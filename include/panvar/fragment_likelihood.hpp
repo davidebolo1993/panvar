@@ -23,16 +23,43 @@ namespace panvar {
 // comparison below is a forward comparison once the reads are pre-complemented.
 enum class MateOrientation { FirstForward, SecondForward };
 
-// A single physical origin of a fragment on one haplotype: where each mate sits and how far apart.
-// Two distinct repeat copies produce two of these even when every statistic agrees, because they are
-// two places the fragment could physically have come from.
+// A single physical origin of a fragment on one haplotype.
+//
+// A physical origin is a PLACE, described by the two endpoints of the template and the library
+// orientation: the forward mate is anchored at the left endpoint, the reverse mate at the right
+// endpoint, and `insert_bp` is their separation. Two distinct repeat copies produce two of these
+// even when every statistic agrees, because they are two places the fragment could physically have
+// come from.
+//
+// An ALIGNMENT is not an origin. Once indels are admitted, one origin is explained by several latent
+// alignments -- the same left and right endpoints reached with different numbers of haplotype bases
+// consumed by each mate -- and those are competing explanations of one physical event, not extra
+// physical events. Their masses are therefore SUMMED into `log_latent_mass`, never counted as
+// additional multiplicity. Getting that backwards inflates a repeat-free locus with phantom copies.
 struct FragmentPlacement {
+    // The template's left endpoint: where the forward mate is anchored.
     std::size_t forward_start = 0;
-    std::size_t reverse_start = 0;
+    // Right endpoint minus left endpoint. The right endpoint is forward_start + insert_bp.
     std::size_t insert_bp = 0;
+    MateOrientation orientation = MateOrientation::FirstForward;
+    // log sum over every latent alignment pair explaining this origin, of the two mates' normalised
+    // emissions. This is the whole of what the origin contributes, before the orientation prior and
+    // the insert probability -- both of which apply once per origin, because there is one template.
+    double log_latent_mass = -std::numeric_limits<double>::infinity();
+    // How many latent alignment pairs were summed. One under a gapless model; up to (2d+1)^2 with a
+    // displacement band of d. Reported so the pairing cost is measured rather than assumed.
+    std::size_t latent_alignments = 0;
+
+    // ---- diagnostics: the single highest-mass latent alignment of this origin -------------------
+    // None of these may be used to recompute a score. Under the indel-aware emission a mismatch count
+    // does not determine an emission, and one alignment's consumed span does not carry the origin's
+    // mass -- attaching the summed mass to the best span's geometry is exactly the defect this
+    // structure exists to prevent.
+    std::size_t reverse_start = 0;
+    std::size_t forward_consumed_bp = 0;
+    std::size_t reverse_consumed_bp = 0;
     std::size_t forward_mismatches = 0;
     std::size_t reverse_mismatches = 0;
-    MateOrientation orientation = MateOrientation::FirstForward;
 };
 
 // Fixed-position Hamming emission of `read` against `haplotype` starting at `start`. Version one is
@@ -77,6 +104,120 @@ double log_truncated_emission(
     double substitution_error,
     std::size_t mismatch_band);
 
+// ---------------------------------------------------------------------------------------------
+// Indel-aware emission, version two.
+//
+// Version one aligned a read at a fixed start and counted substitutions. A single inserted or
+// deleted base shifts every downstream base, so a read spanning a one-base indel accumulates
+// roughly L/2 mismatches, leaves the declared band, and gets NO placement at all -- it falls to the
+// outlier background on the haplotype that is actually correct, while a haplotype that happens to
+// match by chance keeps it. That is not a tolerance problem, it is a misspecified emission, and it
+// is what cost the two-edit allele 2,871 nats to a sixteen-edit one on NA19240.
+//
+// The replacement is a banded affine-gap pair-HMM, conditioned on the observed read length:
+//
+//   states     M consumes one read base and one haplotype base, I one read base, D one haplotype
+//              base. No I<->D transition, so a gap has one kind.
+//   emissions  M emits the read base with 1-e when it matches and e/3 otherwise; I emits a read
+//              base uniformly at 1/4. Both sum to one over the emitted base, and D emits nothing.
+//   band       the total edit budget `mismatch_band` counts substitutions AND gap bases together,
+//              and net displacement is bounded by `max_gap_bp`.
+//
+// Because every emitting state's distribution sums to one over the base it emits, summing the
+// unnormalised path mass over all 4^L reads of length L leaves exactly the transition mass of the
+// admissible alignment SHAPES -- which depends on the read length and the band, never on the
+// haplotype or the read. That sum is the normaliser below, so the emission is a proper distribution
+// over reads of the observed length, the exposure identity carries over unchanged, and no score can
+// depend on which other candidates are present.
+//
+// At max_gap_bp == 0 this reduces exactly to log_truncated_emission, which is gated as an equality.
+
+// The shape mass log Z: the same recursion with every emission set to one. Independent of the
+// sequences' CONTENT, but not of how much haplotype is available: `available_bp` bounds the bases an
+// alignment may consume from the start in question, and the normaliser must honour the same bound the
+// numerator does. Normalising against an unbounded haplotype instead leaks mass near the ends --
+// shapes dropped from the numerator would still divide the denominator, and the emission would sum to
+// less than one there, breaking the exposure identity by a small, load-bearing amount.
+double log_gap_shape_mass(
+    std::size_t read_length,
+    std::size_t available_bp,
+    std::size_t mismatch_band,
+    const LibraryModel& library);
+
+// One terminal consumed-span class of the alignments of a read at a fixed start.
+//
+// A gapped read does not occupy read_length haplotype bases, and it does not occupy ONE number of
+// them either: with a displacement band of d it may end anywhere in read_length +/- d, and each of
+// those spans places the mate's far endpoint somewhere different. Because the spans imply different
+// fragment geometries and different insert probabilities, the mass of each has to be carried
+// separately as far as the geometry -- summing them first and attaching the total to the best span's
+// insert length weights real alignment mass with the wrong insert probability, which is what broke
+// the exposure identity.
+struct GappedComponent {
+    // Haplotype bases this class of alignments consumes from `start`.
+    std::size_t consumed_bp = 0;
+    // Normalised log mass of every admissible alignment ending with that consumed span.
+    double log_emission = -std::numeric_limits<double>::infinity();
+    // Fewest total edits -- substitutions plus gap bases -- within this class. Diagnostic.
+    std::size_t edits = 0;
+};
+
+// Every admissible alignment of one read at one start, grouped by what it consumes.
+struct GappedFit {
+    // One entry per terminal consumed span carrying mass, ascending. At most 2*max_gap_bp+1 of them.
+    std::vector<GappedComponent> components;
+    // log sum of the components: the whole read's normalised emission at this start, which is what
+    // must sum to one over every read of this length. The components share ONE normaliser -- the
+    // shape mass of the read length -- so summing them reproduces this exactly. Normalising each
+    // span against its own shape mass would make every span a distribution in its own right and
+    // their sum several times one.
+    double log_emission = -std::numeric_limits<double>::infinity();
+    // The highest-mass component's span and edit count. DIAGNOSTIC ONLY: it is not where the
+    // emission lives, and using it as the geometry of the whole emission is the defect above.
+    std::size_t consumed_bp = 0;
+    std::size_t edits = 0;
+};
+
+// Sums over every admissible alignment of the read at this start -- it is a likelihood, not a best
+// path -- and returns that sum decomposed by consumed haplotype span, so each part can be given the
+// fragment geometry it actually implies. Returns nullopt when the haplotype cannot hold the read at
+// this start at all.
+std::optional<GappedFit> gapped_emission(
+    const std::string& haplotype,
+    const std::string& read,
+    std::size_t start,
+    const LibraryModel& library,
+    std::size_t mismatch_band);
+
+// The same emission, anchored at the read's RIGHT endpoint instead of at its start.
+//
+// An FR pair is sequenced from both ends of ONE template: the forward mate is read rightward from
+// the left endpoint, the reverse mate leftward from the right endpoint. Each mate's emission has to
+// be a proper distribution given ITS OWN anchor, and the reverse mate's anchor is the right
+// endpoint -- exactly as FragmentPlacement above describes a physical origin.
+//
+// This is not gapped_emission with the arguments moved about. The recursion is DIRECTIONAL: an
+// alignment may end in a gap but may not begin in one, so a path and its reversal do not carry the
+// same mass (measured at 3.8 to 11.2 nats apart), and the normaliser is conditioned on the sequence
+// available in the direction the mate is actually read.
+//
+// Left-anchoring the reverse mate is what broke the exposure identity. Several starts share one
+// right endpoint -- rs = R - consumed, one per consumed span -- and each was normalised against a
+// different amount of remaining haplotype, so gathering one consumed-span class from each summed to
+// MORE than one wherever the haplotype end bound the normaliser. The excess appeared only near the
+// right boundary and walked inward as max_gap_bp widened, which is precisely what was measured.
+// Anchored here, the identity holds exactly at every (mismatch_band, max_gap_bp) combination, with
+// no precondition relating the two, and at max_gap_bp 0 it is identical to gapped_emission.
+//
+// `end` is one past the last haplotype base the mate may consume; a component's consumed span is
+// measured leftward from it, so that alignment occupies [end - consumed_bp, end).
+std::optional<GappedFit> gapped_emission_ending_at(
+    const std::string& haplotype,
+    const std::string& read,
+    std::size_t end,
+    const LibraryModel& library,
+    std::size_t mismatch_band);
+
 // log(1/2): each template is read in one of two library orientations.
 inline constexpr double kLogMateOrientationPrior = -0.69314718055994530942;
 
@@ -88,6 +229,18 @@ std::optional<std::size_t> fr_insert_length(
     std::size_t forward_length,
     std::size_t reverse_start,
     std::size_t reverse_length,
+    const InsertSupport& support);
+
+// The same admission rule stated on the template's two ENDPOINTS, which is how an origin is named
+// once the reverse mate is anchored at its right endpoint. Equivalent to fr_insert_length with
+// reverse_start = reverse_end - reverse_consumed_bp, but it cannot underflow when a gapped mate
+// consumes more than its endpoint offset, and it does not ask the caller to reconstruct a start it
+// no longer has.
+std::optional<std::size_t> fr_insert_from_endpoints(
+    std::size_t forward_start,
+    std::size_t forward_consumed_bp,
+    std::size_t reverse_end,
+    std::size_t reverse_consumed_bp,
     const InsertSupport& support);
 
 // Expected number of templates on one chromosome copy of this haplotype that can produce a fragment
@@ -129,17 +282,27 @@ std::vector<FragmentPlacement> enumerate_placements_exhaustive(
     const std::string& haplotype,
     const ReadPair& fragment,
     const InsertSupport& support,
-    std::size_t mismatch_limit);
+    const LibraryModel& library,
+    std::size_t mismatch_band);
 
-// Summed log mass of a fragment on one chromosome copy under the truncated model: sum over
-// placements of (1/2) * P_library(insert) * truncated emission of both mates. `insert` must be the
-// library distribution. Returns -inf when no placement is accepted.
+// Summed log mass of a fragment on one chromosome copy under the truncated model: sum over physical
+// origins of (1/2) * P_library(insert) * the origin's summed latent alignment mass. `insert` must be
+// the library distribution. Returns -inf when no placement is accepted.
+//
+// The orientation prior and the insert probability multiply the origin ONCE, because one origin is
+// one template with one insert length. The latent alignments inside it were already summed when it
+// was built, at the geometry each of them implied.
+// There is deliberately no band parameter. Under the substitution-only model the emission was
+// recoverable from a mismatch count, so the same placement list could be re-normalised at scoring
+// time by passing a different band. A gapped alignment is not summarised by a count: the band selects
+// AND normalises the placements when they are enumerated, and this can only sum what they carry.
+// Keeping a band argument here would let a caller ask for a renormalisation that silently does not
+// happen, which is worse than not offering it.
 double log_placement_mass(
     const std::vector<FragmentPlacement>& placements,
     const ReadPair& fragment,
     const DiscreteInsertDistribution& insert,
-    const LibraryModel& library,
-    std::size_t mismatch_band);
+    const LibraryModel& library);
 
 // ---------------------------------------------------------------------------------------------
 // Accelerated scorer.
@@ -216,6 +379,12 @@ struct FragmentScoringOptions {
     std::uint64_t max_physical_origins = 500000000ULL;
     std::uint64_t max_state_classes = 200000000ULL;
     std::uint64_t max_mass_cells = 200000000ULL;
+    // Admitting indels multiplies the pairing work by up to (2*max_gap_bp+1)^2 per physical origin,
+    // so it gets a declared bound of its own rather than being absorbed into the origin cap. Like
+    // max_state_classes this is an acceptance cap checked on the merged totals: the pairs are counted
+    // as the geometry is tested, and a running per-worker crossing point would move with the
+    // partition. The default holds the same headroom over C4 that the origin cap does.
+    std::uint64_t max_latent_alignment_pairs = 2000000000ULL;
     // Diagnostics only; nothing here enters a score or a ranking. When set, the result carries for
     // every (fragment, haplotype) the accepted physical-origin count and the single highest-mass origin,
     // and for the listed fragments every accepted origin.
@@ -244,6 +413,21 @@ struct FragmentScoringCounters {
     std::uint64_t full_read_verifications = 0;
     std::uint64_t accepted_mate_placements = 0;
     std::uint64_t valid_fr_states = 0;
+    // Latent alignment pairs TESTED: one per (forward consumed span, reverse consumed span) offered
+    // to the FR geometry, whether or not it was accepted. This is the pairing work that admitting
+    // indels multiplies, which is why it counts attempts rather than successes -- `valid_fr_states`
+    // is the accepted subset. Measured rather than assumed negligible: a mate has at most
+    // 2*max_gap_bp+1 terminal spans, so one mate pair can present up to (2*max_gap_bp+1)^2 of them --
+    // 49 at the production max_gap_bp of 3 -- before the collapse onto endpoints reduces them.
+    std::uint64_t latent_alignment_pairs = 0;
+    // Fragments whose declared insert support lets the geometry's floor -- insert >= the larger
+    // consumed span -- actually bind. Only those need their consumed-span components carried
+    // separately through the pairing: for every other fragment the mass at an anchor pair
+    // factorises exactly as (sum over forward spans) * (sum over reverse spans), so one
+    // whole-emission row per anchor yields the IDENTICAL likelihood at a fraction of the cost.
+    // Counted because a fast path nobody can see is one that can diverge unnoticed; the scorer's
+    // agreement with the always-componentised oracle is what certifies it.
+    std::uint64_t fragments_with_floor_binding = 0;
     std::uint64_t physical_origins = 0;
     std::uint64_t statistical_state_classes = 0;
 };

@@ -71,6 +71,17 @@ void validate_library_model(const LibraryModel& model) {
     if (!std::isfinite(model.fragment_start_intensity) || model.fragment_start_intensity <= 0.0) {
         throw std::invalid_argument("library fragment-start intensity must be finite and positive");
     }
+    // Two gaps may open at a match position, one of each kind, so 2*gap_open must leave positive
+    // probability for continuing as a match. At gap_open = 0 the process can never leave the match
+    // state and the emission is the substitution-only model whatever max_gap_bp says.
+    if (!std::isfinite(model.gap_open) || model.gap_open < 0.0 || 2.0 * model.gap_open >= 1.0) {
+        throw std::invalid_argument(
+            "library gap-open probability must be in [0, 0.5): at 0.5 no probability is left for "
+            "continuing the alignment as a match");
+    }
+    if (!std::isfinite(model.gap_extend) || model.gap_extend < 0.0 || model.gap_extend >= 1.0) {
+        throw std::invalid_argument("library gap-extend probability must be in [0, 1)");
+    }
     if (model.provenance.empty()) {
         throw std::invalid_argument("library model provenance must not be empty");
     }

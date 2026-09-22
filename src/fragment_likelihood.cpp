@@ -44,6 +44,43 @@ std::string reverse_complement_read(const std::string& bases) {
     return out;
 }
 
+// A reverse-role mate is compared against the haplotype's forward strand as rc(mate), and is then
+// anchored at its RIGHT endpoint by running the recursion over reversed sequences. The reversed form
+// of rc(mate) is just its complement, since rc(X) = reverse(complement(X)). Spelling that out here
+// keeps the scorer from reversing a string per verification in its hottest loop.
+std::string complement_read(const std::string& bases) {
+    std::string out(bases.size(), 'N');
+    for (std::size_t i = 0; i < bases.size(); ++i) out[i] = complement(bases[i]);
+    return out;
+}
+
+// One physical origin under construction, while the latent alignments that explain it are summed.
+// Shared by the oracle and the accelerated scorer so the two cannot drift in how they collapse.
+struct OriginAccumulator {
+    double log_latent_mass = kNegInf;
+    std::size_t latent_alignments = 0;
+    // The best single latent alignment, kept only to describe the origin in diagnostics.
+    double best_pair = kNegInf;
+    std::size_t reverse_start = 0;
+    std::size_t forward_consumed_bp = 0;
+    std::size_t reverse_consumed_bp = 0;
+    std::size_t forward_mismatches = 0;
+    std::size_t reverse_mismatches = 0;
+
+    void add(double pair_mass, std::size_t reverse, std::size_t forward_consumed,
+             std::size_t reverse_consumed, std::size_t forward_edits, std::size_t reverse_edits) {
+        log_latent_mass = log_add_exp(log_latent_mass, pair_mass);
+        ++latent_alignments;
+        if (pair_mass <= best_pair) return;
+        best_pair = pair_mass;
+        reverse_start = reverse;
+        forward_consumed_bp = forward_consumed;
+        reverse_consumed_bp = reverse_consumed;
+        forward_mismatches = forward_edits;
+        reverse_mismatches = reverse_edits;
+    }
+};
+
 } // namespace
 
 std::optional<std::size_t> count_mismatches(
@@ -116,6 +153,326 @@ double log_truncated_emission(
            log_band_mass(read_length, mismatch_band, substitution_error);
 }
 
+// -------------------------------------------------------------------------------------------
+// Indel-aware emission: a banded affine-gap pair-HMM, conditioned on the observed read length.
+// -------------------------------------------------------------------------------------------
+
+namespace {
+
+enum GapState { kMatch = 0, kInsert = 1, kDelete = 2, kStates = 3 };
+
+// The recursion, shared by the emission and its normaliser. `emitting` false replaces every
+// emission with one, which is exactly the sum over all 4^L reads and therefore the shape mass.
+// Cells are indexed [read position][displacement][state][edits used].
+// `available` is how many haplotype bases may be consumed from `start`. It bounds BOTH modes: the
+// numerator must not walk off the haplotype, and the normaliser must not count shapes that would.
+// Bounding only the emitting pass is what leaked mass near the haplotype ends -- shapes dropped from
+// the numerator were still dividing the denominator, so the emission summed to less than one there.
+double gap_recursion(
+    const std::string* haplotype,
+    const std::string* read,
+    std::size_t start,
+    std::size_t read_length,
+    std::size_t available,
+    std::size_t band,
+    const LibraryModel& library,
+    bool emitting,
+    std::vector<GappedComponent>* components) {
+    const std::size_t delta = library.max_gap_bp;
+    const std::size_t width = 2 * delta + 1;
+    const std::size_t budget = band + 1;                 // edits 0..band
+    const double log_match = std::log(1.0 - library.substitution_error);
+    const double log_mismatch = std::log(library.substitution_error / 3.0);
+    const double log_insert_emission = std::log(0.25);
+    const double log_continue = library.gap_open > 0.0
+        ? std::log(1.0 - 2.0 * library.gap_open) : 0.0;
+    const double log_open = library.gap_open > 0.0 ? std::log(library.gap_open) : kNegInf;
+    const double log_extend = library.gap_extend > 0.0 ? std::log(library.gap_extend) : kNegInf;
+    const double log_close = library.gap_extend < 1.0 ? std::log(1.0 - library.gap_extend) : kNegInf;
+
+    const std::size_t cells = width * kStates * budget;
+    std::vector<double> previous(cells, kNegInf);
+    std::vector<double> current(cells, kNegInf);
+
+    const auto at = [&](std::size_t displacement, std::size_t state, std::size_t edits) {
+        return (displacement * kStates + state) * budget + edits;
+    };
+    // Displacement k is stored offset by delta, so index 0 means k = -delta.
+    previous[at(delta, kMatch, 0)] = 0.0;
+
+    for (std::size_t i = 1; i <= read_length; ++i) {
+        std::fill(current.begin(), current.end(), kNegInf);
+        for (std::size_t d = 0; d < width; ++d) {
+            const long k = static_cast<long>(d) - static_cast<long>(delta);
+            // Haplotype bases consumed before this read base under M: i - 1 + k.
+            const long consumed_before = static_cast<long>(i) - 1 + k;
+            for (std::size_t e = 0; e < budget; ++e) {
+                // --- M: consume one read base and one haplotype base -------------------------
+                if (consumed_before >= 0) {
+                    const std::size_t index = start + static_cast<std::size_t>(consumed_before);
+                    // The match step, as (weight, edit cost) branches.
+                    //
+                    // Emitting, the read base is known, so there is exactly one branch. Summing over
+                    // ALL 4^L reads there are two, and they must both be walked: a match position
+                    // carries (1-e) over the one base that matches, and a mismatch carries 3*(e/3) = e
+                    // over the three that do not, at a cost of one edit. Collapsing that to a single
+                    // zero-cost branch -- which is what computing the normaliser with "no emission"
+                    // does -- makes Z count only the all-match path, and the emission then reduces to
+                    // the UNTRUNCATED substitution model instead of the declared truncated one.
+                    double weights[2] = {0.0, 0.0};
+                    std::size_t costs[2] = {0, 1};
+                    std::size_t branches = 0;
+                    // The consumption bound applies whether or not we are emitting.
+                    bool usable = static_cast<std::size_t>(consumed_before) < available;
+                    if (emitting && usable) {
+                        {
+                            const char reference = (*haplotype)[index];
+                            const char observed = (*read)[i - 1];
+                            if (!is_acgt(reference) || !is_acgt(observed)) {
+                                throw std::invalid_argument(
+                                    "gapped emission is defined over ACGT; a non-ACGT base must "
+                                    "refuse rather than be scored as a mismatch");
+                            }
+                            const bool same = reference == observed;
+                            weights[0] = same ? log_match : log_mismatch;
+                            costs[0] = same ? 0 : 1;
+                            branches = 1;
+                        }
+                    } else {
+                        weights[0] = std::log(1.0 - library.substitution_error);
+                        costs[0] = 0;
+                        weights[1] = std::log(library.substitution_error);
+                        costs[1] = 1;
+                        branches = 2;
+                    }
+                    for (std::size_t b = 0; usable && b < branches; ++b) {
+                        const double emission = weights[b];
+                        const std::size_t cost = costs[b];
+                        if (e < cost) continue;
+                        const std::size_t from = e - cost;
+                        const double arrivals[kStates] = {
+                            previous[at(d, kMatch, from)] + log_continue,
+                            previous[at(d, kInsert, from)] + log_close,
+                            previous[at(d, kDelete, from)] + log_close,
+                        };
+                        double sum = kNegInf;
+                        for (std::size_t s = 0; s < kStates; ++s) {
+                            sum = log_add_exp(sum, arrivals[s]);
+                        }
+                        const std::size_t cell = at(d, kMatch, e);
+                        current[cell] = log_add_exp(current[cell], sum + emission);
+                    }
+                }
+                // --- I: consume one read base only, displacement falls by one ----------------
+                if (d + 1 < width && e >= 1) {
+                    const double emission = emitting ? log_insert_emission : 0.0;
+                    const std::size_t from = e - 1;
+                    const double opened = previous[at(d + 1, kMatch, from)] + log_open;
+                    const double extended = previous[at(d + 1, kInsert, from)] + log_extend;
+                    const std::size_t cell = at(d, kInsert, e);
+                    current[cell] = log_add_exp(current[cell], log_add_exp(opened, extended) + emission);
+                }
+            }
+        }
+        // --- D: consume haplotype only. No read base advances, so it is resolved within the
+        // current read position, sweeping displacement upward because D raises k by one.
+        for (std::size_t d = 1; d < width; ++d) {
+            const long k = static_cast<long>(d) - static_cast<long>(delta);
+            const long consumed_before = static_cast<long>(i) + k - 1;
+            if (consumed_before < 0) continue;
+            if (static_cast<std::size_t>(consumed_before) >= available) continue;
+            for (std::size_t e = 1; e < budget; ++e) {
+                const std::size_t from = e - 1;
+                const double opened = current[at(d - 1, kMatch, from)] + log_open;
+                const double extended = current[at(d - 1, kDelete, from)] + log_extend;
+                const std::size_t cell = at(d, kDelete, e);
+                current[cell] = log_add_exp(current[cell], log_add_exp(opened, extended));
+            }
+        }
+        previous.swap(current);
+    }
+
+    double total = kNegInf;
+    // The displacement band bounds consumption from BELOW as well as above. Without the floor an
+    // alignment may terminate having consumed almost no haplotype -- a read absorbed entirely by
+    // insertions -- which is not a placement in any useful sense: near the end of a haplotype every
+    // start would then admit the read, and those degenerate origins put a whole extra unit of mass
+    // into the exposure sum. With it, a read that cannot fit yields no placement, exactly as the
+    // substitution-only model behaved when count_mismatches ran off the end.
+    const std::size_t floor_bp = read_length - std::min(read_length, delta);
+    // Each terminal displacement is one CONSUMED-SPAN CLASS, and they are kept apart here rather than
+    // summed into one number. They have to be: every class ends the mate at a different haplotype
+    // coordinate, so each implies a different fragment geometry and a different insert probability.
+    // Collapsing them and handing the total to the best class's span weights the other classes' mass
+    // with an insert probability that is not theirs -- which is what made the signal density fail to
+    // integrate to the exposure. The caller applies the geometry to each class separately.
+    for (std::size_t d = 0; d < width; ++d) {
+        const long k = static_cast<long>(d) - static_cast<long>(delta);
+        const long consumed = static_cast<long>(read_length) + k;
+        if (consumed < 0 || static_cast<std::size_t>(consumed) > available) continue;
+        if (static_cast<std::size_t>(consumed) < floor_bp) continue;
+        double span = kNegInf;
+        // Fewest edits reaching this span. A cell is INDEXED by the edits spent to reach it, so the
+        // lowest finite e in the class is that minimum exactly -- there is nothing to track alongside
+        // the recursion, and the arrays that used to do it could only restate their own index.
+        std::size_t span_edits = budget;
+        for (std::size_t s = 0; s < kStates; ++s) {
+            for (std::size_t e = 0; e < budget; ++e) {
+                const double cell = previous[at(d, s, e)];
+                if (cell == kNegInf) continue;
+                span = log_add_exp(span, cell);
+                if (e < span_edits) span_edits = e;
+            }
+        }
+        if (span == kNegInf) continue;
+        total = log_add_exp(total, span);
+        if (components != nullptr) {
+            components->push_back({static_cast<std::size_t>(consumed), span, span_edits});
+        }
+    }
+    return total;
+}
+
+} // namespace
+
+double log_gap_shape_mass(
+    std::size_t read_length,
+    std::size_t available_bp,
+    std::size_t mismatch_band,
+    const LibraryModel& library) {
+    if (read_length == 0) throw std::invalid_argument("gapped emission requires a non-empty read");
+    // ONE normaliser, summed over every terminal span. Deliberately not per span: the components are
+    // parts of a single distribution over reads of this length, not several distributions, and
+    // dividing each by its own shape mass would make each of them sum to one on its own and their
+    // total several times that.
+    //
+    // MEMOISED, because this is a pure function of its arguments and gapped_emission calls it on
+    // every verification -- which made each verification run the whole recursion TWICE, once for the
+    // numerator and once for a denominator that depends on neither sequence. Measured at 175us of a
+    // 255us call: 69% of the cost of every placement in the program.
+    //
+    // The key space is tiny once `available_bp` is clamped. The haplotype end cuts admissible shapes
+    // only while it is within reach; once available_bp reaches read_length + max_gap_bp, no terminal
+    // span and no intermediate path is excluded, and every larger value yields a BIT-IDENTICAL
+    // result -- measured across available_bp from 103 to 200,000 at read_length 100, max_gap_bp 3.
+    // So the clamp leaves exactly max_gap_bp + 1 distinct entries per read length, and it is an
+    // identity rather than a tolerance.
+    const std::size_t key_available = std::min(available_bp, read_length + library.max_gap_bp);
+
+    struct ShapeKey {
+        std::size_t read_length;
+        std::size_t available;
+        std::size_t band;
+        std::size_t max_gap;
+        double substitution_error;
+        double gap_open;
+        double gap_extend;
+
+        bool operator<(const ShapeKey& other) const noexcept {
+            return std::tie(read_length, available, band, max_gap, substitution_error, gap_open,
+                            gap_extend) <
+                   std::tie(other.read_length, other.available, other.band, other.max_gap,
+                            other.substitution_error, other.gap_open, other.gap_extend);
+        }
+    };
+    // Every parameter the value depends on is in the key, so a stale hit is impossible: change the
+    // band or any gap parameter and it is a different entry, not a reused one. Thread-local because
+    // the placement phase runs on several workers and a shared cache would need a lock in the
+    // hottest path in the program; each worker paying for four entries is not worth contending for.
+    static thread_local std::map<ShapeKey, double> cache;
+    const ShapeKey key{read_length,   key_available,       mismatch_band,     library.max_gap_bp,
+                       library.substitution_error, library.gap_open, library.gap_extend};
+    const auto found = cache.find(key);
+    if (found != cache.end()) return found->second;
+    const double value = gap_recursion(nullptr, nullptr, 0, read_length, key_available,
+                                       mismatch_band, library, false, nullptr);
+    cache.emplace(key, value);
+    return value;
+}
+
+std::optional<GappedFit> gapped_emission(
+    const std::string& haplotype,
+    const std::string& read,
+    std::size_t start,
+    const LibraryModel& library,
+    std::size_t mismatch_band) {
+    if (read.empty()) throw std::invalid_argument("gapped emission requires a non-empty read");
+    if (start > haplotype.size()) return std::nullopt;
+    // ELIGIBILITY is by read length, exactly as the substitution-only model required: the haplotype
+    // must be able to hold the read from here. The alignment inside that window is still free to
+    // consume read_length +/- max_gap_bp, which is what admits indels.
+    //
+    // Admitting starts with only read_length - max_gap_bp bases left looks more permissive but is
+    // wrong twice over. Such a start can be reached only by absorbing the overhang as insertions, and
+    // because the normaliser is conditioned on what is available there, those gapped shapes are the
+    // ONLY admissible ones and normalise to near certainty -- a gap costing 1e-4 in the interior
+    // arrives at ~0.2 at the boundary. Summed over reads that manufactured exactly one extra unit of
+    // density at the haplotype end, which is why the signal integrated to exposure + 1 regardless of
+    // haplotype length or gap width.
+    if (haplotype.size() - start < read.size()) return std::nullopt;
+    // Both passes see the same bound on what the haplotype can supply from here.
+    const std::size_t available = haplotype.size() - start;
+    std::vector<GappedComponent> raw;
+    const double raw_total = gap_recursion(&haplotype, &read, start, read.size(), available,
+                                           mismatch_band, library, true, &raw);
+    if (raw_total == kNegInf || raw.empty()) return std::nullopt;
+    const double shapes = log_gap_shape_mass(read.size(), available, mismatch_band, library);
+
+    GappedFit fit;
+    // Every component is divided by the SAME normaliser, so their sum is the whole read's emission
+    // and the decomposition changes where the mass is attached without changing how much there is.
+    fit.log_emission = raw_total - shapes;
+    fit.components.reserve(raw.size());
+    double best = kNegInf;
+    for (GappedComponent component : raw) {
+        component.log_emission -= shapes;
+        if (component.log_emission > best) {
+            best = component.log_emission;
+            fit.consumed_bp = component.consumed_bp;
+            fit.edits = component.edits;
+        }
+        fit.components.push_back(component);
+    }
+    return fit;
+}
+
+std::optional<GappedFit> gapped_emission_ending_at(
+    const std::string& haplotype,
+    const std::string& read,
+    std::size_t end,
+    const LibraryModel& library,
+    std::size_t mismatch_band) {
+    if (read.empty()) throw std::invalid_argument("gapped emission requires a non-empty read");
+    if (end > haplotype.size()) return std::nullopt;
+    // Eligibility by read length, measured leftward: the haplotype must be able to hold the read
+    // ending here, exactly as the left-anchored form requires it to hold the read starting there.
+    if (end < read.size()) return std::nullopt;
+    // Reversing BOTH sequences turns "read leftward from `end`" into "read rightward from
+    // haplotype.size() - end", which is the recursion already written. Reversing both preserves the
+    // match/mismatch pattern exactly; what changes is the direction the gap model runs in, and that
+    // is the whole point -- the mate really is sequenced from this end.
+    const std::string reversed_haplotype(haplotype.rbegin(), haplotype.rend());
+    const std::string reversed_read(read.rbegin(), read.rend());
+    return gapped_emission(reversed_haplotype, reversed_read, haplotype.size() - end, library,
+                           mismatch_band);
+}
+
+std::optional<std::size_t> fr_insert_from_endpoints(
+    std::size_t forward_start,
+    std::size_t forward_consumed_bp,
+    std::size_t reverse_end,
+    std::size_t reverse_consumed_bp,
+    const InsertSupport& support) {
+    if (reverse_end <= forward_start) return std::nullopt;
+    const std::size_t insert = reverse_end - forward_start;
+    // Overlapping mates are a physical state, so the floor is the longer mate's CONSUMED span,
+    // never the sum. A gapped mate occupies a different stretch than its read length, so the floor
+    // has to be stated on what was consumed.
+    if (insert < std::max(forward_consumed_bp, reverse_consumed_bp)) return std::nullopt;
+    if (support.empty() || insert < support.min_bp || insert > support.max_bp) return std::nullopt;
+    return insert;
+}
+
 std::optional<std::size_t> fr_insert_length(
     std::size_t forward_start,
     std::size_t forward_length,
@@ -178,8 +535,10 @@ std::vector<FragmentPlacement> enumerate_placements_exhaustive(
     const std::string& haplotype,
     const ReadPair& fragment,
     const InsertSupport& support,
-    std::size_t mismatch_limit) {
+    const LibraryModel& library,
+    std::size_t mismatch_band) {
     validate_read_pair(fragment);
+    validate_library_model(library);
     std::vector<FragmentPlacement> placements;
     if (haplotype.empty() || support.empty()) return placements;
 
@@ -195,28 +554,69 @@ std::vector<FragmentPlacement> enumerate_placements_exhaustive(
             arm == 0 ? fragment.first.bases : fragment.second.bases;
         const std::string& reverse_bases = arm == 0 ? second_rc : first_rc;
 
-        for (std::size_t forward_start = 0; forward_start < haplotype.size(); ++forward_start) {
-            const std::optional<std::size_t> forward_mismatches =
-                count_mismatches(haplotype, forward_bases, forward_start, mismatch_limit);
-            if (!forward_mismatches.has_value()) continue;
-            for (std::size_t reverse_start = 0; reverse_start < haplotype.size(); ++reverse_start) {
-                const std::optional<std::size_t> insert = fr_insert_length(
-                    forward_start, forward_bases.size(),
-                    reverse_start, reverse_bases.size(), support);
-                if (!insert.has_value()) continue;
-                const std::optional<std::size_t> reverse_mismatches =
-                    count_mismatches(haplotype, reverse_bases, reverse_start, mismatch_limit);
-                if (!reverse_mismatches.has_value()) continue;
-
-                FragmentPlacement placement;
-                placement.orientation = orientation;
-                placement.forward_start = forward_start;
-                placement.reverse_start = reverse_start;
-                placement.insert_bp = *insert;
-                placement.forward_mismatches = *forward_mismatches;
-                placement.reverse_mismatches = *reverse_mismatches;
-                placements.push_back(placement);
+        // Each anchor's components once per form. The pairing below reads them O(L^2) times, and
+        // recomputing the recursion inside that loop made the oracle quadratic in DP evaluations
+        // rather than merely in pairings.
+        //
+        // The two mates are anchored at OPPOSITE ends, because that is how the template was read:
+        // the forward mate rightward from the left endpoint, the reverse mate leftward from the
+        // right endpoint. Anchoring both at a start is what broke the exposure identity.
+        std::vector<std::optional<GappedFit>> forward_fits(haplotype.size() + 1);
+        std::vector<std::optional<GappedFit>> reverse_fits(haplotype.size() + 1);
+        for (std::size_t at = 0; at <= haplotype.size(); ++at) {
+            if (at < haplotype.size()) {
+                forward_fits[at] = gapped_emission(haplotype, forward_bases, at, library,
+                                                   mismatch_band);
             }
+            reverse_fits[at] =
+                gapped_emission_ending_at(haplotype, reverse_bases, at, library, mismatch_band);
+        }
+
+        // Keyed by (left endpoint, insert). The right endpoint is their sum, so this names the
+        // template's two ends -- which is what a physical origin is. Every latent alignment pair
+        // arriving at the same pair of ends is one more explanation of ONE template, so it is summed
+        // into that origin rather than producing a second one.
+        std::map<std::pair<std::size_t, std::size_t>, OriginAccumulator> origins;
+        for (std::size_t forward_start = 0; forward_start < haplotype.size(); ++forward_start) {
+            const std::optional<GappedFit>& forward_fit = forward_fits[forward_start];
+            if (!forward_fit.has_value()) continue;
+            for (std::size_t reverse_end = 0; reverse_end <= haplotype.size(); ++reverse_end) {
+                const std::optional<GappedFit>& reverse_fit = reverse_fits[reverse_end];
+                if (!reverse_fit.has_value()) continue;
+                // Geometry follows the bases each mate CONSUMES, not the bases it carries, and each
+                // consumed-span class is given its own geometry: a gapped mate spans a different
+                // stretch of haplotype than its read length, and a different one per class.
+                for (const GappedComponent& forward_span : forward_fit->components) {
+                    if (forward_span.log_emission == kNegInf) continue;
+                    for (const GappedComponent& reverse_span : reverse_fit->components) {
+                        if (reverse_span.log_emission == kNegInf) continue;
+                        const std::optional<std::size_t> insert = fr_insert_from_endpoints(
+                            forward_start, forward_span.consumed_bp,
+                            reverse_end, reverse_span.consumed_bp, support);
+                        if (!insert.has_value()) continue;
+                        origins[{forward_start, *insert}].add(
+                            forward_span.log_emission + reverse_span.log_emission,
+                            reverse_end - reverse_span.consumed_bp,
+                            forward_span.consumed_bp, reverse_span.consumed_bp,
+                            forward_span.edits, reverse_span.edits);
+                    }
+                }
+            }
+        }
+
+        for (const auto& item : origins) {
+            FragmentPlacement placement;
+            placement.orientation = orientation;
+            placement.forward_start = item.first.first;
+            placement.insert_bp = item.first.second;
+            placement.log_latent_mass = item.second.log_latent_mass;
+            placement.latent_alignments = item.second.latent_alignments;
+            placement.reverse_start = item.second.reverse_start;
+            placement.forward_consumed_bp = item.second.forward_consumed_bp;
+            placement.reverse_consumed_bp = item.second.reverse_consumed_bp;
+            placement.forward_mismatches = item.second.forward_mismatches;
+            placement.reverse_mismatches = item.second.reverse_mismatches;
+            placements.push_back(placement);
         }
     }
     return placements;
@@ -226,23 +626,18 @@ double log_placement_mass(
     const std::vector<FragmentPlacement>& placements,
     const ReadPair& fragment,
     const DiscreteInsertDistribution& insert,
-    const LibraryModel& library,
-    std::size_t mismatch_band) {
+    const LibraryModel& library) {
     validate_read_pair(fragment);
     validate_library_model(library);
     double mass = kNegInf;
     for (const FragmentPlacement& placement : placements) {
-        const std::size_t forward_length = placement.orientation == MateOrientation::FirstForward
-            ? fragment.first.bases.size() : fragment.second.bases.size();
-        const std::size_t reverse_length = placement.orientation == MateOrientation::FirstForward
-            ? fragment.second.bases.size() : fragment.first.bases.size();
+        // One template, so one orientation prior and one insert probability. The latent alignments
+        // were summed into log_latent_mass at the geometry each of them implied, which is the whole
+        // point of carrying them separately that far.
         const double term =
             kLogMateOrientationPrior +
             insert.log_probability(placement.insert_bp) +
-            log_truncated_emission(forward_length, placement.forward_mismatches,
-                                   library.substitution_error, mismatch_band) +
-            log_truncated_emission(reverse_length, placement.reverse_mismatches,
-                                   library.substitution_error, mismatch_band);
+            placement.log_latent_mass;
         mass = log_add_exp(mass, term);
     }
     return mass;
@@ -286,24 +681,35 @@ struct PieceIndex {
     std::vector<PieceEntry> entries;   // sorted by code
 };
 
-// A verified placement of one read form on one haplotype.
+// One verified consumed-span class of one read form at one start on one haplotype. There is a row
+// per class, not per start: the classes end the mate at different coordinates and so pair with
+// different reverse mates, and merging them before the geometry is applied is exactly the defect
+// this file was corrected for. The emission is carried rather than a mismatch count, because under
+// the indel-aware model the count no longer determines it.
 struct FormPlacement {
     std::uint32_t start = 0;
-    std::uint32_t mismatches = 0;
+    std::uint32_t consumed = 0;        // haplotype bases this alignment class spans
+    std::uint32_t mismatches = 0;      // diagnostic only
+    double emission = 0.0;             // normalised log mass of this class
 };
 
-// The exact statistical class of a physical origin. Origins sharing all four fields may be stored
-// once with a multiplicity, but only because every term of their mass is identical.
+// The exact statistical class of a physical origin. Origins sharing every field may be stored once
+// with a multiplicity, but ONLY because every term of their mass is then identical. Keying on
+// mismatch counts was sufficient when the count determined the emission; it no longer does, so the
+// summed latent mass is itself part of the key. Two origins with equal counts but different gapped
+// alignments are different classes and must not be collapsed.
+//
+// The multiplicity here counts PLACES -- distinct left endpoints carrying the same insert and the
+// same latent mass, which is what repeat copies look like. It never counts alternative alignments of
+// one place: those were summed into log_latent_mass before this key was formed.
 struct StateKey {
     std::uint32_t insert_bp = 0;
-    std::uint32_t forward_mismatches = 0;
-    std::uint32_t reverse_mismatches = 0;
     std::uint32_t orientation = 0;
+    double log_latent_mass = 0.0;
 
     bool operator<(const StateKey& other) const noexcept {
-        return std::tie(insert_bp, forward_mismatches, reverse_mismatches, orientation) <
-               std::tie(other.insert_bp, other.forward_mismatches, other.reverse_mismatches,
-                        other.orientation);
+        return std::tie(insert_bp, orientation, log_latent_mass) <
+               std::tie(other.insert_bp, other.orientation, other.log_latent_mass);
     }
 };
 
@@ -385,9 +791,14 @@ class PlacementCancelled : public std::exception {};
 void collect_form_placements(
     const std::string& haplotype,
     const std::vector<ReadForm>& forms,
+    // Parallel to `forms`: whether this form's consumed-span classes must be carried separately.
+    // False only when the fragment's insert support makes the geometry's floor unreachable, where
+    // emitting the whole emission once per anchor is exactly equal and far cheaper.
+    const std::vector<char>& componentise,
     const std::vector<PieceIndex>& indexes,
     PlacementBudget& budget,
     std::size_t band,
+    const LibraryModel& library,
     std::vector<std::vector<FormPlacement>>& out,
     FragmentScoringCounters& counters,
     const FragmentScoringOptions& options) {
@@ -459,9 +870,18 @@ void collect_form_placements(
                     if (budget.stop()) throw PlacementCancelled();
                 }
                 if (it->offset > piece_start) continue;   // implied start would be negative
-                proposed.emplace_back(it->form,
-                                      static_cast<std::uint32_t>(piece_start - it->offset));
-                ++counters.proposed_starts;
+                // The seed implies a start only under a gapless alignment. An indel BEFORE the seed
+                // shifts the true start by up to max_gap_bp in either direction, so the whole
+                // neighbourhood is proposed. Pigeonhole is unaffected -- d edits still break at most
+                // d pieces, so no read the substitution-only scan found is lost -- and the extra
+                // starts are deduplicated below before any verification happens.
+                const std::size_t implied = piece_start - it->offset;
+                const std::size_t lo = implied > library.max_gap_bp ? implied - library.max_gap_bp : 0;
+                const std::size_t hi = implied + library.max_gap_bp;
+                for (std::size_t shifted = lo; shifted <= hi; ++shifted) {
+                    proposed.emplace_back(it->form, static_cast<std::uint32_t>(shifted));
+                    ++counters.proposed_starts;
+                }
                 if (proposed.size() > options.max_proposed_starts_per_haplotype) {
                     throw ResourceExhausted(
                         "fragment scoring reached its per-haplotype proposed-start cap; no partial "
@@ -492,15 +912,46 @@ void collect_form_placements(
         // where a cancelled worker would otherwise spend the longest.
         if (budget.stop()) throw PlacementCancelled();
         ++counters.full_read_verifications;
-        const std::optional<std::size_t> mismatches =
-            count_mismatches(haplotype, forms[item.first].bases, item.second, band);
-        if (!mismatches.has_value()) continue;
-        out[item.first].push_back({item.second, static_cast<std::uint32_t>(*mismatches)});
+        const std::optional<GappedFit> fit =
+            gapped_emission(haplotype, forms[item.first].bases, item.second, library, band);
+        if (!fit.has_value() || fit->log_emission == kNegInf) continue;
+        if (componentise[item.first] != 0) {
+            // One row per consumed-span class. The scorer must see the same decomposition the oracle
+            // sees, or the two agree only where no alignment is gapped.
+            for (const GappedComponent& component : fit->components) {
+                if (component.log_emission == kNegInf) continue;
+                FormPlacement placement;
+                placement.start = item.second;
+                placement.consumed = static_cast<std::uint32_t>(component.consumed_bp);
+                placement.mismatches = static_cast<std::uint32_t>(component.edits);
+                placement.emission = component.log_emission;
+                out[item.first].push_back(placement);
+                ++counters.accepted_mate_placements;
+            }
+            continue;
+        }
+        // The exact fast path, not an approximation. The insert is the distance between the two
+        // ANCHORS, so a consumed span changes the likelihood only through the floor
+        // insert >= max(consumed spans). Where the declared support cannot reach that floor, every
+        // span pair at an anchor pair is admitted, the sum factorises into the two mates' whole
+        // emissions, and carrying the classes separately would compute the same number through
+        // (2*max_gap_bp+1)^2 times as many terms. Measured: identical to the last bit above the
+        // floor, and genuinely different below it -- which is why the predicate, not a tolerance,
+        // decides. The consumed span recorded here is the highest-mass class, used only for the
+        // floor check that cannot bind and for diagnostics.
+        FormPlacement placement;
+        placement.start = item.second;
+        placement.consumed = static_cast<std::uint32_t>(fit->consumed_bp);
+        placement.mismatches = static_cast<std::uint32_t>(fit->edits);
+        placement.emission = fit->log_emission;
+        out[item.first].push_back(placement);
         ++counters.accepted_mate_placements;
     }
+    // Sorted by start first, so the pairing below can walk one left endpoint's classes as a group,
+    // and by consumed span within it so the row order is fixed rather than insertion-dependent.
     for (std::vector<FormPlacement>& list : out) {
         std::sort(list.begin(), list.end(), [](const FormPlacement& lhs, const FormPlacement& rhs) {
-            return lhs.start < rhs.start;
+            return std::tie(lhs.start, lhs.consumed) < std::tie(rhs.start, rhs.consumed);
         });
     }
 }
@@ -514,15 +965,19 @@ PieceHitCensus census_piece_hits(
     PieceHitCensus census;
     const std::size_t band = options.mismatch_band;
 
-    // The same four oriented forms per fragment the scorer builds.
+    // The same four oriented forms per fragment the scorer builds: two forward-role mates scanned
+    // against the haplotype, and two reverse-role mates stored reversed -- complement(mate) -- and
+    // scanned against the reversed haplotype. Both are indexed together here because a piece hit
+    // costs the same whichever direction its form is scanned in, and the census exists to count
+    // hits; the haplotype is scanned in both orientations below so the total matches the scorer's.
     std::vector<ReadForm> forms;
     forms.reserve(fragments.size() * 4);
     for (std::size_t f = 0; f < fragments.size(); ++f) {
         validate_read_pair(fragments[f]);
         forms.push_back({f, fragments[f].first.bases, true});
-        forms.push_back({f, reverse_complement_read(fragments[f].first.bases), false});
+        forms.push_back({f, complement_read(fragments[f].second.bases), false});
         forms.push_back({f, fragments[f].second.bases, false});
-        forms.push_back({f, reverse_complement_read(fragments[f].second.bases), true});
+        forms.push_back({f, complement_read(fragments[f].first.bases), true});
     }
     census.total_forms = forms.size();
     if (forms.empty()) return census;
@@ -544,8 +999,11 @@ PieceHitCensus census_piece_hits(
         }
     }
 
-    for (const std::string& haplotype : haplotypes.sequences) {
-        std::uint64_t hits_here = 0;
+    for (const std::string& forward_haplotype : haplotypes.sequences) {
+      const std::string reversed_haplotype(forward_haplotype.rbegin(), forward_haplotype.rend());
+      std::uint64_t hits_here = 0;
+      for (int direction = 0; direction < 2; ++direction) {
+        const std::string& haplotype = direction == 0 ? forward_haplotype : reversed_haplotype;
         for (const PieceIndex& index : indexes) {
             const std::size_t piece = index.piece_bp;
             if (piece == 0 || haplotype.size() < piece) continue;
@@ -582,8 +1040,9 @@ PieceHitCensus census_piece_hits(
                 census.max_piece_hits_at_one_seed = std::max(census.max_piece_hits_at_one_seed, all);
             }
         }
-        census.max_piece_hits_one_haplotype =
-            std::max(census.max_piece_hits_one_haplotype, hits_here);
+      }
+      census.max_piece_hits_one_haplotype =
+          std::max(census.max_piece_hits_one_haplotype, hits_here);
     }
     return census;
 }
@@ -638,7 +1097,7 @@ FragmentScoringResult score_diplotypes(
     }
     if (options.max_piece_hits == 0 || options.max_proposed_starts_per_haplotype == 0 ||
         options.max_physical_origins == 0 || options.max_state_classes == 0 ||
-        options.max_mass_cells == 0) {
+        options.max_mass_cells == 0 || options.max_latent_alignment_pairs == 0) {
         throw std::invalid_argument("every fragment-scoring resource cap must be positive");
     }
     for (const HaplotypeCandidate& candidate : candidates) {
@@ -655,25 +1114,10 @@ FragmentScoringResult score_diplotypes(
     const std::size_t band = options.mismatch_band;
     const DiscreteInsertDistribution library_insert = build_library_insert_distribution(library);
 
-    // Filled completely before any worker starts, and read-only thereafter. A lazily-filled shared
-    // cache would be a data race under placement parallelism, and giving each worker its own would
-    // recompute the same handful of values per thread; the set of lengths it can ever be asked for is
-    // exactly the distinct mate lengths of the fragments, which are known here.
-    std::map<std::size_t, double> band_mass_by_length;
-    for (const ReadPair& fragment : fragments) {
-        for (const std::size_t length : {fragment.first.bases.size(), fragment.second.bases.size()}) {
-            if (band_mass_by_length.find(length) == band_mass_by_length.end()) {
-                band_mass_by_length.emplace(length, log_band_mass(length, band, library.substitution_error));
-            }
-        }
-    }
-    const auto band_mass = [&](std::size_t length) -> double {
-        const auto found = band_mass_by_length.find(length);
-        if (found != band_mass_by_length.end()) return found->second;
-        // Only reachable if a length appears that no fragment mate carries, which cannot happen for
-        // the calls below; computing it rather than asserting keeps the function total.
-        return log_band_mass(length, band, library.substitution_error);
-    };
+    // The per-length band-mass cache is gone with the substitution-only emission that needed it. The
+    // indel-aware emission normalises itself -- gapped_emission divides by the shape mass of the
+    // read's own length before returning -- so there is nothing left for the scorer to divide by, and
+    // a cache here would only be a second place for the normaliser to disagree with the oracle.
 
     // Phase 1 of three: per-fragment preparation. Timed so a caller can attribute rescoring rather
     // than report it whole -- it is 57-93% of a run, and which phase dominates decides how it should
@@ -682,31 +1126,76 @@ FragmentScoringResult score_diplotypes(
 
     // Four oriented forms per fragment: each mate as given, and each pre-complemented. Whichever
     // mate reads off the forward strand is compared as given, so every comparison is forward.
-    std::vector<ReadForm> forms;
-    forms.reserve(fragments.size() * 4);
+    // Two form sets, because the two mates of an FR pair are anchored at OPPOSITE ends of the
+    // template and their emissions are therefore computed by scanning in opposite directions.
+    //
+    //   forward-role, slot 2f+arm: the mate that reads rightward off the forward strand. Scanned
+    //                              against the haplotype, anchored at its start.
+    //   reverse-role, slot 2f+arm: the mate that reads leftward from the right endpoint, compared
+    //                              as rc(mate) and stored already reversed -- which is complement
+    //                              (mate). Scanned against the REVERSED haplotype, so the same
+    //                              left-anchored machinery anchors it at its right endpoint once
+    //                              its coordinates are mapped back.
+    //
+    // Anchoring both mates at a start is what broke the exposure identity, and the two paths must
+    // make the same choice or the scorer and the oracle agree only where no alignment is gapped.
+    std::vector<ReadForm> forward_forms;
+    std::vector<ReadForm> reverse_forms;
+    forward_forms.reserve(fragments.size() * 2);
+    reverse_forms.reserve(fragments.size() * 2);
     std::vector<InsertSupport> support_by_fragment;
     std::vector<double> background_by_fragment;
+    std::vector<char> floor_binds;
     std::map<std::size_t, std::size_t> fragments_by_floor;
     support_by_fragment.reserve(fragments.size());
     background_by_fragment.reserve(fragments.size());
+    floor_binds.reserve(fragments.size());
     for (std::size_t f = 0; f < fragments.size(); ++f) {
         validate_read_pair(fragments[f]);
-        forms.push_back({f, fragments[f].first.bases, true});
-        forms.push_back({f, reverse_complement_read(fragments[f].first.bases), false});
-        forms.push_back({f, fragments[f].second.bases, false});
-        forms.push_back({f, reverse_complement_read(fragments[f].second.bases), true});
+        // arm 0: mate one reads forward, mate two is the reverse mate.
+        forward_forms.push_back({f, fragments[f].first.bases, true});
+        reverse_forms.push_back({f, complement_read(fragments[f].second.bases), false});
+        // arm 1: the other way round.
+        forward_forms.push_back({f, fragments[f].second.bases, false});
+        reverse_forms.push_back({f, complement_read(fragments[f].first.bases), true});
         support_by_fragment.push_back(fragment_insert_support(fragments[f], library));
+        // Can the geometry's floor reach this fragment at all? The widest span either mate can
+        // consume is its read length plus the displacement band; if the support's shortest insert
+        // already exceeds that, no admissible insert can fall below a consumed span, and the
+        // consumed-span decomposition cannot change this fragment's likelihood.
+        {
+            const std::size_t widest_span =
+                std::max(fragments[f].first.bases.size(), fragments[f].second.bases.size()) +
+                library.max_gap_bp;
+            const bool binds = support_by_fragment.back().empty() ||
+                               support_by_fragment.back().min_bp < widest_span;
+            floor_binds.push_back(binds ? 1 : 0);
+            if (binds) ++counters.fragments_with_floor_binding;
+        }
         background_by_fragment.push_back(log_background_probability(fragments[f]));
         ++fragments_by_floor[std::max(fragments[f].first.bases.size(),
                                       fragments[f].second.bases.size())];
     }
-    const auto form_slot = [](std::size_t fragment, std::size_t which) {
-        return fragment * 4 + which;   // 0: mate1, 1: rc(mate1), 2: mate2, 3: rc(mate2)
-    };
+    const auto form_slot = [](std::size_t fragment, std::size_t arm) { return fragment * 2 + arm; };
 
-    const std::vector<PieceIndex> indexes =
-        forms.empty() ? std::vector<PieceIndex>{}
-                      : build_piece_indexes(forms, band, options.minimum_piece_bp);
+    // Parallel to each form set: a form takes the exact fast path exactly when its fragment's insert
+    // floor is unreachable. Decided per fragment, once, from declared quantities only -- never from
+    // the data, and never from a tolerance.
+    std::vector<char> forward_componentise(forward_forms.size(), 0);
+    std::vector<char> reverse_componentise(reverse_forms.size(), 0);
+    for (std::size_t i = 0; i < forward_forms.size(); ++i) {
+        forward_componentise[i] = floor_binds[forward_forms[i].fragment];
+    }
+    for (std::size_t i = 0; i < reverse_forms.size(); ++i) {
+        reverse_componentise[i] = floor_binds[reverse_forms[i].fragment];
+    }
+
+    const std::vector<PieceIndex> forward_indexes =
+        forward_forms.empty() ? std::vector<PieceIndex>{}
+                              : build_piece_indexes(forward_forms, band, options.minimum_piece_bp);
+    const std::vector<PieceIndex> reverse_indexes =
+        reverse_forms.empty() ? std::vector<PieceIndex>{}
+                              : build_piece_indexes(reverse_forms, band, options.minimum_piece_bp);
 
     result.seconds_fragment_preparation =
         std::chrono::duration<double>(std::chrono::steady_clock::now() - preparation_mark).count();
@@ -767,72 +1256,125 @@ FragmentScoringResult score_diplotypes(
     const auto place_range = [&](std::size_t first_h, std::size_t last_h,
                                  FragmentScoringCounters& counters) {
     std::map<StateKey, std::uint64_t> states;
+    // Right endpoints reachable from one left endpoint, reused across groups to keep the allocation
+    // out of the inner loop.
+    std::map<std::uint32_t, OriginAccumulator> origins;
     for (std::size_t h = first_h; h < last_h; ++h) {
         // Haplotype and fragment boundaries are the natural places to notice someone else's refusal:
         // both are cheap relative to the work they precede, and a worker that has just finished one
         // haplotype would otherwise start another that can never be used.
         if (budget.stop()) throw PlacementCancelled();
         const std::string& haplotype = haplotypes.sequences[h];
-        if (forms.empty()) continue;
+        if (forward_forms.empty()) continue;
 
-        std::vector<std::vector<FormPlacement>> placements(forms.size());
-        collect_form_placements(haplotype, forms, indexes, budget, band, placements, counters, options);
+        std::vector<std::vector<FormPlacement>> forward_placements(forward_forms.size());
+        collect_form_placements(haplotype, forward_forms, forward_componentise, forward_indexes,
+                                budget, band, library, forward_placements, counters, options);
+
+        // The reverse-role scan runs against the reversed haplotype, which anchors those mates at
+        // their right endpoints. One reversal per haplotype, not per verification.
+        const std::string reversed_haplotype(haplotype.rbegin(), haplotype.rend());
+        std::vector<std::vector<FormPlacement>> reverse_placements(reverse_forms.size());
+        collect_form_placements(reversed_haplotype, reverse_forms, reverse_componentise,
+                                reverse_indexes, budget, band, library, reverse_placements, counters,
+                                options);
+        // Map reversed coordinates back: a class occupying reversed [s, s+consumed) occupies forward
+        // [L-s-consumed, L-s), so its forward-coordinate RIGHT ENDPOINT is L - s. `start` carries
+        // that endpoint from here on, and the list is re-sorted because reversing the axis reverses
+        // the order the two-pointer window below depends on.
+        for (std::vector<FormPlacement>& list : reverse_placements) {
+            for (FormPlacement& placement : list) {
+                placement.start =
+                    static_cast<std::uint32_t>(haplotype.size() - placement.start);
+            }
+            std::sort(list.begin(), list.end(),
+                      [](const FormPlacement& lhs, const FormPlacement& rhs) {
+                          return std::tie(lhs.start, lhs.consumed) <
+                                 std::tie(rhs.start, rhs.consumed);
+                      });
+        }
 
         for (std::size_t f = 0; f < fragments.size(); ++f) {
             if (budget.stop()) throw PlacementCancelled();
-            const std::size_t first_length = fragments[f].first.bases.size();
-            const std::size_t second_length = fragments[f].second.bases.size();
             const InsertSupport& support = support_by_fragment[f];
             if (support.empty()) continue;
             states.clear();
 
-            for (int arm = 0; arm < 2; ++arm) {
+            for (std::size_t arm = 0; arm < 2; ++arm) {
                 // FirstForward: mate one as given is the forward mate, rc(mate two) the reverse one.
-                const std::vector<FormPlacement>& forward =
-                    placements[form_slot(f, arm == 0 ? 0 : 2)];
-                const std::vector<FormPlacement>& reverse =
-                    placements[form_slot(f, arm == 0 ? 3 : 1)];
-                const std::size_t forward_length = arm == 0 ? first_length : second_length;
-                const std::size_t reverse_length = arm == 0 ? second_length : first_length;
+                // `forward` rows carry a START, `reverse` rows carry a RIGHT ENDPOINT.
+                const std::vector<FormPlacement>& forward = forward_placements[form_slot(f, arm)];
+                const std::vector<FormPlacement>& reverse = reverse_placements[form_slot(f, arm)];
                 if (forward.empty() || reverse.empty()) continue;
 
-                for (const FormPlacement& start : forward) {
-                    // reverse_start + reverse_length - forward_start must lie in the support, so the
-                    // reverse starts form one contiguous window. Two-pointer bounds, no map.
-                    const std::size_t lo_end = static_cast<std::size_t>(start.start) +
-                                               std::max(support.min_bp, std::max(forward_length,
-                                                                                 reverse_length));
+                // Forward rows are grouped by start, because one start is one LEFT ENDPOINT and all
+                // of its consumed-span classes are latent explanations of templates anchored there.
+                for (std::size_t first_row = 0; first_row < forward.size();) {
+                    const std::uint32_t forward_start = forward[first_row].start;
+                    std::size_t last_row = first_row;
+                    while (last_row < forward.size() && forward[last_row].start == forward_start) {
+                        ++last_row;
+                    }
+
+                    // insert = right endpoint - left endpoint must lie in the support, so the
+                    // admissible right endpoints form one contiguous window. Two-pointer bounds, no
+                    // map. The window depends only on the left endpoint, so it is derived once per
+                    // group.
+                    //
+                    // No max_gap_bp slack is needed any more, and adding it back would be a mistake.
+                    // The old widening existed only because a reverse START had to be turned into an
+                    // endpoint through a consumed span that was not yet known; the reverse rows now
+                    // carry the endpoint itself, so these bounds are exact. fr_insert_from_endpoints
+                    // still decides admission on the spans actually consumed.
+                    const std::size_t lo_end =
+                        static_cast<std::size_t>(forward_start) + support.min_bp;
                     const std::size_t hi_end =
-                        static_cast<std::size_t>(start.start) + support.max_bp;
-                    if (hi_end < reverse_length) continue;
-                    const std::size_t lo_start =
-                        lo_end < reverse_length ? 0 : lo_end - reverse_length;
-                    const std::size_t hi_start = hi_end - reverse_length;
+                        static_cast<std::size_t>(forward_start) + support.max_bp;
 
                     const auto begin = std::lower_bound(
-                        reverse.begin(), reverse.end(), lo_start,
+                        reverse.begin(), reverse.end(), lo_end,
                         [](const FormPlacement& lhs, std::size_t value) {
                             return lhs.start < value;
                         });
                     const auto end = std::upper_bound(
-                        begin, reverse.end(), hi_start,
+                        begin, reverse.end(), hi_end,
                         [](std::size_t value, const FormPlacement& rhs) {
                             return value < rhs.start;
                         });
-                    for (auto it = begin; it != end; ++it) {
-                        const std::optional<std::size_t> insert = fr_insert_length(
-                            start.start, forward_length, it->start, reverse_length, support);
-                        if (!insert.has_value()) continue;
-                        ++counters.valid_fr_states;
+
+                    // One entry per RIGHT ENDPOINT reachable from this left endpoint. Every latent
+                    // alignment pair that reaches the same right endpoint -- whatever spans the two
+                    // mates consumed on the way -- is another explanation of ONE template, so the
+                    // masses are summed and the origin is counted once. Letting each pair be its own
+                    // origin would manufacture physical copies out of alignment ambiguity.
+                    origins.clear();
+                    for (std::size_t row = first_row; row < last_row; ++row) {
+                        for (auto it = begin; it != end; ++it) {
+                            // Counted whether or not the geometry accepts: this is the pairing WORK
+                            // that admitting indels multiplies, and it has a declared cap of its own.
+                            ++counters.latent_alignment_pairs;
+                            const std::optional<std::size_t> insert = fr_insert_from_endpoints(
+                                forward_start, forward[row].consumed, it->start, it->consumed,
+                                support);
+                            if (!insert.has_value()) continue;
+                            ++counters.valid_fr_states;
+                            origins[static_cast<std::uint32_t>(*insert)].add(
+                                forward[row].emission + it->emission, it->start - it->consumed,
+                                forward[row].consumed, it->consumed, forward[row].mismatches,
+                                it->mismatches);
+                        }
+                    }
+
+                    for (const auto& item : origins) {
                         // Thirty times cooler than piece_hits (9.4M against 320M on C4), so this one
                         // carries an exact shared counter: the work bound is tight, with no batching
                         // overshoot at all. Crossing it cancels every worker rather than letting each
                         // consume a full cap. Refusing here is exact and immediate; acceptance is still
                         // decided later, on the merged totals.
                         ++counters.physical_origins;
-                        const std::uint64_t origins =
+                        const std::uint64_t seen =
                             budget.physical_origins.fetch_add(1, std::memory_order_relaxed) + 1;
-                        if (origins > budget.max_physical_origins) {
+                        if (seen > budget.max_physical_origins) {
                             budget.cancel();
                             throw ResourceExhausted(
                                 "fragment scoring reached its physical-origin cap; no partial "
@@ -840,29 +1382,30 @@ FragmentScoringResult score_diplotypes(
                         }
                         if (budget.stop()) throw PlacementCancelled();
                         StateKey key;
-                        key.insert_bp = static_cast<std::uint32_t>(*insert);
-                        key.forward_mismatches = start.mismatches;
-                        key.reverse_mismatches = it->mismatches;
+                        key.insert_bp = item.first;
                         key.orientation = static_cast<std::uint32_t>(arm);
+                        key.log_latent_mass = item.second.log_latent_mass;
                         ++states[key];
                         if (options.record_origin_summary || record_origins[f] != 0) {
                             FragmentPlacement placement;
-                            placement.forward_start = start.start;
-                            placement.reverse_start = it->start;
-                            placement.insert_bp = *insert;
-                            placement.forward_mismatches = start.mismatches;
-                            placement.reverse_mismatches = it->mismatches;
+                            placement.forward_start = forward_start;
+                            placement.insert_bp = item.first;
+                            placement.log_latent_mass = item.second.log_latent_mass;
+                            placement.latent_alignments = item.second.latent_alignments;
+                            placement.reverse_start = item.second.reverse_start;
+                            placement.forward_mismatches = item.second.forward_mismatches;
+                            placement.reverse_mismatches = item.second.reverse_mismatches;
+                            placement.forward_consumed_bp = item.second.forward_consumed_bp;
+                            placement.reverse_consumed_bp = item.second.reverse_consumed_bp;
                             placement.orientation =
                                 arm == 0 ? MateOrientation::FirstForward : MateOrientation::SecondForward;
                             if (options.record_origin_summary) {
                                 OriginSummary& summary = result.origin_summary[f * unique + h];
                                 ++summary.origins;
                                 const double term =
-                                    kLogMateOrientationPrior + library_insert.log_probability(*insert) +
-                                    log_emission(forward_length, start.mismatches, library.substitution_error) -
-                                    band_mass(forward_length) +
-                                    log_emission(reverse_length, it->mismatches, library.substitution_error) -
-                                    band_mass(reverse_length);
+                                    kLogMateOrientationPrior +
+                                    library_insert.log_probability(item.first) +
+                                    item.second.log_latent_mass;
                                 if (term > summary.best_log_term) {
                                     summary.best_log_term = term;
                                     summary.best = placement;
@@ -871,6 +1414,7 @@ FragmentScoringResult score_diplotypes(
                             if (record_origins[f] != 0) result.recorded_origins[{f, h}].push_back(placement);
                         }
                     }
+                    first_row = last_row;
                 }
             }
             if (states.empty()) continue;
@@ -880,19 +1424,14 @@ FragmentScoringResult score_diplotypes(
 
             double total = kNegInf;
             for (const auto& item : states) {
-                const std::size_t forward_length =
-                    item.first.orientation == 0 ? first_length : second_length;
-                const std::size_t reverse_length =
-                    item.first.orientation == 0 ? second_length : first_length;
                 // Exact log-multiplicity: every origin in this class has an identical mass term, so
                 // multiplying by the count is not an approximation of summing them, it IS the sum.
+                // The emissions are part of the key, so two origins collapse only when their masses
+                // agree exactly -- which is what makes that still true under gapped alignments.
                 const double term =
                     std::log(static_cast<double>(item.second)) + kLogMateOrientationPrior +
                     library_insert.log_probability(item.first.insert_bp) +
-                    log_emission(forward_length, item.first.forward_mismatches,
-                                 library.substitution_error) - band_mass(forward_length) +
-                    log_emission(reverse_length, item.first.reverse_mismatches,
-                                 library.substitution_error) - band_mass(reverse_length);
+                    item.first.log_latent_mass;
                 total = log_add_exp(total, term);
             }
             mass[f * unique + h] = total;
@@ -983,6 +1522,7 @@ FragmentScoringResult score_diplotypes(
             counters.full_read_verifications += part.full_read_verifications;
             counters.accepted_mate_placements += part.accepted_mate_placements;
             counters.valid_fr_states += part.valid_fr_states;
+            counters.latent_alignment_pairs += part.latent_alignment_pairs;
             counters.physical_origins += part.physical_origins;
             counters.statistical_state_classes += part.statistical_state_classes;
         }
@@ -1012,6 +1552,16 @@ FragmentScoringResult score_diplotypes(
         note_observed_work();
         throw ResourceExhausted(
             "fragment scoring reached its statistical-class cap; no partial ranking is returned");
+    }
+    // Like the class cap, an acceptance cap rather than a breaker: the pairs are counted as the
+    // geometry is tested, so a running crossing point would move with the partition. It is declared
+    // separately from the origin cap because indels multiply the pairing work by up to
+    // (2*max_gap_bp+1)^2 per origin, and a bound that cannot be seen is a bound nobody is holding.
+    if (counters.latent_alignment_pairs > options.max_latent_alignment_pairs) {
+        note_observed_work();
+        throw ResourceExhausted(
+            "fragment scoring reached its latent-alignment-pair cap; the declared gap width expands "
+            "the pairing work beyond the cap and no partial ranking is returned");
     }
 
     result.seconds_placement_and_mass =

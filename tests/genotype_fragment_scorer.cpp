@@ -115,9 +115,9 @@ void certify_against_oracle(
             panvar::build_library_insert_distribution(model);
         for (std::size_t h = 0; h < interned.sequences.size(); ++h) {
             const auto placements = panvar::enumerate_placements_exhaustive(
-                interned.sequences[h], fragments[f], support, band);
+                interned.sequences[h], fragments[f], support, model, band);
             const double expected =
-                panvar::log_placement_mass(placements, fragments[f], insert, model, band);
+                panvar::log_placement_mass(placements, fragments[f], insert, model);
             require_close(actual.mass_of(f, h), expected, 1e-9,
                           label + ": accelerated mass must equal the exhaustive mass");
             ++compared;
@@ -288,6 +288,60 @@ void test_candidate_independence() {
             "the fixture must separate candidates, or candidate-independence proves nothing");
 }
 
+// The consumed-span decomposition changes a likelihood ONLY where the geometry's floor
+// -- insert >= the larger consumed span -- can be reached. Above it the mass at an anchor pair
+// factorises into the two mates' whole emissions, so the scorer emits one row per anchor instead of
+// one per span, and the answer is identical. That shortcut is worth roughly (2*max_gap_bp+1)^2 in
+// the pairing loop, which is the difference between a 60-second donor and a 20-minute one.
+//
+// Both branches must therefore be certified against the oracle, which always componentises: if only
+// the componentised branch were exercised the shortcut would be certified by nothing, and if only
+// the fast branch were, the decomposition itself would be.
+void test_both_span_paths_agree_with_the_oracle() {
+    std::mt19937_64 rng(13);
+    const std::string haplotype = random_bases(rng, 420);
+    const panvar::LibraryModel model = library();   // library support [75, 165]
+    require(model.max_gap_bp > 0, "fixture: this gate is empty with gaps closed");
+    const panvar::InternedHaplotypes interned = intern({haplotype});
+    panvar::FragmentScoringOptions options;
+    options.mismatch_band = 2;
+    options.minimum_piece_bp = 8;
+    const panvar::DiscreteInsertDistribution insert =
+        panvar::build_library_insert_distribution(model);
+
+    // 60 bp mates: widest consumed span 63, below the support floor of 75, so the floor is
+    // unreachable and the scorer must take the exact fast path.
+    const std::vector<panvar::ReadPair> unreachable = {
+        {read("n/1", haplotype.substr(40, 60)), read("n/2", revcomp(haplotype.substr(100, 60)))}};
+    // 90 bp fully overlapping mates: the fragment's own floor lifts the support to [90, 165] while
+    // the widest consumed span is 93, so the floor CAN bind and the classes must be carried.
+    const std::vector<panvar::ReadPair> reachable = {
+        {read("w/1", haplotype.substr(200, 90)), read("w/2", revcomp(haplotype.substr(200, 90)))}};
+
+    struct Case { const std::vector<panvar::ReadPair>* fragments; std::uint64_t binding; const char* name; };
+    const Case cases[] = {{&unreachable, 0, "floor unreachable (fast path)"},
+                          {&reachable, 1, "floor reachable (componentised)"}};
+    for (const Case& item : cases) {
+        const panvar::FragmentScoringResult scored =
+            panvar::score_diplotypes(interned, {{0, 0}}, *item.fragments, model, options);
+        require(scored.counters.fragments_with_floor_binding == item.binding,
+                std::string("fixture: ") + item.name +
+                    " must select the branch it names, or this gate certifies the wrong path");
+        const panvar::InsertSupport support =
+            panvar::fragment_insert_support((*item.fragments)[0], model);
+        const auto placements = panvar::enumerate_placements_exhaustive(
+            haplotype, (*item.fragments)[0], support, model, options.mismatch_band);
+        const double expected =
+            panvar::log_placement_mass(placements, (*item.fragments)[0], insert, model);
+        require(std::isfinite(expected), "fixture: the fragment must place, or nothing is compared");
+        require_close(scored.mass_of(0, 0), expected, 1e-9,
+                      std::string("the scorer must equal the always-componentised oracle on the ") +
+                          item.name + " branch");
+        std::cout << "  " << item.name << ": scorer mass " << scored.mass_of(0, 0)
+                  << " = oracle mass " << expected << '\n';
+    }
+}
+
 void test_homozygote_counts_two_copies() {
     std::mt19937_64 rng(555);
     const std::string a = random_bases(rng, 380);
@@ -420,11 +474,18 @@ void test_counters_are_measured() {
             "both mates of every planted fragment must place");
     require(counters.physical_origins >= counters.statistical_state_classes,
             "compression can only ever reduce the class count below the origin count");
+    // The pairing work admitting indels creates, measured rather than assumed negligible.
+    require(counters.latent_alignment_pairs >= counters.valid_fr_states,
+            "tested latent alignment pairs cannot be fewer than the accepted ones");
+    require(counters.valid_fr_states >= counters.physical_origins,
+            "accepted pairs collapse onto origins, so they cannot be the fewer of the two");
     std::cout << "  counters: scanned=" << counters.candidate_bases_scanned
               << " piece_hits=" << counters.piece_hits
               << " proposed=" << counters.proposed_starts
               << " unique=" << counters.unique_starts
               << " verified=" << counters.full_read_verifications
+              << " tested_pairs=" << counters.latent_alignment_pairs
+              << " accepted_pairs=" << counters.valid_fr_states
               << " origins=" << counters.physical_origins
               << " classes=" << counters.statistical_state_classes << '\n';
 }
@@ -670,6 +731,9 @@ void test_resource_caps_refuse_without_partial_output() {
     capped.max_state_classes = 1;
     expect_exhausted(capped, "state-class");
     capped = base;
+    capped.max_latent_alignment_pairs = 1;
+    expect_exhausted(capped, "latent-alignment-pair");
+    capped = base;
     capped.max_mass_cells = 1;
     expect_exhausted(capped, "mass-cell");
 
@@ -677,6 +741,198 @@ void test_resource_caps_refuse_without_partial_output() {
     capped.max_physical_origins = 0;
     require_throws([&] { panvar::score_diplotypes(interned, {{0, 0}}, fragments, model, capped); },
                    "a zero resource cap is a malformed declaration and must refuse");
+    capped = base;
+    capped.max_latent_alignment_pairs = 0;
+    require_throws([&] { panvar::score_diplotypes(interned, {{0, 0}}, fragments, model, capped); },
+                   "a zero latent-alignment-pair cap is a malformed declaration and must refuse");
+}
+
+// GATE 4. Reads simulated from either candidate must prefer the candidate they came from -- with the
+// two candidates separated by a one-base homopolymer insertion, which is precisely the difference a
+// substitution-only emission could not see. Under that emission a read spanning the indel lost every
+// placement on its OWN source and fell to the background, which is how NA19240's two-edit allele lost
+// to a sixteen-edit one.
+void test_reads_prefer_their_source_candidate() {
+    std::mt19937_64 rng(31337);
+    std::string a = random_bases(rng, 520);
+    a.replace(200, 8, "TTTTTTTT");          // a homopolymer for the indel to live in
+    std::string b = a;
+    b.insert(204, "T");                     // one extra base: every downstream base shifts
+    b[330] = b[330] == 'A' ? 'C' : 'A';     // and one plain substitution
+
+    const auto reads_from = [&](const std::string& source, const std::string& tag) {
+        std::vector<panvar::ReadPair> out;
+        for (std::size_t start = 120; start + 125 < source.size() && start < 300; start += 8) {
+            out.push_back({read(tag + "/1", source.substr(start, 60)),
+                           read(tag + "/2", revcomp(source.substr(start + 60, 60)))});
+        }
+        return out;
+    };
+
+    const panvar::InternedHaplotypes interned = intern({a, b});
+    panvar::FragmentScoringOptions options;
+    options.mismatch_band = 6;
+    options.minimum_piece_bp = 8;
+    const panvar::LibraryModel model = library();
+    require(model.max_gap_bp > 0, "fixture: this gate is meaningless with gaps closed");
+    const std::vector<panvar::HaplotypeCandidate> candidates = {{0, 0}, {1, 1}};
+
+    const std::vector<panvar::ReadPair> a_reads = reads_from(a, "a");
+    const std::vector<panvar::ReadPair> b_reads = reads_from(b, "b");
+    require(!a_reads.empty() && a_reads.size() == b_reads.size(),
+            "fixture: both read sets must be non-empty and comparable");
+
+    const panvar::FragmentScoringResult from_a =
+        panvar::score_diplotypes(interned, candidates, a_reads, model, options);
+    require(from_a.scores[0].log_likelihood > from_a.scores[1].log_likelihood,
+            "reads simulated from A must prefer A");
+    const panvar::FragmentScoringResult from_b =
+        panvar::score_diplotypes(interned, candidates, b_reads, model, options);
+    require(from_b.scores[1].log_likelihood > from_b.scores[0].log_likelihood,
+            "reads simulated from B must prefer B");
+
+    // Non-vacuity, and the heart of the matter: the reads that span the indel must actually PLACE on
+    // their own source. Under the substitution-only emission they placed on neither.
+    std::size_t spanning = 0;
+    std::size_t placed = 0;
+    for (std::size_t f = 0; f < b_reads.size(); ++f) {
+        const std::size_t start = 120 + f * 8;
+        if (start > 204 || start + 120 < 205) continue;   // does this fragment straddle the indel?
+        ++spanning;
+        if (from_b.mass_of(f, 1) != kNegInf) ++placed;
+    }
+    require(spanning > 0, "fixture: some fragment must span the planted indel");
+    require(placed == spanning,
+            "every fragment spanning the indel must place on the haplotype it came from; losing "
+            "them to the background is the NA19240 defect");
+    std::cout << "  generator preference: A-reads favour A by "
+              << from_a.scores[0].log_likelihood - from_a.scores[1].log_likelihood
+              << " nats, B-reads favour B by "
+              << from_b.scores[1].log_likelihood - from_b.scores[0].log_likelihood << " nats; "
+              << placed << "/" << spanning << " indel-spanning fragments placed\n";
+}
+
+// GATE 6. One physical template read in either library orientation is the same template. Swapping
+// which mate is named first must therefore leave the mass exactly unchanged -- the two arms each
+// carry half, so exchanging them is a relabelling and nothing else.
+void test_orientation_roles_are_symmetric() {
+    std::mt19937_64 rng(2718);
+    const std::string haplotype = random_bases(rng, 420);
+    const panvar::InternedHaplotypes interned = intern({haplotype});
+    panvar::FragmentScoringOptions options;
+    options.mismatch_band = 3;
+    options.minimum_piece_bp = 8;
+    const panvar::LibraryModel model = library();
+
+    std::vector<panvar::ReadPair> direct;
+    std::vector<panvar::ReadPair> swapped;
+    for (std::size_t start : {30, 140, 250}) {
+        const std::string left = haplotype.substr(start, 55);
+        const std::string right = revcomp(haplotype.substr(start + 65, 55));
+        direct.push_back({read("f/1", left), read("f/2", right)});
+        // The same physical fragment, with the mate roles exchanged.
+        swapped.push_back({read("f/1", right), read("f/2", left)});
+    }
+    const panvar::FragmentScoringResult a =
+        panvar::score_diplotypes(interned, {{0, 0}}, direct, model, options);
+    const panvar::FragmentScoringResult b =
+        panvar::score_diplotypes(interned, {{0, 0}}, swapped, model, options);
+    for (std::size_t f = 0; f < direct.size(); ++f) {
+        require(a.mass_of(f, 0) != kNegInf, "fixture: the planted fragments must place");
+        require_close(a.mass_of(f, 0), b.mass_of(f, 0), 1e-12,
+                      "exchanging the mate roles must not change a fragment's mass: each "
+                      "orientation carries exactly half, so the swap is a relabelling");
+    }
+    require_close(a.scores[0].log_likelihood, b.scores[0].log_likelihood, 1e-12,
+                  "nor may it change the candidate score");
+}
+
+// GATES 7 and 10. Multiplicity counts PLACES. Alternative gapped alignments of one place are latent
+// explanations and must be summed into it, never counted as extra physical copies -- otherwise a
+// repeat-free locus acquires phantom copy number the moment gaps are opened.
+//
+// The pairing work this creates is bounded and measured here rather than assumed negligible: for one
+// left endpoint and one insert, the forward mate has at most 2d+1 consumed spans and the reverse mate
+// at most 2d+1 that reach the same right endpoint, so accepted geometries per physical origin cannot
+// exceed (2d+1)^2 -- 49 at the production max_gap_bp of 3.
+void test_multiplicity_counts_places_not_alignments() {
+    std::mt19937_64 rng(29);
+    const std::string unit = random_bases(rng, 130);
+    const std::string spacer = random_bases(rng, 40);
+    const std::string two = spacer + unit + spacer + unit + spacer;
+    const std::string three = spacer + unit + spacer + unit + spacer + unit + spacer;
+
+    const panvar::InternedHaplotypes interned = intern({two, three});
+    panvar::FragmentScoringOptions options;
+    options.mismatch_band = 3;
+    options.minimum_piece_bp = 8;
+
+    // Production-like geometry: the insert support starts at 75 while the widest consumed span is
+    // 58, so the geometry's floor is unreachable and the scorer takes the exact fast path. A real
+    // library lives here -- 350 bp inserts against 100 bp reads -- and there is NO pairing expansion
+    // in this regime, which is the whole point of the shortcut.
+    const std::vector<panvar::ReadPair> wide_insert = {
+        {read("r/1", unit.substr(0, 55)), read("r/2", revcomp(unit.substr(65, 55)))}};
+    // Tight geometry: a short insert support brings the floor within reach of a gapped span, so the
+    // consumed-span classes must be carried separately and the pairing genuinely expands.
+    panvar::LibraryModel tight_library = library();
+    tight_library.insert_mean_bp = 70.0;
+    tight_library.insert_sd_bp = 5.0;
+    tight_library.support_sigmas = 3.0;            // support [55, 85] against a widest span of 58
+    const std::vector<panvar::ReadPair> tight_insert = {
+        {read("t/1", unit.substr(0, 55)), read("t/2", revcomp(unit.substr(15, 55)))}};
+
+    std::size_t expanded = 0;
+    std::size_t collapsed = 0;
+    for (std::size_t max_gap : {0, 3}) {
+        for (int which = 0; which < 2; ++which) {
+            panvar::LibraryModel model = which == 0 ? library() : tight_library;
+            model.max_gap_bp = max_gap;
+            const std::vector<panvar::ReadPair>& fragments =
+                which == 0 ? wide_insert : tight_insert;
+            const panvar::FragmentScoringResult result =
+                panvar::score_diplotypes(interned, {{0, 0}}, fragments, model, options);
+
+            // Multiplicity counts PLACES. Three copies against two must carry log(3/2) more mass,
+            // whether or not each place is explained by several latent alignments.
+            require_close(result.mass_of(0, 1) - result.mass_of(0, 0), std::log(3.0 / 2.0), 0.02,
+                          "placement mass must scale with copy number, not with the number of "
+                          "latent alignments per copy");
+
+            const panvar::FragmentScoringCounters& c = result.counters;
+            require(c.physical_origins > 0 && c.valid_fr_states > 0,
+                    "fixture: the repeat must produce origins");
+            const std::uint64_t width = 2 * static_cast<std::uint64_t>(max_gap) + 1;
+            require(c.valid_fr_states <= c.physical_origins * width * width,
+                    "accepted geometries per physical origin cannot exceed (2*max_gap_bp+1)^2");
+            require(c.latent_alignment_pairs >= c.valid_fr_states,
+                    "tested pairs cannot be fewer than accepted ones");
+            if (max_gap == 0 || c.fragments_with_floor_binding == 0) {
+                // Either no gapped span exists at all, or the floor is unreachable and the scorer
+                // collapses the spans exactly. One latent alignment per origin, by construction.
+                require(c.valid_fr_states == c.physical_origins,
+                        "with no reachable insert floor every origin must carry exactly one latent "
+                        "alignment: that is what the exact fast path means");
+                ++collapsed;
+            } else {
+                require(c.valid_fr_states > c.physical_origins,
+                        "with the floor reachable and gaps open, some origin must be explained by "
+                        "several latent alignments, or the componentised branch is untested");
+                ++expanded;
+            }
+            std::cout << "  multiplicity max_gap=" << max_gap
+                      << (which == 0 ? " wide-insert " : " tight-insert")
+                      << ": floor_binding=" << c.fragments_with_floor_binding
+                      << " origins=" << c.physical_origins
+                      << " accepted_pairs=" << c.valid_fr_states
+                      << " tested_pairs=" << c.latent_alignment_pairs << '\n';
+        }
+    }
+    // Both branches must actually run here. If only one did, the other is measured by nothing --
+    // which is how the previous version of this gate came to assert a premise the fast path had
+    // already made false.
+    require(expanded > 0 && collapsed > 0,
+            "both the expanding and the collapsed branch must be exercised by this gate");
 }
 
 } // namespace
@@ -690,6 +946,10 @@ int main() {
         test_mixed_read_lengths();
         test_random_sweep();
         test_candidate_independence();
+        test_reads_prefer_their_source_candidate();
+        test_orientation_roles_are_symmetric();
+        test_multiplicity_counts_places_not_alignments();
+        test_both_span_paths_agree_with_the_oracle();
         test_homozygote_counts_two_copies();
         test_exposure_uses_read_length_distribution();
         test_refusals();

@@ -38,6 +38,28 @@ struct LibraryModel {
     // Fragment-start intensity per haplotype base: lambda in the fragment contract. This is a
     // fragment-start rate, not a marker depth, and the two must not be conflated.
     double fragment_start_intensity = 0.0;
+
+    // ---------------------------------------------------------------------------------------
+    // Indel model. These are part of the declared emission, not a search tolerance.
+    //
+    // A read is generated from a haplotype window by a three-state process: match/mismatch, an
+    // insertion that consumes a read base only, and a deletion that consumes a haplotype base only.
+    // `gap_open` is the per-position probability of beginning an insertion AND, separately, of
+    // beginning a deletion, so a match position continues as a match with probability
+    // 1 - 2*gap_open. `gap_extend` is the probability an open gap continues.
+    //
+    // `max_gap_bp` is the declared band on net displacement: over the whole alignment the number of
+    // haplotype bases consumed may differ from the read length by at most this much. At zero the
+    // emission is EXACTLY the substitution-only truncated model, which is gated as an equality
+    // rather than as an approximation.
+    //
+    // Why these defaults: the reads this scores are Illumina-like, where indels are rare and short.
+    // They are declared here, with the rest of the model, because changing them changes the
+    // likelihood -- exactly as changing the mismatch band does.
+    double gap_open = 1e-4;
+    double gap_extend = 0.5;
+    std::size_t max_gap_bp = 3;
+
     std::string provenance;
 };
 

@@ -970,14 +970,37 @@ std::vector<panvar::ReadPair> simulate_from(const std::vector<std::string>& hapl
 
 // Every accepted origin found by scanning every start position -- no seed index. The Hamming count and
 // FR geometry are the shared primitives; the search is independent of the pigeonhole index.
+// Every field a placement carries must be filled here, not left defaulted. log_placement_mass no
+// longer recomputes an emission from a mismatch count, so a producer that forgets the emission gets
+// zeros and a SILENTLY wrong mass rather than a compile error -- and this scan exists precisely to
+// cross-check the accelerated scorer, so a silent zero would make the two paths agree for the wrong
+// reason.
 std::vector<panvar::FragmentPlacement> scan_origins(const std::string& haplotype, const panvar::ReadPair& fragment,
-                                                    const panvar::InsertSupport& support, std::size_t band) {
+                                                    const panvar::InsertSupport& support,
+                                                    const panvar::LibraryModel& library, std::size_t band) {
+    struct Hit {
+        std::size_t start = 0;
+        panvar::GappedFit fit;
+    };
+    // The forward mate is anchored at its START and the reverse mate at its RIGHT ENDPOINT, because
+    // that is how the template was sequenced and how the production path scores it. Anchoring both
+    // at a start would make this cross-check disagree with production wherever an alignment is
+    // gapped -- silently, since both would still be proper distributions.
     const auto starts = [&](const std::string& read) {
-        std::vector<std::pair<std::size_t, std::size_t>> out;
-        if (haplotype.size() < read.size()) return out;
-        for (std::size_t p = 0; p + read.size() <= haplotype.size(); ++p) {
-            const auto mismatches = panvar::count_mismatches(haplotype, read, p, band);
-            if (mismatches.has_value()) out.emplace_back(p, *mismatches);
+        std::vector<Hit> out;
+        if (haplotype.empty()) return out;
+        for (std::size_t p = 0; p < haplotype.size(); ++p) {
+            const auto fit = panvar::gapped_emission(haplotype, read, p, library, band);
+            if (fit.has_value() && std::isfinite(fit->log_emission)) out.push_back({p, *fit});
+        }
+        return out;
+    };
+    const auto ends = [&](const std::string& read) {
+        std::vector<Hit> out;
+        if (haplotype.empty()) return out;
+        for (std::size_t p = 0; p <= haplotype.size(); ++p) {
+            const auto fit = panvar::gapped_emission_ending_at(haplotype, read, p, library, band);
+            if (fit.has_value() && std::isfinite(fit->log_emission)) out.push_back({p, *fit});
         }
         return out;
     };
@@ -988,28 +1011,69 @@ std::vector<panvar::FragmentPlacement> scan_origins(const std::string& haplotype
         const std::string& forward = arm == 0 ? fragment.first.bases : fragment.second.bases;
         const std::string& reverse = arm == 0 ? rc2 : rc1;
         const auto f_starts = starts(forward);
-        const auto r_starts = starts(reverse);
+        const auto r_ends = ends(reverse);
+        // (left endpoint, insert) -> the summed mass of every latent alignment pair reaching those
+        // two template ends. This scan exists to cross-check the production collapse, so it must
+        // collapse the same way: alternative alignments of one template are ONE origin, and pairing
+        // them without collapsing would report alignment ambiguity as extra physical copies.
+        struct Accumulated {
+            double log_latent_mass = -std::numeric_limits<double>::infinity();
+            std::size_t latent_alignments = 0;
+            double best_pair = -std::numeric_limits<double>::infinity();
+            std::size_t reverse_start = 0;
+            std::size_t forward_consumed_bp = 0;
+            std::size_t reverse_consumed_bp = 0;
+            std::size_t forward_mismatches = 0;
+            std::size_t reverse_mismatches = 0;
+        };
+        std::map<std::pair<std::size_t, std::size_t>, Accumulated> origins;
         for (const auto& fs : f_starts) {
-            for (const auto& rs : r_starts) {
-                const auto insert = panvar::fr_insert_length(fs.first, forward.size(), rs.first, reverse.size(), support);
-                if (!insert.has_value()) continue;
-                panvar::FragmentPlacement placement;
-                placement.forward_start = fs.first;
-                placement.reverse_start = rs.first;
-                placement.insert_bp = *insert;
-                placement.forward_mismatches = fs.second;
-                placement.reverse_mismatches = rs.second;
-                placement.orientation = arm == 0 ? panvar::MateOrientation::FirstForward : panvar::MateOrientation::SecondForward;
-                out.push_back(placement);
+            for (const auto& rs : r_ends) {
+                for (const auto& forward_span : fs.fit.components) {
+                    for (const auto& reverse_span : rs.fit.components) {
+                        const auto insert = panvar::fr_insert_from_endpoints(
+                            fs.start, forward_span.consumed_bp,
+                            rs.start, reverse_span.consumed_bp, support);
+                        if (!insert.has_value()) continue;
+                        Accumulated& origin = origins[{fs.start, *insert}];
+                        const double pair = forward_span.log_emission + reverse_span.log_emission;
+                        origin.log_latent_mass = panvar::log_add_exp(origin.log_latent_mass, pair);
+                        ++origin.latent_alignments;
+                        if (pair <= origin.best_pair) continue;
+                        origin.best_pair = pair;
+                        origin.reverse_start = rs.start - reverse_span.consumed_bp;
+                        origin.forward_consumed_bp = forward_span.consumed_bp;
+                        origin.reverse_consumed_bp = reverse_span.consumed_bp;
+                        origin.forward_mismatches = forward_span.edits;
+                        origin.reverse_mismatches = reverse_span.edits;
+                    }
+                }
             }
+        }
+        for (const auto& item : origins) {
+            panvar::FragmentPlacement placement;
+            placement.forward_start = item.first.first;
+            placement.insert_bp = item.first.second;
+            placement.log_latent_mass = item.second.log_latent_mass;
+            placement.latent_alignments = item.second.latent_alignments;
+            placement.reverse_start = item.second.reverse_start;
+            placement.forward_mismatches = item.second.forward_mismatches;
+            placement.reverse_mismatches = item.second.reverse_mismatches;
+            placement.forward_consumed_bp = item.second.forward_consumed_bp;
+            placement.reverse_consumed_bp = item.second.reverse_consumed_bp;
+            placement.orientation = arm == 0 ? panvar::MateOrientation::FirstForward : panvar::MateOrientation::SecondForward;
+            out.push_back(placement);
         }
     }
     return out;
 }
 
+// A physical origin is identified by its two template ends and its orientation. The reverse start and
+// the mismatch counts describe whichever latent alignment carried the most mass, which is a property
+// of the explanation rather than of the place, so they are deliberately NOT part of the identity: two
+// implementations that agree on the origins may legitimately pick different best alignments.
 auto placement_key(const panvar::FragmentPlacement& p) {
-    return std::make_tuple(static_cast<int>(p.orientation), p.forward_start, p.reverse_start, p.insert_bp,
-                           p.forward_mismatches, p.reverse_mismatches);
+    return std::make_tuple(static_cast<int>(p.orientation), p.forward_start, p.insert_bp);
 }
 
 struct EditRun {
@@ -1322,7 +1386,7 @@ int compare(const Args& args) {
     for (std::size_t i = 0; i < checked; ++i) {
         const panvar::InsertSupport support = panvar::fragment_insert_support(subset[i], library);
         for (std::size_t h = 0; h < all.sequences.size(); ++h) {
-            auto scanned = scan_origins(all.sequences[h], subset[i], support, band);
+            auto scanned = scan_origins(all.sequences[h], subset[i], support, library, band);
             const auto found = recorded.recorded_origins.find({i, h});
             auto produced = found == recorded.recorded_origins.end() ? std::vector<panvar::FragmentPlacement>{} : found->second;
             const auto order = [](const panvar::FragmentPlacement& x, const panvar::FragmentPlacement& y) {
@@ -1336,7 +1400,7 @@ int compare(const Args& args) {
             }
             if (!identical) ++identity_mismatch;
             origins_compared += scanned.size();
-            const double scanned_mass = panvar::log_placement_mass(scanned, subset[i], insert, library, band);
+            const double scanned_mass = panvar::log_placement_mass(scanned, subset[i], insert, library);
             const double production_mass = recorded.mass_of(i, h);
             const double full_mass = together.mass_of(rows[i].fragment, h);
             const bool masses_agree =

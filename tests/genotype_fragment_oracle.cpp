@@ -54,6 +54,10 @@ panvar::SequencingRead read(const std::string& name, const std::string& bases) {
     return {name, bases, std::string(bases.size(), 'I')};
 }
 
+// The substitution-only fixture library: gaps are CLOSED here deliberately. Every gate below that
+// asserts an exact placement count, an exact mismatch value or an exact normalisation identity was
+// written against the substitution-only model, and those statements stay true only while the
+// displacement band is zero. Gates that mean to open gaps use gap_library() and say so.
 panvar::LibraryModel library(double error = 0.01, double outlier = 0.001) {
     panvar::LibraryModel model;
     model.insert_mean_bp = 20.0;
@@ -62,6 +66,7 @@ panvar::LibraryModel library(double error = 0.01, double outlier = 0.001) {
     model.substitution_error = error;
     model.outlier_weight = outlier;
     model.fragment_start_intensity = 0.05;
+    model.max_gap_bp = 0;
     model.provenance = "fixture: declared";
     return model;
 }
@@ -175,7 +180,7 @@ void test_single_origin() {
     const panvar::InsertSupport support{16, 30};
 
     const auto placements =
-        panvar::enumerate_placements_exhaustive(haplotype, fragment, support, 0);
+        panvar::enumerate_placements_exhaustive(haplotype, fragment, support, library(), 0);
     require(placements.size() == 1, "one planted origin must yield exactly one placement");
     const panvar::FragmentPlacement& only = placements.front();
     require(only.orientation == panvar::MateOrientation::FirstForward,
@@ -194,17 +199,26 @@ void test_single_origin() {
     // At band zero a perfect mate's truncated emission is (1-e)^8 / (1-e)^8 = 1, so the mass is the
     // insert probability times the 1/2 orientation prior, and nothing else.
     require_close(
-        panvar::log_placement_mass(placements, fragment, insert, model, 0),
+        panvar::log_placement_mass(placements, fragment, insert, model),
         std::log(1.0 / 15.0) + std::log(0.5), 1e-12,
         "single-origin mass is the insert probability times the orientation prior");
-    // At band one the same origin keeps only the fraction of emission mass the band admits.
+    // A wider band still renormalises each mate by the binomial mass it admits -- but the band now
+    // acts where the placement is made, not where it is scored, so the claim is asserted on the
+    // emission itself. Re-enumerating at band one would also admit other one-mismatch origins and
+    // change the mass for a second, unrelated reason, which would test two things at once.
     const double e = model.substitution_error;
-    require_close(
-        panvar::log_placement_mass(placements, fragment, insert, model, 1),
-        std::log(1.0 / 15.0) + std::log(0.5) +
-            2.0 * (8.0 * std::log(1.0 - e) - std::log(std::pow(1.0 - e, 8) + 8.0 * e * std::pow(1.0 - e, 7))),
-        1e-12,
-        "a wider band renormalises each mate by the binomial mass it admits");
+    const double admitted =
+        std::log(std::pow(1.0 - e, 8) + 8.0 * e * std::pow(1.0 - e, 7));   // F(1, 8)
+    const auto exact_at_band_zero =
+        panvar::gapped_emission(haplotype, fragment.first.bases, 4, model, 0);
+    const auto exact_at_band_one =
+        panvar::gapped_emission(haplotype, fragment.first.bases, 4, model, 1);
+    require(exact_at_band_zero.has_value() && exact_at_band_one.has_value(),
+            "the planted mate must place under both bands");
+    require_close(exact_at_band_zero->log_emission, 0.0, 1e-12,
+                  "at band zero a perfect mate is the only admitted sequence, so its emission is one");
+    require_close(exact_at_band_one->log_emission, 8.0 * std::log(1.0 - e) - admitted, 1e-12,
+                  "a wider band renormalises each mate by the binomial mass it admits");
 }
 
 // The other library orientation must be populated, not quietly skipped. The physical template spans
@@ -223,9 +237,11 @@ void test_both_orientations() {
         read("f/1", right_reverse), read("f/2", left_forward)};
 
     const auto arm_a =
-        panvar::enumerate_placements_exhaustive(haplotype, first_reads_left, support, 0);
+        panvar::enumerate_placements_exhaustive(haplotype, first_reads_left, support,
+                                                library(), 0);
     const auto arm_b =
-        panvar::enumerate_placements_exhaustive(haplotype, second_reads_left, support, 0);
+        panvar::enumerate_placements_exhaustive(haplotype, second_reads_left, support,
+                                                library(), 0);
     require(arm_a.size() == 1 && arm_b.size() == 1,
             "the same physical fragment must be found whichever mate read the left end");
     require(arm_a.front().orientation == panvar::MateOrientation::FirstForward,
@@ -250,7 +266,7 @@ void test_repeat_multiplicity() {
     const panvar::InsertSupport support{20, 28};
 
     const auto placements =
-        panvar::enumerate_placements_exhaustive(haplotype, fragment, support, 0);
+        panvar::enumerate_placements_exhaustive(haplotype, fragment, support, library(), 0);
     require(placements.size() == 2, "two identical repeat copies must yield two physical origins");
     require(placements[0].forward_start != placements[1].forward_start,
             "the two origins must be at distinct coordinates");
@@ -265,8 +281,8 @@ void test_repeat_multiplicity() {
     insert.log_probability_by_offset.assign(support.max_bp - support.min_bp + 1,
                                             std::log(1.0 / 9.0));
     const panvar::LibraryModel model = library();
-    const double both = panvar::log_placement_mass(placements, fragment, insert, model, 0);
-    const double one = panvar::log_placement_mass({placements[0]}, fragment, insert, model, 0);
+    const double both = panvar::log_placement_mass(placements, fragment, insert, model);
+    const double one = panvar::log_placement_mass({placements[0]}, fragment, insert, model);
     require_close(both, one + std::log(2.0), 1e-12,
                   "two origins with equal statistics must contribute exactly twice the mass: "
                   "collapsing them to one would discard real evidence");
@@ -281,10 +297,11 @@ void test_band_is_model() {
     const panvar::ReadPair fragment{read("f/1", mate1), read("f/2", mate2)};
     const panvar::InsertSupport support{16, 30};
 
-    require(panvar::enumerate_placements_exhaustive(haplotype, fragment, support, 0).empty(),
+    require(panvar::enumerate_placements_exhaustive(haplotype, fragment, support,
+                                                    library(), 0).empty(),
             "a band of zero omits the mismatching origin entirely");
     const auto banded =
-        panvar::enumerate_placements_exhaustive(haplotype, fragment, support, 1);
+        panvar::enumerate_placements_exhaustive(haplotype, fragment, support, library(), 1);
     require(banded.size() == 1 && banded.front().forward_mismatches == 1,
             "widening the band to one admits exactly that origin");
 
@@ -292,8 +309,8 @@ void test_band_is_model() {
     insert.support = support;
     insert.log_probability_by_offset.assign(15, std::log(1.0 / 15.0));
     const panvar::LibraryModel model = library();
-    const double narrow = panvar::log_placement_mass({}, fragment, insert, model, 0);
-    const double wide = panvar::log_placement_mass(banded, fragment, insert, model, 1);
+    const double narrow = panvar::log_placement_mass({}, fragment, insert, model);
+    const double wide = panvar::log_placement_mass(banded, fragment, insert, model);
     require(narrow == kNegInf && std::isfinite(wide),
             "the band changes the mass, so it is part of the model and not an optimisation");
 }
@@ -309,8 +326,8 @@ void test_homozygote_counts_two_copies() {
     const panvar::LibraryModel model = library();
 
     const auto placements =
-        panvar::enumerate_placements_exhaustive(haplotype, fragment, support, 0);
-    const double one_copy = panvar::log_placement_mass(placements, fragment, insert, model, 0);
+        panvar::enumerate_placements_exhaustive(haplotype, fragment, support, model, 0);
+    const double one_copy = panvar::log_placement_mass(placements, fragment, insert, model);
     const double two_copies = panvar::log_add_exp(one_copy, one_copy);
     require_close(two_copies, one_copy + std::log(2.0), 1e-12,
                   "a homozygote's mass is twice one chromosome copy's");
@@ -334,15 +351,18 @@ void test_order_and_uniqueness() {
     insert.log_probability_by_offset.assign(9, std::log(1.0 / 9.0));
     const panvar::LibraryModel model = library();
 
-    auto placements = panvar::enumerate_placements_exhaustive(haplotype, fragment, support, 0);
-    const double forward = panvar::log_placement_mass(placements, fragment, insert, model, 0);
+    auto placements = panvar::enumerate_placements_exhaustive(haplotype, fragment, support, model, 0);
+    const double forward = panvar::log_placement_mass(placements, fragment, insert, model);
     std::reverse(placements.begin(), placements.end());
-    require_close(panvar::log_placement_mass(placements, fragment, insert, model, 0), forward, 1e-12,
+    require_close(panvar::log_placement_mass(placements, fragment, insert, model), forward, 1e-12,
                   "placement order must not change the summed mass");
 
+    // An origin is its two template ends plus the orientation. Keying on the reverse START instead
+    // would be wrong now: several reverse starts reach the same right endpoint by consuming
+    // different numbers of bases, and those are one place, not several.
     std::set<std::tuple<std::size_t, std::size_t, int>> distinct;
     for (const panvar::FragmentPlacement& placement : placements) {
-        distinct.emplace(placement.forward_start, placement.reverse_start,
+        distinct.emplace(placement.forward_start, placement.insert_bp,
                          static_cast<int>(placement.orientation));
     }
     require(distinct.size() == placements.size(),
@@ -374,65 +394,8 @@ void test_truncated_emission_normalises() {
     }
 }
 
-// The normalisation gate. Summing the signal mass over EVERY possible observation with fixed read
-// lengths must reproduce the exposure exactly: the -lambda*E term and the fragment density describe
-// the same generated process only if this holds. Checked at a band that truncates and at one that
-// does not. Each orientation arm must carry exactly half, which is what proves the 1/2 prior is where
-// it belongs rather than compensated somewhere else.
-void test_signal_density_integrates_to_exposure() {
-    const std::string haplotype = "ACGTTGCAAGTCCA";   // L = 14
-    panvar::LibraryModel model;
-    model.insert_mean_bp = 8.0;
-    model.insert_sd_bp = 2.0;
-    model.support_sigmas = 2.0;          // support [4, 12]
-    model.substitution_error = 0.1;
-    model.outlier_weight = 0.001;
-    model.fragment_start_intensity = 0.05;
-    model.provenance = "fixture: declared";
-    const panvar::DiscreteInsertDistribution insert = panvar::build_library_insert_distribution(model);
-    require(insert.support.min_bp == 4 && insert.support.max_bp == 12,
-            "fixture: the library support must be [4,12]");
-
-    const std::size_t mate = 3;
-    const double exposure = panvar::haplotype_exposure(haplotype.size(), insert, mate);
-    require(exposure > 0.0, "fixture: exposure must be positive, or the identity is vacuous");
-
-    for (std::size_t band : {1, 3}) {
-        double total = 0.0;
-        double first_forward = 0.0;
-        std::size_t observations = 0;
-        for (std::size_t code1 = 0; code1 < 64; ++code1) {
-            for (std::size_t code2 = 0; code2 < 64; ++code2) {
-                std::string r1(mate, 'A');
-                std::string r2(mate, 'A');
-                for (std::size_t i = 0; i < mate; ++i) {
-                    r1[i] = "ACGT"[(code1 >> (2 * i)) & 3];
-                    r2[i] = "ACGT"[(code2 >> (2 * i)) & 3];
-                }
-                const panvar::ReadPair fragment{read("o/1", r1), read("o/2", r2)};
-                const panvar::InsertSupport support = panvar::fragment_insert_support(fragment, model);
-                const auto placements =
-                    panvar::enumerate_placements_exhaustive(haplotype, fragment, support, band);
-                const double mass = panvar::log_placement_mass(placements, fragment, insert, model, band);
-                if (mass != kNegInf) total += std::exp(mass);
-                std::vector<panvar::FragmentPlacement> arm;
-                for (const auto& p : placements) {
-                    if (p.orientation == panvar::MateOrientation::FirstForward) arm.push_back(p);
-                }
-                const double arm_mass = panvar::log_placement_mass(arm, fragment, insert, model, band);
-                if (arm_mass != kNegInf) first_forward += std::exp(arm_mass);
-                ++observations;
-            }
-        }
-        require(observations == 4096, "the gate must sum over every possible observation");
-        require_close(total, exposure, 1e-9,
-                      "the signal density summed over every observation must equal the exposure");
-        require_close(first_forward, 0.5 * exposure, 1e-9,
-                      "each library orientation must carry exactly half of the exposure");
-        std::cout << "  normalisation at band " << band << ": integrated mass " << total
-                  << " = exposure " << exposure << '\n';
-    }
-}
+// The normalisation gate now lives after gap_library(), because it must be run with gaps genuinely
+// open across a grid of displacement bands. See test_signal_density_integrates_to_exposure below.
 
 
 // The complete intensity -- signal plus background -- summed over every observation must equal the
@@ -466,8 +429,8 @@ void test_complete_intensity_integrates() {
             }
             const panvar::ReadPair fragment{read("o/1", r1), read("o/2", r2)};
             const auto placements = panvar::enumerate_placements_exhaustive(
-                haplotype, fragment, panvar::fragment_insert_support(fragment, model), band);
-            const double mass = panvar::log_placement_mass(placements, fragment, insert, model, band);
+                haplotype, fragment, panvar::fragment_insert_support(fragment, model), model, band);
+            const double mass = panvar::log_placement_mass(placements, fragment, insert, model);
             total += std::exp(panvar::log_fragment_contribution(
                 mass, panvar::log_background_probability(fragment), model));
         }
@@ -495,8 +458,667 @@ void test_complete_intensity_integrates() {
 
 } // namespace
 
+// A library whose indel parameters are stated here rather than inherited, so a gate cannot silently
+// change meaning when a default moves.
+panvar::LibraryModel gap_library(double substitution_error, std::size_t max_gap_bp) {
+    panvar::LibraryModel model;
+    model.insert_mean_bp = 350.0;
+    model.insert_sd_bp = 40.0;
+    model.support_sigmas = 4.0;
+    model.substitution_error = substitution_error;
+    model.outlier_weight = 0.001;
+    model.fragment_start_intensity = 0.05;
+    model.gap_open = 1e-4;
+    model.gap_extend = 0.5;
+    model.max_gap_bp = max_gap_bp;
+    model.provenance = "fixture: declared";
+    return model;
+}
+
+// GATE 3, as an equality rather than a control: with the displacement band closed the indel-aware
+// emission must reproduce the substitution-only truncated emission exactly, including its refusal
+// beyond the band. If this drifts, every number the old model produced has silently changed.
+void test_gapped_reduces_to_substitution_model() {
+    std::string haplotype(24, 'A');
+    for (std::size_t i = 0; i < haplotype.size(); ++i) haplotype[i] = "ACGT"[(i * 7 + 3) % 4];
+    std::size_t compared = 0;
+    for (double e : {0.002, 0.02, 0.2}) {
+        const panvar::LibraryModel model = gap_library(e, 0);
+        for (std::size_t band : {0, 1, 2, 3}) {
+            for (std::size_t length : {5, 8, 12}) {
+                for (std::size_t m = 0; m <= std::min(band + 1, length); ++m) {
+                    std::string bases = haplotype.substr(1, length);
+                    for (std::size_t j = 0; j < m; ++j) {
+                        // Distinct positions, and a base that really differs.
+                        const char was = bases[j];
+                        bases[j] = was == 'A' ? 'C' : 'A';
+                    }
+                    const auto fit = panvar::gapped_emission(haplotype, bases, 1, model, band);
+                    const double expected = panvar::log_truncated_emission(length, m, e, band);
+                    if (m > band) {
+                        require(!fit.has_value() || fit->log_emission == kNegInf,
+                                "beyond the band the gapped emission must refuse, as the "
+                                "substitution-only model does");
+                        continue;
+                    }
+                    require(fit.has_value(), "within the band the gapped emission must exist");
+                    require_close(fit->log_emission, expected, 1e-9,
+                                  "with max_gap_bp 0 the gapped emission must equal the "
+                                  "substitution-only truncated emission exactly");
+                    require(fit->consumed_bp == length,
+                            "an ungapped alignment consumes exactly the read length");
+                    ++compared;
+                }
+            }
+        }
+    }
+    std::cout << "  gapped emission reduces to the substitution model on " << compared
+              << " (error, band, length, mismatch) combinations\n";
+}
+
+// The property the normaliser exists for, and the precondition for the exposure identity: at a fixed
+// start the emission is a distribution over the reads of that length, so summing it over every one of
+// them is exactly one. Checked with gaps closed AND open, because an unnormalised gap model would
+// still pass the closed case.
+void test_gapped_emission_normalises() {
+    const std::string haplotype = "ACGTTGCAAGTCCATGA";
+    const std::size_t length = 4;
+    for (std::size_t max_gap : {0, 1, 2}) {
+        for (std::size_t band : {1, 2, 4}) {
+            const panvar::LibraryModel model = gap_library(0.1, max_gap);
+            double total = 0.0;
+            std::size_t reads = 0;
+            for (std::size_t code = 0; code < 256; ++code) {
+                std::string bases(length, 'A');
+                for (std::size_t i = 0; i < length; ++i) bases[i] = "ACGT"[(code >> (2 * i)) & 3];
+                const auto fit = panvar::gapped_emission(haplotype, bases, 4, model, band);
+                if (fit.has_value() && fit->log_emission != kNegInf) total += std::exp(fit->log_emission);
+                ++reads;
+            }
+            require(reads == 256, "the gate must sum over every read of this length");
+            require_close(total, 1.0, 1e-9,
+                          "the gapped emission must sum to one over every read of the observed "
+                          "length, or it is not a probability and the exposure identity fails");
+        }
+    }
+    std::cout << "  gapped emission normalises over all 256 reads at every band and gap width\n";
+}
+
+// GATE 1. The NA19240 mechanism in miniature: a read carrying one extra base in a homopolymer. Under
+// a fixed-position emission every base after the run is shifted, the mismatches leave the band, and
+// the read gets NO placement on the haplotype it actually came from -- which is how a two-edit allele
+// lost to a sixteen-edit one. The fixture asserts that failure rather than assuming it, so the gate
+// cannot quietly stop testing anything.
+void test_one_base_homopolymer_insertion() {
+    const std::string prefix = "CGTACGT";
+    const std::string tail = "TCTCTGCAAAAC";
+    const std::string haplotype = prefix + std::string(8, 'A') + tail + "GGTTCA";
+    const std::string bases = prefix + std::string(9, 'A') + tail;   // one extra A
+    const std::size_t band = 6;
+
+    const auto ungapped = panvar::count_mismatches(haplotype, bases, 0, band);
+    require(!ungapped.has_value(),
+            "fixture: the substitution-only model must FAIL on this read, or the gate proves nothing");
+
+    const panvar::LibraryModel model = gap_library(0.002, 2);
+    const auto fit = panvar::gapped_emission(haplotype, bases, 0, model, band);
+    require(fit.has_value() && std::isfinite(fit->log_emission),
+            "a one-base homopolymer insertion must receive a valid gapped placement");
+    require(fit->edits == 1, "it must cost exactly one edit, not a shifted run of substitutions");
+    require(fit->consumed_bp == bases.size() - 1,
+            "an inserted read base consumes one fewer haplotype base");
+    std::cout << "  one-base homopolymer insertion: substitution model refuses, gapped emission "
+              << fit->log_emission << " at 1 edit\n";
+}
+
+// GATE 2. The same, with the read missing a base the haplotype carries.
+void test_one_base_deletion() {
+    const std::string prefix = "CGTACGT";
+    const std::string tail = "TCTCTGCAAAAC";
+    const std::string haplotype = prefix + std::string(9, 'A') + tail + "GGTTCA";
+    const std::string bases = prefix + std::string(8, 'A') + tail;   // one A short
+    const std::size_t band = 6;
+
+    const auto ungapped = panvar::count_mismatches(haplotype, bases, 0, band);
+    require(!ungapped.has_value(),
+            "fixture: the substitution-only model must FAIL on this read, or the gate proves nothing");
+
+    const panvar::LibraryModel model = gap_library(0.002, 2);
+    const auto fit = panvar::gapped_emission(haplotype, bases, 0, model, band);
+    require(fit.has_value() && std::isfinite(fit->log_emission),
+            "a one-base deletion must receive a valid gapped placement");
+    require(fit->edits == 1, "it must cost exactly one edit");
+    require(fit->consumed_bp == bases.size() + 1,
+            "a deleted read base consumes one extra haplotype base");
+    std::cout << "  one-base deletion: substitution model refuses, gapped emission "
+              << fit->log_emission << " at 1 edit\n";
+}
+
+// -------------------------------------------------------------------------------------------
+// Consumed-span components: the correction, and the defect it replaces.
+//
+// gapped_emission sums alignment mass over every terminal consumed span. Each span ends the mate at
+// a different haplotype coordinate, so each implies a different fragment geometry and a different
+// insert probability. The previous implementation summed the mass first and attached the total to
+// the single best span, weighting every other span's mass with an insert probability that was not
+// its own. The gates below pin down the corrected behaviour AND reject the old one.
+// -------------------------------------------------------------------------------------------
+
+// A second, genuinely different insert distribution over the same support: strongly skewed toward
+// long inserts, where the library's own distribution is near-symmetric. Misattributing mass between
+// neighbouring consumed spans costs something quite different under the two, so an identity that
+// holds under both is not holding by an accident of shape.
+panvar::DiscreteInsertDistribution skewed_insert(const panvar::InsertSupport& support) {
+    panvar::DiscreteInsertDistribution out;
+    out.support = support;
+    const std::size_t span = support.max_bp - support.min_bp + 1;
+    std::vector<double> weight(span);
+    double total = 0.0;
+    for (std::size_t i = 0; i < span; ++i) {
+        const double x = static_cast<double>(i + 1);
+        weight[i] = x * x * x;
+        total += weight[i];
+    }
+    for (std::size_t i = 0; i < span; ++i) {
+        out.log_probability_by_offset.push_back(std::log(weight[i] / total));
+    }
+    return out;
+}
+
+// A near-symmetric discrete distribution over an EXPLICIT support, normalised over it.
+//
+// The gate builds its own rather than taking the library's, because the exposure identity constrains
+// where the support's floor may sit. A template of length i can host a mate whose alignment consumes
+// c haplotype bases only if c <= i, and consumed spans reach read_length + max_gap_bp -- while
+// haplotype_exposure counts EVERY template at or above its floor. If the floor were below
+// max_mate_length + max_gap_bp, templates between the two would be counted by the exposure but could
+// not host the widest admissible alignments, and the identity would fail for a reason that has
+// nothing to do with normalisation. Every support below is therefore floored at that value. The
+// production library satisfies it with room to spare: inserts near 350 bp against 100 + 3.
+panvar::DiscreteInsertDistribution gaussian_insert(const panvar::InsertSupport& support,
+                                                   double mean, double sd) {
+    panvar::DiscreteInsertDistribution out;
+    out.support = support;
+    std::vector<double> weight;
+    double total = 0.0;
+    for (std::size_t i = support.min_bp; i <= support.max_bp; ++i) {
+        const double z = (static_cast<double>(i) - mean) / sd;
+        weight.push_back(std::exp(-0.5 * z * z));
+        total += weight.back();
+    }
+    for (double w : weight) out.log_probability_by_offset.push_back(std::log(w / total));
+    return out;
+}
+
+// The support this fixture must use for a given fragment shape, by the rule above.
+panvar::InsertSupport safe_support(std::size_t first_len, std::size_t second_len,
+                                   std::size_t max_gap_bp, std::size_t haplotype_length) {
+    panvar::InsertSupport support;
+    support.min_bp = std::max(first_len, second_len) + max_gap_bp;
+    support.max_bp = haplotype_length;
+    return support;
+}
+
+// The fixture the whole grid runs on: short enough to enumerate every observation exhaustively, long
+// enough that interior starts exist alongside the two boundaries.
+panvar::LibraryModel exposure_model(std::size_t max_gap_bp) {
+    panvar::LibraryModel model;
+    model.insert_mean_bp = 6.0;
+    model.insert_sd_bp = 1.5;
+    model.support_sigmas = 2.0;
+    model.substitution_error = 0.1;
+    model.outlier_weight = 0.001;
+    model.fragment_start_intensity = 0.05;
+    // Deliberately loose, so gapped alignments carry mass worth measuring rather than 1e-12 of it:
+    // a collapse defect hidden below the tolerance would be a gate that cannot fail.
+    model.gap_open = 5e-3;
+    model.gap_extend = 0.4;
+    model.max_gap_bp = max_gap_bp;
+    model.provenance = "fixture: declared";
+    return model;
+}
+
+// THE MUTATION, kept here in the suite rather than in the library: exactly what the implementation
+// did before the consumed-span correction. gapped_emission sums mass over every terminal span, and
+// this attaches that whole sum to the single BEST span's geometry -- so every other span's mass is
+// weighted with an insert probability that is not its own. The normalisation gate must reject it.
+std::vector<panvar::FragmentPlacement> collapse_to_best_span(
+    const std::string& haplotype,
+    const panvar::ReadPair& fragment,
+    const panvar::InsertSupport& support,
+    const panvar::LibraryModel& model,
+    std::size_t band) {
+    std::vector<panvar::FragmentPlacement> out;
+    const std::string rc_first = revcomp(fragment.first.bases);
+    const std::string rc_second = revcomp(fragment.second.bases);
+    for (int arm = 0; arm < 2; ++arm) {
+        const std::string& forward = arm == 0 ? fragment.first.bases : fragment.second.bases;
+        const std::string& reverse = arm == 0 ? rc_second : rc_first;
+        for (std::size_t fs = 0; fs < haplotype.size(); ++fs) {
+            const auto forward_fit = panvar::gapped_emission(haplotype, forward, fs, model, band);
+            if (!forward_fit.has_value() || forward_fit->log_emission == kNegInf) continue;
+            for (std::size_t re = 0; re <= haplotype.size(); ++re) {
+                // Right-anchored, exactly as the corrected implementation anchors it. The ONLY thing
+                // this function mutates is the best-span collapse; if it also left-anchored the
+                // reverse mate it would be rejected for two reasons at once and would prove nothing
+                // about the collapse.
+                const auto reverse_fit =
+                    panvar::gapped_emission_ending_at(haplotype, reverse, re, model, band);
+                if (!reverse_fit.has_value() || reverse_fit->log_emission == kNegInf) continue;
+                const auto length = panvar::fr_insert_from_endpoints(
+                    fs, forward_fit->consumed_bp, re, reverse_fit->consumed_bp, support);
+                if (!length.has_value()) continue;
+                panvar::FragmentPlacement placement;
+                placement.orientation = arm == 0 ? panvar::MateOrientation::FirstForward
+                                                 : panvar::MateOrientation::SecondForward;
+                placement.forward_start = fs;
+                placement.insert_bp = *length;
+                placement.reverse_start = re - reverse_fit->consumed_bp;
+                placement.forward_consumed_bp = forward_fit->consumed_bp;
+                placement.reverse_consumed_bp = reverse_fit->consumed_bp;
+                placement.forward_mismatches = forward_fit->edits;
+                placement.reverse_mismatches = reverse_fit->edits;
+                placement.latent_alignments = 1;
+                // The defect in one line: each mate's WHOLE emission, at the best span's geometry.
+                placement.log_latent_mass = forward_fit->log_emission + reverse_fit->log_emission;
+                out.push_back(placement);
+            }
+        }
+    }
+    return out;
+}
+
+struct IntegratedSignal {
+    double total = 0.0;
+    double first_forward = 0.0;
+    std::size_t observations = 0;
+    std::size_t origins = 0;
+    std::size_t multi_alignment_origins = 0;
+    std::size_t boundary_left = 0;    // origins anchored at the very first base
+    std::size_t boundary_right = 0;   // origins whose template ends at the very last base
+    std::size_t interior = 0;
+};
+
+// Sums the signal mass over EVERY observation with the given mate lengths. `collapse` selects the
+// MUTATION: when set, each mate's whole emission is attached to its single best consumed span, which
+// is exactly what the implementation did before this correction.
+IntegratedSignal integrate_signal(
+    const std::string& haplotype,
+    const panvar::LibraryModel& model,
+    const panvar::InsertSupport& support,
+    const panvar::DiscreteInsertDistribution& insert,
+    std::size_t band,
+    std::size_t first_len,
+    std::size_t second_len,
+    bool collapse) {
+    IntegratedSignal out;
+    const std::size_t first_codes = std::size_t{1} << (2 * first_len);
+    const std::size_t second_codes = std::size_t{1} << (2 * second_len);
+    for (std::size_t code1 = 0; code1 < first_codes; ++code1) {
+        for (std::size_t code2 = 0; code2 < second_codes; ++code2) {
+            std::string r1(first_len, 'A');
+            std::string r2(second_len, 'A');
+            for (std::size_t i = 0; i < first_len; ++i) r1[i] = "ACGT"[(code1 >> (2 * i)) & 3];
+            for (std::size_t i = 0; i < second_len; ++i) r2[i] = "ACGT"[(code2 >> (2 * i)) & 3];
+            const panvar::ReadPair fragment{read("o/1", r1), read("o/2", r2)};
+
+            std::vector<panvar::FragmentPlacement> placements;
+            if (collapse) {
+                placements = collapse_to_best_span(haplotype, fragment, support, model, band);
+            } else {
+                placements = panvar::enumerate_placements_exhaustive(haplotype, fragment, support,
+                                                                     model, band);
+            }
+            const double mass = panvar::log_placement_mass(placements, fragment, insert, model);
+            if (mass != kNegInf) out.total += std::exp(mass);
+
+            std::vector<panvar::FragmentPlacement> arm;
+            for (const panvar::FragmentPlacement& p : placements) {
+                if (p.orientation == panvar::MateOrientation::FirstForward) arm.push_back(p);
+                ++out.origins;
+                if (p.latent_alignments > 1) ++out.multi_alignment_origins;
+                const bool left = p.forward_start == 0;
+                const bool right = p.forward_start + p.insert_bp == haplotype.size();
+                if (left) ++out.boundary_left;
+                if (right) ++out.boundary_right;
+                if (!left && !right) ++out.interior;
+            }
+            const double arm_mass = panvar::log_placement_mass(arm, fragment, insert, model);
+            if (arm_mass != kNegInf) out.first_forward += std::exp(arm_mass);
+            ++out.observations;
+        }
+    }
+    return out;
+}
+
+// GATES 6 and 8. Summing the signal mass over EVERY possible observation must reproduce the exposure
+// exactly, and each library orientation must carry exactly half of it. This is the identity that ties
+// the -lambda*E term to the fragment density: if it fails, the two describe different generated
+// processes and every likelihood ratio between haplotypes of different lengths is off.
+//
+// Run over band < max_gap_bp, band == max_gap_bp and band > max_gap_bp, with NO precondition
+// relating the two. An earlier reading of this file's failures proposed requiring band > max_gap_bp
+// as a declared model precondition; that was a symptom being mistaken for a contract. A correctly
+// normalised truncated model owes the identity at every combination -- gap shapes the edit budget
+// cannot pay for simply carry zero mass, which costs the identity nothing.
+struct GridCell {
+    std::size_t max_gap;
+    std::size_t band;
+    std::size_t first_len;
+    std::size_t second_len;
+    bool skewed;
+};
+
+void test_signal_density_integrates_to_exposure() {
+    const std::string haplotype = "ACGTTGCAAG";   // L = 10
+    // Every cell keeps max_gap_bp < the shorter mate. At max_gap_bp >= read length the consumption
+    // floor read_length - min(read_length, max_gap_bp) collapses to zero and a read may be absorbed
+    // entirely into insertions, consuming NO haplotype at all -- which is not a placement in any
+    // useful sense and is a regime production never enters (100 bp reads against max_gap_bp 3).
+    // Testing the identity there would be testing a degenerate model, not this one.
+    const GridCell grid[] = {
+        // gaps closed: the substitution-only control, which must stay exact.
+        {0, 1, 2, 2, false}, {0, 3, 3, 3, false},
+        // band == max_gap, band > max_gap, a skewed insert distribution, and unequal mate lengths.
+        {1, 1, 2, 2, false}, {1, 2, 2, 2, false}, {1, 3, 2, 2, true}, {1, 1, 2, 3, false},
+        {1, 2, 2, 3, true},
+        // band < max_gap, band == max_gap, band > max_gap at a wider displacement band.
+        {2, 1, 3, 3, false}, {2, 2, 3, 3, false}, {2, 3, 3, 3, true},
+    };
+    std::size_t cells = 0;
+    std::size_t below = 0, equal = 0, above = 0;
+    std::size_t multi_alignment_origins = 0;
+    std::size_t boundary_left = 0;
+    std::size_t boundary_right = 0;
+    std::size_t interior = 0;
+
+    for (const GridCell& cell : grid) {
+        const panvar::LibraryModel model = exposure_model(cell.max_gap);
+        const panvar::InsertSupport support =
+            safe_support(cell.first_len, cell.second_len, cell.max_gap, haplotype.size());
+        require(support.min_bp < support.max_bp, "fixture: the support must be non-degenerate");
+        const panvar::DiscreteInsertDistribution insert =
+            cell.skewed ? skewed_insert(support)
+                        : gaussian_insert(support, 0.5 * (support.min_bp + support.max_bp), 2.0);
+        const double exposure =
+            panvar::haplotype_exposure(haplotype.size(), insert, support.min_bp);
+        require(exposure > 0.0, "fixture: exposure must be positive, or the identity is vacuous");
+
+        const IntegratedSignal signal = integrate_signal(
+            haplotype, model, support, insert, cell.band, cell.first_len, cell.second_len, false);
+        const std::string where =
+            "max_gap=" + std::to_string(cell.max_gap) + " band=" + std::to_string(cell.band) +
+            " mates=" + std::to_string(cell.first_len) + "/" + std::to_string(cell.second_len) +
+            (cell.skewed ? " skewed-insert" : " gaussian-insert");
+        require_close(signal.total, exposure, 1e-9,
+                      "the signal density summed over every observation must equal the exposure ["
+                      + where + "]");
+        require_close(signal.first_forward, 0.5 * exposure, 1e-9,
+                      "each library orientation must carry exactly half of the exposure [" + where
+                      + "]");
+        if (cell.max_gap > 0) {
+            if (cell.band < cell.max_gap) ++below;
+            else if (cell.band == cell.max_gap) ++equal;
+            else ++above;
+        }
+        multi_alignment_origins += signal.multi_alignment_origins;
+        boundary_left += signal.boundary_left;
+        boundary_right += signal.boundary_right;
+        interior += signal.interior;
+        ++cells;
+    }
+    require(cells == sizeof(grid) / sizeof(grid[0]), "the grid must run every declared cell");
+    // The identity is required at every relation between the band and the displacement width, with
+    // no precondition connecting them. An earlier reading of this file proposed band > max_gap_bp as
+    // a declared precondition; it was a symptom mistaken for a contract, and these three counters
+    // exist so that reading cannot quietly come back.
+    require(below > 0 && equal > 0 && above > 0,
+            "the grid must cover band < max_gap, band == max_gap and band > max_gap");
+    // Non-vacuity, all four of them. Without multi-alignment origins the componentisation is never
+    // exercised; without both boundaries and the interior the identity is only being checked where
+    // the haplotype does not constrain the alignment.
+    require(multi_alignment_origins > 0,
+            "the grid must produce origins explained by several latent alignments, or the "
+            "componentisation is untested");
+    require(boundary_left > 0 && boundary_right > 0 && interior > 0,
+            "the grid must cover boundary and interior starts, or the identity is only checked "
+            "where the haplotype end does not bind");
+    std::cout << "  exposure identity holds on " << cells
+              << " cells (" << below << " band<max_gap, " << equal << " band==max_gap, " << above
+              << " band>max_gap); " << multi_alignment_origins
+              << " multi-alignment origins, boundaries " << boundary_left << "/" << boundary_right
+              << ", interior " << interior << '\n';
+}
+
+// GATE 7 (the mutation). Collapsing every consumed span's mass onto the best span is the defect this
+// correction removes, so the normalisation gate must REJECT it. With gaps closed the mutation is a
+// no-op and the identity must still hold -- which is what proves the gate is detecting the collapse
+// rather than merely detecting that something changed.
+// How many (forward span, reverse span) pairs the insert floor excludes at admissible anchor pairs.
+// Zero exactly when support.min_bp >= max mate length + max_gap_bp, which is what makes the collapse
+// inert there; positive is what makes the mutation detectable.
+std::size_t floor_exclusions(const std::string& haplotype, const panvar::ReadPair& fragment,
+                             const panvar::InsertSupport& support,
+                             const panvar::LibraryModel& model, std::size_t band) {
+    std::size_t excluded = 0;
+    const std::string reverse = revcomp(fragment.second.bases);
+    for (std::size_t fs = 0; fs < haplotype.size(); ++fs) {
+        const auto forward_fit =
+            panvar::gapped_emission(haplotype, fragment.first.bases, fs, model, band);
+        if (!forward_fit.has_value()) continue;
+        for (std::size_t re = fs + 1; re <= haplotype.size(); ++re) {
+            const auto reverse_fit =
+                panvar::gapped_emission_ending_at(haplotype, reverse, re, model, band);
+            if (!reverse_fit.has_value()) continue;
+            const std::size_t insert = re - fs;
+            if (insert < support.min_bp || insert > support.max_bp) continue;
+            for (const auto& a : forward_fit->components) {
+                for (const auto& b : reverse_fit->components) {
+                    if (insert < std::max(a.consumed_bp, b.consumed_bp)) ++excluded;
+                }
+            }
+        }
+    }
+    return excluded;
+}
+
+void test_best_span_collapse_is_rejected() {
+    const std::string haplotype = "ACGTTGCAAGTC";   // L = 12
+    const panvar::ReadPair probe_fragment{read("p/1", haplotype.substr(1, 3)),
+                                          read("p/2", revcomp(haplotype.substr(6, 3)))};
+
+    // (a) Gaps closed. Every mate then has exactly one consumed span, so the collapse is a no-op
+    // and the identity must still hold. This is what shows the gate is detecting the COLLAPSE and
+    // not merely detecting that something changed.
+    {
+        const panvar::LibraryModel closed = exposure_model(0);
+        const panvar::InsertSupport support = safe_support(2, 2, 0, haplotype.size());
+        const panvar::DiscreteInsertDistribution insert =
+            gaussian_insert(support, 0.5 * (support.min_bp + support.max_bp), 2.0);
+        const double exposure =
+            panvar::haplotype_exposure(haplotype.size(), insert, support.min_bp);
+        const IntegratedSignal collapsed =
+            integrate_signal(haplotype, closed, support, insert, 2, 2, 2, true);
+        require_close(collapsed.total, exposure, 1e-9,
+                      "with gaps closed every mate has one consumed span, so the collapse is a "
+                      "no-op and the identity must still hold");
+    }
+
+    // (b) Gaps open, insert floor NOT binding. Here the collapse is provably inert, and saying so
+    // is part of the contract rather than a hole in it. With the reverse mate anchored at its right
+    // endpoint the insert is re - fs: a function of the two ANCHORS alone. The consumed spans enter
+    // only through the floor insert >= max(consumed spans), so where that floor cannot bind, the
+    // correct mass at an anchor pair factorises as (sum over forward spans) * (sum over reverse
+    // spans) -- which is exactly what the collapse computes. The exposure identity therefore CANNOT
+    // reject the collapse in this regime, and a gate claiming it does would be asserting something
+    // false. Measured: identical to the last bit, with zero span pairs excluded.
+    const panvar::LibraryModel model = exposure_model(2);
+    {
+        const panvar::InsertSupport support = safe_support(3, 3, 2, haplotype.size());
+        const panvar::DiscreteInsertDistribution insert =
+            gaussian_insert(support, 0.5 * (support.min_bp + support.max_bp), 2.0);
+        const double exposure =
+            panvar::haplotype_exposure(haplotype.size(), insert, support.min_bp);
+        require(floor_exclusions(haplotype, probe_fragment, support, model, 3) == 0,
+                "fixture: at or above the safe floor nothing may be excluded by the insert floor");
+        for (std::size_t band : {1, 2, 3}) {
+            const IntegratedSignal correct =
+                integrate_signal(haplotype, model, support, insert, band, 3, 3, false);
+            const IntegratedSignal collapsed =
+                integrate_signal(haplotype, model, support, insert, band, 3, 3, true);
+            require_close(correct.total, exposure, 1e-9,
+                          "the componentised path must satisfy the identity here");
+            require_close(collapsed.total, correct.total, 1e-12,
+                          "where the insert floor cannot bind, the best-span collapse is inert by "
+                          "construction and must agree exactly");
+        }
+    }
+
+    // (c) Gaps open, insert floor BINDING. This is where the componentisation is observable and
+    // where the mutation must be rejected: admission is decided per consumed SPAN, and the collapse
+    // decides it once from the best span, so it keeps mass the model excludes and drops mass the
+    // model keeps.
+    std::size_t rejected = 0;
+    {
+        const panvar::InsertSupport support{3, haplotype.size()};   // below 3 + max_gap_bp = 5
+        const panvar::DiscreteInsertDistribution insert =
+            gaussian_insert(support, 0.5 * (support.min_bp + support.max_bp), 2.0);
+        const std::size_t excluded = floor_exclusions(haplotype, probe_fragment, support, model, 3);
+        require(excluded > 0,
+                "fixture: below the safe floor the insert floor must exclude span pairs, or there "
+                "is nothing for the collapse to get wrong");
+        for (std::size_t band : {2, 3}) {
+            const IntegratedSignal correct =
+                integrate_signal(haplotype, model, support, insert, band, 3, 3, false);
+            const IntegratedSignal collapsed =
+                integrate_signal(haplotype, model, support, insert, band, 3, 3, true);
+            require(std::abs(collapsed.total - correct.total) > 1e-9,
+                    "with the insert floor binding, collapsing consumed-span mass onto the best "
+                    "span must give a different answer at band=" + std::to_string(band) +
+                    "; a gate that both versions pass is not a gate");
+            ++rejected;
+        }
+        std::cout << "  best-span collapse: inert where the insert floor cannot bind (exactly, by "
+                     "factorisation), rejected on " << rejected << " floor-binding cells with "
+                  << excluded << " span pairs excluded\n";
+    }
+    require(rejected == 2, "the mutation must be rejected on every floor-binding cell");
+}
+
+// GATE 9. Two consumed spans of one mate, carrying non-zero mass, landing on inserts with DIFFERENT
+// probabilities. The joint likelihood must equal the component-wise reference -- which applies each
+// span's own insert probability -- and must differ from the best-span collapse.
+void test_component_factorisation_and_collapse() {
+    const std::string haplotype = "ACGTTGCAAGTCAG";
+    const panvar::LibraryModel model = exposure_model(2);
+    // Deliberately BELOW the safe floor of 3 + max_gap_bp = 5, because that is the only regime in
+    // which the componentisation is observable at all.
+    //
+    // Requirement 9 as originally framed asked for two consumed spans of one mate carrying
+    // DIFFERENT insert probabilities. That cannot arise once the reverse mate is anchored at its
+    // right endpoint: the insert is re - fs, so every consumed span at one anchor pair shares one
+    // insert, and spans differing in insert are different origins. The premise belonged to the
+    // left-anchored model this batch removed. What survives of the requirement, and is checked
+    // here, is the part that still has content: each span is ADMITTED on its own geometry, and
+    // grouping latent alignments onto physical origins does not change the likelihood.
+    const panvar::InsertSupport support{3, haplotype.size()};
+    // Skewed hard, so mass attributed to the wrong geometry cannot hide inside the tolerance.
+    const panvar::DiscreteInsertDistribution insert = skewed_insert(support);
+    const std::size_t band = 3;
+
+    const panvar::ReadPair fragment{read("t/1", haplotype.substr(2, 3)),
+                                    read("t/2", revcomp(haplotype.substr(6, 3)))};
+    require(floor_exclusions(haplotype, fragment, support, model, band) > 0,
+            "fixture: the insert floor must exclude some span pairs, or admission per span is "
+            "indistinguishable from admission per best span");
+
+    // An independent reference: every (start, span) pair summed directly, with no grouping at all.
+    // Summation is associative, so the production path -- which groups latent alignments onto
+    // physical origins first -- must agree with it exactly. That equality is the whole of the claim
+    // that collapsing by endpoint does not change the likelihood.
+    double reference = 0.0;
+    std::set<std::size_t> inserts_used;
+    std::size_t span_pairs = 0;
+    const std::string rc_first = revcomp(fragment.first.bases);
+    const std::string rc_second = revcomp(fragment.second.bases);
+    for (int arm = 0; arm < 2; ++arm) {
+        const std::string& forward = arm == 0 ? fragment.first.bases : fragment.second.bases;
+        const std::string& reverse = arm == 0 ? rc_second : rc_first;
+        for (std::size_t fs = 0; fs < haplotype.size(); ++fs) {
+            const auto forward_fit = panvar::gapped_emission(haplotype, forward, fs, model, band);
+            if (!forward_fit.has_value()) continue;
+            for (std::size_t re = 0; re <= haplotype.size(); ++re) {
+                const auto reverse_fit =
+                    panvar::gapped_emission_ending_at(haplotype, reverse, re, model, band);
+                if (!reverse_fit.has_value()) continue;
+                for (const auto& fspan : forward_fit->components) {
+                    for (const auto& rspan : reverse_fit->components) {
+                        const auto length = panvar::fr_insert_from_endpoints(
+                            fs, fspan.consumed_bp, re, rspan.consumed_bp, support);
+                        if (!length.has_value()) continue;
+                        inserts_used.insert(*length);
+                        ++span_pairs;
+                        reference += std::exp(std::log(0.5) + insert.log_probability(*length) +
+                                              fspan.log_emission + rspan.log_emission);
+                    }
+                }
+            }
+        }
+    }
+    require(inserts_used.size() >= 2,
+            "fixture: at least two distinct inserts must be reachable, or the insert probability "
+            "plays no part in the comparison");
+    require(span_pairs > inserts_used.size(),
+            "fixture: several latent span pairs must share endpoints, or the grouping claim is "
+            "untested");
+
+    const auto placements =
+        panvar::enumerate_placements_exhaustive(haplotype, fragment, support, model, band);
+    const double produced =
+        std::exp(panvar::log_placement_mass(placements, fragment, insert, model));
+    require_close(produced, reference, 1e-12,
+                  "the joint likelihood must equal the component-wise reference: grouping latent "
+                  "alignments onto physical origins may not change the total");
+
+    // At least one origin must genuinely be explained by more than one latent alignment, and the two
+    // inserts involved must carry different probabilities, or the gate would pass on a fixture where
+    // the distinction does not arise.
+    std::size_t multi = 0;
+    for (const panvar::FragmentPlacement& p : placements) {
+        if (p.latent_alignments > 1) ++multi;
+    }
+    require(multi > 0, "fixture: some origin must have several latent alignments");
+    const std::size_t lo = *inserts_used.begin();
+    const std::size_t hi = *inserts_used.rbegin();
+    require(std::abs(insert.log_probability(lo) - insert.log_probability(hi)) > 0.1,
+            "fixture: the reachable inserts must carry visibly different probabilities");
+
+    const auto collapsed = collapse_to_best_span(haplotype, fragment, support, model, band);
+    const double collapsed_mass =
+        std::exp(panvar::log_placement_mass(collapsed, fragment, insert, model));
+    require(std::abs(collapsed_mass - produced) > 1e-12 * std::max(1.0, produced),
+            "with the insert floor binding, the best-span collapse must give a different answer, "
+            "or this fixture does not exercise the defect");
+    // Printed as DIFFERENCES, not as three values. At six significant figures these masses are
+    // indistinguishable, so printing them side by side made a passing gate look exactly like a gate
+    // that detects nothing -- and a gate whose evidence cannot be read is one nobody can check.
+    // Measured margins on this fixture: the collapse differs by ~3e-9 absolute (4e-7 relative)
+    // against a 1e-12 threshold, while at or above the safe floor it differs by ~4e-18, i.e. zero.
+    std::cout << "  component factorisation over " << inserts_used.size() << " distinct inserts: "
+              << "componentised - reference = " << std::abs(produced - reference)
+              << " (must be 0), collapse - componentised = " << std::abs(collapsed_mass - produced)
+              << " (must be > 0)\n";
+}
+
 int main() {
     try {
+        test_gapped_reduces_to_substitution_model();
+        test_gapped_emission_normalises();
+        test_one_base_homopolymer_insertion();
+        test_one_base_deletion();
+        test_signal_density_integrates_to_exposure();
+        test_best_span_collapse_is_rejected();
+        test_component_factorisation_and_collapse();
         test_emission();
         test_fr_geometry();
         test_exposure();
@@ -508,7 +1130,6 @@ int main() {
         test_homozygote_counts_two_copies();
         test_order_and_uniqueness();
         test_truncated_emission_normalises();
-        test_signal_density_integrates_to_exposure();
         test_complete_intensity_integrates();
         std::cout << "genotype fragment oracle: PASS\n";
         return 0;
