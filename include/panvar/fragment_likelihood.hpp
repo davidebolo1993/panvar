@@ -182,12 +182,32 @@ struct GappedFit {
 // path -- and returns that sum decomposed by consumed haplotype span, so each part can be given the
 // fragment geometry it actually implies. Returns nullopt when the haplotype cannot hold the read at
 // this start at all.
+// One oriented read form's Myers/Hyyro bit-parallel pattern, built once during fragment preparation
+// instead of rebuilt over the read on every verification. The masks are carried as 64-bit halves so
+// that the compiler extension they are assembled into stays inside the implementation.
+//
+// `usable` is false for an empty read or one longer than the word, where the caller falls back to
+// edlib. That fallback is the same exact decision by a different route, not an approximation.
+struct MyersPattern {
+    std::uint64_t peq_lo[4] = {0, 0, 0, 0};
+    std::uint64_t peq_hi[4] = {0, 0, 0, 0};
+    std::uint32_t length = 0;
+    bool usable = false;
+};
+
+// Deterministic from the read alone; holds no reference to it.
+MyersPattern prepare_myers_pattern(const std::string& read);
+
+// `pattern`, when given, is the read's prepared Myers pattern and must correspond to exactly this
+// read; passing nullptr rebuilds it, which is what the reference and test paths do. The decision it
+// yields is identical either way -- preparation moves work, not meaning.
 std::optional<GappedFit> gapped_emission(
     const std::string& haplotype,
     const std::string& read,
     std::size_t start,
     const LibraryModel& library,
-    std::size_t mismatch_band);
+    std::size_t mismatch_band,
+    const MyersPattern* pattern = nullptr);
 
 // The committed log-space recursion, retained verbatim as the REFERENCE the optimised path is
 // certified against. It is never called in production: gapped_emission computes the same quantities
@@ -208,7 +228,17 @@ struct GappedEmissionCounters {
     std::uint64_t dp_evaluations = 0;
     // Placements the exact feasibility prefilter proved to have zero mass, so the recursion did not.
     std::uint64_t prefilter_rejections = 0;
+    // Purely observational work counts, drained from the same thread-local rather than incremented
+    // on shared atomics. At 1.19 billion prefilters a contended fetch_add is itself a measurable
+    // share of the run, and none of these decides anything: they are merged deterministically in
+    // thread-index order after placement, so their totals do not depend on the schedule.
+    std::uint64_t executed_prefilters = 0;
+    std::uint64_t dp_cache_requests = 0;
+    std::uint64_t dp_cache_hits = 0;
+    std::uint64_t dp_cache_misses = 0;
+    std::uint64_t executed_dps = 0;
 };
+
 
 GappedEmissionCounters take_gapped_emission_counters();
 
@@ -261,15 +291,41 @@ EmissionCensus end_emission_census();
 // always retained, and refusals are retained while the declared budget allows. Exhaustion falls
 // back to uncached exact computation -- never eviction -- which changes nothing observable because
 // every cached value is an exact function of its key.
+// The cache holds ONLY what the recursion produced: accepted fits and refusals discovered after the
+// recursion ran. Prefilter refusals are deliberately not retained. Measured at 30x, retaining them
+// cost 733,497,742 declined insertions, drove the hit rate from 97.3% down to 37.8%, and spent the
+// budget on the cheap stream -- a prefilter refusal costs ~1.6us to recompute against ~26us for a
+// recursion, so holding one in the same hash-table representation as the other is a poor trade at
+// any budget. The prefilter therefore runs BEFORE a key is formed, and a refusal returns without
+// ever touching the table.
 struct EmissionCacheCounters {
-    std::uint64_t requests = 0;              // emission requests reaching the cache
-    std::uint64_t hits = 0;
-    std::uint64_t misses = 0;
-    std::uint64_t executed_prefilters = 0;   // prefilters actually run
+    std::uint64_t executed_prefilters = 0;   // prefilters actually run (every request pays one)
+    std::uint64_t dp_cache_requests = 0;     // requests that survived the prefilter and were looked up
+    std::uint64_t dp_cache_hits = 0;
+    std::uint64_t dp_cache_misses = 0;
     std::uint64_t executed_dps = 0;          // recursions actually run
     std::uint64_t payload_bytes = 0;         // key and value bytes retained
     std::uint64_t entries = 0;
-    std::uint64_t refusals_not_retained = 0; // refusals the declared budget declined to hold
+    std::uint64_t entries_not_retained = 0;  // entries the declared budget declined to hold
+};
+
+// Explicitly owned scorer memory, counted rather than inferred. RSS is not evidence about which
+// buffer grew, and the number of haplotypes does not by itself imply more simultaneously live
+// placement vectors: each worker handles one haplotype at a time, so haplotype count drives
+// allocator CHURN, not residency. These accounts separate the two.
+struct ScorerMemoryAccounts {
+    std::uint64_t mass_matrix_bytes = 0;
+    std::uint64_t haplotype_sequence_bytes = 0;      // forward and reversed copies
+    std::uint64_t form_sequence_bytes = 0;
+    std::uint64_t piece_index_bytes = 0;
+    std::uint64_t emission_cache_table_bytes = 0;
+    std::uint64_t emission_cache_arena_bytes = 0;
+    // Summed over workers, at each worker's own peak. Rows are placements actually held; capacity is
+    // what the reused buffers retain between haplotypes.
+    std::uint64_t placement_rows_peak = 0;
+    std::uint64_t placement_capacity_bytes_peak = 0;
+    std::uint64_t proposed_starts_peak = 0;
+    std::uint64_t proposed_starts_capacity_bytes_peak = 0;
 };
 
 // `budget_bytes` bounds what refusal entries may occupy; zero disables the cache entirely, which is
@@ -295,6 +351,12 @@ EmissionCacheCounters end_emission_cache();
 // down before any status writer runs, so the figures are retained here rather than recovered by
 // threading the scoring result through every caller that wants to report them.
 EmissionCacheCounters last_emission_cache_counters();
+
+// The memory accounts of the most recently completed scoring pass, retained for the same reason the
+// cache counters are: write_status is reached from eleven call sites and carries no scoring result,
+// so threading a diagnostic through all of them would be a worse change than keeping the last
+// pass's figures here.
+ScorerMemoryAccounts last_scorer_memory_accounts();
 
 // The same emission, anchored at the read's RIGHT endpoint instead of at its start.
 //
@@ -592,6 +654,9 @@ struct FragmentScoringResult {
     // FragmentScoringCounters: those count logical events and must stay identical between a cached
     // and an uncached run of the same input, which is what makes the two comparable at all.
     EmissionCacheCounters emission_cache;
+    // What this pass actually owned, measured at its peak. Reported so a memory question is answered
+    // by an account rather than by reasoning backwards from RSS.
+    ScorerMemoryAccounts memory;
     // Filled only when requested in FragmentScoringOptions; same row-major layout as log_mass.
     std::vector<OriginSummary> origin_summary;
     // (fragment, haplotype) -> every accepted origin, for record_origins_for_fragments only.

@@ -381,7 +381,7 @@ void test_emission_cache_is_exact() {
     uncached.emission_cache_bytes = 0;
     const panvar::FragmentScoringResult reference =
         panvar::score_diplotypes(interned, candidates, fragments, model, uncached);
-    require(reference.emission_cache.requests == 0,
+    require(reference.emission_cache.dp_cache_requests == 0,
             "a zero budget must leave the cache disarmed, not merely empty");
 
     std::uint64_t total_hits = 0;
@@ -439,12 +439,28 @@ void test_emission_cache_is_exact() {
         same("proposed_starts", want.proposed_starts, got.proposed_starts);
         same("unique_starts", want.unique_starts, got.unique_starts);
         // ... while the WORK counters must show the cache actually did something.
-        require(actual.emission_cache.hits > 0,
+        // Exact invariants on the worker-local counters, which are now merged rather than atomic.
+        // Every request pays exactly one prefilter, and exactly the survivors form a cache key --
+        // so these two identities must hold at any thread count, and they are what proves the
+        // deterministic merge replaced the contended fetch_add without losing a count.
+        require(actual.emission_cache.executed_prefilters ==
+                    got.dp_evaluations + got.prefilter_rejections,
+                "executed prefilters must equal dp_evaluations + prefilter_rejections at threads=" +
+                    std::to_string(threads));
+        require(actual.emission_cache.dp_cache_requests == got.dp_evaluations,
+                "every request surviving the prefilter must form exactly one cache key at threads=" +
+                    std::to_string(threads));
+        // Hits and misses are deliberately NOT gated as equal across thread counts: which worker
+        // reaches a key first depends on interleaving, and only their sum is invariant.
+        require(actual.emission_cache.dp_cache_hits + actual.emission_cache.dp_cache_misses ==
+                    actual.emission_cache.dp_cache_requests,
+                "every cache request must be classified as exactly one hit or one miss");
+        require(actual.emission_cache.dp_cache_hits > 0,
                 "fixture: the cache must actually hit, or this gate proves only that an unused "
                 "cache is harmless");
         require(actual.emission_cache.executed_dps < got.dp_evaluations,
                 "executed recursions must fall below the logical count once reuse is captured");
-        total_hits += actual.emission_cache.hits;
+        total_hits += actual.emission_cache.dp_cache_hits;
     }
     require(worst_mass <= 1e-9 && worst_score <= 1e-9,
             "cached and uncached scores must agree within the declared tolerance");

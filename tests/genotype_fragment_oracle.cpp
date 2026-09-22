@@ -1300,18 +1300,98 @@ void test_emission_cache_matches_the_reference_under_hash_collapse() {
         require(accepted > 0 && refused > 0,
                 "fixture: the sweep must both accept and refuse, or the collision path is only "
                 "half exercised");
-        require(counters.hits >= reads.size(),
-                "the second pass must be served from the cache, or nothing was reused");
-        require(counters.executed_dps + counters.executed_prefilters < counters.requests,
-                "reuse must have avoided work, not merely recorded it");
+        // Two corrections over the obvious threshold, both measured rather than assumed. Only
+        // recursion results are cached, so the unrelated reads here -- turned away before a key
+        // exists -- can never hit. And reads DUPLICATE: at max_gap 0 the 24 accepted reads collapse
+        // to 12 distinct keys, at max_gap 2 and 3 the 36 collapse to 18. So the bound is one hit
+        // per distinct accepted KEY, counted here, not one per accepted read.
+        std::set<std::pair<std::string, std::string>> distinct_accepted;
+        for (std::size_t i = 0; i < reads.size(); ++i) {
+            if (!expected[i].has_value()) continue;
+            const std::size_t window =
+                std::min(haplotype.size() - starts[i], reads[i].size() + max_gap);
+            distinct_accepted.insert({reads[i], haplotype.substr(starts[i], window)});
+        }
+        require(!distinct_accepted.empty(), "fixture: some read must be accepted");
+        require(counters.dp_cache_hits >= static_cast<std::uint64_t>(distinct_accepted.size()),
+                "every distinct accepted key must be served from the cache on the second pass, or "
+                "nothing was reused");
+        // Every request pays a prefilter, so the old "executed work < requests" form is false by
+        // construction. What reuse actually buys is recursions avoided among the requests that got
+        // as far as a lookup.
+        require(counters.executed_dps < counters.dp_cache_requests,
+                "reuse must have avoided recursions, not merely recorded them");
         std::cout << "  hash-collapsed cache matches the reference at max_gap=" << max_gap << ": "
-                  << accepted << " accepted, " << refused << " refused, " << counters.hits
+                  << accepted << " accepted, " << refused << " refused, " << counters.dp_cache_hits
                   << " hits, worst delta " << worst << '\n';
     }
 }
 
+// The prepared Myers pattern must make the IDENTICAL admit/reject decision as building the masks on
+// the spot, and both must agree with edlib. Preparation moves work out of the hot path; if it moved
+// meaning as well, every placement downstream would be wrong in a way no score comparison would
+// localise. The sweep walks the edit count through band + 3 so both sides of the boundary are
+// exercised, and includes indel-bearing and unrelated reads.
+void test_prepared_myers_pattern_matches_the_unprepared_decision() {
+    std::mt19937_64 rng(31337);
+    std::string haplotype(4000, 'A');
+    for (char& base : haplotype) base = "ACGT"[rng() % 4];
+    haplotype.replace(1500, 12, std::string(12, 'G'));
+
+    const std::size_t length = 100;
+    const std::size_t band = 6;
+    const panvar::LibraryModel model = gap_library(0.002, 3);
+
+    std::size_t compared = 0;
+    std::size_t admitted = 0;
+    std::size_t refused = 0;
+    for (int trial = 0; trial < 4000; ++trial) {
+        const std::size_t start = rng() % (haplotype.size() - length - 8);
+        std::string read;
+        if (trial % 9 == 8) {
+            read.assign(length, 'A');                       // unrelated: far outside any band
+            for (char& base : read) base = "ACGT"[rng() % 4];
+        } else {
+            read = haplotype.substr(start, length);
+            const std::size_t edits = trial % (band + 4);
+            for (std::size_t e = 0; e < edits; ++e) {
+                const std::size_t at = (e * 17 + 5) % length;
+                read[at] = read[at] == 'A' ? 'C' : 'A';
+            }
+            if (trial % 5 == 0 && edits > 0) {
+                read.insert(read.begin() + 20, read[20]);    // one-base insertion
+                read.resize(length);
+            }
+        }
+
+        const panvar::MyersPattern pattern = panvar::prepare_myers_pattern(read);
+        require(pattern.usable && pattern.length == length,
+                "fixture: a 100 bp read must yield a usable prepared pattern");
+        // nullptr rebuilds the masks; the pattern uses the prepared ones. Same decision required.
+        const auto unprepared =
+            panvar::gapped_emission(haplotype, read, start, model, band, nullptr);
+        const auto prepared =
+            panvar::gapped_emission(haplotype, read, start, model, band, &pattern);
+        require(unprepared.has_value() == prepared.has_value(),
+                "the prepared pattern must accept and refuse exactly where rebuilding does");
+        ++compared;
+        if (!prepared.has_value()) { ++refused; continue; }
+        ++admitted;
+        require(prepared->components.size() == unprepared->components.size(),
+                "preparation must not change the consumed-span decomposition");
+        require(prepared->log_emission == unprepared->log_emission,
+                "preparation must not change the emission by even a bit");
+    }
+    require(compared == 4000, "the mutation set must run every case");
+    require(admitted > 0 && refused > 0,
+            "the sweep must both admit and refuse, or one side of the decision is untested");
+    std::cout << "  prepared Myers pattern matches the unprepared decision on " << compared
+              << " cases (" << admitted << " admitted, " << refused << " refused)\n";
+}
+
 int main() {
     try {
+        test_prepared_myers_pattern_matches_the_unprepared_decision();
         test_scaled_emission_matches_the_reference();
         test_emission_cache_matches_the_reference_under_hash_collapse();
         test_gapped_reduces_to_substitution_model();

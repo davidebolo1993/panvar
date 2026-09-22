@@ -1064,10 +1064,17 @@ void test_candidate_prefixes_match_standalone() {
                     // Likewise the exact emission cache's work counters, whenever one is armed.
                     // emission_cache_bytes is deliberately NOT here: that is a declared option and
                     // both runs must agree on it.
-                    "emission_cache_requests", "emission_cache_hits", "emission_cache_misses",
-                    "emission_cache_entries", "emission_cache_payload_bytes",
-                    "emission_cache_executed_prefilters", "emission_cache_executed_dps",
-                    "emission_cache_refusals_not_retained"};
+                    "emission_cache_dp_requests", "emission_cache_dp_hits",
+                    "emission_cache_dp_misses", "emission_cache_entries",
+                    "emission_cache_payload_bytes", "emission_cache_executed_prefilters",
+                    "emission_cache_executed_dps", "emission_cache_entries_not_retained",
+                    // The explicit memory accounts describe the pass's own buffers, which the
+                    // ladder sizes for the union of every prefix.
+                    "scorer_mass_matrix_bytes", "scorer_haplotype_sequence_bytes",
+                    "scorer_form_sequence_bytes", "scorer_piece_index_bytes",
+                    "scorer_emission_cache_table_bytes", "scorer_emission_cache_arena_bytes",
+                    "scorer_placement_rows_peak", "scorer_placement_capacity_bytes_peak",
+                    "scorer_proposed_starts_peak", "scorer_proposed_starts_capacity_bytes_peak"};
                 if (shared_work.count(key) != 0) continue;
                 // K = 0 alone is asymmetric, and legitimately so: a standalone K = 0 run requests no
                 // mosaics, no audit and no prefix, so it builds no beam at all, while the K = 0 VIEW of a

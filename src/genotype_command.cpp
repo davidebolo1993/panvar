@@ -342,14 +342,33 @@ void write_status(
         // identical whether or not it was armed. `payload_bytes` is what the declared budget is
         // spent against and is the figure to size a larger run from.
         const EmissionCacheCounters cache = last_emission_cache_counters();
-        out << "emission_cache_requests\t" << cache.requests << '\n';
-        out << "emission_cache_hits\t" << cache.hits << '\n';
-        out << "emission_cache_misses\t" << cache.misses << '\n';
+        out << "emission_cache_dp_requests\t" << cache.dp_cache_requests << '\n';
+        out << "emission_cache_dp_hits\t" << cache.dp_cache_hits << '\n';
+        out << "emission_cache_dp_misses\t" << cache.dp_cache_misses << '\n';
         out << "emission_cache_entries\t" << cache.entries << '\n';
         out << "emission_cache_payload_bytes\t" << cache.payload_bytes << '\n';
         out << "emission_cache_executed_prefilters\t" << cache.executed_prefilters << '\n';
         out << "emission_cache_executed_dps\t" << cache.executed_dps << '\n';
-        out << "emission_cache_refusals_not_retained\t" << cache.refusals_not_retained << '\n';
+        out << "emission_cache_entries_not_retained\t" << cache.entries_not_retained << '\n';
+    }
+    // Explicit memory accounts of the scoring pass. Counted from the containers themselves, so a
+    // question about where RSS went is answered by an account rather than by reasoning backwards.
+    // Peaks are per worker and folded by max: no two workers hold one haplotype's placements at
+    // once, so summing them would describe a moment that never existed.
+    {
+        const ScorerMemoryAccounts memory = last_scorer_memory_accounts();
+        out << "scorer_mass_matrix_bytes\t" << memory.mass_matrix_bytes << '\n';
+        out << "scorer_haplotype_sequence_bytes\t" << memory.haplotype_sequence_bytes << '\n';
+        out << "scorer_form_sequence_bytes\t" << memory.form_sequence_bytes << '\n';
+        out << "scorer_piece_index_bytes\t" << memory.piece_index_bytes << '\n';
+        out << "scorer_emission_cache_table_bytes\t" << memory.emission_cache_table_bytes << '\n';
+        out << "scorer_emission_cache_arena_bytes\t" << memory.emission_cache_arena_bytes << '\n';
+        out << "scorer_placement_rows_peak\t" << memory.placement_rows_peak << '\n';
+        out << "scorer_placement_capacity_bytes_peak\t" << memory.placement_capacity_bytes_peak
+            << '\n';
+        out << "scorer_proposed_starts_peak\t" << memory.proposed_starts_peak << '\n';
+        out << "scorer_proposed_starts_capacity_bytes_peak\t"
+            << memory.proposed_starts_capacity_bytes_peak << '\n';
     }
     out << "max_state_classes\t" << options.max_state_classes << '\n';
     out << "max_mass_cells\t" << options.max_mass_cells << '\n';
