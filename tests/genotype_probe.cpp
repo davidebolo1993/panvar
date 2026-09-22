@@ -3283,6 +3283,225 @@ int repair_pilot(const Args& args) {
 }
 
 // ------------------------------------------------------------------------------------------------
+// score-set: exactly score a handful of declared diplotypes, and nothing else
+//
+// A candidate's score depends only on its own two haplotypes, the fragments and the library -- never
+// on which other candidates are scored beside it. That is what makes this legitimate: six candidates
+// scored alone carry the same fragment and exposure terms they carried inside a 9,028-candidate
+// union, so a compound candidate can be tested without rebuilding that union.
+//
+// The declared file is <label> <hap1 alleles> <hap2 alleles> [expected total]. Where an expected
+// total is given it MUST reproduce, and the command refuses before reporting anything if it does
+// not: a compound result is only interpretable once the candidates it is compared against are shown
+// to be the same ones that were scored before.
+//
+// Truth is loaded after every candidate is scored, and only to measure distance.
+int score_set(const Args& args) {
+    const std::string out = args.required("out");
+    struct StagedGraphs {
+        std::string prefix;
+        ~StagedGraphs() {
+            std::error_code ignored;
+            std::filesystem::remove(prefix + ".model.sorted.gfa", ignored);
+            std::filesystem::remove(prefix + ".truth.sorted.gfa", ignored);
+        }
+    } staged_graphs{out};
+    const std::string reference = args.required("reference");
+    const std::string donor = args.required("donor");
+    const std::string run = args.required("run");
+    const double switch_probability = std::stod(args.get("switch-probability", "0.01"));
+
+    const LoadedModel loaded =
+        load_model(args.required("model-gfa"), reference, out + ".model.sorted.gfa", 50);
+    const panvar::PreparedGenotypeModel& model = *loaded.model;
+    const std::size_t blocks = model.blocks().size();
+    const auto status = read_key_values(run + ".mosaic_status.tsv");
+    if (status.at("model_fingerprint") != loaded.fingerprint) {
+        throw std::runtime_error("the run was not scored on the rebuilt model");
+    }
+
+    struct Declared {
+        std::string label;
+        std::vector<std::size_t> first;
+        std::vector<std::size_t> second;
+        bool has_expected = false;
+        double expected = 0.0;
+    };
+    std::vector<Declared> declared;
+    {
+        std::ifstream file(args.required("candidates"));
+        if (!file) throw std::runtime_error("cannot read " + args.required("candidates"));
+        for (std::string line; std::getline(file, line);) {
+            if (line.empty() || line[0] == '#') continue;
+            std::stringstream fields(line);
+            std::string label, first, second, expected;
+            if (!std::getline(fields, label, '\t') || !std::getline(fields, first, '\t') ||
+                !std::getline(fields, second, '\t')) {
+                throw std::runtime_error("each candidate needs <label> <hap1> <hap2> [expected total]");
+            }
+            Declared entry;
+            entry.label = label;
+            entry.first = parse_alleles(first);
+            entry.second = parse_alleles(second);
+            if (std::getline(fields, expected, '\t') && expected != "NA" && !expected.empty()) {
+                entry.has_expected = true;
+                entry.expected = std::stod(expected);
+            }
+            if (entry.first.size() != blocks || entry.second.size() != blocks) {
+                throw std::runtime_error("candidate " + label + " needs one allele per block");
+            }
+            declared.push_back(std::move(entry));
+        }
+    }
+    if (declared.empty()) throw std::runtime_error("no candidates declared");
+
+    const panvar::LibraryModel library = read_library_file(args.required("library"));
+    const std::vector<panvar::ReadPair> fragments =
+        read_pairs(args.required("reads1"), args.required("reads2"));
+
+    std::vector<panvar::MosaicPath> paths;
+    std::vector<std::string> sequences;
+    std::map<std::vector<std::size_t>, std::size_t> slot_of_path;
+    const auto slot_for = [&](const std::vector<std::size_t>& alleles) {
+        const auto found = slot_of_path.find(alleles);
+        if (found != slot_of_path.end()) return found->second;
+        const std::size_t slot = paths.size();
+        slot_of_path.emplace(alleles, slot);
+        paths.push_back(panvar::MosaicPath{alleles});
+        sequences.push_back(panvar::spell_mosaic(model, panvar::MosaicPath{alleles}).bases);
+        return slot;
+    };
+    std::vector<std::pair<std::size_t, std::size_t>> slots;
+    for (const Declared& entry : declared) slots.push_back({slot_for(entry.first), slot_for(entry.second)});
+
+    const panvar::InternedHaplotypes interned = panvar::intern_haplotypes(paths, sequences);
+    std::map<std::pair<std::size_t, std::size_t>, std::size_t> scored_index;
+    std::vector<panvar::HaplotypeCandidate> scored_pairs;
+    std::vector<std::size_t> pair_of_declared(declared.size(), 0);
+    for (std::size_t i = 0; i < declared.size(); ++i) {
+        std::size_t x = interned.index_of[slots[i].first];
+        std::size_t y = interned.index_of[slots[i].second];
+        if (y < x) std::swap(x, y);
+        const auto inserted = scored_index.emplace(std::make_pair(x, y), scored_pairs.size());
+        if (inserted.second) scored_pairs.push_back({x, y});
+        pair_of_declared[i] = inserted.first->second;
+    }
+
+    panvar::FragmentScoringOptions scoring;
+    scoring.threads = std::stoul(args.get("threads", "8"));
+    scoring.mismatch_band = std::stoul(status.at("mismatch_band"));
+    scoring.minimum_piece_bp = 12;
+    scoring.max_piece_hits = std::stoull(status.at("max_piece_hits"));
+    scoring.max_proposed_starts_per_haplotype = std::stoull(status.at("max_proposed_starts_per_haplotype"));
+    scoring.max_physical_origins = std::stoull(status.at("max_physical_origins"));
+    scoring.max_state_classes = std::stoull(status.at("max_state_classes"));
+    scoring.max_mass_cells = std::stoull(status.at("max_mass_cells"));
+    scoring.emission_cache_bytes = static_cast<std::size_t>(std::stoull(status.at("emission_cache_bytes")));
+    const auto mark = std::chrono::steady_clock::now();
+    const panvar::FragmentScoringResult scored =
+        panvar::score_diplotypes(interned, scored_pairs, fragments, library, scoring);
+    const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - mark).count();
+
+    const std::vector<double> switches(blocks - 1, switch_probability);
+    std::vector<double> prior_of_pair(scored_pairs.size(), 0.0);
+    for (std::size_t slot = 0; slot < scored_pairs.size(); ++slot) {
+        prior_of_pair[slot] = panvar::log_unordered_sequence_pair_prior(
+            model, interned.sequences[scored_pairs[slot].first],
+            interned.sequences[scored_pairs[slot].second], switches);
+    }
+
+    // Reproduction first: a declared expectation that does not reproduce refuses the whole report.
+    std::size_t checked = 0;
+    std::size_t failed = 0;
+    double worst = 0.0;
+    for (std::size_t i = 0; i < declared.size(); ++i) {
+        if (!declared[i].has_expected) continue;
+        const std::size_t slot = pair_of_declared[i];
+        const double total = scored.scores[slot].log_likelihood + prior_of_pair[slot];
+        const double delta = std::fabs(total - declared[i].expected);
+        ++checked;
+        if (delta > 1e-6) {
+            ++failed;
+            worst = std::max(worst, delta);
+        }
+    }
+    if (failed != 0) {
+        std::cout << "score-set " << donor << ": REFUSED, " << failed << " of " << checked
+                  << " declared expectations did not reproduce (worst delta " << worst << ")\n";
+        return 4;
+    }
+
+    // Truth enters only now.
+    const SortedGraph truth_graph = load_truth_in_model_frame(
+        args.required("truth-gfa"), reference, loaded.sorted, out + ".truth.sorted.gfa");
+    std::vector<panvar::PathProjection> truth;
+    for (const panvar::PathRecord* path : donor_paths(truth_graph.graph, donor)) {
+        const auto projection = panvar::project_path_onto_locus(truth_graph.graph, loaded.bubbles,
+                                                                loaded.built.report, path->name);
+        if (!projection.has_value()) throw std::runtime_error("truth does not span the block chain");
+        truth.push_back(*projection);
+    }
+    const auto spelling = [&](std::size_t b, std::size_t allele) -> const std::string& {
+        return model.blocks()[b].alleles[allele].sequence;
+    };
+    const auto block_distance = [&](std::size_t b, std::size_t a1, std::size_t a2) -> long {
+        if (!truth[0].blocks[b].has_value() || !truth[1].blocks[b].has_value()) return -1;
+        const std::string& t1 = *truth[0].blocks[b];
+        const std::string& t2 = *truth[1].blocks[b];
+        return std::min(edit_distance(t1, spelling(b, a1)) + edit_distance(t2, spelling(b, a2)),
+                        edit_distance(t1, spelling(b, a2)) + edit_distance(t2, spelling(b, a1)));
+    };
+    std::vector<long> block_floor(blocks, 0);
+    long floor_total = 0;
+    for (std::size_t b = 0; b < blocks; ++b) {
+        if (!truth[0].blocks[b].has_value() || !truth[1].blocks[b].has_value()) continue;
+        bool available = false;
+        block_floor[b] = closest_allele_distance(*truth[0].blocks[b], model.blocks()[b], available) +
+                         closest_allele_distance(*truth[1].blocks[b], model.blocks()[b], available);
+        floor_total += block_floor[b];
+    }
+
+    std::ofstream table(out + ".scores.tsv");
+    table << std::setprecision(12)
+          << "label\tsequence_pair\thap1_alleles\thap2_alleles\tfragment_term\texposure_term\tprior\t"
+             "total\texpected_total\treproduced\tdistance\tfloor\texcess\n";
+    std::ofstream per_block(out + ".blocks.tsv");
+    per_block << "label\tblock\tblock_id\tkind\tallele1\tallele2\tblock_distance\tblock_floor\tblock_excess\n";
+    const auto join = [](const std::vector<std::size_t>& v) {
+        std::string text;
+        for (std::size_t i = 0; i < v.size(); ++i) {
+            if (i != 0) text += ',';
+            text += std::to_string(v[i]);
+        }
+        return text;
+    };
+    for (std::size_t i = 0; i < declared.size(); ++i) {
+        const std::size_t slot = pair_of_declared[i];
+        const double total = scored.scores[slot].log_likelihood + prior_of_pair[slot];
+        long distance = 0;
+        for (std::size_t b = 0; b < blocks; ++b) {
+            const long d = block_distance(b, declared[i].first[b], declared[i].second[b]);
+            if (d < 0) continue;
+            distance += d;
+            per_block << declared[i].label << '\t' << b << '\t' << model.blocks()[b].block_id << '\t'
+                      << (model.blocks()[b].kind == panvar::GenotypeBlockKind::Variant ? "SV" : "context")
+                      << '\t' << declared[i].first[b] << '\t' << declared[i].second[b] << '\t' << d << '\t'
+                      << block_floor[b] << '\t' << (d - block_floor[b]) << '\n';
+        }
+        table << declared[i].label << '\t' << slot << '\t' << join(declared[i].first) << '\t'
+              << join(declared[i].second) << '\t' << scored.scores[slot].fragment_term << '\t'
+              << scored.scores[slot].exposure_term << '\t' << prior_of_pair[slot] << '\t' << total << '\t'
+              << (declared[i].has_expected ? std::to_string(declared[i].expected) : std::string("NA"))
+              << '\t' << (declared[i].has_expected ? "true" : "NA") << '\t' << distance << '\t'
+              << floor_total << '\t' << (distance - floor_total) << '\n';
+    }
+    std::cout << "score-set " << donor << ": " << declared.size() << " declared, " << scored_pairs.size()
+              << " distinct diplotypes, " << interned.sequences.size() << " unique haplotypes, " << checked
+              << " expectations reproduced, " << seconds << "s scoring\n";
+    return 0;
+}
+
+// ------------------------------------------------------------------------------------------------
 // form-census: how much placement work is spent re-scanning read sequence that already occurred
 // ------------------------------------------------------------------------------------------------
 
@@ -3762,7 +3981,7 @@ int genotype(const Args& args) {
 int main(int argc, char** argv) {
     try {
         if (argc < 2) {
-            std::cerr << "usage: genotype_probe simulate|loo-gfa|evaluate|compare|genotype|trace|anchors|subsample|preflight|respell|coverage-audit|form-census|mosaic-truth|orientations|panel-alleles|tied-consensus --key value ...\n";
+            std::cerr << "usage: genotype_probe simulate|loo-gfa|evaluate|compare|genotype|trace|anchors|subsample|preflight|respell|coverage-audit|form-census|mosaic-truth|orientations|panel-alleles|tied-consensus|score-set --key value ...\n";
             return 2;
         }
         const std::string command = argv[1];
@@ -3784,6 +4003,7 @@ int main(int argc, char** argv) {
         if (command == "panel-alleles") return panel_alleles(args);
         if (command == "tied-consensus") return tied_consensus(args);
         if (command == "repair-pilot") return repair_pilot(args);
+        if (command == "score-set") return score_set(args);
         std::cerr << "unknown probe command: " << command << '\n';
         return 2;
     } catch (const std::exception& error) {
