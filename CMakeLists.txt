@@ -318,6 +318,13 @@ if(PANVAR_BUILD_TESTING)
         add_test(NAME panvar_genotype_ladder_selection
                  COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/tests/genotype_select_ladder_test.py
                          ${CMAKE_CURRENT_SOURCE_DIR}/scripts/select_genotype_ladder.py)
+        # The LOO development campaign's input binding and completeness accounting. Changed read
+        # content, a salted thinning, a missing mate, a failed call, a failed evaluation and a missing
+        # status must each REFUSE rather than report: an earlier revision swallowed evaluate failures
+        # and reported success while 22 of 38 accuracy blocks were missing.
+        add_test(NAME panvar_genotype_loo_development_gates
+                 COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/genotype_loo_c4_development_gates.sh
+                         ${CMAKE_CURRENT_BINARY_DIR}/genotype_loo_dev_gates)
 
         # Fast, dependency-free smoke on a tiny hand-built graph that exercises every
         # call event type + confounders with exact-record assertions (no vg needed).
