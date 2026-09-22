@@ -10,6 +10,7 @@
 #include <functional>
 #include <iostream>
 #include <map>
+#include <random>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -1110,8 +1111,107 @@ void test_component_factorisation_and_collapse() {
               << " (must be > 0)\n";
 }
 
+// -------------------------------------------------------------------------------------------
+// The optimised emission against the committed log-space reference.
+//
+// This gate carries weight that none of the others can. enumerate_placements_exhaustive calls
+// gapped_emission, which is now the SCALED path, so the exposure identity, the factorisation gate
+// and the scorer-versus-oracle comparison all exercise the optimised arithmetic on both sides and
+// cannot tell it apart from the reference. gapped_emission_reference is kept in the library so that
+// this comparison is against the implementation the model was actually gated on.
+//
+// Identical REFUSAL is the prefilter's contract. The prefilter minimises edits over every target
+// prefix, a superset of the consumed spans the model admits, so its minimum can only undershoot the
+// constrained one -- it may over-admit, never falsely reject. The fixtures below therefore walk the
+// edit count from zero through band + 2, so both sides of that boundary are exercised.
+// -------------------------------------------------------------------------------------------
+void test_scaled_emission_matches_the_reference() {
+    std::mt19937_64 rng(90210);
+    std::string haplotype(400, 'A');
+    for (char& base : haplotype) base = "ACGT"[rng() % 4];
+    // A homopolymer, so one-base indels are genuinely ambiguous rather than unique.
+    haplotype.replace(150, 10, std::string(10, 'T'));
+
+    std::size_t compared = 0;
+    std::size_t accepted = 0;
+    std::size_t refused = 0;
+    std::size_t multi_component = 0;
+    double worst_component = 0.0;
+    double worst_total = 0.0;
+
+    for (double error : {0.002, 0.02}) {
+        for (std::size_t max_gap : {0, 1, 3}) {
+            const panvar::LibraryModel model = gap_library(error, max_gap);
+            for (std::size_t band : {2, 6}) {
+                // Interior starts, a boundary start, and one inside the homopolymer.
+                for (std::size_t start : {0, 37, 148, 290, 400 - 60}) {
+                    const std::size_t length = 60;
+                    if (start + length > haplotype.size()) continue;
+                    for (std::size_t edits = 0; edits <= band + 2; ++edits) {
+                        std::string read = haplotype.substr(start, length);
+                        // Substitutions at spread positions, then a one-base indel for the widest
+                        // cases so gapped shapes carry real mass rather than only substitutions.
+                        for (std::size_t e = 0; e < edits && e < length; ++e) {
+                            const std::size_t at = (e * 7 + 3) % length;
+                            read[at] = read[at] == 'A' ? 'C' : 'A';
+                        }
+                        if (max_gap > 0 && edits > 0 && start == 148) {
+                            read.insert(read.begin() + 5, 'T');   // homopolymer insertion
+                        }
+
+                        const auto fast =
+                            panvar::gapped_emission(haplotype, read, start, model, band);
+                        const auto reference =
+                            panvar::gapped_emission_reference(haplotype, read, start, model, band);
+                        ++compared;
+                        require(fast.has_value() == reference.has_value(),
+                                "the optimised emission must accept and refuse exactly where the "
+                                "reference does: a prefilter that rejects a placement carrying mass "
+                                "is a false negative, which this model cannot tolerate");
+                        if (!fast.has_value()) { ++refused; continue; }
+                        ++accepted;
+                        if (fast->components.size() > 1) ++multi_component;
+                        require(fast->components.size() == reference->components.size(),
+                                "the two must report the same consumed-span classes");
+                        for (std::size_t c = 0; c < fast->components.size(); ++c) {
+                            require(fast->components[c].consumed_bp ==
+                                        reference->components[c].consumed_bp,
+                                    "component consumed spans must match exactly");
+                            require(fast->components[c].edits == reference->components[c].edits,
+                                    "component edit counts must match exactly");
+                            const double gap = std::abs(fast->components[c].log_emission -
+                                                        reference->components[c].log_emission);
+                            worst_component = std::max(worst_component, gap);
+                        }
+                        worst_total =
+                            std::max(worst_total, std::abs(fast->log_emission -
+                                                           reference->log_emission));
+                        require(fast->consumed_bp == reference->consumed_bp,
+                                "the highest-mass consumed span must agree");
+                    }
+                }
+            }
+        }
+    }
+    // A declared tolerance, not a fitted one: scaled probability space differs from log space only
+    // by floating-point rounding, and 1e-9 in a log mass is far below any separation that decides a
+    // call while still being orders of magnitude above the rounding actually observed.
+    require(worst_component < 1e-9,
+            "every consumed-span component must match the reference within the declared tolerance");
+    require(worst_total < 1e-9, "the whole-read emission must match the reference likewise");
+    // Non-vacuity, all three: the sweep must accept, must refuse, and must produce gapped classes.
+    require(accepted > 0 && refused > 0 && multi_component > 0,
+            "the sweep must exercise acceptance, refusal and multi-component placements, or it "
+            "certifies far less than it appears to");
+    std::cout << "  scaled emission matches the log-space reference on " << compared
+              << " placements (" << accepted << " accepted, " << refused << " refused, "
+              << multi_component << " multi-component); worst component delta " << worst_component
+              << ", worst total delta " << worst_total << '\n';
+}
+
 int main() {
     try {
+        test_scaled_emission_matches_the_reference();
         test_gapped_reduces_to_substitution_model();
         test_gapped_emission_normalises();
         test_one_base_homopolymer_insertion();

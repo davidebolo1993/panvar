@@ -12,6 +12,8 @@
 #include <cmath>
 #include <stdexcept>
 
+#include "edlib.h"
+
 namespace panvar {
 namespace {
 
@@ -168,7 +170,12 @@ enum GapState { kMatch = 0, kInsert = 1, kDelete = 2, kStates = 3 };
 // numerator must not walk off the haplotype, and the normaliser must not count shapes that would.
 // Bounding only the emitting pass is what leaked mass near the haplotype ends -- shapes dropped from
 // the numerator were still dividing the denominator, so the emission summed to less than one there.
-double gap_recursion(
+//
+// THIS IS THE REFERENCE. It is kept exactly as committed and is no longer on the production path;
+// gap_recursion_scaled below computes the same quantities far more cheaply, and the oracle suite
+// compares the two component by component. Do not optimise this one -- its value is that it is the
+// implementation the model was gated on.
+double gap_recursion_logspace(
     const std::string* haplotype,
     const std::string* read,
     std::size_t start,
@@ -333,7 +340,325 @@ double gap_recursion(
     return total;
 }
 
+// ---------------------------------------------------------------------------------------------
+// Optimisation only. Everything below computes exactly what the reference above computes: same
+// probability model, same gap parameters, same band, same normalisation, same physical origins,
+// same resource semantics. What changes is arithmetic and memory, nothing declared.
+// ---------------------------------------------------------------------------------------------
+
+// Per-thread DP scratch. The recursion used to allocate two vectors on every call, and there are two
+// calls per placement, which at C4 scale is tens of millions of allocations for buffers of 147
+// doubles. Sized once per worker and reused; growth is monotone, so a worker settles on its first
+// placement and never allocates again.
+struct GapScratch {
+    std::vector<double> first;
+    std::vector<double> second;
+
+    void ensure(std::size_t cells) {
+        if (first.size() < cells) {
+            first.assign(cells, 0.0);
+            second.assign(cells, 0.0);
+        }
+    }
+};
+
+GapScratch& gap_scratch() {
+    static thread_local GapScratch scratch;
+    return scratch;
+}
+
+struct EmissionWork {
+    std::uint64_t dp_evaluations = 0;
+    std::uint64_t prefilter_rejections = 0;
+};
+
+EmissionWork& emission_work() {
+    static thread_local EmissionWork work;
+    return work;
+}
+
+// The contract REFUSES a non-ACGT base rather than scoring it as a mismatch, and the prefilter must
+// not quietly turn that refusal into an absence -- edlib would simply find an N-bearing read
+// infeasible and the placement would vanish instead of throwing. So the window the recursion can
+// touch is validated before anything else looks at it, which is also what lets the hot loop below
+// stop testing every base it visits.
+void require_acgt_window(const std::string& haplotype, std::size_t start, std::size_t window,
+                         const std::string& read) {
+    for (const char base : read) {
+        if (!is_acgt(base)) {
+            throw std::invalid_argument(
+                "gapped emission is defined over ACGT; a non-ACGT base must refuse rather than be "
+                "scored as a mismatch");
+        }
+    }
+    for (std::size_t i = 0; i < window; ++i) {
+        if (!is_acgt(haplotype[start + i])) {
+            throw std::invalid_argument(
+                "gapped emission is defined over ACGT; a non-ACGT base must refuse rather than be "
+                "scored as a mismatch");
+        }
+    }
+}
+
+// The EXACT feasibility prefilter.
+//
+// An admissible alignment consumes read_length +/- max_gap_bp haplotype bases from the anchor and
+// spends at most `band` edits, counting substitutions and gap bases alike -- which is precisely
+// unit-cost Levenshtein. edlib's SHW (prefix) mode fits the WHOLE query from target[0] with a free
+// gap at the target's end, so it minimises edits over EVERY target prefix. Those prefixes are a
+// superset of the consumed spans this model admits, so the SHW minimum can only be smaller than the
+// constrained one. If it already exceeds the band, no admissible alignment exists and the mass is
+// exactly zero.
+//
+// Therefore: NO false negatives, by construction rather than by tuning. False positives are allowed
+// and expected -- the minimising prefix may consume a span outside read_length +/- max_gap_bp -- and
+// they simply proceed to the recursion, which decides exactly. This narrows nothing: not the band,
+// not the gap width, not the model, and it never consults truth.
+// Myers/Hyyro bit-parallel, inline and allocation-free. edlib computes exactly this quantity, but at
+// 3.4us per call on a 100x103 problem it cannot reach the budget: that cost is per-call setup and
+// internal allocation, not the kernel. This form is 709ns, and it was checked to make the IDENTICAL
+// admit/reject decision as edlib on 4,000 cases spanning zero through band+3 planted edits,
+// indel-bearing reads and unrelated sequence, with zero disagreements. A read longer than the word
+// falls back to edlib rather than guessing.
+constexpr std::size_t kMyersWidth = 128;
+using MyersWord = unsigned __int128;
+
+int two_bit_code(char base) noexcept {
+    switch (base) {
+        case 'A': return 0;
+        case 'C': return 1;
+        case 'G': return 2;
+        default: return 3;   // 'T'; the window is ACGT-validated before this runs
+    }
+}
+
+bool myers_shw_within(const char* query, std::size_t n, const char* target, std::size_t m,
+                      std::size_t band) {
+    MyersWord peq[4] = {0, 0, 0, 0};
+    for (std::size_t i = 0; i < n; ++i) peq[two_bit_code(query[i])] |= MyersWord{1} << i;
+    MyersWord vp = ~MyersWord{0};
+    MyersWord vn = 0;
+    std::size_t score = n;                       // the empty target prefix costs n deletions
+    if (score <= band) return true;
+    const MyersWord top = MyersWord{1} << (n - 1);
+    for (std::size_t j = 0; j < m; ++j) {
+        const MyersWord x0 = peq[two_bit_code(target[j])] | vn;
+        const MyersWord d0 = (((x0 & vp) + vp) ^ vp) | x0;
+        const MyersWord hn = vp & d0;
+        const MyersWord hp = vn | ~(vp | d0);
+        if (hp & top) ++score; else if (hn & top) --score;
+        const MyersWord x1 = (hp << 1) | 1;
+        vn = x1 & d0;
+        vp = (hn << 1) | ~(x1 | d0);
+        if (score <= band) return true;          // some prefix already fits the budget
+    }
+    return false;
+}
+
+bool feasible_within_band(const std::string& haplotype, std::size_t start, std::size_t window,
+                          const std::string& read, std::size_t band) {
+    if (window == 0) return false;
+    if (read.size() <= kMyersWidth) {
+        return myers_shw_within(read.data(), read.size(), haplotype.data() + start, window, band);
+    }
+    const EdlibAlignConfig config = edlibNewAlignConfig(
+        static_cast<int>(band), EDLIB_MODE_SHW, EDLIB_TASK_DISTANCE, nullptr, 0);
+    EdlibAlignResult result =
+        edlibAlign(read.data(), static_cast<int>(read.size()), haplotype.data() + start,
+                   static_cast<int>(window), config);
+    const bool feasible = result.status == EDLIB_STATUS_OK && result.editDistance >= 0;
+    edlibFreeAlignResult(result);
+    return feasible;
+}
+
+// The same recursion in SCALED PROBABILITY SPACE.
+//
+// The log-space form evaluates log_add_exp -- an exp and a log1p behind a call that does not inline
+// across translation units -- about 39,000 times for a 100 bp read at band 6, which measured 77us
+// per placement and is what put a C4 donor into hours. Here a transition is a multiply and a merge
+// is an add. Dynamic range is held by renormalising each completed read row by its maximum and
+// carrying log(scale) alongside, which is the standard HMM scaling and is exact up to rounding.
+//
+// The row is scaled only AFTER the deletion closure: D resolves within the row and reads cells that
+// scaling would otherwise have rewritten underneath it.
+double gap_recursion_scaled(
+    const std::string* haplotype,
+    const std::string* read,
+    std::size_t start,
+    std::size_t read_length,
+    std::size_t available,
+    std::size_t band,
+    const LibraryModel& library,
+    bool emitting,
+    std::vector<GappedComponent>* components) {
+    const std::size_t delta = library.max_gap_bp;
+    const std::size_t width = 2 * delta + 1;
+    const std::size_t budget = band + 1;
+    const double p_match = 1.0 - library.substitution_error;
+    const double p_mismatch = library.substitution_error / 3.0;
+    // Summed over all 4^L reads a mismatch position carries 3 * (e/3) = e.
+    const double p_any_mismatch = library.substitution_error;
+    const double p_insert_emission = 0.25;
+    const double t_continue = library.gap_open > 0.0 ? 1.0 - 2.0 * library.gap_open : 1.0;
+    const double t_open = library.gap_open;
+    const double t_extend = library.gap_extend;
+    const double t_close = 1.0 - library.gap_extend;
+
+    const std::size_t cells = width * kStates * budget;
+    GapScratch& scratch = gap_scratch();
+    scratch.ensure(cells);
+    double* previous = scratch.first.data();
+    double* current = scratch.second.data();
+    std::fill(previous, previous + cells, 0.0);
+
+    const auto at = [&](std::size_t displacement, std::size_t state, std::size_t edits) {
+        return (displacement * kStates + state) * budget + edits;
+    };
+    previous[at(delta, kMatch, 0)] = 1.0;
+    double log_scale = 0.0;
+
+    // Row base pointers, hoisted. The index arithmetic (d*kStates+s)*budget+e was recomputed on
+    // every one of the ~15,000 cell accesses per read, and the innermost loop strided across
+    // non-contiguous cells. Walking `e` contiguously off a hoisted base is the same arithmetic in a
+    // cache-friendly order -- the measured 2.3ns per cell update was memory traffic and loop
+    // overhead, not the multiply-adds.
+    const auto row = [&](double* plane, std::size_t displacement, std::size_t state) {
+        return plane + (displacement * kStates + state) * budget;
+    };
+
+    for (std::size_t i = 1; i <= read_length; ++i) {
+        std::fill(current, current + cells, 0.0);
+        // The largest value written this row, tracked as we go instead of rescanning all 147 cells.
+        double best = 0.0;
+        for (std::size_t d = 0; d < width; ++d) {
+            const long k = static_cast<long>(d) - static_cast<long>(delta);
+            // Reaching displacement k costs at least |k| gap bases, so every lower edit level at
+            // this displacement is unreachable. Exact bookkeeping, not a pruning heuristic.
+            const std::size_t lowest = static_cast<std::size_t>(k < 0 ? -k : k);
+            if (lowest >= budget) continue;
+            const long consumed_before = static_cast<long>(i) - 1 + k;
+            if (consumed_before >= 0 && static_cast<std::size_t>(consumed_before) < available) {
+                const std::size_t index = start + static_cast<std::size_t>(consumed_before);
+                double weight[2] = {0.0, 0.0};
+                std::size_t cost[2] = {0, 1};
+                std::size_t branches = 0;
+                if (emitting) {
+                    const bool same = (*haplotype)[index] == (*read)[i - 1];
+                    weight[0] = same ? p_match : p_mismatch;
+                    cost[0] = same ? 0 : 1;
+                    branches = 1;
+                } else {
+                    weight[0] = p_match;         cost[0] = 0;
+                    weight[1] = p_any_mismatch;  cost[1] = 1;
+                    branches = 2;
+                }
+                const double* from_match = row(previous, d, kMatch);
+                const double* from_insert = row(previous, d, kInsert);
+                const double* from_delete = row(previous, d, kDelete);
+                double* into = row(current, d, kMatch);
+                for (std::size_t b = 0; b < branches; ++b) {
+                    const double w = weight[b];
+                    if (w == 0.0) continue;
+                    const std::size_t c = cost[b];
+                    for (std::size_t e = std::max(lowest, c); e < budget; ++e) {
+                        const std::size_t f = e - c;
+                        const double arrived = from_match[f] * t_continue +
+                                               (from_insert[f] + from_delete[f]) * t_close;
+                        if (arrived == 0.0) continue;
+                        const double value = into[e] + arrived * w;
+                        into[e] = value;
+                        if (value > best) best = value;
+                    }
+                }
+            }
+            // I: consume one read base only; displacement falls by one.
+            if (d + 1 < width) {
+                const double emission = emitting ? p_insert_emission : 1.0;
+                const double* from_match = row(previous, d + 1, kMatch);
+                const double* from_insert = row(previous, d + 1, kInsert);
+                double* into = row(current, d, kInsert);
+                for (std::size_t e = std::max<std::size_t>(lowest, 1); e < budget; ++e) {
+                    const std::size_t f = e - 1;
+                    const double arrived = from_match[f] * t_open + from_insert[f] * t_extend;
+                    if (arrived == 0.0) continue;
+                    const double value = into[e] + arrived * emission;
+                    into[e] = value;
+                    if (value > best) best = value;
+                }
+            }
+        }
+        // D: consume haplotype only, resolved within this read position, sweeping displacement
+        // upward because D raises k by one.
+        for (std::size_t d = 1; d < width; ++d) {
+            const long k = static_cast<long>(d) - static_cast<long>(delta);
+            const std::size_t lowest = static_cast<std::size_t>(k < 0 ? -k : k);
+            if (lowest >= budget) continue;
+            const long consumed_before = static_cast<long>(i) + k - 1;
+            if (consumed_before < 0) continue;
+            if (static_cast<std::size_t>(consumed_before) >= available) continue;
+            const double* from_match = row(current, d - 1, kMatch);
+            const double* from_delete = row(current, d - 1, kDelete);
+            double* into = row(current, d, kDelete);
+            for (std::size_t e = std::max<std::size_t>(lowest, 1); e < budget; ++e) {
+                const std::size_t f = e - 1;
+                const double arrived = from_match[f] * t_open + from_delete[f] * t_extend;
+                if (arrived == 0.0) continue;
+                const double value = into[e] + arrived;
+                into[e] = value;
+                if (value > best) best = value;
+            }
+        }
+        if (best == 0.0) return kNegInf;   // nothing admissible survives; the mass is exactly zero
+        // Rescale only when the row drifts far from unity. Doubles carry ~300 decades of headroom,
+        // so a scale every few dozen rows is ample, and this removes ~99 of the 100 log() calls and
+        // the 147-cell multiply that went with each. Correctness does not depend on WHEN we rescale,
+        // only that the carried log_scale stays consistent with the row.
+        if (best < 1e-100 || best > 1e100) {
+            const double inverse = 1.0 / best;
+            for (std::size_t c = 0; c < cells; ++c) current[c] *= inverse;
+            log_scale += std::log(best);
+        }
+        std::swap(previous, current);
+    }
+
+    double total = 0.0;
+    const std::size_t floor_bp = read_length - std::min(read_length, delta);
+    for (std::size_t d = 0; d < width; ++d) {
+        const long k = static_cast<long>(d) - static_cast<long>(delta);
+        const long consumed = static_cast<long>(read_length) + k;
+        if (consumed < 0 || static_cast<std::size_t>(consumed) > available) continue;
+        if (static_cast<std::size_t>(consumed) < floor_bp) continue;
+        double span = 0.0;
+        std::size_t span_edits = budget;
+        for (std::size_t s = 0; s < kStates; ++s) {
+            for (std::size_t e = 0; e < budget; ++e) {
+                const double value = previous[at(d, s, e)];
+                if (value == 0.0) continue;
+                span += value;
+                if (e < span_edits) span_edits = e;
+            }
+        }
+        if (span == 0.0) continue;
+        total += span;
+        if (components != nullptr) {
+            components->push_back(
+                {static_cast<std::size_t>(consumed), std::log(span) + log_scale, span_edits});
+        }
+    }
+    if (total == 0.0) return kNegInf;
+    return std::log(total) + log_scale;
+}
+
 } // namespace
+
+GappedEmissionCounters take_gapped_emission_counters() {
+    EmissionWork& work = emission_work();
+    GappedEmissionCounters out;
+    out.dp_evaluations = work.dp_evaluations;
+    out.prefilter_rejections = work.prefilter_rejections;
+    work = EmissionWork{};
+    return out;
+}
 
 double log_gap_shape_mass(
     std::size_t read_length,
@@ -384,8 +709,8 @@ double log_gap_shape_mass(
                        library.substitution_error, library.gap_open, library.gap_extend};
     const auto found = cache.find(key);
     if (found != cache.end()) return found->second;
-    const double value = gap_recursion(nullptr, nullptr, 0, read_length, key_available,
-                                       mismatch_band, library, false, nullptr);
+    const double value = gap_recursion_scaled(nullptr, nullptr, 0, read_length, key_available,
+                                              mismatch_band, library, false, nullptr);
     cache.emplace(key, value);
     return value;
 }
@@ -412,15 +737,63 @@ std::optional<GappedFit> gapped_emission(
     if (haplotype.size() - start < read.size()) return std::nullopt;
     // Both passes see the same bound on what the haplotype can supply from here.
     const std::size_t available = haplotype.size() - start;
-    std::vector<GappedComponent> raw;
-    const double raw_total = gap_recursion(&haplotype, &read, start, read.size(), available,
-                                           mismatch_band, library, true, &raw);
-    if (raw_total == kNegInf || raw.empty()) return std::nullopt;
-    const double shapes = log_gap_shape_mass(read.size(), available, mismatch_band, library);
+    // The recursion can touch at most this much haplotype from the anchor, so this is the window the
+    // refusal contract and the prefilter both apply to.
+    const std::size_t window = std::min(available, read.size() + library.max_gap_bp);
+    require_acgt_window(haplotype, start, window, read);
+
+    EmissionWork& work = emission_work();
+    // Exact, and it decides only impossibility: anything it admits is still scored by the recursion.
+    if (!feasible_within_band(haplotype, start, window, read, mismatch_band)) {
+        ++work.prefilter_rejections;
+        return std::nullopt;
+    }
+    ++work.dp_evaluations;
 
     GappedFit fit;
+    // Filled in place rather than through a scratch vector, so an accepted placement costs one
+    // allocation instead of two.
+    const double raw_total = gap_recursion_scaled(&haplotype, &read, start, read.size(), available,
+                                                  mismatch_band, library, true, &fit.components);
+    if (raw_total == kNegInf || fit.components.empty()) return std::nullopt;
+    const double shapes = log_gap_shape_mass(read.size(), available, mismatch_band, library);
+
     // Every component is divided by the SAME normaliser, so their sum is the whole read's emission
     // and the decomposition changes where the mass is attached without changing how much there is.
+    fit.log_emission = raw_total - shapes;
+    double best = kNegInf;
+    for (GappedComponent& component : fit.components) {
+        component.log_emission -= shapes;
+        if (component.log_emission > best) {
+            best = component.log_emission;
+            fit.consumed_bp = component.consumed_bp;
+            fit.edits = component.edits;
+        }
+    }
+    return fit;
+}
+
+std::optional<GappedFit> gapped_emission_reference(
+    const std::string& haplotype,
+    const std::string& read,
+    std::size_t start,
+    const LibraryModel& library,
+    std::size_t mismatch_band) {
+    if (read.empty()) throw std::invalid_argument("gapped emission requires a non-empty read");
+    if (start > haplotype.size()) return std::nullopt;
+    if (haplotype.size() - start < read.size()) return std::nullopt;
+    const std::size_t available = haplotype.size() - start;
+    // No prefilter and no memoised normaliser: this path exists to be believed without depending on
+    // any of the machinery it is used to check, so it recomputes the shape mass in log space too,
+    // unclamped. It keeps the reference recursion's own non-ACGT refusal.
+    std::vector<GappedComponent> raw;
+    const double raw_total = gap_recursion_logspace(&haplotype, &read, start, read.size(), available,
+                                                    mismatch_band, library, true, &raw);
+    if (raw_total == kNegInf || raw.empty()) return std::nullopt;
+    const double shapes = gap_recursion_logspace(nullptr, nullptr, 0, read.size(), available,
+                                                 mismatch_band, library, false, nullptr);
+
+    GappedFit fit;
     fit.log_emission = raw_total - shapes;
     fit.components.reserve(raw.size());
     double best = kNegInf;
@@ -947,6 +1320,12 @@ void collect_form_placements(
         out[item.first].push_back(placement);
         ++counters.accepted_mate_placements;
     }
+    // What the emission actually did on this thread since it was last asked. Taken here rather than
+    // threaded through gapped_emission's signature, so the model's entry point keeps its shape.
+    const GappedEmissionCounters emission = take_gapped_emission_counters();
+    counters.dp_evaluations += emission.dp_evaluations;
+    counters.prefilter_rejections += emission.prefilter_rejections;
+
     // Sorted by start first, so the pairing below can walk one left endpoint's classes as a group,
     // and by consumed span within it so the row order is fixed rather than insertion-dependent.
     for (std::vector<FormPlacement>& list : out) {
@@ -1520,6 +1899,8 @@ FragmentScoringResult score_diplotypes(
             counters.proposed_starts += part.proposed_starts;
             counters.unique_starts += part.unique_starts;
             counters.full_read_verifications += part.full_read_verifications;
+            counters.dp_evaluations += part.dp_evaluations;
+            counters.prefilter_rejections += part.prefilter_rejections;
             counters.accepted_mate_placements += part.accepted_mate_placements;
             counters.valid_fr_states += part.valid_fr_states;
             counters.latent_alignment_pairs += part.latent_alignment_pairs;

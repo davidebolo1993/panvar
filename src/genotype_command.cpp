@@ -522,6 +522,12 @@ void write_status(
         out << "proposed_starts\t" << counters.proposed_starts << '\n';
         out << "unique_starts\t" << counters.unique_starts << '\n';
         out << "full_read_verifications\t" << counters.full_read_verifications << '\n';
+        // How the verifications split: the pair-HMM ran for one, the exact feasibility prefilter
+        // proved the other impossible first. Reported because the rejected fraction is the number
+        // that says whether the prefilter is earning its place on real data rather than on a
+        // fixture built to contain unplaceable reads.
+        out << "dp_evaluations\t" << counters.dp_evaluations << '\n';
+        out << "prefilter_rejections\t" << counters.prefilter_rejections << '\n';
         out << "accepted_mate_placements\t" << counters.accepted_mate_placements << '\n';
         out << "valid_fr_states\t" << counters.valid_fr_states << '\n';
         out << "physical_origins\t" << counters.physical_origins << '\n';

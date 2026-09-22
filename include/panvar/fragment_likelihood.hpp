@@ -189,6 +189,29 @@ std::optional<GappedFit> gapped_emission(
     const LibraryModel& library,
     std::size_t mismatch_band);
 
+// The committed log-space recursion, retained verbatim as the REFERENCE the optimised path is
+// certified against. It is never called in production: gapped_emission computes the same quantities
+// in scaled probability space, and the oracle suite compares the two component by component on
+// random and adversarial reads. Keeping the reference in the library rather than snapshotting its
+// numbers means the comparison keeps working when either side is touched again.
+std::optional<GappedFit> gapped_emission_reference(
+    const std::string& haplotype,
+    const std::string& read,
+    std::size_t start,
+    const LibraryModel& library,
+    std::size_t mismatch_band);
+
+// Work performed by the emission on THIS thread since the counters were last taken. Reading them
+// resets them, so a caller accumulates its own share without coordinating with any other thread.
+struct GappedEmissionCounters {
+    // Placements where the recursion actually ran.
+    std::uint64_t dp_evaluations = 0;
+    // Placements the exact feasibility prefilter proved to have zero mass, so the recursion did not.
+    std::uint64_t prefilter_rejections = 0;
+};
+
+GappedEmissionCounters take_gapped_emission_counters();
+
 // The same emission, anchored at the read's RIGHT endpoint instead of at its start.
 //
 // An FR pair is sequenced from both ends of ONE template: the forward mate is read rightward from
@@ -411,6 +434,11 @@ struct FragmentScoringCounters {
     std::uint64_t proposed_starts = 0;
     std::uint64_t unique_starts = 0;
     std::uint64_t full_read_verifications = 0;
+    // Of those verifications, how many reached the pair-HMM and how many the exact prefilter proved
+    // impossible first. Their sum is full_read_verifications, and the rejected fraction is the
+    // headline number for whether the prefilter is earning its place.
+    std::uint64_t dp_evaluations = 0;
+    std::uint64_t prefilter_rejections = 0;
     std::uint64_t accepted_mate_placements = 0;
     std::uint64_t valid_fr_states = 0;
     // Latent alignment pairs TESTED: one per (forward consumed span, reverse consumed span) offered
