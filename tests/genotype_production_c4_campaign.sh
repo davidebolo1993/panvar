@@ -110,8 +110,10 @@ plan() {
   {
     printf "key\tvalue\n"
     printf "campaign\tc4-production-final\nlaunched\tfalse\n"
-    printf "git_commit\t%s\ngit_tree_dirty\t%s\n" "$(git -C "$REPO" rev-parse HEAD)" \
-      "$([ -z "$(git -C "$REPO" status --porcelain -- src include profiles tests/genotype_production_c4_campaign.sh)" ] && echo false || echo true)"
+    # Dirtiness of what the campaign itself uses: its profile, harness, runner, consolidation and manifests.
+    # The binary comes from a separate clean build, whose commit the runner records at launch.
+    printf "git_commit\t%s\ncampaign_files_dirty\t%s\n" "$(git -C "$REPO" rev-parse HEAD)" \
+      "$([ -z "$(git -C "$REPO" status --porcelain -- profiles tests/genotype_production_c4_campaign.sh scripts/c4_production_campaign.py scripts/consolidate_c4_production.py tests/genotype_c4_heldout_mosaic.sh "$DONORS" "$ELIGIBILITY" "$MOSAIC_MANIFEST")" ] && echo false || echo true)"
     printf "profile\t%s\nprofile_sha256\t%s\n" "profiles/genotype_c4_campaign_local.tsv" "$(sha "$PROFILE")"
     printf "science_profile\t%s\nscience_profile_sha256\t%s\n" "profiles/genotype_c4.tsv" "$(sha "$SCIENCE_PROFILE")"
     printf "graph\ttests/real_data/c4.gfa.gz\ngraph_gz_sha256\t%s\ngraph_sha256\t%s\n" "$GRAPH_GZ_SHA" "$GRAPH_SHA"
