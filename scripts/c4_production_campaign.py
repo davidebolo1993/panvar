@@ -260,13 +260,13 @@ def call_command(job, build, threads):
     return cmd
 
 
-def evaluate(job, build, fallback=None):
+def evaluate(job, evaluator, fallback=None):
     prefix = job["out_prefix"]
     # Which evaluator measured this job: a later evaluator re-measures it before consolidation.
     with open(prefix + (".fallback" if fallback else ".eval") + ".evaluator", "w") as stamp:
-        stamp.write(sha256(build / "genotype_probe") + "\n")
+        stamp.write(sha256(evaluator) + "\n")
     out = prefix + (".fallback" if fallback else ".eval")
-    cmd = [build / "genotype_probe", "evaluate", "--scheme", job["scheme"], "--donor", job["donor_label"],
+    cmd = [evaluator, "evaluate", "--scheme", job["scheme"], "--donor", job["donor_label"],
            "--reference", REFERENCE, "--run-prefix", prefix, "--model-gfa", job["model_gfa"],
            "--truth-gfa", job["truth_gfa"], "--out", out]
     if job["curation"] != "none":
@@ -348,7 +348,7 @@ def time_fields(path):
     return fields
 
 
-def run_job(job, build, threads):
+def run_job(job, build, evaluator, threads):
     """Call, evaluation and (for an improving-move tie) the labelled union fallback. Returns (outcome, detail)."""
     prefix = pathlib.Path(job["out_prefix"])
     prefix.parent.mkdir(parents=True, exist_ok=True)
@@ -368,12 +368,12 @@ def run_job(job, build, threads):
         return outcome, detail
     if outcome == "no_call" and detail in ("footprint_limit", "time_limit"):
         return outcome, detail   # the process was stopped: there is no model or call to evaluate
-    if evaluate(job, build) != 0 or not os.path.exists(str(prefix) + ".eval.summary.tsv"):
+    if evaluate(job, evaluator) != 0 or not os.path.exists(str(prefix) + ".eval.summary.tsv"):
         return "failed", "evaluation failed"
     if outcome == "no_call" and detail == "improving_move_tie":
         status = key_values(str(prefix) + ".mosaic_status.tsv")
         fallback = f"{status.get('union_top_hap1')}|{status.get('union_top_hap2')}"
-        if "NA" in fallback or evaluate(job, build, fallback) != 0:
+        if "NA" in fallback or evaluate(job, evaluator, fallback) != 0:
             return "failed", "fallback evaluation failed"
     return outcome, detail
 
@@ -427,12 +427,13 @@ class Ledger:
 def launch(args):
     out = pathlib.Path(args.out).resolve()
     build = pathlib.Path(args.build).resolve()
+    evaluator = pathlib.Path(args.evaluator).resolve() if args.evaluator else build / "genotype_probe"
     jobs = read_jobs(out)
     settings = key_values(out / "settings.tsv")
     if settings is None or settings.get("jobs_sha256") != sha256(out / "jobs.tsv"):
         raise Defect("jobs.tsv does not match its plan's settings.tsv")
     profile_sha = sha256(PROFILE)
-    binary = {"panvar": sha256(build / "panvar"), "genotype_probe": sha256(build / "genotype_probe")}
+    binary = {"panvar": sha256(build / "panvar"), "genotype_probe": sha256(evaluator)}
     launch_file = out / "launch.tsv"
     # The production binary, the profile, the plan and the scheduler are fixed for the whole campaign. The
     # EVALUATOR (genotype_probe) may be corrected between launches -- it never touches a call -- and every
@@ -489,7 +490,7 @@ def launch(args):
         attempts = int(ledger.rows[job["job"]].get("attempts") or 0)
         while attempts < MAX_ATTEMPTS and not stop.is_set():
             attempts += 1
-            outcome, detail = run_job(job, build, args.threads)
+            outcome, detail = run_job(job, build, evaluator, args.threads)
             if outcome == "defect":
                 ledger.record(job, "defect", detail, attempts)
                 stop_reason.append(f"{job['job']}: {detail}")
@@ -537,7 +538,7 @@ def launch(args):
     print(f"[{now()}] all {len(jobs) - len(remaining)} of {len(jobs)} jobs accounted for", flush=True)
     if remaining:
         return 1
-    current = sha256(build / "genotype_probe")
+    current = sha256(evaluator)
     for job in jobs:
         row = ledger.rows[job["job"]]
         for kind, fallback in (("eval", None), ("fallback", "union")):
@@ -550,7 +551,7 @@ def launch(args):
             if fallback:
                 status = key_values(job["out_prefix"] + ".mosaic_status.tsv")
                 fallback = f"{status.get('union_top_hap1')}|{status.get('union_top_hap2')}"
-            if evaluate(job, build, fallback) != 0:
+            if evaluate(job, evaluator, fallback) != 0:
                 raise Defect(f"{job['job']}: re-evaluation with the final evaluator failed")
             print(f"[{now()}] {job['job']}: re-evaluated ({kind}) with the final evaluator", flush=True)
     if args.consolidate:
@@ -590,6 +591,9 @@ def main():
     p.add_argument("--jobs", type=int, required=True)
     p.add_argument("--threads", type=int, required=True)
     p.add_argument("--no-consolidate", dest="consolidate", action="store_false")
+    # The evaluator binary, when it is not the build's own genotype_probe (it may be corrected mid-campaign;
+    # the production binary may not).
+    p.add_argument("--evaluator")
     p = sub.add_parser("prepare")
     p.add_argument("--build", required=True)
     p.add_argument("--out", required=True)

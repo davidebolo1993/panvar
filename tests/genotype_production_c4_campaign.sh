@@ -159,7 +159,7 @@ launch() {
   # The resumable runner: classification, retries of external failures only, completeness after every job,
   # then evaluation, consolidation and the figure (scripts/c4_production_campaign.py).
   exec python3 "$REPO/scripts/c4_production_campaign.py" launch --build "$build" --out "$out" \
-    --jobs "$JOBS" --threads "$THREADS"
+    --jobs "$JOBS" --threads "$THREADS" ${EVALUATOR:+--evaluator "$EVALUATOR"}
 }
 
 summarize() {
