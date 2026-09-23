@@ -21,6 +21,8 @@
 #        leaves only <out>.*.partial.tsv rows identical to the complete run's, a TIME_LIMIT status and
 #        no summary; a cap refusal leaves RESOURCE_REFUSAL and nothing final; a complete run's
 #        origin-cache demand reconciles with the work its rounds report.
+#   9    planned retention is independent of request order: adversarially permuted neighbour and
+#        request lists give identical trajectories, scores, cache identities and cache accounting.
 #
 # Gates 3-6 run at --local-pairs 1, where a round is small, since none of them depends on the
 # neighbourhood being wide.
@@ -231,6 +233,36 @@ done
 for f in rounds memory origin_demand distance round_truth; do
   same "interrupted run kept its partial $f table" "$(exists "$WORK/cut.$f.partial.tsv")" "present"
 done
+
+echo "== 9. planned retention is independent of request order =="
+# A deliberately tight budget, so in-round replacement and group reuse both happen.
+PLANNED=(--local-pairs 1 --delta 1 --origin-cache 1 --origin-cache-bytes 8388608 --origin-cache-policy planned --rounds 3)
+pick() {   # pick <table> <columns...>: the named columns, tab-separated, header included
+  local t="$1"; shift
+  awk -F'\t' -v want="$*" 'BEGIN{n=split(want,w," ")} NR==1{for(i=1;i<=NF;i++)h[$i]=i}
+    {line=""; for(k=1;k<=n;k++){line=line (k>1?"\t":"") $h[w[k]]} print line}' "$t"
+}
+ACCOUNT="oc_hits_all oc_misses_all oc_admitted oc_admitted_bytes oc_declined oc_not_selected oc_group_reuses oc_evicted_in_round oc_evicted_in_round_bytes plan_distinct_windows plan_known_windows plan_selected_entries plan_selected_bytes plan_retained_entries plan_evicted_entries plan_evicted_bytes origins_constructed_all origins_reused origins_recomputed"
+IDENT="key_hash window_bytes at_start at_end rel_block_begin rel_new_end requests hits misses group_reuses admitted declined evictions entry_bytes"
+for seed in 0 99991 31337; do
+  code="$(search "$WORK/order$seed" "${PLANNED[@]}" --request-order-seed "$seed")"
+  same "order $seed exit" "$code" "0"
+done
+for seed in 99991 31337; do
+  if diff -q <(cut -f1-28 "$WORK/order0.rounds.tsv") <(cut -f1-28 "$WORK/order$seed.rounds.tsv") > /dev/null; then
+    echo "  ok: order $seed: identical trajectory, scores and ranking"
+  else echo "  GATE FAILED: order $seed changed the trajectory or a score"; fail=1; fi
+  if diff -q <(pick "$WORK/order0.rounds.tsv" $ACCOUNT) <(pick "$WORK/order$seed.rounds.tsv" $ACCOUNT) > /dev/null; then
+    echo "  ok: order $seed: identical cache accounting in every round"
+  else echo "  GATE FAILED: order $seed changed the cache accounting"; fail=1; fi
+  if diff -q <(pick "$WORK/order0.origin_demand.tsv" $IDENT | sort) <(pick "$WORK/order$seed.origin_demand.tsv" $IDENT | sort) > /dev/null; then
+    echo "  ok: order $seed: identical window identities, admissions and evictions"
+  else echo "  GATE FAILED: order $seed changed which windows were cached"; fail=1; fi
+  same "order $seed final total" "$(key "$WORK/order$seed.summary.tsv" final_total)" "$(key "$WORK/order0.summary.tsv" final_total)"
+done
+same "the tight budget really replaced entries" \
+  "$(awk -F'\t' 'NR==1{for(i=1;i<=NF;i++)h[$i]=i;next}{s+=$h["oc_evicted_in_round"]+$h["plan_evicted_entries"]}END{print (s>0)?"yes":"no"}' "$WORK/order0.rounds.tsv")" "yes"
+same "planned run reconciles" "$(key "$WORK/order0.run_status.tsv" reconciled)" "true"
 
 echo
 if [ "$fail" -ne 0 ]; then echo "repair-search gate FAILED"; exit 1; fi

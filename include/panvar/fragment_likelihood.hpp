@@ -1030,6 +1030,13 @@ struct BlockDeltaWork {
     // Planned retention only: a miss on a window the round's plan did not select. Not a decline -- the
     // budget had room; the window's priority did not earn it.
     std::uint64_t origin_cache_not_selected = 0;
+    // Planned retention within a round. A group reuse is a request served from the records the
+    // immediately preceding enumeration built for the SAME window -- the canonical batch order makes
+    // every window's requests adjacent -- so it executes no work and holds nothing extra. Evictions here
+    // are the in-round replacements that made room for a higher-priority window.
+    std::uint64_t origin_group_reuses = 0;
+    std::uint64_t origin_cache_evicted = 0;
+    std::uint64_t origin_cache_evicted_bytes = 0;
     std::uint64_t origin_cache_admitted_bytes = 0;
     std::uint64_t origin_cache_declined_bytes = 0;
     double seconds_reenumeration = 0.0;   // misses on a window already missed before
@@ -1101,6 +1108,8 @@ struct OriginDemandRow {
     // the raw records would cost. For an interior window every retained record is affected
     // (retained_not_affected must be 0), so the aggregate depends on the key alone. For a window at an
     // end the affected subset reads the haplotype length, so its figure describes one call only.
+    std::uint64_t group_reuses = 0;               // served by the adjacent enumeration, no work
+    std::uint64_t evictions = 0;                  // times this window's entry was evicted
     bool aggregate_measured = false;
     std::uint64_t aggregate_states = 0;
     std::uint64_t aggregate_fragments = 0;
@@ -1122,6 +1131,14 @@ struct PlannedRepairWindow {
     bool at_end = false;
     std::uint32_t rel_block_begin = 0;
     std::uint32_t rel_new_end = 0;
+};
+
+// One repair of a batch: replace [block_begin, block_end) of `incumbent` with `replacement`.
+struct RepairRequest {
+    std::size_t incumbent = 0;
+    std::size_t block_begin = 0;
+    std::size_t block_end = 0;
+    std::string replacement;
 };
 
 struct OriginCachePlanReport {
@@ -1258,6 +1275,17 @@ public:
     PlannedRepairWindow plan_repaired_window(std::size_t incumbent, std::size_t block_begin,
                                              std::size_t block_end, const std::string& replacement) const;
     OriginCachePlanReport plan_origin_cache(const std::vector<PlannedRepairWindow>& windows);
+    // A whole round's repairs at once, under planned retention. The batch is planned, then executed in
+    // a CANONICAL order -- by window identity, then haplotype, then the request itself -- so the order
+    // the caller enumerated its candidates in cannot change which windows are enumerated, reused,
+    // retained or evicted, nor any score. Requests for one window are adjacent: the first enumerates,
+    // the rest are group reuses. A window whose exact size was unknown before this round, or that the
+    // plan selected, is retained on its miss by priority (distinct requesting haplotypes per exact
+    // entry byte, the plan's total order), evicting strictly lower-ranked entries first so the payload
+    // never exceeds the budget. Returns one slot per request, in the caller's order.
+    std::vector<std::size_t> add_repaired_haplotypes(const std::vector<RepairRequest>& requests,
+                                                     std::vector<BlockDeltaWork>* works = nullptr,
+                                                     OriginCachePlanReport* plan = nullptr);
     std::vector<std::uint64_t> origin_cache_key_hashes() const;   // live entries, ascending
     std::uint64_t origin_cache_slots() const;                     // entry slots, live or reusable
     // Slots currently holding a full origin census, ascending. A caller that knows what each slot is

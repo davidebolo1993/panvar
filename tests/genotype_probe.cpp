@@ -3429,6 +3429,9 @@ int repair_search(const Args& args) {
         throw std::runtime_error("--origin-cache-policy is first_fit or planned");
     }
     const bool planned_cache = origin_cache_policy == "planned";
+    // ADVERSARIAL GATE HOOK: permute the neighbour list and the repair-request list every round. Under
+    // planned retention nothing observable may change -- cache identities, accounting, scores, ranking.
+    const std::uint64_t request_order_seed = std::stoull(args.get("request-order-seed", "0"));
     if (args.get("origin-self-check", "0") != "0") panvar::set_origin_cache_self_check(true);
     // Memory diagnostic: after the search stops without moving, re-score that same neighbourhood N more
     // times, scoring and releasing without promoting. Hold cycles never enter the rounds table.
@@ -3797,6 +3800,7 @@ int repair_search(const Args& args) {
         // Planned retention: what the round's plan saw, selected and evicted.
         std::uint64_t plan_distinct = 0, plan_known = 0, plan_selected = 0, plan_selected_bytes = 0;
         std::uint64_t plan_retained = 0, plan_evicted = 0, plan_evicted_bytes = 0, oc_not_selected = 0;
+        std::uint64_t oc_group_reuses = 0, oc_evicted = 0, oc_evicted_bytes = 0;
     };
     std::vector<Round> rounds;
     const std::size_t last_round = first_round + max_rounds - 1;
@@ -3912,7 +3916,8 @@ int repair_search(const Args& args) {
                  "records_consumed\tmargin_records_consumed\tmargin_neighbours\tmargin_rounds\t"
                  "census_count\tcensus_bytes\tphys_footprint\tphys_footprint_peak\trss_current\t"
                  "plan_distinct_windows\tplan_known_windows\tplan_selected_entries\tplan_selected_bytes\t"
-                 "plan_retained_entries\tplan_evicted_entries\tplan_evicted_bytes\toc_not_selected\n";
+                 "plan_retained_entries\tplan_evicted_entries\tplan_evicted_bytes\toc_not_selected\t"
+                 "oc_group_reuses\toc_evicted_in_round\toc_evicted_in_round_bytes\n";
         for (const Round& r : rounds) {
             table << r.index << '\t' << r.start_total << '\t' << (r.moved ? "true" : "false") << '\t'
                   << (r.moved ? model.blocks()[r.block].block_id : std::string("NA")) << '\t'
@@ -3963,7 +3968,8 @@ int repair_search(const Args& args) {
                   << r.phys_footprint_peak << '\t' << r.rss_current << '\t' << r.plan_distinct << '\t'
                   << r.plan_known << '\t' << r.plan_selected << '\t' << r.plan_selected_bytes << '\t'
                   << r.plan_retained << '\t' << r.plan_evicted << '\t' << r.plan_evicted_bytes << '\t'
-                  << r.oc_not_selected << '\n';
+                  << r.oc_not_selected << '\t' << r.oc_group_reuses << '\t' << r.oc_evicted << '\t'
+                  << r.oc_evicted_bytes << '\n';
         }
         return table.str();
     };
@@ -3977,7 +3983,7 @@ int repair_search(const Args& args) {
                  "requests\trepeat_requests\thits\tmisses\tadmitted\tdeclined\tentry_bytes\trecords\t"
                  "origins_constructed\tseconds_enumeration\tseconds_reenumeration\t"
                  "aggregate_states\taggregate_fragments\taggregate_multiplicity\tretained_not_affected\t"
-                 "aggregate_entry_bytes\taggregate_entry_bytes_packed\n";
+                 "aggregate_entry_bytes\taggregate_entry_bytes_packed\tgroup_reuses\tevictions\n";
         for (const panvar::OriginDemandRow& row : rows) {
             table << row.order << '\t' << row.key_hash << '\t' << row.window_bytes << '\t'
                   << (row.at_start ? 1 : 0) << '\t' << (row.at_end ? 1 : 0) << '\t' << row.rel_block_begin
@@ -3988,14 +3994,15 @@ int repair_search(const Args& args) {
                   << row.seconds_reenumeration << '\t' << row.aggregate_states << '\t'
                   << row.aggregate_fragments << '\t' << row.aggregate_multiplicity << '\t'
                   << row.retained_not_affected << '\t' << row.aggregate_entry_bytes << '\t'
-                  << row.aggregate_entry_bytes_packed << '\n';
+                  << row.aggregate_entry_bytes_packed << '\t' << row.group_reuses << '\t' << row.evictions
+                  << '\n';
         }
         return table.str();
     };
     const auto demand_report = [&](const std::vector<panvar::OriginDemandRow>& rows) {
         std::uint64_t requested_bytes = 0, requests = 0, repeats = 0, hits = 0, misses = 0;
         std::uint64_t admitted = 0, admitted_bytes = 0, declined = 0, declined_bytes = 0;
-        std::uint64_t decline_events = 0, origins = 0, declined_repeats = 0;
+        std::uint64_t decline_events = 0, origins = 0, declined_repeats = 0, group_reuses = 0;
         double seconds = 0.0, reenumeration = 0.0, reenumeration_declined = 0.0;
         for (const panvar::OriginDemandRow& row : rows) {
             requested_bytes += row.entry_bytes;
@@ -4003,6 +4010,7 @@ int repair_search(const Args& args) {
             repeats += row.requests - 1;
             hits += row.hits;
             misses += row.misses;
+            group_reuses += row.group_reuses;
             decline_events += row.declined;
             origins += row.origins_constructed;
             seconds += row.seconds_enumeration;
@@ -4036,14 +4044,15 @@ int repair_search(const Args& args) {
             return text.str();
         }
         std::uint64_t round_hits = 0, round_misses = 0, round_constructed = 0, round_declined = 0;
-        std::uint64_t round_admitted_bytes = 0, round_evicted_bytes = 0;
+        std::uint64_t round_admitted_bytes = 0, round_evicted_bytes = 0, round_group_reuses = 0;
         for (const Round& r : rounds) {
             round_hits += r.oc_hits_all;
             round_misses += r.oc_misses_all;
             round_constructed += r.origins_constructed_all;
             round_declined += r.oc_declined;
             round_admitted_bytes += r.oc_admitted_bytes;
-            round_evicted_bytes += r.plan_evicted_bytes;
+            round_evicted_bytes += r.plan_evicted_bytes + r.oc_evicted_bytes;
+            round_group_reuses += r.oc_group_reuses;
         }
         // Planned retention evicts, so what is cached is what was admitted less what was evicted; and
         // a ledger row marked admitted may since have been evicted, so the ledger's admitted total
@@ -4053,7 +4062,9 @@ int repair_search(const Args& args) {
         const bool ok = round_hits == hits && round_misses == misses && round_constructed == origins &&
                         executed == origins && round_declined == decline_events &&
                         round_admitted_bytes - round_evicted_bytes == cached &&
-                        (round_evicted_bytes != 0 || admitted_bytes == cached) && hits + misses == requests;
+                        (round_evicted_bytes != 0 || admitted_bytes == cached) &&
+                        round_group_reuses == group_reuses && hits + misses + group_reuses == requests;
+        text << "reconcile_group_reuses\t" << round_group_reuses << " rounds / " << group_reuses << " ledger\n";
         text << "reconcile_hits\t" << round_hits << " rounds / " << hits << " ledger\nreconcile_misses\t"
              << round_misses << " rounds / " << misses << " ledger\nreconcile_origins_constructed\t"
              << round_constructed << " rounds / " << origins << " ledger / " << executed
@@ -4296,6 +4307,10 @@ int repair_search(const Args& args) {
             }
         }
         rec.neighbours = neighbours.size();
+        if (request_order_seed != 0) {
+            std::mt19937_64 rng(request_order_seed * 1000003ULL + round);
+            std::shuffle(neighbours.begin(), neighbours.end(), rng);
+        }
         if (neighbours.empty()) {
             stop_reason = "no_unvisited_neighbour";
             rounds.push_back(rec);
@@ -4316,16 +4331,7 @@ int repair_search(const Args& args) {
         panvar::IncrementalBatchReport batch;
         std::optional<panvar::InternedHaplotypes> interned;
         panvar::BlockDeltaWork round_delta;
-        const auto resolve_by_delta = [&](std::size_t local, bool keep_census) {
-            const Provenance& note = provenance[local];
-            if (note.is_incumbent) return note.side == 0 ? inc_slot_a : inc_slot_b;
-            const panvar::HaplotypeSequence& base = note.side == 0 ? incumbent_a : incumbent_b;
-            const std::size_t from = note.side == 0 ? inc_slot_a : inc_slot_b;
-            const panvar::SequenceInterval span = base.block_intervals[note.block];
-            panvar::BlockDeltaWork work;
-            const std::size_t slot = context->add_repaired_haplotype(
-                from, span.begin, span.end, model.blocks()[note.block].alleles[note.allele].sequence,
-                &work, keep_census);
+        const auto accumulate = [&](const panvar::BlockDeltaWork& work) {
             round_delta.origins_reused += work.origins_reused;
             round_delta.origins_recomputed += work.origins_recomputed;
             round_delta.local_window_bases += work.local_window_bases;
@@ -4360,26 +4366,59 @@ int repair_search(const Args& args) {
             round_delta.seconds_aggregate_merge += work.seconds_aggregate_merge;
             round_delta.seconds_reduce += work.seconds_reduce;
             round_delta.seconds += work.seconds;
+            round_delta.origin_group_reuses += work.origin_group_reuses;
+            round_delta.origin_cache_evicted += work.origin_cache_evicted;
+            round_delta.origin_cache_evicted_bytes += work.origin_cache_evicted_bytes;
+        };
+        const auto resolve_by_delta = [&](std::size_t local, bool keep_census) {
+            const Provenance& note = provenance[local];
+            if (note.is_incumbent) return note.side == 0 ? inc_slot_a : inc_slot_b;
+            const panvar::HaplotypeSequence& base = note.side == 0 ? incumbent_a : incumbent_b;
+            const std::size_t from = note.side == 0 ? inc_slot_a : inc_slot_b;
+            const panvar::SequenceInterval span = base.block_intervals[note.block];
+            panvar::BlockDeltaWork work;
+            const std::size_t slot = context->add_repaired_haplotype(
+                from, span.begin, span.end, model.blocks()[note.block].alleles[note.allele].sequence,
+                &work, keep_census);
+            accumulate(work);
             return slot;
         };
 
         if (use_delta) {
             provenance.resize(paths.size());
             slot_of_local.resize(paths.size());
+            const std::size_t held_before = context->haplotypes_created();
             if (planned_cache) {
-                // The plan: every window this round's repairs will request, built without enumerating,
-                // then the round's cache set chosen from them. Nothing here reads a score.
-                std::vector<panvar::PlannedRepairWindow> planned;
+                // The round's repairs as ONE batch: the context plans them, then executes them in its
+                // canonical order, so how this loop enumerated them cannot matter.
+                std::vector<std::size_t> requested;
                 for (std::size_t i = 0; i < paths.size(); ++i) {
                     const Provenance& note = provenance[i];
-                    if (note.is_incumbent) continue;
-                    const panvar::HaplotypeSequence& base = note.side == 0 ? incumbent_a : incumbent_b;
-                    const std::size_t from = note.side == 0 ? inc_slot_a : inc_slot_b;
-                    const panvar::SequenceInterval span = base.block_intervals[note.block];
-                    planned.push_back(context->plan_repaired_window(
-                        from, span.begin, span.end, model.blocks()[note.block].alleles[note.allele].sequence));
+                    if (note.is_incumbent) {
+                        slot_of_local[i] = note.side == 0 ? inc_slot_a : inc_slot_b;
+                    } else {
+                        requested.push_back(i);
+                    }
                 }
-                const panvar::OriginCachePlanReport plan = context->plan_origin_cache(planned);
+                if (request_order_seed != 0) {
+                    std::mt19937_64 rng(request_order_seed * 7919ULL + round);
+                    std::shuffle(requested.begin(), requested.end(), rng);
+                }
+                std::vector<panvar::RepairRequest> requests;
+                for (const std::size_t i : requested) {
+                    const Provenance& note = provenance[i];
+                    const panvar::HaplotypeSequence& base = note.side == 0 ? incumbent_a : incumbent_b;
+                    const panvar::SequenceInterval span = base.block_intervals[note.block];
+                    requests.push_back({note.side == 0 ? inc_slot_a : inc_slot_b, span.begin, span.end,
+                                        model.blocks()[note.block].alleles[note.allele].sequence});
+                }
+                std::vector<panvar::BlockDeltaWork> works;
+                panvar::OriginCachePlanReport plan;
+                const std::vector<std::size_t> slots = context->add_repaired_haplotypes(requests, &works, &plan);
+                for (std::size_t k = 0; k < requested.size(); ++k) {
+                    slot_of_local[requested[k]] = slots[k];
+                    accumulate(works[k]);
+                }
                 rec.plan_distinct = plan.distinct_windows;
                 rec.plan_known = plan.known_windows;
                 rec.plan_selected = plan.selected_entries;
@@ -4387,10 +4426,10 @@ int repair_search(const Args& args) {
                 rec.plan_retained = plan.retained_entries;
                 rec.plan_evicted = plan.evicted_entries;
                 rec.plan_evicted_bytes = plan.evicted_bytes;
-            }
-            const std::size_t held_before = context->haplotypes_created();
-            for (std::size_t i = 0; i < paths.size(); ++i) {
-                slot_of_local[i] = resolve_by_delta(i, false);
+            } else {
+                for (std::size_t i = 0; i < paths.size(); ++i) {
+                    slot_of_local[i] = resolve_by_delta(i, false);
+                }
             }
             for (std::size_t i = 0; i < sequences.size(); ++i) {
                 sequence_of_slot.emplace(slot_of_local[i], &sequences[i]);
@@ -4676,6 +4715,9 @@ int repair_search(const Args& args) {
             rec.oc_declined = round_delta.origin_cache_declined;
             rec.oc_declined_bytes = round_delta.origin_cache_declined_bytes;
             rec.oc_not_selected = round_delta.origin_cache_not_selected;
+            rec.oc_group_reuses = round_delta.origin_group_reuses;
+            rec.oc_evicted = round_delta.origin_cache_evicted;
+            rec.oc_evicted_bytes = round_delta.origin_cache_evicted_bytes;
             rec.origins_constructed_all = round_delta.physical_origins_constructed;
             rec.seconds_enumeration_all = round_delta.seconds_enumeration;
             rec.seconds_reenumeration_all = round_delta.seconds_reenumeration;

@@ -1633,6 +1633,140 @@ void test_planned_eviction_releases_storage() {
               << capacity[0] << " / " << capacity[1] << " bytes per half, no growth\n";
 }
 
+// ---- planned retention within a round: the canonical batch ----------------------------------------
+struct BatchResult {
+    std::vector<double> cells;                               // canonical: by request index, then round
+    std::vector<double> scores;                              // every (A-request, B-request) diplotype
+    std::vector<std::vector<std::uint64_t>> cache_after;     // live key hashes after each round
+    std::vector<std::uint64_t> accounting;                   // hits, misses, reuses, stored, evicted, ...
+    std::uint64_t max_bytes = 0, slots_after_second = 0, slots_after_last = 0, group_reuses = 0, evicted = 0;
+};
+
+// Two incumbents that differ only at one point far from every repair, so the same allele repaired on
+// either spells the same window: multiplicity 2, and a group reuse for the second. Three rounds of the
+// same batch; `order_seed` permutes the requests the caller offers.
+BatchResult batch_search(const MultiBlock& m, std::size_t budget, bool origin, std::size_t threads,
+                         unsigned order_seed) {
+    panvar::FragmentScoringOptions opts = options();
+    opts.threads = threads;
+    panvar::PreparedScoringContext context(m.locus.fragments, library(), opts);
+    std::string other = m.locus.base;
+    const std::size_t point = 2250;
+    other[point] = other[point] == 'A' ? 'C' : 'A';
+    context.begin_transient_round();
+    const std::vector<std::size_t> seeds = context.add_haplotypes({m.locus.base, other});
+    context.retain_census(seeds[0]);
+    context.retain_census(seeds[1]);
+    if (origin) {
+        context.enable_origin_cache_path(true);
+        context.set_origin_cache_limits(budget, 0);
+    }
+    std::vector<panvar::RepairRequest> requests;
+    for (const std::size_t seed_slot : seeds) {
+        for (const Repair& r : m.repairs) requests.push_back({seed_slot, r.begin, r.end, r.allele});
+    }
+    std::vector<std::size_t> order(requests.size());
+    std::iota(order.begin(), order.end(), std::size_t{0});
+    if (order_seed != 0) {
+        std::mt19937_64 rng(order_seed);
+        std::shuffle(order.begin(), order.end(), rng);
+    }
+    BatchResult out;
+    std::uint64_t hits = 0, misses = 0, stored = 0, evicted = 0, not_selected = 0, declined = 0;
+    for (int round = 0; round < 3; ++round) {
+        std::vector<panvar::RepairRequest> offered;
+        for (const std::size_t i : order) offered.push_back(requests[i]);
+        std::vector<std::size_t> slots(requests.size());
+        if (origin) {
+            std::vector<panvar::BlockDeltaWork> works;
+            const std::vector<std::size_t> got = context.add_repaired_haplotypes(offered, &works);
+            for (std::size_t k = 0; k < order.size(); ++k) {
+                slots[order[k]] = got[k];
+                const panvar::BlockDeltaWork& w = works[k];
+                hits += w.origin_cache_hits;
+                misses += w.origin_cache_misses;
+                out.group_reuses += w.origin_group_reuses;
+                stored += w.origin_cache_stored;
+                evicted += w.origin_cache_evicted;
+                not_selected += w.origin_cache_not_selected;
+                declined += w.origin_cache_declined;
+            }
+            out.max_bytes = std::max<std::uint64_t>(out.max_bytes, context.origin_cache_bytes());
+            require(context.origin_cache_bytes() <= budget, "the cache exceeded its declared budget");
+        } else {
+            for (std::size_t i = 0; i < requests.size(); ++i) {
+                const panvar::RepairRequest& r = requests[i];
+                slots[i] = context.add_repaired_haplotype(r.incumbent, r.block_begin, r.block_end, r.replacement);
+            }
+        }
+        for (std::size_t i = 0; i < requests.size(); ++i) {
+            for (std::size_t f = 0; f < m.locus.fragments.size(); ++f) out.cells.push_back(context.mass_of(f, slots[i]));
+            out.cells.push_back(context.exposure_of(slots[i]));
+        }
+        std::vector<panvar::HaplotypeCandidate> pairs;
+        const std::size_t half = m.repairs.size();
+        for (std::size_t i = 0; i < half; ++i) pairs.push_back({slots[i], slots[half + i]});
+        const panvar::FragmentScoringResult scored = context.score_candidates(pairs);
+        for (const auto& score : scored.scores) out.scores.push_back(score.log_likelihood);
+        if (origin) out.cache_after.push_back(context.origin_cache_key_hashes());
+        if (round == 1) out.slots_after_second = context.origin_cache_slots();
+        context.release_transient(seeds);
+    }
+    out.slots_after_last = context.origin_cache_slots();
+    out.evicted = evicted;
+    out.accounting = {hits, misses, out.group_reuses, stored, evicted, not_selected, declined,
+                      context.origin_cache_bytes(), context.origin_records_consumed(),
+                      context.cumulative_counters().physical_origins};
+    return out;
+}
+
+void test_batch_retention_is_order_independent() {
+    const MultiBlock m = multi_block(3031);
+    const BatchResult stage5 = batch_search(m, 0, false, 1, 0);
+    const BatchResult full = batch_search(m, std::size_t{1} << 30, true, 1, 0);
+    // With nothing retained, a window's second requester can only be served by the group holder.
+    const BatchResult unretained = batch_search(m, 0, true, 1, 0);
+    require(unretained.group_reuses > 0, "the fixture must give some window two requesters in one round");
+    const std::size_t tight = static_cast<std::size_t>(full.accounting[7] / 3);
+    std::uint64_t evictions_seen = 0;
+    for (const std::size_t budget : {std::size_t{1} << 30, tight, std::size_t{0}}) {
+        const BatchResult reference = batch_search(m, budget, true, 1, 0);
+        const std::string at = "budget " + std::to_string(budget);
+        for (std::size_t i = 0; i < stage5.cells.size(); ++i) {
+            require_identical(reference.cells[i], stage5.cells[i], at + ": cell " + std::to_string(i) + " vs stage 5");
+        }
+        for (std::size_t i = 0; i < stage5.scores.size(); ++i) {
+            require_identical(reference.scores[i], stage5.scores[i], at + ": score " + std::to_string(i) + " vs stage 5");
+        }
+        require(reference.max_bytes <= budget, at + ": payload exceeded the budget");
+        require(reference.slots_after_last == reference.slots_after_second,
+                at + ": cache slots grew after the selection settled");
+        evictions_seen += reference.evicted;
+        for (const unsigned seed : {5u, 17u, 1234567u}) {
+            const BatchResult shuffled = batch_search(m, budget, true, 1, seed);
+            const std::string label = at + ", order " + std::to_string(seed);
+            for (std::size_t i = 0; i < reference.cells.size(); ++i) {
+                require_identical(shuffled.cells[i], reference.cells[i], label + ": cell " + std::to_string(i));
+            }
+            for (std::size_t i = 0; i < reference.scores.size(); ++i) {
+                require_identical(shuffled.scores[i], reference.scores[i], label + ": score " + std::to_string(i));
+            }
+            require(shuffled.cache_after == reference.cache_after, label + ": cache identities depend on order");
+            require(shuffled.accounting == reference.accounting, label + ": cache accounting depends on order");
+        }
+        for (const std::size_t threads : {2u, 4u, 8u}) {
+            const BatchResult t = batch_search(m, budget, true, threads, 0);
+            require(t.cells == reference.cells && t.scores == reference.scores, at + ": threads changed a value");
+            require(t.cache_after == reference.cache_after && t.accounting == reference.accounting,
+                    at + ": threads changed the cache");
+        }
+    }
+    require(evictions_seen > 0, "the tight budget must force in-round replacement, or replacement is untested");
+    std::cout << "  ok: 4 request orders x 3 budgets x 1/2/4/8 threads: identical cells, scores, cache identities "
+                 "and accounting; " << unretained.group_reuses << " group reuses unretained, " << evictions_seen
+              << " in-round evictions at the tight budget; matches stage 5\n";
+}
+
 void test_cumulative_caps_through_the_delta() {
     const Locus l = locus(99, {400});
     std::mt19937_64 rng(11);
@@ -1722,6 +1856,8 @@ int main() {
         test_planned_cache_order_independent();
         std::cout << "== planned retention: eviction releases and reuses storage ==\n";
         test_planned_eviction_releases_storage();
+        std::cout << "== planned retention within a round: adversarial request order ==\n";
+        test_batch_retention_is_order_independent();
         std::cout << "== stage 6: origin path versus stage 5 (self-checked) ==\n";
         test_origin_path_matches_stage5();
         std::cout << "== stage 6: disabled, full and undersized origin caches ==\n";

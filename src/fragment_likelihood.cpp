@@ -6,6 +6,7 @@
 #include <exception>
 #include <functional>
 #include <map>
+#include <numeric>
 #include <memory>
 #include <deque>
 #include <thread>
@@ -2443,8 +2444,55 @@ struct OriginCache {
     // the next admission, so slots never outnumber the most entries ever live together.
     std::vector<char> live;
     std::vector<std::uint64_t> demand_of;   // the demand-ledger row each slot holds
+    std::vector<std::uint64_t> multiplicity;   // its requesters in the current plan: its priority
     std::vector<std::size_t> free_slots;
 };
+
+std::uint64_t origin_key_hash(const std::string& bytes, bool at_start, bool at_end,
+                              std::uint32_t rel_block_begin, std::uint32_t rel_new_end);
+
+// A window's full identity, in the order the plan ranks ties by.
+using OriginIdentity = std::tuple<std::uint64_t, std::string, bool, bool, std::uint32_t, std::uint32_t>;
+
+OriginIdentity entry_identity(const OriginCacheEntry& entry) {
+    return OriginIdentity{origin_key_hash(entry.bytes, entry.at_start, entry.at_end, entry.rel_block_begin,
+                                          entry.rel_new_end),
+                          entry.bytes, entry.at_start, entry.at_end, entry.rel_block_begin,
+                          entry.rel_new_end};
+}
+
+// The retention order, shared by the plan and by in-round replacement: more distinct requesters per
+// exact byte first (compared exactly, as integers), then the identity ascending. A total order, so
+// every decision taken from it is a function of the windows alone.
+bool ranks_before(std::uint64_t m_a, std::uint64_t bytes_a, const OriginIdentity& id_a, std::uint64_t m_b,
+                  std::uint64_t bytes_b, const OriginIdentity& id_b) {
+    const unsigned __int128 lhs = static_cast<unsigned __int128>(m_a) * bytes_b;
+    const unsigned __int128 rhs = static_cast<unsigned __int128>(m_b) * bytes_a;
+    if (lhs != rhs) return lhs > rhs;
+    return id_a < id_b;
+}
+
+// Evicts one live slot: the index entry goes, the bytes are released now, and the slot is reused by
+// the next admission. Returns the payload freed.
+std::uint64_t evict_origin_slot(OriginCache& cache, std::size_t at) {
+    OriginCacheEntry& entry = cache.entries[at];
+    const std::uint64_t hash =
+        origin_key_hash(entry.bytes, entry.at_start, entry.at_end, entry.rel_block_begin, entry.rel_new_end);
+    const auto range = cache.index.equal_range(hash);
+    for (auto it = range.first; it != range.second; ++it) {
+        if (it->second == at) {
+            cache.index.erase(it);
+            break;
+        }
+    }
+    const std::uint64_t freed = entry.payload;
+    cache.bytes -= freed;
+    entry = OriginCacheEntry{};   // releases the key bytes and every record array
+    cache.live[at] = 0;
+    cache.multiplicity[at] = 0;
+    cache.free_slots.push_back(at);
+    return freed;
+}
 
 std::atomic<bool>& origin_self_check() {
     static std::atomic<bool> enabled{false};
@@ -3711,6 +3759,14 @@ struct PreparedScoringContext::State {
     // retained only if its row was selected by the latest plan.
     bool origin_planned = false;
     std::vector<char> plan_selected;
+    std::map<OriginIdentity, std::uint64_t> plan_multiplicity;
+    // The group holder: the identity whose records miss_records holds from the latest enumeration.
+    bool holder_valid = false;
+    std::string holder_bytes;
+    bool holder_at_start = false;
+    bool holder_at_end = false;
+    std::uint32_t holder_rel_block_begin = 0;
+    std::uint32_t holder_rel_new_end = 0;
     // The demand ledger: every distinct window requested, admitted or not. Same identity as the cache.
     std::unordered_multimap<std::uint64_t, std::size_t> demand_index;
     std::deque<std::pair<std::string, OriginDemandRow>> demand;
@@ -4105,7 +4161,7 @@ OriginCachePlanReport PreparedScoringContext::plan_origin_cache(
     report.planned_repairs = windows.size();
     // A window's multiplicity is the number of DISTINCT new haplotypes requesting it: a haplotype
     // offered twice is placed once, and a held one requests nothing.
-    using Identity = std::tuple<std::uint64_t, std::string, bool, bool, std::uint32_t, std::uint32_t>;
+    using Identity = OriginIdentity;
     std::map<Identity, std::set<std::uint64_t>> requesters;
     for (const PlannedRepairWindow& w : windows) {
         if (w.already_held) continue;
@@ -4113,6 +4169,9 @@ OriginCachePlanReport PreparedScoringContext::plan_origin_cache(
             .insert(w.haplotype_hash);
     }
     report.distinct_windows = requesters.size();
+    state.plan_multiplicity.clear();
+    for (const auto& item : requesters) state.plan_multiplicity.emplace(item.first, item.second.size());
+    state.holder_valid = false;
     struct Candidate {
         const Identity* identity = nullptr;
         std::uint64_t multiplicity = 0;
@@ -4142,10 +4201,7 @@ OriginCachePlanReport PreparedScoringContext::plan_origin_cache(
     // then the full key. A total order over identities, so the selection is a function of the SET of
     // planned windows and never of the order they were offered in.
     std::sort(candidates.begin(), candidates.end(), [](const Candidate& a, const Candidate& b) {
-        const unsigned __int128 lhs = static_cast<unsigned __int128>(a.multiplicity) * b.bytes;
-        const unsigned __int128 rhs = static_cast<unsigned __int128>(b.multiplicity) * a.bytes;
-        if (lhs != rhs) return lhs > rhs;
-        return *a.identity < *b.identity;
+        return ranks_before(a.multiplicity, a.bytes, *a.identity, b.multiplicity, b.bytes, *b.identity);
     });
     state.plan_selected.assign(state.demand.size(), 0);
     std::uint64_t used = 0;
@@ -4164,26 +4220,56 @@ OriginCachePlanReport PreparedScoringContext::plan_origin_cache(
         if (cache.live[at] == 0) continue;
         if (state.plan_selected[cache.demand_of[at]] != 0) {
             ++report.retained_entries;
+            const auto planned = state.plan_multiplicity.find(entry_identity(cache.entries[at]));
+            cache.multiplicity[at] = planned != state.plan_multiplicity.end() ? planned->second : 0;
             continue;
         }
-        OriginCacheEntry& entry = cache.entries[at];
-        const std::uint64_t hash = origin_key_hash(entry.bytes, entry.at_start, entry.at_end,
-                                                   entry.rel_block_begin, entry.rel_new_end);
-        const auto range = cache.index.equal_range(hash);
-        for (auto it = range.first; it != range.second; ++it) {
-            if (it->second == at) {
-                cache.index.erase(it);
-                break;
-            }
-        }
-        cache.bytes -= entry.payload;
-        report.evicted_bytes += entry.payload;
+        ++state.demand[cache.demand_of[at]].second.evictions;
+        report.evicted_bytes += evict_origin_slot(cache, at);
         ++report.evicted_entries;
-        entry = OriginCacheEntry{};   // releases the key bytes and every record array
-        cache.live[at] = 0;
-        cache.free_slots.push_back(at);
     }
     return report;
+}
+
+std::vector<std::size_t> PreparedScoringContext::add_repaired_haplotypes(
+    const std::vector<RepairRequest>& requests, std::vector<BlockDeltaWork>* works,
+    OriginCachePlanReport* plan) {
+    State& state = *state_;
+    state.require_usable();
+    std::vector<PlannedRepairWindow> planned;
+    planned.reserve(requests.size());
+    for (const RepairRequest& r : requests) {
+        planned.push_back(plan_repaired_window(r.incumbent, r.block_begin, r.block_end, r.replacement));
+    }
+    if (state.origin_path) {
+        const OriginCachePlanReport report = plan_origin_cache(planned);
+        if (plan != nullptr) *plan = report;
+    }
+    // The canonical order: held haplotypes (no window) first, then by window identity so each window's
+    // requests are adjacent, then by haplotype and by the request itself. Total, so ties cannot fall
+    // back on the caller's order.
+    std::vector<std::size_t> order(requests.size());
+    std::iota(order.begin(), order.end(), std::size_t{0});
+    std::sort(order.begin(), order.end(), [&](std::size_t a, std::size_t b) {
+        const PlannedRepairWindow& x = planned[a];
+        const PlannedRepairWindow& y = planned[b];
+        const RepairRequest& p = requests[a];
+        const RepairRequest& q = requests[b];
+        return std::tie(x.already_held, x.key_hash, x.bytes, x.at_start, x.at_end, x.rel_block_begin,
+                        x.rel_new_end, x.haplotype_hash, p.incumbent, p.block_begin, p.block_end,
+                        p.replacement) <
+               std::tie(y.already_held, y.key_hash, y.bytes, y.at_start, y.at_end, y.rel_block_begin,
+                        y.rel_new_end, y.haplotype_hash, q.incumbent, q.block_begin, q.block_end,
+                        q.replacement);
+    });
+    std::vector<std::size_t> slots(requests.size(), 0);
+    if (works != nullptr) works->assign(requests.size(), BlockDeltaWork{});
+    for (const std::size_t i : order) {
+        const RepairRequest& r = requests[i];
+        slots[i] = add_repaired_haplotype(r.incumbent, r.block_begin, r.block_end, r.replacement,
+                                          works != nullptr ? &(*works)[i] : nullptr);
+    }
+    return slots;
 }
 
 std::vector<std::uint64_t> PreparedScoringContext::origin_cache_key_hashes() const {
@@ -4691,8 +4777,28 @@ std::size_t PreparedScoringContext::add_repaired_haplotype(
             state.origin_records_consumed += records;
             local.cached_origin_records_consumed = records;
             source = &entry->records;
+        } else if (state.origin_planned && state.holder_valid && state.holder_at_start == window.at_start &&
+                   state.holder_at_end == window.at_end &&
+                   state.holder_rel_block_begin == rel_block_begin &&
+                   state.holder_rel_new_end == rel_new_end && state.holder_bytes == window.bases) {
+            // The same window the previous enumeration built: its records are still in miss_records.
+            // Like a hit, it executes nothing and is bounded by the consumption cap instead.
+            ++local.origin_group_reuses;
+            ++demand->group_reuses;
+            const std::uint64_t records = state.miss_records.origins.size();
+            if (state.origin_record_cap != 0 &&
+                state.origin_records_consumed + records > state.origin_record_cap) {
+                state.refused = true;
+                throw ResourceExhausted(
+                    "the origin cache reached its declared consumption cap; no partial ranking is "
+                    "returned");
+            }
+            state.origin_records_consumed += records;
+            local.cached_origin_records_consumed = records;
+            source = &state.miss_records;
         } else {
             ++local.origin_cache_misses;
+            const bool size_known_before = demand->misses != 0;
             const auto miss_mark = Clock::now();
             try {
                 enumerate_window_origins(state.prepared, state.fragments, state.library,
@@ -4707,6 +4813,12 @@ std::size_t PreparedScoringContext::add_repaired_haplotype(
             build_origin_records(state.window_scratch, fragment_count, base_offset, rel_block_begin,
                                  rel_new_end, keep_all, state.miss_records);
             source = &state.miss_records;
+            state.holder_valid = true;
+            state.holder_bytes = window.bases;
+            state.holder_at_start = window.at_start;
+            state.holder_at_end = window.at_end;
+            state.holder_rel_block_begin = rel_block_begin;
+            state.holder_rel_new_end = rel_new_end;
             const std::uint64_t cost = origin_entry_bytes(window.bases, state.miss_records);
             {
                 const double spent = seconds_since(miss_mark);
@@ -4720,11 +4832,56 @@ std::size_t PreparedScoringContext::add_repaired_haplotype(
                 demand->entry_bytes = cost;
                 demand->records = state.miss_records.origins.size();
             }
-            const bool selected = !state.origin_planned ||
-                                  (demand->order < state.plan_selected.size() &&
-                                   state.plan_selected[demand->order] != 0);
-            if (state.origin_cache_budget != 0 && selected &&
-                state.origin_cache.bytes + cost <= state.origin_cache_budget) {
+            // First fit keeps any miss that fits. Planned retention considers a window the plan selected,
+            // or one whose exact size was unknown until this miss; a known window the plan left out
+            // stays out. Both planned cases may displace strictly lower-ranked entries.
+            bool selected = true;
+            bool replace = false;
+            std::uint64_t multiplicity = 1;
+            OriginIdentity identity;
+            if (state.origin_planned) {
+                selected = (demand->order < state.plan_selected.size() &&
+                            state.plan_selected[demand->order] != 0) ||
+                           !size_known_before;
+                replace = selected;
+                identity = OriginIdentity{key_hash, window.bases, window.at_start, window.at_end,
+                                          rel_block_begin, rel_new_end};
+                const auto planned = state.plan_multiplicity.find(identity);
+                if (planned != state.plan_multiplicity.end()) multiplicity = planned->second;
+            }
+            bool fits = state.origin_cache.bytes + cost <= state.origin_cache_budget;
+            if (state.origin_cache_budget != 0 && selected && !fits && replace) {
+                OriginCache& cache = state.origin_cache;
+                std::vector<std::pair<std::size_t, OriginIdentity>> below;
+                for (std::size_t at = 0; at < cache.entries.size(); ++at) {
+                    if (cache.live[at] == 0) continue;
+                    OriginIdentity other = entry_identity(cache.entries[at]);
+                    if (ranks_before(multiplicity, cost, identity, cache.multiplicity[at],
+                                     cache.entries[at].payload, other)) {
+                        below.emplace_back(at, std::move(other));
+                    }
+                }
+                // Worst first.
+                std::sort(below.begin(), below.end(), [&](const auto& a, const auto& b) {
+                    return ranks_before(cache.multiplicity[b.first], cache.entries[b.first].payload, b.second,
+                                        cache.multiplicity[a.first], cache.entries[a.first].payload, a.second);
+                });
+                std::uint64_t freeable = 0;
+                std::size_t take = 0;
+                while (take < below.size() && cache.bytes - freeable + cost > state.origin_cache_budget) {
+                    freeable += cache.entries[below[take].first].payload;
+                    ++take;
+                }
+                if (cache.bytes - freeable + cost <= state.origin_cache_budget) {
+                    for (std::size_t k = 0; k < take; ++k) {
+                        ++state.demand[cache.demand_of[below[k].first]].second.evictions;
+                        local.origin_cache_evicted_bytes += evict_origin_slot(cache, below[k].first);
+                        ++local.origin_cache_evicted;
+                    }
+                    fits = true;
+                }
+            }
+            if (state.origin_cache_budget != 0 && selected && fits) {
                 OriginCacheEntry stored;
                 stored.bytes = window.bases;
                 stored.at_start = window.at_start;
@@ -4741,10 +4898,12 @@ std::size_t PreparedScoringContext::add_repaired_haplotype(
                     cache.entries[at] = std::move(stored);
                     cache.live[at] = 1;
                     cache.demand_of[at] = demand->order;
+                    cache.multiplicity[at] = multiplicity;
                 } else {
                     cache.entries.push_back(std::move(stored));
                     cache.live.push_back(1);
                     cache.demand_of.push_back(demand->order);
+                    cache.multiplicity.push_back(multiplicity);
                     at = cache.entries.size() - 1;
                 }
                 cache.index.emplace(key_hash, at);
@@ -4753,6 +4912,9 @@ std::size_t PreparedScoringContext::add_repaired_haplotype(
                 local.origin_cache_admitted_bytes += cost;
                 demand->admitted = true;
                 source = &cache.entries[at].records;   // deque: stable address
+                if (cache.bytes > state.origin_cache_budget) {
+                    throw std::logic_error("origin cache exceeded its declared budget");
+                }
             } else if (state.origin_cache_budget != 0 && !selected) {
                 ++local.origin_cache_not_selected;
             } else if (state.origin_cache_budget != 0) {
