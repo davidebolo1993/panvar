@@ -1767,6 +1767,151 @@ void test_batch_retention_is_order_independent() {
               << " in-round evictions at the tight budget; matches stage 5\n";
 }
 
+// ---- the necessary-condition piece screen (measurement only) ------------------------------------
+// Builds a read from haplotype[start ...] under an explicit edit script, then keeps its first `length`
+// bases. Kinds: 's' substitution, 'i' insertion (a read base the haplotype lacks), 'd' deletion (a
+// haplotype base the read skips). Positions are read coordinates.
+std::string edited_read(const std::string& hap, std::size_t start, std::size_t length,
+                        std::vector<std::pair<char, std::size_t>> script, std::mt19937_64& rng) {
+    std::sort(script.begin(), script.end(), [](const auto& a, const auto& b) { return a.second < b.second; });
+    std::string read;
+    std::size_t h = start;
+    std::size_t e = 0;
+    const std::string bases = "ACGT";
+    while (read.size() < length && h < hap.size()) {
+        if (e < script.size() && script[e].second <= read.size()) {
+            const char kind = script[e++].first;
+            if (kind == 'i') {
+                read.push_back(bases[rng() % 4]);
+            } else if (kind == 'd') {
+                ++h;
+            } else {
+                char b = bases[rng() % 4];
+                while (b == hap[h]) b = bases[rng() % 4];
+                read.push_back(b);
+                ++h;
+            }
+            continue;
+        }
+        read.push_back(hap[h++]);
+    }
+    return read;
+}
+
+void test_piece_screen_is_a_necessary_condition() {
+    const std::size_t band = options().mismatch_band;
+    const std::size_t gap = library().max_gap_bp;
+    const std::vector<std::size_t> pieces = {band + 1, band + 2, 2 * band + 1};
+    const std::size_t length = 100;
+    std::mt19937_64 rng(4141);
+    std::uint64_t checked = 0, feasible = 0, screened = 0, consistency_only = 0;
+    const auto check = [&](const std::string& hap, std::size_t start, const std::string& read,
+                           const std::string& label) {
+        if (read.size() != length) return;
+        const bool prefilter = panvar::feasibility_prefilter_admits(hap, start, read, band, gap);
+        if (prefilter) ++feasible;
+        for (const std::size_t d : pieces) {
+            const bool admit = panvar::piece_screen_admits(hap, start, read, band, gap, d);
+            const bool reference = panvar::piece_screen_admits_reference(hap, start, read, band, gap, d);
+            const std::string at = label + " (d=" + std::to_string(d) + ", start " + std::to_string(start) + ")";
+            require(admit == reference, at + ": the screen disagrees with its brute-force reference");
+            if (prefilter) require(admit, at + ": FALSE NEGATIVE -- the prefilter admits a start the screen rejects");
+            if (!admit) {
+                ++screened;
+                if (panvar::piece_screen_count_passes(hap, start, read, band, gap, d)) ++consistency_only;
+            }
+            ++checked;
+        }
+    };
+    const std::string unique = random_bases(rng, 1200);
+    std::string repeat;
+    {
+        const std::string unit = random_bases(rng, 7);
+        while (repeat.size() < 1200) repeat += unit;
+        for (int v = 0; v < 12; ++v) repeat[rng() % repeat.size()] = "ACGT"[rng() % 4];
+    }
+    std::string period14;
+    {
+        const std::string unit = random_bases(rng, 14);
+        while (period14.size() < 1200) period14 += unit;
+    }
+    // Directed fixtures: each is feasible, and each breaks a naive offset rule.
+    const std::size_t s0 = 300;
+    const std::size_t chunk = length / (band + 1);
+    struct Directed {
+        std::string name;
+        std::vector<std::pair<char, std::size_t>> script;
+        std::size_t start_shift;   // read taken from hap[s0 + shift] but tested at s0 (leading deletions)
+    };
+    const std::vector<Directed> directed = {
+        {"insertion inside piece 1: displacement falls across a broken piece", {{'i', chunk + 3}}, 0},
+        {"deletion exactly at a piece boundary: displacement rises between adjacent exact pieces", {{'d', 2 * chunk}}, 0},
+        {"two leading deletions: the first exact piece sits at displacement +2", {}, 2},
+        {"insertion at the first read base", {{'i', 0}}, 0},
+        {"deletion just before the last read base", {{'d', length - 1}}, 0},
+        {"k substitutions, one per piece boundary", {}, 0},
+        {"mixed k edits: insertion, deletion, substitutions", {{'i', 10}, {'d', 40}, {'s', 55}, {'i', 70}, {'d', 85}, {'s', 95}}, 0},
+        {"k insertions clustered, then k deletions would exceed", {{'i', 20}, {'i', 21}, {'i', 22}}, 0},
+    };
+    for (const auto& hap : {unique, repeat, period14}) {
+        for (Directed d : directed) {
+            if (d.name.rfind("k substitutions", 0) == 0) {
+                d.script.clear();
+                for (std::size_t j = 0; j < band; ++j) d.script.push_back({'s', (j + 1) * chunk});
+            }
+            const std::string read = edited_read(hap, s0 + d.start_shift, length, d.script, rng);
+            require(read.size() == length, d.name + ": fixture read has the wrong length");
+            // Leading deletions are the alignment consuming haplotype bases before the first read base.
+            std::string at_s0 = read;
+            check(hap, s0, at_s0, d.name);
+            require(panvar::feasibility_prefilter_admits(hap, s0, at_s0, band, gap),
+                    d.name + ": the directed fixture must be feasible, or it tests nothing");
+        }
+    }
+    // Random edit scripts: kinds mixed or pure, counts 0..k+3, positions random or on piece boundaries,
+    // tested at the true start and at neighbouring starts.
+    for (int trial = 0; trial < 3000; ++trial) {
+        const std::string& hap = trial % 3 == 0 ? unique : (trial % 3 == 1 ? repeat : period14);
+        const std::size_t start = 200 + rng() % 700;
+        const std::size_t edits = rng() % (band + 4);
+        const int mode = static_cast<int>(rng() % 4);   // 0 mixed, 1 subs, 2 ins, 3 dels
+        const std::size_t d = pieces[rng() % pieces.size()];
+        std::vector<std::pair<char, std::size_t>> script;
+        for (std::size_t e = 0; e < edits; ++e) {
+            const char kind = mode == 1 ? 's' : mode == 2 ? 'i' : mode == 3 ? 'd' : "sid"[rng() % 3];
+            std::size_t at = rng() % length;
+            if (rng() % 2 == 0) at = std::min<std::size_t>(length - 1, (rng() % d) * length / d);   // a boundary
+            script.push_back({kind, at});
+        }
+        const std::string read = edited_read(hap, start, length, script, rng);
+        for (int shift = -3; shift <= 3; ++shift) {
+            check(hap, static_cast<std::size_t>(static_cast<long>(start) + shift), read, "random trial " + std::to_string(trial));
+        }
+    }
+    // Scrambled reads: each piece copied from its own displacement in [-k, k]. The count condition
+    // passes for every one, so any rejection here is the offset consistency at work.
+    for (int trial = 0; trial < 1500; ++trial) {
+        const std::string& hap = trial % 2 == 0 ? unique : period14;
+        const std::size_t start = 200 + rng() % 700;
+        const std::size_t d = pieces[rng() % pieces.size()];
+        std::string read;
+        for (std::size_t j = 0; j < d; ++j) {
+            const std::size_t o = j * length / d;
+            const std::size_t l = (j + 1) * length / d - o;
+            const long delta = static_cast<long>(rng() % (2 * band + 1)) - static_cast<long>(band);
+            const long at = std::max<long>(static_cast<long>(start + o) + delta, static_cast<long>(start));
+            read += hap.substr(static_cast<std::size_t>(at), l);
+        }
+        check(hap, start, read, "scrambled trial " + std::to_string(trial));
+    }
+    require(feasible > 1000, "the fixtures must include many feasible placements");
+    require(screened > 1000, "the fixtures must include placements the screen rejects");
+    require(consistency_only > 0, "some rejection must come from offset consistency alone, or it is untested");
+    std::cout << "  ok: " << checked << " screen evaluations (" << feasible
+              << " prefilter-feasible placements, every one admitted); " << screened << " rejections, "
+              << consistency_only << " by offset consistency alone; screen == brute-force reference throughout\n";
+}
+
 void test_cumulative_caps_through_the_delta() {
     const Locus l = locus(99, {400});
     std::mt19937_64 rng(11);
@@ -1858,6 +2003,8 @@ int main() {
         test_planned_eviction_releases_storage();
         std::cout << "== planned retention within a round: adversarial request order ==\n";
         test_batch_retention_is_order_independent();
+        std::cout << "== piece screen: a necessary condition, with offset consistency ==\n";
+        test_piece_screen_is_a_necessary_condition();
         std::cout << "== stage 6: origin path versus stage 5 (self-checked) ==\n";
         test_origin_path_matches_stage5();
         std::cout << "== stage 6: disabled, full and undersized origin caches ==\n";

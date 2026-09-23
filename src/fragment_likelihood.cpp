@@ -393,6 +393,25 @@ EmissionWork& emission_work() {
     return work;
 }
 
+// MEASUREMENT ONLY: per-thread time inside the feasibility prefilter and inside gapped_emission. Off
+// unless enabled; when off the prefilter pays one relaxed load.
+struct EmissionTimingDiag {
+    std::uint64_t prefilter_ns = 0;
+    std::uint64_t emission_ns = 0;
+};
+std::atomic<bool>& emission_timing_active() {
+    static std::atomic<bool> active{false};
+    return active;
+}
+EmissionTimingDiag& emission_timing() {
+    static thread_local EmissionTimingDiag timing;
+    return timing;
+}
+std::uint64_t nanos_since(std::chrono::steady_clock::time_point from) {
+    return static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - from).count());
+}
+
 // ---- verification-stream census (opt-in; see EmissionCensus in the header) --------------------
 struct CensusKey {
     std::uint64_t a = 0;
@@ -1370,7 +1389,11 @@ std::optional<GappedFit> gapped_emission(
     // recursion result -- spent the whole budget on the cheap stream and collapsed the hit rate to
     // 37.8%. A refusal now returns here, having touched no table at all.
     ++work.executed_prefilters;
-    if (!feasible_within_band(haplotype, start, window, read, mismatch_band, pattern)) {
+    const bool timing = emission_timing_active().load(std::memory_order_relaxed);
+    const auto prefilter_mark = timing ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    const bool feasible = feasible_within_band(haplotype, start, window, read, mismatch_band, pattern);
+    if (timing) emission_timing().prefilter_ns += nanos_since(prefilter_mark);
+    if (!feasible) {
         ++work.prefilter_rejections;
         census_record(read, haplotype.data() + start, window, false, sizeof(double));
         return std::nullopt;
@@ -1830,6 +1853,138 @@ struct PlacementBudget {
 // caller sees does not depend on which worker noticed first.
 class PlacementCancelled : public std::exception {};
 
+// ---- MEASUREMENT ONLY: the necessary-condition piece screen (see the lemma in the header) ----------
+constexpr std::uint64_t kNoPieceCode = std::numeric_limits<std::uint64_t>::max();
+
+struct PieceLayout {
+    std::size_t pieces = 0;
+    bool usable = false;   // false: the screen cannot decide, so it admits
+    std::vector<std::uint32_t> offset;
+    std::vector<std::uint32_t> length;
+    std::vector<std::uint64_t> code;
+};
+
+PieceLayout piece_layout(const std::string& read, std::size_t pieces) {
+    PieceLayout layout;
+    layout.pieces = pieces;
+    const std::size_t n = read.size();
+    if (pieces == 0 || pieces > n) return layout;
+    for (std::size_t j = 0; j < pieces; ++j) {
+        const std::size_t begin = j * n / pieces;
+        const std::size_t end = (j + 1) * n / pieces;
+        if (end - begin == 0 || end - begin > 31) return layout;
+        std::uint64_t code = 0;
+        for (std::size_t i = begin; i < end; ++i) {
+            const std::uint64_t bits = two_bit(read[i]);
+            if (bits == kNoCode) return layout;
+            code = (code << 2) | bits;
+        }
+        layout.offset.push_back(static_cast<std::uint32_t>(begin));
+        layout.length.push_back(static_cast<std::uint32_t>(end - begin));
+        layout.code.push_back(code);
+    }
+    layout.usable = true;
+    return layout;
+}
+
+// Exact 2-bit codes of every `length`-substring of the text, built once per length and text.
+struct HaplotypeCodes {
+    const std::string* text = nullptr;
+    std::map<std::size_t, std::vector<std::uint64_t>> by_length;
+    std::uint64_t build_ns = 0;
+    const std::vector<std::uint64_t>& of(std::size_t length) {
+        auto found = by_length.find(length);
+        if (found != by_length.end()) return found->second;
+        const auto mark = std::chrono::steady_clock::now();
+        std::vector<std::uint64_t> codes(text->size(), kNoPieceCode);
+        const std::uint64_t mask = (std::uint64_t{1} << (2 * length)) - 1;
+        std::uint64_t code = 0;
+        std::size_t run = 0;
+        for (std::size_t at = 0; at < text->size(); ++at) {
+            const std::uint64_t bits = two_bit((*text)[at]);
+            if (bits == kNoCode) { run = 0; code = 0; continue; }
+            code = ((code << 2) | bits) & mask;
+            if (++run >= length) codes[at + 1 - length] = code;
+        }
+        build_ns += nanos_since(mark);
+        return by_length.emplace(length, std::move(codes)).first->second;
+    }
+};
+
+enum class ScreenVerdict { CountReject, ChainReject, Admit };
+
+// The screen for a start whose alignment may consume haplotype[start, start + window).
+ScreenVerdict piece_screen(HaplotypeCodes& codes, std::size_t start, std::size_t window,
+                           const PieceLayout& layout, std::size_t k) {
+    if (!layout.usable) return ScreenVerdict::Admit;
+    const std::size_t d = layout.pieces;
+    if (d <= k) return ScreenVerdict::Admit;   // the lemma says nothing
+    const std::size_t need = d - k;
+    struct Node {
+        std::uint32_t piece;
+        int delta;
+    };
+    static thread_local std::vector<Node> nodes;
+    static thread_local std::vector<int> best;
+    nodes.clear();
+    const long K = static_cast<long>(k);
+    std::size_t with_match = 0;
+    for (std::size_t j = 0; j < d; ++j) {
+        const std::vector<std::uint64_t>& table = codes.of(layout.length[j]);
+        bool any = false;
+        for (long delta = -K; delta <= K; ++delta) {
+            const long at = static_cast<long>(start) + static_cast<long>(layout.offset[j]) + delta;
+            if (at < static_cast<long>(start)) continue;
+            if (static_cast<std::size_t>(at) + layout.length[j] > start + window) continue;
+            if (table[static_cast<std::size_t>(at)] != layout.code[j]) continue;
+            nodes.push_back({static_cast<std::uint32_t>(j), static_cast<int>(delta)});
+            any = true;
+        }
+        if (any) ++with_match;
+        if (with_match + (d - j - 1) < need) return ScreenVerdict::CountReject;
+    }
+    if (with_match < need) return ScreenVerdict::CountReject;
+    // Longest offset-consistent chain within the displacement budget: best[n * (k+1) + c] is the most
+    // exact pieces in a chain ending at node n having spent c units of displacement.
+    const std::size_t width = k + 1;
+    best.assign(nodes.size() * width, -1);
+    for (std::size_t b = 0; b < nodes.size(); ++b) {
+        const std::size_t first = static_cast<std::size_t>(std::abs(nodes[b].delta));
+        if (first <= k) best[b * width + first] = 1;
+        for (std::size_t a = 0; a < b; ++a) {
+            if (nodes[a].piece >= nodes[b].piece) continue;
+            const long between = static_cast<long>(layout.offset[nodes[b].piece]) -
+                                 static_cast<long>(layout.offset[nodes[a].piece] + layout.length[nodes[a].piece]);
+            const long change = static_cast<long>(nodes[b].delta) - static_cast<long>(nodes[a].delta);
+            if (change < -between) continue;   // positions would overlap or go backwards
+            const std::size_t step = static_cast<std::size_t>(change < 0 ? -change : change);
+            for (std::size_t c = 0; c + step <= k; ++c) {
+                const int from = best[a * width + c];
+                if (from < 0) continue;
+                int& to = best[b * width + c + step];
+                if (from + 1 > to) to = from + 1;
+            }
+        }
+        for (std::size_t c = 0; c <= k; ++c) {
+            if (best[b * width + c] >= static_cast<int>(need)) return ScreenVerdict::Admit;
+        }
+    }
+    return ScreenVerdict::ChainReject;
+}
+
+std::atomic<bool>& piece_screen_shadow_active() {
+    static std::atomic<bool> active{false};
+    return active;
+}
+std::mutex& piece_screen_mutex() {
+    static std::mutex mutex;
+    return mutex;
+}
+PieceScreenShadowReport& piece_screen_totals() {
+    static PieceScreenShadowReport totals;
+    return totals;
+}
+
 // Scan one haplotype once per piece-length bucket, turning every piece hit into an implied read
 // start. This is the inversion the design calls for: the haplotype is walked, not queried once per
 // read against a position hash the size of the locus.
@@ -1963,14 +2118,84 @@ void collect_form_placements(
     counters.unique_starts += proposed.size();
     if (budget.stop()) throw PlacementCancelled();
 
+    // MEASUREMENT ONLY: the shadow piece screen and emission timing. Neither changes a verdict.
+    const bool shadow = piece_screen_shadow_active().load(std::memory_order_relaxed);
+    const bool timing = shadow || emission_timing_active().load(std::memory_order_relaxed);
+    PieceScreenShadowReport shadow_local;
+    HaplotypeCodes shadow_codes;
+    shadow_codes.text = &haplotype;
+    const std::size_t shadow_pieces[3] = {band + 1, band + 2, 2 * band + 1};
+    PieceLayout shadow_layouts[3];
+    std::uint32_t shadow_form = std::numeric_limits<std::uint32_t>::max();
     for (const auto& item : proposed) {
         // One relaxed load against a full-read comparison: free at this granularity, and verification is
         // where a cancelled worker would otherwise spend the longest.
         if (budget.stop()) throw PlacementCancelled();
         ++counters.full_read_verifications;
+        ScreenVerdict verdict[3] = {ScreenVerdict::Admit, ScreenVerdict::Admit, ScreenVerdict::Admit};
+        if (shadow) {
+            const std::string& read = forms[item.first].bases;
+            if (item.first != shadow_form) {
+                const auto mark = std::chrono::steady_clock::now();
+                for (int i = 0; i < 3; ++i) shadow_layouts[i] = piece_layout(read, shadow_pieces[i]);
+                shadow_local.layout_ns += nanos_since(mark);
+                shadow_form = item.first;
+                for (int i = 0; i < 3; ++i) {
+                    for (const std::uint32_t length : shadow_layouts[i].length) (void)shadow_codes.of(length);
+                }
+            }
+            if (item.second <= haplotype.size() && haplotype.size() - item.second >= read.size()) {
+                const std::size_t window = std::min(haplotype.size() - item.second, read.size() + library.max_gap_bp);
+                for (int i = 0; i < 3; ++i) {
+                    const auto mark = std::chrono::steady_clock::now();
+                    verdict[i] = piece_screen(shadow_codes, item.second, window, shadow_layouts[i], band);
+                    shadow_local.rows[i].screen_ns += nanos_since(mark);
+                }
+            }
+        }
+        EmissionWork work_before;
+        std::uint64_t prefilter_before = 0;
+        if (shadow) {
+            work_before = emission_work();
+            prefilter_before = emission_timing().prefilter_ns;
+        }
+        const auto emission_mark = timing ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         const std::optional<GappedFit> fit =
             gapped_emission(haplotype, forms[item.first].bases, item.second, library, band,
                             &forms[item.first].pattern);
+        if (timing) {
+            const std::uint64_t spent = nanos_since(emission_mark);
+            emission_timing().emission_ns += spent;
+            if (shadow) {
+                const EmissionWork& work_after = emission_work();
+                const bool entered = work_after.executed_prefilters != work_before.executed_prefilters;
+                const bool passed = entered && work_after.prefilter_rejections == work_before.prefilter_rejections;
+                const bool accepted = fit.has_value() && fit->log_emission != kNegInf;
+                const std::uint64_t prefilter_spent = emission_timing().prefilter_ns - prefilter_before;
+                ++shadow_local.starts;
+                shadow_local.emission_ns += spent;
+                if (entered) {
+                    ++shadow_local.entering;
+                    shadow_local.prefilter_ns += prefilter_spent;
+                    if (passed) ++shadow_local.prefilter_passed;
+                    if (accepted) ++shadow_local.accepted;
+                    for (int i = 0; i < 3; ++i) {
+                        PieceScreenShadowRow& row = shadow_local.rows[i];
+                        ++row.entering;
+                        if (verdict[i] != ScreenVerdict::CountReject) ++row.count_pass;
+                        if (verdict[i] == ScreenVerdict::Admit) {
+                            ++row.admitted;
+                            continue;
+                        }
+                        ++row.rejected;
+                        row.rejected_emission_ns += spent;
+                        row.rejected_prefilter_ns += prefilter_spent;
+                        if (passed) ++row.rejected_prefilter_passed;
+                        if (accepted) ++row.rejected_accepted;
+                    }
+                }
+            }
+        }
         if (!fit.has_value() || fit->log_emission == kNegInf) continue;
         if (componentise[item.first] != 0) {
             // One row per consumed-span class. The scorer must see the same decomposition the oracle
@@ -2007,6 +2232,34 @@ void collect_form_placements(
         if (touched != nullptr && out[item.first].empty()) touched->push_back(item.first);
         out[item.first].push_back(placement);
         ++counters.accepted_mate_placements;
+    }
+    if (shadow) {
+        shadow_local.code_build_ns += shadow_codes.build_ns;
+        const std::lock_guard<std::mutex> lock(piece_screen_mutex());
+        PieceScreenShadowReport& totals = piece_screen_totals();
+        totals.starts += shadow_local.starts;
+        totals.entering += shadow_local.entering;
+        totals.prefilter_passed += shadow_local.prefilter_passed;
+        totals.accepted += shadow_local.accepted;
+        totals.emission_ns += shadow_local.emission_ns;
+        totals.prefilter_ns += shadow_local.prefilter_ns;
+        totals.code_build_ns += shadow_local.code_build_ns;
+        totals.layout_ns += shadow_local.layout_ns;
+        for (int i = 0; i < 3; ++i) {
+            PieceScreenShadowRow& to = totals.rows[i];
+            const PieceScreenShadowRow& from = shadow_local.rows[i];
+            to.pieces = shadow_pieces[i];
+            to.entering += from.entering;
+            to.count_pass += from.count_pass;
+            to.admitted += from.admitted;
+            to.rejected += from.rejected;
+            to.rejected_prefilter_passed += from.rejected_prefilter_passed;
+            to.rejected_accepted += from.rejected_accepted;
+            to.screen_ns += from.screen_ns;
+            to.rejected_emission_ns += from.rejected_emission_ns;
+            to.rejected_prefilter_ns += from.rejected_prefilter_ns;
+        }
+        totals.band = band;
     }
     // What the emission actually did on this thread since it was last asked. Taken here rather than
     // threaded through gapped_emission's signature, so the model's entry point keeps its shape.
@@ -3220,17 +3473,26 @@ void enumerate_window_origins(
     PlacementBudget& budget,
     FragmentScoringCounters& counters,
     EmissionCacheCounters& cache_work,
-    WindowScratch& scratch) {
+    WindowScratch& scratch,
+    // MEASUREMENT ONLY (the fragment-range diagnostic): piece indexes restricted to one range's forms,
+    // and that range. The defaults are the production path, unchanged.
+    const std::vector<PieceIndex>* forward_indexes = nullptr,
+    const std::vector<PieceIndex>* reverse_indexes = nullptr,
+    std::size_t fragment_begin = 0,
+    std::size_t fragment_end = std::numeric_limits<std::size_t>::max()) {
     const auto form_slot = [](std::size_t fragment, std::size_t arm) { return fragment * 2 + arm; };
     scratch.ensure_rows(prepared.forward_forms.size(), prepared.reverse_forms.size());
     scratch.clear_touched();
 
     collect_form_placements(window.bases, prepared.forward_forms, prepared.forward_componentise,
-                            prepared.forward_indexes, budget, band, library, scratch.forward_rows,
+                            forward_indexes != nullptr ? *forward_indexes : prepared.forward_indexes,
+                            budget, band, library, scratch.forward_rows,
                             scratch.proposed, counters, cache_work, options, &scratch.touched_forward);
     collect_form_placements(window.reversed, prepared.reverse_forms, prepared.reverse_componentise,
-                            prepared.reverse_indexes, budget, band, library, scratch.reverse_rows,
+                            reverse_indexes != nullptr ? *reverse_indexes : prepared.reverse_indexes,
+                            budget, band, library, scratch.reverse_rows,
                             scratch.proposed, counters, cache_work, options, &scratch.touched_reverse);
+    const std::size_t last_fragment = std::min(fragment_end, fragments.size());
 
     const std::size_t width = window.bases.size();
     // Filtered and shifted IN PLACE. resize() never grows here, so no row reallocates.
@@ -3265,7 +3527,7 @@ void enumerate_window_origins(
 
     scratch.origins.clear();
     scratch.offsets.assign(fragments.size() + 1, 0);
-    for (std::size_t f = 0; f < fragments.size(); ++f) {
+    for (std::size_t f = fragment_begin; f < last_fragment; ++f) {
         scratch.offsets[f] = scratch.origins.size();
         const InsertSupport& support = prepared.support_by_fragment[f];
         if (support.empty()) continue;
@@ -3351,7 +3613,7 @@ void enumerate_window_origins(
             }
         }
     }
-    scratch.offsets[fragments.size()] = scratch.origins.size();
+    scratch.offsets[last_fragment] = scratch.origins.size();
 }
 
 // The four acceptance caps, decided on whatever totals the caller holds them against: per call for
@@ -4286,6 +4548,318 @@ std::vector<std::uint64_t> PreparedScoringContext::origin_cache_key_hashes() con
 
 std::uint64_t PreparedScoringContext::origin_cache_slots() const {
     return state_->origin_cache.entries.size();
+}
+
+void set_piece_screen_shadow(bool enabled) {
+    if (enabled) {
+        const std::lock_guard<std::mutex> lock(piece_screen_mutex());
+        piece_screen_totals() = PieceScreenShadowReport{};
+    }
+    piece_screen_shadow_active().store(enabled, std::memory_order_relaxed);
+}
+
+PieceScreenShadowReport piece_screen_shadow_report() {
+    const std::lock_guard<std::mutex> lock(piece_screen_mutex());
+    return piece_screen_totals();
+}
+
+namespace {
+// The window the prefilter would test, or 0 when gapped_emission refuses before it.
+std::size_t prefilter_window(const std::string& haplotype, std::size_t start, const std::string& read,
+                             std::size_t max_gap_bp) {
+    if (start > haplotype.size() || haplotype.size() - start < read.size()) return 0;
+    return std::min(haplotype.size() - start, read.size() + max_gap_bp);
+}
+}  // namespace
+
+bool piece_screen_admits(const std::string& haplotype, std::size_t start, const std::string& read,
+                         std::size_t band, std::size_t max_gap_bp, std::size_t pieces) {
+    const std::size_t window = prefilter_window(haplotype, start, read, max_gap_bp);
+    if (window == 0) return false;
+    HaplotypeCodes codes;
+    codes.text = &haplotype;
+    return piece_screen(codes, start, window, piece_layout(read, pieces), band) == ScreenVerdict::Admit;
+}
+
+bool piece_screen_count_passes(const std::string& haplotype, std::size_t start, const std::string& read,
+                               std::size_t band, std::size_t max_gap_bp, std::size_t pieces) {
+    const std::size_t window = prefilter_window(haplotype, start, read, max_gap_bp);
+    if (window == 0) return false;
+    HaplotypeCodes codes;
+    codes.text = &haplotype;
+    return piece_screen(codes, start, window, piece_layout(read, pieces), band) != ScreenVerdict::CountReject;
+}
+
+// Written independently of piece_screen: plain substring comparison and a depth-first search over
+// every choice of exact-or-skip per piece, pruned only by the same three conditions.
+bool piece_screen_admits_reference(const std::string& haplotype, std::size_t start, const std::string& read,
+                                   std::size_t band, std::size_t max_gap_bp, std::size_t pieces) {
+    const std::size_t window = prefilter_window(haplotype, start, read, max_gap_bp);
+    if (window == 0) return false;
+    const std::size_t n = read.size();
+    if (pieces == 0 || pieces > n || pieces <= band) return true;
+    std::vector<std::size_t> offset(pieces), length(pieces);
+    for (std::size_t j = 0; j < pieces; ++j) {
+        offset[j] = j * n / pieces;
+        length[j] = (j + 1) * n / pieces - offset[j];
+        if (length[j] == 0 || length[j] > 31) return true;
+    }
+    const long k = static_cast<long>(band);
+    std::vector<std::vector<long>> matches(pieces);
+    for (std::size_t j = 0; j < pieces; ++j) {
+        for (long delta = -k; delta <= k; ++delta) {
+            const long at = static_cast<long>(start + offset[j]) + delta;
+            if (at < static_cast<long>(start)) continue;
+            if (static_cast<std::size_t>(at) + length[j] > start + window) continue;
+            if (haplotype.compare(static_cast<std::size_t>(at), length[j], read, offset[j], length[j]) == 0) {
+                matches[j].push_back(delta);
+            }
+        }
+    }
+    const std::size_t need = pieces - band;
+    std::function<bool(std::size_t, bool, std::size_t, long, long, std::size_t)> search =
+        [&](std::size_t j, bool have, std::size_t last, long last_delta, long spent, std::size_t count) {
+            if (count >= need) return true;
+            if (j == pieces || count + (pieces - j) < need) return false;
+            for (const long delta : matches[j]) {
+                long cost = spent;
+                if (have) {
+                    const long between = static_cast<long>(offset[j]) - static_cast<long>(offset[last] + length[last]);
+                    if (delta - last_delta < -between) continue;
+                    cost += std::labs(delta - last_delta);
+                } else {
+                    cost += std::labs(delta);
+                }
+                if (cost > k) continue;
+                if (search(j + 1, true, j, delta, cost, count + 1)) return true;
+            }
+            return search(j + 1, have, last, last_delta, spent, count);
+        };
+    return search(0, false, 0, 0, 0, 0);
+}
+
+bool feasibility_prefilter_admits(const std::string& haplotype, std::size_t start, const std::string& read,
+                                  std::size_t band, std::size_t max_gap_bp) {
+    const std::size_t window = prefilter_window(haplotype, start, read, max_gap_bp);
+    if (window == 0) return false;
+    return feasible_within_band(haplotype, start, window, read, band, nullptr);
+}
+
+DemandWindow PreparedScoringContext::demand_window(std::uint64_t key_hash) const {
+    DemandWindow out;
+    const auto range = state_->demand_index.equal_range(key_hash);
+    for (auto it = range.first; it != range.second; ++it) {
+        const auto& row = state_->demand[it->second];
+        out.found = true;
+        out.bytes = row.first;
+        out.at_start = row.second.at_start;
+        out.at_end = row.second.at_end;
+        out.rel_block_begin = row.second.rel_block_begin;
+        out.rel_new_end = row.second.rel_new_end;
+        break;
+    }
+    return out;
+}
+
+WindowEnumerationBench PreparedScoringContext::benchmark_window_enumeration(const std::string& bases,
+                                                                            bool at_start, bool at_end,
+                                                                            std::size_t workers,
+                                                                            std::size_t repeats) {
+    State& state = *state_;
+    state.require_usable();
+    if (workers == 0) workers = 1;
+    WindowEnumerationBench out;
+    out.workers = workers;
+    out.fragments = state.fragments.size();
+    out.window_bytes = bases.size();
+    LocalWindow window;
+    window.bases = bases;
+    window.reversed.assign(bases.rbegin(), bases.rend());
+    window.begin = 0;
+    window.at_start = at_start;
+    window.at_end = at_end;
+    const std::size_t band = state.options.mismatch_band;
+    const auto open_budget = [](PlacementBudget& budget) {
+        budget.max_piece_hits = std::numeric_limits<std::uint64_t>::max();
+        budget.max_physical_origins = std::numeric_limits<std::uint64_t>::max();
+    };
+    using Clock = std::chrono::steady_clock;
+    const auto seconds_since = [](Clock::time_point from) {
+        return std::chrono::duration<double>(Clock::now() - from).count();
+    };
+    // Reference: the production path, one thread, emission cache cold for this window.
+    WindowScratch reference;
+    FragmentScoringCounters reference_counters;
+    EmissionCacheCounters reference_cache;
+    {
+        PlacementBudget budget;
+        open_budget(budget);
+        const auto mark = Clock::now();
+        enumerate_window_origins(state.prepared, state.fragments, state.library, state.options, band, window,
+                                 budget, reference_counters, reference_cache, reference);
+        out.reference_cold_seconds = seconds_since(mark);
+    }
+    // The counter reference: the same path again, emission cache now warm.
+    WindowScratch warm;
+    FragmentScoringCounters warm_counters;
+    EmissionCacheCounters warm_cache;
+    {
+        PlacementBudget budget;
+        open_budget(budget);
+        const auto mark = Clock::now();
+        enumerate_window_origins(state.prepared, state.fragments, state.library, state.options, band, window,
+                                 budget, warm_counters, warm_cache, warm);
+        out.production_warm_seconds = seconds_since(mark);
+    }
+    // Contiguous fragment ranges, and each range's own piece indexes (built before any timing).
+    const std::size_t n = state.fragments.size();
+    struct Worker {
+        std::size_t begin = 0, end = 0;
+        std::vector<PieceIndex> forward, reverse;
+        WindowScratch scratch;
+        FragmentScoringCounters counters;
+        EmissionCacheCounters cache;
+        double busy = 0.0;
+        EmissionTimingDiag timing;
+    };
+    std::vector<Worker> pool(workers);
+    const auto restrict = [&](const std::vector<PieceIndex>& all, const std::deque<ReadForm>& forms,
+                              std::size_t begin, std::size_t end) {
+        std::vector<PieceIndex> part;
+        for (const PieceIndex& index : all) {
+            PieceIndex sub;
+            sub.piece_bp = index.piece_bp;
+            for (const PieceEntry& entry : index.entries) {
+                const std::size_t fragment = forms[entry.form].fragment;
+                if (fragment >= begin && fragment < end) sub.entries.push_back(entry);
+            }
+            part.push_back(std::move(sub));
+        }
+        return part;
+    };
+    for (std::size_t w = 0; w < workers; ++w) {
+        pool[w].begin = n * w / workers;
+        pool[w].end = n * (w + 1) / workers;
+        pool[w].forward = restrict(state.prepared.forward_indexes, state.prepared.forward_forms, pool[w].begin, pool[w].end);
+        pool[w].reverse = restrict(state.prepared.reverse_indexes, state.prepared.reverse_forms, pool[w].begin, pool[w].end);
+    }
+    emission_timing_active().store(true, std::memory_order_relaxed);
+    for (std::size_t r = 0; r < std::max<std::size_t>(repeats, 1); ++r) {
+        PlacementBudget budget;
+        open_budget(budget);
+        for (Worker& worker : pool) {
+            worker.counters = FragmentScoringCounters{};
+            worker.cache = EmissionCacheCounters{};
+        }
+        const auto mark = Clock::now();
+        std::vector<std::thread> threads;
+        for (Worker& worker : pool) {
+            threads.emplace_back([&, target = &worker]() {
+                const EmissionTimingDiag before = emission_timing();
+                const auto started = Clock::now();
+                enumerate_window_origins(state.prepared, state.fragments, state.library, state.options, band, window,
+                                         budget, target->counters, target->cache, target->scratch,
+                                         &target->forward, &target->reverse, target->begin, target->end);
+                target->busy = seconds_since(started);
+                target->timing.prefilter_ns = emission_timing().prefilter_ns - before.prefilter_ns;
+                target->timing.emission_ns = emission_timing().emission_ns - before.emission_ns;
+            });
+        }
+        for (std::thread& thread : threads) thread.join();
+        out.wall_seconds.push_back(seconds_since(mark));
+    }
+    emission_timing_active().store(false, std::memory_order_relaxed);
+    // Merge in ascending fragment order and compare.
+    std::vector<HaploidOrigin> merged;
+    std::vector<std::size_t> offsets(n + 1, 0);
+    FragmentScoringCounters total;
+    EmissionCacheCounters cache;
+    for (std::size_t w = 0; w < workers; ++w) {
+        const Worker& worker = pool[w];
+        for (std::size_t f = worker.begin; f < worker.end; ++f) {
+            offsets[f] = merged.size();
+            merged.insert(merged.end(), worker.scratch.origins.begin() + static_cast<std::ptrdiff_t>(worker.scratch.offsets[f]),
+                          worker.scratch.origins.begin() + static_cast<std::ptrdiff_t>(worker.scratch.offsets[f + 1]));
+        }
+        out.worker_busy_seconds.push_back(worker.busy);
+        out.prefilter_seconds += static_cast<double>(worker.timing.prefilter_ns) * 1e-9;
+        out.emission_seconds += static_cast<double>(worker.timing.emission_ns) * 1e-9;
+        if (w == 0) {
+            total.candidate_bases_scanned += worker.counters.candidate_bases_scanned;
+        } else {
+            out.duplicate_scan_bases += worker.counters.candidate_bases_scanned;
+        }
+        total.piece_hits += worker.counters.piece_hits;
+        total.proposed_starts += worker.counters.proposed_starts;
+        total.unique_starts += worker.counters.unique_starts;
+        total.full_read_verifications += worker.counters.full_read_verifications;
+        total.dp_evaluations += worker.counters.dp_evaluations;
+        total.prefilter_rejections += worker.counters.prefilter_rejections;
+        total.accepted_mate_placements += worker.counters.accepted_mate_placements;
+        total.valid_fr_states += worker.counters.valid_fr_states;
+        total.latent_alignment_pairs += worker.counters.latent_alignment_pairs;
+        total.physical_origins += worker.counters.physical_origins;
+        cache.executed_prefilters += worker.cache.executed_prefilters;
+        cache.dp_cache_requests += worker.cache.dp_cache_requests;
+        cache.dp_cache_hits += worker.cache.dp_cache_hits;
+        cache.dp_cache_misses += worker.cache.dp_cache_misses;
+        cache.executed_dps += worker.cache.executed_dps;
+    }
+    offsets[n] = merged.size();
+    out.origins_identical = merged.size() == reference.origins.size();
+    for (std::size_t i = 0; out.origins_identical && i < merged.size(); ++i) {
+        const HaploidOrigin& a = merged[i];
+        const HaploidOrigin& b = reference.origins[i];
+        out.origins_identical = a.forward_start == b.forward_start && a.insert_bp == b.insert_bp &&
+                                a.orientation == b.orientation &&
+                                std::memcmp(&a.log_latent_mass, &b.log_latent_mass, sizeof(double)) == 0;
+        if (!out.origins_identical) out.first_difference = "origin " + std::to_string(i);
+    }
+    if (out.origins_identical) {
+        for (std::size_t f = 0; f <= n; ++f) {
+            if (offsets[f] != reference.offsets[f]) {
+                out.origins_identical = false;
+                out.first_difference = "offset of fragment " + std::to_string(f);
+                break;
+            }
+        }
+    }
+    const std::pair<const char*, std::pair<std::uint64_t, std::uint64_t>> checks[] = {
+        {"candidate_bases_scanned", {total.candidate_bases_scanned, warm_counters.candidate_bases_scanned}},
+        {"piece_hits", {total.piece_hits, warm_counters.piece_hits}},
+        {"proposed_starts", {total.proposed_starts, warm_counters.proposed_starts}},
+        {"unique_starts", {total.unique_starts, warm_counters.unique_starts}},
+        {"full_read_verifications", {total.full_read_verifications, warm_counters.full_read_verifications}},
+        {"dp_evaluations", {total.dp_evaluations, warm_counters.dp_evaluations}},
+        {"prefilter_rejections", {total.prefilter_rejections, warm_counters.prefilter_rejections}},
+        {"accepted_mate_placements", {total.accepted_mate_placements, warm_counters.accepted_mate_placements}},
+        {"valid_fr_states", {total.valid_fr_states, warm_counters.valid_fr_states}},
+        {"latent_alignment_pairs", {total.latent_alignment_pairs, warm_counters.latent_alignment_pairs}},
+        {"physical_origins", {total.physical_origins, warm_counters.physical_origins}},
+        {"executed_prefilters", {cache.executed_prefilters, warm_cache.executed_prefilters}},
+        {"dp_cache_requests", {cache.dp_cache_requests, warm_cache.dp_cache_requests}},
+        {"dp_cache_hits", {cache.dp_cache_hits, warm_cache.dp_cache_hits}},
+        {"dp_cache_misses", {cache.dp_cache_misses, warm_cache.dp_cache_misses}},
+        {"executed_dps", {cache.executed_dps, warm_cache.executed_dps}},
+    };
+    out.counters_identical = true;
+    for (const auto& check : checks) {
+        if (check.second.first != check.second.second) {
+            out.counters_identical = false;
+            if (out.first_difference.empty()) {
+                out.first_difference = std::string(check.first) + " " + std::to_string(check.second.first) +
+                                       " vs " + std::to_string(check.second.second);
+            }
+            break;
+        }
+    }
+    out.origins = merged.size();
+    out.piece_hits = total.piece_hits;
+    out.latent_pairs = total.latent_alignment_pairs;
+    out.executed_dps = cache.executed_dps;
+    out.executed_prefilters = cache.executed_prefilters;
+    out.verifications = total.full_read_verifications;
+    return out;
 }
 
 std::vector<std::size_t> PreparedScoringContext::census_slots() const {

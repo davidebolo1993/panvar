@@ -3432,6 +3432,19 @@ int repair_search(const Args& args) {
     // ADVERSARIAL GATE HOOK: permute the neighbour list and the repair-request list every round. Under
     // planned retention nothing observable may change -- cache identities, accounting, scores, ranking.
     const std::uint64_t request_order_seed = std::stoull(args.get("request-order-seed", "0"));
+    // MEASUREMENT ONLY: evaluate the necessary-condition piece screen in shadow on every verification
+    // (it rejects nothing), and export named recorded windows for the enumeration benchmark.
+    const bool piece_screen_shadow = args.get("piece-screen-shadow", "0") != "0";
+    if (piece_screen_shadow) panvar::set_piece_screen_shadow(true);
+    std::vector<std::pair<std::string, std::uint64_t>> export_windows;
+    {
+        std::stringstream spec(args.get("export-windows", ""));
+        for (std::string cell; std::getline(spec, cell, ',');) {
+            const std::size_t eq = cell.find('=');
+            if (eq == std::string::npos) throw std::runtime_error("--export-windows wants label=keyhash,...");
+            export_windows.emplace_back(cell.substr(0, eq), std::stoull(cell.substr(eq + 1)));
+        }
+    }
     if (args.get("origin-self-check", "0") != "0") panvar::set_origin_cache_self_check(true);
     // Memory diagnostic: after the search stops without moving, re-score that same neighbourhood N more
     // times, scoring and releasing without promoting. Hold cycles never enter the rounds table.
@@ -4869,6 +4882,34 @@ int repair_search(const Args& args) {
             std::filesystem::remove(out + "." + partial + ".partial.tsv", ignored);
         }
         status_extra = demand_report(demand_rows);
+        if (piece_screen_shadow) {
+            panvar::set_piece_screen_shadow(false);
+            const panvar::PieceScreenShadowReport report = panvar::piece_screen_shadow_report();
+            std::ostringstream text;
+            text << "pieces\tentering\tcount_pass\tadmitted\trejected\trejected_prefilter_passed\t"
+                    "rejected_accepted\tscreen_ns\trejected_emission_ns\trejected_prefilter_ns\t"
+                    "band\tstarts\tall_entering\tprefilter_passed\taccepted\temission_ns\tprefilter_ns\t"
+                    "code_build_ns\tlayout_ns\n";
+            for (const panvar::PieceScreenShadowRow& row : report.rows) {
+                text << row.pieces << '\t' << row.entering << '\t' << row.count_pass << '\t' << row.admitted
+                     << '\t' << row.rejected << '\t' << row.rejected_prefilter_passed << '\t'
+                     << row.rejected_accepted << '\t' << row.screen_ns << '\t' << row.rejected_emission_ns
+                     << '\t' << row.rejected_prefilter_ns << '\t' << report.band << '\t' << report.starts
+                     << '\t' << report.entering << '\t' << report.prefilter_passed << '\t' << report.accepted
+                     << '\t' << report.emission_ns << '\t' << report.prefilter_ns << '\t'
+                     << report.code_build_ns << '\t' << report.layout_ns << '\n';
+            }
+            atomic_write(out + ".piece_screen.tsv", text.str());
+        }
+        for (const auto& [label, hash] : export_windows) {
+            const panvar::DemandWindow w = context->demand_window(hash);
+            std::ostringstream text;
+            text << "key\tvalue\nlabel\t" << label << "\nkey_hash\t" << hash << "\nfound\t"
+                 << (w.found ? "true" : "false") << "\nat_start\t" << (w.at_start ? 1 : 0) << "\nat_end\t"
+                 << (w.at_end ? 1 : 0) << "\nrel_block_begin\t" << w.rel_block_begin << "\nrel_new_end\t"
+                 << w.rel_new_end << "\nwindow_bytes\t" << w.bytes.size() << "\nbytes\t" << w.bytes << '\n';
+            atomic_write(out + ".window." + label + ".tsv", text.str());
+        }
         write_status("COMPLETE", stop_reason);
     }
     if (truth_gfa.empty()) {
@@ -4881,6 +4922,63 @@ int repair_search(const Args& args) {
               << " -> " << tables.final_distance << " (floor " << floor_total << "), " << cumulative_seconds
               << "s scoring\n";
     return 0;
+}
+
+// ------------------------------------------------------------------------------------------------
+// window-bench: MEASUREMENT ONLY. One recorded window's origin enumeration, with its fragments divided
+// among --workers contiguous ranges, checked bit-identical against the production path.
+int window_bench(const Args& args) {
+    const std::string out = args.required("out");
+    const auto status = read_key_values(args.required("run") + ".mosaic_status.tsv");
+    panvar::FragmentScoringOptions scoring;
+    scoring.threads = 1;
+    scoring.mismatch_band = std::stoul(status.at("mismatch_band"));
+    scoring.minimum_piece_bp = 12;
+    scoring.max_piece_hits = std::stoull(status.at("max_piece_hits"));
+    scoring.max_proposed_starts_per_haplotype = std::stoull(status.at("max_proposed_starts_per_haplotype"));
+    scoring.max_physical_origins = std::stoull(status.at("max_physical_origins"));
+    scoring.max_state_classes = std::stoull(status.at("max_state_classes"));
+    scoring.max_mass_cells = std::stoull(status.at("max_mass_cells"));
+    scoring.emission_cache_bytes = static_cast<std::size_t>(std::stoull(status.at("emission_cache_bytes")));
+    const panvar::LibraryModel library = read_library_file(args.required("library"));
+    const std::vector<panvar::ReadPair> fragments = read_pairs(args.required("reads1"), args.required("reads2"));
+    const auto window = read_key_values(args.required("window"));
+    const std::size_t workers = std::stoul(args.get("workers", "1"));
+    const std::size_t repeats = std::stoul(args.get("repeats", "5"));
+    const FootprintSample loaded = physical_footprint();
+    panvar::PreparedScoringContext context(fragments, library, scoring);
+    const FootprintSample prepared = physical_footprint();
+    const panvar::WindowEnumerationBench b = context.benchmark_window_enumeration(
+        window.at("bytes"), window.at("at_start") == "1", window.at("at_end") == "1", workers, repeats);
+    const FootprintSample done = physical_footprint();
+    std::vector<double> walls = b.wall_seconds;
+    std::sort(walls.begin(), walls.end());
+    const double median = walls[walls.size() / 2];
+    double busy = 0.0;
+    for (const double x : b.worker_busy_seconds) busy += x;
+    std::ostringstream text;
+    text << std::setprecision(9) << "key\tvalue\nlabel\t" << window.at("label") << "\nworkers\t" << b.workers
+         << "\nfragments\t" << b.fragments << "\nwindow_bytes\t" << b.window_bytes << "\nat_start\t"
+         << window.at("at_start") << "\nat_end\t" << window.at("at_end") << "\nrepeats\t" << walls.size()
+         << "\nreference_cold_seconds\t" << b.reference_cold_seconds << "\nproduction_warm_seconds\t"
+         << b.production_warm_seconds << "\nwall_seconds_median\t" << median << "\nwall_seconds_min\t" << walls.front()
+         << "\nwall_seconds_max\t" << walls.back() << "\nworker_busy_seconds_sum\t" << busy << "\nutilization\t"
+         << (busy / (static_cast<double>(b.workers) * b.wall_seconds.back())) << "\nprefilter_seconds\t"
+         << b.prefilter_seconds << "\nemission_seconds\t" << b.emission_seconds << "\norigins_identical\t"
+         << (b.origins_identical ? "true" : "false") << "\ncounters_identical\t"
+         << (b.counters_identical ? "true" : "false") << "\nfirst_difference\t"
+         << (b.first_difference.empty() ? "none" : b.first_difference) << "\norigins\t" << b.origins
+         << "\npiece_hits\t" << b.piece_hits << "\nlatent_pairs\t" << b.latent_pairs << "\nexecuted_dps\t"
+         << b.executed_dps << "\nexecuted_prefilters\t" << b.executed_prefilters << "\nverifications\t"
+         << b.verifications << "\nduplicate_scan_bases\t" << b.duplicate_scan_bases
+         << "\nphys_footprint_loaded\t" << loaded.current << "\nphys_footprint_prepared\t" << prepared.current
+         << "\nphys_footprint_done\t" << done.current << "\nphys_footprint_peak\t" << done.peak << '\n';
+    atomic_write(out, text.str());
+    std::cout << "window-bench " << window.at("label") << " workers " << b.workers << ": median " << median
+              << " s (production warm " << b.production_warm_seconds << " s), origins "
+              << (b.origins_identical ? "identical" : "DIFFER") << ", counters "
+              << (b.counters_identical ? "identical" : "DIFFER") << '\n';
+    return b.origins_identical && b.counters_identical ? 0 : 7;
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -5606,6 +5704,7 @@ int main(int argc, char** argv) {
         if (command == "repair-pilot") return repair_pilot(args);
         if (command == "score-set") return score_set(args);
         if (command == "repair-search") return repair_search(args);
+        if (command == "window-bench") return window_bench(args);
         std::cerr << "unknown probe command: " << command << '\n';
         return 2;
     } catch (const std::exception& error) {

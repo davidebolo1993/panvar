@@ -1,0 +1,27 @@
+item	value	provenance
+scope	measurement only: shadow piece screen and fragment-range window enumeration; no call, default or production wiring changed	Sol, after 806854b
+unit_correction	cache at the end of the 0b370e9 30x run: 399568340 bytes = 381.05 MiB = 399.57 MB; budget 402653184 bytes = 384 MiB exactly; margin 3084844 bytes = 2.94 MiB = 3.08 MB	the earlier report's '399.6 MiB' should have read 399.6 MB (381.1 MiB); the margin reconciles exactly
+units	MiB/GiB binary throughout this record	
+lemma	read partitioned into d disjoint pieces; alignment to a prefix of hap[s, s+W) with <= k unit edits => (a) >= d-k pieces exact; (b) exact pieces at increasing non-overlapping positions: delta_b - delta_a >= -(read bases between); (c) |delta_first| + sum |delta change| <= k, displacement starting at 0 at s	(a) and (c) are separate bounds, never added: an indel inside a broken piece counts in both
+lemma_gate	67572 screen evaluations on unique, period-7 and period-14 haplotypes: directed substitution/insertion/deletion/boundary/leading-deletion/read-end fixtures, 3000 random edit scripts at 7 starts each, 1500 scrambled-displacement reads	every one of 11316 prefilter-feasible placements admitted; screen == brute-force DFS reference everywhere; 2598 rejections by offset consistency alone
+shadow_run	NA20509 30x, one cold round, planned 384 MiB, same configuration as the converged run	round-1 scientific row identical to 0b370e9; 167.0 s wall (screen evaluated 3x per start plus timers); peak phys footprint 2047887400 bytes (1.907 GiB)
+shadow_starts	135687439 verification starts; 135238742 reached the prefilter; 24098853 passed it; 23872853 accepted by the exact scorer	
+screen_d7	k+1: rejects 18396818 (13.6%); query 14.04 s; avoided emission 7.68 s	false negatives: 0 vs prefilter, 0 vs exact scorer
+screen_d8	k+2: count condition passes 50659745, chain passes 49480479; rejects 85758263 (63.4%); query 15.81 s; avoided emission 35.77 s	false negatives: 0 / 0
+screen_d13	2k+1: count 27812842, chain 27437320; rejects 107801422 (79.7%); query 23.35 s; avoided emission 44.92 s	false negatives: 0 / 0
+shadow_overheads	piece layouts rebuilt per window: 13.36 s (a real screen would build each layout once at preparation); substring codes 0.32 s; timer 27.5 ns per timed pair (measured)	prefilter_ns reads 0: the shadow did not enable the prefilter-internal timer; the avoided figure is the whole gapped_emission call, which the screen would skip
+screen_selection	by exactness, work and runtime only: d=7 loses time; d=13 has the largest net gain	no truth used
+bench_windows	predeclared from the 0b370e9 ledger by origins per enumeration: median interior (key 17592462196485969964, 15494 bp), heaviest interior (17214837626937967317, 86684 bp), median end (8467408272449988280, at_start, 12956 bp)	
+bench_machine	Apple M4, 4 performance + 6 efficiency cores; load average 2.4-2.7 during the benchmark; run after the shadow round, never concurrently	
+bench_identity	all 12 configurations: origins, offsets and 16 counters bit-identical to the production path	duplicated window scanning reported separately (up to 1213576 bases at 8 workers)
+bench_median_interior	1/2/4/8 workers: 0.146/0.075/0.039/0.031 s; speedup vs production warm 0.95/1.86/3.86/4.52; utilization 1.00/0.99/0.98/0.85	prefilter 0.077 s, emission 0.119 s at 1 worker; 122096 origins, 77325 piece hits, 0 DPs (warm)
+bench_heaviest_interior	0.432/0.224/0.127/0.111 s; speedup 0.96/1.85/3.33/3.73; utilization 1.00/1.00/0.98/0.94	prefilter 0.130 s, emission 0.301 s; 1148776 origins, 332594 piece hits
+bench_median_end	0.118/0.061/0.032/0.025 s; speedup 0.95/1.85/3.51/4.44; utilization 1.00/1.00/0.99/0.83	prefilter 0.068 s, emission 0.097 s
+bench_footprint	0.21-0.51 GiB per benchmark process; 8 workers add <= 20 MiB on the heaviest window	
+projection_basis	measured complete run 336.9 s = 297.7 s window enumeration + 39.2 s fixed (startup, seed placement, per-round scoring and promotion)	
+projection_rules	screen cost as measured (timer included), avoided time with timer removed; emission share of enumeration 0.696 (lowest, heaviest window); 8-worker speedup 3.73 (slowest); overlap: parallelism divides only the work the screen leaves	
+projection_screen_alone	d=13: 323.7 s; d=8: 326.4 s; d=7: 391.9 s	
+projection_parallel_alone	8 workers: 119.1 s; 4 workers: 128.7 s	
+projection_both	d=13 + 8 workers: 115.6 s (134.0 s if the remaining work scaled only 3.0x); with layouts precomputed and the timer removed from the screen's cost: 103 s	
+projection_hypothetical	16 performance cores, perfect scaling, d=13: 57.0 s	NOT for acceptance
+decision	combined conservative projection 115.6 s > 90 s: these two levers are insufficient; no implementation plan	stop before another optimization

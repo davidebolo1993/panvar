@@ -1153,6 +1153,94 @@ struct OriginCachePlanReport {
     std::uint64_t evicted_bytes = 0;
 };
 
+// ---- MEASUREMENT ONLY: the necessary-condition piece screen, in shadow ---------------------------
+//
+// Lemma. Partition a read into d disjoint pieces (offsets o_j, lengths l_j). Let an alignment of the
+// read against a prefix of haplotype[s, s+W) use at most k unit-cost edits (substitutions, inserted
+// and deleted bases) -- the existing feasibility prefilter's acceptance condition. A piece containing
+// no edit is EXACT: it matches haplotype[s + o_j + delta_j, + l_j) with delta_j the alignment's
+// displacement over it (haplotype bases consumed minus read bases consumed). Then:
+//   (a) at least d - k pieces are exact -- each broken piece holds an edit, and pieces are disjoint;
+//   (b) the exact pieces j_1 < ... < j_m lie in increasing, non-overlapping haplotype positions inside
+//       the window: delta_b - delta_a >= -(read bases strictly between a and b);
+//   (c) |delta_{j_1}| + sum |delta_{j_{t+1}} - delta_{j_t}| <= k, because the alignment starts at s
+//       (delta 0 before the first read base) and every unit of displacement change is an indel base.
+// (b) and (c) are the offset consistency. (a) and (c) are separate bounds on the same k edits: an
+// indel inside a broken piece is counted by both, so they are NOT added.
+//
+// The shadow evaluates the screen for d = k+1, k+2 and 2k+1 on every start that reaches the
+// prefilter, rejects nothing, and counts what it WOULD reject -- including any start the prefilter or
+// the exact scorer accepted, which must be zero.
+struct PieceScreenShadowRow {
+    std::uint64_t pieces = 0;
+    std::uint64_t entering = 0;                    // starts that reached the existing prefilter
+    std::uint64_t count_pass = 0;                  // passed (a) alone
+    std::uint64_t admitted = 0;                    // passed (a), (b) and (c)
+    std::uint64_t rejected = 0;
+    std::uint64_t rejected_prefilter_passed = 0;   // MUST be 0
+    std::uint64_t rejected_accepted = 0;           // MUST be 0
+    std::uint64_t screen_ns = 0;                   // query time
+    std::uint64_t rejected_emission_ns = 0;        // gapped_emission time on starts it would reject
+    std::uint64_t rejected_prefilter_ns = 0;       // of which inside the existing prefilter
+};
+struct PieceScreenShadowReport {
+    std::uint64_t band = 0;
+    std::uint64_t starts = 0;                      // verification calls observed
+    std::uint64_t entering = 0;
+    std::uint64_t prefilter_passed = 0;
+    std::uint64_t accepted = 0;
+    std::uint64_t emission_ns = 0;                 // all gapped_emission calls observed
+    std::uint64_t prefilter_ns = 0;                // all prefilter executions observed
+    std::uint64_t code_build_ns = 0;               // substring codes of the scanned haplotypes/windows
+    std::uint64_t layout_ns = 0;                   // read piece layouts
+    PieceScreenShadowRow rows[3];
+};
+void set_piece_screen_shadow(bool enabled);   // enabling also resets the totals
+PieceScreenShadowReport piece_screen_shadow_report();
+// The screen on one placement, the independent brute-force reference used to gate it, the count
+// condition alone, and the existing prefilter under the same window rule. For gates only.
+bool piece_screen_admits(const std::string& haplotype, std::size_t start, const std::string& read,
+                         std::size_t band, std::size_t max_gap_bp, std::size_t pieces);
+bool piece_screen_admits_reference(const std::string& haplotype, std::size_t start,
+                                   const std::string& read, std::size_t band, std::size_t max_gap_bp,
+                                   std::size_t pieces);
+bool piece_screen_count_passes(const std::string& haplotype, std::size_t start, const std::string& read,
+                               std::size_t band, std::size_t max_gap_bp, std::size_t pieces);
+bool feasibility_prefilter_admits(const std::string& haplotype, std::size_t start,
+                                  const std::string& read, std::size_t band, std::size_t max_gap_bp);
+
+// ---- MEASUREMENT ONLY: one window's enumeration split across fragment ranges ---------------------
+struct WindowEnumerationBench {
+    std::size_t workers = 0;
+    std::size_t fragments = 0;
+    std::size_t window_bytes = 0;
+    double reference_cold_seconds = 0.0;       // production path, one thread, emission cache cold
+    double production_warm_seconds = 0.0;      // production path, one thread, emission cache warm
+    std::vector<double> wall_seconds;          // partitioned runs, one per repeat
+    std::vector<double> worker_busy_seconds;   // last repeat
+    double prefilter_seconds = 0.0;            // summed over workers, last repeat
+    double emission_seconds = 0.0;             // gapped_emission, summed over workers, last repeat
+    bool origins_identical = false;            // against the cold production reference
+    bool counters_identical = false;           // against the warm production pass
+    std::string first_difference;
+    std::uint64_t origins = 0;
+    std::uint64_t piece_hits = 0;
+    std::uint64_t latent_pairs = 0;
+    std::uint64_t executed_dps = 0;
+    std::uint64_t executed_prefilters = 0;
+    std::uint64_t verifications = 0;
+    std::uint64_t duplicate_scan_bases = 0;    // extra window scanning the split performs
+};
+
+struct DemandWindow {
+    bool found = false;
+    std::string bytes;
+    bool at_start = false;
+    bool at_end = false;
+    std::uint32_t rel_block_begin = 0;
+    std::uint32_t rel_new_end = 0;
+};
+
 struct ContextMemoryAccount {
     std::uint64_t slots_total = 0;
     std::uint64_t slots_live = 0;
@@ -1287,6 +1375,11 @@ public:
                                                      std::vector<BlockDeltaWork>* works = nullptr,
                                                      OriginCachePlanReport* plan = nullptr);
     std::vector<std::uint64_t> origin_cache_key_hashes() const;   // live entries, ascending
+    // MEASUREMENT ONLY. The recorded window with this key hash, if the demand ledger holds it; and one
+    // window's enumeration timed with its fragments divided among `workers` contiguous ranges.
+    DemandWindow demand_window(std::uint64_t key_hash) const;
+    WindowEnumerationBench benchmark_window_enumeration(const std::string& bases, bool at_start, bool at_end,
+                                                        std::size_t workers, std::size_t repeats);
     std::uint64_t origin_cache_slots() const;                     // entry slots, live or reusable
     // Slots currently holding a full origin census, ascending. A caller that knows what each slot is
     // (an incumbent, a seed, a winner being promoted) can then say why every one of them is live.
