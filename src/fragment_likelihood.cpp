@@ -2998,9 +2998,8 @@ std::uint64_t hash_materialised(const std::string& bases) {
 
 // ---- the local window a replacement can disturb ------------------------------------------------
 //
-// Transient by construction: these bytes live only for one delta. That is precisely why the cache
-// must be frozen before any of this runs -- a key built here would point into `bases` below, which
-// is about to go out of scope.
+// Transient by construction: these bytes live only for one delta. That is safe because the emission
+// cache copies whatever it retains into its own arena -- nothing it keeps points into `bases` below.
 struct LocalWindow {
     std::string bases;
     std::string reversed;
@@ -3630,6 +3629,38 @@ struct PreparedScoringContext::State {
     std::map<std::size_t, HaploidOriginCensus> censuses;
     // Reused by every delta: rows, groups, accumulators and the flat origin output.
     WindowScratch window_scratch;
+    // Size of the matrix the latest score_candidates flattened for its caller, for memory accounts.
+    std::uint64_t last_result_bytes = 0;
+    // Released repair slots, reused before any new slot is appended. Without this the slot count grew
+    // by a whole neighbourhood every round, and score_candidates -- which flattens one column per slot
+    // -- grew with it: measured at 26 MiB per round on NA20509 10x, the only accounted item that grew.
+    std::vector<std::size_t> free_slots;
+    std::size_t slots_created = 0;
+
+    // A slot for a new repair: a released one if any, else a new one. A reused slot's column is reset
+    // to -inf, which is what a fresh slot starts at and what stage 5 relies on for a fragment with no
+    // states. Its sequence strings are already empty (released), its census, segment and hash entry
+    // already gone, and anything keyed by its old identity as an incumbent was dropped when it was
+    // released -- so no retained structure can mistake the new haplotype for the old one.
+    std::size_t allocate_repair_slot(std::uint64_t hash) {
+        std::size_t slot = 0;
+        if (!free_slots.empty()) {
+            slot = free_slots.back();
+            free_slots.pop_back();
+            hash_by_slot[slot] = hash;
+            mass_column[slot].assign(fragments.size(), kNegInf);
+        } else {
+            slot = sequences.size();
+            hash_by_slot.push_back(hash);
+            sequences.emplace_back();
+            reversed.emplace_back();
+            mass_column.resize(slot + 1, std::vector<double>(fragments.size(), kNegInf));
+            exposure.resize(slot + 1, 0.0);
+        }
+        by_hash.emplace(hash, slot);
+        ++slots_created;
+        return slot;
+    }
 
     // Stage 6, off unless enabled. The cache is content-keyed and survives release_transient; the
     // group preaggregates and full aggregates are working state keyed by incumbent and are dropped
@@ -3734,6 +3765,7 @@ std::vector<std::size_t> PreparedScoringContext::add_haplotypes(
         const std::size_t slot = state.sequences.size();
         state.by_hash.emplace(hash, slot);
         state.hash_by_slot.push_back(hash);
+        ++state.slots_created;
         state.sequences.push_back(sequence);
         state.reversed.emplace_back(sequence.rbegin(), sequence.rend());
         out.push_back(slot);
@@ -3933,10 +3965,16 @@ FragmentScoringResult PreparedScoringContext::score_candidates(
     result.exposure = state.exposure;
     result.memory.mass_matrix_bytes =
         static_cast<std::uint64_t>(result.log_mass.size()) * sizeof(double);
+    state.last_result_bytes =
+        static_cast<std::uint64_t>(result.log_mass.capacity() + result.exposure.capacity()) *
+            sizeof(double) +
+        static_cast<std::uint64_t>(result.scores.capacity()) * sizeof(DiplotypeScore);
     return result;
 }
 
 std::size_t PreparedScoringContext::unique_haplotypes() const { return state_->sequences.size(); }
+
+std::size_t PreparedScoringContext::haplotypes_created() const { return state_->slots_created; }
 
 double PreparedScoringContext::mass_of(std::size_t fragment, std::size_t haplotype) const {
     state_->require_usable();
@@ -3987,6 +4025,136 @@ std::uint64_t PreparedScoringContext::merge_working_bytes() const {
         total += sizeof(item) + static_cast<std::uint64_t>(item.second.capacity()) * sizeof(StateCount);
     }
     return total;
+}
+
+ContextMemoryAccount PreparedScoringContext::memory_account() const {
+    const State& state = *state_;
+    ContextMemoryAccount a;
+    // A default string's capacity is its short-string buffer, inside the object itself: only the
+    // excess is heap.
+    const std::size_t inline_capacity = std::string().capacity();
+    const auto heap = [inline_capacity](const std::string& text) -> std::uint64_t {
+        return text.capacity() > inline_capacity ? text.capacity() : 0;
+    };
+    // Declared allowances for node-based containers, whose internals are not observable.
+    constexpr std::uint64_t kTreeNode = 32;
+    constexpr std::uint64_t kHashNode = 16;
+
+    a.slots_total = state.sequences.size();
+    for (std::size_t slot = 0; slot < state.sequences.size(); ++slot) {
+        const bool live = !state.sequences[slot].empty() || !state.mass_column[slot].empty() ||
+                          state.segments.count(slot) != 0;
+        if (live) {
+            ++a.slots_live;
+        } else {
+            ++a.slots_released;
+        }
+        a.sequence_bytes += state.sequences[slot].size() + state.reversed[slot].size();
+        a.sequence_capacity += heap(state.sequences[slot]) + heap(state.reversed[slot]);
+        a.mass_column_bytes += state.mass_column[slot].size() * sizeof(double);
+        a.mass_column_capacity += state.mass_column[slot].capacity() * sizeof(double);
+    }
+    a.slot_table_bytes =
+        static_cast<std::uint64_t>(state.sequences.size()) * 2 * sizeof(std::string) +
+        static_cast<std::uint64_t>(state.mass_column.capacity()) * sizeof(std::vector<double>) +
+        static_cast<std::uint64_t>(state.exposure.capacity()) * sizeof(double) +
+        static_cast<std::uint64_t>(state.hash_by_slot.capacity()) * sizeof(std::uint64_t) +
+        static_cast<std::uint64_t>(state.by_hash.size()) *
+            (sizeof(std::pair<const std::uint64_t, std::size_t>) + kHashNode) +
+        static_cast<std::uint64_t>(state.by_hash.bucket_count()) * sizeof(void*);
+    for (const auto& segment : state.segments) {
+        a.segment_bytes += sizeof(segment) + kTreeNode + heap(segment.second.replacement);
+    }
+    for (const auto& item : state.censuses) {
+        ++a.census_count;
+        for (const std::vector<HaploidOrigin>& list : item.second.origins_by_fragment) {
+            a.census_bytes += list.size() * sizeof(HaploidOrigin);
+        }
+        a.census_capacity += item.second.payload_bytes() + sizeof(item) + kTreeNode;
+    }
+    a.origin_cache_entries = state.origin_cache.entries.size();
+    a.origin_cache_payload = state.origin_cache.bytes;
+    for (const OriginCacheEntry& entry : state.origin_cache.entries) {
+        a.origin_cache_capacity +=
+            sizeof(OriginCacheEntry) + heap(entry.bytes) +
+            static_cast<std::uint64_t>(entry.records.origins.capacity()) * sizeof(CachedOrigin) +
+            static_cast<std::uint64_t>(entry.records.fragments.capacity() +
+                                       entry.records.starts.capacity()) *
+                sizeof(std::uint32_t);
+    }
+    a.origin_cache_capacity +=
+        static_cast<std::uint64_t>(state.origin_cache.index.size()) *
+            (sizeof(std::pair<const std::uint64_t, std::size_t>) + kHashNode) +
+        static_cast<std::uint64_t>(state.origin_cache.index.bucket_count()) * sizeof(void*);
+    for (const auto& item : state.groups) {
+        a.merge_working_bytes +=
+            item.second.unaffected.states.size() * sizeof(StateCount) +
+            (item.second.unaffected.fragments.size() + item.second.unaffected.starts.size()) *
+                sizeof(std::uint32_t);
+        a.merge_working_capacity += item.second.unaffected.bytes() + sizeof(item) + kTreeNode;
+    }
+    for (const auto& item : state.full_aggregates) {
+        a.merge_working_bytes += item.second.size() * sizeof(StateCount);
+        a.merge_working_capacity +=
+            item.second.capacity() * sizeof(StateCount) + sizeof(item) + kTreeNode;
+    }
+    {
+        const WindowScratch& w = state.window_scratch;
+        std::uint64_t cap = static_cast<std::uint64_t>(w.forward_rows.capacity() + w.reverse_rows.capacity()) *
+                            sizeof(std::vector<FormPlacement>);
+        for (const auto& row : w.forward_rows) cap += row.capacity() * sizeof(FormPlacement);
+        for (const auto& row : w.reverse_rows) cap += row.capacity() * sizeof(FormPlacement);
+        cap += static_cast<std::uint64_t>(w.touched_forward.capacity() + w.touched_reverse.capacity()) *
+                   sizeof(std::uint32_t) +
+               static_cast<std::uint64_t>(w.proposed.capacity()) *
+                   sizeof(std::pair<std::uint32_t, std::uint32_t>) +
+               static_cast<std::uint64_t>(w.group_begin.capacity() + w.group_end.capacity() +
+                                          w.offsets.capacity()) *
+                   sizeof(std::size_t) +
+               static_cast<std::uint64_t>(w.accumulators.capacity()) * sizeof(OriginAccumulator) +
+               w.accepted.capacity() +
+               static_cast<std::uint64_t>(w.origins.capacity()) * sizeof(HaploidOrigin);
+        a.window_scratch_capacity = cap;
+    }
+    {
+        const auto records = [](const OriginRecordSet& r) {
+            return static_cast<std::uint64_t>(r.origins.capacity()) * sizeof(CachedOrigin) +
+                   static_cast<std::uint64_t>(r.fragments.capacity() + r.starts.capacity()) *
+                       sizeof(std::uint32_t);
+        };
+        a.origin_scratch_capacity =
+            records(state.miss_records) + records(state.check_records) +
+            state.candidate_states.bytes() +
+            static_cast<std::uint64_t>(state.key_scratch.capacity()) * sizeof(StateKey) +
+            static_cast<std::uint64_t>(state.merged.capacity()) * sizeof(StateCount);
+    }
+    emission_cache_storage_bytes(&a.emission_cache_table, &a.emission_cache_arena);
+    {
+        std::uint64_t prepared = 0;
+        for (const ReadForm& form : state.prepared.forward_forms) prepared += sizeof(ReadForm) + heap(form.bases);
+        for (const ReadForm& form : state.prepared.reverse_forms) prepared += sizeof(ReadForm) + heap(form.bases);
+        for (const PieceIndex& index : state.prepared.forward_indexes) {
+            prepared += index.entries.capacity() * sizeof(PieceEntry);
+        }
+        for (const PieceIndex& index : state.prepared.reverse_indexes) {
+            prepared += index.entries.capacity() * sizeof(PieceEntry);
+        }
+        for (const ReadPair& fragment : state.fragments) {
+            prepared += sizeof(ReadPair) + heap(fragment.first.bases) + heap(fragment.second.bases);
+        }
+        a.prepared_capacity = prepared;
+    }
+    a.last_scoring_result_bytes = state.last_result_bytes;
+    a.logical_total = a.slot_table_bytes + a.sequence_bytes + a.segment_bytes + a.mass_column_bytes +
+                      a.census_bytes + a.origin_cache_payload + a.merge_working_bytes +
+                      a.emission_cache_table + a.emission_cache_arena + a.prepared_capacity +
+                      a.last_scoring_result_bytes;
+    a.capacity_total = a.slot_table_bytes + a.sequence_capacity + a.segment_bytes +
+                       a.mass_column_capacity + a.census_capacity + a.origin_cache_capacity +
+                       a.merge_working_capacity + a.window_scratch_capacity +
+                       a.origin_scratch_capacity + a.emission_cache_table + a.emission_cache_arena +
+                       a.prepared_capacity + a.last_scoring_result_bytes;
+    return a;
 }
 
 void set_origin_cache_self_check(bool enabled) {
@@ -4435,14 +4603,8 @@ std::size_t PreparedScoringContext::add_repaired_haplotype(
         if (already_held) {
             slot = held_slot;
         } else {
-            slot = state.sequences.size();
-            state.by_hash.emplace(repaired_hash, slot);
-            state.hash_by_slot.push_back(repaired_hash);
-            state.sequences.emplace_back();
-            state.reversed.emplace_back();
+            slot = state.allocate_repair_slot(repaired_hash);
             state.segments.emplace(slot, repaired);
-            state.mass_column.resize(slot + 1, std::vector<double>(fragment_count, kNegInf));
-            state.exposure.resize(slot + 1, 0.0);
             state.exposure[slot] = exposure_for_length(new_length, fragment_count,
                                                        state.prepared.fragments_by_floor,
                                                        state.library_insert);
@@ -4756,15 +4918,8 @@ std::size_t PreparedScoringContext::add_repaired_haplotype(
     if (already_held) {
         slot = held_slot;   // refilling an existing column, and its census
     } else {
-        slot = state.sequences.size();
-        state.by_hash.emplace(repaired_hash, slot);
-        state.hash_by_slot.push_back(repaired_hash);
-        // Empty placeholders keep every slot-indexed container aligned; the bytes live in `segments`.
-        state.sequences.emplace_back();
-        state.reversed.emplace_back();
+        slot = state.allocate_repair_slot(repaired_hash);
         state.segments.emplace(slot, repaired);
-        state.mass_column.resize(slot + 1, std::vector<double>(state.fragments.size(), kNegInf));
-        state.exposure.resize(slot + 1, 0.0);
         state.exposure[slot] = exposure_for_length(new_length, state.fragments.size(),
                                                    state.prepared.fragments_by_floor,
                                                    state.library_insert);
@@ -4901,6 +5056,7 @@ void PreparedScoringContext::release_transient(const std::vector<std::size_t>& k
         std::string().swap(state.reversed[slot]);
         std::vector<double>().swap(state.mass_column[slot]);
         state.censuses.erase(slot);
+        state.free_slots.push_back(slot);
     }
 }
 

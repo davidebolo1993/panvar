@@ -6,6 +6,10 @@
 // fingerprint; truth paths are then projected from the full graph onto that model's block frame.
 
 #include <sys/resource.h>
+#if defined(__APPLE__)
+#include <mach/mach.h>
+#include <malloc/malloc.h>
+#endif
 #include "edlib.h"
 #include "panvar/bubbles.hpp"
 #include "panvar/fragment_likelihood.hpp"
@@ -305,6 +309,36 @@ std::vector<std::map<std::string, std::string>> read_table(const std::string& pa
         rows.push_back(std::move(row));
     }
     return rows;
+}
+
+// CURRENT resident size. ru_maxrss is a high-water mark that can only rise, so it cannot tell a
+// plateau from a leak; this can.
+std::uint64_t current_rss_bytes() {
+#if defined(__APPLE__)
+    mach_task_basic_info_data_t info{};
+    mach_msg_type_number_t count = MACH_TASK_BASIC_INFO_COUNT;
+    if (task_info(mach_task_self(), MACH_TASK_BASIC_INFO, reinterpret_cast<task_info_t>(&info),
+                  &count) != KERN_SUCCESS) {
+        return 0;
+    }
+    return info.resident_size;
+#else
+    std::ifstream statm("/proc/self/statm");
+    std::uint64_t size = 0;
+    std::uint64_t resident = 0;
+    statm >> size >> resident;
+    return resident * static_cast<std::uint64_t>(sysconf(_SC_PAGESIZE));
+#endif
+}
+
+// DIAGNOSTIC ONLY: asks the allocator to return free pages and reports what it released. Changes no
+// data; used once, at the end of a hold diagnostic, to measure freed-but-retained memory.
+std::uint64_t release_free_pages() {
+#if defined(__APPLE__)
+    return static_cast<std::uint64_t>(malloc_zone_pressure_relief(nullptr, 0));
+#else
+    return 0;
+#endif
 }
 
 double peak_rss_gib() {
@@ -3347,6 +3381,10 @@ int repair_search(const Args& args) {
         static_cast<std::size_t>(std::stoull(args.get("origin-cache-bytes", "0")));
     const std::uint64_t origin_cache_records = std::stoull(args.get("origin-cache-records", "0"));
     if (args.get("origin-self-check", "0") != "0") panvar::set_origin_cache_self_check(true);
+    // Memory diagnostic: after the search stops without moving, re-score that same neighbourhood N more
+    // times, scoring and releasing without promoting. Hold cycles never enter the rounds table.
+    const std::size_t hold_cycles = std::stoul(args.get("hold-cycles", "0"));
+    const bool pressure_relief = args.get("pressure-relief", "0") != "0";
     const double switch_probability = std::stod(args.get("switch-probability", "0.01"));
     const std::uint64_t declared_cap = std::stoull(args.get("max-neighbors", "0"));
     // Resumption. --start declares where to continue from and --start-score what it must score; the
@@ -3596,6 +3634,48 @@ int repair_search(const Args& args) {
             context->set_origin_cache_limits(origin_cache_bytes, origin_cache_records);
         }
     }
+    // Per-round memory accounts at four fixed points, beside current and peak RSS.
+    std::ofstream memory_log;
+    if (context) {
+        memory_log.open(out + ".memory.tsv");
+        memory_log << "kind\tindex\tpoint\trss_current\trss_peak\trelief_freed\trss_after_relief\t"
+                      "slots_total\tslots_live\tslots_released\tslot_table\tsequence_bytes\t"
+                      "sequence_capacity\tsegment_bytes\tmass_bytes\tmass_capacity\tcensus_count\t"
+                      "census_bytes\tcensus_capacity\torigin_cache_entries\torigin_cache_payload\t"
+                      "origin_cache_capacity\tmerge_bytes\tmerge_capacity\twindow_scratch\t"
+                      "origin_scratch\temission_table\temission_arena\tprepared\tscoring_result\t"
+                      "logical_total\tcapacity_total\trss_minus_capacity\n";
+    }
+    const auto snapshot = [&](const char* kind, std::size_t index, const char* point,
+                              bool result_alive, bool relieve) {
+        if (!memory_log.is_open()) return;
+        const panvar::ContextMemoryAccount a = context->memory_account();
+        const std::uint64_t rss = current_rss_bytes();
+        const std::uint64_t peak = static_cast<std::uint64_t>(peak_rss_gib() * 1073741824.0);
+        std::uint64_t freed = 0;
+        std::uint64_t after = rss;
+        if (relieve) {
+            freed = release_free_pages();
+            after = current_rss_bytes();
+        }
+        // The flattened result belongs to the caller: count it only while the caller still holds it.
+        const std::uint64_t result = result_alive ? a.last_scoring_result_bytes : 0;
+        const std::uint64_t logical = a.logical_total - a.last_scoring_result_bytes + result;
+        const std::uint64_t capacity = a.capacity_total - a.last_scoring_result_bytes + result;
+        memory_log << kind << '\t' << index << '\t' << point << '\t' << rss << '\t' << peak << '\t'
+                   << freed << '\t' << after << '\t' << a.slots_total << '\t' << a.slots_live << '\t'
+                   << a.slots_released << '\t' << a.slot_table_bytes << '\t' << a.sequence_bytes << '\t'
+                   << a.sequence_capacity << '\t' << a.segment_bytes << '\t' << a.mass_column_bytes << '\t'
+                   << a.mass_column_capacity << '\t' << a.census_count << '\t' << a.census_bytes << '\t'
+                   << a.census_capacity << '\t' << a.origin_cache_entries << '\t'
+                   << a.origin_cache_payload << '\t' << a.origin_cache_capacity << '\t'
+                   << a.merge_working_bytes << '\t' << a.merge_working_capacity << '\t'
+                   << a.window_scratch_capacity << '\t' << a.origin_scratch_capacity << '\t'
+                   << a.emission_cache_table << '\t' << a.emission_cache_arena << '\t'
+                   << a.prepared_capacity << '\t' << result << '\t' << logical << '\t' << capacity
+                   << '\t' << (static_cast<std::int64_t>(rss) - static_cast<std::int64_t>(capacity))
+                   << '\n';
+    };
 
     std::vector<std::size_t> cur_first = start_first;
     std::vector<std::size_t> cur_second = start_second;
@@ -3611,6 +3691,9 @@ int repair_search(const Args& args) {
     std::uint64_t cumulative_pairs = 0;
 
     const std::size_t last_round = first_round + max_rounds - 1;
+    std::size_t hold_remaining = hold_cycles;
+    std::size_t hold_index = 0;
+    bool holding = false;
     for (std::size_t round = first_round; round <= last_round; ++round) {
         Round rec;
         rec.index = round;
@@ -3635,6 +3718,8 @@ int repair_search(const Args& args) {
             have_inc_slots = true;
         }
         if (use_delta) rec.transient_before = context->transient_payload_bytes();
+        snapshot(holding ? "hold" : "round", holding ? hold_index : round, "before_candidates", false,
+                 false);
         const double lookup_before = panvar::emission_cache_lookup_seconds();
 
         // ---- neighbourhood construction. NO TRUTH IN SCOPE.
@@ -3780,16 +3865,16 @@ int repair_search(const Args& args) {
         if (use_delta) {
             provenance.resize(paths.size());
             slot_of_local.resize(paths.size());
-            const std::size_t held_before = context->unique_haplotypes();
+            const std::size_t held_before = context->haplotypes_created();
             for (std::size_t i = 0; i < paths.size(); ++i) {
                 slot_of_local[i] = resolve_by_delta(i, false);
             }
             for (std::size_t i = 0; i < sequences.size(); ++i) {
                 sequence_of_slot.emplace(slot_of_local[i], &sequences[i]);
             }
-            rec.haps_new = context->unique_haplotypes() - held_before;
+            rec.haps_new = context->haplotypes_created() - held_before;
             rec.haps_reused = paths.size() - rec.haps_new;
-            rec.unique_haplotypes = context->unique_haplotypes();
+            rec.unique_haplotypes = context->haplotypes_created();
         } else if (context) {
             slot_of_local = context->add_haplotypes(sequences, &batch);
             for (std::size_t i = 0; i < sequences.size(); ++i) {
@@ -3828,6 +3913,7 @@ int repair_search(const Args& args) {
         // The deltas ran while slots were being resolved, which is before `mark`. Leaving them out
         // reported 0.39 s for a run that took 297 s.
         if (use_delta) rec.seconds += round_delta.seconds;
+        snapshot(holding ? "hold" : "round", holding ? hold_index : round, "after_scoring", true, false);
         rec.rss = peak_rss_gib();
         {
             const panvar::FragmentScoringCounters& work = context ? batch.counters : scored.counters;
@@ -3887,8 +3973,10 @@ int repair_search(const Args& args) {
                                      : scored.seconds_placement_and_mass);
             rec.combination_seconds = scored.seconds_diploid_combination;
         }
-        cumulative_seconds += rec.seconds;
-        cumulative_pairs += scored_pairs.size();
+        if (!holding) {
+            cumulative_seconds += rec.seconds;
+            cumulative_pairs += scored_pairs.size();
+        }
 
         std::vector<double> prior_of_pair(scored_pairs.size(), 0.0);
         for (std::size_t slot = 0; slot < scored_pairs.size(); ++slot) {
@@ -4031,8 +4119,12 @@ int repair_search(const Args& args) {
             } else {
                 keep = {inc_slot_a, inc_slot_b};
             }
+            snapshot(holding ? "hold" : "round", holding ? hold_index : round, "after_promotion", true,
+                     false);
             context->release_transient(keep);
             rec.transient_after = context->transient_payload_bytes();
+            snapshot(holding ? "hold" : "round", holding ? hold_index : round, "after_release", true,
+                     pressure_relief && holding && hold_remaining == 0);
             // Re-read AFTER the promotion above. rec.full_bytes was assigned back in the scoring
             // block, before any winner existed, so the one materialisation a round performs could
             // never appear in it -- the figure was structurally stuck at zero.
@@ -4042,8 +4134,18 @@ int repair_search(const Args& args) {
             rec.seconds_merge = round_delta.seconds_statekey_merge;
             rec.seconds_hashing = round_delta.seconds_hashing_and_windows;
         }
-        rounds.push_back(rec);
-        if (!rec.moved) break;
+        if (!holding) rounds.push_back(rec);
+        if (!rec.moved) {
+            if (hold_remaining > 0) {
+                // Not a round: the counter does not advance, and nothing is recorded as one.
+                holding = true;
+                --hold_remaining;
+                ++hold_index;
+                --round;
+                continue;
+            }
+            break;
+        }
         visited.insert(key_of(rec.first, rec.second));
         cur_first = rec.first;
         cur_second = rec.second;

@@ -1060,6 +1060,39 @@ void segmented_window(const std::string& base, std::size_t block_begin, std::siz
                       const std::string& replacement, std::size_t begin, std::size_t end,
                       std::string& forward_out, std::string& reversed_out);
 
+// What a context holds at one instant, measured from its containers rather than inferred from RSS.
+// LOGICAL is what is in use; CAPACITY is what the containers keep reserved. Node-based containers
+// (maps, hashed maps) do not expose their internals, so those are charged a declared per-node
+// allowance and say so. The purpose is to compare the sum with RSS and see what RSS holds that the
+// context cannot account for -- not to assign that remainder to anything without evidence.
+struct ContextMemoryAccount {
+    std::uint64_t slots_total = 0;
+    std::uint64_t slots_live = 0;
+    std::uint64_t slots_released = 0;
+    std::uint64_t slot_table_bytes = 0;          // per-slot bookkeeping, released slots included
+    std::uint64_t sequence_bytes = 0;            // forward + reverse haplotype bytes in use
+    std::uint64_t sequence_capacity = 0;
+    std::uint64_t segment_bytes = 0;             // segmented repairs: node + replacement
+    std::uint64_t mass_column_bytes = 0;
+    std::uint64_t mass_column_capacity = 0;
+    std::uint64_t census_count = 0;
+    std::uint64_t census_bytes = 0;
+    std::uint64_t census_capacity = 0;
+    std::uint64_t origin_cache_entries = 0;
+    std::uint64_t origin_cache_payload = 0;      // the declared, budgeted figure
+    std::uint64_t origin_cache_capacity = 0;
+    std::uint64_t merge_working_bytes = 0;       // group preaggregates + full aggregates
+    std::uint64_t merge_working_capacity = 0;
+    std::uint64_t window_scratch_capacity = 0;   // persistent placement rows and flat origin output
+    std::uint64_t origin_scratch_capacity = 0;   // miss/check records, candidate states, merge buffer
+    std::uint64_t emission_cache_table = 0;
+    std::uint64_t emission_cache_arena = 0;      // components + content slabs
+    std::uint64_t prepared_capacity = 0;         // read forms, piece indexes, fragments: constant
+    std::uint64_t last_scoring_result_bytes = 0; // flattened matrix of the latest score_candidates
+    std::uint64_t logical_total = 0;
+    std::uint64_t capacity_total = 0;
+};
+
 class PreparedScoringContext {
 public:
     // Fragments, library and options are fixed for the context's life: they define the model, and a
@@ -1082,6 +1115,10 @@ public:
     FragmentScoringResult score_candidates(const std::vector<HaplotypeCandidate>& candidates) const;
 
     std::size_t unique_haplotypes() const;
+    // Haplotypes that have ever occupied a slot. Released repair slots are reused, so this is not the
+    // same as unique_haplotypes(): that is how many slots exist, this is how many haplotypes have held
+    // one. Reuse is what keeps the slot count -- and everything sized by it -- bounded across rounds.
+    std::size_t haplotypes_created() const;
     double mass_of(std::size_t fragment, std::size_t haplotype) const;
     double exposure_of(std::size_t haplotype) const;
     const FragmentScoringCounters& cumulative_counters() const;
@@ -1133,14 +1170,16 @@ public:
     // built full aggregates. Reported apart from the cache budget, because it is per-round working
     // state released with the incumbent, not retained across rounds.
     std::uint64_t merge_working_bytes() const;
+    ContextMemoryAccount memory_account() const;
 
     // Retains an origin census for this haplotype, so a later round may delta from it.
     void retain_census(std::size_t haplotype);
     bool holds_census(std::size_t haplotype) const;
 
     // Releases every haplotype added since the last checkpoint that is not named in `keep`: its
-    // sequence, its reversed copy, its mass column and its census. Safe only because the cache was
-    // frozen before any of them existed, so no key points into what is being freed.
+    // sequence, its reversed copy, its mass column and its census. Safe because every cache entry
+    // owns the bytes it compares (the emission cache in its arena, the origin cache in its entries),
+    // so nothing retained points into what is being freed.
     void release_transient(const std::vector<std::size_t>& keep);
     // Bytes currently held by transient sequences, mass columns and censuses, so a caller can check
     // that storage returns to its previous level after every round instead of trusting that it does.

@@ -1350,6 +1350,60 @@ void test_origin_threads_identical() {
     std::cout << "  ok: 1/2/4/8 threads bit-identical on the origin path\n";
 }
 
+void test_released_slots_are_reused() {
+    // The memory cause measured on NA20509: released slots were never reused, so every round appended
+    // a neighbourhood of slots, and score_candidates -- one column per slot -- grew by 26 MiB a round.
+    // Ten release cycles must now hold the slot count and the scoring result constant, on both paths,
+    // while every mass cell stays identical to the first cycle's.
+    const Locus l = locus(2718, {400});
+    std::mt19937_64 rng(27);
+    std::vector<std::string> replacements;
+    for (int i = 0; i < 8; ++i) replacements.push_back(random_bases(rng, 40));
+    for (const bool origin : {false, true}) {
+        panvar::PreparedScoringContext context(l.fragments, library(), options());
+        context.add_haplotypes({l.base});
+        context.begin_transient_round();
+        context.retain_census(0);
+        if (origin) {
+            context.enable_origin_cache_path(true);
+            context.set_origin_cache_limits(std::size_t{1} << 30, 0);
+        }
+        std::vector<double> first;
+        std::size_t slots = 0;
+        std::uint64_t result_bytes = 0;
+        for (int cycle = 0; cycle < 10; ++cycle) {
+            std::vector<double> cells;
+            std::size_t probe_slot = 0;
+            for (const std::string& replacement : replacements) {
+                probe_slot = context.add_repaired_haplotype(0, 400, 440, replacement);
+                for (std::size_t f = 0; f < l.fragments.size(); ++f) cells.push_back(context.mass_of(f, probe_slot));
+            }
+            (void)context.score_candidates({{0, probe_slot}});
+            const std::uint64_t result = context.memory_account().last_scoring_result_bytes;
+            if (cycle == 0) {
+                first = cells;
+                slots = context.unique_haplotypes();
+                result_bytes = result;
+            } else {
+                for (std::size_t i = 0; i < first.size(); ++i) {
+                    require_identical(cells[i], first[i],
+                                      "cycle " + std::to_string(cycle) + " cell " + std::to_string(i));
+                }
+                require(context.unique_haplotypes() == slots,
+                        "released slots must be reused, not appended: " +
+                            std::to_string(context.unique_haplotypes()) + " after " + std::to_string(slots));
+                require(result == result_bytes, "the scoring result must not grow across cycles");
+            }
+            context.release_transient({});
+        }
+        require(context.haplotypes_created() == 1 + replacements.size() * 10,
+                "haplotypes_created must stay cumulative");
+        std::cout << "  ok: " << (origin ? "origin path" : "stage-5 path") << ": 10 cycles, " << slots
+                  << " slots held throughout, scoring result constant at " << result_bytes
+                  << " bytes, masses identical\n";
+    }
+}
+
 void test_cumulative_caps_through_the_delta() {
     const Locus l = locus(99, {400});
     std::mt19937_64 rng(11);
@@ -1429,6 +1483,8 @@ int main() {
         test_transient_release();
         std::cout << "== scoring after a release ==\n";
         test_scoring_after_release();
+        std::cout << "== released slots are reused ==\n";
+        test_released_slots_are_reused();
         std::cout << "== stage 6: origin path versus stage 5 (self-checked) ==\n";
         test_origin_path_matches_stage5();
         std::cout << "== stage 6: disabled, full and undersized origin caches ==\n";

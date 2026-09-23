@@ -11,7 +11,7 @@ wall_seconds	39.50	against 282.09 at stage 5: 7.14x faster
 scoring_seconds	31.11	
 peak_rss_gib	1.4104	1514373120 bytes, against 0.6649 at stage 5
 acceptance_90s	MET	39.50 s
-acceptance_1_5gib	MET	1.4104 GiB, 96.3 MiB of headroom
+acceptance_1_5gib	MET	1.4104 GiB, 91.8 MiB of headroom (1610612736 - 1514373120 bytes)
 acceptance_trajectory	MET	identical seven rounds
 origin_cache_budget	768 MiB	declared; nothing declined
 origin_cache_entries	252 -> 269	
@@ -31,7 +31,7 @@ seconds_reduce_per_round	0.52-0.54
 merge_working_bytes	3.8 MB	group preaggregates + full aggregates
 cumulative_state_classes	158014480	EXECUTED reductions only; copied fragments form none
 residual_time	round 1 enumeration, 24.3 of 39.5 s	a cross-round cache cannot help the first round
-residual_memory	peak RSS rises every round, 0.777 -> 1.364 GiB	cache flat at ~375 MB, working 3.8 MB: NOT attributed
+residual_memory	peak RSS rises every round, 0.777 -> 1.364 GiB	attributed later: released slots never reused, see tests/genotype_memory_na20509.tsv
 pruning_is_safe_because	stage 5 widens the window to an end exactly when a margin condition could fire	interior windows: affected == intersects the replacement
 correctness_rests_on	retained is a superset of affected	the exact absolute filter still runs on every use
 untouched_fragments	copied, not recomputed	same StateKey multiset, so the same reduction bit for bit

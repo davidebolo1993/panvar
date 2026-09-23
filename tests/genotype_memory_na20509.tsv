@@ -1,0 +1,40 @@
+item	value	provenance
+question	why peak RSS rose 0.777 -> 1.364 GiB over seven rounds at b160849 while the origin cache stayed flat	Sol, after stage 6
+donor_cell	NA20509 10x K=128	frozen cov10 reads, frozen call.10.K128 run, same command as stage 6
+instrument	per-round memory account at before_candidates, after_scoring, after_promotion, after_release	PreparedScoringContext::memory_account(); probe writes <out>.memory.tsv
+instrument_rss	current RSS from mach task_info resident_size; peak from ru_maxrss	current RSS is not a peak, so a plateau is visible
+instrument_hold	--hold-cycles N: rescore and release the already-cached round-7 neighbourhood N times without promoting	no new search; the converged round-6 incumbent is resumed
+hold_command	repair-search --start <round-6 winner> --start-score -151090.979646 --first-round 7 --rounds 1 --visited <seed + six winners> --hold-cycles 25 --pressure-relief 1	plus the stage-6 inputs, caps and 768 MiB origin cache
+cause	released repair slots were never reused	slot = sequences.size() on every repair; release_transient emptied a slot but kept its index
+mechanism	score_candidates flattens log_mass as fragments x every slot ever created	released slots included, so the matrix grows with the cumulative slot count
+hold_before_slots	302 -> 7802 over 25 cycles	+300 per cycle, 7800 released
+hold_before_scoring_result	26.2 -> 677.3 MiB	+26.05 MiB per cycle = 300 slots x 11377 fragments x 8 bytes
+hold_before_other_accounts	flat	census 40.9, origin cache 373, emission cache 134, sequences 0.9, mass capacity 0.2 MiB after release
+hold_before_rss_after_release	819 -> 2411 MiB, then 1765-2411	no plateau; peak 2618130432 bytes; wall 54.87 s
+hold_before_pressure_relief	0 bytes freed	malloc_zone_pressure_relief, diagnostic only; no allocator change made
+fix	reuse released slots	free list filled by release_transient, drawn by both add_repaired_haplotype paths; reused column reset to -inf
+fix_identity	nothing retained is keyed by a released slot	origin cache is content-keyed; groups, full aggregates and censuses of a released slot are dropped on release; incumbents are kept, never released
+fix_reporting	haplotypes_created() added	unique_haplotypes() is now slots held; probe round columns use haplotypes_created so they stay cumulative
+fix_reporting_summary	summary context_unique_haplotypes now reports slots held	306 after the fix, 2109 cumulative (same as the rounds column)
+hold_after_slots	302 at every cycle	300 released and reused each cycle
+hold_after_scoring_result	26.2 MiB at every cycle	
+hold_after_logical_and_capacity	588 / 638 MiB at every cycle	bounded live storage
+hold_after_rss_after_release	986 -> 988 MiB over 25 cycles	plateau; peak 1036648448 bytes; wall 53.15 s
+hold_after_unattributed	rss minus accounted capacity 349-350 MiB, constant	not assigned to any component
+gate_10x_trajectory	identical to stage 6 in all seven rounds	block, rank, assignment, alleles, total, and every non-timing column
+gate_10x_final	-151090.979646, distance 114, floor 91, excess 23	identical
+gate_10x_origins	reused 1236837536, recomputed 186058529	identical
+gate_10x_wall	39.88 s	39.50 s at b160849
+gate_10x_peak_rss	1175568384 bytes = 1.0948 GiB	1514373120 bytes = 1.4104 GiB at b160849
+gate_10x_rss_after_release_by_round	1037, 1061, 1072, 1077, 1077, 1081, 1081 MiB	flat from round 4
+gate_10x_acceptance	MET	<=90 s, <=1.5 GiB (474 MiB of headroom), trajectory identical
+gates	all block-delta gates incl. new released-slot reuse gate, scoring-context, scorer, oracle	reuse gate: 10 cycles, slot count and scoring result constant, masses identical, both paths
+pilot_30x_inputs	frozen cov30 reads (sha256 checked against settings.tsv), frozen call.30.K128 run	not resimulated
+pilot_30x_caps	rounds 11, max-neighbors 670, stage-6 scorer caps, origin cache 768 MiB	declared; no default changed
+pilot_30x_watchdog	kill at 360 s wall or 1.9 GiB current RSS (95% of 2 GiB)	declared before the run
+pilot_30x_stop	WALL: killed at 360.09 s	no cap refused before the kill
+pilot_30x_peak_rss	1877999616 bytes = 1.749 GiB	under both limits
+pilot_30x_trajectory	NOT RECORDED	the probe writes rounds.tsv and summary.tsv only at exit; at least four rounds were entered
+pilot_30x_origin_cache	214 entries, 767 MiB: budget full in round 1	about 3.6 MiB per window against 1.4 at 10x; uncached windows are re-enumerated every round
+pilot_30x_accounts_through_round4	slots 326 held; scoring result 84.4 MiB; census 185 -> 246 MiB after release, 307 at promotion; logical 1.36-1.63 GiB	memory.tsv flushed through round 4 after_scoring
+pilot_30x_rss_undercounts	current RSS fell to 0.54-0.67 GiB while accounted live bytes were ~1.4-1.6 GiB	macOS compressor/paging: resident_size is not a footprint under pressure
