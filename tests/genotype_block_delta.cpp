@@ -1452,6 +1452,187 @@ void test_released_seed_is_respelled_identically() {
     }
 }
 
+// ---- planned selective retention -----------------------------------------------------------------
+struct PlannedResult {
+    std::vector<double> cells;                              // canonical: by repair, then by round
+    std::vector<std::vector<std::uint64_t>> cache_after;    // live key hashes after each round
+    std::vector<panvar::OriginCachePlanReport> plans;
+    std::uint64_t hits = 0, misses = 0, not_selected = 0, max_bytes = 0, last_round_misses = 0;
+};
+
+// Round A scores every repair against the seed (no size known yet, so nothing can be selected); the
+// promoted winner is kept; rounds B-D score the rest against it. B learns nothing new about sizes but
+// admits what its plan selected; C and D should then hit. `order_seed` permutes the request order.
+PlannedResult planned_search(const MultiBlock& m, std::size_t budget, bool origin, std::size_t threads,
+                             unsigned order_seed) {
+    panvar::FragmentScoringOptions opts = options();
+    opts.threads = threads;
+    panvar::PreparedScoringContext context(m.locus.fragments, library(), opts);
+    context.add_haplotypes({m.locus.base});
+    context.begin_transient_round();
+    context.retain_census(0);
+    if (origin) {
+        context.enable_origin_cache_path(true);
+        context.set_origin_cache_limits(budget, 0);
+    }
+    std::vector<std::size_t> order(m.repairs.size());
+    std::iota(order.begin(), order.end(), std::size_t{0});
+    if (order_seed != 0) {
+        std::mt19937_64 rng(order_seed);
+        std::shuffle(order.begin(), order.end(), rng);
+    }
+    PlannedResult out;
+    const auto round = [&](std::size_t incumbent, bool skip_promoted) {
+        if (origin) {
+            std::vector<panvar::PlannedRepairWindow> planned;
+            for (const std::size_t i : order) {
+                if (skip_promoted && i == m.promote) continue;
+                const Repair& r = m.repairs[i];
+                planned.push_back(context.plan_repaired_window(incumbent, r.begin, r.end, r.allele));
+            }
+            out.plans.push_back(context.plan_origin_cache(planned));
+            require(out.plans.back().selected_bytes <= budget, "a plan selected more than its budget");
+        }
+        std::vector<std::vector<double>> by_repair(m.repairs.size());
+        std::uint64_t misses = 0;
+        for (const std::size_t i : order) {
+            if (skip_promoted && i == m.promote) continue;
+            const Repair& r = m.repairs[i];
+            panvar::BlockDeltaWork w;
+            const std::size_t slot = context.add_repaired_haplotype(incumbent, r.begin, r.end, r.allele, &w);
+            for (std::size_t f = 0; f < m.locus.fragments.size(); ++f) by_repair[i].push_back(context.mass_of(f, slot));
+            by_repair[i].push_back(context.exposure_of(slot));
+            out.hits += w.origin_cache_hits;
+            misses += w.origin_cache_misses;
+            out.not_selected += w.origin_cache_not_selected;
+            if (origin) {
+                out.max_bytes = std::max<std::uint64_t>(out.max_bytes, context.origin_cache_bytes());
+                require(context.origin_cache_bytes() <= budget, "the cache exceeded its declared budget");
+            }
+        }
+        out.misses += misses;
+        out.last_round_misses = misses;
+        for (const auto& cells : by_repair) out.cells.insert(out.cells.end(), cells.begin(), cells.end());
+        if (origin) out.cache_after.push_back(context.origin_cache_key_hashes());
+    };
+    round(0, false);
+    const Repair& chosen = m.repairs[m.promote];
+    const std::size_t winner = context.add_repaired_haplotype(0, chosen.begin, chosen.end, chosen.allele, nullptr, true);
+    context.release_transient({winner});
+    for (int r = 0; r < 3; ++r) {
+        round(winner, true);
+        context.release_transient({winner});
+    }
+    return out;
+}
+
+void require_same_cells(const PlannedResult& got, const PlannedResult& want, const std::string& label) {
+    require(got.cells.size() == want.cells.size(), label + ": cell counts differ");
+    for (std::size_t i = 0; i < want.cells.size(); ++i) {
+        require_identical(got.cells[i], want.cells[i], label + ": cell " + std::to_string(i));
+    }
+}
+
+void test_planned_cache_scores_identically() {
+    const MultiBlock m = multi_block(2027);
+    const PlannedResult stage5 = planned_search(m, 0, false, 1, 0);
+    const PlannedResult full = planned_search(m, std::size_t{1} << 30, true, 1, 0);
+    require_same_cells(full, stage5, "planned, full budget vs stage 5");
+    require(full.plans[0].known_windows == 0 && full.plans[0].selected_entries == 0,
+            "round A knows no exact size, so its plan must select nothing");
+    require(full.plans[1].selected_entries > 0, "round B must select the windows round A measured");
+    require(full.last_round_misses == 0,
+            "with room for everything, the last round must be all hits: a planned identity that differed "
+            "from the requested one would miss here");
+    const std::size_t small = static_cast<std::size_t>(full.plans[1].selected_bytes / 2);
+    const PlannedResult some = planned_search(m, small, true, 1, 0);
+    require_same_cells(some, stage5, "planned, half budget vs stage 5");
+    require(some.max_bytes <= small, "the undersized cache exceeded its budget");
+    require(some.hits < full.hits && some.hits > 0, "half the budget must hit less, but still hit");
+    const PlannedResult none = planned_search(m, 0, true, 1, 0);
+    require_same_cells(none, stage5, "planned, disabled vs stage 5");
+    require(none.hits == 0, "a disabled cache must not hit");
+    std::cout << "  ok: disabled, half (" << small << " bytes, " << some.hits << " hits) and full ("
+              << full.hits << " hits, last round " << full.last_round_misses
+              << " misses) are bit-identical to stage 5\n";
+}
+
+void test_planned_cache_order_independent() {
+    const MultiBlock m = multi_block(2028);
+    const PlannedResult base = planned_search(m, std::size_t{1} << 30, true, 1, 0);
+    for (const std::size_t budget : {std::size_t{1} << 30, static_cast<std::size_t>(base.plans[1].selected_bytes / 3)}) {
+        const PlannedResult reference = planned_search(m, budget, true, 1, 0);
+        for (const unsigned seed : {7u, 11u, 29u}) {
+            const PlannedResult shuffled = planned_search(m, budget, true, 1, seed);
+            const std::string label = "budget " + std::to_string(budget) + ", order " + std::to_string(seed);
+            require_same_cells(shuffled, reference, label);
+            require(shuffled.cache_after == reference.cache_after, label + ": cache contents depend on request order");
+            require(shuffled.hits == reference.hits && shuffled.misses == reference.misses &&
+                        shuffled.not_selected == reference.not_selected,
+                    label + ": hit/miss accounting depends on request order");
+            for (std::size_t r = 0; r < reference.plans.size(); ++r) {
+                const auto& a = shuffled.plans[r];
+                const auto& b = reference.plans[r];
+                require(a.selected_entries == b.selected_entries && a.selected_bytes == b.selected_bytes &&
+                            a.evicted_entries == b.evicted_entries && a.known_windows == b.known_windows,
+                        label + ": the plan depends on request order");
+            }
+        }
+    }
+    for (const std::size_t threads : {2u, 4u, 8u}) {
+        const PlannedResult t = planned_search(m, static_cast<std::size_t>(base.plans[1].selected_bytes / 3), true, threads, 0);
+        const PlannedResult one = planned_search(m, static_cast<std::size_t>(base.plans[1].selected_bytes / 3), true, 1, 0);
+        require_same_cells(t, one, std::to_string(threads) + " threads");
+        require(t.cache_after == one.cache_after, std::to_string(threads) + " threads: cache contents differ");
+    }
+    std::cout << "  ok: three request orders x two budgets give identical cells, plans, cache contents and "
+                 "accounting; 1/2/4/8 threads identical\n";
+}
+
+void test_planned_eviction_releases_storage() {
+    // Alternate the planned set between two disjoint halves of the repairs. Every switch must evict the
+    // other half, release its storage and reuse its slots: slots and retained capacity may not grow.
+    const MultiBlock m = multi_block(2029);
+    panvar::PreparedScoringContext context(m.locus.fragments, library(), options());
+    context.add_haplotypes({m.locus.base});
+    context.begin_transient_round();
+    context.retain_census(0);
+    context.enable_origin_cache_path(true);
+    context.set_origin_cache_limits(std::size_t{1} << 30, 0);
+    const auto request = [&](int parity, bool plan) {
+        if (plan) {
+            std::vector<panvar::PlannedRepairWindow> planned;
+            for (std::size_t i = 0; i < m.repairs.size(); ++i) {
+                if (parity >= 0 && static_cast<int>(i % 2) != parity) continue;
+                const Repair& r = m.repairs[i];
+                planned.push_back(context.plan_repaired_window(0, r.begin, r.end, r.allele));
+            }
+            (void)context.plan_origin_cache(planned);
+        }
+        for (std::size_t i = 0; i < m.repairs.size(); ++i) {
+            if (parity >= 0 && static_cast<int>(i % 2) != parity) continue;
+            const Repair& r = m.repairs[i];
+            (void)context.add_repaired_haplotype(0, r.begin, r.end, r.allele);
+        }
+        context.release_transient({});
+    };
+    request(-1, false);   // every size becomes known
+    std::uint64_t slots_after_warm = 0;
+    std::uint64_t capacity[2] = {0, 0};
+    for (int cycle = 0; cycle < 10; ++cycle) {
+        request(cycle % 2, true);
+        const std::uint64_t cap = context.memory_account().origin_cache_capacity;
+        if (cycle == 1) slots_after_warm = context.origin_cache_slots();
+        if (cycle >= 2) {
+            require(context.origin_cache_slots() == slots_after_warm, "evicted slots must be reused, not appended");
+            require(cap == capacity[cycle % 2], "retained capacity must return to the same level each cycle");
+        }
+        capacity[cycle % 2] = cap;
+    }
+    std::cout << "  ok: 10 alternating plans, " << slots_after_warm << " slots throughout, capacity "
+              << capacity[0] << " / " << capacity[1] << " bytes per half, no growth\n";
+}
+
 void test_cumulative_caps_through_the_delta() {
     const Locus l = locus(99, {400});
     std::mt19937_64 rng(11);
@@ -1535,6 +1716,12 @@ int main() {
         test_released_slots_are_reused();
         std::cout << "== a released seed census, respelled by delta, is bit-identical ==\n";
         test_released_seed_is_respelled_identically();
+        std::cout << "== planned retention: scoring identical at every budget ==\n";
+        test_planned_cache_scores_identically();
+        std::cout << "== planned retention: independent of request order and threads ==\n";
+        test_planned_cache_order_independent();
+        std::cout << "== planned retention: eviction releases and reuses storage ==\n";
+        test_planned_eviction_releases_storage();
         std::cout << "== stage 6: origin path versus stage 5 (self-checked) ==\n";
         test_origin_path_matches_stage5();
         std::cout << "== stage 6: disabled, full and undersized origin caches ==\n";

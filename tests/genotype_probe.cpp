@@ -3422,6 +3422,13 @@ int repair_search(const Args& args) {
     const std::size_t origin_cache_bytes =
         static_cast<std::size_t>(std::stoull(args.get("origin-cache-bytes", "0")));
     const std::uint64_t origin_cache_records = std::stoull(args.get("origin-cache-records", "0"));
+    // Retention policy, experimental: first_fit (stage 6, the default) keeps any miss that fits;
+    // planned selects each round's cache set from the round's planned windows by reuse per exact byte.
+    const std::string origin_cache_policy = args.get("origin-cache-policy", "first_fit");
+    if (origin_cache_policy != "first_fit" && origin_cache_policy != "planned") {
+        throw std::runtime_error("--origin-cache-policy is first_fit or planned");
+    }
+    const bool planned_cache = origin_cache_policy == "planned";
     if (args.get("origin-self-check", "0") != "0") panvar::set_origin_cache_self_check(true);
     // Memory diagnostic: after the search stops without moving, re-score that same neighbourhood N more
     // times, scoring and releasing without promoting. Hold cycles never enter the rounds table.
@@ -3667,6 +3674,8 @@ int repair_search(const Args& args) {
         summary << "start_hap1\t" << a << "\nstart_hap2\t" << b << '\n';
     }
     summary << "neighbor_cap\t" << cap << "\ndeclared_cap\t" << declared_cap << '\n';
+    summary << "origin_cache_policy\t" << origin_cache_policy << "\norigin_cache_budget_bytes\t"
+            << origin_cache_bytes << '\n';
     if (declared_cap != 0 && cap > declared_cap) {
         summary << "refused\ttrue\nrefusal\tone round's neighbourhood exceeds its declared bound\n";
         std::cout << "repair-search " << donor << ": REFUSED before allocation, " << cap
@@ -3785,6 +3794,9 @@ int repair_search(const Args& args) {
         std::uint64_t cum_latent_pairs = 0, mass_cells = 0, records_consumed = 0;
         std::uint64_t census_count = 0, census_bytes = 0, oc_bytes_end = 0;
         std::uint64_t phys_footprint = 0, phys_footprint_peak = 0, rss_current = 0;
+        // Planned retention: what the round's plan saw, selected and evicted.
+        std::uint64_t plan_distinct = 0, plan_known = 0, plan_selected = 0, plan_selected_bytes = 0;
+        std::uint64_t plan_retained = 0, plan_evicted = 0, plan_evicted_bytes = 0, oc_not_selected = 0;
     };
     std::vector<Round> rounds;
     const std::size_t last_round = first_round + max_rounds - 1;
@@ -3898,7 +3910,9 @@ int repair_search(const Args& args) {
                  "margin_physical_origins\tcum_state_classes\tmargin_state_classes\tcum_latent_pairs\t"
                  "margin_latent_pairs\tmass_cells\tmargin_mass_cells\tmargin_origin_cache_bytes\t"
                  "records_consumed\tmargin_records_consumed\tmargin_neighbours\tmargin_rounds\t"
-                 "census_count\tcensus_bytes\tphys_footprint\tphys_footprint_peak\trss_current\n";
+                 "census_count\tcensus_bytes\tphys_footprint\tphys_footprint_peak\trss_current\t"
+                 "plan_distinct_windows\tplan_known_windows\tplan_selected_entries\tplan_selected_bytes\t"
+                 "plan_retained_entries\tplan_evicted_entries\tplan_evicted_bytes\toc_not_selected\n";
         for (const Round& r : rounds) {
             table << r.index << '\t' << r.start_total << '\t' << (r.moved ? "true" : "false") << '\t'
                   << (r.moved ? model.blocks()[r.block].block_id : std::string("NA")) << '\t'
@@ -3946,7 +3960,10 @@ int repair_search(const Args& args) {
                   << '\t' << r.records_consumed << '\t' << margin(origin_cache_records, r.records_consumed)
                   << '\t' << margin(declared_cap, r.neighbours) << '\t' << (last_round - r.index) << '\t'
                   << r.census_count << '\t' << r.census_bytes << '\t' << r.phys_footprint << '\t'
-                  << r.phys_footprint_peak << '\t' << r.rss_current << '\n';
+                  << r.phys_footprint_peak << '\t' << r.rss_current << '\t' << r.plan_distinct << '\t'
+                  << r.plan_known << '\t' << r.plan_selected << '\t' << r.plan_selected_bytes << '\t'
+                  << r.plan_retained << '\t' << r.plan_evicted << '\t' << r.plan_evicted_bytes << '\t'
+                  << r.oc_not_selected << '\n';
         }
         return table.str();
     };
@@ -4019,26 +4036,32 @@ int repair_search(const Args& args) {
             return text.str();
         }
         std::uint64_t round_hits = 0, round_misses = 0, round_constructed = 0, round_declined = 0;
-        std::uint64_t round_admitted_bytes = 0;
+        std::uint64_t round_admitted_bytes = 0, round_evicted_bytes = 0;
         for (const Round& r : rounds) {
             round_hits += r.oc_hits_all;
             round_misses += r.oc_misses_all;
             round_constructed += r.origins_constructed_all;
             round_declined += r.oc_declined;
             round_admitted_bytes += r.oc_admitted_bytes;
+            round_evicted_bytes += r.plan_evicted_bytes;
         }
+        // Planned retention evicts, so what is cached is what was admitted less what was evicted; and
+        // a ledger row marked admitted may since have been evicted, so the ledger's admitted total
+        // bounds the cache only when nothing was.
+        const std::uint64_t cached = context->origin_cache_bytes();
         const std::uint64_t executed = context->cumulative_counters().physical_origins - seeding_origins;
         const bool ok = round_hits == hits && round_misses == misses && round_constructed == origins &&
                         executed == origins && round_declined == decline_events &&
-                        round_admitted_bytes == context->origin_cache_bytes() &&
-                        admitted_bytes == context->origin_cache_bytes() && hits + misses == requests;
+                        round_admitted_bytes - round_evicted_bytes == cached &&
+                        (round_evicted_bytes != 0 || admitted_bytes == cached) && hits + misses == requests;
         text << "reconcile_hits\t" << round_hits << " rounds / " << hits << " ledger\nreconcile_misses\t"
              << round_misses << " rounds / " << misses << " ledger\nreconcile_origins_constructed\t"
              << round_constructed << " rounds / " << origins << " ledger / " << executed
              << " cumulative-minus-seeding\nreconcile_declines\t" << round_declined << " rounds / "
              << decline_events << " ledger\nreconcile_admitted_bytes\t" << round_admitted_bytes
-             << " rounds / " << admitted_bytes << " ledger / " << context->origin_cache_bytes()
-             << " cache\nreconciled\t" << (ok ? "true" : "false") << '\n';
+             << " admitted - " << round_evicted_bytes << " evicted (rounds) / " << admitted_bytes
+             << " ledger-ever-admitted / " << cached << " cache\nreconciled\t" << (ok ? "true" : "false")
+             << '\n';
         return text.str();
     };
 
@@ -4324,6 +4347,7 @@ int repair_search(const Args& args) {
             round_delta.origin_cache_misses += work.origin_cache_misses;
             round_delta.origin_cache_stored += work.origin_cache_stored;
             round_delta.origin_cache_declined += work.origin_cache_declined;
+            round_delta.origin_cache_not_selected += work.origin_cache_not_selected;
             round_delta.origin_cache_admitted_bytes += work.origin_cache_admitted_bytes;
             round_delta.origin_cache_declined_bytes += work.origin_cache_declined_bytes;
             round_delta.seconds_reenumeration += work.seconds_reenumeration;
@@ -4342,6 +4366,28 @@ int repair_search(const Args& args) {
         if (use_delta) {
             provenance.resize(paths.size());
             slot_of_local.resize(paths.size());
+            if (planned_cache) {
+                // The plan: every window this round's repairs will request, built without enumerating,
+                // then the round's cache set chosen from them. Nothing here reads a score.
+                std::vector<panvar::PlannedRepairWindow> planned;
+                for (std::size_t i = 0; i < paths.size(); ++i) {
+                    const Provenance& note = provenance[i];
+                    if (note.is_incumbent) continue;
+                    const panvar::HaplotypeSequence& base = note.side == 0 ? incumbent_a : incumbent_b;
+                    const std::size_t from = note.side == 0 ? inc_slot_a : inc_slot_b;
+                    const panvar::SequenceInterval span = base.block_intervals[note.block];
+                    planned.push_back(context->plan_repaired_window(
+                        from, span.begin, span.end, model.blocks()[note.block].alleles[note.allele].sequence));
+                }
+                const panvar::OriginCachePlanReport plan = context->plan_origin_cache(planned);
+                rec.plan_distinct = plan.distinct_windows;
+                rec.plan_known = plan.known_windows;
+                rec.plan_selected = plan.selected_entries;
+                rec.plan_selected_bytes = plan.selected_bytes;
+                rec.plan_retained = plan.retained_entries;
+                rec.plan_evicted = plan.evicted_entries;
+                rec.plan_evicted_bytes = plan.evicted_bytes;
+            }
             const std::size_t held_before = context->haplotypes_created();
             for (std::size_t i = 0; i < paths.size(); ++i) {
                 slot_of_local[i] = resolve_by_delta(i, false);
@@ -4629,6 +4675,7 @@ int repair_search(const Args& args) {
             rec.oc_admitted_bytes = round_delta.origin_cache_admitted_bytes;
             rec.oc_declined = round_delta.origin_cache_declined;
             rec.oc_declined_bytes = round_delta.origin_cache_declined_bytes;
+            rec.oc_not_selected = round_delta.origin_cache_not_selected;
             rec.origins_constructed_all = round_delta.physical_origins_constructed;
             rec.seconds_enumeration_all = round_delta.seconds_enumeration;
             rec.seconds_reenumeration_all = round_delta.seconds_reenumeration;

@@ -2439,6 +2439,11 @@ struct OriginCache {
     std::deque<OriginCacheEntry> entries;   // stable addresses
     std::uint64_t bytes = 0;
     std::uint64_t not_retained = 0;
+    // Planned retention evicts. An evicted slot's storage is released at once and the slot is reused by
+    // the next admission, so slots never outnumber the most entries ever live together.
+    std::vector<char> live;
+    std::vector<std::uint64_t> demand_of;   // the demand-ledger row each slot holds
+    std::vector<std::size_t> free_slots;
 };
 
 std::atomic<bool>& origin_self_check() {
@@ -3594,6 +3599,38 @@ struct PreparedScoringContext::State {
         const auto found = segments.find(slot);
         return found != segments.end() ? found->second.length() : sequences[slot].size();
     }
+    // The window a repair requests. One function for the request AND the plan, so a planned identity
+    // can never differ from the one requested.
+    struct RepairWindowBounds {
+        std::size_t margin = 0;
+        std::size_t shortest = 0;
+        std::size_t begin = 0;
+        std::size_t end = 0;
+    };
+    RepairWindowBounds repair_window_bounds(std::size_t block_begin, std::size_t block_end,
+                                            std::size_t old_length, std::size_t new_length,
+                                            std::size_t new_end, std::ptrdiff_t shift) const {
+        // The margin beyond which the emission normaliser is saturated, so an unaffected origin keeps
+        // its key under a length change. Taken at the LONGEST read, which only ever widens the set.
+        std::size_t longest_read = 0;
+        for (const ReadPair& fragment : fragments) {
+            longest_read = std::max({longest_read, fragment.first.bases.size(), fragment.second.bases.size()});
+        }
+        RepairWindowBounds bounds;
+        bounds.margin = longest_read + library.max_gap_bp;
+        const std::size_t max_insert = library_insert_support(library).max_bp;
+        const std::size_t halo = max_insert + bounds.margin;
+        bounds.shortest = std::min(old_length, new_length);
+        bounds.begin = block_begin > halo ? block_begin - halo : 0;
+        bounds.end = std::min(new_length, new_end + halo);
+        // A length change reaches the ends through the normaliser, so the window must cover whichever
+        // end the replacement sits within `margin` of, or the origins there would be dropped by both
+        // halves.
+        if (shift != 0 && block_begin < bounds.margin) bounds.begin = 0;
+        if (shift != 0 && bounds.shortest < block_end + bounds.margin) bounds.end = new_length;
+        return bounds;
+    }
+
     bool slot_equals(std::size_t slot, const SegmentedSequence& other) const {
         const auto found = segments.find(slot);
         if (found != segments.end()) return found->second.equals(other);
@@ -3670,6 +3707,10 @@ struct PreparedScoringContext::State {
     std::uint64_t origin_record_cap = 0;
     std::uint64_t origin_records_consumed = 0;
     OriginCache origin_cache;
+    // Planned retention: set by plan_origin_cache, indexed by demand-ledger row. Once planned, a miss is
+    // retained only if its row was selected by the latest plan.
+    bool origin_planned = false;
+    std::vector<char> plan_selected;
     // The demand ledger: every distinct window requested, admitted or not. Same identity as the cache.
     std::unordered_multimap<std::uint64_t, std::size_t> demand_index;
     std::deque<std::pair<std::string, OriginDemandRow>> demand;
@@ -4018,6 +4059,149 @@ std::vector<OriginDemandRow> PreparedScoringContext::origin_demand() const {
     return out;
 }
 
+PlannedRepairWindow PreparedScoringContext::plan_repaired_window(std::size_t incumbent,
+                                                                std::size_t block_begin,
+                                                                std::size_t block_end,
+                                                                const std::string& replacement) const {
+    const State& state = *state_;
+    if (incumbent >= state.sequences.size() || state.sequences[incumbent].empty()) {
+        throw std::invalid_argument("the incumbent haplotype has not been materialised");
+    }
+    const std::string& old_sequence = state.sequences[incumbent];
+    if (block_end < block_begin || block_end > old_sequence.size()) {
+        throw std::invalid_argument("the replaced block is not an interval of the incumbent");
+    }
+    SegmentedSequence repaired;
+    repaired.base = &old_sequence;
+    repaired.block_begin = block_begin;
+    repaired.block_end = block_end;
+    repaired.replacement = replacement;
+    PlannedRepairWindow out;
+    out.haplotype_hash = repaired.hash();
+    const auto range = state.by_hash.equal_range(out.haplotype_hash);
+    for (auto it = range.first; it != range.second && !out.already_held; ++it) {
+        out.already_held = state.slot_equals(it->second, repaired);
+    }
+    const std::size_t new_length = repaired.length();
+    const std::size_t new_end = block_begin + replacement.size();
+    const std::ptrdiff_t shift = static_cast<std::ptrdiff_t>(replacement.size()) -
+                                 static_cast<std::ptrdiff_t>(block_end - block_begin);
+    const State::RepairWindowBounds bounds = state.repair_window_bounds(
+        block_begin, block_end, old_sequence.size(), new_length, new_end, shift);
+    repaired.append_range(bounds.begin, bounds.end, out.bytes);
+    out.at_start = bounds.begin == 0;
+    out.at_end = bounds.end == new_length;
+    out.rel_block_begin = static_cast<std::uint32_t>(block_begin - bounds.begin);
+    out.rel_new_end = static_cast<std::uint32_t>(new_end - bounds.begin);
+    out.key_hash = origin_key_hash(out.bytes, out.at_start, out.at_end, out.rel_block_begin, out.rel_new_end);
+    return out;
+}
+
+OriginCachePlanReport PreparedScoringContext::plan_origin_cache(
+    const std::vector<PlannedRepairWindow>& windows) {
+    State& state = *state_;
+    state.require_usable();
+    OriginCachePlanReport report;
+    report.planned_repairs = windows.size();
+    // A window's multiplicity is the number of DISTINCT new haplotypes requesting it: a haplotype
+    // offered twice is placed once, and a held one requests nothing.
+    using Identity = std::tuple<std::uint64_t, std::string, bool, bool, std::uint32_t, std::uint32_t>;
+    std::map<Identity, std::set<std::uint64_t>> requesters;
+    for (const PlannedRepairWindow& w : windows) {
+        if (w.already_held) continue;
+        requesters[Identity{w.key_hash, w.bytes, w.at_start, w.at_end, w.rel_block_begin, w.rel_new_end}]
+            .insert(w.haplotype_hash);
+    }
+    report.distinct_windows = requesters.size();
+    struct Candidate {
+        const Identity* identity = nullptr;
+        std::uint64_t multiplicity = 0;
+        std::uint64_t bytes = 0;
+        std::uint64_t row = 0;
+    };
+    std::vector<Candidate> candidates;
+    for (const auto& item : requesters) {
+        report.window_requests += item.second.size();
+        const Identity& id = item.first;
+        const auto range = state.demand_index.equal_range(std::get<0>(id));
+        for (auto it = range.first; it != range.second; ++it) {
+            const auto& row = state.demand[it->second];
+            if (row.second.at_start == std::get<2>(id) && row.second.at_end == std::get<3>(id) &&
+                row.second.rel_block_begin == std::get<4>(id) && row.second.rel_new_end == std::get<5>(id) &&
+                row.first == std::get<1>(id)) {
+                // Known only once enumerated: entry_bytes is written at a miss, identical at every miss.
+                if (row.second.misses != 0) {
+                    candidates.push_back({&id, item.second.size(), row.second.entry_bytes, row.second.order});
+                }
+                break;
+            }
+        }
+    }
+    report.known_windows = candidates.size();
+    // Priority m/bytes, descending, compared exactly as m_a * bytes_b > m_b * bytes_a; then key hash,
+    // then the full key. A total order over identities, so the selection is a function of the SET of
+    // planned windows and never of the order they were offered in.
+    std::sort(candidates.begin(), candidates.end(), [](const Candidate& a, const Candidate& b) {
+        const unsigned __int128 lhs = static_cast<unsigned __int128>(a.multiplicity) * b.bytes;
+        const unsigned __int128 rhs = static_cast<unsigned __int128>(b.multiplicity) * a.bytes;
+        if (lhs != rhs) return lhs > rhs;
+        return *a.identity < *b.identity;
+    });
+    state.plan_selected.assign(state.demand.size(), 0);
+    std::uint64_t used = 0;
+    for (const Candidate& c : candidates) {
+        if (used + c.bytes > state.origin_cache_budget) continue;
+        used += c.bytes;
+        state.plan_selected[c.row] = 1;
+        ++report.selected_entries;
+    }
+    report.selected_bytes = used;
+    state.origin_planned = true;
+    // Evict everything outside the selection, releasing its storage now: the cache may only ever hold
+    // selected windows, whose total fits the budget.
+    OriginCache& cache = state.origin_cache;
+    for (std::size_t at = 0; at < cache.entries.size(); ++at) {
+        if (cache.live[at] == 0) continue;
+        if (state.plan_selected[cache.demand_of[at]] != 0) {
+            ++report.retained_entries;
+            continue;
+        }
+        OriginCacheEntry& entry = cache.entries[at];
+        const std::uint64_t hash = origin_key_hash(entry.bytes, entry.at_start, entry.at_end,
+                                                   entry.rel_block_begin, entry.rel_new_end);
+        const auto range = cache.index.equal_range(hash);
+        for (auto it = range.first; it != range.second; ++it) {
+            if (it->second == at) {
+                cache.index.erase(it);
+                break;
+            }
+        }
+        cache.bytes -= entry.payload;
+        report.evicted_bytes += entry.payload;
+        ++report.evicted_entries;
+        entry = OriginCacheEntry{};   // releases the key bytes and every record array
+        cache.live[at] = 0;
+        cache.free_slots.push_back(at);
+    }
+    return report;
+}
+
+std::vector<std::uint64_t> PreparedScoringContext::origin_cache_key_hashes() const {
+    const OriginCache& cache = state_->origin_cache;
+    std::vector<std::uint64_t> out;
+    for (std::size_t at = 0; at < cache.entries.size(); ++at) {
+        if (cache.live[at] == 0) continue;
+        const OriginCacheEntry& e = cache.entries[at];
+        out.push_back(origin_key_hash(e.bytes, e.at_start, e.at_end, e.rel_block_begin, e.rel_new_end));
+    }
+    std::sort(out.begin(), out.end());
+    return out;
+}
+
+std::uint64_t PreparedScoringContext::origin_cache_slots() const {
+    return state_->origin_cache.entries.size();
+}
+
 std::vector<std::size_t> PreparedScoringContext::census_slots() const {
     std::vector<std::size_t> out;
     for (const auto& item : state_->censuses) out.push_back(item.first);
@@ -4026,7 +4210,7 @@ std::vector<std::size_t> PreparedScoringContext::census_slots() const {
 }
 
 std::size_t PreparedScoringContext::origin_cache_entries() const {
-    return state_->origin_cache.entries.size();
+    return state_->origin_cache.index.size();
 }
 std::uint64_t PreparedScoringContext::origin_cache_bytes() const { return state_->origin_cache.bytes; }
 std::uint64_t PreparedScoringContext::origin_cache_not_retained() const {
@@ -4089,7 +4273,7 @@ ContextMemoryAccount PreparedScoringContext::memory_account() const {
         }
         a.census_capacity += item.second.payload_bytes() + sizeof(item) + kTreeNode;
     }
-    a.origin_cache_entries = state.origin_cache.entries.size();
+    a.origin_cache_entries = state.origin_cache.index.size();
     a.origin_cache_payload = state.origin_cache.bytes;
     for (const OriginCacheEntry& entry : state.origin_cache.entries) {
         a.origin_cache_capacity +=
@@ -4382,16 +4566,10 @@ std::size_t PreparedScoringContext::add_repaired_haplotype(
         return held_slot;
     }
 
-    // The margin beyond which the emission normaliser is saturated, so an unaffected origin keeps its
-    // key under a length change. Taken at the LONGEST read, which only ever widens the affected set.
-    std::size_t longest_read = 0;
-    for (const ReadPair& fragment : state.fragments) {
-        longest_read = std::max({longest_read, fragment.first.bases.size(), fragment.second.bases.size()});
-    }
-    const std::size_t margin = longest_read + state.library.max_gap_bp;
-    const std::size_t max_insert = library_insert_support(state.library).max_bp;
-    const std::size_t halo = max_insert + margin;
-    const std::size_t shortest = std::min(old_length, new_length);
+    const State::RepairWindowBounds bounds =
+        state.repair_window_bounds(block_begin, block_end, old_length, new_length, new_end, shift);
+    const std::size_t margin = bounds.margin;
+    const std::size_t shortest = bounds.shortest;
 
     // Affected on the OLD haplotype. Half-open: an origin ending exactly at block_begin, or starting
     // exactly at block_end, does not intersect and is reused.
@@ -4411,12 +4589,8 @@ std::size_t PreparedScoringContext::add_repaired_haplotype(
     };
 
     LocalWindow window;
-    window.begin = block_begin > halo ? block_begin - halo : 0;
-    std::size_t window_end = std::min(new_length, new_end + halo);
-    // A length change reaches the ends through the normaliser, so the window must cover whichever end
-    // the replacement sits within `margin` of, or the origins there would be dropped by both halves.
-    if (shift != 0 && block_begin < margin) window.begin = 0;
-    if (shift != 0 && shortest < block_end + margin) window_end = new_length;
+    window.begin = bounds.begin;
+    const std::size_t window_end = bounds.end;
     window.at_start = window.begin == 0;
     window.at_end = window_end == new_length;
     {
@@ -4546,7 +4720,10 @@ std::size_t PreparedScoringContext::add_repaired_haplotype(
                 demand->entry_bytes = cost;
                 demand->records = state.miss_records.origins.size();
             }
-            if (state.origin_cache_budget != 0 &&
+            const bool selected = !state.origin_planned ||
+                                  (demand->order < state.plan_selected.size() &&
+                                   state.plan_selected[demand->order] != 0);
+            if (state.origin_cache_budget != 0 && selected &&
                 state.origin_cache.bytes + cost <= state.origin_cache_budget) {
                 OriginCacheEntry stored;
                 stored.bytes = window.bases;
@@ -4556,13 +4733,28 @@ std::size_t PreparedScoringContext::add_repaired_haplotype(
                 stored.rel_new_end = rel_new_end;
                 stored.records = state.miss_records;
                 stored.payload = cost;
-                state.origin_cache.entries.push_back(std::move(stored));
-                state.origin_cache.index.emplace(key_hash, state.origin_cache.entries.size() - 1);
-                state.origin_cache.bytes += cost;
+                OriginCache& cache = state.origin_cache;
+                std::size_t at = 0;
+                if (!cache.free_slots.empty()) {
+                    at = cache.free_slots.back();
+                    cache.free_slots.pop_back();
+                    cache.entries[at] = std::move(stored);
+                    cache.live[at] = 1;
+                    cache.demand_of[at] = demand->order;
+                } else {
+                    cache.entries.push_back(std::move(stored));
+                    cache.live.push_back(1);
+                    cache.demand_of.push_back(demand->order);
+                    at = cache.entries.size() - 1;
+                }
+                cache.index.emplace(key_hash, at);
+                cache.bytes += cost;
                 ++local.origin_cache_stored;
                 local.origin_cache_admitted_bytes += cost;
                 demand->admitted = true;
-                source = &state.origin_cache.entries.back().records;   // deque: stable address
+                source = &cache.entries[at].records;   // deque: stable address
+            } else if (state.origin_cache_budget != 0 && !selected) {
+                ++local.origin_cache_not_selected;
             } else if (state.origin_cache_budget != 0) {
                 // Exhaustion stops RETENTION. The records just built are still used, exactly.
                 ++state.origin_cache.not_retained;

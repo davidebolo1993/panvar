@@ -1027,6 +1027,9 @@ struct BlockDeltaWork {
     // Demand, not just outcome: a miss whose records were built and then NOT retained because the
     // budget was full is a decline, and every later request for that window pays the enumeration again.
     std::uint64_t origin_cache_declined = 0;
+    // Planned retention only: a miss on a window the round's plan did not select. Not a decline -- the
+    // budget had room; the window's priority did not earn it.
+    std::uint64_t origin_cache_not_selected = 0;
     std::uint64_t origin_cache_admitted_bytes = 0;
     std::uint64_t origin_cache_declined_bytes = 0;
     double seconds_reenumeration = 0.0;   // misses on a window already missed before
@@ -1105,6 +1108,32 @@ struct OriginDemandRow {
     std::uint64_t retained_not_affected = 0;
     std::uint64_t aggregate_entry_bytes = 0;         // StateCount records (24 bytes each)
     std::uint64_t aggregate_entry_bytes_packed = 0;  // the same states at 16 bytes each
+};
+
+// The identity of the window a repair WOULD request, computed without enumerating anything: the same
+// bounds, bytes and key add_repaired_haplotype uses. already_held means the repaired haplotype is held,
+// so the repair would request no window at all.
+struct PlannedRepairWindow {
+    std::uint64_t haplotype_hash = 0;
+    bool already_held = false;
+    std::uint64_t key_hash = 0;
+    std::string bytes;
+    bool at_start = false;
+    bool at_end = false;
+    std::uint32_t rel_block_begin = 0;
+    std::uint32_t rel_new_end = 0;
+};
+
+struct OriginCachePlanReport {
+    std::uint64_t planned_repairs = 0;
+    std::uint64_t window_requests = 0;     // distinct new haplotypes, each requesting one window
+    std::uint64_t distinct_windows = 0;
+    std::uint64_t known_windows = 0;       // exact entry size known from an earlier enumeration
+    std::uint64_t selected_entries = 0;
+    std::uint64_t selected_bytes = 0;
+    std::uint64_t retained_entries = 0;    // selected and already held
+    std::uint64_t evicted_entries = 0;
+    std::uint64_t evicted_bytes = 0;
 };
 
 struct ContextMemoryAccount {
@@ -1218,6 +1247,19 @@ public:
     std::uint64_t merge_working_bytes() const;
     ContextMemoryAccount memory_account() const;
     std::vector<OriginDemandRow> origin_demand() const;
+    // Planned selective retention. plan_repaired_window describes the window a repair would request;
+    // plan_origin_cache then chooses the round's cache set from those windows and evicts every entry
+    // outside it, releasing its storage. Selection is deterministic and independent of request order:
+    // a window's priority is the number of distinct new haplotypes requesting it divided by its EXACT
+    // entry bytes (compared as integers), ties broken by key hash and then the full key. Only windows
+    // whose exact size is already known -- enumerated in an earlier round -- are candidates, so no
+    // entry is ever retained speculatively. Once planned, a miss is retained only if its window was
+    // selected; the selected total never exceeds the budget, so neither does the cache.
+    PlannedRepairWindow plan_repaired_window(std::size_t incumbent, std::size_t block_begin,
+                                             std::size_t block_end, const std::string& replacement) const;
+    OriginCachePlanReport plan_origin_cache(const std::vector<PlannedRepairWindow>& windows);
+    std::vector<std::uint64_t> origin_cache_key_hashes() const;   // live entries, ascending
+    std::uint64_t origin_cache_slots() const;                     // entry slots, live or reusable
     // Slots currently holding a full origin census, ascending. A caller that knows what each slot is
     // (an incumbent, a seed, a winner being promoted) can then say why every one of them is live.
     std::vector<std::size_t> census_slots() const;
