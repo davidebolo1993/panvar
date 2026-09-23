@@ -499,6 +499,11 @@ constexpr std::size_t kCacheShards = 64;   // 560M lookups must not serialise on
 struct EmissionCache {
     std::array<CacheShard, kCacheShards> shards;
     std::atomic<bool> active{false};
+    // Frozen: every lookup still serves, every insertion becomes a no-op. A key holds raw pointers
+    // into the read and the haplotype window it was built from, so anything scored against a buffer
+    // that will not outlive the context must never be allowed to insert one. A miss under a frozen
+    // cache is computed exactly and discarded, which is the same answer more slowly.
+    std::atomic<bool> frozen{false};
     std::atomic<std::size_t> refusal_budget_bytes{0};
     std::atomic<std::size_t> refusal_bytes_used{0};
     // Only the INSERTION-path totals stay atomic. They are touched once per retained entry (967,004
@@ -577,6 +582,7 @@ CacheProbe cache_lookup(const CacheKey& key, GappedFit* out, EmissionWork& work)
 void cache_store_refusal(const CacheKey& key, CacheOutcome outcome) {
     EmissionCache& cache = emission_cache();
     if (!cache.active.load(std::memory_order_relaxed)) return;
+    if (cache.frozen.load(std::memory_order_relaxed)) return;
     // The declared bound now governs the whole table, which holds only recursion results. Crossing
     // it stops RETENTION, never correctness: the next request for this key recomputes it exactly,
     // which is the same answer more slowly.
@@ -603,6 +609,7 @@ void cache_store_refusal(const CacheKey& key, CacheOutcome outcome) {
 void cache_store_fit(const CacheKey& key, const GappedFit& fit) {
     EmissionCache& cache = emission_cache();
     if (!cache.active.load(std::memory_order_relaxed)) return;
+    if (cache.frozen.load(std::memory_order_relaxed)) return;
     CacheShard& shard = cache.shards[key.h0 % kCacheShards];
     const std::lock_guard<std::mutex> guard(shard.guard);
     if (shard.table.find(key) != shard.table.end()) return;
@@ -970,6 +977,7 @@ void begin_emission_cache(std::size_t budget_bytes) {
     cache.entries.store(0, std::memory_order_relaxed);
     cache.payload_bytes.store(0, std::memory_order_relaxed);
     cache.entries_not_retained.store(0, std::memory_order_relaxed);
+    cache.frozen.store(false, std::memory_order_relaxed);
     // Zero is off, and off reproduces the uncached path exactly rather than approximately.
     cache.active.store(budget_bytes > 0, std::memory_order_relaxed);
 }
@@ -2090,6 +2098,30 @@ struct PlacementInputs {
     std::size_t band = 0;
 };
 
+// Where a haplotype's complete origin census is written, when one is wanted. Distinct from
+// OriginRecording below: that is a diagnostic carrying alignment detail no score reads, this is the
+// exact input a later block-delta reduces from.
+struct CensusCapture {
+    // [haplotype slot] -> the census to fill, or null for haplotypes nobody will delta from.
+    std::map<std::size_t, HaploidOriginCensus*> wanted;
+};
+
+// The ONE reduction from a StateKey census to a fragment's mass. Shared by the full scorer and the
+// delta so the two cannot reduce in different orders: std::map orders by (insert, orientation,
+// latent mass), and log_add_exp is not associative in floating point, so a second copy of this loop
+// is how bit-identical quietly becomes merely close.
+double reduce_states(const std::map<StateKey, std::uint64_t>& states,
+                     const DiscreteInsertDistribution& library_insert) {
+    double total = kNegInf;
+    for (const auto& item : states) {
+        const double term = std::log(static_cast<double>(item.second)) + kLogMateOrientationPrior +
+                            library_insert.log_probability(item.first.insert_bp) +
+                            item.first.log_latent_mass;
+        total = log_add_exp(total, term);
+    }
+    return total;
+}
+
 // Diagnostics only; the context leaves every pointer null.
 struct OriginRecording {
     bool summary = false;
@@ -2113,7 +2145,8 @@ void place_haplotype_range(
     FragmentScoringCounters& counters,
     ScorerMemoryAccounts& memory,
     EmissionCacheCounters& cache_work,
-    const OriginRecording& origins_out) {
+    const OriginRecording& origins_out,
+    const CensusCapture* census_out) {
     (void)take_gapped_emission_counters();
     const PreparedFragmentSet& prepared = *in.prepared;
     const std::vector<ReadPair>& fragments = *in.fragments;
@@ -2168,6 +2201,16 @@ void place_haplotype_range(
                           return std::tie(lhs.start, lhs.consumed) <
                                  std::tie(rhs.start, rhs.consumed);
                       });
+        }
+
+        HaploidOriginCensus* census = nullptr;
+        if (census_out != nullptr) {
+            const auto found = census_out->wanted.find(h);
+            if (found != census_out->wanted.end()) {
+                census = found->second;
+                census->haplotype_length = haplotype.size();
+                census->origins_by_fragment.assign(fragments.size(), {});
+            }
         }
 
         for (std::size_t f = 0; f < fragments.size(); ++f) {
@@ -2230,6 +2273,11 @@ void place_haplotype_range(
                         key.orientation = static_cast<std::uint32_t>(arm);
                         key.log_latent_mass = item.second.log_latent_mass;
                         ++states[key];
+                        if (census != nullptr) {
+                            census->origins_by_fragment[f].push_back(
+                                {forward_start, item.first, static_cast<std::uint32_t>(arm),
+                                 item.second.log_latent_mass});
+                        }
                         const bool want_named =
                             origins_out.record_origins != nullptr &&
                             (*origins_out.record_origins)[f] != 0;
@@ -2268,16 +2316,7 @@ void place_haplotype_range(
             }
             if (states.empty()) continue;
             counters.statistical_state_classes += states.size();
-
-            double total = kNegInf;
-            for (const auto& item : states) {
-                const double term =
-                    std::log(static_cast<double>(item.second)) + kLogMateOrientationPrior +
-                    library_insert.log_probability(item.first.insert_bp) +
-                    item.first.log_latent_mass;
-                total = log_add_exp(total, term);
-            }
-            mass_column[h][f] = total;
+            mass_column[h][f] = reduce_states(states, library_insert);
         }
     }
     {
@@ -2303,7 +2342,8 @@ std::size_t run_placement(
     FragmentScoringCounters& counters,
     ScorerMemoryAccounts& memory,
     EmissionCacheCounters& cache_work,
-    const OriginRecording& origins_out) {
+    const OriginRecording& origins_out,
+    const CensusCapture* census_out = nullptr) {
     const std::size_t span_count = last_h - first_h;
     const std::size_t threads =
         (span_count == 0 || force_serial)
@@ -2311,7 +2351,7 @@ std::size_t run_placement(
             : std::max<std::size_t>(1, std::min(requested_threads, span_count));
     if (threads <= 1) {
         place_haplotype_range(in, first_h, last_h, budget, mass_column, counters, memory, cache_work,
-                              origins_out);
+                              origins_out, census_out);
         return threads;
     }
     const std::size_t span = (span_count + threads - 1) / threads;
@@ -2327,7 +2367,7 @@ std::size_t run_placement(
         workers.emplace_back([&, t, lo, hi]() {
             try {
                 place_haplotype_range(in, lo, hi, budget, mass_column, local[t], local_memory[t],
-                                      local_cache[t], origins_out);
+                                      local_cache[t], origins_out, census_out);
             } catch (const PlacementCancelled&) {
             } catch (...) {
                 failures[t] = std::current_exception();
@@ -2370,6 +2410,143 @@ std::size_t run_placement(
         counters.statistical_state_classes += part.statistical_state_classes;
     }
     return threads;
+}
+
+// ---- the local window a replacement can disturb ------------------------------------------------
+//
+// Transient by construction: these bytes live only for one delta. That is precisely why the cache
+// must be frozen before any of this runs -- a key built here would point into `bases` below, which
+// is about to go out of scope.
+struct LocalWindow {
+    std::string bases;
+    std::string reversed;
+    std::size_t begin = 0;     // offset of `bases` within the repaired haplotype
+    bool at_start = false;     // the window's left edge IS the haplotype's start
+    bool at_end = false;       // and likewise its right edge
+};
+
+// Enumerates every origin the window can support, in the repaired haplotype's own coordinates.
+//
+// The one trap here is the normaliser. gapped_emission divides by log_gap_shape_mass(read_length,
+// haplotype.size() - start, ...), so a placement scored against a WINDOW is normalised against the
+// window's remaining length, not the haplotype's. Where the window edge is synthetic those two
+// differ, and the emission would silently disagree with the full scorer. The normaliser saturates at
+// read_length + max_gap_bp, so a placement that keeps that much window on the relevant side is
+// identical either way, and one that does not is discarded. Nothing is lost by discarding it: the
+// halo is a whole maximum insert wider than the replacement, so no origin that touches the
+// replacement can reach within a read length of a synthetic edge.
+void enumerate_window_origins(
+    const PreparedFragmentSet& prepared,
+    const std::vector<ReadPair>& fragments,
+    const LibraryModel& library,
+    const FragmentScoringOptions& options,
+    std::size_t band,
+    const LocalWindow& window,
+    PlacementBudget& budget,
+    FragmentScoringCounters& counters,
+    EmissionCacheCounters& cache_work,
+    std::vector<std::vector<HaploidOrigin>>& out) {
+    const auto form_slot = [](std::size_t fragment, std::size_t arm) { return fragment * 2 + arm; };
+    std::vector<std::vector<FormPlacement>> forward_placements(prepared.forward_forms.size());
+    std::vector<std::vector<FormPlacement>> reverse_placements(prepared.reverse_forms.size());
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> proposed_scratch;
+
+    collect_form_placements(window.bases, prepared.forward_forms, prepared.forward_componentise,
+                            prepared.forward_indexes, budget, band, library, forward_placements,
+                            proposed_scratch, counters, cache_work, options);
+    collect_form_placements(window.reversed, prepared.reverse_forms, prepared.reverse_componentise,
+                            prepared.reverse_indexes, budget, band, library, reverse_placements,
+                            proposed_scratch, counters, cache_work, options);
+
+    const std::size_t width = window.bases.size();
+    // Forward rows: drop anything that would have been normalised against a synthetic right edge,
+    // then shift into the repaired haplotype's coordinates.
+    for (std::size_t i = 0; i < forward_placements.size(); ++i) {
+        const std::size_t saturating = prepared.forward_forms[i].bases.size() + library.max_gap_bp;
+        std::vector<FormPlacement> kept;
+        kept.reserve(forward_placements[i].size());
+        for (const FormPlacement& placement : forward_placements[i]) {
+            if (!window.at_end && width - placement.start < saturating) continue;
+            FormPlacement moved = placement;
+            moved.start = static_cast<std::uint32_t>(window.begin + placement.start);
+            kept.push_back(moved);
+        }
+        forward_placements[i] = std::move(kept);
+    }
+    // Reverse rows carry a reversed-coordinate start; map to a right endpoint exactly as the full
+    // scorer does, drop anything normalised against a synthetic LEFT edge, then shift and re-sort.
+    for (std::size_t i = 0; i < reverse_placements.size(); ++i) {
+        const std::size_t saturating = prepared.reverse_forms[i].bases.size() + library.max_gap_bp;
+        std::vector<FormPlacement> kept;
+        kept.reserve(reverse_placements[i].size());
+        for (const FormPlacement& placement : reverse_placements[i]) {
+            const std::size_t endpoint = width - placement.start;
+            if (!window.at_start && endpoint < saturating) continue;
+            FormPlacement moved = placement;
+            moved.start = static_cast<std::uint32_t>(window.begin + endpoint);
+            kept.push_back(moved);
+        }
+        std::sort(kept.begin(), kept.end(), [](const FormPlacement& lhs, const FormPlacement& rhs) {
+            return std::tie(lhs.start, lhs.consumed) < std::tie(rhs.start, rhs.consumed);
+        });
+        reverse_placements[i] = std::move(kept);
+    }
+
+    // The pairing loop, identical to the full scorer's: one group per left endpoint, one origin per
+    // reachable right endpoint, latent alignments summed into the origin rather than counted as
+    // extra copies.
+    out.assign(fragments.size(), {});
+    std::map<std::uint32_t, OriginAccumulator> origins;
+    for (std::size_t f = 0; f < fragments.size(); ++f) {
+        const InsertSupport& support = prepared.support_by_fragment[f];
+        if (support.empty()) continue;
+        for (std::size_t arm = 0; arm < 2; ++arm) {
+            const std::vector<FormPlacement>& forward = forward_placements[form_slot(f, arm)];
+            const std::vector<FormPlacement>& reverse = reverse_placements[form_slot(f, arm)];
+            if (forward.empty() || reverse.empty()) continue;
+            for (std::size_t first_row = 0; first_row < forward.size();) {
+                const std::uint32_t forward_start = forward[first_row].start;
+                std::size_t last_row = first_row;
+                while (last_row < forward.size() && forward[last_row].start == forward_start) ++last_row;
+                const std::size_t lo_end = static_cast<std::size_t>(forward_start) + support.min_bp;
+                const std::size_t hi_end = static_cast<std::size_t>(forward_start) + support.max_bp;
+                const auto begin = std::lower_bound(
+                    reverse.begin(), reverse.end(), lo_end,
+                    [](const FormPlacement& lhs, std::size_t value) { return lhs.start < value; });
+                const auto end = std::upper_bound(
+                    begin, reverse.end(), hi_end,
+                    [](std::size_t value, const FormPlacement& rhs) { return value < rhs.start; });
+                origins.clear();
+                for (std::size_t row = first_row; row < last_row; ++row) {
+                    for (auto it = begin; it != end; ++it) {
+                        ++counters.latent_alignment_pairs;
+                        const std::optional<std::size_t> insert = fr_insert_from_endpoints(
+                            forward_start, forward[row].consumed, it->start, it->consumed, support);
+                        if (!insert.has_value()) continue;
+                        ++counters.valid_fr_states;
+                        origins[static_cast<std::uint32_t>(*insert)].add(
+                            forward[row].emission + it->emission, it->start - it->consumed,
+                            forward[row].consumed, it->consumed, forward[row].mismatches,
+                            it->mismatches);
+                    }
+                }
+                for (const auto& item : origins) {
+                    ++counters.physical_origins;
+                    const std::uint64_t seen =
+                        budget.physical_origins.fetch_add(1, std::memory_order_relaxed) + 1;
+                    if (seen > budget.max_physical_origins) {
+                        budget.cancel();
+                        throw ResourceExhausted(
+                            "fragment scoring reached its physical-origin cap; no partial ranking is "
+                            "returned");
+                    }
+                    out[f].push_back({forward_start, item.first, static_cast<std::uint32_t>(arm),
+                                      item.second.log_latent_mass});
+                }
+                first_row = last_row;
+            }
+        }
+    }
 }
 
 // The four acceptance caps, decided on whatever totals the caller holds them against: per call for
@@ -2662,6 +2839,11 @@ struct PreparedScoringContext::State {
     PlacementBudget budget;                          // cumulative across every batch
     bool refused = false;
     bool cache_pinned = false;
+    // Stage 2. `frozen` gates every transient haplotype; `transient_watermark` is the slot from which
+    // release_transient is allowed to free, so the initial panel columns are structurally out of reach.
+    bool frozen = false;
+    std::size_t transient_watermark = 0;
+    std::map<std::size_t, HaploidOriginCensus> censuses;
 
     void require_usable() const {
         if (refused) {
@@ -2855,6 +3037,14 @@ FragmentScoringResult PreparedScoringContext::score_candidates(
             throw std::invalid_argument("diplotype candidate names an unknown haplotype");
         }
     }
+    // A released haplotype has no column. Naming one is a caller error, and it must be refused here
+    // rather than discovered as a read through freed storage further down.
+    for (const HaplotypeCandidate& candidate : candidates) {
+        if (state.mass_column[candidate.first].empty() || state.mass_column[candidate.second].empty()) {
+            throw std::invalid_argument(
+                "diplotype candidate names a haplotype whose storage has been released");
+        }
+    }
     FragmentScoringResult result;
     result.scores.resize(candidates.size());
     result.unique_haplotypes = unique;
@@ -2921,6 +3111,10 @@ FragmentScoringResult PreparedScoringContext::score_candidates(
 
     result.log_mass.assign(fragments.size() * unique, kNegInf);
     for (std::size_t h = 0; h < unique; ++h) {
+        // Released slots keep their index so nothing is renumbered, but hold no column. Their cells
+        // stay at -inf: the haplotype no longer exists, and walking into the empty vector is what
+        // turned the first release into a segfault.
+        if (state.mass_column[h].empty()) continue;
         for (std::size_t f = 0; f < fragments.size(); ++f) {
             result.log_mass[f * unique + h] = state.mass_column[h][f];
         }
@@ -2952,6 +3146,339 @@ const EmissionCacheCounters& PreparedScoringContext::cumulative_emission_cache()
 }
 
 bool PreparedScoringContext::refused() const { return state_->refused; }
+
+std::uint64_t HaploidOriginCensus::payload_bytes() const {
+    std::uint64_t total = sizeof(HaploidOriginCensus);
+    for (const std::vector<HaploidOrigin>& list : origins_by_fragment) {
+        total += sizeof(list) + static_cast<std::uint64_t>(list.capacity()) * sizeof(HaploidOrigin);
+    }
+    return total;
+}
+
+void PreparedScoringContext::freeze_emission_cache() {
+    State& state = *state_;
+    state.require_usable();
+    // emission_cache() is a file-local singleton in the anonymous namespace, not a scoring_detail
+    // member; only the pin flag lives there.
+    emission_cache().frozen.store(true, std::memory_order_relaxed);
+    state.frozen = true;
+    // Everything added from here is transient until the caller says otherwise.
+    state.transient_watermark = state.sequences.size();
+}
+
+bool PreparedScoringContext::emission_cache_frozen() const { return state_->frozen; }
+
+bool PreparedScoringContext::holds_census(std::size_t haplotype) const {
+    return state_->censuses.count(haplotype) != 0;
+}
+
+void PreparedScoringContext::retain_census(std::size_t haplotype) {
+    State& state = *state_;
+    state.require_usable();
+    if (haplotype >= state.sequences.size()) {
+        throw std::invalid_argument("census requested for an unknown haplotype");
+    }
+    if (state.censuses.count(haplotype) != 0) return;
+    // Placed in full, because nothing is held to delta from. One of these per round is the price of
+    // being able to delta the next round's several hundred neighbours.
+    HaploidOriginCensus census;
+    PlacementInputs inputs;
+    inputs.prepared = &state.prepared;
+    inputs.fragments = &state.fragments;
+    inputs.library = &state.library;
+    inputs.library_insert = &state.library_insert;
+    inputs.options = &state.options;
+    inputs.sequences = &state.sequences;
+    inputs.reversed = &state.reversed;
+    inputs.band = state.options.mismatch_band;
+    CensusCapture capture;
+    capture.wanted.emplace(haplotype, &census);
+    OriginRecording none;
+    FragmentScoringCounters counters;
+    ScorerMemoryAccounts memory;
+    EmissionCacheCounters cache_work;
+    std::vector<std::vector<double>> scratch = state.mass_column;
+    try {
+        place_haplotype_range(inputs, haplotype, haplotype + 1, state.budget, scratch, counters,
+                              memory, cache_work, none, &capture);
+    } catch (const ResourceExhausted&) {
+        state.refused = true;
+        throw;
+    }
+    state.mass_column[haplotype] = scratch[haplotype];
+    state.censuses.emplace(haplotype, std::move(census));
+    // This placement is search work like any other. Leaving it out of the cumulative counters while
+    // the shared budget atomic already counted it is what made a cap measured from those counters
+    // refuse a run that did exactly the same work.
+    state.cumulative.candidate_bases_scanned += counters.candidate_bases_scanned;
+    state.cumulative.piece_hits += counters.piece_hits;
+    state.cumulative.proposed_starts += counters.proposed_starts;
+    state.cumulative.unique_starts += counters.unique_starts;
+    state.cumulative.full_read_verifications += counters.full_read_verifications;
+    state.cumulative.dp_evaluations += counters.dp_evaluations;
+    state.cumulative.prefilter_rejections += counters.prefilter_rejections;
+    state.cumulative.accepted_mate_placements += counters.accepted_mate_placements;
+    state.cumulative.valid_fr_states += counters.valid_fr_states;
+    state.cumulative.latent_alignment_pairs += counters.latent_alignment_pairs;
+    state.cumulative.physical_origins += counters.physical_origins;
+    state.cumulative.statistical_state_classes += counters.statistical_state_classes;
+    state.cumulative_cache.executed_prefilters += cache_work.executed_prefilters;
+    state.cumulative_cache.dp_cache_requests += cache_work.dp_cache_requests;
+    state.cumulative_cache.dp_cache_hits += cache_work.dp_cache_hits;
+    state.cumulative_cache.dp_cache_misses += cache_work.dp_cache_misses;
+    state.cumulative_cache.executed_dps += cache_work.executed_dps;
+    try {
+        enforce_acceptance_caps(state.cumulative, state.options, []() {});
+    } catch (const ResourceExhausted&) {
+        state.refused = true;
+        throw;
+    }
+}
+
+std::size_t PreparedScoringContext::add_repaired_haplotype(
+    std::size_t incumbent,
+    std::size_t block_begin,
+    std::size_t block_end,
+    const std::string& replacement,
+    BlockDeltaWork* work,
+    bool retain_census_for_it) {
+    State& state = *state_;
+    state.require_usable();
+    // Both refusals are deliberate. Placing in full when a precondition is missing would report a
+    // delta that never happened, and the whole point of this path is that its reuse is measurable.
+    if (!state.frozen) {
+        throw std::invalid_argument(
+            "the emission cache must be frozen before a transient repair haplotype is scored");
+    }
+    const auto held = state.censuses.find(incumbent);
+    if (held == state.censuses.end()) {
+        throw std::invalid_argument("no origin census is held for the incumbent haplotype");
+    }
+    const HaploidOriginCensus& census = held->second;
+    const std::string& old_sequence = state.sequences[incumbent];
+    if (block_end < block_begin || block_end > old_sequence.size()) {
+        throw std::invalid_argument("the replaced block is not an interval of the incumbent");
+    }
+
+    const auto mark = std::chrono::steady_clock::now();
+    BlockDeltaWork local;
+    std::string repaired = old_sequence;
+    repaired.replace(block_begin, block_end - block_begin, replacement);
+    const std::size_t old_length = old_sequence.size();
+    const std::size_t new_length = repaired.size();
+    const std::size_t new_end = block_begin + replacement.size();
+    const std::ptrdiff_t shift =
+        static_cast<std::ptrdiff_t>(replacement.size()) -
+        static_cast<std::ptrdiff_t>(block_end - block_begin);
+
+    // Already held? Hand back the same slot. The one exception is a caller that now wants a census
+    // for it -- typically the round's winner, scored earlier without one -- and that must fill the
+    // EXISTING slot rather than mint a second one for identical bytes.
+    const auto found = state.index_of_sequence.find(repaired);
+    const bool already_held = found != state.index_of_sequence.end();
+    if (already_held && (!retain_census_for_it || state.censuses.count(found->second) != 0)) {
+        if (work != nullptr) {
+            local.seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - mark).count();
+            *work = local;
+        }
+        return found->second;
+    }
+
+    // The margin beyond which the emission normaliser is saturated, so an unaffected origin keeps its
+    // key under a length change. Taken at the LONGEST read, which only ever widens the affected set.
+    std::size_t longest_read = 0;
+    for (const ReadPair& fragment : state.fragments) {
+        longest_read = std::max({longest_read, fragment.first.bases.size(), fragment.second.bases.size()});
+    }
+    const std::size_t margin = longest_read + state.library.max_gap_bp;
+    const std::size_t max_insert = library_insert_support(state.library).max_bp;
+    const std::size_t halo = max_insert + margin;
+    const std::size_t shortest = std::min(old_length, new_length);
+
+    // Affected on the OLD haplotype. Half-open: an origin ending exactly at block_begin, or starting
+    // exactly at block_end, does not intersect and is reused.
+    const auto affected = [&](const HaploidOrigin& origin) {
+        const std::size_t begin = origin.forward_start;
+        const std::size_t end = begin + origin.insert_bp;
+        if (begin < block_end && block_begin < end) return true;
+        if (shift == 0) return false;
+        if (end <= block_begin) {
+            // Before the block: its forward mate's available length is L - begin, which the length
+            // change moves. Unsaturated under EITHER length means the key is not safe to reuse.
+            return shortest < begin + margin;
+        }
+        // After the block: its reverse mate's available length is the right endpoint, which shifts.
+        const std::size_t moved_end = static_cast<std::size_t>(static_cast<std::ptrdiff_t>(end) + shift);
+        return std::min(end, moved_end) < margin;
+    };
+
+    LocalWindow window;
+    window.begin = block_begin > halo ? block_begin - halo : 0;
+    std::size_t window_end = std::min(new_length, new_end + halo);
+    // A length change reaches the ends through the normaliser, so the window must cover whichever end
+    // the replacement sits within `margin` of, or the origins there would be dropped by both halves.
+    if (shift != 0 && block_begin < margin) window.begin = 0;
+    if (shift != 0 && shortest < block_end + margin) window_end = new_length;
+    window.at_start = window.begin == 0;
+    window.at_end = window_end == new_length;
+    window.bases = repaired.substr(window.begin, window_end - window.begin);
+    window.reversed.assign(window.bases.rbegin(), window.bases.rend());
+    local.local_window_bases = window.bases.size();
+    local.local_window_payload_bytes =
+        static_cast<std::uint64_t>(window.bases.capacity() + window.reversed.capacity());
+
+    // Affected on the NEW haplotype, mirroring the test above so the two halves partition exactly.
+    const auto affected_new = [&](const HaploidOrigin& origin) {
+        const std::size_t begin = origin.forward_start;
+        const std::size_t end = begin + origin.insert_bp;
+        if (begin < new_end && block_begin < end) return true;
+        if (shift == 0) return false;
+        if (end <= block_begin) return shortest < begin + margin;
+        const std::size_t before = static_cast<std::size_t>(static_cast<std::ptrdiff_t>(end) - shift);
+        return std::min(before, end) < margin;
+    };
+
+    FragmentScoringCounters counters;
+    EmissionCacheCounters cache_work;
+    std::vector<std::vector<HaploidOrigin>> recomputed;
+    try {
+        enumerate_window_origins(state.prepared, state.fragments, state.library, state.options,
+                                 state.options.mismatch_band, window, state.budget, counters,
+                                 cache_work, recomputed);
+    } catch (const ResourceExhausted&) {
+        state.refused = true;
+        throw;
+    }
+
+    std::size_t slot = 0;
+    if (already_held) {
+        slot = found->second;   // refilling an existing column, and its census
+    } else {
+        slot = state.sequences.size();
+        state.index_of_sequence.emplace(repaired, slot);
+        state.sequences.push_back(repaired);
+        state.reversed.emplace_back(repaired.rbegin(), repaired.rend());
+        state.mass_column.resize(slot + 1, std::vector<double>(state.fragments.size(), kNegInf));
+        state.exposure.resize(slot + 1, 0.0);
+        state.exposure[slot] = exposure_for_length(new_length, state.fragments.size(),
+                                                   state.prepared.fragments_by_floor,
+                                                   state.library_insert);
+    }
+
+    local.census_payload_bytes_predicted = census.payload_bytes();
+    HaploidOriginCensus fresh;
+    if (retain_census_for_it) {
+        fresh.haplotype_length = new_length;
+        fresh.origins_by_fragment.assign(state.fragments.size(), {});
+    }
+
+    std::map<StateKey, std::uint64_t> states;
+    for (std::size_t f = 0; f < state.fragments.size(); ++f) {
+        states.clear();
+        for (const HaploidOrigin& origin : census.origins_by_fragment[f]) {
+            if (affected(origin)) continue;
+            ++local.origins_reused;
+            StateKey key;
+            key.insert_bp = origin.insert_bp;
+            key.orientation = origin.orientation;
+            key.log_latent_mass = origin.log_latent_mass;
+            ++states[key];
+            if (retain_census_for_it) {
+                HaploidOrigin moved = origin;
+                if (origin.forward_start >= block_end) {
+                    moved.forward_start = static_cast<std::uint32_t>(
+                        static_cast<std::ptrdiff_t>(origin.forward_start) + shift);
+                }
+                fresh.origins_by_fragment[f].push_back(moved);
+            }
+        }
+        for (const HaploidOrigin& origin : recomputed[f]) {
+            if (!affected_new(origin)) continue;
+            ++local.origins_recomputed;
+            StateKey key;
+            key.insert_bp = origin.insert_bp;
+            key.orientation = origin.orientation;
+            key.log_latent_mass = origin.log_latent_mass;
+            ++states[key];
+            if (retain_census_for_it) fresh.origins_by_fragment[f].push_back(origin);
+        }
+        if (states.empty()) continue;
+        state.cumulative.statistical_state_classes += states.size();
+        state.mass_column[slot][f] = reduce_states(states, state.library_insert);
+    }
+
+    if (retain_census_for_it) {
+        local.census_payload_bytes_observed = fresh.payload_bytes();
+        state.censuses.emplace(slot, std::move(fresh));
+    }
+    local.piece_hits = counters.piece_hits;
+    local.dp_executions = cache_work.executed_dps;
+    local.cache_misses = cache_work.dp_cache_misses;
+    state.cumulative.piece_hits += counters.piece_hits;
+    state.cumulative.candidate_bases_scanned += counters.candidate_bases_scanned;
+    state.cumulative.physical_origins += counters.physical_origins;
+    state.cumulative.latent_alignment_pairs += counters.latent_alignment_pairs;
+    state.cumulative.valid_fr_states += counters.valid_fr_states;
+    state.cumulative.full_read_verifications += counters.full_read_verifications;
+    state.cumulative.proposed_starts += counters.proposed_starts;
+    state.cumulative.unique_starts += counters.unique_starts;
+    state.cumulative.accepted_mate_placements += counters.accepted_mate_placements;
+    state.cumulative.dp_evaluations += counters.dp_evaluations;
+    state.cumulative.prefilter_rejections += counters.prefilter_rejections;
+    state.cumulative_cache.executed_prefilters += cache_work.executed_prefilters;
+    state.cumulative_cache.dp_cache_requests += cache_work.dp_cache_requests;
+    state.cumulative_cache.dp_cache_hits += cache_work.dp_cache_hits;
+    state.cumulative_cache.dp_cache_misses += cache_work.dp_cache_misses;
+    state.cumulative_cache.executed_dps += cache_work.executed_dps;
+    try {
+        enforce_acceptance_caps(state.cumulative, state.options, []() {});
+    } catch (const ResourceExhausted&) {
+        state.refused = true;
+        throw;
+    }
+    local.seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - mark).count();
+    state.cumulative_placement_seconds += local.seconds;
+    if (work != nullptr) *work = local;
+    return slot;
+}
+
+void PreparedScoringContext::release_transient(const std::vector<std::size_t>& keep) {
+    State& state = *state_;
+    const std::set<std::size_t> retained(keep.begin(), keep.end());
+    for (std::size_t slot = state.transient_watermark; slot < state.sequences.size(); ++slot) {
+        if (retained.count(slot) != 0) continue;
+        if (state.sequences[slot].empty() && state.mass_column[slot].empty()) continue;
+        // Safe only because the cache was frozen before any of these existed, so no key points here.
+        state.index_of_sequence.erase(state.sequences[slot]);
+        std::string().swap(state.sequences[slot]);
+        std::string().swap(state.reversed[slot]);
+        std::vector<double>().swap(state.mass_column[slot]);
+        state.censuses.erase(slot);
+    }
+}
+
+std::uint64_t PreparedScoringContext::transient_payload_bytes() const {
+    const State& state = *state_;
+    std::uint64_t total = 0;
+    for (std::size_t slot = state.transient_watermark; slot < state.sequences.size(); ++slot) {
+        // A released slot keeps its shell but owns no heap. std::string::capacity() still reports the
+        // short-string buffer for an empty string, so counting it would report storage that was in
+        // fact returned -- and this figure exists precisely to show that it was.
+        if (state.sequences[slot].empty() && state.mass_column[slot].empty()) continue;
+        total += state.sequences[slot].capacity() + state.reversed[slot].capacity();
+        total += static_cast<std::uint64_t>(state.mass_column[slot].capacity()) * sizeof(double);
+        const auto census = state.censuses.find(slot);
+        if (census != state.censuses.end()) total += census->second.payload_bytes();
+    }
+    return total;
+}
+
+std::uint64_t PreparedScoringContext::retained_census_bytes() const {
+    std::uint64_t total = 0;
+    for (const auto& item : state_->censuses) total += item.second.payload_bytes();
+    return total;
+}
+
 
 CertifiedRanking certify_diplotype_ranking(
     const InternedHaplotypes& haplotypes,

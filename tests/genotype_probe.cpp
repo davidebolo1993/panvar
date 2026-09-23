@@ -3337,6 +3337,10 @@ int repair_search(const Args& args) {
     // score_diplotypes per round. The candidate search, the move rule and the model are untouched:
     // the only difference is who owns the read forms, the piece indexes and the haplotype columns.
     const bool use_context = args.get("context", "0") != "0";
+    // --delta 1 scores each neighbour as a single-block replacement of the incumbent, reusing every
+    // origin the replaced block cannot touch. It implies --context, because a delta needs somewhere
+    // for the incumbent's census and columns to live between rounds.
+    const bool use_delta = args.get("delta", "0") != "0";
     const double switch_probability = std::stod(args.get("switch-probability", "0.01"));
     const std::uint64_t declared_cap = std::stoull(args.get("max-neighbors", "0"));
     // Resumption. --start declares where to continue from and --start-score what it must score; the
@@ -3554,15 +3558,24 @@ int repair_search(const Args& args) {
         std::uint64_t cache_requests = 0, cache_hits = 0, cache_misses = 0, executed_dps = 0;
         std::uint64_t physical_origins = 0, state_classes = 0;
         double placement_seconds = 0.0, combination_seconds = 0.0;
+        // Stage 2. reused against recomputed is the whole claim; transient_after must return to
+        // transient_before, or storage is leaking a round at a time.
+        std::uint64_t origins_reused = 0, origins_recomputed = 0, window_bases = 0;
+        std::uint64_t transient_before = 0, transient_after = 0;
     };
     std::vector<Round> rounds;
     std::unique_ptr<panvar::PreparedScoringContext> context;
-    if (use_context) {
+    if (use_context || use_delta) {
         context = std::make_unique<panvar::PreparedScoringContext>(fragments, library, scoring);
     }
 
     std::vector<std::size_t> cur_first = start_first;
     std::vector<std::size_t> cur_second = start_second;
+    // The incumbent's two haplotypes keep their context slots and their censuses between rounds;
+    // everything else a round creates is transient and released at its end.
+    std::size_t inc_slot_a = 0;
+    std::size_t inc_slot_b = 0;
+    bool have_inc_slots = false;
     double cur_total = start_total;
     visited.insert(key_of(cur_first, cur_second));
     std::string stop_reason = "round_cap";
@@ -3573,6 +3586,27 @@ int repair_search(const Args& args) {
     for (std::size_t round = first_round; round <= last_round; ++round) {
         Round rec;
         rec.index = round;
+
+        // The incumbent, spelled once per round: its block_intervals are the coordinates every
+        // replacement below is expressed in.
+        const panvar::HaplotypeSequence incumbent_a =
+            panvar::spell_mosaic(model, panvar::MosaicPath{cur_first});
+        const panvar::HaplotypeSequence incumbent_b =
+            panvar::spell_mosaic(model, panvar::MosaicPath{cur_second});
+        if (use_delta && !have_inc_slots) {
+            // The initial pass: place the incumbent in full, then FREEZE. Everything after this is
+            // transient, and a frozen cache is what makes it safe to release -- no key may point
+            // into a buffer that will not outlive the context.
+            const std::vector<std::size_t> seeded =
+                context->add_haplotypes({incumbent_a.bases, incumbent_b.bases});
+            inc_slot_a = seeded.front();
+            inc_slot_b = seeded.back();
+            if (!context->emission_cache_frozen()) context->freeze_emission_cache();
+            context->retain_census(inc_slot_a);
+            context->retain_census(inc_slot_b);
+            have_inc_slots = true;
+        }
+        if (use_delta) rec.transient_before = context->transient_payload_bytes();
 
         // ---- neighbourhood construction. NO TRUTH IN SCOPE.
         std::vector<panvar::MosaicPath> paths;
@@ -3592,10 +3626,28 @@ int repair_search(const Args& args) {
             int assignment = 0;
             std::vector<std::size_t> first, second;
         };
+        // How each local haplotype relates to the incumbent. A neighbour differs from it at exactly
+        // one block on one side, which is precisely what the delta needs to be told.
+        struct Provenance {
+            bool is_incumbent = false;
+            int side = 0;            // 0: derived from the incumbent's first haplotype, 1: second
+            std::size_t block = 0;
+            std::size_t allele = 0;
+        };
+        std::vector<Provenance> provenance;
+        const auto slot_with = [&](const std::vector<std::size_t>& alleles, Provenance note) {
+            const std::size_t before = paths.size();
+            const std::size_t slot = slot_for(alleles);
+            if (paths.size() > before) {
+                provenance.resize(paths.size());
+                provenance[slot] = note;
+            }
+            return slot;
+        };
         std::vector<Neighbour> neighbours;
         std::set<std::pair<std::vector<std::size_t>, std::vector<std::size_t>>> seen_round;
-        const std::size_t cur_s1 = slot_for(cur_first);
-        const std::size_t cur_s2 = slot_for(cur_second);
+        const std::size_t cur_s1 = slot_with(cur_first, Provenance{true, 0, 0, 0});
+        const std::size_t cur_s2 = slot_with(cur_second, Provenance{true, 1, 0, 0});
         seen_round.insert(key_of(cur_first, cur_second));
         for (std::size_t b = 0; b < blocks; ++b) {
             for (std::size_t r = 0; r < local[b].size(); ++r) {
@@ -3621,8 +3673,8 @@ int repair_search(const Args& args) {
                         ++rec.duplicate;
                         continue;
                     }
-                    const std::size_t s1 = slot_for(first);
-                    const std::size_t s2 = slot_for(second);
+                    const std::size_t s1 = slot_with(first, Provenance{false, 0, b, first[b]});
+                    const std::size_t s2 = slot_with(second, Provenance{false, 1, b, second[b]});
                     const double prior =
                         panvar::log_unordered_sequence_pair_prior(model, sequences[s1], sequences[s2], switches);
                     if (!std::isfinite(prior)) {
@@ -3653,7 +3705,41 @@ int repair_search(const Args& args) {
         std::map<std::size_t, const std::string*> sequence_of_slot;
         panvar::IncrementalBatchReport batch;
         std::optional<panvar::InternedHaplotypes> interned;
-        if (context) {
+        panvar::BlockDeltaWork round_delta;
+        const auto resolve_by_delta = [&](std::size_t local, bool keep_census) {
+            const Provenance& note = provenance[local];
+            if (note.is_incumbent) return note.side == 0 ? inc_slot_a : inc_slot_b;
+            const panvar::HaplotypeSequence& base = note.side == 0 ? incumbent_a : incumbent_b;
+            const std::size_t from = note.side == 0 ? inc_slot_a : inc_slot_b;
+            const panvar::SequenceInterval span = base.block_intervals[note.block];
+            panvar::BlockDeltaWork work;
+            const std::size_t slot = context->add_repaired_haplotype(
+                from, span.begin, span.end, model.blocks()[note.block].alleles[note.allele].sequence,
+                &work, keep_census);
+            round_delta.origins_reused += work.origins_reused;
+            round_delta.origins_recomputed += work.origins_recomputed;
+            round_delta.local_window_bases += work.local_window_bases;
+            round_delta.piece_hits += work.piece_hits;
+            round_delta.dp_executions += work.dp_executions;
+            round_delta.cache_misses += work.cache_misses;
+            round_delta.seconds += work.seconds;
+            return slot;
+        };
+
+        if (use_delta) {
+            provenance.resize(paths.size());
+            slot_of_local.resize(paths.size());
+            const std::size_t held_before = context->unique_haplotypes();
+            for (std::size_t i = 0; i < paths.size(); ++i) {
+                slot_of_local[i] = resolve_by_delta(i, false);
+            }
+            for (std::size_t i = 0; i < sequences.size(); ++i) {
+                sequence_of_slot.emplace(slot_of_local[i], &sequences[i]);
+            }
+            rec.haps_new = context->unique_haplotypes() - held_before;
+            rec.haps_reused = paths.size() - rec.haps_new;
+            rec.unique_haplotypes = context->unique_haplotypes();
+        } else if (context) {
             slot_of_local = context->add_haplotypes(sequences, &batch);
             for (std::size_t i = 0; i < sequences.size(); ++i) {
                 sequence_of_slot.emplace(slot_of_local[i], &sequences[i]);
@@ -3688,6 +3774,9 @@ int repair_search(const Args& args) {
                     : panvar::score_diplotypes(*interned, scored_pairs, fragments, library, scoring);
         rec.seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - mark).count();
         if (context) rec.seconds += batch.seconds_placement_and_mass;
+        // The deltas ran while slots were being resolved, which is before `mark`. Leaving them out
+        // reported 0.39 s for a run that took 297 s.
+        if (use_delta) rec.seconds += round_delta.seconds;
         rec.rss = peak_rss_gib();
         {
             const panvar::FragmentScoringCounters& work = context ? batch.counters : scored.counters;
@@ -3701,8 +3790,19 @@ int repair_search(const Args& args) {
             rec.executed_dps = cache.executed_dps;
             rec.physical_origins = work.physical_origins;
             rec.state_classes = work.statistical_state_classes;
+            if (use_delta) {
+                rec.bases_scanned = round_delta.local_window_bases;
+                rec.piece_hits = round_delta.piece_hits;
+                rec.cache_misses = round_delta.cache_misses;
+                rec.executed_dps = round_delta.dp_executions;
+                rec.origins_reused = round_delta.origins_reused;
+                rec.origins_recomputed = round_delta.origins_recomputed;
+                rec.window_bases = round_delta.local_window_bases;
+            }
             rec.placement_seconds =
-                context ? batch.seconds_placement_and_mass : scored.seconds_placement_and_mass;
+                use_delta ? round_delta.seconds
+                          : (context ? batch.seconds_placement_and_mass
+                                     : scored.seconds_placement_and_mass);
             rec.combination_seconds = scored.seconds_diploid_combination;
         }
         cumulative_seconds += rec.seconds;
@@ -3836,6 +3936,22 @@ int repair_search(const Args& args) {
         } else {
             rec.moved = true;
         }
+        if (use_delta) {
+            std::vector<std::size_t> keep;
+            if (rec.moved && winner_item != 0) {
+                const Neighbour& best = neighbours[winner_item - 1];
+                // A delta, not a full placement: the winner's census is built from the incumbent's.
+                const std::size_t won_a = resolve_by_delta(best.s1, true);
+                const std::size_t won_b = resolve_by_delta(best.s2, true);
+                keep = {won_a, won_b};
+                inc_slot_a = won_a;
+                inc_slot_b = won_b;
+            } else {
+                keep = {inc_slot_a, inc_slot_b};
+            }
+            context->release_transient(keep);
+            rec.transient_after = context->transient_payload_bytes();
+        }
         rounds.push_back(rec);
         if (!rec.moved) break;
         visited.insert(key_of(rec.first, rec.second));
@@ -3876,10 +3992,22 @@ int repair_search(const Args& args) {
             origins += r.physical_origins;
             classes += r.state_classes;
         }
+        if (context) {
+            origins = context->cumulative_counters().physical_origins;
+            classes = context->cumulative_counters().statistical_state_classes;
+        }
         summary << "cumulative_physical_origins\t" << origins << "\ncumulative_state_classes\t"
                 << classes << "\ndeclared_max_physical_origins\t" << scoring.max_physical_origins
                 << '\n';
-        summary << "scoring_mode\t" << (context ? "prepared_context" : "one_shot_per_round")
+        std::uint64_t reused = 0;
+        std::uint64_t recomputed = 0;
+        for (const Round& r : rounds) {
+            reused += r.origins_reused;
+            recomputed += r.origins_recomputed;
+        }
+        summary << "origins_reused\t" << reused << "\norigins_recomputed\t" << recomputed << '\n';
+        summary << "scoring_mode\t"
+                << (use_delta ? "block_delta" : (context ? "prepared_context" : "one_shot_per_round"))
                 << "\nhaplotypes_placed\t" << new_haps << "\nhaplotypes_reused\t" << reused_haps
                 << "\nseconds_placement\t" << placement << "\nseconds_combination\t" << combination
                 << "\nfraction_scanning_new_haplotypes\t"
@@ -3906,7 +4034,8 @@ int repair_search(const Args& args) {
                  "unique_haplotypes\tscored_pairs\torder_invariant\tswap_invariant\tseconds\tpeak_rss_gib\t"
                  "haplotypes_new\thaplotypes_reused\tbases_scanned\tpiece_hits\tcache_requests\t"
                  "cache_hits\tcache_misses\texecuted_dps\tphysical_origins\tstate_classes\t"
-                 "placement_seconds\tcombination_seconds\n";
+                 "placement_seconds\tcombination_seconds\torigins_reused\torigins_recomputed\t"
+                 "window_bases\ttransient_before\ttransient_after\n";
         for (const Round& r : rounds) {
             table << r.index << '\t' << r.start_total << '\t' << (r.moved ? "true" : "false") << '\t'
                   << (r.moved ? model.blocks()[r.block].block_id : std::string("NA")) << '\t'
@@ -3926,7 +4055,9 @@ int repair_search(const Args& args) {
                   << r.piece_hits << '\t' << r.cache_requests << '\t' << r.cache_hits << '\t'
                   << r.cache_misses << '\t' << r.executed_dps << '\t' << r.physical_origins << '\t'
                   << r.state_classes << '\t' << r.placement_seconds << '\t'
-                  << r.combination_seconds << '\n';
+                  << r.combination_seconds << '\t' << r.origins_reused << '\t'
+                  << r.origins_recomputed << '\t' << r.window_bases << '\t' << r.transient_before
+                  << '\t' << r.transient_after << '\n';
         }
     }
     if (truth_gfa.empty()) {

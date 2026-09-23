@@ -855,6 +855,68 @@ struct IncrementalBatchReport {
     double cumulative_seconds_placement_and_mass = 0.0;
 };
 
+// ---------------------------------------------------------------------------------------------
+// Stage 2: exact haploid block-delta scoring.
+// ---------------------------------------------------------------------------------------------
+//
+// Placing a repaired haplotype from scratch rescans the whole locus to learn what one block changed.
+// A delta reuses the rest. It is exact, not an approximation, and the reason is structural: a
+// fragment's mass on one haplotype is a reduction over a StateKey -> multiplicity census, and an
+// origin the replacement cannot touch keeps its key unchanged.
+//
+// "Cannot touch" is decided on the half-open template interval [forward_start, forward_start +
+// insert_bp): an origin is affected exactly when that interval intersects the replaced block. An
+// origin ending precisely at the block start, or starting precisely at its end, is NOT affected.
+//
+// One subtlety decides whether reuse is sound at the ends, and it is not about which bases an origin
+// reads. The emission normaliser log_gap_shape_mass clamps available_bp at read_length + max_gap_bp
+// and is bit-identical beyond it, so an unaffected origin keeps its normaliser only while it is
+// saturated. A length-changing replacement shifts the forward mate's available length (L - start)
+// for origins BEFORE the block, and the reverse mate's (its right endpoint) for origins AFTER it.
+// Both are saturated unless the origin lies within read_length + max_gap_bp of the corresponding
+// end. So the affected set widens to a whole end exactly when the replaced block sits within that
+// margin of it -- which is why repairing a first or last block costs more than repairing an interior
+// one, and is measured rather than assumed.
+
+// One accepted physical origin, carrying only what the reduction and the affected test need. The
+// diagnostic fields of FragmentPlacement are deliberately absent: they are not inputs to a score,
+// and at hundreds of thousands of origins per haplotype they would dominate the census.
+struct HaploidOrigin {
+    std::uint32_t forward_start = 0;   // template left endpoint
+    std::uint32_t insert_bp = 0;       // template span; the right endpoint is start + insert_bp
+    std::uint32_t orientation = 0;     // which library arm produced it
+    double log_latent_mass = 0.0;      // summed over this origin's latent alignments
+};
+
+// The complete origin census of ONE haplotype. Retained only for haplotypes a later round may delta
+// from -- retaining it for every haplotype ever scored would cost more than the placement it saves.
+struct HaploidOriginCensus {
+    std::vector<std::vector<HaploidOrigin>> origins_by_fragment;
+    std::size_t haplotype_length = 0;
+    std::uint64_t payload_bytes() const;
+};
+
+// What one delta actually did. Reuse is reported, never assumed: origins_reused against
+// origins_recomputed is the claim this whole stage rests on, and a delta that quietly fell back to
+// full placement would otherwise look like a fast one.
+struct BlockDeltaWork {
+    std::uint64_t origins_reused = 0;
+    std::uint64_t origins_recomputed = 0;
+    std::uint64_t local_window_bases = 0;
+    std::uint64_t piece_hits = 0;
+    std::uint64_t dp_executions = 0;
+    std::uint64_t cache_misses = 0;
+    // Predicted from the census shape before it is built, observed from the containers afterwards.
+    // Two numbers rather than one, because a predicted payload nobody checks is a guess.
+    std::uint64_t census_payload_bytes_predicted = 0;
+    std::uint64_t census_payload_bytes_observed = 0;
+    std::uint64_t local_window_payload_bytes = 0;
+    // True when the replacement sat within the end margin, or no census was held, so the haplotype
+    // was placed in full. Still exact; simply not a saving.
+    bool fell_back_to_full = false;
+    double seconds = 0.0;
+};
+
 class PreparedScoringContext {
 public:
     // Fragments, library and options are fixed for the context's life: they define the model, and a
@@ -883,6 +945,45 @@ public:
     const EmissionCacheCounters& cumulative_emission_cache() const;
     // True once a cap has been crossed. The context is then permanently unusable.
     bool refused() const;
+
+    // ---- stage 2 ------------------------------------------------------------------------------
+    //
+    // Freezes the emission cache: lookups continue to serve, insertions stop. This is not a tuning
+    // knob -- it is the precondition for scoring anything transient. A cache key holds raw pointers
+    // into the read and the haplotype window it was built from, so a transient repair haplotype that
+    // was allowed to insert would leave keys pointing into a buffer this context is about to free.
+    // Frozen, a later miss is computed exactly and simply not retained.
+    void freeze_emission_cache();
+    bool emission_cache_frozen() const;
+
+    // Scores the incumbent haplotype with [block_begin, block_end) replaced by `replacement`, reusing
+    // every origin the replacement cannot touch. Returns the new haplotype's index. Requires a frozen
+    // cache and a retained census for `incumbent`; refuses otherwise rather than silently placing in
+    // full, because a silent fallback is indistinguishable from a delta that does not work.
+    //
+    // `retain_census` decides whether the new haplotype keeps a census of its own. It defaults to
+    // false because retaining one per neighbour is not affordable -- a census runs to hundreds of
+    // thousands of origins, and a round offers hundreds of neighbours -- so the caller scores a
+    // round's neighbours without censuses and asks for one only for the winner it moves to.
+    std::size_t add_repaired_haplotype(std::size_t incumbent,
+                                       std::size_t block_begin,
+                                       std::size_t block_end,
+                                       const std::string& replacement,
+                                       BlockDeltaWork* work = nullptr,
+                                       bool retain_census = false);
+
+    // Retains an origin census for this haplotype, so a later round may delta from it.
+    void retain_census(std::size_t haplotype);
+    bool holds_census(std::size_t haplotype) const;
+
+    // Releases every haplotype added since the last checkpoint that is not named in `keep`: its
+    // sequence, its reversed copy, its mass column and its census. Safe only because the cache was
+    // frozen before any of them existed, so no key points into what is being freed.
+    void release_transient(const std::vector<std::size_t>& keep);
+    // Bytes currently held by transient sequences, mass columns and censuses, so a caller can check
+    // that storage returns to its previous level after every round instead of trusting that it does.
+    std::uint64_t transient_payload_bytes() const;
+    std::uint64_t retained_census_bytes() const;
 
 private:
     struct State;

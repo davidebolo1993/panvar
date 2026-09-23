@@ -273,6 +273,14 @@ if(PANVAR_BUILD_TESTING)
         target_compile_options(genotype_scoring_context_test PRIVATE -Wall -Wextra -Wpedantic)
         add_test(NAME panvar_genotype_scoring_context COMMAND genotype_scoring_context_test)
 
+        # Stage 2: the block-delta scorer against the full scorer, which is its oracle. Substitutions,
+        # insertions, deletions, empty alleles, first/last block, both orientations, tandem repeats,
+        # gapped multi-component spans and the half-open boundary cases.
+        add_executable(genotype_block_delta_test tests/genotype_block_delta.cpp)
+        target_link_libraries(genotype_block_delta_test PRIVATE panvarlib)
+        target_compile_options(genotype_block_delta_test PRIVATE -Wall -Wextra -Wpedantic)
+        add_test(NAME panvar_genotype_block_delta COMMAND genotype_block_delta_test)
+
         add_executable(genotype_mosaic_proposal_test tests/genotype_mosaic_proposal.cpp)
         target_link_libraries(genotype_mosaic_proposal_test PRIVATE panvarlib)
         target_compile_options(genotype_mosaic_proposal_test PRIVATE -Wall -Wextra -Wpedantic)
@@ -291,7 +299,7 @@ if(PANVAR_BUILD_TESTING)
         add_test(NAME panvar_genotype_source_tree_clean
                  COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/genotype_source_tree_clean.sh)
         set_tests_properties(panvar_genotype_source_tree_clean PROPERTIES DEPENDS
-            "panvar_genotype_mosaic_core;panvar_genotype_locus_adapter;panvar_genotype_command_e2e;panvar_genotype_fragment_oracle;panvar_genotype_fragment_scorer;panvar_genotype_scoring_context;panvar_genotype_mosaic_proposal")
+            "panvar_genotype_mosaic_core;panvar_genotype_locus_adapter;panvar_genotype_command_e2e;panvar_genotype_fragment_oracle;panvar_genotype_fragment_scorer;panvar_genotype_scoring_context;panvar_genotype_block_delta;panvar_genotype_mosaic_proposal")
         # The mosaic experiment's input binding: a changed read file, library or simulation parameter must
         # be detected, and a missing signature must refuse. Runs on stub files in seconds; it does NOT run
         # the five-plan C4 experiment, which needs the real graph and takes minutes.
