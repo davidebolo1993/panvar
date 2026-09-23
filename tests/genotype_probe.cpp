@@ -3432,6 +3432,24 @@ int repair_search(const Args& args) {
     // ADVERSARIAL GATE HOOK: permute the neighbour list and the repair-request list every round. Under
     // planned retention nothing observable may change -- cache identities, accounting, scores, ranking.
     const std::uint64_t request_order_seed = std::stoull(args.get("request-order-seed", "0"));
+    // DIAGNOSTIC: bounded, source-diverse multi-start. Seeds come from the exactly rescored panel+mosaic
+    // union of --run: the top equivalence set, the best panel candidate with its ties, the best mosaic
+    // candidate with its ties. Each is repaired independently; every scored candidate is pooled and the
+    // pool is exactly reranked. Nothing here reads truth.
+    const bool multi_start = args.get("multi-start", "0") != "0";
+    const std::size_t max_repair_starts = std::stoul(args.get("max-repair-starts", "16"));
+    const bool reverse_seeds = args.get("reverse-seeds", "0") != "0";
+    const bool isolate_seeds = args.get("isolate-seeds", "0") != "0";
+    const bool seeds_only = args.get("seeds-only", "0") != "0";
+    const std::uint64_t shuffle_union = std::stoull(args.get("shuffle-union-input", "0"));
+    const std::string explicit_seeds = args.get("seed-candidates", "");
+    // Per-seed work bounds (0: none), checked at every committed round; the process-wide bound is the
+    // context's own cumulative caps, enforced in flight. Crossing either refuses the whole search.
+    const std::uint64_t seed_max_origins = std::stoull(args.get("seed-max-physical-origins", "0"));
+    const std::uint64_t seed_max_classes = std::stoull(args.get("seed-max-state-classes", "0"));
+    const std::uint64_t seed_max_piece_hits = std::stoull(args.get("seed-max-piece-hits", "0"));
+    const std::uint64_t seed_max_latent = std::stoull(args.get("seed-max-latent-pairs", "0"));
+
     // MEASUREMENT ONLY: evaluate the necessary-condition piece screen in shadow on every verification
     // (it rejects nothing), and export named recorded windows for the enumeration benchmark.
     panvar::reset_peak_active_workers();
@@ -3564,8 +3582,10 @@ int repair_search(const Args& args) {
                                    : "the run returned without a final status");
     }};
 
+    const std::string curation_path = args.get("panel-curation", "");
     const LoadedModel loaded =
-        load_model(args.required("model-gfa"), reference, out + ".model.sorted.gfa", 50);
+        load_model(args.required("model-gfa"), reference, out + ".model.sorted.gfa", 50,
+                   curation_path.empty() ? std::vector<std::string>{} : read_panel_curation(curation_path));
     const panvar::PreparedGenotypeModel& model = *loaded.model;
     const std::size_t blocks = model.blocks().size();
     const auto status = read_key_values(run + ".mosaic_status.tsv");
@@ -3604,11 +3624,13 @@ int repair_search(const Args& args) {
         std::string source;
     };
     std::map<std::string, Original> original_of_id;
+    std::vector<std::string> union_ids;   // the union's candidates in the call's own table order
     for (const auto& row : read_table(run + ".mosaic_candidates.tsv")) {
         Original entry;
         entry.first = parse_alleles(row.at("hap1_alleles"));
         entry.second = parse_alleles(row.at("hap2_alleles"));
         entry.source = row.count("source") != 0 ? row.at("source") : std::string("unknown");
+        union_ids.push_back(row.at("candidate_id"));
         original_of_id.emplace(row.at("candidate_id"), std::move(entry));
     }
     std::string start_id;
@@ -3734,7 +3756,13 @@ int repair_search(const Args& args) {
     scoring.max_physical_origins = std::stoull(status.at("max_physical_origins"));
     scoring.max_state_classes = std::stoull(status.at("max_state_classes"));
     scoring.max_mass_cells = std::stoull(status.at("max_mass_cells"));
-    scoring.emission_cache_bytes = static_cast<std::size_t>(std::stoull(status.at("emission_cache_bytes")));
+    // A run scored before the emission cache existed records no budget. The cache never changes a score,
+    // but its budget is still declared, never guessed: such a run needs --emission-cache-bytes.
+    if (args.get("emission-cache-bytes", "").empty() && status.count("emission_cache_bytes") == 0) {
+        throw std::runtime_error("the run records no emission_cache_bytes; declare --emission-cache-bytes");
+    }
+    scoring.emission_cache_bytes = static_cast<std::size_t>(std::stoull(
+        args.get("emission-cache-bytes", status.count("emission_cache_bytes") != 0 ? status.at("emission_cache_bytes") : "0")));
     // A CUMULATIVE budget is a different declared quantity from a per-call one. The campaign's caps
     // bound one scoring pass; a seven-round search through a persistent context sums seven of them
     // against a single budget, and inheriting the per-call figure silently would refuse a search that
@@ -3898,6 +3926,9 @@ int repair_search(const Args& args) {
         }
         return text;
     };
+    std::string rounds_prefix = out;          // where the current search's rounds are committed
+    std::string round_kind = "round";         // memory-row kind: "round", or "seed<k>" in multi-start
+    std::vector<Round> earlier_seed_rounds;   // multi-start: rounds of seeds already finished
     const auto margin = [](std::uint64_t cap_value, std::uint64_t used) -> std::string {
         if (cap_value == 0) return "none";
         return std::to_string(static_cast<std::int64_t>(cap_value) - static_cast<std::int64_t>(used));
@@ -4057,9 +4088,17 @@ int repair_search(const Args& args) {
             text << "reconciled\tnot_applicable_hold_cycles\n";
             return text.str();
         }
+        if (isolate_seeds) {
+            text << "reconciled\tnot_applicable_isolated_contexts\n";
+            return text.str();
+        }
         std::uint64_t round_hits = 0, round_misses = 0, round_constructed = 0, round_declined = 0;
         std::uint64_t round_admitted_bytes = 0, round_evicted_bytes = 0, round_group_reuses = 0;
-        for (const Round& r : rounds) {
+        std::vector<const Round*> every_round;
+        for (const Round& r : earlier_seed_rounds) every_round.push_back(&r);
+        for (const Round& r : rounds) every_round.push_back(&r);
+        for (const Round* each : every_round) {
+            const Round& r = *each;
             round_hits += r.oc_hits_all;
             round_misses += r.oc_misses_all;
             round_constructed += r.origins_constructed_all;
@@ -4169,7 +4208,7 @@ int repair_search(const Args& args) {
             std::lock_guard<std::mutex> lock(commit_mutex);
             if (finished) return;
             rounds_committed = rounds.size();
-            atomic_write(out + ".rounds.partial.tsv", render_rounds());
+            atomic_write(rounds_prefix + ".rounds.partial.tsv", render_rounds());
             if (memory_on) atomic_write(out + ".memory.partial.tsv", memory_text);
             if (!demand_rows.empty()) {
                 atomic_write(out + ".origin_demand.partial.tsv", render_demand(demand_rows));
@@ -4177,7 +4216,8 @@ int repair_search(const Args& args) {
             status_extra = report;
             write_status("RUNNING", "round " + std::to_string(rounds.back().index) + " committed");
         }
-        if (truth_gfa.empty()) return;
+        // Multi-start evaluates truth once, after every seed has finished searching.
+        if (truth_gfa.empty() || multi_start) return;
         ensure_truth();   // outside the lock: the round is already safe on disk
         const TruthTables tables = render_truth();
         std::lock_guard<std::mutex> lock(commit_mutex);
@@ -4202,9 +4242,186 @@ int repair_search(const Args& args) {
     double cumulative_seconds = 0.0;
     std::uint64_t cumulative_pairs = 0;
 
+    // ---- DIAGNOSTIC multi-start: the pool of every exactly scored candidate, keyed by complete identity
+    using Identity = std::pair<std::vector<std::size_t>, std::vector<std::size_t>>;
+    struct SeqId {
+        std::uint64_t a = 0, b = 0;
+        std::size_t length = 0;
+        bool operator<(const SeqId& o) const { return std::tie(a, b, length) < std::tie(o.a, o.b, o.length); }
+        bool operator==(const SeqId& o) const { return a == o.a && b == o.b && length == o.length; }
+    };
+    // Spelled sequences are grouped by a 128-bit content digest plus length; the allele paths are the
+    // identity itself, compared exactly.
+    const auto seq_id = [](const std::string& text) {
+        SeqId id;
+        id.length = text.size();
+        std::uint64_t h1 = 1469598103934665603ULL;
+        std::uint64_t h2 = 0x9e3779b97f4a7c15ULL;
+        for (const char c : text) {
+            const std::uint64_t v = static_cast<unsigned char>(c);
+            h1 = (h1 ^ v) * 1099511628211ULL;
+            h2 = (h2 + v + 1) * 0xbf58476d1ce4e5b9ULL;
+            h2 ^= h2 >> 31;
+        }
+        id.a = h1;
+        id.b = h2;
+        return id;
+    };
+    struct PoolEntry {
+        Identity key;
+        SeqId first_seq, second_seq;
+        panvar::DiplotypeScore score;
+        double prior = 0.0;
+        std::set<std::string> tags;
+        bool union_member = false;
+        std::string union_id;
+        std::string union_source;
+        std::size_t union_order = 0;
+    };
+    std::map<Identity, PoolEntry> pool;
+    std::uint64_t pool_mismatches = 0;
+    std::size_t current_seed = 0;
+    panvar::FragmentScoringCounters seed_start;
+    const auto same_score = [](const panvar::DiplotypeScore& x, const panvar::DiplotypeScore& y) {
+        return std::memcmp(&x.log_likelihood, &y.log_likelihood, sizeof(double)) == 0 &&
+               std::memcmp(&x.fragment_term, &y.fragment_term, sizeof(double)) == 0 &&
+               std::memcmp(&x.exposure_term, &y.exposure_term, sizeof(double)) == 0 &&
+               std::memcmp(&x.absolute_term_sum, &y.absolute_term_sum, sizeof(double)) == 0 &&
+               x.fragments_with_mass == y.fragments_with_mass;
+    };
+    const auto pool_add = [&](const std::vector<std::size_t>& a, const std::vector<std::size_t>& b,
+                              const std::string& sa, const std::string& sb, const panvar::DiplotypeScore& score,
+                              double prior, const std::string& tag) -> PoolEntry& {
+        const Identity key = key_of(a, b);
+        auto found = pool.find(key);
+        if (found == pool.end()) {
+            PoolEntry entry;
+            entry.key = key;
+            const bool swapped = key.first != a;
+            entry.first_seq = seq_id(swapped ? sb : sa);
+            entry.second_seq = seq_id(swapped ? sa : sb);
+            entry.score = score;
+            entry.prior = prior;
+            found = pool.emplace(key, std::move(entry)).first;
+        } else if (!same_score(found->second.score, score) ||
+                   std::memcmp(&found->second.prior, &prior, sizeof(double)) != 0) {
+            ++pool_mismatches;   // one candidate scored twice must score identically
+        }
+        found->second.tags.insert(tag);
+        return found->second;
+    };
+    const auto check_seed_caps = [&]() {
+        if (!multi_start) return;
+        const panvar::FragmentScoringCounters& c = context->cumulative_counters();
+        const auto over = [&](std::uint64_t now, std::uint64_t start, std::uint64_t cap, const char* what) {
+            if (cap != 0 && now - start > cap) {
+                throw panvar::ResourceExhausted(std::string("the per-seed ") + what + " bound was crossed by seed " +
+                                                std::to_string(current_seed) +
+                                                "; the whole adaptive search is refused");
+            }
+        };
+        over(c.physical_origins, seed_start.physical_origins, seed_max_origins, "physical-origin");
+        over(c.statistical_state_classes, seed_start.statistical_state_classes, seed_max_classes, "state-class");
+        over(c.piece_hits, seed_start.piece_hits, seed_max_piece_hits, "piece-hit");
+        over(c.latent_alignment_pairs, seed_start.latent_alignment_pairs, seed_max_latent, "latent-pair");
+    };
+    struct Seed {
+        std::size_t index = 0;             // canonical position
+        Identity key;
+        std::string candidate_id;
+        std::size_t union_order = 0;
+        std::string union_source;
+        std::size_t group_rank = 0;        // position of its sequence group in the exact union ranking
+        std::string group_sources;         // panel, mosaic or both, over the group's members
+        std::set<std::string> selected_as; // top_set, best_panel, best_mosaic
+        panvar::CertifiedCandidate certified;
+    };
+    struct SeedOutcome {
+        std::size_t seed = 0;
+        std::vector<Round> rounds;
+        std::string stop;
+        Identity optimum;
+        double optimum_total = 0.0;
+        std::vector<Identity> incumbents;
+        panvar::FragmentScoringCounters used;
+        double seconds = 0.0;
+    };
+    struct PooledRanking {
+        std::vector<std::vector<const PoolEntry*>> groups;
+        std::vector<std::size_t> representative;
+        panvar::CertifiedRanking ranking;
+    };
+    std::map<std::vector<std::size_t>, double> path_prior_cache;
+    const auto path_prior = [&](const std::vector<std::size_t>& path) {
+        const auto found = path_prior_cache.find(path);
+        if (found != path_prior_cache.end()) return found->second;
+        const double value = panvar::log_haploid_mosaic_prior(model.panel(), panvar::MosaicPath{path}, switches);
+        path_prior_cache.emplace(path, value);
+        return value;
+    };
+    // Sequence-level ranking, as the caller ranks: members spelling the same unordered sequence pair are
+    // one state; the representative is the member with the highest exact path prior, ties to identity.
+    const auto rank_pool = [&](bool union_only) {
+        std::map<std::pair<SeqId, SeqId>, std::vector<const PoolEntry*>> by_sequence;
+        for (const auto& item : pool) {
+            const PoolEntry& e = item.second;
+            if (union_only && !e.union_member) continue;
+            SeqId x = e.first_seq;
+            SeqId y = e.second_seq;
+            if (y < x) std::swap(x, y);
+            by_sequence[{x, y}].push_back(&e);
+        }
+        PooledRanking out;
+        std::vector<panvar::DiplotypeScore> scores;
+        std::vector<double> priors;
+        for (auto& item : by_sequence) {
+            const std::vector<const PoolEntry*>& members = item.second;
+            std::size_t best = 0;
+            double best_prior = -std::numeric_limits<double>::infinity();
+            for (std::size_t m = 0; m < members.size(); ++m) {
+                const Identity& k = members[m]->key;
+                const double p = path_prior(k.first) + path_prior(k.second) + (k.first != k.second ? std::log(2.0) : 0.0);
+                if (m == 0 || p > best_prior) {
+                    best = m;
+                    best_prior = p;
+                }
+                if (!same_score(members[m]->score, members.front()->score)) ++pool_mismatches;
+            }
+            out.groups.push_back(members);
+            out.representative.push_back(best);
+            scores.push_back(members.front()->score);
+            priors.push_back(members.front()->prior);
+        }
+        out.ranking = panvar::certify_scored_ranking(scores, fragments.size(), scoring.mismatch_band,
+                                                     panvar::FragmentScoringCounters{},
+                                                     panvar::CertificationOptions{}, priors);
+        return out;
+    };
+    const auto genotype_of = [&](const Identity& k) {
+        std::string text;
+        for (std::size_t b = 0; b < blocks; ++b) {
+            if (b != 0) text += ',';
+            const auto pair = std::minmax(k.first[b], k.second[b]);
+            text += std::to_string(pair.first) + "/" + std::to_string(pair.second);
+        }
+        return text;
+    };
+    const auto classify = [&](const PooledRanking& r) -> std::string {
+        if (r.ranking.status == panvar::RescoreStatus::Complete) return "SEPARATED_WINNER";
+        std::set<std::string> genotypes;
+        for (const std::size_t g : r.ranking.winner_set) {
+            genotypes.insert(genotype_of(r.groups[g][r.representative[g]]->key));
+        }
+        return genotypes.size() == 1 ? "TIE_PHASE_EQUIVALENT" : "TIE_DISTINCT";
+    };
+
+    if (multi_start && (hold_cycles != 0 || resuming || !use_delta)) {
+        throw std::runtime_error("--multi-start needs --delta 1 and excludes --hold-cycles and --start");
+    }
     std::size_t hold_remaining = hold_cycles;
     bool holding = false;
-    try {
+    bool transient_opened = false;
+    const auto run_rounds = [&]() -> int {
     for (std::size_t round = first_round; round <= last_round; ++round) {
         Round rec;
         rec.index = round;
@@ -4226,7 +4443,11 @@ int repair_search(const Args& args) {
             // which it IS an incumbent; once a move replaces it nothing deltas from it again, and cycle
             // prevention needs only its allele path, which `visited` holds. Opened after the seed, as
             // it was, both seed censuses stayed live for the whole search -- two of the four at 30x.
-            context->begin_transient_round();
+            if (!transient_opened) {
+                context->begin_transient_round();
+                transient_opened = true;
+            }
+            const std::uint64_t seeding_before = context->cumulative_counters().physical_origins;
             const std::vector<std::size_t> seeded =
                 context->add_haplotypes({incumbent_a.bases, incumbent_b.bases});
             inc_slot_a = seeded.front();
@@ -4235,11 +4456,11 @@ int repair_search(const Args& args) {
             if (inc_slot_b != inc_slot_a) role_of[inc_slot_b] = "seed_hap2";
             context->retain_census(inc_slot_a);
             context->retain_census(inc_slot_b);
-            seeding_origins = context->cumulative_counters().physical_origins;
+            seeding_origins += context->cumulative_counters().physical_origins - seeding_before;
             have_inc_slots = true;
         }
         if (use_delta) rec.transient_before = context->transient_payload_bytes();
-        snapshot(holding ? "hold" : "round", holding ? hold_index : round, "before_candidates", false,
+        snapshot(holding ? "hold" : round_kind.c_str(), holding ? hold_index : round, "before_candidates", false,
                  false);
         const double lookup_before = panvar::emission_cache_lookup_seconds();
 
@@ -4489,7 +4710,7 @@ int repair_search(const Args& args) {
         // The deltas ran while slots were being resolved, which is before `mark`. Leaving them out
         // reported 0.39 s for a run that took 297 s.
         if (use_delta) rec.seconds += round_delta.seconds;
-        snapshot(holding ? "hold" : "round", holding ? hold_index : round, "after_scoring", true, false);
+        snapshot(holding ? "hold" : round_kind.c_str(), holding ? hold_index : round, "after_scoring", true, false);
         rec.rss = peak_rss_gib();
         {
             const panvar::FragmentScoringCounters& work = context ? batch.counters : scored.counters;
@@ -4580,6 +4801,17 @@ int repair_search(const Args& args) {
         // here is what makes a resumed leg byte-identical to never having stopped.
         cur_total = incumbent;
         rec.start_total = incumbent;
+        if (multi_start) {
+            const std::string tag = "seed" + std::to_string(current_seed) + "_visit";
+            for (std::size_t item = 0; item < pair_of_item.size(); ++item) {
+                const std::size_t at = pair_of_item[item];
+                const std::size_t s1 = item == 0 ? cur_s1 : neighbours[item - 1].s1;
+                const std::size_t s2 = item == 0 ? cur_s2 : neighbours[item - 1].s2;
+                pool_add(item == 0 ? cur_first : neighbours[item - 1].first,
+                         item == 0 ? cur_second : neighbours[item - 1].second, sequences[s1], sequences[s2],
+                         scored.scores[at], prior_of_pair[at], tag);
+            }
+        }
 
         // ---- certify the round with production's own certifier, in presentation order
         const auto certify = [&](bool reversed) {
@@ -4701,7 +4933,7 @@ int repair_search(const Args& args) {
             } else {
                 keep = {inc_slot_a, inc_slot_b};
             }
-            snapshot(holding ? "hold" : "round", holding ? hold_index : round, "after_promotion", true,
+            snapshot(holding ? "hold" : round_kind.c_str(), holding ? hold_index : round, "after_promotion", true,
                      false);
             context->release_transient(keep);
             for (auto it = role_of.begin(); it != role_of.end();) {
@@ -4712,7 +4944,7 @@ int repair_search(const Args& args) {
                 }
             }
             rec.transient_after = context->transient_payload_bytes();
-            snapshot(holding ? "hold" : "round", holding ? hold_index : round, "after_release", true,
+            snapshot(holding ? "hold" : round_kind.c_str(), holding ? hold_index : round, "after_release", true,
                      pressure_relief && holding && hold_remaining == 0);
             // Re-read AFTER the promotion above. rec.full_bytes was assigned back in the scoring
             // block, before any winner existed, so the one materialisation a round performs could
@@ -4759,6 +4991,7 @@ int repair_search(const Args& args) {
         if (!holding) {
             rounds.push_back(rec);
             commit();
+            check_seed_caps();
             if (interrupt_after != 0 && rounds.size() >= interrupt_after && rec.moved && round < last_round) {
                 stop_now("TIME_LIMIT",
                          "interrupt-after-rounds " + std::to_string(interrupt_after) +
@@ -4783,6 +5016,250 @@ int repair_search(const Args& args) {
         cur_total = rec.total;
         if (round == last_round) stop_reason = "round_cap";
     }
+    return 0;
+    };
+    std::vector<SeedOutcome> outcomes;
+    std::vector<Seed> seeds;
+    std::string seed_set_text;
+    panvar::FragmentScoringCounters union_context_counters;
+    std::size_t union_haplotypes = 0;
+    double union_max_recorded_difference = 0.0;
+    std::size_t union_recorded_compared = 0;
+    try {
+        if (!multi_start) {
+            const int code = run_rounds();
+            if (code != 0) return code;
+        } else {
+// ---- 1. the union, rescored exactly in this context. Truth is not in scope.
+            const auto new_context = [&]() {
+                context.reset();
+                context = std::make_unique<panvar::PreparedScoringContext>(fragments, library, scoring);
+                if (use_origin_cache) {
+                    context->enable_origin_cache_path(true);
+                    context->set_origin_cache_limits(origin_cache_bytes, origin_cache_records);
+                }
+                transient_opened = false;
+                seeding_origins = 0;   // seeding work is counted within one context
+            };
+            std::vector<std::size_t> input_order(union_ids.size());
+            std::iota(input_order.begin(), input_order.end(), std::size_t{0});
+            if (shuffle_union != 0) {
+                std::mt19937_64 rng(shuffle_union);
+                std::shuffle(input_order.begin(), input_order.end(), rng);
+            }
+            std::map<std::vector<std::size_t>, std::size_t> spelled_index;
+            std::vector<std::string> spelled;
+            const auto spell_of = [&](const std::vector<std::size_t>& path) {
+                const auto found = spelled_index.find(path);
+                if (found != spelled_index.end()) return found->second;
+                spelled.push_back(panvar::spell_mosaic(model, panvar::MosaicPath{path}).bases);
+                spelled_index.emplace(path, spelled.size() - 1);
+                return spelled.size() - 1;
+            };
+            for (const std::size_t i : input_order) {
+                const Original& o = original_of_id.at(union_ids[i]);
+                spell_of(o.first);
+                spell_of(o.second);
+            }
+            union_haplotypes = spelled.size();
+            if (!transient_opened) {
+                context->begin_transient_round();
+                transient_opened = true;
+            }
+            const std::uint64_t union_before = context->cumulative_counters().physical_origins;
+            const std::vector<std::size_t> slot_of_spelled = context->add_haplotypes(spelled);
+            std::map<std::size_t, std::size_t> spelled_of_slot;
+            for (std::size_t i = 0; i < slot_of_spelled.size(); ++i) spelled_of_slot.emplace(slot_of_spelled[i], i);
+            std::map<std::pair<std::size_t, std::size_t>, std::size_t> union_pair_index;
+            std::vector<panvar::HaplotypeCandidate> union_pairs;
+            for (const std::size_t i : input_order) {
+                const Original& o = original_of_id.at(union_ids[i]);
+                std::size_t x = slot_of_spelled[spell_of(o.first)];
+                std::size_t y = slot_of_spelled[spell_of(o.second)];
+                if (y < x) std::swap(x, y);
+                if (union_pair_index.emplace(std::make_pair(x, y), union_pairs.size()).second) union_pairs.push_back({x, y});
+            }
+            const panvar::FragmentScoringResult union_scored = context->score_candidates(union_pairs);
+            seeding_origins += context->cumulative_counters().physical_origins - union_before;
+            for (const std::size_t i : input_order) {
+                const Original& o = original_of_id.at(union_ids[i]);
+                std::size_t x = slot_of_spelled[spell_of(o.first)];
+                std::size_t y = slot_of_spelled[spell_of(o.second)];
+                if (y < x) std::swap(x, y);
+                const std::size_t at = union_pair_index.at({x, y});
+                const std::string& sx = spelled[spelled_of_slot.at(x)];
+                const std::string& sy = spelled[spelled_of_slot.at(y)];
+                const double prior = panvar::log_unordered_sequence_pair_prior(model, sx, sy, switches);
+                PoolEntry& e = pool_add(o.first, o.second, spelled[spell_of(o.first)], spelled[spell_of(o.second)],
+                                        union_scored.scores[at], prior, "union_" + o.source);
+                e.union_member = true;
+                e.union_id = union_ids[i];
+                e.union_source = o.source;
+                e.union_order = i;
+            }
+            // The recorded call's own scores, at their printed precision, against the exact rescoring.
+            for (const auto& row : read_table(run + ".mosaic_scores.tsv")) {
+                const auto found = original_of_id.find(row.at("representative_beam_candidate"));
+                if (found == original_of_id.end()) continue;
+                const auto entry = pool.find(key_of(found->second.first, found->second.second));
+                if (entry == pool.end()) continue;
+                const double mine = entry->second.score.log_likelihood + entry->second.prior;
+                union_max_recorded_difference =
+                    std::max(union_max_recorded_difference, std::fabs(mine - std::stod(row.at("score"))));
+                ++union_recorded_compared;
+            }
+
+            // ---- 2. the seed set, from the exact union ranking alone
+            union_context_counters = context->cumulative_counters();
+            const PooledRanking initial = rank_pool(true);
+            std::vector<std::size_t> position(initial.groups.size(), 0);
+            for (std::size_t p = 0; p < initial.ranking.candidates.size(); ++p) {
+                position[initial.ranking.candidates[p].candidate_id] = p;
+            }
+            const auto group_has = [&](std::size_t g, const std::string& source) {
+                for (const PoolEntry* e : initial.groups[g]) {
+                    if (e->union_source == source) return true;
+                }
+                return false;
+            };
+            const auto tied = [&](const panvar::CertifiedCandidate& a, const panvar::CertifiedCandidate& b) {
+                return std::fabs(a.score - b.score) <= a.numeric_error_bound + b.numeric_error_bound;
+            };
+            std::map<std::size_t, std::set<std::string>> chosen;   // group -> why
+            for (const std::size_t g : initial.ranking.winner_set) chosen[g].insert("top_set");
+            for (const std::string source : {"panel", "mosaic"}) {
+                const panvar::CertifiedCandidate* best = nullptr;
+                for (const panvar::CertifiedCandidate& c : initial.ranking.candidates) {
+                    if (group_has(c.candidate_id, source)) {
+                        best = &c;
+                        break;
+                    }
+                }
+                if (best == nullptr) continue;
+                for (const panvar::CertifiedCandidate& c : initial.ranking.candidates) {
+                    if (tied(c, *best)) chosen[c.candidate_id].insert("best_" + source);
+                }
+            }
+            std::set<std::string> explicit_ids;
+            {
+                std::stringstream list(explicit_seeds);
+                for (std::string id; std::getline(list, id, ',');) {
+                    if (!id.empty()) explicit_ids.insert(id);
+                }
+            }
+            std::vector<Seed> gathered;
+            std::set<Identity> seen_seed;
+            const auto take = [&](std::size_t g, const PoolEntry* e, const std::set<std::string>& why) {
+                if (!seen_seed.insert(e->key).second) return;
+                Seed seed;
+                seed.key = e->key;
+                seed.candidate_id = e->union_id;
+                seed.union_order = e->union_order;
+                seed.union_source = e->union_source;
+                seed.group_rank = position[g] + 1;
+                const bool panel = group_has(g, "panel");
+                const bool mosaic = group_has(g, "mosaic");
+                seed.group_sources = panel && mosaic ? "both" : panel ? "panel" : "mosaic";
+                seed.selected_as = why;
+                seed.certified = initial.ranking.candidates[position[g]];
+                gathered.push_back(seed);
+            };
+            if (!explicit_ids.empty()) {
+                for (std::size_t g = 0; g < initial.groups.size(); ++g) {
+                    for (const PoolEntry* e : initial.groups[g]) {
+                        if (explicit_ids.count(e->union_id) != 0) take(g, e, {"explicit"});
+                    }
+                }
+            } else {
+                for (const auto& item : chosen) {
+                    for (const PoolEntry* e : initial.groups[item.first]) take(item.first, e, item.second);
+                }
+            }
+            // Canonical order: the exact ranking's total order, then the call's own candidate order.
+            std::sort(gathered.begin(), gathered.end(), [](const Seed& x, const Seed& y) {
+                return std::tie(x.group_rank, x.union_order) < std::tie(y.group_rank, y.union_order);
+            });
+            for (std::size_t i = 0; i < gathered.size(); ++i) gathered[i].index = i;
+            seeds = gathered;
+            {
+                std::ostringstream text;
+                text << std::setprecision(17)
+                     << "seed\tcandidate_id\tunion_order\tunion_source\tselected_as\tgroup_rank\tgroup_sources\t"
+                        "score\tfragment_term\texposure_term\tprior\tnumeric_error_bound\tunordered_genotype\t"
+                        "hap1_alleles\thap2_alleles\n";
+                for (const Seed& seed : seeds) {
+                    std::string why;
+                    for (const std::string& w : seed.selected_as) why += (why.empty() ? "" : ",") + w;
+                    text << seed.index << '\t' << seed.candidate_id << '\t' << seed.union_order << '\t'
+                         << seed.union_source << '\t' << why << '\t' << seed.group_rank << '\t' << seed.group_sources
+                         << '\t' << seed.certified.score << '\t' << seed.certified.fragment_term << '\t'
+                         << seed.certified.exposure_term << '\t' << seed.certified.prior << '\t'
+                         << seed.certified.numeric_error_bound << '\t' << genotype_of(seed.key) << '\t'
+                         << join(seed.key.first) << '\t' << join(seed.key.second) << '\n';
+                }
+                seed_set_text = text.str();
+                // Partial until the search completes: a refused run leaves no final-named table.
+                atomic_write(out + ".seed_set.partial.tsv", seed_set_text);
+            }
+            if (seeds.size() > max_repair_starts) {
+                std::cout << "repair-search " << donor << ": REFUSED before repair, " << seeds.size()
+                          << " seeds exceed max_repair_starts " << max_repair_starts << " (never truncated)\n";
+                finish("RESOURCE_REFUSAL", std::to_string(seeds.size()) + " repair seeds exceed max_repair_starts " +
+                                               std::to_string(max_repair_starts) + "; the set is not truncated");
+                return 5;
+            }
+            if (!seeds_only) {
+                // The union was scored in a context of its own. Its 250-odd full haplotypes leave slots,
+                // a full emission cache and allocator residue that no seed needs, so the seeds get a
+                // fresh shared context (or one each, isolated). Contexts never change a score.
+                if (!isolate_seeds) new_context();
+                // ---- 3. one independent search per seed, in canonical (or reversed) order
+                std::vector<std::size_t> order(seeds.size());
+                std::iota(order.begin(), order.end(), std::size_t{0});
+                if (reverse_seeds) std::reverse(order.begin(), order.end());
+                outcomes.resize(seeds.size());
+                for (const std::size_t k : order) {
+                    const Seed& seed = seeds[k];
+                    if (isolate_seeds) new_context();
+                    current_seed = k;
+                    seed_start = context->cumulative_counters();
+                    rounds_prefix = out + ".seed" + std::to_string(k);
+                    round_kind = "seed" + std::to_string(k);
+                    cur_first = seed.key.first;
+                    cur_second = seed.key.second;
+                    cur_total = seed.certified.score;
+                    visited.clear();
+                    visited.insert(key_of(cur_first, cur_second));
+                    rounds.clear();
+                    stop_reason = "round_cap";
+                    have_inc_slots = false;
+                    role_of.clear();
+                    const auto seed_mark = std::chrono::steady_clock::now();
+                    const int code = run_rounds();
+                    if (code != 0) return code;
+                    check_seed_caps();
+                    SeedOutcome& o = outcomes[k];
+                    o.seed = k;
+                    o.rounds = rounds;
+                    o.stop = stop_reason;
+                    o.optimum = key_of(cur_first, cur_second);
+                    o.optimum_total = cur_total;
+                    o.incumbents.push_back(seed.key);
+                    for (const Round& r : rounds) {
+                        if (r.moved) o.incumbents.push_back(key_of(r.first, r.second));
+                    }
+                    const panvar::FragmentScoringCounters& c = context->cumulative_counters();
+                    o.used.physical_origins = c.physical_origins - seed_start.physical_origins;
+                    o.used.statistical_state_classes = c.statistical_state_classes - seed_start.statistical_state_classes;
+                    o.used.piece_hits = c.piece_hits - seed_start.piece_hits;
+                    o.used.latent_alignment_pairs = c.latent_alignment_pairs - seed_start.latent_alignment_pairs;
+                    o.seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - seed_mark).count();
+                    pool.at(o.optimum).tags.insert("seed" + std::to_string(k) + "_optimum");
+                    earlier_seed_rounds.insert(earlier_seed_rounds.end(), rounds.begin(), rounds.end());
+                    if (!isolate_seeds) context->release_transient({});
+                }
+            }
+        }
     } catch (const panvar::ResourceExhausted& refusal) {
         finish("RESOURCE_REFUSAL", refusal.what());
         std::cout << "repair-search " << donor << ": RESOURCE_REFUSAL after " << rounds.size()
@@ -4791,6 +5268,182 @@ int repair_search(const Args& args) {
     } catch (const std::exception& failure) {
         finish("FAILED", failure.what());
         throw;
+    }
+
+    if (multi_start) {
+        // ---- the multi-start report. Truth enters only here, after every search has finished.
+        const PooledRanking initial = rank_pool(true);
+        const PooledRanking final_ranking = rank_pool(false);
+        const std::string initial_class = classify(initial);
+        const std::string final_class = classify(final_ranking);
+        const auto distance_of = [&](const Identity& k) -> long {
+            if (truth_gfa.empty()) return -1;
+            ensure_truth();
+            long total = 0;
+            for (std::size_t b = 0; b < blocks; ++b) {
+                if (!truth[0].blocks[b].has_value() || !truth[1].blocks[b].has_value()) continue;
+                const std::string& t1 = *truth[0].blocks[b];
+                const std::string& t2 = *truth[1].blocks[b];
+                const std::string& a1 = model.blocks()[b].alleles[k.first[b]].sequence;
+                const std::string& a2 = model.blocks()[b].alleles[k.second[b]].sequence;
+                total += std::min(edit_distance(t1, a1) + edit_distance(t2, a2),
+                                  edit_distance(t1, a2) + edit_distance(t2, a1));
+            }
+            return total;
+        };
+        bool round_cap = false;
+        for (const SeedOutcome& o : outcomes) round_cap = round_cap || o.stop == "round_cap";
+        const std::string call_status =
+            seeds_only ? "NOT_SEARCHED"
+            : round_cap ? "NO_CALL_ROUND_CAP"
+            : final_class == "SEPARATED_WINNER" ? "CALL_ELIGIBLE"
+            : final_class == "TIE_PHASE_EQUIVALENT" ? "NO_CALL_TIE_PHASE_EQUIVALENT"
+                                                    : "NO_CALL_TIE_DISTINCT";
+        std::set<Identity> optima;
+        for (const SeedOutcome& o : outcomes) optima.insert(o.optimum);
+        std::ostringstream merges;
+        for (std::size_t i = 0; i < outcomes.size(); ++i) {
+            for (std::size_t j = i + 1; j < outcomes.size(); ++j) {
+                std::size_t shared = 0;
+                for (const Identity& a : outcomes[i].incumbents) {
+                    shared += std::count(outcomes[j].incumbents.begin(), outcomes[j].incumbents.end(), a);
+                }
+                if (shared == 0) continue;
+                merges << (merges.tellp() > 0 ? ";" : "") << i << "-" << j << ":" << shared
+                       << (outcomes[i].optimum == outcomes[j].optimum ? "(same optimum)" : "");
+            }
+        }
+        const auto render_ranking = [&](const PooledRanking& r, std::size_t limit) {
+            std::ostringstream t;
+            t << std::setprecision(17)
+              << "rank\tgroup\tscore\tfragment_term\texposure_term\tprior\tnumeric_error_bound\tin_winner_set\t"
+                 "members\tunion_members\ttags\trep_hap1\trep_hap2\tunordered_genotype\tdistance\n";
+            const std::set<std::size_t> winners(r.ranking.winner_set.begin(), r.ranking.winner_set.end());
+            for (std::size_t p = 0; p < r.ranking.candidates.size(); ++p) {
+                const panvar::CertifiedCandidate& c = r.ranking.candidates[p];
+                if (p >= limit && winners.count(c.candidate_id) == 0) continue;
+                const std::vector<const PoolEntry*>& members = r.groups[c.candidate_id];
+                const Identity& rep = members[r.representative[c.candidate_id]]->key;
+                std::set<std::string> tags;
+                std::size_t union_members = 0;
+                for (const PoolEntry* e : members) {
+                    tags.insert(e->tags.begin(), e->tags.end());
+                    union_members += e->union_member ? 1 : 0;
+                }
+                std::string joined;
+                for (const std::string& tag : tags) joined += (joined.empty() ? "" : ",") + tag;
+                t << (p + 1) << '\t' << c.candidate_id << '\t' << c.score << '\t' << c.fragment_term << '\t'
+                  << c.exposure_term << '\t' << c.prior << '\t' << c.numeric_error_bound << '\t'
+                  << (winners.count(c.candidate_id) ? "true" : "false") << '\t' << members.size() << '\t'
+                  << union_members << '\t' << joined << '\t' << join(rep.first) << '\t' << join(rep.second) << '\t'
+                  << genotype_of(rep) << '\t' << distance_of(rep) << '\n';
+            }
+            return t.str();
+        };
+        const auto winners_text = [&](const PooledRanking& r) {
+            std::string text;
+            for (const std::size_t g : r.ranking.winner_set) {
+                const Identity& rep = r.groups[g][r.representative[g]]->key;
+                text += (text.empty() ? "" : ";") + join(rep.first) + "|" + join(rep.second);
+            }
+            return text;
+        };
+        std::ostringstream seed_table;
+        seed_table << std::setprecision(17)
+                   << "seed\tcandidate_id\tselected_as\tgroup_rank\tgroup_sources\tunion_source\tstart_score\t"
+                      "unordered_genotype\thap1_alleles\thap2_alleles\trounds\tmoves\tstop_reason\toptimum_total\t"
+                      "optimum_hap1\toptimum_hap2\toptimum_genotype\tstart_distance\toptimum_distance\tfloor\t"
+                      "optimum_excess\tseconds\torigins_used\tclasses_used\tpiece_hits_used\tlatent_pairs_used\n";
+        for (const SeedOutcome& o : outcomes) {
+            const Seed& seed = seeds[o.seed];
+            std::string why;
+            for (const std::string& w : seed.selected_as) why += (why.empty() ? "" : ",") + w;
+            const long d_start = distance_of(seed.key);
+            const long d_opt = distance_of(o.optimum);
+            seed_table << seed.index << '\t' << seed.candidate_id << '\t' << why << '\t' << seed.group_rank << '\t'
+                       << seed.group_sources << '\t' << seed.union_source << '\t' << seed.certified.score << '\t'
+                       << genotype_of(seed.key) << '\t' << join(seed.key.first) << '\t' << join(seed.key.second)
+                       << '\t' << o.rounds.size() << '\t' << (o.incumbents.size() - 1) << '\t' << o.stop << '\t'
+                       << o.optimum_total << '\t' << join(o.optimum.first) << '\t' << join(o.optimum.second) << '\t'
+                       << genotype_of(o.optimum) << '\t' << d_start << '\t' << d_opt << '\t'
+                       << (truth_gfa.empty() ? -1 : floor_total) << '\t'
+                       << (truth_gfa.empty() ? -1 : d_opt - floor_total) << '\t' << o.seconds << '\t'
+                       << o.used.physical_origins << '\t' << o.used.statistical_state_classes << '\t'
+                       << o.used.piece_hits << '\t' << o.used.latent_alignment_pairs << '\n';
+        }
+        std::ostringstream report;
+        report << std::setprecision(17) << "multi_start\ttrue\nseeds\t" << seeds.size() << "\nmax_repair_starts\t"
+               << max_repair_starts << "\nseed_order\t" << (reverse_seeds ? "reversed" : "canonical")
+               << "\nseed_contexts\t" << (isolate_seeds ? "isolated" : "shared") << "\nunion_candidates\t"
+               << union_ids.size() << "\nunion_haplotypes\t" << union_haplotypes << "\nunion_recorded_compared\t"
+               << union_recorded_compared << "\nunion_max_recorded_difference\t" << union_max_recorded_difference
+               << "\npool_identities\t" << pool.size() << "\npool_score_mismatches\t" << pool_mismatches
+               << "\ninitial_sequence_candidates\t" << initial.groups.size() << "\ninitial_class\t" << initial_class
+               << "\ninitial_winner_set\t" << initial.ranking.winner_set.size() << "\ninitial_certified_gap\t"
+               << initial.ranking.certified_gap << "\ninitial_winners\t" << winners_text(initial)
+               << "\nfinal_sequence_candidates\t" << final_ranking.groups.size() << "\nfinal_class\t" << final_class
+               << "\nfinal_winner_set\t" << final_ranking.ranking.winner_set.size() << "\nfinal_certified_gap\t"
+               << final_ranking.ranking.certified_gap << "\nfinal_best_score\t"
+               << (final_ranking.ranking.candidates.empty() ? 0.0 : final_ranking.ranking.candidates.front().score)
+               << "\nfinal_winners\t" << winners_text(final_ranking) << "\ncall_status\t" << call_status
+               << "\ndistinct_optima\t" << optima.size() << "\ntrajectory_merges\t"
+               << (merges.tellp() > 0 ? merges.str() : std::string("none")) << '\n';
+        if (!truth_gfa.empty() && !final_ranking.ranking.winner_set.empty()) {
+            long best = std::numeric_limits<long>::max();
+            long worst = 0;
+            for (const std::size_t g : final_ranking.ranking.winner_set) {
+                const long d = distance_of(final_ranking.groups[g][final_ranking.representative[g]]->key);
+                best = std::min(best, d);
+                worst = std::max(worst, d);
+            }
+            report << "final_winner_distance_min\t" << best << "\nfinal_winner_distance_max\t" << worst
+                   << "\navailability_floor_total\t" << floor_total << "\nfinal_winner_excess_min\t"
+                   << (best - floor_total) << '\n';
+        }
+        const panvar::FragmentScoringCounters& cumulative = context->cumulative_counters();
+        report << "union_context_physical_origins\t" << union_context_counters.physical_origins
+               << "\nunion_context_state_classes\t" << union_context_counters.statistical_state_classes << '\n';
+        report << "cumulative_physical_origins\t" << cumulative.physical_origins << "\ncumulative_state_classes\t"
+               << cumulative.statistical_state_classes << "\ncumulative_piece_hits\t" << cumulative.piece_hits
+               << "\ncumulative_latent_pairs\t" << cumulative.latent_alignment_pairs << "\nprocess_margin_origins\t"
+               << margin(scoring.max_physical_origins, cumulative.physical_origins) << "\nprocess_margin_classes\t"
+               << margin(scoring.max_state_classes, cumulative.statistical_state_classes)
+               << "\nthreads_requested\t" << scoring.threads << "\npeak_active_workers\t"
+               << panvar::peak_active_workers() << "\nphys_footprint_peak_bytes\t" << physical_footprint().peak << '\n';
+        std::vector<panvar::OriginDemandRow> demand_rows;
+        if (context && use_origin_cache) demand_rows = context->origin_demand();
+        {
+            std::lock_guard<std::mutex> lock(commit_mutex);
+            if (finished) return 6;
+            finished = true;
+            for (const SeedOutcome& o : outcomes) {
+                rounds = o.rounds;
+                atomic_write(out + ".seed" + std::to_string(o.seed) + ".rounds.tsv", render_rounds());
+                std::error_code ignored;
+                std::filesystem::remove(out + ".seed" + std::to_string(o.seed) + ".rounds.partial.tsv", ignored);
+            }
+            atomic_write(out + ".seeds.tsv", seed_table.str());
+            atomic_write(out + ".seed_set.tsv", seed_set_text);
+            {
+                std::error_code ignored;
+                std::filesystem::remove(out + ".seed_set.partial.tsv", ignored);
+            }
+            atomic_write(out + ".initial_ranking.tsv", render_ranking(initial, 50));
+            atomic_write(out + ".final_ranking.tsv", render_ranking(final_ranking, 50));
+            if (memory_on) atomic_write(out + ".memory.tsv", memory_text);
+            if (!demand_rows.empty()) atomic_write(out + ".origin_demand.tsv", render_demand(demand_rows));
+            atomic_write(out + ".summary.tsv", summary.str() + report.str());
+            for (const char* partial : {"rounds", "memory", "origin_demand", "distance", "round_truth"}) {
+                std::error_code ignored;
+                std::filesystem::remove(out + "." + partial + ".partial.tsv", ignored);
+            }
+            status_extra = report.str();
+            write_status("COMPLETE", seeds_only ? "seed set only" : call_status);
+        }
+        std::cout << "repair-search " << donor << ": multi-start, " << seeds.size() << " seeds, "
+                  << optima.size() << " distinct optima, initial " << initial_class << " -> final " << final_class
+                  << ", " << call_status << '\n';
+        return 0;
     }
 
     bool order_all = true;
