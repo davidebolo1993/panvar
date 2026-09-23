@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <limits>
 #include <map>
+#include <memory>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -798,5 +799,94 @@ CertifiedRanking certify_diplotype_ranking(
     const FragmentScoringOptions& options,
     const CertificationOptions& certification,
     const std::vector<double>& exact_prior = {});
+
+
+// ---------------------------------------------------------------------------------------------
+// Persistent scoring context: exact incremental haplotype scoring.
+// ---------------------------------------------------------------------------------------------
+//
+// score_diplotypes prepares everything, scores everything, and throws it all away. A repair search
+// calls it once per round over a candidate set that is almost entirely the previous round's, so it
+// re-derives the same read forms, the same piece indexes and the same haplotype columns every time.
+// This context owns that work for its whole lifetime instead, and scores only what is new.
+//
+// It is EXACT, not an approximation of the one-shot path: a haplotype's mass column and exposure
+// depend on that haplotype, the fragments and the library alone -- never on which other haplotypes
+// are present -- so a column computed in batch one is the column batch seven would have computed.
+// The gates require the same haplotypes supplied in 1, 2, 3 and 7 batches to agree cell for cell.
+//
+// What it owns, for its whole lifetime, and why each has to be owned rather than borrowed:
+//
+//   read forms and piece indexes   rebuilt per call otherwise, and the emission cache's keys point
+//                                  into the form bytes.
+//   insert supports, backgrounds   per fragment, fixed for the search.
+//   haplotype sequences, forward   in std::deque, whose element addresses never move. The cache key
+//   and reversed                   holds raw pointers into these; a std::vector would relocate them
+//                                  on growth, and only the accident that a 226kb string is not
+//                                  short-string-optimised keeps that from being a dangling read
+//                                  today. Requirement: do not retain pointers into relocatable
+//                                  vectors.
+//   emission cache storage         armed once for the context, never between batches, which is the
+//                                  only reason a key may outlive the batch that created it.
+//   mass columns and exposures     retained so combination can be rerun cheaply, and so a later
+//                                  batch reuses them exactly rather than recomputing them.
+//   cumulative counters, refusal   caps bound the WHOLE search, not each round separately.
+//
+// A refusal invalidates the context permanently: every later call throws, and no partial ranking is
+// ever produced. That is the same contract score_diplotypes has within one call, extended to the
+// search, because a search that continued past a cap would rank whatever it had managed to score.
+
+// What one incremental batch actually did. Per batch, and cumulative, because the caps are
+// cumulative and a per-batch figure alone cannot be checked against them.
+struct IncrementalBatchReport {
+    std::size_t haplotypes_offered = 0;
+    std::size_t haplotypes_new = 0;        // sequences not already held, so actually placed
+    std::size_t haplotypes_reused = 0;     // already had a column, reused exactly
+    std::size_t unique_haplotypes_total = 0;
+    // This batch alone: what placing the new haplotypes cost.
+    FragmentScoringCounters counters;
+    EmissionCacheCounters emission_cache;
+    double seconds_placement_and_mass = 0.0;
+    std::size_t threads_used_placement = 1;
+    ScorerMemoryAccounts memory;
+    // The whole context so far, which is what the caps are held against.
+    FragmentScoringCounters cumulative_counters;
+    EmissionCacheCounters cumulative_emission_cache;
+    double cumulative_seconds_placement_and_mass = 0.0;
+};
+
+class PreparedScoringContext {
+public:
+    // Fragments, library and options are fixed for the context's life: they define the model, and a
+    // context whose model changed between batches would retain columns computed under the old one.
+    PreparedScoringContext(std::vector<ReadPair> fragments,
+                           LibraryModel library,
+                           FragmentScoringOptions options);
+    ~PreparedScoringContext();
+    PreparedScoringContext(const PreparedScoringContext&) = delete;
+    PreparedScoringContext& operator=(const PreparedScoringContext&) = delete;
+
+    // Places and scores only the sequences not already held; returns one haplotype index per offered
+    // sequence, in the order offered. Duplicate bytes within the batch resolve to one column, exactly
+    // as intern_haplotypes collapses them in the one-shot path.
+    std::vector<std::size_t> add_haplotypes(const std::vector<std::string>& sequences,
+                                            IncrementalBatchReport* report = nullptr);
+
+    // Combination from the retained columns. No placement happens here, so this is cheap and may be
+    // rerun over any candidate set the context already holds haplotypes for.
+    FragmentScoringResult score_candidates(const std::vector<HaplotypeCandidate>& candidates) const;
+
+    std::size_t unique_haplotypes() const;
+    double mass_of(std::size_t fragment, std::size_t haplotype) const;
+    double exposure_of(std::size_t haplotype) const;
+    const FragmentScoringCounters& cumulative_counters() const;
+    const EmissionCacheCounters& cumulative_emission_cache() const;
+    // True once a cap has been crossed. The context is then permanently unusable.
+    bool refused() const;
+
+private:
+    struct State;
+    std::unique_ptr<State> state_;
+};
 
 } // namespace panvar

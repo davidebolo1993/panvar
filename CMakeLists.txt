@@ -266,6 +266,13 @@ if(PANVAR_BUILD_TESTING)
         target_compile_options(genotype_fragment_scorer_test PRIVATE -Wall -Wextra -Wpedantic)
         add_test(NAME panvar_genotype_fragment_scorer COMMAND genotype_fragment_scorer_test)
 
+        # The persistent scoring context: exact incremental haplotype scoring. Certified against the
+        # one-shot scorer, which is the oracle here -- batching may not change a single mass cell.
+        add_executable(genotype_scoring_context_test tests/genotype_scoring_context.cpp)
+        target_link_libraries(genotype_scoring_context_test PRIVATE panvarlib)
+        target_compile_options(genotype_scoring_context_test PRIVATE -Wall -Wextra -Wpedantic)
+        add_test(NAME panvar_genotype_scoring_context COMMAND genotype_scoring_context_test)
+
         add_executable(genotype_mosaic_proposal_test tests/genotype_mosaic_proposal.cpp)
         target_link_libraries(genotype_mosaic_proposal_test PRIVATE panvarlib)
         target_compile_options(genotype_mosaic_proposal_test PRIVATE -Wall -Wextra -Wpedantic)
@@ -284,7 +291,7 @@ if(PANVAR_BUILD_TESTING)
         add_test(NAME panvar_genotype_source_tree_clean
                  COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/genotype_source_tree_clean.sh)
         set_tests_properties(panvar_genotype_source_tree_clean PROPERTIES DEPENDS
-            "panvar_genotype_mosaic_core;panvar_genotype_locus_adapter;panvar_genotype_command_e2e;panvar_genotype_fragment_oracle;panvar_genotype_fragment_scorer;panvar_genotype_mosaic_proposal")
+            "panvar_genotype_mosaic_core;panvar_genotype_locus_adapter;panvar_genotype_command_e2e;panvar_genotype_fragment_oracle;panvar_genotype_fragment_scorer;panvar_genotype_scoring_context;panvar_genotype_mosaic_proposal")
         # The mosaic experiment's input binding: a changed read file, library or simulation parameter must
         # be detected, and a missing signature must refuse. Runs on stub files in seconds; it does NOT run
         # the five-plan C4 experiment, which needs the real graph and takes minutes.

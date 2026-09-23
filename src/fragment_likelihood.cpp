@@ -4,7 +4,10 @@
 #include <atomic>
 #include <chrono>
 #include <exception>
+#include <functional>
 #include <map>
+#include <memory>
+#include <deque>
 #include <thread>
 #include <set>
 #include <tuple>
@@ -932,7 +935,22 @@ void set_emission_cache_hash_collapse(bool collapse) {
     cache_hash_collapse().store(collapse, std::memory_order_relaxed);
 }
 
+namespace scoring_detail {
+// A persistent context arms the cache for its whole life. While it does, begin_emission_cache must
+// refuse rather than clear the table out from under it: the context's keys point into ITS buffers,
+// and a one-shot pass that wiped them would silently recompute everything while reporting hits.
+std::atomic<bool>& emission_cache_pinned() {
+    static std::atomic<bool> pinned{false};
+    return pinned;
+}
+}  // namespace scoring_detail
+
 void begin_emission_cache(std::size_t budget_bytes) {
+    if (scoring_detail::emission_cache_pinned().load(std::memory_order_relaxed)) {
+        throw std::runtime_error(
+            "the emission cache is held by a live PreparedScoringContext; destroy it before starting "
+            "a one-shot scoring pass");
+    }
     EmissionCache& cache = emission_cache();
     cache.active.store(false, std::memory_order_relaxed);
     // Discard whatever this thread accumulated BEFORE the cache was armed, so that "what the cache
@@ -1496,7 +1514,9 @@ double log_placement_mass(
 // Accelerated scorer.
 // -------------------------------------------------------------------------------------------
 
-namespace {
+// Named rather than anonymous: PreparedScoringContext::State holds these, and a class with external
+// linkage may not have members whose types come from the anonymous namespace.
+namespace scoring_detail {
 
 constexpr std::uint64_t kNoCode = std::numeric_limits<std::uint64_t>::max();
 
@@ -1564,8 +1584,12 @@ struct StateKey {
     }
 };
 
+// Templated on the form container so the one-shot path, the census and the persistent context can
+// each hold forms in whatever container their lifetime requires -- a vector where the set is built
+// once and discarded, a deque where the emission cache keeps pointers into the bytes.
+template <typename Forms>
 std::vector<PieceIndex> build_piece_indexes(
-    const std::vector<ReadForm>& forms,
+    const Forms& forms,
     std::size_t band,
     std::size_t minimum_piece_bp) {
     // Reads of different lengths yield pieces of different lengths, and one rolling scan can only
@@ -1639,9 +1663,10 @@ class PlacementCancelled : public std::exception {};
 // Scan one haplotype once per piece-length bucket, turning every piece hit into an implied read
 // start. This is the inversion the design calls for: the haplotype is walked, not queried once per
 // read against a position hash the size of the locus.
+template <typename Forms>
 void collect_form_placements(
     const std::string& haplotype,
-    const std::vector<ReadForm>& forms,
+    const Forms& forms,
     // Parallel to `forms`: whether this form's consumed-span classes must be carried separately.
     // False only when the fragment's insert support makes the geometry's floor unreachable, where
     // emitting the whole emission once per anchor is exactly equal and far cheaper.
@@ -1826,7 +1851,9 @@ void collect_form_placements(
     }
 }
 
-} // namespace
+} // namespace scoring_detail
+
+using namespace scoring_detail;
 
 PieceHitCensus census_piece_hits(
     const InternedHaplotypes& haplotypes,
@@ -1958,6 +1985,425 @@ InternedHaplotypes intern_haplotypes(
     return result;
 }
 
+namespace scoring_detail {
+
+// ---- fragment preparation, owned once ----------------------------------------------------------
+//
+// Phase one of the one-shot scorer, lifted out whole so the persistent context prepares fragments by
+// the same definition rather than a parallel copy of it. Nothing here depends on a haplotype, which
+// is exactly why it can be hoisted out of a per-round call.
+struct PreparedFragmentSet {
+    std::deque<ReadForm> forward_forms;
+    std::deque<ReadForm> reverse_forms;
+    std::vector<char> forward_componentise;
+    std::vector<char> reverse_componentise;
+    std::vector<PieceIndex> forward_indexes;
+    std::vector<PieceIndex> reverse_indexes;
+    std::vector<InsertSupport> support_by_fragment;
+    std::vector<double> background_by_fragment;
+    std::vector<char> floor_binds;
+    std::map<std::size_t, std::size_t> fragments_by_floor;
+    std::uint64_t fragments_with_floor_binding = 0;
+};
+
+PreparedFragmentSet prepare_fragment_set(
+    const std::vector<ReadPair>& fragments,
+    const LibraryModel& library,
+    const FragmentScoringOptions& options) {
+    PreparedFragmentSet out;
+    const std::size_t band = options.mismatch_band;
+    out.support_by_fragment.reserve(fragments.size());
+    out.background_by_fragment.reserve(fragments.size());
+    out.floor_binds.reserve(fragments.size());
+    for (std::size_t f = 0; f < fragments.size(); ++f) {
+        validate_read_pair(fragments[f]);
+        const auto add_form = [](std::deque<ReadForm>& into, std::size_t fragment, std::string bases,
+                                 bool first_arm) {
+            ReadForm form;
+            form.fragment = fragment;
+            form.bases = std::move(bases);
+            form.is_forward_mate_of_first_arm = first_arm;
+            form.pattern = prepare_myers_pattern(form.bases);
+            into.push_back(std::move(form));
+        };
+        add_form(out.forward_forms, f, fragments[f].first.bases, true);
+        add_form(out.reverse_forms, f, complement_read(fragments[f].second.bases), false);
+        add_form(out.forward_forms, f, fragments[f].second.bases, false);
+        add_form(out.reverse_forms, f, complement_read(fragments[f].first.bases), true);
+        out.support_by_fragment.push_back(fragment_insert_support(fragments[f], library));
+        {
+            const std::size_t widest_span =
+                std::max(fragments[f].first.bases.size(), fragments[f].second.bases.size()) +
+                library.max_gap_bp;
+            const bool binds = out.support_by_fragment.back().empty() ||
+                               out.support_by_fragment.back().min_bp < widest_span;
+            out.floor_binds.push_back(binds ? 1 : 0);
+            if (binds) ++out.fragments_with_floor_binding;
+        }
+        out.background_by_fragment.push_back(log_background_probability(fragments[f]));
+        ++out.fragments_by_floor[std::max(fragments[f].first.bases.size(),
+                                          fragments[f].second.bases.size())];
+    }
+    out.forward_componentise.assign(out.forward_forms.size(), 0);
+    out.reverse_componentise.assign(out.reverse_forms.size(), 0);
+    for (std::size_t i = 0; i < out.forward_forms.size(); ++i) {
+        out.forward_componentise[i] = out.floor_binds[out.forward_forms[i].fragment];
+    }
+    for (std::size_t i = 0; i < out.reverse_forms.size(); ++i) {
+        out.reverse_componentise[i] = out.floor_binds[out.reverse_forms[i].fragment];
+    }
+    out.forward_indexes = out.forward_forms.empty()
+        ? std::vector<PieceIndex>{}
+        : build_piece_indexes(out.forward_forms, band, options.minimum_piece_bp);
+    out.reverse_indexes = out.reverse_forms.empty()
+        ? std::vector<PieceIndex>{}
+        : build_piece_indexes(out.reverse_forms, band, options.minimum_piece_bp);
+    return out;
+}
+
+// One haplotype's exposure, averaged over the observed distribution of fragment physical floors.
+// Summed in the map's own order, so it does not matter when a haplotype is scored: the same length
+// gives the same value in batch one and batch seven.
+double exposure_for_length(
+    std::size_t length,
+    std::size_t fragment_count,
+    const std::map<std::size_t, std::size_t>& fragments_by_floor,
+    const DiscreteInsertDistribution& library_insert) {
+    if (fragment_count == 0) return haplotype_exposure(length, library_insert, 0);
+    double total = 0.0;
+    for (const auto& item : fragments_by_floor) {
+        total += static_cast<double>(item.second) / static_cast<double>(fragment_count) *
+                 haplotype_exposure(length, library_insert, item.first);
+    }
+    return total;
+}
+
+// Everything placement reads and never writes.
+struct PlacementInputs {
+    const PreparedFragmentSet* prepared = nullptr;
+    const std::vector<ReadPair>* fragments = nullptr;
+    const LibraryModel* library = nullptr;
+    const DiscreteInsertDistribution* library_insert = nullptr;
+    const FragmentScoringOptions* options = nullptr;
+    const std::deque<std::string>* sequences = nullptr;
+    const std::deque<std::string>* reversed = nullptr;
+    std::size_t band = 0;
+};
+
+// Diagnostics only; the context leaves every pointer null.
+struct OriginRecording {
+    bool summary = false;
+    const std::vector<char>* record_origins = nullptr;
+    std::size_t unique_stride = 0;
+    std::vector<OriginSummary>* summaries = nullptr;
+    std::map<std::pair<std::size_t, std::size_t>, std::vector<FragmentPlacement>>* recorded = nullptr;
+};
+
+// Places haplotypes [first_h, last_h) and writes their mass COLUMNS. Column storage rather than the
+// row-major matrix is what makes a later batch appendable: a new haplotype adds a column and moves
+// nothing, whereas a row-major matrix restrides every existing cell when the haplotype count grows.
+// The arithmetic per cell is untouched, so the flattened result is identical to the matrix the
+// one-shot path used to build in place.
+void place_haplotype_range(
+    const PlacementInputs& in,
+    std::size_t first_h,
+    std::size_t last_h,
+    PlacementBudget& budget,
+    std::vector<std::vector<double>>& mass_column,
+    FragmentScoringCounters& counters,
+    ScorerMemoryAccounts& memory,
+    EmissionCacheCounters& cache_work,
+    const OriginRecording& origins_out) {
+    (void)take_gapped_emission_counters();
+    const PreparedFragmentSet& prepared = *in.prepared;
+    const std::vector<ReadPair>& fragments = *in.fragments;
+    const LibraryModel& library = *in.library;
+    const DiscreteInsertDistribution& library_insert = *in.library_insert;
+    const FragmentScoringOptions& options = *in.options;
+    const std::size_t band = in.band;
+    const auto form_slot = [](std::size_t fragment, std::size_t arm) { return fragment * 2 + arm; };
+
+    std::map<StateKey, std::uint64_t> states;
+    std::map<std::uint32_t, OriginAccumulator> origins;
+    std::vector<std::vector<FormPlacement>> forward_placements(prepared.forward_forms.size());
+    std::vector<std::vector<FormPlacement>> reverse_placements(prepared.reverse_forms.size());
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> proposed_scratch;
+
+    for (std::size_t h = first_h; h < last_h; ++h) {
+        if (budget.stop()) throw PlacementCancelled();
+        const std::string& haplotype = (*in.sequences)[h];
+        if (prepared.forward_forms.empty()) continue;
+
+        for (std::vector<FormPlacement>& row : forward_placements) row.clear();
+        const std::uint64_t rows_before = counters.accepted_mate_placements;
+        collect_form_placements(haplotype, prepared.forward_forms, prepared.forward_componentise,
+                                prepared.forward_indexes, budget, band, library, forward_placements,
+                                proposed_scratch, counters, cache_work, options);
+        memory.proposed_starts_peak =
+            std::max<std::uint64_t>(memory.proposed_starts_peak, proposed_scratch.size());
+        memory.proposed_starts_capacity_bytes_peak = std::max<std::uint64_t>(
+            memory.proposed_starts_capacity_bytes_peak,
+            proposed_scratch.capacity() * sizeof(std::pair<std::uint32_t, std::uint32_t>));
+
+        const std::string& reversed_haplotype = (*in.reversed)[h];
+        for (std::vector<FormPlacement>& row : reverse_placements) row.clear();
+        collect_form_placements(reversed_haplotype, prepared.reverse_forms,
+                                prepared.reverse_componentise, prepared.reverse_indexes, budget, band,
+                                library, reverse_placements, proposed_scratch, counters, cache_work,
+                                options);
+        memory.proposed_starts_peak =
+            std::max<std::uint64_t>(memory.proposed_starts_peak, proposed_scratch.size());
+        memory.proposed_starts_capacity_bytes_peak = std::max<std::uint64_t>(
+            memory.proposed_starts_capacity_bytes_peak,
+            proposed_scratch.capacity() * sizeof(std::pair<std::uint32_t, std::uint32_t>));
+        memory.placement_rows_peak = std::max<std::uint64_t>(
+            memory.placement_rows_peak, counters.accepted_mate_placements - rows_before);
+
+        for (std::vector<FormPlacement>& list : reverse_placements) {
+            for (FormPlacement& placement : list) {
+                placement.start = static_cast<std::uint32_t>(haplotype.size() - placement.start);
+            }
+            std::sort(list.begin(), list.end(),
+                      [](const FormPlacement& lhs, const FormPlacement& rhs) {
+                          return std::tie(lhs.start, lhs.consumed) <
+                                 std::tie(rhs.start, rhs.consumed);
+                      });
+        }
+
+        for (std::size_t f = 0; f < fragments.size(); ++f) {
+            if (budget.stop()) throw PlacementCancelled();
+            const InsertSupport& support = prepared.support_by_fragment[f];
+            if (support.empty()) continue;
+            states.clear();
+
+            for (std::size_t arm = 0; arm < 2; ++arm) {
+                const std::vector<FormPlacement>& forward = forward_placements[form_slot(f, arm)];
+                const std::vector<FormPlacement>& reverse = reverse_placements[form_slot(f, arm)];
+                if (forward.empty() || reverse.empty()) continue;
+
+                for (std::size_t first_row = 0; first_row < forward.size();) {
+                    const std::uint32_t forward_start = forward[first_row].start;
+                    std::size_t last_row = first_row;
+                    while (last_row < forward.size() && forward[last_row].start == forward_start) {
+                        ++last_row;
+                    }
+                    const std::size_t lo_end =
+                        static_cast<std::size_t>(forward_start) + support.min_bp;
+                    const std::size_t hi_end =
+                        static_cast<std::size_t>(forward_start) + support.max_bp;
+                    const auto begin = std::lower_bound(
+                        reverse.begin(), reverse.end(), lo_end,
+                        [](const FormPlacement& lhs, std::size_t value) { return lhs.start < value; });
+                    const auto end = std::upper_bound(
+                        begin, reverse.end(), hi_end,
+                        [](std::size_t value, const FormPlacement& rhs) { return value < rhs.start; });
+
+                    origins.clear();
+                    for (std::size_t row = first_row; row < last_row; ++row) {
+                        for (auto it = begin; it != end; ++it) {
+                            ++counters.latent_alignment_pairs;
+                            const std::optional<std::size_t> insert = fr_insert_from_endpoints(
+                                forward_start, forward[row].consumed, it->start, it->consumed,
+                                support);
+                            if (!insert.has_value()) continue;
+                            ++counters.valid_fr_states;
+                            origins[static_cast<std::uint32_t>(*insert)].add(
+                                forward[row].emission + it->emission, it->start - it->consumed,
+                                forward[row].consumed, it->consumed, forward[row].mismatches,
+                                it->mismatches);
+                        }
+                    }
+
+                    for (const auto& item : origins) {
+                        ++counters.physical_origins;
+                        const std::uint64_t seen =
+                            budget.physical_origins.fetch_add(1, std::memory_order_relaxed) + 1;
+                        if (seen > budget.max_physical_origins) {
+                            budget.cancel();
+                            throw ResourceExhausted(
+                                "fragment scoring reached its physical-origin cap; no partial "
+                                "ranking is returned");
+                        }
+                        if (budget.stop()) throw PlacementCancelled();
+                        StateKey key;
+                        key.insert_bp = item.first;
+                        key.orientation = static_cast<std::uint32_t>(arm);
+                        key.log_latent_mass = item.second.log_latent_mass;
+                        ++states[key];
+                        const bool want_named =
+                            origins_out.record_origins != nullptr &&
+                            (*origins_out.record_origins)[f] != 0;
+                        if (origins_out.summary || want_named) {
+                            FragmentPlacement placement;
+                            placement.forward_start = forward_start;
+                            placement.insert_bp = item.first;
+                            placement.log_latent_mass = item.second.log_latent_mass;
+                            placement.latent_alignments = item.second.latent_alignments;
+                            placement.reverse_start = item.second.reverse_start;
+                            placement.forward_mismatches = item.second.forward_mismatches;
+                            placement.reverse_mismatches = item.second.reverse_mismatches;
+                            placement.forward_consumed_bp = item.second.forward_consumed_bp;
+                            placement.reverse_consumed_bp = item.second.reverse_consumed_bp;
+                            placement.orientation = arm == 0 ? MateOrientation::FirstForward
+                                                             : MateOrientation::SecondForward;
+                            if (origins_out.summary && origins_out.summaries != nullptr) {
+                                OriginSummary& summary =
+                                    (*origins_out.summaries)[f * origins_out.unique_stride + h];
+                                ++summary.origins;
+                                const double term = kLogMateOrientationPrior +
+                                                    library_insert.log_probability(item.first) +
+                                                    item.second.log_latent_mass;
+                                if (term > summary.best_log_term) {
+                                    summary.best_log_term = term;
+                                    summary.best = placement;
+                                }
+                            }
+                            if (want_named && origins_out.recorded != nullptr) {
+                                (*origins_out.recorded)[{f, h}].push_back(placement);
+                            }
+                        }
+                    }
+                    first_row = last_row;
+                }
+            }
+            if (states.empty()) continue;
+            counters.statistical_state_classes += states.size();
+
+            double total = kNegInf;
+            for (const auto& item : states) {
+                const double term =
+                    std::log(static_cast<double>(item.second)) + kLogMateOrientationPrior +
+                    library_insert.log_probability(item.first.insert_bp) +
+                    item.first.log_latent_mass;
+                total = log_add_exp(total, term);
+            }
+            mass_column[h][f] = total;
+        }
+    }
+    {
+        std::uint64_t capacity = 0;
+        for (const std::vector<FormPlacement>& row : forward_placements) capacity += row.capacity();
+        for (const std::vector<FormPlacement>& row : reverse_placements) capacity += row.capacity();
+        memory.placement_capacity_bytes_peak = std::max<std::uint64_t>(
+            memory.placement_capacity_bytes_peak, capacity * sizeof(FormPlacement));
+    }
+}
+
+// Runs placement over [0, unique) with the declared worker count, merging in thread-index order so
+// the totals are the serial totals exactly. Shared by the one-shot path and every incremental batch,
+// which is what makes their counters comparable rather than merely similar.
+std::size_t run_placement(
+    const PlacementInputs& in,
+    std::size_t first_h,
+    std::size_t last_h,
+    std::size_t requested_threads,
+    bool force_serial,
+    PlacementBudget& budget,
+    std::vector<std::vector<double>>& mass_column,
+    FragmentScoringCounters& counters,
+    ScorerMemoryAccounts& memory,
+    EmissionCacheCounters& cache_work,
+    const OriginRecording& origins_out) {
+    const std::size_t span_count = last_h - first_h;
+    const std::size_t threads =
+        (span_count == 0 || force_serial)
+            ? 1
+            : std::max<std::size_t>(1, std::min(requested_threads, span_count));
+    if (threads <= 1) {
+        place_haplotype_range(in, first_h, last_h, budget, mass_column, counters, memory, cache_work,
+                              origins_out);
+        return threads;
+    }
+    const std::size_t span = (span_count + threads - 1) / threads;
+    std::vector<FragmentScoringCounters> local(threads);
+    std::vector<ScorerMemoryAccounts> local_memory(threads);
+    std::vector<EmissionCacheCounters> local_cache(threads);
+    std::vector<std::exception_ptr> failures(threads);
+    std::vector<std::thread> workers;
+    workers.reserve(threads);
+    for (std::size_t t = 0; t < threads; ++t) {
+        const std::size_t lo = std::min(first_h + t * span, last_h);
+        const std::size_t hi = std::min(lo + span, last_h);
+        workers.emplace_back([&, t, lo, hi]() {
+            try {
+                place_haplotype_range(in, lo, hi, budget, mass_column, local[t], local_memory[t],
+                                      local_cache[t], origins_out);
+            } catch (const PlacementCancelled&) {
+            } catch (...) {
+                failures[t] = std::current_exception();
+            }
+        });
+    }
+    for (std::thread& worker : workers) worker.join();
+    for (const std::exception_ptr& failure : failures) {
+        if (!failure) continue;
+        std::rethrow_exception(failure);
+    }
+    for (const EmissionCacheCounters& part : local_cache) {
+        cache_work.executed_prefilters += part.executed_prefilters;
+        cache_work.dp_cache_requests += part.dp_cache_requests;
+        cache_work.dp_cache_hits += part.dp_cache_hits;
+        cache_work.dp_cache_misses += part.dp_cache_misses;
+        cache_work.executed_dps += part.executed_dps;
+    }
+    for (const ScorerMemoryAccounts& part : local_memory) {
+        memory.placement_rows_peak = std::max(memory.placement_rows_peak, part.placement_rows_peak);
+        memory.placement_capacity_bytes_peak =
+            std::max(memory.placement_capacity_bytes_peak, part.placement_capacity_bytes_peak);
+        memory.proposed_starts_peak =
+            std::max(memory.proposed_starts_peak, part.proposed_starts_peak);
+        memory.proposed_starts_capacity_bytes_peak = std::max(
+            memory.proposed_starts_capacity_bytes_peak, part.proposed_starts_capacity_bytes_peak);
+    }
+    for (const FragmentScoringCounters& part : local) {
+        counters.candidate_bases_scanned += part.candidate_bases_scanned;
+        counters.piece_hits += part.piece_hits;
+        counters.proposed_starts += part.proposed_starts;
+        counters.unique_starts += part.unique_starts;
+        counters.full_read_verifications += part.full_read_verifications;
+        counters.dp_evaluations += part.dp_evaluations;
+        counters.prefilter_rejections += part.prefilter_rejections;
+        counters.accepted_mate_placements += part.accepted_mate_placements;
+        counters.valid_fr_states += part.valid_fr_states;
+        counters.latent_alignment_pairs += part.latent_alignment_pairs;
+        counters.physical_origins += part.physical_origins;
+        counters.statistical_state_classes += part.statistical_state_classes;
+    }
+    return threads;
+}
+
+// The four acceptance caps, decided on whatever totals the caller holds them against: per call for
+// the one-shot path, cumulative for a context. Throwing here is the same refusal either way.
+void enforce_acceptance_caps(
+    const FragmentScoringCounters& counters,
+    const FragmentScoringOptions& options,
+    const std::function<void()>& note) {
+    if (counters.piece_hits > options.max_piece_hits) {
+        note();
+        throw ResourceExhausted(
+            "fragment scoring reached its piece-hit cap; the locus is too repetitive for the declared "
+            "caps and no partial ranking is returned");
+    }
+    if (counters.physical_origins > options.max_physical_origins) {
+        note();
+        throw ResourceExhausted(
+            "fragment scoring reached its physical-origin cap; no partial ranking is returned");
+    }
+    if (counters.statistical_state_classes > options.max_state_classes) {
+        note();
+        throw ResourceExhausted(
+            "fragment scoring reached its statistical-class cap; no partial ranking is returned");
+    }
+    if (counters.latent_alignment_pairs > options.max_latent_alignment_pairs) {
+        note();
+        throw ResourceExhausted(
+            "fragment scoring reached its latent-alignment-pair cap; the declared gap width expands "
+            "the pairing work beyond the cap and no partial ranking is returned");
+    }
+}
+
+}  // namespace scoring_detail
+
 FragmentScoringResult score_diplotypes(
     const InternedHaplotypes& haplotypes,
     const std::vector<HaplotypeCandidate>& candidates,
@@ -1988,163 +2434,47 @@ FragmentScoringResult score_diplotypes(
     const std::size_t band = options.mismatch_band;
     const DiscreteInsertDistribution library_insert = build_library_insert_distribution(library);
 
-    // The per-length band-mass cache is gone with the substitution-only emission that needed it. The
-    // indel-aware emission normalises itself -- gapped_emission divides by the shape mass of the
-    // read's own length before returning -- so there is nothing left for the scorer to divide by, and
-    // a cache here would only be a second place for the normaliser to disagree with the oracle.
-
-    // Phase 1 of three: per-fragment preparation. Timed so a caller can attribute rescoring rather
-    // than report it whole -- it is 57-93% of a run, and which phase dominates decides how it should
-    // be parallelised.
     const auto preparation_mark = std::chrono::steady_clock::now();
-
-    // Four oriented forms per fragment: each mate as given, and each pre-complemented. Whichever
-    // mate reads off the forward strand is compared as given, so every comparison is forward.
-    // Two form sets, because the two mates of an FR pair are anchored at OPPOSITE ends of the
-    // template and their emissions are therefore computed by scanning in opposite directions.
-    //
-    //   forward-role, slot 2f+arm: the mate that reads rightward off the forward strand. Scanned
-    //                              against the haplotype, anchored at its start.
-    //   reverse-role, slot 2f+arm: the mate that reads leftward from the right endpoint, compared
-    //                              as rc(mate) and stored already reversed -- which is complement
-    //                              (mate). Scanned against the REVERSED haplotype, so the same
-    //                              left-anchored machinery anchors it at its right endpoint once
-    //                              its coordinates are mapped back.
-    //
-    // Anchoring both mates at a start is what broke the exposure identity, and the two paths must
-    // make the same choice or the scorer and the oracle agree only where no alignment is gapped.
-    std::vector<ReadForm> forward_forms;
-    std::vector<ReadForm> reverse_forms;
-    forward_forms.reserve(fragments.size() * 2);
-    reverse_forms.reserve(fragments.size() * 2);
-    std::vector<InsertSupport> support_by_fragment;
-    std::vector<double> background_by_fragment;
-    std::vector<char> floor_binds;
-    std::map<std::size_t, std::size_t> fragments_by_floor;
-    support_by_fragment.reserve(fragments.size());
-    background_by_fragment.reserve(fragments.size());
-    floor_binds.reserve(fragments.size());
-    for (std::size_t f = 0; f < fragments.size(); ++f) {
-        validate_read_pair(fragments[f]);
-        // arm 0: mate one reads forward, mate two is the reverse mate.
-        const auto add_form = [](std::vector<ReadForm>& into, std::size_t fragment,
-                                 std::string bases, bool first_arm) {
-            ReadForm form;
-            form.fragment = fragment;
-            form.bases = std::move(bases);
-            form.is_forward_mate_of_first_arm = first_arm;
-            form.pattern = prepare_myers_pattern(form.bases);
-            into.push_back(std::move(form));
-        };
-        add_form(forward_forms, f, fragments[f].first.bases, true);
-        add_form(reverse_forms, f, complement_read(fragments[f].second.bases), false);
-        // arm 1: the other way round.
-        add_form(forward_forms, f, fragments[f].second.bases, false);
-        add_form(reverse_forms, f, complement_read(fragments[f].first.bases), true);
-        support_by_fragment.push_back(fragment_insert_support(fragments[f], library));
-        // Can the geometry's floor reach this fragment at all? The widest span either mate can
-        // consume is its read length plus the displacement band; if the support's shortest insert
-        // already exceeds that, no admissible insert can fall below a consumed span, and the
-        // consumed-span decomposition cannot change this fragment's likelihood.
-        {
-            const std::size_t widest_span =
-                std::max(fragments[f].first.bases.size(), fragments[f].second.bases.size()) +
-                library.max_gap_bp;
-            const bool binds = support_by_fragment.back().empty() ||
-                               support_by_fragment.back().min_bp < widest_span;
-            floor_binds.push_back(binds ? 1 : 0);
-            if (binds) ++counters.fragments_with_floor_binding;
-        }
-        background_by_fragment.push_back(log_background_probability(fragments[f]));
-        ++fragments_by_floor[std::max(fragments[f].first.bases.size(),
-                                      fragments[f].second.bases.size())];
-    }
-    const auto form_slot = [](std::size_t fragment, std::size_t arm) { return fragment * 2 + arm; };
-
-    // Parallel to each form set: a form takes the exact fast path exactly when its fragment's insert
-    // floor is unreachable. Decided per fragment, once, from declared quantities only -- never from
-    // the data, and never from a tolerance.
-    std::vector<char> forward_componentise(forward_forms.size(), 0);
-    std::vector<char> reverse_componentise(reverse_forms.size(), 0);
-    for (std::size_t i = 0; i < forward_forms.size(); ++i) {
-        forward_componentise[i] = floor_binds[forward_forms[i].fragment];
-    }
-    for (std::size_t i = 0; i < reverse_forms.size(); ++i) {
-        reverse_componentise[i] = floor_binds[reverse_forms[i].fragment];
-    }
-
-    const std::vector<PieceIndex> forward_indexes =
-        forward_forms.empty() ? std::vector<PieceIndex>{}
-                              : build_piece_indexes(forward_forms, band, options.minimum_piece_bp);
-    const std::vector<PieceIndex> reverse_indexes =
-        reverse_forms.empty() ? std::vector<PieceIndex>{}
-                              : build_piece_indexes(reverse_forms, band, options.minimum_piece_bp);
-
+    const PreparedFragmentSet prepared = prepare_fragment_set(fragments, library, options);
+    counters.fragments_with_floor_binding = prepared.fragments_with_floor_binding;
     result.seconds_fragment_preparation =
         std::chrono::duration<double>(std::chrono::steady_clock::now() - preparation_mark).count();
-    // Phase 2: placement and mass construction, per (fragment, haplotype).
-    const auto placement_mark = std::chrono::steady_clock::now();
 
+    const auto placement_mark = std::chrono::steady_clock::now();
     const std::size_t unique = haplotypes.sequences.size();
-    // Checked before the allocation it guards, so a refusal costs nothing.
     if (!fragments.empty() && unique > options.max_mass_cells / fragments.size()) {
         throw ResourceExhausted(
             "the fragment-by-haplotype mass matrix would exceed its declared cell cap; no partial "
             "ranking is returned");
     }
-    std::vector<double> mass(fragments.size() * unique, kNegInf);
+    std::vector<std::vector<double>> mass_column(unique,
+                                                 std::vector<double>(fragments.size(), kNegInf));
     std::vector<double> exposure(unique, 0.0);
-    if (options.record_origin_summary) result.origin_summary.assign(fragments.size() * unique, OriginSummary{});
+    if (options.record_origin_summary) {
+        result.origin_summary.assign(fragments.size() * unique, OriginSummary{});
+    }
     std::vector<char> record_origins(fragments.size(), 0);
     for (const std::size_t f : options.record_origins_for_fragments) {
-        if (f >= fragments.size()) throw std::invalid_argument("origin recording names an unknown fragment");
+        if (f >= fragments.size()) {
+            throw std::invalid_argument("origin recording names an unknown fragment");
+        }
         record_origins[f] = 1;
     }
-
-    // The fragment likelihood conditions on the observed read lengths, and a template shorter than a
-    // fragment's longer mate cannot produce that fragment. Exposure therefore averages the analytic
-    // count over the observed distribution of physical floors, so the -lambda*E term and the signal
-    // density describe the same generated process.
     for (std::size_t h = 0; h < unique; ++h) {
-        const std::size_t length = haplotypes.sequences[h].size();
-        if (fragments.empty()) {
-            exposure[h] = haplotype_exposure(length, library_insert, 0);
-            continue;
-        }
-        for (const auto& item : fragments_by_floor) {
-            exposure[h] += static_cast<double>(item.second) /
-                           static_cast<double>(fragments.size()) *
-                           haplotype_exposure(length, library_insert, item.first);
-        }
+        exposure[h] = exposure_for_length(haplotypes.sequences[h].size(), fragments.size(),
+                                          prepared.fragments_by_floor, library_insert);
     }
 
-    // Placement and mass construction, partitioned over haplotypes. Every write below is indexed by
-    // this worker's own h -- mass[f * unique + h], exposure[h], origin_summary[f * unique + h] -- so no
-    // two workers touch the same cell, and `forms`, `indexes`, the per-fragment supports and the
-    // sequences are read-only by the time we get here.
-    //
-    // Counters are per worker and merged in thread-index order, so the totals a run reports do not
-    // depend on the schedule. The two running-total caps inside this phase -- physical_origins and
-    // statistical_state_classes -- are therefore checked AFTER the merge rather than mid-loop: their
-    // crossing point moves with the partition, and the declared contract is that a given input either
-    // completes or refuses regardless of thread count. `max_proposed_starts_per_haplotype` is unaffected
-    // and still throws locally, because it tests a per-haplotype vector rather than a running total.
-    // One budget for every worker: these two caps bound the work performed, not merely the answer, so
-    // they cannot be per worker without letting T workers each consume a full cap.
-    // Reversed haplotypes for the reverse-role scan, built once for the whole pass. They used to be
-    // per-iteration locals inside place_range; the emission cache stores pointers into the window it
-    // is handed, so a local would dangle the moment its haplotype iteration ended. 129 x 226kb is
-    // about 29MB, which is cheap against the alternative of copying key bytes per entry.
-    std::vector<std::string> reversed_sequences;
-    reversed_sequences.reserve(unique);
+    // Stable storage, appended once here. A deque so the emission cache's raw window pointers stay
+    // valid however the container grows -- the one-shot path never grows it, but the definition is
+    // shared with the context, which does.
+    std::deque<std::string> sequences;
+    std::deque<std::string> reversed_sequences;
     for (const std::string& sequence : haplotypes.sequences) {
+        sequences.push_back(sequence);
         reversed_sequences.emplace_back(sequence.rbegin(), sequence.rend());
     }
 
-    // The exact emission cache lives exactly as long as this scoring pass, because its keys point
-    // into `forms` and `reversed_sequences` above. score_diplotypes leaves by eleven paths -- four
-    // returns and seven ResourceExhausted throws -- so disarming is a destructor's job, not a
-    // statement before each exit.
     struct EmissionCacheScope {
         explicit EmissionCacheScope(std::size_t bytes) { begin_emission_cache(bytes); }
         ~EmissionCacheScope() { counters = end_emission_cache(); }
@@ -2158,257 +2488,25 @@ FragmentScoringResult score_diplotypes(
     budget.max_physical_origins = options.max_physical_origins;
     budget.publish_batch = std::max<std::uint64_t>(1, options.piece_hit_publish_batch);
 
-    const auto place_range = [&](std::size_t first_h, std::size_t last_h,
-                                 FragmentScoringCounters& counters,
-                                 ScorerMemoryAccounts& memory,
-                                 EmissionCacheCounters& cache_work) {
-    // Discard whatever this thread accumulated before the pass began. The emission's work counters
-    // live in a thread_local that ANY caller dirties -- the exhaustive oracle, the probe's compare
-    // and scan diagnostics, the census -- and collect_form_placements drains that thread_local into
-    // the pass's totals. Without this, a scoring pass silently absorbs the residue of whatever ran
-    // on its thread beforehand: measured at dp=397 pf=1949 against a clean 369/53, with the
-    // verification count unchanged, which is the signature of counting work nobody in this pass did.
-    (void)take_gapped_emission_counters();
-    std::map<StateKey, std::uint64_t> states;
-    // Right endpoints reachable from one left endpoint, reused across groups to keep the allocation
-    // out of the inner loop.
-    std::map<std::uint32_t, OriginAccumulator> origins;
-    // Worker-local placement storage, allocated once for this worker's whole range rather than once
-    // per haplotype. See the clear() calls below for why.
-    std::vector<std::vector<FormPlacement>> forward_placements(forward_forms.size());
-    std::vector<std::vector<FormPlacement>> reverse_placements(reverse_forms.size());
-    std::vector<std::pair<std::uint32_t, std::uint32_t>> proposed_scratch;
-    for (std::size_t h = first_h; h < last_h; ++h) {
-        // Haplotype and fragment boundaries are the natural places to notice someone else's refusal:
-        // both are cheap relative to the work they precede, and a worker that has just finished one
-        // haplotype would otherwise start another that can never be used.
-        if (budget.stop()) throw PlacementCancelled();
-        const std::string& haplotype = haplotypes.sequences[h];
-        if (forward_forms.empty()) continue;
+    PlacementInputs inputs;
+    inputs.prepared = &prepared;
+    inputs.fragments = &fragments;
+    inputs.library = &library;
+    inputs.library_insert = &library_insert;
+    inputs.options = &options;
+    inputs.sequences = &sequences;
+    inputs.reversed = &reversed_sequences;
+    inputs.band = band;
 
-        // Reused across haplotypes rather than rebuilt per haplotype. Each worker handles one
-        // haplotype at a time, so these were never simultaneously live per haplotype -- constructing
-        // 142,648 vectors per haplotype and destroying them again is churn the allocator retains,
-        // which is what RSS was showing. clear() keeps each row's capacity, so a worker settles at
-        // its own peak instead of re-growing on every haplotype. Placement semantics are unchanged:
-        // the rows start empty either way.
-        for (std::vector<FormPlacement>& row : forward_placements) row.clear();
-        const std::uint64_t rows_before = counters.accepted_mate_placements;
-        collect_form_placements(haplotype, forward_forms, forward_componentise, forward_indexes,
-                                budget, band, library, forward_placements, proposed_scratch,
-                                counters, cache_work, options);
-        // Sampling the scratch is two integer reads; sampling every placement row would be 142,648
-        // reads per haplotype, so rows are taken from the counter delta instead and capacity once
-        // per range below, where it is monotone.
-        memory.proposed_starts_peak =
-            std::max<std::uint64_t>(memory.proposed_starts_peak, proposed_scratch.size());
-        memory.proposed_starts_capacity_bytes_peak = std::max<std::uint64_t>(
-            memory.proposed_starts_capacity_bytes_peak,
-            proposed_scratch.capacity() * sizeof(std::pair<std::uint32_t, std::uint32_t>));
+    OriginRecording origins_out;
+    origins_out.summary = options.record_origin_summary;
+    origins_out.record_origins = &record_origins;
+    origins_out.unique_stride = unique;
+    origins_out.summaries = &result.origin_summary;
+    origins_out.recorded = &result.recorded_origins;
 
-        // The reverse-role scan runs against the reversed haplotype, which anchors those mates at
-        // their right endpoints. Precomputed once for the whole pass rather than rebuilt here: the
-        // emission cache stores POINTERS into the window it was given, and a per-iteration local
-        // would dangle the instant this haplotype's iteration ended.
-        const std::string& reversed_haplotype = reversed_sequences[h];
-        for (std::vector<FormPlacement>& row : reverse_placements) row.clear();
-        collect_form_placements(reversed_haplotype, reverse_forms, reverse_componentise,
-                                reverse_indexes, budget, band, library, reverse_placements,
-                                proposed_scratch, counters, cache_work, options);
-        memory.proposed_starts_peak =
-            std::max<std::uint64_t>(memory.proposed_starts_peak, proposed_scratch.size());
-        memory.proposed_starts_capacity_bytes_peak = std::max<std::uint64_t>(
-            memory.proposed_starts_capacity_bytes_peak,
-            proposed_scratch.capacity() * sizeof(std::pair<std::uint32_t, std::uint32_t>));
-        // Placements held simultaneously for THIS haplotype -- which is what one worker owns at a
-        // time, and the quantity a haplotype count does not multiply.
-        memory.placement_rows_peak = std::max<std::uint64_t>(
-            memory.placement_rows_peak, counters.accepted_mate_placements - rows_before);
-        // Map reversed coordinates back: a class occupying reversed [s, s+consumed) occupies forward
-        // [L-s-consumed, L-s), so its forward-coordinate RIGHT ENDPOINT is L - s. `start` carries
-        // that endpoint from here on, and the list is re-sorted because reversing the axis reverses
-        // the order the two-pointer window below depends on.
-        for (std::vector<FormPlacement>& list : reverse_placements) {
-            for (FormPlacement& placement : list) {
-                placement.start =
-                    static_cast<std::uint32_t>(haplotype.size() - placement.start);
-            }
-            std::sort(list.begin(), list.end(),
-                      [](const FormPlacement& lhs, const FormPlacement& rhs) {
-                          return std::tie(lhs.start, lhs.consumed) <
-                                 std::tie(rhs.start, rhs.consumed);
-                      });
-        }
-
-        for (std::size_t f = 0; f < fragments.size(); ++f) {
-            if (budget.stop()) throw PlacementCancelled();
-            const InsertSupport& support = support_by_fragment[f];
-            if (support.empty()) continue;
-            states.clear();
-
-            for (std::size_t arm = 0; arm < 2; ++arm) {
-                // FirstForward: mate one as given is the forward mate, rc(mate two) the reverse one.
-                // `forward` rows carry a START, `reverse` rows carry a RIGHT ENDPOINT.
-                const std::vector<FormPlacement>& forward = forward_placements[form_slot(f, arm)];
-                const std::vector<FormPlacement>& reverse = reverse_placements[form_slot(f, arm)];
-                if (forward.empty() || reverse.empty()) continue;
-
-                // Forward rows are grouped by start, because one start is one LEFT ENDPOINT and all
-                // of its consumed-span classes are latent explanations of templates anchored there.
-                for (std::size_t first_row = 0; first_row < forward.size();) {
-                    const std::uint32_t forward_start = forward[first_row].start;
-                    std::size_t last_row = first_row;
-                    while (last_row < forward.size() && forward[last_row].start == forward_start) {
-                        ++last_row;
-                    }
-
-                    // insert = right endpoint - left endpoint must lie in the support, so the
-                    // admissible right endpoints form one contiguous window. Two-pointer bounds, no
-                    // map. The window depends only on the left endpoint, so it is derived once per
-                    // group.
-                    //
-                    // No max_gap_bp slack is needed any more, and adding it back would be a mistake.
-                    // The old widening existed only because a reverse START had to be turned into an
-                    // endpoint through a consumed span that was not yet known; the reverse rows now
-                    // carry the endpoint itself, so these bounds are exact. fr_insert_from_endpoints
-                    // still decides admission on the spans actually consumed.
-                    const std::size_t lo_end =
-                        static_cast<std::size_t>(forward_start) + support.min_bp;
-                    const std::size_t hi_end =
-                        static_cast<std::size_t>(forward_start) + support.max_bp;
-
-                    const auto begin = std::lower_bound(
-                        reverse.begin(), reverse.end(), lo_end,
-                        [](const FormPlacement& lhs, std::size_t value) {
-                            return lhs.start < value;
-                        });
-                    const auto end = std::upper_bound(
-                        begin, reverse.end(), hi_end,
-                        [](std::size_t value, const FormPlacement& rhs) {
-                            return value < rhs.start;
-                        });
-
-                    // One entry per RIGHT ENDPOINT reachable from this left endpoint. Every latent
-                    // alignment pair that reaches the same right endpoint -- whatever spans the two
-                    // mates consumed on the way -- is another explanation of ONE template, so the
-                    // masses are summed and the origin is counted once. Letting each pair be its own
-                    // origin would manufacture physical copies out of alignment ambiguity.
-                    origins.clear();
-                    for (std::size_t row = first_row; row < last_row; ++row) {
-                        for (auto it = begin; it != end; ++it) {
-                            // Counted whether or not the geometry accepts: this is the pairing WORK
-                            // that admitting indels multiplies, and it has a declared cap of its own.
-                            ++counters.latent_alignment_pairs;
-                            const std::optional<std::size_t> insert = fr_insert_from_endpoints(
-                                forward_start, forward[row].consumed, it->start, it->consumed,
-                                support);
-                            if (!insert.has_value()) continue;
-                            ++counters.valid_fr_states;
-                            origins[static_cast<std::uint32_t>(*insert)].add(
-                                forward[row].emission + it->emission, it->start - it->consumed,
-                                forward[row].consumed, it->consumed, forward[row].mismatches,
-                                it->mismatches);
-                        }
-                    }
-
-                    for (const auto& item : origins) {
-                        // Thirty times cooler than piece_hits (9.4M against 320M on C4), so this one
-                        // carries an exact shared counter: the work bound is tight, with no batching
-                        // overshoot at all. Crossing it cancels every worker rather than letting each
-                        // consume a full cap. Refusing here is exact and immediate; acceptance is still
-                        // decided later, on the merged totals.
-                        ++counters.physical_origins;
-                        const std::uint64_t seen =
-                            budget.physical_origins.fetch_add(1, std::memory_order_relaxed) + 1;
-                        if (seen > budget.max_physical_origins) {
-                            budget.cancel();
-                            throw ResourceExhausted(
-                                "fragment scoring reached its physical-origin cap; no partial "
-                                "ranking is returned");
-                        }
-                        if (budget.stop()) throw PlacementCancelled();
-                        StateKey key;
-                        key.insert_bp = item.first;
-                        key.orientation = static_cast<std::uint32_t>(arm);
-                        key.log_latent_mass = item.second.log_latent_mass;
-                        ++states[key];
-                        if (options.record_origin_summary || record_origins[f] != 0) {
-                            FragmentPlacement placement;
-                            placement.forward_start = forward_start;
-                            placement.insert_bp = item.first;
-                            placement.log_latent_mass = item.second.log_latent_mass;
-                            placement.latent_alignments = item.second.latent_alignments;
-                            placement.reverse_start = item.second.reverse_start;
-                            placement.forward_mismatches = item.second.forward_mismatches;
-                            placement.reverse_mismatches = item.second.reverse_mismatches;
-                            placement.forward_consumed_bp = item.second.forward_consumed_bp;
-                            placement.reverse_consumed_bp = item.second.reverse_consumed_bp;
-                            placement.orientation =
-                                arm == 0 ? MateOrientation::FirstForward : MateOrientation::SecondForward;
-                            if (options.record_origin_summary) {
-                                OriginSummary& summary = result.origin_summary[f * unique + h];
-                                ++summary.origins;
-                                const double term =
-                                    kLogMateOrientationPrior +
-                                    library_insert.log_probability(item.first) +
-                                    item.second.log_latent_mass;
-                                if (term > summary.best_log_term) {
-                                    summary.best_log_term = term;
-                                    summary.best = placement;
-                                }
-                            }
-                            if (record_origins[f] != 0) result.recorded_origins[{f, h}].push_back(placement);
-                        }
-                    }
-                    first_row = last_row;
-                }
-            }
-            if (states.empty()) continue;
-            // A pure running total with no memory role, so it is accumulated here and decided once,
-            // after the ordered merge, where the sum is the same at any thread count.
-            counters.statistical_state_classes += states.size();
-
-            double total = kNegInf;
-            for (const auto& item : states) {
-                // Exact log-multiplicity: every origin in this class has an identical mass term, so
-                // multiplying by the count is not an approximation of summing them, it IS the sum.
-                // The emissions are part of the key, so two origins collapse only when their masses
-                // agree exactly -- which is what makes that still true under gapped alignments.
-                const double term =
-                    std::log(static_cast<double>(item.second)) + kLogMateOrientationPrior +
-                    library_insert.log_probability(item.first.insert_bp) +
-                    item.first.log_latent_mass;
-                total = log_add_exp(total, term);
-            }
-            mass[f * unique + h] = total;
-        }
-    }
-    // Capacity is monotone across this range -- rows are cleared, never shrunk -- so one sweep at
-    // the end is the exact peak. Sampling it per haplotype would be 40M reads instead of 285K.
-    {
-        std::uint64_t capacity = 0;
-        for (const std::vector<FormPlacement>& row : forward_placements) capacity += row.capacity();
-        for (const std::vector<FormPlacement>& row : reverse_placements) capacity += row.capacity();
-        memory.placement_capacity_bytes_peak = std::max<std::uint64_t>(
-            memory.placement_capacity_bytes_peak, capacity * sizeof(FormPlacement));
-    }
-    };
-
-    // Full-origin recording writes result.recorded_origins, a shared map, from the innermost loop.
-    // Rather than make that deterministic for a diagnostic no score depends on, it forces the serial
-    // path -- and says so in threads_used_placement instead of claiming workers it did not use.
     const bool origins_force_serial = !options.record_origins_for_fragments.empty();
-    const std::size_t placement_threads =
-        (unique == 0 || origins_force_serial)
-            ? 1
-            : std::max<std::size_t>(1, std::min(options.threads, unique));
-    result.threads_used_placement = placement_threads;
 
-    // A refusal reports the work it performed, so the breaker can be held to a bound and not merely to
-    // a verdict. After a worker threw, `counters` is still empty -- the merge below never ran -- and the
-    // budget's published totals are the only global record; after a post-merge check `counters` is exact
-    // and includes the remainders no batch published. The larger of the two is right in both cases. On
-    // the worker path the other fields stay zero: they are per-range sums that were never merged.
     const auto note_observed_work = [&]() {
         if (observed_on_failure == nullptr) return;
         observed_on_failure->counters = counters;
@@ -2416,11 +2514,7 @@ FragmentScoringResult score_diplotypes(
             std::max(counters.piece_hits, budget.piece_hits.load(std::memory_order_relaxed));
         observed_on_failure->counters.physical_origins = std::max(
             counters.physical_origins, budget.physical_origins.load(std::memory_order_relaxed));
-        // The workers that actually ran, and the phases as they stand at the refusal: preparation is
-        // complete, placement is however far it got, combination has not started. Reporting the
-        // placement elapsed rather than zero is the point -- a refused run's time is not
-        // unattributable, and it is exactly when knowing where the time went matters most.
-        observed_on_failure->threads_used_placement = placement_threads;
+        observed_on_failure->threads_used_placement = result.threads_used_placement;
         observed_on_failure->threads_used_combination = 0;
         observed_on_failure->seconds_fragment_preparation = result.seconds_fragment_preparation;
         observed_on_failure->seconds_placement_and_mass =
@@ -2428,153 +2522,38 @@ FragmentScoringResult score_diplotypes(
         observed_on_failure->seconds_diploid_combination = 0.0;
     };
 
-    if (placement_threads <= 1) {
-        try {
-            place_range(0, unique, counters, result.memory, result.emission_cache);
-        } catch (const ResourceExhausted&) {
-            note_observed_work();
-            throw;
-        }
-    } else {
-        const std::size_t span = (unique + placement_threads - 1) / placement_threads;
-        std::vector<FragmentScoringCounters> local(placement_threads);
-        std::vector<ScorerMemoryAccounts> local_memory(placement_threads);
-        std::vector<EmissionCacheCounters> local_cache(placement_threads);
-        std::vector<std::exception_ptr> failures(placement_threads);
-        std::vector<std::thread> workers;
-        workers.reserve(placement_threads);
-        for (std::size_t t = 0; t < placement_threads; ++t) {
-            const std::size_t first_h = std::min(t * span, unique);
-            const std::size_t last_h = std::min(first_h + span, unique);
-            workers.emplace_back([&, t, first_h, last_h]() {
-                try {
-                    place_range(first_h, last_h, local[t], local_memory[t], local_cache[t]);
-                } catch (const PlacementCancelled&) {
-                    // Another worker crossed a cap and this one abandoned its range. That is the
-                    // breaker working, not a failure of its own: the worker that actually crossed
-                    // reports the cap, so the message does not depend on who noticed first.
-                } catch (...) {
-                    failures[t] = std::current_exception();
-                }
-            });
-        }
-        for (std::thread& worker : workers) worker.join();
-        // Rethrown in thread-index order, so which worker's message surfaces does not depend on which
-        // one crossed the cap first. A refusal records the work performed before it stopped.
-        for (const std::exception_ptr& failure : failures) {
-            if (!failure) continue;
-            try {
-                std::rethrow_exception(failure);
-            } catch (const ResourceExhausted&) {
-                note_observed_work();
-                throw;
-            }
-        }
-        // Summed in thread-index order, so the totals a run reports are the serial totals exactly.
-        // Per-worker PEAKS, so these fold by max rather than by sum: no two workers hold the same
-        // haplotype's placements at once, and adding their peaks would describe a moment that never
-        // existed. The counters below are event tallies and do sum.
-        // Event tallies, so these SUM in thread-index order -- unlike the memory figures below,
-        // which are per-worker peaks and fold by max. Summing in a fixed order is what makes the
-        // reported totals independent of the schedule now that no atomic guards them.
-        for (const EmissionCacheCounters& part : local_cache) {
-            result.emission_cache.executed_prefilters += part.executed_prefilters;
-            result.emission_cache.dp_cache_requests += part.dp_cache_requests;
-            result.emission_cache.dp_cache_hits += part.dp_cache_hits;
-            result.emission_cache.dp_cache_misses += part.dp_cache_misses;
-            result.emission_cache.executed_dps += part.executed_dps;
-        }
-        for (const ScorerMemoryAccounts& part : local_memory) {
-            result.memory.placement_rows_peak =
-                std::max(result.memory.placement_rows_peak, part.placement_rows_peak);
-            result.memory.placement_capacity_bytes_peak = std::max(
-                result.memory.placement_capacity_bytes_peak, part.placement_capacity_bytes_peak);
-            result.memory.proposed_starts_peak =
-                std::max(result.memory.proposed_starts_peak, part.proposed_starts_peak);
-            result.memory.proposed_starts_capacity_bytes_peak =
-                std::max(result.memory.proposed_starts_capacity_bytes_peak,
-                         part.proposed_starts_capacity_bytes_peak);
-        }
-        for (const FragmentScoringCounters& part : local) {
-            counters.candidate_bases_scanned += part.candidate_bases_scanned;
-            counters.piece_hits += part.piece_hits;
-            counters.proposed_starts += part.proposed_starts;
-            counters.unique_starts += part.unique_starts;
-            counters.full_read_verifications += part.full_read_verifications;
-            counters.dp_evaluations += part.dp_evaluations;
-            counters.prefilter_rejections += part.prefilter_rejections;
-            counters.accepted_mate_placements += part.accepted_mate_placements;
-            counters.valid_fr_states += part.valid_fr_states;
-            counters.latent_alignment_pairs += part.latent_alignment_pairs;
-            counters.physical_origins += part.physical_origins;
-            counters.statistical_state_classes += part.statistical_state_classes;
-        }
+    result.threads_used_placement =
+        (unique == 0 || origins_force_serial)
+            ? 1
+            : std::max<std::size_t>(1, std::min(options.threads, unique));
+    try {
+        result.threads_used_placement =
+            run_placement(inputs, 0, unique, options.threads, origins_force_serial, budget,
+                          mass_column, counters, result.memory, result.emission_cache, origins_out);
+    } catch (const ResourceExhausted&) {
+        note_observed_work();
+        throw;
     }
 
-    // The ACCEPTANCE decision, taken once on the merged totals. A refusal may already have been raised
-    // in flight, by a worker that watched the shared budget cross a cap -- so this is not the only place
-    // a verdict is reached, and claiming otherwise would be wrong. That early refusal is sound because a
-    // shared total can only undercount the exact one. What this block settles is the other half: a run
-    // no worker stopped is accepted or refused on exact totals, so the answer is the same at any thread
-    // count -- the crossing point moves with the partition, the total does not.
-    if (counters.piece_hits > options.max_piece_hits) {
-        note_observed_work();
-        throw ResourceExhausted(
-            "fragment scoring reached its piece-hit cap; the locus is too repetitive for the declared "
-            "caps and no partial ranking is returned");
-    }
-    if (counters.physical_origins > options.max_physical_origins) {
-        note_observed_work();
-        throw ResourceExhausted(
-            "fragment scoring reached its physical-origin cap; no partial ranking is returned");
-    }
-    // Unlike the two above, this one bounds nothing in flight: state classes are counted after the
-    // per-fragment merge, so the work and the memory are already spent by the time it is consulted. It
-    // is an acceptance cap on the result, not a breaker, and so it needs no shared budget.
-    if (counters.statistical_state_classes > options.max_state_classes) {
-        note_observed_work();
-        throw ResourceExhausted(
-            "fragment scoring reached its statistical-class cap; no partial ranking is returned");
-    }
-    // Like the class cap, an acceptance cap rather than a breaker: the pairs are counted as the
-    // geometry is tested, so a running crossing point would move with the partition. It is declared
-    // separately from the origin cap because indels multiply the pairing work by up to
-    // (2*max_gap_bp+1)^2 per origin, and a bound that cannot be seen is a bound nobody is holding.
-    if (counters.latent_alignment_pairs > options.max_latent_alignment_pairs) {
-        note_observed_work();
-        throw ResourceExhausted(
-            "fragment scoring reached its latent-alignment-pair cap; the declared gap width expands "
-            "the pairing work beyond the cap and no partial ranking is returned");
-    }
+    enforce_acceptance_caps(counters, options, note_observed_work);
 
     result.seconds_placement_and_mass =
         std::chrono::duration<double>(std::chrono::steady_clock::now() - placement_mark).count();
-    // Phase 3: diploid combination, per (candidate, fragment). This is the term that grows with the
-    // panel -- roughly 108,000 candidates on the large loci against 8,515 on c4.
-    const auto combination_mark = std::chrono::steady_clock::now();
 
-    // One candidate's score depends on nothing but its own two haplotypes and the shared, now
-    // immutable, mass matrix -- so candidates partition cleanly. Each worker takes a fixed contiguous
-    // range and writes only its own complete DiplotypeScore entries; within a candidate the fragment
-    // order is exactly the serial order, and no value is accumulated across threads. There is
-    // therefore no floating-point reduction whose order could change, which is what makes this
-    // bit-for-bit identical at any thread count rather than merely close.
+    const auto combination_mark = std::chrono::steady_clock::now();
     const auto combine_range = [&](std::size_t begin, std::size_t end) {
         for (std::size_t c = begin; c < end; ++c) {
             const std::size_t a = candidates[c].first;
             const std::size_t b = candidates[c].second;
             DiplotypeScore& score = result.scores[c];
-            // A homozygote names the same haplotype twice and therefore counts two chromosome copies
-            // in both terms, which is what the fragment contract requires.
             score.exposure_term = -expected_signal_fragments(exposure[a] + exposure[b], library);
             score.absolute_term_sum = std::abs(score.exposure_term);
             double fragment_term = 0.0;
             for (std::size_t f = 0; f < fragments.size(); ++f) {
-                const double combined =
-                    log_add_exp(mass[f * unique + a], mass[f * unique + b]);
+                const double combined = log_add_exp(mass_column[a][f], mass_column[b][f]);
                 if (combined != kNegInf) ++score.fragments_with_mass;
-                const double contribution =
-                    log_fragment_contribution(combined, background_by_fragment[f], library);
+                const double contribution = log_fragment_contribution(
+                    combined, prepared.background_by_fragment[f], library);
                 fragment_term += contribution;
                 score.absolute_term_sum += std::abs(contribution);
             }
@@ -2609,57 +2588,370 @@ FragmentScoringResult score_diplotypes(
             });
         }
         for (std::thread& worker : workers) worker.join();
-        // Every worker is joined before anything is rethrown, and the rethrow walks thread order, so
-        // which worker happened to fail first cannot change which refusal the caller sees.
         for (const std::exception_ptr& failure : failures) {
             if (failure) std::rethrow_exception(failure);
         }
     }
     result.seconds_diploid_combination =
         std::chrono::duration<double>(std::chrono::steady_clock::now() - combination_mark).count();
-    result.log_mass = std::move(mass);
+
+    // Flattened to the documented row-major layout. Column storage is an internal choice about what
+    // can be appended; the published matrix keeps its shape.
+    result.log_mass.assign(fragments.size() * unique, kNegInf);
+    for (std::size_t h = 0; h < unique; ++h) {
+        for (std::size_t f = 0; f < fragments.size(); ++f) {
+            result.log_mass[f * unique + h] = mass_column[h][f];
+        }
+    }
     result.exposure = std::move(exposure);
-    // Teardown belongs to the scope alone -- it is the only path that covers the seven throws as
-    // well as the returns -- so this reads the live counters and leaves the disarming to it. Calling
-    // end_emission_cache() here as well would disarm early and hand the destructor zeroes.
-    // Combine the two halves: the worker-local observational totals already merged into
-    // result.emission_cache during placement, and the atomic-backed insertion figures read here.
     {
         const EmissionCacheCounters stored = read_emission_cache_counters();
         result.emission_cache.payload_bytes = stored.payload_bytes;
         result.emission_cache.entries = stored.entries;
         result.emission_cache.entries_not_retained = stored.entries_not_retained;
     }
-    // Explicit accounts of what this pass owned. Read before the scope destructor tears the cache
-    // table down, and counted from the containers themselves rather than inferred from RSS.
     emission_cache_storage_bytes(&result.memory.emission_cache_table_bytes,
                                  &result.memory.emission_cache_arena_bytes);
     result.memory.mass_matrix_bytes =
         static_cast<std::uint64_t>(result.log_mass.size()) * sizeof(double);
-    for (const std::string& sequence : haplotypes.sequences) {
+    for (const std::string& sequence : sequences) {
         result.memory.haplotype_sequence_bytes += sequence.capacity();
     }
     for (const std::string& sequence : reversed_sequences) {
         result.memory.haplotype_sequence_bytes += sequence.capacity();
     }
-    for (const ReadForm& form : forward_forms) result.memory.form_sequence_bytes += form.bases.capacity();
-    for (const ReadForm& form : reverse_forms) result.memory.form_sequence_bytes += form.bases.capacity();
-    for (const PieceIndex& index : forward_indexes) {
+    for (const ReadForm& form : prepared.forward_forms) {
+        result.memory.form_sequence_bytes += form.bases.capacity();
+    }
+    for (const ReadForm& form : prepared.reverse_forms) {
+        result.memory.form_sequence_bytes += form.bases.capacity();
+    }
+    for (const PieceIndex& index : prepared.forward_indexes) {
         result.memory.piece_index_bytes += index.entries.capacity() * sizeof(PieceEntry);
     }
-    for (const PieceIndex& index : reverse_indexes) {
+    for (const PieceIndex& index : prepared.reverse_indexes) {
         result.memory.piece_index_bytes += index.entries.capacity() * sizeof(PieceEntry);
     }
-    // Retained past this call so a status writer that never sees the scoring result can still
-    // report what the pass owned.
     last_memory_slot() = result.memory;
-    // Retain the MERGED cache figures, not the ones the scope destructor will see. By the time it
-    // runs, every worker's thread-local has already been drained by collect_form_placements and the
-    // atomics hold only the insertion-path totals -- so the destructor's view reports zero work
-    // beside a non-zero entry count, which reads as a broken cache rather than a stale instrument.
     last_emission_cache_slot() = result.emission_cache;
     return result;
 }
+
+// ---------------------------------------------------------------------------------------------
+// PreparedScoringContext
+// ---------------------------------------------------------------------------------------------
+
+struct PreparedScoringContext::State {
+    std::vector<ReadPair> fragments;
+    LibraryModel library;
+    FragmentScoringOptions options;
+    DiscreteInsertDistribution library_insert;
+    PreparedFragmentSet prepared;
+
+    // Address-stable for the context's whole life: the emission cache retains raw pointers into both.
+    std::deque<std::string> sequences;
+    std::deque<std::string> reversed;
+    std::map<std::string, std::size_t> index_of_sequence;
+
+    std::vector<std::vector<double>> mass_column;   // [haplotype][fragment]
+    std::vector<double> exposure;
+
+    FragmentScoringCounters cumulative;
+    EmissionCacheCounters cumulative_cache;
+    double cumulative_placement_seconds = 0.0;
+    PlacementBudget budget;                          // cumulative across every batch
+    bool refused = false;
+    bool cache_pinned = false;
+
+    void require_usable() const {
+        if (refused) {
+            throw ResourceExhausted(
+                "this scoring context refused a declared cap; the whole search is invalid and no "
+                "partial ranking is available from it");
+        }
+    }
+};
+
+PreparedScoringContext::PreparedScoringContext(std::vector<ReadPair> fragments,
+                                               LibraryModel library,
+                                               FragmentScoringOptions options)
+    : state_(std::make_unique<State>()) {
+    validate_library_model(library);
+    if (options.minimum_piece_bp == 0) {
+        throw std::invalid_argument("minimum indexable piece length must be positive");
+    }
+    if (options.max_piece_hits == 0 || options.max_proposed_starts_per_haplotype == 0 ||
+        options.max_physical_origins == 0 || options.max_state_classes == 0 ||
+        options.max_mass_cells == 0 || options.max_latent_alignment_pairs == 0) {
+        throw std::invalid_argument("every fragment-scoring resource cap must be positive");
+    }
+    if (options.record_origin_summary || !options.record_origins_for_fragments.empty()) {
+        // Origin recording indexes by a stride that changes every time a haplotype is added, and it
+        // forces the serial path. Refusing is honest; half-supporting it would give a diagnostic
+        // whose rows silently referred to a different haplotype count than the one that produced them.
+        throw std::invalid_argument(
+            "origin recording is not available from an incremental scoring context");
+    }
+    state_->fragments = std::move(fragments);
+    state_->library = std::move(library);
+    state_->options = std::move(options);
+    state_->library_insert = build_library_insert_distribution(state_->library);
+    state_->prepared =
+        prepare_fragment_set(state_->fragments, state_->library, state_->options);
+    state_->cumulative.fragments_with_floor_binding = state_->prepared.fragments_with_floor_binding;
+    state_->budget.max_piece_hits = state_->options.max_piece_hits;
+    state_->budget.max_physical_origins = state_->options.max_physical_origins;
+    state_->budget.publish_batch =
+        std::max<std::uint64_t>(1, state_->options.piece_hit_publish_batch);
+
+    // Armed once, for the whole life of the context. This is the only reason a cache key may outlive
+    // the batch that created it: every buffer it points into is owned here and never moves.
+    if (scoring_detail::emission_cache_pinned().exchange(true, std::memory_order_relaxed)) {
+        throw std::runtime_error("another PreparedScoringContext already holds the emission cache");
+    }
+    state_->cache_pinned = true;
+    scoring_detail::emission_cache_pinned().store(false, std::memory_order_relaxed);
+    begin_emission_cache(state_->options.emission_cache_bytes);
+    scoring_detail::emission_cache_pinned().store(true, std::memory_order_relaxed);
+}
+
+PreparedScoringContext::~PreparedScoringContext() {
+    if (state_ && state_->cache_pinned) {
+        scoring_detail::emission_cache_pinned().store(false, std::memory_order_relaxed);
+        state_->cumulative_cache = end_emission_cache();
+    }
+}
+
+std::vector<std::size_t> PreparedScoringContext::add_haplotypes(
+    const std::vector<std::string>& sequences,
+    IncrementalBatchReport* report) {
+    State& state = *state_;
+    state.require_usable();
+    const std::size_t before = state.sequences.size();
+
+    std::vector<std::size_t> out;
+    out.reserve(sequences.size());
+    std::size_t reused = 0;
+    for (const std::string& sequence : sequences) {
+        const auto found = state.index_of_sequence.find(sequence);
+        if (found != state.index_of_sequence.end()) {
+            ++reused;
+            out.push_back(found->second);
+            continue;
+        }
+        const std::size_t slot = state.sequences.size();
+        state.index_of_sequence.emplace(sequence, slot);
+        state.sequences.push_back(sequence);
+        state.reversed.emplace_back(sequence.rbegin(), sequence.rend());
+        out.push_back(slot);
+    }
+    const std::size_t after = state.sequences.size();
+    const std::size_t added = after - before;
+
+    if (!state.fragments.empty() &&
+        after > state.options.max_mass_cells / state.fragments.size()) {
+        state.refused = true;
+        throw ResourceExhausted(
+            "the fragment-by-haplotype mass matrix would exceed its declared cell cap; no partial "
+            "ranking is returned");
+    }
+
+    state.mass_column.resize(after, std::vector<double>(state.fragments.size(), kNegInf));
+    state.exposure.resize(after, 0.0);
+    for (std::size_t h = before; h < after; ++h) {
+        state.exposure[h] =
+            exposure_for_length(state.sequences[h].size(), state.fragments.size(),
+                                state.prepared.fragments_by_floor, state.library_insert);
+    }
+
+    FragmentScoringCounters batch;
+    EmissionCacheCounters batch_cache;
+    ScorerMemoryAccounts batch_memory;
+    std::size_t threads_used = 1;
+    const auto mark = std::chrono::steady_clock::now();
+    if (added != 0) {
+        PlacementInputs inputs;
+        inputs.prepared = &state.prepared;
+        inputs.fragments = &state.fragments;
+        inputs.library = &state.library;
+        inputs.library_insert = &state.library_insert;
+        inputs.options = &state.options;
+        inputs.sequences = &state.sequences;
+        inputs.reversed = &state.reversed;
+        inputs.band = state.options.mismatch_band;
+        OriginRecording none;
+        try {
+            threads_used = run_placement(inputs, before, after, state.options.threads, false,
+                                         state.budget, state.mass_column, batch, batch_memory,
+                                         batch_cache, none);
+        } catch (const ResourceExhausted&) {
+            // A refusal invalidates the WHOLE search, not this batch: columns already retained were
+            // computed under a budget that has now been exceeded, and ranking from them would present
+            // a partial search as a complete one.
+            state.refused = true;
+            throw;
+        }
+    }
+    const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - mark).count();
+
+    // Cumulative first, because the caps bound the whole search rather than any one batch.
+    state.cumulative.candidate_bases_scanned += batch.candidate_bases_scanned;
+    state.cumulative.piece_hits += batch.piece_hits;
+    state.cumulative.proposed_starts += batch.proposed_starts;
+    state.cumulative.unique_starts += batch.unique_starts;
+    state.cumulative.full_read_verifications += batch.full_read_verifications;
+    state.cumulative.dp_evaluations += batch.dp_evaluations;
+    state.cumulative.prefilter_rejections += batch.prefilter_rejections;
+    state.cumulative.accepted_mate_placements += batch.accepted_mate_placements;
+    state.cumulative.valid_fr_states += batch.valid_fr_states;
+    state.cumulative.latent_alignment_pairs += batch.latent_alignment_pairs;
+    state.cumulative.physical_origins += batch.physical_origins;
+    state.cumulative.statistical_state_classes += batch.statistical_state_classes;
+    state.cumulative_cache.executed_prefilters += batch_cache.executed_prefilters;
+    state.cumulative_cache.dp_cache_requests += batch_cache.dp_cache_requests;
+    state.cumulative_cache.dp_cache_hits += batch_cache.dp_cache_hits;
+    state.cumulative_cache.dp_cache_misses += batch_cache.dp_cache_misses;
+    state.cumulative_cache.executed_dps += batch_cache.executed_dps;
+    state.cumulative_placement_seconds += seconds;
+
+    try {
+        enforce_acceptance_caps(state.cumulative, state.options, []() {});
+    } catch (const ResourceExhausted&) {
+        state.refused = true;
+        throw;
+    }
+
+    if (report != nullptr) {
+        report->haplotypes_offered = sequences.size();
+        report->haplotypes_new = added;
+        report->haplotypes_reused = reused;
+        report->unique_haplotypes_total = after;
+        report->counters = batch;
+        report->emission_cache = batch_cache;
+        report->seconds_placement_and_mass = seconds;
+        report->threads_used_placement = threads_used;
+        report->memory = batch_memory;
+        const EmissionCacheCounters stored = read_emission_cache_counters();
+        report->emission_cache.payload_bytes = stored.payload_bytes;
+        report->emission_cache.entries = stored.entries;
+        report->emission_cache.entries_not_retained = stored.entries_not_retained;
+        report->cumulative_counters = state.cumulative;
+        report->cumulative_emission_cache = state.cumulative_cache;
+        report->cumulative_emission_cache.payload_bytes = stored.payload_bytes;
+        report->cumulative_emission_cache.entries = stored.entries;
+        report->cumulative_emission_cache.entries_not_retained = stored.entries_not_retained;
+        report->cumulative_seconds_placement_and_mass = state.cumulative_placement_seconds;
+    }
+    return out;
+}
+
+FragmentScoringResult PreparedScoringContext::score_candidates(
+    const std::vector<HaplotypeCandidate>& candidates) const {
+    State& state = *state_;
+    state.require_usable();
+    const std::size_t unique = state.sequences.size();
+    for (const HaplotypeCandidate& candidate : candidates) {
+        if (candidate.first >= unique || candidate.second >= unique) {
+            throw std::invalid_argument("diplotype candidate names an unknown haplotype");
+        }
+    }
+    FragmentScoringResult result;
+    result.scores.resize(candidates.size());
+    result.unique_haplotypes = unique;
+    result.counters = state.cumulative;
+    result.emission_cache = state.cumulative_cache;
+
+    const std::vector<ReadPair>& fragments = state.fragments;
+    const auto combination_mark = std::chrono::steady_clock::now();
+    const auto combine_range = [&](std::size_t begin, std::size_t end) {
+        for (std::size_t c = begin; c < end; ++c) {
+            const std::size_t a = candidates[c].first;
+            const std::size_t b = candidates[c].second;
+            DiplotypeScore& score = result.scores[c];
+            score.exposure_term =
+                -expected_signal_fragments(state.exposure[a] + state.exposure[b], state.library);
+            score.absolute_term_sum = std::abs(score.exposure_term);
+            double fragment_term = 0.0;
+            for (std::size_t f = 0; f < fragments.size(); ++f) {
+                const double combined =
+                    log_add_exp(state.mass_column[a][f], state.mass_column[b][f]);
+                if (combined != kNegInf) ++score.fragments_with_mass;
+                const double contribution = log_fragment_contribution(
+                    combined, state.prepared.background_by_fragment[f], state.library);
+                fragment_term += contribution;
+                score.absolute_term_sum += std::abs(contribution);
+            }
+            score.fragment_term = fragment_term;
+            score.log_likelihood = score.exposure_term + fragment_term;
+        }
+    };
+    const std::size_t threads =
+        candidates.empty()
+            ? 1
+            : std::max<std::size_t>(1, std::min(state.options.threads, candidates.size()));
+    result.threads_used_combination = threads;
+    result.candidate_fragment_evaluations =
+        static_cast<std::uint64_t>(candidates.size()) * static_cast<std::uint64_t>(fragments.size());
+    if (threads <= 1) {
+        combine_range(0, candidates.size());
+    } else {
+        const std::size_t span = (candidates.size() + threads - 1) / threads;
+        std::vector<std::exception_ptr> failures(threads);
+        std::vector<std::thread> workers;
+        workers.reserve(threads);
+        for (std::size_t t = 0; t < threads; ++t) {
+            const std::size_t begin = std::min(t * span, candidates.size());
+            const std::size_t end = std::min(begin + span, candidates.size());
+            workers.emplace_back([&, t, begin, end]() {
+                try {
+                    combine_range(begin, end);
+                } catch (...) {
+                    failures[t] = std::current_exception();
+                }
+            });
+        }
+        for (std::thread& worker : workers) worker.join();
+        for (const std::exception_ptr& failure : failures) {
+            if (failure) std::rethrow_exception(failure);
+        }
+    }
+    result.seconds_diploid_combination =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - combination_mark).count();
+    result.seconds_placement_and_mass = state.cumulative_placement_seconds;
+
+    result.log_mass.assign(fragments.size() * unique, kNegInf);
+    for (std::size_t h = 0; h < unique; ++h) {
+        for (std::size_t f = 0; f < fragments.size(); ++f) {
+            result.log_mass[f * unique + h] = state.mass_column[h][f];
+        }
+    }
+    result.exposure = state.exposure;
+    result.memory.mass_matrix_bytes =
+        static_cast<std::uint64_t>(result.log_mass.size()) * sizeof(double);
+    return result;
+}
+
+std::size_t PreparedScoringContext::unique_haplotypes() const { return state_->sequences.size(); }
+
+double PreparedScoringContext::mass_of(std::size_t fragment, std::size_t haplotype) const {
+    state_->require_usable();
+    return state_->mass_column.at(haplotype).at(fragment);
+}
+
+double PreparedScoringContext::exposure_of(std::size_t haplotype) const {
+    state_->require_usable();
+    return state_->exposure.at(haplotype);
+}
+
+const FragmentScoringCounters& PreparedScoringContext::cumulative_counters() const {
+    return state_->cumulative;
+}
+
+const EmissionCacheCounters& PreparedScoringContext::cumulative_emission_cache() const {
+    return state_->cumulative_cache;
+}
+
+bool PreparedScoringContext::refused() const { return state_->refused; }
 
 CertifiedRanking certify_diplotype_ranking(
     const InternedHaplotypes& haplotypes,

@@ -3333,6 +3333,10 @@ int repair_search(const Args& args) {
     const std::string truth_gfa = args.get("truth-gfa", "");
     const std::size_t local_pairs = std::stoul(args.get("local-pairs", "32"));
     const std::size_t max_rounds = std::stoul(args.get("rounds", "4"));
+    // --context 1 drives the search through one PreparedScoringContext instead of a cold
+    // score_diplotypes per round. The candidate search, the move rule and the model are untouched:
+    // the only difference is who owns the read forms, the piece indexes and the haplotype columns.
+    const bool use_context = args.get("context", "0") != "0";
     const double switch_probability = std::stod(args.get("switch-probability", "0.01"));
     const std::uint64_t declared_cap = std::stoull(args.get("max-neighbors", "0"));
     // Resumption. --start declares where to continue from and --start-score what it must score; the
@@ -3508,6 +3512,22 @@ int repair_search(const Args& args) {
     scoring.max_state_classes = std::stoull(status.at("max_state_classes"));
     scoring.max_mass_cells = std::stoull(status.at("max_mass_cells"));
     scoring.emission_cache_bytes = static_cast<std::size_t>(std::stoull(status.at("emission_cache_bytes")));
+    // A CUMULATIVE budget is a different declared quantity from a per-call one. The campaign's caps
+    // bound one scoring pass; a seven-round search through a persistent context sums seven of them
+    // against a single budget, and inheriting the per-call figure silently would refuse a search that
+    // no round of it exceeded. These overrides are how that difference gets declared out loud.
+    // Named to avoid the neighbourhood bound already called `cap` in this function: that one bounds
+    // how many candidates a round may construct, this one bounds the work the whole search may spend.
+    const auto declared_budget = [&](const char* name, std::uint64_t current) {
+        return std::stoull(args.get(name, std::to_string(current)));
+    };
+    scoring.max_physical_origins =
+        declared_budget("max-physical-origins", scoring.max_physical_origins);
+    scoring.max_state_classes = declared_budget("max-state-classes", scoring.max_state_classes);
+    scoring.max_piece_hits = declared_budget("max-piece-hits", scoring.max_piece_hits);
+    scoring.max_latent_alignment_pairs =
+        declared_budget("max-latent-pairs", scoring.max_latent_alignment_pairs);
+    scoring.max_mass_cells = declared_budget("max-mass-cells", scoring.max_mass_cells);
 
     struct Round {
         std::size_t index = 0;
@@ -3526,8 +3546,20 @@ int repair_search(const Args& args) {
         bool complete = false, unique_best = true, order_invariant = true, swap_invariant = true;
         double separation = 0.0;
         double seconds = 0.0, rss = 0.0;
+        // What the round actually cost, and how much of it was work the previous rounds had already
+        // done. haplotypes_reused is the whole point of the context: in the one-shot path it is zero
+        // by construction, because nothing survives the call.
+        std::size_t haps_new = 0, haps_reused = 0;
+        std::uint64_t bases_scanned = 0, piece_hits = 0;
+        std::uint64_t cache_requests = 0, cache_hits = 0, cache_misses = 0, executed_dps = 0;
+        std::uint64_t physical_origins = 0, state_classes = 0;
+        double placement_seconds = 0.0, combination_seconds = 0.0;
     };
     std::vector<Round> rounds;
+    std::unique_ptr<panvar::PreparedScoringContext> context;
+    if (use_context) {
+        context = std::make_unique<panvar::PreparedScoringContext>(fragments, library, scoring);
+    }
 
     std::vector<std::size_t> cur_first = start_first;
     std::vector<std::size_t> cur_second = start_second;
@@ -3609,13 +3641,38 @@ int repair_search(const Args& args) {
         }
 
         // ---- ONE scoring pass: the current candidate, then its neighbours
-        const panvar::InternedHaplotypes interned = panvar::intern_haplotypes(paths, sequences);
+        //
+        // Both paths resolve each offered sequence to a scoring index and then score the pairs. The
+        // one-shot path interns within the round and forgets afterwards; the context interns against
+        // everything it has ever held, so a haplotype this round shares with the last is not placed
+        // again. Nothing downstream of here knows which path produced the scores.
         std::map<std::pair<std::size_t, std::size_t>, std::size_t> scored_index;
         std::vector<panvar::HaplotypeCandidate> scored_pairs;
         std::vector<std::size_t> pair_of_item;
+        std::vector<std::size_t> slot_of_local;
+        std::map<std::size_t, const std::string*> sequence_of_slot;
+        panvar::IncrementalBatchReport batch;
+        std::optional<panvar::InternedHaplotypes> interned;
+        if (context) {
+            slot_of_local = context->add_haplotypes(sequences, &batch);
+            for (std::size_t i = 0; i < sequences.size(); ++i) {
+                sequence_of_slot.emplace(slot_of_local[i], &sequences[i]);
+            }
+            rec.haps_new = batch.haplotypes_new;
+            rec.haps_reused = batch.haplotypes_reused;
+            rec.unique_haplotypes = batch.unique_haplotypes_total;
+        } else {
+            interned.emplace(panvar::intern_haplotypes(paths, sequences));
+            slot_of_local = interned->index_of;
+            for (std::size_t i = 0; i < sequences.size(); ++i) {
+                sequence_of_slot.emplace(slot_of_local[i], &interned->sequences[slot_of_local[i]]);
+            }
+            rec.haps_new = interned->sequences.size();
+            rec.unique_haplotypes = interned->sequences.size();
+        }
         const auto add_item = [&](std::size_t a, std::size_t b2) {
-            std::size_t x = interned.index_of[a];
-            std::size_t y = interned.index_of[b2];
+            std::size_t x = slot_of_local[a];
+            std::size_t y = slot_of_local[b2];
             if (y < x) std::swap(x, y);
             const auto inserted = scored_index.emplace(std::make_pair(x, y), scored_pairs.size());
             if (inserted.second) scored_pairs.push_back({x, y});
@@ -3623,22 +3680,39 @@ int repair_search(const Args& args) {
         };
         add_item(cur_s1, cur_s2);                                  // item 0 is always the incumbent
         for (const Neighbour& n : neighbours) add_item(n.s1, n.s2);
-        rec.unique_haplotypes = interned.sequences.size();
         rec.scored_pairs = scored_pairs.size();
 
         const auto mark = std::chrono::steady_clock::now();
         const panvar::FragmentScoringResult scored =
-            panvar::score_diplotypes(interned, scored_pairs, fragments, library, scoring);
+            context ? context->score_candidates(scored_pairs)
+                    : panvar::score_diplotypes(*interned, scored_pairs, fragments, library, scoring);
         rec.seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - mark).count();
+        if (context) rec.seconds += batch.seconds_placement_and_mass;
         rec.rss = peak_rss_gib();
+        {
+            const panvar::FragmentScoringCounters& work = context ? batch.counters : scored.counters;
+            const panvar::EmissionCacheCounters& cache =
+                context ? batch.emission_cache : scored.emission_cache;
+            rec.bases_scanned = work.candidate_bases_scanned;
+            rec.piece_hits = work.piece_hits;
+            rec.cache_requests = cache.dp_cache_requests;
+            rec.cache_hits = cache.dp_cache_hits;
+            rec.cache_misses = cache.dp_cache_misses;
+            rec.executed_dps = cache.executed_dps;
+            rec.physical_origins = work.physical_origins;
+            rec.state_classes = work.statistical_state_classes;
+            rec.placement_seconds =
+                context ? batch.seconds_placement_and_mass : scored.seconds_placement_and_mass;
+            rec.combination_seconds = scored.seconds_diploid_combination;
+        }
         cumulative_seconds += rec.seconds;
         cumulative_pairs += scored_pairs.size();
 
         std::vector<double> prior_of_pair(scored_pairs.size(), 0.0);
         for (std::size_t slot = 0; slot < scored_pairs.size(); ++slot) {
             prior_of_pair[slot] = panvar::log_unordered_sequence_pair_prior(
-                model, interned.sequences[scored_pairs[slot].first],
-                interned.sequences[scored_pairs[slot].second], switches);
+                model, *sequence_of_slot.at(scored_pairs[slot].first),
+                *sequence_of_slot.at(scored_pairs[slot].second), switches);
         }
 
         // ---- the guard: the incumbent must still score what it scored before any neighbour is read.
@@ -3785,6 +3859,35 @@ int repair_search(const Args& args) {
         order_all = order_all && r.order_invariant;
         swap_all = swap_all && r.swap_invariant;
     }
+    {
+        double placement = 0.0;
+        double combination = 0.0;
+        std::size_t new_haps = 0;
+        std::size_t reused_haps = 0;
+        for (const Round& r : rounds) {
+            placement += r.placement_seconds;
+            combination += r.combination_seconds;
+            new_haps += r.haps_new;
+            reused_haps += r.haps_reused;
+        }
+        std::uint64_t origins = 0;
+        std::uint64_t classes = 0;
+        for (const Round& r : rounds) {
+            origins += r.physical_origins;
+            classes += r.state_classes;
+        }
+        summary << "cumulative_physical_origins\t" << origins << "\ncumulative_state_classes\t"
+                << classes << "\ndeclared_max_physical_origins\t" << scoring.max_physical_origins
+                << '\n';
+        summary << "scoring_mode\t" << (context ? "prepared_context" : "one_shot_per_round")
+                << "\nhaplotypes_placed\t" << new_haps << "\nhaplotypes_reused\t" << reused_haps
+                << "\nseconds_placement\t" << placement << "\nseconds_combination\t" << combination
+                << "\nfraction_scanning_new_haplotypes\t"
+                << (cumulative_seconds > 0.0 ? placement / cumulative_seconds : 0.0) << '\n';
+        if (context) {
+            summary << "context_unique_haplotypes\t" << context->unique_haplotypes() << '\n';
+        }
+    }
     summary << "rounds_run\t" << rounds.size() << "\nstop_reason\t" << stop_reason
             << "\nvisited_size\t" << visited.size() << "\norder_invariant\t"
             << (order_all ? "true" : "false") << "\nswap_invariant\t" << (swap_all ? "true" : "false")
@@ -3800,7 +3903,10 @@ int repair_search(const Args& args) {
                  "allele_y\thap1_alleles\thap2_alleles\tfragment_term\texposure_term\tprior\ttotal\t"
                  "delta_total\tstatus\tunique_best\tseparation\tneighbours_generated\tneighbours_scored\t"
                  "duplicate\tsuppressed_visited\tself_skipped\trejected_infinite_prior\t"
-                 "unique_haplotypes\tscored_pairs\torder_invariant\tswap_invariant\tseconds\tpeak_rss_gib\n";
+                 "unique_haplotypes\tscored_pairs\torder_invariant\tswap_invariant\tseconds\tpeak_rss_gib\t"
+                 "haplotypes_new\thaplotypes_reused\tbases_scanned\tpiece_hits\tcache_requests\t"
+                 "cache_hits\tcache_misses\texecuted_dps\tphysical_origins\tstate_classes\t"
+                 "placement_seconds\tcombination_seconds\n";
         for (const Round& r : rounds) {
             table << r.index << '\t' << r.start_total << '\t' << (r.moved ? "true" : "false") << '\t'
                   << (r.moved ? model.blocks()[r.block].block_id : std::string("NA")) << '\t'
@@ -3815,7 +3921,12 @@ int repair_search(const Args& args) {
                   << '\t' << r.neighbours << '\t' << r.duplicate << '\t' << r.suppressed << '\t'
                   << r.self_skipped << '\t' << r.rejected_prior << '\t' << r.unique_haplotypes << '\t'
                   << r.scored_pairs << '\t' << (r.order_invariant ? "true" : "false") << '\t'
-                  << (r.swap_invariant ? "true" : "false") << '\t' << r.seconds << '\t' << r.rss << '\n';
+                  << (r.swap_invariant ? "true" : "false") << '\t' << r.seconds << '\t' << r.rss
+                  << '\t' << r.haps_new << '\t' << r.haps_reused << '\t' << r.bases_scanned << '\t'
+                  << r.piece_hits << '\t' << r.cache_requests << '\t' << r.cache_hits << '\t'
+                  << r.cache_misses << '\t' << r.executed_dps << '\t' << r.physical_origins << '\t'
+                  << r.state_classes << '\t' << r.placement_seconds << '\t'
+                  << r.combination_seconds << '\n';
         }
     }
     if (truth_gfa.empty()) {
