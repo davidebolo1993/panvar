@@ -91,11 +91,17 @@ def consolidate(out):
                                        "phase_support": status.get("phase_support", "NA")})
         blocks.extend(block_rows)
         distance = number(summary.get("unordered_distance_total")) if called else np.nan
+        reason = status.get("no_call_reason", "NA")
+        if outcome == "no_call" and reason in ("NA", ""):
+            # Stops before the repair write no no_call_reason; name them from the status itself.
+            state = status.get("status", "")
+            note = status.get("note", "")
+            reason = ("union_scoring_cap" if state == "RESCORE_INCOMPLETE" and "resource cap" in note
+                      else state.lower() if state else "unknown")
         runs.append({
             "job": job.job, "experiment": job.campaign, "subject": job.subject, "coverage": int(job.coverage),
             "outcome": outcome, "status": status.get("status", "NA"),
-            "call_class": status.get("call_class", "NA"), "no_call_reason": status.get("no_call_reason", "NA")
-            if outcome == "no_call" else "none",
+            "call_class": status.get("call_class", "NA"), "no_call_reason": reason if outcome == "no_call" else "none",
             "phase_support": status.get("phase_support", "NA") if called else "NA",
             "final_decision": status.get("final_decision", "NA"), "top_set_size": status.get("top_set_size", "NA"),
             "distance": distance, "floor": number(summary.get("availability_floor_total")),
