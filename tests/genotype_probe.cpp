@@ -3341,6 +3341,12 @@ int repair_search(const Args& args) {
     // origin the replaced block cannot touch. It implies --context, because a delta needs somewhere
     // for the incumbent's census and columns to live between rounds.
     const bool use_delta = args.get("delta", "0") != "0";
+    // Stage 6, diagnostic only: the window-origin cache and the preaggregated merge. Requires --delta.
+    const bool use_origin_cache = args.get("origin-cache", "0") != "0";
+    const std::size_t origin_cache_bytes =
+        static_cast<std::size_t>(std::stoull(args.get("origin-cache-bytes", "0")));
+    const std::uint64_t origin_cache_records = std::stoull(args.get("origin-cache-records", "0"));
+    if (args.get("origin-self-check", "0") != "0") panvar::set_origin_cache_self_check(true);
     const double switch_probability = std::stod(args.get("switch-probability", "0.01"));
     const std::uint64_t declared_cap = std::stoull(args.get("max-neighbors", "0"));
     // Resumption. --start declares where to continue from and --start-score what it must score; the
@@ -3574,11 +3580,21 @@ int repair_search(const Args& args) {
         // rows have warmed. A non-zero row figure after round one means something is still being
         // constructed per candidate.
         std::uint64_t row_constructions = 0, accumulator_growths = 0, origin_growths = 0;
+        // Stage 6: what was reused against what was performed, and where the time went.
+        std::uint64_t oc_hits = 0, oc_misses = 0, oc_stored = 0, oc_entries = 0, oc_bytes = 0;
+        std::uint64_t origins_constructed = 0, origins_loaded = 0;
+        std::uint64_t fragments_reduced = 0, fragments_copied = 0, merge_working_bytes = 0;
+        double seconds_enumeration = 0.0, seconds_filter = 0.0, seconds_aggregate = 0.0;
+        double seconds_reduce = 0.0;
     };
     std::vector<Round> rounds;
     std::unique_ptr<panvar::PreparedScoringContext> context;
     if (use_context || use_delta) {
         context = std::make_unique<panvar::PreparedScoringContext>(fragments, library, scoring);
+        if (use_origin_cache) {
+            context->enable_origin_cache_path(true);
+            context->set_origin_cache_limits(origin_cache_bytes, origin_cache_records);
+        }
     }
 
     std::vector<std::size_t> cur_first = start_first;
@@ -3746,6 +3762,17 @@ int repair_search(const Args& args) {
             round_delta.placement_row_constructions += work.placement_row_constructions;
             round_delta.accumulator_growths += work.accumulator_growths;
             round_delta.origin_output_growths += work.origin_output_growths;
+            round_delta.origin_cache_hits += work.origin_cache_hits;
+            round_delta.origin_cache_misses += work.origin_cache_misses;
+            round_delta.origin_cache_stored += work.origin_cache_stored;
+            round_delta.cached_origin_records_consumed += work.cached_origin_records_consumed;
+            round_delta.physical_origins_constructed += work.physical_origins_constructed;
+            round_delta.fragments_reduced += work.fragments_reduced;
+            round_delta.fragments_copied += work.fragments_copied;
+            round_delta.seconds_enumeration += work.seconds_enumeration;
+            round_delta.seconds_affected_filter += work.seconds_affected_filter;
+            round_delta.seconds_aggregate_merge += work.seconds_aggregate_merge;
+            round_delta.seconds_reduce += work.seconds_reduce;
             round_delta.seconds += work.seconds;
             return slot;
         };
@@ -3833,6 +3860,20 @@ int repair_search(const Args& args) {
                 rec.row_constructions = round_delta.placement_row_constructions;
                 rec.accumulator_growths = round_delta.accumulator_growths;
                 rec.origin_growths = round_delta.origin_output_growths;
+                rec.oc_hits = round_delta.origin_cache_hits;
+                rec.oc_misses = round_delta.origin_cache_misses;
+                rec.oc_stored = round_delta.origin_cache_stored;
+                rec.origins_constructed = round_delta.physical_origins_constructed;
+                rec.origins_loaded = round_delta.cached_origin_records_consumed;
+                rec.fragments_reduced = round_delta.fragments_reduced;
+                rec.fragments_copied = round_delta.fragments_copied;
+                rec.seconds_enumeration = round_delta.seconds_enumeration;
+                rec.seconds_filter = round_delta.seconds_affected_filter;
+                rec.seconds_aggregate = round_delta.seconds_aggregate_merge;
+                rec.seconds_reduce = round_delta.seconds_reduce;
+                rec.oc_entries = context->origin_cache_entries();
+                rec.oc_bytes = context->origin_cache_bytes();
+                rec.merge_working_bytes = context->merge_working_bytes();
             }
             rec.seconds_lookup = panvar::emission_cache_lookup_seconds() - lookup_before;
             {
@@ -4087,7 +4128,10 @@ int repair_search(const Args& args) {
                  "window_bases\ttransient_before\ttransient_after\tfull_haplotype_bytes\t"
                  "window_bytes\tsequence_key_bytes\tseconds_origins\tseconds_merge\t"
                  "seconds_hashing\tseconds_lookup\tentry_metadata_bytes\tcontent_arena_bytes\t"
-                 "row_constructions\taccumulator_growths\torigin_growths\n";
+                 "row_constructions\taccumulator_growths\torigin_growths\t"
+                 "oc_hits\toc_misses\toc_stored\toc_entries\toc_bytes\torigins_constructed\t"
+                 "origins_loaded\tfragments_reduced\tfragments_copied\tmerge_working_bytes\t"
+                 "seconds_enumeration\tseconds_filter\tseconds_aggregate\tseconds_reduce\n";
         for (const Round& r : rounds) {
             table << r.index << '\t' << r.start_total << '\t' << (r.moved ? "true" : "false") << '\t'
                   << (r.moved ? model.blocks()[r.block].block_id : std::string("NA")) << '\t'
@@ -4114,7 +4158,13 @@ int repair_search(const Args& args) {
                   << '\t' << r.seconds_hashing << '\t' << r.seconds_lookup << '\t'
                   << r.entry_metadata_bytes << '\t' << r.content_arena_bytes << '\t'
                   << r.row_constructions << '\t' << r.accumulator_growths << '\t'
-                  << r.origin_growths << '\n';
+                  << r.origin_growths << '\t' << r.oc_hits << '\t' << r.oc_misses << '\t'
+                  << r.oc_stored << '\t' << r.oc_entries << '\t' << r.oc_bytes << '\t'
+                  << r.origins_constructed << '\t' << r.origins_loaded << '\t'
+                  << r.fragments_reduced << '\t' << r.fragments_copied << '\t'
+                  << r.merge_working_bytes << '\t' << r.seconds_enumeration << '\t'
+                  << r.seconds_filter << '\t' << r.seconds_aggregate << '\t' << r.seconds_reduce
+                  << '\n';
         }
     }
     if (truth_gfa.empty()) {

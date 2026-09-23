@@ -2343,6 +2343,242 @@ std::atomic<bool>& window_self_check() {
     return enabled;
 }
 
+// ---- stage 6: the window-origin cache and the preaggregated merge ------------------------------
+
+struct StateCount {
+    StateKey key;
+    std::uint64_t count = 0;
+};
+
+// The map's own notion of "same key": neither orders before the other.
+inline bool same_state(const StateKey& lhs, const StateKey& rhs) {
+    return !(lhs < rhs) && !(rhs < lhs);
+}
+
+// One retained origin, relative to its window, packed to 16 bytes. insert and arm share a word as
+// (insert << 1 | arm), which orders exactly as StateKey orders (insert, orientation).
+struct CachedOrigin {
+    std::uint32_t rel_start = 0;
+    std::uint32_t insert_and_arm = 0;
+    double log_latent_mass = 0.0;
+    std::uint32_t insert() const { return insert_and_arm >> 1; }
+    std::uint32_t arm() const { return insert_and_arm & 1u; }
+};
+static_assert(sizeof(CachedOrigin) == 16, "a cached origin is declared at 16 bytes");
+
+// Records per fragment, sparse: only fragments with at least one record appear. Within a fragment,
+// records are sorted by StateKey and then by relative start -- so a filtered subsequence is still
+// StateKey-sorted, and its multiplicities are run lengths. That is the "sorted StateKey ->
+// multiplicity contribution" and the raw relative origins in one array rather than two.
+struct OriginRecordSet {
+    std::vector<std::uint32_t> fragments;
+    std::vector<std::uint32_t> starts;   // fragments.size() + 1
+    std::vector<CachedOrigin> origins;
+    void clear() {
+        fragments.clear();
+        starts.clear();
+        origins.clear();
+    }
+    bool operator==(const OriginRecordSet& other) const {
+        if (fragments != other.fragments || starts != other.starts) return false;
+        if (origins.size() != other.origins.size()) return false;
+        for (std::size_t i = 0; i < origins.size(); ++i) {
+            const CachedOrigin& a = origins[i];
+            const CachedOrigin& b = other.origins[i];
+            if (a.rel_start != b.rel_start || a.insert_and_arm != b.insert_and_arm ||
+                !(a.log_latent_mass == b.log_latent_mass)) {
+                return false;
+            }
+        }
+        return true;
+    }
+};
+
+// Sparse per-fragment sorted StateKey -> multiplicity arrays, for the merge.
+struct StateAggregateSet {
+    std::vector<std::uint32_t> fragments;
+    std::vector<std::uint32_t> starts;   // fragments.size() + 1 once closed
+    std::vector<StateCount> states;
+    void clear() {
+        fragments.clear();
+        starts.clear();
+        states.clear();
+    }
+    std::uint64_t bytes() const {
+        return static_cast<std::uint64_t>(fragments.capacity() + starts.capacity()) *
+                   sizeof(std::uint32_t) +
+               static_cast<std::uint64_t>(states.capacity()) * sizeof(StateCount);
+    }
+};
+
+// Identity: exact window bytes, the two end flags, and the relative replacement interval that
+// decided which origins were retained. window.begin is deliberately NOT part of it -- records are
+// relative and translated on use, so the same bytes at another locus offset reuse correctly.
+struct OriginCacheEntry {
+    std::string bytes;
+    bool at_start = false;
+    bool at_end = false;
+    std::uint32_t rel_block_begin = 0;
+    std::uint32_t rel_new_end = 0;
+    OriginRecordSet records;
+    std::uint64_t payload = 0;
+};
+
+// Declared per-entry cost: the struct, a hash-node allowance, the key bytes, the origin array and
+// both offset arrays. Size-based, so what a budget is held to does not depend on how a vector grew.
+constexpr std::uint64_t kOriginCacheNodeBytes = 64;
+std::uint64_t origin_entry_bytes(const std::string& bytes, const OriginRecordSet& records) {
+    return sizeof(OriginCacheEntry) + kOriginCacheNodeBytes + bytes.size() +
+           static_cast<std::uint64_t>(records.origins.size()) * sizeof(CachedOrigin) +
+           static_cast<std::uint64_t>(records.fragments.size() + records.starts.size()) *
+               sizeof(std::uint32_t);
+}
+
+struct OriginCache {
+    std::unordered_multimap<std::uint64_t, std::size_t> index;
+    std::deque<OriginCacheEntry> entries;   // stable addresses
+    std::uint64_t bytes = 0;
+    std::uint64_t not_retained = 0;
+};
+
+std::atomic<bool>& origin_self_check() {
+    static std::atomic<bool> enabled{false};
+    return enabled;
+}
+std::atomic<bool>& origin_hash_collapse() {
+    static std::atomic<bool> collapse{false};
+    return collapse;
+}
+
+std::uint64_t origin_key_hash(const std::string& bytes, bool at_start, bool at_end,
+                              std::uint32_t rel_block_begin, std::uint32_t rel_new_end) {
+    if (origin_hash_collapse().load(std::memory_order_relaxed)) return 0;
+    std::uint64_t h = 1469598103934665603ULL;
+    const auto mix = [&h](std::uint64_t value) { h = (h ^ value) * 1099511628211ULL; };
+    for (const char c : bytes) mix(static_cast<unsigned char>(c));
+    mix(0x100u | (at_start ? 1u : 0u) | (at_end ? 2u : 0u));
+    mix(rel_block_begin);
+    mix(rel_new_end);
+    return h;
+}
+
+const OriginCacheEntry* find_origin_entry(const OriginCache& cache, std::uint64_t hash,
+                                          const std::string& bytes, bool at_start, bool at_end,
+                                          std::uint32_t rel_block_begin, std::uint32_t rel_new_end) {
+    const auto range = cache.index.equal_range(hash);
+    for (auto it = range.first; it != range.second; ++it) {
+        const OriginCacheEntry& entry = cache.entries[it->second];
+        // Hash chose the candidates; this decides. Flags and interval first, then every byte.
+        if (entry.at_start == at_start && entry.at_end == at_end &&
+            entry.rel_block_begin == rel_block_begin && entry.rel_new_end == rel_new_end &&
+            entry.bytes == bytes) {
+            return &entry;
+        }
+    }
+    return nullptr;
+}
+
+bool cached_order(const CachedOrigin& lhs, const CachedOrigin& rhs) {
+    if (lhs.insert_and_arm != rhs.insert_and_arm) return lhs.insert_and_arm < rhs.insert_and_arm;
+    if (lhs.log_latent_mass != rhs.log_latent_mass) return lhs.log_latent_mass < rhs.log_latent_mass;
+    return lhs.rel_start < rhs.rel_start;
+}
+
+// The complete window enumeration, relative and pruned to what COULD be affected. An interior
+// window (neither end flag) keeps exactly the origins intersecting the relative replacement; a
+// window touching an end keeps everything, because there the end-margin conditions can fire. The
+// exact absolute filter still runs at every use, so correctness rests only on "retained is a superset
+// of affected".
+void build_origin_records(const WindowScratch& scratch, std::size_t fragment_count, std::size_t base,
+                          std::uint32_t rel_block_begin, std::uint32_t rel_new_end, bool keep_all,
+                          OriginRecordSet& out) {
+    out.clear();
+    for (std::size_t f = 0; f < fragment_count; ++f) {
+        const std::size_t first = out.origins.size();
+        for (std::size_t at = scratch.offsets[f]; at < scratch.offsets[f + 1]; ++at) {
+            const HaploidOrigin& origin = scratch.origins[at];
+            const std::uint32_t rel = static_cast<std::uint32_t>(origin.forward_start - base);
+            if (!keep_all && !(rel < rel_new_end && rel_block_begin < rel + origin.insert_bp)) continue;
+            CachedOrigin record;
+            record.rel_start = rel;
+            record.insert_and_arm = (origin.insert_bp << 1) | (origin.orientation & 1u);
+            record.log_latent_mass = origin.log_latent_mass;
+            out.origins.push_back(record);
+        }
+        if (out.origins.size() == first) continue;
+        std::sort(out.origins.begin() + static_cast<std::ptrdiff_t>(first), out.origins.end(),
+                  cached_order);
+        out.fragments.push_back(static_cast<std::uint32_t>(f));
+        out.starts.push_back(static_cast<std::uint32_t>(first));
+    }
+    out.starts.push_back(static_cast<std::uint32_t>(out.origins.size()));
+}
+
+// Appends one fragment's aggregate to `out`. `first` is where this fragment's states begin, so a
+// run never merges into the previous fragment's last state when two fragments share one array.
+void sort_and_count(std::vector<StateKey>& keys, std::vector<StateCount>& out, std::size_t first) {
+    std::sort(keys.begin(), keys.end());
+    for (const StateKey& key : keys) {
+        if (out.size() > first && same_state(out.back().key, key)) {
+            ++out.back().count;
+        } else {
+            out.push_back({key, 1});
+        }
+    }
+}
+
+// The SAME arithmetic as reduce_states, in the same order, over a sorted array instead of a map:
+// ascending StateKey, one log_add_exp per key. Bit-identical because every operation is.
+double reduce_sorted(const StateCount* first, const StateCount* last,
+                     const DiscreteInsertDistribution& library_insert) {
+    double total = kNegInf;
+    for (; first != last; ++first) {
+        const double term = std::log(static_cast<double>(first->count)) + kLogMateOrientationPrior +
+                            library_insert.log_probability(first->key.insert_bp) +
+                            first->key.log_latent_mass;
+        total = log_add_exp(total, term);
+    }
+    return total;
+}
+
+// Linear merge of two sorted multiplicity arrays; equal keys add, exactly as ++states[key] would.
+void merge_sorted(const StateCount* a, const StateCount* a_end, const StateCount* b,
+                  const StateCount* b_end, std::vector<StateCount>& out) {
+    out.clear();
+    while (a != a_end && b != b_end) {
+        if (a->key < b->key) {
+            out.push_back(*a++);
+        } else if (b->key < a->key) {
+            out.push_back(*b++);
+        } else {
+            out.push_back({a->key, a->count + b->count});
+            ++a;
+            ++b;
+        }
+    }
+    out.insert(out.end(), a, a_end);
+    out.insert(out.end(), b, b_end);
+}
+
+// Unaffected incumbent origins, preaggregated once per exact (incumbent, block interval, length
+// shift): the unaffected predicate reads the shift, so two shifts may not share a preaggregation.
+struct GroupKey {
+    std::size_t incumbent = 0;
+    std::size_t block_begin = 0;
+    std::size_t block_end = 0;
+    std::ptrdiff_t shift = 0;
+    bool operator<(const GroupKey& other) const {
+        return std::tie(incumbent, block_begin, block_end, shift) <
+               std::tie(other.incumbent, other.block_begin, other.block_end, other.shift);
+    }
+};
+struct GroupEntry {
+    std::uint64_t unaffected_origins = 0;
+    // Only fragments with at least one AFFECTED incumbent origin; every other fragment's unaffected
+    // set is its whole census.
+    StateAggregateSet unaffected;
+};
+
 // Diagnostics only; the context leaves every pointer null.
 struct OriginRecording {
     bool summary = false;
@@ -3395,6 +3631,22 @@ struct PreparedScoringContext::State {
     // Reused by every delta: rows, groups, accumulators and the flat origin output.
     WindowScratch window_scratch;
 
+    // Stage 6, off unless enabled. The cache is content-keyed and survives release_transient; the
+    // group preaggregates and full aggregates are working state keyed by incumbent and are dropped
+    // with it.
+    bool origin_path = false;
+    std::size_t origin_cache_budget = 0;
+    std::uint64_t origin_record_cap = 0;
+    std::uint64_t origin_records_consumed = 0;
+    OriginCache origin_cache;
+    std::map<GroupKey, GroupEntry> groups;
+    std::map<std::pair<std::size_t, std::uint32_t>, std::vector<StateCount>> full_aggregates;
+    OriginRecordSet miss_records;
+    OriginRecordSet check_records;
+    StateAggregateSet candidate_states;
+    std::vector<StateKey> key_scratch;
+    std::vector<StateCount> merged;
+
     void require_usable() const {
         if (refused) {
             throw ResourceExhausted(
@@ -3706,6 +3958,45 @@ const EmissionCacheCounters& PreparedScoringContext::cumulative_emission_cache()
 
 bool PreparedScoringContext::refused() const { return state_->refused; }
 
+void PreparedScoringContext::enable_origin_cache_path(bool enabled) {
+    state_->require_usable();
+    state_->origin_path = enabled;
+}
+
+void PreparedScoringContext::set_origin_cache_limits(std::size_t budget_bytes,
+                                                     std::uint64_t max_records_consumed) {
+    state_->require_usable();
+    state_->origin_cache_budget = budget_bytes;
+    state_->origin_record_cap = max_records_consumed;
+}
+
+std::size_t PreparedScoringContext::origin_cache_entries() const {
+    return state_->origin_cache.entries.size();
+}
+std::uint64_t PreparedScoringContext::origin_cache_bytes() const { return state_->origin_cache.bytes; }
+std::uint64_t PreparedScoringContext::origin_cache_not_retained() const {
+    return state_->origin_cache.not_retained;
+}
+std::uint64_t PreparedScoringContext::origin_records_consumed() const {
+    return state_->origin_records_consumed;
+}
+std::uint64_t PreparedScoringContext::merge_working_bytes() const {
+    std::uint64_t total = 0;
+    for (const auto& item : state_->groups) total += sizeof(item) + item.second.unaffected.bytes();
+    for (const auto& item : state_->full_aggregates) {
+        total += sizeof(item) + static_cast<std::uint64_t>(item.second.capacity()) * sizeof(StateCount);
+    }
+    return total;
+}
+
+void set_origin_cache_self_check(bool enabled) {
+    scoring_detail::origin_self_check().store(enabled, std::memory_order_relaxed);
+}
+
+void set_origin_cache_hash_collapse(bool collapse) {
+    scoring_detail::origin_hash_collapse().store(collapse, std::memory_order_relaxed);
+}
+
 void set_window_enumeration_self_check(bool enabled) {
     scoring_detail::window_self_check().store(enabled, std::memory_order_relaxed);
 }
@@ -3962,6 +4253,446 @@ std::size_t PreparedScoringContext::add_repaired_haplotype(
         return std::min(before, end) < margin;
     };
 
+    // ==== stage 6: window-origin cache + preaggregated sorted merge. Off unless enabled; when off,
+    // ==== everything below this block is the stage-5 path, unchanged.
+    if (state.origin_path) {
+        using Clock = std::chrono::steady_clock;
+        const auto seconds_since = [](Clock::time_point from) {
+            return std::chrono::duration<double>(Clock::now() - from).count();
+        };
+        const std::size_t fragment_count = state.fragments.size();
+        const std::size_t base_offset = window.begin;
+        const std::uint32_t rel_block_begin = static_cast<std::uint32_t>(block_begin - base_offset);
+        const std::uint32_t rel_new_end = static_cast<std::uint32_t>(new_end - base_offset);
+        // At an end the margin conditions can fire, so nothing may be pruned there.
+        const bool keep_all = window.at_start || window.at_end;
+        const bool checking = origin_self_check().load(std::memory_order_relaxed);
+
+        FragmentScoringCounters counters;
+        EmissionCacheCounters cache_work;
+        const std::uint64_t rows_before = state.window_scratch.row_constructions;
+        const std::uint64_t accumulators_before = state.window_scratch.accumulator_growths;
+        const std::uint64_t origins_before = state.window_scratch.origin_growths;
+
+        // ---- 1. the window's origins: loaded from the cache, or enumerated and retained if it fits
+        const auto enumeration_mark = Clock::now();
+        const std::uint64_t key_hash = origin_key_hash(window.bases, window.at_start, window.at_end,
+                                                       rel_block_begin, rel_new_end);
+        const OriginCacheEntry* entry =
+            find_origin_entry(state.origin_cache, key_hash, window.bases, window.at_start,
+                              window.at_end, rel_block_begin, rel_new_end);
+        const OriginRecordSet* source = nullptr;
+        bool scratch_is_fresh = false;
+        if (entry != nullptr) {
+            ++local.origin_cache_hits;
+            const std::uint64_t records = entry->records.origins.size();
+            // A separate cap on what REUSE consumes. Executed-work caps are not charged for a hit --
+            // that work was not performed -- so reuse needs a bound of its own.
+            if (state.origin_record_cap != 0 &&
+                state.origin_records_consumed + records > state.origin_record_cap) {
+                state.refused = true;
+                throw ResourceExhausted(
+                    "the origin cache reached its declared consumption cap; no partial ranking is "
+                    "returned");
+            }
+            state.origin_records_consumed += records;
+            local.cached_origin_records_consumed = records;
+            source = &entry->records;
+        } else {
+            ++local.origin_cache_misses;
+            try {
+                enumerate_window_origins(state.prepared, state.fragments, state.library,
+                                         state.options, state.options.mismatch_band, window,
+                                         state.budget, counters, cache_work, state.window_scratch);
+            } catch (const ResourceExhausted&) {
+                state.refused = true;
+                throw;
+            }
+            scratch_is_fresh = true;
+            local.physical_origins_constructed = counters.physical_origins;
+            build_origin_records(state.window_scratch, fragment_count, base_offset, rel_block_begin,
+                                 rel_new_end, keep_all, state.miss_records);
+            source = &state.miss_records;
+            const std::uint64_t cost = origin_entry_bytes(window.bases, state.miss_records);
+            if (state.origin_cache_budget != 0 &&
+                state.origin_cache.bytes + cost <= state.origin_cache_budget) {
+                OriginCacheEntry stored;
+                stored.bytes = window.bases;
+                stored.at_start = window.at_start;
+                stored.at_end = window.at_end;
+                stored.rel_block_begin = rel_block_begin;
+                stored.rel_new_end = rel_new_end;
+                stored.records = state.miss_records;
+                stored.payload = cost;
+                state.origin_cache.entries.push_back(std::move(stored));
+                state.origin_cache.index.emplace(key_hash, state.origin_cache.entries.size() - 1);
+                state.origin_cache.bytes += cost;
+                ++local.origin_cache_stored;
+                source = &state.origin_cache.entries.back().records;   // deque: stable address
+            } else if (state.origin_cache_budget != 0) {
+                // Exhaustion stops RETENTION. The records just built are still used, exactly.
+                ++state.origin_cache.not_retained;
+            }
+        }
+        // Certification of a hit: enumerate fresh against a throwaway budget and require the
+        // retained records to be exactly what a fresh enumeration would retain.
+        if (checking && !scratch_is_fresh) {
+            PlacementBudget spare;
+            spare.max_piece_hits = std::numeric_limits<std::uint64_t>::max();
+            spare.max_physical_origins = std::numeric_limits<std::uint64_t>::max();
+            spare.publish_batch = std::numeric_limits<std::uint64_t>::max();
+            FragmentScoringCounters spare_counters;
+            EmissionCacheCounters spare_cache;
+            enumerate_window_origins(state.prepared, state.fragments, state.library, state.options,
+                                     state.options.mismatch_band, window, spare, spare_counters,
+                                     spare_cache, state.window_scratch);
+            scratch_is_fresh = true;
+            build_origin_records(state.window_scratch, fragment_count, base_offset, rel_block_begin,
+                                 rel_new_end, keep_all, state.check_records);
+            if (!(state.check_records == *source)) {
+                throw std::runtime_error(
+                    "origin-cache self-check: retained origins differ from a fresh enumeration");
+            }
+        }
+        local.seconds_enumeration = seconds_since(enumeration_mark);
+        local.seconds_placement_and_origins = local.seconds_enumeration;
+        local.placement_row_constructions = state.window_scratch.row_constructions - rows_before;
+        local.accumulator_growths = state.window_scratch.accumulator_growths - accumulators_before;
+        local.origin_output_growths = state.window_scratch.origin_growths - origins_before;
+
+        // ---- 2. the EXPLICIT affected filter, on absolute coordinates, aggregated per fragment.
+        // Records are StateKey-sorted within a fragment, so the kept subsequence is too, and each
+        // multiplicity is a run length.
+        const auto filter_mark = Clock::now();
+        StateAggregateSet& candidate = state.candidate_states;
+        candidate.clear();
+        for (std::size_t i = 0; i < source->fragments.size(); ++i) {
+            const std::size_t first = candidate.states.size();
+            for (std::uint32_t at = source->starts[i]; at < source->starts[i + 1]; ++at) {
+                const CachedOrigin& record = source->origins[at];
+                HaploidOrigin origin;
+                origin.forward_start = static_cast<std::uint32_t>(base_offset + record.rel_start);
+                origin.insert_bp = record.insert();
+                origin.orientation = record.arm();
+                origin.log_latent_mass = record.log_latent_mass;
+                if (!affected_new(origin)) continue;
+                ++local.origins_recomputed;
+                StateKey key;
+                key.insert_bp = origin.insert_bp;
+                key.orientation = origin.orientation;
+                key.log_latent_mass = origin.log_latent_mass;
+                if (candidate.states.size() > first && same_state(candidate.states.back().key, key)) {
+                    ++candidate.states.back().count;
+                } else {
+                    candidate.states.push_back({key, 1});
+                }
+            }
+            if (candidate.states.size() > first) {
+                candidate.fragments.push_back(source->fragments[i]);
+                candidate.starts.push_back(static_cast<std::uint32_t>(first));
+            }
+        }
+        candidate.starts.push_back(static_cast<std::uint32_t>(candidate.states.size()));
+        local.seconds_affected_filter = seconds_since(filter_mark);
+
+        // ---- 3. the unaffected incumbent origins, preaggregated once per exact (block, shift)
+        const auto merge_mark = Clock::now();
+        const GroupKey group_key{incumbent, block_begin, block_end, shift};
+        auto group_it = state.groups.find(group_key);
+        if (group_it == state.groups.end()) {
+            GroupEntry built;
+            for (std::size_t f = 0; f < fragment_count; ++f) {
+                const std::vector<HaploidOrigin>& list = census.origins_by_fragment[f];
+                std::size_t hit = 0;
+                for (const HaploidOrigin& origin : list) {
+                    if (affected(origin)) ++hit;
+                }
+                built.unaffected_origins += list.size() - hit;
+                if (hit == 0) continue;   // this fragment's unaffected set is its whole census
+                state.key_scratch.clear();
+                for (const HaploidOrigin& origin : list) {
+                    if (affected(origin)) continue;
+                    StateKey key;
+                    key.insert_bp = origin.insert_bp;
+                    key.orientation = origin.orientation;
+                    key.log_latent_mass = origin.log_latent_mass;
+                    state.key_scratch.push_back(key);
+                }
+                const std::size_t first = built.unaffected.states.size();
+                built.unaffected.fragments.push_back(static_cast<std::uint32_t>(f));
+                built.unaffected.starts.push_back(static_cast<std::uint32_t>(first));
+                sort_and_count(state.key_scratch, built.unaffected.states, first);
+            }
+            built.unaffected.starts.push_back(
+                static_cast<std::uint32_t>(built.unaffected.states.size()));
+            group_it = state.groups.emplace(group_key, std::move(built)).first;
+        }
+        const GroupEntry& group = group_it->second;
+        local.origins_reused = group.unaffected_origins;
+
+        // ---- 4. the slot, exactly as stage 5 makes it
+        std::size_t slot = 0;
+        if (already_held) {
+            slot = held_slot;
+        } else {
+            slot = state.sequences.size();
+            state.by_hash.emplace(repaired_hash, slot);
+            state.hash_by_slot.push_back(repaired_hash);
+            state.sequences.emplace_back();
+            state.reversed.emplace_back();
+            state.segments.emplace(slot, repaired);
+            state.mass_column.resize(slot + 1, std::vector<double>(fragment_count, kNegInf));
+            state.exposure.resize(slot + 1, 0.0);
+            state.exposure[slot] = exposure_for_length(new_length, fragment_count,
+                                                       state.prepared.fragments_by_floor,
+                                                       state.library_insert);
+        }
+        if (retain_census_for_it) {
+            const bool was_segmented = state.segments.count(slot) != 0;
+            state.materialise(slot);
+            local.full_haplotype_bytes_materialised =
+                was_segmented ? static_cast<std::uint64_t>(state.sequences[slot].size() +
+                                                           state.reversed[slot].size())
+                              : 0;
+        }
+
+        // ---- 5. the column. A fragment with no affected origin on EITHER side has the incumbent's
+        // StateKey multiset, so its reduction is the incumbent's value bit for bit: copied. Every
+        // other fragment is merged linearly and reduced in ascending StateKey order.
+        std::vector<double>& column = state.mass_column[slot];
+        if (slot != incumbent) column = state.mass_column[incumbent];
+        std::map<std::uint32_t, std::vector<StateCount>> merged_for_check;
+        std::uint64_t reduced = 0;
+        double reduce_seconds = 0.0;
+        const std::vector<std::uint32_t>& group_fragments = group.unaffected.fragments;
+        const std::vector<std::uint32_t>& candidate_fragments = candidate.fragments;
+        std::size_t gi = 0;
+        std::size_t ci = 0;
+        while (gi < group_fragments.size() || ci < candidate_fragments.size()) {
+            bool in_group = false;
+            bool in_candidate = false;
+            std::uint32_t f = 0;
+            if (ci == candidate_fragments.size() ||
+                (gi < group_fragments.size() && group_fragments[gi] < candidate_fragments[ci])) {
+                f = group_fragments[gi];
+                in_group = true;
+            } else if (gi == group_fragments.size() || candidate_fragments[ci] < group_fragments[gi]) {
+                f = candidate_fragments[ci];
+                in_candidate = true;
+            } else {
+                f = group_fragments[gi];
+                in_group = true;
+                in_candidate = true;
+            }
+            const StateCount* base_first = nullptr;
+            const StateCount* base_last = nullptr;
+            if (in_group) {
+                base_first = group.unaffected.states.data() + group.unaffected.starts[gi];
+                base_last = group.unaffected.states.data() + group.unaffected.starts[gi + 1];
+            } else {
+                const auto aggregate_key = std::make_pair(incumbent, f);
+                auto aggregate = state.full_aggregates.find(aggregate_key);
+                if (aggregate == state.full_aggregates.end()) {
+                    state.key_scratch.clear();
+                    for (const HaploidOrigin& origin : census.origins_by_fragment[f]) {
+                        StateKey key;
+                        key.insert_bp = origin.insert_bp;
+                        key.orientation = origin.orientation;
+                        key.log_latent_mass = origin.log_latent_mass;
+                        state.key_scratch.push_back(key);
+                    }
+                    std::vector<StateCount> whole;
+                    sort_and_count(state.key_scratch, whole, 0);
+                    aggregate = state.full_aggregates.emplace(aggregate_key, std::move(whole)).first;
+                }
+                base_first = aggregate->second.data();
+                base_last = aggregate->second.data() + aggregate->second.size();
+            }
+            const StateCount* add_first = nullptr;
+            const StateCount* add_last = nullptr;
+            if (in_candidate) {
+                add_first = candidate.states.data() + candidate.starts[ci];
+                add_last = candidate.states.data() + candidate.starts[ci + 1];
+            }
+            merge_sorted(base_first, base_last, add_first, add_last, state.merged);
+            if (state.merged.empty()) {
+                column[f] = kNegInf;
+            } else {
+                const auto reduce_mark = Clock::now();
+                column[f] = reduce_sorted(state.merged.data(),
+                                          state.merged.data() + state.merged.size(),
+                                          state.library_insert);
+                reduce_seconds += seconds_since(reduce_mark);
+                // Executed work only: copied fragments formed no states.
+                state.cumulative.statistical_state_classes += state.merged.size();
+            }
+            ++reduced;
+            if (checking) merged_for_check.emplace(f, state.merged);
+            if (in_group) ++gi;
+            if (in_candidate) ++ci;
+        }
+        local.fragments_reduced = reduced;
+        local.fragments_copied = fragment_count - reduced;
+        local.seconds_reduce = reduce_seconds;
+        local.seconds_aggregate_merge = seconds_since(merge_mark) - reduce_seconds;
+        local.seconds_statekey_merge = local.seconds_aggregate_merge + reduce_seconds;
+
+        // ---- 6. certification against the stage-5 std::map merge over a FRESH, unpruned enumeration
+        if (checking) {
+            std::map<StateKey, std::uint64_t> states;
+            for (std::size_t f = 0; f < fragment_count; ++f) {
+                states.clear();
+                for (const HaploidOrigin& origin : census.origins_by_fragment[f]) {
+                    if (affected(origin)) continue;
+                    StateKey key;
+                    key.insert_bp = origin.insert_bp;
+                    key.orientation = origin.orientation;
+                    key.log_latent_mass = origin.log_latent_mass;
+                    ++states[key];
+                }
+                for (std::size_t at = state.window_scratch.offsets[f];
+                     at < state.window_scratch.offsets[f + 1]; ++at) {
+                    const HaploidOrigin& origin = state.window_scratch.origins[at];
+                    if (!affected_new(origin)) continue;
+                    StateKey key;
+                    key.insert_bp = origin.insert_bp;
+                    key.orientation = origin.orientation;
+                    key.log_latent_mass = origin.log_latent_mass;
+                    ++states[key];
+                }
+                const double expected = states.empty() ? kNegInf : reduce_states(states, state.library_insert);
+                if (!(column[f] == expected)) {
+                    throw std::runtime_error("origin-path self-check: mass diverged at fragment " +
+                                             std::to_string(f));
+                }
+                const auto merged = merged_for_check.find(static_cast<std::uint32_t>(f));
+                if (merged == merged_for_check.end()) continue;   // copied: its mass was checked
+                if (merged->second.size() != states.size()) {
+                    throw std::runtime_error("origin-path self-check: state count diverged at fragment " +
+                                             std::to_string(f));
+                }
+                auto expected_state = states.begin();
+                for (const StateCount& mine : merged->second) {
+                    if (!same_state(mine.key, expected_state->first) ||
+                        mine.count != expected_state->second) {
+                        throw std::runtime_error(
+                            "origin-path self-check: key or multiplicity diverged at fragment " +
+                            std::to_string(f));
+                    }
+                    ++expected_state;
+                }
+            }
+        }
+
+        // ---- 7. the promoted winner's census: unaffected (moved) + affected (translated records)
+        local.census_payload_bytes_predicted = census.payload_bytes();
+        if (retain_census_for_it) {
+            HaploidOriginCensus fresh;
+            fresh.haplotype_length = new_length;
+            fresh.origins_by_fragment.assign(fragment_count, {});
+            for (std::size_t f = 0; f < fragment_count; ++f) {
+                for (const HaploidOrigin& origin : census.origins_by_fragment[f]) {
+                    if (affected(origin)) continue;
+                    HaploidOrigin moved = origin;
+                    if (origin.forward_start >= block_end) {
+                        moved.forward_start = static_cast<std::uint32_t>(
+                            static_cast<std::ptrdiff_t>(origin.forward_start) + shift);
+                    }
+                    fresh.origins_by_fragment[f].push_back(moved);
+                }
+            }
+            for (std::size_t i = 0; i < source->fragments.size(); ++i) {
+                const std::uint32_t f = source->fragments[i];
+                for (std::uint32_t at = source->starts[i]; at < source->starts[i + 1]; ++at) {
+                    const CachedOrigin& record = source->origins[at];
+                    HaploidOrigin origin;
+                    origin.forward_start = static_cast<std::uint32_t>(base_offset + record.rel_start);
+                    origin.insert_bp = record.insert();
+                    origin.orientation = record.arm();
+                    origin.log_latent_mass = record.log_latent_mass;
+                    if (affected_new(origin)) fresh.origins_by_fragment[f].push_back(origin);
+                }
+            }
+            // Census ORDER carries no meaning -- every consumer aggregates it -- so the stage-5 census
+            // is compared as a per-fragment multiset.
+            if (checking) {
+                const auto order = [](const HaploidOrigin& lhs, const HaploidOrigin& rhs) {
+                    return std::tie(lhs.forward_start, lhs.insert_bp, lhs.orientation,
+                                    lhs.log_latent_mass) <
+                           std::tie(rhs.forward_start, rhs.insert_bp, rhs.orientation,
+                                    rhs.log_latent_mass);
+                };
+                for (std::size_t f = 0; f < fragment_count; ++f) {
+                    std::vector<HaploidOrigin> expect;
+                    for (const HaploidOrigin& origin : census.origins_by_fragment[f]) {
+                        if (affected(origin)) continue;
+                        HaploidOrigin moved = origin;
+                        if (origin.forward_start >= block_end) {
+                            moved.forward_start = static_cast<std::uint32_t>(
+                                static_cast<std::ptrdiff_t>(origin.forward_start) + shift);
+                        }
+                        expect.push_back(moved);
+                    }
+                    for (std::size_t at = state.window_scratch.offsets[f];
+                         at < state.window_scratch.offsets[f + 1]; ++at) {
+                        const HaploidOrigin& origin = state.window_scratch.origins[at];
+                        if (affected_new(origin)) expect.push_back(origin);
+                    }
+                    std::vector<HaploidOrigin> mine = fresh.origins_by_fragment[f];
+                    std::sort(expect.begin(), expect.end(), order);
+                    std::sort(mine.begin(), mine.end(), order);
+                    bool same = expect.size() == mine.size();
+                    for (std::size_t k = 0; same && k < mine.size(); ++k) {
+                        same = mine[k].forward_start == expect[k].forward_start &&
+                               mine[k].insert_bp == expect[k].insert_bp &&
+                               mine[k].orientation == expect[k].orientation &&
+                               mine[k].log_latent_mass == expect[k].log_latent_mass;
+                    }
+                    if (!same) {
+                        throw std::runtime_error(
+                            "origin-path self-check: promoted census diverged at fragment " +
+                            std::to_string(f));
+                    }
+                }
+            }
+            local.census_payload_bytes_observed = fresh.payload_bytes();
+            state.censuses.emplace(slot, std::move(fresh));
+        }
+
+        // ---- 8. work counters: ONLY what was executed. A hit leaves every one of these at zero.
+        local.piece_hits = counters.piece_hits;
+        local.dp_executions = cache_work.executed_dps;
+        local.cache_misses = cache_work.dp_cache_misses;
+        local.cache_requests = cache_work.dp_cache_requests;
+        local.cache_hits = cache_work.dp_cache_hits;
+        state.cumulative.piece_hits += counters.piece_hits;
+        state.cumulative.candidate_bases_scanned += counters.candidate_bases_scanned;
+        state.cumulative.physical_origins += counters.physical_origins;
+        state.cumulative.latent_alignment_pairs += counters.latent_alignment_pairs;
+        state.cumulative.valid_fr_states += counters.valid_fr_states;
+        state.cumulative.full_read_verifications += counters.full_read_verifications;
+        state.cumulative.proposed_starts += counters.proposed_starts;
+        state.cumulative.unique_starts += counters.unique_starts;
+        state.cumulative.accepted_mate_placements += counters.accepted_mate_placements;
+        state.cumulative.dp_evaluations += counters.dp_evaluations;
+        state.cumulative.prefilter_rejections += counters.prefilter_rejections;
+        state.cumulative_cache.executed_prefilters += cache_work.executed_prefilters;
+        state.cumulative_cache.dp_cache_requests += cache_work.dp_cache_requests;
+        state.cumulative_cache.dp_cache_hits += cache_work.dp_cache_hits;
+        state.cumulative_cache.dp_cache_misses += cache_work.dp_cache_misses;
+        state.cumulative_cache.executed_dps += cache_work.executed_dps;
+        try {
+            enforce_acceptance_caps(state.cumulative, state.options, []() {});
+        } catch (const ResourceExhausted&) {
+            state.refused = true;
+            throw;
+        }
+        local.seconds = seconds_since(mark);
+        state.cumulative_placement_seconds += local.seconds;
+        if (work != nullptr) *work = local;
+        return slot;
+    }
+
     FragmentScoringCounters counters;
     EmissionCacheCounters cache_work;
     const std::uint64_t rows_before = state.window_scratch.row_constructions;
@@ -4136,6 +4867,23 @@ std::size_t PreparedScoringContext::add_repaired_haplotype(
 void PreparedScoringContext::release_transient(const std::vector<std::size_t>& keep) {
     State& state = *state_;
     const std::set<std::size_t> retained(keep.begin(), keep.end());
+    // Group preaggregates and full aggregates are keyed by incumbent and are pure working state:
+    // an incumbent that is not kept will never be delta'd from again. The origin cache is content-
+    // keyed and deliberately survives -- that is what lets the next round reuse this one's windows.
+    for (auto it = state.groups.begin(); it != state.groups.end();) {
+        if (retained.count(it->first.incumbent) == 0) {
+            it = state.groups.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    for (auto it = state.full_aggregates.begin(); it != state.full_aggregates.end();) {
+        if (retained.count(it->first.first) == 0) {
+            it = state.full_aggregates.erase(it);
+        } else {
+            ++it;
+        }
+    }
     for (std::size_t slot = state.transient_watermark; slot < state.sequences.size(); ++slot) {
         if (retained.count(slot) != 0) continue;
         if (state.sequences[slot].empty() && state.mass_column[slot].empty() &&

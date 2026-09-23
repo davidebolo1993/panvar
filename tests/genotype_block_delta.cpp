@@ -966,6 +966,390 @@ void test_scratch_does_not_allocate_per_candidate() {
     std::cout << "  ok: the enumeration builds no per-form or per-origin container after warm-up\n";
 }
 
+// ================================================================================================
+// Stage 6: the window-origin cache and the preaggregated sorted merge.
+// ================================================================================================
+
+struct Repair {
+    std::size_t begin = 0;
+    std::size_t end = 0;
+    std::string allele;
+};
+
+struct SearchResult {
+    std::vector<double> cells;
+    std::vector<double> exposures;
+    std::vector<double> scores;
+    std::uint64_t hits = 0, misses = 0, stored = 0, copied = 0, reduced = 0;
+    std::uint64_t executed_origins = 0, consumed = 0, not_retained = 0, cache_bytes = 0;
+    std::uint64_t hit_calls_with_work = 0;   // a hit that nevertheless charged executed work
+};
+
+struct SearchOptions {
+    bool origin_path = false;
+    std::size_t budget = 0;
+    std::uint64_t record_cap = 0;
+    std::size_t threads = 1;
+    std::uint64_t max_physical_origins = 0;
+};
+
+// Round A scores every repair against the base; one same-length repair is promoted to incumbent and
+// the rest released; round B scores the same repairs against the winner. Windows away from the
+// promoted block are byte-identical in round B, which is what a cross-round cache is for.
+SearchResult mini_search(const Locus& l, const std::vector<Repair>& repairs, std::size_t promote,
+                         const SearchOptions& how) {
+    panvar::FragmentScoringOptions opts = options();
+    opts.threads = how.threads;
+    if (how.max_physical_origins != 0) opts.max_physical_origins = how.max_physical_origins;
+    panvar::PreparedScoringContext context(l.fragments, library(), opts);
+    context.add_haplotypes({l.base});
+    context.begin_transient_round();
+    context.retain_census(0);
+    if (how.origin_path) {
+        context.enable_origin_cache_path(true);
+        context.set_origin_cache_limits(how.budget, how.record_cap);
+    }
+    SearchResult out;
+    const auto record = [&](std::size_t incumbent, std::size_t slot, const panvar::BlockDeltaWork& w) {
+        for (std::size_t f = 0; f < l.fragments.size(); ++f) out.cells.push_back(context.mass_of(f, slot));
+        out.exposures.push_back(context.exposure_of(slot));
+        out.scores.push_back(context.score_candidates({{incumbent, slot}}).scores[0].log_likelihood);
+        out.hits += w.origin_cache_hits;
+        out.misses += w.origin_cache_misses;
+        out.stored += w.origin_cache_stored;
+        out.copied += w.fragments_copied;
+        out.reduced += w.fragments_reduced;
+        if (w.origin_cache_hits != 0 &&
+            (w.piece_hits != 0 || w.dp_executions != 0 || w.physical_origins_constructed != 0)) {
+            ++out.hit_calls_with_work;
+        }
+    };
+    for (const Repair& r : repairs) {
+        panvar::BlockDeltaWork w;
+        const std::size_t slot = context.add_repaired_haplotype(0, r.begin, r.end, r.allele, &w);
+        record(0, slot, w);
+    }
+    panvar::BlockDeltaWork promoted;
+    const Repair& chosen = repairs[promote];
+    const std::size_t winner =
+        context.add_repaired_haplotype(0, chosen.begin, chosen.end, chosen.allele, &promoted, true);
+    record(0, winner, promoted);
+    context.release_transient({winner});
+    for (std::size_t i = 0; i < repairs.size(); ++i) {
+        if (i == promote) continue;
+        panvar::BlockDeltaWork w;
+        const std::size_t slot =
+            context.add_repaired_haplotype(winner, repairs[i].begin, repairs[i].end, repairs[i].allele, &w);
+        record(winner, slot, w);
+    }
+    out.executed_origins = context.cumulative_counters().physical_origins;
+    out.consumed = context.origin_records_consumed();
+    out.not_retained = context.origin_cache_not_retained();
+    out.cache_bytes = context.origin_cache_bytes();
+    return out;
+}
+
+void require_same_search(const SearchResult& got, const SearchResult& want, const std::string& label) {
+    require(got.cells.size() == want.cells.size(), label + ": cell counts differ");
+    for (std::size_t i = 0; i < want.cells.size(); ++i) {
+        require_identical(got.cells[i], want.cells[i], label + ": mass cell " + std::to_string(i));
+    }
+    for (std::size_t i = 0; i < want.exposures.size(); ++i) {
+        require_identical(got.exposures[i], want.exposures[i], label + ": exposure " + std::to_string(i));
+    }
+    for (std::size_t i = 0; i < want.scores.size(); ++i) {
+        require_identical(got.scores[i], want.scores[i], label + ": score " + std::to_string(i));
+    }
+}
+
+// Five blocks: one near the start (an at_start window), three interior, one near the end (at_end).
+struct MultiBlock {
+    Locus locus;
+    std::vector<Repair> repairs;
+    std::size_t promote = 0;   // a same-length substitution, so coordinates hold in round B
+};
+
+MultiBlock multi_block(std::uint64_t seed) {
+    std::mt19937_64 rng(seed);
+    MultiBlock out;
+    out.locus.base = random_bases(rng, 6000);
+    std::size_t n = 0;
+    for (std::size_t start = 0; start + 260 <= out.locus.base.size(); start += 11) {
+        out.locus.fragments.push_back(fragment_at(out.locus.base, start, 260, 100, "m" + std::to_string(n++)));
+    }
+    const std::vector<std::size_t> blocks = {50, 1500, 3000, 4500, 5900};
+    for (const std::size_t b : blocks) {
+        const std::size_t e = std::min<std::size_t>(b + 40, out.locus.base.size());
+        out.repairs.push_back({b, e, random_bases(rng, e - b)});           // same length
+        out.repairs.push_back({b, e, random_bases(rng, (e - b) + 23)});    // longer
+        out.repairs.push_back({b, e, random_bases(rng, (e - b) / 3)});     // shorter
+    }
+    out.promote = 6;   // the same-length substitution at block 3000
+    return out;
+}
+
+void test_origin_path_matches_stage5() {
+    const MultiBlock m = multi_block(606);
+    const SearchResult stage5 = mini_search(m.locus, m.repairs, m.promote, {});
+    SearchOptions cached;
+    cached.origin_path = true;
+    cached.budget = std::size_t{1} << 30;
+    panvar::set_origin_cache_self_check(true);
+    SearchResult got;
+    try {
+        got = mini_search(m.locus, m.repairs, m.promote, cached);
+    } catch (...) {
+        panvar::set_origin_cache_self_check(false);
+        throw;
+    }
+    panvar::set_origin_cache_self_check(false);
+    require_same_search(got, stage5, "origin path vs stage 5");
+    require(got.hits > 0, "round B must reuse windows, or the cache path was never exercised");
+    require(got.copied > 0, "some fragments must be copied, or the untouched-fragment path is untested");
+    require(got.hit_calls_with_work == 0, "a cache hit must charge no executed work");
+    std::cout << "  ok: bit-identical to stage 5 over " << got.cells.size() << " cells; " << got.hits
+              << " hits, " << got.misses << " misses; " << got.copied << " fragments copied, "
+              << got.reduced << " reduced; self-check certified keys, multiplicities and census\n";
+}
+
+void test_origin_budgets_identical() {
+    const MultiBlock m = multi_block(707);
+    SearchOptions disabled;
+    disabled.origin_path = true;
+    disabled.budget = 0;
+    SearchOptions full = disabled;
+    full.budget = std::size_t{1} << 30;
+    const SearchResult none = mini_search(m.locus, m.repairs, m.promote, disabled);
+    const SearchResult all = mini_search(m.locus, m.repairs, m.promote, full);
+    SearchOptions small = disabled;
+    small.budget = static_cast<std::size_t>(all.cache_bytes / 3);
+    const SearchResult some = mini_search(m.locus, m.repairs, m.promote, small);
+    require_same_search(all, none, "fully retained vs disabled");
+    require_same_search(some, none, "undersized vs disabled");
+    require(none.hits == 0, "a disabled cache must not hit");
+    require(all.hits > some.hits, "an undersized cache must hit less than a full one");
+    require(some.not_retained > 0, "the undersized budget must actually decline entries");
+    std::cout << "  ok: disabled (" << none.hits << " hits), undersized (" << some.hits << " hits, "
+              << some.not_retained << " declined) and full (" << all.hits << " hits, " << all.cache_bytes
+              << " bytes) are identical\n";
+}
+
+void test_origin_forced_collisions() {
+    const MultiBlock m = multi_block(808);
+    const SearchResult stage5 = mini_search(m.locus, m.repairs, m.promote, {});
+    SearchOptions cached;
+    cached.origin_path = true;
+    cached.budget = std::size_t{1} << 30;
+    panvar::set_origin_cache_hash_collapse(true);
+    panvar::set_origin_cache_self_check(true);
+    SearchResult got;
+    try {
+        got = mini_search(m.locus, m.repairs, m.promote, cached);
+    } catch (...) {
+        panvar::set_origin_cache_hash_collapse(false);
+        panvar::set_origin_cache_self_check(false);
+        throw;
+    }
+    panvar::set_origin_cache_hash_collapse(false);
+    panvar::set_origin_cache_self_check(false);
+    require_same_search(got, stage5, "forced collisions vs stage 5");
+    require(got.hits > 0, "collisions must still let genuine hits through");
+    std::cout << "  ok: every key in one bucket, " << got.hits << " hits, results unchanged\n";
+}
+
+// halo = max supported insert + longest read + max_gap_bp, exactly as the delta computes it.
+std::size_t fixture_halo() {
+    return panvar::library_insert_support(library()).max_bp + 100 + library().max_gap_bp;
+}
+
+void test_origin_translation_across_offsets() {
+    // Two copies of one segment at different offsets. The window around the same relative block in
+    // each is byte-identical, so the second must be a HIT, served from records stored relative to the
+    // first window and translated to the second's offset.
+    std::mt19937_64 rng(909);
+    const std::size_t halo = fixture_halo();
+    const std::string zone = random_bases(rng, halo + 40 + halo);
+    const std::string base = random_bases(rng, 700) + zone + random_bases(rng, 700) + zone + random_bases(rng, 700);
+    Locus l;
+    l.base = base;
+    std::size_t n = 0;
+    for (std::size_t start = 0; start + 260 <= base.size(); start += 9) {
+        l.fragments.push_back(fragment_at(base, start, 260, 100, "z" + std::to_string(n++)));
+    }
+    const std::string allele = random_bases(rng, 40);
+    const std::size_t first_block = 700 + halo;
+    const std::size_t second_block = 700 + zone.size() + 700 + halo;
+    const std::vector<Repair> repairs = {{first_block, first_block + 40, allele},
+                                         {second_block, second_block + 40, allele}};
+
+    const auto run = [&](bool origin) {
+        panvar::PreparedScoringContext context(l.fragments, library(), options());
+        context.add_haplotypes({l.base});
+        context.begin_transient_round();
+        context.retain_census(0);
+        if (origin) {
+            context.enable_origin_cache_path(true);
+            context.set_origin_cache_limits(std::size_t{1} << 30, 0);
+        }
+        std::vector<double> cells;
+        std::vector<panvar::BlockDeltaWork> works;
+        for (const Repair& r : repairs) {
+            panvar::BlockDeltaWork w;
+            const std::size_t slot = context.add_repaired_haplotype(0, r.begin, r.end, r.allele, &w);
+            for (std::size_t f = 0; f < l.fragments.size(); ++f) cells.push_back(context.mass_of(f, slot));
+            works.push_back(w);
+        }
+        return std::make_pair(cells, works);
+    };
+    const auto stage5 = run(false);
+    panvar::set_origin_cache_self_check(true);
+    std::pair<std::vector<double>, std::vector<panvar::BlockDeltaWork>> cached;
+    try {
+        cached = run(true);
+    } catch (...) {
+        panvar::set_origin_cache_self_check(false);
+        throw;
+    }
+    panvar::set_origin_cache_self_check(false);
+    require(cached.second[0].origin_cache_misses == 1, "the first copy must be enumerated");
+    require(cached.second[1].origin_cache_hits == 1,
+            "the second copy's identical window must be a hit at a different offset");
+    for (std::size_t i = 0; i < stage5.first.size(); ++i) {
+        require_identical(cached.first[i], stage5.first[i], "translated cell " + std::to_string(i));
+    }
+    std::cout << "  ok: identical window " << (second_block - first_block)
+              << " bp further along is a hit, translated, and every cell matches stage 5\n";
+}
+
+void test_origin_end_flags_never_alias() {
+    // The same bytes twice, the second copy flush with the locus END, so its window carries at_end and
+    // the first does not. at_end changes which placements the enumeration keeps, so a hit here would
+    // be a wrong answer: it must be a miss.
+    std::mt19937_64 rng(1010);
+    const std::size_t halo = fixture_halo();
+    const std::string zone = random_bases(rng, halo + 40 + halo);
+    const std::string base = random_bases(rng, 700) + zone + random_bases(rng, 700) + zone;
+    Locus l;
+    l.base = base;
+    std::size_t n = 0;
+    for (std::size_t start = 0; start + 260 <= base.size(); start += 9) {
+        l.fragments.push_back(fragment_at(base, start, 260, 100, "e" + std::to_string(n++)));
+    }
+    const std::string allele = random_bases(rng, 40);
+    const std::size_t first_block = 700 + halo;
+    const std::size_t second_block = 700 + zone.size() + 700 + halo;
+
+    const auto run = [&](bool origin) {
+        panvar::PreparedScoringContext context(l.fragments, library(), options());
+        context.add_haplotypes({l.base});
+        context.begin_transient_round();
+        context.retain_census(0);
+        if (origin) {
+            context.enable_origin_cache_path(true);
+            context.set_origin_cache_limits(std::size_t{1} << 30, 0);
+        }
+        std::vector<double> cells;
+        std::vector<panvar::BlockDeltaWork> works;
+        for (const std::size_t b : {first_block, second_block}) {
+            panvar::BlockDeltaWork w;
+            const std::size_t slot = context.add_repaired_haplotype(0, b, b + 40, allele, &w);
+            for (std::size_t f = 0; f < l.fragments.size(); ++f) cells.push_back(context.mass_of(f, slot));
+            works.push_back(w);
+        }
+        return std::make_pair(cells, works);
+    };
+    const auto stage5 = run(false);
+    const auto cached = run(true);
+    require(cached.second[1].origin_cache_misses == 1,
+            "an at_end window must never be served by an interior window's entry");
+    for (std::size_t i = 0; i < stage5.first.size(); ++i) {
+        require_identical(cached.first[i], stage5.first[i], "end-flag cell " + std::to_string(i));
+    }
+    std::cout << "  ok: byte-identical windows differing only in at_end do not alias\n";
+}
+
+void test_origin_length_shifts_keep_groups_apart() {
+    // Three lengths at one near-start block: three shifts, three unaffected sets. Near an end the
+    // unaffected predicate reads the shift, so a preaggregation shared across shifts would be wrong
+    // for two of them; the self-check compares every merged key against the stage-5 map.
+    std::mt19937_64 rng(1111);
+    Locus l;
+    l.base = random_bases(rng, 2500);
+    std::size_t n = 0;
+    for (std::size_t start = 0; start + 260 <= l.base.size(); start += 7) {
+        l.fragments.push_back(fragment_at(l.base, start, 260, 100, "s" + std::to_string(n++)));
+    }
+    std::vector<Repair> repairs;
+    for (const std::size_t length : {40u, 5u, 71u, 40u, 5u, 71u}) {   // each shift twice: groups reused
+        repairs.push_back({30, 70, random_bases(rng, length)});
+    }
+    const SearchResult stage5 = mini_search(l, repairs, 0, {});
+    SearchOptions cached;
+    cached.origin_path = true;
+    cached.budget = std::size_t{1} << 30;
+    panvar::set_origin_cache_self_check(true);
+    SearchResult got;
+    try {
+        got = mini_search(l, repairs, 0, cached);
+    } catch (...) {
+        panvar::set_origin_cache_self_check(false);
+        throw;
+    }
+    panvar::set_origin_cache_self_check(false);
+    require_same_search(got, stage5, "length shifts vs stage 5");
+    std::cout << "  ok: shifts -35, 0 and +31 at a near-start block keep separate preaggregations\n";
+}
+
+void test_origin_caps_count_executed_work() {
+    const MultiBlock m = multi_block(1212);
+    SearchOptions none;
+    none.origin_path = true;
+    SearchOptions full = none;
+    full.budget = std::size_t{1} << 30;
+    const SearchResult enumerated = mini_search(m.locus, m.repairs, m.promote, none);
+    const SearchResult reused = mini_search(m.locus, m.repairs, m.promote, full);
+    require(reused.executed_origins < enumerated.executed_origins,
+            "hits must not be charged as executed physical origins");
+
+    // Executed-work cap: exactly what the cached search executed is enough for it.
+    SearchOptions exact = full;
+    exact.max_physical_origins = reused.executed_origins;
+    (void)mini_search(m.locus, m.repairs, m.promote, exact);
+
+    // Consumption cap: at the measured figure accepted, one below refused with no ranking.
+    SearchOptions at_cap = full;
+    at_cap.record_cap = reused.consumed;
+    const SearchResult accepted = mini_search(m.locus, m.repairs, m.promote, at_cap);
+    require_same_search(accepted, reused, "consumption cap at the bound");
+    SearchOptions under = full;
+    under.record_cap = reused.consumed - 1;
+    bool refused = false;
+    try {
+        (void)mini_search(m.locus, m.repairs, m.promote, under);
+    } catch (const panvar::ResourceExhausted&) {
+        refused = true;
+    }
+    require(refused, "one record below the consumption cap must refuse");
+    std::cout << "  ok: executed origins " << reused.executed_origins << " (cached) vs "
+              << enumerated.executed_origins << " (enumerated); consumption cap " << reused.consumed
+              << " accepts, one below refuses\n";
+}
+
+void test_origin_threads_identical() {
+    const MultiBlock m = multi_block(1313);
+    SearchOptions base;
+    base.origin_path = true;
+    base.budget = std::size_t{1} << 30;
+    const SearchResult one = mini_search(m.locus, m.repairs, m.promote, base);
+    for (const std::size_t threads : {2u, 4u, 8u}) {
+        SearchOptions how = base;
+        how.threads = threads;
+        require_same_search(mini_search(m.locus, m.repairs, m.promote, how), one,
+                            std::to_string(threads) + " threads");
+    }
+    std::cout << "  ok: 1/2/4/8 threads bit-identical on the origin path\n";
+}
+
 void test_cumulative_caps_through_the_delta() {
     const Locus l = locus(99, {400});
     std::mt19937_64 rng(11);
@@ -1045,6 +1429,22 @@ int main() {
         test_transient_release();
         std::cout << "== scoring after a release ==\n";
         test_scoring_after_release();
+        std::cout << "== stage 6: origin path versus stage 5 (self-checked) ==\n";
+        test_origin_path_matches_stage5();
+        std::cout << "== stage 6: disabled, full and undersized origin caches ==\n";
+        test_origin_budgets_identical();
+        std::cout << "== stage 6: forced origin-cache collisions ==\n";
+        test_origin_forced_collisions();
+        std::cout << "== stage 6: identical windows at different offsets ==\n";
+        test_origin_translation_across_offsets();
+        std::cout << "== stage 6: end flags never alias ==\n";
+        test_origin_end_flags_never_alias();
+        std::cout << "== stage 6: length shifts keep preaggregations apart ==\n";
+        test_origin_length_shifts_keep_groups_apart();
+        std::cout << "== stage 6: caps count executed work; consumption is capped separately ==\n";
+        test_origin_caps_count_executed_work();
+        std::cout << "== stage 6: thread identity ==\n";
+        test_origin_threads_identical();
         std::cout << "== grouped enumeration versus the reference ==\n";
         test_window_enumeration_matches_reference();
         std::cout << "== scratch reuse and per-candidate allocation ==\n";

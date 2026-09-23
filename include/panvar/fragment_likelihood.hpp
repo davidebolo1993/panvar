@@ -431,6 +431,14 @@ EmissionCacheCounters last_emission_cache_counters();
 // the work. The reference is kept for exactly this reason, as gap_recursion_logspace is.
 void set_window_enumeration_self_check(bool enabled);
 
+// Stage 6 certification. When on, every origin-path delta also runs a fresh stage-5 enumeration and
+// the stage-5 std::map merge, and refuses on any divergence in retained origins, merged StateKeys,
+// multiplicities, reduced masses, or a promoted census. Off by default: it more than doubles the work.
+void set_origin_cache_self_check(bool enabled);
+// TEST ONLY. Collapses every origin-cache key hash to one value, so byte comparison alone separates
+// entries. Never set on a production path.
+void set_origin_cache_hash_collapse(bool collapse);
+
 // Seconds spent inside cache lookups, accumulated per thread and folded in as placement drains its
 // counters. Reported separately from origin construction because the two answer different questions:
 // whether the cache is cheap to consult, and whether the work it saves was worth consulting it for.
@@ -1011,6 +1019,19 @@ struct BlockDeltaWork {
     // Container GROWTH events, which is where the allocations are. Persistent scratch means these
     // should fall to zero once warmed: a non-zero figure after the first round says something is
     // still being built per candidate rather than reused.
+    // Stage 6: the window-origin cache and the preaggregated merge. Work that was LOADED is reported
+    // apart from work that was PERFORMED, because a cache hit performs none of it.
+    std::uint64_t origin_cache_hits = 0;
+    std::uint64_t origin_cache_misses = 0;
+    std::uint64_t origin_cache_stored = 0;
+    std::uint64_t cached_origin_records_consumed = 0;
+    std::uint64_t physical_origins_constructed = 0;
+    std::uint64_t fragments_reduced = 0;
+    std::uint64_t fragments_copied = 0;
+    double seconds_enumeration = 0.0;
+    double seconds_affected_filter = 0.0;
+    double seconds_aggregate_merge = 0.0;
+    double seconds_reduce = 0.0;
     std::uint64_t placement_row_constructions = 0;
     std::uint64_t accumulator_growths = 0;
     std::uint64_t origin_output_growths = 0;
@@ -1094,6 +1115,24 @@ public:
                                        const std::string& replacement,
                                        BlockDeltaWork* work = nullptr,
                                        bool retain_census = false);
+
+    // ---- stage 6 (diagnostic path only; stage 5 remains the default and the reference) -------
+    //
+    // Routes add_repaired_haplotype through the window-origin cache and the preaggregated sorted
+    // merge. Off by default, in which case the stage-5 code runs unchanged.
+    void enable_origin_cache_path(bool enabled);
+    // Bytes the origin cache may retain (0: retain nothing, recompute every window exactly), and a cap
+    // on cached origin records CONSUMED over the search (0: none). Crossing the budget stops
+    // retention only; crossing the consumption cap refuses, like every other declared cap.
+    void set_origin_cache_limits(std::size_t budget_bytes, std::uint64_t max_records_consumed);
+    std::size_t origin_cache_entries() const;
+    std::uint64_t origin_cache_bytes() const;
+    std::uint64_t origin_cache_not_retained() const;
+    std::uint64_t origin_records_consumed() const;
+    // Working storage for the preaggregated merge: per-group unaffected StateKey arrays and lazily
+    // built full aggregates. Reported apart from the cache budget, because it is per-round working
+    // state released with the incumbent, not retained across rounds.
+    std::uint64_t merge_working_bytes() const;
 
     // Retains an origin census for this haplotype, so a later round may delta from it.
     void retain_census(std::size_t haplotype);
