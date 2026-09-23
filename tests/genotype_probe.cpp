@@ -3335,6 +3335,13 @@ int repair_search(const Args& args) {
     const std::size_t max_rounds = std::stoul(args.get("rounds", "4"));
     const double switch_probability = std::stod(args.get("switch-probability", "0.01"));
     const std::uint64_t declared_cap = std::stoull(args.get("max-neighbors", "0"));
+    // Resumption. --start declares where to continue from and --start-score what it must score; the
+    // incumbent guard in round one then IS the reproduction requirement, refusing unless the declared
+    // value comes back exactly. Resuming without also restoring --visited would let the search walk
+    // back onto candidates the earlier leg already occupied, so the caller restores both.
+    const std::string declared_start = args.get("start", "");
+    const bool resuming = !declared_start.empty();
+    const std::size_t first_round = std::stoul(args.get("first-round", "1"));
 
     const LoadedModel loaded =
         load_model(args.required("model-gfa"), reference, out + ".model.sorted.gfa", 50);
@@ -3396,7 +3403,27 @@ int repair_search(const Args& args) {
             start_id = row.at("representative_beam_candidate");
         }
     }
-    if (!have_start) throw std::runtime_error("the run has no exactly scored panel candidate");
+    if (!have_start && !resuming) {
+        throw std::runtime_error("the run has no exactly scored panel candidate");
+    }
+
+    std::vector<std::size_t> start_first;
+    std::vector<std::size_t> start_second;
+    double start_total = 0.0;
+    if (resuming) {
+        const std::size_t bar = declared_start.find('|');
+        if (bar == std::string::npos) throw std::runtime_error("--start wants <hap1>|<hap2>");
+        start_first = parse_alleles(declared_start.substr(0, bar));
+        start_second = parse_alleles(declared_start.substr(bar + 1));
+        if (start_first.size() != blocks || start_second.size() != blocks) {
+            throw std::runtime_error("--start needs one allele per block");
+        }
+        start_total = std::stod(args.required("start-score"));
+    } else {
+        start_first = original_of_id.at(start_id).first;
+        start_second = original_of_id.at(start_id).second;
+        start_total = start_recorded;
+    }
 
     // ---- the per-block local pairs, ranked once. Deterministic: emission descending, then indices.
     std::vector<std::vector<std::pair<std::size_t, std::size_t>>> local(blocks);
@@ -3428,7 +3455,18 @@ int repair_search(const Args& args) {
             << depth.background << "\nrecorded_marker_depth_rate_per_copy\t"
             << status.at("marker_depth_rate_per_copy") << "\nrecorded_marker_background\t"
             << status.at("marker_background") << '\n';
-    summary << "start_candidate\t" << start_id << "\nstart_recorded_score\t" << start_recorded << '\n';
+    summary << "resumed\t" << (resuming ? "true" : "false") << "\nfirst_round\t" << first_round
+            << "\nstart_candidate\t" << (resuming ? std::string("declared") : start_id)
+            << "\nstart_required_score\t" << start_total << '\n';
+    {
+        std::string a, b;
+        for (std::size_t i = 0; i < blocks; ++i) {
+            if (i != 0) { a += ','; b += ','; }
+            a += std::to_string(start_first[i]);
+            b += std::to_string(start_second[i]);
+        }
+        summary << "start_hap1\t" << a << "\nstart_hap2\t" << b << '\n';
+    }
     summary << "neighbor_cap\t" << cap << "\ndeclared_cap\t" << declared_cap << '\n';
     if (declared_cap != 0 && cap > declared_cap) {
         summary << "refused\ttrue\nrefusal\tone round's neighbourhood exceeds its declared bound\n";
@@ -3491,18 +3529,18 @@ int repair_search(const Args& args) {
     };
     std::vector<Round> rounds;
 
-    std::vector<std::size_t> cur_first = original_of_id.at(start_id).first;
-    std::vector<std::size_t> cur_second = original_of_id.at(start_id).second;
-    double cur_total = start_recorded;
+    std::vector<std::size_t> cur_first = start_first;
+    std::vector<std::size_t> cur_second = start_second;
+    double cur_total = start_total;
     visited.insert(key_of(cur_first, cur_second));
     std::string stop_reason = "round_cap";
     double cumulative_seconds = 0.0;
     std::uint64_t cumulative_pairs = 0;
 
-    for (std::size_t round = 1; round <= max_rounds; ++round) {
+    const std::size_t last_round = first_round + max_rounds - 1;
+    for (std::size_t round = first_round; round <= last_round; ++round) {
         Round rec;
         rec.index = round;
-        rec.start_total = cur_total;
 
         // ---- neighbourhood construction. NO TRUTH IN SCOPE.
         std::vector<panvar::MosaicPath> paths;
@@ -3616,6 +3654,11 @@ int repair_search(const Args& args) {
                       << round << " (expected " << cur_total << ", scored " << incumbent << ")\n";
             return 4;
         }
+        // The scored value is the authoritative one; a declared --start-score is only an assertion
+        // about it, and one that has been through text at finite precision. Adopting the scored value
+        // here is what makes a resumed leg byte-identical to never having stopped.
+        cur_total = incumbent;
+        rec.start_total = incumbent;
 
         // ---- certify the round with production's own certifier, in presentation order
         const auto certify = [&](bool reversed) {
@@ -3725,7 +3768,7 @@ int repair_search(const Args& args) {
         cur_first = rec.first;
         cur_second = rec.second;
         cur_total = rec.total;
-        if (round == max_rounds) stop_reason = "round_cap";
+        if (round == last_round) stop_reason = "round_cap";
     }
 
     const auto join = [](const std::vector<std::size_t>& v) {
@@ -3747,7 +3790,7 @@ int repair_search(const Args& args) {
             << (order_all ? "true" : "false") << "\nswap_invariant\t" << (swap_all ? "true" : "false")
             << "\ncumulative_scoring_seconds\t" << cumulative_seconds << "\ncumulative_scored_pairs\t"
             << cumulative_pairs << "\npeak_rss_gib\t" << peak_rss_gib() << "\nfinal_total\t" << cur_total
-            << "\nimprovement_total\t" << (cur_total - start_recorded) << '\n';
+            << "\nimprovement_total\t" << (cur_total - start_total) << '\n';
 
     // ---- the rounds table: TRUTH-FREE, and written before the truth graph is opened ----------------
     {
@@ -3778,7 +3821,7 @@ int repair_search(const Args& args) {
     if (truth_gfa.empty()) {
         summary << "truth_evaluated\tfalse\n";
         std::cout << "repair-search " << donor << ": " << rounds.size() << " rounds, stop=" << stop_reason
-                  << ", improvement " << (cur_total - start_recorded) << " nats, no truth evaluation\n";
+                  << ", improvement " << (cur_total - start_total) << " nats, no truth evaluation\n";
         return 0;
     }
 
@@ -3832,8 +3875,7 @@ int repair_search(const Args& args) {
                  << '\t' << (total - floor_total) << '\n';
         return total;
     };
-    const long start_distance =
-        evaluate(0, original_of_id.at(start_id).first, original_of_id.at(start_id).second);
+    const long start_distance = evaluate(first_round - 1, start_first, start_second);
     long final_distance = start_distance;
     for (const Round& r : rounds) final_distance = evaluate(r.index, r.first, r.second);
     summary << "truth_evaluated\ttrue\navailability_floor_total\t" << floor_total << "\nstart_distance\t"
@@ -3841,7 +3883,7 @@ int repair_search(const Args& args) {
             << (final_distance - floor_total) << '\n';
 
     std::cout << "repair-search " << donor << ": " << rounds.size() << " rounds, stop=" << stop_reason
-              << ", improvement " << (cur_total - start_recorded) << " nats, distance " << start_distance
+              << ", improvement " << (cur_total - start_total) << " nats, distance " << start_distance
               << " -> " << final_distance << " (floor " << floor_total << "), " << cumulative_seconds
               << "s scoring\n";
     return 0;

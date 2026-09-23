@@ -1,45 +1,47 @@
 item	value	provenance
-donor_cell	NA20509 10x K=128	repair-search
+donor_cell	NA20509 10x K=128	repair-search, two legs
+round_cap	11	declared maximum
+rounds_run	7	converged before the cap
+stop_reason	no_improvement	round 7 found no improving neighbour
+convergence_round	7	actual convergence, not a cap
 start_candidate	329	best exactly scored panel candidate
-start_recorded_score	-152228.321247	reproduced in round 1 before any neighbour was read
-local_pairs	32	top truth-free local allele pairs per block
-rounds_requested	4	declared round cap
-rounds_run	4	every round moved
-stop_reason	round_cap	NOT convergence: it was still improving when the cap stopped it
-round1_block	ctx:2	local-pair rank 17, assignment 1, alleles (37,87)
-round1_total	-151931.605119	equals the persisted R=32 pilot winner
-round1_delta	+296.716128	nats over the seed
-round1_distance	6513	floor 91
-round2_block	ctx:6	local-pair rank 21, assignment 1, alleles (4,58)
-round2_total	-151654.646613	outscores the compound by 3.066601 nats
-round2_delta	+276.958506	nats
-round2_distance	6508	floor 91
-round3_block	sv:7	local-pair rank 1, assignment 0, alleles (11,108)
-round3_total	-151371.300167	nats
-round3_delta	+283.346446	nats
-round3_distance	129	floor 91
-round4_block	sv:1	local-pair rank 1, assignment 0, alleles (10,51)
-round4_total	-151241.672952	final
-round4_delta	+129.627215	nats
-round4_distance	116	floor 91
-final_excess	25	ctx:0 9, ctx:2 7, ctx:8 1, ctx:10 8
-blocks_at_availability_floor	sv:1, ctx:6, sv:7	excess 0 each after repair
-improvement_total	+986.648295	nats over the seed
-distance_improvement	6526 -> 116	floor 91 throughout
-compound_total	-151657.713214	score-set, previous batch
-compound_distance	134	score-set, previous batch
-search_surpasses_compound_by	+416.040262	nats, round 4 against the compound
-compound_is_round2_runner_up	true	certified separation 3.06660018201 = winner - compound
-compound_selected_when_winner_suppressed	true	--visited re-run selects sv:7 (11,108) at -151657.713214
-every_round_certified	COMPLETE	production certifier, unique best each round
-round3_suppressed_by_visited	1	a previously occupied candidate was suppressed in the main run
-visited_size	5	start plus four moves
-order_invariant	true	all rounds, recertified from the same scores
-swap_invariant	true	all rounds
-neighbours_per_round	651 generated	644, 643, 642, 642 scored after dedup and suppression
-scored_pairs_per_round	645, 644, 643, 643	cumulative 2575
-unique_haplotypes_per_round	306, 305, 305, 304	one cold scoring pass per round
-seconds_per_round	53.55, 54.38, 55.64, 59.05	cumulative 222.63 s scoring
-wall_seconds	225.82	/usr/bin/time
-peak_rss_gib	0.8247	/usr/bin/time, 885506048 bytes
-conclusion	coordinate ascent reaches the compound and keeps going	convergence not yet established
+start_recorded_score	-152228.321247	reproduced in round 1
+leg1_rounds	1-4	first invocation
+leg2_rounds	5-7	resumed from the round-4 winner
+resume_required_score	-151241.672952	reproduced exactly in round 5 or the run refuses
+resume_visited_restored	5	seed plus four winners, so the cycle guard spans the join
+round1_block	ctx:2	rank 17, assignment 1, alleles (37,87)
+round1_total	-151931.605119	delta +296.716128
+round2_block	ctx:6	rank 21, assignment 1, alleles (4,58)
+round2_total	-151654.646613	delta +276.958506
+round3_block	sv:7	rank 1, assignment 0, alleles (11,108)
+round3_total	-151371.300167	delta +283.346446
+round4_block	sv:1	rank 1, assignment 0, alleles (10,51)
+round4_total	-151241.672952	delta +129.627215
+round5_block	ctx:0	rank 2, assignment 1, alleles (0,15)
+round5_total	-151131.557415	delta +110.115537
+round6_block	ctx:10	rank 9, assignment 0, alleles (99,117)
+round6_total	-151090.979646	delta +40.577769
+round7_moved	false	no improving neighbour; certified gap 0.668074647605
+distance_by_round	6526,6513,6508,129,116,107,114	rounds 0 through 6, evaluator only
+round5_distance	107	best truth distance reached anywhere on the path
+final_distance	114	at the converged round
+availability_floor	91	unchanged throughout
+final_excess	23	ctx:2 7, ctx:8 1, ctx:10 15
+likelihood_gain_that_worsened_truth	round 6	+40.577769 nats while distance went 107 -> 114
+round6_block_detail	ctx:10 99/119 -> 99/117	block distance 34 -> 41, excess 8 -> 15
+likelihood_optimum_is_not_truth_optimum	true	the converged point is 7 worse than round 5
+blocks_at_availability_floor	ctx:0, sv:1, sv:3, ctx:4, sv:5, ctx:6, sv:7, sv:9	excess 0 at convergence
+improvement_total	+1137.341601	nats, seed to converged
+distance_improvement	6526 -> 114	floor 91 throughout
+every_round_certified	COMPLETE	unique best neighbour in every moving round
+resource_refusal_armed	true	--max-neighbors 670 declared, exactly the computed bound
+cycle_guard_fired	rounds 3 and 7	one already-occupied neighbour suppressed in each
+order_invariant	true	all rounds, both legs
+swap_invariant	true	all rounds, both legs
+cumulative_scored_pairs	4498	2575 + 1923
+cumulative_unique_haplotypes	306,305,305,304,303,302,302	per round, one cold pass each
+cumulative_scoring_seconds	388.30	222.63 + 165.68
+cumulative_wall_seconds	394.46	225.82 + 168.64
+peak_rss_gib	0.8247	maximum across both legs
+conclusion	coordinate ascent converges at round 7	truth distance is not monotone in the likelihood

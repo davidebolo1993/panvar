@@ -151,6 +151,32 @@ else
   echo "  GATE FAILED: the rounds table depends on truth being present"; fail=1
 fi
 
+echo "== 7. resuming mid-search continues exactly as running straight through would =="
+# Resumption is only safe if it is indistinguishable from not having stopped. Run four rounds, then
+# resume from round 2's winner with the first two rounds' candidates restored as visited, and require
+# rounds 3 and 4 to come out identical. Comparing only the final score would not catch a resumed leg
+# that took a different route to a similar place.
+code="$(search "$WORK/straight" --local-pairs 1 --rounds 4)"
+same "straight-through exit" "$code" "0"
+seed1="$(key "$WORK/straight.summary.tsv" start_hap1)"
+seed2="$(key "$WORK/straight.summary.tsv" start_hap2)"
+r1a="$(col "$WORK/straight.rounds.tsv" 1 hap1_alleles)"; r1b="$(col "$WORK/straight.rounds.tsv" 1 hap2_alleles)"
+r2a="$(col "$WORK/straight.rounds.tsv" 2 hap1_alleles)"; r2b="$(col "$WORK/straight.rounds.tsv" 2 hap2_alleles)"
+r2t="$(col "$WORK/straight.rounds.tsv" 2 total)"
+code="$(search "$WORK/resumed" --local-pairs 1 --rounds 2 --first-round 3           --start "$r2a|$r2b" --start-score "$r2t" --visited "$seed1|$seed2;$r1a|$r1b;$r2a|$r2b")"
+same "resumed exit" "$code" "0"
+same "the resumed leg declares it resumed" "$(key "$WORK/resumed.summary.tsv" resumed)" "true"
+if diff -q <(awk -F'\t' 'NR==1 || $1>=3' "$WORK/straight.rounds.tsv" | cut -f1-28) \
+           <(cut -f1-28 "$WORK/resumed.rounds.tsv") > /dev/null; then
+  echo "  ok: rounds 3-4 are identical whether resumed or run straight through"
+else
+  echo "  GATE FAILED: the resumed leg diverges from the straight-through search"; fail=1
+fi
+# And the guard really is a guard: a start-score one nat off must refuse.
+code="$(search "$WORK/badresume" --local-pairs 1 --rounds 1 --first-round 3 \
+          --start "$r2a|$r2b" --start-score "$(awk -v t="$r2t" 'BEGIN{printf "%.6f", t+1}')")"
+same "a wrong declared start score refuses" "$code" "4"
+
 echo
 if [ "$fail" -ne 0 ]; then echo "repair-search gate FAILED"; exit 1; fi
 echo "repair-search gate passed"
