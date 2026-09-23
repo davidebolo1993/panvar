@@ -1404,6 +1404,54 @@ void test_released_slots_are_reused() {
     }
 }
 
+void test_released_seed_is_respelled_identically() {
+    // The census-lifetime correction: repair search now opens the transient round BEFORE the seed, so a
+    // seed that stops being an incumbent is released with its full census. Two things must then hold.
+    // Only the promoted incumbent keeps a census. And a later neighbour that spells the seed's haplotype
+    // again -- which the search can generate, since it may restore one block on one homologue -- is
+    // rebuilt by delta from the new incumbent and must come back bit-identical to the seed's own full
+    // placement, cell for cell, in exposure, and in the diplotype score. If it did not, releasing the
+    // seed would change a later round's ranking.
+    const MultiBlock m = multi_block(4242);
+    const Repair& chosen = m.repairs[m.promote];   // same length, so the winner's coordinates hold
+    const std::string original = m.locus.base.substr(chosen.begin, chosen.end - chosen.begin);
+    for (const bool origin : {false, true}) {
+        const std::string label = origin ? "origin path" : "stage-5 path";
+        panvar::PreparedScoringContext context(m.locus.fragments, library(), options());
+        if (origin) {
+            context.enable_origin_cache_path(true);
+            context.set_origin_cache_limits(std::size_t{1} << 30, 0);
+        }
+        context.begin_transient_round();
+        const std::size_t seed = context.add_haplotypes({m.locus.base}).front();
+        context.retain_census(seed);
+        std::vector<double> seed_cells;
+        for (std::size_t f = 0; f < m.locus.fragments.size(); ++f) seed_cells.push_back(context.mass_of(f, seed));
+        const double seed_exposure = context.exposure_of(seed);
+        panvar::BlockDeltaWork promoted;
+        const std::size_t winner =
+            context.add_repaired_haplotype(seed, chosen.begin, chosen.end, chosen.allele, &promoted, true);
+        const double seed_score = context.score_candidates({{seed, winner}}).scores[0].log_likelihood;
+        require(context.census_slots().size() == 2, label + ": seed and winner both hold a census");
+        context.release_transient({winner});
+        require(context.census_slots() == std::vector<std::size_t>{winner},
+                label + ": after promotion only the incumbent may keep a full census");
+        panvar::BlockDeltaWork work;
+        const std::size_t again = context.add_repaired_haplotype(
+            winner, chosen.begin, chosen.begin + chosen.allele.size(), original, &work);
+        require(!work.fell_back_to_full, label + ": the respelled seed must be built by delta");
+        for (std::size_t f = 0; f < seed_cells.size(); ++f) {
+            require_identical(context.mass_of(f, again), seed_cells[f],
+                              label + ": respelled seed, mass cell f" + std::to_string(f));
+        }
+        require_identical(context.exposure_of(again), seed_exposure, label + ": respelled seed exposure");
+        require_identical(context.score_candidates({{again, winner}}).scores[0].log_likelihood, seed_score,
+                          label + ": respelled seed, diplotype score");
+        std::cout << "  ok: " << label << ": seed released at promotion (census slots {" << winner
+                  << "}), respelled by delta bit-identically over " << seed_cells.size() << " cells\n";
+    }
+}
+
 void test_cumulative_caps_through_the_delta() {
     const Locus l = locus(99, {400});
     std::mt19937_64 rng(11);
@@ -1485,6 +1533,8 @@ int main() {
         test_scoring_after_release();
         std::cout << "== released slots are reused ==\n";
         test_released_slots_are_reused();
+        std::cout << "== a released seed census, respelled by delta, is bit-identical ==\n";
+        test_released_seed_is_respelled_identically();
         std::cout << "== stage 6: origin path versus stage 5 (self-checked) ==\n";
         test_origin_path_matches_stage5();
         std::cout << "== stage 6: disabled, full and undersized origin caches ==\n";

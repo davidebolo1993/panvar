@@ -30,6 +30,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -41,11 +42,13 @@
 #include <numeric>
 #include <set>
 #include <map>
+#include <mutex>
 #include <optional>
 #include <random>
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <tuple>
 #include <unordered_map>
 #include <vector>
@@ -339,6 +342,44 @@ std::uint64_t release_free_pages() {
 #else
     return 0;
 #endif
+}
+
+// macOS physical footprint: what the kernel charges the process, compressed pages included. Reported
+// BESIDE resident size, not instead of it -- resident size falls when the compressor takes pages, so
+// under pressure it can read far below the live data it is supposed to bound. Zero where unavailable.
+struct FootprintSample {
+    std::uint64_t current = 0;
+    std::uint64_t peak = 0;
+};
+FootprintSample physical_footprint() {
+    FootprintSample sample;
+#if defined(__APPLE__)
+    task_vm_info_data_t info{};
+    mach_msg_type_number_t count = TASK_VM_INFO_COUNT;
+    if (task_info(mach_task_self(), TASK_VM_INFO, reinterpret_cast<task_info_t>(&info), &count) !=
+        KERN_SUCCESS) {
+        return sample;
+    }
+    if (count >= TASK_VM_INFO_REV1_COUNT) sample.current = info.phys_footprint;
+    if (count >= TASK_VM_INFO_REV3_COUNT && info.ledger_phys_footprint_peak > 0) {
+        sample.peak = static_cast<std::uint64_t>(info.ledger_phys_footprint_peak);
+    }
+#endif
+    return sample;
+}
+
+// Whole-file replacement by rename, so a reader -- or a run killed mid-write -- only ever sees the
+// previous complete version or the new complete version, never a torn one.
+void atomic_write(const std::string& path, const std::string& content) {
+    const std::string staging = path + ".writing";
+    {
+        std::ofstream file(staging, std::ios::binary | std::ios::trunc);
+        if (!file) throw std::runtime_error("cannot write " + staging);
+        file << content;
+        file.flush();
+        if (!file) throw std::runtime_error("short write to " + staging);
+    }
+    std::filesystem::rename(staging, path);
 }
 
 double peak_rss_gib() {
@@ -3395,6 +3436,91 @@ int repair_search(const Args& args) {
     const bool resuming = !declared_start.empty();
     const std::size_t first_round = std::stoul(args.get("first-round", "1"));
 
+    // ---- run state. A run is RUNNING until it is COMPLETE, TIME_LIMIT, RESOURCE_REFUSAL or FAILED.
+    // Every completed round is committed atomically to <out>.*.partial.tsv as it finishes, and the
+    // status file says what those rows are. Only a normal completion writes the final names and the
+    // summary -- so no partial trajectory can be read as a completed call, whoever stops the run.
+    const auto run_started = std::chrono::steady_clock::now();
+    const auto elapsed = [&run_started]() {
+        return std::chrono::duration<double>(std::chrono::steady_clock::now() - run_started).count();
+    };
+    const double time_limit = std::stod(args.get("time-limit-seconds", "0"));
+    const std::uint64_t footprint_limit = std::stoull(args.get("footprint-limit-bytes", "0"));
+    // TEST HOOK: stop through the time-limit path after this many committed rounds, so the gate can
+    // exercise an interruption deterministically. It is reported as such in the status reason.
+    const std::size_t interrupt_after = std::stoul(args.get("interrupt-after-rounds", "0"));
+    std::mutex commit_mutex;
+    std::atomic<bool> finished{false};
+    std::size_t rounds_committed = 0;
+    std::string status_extra;
+    const auto write_status = [&](const std::string& state_name, const std::string& reason) {
+        const FootprintSample footprint = physical_footprint();
+        const bool complete = state_name == "COMPLETE";
+        std::ostringstream text;
+        text << std::setprecision(12) << "key\tvalue\nstatus\t" << state_name << "\nreason\t" << reason
+             << "\ncomplete\t" << (complete ? "true" : "false") << "\nrounds_committed\t"
+             << rounds_committed << "\nelapsed_seconds\t" << elapsed() << "\ntime_limit_seconds\t"
+             << time_limit << "\nfootprint_limit_bytes\t" << footprint_limit
+             << "\nphys_footprint_bytes\t" << footprint.current << "\nphys_footprint_peak_bytes\t"
+             << footprint.peak << "\nrss_current_bytes\t" << current_rss_bytes()
+             << "\nrss_peak_bytes\t" << static_cast<std::uint64_t>(peak_rss_gib() * 1073741824.0)
+             << "\noutputs\t"
+             << (complete ? "final: <out>.rounds.tsv, .summary.tsv and companions"
+                          : "PARTIAL: <out>.*.partial.tsv hold committed rounds only; no summary, not a call")
+             << '\n' << status_extra;
+        atomic_write(out + ".run_status.tsv", text.str());
+    };
+    // Caller must NOT hold the lock. After this, the watchdog can no longer overwrite the status.
+    const auto finish = [&](const std::string& state_name, const std::string& reason) {
+        std::lock_guard<std::mutex> lock(commit_mutex);
+        finished = true;
+        write_status(state_name, reason);
+    };
+    // Stops the process where it stands. Rounds already committed stay on disk, intact.
+    const auto stop_now = [&](const std::string& state_name, const std::string& reason, int code) {
+        std::lock_guard<std::mutex> lock(commit_mutex);
+        if (finished) return;
+        finished = true;
+        write_status(state_name, reason);
+        std::cout << "repair-search: " << state_name << ": " << reason << " (" << rounds_committed
+                  << " rounds committed)" << std::endl;
+        std::_Exit(code);
+    };
+    {
+        std::lock_guard<std::mutex> lock(commit_mutex);
+        write_status("RUNNING", "started");
+    }
+    std::thread watchdog;
+    if (time_limit > 0.0 || footprint_limit != 0) {
+        watchdog = std::thread([&]() {
+            while (!finished.load()) {
+                if (time_limit > 0.0 && elapsed() > time_limit) {
+                    std::ostringstream why;
+                    why << "wall " << elapsed() << " s exceeded the declared " << time_limit << " s";
+                    stop_now("TIME_LIMIT", why.str(), 124);
+                }
+                if (footprint_limit != 0) {
+                    const std::uint64_t now = physical_footprint().current;
+                    if (now > footprint_limit) {
+                        std::ostringstream why;
+                        why << "physical footprint " << now << " bytes exceeded the declared "
+                            << footprint_limit;
+                        stop_now("RESOURCE_REFUSAL", why.str(), 125);
+                    }
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            }
+        });
+    }
+    struct WatchdogJoin {
+        std::atomic<bool>& done;
+        std::thread& thread;
+        ~WatchdogJoin() {
+            done = true;
+            if (thread.joinable()) thread.join();
+        }
+    } watchdog_join{finished, watchdog};
+
     const LoadedModel loaded =
         load_model(args.required("model-gfa"), reference, out + ".model.sorted.gfa", 50);
     const panvar::PreparedGenotypeModel& model = *loaded.model;
@@ -3499,7 +3625,9 @@ int repair_search(const Args& args) {
         const std::uint64_t a = model.blocks()[b].alleles.size();
         cap += std::min<std::uint64_t>(local_pairs, a * (a + 1) / 2) * 2;
     }
-    std::ofstream summary(out + ".summary.tsv");
+    // Assembled in memory and written only by a normal completion: a partial summary is exactly the
+    // kind of file that could be mistaken for a finished run.
+    std::ostringstream summary;
     summary << std::setprecision(12) << "key\tvalue\n";
     summary << "donor\t" << donor << "\nrun\t" << run << "\nlocal_pairs\t" << local_pairs
             << "\nrounds_requested\t" << max_rounds << '\n';
@@ -3524,6 +3652,8 @@ int repair_search(const Args& args) {
         summary << "refused\ttrue\nrefusal\tone round's neighbourhood exceeds its declared bound\n";
         std::cout << "repair-search " << donor << ": REFUSED before allocation, " << cap
                   << " neighbours per round exceeds the declared " << declared_cap << '\n';
+        finish("RESOURCE_REFUSAL", "one round's neighbourhood (" + std::to_string(cap) +
+                                       ") exceeds its declared bound " + std::to_string(declared_cap));
         return 3;
     }
 
@@ -3624,8 +3754,22 @@ int repair_search(const Args& args) {
         std::uint64_t fragments_reduced = 0, fragments_copied = 0, merge_working_bytes = 0;
         double seconds_enumeration = 0.0, seconds_filter = 0.0, seconds_aggregate = 0.0;
         double seconds_reduce = 0.0;
+        // The WHOLE round, promotion included -- the columns above stop at scoring. Demand columns:
+        // what was admitted, what the full budget declined, and what re-enumerating declined or
+        // otherwise repeated windows cost.
+        double round_wall_seconds = 0.0;
+        std::uint64_t oc_hits_all = 0, oc_misses_all = 0, oc_admitted = 0, oc_admitted_bytes = 0;
+        std::uint64_t oc_declined = 0, oc_declined_bytes = 0, origins_constructed_all = 0;
+        double seconds_enumeration_all = 0.0, seconds_reenumeration_all = 0.0;
+        // Cumulative against every cumulative cap, read after the round.
+        std::uint64_t cum_piece_hits = 0, cum_physical_origins = 0, cum_state_classes = 0;
+        std::uint64_t cum_latent_pairs = 0, mass_cells = 0, records_consumed = 0;
+        std::uint64_t census_count = 0, census_bytes = 0, oc_bytes_end = 0;
+        std::uint64_t phys_footprint = 0, phys_footprint_peak = 0, rss_current = 0;
     };
     std::vector<Round> rounds;
+    const std::size_t last_round = first_round + max_rounds - 1;
+    std::size_t hold_index = 0;
     std::unique_ptr<panvar::PreparedScoringContext> context;
     if (use_context || use_delta) {
         context = std::make_unique<panvar::PreparedScoringContext>(fragments, library, scoring);
@@ -3634,22 +3778,38 @@ int repair_search(const Args& args) {
             context->set_origin_cache_limits(origin_cache_bytes, origin_cache_records);
         }
     }
-    // Per-round memory accounts at four fixed points, beside current and peak RSS.
-    std::ofstream memory_log;
-    if (context) {
-        memory_log.open(out + ".memory.tsv");
-        memory_log << "kind\tindex\tpoint\trss_current\trss_peak\trelief_freed\trss_after_relief\t"
+    // Per-round memory accounts at four fixed points, beside current and peak RSS and the physical
+    // footprint. Held in memory and committed with each round, so a stopped run keeps every row.
+    const bool memory_on = static_cast<bool>(context);
+    std::string memory_text;
+    // Why each census is live: the role of every slot this search has given one.
+    std::map<std::size_t, std::string> role_of;
+    std::size_t inc_slot_a = 0;
+    std::size_t inc_slot_b = 0;
+    if (memory_on) {
+        memory_text += "kind\tindex\tpoint\trss_current\trss_peak\trelief_freed\trss_after_relief\t"
                       "slots_total\tslots_live\tslots_released\tslot_table\tsequence_bytes\t"
                       "sequence_capacity\tsegment_bytes\tmass_bytes\tmass_capacity\tcensus_count\t"
                       "census_bytes\tcensus_capacity\torigin_cache_entries\torigin_cache_payload\t"
                       "origin_cache_capacity\tmerge_bytes\tmerge_capacity\twindow_scratch\t"
                       "origin_scratch\temission_table\temission_arena\tprepared\tscoring_result\t"
-                      "logical_total\tcapacity_total\trss_minus_capacity\n";
+                      "logical_total\tcapacity_total\trss_minus_capacity\tphys_footprint\t"
+                      "phys_footprint_peak\torigin_demand\tcensus_slots\tcensus_roles\n";
     }
     const auto snapshot = [&](const char* kind, std::size_t index, const char* point,
                               bool result_alive, bool relieve) {
-        if (!memory_log.is_open()) return;
+        if (!memory_on) return;
         const panvar::ContextMemoryAccount a = context->memory_account();
+        const FootprintSample footprint = physical_footprint();
+        std::string slots_text;
+        std::string roles_text;
+        for (const std::size_t slot : context->census_slots()) {
+            if (!slots_text.empty()) { slots_text += ','; roles_text += ','; }
+            slots_text += std::to_string(slot);
+            const auto role = role_of.find(slot);
+            roles_text += role == role_of.end() ? std::string("unknown") : role->second;
+            if (slot == inc_slot_a || slot == inc_slot_b) roles_text += "*";
+        }
         const std::uint64_t rss = current_rss_bytes();
         const std::uint64_t peak = static_cast<std::uint64_t>(peak_rss_gib() * 1073741824.0);
         std::uint64_t freed = 0;
@@ -3662,6 +3822,7 @@ int repair_search(const Args& args) {
         const std::uint64_t result = result_alive ? a.last_scoring_result_bytes : 0;
         const std::uint64_t logical = a.logical_total - a.last_scoring_result_bytes + result;
         const std::uint64_t capacity = a.capacity_total - a.last_scoring_result_bytes + result;
+        std::ostringstream memory_log;
         memory_log << kind << '\t' << index << '\t' << point << '\t' << rss << '\t' << peak << '\t'
                    << freed << '\t' << after << '\t' << a.slots_total << '\t' << a.slots_live << '\t'
                    << a.slots_released << '\t' << a.slot_table_bytes << '\t' << a.sequence_bytes << '\t'
@@ -3674,15 +3835,294 @@ int repair_search(const Args& args) {
                    << a.emission_cache_table << '\t' << a.emission_cache_arena << '\t'
                    << a.prepared_capacity << '\t' << result << '\t' << logical << '\t' << capacity
                    << '\t' << (static_cast<std::int64_t>(rss) - static_cast<std::int64_t>(capacity))
-                   << '\n';
+                   << '\t' << footprint.current << '\t' << footprint.peak << '\t'
+                   << a.origin_demand_bytes << '\t' << (slots_text.empty() ? "-" : slots_text) << '\t'
+                   << (roles_text.empty() ? "-" : roles_text) << '\n';
+        memory_text += memory_log.str();
+    };
+
+    const auto join = [](const std::vector<std::size_t>& v) {
+        std::string text;
+        for (std::size_t i = 0; i < v.size(); ++i) {
+            if (i != 0) text += ',';
+            text += std::to_string(v[i]);
+        }
+        return text;
+    };
+    const auto margin = [](std::uint64_t cap_value, std::uint64_t used) -> std::string {
+        if (cap_value == 0) return "none";
+        return std::to_string(static_cast<std::int64_t>(cap_value) - static_cast<std::int64_t>(used));
+    };
+
+    // ---- the rounds table, rendered from the rounds that exist. TRUTH-FREE.
+    const auto render_rounds = [&]() {
+        std::ostringstream table;
+        table << std::setprecision(12)
+              << "round\tstart_total\tmoved\trepaired_block\tlocal_pair_rank\tassignment\tallele_x\t"
+                 "allele_y\thap1_alleles\thap2_alleles\tfragment_term\texposure_term\tprior\ttotal\t"
+                 "delta_total\tstatus\tunique_best\tseparation\tneighbours_generated\tneighbours_scored\t"
+                 "duplicate\tsuppressed_visited\tself_skipped\trejected_infinite_prior\t"
+                 "unique_haplotypes\tscored_pairs\torder_invariant\tswap_invariant\tseconds\tpeak_rss_gib\t"
+                 "haplotypes_new\thaplotypes_reused\tbases_scanned\tpiece_hits\tcache_requests\t"
+                 "cache_hits\tcache_misses\texecuted_dps\tphysical_origins\tstate_classes\t"
+                 "placement_seconds\tcombination_seconds\torigins_reused\torigins_recomputed\t"
+                 "window_bases\ttransient_before\ttransient_after\tfull_haplotype_bytes\t"
+                 "window_bytes\tsequence_key_bytes\tseconds_origins\tseconds_merge\t"
+                 "seconds_hashing\tseconds_lookup\tentry_metadata_bytes\tcontent_arena_bytes\t"
+                 "row_constructions\taccumulator_growths\torigin_growths\t"
+                 "oc_hits\toc_misses\toc_stored\toc_entries\toc_bytes\torigins_constructed\t"
+                 "origins_loaded\tfragments_reduced\tfragments_copied\tmerge_working_bytes\t"
+                 "seconds_enumeration\tseconds_filter\tseconds_aggregate\tseconds_reduce\t"
+                 "round_wall_seconds\toc_hits_all\toc_misses_all\toc_admitted\toc_admitted_bytes\t"
+                 "oc_declined\toc_declined_bytes\torigins_constructed_all\tseconds_enumeration_all\t"
+                 "seconds_reenumeration_all\tcum_piece_hits\tmargin_piece_hits\tcum_physical_origins\t"
+                 "margin_physical_origins\tcum_state_classes\tmargin_state_classes\tcum_latent_pairs\t"
+                 "margin_latent_pairs\tmass_cells\tmargin_mass_cells\tmargin_origin_cache_bytes\t"
+                 "records_consumed\tmargin_records_consumed\tmargin_neighbours\tmargin_rounds\t"
+                 "census_count\tcensus_bytes\tphys_footprint\tphys_footprint_peak\trss_current\n";
+        for (const Round& r : rounds) {
+            table << r.index << '\t' << r.start_total << '\t' << (r.moved ? "true" : "false") << '\t'
+                  << (r.moved ? model.blocks()[r.block].block_id : std::string("NA")) << '\t'
+                  << (r.moved ? std::to_string(r.rank) : std::string("NA")) << '\t'
+                  << (r.moved ? std::to_string(r.assignment) : std::string("NA")) << '\t'
+                  << (r.moved ? std::to_string(r.allele_x) : std::string("NA")) << '\t'
+                  << (r.moved ? std::to_string(r.allele_y) : std::string("NA")) << '\t'
+                  << join(r.first) << '\t' << join(r.second) << '\t' << r.fragment << '\t' << r.exposure
+                  << '\t' << r.prior << '\t' << r.total << '\t' << (r.total - r.start_total) << '\t'
+                  << (r.complete ? "COMPLETE" : "RESCORE_INCOMPLETE") << '\t'
+                  << (r.unique_best ? "true" : "false") << '\t' << r.separation << '\t' << r.generated
+                  << '\t' << r.neighbours << '\t' << r.duplicate << '\t' << r.suppressed << '\t'
+                  << r.self_skipped << '\t' << r.rejected_prior << '\t' << r.unique_haplotypes << '\t'
+                  << r.scored_pairs << '\t' << (r.order_invariant ? "true" : "false") << '\t'
+                  << (r.swap_invariant ? "true" : "false") << '\t' << r.seconds << '\t' << r.rss
+                  << '\t' << r.haps_new << '\t' << r.haps_reused << '\t' << r.bases_scanned << '\t'
+                  << r.piece_hits << '\t' << r.cache_requests << '\t' << r.cache_hits << '\t'
+                  << r.cache_misses << '\t' << r.executed_dps << '\t' << r.physical_origins << '\t'
+                  << r.state_classes << '\t' << r.placement_seconds << '\t'
+                  << r.combination_seconds << '\t' << r.origins_reused << '\t'
+                  << r.origins_recomputed << '\t' << r.window_bases << '\t' << r.transient_before
+                  << '\t' << r.transient_after << '\t' << r.full_bytes << '\t' << r.window_bytes
+                  << '\t' << r.key_bytes << '\t' << r.seconds_origins << '\t' << r.seconds_merge
+                  << '\t' << r.seconds_hashing << '\t' << r.seconds_lookup << '\t'
+                  << r.entry_metadata_bytes << '\t' << r.content_arena_bytes << '\t'
+                  << r.row_constructions << '\t' << r.accumulator_growths << '\t'
+                  << r.origin_growths << '\t' << r.oc_hits << '\t' << r.oc_misses << '\t'
+                  << r.oc_stored << '\t' << r.oc_entries << '\t' << r.oc_bytes << '\t'
+                  << r.origins_constructed << '\t' << r.origins_loaded << '\t'
+                  << r.fragments_reduced << '\t' << r.fragments_copied << '\t'
+                  << r.merge_working_bytes << '\t' << r.seconds_enumeration << '\t'
+                  << r.seconds_filter << '\t' << r.seconds_aggregate << '\t' << r.seconds_reduce
+                  << '\t' << r.round_wall_seconds << '\t' << r.oc_hits_all << '\t' << r.oc_misses_all
+                  << '\t' << r.oc_admitted << '\t' << r.oc_admitted_bytes << '\t' << r.oc_declined
+                  << '\t' << r.oc_declined_bytes << '\t' << r.origins_constructed_all << '\t'
+                  << r.seconds_enumeration_all << '\t' << r.seconds_reenumeration_all << '\t'
+                  << r.cum_piece_hits << '\t' << margin(scoring.max_piece_hits, r.cum_piece_hits)
+                  << '\t' << r.cum_physical_origins << '\t'
+                  << margin(scoring.max_physical_origins, r.cum_physical_origins) << '\t'
+                  << r.cum_state_classes << '\t' << margin(scoring.max_state_classes, r.cum_state_classes)
+                  << '\t' << r.cum_latent_pairs << '\t'
+                  << margin(scoring.max_latent_alignment_pairs, r.cum_latent_pairs) << '\t'
+                  << r.mass_cells << '\t' << margin(scoring.max_mass_cells, r.mass_cells) << '\t'
+                  << (use_origin_cache ? margin(origin_cache_bytes, r.oc_bytes_end) : std::string("none"))
+                  << '\t' << r.records_consumed << '\t' << margin(origin_cache_records, r.records_consumed)
+                  << '\t' << margin(declared_cap, r.neighbours) << '\t' << (last_round - r.index) << '\t'
+                  << r.census_count << '\t' << r.census_bytes << '\t' << r.phys_footprint << '\t'
+                  << r.phys_footprint_peak << '\t' << r.rss_current << '\n';
+        }
+        return table.str();
+    };
+
+    // ---- exact origin-cache demand, and its reconciliation against the work the rounds report
+    std::uint64_t seeding_origins = 0;
+    const auto render_demand = [&](const std::vector<panvar::OriginDemandRow>& rows) {
+        std::ostringstream table;
+        table << std::setprecision(12)
+              << "order\tkey_hash\twindow_bytes\tat_start\tat_end\trel_block_begin\trel_new_end\t"
+                 "requests\trepeat_requests\thits\tmisses\tadmitted\tdeclined\tentry_bytes\trecords\t"
+                 "origins_constructed\tseconds_enumeration\tseconds_reenumeration\n";
+        for (const panvar::OriginDemandRow& row : rows) {
+            table << row.order << '\t' << row.key_hash << '\t' << row.window_bytes << '\t'
+                  << (row.at_start ? 1 : 0) << '\t' << (row.at_end ? 1 : 0) << '\t' << row.rel_block_begin
+                  << '\t' << row.rel_new_end << '\t' << row.requests << '\t' << (row.requests - 1) << '\t'
+                  << row.hits << '\t' << row.misses << '\t' << (row.admitted ? "true" : "false") << '\t'
+                  << row.declined << '\t' << row.entry_bytes << '\t' << row.records << '\t'
+                  << row.origins_constructed << '\t' << row.seconds_enumeration << '\t'
+                  << row.seconds_reenumeration << '\n';
+        }
+        return table.str();
+    };
+    const auto demand_report = [&](const std::vector<panvar::OriginDemandRow>& rows) {
+        std::uint64_t requested_bytes = 0, requests = 0, repeats = 0, hits = 0, misses = 0;
+        std::uint64_t admitted = 0, admitted_bytes = 0, declined = 0, declined_bytes = 0;
+        std::uint64_t decline_events = 0, origins = 0, declined_repeats = 0;
+        double seconds = 0.0, reenumeration = 0.0, reenumeration_declined = 0.0;
+        for (const panvar::OriginDemandRow& row : rows) {
+            requested_bytes += row.entry_bytes;
+            requests += row.requests;
+            repeats += row.requests - 1;
+            hits += row.hits;
+            misses += row.misses;
+            decline_events += row.declined;
+            origins += row.origins_constructed;
+            seconds += row.seconds_enumeration;
+            reenumeration += row.seconds_reenumeration;
+            if (row.admitted) {
+                ++admitted;
+                admitted_bytes += row.entry_bytes;
+            } else if (row.declined != 0) {
+                ++declined;
+                declined_bytes += row.entry_bytes;
+                declined_repeats += row.requests - 1;
+                reenumeration_declined += row.seconds_reenumeration;
+            }
+        }
+        std::ostringstream text;
+        text << std::setprecision(12);
+        if (rows.empty()) return std::string();
+        text << "demand_distinct_windows\t" << rows.size() << "\ndemand_distinct_window_bytes\t"
+             << requested_bytes << "\ndemand_requests\t" << requests << "\ndemand_repeat_requests\t"
+             << repeats << "\ndemand_admitted_entries\t" << admitted << "\ndemand_admitted_bytes\t"
+             << admitted_bytes << "\ndemand_declined_entries\t" << declined
+             << "\ndemand_declined_bytes\t" << declined_bytes << "\ndemand_declined_repeat_requests\t"
+             << declined_repeats << "\ndemand_decline_events\t" << decline_events
+             << "\ndemand_seconds_enumeration\t" << seconds << "\ndemand_seconds_reenumeration\t"
+             << reenumeration << "\ndemand_seconds_reenumeration_declined\t" << reenumeration_declined
+             << '\n';
+        // Reconciliation: the ledger is kept by the cache path, the round columns by the caller, and
+        // the cumulative counters by the budget. Hold cycles add ledger traffic no round reports.
+        if (hold_index != 0) {
+            text << "reconciled\tnot_applicable_hold_cycles\n";
+            return text.str();
+        }
+        std::uint64_t round_hits = 0, round_misses = 0, round_constructed = 0, round_declined = 0;
+        std::uint64_t round_admitted_bytes = 0;
+        for (const Round& r : rounds) {
+            round_hits += r.oc_hits_all;
+            round_misses += r.oc_misses_all;
+            round_constructed += r.origins_constructed_all;
+            round_declined += r.oc_declined;
+            round_admitted_bytes += r.oc_admitted_bytes;
+        }
+        const std::uint64_t executed = context->cumulative_counters().physical_origins - seeding_origins;
+        const bool ok = round_hits == hits && round_misses == misses && round_constructed == origins &&
+                        executed == origins && round_declined == decline_events &&
+                        round_admitted_bytes == context->origin_cache_bytes() &&
+                        admitted_bytes == context->origin_cache_bytes() && hits + misses == requests;
+        text << "reconcile_hits\t" << round_hits << " rounds / " << hits << " ledger\nreconcile_misses\t"
+             << round_misses << " rounds / " << misses << " ledger\nreconcile_origins_constructed\t"
+             << round_constructed << " rounds / " << origins << " ledger / " << executed
+             << " cumulative-minus-seeding\nreconcile_declines\t" << round_declined << " rounds / "
+             << decline_events << " ledger\nreconcile_admitted_bytes\t" << round_admitted_bytes
+             << " rounds / " << admitted_bytes << " ledger / " << context->origin_cache_bytes()
+             << " cache\nreconciled\t" << (ok ? "true" : "false") << '\n';
+        return text.str();
+    };
+
+    // ---- truth: opened only once a round is on disk, and only ever read to measure distance. Nothing
+    // below is visible to the construction or the move rule above.
+    std::optional<SortedGraph> truth_graph;
+    std::vector<panvar::PathProjection> truth;
+    std::vector<long> block_floor(blocks, 0);
+    long floor_total = 0;
+    const auto ensure_truth = [&]() {
+        if (truth_graph.has_value()) return;
+        truth_graph.emplace(
+            load_truth_in_model_frame(truth_gfa, reference, loaded.sorted, out + ".truth.sorted.gfa"));
+        for (const panvar::PathRecord* path : donor_paths(truth_graph->graph, donor)) {
+            const auto projection = panvar::project_path_onto_locus(truth_graph->graph, loaded.bubbles,
+                                                                    loaded.built.report, path->name);
+            if (!projection.has_value()) throw std::runtime_error("truth does not span the block chain");
+            truth.push_back(*projection);
+        }
+        for (std::size_t b = 0; b < blocks; ++b) {
+            if (!truth[0].blocks[b].has_value() || !truth[1].blocks[b].has_value()) continue;
+            bool available = false;
+            block_floor[b] = closest_allele_distance(*truth[0].blocks[b], model.blocks()[b], available) +
+                             closest_allele_distance(*truth[1].blocks[b], model.blocks()[b], available);
+            floor_total += block_floor[b];
+        }
+    };
+    struct TruthTables {
+        std::string distance;
+        std::string per_block;
+        long start_distance = 0;
+        long final_distance = 0;
+    };
+    const auto render_truth = [&]() {
+        const auto spelling = [&](std::size_t b, std::size_t allele) -> const std::string& {
+            return model.blocks()[b].alleles[allele].sequence;
+        };
+        const auto block_distance = [&](std::size_t b, std::size_t a1, std::size_t a2) -> long {
+            if (!truth[0].blocks[b].has_value() || !truth[1].blocks[b].has_value()) return -1;
+            const std::string& t1 = *truth[0].blocks[b];
+            const std::string& t2 = *truth[1].blocks[b];
+            return std::min(edit_distance(t1, spelling(b, a1)) + edit_distance(t2, spelling(b, a2)),
+                            edit_distance(t1, spelling(b, a2)) + edit_distance(t2, spelling(b, a1)));
+        };
+        std::ostringstream distance;
+        std::ostringstream per_block;
+        distance << "round\thap1_alleles\thap2_alleles\tdistance\tfloor\texcess\n";
+        per_block << "round\tblock\tblock_id\tkind\tallele1\tallele2\tblock_distance\tblock_floor\tblock_excess\n";
+        const auto evaluate = [&](std::size_t index, const std::vector<std::size_t>& a,
+                                  const std::vector<std::size_t>& b2) {
+            long total = 0;
+            for (std::size_t b = 0; b < blocks; ++b) {
+                const long d = block_distance(b, a[b], b2[b]);
+                if (d < 0) continue;
+                total += d;
+                per_block << index << '\t' << b << '\t' << model.blocks()[b].block_id << '\t'
+                          << (model.blocks()[b].kind == panvar::GenotypeBlockKind::Variant ? "SV" : "context")
+                          << '\t' << a[b] << '\t' << b2[b] << '\t' << d << '\t' << block_floor[b] << '\t'
+                          << (d - block_floor[b]) << '\n';
+            }
+            distance << index << '\t' << join(a) << '\t' << join(b2) << '\t' << total << '\t' << floor_total
+                     << '\t' << (total - floor_total) << '\n';
+            return total;
+        };
+        TruthTables tables;
+        tables.start_distance = evaluate(first_round - 1, start_first, start_second);
+        tables.final_distance = tables.start_distance;
+        for (const Round& r : rounds) tables.final_distance = evaluate(r.index, r.first, r.second);
+        tables.distance = distance.str();
+        tables.per_block = per_block.str();
+        return tables;
+    };
+
+    // ---- commit: every completed round, atomically, before the next one starts
+    const auto commit = [&]() {
+        std::vector<panvar::OriginDemandRow> demand_rows;
+        if (context && use_origin_cache) demand_rows = context->origin_demand();
+        const std::string report = demand_report(demand_rows);
+        {
+            std::lock_guard<std::mutex> lock(commit_mutex);
+            if (finished) return;
+            rounds_committed = rounds.size();
+            atomic_write(out + ".rounds.partial.tsv", render_rounds());
+            if (memory_on) atomic_write(out + ".memory.partial.tsv", memory_text);
+            if (!demand_rows.empty()) {
+                atomic_write(out + ".origin_demand.partial.tsv", render_demand(demand_rows));
+            }
+            status_extra = report;
+            write_status("RUNNING", "round " + std::to_string(rounds.back().index) + " committed");
+        }
+        if (truth_gfa.empty()) return;
+        ensure_truth();   // outside the lock: the round is already safe on disk
+        const TruthTables tables = render_truth();
+        std::lock_guard<std::mutex> lock(commit_mutex);
+        if (finished) return;
+        atomic_write(out + ".distance.partial.tsv", tables.distance);
+        atomic_write(out + ".round_truth.partial.tsv", tables.per_block);
+        status_extra = report + "last_committed_distance\t" + std::to_string(tables.final_distance) +
+                       "\navailability_floor_total\t" + std::to_string(floor_total) +
+                       "\nlast_committed_excess\t" + std::to_string(tables.final_distance - floor_total) +
+                       '\n';
+        write_status("RUNNING", "round " + std::to_string(rounds.back().index) + " committed, distance measured");
     };
 
     std::vector<std::size_t> cur_first = start_first;
     std::vector<std::size_t> cur_second = start_second;
     // The incumbent's two haplotypes keep their context slots and their censuses between rounds;
     // everything else a round creates is transient and released at its end.
-    std::size_t inc_slot_a = 0;
-    std::size_t inc_slot_b = 0;
     bool have_inc_slots = false;
     double cur_total = start_total;
     visited.insert(key_of(cur_first, cur_second));
@@ -3690,13 +4130,13 @@ int repair_search(const Args& args) {
     double cumulative_seconds = 0.0;
     std::uint64_t cumulative_pairs = 0;
 
-    const std::size_t last_round = first_round + max_rounds - 1;
     std::size_t hold_remaining = hold_cycles;
-    std::size_t hold_index = 0;
     bool holding = false;
+    try {
     for (std::size_t round = first_round; round <= last_round; ++round) {
         Round rec;
         rec.index = round;
+        const auto round_mark = std::chrono::steady_clock::now();
 
         // The incumbent, spelled once per round: its block_intervals are the coordinates every
         // replacement below is expressed in.
@@ -3708,13 +4148,22 @@ int repair_search(const Args& args) {
             // The initial pass: place the incumbent in full, then mark everything after it
             // transient. Nothing is frozen -- owned cache keys mean a released haplotype's entries
             // stay valid and keep serving, which is what stage 3 bought.
+            //
+            // The transient round opens BEFORE the seed is added, so a seed haplotype is released like
+            // any other former incumbent. Its census exists to delta the neighbours of the rounds in
+            // which it IS an incumbent; once a move replaces it nothing deltas from it again, and cycle
+            // prevention needs only its allele path, which `visited` holds. Opened after the seed, as
+            // it was, both seed censuses stayed live for the whole search -- two of the four at 30x.
+            context->begin_transient_round();
             const std::vector<std::size_t> seeded =
                 context->add_haplotypes({incumbent_a.bases, incumbent_b.bases});
             inc_slot_a = seeded.front();
             inc_slot_b = seeded.back();
-            context->begin_transient_round();
+            role_of[inc_slot_a] = inc_slot_a == inc_slot_b ? "seed_hap1+2" : "seed_hap1";
+            if (inc_slot_b != inc_slot_a) role_of[inc_slot_b] = "seed_hap2";
             context->retain_census(inc_slot_a);
             context->retain_census(inc_slot_b);
+            seeding_origins = context->cumulative_counters().physical_origins;
             have_inc_slots = true;
         }
         if (use_delta) rec.transient_before = context->transient_payload_bytes();
@@ -3850,6 +4299,10 @@ int repair_search(const Args& args) {
             round_delta.origin_cache_hits += work.origin_cache_hits;
             round_delta.origin_cache_misses += work.origin_cache_misses;
             round_delta.origin_cache_stored += work.origin_cache_stored;
+            round_delta.origin_cache_declined += work.origin_cache_declined;
+            round_delta.origin_cache_admitted_bytes += work.origin_cache_admitted_bytes;
+            round_delta.origin_cache_declined_bytes += work.origin_cache_declined_bytes;
+            round_delta.seconds_reenumeration += work.seconds_reenumeration;
             round_delta.cached_origin_records_consumed += work.cached_origin_records_consumed;
             round_delta.physical_origins_constructed += work.physical_origins_constructed;
             round_delta.fragments_reduced += work.fragments_reduced;
@@ -3996,6 +4449,7 @@ int repair_search(const Args& args) {
                     << incumbent << '\n';
             std::cout << "repair-search " << donor << ": REFUSED, the incumbent did not reproduce in round "
                       << round << " (expected " << cur_total << ", scored " << incumbent << ")\n";
+            finish("FAILED", "the incumbent did not reproduce in round " + std::to_string(round));
             return 4;
         }
         // The scored value is the authoritative one; a declared --start-score is only an assertion
@@ -4114,6 +4568,11 @@ int repair_search(const Args& args) {
                 const std::size_t won_a = resolve_by_delta(best.s1, true);
                 const std::size_t won_b = resolve_by_delta(best.s2, true);
                 keep = {won_a, won_b};
+                const std::string promoted = "promoted_r" + std::to_string(round);
+                if (won_a != inc_slot_a && won_a != inc_slot_b) role_of[won_a] = promoted + "_hap1";
+                if (won_b != inc_slot_a && won_b != inc_slot_b && won_b != won_a) {
+                    role_of[won_b] = promoted + "_hap2";
+                }
                 inc_slot_a = won_a;
                 inc_slot_b = won_b;
             } else {
@@ -4122,6 +4581,13 @@ int repair_search(const Args& args) {
             snapshot(holding ? "hold" : "round", holding ? hold_index : round, "after_promotion", true,
                      false);
             context->release_transient(keep);
+            for (auto it = role_of.begin(); it != role_of.end();) {
+                if (std::find(keep.begin(), keep.end(), it->first) == keep.end()) {
+                    it = role_of.erase(it);
+                } else {
+                    ++it;
+                }
+            }
             rec.transient_after = context->transient_payload_bytes();
             snapshot(holding ? "hold" : "round", holding ? hold_index : round, "after_release", true,
                      pressure_relief && holding && hold_remaining == 0);
@@ -4133,8 +4599,46 @@ int repair_search(const Args& args) {
             rec.seconds_origins = round_delta.seconds_placement_and_origins;
             rec.seconds_merge = round_delta.seconds_statekey_merge;
             rec.seconds_hashing = round_delta.seconds_hashing_and_windows;
+            rec.oc_hits_all = round_delta.origin_cache_hits;
+            rec.oc_misses_all = round_delta.origin_cache_misses;
+            rec.oc_admitted = round_delta.origin_cache_stored;
+            rec.oc_admitted_bytes = round_delta.origin_cache_admitted_bytes;
+            rec.oc_declined = round_delta.origin_cache_declined;
+            rec.oc_declined_bytes = round_delta.origin_cache_declined_bytes;
+            rec.origins_constructed_all = round_delta.physical_origins_constructed;
+            rec.seconds_enumeration_all = round_delta.seconds_enumeration;
+            rec.seconds_reenumeration_all = round_delta.seconds_reenumeration;
         }
-        if (!holding) rounds.push_back(rec);
+        if (context) {
+            const panvar::FragmentScoringCounters& cumulative = context->cumulative_counters();
+            rec.cum_piece_hits = cumulative.piece_hits;
+            rec.cum_physical_origins = cumulative.physical_origins;
+            rec.cum_state_classes = cumulative.statistical_state_classes;
+            rec.cum_latent_pairs = cumulative.latent_alignment_pairs;
+            rec.mass_cells = static_cast<std::uint64_t>(fragments.size()) * context->unique_haplotypes();
+            rec.records_consumed = context->origin_records_consumed();
+            rec.census_count = context->census_slots().size();
+            rec.census_bytes = context->retained_census_bytes();
+            rec.oc_bytes_end = context->origin_cache_bytes();
+        }
+        {
+            const FootprintSample footprint = physical_footprint();
+            rec.phys_footprint = footprint.current;
+            rec.phys_footprint_peak = footprint.peak;
+            rec.rss_current = current_rss_bytes();
+        }
+        rec.round_wall_seconds =
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - round_mark).count();
+        if (!holding) {
+            rounds.push_back(rec);
+            commit();
+            if (interrupt_after != 0 && rounds.size() >= interrupt_after && rec.moved && round < last_round) {
+                stop_now("TIME_LIMIT",
+                         "interrupt-after-rounds " + std::to_string(interrupt_after) +
+                             " (test hook: the time-limit path, triggered deterministically)",
+                         124);
+            }
+        }
         if (!rec.moved) {
             if (hold_remaining > 0) {
                 // Not a round: the counter does not advance, and nothing is recorded as one.
@@ -4152,15 +4656,16 @@ int repair_search(const Args& args) {
         cur_total = rec.total;
         if (round == last_round) stop_reason = "round_cap";
     }
+    } catch (const panvar::ResourceExhausted& refusal) {
+        finish("RESOURCE_REFUSAL", refusal.what());
+        std::cout << "repair-search " << donor << ": RESOURCE_REFUSAL after " << rounds.size()
+                  << " committed rounds: " << refusal.what() << '\n';
+        return 5;
+    } catch (const std::exception& failure) {
+        finish("FAILED", failure.what());
+        throw;
+    }
 
-    const auto join = [](const std::vector<std::size_t>& v) {
-        std::string text;
-        for (std::size_t i = 0; i < v.size(); ++i) {
-            if (i != 0) text += ',';
-            text += std::to_string(v[i]);
-        }
-        return text;
-    };
     bool order_all = true;
     bool swap_all = true;
     for (const Round& r : rounds) {
@@ -4214,128 +4719,53 @@ int repair_search(const Args& args) {
             << "\ncumulative_scoring_seconds\t" << cumulative_seconds << "\ncumulative_scored_pairs\t"
             << cumulative_pairs << "\npeak_rss_gib\t" << peak_rss_gib() << "\nfinal_total\t" << cur_total
             << "\nimprovement_total\t" << (cur_total - start_total) << '\n';
+    std::vector<panvar::OriginDemandRow> demand_rows;
+    if (context && use_origin_cache) demand_rows = context->origin_demand();
+    summary << demand_report(demand_rows);
+    summary << "phys_footprint_peak_bytes\t" << physical_footprint().peak << '\n';
 
-    // ---- the rounds table: TRUTH-FREE, and written before the truth graph is opened ----------------
+    // ---- completion. Truth, if any, is loaded first (a committed round usually loaded it already);
+    // then every final file is written under the commit lock, so a watchdog can neither interleave
+    // with them nor stamp a finished run as stopped. The rounds table is TRUTH-FREE, as it always was.
+    TruthTables tables;
+    if (!truth_gfa.empty()) {
+        ensure_truth();
+        tables = render_truth();
+    }
     {
-        std::ofstream table(out + ".rounds.tsv");
-        table << std::setprecision(12)
-              << "round\tstart_total\tmoved\trepaired_block\tlocal_pair_rank\tassignment\tallele_x\t"
-                 "allele_y\thap1_alleles\thap2_alleles\tfragment_term\texposure_term\tprior\ttotal\t"
-                 "delta_total\tstatus\tunique_best\tseparation\tneighbours_generated\tneighbours_scored\t"
-                 "duplicate\tsuppressed_visited\tself_skipped\trejected_infinite_prior\t"
-                 "unique_haplotypes\tscored_pairs\torder_invariant\tswap_invariant\tseconds\tpeak_rss_gib\t"
-                 "haplotypes_new\thaplotypes_reused\tbases_scanned\tpiece_hits\tcache_requests\t"
-                 "cache_hits\tcache_misses\texecuted_dps\tphysical_origins\tstate_classes\t"
-                 "placement_seconds\tcombination_seconds\torigins_reused\torigins_recomputed\t"
-                 "window_bases\ttransient_before\ttransient_after\tfull_haplotype_bytes\t"
-                 "window_bytes\tsequence_key_bytes\tseconds_origins\tseconds_merge\t"
-                 "seconds_hashing\tseconds_lookup\tentry_metadata_bytes\tcontent_arena_bytes\t"
-                 "row_constructions\taccumulator_growths\torigin_growths\t"
-                 "oc_hits\toc_misses\toc_stored\toc_entries\toc_bytes\torigins_constructed\t"
-                 "origins_loaded\tfragments_reduced\tfragments_copied\tmerge_working_bytes\t"
-                 "seconds_enumeration\tseconds_filter\tseconds_aggregate\tseconds_reduce\n";
-        for (const Round& r : rounds) {
-            table << r.index << '\t' << r.start_total << '\t' << (r.moved ? "true" : "false") << '\t'
-                  << (r.moved ? model.blocks()[r.block].block_id : std::string("NA")) << '\t'
-                  << (r.moved ? std::to_string(r.rank) : std::string("NA")) << '\t'
-                  << (r.moved ? std::to_string(r.assignment) : std::string("NA")) << '\t'
-                  << (r.moved ? std::to_string(r.allele_x) : std::string("NA")) << '\t'
-                  << (r.moved ? std::to_string(r.allele_y) : std::string("NA")) << '\t'
-                  << join(r.first) << '\t' << join(r.second) << '\t' << r.fragment << '\t' << r.exposure
-                  << '\t' << r.prior << '\t' << r.total << '\t' << (r.total - r.start_total) << '\t'
-                  << (r.complete ? "COMPLETE" : "RESCORE_INCOMPLETE") << '\t'
-                  << (r.unique_best ? "true" : "false") << '\t' << r.separation << '\t' << r.generated
-                  << '\t' << r.neighbours << '\t' << r.duplicate << '\t' << r.suppressed << '\t'
-                  << r.self_skipped << '\t' << r.rejected_prior << '\t' << r.unique_haplotypes << '\t'
-                  << r.scored_pairs << '\t' << (r.order_invariant ? "true" : "false") << '\t'
-                  << (r.swap_invariant ? "true" : "false") << '\t' << r.seconds << '\t' << r.rss
-                  << '\t' << r.haps_new << '\t' << r.haps_reused << '\t' << r.bases_scanned << '\t'
-                  << r.piece_hits << '\t' << r.cache_requests << '\t' << r.cache_hits << '\t'
-                  << r.cache_misses << '\t' << r.executed_dps << '\t' << r.physical_origins << '\t'
-                  << r.state_classes << '\t' << r.placement_seconds << '\t'
-                  << r.combination_seconds << '\t' << r.origins_reused << '\t'
-                  << r.origins_recomputed << '\t' << r.window_bases << '\t' << r.transient_before
-                  << '\t' << r.transient_after << '\t' << r.full_bytes << '\t' << r.window_bytes
-                  << '\t' << r.key_bytes << '\t' << r.seconds_origins << '\t' << r.seconds_merge
-                  << '\t' << r.seconds_hashing << '\t' << r.seconds_lookup << '\t'
-                  << r.entry_metadata_bytes << '\t' << r.content_arena_bytes << '\t'
-                  << r.row_constructions << '\t' << r.accumulator_growths << '\t'
-                  << r.origin_growths << '\t' << r.oc_hits << '\t' << r.oc_misses << '\t'
-                  << r.oc_stored << '\t' << r.oc_entries << '\t' << r.oc_bytes << '\t'
-                  << r.origins_constructed << '\t' << r.origins_loaded << '\t'
-                  << r.fragments_reduced << '\t' << r.fragments_copied << '\t'
-                  << r.merge_working_bytes << '\t' << r.seconds_enumeration << '\t'
-                  << r.seconds_filter << '\t' << r.seconds_aggregate << '\t' << r.seconds_reduce
-                  << '\n';
+        std::lock_guard<std::mutex> lock(commit_mutex);
+        if (finished) return 6;   // a stop already won; its status stands
+        finished = true;
+        rounds_committed = rounds.size();
+        atomic_write(out + ".rounds.tsv", render_rounds());
+        if (memory_on) atomic_write(out + ".memory.tsv", memory_text);
+        if (!demand_rows.empty()) atomic_write(out + ".origin_demand.tsv", render_demand(demand_rows));
+        if (truth_gfa.empty()) {
+            summary << "truth_evaluated\tfalse\n";
+        } else {
+            atomic_write(out + ".distance.tsv", tables.distance);
+            atomic_write(out + ".round_truth.tsv", tables.per_block);
+            summary << "truth_evaluated\ttrue\navailability_floor_total\t" << floor_total
+                    << "\nstart_distance\t" << tables.start_distance << "\nfinal_distance\t"
+                    << tables.final_distance << "\nfinal_excess\t" << (tables.final_distance - floor_total)
+                    << '\n';
         }
+        atomic_write(out + ".summary.tsv", summary.str());
+        for (const char* partial : {"rounds", "memory", "origin_demand", "distance", "round_truth"}) {
+            std::error_code ignored;
+            std::filesystem::remove(out + "." + partial + ".partial.tsv", ignored);
+        }
+        status_extra = demand_report(demand_rows);
+        write_status("COMPLETE", stop_reason);
     }
     if (truth_gfa.empty()) {
-        summary << "truth_evaluated\tfalse\n";
         std::cout << "repair-search " << donor << ": " << rounds.size() << " rounds, stop=" << stop_reason
                   << ", improvement " << (cur_total - start_total) << " nats, no truth evaluation\n";
         return 0;
     }
-
-    // ---- truth enters ONLY here, after the rounds table is complete on disk -------------------------
-    const SortedGraph truth_graph =
-        load_truth_in_model_frame(truth_gfa, reference, loaded.sorted, out + ".truth.sorted.gfa");
-    std::vector<panvar::PathProjection> truth;
-    for (const panvar::PathRecord* path : donor_paths(truth_graph.graph, donor)) {
-        const auto projection = panvar::project_path_onto_locus(truth_graph.graph, loaded.bubbles,
-                                                                loaded.built.report, path->name);
-        if (!projection.has_value()) throw std::runtime_error("truth does not span the block chain");
-        truth.push_back(*projection);
-    }
-    const auto spelling = [&](std::size_t b, std::size_t allele) -> const std::string& {
-        return model.blocks()[b].alleles[allele].sequence;
-    };
-    const auto block_distance = [&](std::size_t b, std::size_t a1, std::size_t a2) -> long {
-        if (!truth[0].blocks[b].has_value() || !truth[1].blocks[b].has_value()) return -1;
-        const std::string& t1 = *truth[0].blocks[b];
-        const std::string& t2 = *truth[1].blocks[b];
-        return std::min(edit_distance(t1, spelling(b, a1)) + edit_distance(t2, spelling(b, a2)),
-                        edit_distance(t1, spelling(b, a2)) + edit_distance(t2, spelling(b, a1)));
-    };
-    std::vector<long> block_floor(blocks, 0);
-    long floor_total = 0;
-    for (std::size_t b = 0; b < blocks; ++b) {
-        if (!truth[0].blocks[b].has_value() || !truth[1].blocks[b].has_value()) continue;
-        bool available = false;
-        block_floor[b] = closest_allele_distance(*truth[0].blocks[b], model.blocks()[b], available) +
-                         closest_allele_distance(*truth[1].blocks[b], model.blocks()[b], available);
-        floor_total += block_floor[b];
-    }
-
-    std::ofstream distance(out + ".distance.tsv");
-    distance << "round\thap1_alleles\thap2_alleles\tdistance\tfloor\texcess\n";
-    std::ofstream per_block(out + ".round_truth.tsv");
-    per_block << "round\tblock\tblock_id\tkind\tallele1\tallele2\tblock_distance\tblock_floor\tblock_excess\n";
-    const auto evaluate = [&](std::size_t index, const std::vector<std::size_t>& a,
-                              const std::vector<std::size_t>& b2) {
-        long total = 0;
-        for (std::size_t b = 0; b < blocks; ++b) {
-            const long d = block_distance(b, a[b], b2[b]);
-            if (d < 0) continue;
-            total += d;
-            per_block << index << '\t' << b << '\t' << model.blocks()[b].block_id << '\t'
-                      << (model.blocks()[b].kind == panvar::GenotypeBlockKind::Variant ? "SV" : "context")
-                      << '\t' << a[b] << '\t' << b2[b] << '\t' << d << '\t' << block_floor[b] << '\t'
-                      << (d - block_floor[b]) << '\n';
-        }
-        distance << index << '\t' << join(a) << '\t' << join(b2) << '\t' << total << '\t' << floor_total
-                 << '\t' << (total - floor_total) << '\n';
-        return total;
-    };
-    const long start_distance = evaluate(first_round - 1, start_first, start_second);
-    long final_distance = start_distance;
-    for (const Round& r : rounds) final_distance = evaluate(r.index, r.first, r.second);
-    summary << "truth_evaluated\ttrue\navailability_floor_total\t" << floor_total << "\nstart_distance\t"
-            << start_distance << "\nfinal_distance\t" << final_distance << "\nfinal_excess\t"
-            << (final_distance - floor_total) << '\n';
-
     std::cout << "repair-search " << donor << ": " << rounds.size() << " rounds, stop=" << stop_reason
-              << ", improvement " << (cur_total - start_total) << " nats, distance " << start_distance
-              << " -> " << final_distance << " (floor " << floor_total << "), " << cumulative_seconds
+              << ", improvement " << (cur_total - start_total) << " nats, distance " << tables.start_distance
+              << " -> " << tables.final_distance << " (floor " << floor_total << "), " << cumulative_seconds
               << "s scoring\n";
     return 0;
 }

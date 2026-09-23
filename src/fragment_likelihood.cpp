@@ -3670,6 +3670,9 @@ struct PreparedScoringContext::State {
     std::uint64_t origin_record_cap = 0;
     std::uint64_t origin_records_consumed = 0;
     OriginCache origin_cache;
+    // The demand ledger: every distinct window requested, admitted or not. Same identity as the cache.
+    std::unordered_multimap<std::uint64_t, std::size_t> demand_index;
+    std::deque<std::pair<std::string, OriginDemandRow>> demand;
     std::map<GroupKey, GroupEntry> groups;
     std::map<std::pair<std::size_t, std::uint32_t>, std::vector<StateCount>> full_aggregates;
     OriginRecordSet miss_records;
@@ -4008,6 +4011,20 @@ void PreparedScoringContext::set_origin_cache_limits(std::size_t budget_bytes,
     state_->origin_record_cap = max_records_consumed;
 }
 
+std::vector<OriginDemandRow> PreparedScoringContext::origin_demand() const {
+    std::vector<OriginDemandRow> out;
+    out.reserve(state_->demand.size());
+    for (const auto& row : state_->demand) out.push_back(row.second);
+    return out;
+}
+
+std::vector<std::size_t> PreparedScoringContext::census_slots() const {
+    std::vector<std::size_t> out;
+    for (const auto& item : state_->censuses) out.push_back(item.first);
+    std::sort(out.begin(), out.end());
+    return out;
+}
+
 std::size_t PreparedScoringContext::origin_cache_entries() const {
     return state_->origin_cache.entries.size();
 }
@@ -4145,11 +4162,18 @@ ContextMemoryAccount PreparedScoringContext::memory_account() const {
         a.prepared_capacity = prepared;
     }
     a.last_scoring_result_bytes = state.last_result_bytes;
+    for (const auto& row : state.demand) {
+        a.origin_demand_bytes += sizeof(row) + heap(row.first);
+    }
+    a.origin_demand_bytes += static_cast<std::uint64_t>(state.demand_index.size()) *
+                                 (sizeof(std::pair<const std::uint64_t, std::size_t>) + kHashNode) +
+                             static_cast<std::uint64_t>(state.demand_index.bucket_count()) * sizeof(void*);
     a.logical_total = a.slot_table_bytes + a.sequence_bytes + a.segment_bytes + a.mass_column_bytes +
+                      a.origin_demand_bytes +
                       a.census_bytes + a.origin_cache_payload + a.merge_working_bytes +
                       a.emission_cache_table + a.emission_cache_arena + a.prepared_capacity +
                       a.last_scoring_result_bytes;
-    a.capacity_total = a.slot_table_bytes + a.sequence_capacity + a.segment_bytes +
+    a.capacity_total = a.slot_table_bytes + a.sequence_capacity + a.segment_bytes + a.origin_demand_bytes +
                        a.mass_column_capacity + a.census_capacity + a.origin_cache_capacity +
                        a.merge_working_capacity + a.window_scratch_capacity +
                        a.origin_scratch_capacity + a.emission_cache_table + a.emission_cache_arena +
@@ -4449,10 +4473,37 @@ std::size_t PreparedScoringContext::add_repaired_haplotype(
         const OriginCacheEntry* entry =
             find_origin_entry(state.origin_cache, key_hash, window.bases, window.at_start,
                               window.at_end, rel_block_begin, rel_new_end);
+        OriginDemandRow* demand = nullptr;
+        {
+            const auto range = state.demand_index.equal_range(key_hash);
+            for (auto it = range.first; it != range.second && demand == nullptr; ++it) {
+                auto& row = state.demand[it->second];
+                if (row.second.at_start == window.at_start && row.second.at_end == window.at_end &&
+                    row.second.rel_block_begin == rel_block_begin &&
+                    row.second.rel_new_end == rel_new_end && row.first == window.bases) {
+                    demand = &row.second;
+                }
+            }
+            if (demand == nullptr) {
+                OriginDemandRow fresh;
+                fresh.order = state.demand.size();
+                fresh.key_hash = key_hash;
+                fresh.window_bytes = window.bases.size();
+                fresh.at_start = window.at_start;
+                fresh.at_end = window.at_end;
+                fresh.rel_block_begin = rel_block_begin;
+                fresh.rel_new_end = rel_new_end;
+                state.demand.emplace_back(window.bases, fresh);
+                state.demand_index.emplace(key_hash, state.demand.size() - 1);
+                demand = &state.demand.back().second;   // deque: stable address
+            }
+            ++demand->requests;
+        }
         const OriginRecordSet* source = nullptr;
         bool scratch_is_fresh = false;
         if (entry != nullptr) {
             ++local.origin_cache_hits;
+            ++demand->hits;
             const std::uint64_t records = entry->records.origins.size();
             // A separate cap on what REUSE consumes. Executed-work caps are not charged for a hit --
             // that work was not performed -- so reuse needs a bound of its own.
@@ -4468,6 +4519,7 @@ std::size_t PreparedScoringContext::add_repaired_haplotype(
             source = &entry->records;
         } else {
             ++local.origin_cache_misses;
+            const auto miss_mark = Clock::now();
             try {
                 enumerate_window_origins(state.prepared, state.fragments, state.library,
                                          state.options, state.options.mismatch_band, window,
@@ -4482,6 +4534,18 @@ std::size_t PreparedScoringContext::add_repaired_haplotype(
                                  rel_new_end, keep_all, state.miss_records);
             source = &state.miss_records;
             const std::uint64_t cost = origin_entry_bytes(window.bases, state.miss_records);
+            {
+                const double spent = seconds_since(miss_mark);
+                if (demand->misses != 0) {
+                    demand->seconds_reenumeration += spent;
+                    local.seconds_reenumeration += spent;
+                }
+                ++demand->misses;
+                demand->seconds_enumeration += spent;
+                demand->origins_constructed += counters.physical_origins;
+                demand->entry_bytes = cost;
+                demand->records = state.miss_records.origins.size();
+            }
             if (state.origin_cache_budget != 0 &&
                 state.origin_cache.bytes + cost <= state.origin_cache_budget) {
                 OriginCacheEntry stored;
@@ -4496,10 +4560,15 @@ std::size_t PreparedScoringContext::add_repaired_haplotype(
                 state.origin_cache.index.emplace(key_hash, state.origin_cache.entries.size() - 1);
                 state.origin_cache.bytes += cost;
                 ++local.origin_cache_stored;
+                local.origin_cache_admitted_bytes += cost;
+                demand->admitted = true;
                 source = &state.origin_cache.entries.back().records;   // deque: stable address
             } else if (state.origin_cache_budget != 0) {
                 // Exhaustion stops RETENTION. The records just built are still used, exactly.
                 ++state.origin_cache.not_retained;
+                ++local.origin_cache_declined;
+                local.origin_cache_declined_bytes += cost;
+                ++demand->declined;
             }
         }
         // Certification of a hit: enumerate fresh against a throwaway budget and require the

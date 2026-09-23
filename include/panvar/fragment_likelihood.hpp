@@ -1024,6 +1024,12 @@ struct BlockDeltaWork {
     std::uint64_t origin_cache_hits = 0;
     std::uint64_t origin_cache_misses = 0;
     std::uint64_t origin_cache_stored = 0;
+    // Demand, not just outcome: a miss whose records were built and then NOT retained because the
+    // budget was full is a decline, and every later request for that window pays the enumeration again.
+    std::uint64_t origin_cache_declined = 0;
+    std::uint64_t origin_cache_admitted_bytes = 0;
+    std::uint64_t origin_cache_declined_bytes = 0;
+    double seconds_reenumeration = 0.0;   // misses on a window already missed before
     std::uint64_t cached_origin_records_consumed = 0;
     std::uint64_t physical_origins_constructed = 0;
     std::uint64_t fragments_reduced = 0;
@@ -1065,6 +1071,30 @@ void segmented_window(const std::string& base, std::size_t block_begin, std::siz
 // (maps, hashed maps) do not expose their internals, so those are charged a declared per-node
 // allowance and say so. The purpose is to compare the sum with RSS and see what RSS holds that the
 // context cannot account for -- not to assign that remainder to anything without evidence.
+// One row per DISTINCT window the origin path was asked for, in first-request order. Identity is the
+// origin cache's own: window bytes, both end flags and the relative replacement interval. It records
+// demand whether or not the window was admitted, so what a budget declines -- and what declining it
+// costs on every later request -- is measured rather than estimated.
+struct OriginDemandRow {
+    std::uint64_t order = 0;
+    std::uint64_t key_hash = 0;
+    std::uint64_t window_bytes = 0;
+    bool at_start = false;
+    bool at_end = false;
+    std::uint32_t rel_block_begin = 0;
+    std::uint32_t rel_new_end = 0;
+    std::uint64_t requests = 0;
+    std::uint64_t hits = 0;
+    std::uint64_t misses = 0;
+    bool admitted = false;
+    std::uint64_t declined = 0;               // misses built and not retained: the budget was full
+    std::uint64_t entry_bytes = 0;            // declared cost of one entry; the same at every miss
+    std::uint64_t records = 0;                // retained origin records in one entry
+    std::uint64_t origins_constructed = 0;    // executed, summed over every miss
+    double seconds_enumeration = 0.0;         // enumeration + record building, summed over misses
+    double seconds_reenumeration = 0.0;       // the same, for misses after the first
+};
+
 struct ContextMemoryAccount {
     std::uint64_t slots_total = 0;
     std::uint64_t slots_live = 0;
@@ -1083,6 +1113,7 @@ struct ContextMemoryAccount {
     std::uint64_t origin_cache_capacity = 0;
     std::uint64_t merge_working_bytes = 0;       // group preaggregates + full aggregates
     std::uint64_t merge_working_capacity = 0;
+    std::uint64_t origin_demand_bytes = 0;       // the demand ledger: one row + key bytes per window
     std::uint64_t window_scratch_capacity = 0;   // persistent placement rows and flat origin output
     std::uint64_t origin_scratch_capacity = 0;   // miss/check records, candidate states, merge buffer
     std::uint64_t emission_cache_table = 0;
@@ -1134,7 +1165,10 @@ public:
     // 171,000 of them per round. Keys now OWN the bytes they compare, so a transient repair haplotype
     // may be destroyed while every entry it produced stays valid and keeps serving.
     //
-    // Marks the point after which added haplotypes are transient and may be released.
+    // Marks the point after which added haplotypes are transient and may be released. It may be called
+    // before anything is added, which makes every haplotype -- the seed included -- releasable once it
+    // is no longer kept. Repair search does that: a seed that has stopped being an incumbent is never
+    // delta'd from again, so its full census is pure retention.
     void begin_transient_round();
 
     // Scores the incumbent haplotype with [block_begin, block_end) replaced by `replacement`, reusing
@@ -1171,6 +1205,10 @@ public:
     // state released with the incumbent, not retained across rounds.
     std::uint64_t merge_working_bytes() const;
     ContextMemoryAccount memory_account() const;
+    std::vector<OriginDemandRow> origin_demand() const;
+    // Slots currently holding a full origin census, ascending. A caller that knows what each slot is
+    // (an incumbent, a seed, a winner being promoted) can then say why every one of them is live.
+    std::vector<std::size_t> census_slots() const;
 
     // Retains an origin census for this haplotype, so a later round may delta from it.
     void retain_census(std::size_t haplotype);

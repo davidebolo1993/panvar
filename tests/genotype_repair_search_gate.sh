@@ -16,6 +16,11 @@
 #   5    exact-at-cap proceeds, cap-minus-one refuses before allocating.
 #   6    construction never reads truth: the rounds table must be byte-identical with and without
 #        --truth-gfa. If any selection consulted truth, dropping it would change the table.
+#   7    resuming mid-search continues exactly as running straight through would.
+#   8    an interrupted run can never be read as a completed one: a stop through the time-limit path
+#        leaves only <out>.*.partial.tsv rows identical to the complete run's, a TIME_LIMIT status and
+#        no summary; a cap refusal leaves RESOURCE_REFUSAL and nothing final; a complete run's
+#        origin-cache demand reconciles with the work its rounds report.
 #
 # Gates 3-6 run at --local-pairs 1, where a round is small, since none of them depends on the
 # neighbourhood being wide.
@@ -176,6 +181,40 @@ fi
 code="$(search "$WORK/badresume" --local-pairs 1 --rounds 1 --first-round 3 \
           --start "$r2a|$r2b" --start-score "$(awk -v t="$r2t" 'BEGIN{printf "%.6f", t+1}')")"
 same "a wrong declared start score refuses" "$code" "4"
+
+
+echo "== 8. an interrupted run can never be read as a completed one =="
+exists() { [ -e "$1" ] && echo present || echo absent; }
+DELTA=(--local-pairs 1 --delta 1 --origin-cache 1 --origin-cache-bytes 268435456)
+code="$(search "$WORK/whole" "${DELTA[@]}" --rounds 3 --truth-gfa "$G")"
+same "complete run exit" "$code" "0"
+same "complete run status" "$(key "$WORK/whole.run_status.tsv" status)" "COMPLETE"
+same "complete run leaves no partial rounds" "$(exists "$WORK/whole.rounds.partial.tsv")" "absent"
+same "complete run demand reconciles" "$(key "$WORK/whole.run_status.tsv" reconciled)" "true"
+code="$(search "$WORK/cut" "${DELTA[@]}" --rounds 3 --truth-gfa "$G" --interrupt-after-rounds 2)"
+same "interrupted exit" "$code" "124"
+same "interrupted status" "$(key "$WORK/cut.run_status.tsv" status)" "TIME_LIMIT"
+same "interrupted is not complete" "$(key "$WORK/cut.run_status.tsv" complete)" "false"
+same "interrupted rounds committed" "$(key "$WORK/cut.run_status.tsv" rounds_committed)" "2"
+for f in rounds summary distance memory origin_demand; do
+  same "interrupted run wrote no final $f table" "$(exists "$WORK/cut.$f.tsv")" "absent"
+done
+if diff -q <(head -3 "$WORK/whole.rounds.tsv" | cut -f1-28) <(cut -f1-28 "$WORK/cut.rounds.partial.tsv") > /dev/null; then
+  echo "  ok: the two committed rounds are identical to the complete run's"
+else
+  echo "  GATE FAILED: committed rounds differ from the complete run's"; fail=1
+fi
+if diff -q <(head -4 "$WORK/whole.distance.tsv") "$WORK/cut.distance.partial.tsv" > /dev/null; then
+  echo "  ok: the committed distances are identical to the complete run's"
+else
+  echo "  GATE FAILED: committed distances differ from the complete run's"; fail=1
+fi
+code="$(search "$WORK/capped" "${DELTA[@]}" --rounds 2 --max-physical-origins 1000)"
+same "cap refusal exit" "$code" "5"
+same "cap refusal status" "$(key "$WORK/capped.run_status.tsv" status)" "RESOURCE_REFUSAL"
+same "cap refusal is not complete" "$(key "$WORK/capped.run_status.tsv" complete)" "false"
+same "cap refusal wrote no rounds table" "$(exists "$WORK/capped.rounds.tsv")" "absent"
+same "cap refusal wrote no summary" "$(exists "$WORK/capped.summary.tsv")" "absent"
 
 echo
 if [ "$fail" -ne 0 ]; then echo "repair-search gate FAILED"; exit 1; fi

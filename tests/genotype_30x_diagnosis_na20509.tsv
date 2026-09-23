@@ -1,0 +1,34 @@
+item	value	provenance
+question	why 30x repair search cannot finish in 360 s / 2 GiB, measured rather than estimated	Sol, after 66f983e
+donor_cell	NA20509 30x K=128	frozen cov30 reads (sha256 checked), frozen call.30.K128 run; not resimulated
+caps	rounds 2, max-neighbors 670, stage-6 scorer caps; origin cache as stated per run	no default changed
+instrument_rounds	each completed round committed atomically to <out>.*.partial.tsv; <out>.run_status.tsv says RUNNING, TIME_LIMIT, RESOURCE_REFUSAL, FAILED or COMPLETE	final names and summary only on normal completion
+instrument_watchdog	in-process: --time-limit-seconds, --footprint-limit-bytes (macOS phys_footprint)	RSS kept beside it, not replaced
+instrument_demand	one ledger row per distinct window: requests, hits, misses, admitted, declined, entry bytes, records, enumeration and re-enumeration seconds	reconciled against round columns and cumulative counters
+census_why_live	four censuses at 30x round 4 = two seed censuses + two current incumbents	seeds were added BEFORE the transient round opened, so release_transient could never free them
+census_needed	only the current incumbents' censuses (delta source); earlier incumbents only as allele paths in visited	transient former incumbents were already released at promotion
+census_fix	repair search opens the transient round before seeding	seed released with its census once a move replaces it
+census_gate	released seed respelled by delta is bit-identical to its full placement: cells, exposure, diplotype score	both paths; only the incumbent keeps a census
+census_10x_after	2 censuses after every release	roles recorded per memory row
+census_30x_after	2 censuses, 122.0 MiB after round 2	184.7 MiB (4) at the same point before the fix
+gate_10x_trajectory	identical in all seven rounds: block, rank, assignment, alleles, totals	against the stage-6 table
+gate_10x_final	-151090.979646, distance 114, floor 91	identical
+gate_10x_work_totals	origins reused 1240554668, recomputed 186373979	changed BY CONSTRUCTION from 1236837536 / 186058529: a seed haplotype respelled in rounds 2-7 is rebuilt by delta instead of served from the retained seed column (+1 new haplotype per round)
+gate_10x_resources	40.28 s wall; peak RSS 1004421120 bytes; peak phys footprint 1102726392 bytes	66f983e: 39.88 s, peak RSS 1175568384
+gate_10x_demand	270 windows, 399369687 bytes, all admitted, reconciled	
+gate_interruption	TIME_LIMIT via test hook leaves 2 committed rounds identical to the complete run, no final tables, complete=false; cap refusal leaves RESOURCE_REFUSAL and nothing final	tests/genotype_repair_search_gate.sh section 8
+run_768_two_rounds	STOPPED: RESOURCE_REFUSAL in round 1 at 100.3 s, phys footprint 2062698560 bytes > declared 2040109465 (1.9 GiB)	no round committed; RSS at that moment 830947328 current, 1161936896 peak
+rss_undercounts	RSS read 0.77 GiB while the footprint was 1.92 GiB	the earlier 1.749 GiB pilot figure was RSS, not footprint
+run_demand	--origin-cache-bytes 0, two rounds, COMPLETE in 196.3 s; peak phys footprint 1350878720 bytes	measurement-only substitute for the 768 run, which committed nothing
+demand_windows	266 distinct windows, 1133195540 bytes (1.055 GiB) of entries	exact; replaces the 0.95 GiB estimate
+demand_requests	649 requests, 383 repeats; every window repeated at least once	repeat counts: 207x1, 1x2, 58x3
+demand_enumeration	175.16 s total: 71.58 s first requests, 103.58 s repeats	
+demand_by_class	interior 231 windows 944.6 MiB; start 20 / 27.6 MiB; end 15 / 108.5 MiB	16.2-16.3 bytes per retained origin record: the raw record dominates
+replay_768_first_fit	admits 214 / 767.4 MiB, declines 52 / 313.3 MiB; declined repeats cost 38.58 s of 103.58 s	exact replay: admission is decided at a window's first miss, in first-request order
+replay_768_value_per_byte	admits 240 / 758.0 MiB; declined repeats cost 8.04 s	first-fit is not the best admission at this budget
+round_1_no_cache	104.2 s wall, 88.3 s enumeration, 325 misses; distance 6541 -> 163	
+round_2_no_cache	89.2 s wall, 86.9 s enumeration (all repeats), 324 misses; distance 170, floor 91, excess 79	
+margins_after_round_2	origins 4731849949, classes 4058359607, piece hits 13900231209, latent pairs 13831849949, mass cells 188942406	none binding
+footprint_projection	no cache 1.26 GiB; 768 MiB cache measured 1.92 GiB in round 1; complete 1.055 GiB cache ~2.3 GiB	no meaningful headroom at 768, none for a complete cache
+decision	no larger-cache run and no full 30x pilot	the footprint criterion fails before the time criterion is reached
+next_target	a smaller cached representation (61 million raw 16-byte origin records at 30x), not a larger budget	value-per-byte admission recovers time at the same budget but not footprint
