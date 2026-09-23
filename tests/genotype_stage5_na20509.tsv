@@ -1,0 +1,43 @@
+item	value	provenance
+stage	5: persistent scratch + endpoint groups + flat origins	enumerate_window_origins only
+donor_cell	NA20509 10x K=128	seven-round trajectory
+trajectory_identical	true	all 7 rounds: block, rank, assignment, alleles, total
+final_total	-151090.979646	bit-identical to every prior stage
+final_distance	114	floor 91, excess 23, unchanged
+stop_reason	no_improvement	converged at round 7
+stage2_wall_s	301.09	0.9686 GiB
+stage4_wall_s	576.30	0.8290 GiB
+stage5_wall_s	282.09	0.6649 GiB (713900032 bytes)
+stage5_vs_stage4	2.04x faster	1.25x less memory
+stage5_vs_stage2	BEATS by 19.00 s	1.07x faster, 1.46x less memory
+required_360s_2gib	MET on both axes	282.09 s, 0.6649 GiB
+desired_60_90s	MISSED	282.09 s
+seconds_origins_per_round	29.74, 28.97, 28.86, 28.85, 28.73, 29.08, 29.08	was ~60 at stage 4
+seconds_merge_per_round	9.83, 9.84, 9.87, 9.92, 9.87, 9.81, 9.96	was ~19 at stage 4
+seconds_lookup_per_round	1.30, 1.30, 1.28, 1.28, 1.27, 1.25, 1.34	was ~5.3 at stage 4
+seconds_total_per_round	39.25, 38.69, 38.68, 38.75, 38.61, 38.67, 39.13	was ~79 at stage 4
+row_constructions_round_1	45508	one per read form, once
+row_constructions_rounds_2_to_7	0	rows are reused, not rebuilt
+accumulator_growths_round_1	20	
+accumulator_growths_rounds_2_to_7	0	endpoint accumulators reused
+origin_output_growths_round_1	20	
+origin_output_growths_rounds_2_to_7	0	flat origin vector reused
+origins_reused	1236837536	unchanged
+origins_recomputed	186058529	unchanged
+cumulative_physical_origins	191981492	unchanged
+cumulative_state_classes	1246528965	unchanged
+seconds_combination	0.269	0.1% of the run
+grouping_is_exact_because	fr_insert_from_endpoints returns reverse_end - forward_start	insert is strictly increasing in the endpoint
+so_contiguous_endpoint_runs_are	exactly the map's keys, already ascending	no reordering, no re-keying
+accumulation_order_preserved	forward row outer, reverse row inner, groups ascending	each accumulator sees the same additions in the same sequence
+self_check_compares	origins, their order, and the counters	including latent_alignment_pairs, which counts REJECTED pairs
+why_that_matters	same origins by a different test sequence would move the counter and the budget crossing	masses alone would not catch it
+gate_old_vs_new	passes	substitutions, indels, empty alleles, both locus ends, adjacent short blocks, tandem repeats
+gate_thread_identity	passes	1/2/4/8 threads, worst mass delta 0
+gate_scratch_allocation	passes	zero per-form and per-origin-container construction after warm-up
+residual_allocations_per_candidate	~1170, flat	NOT the enumeration: all three of its counters are zero
+residual_attributed_to	the StateKey merge's per-fragment std::map	a different call site, outside this batch
+hypothesis_i_got_wrong	that the residual was cold rows warming	measured flat at 1168.93 then 1174.27, so it was not
+gates_passed	all	plus stage-1 context gates and the exhaustive oracle
+speed_target_30x	not addressed	10x only
+conclusion	the container churn and the inner map WERE the cost	origins halved, merge halved, and stage 2 is finally beaten

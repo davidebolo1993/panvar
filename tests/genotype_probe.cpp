@@ -3570,6 +3570,10 @@ int repair_search(const Args& args) {
         // whether consulting the cache is cheap, and whether what it saves was worth consulting.
         double seconds_lookup = 0.0;
         std::uint64_t entry_metadata_bytes = 0, content_arena_bytes = 0;
+        // Persistent scratch: these are container GROWTH events, and should fall to zero once the
+        // rows have warmed. A non-zero row figure after round one means something is still being
+        // constructed per candidate.
+        std::uint64_t row_constructions = 0, accumulator_growths = 0, origin_growths = 0;
     };
     std::vector<Round> rounds;
     std::unique_ptr<panvar::PreparedScoringContext> context;
@@ -3739,6 +3743,9 @@ int repair_search(const Args& args) {
             round_delta.seconds_placement_and_origins += work.seconds_placement_and_origins;
             round_delta.seconds_statekey_merge += work.seconds_statekey_merge;
             round_delta.seconds_hashing_and_windows += work.seconds_hashing_and_windows;
+            round_delta.placement_row_constructions += work.placement_row_constructions;
+            round_delta.accumulator_growths += work.accumulator_growths;
+            round_delta.origin_output_growths += work.origin_output_growths;
             round_delta.seconds += work.seconds;
             return slot;
         };
@@ -3823,6 +3830,9 @@ int repair_search(const Args& args) {
                 rec.seconds_origins = round_delta.seconds_placement_and_origins;
                 rec.seconds_merge = round_delta.seconds_statekey_merge;
                 rec.seconds_hashing = round_delta.seconds_hashing_and_windows;
+                rec.row_constructions = round_delta.placement_row_constructions;
+                rec.accumulator_growths = round_delta.accumulator_growths;
+                rec.origin_growths = round_delta.origin_output_growths;
             }
             rec.seconds_lookup = panvar::emission_cache_lookup_seconds() - lookup_before;
             {
@@ -4076,7 +4086,8 @@ int repair_search(const Args& args) {
                  "placement_seconds\tcombination_seconds\torigins_reused\torigins_recomputed\t"
                  "window_bases\ttransient_before\ttransient_after\tfull_haplotype_bytes\t"
                  "window_bytes\tsequence_key_bytes\tseconds_origins\tseconds_merge\t"
-                 "seconds_hashing\tseconds_lookup\tentry_metadata_bytes\tcontent_arena_bytes\n";
+                 "seconds_hashing\tseconds_lookup\tentry_metadata_bytes\tcontent_arena_bytes\t"
+                 "row_constructions\taccumulator_growths\torigin_growths\n";
         for (const Round& r : rounds) {
             table << r.index << '\t' << r.start_total << '\t' << (r.moved ? "true" : "false") << '\t'
                   << (r.moved ? model.blocks()[r.block].block_id : std::string("NA")) << '\t'
@@ -4101,7 +4112,9 @@ int repair_search(const Args& args) {
                   << '\t' << r.transient_after << '\t' << r.full_bytes << '\t' << r.window_bytes
                   << '\t' << r.key_bytes << '\t' << r.seconds_origins << '\t' << r.seconds_merge
                   << '\t' << r.seconds_hashing << '\t' << r.seconds_lookup << '\t'
-                  << r.entry_metadata_bytes << '\t' << r.content_arena_bytes << '\n';
+                  << r.entry_metadata_bytes << '\t' << r.content_arena_bytes << '\t'
+                  << r.row_constructions << '\t' << r.accumulator_growths << '\t'
+                  << r.origin_growths << '\n';
         }
     }
     if (truth_gfa.empty()) {

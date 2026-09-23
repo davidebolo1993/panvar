@@ -426,6 +426,11 @@ EmissionCacheCounters end_emission_cache();
 // threading the scoring result through every caller that wants to report them.
 EmissionCacheCounters last_emission_cache_counters();
 
+// Runs the previous window enumeration alongside the current one and refuses if they disagree on any
+// placement, origin, counter or ordering. Off by default and never on a production path: it doubles
+// the work. The reference is kept for exactly this reason, as gap_recursion_logspace is.
+void set_window_enumeration_self_check(bool enabled);
+
 // Seconds spent inside cache lookups, accumulated per thread and folded in as placement drains its
 // counters. Reported separately from origin construction because the two answer different questions:
 // whether the cache is cheap to consult, and whether the work it saves was worth consulting it for.
@@ -1003,6 +1008,12 @@ struct BlockDeltaWork {
     std::uint64_t local_window_bytes_materialised = 0;
     std::uint64_t sequence_key_bytes = 0;
     // Where the time goes, split three ways rather than reported whole.
+    // Container GROWTH events, which is where the allocations are. Persistent scratch means these
+    // should fall to zero once warmed: a non-zero figure after the first round says something is
+    // still being built per candidate rather than reused.
+    std::uint64_t placement_row_constructions = 0;
+    std::uint64_t accumulator_growths = 0;
+    std::uint64_t origin_output_growths = 0;
     double seconds_placement_and_origins = 0.0;
     double seconds_statekey_merge = 0.0;
     double seconds_hashing_and_windows = 0.0;

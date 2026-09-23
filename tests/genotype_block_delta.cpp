@@ -837,6 +837,135 @@ void test_hits_allocate_nothing() {
               << " allocations -- nothing on the hit path scales with hits\n";
 }
 
+void test_window_enumeration_matches_reference() {
+    // The old-versus-new gate. With the self-check armed, every delta runs BOTH enumerations and
+    // refuses on any divergence in origins, their order, or the counters -- including
+    // latent_alignment_pairs, which counts rejected pairs too, so an implementation reaching the same
+    // origins by a different test sequence would be caught even though every mass matched.
+    //
+    // Driven through the real call path over the cases the suite already covers: substitutions,
+    // insertions, deletions, empty alleles, first and last block with normaliser widening, adjacent
+    // short blocks, tandem repeats (duplicate endpoints with several consumed-span classes), gapped
+    // multi-component spans, and both orientations.
+    panvar::set_window_enumeration_self_check(true);
+    try {
+        const std::size_t b = 400;
+        const Locus l = locus(11, {b, b + 30});
+        std::mt19937_64 rng(5);
+        compare(l.base, l.fragments,
+                {{"substitution", b, b + 30, random_bases(rng, 30)},
+                 {"insertion", b, b + 30, random_bases(rng, 55)},
+                 {"deletion", b, b + 30, random_bases(rng, 8)},
+                 {"empty_allele", b, b + 30, ""}},
+                "self-checked replacement kinds");
+
+        const Locus ends = locus(23, {0, 40, 860, 900});
+        compare(ends.base, ends.fragments,
+                {{"first_block", 0, 40, random_bases(rng, 61)},
+                 {"last_block", 860, 900, random_bases(rng, 19)}},
+                "self-checked locus ends");
+
+        // A tandem array: many endpoints repeat, so groups carry several rows apiece.
+        std::mt19937_64 tandem(41);
+        const std::string unit = random_bases(tandem, 60);
+        std::string base = random_bases(tandem, 240);
+        for (int i = 0; i < 6; ++i) base += unit;
+        base += random_bases(tandem, 240);
+        Locus repeats;
+        repeats.base = base;
+        std::size_t n = 0;
+        for (std::size_t start = 0; start + 260 <= base.size(); start += 13) {
+            repeats.fragments.push_back(fragment_at(base, start, 260, 100, "t" + std::to_string(n++)));
+        }
+        compare(repeats.base, repeats.fragments,
+                {{"inside_the_array", 300, 360, random_bases(tandem, 60)},
+                 {"array_shortened", 300, 360, random_bases(tandem, 20)}},
+                "self-checked tandem repeats");
+    } catch (...) {
+        panvar::set_window_enumeration_self_check(false);
+        throw;
+    }
+    panvar::set_window_enumeration_self_check(false);
+    std::cout << "  ok: grouped enumeration matches the reference on every case, origins and counters\n";
+}
+
+void test_scratch_does_not_allocate_per_candidate() {
+    // Persistent scratch means the per-form row vectors, the endpoint accumulators and the flat
+    // origin output are built once and reused. After a warm-up candidate, scoring more candidates
+    // must not allocate in proportion to them -- that is the whole point of the change, and the
+    // reference allocated roughly 57,000 containers per candidate.
+    const Locus l = locus(4242, {400});
+    std::mt19937_64 rng(19);
+    std::vector<std::string> replacements;
+    for (int i = 0; i < 40; ++i) replacements.push_back(random_bases(rng, 40));
+
+    panvar::PreparedScoringContext context(l.fragments, library(), options());
+    context.add_haplotypes({l.base});
+    context.begin_transient_round();
+    context.retain_census(0);
+
+    // Two properties, and they are different. CONSTRUCTION of per-form row containers must stop
+    // outright after the first candidate -- that is the reference's 57,000-containers-per-candidate
+    // defect, and it is measured directly. What remains is row GROWTH: each window sits at a
+    // different locus position, so a different subset of read forms matches, and a row touched for
+    // the first time at candidate five still has no capacity. That cost is a warm-up, not a per-form
+    // cost, so the test is that it DECLINES -- not an absolute threshold, which would just be a
+    // number chosen to make the result pass.
+    panvar::BlockDeltaWork warm;
+    (void)context.add_repaired_haplotype(0, 400, 440, replacements[0], &warm);
+
+    panvar::BlockDeltaWork second;
+    (void)context.add_repaired_haplotype(0, 400, 440, replacements[1], &second);
+
+    const std::size_t batch = 15;
+    const std::uint64_t before_early = allocation_count().load();
+    for (std::size_t i = 2; i < 2 + batch; ++i) {
+        panvar::BlockDeltaWork work;
+        (void)context.add_repaired_haplotype(0, 400, 440, replacements[i], &work);
+    }
+    const double early = static_cast<double>(allocation_count().load() - before_early) / batch;
+
+    std::uint64_t later_rows = 0;
+    std::uint64_t later_accumulators = 0;
+    std::uint64_t later_origins = 0;
+    const std::uint64_t before_late = allocation_count().load();
+    for (std::size_t i = 2 + batch; i < 2 + 2 * batch; ++i) {
+        panvar::BlockDeltaWork work;
+        (void)context.add_repaired_haplotype(0, 400, 440, replacements[i], &work);
+        later_rows += work.placement_row_constructions;
+        later_accumulators += work.accumulator_growths;
+        later_origins += work.origin_output_growths;
+    }
+    const double late = static_cast<double>(allocation_count().load() - before_late) / batch;
+
+    std::cout << "  measured: warm-up candidate built " << warm.placement_row_constructions
+              << " placement rows; the next built " << second.placement_row_constructions << "\n";
+    std::cout << "  measured: allocations per candidate, first " << batch << " -> " << early
+              << ", next " << batch << " -> " << late << "\n";
+    std::cout << "  measured: over " << batch << " warmed candidates -- row constructions "
+              << later_rows << ", accumulator growths " << later_accumulators
+              << ", origin-output growths " << later_origins << "\n";
+    // What this batch is responsible for: the enumeration's own containers. Zero on all three means
+    // no per-form row is built and neither the endpoint accumulators nor the flat origin output grow.
+    require(second.placement_row_constructions == 0,
+            "a warmed candidate must construct no placement rows, built " +
+                std::to_string(second.placement_row_constructions));
+    require(later_rows == 0,
+            "later candidates must construct no placement rows, built " + std::to_string(later_rows));
+    require(later_accumulators == 0,
+            "endpoint accumulators must be reused, grew " + std::to_string(later_accumulators));
+    require(later_origins == 0,
+            "the flat origin output must be reused, grew " + std::to_string(later_origins));
+    // The residual is REPORTED, not asserted. It does not fall with warm-up -- measured flat at about
+    // 1170 a candidate -- so it is not row growth, and with the three counters above at zero it is
+    // not the enumeration at all. The StateKey merge clears and refills a std::map per fragment,
+    // allocating a node per state across every fragment, and that is a different call site than the
+    // one this batch was asked to change.
+    std::cout << "  reported: " << early << " then " << late
+              << " total allocations per candidate, flat -- outside the enumeration (see the merge)\n";
+    std::cout << "  ok: the enumeration builds no per-form or per-origin container after warm-up\n";
+}
+
 void test_cumulative_caps_through_the_delta() {
     const Locus l = locus(99, {400});
     std::mt19937_64 rng(11);
@@ -916,6 +1045,10 @@ int main() {
         test_transient_release();
         std::cout << "== scoring after a release ==\n";
         test_scoring_after_release();
+        std::cout << "== grouped enumeration versus the reference ==\n";
+        test_window_enumeration_matches_reference();
+        std::cout << "== scratch reuse and per-candidate allocation ==\n";
+        test_scratch_does_not_allocate_per_candidate();
         std::cout << "== arena slab growth and cross-slab equality ==\n";
         test_arena_slabs_grow_and_compare_across_slabs();
         std::cout << "== allocations on the hit path ==\n";

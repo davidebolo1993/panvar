@@ -1853,7 +1853,10 @@ void collect_form_placements(
     // Worker-local observational totals. Summed in thread-index order after placement, so the
     // reported figures do not depend on the schedule even though no atomic guards them.
     EmissionCacheCounters& cache_work,
-    const FragmentScoringOptions& options) {
+    const FragmentScoringOptions& options,
+    // When given, receives the index of every row this call writes to for the first time, so a
+    // caller holding persistent rows can clear and sort just those instead of walking all 22,754.
+    std::vector<std::uint32_t>* touched = nullptr) {
     proposed.clear();   // keeps capacity: the point of hoisting it
     // Piece hits accumulated since the last publication to the shared budget. Drained before this
     // function returns, so nothing a worker counted goes unpublished and the merged total stays exact.
@@ -1978,6 +1981,9 @@ void collect_form_placements(
                 placement.consumed = static_cast<std::uint32_t>(component.consumed_bp);
                 placement.mismatches = static_cast<std::uint32_t>(component.edits);
                 placement.emission = component.log_emission;
+                if (touched != nullptr && out[item.first].empty()) {
+                    touched->push_back(item.first);
+                }
                 out[item.first].push_back(placement);
                 ++counters.accepted_mate_placements;
             }
@@ -1997,6 +2003,7 @@ void collect_form_placements(
         placement.consumed = static_cast<std::uint32_t>(fit->consumed_bp);
         placement.mismatches = static_cast<std::uint32_t>(fit->edits);
         placement.emission = fit->log_emission;
+        if (touched != nullptr && out[item.first].empty()) touched->push_back(item.first);
         out[item.first].push_back(placement);
         ++counters.accepted_mate_placements;
     }
@@ -2013,10 +2020,17 @@ void collect_form_placements(
 
     // Sorted by start first, so the pairing below can walk one left endpoint's classes as a group,
     // and by consumed span within it so the row order is fixed rather than insertion-dependent.
-    for (std::vector<FormPlacement>& list : out) {
+    // Sorting only the touched rows is identical: an untouched row is empty, and sorting an empty
+    // range is a no-op.
+    const auto sort_row = [](std::vector<FormPlacement>& list) {
         std::sort(list.begin(), list.end(), [](const FormPlacement& lhs, const FormPlacement& rhs) {
             return std::tie(lhs.start, lhs.consumed) < std::tie(rhs.start, rhs.consumed);
         });
+    };
+    if (touched != nullptr) {
+        for (const std::uint32_t row : *touched) sort_row(out[row]);
+    } else {
+        for (std::vector<FormPlacement>& list : out) sort_row(list);
     }
 }
 
@@ -2281,6 +2295,52 @@ double reduce_states(const std::map<StateKey, std::uint64_t>& states,
         total = log_add_exp(total, term);
     }
     return total;
+}
+
+// Everything one window enumeration needs, owned across calls. The reference built a vector per read
+// form on every candidate -- about 57,000 container constructions each, 36 million a round -- which is
+// what this exists to stop. Rows persist; only the ones the previous window touched are cleared.
+struct WindowScratch {
+    std::vector<std::vector<FormPlacement>> forward_rows;
+    std::vector<std::vector<FormPlacement>> reverse_rows;
+    std::vector<std::uint32_t> touched_forward;
+    std::vector<std::uint32_t> touched_reverse;
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> proposed;
+    // Contiguous equal-endpoint groups of the reverse range, replacing the per-forward-start map.
+    std::vector<std::size_t> group_begin;
+    std::vector<std::size_t> group_end;
+    std::vector<OriginAccumulator> accumulators;
+    std::vector<char> accepted;
+    // Flat output: fragment f owns [offsets[f], offsets[f + 1]).
+    std::vector<HaploidOrigin> origins;
+    std::vector<std::size_t> offsets;
+    // Growth events, which is where the allocations are.
+    std::uint64_t row_constructions = 0;
+    std::uint64_t accumulator_growths = 0;
+    std::uint64_t origin_growths = 0;
+
+    void ensure_rows(std::size_t forward_count, std::size_t reverse_count) {
+        if (forward_rows.size() < forward_count) {
+            row_constructions += forward_count - forward_rows.size();
+            forward_rows.resize(forward_count);
+        }
+        if (reverse_rows.size() < reverse_count) {
+            row_constructions += reverse_count - reverse_rows.size();
+            reverse_rows.resize(reverse_count);
+        }
+    }
+    // Only what the previous window wrote.
+    void clear_touched() {
+        for (const std::uint32_t row : touched_forward) forward_rows[row].clear();
+        for (const std::uint32_t row : touched_reverse) reverse_rows[row].clear();
+        touched_forward.clear();
+        touched_reverse.clear();
+    }
+};
+
+std::atomic<bool>& window_self_check() {
+    static std::atomic<bool> enabled{false};
+    return enabled;
 }
 
 // Diagnostics only; the context leaves every pointer null.
@@ -2723,7 +2783,11 @@ struct LocalWindow {
 // identical either way, and one that does not is discarded. Nothing is lost by discarding it: the
 // halo is a whole maximum insert wider than the replacement, so no origin that touches the
 // replacement can reach within a read length of a synthetic edge.
-void enumerate_window_origins(
+// THE REFERENCE. Kept verbatim so the optimised enumeration below can be certified against it, the
+// way gap_recursion_logspace certifies the scaled recursion. It allocates a vector per read form on
+// every call, which is exactly what the replacement exists to stop doing, so it is never on a
+// production path -- only the self-check drives it.
+void enumerate_window_origins_reference(
     const PreparedFragmentSet& prepared,
     const std::vector<ReadPair>& fragments,
     const LibraryModel& library,
@@ -2835,6 +2899,171 @@ void enumerate_window_origins(
             }
         }
     }
+}
+
+// The optimised enumeration. Same placements, same origins, same counters, same order -- the only
+// things that change are who owns the memory and how the per-endpoint sums are addressed.
+//
+// Two substitutions, both exact:
+//
+//   persistent rows   the reference built a vector per read form per candidate. These persist in the
+//                     caller's scratch and only the rows the previous window wrote are cleared.
+//
+//   endpoint groups   the reference kept a std::map<insert, OriginAccumulator> per forward start.
+//                     fr_insert_from_endpoints returns exactly reverse_end - forward_start when it
+//                     accepts, so for a fixed forward start the insert is strictly increasing in the
+//                     endpoint: contiguous equal-endpoint runs of the reverse range ARE the map's
+//                     keys, already in ascending order. The loop nesting is unchanged -- forward row
+//                     outer, reverse row inner, groups ascending -- so every accumulator receives its
+//                     additions in the sequence the map's accumulator received them, and log_add_exp
+//                     is applied to the same values in the same order. That is what keeps it
+//                     bit-identical rather than merely equal in exact arithmetic.
+//
+// The pair COUNTER is order-sensitive too: latent_alignment_pairs counts every pair tested, rejected
+// ones included, and the physical-origin budget is charged per emitted origin in ascending insert
+// order. Reaching the same origins by a different route would keep the masses and move both.
+void enumerate_window_origins(
+    const PreparedFragmentSet& prepared,
+    const std::vector<ReadPair>& fragments,
+    const LibraryModel& library,
+    const FragmentScoringOptions& options,
+    std::size_t band,
+    const LocalWindow& window,
+    PlacementBudget& budget,
+    FragmentScoringCounters& counters,
+    EmissionCacheCounters& cache_work,
+    WindowScratch& scratch) {
+    const auto form_slot = [](std::size_t fragment, std::size_t arm) { return fragment * 2 + arm; };
+    scratch.ensure_rows(prepared.forward_forms.size(), prepared.reverse_forms.size());
+    scratch.clear_touched();
+
+    collect_form_placements(window.bases, prepared.forward_forms, prepared.forward_componentise,
+                            prepared.forward_indexes, budget, band, library, scratch.forward_rows,
+                            scratch.proposed, counters, cache_work, options, &scratch.touched_forward);
+    collect_form_placements(window.reversed, prepared.reverse_forms, prepared.reverse_componentise,
+                            prepared.reverse_indexes, budget, band, library, scratch.reverse_rows,
+                            scratch.proposed, counters, cache_work, options, &scratch.touched_reverse);
+
+    const std::size_t width = window.bases.size();
+    // Filtered and shifted IN PLACE. resize() never grows here, so no row reallocates.
+    for (const std::uint32_t i : scratch.touched_forward) {
+        std::vector<FormPlacement>& row = scratch.forward_rows[i];
+        const std::size_t saturating = prepared.forward_forms[i].bases.size() + library.max_gap_bp;
+        std::size_t write = 0;
+        for (std::size_t read = 0; read < row.size(); ++read) {
+            if (!window.at_end && width - row[read].start < saturating) continue;
+            FormPlacement moved = row[read];
+            moved.start = static_cast<std::uint32_t>(window.begin + row[read].start);
+            row[write++] = moved;
+        }
+        row.resize(write);
+    }
+    for (const std::uint32_t i : scratch.touched_reverse) {
+        std::vector<FormPlacement>& row = scratch.reverse_rows[i];
+        const std::size_t saturating = prepared.reverse_forms[i].bases.size() + library.max_gap_bp;
+        std::size_t write = 0;
+        for (std::size_t read = 0; read < row.size(); ++read) {
+            const std::size_t endpoint = width - row[read].start;
+            if (!window.at_start && endpoint < saturating) continue;
+            FormPlacement moved = row[read];
+            moved.start = static_cast<std::uint32_t>(window.begin + endpoint);
+            row[write++] = moved;
+        }
+        row.resize(write);
+        std::sort(row.begin(), row.end(), [](const FormPlacement& lhs, const FormPlacement& rhs) {
+            return std::tie(lhs.start, lhs.consumed) < std::tie(rhs.start, rhs.consumed);
+        });
+    }
+
+    scratch.origins.clear();
+    scratch.offsets.assign(fragments.size() + 1, 0);
+    for (std::size_t f = 0; f < fragments.size(); ++f) {
+        scratch.offsets[f] = scratch.origins.size();
+        const InsertSupport& support = prepared.support_by_fragment[f];
+        if (support.empty()) continue;
+        for (std::size_t arm = 0; arm < 2; ++arm) {
+            const std::vector<FormPlacement>& forward = scratch.forward_rows[form_slot(f, arm)];
+            const std::vector<FormPlacement>& reverse = scratch.reverse_rows[form_slot(f, arm)];
+            if (forward.empty() || reverse.empty()) continue;
+            for (std::size_t first_row = 0; first_row < forward.size();) {
+                const std::uint32_t forward_start = forward[first_row].start;
+                std::size_t last_row = first_row;
+                while (last_row < forward.size() && forward[last_row].start == forward_start) ++last_row;
+                const std::size_t lo_end = static_cast<std::size_t>(forward_start) + support.min_bp;
+                const std::size_t hi_end = static_cast<std::size_t>(forward_start) + support.max_bp;
+                const auto begin = std::lower_bound(
+                    reverse.begin(), reverse.end(), lo_end,
+                    [](const FormPlacement& lhs, std::size_t value) { return lhs.start < value; });
+                const auto end = std::upper_bound(
+                    begin, reverse.end(), hi_end,
+                    [](std::size_t value, const FormPlacement& rhs) { return value < rhs.start; });
+
+                // Contiguous equal-endpoint runs, ascending: the map's keys without the map.
+                scratch.group_begin.clear();
+                scratch.group_end.clear();
+                for (auto it = begin; it != end;) {
+                    auto stop = it;
+                    while (stop != end && stop->start == it->start) ++stop;
+                    scratch.group_begin.push_back(static_cast<std::size_t>(it - reverse.begin()));
+                    scratch.group_end.push_back(static_cast<std::size_t>(stop - reverse.begin()));
+                    it = stop;
+                }
+                const std::size_t groups = scratch.group_begin.size();
+                if (groups == 0) {
+                    first_row = last_row;
+                    continue;
+                }
+                if (scratch.accumulators.size() < groups) {
+                    scratch.accumulator_growths += groups - scratch.accumulators.size();
+                    scratch.accumulators.resize(groups);
+                    scratch.accepted.resize(groups);
+                }
+                for (std::size_t g = 0; g < groups; ++g) {
+                    scratch.accumulators[g] = OriginAccumulator{};
+                    scratch.accepted[g] = 0;
+                }
+
+                // Forward row outer, reverse row inner, groups ascending -- the reference's order.
+                for (std::size_t row = first_row; row < last_row; ++row) {
+                    for (std::size_t g = 0; g < groups; ++g) {
+                        for (std::size_t at = scratch.group_begin[g]; at < scratch.group_end[g]; ++at) {
+                            const FormPlacement& rev = reverse[at];
+                            ++counters.latent_alignment_pairs;
+                            const std::optional<std::size_t> insert = fr_insert_from_endpoints(
+                                forward_start, forward[row].consumed, rev.start, rev.consumed, support);
+                            if (!insert.has_value()) continue;
+                            ++counters.valid_fr_states;
+                            scratch.accumulators[g].add(forward[row].emission + rev.emission,
+                                                        rev.start - rev.consumed, forward[row].consumed,
+                                                        rev.consumed, forward[row].mismatches,
+                                                        rev.mismatches);
+                            scratch.accepted[g] = 1;
+                        }
+                    }
+                }
+
+                for (std::size_t g = 0; g < groups; ++g) {
+                    if (scratch.accepted[g] == 0) continue;   // the map held no key for this endpoint
+                    ++counters.physical_origins;
+                    const std::uint64_t seen =
+                        budget.physical_origins.fetch_add(1, std::memory_order_relaxed) + 1;
+                    if (seen > budget.max_physical_origins) {
+                        budget.cancel();
+                        throw ResourceExhausted(
+                            "fragment scoring reached its physical-origin cap; no partial ranking is "
+                            "returned");
+                    }
+                    const std::uint32_t insert =
+                        reverse[scratch.group_begin[g]].start - forward_start;
+                    if (scratch.origins.size() == scratch.origins.capacity()) ++scratch.origin_growths;
+                    scratch.origins.push_back({forward_start, insert, static_cast<std::uint32_t>(arm),
+                                               scratch.accumulators[g].log_latent_mass});
+                }
+                first_row = last_row;
+            }
+        }
+    }
+    scratch.offsets[fragments.size()] = scratch.origins.size();
 }
 
 // The four acceptance caps, decided on whatever totals the caller holds them against: per call for
@@ -3163,6 +3392,8 @@ struct PreparedScoringContext::State {
     // initial panel columns are structurally out of reach.
     std::size_t transient_watermark = 0;
     std::map<std::size_t, HaploidOriginCensus> censuses;
+    // Reused by every delta: rows, groups, accumulators and the flat origin output.
+    WindowScratch window_scratch;
 
     void require_usable() const {
         if (refused) {
@@ -3475,6 +3706,10 @@ const EmissionCacheCounters& PreparedScoringContext::cumulative_emission_cache()
 
 bool PreparedScoringContext::refused() const { return state_->refused; }
 
+void set_window_enumeration_self_check(bool enabled) {
+    scoring_detail::window_self_check().store(enabled, std::memory_order_relaxed);
+}
+
 namespace {
 SegmentedSequence segment_of(const std::string& base, std::size_t block_begin, std::size_t block_end,
                              const std::string& replacement) {
@@ -3729,16 +3964,60 @@ std::size_t PreparedScoringContext::add_repaired_haplotype(
 
     FragmentScoringCounters counters;
     EmissionCacheCounters cache_work;
-    std::vector<std::vector<HaploidOrigin>> recomputed;
+    const std::uint64_t rows_before = state.window_scratch.row_constructions;
+    const std::uint64_t accumulators_before = state.window_scratch.accumulator_growths;
+    const std::uint64_t origins_before = state.window_scratch.origin_growths;
     const auto origins_mark = std::chrono::steady_clock::now();
     try {
         enumerate_window_origins(state.prepared, state.fragments, state.library, state.options,
                                  state.options.mismatch_band, window, state.budget, counters,
-                                 cache_work, recomputed);
+                                 cache_work, state.window_scratch);
     } catch (const ResourceExhausted&) {
         state.refused = true;
         throw;
     }
+    // Certification against the implementation this replaced. Off unless asked for: it doubles the
+    // work. The reference gets a throwaway budget so its origins are not charged twice, and its
+    // counters start from zero so they can be compared as deltas.
+    if (window_self_check().load(std::memory_order_relaxed)) {
+        PlacementBudget spare;
+        spare.max_piece_hits = std::numeric_limits<std::uint64_t>::max();
+        spare.max_physical_origins = std::numeric_limits<std::uint64_t>::max();
+        spare.publish_batch = std::numeric_limits<std::uint64_t>::max();
+        FragmentScoringCounters reference_counters;
+        EmissionCacheCounters reference_cache;
+        std::vector<std::vector<HaploidOrigin>> reference;
+        enumerate_window_origins_reference(state.prepared, state.fragments, state.library,
+                                           state.options, state.options.mismatch_band, window, spare,
+                                           reference_counters, reference_cache, reference);
+        if (reference_counters.latent_alignment_pairs != counters.latent_alignment_pairs ||
+            reference_counters.valid_fr_states != counters.valid_fr_states ||
+            reference_counters.physical_origins != counters.physical_origins ||
+            reference_counters.accepted_mate_placements != counters.accepted_mate_placements) {
+            throw std::runtime_error("window enumeration self-check: counters diverged");
+        }
+        for (std::size_t f = 0; f < state.fragments.size(); ++f) {
+            const std::size_t lo = state.window_scratch.offsets[f];
+            const std::size_t hi = state.window_scratch.offsets[f + 1];
+            if (hi - lo != reference[f].size()) {
+                throw std::runtime_error("window enumeration self-check: origin count diverged");
+            }
+            for (std::size_t i = 0; i < reference[f].size(); ++i) {
+                const HaploidOrigin& mine = state.window_scratch.origins[lo + i];
+                const HaploidOrigin& theirs = reference[f][i];
+                if (mine.forward_start != theirs.forward_start || mine.insert_bp != theirs.insert_bp ||
+                    mine.orientation != theirs.orientation ||
+                    !(mine.log_latent_mass == theirs.log_latent_mass)) {
+                    throw std::runtime_error(
+                        "window enumeration self-check: origin diverged at fragment " +
+                        std::to_string(f) + " index " + std::to_string(i));
+                }
+            }
+        }
+    }
+    local.placement_row_constructions = state.window_scratch.row_constructions - rows_before;
+    local.accumulator_growths = state.window_scratch.accumulator_growths - accumulators_before;
+    local.origin_output_growths = state.window_scratch.origin_growths - origins_before;
     local.seconds_placement_and_origins =
         std::chrono::duration<double>(std::chrono::steady_clock::now() - origins_mark).count();
 
@@ -3798,7 +4077,9 @@ std::size_t PreparedScoringContext::add_repaired_haplotype(
                 fresh.origins_by_fragment[f].push_back(moved);
             }
         }
-        for (const HaploidOrigin& origin : recomputed[f]) {
+        for (std::size_t at = state.window_scratch.offsets[f];
+             at < state.window_scratch.offsets[f + 1]; ++at) {
+            const HaploidOrigin& origin = state.window_scratch.origins[at];
             if (!affected_new(origin)) continue;
             ++local.origins_recomputed;
             StateKey key;
