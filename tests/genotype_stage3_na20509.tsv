@@ -1,0 +1,47 @@
+item	value	provenance
+stage	3: content-owned cache keys + segmented repairs	behind the diagnostic repair path
+donor_cell	NA20509 10x K=128	seven-round trajectory
+trajectory_identical_to_stage2	true	all 7 rounds: block, rank, assignment, alleles, total
+final_total	-151090.979646	bit-identical to the stage-2 oracle
+final_distance	114	floor 91, excess 23, unchanged
+stop_reason	no_improvement	converged at round 7, as the oracle did
+one_shot_per_round_wall_s	394.46	original baseline
+stage1_context_wall_s	232.19	2.1092 GiB, over the 2 GiB bound
+stage2_blockdelta_wall_s	301.09	0.9686 GiB
+stage3_wall_s	586.01	0.8625 GiB (926105600 bytes)
+stage3_vs_stage2_time	1.95x SLOWER	+284.92 s
+stage3_vs_stage2_memory	1.12x less	lowest residency of any context configuration
+required_360s_2gib	time MISSED, memory MET	586.01 s against 360 s
+desired_60_90s	MISSED	586.01 s
+change1_goal_met	true	no freeze; transients destroyable; entries keep serving
+dp_executions_round_1	28320	stage 2 executed 175835 EVERY round
+dp_executions_rounds_2_to_7	0	the freeze removal eliminates recursion entirely after round 1
+cache_hits_per_round	8.09M - 8.19M	99.66% hit rate in round 1, 100% thereafter
+change2_goal_met	true	no neighbour materialises a haplotype
+full_haplotype_bytes_round_1	917632	the promoted incumbent only
+full_haplotype_bytes_rounds_2_to_6	~452224	one promotion per round: 226138 x 2
+full_haplotype_bytes_round_7	0	no move, so nothing promoted
+window_bytes_per_round	~17.1-17.4 MB	forward and reversed local windows
+sequence_key_bytes_per_round	~8.27-8.41 MB	segment descriptors, not 226kb map keys
+seconds_placement_and_origins	61.0 - 63.5	per round
+seconds_statekey_merge	19.0 - 19.4	per round, over ~206M origins
+seconds_hashing_and_windows	0.13 - 0.14	per round: segmentation is effectively free
+seconds_combination	0.349545	0.06% of the run
+origins_reused	1236837536	86.9%
+origins_recomputed	186058529	local window only
+cumulative_physical_origins	191981492	4.4x fewer than stage 1
+regression_located	the cache hit path	rounds 2-7 do ZERO dp yet take 80 s each
+regression_size	~44 s per round over ~8.1M lookups	~5 us added per lookup
+regression_cause	owned keys are per-entry heap allocations	the comparison dereferences cold storage
+prior_behaviour	a pointer key compared buffers the prefilter had just touched	hot, not cold
+ruled_out_shard_contention	true	1024 shards: 82.73 s against 82.20 s at 64
+ruled_out_window_construction	true	0.14 s per round
+ruled_out_materialisation	true	zero bytes for neighbours
+stage4_target	arena-backed inline keys, not std::string per entry	keeps ownership, restores locality
+budget_policy_changed	true	now governs EVERY retained entry, fits included
+budget_policy_reason	the old budget governed only post-recursion refusals	an exact prefilter makes that stream ~empty
+budget_boundary_gate	255463 retains all, 255462 declines 1	exact
+gates_passed	all	including the seven selected repairs, bit-identical
+oracle_certification_still_passes	true	score_diplotypes vs the exhaustive oracle
+speed_target_30x	not addressed	10x only
+conclusion	both changes work; the trajectory got slower	the hit path now costs more than the recursions it removed

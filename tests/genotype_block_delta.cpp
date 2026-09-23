@@ -148,7 +148,7 @@ void compare(const std::string& base, const std::vector<panvar::ReadPair>& fragm
     {
         panvar::PreparedScoringContext context(fragments, library(), options());
         context.add_haplotypes({base});
-        context.freeze_emission_cache();
+        context.begin_transient_round();
         context.retain_census(0);
         for (std::size_t c = 0; c < cases.size(); ++c) {
             panvar::BlockDeltaWork work;
@@ -313,13 +313,9 @@ void test_preconditions_refuse() {
     const std::string replacement = random_bases(rng, 40);
     panvar::PreparedScoringContext context(l.fragments, library(), options());
     context.add_haplotypes({l.base});
-    // Not frozen yet: scoring a transient haplotype would let its bytes into the pointer cache.
-    require_throws<std::invalid_argument>(
-        [&]() { (void)context.add_repaired_haplotype(0, 400, 440, replacement); },
-        "an unfrozen cache must refuse a transient repair haplotype");
-    context.freeze_emission_cache();
-    // Frozen, but no census: refusing is the point. Placing in full here would report a delta that
-    // never happened.
+    context.begin_transient_round();
+    // No census: refusing is the point. Placing in full here would report a delta that never
+    // happened, which is indistinguishable from a delta that does not work.
     require_throws<std::invalid_argument>(
         [&]() { (void)context.add_repaired_haplotype(0, 400, 440, replacement); },
         "a missing census must refuse rather than silently place in full");
@@ -327,7 +323,43 @@ void test_preconditions_refuse() {
     panvar::BlockDeltaWork work;
     (void)context.add_repaired_haplotype(0, 400, 440, replacement, &work);
     require(work.origins_reused > 0, "the delta should run once its preconditions hold");
-    std::cout << "  ok: an unfrozen cache and a missing census both refuse\n";
+    std::cout << "  ok: a missing census refuses rather than placing in full\n";
+}
+
+void test_transient_destruction_then_cache_hits() {
+    // The gate the freeze used to make impossible. Score some repairs, destroy them, then score a
+    // haplotype that shares their windows: the entries they inserted must still be there and still
+    // serve. With pointer-keyed entries this would read freed bytes; with owned keys it is simply a
+    // hit. A rising hit count after destruction is the whole claim of stage 3.
+    const Locus l = locus(64, {400});
+    std::mt19937_64 rng(21);
+    panvar::PreparedScoringContext context(l.fragments, library(), options());
+    context.add_haplotypes({l.base});
+    context.begin_transient_round();
+    context.retain_census(0);
+
+    std::vector<std::size_t> doomed;
+    std::vector<std::string> replacements;
+    for (int i = 0; i < 4; ++i) replacements.push_back(random_bases(rng, 40));
+    for (const std::string& replacement : replacements) {
+        doomed.push_back(context.add_repaired_haplotype(0, 400, 440, replacement));
+    }
+    const std::uint64_t hits_before = context.cumulative_emission_cache().dp_cache_hits;
+    // Every one of them goes, along with its sequence bytes.
+    context.release_transient({});
+    require(context.transient_payload_bytes() == 0, "the transient haplotypes must really be gone");
+
+    // Re-score the identical repairs. Their windows are byte-identical to the destroyed ones, so
+    // these must be served from entries whose source buffers no longer exist.
+    panvar::BlockDeltaWork work;
+    for (const std::string& replacement : replacements) {
+        (void)context.add_repaired_haplotype(0, 400, 440, replacement, &work);
+    }
+    const std::uint64_t hits_after = context.cumulative_emission_cache().dp_cache_hits;
+    require(hits_after > hits_before,
+            "entries produced by destroyed haplotypes must still serve hits");
+    std::cout << "  ok: after destroying every transient haplotype, the cache served "
+              << (hits_after - hits_before) << " further hits\n";
 }
 
 void test_transient_release() {
@@ -335,7 +367,7 @@ void test_transient_release() {
     std::mt19937_64 rng(10);
     panvar::PreparedScoringContext context(l.fragments, library(), options());
     context.add_haplotypes({l.base});
-    context.freeze_emission_cache();
+    context.begin_transient_round();
     context.retain_census(0);
     const std::uint64_t before = context.transient_payload_bytes();
     require(before == 0, "nothing is transient before the first repair");
@@ -364,7 +396,7 @@ void test_scoring_after_release() {
     std::mt19937_64 rng(12);
     panvar::PreparedScoringContext context(l.fragments, library(), options());
     context.add_haplotypes({l.base});
-    context.freeze_emission_cache();
+    context.begin_transient_round();
     context.retain_census(0);
 
     std::vector<std::size_t> slots;
@@ -391,6 +423,272 @@ void test_scoring_after_release() {
     std::cout << "  ok: scoring after a release survives, and released slots are refused\n";
 }
 
+// Every mass cell of a full delta run, so two configurations can be compared exactly.
+std::vector<double> delta_cells(const Locus& l, const std::vector<std::string>& replacements) {
+    std::vector<double> out;
+    panvar::PreparedScoringContext context(l.fragments, library(), options());
+    context.add_haplotypes({l.base});
+    context.begin_transient_round();
+    context.retain_census(0);
+    for (const std::string& replacement : replacements) {
+        const std::size_t slot = context.add_repaired_haplotype(0, 400, 440, replacement);
+        for (std::size_t f = 0; f < l.fragments.size(); ++f) out.push_back(context.mass_of(f, slot));
+    }
+    return out;
+}
+
+void test_forced_hash_collisions() {
+    // Collapsing every key's hash to zero puts every distinct key in one bucket of one shard, so
+    // byte equality alone separates them. A key that decided identity by hash -- or that compared
+    // only a prefix -- would start returning one entry's answer for another's question, and the
+    // masses would move. They may not.
+    const Locus l = locus(55, {400});
+    std::mt19937_64 rng(31);
+    std::vector<std::string> replacements;
+    for (int i = 0; i < 5; ++i) replacements.push_back(random_bases(rng, 40));
+
+    const std::vector<double> ordinary = delta_cells(l, replacements);
+    panvar::set_emission_cache_hash_collapse(true);
+    std::vector<double> collided;
+    try {
+        collided = delta_cells(l, replacements);
+    } catch (...) {
+        panvar::set_emission_cache_hash_collapse(false);
+        throw;
+    }
+    panvar::set_emission_cache_hash_collapse(false);
+
+    require(ordinary.size() == collided.size(), "both runs must produce the same number of cells");
+    for (std::size_t i = 0; i < ordinary.size(); ++i) {
+        require_identical(collided[i], ordinary[i],
+                          "mass cell " + std::to_string(i) + " under forced hash collision");
+    }
+    std::cout << "  ok: every key colliding into one bucket changes nothing across "
+              << ordinary.size() << " cells\n";
+}
+
+void test_ambiguous_bases_refuse() {
+    // The emission is defined over ACGT and require_acgt_window refuses anything else BEFORE a key is
+    // formed, so an ambiguous base can never reach the cache. The identity question is therefore
+    // settled by refusal, and that is what this asserts -- in both the read and the haplotype. The
+    // owned key copies raw bytes and would admit a wider alphabet unchanged if the model ever did.
+    std::mt19937_64 rng(77);
+    const std::string clean = random_bases(rng, 600);
+    std::string ambiguous = clean;
+    ambiguous[300] = 'N';
+
+    const panvar::ReadPair good = fragment_at(clean, 100, 260, 100, "clean");
+    panvar::ReadPair ambiguous_read = good;
+    std::string bases = ambiguous_read.first.bases;
+    bases[40] = 'N';
+    ambiguous_read.first = read_of(ambiguous_read.first.name, bases);
+
+    require_throws<std::invalid_argument>(
+        [&]() {
+            (void)panvar::gapped_emission(clean, ambiguous_read.first.bases, 100, library(), 6);
+        },
+        "an ambiguous base in the READ must refuse");
+    require_throws<std::invalid_argument>(
+        [&]() { (void)panvar::gapped_emission(ambiguous, good.first.bases, 250, library(), 6); },
+        "an ambiguous base in the HAPLOTYPE window must refuse");
+    std::cout << "  ok: ambiguous bases refuse in both the read and the window, before any key\n";
+}
+
+void test_identical_after_transient_destruction() {
+    // Stronger than "a hit still happens": the ANSWERS served from entries whose source buffers were
+    // destroyed must be the same answers. A key that still referenced freed bytes could compare equal
+    // by luck and return a neighbouring window's fit.
+    const Locus l = locus(66, {400});
+    std::mt19937_64 rng(41);
+    std::vector<std::string> replacements;
+    for (int i = 0; i < 4; ++i) replacements.push_back(random_bases(rng, 40));
+
+    panvar::PreparedScoringContext context(l.fragments, library(), options());
+    context.add_haplotypes({l.base});
+    context.begin_transient_round();
+    context.retain_census(0);
+
+    std::vector<std::vector<double>> before;
+    for (const std::string& replacement : replacements) {
+        const std::size_t slot = context.add_repaired_haplotype(0, 400, 440, replacement);
+        std::vector<double> column;
+        for (std::size_t f = 0; f < l.fragments.size(); ++f) column.push_back(context.mass_of(f, slot));
+        before.push_back(std::move(column));
+    }
+    context.release_transient({});
+    require(context.transient_payload_bytes() == 0, "every transient haplotype must be gone");
+
+    for (std::size_t i = 0; i < replacements.size(); ++i) {
+        const std::size_t slot = context.add_repaired_haplotype(0, 400, 440, replacements[i]);
+        for (std::size_t f = 0; f < l.fragments.size(); ++f) {
+            require_identical(context.mass_of(f, slot), before[i][f],
+                              "cell f" + std::to_string(f) + " of repair " + std::to_string(i) +
+                                  " after its source buffers were destroyed");
+        }
+    }
+    std::cout << "  ok: answers served after destruction are identical, not merely present\n";
+}
+
+void test_segmented_windows_match_materialised() {
+    // The segmented extraction against the obvious materialised answer, for every kind of
+    // replacement and at both ends of the locus. A segment walk that mishandled the suffix mapping
+    // after a length change, or reversed the wrong range, would show here and nowhere else -- mass
+    // equality can hide it whenever the affected set happens not to reach the discrepancy.
+    std::mt19937_64 rng(4242);
+    const std::string base = random_bases(rng, 900);
+    struct Case { std::string name; std::size_t begin, end; std::string replacement; };
+    const std::vector<Case> cases = {
+        {"substitution", 400, 440, random_bases(rng, 40)},
+        {"insertion", 400, 440, random_bases(rng, 77)},
+        {"deletion", 400, 440, random_bases(rng, 9)},
+        {"empty_allele", 400, 440, ""},
+        {"first_block", 0, 40, random_bases(rng, 55)},
+        {"first_block_empty", 0, 40, ""},
+        {"last_block", 860, 900, random_bases(rng, 12)},
+        {"last_block_empty", 860, 900, ""},
+        {"whole_locus", 0, 900, random_bases(rng, 300)},
+    };
+    std::size_t checked = 0;
+    for (const Case& item : cases) {
+        std::string materialised = base;
+        materialised.replace(item.begin, item.end - item.begin, item.replacement);
+        require(panvar::segmented_length(base, item.begin, item.end, item.replacement) ==
+                    materialised.size(),
+                item.name + ": segmented length must match");
+        require(panvar::segmented_hash(base, item.begin, item.end, item.replacement) ==
+                    panvar::segmented_hash(materialised, 0, 0, ""),
+                item.name + ": segmented hash must match the materialised hash");
+
+        const std::size_t n = materialised.size();
+        std::vector<std::pair<std::size_t, std::size_t>> ranges = {
+            {0, n}, {0, 0}, {0, std::min<std::size_t>(n, 50)},
+            {n > 50 ? n - 50 : 0, n},
+        };
+        if (n > item.begin) ranges.push_back({item.begin, n});
+        if (item.begin > 10) ranges.push_back({item.begin - 10, std::min(n, item.begin + 10)});
+        if (n > 200) ranges.push_back({100, 200});
+        for (const auto& range : ranges) {
+            if (range.second > n || range.first > range.second) continue;
+            std::string forward;
+            std::string backward;
+            panvar::segmented_window(base, item.begin, item.end, item.replacement, range.first,
+                                     range.second, forward, backward);
+            const std::string expect = materialised.substr(range.first, range.second - range.first);
+            require(forward == expect,
+                    item.name + ": forward window [" + std::to_string(range.first) + "," +
+                        std::to_string(range.second) + ")");
+            require(backward == std::string(expect.rbegin(), expect.rend()),
+                    item.name + ": reversed window [" + std::to_string(range.first) + "," +
+                        std::to_string(range.second) + ")");
+            ++checked;
+        }
+    }
+    std::cout << "  ok: " << checked << " segmented windows match their materialised equivalents\n";
+}
+
+void test_path_distinct_haplotypes_share_one_column() {
+    // Two DIFFERENT replacements that spell the same bytes. Held as segments they are distinct
+    // objects with distinct block bounds, so only an exact comparison after the hash match can see
+    // that they are one haplotype -- and they must share one column, or the same haplotype would be
+    // placed twice and counted twice.
+    const Locus l = locus(31337, {400});
+    std::mt19937_64 rng(13);
+    const std::string replacement = random_bases(rng, 40);
+
+    panvar::PreparedScoringContext context(l.fragments, library(), options());
+    context.add_haplotypes({l.base});
+    context.begin_transient_round();
+    context.retain_census(0);
+
+    // [400,440) <- R, and [400,441) <- R + the base byte at 440: identical haplotypes, different paths.
+    const std::size_t first = context.add_repaired_haplotype(0, 400, 440, replacement);
+    const std::size_t second =
+        context.add_repaired_haplotype(0, 400, 441, replacement + l.base[440]);
+    require(first == second,
+            "byte-identical haplotypes reached by different replacements must share one slot");
+
+    // And a genuinely different one must NOT collapse onto it.
+    const std::size_t other = context.add_repaired_haplotype(0, 400, 440, random_bases(rng, 40));
+    require(other != first, "a different haplotype must not be deduplicated onto the same slot");
+    std::cout << "  ok: path-distinct but byte-identical repairs share one column\n";
+}
+
+void test_cache_budget_exact_boundary() {
+    // The budget governs retained REFUSAL entries, and now counts the bytes their keys own. At
+    // exactly the measured figure everything is retained; one byte below, something is declined.
+    const Locus l = locus(808, {400});
+    const panvar::InternedHaplotypes interned = intern({l.base});
+    const std::vector<panvar::HaplotypeCandidate> candidates = {{0, 0}};
+
+    panvar::FragmentScoringOptions generous = options();
+    generous.emission_cache_bytes = 1u << 30;
+    (void)panvar::score_diplotypes(interned, candidates, l.fragments, library(), generous);
+    const std::uint64_t used = panvar::last_emission_cache_counters().budgeted_bytes_used;
+    // Non-zero because the budget now governs every retained entry, keys included. While it governed
+    // only post-recursion refusals it was very nearly vacuous: the prefilter is exact, so almost
+    // nothing reaches that stream, and this figure was 0 on any clean fixture.
+    require(used > 0, "the fixture must retain some budgeted entries");
+
+    panvar::FragmentScoringOptions at_bound = options();
+    at_bound.emission_cache_bytes = static_cast<std::size_t>(used);
+    (void)panvar::score_diplotypes(interned, candidates, l.fragments, library(), at_bound);
+    const panvar::EmissionCacheCounters exact = panvar::last_emission_cache_counters();
+    require(exact.entries_not_retained == 0,
+            "exactly at the budget, every budgeted entry must be retained");
+
+    panvar::FragmentScoringOptions below = options();
+    below.emission_cache_bytes = static_cast<std::size_t>(used - 1);
+    (void)panvar::score_diplotypes(interned, candidates, l.fragments, library(), below);
+    const panvar::EmissionCacheCounters short_by_one = panvar::last_emission_cache_counters();
+    require(short_by_one.entries_not_retained > 0,
+            "one byte below the budget, at least one entry must be declined");
+    std::cout << "  ok: budget " << used << " retains everything, " << (used - 1) << " declines "
+              << short_by_one.entries_not_retained << "\n";
+}
+
+void test_no_dangling_reads_after_destruction() {
+    // "No retained pointer addresses" stated as something observable: destroy every transient, then
+    // churn the heap hard enough that freed pages are very likely reused, and require the cache to
+    // return the SAME answers. A key still pointing at released bytes would now be comparing against
+    // whatever overwrote them.
+    const Locus l = locus(99991, {400});
+    std::mt19937_64 rng(17);
+    std::vector<std::string> replacements;
+    for (int i = 0; i < 4; ++i) replacements.push_back(random_bases(rng, 40));
+
+    panvar::PreparedScoringContext context(l.fragments, library(), options());
+    context.add_haplotypes({l.base});
+    context.begin_transient_round();
+    context.retain_census(0);
+
+    std::vector<std::vector<double>> before;
+    for (const std::string& replacement : replacements) {
+        const std::size_t slot = context.add_repaired_haplotype(0, 400, 440, replacement);
+        std::vector<double> column;
+        for (std::size_t f = 0; f < l.fragments.size(); ++f) column.push_back(context.mass_of(f, slot));
+        before.push_back(std::move(column));
+    }
+    context.release_transient({});
+
+    // Churn: a few hundred megabytes of short-lived allocations over the freed range.
+    {
+        std::vector<std::string> rubbish;
+        for (int i = 0; i < 2000; ++i) rubbish.emplace_back(100000, static_cast<char>('A' + (i % 4)));
+        rubbish.clear();
+        rubbish.shrink_to_fit();
+    }
+
+    for (std::size_t i = 0; i < replacements.size(); ++i) {
+        const std::size_t slot = context.add_repaired_haplotype(0, 400, 440, replacements[i]);
+        for (std::size_t f = 0; f < l.fragments.size(); ++f) {
+            require_identical(context.mass_of(f, slot), before[i][f],
+                              "cell f" + std::to_string(f) + " of repair " + std::to_string(i) +
+                                  " after the heap was churned over its released bytes");
+        }
+    }
+    std::cout << "  ok: answers survive destruction followed by heavy heap reuse\n";
+}
+
 void test_cumulative_caps_through_the_delta() {
     const Locus l = locus(99, {400});
     std::mt19937_64 rng(11);
@@ -401,7 +699,7 @@ void test_cumulative_caps_through_the_delta() {
     {
         panvar::PreparedScoringContext context(l.fragments, library(), options());
         context.add_haplotypes({l.base});
-        context.freeze_emission_cache();
+        context.begin_transient_round();
         context.retain_census(0);
         for (const std::string& replacement : replacements) {
             (void)context.add_repaired_haplotype(0, 400, 440, replacement);
@@ -415,7 +713,7 @@ void test_cumulative_caps_through_the_delta() {
         at_cap.max_physical_origins = total;
         panvar::PreparedScoringContext context(l.fragments, library(), at_cap);
         context.add_haplotypes({l.base});
-        context.freeze_emission_cache();
+        context.begin_transient_round();
         context.retain_census(0);
         for (const std::string& replacement : replacements) {
             (void)context.add_repaired_haplotype(0, 400, 440, replacement);
@@ -429,7 +727,7 @@ void test_cumulative_caps_through_the_delta() {
         bool refused = false;
         try {
             context.add_haplotypes({l.base});
-            context.freeze_emission_cache();
+            context.begin_transient_round();
             context.retain_census(0);
             for (const std::string& replacement : replacements) {
                 (void)context.add_repaired_haplotype(0, 400, 440, replacement);
@@ -464,10 +762,26 @@ int main() {
         test_random_sweep();
         std::cout << "== preconditions ==\n";
         test_preconditions_refuse();
+        std::cout << "== transient destruction, then cache hits ==\n";
+        test_transient_destruction_then_cache_hits();
         std::cout << "== transient release ==\n";
         test_transient_release();
         std::cout << "== scoring after a release ==\n";
         test_scoring_after_release();
+        std::cout << "== segmented versus materialised windows ==\n";
+        test_segmented_windows_match_materialised();
+        std::cout << "== path-distinct, byte-identical haplotypes ==\n";
+        test_path_distinct_haplotypes_share_one_column();
+        std::cout << "== exact cache-budget boundary ==\n";
+        test_cache_budget_exact_boundary();
+        std::cout << "== no dangling reads after destruction ==\n";
+        test_no_dangling_reads_after_destruction();
+        std::cout << "== forced cache-hash collisions ==\n";
+        test_forced_hash_collisions();
+        std::cout << "== ambiguous bases ==\n";
+        test_ambiguous_bases_refuse();
+        std::cout << "== identity after transient destruction ==\n";
+        test_identical_after_transient_destruction();
         std::cout << "== cumulative caps through the delta ==\n";
         test_cumulative_caps_through_the_delta();
         std::cout << "\nblock-delta gates passed\n";

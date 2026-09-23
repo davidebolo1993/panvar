@@ -308,6 +308,10 @@ struct EmissionCacheCounters {
     std::uint64_t payload_bytes = 0;         // key and value bytes retained
     std::uint64_t entries = 0;
     std::uint64_t entries_not_retained = 0;  // entries the declared budget declined to hold
+    // Bytes charged against the declared budget, which governs REFUSAL entries only -- accepted fits
+    // are retained regardless. payload_bytes mixes the two, so it cannot be held to the budget; this
+    // can, and is what an exact budget boundary has to be measured against.
+    std::uint64_t budgeted_bytes_used = 0;
 };
 
 // Explicitly owned scorer memory, counted rather than inferred. RSS is not evidence about which
@@ -906,16 +910,48 @@ struct BlockDeltaWork {
     std::uint64_t piece_hits = 0;
     std::uint64_t dp_executions = 0;
     std::uint64_t cache_misses = 0;
+    // Requests and hits as well as misses. Reporting misses alone hides the probe VOLUME, which is
+    // what decides whether an owned key's copy costs anything -- and a delta path that reported
+    // hits as zero because nobody filled the field is worse than one that reported nothing.
+    std::uint64_t cache_requests = 0;
+    std::uint64_t cache_hits = 0;
     // Predicted from the census shape before it is built, observed from the containers afterwards.
     // Two numbers rather than one, because a predicted payload nobody checks is a guess.
     std::uint64_t census_payload_bytes_predicted = 0;
     std::uint64_t census_payload_bytes_observed = 0;
     std::uint64_t local_window_payload_bytes = 0;
+    // Stage 3 accounts. A repair is held as SEGMENTS, so the bytes it materialises are the window it
+    // actually looked at, not a 226kb haplotype and its reverse. full_haplotype_bytes_materialised is
+    // therefore expected to be zero for a neighbour and non-zero only when one is promoted to
+    // incumbent -- if it is not, the segmented representation is not doing its job.
+    std::uint64_t full_haplotype_bytes_materialised = 0;
+    std::uint64_t local_window_bytes_materialised = 0;
+    std::uint64_t sequence_key_bytes = 0;
+    // Where the time goes, split three ways rather than reported whole.
+    double seconds_placement_and_origins = 0.0;
+    double seconds_statekey_merge = 0.0;
+    double seconds_hashing_and_windows = 0.0;
     // True when the replacement sat within the end margin, or no census was held, so the haplotype
     // was placed in full. Still exact; simply not a saving.
     bool fell_back_to_full = false;
     double seconds = 0.0;
 };
+
+// A repair as segments, exposed so the extraction can be compared against the materialised
+// equivalent directly. The context uses exactly these operations, so a gate that drives them is
+// testing the real path rather than a parallel copy of it.
+//
+// All three describe the haplotype formed by replacing [block_begin, block_end) of `base` with
+// `replacement`, and none of them materialises it.
+std::size_t segmented_length(const std::string& base, std::size_t block_begin, std::size_t block_end,
+                             const std::string& replacement);
+std::uint64_t segmented_hash(const std::string& base, std::size_t block_begin, std::size_t block_end,
+                             const std::string& replacement);
+// `forward_out` receives [begin, end); `reversed_out` receives that same range reversed, which is
+// what the reverse-role scan consumes.
+void segmented_window(const std::string& base, std::size_t block_begin, std::size_t block_end,
+                      const std::string& replacement, std::size_t begin, std::size_t end,
+                      std::string& forward_out, std::string& reversed_out);
 
 class PreparedScoringContext {
 public:
@@ -948,18 +984,19 @@ public:
 
     // ---- stage 2 ------------------------------------------------------------------------------
     //
-    // Freezes the emission cache: lookups continue to serve, insertions stop. This is not a tuning
-    // knob -- it is the precondition for scoring anything transient. A cache key holds raw pointers
-    // into the read and the haplotype window it was built from, so a transient repair haplotype that
-    // was allowed to insert would leave keys pointing into a buffer this context is about to free.
-    // Frozen, a later miss is computed exactly and simply not retained.
-    void freeze_emission_cache();
-    bool emission_cache_frozen() const;
+    // There is no freeze any more, and removing it is the point of stage 3. A cache key used to hold
+    // raw pointers into the read and the haplotype window it was built from, so anything transient
+    // had to be kept out of the table -- which cost a recomputed recursion on every later miss, about
+    // 171,000 of them per round. Keys now OWN the bytes they compare, so a transient repair haplotype
+    // may be destroyed while every entry it produced stays valid and keeps serving.
+    //
+    // Marks the point after which added haplotypes are transient and may be released.
+    void begin_transient_round();
 
     // Scores the incumbent haplotype with [block_begin, block_end) replaced by `replacement`, reusing
-    // every origin the replacement cannot touch. Returns the new haplotype's index. Requires a frozen
-    // cache and a retained census for `incumbent`; refuses otherwise rather than silently placing in
-    // full, because a silent fallback is indistinguishable from a delta that does not work.
+    // every origin the replacement cannot touch. Returns the new haplotype's index. Requires a
+    // retained census for `incumbent`; refuses otherwise rather than silently placing in full,
+    // because a silent fallback is indistinguishable from a delta that does not work.
     //
     // `retain_census` decides whether the new haplotype keeps a census of its own. It defaults to
     // false because retaining one per neighbour is not affordable -- a census runs to hundreds of

@@ -440,21 +440,24 @@ CensusKey census_key_of(const std::string& read, const char* window, std::size_t
 // ~203 key bytes per entry would cost 1.96GB at 30x, against ~48 by reference. The referenced
 // buffers must outlive the scoring pass, which is why the reversed haplotypes are precomputed once
 // below rather than rebuilt per haplotype iteration.
+// The key OWNS its bytes. It used to hold pointers into the caller's read and haplotype buffers,
+// which is why anything transient had to be kept out of the table. `content` is the read followed by
+// the window, and `read_length` records where one ends and the other begins -- so two different
+// (read, window) pairs cannot collide by concatenating to the same bytes, and identity stays exact.
+//
+// Hashes select a bucket and nothing else. Equality compares the COMPLETE content, so a collision
+// costs a comparison and never a wrong answer. Nothing here interprets a base, so the key admits
+// whatever the emission admits; today require_acgt_window refuses anything but ACGT before a key is
+// ever formed, and the key is correct either way.
 struct CacheKey {
     std::uint64_t h0 = 0;
     std::uint64_t h1 = 0;
-    const char* read = nullptr;
-    const char* window = nullptr;
     std::uint32_t read_length = 0;
-    std::uint32_t window_length = 0;
+    std::string content;
 
-    // Hashes only accelerate the lookup. BYTE EQUALITY decides, so a collision costs a comparison
-    // and never a wrong answer.
     bool operator==(const CacheKey& other) const noexcept {
         return h0 == other.h0 && h1 == other.h1 && read_length == other.read_length &&
-               window_length == other.window_length &&
-               std::memcmp(read, other.read, read_length) == 0 &&
-               std::memcmp(window, other.window, window_length) == 0;
+               content == other.content;
     }
 };
 struct CacheKeyHash {
@@ -494,18 +497,26 @@ struct CacheShard {
     std::vector<GappedComponent> arena;
 };
 
-constexpr std::size_t kCacheShards = 64;   // 560M lookups must not serialise on one mutex
+// The probe a lookup is built into. Reused per thread, so assigning into it keeps its capacity and a
+// lookup allocates nothing after warm-up -- which is what stops owned keys from turning round one's
+// 62 million probes into 62 million small allocations.
+CacheKey& probe_key() {
+    static thread_local CacheKey key;
+    return key;
+}
+
+// Measured, not assumed: raising this to 1024 moved a repair round from 82.20 s to 82.73 s, so the
+// 8.2M lookups a round now performs are NOT queueing behind these mutexes and finer sharding buys
+// nothing. Left at the value the 560M-lookup one-shot pass was sized for.
+constexpr std::size_t kCacheShards = 64;
 
 struct EmissionCache {
     std::array<CacheShard, kCacheShards> shards;
     std::atomic<bool> active{false};
-    // Frozen: every lookup still serves, every insertion becomes a no-op. A key holds raw pointers
-    // into the read and the haplotype window it was built from, so anything scored against a buffer
-    // that will not outlive the context must never be allowed to insert one. A miss under a frozen
-    // cache is computed exactly and discarded, which is the same answer more slowly.
-    std::atomic<bool> frozen{false};
-    std::atomic<std::size_t> refusal_budget_bytes{0};
-    std::atomic<std::size_t> refusal_bytes_used{0};
+    // Governs EVERY retained entry, keys included. Declining one costs a recomputation, never a
+    // wrong answer.
+    std::atomic<std::size_t> budget_bytes{0};
+    std::atomic<std::size_t> budgeted_bytes_used{0};
     // Only the INSERTION-path totals stay atomic. They are touched once per retained entry (967,004
     // times on the frozen 30x run) rather than once per request (1.19 billion), so the contention
     // that mattered is gone and the budget still needs an exact shared count.
@@ -524,7 +535,8 @@ std::atomic<bool>& cache_hash_collapse() {
     return collapse;
 }
 
-CacheKey cache_key_of(const std::string& read, const char* window, std::size_t window_length) {
+// Fills the per-thread probe in place and returns it. Never allocates once the buffer has grown.
+CacheKey& cache_key_of(const std::string& read, const char* window, std::size_t window_length) {
     std::uint64_t a = 1469598103934665603ULL;
     std::uint64_t b = 0x2545f4914f6cdd1dULL;
     const auto mix = [&](unsigned char value) {
@@ -535,23 +547,27 @@ CacheKey cache_key_of(const std::string& read, const char* window, std::size_t w
     for (const char c : read) mix(static_cast<unsigned char>(c));
     mix(0xff);
     for (std::size_t i = 0; i < window_length; ++i) mix(static_cast<unsigned char>(window[i]));
-    CacheKey key;
+    CacheKey& key = probe_key();
     // Under the test collapse every key hashes alike, so the table degenerates to one bucket in one
-    // shard and every lookup must be decided by memcmp. The answers may not change.
+    // shard and every lookup must be decided by byte comparison. The answers may not change.
     const bool collapse = cache_hash_collapse().load(std::memory_order_relaxed);
     key.h0 = collapse ? 0 : a;
     key.h1 = collapse ? 0 : b;
-    key.read = read.data();
     key.read_length = static_cast<std::uint32_t>(read.size());
-    key.window = window;
-    key.window_length = static_cast<std::uint32_t>(window_length);
+    key.content.assign(read.data(), read.size());
+    key.content.append(window, window_length);
     return key;
 }
 
 // Declared per-entry cost: the key, the value, and a conservative allowance for the hash table's
 // own node and bucket overhead. Used to hold the refusal budget to a byte figure a caller declared,
 // not to a guess about container internals.
-constexpr std::size_t kCacheEntryBytes = sizeof(CacheKey) + sizeof(CacheValue) + 48;
+// A retained entry's declared cost now includes the bytes the key OWNS, because that is what the
+// table actually holds. Measured from content.size() rather than capacity so the figure a budget is
+// held to does not depend on how a string chose to grow.
+std::size_t cache_entry_bytes(const CacheKey& key) {
+    return sizeof(CacheKey) + key.content.size() + sizeof(CacheValue) + 48;
+}
 
 enum class CacheProbe { Disabled, Miss, HitAccepted, HitRefusedAfterRecursion };
 
@@ -582,15 +598,15 @@ CacheProbe cache_lookup(const CacheKey& key, GappedFit* out, EmissionWork& work)
 void cache_store_refusal(const CacheKey& key, CacheOutcome outcome) {
     EmissionCache& cache = emission_cache();
     if (!cache.active.load(std::memory_order_relaxed)) return;
-    if (cache.frozen.load(std::memory_order_relaxed)) return;
+    const std::size_t kCacheEntryBytes = cache_entry_bytes(key);
     // The declared bound now governs the whole table, which holds only recursion results. Crossing
     // it stops RETENTION, never correctness: the next request for this key recomputes it exactly,
     // which is the same answer more slowly.
     const std::size_t used =
-        cache.refusal_bytes_used.fetch_add(kCacheEntryBytes, std::memory_order_relaxed) +
+        cache.budgeted_bytes_used.fetch_add(kCacheEntryBytes, std::memory_order_relaxed) +
         kCacheEntryBytes;
-    if (used > cache.refusal_budget_bytes.load(std::memory_order_relaxed)) {
-        cache.refusal_bytes_used.fetch_sub(kCacheEntryBytes, std::memory_order_relaxed);
+    if (used > cache.budget_bytes.load(std::memory_order_relaxed)) {
+        cache.budgeted_bytes_used.fetch_sub(kCacheEntryBytes, std::memory_order_relaxed);
         cache.entries_not_retained.fetch_add(1, std::memory_order_relaxed);
         return;
     }
@@ -599,7 +615,7 @@ void cache_store_refusal(const CacheKey& key, CacheOutcome outcome) {
     CacheValue value;
     value.outcome = outcome;
     if (!shard.table.emplace(key, value).second) {
-        cache.refusal_bytes_used.fetch_sub(kCacheEntryBytes, std::memory_order_relaxed);
+        cache.budgeted_bytes_used.fetch_sub(kCacheEntryBytes, std::memory_order_relaxed);
         return;   // another worker got there first; the budget is not spent twice
     }
     cache.entries.fetch_add(1, std::memory_order_relaxed);
@@ -609,10 +625,26 @@ void cache_store_refusal(const CacheKey& key, CacheOutcome outcome) {
 void cache_store_fit(const CacheKey& key, const GappedFit& fit) {
     EmissionCache& cache = emission_cache();
     if (!cache.active.load(std::memory_order_relaxed)) return;
-    if (cache.frozen.load(std::memory_order_relaxed)) return;
+    // Fits are budgeted now, where they used to be retained unconditionally. Once the key OWNS its
+    // bytes an accepted fit is the DEARER entry, not the cheaper one -- roughly 300 bytes against a
+    // pointer key's ~112 -- and a budget that governed only the refusal stream governed almost
+    // nothing, because the prefilter is exact and post-recursion refusals are vanishingly rare.
+    // Exhaustion stops RETENTION, never correctness: the next request for this key recomputes it
+    // exactly, which is the same answer more slowly.
+    const std::size_t bytes =
+        cache_entry_bytes(key) + fit.components.size() * sizeof(GappedComponent);
+    const std::size_t used = cache.budgeted_bytes_used.fetch_add(bytes, std::memory_order_relaxed) + bytes;
+    if (used > cache.budget_bytes.load(std::memory_order_relaxed)) {
+        cache.budgeted_bytes_used.fetch_sub(bytes, std::memory_order_relaxed);
+        cache.entries_not_retained.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
     CacheShard& shard = cache.shards[key.h0 % kCacheShards];
     const std::lock_guard<std::mutex> guard(shard.guard);
-    if (shard.table.find(key) != shard.table.end()) return;
+    if (shard.table.find(key) != shard.table.end()) {
+        cache.budgeted_bytes_used.fetch_sub(bytes, std::memory_order_relaxed);
+        return;   // another worker got there first; the budget is not spent twice
+    }
     CacheValue value;
     value.outcome = CacheOutcome::Accepted;
     value.log_emission = fit.log_emission;
@@ -623,12 +655,7 @@ void cache_store_fit(const CacheKey& key, const GappedFit& fit) {
     shard.arena.insert(shard.arena.end(), fit.components.begin(), fit.components.end());
     shard.table.emplace(key, value);
     cache.entries.fetch_add(1, std::memory_order_relaxed);
-    // Accepted fits are retained unconditionally: the census puts them at a fiftieth of the refusal
-    // population and sixteen times the recomputation cost, so they are the cheap half to hold and
-    // the dear half to lose.
-    cache.payload_bytes.fetch_add(
-        kCacheEntryBytes + fit.components.size() * sizeof(GappedComponent),
-        std::memory_order_relaxed);
+    cache.payload_bytes.fetch_add(bytes, std::memory_order_relaxed);
 }
 
 void census_record(const std::string& read, const char* window, std::size_t window_length,
@@ -972,12 +999,11 @@ void begin_emission_cache(std::size_t budget_bytes) {
         shard.table.clear();
         shard.arena.clear();
     }
-    cache.refusal_budget_bytes.store(budget_bytes, std::memory_order_relaxed);
-    cache.refusal_bytes_used.store(0, std::memory_order_relaxed);
+    cache.budget_bytes.store(budget_bytes, std::memory_order_relaxed);
+    cache.budgeted_bytes_used.store(0, std::memory_order_relaxed);
     cache.entries.store(0, std::memory_order_relaxed);
     cache.payload_bytes.store(0, std::memory_order_relaxed);
     cache.entries_not_retained.store(0, std::memory_order_relaxed);
-    cache.frozen.store(false, std::memory_order_relaxed);
     // Zero is off, and off reproduces the uncached path exactly rather than approximately.
     cache.active.store(budget_bytes > 0, std::memory_order_relaxed);
 }
@@ -990,6 +1016,8 @@ EmissionCacheCounters read_emission_cache_counters() {
     out.payload_bytes = cache.payload_bytes.load(std::memory_order_relaxed);
     out.entries = cache.entries.load(std::memory_order_relaxed);
     out.entries_not_retained = cache.entries_not_retained.load(std::memory_order_relaxed);
+    // What the declared budget is actually holding, separate from the fits it does not govern.
+    out.budgeted_bytes_used = cache.budgeted_bytes_used.load(std::memory_order_relaxed);
     return out;
 }
 
@@ -1002,7 +1030,9 @@ void emission_cache_storage_bytes(std::uint64_t* table_bytes, std::uint64_t* are
     std::uint64_t arena = 0;
     for (CacheShard& shard : cache.shards) {
         const std::lock_guard<std::mutex> guard(shard.guard);
-        table += static_cast<std::uint64_t>(shard.table.size()) * kCacheEntryBytes;
+        // Per entry now, not a count times a constant: the key owns a variable number of bytes, so
+        // the only honest figure is the sum of what each one actually holds.
+        for (const auto& entry : shard.table) table += cache_entry_bytes(entry.first);
         arena += static_cast<std::uint64_t>(shard.arena.capacity()) * sizeof(GappedComponent);
     }
     if (table_bytes != nullptr) *table_bytes = table;
@@ -1046,7 +1076,7 @@ EmissionCacheCounters end_emission_cache() {
     // stamp over the real figures. Only the atomic-backed fields survived that overwrite, which is
     // exactly the symptom seen -- payload_bytes and entries correct beside five zeroed counters.
     // Direct callers use this function's RETURN value, which is complete for their single thread.
-    // Keys point into the caller's buffers, so nothing may survive the pass that owns them.
+    // Keys own their bytes now, so this is reclaiming memory rather than avoiding dangling reads.
     for (CacheShard& shard : cache.shards) {
         const std::lock_guard<std::mutex> guard(shard.guard);
         shard.table.clear();
@@ -2412,6 +2442,133 @@ std::size_t run_placement(
     return threads;
 }
 
+// ---- a repair, held as segments rather than as 226kb of bytes ----------------------------------
+//
+// A neighbour differs from its incumbent in one block, so materialising it means copying a whole
+// haplotype, reversing it, and -- worst of all -- using it as a std::map key, where every comparison
+// memcmps up to 226kb. Held as prefix + replacement + suffix, none of that happens: length, hash and
+// equality all stream over the three segments, and only the window a delta actually reads is ever
+// turned into bytes.
+//
+// `base` must outlive the segment. That is guaranteed by construction: a segment is only ever taken
+// against a materialised INCUMBENT, and an incumbent is retained for the whole round in which its
+// neighbours exist.
+struct SegmentedSequence {
+    const std::string* base = nullptr;
+    std::size_t block_begin = 0;
+    std::size_t block_end = 0;
+    std::string replacement;
+
+    std::size_t replaced_at_end() const { return block_begin + replacement.size(); }
+
+    std::size_t length() const {
+        return base->size() - (block_end - block_begin) + replacement.size();
+    }
+
+    char at(std::size_t i) const {
+        if (i < block_begin) return (*base)[i];
+        const std::size_t after = replaced_at_end();
+        if (i < after) return replacement[i - block_begin];
+        return (*base)[i - after + block_end];
+    }
+
+    // Appends [from, to) by SEGMENT, so each piece is one memcpy rather than a per-byte walk.
+    void append_range(std::size_t from, std::size_t to, std::string& out) const {
+        if (to <= from) return;
+        const std::size_t after = replaced_at_end();
+        // prefix
+        if (from < block_begin) {
+            const std::size_t stop = std::min(to, block_begin);
+            out.append(base->data() + from, stop - from);
+            from = stop;
+        }
+        // replacement
+        if (from < after && from >= block_begin) {
+            const std::size_t stop = std::min(to, after);
+            out.append(replacement.data() + (from - block_begin), stop - from);
+            from = stop;
+        }
+        // suffix, mapped back into the base's coordinates
+        if (from < to) {
+            const std::size_t base_from = from - after + block_end;
+            out.append(base->data() + base_from, to - from);
+        }
+    }
+
+    void append_range_reversed(std::size_t from, std::size_t to, std::string& out) const {
+        if (to <= from) return;
+        const std::size_t start = out.size();
+        append_range(from, to, out);
+        std::reverse(out.begin() + static_cast<std::ptrdiff_t>(start), out.end());
+    }
+
+    // FNV-1a streamed over the three segments. Selects a dedup bucket only: equality below decides.
+    std::uint64_t hash() const {
+        std::uint64_t h = 1469598103934665603ULL;
+        const auto mix = [&h](const char* data, std::size_t count) {
+            for (std::size_t i = 0; i < count; ++i) {
+                h = (h ^ static_cast<unsigned char>(data[i])) * 1099511628211ULL;
+            }
+        };
+        mix(base->data(), block_begin);
+        mix(replacement.data(), replacement.size());
+        mix(base->data() + block_end, base->size() - block_end);
+        return h;
+    }
+
+    // Exact, after a hash match. The common case -- the same block of the same base replaced by the
+    // same allele -- is settled without looking at a single base; anything else is compared for real,
+    // because two different allele paths may spell the identical haplotype and must share one column.
+    bool equals(const SegmentedSequence& other) const {
+        if (base == other.base && block_begin == other.block_begin &&
+            block_end == other.block_end && replacement == other.replacement) {
+            return true;
+        }
+        const std::size_t n = length();
+        if (n != other.length()) return false;
+        constexpr std::size_t kChunk = 4096;
+        std::string mine;
+        std::string theirs;
+        for (std::size_t at = 0; at < n; at += kChunk) {
+            const std::size_t stop = std::min(n, at + kChunk);
+            mine.clear();
+            theirs.clear();
+            append_range(at, stop, mine);
+            other.append_range(at, stop, theirs);
+            if (mine != theirs) return false;
+        }
+        return true;
+    }
+
+    bool equals_materialised(const std::string& other) const {
+        const std::size_t n = length();
+        if (n != other.size()) return false;
+        constexpr std::size_t kChunk = 4096;
+        std::string mine;
+        for (std::size_t at = 0; at < n; at += kChunk) {
+            const std::size_t stop = std::min(n, at + kChunk);
+            mine.clear();
+            append_range(at, stop, mine);
+            if (std::memcmp(mine.data(), other.data() + at, mine.size()) != 0) return false;
+        }
+        return true;
+    }
+
+    void materialise(std::string& out) const {
+        out.clear();
+        out.reserve(length());
+        append_range(0, length(), out);
+    }
+};
+
+// Streamed hash of an already-materialised sequence, so the two representations share one bucket
+// space. Must agree with SegmentedSequence::hash byte for byte.
+std::uint64_t hash_materialised(const std::string& bases) {
+    std::uint64_t h = 1469598103934665603ULL;
+    for (const char c : bases) h = (h ^ static_cast<unsigned char>(c)) * 1099511628211ULL;
+    return h;
+}
+
 // ---- the local window a replacement can disturb ------------------------------------------------
 //
 // Transient by construction: these bytes live only for one delta. That is precisely why the cache
@@ -2786,6 +2943,7 @@ FragmentScoringResult score_diplotypes(
         result.emission_cache.payload_bytes = stored.payload_bytes;
         result.emission_cache.entries = stored.entries;
         result.emission_cache.entries_not_retained = stored.entries_not_retained;
+        result.emission_cache.budgeted_bytes_used = stored.budgeted_bytes_used;
     }
     emission_cache_storage_bytes(&result.memory.emission_cache_table_bytes,
                                  &result.memory.emission_cache_arena_bytes);
@@ -2825,10 +2983,41 @@ struct PreparedScoringContext::State {
     DiscreteInsertDistribution library_insert;
     PreparedFragmentSet prepared;
 
-    // Address-stable for the context's whole life: the emission cache retains raw pointers into both.
+    // Materialised bytes exist only for haplotypes that are actually PLACED in full: the initial
+    // panel, and whichever repair has been promoted to incumbent. A transient neighbour leaves these
+    // entries empty and lives in `segments` instead, so a round costs no 226kb copies, no reversed
+    // copies, and no map keyed on whole haplotypes.
     std::deque<std::string> sequences;
     std::deque<std::string> reversed;
-    std::map<std::string, std::size_t> index_of_sequence;
+    std::map<std::size_t, SegmentedSequence> segments;
+    // Dedup by streamed hash, then EXACT comparison on a match. A hash alone cannot decide identity,
+    // and byte-identical haplotypes spelled by different allele paths must share one column.
+    std::unordered_multimap<std::uint64_t, std::size_t> by_hash;
+    std::vector<std::uint64_t> hash_by_slot;
+
+    std::size_t slot_length(std::size_t slot) const {
+        const auto found = segments.find(slot);
+        return found != segments.end() ? found->second.length() : sequences[slot].size();
+    }
+    bool slot_equals(std::size_t slot, const SegmentedSequence& other) const {
+        const auto found = segments.find(slot);
+        if (found != segments.end()) return found->second.equals(other);
+        return other.equals_materialised(sequences[slot]);
+    }
+    bool slot_equals_materialised(std::size_t slot, const std::string& other) const {
+        const auto found = segments.find(slot);
+        if (found != segments.end()) return found->second.equals_materialised(other);
+        return sequences[slot] == other;
+    }
+    // Gives a transient repair real bytes. Done once, when it is promoted to incumbent, because the
+    // next round deltas FROM it and full placement needs a string.
+    void materialise(std::size_t slot) {
+        const auto found = segments.find(slot);
+        if (found == segments.end()) return;
+        found->second.materialise(sequences[slot]);
+        reversed[slot].assign(sequences[slot].rbegin(), sequences[slot].rend());
+        segments.erase(found);
+    }
 
     std::vector<std::vector<double>> mass_column;   // [haplotype][fragment]
     std::vector<double> exposure;
@@ -2839,9 +3028,8 @@ struct PreparedScoringContext::State {
     PlacementBudget budget;                          // cumulative across every batch
     bool refused = false;
     bool cache_pinned = false;
-    // Stage 2. `frozen` gates every transient haplotype; `transient_watermark` is the slot from which
-    // release_transient is allowed to free, so the initial panel columns are structurally out of reach.
-    bool frozen = false;
+    // `transient_watermark` is the slot from which release_transient is allowed to free, so the
+    // initial panel columns are structurally out of reach.
     std::size_t transient_watermark = 0;
     std::map<std::size_t, HaploidOriginCensus> censuses;
 
@@ -2915,14 +3103,23 @@ std::vector<std::size_t> PreparedScoringContext::add_haplotypes(
     out.reserve(sequences.size());
     std::size_t reused = 0;
     for (const std::string& sequence : sequences) {
-        const auto found = state.index_of_sequence.find(sequence);
-        if (found != state.index_of_sequence.end()) {
+        const std::uint64_t hash = hash_materialised(sequence);
+        std::size_t existing = state.sequences.size();
+        const auto range = state.by_hash.equal_range(hash);
+        for (auto it = range.first; it != range.second; ++it) {
+            if (state.slot_equals_materialised(it->second, sequence)) {
+                existing = it->second;
+                break;
+            }
+        }
+        if (existing != state.sequences.size()) {
             ++reused;
-            out.push_back(found->second);
+            out.push_back(existing);
             continue;
         }
         const std::size_t slot = state.sequences.size();
-        state.index_of_sequence.emplace(sequence, slot);
+        state.by_hash.emplace(hash, slot);
+        state.hash_by_slot.push_back(hash);
         state.sequences.push_back(sequence);
         state.reversed.emplace_back(sequence.rbegin(), sequence.rend());
         out.push_back(slot);
@@ -3147,6 +3344,44 @@ const EmissionCacheCounters& PreparedScoringContext::cumulative_emission_cache()
 
 bool PreparedScoringContext::refused() const { return state_->refused; }
 
+namespace {
+SegmentedSequence segment_of(const std::string& base, std::size_t block_begin, std::size_t block_end,
+                             const std::string& replacement) {
+    if (block_end < block_begin || block_end > base.size()) {
+        throw std::invalid_argument("the replaced block is not an interval of the base");
+    }
+    SegmentedSequence segment;
+    segment.base = &base;
+    segment.block_begin = block_begin;
+    segment.block_end = block_end;
+    segment.replacement = replacement;
+    return segment;
+}
+}  // namespace
+
+std::size_t segmented_length(const std::string& base, std::size_t block_begin, std::size_t block_end,
+                             const std::string& replacement) {
+    return segment_of(base, block_begin, block_end, replacement).length();
+}
+
+std::uint64_t segmented_hash(const std::string& base, std::size_t block_begin, std::size_t block_end,
+                             const std::string& replacement) {
+    return segment_of(base, block_begin, block_end, replacement).hash();
+}
+
+void segmented_window(const std::string& base, std::size_t block_begin, std::size_t block_end,
+                      const std::string& replacement, std::size_t begin, std::size_t end,
+                      std::string& forward_out, std::string& reversed_out) {
+    const SegmentedSequence segment = segment_of(base, block_begin, block_end, replacement);
+    if (end > segment.length() || begin > end) {
+        throw std::invalid_argument("the requested window is not a range of the repaired haplotype");
+    }
+    forward_out.clear();
+    segment.append_range(begin, end, forward_out);
+    reversed_out.clear();
+    segment.append_range_reversed(begin, end, reversed_out);
+}
+
 std::uint64_t HaploidOriginCensus::payload_bytes() const {
     std::uint64_t total = sizeof(HaploidOriginCensus);
     for (const std::vector<HaploidOrigin>& list : origins_by_fragment) {
@@ -3155,18 +3390,13 @@ std::uint64_t HaploidOriginCensus::payload_bytes() const {
     return total;
 }
 
-void PreparedScoringContext::freeze_emission_cache() {
+void PreparedScoringContext::begin_transient_round() {
     State& state = *state_;
     state.require_usable();
-    // emission_cache() is a file-local singleton in the anonymous namespace, not a scoring_detail
-    // member; only the pin flag lives there.
-    emission_cache().frozen.store(true, std::memory_order_relaxed);
-    state.frozen = true;
-    // Everything added from here is transient until the caller says otherwise.
+    // Nothing is frozen. Owned cache keys mean a transient haplotype may be destroyed while the
+    // entries it produced keep serving, so all this records is the slot from which release is allowed.
     state.transient_watermark = state.sequences.size();
 }
-
-bool PreparedScoringContext::emission_cache_frozen() const { return state_->frozen; }
 
 bool PreparedScoringContext::holds_census(std::size_t haplotype) const {
     return state_->censuses.count(haplotype) != 0;
@@ -3244,17 +3474,17 @@ std::size_t PreparedScoringContext::add_repaired_haplotype(
     bool retain_census_for_it) {
     State& state = *state_;
     state.require_usable();
-    // Both refusals are deliberate. Placing in full when a precondition is missing would report a
-    // delta that never happened, and the whole point of this path is that its reuse is measurable.
-    if (!state.frozen) {
-        throw std::invalid_argument(
-            "the emission cache must be frozen before a transient repair haplotype is scored");
-    }
+    // Refusing is deliberate. Placing in full when no census is held would report a delta that never
+    // happened, and the whole point of this path is that its reuse is measurable.
     const auto held = state.censuses.find(incumbent);
     if (held == state.censuses.end()) {
         throw std::invalid_argument("no origin census is held for the incumbent haplotype");
     }
     const HaploidOriginCensus& census = held->second;
+    // The incumbent must have real bytes: a delta reads its prefix and suffix directly.
+    if (state.sequences[incumbent].empty()) {
+        throw std::invalid_argument("the incumbent haplotype has not been materialised");
+    }
     const std::string& old_sequence = state.sequences[incumbent];
     if (block_end < block_begin || block_end > old_sequence.size()) {
         throw std::invalid_argument("the replaced block is not an interval of the incumbent");
@@ -3262,26 +3492,45 @@ std::size_t PreparedScoringContext::add_repaired_haplotype(
 
     const auto mark = std::chrono::steady_clock::now();
     BlockDeltaWork local;
-    std::string repaired = old_sequence;
-    repaired.replace(block_begin, block_end - block_begin, replacement);
+    const auto hash_mark = std::chrono::steady_clock::now();
+    // The repair, as three immutable segments. No haplotype is copied and none is reversed.
+    SegmentedSequence repaired;
+    repaired.base = &old_sequence;
+    repaired.block_begin = block_begin;
+    repaired.block_end = block_end;
+    repaired.replacement = replacement;
+    const std::uint64_t repaired_hash = repaired.hash();
+    local.sequence_key_bytes = replacement.size() + sizeof(SegmentedSequence);
     const std::size_t old_length = old_sequence.size();
-    const std::size_t new_length = repaired.size();
+    const std::size_t new_length = repaired.length();
     const std::size_t new_end = block_begin + replacement.size();
     const std::ptrdiff_t shift =
         static_cast<std::ptrdiff_t>(replacement.size()) -
         static_cast<std::ptrdiff_t>(block_end - block_begin);
 
-    // Already held? Hand back the same slot. The one exception is a caller that now wants a census
-    // for it -- typically the round's winner, scored earlier without one -- and that must fill the
-    // EXISTING slot rather than mint a second one for identical bytes.
-    const auto found = state.index_of_sequence.find(repaired);
-    const bool already_held = found != state.index_of_sequence.end();
-    if (already_held && (!retain_census_for_it || state.censuses.count(found->second) != 0)) {
+    // Already held? Hand back the same slot. Found by streamed hash, then confirmed byte for byte --
+    // two different allele paths may spell the identical haplotype and must share one column. The one
+    // exception is a caller that now wants a census for it (the round's winner, scored earlier
+    // without one), which must fill the EXISTING slot rather than mint a second for identical bytes.
+    std::size_t held_slot = state.sequences.size();
+    {
+        const auto range = state.by_hash.equal_range(repaired_hash);
+        for (auto it = range.first; it != range.second; ++it) {
+            if (state.slot_equals(it->second, repaired)) {
+                held_slot = it->second;
+                break;
+            }
+        }
+    }
+    local.seconds_hashing_and_windows =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - hash_mark).count();
+    const bool already_held = held_slot != state.sequences.size();
+    if (already_held && (!retain_census_for_it || state.censuses.count(held_slot) != 0)) {
         if (work != nullptr) {
             local.seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - mark).count();
             *work = local;
         }
-        return found->second;
+        return held_slot;
     }
 
     // The margin beyond which the emission normaliser is saturated, so an unaffected origin keeps its
@@ -3321,9 +3570,18 @@ std::size_t PreparedScoringContext::add_repaired_haplotype(
     if (shift != 0 && shortest < block_end + margin) window_end = new_length;
     window.at_start = window.begin == 0;
     window.at_end = window_end == new_length;
-    window.bases = repaired.substr(window.begin, window_end - window.begin);
-    window.reversed.assign(window.bases.rbegin(), window.bases.rend());
+    {
+        const auto window_mark = std::chrono::steady_clock::now();
+        window.bases.clear();
+        repaired.append_range(window.begin, window_end, window.bases);
+        window.reversed.clear();
+        repaired.append_range_reversed(window.begin, window_end, window.reversed);
+        local.seconds_hashing_and_windows +=
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - window_mark).count();
+    }
     local.local_window_bases = window.bases.size();
+    local.local_window_bytes_materialised =
+        static_cast<std::uint64_t>(window.bases.size() + window.reversed.size());
     local.local_window_payload_bytes =
         static_cast<std::uint64_t>(window.bases.capacity() + window.reversed.capacity());
 
@@ -3341,6 +3599,7 @@ std::size_t PreparedScoringContext::add_repaired_haplotype(
     FragmentScoringCounters counters;
     EmissionCacheCounters cache_work;
     std::vector<std::vector<HaploidOrigin>> recomputed;
+    const auto origins_mark = std::chrono::steady_clock::now();
     try {
         enumerate_window_origins(state.prepared, state.fragments, state.library, state.options,
                                  state.options.mismatch_band, window, state.budget, counters,
@@ -3349,20 +3608,35 @@ std::size_t PreparedScoringContext::add_repaired_haplotype(
         state.refused = true;
         throw;
     }
+    local.seconds_placement_and_origins =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - origins_mark).count();
 
     std::size_t slot = 0;
     if (already_held) {
-        slot = found->second;   // refilling an existing column, and its census
+        slot = held_slot;   // refilling an existing column, and its census
     } else {
         slot = state.sequences.size();
-        state.index_of_sequence.emplace(repaired, slot);
-        state.sequences.push_back(repaired);
-        state.reversed.emplace_back(repaired.rbegin(), repaired.rend());
+        state.by_hash.emplace(repaired_hash, slot);
+        state.hash_by_slot.push_back(repaired_hash);
+        // Empty placeholders keep every slot-indexed container aligned; the bytes live in `segments`.
+        state.sequences.emplace_back();
+        state.reversed.emplace_back();
+        state.segments.emplace(slot, repaired);
         state.mass_column.resize(slot + 1, std::vector<double>(state.fragments.size(), kNegInf));
         state.exposure.resize(slot + 1, 0.0);
         state.exposure[slot] = exposure_for_length(new_length, state.fragments.size(),
                                                    state.prepared.fragments_by_floor,
                                                    state.library_insert);
+    }
+    // Promotion to incumbent is the only thing that earns real bytes, and a census request is the
+    // signal for it: the next round reads this haplotype's prefix and suffix directly.
+    if (retain_census_for_it) {
+        const bool was_segmented = state.segments.count(slot) != 0;
+        state.materialise(slot);
+        local.full_haplotype_bytes_materialised =
+            was_segmented ? static_cast<std::uint64_t>(state.sequences[slot].size() +
+                                                       state.reversed[slot].size())
+                          : 0;
     }
 
     local.census_payload_bytes_predicted = census.payload_bytes();
@@ -3372,6 +3646,7 @@ std::size_t PreparedScoringContext::add_repaired_haplotype(
         fresh.origins_by_fragment.assign(state.fragments.size(), {});
     }
 
+    const auto merge_mark = std::chrono::steady_clock::now();
     std::map<StateKey, std::uint64_t> states;
     for (std::size_t f = 0; f < state.fragments.size(); ++f) {
         states.clear();
@@ -3406,6 +3681,8 @@ std::size_t PreparedScoringContext::add_repaired_haplotype(
         state.cumulative.statistical_state_classes += states.size();
         state.mass_column[slot][f] = reduce_states(states, state.library_insert);
     }
+    local.seconds_statekey_merge =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - merge_mark).count();
 
     if (retain_census_for_it) {
         local.census_payload_bytes_observed = fresh.payload_bytes();
@@ -3414,6 +3691,8 @@ std::size_t PreparedScoringContext::add_repaired_haplotype(
     local.piece_hits = counters.piece_hits;
     local.dp_executions = cache_work.executed_dps;
     local.cache_misses = cache_work.dp_cache_misses;
+    local.cache_requests = cache_work.dp_cache_requests;
+    local.cache_hits = cache_work.dp_cache_hits;
     state.cumulative.piece_hits += counters.piece_hits;
     state.cumulative.candidate_bases_scanned += counters.candidate_bases_scanned;
     state.cumulative.physical_origins += counters.physical_origins;
@@ -3447,9 +3726,17 @@ void PreparedScoringContext::release_transient(const std::vector<std::size_t>& k
     const std::set<std::size_t> retained(keep.begin(), keep.end());
     for (std::size_t slot = state.transient_watermark; slot < state.sequences.size(); ++slot) {
         if (retained.count(slot) != 0) continue;
-        if (state.sequences[slot].empty() && state.mass_column[slot].empty()) continue;
-        // Safe only because the cache was frozen before any of these existed, so no key points here.
-        state.index_of_sequence.erase(state.sequences[slot]);
+        if (state.sequences[slot].empty() && state.mass_column[slot].empty() &&
+            state.segments.count(slot) == 0) {
+            continue;
+        }
+        // Safe because cache keys OWN their bytes now: entries this haplotype produced keep serving
+        // after it is gone. That is what removing the freeze bought.
+        const auto range = state.by_hash.equal_range(state.hash_by_slot[slot]);
+        for (auto it = range.first; it != range.second; ++it) {
+            if (it->second == slot) { state.by_hash.erase(it); break; }
+        }
+        state.segments.erase(slot);
         std::string().swap(state.sequences[slot]);
         std::string().swap(state.reversed[slot]);
         std::vector<double>().swap(state.mass_column[slot]);
@@ -3464,8 +3751,15 @@ std::uint64_t PreparedScoringContext::transient_payload_bytes() const {
         // A released slot keeps its shell but owns no heap. std::string::capacity() still reports the
         // short-string buffer for an empty string, so counting it would report storage that was in
         // fact returned -- and this figure exists precisely to show that it was.
-        if (state.sequences[slot].empty() && state.mass_column[slot].empty()) continue;
+        if (state.sequences[slot].empty() && state.mass_column[slot].empty() &&
+            state.segments.count(slot) == 0) {
+            continue;
+        }
         total += state.sequences[slot].capacity() + state.reversed[slot].capacity();
+        const auto segment = state.segments.find(slot);
+        if (segment != state.segments.end()) {
+            total += segment->second.replacement.capacity() + sizeof(SegmentedSequence);
+        }
         total += static_cast<std::uint64_t>(state.mass_column[slot].capacity()) * sizeof(double);
         const auto census = state.censuses.find(slot);
         if (census != state.censuses.end()) total += census->second.payload_bytes();

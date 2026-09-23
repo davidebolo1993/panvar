@@ -3562,6 +3562,10 @@ int repair_search(const Args& args) {
         // transient_before, or storage is leaking a round at a time.
         std::uint64_t origins_reused = 0, origins_recomputed = 0, window_bases = 0;
         std::uint64_t transient_before = 0, transient_after = 0;
+        // Stage 3. full_bytes is the headline: a segmented repair should materialise NOTHING, so a
+        // non-zero figure here means only the promoted incumbent, once per round.
+        std::uint64_t full_bytes = 0, window_bytes = 0, key_bytes = 0;
+        double seconds_origins = 0.0, seconds_merge = 0.0, seconds_hashing = 0.0;
     };
     std::vector<Round> rounds;
     std::unique_ptr<panvar::PreparedScoringContext> context;
@@ -3594,14 +3598,14 @@ int repair_search(const Args& args) {
         const panvar::HaplotypeSequence incumbent_b =
             panvar::spell_mosaic(model, panvar::MosaicPath{cur_second});
         if (use_delta && !have_inc_slots) {
-            // The initial pass: place the incumbent in full, then FREEZE. Everything after this is
-            // transient, and a frozen cache is what makes it safe to release -- no key may point
-            // into a buffer that will not outlive the context.
+            // The initial pass: place the incumbent in full, then mark everything after it
+            // transient. Nothing is frozen -- owned cache keys mean a released haplotype's entries
+            // stay valid and keep serving, which is what stage 3 bought.
             const std::vector<std::size_t> seeded =
                 context->add_haplotypes({incumbent_a.bases, incumbent_b.bases});
             inc_slot_a = seeded.front();
             inc_slot_b = seeded.back();
-            if (!context->emission_cache_frozen()) context->freeze_emission_cache();
+            context->begin_transient_round();
             context->retain_census(inc_slot_a);
             context->retain_census(inc_slot_b);
             have_inc_slots = true;
@@ -3722,6 +3726,14 @@ int repair_search(const Args& args) {
             round_delta.piece_hits += work.piece_hits;
             round_delta.dp_executions += work.dp_executions;
             round_delta.cache_misses += work.cache_misses;
+            round_delta.cache_requests += work.cache_requests;
+            round_delta.cache_hits += work.cache_hits;
+            round_delta.full_haplotype_bytes_materialised += work.full_haplotype_bytes_materialised;
+            round_delta.local_window_bytes_materialised += work.local_window_bytes_materialised;
+            round_delta.sequence_key_bytes += work.sequence_key_bytes;
+            round_delta.seconds_placement_and_origins += work.seconds_placement_and_origins;
+            round_delta.seconds_statekey_merge += work.seconds_statekey_merge;
+            round_delta.seconds_hashing_and_windows += work.seconds_hashing_and_windows;
             round_delta.seconds += work.seconds;
             return slot;
         };
@@ -3794,10 +3806,18 @@ int repair_search(const Args& args) {
                 rec.bases_scanned = round_delta.local_window_bases;
                 rec.piece_hits = round_delta.piece_hits;
                 rec.cache_misses = round_delta.cache_misses;
+                rec.cache_requests = round_delta.cache_requests;
+                rec.cache_hits = round_delta.cache_hits;
                 rec.executed_dps = round_delta.dp_executions;
                 rec.origins_reused = round_delta.origins_reused;
                 rec.origins_recomputed = round_delta.origins_recomputed;
                 rec.window_bases = round_delta.local_window_bases;
+                rec.full_bytes = round_delta.full_haplotype_bytes_materialised;
+                rec.window_bytes = round_delta.local_window_bytes_materialised;
+                rec.key_bytes = round_delta.sequence_key_bytes;
+                rec.seconds_origins = round_delta.seconds_placement_and_origins;
+                rec.seconds_merge = round_delta.seconds_statekey_merge;
+                rec.seconds_hashing = round_delta.seconds_hashing_and_windows;
             }
             rec.placement_seconds =
                 use_delta ? round_delta.seconds
@@ -3951,6 +3971,14 @@ int repair_search(const Args& args) {
             }
             context->release_transient(keep);
             rec.transient_after = context->transient_payload_bytes();
+            // Re-read AFTER the promotion above. rec.full_bytes was assigned back in the scoring
+            // block, before any winner existed, so the one materialisation a round performs could
+            // never appear in it -- the figure was structurally stuck at zero.
+            rec.full_bytes = round_delta.full_haplotype_bytes_materialised;
+            rec.key_bytes = round_delta.sequence_key_bytes;
+            rec.seconds_origins = round_delta.seconds_placement_and_origins;
+            rec.seconds_merge = round_delta.seconds_statekey_merge;
+            rec.seconds_hashing = round_delta.seconds_hashing_and_windows;
         }
         rounds.push_back(rec);
         if (!rec.moved) break;
@@ -4035,7 +4063,9 @@ int repair_search(const Args& args) {
                  "haplotypes_new\thaplotypes_reused\tbases_scanned\tpiece_hits\tcache_requests\t"
                  "cache_hits\tcache_misses\texecuted_dps\tphysical_origins\tstate_classes\t"
                  "placement_seconds\tcombination_seconds\torigins_reused\torigins_recomputed\t"
-                 "window_bases\ttransient_before\ttransient_after\n";
+                 "window_bases\ttransient_before\ttransient_after\tfull_haplotype_bytes\t"
+                 "window_bytes\tsequence_key_bytes\tseconds_origins\tseconds_merge\t"
+                 "seconds_hashing\n";
         for (const Round& r : rounds) {
             table << r.index << '\t' << r.start_total << '\t' << (r.moved ? "true" : "false") << '\t'
                   << (r.moved ? model.blocks()[r.block].block_id : std::string("NA")) << '\t'
@@ -4057,7 +4087,9 @@ int repair_search(const Args& args) {
                   << r.state_classes << '\t' << r.placement_seconds << '\t'
                   << r.combination_seconds << '\t' << r.origins_reused << '\t'
                   << r.origins_recomputed << '\t' << r.window_bases << '\t' << r.transient_before
-                  << '\t' << r.transient_after << '\n';
+                  << '\t' << r.transient_after << '\t' << r.full_bytes << '\t' << r.window_bytes
+                  << '\t' << r.key_bytes << '\t' << r.seconds_origins << '\t' << r.seconds_merge
+                  << '\t' << r.seconds_hashing << '\n';
         }
     }
     if (truth_gfa.empty()) {
