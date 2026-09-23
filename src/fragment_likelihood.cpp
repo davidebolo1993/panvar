@@ -4631,6 +4631,24 @@ std::size_t PreparedScoringContext::add_repaired_haplotype(
         }
         candidate.starts.push_back(static_cast<std::uint32_t>(candidate.states.size()));
         local.seconds_affected_filter = seconds_since(filter_mark);
+        if (!demand->aggregate_measured) {
+            // Measurement only: nothing below reads these, and nothing is retained differently.
+            demand->aggregate_measured = true;
+            demand->aggregate_states = candidate.states.size();
+            demand->aggregate_fragments = candidate.fragments.size();
+            std::uint64_t multiplicity = 0;
+            for (const StateCount& item : candidate.states) multiplicity += item.count;
+            demand->aggregate_multiplicity = multiplicity;
+            demand->retained_not_affected = source->origins.size() - multiplicity;
+            const std::uint64_t shared = sizeof(OriginCacheEntry) + kOriginCacheNodeBytes +
+                                         window.bases.size() +
+                                         static_cast<std::uint64_t>(2 * candidate.fragments.size() + 1) *
+                                             sizeof(std::uint32_t);
+            demand->aggregate_entry_bytes =
+                shared + static_cast<std::uint64_t>(candidate.states.size()) * sizeof(StateCount);
+            demand->aggregate_entry_bytes_packed =
+                shared + static_cast<std::uint64_t>(candidate.states.size()) * 16u;
+        }
 
         // ---- 3. the unaffected incumbent origins, preaggregated once per exact (block, shift)
         const auto merge_mark = Clock::now();

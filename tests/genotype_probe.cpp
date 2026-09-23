@@ -36,6 +36,7 @@
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iomanip>
 #include <iostream>
 #include <limits>
@@ -3484,6 +3485,11 @@ int repair_search(const Args& args) {
         write_status(state_name, reason);
         std::cout << "repair-search: " << state_name << ": " << reason << " (" << rounds_committed
                   << " rounds committed)" << std::endl;
+        // _Exit runs no destructor, so the staged graphs are removed here. The partial tables and the
+        // status are the diagnostic record and stay.
+        std::error_code ignored;
+        std::filesystem::remove(out + ".model.sorted.gfa", ignored);
+        std::filesystem::remove(out + ".truth.sorted.gfa", ignored);
         std::_Exit(code);
     };
     {
@@ -3520,6 +3526,19 @@ int repair_search(const Args& args) {
             if (thread.joinable()) thread.join();
         }
     } watchdog_join{finished, watchdog};
+    // Any exit that did not set a final status -- an exception thrown outside the search loop, or an
+    // early return -- leaves FAILED rather than a stale RUNNING. Unwinding then runs StagedGraphs.
+    struct UnfinishedGuard {
+        const std::function<void()> on_exit;
+        ~UnfinishedGuard() { on_exit(); }
+    } unfinished_guard{[&]() {
+        std::lock_guard<std::mutex> lock(commit_mutex);
+        if (finished) return;
+        finished = true;
+        write_status("FAILED", std::uncaught_exceptions() > 0
+                                   ? "an exception ended the run before a final status"
+                                   : "the run returned without a final status");
+    }};
 
     const LoadedModel loaded =
         load_model(args.required("model-gfa"), reference, out + ".model.sorted.gfa", 50);
@@ -3939,7 +3958,9 @@ int repair_search(const Args& args) {
         table << std::setprecision(12)
               << "order\tkey_hash\twindow_bytes\tat_start\tat_end\trel_block_begin\trel_new_end\t"
                  "requests\trepeat_requests\thits\tmisses\tadmitted\tdeclined\tentry_bytes\trecords\t"
-                 "origins_constructed\tseconds_enumeration\tseconds_reenumeration\n";
+                 "origins_constructed\tseconds_enumeration\tseconds_reenumeration\t"
+                 "aggregate_states\taggregate_fragments\taggregate_multiplicity\tretained_not_affected\t"
+                 "aggregate_entry_bytes\taggregate_entry_bytes_packed\n";
         for (const panvar::OriginDemandRow& row : rows) {
             table << row.order << '\t' << row.key_hash << '\t' << row.window_bytes << '\t'
                   << (row.at_start ? 1 : 0) << '\t' << (row.at_end ? 1 : 0) << '\t' << row.rel_block_begin
@@ -3947,7 +3968,10 @@ int repair_search(const Args& args) {
                   << row.hits << '\t' << row.misses << '\t' << (row.admitted ? "true" : "false") << '\t'
                   << row.declined << '\t' << row.entry_bytes << '\t' << row.records << '\t'
                   << row.origins_constructed << '\t' << row.seconds_enumeration << '\t'
-                  << row.seconds_reenumeration << '\n';
+                  << row.seconds_reenumeration << '\t' << row.aggregate_states << '\t'
+                  << row.aggregate_fragments << '\t' << row.aggregate_multiplicity << '\t'
+                  << row.retained_not_affected << '\t' << row.aggregate_entry_bytes << '\t'
+                  << row.aggregate_entry_bytes_packed << '\n';
         }
         return table.str();
     };

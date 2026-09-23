@@ -1093,6 +1093,18 @@ struct OriginDemandRow {
     std::uint64_t origins_constructed = 0;    // executed, summed over every miss
     double seconds_enumeration = 0.0;         // enumeration + record building, summed over misses
     double seconds_reenumeration = 0.0;       // the same, for misses after the first
+    // MEASUREMENT ONLY, at the first request: the exact sorted StateKey -> multiplicity aggregate of
+    // the affected retained origins -- the array the merge consumes -- and what storing it instead of
+    // the raw records would cost. For an interior window every retained record is affected
+    // (retained_not_affected must be 0), so the aggregate depends on the key alone. For a window at an
+    // end the affected subset reads the haplotype length, so its figure describes one call only.
+    bool aggregate_measured = false;
+    std::uint64_t aggregate_states = 0;
+    std::uint64_t aggregate_fragments = 0;
+    std::uint64_t aggregate_multiplicity = 0;
+    std::uint64_t retained_not_affected = 0;
+    std::uint64_t aggregate_entry_bytes = 0;         // StateCount records (24 bytes each)
+    std::uint64_t aggregate_entry_bytes_packed = 0;  // the same states at 16 bytes each
 };
 
 struct ContextMemoryAccount {

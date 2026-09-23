@@ -215,6 +215,22 @@ same "cap refusal status" "$(key "$WORK/capped.run_status.tsv" status)" "RESOURC
 same "cap refusal is not complete" "$(key "$WORK/capped.run_status.tsv" complete)" "false"
 same "cap refusal wrote no rounds table" "$(exists "$WORK/capped.rounds.tsv")" "absent"
 same "cap refusal wrote no summary" "$(exists "$WORK/capped.summary.tsv")" "absent"
+# Every exit path removes the staged graphs and keeps the diagnostic record. The interrupted run exits
+# through _Exit, which runs no destructor, so its cleanup is explicit; the others unwind.
+code="$(search "$WORK/footprint" "${DELTA[@]}" --rounds 2 --footprint-limit-bytes 1)"
+same "footprint refusal exit" "$code" "125"
+same "footprint refusal status" "$(key "$WORK/footprint.run_status.tsv" status)" "RESOURCE_REFUSAL"
+code="$(search "$WORK/broken" "${DELTA[@]}" --rounds 1 --start "1|2" --start-score 0)"
+differs "exception exit" "$code" "0"
+same "exception status" "$(key "$WORK/broken.run_status.tsv" status)" "FAILED"
+for o in cut capped footprint broken; do
+  same "$o: staged model graph removed" "$(exists "$WORK/$o.model.sorted.gfa")" "absent"
+  same "$o: staged truth graph removed" "$(exists "$WORK/$o.truth.sorted.gfa")" "absent"
+  same "$o: run status kept" "$(exists "$WORK/$o.run_status.tsv")" "present"
+done
+for f in rounds memory origin_demand distance round_truth; do
+  same "interrupted run kept its partial $f table" "$(exists "$WORK/cut.$f.partial.tsv")" "present"
+done
 
 echo
 if [ "$fail" -ne 0 ]; then echo "repair-search gate FAILED"; exit 1; fi
