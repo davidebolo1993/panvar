@@ -776,6 +776,11 @@ int evaluate(const Args& args) {
                                  [](const auto& item) { return item.second != "READS"; })
                 << "\nphase_unsupported\t" << (phase_claimed ? "false" : "true") << '\n';
 
+        // The candidate-set diagnostics below read the run's candidate and score tables, which a run that
+        // emitted no genotype never writes: a fallback evaluation has no candidate set to describe.
+        if (use_fallback) {
+            summary << "candidate_set_diagnostics\tnot_applicable_to_a_fallback\n";
+        } else {
         // Truth in candidate set: some retained beam candidate spells both truth haplotypes.
         std::string truth_proposal_rank = "absent";
         std::string truth_sequence_candidate = "absent";
@@ -872,10 +877,12 @@ int evaluate(const Args& args) {
                 << "\nclosest_candidate_total_score_gap_to_winner\t"
                 << score_of.at(winner_sequence) - score_of.at(closest) << std::setprecision(6)
                 << "\nwinner_excess_over_floor\t" << unordered_total - floor_total << '\n';
+        }
     } else {
         summary << "accuracy\texcluded: run status is not COMPLETE\n";
     }
-    std::cout << "evaluated " << scheme << " " << donor << " K=" << status.at("max_mosaic_candidates") << '\n';
+    std::cout << "evaluated " << scheme << " " << donor << " K="
+              << (status.count("max_mosaic_candidates") ? status.at("max_mosaic_candidates") : std::string("NA")) << '\n';
     return 0;
 }
 

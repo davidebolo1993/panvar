@@ -262,6 +262,9 @@ def call_command(job, build, threads):
 
 def evaluate(job, build, fallback=None):
     prefix = job["out_prefix"]
+    # Which evaluator measured this job: a later evaluator re-measures it before consolidation.
+    with open(prefix + (".fallback" if fallback else ".eval") + ".evaluator", "w") as stamp:
+        stamp.write(sha256(build / "genotype_probe") + "\n")
     out = prefix + (".fallback" if fallback else ".eval")
     cmd = [build / "genotype_probe", "evaluate", "--scheme", job["scheme"], "--donor", job["donor_label"],
            "--reference", REFERENCE, "--run-prefix", prefix, "--model-gfa", job["model_gfa"],
@@ -270,7 +273,12 @@ def evaluate(job, build, fallback=None):
         cmd += ["--panel-curation", job["curation"]]
     if fallback:
         cmd += ["--fallback-alleles", fallback]
-    return run(cmd, prefix + ".evaluate.log")
+    code = run(cmd, prefix + ".evaluate.log")
+    # The evaluator stages two sorted graphs per call; they are intermediates, ~7 MB a job.
+    for staged in (out + ".model.sorted.gfa", out + ".truth.sorted.gfa"):
+        if os.path.exists(staged):
+            os.remove(staged)
+    return code
 
 
 def classify(job):
@@ -358,6 +366,8 @@ def run_job(job, build, threads):
     outcome, detail = classify(job)
     if outcome in ("failed", "pending", "defect"):
         return outcome, detail
+    if outcome == "no_call" and detail in ("footprint_limit", "time_limit"):
+        return outcome, detail   # the process was stopped: there is no model or call to evaluate
     if evaluate(job, build) != 0 or not os.path.exists(str(prefix) + ".eval.summary.tsv"):
         return "failed", "evaluation failed"
     if outcome == "no_call" and detail == "improving_move_tie":
@@ -424,14 +434,27 @@ def launch(args):
     profile_sha = sha256(PROFILE)
     binary = {"panvar": sha256(build / "panvar"), "genotype_probe": sha256(build / "genotype_probe")}
     launch_file = out / "launch.tsv"
-    fixed = {"panvar_sha256": binary["panvar"], "genotype_probe_sha256": binary["genotype_probe"],
-             "profile": str(PROFILE.relative_to(REPO)), "profile_sha256": profile_sha, "jobs": str(args.jobs),
-             "threads": str(args.threads), "jobs_sha256": settings["jobs_sha256"]}
+    # The production binary, the profile, the plan and the scheduler are fixed for the whole campaign. The
+    # EVALUATOR (genotype_probe) may be corrected between launches -- it never touches a call -- and every
+    # version is recorded; jobs it failed are retried, and jobs it measured are re-measured before the end.
+    fixed = {"panvar_sha256": binary["panvar"], "profile": str(PROFILE.relative_to(REPO)),
+             "profile_sha256": profile_sha, "jobs": str(args.jobs), "threads": str(args.threads),
+             "jobs_sha256": settings["jobs_sha256"]}
     previous = key_values(launch_file)
+    evaluator_changed = False
     if previous is not None:
         for key, value in fixed.items():
             if previous.get(key) != value:
                 raise Defect(f"resume refused: {key} was {previous.get(key)} at launch, now {value}")
+        history = [line.rstrip("\n").split("\t")[1] for line in open(launch_file)
+                   if line.startswith("evaluator_sha256\t")]
+        if binary["genotype_probe"] not in history:
+            evaluator_changed = True
+            with open(launch_file, "a") as handle:
+                handle.write(f"evaluator_sha256\t{binary['genotype_probe']}\nresumed_utc\t{now()}\n")
+        else:
+            with open(launch_file, "a") as handle:
+                handle.write(f"resumed_utc\t{now()}\n")
     else:
         commit = subprocess.run(["git", "-C", str(build.parent), "rev-parse", "HEAD"], capture_output=True,
                                 text=True).stdout.strip()
@@ -441,11 +464,18 @@ def launch(args):
             handle.write("key\tvalue\n")
             for key, value in fixed.items():
                 handle.write(f"{key}\t{value}\n")
+            handle.write(f"evaluator_sha256\t{binary['genotype_probe']}\n")
             handle.write(f"build\t{build}\nbuild_commit\t{commit}\nbuild_tree_dirty\t{'true' if dirty else 'false'}\n"
                          f"launched_utc\t{now()}\nhost_physical_memory_bytes\t"
                          f"{subprocess.run(['sysctl', '-n', 'hw.memsize'], capture_output=True, text=True).stdout.strip()}\n")
     inputs = Inputs(out)
     ledger = Ledger(out, jobs)
+    if evaluator_changed:
+        for row in ledger.rows.values():
+            if row["outcome"] == "failed" and "evaluation" in row.get("detail", ""):
+                row.update({"outcome": "pending", "attempts": "0",
+                            "detail": f"reset: failed only at evaluation, evaluator replaced {now()}"})
+        ledger.write()
     ensure_graph(out, inputs)
     if any(j["campaign"] == "mosaic" for j in jobs):
         prepare_mosaic(out, build, inputs, out / "mosaic_prepare.log")
@@ -507,6 +537,22 @@ def launch(args):
     print(f"[{now()}] all {len(jobs) - len(remaining)} of {len(jobs)} jobs accounted for", flush=True)
     if remaining:
         return 1
+    current = sha256(build / "genotype_probe")
+    for job in jobs:
+        row = ledger.rows[job["job"]]
+        for kind, fallback in (("eval", None), ("fallback", "union")):
+            stamp = pathlib.Path(job["out_prefix"] + f".{kind}.evaluator")
+            summary = pathlib.Path(job["out_prefix"] + f".{kind}.summary.tsv")
+            if not summary.exists():
+                continue   # never evaluated this way (a watchdog stop; or no fallback)
+            if stamp.exists() and stamp.read_text().strip() == current:
+                continue   # already measured by the final evaluator
+            if fallback:
+                status = key_values(job["out_prefix"] + ".mosaic_status.tsv")
+                fallback = f"{status.get('union_top_hap1')}|{status.get('union_top_hap2')}"
+            if evaluate(job, build, fallback) != 0:
+                raise Defect(f"{job['job']}: re-evaluation with the final evaluator failed")
+            print(f"[{now()}] {job['job']}: re-evaluated ({kind}) with the final evaluator", flush=True)
     if args.consolidate:
         return subprocess.run([sys.executable, str(REPO / "scripts" / "consolidate_c4_production.py"),
                                "--out", str(out)]).returncode
