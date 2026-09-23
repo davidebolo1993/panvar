@@ -1241,6 +1241,21 @@ struct DemandWindow {
     std::uint32_t rel_new_end = 0;
 };
 
+// Every thread doing scoring work -- placement, combination, window enumeration -- holds one slot of
+// this process-wide gauge while it works. The peak is how a gate proves the total never exceeds the
+// requested thread count, whichever stages run.
+std::size_t peak_active_workers();
+void reset_peak_active_workers();
+
+// Window enumeration split across the context's workers. The work counters and every result are the
+// one-thread values exactly; these are what parallelism added on top.
+struct ParallelEnumerationStats {
+    std::size_t workers = 1;                    // per enumeration: min(threads, fragments)
+    std::uint64_t parallel_enumerations = 0;
+    std::uint64_t duplicate_dps = 0;            // recursions two workers both ran for one new key
+    std::uint64_t duplicate_scan_bases = 0;     // window scanning repeated by workers 1..W-1
+};
+
 struct ContextMemoryAccount {
     std::uint64_t slots_total = 0;
     std::uint64_t slots_live = 0;
@@ -1378,6 +1393,9 @@ public:
     // MEASUREMENT ONLY. The recorded window with this key hash, if the demand ledger holds it; and one
     // window's enumeration timed with its fragments divided among `workers` contiguous ranges.
     DemandWindow demand_window(std::uint64_t key_hash) const;
+    ParallelEnumerationStats parallel_enumeration_stats() const;
+    // A digest of the latest window enumeration's origins and offsets, bit for bit. For gates only.
+    std::uint64_t last_window_digest() const;
     WindowEnumerationBench benchmark_window_enumeration(const std::string& bases, bool at_start, bool at_end,
                                                         std::size_t workers, std::size_t repeats);
     std::uint64_t origin_cache_slots() const;                     // entry slots, live or reusable

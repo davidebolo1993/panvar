@@ -1912,6 +1912,210 @@ void test_piece_screen_is_a_necessary_condition() {
               << consistency_only << " by offset consistency alone; screen == brute-force reference throughout\n";
 }
 
+// ---- window enumeration across workers ------------------------------------------------------------
+std::vector<std::uint64_t> work_fields(const panvar::BlockDeltaWork& w) {
+    // Every work and accounting field. Excluded: timings, and the three allocation-growth diagnostics,
+    // which count each worker's own scratch growth and so necessarily differ with the worker count.
+    return {w.origins_reused, w.origins_recomputed, w.local_window_bases, w.piece_hits, w.dp_executions,
+            w.cache_misses, w.cache_requests, w.cache_hits, w.census_payload_bytes_predicted,
+            w.census_payload_bytes_observed, w.local_window_payload_bytes, w.full_haplotype_bytes_materialised,
+            w.local_window_bytes_materialised, w.sequence_key_bytes, w.origin_cache_hits, w.origin_cache_misses,
+            w.origin_cache_stored, w.origin_cache_declined, w.origin_cache_not_selected, w.origin_group_reuses,
+            w.origin_cache_evicted, w.origin_cache_evicted_bytes, w.origin_cache_admitted_bytes,
+            w.origin_cache_declined_bytes, w.cached_origin_records_consumed, w.physical_origins_constructed,
+            w.fragments_reduced, w.fragments_copied, static_cast<std::uint64_t>(w.fell_back_to_full)};
+}
+
+struct ParallelTrace {
+    std::vector<double> values;           // masses, exposures and diplotype scores
+    std::vector<std::uint64_t> work;      // every field of every call, then the cumulative counters
+    std::vector<std::uint64_t> digests;   // the enumerated origins and offsets, bit for bit, per call
+};
+
+// Substitutions, insertions, deletions and empty alleles at interior, start and end windows; a round
+// against the seed, a promotion, a round against the winner, then one planned batch. `mode`: 0 the
+// stage-5 path, 1 the origin cache with room for everything, 2 a tight planned budget that evicts.
+ParallelTrace parallel_trace(const Locus& l, const std::vector<Repair>& repairs, std::size_t promote,
+                             std::size_t threads, int mode, std::size_t tight_budget,
+                             std::uint64_t max_origins = 0, std::uint64_t max_piece_hits = 0) {
+    panvar::FragmentScoringOptions opts = options();
+    opts.threads = threads;
+    if (max_origins != 0) opts.max_physical_origins = max_origins;
+    if (max_piece_hits != 0) opts.max_piece_hits = max_piece_hits;
+    panvar::PreparedScoringContext context(l.fragments, library(), opts);
+    context.begin_transient_round();
+    context.add_haplotypes({l.base});
+    context.retain_census(0);
+    if (mode != 0) {
+        context.enable_origin_cache_path(true);
+        context.set_origin_cache_limits(mode == 1 ? std::size_t{1} << 30 : tight_budget, 0);
+    }
+    ParallelTrace out;
+    const auto record = [&](std::size_t slot, const panvar::BlockDeltaWork& w) {
+        for (std::size_t f = 0; f < l.fragments.size(); ++f) out.values.push_back(context.mass_of(f, slot));
+        out.values.push_back(context.exposure_of(slot));
+        const std::vector<std::uint64_t> fields = work_fields(w);
+        out.work.insert(out.work.end(), fields.begin(), fields.end());
+        out.digests.push_back(context.last_window_digest());
+    };
+    std::vector<std::size_t> round_a;
+    for (const Repair& r : repairs) {
+        panvar::BlockDeltaWork w;
+        const std::size_t slot = context.add_repaired_haplotype(0, r.begin, r.end, r.allele, &w);
+        record(slot, w);
+        round_a.push_back(slot);
+    }
+    for (std::size_t i = 0; i + 1 < round_a.size(); i += 2) {
+        out.values.push_back(context.score_candidates({{round_a[i], round_a[i + 1]}}).scores[0].log_likelihood);
+    }
+    panvar::BlockDeltaWork promoted;
+    const Repair& chosen = repairs[promote];
+    const std::size_t winner = context.add_repaired_haplotype(0, chosen.begin, chosen.end, chosen.allele, &promoted, true);
+    record(winner, promoted);
+    context.release_transient({winner});
+    for (std::size_t i = 0; i < repairs.size(); ++i) {
+        if (i == promote) continue;
+        panvar::BlockDeltaWork w;
+        const std::size_t slot = context.add_repaired_haplotype(winner, repairs[i].begin, repairs[i].end, repairs[i].allele, &w);
+        record(slot, w);
+    }
+    context.release_transient({winner});
+    if (mode != 0) {
+        std::vector<panvar::RepairRequest> batch;
+        for (std::size_t i = 0; i < repairs.size(); ++i) {
+            if (i != promote) batch.push_back({winner, repairs[i].begin, repairs[i].end, repairs[i].allele});
+        }
+        std::vector<panvar::BlockDeltaWork> works;
+        const std::vector<std::size_t> slots = context.add_repaired_haplotypes(batch, &works);
+        for (std::size_t k = 0; k < slots.size(); ++k) record(slots[k], works[k]);
+        context.release_transient({winner});
+    }
+    const panvar::FragmentScoringCounters& c = context.cumulative_counters();
+    out.work.insert(out.work.end(), {c.candidate_bases_scanned, c.piece_hits, c.proposed_starts, c.unique_starts,
+                                     c.full_read_verifications, c.dp_evaluations, c.prefilter_rejections,
+                                     c.accepted_mate_placements, c.valid_fr_states, c.latent_alignment_pairs,
+                                     c.physical_origins, c.statistical_state_classes,
+                                     context.origin_records_consumed(), context.origin_cache_bytes(),
+                                     static_cast<std::uint64_t>(context.origin_cache_entries())});
+    return out;
+}
+
+void require_same_trace(const ParallelTrace& got, const ParallelTrace& want, const std::string& label) {
+    require(got.values.size() == want.values.size(), label + ": value counts differ");
+    for (std::size_t i = 0; i < want.values.size(); ++i) {
+        require_identical(got.values[i], want.values[i], label + ": value " + std::to_string(i));
+    }
+    require(got.work == want.work, label + ": a work or accounting counter differs");
+    require(got.digests == want.digests, label + ": enumerated origins or their order differ");
+}
+
+Locus tandem_locus(std::uint64_t seed) {
+    std::mt19937_64 rng(seed);
+    const std::string unit = random_bases(rng, 10);
+    Locus l;
+    l.base = random_bases(rng, 900);
+    for (int i = 0; i < 60; ++i) l.base += unit;
+    l.base += random_bases(rng, 900);
+    std::size_t n = 0;
+    for (std::size_t start = 0; start + 260 <= l.base.size(); start += 9) {
+        l.fragments.push_back(fragment_at(l.base, start, 260, 100, "t" + std::to_string(n++)));
+    }
+    return l;
+}
+
+void test_parallel_enumeration_is_exact() {
+    MultiBlock m = multi_block(5151);
+    std::mt19937_64 rng(5152);
+    for (const std::size_t b : {50u, 3000u, 5900u}) {   // empty alleles at start, interior and end blocks
+        m.repairs.push_back({b, std::min<std::size_t>(b + 40, m.locus.base.size()), std::string()});
+    }
+    const Locus t = tandem_locus(5153);
+    const std::vector<Repair> tandem_repairs = {
+        {1000, 1040, random_bases(rng, 40)}, {1100, 1140, random_bases(rng, 55)}, {1200, 1240, random_bases(rng, 12)},
+        {1300, 1340, std::string()}, {1000, 1040, t.base.substr(1010, 40)}};   // the last is a shifted copy
+    std::size_t traces = 0;
+    for (int mode = 0; mode <= 2; ++mode) {
+        using Fixture = std::pair<const Locus*, const std::vector<Repair>*>;
+        for (const Fixture& fixture : {Fixture{&m.locus, &m.repairs}, Fixture{&t, &tandem_repairs}}) {
+            const std::size_t promote = fixture.second == &m.repairs ? m.promote : 0;
+            const ParallelTrace one = parallel_trace(*fixture.first, *fixture.second, promote, 1, mode, 60000);
+            for (const std::size_t threads : {2u, 4u, 8u}) {
+                const ParallelTrace many = parallel_trace(*fixture.first, *fixture.second, promote, threads, mode, 60000);
+                require_same_trace(many, one, "mode " + std::to_string(mode) + ", " +
+                                                  (fixture.second == &m.repairs ? "multi-block" : "tandem") + ", " +
+                                                  std::to_string(threads) + " threads");
+                ++traces;
+            }
+        }
+    }
+    std::cout << "  ok: " << traces << " traces (stage 5, full cache, evicting cache x multi-block, tandem x "
+                 "2/4/8 threads) bit-identical to one thread: masses, exposures, scores, origins and order, "
+                 "every work and cache counter\n";
+}
+
+void test_parallel_caps_exact() {
+    const MultiBlock m = multi_block(6161);
+    const ParallelTrace reference = parallel_trace(m.locus, m.repairs, m.promote, 1, 0, 0);
+    // The cumulative physical origins and piece hits are the 11th and 2nd of the trailing counters.
+    const std::size_t tail = reference.work.size() - 15;
+    const std::uint64_t origins = reference.work[tail + 10];
+    const std::uint64_t piece_hits = reference.work[tail + 1];
+    for (const std::size_t threads : {1u, 2u, 4u, 8u}) {
+        const std::string at = std::to_string(threads) + " threads";
+        require_same_trace(parallel_trace(m.locus, m.repairs, m.promote, threads, 0, 0, origins, 0), reference,
+                           at + ", physical-origin cap exactly at the total");
+        require_same_trace(parallel_trace(m.locus, m.repairs, m.promote, threads, 0, 0, 0, piece_hits), reference,
+                           at + ", piece-hit cap exactly at the total");
+        for (const int which : {0, 1}) {
+            bool refused = false;
+            std::string message;
+            try {
+                (void)parallel_trace(m.locus, m.repairs, m.promote, threads, 0, 0, which == 0 ? origins - 1 : 0,
+                                     which == 1 ? piece_hits - 1 : 0);
+            } catch (const panvar::ResourceExhausted& e) {
+                refused = true;
+                message = e.what();
+            }
+            const std::string cap = which == 0 ? "physical-origin cap" : "piece-hit cap";
+            require(refused, at + ": one below the " + cap + " must refuse");
+            require(message.find(cap) != std::string::npos,
+                    at + ": the refusal must name the " + cap + ", not a cancellation: " + message);
+        }
+    }
+    std::cout << "  ok: 1/2/4/8 threads accept exactly at the physical-origin (" << origins << ") and piece-hit ("
+              << piece_hits << ") totals, identically, and refuse one below naming the crossed cap\n";
+}
+
+void test_active_workers_never_exceed_threads() {
+    const MultiBlock m = multi_block(7171);
+    for (const std::size_t threads : {1u, 2u, 4u, 8u}) {
+        panvar::reset_peak_active_workers();
+        panvar::FragmentScoringOptions opts = options();
+        opts.threads = threads;
+        panvar::PreparedScoringContext context(m.locus.fragments, library(), opts);
+        context.begin_transient_round();
+        std::vector<std::string> seeds{m.locus.base};
+        for (int v = 0; v < 5; ++v) {   // several haplotypes, so placement runs in parallel too
+            std::string other = m.locus.base;
+            other[700 + 900 * v] = other[700 + 900 * v] == 'A' ? 'C' : 'A';
+            seeds.push_back(other);
+        }
+        const std::vector<std::size_t> slots = context.add_haplotypes(seeds);   // placement stage
+        context.retain_census(slots[0]);
+        std::vector<panvar::HaplotypeCandidate> pairs;
+        for (const Repair& r : m.repairs) {                                     // enumeration stage
+            pairs.push_back({slots[0], context.add_repaired_haplotype(slots[0], r.begin, r.end, r.allele)});
+        }
+        (void)context.score_candidates(pairs);                                  // combination stage
+        const std::size_t peak = panvar::peak_active_workers();
+        require(peak <= threads, std::to_string(threads) + " threads requested but " + std::to_string(peak) +
+                                     " workers were active at once");
+        if (threads > 1) require(peak >= 2, std::to_string(threads) + " threads: no stage ran in parallel");
+        std::cout << "  ok: --threads " << threads << ": peak " << peak
+                  << " active workers across placement, enumeration and combination\n";
+    }
+}
+
 void test_cumulative_caps_through_the_delta() {
     const Locus l = locus(99, {400});
     std::mt19937_64 rng(11);
@@ -2005,6 +2209,12 @@ int main() {
         test_batch_retention_is_order_independent();
         std::cout << "== piece screen: a necessary condition, with offset consistency ==\n";
         test_piece_screen_is_a_necessary_condition();
+        std::cout << "== window enumeration across workers: bit-identical to one thread ==\n";
+        test_parallel_enumeration_is_exact();
+        std::cout << "== window enumeration across workers: caps exact at 1/2/4/8 threads ==\n";
+        test_parallel_caps_exact();
+        std::cout << "== active workers never exceed --threads ==\n";
+        test_active_workers_never_exceed_threads();
         std::cout << "== stage 6: origin path versus stage 5 (self-checked) ==\n";
         test_origin_path_matches_stage5();
         std::cout << "== stage 6: disabled, full and undersized origin caches ==\n";

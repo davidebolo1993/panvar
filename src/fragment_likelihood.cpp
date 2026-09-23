@@ -17,6 +17,7 @@
 #include <cmath>
 #include <cstring>
 #include <mutex>
+#include <condition_variable>
 #include <stdexcept>
 #include <unordered_map>
 
@@ -393,6 +394,27 @@ EmissionWork& emission_work() {
     return work;
 }
 
+// The process-wide worker gauge. A thread holds a slot for exactly as long as it does scoring work.
+std::atomic<std::size_t>& active_worker_count() {
+    static std::atomic<std::size_t> count{0};
+    return count;
+}
+std::atomic<std::size_t>& active_worker_peak() {
+    static std::atomic<std::size_t> peak{0};
+    return peak;
+}
+struct ActiveWorker {
+    ActiveWorker() {
+        const std::size_t now = active_worker_count().fetch_add(1, std::memory_order_relaxed) + 1;
+        std::size_t peak = active_worker_peak().load(std::memory_order_relaxed);
+        while (now > peak && !active_worker_peak().compare_exchange_weak(peak, now, std::memory_order_relaxed)) {
+        }
+    }
+    ~ActiveWorker() { active_worker_count().fetch_sub(1, std::memory_order_relaxed); }
+    ActiveWorker(const ActiveWorker&) = delete;
+    ActiveWorker& operator=(const ActiveWorker&) = delete;
+};
+
 // MEASUREMENT ONLY: per-thread time inside the feasibility prefilter and inside gapped_emission. Off
 // unless enabled; when off the prefilter pays one relaxed load.
 struct EmissionTimingDiag {
@@ -664,6 +686,50 @@ void store_content(CacheShard& shard, const KeyView& key, ArenaEntry& entry) {
 
 enum class CacheProbe { Disabled, Miss, HitAccepted, HitRefusedAfterRecursion };
 
+bool same_key(const KeyView& a, const KeyView& b) {
+    return a.h0 == b.h0 && a.h1 == b.h1 && a.read_length == b.read_length &&
+           a.window_length == b.window_length && std::memcmp(a.read, b.read, a.read_length) == 0 &&
+           std::memcmp(a.window, b.window, a.window_length) == 0;
+}
+
+// A parallel window enumeration freezes the shared emission cache: workers only read it. A key that
+// misses there is resolved from the worker's own earlier result, or computed and recorded; after the
+// join the caller replays every record in single-thread order, inserting into the shared cache exactly
+// where one thread would have. That keeps hits, misses, executed recursions and retention decisions
+// the one-thread values, whatever the schedule.
+struct DeferredEmissions {
+    struct Record {
+        KeyView key;
+        bool refused = false;
+        GappedFit fit;
+    };
+    std::vector<Record> records;   // every shared-cache miss, in this worker's request order
+    std::unordered_multimap<std::uint64_t, std::size_t> first_of;   // h0 -> first computing record
+    const Record* find(const KeyView& key) const {
+        const auto range = first_of.equal_range(key.h0);
+        for (auto it = range.first; it != range.second; ++it) {
+            if (same_key(records[it->second].key, key)) return &records[it->second];
+        }
+        return nullptr;
+    }
+    void add(const KeyView& key, bool refused, const GappedFit* fit) {
+        Record record;
+        record.key = key;
+        record.refused = refused;
+        if (fit != nullptr) record.fit = *fit;
+        first_of.emplace(key.h0, records.size());
+        records.push_back(std::move(record));
+    }
+    void clear() {
+        records.clear();
+        first_of.clear();
+    }
+};
+DeferredEmissions*& deferred_emissions() {
+    static thread_local DeferredEmissions* deferred = nullptr;
+    return deferred;
+}
+
 // The hit path: one mutex, one probe chain, one memcmp pair, and a component copy into a buffer the
 // caller already owns. No allocation.
 CacheProbe cache_lookup(const KeyView& key, GappedFit* out, EmissionWork& work) {
@@ -733,6 +799,13 @@ bool insert_entry(const KeyView& key, const CacheValue& value, std::size_t extra
     cache.entries.fetch_add(1, std::memory_order_relaxed);
     cache.payload_bytes.fetch_add(bytes, std::memory_order_relaxed);
     return true;
+}
+
+bool cache_contains(const KeyView& key) {
+    EmissionCache& cache = emission_cache();
+    CacheShard& shard = cache.shards[key.h0 % kCacheShards];
+    const std::lock_guard<std::mutex> guard(shard.guard);
+    return find_occupied_slot(shard, key) != kNoSlot;
 }
 
 void cache_store_refusal(const KeyView& key, CacheOutcome outcome) {
@@ -1419,6 +1492,17 @@ std::optional<GappedFit> gapped_emission(
             default:
                 break;
         }
+        if (DeferredEmissions* deferred = deferred_emissions(); deferred != nullptr) {
+            if (const DeferredEmissions::Record* earlier = deferred->find(key)) {
+                DeferredEmissions::Record repeat;
+                repeat.key = key;
+                repeat.refused = earlier->refused;
+                repeat.fit = earlier->fit;
+                deferred->records.push_back(repeat);
+                if (repeat.refused) return std::nullopt;
+                return repeat.fit;
+            }
+        }
     }
 
     ++work.executed_dps;
@@ -1432,7 +1516,13 @@ std::optional<GappedFit> gapped_emission(
         // The recursion RAN and found nothing. That is still work a cache would avoid, so it counts
         // against the DP stream rather than the prefilter's -- and it is retained as a refusal,
         // because recomputing it costs a whole recursion.
-        if (caching) cache_store_refusal(key, CacheOutcome::RefusedAfterRecursion);
+        if (caching) {
+            if (DeferredEmissions* deferred = deferred_emissions(); deferred != nullptr) {
+                deferred->add(key, true, nullptr);
+            } else {
+                cache_store_refusal(key, CacheOutcome::RefusedAfterRecursion);
+            }
+        }
         census_record(read, haplotype.data() + start, window, true, sizeof(double));
         return std::nullopt;
     }
@@ -1455,7 +1545,13 @@ std::optional<GappedFit> gapped_emission(
     census_record(read, haplotype.data() + start, window, true,
                   3 * sizeof(double) + fit.components.size() * (2 * sizeof(std::size_t) +
                                                                 sizeof(double)));
-    if (caching) cache_store_fit(key, fit);
+    if (caching) {
+        if (DeferredEmissions* deferred = deferred_emissions(); deferred != nullptr) {
+            deferred->add(key, false, &fit);
+        } else {
+            cache_store_fit(key, fit);
+        }
+    }
     return fit;
 }
 
@@ -3113,6 +3209,7 @@ std::size_t run_placement(
             ? 1
             : std::max<std::size_t>(1, std::min(requested_threads, span_count));
     if (threads <= 1) {
+        const ActiveWorker active;
         place_haplotype_range(in, first_h, last_h, budget, mass_column, counters, memory, cache_work,
                               origins_out, census_out);
         return threads;
@@ -3128,6 +3225,7 @@ std::size_t run_placement(
         const std::size_t lo = std::min(first_h + t * span, last_h);
         const std::size_t hi = std::min(lo + span, last_h);
         workers.emplace_back([&, t, lo, hi]() {
+            const ActiveWorker active;
             try {
                 place_haplotype_range(in, lo, hi, budget, mass_column, local[t], local_memory[t],
                                       local_cache[t], origins_out, census_out);
@@ -3479,19 +3577,27 @@ void enumerate_window_origins(
     const std::vector<PieceIndex>* forward_indexes = nullptr,
     const std::vector<PieceIndex>* reverse_indexes = nullptr,
     std::size_t fragment_begin = 0,
-    std::size_t fragment_end = std::numeric_limits<std::size_t>::max()) {
+    std::size_t fragment_end = std::numeric_limits<std::size_t>::max(),
+    // Proposed starts of the forward and the reverse pass, for the exact post-merge cap check.
+    std::uint64_t* proposed_by_pass = nullptr) {
     const auto form_slot = [](std::size_t fragment, std::size_t arm) { return fragment * 2 + arm; };
     scratch.ensure_rows(prepared.forward_forms.size(), prepared.reverse_forms.size());
     scratch.clear_touched();
 
+    const std::uint64_t proposed_at_start = counters.proposed_starts;
     collect_form_placements(window.bases, prepared.forward_forms, prepared.forward_componentise,
                             forward_indexes != nullptr ? *forward_indexes : prepared.forward_indexes,
                             budget, band, library, scratch.forward_rows,
                             scratch.proposed, counters, cache_work, options, &scratch.touched_forward);
+    const std::uint64_t proposed_after_forward = counters.proposed_starts;
     collect_form_placements(window.reversed, prepared.reverse_forms, prepared.reverse_componentise,
                             reverse_indexes != nullptr ? *reverse_indexes : prepared.reverse_indexes,
                             budget, band, library, scratch.reverse_rows,
                             scratch.proposed, counters, cache_work, options, &scratch.touched_reverse);
+    if (proposed_by_pass != nullptr) {
+        proposed_by_pass[0] = proposed_after_forward - proposed_at_start;
+        proposed_by_pass[1] = counters.proposed_starts - proposed_after_forward;
+    }
     const std::size_t last_fragment = std::min(fragment_end, fragments.size());
 
     const std::size_t width = window.bases.size();
@@ -3814,6 +3920,7 @@ FragmentScoringResult score_diplotypes(
         static_cast<std::uint64_t>(candidates.size()) * static_cast<std::uint64_t>(fragments.size());
 
     if (combination_threads <= 1) {
+        const ActiveWorker active;
         combine_range(0, candidates.size());
     } else {
         const std::size_t span = (candidates.size() + combination_threads - 1) / combination_threads;
@@ -3824,6 +3931,7 @@ FragmentScoringResult score_diplotypes(
             const std::size_t begin = std::min(t * span, candidates.size());
             const std::size_t end = std::min(begin + span, candidates.size());
             workers.emplace_back([&, t, begin, end]() {
+                const ActiveWorker active;
                 try {
                     combine_range(begin, end);
                 } catch (...) {
@@ -3885,6 +3993,80 @@ FragmentScoringResult score_diplotypes(
 // ---------------------------------------------------------------------------------------------
 // PreparedScoringContext
 // ---------------------------------------------------------------------------------------------
+
+// A persistent pool for window enumeration: size-1 background threads, and the caller as worker 0.
+// Created once per context, so no window pays for thread creation. Only one stage uses it at a time --
+// the caller is blocked in run() while it works -- so it never runs beside placement or combination.
+class EnumerationPool {
+public:
+    explicit EnumerationPool(std::size_t size) : size_(size) {
+        for (std::size_t w = 1; w < size_; ++w) threads_.emplace_back([this, w]() { serve(w); });
+    }
+    ~EnumerationPool() {
+        {
+            const std::lock_guard<std::mutex> lock(mutex_);
+            stop_ = true;
+        }
+        start_.notify_all();
+        for (std::thread& thread : threads_) thread.join();
+    }
+    EnumerationPool(const EnumerationPool&) = delete;
+    EnumerationPool& operator=(const EnumerationPool&) = delete;
+    std::size_t size() const { return size_; }
+    // task(w) for w in [0, count); count <= size(). Tasks must not throw: callers capture.
+    void run(std::size_t count, const std::function<void(std::size_t)>& task) {
+        {
+            const std::lock_guard<std::mutex> lock(mutex_);
+            task_ = &task;
+            count_ = count;
+            pending_ = count > 0 ? count - 1 : 0;
+            ++generation_;
+        }
+        start_.notify_all();
+        if (count > 0) {
+            const ActiveWorker active;
+            task(0);
+        }
+        std::unique_lock<std::mutex> lock(mutex_);
+        done_.wait(lock, [this]() { return pending_ == 0; });
+        task_ = nullptr;
+    }
+
+private:
+    void serve(std::size_t w) {
+        std::uint64_t seen = 0;
+        for (;;) {
+            const std::function<void(std::size_t)>* task = nullptr;
+            {
+                std::unique_lock<std::mutex> lock(mutex_);
+                start_.wait(lock, [&]() { return stop_ || generation_ != seen; });
+                if (stop_) return;
+                seen = generation_;
+                if (w >= count_) continue;
+                task = task_;
+            }
+            {
+                const ActiveWorker active;
+                (*task)(w);
+            }
+            {
+                const std::lock_guard<std::mutex> lock(mutex_);
+                --pending_;
+            }
+            done_.notify_one();
+        }
+    }
+    std::size_t size_ = 1;
+    std::vector<std::thread> threads_;
+    std::mutex mutex_;
+    std::condition_variable start_;
+    std::condition_variable done_;
+    const std::function<void(std::size_t)>* task_ = nullptr;
+    std::size_t count_ = 0;
+    std::size_t pending_ = 0;
+    std::uint64_t generation_ = 0;
+    bool stop_ = false;
+};
 
 struct PreparedScoringContext::State {
     std::vector<ReadPair> fragments;
@@ -3984,6 +4166,30 @@ struct PreparedScoringContext::State {
     std::vector<std::size_t> free_slots;
     std::size_t slots_created = 0;
 
+    // ---- window enumeration across workers. Declared after the scratch and caches it writes into.
+    struct EnumerationPartition {
+        std::size_t begin = 0;
+        std::size_t end = 0;
+        std::vector<PieceIndex> forward;
+        std::vector<PieceIndex> reverse;
+        WindowScratch scratch;
+    };
+    std::vector<EnumerationPartition> partitions;
+    std::unique_ptr<EnumerationPool> pool;
+    ParallelEnumerationStats parallel_stats;
+
+    std::size_t enumeration_workers() const {
+        return std::max<std::size_t>(1, std::min(options.threads, fragments.size()));
+    }
+
+    // Every production window enumeration goes through here. One worker: the reference function
+    // itself, untouched. Several: contiguous fragment ranges, each with its own piece indexes, scratch
+    // and counters, merged in ascending fragment order into `out` -- the same origins, offsets and work
+    // counters one thread produces.
+    void enumerate_window(const LocalWindow& window, PlacementBudget& shared_budget,
+                          FragmentScoringCounters& counters, EmissionCacheCounters& cache_work,
+                          WindowScratch& out);
+
     // A slot for a new repair: a released one if any, else a new one. A reused slot's column is reset
     // to -inf, which is what a fresh slot starts at and what stage 5 relies on for a fragment with no
     // states. Its sequence strings are already empty (released), its census, segment and hash entry
@@ -4048,6 +4254,173 @@ struct PreparedScoringContext::State {
         }
     }
 };
+
+void PreparedScoringContext::State::enumerate_window(const LocalWindow& window, PlacementBudget& shared_budget,
+                                                     FragmentScoringCounters& counters,
+                                                     EmissionCacheCounters& cache_work, WindowScratch& out) {
+    const std::size_t workers = enumeration_workers();
+    const std::size_t band = options.mismatch_band;
+    parallel_stats.workers = workers;
+    if (workers <= 1) {
+        const ActiveWorker active;
+        enumerate_window_origins(prepared, fragments, library, options, band, window, shared_budget, counters,
+                                 cache_work, out);
+        return;
+    }
+    const std::size_t n = fragments.size();
+    if (partitions.size() != workers) {
+        partitions.clear();
+        partitions.resize(workers);
+        const auto restrict = [&](const std::vector<PieceIndex>& all, const std::deque<ReadForm>& forms,
+                                  std::size_t begin, std::size_t end) {
+            std::vector<PieceIndex> part;
+            for (const PieceIndex& index : all) {
+                PieceIndex sub;
+                sub.piece_bp = index.piece_bp;
+                for (const PieceEntry& entry : index.entries) {
+                    const std::size_t fragment = forms[entry.form].fragment;
+                    if (fragment >= begin && fragment < end) sub.entries.push_back(entry);
+                }
+                part.push_back(std::move(sub));
+            }
+            return part;
+        };
+        for (std::size_t w = 0; w < workers; ++w) {
+            EnumerationPartition& p = partitions[w];
+            p.begin = n * w / workers;
+            p.end = n * (w + 1) / workers;
+            p.forward = restrict(prepared.forward_indexes, prepared.forward_forms, p.begin, p.end);
+            p.reverse = restrict(prepared.reverse_indexes, prepared.reverse_forms, p.begin, p.end);
+        }
+    }
+    if (!pool || pool->size() != workers) pool = std::make_unique<EnumerationPool>(workers);
+
+    struct Outcome {
+        FragmentScoringCounters counters;
+        EmissionCacheCounters cache;
+        std::uint64_t proposed[2] = {0, 0};
+        DeferredEmissions deferred;
+        std::exception_ptr failure;
+        bool refusal = false;
+    };
+    std::vector<Outcome> outcomes(workers);
+    const bool caching = emission_cache().active.load(std::memory_order_relaxed);
+    pool->run(workers, [&](std::size_t w) {
+        EnumerationPartition& p = partitions[w];
+        Outcome& o = outcomes[w];
+        deferred_emissions() = caching ? &o.deferred : nullptr;
+        try {
+            enumerate_window_origins(prepared, fragments, library, options, band, window, shared_budget,
+                                     o.counters, o.cache, p.scratch, &p.forward, &p.reverse, p.begin, p.end,
+                                     o.proposed);
+        } catch (const PlacementCancelled&) {
+            // Another worker crossed a cap; its refusal is the one reported.
+        } catch (const ResourceExhausted&) {
+            o.refusal = true;
+            o.failure = std::current_exception();
+        } catch (...) {
+            o.failure = std::current_exception();
+        }
+        deferred_emissions() = nullptr;
+    });
+    // The worker that crossed a cap is reported, never a cancellation it caused.
+    for (const Outcome& o : outcomes) {
+        if (o.refusal) std::rethrow_exception(o.failure);
+    }
+    for (const Outcome& o : outcomes) {
+        if (o.failure) std::rethrow_exception(o.failure);
+    }
+    if (shared_budget.stop()) {
+        throw std::logic_error("a window enumeration was cancelled without a refusal");
+    }
+    // The per-haplotype proposed-start cap bounds one PASS over the window; each worker saw only its
+    // share, so it is decided exactly here, on the merged totals.
+    for (int pass = 0; pass < 2; ++pass) {
+        std::uint64_t proposed = 0;
+        for (const Outcome& o : outcomes) proposed += o.proposed[pass];
+        if (proposed > options.max_proposed_starts_per_haplotype) {
+            shared_budget.cancel();
+            throw ResourceExhausted(
+                "fragment scoring reached its per-haplotype proposed-start cap; no partial ranking is "
+                "returned");
+        }
+    }
+    // Origins and offsets, in ascending fragment order.
+    out.origins.clear();
+    out.offsets.assign(n + 1, 0);
+    for (std::size_t w = 0; w < workers; ++w) {
+        const EnumerationPartition& p = partitions[w];
+        for (std::size_t f = p.begin; f < p.end; ++f) {
+            out.offsets[f] = out.origins.size();
+            out.origins.insert(out.origins.end(),
+                               p.scratch.origins.begin() + static_cast<std::ptrdiff_t>(p.scratch.offsets[f]),
+                               p.scratch.origins.begin() + static_cast<std::ptrdiff_t>(p.scratch.offsets[f + 1]));
+        }
+    }
+    out.offsets[n] = out.origins.size();
+    // Work counters: sums, except the window scan every worker repeats -- counted once.
+    for (std::size_t w = 0; w < workers; ++w) {
+        const FragmentScoringCounters& c = outcomes[w].counters;
+        if (w == 0) {
+            counters.candidate_bases_scanned += c.candidate_bases_scanned;
+        } else {
+            parallel_stats.duplicate_scan_bases += c.candidate_bases_scanned;
+        }
+        counters.piece_hits += c.piece_hits;
+        counters.proposed_starts += c.proposed_starts;
+        counters.unique_starts += c.unique_starts;
+        counters.full_read_verifications += c.full_read_verifications;
+        counters.dp_evaluations += c.dp_evaluations;
+        counters.prefilter_rejections += c.prefilter_rejections;
+        counters.accepted_mate_placements += c.accepted_mate_placements;
+        counters.valid_fr_states += c.valid_fr_states;
+        counters.latent_alignment_pairs += c.latent_alignment_pairs;
+        counters.physical_origins += c.physical_origins;
+        counters.statistical_state_classes += c.statistical_state_classes;
+    }
+    // The emission cache, replayed in one thread's order: the forward pass of every range, then the
+    // reverse pass of every range. A request the frozen cache already answered is a hit either way.
+    std::uint64_t shared_hits = 0;
+    std::uint64_t executed = 0;
+    for (const Outcome& o : outcomes) {
+        cache_work.executed_prefilters += o.cache.executed_prefilters;
+        cache_work.dp_cache_requests += o.cache.dp_cache_requests;
+        shared_hits += o.cache.dp_cache_hits;
+        executed += o.cache.executed_dps;
+    }
+    std::uint64_t replay_hits = 0;
+    std::uint64_t replay_misses = 0;
+    if (caching) {
+        const char* forward_begin = window.bases.data();
+        const char* forward_end = forward_begin + window.bases.size();
+        for (int pass = 0; pass < 2; ++pass) {
+            for (const Outcome& o : outcomes) {
+                for (const DeferredEmissions::Record& record : o.deferred.records) {
+                    const bool forward = record.key.window >= forward_begin && record.key.window < forward_end;
+                    if (forward != (pass == 0)) continue;
+                    if (cache_contains(record.key)) {
+                        ++replay_hits;
+                        continue;
+                    }
+                    ++replay_misses;
+                    if (record.refused) {
+                        cache_store_refusal(record.key, CacheOutcome::RefusedAfterRecursion);
+                    } else {
+                        cache_store_fit(record.key, record.fit);
+                    }
+                }
+            }
+        }
+        cache_work.dp_cache_hits += shared_hits + replay_hits;
+        cache_work.dp_cache_misses += replay_misses;
+        cache_work.executed_dps += replay_misses;
+        parallel_stats.duplicate_dps += executed - replay_misses;
+    } else {
+        cache_work.dp_cache_hits += shared_hits;
+        cache_work.executed_dps += executed;
+    }
+    ++parallel_stats.parallel_enumerations;
+}
 
 PreparedScoringContext::PreparedScoringContext(std::vector<ReadPair> fragments,
                                                LibraryModel library,
@@ -4288,6 +4661,7 @@ FragmentScoringResult PreparedScoringContext::score_candidates(
     result.candidate_fragment_evaluations =
         static_cast<std::uint64_t>(candidates.size()) * static_cast<std::uint64_t>(fragments.size());
     if (threads <= 1) {
+        const ActiveWorker active;
         combine_range(0, candidates.size());
     } else {
         const std::size_t span = (candidates.size() + threads - 1) / threads;
@@ -4298,6 +4672,7 @@ FragmentScoringResult PreparedScoringContext::score_candidates(
             const std::size_t begin = std::min(t * span, candidates.size());
             const std::size_t end = std::min(begin + span, candidates.size());
             workers.emplace_back([&, t, begin, end]() {
+                const ActiveWorker active;
                 try {
                     combine_range(begin, end);
                 } catch (...) {
@@ -4862,6 +5237,35 @@ WindowEnumerationBench PreparedScoringContext::benchmark_window_enumeration(cons
     return out;
 }
 
+std::size_t peak_active_workers() { return active_worker_peak().load(std::memory_order_relaxed); }
+
+void reset_peak_active_workers() {
+    active_worker_peak().store(active_worker_count().load(std::memory_order_relaxed), std::memory_order_relaxed);
+}
+
+ParallelEnumerationStats PreparedScoringContext::parallel_enumeration_stats() const {
+    ParallelEnumerationStats out = state_->parallel_stats;
+    out.workers = state_->enumeration_workers();
+    return out;
+}
+
+std::uint64_t PreparedScoringContext::last_window_digest() const {
+    const WindowScratch& w = state_->window_scratch;
+    std::uint64_t h = 1469598103934665603ULL;
+    const auto mix = [&h](const void* data, std::size_t bytes) {
+        const unsigned char* p = static_cast<const unsigned char*>(data);
+        for (std::size_t i = 0; i < bytes; ++i) h = (h ^ p[i]) * 1099511628211ULL;
+    };
+    for (const HaploidOrigin& o : w.origins) {
+        mix(&o.forward_start, sizeof(o.forward_start));
+        mix(&o.insert_bp, sizeof(o.insert_bp));
+        mix(&o.orientation, sizeof(o.orientation));
+        mix(&o.log_latent_mass, sizeof(o.log_latent_mass));
+    }
+    for (const std::size_t offset : w.offsets) mix(&offset, sizeof(offset));
+    return h;
+}
+
 std::vector<std::size_t> PreparedScoringContext::census_slots() const {
     std::vector<std::size_t> out;
     for (const auto& item : state_->censuses) out.push_back(item.first);
@@ -5375,9 +5779,7 @@ std::size_t PreparedScoringContext::add_repaired_haplotype(
             const bool size_known_before = demand->misses != 0;
             const auto miss_mark = Clock::now();
             try {
-                enumerate_window_origins(state.prepared, state.fragments, state.library,
-                                         state.options, state.options.mismatch_band, window,
-                                         state.budget, counters, cache_work, state.window_scratch);
+                state.enumerate_window(window, state.budget, counters, cache_work, state.window_scratch);
             } catch (const ResourceExhausted&) {
                 state.refused = true;
                 throw;
@@ -5877,9 +6279,7 @@ std::size_t PreparedScoringContext::add_repaired_haplotype(
     const std::uint64_t origins_before = state.window_scratch.origin_growths;
     const auto origins_mark = std::chrono::steady_clock::now();
     try {
-        enumerate_window_origins(state.prepared, state.fragments, state.library, state.options,
-                                 state.options.mismatch_band, window, state.budget, counters,
-                                 cache_work, state.window_scratch);
+        state.enumerate_window(window, state.budget, counters, cache_work, state.window_scratch);
     } catch (const ResourceExhausted&) {
         state.refused = true;
         throw;

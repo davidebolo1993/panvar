@@ -3434,6 +3434,7 @@ int repair_search(const Args& args) {
     const std::uint64_t request_order_seed = std::stoull(args.get("request-order-seed", "0"));
     // MEASUREMENT ONLY: evaluate the necessary-condition piece screen in shadow on every verification
     // (it rejects nothing), and export named recorded windows for the enumeration benchmark.
+    panvar::reset_peak_active_workers();
     const bool piece_screen_shadow = args.get("piece-screen-shadow", "0") != "0";
     if (piece_screen_shadow) panvar::set_piece_screen_shadow(true);
     std::vector<std::pair<std::string, std::uint64_t>> export_windows;
@@ -4849,6 +4850,16 @@ int repair_search(const Args& args) {
     if (context && use_origin_cache) demand_rows = context->origin_demand();
     summary << demand_report(demand_rows);
     summary << "phys_footprint_peak_bytes\t" << physical_footprint().peak << '\n';
+    // Threads: what was requested, what the window enumeration split into, and the most workers that
+    // were ever active at once across every stage -- which may never exceed the request.
+    summary << "threads_requested\t" << scoring.threads << "\npeak_active_workers\t"
+            << panvar::peak_active_workers() << '\n';
+    if (context) {
+        const panvar::ParallelEnumerationStats p = context->parallel_enumeration_stats();
+        summary << "enumeration_workers\t" << p.workers << "\nparallel_enumerations\t" << p.parallel_enumerations
+                << "\nparallel_duplicate_dps\t" << p.duplicate_dps << "\nparallel_duplicate_scan_bases\t"
+                << p.duplicate_scan_bases << '\n';
+    }
 
     // ---- completion. Truth, if any, is loaded first (a committed round usually loaded it already);
     // then every final file is written under the commit lock, so a watchdog can neither interleave
