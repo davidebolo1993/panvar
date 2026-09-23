@@ -1,0 +1,16 @@
+# Production timings of `panvar genotype --profile profiles/genotype_c4.tsv` on an Apple M4 (4 performance +
+# 6 efficiency cores), one call at a time, 8 threads; measured at b754647 (30x, 10x) and b754647+record (5x, 2x),
+# which differ only in a status key. Read by tests/genotype_production_c4_campaign.sh plan for its estimate.
+#   seconds_per_job   30x: mean of NA20509 LOO 442.1, NA19240 LOO 360.4, NA20509 LZO 309.4, bridgeable 384.1
+#                     10x: NA20509 LOO 125.4; 5x: NA20509 LOO 70.5
+#                     2x: NA20509 LOO 26.3 -- a LOWER BOUND: that run stopped after one round on a tie among
+#                     improving neighbours (REPAIR_INCOMPLETE), so a converged 2x call would take longer
+#   bytes_per_job     the call's outputs plus that job's regenerated reads (the per-donor LOO graph, ~3.4 MB,
+#                     is shared across a donor's coverages and is not included)
+#   peak_footprint    the largest measured at that coverage; 30x is NA20509 LOO 2569194208, and NA19240 LOO
+#                     30x refused at the 2684354560 limit in one run and peaked at 2438105848 in another
+coverage	seconds_per_job	bytes_per_job	peak_footprint_bytes
+2	26.3	4700000	616399784
+5	70.5	6200000	961823896
+10	125.4	8700000	1156482536
+30	374.0	18400000	2684635872

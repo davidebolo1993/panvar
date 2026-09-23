@@ -588,6 +588,19 @@ local artifact and is not tracked in git. Regenerate with `scripts/consolidate_c
 
 ## Current blockers
 
+- **The 2.5 GiB footprint limit is marginal at 30x in one process** (production campaign launch blocker).
+  The union pass leaves allocator-retained pages that the repair then carries; how many varies run to
+  run. NA19240 LOO 30x refused in repair round 3 at 2,684,635,872 bytes in one run and peaked at
+  2,438,105,848 in another, with identical scores (repair start 1.55 GB against 1.15 GB); NA20509 LOO 30x
+  peaked at 2,569,194,208. `malloc_zone_pressure_relief` returned nothing. The live accounted data is
+  about 1.4 GB. Options are Sol's: a higher profile limit, the union and the repair in separate
+  processes, or a smaller union emission cache.
+- **At 2x a tie among improving neighbours stops the repair** (production campaign launch blocker).
+  NA20509 LOO 2x: round 1's best neighbours tie with each other 36 nats above the panel anchor, the
+  search cannot choose between them, and the frozen rule fails closed with `REPAIR_INCOMPLETE`. At low
+  coverage few fragments link neighbouring blocks, so equal-scoring phase alternatives of the best move
+  are likely common. Whether a tie among genotype-equivalent improving moves may be followed is Sol's
+  decision; the rule is unchanged.
 - ACOT 30x cannot complete under the frozen cap without a lower-complexity placement algorithm.
 - Dense-switch mosaics need beam diversity work (distinct diplotype prefixes rather than many
   template-level states representing one prefix), not a larger width. Now measured rather than

@@ -1,0 +1,14 @@
+# The five C4 production regressions of panel-anchored adaptive completion, through the real command
+# `panvar genotype --profile profiles/genotype_c4.tsv`, run serially from a clean detached worktree at b754647
+# (tests/genotype_production_c4_regressions.sh). Expected values: the 9a0f4c0 multi-start evidence restricted
+# to the production pool. na19240_30 refused at the 2.5 GiB footprint limit in that run (RESOURCE_REFUSAL,
+# repair round 3, 2684635872 bytes, rounds 1-2 identical to the recorded branch); its row below is the rerun
+# (same inputs, same scores), which peaked at 2438105848 bytes. The footprint differs by ~0.4 GB between runs
+# of one input: the process entered the repair at 1.55 GB in the refused run and 1.15 GB in the passing one.
+# Full suite at b754647: 30/30 (2 disabled by configuration). Repair-search gate 72 ok; multi-start gate 40 ok.
+case	status	anchor	rounds	moves	stop	repaired_blocks	score	final_decision	top_set	phase_support	candidate_scope	final_candidate_scope	genotype_separation_gap	same_genotype_fragment_identical	same_genotype_prior_gap	winner_source	winner_candidate	distance	floor	excess	blocks_exact	blocks	pool_identities	pool_repair_only	pool_score_mismatches	trajectory	wall_seconds	seconds_union_scoring	seconds_repair	peak_rss_bytes	peak_phys_footprint_bytes
+na20509_10	COMPLETE	329	7	6	no_improvement	ctx:2,ctx:6,sv:7,sv:1,ctx:0,ctx:10	-151090.979646	UNIQUE	1	PRIOR_ONLY	CONDITIONAL	CONDITIONAL	0.66807541204616427	true	8.0689510539520057	repair	8908	114	91	23	4	11	12501	4117	0	identical	125.36	81.297	40.146	1474740224	1156482536
+na20509_30	COMPLETE	280	9	8	no_improvement	sv:7,ctx:2,ctx:6,ctx:0,ctx:10,sv:3,sv:1,ctx:8	-414918.317265	UNIQUE	1	PRIOR_ONLY	CONDITIONAL	CONDITIONAL	4.4026270815520547	true	7.6592302385645183	repair	10603	113	91	22	4	11	13669	5285	0	identical	442.09	246.304	191.537	2501672960	2569194208
+na20509_lzo_30	COMPLETE	8461	1	0	no_improvement	none	-409264.331248	UNIQUE	1	PRIOR_ONLY	CONDITIONAL	CONDITIONAL	21.934394265059382	true	17.545802057205137	panel	8461	0	0	0	11	11	9260	617	0	identical	309.38	242.732	62.380	2770649088	1967934008
+bridgeable_30	COMPLETE	5356	3	2	no_improvement	sv:3,ctx:4	-405132.712785	UNIQUE	1	PRIOR_ONLY	CONDITIONAL	CONDITIONAL	22.460448165482376	false	7.6696251779992792	mosaic	8515	0	0	0	11	11	10442	1799	0	identical	384.14	272.896	106.897	2927493120	2277378784
+na19240_30	COMPLETE	7793	4	3	no_improvement	sv:1,ctx:2,ctx:6	-426151.472546	UNIQUE	1	PRIOR_ONLY	CONDITIONAL	CONDITIONAL	7.6718618028680794	true	17.300661488449098	repair	9206	4	4	0	8	11	10877	2364	0	identical	360.42	252.054	103.589	2620817408	2438105848

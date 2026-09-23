@@ -125,10 +125,12 @@ plan() {
       FNR==NR { if ($1 != "coverage" && $1 !~ /^#/) { wall[$1]=$2; disk[$1]=$3; fp[$1]=$4 } next }
       FNR>1 { count[$4]++ }
       END {
-        print "coverage\tjobs\tseconds_per_job\tbytes_per_job\tpeak_footprint_bytes_per_job\tserial_hours\tbytes_total"
         for (c in count) { printf "%s\t%d\t%s\t%s\t%s\t%.2f\t%.0f\n", c, count[c], wall[c], disk[c], fp[c], count[c]*wall[c]/3600, count[c]*disk[c]; h+=count[c]*wall[c]; b+=count[c]*disk[c] }
         printf "all\t%d\tNA\tNA\tNA\t%.2f\t%.0f\n", FNR-1, h/3600, b
-      }' "$TIMING" "$jobs" | sort -t$'\t' -k1,1n > "$out/estimate.tsv"
+      }' "$TIMING" "$jobs" | sort -t$'\t' -k1,1n > "$out/estimate.body"
+    { printf "coverage\tjobs\tseconds_per_job\tbytes_per_job\tpeak_footprint_bytes_per_job\tserial_hours\tbytes_total\n"
+      grep -v '^all' "$out/estimate.body"; grep '^all' "$out/estimate.body"; } > "$out/estimate.tsv"
+    rm -f "$out/estimate.body"
   fi
   echo "planned $n jobs under $out (not launched)"
   [ -f "$out/estimate.tsv" ] && column -t -s$'\t' "$out/estimate.tsv"

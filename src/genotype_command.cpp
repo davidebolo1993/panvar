@@ -424,6 +424,7 @@ struct RepairReport {
     std::string same_genotype_fragment_identical = "NA";
     std::string haplotype_representation = "none";
     FragmentScoringCounters cumulative;
+    std::uint64_t footprint_at_repair_start = 0;
     std::uint64_t origin_cache_bytes_end = 0;
     std::size_t enumeration_workers = 0;
     double seconds = 0.0;
@@ -471,6 +472,7 @@ void write_repair_report(std::ostream& out, const RepairReport& r) {
     out << "haplotype_representation\t" << r.haplotype_representation << '\n';
     // The pool is a local search from one anchor: never an exhaustive search of genotype space.
     out << "search_globally_exhaustive\tfalse\nconditional_gq_calibration\tuncalibrated\n";
+    out << "resources_footprint_at_repair_start_bytes\t" << r.footprint_at_repair_start << '\n';
     out << "repair_cumulative_physical_origins\t" << r.cumulative.physical_origins
         << "\nrepair_margin_physical_origins\t" << margin(o.repair_max_physical_origins, r.cumulative.physical_origins)
         << "\nrepair_cumulative_state_classes\t" << r.cumulative.statistical_state_classes
@@ -1792,6 +1794,10 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
         // The union pass's mass matrix is not needed again; release it before the repair context exists.
         std::vector<double>().swap(scored.log_mass);
         std::vector<OriginSummary>().swap(scored.origin_summary);
+        // What the process carries into the repair. The union pass leaves allocator-retained pages behind,
+        // and how many varies run to run: NA19240 30x entered the repair at 1.55 GB in one run and 1.15 GB
+        // in another, with the same scores. Recorded so a footprint refusal can be attributed.
+        report.footprint_at_repair_start = physical_footprint().current;
 
         // ---- 3. the exact coordinate repair from the anchor
         FragmentScoringOptions repair_scoring = scoring_options;
