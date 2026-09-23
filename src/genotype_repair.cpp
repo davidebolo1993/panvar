@@ -1,0 +1,1209 @@
+#include "panvar/genotype_repair.hpp"
+
+#include "panvar/genotype_command.hpp"
+#include "panvar/ls_hmm.hpp"
+#include "panvar/mosaic_spelling.hpp"
+
+#include <sys/resource.h>
+#if defined(__APPLE__)
+#include <mach/mach.h>
+#include <malloc/malloc.h>
+#endif
+#include <unistd.h>
+
+#include <algorithm>
+#include <array>
+#include <chrono>
+#include <cmath>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <iomanip>
+#include <limits>
+#include <optional>
+#include <random>
+#include <sstream>
+#include <stdexcept>
+
+namespace panvar {
+
+// ---- process resources ------------------------------------------------------------------------
+
+std::uint64_t current_rss_bytes() {
+#if defined(__APPLE__)
+    mach_task_basic_info_data_t info{};
+    mach_msg_type_number_t count = MACH_TASK_BASIC_INFO_COUNT;
+    if (task_info(mach_task_self(), MACH_TASK_BASIC_INFO, reinterpret_cast<task_info_t>(&info),
+                  &count) != KERN_SUCCESS) {
+        return 0;
+    }
+    return info.resident_size;
+#else
+    std::ifstream statm("/proc/self/statm");
+    std::uint64_t size = 0;
+    std::uint64_t resident = 0;
+    statm >> size >> resident;
+    return resident * static_cast<std::uint64_t>(sysconf(_SC_PAGESIZE));
+#endif
+}
+
+std::uint64_t release_free_pages() {
+#if defined(__APPLE__)
+    return static_cast<std::uint64_t>(malloc_zone_pressure_relief(nullptr, 0));
+#else
+    return 0;
+#endif
+}
+
+FootprintSample physical_footprint() {
+    FootprintSample sample;
+#if defined(__APPLE__)
+    task_vm_info_data_t info{};
+    mach_msg_type_number_t count = TASK_VM_INFO_COUNT;
+    if (task_info(mach_task_self(), TASK_VM_INFO, reinterpret_cast<task_info_t>(&info), &count) !=
+        KERN_SUCCESS) {
+        return sample;
+    }
+    if (count >= TASK_VM_INFO_REV1_COUNT) sample.current = info.phys_footprint;
+    if (count >= TASK_VM_INFO_REV3_COUNT && info.ledger_phys_footprint_peak > 0) {
+        sample.peak = static_cast<std::uint64_t>(info.ledger_phys_footprint_peak);
+    }
+#endif
+    return sample;
+}
+
+void atomic_write(const std::string& path, const std::string& content) {
+    const std::string staging = path + ".writing";
+    {
+        std::ofstream file(staging, std::ios::binary | std::ios::trunc);
+        if (!file) throw std::runtime_error("cannot write " + staging);
+        file << content;
+        file.flush();
+        if (!file) throw std::runtime_error("short write to " + staging);
+    }
+    std::filesystem::rename(staging, path);
+}
+
+double peak_rss_gib() {
+    rusage usage{};
+    getrusage(RUSAGE_SELF, &usage);
+#if defined(__APPLE__)
+    return static_cast<double>(usage.ru_maxrss) / (1024.0 * 1024.0 * 1024.0);   // Darwin reports bytes
+#else
+    return static_cast<double>(usage.ru_maxrss) / (1024.0 * 1024.0);            // Linux reports KiB
+#endif
+}
+
+namespace {
+
+// FIPS 180-4 SHA-256, streaming. Provenance of inputs only; nothing statistical depends on it.
+class Sha256 {
+public:
+    void update(const unsigned char* data, std::size_t size) {
+        for (std::size_t i = 0; i < size; ++i) {
+            block_[used_++] = data[i];
+            if (used_ == 64) {
+                compress();
+                used_ = 0;
+            }
+        }
+        bits_ += static_cast<std::uint64_t>(size) * 8;
+    }
+    std::string hex() {
+        const std::uint64_t bits = bits_;
+        const unsigned char pad = 0x80;
+        update(&pad, 1);
+        const unsigned char zero = 0;
+        while (used_ != 56) update(&zero, 1);
+        unsigned char length[8];
+        for (int i = 0; i < 8; ++i) length[i] = static_cast<unsigned char>(bits >> (56 - 8 * i));
+        update(length, 8);
+        std::ostringstream out;
+        for (const std::uint32_t word : state_) out << std::hex << std::setw(8) << std::setfill('0') << word;
+        return out.str();
+    }
+
+private:
+    static std::uint32_t rotr(std::uint32_t x, int n) { return (x >> n) | (x << (32 - n)); }
+    void compress() {
+        static const std::uint32_t k[64] = {
+            0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+            0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+            0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+            0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+            0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+            0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+            0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+            0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2};
+        std::uint32_t w[64];
+        for (int i = 0; i < 16; ++i) {
+            w[i] = (static_cast<std::uint32_t>(block_[4 * i]) << 24) |
+                   (static_cast<std::uint32_t>(block_[4 * i + 1]) << 16) |
+                   (static_cast<std::uint32_t>(block_[4 * i + 2]) << 8) | static_cast<std::uint32_t>(block_[4 * i + 3]);
+        }
+        for (int i = 16; i < 64; ++i) {
+            const std::uint32_t s0 = rotr(w[i - 15], 7) ^ rotr(w[i - 15], 18) ^ (w[i - 15] >> 3);
+            const std::uint32_t s1 = rotr(w[i - 2], 17) ^ rotr(w[i - 2], 19) ^ (w[i - 2] >> 10);
+            w[i] = w[i - 16] + s0 + w[i - 7] + s1;
+        }
+        std::uint32_t a = state_[0], b = state_[1], c = state_[2], d = state_[3];
+        std::uint32_t e = state_[4], f = state_[5], g = state_[6], h = state_[7];
+        for (int i = 0; i < 64; ++i) {
+            const std::uint32_t s1 = rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25);
+            const std::uint32_t ch = (e & f) ^ (~e & g);
+            const std::uint32_t t1 = h + s1 + ch + k[i] + w[i];
+            const std::uint32_t s0 = rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22);
+            const std::uint32_t maj = (a & b) ^ (a & c) ^ (b & c);
+            const std::uint32_t t2 = s0 + maj;
+            h = g; g = f; f = e; e = d + t1; d = c; c = b; b = a; a = t1 + t2;
+        }
+        state_[0] += a; state_[1] += b; state_[2] += c; state_[3] += d;
+        state_[4] += e; state_[5] += f; state_[6] += g; state_[7] += h;
+    }
+    std::array<std::uint32_t, 8> state_ = {0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
+                                           0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19};
+    unsigned char block_[64] = {};
+    std::size_t used_ = 0;
+    std::uint64_t bits_ = 0;
+};
+
+bool same_score(const DiplotypeScore& x, const DiplotypeScore& y) {
+    return std::memcmp(&x.log_likelihood, &y.log_likelihood, sizeof(double)) == 0 &&
+           std::memcmp(&x.fragment_term, &y.fragment_term, sizeof(double)) == 0 &&
+           std::memcmp(&x.exposure_term, &y.exposure_term, sizeof(double)) == 0 &&
+           std::memcmp(&x.absolute_term_sum, &y.absolute_term_sum, sizeof(double)) == 0 &&
+           x.fragments_with_mass == y.fragments_with_mass;
+}
+
+std::string join(const std::vector<std::size_t>& v) {
+    std::string text;
+    for (std::size_t i = 0; i < v.size(); ++i) {
+        if (i != 0) text += ',';
+        text += std::to_string(v[i]);
+    }
+    return text;
+}
+
+std::string margin(std::uint64_t cap_value, std::uint64_t used) {
+    if (cap_value == 0) return "none";
+    return std::to_string(static_cast<std::int64_t>(cap_value) - static_cast<std::int64_t>(used));
+}
+
+} // namespace
+
+std::string sha256_file(const std::string& path) {
+    std::ifstream file(path, std::ios::binary);
+    if (!file) throw std::runtime_error("cannot open for hashing: " + path);
+    Sha256 hash;
+    std::vector<char> buffer(1 << 20);
+    while (file) {
+        file.read(buffer.data(), static_cast<std::streamsize>(buffer.size()));
+        const std::streamsize got = file.gcount();
+        if (got > 0) hash.update(reinterpret_cast<const unsigned char*>(buffer.data()), static_cast<std::size_t>(got));
+    }
+    return hash.hex();
+}
+
+// ---- the search --------------------------------------------------------------------------------
+
+DiplotypeIdentity diplotype_identity(const std::vector<std::size_t>& a, const std::vector<std::size_t>& b) {
+    return a <= b ? std::make_pair(a, b) : std::make_pair(b, a);
+}
+
+std::uint64_t repair_neighbour_bound(const PreparedGenotypeModel& model, std::size_t local_pairs) {
+    std::uint64_t bound = 0;
+    for (std::size_t b = 0; b < model.blocks().size(); ++b) {
+        const std::uint64_t a = model.blocks()[b].alleles.size();
+        bound += std::min<std::uint64_t>(local_pairs, a * (a + 1) / 2) * 2;
+    }
+    return bound;
+}
+
+CoordinateRepairSearch::CoordinateRepairSearch(const PreparedGenotypeModel& model,
+                                               const PreparedProposalEmissions& emissions,
+                                               const std::vector<ReadPair>& fragments,
+                                               const LibraryModel& library,
+                                               const FragmentScoringOptions& scoring,
+                                               const RepairSearchOptions& options)
+    : model_(model), fragments_(fragments), library_(library), scoring_(scoring), options_(options) {
+    const std::size_t blocks = model.blocks().size();
+    if (blocks < 2) throw std::invalid_argument("the repair search needs at least two blocks");
+    if (emissions.blocks.size() != blocks) throw std::invalid_argument("one proposal emission per block");
+    switches_.assign(blocks - 1, options.switch_probability);
+    // The per-block local pairs, ranked once. Deterministic: emission descending, then indices.
+    local_.resize(blocks);
+    for (std::size_t b = 0; b < blocks; ++b) {
+        const BlockProposalEmissions& emission = emissions.blocks[b];
+        std::vector<std::pair<double, std::pair<std::size_t, std::size_t>>> ranked;
+        for (std::size_t x = 0; x < emission.allele_count; ++x) {
+            for (std::size_t y = x; y < emission.allele_count; ++y) ranked.push_back({emission.at(x, y), {x, y}});
+        }
+        std::sort(ranked.begin(), ranked.end(), [](const auto& lhs, const auto& rhs) {
+            if (lhs.first != rhs.first) return lhs.first > rhs.first;
+            return lhs.second < rhs.second;
+        });
+        const std::size_t take = std::min(options.local_pairs, ranked.size());
+        for (std::size_t r = 0; r < take; ++r) local_[b].push_back(ranked[r].second);
+    }
+    neighbour_bound_ = repair_neighbour_bound(model, options.local_pairs);
+    if (options_.mode != RepairScoringMode::OneShot) new_context();
+    memory_on_ = context_ != nullptr && options_.memory_log;
+    if (memory_on_) {
+        memory_text_ += "kind\tindex\tpoint\trss_current\trss_peak\trelief_freed\trss_after_relief\t"
+                        "slots_total\tslots_live\tslots_released\tslot_table\tsequence_bytes\t"
+                        "sequence_capacity\tsegment_bytes\tmass_bytes\tmass_capacity\tcensus_count\t"
+                        "census_bytes\tcensus_capacity\torigin_cache_entries\torigin_cache_payload\t"
+                        "origin_cache_capacity\tmerge_bytes\tmerge_capacity\twindow_scratch\t"
+                        "origin_scratch\temission_table\temission_arena\tprepared\tscoring_result\t"
+                        "logical_total\tcapacity_total\trss_minus_capacity\tphys_footprint\t"
+                        "phys_footprint_peak\torigin_demand\tcensus_slots\tcensus_roles\n";
+    }
+    hold_remaining_ = options_.hold_cycles;
+}
+
+CoordinateRepairSearch::~CoordinateRepairSearch() = default;
+
+void CoordinateRepairSearch::new_context() {
+    context_.reset();
+    context_ = std::make_unique<PreparedScoringContext>(fragments_, library_, scoring_);
+    if (options_.origin_cache) {
+        context_->enable_origin_cache_path(true);
+        context_->set_origin_cache_limits(options_.origin_cache_bytes, options_.origin_cache_records);
+    }
+    transient_opened_ = false;
+    seeding_origins_ = 0;   // seeding work is counted within one context
+}
+
+void CoordinateRepairSearch::open_transient_round() {
+    if (transient_opened_ || !context_) return;
+    context_->begin_transient_round();
+    transient_opened_ = true;
+}
+
+void CoordinateRepairSearch::start(const std::vector<std::size_t>& first, const std::vector<std::size_t>& second,
+                                   double total) {
+    const std::size_t blocks = model_.blocks().size();
+    if (first.size() != blocks || second.size() != blocks) {
+        throw std::invalid_argument("a repair start needs one allele per block on both haplotypes");
+    }
+    cur_first_ = first;
+    cur_second_ = second;
+    cur_total_ = total;
+    visited_.clear();
+    visited_.insert(diplotype_identity(first, second));
+    rounds_.clear();
+    stop_reason_ = "round_cap";
+    have_inc_slots_ = false;
+    role_of_.clear();
+    failed_round_ = 0;
+}
+
+void CoordinateRepairSearch::add_visited(const std::vector<std::size_t>& first, const std::vector<std::size_t>& second) {
+    visited_.insert(diplotype_identity(first, second));
+}
+
+bool CoordinateRepairSearch::converged() const {
+    if (stop_reason_ == "no_improvement" || stop_reason_ == "no_unvisited_neighbour") return true;
+    // A round tie with the incumbent inside the top set: nothing improves on it beyond error.
+    if (stop_reason_ == "rescore_incomplete" && !rounds_.empty()) return rounds_.back().incumbent_in_top_set;
+    return false;
+}
+
+void CoordinateRepairSearch::snapshot(const char* kind, std::size_t index, const char* point, bool result_alive,
+                                      bool relieve) {
+    if (!memory_on_) return;
+    const ContextMemoryAccount a = context_->memory_account();
+    const FootprintSample footprint = physical_footprint();
+    std::string slots_text;
+    std::string roles_text;
+    for (const std::size_t slot : context_->census_slots()) {
+        if (!slots_text.empty()) {
+            slots_text += ',';
+            roles_text += ',';
+        }
+        slots_text += std::to_string(slot);
+        const auto role = role_of_.find(slot);
+        roles_text += role == role_of_.end() ? std::string("unknown") : role->second;
+        if (slot == inc_slot_a_ || slot == inc_slot_b_) roles_text += "*";
+    }
+    const std::uint64_t rss = current_rss_bytes();
+    const std::uint64_t peak = static_cast<std::uint64_t>(peak_rss_gib() * 1073741824.0);
+    std::uint64_t freed = 0;
+    std::uint64_t after = rss;
+    if (relieve) {
+        freed = release_free_pages();
+        after = current_rss_bytes();
+    }
+    // The flattened result belongs to the caller: count it only while the caller still holds it.
+    const std::uint64_t result = result_alive ? a.last_scoring_result_bytes : 0;
+    const std::uint64_t logical = a.logical_total - a.last_scoring_result_bytes + result;
+    const std::uint64_t capacity = a.capacity_total - a.last_scoring_result_bytes + result;
+    std::ostringstream memory_log;
+    memory_log << kind << '\t' << index << '\t' << point << '\t' << rss << '\t' << peak << '\t' << freed << '\t'
+               << after << '\t' << a.slots_total << '\t' << a.slots_live << '\t' << a.slots_released << '\t'
+               << a.slot_table_bytes << '\t' << a.sequence_bytes << '\t' << a.sequence_capacity << '\t'
+               << a.segment_bytes << '\t' << a.mass_column_bytes << '\t' << a.mass_column_capacity << '\t'
+               << a.census_count << '\t' << a.census_bytes << '\t' << a.census_capacity << '\t'
+               << a.origin_cache_entries << '\t' << a.origin_cache_payload << '\t' << a.origin_cache_capacity
+               << '\t' << a.merge_working_bytes << '\t' << a.merge_working_capacity << '\t'
+               << a.window_scratch_capacity << '\t' << a.origin_scratch_capacity << '\t' << a.emission_cache_table
+               << '\t' << a.emission_cache_arena << '\t' << a.prepared_capacity << '\t' << result << '\t' << logical
+               << '\t' << capacity << '\t'
+               << (static_cast<std::int64_t>(rss) - static_cast<std::int64_t>(capacity)) << '\t'
+               << footprint.current << '\t' << footprint.peak << '\t' << a.origin_demand_bytes << '\t'
+               << (slots_text.empty() ? "-" : slots_text) << '\t' << (roles_text.empty() ? "-" : roles_text)
+               << '\n';
+    memory_text_ += memory_log.str();
+}
+
+bool CoordinateRepairSearch::run(const RepairHooks& hooks) {
+    const std::size_t blocks = model_.blocks().size();
+    const bool use_delta = options_.mode == RepairScoringMode::Delta;
+    const bool planned_cache = options_.planned_cache;
+    const std::uint64_t request_order_seed = options_.request_order_seed;
+    PreparedScoringContext* context = context_.get();
+    const std::size_t first_round = options_.first_round;
+    const std::size_t final_round = last_round();
+    const auto key_of = [](const std::vector<std::size_t>& a, const std::vector<std::size_t>& b) {
+        return diplotype_identity(a, b);
+    };
+
+    for (std::size_t round = first_round; round <= final_round; ++round) {
+        RepairRound rec;
+        rec.index = round;
+        const auto round_mark = std::chrono::steady_clock::now();
+        const char* kind = holding_ ? "hold" : round_kind_.c_str();
+        const std::size_t snapshot_index = holding_ ? hold_index_ : round;
+
+        // The incumbent, spelled once per round: its block_intervals are the coordinates every
+        // replacement below is expressed in.
+        const HaplotypeSequence incumbent_a = spell_mosaic(model_, MosaicPath{cur_first_});
+        const HaplotypeSequence incumbent_b = spell_mosaic(model_, MosaicPath{cur_second_});
+        if (use_delta && !have_inc_slots_) {
+            // The initial pass: place the incumbent in full, then mark everything after it
+            // transient. Owned cache keys mean a released haplotype's entries stay valid and keep
+            // serving. The transient round opens BEFORE the seed is added, so a seed haplotype is
+            // released like any other former incumbent: once a move replaces it nothing deltas from
+            // it again, and cycle prevention needs only its allele path, which the visited set holds.
+            open_transient_round();
+            const std::uint64_t seeding_before = context->cumulative_counters().physical_origins;
+            const std::vector<std::size_t> seeded = context->add_haplotypes({incumbent_a.bases, incumbent_b.bases});
+            inc_slot_a_ = seeded.front();
+            inc_slot_b_ = seeded.back();
+            role_of_[inc_slot_a_] = inc_slot_a_ == inc_slot_b_ ? "seed_hap1+2" : "seed_hap1";
+            if (inc_slot_b_ != inc_slot_a_) role_of_[inc_slot_b_] = "seed_hap2";
+            context->retain_census(inc_slot_a_);
+            context->retain_census(inc_slot_b_);
+            seeding_origins_ += context->cumulative_counters().physical_origins - seeding_before;
+            have_inc_slots_ = true;
+        }
+        if (use_delta) rec.transient_before = context->transient_payload_bytes();
+        snapshot(kind, snapshot_index, "before_candidates", false, false);
+        const double lookup_before = emission_cache_lookup_seconds();
+
+        // ---- neighbourhood construction. NO TRUTH IN SCOPE.
+        std::vector<MosaicPath> paths;
+        std::vector<std::string> sequences;
+        std::map<std::vector<std::size_t>, std::size_t> slot_of_path;
+        const auto slot_for = [&](const std::vector<std::size_t>& alleles) {
+            const auto found = slot_of_path.find(alleles);
+            if (found != slot_of_path.end()) return found->second;
+            const std::size_t slot = paths.size();
+            slot_of_path.emplace(alleles, slot);
+            paths.push_back(MosaicPath{alleles});
+            sequences.push_back(spell_mosaic(model_, MosaicPath{alleles}).bases);
+            return slot;
+        };
+        struct Neighbour {
+            std::size_t s1 = 0, s2 = 0, block = 0, rank = 0, x = 0, y = 0;
+            int assignment = 0;
+            std::vector<std::size_t> first, second;
+        };
+        // How each local haplotype relates to the incumbent. A neighbour differs from it at exactly
+        // one block on one side, which is precisely what the delta needs to be told.
+        struct Provenance {
+            bool is_incumbent = false;
+            int side = 0;            // 0: derived from the incumbent's first haplotype, 1: second
+            std::size_t block = 0;
+            std::size_t allele = 0;
+        };
+        std::vector<Provenance> provenance;
+        const auto slot_with = [&](const std::vector<std::size_t>& alleles, Provenance note) {
+            const std::size_t before = paths.size();
+            const std::size_t slot = slot_for(alleles);
+            if (paths.size() > before) {
+                provenance.resize(paths.size());
+                provenance[slot] = note;
+            }
+            return slot;
+        };
+        std::vector<Neighbour> neighbours;
+        std::set<DiplotypeIdentity> seen_round;
+        const std::size_t cur_s1 = slot_with(cur_first_, Provenance{true, 0, 0, 0});
+        const std::size_t cur_s2 = slot_with(cur_second_, Provenance{true, 1, 0, 0});
+        seen_round.insert(key_of(cur_first_, cur_second_));
+        for (std::size_t b = 0; b < blocks; ++b) {
+            for (std::size_t r = 0; r < local_[b].size(); ++r) {
+                const std::size_t x = local_[b][r].first;
+                const std::size_t y = local_[b][r].second;
+                for (int assignment = 0; assignment < 2; ++assignment) {
+                    if (assignment == 1 && x == y) continue;   // the swap is the same diplotype
+                    std::vector<std::size_t> first = cur_first_;
+                    std::vector<std::size_t> second = cur_second_;
+                    first[b] = assignment == 0 ? x : y;
+                    second[b] = assignment == 0 ? y : x;
+                    ++rec.generated;
+                    const auto key = key_of(first, second);
+                    if (key == key_of(cur_first_, cur_second_)) {
+                        ++rec.self_skipped;
+                        continue;
+                    }
+                    if (visited_.count(key) != 0) {
+                        ++rec.suppressed;
+                        continue;
+                    }
+                    if (!seen_round.insert(key).second) {
+                        ++rec.duplicate;
+                        continue;
+                    }
+                    const std::size_t s1 = slot_with(first, Provenance{false, 0, b, first[b]});
+                    const std::size_t s2 = slot_with(second, Provenance{false, 1, b, second[b]});
+                    const double prior = log_unordered_sequence_pair_prior(model_, sequences[s1], sequences[s2], switches_);
+                    if (!std::isfinite(prior)) {
+                        ++rec.rejected_prior;
+                        continue;
+                    }
+                    neighbours.push_back({s1, s2, b, r + 1, x, y, assignment, first, second});
+                }
+            }
+        }
+        rec.neighbours = neighbours.size();
+        if (request_order_seed != 0) {
+            std::mt19937_64 rng(request_order_seed * 1000003ULL + round);
+            std::shuffle(neighbours.begin(), neighbours.end(), rng);
+        }
+        if (neighbours.empty()) {
+            stop_reason_ = "no_unvisited_neighbour";
+            rounds_.push_back(rec);
+            break;
+        }
+
+        // ---- ONE scoring pass: the current candidate, then its neighbours
+        std::map<std::pair<std::size_t, std::size_t>, std::size_t> scored_index;
+        std::vector<HaplotypeCandidate> scored_pairs;
+        std::vector<std::size_t> pair_of_item;
+        std::vector<std::size_t> slot_of_local;
+        std::map<std::size_t, const std::string*> sequence_of_slot;
+        IncrementalBatchReport batch;
+        std::optional<InternedHaplotypes> interned;
+        BlockDeltaWork round_delta;
+        const auto accumulate = [&](const BlockDeltaWork& work) {
+            round_delta.origins_reused += work.origins_reused;
+            round_delta.origins_recomputed += work.origins_recomputed;
+            round_delta.local_window_bases += work.local_window_bases;
+            round_delta.piece_hits += work.piece_hits;
+            round_delta.dp_executions += work.dp_executions;
+            round_delta.cache_misses += work.cache_misses;
+            round_delta.cache_requests += work.cache_requests;
+            round_delta.cache_hits += work.cache_hits;
+            round_delta.full_haplotype_bytes_materialised += work.full_haplotype_bytes_materialised;
+            round_delta.local_window_bytes_materialised += work.local_window_bytes_materialised;
+            round_delta.sequence_key_bytes += work.sequence_key_bytes;
+            round_delta.seconds_placement_and_origins += work.seconds_placement_and_origins;
+            round_delta.seconds_statekey_merge += work.seconds_statekey_merge;
+            round_delta.seconds_hashing_and_windows += work.seconds_hashing_and_windows;
+            round_delta.placement_row_constructions += work.placement_row_constructions;
+            round_delta.accumulator_growths += work.accumulator_growths;
+            round_delta.origin_output_growths += work.origin_output_growths;
+            round_delta.origin_cache_hits += work.origin_cache_hits;
+            round_delta.origin_cache_misses += work.origin_cache_misses;
+            round_delta.origin_cache_stored += work.origin_cache_stored;
+            round_delta.origin_cache_declined += work.origin_cache_declined;
+            round_delta.origin_cache_not_selected += work.origin_cache_not_selected;
+            round_delta.origin_cache_admitted_bytes += work.origin_cache_admitted_bytes;
+            round_delta.origin_cache_declined_bytes += work.origin_cache_declined_bytes;
+            round_delta.seconds_reenumeration += work.seconds_reenumeration;
+            round_delta.cached_origin_records_consumed += work.cached_origin_records_consumed;
+            round_delta.physical_origins_constructed += work.physical_origins_constructed;
+            round_delta.fragments_reduced += work.fragments_reduced;
+            round_delta.fragments_copied += work.fragments_copied;
+            round_delta.seconds_enumeration += work.seconds_enumeration;
+            round_delta.seconds_affected_filter += work.seconds_affected_filter;
+            round_delta.seconds_aggregate_merge += work.seconds_aggregate_merge;
+            round_delta.seconds_reduce += work.seconds_reduce;
+            round_delta.seconds += work.seconds;
+            round_delta.origin_group_reuses += work.origin_group_reuses;
+            round_delta.origin_cache_evicted += work.origin_cache_evicted;
+            round_delta.origin_cache_evicted_bytes += work.origin_cache_evicted_bytes;
+        };
+        const auto resolve_by_delta = [&](std::size_t local, bool keep_census) {
+            const Provenance& note = provenance[local];
+            if (note.is_incumbent) return note.side == 0 ? inc_slot_a_ : inc_slot_b_;
+            const HaplotypeSequence& base = note.side == 0 ? incumbent_a : incumbent_b;
+            const std::size_t from = note.side == 0 ? inc_slot_a_ : inc_slot_b_;
+            const SequenceInterval span = base.block_intervals[note.block];
+            BlockDeltaWork work;
+            const std::size_t slot = context->add_repaired_haplotype(
+                from, span.begin, span.end, model_.blocks()[note.block].alleles[note.allele].sequence, &work,
+                keep_census);
+            accumulate(work);
+            return slot;
+        };
+
+        if (use_delta) {
+            provenance.resize(paths.size());
+            slot_of_local.resize(paths.size());
+            const std::size_t held_before = context->haplotypes_created();
+            if (planned_cache) {
+                // The round's repairs as ONE batch: the context plans them, then executes them in its
+                // canonical order, so how this loop enumerated them cannot matter.
+                std::vector<std::size_t> requested;
+                for (std::size_t i = 0; i < paths.size(); ++i) {
+                    const Provenance& note = provenance[i];
+                    if (note.is_incumbent) {
+                        slot_of_local[i] = note.side == 0 ? inc_slot_a_ : inc_slot_b_;
+                    } else {
+                        requested.push_back(i);
+                    }
+                }
+                if (request_order_seed != 0) {
+                    std::mt19937_64 rng(request_order_seed * 7919ULL + round);
+                    std::shuffle(requested.begin(), requested.end(), rng);
+                }
+                std::vector<RepairRequest> requests;
+                for (const std::size_t i : requested) {
+                    const Provenance& note = provenance[i];
+                    const HaplotypeSequence& base = note.side == 0 ? incumbent_a : incumbent_b;
+                    const SequenceInterval span = base.block_intervals[note.block];
+                    requests.push_back({note.side == 0 ? inc_slot_a_ : inc_slot_b_, span.begin, span.end,
+                                        model_.blocks()[note.block].alleles[note.allele].sequence});
+                }
+                std::vector<BlockDeltaWork> works;
+                OriginCachePlanReport plan;
+                const std::vector<std::size_t> slots = context->add_repaired_haplotypes(requests, &works, &plan);
+                for (std::size_t k = 0; k < requested.size(); ++k) {
+                    slot_of_local[requested[k]] = slots[k];
+                    accumulate(works[k]);
+                }
+                rec.plan_distinct = plan.distinct_windows;
+                rec.plan_known = plan.known_windows;
+                rec.plan_selected = plan.selected_entries;
+                rec.plan_selected_bytes = plan.selected_bytes;
+                rec.plan_retained = plan.retained_entries;
+                rec.plan_evicted = plan.evicted_entries;
+                rec.plan_evicted_bytes = plan.evicted_bytes;
+            } else {
+                for (std::size_t i = 0; i < paths.size(); ++i) slot_of_local[i] = resolve_by_delta(i, false);
+            }
+            for (std::size_t i = 0; i < sequences.size(); ++i) sequence_of_slot.emplace(slot_of_local[i], &sequences[i]);
+            rec.haps_new = context->haplotypes_created() - held_before;
+            rec.haps_reused = paths.size() - rec.haps_new;
+            rec.unique_haplotypes = context->haplotypes_created();
+        } else if (context) {
+            slot_of_local = context->add_haplotypes(sequences, &batch);
+            for (std::size_t i = 0; i < sequences.size(); ++i) sequence_of_slot.emplace(slot_of_local[i], &sequences[i]);
+            rec.haps_new = batch.haplotypes_new;
+            rec.haps_reused = batch.haplotypes_reused;
+            rec.unique_haplotypes = batch.unique_haplotypes_total;
+        } else {
+            interned.emplace(intern_haplotypes(paths, sequences));
+            slot_of_local = interned->index_of;
+            for (std::size_t i = 0; i < sequences.size(); ++i) {
+                sequence_of_slot.emplace(slot_of_local[i], &interned->sequences[slot_of_local[i]]);
+            }
+            rec.haps_new = interned->sequences.size();
+            rec.unique_haplotypes = interned->sequences.size();
+        }
+        const auto add_item = [&](std::size_t a, std::size_t b2) {
+            std::size_t x = slot_of_local[a];
+            std::size_t y = slot_of_local[b2];
+            if (y < x) std::swap(x, y);
+            const auto inserted = scored_index.emplace(std::make_pair(x, y), scored_pairs.size());
+            if (inserted.second) scored_pairs.push_back({x, y});
+            pair_of_item.push_back(inserted.first->second);
+        };
+        add_item(cur_s1, cur_s2);                                  // item 0 is always the incumbent
+        for (const Neighbour& n : neighbours) add_item(n.s1, n.s2);
+        rec.scored_pairs = scored_pairs.size();
+
+        const auto mark = std::chrono::steady_clock::now();
+        const FragmentScoringResult scored = context ? context->score_candidates(scored_pairs)
+                                                     : score_diplotypes(*interned, scored_pairs, fragments_, library_, scoring_);
+        rec.seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - mark).count();
+        if (context) rec.seconds += batch.seconds_placement_and_mass;
+        // The deltas ran while slots were being resolved, which is before `mark`.
+        if (use_delta) rec.seconds += round_delta.seconds;
+        snapshot(kind, snapshot_index, "after_scoring", true, false);
+        rec.rss = peak_rss_gib();
+        {
+            const FragmentScoringCounters& work = context ? batch.counters : scored.counters;
+            const EmissionCacheCounters& cache = context ? batch.emission_cache : scored.emission_cache;
+            rec.bases_scanned = work.candidate_bases_scanned;
+            rec.piece_hits = work.piece_hits;
+            rec.cache_requests = cache.dp_cache_requests;
+            rec.cache_hits = cache.dp_cache_hits;
+            rec.cache_misses = cache.dp_cache_misses;
+            rec.executed_dps = cache.executed_dps;
+            rec.physical_origins = work.physical_origins;
+            rec.state_classes = work.statistical_state_classes;
+            if (use_delta) {
+                rec.bases_scanned = round_delta.local_window_bases;
+                rec.piece_hits = round_delta.piece_hits;
+                rec.cache_misses = round_delta.cache_misses;
+                rec.cache_requests = round_delta.cache_requests;
+                rec.cache_hits = round_delta.cache_hits;
+                rec.executed_dps = round_delta.dp_executions;
+                rec.origins_reused = round_delta.origins_reused;
+                rec.origins_recomputed = round_delta.origins_recomputed;
+                rec.window_bases = round_delta.local_window_bases;
+                rec.full_bytes = round_delta.full_haplotype_bytes_materialised;
+                rec.window_bytes = round_delta.local_window_bytes_materialised;
+                rec.key_bytes = round_delta.sequence_key_bytes;
+                rec.seconds_origins = round_delta.seconds_placement_and_origins;
+                rec.seconds_merge = round_delta.seconds_statekey_merge;
+                rec.seconds_hashing = round_delta.seconds_hashing_and_windows;
+                rec.row_constructions = round_delta.placement_row_constructions;
+                rec.accumulator_growths = round_delta.accumulator_growths;
+                rec.origin_growths = round_delta.origin_output_growths;
+                rec.oc_hits = round_delta.origin_cache_hits;
+                rec.oc_misses = round_delta.origin_cache_misses;
+                rec.oc_stored = round_delta.origin_cache_stored;
+                rec.origins_constructed = round_delta.physical_origins_constructed;
+                rec.origins_loaded = round_delta.cached_origin_records_consumed;
+                rec.fragments_reduced = round_delta.fragments_reduced;
+                rec.fragments_copied = round_delta.fragments_copied;
+                rec.seconds_enumeration = round_delta.seconds_enumeration;
+                rec.seconds_filter = round_delta.seconds_affected_filter;
+                rec.seconds_aggregate = round_delta.seconds_aggregate_merge;
+                rec.seconds_reduce = round_delta.seconds_reduce;
+                rec.oc_entries = context->origin_cache_entries();
+                rec.oc_bytes = context->origin_cache_bytes();
+                rec.merge_working_bytes = context->merge_working_bytes();
+            }
+            rec.seconds_lookup = emission_cache_lookup_seconds() - lookup_before;
+            {
+                const EmissionCacheCounters live = read_emission_cache_counters();
+                rec.entry_metadata_bytes = live.entry_metadata_bytes;
+                rec.content_arena_bytes = live.content_arena_bytes;
+            }
+            rec.placement_seconds = use_delta ? round_delta.seconds
+                                              : (context ? batch.seconds_placement_and_mass
+                                                         : scored.seconds_placement_and_mass);
+            rec.combination_seconds = scored.seconds_diploid_combination;
+        }
+        if (!holding_) {
+            cumulative_seconds_ += rec.seconds;
+            cumulative_pairs_ += scored_pairs.size();
+        }
+
+        std::vector<double> prior_of_pair(scored_pairs.size(), 0.0);
+        for (std::size_t slot = 0; slot < scored_pairs.size(); ++slot) {
+            prior_of_pair[slot] = log_unordered_sequence_pair_prior(
+                model_, *sequence_of_slot.at(scored_pairs[slot].first), *sequence_of_slot.at(scored_pairs[slot].second),
+                switches_);
+        }
+
+        // ---- the guard: the incumbent must still score what it scored before any neighbour is read.
+        // Round 1 checks against the start's declared score, which is what ties the search to the
+        // ranking it continues rather than to one it produced itself.
+        const double incumbent = scored.scores[pair_of_item[0]].log_likelihood + prior_of_pair[pair_of_item[0]];
+        if (std::fabs(incumbent - cur_total_) > 1e-6) {
+            failed_round_ = round;
+            failed_expected_ = cur_total_;
+            failed_scored_ = incumbent;
+            stop_reason_ = "incumbent_not_reproduced";
+            return false;
+        }
+        // The scored value is the authoritative one; a declared start score is only an assertion about
+        // it, possibly through text at finite precision. Adopting it makes a resumed leg byte-identical.
+        cur_total_ = incumbent;
+        rec.start_total = incumbent;
+        if (hooks.on_scored && !holding_) {
+            for (std::size_t item = 0; item < pair_of_item.size(); ++item) {
+                const std::size_t at = pair_of_item[item];
+                const std::size_t s1 = item == 0 ? cur_s1 : neighbours[item - 1].s1;
+                const std::size_t s2 = item == 0 ? cur_s2 : neighbours[item - 1].s2;
+                hooks.on_scored(item == 0 ? cur_first_ : neighbours[item - 1].first,
+                                item == 0 ? cur_second_ : neighbours[item - 1].second, sequences[s1], sequences[s2],
+                                scored.scores[at], prior_of_pair[at]);
+            }
+        }
+
+        // ---- certify the round with production's own certifier, in presentation order
+        const auto certify = [&](bool reversed) {
+            std::vector<std::size_t> order(pair_of_item.size());
+            for (std::size_t i = 0; i < order.size(); ++i) order[i] = i;
+            if (reversed) std::reverse(order.begin(), order.end());
+            std::vector<DiplotypeScore> scores;
+            std::vector<double> priors;
+            std::vector<std::size_t> item_of_local;
+            std::set<std::size_t> taken;
+            for (const std::size_t i : order) {
+                const std::size_t slot = pair_of_item[i];
+                if (!taken.insert(slot).second) continue;
+                scores.push_back(scored.scores[slot]);
+                priors.push_back(prior_of_pair[slot]);
+                item_of_local.push_back(i);
+            }
+            const CertifiedRanking ranking = certify_scored_ranking(
+                scores, fragments_.size(), scoring_.mismatch_band, scored.counters, CertificationOptions{}, priors);
+            return std::make_pair(ranking, item_of_local);
+        };
+        const auto forward = certify(false);
+        const CertifiedRanking& ranking = forward.first;
+        const std::size_t winner_item = forward.second[ranking.candidates.front().candidate_id];
+        rec.complete = ranking.status == RescoreStatus::Complete;
+        rec.unique_best = ranking.winner_set.size() == 1;
+        rec.separation = ranking.certified_gap;
+        rec.incumbent_in_top_set = false;
+        for (const std::size_t id : ranking.winner_set) {
+            if (forward.second[id] == 0) rec.incumbent_in_top_set = true;
+        }
+
+        // Order invariance, from the scores already computed: no new likelihood call.
+        {
+            const auto back = certify(true);
+            const std::size_t back_item = back.second[back.first.candidates.front().candidate_id];
+            const auto alleles_of = [&](std::size_t item) {
+                if (item == 0) return std::minmax(cur_first_, cur_second_);
+                return std::minmax(neighbours[item - 1].first, neighbours[item - 1].second);
+            };
+            if (alleles_of(back_item) != alleles_of(winner_item) ||
+                back.first.candidates.front().score != ranking.candidates.front().score) {
+                rec.order_invariant = false;
+            }
+        }
+        // Homologue swap: rebuilding the neighbourhood with the incumbent's haplotypes exchanged must
+        // give the identical key set, because both assignments are generated for every local pair.
+        {
+            std::set<DiplotypeIdentity> swapped;
+            for (std::size_t b = 0; b < blocks; ++b) {
+                for (std::size_t r = 0; r < local_[b].size(); ++r) {
+                    const std::size_t x = local_[b][r].first;
+                    const std::size_t y = local_[b][r].second;
+                    for (int assignment = 0; assignment < 2; ++assignment) {
+                        if (assignment == 1 && x == y) continue;
+                        std::vector<std::size_t> first = cur_second_;   // homologues exchanged
+                        std::vector<std::size_t> second = cur_first_;
+                        first[b] = assignment == 0 ? x : y;
+                        second[b] = assignment == 0 ? y : x;
+                        swapped.insert(key_of(first, second));
+                    }
+                }
+            }
+            for (const Neighbour& n : neighbours) {
+                if (swapped.count(key_of(n.first, n.second)) == 0) rec.swap_invariant = false;
+            }
+        }
+
+        // ---- the move rule
+        if (winner_item != 0) {
+            const Neighbour& best = neighbours[winner_item - 1];
+            const std::size_t slot = pair_of_item[winner_item];
+            rec.block = best.block;
+            rec.rank = best.rank;
+            rec.assignment = best.assignment;
+            rec.allele_x = best.x;
+            rec.allele_y = best.y;
+            rec.first = best.first;
+            rec.second = best.second;
+            rec.fragment = scored.scores[slot].fragment_term;
+            rec.exposure = scored.scores[slot].exposure_term;
+            rec.prior = prior_of_pair[slot];
+            rec.total = scored.scores[slot].log_likelihood + prior_of_pair[slot];
+        } else {
+            rec.first = cur_first_;
+            rec.second = cur_second_;
+            const std::size_t slot = pair_of_item[0];
+            rec.fragment = scored.scores[slot].fragment_term;
+            rec.exposure = scored.scores[slot].exposure_term;
+            rec.prior = prior_of_pair[slot];
+            rec.total = incumbent;
+        }
+
+        if (!rec.complete) {
+            stop_reason_ = "rescore_incomplete";
+        } else if (winner_item == 0) {
+            stop_reason_ = "no_improvement";
+        } else if (!rec.unique_best) {
+            stop_reason_ = "tie_at_best";
+        } else if (rec.total <= cur_total_) {
+            stop_reason_ = "no_improvement";
+        } else if (visited_.count(key_of(rec.first, rec.second)) != 0) {
+            stop_reason_ = "cycle";                                  // suppression should preclude this
+        } else {
+            rec.moved = true;
+        }
+        if (use_delta) {
+            std::vector<std::size_t> keep;
+            if (rec.moved && winner_item != 0) {
+                const Neighbour& best = neighbours[winner_item - 1];
+                // A delta, not a full placement: the winner's census is built from the incumbent's.
+                const std::size_t won_a = resolve_by_delta(best.s1, true);
+                const std::size_t won_b = resolve_by_delta(best.s2, true);
+                keep = {won_a, won_b};
+                const std::string promoted = "promoted_r" + std::to_string(round);
+                if (won_a != inc_slot_a_ && won_a != inc_slot_b_) role_of_[won_a] = promoted + "_hap1";
+                if (won_b != inc_slot_a_ && won_b != inc_slot_b_ && won_b != won_a) role_of_[won_b] = promoted + "_hap2";
+                inc_slot_a_ = won_a;
+                inc_slot_b_ = won_b;
+            } else {
+                keep = {inc_slot_a_, inc_slot_b_};
+            }
+            snapshot(kind, snapshot_index, "after_promotion", true, false);
+            context->release_transient(keep);
+            for (auto it = role_of_.begin(); it != role_of_.end();) {
+                if (std::find(keep.begin(), keep.end(), it->first) == keep.end()) {
+                    it = role_of_.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+            rec.transient_after = context->transient_payload_bytes();
+            snapshot(kind, snapshot_index, "after_release", true,
+                     options_.pressure_relief && holding_ && hold_remaining_ == 0);
+            // Re-read AFTER the promotion: the one materialisation a round performs happens there.
+            rec.full_bytes = round_delta.full_haplotype_bytes_materialised;
+            rec.key_bytes = round_delta.sequence_key_bytes;
+            rec.seconds_origins = round_delta.seconds_placement_and_origins;
+            rec.seconds_merge = round_delta.seconds_statekey_merge;
+            rec.seconds_hashing = round_delta.seconds_hashing_and_windows;
+            rec.oc_hits_all = round_delta.origin_cache_hits;
+            rec.oc_misses_all = round_delta.origin_cache_misses;
+            rec.oc_admitted = round_delta.origin_cache_stored;
+            rec.oc_admitted_bytes = round_delta.origin_cache_admitted_bytes;
+            rec.oc_declined = round_delta.origin_cache_declined;
+            rec.oc_declined_bytes = round_delta.origin_cache_declined_bytes;
+            rec.oc_not_selected = round_delta.origin_cache_not_selected;
+            rec.oc_group_reuses = round_delta.origin_group_reuses;
+            rec.oc_evicted = round_delta.origin_cache_evicted;
+            rec.oc_evicted_bytes = round_delta.origin_cache_evicted_bytes;
+            rec.origins_constructed_all = round_delta.physical_origins_constructed;
+            rec.seconds_enumeration_all = round_delta.seconds_enumeration;
+            rec.seconds_reenumeration_all = round_delta.seconds_reenumeration;
+        }
+        if (context) {
+            const FragmentScoringCounters& cumulative = context->cumulative_counters();
+            rec.cum_piece_hits = cumulative.piece_hits;
+            rec.cum_physical_origins = cumulative.physical_origins;
+            rec.cum_state_classes = cumulative.statistical_state_classes;
+            rec.cum_latent_pairs = cumulative.latent_alignment_pairs;
+            rec.mass_cells = static_cast<std::uint64_t>(fragments_.size()) * context->unique_haplotypes();
+            rec.records_consumed = context->origin_records_consumed();
+            rec.census_count = context->census_slots().size();
+            rec.census_bytes = context->retained_census_bytes();
+            rec.oc_bytes_end = context->origin_cache_bytes();
+        }
+        {
+            const FootprintSample footprint = physical_footprint();
+            rec.phys_footprint = footprint.current;
+            rec.phys_footprint_peak = footprint.peak;
+            rec.rss_current = current_rss_bytes();
+        }
+        rec.round_wall_seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - round_mark).count();
+        if (!holding_) {
+            rounds_.push_back(rec);
+            if (hooks.on_round) hooks.on_round(rounds_.back());
+        }
+        if (!rec.moved) {
+            if (hold_remaining_ > 0) {
+                // Not a round: the counter does not advance, and nothing is recorded as one.
+                holding_ = true;
+                --hold_remaining_;
+                ++hold_index_;
+                --round;
+                continue;
+            }
+            break;
+        }
+        visited_.insert(key_of(rec.first, rec.second));
+        cur_first_ = rec.first;
+        cur_second_ = rec.second;
+        cur_total_ = rec.total;
+        if (round == final_round) stop_reason_ = "round_cap";
+    }
+    return true;
+}
+
+std::string CoordinateRepairSearch::render_rounds(const std::vector<RepairRound>& rounds) const {
+    const std::size_t final_round = last_round();
+    std::ostringstream table;
+    table << std::setprecision(12)
+          << "round\tstart_total\tmoved\trepaired_block\tlocal_pair_rank\tassignment\tallele_x\t"
+             "allele_y\thap1_alleles\thap2_alleles\tfragment_term\texposure_term\tprior\ttotal\t"
+             "delta_total\tstatus\tunique_best\tseparation\tneighbours_generated\tneighbours_scored\t"
+             "duplicate\tsuppressed_visited\tself_skipped\trejected_infinite_prior\t"
+             "unique_haplotypes\tscored_pairs\torder_invariant\tswap_invariant\tseconds\tpeak_rss_gib\t"
+             "haplotypes_new\thaplotypes_reused\tbases_scanned\tpiece_hits\tcache_requests\t"
+             "cache_hits\tcache_misses\texecuted_dps\tphysical_origins\tstate_classes\t"
+             "placement_seconds\tcombination_seconds\torigins_reused\torigins_recomputed\t"
+             "window_bases\ttransient_before\ttransient_after\tfull_haplotype_bytes\t"
+             "window_bytes\tsequence_key_bytes\tseconds_origins\tseconds_merge\t"
+             "seconds_hashing\tseconds_lookup\tentry_metadata_bytes\tcontent_arena_bytes\t"
+             "row_constructions\taccumulator_growths\torigin_growths\t"
+             "oc_hits\toc_misses\toc_stored\toc_entries\toc_bytes\torigins_constructed\t"
+             "origins_loaded\tfragments_reduced\tfragments_copied\tmerge_working_bytes\t"
+             "seconds_enumeration\tseconds_filter\tseconds_aggregate\tseconds_reduce\t"
+             "round_wall_seconds\toc_hits_all\toc_misses_all\toc_admitted\toc_admitted_bytes\t"
+             "oc_declined\toc_declined_bytes\torigins_constructed_all\tseconds_enumeration_all\t"
+             "seconds_reenumeration_all\tcum_piece_hits\tmargin_piece_hits\tcum_physical_origins\t"
+             "margin_physical_origins\tcum_state_classes\tmargin_state_classes\tcum_latent_pairs\t"
+             "margin_latent_pairs\tmass_cells\tmargin_mass_cells\tmargin_origin_cache_bytes\t"
+             "records_consumed\tmargin_records_consumed\tmargin_neighbours\tmargin_rounds\t"
+             "census_count\tcensus_bytes\tphys_footprint\tphys_footprint_peak\trss_current\t"
+             "plan_distinct_windows\tplan_known_windows\tplan_selected_entries\tplan_selected_bytes\t"
+             "plan_retained_entries\tplan_evicted_entries\tplan_evicted_bytes\toc_not_selected\t"
+             "oc_group_reuses\toc_evicted_in_round\toc_evicted_in_round_bytes\n";
+    for (const RepairRound& r : rounds) {
+        table << r.index << '\t' << r.start_total << '\t' << (r.moved ? "true" : "false") << '\t'
+              << (r.moved ? model_.blocks()[r.block].block_id : std::string("NA")) << '\t'
+              << (r.moved ? std::to_string(r.rank) : std::string("NA")) << '\t'
+              << (r.moved ? std::to_string(r.assignment) : std::string("NA")) << '\t'
+              << (r.moved ? std::to_string(r.allele_x) : std::string("NA")) << '\t'
+              << (r.moved ? std::to_string(r.allele_y) : std::string("NA")) << '\t' << join(r.first) << '\t'
+              << join(r.second) << '\t' << r.fragment << '\t' << r.exposure << '\t' << r.prior << '\t' << r.total
+              << '\t' << (r.total - r.start_total) << '\t' << (r.complete ? "COMPLETE" : "RESCORE_INCOMPLETE")
+              << '\t' << (r.unique_best ? "true" : "false") << '\t' << r.separation << '\t' << r.generated << '\t'
+              << r.neighbours << '\t' << r.duplicate << '\t' << r.suppressed << '\t' << r.self_skipped << '\t'
+              << r.rejected_prior << '\t' << r.unique_haplotypes << '\t' << r.scored_pairs << '\t'
+              << (r.order_invariant ? "true" : "false") << '\t' << (r.swap_invariant ? "true" : "false") << '\t'
+              << r.seconds << '\t' << r.rss << '\t' << r.haps_new << '\t' << r.haps_reused << '\t'
+              << r.bases_scanned << '\t' << r.piece_hits << '\t' << r.cache_requests << '\t' << r.cache_hits
+              << '\t' << r.cache_misses << '\t' << r.executed_dps << '\t' << r.physical_origins << '\t'
+              << r.state_classes << '\t' << r.placement_seconds << '\t' << r.combination_seconds << '\t'
+              << r.origins_reused << '\t' << r.origins_recomputed << '\t' << r.window_bases << '\t'
+              << r.transient_before << '\t' << r.transient_after << '\t' << r.full_bytes << '\t' << r.window_bytes
+              << '\t' << r.key_bytes << '\t' << r.seconds_origins << '\t' << r.seconds_merge << '\t'
+              << r.seconds_hashing << '\t' << r.seconds_lookup << '\t' << r.entry_metadata_bytes << '\t'
+              << r.content_arena_bytes << '\t' << r.row_constructions << '\t' << r.accumulator_growths << '\t'
+              << r.origin_growths << '\t' << r.oc_hits << '\t' << r.oc_misses << '\t' << r.oc_stored << '\t'
+              << r.oc_entries << '\t' << r.oc_bytes << '\t' << r.origins_constructed << '\t' << r.origins_loaded
+              << '\t' << r.fragments_reduced << '\t' << r.fragments_copied << '\t' << r.merge_working_bytes << '\t'
+              << r.seconds_enumeration << '\t' << r.seconds_filter << '\t' << r.seconds_aggregate << '\t'
+              << r.seconds_reduce << '\t' << r.round_wall_seconds << '\t' << r.oc_hits_all << '\t'
+              << r.oc_misses_all << '\t' << r.oc_admitted << '\t' << r.oc_admitted_bytes << '\t' << r.oc_declined
+              << '\t' << r.oc_declined_bytes << '\t' << r.origins_constructed_all << '\t'
+              << r.seconds_enumeration_all << '\t' << r.seconds_reenumeration_all << '\t' << r.cum_piece_hits
+              << '\t' << margin(scoring_.max_piece_hits, r.cum_piece_hits) << '\t' << r.cum_physical_origins
+              << '\t' << margin(scoring_.max_physical_origins, r.cum_physical_origins) << '\t'
+              << r.cum_state_classes << '\t' << margin(scoring_.max_state_classes, r.cum_state_classes) << '\t'
+              << r.cum_latent_pairs << '\t' << margin(scoring_.max_latent_alignment_pairs, r.cum_latent_pairs)
+              << '\t' << r.mass_cells << '\t' << margin(scoring_.max_mass_cells, r.mass_cells) << '\t'
+              << (options_.origin_cache ? margin(options_.origin_cache_bytes, r.oc_bytes_end) : std::string("none"))
+              << '\t' << r.records_consumed << '\t' << margin(options_.origin_cache_records, r.records_consumed)
+              << '\t' << margin(options_.declared_neighbour_cap, r.neighbours) << '\t' << (final_round - r.index)
+              << '\t' << r.census_count << '\t' << r.census_bytes << '\t' << r.phys_footprint << '\t'
+              << r.phys_footprint_peak << '\t' << r.rss_current << '\t' << r.plan_distinct << '\t' << r.plan_known
+              << '\t' << r.plan_selected << '\t' << r.plan_selected_bytes << '\t' << r.plan_retained << '\t'
+              << r.plan_evicted << '\t' << r.plan_evicted_bytes << '\t' << r.oc_not_selected << '\t'
+              << r.oc_group_reuses << '\t' << r.oc_evicted << '\t' << r.oc_evicted_bytes << '\n';
+    }
+    return table.str();
+}
+
+// ---- the final decision -------------------------------------------------------------------------
+
+bool SequenceDigest::operator<(const SequenceDigest& o) const {
+    return std::tie(a, b, length) < std::tie(o.a, o.b, o.length);
+}
+bool SequenceDigest::operator==(const SequenceDigest& o) const {
+    return a == o.a && b == o.b && length == o.length;
+}
+
+SequenceDigest sequence_digest(const std::string& bases) {
+    SequenceDigest id;
+    id.length = bases.size();
+    std::uint64_t h1 = 1469598103934665603ULL;
+    std::uint64_t h2 = 0x9e3779b97f4a7c15ULL;
+    for (const char c : bases) {
+        const std::uint64_t v = static_cast<unsigned char>(c);
+        h1 = (h1 ^ v) * 1099511628211ULL;
+        h2 = (h2 + v + 1) * 0xbf58476d1ce4e5b9ULL;
+        h2 ^= h2 >> 31;
+    }
+    id.a = h1;
+    id.b = h2;
+    return id;
+}
+
+const char* top_set_decision_name(TopSetDecision decision) {
+    switch (decision) {
+        case TopSetDecision::Unique: return "UNIQUE";
+        case TopSetDecision::GenotypeEquivalent: return "GENOTYPE_EQUIVALENT";
+        case TopSetDecision::DistinctTie: return "DISTINCT_TIE";
+    }
+    return "DISTINCT_TIE";
+}
+
+PooledDecision decide_pooled_genotype(std::vector<PoolCandidate> pool, std::size_t block_count,
+                                      std::size_t fragments, std::size_t mismatch_band) {
+    if (pool.empty()) throw std::invalid_argument("the pooled decision needs at least one candidate");
+    for (PoolCandidate& c : pool) {
+        if (c.first.size() != block_count || c.second.size() != block_count) {
+            throw std::invalid_argument("every pooled candidate needs one allele per block on both haplotypes");
+        }
+        // Canonical orientation of the identity; the sequences follow their haplotypes.
+        if (c.second < c.first) {
+            std::swap(c.first, c.second);
+            std::swap(c.first_sequence, c.second_sequence);
+        }
+    }
+    std::sort(pool.begin(), pool.end(), [](const PoolCandidate& x, const PoolCandidate& y) {
+        return std::tie(x.first, x.second) < std::tie(y.first, y.second);
+    });
+    for (std::size_t i = 1; i < pool.size(); ++i) {
+        if (pool[i].first == pool[i - 1].first && pool[i].second == pool[i - 1].second) {
+            throw std::invalid_argument("pooled candidate identities must be unique");
+        }
+    }
+    PooledDecision out;
+    out.candidates = std::move(pool);
+    const std::vector<PoolCandidate>& candidates = out.candidates;
+    const auto genotype_of = [&](std::size_t i) {
+        std::vector<std::pair<std::size_t, std::size_t>> row(block_count);
+        for (std::size_t b = 0; b < block_count; ++b) {
+            row[b] = std::minmax(candidates[i].first[b], candidates[i].second[b]);
+        }
+        return row;
+    };
+
+    // Sequence-level candidates, as the caller ranks: members spelling one unordered sequence pair are
+    // one state. Groups are ordered by their sequence pair, members by identity: both canonical.
+    std::map<std::pair<SequenceDigest, SequenceDigest>, std::size_t> group_of;
+    for (std::size_t i = 0; i < candidates.size(); ++i) {
+        SequenceDigest x = candidates[i].first_sequence;
+        SequenceDigest y = candidates[i].second_sequence;
+        if (y < x) std::swap(x, y);
+        group_of.emplace(std::make_pair(x, y), 0);
+    }
+    {
+        std::size_t next = 0;
+        for (auto& item : group_of) item.second = next++;
+    }
+    out.groups.assign(group_of.size(), {});
+    for (std::size_t i = 0; i < candidates.size(); ++i) {
+        SequenceDigest x = candidates[i].first_sequence;
+        SequenceDigest y = candidates[i].second_sequence;
+        if (y < x) std::swap(x, y);
+        out.groups[group_of.at({x, y})].push_back(i);
+    }
+    std::vector<DiplotypeScore> scores;
+    std::vector<double> priors;
+    for (const std::vector<std::size_t>& members : out.groups) {
+        std::size_t best = members.front();
+        bool ambiguous = false;
+        for (const std::size_t m : members) {
+            if (candidates[m].path_prior > candidates[best].path_prior) best = m;
+            if (!same_score(candidates[m].score, candidates[members.front()].score) ||
+                std::memcmp(&candidates[m].sequence_prior, &candidates[members.front()].sequence_prior,
+                            sizeof(double)) != 0) {
+                ++out.score_mismatches;
+            }
+        }
+        const auto chosen = genotype_of(best);
+        for (const std::size_t m : members) {
+            if (genotype_of(m) != chosen) ambiguous = true;
+        }
+        out.representative.push_back(best);
+        out.projection_ambiguous.push_back(ambiguous);
+        scores.push_back(candidates[members.front()].score);
+        priors.push_back(candidates[members.front()].sequence_prior);
+    }
+    out.ranking = certify_scored_ranking(scores, fragments, mismatch_band, FragmentScoringCounters{},
+                                         CertificationOptions{}, priors);
+
+    // ---- the numerical top set, in rank order
+    const std::set<std::size_t> winners(out.ranking.winner_set.begin(), out.ranking.winner_set.end());
+    for (const CertifiedCandidate& c : out.ranking.candidates) {
+        if (winners.count(c.candidate_id) != 0) out.top_groups.push_back(c.candidate_id);
+    }
+    const CertifiedCandidate& best = out.ranking.candidates.front();
+    out.genotype = genotype_of(out.representative[best.candidate_id]);
+    {
+        std::set<std::size_t> disagreeing;
+        for (const std::size_t g : out.top_groups) {
+            for (const std::size_t m : out.groups[g]) {
+                const auto row = genotype_of(m);
+                for (std::size_t b = 0; b < block_count; ++b) {
+                    if (row[b] != out.genotype[b]) disagreeing.insert(b);
+                }
+            }
+        }
+        out.disagreeing_blocks.assign(disagreeing.begin(), disagreeing.end());
+    }
+    if (!out.disagreeing_blocks.empty()) {
+        out.decision = TopSetDecision::DistinctTie;
+    } else {
+        out.decision = out.top_groups.size() == 1 ? TopSetDecision::Unique : TopSetDecision::GenotypeEquivalent;
+    }
+
+    // ---- separation of the genotype, and the best same-genotype alternative below the top set
+    const auto carries_only = [&](std::size_t g) {
+        for (const std::size_t m : out.groups[g]) {
+            if (genotype_of(m) != out.genotype) return false;
+        }
+        return true;
+    };
+    for (const CertifiedCandidate& c : out.ranking.candidates) {
+        if (winners.count(c.candidate_id) != 0) continue;
+        if (!carries_only(c.candidate_id)) {
+            if (!out.has_other_genotype) {
+                out.has_other_genotype = true;
+                out.best_other_genotype_group = c.candidate_id;
+                out.genotype_separation_gap = best.score - c.score;
+                out.genotype_separation_certified =
+                    best.score - best.numeric_error_bound > c.score + c.numeric_error_bound;
+            }
+        } else if (!out.has_same_genotype_alternative) {
+            out.has_same_genotype_alternative = true;
+            out.best_same_genotype_group = c.candidate_id;
+            out.same_genotype_score_gap = best.score - c.score;
+            out.same_genotype_fragment_gap = best.fragment_term - c.fragment_term;
+            out.same_genotype_prior_gap = best.prior - c.prior;
+            out.same_genotype_fragment_identical =
+                std::memcmp(&best.fragment_term, &c.fragment_term, sizeof(double)) == 0;
+        }
+        if (out.has_other_genotype && out.has_same_genotype_alternative) break;
+    }
+    if (!out.has_other_genotype) out.genotype_separation_gap = std::numeric_limits<double>::infinity();
+
+    // ---- phase support and per-block read support, exactly as the unpooled caller reports them
+    out.block_genotype_read_supported.assign(block_count, true);
+    out.fragment_term_gap = out.ranking.candidates.size() > 1
+                                ? best.fragment_term - out.ranking.candidates[1].fragment_term
+                                : std::numeric_limits<double>::infinity();
+    for (std::size_t i = 1; i < out.ranking.candidates.size(); ++i) {
+        const CertifiedCandidate& rival = out.ranking.candidates[i];
+        // A fragment contender: the reads alone do not put it below the winner.
+        if (rival.fragment_term + rival.numeric_error_bound < best.fragment_term - best.numeric_error_bound) continue;
+        ++out.fragment_contenders;
+        const auto row = genotype_of(out.representative[rival.candidate_id]);
+        for (std::size_t b = 0; b < block_count; ++b) {
+            if (row[b] != out.genotype[b]) out.block_genotype_read_supported[b] = false;
+        }
+    }
+    if (out.decision != TopSetDecision::Unique) {
+        out.phase_support = "UNRESOLVED";
+    } else {
+        out.phase_support = out.fragment_contenders == 0 ? "READS_WITHIN_CANDIDATES" : "PRIOR_ONLY";
+    }
+    {
+        std::vector<double> ranked_scores;
+        std::vector<double> ranked_bounds;
+        std::vector<std::vector<std::pair<std::size_t, std::size_t>>> ranked_genotypes;
+        for (const CertifiedCandidate& entry : out.ranking.candidates) {
+            ranked_scores.push_back(entry.score);
+            ranked_bounds.push_back(entry.numeric_error_bound);
+            ranked_genotypes.push_back(genotype_of(out.representative[entry.candidate_id]));
+        }
+        for (const BlockGenotypeConfidence& block :
+             block_genotype_confidence(ranked_scores, ranked_bounds, ranked_genotypes)) {
+            out.block_genotype_posterior.push_back(block.posterior);
+            out.block_genotype_quality.push_back(block.quality);
+            out.block_numerically_separated.push_back(block.numerically_separated);
+        }
+    }
+    return out;
+}
+
+} // namespace panvar

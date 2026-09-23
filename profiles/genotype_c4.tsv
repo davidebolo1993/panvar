@@ -1,0 +1,36 @@
+# The frozen C4 production profile for `panvar genotype`: panel-anchored adaptive completion.
+# Committed, hashed into every run's status, and never edited in place: a change is a new profile.
+#
+# Candidate union: proposal width 256 (allele-prefix pairs), K = 128 grouped-prefix mosaics beside every
+# panel diplotype, phase audit 0 -- the caller settings of the C4 development LOO campaign
+# (tests/results/genotype_loo_c4_development_7e37bb4/settings.tsv), with its per-pass scorer caps and
+# 512 MiB emission cache.
+#
+# Repair: 32 local pairs per block, at most 11 rounds, the 384 MiB planned origin cache, and the
+# cumulative caps the single-start searches were accepted under (4.9e9 physical origins, 4.2e9 state
+# classes, 1.4e10 piece hits, 1.4e10 latent pairs). A round's neighbourhood is at most 670 candidates.
+#
+# Eight threads; deterministic, so the result does not depend on the count. The process is stopped at
+# 2.5 GiB of physical footprint (macOS phys_footprint; RESOURCE_REFUSAL, no genotype).
+profile	c4-panel-anchored-v1
+proposal_state_limit	256
+max_mosaic_candidates	128
+phase_audit_candidates	0
+threads	8
+kmer_size	31
+syncmer_s	15
+min_variant_bp	50
+switch_probability	0.01
+mismatch_band	6
+max_physical_origins	700000000
+max_state_classes	600000000
+emission_cache_bytes	536870912
+repair_rounds	11
+repair_local_pairs	32
+repair_origin_cache_bytes	402653184
+repair_max_neighbours	670
+repair_max_physical_origins	4900000000
+repair_max_state_classes	4200000000
+repair_max_piece_hits	14000000000
+repair_max_latent_pairs	14000000000
+footprint_limit_bytes	2684354560

@@ -25,6 +25,10 @@ Run statuses and what each emits:
 | `CANDIDATE_INCOMPLETE` | proposal stopped at a declared budget | status only |
 | `SPELLING_INCOMPLETE` | a candidate could not be spelled | status only |
 | `RESCORE_INCOMPLETE` | a resource cap was reached, or a tie with no block agreement | status only |
+| `CONDITIONAL_GENOTYPE_EQUIVALENT` | adaptive completion: the pooled top set is several candidates tied on total score that carry one unordered genotype at every block | genotypes, block genotypes, scores, candidates, equivalence set, repair trajectory; phase `UNRESOLVED`; **no** haplotype FASTA |
+| `REPAIR_INCOMPLETE` | adaptive completion: the repair did not converge (round cap, a tie among improving neighbours, a cycle), the anchor did not reproduce, or a candidate scored twice did not score identically | status and repair trajectory only |
+| `RUNNING` | adaptive completion in progress | status; committed rounds in `.repair_rounds.partial.tsv` |
+| `TIME_LIMIT` / `RESOURCE_REFUSAL` | the watchdog stopped the process at the declared wall or physical-footprint limit | status and the committed partial rounds only |
 
 The FASTA a `COMPLETE` run emits holds the two members of an **unordered genotype pair**, written in a
 canonical order. `MosaicDiplotype` is a bare `{first, second}` with no ordering invariant, candidates
@@ -60,6 +64,99 @@ describes the prefix: `primary_prefix_k`, `full_beam_candidates`, `proposal_sear
 
 A refused run reports the work it performed: `observed_piece_hits`, `observed_physical_origins`, the
 placement workers actually used, and the phase timings up to the refusal.
+
+## Production algorithm: panel-anchored adaptive completion (2026-09-23)
+
+The production caller is one adaptive algorithm. It is never told whether a sample is LZO, LOO or a
+mosaic -- those are evaluation scenarios, which decide only the model graph a campaign hands it and the
+truth an evaluation compares against afterwards. The documented command:
+
+```text
+panvar genotype --profile profiles/genotype_c4.tsv --gfa <graph.gfa> --reference-path <name> \
+                --reads1 <r1.fq> --reads2 <r2.fq> --library <params.txt> --out-prefix <prefix> \
+                [--panel-curation <manifest.tsv>]
+```
+
+`profiles/genotype_c4.tsv` is the committed, frozen C4 profile (`c4-panel-anchored-v1`): proposal width
+256, K = 128, phase audit 0, 8 threads; the union's per-pass caps (7e8 physical origins, 6e8 state
+classes, 512 MiB emission cache) from the development LOO campaign; repair with 32 local pairs, at most
+11 rounds, the 384 MiB planned origin cache, a 670-candidate neighbourhood bound and cumulative caps of
+4.9e9 physical origins, 4.2e9 state classes, 1.4e10 piece hits and 1.4e10 latent pairs; and a 2.5 GiB
+physical-footprint limit. Unknown, repeated or malformed profile settings are refused. The status records
+the profile path, name and SHA-256, every setting a flag overrode after it, and the SHA-256 of every input
+(graph, reads, library, curation). Without a profile the unrepaired call from the proposal's candidate set
+is made: a development view, not the production caller.
+
+**Algorithm.**
+
+1. Exactly score the union: every unordered panel diplotype and up to K grouped-prefix mosaics.
+2. Anchor on the best exactly scored **panel** diplotype -- the first sequence candidate of the union's
+   exact ranking with a panel member, its highest-path-prior panel member. A deterministic search anchor,
+   not a claim about the sample.
+3. Run the exact one-block coordinate repair from the anchor: each round scores every neighbour that
+   replaces one block of one haplotype by one of the block's 32 locally best allele pairs (both
+   assignments), and moves to the best one when it improves beyond floating-point error; visited
+   incumbents are never revisited. Deterministic, 8-thread fragment-parallel window enumeration, identical
+   at any thread count. The implementation is `CoordinateRepairSearch` in `genotype_repair.cpp`, the same
+   code the developer probe's `repair-search` drives.
+4. Pool the union and every candidate the repair scored. A candidate scored by both must score
+   identically, bit for bit (`pool_score_mismatches` 0), or the run refuses.
+5. Rerank the pool exactly at the sequence-pair level and decide over its **numerical top set** -- the
+   candidates that cannot be separated from the best total score beyond floating-point error:
+   - one candidate: the normal genotype decision, status `COMPLETE`;
+   - several, all with the same unordered allele pair at every block: `CONDITIONAL_GENOTYPE_EQUIVALENT`,
+     the unphased block genotype is emitted, phase is `UNRESOLVED`, `.equivalence_set.tsv` lists every
+     member and no haplotype FASTA is written;
+   - several that disagree at any block: refused (`RESCORE_INCOMPLETE`), the disagreeing blocks named.
+   Lower-scoring candidates of the winner's genotype never turn a unique winner into a tie. No majority
+   vote and no consensus across candidates that disagree anywhere.
+
+A search that does not converge -- round cap, a tie among improving neighbours, a cycle -- emits no
+genotype (`REPAIR_INCOMPLETE`), and neither does a cumulative-cap refusal (`RESCORE_INCOMPLETE`) or a
+watchdog stop (`TIME_LIMIT`, `RESOURCE_REFUSAL`). A round tie that includes the incumbent is converged:
+no neighbour improves on it.
+
+**Phase support is a separate axis from the decision.** `READS_WITHIN_CANDIDATES` when no pooled rival is a
+fragment contender; `PRIOR_ONLY` when some rival's fragment term is not below the winner's beyond error
+and only the prior chose the unique winner; `UNRESOLVED` when total scores stay tied within the top set.
+A unique `PRIOR_ONLY` winner does emit its haplotype FASTA, but as a **prior-selected haplotype
+representation**, not a read-phased result: the FASTA header and the status carry
+`phase_support=PRIOR_ONLY` and `representation=prior_selected` (`haplotype_representation`). The status
+also reports the best same-genotype alternative below the top set -- its score, fragment and prior gaps,
+and whether its fragment term is identical -- which is the evidence for `PRIOR_ONLY`, never a reason to
+suppress the genotype.
+
+**Scope and confidence.** The pool is a local search from one anchor: `candidate_scope` and
+`final_candidate_scope` stay `CONDITIONAL`, `global_certified` is false and
+`search_globally_exhaustive` false. Separation is reported against the best candidate carrying a
+**different** genotype (`genotype_separation_gap`), beside the raw `numeric_separation_gap`.
+`conditional_GQ` is conditional on the pool and labelled `uncalibrated`. The multi-start diagnostic
+(9a0f4c0) found, for NA20509 30x, a second phase history at the same score outside this restricted pool;
+it stays diagnostic evidence and is not added to production.
+
+**Outputs and process contract.** Beside the standard tables: `.equivalence_set.tsv` (the complete top
+set), `.repair_rounds.tsv` (the full trajectory: moves, stopping reason and every work, cache and
+resource column), `.repair_memory.tsv` (per-round memory accounts at four points). While running the
+status says `RUNNING` and each committed round is atomically rewritten to `.repair_rounds.partial.tsv`.
+A watchdog enforces the declared wall and footprint limits: a stop removes every final output and the
+staged graph, keeps the committed partial rounds, and writes `TIME_LIMIT` or `RESOURCE_REFUSAL`. Once the
+run has decided, it claims itself and can no longer be stopped half-written. The staged sorted graph is
+removed on every exit. The status reports `threads_peak_active_workers`,
+`resources_phys_footprint_peak_bytes` and `resources_rss_peak_bytes`. Exit status is 0 when a genotype
+was emitted (`COMPLETE`, `CONDITIONAL_GENOTYPE_EQUIVALENT`), 1 otherwise.
+
+**Regressions** (`tests/genotype_production_c4_regressions.sh`, the real command on five frozen cases;
+expected values from the multi-start evidence restricted to the production pool, trajectories bit-identical
+to the recorded panel-anchor branch in `tests/genotype_production_c4_expected/`): NA20509 LOO 10x
+(-151090.979646, distance 114, floor 91), NA20509 LOO 30x (-414918.317265, distance 113, floor 91, a
+unique winner 4.40 nats from the best different genotype, `PRIOR_ONLY`: the best same-genotype alternative
+has an identical fragment term and is 7.66 nats lower through the prior), NA19240 LOO 30x (distance 4 =
+floor 4, with the ctx:6 repair), NA20509 LZO 30x (exact, no repair movement) and the bridgeable synthetic
+mosaic (11/11 exact).
+
+**Campaigns.** `tests/genotype_production_c4_campaign.sh plan` prepares the final held-out LZO (56
+donors), eligible-donor LOO (55) and synthetic-mosaic (10 plans) campaigns at 2x, 5x, 10x and 30x -- 484
+serial jobs -- with a runtime and disk estimate. `launch` refuses without the reviewed plan's hash.
 
 ## Frozen defaults
 
@@ -507,7 +604,8 @@ local artifact and is not tracked in git. Regenerate with `scripts/consolidate_c
 
 ## Ordered next work
 
-1. Sol's review of this stop point.
+1. Sol's review of this stop point: the panel-anchored production integration, its five regressions, and
+   the prepared (not launched) final C4 campaigns.
 2. **Resolved, not pending: beam crowding.** The grouped-prefix proposer made the allele-prefix PAIR the
    unit of retention, so a single diplotype prefix can no longer occupy a layer through many
    template-level states that all spell it. It carries every template attribution exactly, costs less,

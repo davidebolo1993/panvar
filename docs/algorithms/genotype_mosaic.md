@@ -613,6 +613,10 @@ Status is one of:
 
 An incomplete run emits diagnostics but no ranking presented as complete.
 
+The production caller is now panel-anchored adaptive completion (`panvar genotype --profile
+profiles/genotype_c4.tsv`), which adds `CONDITIONAL_GENOTYPE_EQUIVALENT`, `REPAIR_INCOMPLETE`, `RUNNING`,
+`TIME_LIMIT` and `RESOURCE_REFUSAL`; its contract is in `genotype_mosaic_current.md`.
+
 ### Candidate set, confidence and phase (review rounds 5-6)
 
 This section amends the phases above; where they speak of "top-K candidates", read the following.

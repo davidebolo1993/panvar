@@ -16,6 +16,7 @@
 #include "panvar/genotype_command.hpp"
 #include "panvar/genotype_locus.hpp"
 #include "panvar/genotype_model.hpp"
+#include "panvar/genotype_repair.hpp"
 #include "panvar/gfa.hpp"
 #include "panvar/gfa_io.hpp"
 #include "panvar/graph_sort.hpp"
@@ -315,83 +316,13 @@ std::vector<std::map<std::string, std::string>> read_table(const std::string& pa
     return rows;
 }
 
-// CURRENT resident size. ru_maxrss is a high-water mark that can only rise, so it cannot tell a
-// plateau from a leak; this can.
-std::uint64_t current_rss_bytes() {
-#if defined(__APPLE__)
-    mach_task_basic_info_data_t info{};
-    mach_msg_type_number_t count = MACH_TASK_BASIC_INFO_COUNT;
-    if (task_info(mach_task_self(), MACH_TASK_BASIC_INFO, reinterpret_cast<task_info_t>(&info),
-                  &count) != KERN_SUCCESS) {
-        return 0;
-    }
-    return info.resident_size;
-#else
-    std::ifstream statm("/proc/self/statm");
-    std::uint64_t size = 0;
-    std::uint64_t resident = 0;
-    statm >> size >> resident;
-    return resident * static_cast<std::uint64_t>(sysconf(_SC_PAGESIZE));
-#endif
-}
-
-// DIAGNOSTIC ONLY: asks the allocator to return free pages and reports what it released. Changes no
-// data; used once, at the end of a hold diagnostic, to measure freed-but-retained memory.
-std::uint64_t release_free_pages() {
-#if defined(__APPLE__)
-    return static_cast<std::uint64_t>(malloc_zone_pressure_relief(nullptr, 0));
-#else
-    return 0;
-#endif
-}
-
-// macOS physical footprint: what the kernel charges the process, compressed pages included. Reported
-// BESIDE resident size, not instead of it -- resident size falls when the compressor takes pages, so
-// under pressure it can read far below the live data it is supposed to bound. Zero where unavailable.
-struct FootprintSample {
-    std::uint64_t current = 0;
-    std::uint64_t peak = 0;
-};
-FootprintSample physical_footprint() {
-    FootprintSample sample;
-#if defined(__APPLE__)
-    task_vm_info_data_t info{};
-    mach_msg_type_number_t count = TASK_VM_INFO_COUNT;
-    if (task_info(mach_task_self(), TASK_VM_INFO, reinterpret_cast<task_info_t>(&info), &count) !=
-        KERN_SUCCESS) {
-        return sample;
-    }
-    if (count >= TASK_VM_INFO_REV1_COUNT) sample.current = info.phys_footprint;
-    if (count >= TASK_VM_INFO_REV3_COUNT && info.ledger_phys_footprint_peak > 0) {
-        sample.peak = static_cast<std::uint64_t>(info.ledger_phys_footprint_peak);
-    }
-#endif
-    return sample;
-}
-
-// Whole-file replacement by rename, so a reader -- or a run killed mid-write -- only ever sees the
-// previous complete version or the new complete version, never a torn one.
-void atomic_write(const std::string& path, const std::string& content) {
-    const std::string staging = path + ".writing";
-    {
-        std::ofstream file(staging, std::ios::binary | std::ios::trunc);
-        if (!file) throw std::runtime_error("cannot write " + staging);
-        file << content;
-        file.flush();
-        if (!file) throw std::runtime_error("short write to " + staging);
-    }
-    std::filesystem::rename(staging, path);
-}
-
-double peak_rss_gib() {
-    rusage usage{};
-    getrusage(RUSAGE_SELF, &usage);
-#if defined(__APPLE__)
-    return static_cast<double>(usage.ru_maxrss) / (1024.0 * 1024.0 * 1024.0);   // Darwin reports bytes
-#else
-    return static_cast<double>(usage.ru_maxrss) / (1024.0 * 1024.0);            // Linux reports KiB
-#endif
-}
+// Process resources and atomic replacement live in the library, shared with panvar genotype.
+using panvar::FootprintSample;
+using panvar::atomic_write;
+using panvar::current_rss_bytes;
+using panvar::peak_rss_gib;
+using panvar::physical_footprint;
+using panvar::release_free_pages;
 
 std::vector<std::size_t> parse_alleles(const std::string& joined) {
     std::vector<std::size_t> out;
@@ -687,7 +618,10 @@ int evaluate(const Args& args) {
              "called2_bp\tunordered_distance\tavailability_floor\texcess\ttruth1_available\t"
              "truth2_available\tgenotype_support\n";
 
-    const bool complete = status.count("status") && status.at("status") == "COMPLETE";
+    // A genotype-equivalent call emits one unordered genotype shared by its whole top set, and the
+    // distances below are unordered per block, so any representative of the set measures it exactly.
+    const bool complete = status.count("status") &&
+                          (status.at("status") == "COMPLETE" || status.at("status") == "CONDITIONAL_GENOTYPE_EQUIVALENT");
     std::vector<std::size_t> hap1;
     std::vector<std::size_t> hap2;
     std::map<std::string, std::string> genotype_support;
@@ -3668,28 +3602,8 @@ int repair_search(const Args& args) {
         start_total = start_recorded;
     }
 
-    // ---- the per-block local pairs, ranked once. Deterministic: emission descending, then indices.
-    std::vector<std::vector<std::pair<std::size_t, std::size_t>>> local(blocks);
-    for (std::size_t b = 0; b < blocks; ++b) {
-        const panvar::BlockProposalEmissions& emission = emissions.blocks[b];
-        std::vector<std::pair<double, std::pair<std::size_t, std::size_t>>> ranked;
-        for (std::size_t x = 0; x < emission.allele_count; ++x) {
-            for (std::size_t y = x; y < emission.allele_count; ++y) ranked.push_back({emission.at(x, y), {x, y}});
-        }
-        std::sort(ranked.begin(), ranked.end(), [](const auto& lhs, const auto& rhs) {
-            if (lhs.first != rhs.first) return lhs.first > rhs.first;
-            return lhs.second < rhs.second;
-        });
-        const std::size_t take = std::min(local_pairs, ranked.size());
-        for (std::size_t r = 0; r < take; ++r) local[b].push_back(ranked[r].second);
-    }
-
     // ---- the declared bound on ONE round's neighbourhood, from the block shape rather than assumed
-    std::uint64_t cap = 0;
-    for (std::size_t b = 0; b < blocks; ++b) {
-        const std::uint64_t a = model.blocks()[b].alleles.size();
-        cap += std::min<std::uint64_t>(local_pairs, a * (a + 1) / 2) * 2;
-    }
+    const std::uint64_t cap = panvar::repair_neighbour_bound(model, local_pairs);
     // Assembled in memory and written only by a normal completion: a partial summary is exactly the
     // kind of file that could be mistaken for a finished run.
     std::ostringstream summary;
@@ -3727,7 +3641,7 @@ int repair_search(const Args& args) {
     const auto key_of = [](const std::vector<std::size_t>& a, const std::vector<std::size_t>& b) {
         return a <= b ? std::make_pair(a, b) : std::make_pair(b, a);
     };
-    std::set<std::pair<std::vector<std::size_t>, std::vector<std::size_t>>> visited;
+    std::vector<std::pair<std::vector<std::size_t>, std::vector<std::size_t>>> preoccupied_keys;
     // --visited pre-occupies candidates, so a gate can prove the set really suppresses a neighbour
     // that would otherwise have been selected. Nothing in the search itself writes to it this way.
     std::size_t preoccupied = 0;
@@ -3740,7 +3654,7 @@ int repair_search(const Args& args) {
             if (bar == std::string::npos) {
                 throw std::runtime_error("--visited wants <hap1>|<hap2>, entries separated by ';'");
             }
-            visited.insert(key_of(parse_alleles(cell.substr(0, bar)), parse_alleles(cell.substr(bar + 1))));
+            preoccupied_keys.push_back(key_of(parse_alleles(cell.substr(0, bar)), parse_alleles(cell.substr(bar + 1))));
             ++preoccupied;
         }
     }
@@ -3780,143 +3694,26 @@ int repair_search(const Args& args) {
         declared_budget("max-latent-pairs", scoring.max_latent_alignment_pairs);
     scoring.max_mass_cells = declared_budget("max-mass-cells", scoring.max_mass_cells);
 
-    struct Round {
-        std::size_t index = 0;
-        double start_total = 0.0;
-        bool moved = false;
-        std::size_t block = 0;
-        std::size_t rank = 0;
-        int assignment = 0;
-        std::size_t allele_x = 0;
-        std::size_t allele_y = 0;
-        std::vector<std::size_t> first;
-        std::vector<std::size_t> second;
-        double fragment = 0.0, exposure = 0.0, prior = 0.0, total = 0.0;
-        std::uint64_t generated = 0, duplicate = 0, rejected_prior = 0, suppressed = 0, self_skipped = 0;
-        std::size_t neighbours = 0, unique_haplotypes = 0, scored_pairs = 0;
-        bool complete = false, unique_best = true, order_invariant = true, swap_invariant = true;
-        double separation = 0.0;
-        double seconds = 0.0, rss = 0.0;
-        // What the round actually cost, and how much of it was work the previous rounds had already
-        // done. haplotypes_reused is the whole point of the context: in the one-shot path it is zero
-        // by construction, because nothing survives the call.
-        std::size_t haps_new = 0, haps_reused = 0;
-        std::uint64_t bases_scanned = 0, piece_hits = 0;
-        std::uint64_t cache_requests = 0, cache_hits = 0, cache_misses = 0, executed_dps = 0;
-        std::uint64_t physical_origins = 0, state_classes = 0;
-        double placement_seconds = 0.0, combination_seconds = 0.0;
-        // Stage 2. reused against recomputed is the whole claim; transient_after must return to
-        // transient_before, or storage is leaking a round at a time.
-        std::uint64_t origins_reused = 0, origins_recomputed = 0, window_bases = 0;
-        std::uint64_t transient_before = 0, transient_after = 0;
-        // Stage 3. full_bytes is the headline: a segmented repair should materialise NOTHING, so a
-        // non-zero figure here means only the promoted incumbent, once per round.
-        std::uint64_t full_bytes = 0, window_bytes = 0, key_bytes = 0;
-        double seconds_origins = 0.0, seconds_merge = 0.0, seconds_hashing = 0.0;
-        // Lookup time, separate from origin construction: the two answer different questions --
-        // whether consulting the cache is cheap, and whether what it saves was worth consulting.
-        double seconds_lookup = 0.0;
-        std::uint64_t entry_metadata_bytes = 0, content_arena_bytes = 0;
-        // Persistent scratch: these are container GROWTH events, and should fall to zero once the
-        // rows have warmed. A non-zero row figure after round one means something is still being
-        // constructed per candidate.
-        std::uint64_t row_constructions = 0, accumulator_growths = 0, origin_growths = 0;
-        // Stage 6: what was reused against what was performed, and where the time went.
-        std::uint64_t oc_hits = 0, oc_misses = 0, oc_stored = 0, oc_entries = 0, oc_bytes = 0;
-        std::uint64_t origins_constructed = 0, origins_loaded = 0;
-        std::uint64_t fragments_reduced = 0, fragments_copied = 0, merge_working_bytes = 0;
-        double seconds_enumeration = 0.0, seconds_filter = 0.0, seconds_aggregate = 0.0;
-        double seconds_reduce = 0.0;
-        // The WHOLE round, promotion included -- the columns above stop at scoring. Demand columns:
-        // what was admitted, what the full budget declined, and what re-enumerating declined or
-        // otherwise repeated windows cost.
-        double round_wall_seconds = 0.0;
-        std::uint64_t oc_hits_all = 0, oc_misses_all = 0, oc_admitted = 0, oc_admitted_bytes = 0;
-        std::uint64_t oc_declined = 0, oc_declined_bytes = 0, origins_constructed_all = 0;
-        double seconds_enumeration_all = 0.0, seconds_reenumeration_all = 0.0;
-        // Cumulative against every cumulative cap, read after the round.
-        std::uint64_t cum_piece_hits = 0, cum_physical_origins = 0, cum_state_classes = 0;
-        std::uint64_t cum_latent_pairs = 0, mass_cells = 0, records_consumed = 0;
-        std::uint64_t census_count = 0, census_bytes = 0, oc_bytes_end = 0;
-        std::uint64_t phys_footprint = 0, phys_footprint_peak = 0, rss_current = 0;
-        // Planned retention: what the round's plan saw, selected and evicted.
-        std::uint64_t plan_distinct = 0, plan_known = 0, plan_selected = 0, plan_selected_bytes = 0;
-        std::uint64_t plan_retained = 0, plan_evicted = 0, plan_evicted_bytes = 0, oc_not_selected = 0;
-        std::uint64_t oc_group_reuses = 0, oc_evicted = 0, oc_evicted_bytes = 0;
-    };
-    std::vector<Round> rounds;
-    const std::size_t last_round = first_round + max_rounds - 1;
-    std::size_t hold_index = 0;
-    std::unique_ptr<panvar::PreparedScoringContext> context;
-    if (use_context || use_delta) {
-        context = std::make_unique<panvar::PreparedScoringContext>(fragments, library, scoring);
-        if (use_origin_cache) {
-            context->enable_origin_cache_path(true);
-            context->set_origin_cache_limits(origin_cache_bytes, origin_cache_records);
-        }
-    }
-    // Per-round memory accounts at four fixed points, beside current and peak RSS and the physical
-    // footprint. Held in memory and committed with each round, so a stopped run keeps every row.
-    const bool memory_on = static_cast<bool>(context);
-    std::string memory_text;
-    // Why each census is live: the role of every slot this search has given one.
-    std::map<std::size_t, std::string> role_of;
-    std::size_t inc_slot_a = 0;
-    std::size_t inc_slot_b = 0;
-    if (memory_on) {
-        memory_text += "kind\tindex\tpoint\trss_current\trss_peak\trelief_freed\trss_after_relief\t"
-                      "slots_total\tslots_live\tslots_released\tslot_table\tsequence_bytes\t"
-                      "sequence_capacity\tsegment_bytes\tmass_bytes\tmass_capacity\tcensus_count\t"
-                      "census_bytes\tcensus_capacity\torigin_cache_entries\torigin_cache_payload\t"
-                      "origin_cache_capacity\tmerge_bytes\tmerge_capacity\twindow_scratch\t"
-                      "origin_scratch\temission_table\temission_arena\tprepared\tscoring_result\t"
-                      "logical_total\tcapacity_total\trss_minus_capacity\tphys_footprint\t"
-                      "phys_footprint_peak\torigin_demand\tcensus_slots\tcensus_roles\n";
-    }
-    const auto snapshot = [&](const char* kind, std::size_t index, const char* point,
-                              bool result_alive, bool relieve) {
-        if (!memory_on) return;
-        const panvar::ContextMemoryAccount a = context->memory_account();
-        const FootprintSample footprint = physical_footprint();
-        std::string slots_text;
-        std::string roles_text;
-        for (const std::size_t slot : context->census_slots()) {
-            if (!slots_text.empty()) { slots_text += ','; roles_text += ','; }
-            slots_text += std::to_string(slot);
-            const auto role = role_of.find(slot);
-            roles_text += role == role_of.end() ? std::string("unknown") : role->second;
-            if (slot == inc_slot_a || slot == inc_slot_b) roles_text += "*";
-        }
-        const std::uint64_t rss = current_rss_bytes();
-        const std::uint64_t peak = static_cast<std::uint64_t>(peak_rss_gib() * 1073741824.0);
-        std::uint64_t freed = 0;
-        std::uint64_t after = rss;
-        if (relieve) {
-            freed = release_free_pages();
-            after = current_rss_bytes();
-        }
-        // The flattened result belongs to the caller: count it only while the caller still holds it.
-        const std::uint64_t result = result_alive ? a.last_scoring_result_bytes : 0;
-        const std::uint64_t logical = a.logical_total - a.last_scoring_result_bytes + result;
-        const std::uint64_t capacity = a.capacity_total - a.last_scoring_result_bytes + result;
-        std::ostringstream memory_log;
-        memory_log << kind << '\t' << index << '\t' << point << '\t' << rss << '\t' << peak << '\t'
-                   << freed << '\t' << after << '\t' << a.slots_total << '\t' << a.slots_live << '\t'
-                   << a.slots_released << '\t' << a.slot_table_bytes << '\t' << a.sequence_bytes << '\t'
-                   << a.sequence_capacity << '\t' << a.segment_bytes << '\t' << a.mass_column_bytes << '\t'
-                   << a.mass_column_capacity << '\t' << a.census_count << '\t' << a.census_bytes << '\t'
-                   << a.census_capacity << '\t' << a.origin_cache_entries << '\t'
-                   << a.origin_cache_payload << '\t' << a.origin_cache_capacity << '\t'
-                   << a.merge_working_bytes << '\t' << a.merge_working_capacity << '\t'
-                   << a.window_scratch_capacity << '\t' << a.origin_scratch_capacity << '\t'
-                   << a.emission_cache_table << '\t' << a.emission_cache_arena << '\t'
-                   << a.prepared_capacity << '\t' << result << '\t' << logical << '\t' << capacity
-                   << '\t' << (static_cast<std::int64_t>(rss) - static_cast<std::int64_t>(capacity))
-                   << '\t' << footprint.current << '\t' << footprint.peak << '\t'
-                   << a.origin_demand_bytes << '\t' << (slots_text.empty() ? "-" : slots_text) << '\t'
-                   << (roles_text.empty() ? "-" : roles_text) << '\n';
-        memory_text += memory_log.str();
-    };
+    // The search itself is the library's, shared with panvar genotype. Only the driver lives here.
+    using Round = panvar::RepairRound;
+    panvar::RepairSearchOptions search_options;
+    search_options.local_pairs = local_pairs;
+    search_options.max_rounds = max_rounds;
+    search_options.first_round = first_round;
+    search_options.mode = use_delta     ? panvar::RepairScoringMode::Delta
+                          : use_context ? panvar::RepairScoringMode::Context
+                                        : panvar::RepairScoringMode::OneShot;
+    search_options.origin_cache = use_origin_cache;
+    search_options.planned_cache = planned_cache;
+    search_options.origin_cache_bytes = origin_cache_bytes;
+    search_options.origin_cache_records = origin_cache_records;
+    search_options.switch_probability = switch_probability;
+    search_options.declared_neighbour_cap = declared_cap;
+    search_options.request_order_seed = request_order_seed;
+    search_options.hold_cycles = hold_cycles;
+    search_options.pressure_relief = pressure_relief;
+    panvar::CoordinateRepairSearch search(model, emissions, fragments, library, scoring, search_options);
+    const std::size_t last_round = search.last_round();
 
     const auto join = [](const std::vector<std::size_t>& v) {
         std::string text;
@@ -3927,7 +3724,6 @@ int repair_search(const Args& args) {
         return text;
     };
     std::string rounds_prefix = out;          // where the current search's rounds are committed
-    std::string round_kind = "round";         // memory-row kind: "round", or "seed<k>" in multi-start
     std::vector<Round> earlier_seed_rounds;   // multi-start: rounds of seeds already finished
     const auto margin = [](std::uint64_t cap_value, std::uint64_t used) -> std::string {
         if (cap_value == 0) return "none";
@@ -3935,92 +3731,9 @@ int repair_search(const Args& args) {
     };
 
     // ---- the rounds table, rendered from the rounds that exist. TRUTH-FREE.
-    const auto render_rounds = [&]() {
-        std::ostringstream table;
-        table << std::setprecision(12)
-              << "round\tstart_total\tmoved\trepaired_block\tlocal_pair_rank\tassignment\tallele_x\t"
-                 "allele_y\thap1_alleles\thap2_alleles\tfragment_term\texposure_term\tprior\ttotal\t"
-                 "delta_total\tstatus\tunique_best\tseparation\tneighbours_generated\tneighbours_scored\t"
-                 "duplicate\tsuppressed_visited\tself_skipped\trejected_infinite_prior\t"
-                 "unique_haplotypes\tscored_pairs\torder_invariant\tswap_invariant\tseconds\tpeak_rss_gib\t"
-                 "haplotypes_new\thaplotypes_reused\tbases_scanned\tpiece_hits\tcache_requests\t"
-                 "cache_hits\tcache_misses\texecuted_dps\tphysical_origins\tstate_classes\t"
-                 "placement_seconds\tcombination_seconds\torigins_reused\torigins_recomputed\t"
-                 "window_bases\ttransient_before\ttransient_after\tfull_haplotype_bytes\t"
-                 "window_bytes\tsequence_key_bytes\tseconds_origins\tseconds_merge\t"
-                 "seconds_hashing\tseconds_lookup\tentry_metadata_bytes\tcontent_arena_bytes\t"
-                 "row_constructions\taccumulator_growths\torigin_growths\t"
-                 "oc_hits\toc_misses\toc_stored\toc_entries\toc_bytes\torigins_constructed\t"
-                 "origins_loaded\tfragments_reduced\tfragments_copied\tmerge_working_bytes\t"
-                 "seconds_enumeration\tseconds_filter\tseconds_aggregate\tseconds_reduce\t"
-                 "round_wall_seconds\toc_hits_all\toc_misses_all\toc_admitted\toc_admitted_bytes\t"
-                 "oc_declined\toc_declined_bytes\torigins_constructed_all\tseconds_enumeration_all\t"
-                 "seconds_reenumeration_all\tcum_piece_hits\tmargin_piece_hits\tcum_physical_origins\t"
-                 "margin_physical_origins\tcum_state_classes\tmargin_state_classes\tcum_latent_pairs\t"
-                 "margin_latent_pairs\tmass_cells\tmargin_mass_cells\tmargin_origin_cache_bytes\t"
-                 "records_consumed\tmargin_records_consumed\tmargin_neighbours\tmargin_rounds\t"
-                 "census_count\tcensus_bytes\tphys_footprint\tphys_footprint_peak\trss_current\t"
-                 "plan_distinct_windows\tplan_known_windows\tplan_selected_entries\tplan_selected_bytes\t"
-                 "plan_retained_entries\tplan_evicted_entries\tplan_evicted_bytes\toc_not_selected\t"
-                 "oc_group_reuses\toc_evicted_in_round\toc_evicted_in_round_bytes\n";
-        for (const Round& r : rounds) {
-            table << r.index << '\t' << r.start_total << '\t' << (r.moved ? "true" : "false") << '\t'
-                  << (r.moved ? model.blocks()[r.block].block_id : std::string("NA")) << '\t'
-                  << (r.moved ? std::to_string(r.rank) : std::string("NA")) << '\t'
-                  << (r.moved ? std::to_string(r.assignment) : std::string("NA")) << '\t'
-                  << (r.moved ? std::to_string(r.allele_x) : std::string("NA")) << '\t'
-                  << (r.moved ? std::to_string(r.allele_y) : std::string("NA")) << '\t'
-                  << join(r.first) << '\t' << join(r.second) << '\t' << r.fragment << '\t' << r.exposure
-                  << '\t' << r.prior << '\t' << r.total << '\t' << (r.total - r.start_total) << '\t'
-                  << (r.complete ? "COMPLETE" : "RESCORE_INCOMPLETE") << '\t'
-                  << (r.unique_best ? "true" : "false") << '\t' << r.separation << '\t' << r.generated
-                  << '\t' << r.neighbours << '\t' << r.duplicate << '\t' << r.suppressed << '\t'
-                  << r.self_skipped << '\t' << r.rejected_prior << '\t' << r.unique_haplotypes << '\t'
-                  << r.scored_pairs << '\t' << (r.order_invariant ? "true" : "false") << '\t'
-                  << (r.swap_invariant ? "true" : "false") << '\t' << r.seconds << '\t' << r.rss
-                  << '\t' << r.haps_new << '\t' << r.haps_reused << '\t' << r.bases_scanned << '\t'
-                  << r.piece_hits << '\t' << r.cache_requests << '\t' << r.cache_hits << '\t'
-                  << r.cache_misses << '\t' << r.executed_dps << '\t' << r.physical_origins << '\t'
-                  << r.state_classes << '\t' << r.placement_seconds << '\t'
-                  << r.combination_seconds << '\t' << r.origins_reused << '\t'
-                  << r.origins_recomputed << '\t' << r.window_bases << '\t' << r.transient_before
-                  << '\t' << r.transient_after << '\t' << r.full_bytes << '\t' << r.window_bytes
-                  << '\t' << r.key_bytes << '\t' << r.seconds_origins << '\t' << r.seconds_merge
-                  << '\t' << r.seconds_hashing << '\t' << r.seconds_lookup << '\t'
-                  << r.entry_metadata_bytes << '\t' << r.content_arena_bytes << '\t'
-                  << r.row_constructions << '\t' << r.accumulator_growths << '\t'
-                  << r.origin_growths << '\t' << r.oc_hits << '\t' << r.oc_misses << '\t'
-                  << r.oc_stored << '\t' << r.oc_entries << '\t' << r.oc_bytes << '\t'
-                  << r.origins_constructed << '\t' << r.origins_loaded << '\t'
-                  << r.fragments_reduced << '\t' << r.fragments_copied << '\t'
-                  << r.merge_working_bytes << '\t' << r.seconds_enumeration << '\t'
-                  << r.seconds_filter << '\t' << r.seconds_aggregate << '\t' << r.seconds_reduce
-                  << '\t' << r.round_wall_seconds << '\t' << r.oc_hits_all << '\t' << r.oc_misses_all
-                  << '\t' << r.oc_admitted << '\t' << r.oc_admitted_bytes << '\t' << r.oc_declined
-                  << '\t' << r.oc_declined_bytes << '\t' << r.origins_constructed_all << '\t'
-                  << r.seconds_enumeration_all << '\t' << r.seconds_reenumeration_all << '\t'
-                  << r.cum_piece_hits << '\t' << margin(scoring.max_piece_hits, r.cum_piece_hits)
-                  << '\t' << r.cum_physical_origins << '\t'
-                  << margin(scoring.max_physical_origins, r.cum_physical_origins) << '\t'
-                  << r.cum_state_classes << '\t' << margin(scoring.max_state_classes, r.cum_state_classes)
-                  << '\t' << r.cum_latent_pairs << '\t'
-                  << margin(scoring.max_latent_alignment_pairs, r.cum_latent_pairs) << '\t'
-                  << r.mass_cells << '\t' << margin(scoring.max_mass_cells, r.mass_cells) << '\t'
-                  << (use_origin_cache ? margin(origin_cache_bytes, r.oc_bytes_end) : std::string("none"))
-                  << '\t' << r.records_consumed << '\t' << margin(origin_cache_records, r.records_consumed)
-                  << '\t' << margin(declared_cap, r.neighbours) << '\t' << (last_round - r.index) << '\t'
-                  << r.census_count << '\t' << r.census_bytes << '\t' << r.phys_footprint << '\t'
-                  << r.phys_footprint_peak << '\t' << r.rss_current << '\t' << r.plan_distinct << '\t'
-                  << r.plan_known << '\t' << r.plan_selected << '\t' << r.plan_selected_bytes << '\t'
-                  << r.plan_retained << '\t' << r.plan_evicted << '\t' << r.plan_evicted_bytes << '\t'
-                  << r.oc_not_selected << '\t' << r.oc_group_reuses << '\t' << r.oc_evicted << '\t'
-                  << r.oc_evicted_bytes << '\n';
-        }
-        return table.str();
-    };
+    const auto render_rounds = [&]() { return search.render_rounds(search.rounds()); };
 
     // ---- exact origin-cache demand, and its reconciliation against the work the rounds report
-    std::uint64_t seeding_origins = 0;
     const auto render_demand = [&](const std::vector<panvar::OriginDemandRow>& rows) {
         std::ostringstream table;
         table << std::setprecision(12)
@@ -4084,7 +3797,7 @@ int repair_search(const Args& args) {
              << '\n';
         // Reconciliation: the ledger is kept by the cache path, the round columns by the caller, and
         // the cumulative counters by the budget. Hold cycles add ledger traffic no round reports.
-        if (hold_index != 0) {
+        if (search.hold_index() != 0) {
             text << "reconciled\tnot_applicable_hold_cycles\n";
             return text.str();
         }
@@ -4096,7 +3809,7 @@ int repair_search(const Args& args) {
         std::uint64_t round_admitted_bytes = 0, round_evicted_bytes = 0, round_group_reuses = 0;
         std::vector<const Round*> every_round;
         for (const Round& r : earlier_seed_rounds) every_round.push_back(&r);
-        for (const Round& r : rounds) every_round.push_back(&r);
+        for (const Round& r : search.rounds()) every_round.push_back(&r);
         for (const Round* each : every_round) {
             const Round& r = *each;
             round_hits += r.oc_hits_all;
@@ -4110,8 +3823,8 @@ int repair_search(const Args& args) {
         // Planned retention evicts, so what is cached is what was admitted less what was evicted; and
         // a ledger row marked admitted may since have been evicted, so the ledger's admitted total
         // bounds the cache only when nothing was.
-        const std::uint64_t cached = context->origin_cache_bytes();
-        const std::uint64_t executed = context->cumulative_counters().physical_origins - seeding_origins;
+        const std::uint64_t cached = search.context()->origin_cache_bytes();
+        const std::uint64_t executed = search.context()->cumulative_counters().physical_origins - search.seeding_origins();
         const bool ok = round_hits == hits && round_misses == misses && round_constructed == origins &&
                         executed == origins && round_declined == decline_events &&
                         round_admitted_bytes - round_evicted_bytes == cached &&
@@ -4193,7 +3906,7 @@ int repair_search(const Args& args) {
         TruthTables tables;
         tables.start_distance = evaluate(first_round - 1, start_first, start_second);
         tables.final_distance = tables.start_distance;
-        for (const Round& r : rounds) tables.final_distance = evaluate(r.index, r.first, r.second);
+        for (const Round& r : search.rounds()) tables.final_distance = evaluate(r.index, r.first, r.second);
         tables.distance = distance.str();
         tables.per_block = per_block.str();
         return tables;
@@ -4202,19 +3915,19 @@ int repair_search(const Args& args) {
     // ---- commit: every completed round, atomically, before the next one starts
     const auto commit = [&]() {
         std::vector<panvar::OriginDemandRow> demand_rows;
-        if (context && use_origin_cache) demand_rows = context->origin_demand();
+        if (search.context() && use_origin_cache) demand_rows = search.context()->origin_demand();
         const std::string report = demand_report(demand_rows);
         {
             std::lock_guard<std::mutex> lock(commit_mutex);
             if (finished) return;
-            rounds_committed = rounds.size();
+            rounds_committed = search.rounds().size();
             atomic_write(rounds_prefix + ".rounds.partial.tsv", render_rounds());
-            if (memory_on) atomic_write(out + ".memory.partial.tsv", memory_text);
+            if (search.memory_on()) atomic_write(out + ".memory.partial.tsv", search.memory_text());
             if (!demand_rows.empty()) {
                 atomic_write(out + ".origin_demand.partial.tsv", render_demand(demand_rows));
             }
             status_extra = report;
-            write_status("RUNNING", "round " + std::to_string(rounds.back().index) + " committed");
+            write_status("RUNNING", "round " + std::to_string(search.rounds().back().index) + " committed");
         }
         // Multi-start evaluates truth once, after every seed has finished searching.
         if (truth_gfa.empty() || multi_start) return;
@@ -4228,19 +3941,11 @@ int repair_search(const Args& args) {
                        "\navailability_floor_total\t" + std::to_string(floor_total) +
                        "\nlast_committed_excess\t" + std::to_string(tables.final_distance - floor_total) +
                        '\n';
-        write_status("RUNNING", "round " + std::to_string(rounds.back().index) + " committed, distance measured");
+        write_status("RUNNING", "round " + std::to_string(search.rounds().back().index) + " committed, distance measured");
     };
 
-    std::vector<std::size_t> cur_first = start_first;
-    std::vector<std::size_t> cur_second = start_second;
-    // The incumbent's two haplotypes keep their context slots and their censuses between rounds;
-    // everything else a round creates is transient and released at its end.
-    bool have_inc_slots = false;
-    double cur_total = start_total;
-    visited.insert(key_of(cur_first, cur_second));
-    std::string stop_reason = "round_cap";
-    double cumulative_seconds = 0.0;
-    std::uint64_t cumulative_pairs = 0;
+    search.start(start_first, start_second, start_total);
+    for (const auto& key : preoccupied_keys) search.add_visited(key.first, key.second);
 
     // ---- DIAGNOSTIC multi-start: the pool of every exactly scored candidate, keyed by complete identity
     using Identity = std::pair<std::vector<std::size_t>, std::vector<std::size_t>>;
@@ -4312,7 +4017,7 @@ int repair_search(const Args& args) {
     };
     const auto check_seed_caps = [&]() {
         if (!multi_start) return;
-        const panvar::FragmentScoringCounters& c = context->cumulative_counters();
+        const panvar::FragmentScoringCounters& c = search.context()->cumulative_counters();
         const auto over = [&](std::uint64_t now, std::uint64_t start, std::uint64_t cap, const char* what) {
             if (cap != 0 && now - start > cap) {
                 throw panvar::ResourceExhausted(std::string("the per-seed ") + what + " bound was crossed by seed " +
@@ -4418,605 +4123,37 @@ int repair_search(const Args& args) {
     if (multi_start && (hold_cycles != 0 || resuming || !use_delta)) {
         throw std::runtime_error("--multi-start needs --delta 1 and excludes --hold-cycles and --start");
     }
-    std::size_t hold_remaining = hold_cycles;
-    bool holding = false;
-    bool transient_opened = false;
     const auto run_rounds = [&]() -> int {
-    for (std::size_t round = first_round; round <= last_round; ++round) {
-        Round rec;
-        rec.index = round;
-        const auto round_mark = std::chrono::steady_clock::now();
-
-        // The incumbent, spelled once per round: its block_intervals are the coordinates every
-        // replacement below is expressed in.
-        const panvar::HaplotypeSequence incumbent_a =
-            panvar::spell_mosaic(model, panvar::MosaicPath{cur_first});
-        const panvar::HaplotypeSequence incumbent_b =
-            panvar::spell_mosaic(model, panvar::MosaicPath{cur_second});
-        if (use_delta && !have_inc_slots) {
-            // The initial pass: place the incumbent in full, then mark everything after it
-            // transient. Nothing is frozen -- owned cache keys mean a released haplotype's entries
-            // stay valid and keep serving, which is what stage 3 bought.
-            //
-            // The transient round opens BEFORE the seed is added, so a seed haplotype is released like
-            // any other former incumbent. Its census exists to delta the neighbours of the rounds in
-            // which it IS an incumbent; once a move replaces it nothing deltas from it again, and cycle
-            // prevention needs only its allele path, which `visited` holds. Opened after the seed, as
-            // it was, both seed censuses stayed live for the whole search -- two of the four at 30x.
-            if (!transient_opened) {
-                context->begin_transient_round();
-                transient_opened = true;
-            }
-            const std::uint64_t seeding_before = context->cumulative_counters().physical_origins;
-            const std::vector<std::size_t> seeded =
-                context->add_haplotypes({incumbent_a.bases, incumbent_b.bases});
-            inc_slot_a = seeded.front();
-            inc_slot_b = seeded.back();
-            role_of[inc_slot_a] = inc_slot_a == inc_slot_b ? "seed_hap1+2" : "seed_hap1";
-            if (inc_slot_b != inc_slot_a) role_of[inc_slot_b] = "seed_hap2";
-            context->retain_census(inc_slot_a);
-            context->retain_census(inc_slot_b);
-            seeding_origins += context->cumulative_counters().physical_origins - seeding_before;
-            have_inc_slots = true;
-        }
-        if (use_delta) rec.transient_before = context->transient_payload_bytes();
-        snapshot(holding ? "hold" : round_kind.c_str(), holding ? hold_index : round, "before_candidates", false,
-                 false);
-        const double lookup_before = panvar::emission_cache_lookup_seconds();
-
-        // ---- neighbourhood construction. NO TRUTH IN SCOPE.
-        std::vector<panvar::MosaicPath> paths;
-        std::vector<std::string> sequences;
-        std::map<std::vector<std::size_t>, std::size_t> slot_of_path;
-        const auto slot_for = [&](const std::vector<std::size_t>& alleles) {
-            const auto found = slot_of_path.find(alleles);
-            if (found != slot_of_path.end()) return found->second;
-            const std::size_t slot = paths.size();
-            slot_of_path.emplace(alleles, slot);
-            paths.push_back(panvar::MosaicPath{alleles});
-            sequences.push_back(panvar::spell_mosaic(model, panvar::MosaicPath{alleles}).bases);
-            return slot;
-        };
-        struct Neighbour {
-            std::size_t s1 = 0, s2 = 0, block = 0, rank = 0, x = 0, y = 0;
-            int assignment = 0;
-            std::vector<std::size_t> first, second;
-        };
-        // How each local haplotype relates to the incumbent. A neighbour differs from it at exactly
-        // one block on one side, which is precisely what the delta needs to be told.
-        struct Provenance {
-            bool is_incumbent = false;
-            int side = 0;            // 0: derived from the incumbent's first haplotype, 1: second
-            std::size_t block = 0;
-            std::size_t allele = 0;
-        };
-        std::vector<Provenance> provenance;
-        const auto slot_with = [&](const std::vector<std::size_t>& alleles, Provenance note) {
-            const std::size_t before = paths.size();
-            const std::size_t slot = slot_for(alleles);
-            if (paths.size() > before) {
-                provenance.resize(paths.size());
-                provenance[slot] = note;
-            }
-            return slot;
-        };
-        std::vector<Neighbour> neighbours;
-        std::set<std::pair<std::vector<std::size_t>, std::vector<std::size_t>>> seen_round;
-        const std::size_t cur_s1 = slot_with(cur_first, Provenance{true, 0, 0, 0});
-        const std::size_t cur_s2 = slot_with(cur_second, Provenance{true, 1, 0, 0});
-        seen_round.insert(key_of(cur_first, cur_second));
-        for (std::size_t b = 0; b < blocks; ++b) {
-            for (std::size_t r = 0; r < local[b].size(); ++r) {
-                const std::size_t x = local[b][r].first;
-                const std::size_t y = local[b][r].second;
-                for (int assignment = 0; assignment < 2; ++assignment) {
-                    if (assignment == 1 && x == y) continue;   // the swap is the same diplotype
-                    std::vector<std::size_t> first = cur_first;
-                    std::vector<std::size_t> second = cur_second;
-                    first[b] = assignment == 0 ? x : y;
-                    second[b] = assignment == 0 ? y : x;
-                    ++rec.generated;
-                    const auto key = key_of(first, second);
-                    if (key == key_of(cur_first, cur_second)) {
-                        ++rec.self_skipped;
-                        continue;
-                    }
-                    if (visited.count(key) != 0) {
-                        ++rec.suppressed;
-                        continue;
-                    }
-                    if (!seen_round.insert(key).second) {
-                        ++rec.duplicate;
-                        continue;
-                    }
-                    const std::size_t s1 = slot_with(first, Provenance{false, 0, b, first[b]});
-                    const std::size_t s2 = slot_with(second, Provenance{false, 1, b, second[b]});
-                    const double prior =
-                        panvar::log_unordered_sequence_pair_prior(model, sequences[s1], sequences[s2], switches);
-                    if (!std::isfinite(prior)) {
-                        ++rec.rejected_prior;
-                        continue;
-                    }
-                    neighbours.push_back({s1, s2, b, r + 1, x, y, assignment, first, second});
-                }
-            }
-        }
-        rec.neighbours = neighbours.size();
-        if (request_order_seed != 0) {
-            std::mt19937_64 rng(request_order_seed * 1000003ULL + round);
-            std::shuffle(neighbours.begin(), neighbours.end(), rng);
-        }
-        if (neighbours.empty()) {
-            stop_reason = "no_unvisited_neighbour";
-            rounds.push_back(rec);
-            break;
-        }
-
-        // ---- ONE scoring pass: the current candidate, then its neighbours
-        //
-        // Both paths resolve each offered sequence to a scoring index and then score the pairs. The
-        // one-shot path interns within the round and forgets afterwards; the context interns against
-        // everything it has ever held, so a haplotype this round shares with the last is not placed
-        // again. Nothing downstream of here knows which path produced the scores.
-        std::map<std::pair<std::size_t, std::size_t>, std::size_t> scored_index;
-        std::vector<panvar::HaplotypeCandidate> scored_pairs;
-        std::vector<std::size_t> pair_of_item;
-        std::vector<std::size_t> slot_of_local;
-        std::map<std::size_t, const std::string*> sequence_of_slot;
-        panvar::IncrementalBatchReport batch;
-        std::optional<panvar::InternedHaplotypes> interned;
-        panvar::BlockDeltaWork round_delta;
-        const auto accumulate = [&](const panvar::BlockDeltaWork& work) {
-            round_delta.origins_reused += work.origins_reused;
-            round_delta.origins_recomputed += work.origins_recomputed;
-            round_delta.local_window_bases += work.local_window_bases;
-            round_delta.piece_hits += work.piece_hits;
-            round_delta.dp_executions += work.dp_executions;
-            round_delta.cache_misses += work.cache_misses;
-            round_delta.cache_requests += work.cache_requests;
-            round_delta.cache_hits += work.cache_hits;
-            round_delta.full_haplotype_bytes_materialised += work.full_haplotype_bytes_materialised;
-            round_delta.local_window_bytes_materialised += work.local_window_bytes_materialised;
-            round_delta.sequence_key_bytes += work.sequence_key_bytes;
-            round_delta.seconds_placement_and_origins += work.seconds_placement_and_origins;
-            round_delta.seconds_statekey_merge += work.seconds_statekey_merge;
-            round_delta.seconds_hashing_and_windows += work.seconds_hashing_and_windows;
-            round_delta.placement_row_constructions += work.placement_row_constructions;
-            round_delta.accumulator_growths += work.accumulator_growths;
-            round_delta.origin_output_growths += work.origin_output_growths;
-            round_delta.origin_cache_hits += work.origin_cache_hits;
-            round_delta.origin_cache_misses += work.origin_cache_misses;
-            round_delta.origin_cache_stored += work.origin_cache_stored;
-            round_delta.origin_cache_declined += work.origin_cache_declined;
-            round_delta.origin_cache_not_selected += work.origin_cache_not_selected;
-            round_delta.origin_cache_admitted_bytes += work.origin_cache_admitted_bytes;
-            round_delta.origin_cache_declined_bytes += work.origin_cache_declined_bytes;
-            round_delta.seconds_reenumeration += work.seconds_reenumeration;
-            round_delta.cached_origin_records_consumed += work.cached_origin_records_consumed;
-            round_delta.physical_origins_constructed += work.physical_origins_constructed;
-            round_delta.fragments_reduced += work.fragments_reduced;
-            round_delta.fragments_copied += work.fragments_copied;
-            round_delta.seconds_enumeration += work.seconds_enumeration;
-            round_delta.seconds_affected_filter += work.seconds_affected_filter;
-            round_delta.seconds_aggregate_merge += work.seconds_aggregate_merge;
-            round_delta.seconds_reduce += work.seconds_reduce;
-            round_delta.seconds += work.seconds;
-            round_delta.origin_group_reuses += work.origin_group_reuses;
-            round_delta.origin_cache_evicted += work.origin_cache_evicted;
-            round_delta.origin_cache_evicted_bytes += work.origin_cache_evicted_bytes;
-        };
-        const auto resolve_by_delta = [&](std::size_t local, bool keep_census) {
-            const Provenance& note = provenance[local];
-            if (note.is_incumbent) return note.side == 0 ? inc_slot_a : inc_slot_b;
-            const panvar::HaplotypeSequence& base = note.side == 0 ? incumbent_a : incumbent_b;
-            const std::size_t from = note.side == 0 ? inc_slot_a : inc_slot_b;
-            const panvar::SequenceInterval span = base.block_intervals[note.block];
-            panvar::BlockDeltaWork work;
-            const std::size_t slot = context->add_repaired_haplotype(
-                from, span.begin, span.end, model.blocks()[note.block].alleles[note.allele].sequence,
-                &work, keep_census);
-            accumulate(work);
-            return slot;
-        };
-
-        if (use_delta) {
-            provenance.resize(paths.size());
-            slot_of_local.resize(paths.size());
-            const std::size_t held_before = context->haplotypes_created();
-            if (planned_cache) {
-                // The round's repairs as ONE batch: the context plans them, then executes them in its
-                // canonical order, so how this loop enumerated them cannot matter.
-                std::vector<std::size_t> requested;
-                for (std::size_t i = 0; i < paths.size(); ++i) {
-                    const Provenance& note = provenance[i];
-                    if (note.is_incumbent) {
-                        slot_of_local[i] = note.side == 0 ? inc_slot_a : inc_slot_b;
-                    } else {
-                        requested.push_back(i);
-                    }
-                }
-                if (request_order_seed != 0) {
-                    std::mt19937_64 rng(request_order_seed * 7919ULL + round);
-                    std::shuffle(requested.begin(), requested.end(), rng);
-                }
-                std::vector<panvar::RepairRequest> requests;
-                for (const std::size_t i : requested) {
-                    const Provenance& note = provenance[i];
-                    const panvar::HaplotypeSequence& base = note.side == 0 ? incumbent_a : incumbent_b;
-                    const panvar::SequenceInterval span = base.block_intervals[note.block];
-                    requests.push_back({note.side == 0 ? inc_slot_a : inc_slot_b, span.begin, span.end,
-                                        model.blocks()[note.block].alleles[note.allele].sequence});
-                }
-                std::vector<panvar::BlockDeltaWork> works;
-                panvar::OriginCachePlanReport plan;
-                const std::vector<std::size_t> slots = context->add_repaired_haplotypes(requests, &works, &plan);
-                for (std::size_t k = 0; k < requested.size(); ++k) {
-                    slot_of_local[requested[k]] = slots[k];
-                    accumulate(works[k]);
-                }
-                rec.plan_distinct = plan.distinct_windows;
-                rec.plan_known = plan.known_windows;
-                rec.plan_selected = plan.selected_entries;
-                rec.plan_selected_bytes = plan.selected_bytes;
-                rec.plan_retained = plan.retained_entries;
-                rec.plan_evicted = plan.evicted_entries;
-                rec.plan_evicted_bytes = plan.evicted_bytes;
-            } else {
-                for (std::size_t i = 0; i < paths.size(); ++i) {
-                    slot_of_local[i] = resolve_by_delta(i, false);
-                }
-            }
-            for (std::size_t i = 0; i < sequences.size(); ++i) {
-                sequence_of_slot.emplace(slot_of_local[i], &sequences[i]);
-            }
-            rec.haps_new = context->haplotypes_created() - held_before;
-            rec.haps_reused = paths.size() - rec.haps_new;
-            rec.unique_haplotypes = context->haplotypes_created();
-        } else if (context) {
-            slot_of_local = context->add_haplotypes(sequences, &batch);
-            for (std::size_t i = 0; i < sequences.size(); ++i) {
-                sequence_of_slot.emplace(slot_of_local[i], &sequences[i]);
-            }
-            rec.haps_new = batch.haplotypes_new;
-            rec.haps_reused = batch.haplotypes_reused;
-            rec.unique_haplotypes = batch.unique_haplotypes_total;
-        } else {
-            interned.emplace(panvar::intern_haplotypes(paths, sequences));
-            slot_of_local = interned->index_of;
-            for (std::size_t i = 0; i < sequences.size(); ++i) {
-                sequence_of_slot.emplace(slot_of_local[i], &interned->sequences[slot_of_local[i]]);
-            }
-            rec.haps_new = interned->sequences.size();
-            rec.unique_haplotypes = interned->sequences.size();
-        }
-        const auto add_item = [&](std::size_t a, std::size_t b2) {
-            std::size_t x = slot_of_local[a];
-            std::size_t y = slot_of_local[b2];
-            if (y < x) std::swap(x, y);
-            const auto inserted = scored_index.emplace(std::make_pair(x, y), scored_pairs.size());
-            if (inserted.second) scored_pairs.push_back({x, y});
-            pair_of_item.push_back(inserted.first->second);
-        };
-        add_item(cur_s1, cur_s2);                                  // item 0 is always the incumbent
-        for (const Neighbour& n : neighbours) add_item(n.s1, n.s2);
-        rec.scored_pairs = scored_pairs.size();
-
-        const auto mark = std::chrono::steady_clock::now();
-        const panvar::FragmentScoringResult scored =
-            context ? context->score_candidates(scored_pairs)
-                    : panvar::score_diplotypes(*interned, scored_pairs, fragments, library, scoring);
-        rec.seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - mark).count();
-        if (context) rec.seconds += batch.seconds_placement_and_mass;
-        // The deltas ran while slots were being resolved, which is before `mark`. Leaving them out
-        // reported 0.39 s for a run that took 297 s.
-        if (use_delta) rec.seconds += round_delta.seconds;
-        snapshot(holding ? "hold" : round_kind.c_str(), holding ? hold_index : round, "after_scoring", true, false);
-        rec.rss = peak_rss_gib();
-        {
-            const panvar::FragmentScoringCounters& work = context ? batch.counters : scored.counters;
-            const panvar::EmissionCacheCounters& cache =
-                context ? batch.emission_cache : scored.emission_cache;
-            rec.bases_scanned = work.candidate_bases_scanned;
-            rec.piece_hits = work.piece_hits;
-            rec.cache_requests = cache.dp_cache_requests;
-            rec.cache_hits = cache.dp_cache_hits;
-            rec.cache_misses = cache.dp_cache_misses;
-            rec.executed_dps = cache.executed_dps;
-            rec.physical_origins = work.physical_origins;
-            rec.state_classes = work.statistical_state_classes;
-            if (use_delta) {
-                rec.bases_scanned = round_delta.local_window_bases;
-                rec.piece_hits = round_delta.piece_hits;
-                rec.cache_misses = round_delta.cache_misses;
-                rec.cache_requests = round_delta.cache_requests;
-                rec.cache_hits = round_delta.cache_hits;
-                rec.executed_dps = round_delta.dp_executions;
-                rec.origins_reused = round_delta.origins_reused;
-                rec.origins_recomputed = round_delta.origins_recomputed;
-                rec.window_bases = round_delta.local_window_bases;
-                rec.full_bytes = round_delta.full_haplotype_bytes_materialised;
-                rec.window_bytes = round_delta.local_window_bytes_materialised;
-                rec.key_bytes = round_delta.sequence_key_bytes;
-                rec.seconds_origins = round_delta.seconds_placement_and_origins;
-                rec.seconds_merge = round_delta.seconds_statekey_merge;
-                rec.seconds_hashing = round_delta.seconds_hashing_and_windows;
-                rec.row_constructions = round_delta.placement_row_constructions;
-                rec.accumulator_growths = round_delta.accumulator_growths;
-                rec.origin_growths = round_delta.origin_output_growths;
-                rec.oc_hits = round_delta.origin_cache_hits;
-                rec.oc_misses = round_delta.origin_cache_misses;
-                rec.oc_stored = round_delta.origin_cache_stored;
-                rec.origins_constructed = round_delta.physical_origins_constructed;
-                rec.origins_loaded = round_delta.cached_origin_records_consumed;
-                rec.fragments_reduced = round_delta.fragments_reduced;
-                rec.fragments_copied = round_delta.fragments_copied;
-                rec.seconds_enumeration = round_delta.seconds_enumeration;
-                rec.seconds_filter = round_delta.seconds_affected_filter;
-                rec.seconds_aggregate = round_delta.seconds_aggregate_merge;
-                rec.seconds_reduce = round_delta.seconds_reduce;
-                rec.oc_entries = context->origin_cache_entries();
-                rec.oc_bytes = context->origin_cache_bytes();
-                rec.merge_working_bytes = context->merge_working_bytes();
-            }
-            rec.seconds_lookup = panvar::emission_cache_lookup_seconds() - lookup_before;
-            {
-                const panvar::EmissionCacheCounters live = panvar::read_emission_cache_counters();
-                rec.entry_metadata_bytes = live.entry_metadata_bytes;
-                rec.content_arena_bytes = live.content_arena_bytes;
-            }
-            rec.placement_seconds =
-                use_delta ? round_delta.seconds
-                          : (context ? batch.seconds_placement_and_mass
-                                     : scored.seconds_placement_and_mass);
-            rec.combination_seconds = scored.seconds_diploid_combination;
-        }
-        if (!holding) {
-            cumulative_seconds += rec.seconds;
-            cumulative_pairs += scored_pairs.size();
-        }
-
-        std::vector<double> prior_of_pair(scored_pairs.size(), 0.0);
-        for (std::size_t slot = 0; slot < scored_pairs.size(); ++slot) {
-            prior_of_pair[slot] = panvar::log_unordered_sequence_pair_prior(
-                model, *sequence_of_slot.at(scored_pairs[slot].first),
-                *sequence_of_slot.at(scored_pairs[slot].second), switches);
-        }
-
-        // ---- the guard: the incumbent must still score what it scored before any neighbour is read.
-        // Round 1 checks against the campaign's own recorded value, which is what ties this search to
-        // the signature-bound outputs rather than to a ranking it produced itself.
-        const double incumbent =
-            scored.scores[pair_of_item[0]].log_likelihood + prior_of_pair[pair_of_item[0]];
-        if (std::fabs(incumbent - cur_total) > 1e-6) {
-            summary << "refused\ttrue\nrefusal\tthe incumbent did not reproduce in round "
-                    << round << "\nincumbent_expected\t" << cur_total << "\nincumbent_scored\t"
-                    << incumbent << '\n';
-            std::cout << "repair-search " << donor << ": REFUSED, the incumbent did not reproduce in round "
-                      << round << " (expected " << cur_total << ", scored " << incumbent << ")\n";
-            finish("FAILED", "the incumbent did not reproduce in round " + std::to_string(round));
-            return 4;
-        }
-        // The scored value is the authoritative one; a declared --start-score is only an assertion
-        // about it, and one that has been through text at finite precision. Adopting the scored value
-        // here is what makes a resumed leg byte-identical to never having stopped.
-        cur_total = incumbent;
-        rec.start_total = incumbent;
+        panvar::RepairHooks hooks;
         if (multi_start) {
-            const std::string tag = "seed" + std::to_string(current_seed) + "_visit";
-            for (std::size_t item = 0; item < pair_of_item.size(); ++item) {
-                const std::size_t at = pair_of_item[item];
-                const std::size_t s1 = item == 0 ? cur_s1 : neighbours[item - 1].s1;
-                const std::size_t s2 = item == 0 ? cur_s2 : neighbours[item - 1].s2;
-                pool_add(item == 0 ? cur_first : neighbours[item - 1].first,
-                         item == 0 ? cur_second : neighbours[item - 1].second, sequences[s1], sequences[s2],
-                         scored.scores[at], prior_of_pair[at], tag);
-            }
-        }
-
-        // ---- certify the round with production's own certifier, in presentation order
-        const auto certify = [&](bool reversed) {
-            std::vector<std::size_t> order(pair_of_item.size());
-            for (std::size_t i = 0; i < order.size(); ++i) order[i] = i;
-            if (reversed) std::reverse(order.begin(), order.end());
-            std::vector<panvar::DiplotypeScore> scores;
-            std::vector<double> priors;
-            std::vector<std::size_t> item_of_local;
-            std::set<std::size_t> taken;
-            for (const std::size_t i : order) {
-                const std::size_t slot = pair_of_item[i];
-                if (!taken.insert(slot).second) continue;
-                scores.push_back(scored.scores[slot]);
-                priors.push_back(prior_of_pair[slot]);
-                item_of_local.push_back(i);
-            }
-            const panvar::CertifiedRanking ranking = panvar::certify_scored_ranking(
-                scores, fragments.size(), scoring.mismatch_band, scored.counters,
-                panvar::CertificationOptions{}, priors);
-            return std::make_pair(ranking, item_of_local);
-        };
-        const auto forward = certify(false);
-        const panvar::CertifiedRanking& ranking = forward.first;
-        const std::size_t winner_item = forward.second[ranking.candidates.front().candidate_id];
-        rec.complete = ranking.status == panvar::RescoreStatus::Complete;
-        rec.unique_best = ranking.winner_set.size() == 1;
-        rec.separation = ranking.certified_gap;
-
-        // Order invariance, from the scores already computed: no new likelihood call.
-        {
-            const auto back = certify(true);
-            const std::size_t back_item = back.second[back.first.candidates.front().candidate_id];
-            const auto alleles_of = [&](std::size_t item) {
-                if (item == 0) return std::minmax(cur_first, cur_second);
-                return std::minmax(neighbours[item - 1].first, neighbours[item - 1].second);
+            hooks.on_scored = [&](const std::vector<std::size_t>& a, const std::vector<std::size_t>& b,
+                                  const std::string& sa, const std::string& sb, const panvar::DiplotypeScore& score,
+                                  double prior) {
+                pool_add(a, b, sa, sb, score, prior, "seed" + std::to_string(current_seed) + "_visit");
             };
-            if (alleles_of(back_item) != alleles_of(winner_item) ||
-                back.first.candidates.front().score != ranking.candidates.front().score) {
-                rec.order_invariant = false;
-            }
         }
-        // Homologue swap: rebuilding the neighbourhood with the incumbent's haplotypes exchanged must
-        // give the identical key set, because both assignments are generated for every local pair.
-        {
-            std::set<std::pair<std::vector<std::size_t>, std::vector<std::size_t>>> swapped;
-            for (std::size_t b = 0; b < blocks; ++b) {
-                for (std::size_t r = 0; r < local[b].size(); ++r) {
-                    const std::size_t x = local[b][r].first;
-                    const std::size_t y = local[b][r].second;
-                    for (int assignment = 0; assignment < 2; ++assignment) {
-                        if (assignment == 1 && x == y) continue;
-                        std::vector<std::size_t> first = cur_second;   // homologues exchanged
-                        std::vector<std::size_t> second = cur_first;
-                        first[b] = assignment == 0 ? x : y;
-                        second[b] = assignment == 0 ? y : x;
-                        swapped.insert(key_of(first, second));
-                    }
-                }
-            }
-            for (const Neighbour& n : neighbours) {
-                if (swapped.count(key_of(n.first, n.second)) == 0) rec.swap_invariant = false;
-            }
-        }
-
-        // ---- the move rule
-        if (winner_item != 0) {
-            const Neighbour& best = neighbours[winner_item - 1];
-            const std::size_t slot = pair_of_item[winner_item];
-            rec.block = best.block;
-            rec.rank = best.rank;
-            rec.assignment = best.assignment;
-            rec.allele_x = best.x;
-            rec.allele_y = best.y;
-            rec.first = best.first;
-            rec.second = best.second;
-            rec.fragment = scored.scores[slot].fragment_term;
-            rec.exposure = scored.scores[slot].exposure_term;
-            rec.prior = prior_of_pair[slot];
-            rec.total = scored.scores[slot].log_likelihood + prior_of_pair[slot];
-        } else {
-            rec.first = cur_first;
-            rec.second = cur_second;
-            const std::size_t slot = pair_of_item[0];
-            rec.fragment = scored.scores[slot].fragment_term;
-            rec.exposure = scored.scores[slot].exposure_term;
-            rec.prior = prior_of_pair[slot];
-            rec.total = incumbent;
-        }
-
-        if (!rec.complete) {
-            stop_reason = "rescore_incomplete";
-        } else if (winner_item == 0) {
-            stop_reason = "no_improvement";
-        } else if (!rec.unique_best) {
-            stop_reason = "tie_at_best";
-        } else if (rec.total <= cur_total) {
-            stop_reason = "no_improvement";
-        } else if (visited.count(key_of(rec.first, rec.second)) != 0) {
-            stop_reason = "cycle";                                  // suppression should preclude this
-        } else {
-            rec.moved = true;
-        }
-        if (use_delta) {
-            std::vector<std::size_t> keep;
-            if (rec.moved && winner_item != 0) {
-                const Neighbour& best = neighbours[winner_item - 1];
-                // A delta, not a full placement: the winner's census is built from the incumbent's.
-                const std::size_t won_a = resolve_by_delta(best.s1, true);
-                const std::size_t won_b = resolve_by_delta(best.s2, true);
-                keep = {won_a, won_b};
-                const std::string promoted = "promoted_r" + std::to_string(round);
-                if (won_a != inc_slot_a && won_a != inc_slot_b) role_of[won_a] = promoted + "_hap1";
-                if (won_b != inc_slot_a && won_b != inc_slot_b && won_b != won_a) {
-                    role_of[won_b] = promoted + "_hap2";
-                }
-                inc_slot_a = won_a;
-                inc_slot_b = won_b;
-            } else {
-                keep = {inc_slot_a, inc_slot_b};
-            }
-            snapshot(holding ? "hold" : round_kind.c_str(), holding ? hold_index : round, "after_promotion", true,
-                     false);
-            context->release_transient(keep);
-            for (auto it = role_of.begin(); it != role_of.end();) {
-                if (std::find(keep.begin(), keep.end(), it->first) == keep.end()) {
-                    it = role_of.erase(it);
-                } else {
-                    ++it;
-                }
-            }
-            rec.transient_after = context->transient_payload_bytes();
-            snapshot(holding ? "hold" : round_kind.c_str(), holding ? hold_index : round, "after_release", true,
-                     pressure_relief && holding && hold_remaining == 0);
-            // Re-read AFTER the promotion above. rec.full_bytes was assigned back in the scoring
-            // block, before any winner existed, so the one materialisation a round performs could
-            // never appear in it -- the figure was structurally stuck at zero.
-            rec.full_bytes = round_delta.full_haplotype_bytes_materialised;
-            rec.key_bytes = round_delta.sequence_key_bytes;
-            rec.seconds_origins = round_delta.seconds_placement_and_origins;
-            rec.seconds_merge = round_delta.seconds_statekey_merge;
-            rec.seconds_hashing = round_delta.seconds_hashing_and_windows;
-            rec.oc_hits_all = round_delta.origin_cache_hits;
-            rec.oc_misses_all = round_delta.origin_cache_misses;
-            rec.oc_admitted = round_delta.origin_cache_stored;
-            rec.oc_admitted_bytes = round_delta.origin_cache_admitted_bytes;
-            rec.oc_declined = round_delta.origin_cache_declined;
-            rec.oc_declined_bytes = round_delta.origin_cache_declined_bytes;
-            rec.oc_not_selected = round_delta.origin_cache_not_selected;
-            rec.oc_group_reuses = round_delta.origin_group_reuses;
-            rec.oc_evicted = round_delta.origin_cache_evicted;
-            rec.oc_evicted_bytes = round_delta.origin_cache_evicted_bytes;
-            rec.origins_constructed_all = round_delta.physical_origins_constructed;
-            rec.seconds_enumeration_all = round_delta.seconds_enumeration;
-            rec.seconds_reenumeration_all = round_delta.seconds_reenumeration;
-        }
-        if (context) {
-            const panvar::FragmentScoringCounters& cumulative = context->cumulative_counters();
-            rec.cum_piece_hits = cumulative.piece_hits;
-            rec.cum_physical_origins = cumulative.physical_origins;
-            rec.cum_state_classes = cumulative.statistical_state_classes;
-            rec.cum_latent_pairs = cumulative.latent_alignment_pairs;
-            rec.mass_cells = static_cast<std::uint64_t>(fragments.size()) * context->unique_haplotypes();
-            rec.records_consumed = context->origin_records_consumed();
-            rec.census_count = context->census_slots().size();
-            rec.census_bytes = context->retained_census_bytes();
-            rec.oc_bytes_end = context->origin_cache_bytes();
-        }
-        {
-            const FootprintSample footprint = physical_footprint();
-            rec.phys_footprint = footprint.current;
-            rec.phys_footprint_peak = footprint.peak;
-            rec.rss_current = current_rss_bytes();
-        }
-        rec.round_wall_seconds =
-            std::chrono::duration<double>(std::chrono::steady_clock::now() - round_mark).count();
-        if (!holding) {
-            rounds.push_back(rec);
+        hooks.on_round = [&](const Round& rec) {
             commit();
             check_seed_caps();
-            if (interrupt_after != 0 && rounds.size() >= interrupt_after && rec.moved && round < last_round) {
+            if (interrupt_after != 0 && search.rounds().size() >= interrupt_after && rec.moved && rec.index < last_round) {
                 stop_now("TIME_LIMIT",
                          "interrupt-after-rounds " + std::to_string(interrupt_after) +
                              " (test hook: the time-limit path, triggered deterministically)",
                          124);
             }
+        };
+        if (!search.run(hooks)) {
+            const std::size_t round = search.failed_round();
+            summary << "refused\ttrue\nrefusal\tthe incumbent did not reproduce in round " << round
+                    << "\nincumbent_expected\t" << search.incumbent_expected() << "\nincumbent_scored\t"
+                    << search.incumbent_scored() << '\n';
+            std::cout << "repair-search " << donor << ": REFUSED, the incumbent did not reproduce in round "
+                      << round << " (expected " << search.incumbent_expected() << ", scored "
+                      << search.incumbent_scored() << ")\n";
+            finish("FAILED", "the incumbent did not reproduce in round " + std::to_string(round));
+            return 4;
         }
-        if (!rec.moved) {
-            if (hold_remaining > 0) {
-                // Not a round: the counter does not advance, and nothing is recorded as one.
-                holding = true;
-                --hold_remaining;
-                ++hold_index;
-                --round;
-                continue;
-            }
-            break;
-        }
-        visited.insert(key_of(rec.first, rec.second));
-        cur_first = rec.first;
-        cur_second = rec.second;
-        cur_total = rec.total;
-        if (round == last_round) stop_reason = "round_cap";
-    }
-    return 0;
+        return 0;
     };
     std::vector<SeedOutcome> outcomes;
     std::vector<Seed> seeds;
@@ -5031,16 +4168,7 @@ int repair_search(const Args& args) {
             if (code != 0) return code;
         } else {
 // ---- 1. the union, rescored exactly in this context. Truth is not in scope.
-            const auto new_context = [&]() {
-                context.reset();
-                context = std::make_unique<panvar::PreparedScoringContext>(fragments, library, scoring);
-                if (use_origin_cache) {
-                    context->enable_origin_cache_path(true);
-                    context->set_origin_cache_limits(origin_cache_bytes, origin_cache_records);
-                }
-                transient_opened = false;
-                seeding_origins = 0;   // seeding work is counted within one context
-            };
+            const auto new_context = [&]() { search.new_context(); };
             std::vector<std::size_t> input_order(union_ids.size());
             std::iota(input_order.begin(), input_order.end(), std::size_t{0});
             if (shuffle_union != 0) {
@@ -5062,12 +4190,9 @@ int repair_search(const Args& args) {
                 spell_of(o.second);
             }
             union_haplotypes = spelled.size();
-            if (!transient_opened) {
-                context->begin_transient_round();
-                transient_opened = true;
-            }
-            const std::uint64_t union_before = context->cumulative_counters().physical_origins;
-            const std::vector<std::size_t> slot_of_spelled = context->add_haplotypes(spelled);
+            search.open_transient_round();
+            const std::uint64_t union_before = search.context()->cumulative_counters().physical_origins;
+            const std::vector<std::size_t> slot_of_spelled = search.context()->add_haplotypes(spelled);
             std::map<std::size_t, std::size_t> spelled_of_slot;
             for (std::size_t i = 0; i < slot_of_spelled.size(); ++i) spelled_of_slot.emplace(slot_of_spelled[i], i);
             std::map<std::pair<std::size_t, std::size_t>, std::size_t> union_pair_index;
@@ -5079,8 +4204,8 @@ int repair_search(const Args& args) {
                 if (y < x) std::swap(x, y);
                 if (union_pair_index.emplace(std::make_pair(x, y), union_pairs.size()).second) union_pairs.push_back({x, y});
             }
-            const panvar::FragmentScoringResult union_scored = context->score_candidates(union_pairs);
-            seeding_origins += context->cumulative_counters().physical_origins - union_before;
+            const panvar::FragmentScoringResult union_scored = search.context()->score_candidates(union_pairs);
+            search.add_seeding_origins(search.context()->cumulative_counters().physical_origins - union_before);
             for (const std::size_t i : input_order) {
                 const Original& o = original_of_id.at(union_ids[i]);
                 std::size_t x = slot_of_spelled[spell_of(o.first)];
@@ -5110,7 +4235,7 @@ int repair_search(const Args& args) {
             }
 
             // ---- 2. the seed set, from the exact union ranking alone
-            union_context_counters = context->cumulative_counters();
+            union_context_counters = search.context()->cumulative_counters();
             const PooledRanking initial = rank_pool(true);
             std::vector<std::size_t> position(initial.groups.size(), 0);
             for (std::size_t p = 0; p < initial.ranking.candidates.size(); ++p) {
@@ -5222,47 +4347,39 @@ int repair_search(const Args& args) {
                     const Seed& seed = seeds[k];
                     if (isolate_seeds) new_context();
                     current_seed = k;
-                    seed_start = context->cumulative_counters();
+                    seed_start = search.context()->cumulative_counters();
                     rounds_prefix = out + ".seed" + std::to_string(k);
-                    round_kind = "seed" + std::to_string(k);
-                    cur_first = seed.key.first;
-                    cur_second = seed.key.second;
-                    cur_total = seed.certified.score;
-                    visited.clear();
-                    visited.insert(key_of(cur_first, cur_second));
-                    rounds.clear();
-                    stop_reason = "round_cap";
-                    have_inc_slots = false;
-                    role_of.clear();
+                    search.set_round_kind("seed" + std::to_string(k));
+                    search.start(seed.key.first, seed.key.second, seed.certified.score);
                     const auto seed_mark = std::chrono::steady_clock::now();
                     const int code = run_rounds();
                     if (code != 0) return code;
                     check_seed_caps();
                     SeedOutcome& o = outcomes[k];
                     o.seed = k;
-                    o.rounds = rounds;
-                    o.stop = stop_reason;
-                    o.optimum = key_of(cur_first, cur_second);
-                    o.optimum_total = cur_total;
+                    o.rounds = search.rounds();
+                    o.stop = search.stop_reason();
+                    o.optimum = key_of(search.incumbent_first(), search.incumbent_second());
+                    o.optimum_total = search.incumbent_total();
                     o.incumbents.push_back(seed.key);
-                    for (const Round& r : rounds) {
+                    for (const Round& r : search.rounds()) {
                         if (r.moved) o.incumbents.push_back(key_of(r.first, r.second));
                     }
-                    const panvar::FragmentScoringCounters& c = context->cumulative_counters();
+                    const panvar::FragmentScoringCounters& c = search.context()->cumulative_counters();
                     o.used.physical_origins = c.physical_origins - seed_start.physical_origins;
                     o.used.statistical_state_classes = c.statistical_state_classes - seed_start.statistical_state_classes;
                     o.used.piece_hits = c.piece_hits - seed_start.piece_hits;
                     o.used.latent_alignment_pairs = c.latent_alignment_pairs - seed_start.latent_alignment_pairs;
                     o.seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - seed_mark).count();
                     pool.at(o.optimum).tags.insert("seed" + std::to_string(k) + "_optimum");
-                    earlier_seed_rounds.insert(earlier_seed_rounds.end(), rounds.begin(), rounds.end());
-                    if (!isolate_seeds) context->release_transient({});
+                    earlier_seed_rounds.insert(earlier_seed_rounds.end(), search.rounds().begin(), search.rounds().end());
+                    if (!isolate_seeds) search.context()->release_transient({});
                 }
             }
         }
     } catch (const panvar::ResourceExhausted& refusal) {
         finish("RESOURCE_REFUSAL", refusal.what());
-        std::cout << "repair-search " << donor << ": RESOURCE_REFUSAL after " << rounds.size()
+        std::cout << "repair-search " << donor << ": RESOURCE_REFUSAL after " << search.rounds().size()
                   << " committed rounds: " << refusal.what() << '\n';
         return 5;
     } catch (const std::exception& failure) {
@@ -5400,7 +4517,7 @@ int repair_search(const Args& args) {
                    << "\navailability_floor_total\t" << floor_total << "\nfinal_winner_excess_min\t"
                    << (best - floor_total) << '\n';
         }
-        const panvar::FragmentScoringCounters& cumulative = context->cumulative_counters();
+        const panvar::FragmentScoringCounters& cumulative = search.context()->cumulative_counters();
         report << "union_context_physical_origins\t" << union_context_counters.physical_origins
                << "\nunion_context_state_classes\t" << union_context_counters.statistical_state_classes << '\n';
         report << "cumulative_physical_origins\t" << cumulative.physical_origins << "\ncumulative_state_classes\t"
@@ -5411,14 +4528,13 @@ int repair_search(const Args& args) {
                << "\nthreads_requested\t" << scoring.threads << "\npeak_active_workers\t"
                << panvar::peak_active_workers() << "\nphys_footprint_peak_bytes\t" << physical_footprint().peak << '\n';
         std::vector<panvar::OriginDemandRow> demand_rows;
-        if (context && use_origin_cache) demand_rows = context->origin_demand();
+        if (search.context() && use_origin_cache) demand_rows = search.context()->origin_demand();
         {
             std::lock_guard<std::mutex> lock(commit_mutex);
             if (finished) return 6;
             finished = true;
             for (const SeedOutcome& o : outcomes) {
-                rounds = o.rounds;
-                atomic_write(out + ".seed" + std::to_string(o.seed) + ".rounds.tsv", render_rounds());
+                atomic_write(out + ".seed" + std::to_string(o.seed) + ".rounds.tsv", search.render_rounds(o.rounds));
                 std::error_code ignored;
                 std::filesystem::remove(out + ".seed" + std::to_string(o.seed) + ".rounds.partial.tsv", ignored);
             }
@@ -5430,7 +4546,7 @@ int repair_search(const Args& args) {
             }
             atomic_write(out + ".initial_ranking.tsv", render_ranking(initial, 50));
             atomic_write(out + ".final_ranking.tsv", render_ranking(final_ranking, 50));
-            if (memory_on) atomic_write(out + ".memory.tsv", memory_text);
+            if (search.memory_on()) atomic_write(out + ".memory.tsv", search.memory_text());
             if (!demand_rows.empty()) atomic_write(out + ".origin_demand.tsv", render_demand(demand_rows));
             atomic_write(out + ".summary.tsv", summary.str() + report.str());
             for (const char* partial : {"rounds", "memory", "origin_demand", "distance", "round_truth"}) {
@@ -5448,7 +4564,7 @@ int repair_search(const Args& args) {
 
     bool order_all = true;
     bool swap_all = true;
-    for (const Round& r : rounds) {
+    for (const Round& r : search.rounds()) {
         order_all = order_all && r.order_invariant;
         swap_all = swap_all && r.swap_invariant;
     }
@@ -5457,7 +4573,7 @@ int repair_search(const Args& args) {
         double combination = 0.0;
         std::size_t new_haps = 0;
         std::size_t reused_haps = 0;
-        for (const Round& r : rounds) {
+        for (const Round& r : search.rounds()) {
             placement += r.placement_seconds;
             combination += r.combination_seconds;
             new_haps += r.haps_new;
@@ -5465,50 +4581,50 @@ int repair_search(const Args& args) {
         }
         std::uint64_t origins = 0;
         std::uint64_t classes = 0;
-        for (const Round& r : rounds) {
+        for (const Round& r : search.rounds()) {
             origins += r.physical_origins;
             classes += r.state_classes;
         }
-        if (context) {
-            origins = context->cumulative_counters().physical_origins;
-            classes = context->cumulative_counters().statistical_state_classes;
+        if (search.context()) {
+            origins = search.context()->cumulative_counters().physical_origins;
+            classes = search.context()->cumulative_counters().statistical_state_classes;
         }
         summary << "cumulative_physical_origins\t" << origins << "\ncumulative_state_classes\t"
                 << classes << "\ndeclared_max_physical_origins\t" << scoring.max_physical_origins
                 << '\n';
         std::uint64_t reused = 0;
         std::uint64_t recomputed = 0;
-        for (const Round& r : rounds) {
+        for (const Round& r : search.rounds()) {
             reused += r.origins_reused;
             recomputed += r.origins_recomputed;
         }
         summary << "origins_reused\t" << reused << "\norigins_recomputed\t" << recomputed << '\n';
         summary << "scoring_mode\t"
-                << (use_delta ? "block_delta" : (context ? "prepared_context" : "one_shot_per_round"))
+                << (use_delta ? "block_delta" : (search.context() ? "prepared_context" : "one_shot_per_round"))
                 << "\nhaplotypes_placed\t" << new_haps << "\nhaplotypes_reused\t" << reused_haps
                 << "\nseconds_placement\t" << placement << "\nseconds_combination\t" << combination
                 << "\nfraction_scanning_new_haplotypes\t"
-                << (cumulative_seconds > 0.0 ? placement / cumulative_seconds : 0.0) << '\n';
-        if (context) {
-            summary << "context_unique_haplotypes\t" << context->unique_haplotypes() << '\n';
+                << (search.cumulative_seconds() > 0.0 ? placement / search.cumulative_seconds() : 0.0) << '\n';
+        if (search.context()) {
+            summary << "context_unique_haplotypes\t" << search.context()->unique_haplotypes() << '\n';
         }
     }
-    summary << "rounds_run\t" << rounds.size() << "\nstop_reason\t" << stop_reason
-            << "\nvisited_size\t" << visited.size() << "\norder_invariant\t"
+    summary << "rounds_run\t" << search.rounds().size() << "\nstop_reason\t" << search.stop_reason()
+            << "\nvisited_size\t" << search.visited_size() << "\norder_invariant\t"
             << (order_all ? "true" : "false") << "\nswap_invariant\t" << (swap_all ? "true" : "false")
-            << "\ncumulative_scoring_seconds\t" << cumulative_seconds << "\ncumulative_scored_pairs\t"
-            << cumulative_pairs << "\npeak_rss_gib\t" << peak_rss_gib() << "\nfinal_total\t" << cur_total
-            << "\nimprovement_total\t" << (cur_total - start_total) << '\n';
+            << "\ncumulative_scoring_seconds\t" << search.cumulative_seconds() << "\ncumulative_scored_pairs\t"
+            << search.cumulative_pairs() << "\npeak_rss_gib\t" << peak_rss_gib() << "\nfinal_total\t" << search.incumbent_total()
+            << "\nimprovement_total\t" << (search.incumbent_total() - start_total) << '\n';
     std::vector<panvar::OriginDemandRow> demand_rows;
-    if (context && use_origin_cache) demand_rows = context->origin_demand();
+    if (search.context() && use_origin_cache) demand_rows = search.context()->origin_demand();
     summary << demand_report(demand_rows);
     summary << "phys_footprint_peak_bytes\t" << physical_footprint().peak << '\n';
     // Threads: what was requested, what the window enumeration split into, and the most workers that
     // were ever active at once across every stage -- which may never exceed the request.
     summary << "threads_requested\t" << scoring.threads << "\npeak_active_workers\t"
             << panvar::peak_active_workers() << '\n';
-    if (context) {
-        const panvar::ParallelEnumerationStats p = context->parallel_enumeration_stats();
+    if (search.context()) {
+        const panvar::ParallelEnumerationStats p = search.context()->parallel_enumeration_stats();
         summary << "enumeration_workers\t" << p.workers << "\nparallel_enumerations\t" << p.parallel_enumerations
                 << "\nparallel_duplicate_dps\t" << p.duplicate_dps << "\nparallel_duplicate_scan_bases\t"
                 << p.duplicate_scan_bases << '\n';
@@ -5526,9 +4642,9 @@ int repair_search(const Args& args) {
         std::lock_guard<std::mutex> lock(commit_mutex);
         if (finished) return 6;   // a stop already won; its status stands
         finished = true;
-        rounds_committed = rounds.size();
+        rounds_committed = search.rounds().size();
         atomic_write(out + ".rounds.tsv", render_rounds());
-        if (memory_on) atomic_write(out + ".memory.tsv", memory_text);
+        if (search.memory_on()) atomic_write(out + ".memory.tsv", search.memory_text());
         if (!demand_rows.empty()) atomic_write(out + ".origin_demand.tsv", render_demand(demand_rows));
         if (truth_gfa.empty()) {
             summary << "truth_evaluated\tfalse\n";
@@ -5566,7 +4682,7 @@ int repair_search(const Args& args) {
             atomic_write(out + ".piece_screen.tsv", text.str());
         }
         for (const auto& [label, hash] : export_windows) {
-            const panvar::DemandWindow w = context->demand_window(hash);
+            const panvar::DemandWindow w = search.context()->demand_window(hash);
             std::ostringstream text;
             text << "key\tvalue\nlabel\t" << label << "\nkey_hash\t" << hash << "\nfound\t"
                  << (w.found ? "true" : "false") << "\nat_start\t" << (w.at_start ? 1 : 0) << "\nat_end\t"
@@ -5574,16 +4690,16 @@ int repair_search(const Args& args) {
                  << w.rel_new_end << "\nwindow_bytes\t" << w.bytes.size() << "\nbytes\t" << w.bytes << '\n';
             atomic_write(out + ".window." + label + ".tsv", text.str());
         }
-        write_status("COMPLETE", stop_reason);
+        write_status("COMPLETE", search.stop_reason());
     }
     if (truth_gfa.empty()) {
-        std::cout << "repair-search " << donor << ": " << rounds.size() << " rounds, stop=" << stop_reason
-                  << ", improvement " << (cur_total - start_total) << " nats, no truth evaluation\n";
+        std::cout << "repair-search " << donor << ": " << search.rounds().size() << " rounds, stop=" << search.stop_reason()
+                  << ", improvement " << (search.incumbent_total() - start_total) << " nats, no truth evaluation\n";
         return 0;
     }
-    std::cout << "repair-search " << donor << ": " << rounds.size() << " rounds, stop=" << stop_reason
-              << ", improvement " << (cur_total - start_total) << " nats, distance " << tables.start_distance
-              << " -> " << tables.final_distance << " (floor " << floor_total << "), " << cumulative_seconds
+    std::cout << "repair-search " << donor << ": " << search.rounds().size() << " rounds, stop=" << search.stop_reason()
+              << ", improvement " << (search.incumbent_total() - start_total) << " nats, distance " << tables.start_distance
+              << " -> " << tables.final_distance << " (floor " << floor_total << "), " << search.cumulative_seconds()
               << "s scoring\n";
     return 0;
 }

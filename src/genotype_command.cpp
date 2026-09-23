@@ -4,6 +4,7 @@
 #include "panvar/fragment_likelihood.hpp"
 #include "panvar/genotype_locus.hpp"
 #include "panvar/genotype_model.hpp"
+#include "panvar/genotype_repair.hpp"
 #include "panvar/gfa.hpp"
 #include "panvar/gfa_io.hpp"
 #include "panvar/graph_sort.hpp"
@@ -17,18 +18,23 @@
 #include "panvar/output.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
+#include <cstdlib>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <limits>
 #include <map>
+#include <mutex>
 #include <optional>
 #include <set>
 #include <sstream>
 #include <stdexcept>
+#include <thread>
 
 namespace panvar {
 namespace {
@@ -37,6 +43,95 @@ using Clock = std::chrono::steady_clock;
 
 double seconds_since(Clock::time_point from) {
     return std::chrono::duration<double>(Clock::now() - from).count();
+}
+
+// Every output a run can leave under its prefix, final and partial. A run owns its prefix: these are
+// removed before anything else, so a run that stops early can never sit beside an earlier result.
+const char* const kFinalOutputs[] = {".genotypes.tsv", ".block_genotypes.tsv", ".mosaic_candidates.tsv",
+                                     ".mosaic_scores.tsv", ".mosaic_haplotypes.fa", ".equivalence_set.tsv",
+                                     ".repair_rounds.tsv", ".repair_memory.tsv"};
+const char* const kPartialOutputs[] = {".repair_rounds.partial.tsv", ".repair_memory.partial.tsv"};
+
+// The run's process-level guard. Status files are written whole (atomic rename), and the terminal
+// status, or the start of the final outputs, CLAIMS the run under the mutex: from then on the
+// watchdog cannot stop it, and before then a watchdog stop removes every final output first. So a
+// stopped run can never leave a final-named table, and a completed one is never stamped as stopped.
+struct RunWatch {
+    std::mutex mutex;
+    bool finished = false;
+    std::string out_prefix;
+    std::string fingerprint = "NA";
+    std::string profile = "none";
+    std::string profile_sha256 = "none";
+    std::string phase = "starting";
+    std::size_t repair_rounds_committed = 0;
+    Clock::time_point started = Clock::now();
+    std::uint64_t footprint_limit = 0;
+    double time_limit = 0.0;
+};
+// The one run in flight in this process, or null. Runs are sequential within a process.
+RunWatch* g_watch = nullptr;
+// Provenance of the inputs, by content, for the run in flight.
+std::vector<std::pair<std::string, std::string>> g_input_hashes;
+
+std::string minimal_status(const RunWatch& watch, const std::string& state, const std::string& note) {
+    const FootprintSample footprint = physical_footprint();
+    std::ostringstream text;
+    text << std::setprecision(12) << "key\tvalue\nstatus\t" << state << "\nnote\t" << note
+         << "\nmodel_fingerprint\t" << watch.fingerprint << "\nprofile\t" << watch.profile << "\nprofile_sha256\t"
+         << watch.profile_sha256 << "\nphase\t" << watch.phase << "\nelapsed_seconds\t" << seconds_since(watch.started)
+         << "\ntime_limit_seconds\t" << watch.time_limit << "\nfootprint_limit_bytes\t" << watch.footprint_limit
+         << "\nphys_footprint_bytes\t" << footprint.current << "\nphys_footprint_peak_bytes\t" << footprint.peak
+         << "\nrss_current_bytes\t" << current_rss_bytes() << "\nrss_peak_bytes\t"
+         << static_cast<std::uint64_t>(peak_rss_gib() * 1073741824.0) << "\nrepair_rounds_committed\t"
+         << watch.repair_rounds_committed << "\noutputs\t"
+         << (state == "RUNNING" ? "IN PROGRESS: nothing under this prefix is a result yet"
+                                : "PARTIAL: <prefix>.repair_rounds.partial.tsv holds committed rounds only; no "
+                                  "genotype, not a call")
+         << '\n';
+    for (const auto& hash : g_input_hashes) text << "sha256_" << hash.first << '\t' << hash.second << '\n';
+    return text.str();
+}
+
+// A RUNNING status, only while nothing has claimed the run.
+void write_running_status(const std::string& phase) {
+    if (g_watch == nullptr) return;
+    std::lock_guard<std::mutex> lock(g_watch->mutex);
+    if (g_watch->finished) return;
+    g_watch->phase = phase;
+    atomic_write(g_watch->out_prefix + ".mosaic_status.tsv", minimal_status(*g_watch, "RUNNING", phase));
+}
+
+// Claims the run: the watchdog can no longer stop it. Idempotent.
+void claim_run() {
+    if (g_watch == nullptr) return;
+    std::lock_guard<std::mutex> lock(g_watch->mutex);
+    g_watch->finished = true;
+}
+
+// Stops the process where it stands, if nothing has claimed the run. _Exit runs no destructor, so the
+// staged graph and any final output are removed here; committed partial rounds stay as the record.
+void stop_run(const std::string& state, const std::string& note, int code) {
+    std::lock_guard<std::mutex> lock(g_watch->mutex);
+    if (g_watch->finished) return;
+    g_watch->finished = true;
+    std::error_code ignored;
+    for (const char* suffix : kFinalOutputs) std::filesystem::remove(g_watch->out_prefix + suffix, ignored);
+    std::filesystem::remove(g_watch->out_prefix + ".sorted.gfa", ignored);
+    atomic_write(g_watch->out_prefix + ".mosaic_status.tsv", minimal_status(*g_watch, state, note));
+    std::cerr << "[genotype] " << state << ": " << note << '\n';
+    std::_Exit(code);
+}
+
+// The status of a run is written whole, and a terminal status claims the run.
+void commit_status(const std::string& path, const std::string& text) {
+    if (g_watch != nullptr) {
+        std::lock_guard<std::mutex> lock(g_watch->mutex);
+        g_watch->finished = true;
+        atomic_write(path, text);
+        return;
+    }
+    atomic_write(path, text);
 }
 
 // One panel template name per line; '#' begins a comment and blank lines are ignored. Deliberately
@@ -292,6 +387,106 @@ struct RankingSummary {
     std::size_t consensus_blocks_no_called = 0;
 };
 
+// What the panel-anchored adaptive completion did, for the status. Every fact separately: the anchor,
+// the search and why it stopped, the pool, and the decision made over it.
+struct RepairReport {
+    const GenotypeCommandOptions* options = nullptr;
+    std::uint64_t neighbour_bound = 0;
+    std::string union_status = "NA";           // the union ranking before repair
+    std::size_t union_winner_set = 0;
+    double union_certified_gap = 0.0;
+    std::string anchor_candidate_id = "NA";
+    std::string anchor_union_rank = "NA";
+    double anchor_score = 0.0;
+    std::string anchor_hap1 = "NA", anchor_hap2 = "NA";
+    bool searched = false;
+    std::size_t rounds_run = 0;
+    std::size_t moves = 0;
+    std::string stop_reason = "NA";
+    bool converged = false;
+    double final_incumbent_score = 0.0;
+    std::string final_incumbent_hap1 = "NA", final_incumbent_hap2 = "NA";
+    std::size_t pool_union_candidates = 0;
+    std::uint64_t pool_repair_scored = 0;
+    std::size_t pool_identities = 0;
+    std::size_t pool_repair_only = 0;
+    std::uint64_t pool_score_mismatches = 0;
+    std::size_t pool_sequence_candidates = 0;
+    std::string decision = "NA";
+    std::size_t top_set_size = 0;
+    std::string disagreeing_blocks = "none";
+    std::string genotype_separation_gap = "NA";
+    std::string genotype_separation_certified = "NA";
+    std::string best_other_genotype_score = "NA";
+    std::string same_genotype_score_gap = "NA";
+    std::string same_genotype_fragment_gap = "NA";
+    std::string same_genotype_prior_gap = "NA";
+    std::string same_genotype_fragment_identical = "NA";
+    std::string haplotype_representation = "none";
+    FragmentScoringCounters cumulative;
+    std::uint64_t origin_cache_bytes_end = 0;
+    std::size_t enumeration_workers = 0;
+    double seconds = 0.0;
+    double seconds_scoring = 0.0;
+};
+
+void write_repair_report(std::ostream& out, const RepairReport& r) {
+    const GenotypeCommandOptions& o = *r.options;
+    const auto margin = [](std::uint64_t cap, std::uint64_t used) {
+        return std::to_string(static_cast<std::int64_t>(cap) - static_cast<std::int64_t>(used));
+    };
+    out.unsetf(std::ios::floatfield);
+    out << std::setprecision(17);
+    out << "algorithm\tpanel_anchored_adaptive_completion\n";
+    out << "repair_max_rounds\t" << o.repair_rounds << "\nrepair_local_pairs\t" << o.repair_local_pairs
+        << "\nrepair_origin_cache_bytes\t" << o.repair_origin_cache_bytes << "\nrepair_origin_cache_policy\tplanned"
+        << "\nrepair_max_neighbours\t" << o.repair_max_neighbours << "\nrepair_neighbour_bound\t" << r.neighbour_bound
+        << "\nrepair_max_physical_origins\t" << o.repair_max_physical_origins << "\nrepair_max_state_classes\t"
+        << o.repair_max_state_classes << "\nrepair_max_piece_hits\t" << o.repair_max_piece_hits
+        << "\nrepair_max_latent_pairs\t" << o.repair_max_latent_pairs << '\n';
+    out << "union_ranking_status\t" << r.union_status << "\nunion_winner_set_size\t" << r.union_winner_set
+        << "\nunion_certified_gap\t" << r.union_certified_gap << '\n';
+    out << "repair_anchor_candidate_id\t" << r.anchor_candidate_id << "\nrepair_anchor_union_rank\t"
+        << r.anchor_union_rank << "\nrepair_anchor_score\t" << r.anchor_score << "\nrepair_anchor_hap1\t"
+        << r.anchor_hap1 << "\nrepair_anchor_hap2\t" << r.anchor_hap2 << '\n';
+    out << "repair_searched\t" << (r.searched ? "true" : "false") << "\nrepair_rounds_run\t" << r.rounds_run
+        << "\nrepair_moves\t" << r.moves << "\nrepair_stop_reason\t" << r.stop_reason << "\nrepair_converged\t"
+        << (r.converged ? "true" : "false") << "\nrepair_final_incumbent_score\t" << r.final_incumbent_score
+        << "\nrepair_final_incumbent_hap1\t" << r.final_incumbent_hap1 << "\nrepair_final_incumbent_hap2\t"
+        << r.final_incumbent_hap2 << '\n';
+    out << "pool_union_candidates\t" << r.pool_union_candidates << "\npool_repair_scored\t" << r.pool_repair_scored
+        << "\npool_identities\t" << r.pool_identities << "\npool_repair_only\t" << r.pool_repair_only
+        << "\npool_score_mismatches\t" << r.pool_score_mismatches << "\npool_sequence_candidates\t"
+        << r.pool_sequence_candidates << '\n';
+    out << "final_decision\t" << r.decision << "\ntop_set_size\t" << r.top_set_size
+        << "\ntop_set_disagreeing_blocks\t" << r.disagreeing_blocks << "\ngenotype_separation_gap\t"
+        << r.genotype_separation_gap << "\ngenotype_separation_certified\t" << r.genotype_separation_certified
+        << "\nbest_other_genotype_score\t" << r.best_other_genotype_score
+        << "\nsame_genotype_alternative_score_gap\t" << r.same_genotype_score_gap
+        << "\nsame_genotype_alternative_fragment_gap\t" << r.same_genotype_fragment_gap
+        << "\nsame_genotype_alternative_prior_gap\t" << r.same_genotype_prior_gap
+        << "\nsame_genotype_alternative_fragment_identical\t" << r.same_genotype_fragment_identical << '\n';
+    // What the haplotype FASTA is, when there is one. prior_selected: the reads give no preference
+    // among phase alternatives and the prior chose this representative; it is not a read-phased result.
+    out << "haplotype_representation\t" << r.haplotype_representation << '\n';
+    // The pool is a local search from one anchor: never an exhaustive search of genotype space.
+    out << "search_globally_exhaustive\tfalse\nconditional_gq_calibration\tuncalibrated\n";
+    out << "repair_cumulative_physical_origins\t" << r.cumulative.physical_origins
+        << "\nrepair_margin_physical_origins\t" << margin(o.repair_max_physical_origins, r.cumulative.physical_origins)
+        << "\nrepair_cumulative_state_classes\t" << r.cumulative.statistical_state_classes
+        << "\nrepair_margin_state_classes\t" << margin(o.repair_max_state_classes, r.cumulative.statistical_state_classes)
+        << "\nrepair_cumulative_piece_hits\t" << r.cumulative.piece_hits << "\nrepair_margin_piece_hits\t"
+        << margin(o.repair_max_piece_hits, r.cumulative.piece_hits) << "\nrepair_cumulative_latent_pairs\t"
+        << r.cumulative.latent_alignment_pairs << "\nrepair_margin_latent_pairs\t"
+        << margin(o.repair_max_latent_pairs, r.cumulative.latent_alignment_pairs)
+        << "\nrepair_origin_cache_bytes_end\t" << r.origin_cache_bytes_end << "\nthreads_repair_enumeration_workers\t"
+        << r.enumeration_workers << '\n';
+    out << std::fixed << std::setprecision(3) << "seconds_repair\t" << r.seconds << "\nseconds_repair_scoring\t"
+        << r.seconds_scoring << '\n';
+    out.unsetf(std::ios::floatfield);
+    out << std::setprecision(6);
+}
+
 void write_status(
     const std::string& path,
     GenotypeRunStatus status,
@@ -306,12 +501,32 @@ void write_status(
     const std::string& note,
     const RankingSummary* summary = nullptr,
     const MarkerDepthEstimate* depth = nullptr,
-    const CandidateSetReport* candidate_set = nullptr) {
-    std::ofstream out = open_output(path);
+    const CandidateSetReport* candidate_set = nullptr,
+    const RepairReport* repair = nullptr) {
+    std::ostringstream out;
     out << "key\tvalue\n";
     out << "status\t" << genotype_run_status_name(status) << '\n';
     if (!note.empty()) out << "note\t" << note << '\n';
     out << "model_fingerprint\t" << fingerprint << '\n';
+    // What configured the run, and what it ran on, by content.
+    out << "profile\t" << (options.profile_path.empty() ? "none" : options.profile_path) << '\n';
+    out << "profile_name\t" << (options.profile_name.empty() ? "none" : options.profile_name) << '\n';
+    out << "profile_sha256\t" << (options.profile_sha256.empty() ? "none" : options.profile_sha256) << '\n';
+    {
+        std::string overridden;
+        for (const std::string& key : options.overridden_settings) overridden += (overridden.empty() ? "" : ",") + key;
+        out << "settings_overridden_after_profile\t" << (overridden.empty() ? "none" : overridden) << '\n';
+    }
+    for (const auto& hash : g_input_hashes) out << "sha256_" << hash.first << '\t' << hash.second << '\n';
+    out << "footprint_limit_bytes\t" << options.footprint_limit_bytes << '\n';
+    out << "time_limit_seconds\t" << options.time_limit_seconds << '\n';
+    {
+        // Worker and process memory at the moment the status is written.
+        const FootprintSample footprint = physical_footprint();
+        out << "threads_peak_active_workers\t" << peak_active_workers() << '\n';
+        out << "resources_phys_footprint_peak_bytes\t" << footprint.peak << '\n';
+        out << "resources_rss_peak_bytes\t" << static_cast<std::uint64_t>(peak_rss_gib() * 1073741824.0) << '\n';
+    }
     out << "gfa\t" << options.gfa_path << '\n';
     out << "reference_path\t" << options.reference_path << '\n';
     out << "kmer_size\t" << options.kmer_size << '\n';
@@ -518,7 +733,8 @@ void write_status(
         // The gap is certified within the retained candidate set only. It is global only when the search
         // was exhaustive and nothing was truncated from its result.
         out << "global_certified\t"
-            << (ranking->status == RescoreStatus::Complete && beam != nullptr && !beam->candidate_set_conditional
+            << (repair == nullptr && ranking->status == RescoreStatus::Complete && beam != nullptr &&
+                        !beam->candidate_set_conditional
                     ? "true" : "false") << '\n';
         out << "winner_set_size\t" << ranking->winner_set.size() << '\n';
         out << "score_gap_to_runner_up\t" << ranking->score_gap_to_runner_up << '\n';
@@ -582,6 +798,8 @@ void write_status(
     out << "seconds_prior\t" << timings.prior << '\n';
     out << "seconds_ranking\t" << timings.ranking << '\n';
     out << "seconds_total\t" << timings.total << '\n';
+    if (repair != nullptr) write_repair_report(out, *repair);
+    commit_status(path, out.str());
 }
 
 } // namespace
@@ -594,6 +812,10 @@ const char* genotype_run_status_name(GenotypeRunStatus status) {
         case GenotypeRunStatus::SpellingIncomplete: return "SPELLING_INCOMPLETE";
         case GenotypeRunStatus::RescoreIncomplete: return "RESCORE_INCOMPLETE";
         case GenotypeRunStatus::BlockConsensus: return "BLOCK_CONSENSUS";
+        case GenotypeRunStatus::ConditionalGenotypeEquivalent: return "CONDITIONAL_GENOTYPE_EQUIVALENT";
+        case GenotypeRunStatus::RepairIncomplete: return "REPAIR_INCOMPLETE";
+        case GenotypeRunStatus::TimeLimit: return "TIME_LIMIT";
+        case GenotypeRunStatus::ResourceRefusal: return "RESOURCE_REFUSAL";
     }
     return "MODEL_INCOMPLETE";
 }
@@ -622,6 +844,68 @@ std::vector<BlockConsensusCall> block_consensus(
         }
     }
     return out;
+}
+
+void apply_genotype_profile(const std::string& path, GenotypeCommandOptions& options) {
+    std::ifstream file(path);
+    if (!file) throw std::runtime_error("cannot open genotype profile: " + path);
+    const auto whole_u64 = [&](const std::string& key, const std::string& text) {
+        std::size_t used = 0;
+        const unsigned long long value = std::stoull(text, &used);
+        if (used != text.size() || text.empty() || text[0] == '-') {
+            throw std::runtime_error("profile " + path + ": '" + key + "' is not a non-negative integer: " + text);
+        }
+        return static_cast<std::uint64_t>(value);
+    };
+    const auto whole_double = [&](const std::string& key, const std::string& text) {
+        std::size_t used = 0;
+        const double value = std::stod(text, &used);
+        if (used != text.size() || !std::isfinite(value) || value < 0.0) {
+            throw std::runtime_error("profile " + path + ": '" + key + "' is not a finite non-negative number: " + text);
+        }
+        return value;
+    };
+    std::set<std::string> seen;
+    std::string line;
+    while (std::getline(file, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        if (line.empty() || line[0] == '#') continue;
+        const std::size_t tab = line.find('\t');
+        if (tab == std::string::npos) throw std::runtime_error("profile " + path + ": expected key<TAB>value: " + line);
+        const std::string key = line.substr(0, tab);
+        const std::string value = line.substr(tab + 1);
+        if (!seen.insert(key).second) throw std::runtime_error("profile " + path + ": '" + key + "' is set twice");
+        const auto u = [&]() { return whole_u64(key, value); };
+        if (key == "profile") options.profile_name = value;
+        else if (key == "proposal_state_limit") options.proposal_state_limit = u();
+        else if (key == "max_mosaic_candidates") options.max_mosaic_candidates = u();
+        else if (key == "phase_audit_candidates") options.phase_audit_candidates = u();
+        else if (key == "threads") options.threads = u();
+        else if (key == "kmer_size") options.kmer_size = u();
+        else if (key == "syncmer_s") options.syncmer_s = u();
+        else if (key == "min_variant_bp") options.min_variant_bp = u();
+        else if (key == "switch_probability") options.switch_probability = whole_double(key, value);
+        else if (key == "mismatch_band") options.mismatch_band = u();
+        else if (key == "max_piece_hits") options.max_piece_hits = u();
+        else if (key == "max_physical_origins") options.max_physical_origins = u();
+        else if (key == "max_state_classes") options.max_state_classes = u();
+        else if (key == "max_mass_cells") options.max_mass_cells = u();
+        else if (key == "emission_cache_bytes") options.emission_cache_bytes = u();
+        else if (key == "repair_rounds") options.repair_rounds = u();
+        else if (key == "repair_local_pairs") options.repair_local_pairs = u();
+        else if (key == "repair_origin_cache_bytes") options.repair_origin_cache_bytes = u();
+        else if (key == "repair_max_neighbours") options.repair_max_neighbours = u();
+        else if (key == "repair_max_physical_origins") options.repair_max_physical_origins = u();
+        else if (key == "repair_max_state_classes") options.repair_max_state_classes = u();
+        else if (key == "repair_max_piece_hits") options.repair_max_piece_hits = u();
+        else if (key == "repair_max_latent_pairs") options.repair_max_latent_pairs = u();
+        else if (key == "footprint_limit_bytes") options.footprint_limit_bytes = u();
+        else if (key == "time_limit_seconds") options.time_limit_seconds = whole_double(key, value);
+        else throw std::runtime_error("profile " + path + ": unknown setting '" + key + "'");
+    }
+    if (seen.count("profile") == 0) throw std::runtime_error("profile " + path + " does not name itself ('profile')");
+    options.profile_path = path;
+    options.profile_sha256 = sha256_file(path);
 }
 
 std::string audited_phase_support(const std::string& within_candidates, bool audit_complete, bool same_winner,
@@ -662,10 +946,9 @@ std::vector<BlockGenotypeConfidence> block_genotype_confidence(
 namespace {
 
 void remove_run_outputs(const std::string& out_prefix) {
-    for (const char* suffix : {".genotypes.tsv", ".block_genotypes.tsv", ".mosaic_candidates.tsv",
-                               ".mosaic_scores.tsv", ".mosaic_status.tsv", ".mosaic_haplotypes.fa"}) {
-        std::remove((out_prefix + suffix).c_str());
-    }
+    for (const char* suffix : kFinalOutputs) std::remove((out_prefix + suffix).c_str());
+    for (const char* suffix : kPartialOutputs) std::remove((out_prefix + suffix).c_str());
+    std::remove((out_prefix + ".mosaic_status.tsv").c_str());
 }
 
 // The proposal a standalone run with target k returns. Neither the beam's pruning nor its ordering reads
@@ -707,6 +990,111 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
         throw std::runtime_error("--threads must be at least 1");
     }
 
+    // The adaptive completion is one algorithm over one candidate set: a development ladder of prefixes
+    // or a phase audit beside it would each need their own search, and is refused rather than guessed.
+    if (options.repair_rounds > 0) {
+        if (!options.development_candidate_prefixes.empty()) {
+            throw std::runtime_error("the repair search does not run over development candidate prefixes");
+        }
+        if (options.phase_audit_candidates != 0) {
+            throw std::runtime_error("the repair search runs with phase audit 0; the pooled rerank replaces it");
+        }
+        if (options.repair_local_pairs < 1) throw std::runtime_error("repair_local_pairs must be at least 1");
+    }
+
+    // Provenance by content, recorded in every status this run writes. An input that cannot be read is
+    // left to the stage that reads it, which fails with its own message.
+    reset_peak_active_workers();
+    g_input_hashes.clear();
+    {
+        const auto hash = [&](const std::string& name, const std::string& file) {
+            if (file.empty()) return;
+            try {
+                g_input_hashes.emplace_back(name, sha256_file(file));
+            } catch (const std::exception&) {
+                g_input_hashes.emplace_back(name, "unreadable");
+            }
+        };
+        hash("gfa", options.gfa_path);
+        hash("bubbles", options.bubbles_path);
+        hash("reads1", options.reads1_path);
+        hash("reads2", options.reads2_path);
+        hash("library", options.library_path);
+        hash("panel_curation", options.curation_manifest_path);
+    }
+    // The staged sorted graph is an intermediate, removed however the run ends.
+    struct StagedGraph {
+        std::string path;
+        ~StagedGraph() {
+            std::error_code ignored;
+            std::filesystem::remove(path, ignored);
+        }
+    } staged_graph{options.out_prefix + ".sorted.gfa"};
+
+    // The run watch: RUNNING status and partial rounds for a repair run, and the watchdog over the
+    // declared time and physical-footprint limits. Disarmed on every exit.
+    std::unique_ptr<RunWatch> watch;
+    std::thread watchdog;
+    if (options.repair_rounds > 0 || options.footprint_limit_bytes != 0 || options.time_limit_seconds > 0.0) {
+        watch = std::make_unique<RunWatch>();
+        watch->out_prefix = options.out_prefix;
+        watch->profile = options.profile_path.empty() ? "none" : options.profile_path;
+        watch->profile_sha256 = options.profile_sha256.empty() ? "none" : options.profile_sha256;
+        watch->started = started;
+        watch->footprint_limit = options.footprint_limit_bytes;
+        watch->time_limit = options.time_limit_seconds;
+        g_watch = watch.get();
+        write_running_status("model");
+        if (options.footprint_limit_bytes != 0 || options.time_limit_seconds > 0.0) {
+            watchdog = std::thread([limit = options.footprint_limit_bytes, seconds = options.time_limit_seconds,
+                                    started]() {
+                for (;;) {
+                    {
+                        std::lock_guard<std::mutex> lock(g_watch->mutex);
+                        if (g_watch->finished) return;
+                    }
+                    if (seconds > 0.0 && seconds_since(started) > seconds) {
+                        std::ostringstream why;
+                        why << "wall " << seconds_since(started) << " s exceeded the declared " << seconds << " s";
+                        stop_run("TIME_LIMIT", why.str(), 124);
+                    }
+                    if (limit != 0) {
+                        const std::uint64_t now = physical_footprint().current;
+                        if (now > limit) {
+                            std::ostringstream why;
+                            why << "physical footprint " << now << " bytes exceeded the declared " << limit;
+                            stop_run("RESOURCE_REFUSAL", why.str(), 125);
+                        }
+                    }
+                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                }
+            });
+        }
+    }
+    struct WatchDisarm {
+        std::thread& thread;
+        bool armed;
+        ~WatchDisarm() {
+            if (!armed) return;
+            {
+                std::lock_guard<std::mutex> lock(g_watch->mutex);
+                // An exception that escapes the run before any terminal status would otherwise leave
+                // RUNNING behind, which a reader could take for a run still in progress.
+                if (!g_watch->finished && std::uncaught_exceptions() > 0) {
+                    try {
+                        atomic_write(g_watch->out_prefix + ".mosaic_status.tsv",
+                                     minimal_status(*g_watch, "FAILED",
+                                                    "an exception ended the run before a final status"));
+                    } catch (...) {
+                    }
+                }
+                g_watch->finished = true;
+            }
+            if (thread.joinable()) thread.join();
+            g_watch = nullptr;
+        }
+    } watch_disarm{watchdog, static_cast<bool>(watch)};
+
     if (options.phase_audit_candidates > 0) {
         const std::size_t largest = options.development_candidate_prefixes.empty()
                                         ? options.max_mosaic_candidates
@@ -742,7 +1130,14 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
         sort_options.flip = true;
         const std::string resolved = sort_graph_reference(gfa, sort_options).resolved_reference;
         const std::string staged = options.out_prefix + ".sorted.gfa";
-        write_gfa_model(staged, gfa);
+        if (g_watch != nullptr) {
+            // Under the watch lock: a watchdog stop either sees the finished file and removes it, or
+            // stops the process before it is begun. It can never leave one half-written behind.
+            std::lock_guard<std::mutex> lock(g_watch->mutex);
+            write_gfa_model(staged, gfa);
+        } else {
+            write_gfa_model(staged, gfa);
+        }
         ParseGfaOptions parse_options;
         graph = parse_gfa(staged, parse_options);
         validate_graph_paths(graph, "genotype", true, true);
@@ -787,6 +1182,11 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
     }
     const PreparedGenotypeModel& model = *prepared;
     timings.model = seconds_since(mark);
+    if (g_watch != nullptr) {
+        std::lock_guard<std::mutex> lock(g_watch->mutex);
+        g_watch->fingerprint = fingerprint;
+    }
+    write_running_status("markers");
 
     if (model.blocks().size() < 2 || model.panel().template_count() < 2) {
         timings.total = seconds_since(started);
@@ -875,6 +1275,7 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
     candidate_report.panel_only = panel_only;
 
     // ---- stage 3b: mosaic proposal --------------------------------------------------------------------------
+    write_running_status("proposal");
     mark = Clock::now();
     const std::vector<double> switch_probability(
         model.blocks().size() - 1, options.switch_probability);
@@ -988,6 +1389,7 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
     }
     timings.spelling = seconds_since(mark);
 
+    write_running_status("union_scoring");
     mark = Clock::now();
     FragmentScoringOptions scoring_options;
     // Candidates partition into fixed contiguous ranges, each worker owning complete score entries, so
@@ -1243,6 +1645,520 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
     // 0.000. They are run-level accumulations, like the shared work counters, so each status refreshes
     // them from this alias, which names the outer accumulator the parameter below shadows.
     StageTimings& run_timings = timings;
+    // ---- panel-anchored adaptive completion ----------------------------------------------------------
+    // The union just ranked is the starting evidence, not the decision. Its best exactly scored PANEL
+    // diplotype anchors the exact coordinate repair (a deterministic search anchor, not a claim about
+    // the sample); the union and every candidate the repair scored are pooled and exactly reranked, and
+    // the call is made from the pool's numerical top set. Nothing here reads truth.
+    const auto adaptive_completion = [&](const MosaicBeamResult& beam, const SetRanking& chosen,
+                                         CandidateSetReport set_report, StageTimings timings) -> GenotypeRunStatus {
+        const Clock::time_point repair_mark = Clock::now();
+        const std::vector<MosaicCandidate>& candidates = chosen.candidates;
+        const std::size_t panel_count = panel_candidates.size();
+        const CertifiedRanking& union_ranking = chosen.ranking;
+        const std::size_t block_count = model.blocks().size();
+        const MosaicBeamResult* beam_view = panel_only ? nullptr : &beam;
+        const std::string& prefix = options.out_prefix;
+        constexpr std::size_t npos = std::numeric_limits<std::size_t>::max();
+        RepairReport report;
+        report.options = &options;
+        report.neighbour_bound = repair_neighbour_bound(model, options.repair_local_pairs);
+        report.union_status = union_ranking.status == RescoreStatus::Complete ? "SEPARATED" : "TIED";
+        report.union_winner_set = union_ranking.winner_set.size();
+        report.union_certified_gap = union_ranking.certified_gap;
+        report.pool_union_candidates = candidates.size();
+        // A local search from one anchor never makes the candidate set complete.
+        set_report.final_candidate_scope = "CONDITIONAL";
+        const auto stop_with = [&](GenotypeRunStatus status, const std::string& note, const CertifiedRanking* ranking,
+                                   const RankingSummary* summary) {
+            timings.candidate_grouping = run_timings.candidate_grouping;
+            timings.prior = run_timings.prior;
+            timings.ranking = run_timings.ranking;
+            set_report.distinct_haplotype_paths = candidate_report.distinct_haplotype_paths;
+            set_report.haploid_prior_evaluations = candidate_report.haploid_prior_evaluations;
+            set_report.diploid_prior_lookups = candidate_report.diploid_prior_lookups;
+            report.seconds = seconds_since(repair_mark);
+            timings.total = seconds_since(started);
+            write_status(status_path, status, fingerprint, options, library, timings, &built.report, &panel, beam_view,
+                         ranking, note, summary, &depth, &set_report, &report);
+            if (!options.quiet) {
+                std::cerr << "[genotype] " << genotype_run_status_name(status) << "  fingerprint=" << fingerprint
+                          << "  " << note.substr(0, 160) << "\n";
+            }
+            return status;
+        };
+        // A partial file is written only while nothing has claimed the run, and never torn.
+        const auto commit_partial = [&](const std::string& path, const std::string& text) {
+            if (g_watch == nullptr) {
+                atomic_write(path, text);
+                return;
+            }
+            std::lock_guard<std::mutex> lock(g_watch->mutex);
+            if (g_watch->finished) return;
+            atomic_write(path, text);
+        };
+
+        // ---- 1. the anchor: the best exactly scored panel diplotype, by the union's exact ranking
+        std::size_t anchor = npos;
+        std::size_t anchor_rank = 0;
+        for (std::size_t p = 0; p < union_ranking.candidates.size() && anchor == npos; ++p) {
+            for (const std::size_t member : chosen.sequence_candidates[union_ranking.candidates[p].candidate_id].members) {
+                if (member >= panel_count) continue;
+                if (anchor == npos || chosen.path_prior[member] > chosen.path_prior[anchor]) anchor = member;
+            }
+            if (anchor != npos) anchor_rank = p;
+        }
+        if (anchor == npos) {
+            return stop_with(GenotypeRunStatus::RepairIncomplete,
+                             "the union holds no exactly scored panel diplotype to anchor the repair", nullptr, nullptr);
+        }
+        const MosaicDiplotype& anchor_diplotype = candidates[anchor].diplotype;
+        const double anchor_score = union_ranking.candidates[anchor_rank].score;
+        report.anchor_candidate_id = std::to_string(candidates[anchor].candidate_id);
+        report.anchor_union_rank = std::to_string(anchor_rank + 1);
+        report.anchor_score = anchor_score;
+        report.anchor_hap1 = join_alleles(anchor_diplotype.first.alleles);
+        report.anchor_hap2 = join_alleles(anchor_diplotype.second.alleles);
+        if (options.repair_max_neighbours != 0 && report.neighbour_bound > options.repair_max_neighbours) {
+            return stop_with(GenotypeRunStatus::RepairIncomplete,
+                             "one repair round's neighbourhood (" + std::to_string(report.neighbour_bound) +
+                                 ") exceeds its declared bound " + std::to_string(options.repair_max_neighbours) +
+                                 "; refused before any allocation",
+                             nullptr, nullptr);
+        }
+
+        // ---- 2. the pool: the exactly scored union, then every candidate the repair scores
+        struct PoolEntry {
+            PoolCandidate candidate;
+            bool in_union = false;
+            std::size_t union_index = 0;
+            std::string source;
+            std::string scored_in;
+        };
+        std::vector<PoolEntry> pool;
+        std::map<DiplotypeIdentity, std::size_t> pool_at;
+        std::uint64_t mismatches = 0;
+        const auto bitwise_equal = [](double a, double b) { return std::memcmp(&a, &b, sizeof(double)) == 0; };
+        const auto add = [&](const std::vector<std::size_t>& a, const std::vector<std::size_t>& b, SequenceDigest da,
+                             SequenceDigest db, const DiplotypeScore& score, double sequence_prior, double path_prior_value,
+                             const std::string& source, const std::string& scored_in, bool in_union,
+                             std::size_t union_index) {
+            const DiplotypeIdentity key = diplotype_identity(a, b);
+            const auto found = pool_at.find(key);
+            if (found != pool_at.end()) {
+                // One candidate scored twice -- by the union pass and by the repair -- must score
+                // identically, bit for bit. Anything else fails the run closed below.
+                const PoolCandidate& held = pool[found->second].candidate;
+                if (!bitwise_equal(held.score.log_likelihood, score.log_likelihood) ||
+                    !bitwise_equal(held.score.fragment_term, score.fragment_term) ||
+                    !bitwise_equal(held.score.exposure_term, score.exposure_term) ||
+                    !bitwise_equal(held.score.absolute_term_sum, score.absolute_term_sum) ||
+                    held.score.fragments_with_mass != score.fragments_with_mass ||
+                    !bitwise_equal(held.sequence_prior, sequence_prior)) {
+                    ++mismatches;
+                }
+                return;
+            }
+            PoolEntry entry;
+            entry.candidate.first = a;
+            entry.candidate.second = b;
+            entry.candidate.first_sequence = da;
+            entry.candidate.second_sequence = db;
+            entry.candidate.score = score;
+            entry.candidate.sequence_prior = sequence_prior;
+            entry.candidate.path_prior = path_prior_value;
+            entry.in_union = in_union;
+            entry.union_index = union_index;
+            entry.source = source;
+            entry.scored_in = scored_in;
+            pool_at.emplace(key, pool.size());
+            pool.push_back(std::move(entry));
+        };
+        {
+            std::vector<SequenceDigest> digest(interned.sequences.size());
+            for (std::size_t h = 0; h < interned.sequences.size(); ++h) digest[h] = sequence_digest(interned.sequences[h]);
+            for (std::size_t i = 0; i < candidates.size(); ++i) {
+                const MosaicCandidate& c = candidates[i];
+                const std::size_t x = interned.index_of[slot_of_path.at(c.diplotype.first.alleles)];
+                const std::size_t y = interned.index_of[slot_of_path.at(c.diplotype.second.alleles)];
+                const auto key = sequence_pair(c);
+                const double prior = haploid_sequence_prior[key.first] + haploid_sequence_prior[key.second] +
+                                     (key.first != key.second ? std::log(2.0) : 0.0);
+                add(c.diplotype.first.alleles, c.diplotype.second.alleles, digest[x], digest[y],
+                    scored.scores[scored_index.at(key)], prior, chosen.path_prior[i], i < panel_count ? "panel" : "mosaic",
+                    "union", true, i);
+            }
+        }
+        // The union pass's mass matrix is not needed again; release it before the repair context exists.
+        std::vector<double>().swap(scored.log_mass);
+        std::vector<OriginSummary>().swap(scored.origin_summary);
+
+        // ---- 3. the exact coordinate repair from the anchor
+        FragmentScoringOptions repair_scoring = scoring_options;
+        repair_scoring.max_physical_origins = options.repair_max_physical_origins;
+        repair_scoring.max_state_classes = options.repair_max_state_classes;
+        repair_scoring.max_piece_hits = options.repair_max_piece_hits;
+        repair_scoring.max_latent_alignment_pairs = options.repair_max_latent_pairs;
+        RepairSearchOptions search_options;
+        search_options.local_pairs = options.repair_local_pairs;
+        search_options.max_rounds = options.repair_rounds;
+        search_options.mode = RepairScoringMode::Delta;
+        search_options.origin_cache = true;
+        search_options.planned_cache = true;
+        search_options.origin_cache_bytes = options.repair_origin_cache_bytes;
+        search_options.switch_probability = options.switch_probability;
+        search_options.declared_neighbour_cap = options.repair_max_neighbours;
+        search_options.memory_log = true;
+        write_running_status("repair");
+        std::unique_ptr<CoordinateRepairSearch> search;
+        std::string refusal;
+        bool reproduced = true;
+        try {
+            search = std::make_unique<CoordinateRepairSearch>(model, emissions, fragments, library, repair_scoring,
+                                                              search_options);
+            search->start(anchor_diplotype.first.alleles, anchor_diplotype.second.alleles, anchor_score);
+            RepairHooks hooks;
+            hooks.on_scored = [&](const std::vector<std::size_t>& a, const std::vector<std::size_t>& b,
+                                  const std::string& sa, const std::string& sb, const DiplotypeScore& score,
+                                  double prior) {
+                ++report.pool_repair_scored;
+                const double pa = cached_haploid_prior(MosaicPath{a});
+                const double pb = cached_haploid_prior(MosaicPath{b});
+                const double negative_infinity = -std::numeric_limits<double>::infinity();
+                const double path = pa == negative_infinity || pb == negative_infinity
+                                        ? negative_infinity
+                                        : pa + pb + (a != b ? std::log(2.0) : 0.0);
+                add(a, b, sequence_digest(sa), sequence_digest(sb), score, prior, path, "repair",
+                    "round" + std::to_string(search->rounds().size() + 1), false, 0);
+            };
+            hooks.on_round = [&](const RepairRound& round) {
+                commit_partial(prefix + ".repair_rounds.partial.tsv", search->render_rounds(search->rounds()));
+                if (search->memory_on()) commit_partial(prefix + ".repair_memory.partial.tsv", search->memory_text());
+                if (g_watch != nullptr) {
+                    std::lock_guard<std::mutex> lock(g_watch->mutex);
+                    g_watch->repair_rounds_committed = search->rounds().size();
+                }
+                write_running_status("repair round " + std::to_string(round.index) + " committed");
+                if (options.test_interrupt_after_repair_rounds != 0 && round.moved &&
+                    search->rounds().size() >= options.test_interrupt_after_repair_rounds) {
+                    stop_run("TIME_LIMIT",
+                             "test hook: interrupted after " + std::to_string(search->rounds().size()) +
+                                 " committed repair rounds (the time-limit path, triggered deterministically)",
+                             124);
+                }
+            };
+            reproduced = search->run(hooks);
+        } catch (const ResourceExhausted& error) {
+            refusal = error.what();
+        } catch (const std::exception& error) {
+            return stop_with(GenotypeRunStatus::RepairIncomplete,
+                             std::string("the repair search failed and returned no genotype: ") + error.what(),
+                             nullptr, nullptr);
+        }
+        if (search) {
+            report.searched = true;
+            report.rounds_run = search->rounds().size();
+            for (const RepairRound& round : search->rounds()) report.moves += round.moved ? 1 : 0;
+            report.stop_reason = refusal.empty() ? search->stop_reason() : "resource_refusal";
+            report.converged = refusal.empty() && reproduced && search->converged();
+            report.final_incumbent_score = search->incumbent_total();
+            report.final_incumbent_hap1 = join_alleles(search->incumbent_first());
+            report.final_incumbent_hap2 = join_alleles(search->incumbent_second());
+            if (search->context() != nullptr) {
+                report.cumulative = search->context()->cumulative_counters();
+                report.origin_cache_bytes_end = search->context()->origin_cache_bytes();
+                report.enumeration_workers = search->context()->parallel_enumeration_stats().workers;
+            }
+            report.seconds_scoring = search->cumulative_seconds();
+        }
+        report.pool_identities = pool.size();
+        for (const PoolEntry& entry : pool) report.pool_repair_only += entry.in_union ? 0 : 1;
+        report.pool_score_mismatches = mismatches;
+        if (!refusal.empty()) {
+            // Committed rounds stay as <prefix>.repair_rounds.partial.tsv: a record, never a call.
+            return stop_with(GenotypeRunStatus::RescoreIncomplete,
+                             "the repair search stopped at a declared cumulative cap and returned no genotype: " +
+                                 refusal,
+                             nullptr, nullptr);
+        }
+        // Every stop that returned normally leaves its whole trajectory under the final name.
+        const auto write_trajectory = [&]() {
+            atomic_write(prefix + ".repair_rounds.tsv", search->render_rounds(search->rounds()));
+            if (search->memory_on()) atomic_write(prefix + ".repair_memory.tsv", search->memory_text());
+            for (const char* suffix : kPartialOutputs) std::remove((prefix + suffix).c_str());
+        };
+        claim_run();
+        if (!reproduced) {
+            write_trajectory();
+            std::ostringstream why;
+            why << std::setprecision(17) << "the repair anchor did not reproduce its union score in round "
+                << search->failed_round() << " (expected " << search->incumbent_expected() << ", scored "
+                << search->incumbent_scored() << "); no genotype";
+            return stop_with(GenotypeRunStatus::RepairIncomplete, why.str(), nullptr, nullptr);
+        }
+        if (!report.converged) {
+            write_trajectory();
+            return stop_with(GenotypeRunStatus::RepairIncomplete,
+                             "the repair search stopped without converging (" + report.stop_reason +
+                                 "); the trajectory is kept and no genotype is emitted",
+                             nullptr, nullptr);
+        }
+        if (mismatches != 0) {
+            write_trajectory();
+            return stop_with(GenotypeRunStatus::RepairIncomplete,
+                             std::to_string(mismatches) +
+                                 " candidates scored by both the union pass and the repair did not score "
+                                 "identically; the pool is not exact and no genotype is emitted",
+                             nullptr, nullptr);
+        }
+
+        // ---- 4. the exact rerank of the pool, and the decision over its numerical top set
+        const Clock::time_point decision_mark = Clock::now();
+        std::vector<PoolCandidate> pooled;
+        pooled.reserve(pool.size());
+        for (const PoolEntry& entry : pool) pooled.push_back(entry.candidate);
+        PooledDecision decided = decide_pooled_genotype(std::move(pooled), block_count, fragments.size(),
+                                                        scoring_options.mismatch_band);
+        run_timings.ranking += seconds_since(decision_mark);
+        decided.ranking.counters = scored.counters;   // the union pass; the repair's are reported apart
+        report.pool_sequence_candidates = decided.groups.size();
+        if (decided.score_mismatches != 0) {
+            write_trajectory();
+            return stop_with(GenotypeRunStatus::RepairIncomplete,
+                             std::to_string(decided.score_mismatches) +
+                                 " candidates spelling one sequence pair did not score identically; no genotype",
+                             nullptr, nullptr);
+        }
+        const CertifiedCandidate& best = decided.ranking.candidates.front();
+        std::ostringstream number;
+        number << std::setprecision(17);
+        const auto text = [&](double value) {
+            number.str("");
+            number << value;
+            return number.str();
+        };
+        report.decision = top_set_decision_name(decided.decision);
+        report.top_set_size = decided.top_groups.size();
+        if (!decided.disagreeing_blocks.empty()) {
+            report.disagreeing_blocks.clear();
+            for (const std::size_t b : decided.disagreeing_blocks) {
+                report.disagreeing_blocks += (report.disagreeing_blocks.empty() ? "" : ",") + model.blocks()[b].block_id;
+            }
+        }
+        if (decided.has_other_genotype) {
+            report.genotype_separation_gap = text(decided.genotype_separation_gap);
+            report.genotype_separation_certified = decided.genotype_separation_certified ? "true" : "false";
+            for (const CertifiedCandidate& c : decided.ranking.candidates) {
+                if (c.candidate_id == decided.best_other_genotype_group) report.best_other_genotype_score = text(c.score);
+            }
+        } else {
+            report.genotype_separation_gap = "inf";
+            report.genotype_separation_certified = "true";
+        }
+        if (decided.has_same_genotype_alternative) {
+            report.same_genotype_score_gap = text(decided.same_genotype_score_gap);
+            report.same_genotype_fragment_gap = text(decided.same_genotype_fragment_gap);
+            report.same_genotype_prior_gap = text(decided.same_genotype_prior_gap);
+            report.same_genotype_fragment_identical = decided.same_genotype_fragment_identical ? "true" : "false";
+        }
+
+        RankingSummary summary;
+        summary.sequence_candidates = decided.groups.size();
+        summary.collapsed_beam_candidates = decided.candidates.size() - decided.groups.size();
+        summary.phase_support = decided.phase_support;
+        summary.phase_support_within_candidates = decided.phase_support;
+        summary.fragment_contenders = decided.fragment_contenders;
+        summary.fragment_term_gap = decided.fragment_term_gap;
+        summary.projection_ambiguous = decided.projection_ambiguous[best.candidate_id];
+        summary.block_genotype_read_supported = decided.block_genotype_read_supported;
+        summary.block_genotype_posterior = decided.block_genotype_posterior;
+        summary.block_genotype_quality = decided.block_genotype_quality;
+        summary.block_numerically_separated = decided.block_numerically_separated;
+
+        // Table identities: union candidates keep theirs; repair-only candidates follow, canonically.
+        std::vector<std::size_t> table_id(decided.candidates.size());
+        std::vector<const PoolEntry*> entry_of(decided.candidates.size());
+        std::vector<std::size_t> group_of(decided.candidates.size());
+        {
+            std::size_t next = 0;
+            for (const MosaicCandidate& c : candidates) next = std::max(next, c.candidate_id + 1);
+            for (std::size_t i = 0; i < decided.candidates.size(); ++i) {
+                const PoolCandidate& c = decided.candidates[i];
+                entry_of[i] = &pool[pool_at.at(diplotype_identity(c.first, c.second))];
+                table_id[i] = entry_of[i]->in_union ? candidates[entry_of[i]->union_index].candidate_id : next++;
+            }
+            for (std::size_t g = 0; g < decided.groups.size(); ++g) {
+                for (const std::size_t m : decided.groups[g]) group_of[m] = g;
+            }
+        }
+        const std::set<std::size_t> top(decided.top_groups.begin(), decided.top_groups.end());
+        const auto carries_call = [&](std::size_t g) {
+            for (const std::size_t m : decided.groups[g]) {
+                for (std::size_t b = 0; b < block_count; ++b) {
+                    if (std::minmax(decided.candidates[m].first[b], decided.candidates[m].second[b]) != decided.genotype[b]) {
+                        return false;
+                    }
+                }
+            }
+            return true;
+        };
+
+        // ---- outputs. The run is claimed: the watchdog can no longer stop it half-written.
+        {
+            std::vector<std::size_t> order(decided.candidates.size());
+            for (std::size_t i = 0; i < order.size(); ++i) order[i] = i;
+            std::sort(order.begin(), order.end(), [&](std::size_t x, std::size_t y) { return table_id[x] < table_id[y]; });
+            std::ofstream out = open_output(prefix + ".mosaic_candidates.tsv");
+            out << std::setprecision(17)
+                << "candidate_id\tunique_rank\thap1_alleles\thap2_alleles\tbest_proposal_score\t"
+                   "retained_logsum_proposal_score\tproposal_emission_component\tproposal_transition_component\t"
+                   "equivalent_retained_histories\tevery_allele_scored\texact_path_prior\tsequence_candidate_id\t"
+                   "history_count_saturated\tsource\tscored_in\n";
+            for (const std::size_t i : order) {
+                const PoolCandidate& c = decided.candidates[i];
+                const PoolEntry& entry = *entry_of[i];
+                out << table_id[i] << '\t';
+                if (entry.in_union && entry.union_index >= panel_count) {
+                    const MosaicCandidate& m = candidates[entry.union_index];
+                    out << m.unique_rank << '\t' << join_alleles(c.first) << '\t' << join_alleles(c.second) << '\t'
+                        << m.best_proposal_score << '\t' << m.retained_logsum_proposal_score << '\t'
+                        << m.proposal_emission_component << '\t' << m.proposal_transition_component << '\t'
+                        << m.equivalent_retained_histories << '\t' << (m.every_allele_scored ? "true" : "false") << '\t'
+                        << c.path_prior << '\t' << group_of[i] << '\t' << (m.history_count_saturated ? "true" : "false");
+                } else {
+                    out << "NA\t" << join_alleles(c.first) << '\t' << join_alleles(c.second) << "\tNA\tNA\tNA\tNA\tNA\t"
+                        << (emissions.every_allele_scored() ? "true" : "false") << '\t' << c.path_prior << '\t'
+                        << group_of[i] << "\tNA";
+                }
+                out << '\t' << entry.source << '\t' << entry.scored_in << '\n';
+            }
+        }
+        {
+            std::ofstream out = open_output(prefix + ".mosaic_scores.tsv");
+            out << "sequence_candidate_id\trepresentative_beam_candidate\tequivalent_beam_candidates\t"
+                   "score\tfragment_term\texposure_term\tsequence_pair_prior\tnumeric_error_bound\t"
+                   "fragments_with_mass\tfragments_total\tcandidate_set_probability\tmismatch_band\t"
+                   "projection_ambiguous\tin_winner_set\tcarries_called_genotype\n";
+            out << std::setprecision(12);
+            for (const CertifiedCandidate& entry : decided.ranking.candidates) {
+                const std::size_t g = entry.candidate_id;
+                out << g << '\t' << table_id[decided.representative[g]] << '\t' << decided.groups[g].size() << '\t'
+                    << entry.score << '\t' << entry.fragment_term << '\t' << entry.exposure_term << '\t' << entry.prior
+                    << '\t' << entry.numeric_error_bound << '\t' << entry.fragments_with_mass << '\t'
+                    << fragments.size() << '\t' << entry.candidate_set_probability << '\t'
+                    << decided.ranking.mismatch_band << '\t' << (decided.projection_ambiguous[g] ? "true" : "false")
+                    << '\t' << (top.count(g) != 0 ? "true" : "false") << '\t' << (carries_call(g) ? "true" : "false")
+                    << '\n';
+            }
+        }
+        {
+            // The complete numerical top set, every member of every tied sequence candidate.
+            std::ofstream out = open_output(prefix + ".equivalence_set.tsv");
+            out << "rank\tsequence_candidate_id\tcandidate_id\trepresentative\thap1_alleles\thap2_alleles\tsource\t"
+                   "scored_in\tscore\tfragment_term\texposure_term\tsequence_pair_prior\tnumeric_error_bound\t"
+                   "exact_path_prior\n";
+            out << std::setprecision(17);
+            std::size_t rank = 0;
+            for (const CertifiedCandidate& entry : decided.ranking.candidates) {
+                ++rank;
+                if (top.count(entry.candidate_id) == 0) continue;
+                for (const std::size_t m : decided.groups[entry.candidate_id]) {
+                    const PoolCandidate& c = decided.candidates[m];
+                    out << rank << '\t' << entry.candidate_id << '\t' << table_id[m] << '\t'
+                        << (decided.representative[entry.candidate_id] == m ? "true" : "false") << '\t'
+                        << join_alleles(c.first) << '\t' << join_alleles(c.second) << '\t' << entry_of[m]->source
+                        << '\t' << entry_of[m]->scored_in << '\t' << entry.score << '\t' << entry.fragment_term << '\t'
+                        << entry.exposure_term << '\t' << entry.prior << '\t' << entry.numeric_error_bound << '\t'
+                        << c.path_prior << '\n';
+                }
+            }
+        }
+        write_trajectory();
+
+        if (decided.decision == TopSetDecision::DistinctTie) {
+            return stop_with(GenotypeRunStatus::RescoreIncomplete,
+                             "the pooled top set holds " + std::to_string(decided.top_groups.size()) +
+                                 " candidates tied on total score that disagree at block(s) " + report.disagreeing_blocks +
+                                 "; the equivalence set is reported and no genotype is called",
+                             &decided.ranking, &summary);
+        }
+        const bool unique = decided.decision == TopSetDecision::Unique;
+        const PoolCandidate& called = decided.candidates[decided.representative[best.candidate_id]];
+        // Allele order: the representative's haplotypes for a unique call; the unordered pair otherwise.
+        const auto alleles_at = [&](std::size_t b) {
+            return unique ? std::make_pair(called.first[b], called.second[b]) : decided.genotype[b];
+        };
+        const auto sources_of = [&](const PreparedGenotypeBlock& block, std::size_t id) {
+            std::string joined;
+            for (const std::string& source : block.alleles[id].source_ids) joined += (joined.empty() ? "" : ",") + source;
+            return joined;
+        };
+        {
+            std::ofstream out = open_output(prefix + ".genotypes.tsv");
+            out << "block_id\tkind\tallele1\tallele2\tallele1_bp\tallele2_bp\tallele1_sources\t"
+                   "allele2_sources\tzygosity\tconditional_genotype_posterior\tconditional_GQ\n";
+            for (std::size_t b = 0; b < block_count; ++b) {
+                const PreparedGenotypeBlock& block = model.blocks()[b];
+                if (block.kind != GenotypeBlockKind::Variant) continue;
+                const auto [a1, a2] = alleles_at(b);
+                out << block.block_id << "\tSV\t" << a1 << '\t' << a2 << '\t' << block.alleles[a1].sequence.size() << '\t'
+                    << block.alleles[a2].sequence.size() << '\t' << sources_of(block, a1) << '\t' << sources_of(block, a2)
+                    << '\t' << (a1 == a2 ? "HOM" : "HET") << '\t' << std::setprecision(12)
+                    << summary.block_genotype_posterior[b] << '\t' << summary.block_genotype_quality[b]
+                    << std::setprecision(6) << '\n';
+            }
+        }
+        {
+            std::ofstream out = open_output(prefix + ".block_genotypes.tsv");
+            out << "block_id\tkind\treportable\tallele1\tallele2\tallele1_bp\tallele2_bp\tzygosity\t"
+                   "projection_ambiguous\tgenotype_support\tphase_support\tconditional_genotype_posterior\t"
+                   "conditional_GQ\tnumerically_separated\tcandidate_scope\n";
+            for (std::size_t b = 0; b < block_count; ++b) {
+                const PreparedGenotypeBlock& block = model.blocks()[b];
+                const bool variant = block.kind == GenotypeBlockKind::Variant;
+                const auto [a1, a2] = alleles_at(b);
+                out << block.block_id << '\t' << (variant ? "SV" : "context") << '\t' << (variant ? "true" : "false")
+                    << '\t' << a1 << '\t' << a2 << '\t' << block.alleles[a1].sequence.size() << '\t'
+                    << block.alleles[a2].sequence.size() << '\t' << (a1 == a2 ? "HOM" : "HET") << '\t'
+                    << (summary.projection_ambiguous ? "true" : "false") << '\t'
+                    << (summary.block_genotype_read_supported[b] ? "READS" : "PRIOR_ONLY") << '\t'
+                    << summary.phase_support << '\t' << std::setprecision(12) << summary.block_genotype_posterior[b]
+                    << '\t' << summary.block_genotype_quality[b] << std::setprecision(6) << '\t'
+                    << (summary.block_numerically_separated[b] ? "true" : "false") << '\t'
+                    << set_report.final_candidate_scope << '\n';
+            }
+        }
+        if (unique) {
+            // A unique candidate's two haplotypes. Under PRIOR_ONLY the reads gave no preference among the
+            // phase alternatives and the prior chose this one: a prior-selected haplotype representation,
+            // not a read-phased result, and the header says so.
+            report.haplotype_representation =
+                summary.phase_support == "PRIOR_ONLY" ? "prior_selected" : "read_supported_within_candidates";
+            std::ofstream out = open_output(prefix + ".mosaic_haplotypes.fa");
+            const HaplotypeSequence first = spell_mosaic(model, MosaicPath{called.first});
+            const HaplotypeSequence second = spell_mosaic(model, MosaicPath{called.second});
+            for (const auto& item : {std::make_pair("hap1", &first), std::make_pair("hap2", &second)}) {
+                out << '>' << prefix << '_' << item.first << " fingerprint=" << fingerprint
+                    << " bp=" << item.second->bases.size() << " phase_support=" << summary.phase_support
+                    << " representation=" << report.haplotype_representation << '\n';
+                for (std::size_t at = 0; at < item.second->bases.size(); at += 60) {
+                    out << item.second->bases.substr(at, 60) << '\n';
+                }
+            }
+            return stop_with(GenotypeRunStatus::Complete,
+                             "unique best candidate within the pooled candidate set; phase_support " +
+                                 summary.phase_support,
+                             &decided.ranking, &summary);
+        }
+        report.haplotype_representation = "none";
+        return stop_with(GenotypeRunStatus::ConditionalGenotypeEquivalent,
+                         std::to_string(decided.top_groups.size()) +
+                             " candidates tied on total score carry one unordered genotype at every block; the "
+                             "genotype is emitted unphased, phase is UNRESOLVED, the equivalence set is reported "
+                             "and no haplotype FASTA is written",
+                         &decided.ranking, &summary);
+    };
+
     const auto finish = [&](const MosaicBeamResult& beam, const GenotypeCommandOptions& options,
                             StageTimings timings) -> GenotypeRunStatus {
         const std::string status_path = options.out_prefix + ".mosaic_status.tsv";
@@ -1319,6 +2235,7 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
             }
             set_report.unique_haplotypes = haplotypes.size();
         }
+        if (options.repair_rounds > 0) return adaptive_completion(beam, chosen, set_report, timings);
 
         // Phase support from the declared audit set. A small candidate set can omit the rival that makes phase a
         // fragment tie: in the round-5 held-out cohort nine of ten READS claims at K = 8 vanished at K = 256. The
@@ -1683,8 +2600,18 @@ int run_genotype_command(const std::vector<std::string>& args) {
         if (i + 1 >= args.size()) throw std::runtime_error("missing value for " + args[i]);
         return args[++i];
     };
+    // The profile is applied first, wherever it appears; a flag given beside it overrides it and is
+    // recorded as an override, so the status always says what the run actually ran under.
+    for (std::size_t i = 0; i < args.size(); ++i) {
+        if (args[i] == "--profile") apply_genotype_profile(need(i), options);
+    }
+    const bool profiled = !options.profile_path.empty();
     for (std::size_t i = 0; i < args.size(); ++i) {
         const std::string& flag = args[i];
+        if (flag == "--profile") { ++i; continue; }
+        if (profiled && (flag == "--threads" || flag == "--max-mosaic-candidates")) {
+            options.overridden_settings.push_back(flag.substr(2));
+        }
         if (flag == "--gfa" || flag == "-i") options.gfa_path = need(i);
         else if (flag == "--bubbles") options.bubbles_path = need(i);
         else if (flag == "--reads1") options.reads1_path = need(i);
@@ -1703,27 +2630,39 @@ int run_genotype_command(const std::vector<std::string>& args) {
         else if (flag == "-h" || flag == "--help") {
             std::cout <<
                 "Usage:\n"
-                "  panvar genotype --gfa <graph.gfa> --reference-path <name> \\\n"
+                "  panvar genotype --profile <profile.tsv> --gfa <graph.gfa> --reference-path <name> \\\n"
                 "                  --reads1 <r1.fq> --reads2 <r2.fq> --library <params.txt> \\\n"
-                "                  [--bubbles <bubbles.csv>] [--out-prefix <prefix>] \\\n"
-                "                  [--max-mosaic-candidates <K>] [--panel-curation <manifest.tsv>]\n\n"
-                "Calls a pair of whole-locus mosaic haplotypes and projects them to one allele\n"
-                "pair per SV block. Paired reads only.\n\n"
-                "Every unordered pair of panel haplotypes is always a candidate. --max-mosaic-candidates\n"
-                "adds up to K recombinant mosaics from the proposal beam (0: the panel alone); when the\n"
-                "beam finds fewer, the call is still made and marked CONDITIONAL.\n\n"
+                "                  --out-prefix <prefix> [--panel-curation <manifest.tsv>] [--bubbles <bubbles.csv>]\n\n"
+                "Calls a pair of whole-locus haplotypes and projects them to one allele pair per SV\n"
+                "block. Paired reads only. The command never asks what kind of sample it is given.\n\n"
+                "With a profile (the C4 production profile is profiles/genotype_c4.tsv) the call is\n"
+                "panel-anchored adaptive completion:\n"
+                "  1. every unordered pair of panel haplotypes and up to K grouped-prefix mosaics are\n"
+                "     exactly scored;\n"
+                "  2. the best exactly scored panel diplotype anchors an exact one-block coordinate\n"
+                "     repair, which moves to the best improving neighbour until none improves;\n"
+                "  3. the union and every candidate the repair scored are pooled and exactly reranked;\n"
+                "  4. one candidate at the top calls (status COMPLETE); several tied on total score\n"
+                "     with one unordered genotype at every block emit that genotype unphased\n"
+                "     (CONDITIONAL_GENOTYPE_EQUIVALENT, no FASTA); tied candidates that disagree at\n"
+                "     any block refuse. A round cap, resource refusal or interruption emits no genotype.\n"
+                "The candidate set is always CONDITIONAL: the search is local, never exhaustive, and\n"
+                "conditional_GQ is uncalibrated. phase_support is reported separately: PRIOR_ONLY\n"
+                "means the reads give no preference between phase alternatives, and the FASTA of\n"
+                "such a call is a prior-selected haplotype representation, not a read-phased result.\n\n"
+                "Without a profile the unrepaired call from the proposal's candidate set is made\n"
+                "(a development view). --max-mosaic-candidates sets K (0: the panel alone) and\n"
+                "--threads the workers; given beside a profile, either is recorded as an override.\n\n"
                 "Outputs <prefix>.genotypes.tsv, .block_genotypes.tsv, .mosaic_candidates.tsv,\n"
-                ".mosaic_scores.tsv,"
-                ".mosaic_status.tsv and .mosaic_haplotypes.fa. An incomplete run emits its\n"
-                "diagnostics and says so in the status file; it never presents a partial ranking\n"
-                "as a result.\n\n"
+                ".mosaic_scores.tsv, .mosaic_status.tsv and .mosaic_haplotypes.fa; with a profile\n"
+                "also .equivalence_set.tsv, .repair_rounds.tsv and .repair_memory.tsv. While running,\n"
+                "the status says RUNNING and committed repair rounds are in .repair_rounds.partial.tsv;\n"
+                "a run stopped by the profile's footprint or time limit keeps only those and says\n"
+                "RESOURCE_REFUSAL or TIME_LIMIT. An incomplete run never presents a partial ranking\n"
+                "as a result. Exit status 0 when a genotype was emitted, 1 otherwise.\n\n"
                 "--panel-curation takes a manifest of panel templates to exclude: one template name\n"
-                "per line, '#' opening a comment line. Curation is the only sanctioned way a template\n"
-                "leaves the panel -- a partial chain frame still refuses the model outright -- and it\n"
-                "is recorded rather than silent: the status names each excluded template with the\n"
-                "reason it would otherwise have carried, the manifest path, and a digest of the\n"
-                "decision, and the model fingerprint changes because the panel did. A manifest naming\n"
-                "a template the graph does not have is refused, not ignored.\n\n"
+                "per line, '#' opening a comment line. It is recorded with the reason, the manifest\n"
+                "path and a digest, and a manifest naming an absent template is refused.\n\n"
                 "--library declares insert_mean_bp, insert_sd_bp, support_sigmas,\n"
                 "substitution_error, outlier_weight and fragment_start_intensity, one per line,\n"
                 "and optionally marker_background (estimated from invariant anchors when absent).\n"
@@ -1734,7 +2673,7 @@ int run_genotype_command(const std::vector<std::string>& args) {
         }
     }
     const GenotypeRunStatus status = run_genotype(options);
-    return status == GenotypeRunStatus::Complete ? 0 : 1;
+    return status == GenotypeRunStatus::Complete || status == GenotypeRunStatus::ConditionalGenotypeEquivalent ? 0 : 1;
 }
 
 } // namespace panvar

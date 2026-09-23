@@ -15,8 +15,14 @@
 // perform, and that bound is cap + threads * batch. Reading the default here rather than repeating the
 // number keeps the test honest if the batch is ever retuned.
 #include "panvar/fragment_likelihood.hpp"
+#include "panvar/genotype_repair.hpp"
 
+#include <sys/wait.h>
+#include <unistd.h>
+
+#include <algorithm>
 #include <cmath>
+#include <iomanip>
 #include <cstdio>
 #include <fstream>
 #include <functional>
@@ -249,8 +255,9 @@ void test_end_to_end() {
             std::string line;
             std::string text;
             while (std::getline(input, line)) {
-                // Timings and the thread counters are exactly what a thread count may change.
-                if (status_file && (line.rfind("seconds_", 0) == 0 || line.rfind("threads_", 0) == 0)) {
+                // Timings, the thread counters and process memory are exactly what a thread count may change.
+                if (status_file && (line.rfind("seconds_", 0) == 0 || line.rfind("threads_", 0) == 0 ||
+                                    line.rfind("resources_", 0) == 0)) {
                     continue;
                 }
                 if (!line.empty() && line[0] == '>') line = line.substr(line.find(' '));
@@ -1034,6 +1041,8 @@ void test_candidate_prefixes_match_standalone() {
         std::string text;
         while (std::getline(input, line)) {
             if (status_file && line.rfind("seconds_", 0) == 0) continue;
+            // Process memory and the worker gauge describe the process, not the ranking.
+            if (status_file && (line.rfind("resources_", 0) == 0 || line.rfind("threads_peak_", 0) == 0)) continue;
             // Prefixes share one scoring pass over their union, so its work counters describe that pass.
             if (status_file) {
                 const std::string key = line.substr(0, line.find('\t'));
@@ -1833,9 +1842,385 @@ void test_resource_caps_are_thread_invariant() {
     }
 }
 
+// ---- the frozen final decision contract, as the pure function production calls ----------------------
+// Synthetic pools: every candidate is its own sequence pair, scored as the caller would hand it over.
+panvar::PoolCandidate pooled(std::vector<std::size_t> a, std::vector<std::size_t> b, double fragment, double prior) {
+    const auto spell = [](const std::vector<std::size_t>& v) {
+        std::string text = "h";
+        for (const std::size_t x : v) text += std::to_string(x) + ".";
+        return text;
+    };
+    panvar::PoolCandidate c;
+    c.first_sequence = panvar::sequence_digest(spell(a));
+    c.second_sequence = panvar::sequence_digest(spell(b));
+    c.first = std::move(a);
+    c.second = std::move(b);
+    c.score.fragment_term = fragment;
+    c.score.exposure_term = -100.0;
+    c.score.log_likelihood = fragment - 100.0;
+    c.score.absolute_term_sum = std::fabs(fragment) + 100.0;
+    c.score.fragments_with_mass = 10;
+    c.sequence_prior = prior;
+    c.path_prior = prior;
+    return c;
+}
+
+// Everything the decision says, independent of the order the pool was handed over in.
+std::string render_decision(const panvar::PooledDecision& d) {
+    std::ostringstream out;
+    out << std::setprecision(17) << panvar::top_set_decision_name(d.decision) << '|' << d.phase_support << '|';
+    for (const std::size_t g : d.top_groups) {
+        for (const std::size_t m : d.groups[g]) {
+            for (const std::size_t x : d.candidates[m].first) out << x << ',';
+            out << '/';
+            for (const std::size_t x : d.candidates[m].second) out << x << ',';
+            out << ';';
+        }
+    }
+    out << '|';
+    for (const auto& pair : d.genotype) out << pair.first << '/' << pair.second << ',';
+    out << '|';
+    for (const std::size_t b : d.disagreeing_blocks) out << b << ',';
+    const panvar::PoolCandidate& rep = d.candidates[d.representative[d.ranking.candidates.front().candidate_id]];
+    out << "|rep:";
+    for (const std::size_t x : rep.first) out << x << ',';
+    out << '/';
+    for (const std::size_t x : rep.second) out << x << ',';
+    out << '|' << d.genotype_separation_gap << '|' << d.has_same_genotype_alternative << d.same_genotype_fragment_identical
+        << '|' << d.same_genotype_prior_gap;
+    return out.str();
+}
+
+panvar::PooledDecision decide_both_ways(std::vector<panvar::PoolCandidate> pool, std::size_t blocks,
+                                        const std::string& label) {
+    const panvar::PooledDecision forward = panvar::decide_pooled_genotype(pool, blocks, 10, 6);
+    std::reverse(pool.begin(), pool.end());
+    for (panvar::PoolCandidate& c : pool) {   // and each identity presented with its homologues exchanged
+        std::swap(c.first, c.second);
+        std::swap(c.first_sequence, c.second_sequence);
+    }
+    const panvar::PooledDecision reversed = panvar::decide_pooled_genotype(pool, blocks, 10, 6);
+    require(render_decision(forward) == render_decision(reversed),
+            label + ": reversing the candidate order must give the identical decision:\n  " +
+                render_decision(forward) + "\n  " + render_decision(reversed));
+    return forward;
+}
+
+void test_pooled_decision_rule() {
+    using panvar::TopSetDecision;
+    // 1. Two tied candidates differing only in the phase between their two heterozygous blocks.
+    {
+        const auto d = decide_both_ways({pooled({0, 0, 2}, {1, 1, 2}, -1000.0, -5.0),
+                                         pooled({0, 1, 2}, {1, 0, 2}, -1000.0, -5.0),
+                                         pooled({0, 0, 2}, {0, 0, 2}, -1100.0, -5.0)},
+                                        3, "global phase");
+        require(d.decision == TopSetDecision::GenotypeEquivalent && d.top_groups.size() == 2,
+                "two tied phase alternatives of one genotype must be genotype-equivalent");
+        require(d.phase_support == "UNRESOLVED", "a tied top set must leave phase UNRESOLVED");
+        require(d.genotype == std::vector<std::pair<std::size_t, std::size_t>>{{0, 1}, {0, 1}, {2, 2}},
+                "the equivalent set must emit its shared unordered genotype");
+        require(d.has_other_genotype && d.genotype_separation_certified,
+                "the genotype must be separated from the best different genotype");
+    }
+    // 2. Two tied candidates with blockwise phase switches but identical unordered genotypes.
+    {
+        const auto d = decide_both_ways({pooled({0, 0, 0, 0}, {1, 1, 1, 1}, -1000.0, -5.0),
+                                         pooled({0, 1, 0, 1}, {1, 0, 1, 0}, -1000.0, -5.0),
+                                         pooled({0, 0, 0, 0}, {0, 1, 1, 1}, -1100.0, -5.0)},
+                                        4, "blockwise switches");
+        require(d.decision == TopSetDecision::GenotypeEquivalent && d.phase_support == "UNRESOLVED",
+                "tied blockwise phase switches of one genotype must be genotype-equivalent and unphased");
+    }
+    // 3. A tie differing at one block: refused, and the disagreeing block is named.
+    {
+        const auto d = decide_both_ways({pooled({0, 0, 0}, {1, 1, 1}, -1000.0, -5.0),
+                                         pooled({0, 0, 0}, {1, 1, 0}, -1000.0, -5.0),
+                                         pooled({0, 0, 0}, {0, 0, 0}, -1100.0, -5.0)},
+                                        3, "one-block disagreement");
+        require(d.decision == TopSetDecision::DistinctTie, "a tie that disagrees at any block must refuse");
+        require(d.disagreeing_blocks == std::vector<std::size_t>{2}, "the refusal must name the disagreeing block");
+    }
+    // 4. A unique winner. A same-genotype phase alternative with an IDENTICAL fragment term, lower only
+    // through the prior, does not make it a tie: it makes its phase PRIOR_ONLY.
+    {
+        const auto d = decide_both_ways({pooled({0, 0, 0}, {1, 1, 1}, -1000.0, -5.0),
+                                         pooled({0, 1, 1}, {1, 0, 0}, -1000.0, -12.0),
+                                         pooled({0, 0, 0}, {1, 1, 0}, -1004.0, -5.0)},
+                                        3, "unique winner");
+        require(d.decision == TopSetDecision::Unique && d.top_groups.size() == 1,
+                "a unique numerical winner must follow the unique path whatever lower same-genotype candidates exist");
+        require(d.phase_support == "PRIOR_ONLY", "a phase chosen only by the prior must be PRIOR_ONLY");
+        require(d.has_same_genotype_alternative && d.same_genotype_fragment_identical &&
+                    std::fabs(d.same_genotype_prior_gap - 7.0) < 1e-12,
+                "the best same-genotype alternative must be reported with its identical fragment term and prior gap");
+        require(std::fabs(d.genotype_separation_gap - 4.0) < 1e-9 && d.genotype_separation_certified,
+                "separation must be measured against the best DIFFERENT genotype, not the phase alternative");
+        const auto reads = decide_both_ways({pooled({0, 0, 0}, {1, 1, 1}, -1000.0, -5.0),
+                                             pooled({0, 1, 1}, {1, 0, 0}, -1010.0, -5.0),
+                                             pooled({0, 0, 0}, {1, 1, 0}, -1004.0, -5.0)},
+                                            3, "read-supported unique winner");
+        require(reads.decision == TopSetDecision::Unique && reads.phase_support == "READS_WITHIN_CANDIDATES",
+                "a phase the fragments choose must be read-supported within the candidates");
+    }
+    std::cout << "  pooled decision rule: phase-only and blockwise-switch ties unphased, one-block tie refused, "
+                 "unique winner unique (PRIOR_ONLY / READS), all order-invariant\n";
+}
+
+// ---- panel-anchored adaptive completion, end to end ------------------------------------------------
+panvar::GenotypeCommandOptions repair_options(const std::string& prefix, const std::string& r1,
+                                              const std::string& r2, const std::string& gfa) {
+    panvar::GenotypeCommandOptions options = tiny_options(prefix, r1, r2, gfa);
+    options.repair_rounds = 11;
+    options.repair_local_pairs = 32;
+    options.repair_origin_cache_bytes = 1 << 24;
+    options.threads = 2;
+    return options;
+}
+
+std::string slurp(const std::string& file) {
+    std::ifstream input(file);
+    std::stringstream buffer;
+    buffer << input.rdbuf();
+    return buffer.str();
+}
+
+// The scientific columns of a rounds table: everything up to the invariance flags, no timing.
+std::string rounds_science(const std::string& file) {
+    std::string out;
+    for (const auto& row : read_rows(file)) {
+        for (std::size_t c = 0; c < 28 && c < row.size(); ++c) out += row[c] + '\t';
+        out += '\n';
+    }
+    return out;
+}
+
+bool no_final_outputs(const std::string& prefix) {
+    for (const char* suffix : {".genotypes.tsv", ".block_genotypes.tsv", ".mosaic_candidates.tsv", ".mosaic_scores.tsv",
+                               ".mosaic_haplotypes.fa", ".equivalence_set.tsv", ".repair_rounds.tsv"}) {
+        if (exists(path(prefix + suffix))) return false;
+    }
+    return true;
+}
+
+void require_truth_genotype(const panvar::GenotypeCommandOptions& options, const std::string& prefix) {
+    const auto reported = read_status(path(prefix + ".mosaic_status.tsv"));
+    const TruthFrame frame = rebuild_truth_frame(options, reported.at("model_fingerprint"), kTruth1Nodes, kTruth2Nodes);
+    const auto rows = read_rows(path(prefix + ".block_genotypes.tsv"));
+    require(rows.size() == frame.model->blocks().size(), "the block table must carry every block");
+    for (std::size_t b = 0; b < rows.size(); ++b) {
+        const auto& alleles = frame.model->blocks()[b].alleles;
+        const std::string& c1 = alleles[std::stoul(rows[b][3])].sequence;
+        const std::string& c2 = alleles[std::stoul(rows[b][4])].sequence;
+        const std::string& a = *frame.truth1.blocks[b];
+        const std::string& d = *frame.truth2.blocks[b];
+        require((c1 == a && c2 == d) || (c1 == d && c2 == a),
+                prefix + ": block " + rows[b][0] + " must be called as the truth's unordered allele pair");
+    }
+}
+
+void test_adaptive_completion() {
+    const std::string r1 = path("phaseable_r1.fq");
+    const std::string r2 = path("phaseable_r2.fq");
+
+    // The panel alone as the union (K = 0): the truth is off-panel, so only the repair can reach it.
+    panvar::GenotypeCommandOptions anchored = repair_options("adaptive_k0", r1, r2, "tiny_phaseable.gfa");
+    anchored.max_mosaic_candidates = 0;
+    const panvar::GenotypeRunStatus status = panvar::run_genotype(anchored);
+    const auto reported = read_status(path("adaptive_k0.mosaic_status.tsv"));
+    require(status == panvar::GenotypeRunStatus::Complete,
+            std::string("the panel-anchored completion must call the phaseable locus, got ") +
+                panvar::genotype_run_status_name(status) + ": " + (reported.count("note") ? reported.at("note") : ""));
+    require(reported.at("algorithm") == "panel_anchored_adaptive_completion" &&
+                reported.at("repair_converged") == "true" && std::stoul(reported.at("repair_moves")) > 0,
+            "the repair must run, move off the panel anchor and converge");
+    require(reported.at("final_decision") == "UNIQUE" && reported.at("phase_support") == "READS_WITHIN_CANDIDATES",
+            "the phaseable truth must be a unique, read-phased winner of the pool");
+    require(reported.at("final_candidate_scope") == "CONDITIONAL" && reported.at("global_certified") == "false" &&
+                reported.at("search_globally_exhaustive") == "false",
+            "a local search from one anchor must never claim a complete candidate set");
+    require(reported.at("pool_score_mismatches") == "0", "the union and the repair must score shared candidates identically");
+    require(reported.at("haplotype_representation") == "read_supported_within_candidates",
+            "a read-phased unique call must say what its FASTA is");
+    require(reported.count("sha256_gfa") && reported.at("sha256_gfa").size() == 64 &&
+                reported.at("sha256_reads1").size() == 64,
+            "the inputs must be recorded by content");
+    require(reported.at("conditional_gq_calibration") == "uncalibrated", "GQ must be labelled uncalibrated");
+    require_truth_genotype(anchored, "adaptive_k0");
+    require(exists(path("adaptive_k0.repair_rounds.tsv")) && exists(path("adaptive_k0.equivalence_set.tsv")) &&
+                exists(path("adaptive_k0.mosaic_haplotypes.fa")),
+            "a completed repair must leave its trajectory, its equivalence set and its haplotypes");
+    require(!exists(path("adaptive_k0.repair_rounds.partial.tsv")) && !exists(path("adaptive_k0.sorted.gfa")),
+            "a completed run must leave no partial rounds and no staged graph");
+    require(slurp(path("adaptive_k0.mosaic_haplotypes.fa")).find("phase_support=READS_WITHIN_CANDIDATES") !=
+                std::string::npos,
+            "the FASTA header must carry the phase support");
+
+    // The frozen union (K = 16) and the thread count: identical trajectory and identical outputs.
+    std::string reference_rounds;
+    std::string reference_tables;
+    for (const std::size_t threads : {std::size_t{1}, std::size_t{4}}) {
+        const std::string name = "adaptive_t" + std::to_string(threads);
+        panvar::GenotypeCommandOptions run = repair_options(name, r1, r2, "tiny_phaseable.gfa");
+        run.threads = threads;
+        require(panvar::run_genotype(run) == panvar::GenotypeRunStatus::Complete, "the K = 16 completion must call");
+        require_truth_genotype(run, name);
+        const std::string rounds = rounds_science(path(name + ".repair_rounds.tsv"));
+        const std::string tables = slurp(path(name + ".genotypes.tsv")) + slurp(path(name + ".block_genotypes.tsv")) +
+                                   slurp(path(name + ".mosaic_scores.tsv")) + slurp(path(name + ".equivalence_set.tsv")) +
+                                   slurp(path(name + ".mosaic_candidates.tsv"));
+        if (reference_rounds.empty()) {
+            reference_rounds = rounds;
+            reference_tables = tables;
+        } else {
+            require(rounds == reference_rounds, "the repair trajectory must not depend on the thread count");
+            require(tables == reference_tables, "the pooled decision and its tables must not depend on the thread count");
+        }
+    }
+
+    // The unphaseable locus: no fragment links neighbouring variants.
+    {
+        panvar::GenotypeCommandOptions run =
+            repair_options("adaptive_unphaseable", path("unphaseable_r1.fq"), path("unphaseable_r2.fq"), "tiny.gfa");
+        const panvar::GenotypeRunStatus result = panvar::run_genotype(run);
+        const auto unphased = read_status(path("adaptive_unphaseable.mosaic_status.tsv"));
+        require(result == panvar::GenotypeRunStatus::ConditionalGenotypeEquivalent,
+                std::string("tied phase histories of one genotype must be CONDITIONAL_GENOTYPE_EQUIVALENT, got ") +
+                    panvar::genotype_run_status_name(result) + ": " + (unphased.count("note") ? unphased.at("note") : ""));
+        require(std::stoul(unphased.at("top_set_size")) > 1 && unphased.at("phase_support") == "UNRESOLVED",
+                "the equivalent set must hold several candidates with phase UNRESOLVED");
+        require(!exists(path("adaptive_unphaseable.mosaic_haplotypes.fa")),
+                "a genotype-equivalent call must emit no haplotype FASTA");
+        require(read_rows(path("adaptive_unphaseable.equivalence_set.tsv")).size() >= 2,
+                "the complete equivalence set must be reported");
+        for (const auto& row : read_rows(path("adaptive_unphaseable.block_genotypes.tsv"))) {
+            require(row[3] != "." && row[10] == "UNRESOLVED", "every block is genotyped, every block unphased");
+        }
+        require(unphased.at("haplotype_representation") == "none", "no haplotype representation is emitted");
+    }
+
+    // A round cap: the search is stopped before it converges, so no genotype.
+    {
+        panvar::GenotypeCommandOptions capped = repair_options("adaptive_cap", r1, r2, "tiny_phaseable.gfa");
+        capped.max_mosaic_candidates = 0;
+        capped.repair_rounds = 1;
+        require(panvar::run_genotype(capped) == panvar::GenotypeRunStatus::RepairIncomplete,
+                "a search stopped at its round cap must not call");
+        const auto s = read_status(path("adaptive_cap.mosaic_status.tsv"));
+        require(s.at("repair_stop_reason") == "round_cap" && s.at("repair_converged") == "false",
+                "the round cap must be named as the stop");
+        require(!exists(path("adaptive_cap.genotypes.tsv")) && !exists(path("adaptive_cap.mosaic_haplotypes.fa")) &&
+                    !exists(path("adaptive_cap.mosaic_scores.tsv")),
+                "a round-capped search must emit no genotype and no ranking");
+        require(exists(path("adaptive_cap.repair_rounds.tsv")), "the trajectory it did run is kept");
+    }
+    // A cumulative cap: refused in flight, no genotype, no ranking.
+    {
+        panvar::GenotypeCommandOptions refused = repair_options("adaptive_refused", r1, r2, "tiny_phaseable.gfa");
+        refused.repair_max_physical_origins = 1;
+        require(panvar::run_genotype(refused) == panvar::GenotypeRunStatus::RescoreIncomplete,
+                "a repair past its cumulative cap must refuse");
+        require(no_final_outputs("adaptive_refused") && !exists(path("adaptive_refused.sorted.gfa")),
+                "a refused repair must leave no final output and no staged graph");
+    }
+    std::cout << "  adaptive completion: off-panel truth reached from the panel anchor ("
+              << reported.at("repair_moves") << " moves), thread-invariant; unphaseable locus genotype-equivalent "
+                 "with no FASTA; round cap and cumulative cap emit no genotype\n";
+}
+
+// The watchdog stops the whole process, so it is exercised in a child.
+int run_in_child(const panvar::GenotypeCommandOptions& options) {
+    std::cout.flush();
+    const pid_t child = fork();
+    require(child >= 0, "fork failed");
+    if (child == 0) {
+        try {
+            panvar::run_genotype(options);
+        } catch (...) {
+            std::_Exit(3);
+        }
+        std::_Exit(0);
+    }
+    int wait_status = 0;
+    waitpid(child, &wait_status, 0);
+    return WIFEXITED(wait_status) ? WEXITSTATUS(wait_status) : -1;
+}
+
+void test_watchdog_and_interruption() {
+    const std::string r1 = path("phaseable_r1.fq");
+    const std::string r2 = path("phaseable_r2.fq");
+    {
+        panvar::GenotypeCommandOptions interrupted = repair_options("adaptive_interrupted", r1, r2, "tiny_phaseable.gfa");
+        interrupted.max_mosaic_candidates = 0;
+        interrupted.test_interrupt_after_repair_rounds = 1;
+        require(run_in_child(interrupted) == 124, "an interrupted run must stop through the time-limit path");
+        const auto s = read_status(path("adaptive_interrupted.mosaic_status.tsv"));
+        require(s.at("status") == "TIME_LIMIT" && s.at("repair_rounds_committed") == "1",
+                "the status must say TIME_LIMIT and how many rounds were committed");
+        require(read_rows(path("adaptive_interrupted.repair_rounds.partial.tsv")).size() == 1,
+                "the committed round must be preserved as a partial row");
+        require(no_final_outputs("adaptive_interrupted") && !exists(path("adaptive_interrupted.sorted.gfa")),
+                "an interrupted run must leave no final output and no staged graph");
+        // The preserved row is the complete run's first round.
+        const auto partial = read_rows(path("adaptive_interrupted.repair_rounds.partial.tsv"));
+        const auto complete = read_rows(path("adaptive_k0.repair_rounds.tsv"));
+        for (std::size_t c = 0; c < 28; ++c) {
+            require(partial[0][c] == complete[0][c], "a preserved partial round must equal the uninterrupted run's");
+        }
+    }
+    {
+        panvar::GenotypeCommandOptions breached = repair_options("adaptive_footprint", r1, r2, "tiny_phaseable.gfa");
+        breached.footprint_limit_bytes = 1;
+        require(run_in_child(breached) == 125, "a footprint breach must stop the process as a resource refusal");
+        const auto s = read_status(path("adaptive_footprint.mosaic_status.tsv"));
+        require(s.at("status") == "RESOURCE_REFUSAL", "the status must say RESOURCE_REFUSAL");
+        require(no_final_outputs("adaptive_footprint") && !exists(path("adaptive_footprint.sorted.gfa")),
+                "a refused run must leave no final output and no staged graph");
+    }
+    std::cout << "  watchdog: interruption keeps its committed round and nothing final; a footprint breach refuses\n";
+}
+
+void test_profile(const std::string& source_dir) {
+    {
+        std::ofstream abc(path("abc.txt"));
+        abc << "abc";
+    }
+    require(panvar::sha256_file(path("abc.txt")) ==
+                "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+            "SHA-256 must match the FIPS 180-4 test vector");
+    panvar::GenotypeCommandOptions options;
+    panvar::apply_genotype_profile(source_dir + "/profiles/genotype_c4.tsv", options);
+    require(options.profile_name == "c4-panel-anchored-v1" && options.proposal_state_limit == 256 &&
+                options.max_mosaic_candidates == 128 && options.phase_audit_candidates == 0 && options.threads == 8 &&
+                options.repair_rounds == 11 && options.repair_local_pairs == 32 &&
+                options.repair_origin_cache_bytes == 402653184 && options.footprint_limit_bytes == 2684354560ULL &&
+                options.emission_cache_bytes == 536870912 && options.max_physical_origins == 700000000 &&
+                options.max_state_classes == 600000000 && options.repair_max_neighbours == 670,
+            "the committed C4 profile must set the frozen production settings");
+    require(options.profile_sha256.size() == 64, "the profile must be recorded by content");
+    const auto refuses = [&](const std::string& body, const std::string& label) {
+        {
+            std::ofstream bad(path("bad_profile.tsv"));
+            bad << body;
+        }
+        panvar::GenotypeCommandOptions ignored;
+        bool threw = false;
+        try {
+            panvar::apply_genotype_profile(path("bad_profile.tsv"), ignored);
+        } catch (const std::exception&) {
+            threw = true;
+        }
+        require(threw, "a profile with " + label + " must be refused");
+    };
+    refuses("profile\tx\nno_such_setting\t1\n", "an unknown setting");
+    refuses("profile\tx\nrepair_rounds\t11\nrepair_rounds\t12\n", "a repeated setting");
+    refuses("repair_rounds\t11\n", "no name");
+    refuses("profile\tx\nrepair_rounds\t11x\n", "an unparsable value");
+    std::cout << "  profile: committed C4 profile applied and hashed; malformed profiles refused\n";
+}
+
 int main(int argc, char** argv) {
     if (argc < 2) {
-        std::cerr << "usage: genotype_command_e2e_test <scratch dir>\n";
+        std::cerr << "usage: genotype_command_e2e_test <scratch dir> [source dir]\n";
         return 2;
     }
     dir = argv[1];
@@ -1857,6 +2242,10 @@ int main(int argc, char** argv) {
         test_proposal_payload_ceiling();
         test_curated_panel();
         test_resource_caps_are_thread_invariant();
+        test_pooled_decision_rule();
+        test_adaptive_completion();
+        test_watchdog_and_interruption();
+        if (argc >= 3) test_profile(argv[2]);
         std::cout << "genotype command end-to-end: PASS\n";
         return 0;
     } catch (const std::exception& error) {

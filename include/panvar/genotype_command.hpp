@@ -88,6 +88,43 @@ struct GenotypeCommandOptions {
     // if that larger set agrees on the winner, the block genotypes and read-supported phase. Without an audit a
     // read-supported phase is READS_WITHIN_CANDIDATES.
     std::size_t phase_audit_candidates = 0;
+
+    // ---- panel-anchored adaptive completion (the production algorithm; set by a profile) --------
+    // When repair_rounds > 0 the call is not made from the proposal's candidate set alone. The panel
+    // and grouped-mosaic union is exactly scored, the best exactly scored PANEL diplotype anchors an
+    // exact one-block coordinate repair, the union and every candidate the repair scored are pooled,
+    // and the pool is exactly reranked. The decision is then made over the pool's numerical top set:
+    // one candidate calls normally; several with one unordered genotype are
+    // CONDITIONAL_GENOTYPE_EQUIVALENT (unphased, no FASTA); several that disagree anywhere refuse.
+    // A search that does not converge -- round cap, an unresolved tie among improving neighbours, a
+    // cycle, a resource refusal or an interruption -- emits no genotype. 0 keeps the unrepaired call,
+    // which is a development view only.
+    std::size_t repair_rounds = 0;
+    std::size_t repair_local_pairs = 32;
+    std::size_t repair_origin_cache_bytes = 402653184;   // 384 MiB, planned retention
+    // One round's neighbourhood above this is refused before any allocation.
+    std::uint64_t repair_max_neighbours = 670;
+    // CUMULATIVE caps over the whole repair search, a different declared quantity from the per-pass
+    // caps above, which bound the union's single scoring pass.
+    std::uint64_t repair_max_physical_origins = 4900000000ULL;
+    std::uint64_t repair_max_state_classes = 4200000000ULL;
+    std::uint64_t repair_max_piece_hits = 14000000000ULL;
+    std::uint64_t repair_max_latent_pairs = 14000000000ULL;
+    // Process limits, enforced by a watchdog over the whole run (0: none). Crossing one stops the
+    // process at once: committed repair rounds stay as <prefix>.repair_rounds.partial.tsv, the staged
+    // graph and every final output are removed, and the status says TIME_LIMIT or RESOURCE_REFUSAL.
+    std::uint64_t footprint_limit_bytes = 0;
+    double time_limit_seconds = 0.0;
+    // Provenance of the profile the settings came from, and of every setting a command-line flag
+    // overrode after it. Recorded; never interpreted.
+    std::string profile_path;
+    std::string profile_sha256;
+    std::string profile_name;
+    std::vector<std::string> overridden_settings;
+    // Development harness only; not a command-line option. Stops the process through the time-limit
+    // path after this many committed repair rounds that moved, so the interruption contract -- partial
+    // rounds kept, no final output, TIME_LIMIT -- is testable deterministically. 0: never.
+    std::size_t test_interrupt_after_repair_rounds = 0;
 };
 
 // A run that cannot complete emits its diagnostics and says so. It never presents a partial ranking
@@ -105,6 +142,16 @@ enum class GenotypeRunStatus {
     // phased haplotype is emitted, and phase is UNRESOLVED. A caller must be able to tell this from a
     // certified winner without reading the status file.
     BlockConsensus,
+    // The pooled top set holds several candidates, numerically tied on total score, that carry the
+    // same unordered allele pair at every block: the block genotype is emitted, phase is UNRESOLVED,
+    // the equivalence set is reported and no haplotype FASTA is written.
+    ConditionalGenotypeEquivalent,
+    // The repair search stopped without converging (round cap, a tie among improving neighbours, a
+    // cycle, or an incumbent that did not reproduce). The trajectory is kept; no genotype.
+    RepairIncomplete,
+    // Written by the watchdog as the process stops; a run never returns these.
+    TimeLimit,
+    ResourceRefusal,
 };
 
 const char* genotype_run_status_name(GenotypeRunStatus status);
@@ -148,6 +195,11 @@ std::vector<BlockConsensusCall> block_consensus(
     const std::vector<std::vector<std::pair<std::size_t, std::size_t>>>& tied_genotypes);
 
 GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options);
+
+// Reads a genotype profile: one `key<TAB>value` per line, '#' comment lines. Every key sets one
+// option; an unknown key, a repeated key or an unparsable value refuses. Records the profile's path,
+// name and SHA-256 in the options so every run states what it was configured by.
+void apply_genotype_profile(const std::string& path, GenotypeCommandOptions& options);
 
 int run_genotype_command(const std::vector<std::string>& args);
 

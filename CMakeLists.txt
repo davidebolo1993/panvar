@@ -133,6 +133,7 @@ add_library(panvarlib
     src/mosaic_beam_grouped.cpp
     src/genotype_locus.cpp
     src/genotype_command.cpp
+    src/genotype_repair.cpp
     src/fragment_likelihood.cpp
     src/bubble_path.cpp
     src/bubbles.cpp
@@ -247,7 +248,7 @@ if(PANVAR_BUILD_TESTING)
         target_link_libraries(genotype_command_e2e_test PRIVATE panvarlib)
         target_compile_options(genotype_command_e2e_test PRIVATE -Wall -Wextra -Wpedantic)
         add_test(NAME panvar_genotype_command_e2e
-                 COMMAND genotype_command_e2e_test ${CMAKE_CURRENT_BINARY_DIR}/genotype_e2e)
+                 COMMAND genotype_command_e2e_test ${CMAKE_CURRENT_BINARY_DIR}/genotype_e2e ${CMAKE_CURRENT_SOURCE_DIR})
         file(MAKE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/genotype_e2e)
 
         # Developer probe: seeded simulation, leave-one-out graphs and truth evaluation. Not a test and
@@ -347,6 +348,11 @@ if(PANVAR_BUILD_TESTING)
         add_test(NAME panvar_genotype_pair_override
                  COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/genotype_pair_override.sh
                          ${CMAKE_CURRENT_BINARY_DIR} ${CMAKE_CURRENT_BINARY_DIR}/genotype_pair_override)
+        # The prepared-not-launched final C4 campaigns: planned from committed manifests, launch refused.
+        add_test(NAME panvar_genotype_production_campaign_plan
+                 COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/genotype_production_campaign_gate.sh
+                         ${CMAKE_CURRENT_BINARY_DIR}/genotype_production_campaign)
+
         # repair-pilot's construction and certification must not depend on candidate order or on which
         # homologue of a seed is written first. Both are checked from the scores its single pass already
         # produced, so neither costs an extra likelihood call.
