@@ -2045,6 +2045,10 @@ void test_adaptive_completion() {
                 reported.at("sha256_reads1").size() == 64,
             "the inputs must be recorded by content");
     require(reported.at("conditional_gq_calibration") == "uncalibrated", "GQ must be labelled uncalibrated");
+    require(reported.at("call_class") == "strict_call" && reported.at("no_call_reason") == "none",
+            "a unique call must be classed a strict call");
+    require(reported.at("union_top_hap1") != "NA" && reported.at("union_top_hap2") != "NA",
+            "the union's top candidate must be recorded as the diagnostic fallback");
     require_truth_genotype(anchored, "adaptive_k0");
     require(exists(path("adaptive_k0.repair_rounds.tsv")) && exists(path("adaptive_k0.equivalence_set.tsv")) &&
                 exists(path("adaptive_k0.mosaic_haplotypes.fa")),
@@ -2096,6 +2100,7 @@ void test_adaptive_completion() {
             require(row[3] != "." && row[10] == "UNRESOLVED", "every block is genotyped, every block unphased");
         }
         require(unphased.at("haplotype_representation") == "none", "no haplotype representation is emitted");
+        require(unphased.at("call_class") == "genotype_equivalent_call", "the call must be classed genotype-equivalent");
     }
 
     // A round cap: the search is stopped before it converges, so no genotype.
@@ -2108,6 +2113,8 @@ void test_adaptive_completion() {
         const auto s = read_status(path("adaptive_cap.mosaic_status.tsv"));
         require(s.at("repair_stop_reason") == "round_cap" && s.at("repair_converged") == "false",
                 "the round cap must be named as the stop");
+        require(s.at("call_class") == "no_call" && s.at("no_call_reason") == "round_cap",
+                "a round-capped search is a no-call for the round cap");
         require(!exists(path("adaptive_cap.genotypes.tsv")) && !exists(path("adaptive_cap.mosaic_haplotypes.fa")) &&
                     !exists(path("adaptive_cap.mosaic_scores.tsv")),
                 "a round-capped search must emit no genotype and no ranking");
@@ -2172,7 +2179,8 @@ void test_watchdog_and_interruption() {
         breached.footprint_limit_bytes = 1;
         require(run_in_child(breached) == 125, "a footprint breach must stop the process as a resource refusal");
         const auto s = read_status(path("adaptive_footprint.mosaic_status.tsv"));
-        require(s.at("status") == "RESOURCE_REFUSAL", "the status must say RESOURCE_REFUSAL");
+        require(s.at("status") == "RESOURCE_REFUSAL" && s.at("no_call_reason") == "footprint_limit",
+                "the status must say RESOURCE_REFUSAL, for the footprint limit");
         require(no_final_outputs("adaptive_footprint") && !exists(path("adaptive_footprint.sorted.gfa")),
                 "a refused run must leave no final output and no staged graph");
     }

@@ -78,6 +78,8 @@ std::string minimal_status(const RunWatch& watch, const std::string& state, cons
     const FootprintSample footprint = physical_footprint();
     std::ostringstream text;
     text << std::setprecision(12) << "key\tvalue\nstatus\t" << state << "\nnote\t" << note
+         << "\ncall_class\t" << (state == "RUNNING" ? "pending" : "no_call") << "\nno_call_reason\t"
+         << (state == "TIME_LIMIT" ? "time_limit" : state == "RESOURCE_REFUSAL" ? "footprint_limit" : "NA")
          << "\nmodel_fingerprint\t" << watch.fingerprint << "\nprofile\t" << watch.profile << "\nprofile_sha256\t"
          << watch.profile_sha256 << "\nphase\t" << watch.phase << "\nelapsed_seconds\t" << seconds_since(watch.started)
          << "\ntime_limit_seconds\t" << watch.time_limit << "\nfootprint_limit_bytes\t" << watch.footprint_limit
@@ -423,6 +425,13 @@ struct RepairReport {
     std::string same_genotype_prior_gap = "NA";
     std::string same_genotype_fragment_identical = "NA";
     std::string haplotype_representation = "none";
+    // strict_call, genotype_equivalent_call or no_call, and why a no-call is one. Reporting only.
+    std::string call_class = "no_call";
+    std::string no_call_reason = "NA";
+    // The union's exact ranking top, before any repair: a labelled diagnostic fallback for a run that
+    // emits no genotype, never a call.
+    std::string union_top_hap1 = "NA", union_top_hap2 = "NA";
+    double union_top_score = 0.0;
     FragmentScoringCounters cumulative;
     std::uint64_t footprint_at_repair_start = 0;
     std::uint64_t origin_cache_bytes_end = 0;
@@ -445,8 +454,10 @@ void write_repair_report(std::ostream& out, const RepairReport& r) {
         << "\nrepair_max_physical_origins\t" << o.repair_max_physical_origins << "\nrepair_max_state_classes\t"
         << o.repair_max_state_classes << "\nrepair_max_piece_hits\t" << o.repair_max_piece_hits
         << "\nrepair_max_latent_pairs\t" << o.repair_max_latent_pairs << '\n';
+    out << "call_class\t" << r.call_class << "\nno_call_reason\t" << r.no_call_reason << '\n';
     out << "union_ranking_status\t" << r.union_status << "\nunion_winner_set_size\t" << r.union_winner_set
-        << "\nunion_certified_gap\t" << r.union_certified_gap << '\n';
+        << "\nunion_certified_gap\t" << r.union_certified_gap << "\nunion_top_score\t" << r.union_top_score
+        << "\nunion_top_hap1\t" << r.union_top_hap1 << "\nunion_top_hap2\t" << r.union_top_hap2 << '\n';
     out << "repair_anchor_candidate_id\t" << r.anchor_candidate_id << "\nrepair_anchor_union_rank\t"
         << r.anchor_union_rank << "\nrepair_anchor_score\t" << r.anchor_score << "\nrepair_anchor_hap1\t"
         << r.anchor_hap1 << "\nrepair_anchor_hap2\t" << r.anchor_hap2 << '\n';
@@ -1669,6 +1680,13 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
         report.union_winner_set = union_ranking.winner_set.size();
         report.union_certified_gap = union_ranking.certified_gap;
         report.pool_union_candidates = candidates.size();
+        {
+            const MosaicDiplotype& top =
+                candidates[chosen.sequence_candidates[union_ranking.candidates.front().candidate_id].representative].diplotype;
+            report.union_top_hap1 = join_alleles(top.first.alleles);
+            report.union_top_hap2 = join_alleles(top.second.alleles);
+            report.union_top_score = union_ranking.candidates.front().score;
+        }
         // A local search from one anchor never makes the candidate set complete.
         set_report.final_candidate_scope = "CONDITIONAL";
         const auto stop_with = [&](GenotypeRunStatus status, const std::string& note, const CertifiedRanking* ranking,
@@ -1680,6 +1698,10 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
             set_report.haploid_prior_evaluations = candidate_report.haploid_prior_evaluations;
             set_report.diploid_prior_lookups = candidate_report.diploid_prior_lookups;
             report.seconds = seconds_since(repair_mark);
+            report.call_class = status == GenotypeRunStatus::Complete                        ? "strict_call"
+                                : status == GenotypeRunStatus::ConditionalGenotypeEquivalent ? "genotype_equivalent_call"
+                                                                                             : "no_call";
+            if (report.call_class != "no_call") report.no_call_reason = "none";
             timings.total = seconds_since(started);
             write_status(status_path, status, fingerprint, options, library, timings, &built.report, &panel, beam_view,
                          ranking, note, summary, &depth, &set_report, &report);
@@ -1711,6 +1733,7 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
             if (anchor != npos) anchor_rank = p;
         }
         if (anchor == npos) {
+            report.no_call_reason = "no_panel_anchor";
             return stop_with(GenotypeRunStatus::RepairIncomplete,
                              "the union holds no exactly scored panel diplotype to anchor the repair", nullptr, nullptr);
         }
@@ -1722,6 +1745,7 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
         report.anchor_hap1 = join_alleles(anchor_diplotype.first.alleles);
         report.anchor_hap2 = join_alleles(anchor_diplotype.second.alleles);
         if (options.repair_max_neighbours != 0 && report.neighbour_bound > options.repair_max_neighbours) {
+            report.no_call_reason = "neighbourhood_bound";
             return stop_with(GenotypeRunStatus::RepairIncomplete,
                              "one repair round's neighbourhood (" + std::to_string(report.neighbour_bound) +
                                  ") exceeds its declared bound " + std::to_string(options.repair_max_neighbours) +
@@ -1857,6 +1881,7 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
         } catch (const ResourceExhausted& error) {
             refusal = error.what();
         } catch (const std::exception& error) {
+            report.no_call_reason = "repair_failed";
             return stop_with(GenotypeRunStatus::RepairIncomplete,
                              std::string("the repair search failed and returned no genotype: ") + error.what(),
                              nullptr, nullptr);
@@ -1881,6 +1906,7 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
         for (const PoolEntry& entry : pool) report.pool_repair_only += entry.in_union ? 0 : 1;
         report.pool_score_mismatches = mismatches;
         if (!refusal.empty()) {
+            report.no_call_reason = "cumulative_cap";
             // Committed rounds stay as <prefix>.repair_rounds.partial.tsv: a record, never a call.
             return stop_with(GenotypeRunStatus::RescoreIncomplete,
                              "the repair search stopped at a declared cumulative cap and returned no genotype: " +
@@ -1895,6 +1921,7 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
         };
         claim_run();
         if (!reproduced) {
+            report.no_call_reason = "anchor_not_reproduced";
             write_trajectory();
             std::ostringstream why;
             why << std::setprecision(17) << "the repair anchor did not reproduce its union score in round "
@@ -1903,6 +1930,11 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
             return stop_with(GenotypeRunStatus::RepairIncomplete, why.str(), nullptr, nullptr);
         }
         if (!report.converged) {
+            // A round tie that excludes the incumbent is a tie among improving moves: the search cannot
+            // choose between them and fails closed. Every other non-converged stop keeps its own name.
+            const std::string& stop = report.stop_reason;
+            report.no_call_reason =
+                stop == "rescore_incomplete" || stop == "tie_at_best" ? "improving_move_tie" : stop;
             write_trajectory();
             return stop_with(GenotypeRunStatus::RepairIncomplete,
                              "the repair search stopped without converging (" + report.stop_reason +
@@ -1910,6 +1942,7 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
                              nullptr, nullptr);
         }
         if (mismatches != 0) {
+            report.no_call_reason = "pool_score_mismatch";
             write_trajectory();
             return stop_with(GenotypeRunStatus::RepairIncomplete,
                              std::to_string(mismatches) +
@@ -1929,6 +1962,7 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
         decided.ranking.counters = scored.counters;   // the union pass; the repair's are reported apart
         report.pool_sequence_candidates = decided.groups.size();
         if (decided.score_mismatches != 0) {
+            report.no_call_reason = "sequence_score_mismatch";
             write_trajectory();
             return stop_with(GenotypeRunStatus::RepairIncomplete,
                              std::to_string(decided.score_mismatches) +
@@ -2082,6 +2116,7 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
         write_trajectory();
 
         if (decided.decision == TopSetDecision::DistinctTie) {
+            report.no_call_reason = "distinct_tie";
             return stop_with(GenotypeRunStatus::RescoreIncomplete,
                              "the pooled top set holds " + std::to_string(decided.top_groups.size()) +
                                  " candidates tied on total score that disagree at block(s) " + report.disagreeing_blocks +
@@ -2615,9 +2650,6 @@ int run_genotype_command(const std::vector<std::string>& args) {
     for (std::size_t i = 0; i < args.size(); ++i) {
         const std::string& flag = args[i];
         if (flag == "--profile") { ++i; continue; }
-        if (profiled && (flag == "--threads" || flag == "--max-mosaic-candidates")) {
-            options.overridden_settings.push_back(flag.substr(2));
-        }
         if (flag == "--gfa" || flag == "-i") options.gfa_path = need(i);
         else if (flag == "--bubbles") options.bubbles_path = need(i);
         else if (flag == "--reads1") options.reads1_path = need(i);
@@ -2676,6 +2708,16 @@ int run_genotype_command(const std::vector<std::string>& args) {
             return 0;
         } else {
             throw std::runtime_error("unknown genotype option: " + flag);
+        }
+    }
+    if (profiled) {
+        // Every setting a flag gave beside the profile, with the value it took.
+        for (const std::string& flag : args) {
+            if (flag == "--threads") options.overridden_settings.push_back("threads=" + std::to_string(options.threads));
+            if (flag == "--max-mosaic-candidates") {
+                options.overridden_settings.push_back("max_mosaic_candidates=" +
+                                                      std::to_string(options.max_mosaic_candidates));
+            }
         }
     }
     const GenotypeRunStatus status = run_genotype(options);

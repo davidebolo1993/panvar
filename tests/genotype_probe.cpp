@@ -620,15 +620,29 @@ int evaluate(const Args& args) {
 
     // A genotype-equivalent call emits one unordered genotype shared by its whole top set, and the
     // distances below are unordered per block, so any representative of the set measures it exactly.
-    const bool complete = status.count("status") &&
-                          (status.at("status") == "COMPLETE" || status.at("status") == "CONDITIONAL_GENOTYPE_EQUIVALENT");
+    // DIAGNOSTIC FALLBACK ONLY: --fallback-alleles <hap1>|<hap2> evaluates a declared diplotype -- the
+    // initial union's top candidate of a run that emitted no genotype -- instead of the run's call. The
+    // summary labels it, and it is never an official call: callers keep it out of called-only accuracy.
+    const std::string fallback = args.get("fallback-alleles", "");
+    const bool use_fallback = !fallback.empty();
+    const bool complete = use_fallback ||
+                          (status.count("status") &&
+                           (status.at("status") == "COMPLETE" || status.at("status") == "CONDITIONAL_GENOTYPE_EQUIVALENT"));
     std::vector<std::size_t> hap1;
     std::vector<std::size_t> hap2;
     std::map<std::string, std::string> genotype_support;
     const std::string phase_support = status.count("phase_support") ? status.at("phase_support") : "NA";
     // Phase-aware accuracy only where the reads chose the phase: within the candidates, or audited.
     const bool phase_claimed = phase_support == "READS_WITHIN_CANDIDATES" || phase_support == "READS_AUDITED";
-    if (complete) {
+    if (use_fallback) {
+        const std::size_t bar = fallback.find('|');
+        if (bar == std::string::npos) throw std::runtime_error("--fallback-alleles wants <hap1>|<hap2>");
+        hap1 = parse_alleles(fallback.substr(0, bar));
+        hap2 = parse_alleles(fallback.substr(bar + 1));
+        if (hap1.size() != model.blocks().size() || hap2.size() != model.blocks().size()) {
+            throw std::runtime_error("--fallback-alleles needs one allele per block on both haplotypes");
+        }
+    } else if (complete) {
         for (const auto& row : read_table(run + ".block_genotypes.tsv")) {
             genotype_support[row.at("block_id")] = row.at("genotype_support");
         }
@@ -728,6 +742,7 @@ int evaluate(const Args& args) {
 
     // The only no-call: no genotype result exists.
     summary << "run_no_call\t" << (complete ? "false" : "true") << '\n';
+    summary << "evaluated_diplotype\t" << (use_fallback ? "diagnostic_fallback_not_a_call" : "the_run_call") << '\n';
     summary << "blocks\t" << model.blocks().size() << "\nsv_blocks\t" << sv_blocks
             << "\nundefined_truth_blocks\t" << undefined_blocks
             << "\nblocks_with_both_truth_alleles_available\t" << blocks_with_both_available

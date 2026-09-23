@@ -25,6 +25,12 @@ same "mosaic jobs" "$(key "$S" jobs_mosaic)" "40"
 same "launched" "$(key "$S" launched)" "false"
 same "HG00096 LOO jobs" "$(awk -F'\t' '$2=="loo" && $3=="HG00096"' "$WORK/plan/jobs.tsv" | wc -l | tr -d ' ')" "0"
 same "coverages per subject" "$(awk -F'\t' 'NR>1{print $4}' "$WORK/plan/jobs.tsv" | sort -un | tr '\n' ' ')" "2 5 10 30 "
+# The local campaign profile carries the production profile's science, key for key; only the process
+# settings (its name, the footprint and time limits, the thread count) may differ.
+science() { grep -v '^#' "$1" | grep -v -E '^(profile|threads|footprint_limit_bytes|time_limit_seconds)'$'\t' | sort; }
+same "campaign profile science" "$(diff <(science "$REPO/profiles/genotype_c4.tsv") <(science "$REPO/profiles/genotype_c4_campaign_local.tsv") > /dev/null && echo identical || echo DIFFERS)" "identical"
+same "campaign profile footprint limit" "$(awk -F'\t' '$1=="footprint_limit_bytes"{print $2}' "$REPO/profiles/genotype_c4_campaign_local.tsv")" "3758096384"
+same "campaign profile leaves threads to the scheduler" "$(grep -c '^threads'$'\t' "$REPO/profiles/genotype_c4_campaign_local.tsv")" "0"
 bash "$REPO/tests/genotype_production_c4_campaign.sh" launch /nonexistent "$WORK/plan" > "$WORK/launch.log" 2>&1
 same "launch without approval" "$?" "2"
 same "nothing launched" "$(find "$WORK/plan" -name '*.mosaic_status.tsv' | wc -l | tr -d ' ')" "0"

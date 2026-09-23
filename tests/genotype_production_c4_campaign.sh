@@ -1,15 +1,16 @@
 #!/usr/bin/env bash
 # The final C4 production campaigns, PREPARED BUT NOT LAUNCHED: held-out LZO, held-out synthetic
 # mosaic and eligible-donor LOO, each at 2x, 5x, 10x and 30x, every call made by the one production
-# command -- `panvar genotype --profile profiles/genotype_c4.tsv` -- which is never told what kind of
+# command -- `panvar genotype --profile profiles/genotype_c4_campaign_local.tsv` (the science of
+# profiles/genotype_c4.tsv with the local 3.5 GiB process limit) -- which is never told what kind of
 # sample it is given. The campaign kind decides only the MODEL graph the call receives and the truth
 # the evaluation compares against afterwards.
 #
 #   tests/genotype_production_c4_campaign.sh plan <out dir>
 #       Writes <out>/jobs.tsv, <out>/settings.tsv and <out>/estimate.tsv, and checks every source input
 #       it will need exists and is bound by content. Generates no reads, calls nothing, evaluates nothing.
-#   tests/genotype_production_c4_campaign.sh launch <build dir> <out dir>
-#       Runs the planned jobs, serially (each call uses the profile's eight threads). REFUSES unless
+#   JOBS=<j> THREADS=<t> tests/genotype_production_c4_campaign.sh launch <build dir> <out dir>
+#       Runs the planned jobs through scripts/c4_production_campaign.py, JOBS at a time. REFUSES unless
 #       GENOTYPE_C4_CAMPAIGN_APPROVED names the reviewed plan's jobs.tsv sha256: a campaign that can be
 #       launched by accident is not frozen.
 #   tests/genotype_production_c4_campaign.sh summarize <out dir>
@@ -18,9 +19,13 @@
 #
 # COHORTS, all from committed manifests, none re-selected here:
 #   lzo     the 56 held-out donors of tests/genotype_development_donors.tsv, model = the full C4 graph,
-#           reads = the frozen held-out sources (tests/results/genotype_coverage_c4_held_out_abb35a0),
-#           thinned by the nested, donor-salted selector those sources were drawn with; the retained
-#           fragment count at every coverage must equal the package's recorded subsample.tsv.
+#           reads = the frozen held-out 30x sources (tests/results/genotype_coverage_c4_held_out_abb35a0).
+#           Their 2x/5x/10x subsets were never frozen as reads, and the selector that drew them at abb35a0
+#           has since been retired, so they are regenerated -- genuinely missing -- by the current nested
+#           selector UNSALTED (fnv1a64_fmix64_top53_v1), the development LOO campaign's rule for sources
+#           drawn from the shared unsalted stream, and bound by content on creation. The package's own
+#           retained counts are kept in package_kept_fragments as a record, not a gate. LZO and LOO of one
+#           donor score identical subsets.
 #   loo     the 55 eligible held-out donors of tests/genotype_loo_heldout_eligibility.tsv (HG00096, the
 #           coordinate-reference donor, is ineligible), model = the C4 graph with the donor's two paths
 #           removed (genotype_probe loo-gfa), the same reads as lzo, truth = the full C4 graph.
@@ -38,7 +43,8 @@ set -uo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 MODE="${1:?usage: genotype_production_c4_campaign.sh plan <out> | launch <build> <out> | summarize <out>}"
 shift
-PROFILE="$REPO/profiles/genotype_c4.tsv"
+PROFILE="$REPO/profiles/genotype_c4_campaign_local.tsv"
+SCIENCE_PROFILE="$REPO/profiles/genotype_c4.tsv"
 GRAPH_GZ="$REPO/tests/real_data/c4.gfa.gz"
 GRAPH_GZ_SHA=bf67be79db3ca05c2544162be0e18e4f0e3325872dd0d872407b577275870aa0
 GRAPH_SHA=b13af390c28dd8b43a913c43f123bb1fcf639e0569f99783fa12a778820c8733
@@ -58,7 +64,7 @@ plan() {
   mkdir -p "$out"
   [ "$(sha "$GRAPH_GZ")" = "$GRAPH_GZ_SHA" ] || { echo "REFUSED: $GRAPH_GZ moved" >&2; exit 1; }
   local jobs="$out/jobs.tsv"
-  printf "job\tcampaign\tsubject\tcoverage\tscheme\tdonor_label\tmodel_gfa\treads1\treads2\tlibrary\tcuration\ttruth_gfa\tsource_reads1\tsource_reads2\tsource_library\texpected_kept_fragments\tsubsample_salt\tout_prefix\n" > "$jobs"
+  printf "job\tcampaign\tsubject\tcoverage\tscheme\tdonor_label\tmodel_gfa\treads1\treads2\tlibrary\tcuration\ttruth_gfa\tsource_reads1\tsource_reads2\tsource_library\tpackage_kept_fragments\tsubsample_salt\tout_prefix\n" > "$jobs"
   local n=0
   # ---- lzo and loo: held-out donors, the frozen held-out read sources
   local donor cov src kept
@@ -82,7 +88,7 @@ plan() {
           "$campaign.$donor.$cov" "$campaign" "$donor" "$cov" "$campaign" "$donor" "$model" \
           "$out/reads/$donor/cov$cov/reads_1.fq" "$out/reads/$donor/cov$cov/reads_2.fq" \
           "$out/reads/$donor/cov$cov/library.txt" "none" "$out/graphs/c4.gfa" "$src/reads_1.fq.gz" \
-          "$src/reads_2.fq.gz" "$src/library.txt" "${kept:-all}" "$donor" "$base/call.$cov" >> "$jobs"
+          "$src/reads_2.fq.gz" "$src/library.txt" "${kept:-all}" "none" "$base/call.$cov" >> "$jobs"
       done
     done
   done < <(awk -F'\t' '!/^#/ && $2=="held_out"{print $1}' "$DONORS")
@@ -106,7 +112,8 @@ plan() {
     printf "campaign\tc4-production-final\nlaunched\tfalse\n"
     printf "git_commit\t%s\ngit_tree_dirty\t%s\n" "$(git -C "$REPO" rev-parse HEAD)" \
       "$([ -z "$(git -C "$REPO" status --porcelain -- src include profiles tests/genotype_production_c4_campaign.sh)" ] && echo false || echo true)"
-    printf "profile\t%s\nprofile_sha256\t%s\n" "profiles/genotype_c4.tsv" "$(sha "$PROFILE")"
+    printf "profile\t%s\nprofile_sha256\t%s\n" "profiles/genotype_c4_campaign_local.tsv" "$(sha "$PROFILE")"
+    printf "science_profile\t%s\nscience_profile_sha256\t%s\n" "profiles/genotype_c4.tsv" "$(sha "$SCIENCE_PROFILE")"
     printf "graph\ttests/real_data/c4.gfa.gz\ngraph_gz_sha256\t%s\ngraph_sha256\t%s\n" "$GRAPH_GZ_SHA" "$GRAPH_SHA"
     printf "donor_manifest_sha256\t%s\neligibility_sha256\t%s\nmosaic_manifest_sha256\t%s\n" \
       "$(sha "$DONORS")" "$(sha "$ELIGIBILITY")" "$(sha "$MOSAIC_MANIFEST")"
@@ -142,56 +149,15 @@ launch() {
   local jobs="$out/jobs.tsv"
   [ -f "$jobs" ] || { echo "no plan at $out; run plan first" >&2; exit 1; }
   if [ "${GENOTYPE_C4_CAMPAIGN_APPROVED:-}" != "$(sha "$jobs")" ]; then
-    echo "REFUSED: the campaign is prepared, not launched. Launching requires review of $jobs and" >&2
-    echo "GENOTYPE_C4_CAMPAIGN_APPROVED=<its sha256>." >&2
+    echo "REFUSED: launching requires review of $jobs and GENOTYPE_C4_CAMPAIGN_APPROVED=<its sha256>." >&2
     exit 2
   fi
-  local panvar="$build/panvar" probe="$build/genotype_probe"
-  [ -x "$panvar" ] && [ -x "$probe" ] || { echo "panvar and genotype_probe must be built in $build" >&2; exit 1; }
-  mkdir -p "$out/graphs"
-  [ -f "$out/graphs/c4.gfa" ] || gzip -dc "$GRAPH_GZ" > "$out/graphs/c4.gfa"
-  [ "$(sha "$out/graphs/c4.gfa")" = "$GRAPH_SHA" ] || { echo "REFUSED: the staged graph moved" >&2; exit 1; }
-  if awk -F'\t' '$2=="mosaic"' "$jobs" | grep -q . && [ ! -f "$out/mosaic_inputs/mosaic_exclude.tsv" ]; then
-    STAGES="manifest stage verify reads nested" BUILD="$build" bash "$REPO/tests/genotype_c4_heldout_mosaic.sh" \
-      "$out/mosaic_inputs" || { echo "mosaic input preparation failed" >&2; exit 1; }
-  fi
-  if [ "$(uname)" = "Darwin" ]; then local time=(/usr/bin/time -l); else local time=(/usr/bin/time -v); fi
-  tail -n +2 "$jobs" | while IFS=$'\t' read -r job campaign subject cov scheme label model r1 r2 lib cur truth \
-                                          s1 s2 slib kept salt prefix; do
-    [ -f "$prefix.mosaic_status.tsv" ] && [ "$(key "$prefix.mosaic_status.tsv" status)" != RUNNING ] && continue
-    mkdir -p "$(dirname "$prefix")"
-    # ---- inputs: the model graph and the nested reads, gated against the recorded draw
-    if [ "$campaign" = loo ] && [ ! -f "$model" ]; then
-      "$probe" loo-gfa --gfa "$out/graphs/c4.gfa" --donor "$subject" --out "$model" > "$model.log" 2>&1 ||
-        { echo "$job: loo-gfa failed" >&2; continue; }
-    fi
-    if [ "$campaign" != mosaic ] && [ ! -f "$r1" ]; then
-      local d; d="$(dirname "$r1")"; mkdir -p "$d" "$out/reads/$subject/source"
-      [ -f "$out/reads/$subject/source/reads_1.fq" ] || gzip -dc "$s1" > "$out/reads/$subject/source/reads_1.fq"
-      [ -f "$out/reads/$subject/source/reads_2.fq" ] || gzip -dc "$s2" > "$out/reads/$subject/source/reads_2.fq"
-      "$probe" subsample --reads1 "$out/reads/$subject/source/reads_1.fq" --reads2 "$out/reads/$subject/source/reads_2.fq" \
-        --library "$slib" --source-coverage "$SOURCE_COVERAGE" --coverage "$cov" --name-salt "$salt" --out "$d" \
-        > "$d/subsample.log" 2>&1 || { echo "$job: subsample failed" >&2; continue; }
-      if [ "$kept" != all ] && [ "$(key "$d/subsample.tsv" kept_fragments)" != "$kept" ]; then
-        echo "$job: REFUSED, kept $(key "$d/subsample.tsv" kept_fragments) fragments, the package recorded $kept" >&2
-        continue
-      fi
-    fi
-    local cmd=("$panvar" genotype --profile "$PROFILE" --gfa "$model" --reference-path "$REF" --reads1 "$r1"
-               --reads2 "$r2" --library "$lib" --out-prefix "$prefix" --quiet)
-    [ "$cur" != none ] && cmd+=(--panel-curation "$cur")
-    if [ "$campaign" = loo ]; then
-      case " ${cmd[*]} " in *" $truth "*) echo "$job: REFUSED, truth on the call's command line" >&2; continue ;; esac
-    fi
-    printf '%q ' "${cmd[@]}" > "$prefix.command.txt"
-    "${time[@]}" "${cmd[@]}" > "$prefix.log" 2> "$prefix.time"
-    # ---- evaluation: truth enters here, after the call
-    local ev=("$probe" evaluate --scheme "$scheme" --donor "$label" --reference "$REF" --run-prefix "$prefix"
-              --model-gfa "$model" --truth-gfa "$truth" --out "$prefix.eval")
-    [ "$cur" != none ] && ev+=(--panel-curation "$cur")
-    "${ev[@]}" >> "$prefix.log" 2>&1 || echo "$job: evaluation failed" >&2
-    echo "$job $(key "$prefix.mosaic_status.tsv" status)"
-  done
+  : "${JOBS:?JOBS (concurrent calls) must be set by the scheduler calibration}"
+  : "${THREADS:?THREADS (per call) must be set by the scheduler calibration}"
+  # The resumable runner: classification, retries of external failures only, completeness after every job,
+  # then evaluation, consolidation and the figure (scripts/c4_production_campaign.py).
+  exec python3 "$REPO/scripts/c4_production_campaign.py" launch --build "$build" --out "$out" \
+    --jobs "$JOBS" --threads "$THREADS"
 }
 
 summarize() {
