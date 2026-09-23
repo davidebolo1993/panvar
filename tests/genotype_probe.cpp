@@ -3566,6 +3566,10 @@ int repair_search(const Args& args) {
         // non-zero figure here means only the promoted incumbent, once per round.
         std::uint64_t full_bytes = 0, window_bytes = 0, key_bytes = 0;
         double seconds_origins = 0.0, seconds_merge = 0.0, seconds_hashing = 0.0;
+        // Lookup time, separate from origin construction: the two answer different questions --
+        // whether consulting the cache is cheap, and whether what it saves was worth consulting.
+        double seconds_lookup = 0.0;
+        std::uint64_t entry_metadata_bytes = 0, content_arena_bytes = 0;
     };
     std::vector<Round> rounds;
     std::unique_ptr<panvar::PreparedScoringContext> context;
@@ -3611,6 +3615,7 @@ int repair_search(const Args& args) {
             have_inc_slots = true;
         }
         if (use_delta) rec.transient_before = context->transient_payload_bytes();
+        const double lookup_before = panvar::emission_cache_lookup_seconds();
 
         // ---- neighbourhood construction. NO TRUTH IN SCOPE.
         std::vector<panvar::MosaicPath> paths;
@@ -3818,6 +3823,12 @@ int repair_search(const Args& args) {
                 rec.seconds_origins = round_delta.seconds_placement_and_origins;
                 rec.seconds_merge = round_delta.seconds_statekey_merge;
                 rec.seconds_hashing = round_delta.seconds_hashing_and_windows;
+            }
+            rec.seconds_lookup = panvar::emission_cache_lookup_seconds() - lookup_before;
+            {
+                const panvar::EmissionCacheCounters live = panvar::read_emission_cache_counters();
+                rec.entry_metadata_bytes = live.entry_metadata_bytes;
+                rec.content_arena_bytes = live.content_arena_bytes;
             }
             rec.placement_seconds =
                 use_delta ? round_delta.seconds
@@ -4065,7 +4076,7 @@ int repair_search(const Args& args) {
                  "placement_seconds\tcombination_seconds\torigins_reused\torigins_recomputed\t"
                  "window_bases\ttransient_before\ttransient_after\tfull_haplotype_bytes\t"
                  "window_bytes\tsequence_key_bytes\tseconds_origins\tseconds_merge\t"
-                 "seconds_hashing\n";
+                 "seconds_hashing\tseconds_lookup\tentry_metadata_bytes\tcontent_arena_bytes\n";
         for (const Round& r : rounds) {
             table << r.index << '\t' << r.start_total << '\t' << (r.moved ? "true" : "false") << '\t'
                   << (r.moved ? model.blocks()[r.block].block_id : std::string("NA")) << '\t'
@@ -4089,7 +4100,8 @@ int repair_search(const Args& args) {
                   << r.origins_recomputed << '\t' << r.window_bases << '\t' << r.transient_before
                   << '\t' << r.transient_after << '\t' << r.full_bytes << '\t' << r.window_bytes
                   << '\t' << r.key_bytes << '\t' << r.seconds_origins << '\t' << r.seconds_merge
-                  << '\t' << r.seconds_hashing << '\n';
+                  << '\t' << r.seconds_hashing << '\t' << r.seconds_lookup << '\t'
+                  << r.entry_metadata_bytes << '\t' << r.content_arena_bytes << '\n';
         }
     }
     if (truth_gfa.empty()) {

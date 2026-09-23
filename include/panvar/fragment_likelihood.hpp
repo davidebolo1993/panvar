@@ -163,10 +163,74 @@ struct GappedComponent {
     std::size_t edits = 0;
 };
 
+// The components of one fit, held INLINE.
+//
+// A fit has at most 2*max_gap_bp+1 terminal spans -- seven at the production gap width -- so eight
+// slots cover the declared model outright, and anything wider spills to the heap so correctness never
+// depends on that bound. The reason it is not simply a std::vector: a cache hit copies components
+// into a freshly constructed fit, and with a vector that was one heap allocation per hit, measured at
+// 64 allocations over 64 hits and 640 over 640. The arena removed the key allocation; this removes
+// the last one on the hit path.
+class ComponentList {
+public:
+    using value_type = GappedComponent;
+    static constexpr std::size_t kInline = 8;
+
+    std::size_t size() const noexcept { return size_; }
+    bool empty() const noexcept { return size_ == 0; }
+    void clear() noexcept {
+        size_ = 0;
+        heap_.clear();
+    }
+
+    GappedComponent* begin() noexcept { return data(); }
+    GappedComponent* end() noexcept { return data() + size_; }
+    const GappedComponent* begin() const noexcept { return data(); }
+    const GappedComponent* end() const noexcept { return data() + size_; }
+    GappedComponent& operator[](std::size_t at) noexcept { return data()[at]; }
+    const GappedComponent& operator[](std::size_t at) const noexcept { return data()[at]; }
+    GappedComponent& back() noexcept { return data()[size_ - 1]; }
+    const GappedComponent& back() const noexcept { return data()[size_ - 1]; }
+
+    void push_back(const GappedComponent& value) {
+        if (heap_.empty() && size_ < kInline) {
+            inline_[size_++] = value;
+            return;
+        }
+        if (heap_.empty()) heap_.assign(inline_, inline_ + size_);
+        heap_.push_back(value);
+        size_ = heap_.size();
+    }
+
+    template <typename Iterator>
+    void assign(Iterator first, Iterator last) {
+        clear();
+        for (; first != last; ++first) push_back(*first);
+    }
+
+    void resize(std::size_t count) {
+        while (size_ > count) {
+            if (!heap_.empty()) heap_.pop_back();
+            --size_;
+        }
+        while (size_ < count) push_back(GappedComponent{});
+    }
+
+    void reserve(std::size_t) noexcept {}   // inline storage needs none; the spill handles the rest
+
+private:
+    GappedComponent* data() noexcept { return heap_.empty() ? inline_ : heap_.data(); }
+    const GappedComponent* data() const noexcept { return heap_.empty() ? inline_ : heap_.data(); }
+
+    GappedComponent inline_[kInline]{};
+    std::vector<GappedComponent> heap_;
+    std::size_t size_ = 0;
+};
+
 // Every admissible alignment of one read at one start, grouped by what it consumes.
 struct GappedFit {
     // One entry per terminal consumed span carrying mass, ascending. At most 2*max_gap_bp+1 of them.
-    std::vector<GappedComponent> components;
+    ComponentList components;
     // log sum of the components: the whole read's normalised emission at this start, which is what
     // must sum to one over every read of this length. The components share ONE normaliser -- the
     // shape mass of the read length -- so summing them reproduces this exactly. Normalising each
@@ -312,6 +376,11 @@ struct EmissionCacheCounters {
     // are retained regardless. payload_bytes mixes the two, so it cannot be held to the budget; this
     // can, and is what an exact budget boundary has to be measured against.
     std::uint64_t budgeted_bytes_used = 0;
+    // Where the retained bytes actually are. The table holds fixed-size entries carrying arena
+    // offsets, and the content arena holds the read and window bytes each entry compares against, so
+    // these two are the whole of what a retained entry costs besides its components.
+    std::uint64_t entry_metadata_bytes = 0;
+    std::uint64_t content_arena_bytes = 0;
 };
 
 // Explicitly owned scorer memory, counted rather than inferred. RSS is not evidence about which
@@ -356,6 +425,12 @@ EmissionCacheCounters end_emission_cache();
 // down before any status writer runs, so the figures are retained here rather than recovered by
 // threading the scoring result through every caller that wants to report them.
 EmissionCacheCounters last_emission_cache_counters();
+
+// Seconds spent inside cache lookups, accumulated per thread and folded in as placement drains its
+// counters. Reported separately from origin construction because the two answer different questions:
+// whether the cache is cheap to consult, and whether the work it saves was worth consulting it for.
+double emission_cache_lookup_seconds();
+void reset_emission_cache_lookup_seconds();
 
 // The memory accounts of the most recently completed scoring pass, retained for the same reason the
 // cache counters are: write_status is reached from eleven call sites and carries no scoring result,

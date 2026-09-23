@@ -191,7 +191,7 @@ double gap_recursion_logspace(
     std::size_t band,
     const LibraryModel& library,
     bool emitting,
-    std::vector<GappedComponent>* components) {
+    ComponentList* components) {
     const std::size_t delta = library.max_gap_bp;
     const std::size_t width = 2 * delta + 1;
     const std::size_t budget = band + 1;                 // edits 0..band
@@ -384,6 +384,7 @@ struct EmissionWork {
     std::uint64_t dp_cache_hits = 0;
     std::uint64_t dp_cache_misses = 0;
     std::uint64_t executed_dps = 0;
+    std::uint64_t cache_lookup_nanos = 0;
 };
 
 EmissionWork& emission_work() {
@@ -449,34 +450,22 @@ CensusKey census_key_of(const std::string& read, const char* window, std::size_t
 // costs a comparison and never a wrong answer. Nothing here interprets a base, so the key admits
 // whatever the emission admits; today require_acgt_window refuses anything but ACGT before a key is
 // ever formed, and the key is correct either way.
-struct CacheKey {
+// A lookup's key, as a VIEW. Non-owning, stack-only, valid for exactly the duration of the lookup:
+// the pointers are the caller's read and the haplotype window it is being compared against. Nothing
+// here allocates, and nothing here is retained.
+//
+// The previous revision owned its bytes in a std::string, which fixed the dangling-pointer problem
+// and introduced a worse one: the call site copy-assigned a fresh key per request, so 8.2M lookups a
+// round became 8.2M heap allocations. Ownership belongs to the CACHE, not to the key.
+struct KeyView {
     std::uint64_t h0 = 0;
     std::uint64_t h1 = 0;
+    const char* read = nullptr;
+    const char* window = nullptr;
     std::uint32_t read_length = 0;
-    std::string content;
+    std::uint32_t window_length = 0;
+};
 
-    bool operator==(const CacheKey& other) const noexcept {
-        return h0 == other.h0 && h1 == other.h1 && read_length == other.read_length &&
-               content == other.content;
-    }
-};
-struct CacheKeyHash {
-    std::size_t operator()(const CacheKey& key) const noexcept {
-        return static_cast<std::size_t>(key.h0 ^ (key.h1 * 0x9e3779b97f4a7c15ULL));
-    }
-};
-// Components live in a per-shard arena, so an entry is a fixed 32 bytes whether it holds a refusal
-// or a seven-component fit. Entries are never removed, so arena offsets stay valid.
-// A cached answer records WHICH logical outcome the uncached run would have recorded, not merely
-// whether it accepted. Refusals arrive from two places -- the prefilter, and a recursion that ran
-// and found nothing -- and the uncached path counts those differently. Collapsing them to one
-// "refused" flag made a later cache hit count a post-recursion refusal as a prefilter rejection,
-// which moved 25 requests between two logical counters on the diagnostic fixture while every
-// placement counter stayed identical. Logical counters have to be invariant, so the distinction is
-// carried in the value.
-// Only two outcomes are cacheable, because only these two cost a recursion to obtain. Prefilter
-// refusals never reach the table, so the classification that once let a post-recursion refusal
-// replay as a prefilter rejection is now structurally impossible rather than merely corrected.
 enum class CacheOutcome : std::uint8_t { Accepted, RefusedAfterRecursion };
 
 struct CacheValue {
@@ -486,43 +475,62 @@ struct CacheValue {
     std::uint32_t component_offset = 0;
     std::uint16_t component_count = 0;
     // Both store paths set this explicitly; the default is the conservative one, since a value that
-    // somehow escaped without being set describes a recursion that ran and found nothing rather
-    // than an acceptance nobody computed.
+    // somehow escaped without being set describes a recursion that ran and found nothing rather than
+    // an acceptance nobody computed. The distinction is carried in the VALUE because the uncached
+    // path counts a prefilter rejection and a post-recursion refusal differently, and a logical
+    // counter that moved when the cache was armed would make cached and uncached runs incomparable.
     CacheOutcome outcome = CacheOutcome::RefusedAfterRecursion;
 };
 
-struct CacheShard {
-    std::mutex guard;
-    std::unordered_map<CacheKey, CacheValue, CacheKeyHash> table;
-    std::vector<GappedComponent> arena;
+// A retained entry. Fixed size, stored inline in an open-addressed table, and carrying OFFSETS into
+// the content arena rather than pointers -- so a transient haplotype may be destroyed while every
+// entry it produced keeps serving, and so arena growth cannot invalidate anything.
+//
+// `state` is an explicit occupancy flag rather than a hash sentinel, because the forced-collision
+// test drives every key to h0 == h1 == 0 and a zero hash must remain a legal key.
+struct ArenaEntry {
+    std::uint64_t h0 = 0;
+    std::uint64_t h1 = 0;
+    std::uint32_t read_length = 0;
+    std::uint32_t window_length = 0;
+    std::uint32_t slab = 0;
+    std::uint32_t offset = 0;
+    CacheValue value;
+    std::uint8_t state = 0;   // 0 empty, 1 occupied
 };
 
-// The probe a lookup is built into. Reused per thread, so assigning into it keeps its capacity and a
-// lookup allocates nothing after warm-up -- which is what stops owned keys from turning round one's
-// 62 million probes into 62 million small allocations.
-CacheKey& probe_key() {
-    static thread_local CacheKey key;
-    return key;
-}
+// Slabs are append-only and never reallocated, which is what makes an offset permanent. A request
+// larger than a slab gets one of its own rather than being split.
+constexpr std::size_t kSlabBytes = 1u << 20;
+constexpr std::size_t kNoSlot = static_cast<std::size_t>(-1);
+
+struct CacheShard {
+    std::mutex guard;
+    std::vector<ArenaEntry> table;                 // power-of-two capacity, linear probing
+    std::size_t occupied = 0;
+    std::vector<std::unique_ptr<char[]>> slabs;    // stable: never moved, never resized
+    std::size_t slab_used = 0;
+    std::vector<GappedComponent> arena;            // components, addressed by index
+};
 
 // Measured, not assumed: raising this to 1024 moved a repair round from 82.20 s to 82.73 s, so the
-// 8.2M lookups a round now performs are NOT queueing behind these mutexes and finer sharding buys
+// 8.2M lookups a round performs are NOT queueing behind these mutexes and finer sharding buys
 // nothing. Left at the value the 560M-lookup one-shot pass was sized for.
 constexpr std::size_t kCacheShards = 64;
 
 struct EmissionCache {
     std::array<CacheShard, kCacheShards> shards;
     std::atomic<bool> active{false};
-    // Governs EVERY retained entry, keys included. Declining one costs a recomputation, never a
-    // wrong answer.
+    // Governs EVERY retained entry: its table slots, its arena bytes and its components. Declining
+    // one costs a recomputation, never a wrong answer.
     std::atomic<std::size_t> budget_bytes{0};
     std::atomic<std::size_t> budgeted_bytes_used{0};
-    // Only the INSERTION-path totals stay atomic. They are touched once per retained entry (967,004
-    // times on the frozen 30x run) rather than once per request (1.19 billion), so the contention
-    // that mattered is gone and the budget still needs an exact shared count.
     std::atomic<std::uint64_t> entries{0};
     std::atomic<std::uint64_t> payload_bytes{0};
     std::atomic<std::uint64_t> entries_not_retained{0};
+    // Nanoseconds inside lookups, folded in per haplotype rather than per lookup: at 8.2M lookups a
+    // round a shared counter touched per request would be contention with no decision attached.
+    std::atomic<std::uint64_t> lookup_nanos{0};
 };
 
 EmissionCache& emission_cache() {
@@ -535,8 +543,8 @@ std::atomic<bool>& cache_hash_collapse() {
     return collapse;
 }
 
-// Fills the per-thread probe in place and returns it. Never allocates once the buffer has grown.
-CacheKey& cache_key_of(const std::string& read, const char* window, std::size_t window_length) {
+// Builds the view on the stack. No allocation, no copy, nothing retained.
+KeyView key_view_of(const std::string& read, const char* window, std::size_t window_length) {
     std::uint64_t a = 1469598103934665603ULL;
     std::uint64_t b = 0x2545f4914f6cdd1dULL;
     const auto mix = [&](unsigned char value) {
@@ -547,92 +555,180 @@ CacheKey& cache_key_of(const std::string& read, const char* window, std::size_t 
     for (const char c : read) mix(static_cast<unsigned char>(c));
     mix(0xff);
     for (std::size_t i = 0; i < window_length; ++i) mix(static_cast<unsigned char>(window[i]));
-    CacheKey& key = probe_key();
-    // Under the test collapse every key hashes alike, so the table degenerates to one bucket in one
-    // shard and every lookup must be decided by byte comparison. The answers may not change.
+    KeyView key;
+    // Under the test collapse every key hashes alike, so the table degenerates to one probe chain
+    // and byte comparison alone separates them. The answers may not change.
     const bool collapse = cache_hash_collapse().load(std::memory_order_relaxed);
     key.h0 = collapse ? 0 : a;
     key.h1 = collapse ? 0 : b;
+    key.read = read.data();
     key.read_length = static_cast<std::uint32_t>(read.size());
-    key.content.assign(read.data(), read.size());
-    key.content.append(window, window_length);
+    key.window = window;
+    key.window_length = static_cast<std::uint32_t>(window_length);
     return key;
 }
 
-// Declared per-entry cost: the key, the value, and a conservative allowance for the hash table's
-// own node and bucket overhead. Used to hold the refusal budget to a byte figure a caller declared,
-// not to a guess about container internals.
-// A retained entry's declared cost now includes the bytes the key OWNS, because that is what the
-// table actually holds. Measured from content.size() rather than capacity so the figure a budget is
-// held to does not depend on how a string chose to grow.
-std::size_t cache_entry_bytes(const CacheKey& key) {
-    return sizeof(CacheKey) + key.content.size() + sizeof(CacheValue) + 48;
+std::size_t slot_hash(std::uint64_t h0, std::uint64_t h1) {
+    return static_cast<std::size_t>(h0 ^ (h1 * 0x9e3779b97f4a7c15ULL));
+}
+
+// Content bytes are 8-aligned inside a slab, so the padding a retained entry occupies is charged
+// rather than ignored.
+std::size_t aligned_content_bytes(std::size_t read_length, std::size_t window_length) {
+    const std::size_t raw = read_length + window_length;
+    return (raw + 7u) & ~static_cast<std::size_t>(7u);
+}
+
+// What a retained entry declares against the budget: two table slots, because the table is held at
+// or below half load so every entry reserves the slack that keeps probing short; its aligned content
+// bytes; and the slab pointer's own share. Components are added by the fit path.
+std::size_t arena_entry_bytes(std::size_t read_length, std::size_t window_length) {
+    return 2 * sizeof(ArenaEntry) + aligned_content_bytes(read_length, window_length) +
+           sizeof(std::unique_ptr<char[]>);
+}
+
+const char* entry_bytes(const CacheShard& shard, const ArenaEntry& entry) {
+    return shard.slabs[entry.slab].get() + entry.offset;
+}
+
+// Exact identity: lengths first, then the complete retained content. The hash only chose where to
+// start probing.
+bool entry_matches(const CacheShard& shard, const ArenaEntry& entry, const KeyView& key) {
+    if (entry.h0 != key.h0 || entry.h1 != key.h1) return false;
+    if (entry.read_length != key.read_length || entry.window_length != key.window_length) return false;
+    const char* bytes = entry_bytes(shard, entry);
+    return std::memcmp(bytes, key.read, key.read_length) == 0 &&
+           std::memcmp(bytes + key.read_length, key.window, key.window_length) == 0;
+}
+
+std::size_t find_occupied_slot(const CacheShard& shard, const KeyView& key) {
+    if (shard.table.empty()) return kNoSlot;
+    const std::size_t mask = shard.table.size() - 1;
+    std::size_t at = slot_hash(key.h0, key.h1) & mask;
+    for (std::size_t probes = 0; probes <= mask; ++probes) {
+        const ArenaEntry& entry = shard.table[at];
+        if (entry.state == 0) return kNoSlot;
+        if (entry_matches(shard, entry, key)) return at;
+        at = (at + 1) & mask;
+    }
+    return kNoSlot;
+}
+
+void grow_table(CacheShard& shard) {
+    const std::size_t wanted = shard.table.empty() ? 1024 : shard.table.size() * 2;
+    std::vector<ArenaEntry> next(wanted);
+    const std::size_t mask = wanted - 1;
+    for (const ArenaEntry& entry : shard.table) {
+        if (entry.state == 0) continue;
+        std::size_t at = slot_hash(entry.h0, entry.h1) & mask;
+        while (next[at].state != 0) at = (at + 1) & mask;
+        next[at] = entry;
+    }
+    shard.table.swap(next);
+}
+
+// Copies the key's bytes into append-only slab storage exactly once, on the insertion path only.
+void store_content(CacheShard& shard, const KeyView& key, ArenaEntry& entry) {
+    const std::size_t need = aligned_content_bytes(key.read_length, key.window_length);
+    if (shard.slabs.empty() || shard.slab_used + need > kSlabBytes) {
+        shard.slabs.push_back(std::make_unique<char[]>(std::max(kSlabBytes, need)));
+        shard.slab_used = 0;
+    }
+    char* at = shard.slabs.back().get() + shard.slab_used;
+    std::memcpy(at, key.read, key.read_length);
+    std::memcpy(at + key.read_length, key.window, key.window_length);
+    entry.slab = static_cast<std::uint32_t>(shard.slabs.size() - 1);
+    entry.offset = static_cast<std::uint32_t>(shard.slab_used);
+    shard.slab_used += need;
 }
 
 enum class CacheProbe { Disabled, Miss, HitAccepted, HitRefusedAfterRecursion };
 
-CacheProbe cache_lookup(const CacheKey& key, GappedFit* out, EmissionWork& work) {
+// The hit path: one mutex, one probe chain, one memcmp pair, and a component copy into a buffer the
+// caller already owns. No allocation.
+CacheProbe cache_lookup(const KeyView& key, GappedFit* out, EmissionWork& work) {
     EmissionCache& cache = emission_cache();
     if (!cache.active.load(std::memory_order_relaxed)) return CacheProbe::Disabled;
+    const auto mark = std::chrono::steady_clock::now();
     CacheShard& shard = cache.shards[key.h0 % kCacheShards];
-    const std::lock_guard<std::mutex> guard(shard.guard);
-    const auto found = shard.table.find(key);
-    if (found == shard.table.end()) {
-        ++work.dp_cache_misses;
-        return CacheProbe::Miss;
+    CacheProbe answer = CacheProbe::Miss;
+    {
+        const std::lock_guard<std::mutex> guard(shard.guard);
+        const std::size_t at = find_occupied_slot(shard, key);
+        if (at == kNoSlot) {
+            ++work.dp_cache_misses;
+        } else {
+            ++work.dp_cache_hits;
+            const CacheValue& value = shard.table[at].value;
+            if (value.outcome == CacheOutcome::RefusedAfterRecursion) {
+                answer = CacheProbe::HitRefusedAfterRecursion;
+            } else {
+                out->log_emission = value.log_emission;
+                out->consumed_bp = value.consumed_bp;
+                out->edits = value.edits;
+                // assign into the caller's existing capacity; the arena may be appended to by a
+                // concurrent insert, so it is read under the lock.
+                out->components.assign(shard.arena.begin() + value.component_offset,
+                                       shard.arena.begin() + value.component_offset +
+                                           value.component_count);
+                answer = CacheProbe::HitAccepted;
+            }
+        }
     }
-    ++work.dp_cache_hits;
-    const CacheValue& value = found->second;
-    if (value.outcome == CacheOutcome::RefusedAfterRecursion) {
-        return CacheProbe::HitRefusedAfterRecursion;
-    }
-    // Copied out under the shard lock: a concurrent insert into this shard may reallocate the arena.
-    out->log_emission = value.log_emission;
-    out->consumed_bp = value.consumed_bp;
-    out->edits = value.edits;
-    out->components.assign(shard.arena.begin() + value.component_offset,
-                           shard.arena.begin() + value.component_offset + value.component_count);
-    return CacheProbe::HitAccepted;
+    work.cache_lookup_nanos += static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - mark)
+            .count());
+    return answer;
 }
 
-void cache_store_refusal(const CacheKey& key, CacheOutcome outcome) {
+// Shared by both store paths: charge the budget, take the slot, copy the bytes once.
+bool insert_entry(const KeyView& key, const CacheValue& value, std::size_t extra_bytes) {
     EmissionCache& cache = emission_cache();
-    if (!cache.active.load(std::memory_order_relaxed)) return;
-    const std::size_t kCacheEntryBytes = cache_entry_bytes(key);
-    // The declared bound now governs the whole table, which holds only recursion results. Crossing
-    // it stops RETENTION, never correctness: the next request for this key recomputes it exactly,
-    // which is the same answer more slowly.
-    const std::size_t used =
-        cache.budgeted_bytes_used.fetch_add(kCacheEntryBytes, std::memory_order_relaxed) +
-        kCacheEntryBytes;
+    const std::size_t bytes = arena_entry_bytes(key.read_length, key.window_length) + extra_bytes;
+    const std::size_t used = cache.budgeted_bytes_used.fetch_add(bytes, std::memory_order_relaxed) + bytes;
     if (used > cache.budget_bytes.load(std::memory_order_relaxed)) {
-        cache.budgeted_bytes_used.fetch_sub(kCacheEntryBytes, std::memory_order_relaxed);
+        cache.budgeted_bytes_used.fetch_sub(bytes, std::memory_order_relaxed);
         cache.entries_not_retained.fetch_add(1, std::memory_order_relaxed);
-        return;
+        return false;
     }
     CacheShard& shard = cache.shards[key.h0 % kCacheShards];
     const std::lock_guard<std::mutex> guard(shard.guard);
+    if (find_occupied_slot(shard, key) != kNoSlot) {
+        cache.budgeted_bytes_used.fetch_sub(bytes, std::memory_order_relaxed);
+        return false;   // another worker got there first; the budget is not spent twice
+    }
+    if (shard.table.empty() || (shard.occupied + 1) * 2 > shard.table.size()) grow_table(shard);
+    const std::size_t mask = shard.table.size() - 1;
+    std::size_t at = slot_hash(key.h0, key.h1) & mask;
+    while (shard.table[at].state != 0) at = (at + 1) & mask;
+    ArenaEntry& entry = shard.table[at];
+    entry.h0 = key.h0;
+    entry.h1 = key.h1;
+    entry.read_length = key.read_length;
+    entry.window_length = key.window_length;
+    entry.value = value;
+    store_content(shard, key, entry);
+    entry.state = 1;
+    ++shard.occupied;
+    cache.entries.fetch_add(1, std::memory_order_relaxed);
+    cache.payload_bytes.fetch_add(bytes, std::memory_order_relaxed);
+    return true;
+}
+
+void cache_store_refusal(const KeyView& key, CacheOutcome outcome) {
+    if (!emission_cache().active.load(std::memory_order_relaxed)) return;
     CacheValue value;
     value.outcome = outcome;
-    if (!shard.table.emplace(key, value).second) {
-        cache.budgeted_bytes_used.fetch_sub(kCacheEntryBytes, std::memory_order_relaxed);
-        return;   // another worker got there first; the budget is not spent twice
-    }
-    cache.entries.fetch_add(1, std::memory_order_relaxed);
-    cache.payload_bytes.fetch_add(kCacheEntryBytes, std::memory_order_relaxed);
+    (void)insert_entry(key, value, 0);
 }
 
-void cache_store_fit(const CacheKey& key, const GappedFit& fit) {
+void cache_store_fit(const KeyView& key, const GappedFit& fit) {
     EmissionCache& cache = emission_cache();
     if (!cache.active.load(std::memory_order_relaxed)) return;
-    // Fits are budgeted now, where they used to be retained unconditionally. Once the key OWNS its
-    // bytes an accepted fit is the DEARER entry, not the cheaper one -- roughly 300 bytes against a
-    // pointer key's ~112 -- and a budget that governed only the refusal stream governed almost
-    // nothing, because the prefilter is exact and post-recursion refusals are vanishingly rare.
-    // Exhaustion stops RETENTION, never correctness: the next request for this key recomputes it
-    // exactly, which is the same answer more slowly.
-    const std::size_t bytes =
-        cache_entry_bytes(key) + fit.components.size() * sizeof(GappedComponent);
+    const std::size_t extra = fit.components.size() * sizeof(GappedComponent);
+    // The components must land in the arena under the same lock that takes the slot, so the offset an
+    // entry records is the offset its components actually occupy.
+    const std::size_t bytes = arena_entry_bytes(key.read_length, key.window_length) + extra;
     const std::size_t used = cache.budgeted_bytes_used.fetch_add(bytes, std::memory_order_relaxed) + bytes;
     if (used > cache.budget_bytes.load(std::memory_order_relaxed)) {
         cache.budgeted_bytes_used.fetch_sub(bytes, std::memory_order_relaxed);
@@ -641,19 +737,29 @@ void cache_store_fit(const CacheKey& key, const GappedFit& fit) {
     }
     CacheShard& shard = cache.shards[key.h0 % kCacheShards];
     const std::lock_guard<std::mutex> guard(shard.guard);
-    if (shard.table.find(key) != shard.table.end()) {
+    if (find_occupied_slot(shard, key) != kNoSlot) {
         cache.budgeted_bytes_used.fetch_sub(bytes, std::memory_order_relaxed);
-        return;   // another worker got there first; the budget is not spent twice
+        return;
     }
-    CacheValue value;
-    value.outcome = CacheOutcome::Accepted;
-    value.log_emission = fit.log_emission;
-    value.consumed_bp = static_cast<std::uint32_t>(fit.consumed_bp);
-    value.edits = static_cast<std::uint32_t>(fit.edits);
-    value.component_offset = static_cast<std::uint32_t>(shard.arena.size());
-    value.component_count = static_cast<std::uint16_t>(fit.components.size());
+    if (shard.table.empty() || (shard.occupied + 1) * 2 > shard.table.size()) grow_table(shard);
+    const std::size_t mask = shard.table.size() - 1;
+    std::size_t at = slot_hash(key.h0, key.h1) & mask;
+    while (shard.table[at].state != 0) at = (at + 1) & mask;
+    ArenaEntry& entry = shard.table[at];
+    entry.h0 = key.h0;
+    entry.h1 = key.h1;
+    entry.read_length = key.read_length;
+    entry.window_length = key.window_length;
+    entry.value.outcome = CacheOutcome::Accepted;
+    entry.value.log_emission = fit.log_emission;
+    entry.value.consumed_bp = static_cast<std::uint32_t>(fit.consumed_bp);
+    entry.value.edits = static_cast<std::uint32_t>(fit.edits);
+    entry.value.component_offset = static_cast<std::uint32_t>(shard.arena.size());
+    entry.value.component_count = static_cast<std::uint16_t>(fit.components.size());
     shard.arena.insert(shard.arena.end(), fit.components.begin(), fit.components.end());
-    shard.table.emplace(key, value);
+    store_content(shard, key, entry);
+    entry.state = 1;
+    ++shard.occupied;
     cache.entries.fetch_add(1, std::memory_order_relaxed);
     cache.payload_bytes.fetch_add(bytes, std::memory_order_relaxed);
 }
@@ -804,7 +910,7 @@ double gap_recursion_scaled(
     std::size_t band,
     const LibraryModel& library,
     bool emitting,
-    std::vector<GappedComponent>* components) {
+    ComponentList* components) {
     const std::size_t delta = library.max_gap_bp;
     const std::size_t width = 2 * delta + 1;
     const std::size_t budget = band + 1;
@@ -997,8 +1103,12 @@ void begin_emission_cache(std::size_t budget_bytes) {
     for (CacheShard& shard : cache.shards) {
         const std::lock_guard<std::mutex> guard(shard.guard);
         shard.table.clear();
+        shard.occupied = 0;
+        shard.slabs.clear();
+        shard.slab_used = 0;
         shard.arena.clear();
     }
+    cache.lookup_nanos.store(0, std::memory_order_relaxed);
     cache.budget_bytes.store(budget_bytes, std::memory_order_relaxed);
     cache.budgeted_bytes_used.store(0, std::memory_order_relaxed);
     cache.entries.store(0, std::memory_order_relaxed);
@@ -1018,6 +1128,13 @@ EmissionCacheCounters read_emission_cache_counters() {
     out.entries_not_retained = cache.entries_not_retained.load(std::memory_order_relaxed);
     // What the declared budget is actually holding, separate from the fits it does not govern.
     out.budgeted_bytes_used = cache.budgeted_bytes_used.load(std::memory_order_relaxed);
+    for (CacheShard& shard : cache.shards) {
+        const std::lock_guard<std::mutex> guard(shard.guard);
+        out.entry_metadata_bytes +=
+            static_cast<std::uint64_t>(shard.table.capacity()) * sizeof(ArenaEntry);
+        out.content_arena_bytes +=
+            static_cast<std::uint64_t>(shard.slabs.size()) * kSlabBytes;
+    }
     return out;
 }
 
@@ -1032,8 +1149,9 @@ void emission_cache_storage_bytes(std::uint64_t* table_bytes, std::uint64_t* are
         const std::lock_guard<std::mutex> guard(shard.guard);
         // Per entry now, not a count times a constant: the key owns a variable number of bytes, so
         // the only honest figure is the sum of what each one actually holds.
-        for (const auto& entry : shard.table) table += cache_entry_bytes(entry.first);
-        arena += static_cast<std::uint64_t>(shard.arena.capacity()) * sizeof(GappedComponent);
+        table += static_cast<std::uint64_t>(shard.table.capacity()) * sizeof(ArenaEntry);
+        arena += static_cast<std::uint64_t>(shard.arena.capacity()) * sizeof(GappedComponent) +
+                 static_cast<std::uint64_t>(shard.slabs.size()) * kSlabBytes;
     }
     if (table_bytes != nullptr) *table_bytes = table;
     if (arena_bytes != nullptr) *arena_bytes = arena;
@@ -1052,6 +1170,14 @@ ScorerMemoryAccounts& last_memory_slot() {
 }
 
 ScorerMemoryAccounts last_scorer_memory_accounts() { return last_memory_slot(); }
+
+double emission_cache_lookup_seconds() {
+    return static_cast<double>(emission_cache().lookup_nanos.load(std::memory_order_relaxed)) / 1e9;
+}
+
+void reset_emission_cache_lookup_seconds() {
+    emission_cache().lookup_nanos.store(0, std::memory_order_relaxed);
+}
 
 EmissionCacheCounters end_emission_cache() {
     EmissionCache& cache = emission_cache();
@@ -1080,6 +1206,9 @@ EmissionCacheCounters end_emission_cache() {
     for (CacheShard& shard : cache.shards) {
         const std::lock_guard<std::mutex> guard(shard.guard);
         shard.table.clear();
+        shard.occupied = 0;
+        shard.slabs.clear();
+        shard.slab_used = 0;
         shard.arena.clear();
     }
     return out;
@@ -1125,6 +1254,8 @@ GappedEmissionCounters take_gapped_emission_counters() {
     out.dp_cache_hits = work.dp_cache_hits;
     out.dp_cache_misses = work.dp_cache_misses;
     out.executed_dps = work.executed_dps;
+    // Folded in here rather than per lookup: once per haplotype instead of 8.2M times a round.
+    emission_cache().lookup_nanos.fetch_add(work.cache_lookup_nanos, std::memory_order_relaxed);
     work = EmissionWork{};
     return out;
 }
@@ -1249,9 +1380,9 @@ std::optional<GappedFit> gapped_emission(
 
     // Only survivors get a key, and only recursion results are ever retained.
     const bool caching = cache.active.load(std::memory_order_relaxed);
-    CacheKey key;
+    KeyView key;
     if (caching) {
-        key = cache_key_of(read, haplotype.data() + start, window);
+        key = key_view_of(read, haplotype.data() + start, window);
         ++work.dp_cache_requests;
         GappedFit cached;
         switch (cache_lookup(key, &cached, work)) {
@@ -1317,7 +1448,7 @@ std::optional<GappedFit> gapped_emission_reference(
     // No prefilter and no memoised normaliser: this path exists to be believed without depending on
     // any of the machinery it is used to check, so it recomputes the shape mass in log space too,
     // unclamped. It keeps the reference recursion's own non-ACGT refusal.
-    std::vector<GappedComponent> raw;
+    ComponentList raw;
     const double raw_total = gap_recursion_logspace(&haplotype, &read, start, read.size(), available,
                                                     mismatch_band, library, true, &raw);
     if (raw_total == kNegInf || raw.empty()) return std::nullopt;

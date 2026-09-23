@@ -24,13 +24,39 @@
 #include "panvar/genotype_model.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
+#include <cstdlib>
 #include <functional>
 #include <iostream>
+#include <new>
 #include <random>
 #include <stdexcept>
 #include <string>
 #include <vector>
+
+// Every heap allocation in this binary passes through here, so "no allocation on the hit path" is a
+// counted fact rather than a reading of the code.
+std::atomic<std::uint64_t>& allocation_count() {
+    static std::atomic<std::uint64_t> count{0};
+    return count;
+}
+void* operator new(std::size_t size) {
+    allocation_count().fetch_add(1, std::memory_order_relaxed);
+    void* memory = std::malloc(size == 0 ? 1 : size);
+    if (memory == nullptr) throw std::bad_alloc();
+    return memory;
+}
+void operator delete(void* memory) noexcept { std::free(memory); }
+void operator delete(void* memory, std::size_t) noexcept { std::free(memory); }
+void* operator new[](std::size_t size) {
+    allocation_count().fetch_add(1, std::memory_order_relaxed);
+    void* memory = std::malloc(size == 0 ? 1 : size);
+    if (memory == nullptr) throw std::bad_alloc();
+    return memory;
+}
+void operator delete[](void* memory) noexcept { std::free(memory); }
+void operator delete[](void* memory, std::size_t) noexcept { std::free(memory); }
 
 namespace {
 
@@ -689,6 +715,128 @@ void test_no_dangling_reads_after_destruction() {
     std::cout << "  ok: answers survive destruction followed by heavy heap reuse\n";
 }
 
+void test_arena_slabs_grow_and_compare_across_slabs() {
+    // Slabs are 1 MB and append-only. Forcing every key into one shard (the hash collapse sends them
+    // all to shard 0) makes a few thousand entries span several slabs, which is the only way to
+    // exercise an entry whose bytes live in a slab other than the newest one. Every key must still
+    // hit, and hit with the value it was stored with: a lookup that read from the wrong slab, or that
+    // assumed the latest slab, would surface here and essentially nowhere else.
+    // Reads are drawn FROM the haplotype at their own start, so each is an exact match that survives
+    // the prefilter and is retained. Random reads would all be rejected before a key is even formed
+    // -- prefilter refusals never reach the table -- and nothing would be stored to span a slab.
+    std::mt19937_64 rng(20260923);
+    const std::string haplotype = random_bases(rng, 20000);
+    const std::size_t count = 6000;
+    std::vector<std::size_t> starts;
+    for (std::size_t i = 0; i < count; ++i) starts.push_back(i);
+
+    panvar::set_emission_cache_hash_collapse(true);
+    panvar::begin_emission_cache(1u << 30);
+    std::vector<double> stored;
+    try {
+        for (const std::size_t start : starts) {
+            const std::string read = haplotype.substr(start, 100);
+            const auto fit = panvar::gapped_emission(haplotype, read, start, library(), 6);
+            stored.push_back(fit.has_value() ? fit->log_emission : kNegInf);
+        }
+        const std::uint64_t arena = panvar::read_emission_cache_counters().content_arena_bytes;
+        require(arena > (1u << 20),
+                "the fixture must span more than one slab, or cross-slab lookup is untested");
+        // Second pass: every one of these is a hit, and entries are spread across the slabs.
+        for (std::size_t i = 0; i < starts.size(); ++i) {
+            const std::string read = haplotype.substr(starts[i], 100);
+            const auto fit = panvar::gapped_emission(haplotype, read, starts[i], library(), 6);
+            const double again = fit.has_value() ? fit->log_emission : kNegInf;
+            require_identical(again, stored[i],
+                              "cross-slab hit " + std::to_string(i) + " returned a different value");
+        }
+        std::cout << "  ok: " << starts.size() << " entries across " << (arena >> 20)
+                  << " slabs, every cross-slab lookup identical\n";
+    } catch (...) {
+        panvar::end_emission_cache();
+        panvar::set_emission_cache_hash_collapse(false);
+        throw;
+    }
+    panvar::end_emission_cache();
+    panvar::set_emission_cache_hash_collapse(false);
+}
+
+void test_hits_allocate_nothing() {
+    // The microbenchmark the requirement asks for, counted through the replaced operator new above.
+    //
+    // The property is that allocations do not GROW WITH HITS. A raw zero is not measurable here: any
+    // loop that drives the cache carries some fixed cost of its own, and an earlier version of this
+    // gate divided exactly that by the hit count and reported "0.0156 per hit" as if the hit path
+    // were leaking. Two passes of very different lengths settle it -- if the count is the same for 64
+    // hits and for 640, nothing in the hit path is allocating.
+    // Each read is scored at ITS OWN start, so every call is a genuine accepted hit. Scoring them
+    // all at start 0 -- as this did -- made 63 of 64 calls prefilter rejections, which never form a
+    // key and never touch the table, so the "per hit" rate was measuring almost no hits at all.
+    std::mt19937_64 rng(5150);
+    const std::string haplotype = random_bases(rng, 2000);
+    std::vector<std::size_t> starts;
+    for (std::size_t i = 0; i < 64; ++i) starts.push_back(i * 7);
+    std::vector<std::string> reads;
+    for (const std::size_t start : starts) reads.push_back(haplotype.substr(start, 100));
+
+    panvar::begin_emission_cache(1u << 28);
+    std::uint64_t on_insert = 0;
+    std::uint64_t on_hit = 0;
+    std::uint64_t single_pass = 0;
+    std::uint64_t wide = 0;
+    std::uint64_t narrow = 0;
+    try {
+        const std::uint64_t before_insert = allocation_count().load();
+        for (std::size_t i = 0; i < starts.size(); ++i) {
+            (void)panvar::gapped_emission(haplotype, reads[i], starts[i], library(), 6);
+        }
+        on_insert = allocation_count().load() - before_insert;
+
+        // Hoisted: constructing a LibraryModel per call is the test's own cost, not the cache's.
+        const panvar::LibraryModel model = library();
+
+        // ONE loop entry each, 64 hits against 640. Holding the number of passes fixed is the whole
+        // point: an earlier version varied the pass count instead, so a fixed per-pass cost looked
+        // like growth. Built up front so its own allocations are outside the counted region.
+        std::vector<std::size_t> long_run;
+        long_run.reserve(starts.size() * 10);
+        for (int repeat = 0; repeat < 10; ++repeat) {
+            for (const std::size_t start : starts) long_run.push_back(start);
+        }
+
+        const std::uint64_t before_single = allocation_count().load();
+        for (std::size_t i = 0; i < starts.size(); ++i) {
+            (void)panvar::gapped_emission(haplotype, reads[i], starts[i], model, 6);
+        }
+        single_pass = allocation_count().load() - before_single;
+
+        const std::uint64_t before_wide = allocation_count().load();
+        for (const std::size_t start : long_run) {
+            (void)panvar::gapped_emission(haplotype, reads[start / 7], start, model, 6);
+        }
+        wide = allocation_count().load() - before_wide;
+        narrow = 0;
+        on_hit = wide > single_pass ? wide - single_pass : 0;
+    } catch (...) {
+        panvar::end_emission_cache();
+        throw;
+    }
+    panvar::end_emission_cache();
+
+    std::cout << "  measured: " << on_insert << " allocations over " << reads.size()
+              << " insertions\n";
+    std::cout << "  measured: one pass, " << reads.size() << " hits -> " << single_pass
+              << " allocations\n";
+    std::cout << "  measured: one pass, " << (reads.size() * 10) << " hits -> " << wide
+              << " allocations\n";
+    require(on_hit == 0,
+            "allocations grew with hits: " + std::to_string(single_pass) + " at " +
+                std::to_string(reads.size()) + " hits, " + std::to_string(wide) + " at " +
+                std::to_string(reads.size() * 10) + " -- the hit path is allocating");
+    std::cout << "  ok: ten times the hits, the same " << wide
+              << " allocations -- nothing on the hit path scales with hits\n";
+}
+
 void test_cumulative_caps_through_the_delta() {
     const Locus l = locus(99, {400});
     std::mt19937_64 rng(11);
@@ -768,6 +916,10 @@ int main() {
         test_transient_release();
         std::cout << "== scoring after a release ==\n";
         test_scoring_after_release();
+        std::cout << "== arena slab growth and cross-slab equality ==\n";
+        test_arena_slabs_grow_and_compare_across_slabs();
+        std::cout << "== allocations on the hit path ==\n";
+        test_hits_allocate_nothing();
         std::cout << "== segmented versus materialised windows ==\n";
         test_segmented_windows_match_materialised();
         std::cout << "== path-distinct, byte-identical haplotypes ==\n";
