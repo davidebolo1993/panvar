@@ -308,4 +308,37 @@ struct PooledDecision {
 PooledDecision decide_pooled_genotype(std::vector<PoolCandidate> pool, std::size_t block_count,
                                       std::size_t fragments, std::size_t mismatch_band);
 
+// ---- phase-switch symmetry of two tied repair branches (diagnostic) ------------------------------
+// Two tied improving moves that carry one unordered genotype differ by a LOCAL phase switch at one block:
+// the second is the first with its two haplotypes' alleles at that block exchanged. (A global homologue
+// swap maps an unordered diplotype onto itself, so two distinct tied candidates are never global swaps of
+// each other.) The two branches continued from them are exactly equivalent when, at every depth, the
+// candidates branch B scored are the local switches of those branch A scored, with bit-identical scores
+// and priors -- and only then is continuing one of them provably enough. Anything else -- a candidate one
+// branch scores and the other does not (visited sets differ), a score or prior that differs in a single bit,
+// a different number of rounds -- breaks the equivalence at that depth. Convergence alone proves nothing.
+struct SymmetryTraceItem {
+    std::size_t round = 0;
+    std::vector<std::size_t> first;
+    std::vector<std::size_t> second;
+    DiplotypeScore score;
+    double prior = 0.0;
+};
+struct SymmetryDepth {
+    std::size_t round = 0;
+    std::size_t a_candidates = 0;
+    std::size_t b_candidates = 0;
+    std::size_t matched = 0;             // B candidates whose local switch A also scored
+    std::size_t bit_identical = 0;       // of those, identical score components and prior, bit for bit
+    double max_total_difference = 0.0;   // over matched candidates
+};
+struct SymmetryReport {
+    bool equivalent = false;
+    std::size_t first_break_round = 0;   // 0: none
+    std::string first_break;             // what broke there
+    std::vector<SymmetryDepth> depths;
+};
+SymmetryReport check_phase_switch_symmetry(const std::vector<SymmetryTraceItem>& a,
+                                           const std::vector<SymmetryTraceItem>& b, std::size_t block);
+
 } // namespace panvar

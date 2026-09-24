@@ -1966,6 +1966,69 @@ void test_pooled_decision_rule() {
                  "unique winner unique (PRIOR_ONLY / READS), all order-invariant\n";
 }
 
+// ---- phase-switch symmetry: exact equivalence of two tied branches, and the adversarial case -------------
+panvar::SymmetryTraceItem traced(std::size_t round, std::vector<std::size_t> a, std::vector<std::size_t> b,
+                                 double fragment, double prior) {
+    panvar::SymmetryTraceItem item;
+    item.round = round;
+    item.first = std::move(a);
+    item.second = std::move(b);
+    item.score.fragment_term = fragment;
+    item.score.exposure_term = -100.0;
+    item.score.log_likelihood = fragment - 100.0;
+    item.score.absolute_term_sum = std::fabs(fragment) + 100.0;
+    item.score.fragments_with_mass = 10;
+    item.prior = prior;
+    return item;
+}
+
+// The local phase switch at `block`: the two haplotypes' alleles there exchanged.
+panvar::SymmetryTraceItem switched(panvar::SymmetryTraceItem item, std::size_t block) {
+    std::swap(item.first[block], item.second[block]);
+    return item;
+}
+
+void test_phase_switch_symmetry() {
+    // Branch A from a0 = (0,0,2 | 1,1,3); branch B from a1 = the local switch at block 1 = (0,1,2 | 1,0,3).
+    const std::size_t block = 1;
+    std::vector<panvar::SymmetryTraceItem> a = {
+        traced(1, {0, 0, 2}, {1, 1, 3}, -1000.0, -5.0),    // incumbent a0
+        traced(1, {4, 0, 2}, {1, 1, 3}, -990.0, -6.0),     // improving move at block 0
+        traced(1, {0, 0, 5}, {1, 1, 3}, -1004.0, -6.0),
+        traced(2, {4, 0, 2}, {1, 1, 3}, -990.0, -6.0),     // incumbent after the move
+        traced(2, {4, 0, 2}, {1, 1, 6}, -995.0, -7.0),
+    };
+    std::vector<panvar::SymmetryTraceItem> b;
+    for (const auto& item : a) b.push_back(switched(item, block));
+    const panvar::SymmetryReport same = panvar::check_phase_switch_symmetry(a, b, block);
+    require(same.equivalent && same.first_break_round == 0 && same.depths.size() == 2,
+            "branches that are local switches of each other, bit for bit, must be equivalent");
+
+    // ADVERSARIAL: locally genotype-equivalent at depth 1, but at depth 2 the switched candidate carries a
+    // different prior (a switch the Li-Stephens path can take on one haplotype and not the other), so branch B
+    // moves elsewhere and ends on a different genotype. Equivalence must break at depth 2, and the pooled rule
+    // over the two terminals must refuse rather than pick one.
+    std::vector<panvar::SymmetryTraceItem> b2 = b;
+    b2[4].prior = std::nextafter(b2[4].prior, 0.0);       // one bit
+    b2.push_back(traced(2, {0, 1, 2}, {4, 0, 7}, -990.0, -6.0));   // a move only branch B makes
+    const panvar::SymmetryReport broken = panvar::check_phase_switch_symmetry(a, b2, block);
+    require(!broken.equivalent && broken.first_break_round == 2,
+            "a single-bit score difference at depth 2 must break equivalence at depth 2, not be inferred away");
+    std::vector<panvar::PoolCandidate> terminals = {pooled({4, 0, 2}, {1, 1, 3}, -990.0, -6.0),
+                                                    pooled({0, 1, 2}, {4, 0, 7}, -990.0, -6.0)};
+    require(panvar::decide_pooled_genotype(terminals, 3, 10, 6).decision == panvar::TopSetDecision::DistinctTie,
+            "branches that end on different genotypes, tied, must be refused");
+
+    // A candidate one branch scores and the other does not (their visited sets differ) also breaks it.
+    std::vector<panvar::SymmetryTraceItem> b3 = b;
+    b3.erase(b3.begin() + 2);
+    const panvar::SymmetryReport visited = panvar::check_phase_switch_symmetry(a, b3, block);
+    require(!visited.equivalent && visited.first_break_round == 1,
+            "a switched neighbourhood missing a candidate must break equivalence at that depth");
+    std::cout << "  phase-switch symmetry: exact switched branches equivalent; one-bit prior break, divergent terminals "
+                 "and visited-set asymmetry all detected\n";
+}
+
 // ---- panel-anchored adaptive completion, end to end ------------------------------------------------
 panvar::GenotypeCommandOptions repair_options(const std::string& prefix, const std::string& r1,
                                               const std::string& r2, const std::string& gfa) {
@@ -2251,6 +2314,7 @@ int main(int argc, char** argv) {
         test_curated_panel();
         test_resource_caps_are_thread_invariant();
         test_pooled_decision_rule();
+        test_phase_switch_symmetry();
         test_adaptive_completion();
         test_watchdog_and_interruption();
         if (argc >= 3) test_profile(argv[2]);

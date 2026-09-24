@@ -2092,6 +2092,8 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
                                 "outcome\tterminal_hap1\tterminal_hap2\tterminal_genotype\tterminal_total\tseconds\t"
                                 "physical_origins\tphys_footprint_at_end\n";
                 std::string incomplete;                // non-empty: DIAGNOSTIC_INCOMPLETE, and why
+                std::map<DiplotypeIdentity, std::size_t> branch_of_start;    // for the symmetry check
+                std::vector<std::vector<RoundItem>> branch_items;
                 std::uint64_t total_origins = 0;
                 std::size_t branches_run = 0;
                 std::set<std::string> terminal_genotypes;
@@ -2164,6 +2166,8 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
                     }
                     const std::uint64_t origins =
                         branch_search && branch_search->context() ? branch_search->context()->cumulative_counters().physical_origins : 0;
+                    branch_of_start[diplotype_identity(branch.start.first, branch.start.second)] = branch.id;
+                    branch_items.push_back(items);
                     total_origins += origins;
                     std::string outcome;
                     if (!branch_failure.empty()) {
@@ -2213,6 +2217,58 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
                                  << seconds_since(branch_mark) << '\t' << origins << '\t' << physical_footprint().current
                                  << '\n';
                     write_diag_status("RUNNING", "");   // atomic partial after every branch
+                }
+                // ---- phase-switch symmetry of every two-way tie whose two branches both ran
+                {
+                    std::ostringstream symmetry;
+                    symmetry << std::setprecision(17)
+                             << "tie\tswitch_block\tbranch_a\tbranch_b\ttied_pair_bit_identical\tequivalent\t"
+                                "first_break_round\tfirst_break\tdepths\n";
+                    for (const Tie& tie : ties) {
+                        if (tie.tied.size() != 2) continue;
+                        const RoundItem& x = tie.tied[0];
+                        const RoundItem& y = tie.tied[1];
+                        const auto ax = branch_of_start.find(diplotype_identity(x.first, x.second));
+                        const auto ay = branch_of_start.find(diplotype_identity(y.first, y.second));
+                        if (ax == branch_of_start.end() || ay == branch_of_start.end()) continue;
+                        // The block where the pair's allele assignment differs; a local switch there maps one onto
+                        // the other exactly when it is the only difference.
+                        std::size_t block = block_count;
+                        bool local_switch = true;
+                        for (std::size_t b = 0; b < block_count; ++b) {
+                            if (x.first[b] == y.first[b] && x.second[b] == y.second[b]) continue;
+                            if (x.first[b] == y.second[b] && x.second[b] == y.first[b] && block == block_count) block = b;
+                            else local_switch = false;
+                        }
+                        if (!local_switch || block == block_count) {
+                            symmetry << tie.id << "\tNA\t" << ax->second << '\t' << ay->second
+                                     << "\tNA\tfalse\t0\tthe tied pair is not a local phase switch at one block\tNA\n";
+                            continue;
+                        }
+                        const auto to_trace = [](const std::vector<RoundItem>& items) {
+                            std::vector<SymmetryTraceItem> out;
+                            for (const RoundItem& item : items) out.push_back({item.round, item.first, item.second, item.score, item.prior});
+                            return out;
+                        };
+                        const SymmetryReport report = check_phase_switch_symmetry(
+                            to_trace(branch_items[ax->second]), to_trace(branch_items[ay->second]), block);
+                        const bool pair_identical =
+                            std::memcmp(&x.score.log_likelihood, &y.score.log_likelihood, sizeof(double)) == 0 &&
+                            std::memcmp(&x.score.fragment_term, &y.score.fragment_term, sizeof(double)) == 0 &&
+                            std::memcmp(&x.score.exposure_term, &y.score.exposure_term, sizeof(double)) == 0 &&
+                            std::memcmp(&x.prior, &y.prior, sizeof(double)) == 0;
+                        std::string depths;
+                        for (const SymmetryDepth& d : report.depths) {
+                            depths += (depths.empty() ? "" : ";") + std::to_string(d.round) + ":" +
+                                      std::to_string(d.a_candidates) + "/" + std::to_string(d.b_candidates) + "/" +
+                                      std::to_string(d.matched) + "/" + std::to_string(d.bit_identical);
+                        }
+                        symmetry << tie.id << '\t' << model.blocks()[block].block_id << '\t' << ax->second << '\t'
+                                 << ay->second << '\t' << (pair_identical ? "true" : "false") << '\t'
+                                 << (report.equivalent ? "true" : "false") << '\t' << report.first_break_round << '\t'
+                                 << (report.first_break.empty() ? "none" : report.first_break) << '\t' << depths << '\n';
+                    }
+                    atomic_write(diag + ".symmetry.tsv", symmetry.str());
                 }
                 // ---- the decision: the production rule over the pooled numerical top set
                 std::ostringstream extra;

@@ -1206,4 +1206,59 @@ PooledDecision decide_pooled_genotype(std::vector<PoolCandidate> pool, std::size
     return out;
 }
 
+SymmetryReport check_phase_switch_symmetry(const std::vector<SymmetryTraceItem>& a,
+                                           const std::vector<SymmetryTraceItem>& b, std::size_t block) {
+    SymmetryReport report;
+    const auto key_of = [](const SymmetryTraceItem& item, bool switch_block, std::size_t at) {
+        std::vector<std::size_t> x = item.first;
+        std::vector<std::size_t> y = item.second;
+        if (switch_block) std::swap(x[at], y[at]);
+        return diplotype_identity(x, y);
+    };
+    std::size_t rounds_a = 0, rounds_b = 0;
+    for (const auto& item : a) rounds_a = std::max(rounds_a, item.round);
+    for (const auto& item : b) rounds_b = std::max(rounds_b, item.round);
+    const std::size_t rounds = std::max(rounds_a, rounds_b);
+    for (std::size_t r = 1; r <= rounds; ++r) {
+        std::map<DiplotypeIdentity, const SymmetryTraceItem*> in_a;
+        SymmetryDepth depth;
+        depth.round = r;
+        for (const auto& item : a) {
+            if (item.round == r && in_a.emplace(key_of(item, false, block), &item).second) ++depth.a_candidates;
+        }
+        std::set<DiplotypeIdentity> seen_b;
+        for (const auto& item : b) {
+            if (item.round != r || !seen_b.insert(key_of(item, true, block)).second) continue;
+            ++depth.b_candidates;
+            const auto found = in_a.find(key_of(item, true, block));
+            if (found == in_a.end()) continue;
+            ++depth.matched;
+            const SymmetryTraceItem& other = *found->second;
+            if (same_score(item.score, other.score) &&
+                std::memcmp(&item.prior, &other.prior, sizeof(double)) == 0) {
+                ++depth.bit_identical;
+            }
+            depth.max_total_difference =
+                std::max(depth.max_total_difference, std::fabs((item.score.log_likelihood + item.prior) -
+                                                               (other.score.log_likelihood + other.prior)));
+        }
+        report.depths.push_back(depth);
+        if (report.first_break_round == 0) {
+            std::string why;
+            if (r > rounds_a || r > rounds_b) why = "one branch stopped at an earlier round";
+            else if (depth.a_candidates != depth.b_candidates || depth.matched != depth.b_candidates)
+                why = "the switched neighbourhoods differ (" + std::to_string(depth.b_candidates - depth.matched) +
+                      " candidates without a switched counterpart)";
+            else if (depth.bit_identical != depth.matched)
+                why = std::to_string(depth.matched - depth.bit_identical) + " switched candidates score differently";
+            if (!why.empty()) {
+                report.first_break_round = r;
+                report.first_break = why;
+            }
+        }
+    }
+    report.equivalent = rounds > 0 && report.first_break_round == 0;
+    return report;
+}
+
 } // namespace panvar
