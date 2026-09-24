@@ -31,7 +31,7 @@ run() {   # run <name> <threads> [extra...]
   local name="$1" threads="$2"; shift 2
   mkdir -p "$WORK/$name"
   "$PROBE" tie-branch --profile "$PROFILE" --threads "$threads" --gfa "$model" --reference "$REF" --reads1 "$r1" \
-    --reads2 "$r2" --library "$lib" "${CUR[@]}" --out-prefix "$WORK/$name/call" "$@" > "$WORK/$name/log" 2>&1
+    --reads2 "$r2" --library "$lib" ${CUR[@]+"${CUR[@]}"} --out-prefix "$WORK/$name/call" "$@" > "$WORK/$name/log" 2>&1
 }
 # The status apart from what a rerun legitimately changes: wall time, process memory and worker gauges.
 status_science() {   # 8 threads: the cache's hit/miss split is scheduling-dependent
@@ -78,7 +78,7 @@ same "4. 4 threads = 8 threads" \
 before="$(digest "$WORK/on8/call.diag."*.tsv)"
 rep="$(awk -F'\t' '$1=="representative_hap1"{a=$2} $1=="representative_hap2"{b=$2} END{print a"|"b}' "$WORK/on8/call.diag.status.tsv")"
 "$PROBE" evaluate --scheme "$scheme" --donor "$label" --reference "$REF" --run-prefix "$WORK/on8/call" --model-gfa "$model" \
-  --truth-gfa "$truth" "${CUR[@]}" --fallback-alleles "$rep" --evaluated-label diagnostic_tie_branching_v2_posthoc_not_a_call \
+  --truth-gfa "$truth" ${CUR[@]+"${CUR[@]}"} --fallback-alleles "$rep" --evaluated-label diagnostic_tie_branching_v2_posthoc_not_a_call \
   --out "$WORK/on8/call.diag_eval" > "$WORK/on8/eval.log" 2>&1
 same "5. evaluation ran" "$?" "0"
 same "5. truth-free tables unchanged by evaluation" "$(digest "$WORK/on8/call.diag."*.tsv)" "$before"

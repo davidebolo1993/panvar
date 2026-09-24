@@ -41,7 +41,7 @@ while IFS=$'\t' read -r job reason; do
   [ "$reason" = union_scoring_cap ] && extra=(--union-max-physical-origins "$UNION_CAP_EXPERIMENT")
   echo "[$(date -u +%H:%M:%S)] $job ($reason)"
   "${TIME[@]}" "$PROBE" tie-branch --profile "$PROFILE" --threads 8 --gfa "$model" --reference "$REF" --reads1 "$r1" \
-    --reads2 "$r2" --library "$lib" --panel-curation "$cur" --out-prefix "$d/call" "${extra[@]}" > "$d/log" 2> "$d/time"
+    --reads2 "$r2" --library "$lib" --panel-curation "$cur" --out-prefix "$d/call" ${extra[@]+"${extra[@]}"} > "$d/log" 2> "$d/time"
   echo "  $(tail -1 "$d/log")"
 done <<< "$cells"
 
