@@ -281,6 +281,12 @@ if(PANVAR_BUILD_TESTING)
         target_link_libraries(genotype_block_delta_test PRIVATE panvarlib)
         target_compile_options(genotype_block_delta_test PRIVATE -Wall -Wextra -Wpedantic)
         add_test(NAME panvar_genotype_block_delta COMMAND genotype_block_delta_test)
+        # Exact union placement reuse: bit-identical to the reference scorer under every segmentation,
+        # budget, cap, thread count and order.
+        add_executable(genotype_union_placement_cache_test tests/genotype_union_placement_cache.cpp)
+        target_link_libraries(genotype_union_placement_cache_test PRIVATE panvarlib)
+        target_compile_options(genotype_union_placement_cache_test PRIVATE -Wall -Wextra -Wpedantic)
+        add_test(NAME panvar_genotype_union_placement_cache COMMAND genotype_union_placement_cache_test)
 
         add_executable(genotype_mosaic_proposal_test tests/genotype_mosaic_proposal.cpp)
         target_link_libraries(genotype_mosaic_proposal_test PRIVATE panvarlib)

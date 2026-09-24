@@ -124,6 +124,10 @@ struct GenotypeCommandOptions {
     // declared threshold. Truth-free and locus-free; see representation_conflict_rule_v1. Off by default: it is
     // bound explicitly by the v3 profiles, so the v1 and v2 profiles run as they were accepted.
     bool representation_guard = false;
+    // Exact union placement reuse (performance only; every score is the reference's bit for bit). 0: off.
+    // The cap bounds cached placements CONSUMED over the union pass (0: none); crossing it refuses.
+    std::size_t union_placement_cache_bytes = 0;
+    std::uint64_t max_union_cached_placements_consumed = 0;
     // Gate hooks only, never settings: score every competitor in the live context even when the pool holds
     // it (the outside-pool path), and replace the declared threshold (NaN: kRepresentationBoundNats).
     bool test_representation_guard_force_context = false;

@@ -2081,6 +2081,34 @@ PieceScreenShadowReport& piece_screen_totals() {
     return totals;
 }
 
+// ---- exact union placement reuse -------------------------------------------------------------------
+struct CachedPlacement {
+    std::uint32_t form = 0;
+    std::uint32_t start = 0;   // local to the segment
+    std::uint32_t consumed = 0;
+    std::uint32_t mismatches = 0;
+    double emission = 0.0;
+};
+struct UnionSegmentEntry {
+    std::vector<CachedPlacement> placements;   // the interior zone's, in (form, start) order
+};
+// Starts [lo, hi] of one haplotype strand are served by `entry`, translated by `shift`.
+struct ReplayZone {
+    std::uint32_t lo = 0;
+    std::uint32_t hi = 0;
+    std::uint32_t shift = 0;
+    const UnionSegmentEntry* entry = nullptr;
+};
+struct UnionReplay {
+    std::vector<std::vector<ReplayZone>> forward, reverse;   // per haplotype
+    std::atomic<std::uint64_t> consumed{0};
+    std::uint64_t max_consumed = 0;   // 0: none
+};
+std::atomic<bool>& union_hash_collapse() {
+    static std::atomic<bool> collapse{false};
+    return collapse;
+}
+
 // Scan one haplotype once per piece-length bucket, turning every piece hit into an implied read
 // start. This is the inversion the design calls for: the haplotype is walked, not queried once per
 // read against a position hash the size of the locus.
@@ -2108,8 +2136,20 @@ void collect_form_placements(
     const FragmentScoringOptions& options,
     // When given, receives the index of every row this call writes to for the first time, so a
     // caller holding persistent rows can clear and sort just those instead of walking all 22,754.
-    std::vector<std::uint32_t>* touched = nullptr) {
+    std::vector<std::uint32_t>* touched = nullptr,
+    // Exact union reuse: starts inside these zones are not proposed here; their cached placements are
+    // replayed instead, and counted against `replay`'s consumption cap. `skip` is worker scratch.
+    const std::vector<ReplayZone>* zones = nullptr,
+    std::vector<std::uint8_t>* skip = nullptr,
+    UnionReplay* replay = nullptr) {
     proposed.clear();   // keeps capacity: the point of hoisting it
+    const bool replaying = zones != nullptr && !zones->empty();
+    if (replaying) {
+        skip->assign(haplotype.size() + library.max_gap_bp + 2, 0);
+        for (const ReplayZone& zone : *zones) {
+            std::fill(skip->begin() + zone.lo, skip->begin() + zone.hi + 1, static_cast<std::uint8_t>(1));
+        }
+    }
     // Piece hits accumulated since the last publication to the shared budget. Drained before this
     // function returns, so nothing a worker counted goes unpublished and the merged total stays exact.
     std::uint64_t unpublished_piece_hits = 0;
@@ -2186,6 +2226,7 @@ void collect_form_placements(
                 const std::size_t lo = implied > library.max_gap_bp ? implied - library.max_gap_bp : 0;
                 const std::size_t hi = implied + library.max_gap_bp;
                 for (std::size_t shifted = lo; shifted <= hi; ++shifted) {
+                    if (replaying && shifted < skip->size() && (*skip)[shifted] != 0) continue;   // served by the cache
                     proposed.emplace_back(it->form, static_cast<std::uint32_t>(shifted));
                     ++counters.proposed_starts;
                 }
@@ -2367,6 +2408,31 @@ void collect_form_placements(
     cache_work.dp_cache_hits += emission.dp_cache_hits;
     cache_work.dp_cache_misses += emission.dp_cache_misses;
     cache_work.executed_dps += emission.executed_dps;
+
+    // Exact union reuse: the cached placements of every zone, translated to this haplotype. Appended before
+    // the sort below, which puts every row in (start, consumed) order -- unique within a row -- so the rows
+    // are the reference's exactly. Each occurrence is replayed, so repeat multiplicity is preserved.
+    if (replaying) {
+        std::uint64_t replayed = 0;
+        for (const ReplayZone& zone : *zones) {
+            for (const CachedPlacement& cached : zone.entry->placements) {
+                FormPlacement placement;
+                placement.start = cached.start + zone.shift;
+                placement.consumed = cached.consumed;
+                placement.mismatches = cached.mismatches;
+                placement.emission = cached.emission;
+                out[cached.form].push_back(placement);
+                ++replayed;
+            }
+        }
+        counters.accepted_mate_placements += replayed;
+        const std::uint64_t total = replay->consumed.fetch_add(replayed, std::memory_order_relaxed) + replayed;
+        if (replay->max_consumed != 0 && total > replay->max_consumed) {
+            budget.cancel();
+            throw ResourceExhausted(
+                "fragment scoring reached its cached-placement consumption cap; no partial ranking is returned");
+        }
+    }
 
     // Sorted by start first, so the pairing below can walk one left endpoint's classes as a group,
     // and by consumed span within it so the row order is fixed rather than insertion-dependent.
@@ -2621,6 +2687,7 @@ struct PlacementInputs {
     const std::deque<std::string>* sequences = nullptr;
     const std::deque<std::string>* reversed = nullptr;
     std::size_t band = 0;
+    UnionReplay* replay = nullptr;   // exact union reuse, one-shot passes only
 };
 
 // Where a haplotype's complete origin census is written, when one is wanted. Distinct from
@@ -3020,6 +3087,7 @@ void place_haplotype_range(
     std::vector<std::vector<FormPlacement>> forward_placements(prepared.forward_forms.size());
     std::vector<std::vector<FormPlacement>> reverse_placements(prepared.reverse_forms.size());
     std::vector<std::pair<std::uint32_t, std::uint32_t>> proposed_scratch;
+    std::vector<std::uint8_t> replay_skip;
 
     for (std::size_t h = first_h; h < last_h; ++h) {
         if (budget.stop()) throw PlacementCancelled();
@@ -3035,7 +3103,8 @@ void place_haplotype_range(
         const std::uint64_t rows_before = counters.accepted_mate_placements;
         collect_form_placements(haplotype, prepared.forward_forms, prepared.forward_componentise,
                                 prepared.forward_indexes, budget, band, library, forward_placements,
-                                proposed_scratch, counters, cache_work, options);
+                                proposed_scratch, counters, cache_work, options, nullptr,
+                                in.replay != nullptr ? &in.replay->forward[h] : nullptr, &replay_skip, in.replay);
         memory.proposed_starts_peak =
             std::max<std::uint64_t>(memory.proposed_starts_peak, proposed_scratch.size());
         memory.proposed_starts_capacity_bytes_peak = std::max<std::uint64_t>(
@@ -3047,7 +3116,8 @@ void place_haplotype_range(
         collect_form_placements(reversed_haplotype, prepared.reverse_forms,
                                 prepared.reverse_componentise, prepared.reverse_indexes, budget, band,
                                 library, reverse_placements, proposed_scratch, counters, cache_work,
-                                options);
+                                options, nullptr, in.replay != nullptr ? &in.replay->reverse[h] : nullptr,
+                                &replay_skip, in.replay);
         memory.proposed_starts_peak =
             std::max<std::uint64_t>(memory.proposed_starts_peak, proposed_scratch.size());
         memory.proposed_starts_capacity_bytes_peak = std::max<std::uint64_t>(
@@ -3209,6 +3279,210 @@ void place_haplotype_range(
         memory.placement_capacity_bytes_peak = std::max<std::uint64_t>(
             memory.placement_capacity_bytes_peak, capacity * sizeof(FormPlacement));
     }
+}
+
+// Exact union reuse, stage one: every distinct (strand, segment bytes) with a non-empty interior zone that
+// occurs at least twice, filled in a canonical order -- most occurrences first, then shorter, then strand and
+// first occurrence -- and admitted in that order while it fits the byte budget, so what is retained never
+// depends on which worker finished first. A declined segment is simply placed directly. Filling counts its
+// executed seeding, verification and emission work; its placements are not accepted placements until replayed.
+void fill_union_cache(const PlacementInputs& in, const std::vector<std::vector<std::uint32_t>>& lengths,
+                      std::size_t budget_bytes, std::uint64_t max_consumed, std::size_t threads,
+                      PlacementBudget& budget, FragmentScoringCounters& counters, EmissionCacheCounters& cache_work,
+                      std::vector<UnionSegmentEntry>& entries, UnionReplay& replay,
+                      UnionPlacementCacheReport& report) {
+    const auto fill_mark = std::chrono::steady_clock::now();
+    const PreparedFragmentSet& prepared = *in.prepared;
+    const LibraryModel& library = *in.library;
+    std::size_t R = 0;
+    for (const auto& form : prepared.forward_forms) R = std::max(R, form.bases.size());
+    for (const auto& form : prepared.reverse_forms) R = std::max(R, form.bases.size());
+    const std::size_t g = library.max_gap_bp;
+    report.active = true;
+    report.read_span_bp = R;
+    report.max_gap_bp = g;
+    report.budget_bytes = budget_bytes;
+    report.max_placements_consumed = max_consumed;
+    const std::size_t unique = in.sequences->size();
+    if (lengths.size() != unique) throw std::invalid_argument("the union segmentation needs one entry per unique haplotype");
+    replay.forward.assign(unique, {});
+    replay.reverse.assign(unique, {});
+    replay.max_consumed = max_consumed;
+
+    struct Occurrence {
+        std::size_t haplotype = 0;
+        std::uint32_t offset = 0;   // in the strand's own coordinates
+    };
+    struct Distinct {
+        int strand = 0;
+        std::string bytes;
+        std::vector<Occurrence> occurrences;
+    };
+    std::vector<Distinct> distinct;
+    std::unordered_multimap<std::uint64_t, std::size_t> by_hash;
+    const bool collapse = union_hash_collapse().load(std::memory_order_relaxed);
+    const std::size_t minimum = R + 2 * g + 1;   // a segment this long has at least one interior start
+    for (std::size_t h = 0; h < unique; ++h) {
+        const std::string& forward = (*in.sequences)[h];
+        std::uint64_t sum = 0;
+        for (const std::uint32_t length : lengths[h]) sum += length;
+        if (sum != forward.size()) throw std::invalid_argument("union segment lengths must sum to the haplotype length");
+        std::uint32_t offset = 0;
+        for (const std::uint32_t length : lengths[h]) {
+            if (length >= minimum) {
+                for (int strand = 0; strand < 2; ++strand) {
+                    const std::uint32_t at = strand == 0 ? offset : static_cast<std::uint32_t>(forward.size() - offset - length);
+                    const std::string& text = strand == 0 ? forward : (*in.reversed)[h];
+                    std::string bytes = text.substr(at, length);
+                    ++report.segment_occurrences;
+                    report.zone_starts_requested += length - minimum + 1;
+                    std::uint64_t key = 0;
+                    if (!collapse) {
+                        key = 1469598103934665603ULL;
+                        for (const char base : bytes) key = (key ^ static_cast<unsigned char>(base)) * 1099511628211ULL;
+                        key = (key ^ static_cast<std::uint64_t>(strand + 1)) * 1099511628211ULL;
+                    }
+                    std::size_t found = distinct.size();
+                    const auto range = by_hash.equal_range(key);
+                    for (auto it = range.first; it != range.second; ++it) {
+                        if (distinct[it->second].strand == strand && distinct[it->second].bytes == bytes) found = it->second;
+                    }
+                    if (found == distinct.size()) {
+                        distinct.push_back({strand, std::move(bytes), {}});
+                        by_hash.emplace(key, found);
+                    }
+                    distinct[found].occurrences.push_back({h, at});
+                }
+            }
+            offset += length;
+        }
+    }
+    report.distinct_segments = distinct.size();
+    for (const Distinct& d : distinct) report.index_bytes += d.bytes.size() + sizeof(Distinct) + d.occurrences.size() * sizeof(Occurrence);
+
+    std::vector<std::size_t> eligible;
+    for (std::size_t i = 0; i < distinct.size(); ++i) {
+        if (distinct[i].occurrences.size() >= 2) eligible.push_back(i);
+    }
+    std::sort(eligible.begin(), eligible.end(), [&](std::size_t x, std::size_t y) {
+        const Distinct& a = distinct[x];
+        const Distinct& b = distinct[y];
+        if (a.occurrences.size() != b.occurrences.size()) return a.occurrences.size() > b.occurrences.size();
+        if (a.bytes.size() != b.bytes.size()) return a.bytes.size() < b.bytes.size();
+        if (a.strand != b.strand) return a.strand < b.strand;
+        return std::tie(a.occurrences.front().haplotype, a.occurrences.front().offset) <
+               std::tie(b.occurrences.front().haplotype, b.occurrences.front().offset);
+    });
+    report.eligible_segments = eligible.size();
+    entries.assign(eligible.size(), UnionSegmentEntry{});
+    std::vector<char> admitted(eligible.size(), 0);
+
+    const std::size_t workers = std::max<std::size_t>(1, std::min(threads, eligible.size()));
+    std::uint64_t held = 0;
+    report.peak_bytes = report.index_bytes;
+    for (std::size_t begin = 0; begin < eligible.size(); begin += workers) {
+        const std::size_t end = std::min(begin + workers, eligible.size());
+        std::vector<FragmentScoringCounters> local(end - begin);
+        std::vector<EmissionCacheCounters> local_cache(end - begin);
+        std::vector<std::exception_ptr> failures(end - begin);
+        const auto fill_one = [&](std::size_t slot) {
+            const ActiveWorker active;
+            const Distinct& d = distinct[eligible[begin + slot]];
+            const bool forward = d.strand == 0;
+            const auto& forms = forward ? prepared.forward_forms : prepared.reverse_forms;
+            std::vector<std::vector<FormPlacement>> rows(forms.size());
+            std::vector<std::pair<std::uint32_t, std::uint32_t>> proposed;
+            (void)take_gapped_emission_counters();
+            collect_form_placements(d.bytes, forms, forward ? prepared.forward_componentise : prepared.reverse_componentise,
+                                    forward ? prepared.forward_indexes : prepared.reverse_indexes, budget, in.band,
+                                    library, rows, proposed, local[slot], local_cache[slot], *in.options);
+            const std::size_t length = d.bytes.size();
+            std::vector<CachedPlacement>& out = entries[begin + slot].placements;
+            for (std::size_t f = 0; f < rows.size(); ++f) {
+                for (const FormPlacement& p : rows[f]) {
+                    if (p.start < g || p.start + R + g > length) continue;   // outside the interior zone
+                    out.push_back({static_cast<std::uint32_t>(f), p.start, p.consumed, p.mismatches, p.emission});
+                }
+            }
+        };
+        if (end - begin == 1) {
+            fill_one(0);
+        } else {
+            std::vector<std::thread> pool;
+            for (std::size_t slot = 0; slot < end - begin; ++slot) {
+                pool.emplace_back([&, slot]() {
+                    try {
+                        fill_one(slot);
+                    } catch (const PlacementCancelled&) {
+                    } catch (...) {
+                        failures[slot] = std::current_exception();
+                    }
+                });
+            }
+            for (std::thread& worker : pool) worker.join();
+            for (const std::exception_ptr& failure : failures) {
+                if (failure) std::rethrow_exception(failure);
+            }
+            if (budget.stop()) throw PlacementCancelled();
+        }
+        std::uint64_t transient = 0;
+        for (std::size_t slot = 0; slot < end - begin; ++slot) {
+            const FragmentScoringCounters& part = local[slot];
+            counters.candidate_bases_scanned += part.candidate_bases_scanned;
+            counters.piece_hits += part.piece_hits;
+            counters.proposed_starts += part.proposed_starts;
+            counters.unique_starts += part.unique_starts;
+            counters.full_read_verifications += part.full_read_verifications;
+            counters.dp_evaluations += part.dp_evaluations;
+            counters.prefilter_rejections += part.prefilter_rejections;
+            report.placements_enumerated += part.accepted_mate_placements;
+            const EmissionCacheCounters& e = local_cache[slot];
+            cache_work.executed_prefilters += e.executed_prefilters;
+            cache_work.dp_cache_requests += e.dp_cache_requests;
+            cache_work.dp_cache_hits += e.dp_cache_hits;
+            cache_work.dp_cache_misses += e.dp_cache_misses;
+            cache_work.executed_dps += e.executed_dps;
+            transient += entries[begin + slot].placements.size() * sizeof(CachedPlacement);
+        }
+        report.peak_bytes = std::max<std::uint64_t>(report.peak_bytes, report.index_bytes + held + transient);
+        for (std::size_t slot = 0; slot < end - begin; ++slot) {
+            std::vector<CachedPlacement>& placements = entries[begin + slot].placements;
+            const std::uint64_t bytes = placements.size() * sizeof(CachedPlacement);
+            if (held + bytes <= budget_bytes) {
+                admitted[begin + slot] = 1;
+                held += bytes;
+                ++report.admitted_segments;
+                report.placements_cached += placements.size();
+            } else {
+                ++report.declined_segments;
+                std::vector<CachedPlacement>().swap(placements);
+            }
+        }
+    }
+    report.payload_bytes = held;
+
+    for (std::size_t e = 0; e < eligible.size(); ++e) {
+        if (admitted[e] == 0) continue;
+        const Distinct& d = distinct[eligible[e]];
+        const std::uint32_t length = static_cast<std::uint32_t>(d.bytes.size());
+        for (const Occurrence& occurrence : d.occurrences) {
+            ReplayZone zone;
+            zone.lo = occurrence.offset + static_cast<std::uint32_t>(g);
+            zone.hi = occurrence.offset + length - static_cast<std::uint32_t>(R + g);
+            zone.shift = occurrence.offset;
+            zone.entry = &entries[e];
+            (d.strand == 0 ? replay.forward : replay.reverse)[occurrence.haplotype].push_back(zone);
+            ++report.hits;
+            report.zone_starts_served += length - minimum + 1;
+        }
+    }
+    for (auto* plan : {&replay.forward, &replay.reverse}) {
+        for (std::vector<ReplayZone>& zones : *plan) {
+            std::sort(zones.begin(), zones.end(), [](const ReplayZone& x, const ReplayZone& y) { return x.lo < y.lo; });
+        }
+    }
+    report.misses = report.segment_occurrences - report.hits;
+    report.seconds_fill = std::chrono::duration<double>(std::chrono::steady_clock::now() - fill_mark).count();
 }
 
 // Runs placement over [0, unique) with the declared worker count, merging in thread-index order so
@@ -3880,6 +4154,8 @@ FragmentScoringResult score_diplotypes(
     origins_out.recorded = &result.recorded_origins;
 
     const bool origins_force_serial = !options.record_origins_for_fragments.empty();
+    UnionReplay union_replay;
+    std::vector<UnionSegmentEntry> union_entries;
 
     const auto note_observed_work = [&]() {
         if (observed_on_failure == nullptr) return;
@@ -3894,6 +4170,8 @@ FragmentScoringResult score_diplotypes(
         observed_on_failure->seconds_placement_and_mass =
             std::chrono::duration<double>(std::chrono::steady_clock::now() - placement_mark).count();
         observed_on_failure->seconds_diploid_combination = 0.0;
+        observed_on_failure->union_placement_cache = result.union_placement_cache;
+        observed_on_failure->union_placement_cache.placements_replayed = union_replay.consumed.load(std::memory_order_relaxed);
     };
 
     result.threads_used_placement =
@@ -3902,9 +4180,17 @@ FragmentScoringResult score_diplotypes(
             : std::max<std::size_t>(1, std::min(options.threads, unique));
     try {
         if (options.record_haplotype_work != nullptr) options.record_haplotype_work->assign(unique, HaplotypeWork{});
+        if (options.union_segment_lengths != nullptr && options.union_placement_cache_bytes > 0 && unique > 0 &&
+            !prepared.forward_forms.empty()) {
+            fill_union_cache(inputs, *options.union_segment_lengths, options.union_placement_cache_bytes,
+                             options.max_union_cached_placements_consumed, options.threads, budget, counters,
+                             result.emission_cache, union_entries, union_replay, result.union_placement_cache);
+            inputs.replay = &union_replay;
+        }
         result.threads_used_placement =
             run_placement(inputs, 0, unique, options.threads, origins_force_serial, budget,
                           mass_column, counters, result.memory, result.emission_cache, origins_out);
+        result.union_placement_cache.placements_replayed = union_replay.consumed.load(std::memory_order_relaxed);
     } catch (const ResourceExhausted&) {
         note_observed_work();
         throw;
@@ -5456,6 +5742,10 @@ ContextMemoryAccount PreparedScoringContext::memory_account() const {
 
 void set_origin_cache_self_check(bool enabled) {
     scoring_detail::origin_self_check().store(enabled, std::memory_order_relaxed);
+}
+
+void set_union_placement_cache_hash_collapse(bool collapse) {
+    scoring_detail::union_hash_collapse().store(collapse, std::memory_order_relaxed);
 }
 
 void set_origin_cache_hash_collapse(bool collapse) {

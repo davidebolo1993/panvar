@@ -320,6 +320,47 @@ not meant to flag it -- this is not a guard failure. It has 0/11 high-quality bl
 genotype support is `PRIOR_ONLY`: the 6.3 kb spike stays in the all-quality and representation-PASS views and is
 absent from the high-quality view.
 
+## Union placement reuse, phase 1 (2026-09-25): implemented, off, bound by no profile
+
+The union pass places reads on haplotypes that repeat each other's blocks (58.8% of NA19434.30's window
+positions repeat). Phase 1 serves the repeated local problems from a content-addressed cache without
+changing a single output: likelihood, accepted origins and their multiplicity, candidates, scores, ranking,
+calls, phase and filters are the reference scorer's, which stays the oracle.
+
+- **The reuse unit.** A segment is one union block's bytes on one strand; the key is (strand, bytes), with the
+  read span R and `max_gap_bp` g fixed per run. A placement starting at s depends on [s-g, s+R+g) only, so a
+  segment's interior zone -- local starts [g, len-R-g] -- has placements that do not depend on its neighbours.
+  Segments occurring at least twice are filled once and their interior placements translated to every
+  occurrence; every start outside a served zone, including every window crossing a boundary and every short
+  or empty allele, is placed as before. Replay appends before the row sort, whose (start, consumed) keys are
+  unique, so rows are bit-identical. Segmentation is a hint only: a wrong one stays exact (fixture).
+- **Admission.** Canonical order (occurrences desc, length asc, strand, first occurrence), admitted while
+  payload + index fit `union_placement_cache_bytes`; the rest are declined and placed directly. No eviction.
+- **Resource accounting.** Executed counters count executions only: the fill's, plus the direct placements.
+  Replayed placements are counted by `union_cached_placements_consumed` and bounded by
+  `max_union_cached_placements_consumed` (the cap accepts exactly, and one below refuses before any
+  ranking). Physical origins and the other statistical caps are unchanged, and cache-served origins still
+  count against them; not counting them is phase 2, which is not implemented.
+- **Keys.** `union_placement_cache_bytes` and `max_union_cached_placements_consumed` (profile keys and probe
+  overrides, both default 0 = off/no cap); the status records the budget, segments (distinct, eligible,
+  admitted, declined), hits, misses, zone starts requested/served, placements enumerated/cached/replayed,
+  payload, index and peak bytes and fill seconds. No v1-v4 profile binds them.
+- **Gates.** `panvar_genotype_union_placement_cache`: substitution/insertion/deletion/empty alleles, first and
+  last windows, short blocks, tandem repeats, identical content at offsets, both strands, 1/2/4/8 threads,
+  permuted order, forced hash collisions, cache off/full/undersized, byte budget exact and one below,
+  consumption cap exact and one below, wrong and whole-haplotype segmentations -- mass cells, exposure,
+  components, totals, ranking and accepted/origin/state-class counts equal to the reference. Real:
+  `loo.HG02282.2` (v4, 8 threads) cache on = off in every table, the trajectory and the status apart from the
+  cache's keys and timings.
+- **Benchmark** (`loo.NA19434.30`, v4 campaign-local, `max_union_physical_origins` 7e8, 300 s, 8 threads,
+  512 MiB budget; `tests/results/.../v4_union/RECORD.md`). Both runs refuse at the same 700,000,001 origins
+  (`RESCORE_INCOMPLETE`, no genotype artefacts); 270 haplotypes completed in both with identical accepted
+  placements, origins and state classes (the one haplotype in flight at the refusal is scheduling-dependent).
+  276/276 eligible segments admitted; 65% of zone starts served; 135.0M placements replayed; payload
+  191.8 MB, peak 241.9 MB, fill 10.1 s. Placement-and-mass 165.3 -> 99.1 s (1.67x), seeding+emission
+  worker-seconds 3.56x, wall 167.7 -> 101.5 s, CPU 1,164 -> 473 s, footprint 2.16 -> 2.02 GiB. At 2x
+  (`loo.HG02282.2`) there is no overhead: wall 23.8 -> 22.2 s, footprint 0.57 -> 0.62 GiB.
+
 ## Frozen defaults
 
 State limit **256** (production) and **1,024** (diagnostic comparison width) -- counted in allele-prefix

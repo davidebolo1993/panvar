@@ -337,6 +337,8 @@ struct CandidateSetReport {
     // stopped at the cap is indistinguishable from one that stopped long past it.
     FragmentScoringObservation observed;
     bool observed_valid = false;
+    // Exact union placement reuse, as the union pass reported it (or as far as it got before a refusal).
+    UnionPlacementCacheReport union_placement_cache;
     // True when no beam ran at all: K = 0, no phase audit and no positive development prefix, so the
     // candidate set is exactly the panel and nothing about it is conditional on a search. Reported as
     // candidate_scope PANEL_ONLY, which is neither COMPLETE nor CONDITIONAL -- both of those describe
@@ -773,6 +775,29 @@ void write_status(
             out << "observed_threads_used_combination\t"
                 << candidate_set->observed.threads_used_combination << '\n';
         }
+        {
+            // Exact union placement reuse: what it held, served and consumed. Executed seeding counters above
+            // count only executed work; replayed placements are counted here and held to their own cap.
+            const UnionPlacementCacheReport& u = candidate_set->union_placement_cache;
+            out << "union_placement_cache\t" << (u.active ? "on" : "off") << "\nunion_placement_cache_budget_bytes\t"
+                << u.budget_bytes << "\nmax_union_cached_placements_consumed\t" << u.max_placements_consumed
+                << "\nunion_placement_cache_read_span_bp\t" << u.read_span_bp << "\nunion_placement_cache_max_gap_bp\t"
+                << u.max_gap_bp << "\nunion_placement_cache_segment_occurrences\t" << u.segment_occurrences
+                << "\nunion_placement_cache_distinct_segments\t" << u.distinct_segments
+                << "\nunion_placement_cache_eligible_segments\t" << u.eligible_segments
+                << "\nunion_placement_cache_admitted_segments\t" << u.admitted_segments
+                << "\nunion_placement_cache_declined_segments\t" << u.declined_segments
+                << "\nunion_placement_cache_evictions\t" << u.evictions << "\nunion_placement_cache_hits\t" << u.hits
+                << "\nunion_placement_cache_misses\t" << u.misses << "\nunion_placement_cache_zone_starts_requested\t"
+                << u.zone_starts_requested << "\nunion_placement_cache_zone_starts_served\t" << u.zone_starts_served
+                << "\nunion_placement_cache_placements_enumerated\t" << u.placements_enumerated
+                << "\nunion_placement_cache_placements_cached\t" << u.placements_cached
+                << "\nunion_cached_placements_consumed\t" << u.placements_replayed
+                << "\nunion_placement_cache_payload_bytes\t" << u.payload_bytes
+                << "\nunion_placement_cache_index_bytes\t" << u.index_bytes
+                << "\nunion_placement_cache_peak_bytes\t" << u.peak_bytes
+                << "\nseconds_union_placement_cache_fill\t" << u.seconds_fill << '\n';
+        }
         // Derived once, here, and used verbatim by every block row.
         out << "candidate_scope\t"
             << candidate_scope_name(candidate_set->panel_only,
@@ -960,6 +985,8 @@ void apply_genotype_profile(const std::string& path, GenotypeCommandOptions& opt
             options.repair_tie_branching = value == "1";
         }
         else if (key == "repair_tie_max_branches") options.repair_tie_max_branches = u();
+        else if (key == "union_placement_cache_bytes") options.union_placement_cache_bytes = u();
+        else if (key == "max_union_cached_placements_consumed") options.max_union_cached_placements_consumed = u();
         else if (key == "representation_guard") {
             if (value != "0" && value != "1") throw std::runtime_error("profile " + path + ": 'representation_guard' is 0 or 1: " + value);
             options.representation_guard = value == "1";
@@ -1413,6 +1440,7 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
     mark = Clock::now();
     std::vector<MosaicPath> paths;
     std::vector<std::string> sequences;
+    std::vector<std::vector<std::uint32_t>> segment_lengths_of_slot;   // block segmentation: a reuse hint only
     std::map<std::vector<std::size_t>, std::size_t> slot_of_path;
     const auto slot_for = [&](const MosaicPath& path) {
         const auto found = slot_of_path.find(path.alleles);
@@ -1420,7 +1448,18 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
         const std::size_t slot = paths.size();
         slot_of_path.emplace(path.alleles, slot);
         paths.push_back(path);
-        sequences.push_back(spell_mosaic(model, path).bases);
+        HaplotypeSequence spelled = spell_mosaic(model, path);
+        // A partition from the block starts, so the lengths always sum to the haplotype (a hint either way).
+        std::vector<std::uint32_t> lengths;
+        std::size_t cut = 0;
+        for (std::size_t b = 1; b < spelled.block_intervals.size(); ++b) {
+            const std::size_t next = std::max(cut, std::min(spelled.block_intervals[b].begin, spelled.bases.size()));
+            lengths.push_back(static_cast<std::uint32_t>(next - cut));
+            cut = next;
+        }
+        lengths.push_back(static_cast<std::uint32_t>(spelled.bases.size() - cut));
+        segment_lengths_of_slot.push_back(std::move(lengths));
+        sequences.push_back(std::move(spelled.bases));
         return slot;
     };
     std::vector<const MosaicCandidate*> scored_union;
@@ -1468,6 +1507,21 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
     scoring_options.max_state_classes = options.max_state_classes;
     scoring_options.max_mass_cells = options.max_mass_cells;
     scoring_options.emission_cache_bytes = options.emission_cache_bytes;
+    // Exact union placement reuse: one segmentation per unique haplotype (its first path's blocks).
+    std::vector<std::vector<std::uint32_t>> union_segments;
+    if (options.union_placement_cache_bytes > 0 && any_ranked) {
+        union_segments.assign(interned.sequences.size(), {});
+        std::vector<char> filled(interned.sequences.size(), 0);
+        for (std::size_t slot = 0; slot < paths.size(); ++slot) {
+            const std::size_t h = interned.index_of[slot];
+            if (filled[h] != 0) continue;
+            filled[h] = 1;
+            union_segments[h] = segment_lengths_of_slot[slot];
+        }
+        scoring_options.union_segment_lengths = &union_segments;
+        scoring_options.union_placement_cache_bytes = options.union_placement_cache_bytes;
+        scoring_options.max_union_cached_placements_consumed = options.max_union_cached_placements_consumed;
+    }
     FragmentScoringResult scored;
     std::string rescore_failure;
     std::vector<HaplotypeWork> union_work;
@@ -1482,9 +1536,11 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
             candidate_report.threads_used_combination = scored.threads_used_combination;
             candidate_report.threads_used_placement = scored.threads_used_placement;
             candidate_report.candidate_fragment_evaluations = scored.candidate_fragment_evaluations;
+            candidate_report.union_placement_cache = scored.union_placement_cache;
         } catch (const ResourceExhausted& error) {
             rescore_failure = error.what();
             candidate_report.observed_valid = true;
+            candidate_report.union_placement_cache = candidate_report.observed.union_placement_cache;
             // The phases that did run, up to the refusal. Without these a refused run reports its
             // whole duration under seconds_rescoring and 0.000 for each of the three parts, which is
             // precisely the breakdown a refusal needs.

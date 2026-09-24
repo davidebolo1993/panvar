@@ -610,6 +610,41 @@ struct HaplotypeWork {
     double seconds_pairing_and_reduction = 0.0;  // mate pairing, physical origins, StateKey reduction
 };
 
+// Exact union placement reuse (one-shot passes). A start whose whole dependency window -- the bases its seeds
+// can come from, [start - max_gap_bp, start + R + max_gap_bp) with R the longest read form, and the bases its
+// verification and emission read -- lies inside one segment of a haplotype has placements that depend on that
+// segment's bytes alone (the emission normaliser is saturated there). Such placements are computed once per
+// distinct (strand, segment bytes) occurring at least twice, stored in local coordinates, and replayed at every
+// occurrence; every other start is placed directly as before. Rows are sorted by (start, consumed) at the end
+// either way, so the result is the reference's, bit for bit. The segmentation is a hint: any segmentation is
+// exact, a poor one only reuses less. What was reused is reported here.
+struct UnionPlacementCacheReport {
+    bool active = false;
+    std::size_t read_span_bp = 0;                 // R
+    std::size_t max_gap_bp = 0;                   // the seed and verification margin
+    std::uint64_t budget_bytes = 0;
+    std::uint64_t max_placements_consumed = 0;    // 0: none
+    std::uint64_t segment_occurrences = 0;        // (haplotype, strand, segment) with a non-empty interior zone
+    std::uint64_t distinct_segments = 0;
+    std::uint64_t eligible_segments = 0;          // distinct segments occurring at least twice
+    std::uint64_t admitted_segments = 0;
+    std::uint64_t declined_segments = 0;          // did not fit the byte budget: placed directly instead
+    std::uint64_t evictions = 0;                  // nothing admitted is ever evicted
+    std::uint64_t hits = 0;                       // occurrences served from the cache
+    std::uint64_t misses = 0;                     // occurrences placed directly
+    std::uint64_t zone_starts_requested = 0;      // start positions inside interior zones
+    std::uint64_t zone_starts_served = 0;         // of those, served from the cache
+    std::uint64_t placements_enumerated = 0;      // accepted placements computed while filling (whole segments)
+    std::uint64_t placements_cached = 0;          // interior placements retained
+    std::uint64_t placements_replayed = 0;        // consumed: replayed into haplotypes (held to the cap)
+    std::uint64_t payload_bytes = 0;              // retained placements
+    std::uint64_t index_bytes = 0;                // segment keys held while filling
+    std::uint64_t peak_bytes = 0;                 // payload + index + the batch being filled, at its peak
+    double seconds_fill = 0.0;
+};
+// TEST ONLY: collapse every union segment key's hash, so byte comparison alone separates segments.
+void set_union_placement_cache_hash_collapse(bool collapse);
+
 struct FragmentScoringOptions {
     // The declared band of the truncated model. Fixed for a run: changing it changes the model.
     std::size_t mismatch_band = 6;
@@ -672,6 +707,14 @@ struct FragmentScoringOptions {
     // MEASUREMENT ONLY (one-shot passes): when set, sized to the unique haplotypes and filled per haplotype. Owned by
     // the caller, so a pass refused at a cap still leaves the haplotypes it finished.
     std::vector<HaplotypeWork>* record_haplotype_work = nullptr;
+    // Exact union placement reuse (see UnionPlacementCacheReport). One-shot passes only; off unless both a
+    // segmentation and a byte budget are given. The segmentation is per unique haplotype (index order of the
+    // interned set): segment lengths summing to the haplotype's length.
+    const std::vector<std::vector<std::uint32_t>>* union_segment_lengths = nullptr;
+    std::size_t union_placement_cache_bytes = 0;
+    // A cap on cached placements CONSUMED over the pass (0: none). Replayed placements are not executed work
+    // and are not charged as such, so reuse needs a bound of its own: exceeding it refuses, with no ranking.
+    std::uint64_t max_union_cached_placements_consumed = 0;
     // Workers for the diploid combination phase. Candidates are partitioned into fixed contiguous
     // ranges and each worker writes only its own complete DiplotypeScore entries, so the result does
     // not depend on the thread count: no cross-thread floating-point reduction exists to reorder.
@@ -730,6 +773,7 @@ struct DiplotypeScore {
 };
 
 struct FragmentScoringResult {
+    UnionPlacementCacheReport union_placement_cache;
     std::vector<DiplotypeScore> scores;     // parallel to the requested candidates
     // Row-major [fragment * unique_haplotypes + haplotype]: the summed log placement mass of one
     // fragment on one chromosome copy of one haplotype. Retained because it is what the exhaustive
@@ -792,6 +836,7 @@ struct FragmentScoringObservation {
     double seconds_fragment_preparation = 0.0;
     double seconds_placement_and_mass = 0.0;
     double seconds_diploid_combination = 0.0;
+    UnionPlacementCacheReport union_placement_cache;   // what the reuse did before the refusal
 };
 
 // A measurement, not an optimisation. Oriented read forms repeat -- four forms per fragment, and at
