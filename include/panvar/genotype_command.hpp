@@ -139,6 +139,9 @@ struct GenotypeCommandOptions {
     std::uint64_t diagnostic_footprint_limit_bytes = 3758096384ULL;   // checked per round
     std::uint64_t diagnostic_max_total_physical_origins = 19600000000ULL;   // over every branch
     bool diagnostic_reverse_branch_order = false;      // gate hook: the result must not depend on it
+    // MEASUREMENT ONLY: per search (production, then each branch) its rounds and origin-demand ledger, to
+    // price what a warm cache shared across branches would avoid. Changes no score and no decision.
+    bool diagnostic_reuse_trace = false;
 };
 
 // A run that cannot complete emits its diagnostics and says so. It never presents a partial ranking

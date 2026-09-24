@@ -4874,6 +4874,61 @@ int score_set(const Args& args) {
     const std::vector<panvar::ReadPair> fragments =
         read_pairs(args.required("reads1"), args.required("reads2"));
 
+    // --rank-blocks: every unordered allele pair at the named blocks, ranked by proposal emission exactly as
+    // CoordinateRepairSearch ranks its local pairs (emission descending, then indices), so a pair's rank says
+    // whether it was in the repair's local-pair list. Truth-free; the command's stage 2 with its defaults.
+    const std::string rank_blocks = args.get("rank-blocks", "");
+    if (!rank_blocks.empty()) {
+        const panvar::PreparedMarkerPanel markers = panvar::build_marker_panel(model, 31, 15);
+        const panvar::MarkerObservations observations = panvar::count_marker_observations(markers, fragments);
+        std::optional<double> declared_background;
+        {
+            std::ifstream library_file(args.required("library"));
+            std::string key;
+            double value = 0.0;
+            for (std::string line; std::getline(library_file, line);) {
+                std::istringstream fields(line);
+                if (fields >> key >> value && key == "marker_background") declared_background = value;
+            }
+        }
+        const panvar::MarkerDepthEstimate depth =
+            panvar::estimate_marker_depth(markers, observations, declared_background);
+        if (!depth.converged) throw std::runtime_error("the depth fit did not converge: " + depth.termination);
+        const panvar::PreparedProposalEmissions emissions = panvar::build_proposal_emissions(
+            markers, observations, panvar::proposal_marker_parameters(depth, 31, 15));
+        const std::size_t local_pairs = std::stoul(status.at("repair_local_pairs"));
+        std::ofstream ranks(out + ".local_ranks.tsv");
+        ranks << std::setprecision(12)
+              << "block_id\trank\tallele_x\tallele_y\tx_bp\ty_bp\temission\tbelow_top\tin_local_list\n";
+        std::stringstream wanted(rank_blocks);
+        for (std::string id; std::getline(wanted, id, ',');) {
+            std::size_t b = blocks;
+            for (std::size_t i = 0; i < blocks; ++i) {
+                if (model.blocks()[i].block_id == id) b = i;
+            }
+            if (b == blocks) throw std::runtime_error("no block " + id);
+            const panvar::BlockProposalEmissions& emission = emissions.blocks[b];
+            std::vector<std::pair<double, std::pair<std::size_t, std::size_t>>> ranked;
+            for (std::size_t x = 0; x < emission.allele_count; ++x) {
+                for (std::size_t y = x; y < emission.allele_count; ++y) ranked.push_back({emission.at(x, y), {x, y}});
+            }
+            std::sort(ranked.begin(), ranked.end(), [](const auto& lhs, const auto& rhs) {
+                if (lhs.first != rhs.first) return lhs.first > rhs.first;
+                return lhs.second < rhs.second;
+            });
+            for (std::size_t r = 0; r < ranked.size(); ++r) {
+                const auto& alleles = model.blocks()[b].alleles;
+                ranks << id << '\t' << (r + 1) << '\t' << ranked[r].second.first << '\t' << ranked[r].second.second
+                      << '\t' << alleles[ranked[r].second.first].sequence.size() << '\t'
+                      << alleles[ranked[r].second.second].sequence.size() << '\t' << ranked[r].first << '\t' << (ranked.front().first - ranked[r].first) << '\t'
+                      << (r < local_pairs ? "true" : "false") << '\n';
+            }
+        }
+        ranks.close();
+        std::cout << "score-set " << donor << ": local ranks written for " << rank_blocks << '\n';
+        if (args.get("emissions-only", "0") == "1") return 0;
+    }
+
     std::vector<panvar::MosaicPath> paths;
     std::vector<std::string> sequences;
     std::map<std::vector<std::size_t>, std::size_t> slot_of_path;
@@ -4945,6 +5000,31 @@ int score_set(const Args& args) {
                   << " declared expectations did not reproduce (worst delta " << worst << ")\n";
         return 4;
     }
+
+    // The truth-free score table is written, and its digest printed, before truth is loaded.
+    {
+        std::ostringstream free_table;
+        free_table << std::setprecision(17)
+                   << "label\tsequence_pair\thap1_alleles\thap2_alleles\tfragment_term\texposure_term\tprior\ttotal\t"
+                      "expected_total\n";
+        for (std::size_t i = 0; i < declared.size(); ++i) {
+            const std::size_t slot = pair_of_declared[i];
+            std::string h1, h2;
+            for (std::size_t b = 0; b < blocks; ++b) {
+                h1 += (b ? "," : "") + std::to_string(declared[i].first[b]);
+                h2 += (b ? "," : "") + std::to_string(declared[i].second[b]);
+            }
+            free_table << declared[i].label << '\t' << slot << '\t' << h1 << '\t' << h2 << '\t'
+                       << scored.scores[slot].fragment_term << '\t' << scored.scores[slot].exposure_term << '\t'
+                       << prior_of_pair[slot] << '\t' << (scored.scores[slot].log_likelihood + prior_of_pair[slot])
+                       << '\t' << (declared[i].has_expected ? std::to_string(declared[i].expected) : std::string("NA"))
+                       << '\n';
+        }
+        atomic_write(out + ".scores_truth_free.tsv", free_table.str());
+        std::cout << "score-set " << donor << ": truth-free table sha256 "
+                  << panvar::sha256_file(out + ".scores_truth_free.tsv") << '\n';
+    }
+    if (args.get("truth-gfa", "").empty()) return 0;
 
     // Truth enters only now.
     const SortedGraph truth_graph = load_truth_in_model_frame(
@@ -5517,6 +5597,7 @@ int tie_branch(const Args& args) {
     options.diagnostic_max_total_physical_origins =
         std::stoull(args.get("diagnostic-max-total-physical-origins", "19600000000"));
     options.diagnostic_reverse_branch_order = args.get("reverse-branches", "0") != "0";
+    options.diagnostic_reuse_trace = args.get("reuse-trace", "0") != "0";
     // EXPERIMENT ONLY: a higher union physical-origin cap for one diagnosed refusal. Recorded as an override;
     // no profile or default moves.
     if (!args.get("union-max-physical-origins", "").empty()) {

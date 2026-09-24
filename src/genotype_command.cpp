@@ -2083,6 +2083,29 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
                 };
                 const Tie first_tie = record_tie(terminal_tie(production_items, production_last_round));
                 enqueue(first_tie, production_history);
+                // MEASUREMENT ONLY: a search's rounds and the windows its context enumerated or reused.
+                const auto dump_reuse = [&](const std::string& tag, CoordinateRepairSearch& traced) {
+                    if (!options.diagnostic_reuse_trace) return;
+                    atomic_write(diag + ".reuse." + tag + ".rounds.tsv", traced.render_rounds(traced.rounds()));
+                    std::ostringstream demand;
+                    demand << std::setprecision(17)
+                           << "order\tkey_hash\twindow_bytes\tat_start\tat_end\trel_block_begin\trel_new_end\trequests\t"
+                              "hits\tmisses\tgroup_reuses\tadmitted\tdeclined\tentry_bytes\trecords\torigins_constructed\t"
+                              "seconds_enumeration\tseconds_reenumeration\tevictions\n";
+                    if (traced.context() != nullptr) {
+                        for (const OriginDemandRow& row : traced.context()->origin_demand()) {
+                            demand << row.order << '\t' << row.key_hash << '\t' << row.window_bytes << '\t'
+                                   << row.at_start << '\t' << row.at_end << '\t' << row.rel_block_begin << '\t'
+                                   << row.rel_new_end << '\t' << row.requests << '\t' << row.hits << '\t' << row.misses
+                                   << '\t' << row.group_reuses << '\t' << row.admitted << '\t' << row.declined << '\t'
+                                   << row.entry_bytes << '\t' << row.records << '\t' << row.origins_constructed << '\t'
+                                   << row.seconds_enumeration << '\t' << row.seconds_reenumeration << '\t'
+                                   << row.evictions << '\n';
+                        }
+                    }
+                    atomic_write(diag + ".reuse." + tag + ".demand.tsv", demand.str());
+                };
+                if (search) dump_reuse("production", *search);
                 // The emission cache belongs to one scoring context at a time: the production search is
                 // finished and its outputs written, so it is released before any branch builds its own.
                 search.reset();
@@ -2164,6 +2187,7 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
                     } catch (const std::exception& error) {
                         branch_failure = std::string("branch failed: ") + error.what();
                     }
+                    if (branch_search) dump_reuse("branch" + std::to_string(branch.id), *branch_search);
                     const std::uint64_t origins =
                         branch_search && branch_search->context() ? branch_search->context()->cumulative_counters().physical_origins : 0;
                     branch_of_start[diplotype_identity(branch.start.first, branch.start.second)] = branch.id;
