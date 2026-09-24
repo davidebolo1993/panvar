@@ -5821,11 +5821,17 @@ int tie_branch(const Args& args) {
         options.representation_guard = args.get("representation-guard", "") != "0";
         options.overridden_settings.push_back(std::string("representation_guard=") + (options.representation_guard ? "1" : "0"));
     }
-    for (const char* key : {"repair-max-physical-origins", "repair-tie-max-branches"}) {
+    // DIAGNOSTIC-ONLY overrides (recorded in settings_overridden_after_profile): the repair round limit and the
+    // run's wall limit, e.g. to ask whether a round-capped search converges given more rounds.
+    for (const char* key : {"repair-max-physical-origins", "repair-tie-max-branches", "repair-rounds",
+                            "time-limit-seconds"}) {
         const std::string value = args.get(key, "");
         if (value.empty()) continue;
-        if (std::string(key) == "repair-max-physical-origins") options.repair_max_physical_origins = std::stoull(value);
-        else options.repair_tie_max_branches = std::stoul(value);
+        const std::string name_of = key;
+        if (name_of == "repair-max-physical-origins") options.repair_max_physical_origins = std::stoull(value);
+        else if (name_of == "repair-tie-max-branches") options.repair_tie_max_branches = std::stoul(value);
+        else if (name_of == "repair-rounds") options.repair_rounds = std::stoul(value);
+        else options.time_limit_seconds = std::stod(value);
         std::string name = key;
         std::replace(name.begin(), name.end(), '-', '_');
         options.overridden_settings.push_back(name + "=" + value);
