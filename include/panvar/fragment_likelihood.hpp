@@ -598,6 +598,18 @@ public:
     using std::runtime_error::runtime_error;
 };
 
+// MEASUREMENT ONLY: one unique haplotype's placement work in a one-shot scoring pass -- deltas of the worker's own
+// counters around that haplotype, and the time of its two phases. Filled only when requested; never read by a score.
+struct HaplotypeWork {
+    bool recorded = false;
+    std::uint64_t haplotype_bp = 0;
+    std::uint64_t piece_hits = 0, proposed_starts = 0, unique_starts = 0, full_read_verifications = 0;
+    std::uint64_t prefilter_rejections = 0, dp_evaluations = 0, executed_dps = 0, accepted_mate_placements = 0;
+    std::uint64_t physical_origins = 0, statistical_state_classes = 0;
+    double seconds_seeding_and_emission = 0.0;   // exact seeds, prefilter, gapped emission, both strands
+    double seconds_pairing_and_reduction = 0.0;  // mate pairing, physical origins, StateKey reduction
+};
+
 struct FragmentScoringOptions {
     // The declared band of the truncated model. Fixed for a run: changing it changes the model.
     std::size_t mismatch_band = 6;
@@ -657,6 +669,9 @@ struct FragmentScoringOptions {
     // and for the listed fragments every accepted origin.
     bool record_origin_summary = false;
     std::vector<std::size_t> record_origins_for_fragments;
+    // MEASUREMENT ONLY (one-shot passes): when set, sized to the unique haplotypes and filled per haplotype. Owned by
+    // the caller, so a pass refused at a cap still leaves the haplotypes it finished.
+    std::vector<HaplotypeWork>* record_haplotype_work = nullptr;
     // Workers for the diploid combination phase. Candidates are partitioned into fixed contiguous
     // ranges and each worker writes only its own complete DiplotypeScore entries, so the result does
     // not depend on the thread count: no cross-thread floating-point reduction exists to reorder.

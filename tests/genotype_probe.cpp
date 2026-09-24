@@ -5801,6 +5801,7 @@ int tie_branch(const Args& args) {
         std::stoull(args.get("diagnostic-max-total-physical-origins", "19600000000"));
     options.diagnostic_reverse_branch_order = args.get("reverse-branches", "0") != "0";
     options.diagnostic_reuse_trace = args.get("reuse-trace", "0") != "0";
+    options.diagnostic_union_work_trace = args.get("union-work-trace", "0") != "0";
     options.diagnostic_warm_branches = args.get("warm-branches", "0") != "0";
     options.diagnostic_digest_memo = args.get("digest-memo", "0") != "0";
     options.diagnostic_digest_memo_check = args.get("digest-memo-check", "0") != "0";

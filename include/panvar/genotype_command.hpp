@@ -162,6 +162,9 @@ struct GenotypeCommandOptions {
     // MEASUREMENT ONLY: per search (production, then each branch) its rounds and origin-demand ledger, to
     // price what a warm cache shared across branches would avoid. Changes no score and no decision.
     bool diagnostic_reuse_trace = false;
+    // MEASUREMENT ONLY: <prefix>.union_haplotype_work.tsv, the union pass's placement work per unique haplotype
+    // (panel or mosaic), written whether the pass completes or refuses. Changes no score, order or counter.
+    bool diagnostic_union_work_trace = false;
     // DIAGNOSTIC branch-speed pilot. Warm branches share the production search's scoring context: each
     // tied neighbour is created by the exact block delta of a promoted repair from its parent incumbent's
     // census (pinned, never mutated), instead of a fresh context placing the start in full. The digest

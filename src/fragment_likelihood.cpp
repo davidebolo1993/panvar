@@ -3025,6 +3025,11 @@ void place_haplotype_range(
         if (budget.stop()) throw PlacementCancelled();
         const std::string& haplotype = (*in.sequences)[h];
         if (prepared.forward_forms.empty()) continue;
+        // MEASUREMENT ONLY: this worker's counters before the haplotype (read, never changed).
+        const bool trace_work = options.record_haplotype_work != nullptr && census_out == nullptr;
+        const FragmentScoringCounters work_before = trace_work ? counters : FragmentScoringCounters{};
+        const std::uint64_t executed_before = trace_work ? cache_work.executed_dps : 0;
+        const auto work_mark = std::chrono::steady_clock::now();
 
         for (std::vector<FormPlacement>& row : forward_placements) row.clear();
         const std::uint64_t rows_before = counters.accepted_mate_placements;
@@ -3050,6 +3055,7 @@ void place_haplotype_range(
             proposed_scratch.capacity() * sizeof(std::pair<std::uint32_t, std::uint32_t>));
         memory.placement_rows_peak = std::max<std::uint64_t>(
             memory.placement_rows_peak, counters.accepted_mate_placements - rows_before);
+        const auto work_seeded = std::chrono::steady_clock::now();
 
         for (std::vector<FormPlacement>& list : reverse_placements) {
             for (FormPlacement& placement : list) {
@@ -3176,6 +3182,24 @@ void place_haplotype_range(
             if (states.empty()) continue;
             counters.statistical_state_classes += states.size();
             mass_column[h][f] = reduce_states(states, library_insert);
+        }
+        if (trace_work && h < options.record_haplotype_work->size()) {
+            HaplotypeWork& work = (*options.record_haplotype_work)[h];   // one worker per haplotype: no race
+            const auto work_done = std::chrono::steady_clock::now();
+            work.recorded = true;
+            work.haplotype_bp = haplotype.size();
+            work.piece_hits = counters.piece_hits - work_before.piece_hits;
+            work.proposed_starts = counters.proposed_starts - work_before.proposed_starts;
+            work.unique_starts = counters.unique_starts - work_before.unique_starts;
+            work.full_read_verifications = counters.full_read_verifications - work_before.full_read_verifications;
+            work.prefilter_rejections = counters.prefilter_rejections - work_before.prefilter_rejections;
+            work.dp_evaluations = counters.dp_evaluations - work_before.dp_evaluations;
+            work.executed_dps = cache_work.executed_dps - executed_before;
+            work.accepted_mate_placements = counters.accepted_mate_placements - work_before.accepted_mate_placements;
+            work.physical_origins = counters.physical_origins - work_before.physical_origins;
+            work.statistical_state_classes = counters.statistical_state_classes - work_before.statistical_state_classes;
+            work.seconds_seeding_and_emission = std::chrono::duration<double>(work_seeded - work_mark).count();
+            work.seconds_pairing_and_reduction = std::chrono::duration<double>(work_done - work_seeded).count();
         }
     }
     {
@@ -3877,6 +3901,7 @@ FragmentScoringResult score_diplotypes(
             ? 1
             : std::max<std::size_t>(1, std::min(options.threads, unique));
     try {
+        if (options.record_haplotype_work != nullptr) options.record_haplotype_work->assign(unique, HaplotypeWork{});
         result.threads_used_placement =
             run_placement(inputs, 0, unique, options.threads, origins_force_serial, budget,
                           mass_column, counters, result.memory, result.emission_cache, origins_out);

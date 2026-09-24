@@ -1470,6 +1470,8 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
     scoring_options.emission_cache_bytes = options.emission_cache_bytes;
     FragmentScoringResult scored;
     std::string rescore_failure;
+    std::vector<HaplotypeWork> union_work;
+    if (options.diagnostic_union_work_trace) scoring_options.record_haplotype_work = &union_work;
     if (any_ranked) {
         try {
             scored = score_diplotypes(interned, scored_pairs, fragments, library, scoring_options,
@@ -1500,6 +1502,33 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
         }
     }
     timings.rescoring = seconds_since(mark);
+    if (options.diagnostic_union_work_trace && any_ranked) {
+        // Which unique haplotypes a panel template spells, and how many allele paths spell each one.
+        std::set<std::vector<std::size_t>> panel_paths(model.panel().template_alleles.begin(),
+                                                       model.panel().template_alleles.end());
+        std::vector<std::size_t> paths_of(interned.sequences.size(), 0);
+        std::vector<bool> is_panel(interned.sequences.size(), false);
+        for (const auto& [alleles, slot] : slot_of_path) {
+            const std::size_t h = interned.index_of[slot];
+            ++paths_of[h];
+            if (panel_paths.count(alleles) != 0) is_panel[h] = true;
+        }
+        std::ostringstream text;
+        text << std::setprecision(9)
+             << "haplotype\tclass\tallele_paths\trecorded\thaplotype_bp\tpiece_hits\tproposed_starts\tunique_starts\t"
+                "full_read_verifications\tprefilter_rejections\tdp_evaluations\texecuted_dps\taccepted_mate_placements\t"
+                "physical_origins\tstatistical_state_classes\tseconds_seeding_and_emission\tseconds_pairing_and_reduction\n";
+        for (std::size_t h = 0; h < union_work.size(); ++h) {
+            const HaplotypeWork& w = union_work[h];
+            text << h << '\t' << (is_panel[h] ? "panel" : "mosaic") << '\t' << paths_of[h] << '\t'
+                 << (w.recorded ? "true" : "false") << '\t' << w.haplotype_bp << '\t' << w.piece_hits << '\t'
+                 << w.proposed_starts << '\t' << w.unique_starts << '\t' << w.full_read_verifications << '\t'
+                 << w.prefilter_rejections << '\t' << w.dp_evaluations << '\t' << w.executed_dps << '\t'
+                 << w.accepted_mate_placements << '\t' << w.physical_origins << '\t' << w.statistical_state_classes
+                 << '\t' << w.seconds_seeding_and_emission << '\t' << w.seconds_pairing_and_reduction << '\n';
+        }
+        atomic_write(options.out_prefix + ".union_haplotype_work.tsv", text.str());
+    }
 
     // Exact-path prior cache, shared by every ranked set: the primary one, each development prefix and
     // the phase audit. The haploid prior is a function of one complete allele path alone, so it is
