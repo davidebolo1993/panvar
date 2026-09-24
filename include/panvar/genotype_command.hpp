@@ -142,6 +142,16 @@ struct GenotypeCommandOptions {
     // MEASUREMENT ONLY: per search (production, then each branch) its rounds and origin-demand ledger, to
     // price what a warm cache shared across branches would avoid. Changes no score and no decision.
     bool diagnostic_reuse_trace = false;
+    // DIAGNOSTIC branch-speed pilot. Warm branches share the production search's scoring context: each
+    // tied neighbour is created by the exact block delta of a promoted repair from its parent incumbent's
+    // census (pinned, never mutated), instead of a fresh context placing the start in full. The digest
+    // memo keys sequence digests by allele path -- immutable content under the fixed model, never a
+    // slot or a buffer -- and the check recomputes every memo hit and counts disagreements.
+    bool diagnostic_warm_branches = false;
+    bool diagnostic_digest_memo = false;
+    bool diagnostic_digest_memo_check = false;
+    std::uint64_t diagnostic_branch_request_order_seed = 0;   // gate hook: permutes branch requests
+    bool diagnostic_pool_dump = false;                        // gate hook: the whole pool, bit-exact
 };
 
 // A run that cannot complete emits its diagnostics and says so. It never presents a partial ranking

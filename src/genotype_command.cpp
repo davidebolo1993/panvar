@@ -1853,18 +1853,38 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
             double prior = 0.0;
         };
         std::vector<RoundItem> production_items;
+        // DIAGNOSTIC digest memo (branch hooks only): keyed by allele path, which fixes the spelled bytes
+        // under this model, so a released and recycled slot or a freed buffer can never alias an entry.
+        std::map<std::vector<std::size_t>, SequenceDigest> digest_memo;
+        std::uint64_t digest_memo_hits = 0, digest_memo_misses = 0, digest_memo_mismatches = 0;
+        const auto digest_of = [&](const std::vector<std::size_t>& path, const std::string& bases, bool memo) {
+            if (!memo) return sequence_digest(bases);
+            const auto found = digest_memo.find(path);
+            if (found == digest_memo.end()) {
+                ++digest_memo_misses;
+                const SequenceDigest fresh = sequence_digest(bases);
+                digest_memo.emplace(path, fresh);
+                return fresh;
+            }
+            ++digest_memo_hits;
+            if (options.diagnostic_digest_memo_check) {
+                const SequenceDigest fresh = sequence_digest(bases);
+                if (fresh < found->second || found->second < fresh) ++digest_memo_mismatches;
+            }
+            return found->second;
+        };
         const auto pool_scored = [&](const std::vector<std::size_t>& a, const std::vector<std::size_t>& b,
                                      const std::string& sa, const std::string& sb, const DiplotypeScore& score,
                                      double prior, const std::string& source, const std::string& scored_in,
-                                     std::vector<RoundItem>* items, std::size_t round) {
+                                     std::vector<RoundItem>* items, std::size_t round, bool memo = false) {
             const double pa = cached_haploid_prior(MosaicPath{a});
             const double pb = cached_haploid_prior(MosaicPath{b});
             const double negative_infinity = -std::numeric_limits<double>::infinity();
             const double path = pa == negative_infinity || pb == negative_infinity
                                     ? negative_infinity
                                     : pa + pb + (a != b ? std::log(2.0) : 0.0);
-            const SequenceDigest da = sequence_digest(sa);
-            const SequenceDigest db = sequence_digest(sb);
+            const SequenceDigest da = digest_of(a, sa, memo);
+            const SequenceDigest db = digest_of(b, sb, memo);
             add(a, b, da, db, score, prior, path, source, scored_in, false, 0);
             if (items != nullptr) items->push_back({round, a, b, da, db, score, prior});
         };
@@ -2106,9 +2126,50 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
                     atomic_write(diag + ".reuse." + tag + ".demand.tsv", demand.str());
                 };
                 if (search) dump_reuse("production", *search);
-                // The emission cache belongs to one scoring context at a time: the production search is
-                // finished and its outputs written, so it is released before any branch builds its own.
-                search.reset();
+                // Warm branches: every tied neighbour is seeded from its parent incumbent's census by the exact
+                // block delta of a promoted repair. Parents stay pinned (alive, never mutated) for the whole
+                // diagnostic; a seed is pinned until its own branch has finished.
+                const bool warm = options.diagnostic_warm_branches;
+                PreparedScoringContext* shared = warm && search ? search->context() : nullptr;
+                std::map<DiplotypeIdentity, std::pair<std::size_t, std::size_t>> seed_slots;
+                std::set<std::size_t> parent_pins;
+                std::map<std::size_t, std::size_t> seed_pins;   // slot -> pending branches seeded on it
+                std::uint64_t seeding_origins = 0;
+                const auto seed_tie = [&](CoordinateRepairSearch& parent, const Tie& tie) {
+                    parent_pins.insert(parent.incumbent_slot_first());
+                    parent_pins.insert(parent.incumbent_slot_second());
+                    const std::uint64_t before = shared->cumulative_counters().physical_origins;
+                    for (const RoundItem& n : tie.tied) {
+                        const DiplotypeIdentity key = diplotype_identity(n.first, n.second);
+                        if (seed_slots.count(key) != 0) continue;
+                        const auto slots = parent.seed_neighbour_by_delta(n.first, n.second);
+                        seed_slots.emplace(key, slots);
+                        ++seed_pins[slots.first];
+                        if (slots.second != slots.first) ++seed_pins[slots.second];
+                    }
+                    seeding_origins += shared->cumulative_counters().physical_origins - before;
+                };
+                const auto pins_now = [&]() {
+                    std::vector<std::size_t> pins(parent_pins.begin(), parent_pins.end());
+                    for (const auto& seed : seed_pins) pins.push_back(seed.first);
+                    return pins;
+                };
+                std::string warm_failure;
+                if (warm) {
+                    try {
+                        if (shared == nullptr) throw std::runtime_error("no production scoring context to share");
+                        seed_tie(*search, first_tie);
+                    } catch (const std::exception& error) {
+                        warm_failure = std::string("seeding failed: ") + error.what();
+                    }
+                } else {
+                    // The emission cache belongs to one scoring context at a time: the production search is
+                    // finished and its outputs written, so it is released before any branch builds its own.
+                    search.reset();
+                }
+                const std::uint64_t shared_origins_at_start =
+                    shared != nullptr ? shared->cumulative_counters().physical_origins : 0;
+                (void)shared_origins_at_start;
                 std::ostringstream branch_table;
                 branch_table << std::setprecision(17)
                              << "branch\tparent_tie\tstart_hap1\tstart_hap2\tstart_total\trounds\tmoves\tstop\tconverged\t"
@@ -2138,6 +2199,7 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
                     atomic_write(diag + ".terminal_ties.tsv", tie_table.str());
                     atomic_write(diag + ".branches.tsv", branch_table.str());
                 };
+                total_origins += seeding_origins;   // the first tie's seeds (zero when cold)
                 write_diag_status("RUNNING", "");
                 struct DiagnosticStop : std::runtime_error {
                     using std::runtime_error::runtime_error;
@@ -2155,11 +2217,27 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
                     std::unique_ptr<CoordinateRepairSearch> branch_search;
                     std::string branch_failure;
                     bool branch_reproduced = true;
+                    const std::uint64_t shared_before =
+                        shared != nullptr ? shared->cumulative_counters().physical_origins : 0;
+                    const DiplotypeIdentity start_identity = diplotype_identity(branch.start.first, branch.start.second);
                     try {
+                        if (!warm_failure.empty()) throw std::runtime_error(warm_failure);
+                        RepairSearchOptions branch_options = search_options;
+                        branch_options.request_order_seed = options.diagnostic_branch_request_order_seed;
+                        branch_options.external_context = warm;
+                        if (warm) branch_options.memory_log = false;
                         branch_search = std::make_unique<CoordinateRepairSearch>(model, emissions, fragments, library,
-                                                                                 repair_scoring, search_options);
-                        branch_search->start(branch.start.first, branch.start.second,
-                                             branch.start.score.log_likelihood + branch.start.prior);
+                                                                                 repair_scoring, branch_options);
+                        const double start_total = branch.start.score.log_likelihood + branch.start.prior;
+                        if (warm) {
+                            const auto seeded = seed_slots.at(start_identity);
+                            branch_search->attach_context(shared);
+                            branch_search->set_pinned(pins_now());
+                            branch_search->start_from_slots(branch.start.first, branch.start.second, start_total,
+                                                            seeded.first, seeded.second);
+                        } else {
+                            branch_search->start(branch.start.first, branch.start.second, start_total);
+                        }
                         for (const DiplotypeIdentity& seen : branch.history) branch_search->add_visited(seen.first, seen.second);
                         RepairHooks hooks;
                         hooks.on_scored = [&](const std::vector<std::size_t>& a, const std::vector<std::size_t>& b,
@@ -2168,7 +2246,7 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
                             const std::size_t round = branch_search->rounds().size() + 1;
                             pool_scored(a, b, sa, sb, score, prior, "branch",
                                         "branch" + std::to_string(branch.id) + "_round" + std::to_string(round), &items,
-                                        round);
+                                        round, options.diagnostic_digest_memo);
                         };
                         hooks.on_round = [&](const RepairRound&) {
                             diag_footprint_max = std::max(diag_footprint_max, physical_footprint().current);
@@ -2188,8 +2266,12 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
                         branch_failure = std::string("branch failed: ") + error.what();
                     }
                     if (branch_search) dump_reuse("branch" + std::to_string(branch.id), *branch_search);
+                    // Executed work only: in the shared context, what this branch added to the cumulative count.
                     const std::uint64_t origins =
-                        branch_search && branch_search->context() ? branch_search->context()->cumulative_counters().physical_origins : 0;
+                        warm ? (shared != nullptr ? shared->cumulative_counters().physical_origins - shared_before : 0)
+                             : (branch_search && branch_search->context()
+                                    ? branch_search->context()->cumulative_counters().physical_origins
+                                    : 0);
                     branch_of_start[diplotype_identity(branch.start.first, branch.start.second)] = branch.id;
                     branch_items.push_back(items);
                     total_origins += origins;
@@ -2212,10 +2294,30 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
                         }
                         Tie nested = terminal_tie(items, branch_search->rounds().back().index);
                         nested.branch = static_cast<long>(branch.id);
-                        enqueue(record_tie(nested), history);
+                        const Tie& recorded = record_tie(nested);
+                        enqueue(recorded, history);
+                        if (warm) {
+                            try {
+                                const std::uint64_t before = seeding_origins;
+                                seed_tie(*branch_search, recorded);
+                                total_origins += seeding_origins - before;
+                            } catch (const std::exception& error) {
+                                incomplete = "branch " + std::to_string(branch.id) + ": seeding failed: " + error.what();
+                            }
+                        }
                     } else {
                         outcome = "incomplete";
                         incomplete = "branch " + std::to_string(branch.id) + " stopped at " + branch_search->stop_reason();
+                    }
+                    if (warm) {
+                        const auto seeded = seed_slots.find(start_identity);
+                        if (seeded != seed_slots.end()) {
+                            for (const std::size_t slot : {seeded->second.first, seeded->second.second}) {
+                                const auto pin = seed_pins.find(slot);
+                                if (pin != seed_pins.end() && --pin->second == 0) seed_pins.erase(pin);
+                                if (seeded->second.second == seeded->second.first) break;
+                            }
+                        }
                     }
                     if (incomplete.empty() && total_origins > options.diagnostic_max_total_physical_origins) {
                         incomplete = "total physical-origin cap binds across branches";
@@ -2306,7 +2408,36 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
                 }
                 // ---- the decision: the production rule over the pooled numerical top set
                 std::ostringstream extra;
-                extra << std::setprecision(17) << "distinct_branch_terminal_genotypes\t" << terminal_genotypes.size() << '\n';
+                extra << std::setprecision(17) << "distinct_branch_terminal_genotypes\t" << terminal_genotypes.size() << '\n'
+                      << "branch_seeding\t" << (warm ? "delta_promoted_shared_context" : "cold_full_placement") << '\n'
+                      << "seeding_physical_origins\t" << seeding_origins << '\n'
+                      << "digest_memo\t" << (options.diagnostic_digest_memo ? "allele_path" : "off") << '\n'
+                      << "digest_memo_hits\t" << digest_memo_hits << "\ndigest_memo_misses\t" << digest_memo_misses << '\n'
+                      << "digest_memo_check\t" << (options.diagnostic_digest_memo_check ? "on" : "off") << '\n'
+                      << "digest_memo_mismatches\t" << digest_memo_mismatches << '\n'
+                      << "branch_request_order_seed\t" << options.diagnostic_branch_request_order_seed << '\n';
+                if (options.diagnostic_digest_memo_check && digest_memo_mismatches != 0 && incomplete.empty()) {
+                    incomplete = "the digest memo disagreed with a recomputed digest";
+                }
+                if (options.diagnostic_pool_dump) {
+                    std::vector<std::pair<DiplotypeIdentity, const PoolEntry*>> ordered;
+                    for (const PoolEntry& entry : pool) {
+                        ordered.push_back({diplotype_identity(entry.candidate.first, entry.candidate.second), &entry});
+                    }
+                    std::sort(ordered.begin(), ordered.end(),
+                              [](const auto& x, const auto& y) { return x.first < y.first; });
+                    std::ostringstream dump;
+                    dump << std::hexfloat << "hap1\thap2\tlog_likelihood\tfragment_term\texposure_term\tabsolute_term_sum\t"
+                                             "fragments_with_mass\tsequence_prior\tpath_prior\n";
+                    for (const auto& item : ordered) {
+                        const PoolCandidate& c = item.second->candidate;
+                        dump << join_alleles(item.first.first) << '\t' << join_alleles(item.first.second) << '\t'
+                             << c.score.log_likelihood << '\t' << c.score.fragment_term << '\t' << c.score.exposure_term
+                             << '\t' << c.score.absolute_term_sum << '\t' << c.score.fragments_with_mass << '\t'
+                             << c.sequence_prior << '\t' << c.path_prior << '\n';
+                    }
+                    atomic_write(diag + ".pool.tsv", dump.str());
+                }
                 if (!incomplete.empty()) {
                     extra << "decision\tDIAGNOSTIC_INCOMPLETE\nincomplete_reason\t" << incomplete << '\n';
                     write_diag_status("INCOMPLETE", extra.str());

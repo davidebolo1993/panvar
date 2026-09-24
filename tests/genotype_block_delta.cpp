@@ -232,6 +232,73 @@ Locus locus(std::uint64_t seed, const std::vector<std::size_t>& flush_boundaries
     return out;
 }
 
+// A branch start seeded warm -- the tied neighbour promoted by delta from its parent incumbent's census,
+// census retained -- against the same start seeded cold (placed in full, census from full placement). Both
+// the start and a neighbour the branch then deltas FROM that census must equal the one-shot oracle in every
+// mass cell and in exposure, bit for bit, with and without the origin-cache path.
+void test_delta_promoted_seed_matches_cold_seed() {
+    const std::size_t b1 = 300;
+    const std::size_t b2 = 600;
+    const Locus l = locus(71, {b1, b1 + 30, b2, b2 + 30});
+    std::mt19937_64 rng(9);
+    const std::string r1 = random_bases(rng, 30);
+    const std::string r2 = random_bases(rng, 45);
+    std::string seed = l.base;
+    seed.replace(b1, 30, r1);
+    std::string next = seed;
+    next.replace(b2, 30, r2);
+    const panvar::InternedHaplotypes interned = intern({seed, next});
+    const panvar::FragmentScoringResult oracle =
+        panvar::score_diplotypes(interned, {{0, 0}, {1, 1}}, l.fragments, library(), options());
+    const auto check = [&](panvar::PreparedScoringContext& context, std::size_t slot, std::size_t oracle_index,
+                           const std::string& where) {
+        require_identical(context.exposure_of(slot), oracle.exposure[oracle_index], where + " exposure");
+        for (std::size_t f = 0; f < l.fragments.size(); ++f) {
+            require_identical(context.mass_of(f, slot), oracle.mass_of(f, oracle_index),
+                              where + " mass cell f" + std::to_string(f));
+        }
+    };
+    for (const bool origin_path : {false, true}) {
+        const std::string mode = origin_path ? "origin-cache path" : "stage-5 path";
+        {
+            panvar::PreparedScoringContext context(l.fragments, library(), options());
+            if (origin_path) {
+                context.enable_origin_cache_path(true);
+                context.set_origin_cache_limits(1u << 24, 0);
+            }
+            context.add_haplotypes({l.base});
+            context.begin_transient_round();
+            context.retain_census(0);
+            panvar::BlockDeltaWork promote;
+            const std::size_t start = context.add_repaired_haplotype(0, b1, b1 + 30, r1, &promote, true);
+            require(!promote.fell_back_to_full, mode + ": the promotion must be a delta");
+            require(promote.origins_reused > 0 && promote.origins_recomputed > 0,
+                    mode + ": the promotion must reuse and recompute origins");
+            require(context.holds_census(start), mode + ": a promoted seed must hold a census");
+            check(context, start, interned.index_of[0], mode + " warm seed");
+            panvar::BlockDeltaWork work;
+            const std::size_t onward = context.add_repaired_haplotype(start, b2, b2 + 30, r2, &work);
+            require(!work.fell_back_to_full, mode + ": the onward repair must delta from the promoted census");
+            check(context, onward, interned.index_of[1], mode + " warm onward");
+        }
+        {
+            panvar::PreparedScoringContext context(l.fragments, library(), options());
+            if (origin_path) {
+                context.enable_origin_cache_path(true);
+                context.set_origin_cache_limits(1u << 24, 0);
+            }
+            context.add_haplotypes({seed});
+            context.begin_transient_round();
+            context.retain_census(0);
+            check(context, 0, interned.index_of[0], mode + " cold seed");
+            panvar::BlockDeltaWork work;
+            const std::size_t onward = context.add_repaired_haplotype(0, b2, b2 + 30, r2, &work);
+            check(context, onward, interned.index_of[1], mode + " cold onward");
+        }
+    }
+    std::cout << "  ok: a delta-promoted seed and its onward repair equal cold full seeding, every cell, both paths\n";
+}
+
 void test_replacement_kinds() {
     const std::size_t b = 400;
     const Locus l = locus(11, {b, b + 30});
@@ -2231,6 +2298,8 @@ int main() {
         test_origin_caps_count_executed_work();
         std::cout << "== stage 6: thread identity ==\n";
         test_origin_threads_identical();
+        std::cout << "== warm branch seeding: delta-promoted census equals cold full seeding ==\n";
+        test_delta_promoted_seed_matches_cold_seed();
         std::cout << "== grouped enumeration versus the reference ==\n";
         test_window_enumeration_matches_reference();
         std::cout << "== scratch reuse and per-candidate allocation ==\n";

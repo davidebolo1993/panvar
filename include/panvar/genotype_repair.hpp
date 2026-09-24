@@ -66,6 +66,9 @@ struct RepairSearchOptions {
     std::uint64_t request_order_seed = 0;
     std::size_t hold_cycles = 0;
     bool pressure_relief = false;
+    // DIAGNOSTIC (tie branching): the search builds no context of its own; the caller attaches one that
+    // another search owns and keeps alive (attach_context).
+    bool external_context = false;
 };
 
 // One committed round, with every work and resource column the rounds table reports.
@@ -150,7 +153,27 @@ public:
 
     // A fresh scoring context (context modes), configured by the options. Resets the seeding count.
     void new_context();
-    PreparedScoringContext* context() { return context_.get(); }
+    PreparedScoringContext* context() { return shared_ != nullptr ? shared_ : context_.get(); }
+
+    // ---- DIAGNOSTIC tie branching over one shared context -----------------------------------------
+    // Borrows a context another search owns (options.external_context). The context is not owned: it
+    // must outlive this search, and its transient round is already open.
+    void attach_context(PreparedScoringContext* shared);
+    // The census-holding slots of the current incumbent (valid once a delta search has seeded).
+    std::size_t incumbent_slot_first() const { return inc_slot_a_; }
+    std::size_t incumbent_slot_second() const { return inc_slot_b_; }
+    // A neighbour of the current incumbent (one block replaced, side-aligned as the round generated it),
+    // created by the same exact block delta a promoted repair uses, census retained. Returns its two
+    // slots. A side equal to an incumbent haplotype resolves to that haplotype's slot, as a round does.
+    std::pair<std::size_t, std::size_t> seed_neighbour_by_delta(const std::vector<std::size_t>& first,
+                                                                const std::vector<std::size_t>& second,
+                                                                BlockDeltaWork* work = nullptr);
+    // start(), then adopt two census-holding slots of the attached context as the incumbent, so round
+    // one deltas from them instead of placing the start in full.
+    void start_from_slots(const std::vector<std::size_t>& first, const std::vector<std::size_t>& second,
+                          double total, std::size_t slot_first, std::size_t slot_second);
+    // Slots every release must keep (other branches' parents and pending seeds). Never mutated here.
+    void set_pinned(std::vector<std::size_t> pinned) { pinned_ = std::move(pinned); }
     // Opens the context's transient round once; everything created after it is released between
     // rounds unless retained.
     void open_transient_round();
@@ -206,6 +229,8 @@ private:
     std::vector<std::vector<std::pair<std::size_t, std::size_t>>> local_;
     std::uint64_t neighbour_bound_ = 0;
     std::unique_ptr<PreparedScoringContext> context_;
+    PreparedScoringContext* shared_ = nullptr;
+    std::vector<std::size_t> pinned_;
     bool transient_opened_ = false;
     std::uint64_t seeding_origins_ = 0;
     bool memory_on_ = false;

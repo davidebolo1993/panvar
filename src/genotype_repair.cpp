@@ -246,7 +246,7 @@ CoordinateRepairSearch::CoordinateRepairSearch(const PreparedGenotypeModel& mode
         for (std::size_t r = 0; r < take; ++r) local_[b].push_back(ranked[r].second);
     }
     neighbour_bound_ = repair_neighbour_bound(model, options.local_pairs);
-    if (options_.mode != RepairScoringMode::OneShot) new_context();
+    if (options_.mode != RepairScoringMode::OneShot && !options_.external_context) new_context();
     memory_on_ = context_ != nullptr && options_.memory_log;
     if (memory_on_) {
         memory_text_ += "kind\tindex\tpoint\trss_current\trss_peak\trelief_freed\trss_after_relief\t"
@@ -275,9 +275,73 @@ void CoordinateRepairSearch::new_context() {
 }
 
 void CoordinateRepairSearch::open_transient_round() {
-    if (transient_opened_ || !context_) return;
-    context_->begin_transient_round();
+    if (transient_opened_ || !context()) return;
+    context()->begin_transient_round();
     transient_opened_ = true;
+}
+
+void CoordinateRepairSearch::attach_context(PreparedScoringContext* shared) {
+    if (!options_.external_context || shared == nullptr) {
+        throw std::logic_error("attach_context needs options.external_context and a live context");
+    }
+    shared_ = shared;
+    transient_opened_ = true;   // the owner opened it
+}
+
+std::pair<std::size_t, std::size_t> CoordinateRepairSearch::seed_neighbour_by_delta(
+    const std::vector<std::size_t>& first, const std::vector<std::size_t>& second, BlockDeltaWork* work) {
+    PreparedScoringContext* context = this->context();
+    if (context == nullptr || !have_inc_slots_) throw std::logic_error("seeding needs a seeded delta search");
+    const std::size_t blocks = model_.blocks().size();
+    const HaplotypeSequence incumbent_a = spell_mosaic(model_, MosaicPath{cur_first_});
+    const HaplotypeSequence incumbent_b = spell_mosaic(model_, MosaicPath{cur_second_});
+    // As a round resolves a local path: an incumbent haplotype is its slot; otherwise a delta from the
+    // same side's incumbent at the one block where they differ, census retained (a promotion).
+    const auto resolve = [&](const std::vector<std::size_t>& path, int side) {
+        if (path == cur_first_) return inc_slot_a_;
+        if (path == cur_second_) return inc_slot_b_;
+        const std::vector<std::size_t>& base_path = side == 0 ? cur_first_ : cur_second_;
+        const HaplotypeSequence& base = side == 0 ? incumbent_a : incumbent_b;
+        std::size_t block = blocks;
+        for (std::size_t b = 0; b < blocks; ++b) {
+            if (path[b] == base_path[b]) continue;
+            if (block != blocks) throw std::invalid_argument("a seeded neighbour differs from its side at two blocks");
+            block = b;
+        }
+        const SequenceInterval span = base.block_intervals[block];
+        BlockDeltaWork local;
+        const std::size_t slot = context->add_repaired_haplotype(
+            side == 0 ? inc_slot_a_ : inc_slot_b_, span.begin, span.end,
+            model_.blocks()[block].alleles[path[block]].sequence, &local, true);
+        if (work != nullptr) {
+            work->origins_reused += local.origins_reused;
+            work->origins_recomputed += local.origins_recomputed;
+            work->physical_origins_constructed += local.physical_origins_constructed;
+            work->seconds += local.seconds;
+        }
+        return slot;
+    };
+    const std::size_t a = resolve(first, 0);
+    const std::size_t b = second == first ? a : resolve(second, 1);
+    return {a, b};
+}
+
+void CoordinateRepairSearch::start_from_slots(const std::vector<std::size_t>& first,
+                                              const std::vector<std::size_t>& second, double total,
+                                              std::size_t slot_first, std::size_t slot_second) {
+    PreparedScoringContext* context = this->context();
+    if (context == nullptr || options_.mode != RepairScoringMode::Delta) {
+        throw std::logic_error("start_from_slots needs a delta search with a context");
+    }
+    if (!context->holds_census(slot_first) || !context->holds_census(slot_second)) {
+        throw std::invalid_argument("a seeded start must hold a census on both haplotypes");
+    }
+    start(first, second, total);
+    inc_slot_a_ = slot_first;
+    inc_slot_b_ = slot_second;
+    role_of_[inc_slot_a_] = inc_slot_a_ == inc_slot_b_ ? "seed_hap1+2" : "seed_hap1";
+    if (inc_slot_b_ != inc_slot_a_) role_of_[inc_slot_b_] = "seed_hap2";
+    have_inc_slots_ = true;
 }
 
 void CoordinateRepairSearch::start(const std::vector<std::size_t>& first, const std::vector<std::size_t>& second,
@@ -361,7 +425,7 @@ bool CoordinateRepairSearch::run(const RepairHooks& hooks) {
     const bool use_delta = options_.mode == RepairScoringMode::Delta;
     const bool planned_cache = options_.planned_cache;
     const std::uint64_t request_order_seed = options_.request_order_seed;
-    PreparedScoringContext* context = context_.get();
+    PreparedScoringContext* context = this->context();
     const std::size_t first_round = options_.first_round;
     const std::size_t final_round = last_round();
     const auto key_of = [](const std::vector<std::size_t>& a, const std::vector<std::size_t>& b) {
@@ -851,7 +915,9 @@ bool CoordinateRepairSearch::run(const RepairHooks& hooks) {
                 keep = {inc_slot_a_, inc_slot_b_};
             }
             snapshot(kind, snapshot_index, "after_promotion", true, false);
-            context->release_transient(keep);
+            std::vector<std::size_t> kept = keep;
+            kept.insert(kept.end(), pinned_.begin(), pinned_.end());
+            context->release_transient(kept);
             for (auto it = role_of_.begin(); it != role_of_.end();) {
                 if (std::find(keep.begin(), keep.end(), it->first) == keep.end()) {
                     it = role_of_.erase(it);
