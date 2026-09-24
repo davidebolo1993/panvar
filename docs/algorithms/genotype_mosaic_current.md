@@ -794,8 +794,10 @@ The 30x footprint blocker below was resolved for the campaign by the 3.5 GiB loc
 
 v1: campaign binary `bc5dd97`, evaluator `11627a2`, package under
 `tests/results/genotype_c4_production_bc5dd97/campaign/package`. v2: tie branch-and-pool at `cc765d8`,
-accepted in review. The active suite is CTest's: 32 tests are registered, 2 of them disabled by default
-(`panvar_real_regressions`, `panvar_rebuild_stats`), so 30 run -- at `cc765d8`, 30/30. Targeted gates that
+accepted in review. Representation guard and downstream schema at `4b14d64`, under review. The active suite
+is CTest's: 33 tests are registered, 2 of them disabled by default (`panvar_real_regressions`,
+`panvar_rebuild_stats`), so 31 run -- at `4b14d64`, 31/31 (at `cc765d8`, before the downstream schema gate
+was registered, 30/30). Targeted gates that
 need the gitignored C4 artifacts run separately and are named with each result
 (`tests/genotype_tie_branching_regressions.sh`, `tests/genotype_production_c4_regressions.sh`,
 `tests/genotype_tie_branch_gate.sh`, `tests/genotype_score_set_gate.sh`).
