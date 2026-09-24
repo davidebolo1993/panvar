@@ -216,6 +216,60 @@ high-excess LOO tie, the 14-branch nested case) whose production outputs must eq
 diagnostics: status, pool, pooled top set member for member and score for score, representative, branch
 endpoints, terminal ties and the unchanged production trajectory.
 
+## Representation-conflict quality guard (2026-09-24)
+
+An annotation of calls, never a calling change: the genotype, its score, the status and call class, phase and
+any branch trajectory are exactly what they are with the guard off (`representation_guard 0`), and a no-call
+is never relabelled. On every call of the production (repair) path, `representation_conflict_rule_v1`
+examines each called block:
+
+1. the marker (k-mer depth) channel's best available allele pair at the block -- emission descending, the
+   first pair in index order on a tie -- and its margin over the called pair, `representation_marker_margin`;
+2. when that margin reaches ln(1000) nats, the competitor: the called diplotype with that pair substituted at
+   the block, in both assignments, scored exactly (from the pool when it is there, else in the live scoring
+   context, outside the pool) and the better by total (ties: fragment term, then exposure term);
+3. the block is `LOWQUAL_REPRESENTATION_CONFLICT` when min(marker margin, the fragment term's preference for
+   the call, the exposure term's preference for the competitor) >= ln(1000) nats: two depth readings -- the
+   marker channel and the likelihood's own exposure term -- against the call, the sequence-placement term
+   alone for it. Otherwise `PASS`; a competitor that cannot be scored gives `NOT_EVALUATED`.
+
+Truth-free and locus-free: no truth, availability floor, donor or block identity enters, and the marker never
+enters the ranking. ln(1000) is the conventional decisive-evidence bound, not a fitted cutoff.
+
+**Measured before integration** (`tests/results/.../v2_representation_guard/`, a ten-cell set; the truth-free
+metrics table and its flags were frozen by SHA-256 before any truth was joined): the rule flags exactly the four
+HG01114 sv:7 blocks (2x, and the tie-branched 5x, 10x and 30x calls; statistics 163.7, 409.3, 792.2 and 2455.3
+nats; each block about 32.6 kb above the floor) and no block of the controls -- two exact LZO calls, an exact
+synthetic mosaic, the floor-attaining HG00514.10. The largest unflagged statistic is 1.46 nats, so the flags are
+identical for any bound in (1.46, 163.7]. The marker channel alone disagrees with exact calls by up to 63 nats
+(the mosaic's sv:3), which is why a marker margin alone is not a rule. Not flagged, as the definition intends:
+HG00512.2 sv:1 (2,034 bp; the marker agrees with the call, the prior decides) and HG00171.2 ctx:10 (13 bp; a
+sequence-only projection difference with no exposure-scale difference).
+
+**Outputs.** `.genotypes.tsv` and `.block_genotypes.tsv` gain `filter`, `filter_reason`,
+`representation_marker_margin`, `representation_competitor_pair`, `representation_fragment_diff`,
+`representation_exposure_diff`, `representation_likelihood_margin`, `representation_conflict_statistic` (on
+the development paths, `NOT_EVALUATED`). The status gains `representation_guard`, `representation_guard_rule`,
+`representation_guard_bound_nats`, `locus_filter` (`PASS`, `LOWQUAL_REPRESENTATION_CONFLICT`, `NOT_EVALUATED`;
+`NA` for a no-call), `lowqual_blocks`, `representation_competitors_scored` and `seconds_representation_guard`.
+An emitted FASTA header carries `locus_filter=`. A LowQual call stays in every all-quality output.
+
+**Downstream.** The campaign classifier decides a call by status and call class, never `repair_converged`
+(false for a tie-branched call), and treats a no-call carrying a locus filter as a defect. The evaluator
+writes each block's `filter` into `.eval.blocks.tsv` and adds `locus_filter`, `lowqual_blocks`,
+`pass_blocks`, `pass_blocks_exact`, `pass_unordered_distance_total`, `pass_availability_floor_total` and
+`pass_excess_over_floor_total` beside the unchanged all-quality totals. The consolidator writes
+`blocks_all_quality.tsv` and `blocks_pass_only.tsv` (PASS-only excludes exactly the flagged blocks) and
+reports `lowqual_calls`, `lowqual_call_rate_given_call`, `block_filter_rate_given_call` and the PASS-only
+excess beside callability and the no-call rate, which the filter never changes.
+
+**Gates.** e2e fixtures (the conflict shape flagged, a marker-only disagreement not; the bound exact and one
+ulp below; assignment order and homologue swap invariant; canonical marker ties);
+`tests/genotype_representation_guard_gate.sh` (three frozen cells through the production path: guard on and
+off give identical pre-filter outputs, the v1-call cells equal their frozen campaign tables, the flags and
+evidence equal the frozen diagnostic, 1/4/8 threads identical, and only graph, reads and library are read);
+`tests/genotype_downstream_schema_gate.sh` (CTest `panvar_genotype_downstream_schema`).
+
 ## Frozen defaults
 
 State limit **256** (production) and **1,024** (diagnostic comparison width) -- counted in allele-prefix
@@ -662,6 +716,27 @@ local artifact and is not tracked in git. Regenerate with `scripts/consolidate_c
 
 ## Current blockers
 
+State as of 2026-09-24:
+
+- **v1 is complete and immutable.** C4 production-v1 (`c4-panel-anchored-v1`, binary `bc5dd97`, evaluator
+  `11627a2`): 484/484 jobs, package `tests/results/genotype_c4_production_bc5dd97/campaign/package`. Its
+  profiles are never edited; nothing reruns it.
+- **v2 improving-move tie branch-and-pool is integrated** at `cc765d8` (see the v2 section above) and was
+  accepted in review. The 2x improving-move-tie blocker recorded below is resolved by it for v2; v1 keeps its
+  `improving_move_tie` no-calls.
+- **Representation-conflict filtering: implemented, under review** (see its section above). A LOO call can be the
+  internally consistent likelihood optimum and still be catastrophically far from the truth, when the panel
+  lacks the truth-like allele (HG01114 sv:7, above). The caller must flag such calls, truth-free, without
+  changing the genotype the likelihood selects.
+
+Later work, not blocking correctness: performance engineering (the per-request merge dominates warm
+branches; lower-complexity placement for 30x large loci), the final v2 C4 campaign, and other loci.
+
+The 30x footprint blocker below was resolved for the campaign by the 3.5 GiB local campaign profile (Sol,
+2026-09-23); the global 2.5 GiB default is unchanged.
+
+### Recorded before 2026-09-23 (historical, kept as measured)
+
 - **The 2.5 GiB footprint limit is marginal at 30x in one process** (production campaign launch blocker).
   The union pass leaves allocator-retained pages that the repair then carries; how many varies run to
   run. NA19240 LOO 30x refused in repair round 3 at 2,684,635,872 bytes in one run and peaked at
@@ -691,6 +766,12 @@ local artifact and is not tracked in git. Regenerate with `scripts/consolidate_c
 
 ## Ordered next work
 
+1. **Done:** the representation-conflict quality guard and the downstream schema (see the section above);
+   under review.
+2. Performance engineering, then the final v2 C4 campaign, then other loci.
+
+### Recorded before 2026-09-23 (historical)
+
 1. Sol's review of this stop point: the panel-anchored production integration, its five regressions, and
    the prepared (not launched) final C4 campaigns.
 2. **Resolved, not pending: beam crowding.** The grouped-prefix proposer made the allele-prefix PAIR the
@@ -710,6 +791,16 @@ local artifact and is not tracked in git. Regenerate with `scripts/consolidate_c
    draw can only consider donors that are forward on both haplotypes, which is what bounds its pool.
 
 ## Provenance
+
+v1: campaign binary `bc5dd97`, evaluator `11627a2`, package under
+`tests/results/genotype_c4_production_bc5dd97/campaign/package`. v2: tie branch-and-pool at `cc765d8`,
+accepted in review. The active suite is CTest's: 32 tests are registered, 2 of them disabled by default
+(`panvar_real_regressions`, `panvar_rebuild_stats`), so 30 run -- at `cc765d8`, 30/30. Targeted gates that
+need the gitignored C4 artifacts run separately and are named with each result
+(`tests/genotype_tie_branching_regressions.sh`, `tests/genotype_production_c4_regressions.sh`,
+`tests/genotype_tie_branch_gate.sh`, `tests/genotype_score_set_gate.sh`).
+
+### Recorded before 2026-09-23 (historical)
 
 Last independently reviewed commit: `2a43fa7` (harness input binding, suite 19/19). The block-consensus
 implementation and the hardened input-bundle binding are under review at this stop point.

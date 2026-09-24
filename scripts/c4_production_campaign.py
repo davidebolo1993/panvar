@@ -291,6 +291,8 @@ def classify(job):
     state = status.get("status", "")
     if state == "RUNNING":
         return "failed", "status still RUNNING"
+    # The final status and call class decide; repair_converged describes the production search alone and stays
+    # false for a tie-branched call (search_conditional tie_branched).
     if state == "COMPLETE":
         if status.get("call_class") != "strict_call":
             return "defect", "COMPLETE without call_class strict_call"
@@ -304,6 +306,9 @@ def classify(job):
             return "defect", "genotype-equivalent call breaks its file contract"
         return "genotype_equivalent_call", status.get("phase_support", "NA")
     reason = status.get("no_call_reason", "NA")
+    # A no-call is its own state: a quality filter belongs to calls only and never relabels one.
+    if status.get("locus_filter", "NA") not in ("NA", ""):
+        return "defect", f"{state} carries locus_filter {status.get('locus_filter')}"
     if exists(".genotypes.tsv") or exists(".block_genotypes.tsv") or exists(".mosaic_haplotypes.fa"):
         return "defect", f"{state} left a genotype table or FASTA"
     if state in ("REPAIR_INCOMPLETE", "RESCORE_INCOMPLETE", "TIME_LIMIT", "RESOURCE_REFUSAL",

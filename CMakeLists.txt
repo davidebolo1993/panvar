@@ -352,6 +352,11 @@ if(PANVAR_BUILD_TESTING)
         add_test(NAME panvar_genotype_production_campaign_plan
                  COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/genotype_production_campaign_gate.sh
                          ${CMAKE_CURRENT_BINARY_DIR}/genotype_production_campaign)
+        # Downstream schema: calls by final status and call class (never repair_converged), the quality filter
+        # on calls only, all-quality and PASS-only block tables, and filter rates apart from callability.
+        add_test(NAME panvar_genotype_downstream_schema
+                 COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/genotype_downstream_schema_gate.sh
+                         ${CMAKE_CURRENT_BINARY_DIR}/genotype_downstream_schema)
 
         # repair-pilot's construction and certification must not depend on candidate order or on which
         # homologue of a seed is written first. Both are checked from the scores its single pass already

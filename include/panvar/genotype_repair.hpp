@@ -454,4 +454,31 @@ struct TieBranchVerdict {
 };
 TieBranchVerdict tie_branch_verdict(bool incomplete, TopSetDecision decision);
 
+
+// ---- representation-conflict quality guard (an annotation; never changes a call) ---------------------------
+// representation_conflict_rule_v1. At one called block, the marker (depth) channel's best available pair is
+// compared with the called pair; when the marker prefers it by at least kRepresentationBoundNats, the called
+// diplotype with that pair substituted at the block is scored exactly in both assignments and the better one
+// by total is the competitor (ties: fragment term, then exposure term -- never input order). The block is
+// LOWQUAL_REPRESENTATION_CONFLICT when min(marker margin, fragment term for the call, exposure term for the
+// competitor) >= the bound: both depth readings against the call, the sequence-placement term alone for it.
+// ln(1000): the conventional decisive evidence bound; the diagnostic flags were unchanged for any bound in
+// (1.46, 163.7] nats. Truth-free, locus-free, and the marker never enters the ranking.
+constexpr double kRepresentationBoundNats = 6.907755278982137;   // ln(1000)
+std::pair<std::size_t, std::size_t> marker_best_pair(const BlockProposalEmissions& emission);
+struct RepresentationAssignment {
+    DiplotypeScore score;
+    double prior = 0.0;
+};
+struct RepresentationEvidence {
+    bool conflict = false;
+    double marker_margin = 0.0;
+    double fragment_diff = 0.0;   // called minus competitor
+    double exposure_diff = 0.0;
+    double likelihood_margin = 0.0;
+    double statistic = 0.0;
+};
+RepresentationEvidence representation_conflict(double marker_margin, const DiplotypeScore& called, double called_prior,
+                                               std::vector<RepresentationAssignment> competitor_assignments);
+
 } // namespace panvar

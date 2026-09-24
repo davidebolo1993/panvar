@@ -622,7 +622,7 @@ int evaluate(const Args& args) {
     table << "scheme\tdonor\tmax_mosaic_candidates\tblock_id\tkind\ttruth1_bp\ttruth2_bp\tcalled1_bp\t"
              "called2_bp\tunordered_distance\tavailability_floor\texcess\ttruth1_available\t"
              "truth2_available\tgenotype_support\tcalled_allele1\tcalled_allele2\ttruth1_closest_allele\t"
-             "truth2_closest_allele\ttruth1_closest_distance\ttruth2_closest_distance\n";
+             "truth2_closest_allele\ttruth1_closest_distance\ttruth2_closest_distance\tfilter\n";
 
     // A genotype-equivalent call emits one unordered genotype shared by its whole top set, and the
     // distances below are unordered per block, so any representative of the set measures it exactly.
@@ -637,6 +637,8 @@ int evaluate(const Args& args) {
     std::vector<std::size_t> hap1;
     std::vector<std::size_t> hap2;
     std::map<std::string, std::string> genotype_support;
+    // The caller's per-block quality filter (PASS / LOWQUAL_*); NA for a run that predates it or a fallback.
+    std::map<std::string, std::string> block_filter;
     const std::string phase_support = status.count("phase_support") ? status.at("phase_support") : "NA";
     // Phase-aware accuracy only where the reads chose the phase: within the candidates, or audited.
     const bool phase_claimed = phase_support == "READS_WITHIN_CANDIDATES" || phase_support == "READS_AUDITED";
@@ -651,6 +653,7 @@ int evaluate(const Args& args) {
     } else if (complete) {
         for (const auto& row : read_table(run + ".block_genotypes.tsv")) {
             genotype_support[row.at("block_id")] = row.at("genotype_support");
+            block_filter[row.at("block_id")] = row.count("filter") ? row.at("filter") : "NA";
         }
         std::string representative;
         for (const auto& row : read_table(run + ".mosaic_scores.tsv")) {
@@ -681,6 +684,13 @@ int evaluate(const Args& args) {
     std::size_t sv_blocks = 0;
     std::size_t all_exact = 0;
     std::size_t undefined_blocks = 0;
+    // PASS-only accuracy: every block the caller did not flag LOWQUAL_*. The all-quality totals above are
+    // unchanged by the filter; only these exclude the flagged blocks.
+    long pass_distance = 0;
+    long pass_floor = 0;
+    std::size_t pass_blocks = 0;
+    std::size_t pass_exact = 0;
+    std::size_t lowqual_blocks = 0;
     std::vector<int> local_best;   // +1 when direct pairing is strictly better, -1 swapped, 0 tie
     for (std::size_t b = 0; b < model.blocks().size(); ++b) {
         const panvar::PreparedGenotypeBlock& block = model.blocks()[b];
@@ -694,7 +704,8 @@ int evaluate(const Args& args) {
             spellable[1] = spellable[1] && t2.has_value();
             table << scheme << '\t' << donor << '\t' << status.at("max_mosaic_candidates") << '\t'
                   << block.block_id << '\t' << (variant ? "SV" : "context")
-                  << "\tNA\tNA\tNA\tNA\tNA\tNA\tNA\tNA\tNA\tNA\tNA\tNA\tNA\tNA\tNA\tNA\n";
+                  << "\tNA\tNA\tNA\tNA\tNA\tNA\tNA\tNA\tNA\tNA\tNA\tNA\tNA\tNA\tNA\tNA\t"
+                  << (block_filter.count(block.block_id) ? block_filter.at(block.block_id) : "NA") << '\n';
             continue;
         }
         bool available1 = false;
@@ -736,6 +747,15 @@ int evaluate(const Args& args) {
                 ++all_exact;
                 if (variant) ++sv_exact;
             }
+            const auto flagged = block_filter.find(block.block_id);
+            if (flagged != block_filter.end() && flagged->second.rfind("LOWQUAL", 0) == 0) {
+                ++lowqual_blocks;
+            } else {
+                ++pass_blocks;
+                pass_distance += unordered;
+                pass_floor += floor;
+                if (unordered == 0) ++pass_exact;
+            }
             called1_bp = std::to_string(c1.size());
             called2_bp = std::to_string(c2.size());
             distance_cell = std::to_string(unordered);
@@ -749,7 +769,8 @@ int evaluate(const Args& args) {
               << (genotype_support.count(block.block_id) ? genotype_support.at(block.block_id) : "NA") << '\t'
               << (complete ? std::to_string(hap1[b]) : std::string("NA")) << '\t'
               << (complete ? std::to_string(hap2[b]) : std::string("NA")) << '\t' << closest1 << '\t' << closest2
-              << '\t' << floor1 << '\t' << floor2 << '\n';
+              << '\t' << floor1 << '\t' << floor2 << '\t'
+              << (block_filter.count(block.block_id) ? block_filter.at(block.block_id) : "NA") << '\n';
     }
 
     // The only no-call: no genotype result exists.
@@ -788,7 +809,13 @@ int evaluate(const Args& args) {
                 << "\nblock_unsupported\t"
                 << std::count_if(genotype_support.begin(), genotype_support.end(),
                                  [](const auto& item) { return item.second != "READS"; })
-                << "\nphase_unsupported\t" << (phase_claimed ? "false" : "true") << '\n';
+                << "\nphase_unsupported\t" << (phase_claimed ? "false" : "true")
+                // The representation filter: all-quality totals are above; these exclude only flagged blocks.
+                << "\nlocus_filter\t" << (use_fallback ? std::string("NA") : status.count("locus_filter") ? status.at("locus_filter") : std::string("NA"))
+                << "\nlowqual_blocks\t" << lowqual_blocks << "\npass_blocks\t" << pass_blocks
+                << "\npass_blocks_exact\t" << pass_exact << "\npass_unordered_distance_total\t" << pass_distance
+                << "\npass_availability_floor_total\t" << pass_floor
+                << "\npass_excess_over_floor_total\t" << pass_distance - pass_floor << '\n';
 
         // The candidate-set diagnostics below read the run's candidate and score tables, which a run that
         // emitted no genotype never writes: a fallback evaluation has no candidate set to describe.
@@ -4826,8 +4853,10 @@ int score_set(const Args& args) {
     const std::string run = args.required("run");
     const double switch_probability = std::stod(args.get("switch-probability", "0.01"));
 
+    const std::string score_curation = args.get("panel-curation", "");
     const LoadedModel loaded =
-        load_model(args.required("model-gfa"), reference, out + ".model.sorted.gfa", 50);
+        load_model(args.required("model-gfa"), reference, out + ".model.sorted.gfa", 50,
+                   score_curation.empty() ? std::vector<std::string>{} : read_panel_curation(score_curation));
     const panvar::PreparedGenotypeModel& model = *loaded.model;
     const std::size_t blocks = model.blocks().size();
     const auto status = read_key_values(run + ".mosaic_status.tsv");
@@ -5758,6 +5787,10 @@ int tie_branch(const Args& args) {
     options.diagnostic_pool_dump = args.get("pool-dump", "0") != "0";
     // v2 production gates: overrides are recorded; the reversal is a test hook, never a setting.
     options.test_reverse_tie_branch_order = args.get("tie-reverse", "0") != "0";
+    if (!args.get("representation-guard", "").empty()) {
+        options.representation_guard = args.get("representation-guard", "") != "0";
+        options.overridden_settings.push_back(std::string("representation_guard=") + (options.representation_guard ? "1" : "0"));
+    }
     for (const char* key : {"repair-max-physical-origins", "repair-tie-max-branches"}) {
         const std::string value = args.get(key, "");
         if (value.empty()) continue;

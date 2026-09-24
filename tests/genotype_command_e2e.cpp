@@ -827,10 +827,27 @@ void require_scope_agrees(const std::string& prefix, const std::string& expected
             prefix + " must report candidate_scope " + expected + ", got " +
                 (status.count("candidate_scope") ? status.at("candidate_scope") : std::string("(absent)")));
     std::size_t checked = 0;
+    std::size_t scope_column = 0;
+    {
+        // By name: the filter columns follow candidate_scope, so it is no longer the last column.
+        std::ifstream header_file(path(prefix + ".block_genotypes.tsv"));
+        std::string header;
+        std::getline(header_file, header);
+        std::stringstream fields(header);
+        std::size_t at = 0;
+        bool found = false;
+        for (std::string cell; std::getline(fields, cell, '\t'); ++at) {
+            if (cell == "candidate_scope") {
+                scope_column = at;
+                found = true;
+            }
+        }
+        require(found, prefix + ".block_genotypes.tsv has no candidate_scope column");
+    }
     for (const auto& row : read_rows(path(prefix + ".block_genotypes.tsv"))) {
         if (row.empty() || row.front() == "block_id") continue;   // header, if read_rows returns one
-        require(row.back() == expected,
-                prefix + " block row " + row.front() + " reports scope " + row.back() +
+        require(row.size() > scope_column && row[scope_column] == expected,
+                prefix + " block row " + row.front() + " reports scope " + row[scope_column] +
                     " while its status reports " + expected);
         ++checked;
     }
@@ -1120,8 +1137,13 @@ void test_candidate_prefixes_match_standalone() {
                 // K = 0 view of a ladder shares the beam its larger prefixes needed, so this column
                 // legitimately differs -- and only this column. Everything else on the row, the
                 // genotype, posterior, GQ and phase, must still match byte for byte.
-                const std::size_t last = line.rfind('\t');
-                if (last != std::string::npos) line = line.substr(0, last);
+                // It is the 15th column; the representation-filter columns follow it and are compared.
+                std::vector<std::string> cells;
+                std::stringstream fields(line);
+                for (std::string cell; std::getline(fields, cell, '\t');) cells.push_back(cell);
+                if (cells.size() > 14) cells.erase(cells.begin() + 14);
+                line.clear();
+                for (std::size_t c = 0; c < cells.size(); ++c) line += (c == 0 ? "" : "\t") + cells[c];
             }
             if (!line.empty() && line[0] == '>') line = line.substr(line.find(' '));   // header names the prefix
             text += line + '\n';
@@ -2252,6 +2274,60 @@ void test_tie_branching_engine() {
                  "and minus one, exceptions, reversed order and tieless splits all behave as contracted\n";
 }
 
+// ---- representation-conflict guard: the rule, at its bound and under every symmetry --------------------
+panvar::DiplotypeScore component_score(double fragment, double exposure) {
+    panvar::DiplotypeScore s;
+    s.fragment_term = fragment;
+    s.exposure_term = exposure;
+    s.log_likelihood = fragment + exposure;
+    s.absolute_term_sum = std::fabs(fragment) + std::fabs(exposure);
+    return s;
+}
+
+void test_representation_guard() {
+    const double B = panvar::kRepresentationBoundNats;
+    require(std::fabs(B - std::log(1000.0)) < 1e-15, "the bound is ln(1000)");
+    // The sv:7 shape: fragments +253 for the call, exposure -164 against it, marker 186 against it.
+    const panvar::DiplotypeScore called = component_score(-30172.49, -2323.65);
+    const panvar::DiplotypeScore comp = component_score(-30425.36, -2159.96);
+    const panvar::RepresentationEvidence sv7 =
+        panvar::representation_conflict(186.3, called, -9.2, {{comp, -45.2}, {comp, -45.6}});
+    require(sv7.conflict && std::fabs(sv7.statistic - 163.69) < 1e-6, "two depth readings against the call: flagged");
+    // The exact-mosaic shape: the marker disagrees by 63 nats, the exposure term does not -- never flagged.
+    require(!panvar::representation_conflict(63.3, component_score(-1000.0, -200.0), 0.0,
+                                             {{component_score(-1032.4, -200.6), -18.2}}).conflict,
+            "a marker disagreement without an exposure-scale difference is not a conflict");
+    // A depth channel that agrees with the call can never flag it, whatever the components.
+    require(!panvar::representation_conflict(0.0, called, -9.2, {{comp, -45.2}}).conflict, "marker margin 0: PASS");
+    // At the bound exactly: flagged; one ulp below on any channel: PASS.
+    const panvar::DiplotypeScore at = component_score(-100.0 + B, -50.0 - B);
+    const panvar::DiplotypeScore rival = component_score(-100.0, -50.0);
+    require(panvar::representation_conflict(B, at, 0.0, {{rival, 0.0}}).conflict, "exactly at the bound: flagged");
+    require(!panvar::representation_conflict(std::nextafter(B, 0.0), at, 0.0, {{rival, 0.0}}).conflict,
+            "one ulp below the bound on the marker: PASS");
+    // Assignment order and homologue swap: the competitor is the better assignment by a total order, so the
+    // order they are offered in, or which homologue carries which allele, cannot change the evidence.
+    const panvar::DiplotypeScore a0 = component_score(-30425.36, -2159.96);
+    const panvar::DiplotypeScore a1 = component_score(-30425.36, -2159.90);   // same total after its prior
+    const panvar::RepresentationEvidence forward = panvar::representation_conflict(186.3, called, -9.2, {{a0, -45.20}, {a1, -45.26}});
+    const panvar::RepresentationEvidence backward = panvar::representation_conflict(186.3, called, -9.2, {{a1, -45.26}, {a0, -45.20}});
+    require(forward.conflict == backward.conflict && forward.statistic == backward.statistic &&
+                forward.exposure_diff == backward.exposure_diff && forward.likelihood_margin == backward.likelihood_margin,
+            "competitor assignment order (and so homologue swap) cannot change the evidence");
+    // The marker-best pair: emission descending, the first in index order on a tie.
+    panvar::BlockProposalEmissions emission;
+    emission.allele_count = 3;
+    emission.log_score.assign(9, -10.0);
+    emission.log_score[0 * 3 + 2] = -1.0;
+    emission.log_score[2 * 3 + 0] = -1.0;
+    emission.log_score[1 * 3 + 2] = -1.0;
+    emission.log_score[2 * 3 + 1] = -1.0;
+    require(panvar::marker_best_pair(emission) == std::make_pair(std::size_t{0}, std::size_t{2}),
+            "a marker tie goes to the first pair in index order");
+    std::cout << "  representation guard: flags the two-depth-readings conflict, not a marker-only disagreement; "
+                 "bound exact and one ulp below; order and homologue swap invariant; marker ties canonical\n";
+}
+
 // ---- panel-anchored adaptive completion, end to end ------------------------------------------------
 panvar::GenotypeCommandOptions repair_options(const std::string& prefix, const std::string& r1,
                                               const std::string& r2, const std::string& gfa) {
@@ -2539,6 +2615,7 @@ int main(int argc, char** argv) {
         test_pooled_decision_rule();
         test_phase_switch_symmetry();
         test_tie_branching_engine();
+        test_representation_guard();
         test_adaptive_completion();
         test_watchdog_and_interruption();
         if (argc >= 3) test_profile(argv[2]);

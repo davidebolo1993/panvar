@@ -8,7 +8,10 @@ under <campaign dir>/package/:
 
     runs.tsv              one row per intended job: outcome, call class, no-call reason, phase support,
                           distance, floor, excess, exact blocks, runtime and memory
-    blocks.tsv            one row per job and block of every CALL (strict or genotype-equivalent)
+    blocks.tsv            one row per job and block of every CALL (strict or genotype-equivalent), every
+                          quality -- the same rows as blocks_all_quality.tsv
+    blocks_all_quality.tsv   every called block, with the caller's per-block filter (PASS / LOWQUAL_*)
+    blocks_pass_only.tsv  the called blocks the caller did not flag; the ONLY place flagged blocks are excluded
     summary.tsv           per experiment and coverage: strict / genotype-equivalent / no-call rates, no-call
                           reasons, exact genotype rate over all intended samples and given a call, exact blocks
                           and SV blocks, total and normalized edit distance, distance above the availability
@@ -18,6 +21,11 @@ under <campaign dir>/package/:
     c4_production_block_distance.png / .pdf   the figure
 
 Called-only accuracy uses calls only. Over-all-intended rates count every no-call as not exact.
+
+A call is decided by the final status and call class (and search_conditional names a tie-branched one), never
+by repair_converged: a tie-branched COMPLETE call keeps the production search's repair_converged false. The
+quality filter never turns a call into a no-call: callability counts every call whatever its filter, and the
+LowQual rate is reported beside it, separately, over calls only.
 """
 import argparse
 import csv
@@ -59,7 +67,7 @@ def distribution(series, prefix):
             f"{prefix}_max": f"{values.max():.6g}"}
 
 
-def consolidate(out):
+def consolidate(out, figure=True):
     package = out / "package"
     package.mkdir(exist_ok=True)
     jobs = pd.read_csv(out / "jobs.tsv", sep="\t", dtype=str)
@@ -88,7 +96,8 @@ def consolidate(out):
                                        "normalized_distance": d / t if t and not np.isnan(d) else np.nan,
                                        "availability_floor": row.availability_floor, "excess": row.excess,
                                        "genotype_support": row.genotype_support,
-                                       "phase_support": status.get("phase_support", "NA")})
+                                       "phase_support": status.get("phase_support", "NA"),
+                                       "filter": getattr(row, "filter", "NA")})
         blocks.extend(block_rows)
         distance = number(summary.get("unordered_distance_total")) if called else np.nan
         reason = status.get("no_call_reason", "NA")
@@ -103,6 +112,11 @@ def consolidate(out):
             "outcome": outcome, "status": status.get("status", "NA"),
             "call_class": status.get("call_class", "NA"), "no_call_reason": reason if outcome == "no_call" else "none",
             "phase_support": status.get("phase_support", "NA") if called else "NA",
+            "search_conditional": status.get("search_conditional", "none"),
+            "locus_filter": status.get("locus_filter", "NA") if called else "NA",
+            "lowqual_blocks": status.get("lowqual_blocks", "NA") if called else "NA",
+            "pass_distance": number(summary.get("pass_unordered_distance_total")) if called else np.nan,
+            "pass_excess": number(summary.get("pass_excess_over_floor_total")) if called else np.nan,
             "final_decision": status.get("final_decision", "NA"), "top_set_size": status.get("top_set_size", "NA"),
             "distance": distance, "floor": number(summary.get("availability_floor_total")),
             "excess": number(summary.get("excess_over_floor_total")) if called else np.nan,
@@ -135,6 +149,9 @@ def consolidate(out):
     blocks = pd.DataFrame(blocks)
     runs.to_csv(package / "runs.tsv", sep="\t", index=False)
     blocks.to_csv(package / "blocks.tsv", sep="\t", index=False)
+    blocks.to_csv(package / "blocks_all_quality.tsv", sep="\t", index=False)
+    lowqual = blocks["filter"].astype(str).str.startswith("LOWQUAL") if not blocks.empty else pd.Series(dtype=bool)
+    (blocks[~lowqual] if not blocks.empty else blocks).to_csv(package / "blocks_pass_only.tsv", sep="\t", index=False)
     pd.DataFrame(fallback).to_csv(package / "fallback_diagnostic.tsv", sep="\t", index=False)
 
     rows = []
@@ -168,13 +185,25 @@ def consolidate(out):
             row["normalized_distance_mean_given_call"] = calls.normalized_distance.mean() if len(calls) else np.nan
             row["excess_total_given_call"] = calls.excess.sum() if len(calls) else np.nan
             row["excess_mean_given_call"] = calls.excess.mean() if len(calls) else np.nan
+            # Quality, reported beside callability and never folded into it.
+            flagged = calls.locus_filter.astype(str).str.startswith("LOWQUAL")
+            row["tie_branched_calls"] = int((calls.search_conditional == "tie_branched").sum())
+            row["lowqual_calls"] = int(flagged.sum())
+            row["lowqual_call_rate_given_call"] = float(flagged.mean()) if len(calls) else np.nan
+            here = blocks[(blocks.experiment == experiment) & (blocks.coverage == coverage)] if not blocks.empty else blocks
+            flagged_blocks = here["filter"].astype(str).str.startswith("LOWQUAL") if not here.empty else pd.Series(dtype=bool)
+            row["called_blocks"] = len(here)
+            row["lowqual_blocks"] = int(flagged_blocks.sum()) if len(here) else 0
+            row["block_filter_rate_given_call"] = float(flagged_blocks.mean()) if len(here) else np.nan
+            row["excess_total_pass_only_given_call"] = calls.pass_excess.sum() if len(calls) else np.nan
             for support in ("READS_WITHIN_CANDIDATES", "PRIOR_ONLY", "UNRESOLVED"):
                 row[f"phase_{support}"] = int((calls.phase_support == support).sum())
             row.update(distribution(part.wall_seconds, "wall_seconds"))
             row.update(distribution(part.peak_footprint_bytes, "peak_footprint_bytes"))
             rows.append(row)
     pd.DataFrame(rows).to_csv(package / "summary.tsv", sep="\t", index=False)
-    plot(runs, blocks, package)
+    if figure:
+        plot(runs, blocks, package)
     print(f"package written to {package}")
 
 
@@ -262,8 +291,9 @@ def plot(runs, blocks, package):
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--out", required=True)
+    parser.add_argument("--no-figure", action="store_true", help="write the tables only")
     args = parser.parse_args()
-    consolidate(pathlib.Path(args.out).resolve())
+    consolidate(pathlib.Path(args.out).resolve(), figure=not args.no_figure)
 
 
 if __name__ == "__main__":

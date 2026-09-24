@@ -116,6 +116,12 @@ struct GenotypeCommandOptions {
     bool repair_tie_branching = false;
     std::size_t repair_tie_max_branches = 16;
     bool test_reverse_tie_branch_order = false;   // gate hook only: the pooled result must not depend on it
+    // Representation-conflict quality guard (an annotation; it never changes a call, a score or a phase).
+    // A called block is LOWQUAL_REPRESENTATION_CONFLICT when the marker (depth) channel prefers another
+    // available pair at that block, and substituting that pair into the call shows the likelihood's exposure
+    // (depth) term preferring it too while its fragment term carries the call -- each by at least
+    // ln(1000) nats. Truth-free and locus-free; see representation_conflict_rule_v1.
+    bool representation_guard = true;
     // Process limits, enforced by a watchdog over the whole run (0: none). Crossing one stops the
     // process at once: committed repair rounds stay as <prefix>.repair_rounds.partial.tsv, the staged
     // graph and every final output are removed, and the status says TIME_LIMIT or RESOURCE_REFUSAL.

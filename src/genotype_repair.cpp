@@ -1481,4 +1481,44 @@ TieBranchVerdict tie_branch_verdict(bool incomplete, TopSetDecision decision) {
     return {"RESCORE_INCOMPLETE", "no_call", "divergent_tie", "tie_branched"};
 }
 
+
+// ---- representation-conflict quality guard -------------------------------------------------------------
+
+std::pair<std::size_t, std::size_t> marker_best_pair(const BlockProposalEmissions& emission) {
+    if (emission.allele_count == 0) throw std::invalid_argument("a block with no allele has no marker pair");
+    std::pair<std::size_t, std::size_t> top{0, 0};
+    double top_value = -std::numeric_limits<double>::infinity();
+    for (std::size_t x = 0; x < emission.allele_count; ++x) {
+        for (std::size_t y = x; y < emission.allele_count; ++y) {
+            if (emission.at(x, y) > top_value) {   // strict: the first pair in index order wins a tie
+                top_value = emission.at(x, y);
+                top = {x, y};
+            }
+        }
+    }
+    return top;
+}
+
+RepresentationEvidence representation_conflict(double marker_margin, const DiplotypeScore& called, double called_prior,
+                                               std::vector<RepresentationAssignment> competitor_assignments) {
+    if (competitor_assignments.empty()) throw std::invalid_argument("a representation competitor needs a scored assignment");
+    std::sort(competitor_assignments.begin(), competitor_assignments.end(),
+              [](const RepresentationAssignment& x, const RepresentationAssignment& y) {
+                  const double tx = x.score.log_likelihood + x.prior;
+                  const double ty = y.score.log_likelihood + y.prior;
+                  if (tx != ty) return tx > ty;
+                  if (x.score.fragment_term != y.score.fragment_term) return x.score.fragment_term > y.score.fragment_term;
+                  return x.score.exposure_term > y.score.exposure_term;
+              });
+    const RepresentationAssignment& best = competitor_assignments.front();
+    RepresentationEvidence out;
+    out.marker_margin = marker_margin;
+    out.fragment_diff = called.fragment_term - best.score.fragment_term;
+    out.exposure_diff = called.exposure_term - best.score.exposure_term;
+    out.likelihood_margin = (called.log_likelihood + called_prior) - (best.score.log_likelihood + best.prior);
+    out.statistic = std::min({marker_margin, out.fragment_diff, -out.exposure_diff});
+    out.conflict = out.statistic >= kRepresentationBoundNats;
+    return out;
+}
+
 } // namespace panvar
