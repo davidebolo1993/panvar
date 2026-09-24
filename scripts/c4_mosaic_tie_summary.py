@@ -44,14 +44,17 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--campaign", required=True)
     parser.add_argument("--out", required=True)
+    parser.add_argument("--experiment", default="mosaic")
     args = parser.parse_args()
     campaign, out = pathlib.Path(args.campaign), pathlib.Path(args.out)
     ledger = list(csv.DictReader(open(campaign / "completeness.tsv"), delimiter="\t"))
     rows = []
     for entry in sorted(ledger, key=lambda r: r["job"]):
-        if not (entry["campaign"] == "mosaic" and entry["outcome"] == "no_call"):
+        if not (entry["campaign"] == args.experiment and entry["outcome"] == "no_call"):
             continue
         d = out / entry["job"]
+        if not d.is_dir():
+            continue   # only the cells this diagnostic ran
         if entry["detail"] == "rescore_incomplete":
             entry = dict(entry, detail="union_scoring_cap")   # the ledger's name for the pre-repair union-cap refusal
         diag = kv(d / "call.diag.status.tsv")
@@ -95,7 +98,7 @@ def main():
         top = d / "call.diag.pooled_top.tsv"
         if top.exists():
             rows[-1]["pooled_top_from"] = ",".join(sorted({r["scored_in"].split("_")[0] for r in csv.DictReader(open(top), delimiter="\t")}))
-    with open(out / "mosaic_no_call_diagnostic.tsv", "w") as handle:
+    with open(out / f"{args.experiment}_no_call_diagnostic.tsv", "w") as handle:
         writer = csv.DictWriter(handle, fieldnames=list(rows[0]), delimiter="\t", lineterminator="\n")
         writer.writeheader()
         writer.writerows(rows)
