@@ -95,6 +95,25 @@ def main():
             if entry["detail"] == "union_scoring_cap" else "",
             "union_cap_rerun_overrides": rerun.get("settings_overridden_after_profile", "") if entry["detail"] == "union_scoring_cap" else "",
         })
+        # Phase-switch symmetry of each two-way tie whose branches both ran (written by builds from 648476c on).
+        sym_path = d / "call.diag.symmetry.tsv"
+        sym = list(csv.DictReader(open(sym_path), delimiter="\t")) if sym_path.exists() else None
+        rows[-1].update({
+            "tied_pair_total_difference": (abs(float(first[0]["total"]) - float(first[1]["total"]))
+                                           if len(first) == 2 else "NA"),
+            "symmetry_ties_checked": len(sym) if sym is not None else "NA",
+            "symmetry_tied_pair_bit_identical": ",".join(r["tied_pair_bit_identical"] for r in sym) if sym else "NA",
+            "symmetry_bit_exact_equivalent": ",".join(r["equivalent"] for r in sym) if sym else "NA",
+            "symmetry_bit_first_break": ";".join(f"r{r['first_break_round']}:{r['first_break']}" for r in sym) if sym else "NA",
+            "symmetry_numeric_equivalent": ",".join(r["numerically_equivalent"] for r in sym)
+            if sym and "numerically_equivalent" in sym[0] else "NA",
+            "symmetry_numeric_first_break": ";".join(f"r{r['numeric_first_break_round']}:{r['numeric_first_break']}" for r in sym)
+            if sym and "numerically_equivalent" in sym[0] else "NA",
+            "symmetry_max_difference_over_bound": max((float(r["max_difference_over_bound"]) for r in sym
+                                                       if r.get("max_difference_over_bound", "NA") != "NA"), default="NA")
+            if sym and "max_difference_over_bound" in sym[0] else "NA",
+            "symmetry_depths": " | ".join(r["depths"] for r in sym) if sym else "NA",
+        })
         top = d / "call.diag.pooled_top.tsv"
         if top.exists():
             rows[-1]["pooled_top_from"] = ",".join(sorted({r["scored_in"].split("_")[0] for r in csv.DictReader(open(top), delimiter="\t")}))
@@ -105,7 +124,8 @@ def main():
     for row in rows:
         print("\t".join(str(row[k]) for k in ("job", "original_refusal", "tied_neighbours", "tied_distinct_genotypes",
                                                 "branches_run", "pooled_top_size", "pooled_top_genotypes",
-                                                "diagnostic_outcome", "distance", "floor", "excess")))
+                                                "diagnostic_outcome", "distance", "floor", "excess",
+                                                "symmetry_numeric_equivalent")))
 
 
 if __name__ == "__main__":
