@@ -125,6 +125,20 @@ struct GenotypeCommandOptions {
     // path after this many committed repair rounds that moved, so the interruption contract -- partial
     // rounds kept, no final output, TIME_LIMIT -- is testable deterministically. 0: never.
     std::size_t test_interrupt_after_repair_rounds = 0;
+
+    // ---- DIAGNOSTIC ONLY (v2/post-hoc): improving-move-tie branching. Not a command-line option, off by
+    // default, and never part of a call. When on, a run that stops on an improving-move tie first writes
+    // every production output exactly as it would otherwise; only then does it reconstruct the terminal
+    // tied round, repair from every tied best neighbour on its own branch, pool every scored candidate
+    // and rank the pool with the production rule. Everything it finds goes to <prefix>.diag.* files, and
+    // its outcome is DIAGNOSTIC_UNIQUE, DIAGNOSTIC_GENOTYPE_EQUIVALENT, DIAGNOSTIC_DIVERGENT or
+    // DIAGNOSTIC_INCOMPLETE -- a conditional diagnostic over a pruned search, not a certified call.
+    bool diagnostic_tie_branching = false;
+    std::size_t diagnostic_max_branches = 16;          // branches started, nested ties included
+    double diagnostic_time_limit_seconds = 3600.0;     // wall spent in the diagnostic, checked per round
+    std::uint64_t diagnostic_footprint_limit_bytes = 3758096384ULL;   // checked per round
+    std::uint64_t diagnostic_max_total_physical_origins = 19600000000ULL;   // over every branch
+    bool diagnostic_reverse_branch_order = false;      // gate hook: the result must not depend on it
 };
 
 // A run that cannot complete emits its diagnostics and says so. It never presents a partial ranking

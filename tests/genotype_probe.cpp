@@ -742,7 +742,9 @@ int evaluate(const Args& args) {
 
     // The only no-call: no genotype result exists.
     summary << "run_no_call\t" << (complete ? "false" : "true") << '\n';
-    summary << "evaluated_diplotype\t" << (use_fallback ? "diagnostic_fallback_not_a_call" : "the_run_call") << '\n';
+    summary << "evaluated_diplotype\t"
+            << (use_fallback ? args.get("evaluated-label", "diagnostic_fallback_not_a_call") : std::string("the_run_call"))
+            << '\n';
     summary << "blocks\t" << model.blocks().size() << "\nsv_blocks\t" << sv_blocks
             << "\nundefined_truth_blocks\t" << undefined_blocks
             << "\nblocks_with_both_truth_alleles_available\t" << blocks_with_both_available
@@ -5479,6 +5481,44 @@ int genotype(const Args& args) {
     return 0;
 }
 
+// ------------------------------------------------------------------------------------------------
+// tie-branch: DIAGNOSTIC ONLY (v2/post-hoc). The production call under a profile, with the improving-move-tie
+// branching diagnostic switched on. Production outputs are written exactly as the plain call writes them;
+// the diagnostic adds <out-prefix>.diag.* files. Truth is never an input here: evaluate separately.
+int tie_branch(const Args& args) {
+    panvar::GenotypeCommandOptions options;
+    panvar::apply_genotype_profile(args.required("profile"), options);
+    options.threads = std::stoul(args.required("threads"));
+    options.overridden_settings.push_back("threads=" + std::to_string(options.threads));
+    options.gfa_path = args.required("gfa");
+    options.reference_path = args.required("reference");
+    options.reads1_path = args.required("reads1");
+    options.reads2_path = args.required("reads2");
+    options.library_path = args.required("library");
+    options.curation_manifest_path = args.get("panel-curation", "");
+    options.out_prefix = args.required("out-prefix");
+    options.quiet = true;
+    options.diagnostic_tie_branching = args.get("diagnostic", "1") != "0";
+    options.diagnostic_max_branches = std::stoul(args.get("max-branches", "16"));
+    options.diagnostic_time_limit_seconds = std::stod(args.get("diagnostic-time-limit-seconds", "3600"));
+    options.diagnostic_footprint_limit_bytes = std::stoull(args.get("diagnostic-footprint-limit-bytes", "3758096384"));
+    options.diagnostic_max_total_physical_origins =
+        std::stoull(args.get("diagnostic-max-total-physical-origins", "19600000000"));
+    options.diagnostic_reverse_branch_order = args.get("reverse-branches", "0") != "0";
+    // EXPERIMENT ONLY: a higher union physical-origin cap for one diagnosed refusal. Recorded as an override;
+    // no profile or default moves.
+    if (!args.get("union-max-physical-origins", "").empty()) {
+        options.max_physical_origins = std::stoull(args.get("union-max-physical-origins", ""));
+        options.overridden_settings.push_back("max_physical_origins=" + std::to_string(options.max_physical_origins));
+    }
+    const panvar::GenotypeRunStatus status = panvar::run_genotype(options);
+    const auto diag = read_key_values(options.out_prefix + ".diag.status.tsv");
+    std::cout << "tie-branch " << options.out_prefix << ": production " << panvar::genotype_run_status_name(status)
+              << ", diagnostic " << (diag.count("state") ? diag.at("state") : std::string("not run")) << ' '
+              << (diag.count("decision") ? diag.at("decision") : std::string("")) << '\n';
+    return 0;
+}
+
 int main(int argc, char** argv) {
     try {
         if (argc < 2) {
@@ -5507,6 +5547,7 @@ int main(int argc, char** argv) {
         if (command == "score-set") return score_set(args);
         if (command == "repair-search") return repair_search(args);
         if (command == "window-bench") return window_bench(args);
+        if (command == "tie-branch") return tie_branch(args);
         std::cerr << "unknown probe command: " << command << '\n';
         return 2;
     } catch (const std::exception& error) {
