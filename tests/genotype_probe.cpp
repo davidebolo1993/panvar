@@ -684,13 +684,18 @@ int evaluate(const Args& args) {
     std::size_t sv_blocks = 0;
     std::size_t all_exact = 0;
     std::size_t undefined_blocks = 0;
-    // PASS-only accuracy: every block the caller did not flag LOWQUAL_*. The all-quality totals above are
-    // unchanged by the filter; only these exclude the flagged blocks.
+    // Fail closed: representation-PASS accuracy counts only blocks whose filter is exactly PASS -- never
+    // NOT_EVALUATED or NA. High quality is PASS AND read-supported. The all-quality totals above are unchanged.
     long pass_distance = 0;
     long pass_floor = 0;
     std::size_t pass_blocks = 0;
     std::size_t pass_exact = 0;
     std::size_t lowqual_blocks = 0;
+    std::size_t not_evaluated_blocks = 0;
+    long high_quality_distance = 0;
+    long high_quality_floor = 0;
+    std::size_t high_quality_blocks = 0;
+    std::size_t high_quality_exact = 0;
     std::vector<int> local_best;   // +1 when direct pairing is strictly better, -1 swapped, 0 tie
     for (std::size_t b = 0; b < model.blocks().size(); ++b) {
         const panvar::PreparedGenotypeBlock& block = model.blocks()[b];
@@ -748,13 +753,22 @@ int evaluate(const Args& args) {
                 if (variant) ++sv_exact;
             }
             const auto flagged = block_filter.find(block.block_id);
-            if (flagged != block_filter.end() && flagged->second.rfind("LOWQUAL", 0) == 0) {
+            const std::string filter = flagged == block_filter.end() ? std::string("NA") : flagged->second;
+            if (filter.rfind("LOWQUAL", 0) == 0) {
                 ++lowqual_blocks;
+            } else if (filter != "PASS") {
+                ++not_evaluated_blocks;
             } else {
                 ++pass_blocks;
                 pass_distance += unordered;
                 pass_floor += floor;
                 if (unordered == 0) ++pass_exact;
+                if (support != genotype_support.end() && support->second == "READS") {
+                    ++high_quality_blocks;
+                    high_quality_distance += unordered;
+                    high_quality_floor += floor;
+                    if (unordered == 0) ++high_quality_exact;
+                }
             }
             called1_bp = std::to_string(c1.size());
             called2_bp = std::to_string(c2.size());
@@ -812,10 +826,17 @@ int evaluate(const Args& args) {
                 << "\nphase_unsupported\t" << (phase_claimed ? "false" : "true")
                 // The representation filter: all-quality totals are above; these exclude only flagged blocks.
                 << "\nlocus_filter\t" << (use_fallback ? std::string("NA") : status.count("locus_filter") ? status.at("locus_filter") : std::string("NA"))
-                << "\nlowqual_blocks\t" << lowqual_blocks << "\npass_blocks\t" << pass_blocks
+                << "\nrepresentation_guard_complete\t"
+                << (use_fallback ? std::string("NA") : status.count("representation_guard_complete") ? status.at("representation_guard_complete") : std::string("NA"))
+                << "\nlowqual_blocks\t" << lowqual_blocks << "\nnot_evaluated_blocks\t" << not_evaluated_blocks
+                << "\npass_blocks\t" << pass_blocks
                 << "\npass_blocks_exact\t" << pass_exact << "\npass_unordered_distance_total\t" << pass_distance
                 << "\npass_availability_floor_total\t" << pass_floor
-                << "\npass_excess_over_floor_total\t" << pass_distance - pass_floor << '\n';
+                << "\npass_excess_over_floor_total\t" << pass_distance - pass_floor
+                << "\nhigh_quality_blocks\t" << high_quality_blocks << "\nhigh_quality_blocks_exact\t" << high_quality_exact
+                << "\nhigh_quality_unordered_distance_total\t" << high_quality_distance
+                << "\nhigh_quality_availability_floor_total\t" << high_quality_floor
+                << "\nhigh_quality_excess_over_floor_total\t" << high_quality_distance - high_quality_floor << '\n';
 
         // The candidate-set diagnostics below read the run's candidate and score tables, which a run that
         // emitted no genotype never writes: a fallback evaluation has no candidate set to describe.
@@ -5787,6 +5808,15 @@ int tie_branch(const Args& args) {
     options.diagnostic_pool_dump = args.get("pool-dump", "0") != "0";
     // v2 production gates: overrides are recorded; the reversal is a test hook, never a setting.
     options.test_reverse_tie_branch_order = args.get("tie-reverse", "0") != "0";
+    // Gate hooks for the outside-pool guard path; recorded as overrides.
+    if (args.get("representation-guard-force-context", "0") != "0") {
+        options.test_representation_guard_force_context = true;
+        options.overridden_settings.push_back("test_representation_guard_force_context=1");
+    }
+    if (!args.get("representation-guard-bound", "").empty()) {
+        options.test_representation_guard_bound_nats = std::stod(args.get("representation-guard-bound", ""));
+        options.overridden_settings.push_back("test_representation_guard_bound_nats=" + args.get("representation-guard-bound", ""));
+    }
     if (!args.get("representation-guard", "").empty()) {
         options.representation_guard = args.get("representation-guard", "") != "0";
         options.overridden_settings.push_back(std::string("representation_guard=") + (options.representation_guard ? "1" : "0"));

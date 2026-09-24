@@ -219,9 +219,11 @@ endpoints, terminal ties and the unchanged production trajectory.
 ## Representation-conflict quality guard (2026-09-24)
 
 An annotation of calls, never a calling change: the genotype, its score, the status and call class, phase and
-any branch trajectory are exactly what they are with the guard off (`representation_guard 0`), and a no-call
-is never relabelled. On every call of the production (repair) path, `representation_conflict_rule_v1`
-examines each called block:
+any branch trajectory are exactly what they are with the guard off, and a no-call is never relabelled. It is
+off by default and bound explicitly by the v3 profiles (`profiles/genotype_c4_v3.tsv`,
+`profiles/genotype_c4_v3_campaign_local.tsv`: each its v2 profile plus exactly `representation_guard 1`), so
+the immutable v1 and v2 profiles run as they were accepted; the final C4 campaign uses v3. On every call of
+the production (repair) path, `representation_conflict_rule_v1` examines each called block:
 
 1. the marker (k-mer depth) channel's best available allele pair at the block -- emission descending, the
    first pair in index order on a tie -- and its margin over the called pair, `representation_marker_margin`;
@@ -231,10 +233,21 @@ examines each called block:
 3. the block is `LOWQUAL_REPRESENTATION_CONFLICT` when min(marker margin, the fragment term's preference for
    the call, the exposure term's preference for the competitor) >= ln(1000) nats: two depth readings -- the
    marker channel and the likelihood's own exposure term -- against the call, the sequence-placement term
-   alone for it. Otherwise `PASS`; a competitor that cannot be scored gives `NOT_EVALUATED`.
+   alone for it. Otherwise `PASS`; a competitor that cannot be scored (a cap, an exception) gives
+   `NOT_EVALUATED`, never `PASS`.
+
+**Fail closed.** The locus filter is `LOWQUAL_REPRESENTATION_CONFLICT` if any block is flagged; otherwise
+`NOT_EVALUATED` if any block did not complete the rule; `PASS` only when every block completed it and passed.
+`representation_guard_complete` and `not_evaluated_blocks` keep both facts when a flag and an unevaluated
+block coexist. The guard's own scoring is reported apart (`representation_guard_physical_origins`,
+`representation_competitors_scored`) and the cumulative repair counters and margins are refreshed after it,
+so the caps bind it with everything else.
 
 Truth-free and locus-free: no truth, availability floor, donor or block identity enters, and the marker never
-enters the ranking. ln(1000) is the conventional decisive-evidence bound, not a fitted cutoff.
+enters the ranking. **ln(1000) is a declared conservative threshold for a heuristic conflict statistic, not a
+calibrated Bayes factor**: the marker depth and the exposure term are correlated evidence derived from the same
+reads, and nothing here is calibrated across loci. What was observed is a broad separation on the C4
+diagnostic set (below), not independence or calibration.
 
 **Measured before integration** (`tests/results/.../v2_representation_guard/`, a ten-cell set; the truth-free
 metrics table and its flags were frozen by SHA-256 before any truth was joined): the rule flags exactly the four
@@ -246,29 +259,46 @@ identical for any bound in (1.46, 163.7]. The marker channel alone disagrees wit
 HG00512.2 sv:1 (2,034 bp; the marker agrees with the call, the prior decides) and HG00171.2 ctx:10 (13 bp; a
 sequence-only projection difference with no exposure-scale difference).
 
+**Representation-PASS is not high quality.** A PASS block has no certified depth-versus-sequence conflict; it
+can still be wrong. HG00512.2 sv:1 stays a 2,034 bp error under PASS, because the marker channel agrees with
+the call and the prior decides it at 2x -- expected under this rule, which is not a general error detector.
+Downstream therefore keeps three block tables: `blocks_all_quality.tsv` (every called block),
+`blocks_pass_only.tsv` (filter exactly `PASS`) and `blocks_high_quality.tsv` (`PASS` and genotype support
+`READS`), each with its denominator and retained fraction. The final "high-quality" plot uses the third;
+representation-PASS stays separately available. None of the three is calibrated accuracy.
+
 **Outputs.** `.genotypes.tsv` and `.block_genotypes.tsv` gain `filter`, `filter_reason`,
 `representation_marker_margin`, `representation_competitor_pair`, `representation_fragment_diff`,
 `representation_exposure_diff`, `representation_likelihood_margin`, `representation_conflict_statistic` (on
 the development paths, `NOT_EVALUATED`). The status gains `representation_guard`, `representation_guard_rule`,
 `representation_guard_bound_nats`, `locus_filter` (`PASS`, `LOWQUAL_REPRESENTATION_CONFLICT`, `NOT_EVALUATED`;
-`NA` for a no-call), `lowqual_blocks`, `representation_competitors_scored` and `seconds_representation_guard`.
+`NA` for a no-call), `lowqual_blocks`, `not_evaluated_blocks`, `representation_guard_complete`,
+`representation_competitors_scored`, `representation_guard_physical_origins` and
+`seconds_representation_guard`.
 An emitted FASTA header carries `locus_filter=`. A LowQual call stays in every all-quality output.
 
 **Downstream.** The campaign classifier decides a call by status and call class, never `repair_converged`
 (false for a tie-branched call), and treats a no-call carrying a locus filter as a defect. The evaluator
 writes each block's `filter` into `.eval.blocks.tsv` and adds `locus_filter`, `lowqual_blocks`,
-`pass_blocks`, `pass_blocks_exact`, `pass_unordered_distance_total`, `pass_availability_floor_total` and
-`pass_excess_over_floor_total` beside the unchanged all-quality totals. The consolidator writes
-`blocks_all_quality.tsv` and `blocks_pass_only.tsv` (PASS-only excludes exactly the flagged blocks) and
-reports `lowqual_calls`, `lowqual_call_rate_given_call`, `block_filter_rate_given_call` and the PASS-only
-excess beside callability and the no-call rate, which the filter never changes.
+`representation_guard_complete`, `not_evaluated_blocks`, the PASS-only totals (`pass_blocks`,
+`pass_blocks_exact`, `pass_unordered_distance_total`, `pass_availability_floor_total`,
+`pass_excess_over_floor_total`: filter exactly PASS) and the high-quality totals (`high_quality_*`: PASS and
+READS) beside the unchanged all-quality totals. The consolidator writes the three block tables and reports
+`lowqual_calls`, `not_evaluated_calls` and their rates, block filter and NOT_EVALUATED rates, the three
+tables' denominators and retained fractions, and the PASS-only and high-quality excess -- all beside
+callability and the no-call rate, which no filter changes.
 
 **Gates.** e2e fixtures (the conflict shape flagged, a marker-only disagreement not; the bound exact and one
 ulp below; assignment order and homologue swap invariant; canonical marker ties);
 `tests/genotype_representation_guard_gate.sh` (three frozen cells through the production path: guard on and
 off give identical pre-filter outputs, the v1-call cells equal their frozen campaign tables, the flags and
 evidence equal the frozen diagnostic, 1/4/8 threads identical, and only graph, reads and library are read);
-`tests/genotype_downstream_schema_gate.sh` (CTest `panvar_genotype_downstream_schema`).
+`tests/genotype_downstream_schema_gate.sh` (CTest `panvar_genotype_downstream_schema`: NOT_EVALUATED and NA
+never PASS, high quality needs READS, every rate apart); the outside-pool fixture in the command e2e (gate hooks
+force every competitor into the live context: call and ranking unchanged, evidence equal to the pool's, guard
+work reconciled exactly with the cumulative counters, the cumulative cap exact and one below -- the refused
+block NOT_EVALUATED beside the flagged ones, the genotype untouched -- and 1/4/8 threads); and the campaign
+gate's profile checks (v3 = v2 plus exactly the guard; v1 and v2 never set it).
 
 ## Frozen defaults
 
@@ -724,13 +754,17 @@ State as of 2026-09-24:
 - **v2 improving-move tie branch-and-pool is integrated** at `cc765d8` (see the v2 section above) and was
   accepted in review. The 2x improving-move-tie blocker recorded below is resolved by it for v2; v1 keeps its
   `improving_move_tie` no-calls.
-- **Representation-conflict filtering: implemented, under review** (see its section above). A LOO call can be the
+- **Representation-conflict filtering: accepted scientifically**, with a fail-closed and schema correction (see its
+  section above). A LOO call can be the
   internally consistent likelihood optimum and still be catastrophically far from the truth, when the panel
   lacks the truth-like allele (HG01114 sv:7, above). The caller must flag such calls, truth-free, without
   changing the genotype the likelihood selects.
 
+- **Remaining correctness item: the ten non-tie no-calls** of v1 (seven union-scoring-cap refusals at 30x,
+  three repair round caps still improving at round 11), to be resolved with bounded representative diagnostics.
+
 Later work, not blocking correctness: performance engineering (the per-request merge dominates warm
-branches; lower-complexity placement for 30x large loci), the final v2 C4 campaign, and other loci.
+branches; lower-complexity placement for 30x large loci), the final C4 v3 campaign, and other loci.
 
 The 30x footprint blocker below was resolved for the campaign by the 3.5 GiB local campaign profile (Sol,
 2026-09-23); the global 2.5 GiB default is unchanged.
@@ -766,9 +800,14 @@ The 30x footprint blocker below was resolved for the campaign by the 3.5 GiB loc
 
 ## Ordered next work
 
-1. **Done:** the representation-conflict quality guard and the downstream schema (see the section above);
-   under review.
-2. Performance engineering, then the final v2 C4 campaign, then other loci.
+1. The fail-closed and schema correction of the representation guard (this batch).
+2. Resolve the ten non-tie no-calls with bounded representative diagnostics: seven union-scoring-cap
+   refusals and three repair round caps (`scripts/c4_non_tie_no_call_inventory.py`; cheapest representatives
+   `loo.NA19434.30` and `loo.HG02282.2`, not yet run).
+3. Major speed engineering.
+4. One final C4 v3 campaign.
+5. Final all-quality, representation-PASS and high-quality plots.
+6. Other loci.
 
 ### Recorded before 2026-09-23 (historical)
 

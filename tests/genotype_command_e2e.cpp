@@ -2380,6 +2380,140 @@ void require_truth_genotype(const panvar::GenotypeCommandOptions& options, const
     }
 }
 
+// ---- the representation guard's outside-pool path, end to end on the tiny locus ------------------------
+// Gate hooks score every marker competitor in the live context (never from the pool) and accept any margin,
+// so the path Sol asked to see is exercised on a cheap locus. The hooks also flag every scored block, which is
+// what lets the cap-minus-one case keep a LowQual and an unevaluated block side by side.
+std::vector<std::string> guard_prefilter(const std::string& prefix) {
+    std::vector<std::string> out;
+    for (const char* table : {".genotypes.tsv", ".block_genotypes.tsv"}) {
+        for (const auto& row : read_rows(path(prefix + table))) {
+            std::string line;
+            for (std::size_t c = 0; c + 8 < row.size(); ++c) line += row[c] + '\t';
+            out.push_back(line);
+        }
+    }
+    for (const char* table : {".mosaic_candidates.tsv", ".mosaic_scores.tsv", ".equivalence_set.tsv", ".repair_rounds.tsv"}) {
+        for (const auto& row : read_rows(path(prefix + table))) {
+            std::string line;
+            for (std::size_t c = 0; c < row.size() && (std::string(table) != ".repair_rounds.tsv" || c < 28); ++c) line += row[c] + '\t';
+            out.push_back(line);
+        }
+    }
+    std::ifstream fasta(path(prefix + ".mosaic_haplotypes.fa"));
+    for (std::string line; std::getline(fasta, line);) {
+        if (!line.empty() && line[0] != '>') out.push_back(line);
+    }
+    // The status apart from timing, process gauges, the guard's own keys and the cumulative repair work,
+    // which legitimately includes the guard's scoring when it is on.
+    for (const auto& [key, value] : read_status(path(prefix + ".mosaic_status.tsv"))) {
+        static const std::vector<std::string> skip = {"seconds_", "resources_", "threads_", "representation_",
+                                                      "locus_filter", "lowqual_blocks", "not_evaluated_blocks",
+                                                      "repair_cumulative_", "repair_margin_", "repair_origin_cache_bytes_end",
+                                                      "settings_overridden", "phys_", "rss_", "emission_cache_",
+                                                      "scorer_",
+                                                      // the declared cap itself, which the cap cases set
+                                                      "repair_max_physical_origins"};
+        bool skipped = false;
+        for (const std::string& prefix_key : skip) skipped = skipped || key.rfind(prefix_key, 0) == 0;
+        if (!skipped) out.push_back(key + "=" + value);
+    }
+    return out;
+}
+
+std::vector<std::string> guard_filters(const std::string& prefix) {
+    std::vector<std::string> out;
+    for (const auto& row : read_rows(path(prefix + ".block_genotypes.tsv"))) {
+        std::string line = row[0];
+        for (std::size_t c = row.size() - 8; c < row.size(); ++c) line += '\t' + row[c];
+        out.push_back(line);
+    }
+    return out;
+}
+
+void test_representation_guard_outside_pool() {
+    const std::string r1 = path("phaseable_r1.fq");
+    const std::string r2 = path("phaseable_r2.fq");
+    const auto options_for = [&](const std::string& name, bool guard, bool force, std::size_t threads) {
+        panvar::GenotypeCommandOptions o = repair_options(name, r1, r2, "tiny_phaseable.gfa");
+        o.max_mosaic_candidates = 0;
+        o.threads = threads;
+        o.representation_guard = guard;
+        o.test_representation_guard_force_context = force;
+        if (guard) {
+            o.test_representation_guard_bound_nats = -std::numeric_limits<double>::max();
+            o.test_representation_guard_runner_up = true;   // the marker agrees here: take its runner-up
+        }
+        return o;
+    };
+    const auto status_of = [&](const std::string& name) { return read_status(path(name + ".mosaic_status.tsv")); };
+    require(panvar::run_genotype(options_for("guard_off", false, false, 2)) == panvar::GenotypeRunStatus::Complete,
+            "fixture: the guard-off run calls");
+    require(panvar::run_genotype(options_for("guard_pool", true, false, 2)) == panvar::GenotypeRunStatus::Complete &&
+                panvar::run_genotype(options_for("guard_ctx", true, true, 2)) == panvar::GenotypeRunStatus::Complete,
+            "the guard never changes the call status");
+    const auto off = status_of("guard_off");
+    const auto pooled_run = status_of("guard_pool");
+    const auto ctx = status_of("guard_ctx");
+    const std::size_t scored = std::stoul(ctx.at("representation_competitors_scored"));
+    require(scored > 0, "the fixture must reach the outside-pool path (competitors scored in the live context)");
+    require(guard_prefilter("guard_ctx") == guard_prefilter("guard_off") &&
+                guard_prefilter("guard_pool") == guard_prefilter("guard_off"),
+            "call, ranking, tables and FASTA are identical with the guard on (pool or live context) and off");
+    require(guard_filters("guard_ctx") == guard_filters("guard_pool"),
+            "a competitor scored outside the pool carries exactly the evidence the pool holds for it");
+    // The guard's own work reconciles exactly with the refreshed cumulative counters.
+    const std::uint64_t guard_work = std::stoull(ctx.at("representation_guard_physical_origins"));
+    const std::uint64_t total_on = std::stoull(ctx.at("repair_cumulative_physical_origins"));
+    const std::uint64_t total_off = std::stoull(off.at("repair_cumulative_physical_origins"));
+    require(guard_work > 0 && total_on == total_off + guard_work,
+            "cumulative physical origins = production work + the guard's reported work, exactly");
+    require(std::stoull(pooled_run.at("representation_guard_physical_origins")) == 0 &&
+                pooled_run.at("repair_cumulative_physical_origins") == off.at("repair_cumulative_physical_origins"),
+            "competitors held in the pool cost no scoring");
+    require(ctx.at("representation_guard_complete") == "true" && ctx.at("not_evaluated_blocks") == "none",
+            "every block completed the rule");
+    // Exact-cap admission, then one below: the guard's last scoring is refused -> NOT_EVALUATED, never PASS,
+    // and the genotype untouched; the flags the guard did reach are kept beside it.
+    panvar::GenotypeCommandOptions exact = options_for("guard_cap_exact", true, true, 2);
+    exact.repair_max_physical_origins = total_on;
+    require(panvar::run_genotype(exact) == panvar::GenotypeRunStatus::Complete &&
+                guard_filters("guard_cap_exact") == guard_filters("guard_ctx") &&
+                status_of("guard_cap_exact").at("representation_guard_complete") == "true",
+            "at exactly the cumulative cap the guard completes with the same evidence");
+    panvar::GenotypeCommandOptions short_by_one = options_for("guard_cap_minus1", true, true, 2);
+    short_by_one.repair_max_physical_origins = total_on - 1;
+    require(panvar::run_genotype(short_by_one) == panvar::GenotypeRunStatus::Complete,
+            "a guard refusal never changes the call status");
+    const auto minus = status_of("guard_cap_minus1");
+    require(minus.at("representation_guard_complete") == "false" && minus.at("not_evaluated_blocks") != "none",
+            "one origin short: a block is NOT_EVALUATED and the guard is marked incomplete");
+    require(minus.at("locus_filter") != "PASS", "an incomplete guard is never PASS");
+    bool unevaluated_row = false;
+    for (const std::string& line : guard_filters("guard_cap_minus1")) {
+        require(line.find("\tPASS\t") == std::string::npos || line.find("NOT_EVALUATED") == std::string::npos,
+                "a row is never both");
+        unevaluated_row = unevaluated_row || line.find("\tNOT_EVALUATED\tcompetitor_not_scored") != std::string::npos;
+    }
+    require(unevaluated_row, "the refused block says why");
+    require(guard_prefilter("guard_cap_minus1") == guard_prefilter("guard_off"),
+            "a guard scoring refusal leaves the genotype, ranking, tables and FASTA exactly as they were");
+    if (minus.at("lowqual_blocks") != "none") {
+        require(minus.at("locus_filter") == "LOWQUAL_REPRESENTATION_CONFLICT",
+                "a flag and an unevaluated block coexist: the locus is LowQual and the guard is incomplete");
+    }
+    // Thread count cannot change the filter.
+    for (const std::size_t threads : {std::size_t{1}, std::size_t{4}, std::size_t{8}}) {
+        const std::string name = "guard_ctx_t" + std::to_string(threads);
+        require(panvar::run_genotype(options_for(name, true, true, threads)) == panvar::GenotypeRunStatus::Complete &&
+                    guard_filters(name) == guard_filters("guard_ctx"),
+                "the filter is identical at " + std::to_string(threads) + " threads");
+    }
+    std::cout << "  representation guard outside the pool: " << scored << " competitors scored in the live context, "
+              << "call and ranking unchanged, evidence equal to the pool's, " << guard_work
+              << " guard origins reconciled, cap exact / minus one (NOT_EVALUATED, never PASS), 1/4/8 threads\n";
+}
+
 void test_adaptive_completion() {
     const std::string r1 = path("phaseable_r1.fq");
     const std::string r2 = path("phaseable_r2.fq");
@@ -2617,6 +2751,7 @@ int main(int argc, char** argv) {
         test_tie_branching_engine();
         test_representation_guard();
         test_adaptive_completion();
+        test_representation_guard_outside_pool();
         test_watchdog_and_interruption();
         if (argc >= 3) test_profile(argv[2]);
         std::cout << "genotype command end-to-end: PASS\n";

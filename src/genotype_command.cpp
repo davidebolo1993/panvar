@@ -447,7 +447,10 @@ struct RepairReport {
     // The representation-conflict guard, over the called blocks (NA for a no-call: never relabelled LowQual).
     std::string locus_filter = "NA";
     std::string lowqual_blocks = "none";
+    std::string not_evaluated_blocks = "none";
+    std::string representation_guard_complete = "NA";   // NA for a no-call: the guard never runs on one
     std::size_t representation_competitors_scored = 0;
+    std::uint64_t representation_guard_physical_origins = 0;
     double seconds_representation_guard = 0.0;
     // strict_call, genotype_equivalent_call or no_call, and why a no-call is one. Reporting only.
     std::string call_class = "no_call";
@@ -490,8 +493,10 @@ void write_repair_report(std::ostream& out, const RepairReport& r) {
         << r.tie_digest_memo_misses << '\n';
     out << "representation_guard\t" << (o.representation_guard ? "true" : "false") << "\nrepresentation_guard_rule\t"
         << kRepresentationRule << "\nrepresentation_guard_bound_nats\t" << kRepresentationBoundNats << "\nlocus_filter\t"
-        << r.locus_filter << "\nlowqual_blocks\t" << r.lowqual_blocks << "\nrepresentation_competitors_scored\t"
-        << r.representation_competitors_scored << '\n';
+        << r.locus_filter << "\nlowqual_blocks\t" << r.lowqual_blocks << "\nnot_evaluated_blocks\t"
+        << r.not_evaluated_blocks << "\nrepresentation_guard_complete\t" << r.representation_guard_complete
+        << "\nrepresentation_competitors_scored\t" << r.representation_competitors_scored
+        << "\nrepresentation_guard_physical_origins\t" << r.representation_guard_physical_origins << '\n';
     out << "union_ranking_status\t" << r.union_status << "\nunion_winner_set_size\t" << r.union_winner_set
         << "\nunion_certified_gap\t" << r.union_certified_gap << "\nunion_top_score\t" << r.union_top_score
         << "\nunion_top_hap1\t" << r.union_top_hap1 << "\nunion_top_hap2\t" << r.union_top_hap2 << '\n';
@@ -2942,14 +2947,22 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
         std::vector<BlockFilter> block_filter(block_count);
         {
             const Clock::time_point guard_mark = Clock::now();
-            const double bound = kRepresentationBoundNats;
+            const double bound = std::isnan(options.test_representation_guard_bound_nats)
+                                      ? kRepresentationBoundNats
+                                      : options.test_representation_guard_bound_nats;
             PreparedScoringContext* guard_context = search ? search->context() : nullptr;
+            const std::uint64_t guard_origins_before =
+                guard_context != nullptr ? guard_context->cumulative_counters().physical_origins : 0;
             const std::vector<double> guard_switches(block_count - 1, options.switch_probability);
             for (std::size_t b = 0; b < block_count && options.representation_guard; ++b) {
                 BlockFilter& bf = block_filter[b];
                 const BlockProposalEmissions& emission = emissions.blocks[b];
                 const auto pair = std::minmax(called.first[b], called.second[b]);
-                const std::pair<std::size_t, std::size_t> top = marker_best_pair(emission);
+                std::pair<std::size_t, std::size_t> top = marker_best_pair(emission);
+                if (options.test_representation_guard_runner_up && top == std::make_pair(pair.first, pair.second) &&
+                    emission.allele_count > 1) {
+                    top = marker_best_pair(emission, top);
+                }
                 bf.marker_margin = emission.at(top.first, top.second) - emission.at(pair.first, pair.second);
                 if (top == std::make_pair(pair.first, pair.second) || !(bf.marker_margin >= bound)) continue;
                 bf.competitor = std::to_string(top.first) + "/" + std::to_string(top.second);
@@ -2963,7 +2976,9 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
                     second[b] = assignment == 0 ? top.second : top.first;
                     DiplotypeScore score;
                     double prior = 0.0;
-                    const auto held = pool_at.find(diplotype_identity(first, second));
+                    const auto held = options.test_representation_guard_force_context
+                                          ? pool_at.end()
+                                          : pool_at.find(diplotype_identity(first, second));
                     if (held != pool_at.end()) {
                         score = pool[held->second].candidate.score;
                         prior = pool[held->second].candidate.sequence_prior;
@@ -2993,7 +3008,7 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
                     continue;
                 }
                 const RepresentationEvidence evidence =
-                    representation_conflict(bf.marker_margin, called.score, called.sequence_prior, assignments);
+                    representation_conflict(bf.marker_margin, called.score, called.sequence_prior, assignments, bound);
                 bf.fragment_diff = evidence.fragment_diff;
                 bf.exposure_diff = evidence.exposure_diff;
                 bf.likelihood_margin = evidence.likelihood_margin;
@@ -3003,19 +3018,40 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
                     bf.reason = "marker_and_exposure_prefer_competitor_fragment_term_prefers_call";
                 }
             }
-            report.locus_filter = options.representation_guard ? "PASS" : "NOT_EVALUATED";
-            report.lowqual_blocks = "none";
-            for (std::size_t b = 0; b < block_count; ++b) {
-                if (block_filter[b].filter != "LOWQUAL_REPRESENTATION_CONFLICT") continue;
-                report.locus_filter = "LOWQUAL_REPRESENTATION_CONFLICT";
-                report.lowqual_blocks = (report.lowqual_blocks == "none" ? std::string() : report.lowqual_blocks + ",") +
-                                        model.blocks()[b].block_id;
-            }
             if (!options.representation_guard) {
                 for (BlockFilter& bf : block_filter) {
                     bf.filter = "NOT_EVALUATED";
                     bf.reason = "guard_off";
                 }
+            }
+            // Fail closed: PASS only when every block completed the rule and passed. A flag wins the locus;
+            // otherwise any unevaluated block makes it NOT_EVALUATED. Both facts are kept when they coexist.
+            report.lowqual_blocks = "none";
+            report.not_evaluated_blocks = "none";
+            bool any_lowqual = false;
+            bool any_unevaluated = false;
+            for (std::size_t b = 0; b < block_count; ++b) {
+                const std::string& id = model.blocks()[b].block_id;
+                if (block_filter[b].filter == "LOWQUAL_REPRESENTATION_CONFLICT") {
+                    any_lowqual = true;
+                    report.lowqual_blocks = (report.lowqual_blocks == "none" ? std::string() : report.lowqual_blocks + ",") + id;
+                } else if (block_filter[b].filter != "PASS") {
+                    any_unevaluated = true;
+                    report.not_evaluated_blocks =
+                        (report.not_evaluated_blocks == "none" ? std::string() : report.not_evaluated_blocks + ",") + id;
+                }
+            }
+            report.locus_filter = any_lowqual       ? "LOWQUAL_REPRESENTATION_CONFLICT"
+                                  : any_unevaluated ? "NOT_EVALUATED"
+                                                    : "PASS";
+            report.representation_guard_complete = any_unevaluated ? "false" : "true";
+            // The guard's own scoring, reported apart, and the cumulative repair counters refreshed so the
+            // reported totals and margins include it (the caps bind it with everything else).
+            if (guard_context != nullptr) {
+                report.representation_guard_physical_origins =
+                    guard_context->cumulative_counters().physical_origins - guard_origins_before;
+                report.cumulative = guard_context->cumulative_counters();
+                report.origin_cache_bytes_end = guard_context->origin_cache_bytes();
             }
             report.seconds_representation_guard = seconds_since(guard_mark);
         }

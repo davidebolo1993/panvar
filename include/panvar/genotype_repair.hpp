@@ -462,10 +462,15 @@ TieBranchVerdict tie_branch_verdict(bool incomplete, TopSetDecision decision);
 // by total is the competitor (ties: fragment term, then exposure term -- never input order). The block is
 // LOWQUAL_REPRESENTATION_CONFLICT when min(marker margin, fragment term for the call, exposure term for the
 // competitor) >= the bound: both depth readings against the call, the sequence-placement term alone for it.
-// ln(1000): the conventional decisive evidence bound; the diagnostic flags were unchanged for any bound in
+// ln(1000) is a DECLARED conservative threshold for this heuristic conflict statistic, not a calibrated Bayes
+// factor: the marker depth and the exposure term are correlated evidence from the same reads, and nothing
+// here is calibrated across loci. On the C4 diagnostic set the flags were unchanged for any threshold in
 // (1.46, 163.7] nats. Truth-free, locus-free, and the marker never enters the ranking.
 constexpr double kRepresentationBoundNats = 6.907755278982137;   // ln(1000)
 std::pair<std::size_t, std::size_t> marker_best_pair(const BlockProposalEmissions& emission);
+// The best pair other than `excluded` (a gate hook's runner-up competitor), by the same order.
+std::pair<std::size_t, std::size_t> marker_best_pair(const BlockProposalEmissions& emission,
+                                                     std::pair<std::size_t, std::size_t> excluded);
 struct RepresentationAssignment {
     DiplotypeScore score;
     double prior = 0.0;
@@ -479,6 +484,7 @@ struct RepresentationEvidence {
     double statistic = 0.0;
 };
 RepresentationEvidence representation_conflict(double marker_margin, const DiplotypeScore& called, double called_prior,
-                                               std::vector<RepresentationAssignment> competitor_assignments);
+                                               std::vector<RepresentationAssignment> competitor_assignments,
+                                               double bound = kRepresentationBoundNats);
 
 } // namespace panvar

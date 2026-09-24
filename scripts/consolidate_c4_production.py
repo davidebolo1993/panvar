@@ -10,8 +10,12 @@ under <campaign dir>/package/:
                           distance, floor, excess, exact blocks, runtime and memory
     blocks.tsv            one row per job and block of every CALL (strict or genotype-equivalent), every
                           quality -- the same rows as blocks_all_quality.tsv
-    blocks_all_quality.tsv   every called block, with the caller's per-block filter (PASS / LOWQUAL_*)
-    blocks_pass_only.tsv  the called blocks the caller did not flag; the ONLY place flagged blocks are excluded
+    blocks_all_quality.tsv   every called block, with the caller's per-block filter (PASS / LOWQUAL_* /
+                          NOT_EVALUATED / NA)
+    blocks_pass_only.tsv  representation-PASS: the called blocks whose filter is exactly PASS (fail closed:
+                          NOT_EVALUATED and NA are not PASS)
+    blocks_high_quality.tsv   representation-PASS AND genotype_support READS. Not calibrated accuracy: a PASS block
+                          can still be wrong where both channels agree with the call (HG00512.2 sv:1)
     summary.tsv           per experiment and coverage: strict / genotype-equivalent / no-call rates, no-call
                           reasons, exact genotype rate over all intended samples and given a call, exact blocks
                           and SV blocks, total and normalized edit distance, distance above the availability
@@ -25,7 +29,8 @@ Called-only accuracy uses calls only. Over-all-intended rates count every no-cal
 A call is decided by the final status and call class (and search_conditional names a tie-branched one), never
 by repair_converged: a tie-branched COMPLETE call keeps the production search's repair_converged false. The
 quality filter never turns a call into a no-call: callability counts every call whatever its filter, and the
-LowQual rate is reported beside it, separately, over calls only.
+LowQual rate is reported beside it, separately, over calls only, and so is the NOT_EVALUATED rate; each of
+the three block tables reports its denominator and the fraction of called blocks it retains.
 """
 import argparse
 import csv
@@ -115,8 +120,11 @@ def consolidate(out, figure=True):
             "search_conditional": status.get("search_conditional", "none"),
             "locus_filter": status.get("locus_filter", "NA") if called else "NA",
             "lowqual_blocks": status.get("lowqual_blocks", "NA") if called else "NA",
+            "not_evaluated_blocks": status.get("not_evaluated_blocks", "NA") if called else "NA",
+            "representation_guard_complete": status.get("representation_guard_complete", "NA") if called else "NA",
             "pass_distance": number(summary.get("pass_unordered_distance_total")) if called else np.nan,
             "pass_excess": number(summary.get("pass_excess_over_floor_total")) if called else np.nan,
+            "high_quality_excess": number(summary.get("high_quality_excess_over_floor_total")) if called else np.nan,
             "final_decision": status.get("final_decision", "NA"), "top_set_size": status.get("top_set_size", "NA"),
             "distance": distance, "floor": number(summary.get("availability_floor_total")),
             "excess": number(summary.get("excess_over_floor_total")) if called else np.nan,
@@ -150,8 +158,11 @@ def consolidate(out, figure=True):
     runs.to_csv(package / "runs.tsv", sep="\t", index=False)
     blocks.to_csv(package / "blocks.tsv", sep="\t", index=False)
     blocks.to_csv(package / "blocks_all_quality.tsv", sep="\t", index=False)
-    lowqual = blocks["filter"].astype(str).str.startswith("LOWQUAL") if not blocks.empty else pd.Series(dtype=bool)
-    (blocks[~lowqual] if not blocks.empty else blocks).to_csv(package / "blocks_pass_only.tsv", sep="\t", index=False)
+    passing = (blocks["filter"].astype(str) == "PASS") if not blocks.empty else pd.Series(dtype=bool)
+    reads = (blocks["genotype_support"].astype(str) == "READS") if not blocks.empty else pd.Series(dtype=bool)
+    (blocks[passing] if not blocks.empty else blocks).to_csv(package / "blocks_pass_only.tsv", sep="\t", index=False)
+    (blocks[passing & reads] if not blocks.empty else blocks).to_csv(package / "blocks_high_quality.tsv", sep="\t",
+                                                                      index=False)
     pd.DataFrame(fallback).to_csv(package / "fallback_diagnostic.tsv", sep="\t", index=False)
 
     rows = []
@@ -192,10 +203,26 @@ def consolidate(out, figure=True):
             row["lowqual_call_rate_given_call"] = float(flagged.mean()) if len(calls) else np.nan
             here = blocks[(blocks.experiment == experiment) & (blocks.coverage == coverage)] if not blocks.empty else blocks
             flagged_blocks = here["filter"].astype(str).str.startswith("LOWQUAL") if not here.empty else pd.Series(dtype=bool)
+            unevaluated = calls.locus_filter.astype(str) == "NOT_EVALUATED"
+            row["not_evaluated_calls"] = int(unevaluated.sum())
+            row["not_evaluated_call_rate_given_call"] = float(unevaluated.mean()) if len(calls) else np.nan
             row["called_blocks"] = len(here)
             row["lowqual_blocks"] = int(flagged_blocks.sum()) if len(here) else 0
             row["block_filter_rate_given_call"] = float(flagged_blocks.mean()) if len(here) else np.nan
+            filters = here["filter"].astype(str) if len(here) else pd.Series(dtype=str)
+            not_evaluated = ~filters.isin(["PASS"]) & ~filters.str.startswith("LOWQUAL") if len(here) else pd.Series(dtype=bool)
+            row["not_evaluated_blocks"] = int(not_evaluated.sum()) if len(here) else 0
+            row["not_evaluated_block_rate_given_call"] = float(not_evaluated.mean()) if len(here) else np.nan
+            # The three block tables, each with its denominator (called blocks) and retained fraction.
+            pass_here = filters == "PASS" if len(here) else pd.Series(dtype=bool)
+            high_here = pass_here & (here["genotype_support"].astype(str) == "READS") if len(here) else pd.Series(dtype=bool)
+            row["all_quality_blocks"] = len(here)
+            row["representation_pass_blocks"] = int(pass_here.sum()) if len(here) else 0
+            row["representation_pass_fraction"] = float(pass_here.mean()) if len(here) else np.nan
+            row["high_quality_blocks"] = int(high_here.sum()) if len(here) else 0
+            row["high_quality_fraction"] = float(high_here.mean()) if len(here) else np.nan
             row["excess_total_pass_only_given_call"] = calls.pass_excess.sum() if len(calls) else np.nan
+            row["excess_total_high_quality_given_call"] = calls.high_quality_excess.sum() if len(calls) else np.nan
             for support in ("READS_WITHIN_CANDIDATES", "PRIOR_ONLY", "UNRESOLVED"):
                 row[f"phase_{support}"] = int((calls.phase_support == support).sum())
             row.update(distribution(part.wall_seconds, "wall_seconds"))

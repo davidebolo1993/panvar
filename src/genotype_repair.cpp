@@ -1499,8 +1499,28 @@ std::pair<std::size_t, std::size_t> marker_best_pair(const BlockProposalEmission
     return top;
 }
 
+std::pair<std::size_t, std::size_t> marker_best_pair(const BlockProposalEmissions& emission,
+                                                     std::pair<std::size_t, std::size_t> excluded) {
+    std::pair<std::size_t, std::size_t> top{0, 0};
+    double top_value = -std::numeric_limits<double>::infinity();
+    bool found = false;
+    for (std::size_t x = 0; x < emission.allele_count; ++x) {
+        for (std::size_t y = x; y < emission.allele_count; ++y) {
+            if (std::make_pair(x, y) == excluded) continue;
+            if (!found || emission.at(x, y) > top_value) {
+                top_value = emission.at(x, y);
+                top = {x, y};
+                found = true;
+            }
+        }
+    }
+    if (!found) throw std::invalid_argument("a block with one allele pair has no runner-up");
+    return top;
+}
+
 RepresentationEvidence representation_conflict(double marker_margin, const DiplotypeScore& called, double called_prior,
-                                               std::vector<RepresentationAssignment> competitor_assignments) {
+                                               std::vector<RepresentationAssignment> competitor_assignments,
+                                               double bound) {
     if (competitor_assignments.empty()) throw std::invalid_argument("a representation competitor needs a scored assignment");
     std::sort(competitor_assignments.begin(), competitor_assignments.end(),
               [](const RepresentationAssignment& x, const RepresentationAssignment& y) {
@@ -1517,7 +1537,7 @@ RepresentationEvidence representation_conflict(double marker_margin, const Diplo
     out.exposure_diff = called.exposure_term - best.score.exposure_term;
     out.likelihood_margin = (called.log_likelihood + called_prior) - (best.score.log_likelihood + best.prior);
     out.statistic = std::min({marker_margin, out.fragment_diff, -out.exposure_diff});
-    out.conflict = out.statistic >= kRepresentationBoundNats;
+    out.conflict = out.statistic >= bound;
     return out;
 }
 

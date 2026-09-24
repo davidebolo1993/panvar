@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # The representation-conflict guard (representation_conflict_rule_v1) on three frozen C4 cells, through the
-# production path (v2 profile).
+# production path (v3 profile, which binds the guard; --representation-guard 0 turns it off).
 #
 #   tests/genotype_representation_guard_gate.sh <build dir> <campaign dir> <diagnostics_v2 dir> <out dir>
 #
@@ -17,7 +17,7 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BUILD="${1:?usage: genotype_representation_guard_gate.sh <build> <campaign> <diagnostics_v2> <out>}"
 CAMPAIGN="${2:?}"; DIAG="${3:?}"; OUT="${4:?}"
 PROBE="$BUILD/genotype_probe"
-PROFILE="$REPO/profiles/genotype_c4_v2_campaign_local.tsv"
+PROFILE="$REPO/profiles/genotype_c4_v3_campaign_local.tsv"
 REF='HG00096#1#haplotype1-0000024:31848049-32074186'
 FROZEN="$(dirname "$DIAG")/v2_representation_guard/truth_free_flags.tsv"
 mkdir -p "$OUT"
@@ -42,7 +42,7 @@ prefilter() {   # every output apart from the guard's own columns, keys and FAST
   cut -f1-28 "$p.repair_rounds.tsv"
   [ -f "$p.mosaic_haplotypes.fa" ] && sed -e 's/ locus_filter=[A-Z_]*//' -e 's/^>[^ ]*_hap/>hap/' "$p.mosaic_haplotypes.fa"
   [ -f "$p.tie_branches.tsv" ] && cut -f1-13 "$p.tie_branches.tsv"
-  grep -vE '^(seconds_|resources_|threads_|phys_footprint|rss_|emission_cache_dp_hits|emission_cache_dp_misses|emission_cache_executed_dps|scorer_|representation_|locus_filter|lowqual_blocks|settings_overridden|sha256_)' "$p.mosaic_status.tsv"
+  grep -vE '^(seconds_|resources_|threads_|phys_footprint|rss_|emission_cache_dp_hits|emission_cache_dp_misses|emission_cache_executed_dps|scorer_|representation_|locus_filter|lowqual_blocks|not_evaluated_blocks|settings_overridden|sha256_)' "$p.mosaic_status.tsv"
 }
 filters() { awk -F'\t' 'NR>1{print $1"\t"$(NF-7)"\t"$(NF-6)"\t"$(NF-5)"\t"$(NF-4)"\t"$(NF-3)"\t"$(NF-2)"\t"$(NF-1)"\t"$NF}' "$1.block_genotypes.tsv"; }
 evidence() {   # <run prefix> <block>: filter, marker margin, fragment diff, exposure diff, to one decimal
@@ -84,6 +84,10 @@ same "HG01114.5 sv:7 evidence = the frozen diagnostic's" "$(evidence "$OUT/h5_on
 same "HG01114.5 is still a tie-branched call" "$(key search_conditional "$OUT/h5_on8/call.mosaic_status.tsv")/$(key call_class "$OUT/h5_on8/call.mosaic_status.tsv")" "tie_branched/genotype_equivalent_call"
 same "LZO control: every block PASS" "$(filters "$OUT/lzo_on8/call" | cut -f2 | sort -u | tr '\n' ' ')" "PASS "
 same "LZO control locus filter" "$(key locus_filter "$OUT/lzo_on8/call.mosaic_status.tsv")" "PASS"
+for name in h2_on8 lzo_on8 h5_on8; do
+  same "$name: every block completed the rule" "$(key representation_guard_complete "$OUT/$name/call.mosaic_status.tsv")/$(key not_evaluated_blocks "$OUT/$name/call.mosaic_status.tsv")" "true/none"
+done
+same "guard off: the locus is NOT_EVALUATED and incomplete, never PASS" "$(key locus_filter "$OUT/h2_off8/call.mosaic_status.tsv")/$(key representation_guard_complete "$OUT/h2_off8/call.mosaic_status.tsv")" "NOT_EVALUATED/false"
 same "the FASTA records the locus filter" "$(grep -c 'locus_filter=PASS' "$OUT/lzo_on8/call.mosaic_haplotypes.fa")" "2"
 
 echo "== 3. thread invariance"

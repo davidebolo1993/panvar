@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <string>
 #include <utility>
 #include <vector>
@@ -119,9 +120,16 @@ struct GenotypeCommandOptions {
     // Representation-conflict quality guard (an annotation; it never changes a call, a score or a phase).
     // A called block is LOWQUAL_REPRESENTATION_CONFLICT when the marker (depth) channel prefers another
     // available pair at that block, and substituting that pair into the call shows the likelihood's exposure
-    // (depth) term preferring it too while its fragment term carries the call -- each by at least
-    // ln(1000) nats. Truth-free and locus-free; see representation_conflict_rule_v1.
-    bool representation_guard = true;
+    // (depth) term preferring it too while its fragment term carries the call -- each by at least the
+    // declared threshold. Truth-free and locus-free; see representation_conflict_rule_v1. Off by default: it is
+    // bound explicitly by the v3 profiles, so the v1 and v2 profiles run as they were accepted.
+    bool representation_guard = false;
+    // Gate hooks only, never settings: score every competitor in the live context even when the pool holds
+    // it (the outside-pool path), and replace the declared threshold (NaN: kRepresentationBoundNats).
+    bool test_representation_guard_force_context = false;
+    double test_representation_guard_bound_nats = std::numeric_limits<double>::quiet_NaN();
+    // Gate hook: where the marker's best pair is the called pair, take the best other pair as the competitor.
+    bool test_representation_guard_runner_up = false;
     // Process limits, enforced by a watchdog over the whole run (0: none). Crossing one stops the
     // process at once: committed repair rounds stay as <prefix>.repair_rounds.partial.tsv, the staged
     // graph and every final output are removed, and the status says TIME_LIMIT or RESOURCE_REFUSAL.

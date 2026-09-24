@@ -37,6 +37,15 @@ for v in genotype_c4 genotype_c4_campaign_local; do
   same "$v v2 = v1 apart from tie branching" "$(diff <(v2 "$REPO/profiles/$v.tsv") <(v2 "$REPO/profiles/${v/genotype_c4/genotype_c4_v2}.tsv") > /dev/null && echo identical || echo DIFFERS)" "identical"
   same "$v v2 enables tie branching" "$(grep -c -E '^(repair_tie_branching'$'\t''1|repair_tie_max_branches'$'\t''16)$' "$REPO/profiles/${v/genotype_c4/genotype_c4_v2}.tsv")" "2"
 done
+# The v3 profiles are their v2 profiles, key for key, plus exactly representation_guard 1; v1 and v2 never set it.
+v3() { grep -v '^#' "$1" | grep -v -E '^(profile|representation_guard)'$'\t' | sort; }
+for v in genotype_c4 genotype_c4_campaign_local; do
+  v2p="$REPO/profiles/${v/genotype_c4/genotype_c4_v2}.tsv"; v3p="$REPO/profiles/${v/genotype_c4/genotype_c4_v3}.tsv"
+  same "$v v3 = v2 apart from the guard" "$(diff <(v3 "$v2p") <(v3 "$v3p") > /dev/null && echo identical || echo DIFFERS)" "identical"
+  same "$v v3 binds the guard" "$(grep -c -E '^representation_guard'$'\t''1$' "$v3p")" "1"
+  same "$v v3 names itself v3" "$(awk -F'\t' '$1=="profile"{print $2}' "$v3p")" "$(awk -F'\t' '$1=="profile"{print $2}' "$v2p" | sed 's/-v2/-v3/')"
+  same "$v v1 and v2 never set the guard" "$(cat "$REPO/profiles/$v.tsv" "$v2p" | grep -c '^representation_guard')" "0"
+done
 bash "$REPO/tests/genotype_production_c4_campaign.sh" launch /nonexistent "$WORK/plan" > "$WORK/launch.log" 2>&1
 same "launch without approval" "$?" "2"
 same "nothing launched" "$(find "$WORK/plan" -name '*.mosaic_status.tsv' | wc -l | tr -d ' ')" "0"
