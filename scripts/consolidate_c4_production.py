@@ -215,10 +215,14 @@ def plot(runs, blocks, package):
                     x = i + offset + rng.uniform(-0.1, 0.1, size=len(y))
                     axis.scatter(x, y, s=7, marker=symbol, color=colour[kind], alpha=0.55, linewidths=0)
         axis.set_title(title)
-        ticks = [0, 1, 10, 100, 1000, 10000]
+        # The axis reaches the largest distance in ANY panel, so no block falls off the top unseen and the
+        # three experiments share one scale.
+        largest = pd.to_numeric(blocks.unordered_distance, errors="coerce").max() if not blocks.empty else 0
+        top = max(20000.0, float(largest) if largest == largest else 0.0)
+        ticks = [t for t in (0, 1, 10, 100, 1000, 10000, 100000, 1000000) if t <= top * 10]
         axis.set_yticks(np.log10(np.array(ticks) + 1.0))
-        axis.set_yticklabels([str(t) for t in ticks])
-        axis.set_ylim(-0.15, np.log10(20001))
+        axis.set_yticklabels([f"{t:,}" for t in ticks])
+        axis.set_ylim(-0.15, np.log10(top + 1.0) + 0.12)
         if column == 0:
             axis.set_ylabel("phase-invariant block distance from truth (bp, log)")
         plt.setp(axis.get_xticklabels(), visible=False)
