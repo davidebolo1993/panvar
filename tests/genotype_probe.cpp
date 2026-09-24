@@ -349,22 +349,27 @@ long edit_distance(const std::string& a, const std::string& b, long bound = -1) 
 
 // The availability floor for one truth sequence: the closest allele the model offers at this block.
 long closest_allele_distance(const std::string& truth, const panvar::PreparedGenotypeBlock& block,
-                             bool& exactly_available) {
-    std::vector<const std::string*> alleles;
-    for (const auto& allele : block.alleles) alleles.push_back(&allele.sequence);
-    std::sort(alleles.begin(), alleles.end(), [&](const std::string* lhs, const std::string* rhs) {
-        const long dl = std::labs(static_cast<long>(lhs->size()) - static_cast<long>(truth.size()));
-        const long dr = std::labs(static_cast<long>(rhs->size()) - static_cast<long>(truth.size()));
+                             bool& exactly_available, std::size_t* closest = nullptr) {
+    std::vector<std::size_t> alleles(block.alleles.size());
+    for (std::size_t a = 0; a < alleles.size(); ++a) alleles[a] = a;
+    // stable: equal length gaps keep allele order, so the closest allele reported is deterministic
+    std::stable_sort(alleles.begin(), alleles.end(), [&](std::size_t lhs, std::size_t rhs) {
+        const long dl = std::labs(static_cast<long>(block.alleles[lhs].sequence.size()) - static_cast<long>(truth.size()));
+        const long dr = std::labs(static_cast<long>(block.alleles[rhs].sequence.size()) - static_cast<long>(truth.size()));
         return dl < dr;
     });
     long best = -1;
     exactly_available = false;
-    for (const std::string* allele : alleles) {
+    for (const std::size_t index : alleles) {
+        const std::string* allele = &block.alleles[index].sequence;
         const long length_gap =
             std::labs(static_cast<long>(allele->size()) - static_cast<long>(truth.size()));
         if (best >= 0 && length_gap >= best) break;   // length difference bounds edit distance below
         const long distance = edit_distance(truth, *allele, best < 0 ? -1 : best - 1);
-        if (distance >= 0 && (best < 0 || distance < best)) best = distance;
+        if (distance >= 0 && (best < 0 || distance < best)) {
+            best = distance;
+            if (closest != nullptr) *closest = index;
+        }
         if (best == 0) {
             exactly_available = true;
             break;
@@ -616,7 +621,8 @@ int evaluate(const Args& args) {
     std::ofstream table(out + ".blocks.tsv");
     table << "scheme\tdonor\tmax_mosaic_candidates\tblock_id\tkind\ttruth1_bp\ttruth2_bp\tcalled1_bp\t"
              "called2_bp\tunordered_distance\tavailability_floor\texcess\ttruth1_available\t"
-             "truth2_available\tgenotype_support\n";
+             "truth2_available\tgenotype_support\tcalled_allele1\tcalled_allele2\ttruth1_closest_allele\t"
+             "truth2_closest_allele\ttruth1_closest_distance\ttruth2_closest_distance\n";
 
     // A genotype-equivalent call emits one unordered genotype shared by its whole top set, and the
     // distances below are unordered per block, so any representative of the set measures it exactly.
@@ -688,13 +694,16 @@ int evaluate(const Args& args) {
             spellable[1] = spellable[1] && t2.has_value();
             table << scheme << '\t' << donor << '\t' << status.at("max_mosaic_candidates") << '\t'
                   << block.block_id << '\t' << (variant ? "SV" : "context")
-                  << "\tNA\tNA\tNA\tNA\tNA\tNA\tNA\tNA\tNA\tNA\n";
+                  << "\tNA\tNA\tNA\tNA\tNA\tNA\tNA\tNA\tNA\tNA\tNA\tNA\tNA\tNA\tNA\tNA\n";
             continue;
         }
         bool available1 = false;
         bool available2 = false;
-        const long floor1 = closest_allele_distance(*t1, block, available1);
-        const long floor2 = closest_allele_distance(*t2, block, available2);
+        // The floor pair: the allele closest to each truth haplotype (first by allele order among equals).
+        std::size_t closest1 = 0;
+        std::size_t closest2 = 0;
+        const long floor1 = closest_allele_distance(*t1, block, available1, &closest1);
+        const long floor2 = closest_allele_distance(*t2, block, available2, &closest2);
         spellable[0] = spellable[0] && available1;
         spellable[1] = spellable[1] && available2;
         if (available1 && available2) ++blocks_with_both_available;
@@ -737,7 +746,10 @@ int evaluate(const Args& args) {
               << called1_bp << '\t' << called2_bp << '\t' << distance_cell << '\t' << floor << '\t'
               << excess_cell << '\t' << (available1 ? "true" : "false") << '\t'
               << (available2 ? "true" : "false") << '\t'
-              << (genotype_support.count(block.block_id) ? genotype_support.at(block.block_id) : "NA") << '\n';
+              << (genotype_support.count(block.block_id) ? genotype_support.at(block.block_id) : "NA") << '\t'
+              << (complete ? std::to_string(hap1[b]) : std::string("NA")) << '\t'
+              << (complete ? std::to_string(hap2[b]) : std::string("NA")) << '\t' << closest1 << '\t' << closest2
+              << '\t' << floor1 << '\t' << floor2 << '\n';
     }
 
     // The only no-call: no genotype result exists.
