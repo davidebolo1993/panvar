@@ -377,4 +377,81 @@ SymmetryReport check_phase_switch_symmetry(const std::vector<SymmetryTraceItem>&
                                            const std::vector<SymmetryTraceItem>& b, std::size_t block,
                                            std::size_t fragment_count);
 
+
+// ---- improving-move tie branching: exact branch-and-pool (panvar genotype, v2) ---------------------------
+// A repair round whose numerical top set excludes the incumbent is an improving-move tie: the search cannot
+// choose. Every tied neighbour becomes a branch that continues the exact repair from it; a branch that stops
+// at a tie of its own splits again. Branches run in ONE canonical order -- breadth-first, and within a tie by
+// diplotype identity -- that no input enumeration or thread schedule can change; kTieBranchOrder names it.
+// Nothing here chooses a genotype: every candidate every branch scores joins the pool, and the pooled rule
+// decides. A branch cap, a branch that does not finish, or a split without an improving tie fails closed.
+constexpr const char* kTieBranchOrder = "bfs_canonical_identity_v1";
+
+struct TieItem {
+    std::size_t round = 0;
+    std::vector<std::size_t> first, second;   // as generated, side-aligned with the round's incumbent
+    SequenceDigest first_sequence, second_sequence;
+    DiplotypeScore score;
+    double prior = 0.0;
+};
+struct TieSet {
+    std::size_t id = 0;
+    long branch = -1;               // the branch that stopped at it; -1: the production search
+    TieItem incumbent;
+    std::vector<TieItem> tied;      // the improving tied neighbours, canonical identity order
+};
+// The caller's certify rule over the round's items (the round's first item is its incumbent), candidates
+// grouped by sequence pair: the tied set is every non-incumbent member of the numerical top set.
+TieSet terminal_tie(const std::vector<TieItem>& items, std::size_t round, std::size_t fragments,
+                    std::size_t mismatch_band);
+
+struct BranchStart {
+    std::size_t id = 0;
+    long parent_tie = 0;
+    TieItem start;
+    std::vector<DiplotypeIdentity> history;   // incumbents before it: never revisited by this branch
+};
+enum class BranchOutcome { Converged, Split, Incomplete };
+struct BranchResult {
+    BranchOutcome outcome = BranchOutcome::Incomplete;
+    std::string why;                          // Incomplete only
+    std::vector<TieItem> items;               // every candidate the branch scored, round by round
+    std::size_t rounds = 0, moves = 0, last_round = 0;
+    std::string stop = "none";
+    std::vector<DiplotypeIdentity> moved_to;  // the incumbents it moved to, in order
+    std::vector<std::size_t> terminal_first, terminal_second;
+    double terminal_total = 0.0;
+    std::uint64_t executed_physical_origins = 0;
+    double seconds = 0.0;
+};
+struct BranchRecord {
+    BranchStart start;
+    BranchResult result;
+};
+struct TieBranchingReport {
+    std::string incomplete;                   // non-empty: fail closed, and why
+    std::vector<TieSet> ties;
+    std::vector<BranchRecord> branches;
+    std::set<std::string> terminal_genotypes; // unordered, of the converged branches
+};
+// `run_branch` runs one branch to its stop; an exception it throws makes the run incomplete. `on_tie` is
+// called for every recorded tie before any of its branches runs -- immediately after the branch that stopped
+// at it returns, so that branch's state is still live -- and may throw (fail closed). `reverse` is a gate
+// hook only: it reverses the order within every tie, which must not change the pooled result.
+TieBranchingReport run_tie_branching(const TieSet& root, const std::vector<DiplotypeIdentity>& root_history,
+                                     std::size_t max_branches, std::size_t fragments, std::size_t mismatch_band,
+                                     const std::function<BranchResult(const BranchStart&)>& run_branch,
+                                     const std::function<void(const TieSet&)>& on_tie, bool reverse = false);
+
+// The calling contract of a tie-branched pool: incomplete -> REPAIR_INCOMPLETE tie_branching_incomplete;
+// otherwise the pooled rule's decision with search_conditional=tie_branched, a distinct top set as the no-call
+// divergent_tie. The status is a genotype_run_status_name.
+struct TieBranchVerdict {
+    std::string status;
+    std::string call_class;
+    std::string no_call_reason;
+    std::string search_conditional;
+};
+TieBranchVerdict tie_branch_verdict(bool incomplete, TopSetDecision decision);
+
 } // namespace panvar

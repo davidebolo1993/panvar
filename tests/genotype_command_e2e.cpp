@@ -2049,6 +2049,209 @@ void test_phase_switch_symmetry() {
                  "beyond the bound, one-bit prior break, divergent terminals and visited-set asymmetry all detected\n";
 }
 
+// ---- improving-move tie branching: the engine and the calling contract, on a scripted landscape --------
+panvar::TieItem tie_item(std::size_t round, std::vector<std::size_t> a, std::vector<std::size_t> b, double fragment,
+                         double prior) {
+    const panvar::PoolCandidate c = pooled(a, b, fragment, prior);
+    panvar::TieItem item;
+    item.round = round;
+    item.first = c.first;
+    item.second = c.second;
+    item.first_sequence = c.first_sequence;
+    item.second_sequence = c.second_sequence;
+    item.score = c.score;
+    item.prior = prior;
+    return item;
+}
+
+struct ScriptedTies {
+    std::map<panvar::DiplotypeIdentity, panvar::BranchResult> script;
+    std::vector<std::string> ran;              // start identities, in the order branches ran
+    std::vector<std::string> ties_seen;
+    std::vector<panvar::PoolCandidate> pool;
+    std::set<panvar::DiplotypeIdentity> pooled_ids;
+    std::string throw_for;                     // a start that throws
+    void add(const panvar::TieItem& item) {
+        const panvar::DiplotypeIdentity key = panvar::diplotype_identity(item.first, item.second);
+        if (!pooled_ids.insert(key).second) return;
+        panvar::PoolCandidate c;
+        c.first = item.first;
+        c.second = item.second;
+        c.first_sequence = item.first_sequence;
+        c.second_sequence = item.second_sequence;
+        c.score = item.score;
+        c.sequence_prior = item.prior;
+        c.path_prior = item.prior;
+        pool.push_back(c);
+    }
+};
+
+panvar::BranchResult converged_at(std::size_t round, const panvar::TieItem& start, const panvar::TieItem& terminal) {
+    panvar::BranchResult r;
+    r.outcome = panvar::BranchOutcome::Converged;
+    r.items = {start, terminal};
+    r.items[0].round = round;
+    r.items[1].round = round;
+    r.rounds = 2;
+    r.moves = 1;
+    r.last_round = 2;
+    r.stop = "no_improvement";
+    r.moved_to = {panvar::diplotype_identity(terminal.first, terminal.second)};
+    r.terminal_first = terminal.first;
+    r.terminal_second = terminal.second;
+    r.terminal_total = terminal.score.log_likelihood + terminal.prior;
+    return r;
+}
+
+std::string identity_text(const panvar::TieItem& item) {
+    std::string text;
+    const panvar::DiplotypeIdentity key = panvar::diplotype_identity(item.first, item.second);
+    for (const auto* side : {&key.first, &key.second}) {
+        for (const std::size_t x : *side) text += std::to_string(x);
+        text += "|";
+    }
+    return text;
+}
+
+struct TieRun {
+    panvar::TieBranchingReport report;
+    panvar::PooledDecision decided;
+    panvar::TieBranchVerdict verdict;
+    std::vector<std::string> ran;
+};
+
+TieRun run_scripted(ScriptedTies scripted, const std::vector<panvar::TieItem>& root_items, std::size_t max_branches,
+                    bool reverse) {
+    for (const panvar::TieItem& item : root_items) scripted.add(item);
+    const panvar::TieSet root = panvar::terminal_tie(root_items, root_items.front().round, 10, 6);
+    const auto run_branch = [&](const panvar::BranchStart& start) {
+        if (identity_text(start.start) == scripted.throw_for) throw std::runtime_error("scripted branch failure");
+        scripted.ran.push_back(identity_text(start.start));
+        const panvar::BranchResult result =
+            scripted.script.at(panvar::diplotype_identity(start.start.first, start.start.second));
+        for (const panvar::TieItem& item : result.items) scripted.add(item);
+        return result;
+    };
+    const auto on_tie = [&](const panvar::TieSet& tie) { scripted.ties_seen.push_back(std::to_string(tie.tied.size())); };
+    TieRun out;
+    out.report = panvar::run_tie_branching(root, {}, max_branches, 10, 6, run_branch, on_tie, reverse);
+    out.ran = scripted.ran;
+    out.decided = panvar::decide_pooled_genotype(scripted.pool, 3, 10, 6);
+    out.verdict = panvar::tie_branch_verdict(!out.report.incomplete.empty(), out.decided.decision);
+    return out;
+}
+
+void test_tie_branching_engine() {
+    // The production tie: incumbent I, two improving phase assignments a0 / a1 of one pair, tied.
+    const panvar::TieItem I = tie_item(2, {0, 0, 0}, {1, 1, 1}, -1000.0, -5.0);
+    const panvar::TieItem a0 = tie_item(2, {0, 2, 0}, {1, 3, 1}, -990.0, -5.0);
+    const panvar::TieItem a1 = tie_item(2, {0, 3, 0}, {1, 2, 1}, -990.0, -5.0);
+    const panvar::TieItem other = tie_item(2, {4, 0, 0}, {1, 1, 1}, -1003.0, -5.0);
+    const std::vector<panvar::TieItem> root = {I, a0, a1, other};
+    const panvar::TieSet tie = panvar::terminal_tie(root, 2, 10, 6);
+    require(tie.tied.size() == 2 && identity_text(tie.tied[0]) == identity_text(a0),
+            "the certify rule finds both improving assignments, in canonical identity order");
+    const auto key = [](const panvar::TieItem& x) { return panvar::diplotype_identity(x.first, x.second); };
+
+    // 1. unique: the canonical-FIRST branch ends lower; the pooled rule takes the other branch's terminal
+    {
+        ScriptedTies s;
+        s.script[key(a0)] = converged_at(1, a0, tie_item(0, {0, 2, 5}, {1, 3, 1}, -980.0, -5.0));
+        const panvar::TieItem y = tie_item(0, {0, 3, 0}, {1, 2, 6}, -970.0, -5.0);
+        s.script[key(a1)] = converged_at(1, a1, y);
+        const TieRun r = run_scripted(s, root, 16, false);
+        require(r.report.incomplete.empty() && r.report.branches.size() == 2, "two branches, complete");
+        require(r.decided.decision == panvar::TopSetDecision::Unique, "one pooled winner");
+        const panvar::PoolCandidate& best = r.decided.candidates[r.decided.representative[r.decided.ranking.candidates.front().candidate_id]];
+        require(panvar::diplotype_identity(best.first, best.second) == key(y),
+                "the winner is the second branch's terminal: never the first branch because it is first");
+        require(r.verdict.status == "COMPLETE" && r.verdict.search_conditional == "tie_branched" &&
+                    r.verdict.no_call_reason == "none",
+                "unique -> COMPLETE, search_conditional=tie_branched");
+    }
+    // 2. genotype-equivalent: both branches end on one unordered genotype, phased differently, tied
+    {
+        ScriptedTies s;
+        s.script[key(a0)] = converged_at(1, a0, tie_item(0, {0, 2, 5}, {1, 3, 1}, -980.0, -5.0));
+        s.script[key(a1)] = converged_at(1, a1, tie_item(0, {0, 2, 1}, {1, 3, 5}, -980.0, -5.0));
+        const TieRun r = run_scripted(s, root, 16, false);
+        require(r.decided.decision == panvar::TopSetDecision::GenotypeEquivalent && r.decided.phase_support == "UNRESOLVED",
+                "one unordered genotype, phase unresolved");
+        require(r.verdict.status == "CONDITIONAL_GENOTYPE_EQUIVALENT", "genotype-equivalent -> CONDITIONAL_GENOTYPE_EQUIVALENT");
+    }
+    // 3. divergent: tied terminals that disagree at a block
+    {
+        ScriptedTies s;
+        s.script[key(a0)] = converged_at(1, a0, tie_item(0, {0, 2, 5}, {1, 3, 1}, -980.0, -5.0));
+        s.script[key(a1)] = converged_at(1, a1, tie_item(0, {0, 3, 7}, {1, 2, 1}, -980.0, -5.0));
+        const TieRun r = run_scripted(s, root, 16, false);
+        require(r.report.terminal_genotypes.size() == 2 && r.decided.decision == panvar::TopSetDecision::DistinctTie,
+                "two terminal genotypes, tied");
+        require(r.verdict.no_call_reason == "divergent_tie" && r.verdict.call_class == "no_call", "divergent -> no-call divergent_tie");
+    }
+    // 4. nested: branch a0 stops at a tie of its own; its two assignments become branches 2 and 3
+    ScriptedTies nested;
+    {
+        panvar::BranchResult split;
+        split.outcome = panvar::BranchOutcome::Split;
+        split.items = {tie_item(1, {0, 2, 0}, {1, 3, 1}, -990.0, -5.0), tie_item(1, {0, 2, 8}, {1, 3, 1}, -985.0, -5.0),
+                       tie_item(1, {0, 2, 1}, {1, 3, 8}, -985.0, -5.0)};
+        split.rounds = 1;
+        split.last_round = 1;
+        split.stop = "rescore_incomplete";
+        split.terminal_first = {0, 2, 0};
+        split.terminal_second = {1, 3, 1};
+        nested.script[key(a0)] = split;
+        nested.script[key(a1)] = converged_at(1, a1, tie_item(0, {0, 3, 0}, {1, 2, 9}, -995.0, -5.0));
+        const panvar::TieItem b0 = split.items[1];
+        const panvar::TieItem b1 = split.items[2];
+        nested.script[key(b0)] = converged_at(1, b0, tie_item(0, {0, 2, 8}, {1, 3, 6}, -975.0, -5.0));
+        nested.script[key(b1)] = converged_at(1, b1, tie_item(0, {0, 2, 6}, {1, 3, 8}, -975.0, -5.0));
+    }
+    const TieRun deep = run_scripted(nested, root, 4, false);
+    require(deep.report.incomplete.empty() && deep.report.ties.size() == 2 && deep.report.branches.size() == 4,
+            "a nested tie adds its branches: two ties, four branches");
+    require(deep.report.branches[2].start.history.size() == 1 && deep.report.branches[2].start.parent_tie == 1,
+            "a nested branch inherits its parent's start in its history, and names its tie");
+    require(deep.ran.size() == 4 && deep.ran[0] == identity_text(a0) && deep.ran[1] == identity_text(a1),
+            "breadth-first, canonical order: the production tie's branches run first");
+    require(deep.verdict.status == "CONDITIONAL_GENOTYPE_EQUIVALENT", "the nested terminals pool to one genotype");
+    // 5. the branch cap: exactly the four it needs succeeds; three refuses, with no decision to make
+    const TieRun capped = run_scripted(nested, root, 3, false);
+    require(!capped.report.incomplete.empty() && capped.report.incomplete.find("branch cap 3") != std::string::npos,
+            "one branch below what the ties need refuses");
+    require(capped.verdict.status == "REPAIR_INCOMPLETE" && capped.verdict.no_call_reason == "tie_branching_incomplete",
+            "incompleteness -> REPAIR_INCOMPLETE tie_branching_incomplete");
+    // 6. an exception inside a branch fails closed
+    {
+        ScriptedTies s = nested;
+        s.throw_for = identity_text(a1);
+        const TieRun r = run_scripted(s, root, 16, false);
+        require(r.report.incomplete.find("scripted branch failure") != std::string::npos &&
+                    r.verdict.no_call_reason == "tie_branching_incomplete",
+                "a throwing branch makes the run incomplete");
+    }
+    // 7. reversed order within every tie: the same branches, the same pooled decision and representative
+    {
+        const TieRun reversed = run_scripted(nested, root, 4, true);
+        require(reversed.ran[0] == identity_text(a1), "the gate hook really reverses the order");
+        require(render_decision(reversed.decided) == render_decision(deep.decided) &&
+                    reversed.report.branches.size() == deep.report.branches.size(),
+                "the pooled result does not depend on the branch order");
+    }
+    // 8. a split whose last round holds no improving tie is an error, never a silent stop
+    {
+        ScriptedTies s = nested;
+        panvar::BranchResult bad = s.script[key(a0)];
+        bad.items = {tie_item(1, {0, 2, 0}, {1, 3, 1}, -990.0, -5.0), tie_item(1, {0, 2, 8}, {1, 3, 1}, -995.0, -5.0)};
+        s.script[key(a0)] = bad;
+        const TieRun r = run_scripted(s, root, 16, false);
+        require(r.report.incomplete.find("without an improving tie") != std::string::npos, "a split with no tie refuses");
+    }
+    std::cout << "  tie branching: unique (not the first branch), genotype-equivalent, divergent, nested BFS, cap exact "
+                 "and minus one, exceptions, reversed order and tieless splits all behave as contracted\n";
+}
+
 // ---- panel-anchored adaptive completion, end to end ------------------------------------------------
 panvar::GenotypeCommandOptions repair_options(const std::string& prefix, const std::string& r1,
                                               const std::string& r2, const std::string& gfa) {
@@ -2335,6 +2538,7 @@ int main(int argc, char** argv) {
         test_resource_caps_are_thread_invariant();
         test_pooled_decision_rule();
         test_phase_switch_symmetry();
+        test_tie_branching_engine();
         test_adaptive_completion();
         test_watchdog_and_interruption();
         if (argc >= 3) test_profile(argv[2]);

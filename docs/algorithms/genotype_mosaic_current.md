@@ -158,6 +158,64 @@ mosaic (11/11 exact).
 donors), eligible-donor LOO (55) and synthetic-mosaic (10 plans) campaigns at 2x, 5x, 10x and 30x -- 484
 serial jobs -- with a runtime and disk estimate. `launch` refuses without the reviewed plan's hash.
 
+## v2: exact branch-and-pool at an improving-move tie (2026-09-24)
+
+C4 production-v1 (`c4-panel-anchored-v1`, the 484-job campaign) stays the immutable result: its profiles are
+unchanged, and without `repair_tie_branching` a run behaves exactly as v1 (an improving-move tie is the
+no-call `improving_move_tie`). v2 adds one step and is selected only by its own profiles,
+`profiles/genotype_c4_v2.tsv` (`c4-panel-anchored-v2`) and `profiles/genotype_c4_v2_campaign_local.tsv`:
+every v1 setting unchanged, plus `repair_tie_branching 1` and `repair_tie_max_branches 16`. The likelihood,
+the candidate union, the repair and the pooled rule are unchanged.
+
+**Step 3b.** When the repair stops at a round whose numerical top set excludes the incumbent, every tied
+neighbour becomes a branch that continues the same exact repair from it, and a branch that stops at a tie of
+its own splits again. Branches run breadth-first, within a tie in diplotype-identity order
+(`tie_branch_order bfs_canonical_identity_v1`), which no input enumeration or thread schedule can change.
+They share the production search's scoring context -- warm origin and emission caches -- and each tied
+neighbour is created by the exact block delta of a promoted repair from its parent incumbent's census, which
+stays pinned and unmodified (`tie_branch_seeding delta_promoted_shared_context`); sequence digests are
+memoised by allele path. Each branch has its own visited set (its ancestors' incumbents included), ranking
+state and candidates. Every candidate any branch scores joins the pool; the pooled rule decides, never the
+order branches ran in. Branching runs before the run is claimed, so the watchdog still bounds it.
+
+**Calling contract.**
+
+| pooled outcome | status | call class | no-call reason | FASTA |
+|---|---|---|---|---|
+| a unique top candidate | `COMPLETE` | `strict_call` | `none` | yes (its phase support as in v1) |
+| one unordered genotype in the top set | `CONDITIONAL_GENOTYPE_EQUIVALENT` | `genotype_equivalent_call` | `none` | no; phase `UNRESOLVED` |
+| different unordered genotypes | `RESCORE_INCOMPLETE` | `no_call` | `divergent_tie` | no |
+| a branch cap, any cumulative cap, an exception, an unfinished branch, a split without an improving tie | `REPAIR_INCOMPLETE` | `no_call` | `tie_branching_incomplete` | no |
+
+Every tie-branched run carries `search_conditional tie_branched`: the call is conditional on a pruned,
+anchor-local search that was branched at a tie. Branch recovery improves callability; it does not
+guarantee proximity to truth (in the LOO audit 18 of 37 recovered ties resolve to one genotype more than
+1 kb above the floor).
+
+**Resources.** Branches share the production context, so the cumulative repair caps
+(`repair_max_physical_origins` and the others) bind production and branches together, and the status
+margins are reported against that shared total. Because the caches are shared, executed work depends on the
+order branches ran in; resource acceptance is defined on the canonical order. Gates that reverse the order
+compare scientific output with cap headroom, never a boundary cap.
+
+**Outputs.** `.tie_terminal_ties.tsv` (every tie: its tied neighbours, block, assignment and score
+components) and `.tie_branches.tsv` (every branch: start, rounds, moves, stop, outcome, terminal, executed
+physical origins, seconds). Branch-scored candidates appear in `.mosaic_candidates.tsv` and
+`.equivalence_set.tsv` with `source branch` and `scored_in branch<k>_round<r>`. Status keys:
+`search_conditional`, `repair_tie_branching`, `repair_tie_max_branches`, `tie_branch_order`,
+`tie_branch_seeding`, `tie_branched`, `tie_ties`, `tie_branches_run`, `tie_distinct_terminal_genotypes`,
+`tie_incomplete_reason`, `tie_branch_physical_origins`, `pool_branch_scored`, `tie_digest_memo_hits`,
+`tie_digest_memo_misses`, `seconds_tie_branching`.
+
+**Gates.** Engine fixtures in the command end-to-end test (unique convergence where the winner is not the
+first branch, genotype-equivalent and divergent terminals, nested ties, the branch cap exact and one below,
+a throwing branch, reversed order, a split without a tie); the block-delta fixture (a delta-promoted seed and
+the repair from its census equal cold full seeding in every mass cell and in exposure); and
+`tests/genotype_tie_branching_regressions.sh`, five frozen C4 ties (two synthetic mosaics, a low- and a
+high-excess LOO tie, the 14-branch nested case) whose production outputs must equal their frozen v2/post-hoc
+diagnostics: status, pool, pooled top set member for member and score for score, representative, branch
+endpoints, terminal ties and the unchanged production trajectory.
+
 ## Frozen defaults
 
 State limit **256** (production) and **1,024** (diagnostic comparison width) -- counted in allele-prefix
@@ -576,6 +634,22 @@ local artifact and is not tracked in git. Regenerate with `scripts/consolidate_c
 
 ## Known limitations
 
+- **LOO can be representation-limited even above the availability floor.** The availability floor is an
+  edit-distance oracle -- the panel allele pair nearest the truth in sequence -- not necessarily the
+  maximum-likelihood available allele. When the truth allele is absent from the panel, the reads can prefer
+  a different available allele than the sequence-nearest one, and the call then sits above the floor without
+  any search or likelihood fault (HG00171 ctx:10, 13 bp at every coverage: the repair scored the floor pair
+  and the reads preferred the called allele by 12.5 nats).
+- **HG01114.2 sv:7 is a sequence-versus-copy-number trade-off caused by the missing truth-like short
+  allele.** The per-fragment decomposition (`score-set --decompose`) shows the Poisson likelihood counting
+  every module copy once: interior fragments carry exactly log(4/3), and on depth alone the likelihood
+  prefers the true three copies by 18.4 nats (145.3 nats of multiplicity against 163.7 of exposure). The
+  panel's only short allele (80) is 94 bp from the truth's, and the fragments covering those differences
+  prefer the called long alleles by a net 44.7 nats, which reverses the call. No accounting fault, and no
+  likelihood change is made; the marker score is not combined with the fragment likelihood, since both use
+  the same reads.
+- **Branch recovery improves callability, not proximity to truth.** A tie-branched call is one genotype of
+  the pooled search, conditional on that search.
 - Whole-locus phase is often unidentifiable from short reads; block consensus is the response.
 - `every_block`-style dense switching is not recovered at either width.
 - Reverse-orientation splicing is unimplemented, so only 5 of 8 frozen C4 development donors can be used

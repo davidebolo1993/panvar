@@ -1353,4 +1353,132 @@ SymmetryReport check_phase_switch_symmetry(const std::vector<SymmetryTraceItem>&
     return report;
 }
 
+
+// ---- improving-move tie branching ----------------------------------------------------------------------
+
+TieSet terminal_tie(const std::vector<TieItem>& items, std::size_t round, std::size_t fragments,
+                    std::size_t mismatch_band) {
+    TieSet tie;
+    std::vector<const TieItem*> here;
+    for (const TieItem& item : items) {
+        if (item.round == round) here.push_back(&item);
+    }
+    if (here.empty()) throw std::invalid_argument("no scored candidate in the tied round");
+    tie.incumbent = *here.front();
+    std::map<std::pair<SequenceDigest, SequenceDigest>, std::size_t> slot;
+    std::vector<std::vector<const TieItem*>> groups;
+    std::vector<DiplotypeScore> scores;
+    std::vector<double> priors;
+    for (const TieItem* item : here) {
+        SequenceDigest x = item->first_sequence;
+        SequenceDigest y = item->second_sequence;
+        if (y < x) std::swap(x, y);
+        const auto found = slot.emplace(std::make_pair(x, y), groups.size());
+        if (found.second) {
+            groups.emplace_back();
+            scores.push_back(item->score);
+            priors.push_back(item->prior);
+        }
+        groups[found.first->second].push_back(item);
+    }
+    const CertifiedRanking ranking =
+        certify_scored_ranking(scores, fragments, mismatch_band, FragmentScoringCounters{}, CertificationOptions{}, priors);
+    const DiplotypeIdentity incumbent_key = diplotype_identity(tie.incumbent.first, tie.incumbent.second);
+    for (const std::size_t g : ranking.winner_set) {
+        for (const TieItem* item : groups[g]) {
+            if (diplotype_identity(item->first, item->second) != incumbent_key) tie.tied.push_back(*item);
+        }
+    }
+    std::sort(tie.tied.begin(), tie.tied.end(), [](const TieItem& x, const TieItem& y) {
+        return diplotype_identity(x.first, x.second) < diplotype_identity(y.first, y.second);
+    });
+    return tie;
+}
+
+TieBranchingReport run_tie_branching(const TieSet& root, const std::vector<DiplotypeIdentity>& root_history,
+                                     std::size_t max_branches, std::size_t fragments, std::size_t mismatch_band,
+                                     const std::function<BranchResult(const BranchStart&)>& run_branch,
+                                     const std::function<void(const TieSet&)>& on_tie, bool reverse) {
+    TieBranchingReport report;
+    std::vector<BranchStart> worklist;
+    std::set<DiplotypeIdentity> started;
+    const auto record = [&](TieSet tie, const std::vector<DiplotypeIdentity>& history) {
+        tie.id = report.ties.size();
+        if (tie.tied.empty()) throw std::runtime_error("a split without an improving tie");
+        report.ties.push_back(tie);
+        on_tie(report.ties.back());
+        std::vector<TieItem> order = report.ties.back().tied;
+        if (reverse) std::reverse(order.begin(), order.end());
+        for (const TieItem& n : order) {
+            if (!started.insert(diplotype_identity(n.first, n.second)).second) continue;   // one branch per start
+            BranchStart branch;
+            branch.parent_tie = static_cast<long>(tie.id);
+            branch.start = n;
+            branch.history = history;
+            worklist.push_back(branch);
+        }
+    };
+    try {
+        record(root, root_history);
+    } catch (const std::exception& error) {
+        report.incomplete = std::string("the production tie could not be branched: ") + error.what();
+        return report;
+    }
+    for (std::size_t next = 0; next < worklist.size(); ++next) {
+        if (report.branches.size() >= max_branches) {
+            report.incomplete = "branch cap " + std::to_string(max_branches) + " binds (" +
+                                std::to_string(worklist.size()) + " branches required)";
+            break;
+        }
+        BranchRecord entry;
+        entry.start = worklist[next];
+        entry.start.id = report.branches.size();
+        try {
+            entry.result = run_branch(entry.start);
+        } catch (const std::exception& error) {
+            entry.result = BranchResult{};
+            entry.result.outcome = BranchOutcome::Incomplete;
+            entry.result.why = error.what();
+        }
+        report.branches.push_back(entry);
+        const BranchRecord& done = report.branches.back();
+        if (done.result.outcome == BranchOutcome::Incomplete) {
+            report.incomplete = "branch " + std::to_string(done.start.id) + ": " + done.result.why;
+            break;
+        }
+        if (done.result.outcome == BranchOutcome::Converged) {
+            std::string text;
+            for (std::size_t b = 0; b < done.result.terminal_first.size(); ++b) {
+                const auto pair = std::minmax(done.result.terminal_first[b], done.result.terminal_second[b]);
+                text += (b == 0 ? "" : ",") + std::to_string(pair.first) + "/" + std::to_string(pair.second);
+            }
+            report.terminal_genotypes.insert(text);
+            continue;
+        }
+        std::vector<DiplotypeIdentity> history = done.start.history;
+        history.push_back(diplotype_identity(done.start.start.first, done.start.start.second));
+        history.insert(history.end(), done.result.moved_to.begin(), done.result.moved_to.end());
+        try {
+            TieSet nested = terminal_tie(done.result.items, done.result.last_round, fragments, mismatch_band);
+            nested.branch = static_cast<long>(done.start.id);
+            record(nested, history);
+        } catch (const std::exception& error) {
+            report.incomplete = "branch " + std::to_string(done.start.id) + ": " + error.what();
+            break;
+        }
+    }
+    return report;
+}
+
+TieBranchVerdict tie_branch_verdict(bool incomplete, TopSetDecision decision) {
+    if (incomplete) return {"REPAIR_INCOMPLETE", "no_call", "tie_branching_incomplete", "tie_branched"};
+    switch (decision) {
+    case TopSetDecision::Unique: return {"COMPLETE", "strict_call", "none", "tie_branched"};
+    case TopSetDecision::GenotypeEquivalent:
+        return {"CONDITIONAL_GENOTYPE_EQUIVALENT", "genotype_equivalent_call", "none", "tie_branched"};
+    case TopSetDecision::DistinctTie: break;
+    }
+    return {"RESCORE_INCOMPLETE", "no_call", "divergent_tie", "tie_branched"};
+}
+
 } // namespace panvar

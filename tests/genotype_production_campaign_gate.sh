@@ -31,6 +31,12 @@ science() { grep -v '^#' "$1" | grep -v -E '^(profile|threads|footprint_limit_by
 same "campaign profile science" "$(diff <(science "$REPO/profiles/genotype_c4.tsv") <(science "$REPO/profiles/genotype_c4_campaign_local.tsv") > /dev/null && echo identical || echo DIFFERS)" "identical"
 same "campaign profile footprint limit" "$(awk -F'\t' '$1=="footprint_limit_bytes"{print $2}' "$REPO/profiles/genotype_c4_campaign_local.tsv")" "3758096384"
 same "campaign profile leaves threads to the scheduler" "$(grep -c '^threads'$'\t' "$REPO/profiles/genotype_c4_campaign_local.tsv")" "0"
+# The v2 profiles are their v1 profiles, key for key, plus exactly the two tie-branching keys.
+v2() { grep -v '^#' "$1" | grep -v -E '^(profile|repair_tie_branching|repair_tie_max_branches)'$'\t' | sort; }
+for v in genotype_c4 genotype_c4_campaign_local; do
+  same "$v v2 = v1 apart from tie branching" "$(diff <(v2 "$REPO/profiles/$v.tsv") <(v2 "$REPO/profiles/${v/genotype_c4/genotype_c4_v2}.tsv") > /dev/null && echo identical || echo DIFFERS)" "identical"
+  same "$v v2 enables tie branching" "$(grep -c -E '^(repair_tie_branching'$'\t''1|repair_tie_max_branches'$'\t''16)$' "$REPO/profiles/${v/genotype_c4/genotype_c4_v2}.tsv")" "2"
+done
 bash "$REPO/tests/genotype_production_c4_campaign.sh" launch /nonexistent "$WORK/plan" > "$WORK/launch.log" 2>&1
 same "launch without approval" "$?" "2"
 same "nothing launched" "$(find "$WORK/plan" -name '*.mosaic_status.tsv' | wc -l | tr -d ' ')" "0"

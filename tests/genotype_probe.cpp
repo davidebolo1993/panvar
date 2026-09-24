@@ -5756,6 +5756,17 @@ int tie_branch(const Args& args) {
     options.diagnostic_digest_memo_check = args.get("digest-memo-check", "0") != "0";
     options.diagnostic_branch_request_order_seed = std::stoull(args.get("branch-request-order-seed", "0"));
     options.diagnostic_pool_dump = args.get("pool-dump", "0") != "0";
+    // v2 production gates: overrides are recorded; the reversal is a test hook, never a setting.
+    options.test_reverse_tie_branch_order = args.get("tie-reverse", "0") != "0";
+    for (const char* key : {"repair-max-physical-origins", "repair-tie-max-branches"}) {
+        const std::string value = args.get(key, "");
+        if (value.empty()) continue;
+        if (std::string(key) == "repair-max-physical-origins") options.repair_max_physical_origins = std::stoull(value);
+        else options.repair_tie_max_branches = std::stoul(value);
+        std::string name = key;
+        std::replace(name.begin(), name.end(), '-', '_');
+        options.overridden_settings.push_back(name + "=" + value);
+    }
     // EXPERIMENT ONLY: a higher union physical-origin cap for one diagnosed refusal. Recorded as an override;
     // no profile or default moves.
     if (!args.get("union-max-physical-origins", "").empty()) {

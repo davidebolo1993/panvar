@@ -49,7 +49,8 @@ double seconds_since(Clock::time_point from) {
 // removed before anything else, so a run that stops early can never sit beside an earlier result.
 const char* const kFinalOutputs[] = {".genotypes.tsv", ".block_genotypes.tsv", ".mosaic_candidates.tsv",
                                      ".mosaic_scores.tsv", ".mosaic_haplotypes.fa", ".equivalence_set.tsv",
-                                     ".repair_rounds.tsv", ".repair_memory.tsv"};
+                                     ".repair_rounds.tsv", ".repair_memory.tsv", ".tie_branches.tsv",
+                                     ".tie_terminal_ties.tsv"};
 const char* const kPartialOutputs[] = {".repair_rounds.partial.tsv", ".repair_memory.partial.tsv"};
 
 // The run's process-level guard. Status files are written whole (atomic rename), and the terminal
@@ -425,6 +426,17 @@ struct RepairReport {
     std::string same_genotype_prior_gap = "NA";
     std::string same_genotype_fragment_identical = "NA";
     std::string haplotype_representation = "none";
+    // v2 tie branching: what ran, and on what the call is conditional.
+    std::string search_conditional = "none";
+    bool tie_branched = false;
+    std::size_t tie_ties = 0;
+    std::size_t tie_branches_run = 0;
+    std::size_t tie_distinct_terminal_genotypes = 0;
+    std::string tie_incomplete_reason = "none";
+    std::uint64_t tie_branch_physical_origins = 0;
+    std::uint64_t pool_branch_scored = 0;
+    std::uint64_t tie_digest_memo_hits = 0, tie_digest_memo_misses = 0;
+    double seconds_tie_branching = 0.0;
     // strict_call, genotype_equivalent_call or no_call, and why a no-call is one. Reporting only.
     std::string call_class = "no_call";
     std::string no_call_reason = "NA";
@@ -455,6 +467,15 @@ void write_repair_report(std::ostream& out, const RepairReport& r) {
         << o.repair_max_state_classes << "\nrepair_max_piece_hits\t" << o.repair_max_piece_hits
         << "\nrepair_max_latent_pairs\t" << o.repair_max_latent_pairs << '\n';
     out << "call_class\t" << r.call_class << "\nno_call_reason\t" << r.no_call_reason << '\n';
+    out << "search_conditional\t" << r.search_conditional << "\nrepair_tie_branching\t"
+        << (o.repair_tie_branching ? "true" : "false") << "\nrepair_tie_max_branches\t" << o.repair_tie_max_branches
+        << "\ntie_branch_order\t" << kTieBranchOrder << "\ntie_branch_seeding\tdelta_promoted_shared_context"
+        << "\ntie_branched\t" << (r.tie_branched ? "true" : "false") << "\ntie_ties\t" << r.tie_ties
+        << "\ntie_branches_run\t" << r.tie_branches_run << "\ntie_distinct_terminal_genotypes\t"
+        << r.tie_distinct_terminal_genotypes << "\ntie_incomplete_reason\t" << r.tie_incomplete_reason
+        << "\ntie_branch_physical_origins\t" << r.tie_branch_physical_origins << "\npool_branch_scored\t"
+        << r.pool_branch_scored << "\ntie_digest_memo_hits\t" << r.tie_digest_memo_hits << "\ntie_digest_memo_misses\t"
+        << r.tie_digest_memo_misses << '\n';
     out << "union_ranking_status\t" << r.union_status << "\nunion_winner_set_size\t" << r.union_winner_set
         << "\nunion_certified_gap\t" << r.union_certified_gap << "\nunion_top_score\t" << r.union_top_score
         << "\nunion_top_hap1\t" << r.union_top_hap1 << "\nunion_top_hap2\t" << r.union_top_hap2 << '\n';
@@ -495,7 +516,7 @@ void write_repair_report(std::ostream& out, const RepairReport& r) {
         << "\nrepair_origin_cache_bytes_end\t" << r.origin_cache_bytes_end << "\nthreads_repair_enumeration_workers\t"
         << r.enumeration_workers << '\n';
     out << std::fixed << std::setprecision(3) << "seconds_repair\t" << r.seconds << "\nseconds_repair_scoring\t"
-        << r.seconds_scoring << '\n';
+        << r.seconds_scoring << "\nseconds_tie_branching\t" << r.seconds_tie_branching << '\n';
     out.unsetf(std::ios::floatfield);
     out << std::setprecision(6);
 }
@@ -912,6 +933,11 @@ void apply_genotype_profile(const std::string& path, GenotypeCommandOptions& opt
         else if (key == "repair_max_state_classes") options.repair_max_state_classes = u();
         else if (key == "repair_max_piece_hits") options.repair_max_piece_hits = u();
         else if (key == "repair_max_latent_pairs") options.repair_max_latent_pairs = u();
+        else if (key == "repair_tie_branching") {
+            if (value != "0" && value != "1") throw std::runtime_error("profile " + path + ": 'repair_tie_branching' is 0 or 1: " + value);
+            options.repair_tie_branching = value == "1";
+        }
+        else if (key == "repair_tie_max_branches") options.repair_tie_max_branches = u();
         else if (key == "footprint_limit_bytes") options.footprint_limit_bytes = u();
         else if (key == "time_limit_seconds") options.time_limit_seconds = whole_double(key, value);
         else throw std::runtime_error("profile " + path + ": unknown setting '" + key + "'");
@@ -1845,13 +1871,7 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
         bool reproduced = true;
         // One scored candidate into the pool. The diagnostic also keeps the round's items, so a terminal
         // tied round can be reconstructed from the scores the search already computed.
-        struct RoundItem {
-            std::size_t round = 0;
-            std::vector<std::size_t> first, second;   // as generated, relative to the round's incumbent
-            SequenceDigest first_sequence, second_sequence;
-            DiplotypeScore score;
-            double prior = 0.0;
-        };
+        using RoundItem = TieItem;
         std::vector<RoundItem> production_items;
         // DIAGNOSTIC digest memo (branch hooks only): keyed by allele path, which fixes the spelled bytes
         // under this model, so a released and recycled slot or a freed buffer can never alias an entry.
@@ -1899,7 +1919,8 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
                 ++report.pool_repair_scored;
                 const std::size_t round = search->rounds().size() + 1;
                 pool_scored(a, b, sa, sb, score, prior, "repair", "round" + std::to_string(round),
-                            options.diagnostic_tie_branching ? &production_items : nullptr, round);
+                            options.diagnostic_tie_branching || options.repair_tie_branching ? &production_items : nullptr,
+                            round);
             };
             hooks.on_round = [&](const RepairRound& round) {
                 commit_partial(prefix + ".repair_rounds.partial.tsv", search->render_rounds(search->rounds()));
@@ -1959,7 +1980,215 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
             if (search->memory_on()) atomic_write(prefix + ".repair_memory.tsv", search->memory_text());
             for (const char* suffix : kPartialOutputs) std::remove((prefix + suffix).c_str());
         };
+
+        // ---- 3b. v2: an improving-move tie is branched and pooled, before the run is claimed (the watchdog
+        // still bounds it). Branches share the production search's scoring context: warm origin and emission
+        // caches, each tied neighbour created by the exact block delta of a promoted repair from its parent
+        // incumbent's census, which stays pinned and unmodified; a seed stays pinned until its branch has run.
+        // Each branch has its own visited set, ranking state and candidates; everything any branch scores
+        // joins the pool, and the pooled rule below decides -- never the order branches ran in.
+        const bool improving_tie = reproduced && !report.converged &&
+                                   (report.stop_reason == "rescore_incomplete" || report.stop_reason == "tie_at_best");
+        std::string tie_ties_text, tie_branches_text;
+        std::string tie_incomplete;
+        if (improving_tie && options.repair_tie_branching) {
+            const Clock::time_point tie_mark = Clock::now();
+            write_running_status("tie branching");
+            report.tie_branched = true;
+            report.search_conditional = "tie_branched";
+            PreparedScoringContext* shared = search->context();
+            const std::uint64_t shared_before = shared != nullptr ? shared->cumulative_counters().physical_origins : 0;
+            const std::uint64_t memo_hits_before = digest_memo_hits, memo_misses_before = digest_memo_misses;
+            std::map<DiplotypeIdentity, std::pair<std::size_t, std::size_t>> seed_slots;
+            std::set<std::size_t> parent_pins;
+            std::map<std::size_t, std::size_t> seed_pins;   // slot -> seeds still waiting on it
+            std::unique_ptr<CoordinateRepairSearch> live;   // the branch that ran last, alive for its own tie
+            const auto pins_now = [&]() {
+                std::vector<std::size_t> pins(parent_pins.begin(), parent_pins.end());
+                for (const auto& seed : seed_pins) pins.push_back(seed.first);
+                return pins;
+            };
+            const auto on_tie = [&](const TieSet& tie) {
+                if (shared == nullptr) throw std::runtime_error("no production scoring context to branch from");
+                CoordinateRepairSearch& parent = tie.branch < 0 ? *search : *live;
+                parent_pins.insert(parent.incumbent_slot_first());
+                parent_pins.insert(parent.incumbent_slot_second());
+                for (const TieItem& n : tie.tied) {
+                    const DiplotypeIdentity key = diplotype_identity(n.first, n.second);
+                    if (seed_slots.count(key) != 0) continue;
+                    const auto slots = parent.seed_neighbour_by_delta(n.first, n.second);
+                    seed_slots.emplace(key, slots);
+                    ++seed_pins[slots.first];
+                    if (slots.second != slots.first) ++seed_pins[slots.second];
+                }
+            };
+            RepairSearchOptions branch_options = search_options;
+            branch_options.external_context = true;
+            branch_options.memory_log = false;
+            const auto run_branch = [&](const BranchStart& branch) {
+                live.reset();
+                BranchResult out;
+                const Clock::time_point mark = Clock::now();
+                const std::uint64_t before = shared->cumulative_counters().physical_origins;
+                const DiplotypeIdentity key = diplotype_identity(branch.start.first, branch.start.second);
+                const auto seeded = seed_slots.at(key);
+                live = std::make_unique<CoordinateRepairSearch>(model, emissions, fragments, library, repair_scoring,
+                                                                branch_options);
+                live->attach_context(shared);
+                live->set_pinned(pins_now());
+                live->start_from_slots(branch.start.first, branch.start.second,
+                                       branch.start.score.log_likelihood + branch.start.prior, seeded.first, seeded.second);
+                for (const DiplotypeIdentity& seen : branch.history) live->add_visited(seen.first, seen.second);
+                RepairHooks hooks;
+                hooks.on_scored = [&](const std::vector<std::size_t>& a, const std::vector<std::size_t>& b,
+                                      const std::string& sa, const std::string& sb, const DiplotypeScore& score,
+                                      double prior) {
+                    ++report.pool_branch_scored;
+                    const std::size_t round = live->rounds().size() + 1;
+                    pool_scored(a, b, sa, sb, score, prior, "branch",
+                                "branch" + std::to_string(branch.id) + "_round" + std::to_string(round), &out.items,
+                                round, true);
+                };
+                hooks.on_round = [&](const RepairRound& round) {
+                    write_running_status("tie branch " + std::to_string(branch.id) + " round " +
+                                         std::to_string(round.index) + " committed");
+                };
+                const bool branch_reproduced = live->run(hooks);
+                for (const std::size_t slot : {seeded.first, seeded.second}) {
+                    const auto pin = seed_pins.find(slot);
+                    if (pin != seed_pins.end() && --pin->second == 0) seed_pins.erase(pin);
+                    if (seeded.second == seeded.first) break;
+                }
+                out.rounds = live->rounds().size();
+                for (const RepairRound& round : live->rounds()) {
+                    if (!round.moved) continue;
+                    ++out.moves;
+                    out.moved_to.push_back(diplotype_identity(round.first, round.second));
+                }
+                out.stop = live->stop_reason();
+                out.last_round = live->rounds().empty() ? 0 : live->rounds().back().index;
+                out.terminal_first = live->incumbent_first();
+                out.terminal_second = live->incumbent_second();
+                out.terminal_total = live->incumbent_total();
+                out.executed_physical_origins = shared->cumulative_counters().physical_origins - before;
+                out.seconds = seconds_since(mark);
+                if (!branch_reproduced) {
+                    out.outcome = BranchOutcome::Incomplete;
+                    out.why = "its start did not reproduce";
+                } else if (live->converged()) {
+                    out.outcome = BranchOutcome::Converged;
+                } else if (out.stop == "rescore_incomplete" || out.stop == "tie_at_best") {
+                    out.outcome = BranchOutcome::Split;
+                } else {
+                    out.outcome = BranchOutcome::Incomplete;
+                    out.why = "stopped at " + out.stop;
+                }
+                return out;
+            };
+            TieBranchingReport branched;
+            try {
+                const TieSet root = terminal_tie(production_items, search->rounds().back().index, fragments.size(),
+                                                 scoring_options.mismatch_band);
+                std::vector<DiplotypeIdentity> root_history;
+                root_history.push_back(diplotype_identity(anchor_diplotype.first.alleles, anchor_diplotype.second.alleles));
+                for (const RepairRound& round : search->rounds()) {
+                    if (round.moved) root_history.push_back(diplotype_identity(round.first, round.second));
+                }
+                branched = run_tie_branching(root, root_history, options.repair_tie_max_branches, fragments.size(),
+                                             scoring_options.mismatch_band, run_branch, on_tie,
+                                             options.test_reverse_tie_branch_order);
+            } catch (const std::exception& error) {
+                branched.incomplete = std::string("tie branching failed: ") + error.what();
+            }
+            live.reset();
+            tie_incomplete = branched.incomplete;
+            report.tie_ties = branched.ties.size();
+            report.tie_branches_run = branched.branches.size();
+            report.tie_distinct_terminal_genotypes = branched.terminal_genotypes.size();
+            report.tie_incomplete_reason = tie_incomplete.empty() ? "none" : tie_incomplete;
+            report.tie_branch_physical_origins =
+                shared != nullptr ? shared->cumulative_counters().physical_origins - shared_before : 0;
+            report.tie_digest_memo_hits = digest_memo_hits - memo_hits_before;
+            report.tie_digest_memo_misses = digest_memo_misses - memo_misses_before;
+            if (shared != nullptr) {
+                report.cumulative = shared->cumulative_counters();   // the caps bind production and branches together
+                report.origin_cache_bytes_end = shared->origin_cache_bytes();
+            }
+            report.pool_identities = pool.size();
+            report.pool_repair_only = 0;
+            for (const PoolEntry& entry : pool) report.pool_repair_only += entry.in_union ? 0 : 1;
+            report.pool_score_mismatches = mismatches;
+            report.seconds_tie_branching = seconds_since(tie_mark);
+            // The two tables, rendered now and written with the final outputs.
+            const auto genotype_of = [&](const std::vector<std::size_t>& a, const std::vector<std::size_t>& b) {
+                std::string text;
+                for (std::size_t block = 0; block < block_count; ++block) {
+                    const auto pair = std::minmax(a[block], b[block]);
+                    text += (block == 0 ? "" : ",") + std::to_string(pair.first) + "/" + std::to_string(pair.second);
+                }
+                return text;
+            };
+            std::ostringstream ties_out;
+            ties_out << std::setprecision(17)
+                     << "tie\tbranch\tneighbour\thap1_alleles\thap2_alleles\tunordered_genotype\trepaired_block\t"
+                        "allele_x\tallele_y\tassignment\ttotal\tlog_likelihood\tfragment_term\texposure_term\tprior\t"
+                        "incumbent_total\timprovement\n";
+            for (const TieSet& tie : branched.ties) {
+                const double inc_total = tie.incumbent.score.log_likelihood + tie.incumbent.prior;
+                for (std::size_t k = 0; k < tie.tied.size(); ++k) {
+                    const TieItem& n = tie.tied[k];
+                    std::size_t block = 0;
+                    for (std::size_t b = 0; b < block_count; ++b) {
+                        if (n.first[b] != tie.incumbent.first[b] || n.second[b] != tie.incumbent.second[b]) block = b;
+                    }
+                    const auto pair = std::minmax(n.first[block], n.second[block]);
+                    const DiplotypeIdentity key = diplotype_identity(n.first, n.second);
+                    const double total = n.score.log_likelihood + n.prior;
+                    ties_out << tie.id << '\t' << tie.branch << '\t' << k << '\t' << join_alleles(key.first) << '\t'
+                             << join_alleles(key.second) << '\t' << genotype_of(n.first, n.second) << '\t'
+                             << model.blocks()[block].block_id << '\t' << pair.first << '\t' << pair.second << '\t'
+                             << (n.first[block] == pair.first ? 0 : 1) << '\t' << total << '\t'
+                             << n.score.log_likelihood << '\t' << n.score.fragment_term << '\t' << n.score.exposure_term
+                             << '\t' << n.prior << '\t' << inc_total << '\t' << total - inc_total << '\n';
+                }
+            }
+            tie_ties_text = ties_out.str();
+            std::ostringstream branches_out;
+            branches_out << std::setprecision(17)
+                         << "branch\tparent_tie\tstart_hap1\tstart_hap2\tstart_total\trounds\tmoves\tstop\toutcome\t"
+                            "terminal_hap1\tterminal_hap2\tterminal_genotype\tterminal_total\texecuted_physical_origins\t"
+                            "seconds\n";
+            for (const BranchRecord& record : branched.branches) {
+                const DiplotypeIdentity start = diplotype_identity(record.start.start.first, record.start.start.second);
+                const BranchResult& r = record.result;
+                const bool ended = !r.terminal_first.empty();
+                const DiplotypeIdentity end = ended ? diplotype_identity(r.terminal_first, r.terminal_second) : start;
+                branches_out << record.start.id << '\t' << record.start.parent_tie << '\t' << join_alleles(start.first)
+                             << '\t' << join_alleles(start.second) << '\t'
+                             << record.start.start.score.log_likelihood + record.start.start.prior << '\t' << r.rounds
+                             << '\t' << r.moves << '\t' << r.stop << '\t'
+                             << (r.outcome == BranchOutcome::Converged ? "converged"
+                                 : r.outcome == BranchOutcome::Split   ? "split"
+                                                                       : "incomplete")
+                             << '\t' << join_alleles(end.first) << '\t' << join_alleles(end.second) << '\t'
+                             << genotype_of(end.first, end.second) << '\t' << r.terminal_total << '\t'
+                             << r.executed_physical_origins << '\t' << r.seconds << '\n';
+            }
+            tie_branches_text = branches_out.str();
+        }
         claim_run();
+        if (report.tie_branched) {
+            atomic_write(prefix + ".tie_terminal_ties.tsv", tie_ties_text);
+            atomic_write(prefix + ".tie_branches.tsv", tie_branches_text);
+        }
+        if (report.tie_branched && !tie_incomplete.empty()) {
+            report.no_call_reason = "tie_branching_incomplete";
+            write_trajectory();
+            return stop_with(GenotypeRunStatus::RepairIncomplete,
+                             "improving-move tie branching did not complete (" + tie_incomplete +
+                                 "); the trajectory and the branch tables are kept and no genotype is emitted",
+                             nullptr, nullptr);
+        }
         if (!reproduced) {
             report.no_call_reason = "anchor_not_reproduced";
             write_trajectory();
@@ -1969,9 +2198,10 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
                 << search->incumbent_scored() << "); no genotype";
             return stop_with(GenotypeRunStatus::RepairIncomplete, why.str(), nullptr, nullptr);
         }
-        if (!report.converged) {
+        if (!report.converged && !report.tie_branched) {
             // A round tie that excludes the incumbent is a tie among improving moves: the search cannot
-            // choose between them and fails closed. Every other non-converged stop keeps its own name.
+            // choose between them and fails closed (v1, or tie branching off). Every other non-converged stop
+            // keeps its own name.
             const std::string& stop = report.stop_reason;
             report.no_call_reason =
                 stop == "rescore_incomplete" || stop == "tie_at_best" ? "improving_move_tie" : stop;
@@ -2662,7 +2892,8 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
         write_trajectory();
 
         if (decided.decision == TopSetDecision::DistinctTie) {
-            report.no_call_reason = "distinct_tie";
+            // After tie branching the pooled top set spans the branches: disagreement there is a divergent tie.
+            report.no_call_reason = report.tie_branched ? "divergent_tie" : "distinct_tie";
             return stop_with(GenotypeRunStatus::RescoreIncomplete,
                              "the pooled top set holds " + std::to_string(decided.top_groups.size()) +
                                  " candidates tied on total score that disagree at block(s) " + report.disagreeing_blocks +

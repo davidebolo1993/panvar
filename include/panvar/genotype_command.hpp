@@ -110,6 +110,12 @@ struct GenotypeCommandOptions {
     std::uint64_t repair_max_state_classes = 4200000000ULL;
     std::uint64_t repair_max_piece_hits = 14000000000ULL;
     std::uint64_t repair_max_latent_pairs = 14000000000ULL;
+    // v2: exact branch-and-pool at an improving-move tie (off by default, so a v1 profile runs unchanged). Every
+    // tied neighbour is continued by a warm branch over the production search's scoring context, seeded by the
+    // exact block delta of a promoted repair; every candidate joins the pool and the pooled rule decides.
+    bool repair_tie_branching = false;
+    std::size_t repair_tie_max_branches = 16;
+    bool test_reverse_tie_branch_order = false;   // gate hook only: the pooled result must not depend on it
     // Process limits, enforced by a watchdog over the whole run (0: none). Crossing one stops the
     // process at once: committed repair rounds stay as <prefix>.repair_rounds.partial.tsv, the staged
     // graph and every final output are removed, and the status says TIME_LIMIT or RESOURCE_REFUSAL.
