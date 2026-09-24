@@ -35,10 +35,12 @@ while IFS=$'\t' read -r job reason; do
   IFS=$'\t' read -r _ _ _ _ _ _ model r1 r2 lib cur _ <<< "$row"
   d="$OUT/$job"; mkdir -p "$d"
   if [ -f "$d/call.diag.status.tsv" ] && ! grep -q $'^state\tRUNNING' "$d/call.diag.status.tsv"; then continue; fi
-  if [ "$reason" = union_scoring_cap ] && [ -f "$d/call.mosaic_status.tsv" ]; then continue; fi
+  if { [ "$reason" = union_scoring_cap ] || [ "$reason" = rescore_incomplete ]; } && \
+     grep -q '^settings_overridden_after_profile.*max_physical_origins=' "$d/call.mosaic_status.tsv" 2>/dev/null; then continue; fi
   for f in "$model" "$r1" "$r2" "$lib" "$cur"; do bound "$f"; done
   extra=()
-  [ "$reason" = union_scoring_cap ] && extra=(--union-max-physical-origins "$UNION_CAP_EXPERIMENT")
+  # The campaign ledger names this pre-repair refusal rescore_incomplete (its consolidation, union_scoring_cap).
+  [ "$reason" = union_scoring_cap ] || [ "$reason" = rescore_incomplete ] && extra=(--union-max-physical-origins "$UNION_CAP_EXPERIMENT")
   echo "[$(date -u +%H:%M:%S)] $job ($reason)"
   "${TIME[@]}" "$PROBE" tie-branch --profile "$PROFILE" --threads 8 --gfa "$model" --reference "$REF" --reads1 "$r1" \
     --reads2 "$r2" --library "$lib" --panel-curation "$cur" --out-prefix "$d/call" ${extra[@]+"${extra[@]}"} > "$d/log" 2> "$d/time"
@@ -53,7 +55,7 @@ while IFS=$'\t' read -r job reason; do
   row="$(awk -F'\t' -v j="$job" '$1==j' "$CAMPAIGN/jobs.tsv")"
   IFS=$'\t' read -r _ _ _ _ scheme label model r1 r2 lib cur truth _ <<< "$row"
   d="$OUT/$job"
-  if [ "$reason" = union_scoring_cap ]; then
+  if [ "$reason" = union_scoring_cap ] || [ "$reason" = rescore_incomplete ]; then
     # The experiment-only rerun's own outcome, whatever it is: evaluate it as its status says.
     "$PROBE" evaluate --scheme "$scheme" --donor "$label" --reference "$REF" --run-prefix "$d/call" --model-gfa "$model" \
       --truth-gfa "$truth" --panel-curation "$cur" --out "$d/call.eval" > "$d/eval.log" 2>&1

@@ -52,6 +52,8 @@ def main():
         if not (entry["campaign"] == "mosaic" and entry["outcome"] == "no_call"):
             continue
         d = out / entry["job"]
+        if entry["detail"] == "rescore_incomplete":
+            entry = dict(entry, detail="union_scoring_cap")   # the ledger's name for the pre-repair union-cap refusal
         diag = kv(d / "call.diag.status.tsv")
         ties = list(csv.DictReader(open(d / "call.diag.terminal_ties.tsv"), delimiter="\t")) \
             if (d / "call.diag.terminal_ties.tsv").exists() else []
