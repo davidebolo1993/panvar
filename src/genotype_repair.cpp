@@ -1207,8 +1207,16 @@ PooledDecision decide_pooled_genotype(std::vector<PoolCandidate> pool, std::size
 }
 
 SymmetryReport check_phase_switch_symmetry(const std::vector<SymmetryTraceItem>& a,
-                                           const std::vector<SymmetryTraceItem>& b, std::size_t block) {
+                                           const std::vector<SymmetryTraceItem>& b, std::size_t block,
+                                           std::size_t fragment_count) {
     SymmetryReport report;
+    // certify_scored_ranking's per-candidate bound, with its default floor
+    const auto error_bound = [&](const SymmetryTraceItem& item) {
+        const double terms = static_cast<double>(fragment_count + 16);
+        return std::max(terms * std::numeric_limits<double>::epsilon() *
+                            (item.score.absolute_term_sum + std::fabs(item.prior)),
+                        0.5 * CertificationOptions{}.minimum_tie_tolerance_nats);
+    };
     const auto key_of = [](const SymmetryTraceItem& item, bool switch_block, std::size_t at) {
         std::vector<std::size_t> x = item.first;
         std::vector<std::size_t> y = item.second;
@@ -1238,9 +1246,12 @@ SymmetryReport check_phase_switch_symmetry(const std::vector<SymmetryTraceItem>&
                 std::memcmp(&item.prior, &other.prior, sizeof(double)) == 0) {
                 ++depth.bit_identical;
             }
-            depth.max_total_difference =
-                std::max(depth.max_total_difference, std::fabs((item.score.log_likelihood + item.prior) -
-                                                               (other.score.log_likelihood + other.prior)));
+            const double difference = std::fabs((item.score.log_likelihood + item.prior) -
+                                                (other.score.log_likelihood + other.prior));
+            const double bound = error_bound(item) + error_bound(other);
+            if (difference <= bound) ++depth.indistinguishable;
+            depth.max_total_difference = std::max(depth.max_total_difference, difference);
+            depth.max_difference_over_bound = std::max(depth.max_difference_over_bound, difference / bound);
         }
         report.depths.push_back(depth);
         if (report.first_break_round == 0) {
@@ -1256,8 +1267,23 @@ SymmetryReport check_phase_switch_symmetry(const std::vector<SymmetryTraceItem>&
                 report.first_break = why;
             }
         }
+        if (report.numeric_first_break_round == 0) {
+            std::string why;
+            if (r > rounds_a || r > rounds_b) why = "one branch stopped at an earlier round";
+            else if (depth.a_candidates != depth.b_candidates || depth.matched != depth.b_candidates)
+                why = "the switched neighbourhoods differ (" + std::to_string(depth.b_candidates - depth.matched) +
+                      " candidates without a switched counterpart)";
+            else if (depth.indistinguishable != depth.matched)
+                why = std::to_string(depth.matched - depth.indistinguishable) +
+                      " switched candidates differ beyond the certified numerical bound";
+            if (!why.empty()) {
+                report.numeric_first_break_round = r;
+                report.numeric_first_break = why;
+            }
+        }
     }
     report.equivalent = rounds > 0 && report.first_break_round == 0;
+    report.numerically_equivalent = rounds > 0 && report.numeric_first_break_round == 0;
     return report;
 }
 

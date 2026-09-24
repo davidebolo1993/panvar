@@ -2223,7 +2223,8 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
                     std::ostringstream symmetry;
                     symmetry << std::setprecision(17)
                              << "tie\tswitch_block\tbranch_a\tbranch_b\ttied_pair_bit_identical\tequivalent\t"
-                                "first_break_round\tfirst_break\tdepths\n";
+                                "first_break_round\tfirst_break\tnumerically_equivalent\tnumeric_first_break_round\t"
+                                "numeric_first_break\tmax_difference_over_bound\tdepths\n";
                     for (const Tie& tie : ties) {
                         if (tie.tied.size() != 2) continue;
                         const RoundItem& x = tie.tied[0];
@@ -2242,7 +2243,8 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
                         }
                         if (!local_switch || block == block_count) {
                             symmetry << tie.id << "\tNA\t" << ax->second << '\t' << ay->second
-                                     << "\tNA\tfalse\t0\tthe tied pair is not a local phase switch at one block\tNA\n";
+                                     << "\tNA\tfalse\t0\tthe tied pair is not a local phase switch at one block\tfalse\t0\t"
+                                        "the tied pair is not a local phase switch at one block\tNA\tNA\n";
                             continue;
                         }
                         const auto to_trace = [](const std::vector<RoundItem>& items) {
@@ -2251,22 +2253,30 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
                             return out;
                         };
                         const SymmetryReport report = check_phase_switch_symmetry(
-                            to_trace(branch_items[ax->second]), to_trace(branch_items[ay->second]), block);
+                            to_trace(branch_items[ax->second]), to_trace(branch_items[ay->second]), block,
+                            fragments.size());
                         const bool pair_identical =
                             std::memcmp(&x.score.log_likelihood, &y.score.log_likelihood, sizeof(double)) == 0 &&
                             std::memcmp(&x.score.fragment_term, &y.score.fragment_term, sizeof(double)) == 0 &&
                             std::memcmp(&x.score.exposure_term, &y.score.exposure_term, sizeof(double)) == 0 &&
                             std::memcmp(&x.prior, &y.prior, sizeof(double)) == 0;
                         std::string depths;
+                        double over_bound = 0.0;
                         for (const SymmetryDepth& d : report.depths) {
                             depths += (depths.empty() ? "" : ";") + std::to_string(d.round) + ":" +
                                       std::to_string(d.a_candidates) + "/" + std::to_string(d.b_candidates) + "/" +
-                                      std::to_string(d.matched) + "/" + std::to_string(d.bit_identical);
+                                      std::to_string(d.matched) + "/" + std::to_string(d.bit_identical) + "/" +
+                                      std::to_string(d.indistinguishable);
+                            over_bound = std::max(over_bound, d.max_difference_over_bound);
                         }
                         symmetry << tie.id << '\t' << model.blocks()[block].block_id << '\t' << ax->second << '\t'
                                  << ay->second << '\t' << (pair_identical ? "true" : "false") << '\t'
                                  << (report.equivalent ? "true" : "false") << '\t' << report.first_break_round << '\t'
-                                 << (report.first_break.empty() ? "none" : report.first_break) << '\t' << depths << '\n';
+                                 << (report.first_break.empty() ? "none" : report.first_break) << '\t'
+                                 << (report.numerically_equivalent ? "true" : "false") << '\t'
+                                 << report.numeric_first_break_round << '\t'
+                                 << (report.numeric_first_break.empty() ? "none" : report.numeric_first_break) << '\t'
+                                 << over_bound << '\t' << depths << '\n';
                     }
                     atomic_write(diag + ".symmetry.tsv", symmetry.str());
                 }

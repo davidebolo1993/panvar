@@ -317,6 +317,11 @@ PooledDecision decide_pooled_genotype(std::vector<PoolCandidate> pool, std::size
 // and priors -- and only then is continuing one of them provably enough. Anything else -- a candidate one
 // branch scores and the other does not (visited sets differ), a score or prior that differs in a single bit,
 // a different number of rounds -- breaks the equivalence at that depth. Convergence alone proves nothing.
+// Bit identity is the exact criterion, but two haplotype orders sum the same terms in different orders, so
+// an exactly symmetric switch can still differ in the last bits. The second verdict therefore takes the
+// certify rule's own equality: counterparts whose totals differ by no more than the sum of their numerical
+// error bounds (the bound certify_scored_ranking computes, from `fragment_count`) are indistinguishable, the
+// same way the caller's tie is. Neighbourhoods and round counts must still match exactly for either verdict.
 struct SymmetryTraceItem {
     std::size_t round = 0;
     std::vector<std::size_t> first;
@@ -330,15 +335,21 @@ struct SymmetryDepth {
     std::size_t b_candidates = 0;
     std::size_t matched = 0;             // B candidates whose local switch A also scored
     std::size_t bit_identical = 0;       // of those, identical score components and prior, bit for bit
+    std::size_t indistinguishable = 0;   // of those, totals within the certify rule's summed error bounds
     double max_total_difference = 0.0;   // over matched candidates
+    double max_difference_over_bound = 0.0;   // max |total difference| / summed error bound
 };
 struct SymmetryReport {
-    bool equivalent = false;
+    bool equivalent = false;             // bit-exact
     std::size_t first_break_round = 0;   // 0: none
     std::string first_break;             // what broke there
+    bool numerically_equivalent = false;          // under the certify rule's numerical equality
+    std::size_t numeric_first_break_round = 0;
+    std::string numeric_first_break;
     std::vector<SymmetryDepth> depths;
 };
 SymmetryReport check_phase_switch_symmetry(const std::vector<SymmetryTraceItem>& a,
-                                           const std::vector<SymmetryTraceItem>& b, std::size_t block);
+                                           const std::vector<SymmetryTraceItem>& b, std::size_t block,
+                                           std::size_t fragment_count);
 
 } // namespace panvar

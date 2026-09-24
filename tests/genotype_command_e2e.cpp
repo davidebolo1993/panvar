@@ -2000,9 +2000,25 @@ void test_phase_switch_symmetry() {
     };
     std::vector<panvar::SymmetryTraceItem> b;
     for (const auto& item : a) b.push_back(switched(item, block));
-    const panvar::SymmetryReport same = panvar::check_phase_switch_symmetry(a, b, block);
+    const panvar::SymmetryReport same = panvar::check_phase_switch_symmetry(a, b, block, 10);
     require(same.equivalent && same.first_break_round == 0 && same.depths.size() == 2,
             "branches that are local switches of each other, bit for bit, must be equivalent");
+    require(same.numerically_equivalent, "bit-identical switched branches are numerically equivalent too");
+
+    // Summation order: the same switched branches with one counterpart's exposure term an ulp away (its
+    // total within the certified bound) are not bit-exact, but are equivalent under the certify rule's equality.
+    std::vector<panvar::SymmetryTraceItem> b_ulp = b;
+    b_ulp[3].score.exposure_term = std::nextafter(b_ulp[3].score.exposure_term, 0.0);
+    b_ulp[3].score.log_likelihood = std::nextafter(b_ulp[3].score.log_likelihood, 0.0);
+    const panvar::SymmetryReport ulp = panvar::check_phase_switch_symmetry(a, b_ulp, block, 10);
+    require(!ulp.equivalent && ulp.first_break_round == 2 && ulp.numerically_equivalent,
+            "an ulp of summation order must break bit identity but not the certified numerical equality");
+    // ... while a difference beyond the bound (1e-6 nats here, far above ~1e-9) breaks both.
+    std::vector<panvar::SymmetryTraceItem> b_far = b;
+    b_far[3].score.log_likelihood += 1e-6;
+    const panvar::SymmetryReport far = panvar::check_phase_switch_symmetry(a, b_far, block, 10);
+    require(!far.numerically_equivalent && far.numeric_first_break_round == 2,
+            "a difference beyond the certified bound must break the numerical equality");
 
     // ADVERSARIAL: locally genotype-equivalent at depth 1, but at depth 2 the switched candidate carries a
     // different prior (a switch the Li-Stephens path can take on one haplotype and not the other), so branch B
@@ -2011,9 +2027,11 @@ void test_phase_switch_symmetry() {
     std::vector<panvar::SymmetryTraceItem> b2 = b;
     b2[4].prior = std::nextafter(b2[4].prior, 0.0);       // one bit
     b2.push_back(traced(2, {0, 1, 2}, {4, 0, 7}, -990.0, -6.0));   // a move only branch B makes
-    const panvar::SymmetryReport broken = panvar::check_phase_switch_symmetry(a, b2, block);
+    const panvar::SymmetryReport broken = panvar::check_phase_switch_symmetry(a, b2, block, 10);
     require(!broken.equivalent && broken.first_break_round == 2,
             "a single-bit score difference at depth 2 must break equivalence at depth 2, not be inferred away");
+    require(!broken.numerically_equivalent && broken.numeric_first_break_round == 2,
+            "a move only one branch makes breaks the numerical equality too");
     std::vector<panvar::PoolCandidate> terminals = {pooled({4, 0, 2}, {1, 1, 3}, -990.0, -6.0),
                                                     pooled({0, 1, 2}, {4, 0, 7}, -990.0, -6.0)};
     require(panvar::decide_pooled_genotype(terminals, 3, 10, 6).decision == panvar::TopSetDecision::DistinctTie,
@@ -2022,11 +2040,13 @@ void test_phase_switch_symmetry() {
     // A candidate one branch scores and the other does not (their visited sets differ) also breaks it.
     std::vector<panvar::SymmetryTraceItem> b3 = b;
     b3.erase(b3.begin() + 2);
-    const panvar::SymmetryReport visited = panvar::check_phase_switch_symmetry(a, b3, block);
+    const panvar::SymmetryReport visited = panvar::check_phase_switch_symmetry(a, b3, block, 10);
     require(!visited.equivalent && visited.first_break_round == 1,
             "a switched neighbourhood missing a candidate must break equivalence at that depth");
-    std::cout << "  phase-switch symmetry: exact switched branches equivalent; one-bit prior break, divergent terminals "
-                 "and visited-set asymmetry all detected\n";
+    require(!visited.numerically_equivalent && visited.numeric_first_break_round == 1,
+            "a visited-set asymmetry breaks the numerical equality too");
+    std::cout << "  phase-switch symmetry: exact switched branches equivalent; an ulp breaks bit identity only; a gap "
+                 "beyond the bound, one-bit prior break, divergent terminals and visited-set asymmetry all detected\n";
 }
 
 // ---- panel-anchored adaptive completion, end to end ------------------------------------------------
