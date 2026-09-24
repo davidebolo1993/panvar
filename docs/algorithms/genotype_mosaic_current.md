@@ -300,6 +300,26 @@ work reconciled exactly with the cumulative counters, the cumulative cap exact a
 block NOT_EVALUATED beside the flagged ones, the genotype untouched -- and 1/4/8 threads); and the campaign
 gate's profile checks (v3 = v2 plus exactly the guard; v1 and v2 never set it).
 
+## v4: repair round limit 32 (2026-09-25)
+
+`profiles/genotype_c4_v4.tsv` and `profiles/genotype_c4_v4_campaign_local.tsv` are their v3 profiles key for
+key except the name and `repair_rounds 32` (was 11); the campaign gate checks it. The final C4 campaign uses v4.
+
+Why: the three v1 round-cap no-calls (`loo.HG02282.2`, `loo.NA19384.5`, `loo.NA18989.10`) were searches still
+improving (by 7.3, 11.3 and 3.7 nats) when the 11-round cap stopped them. Rerun truth-free with only the round
+limit (32) and a 300 s wall limit overridden (`tests/results/.../v3_round_cap/<job>/RECORD.md`): rounds 1-11
+reproduce the frozen trajectories exactly, and each converges normally (`no_improvement`) at round 12, 12 and
+14 -- maximum 14, with no tie, cycle, refusal or timeout, and cumulative resource margins above 99%. 32 is frozen
+with headroom; a search stops at convergence, so an easy sample never pays for unused rounds. The three become
+strict calls with excess 17, 11 and 6,343 bp.
+
+NA18989.10's 6,343 bp are 6,332 bp at sv:7 (called 65,449/59,084 bp, truth two ~65 kb alleles), the same sv:7
+error NA18989's v1 calls carry at 2x, 5x and 30x. Its representation filter is PASS: the marker prefers another
+pair by 232 nats, but one with the same exposure, so it is not a depth-versus-sequence conflict and the guard is
+not meant to flag it -- this is not a guard failure. It has 0/11 high-quality blocks, because every block's
+genotype support is `PRIOR_ONLY`: the 6.3 kb spike stays in the all-quality and representation-PASS views and is
+absent from the high-quality view.
+
 ## Frozen defaults
 
 State limit **256** (production) and **1,024** (diagnostic comparison width) -- counted in allele-prefix
@@ -760,8 +780,8 @@ State as of 2026-09-24:
   lacks the truth-like allele (HG01114 sv:7, above). The caller must flag such calls, truth-free, without
   changing the genotype the likelihood selects.
 
-- **Remaining correctness item: the ten non-tie no-calls** of v1 (seven union-scoring-cap refusals at 30x,
-  three repair round caps still improving at round 11), to be resolved with bounded representative diagnostics.
+- **The ten non-tie no-calls of v1.** The three repair round caps are resolved (v4, `repair_rounds 32`). The seven
+  union-scoring-cap refusals at 30x are safe resource refusals, addressed by acceleration, not by a higher cap.
 
 Later work, not blocking correctness: performance engineering (the per-request merge dominates warm
 branches; lower-complexity placement for 30x large loci), the final C4 v3 campaign, and other loci.
@@ -800,11 +820,11 @@ The 30x footprint blocker below was resolved for the campaign by the 3.5 GiB loc
 
 ## Ordered next work
 
-1. The fail-closed and schema correction of the representation guard (this batch).
-2. Resolve the ten non-tie no-calls with bounded representative diagnostics: seven union-scoring-cap
-   refusals and three repair round caps (`scripts/c4_non_tie_no_call_inventory.py`; cheapest representatives
-   `loo.NA19434.30` and `loo.HG02282.2`, not yet run).
-3. Major speed engineering.
+1. **Done:** the fail-closed and schema correction of the representation guard (`c810ef0`).
+2. **Done for the three round caps:** all converge by round 14; `repair_rounds 32` is frozen in v4. The seven
+   union-scoring-cap refusals (all 30x) are resource/performance refusals, handled in the acceleration phase,
+   never by raising the production cap.
+3. Major speed engineering, starting with the union stage.
 4. One final C4 v3 campaign.
 5. Final all-quality, representation-PASS and high-quality plots.
 6. Other loci.

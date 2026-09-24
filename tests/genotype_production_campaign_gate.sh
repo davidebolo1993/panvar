@@ -46,6 +46,15 @@ for v in genotype_c4 genotype_c4_campaign_local; do
   same "$v v3 names itself v3" "$(awk -F'\t' '$1=="profile"{print $2}' "$v3p")" "$(awk -F'\t' '$1=="profile"{print $2}' "$v2p" | sed 's/-v2/-v3/')"
   same "$v v1 and v2 never set the guard" "$(cat "$REPO/profiles/$v.tsv" "$v2p" | grep -c '^representation_guard')" "0"
 done
+# The v4 profiles are their v3 profiles, key for key, except the name and repair_rounds 11 -> 32.
+v4() { grep -v '^#' "$1" | grep -v -E '^(profile|repair_rounds)'$'\t' | sort; }
+for v in genotype_c4 genotype_c4_campaign_local; do
+  v3p="$REPO/profiles/${v/genotype_c4/genotype_c4_v3}.tsv"; v4p="$REPO/profiles/${v/genotype_c4/genotype_c4_v4}.tsv"
+  same "$v v4 = v3 apart from the round limit" "$(diff <(v4 "$v3p") <(v4 "$v4p") > /dev/null && echo identical || echo DIFFERS)" "identical"
+  same "$v v3 repair_rounds" "$(awk -F'\t' '$1=="repair_rounds"{print $2}' "$v3p")" "11"
+  same "$v v4 repair_rounds" "$(awk -F'\t' '$1=="repair_rounds"{print $2}' "$v4p")" "32"
+  same "$v v4 names itself v4" "$(awk -F'\t' '$1=="profile"{print $2}' "$v4p")" "$(awk -F'\t' '$1=="profile"{print $2}' "$v3p" | sed 's/-v3/-v4/')"
+done
 bash "$REPO/tests/genotype_production_c4_campaign.sh" launch /nonexistent "$WORK/plan" > "$WORK/launch.log" 2>&1
 same "launch without approval" "$?" "2"
 same "nothing launched" "$(find "$WORK/plan" -name '*.mosaic_status.tsv' | wc -l | tr -d ' ')" "0"
