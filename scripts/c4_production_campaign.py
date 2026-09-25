@@ -15,6 +15,12 @@ representation guard, 32 repair rounds -- plus the reviewed campaign-local resou
 settings), and truth enters only the evaluation that follows it. The production binary, the profile, the plan and
 the scheduler (concurrent jobs, threads per call) are the plan's: launch refuses anything else.
 
+The reviewed plan is plan_manifest.tsv, which names the sha256 and size of jobs.tsv, settings.tsv and
+source_inputs.tsv; GENOTYPE_C4_CAMPAIGN_APPROVED must be the manifest's sha256. Before anything is staged or called,
+launch verifies, in order: the approval against the manifest; every component against the manifest; the production
+binary, profile and scheduler against settings.tsv; every campaign file settings.tsv hashed; and every frozen held-out
+source in source_inputs.tsv by content and size. Inputs created afterwards are bound in inputs.tsv as they are made.
+
 Outcomes. A finished job is exactly one of
     strict_call                 COMPLETE / strict_call: genotypes, block genotypes, the haplotype FASTA and the
                                 repair rounds exist
@@ -31,11 +37,12 @@ Outcomes. A finished job is exactly one of
                                   time_limit, footprint_limit   the watchdog stopped the process (not evaluated)
                                   improving_move_tie        v1 only (tie branching off): the repair rounds. Under
                                                             v6 an improving-move tie is branched, so it cannot occur
-and an unfinished one is pending, or failed:<why> after an external failure (a crash, a signal, a missing or
-RUNNING status, a failed evaluation). Only external failures are retried; a job that fails externally on
-every attempt stops the campaign, as does any harness or provenance defect (an outcome whose files break its
-contract, an input whose content moved, a binary or profile that is not the plan's or changed between
-launches). A legitimate no-call never stops anything.
+and an unfinished one is pending, or failed:<why> after an external failure (a crash, a signal, a process that
+exited without writing a status, a RUNNING status, a failed evaluation). Only external failures are retried; a job
+that fails externally on every attempt stops the campaign, as does any harness or provenance defect (an outcome whose
+files break its contract, an input whose content moved, a binary or profile that is not the plan's or changed between
+launches), any outcome label this runner does not know, and any exception a worker raises -- every finished worker's
+result is collected, so none is left unseen. A legitimate no-call never stops anything.
 
 Inputs are bound by SHA-256 the moment they are created (inputs.tsv) and re-verified on every reuse. Jobs are
 isolated: each writes only under its own prefix. completeness.tsv is rewritten after every job.
@@ -64,6 +71,8 @@ SOURCE_COVERAGE = "30"
 MAX_ATTEMPTS = 3            # one run plus two retries, for external failures only
 PROCESS_BACKSTOP_SECONDS = 4000   # the profile's own watchdog stops a call at 3600 s; this catches a hang
 EXTERNAL_EXIT_CODES_OK = {0, 1, 124, 125}
+COMPLETED = ("strict_call", "genotype_equivalent_call", "no_call")   # the only outcomes that finish a job
+MANIFEST_COMPONENTS = ("jobs.tsv", "settings.tsv", "source_inputs.tsv")
 
 
 class Defect(RuntimeError):
@@ -392,7 +401,10 @@ def run_job(job, build, evaluator, threads):
     if code not in EXTERNAL_EXIT_CODES_OK:
         return "failed", f"exit {code}"
     outcome, detail = classify(job)
-    if outcome in ("failed", "pending", "defect"):
+    if outcome == "pending":
+        # The process exited but left no status: an external failure (retried), never a finished job.
+        return "failed", f"the process exited ({code}) without a status"
+    if outcome in ("failed", "defect"):
         return outcome, detail
     if outcome == "no_call" and detail in ("footprint_limit", "time_limit"):
         return outcome, detail   # the process was stopped: there is no model or call to evaluate
@@ -449,17 +461,136 @@ class Ledger:
             os.replace(tmp, self.out / "completeness.tsv")
 
     def finished(self, name):
-        return self.rows[name]["outcome"] in ("strict_call", "genotype_equivalent_call", "no_call")
+        return self.rows[name]["outcome"] in COMPLETED
+
+
+def verify_plan(out, approved):
+    """The reviewed plan is plan_manifest.tsv: the approval names its hash, and it names the hash of every component.
+    Returns the settings."""
+    manifest = out / "plan_manifest.tsv"
+    if not manifest.exists():
+        raise Defect(f"no plan manifest at {manifest}")
+    if approved != sha256(manifest):
+        raise Defect("launch refused: the approval does not name this plan's manifest")
+    with open(manifest) as handle:
+        rows = {r["component"]: r for r in csv.DictReader(handle, delimiter="\t")}
+    if sorted(rows) != sorted(MANIFEST_COMPONENTS):
+        raise Defect(f"the plan manifest names {sorted(rows)}, not {sorted(MANIFEST_COMPONENTS)}")
+    for name, row in rows.items():
+        path = out / name
+        if not path.exists() or sha256(path) != row["sha256"] or str(os.path.getsize(path)) != row["bytes"]:
+            raise Defect(f"launch refused: {name} is not the component the plan manifest reviewed")
+    settings = key_values(out / "settings.tsv")
+    if settings is None or settings.get("jobs_sha256") != sha256(out / "jobs.tsv"):
+        raise Defect("jobs.tsv does not match its plan's settings.tsv")
+    return settings
+
+
+def verify_sources(out):
+    """Every frozen held-out source the plan will read, by content and size, before anything is staged."""
+    with open(out / "source_inputs.tsv") as handle:
+        rows = list(csv.DictReader(handle, delimiter="\t"))
+    if not rows:
+        raise Defect("source_inputs.tsv lists no source")
+    for row in rows:
+        path = row["path"]
+        if not os.path.isfile(path) or str(os.path.getsize(path)) != row["bytes"] or sha256(path) != row["sha256"]:
+            raise Defect(f"launch refused: the frozen source {path} is not the one the plan bound")
+    return len(rows)
+
+
+def attempt_job(job, build, evaluator, threads, profile_sha, inputs):
+    """One attempt: the call and its evaluation, then -- for a finished job only -- its provenance."""
+    outcome, detail = run_job(job, build, evaluator, threads)
+    if outcome in COMPLETED:
+        status = key_values(job["out_prefix"] + ".mosaic_status.tsv")
+        try:
+            check_provenance(job, status, profile_sha, threads, inputs)
+        except Defect as defect:
+            return "defect", str(defect)
+    return outcome, detail
+
+
+def dispatch(todo, ledger, workers, attempt, prepare=None, log=None):
+    """Runs `todo` through attempt(job) -> (outcome, detail), `workers` at a time, preparing each job's inputs
+    serially first. Returns the stop reasons: empty when every job ran to a completed outcome.
+
+    Fail closed: a completed outcome is recorded and finishes the job; `failed` (an external failure: an exit, a
+    signal, a missing status) is retried up to MAX_ATTEMPTS and then stops the campaign; `defect` and any label this
+    runner does not know stop it at once. A worker that raises is recorded and stops the campaign, and every
+    finished future's result is collected, so no exception can sit unseen in a future while dispatch continues."""
+    log = log or (lambda message: print(message, flush=True))
+    stop = threading.Event()
+    reasons = []
+    guard = threading.Lock()
+
+    def halt(reason):
+        with guard:
+            reasons.append(reason)
+        stop.set()
+
+    def work(job):
+        attempts = int(ledger.rows[job["job"]].get("attempts") or 0)
+        while attempts < MAX_ATTEMPTS and not stop.is_set():
+            attempts += 1
+            outcome, detail = attempt(job)
+            if outcome in COMPLETED:
+                ledger.record(job, outcome, detail, attempts)
+                log(f"[{now()}] {job['job']}: {outcome} {detail}")
+                return
+            if outcome == "failed":
+                ledger.record(job, "failed", detail, attempts)
+                log(f"[{now()}] {job['job']}: external failure ({detail}), attempt {attempts}")
+                continue
+            what = detail if outcome == "defect" else f"unknown outcome {outcome!r} ({detail})"
+            ledger.record(job, "defect", what, attempts)
+            halt(f"{job['job']}: {what}")
+            return
+        if not stop.is_set():
+            halt(f"{job['job']}: repeated external failure")
+
+    def guarded(job):
+        try:
+            work(job)
+        except Exception as error:   # an unexpected worker failure is a stop, never a silent future
+            attempts = int(ledger.rows[job["job"]].get("attempts") or 0)
+            ledger.record(job, "defect", f"worker raised {type(error).__name__}: {error}", attempts)
+            halt(f"{job['job']}: worker raised {type(error).__name__}: {error}")
+
+    def collect(done):
+        for future in done:
+            try:
+                future.result()
+            except Exception as error:
+                halt(f"a worker future raised {type(error).__name__}: {error}")
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+        pending = set()
+        for job in todo:
+            if stop.is_set():
+                break
+            if prepare is not None:
+                try:
+                    prepare(job)
+                except Exception as error:
+                    halt(f"{job['job']}: input preparation failed: {error}")
+                    break
+            while len(pending) >= workers:
+                done, pending = concurrent.futures.wait(pending, return_when=concurrent.futures.FIRST_COMPLETED)
+                collect(done)
+            pending.add(pool.submit(guarded, job))
+        done, _ = concurrent.futures.wait(pending)
+        collect(done)
+    return reasons
 
 
 def launch(args):
     out = pathlib.Path(args.out).resolve()
     build = pathlib.Path(args.build).resolve()
     evaluator = pathlib.Path(args.evaluator).resolve() if args.evaluator else build / "genotype_probe"
+    # The whole reviewed plan first: the approval names the manifest, the manifest every component.
+    settings = verify_plan(out, os.environ.get("GENOTYPE_C4_CAMPAIGN_APPROVED", ""))
     jobs = read_jobs(out)
-    settings = key_values(out / "settings.tsv")
-    if settings is None or settings.get("jobs_sha256") != sha256(out / "jobs.tsv"):
-        raise Defect("jobs.tsv does not match its plan's settings.tsv")
     profile_sha = sha256(PROFILE)
     binary = {"panvar": sha256(build / "panvar"), "genotype_probe": sha256(evaluator)}
     # The plan names the production profile, binary and scheduler; nothing else may run it.
@@ -476,6 +607,8 @@ def launch(args):
         path = REPO / name[: -len("_sha256")]
         if not path.exists() or sha256(path) != value:
             raise Defect(f"launch refused: {path.relative_to(REPO)} is not the file the plan reviewed")
+    # The frozen held-out sources, before anything is staged or run.
+    print(f"[{now()}] {verify_sources(out)} frozen source inputs verified", flush=True)
     launch_file = out / "launch.tsv"
     # The production binary, the profile, the plan and the scheduler are fixed for the whole campaign. The
     # EVALUATOR (genotype_probe) may be corrected between launches -- it never touches a call -- and every
@@ -525,56 +658,12 @@ def launch(args):
     todo = [j for j in jobs if not ledger.finished(j["job"])]
     print(f"[{now()}] {len(jobs) - len(todo)} of {len(jobs)} jobs already finished; {len(todo)} to run "
           f"with {args.jobs} job(s) x {args.threads} thread(s)", flush=True)
-    stop = threading.Event()
-    stop_reason = []
-
-    def work(job):
-        attempts = int(ledger.rows[job["job"]].get("attempts") or 0)
-        while attempts < MAX_ATTEMPTS and not stop.is_set():
-            attempts += 1
-            outcome, detail = run_job(job, build, evaluator, args.threads)
-            if outcome == "defect":
-                ledger.record(job, "defect", detail, attempts)
-                stop_reason.append(f"{job['job']}: {detail}")
-                stop.set()
-                return
-            if outcome != "failed":
-                status = key_values(job["out_prefix"] + ".mosaic_status.tsv")
-                try:
-                    check_provenance(job, status, profile_sha, args.threads, inputs)
-                except Defect as defect:
-                    ledger.record(job, "defect", str(defect), attempts)
-                    stop_reason.append(str(defect))
-                    stop.set()
-                    return
-                ledger.record(job, outcome, detail, attempts)
-                print(f"[{now()}] {job['job']}: {outcome} {detail}", flush=True)
-                return
-            ledger.record(job, "failed", detail, attempts)
-            print(f"[{now()}] {job['job']}: external failure ({detail}), attempt {attempts}", flush=True)
-        if not stop.is_set():
-            stop_reason.append(f"{job['job']}: repeated external failure")
-            stop.set()
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as pool:
-        pending = set()
-        for job in todo:
-            if stop.is_set():
-                break
-            # Inputs are prepared here, one job at a time, before the job is handed to a worker.
-            try:
-                ensure_inputs(job, out, build, inputs)
-            except Defect as defect:
-                stop_reason.append(str(defect))
-                stop.set()
-                break
-            while len(pending) >= args.jobs:
-                done, pending = concurrent.futures.wait(pending, return_when=concurrent.futures.FIRST_COMPLETED)
-            pending.add(pool.submit(work, job))
-        concurrent.futures.wait(pending)
+    reasons = dispatch(todo, ledger, args.jobs,
+                       lambda job: attempt_job(job, build, evaluator, args.threads, profile_sha, inputs),
+                       prepare=lambda job: ensure_inputs(job, out, build, inputs))
     ledger.write()
-    if stop.is_set():
-        print(f"[{now()}] STOPPED: {'; '.join(stop_reason)}", flush=True)
+    if reasons:
+        print(f"[{now()}] STOPPED: {'; '.join(reasons)}", flush=True)
         return 1
     remaining = [n for n in ledger.rows if not ledger.finished(n)]
     print(f"[{now()}] all {len(jobs) - len(remaining)} of {len(jobs)} jobs accounted for", flush=True)

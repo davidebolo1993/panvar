@@ -703,26 +703,63 @@ exactly the 768 MiB repair origin cache (`panvar_genotype_v6_profile`). The v1 p
 campaign's and are never used by it; the v1-era tie diagnostics and production regressions keep them.
 
 - **Plan.** `tests/genotype_production_c4_campaign.sh plan <out> <build>` refuses unless the profile chain holds, the
-  build is a clean tree at the production commit `fefa6c0` (census-free tie-branch seeds, accepted with the v6
-  sentinels) or at a descendant whose `src`, `include`, `CMakeLists.txt` and `external` are identical to it, and
+  build is a clean tree at the production commit `11fe681` (census-free tie-branch seeds from `fefa6c0`, plus the
+  exact early branch-cap stop and the seed cache left off) or at a descendant whose `src`, `include`,
+  `CMakeLists.txt` and `external` are identical to it, and
   `<out>` is new -- never the frozen campaign, never a directory a campaign ran in -- and named
   `genotype_c4_production_<build commit, 7 hex>`. `settings.tsv` records the production and scientific profile
   paths and hashes, the intermediate profiles and gates, the production commit, the build commit, the production and
   evaluator binary hashes, the runner, harness, consolidator and mosaic-harness hashes, and the scheduler: one
-  concurrent job at 8 threads unless a scheduler calibration selects more. The runner refuses a production binary,
-  profile or scheduler that is not the plan's, and a resume that changes any of them.
+  concurrent job at 8 threads unless a scheduler calibration selects more. `source_inputs.tsv` binds every frozen
+  held-out source (both FASTQs and the library of each donor: absolute path, sha256, bytes), and `plan_manifest.tsv`
+  the sha256 and size of `jobs.tsv`, `settings.tsv` and `source_inputs.tsv`; the approval token is the manifest's
+  sha256. Before anything is staged or called, launch verifies the approval, every manifest component, the binary,
+  profile and scheduler, every campaign file the settings hashed, and every frozen source; a resume that changes any
+  of them is refused. Workers fail closed: a process that exits without a status is an external failure (retried,
+  then a stop), an unknown outcome or a worker exception stops the campaign, and every finished worker's result is
+  collected.
 - **Outcomes.** Completed: `COMPLETE`/`strict_call`, `CONDITIONAL_GENOTYPE_EQUIVALENT`/`genotype_equivalent_call`,
   and every declared no-call -- `REPAIR_INCOMPLETE`/`tie_branching_incomplete` (with its repair rounds and both tie
   tables) and `RESCORE_INCOMPLETE`/`divergent_tie` (the same, plus the equivalence set) among them. A no-call is never
   retried, never stops the campaign and never carries a genotype, block-genotype or FASTA output. `improving_move_tie`
   is v1-only: under v6 such a tie is branched.
 - **Estimate.** `tests/genotype_production_c4_timing.tsv` was measured with the v1 profile at `b754647`; the plan's
-  `estimate.tsv` is labelled historical and is not a v6 prediction.
+  `estimate.tsv` is labelled historical and is not a prediction for the production profile.
 - **Package.** The consolidator's high-quality table is the block-level `quality_filter == PASS`, never the call's
   `locus_filter`; no-call rows enter no block table or denominator; undefined-truth blocks stay in the tables flagged
   `truth_defined false`, are listed in `blocks_undefined_truth.tsv`, and are excluded from every block-accuracy
   denominator. `panvar_genotype_downstream_schema` holds an `NA20847.30`-shaped call (representation PASS, ten of eleven
   blocks LOW_QUALITY for no read support) and `panvar_genotype_production_campaign_plan` the plan's contract.
+
+## Exact early branch-cap stop (2026-09-25)
+
+Every unique start in the tie-branch worklist, run or waiting, needs a branch of its own, so once the worklist holds
+more of them than `repair_tie_max_branches` the search cannot complete within the cap. It now stops there, fails
+closed as `REPAIR_INCOMPLETE` / `tie_branching_incomplete` (reason: "branch cap 16 binds (at least N branches required;
+proven after K branches)"), and materialises or scores nothing further. A worklist of exactly the cap runs to its end;
+searches that complete below the cap are unchanged (the five frozen tie regressions, whose largest tree has 14
+branches). `loo.HG01573.30` (clean `11fe681`, v6): branches 0-7 and ties 0-8 byte-identical to the 16-branch run, then
+18 required starts against 16 -- stopped after 8 branches, the same no-call; 154.3 s wall (branching 91.8 s),
+footprint 3.11 GiB.
+
+## Bounded tie-branch seed cache (2026-09-25): implemented, off, not adopted
+
+`repair_tie_seed_cache_bytes` (default 0) keeps pending seeds built by the exact block delta when their tie is recorded,
+admitted in canonical tie order while the exact payload of the slots they need fits, released when their branch
+runs; every other seed is materialised just in time, and both kinds of start reproduce their declared score bit for
+bit before any neighbour is scored. The eager frontier (a test hook) is the same cache without a budget. On
+`loo.HG01573.5` census-free, 384 MiB, eager and reversed-with-cache are scientifically identical; the budget is exact at
+the admission boundary (57,411,352 bytes admits both root seeds, one byte less only the first); settle points hold
+exactly the cached seeds.
+
+- **Estimate** (retained v6 ledgers, fixed BFS, census bytes per seed): 384 MiB would serve 5 of 6 seeds on
+  `mosaic.dense_switching_1.30`, 16.8% of its wall -- above the 10% bar, so it was built.
+- **Measured** (clean `11fe681`, two passes each): seed placement 29.6-29.9 s -> 10.1-10.2 s (4 hits: a seed's real
+  payload, census plus mass columns and sequences, is larger than its census, so 4 fit, not 5), branching
+  107.7-120.0 -> 99.2-100.7 s, total wall 166.2 / 182.1 -> 165.7 / 165.5 s (0.3% and 9.1%). The no-tie cell
+  (`lzo.HG00358.30`), where the cache never engages, measured 63.6 -> 73.2 s and 59.1 -> 70.0 s, entirely in the union
+  phase and in both passes run straight after a heavy call: a run-order effect, not resolved. The realised gain is
+  below the bar and the no-tie requirement is not met as measured, so no campaign profile sets the cache; v6 stays.
 
 ## Frozen defaults
 

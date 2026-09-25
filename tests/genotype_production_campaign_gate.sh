@@ -41,8 +41,21 @@ P7="${PRODUCTION_COMMIT:0:7}"
 fake_build "$WORK/prod" "$PRODUCTION_COMMIT" production
 PLAN="$WORK/genotype_c4_production_$P7"
 
+# A mirror of the frozen held-out package, file for file by symbolic link, so a source can be mutated in the mirror
+# without ever touching the package.
+MIRROR="$WORK/heldout_mirror"
+python3 - "$REPO/tests/results/genotype_coverage_c4_held_out_abb35a0" "$MIRROR" <<'PY'
+import os, sys
+src, dst = sys.argv[1], sys.argv[2]
+for root, _, files in os.walk(src):
+    target = os.path.join(dst, os.path.relpath(root, src))
+    os.makedirs(target, exist_ok=True)
+    for name in files:
+        os.symlink(os.path.join(root, name), os.path.join(target, name))
+PY
+
 echo "== plan"
-bash "$HARNESS" plan "$PLAN" "$WORK/prod/build" > "$WORK/plan.log" 2>&1
+GENOTYPE_C4_HELDOUT_READS="$MIRROR" bash "$HARNESS" plan "$PLAN" "$WORK/prod/build" > "$WORK/plan.log" 2>&1
 same "plan exit" "$?" "0"
 S="$PLAN/settings.tsv"
 same "jobs" "$(key "$S" jobs)" "484"
@@ -78,13 +91,14 @@ for f in tests/genotype_production_c4_campaign.sh scripts/c4_production_campaign
 done
 same "concurrent jobs" "$(key "$S" concurrent_jobs)" "1"
 same "threads per call" "$(key "$S" threads_per_call)" "8"
-same "estimate labelled historical" "$(head -1 "$PLAN/estimate.tsv" | grep -c 'HISTORICAL, NOT A v6 PREDICTION')" "1"
+same "estimate labelled historical" "$(head -1 "$PLAN/estimate.tsv" | grep -c 'HISTORICAL, NOT A PREDICTION FOR THE PRODUCTION PROFILE')" "1"
 same "estimate provenance recorded" "$(key "$S" estimate_provenance | cut -c1-10)" "HISTORICAL"
 # The scientific chain, each step exactly its reviewed differences (the v5/v6 gates define them).
 science() { grep -v '^#' "$1" | grep -v '^$' | grep -v -E '^(profile|threads|footprint_limit_bytes|time_limit_seconds)'$'\t' | sort; }
 same "v4 campaign-local carries the science of v4" "$(diff <(science "$REPO/profiles/genotype_c4_v4.tsv") <(science "$REPO/profiles/genotype_c4_v4_campaign_local.tsv") > /dev/null && echo identical || echo DIFFERS)" "identical"
 bash "$REPO/tests/genotype_v5_profile_gate.sh" > "$WORK/v5.log" 2>&1; same "v5 profile gate" "$?" "0"
 bash "$REPO/tests/genotype_v6_profile_gate.sh" > "$WORK/v6.log" 2>&1; same "v6 profile gate" "$?" "0"
+same "the production profile sets no seed cache (measured, not adopted)" "$(grep -c '^repair_tie_seed_cache_bytes' "$REPO/profiles/genotype_c4_v6_campaign_local.tsv")" "0"
 for kv in "repair_tie_branching 1" "repair_tie_max_branches 16" "representation_guard 1" "repair_rounds 32"; do
   for p in genotype_c4_v4 genotype_c4_v6_campaign_local; do
     same "$p ${kv% *}" "$(key "$REPO/profiles/$p.tsv" "${kv% *}")" "${kv#* }"
@@ -176,31 +190,162 @@ same("a never-run job is pending", again.rows["branch_cap_without_tie_tables"]["
 sys.exit(1 if bad else 0)
 EOF
 
+echo "== plan manifest and frozen sources"
+same "the plan records its held-out root" "$(key "$S" heldout_reads_root)" "$MIRROR"
+same "  as a non-canonical (mirror) root" "$(key "$S" heldout_reads_root_canonical)" "false"
+same "source inputs: every unique held-out reads_1, reads_2 and library" \
+  "$(($(wc -l < "$PLAN/source_inputs.tsv") - 1))" \
+  "$(awk -F'\t' 'NR>1 && $13!="harness"{print $13; print $14; print $15}' "$PLAN/jobs.tsv" | sort -u | wc -l | tr -d ' ')"
+same "  56 donors x 3 files" "$(($(wc -l < "$PLAN/source_inputs.tsv") - 1))" "168"
+same "  every source path absolute" "$(awk -F'\t' 'NR>1 && substr($1,1,1)!="/"' "$PLAN/source_inputs.tsv" | wc -l | tr -d ' ')" "0"
+same "  hashes and sizes as the files are now" "$(awk -F'\t' 'NR>1{print $1"\t"$2"\t"$3}' "$PLAN/source_inputs.tsv" | while IFS=$'\t' read -r f h b; do [ "$(sha "$f")" = "$h" ] && [ "$(wc -c < "$f" | tr -d ' ')" = "$b" ] || echo bad; done | wc -l | tr -d ' ')" "0"
+same "manifest components" "$(awk -F'\t' 'NR>1{print $1}' "$PLAN/plan_manifest.tsv" | tr '\n' ' ')" "jobs.tsv settings.tsv source_inputs.tsv "
+for c in jobs.tsv settings.tsv source_inputs.tsv; do
+  same "  $c hash in the manifest" "$(key "$PLAN/plan_manifest.tsv" "$c")" "$(sha "$PLAN/$c")"
+done
+same "the manifest is not named by the settings (non-circular)" "$(grep -c plan_manifest "$S")" "0"
+APPROVED="$(sha "$PLAN/plan_manifest.tsv")"
+JOBS_SHA="$(sha "$PLAN/jobs.tsv")"
+staged() { find "$PLAN" \( -name '*.mosaic_status.tsv' -o -name 'c4.gfa' -o -name 'inputs.tsv' -o -name 'launch.tsv' -o -name '*.command.txt' \) | wc -l | tr -d ' '; }
+launch_as() {   # launch_as <log> <approval> [build]
+  GENOTYPE_C4_CAMPAIGN_APPROVED="$2" bash "$HARNESS" launch "${3:-$WORK/prod/build}" "$PLAN" > "$WORK/$1" 2>&1
+}
+refuses() {   # refuses <what> <log> <expected message>
+  local code=$?
+  same "$1 refused" "$code" "2"
+  same "  for the intended reason" "$(grep -c -F "$3" "$WORK/$2")" "1"
+  same "  before anything is staged or called" "$(staged)" "0"
+}
+reseal() {   # the plan manifest recomputed over the current components: a self-consistent tampered plan
+  { printf "component\tsha256\tbytes\n"; for c in jobs.tsv settings.tsv source_inputs.tsv; do
+      printf "%s\t%s\t%s\n" "$c" "$(sha "$PLAN/$c")" "$(wc -c < "$PLAN/$c" | tr -d ' ')"; done; } > "$PLAN/plan_manifest.tsv"
+  sha "$PLAN/plan_manifest.tsv"
+}
+keep() { cp "$PLAN/$1" "$WORK/reviewed.$1"; }
+restore() { cp "$WORK/reviewed.$1" "$PLAN/$1"; }
+for c in jobs.tsv settings.tsv source_inputs.tsv plan_manifest.tsv; do keep "$c"; done
+
 echo "== launch refusals"
 bash "$HARNESS" launch "$WORK/prod/build" "$PLAN" > "$WORK/launch.log" 2>&1
-same "launch without approval" "$?" "2"
-APPROVED="$(sha "$PLAN/jobs.tsv")"
-GENOTYPE_C4_CAMPAIGN_APPROVED=0000 bash "$HARNESS" launch "$WORK/prod/build" "$PLAN" > "$WORK/launch_wrong.log" 2>&1
-same "launch with another plan's hash" "$?" "2"
+refuses "launch without approval" launch.log "requires review of"
+launch_as launch_wrong.log 0000
+refuses "launch with another plan's approval" launch_wrong.log "requires review of"
+launch_as launch_jobs_token.log "$JOBS_SHA"
+refuses "launch approved by the jobs.tsv hash alone" launch_jobs_token.log "requires review of"
+# settings.tsv changed, jobs.tsv untouched: refused by the manifest.
+printf "tampered\ttrue\n" >> "$PLAN/settings.tsv"
+launch_as launch_settings.log "$APPROVED"
+refuses "launch after settings.tsv changed (jobs.tsv unchanged)" launch_settings.log "settings.tsv is not the component the plan manifest reviewed"
+restore settings.tsv
+# source_inputs.tsv changed: refused by the manifest.
+sed -i.bak -e '2s/\t[0-9a-f]\{64\}\t/\t0000000000000000000000000000000000000000000000000000000000000000\t/' "$PLAN/source_inputs.tsv" && rm -f "$PLAN/source_inputs.tsv.bak"
+launch_as launch_sources_file.log "$APPROVED"
+refuses "launch after source_inputs.tsv changed" launch_sources_file.log "source_inputs.tsv is not the component the plan manifest reviewed"
+restore source_inputs.tsv
+# One held-out source FASTQ changed (in the mirror only).
+FQ="$(awk -F'\t' 'NR>1 && $4=="reads_1"{print $1; exit}' "$PLAN/source_inputs.tsv")"
+rm "$FQ"; { gzip -dc "$(readlink -f "$REPO/tests/results/genotype_coverage_c4_held_out_abb35a0/${FQ#$MIRROR/}")"; printf '@x\nA\n+\nI\n'; } | gzip -c > "$FQ"
+launch_as launch_fastq.log "$APPROVED"
+refuses "launch after a source FASTQ changed" launch_fastq.log "the frozen source $FQ is not the one the plan bound"
+rm "$FQ"; ln -s "$REPO/tests/results/genotype_coverage_c4_held_out_abb35a0/${FQ#$MIRROR/}" "$FQ"
+# One held-out source library changed (in the mirror only).
+LIB="$(awk -F'\t' 'NR>1 && $4=="library"{print $1; exit}' "$PLAN/source_inputs.tsv")"
+rm "$LIB"; { cat "$REPO/tests/results/genotype_coverage_c4_held_out_abb35a0/${LIB#$MIRROR/}"; echo "# changed"; } > "$LIB"
+launch_as launch_library.log "$APPROVED"
+refuses "launch after a source library changed" launch_library.log "the frozen source $LIB is not the one the plan bound"
+rm "$LIB"; ln -s "$REPO/tests/results/genotype_coverage_c4_held_out_abb35a0/${LIB#$MIRROR/}" "$LIB"
+# A binary that is not the plan's.
 fake_build "$WORK/other" "$PRODUCTION_COMMIT" other
-GENOTYPE_C4_CAMPAIGN_APPROVED="$APPROVED" bash "$HARNESS" launch "$WORK/other/build" "$PLAN" > "$WORK/launch_binary.log" 2>&1
-same "launch with a binary that is not the plan's" "$?" "2"
-same "  refused for the binary" "$(grep -c "production_binary_sha256" "$WORK/launch_binary.log")" "1"
-# A campaign file changed after review (here: the plan's record of the runner's hash) is refused.
-cp "$PLAN/settings.tsv" "$WORK/settings.reviewed"
+launch_as launch_binary.log "$APPROVED" "$WORK/other/build"
+refuses "launch with a binary that is not the plan's" launch_binary.log "production_binary_sha256"
+# A campaign file changed after review: a self-consistent plan whose settings name another runner hash.
 sed -i.bak -e 's/^\(scripts\/c4_production_campaign.py_sha256\t\).*/\1changed/' "$PLAN/settings.tsv" && rm -f "$PLAN/settings.tsv.bak"
-GENOTYPE_C4_CAMPAIGN_APPROVED="$APPROVED" bash "$HARNESS" launch "$WORK/prod/build" "$PLAN" > "$WORK/launch_file.log" 2>&1
-same "launch after a campaign file changed" "$?" "2"
-same "  refused for that file" "$(grep -c "scripts/c4_production_campaign.py is not the file the plan reviewed" "$WORK/launch_file.log")" "1"
-cp "$WORK/settings.reviewed" "$PLAN/settings.tsv"
-# A resume whose previous launch ran another profile is refused before anything is staged.
+RESEALED="$(reseal)"
+launch_as launch_file.log "$RESEALED"
+refuses "launch after a campaign file changed" launch_file.log "scripts/c4_production_campaign.py is not the file the plan reviewed"
+for c in settings.tsv plan_manifest.tsv; do restore "$c"; done
+same "the reviewed manifest is restored" "$(sha "$PLAN/plan_manifest.tsv")" "$APPROVED"
+# A resume whose previous launch ran another profile: every plan and source check passes, then the resume refuses.
 printf "key\tvalue\npanvar_sha256\t%s\nprofile\tprofiles/genotype_c4_v6_campaign_local.tsv\nprofile_sha256\tstale\njobs\t1\nthreads\t8\njobs_sha256\t%s\n" \
-  "$(sha "$WORK/prod/build/panvar")" "$APPROVED" > "$PLAN/launch.tsv"
-GENOTYPE_C4_CAMPAIGN_APPROVED="$APPROVED" bash "$HARNESS" launch "$WORK/prod/build" "$PLAN" > "$WORK/launch_resume.log" 2>&1
+  "$(sha "$WORK/prod/build/panvar")" "$JOBS_SHA" > "$PLAN/launch.tsv"
+launch_as launch_resume.log "$APPROVED"
 same "resume after a profile change" "$?" "2"
+same "  every source verified first" "$(grep -c "168 frozen source inputs verified" "$WORK/launch_resume.log")" "1"
 same "  refused as a resume" "$(grep -c "resume refused: profile_sha256" "$WORK/launch_resume.log")" "1"
 rm -f "$PLAN/launch.tsv"
-same "nothing launched or staged" "$(find "$PLAN" \( -name '*.mosaic_status.tsv' -o -name 'c4.gfa' -o -name 'inputs.tsv' \) | wc -l | tr -d ' ')" "0"
+same "nothing launched or staged" "$(staged)" "0"
+
+echo "== worker failures (the runner's dispatcher)"
+python3 - "$REPO" "$WORK" <<'PY' || fail=1
+import importlib.util, pathlib, sys, os
+repo, work = map(pathlib.Path, sys.argv[1:3])
+spec = importlib.util.spec_from_file_location("runner", repo / "scripts" / "c4_production_campaign.py")
+runner = importlib.util.module_from_spec(spec); spec.loader.exec_module(runner)
+bad = []
+def same(what, got, want):
+    print(("  ok: " if got == want else "  GATE FAILED: ") + f"{what} = {got!r}" + ("" if got == want else f", expected {want!r}"))
+    if got != want: bad.append(what)
+root = work / "workers"; root.mkdir()
+# A real process that exits 0 without writing a status: an external failure, never a finished job.
+build = root / "build"; build.mkdir()
+(build / "panvar").write_text("#!/bin/sh\nexit 0\n"); (build / "panvar").chmod(0o755)
+job = {"job": "loo.X.10", "campaign": "loo", "subject": "X", "coverage": "10", "model_gfa": str(root / "m.gfa"),
+       "reads1": str(root / "r1"), "reads2": str(root / "r2"), "library": str(root / "lib"), "curation": "none",
+       "truth_gfa": str(root / "t.gfa"), "out_prefix": str(root / "loo" / "X" / "call.10")}
+outcome, detail = runner.run_job(job, build, build / "genotype_probe", 8)
+same("a process exiting without a status is an external failure", outcome, "failed")
+same("  and says so", "without a status" in detail, True)
+def jobs(n): return [dict(job, job=f"loo.J{i}.10", out_prefix=str(root / f"J{i}" / "call.10")) for i in range(n)]
+def ledger_for(js, name):
+    d = root / name; d.mkdir(); return runner.Ledger(d, js)
+quiet = lambda message: None
+# Retry after a missing status succeeds.
+js = jobs(1); led = ledger_for(js, "retry"); calls = []
+def flaky(j):
+    calls.append(j["job"])
+    return ("failed", "the process exited (0) without a status") if len(calls) == 1 else ("strict_call", "PRIOR_ONLY")
+reasons = runner.dispatch(js, led, 1, flaky, log=quiet)
+same("retry after a missing status: no stop", reasons, [])
+same("  finished as a call on attempt 2", (led.rows[js[0]["job"]]["outcome"], led.rows[js[0]["job"]]["attempts"]), ("strict_call", "2"))
+# A repeated missing status stops the campaign, and nothing after it runs.
+js = jobs(3); led = ledger_for(js, "repeat"); ran = []
+def missing(j):
+    ran.append(j["job"]); return ("failed", "the process exited (0) without a status")
+reasons = runner.dispatch(js, led, 1, missing, log=quiet)
+same("repeated missing status stops the campaign", reasons, [f"{js[0]['job']}: repeated external failure"])
+same("  after exactly MAX_ATTEMPTS attempts and no other job", ran, [js[0]["job"]] * runner.MAX_ATTEMPTS)
+same("  the job is recorded failed, not finished", (led.rows[js[0]["job"]]["outcome"], led.finished(js[0]["job"])), ("failed", False))
+# A worker that raises: recorded, stop, nonzero -- and dispatch does not carry on.
+for workers in (1, 2):
+    js = jobs(4); led = ledger_for(js, f"raise{workers}"); ran = []
+    def explode(j):
+        ran.append(j["job"])
+        if j["job"] == js[0]["job"]: raise RuntimeError("scripted worker bug")
+        return ("strict_call", "PRIOR_ONLY")
+    reasons = runner.dispatch(js, led, workers, explode, log=quiet)
+    same(f"a raising worker stops the campaign ({workers} worker(s))", any("worker raised RuntimeError: scripted worker bug" in r for r in reasons), True)
+    same("  and is recorded as a defect", led.rows[js[0]["job"]]["outcome"], "defect")
+    same("  and dispatch does not continue past it", len(ran) <= workers, True)
+# An unknown outcome label fails closed.
+js = jobs(2); led = ledger_for(js, "unknown")
+reasons = runner.dispatch(js, led, 1, lambda j: ("half_call", "?"), log=quiet)
+same("an unknown outcome stops the campaign", len(reasons) == 1 and "unknown outcome 'half_call'" in reasons[0], True)
+same("  never a finished job", led.finished(js[0]["job"]), False)
+# `pending` returned by an attempt is not a finished job either.
+js = jobs(1); led = ledger_for(js, "pending")
+reasons = runner.dispatch(js, led, 1, lambda j: ("pending", "no status"), log=quiet)
+same("a pending attempt fails closed", len(reasons) == 1 and led.finished(js[0]["job"]) is False, True)
+# Input preparation that raises stops before the job is submitted.
+js = jobs(2); led = ledger_for(js, "prepare"); ran = []
+def prepare(j): raise runner.Defect("input moved")
+reasons = runner.dispatch(js, led, 1, lambda j: (ran.append(j) or ("strict_call", "x")), prepare=prepare, log=quiet)
+same("a failed preparation stops before any call", (len(reasons), ran), (1, []))
+# Every finished job is finished; a clean run returns no reasons.
+js = jobs(3); led = ledger_for(js, "clean")
+reasons = runner.dispatch(js, led, 2, lambda j: ("no_call", "tie_branching_incomplete"), log=quiet)
+same("official no-calls finish their jobs and never stop", (reasons, all(led.finished(j["job"]) for j in js)), ([], True))
+sys.exit(1 if bad else 0)
+PY
 
 echo "== plan refusals"
 refused() {   # refused <what> <log> <command...>
