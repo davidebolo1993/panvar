@@ -240,6 +240,19 @@ enum class GenotypeRunStatus {
 
 const char* genotype_run_status_name(GenotypeRunStatus status);
 
+// The combined per-block quality (block_quality_rule_v1), truth-free, from two facts the call already reports:
+// the representation filter and the genotype support. PASS only for representation PASS with READS support;
+// otherwise LOW_QUALITY, with every applying reason in canonical order -- representation_conflict (the filter is
+// LOWQUAL_REPRESENTATION_CONFLICT), representation_not_evaluated (any other non-PASS filter: fail closed),
+// no_read_support (support other than READS) -- joined by ','. It annotates; it never changes a call.
+// conditional_GQ is not part of it: that quality is conditional on the scored candidate set and is not enough
+// for high-quality status.
+struct BlockQuality {
+    std::string filter;   // PASS or LOW_QUALITY
+    std::string reason;   // none, or the reasons in canonical order
+};
+BlockQuality block_quality(const std::string& representation_filter, const std::string& genotype_support);
+
 // The phase claim after an audit. A read-supported phase within the primary candidates becomes READS_AUDITED
 // only when the audit set was ranked to completion, agrees on the winner and on every block genotype, and is
 // itself read-supported; with the same call but a phase tie there it is PRIOR_ONLY; otherwise UNRESOLVED. Any

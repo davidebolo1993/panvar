@@ -58,6 +58,9 @@ const char* const kFilterHeader = "\tfilter\tfilter_reason\trepresentation_marke
                                   "\trepresentation_fragment_diff\trepresentation_exposure_diff"
                                   "\trepresentation_likelihood_margin\trepresentation_conflict_statistic";
 const char* const kFilterNotEvaluated = "\tNOT_EVALUATED\tguard_not_run_on_this_path\tNA\tNA\tNA\tNA\tNA\tNA";
+// The combined block quality (block_quality), appended after the representation filter columns on every path.
+const char* const kQualityHeader = "\tquality_filter\tquality_reason";
+constexpr const char* kQualityRule = "block_quality_rule_v1";
 constexpr const char* kRepresentationRule = "representation_conflict_rule_v1";
 
 // The run's process-level guard. Status files are written whole (atomic rename), and the terminal
@@ -400,7 +403,19 @@ struct RankingSummary {
     // run that called ten of eleven blocks from one that called two, without parsing the rows.
     std::size_t consensus_blocks_called = 0;
     std::size_t consensus_blocks_no_called = 0;
+    // The combined block quality of every block row written, in block order (empty when no table was written).
+    std::vector<std::string> quality_block_ids;
+    std::vector<BlockQuality> block_qualities;
 };
+
+// Records one block's combined quality in the summary and returns its two table columns.
+std::string quality_columns(RankingSummary& summary, const std::string& block_id, const std::string& representation_filter,
+                            const std::string& genotype_support) {
+    const BlockQuality quality = block_quality(representation_filter, genotype_support);
+    summary.quality_block_ids.push_back(block_id);
+    summary.block_qualities.push_back(quality);
+    return "\t" + quality.filter + "\t" + quality.reason;
+}
 
 // What the panel-anchored adaptive completion did, for the status. Every fact separately: the anchor,
 // the search and why it stopped, the pool, and the decision made over it.
@@ -874,6 +889,32 @@ void write_status(
         out << "winner_numeric_error_bound\t" << ranking->candidates.front().numeric_error_bound
             << '\n';
         if (summary != nullptr) {
+            // The combined block quality, counted and listed from the rows the tables carry.
+            out << "quality_rule\t" << kQualityRule << '\n';
+            if (summary->block_qualities.empty()) {
+                out << "quality_pass_blocks\tNA\nquality_lowqual_blocks\tNA\nquality_pass_block_ids\tNA\n"
+                       "quality_lowqual_block_ids\tNA\nquality_reason_representation_conflict\tNA\n"
+                       "quality_reason_representation_not_evaluated\tNA\nquality_reason_no_read_support\tNA\n";
+            } else {
+                std::string pass_ids, low_ids;
+                std::size_t pass = 0, low = 0, conflict = 0, unevaluated = 0, unsupported = 0;
+                for (std::size_t i = 0; i < summary->block_qualities.size(); ++i) {
+                    const BlockQuality& quality = summary->block_qualities[i];
+                    std::string& ids = quality.filter == "PASS" ? pass_ids : low_ids;
+                    ids += (ids.empty() ? "" : ",") + summary->quality_block_ids[i];
+                    (quality.filter == "PASS" ? pass : low) += 1;
+                    const std::string with_commas = "," + quality.reason + ",";
+                    if (with_commas.find(",representation_conflict,") != std::string::npos) ++conflict;
+                    if (with_commas.find(",representation_not_evaluated,") != std::string::npos) ++unevaluated;
+                    if (with_commas.find(",no_read_support,") != std::string::npos) ++unsupported;
+                }
+                out << "quality_pass_blocks\t" << pass << "\nquality_lowqual_blocks\t" << low
+                    << "\nquality_pass_block_ids\t" << (pass_ids.empty() ? "none" : pass_ids)
+                    << "\nquality_lowqual_block_ids\t" << (low_ids.empty() ? "none" : low_ids)
+                    << "\nquality_reason_representation_conflict\t" << conflict
+                    << "\nquality_reason_representation_not_evaluated\t" << unevaluated
+                    << "\nquality_reason_no_read_support\t" << unsupported << '\n';
+            }
             out << "sequence_candidates\t" << summary->sequence_candidates << '\n';
             out << "consensus_blocks_called\t" << summary->consensus_blocks_called << '\n';
             out << "consensus_blocks_no_called\t" << summary->consensus_blocks_no_called << '\n';
@@ -939,6 +980,19 @@ void write_status(
 }
 
 } // namespace
+
+BlockQuality block_quality(const std::string& representation_filter, const std::string& genotype_support) {
+    std::string reason;
+    const auto add = [&reason](const char* item) { reason += (reason.empty() ? "" : ",") + std::string(item); };
+    if (representation_filter == "LOWQUAL_REPRESENTATION_CONFLICT") {
+        add("representation_conflict");
+    } else if (representation_filter != "PASS") {
+        add("representation_not_evaluated");   // NOT_EVALUATED, NA or anything else: fail closed
+    }
+    if (genotype_support != "READS") add("no_read_support");
+    if (reason.empty()) return {"PASS", "none"};
+    return {"LOW_QUALITY", reason};
+}
 
 const char* genotype_run_status_name(GenotypeRunStatus status) {
     switch (status) {
@@ -3377,10 +3431,17 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
             for (const std::string& source : block.alleles[id].source_ids) joined += (joined.empty() ? "" : ",") + source;
             return joined;
         };
+        // The combined block quality of every block, recorded once in the summary; both tables carry it.
+        std::vector<std::string> genotype_quality(block_count);
+        for (std::size_t b = 0; b < block_count; ++b) {
+            genotype_quality[b] = quality_columns(summary, model.blocks()[b].block_id, block_filter[b].filter,
+                                                  summary.block_genotype_read_supported[b] ? "READS" : "PRIOR_ONLY");
+        }
         {
             std::ofstream out = open_output(prefix + ".genotypes.tsv");
             out << "block_id\tkind\tallele1\tallele2\tallele1_bp\tallele2_bp\tallele1_sources\t"
-                   "allele2_sources\tzygosity\tconditional_genotype_posterior\tconditional_GQ" << kFilterHeader << '\n';
+                   "allele2_sources\tzygosity\tconditional_genotype_posterior\tconditional_GQ" << kFilterHeader
+                << kQualityHeader << '\n';
             for (std::size_t b = 0; b < block_count; ++b) {
                 const PreparedGenotypeBlock& block = model.blocks()[b];
                 if (block.kind != GenotypeBlockKind::Variant) continue;
@@ -3389,14 +3450,14 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
                     << block.alleles[a2].sequence.size() << '\t' << sources_of(block, a1) << '\t' << sources_of(block, a2)
                     << '\t' << (a1 == a2 ? "HOM" : "HET") << '\t' << std::setprecision(12)
                     << summary.block_genotype_posterior[b] << '\t' << summary.block_genotype_quality[b]
-                    << std::setprecision(6) << filter_columns(b) << '\n';
+                    << std::setprecision(6) << filter_columns(b) << genotype_quality[b] << '\n';
             }
         }
         {
             std::ofstream out = open_output(prefix + ".block_genotypes.tsv");
             out << "block_id\tkind\treportable\tallele1\tallele2\tallele1_bp\tallele2_bp\tzygosity\t"
                    "projection_ambiguous\tgenotype_support\tphase_support\tconditional_genotype_posterior\t"
-                   "conditional_GQ\tnumerically_separated\tcandidate_scope" << kFilterHeader << '\n';
+                   "conditional_GQ\tnumerically_separated\tcandidate_scope" << kFilterHeader << kQualityHeader << '\n';
             for (std::size_t b = 0; b < block_count; ++b) {
                 const PreparedGenotypeBlock& block = model.blocks()[b];
                 const bool variant = block.kind == GenotypeBlockKind::Variant;
@@ -3409,7 +3470,7 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
                     << summary.phase_support << '\t' << std::setprecision(12) << summary.block_genotype_posterior[b]
                     << '\t' << summary.block_genotype_quality[b] << std::setprecision(6) << '\t'
                     << (summary.block_numerically_separated[b] ? "true" : "false") << '\t'
-                    << set_report.final_candidate_scope << filter_columns(b) << '\n';
+                    << set_report.final_candidate_scope << filter_columns(b) << genotype_quality[b] << '\n';
             }
         }
         if (unique) {
@@ -3738,17 +3799,27 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
                     }
                     return joined;
                 };
+                // The combined block quality: this path does not run the representation guard (NOT_EVALUATED), and
+                // a no-called block has no read support.
+                std::vector<std::string> consensus_quality(block_count);
+                for (std::size_t b = 0; b < block_count; ++b) {
+                    consensus_quality[b] = quality_columns(
+                        summary, model.blocks()[b].block_id, "NOT_EVALUATED",
+                        !agreed[b] ? "NOCALL" : summary.block_genotype_read_supported[b] ? "READS" : "PRIOR_ONLY");
+                }
                 {
                     std::ofstream out = open_output(options.out_prefix + ".genotypes.tsv");
                     out << "block_id\tkind\tallele1\tallele2\tallele1_bp\tallele2_bp\tallele1_sources\t"
-                           "allele2_sources\tzygosity\tconditional_genotype_posterior\tconditional_GQ" << kFilterHeader << '\n';
+                           "allele2_sources\tzygosity\tconditional_genotype_posterior\tconditional_GQ" << kFilterHeader
+                        << kQualityHeader << '\n';
                     for (std::size_t b = 0; b < block_count; ++b) {
                         const PreparedGenotypeBlock& block = model.blocks()[b];
                         if (block.kind != GenotypeBlockKind::Variant) continue;
                         if (!agreed[b]) {
                             // Emitted as an explicit no-call rather than omitted: a missing row is
                             // indistinguishable from a block that was never modelled.
-                            out << block.block_id << "\tSV\t.\t.\t.\t.\t.\t.\tNOCALL\tNA\tNA" << kFilterNotEvaluated << '\n';
+                            out << block.block_id << "\tSV\t.\t.\t.\t.\t.\t.\tNOCALL\tNA\tNA" << kFilterNotEvaluated
+                                << consensus_quality[b] << '\n';
                             continue;
                         }
                         const std::size_t a1 = consensus[b].first;
@@ -3758,7 +3829,8 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
                             << block.alleles[a2].sequence.size() << '\t' << sources_of(block, a1) << '\t'
                             << sources_of(block, a2) << '\t' << (a1 == a2 ? "HOM" : "HET") << '\t'
                             << std::setprecision(12) << summary.block_genotype_posterior[b] << '\t'
-                            << summary.block_genotype_quality[b] << std::setprecision(6) << kFilterNotEvaluated << '\n';
+                            << summary.block_genotype_quality[b] << std::setprecision(6) << kFilterNotEvaluated
+                            << consensus_quality[b] << '\n';
                     }
                 }
                 {
@@ -3766,7 +3838,7 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
                     out << "block_id\tkind\treportable\tallele1\tallele2\tallele1_bp\tallele2_bp\t"
                            "zygosity\tprojection_ambiguous\tgenotype_support\tphase_support\t"
                            "conditional_genotype_posterior\tconditional_GQ\tnumerically_separated\t"
-                           "candidate_scope" << kFilterHeader << '\n';
+                           "candidate_scope" << kFilterHeader << kQualityHeader << '\n';
                     for (std::size_t b = 0; b < block_count; ++b) {
                         const PreparedGenotypeBlock& block = model.blocks()[b];
                         const bool variant = block.kind == GenotypeBlockKind::Variant;
@@ -3774,7 +3846,7 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
                             << (variant ? "true" : "false") << '\t';
                         if (!agreed[b]) {
                             out << ".\t.\t.\t.\tNOCALL\tfalse\tNOCALL\tUNRESOLVED\tNA\tNA\tfalse\t"
-                                << set_report.final_candidate_scope << kFilterNotEvaluated
+                                << set_report.final_candidate_scope << kFilterNotEvaluated << consensus_quality[b]
                                 << '\n';
                             continue;
                         }
@@ -3788,7 +3860,7 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
                             << summary.block_genotype_posterior[b] << '\t'
                             << summary.block_genotype_quality[b] << std::setprecision(6) << '\t'
                             << (summary.block_numerically_separated[b] ? "true" : "false") << '\t'
-                            << set_report.final_candidate_scope << kFilterNotEvaluated << '\n';
+                            << set_report.final_candidate_scope << kFilterNotEvaluated << consensus_quality[b] << '\n';
                     }
                 }
                 timings.total = seconds_since(started);
@@ -3826,12 +3898,19 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
 
         const std::size_t winner = ranking.winner_set.front();
         const MosaicDiplotype& called = candidates[sequence_candidates[winner].representative].diplotype;
+        // The combined block quality: this path does not run the representation guard (NOT_EVALUATED).
+        std::vector<std::string> plain_quality(model.blocks().size());
+        for (std::size_t b = 0; b < model.blocks().size(); ++b) {
+            plain_quality[b] = quality_columns(summary, model.blocks()[b].block_id, "NOT_EVALUATED",
+                                               summary.block_genotype_read_supported[b] ? "READS" : "PRIOR_ONLY");
+        }
         {
             // Only variant blocks are reporting units. Context blocks are modelled identically and are
             // what let the mosaic recombine, but they are not SV calls and are not presented as such.
             std::ofstream out = open_output(options.out_prefix + ".genotypes.tsv");
             out << "block_id\tkind\tallele1\tallele2\tallele1_bp\tallele2_bp\tallele1_sources\t"
-                   "allele2_sources\tzygosity\tconditional_genotype_posterior\tconditional_GQ" << kFilterHeader << '\n';
+                   "allele2_sources\tzygosity\tconditional_genotype_posterior\tconditional_GQ" << kFilterHeader
+                << kQualityHeader << '\n';
             for (std::size_t b = 0; b < model.blocks().size(); ++b) {
                 const PreparedGenotypeBlock& block = model.blocks()[b];
                 if (block.kind != GenotypeBlockKind::Variant) continue;
@@ -3851,7 +3930,7 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
                     << sources(a1) << '\t' << sources(a2) << '\t'
                     << (a1 == a2 ? "HOM" : "HET") << '\t' << std::setprecision(12)
                     << summary.block_genotype_posterior[b] << '\t' << summary.block_genotype_quality[b]
-                    << std::setprecision(6) << kFilterNotEvaluated << '\n';
+                    << std::setprecision(6) << kFilterNotEvaluated << plain_quality[b] << '\n';
             }
         }
         {
@@ -3861,7 +3940,7 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
             std::ofstream out = open_output(options.out_prefix + ".block_genotypes.tsv");
             out << "block_id\tkind\treportable\tallele1\tallele2\tallele1_bp\tallele2_bp\tzygosity\t"
                    "projection_ambiguous\tgenotype_support\tphase_support\tconditional_genotype_posterior\t"
-                   "conditional_GQ\tnumerically_separated\tcandidate_scope" << kFilterHeader << '\n';
+                   "conditional_GQ\tnumerically_separated\tcandidate_scope" << kFilterHeader << kQualityHeader << '\n';
             const bool ambiguous = sequence_candidates[winner].projection_ambiguous;
             for (std::size_t b = 0; b < model.blocks().size(); ++b) {
                 const PreparedGenotypeBlock& block = model.blocks()[b];
@@ -3876,7 +3955,7 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
                     << summary.phase_support << '\t' << std::setprecision(12)
                     << summary.block_genotype_posterior[b] << '\t' << summary.block_genotype_quality[b]
                     << std::setprecision(6) << '\t' << (summary.block_numerically_separated[b] ? "true" : "false")
-                    << '\t' << set_report.final_candidate_scope << kFilterNotEvaluated << '\n';
+                    << '\t' << set_report.final_candidate_scope << kFilterNotEvaluated << plain_quality[b] << '\n';
             }
         }
         {
@@ -3953,6 +4032,8 @@ int run_genotype_command(const std::vector<std::string>& args) {
         else if (flag == "--threads") options.threads = std::stoul(need(i));   // workers for diploid combination
         else if (flag == "--panel-curation") options.curation_manifest_path = need(i);
         else if (flag == "--max-mosaic-candidates") options.max_mosaic_candidates = std::stoul(need(i));
+        // The repair's planned origin-cache budget, for a diagnostic comparison; recorded as an override.
+        else if (flag == "--repair-origin-cache-bytes") options.repair_origin_cache_bytes = std::stoull(need(i));
         else if (flag == "--max-candidates") {
             throw std::runtime_error("--max-candidates is now --max-mosaic-candidates: every panel diplotype is "
                                      "always a candidate, and K counts only the off-panel mosaics added to it");
@@ -4010,6 +4091,10 @@ int run_genotype_command(const std::vector<std::string>& args) {
             if (flag == "--max-mosaic-candidates") {
                 options.overridden_settings.push_back("max_mosaic_candidates=" +
                                                       std::to_string(options.max_mosaic_candidates));
+            }
+            if (flag == "--repair-origin-cache-bytes") {
+                options.overridden_settings.push_back("repair_origin_cache_bytes=" +
+                                                      std::to_string(options.repair_origin_cache_bytes));
             }
         }
     }

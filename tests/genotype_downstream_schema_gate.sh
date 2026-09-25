@@ -29,9 +29,14 @@ def write_kv(path, values):
 BLOCK_HEADER = ("scheme\tdonor\tmax_mosaic_candidates\tblock_id\tkind\ttruth1_bp\ttruth2_bp\tcalled1_bp\tcalled2_bp\t"
                 "unordered_distance\tavailability_floor\texcess\ttruth1_available\ttruth2_available\tgenotype_support\t"
                 "called_allele1\tcalled_allele2\ttruth1_closest_allele\ttruth2_closest_allele\ttruth1_closest_distance\t"
-                "truth2_closest_distance\tfilter\n")
+                "truth2_closest_distance\tfilter\tquality_filter\tquality_reason\n")
+def quality(flt, sup):
+    # block_quality_rule_v1, as the caller writes it (the consolidator must read it, never rebuild it)
+    reasons = (["representation_conflict"] if flt.startswith("LOWQUAL") else [] if flt == "PASS" else ["representation_not_evaluated"]) + \
+              ([] if sup == "READS" else ["no_read_support"])
+    return ("PASS", "none") if not reasons else ("LOW_QUALITY", ",".join(reasons))
 def blocks(rows):
-    return BLOCK_HEADER + "".join(f"loo\tX\t128\t{b}\t{k}\t10\t10\t10\t10\t{d}\t{f}\t{d-f}\ttrue\ttrue\t{sup}\t0\t1\t0\t1\t0\t0\t{flt}\n"
+    return BLOCK_HEADER + "".join(f"loo\tX\t128\t{b}\t{k}\t10\t10\t10\t10\t{d}\t{f}\t{d-f}\ttrue\ttrue\t{sup}\t0\t1\t0\t1\t0\t0\t{flt}\t{quality(flt, sup)[0]}\t{quality(flt, sup)[1]}\n"
                                   for b, k, d, f, sup, flt in rows)
 # name: (status keys, files present, eval block rows or None)
 jobs = {
@@ -105,7 +110,8 @@ same("a no-call has no locus filter", runs.loc["loo.D.10", "locus_filter"], "NA"
 same("all-quality blocks: every block of every call", len(allq), 6)
 same("PASS-only keeps filter == PASS exactly (LowQual, NOT_EVALUATED and NA out)", pairs(passq),
      [("loo.A.10", "ctx:10"), ("loo.B.10", "sv:7"), ("loo.C.10", "sv:7")])
-same("high quality = PASS and READS", pairs(highq), [("loo.A.10", "ctx:10"), ("loo.B.10", "sv:7")])
+same("high quality = quality_filter PASS (representation PASS and READS)", pairs(highq), [("loo.A.10", "ctx:10"), ("loo.B.10", "sv:7")])
+same("high-quality rows carry quality_filter PASS and reason none", sorted(set(map(tuple, highq[["quality_filter", "quality_reason"]].values))), [("PASS", "none")])
 same("a call's unevaluated blocks are named", runs.loc["loo.B.10", "not_evaluated_blocks"], "ctx:10")
 same("and the guard is marked incomplete", runs.loc["loo.B.10", "representation_guard_complete"], "false")
 same("blocks.tsv is the all-quality table", len(pd.read_csv(package / "blocks.tsv", sep="\t")), 6)

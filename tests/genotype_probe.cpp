@@ -622,7 +622,8 @@ int evaluate(const Args& args) {
     table << "scheme\tdonor\tmax_mosaic_candidates\tblock_id\tkind\ttruth1_bp\ttruth2_bp\tcalled1_bp\t"
              "called2_bp\tunordered_distance\tavailability_floor\texcess\ttruth1_available\t"
              "truth2_available\tgenotype_support\tcalled_allele1\tcalled_allele2\ttruth1_closest_allele\t"
-             "truth2_closest_allele\ttruth1_closest_distance\ttruth2_closest_distance\tfilter\n";
+             "truth2_closest_allele\ttruth1_closest_distance\ttruth2_closest_distance\tfilter\tquality_filter\t"
+             "quality_reason\n";
 
     // A genotype-equivalent call emits one unordered genotype shared by its whole top set, and the
     // distances below are unordered per block, so any representative of the set measures it exactly.
@@ -639,6 +640,14 @@ int evaluate(const Args& args) {
     std::map<std::string, std::string> genotype_support;
     // The caller's per-block quality filter (PASS / LOWQUAL_*); NA for a run that predates it or a fallback.
     std::map<std::string, std::string> block_filter;
+    // The caller's combined block quality (block_quality_rule_v1): read from the call's own table, or -- for a
+    // call that predates the column -- derived by the same function the caller uses, and said so.
+    std::map<std::string, panvar::BlockQuality> block_quality_of;
+    std::string quality_source = "NA";
+    const auto quality_cells = [&](const std::string& id) {
+        const auto found = block_quality_of.find(id);
+        return found == block_quality_of.end() ? std::string("NA\tNA") : found->second.filter + "\t" + found->second.reason;
+    };
     const std::string phase_support = status.count("phase_support") ? status.at("phase_support") : "NA";
     // Phase-aware accuracy only where the reads chose the phase: within the candidates, or audited.
     const bool phase_claimed = phase_support == "READS_WITHIN_CANDIDATES" || phase_support == "READS_AUDITED";
@@ -654,6 +663,14 @@ int evaluate(const Args& args) {
         for (const auto& row : read_table(run + ".block_genotypes.tsv")) {
             genotype_support[row.at("block_id")] = row.at("genotype_support");
             block_filter[row.at("block_id")] = row.count("filter") ? row.at("filter") : "NA";
+            if (row.count("quality_filter")) {
+                block_quality_of[row.at("block_id")] = {row.at("quality_filter"), row.at("quality_reason")};
+                quality_source = "call";
+            } else {
+                block_quality_of[row.at("block_id")] =
+                    panvar::block_quality(block_filter[row.at("block_id")], row.at("genotype_support"));
+                quality_source = "derived_block_quality_rule_v1";
+            }
         }
         std::string representative;
         for (const auto& row : read_table(run + ".mosaic_scores.tsv")) {
@@ -710,7 +727,8 @@ int evaluate(const Args& args) {
             table << scheme << '\t' << donor << '\t' << status.at("max_mosaic_candidates") << '\t'
                   << block.block_id << '\t' << (variant ? "SV" : "context")
                   << "\tNA\tNA\tNA\tNA\tNA\tNA\tNA\tNA\tNA\tNA\tNA\tNA\tNA\tNA\tNA\tNA\t"
-                  << (block_filter.count(block.block_id) ? block_filter.at(block.block_id) : "NA") << '\n';
+                  << (block_filter.count(block.block_id) ? block_filter.at(block.block_id) : "NA") << '\t'
+                  << quality_cells(block.block_id) << '\n';
             continue;
         }
         bool available1 = false;
@@ -763,12 +781,14 @@ int evaluate(const Args& args) {
                 pass_distance += unordered;
                 pass_floor += floor;
                 if (unordered == 0) ++pass_exact;
-                if (support != genotype_support.end() && support->second == "READS") {
-                    ++high_quality_blocks;
-                    high_quality_distance += unordered;
-                    high_quality_floor += floor;
-                    if (unordered == 0) ++high_quality_exact;
-                }
+            }
+            // High quality is the caller's combined block quality, not a rule rebuilt here.
+            const auto quality = block_quality_of.find(block.block_id);
+            if (quality != block_quality_of.end() && quality->second.filter == "PASS") {
+                ++high_quality_blocks;
+                high_quality_distance += unordered;
+                high_quality_floor += floor;
+                if (unordered == 0) ++high_quality_exact;
             }
             called1_bp = std::to_string(c1.size());
             called2_bp = std::to_string(c2.size());
@@ -784,7 +804,8 @@ int evaluate(const Args& args) {
               << (complete ? std::to_string(hap1[b]) : std::string("NA")) << '\t'
               << (complete ? std::to_string(hap2[b]) : std::string("NA")) << '\t' << closest1 << '\t' << closest2
               << '\t' << floor1 << '\t' << floor2 << '\t'
-              << (block_filter.count(block.block_id) ? block_filter.at(block.block_id) : "NA") << '\n';
+              << (block_filter.count(block.block_id) ? block_filter.at(block.block_id) : "NA") << '\t'
+              << quality_cells(block.block_id) << '\n';
     }
 
     // The only no-call: no genotype result exists.
@@ -833,6 +854,7 @@ int evaluate(const Args& args) {
                 << "\npass_blocks_exact\t" << pass_exact << "\npass_unordered_distance_total\t" << pass_distance
                 << "\npass_availability_floor_total\t" << pass_floor
                 << "\npass_excess_over_floor_total\t" << pass_distance - pass_floor
+                << "\nquality_source\t" << quality_source
                 << "\nhigh_quality_blocks\t" << high_quality_blocks << "\nhigh_quality_blocks_exact\t" << high_quality_exact
                 << "\nhigh_quality_unordered_distance_total\t" << high_quality_distance
                 << "\nhigh_quality_availability_floor_total\t" << high_quality_floor

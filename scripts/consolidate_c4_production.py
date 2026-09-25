@@ -14,8 +14,10 @@ under <campaign dir>/package/:
                           NOT_EVALUATED / NA)
     blocks_pass_only.tsv  representation-PASS: the called blocks whose filter is exactly PASS (fail closed:
                           NOT_EVALUATED and NA are not PASS)
-    blocks_high_quality.tsv   representation-PASS AND genotype_support READS. Not calibrated accuracy: a PASS block
-                          can still be wrong where both channels agree with the call (HG00512.2 sv:1)
+    blocks_high_quality.tsv   the caller's combined block quality: quality_filter == PASS (block_quality_rule_v1 --
+                          representation PASS and genotype_support READS), read, never rebuilt here; NA (a run
+                          that predates the column) is not PASS. Not calibrated accuracy: a PASS block can still
+                          be wrong where both channels agree with the call (HG00512.2 sv:1)
     summary.tsv           per experiment and coverage: strict / genotype-equivalent / no-call rates, no-call
                           reasons, exact genotype rate over all intended samples and given a call, exact blocks
                           and SV blocks, total and normalized edit distance, distance above the availability
@@ -102,7 +104,9 @@ def consolidate(out, figure=True):
                                        "availability_floor": row.availability_floor, "excess": row.excess,
                                        "genotype_support": row.genotype_support,
                                        "phase_support": status.get("phase_support", "NA"),
-                                       "filter": getattr(row, "filter", "NA")})
+                                       "filter": getattr(row, "filter", "NA"),
+                                       "quality_filter": getattr(row, "quality_filter", "NA"),
+                                       "quality_reason": getattr(row, "quality_reason", "NA")})
         blocks.extend(block_rows)
         distance = number(summary.get("unordered_distance_total")) if called else np.nan
         reason = status.get("no_call_reason", "NA")
@@ -159,10 +163,10 @@ def consolidate(out, figure=True):
     blocks.to_csv(package / "blocks.tsv", sep="\t", index=False)
     blocks.to_csv(package / "blocks_all_quality.tsv", sep="\t", index=False)
     passing = (blocks["filter"].astype(str) == "PASS") if not blocks.empty else pd.Series(dtype=bool)
-    reads = (blocks["genotype_support"].astype(str) == "READS") if not blocks.empty else pd.Series(dtype=bool)
+    quality = (blocks["quality_filter"].astype(str) == "PASS") if not blocks.empty else pd.Series(dtype=bool)
     (blocks[passing] if not blocks.empty else blocks).to_csv(package / "blocks_pass_only.tsv", sep="\t", index=False)
-    (blocks[passing & reads] if not blocks.empty else blocks).to_csv(package / "blocks_high_quality.tsv", sep="\t",
-                                                                      index=False)
+    (blocks[quality] if not blocks.empty else blocks).to_csv(package / "blocks_high_quality.tsv", sep="\t",
+                                                             index=False)
     pd.DataFrame(fallback).to_csv(package / "fallback_diagnostic.tsv", sep="\t", index=False)
 
     rows = []
@@ -215,7 +219,7 @@ def consolidate(out, figure=True):
             row["not_evaluated_block_rate_given_call"] = float(not_evaluated.mean()) if len(here) else np.nan
             # The three block tables, each with its denominator (called blocks) and retained fraction.
             pass_here = filters == "PASS" if len(here) else pd.Series(dtype=bool)
-            high_here = pass_here & (here["genotype_support"].astype(str) == "READS") if len(here) else pd.Series(dtype=bool)
+            high_here = (here["quality_filter"].astype(str) == "PASS") if len(here) else pd.Series(dtype=bool)
             row["all_quality_blocks"] = len(here)
             row["representation_pass_blocks"] = int(pass_here.sum()) if len(here) else 0
             row["representation_pass_fraction"] = float(pass_here.mean()) if len(here) else np.nan

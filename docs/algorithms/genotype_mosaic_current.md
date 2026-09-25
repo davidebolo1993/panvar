@@ -621,6 +621,31 @@ repair_rounds (32), the representation guard and every calling, correctness and 
   their real haplotype and window-content counts; the per-pass index stays the fallback and the scientific
   reference either way.
 
+## Combined block quality (2026-09-25): quality_filter, block_quality_rule_v1
+
+Every block row of `genotypes.tsv` and `block_genotypes.tsv`, on every call path, ends with `quality_filter` (PASS or
+LOW_QUALITY) and `quality_reason`, from two truth-free facts the call already reports (`block_quality`):
+
+| representation filter | genotype_support | quality_filter | quality_reason |
+|---|---|---|---|
+| PASS | READS | PASS | none |
+| PASS | anything else | LOW_QUALITY | no_read_support |
+| LOWQUAL_REPRESENTATION_CONFLICT | READS | LOW_QUALITY | representation_conflict |
+| NOT_EVALUATED (or any other value: fail closed) | READS | LOW_QUALITY | representation_not_evaluated |
+
+Several reasons are kept, in that canonical order, joined by ',' (e.g. `representation_conflict,no_read_support`).
+The status adds `quality_rule`, `quality_pass_blocks`, `quality_lowqual_blocks`, their block-ID lists and one count
+per reason. The field annotates: calls, ranking, the representation filter, genotype support and consensus are
+unchanged. conditional_GQ is conditional within the scored candidate set and is not part of the rule -- it is not
+sufficient for high-quality status. The evaluator carries the caller's two columns into `eval.blocks.tsv` and its
+`high_quality_*` totals count `quality_filter == PASS` (a call that predates the columns is derived by the same
+function, `quality_source derived_block_quality_rule_v1`); the consolidator's `blocks_high_quality.tsv` is
+`quality_filter == PASS`, read, never rebuilt. Gates: `panvar_genotype_block_quality` (each case, combined reasons,
+fail-closed values); the e2e test checks every block table its runs write (69 tables, 345 rows) against
+`block_quality(filter, genotype_support)` of the same row; the downstream schema gate reads the column. The v5 pilot's
+sealed `loo.NA19434.30` table derives 7 PASS and 4 LOW_QUALITY blocks (ctx:0, sv:1, sv:7, ctx:8, each
+no_read_support), matching its high-quality view.
+
 ## Frozen defaults
 
 State limit **256** (production) and **1,024** (diagnostic comparison width) -- counted in allele-prefix

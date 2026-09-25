@@ -37,16 +37,16 @@ run() {   # run <name> <job> <threads> [flags]
 }
 prefilter() {   # every output apart from the guard's own columns, keys and FASTA field
   local p="$1"
-  for t in genotypes block_genotypes; do awk -F'\t' 'BEGIN{OFS="\t"}{NF=NF-8; print}' "$p.$t.tsv"; done
+  for t in genotypes block_genotypes; do awk -F'\t' 'BEGIN{OFS="\t"}{NF=NF-10; print}' "$p.$t.tsv"; done
   cat "$p.mosaic_candidates.tsv" "$p.mosaic_scores.tsv" "$p.equivalence_set.tsv"
   cut -f1-28 "$p.repair_rounds.tsv"
   [ -f "$p.mosaic_haplotypes.fa" ] && sed -e 's/ locus_filter=[A-Z_]*//' -e 's/^>[^ ]*_hap/>hap/' "$p.mosaic_haplotypes.fa"
   [ -f "$p.tie_branches.tsv" ] && cut -f1-13 "$p.tie_branches.tsv"
   grep -vE '^(seconds_|resources_|threads_|phys_footprint|rss_|emission_cache_dp_hits|emission_cache_dp_misses|emission_cache_executed_dps|scorer_|representation_|locus_filter|lowqual_blocks|not_evaluated_blocks|settings_overridden|sha256_)' "$p.mosaic_status.tsv"
 }
-filters() { awk -F'\t' 'NR>1{print $1"\t"$(NF-7)"\t"$(NF-6)"\t"$(NF-5)"\t"$(NF-4)"\t"$(NF-3)"\t"$(NF-2)"\t"$(NF-1)"\t"$NF}' "$1.block_genotypes.tsv"; }
+filters() { awk -F'\t' 'NR>1{print $1"\t"$(NF-9)"\t"$(NF-8)"\t"$(NF-7)"\t"$(NF-6)"\t"$(NF-5)"\t"$(NF-4)"\t"$(NF-3)"\t"$(NF-2)}' "$1.block_genotypes.tsv"; }
 evidence() {   # <run prefix> <block>: filter, marker margin, fragment diff, exposure diff, to one decimal
-  awk -F'\t' -v b="$2" 'NR>1 && $1==b{printf "%s %.1f %.1f %.1f", $(NF-7), $(NF-5), $(NF-3), $(NF-2)}' "$1.block_genotypes.tsv"
+  awk -F'\t' -v b="$2" 'NR>1 && $1==b{printf "%s %.1f %.1f %.1f", $(NF-9), $(NF-7), $(NF-5), $(NF-4)}' "$1.block_genotypes.tsv"
 }
 frozen_evidence() {   # <cell> <block> from the frozen truth-free table
   awk -F'\t' -v c="$1" -v b="$2" 'NR==1{for(i=1;i<=NF;i++) col[$i]=i; next} $col["cell"]==c && $col["block"]==b{printf "%s %.1f %.1f %.1f", $col["filter"], $col["marker_margin"], $col["fragment_diff"], $col["exposure_diff"]}' "$FROZEN"
@@ -70,7 +70,7 @@ for pair in h2:loo.HG01114.2 lzo:lzo.HG03732.5; do
   name="${pair%%:*}"; job="${pair#*:}"
   frozen="$(awk -F'\t' -v j="$job" '$1==j{print $18}' "$CAMPAIGN/jobs.tsv")"
   same "$name: pre-filter tables = the frozen campaign job's" \
-    "$( { for t in genotypes block_genotypes; do awk -F'\t' 'BEGIN{OFS="\t"}{NF=NF-8; print}' "$OUT/${name}_on8/call.$t.tsv"; done; cat "$OUT/${name}_on8/call."{mosaic_candidates,mosaic_scores,equivalence_set}.tsv; } | digest)" \
+    "$( { for t in genotypes block_genotypes; do awk -F'\t' 'BEGIN{OFS="\t"}{NF=NF-10; print}' "$OUT/${name}_on8/call.$t.tsv"; done; cat "$OUT/${name}_on8/call."{mosaic_candidates,mosaic_scores,equivalence_set}.tsv; } | digest)" \
     "$( { cat "$frozen."{genotypes,block_genotypes,mosaic_candidates,mosaic_scores,equivalence_set}.tsv; } | digest)"
 done
 same "guard off writes NOT_EVALUATED" "$(filters "$OUT/h2_off8/call" | cut -f2 | sort -u | tr '\n' ' ')" "NOT_EVALUATED "

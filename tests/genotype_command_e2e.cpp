@@ -22,6 +22,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <filesystem>
 #include <iomanip>
 #include <cstdio>
 #include <fstream>
@@ -45,6 +46,51 @@ void require(bool condition, const std::string& message) {
 std::string dir;
 
 std::string path(const std::string& name) { return dir + "/" + name; }
+
+// Every block table this test's runs wrote -- on every call path -- carries quality_filter and quality_reason equal to
+// block_quality(filter, genotype_support) of the same row: the two columns depend on nothing else, so no truth
+// input can move them.
+void test_block_quality_columns() {
+    std::size_t tables = 0, rows = 0, pass = 0, low = 0;
+    for (const auto& entry : std::filesystem::directory_iterator(dir)) {
+        const std::string name = entry.path().string();
+        const std::string suffix = ".block_genotypes.tsv";
+        if (name.size() < suffix.size() || name.compare(name.size() - suffix.size(), suffix.size(), suffix) != 0) continue;
+        std::ifstream in(name);
+        std::string line;
+        std::getline(in, line);
+        std::vector<std::string> header;
+        {
+            std::stringstream fields(line);
+            for (std::string cell; std::getline(fields, cell, '\t');) header.push_back(cell);
+        }
+        const auto column = [&](const std::string& key) {
+            const auto at = std::find(header.begin(), header.end(), key);
+            require(at != header.end(), name + ": no column " + key);
+            return static_cast<std::size_t>(at - header.begin());
+        };
+        const std::size_t filter = column("filter"), support = column("genotype_support");
+        const std::size_t quality = column("quality_filter"), reason = column("quality_reason");
+        require(quality + 2 == header.size() && reason + 1 == header.size(), name + ": the quality columns come last");
+        ++tables;
+        while (std::getline(in, line)) {
+            std::vector<std::string> cells;
+            std::stringstream fields(line);
+            for (std::string cell; std::getline(fields, cell, '\t');) cells.push_back(cell);
+            const panvar::BlockQuality expected = panvar::block_quality(cells.at(filter), cells.at(support));
+            require(cells.at(quality) == expected.filter && cells.at(reason) == expected.reason,
+                    name + ": a row's quality columns differ from block_quality(filter, genotype_support)");
+            ++rows;
+            (expected.filter == "PASS" ? pass : low) += 1;
+        }
+    }
+    // PASS needs the guard on and read support; most runs here keep the guard off, so their blocks are
+    // LOW_QUALITY / representation_not_evaluated. The rule's every outcome is gated in genotype_block_quality.
+    require(tables > 10 && pass > 0 && low > 0,
+            "the block-quality check must see many tables and both outcomes (" + std::to_string(tables) + " tables)");
+    std::cout << "  block quality columns: " << tables << " tables, " << rows << " rows (" << pass << " PASS, " << low
+              << " LOW_QUALITY) equal block_quality(filter, genotype_support)\n";
+}
 
 std::string revcomp(const std::string& bases) {
     std::string out(bases.size(), 'N');
@@ -2394,7 +2440,8 @@ std::vector<std::string> guard_prefilter(const std::string& prefix) {
     for (const char* table : {".genotypes.tsv", ".block_genotypes.tsv"}) {
         for (const auto& row : read_rows(path(prefix + table))) {
             std::string line;
-            for (std::size_t c = 0; c + 8 < row.size(); ++c) line += row[c] + '\t';
+            // The guard's eight filter columns and the two combined-quality columns built on them come last.
+            for (std::size_t c = 0; c + 10 < row.size(); ++c) line += row[c] + '\t';
             out.push_back(line);
         }
     }
@@ -2414,6 +2461,7 @@ std::vector<std::string> guard_prefilter(const std::string& prefix) {
     for (const auto& [key, value] : read_status(path(prefix + ".mosaic_status.tsv"))) {
         static const std::vector<std::string> skip = {"seconds_", "resources_", "threads_", "representation_",
                                                       "locus_filter", "lowqual_blocks", "not_evaluated_blocks",
+                                                      "quality_",
                                                       "repair_cumulative_", "repair_margin_", "repair_origin_cache_bytes_end",
                                                       "settings_overridden", "phys_", "rss_", "emission_cache_",
                                                       "scorer_",
@@ -2430,7 +2478,7 @@ std::vector<std::string> guard_filters(const std::string& prefix) {
     std::vector<std::string> out;
     for (const auto& row : read_rows(path(prefix + ".block_genotypes.tsv"))) {
         std::string line = row[0];
-        for (std::size_t c = row.size() - 8; c < row.size(); ++c) line += '\t' + row[c];
+        for (std::size_t c = row.size() - 10; c < row.size(); ++c) line += '\t' + row[c];
         out.push_back(line);
     }
     return out;
@@ -2759,6 +2807,7 @@ int main(int argc, char** argv) {
         test_representation_guard_outside_pool();
         test_watchdog_and_interruption();
         if (argc >= 3) test_profile(argv[2]);
+        test_block_quality_columns();
         std::cout << "genotype command end-to-end: PASS\n";
         return 0;
     } catch (const std::exception& error) {
