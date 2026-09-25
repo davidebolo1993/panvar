@@ -55,7 +55,12 @@ for root, _, files in os.walk(src):
 PY
 
 echo "== plan"
-GENOTYPE_C4_HELDOUT_READS="$MIRROR" bash "$HARNESS" plan "$PLAN" "$WORK/prod/build" > "$WORK/plan.log" 2>&1
+# A copy of the frozen mosaic signatures (41 small files), so a record can be mutated without touching the frozen one.
+SIGS="$WORK/signatures_mirror"
+cp -R "$REPO/tests/results/genotype_c4_mosaic_c8fe2a4_raw/signatures" "$SIGS"
+chmod -R u+w "$SIGS"   # the frozen records are read-only; only the copy is mutated
+GENOTYPE_C4_HELDOUT_READS="$MIRROR" GENOTYPE_C4_MOSAIC_SIGNATURES="$SIGS" \
+  bash "$HARNESS" plan "$PLAN" "$WORK/prod/build" > "$WORK/plan.log" 2>&1
 same "plan exit" "$?" "0"
 S="$PLAN/settings.tsv"
 same "jobs" "$(key "$S" jobs)" "484"
@@ -193,10 +198,21 @@ EOF
 echo "== plan manifest and frozen sources"
 same "the plan records its held-out root" "$(key "$S" heldout_reads_root)" "$MIRROR"
 same "  as a non-canonical (mirror) root" "$(key "$S" heldout_reads_root_canonical)" "false"
+role_count() { awk -F'\t' -v r="$1" 'NR>1 && $4==r' "$PLAN/source_inputs.tsv" | wc -l | tr -d ' '; }
 same "source inputs: every unique held-out reads_1, reads_2 and library" \
-  "$(($(wc -l < "$PLAN/source_inputs.tsv") - 1))" \
+  "$(awk -F'\t' 'NR>1 && ($4=="reads_1" || $4=="reads_2" || $4=="library")' "$PLAN/source_inputs.tsv" | wc -l | tr -d ' ')" \
   "$(awk -F'\t' 'NR>1 && $13!="harness"{print $13; print $14; print $15}' "$PLAN/jobs.tsv" | sort -u | wc -l | tr -d ' ')"
-same "  56 donors x 3 files" "$(($(wc -l < "$PLAN/source_inputs.tsv") - 1))" "168"
+same "  56 donors x 3 files" "$(($(role_count reads_1) + $(role_count reads_2) + $(role_count library)))" "168"
+for r in graph_gz donor_manifest eligibility_manifest mosaic_manifest mosaic_signature_index; do
+  same "  one $r" "$(role_count $r)" "1"
+done
+same "  graph gzip at its repository path" "$(awk -F'\t' '$4=="graph_gz"{print $1}' "$PLAN/source_inputs.tsv")" "$REPO/tests/real_data/c4.gfa.gz"
+same "  40 mosaic signatures" "$(role_count mosaic_signature)" "40"
+same "  keyed by exactly the planned mosaic (plan, coverage)" \
+  "$(awk -F'\t' '$4=="mosaic_signature"{print $5}' "$PLAN/source_inputs.tsv" | sort | tr '\n' ' ')" \
+  "$(awk -F'\t' 'NR>1 && $2=="mosaic"{print $3":"$4}' "$PLAN/jobs.tsv" | sort | tr '\n' ' ')"
+same "  213 frozen inputs in all" "$(($(wc -l < "$PLAN/source_inputs.tsv") - 1))" "213"
+same "  the mirror roots are recorded" "$(key "$S" mosaic_signatures_root)|$(key "$S" mosaic_signatures_root_canonical)" "$SIGS|false"
 same "  every source path absolute" "$(awk -F'\t' 'NR>1 && substr($1,1,1)!="/"' "$PLAN/source_inputs.tsv" | wc -l | tr -d ' ')" "0"
 same "  hashes and sizes as the files are now" "$(awk -F'\t' 'NR>1{print $1"\t"$2"\t"$3}' "$PLAN/source_inputs.tsv" | while IFS=$'\t' read -r f h b; do [ "$(sha "$f")" = "$h" ] && [ "$(wc -c < "$f" | tr -d ' ')" = "$b" ] || echo bad; done | wc -l | tr -d ' ')" "0"
 same "manifest components" "$(awk -F'\t' 'NR>1{print $1}' "$PLAN/plan_manifest.tsv" | tr '\n' ' ')" "jobs.tsv settings.tsv source_inputs.tsv "
@@ -265,12 +281,104 @@ launch_as launch_file.log "$RESEALED"
 refuses "launch after a campaign file changed" launch_file.log "scripts/c4_production_campaign.py is not the file the plan reviewed"
 for c in settings.tsv plan_manifest.tsv; do restore "$c"; done
 same "the reviewed manifest is restored" "$(sha "$PLAN/plan_manifest.tsv")" "$APPROVED"
+echo "== frozen repository inputs and mosaic records"
+# A self-consistent tampered plan: one source_inputs.tsv row edited by awk, then the manifest resealed.
+tamper() {   # tamper <awk program over source_inputs.tsv>
+  awk -F'\t' -v OFS='\t' "$1" "$WORK/reviewed.source_inputs.tsv" > "$PLAN/source_inputs.tsv"; reseal
+}
+untamper() { restore source_inputs.tsv; restore plan_manifest.tsv; }
+# The tracked repository inputs are never modified: their bound record is changed instead, which a launch must
+# refuse exactly as it would refuse the file changing.
+for r in graph_gz donor_manifest eligibility_manifest mosaic_manifest; do
+  F="$(awk -F'\t' -v r=$r '$4==r{print $1}' "$WORK/reviewed.source_inputs.tsv")"
+  T="$(tamper "\$4==\"$r\"{\$2=\"0000000000000000000000000000000000000000000000000000000000000000\"} {print}")"
+  launch_as "launch_$r.log" "$T"
+  refuses "launch with the $r not as bound" "launch_$r.log" "the frozen source $F is not the one the plan bound"
+  untamper
+done
+# A repository input bound at another path (a copy, correct hash) is not the input.
+cp "$REPO/tests/genotype_development_donors.tsv" "$WORK/donors_copy.tsv"
+T="$(tamper "\$4==\"donor_manifest\"{\$1=\"$WORK/donors_copy.tsv\"} {print}")"
+launch_as launch_donor_path.log "$T"
+refuses "launch with the donor manifest bound at another path" launch_donor_path.log "must bind $REPO/tests/genotype_development_donors.tsv once as donor_manifest"
+untamper
+# The signature index and one signature changed, and one signature missing (in the copy only).
+cp "$SIGS/index.tsv" "$WORK/index.reviewed"; printf '# changed\n' >> "$SIGS/index.tsv"
+same "  (the index mutation took effect)" "$(cmp -s "$SIGS/index.tsv" "$WORK/index.reviewed" && echo no || echo yes)" "yes"
+launch_as launch_index.log "$APPROVED"
+refuses "launch after the signature index changed" launch_index.log "the frozen source $SIGS/index.tsv is not the one the plan bound"
+cp "$WORK/index.reviewed" "$SIGS/index.tsv"
+SIG="$(awk -F'\t' '$4=="mosaic_signature"{print $1; exit}' "$PLAN/source_inputs.tsv")"
+cp "$SIG" "$WORK/sig.reviewed"; printf 'extra\tline\n' >> "$SIG"
+same "  (the signature mutation took effect)" "$(cmp -s "$SIG" "$WORK/sig.reviewed" && echo no || echo yes)" "yes"
+launch_as launch_signature.log "$APPROVED"
+refuses "launch after one signature changed" launch_signature.log "the frozen source $SIG is not the one the plan bound"
+rm "$SIG"
+launch_as launch_signature_missing.log "$APPROVED"
+refuses "launch with one signature missing" launch_signature_missing.log "the frozen source $SIG is not the one the plan bound"
+cp "$WORK/sig.reviewed" "$SIG"
+# A duplicate and a missing (plan, coverage) mapping.
+K1="$(awk -F'\t' '$4=="mosaic_signature"{print $5; exit}' "$WORK/reviewed.source_inputs.tsv")"
+K2="$(awk -F'\t' '$4=="mosaic_signature"{n++; if (n==2) {print $5; exit}}' "$WORK/reviewed.source_inputs.tsv")"
+T="$(tamper "\$4==\"mosaic_signature\" && \$5==\"$K2\"{\$5=\"$K1\"} {print}")"
+launch_as launch_duplicate.log "$T"
+refuses "launch with a duplicate (plan, coverage)" launch_duplicate.log "binds (plan, coverage) ['$K1'] more than once"
+untamper
+T="$(tamper "!(\$4==\"mosaic_signature\" && \$5==\"$K2\")")"
+launch_as launch_missing_key.log "$T"
+refuses "launch with a (plan, coverage) unmapped" launch_missing_key.log "do not match the planned mosaic jobs exactly"
+untamper
+same "the reviewed plan is intact after the mutations" "$(sha "$PLAN/plan_manifest.tsv")|$(sha "$PLAN/source_inputs.tsv")" "$APPROVED|$(sha "$WORK/reviewed.source_inputs.tsv")"
+# The comparison after regeneration, and an unrelated file beside the bound records.
+python3 - "$REPO" "$PLAN" "$SIGS" <<'PY' || fail=1
+import importlib.util, pathlib, sys, shutil
+repo, plan, sigs = map(pathlib.Path, sys.argv[1:4])
+spec = importlib.util.spec_from_file_location("runner", repo / "scripts" / "c4_production_campaign.py")
+runner = importlib.util.module_from_spec(spec); spec.loader.exec_module(runner)
+bad = []
+def same(what, got, want):
+    print(("  ok: " if got == want else "  GATE FAILED: ") + f"{what} = {got!r}" + ("" if got == want else f", expected {want!r}"))
+    if got != want: bad.append(what)
+def refused(what, call, text):
+    try:
+        call(); same(what, "accepted", "refused")
+    except runner.Defect as defect:
+        same(what, "refused" if text in str(defect) else f"refused for another reason: {defect}", "refused")
+jobs = runner.read_jobs(plan)
+counts, records = runner.verify_sources(plan, jobs)
+same("40 frozen mosaic records", len(records), 40)
+same("  exactly the planned mosaic jobs", sorted(records), sorted((j["subject"], j["coverage"]) for j in jobs if j["campaign"] == "mosaic"))
+# An unrelated record in the signatures directory, even one claiming a planned key, never overrides a bound one.
+k = sorted(records)[0]
+fake = dict(records[k]); fake["reads_1"] = "0" * 64
+(sigs / ("f" * 64 + ".tsv")).write_text("key\tvalue\n" + "".join(f"{a}\t{b}\n" for a, b in fake.items()))
+_, again = runner.verify_sources(plan, jobs)
+same("an unrelated signature file beside the bound set is ignored", again[k]["reads_1"], records[k]["reads_1"])
+(sigs / ("f" * 64 + ".tsv")).unlink()
+regen = {key: {n: r[n] for n in runner.MOSAIC_COMPARED} for key, r in records.items()}
+same("every regenerated cell identical to its record", set(runner.compare_mosaic(regen, records).values()), {"identical"})
+extra = dict(regen); extra[("dense_switching_1", "15")] = regen[k]
+refused("a regenerated cell with no frozen record", lambda: runner.compare_mosaic(extra, records), "no frozen record")
+short = dict(regen); del short[k]
+refused("a frozen record with no regenerated cell", lambda: runner.compare_mosaic(short, records), "no regenerated cell")
+changed = {key: dict(v) for key, v in regen.items()}; changed[k]["library"] = "0" * 64
+same("a regenerated cell that differs is DIFFERS", runner.compare_mosaic(changed, records)[k], "DIFFERS")
+# A resume over a prepared.tsv that is not the bound set, all identical, is refused before anything runs.
+out = plan.parent / "resume_probe"; (out / "mosaic_inputs").mkdir(parents=True)
+rows = ["plan\tcoverage\treads_1_sha256\treads_2_sha256\tlibrary_sha256\tstaged_graph_sha256\tvs_c8fe2a4_record"]
+rows += [f"{p}\t{c}\t-\t-\t-\t-\t{'no_record' if (p, c) == k else 'identical'}" for p, c in sorted(records)]
+(out / "mosaic_inputs" / "prepared.tsv").write_text("\n".join(rows) + "\n")
+refused("a resume whose prepared mosaic set holds a no_record cell", lambda: runner.prepare_mosaic(out, out, None, out / "log", records), "every cell identical")
+shutil.rmtree(out)
+sys.exit(1 if bad else 0)
+PY
+
 # A resume whose previous launch ran another profile: every plan and source check passes, then the resume refuses.
 printf "key\tvalue\npanvar_sha256\t%s\nprofile\tprofiles/genotype_c4_v6_campaign_local.tsv\nprofile_sha256\tstale\njobs\t1\nthreads\t8\njobs_sha256\t%s\n" \
   "$(sha "$WORK/prod/build/panvar")" "$JOBS_SHA" > "$PLAN/launch.tsv"
 launch_as launch_resume.log "$APPROVED"
 same "resume after a profile change" "$?" "2"
-same "  every source verified first" "$(grep -c "168 frozen source inputs verified" "$WORK/launch_resume.log")" "1"
+same "  every source verified first" "$(grep -c "213 frozen source inputs verified" "$WORK/launch_resume.log")" "1"
 same "  refused as a resume" "$(grep -c "resume refused: profile_sha256" "$WORK/launch_resume.log")" "1"
 rm -f "$PLAN/launch.tsv"
 same "nothing launched or staged" "$(staged)" "0"
@@ -374,6 +482,14 @@ echo "// gate" >> "$WORK/other/src/genotype_command.cpp"
 "${G[@]}" -C "$WORK/other" commit -q -am "gate: a production change"
 D2="$("${G[@]}" -C "$WORK/other" rev-parse HEAD)"
 refused "a descendant whose production sources differ" "$WORK/r_src.log" bash "$HARNESS" plan "$WORK/src/genotype_c4_production_${D2:0:7}" "$WORK/other/build"
+# A signature index that names a (plan, coverage) twice or not at all, or points at a missing record: the plan refuses.
+bad_sigs() { rm -rf "$WORK/bad_sigs"; cp -R "$REPO/tests/results/genotype_c4_mosaic_c8fe2a4_raw/signatures" "$WORK/bad_sigs"; chmod -R u+w "$WORK/bad_sigs"; }
+bad_sigs; head -1 "$WORK/bad_sigs/index.tsv" >> "$WORK/bad_sigs/index.tsv"
+refused "a plan whose signature index names a key twice" "$WORK/r_sig_dup.log" env GENOTYPE_C4_MOSAIC_SIGNATURES="$WORK/bad_sigs" bash "$HARNESS" plan "$WORK/sd/genotype_c4_production_$P7" "$WORK/prod/build"
+bad_sigs; sed -i.bak -e '1d' "$WORK/bad_sigs/index.tsv"
+refused "a plan whose signature index misses a planned key" "$WORK/r_sig_missing.log" env GENOTYPE_C4_MOSAIC_SIGNATURES="$WORK/bad_sigs" bash "$HARNESS" plan "$WORK/sm/genotype_c4_production_$P7" "$WORK/prod/build"
+bad_sigs; rm "$WORK/bad_sigs/$(awk -F'\t' 'NR==1{print $3}' "$WORK/bad_sigs/index.tsv").tsv"
+refused "a plan whose indexed signature is missing" "$WORK/r_sig_file.log" env GENOTYPE_C4_MOSAIC_SIGNATURES="$WORK/bad_sigs" bash "$HARNESS" plan "$WORK/sf/genotype_c4_production_$P7" "$WORK/prod/build"
 PARENT="$(git -C "$REPO" rev-parse "$PRODUCTION_COMMIT^")"
 "${G[@]}" -C "$WORK/other" checkout -q --detach "$PARENT"
 refused "a build before the production commit" "$WORK/r_old_commit.log" bash "$HARNESS" plan "$WORK/p/genotype_c4_production_${PARENT:0:7}" "$WORK/other/build"

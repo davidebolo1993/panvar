@@ -711,7 +711,10 @@ campaign's and are never used by it; the v1-era tie diagnostics and production r
   paths and hashes, the intermediate profiles and gates, the production commit, the build commit, the production and
   evaluator binary hashes, the runner, harness, consolidator and mosaic-harness hashes, and the scheduler: one
   concurrent job at 8 threads unless a scheduler calibration selects more. `source_inputs.tsv` binds every frozen
-  held-out source (both FASTQs and the library of each donor: absolute path, sha256, bytes), and `plan_manifest.tsv`
+  input by absolute path, sha256, bytes, role and key: both FASTQs and the library of each held-out donor (168), the
+  C4 graph gzip, the donor, eligibility and mosaic manifests, the c8fe2a4 mosaic signature index and the 40 signatures
+  keyed by (plan, coverage) -- 213 in all. The runner compares the regenerated mosaic inputs with exactly those 40
+  bound records (never a directory glob) and refuses any cell not identical, unrecorded or missing; `plan_manifest.tsv`
   the sha256 and size of `jobs.tsv`, `settings.tsv` and `source_inputs.tsv`; the approval token is the manifest's
   sha256. Before anything is staged or called, launch verifies the approval, every manifest component, the binary,
   profile and scheduler, every campaign file the settings hashed, and every frozen source; a resume that changes any

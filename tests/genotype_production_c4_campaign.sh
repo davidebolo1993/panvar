@@ -14,8 +14,10 @@
 # are never used here.
 #
 #   tests/genotype_production_c4_campaign.sh plan <out dir> <production build dir>
-#       Writes <out>/jobs.tsv, <out>/settings.tsv, <out>/estimate.tsv, <out>/source_inputs.tsv (every frozen held-out
-#       source read file and library the plan will read: absolute path, sha256, bytes) and <out>/plan_manifest.tsv
+#       Writes <out>/jobs.tsv, <out>/settings.tsv, <out>/estimate.tsv, <out>/source_inputs.tsv (every frozen input the
+#       campaign reads -- each held-out source's reads and library, the C4 graph gzip, the donor, eligibility and mosaic
+#       manifests, the mosaic signature index and the 40 signatures keyed by (plan, coverage): absolute path, sha256,
+#       bytes, role, key) and <out>/plan_manifest.tsv
 #       (the sha256 and size of jobs.tsv, settings.tsv and source_inputs.tsv). The manifest's own sha256 is the
 #       plan's approval token. Generates no reads, calls nothing, evaluates nothing.
 #       <out> must be new (never a directory a campaign has run in) and named genotype_c4_production_<build
@@ -78,6 +80,9 @@ HELDOUT_READS_CANONICAL="$REPO/tests/results/genotype_coverage_c4_held_out_abb35
 # A gate may plan against a mirror of the package (to mutate a source without touching the frozen one); the plan
 # records which root it used, and source_inputs.tsv binds every file it names.
 HELDOUT_READS="${GENOTYPE_C4_HELDOUT_READS:-$HELDOUT_READS_CANONICAL}"
+# The frozen c8fe2a4 mosaic records the regenerated mosaic inputs must equal (a gate may use a mirror, recorded).
+MOSAIC_SIGNATURES_CANONICAL="$REPO/tests/results/genotype_c4_mosaic_c8fe2a4_raw/signatures"
+MOSAIC_SIGNATURES="${GENOTYPE_C4_MOSAIC_SIGNATURES:-$MOSAIC_SIGNATURES_CANONICAL}"
 TIMING="$REPO/tests/genotype_production_c4_timing.tsv"
 REF='HG00096#1#haplotype1-0000024:31848049-32074186'
 COVERAGES="2 5 10 30"
@@ -218,6 +223,8 @@ plan() {
     printf "jobs_sha256\t%s\n" "$(sha "$jobs")"
     printf "heldout_reads_root\t%s\nheldout_reads_root_canonical\t%s\n" "$HELDOUT_READS" \
       "$([ "$HELDOUT_READS" = "$HELDOUT_READS_CANONICAL" ] && echo true || echo false)"
+    printf "mosaic_signatures_root\t%s\nmosaic_signatures_root_canonical\t%s\n" "$MOSAIC_SIGNATURES" \
+      "$([ "$MOSAIC_SIGNATURES" = "$MOSAIC_SIGNATURES_CANONICAL" ] && echo true || echo false)"
     printf "concurrent_jobs\t%s\nthreads_per_call\t%s\nscheduler_calibration\t%s\n" "$concurrent" "$threads" "$calibration"
     printf "execution\t%s concurrent call(s), %s threads each; each call may approach 3.5 GiB of footprint under a 4 GiB limit\n" "$concurrent" "$threads"
     printf "outcomes\tcompleted: strict_call, genotype_equivalent_call, no_call (tie_branching_incomplete, divergent_tie and every other declared no_call_reason); a no-call is never retried and never stops the campaign\n"
@@ -240,14 +247,36 @@ plan() {
       grep -v '^all' "$out/estimate.body"; grep '^all' "$out/estimate.body"; } > "$out/estimate.tsv"
     rm -f "$out/estimate.body"
   fi
+  # ---- the frozen mosaic records: exactly one signature per planned mosaic (plan, coverage), from the index
+  local index="$MOSAIC_SIGNATURES/index.tsv"
+  [ -f "$index" ] || { echo "REFUSED: no mosaic signature index at $index" >&2; exit 1; }
+  local planned indexed
+  planned="$(awk -F'\t' 'NR>1 && $2=="mosaic"{print $3":"$4}' "$jobs" | sort)"
+  indexed="$(awk -F'\t' 'NF>=3{print $1":"$2}' "$index" | sort)"
+  [ "$(printf '%s\n' "$indexed" | uniq -d | wc -l | tr -d ' ')" = 0 ] \
+    || { echo "REFUSED: the mosaic signature index names a (plan, coverage) twice" >&2; exit 1; }
+  [ "$indexed" = "$planned" ] \
+    || { echo "REFUSED: the mosaic signature index does not map exactly the planned mosaic jobs" >&2; exit 1; }
+  local plan_name cov id sig
+  while IFS=$'\t' read -r plan_name cov id _; do
+    sig="$MOSAIC_SIGNATURES/$id.tsv"
+    [ -f "$sig" ] || { echo "REFUSED: the mosaic signature $sig is missing" >&2; exit 1; }
+    [ "$(key "$sig" signature_id)|$(key "$sig" plan)|$(key "$sig" coverage)" = "$id|$plan_name|$cov" ] \
+      || { echo "REFUSED: $sig does not record ($plan_name, $cov) as $id" >&2; exit 1; }
+  done < "$index"
   # ---- the frozen sources, bound by content now; then the manifest over the plan's components
   {
-    printf "path\tsha256\tbytes\trole\n"
+    printf "path\tsha256\tbytes\trole\tkey\n"
+    bind() { [ -f "$1" ] || { echo "MISSING source $1" >&2; return; }
+      printf "%s\t%s\t%s\t%s\t%s\n" "$1" "$(sha "$1")" "$(wc -c < "$1" | tr -d ' ')" "$2" "$3"; }
     awk -F'\t' 'NR>1 && $13!="harness"{print $13"\treads_1"; print $14"\treads_2"; print $15"\tlibrary"}' "$jobs" | sort -u |
-      while IFS=$'\t' read -r path role; do
-        [ -f "$path" ] || { echo "MISSING source $path" >&2; continue; }
-        printf "%s\t%s\t%s\t%s\n" "$path" "$(sha "$path")" "$(wc -c < "$path" | tr -d ' ')" "$role"
-      done
+      while IFS=$'\t' read -r path role; do bind "$path" "$role" "-"; done
+    bind "$GRAPH_GZ" graph_gz "-"
+    bind "$DONORS" donor_manifest "-"
+    bind "$ELIGIBILITY" eligibility_manifest "-"
+    bind "$MOSAIC_MANIFEST" mosaic_manifest "-"
+    bind "$index" mosaic_signature_index "-"
+    while IFS=$'\t' read -r plan_name cov id _; do bind "$MOSAIC_SIGNATURES/$id.tsv" mosaic_signature "$plan_name:$cov"; done < "$index"
   } > "$out/source_inputs.tsv"
   {
     printf "component\tsha256\tbytes\n"
