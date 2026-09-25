@@ -8,21 +8,34 @@
 The plan (jobs.tsv, settings.tsv) is written by tests/genotype_production_c4_campaign.sh plan; this runner
 never re-selects a donor, a plan, a coverage or a setting. Every call is the one production command,
 
-    panvar genotype --profile profiles/genotype_c4_campaign_local.tsv --threads <T> ...
+    panvar genotype --profile profiles/genotype_c4_v6_campaign_local.tsv --threads <T> ...
 
-and truth enters only the evaluation that follows it.
+(the v6 campaign-local profile: the science of profiles/genotype_c4_v4.tsv -- tie branching with cap 16, the
+representation guard, 32 repair rounds -- plus the reviewed campaign-local resource and exact-acceleration
+settings), and truth enters only the evaluation that follows it. The production binary, the profile, the plan and
+the scheduler (concurrent jobs, threads per call) are the plan's: launch refuses anything else.
 
 Outcomes. A finished job is exactly one of
-    strict_call                 COMPLETE: genotypes, block genotypes and the haplotype FASTA exist
-    genotype_equivalent_call    CONDITIONAL_GENOTYPE_EQUIVALENT: genotypes and the equivalence set, no FASTA
+    strict_call                 COMPLETE / strict_call: genotypes, block genotypes, the haplotype FASTA and the
+                                repair rounds exist
+    genotype_equivalent_call    CONDITIONAL_GENOTYPE_EQUIVALENT / genotype_equivalent_call: genotypes and the
+                                equivalence set, no FASTA
     no_call:<reason>            a scientific refusal the caller declared (no_call_reason): an official no-call,
-                                a COMPLETED job, never missing and never retried. improving_move_tie requires the
-                                status and the repair rounds to exist and every genotype table and FASTA to be absent
+                                a COMPLETED job, never missing, never retried, never a stop. None may leave a
+                                genotype table, a block-genotype table or a FASTA. Each keeps its own evidence:
+                                  tie_branching_incomplete  REPAIR_INCOMPLETE, tie_branched: the repair rounds and
+                                                            both tie tables (a branch cap, any cap or failure while
+                                                            branching)
+                                  divergent_tie             RESCORE_INCOMPLETE, tie_branched: the repair rounds, both
+                                                            tie tables and the equivalence set
+                                  time_limit, footprint_limit   the watchdog stopped the process (not evaluated)
+                                  improving_move_tie        v1 only (tie branching off): the repair rounds. Under
+                                                            v6 an improving-move tie is branched, so it cannot occur
 and an unfinished one is pending, or failed:<why> after an external failure (a crash, a signal, a missing or
 RUNNING status, a failed evaluation). Only external failures are retried; a job that fails externally on
 every attempt stops the campaign, as does any harness or provenance defect (an outcome whose files break its
-contract, an input whose content moved, a binary or profile that changed between launches). A legitimate
-no-call never stops anything.
+contract, an input whose content moved, a binary or profile that is not the plan's or changed between
+launches). A legitimate no-call never stops anything.
 
 Inputs are bound by SHA-256 the moment they are created (inputs.tsv) and re-verified on every reuse. Jobs are
 isolated: each writes only under its own prefix. completeness.tsv is rewritten after every job.
@@ -41,7 +54,7 @@ import threading
 import time
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
-PROFILE = REPO / "profiles" / "genotype_c4_campaign_local.tsv"
+PROFILE = REPO / "profiles" / "genotype_c4_v6_campaign_local.tsv"
 REFERENCE = "HG00096#1#haplotype1-0000024:31848049-32074186"
 GRAPH_GZ = REPO / "tests" / "real_data" / "c4.gfa.gz"
 GRAPH_SHA = "b13af390c28dd8b43a913c43f123bb1fcf639e0569f99783fa12a778820c8733"
@@ -315,6 +328,16 @@ def classify(job):
                  "MODEL_INCOMPLETE", "CANDIDATE_INCOMPLETE", "SPELLING_INCOMPLETE"):
         if reason == "improving_move_tie" and not (exists(".repair_rounds.tsv") or exists(".repair_rounds.partial.tsv")):
             return "defect", "improving-move tie without its repair rounds"
+        # The two tie-branched no-calls keep the evidence they were decided on.
+        if reason in ("tie_branching_incomplete", "divergent_tie"):
+            want = "REPAIR_INCOMPLETE" if reason == "tie_branching_incomplete" else "RESCORE_INCOMPLETE"
+            if state != want or status.get("search_conditional") != "tie_branched":
+                return "defect", f"{reason} under {state} / search_conditional {status.get('search_conditional')}"
+            missing = [s for s in (".repair_rounds.tsv", ".tie_branches.tsv", ".tie_terminal_ties.tsv") if not exists(s)]
+            if reason == "divergent_tie" and not exists(".equivalence_set.tsv"):
+                missing.append(".equivalence_set.tsv")
+            if missing:
+                return "defect", f"{reason} without its evidence ({missing})"
         if state == "TIME_LIMIT" and reason == "time_limit":
             return "no_call", "time_limit"
         if state == "RESOURCE_REFUSAL" and reason == "footprint_limit":
@@ -439,6 +462,13 @@ def launch(args):
         raise Defect("jobs.tsv does not match its plan's settings.tsv")
     profile_sha = sha256(PROFILE)
     binary = {"panvar": sha256(build / "panvar"), "genotype_probe": sha256(evaluator)}
+    # The plan names the production profile, binary and scheduler; nothing else may run it.
+    bound = {"production_profile": str(PROFILE.relative_to(REPO)), "production_profile_sha256": profile_sha,
+             "production_binary_sha256": binary["panvar"], "concurrent_jobs": str(args.jobs),
+             "threads_per_call": str(args.threads)}
+    for name, value in bound.items():
+        if settings.get(name) != value:
+            raise Defect(f"launch refused: the plan's {name} is {settings.get(name)}, this launch has {value}")
     launch_file = out / "launch.tsv"
     # The production binary, the profile, the plan and the scheduler are fixed for the whole campaign. The
     # EVALUATOR (genotype_probe) may be corrected between launches -- it never touches a call -- and every

@@ -369,7 +369,9 @@ if(PANVAR_BUILD_TESTING)
         add_test(NAME panvar_genotype_pair_override
                  COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/genotype_pair_override.sh
                          ${CMAKE_CURRENT_BINARY_DIR} ${CMAKE_CURRENT_BINARY_DIR}/genotype_pair_override)
-        # The prepared-not-launched final C4 campaigns: planned from committed manifests, launch refused.
+        # The prepared-not-launched final C4 campaign: planned from committed manifests under the v6 campaign-local
+        # profile (v4 science), bound to a clean production build and a fresh directory; no-calls are completed
+        # outcomes; launch and resume refused without the reviewed plan's hash, binary, profile and scheduler.
         add_test(NAME panvar_genotype_production_campaign_plan
                  COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/genotype_production_campaign_gate.sh
                          ${CMAKE_CURRENT_BINARY_DIR}/genotype_production_campaign)

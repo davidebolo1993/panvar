@@ -17,7 +17,13 @@ under <campaign dir>/package/:
     blocks_high_quality.tsv   the caller's combined block quality: quality_filter == PASS (block_quality_rule_v1 --
                           representation PASS and genotype_support READS), read, never rebuilt here; NA (a run
                           that predates the column) is not PASS. Not calibrated accuracy: a PASS block can still
-                          be wrong where both channels agree with the call (HG00512.2 sv:1)
+                          be wrong where both channels agree with the call (HG00512.2 sv:1). This is the
+                          BLOCK-level field: a call's locus_filter (the representation guard's locus summary) can
+                          be PASS while most of its blocks are LOW_QUALITY (no_read_support), and it never
+                          decides this table
+    blocks_undefined_truth.tsv   the called blocks whose truth is undefined (a truth haplotype does not spell the
+                          block). They stay in the three tables above, flagged truth_defined false, and are
+                          counted apart (undefined_truth_blocks): no block-accuracy denominator includes them
     summary.tsv           per experiment and coverage: strict / genotype-equivalent / no-call rates, no-call
                           reasons, exact genotype rate over all intended samples and given a call, exact blocks
                           and SV blocks, total and normalized edit distance, distance above the availability
@@ -26,7 +32,8 @@ under <campaign dir>/package/:
                           LABELLED DIAGNOSTIC FALLBACK. It is never a call and never enters any rate above.
     c4_production_block_distance.png / .pdf   the figure
 
-Called-only accuracy uses calls only. Over-all-intended rates count every no-call as not exact.
+Called-only accuracy uses calls only: a no-call contributes no block row and enters no block denominator. Over-all-
+intended rates count every no-call as not exact. Block-accuracy denominators count truth-defined blocks only.
 
 A call is decided by the final status and call class (and search_conditional names a tie-branched one), never
 by repair_converged: a tie-branched COMPLETE call keeps the production search's repair_converged false. The
@@ -97,9 +104,11 @@ def consolidate(out, figure=True):
                 for row in frame.itertuples(index=False):
                     d = number(row.unordered_distance)
                     t = number(row.truth1_bp) + number(row.truth2_bp)
+                    defined = not (np.isnan(number(row.truth1_bp)) or np.isnan(number(row.truth2_bp)))
                     block_rows.append({"job": job.job, "experiment": job.campaign, "subject": job.subject,
                                        "coverage": int(job.coverage), "call_class": outcome, "block_id": row.block_id,
-                                       "kind": row.kind, "unordered_distance": row.unordered_distance,
+                                       "kind": row.kind, "truth_defined": "true" if defined else "false",
+                                       "unordered_distance": row.unordered_distance,
                                        "normalized_distance": d / t if t and not np.isnan(d) else np.nan,
                                        "availability_floor": row.availability_floor, "excess": row.excess,
                                        "genotype_support": row.genotype_support,
@@ -134,6 +143,12 @@ def consolidate(out, figure=True):
             "excess": number(summary.get("excess_over_floor_total")) if called else np.nan,
             "normalized_distance": distance / truth_bp if called and truth_bp else np.nan,
             "blocks": number(summary.get("blocks")), "sv_blocks": number(summary.get("sv_blocks")),
+            "undefined_truth_blocks": number(summary.get("undefined_truth_blocks")) if called else np.nan,
+            "blocks_truth_defined": sum(r["truth_defined"] == "true" for r in block_rows) if called else np.nan,
+            "sv_blocks_truth_defined": sum(r["truth_defined"] == "true" and r["kind"] == "SV" for r in block_rows)
+                                       if called else np.nan,
+            "quality_lowqual_blocks": status.get("quality_lowqual_blocks", "NA") if called else "NA",
+            "quality_lowqual_block_ids": status.get("quality_lowqual_block_ids", "NA") if called else "NA",
             "blocks_exact": number(summary.get("blocks_exact")) if called else np.nan,
             "sv_blocks_exact": number(summary.get("sv_blocks_exact")) if called else np.nan,
             "exact": called and distance == 0,
@@ -167,6 +182,8 @@ def consolidate(out, figure=True):
     (blocks[passing] if not blocks.empty else blocks).to_csv(package / "blocks_pass_only.tsv", sep="\t", index=False)
     (blocks[quality] if not blocks.empty else blocks).to_csv(package / "blocks_high_quality.tsv", sep="\t",
                                                              index=False)
+    (blocks[blocks["truth_defined"] == "false"] if not blocks.empty else blocks).to_csv(
+        package / "blocks_undefined_truth.tsv", sep="\t", index=False)
     pd.DataFrame(fallback).to_csv(package / "fallback_diagnostic.tsv", sep="\t", index=False)
 
     rows = []
@@ -193,14 +210,18 @@ def consolidate(out, figure=True):
             row["exact_genotype_rate_all_intended"] = int(part.exact.sum()) / n
             row["exact_genotype_rate_given_call"] = int(calls.exact.sum()) / len(calls) if len(calls) else np.nan
             row["floor_attained_rate_given_call"] = float((calls.excess == 0).mean()) if len(calls) else np.nan
-            row["exact_blocks_given_call"] = calls.blocks_exact.sum() / calls.blocks.sum() if len(calls) else np.nan
-            row["exact_sv_blocks_given_call"] = calls.sv_blocks_exact.sum() / calls.sv_blocks.sum() if len(calls) else np.nan
+            # Exact blocks over the truth-defined blocks of calls (an undefined block can be neither exact nor wrong).
+            row["exact_blocks_given_call"] = (calls.blocks_exact.sum() / calls.blocks_truth_defined.sum()
+                                              if len(calls) and calls.blocks_truth_defined.sum() else np.nan)
+            row["exact_sv_blocks_given_call"] = (calls.sv_blocks_exact.sum() / calls.sv_blocks_truth_defined.sum()
+                                                 if len(calls) and calls.sv_blocks_truth_defined.sum() else np.nan)
             row["distance_total_given_call"] = calls.distance.sum() if len(calls) else np.nan
             row["distance_mean_given_call"] = calls.distance.mean() if len(calls) else np.nan
             row["normalized_distance_mean_given_call"] = calls.normalized_distance.mean() if len(calls) else np.nan
             row["excess_total_given_call"] = calls.excess.sum() if len(calls) else np.nan
             row["excess_mean_given_call"] = calls.excess.mean() if len(calls) else np.nan
-            # Quality, reported beside callability and never folded into it.
+            # Quality, reported beside callability and never folded into it. lowqual_calls is the REPRESENTATION
+            # guard's locus filter; the combined block quality is quality_filter, counted separately below.
             flagged = calls.locus_filter.astype(str).str.startswith("LOWQUAL")
             row["tie_branched_calls"] = int((calls.search_conditional == "tie_branched").sum())
             row["lowqual_calls"] = int(flagged.sum())
@@ -217,14 +238,25 @@ def consolidate(out, figure=True):
             not_evaluated = ~filters.isin(["PASS"]) & ~filters.str.startswith("LOWQUAL") if len(here) else pd.Series(dtype=bool)
             row["not_evaluated_blocks"] = int(not_evaluated.sum()) if len(here) else 0
             row["not_evaluated_block_rate_given_call"] = float(not_evaluated.mean()) if len(here) else np.nan
-            # The three block tables, each with its denominator (called blocks) and retained fraction.
-            pass_here = filters == "PASS" if len(here) else pd.Series(dtype=bool)
-            high_here = (here["quality_filter"].astype(str) == "PASS") if len(here) else pd.Series(dtype=bool)
-            row["all_quality_blocks"] = len(here)
+            # The three block tables, each with its accuracy denominator (truth-defined called blocks) and retained
+            # fraction; undefined-truth blocks are counted apart.
+            defined = (here["truth_defined"] == "true") if len(here) else pd.Series(dtype=bool)
+            pass_here = (filters == "PASS") & defined if len(here) else pd.Series(dtype=bool)
+            high_here = (here["quality_filter"].astype(str) == "PASS") & defined if len(here) else pd.Series(dtype=bool)
+            row["undefined_truth_blocks"] = int((~defined).sum()) if len(here) else 0
+            row["all_quality_blocks"] = int(defined.sum()) if len(here) else 0
             row["representation_pass_blocks"] = int(pass_here.sum()) if len(here) else 0
-            row["representation_pass_fraction"] = float(pass_here.mean()) if len(here) else np.nan
+            row["representation_pass_fraction"] = float(pass_here.sum() / defined.sum()) if len(here) and defined.sum() else np.nan
             row["high_quality_blocks"] = int(high_here.sum()) if len(here) else 0
-            row["high_quality_fraction"] = float(high_here.mean()) if len(here) else np.nan
+            row["high_quality_fraction"] = float(high_here.sum() / defined.sum()) if len(here) and defined.sum() else np.nan
+            # The combined block quality (quality_filter) over every called block, and the calls carrying any
+            # LOW_QUALITY block -- not the locus filter.
+            qualities = here["quality_filter"].astype(str) if len(here) else pd.Series(dtype=str)
+            row["quality_pass_blocks"] = int((qualities == "PASS").sum()) if len(here) else 0
+            row["quality_low_quality_blocks"] = int((qualities == "LOW_QUALITY").sum()) if len(here) else 0
+            row["quality_unrecorded_blocks"] = int((~qualities.isin(["PASS", "LOW_QUALITY"])).sum()) if len(here) else 0
+            low_jobs = set(here.job[qualities == "LOW_QUALITY"]) if len(here) else set()
+            row["calls_with_low_quality_blocks"] = int(calls.job.isin(low_jobs).sum())
             row["excess_total_pass_only_given_call"] = calls.pass_excess.sum() if len(calls) else np.nan
             row["excess_total_high_quality_given_call"] = calls.high_quality_excess.sum() if len(calls) else np.nan
             for support in ("READS_WITHIN_CANDIDATES", "PRIOR_ONLY", "UNRESOLVED"):

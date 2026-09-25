@@ -7,8 +7,12 @@
 # which stays false for a tie-branched call. The representation filter annotates calls only: a no-call
 # carrying a locus filter is a defect. The package keeps an all-quality and a PASS-only block table, PASS-only
 # keeps exactly the blocks whose filter is PASS (fail closed: NOT_EVALUATED and NA are not PASS), the
-# high-quality table keeps PASS blocks with READS support, and callability, no-call, LowQual and NOT_EVALUATED
-# rates are reported separately, so filtering can never make a call disappear or inflate callability.
+# high-quality table keeps exactly the blocks whose combined block quality (quality_filter) is PASS -- never decided
+# by the call's locus_filter -- and callability, no-call, LowQual and NOT_EVALUATED rates are reported separately, so
+# filtering can never make a call disappear or inflate callability. A second package holds a call shaped like
+# loo.NA20847.30 (representation PASS, most blocks LOW_QUALITY for no read support), a tie-branched no-call whose
+# evaluator wrote a block table, and a call with an undefined-truth block: no-call rows never enter a block table or
+# denominator, and undefined-truth blocks are listed apart and excluded from every block-accuracy denominator.
 set -uo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WORK="${1:?usage: genotype_downstream_schema_gate.sh <scratch dir>}"
@@ -58,7 +62,8 @@ jobs = {
                  [("sv:7", "SV", 2, 0, "PRIOR_ONLY"), ("ctx:10", "context", 7, 0, "READS")], {"ctx:10": "NA"}),
     "loo.D.10": ({"status": "RESCORE_INCOMPLETE", "call_class": "no_call", "no_call_reason": "divergent_tie",
                   "search_conditional": "tie_branched", "repair_converged": "false", "locus_filter": "NA"},
-                 [".repair_rounds.tsv", ".tie_branches.tsv"], None, {}),
+                 # what the caller writes for a divergent tie: the trajectory, both tie tables, the equivalence set
+                 [".repair_rounds.tsv", ".tie_branches.tsv", ".tie_terminal_ties.tsv", ".equivalence_set.tsv"], None, {}),
     "loo.E.10": ({"status": "REPAIR_INCOMPLETE", "call_class": "no_call", "no_call_reason": "tie_branching_incomplete",
                   "locus_filter": "LOWQUAL_REPRESENTATION_CONFLICT"},
                  [".repair_rounds.tsv"], None, {}),
@@ -132,6 +137,93 @@ same("high-quality retained fraction", round(float(summary.high_quality_fraction
 same("all-quality excess keeps every block", float(summary.excess_total_given_call), float((32800 - 154) + (50 - 16) + 0 + (9 - 5) + 2 + 7))
 same("PASS-only excess: PASS blocks only", float(summary.excess_total_pass_only_given_call), float((50 - 16) + 0 + 2))
 same("high-quality excess: PASS and READS only", float(summary.excess_total_high_quality_given_call), float((50 - 16) + 0))
+
+# ---- a second package: the combined block quality is block-level (never the locus filter), no-call rows never
+# enter a block table or denominator, and undefined-truth blocks are kept apart.
+print("== block quality, no-calls and undefined truth")
+work2 = work / "quality"; work2.mkdir()
+def block_row(b, kind, truth, called, d, f, sup, flt="PASS"):
+    q = quality(flt, sup)
+    t = "NA\tNA" if truth is None else f"{truth}\t{truth}"
+    c = "NA\tNA" if called is None else f"{called}\t{called}"
+    dd = "NA" if d is None else str(d); ff = "NA" if truth is None else str(f); ee = "NA" if d is None or truth is None else str(d - f)
+    return f"loo\tX\t128\t{b}\t{kind}\t{t}\t{c}\t{dd}\t{ff}\t{ee}\ttrue\ttrue\t{sup}\t0\t1\t0\t1\t0\t0\t{flt}\t{q[0]}\t{q[1]}\n"
+# F resembles loo.NA20847.30: a strict call, representation PASS at every block (locus_filter PASS), one block
+# read-supported and exact, ten without read support -- one of them a 32,747 bp SV error.
+f_rows = [block_row("ctx:0", "context", 100, 100, 0, 0, "READS")] + \
+         [block_row(f"b{i}", "SV" if i % 2 else "context", 100, 100, 32747 if i == 7 else 0, 69 if i == 7 else 0, "PRIOR_ONLY")
+          for i in range(1, 11)]
+# G has one block whose truth is undefined (PASS by the caller's rules) beside one defined, exact block.
+g_rows = [block_row("ctx:0", "context", 100, 100, 0, 0, "READS"), block_row("sv:1", "SV", None, 100, None, 0, "READS")]
+# D2 is a tie-branched no-call whose evaluator still wrote a block table (run_no_call: every called cell NA).
+d_rows = [block_row("ctx:0", "context", 100, None, None, 0, "NA", "NA"), block_row("sv:1", "SV", 100, None, None, 0, "NA", "NA")]
+second = {
+    "loo.F.30": ({"status": "COMPLETE", "call_class": "strict_call", "no_call_reason": "none", "phase_support": "PRIOR_ONLY",
+                  "search_conditional": "none", "locus_filter": "PASS", "lowqual_blocks": "none", "not_evaluated_blocks": "none",
+                  "representation_guard_complete": "true", "quality_pass_blocks": "1", "quality_lowqual_blocks": "10",
+                  "quality_lowqual_block_ids": ",".join(f"b{i}" for i in range(1, 11))},
+                 [".genotypes.tsv", ".block_genotypes.tsv", ".mosaic_haplotypes.fa", ".repair_rounds.tsv"], f_rows,
+                 {"unordered_distance_total": 32747, "availability_floor_total": 69, "excess_over_floor_total": 32678, "blocks": 11,
+                  "sv_blocks": 5, "blocks_exact": 10, "sv_blocks_exact": 4, "undefined_truth_blocks": 0,
+                  "pass_unordered_distance_total": 32747, "pass_excess_over_floor_total": 32678, "high_quality_excess_over_floor_total": 0}),
+    "loo.G.10": ({"status": "COMPLETE", "call_class": "strict_call", "no_call_reason": "none", "phase_support": "READS_WITHIN_CANDIDATES",
+                  "search_conditional": "none", "locus_filter": "PASS", "lowqual_blocks": "none"},
+                 [".genotypes.tsv", ".block_genotypes.tsv", ".mosaic_haplotypes.fa", ".repair_rounds.tsv"], g_rows,
+                 {"unordered_distance_total": 0, "availability_floor_total": 0, "excess_over_floor_total": 0, "blocks": 2,
+                  "sv_blocks": 1, "blocks_exact": 1, "sv_blocks_exact": 0, "undefined_truth_blocks": 1,
+                  "pass_unordered_distance_total": 0, "pass_excess_over_floor_total": 0, "high_quality_excess_over_floor_total": 0}),
+    "loo.D2.30": ({"status": "REPAIR_INCOMPLETE", "call_class": "no_call", "no_call_reason": "tie_branching_incomplete",
+                   "search_conditional": "tie_branched", "locus_filter": "NA"},
+                  [".repair_rounds.tsv", ".tie_branches.tsv", ".tie_terminal_ties.tsv"], d_rows,
+                  {"run_no_call": "true", "availability_floor_total": 0, "blocks": 2, "sv_blocks": 1, "undefined_truth_blocks": 0}),
+}
+rows2 = []
+for name, (status, files, brows, summ) in second.items():
+    prefix = work2 / name
+    write_kv(pathlib.Path(str(prefix) + ".mosaic_status.tsv"), status)
+    for suffix in files: pathlib.Path(str(prefix) + suffix).write_text("x\n")
+    pathlib.Path(str(prefix) + ".eval.blocks.tsv").write_text(BLOCK_HEADER + "".join(brows))
+    write_kv(pathlib.Path(str(prefix) + ".eval.summary.tsv"), summ)
+    rows2.append({"job": name, "campaign": "loo", "subject": name.split(".")[1], "coverage": name.split(".")[2], "out_prefix": str(prefix)})
+out2 = {r["job"]: campaign.classify(r) for r in rows2}
+same("the NA20847-like job is a strict call", out2["loo.F.30"][0], "strict_call")
+same("the tie-branched no-call is an official no-call", out2["loo.D2.30"], ("no_call", "tie_branching_incomplete"))
+with open(work2 / "jobs.tsv", "w") as f:
+    w = csv.DictWriter(f, fieldnames=list(rows2[0]), delimiter="\t"); w.writeheader(); w.writerows(rows2)
+with open(work2 / "completeness.tsv", "w") as f:
+    f.write("job\toutcome\tattempts\twall_seconds\tuser_seconds\tsys_seconds\tpeak_footprint_bytes\tpeak_rss_bytes\n")
+    for r in rows2: f.write(f"{r['job']}\t{out2[r['job']][0]}\t1\t1\t1\t0\t1\t1\n")
+consolidator.consolidate(work2, figure=False)
+pk = work2 / "package"
+read = lambda name: pd.read_csv(pk / name, sep="\t", dtype=str, keep_default_na=False)
+allq2, passq2, highq2, undef2 = read("blocks_all_quality.tsv"), read("blocks_pass_only.tsv"), read("blocks_high_quality.tsv"), read("blocks_undefined_truth.tsv")
+runs2 = read("runs.tsv").set_index("job")
+summ2 = pd.read_csv(pk / "summary.tsv", sep="\t")
+s30 = summ2[summ2.coverage == 30].iloc[0]; s10 = summ2[summ2.coverage == 10].iloc[0]
+jobs_in = lambda frame: sorted(set(frame.job))
+same("all-quality keeps every called block of the NA20847-like call", int((allq2.job == "loo.F.30").sum()), 11)
+same("its LOW_QUALITY blocks are absent from high quality", sorted(highq2.block_id[highq2.job == "loo.F.30"]), ["ctx:0"])
+same("high quality is exactly quality_filter == PASS", sorted(map(tuple, highq2[["job", "block_id"]].values)),
+     sorted(map(tuple, allq2[allq2.quality_filter == "PASS"][["job", "block_id"]].values)))
+same("representation PASS-only keeps all 11 (the locus/representation filter is not the block quality)",
+     int((passq2.job == "loo.F.30").sum()), 11)
+same("the NA20847-like call's locus filter stays PASS", runs2.loc["loo.F.30", "locus_filter"], "PASS")
+same("it is not a representation-LowQual call", int(s30.lowqual_calls), 0)
+same("it is a call with LOW_QUALITY blocks", int(s30.calls_with_low_quality_blocks), 1)
+same("combined quality counts at 30x (PASS, LOW_QUALITY)", (int(s30.quality_pass_blocks), int(s30.quality_low_quality_blocks)), (1, 10))
+same("runs carry the caller's LOW_QUALITY block ids", runs2.loc["loo.F.30", "quality_lowqual_block_ids"], ",".join(f"b{i}" for i in range(1, 11)))
+same("30x high-quality fraction over the call's blocks", round(float(s30.high_quality_fraction), 6), round(1 / 11, 6))
+same("30x high-quality excess: the no-read-support SV error is out", float(s30.excess_total_high_quality_given_call), 0.0)
+same("30x all-quality excess keeps it", float(s30.excess_total_given_call), 32678.0)
+same("no-call rows never enter any block table", [j for j in ("loo.D2.30",) if j in set(allq2.job) | set(passq2.job) | set(highq2.job) | set(undef2.job)], [])
+same("30x all-quality denominator excludes the no-call", int(s30.all_quality_blocks), 11)
+same("the no-call is counted as a no-call", (int(s30.no_calls), int(s30[f"no_call_tie_branching_incomplete"])), (1, 1))
+same("undefined-truth blocks listed apart", sorted(map(tuple, undef2[["job", "block_id"]].values)), [("loo.G.10", "sv:1")])
+same("and flagged in all-quality", allq2[(allq2.job == "loo.G.10") & (allq2.block_id == "sv:1")].truth_defined.tolist(), ["false"])
+same("10x undefined-truth count", int(s10.undefined_truth_blocks), 1)
+same("10x accuracy denominators exclude it (all-quality, high-quality)", (int(s10.all_quality_blocks), int(s10.high_quality_blocks)), (1, 1))
+same("10x exact blocks given a call over truth-defined blocks", float(s10.exact_blocks_given_call), 1.0)
+same("10x exact SV blocks: no truth-defined SV block", str(s10.exact_sv_blocks_given_call), "nan")
 print("downstream schema gate: " + ("PASS" if not failures else "FAILED"))
 sys.exit(1 if failures else 0)
 EOF

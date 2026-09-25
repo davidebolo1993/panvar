@@ -156,7 +156,8 @@ mosaic (11/11 exact).
 
 **Campaigns.** `tests/genotype_production_c4_campaign.sh plan` prepares the final held-out LZO (56
 donors), eligible-donor LOO (55) and synthetic-mosaic (10 plans) campaigns at 2x, 5x, 10x and 30x -- 484
-serial jobs -- with a runtime and disk estimate. `launch` refuses without the reviewed plan's hash.
+jobs -- with a (historical) runtime and disk estimate. `launch` refuses without the reviewed plan's hash. The
+final campaign's binding is in "Final campaign binding" below.
 
 ## v2: exact branch-and-pool at an improving-move tie (2026-09-24)
 
@@ -246,7 +247,7 @@ An annotation of calls, never a calling change: the genotype, its score, the sta
 any branch trajectory are exactly what they are with the guard off, and a no-call is never relabelled. It is
 off by default and bound explicitly by the v3 profiles (`profiles/genotype_c4_v3.tsv`,
 `profiles/genotype_c4_v3_campaign_local.tsv`: each its v2 profile plus exactly `representation_guard 1`), so
-the immutable v1 and v2 profiles run as they were accepted; the final C4 campaign uses v3. On every call of
+the immutable v1 and v2 profiles run as they were accepted (the final campaign's binding is below). On every call of
 the production (repair) path, `representation_conflict_rule_v1` examines each called block:
 
 1. the marker (k-mer depth) channel's best available allele pair at the block -- emission descending, the
@@ -327,7 +328,8 @@ gate's profile checks (v3 = v2 plus exactly the guard; v1 and v2 never set it).
 ## v4: repair round limit 32 (2026-09-25)
 
 `profiles/genotype_c4_v4.tsv` and `profiles/genotype_c4_v4_campaign_local.tsv` are their v3 profiles key for
-key except the name and `repair_rounds 32` (was 11); the campaign gate checks it. The final C4 campaign uses v4.
+key except the name and `repair_rounds 32` (was 11); the campaign gate checks it. v4 is the final C4 campaign's
+scientific profile (see "Final campaign binding").
 
 Why: the three v1 round-cap no-calls (`loo.HG02282.2`, `loo.NA19384.5`, `loo.NA18989.10`) were searches still
 improving (by 7.3, 11.3 and 3.7 nats) when the 11-round cap stopped them. Rerun truth-free with only the round
@@ -690,6 +692,37 @@ v5 384 MiB); `panvar_genotype_v6_profile` proves that is the whole difference. v
   5.8-6.0 s a round; branches 67.2 -> 45.3 s; repair physical origins 1.061e9 -> 0.822e9. Footprint 3.54 GiB (repair
   phase 2.57 -> 3.43 GiB): the projection's 3.37 GiB was low -- the cache's growth cost ~2.2x its bytes -- but it
   stays under 3.85 GiB.
+
+## Final campaign binding (2026-09-25)
+
+The final C4 campaign runs `panvar genotype --profile profiles/genotype_c4_v6_campaign_local.tsv`. Its scientific
+profile is `profiles/genotype_c4_v4.tsv` (tie branching with cap 16, the representation guard, 32 repair rounds);
+v4 campaign-local carries v4's science key for key (only the name, threads and process limits differ), v5 adds
+exactly the reviewed campaign-local resource and exact-acceleration settings (`panvar_genotype_v5_profile`) and v6
+exactly the 768 MiB repair origin cache (`panvar_genotype_v6_profile`). The v1 profiles stay the frozen bc5dd97
+campaign's and are never used by it; the v1-era tie diagnostics and production regressions keep them.
+
+- **Plan.** `tests/genotype_production_c4_campaign.sh plan <out> <build>` refuses unless the profile chain holds, the
+  build is a clean tree at the production commit `fefa6c0` (census-free tie-branch seeds, accepted with the v6
+  sentinels) or at a descendant whose `src`, `include`, `CMakeLists.txt` and `external` are identical to it, and
+  `<out>` is new -- never the frozen campaign, never a directory a campaign ran in -- and named
+  `genotype_c4_production_<build commit, 7 hex>`. `settings.tsv` records the production and scientific profile
+  paths and hashes, the intermediate profiles and gates, the production commit, the build commit, the production and
+  evaluator binary hashes, the runner, harness, consolidator and mosaic-harness hashes, and the scheduler: one
+  concurrent job at 8 threads unless a scheduler calibration selects more. The runner refuses a production binary,
+  profile or scheduler that is not the plan's, and a resume that changes any of them.
+- **Outcomes.** Completed: `COMPLETE`/`strict_call`, `CONDITIONAL_GENOTYPE_EQUIVALENT`/`genotype_equivalent_call`,
+  and every declared no-call -- `REPAIR_INCOMPLETE`/`tie_branching_incomplete` (with its repair rounds and both tie
+  tables) and `RESCORE_INCOMPLETE`/`divergent_tie` (the same, plus the equivalence set) among them. A no-call is never
+  retried, never stops the campaign and never carries a genotype, block-genotype or FASTA output. `improving_move_tie`
+  is v1-only: under v6 such a tie is branched.
+- **Estimate.** `tests/genotype_production_c4_timing.tsv` was measured with the v1 profile at `b754647`; the plan's
+  `estimate.tsv` is labelled historical and is not a v6 prediction.
+- **Package.** The consolidator's high-quality table is the block-level `quality_filter == PASS`, never the call's
+  `locus_filter`; no-call rows enter no block table or denominator; undefined-truth blocks stay in the tables flagged
+  `truth_defined false`, are listed in `blocks_undefined_truth.tsv`, and are excluded from every block-accuracy
+  denominator. `panvar_genotype_downstream_schema` holds an `NA20847.30`-shaped call (representation PASS, ten of eleven
+  blocks LOW_QUALITY for no read support) and `panvar_genotype_production_campaign_plan` the plan's contract.
 
 ## Frozen defaults
 
@@ -1155,7 +1188,7 @@ State as of 2026-09-24:
   union-scoring-cap refusals at 30x are safe resource refusals, addressed by acceleration, not by a higher cap.
 
 Later work, not blocking correctness: performance engineering (the per-request merge dominates warm
-branches; lower-complexity placement for 30x large loci), the final C4 v3 campaign, and other loci.
+branches; lower-complexity placement for 30x large loci), the final C4 campaign, and other loci.
 
 The 30x footprint blocker below was resolved for the campaign by the 3.5 GiB local campaign profile (Sol,
 2026-09-23); the global 2.5 GiB default is unchanged.
@@ -1196,7 +1229,7 @@ The 30x footprint blocker below was resolved for the campaign by the 3.5 GiB loc
    union-scoring-cap refusals (all 30x) are resource/performance refusals, handled in the acceleration phase,
    never by raising the production cap.
 3. Major speed engineering, starting with the union stage.
-4. One final C4 v3 campaign.
+4. One final C4 campaign (v6 campaign-local production profile, v4 science; see "Final campaign binding").
 5. Final all-quality, representation-PASS and high-quality plots.
 6. Other loci.
 

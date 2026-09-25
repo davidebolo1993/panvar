@@ -1,20 +1,24 @@
 #!/usr/bin/env bash
-# The one scheduler calibration for the final C4 campaigns (Sol, 2026-09-23). Two representative 10x jobs
+# The scheduler calibration for the final C4 campaign. It ran once, on 2026-09-23 under the v1 campaign profile, and
+# selected JOBS=1 THREADS=8; it now calls the campaign's production profile (v6 campaign-local), so a new calibration
+# measures what the campaign runs. It is not rerun by the campaign; a plan with more than one concurrent job requires
+# its calibration.tsv (tests/genotype_production_c4_campaign.sh plan, SCHEDULER_CALIBRATION). Two representative 10x jobs
 # on frozen inputs -- NA20509 LOO and NA20509 ordinary LZO -- first one after the other at 8 threads each
 # (JOBS=1, THREADS=8), then both at once at 4 threads each (JOBS=2, THREADS=4). No other combination is run.
 #
 #   tests/genotype_production_c4_scheduler_calibration.sh <build dir> <work dir> [reference LOO 10x prefix]
 #
 # Selects JOBS=2 THREADS=4 only if all hold: two-job throughput at least 30% higher; the combined physical
-# footprint below 75% of physical memory; neither process reaching its 3.5 GiB limit. Otherwise JOBS=1
+# footprint below 75% of physical memory; neither process reaching the profile's footprint limit. Otherwise JOBS=1
 # THREADS=8. Scientific outputs must be byte-identical between the configurations, and the LOO job to the
-# given reference (the production regression's NA20509 LOO 10x call). Writes <work>/calibration.tsv.
+# given reference (an NA20509 LOO 10x call made under the same profile; the v1 production regression's call is not
+# one). Writes <work>/calibration.tsv.
 set -uo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BUILD="${1:?usage: genotype_production_c4_scheduler_calibration.sh <build dir> <work dir> [reference prefix]}"
 WORK="${2:?usage: genotype_production_c4_scheduler_calibration.sh <build dir> <work dir> [reference prefix]}"
 REFERENCE_LOO="${3:-}"
-PROFILE="$REPO/profiles/genotype_c4_campaign_local.tsv"
+PROFILE="$REPO/profiles/genotype_c4_v6_campaign_local.tsv"
 PKG="$REPO/tests/results/genotype_loo_c4_development_7e37bb4/inputs"
 REF='HG00096#1#haplotype1-0000024:31848049-32074186'
 mkdir -p "$WORK"

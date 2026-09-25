@@ -1,18 +1,30 @@
 #!/usr/bin/env bash
 # The final C4 production campaigns, PREPARED BUT NOT LAUNCHED: held-out LZO, held-out synthetic
 # mosaic and eligible-donor LOO, each at 2x, 5x, 10x and 30x, every call made by the one production
-# command -- `panvar genotype --profile profiles/genotype_c4_campaign_local.tsv` (the science of
-# profiles/genotype_c4.tsv with the local 3.5 GiB process limit) -- which is never told what kind of
-# sample it is given. The campaign kind decides only the MODEL graph the call receives and the truth
-# the evaluation compares against afterwards.
+# command -- `panvar genotype --profile profiles/genotype_c4_v6_campaign_local.tsv` -- which is never told
+# what kind of sample it is given. The campaign kind decides only the MODEL graph the call receives and the
+# truth the evaluation compares against afterwards.
 #
-#   tests/genotype_production_c4_campaign.sh plan <out dir>
+# PROFILES. The production profile is the v6 campaign-local profile. Its science is profiles/genotype_c4_v4.tsv
+# (tie branching, cap 16; the representation guard; 32 repair rounds): v4 campaign-local is v4 key for key
+# apart from the process settings (name, threads, footprint and time limits), v5 adds exactly the reviewed
+# campaign-local resource and exact-acceleration settings (tests/genotype_v5_profile_gate.sh), and v6 exactly
+# the 768 MiB repair origin cache (tests/genotype_v6_profile_gate.sh). The plan refuses unless that whole chain
+# holds. The v1 profiles (genotype_c4.tsv, genotype_c4_campaign_local.tsv) are the frozen bc5dd97 campaign's and
+# are never used here.
+#
+#   tests/genotype_production_c4_campaign.sh plan <out dir> <production build dir>
 #       Writes <out>/jobs.tsv, <out>/settings.tsv and <out>/estimate.tsv, and checks every source input
 #       it will need exists and is bound by content. Generates no reads, calls nothing, evaluates nothing.
-#   JOBS=<j> THREADS=<t> tests/genotype_production_c4_campaign.sh launch <build dir> <out dir>
-#       Runs the planned jobs through scripts/c4_production_campaign.py, JOBS at a time. REFUSES unless
-#       GENOTYPE_C4_CAMPAIGN_APPROVED names the reviewed plan's jobs.tsv sha256: a campaign that can be
-#       launched by accident is not frozen.
+#       <out> must be new (never a directory a campaign has run in) and named genotype_c4_production_<build
+#       commit, 7 hex>. The build must be a clean tree at PRODUCTION_COMMIT, or at a descendant whose production
+#       sources (src, include, CMakeLists.txt, external) are identical to it; its commit and binary hashes are
+#       recorded. CONCURRENT_JOBS (default 1) and THREADS_PER_CALL (default 8) are bound into the plan; more
+#       than one concurrent job needs SCHEDULER_CALIBRATION=<calibration.tsv> selecting it.
+#   tests/genotype_production_c4_campaign.sh launch <build dir> <out dir>
+#       Runs the planned jobs through scripts/c4_production_campaign.py with the plan's scheduler. REFUSES
+#       unless GENOTYPE_C4_CAMPAIGN_APPROVED names the reviewed plan's jobs.tsv sha256 (a campaign that can be
+#       launched by accident is not frozen), and the runner refuses a binary or profile that is not the plan's.
 #   tests/genotype_production_c4_campaign.sh summarize <out dir>
 #       One row per job from whatever has finished: status, decision, phase support, distance, floor,
 #       excess, wall and peak memory.
@@ -41,10 +53,16 @@
 set -uo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-MODE="${1:?usage: genotype_production_c4_campaign.sh plan <out> | launch <build> <out> | summarize <out>}"
+MODE="${1:?usage: genotype_production_c4_campaign.sh plan <out> <build> | launch <build> <out> | summarize <out>}"
 shift
-PROFILE="$REPO/profiles/genotype_c4_campaign_local.tsv"
-SCIENCE_PROFILE="$REPO/profiles/genotype_c4.tsv"
+PROFILE_REL=profiles/genotype_c4_v6_campaign_local.tsv
+SCIENCE_PROFILE_REL=profiles/genotype_c4_v4.tsv
+PROFILE="$REPO/$PROFILE_REL"
+SCIENCE_PROFILE="$REPO/$SCIENCE_PROFILE_REL"
+# The reviewed production build: census-free tie-branch seeds, accepted with the v6 sentinels.
+PRODUCTION_COMMIT=fefa6c0b43e2647faadf8bc82bc501d67ea5f880
+PRODUCTION_SOURCES="src include CMakeLists.txt external"
+OLD_CAMPAIGN="$REPO/tests/results/genotype_c4_production_bc5dd97/campaign"
 GRAPH_GZ="$REPO/tests/real_data/c4.gfa.gz"
 GRAPH_GZ_SHA=bf67be79db3ca05c2544162be0e18e4f0e3325872dd0d872407b577275870aa0
 GRAPH_SHA=b13af390c28dd8b43a913c43f123bb1fcf639e0569f99783fa12a778820c8733
@@ -59,10 +77,58 @@ SOURCE_COVERAGE=30
 sha() { if command -v sha256sum > /dev/null; then sha256sum "$1" | cut -d' ' -f1; else shasum -a 256 "$1" | cut -d' ' -f1; fi; }
 key() { awk -F'\t' -v k="$2" '$1==k{print $2; exit}' "$1"; }
 
+# The profile chain v4 -> v4 campaign-local -> v5 -> v6, each step exactly its reviewed differences.
+profile_chain() {
+  science() { grep -v '^#' "$1" | grep -v '^$' | grep -v -E '^(profile|threads|footprint_limit_bytes|time_limit_seconds)'$'\t' | sort; }
+  diff <(science "$SCIENCE_PROFILE") <(science "$REPO/profiles/genotype_c4_v4_campaign_local.tsv") > /dev/null \
+    || { echo "REFUSED: v4 campaign-local does not carry the science of $SCIENCE_PROFILE_REL" >&2; return 1; }
+  bash "$REPO/tests/genotype_v5_profile_gate.sh" > /dev/null || { echo "REFUSED: the v5 profile gate fails" >&2; return 1; }
+  bash "$REPO/tests/genotype_v6_profile_gate.sh" > /dev/null || { echo "REFUSED: the v6 profile gate fails" >&2; return 1; }
+  local k
+  for k in "repair_tie_branching 1" "repair_tie_max_branches 16" "representation_guard 1" "repair_rounds 32"; do
+    [ "$(key "$SCIENCE_PROFILE" "${k% *}")" = "${k#* }" ] || { echo "REFUSED: $SCIENCE_PROFILE_REL ${k% *} is not ${k#* }" >&2; return 1; }
+    [ "$(key "$PROFILE" "${k% *}")" = "${k#* }" ] || { echo "REFUSED: $PROFILE_REL ${k% *} is not ${k#* }" >&2; return 1; }
+  done
+}
+
+# The production build: a clean tree whose production sources are PRODUCTION_COMMIT's. Prints its commit.
+production_build() {
+  local build="$1" tree head
+  [ -x "$build/panvar" ] && [ -x "$build/genotype_probe" ] || { echo "REFUSED: $build has no panvar and genotype_probe" >&2; return 1; }
+  tree="$(git -C "$build/.." rev-parse --show-toplevel 2>/dev/null)" || { echo "REFUSED: $build is not in a git tree" >&2; return 1; }
+  [ -z "$(git -C "$tree" status --porcelain)" ] || { echo "REFUSED: the build tree $tree is not clean" >&2; return 1; }
+  head="$(git -C "$tree" rev-parse HEAD)"
+  if [ "$head" != "$PRODUCTION_COMMIT" ]; then
+    git -C "$tree" merge-base --is-ancestor "$PRODUCTION_COMMIT" "$head" 2> /dev/null \
+      || { echo "REFUSED: the build tree is at $head, not $PRODUCTION_COMMIT or a descendant" >&2; return 1; }
+    # shellcheck disable=SC2086
+    git -C "$tree" diff --quiet "$PRODUCTION_COMMIT" "$head" -- $PRODUCTION_SOURCES \
+      || { echo "REFUSED: the build tree's production sources differ from $PRODUCTION_COMMIT" >&2; return 1; }
+  fi
+  echo "$head"
+}
+
 plan() {
-  local out="$1" bad=0
-  mkdir -p "$out"
+  local out="$1" build="$2" bad=0 build_commit
   [ "$(sha "$GRAPH_GZ")" = "$GRAPH_GZ_SHA" ] || { echo "REFUSED: $GRAPH_GZ moved" >&2; exit 1; }
+  profile_chain || exit 1
+  build_commit="$(production_build "$build")" || exit 1
+  # A fresh directory, named from the build: never the frozen v1 campaign, never one a campaign has run in.
+  local resolved; resolved="$(cd "$(dirname "$out")" 2>/dev/null && pwd)/$(basename "$out")"
+  [ "$resolved" != "$OLD_CAMPAIGN" ] || { echo "REFUSED: $out is the frozen bc5dd97 campaign" >&2; exit 1; }
+  [ "$(basename "$out")" = "genotype_c4_production_${build_commit:0:7}" ] \
+    || { echo "REFUSED: the plan directory must be named genotype_c4_production_${build_commit:0:7}" >&2; exit 1; }
+  local used
+  for used in launch.tsv completeness.tsv inputs.tsv package lzo loo mosaic reads graphs mosaic_inputs; do
+    [ ! -e "$out/$used" ] || { echo "REFUSED: $out already holds $used; a campaign directory is never reused" >&2; exit 1; }
+  done
+  local concurrent="${CONCURRENT_JOBS:-1}" threads="${THREADS_PER_CALL:-8}" calibration="none"
+  if [ "$concurrent" != 1 ]; then
+    [ -n "${SCHEDULER_CALIBRATION:-}" ] && [ "$(key "$SCHEDULER_CALIBRATION" selected)" = "JOBS=$concurrent THREADS=$threads" ] \
+      || { echo "REFUSED: $concurrent concurrent jobs need a scheduler calibration selecting JOBS=$concurrent THREADS=$threads" >&2; exit 1; }
+    calibration="$SCHEDULER_CALIBRATION $(sha "$SCHEDULER_CALIBRATION")"
+  fi
+  mkdir -p "$out"
   local jobs="$out/jobs.tsv"
   printf "job\tcampaign\tsubject\tcoverage\tscheme\tdonor_label\tmodel_gfa\treads1\treads2\tlibrary\tcuration\ttruth_gfa\tsource_reads1\tsource_reads2\tsource_library\tpackage_kept_fragments\tsubsample_salt\tout_prefix\n" > "$jobs"
   local n=0
@@ -113,9 +179,24 @@ plan() {
     # Dirtiness of what the campaign itself uses: its profile, harness, runner, consolidation and manifests.
     # The binary comes from a separate clean build, whose commit the runner records at launch.
     printf "git_commit\t%s\ncampaign_files_dirty\t%s\n" "$(git -C "$REPO" rev-parse HEAD)" \
-      "$([ -z "$(git -C "$REPO" status --porcelain -- profiles tests/genotype_production_c4_campaign.sh scripts/c4_production_campaign.py scripts/consolidate_c4_production.py tests/genotype_c4_heldout_mosaic.sh "$DONORS" "$ELIGIBILITY" "$MOSAIC_MANIFEST")" ] && echo false || echo true)"
-    printf "profile\t%s\nprofile_sha256\t%s\n" "profiles/genotype_c4_campaign_local.tsv" "$(sha "$PROFILE")"
-    printf "science_profile\t%s\nscience_profile_sha256\t%s\n" "profiles/genotype_c4.tsv" "$(sha "$SCIENCE_PROFILE")"
+      "$([ -z "$(git -C "$REPO" status --porcelain -- profiles tests/genotype_production_c4_campaign.sh tests/genotype_v5_profile_gate.sh tests/genotype_v6_profile_gate.sh scripts/c4_production_campaign.py scripts/consolidate_c4_production.py tests/genotype_c4_heldout_mosaic.sh "$DONORS" "$ELIGIBILITY" "$MOSAIC_MANIFEST")" ] && echo false || echo true)"
+    printf "production_profile\t%s\nproduction_profile_sha256\t%s\n" "$PROFILE_REL" "$(sha "$PROFILE")"
+    printf "production_profile_name\t%s\n" "$(key "$PROFILE" profile)"
+    printf "science_profile\t%s\nscience_profile_sha256\t%s\n" "$SCIENCE_PROFILE_REL" "$(sha "$SCIENCE_PROFILE")"
+    printf "profile_chain\tv4 science = v4 campaign-local science; v5 gate; v6 gate: verified\n"
+    local f
+    for f in profiles/genotype_c4_v4_campaign_local.tsv profiles/genotype_c4_v5_campaign_local.tsv \
+             tests/genotype_v5_profile_gate.sh tests/genotype_v6_profile_gate.sh; do
+      printf "%s_sha256\t%s\n" "$f" "$(sha "$REPO/$f")"
+    done
+    printf "production_commit\t%s\nbuild_dir\t%s\nbuild_commit\t%s\nbuild_tree_clean\ttrue\n" \
+      "$PRODUCTION_COMMIT" "$(cd "$build" && pwd)" "$build_commit"
+    printf "build_production_sources\t%s identical to production_commit\n" "$PRODUCTION_SOURCES"
+    printf "production_binary_sha256\t%s\nevaluator_binary_sha256\t%s\n" "$(sha "$build/panvar")" "$(sha "$build/genotype_probe")"
+    for f in tests/genotype_production_c4_campaign.sh scripts/c4_production_campaign.py \
+             scripts/consolidate_c4_production.py tests/genotype_c4_heldout_mosaic.sh; do
+      printf "%s_sha256\t%s\n" "$f" "$(sha "$REPO/$f")"
+    done
     printf "graph\ttests/real_data/c4.gfa.gz\ngraph_gz_sha256\t%s\ngraph_sha256\t%s\n" "$GRAPH_GZ_SHA" "$GRAPH_SHA"
     printf "donor_manifest_sha256\t%s\neligibility_sha256\t%s\nmosaic_manifest_sha256\t%s\n" \
       "$(sha "$DONORS")" "$(sha "$ELIGIBILITY")" "$(sha "$MOSAIC_MANIFEST")"
@@ -124,11 +205,14 @@ plan() {
       "$(awk -F'\t' '$2=="lzo"' "$jobs" | wc -l | tr -d ' ')" "$(awk -F'\t' '$2=="loo"' "$jobs" | wc -l | tr -d ' ')" \
       "$(awk -F'\t' '$2=="mosaic"' "$jobs" | wc -l | tr -d ' ')"
     printf "jobs_sha256\t%s\n" "$(sha "$jobs")"
-    printf "execution\tserial; one call at a time, each with the profile's 8 threads\n"
+    printf "concurrent_jobs\t%s\nthreads_per_call\t%s\nscheduler_calibration\t%s\n" "$concurrent" "$threads" "$calibration"
+    printf "execution\t%s concurrent call(s), %s threads each; each call may approach 3.5 GiB of footprint under a 4 GiB limit\n" "$concurrent" "$threads"
+    printf "outcomes\tcompleted: strict_call, genotype_equivalent_call, no_call (tie_branching_incomplete, divergent_tie and every other declared no_call_reason); a no-call is never retried and never stops the campaign\n"
+    printf "estimate_provenance\tHISTORICAL: tests/genotype_production_c4_timing.tsv was measured with the v1 profile (genotype_c4.tsv) at b754647 on an Apple M4; it is not a v6 prediction\n"
     printf "truth_policy\ttruth is an evaluation input only; no call command names a truth file except LZO (model = truth by definition) and mosaic (synthetic paths curated out of the panel)\n"
   } > "$out/settings.tsv"
 
-  # ---- runtime and disk, from the production timings measured on this commit's regressions
+  # ---- runtime and disk: HISTORICAL v1 timings (see estimate_provenance), labelled as such in the table
   if [ -f "$TIMING" ]; then
     awk -F'\t' -v jobs="$jobs" '
       FNR==NR { if ($1 != "coverage" && $1 !~ /^#/) { wall[$1]=$2; disk[$1]=$3; fp[$1]=$4 } next }
@@ -137,12 +221,14 @@ plan() {
         for (c in count) { printf "%s\t%d\t%s\t%s\t%s\t%.2f\t%.0f\n", c, count[c], wall[c], disk[c], fp[c], count[c]*wall[c]/3600, count[c]*disk[c]; h+=count[c]*wall[c]; b+=count[c]*disk[c] }
         printf "all\t%d\tNA\tNA\tNA\t%.2f\t%.0f\n", FNR-1, h/3600, b
       }' "$TIMING" "$jobs" | sort -t$'\t' -k1,1n > "$out/estimate.body"
-    { printf "coverage\tjobs\tseconds_per_job\tbytes_per_job\tpeak_footprint_bytes_per_job\tserial_hours\tbytes_total\n"
+    { printf "# HISTORICAL, NOT A v6 PREDICTION: per-job seconds, bytes and footprints measured with the v1 profile\n"
+      printf "# (profiles/genotype_c4.tsv, 11 rounds, no tie branching, no representation guard) at b754647 on an Apple M4.\n"
+      printf "coverage\tjobs\tseconds_per_job\tbytes_per_job\tpeak_footprint_bytes_per_job\tserial_hours\tbytes_total\n"
       grep -v '^all' "$out/estimate.body"; grep '^all' "$out/estimate.body"; } > "$out/estimate.tsv"
     rm -f "$out/estimate.body"
   fi
   echo "planned $n jobs under $out (not launched)"
-  [ -f "$out/estimate.tsv" ] && column -t -s$'\t' "$out/estimate.tsv"
+  [ -f "$out/estimate.tsv" ] && grep -v '^#' "$out/estimate.tsv" | column -t -s$'\t' && echo "(historical v1 timings; not a v6 prediction)"
   [ "$bad" -eq 0 ] || { echo "plan INCOMPLETE: missing inputs above" >&2; exit 1; }
 }
 
@@ -154,21 +240,24 @@ launch() {
     echo "REFUSED: launching requires review of $jobs and GENOTYPE_C4_CAMPAIGN_APPROVED=<its sha256>." >&2
     exit 2
   fi
-  : "${JOBS:?JOBS (concurrent calls) must be set by the scheduler calibration}"
-  : "${THREADS:?THREADS (per call) must be set by the scheduler calibration}"
+  # The scheduler is the plan's; the runner refuses a binary or profile that is not.
+  local jobs_n threads_n
+  jobs_n="$(key "$out/settings.tsv" concurrent_jobs)"; threads_n="$(key "$out/settings.tsv" threads_per_call)"
+  [ -n "$jobs_n" ] && [ -n "$threads_n" ] || { echo "REFUSED: $out/settings.tsv binds no scheduler" >&2; exit 2; }
   # The resumable runner: classification, retries of external failures only, completeness after every job,
   # then evaluation, consolidation and the figure (scripts/c4_production_campaign.py).
   exec python3 "$REPO/scripts/c4_production_campaign.py" launch --build "$build" --out "$out" \
-    --jobs "$JOBS" --threads "$THREADS" ${EVALUATOR:+--evaluator "$EVALUATOR"}
+    --jobs "$jobs_n" --threads "$threads_n" ${EVALUATOR:+--evaluator "$EVALUATOR"}
 }
 
 summarize() {
   local out="$1" jobs="$1/jobs.tsv"
-  printf "job\tstatus\tfinal_decision\tphase_support\tdistance\tfloor\texcess\twall_seconds\tpeak_footprint_bytes\n"
+  printf "job\tstatus\tcall_class\tno_call_reason\tfinal_decision\tphase_support\tdistance\tfloor\texcess\twall_seconds\tpeak_footprint_bytes\n"
   tail -n +2 "$jobs" | while IFS=$'\t' read -r job _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ prefix; do
     local st="$prefix.mosaic_status.tsv" ev="$prefix.eval.summary.tsv"
     [ -f "$st" ] || continue
-    printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" "$job" "$(key "$st" status)" "$(key "$st" final_decision)" \
+    printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" "$job" "$(key "$st" status)" "$(key "$st" call_class)" \
+      "$(key "$st" no_call_reason)" "$(key "$st" final_decision)" \
       "$(key "$st" phase_support)" "$(key "$ev" unordered_distance_total 2>/dev/null)" \
       "$(key "$ev" availability_floor_total 2>/dev/null)" "$(key "$ev" excess_over_floor_total 2>/dev/null)" \
       "$(awk '/ real /{print $1}' "$prefix.time" 2>/dev/null)" "$(awk '/peak memory footprint/{print $1}' "$prefix.time" 2>/dev/null)"
@@ -176,7 +265,7 @@ summarize() {
 }
 
 case "$MODE" in
-  plan) plan "${1:?plan <out dir>}" ;;
+  plan) plan "${1:?plan <out dir> <production build dir>}" "${2:?plan <out dir> <production build dir>}" ;;
   launch) launch "${1:?launch <build dir> <out dir>}" "${2:?launch <build dir> <out dir>}" ;;
   summarize) summarize "${1:?summarize <out dir>}" ;;
   *) echo "unknown mode $MODE" >&2; exit 2 ;;
