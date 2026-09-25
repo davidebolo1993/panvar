@@ -341,6 +341,7 @@ struct CandidateSetReport {
     UnionPlacementCacheReport union_placement_cache;
     UnionOriginCacheReport union_origin_cache;
     UnionPrefilterCacheReport union_prefilter_cache;
+    StartSortReport start_sort;
     // True when no beam ran at all: K = 0, no phase audit and no positive development prefix, so the
     // candidate set is exactly the panel and nothing about it is conditional on a search. Reported as
     // candidate_scope PANEL_ONLY, which is neither COMPLETE nor CONDITIONAL -- both of those describe
@@ -579,6 +580,8 @@ void write_status(
     }
     for (const auto& hash : g_input_hashes) out << "sha256_" << hash.first << '\t' << hash.second << '\n';
     out << "footprint_limit_bytes\t" << options.footprint_limit_bytes << '\n';
+    // Whether emission-cache lookups were timed; when not, no lookup time anywhere is a measurement.
+    out << "emission_lookup_timing\t" << (options.emission_lookup_timing ? "measured" : "not_measured") << '\n';
     out << "time_limit_seconds\t" << options.time_limit_seconds << '\n';
     {
         // Worker and process memory at the moment the status is written.
@@ -837,6 +840,12 @@ void write_status(
                 << "\nunion_prefilter_cache_decisions_not_retained\t" << f.decisions_not_retained
                 << "\nunion_cached_prefilters_consumed\t" << f.hits << "\nunion_prefilter_cache_misses\t" << f.misses
                 << "\nworker_seconds_union_prefilter_index\t" << f.worker_seconds_index << '\n';
+            const StartSortReport& q = candidate_set->start_sort;
+            // The share and the peak a worker held depend on the worker count, so they sit with the threads_ keys.
+            out << "start_sort_scratch_bytes\t" << q.budget_bytes << "\nthreads_start_sort_workers\t" << q.workers
+                << "\nthreads_start_sort_share_bytes\t" << q.share_bytes << "\nstart_sort_out_of_place\t"
+                << q.out_of_place << "\nstart_sort_in_place\t" << q.in_place << "\nstart_sort_fallbacks\t"
+                << q.fallbacks << "\nthreads_start_sort_peak_worker_bytes\t" << q.peak_worker_bytes << '\n';
         }
         // Derived once, here, and used verbatim by every block row.
         out << "candidate_scope\t"
@@ -1038,6 +1047,11 @@ void apply_genotype_profile(const std::string& path, GenotypeCommandOptions& opt
         else if (key == "max_union_cached_origins_consumed") options.max_union_cached_origins_consumed = u();
         else if (key == "max_union_cached_states_consumed") options.max_union_cached_states_consumed = u();
         else if (key == "union_prefilter_cache_bytes") options.union_prefilter_cache_bytes = u();
+        else if (key == "start_sort_scratch_bytes") options.start_sort_scratch_bytes = u();
+        else if (key == "emission_lookup_timing") {
+            if (value != "0" && value != "1") throw std::runtime_error("profile " + path + ": 'emission_lookup_timing' is 0 or 1: " + value);
+            options.emission_lookup_timing = value == "1";
+        }
         else if (key == "max_union_cached_prefilters_consumed") options.max_union_cached_prefilters_consumed = u();
         else if (key == "representation_guard") {
             if (value != "0" && value != "1") throw std::runtime_error("profile " + path + ": 'representation_guard' is 0 or 1: " + value);
@@ -1109,6 +1123,7 @@ MosaicBeamResult candidate_prefix(const MosaicBeamResult& beam, std::size_t k) {
 } // namespace
 
 GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
+    set_emission_lookup_timing(options.emission_lookup_timing);
     const Clock::time_point started = Clock::now();
     StageTimings timings;
     const std::string status_path = options.out_prefix + ".mosaic_status.tsv";
@@ -1578,6 +1593,7 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
         scoring_options.max_union_cached_states_consumed = options.max_union_cached_states_consumed;
     }
     scoring_options.union_prefilter_cache_bytes = options.union_prefilter_cache_bytes;
+    scoring_options.start_sort_scratch_bytes = options.start_sort_scratch_bytes;
     scoring_options.max_union_cached_prefilters_consumed = options.max_union_cached_prefilters_consumed;
     FragmentScoringResult scored;
     std::string rescore_failure;
@@ -1602,12 +1618,14 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
             candidate_report.union_placement_cache = scored.union_placement_cache;
             candidate_report.union_origin_cache = scored.union_origin_cache;
             candidate_report.union_prefilter_cache = scored.union_prefilter_cache;
+            candidate_report.start_sort = scored.start_sort;
         } catch (const ResourceExhausted& error) {
             rescore_failure = error.what();
             candidate_report.observed_valid = true;
             candidate_report.union_placement_cache = candidate_report.observed.union_placement_cache;
             candidate_report.union_origin_cache = candidate_report.observed.union_origin_cache;
             candidate_report.union_prefilter_cache = candidate_report.observed.union_prefilter_cache;
+            candidate_report.start_sort = candidate_report.observed.start_sort;
             // The phases that did run, up to the refusal. Without these a refused run reports its
             // whole duration under seconds_rescoring and 0.000 for each of the three parts, which is
             // precisely the breakdown a refusal needs.

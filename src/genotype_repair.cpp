@@ -744,7 +744,9 @@ bool CoordinateRepairSearch::run(const RepairHooks& hooks) {
                 rec.oc_bytes = context->origin_cache_bytes();
                 rec.merge_working_bytes = context->merge_working_bytes();
             }
-            rec.seconds_lookup = emission_cache_lookup_seconds() - lookup_before;
+            // Not measured unless lookup timing is on: NaN, written NA, never a zero that reads as a measurement.
+            rec.seconds_lookup = emission_lookup_timing_enabled() ? emission_cache_lookup_seconds() - lookup_before
+                                                                  : std::numeric_limits<double>::quiet_NaN();
             {
                 const EmissionCacheCounters live = read_emission_cache_counters();
                 rec.entry_metadata_bytes = live.entry_metadata_bytes;
@@ -1040,7 +1042,13 @@ std::string CoordinateRepairSearch::render_rounds(const std::vector<RepairRound>
               << r.origins_reused << '\t' << r.origins_recomputed << '\t' << r.window_bases << '\t'
               << r.transient_before << '\t' << r.transient_after << '\t' << r.full_bytes << '\t' << r.window_bytes
               << '\t' << r.key_bytes << '\t' << r.seconds_origins << '\t' << r.seconds_merge << '\t'
-              << r.seconds_hashing << '\t' << r.seconds_lookup << '\t' << r.entry_metadata_bytes << '\t'
+              << r.seconds_hashing << '\t';
+        if (std::isnan(r.seconds_lookup)) {
+            table << "NA";
+        } else {
+            table << r.seconds_lookup;
+        }
+        table << '\t' << r.entry_metadata_bytes << '\t'
               << r.content_arena_bytes << '\t' << r.row_constructions << '\t' << r.accumulator_growths << '\t'
               << r.origin_growths << '\t' << r.oc_hits << '\t' << r.oc_misses << '\t' << r.oc_stored << '\t'
               << r.oc_entries << '\t' << r.oc_bytes << '\t' << r.origins_constructed << '\t' << r.origins_loaded

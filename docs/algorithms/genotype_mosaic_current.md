@@ -578,6 +578,49 @@ two levers implemented, both exact and always on; the benchmark delivered 2.2%, 
   start sort, indexing, probes, pairing -- stays linear in the haplotype count: prefilter reuse lowers the per-
   panel-haplotype cost from 2.18 to 1.27 worker-seconds, a constant factor, not a change of order.
 
+## v5: memory for speed, frozen (2026-09-25)
+
+`profiles/genotype_c4_v5_campaign_local.tsv` is its v4 profile key for key except the reviewed settings below;
+`panvar_genotype_v5_profile` (tests/genotype_v5_profile_gate.sh) proves that is the whole difference, that v4 sets
+none of the new keys, and that the comparison catches a copy with one more changed setting. Only the campaign-local
+profile has a v5; no global default moved.
+
+| key | v5 | measured on loo.NA19434.30 (union-only, 8 threads) |
+|---|---|---|
+| union_placement_cache_bytes / max_union_cached_placements_consumed | 512 MiB / 2e9 | payload 191.8 MB; 135.0M consumed |
+| union_origin_cache_bytes / max_union_cached_origins_consumed / max_union_cached_states_consumed | 1 GiB / 2e9 / 2e9 | payload 554.0 MB; 450.2M origins, 347.9M aggregates served |
+| union_prefilter_cache_bytes / max_union_cached_prefilters_consumed | 128 MiB / 2e9 | 8.39M decisions held (half-load limit), 0.49M declined; 458.2M served |
+| start_sort_scratch_bytes | 320 MiB | 40 MiB share per worker, 21.5 MB peak, 820 lists out of place, 0 fallbacks |
+| footprint_limit_bytes | 4 GiB (v4: 3.5 GiB) | 3.28 GiB |
+| emission_lookup_timing | 0 | status `emission_lookup_timing not_measured`; repair `seconds_lookup` NA |
+
+repair_rounds (32), the representation guard and every calling, correctness and resource setting are v4's.
+
+- **Out-of-place start sorter** (`start_sort_scratch_bytes`, off unless given). Each worker may hold budget /
+  workers bytes, 4 per proposal (starts only; the form is the bucket), kept across haplotypes and never above
+  its share; a list larger than the share is ordered by the in-place path and counted as a fallback
+  (`start_sort_fallbacks`) -- the same list either way, so the contract is fallback, never refusal. Status:
+  `start_sort_out_of_place`, `start_sort_in_place`, `start_sort_fallbacks`, and (thread-dependent)
+  `threads_start_sort_workers`, `threads_start_sort_share_bytes`, `threads_start_sort_peak_worker_bytes`.
+  std::sort + std::unique stays the fixture oracle. A first benchmark at a 128 MiB budget (16 MiB share) left 106
+  of 820 lists in place (panel lists reach ~5.4M proposals); at 320 MiB none.
+- **Lookup timing opt-in.** Emission-cache lookups read no clock unless `emission_lookup_timing` is on; the
+  status says whether it was measured and the repair's `seconds_lookup` is NA when not. Exact; its benefit on
+  NA19434 (timing on 30.1 s / 215.8 s CPU vs off 29.3 s / 209.9 s, two runs each) is within run-to-run noise.
+- **Gates.** Seeding exactness: out-of-place and in-place lists equal std::sort + std::unique on 3,000
+  randomised lists. Union fixture: a full budget (out of place, no fallbacks) and a one-byte budget (every list in
+  place, counted as fallbacks) at 1/2/4/8 threads, permuted haplotypes and reversed requests, each identical to
+  the reference, the worker peak never above its share. `loo.HG02282.2` (v4 profile, reuse off and every lever on)
+  equal to phase 5 in every table, trajectory and status counter; wall off 21.09 -> 20.80 s, on 19.90 -> 19.90 s.
+  With the v5 profile itself: every table and the trajectory equal v4's, 21.42 s, 0.90 GiB.
+- **`loo.NA19434.30`** (every v5 setting as overrides on v4): ranking and mass digest identical to the reference;
+  union 33.7 -> 28.9 s (1.16x; 5.39x over the reference's 155.8 s), job 35.9 -> 31.1 s, CPU 242 -> 207 s, footprint
+  3.28 GiB; panel start sort 49.3 -> 14.8 worker-seconds, slowest worker 26.5 -> 22.1 s.
+- **Persistent graph-side index: not implemented for C4.** The per-pass exact window index costs ~15
+  worker-seconds (~2 s of wall) here, the most a persistent one could save. Reconsider before larger loci, with
+  their real haplotype and window-content counts; the per-pass index stays the fallback and the scientific
+  reference either way.
+
 ## Frozen defaults
 
 State limit **256** (production) and **1,024** (diagnostic comparison width) -- counted in allele-prefix

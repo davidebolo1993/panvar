@@ -368,6 +368,9 @@ if(PANVAR_BUILD_TESTING)
         add_test(NAME panvar_genotype_downstream_schema
                  COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/genotype_downstream_schema_gate.sh
                          ${CMAKE_CURRENT_BINARY_DIR}/genotype_downstream_schema)
+        # The v5 campaign-local profile differs from v4 by exactly the reviewed speed and memory settings.
+        add_test(NAME panvar_genotype_v5_profile
+                 COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/genotype_v5_profile_gate.sh)
 
         # repair-pilot's construction and certification must not depend on candidate order or on which
         # homologue of a seed is written first. Both are checked from the scores its single pass already

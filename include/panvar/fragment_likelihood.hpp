@@ -450,6 +450,9 @@ void set_origin_cache_hash_collapse(bool collapse);
 // Seconds spent inside cache lookups, accumulated per thread and folded in as placement drains its
 // counters. Reported separately from origin construction because the two answer different questions:
 // whether the cache is cheap to consult, and whether the work it saves was worth consulting it for.
+// Per-lookup timing is off unless enabled (diagnostics); emission_cache_lookup_seconds() is then not a measurement.
+void set_emission_lookup_timing(bool enabled);
+bool emission_lookup_timing_enabled();
 double emission_cache_lookup_seconds();
 void reset_emission_cache_lookup_seconds();
 
@@ -775,6 +778,19 @@ struct UnionPrefilterCacheReport {
 };
 void set_union_prefilter_cache_hash_collapse(bool collapse);   // TEST ONLY: one hash for every window
 
+// The start sorter over one pass. With a scratch budget, each of `workers` holds at most budget / workers bytes
+// (4 per proposal), kept across haplotypes; a list too large for that share is ordered in place instead -- the
+// same list either way -- and counted as a fallback. Without a budget every list is ordered in place.
+struct StartSortReport {
+    std::uint64_t budget_bytes = 0;
+    std::size_t workers = 0;
+    std::uint64_t share_bytes = 0;         // the most any worker may hold
+    std::uint64_t out_of_place = 0;
+    std::uint64_t in_place = 0;
+    std::uint64_t fallbacks = 0;           // in place because the share was too small
+    std::uint64_t peak_worker_bytes = 0;   // the largest scratch a worker held (never above share_bytes)
+};
+
 struct FragmentScoringOptions {
     // The declared band of the truncated model. Fixed for a run: changing it changes the model.
     std::size_t mismatch_band = 6;
@@ -854,6 +870,8 @@ struct FragmentScoringOptions {
     // decision table; the consumption cap bounds decisions served and must then be positive. Needs one read length.
     std::size_t union_prefilter_cache_bytes = 0;
     std::uint64_t max_union_cached_prefilters_consumed = 0;
+    // Scratch for the out-of-place start sorter, over all workers (see StartSortReport). 0: in place always.
+    std::size_t start_sort_scratch_bytes = 0;
     // Workers for the diploid combination phase. Candidates are partitioned into fixed contiguous
     // ranges and each worker writes only its own complete DiplotypeScore entries, so the result does
     // not depend on the thread count: no cross-thread floating-point reduction exists to reorder.
@@ -923,6 +941,7 @@ struct FragmentScoringResult {
     UnionPlacementCacheReport union_placement_cache;
     UnionOriginCacheReport union_origin_cache;
     UnionPrefilterCacheReport union_prefilter_cache;
+    StartSortReport start_sort;
     std::vector<DiplotypeScore> scores;     // parallel to the requested candidates
     // Row-major [fragment * unique_haplotypes + haplotype]: the summed log placement mass of one
     // fragment on one chromosome copy of one haplotype. Retained because it is what the exhaustive
@@ -988,6 +1007,7 @@ struct FragmentScoringObservation {
     UnionPlacementCacheReport union_placement_cache;   // what the reuse did before the refusal
     UnionOriginCacheReport union_origin_cache;
     UnionPrefilterCacheReport union_prefilter_cache;
+    StartSortReport start_sort;
 };
 
 // A measurement, not an optimisation. Oriented read forms repeat -- four forms per fragment, and at
@@ -1468,6 +1488,8 @@ PrefilterDecisions feasibility_prefilter_decisions(const std::string& haplotype,
                                                    const std::string& read, std::size_t band, std::size_t max_gap_bp);
 // Gates only: proposed (form, start) pairs ordered and deduplicated by std::sort + std::unique (bucketed false) or
 // by the production counting-by-form path (true). Exactness means the two lists are equal.
+std::vector<std::pair<std::uint32_t, std::uint32_t>> sort_unique_proposals_scatter_for_test(
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> proposals, std::size_t form_count);
 std::vector<std::pair<std::uint32_t, std::uint32_t>> sort_unique_proposals_for_test(
     std::vector<std::pair<std::uint32_t, std::uint32_t>> proposals, std::size_t form_count, bool bucketed);
 

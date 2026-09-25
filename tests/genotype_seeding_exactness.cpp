@@ -148,9 +148,11 @@ int main() {
             const auto reference = panvar::sort_unique_proposals_for_test(proposals, forms, false);
             const auto bucketed = panvar::sort_unique_proposals_for_test(proposals, forms, true);
             require(reference == bucketed, "start set " + std::to_string(trial) + ": the bucketed list differs");
+            const auto scattered = panvar::sort_unique_proposals_scatter_for_test(proposals, forms);
+            require(reference == scattered, "start set " + std::to_string(trial) + ": the out-of-place list differs");
             ++lists;
         }
-        std::cout << "  ok: start set -- " << lists << " randomised proposal lists, bucketed = std::sort + std::unique\n";
+        std::cout << "  ok: start set -- " << lists << " randomised proposal lists, in-place and out-of-place = std::sort + std::unique\n";
 
         // ---- 3. the ACGT refusal ----------------------------------------------------------------------
         panvar::LibraryModel library;

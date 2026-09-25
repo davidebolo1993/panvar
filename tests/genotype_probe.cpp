@@ -5831,7 +5831,8 @@ int tie_branch(const Args& args) {
                             "time-limit-seconds", "union-placement-cache-bytes",
                             "max-union-cached-placements-consumed", "union-origin-cache-bytes",
                             "max-union-cached-origins-consumed", "max-union-cached-states-consumed",
-                            "union-prefilter-cache-bytes", "max-union-cached-prefilters-consumed"}) {
+                            "union-prefilter-cache-bytes", "max-union-cached-prefilters-consumed",
+                            "start-sort-scratch-bytes", "footprint-limit-bytes", "emission-lookup-timing"}) {
         const std::string value = args.get(key, "");
         if (value.empty()) continue;
         const std::string name_of = key;
@@ -5850,6 +5851,9 @@ int tie_branch(const Args& args) {
             options.max_union_cached_states_consumed = std::stoull(value);
         }
         else if (name_of == "union-prefilter-cache-bytes") options.union_prefilter_cache_bytes = std::stoull(value);
+        else if (name_of == "start-sort-scratch-bytes") options.start_sort_scratch_bytes = std::stoull(value);
+        else if (name_of == "footprint-limit-bytes") options.footprint_limit_bytes = std::stoull(value);
+        else if (name_of == "emission-lookup-timing") options.emission_lookup_timing = value != "0";
         else if (name_of == "max-union-cached-prefilters-consumed") {
             options.max_union_cached_prefilters_consumed = std::stoull(value);
         }

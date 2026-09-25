@@ -138,6 +138,12 @@ struct GenotypeCommandOptions {
     // when on, the consumption cap must be positive.
     std::size_t union_prefilter_cache_bytes = 0;
     std::uint64_t max_union_cached_prefilters_consumed = 0;
+    // Scratch for the union's out-of-place start sorter, over all workers (performance only; the list is the same).
+    // 0: in place always.
+    std::size_t start_sort_scratch_bytes = 0;
+    // Per-lookup emission-cache timing (two clock reads a lookup). Off: no clock is read and lookup time is reported
+    // as not measured.
+    bool emission_lookup_timing = false;
     // Gate hooks only, never settings: score every competitor in the live context even when the pool holds
     // it (the outside-pool path), and replace the declared threshold (NaN: kRepresentationBoundNats).
     bool test_representation_guard_force_context = false;

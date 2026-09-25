@@ -774,10 +774,18 @@ DeferredEmissions*& deferred_emissions() {
 
 // The hit path: one mutex, one probe chain, one memcmp pair, and a component copy into a buffer the
 // caller already owns. No allocation.
+// Lookup timing is diagnostic work -- two clock reads per lookup, measured at ~4.6% of union placement -- so it runs
+// only when asked for; otherwise no clock is read and the time is reported as not measured, never as zero.
+std::atomic<bool>& emission_lookup_timing() {
+    static std::atomic<bool> enabled{false};
+    return enabled;
+}
+
 CacheProbe cache_lookup(const KeyView& key, GappedFit* out, EmissionWork& work) {
     EmissionCache& cache = emission_cache();
     if (!cache.active.load(std::memory_order_relaxed)) return CacheProbe::Disabled;
-    const auto mark = std::chrono::steady_clock::now();
+    const bool timed = emission_lookup_timing().load(std::memory_order_relaxed);
+    const auto mark = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     CacheShard& shard = cache.shards[key.h0 % kCacheShards];
     CacheProbe answer = CacheProbe::Miss;
     {
@@ -803,9 +811,10 @@ CacheProbe cache_lookup(const KeyView& key, GappedFit* out, EmissionWork& work) 
             }
         }
     }
-    work.cache_lookup_nanos += static_cast<std::uint64_t>(
-        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - mark)
-            .count());
+    if (timed) {
+        work.cache_lookup_nanos += static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - mark).count());
+    }
     return answer;
 }
 
@@ -1469,6 +1478,9 @@ ScorerMemoryAccounts& last_memory_slot() {
 }
 
 ScorerMemoryAccounts last_scorer_memory_accounts() { return last_memory_slot(); }
+
+void set_emission_lookup_timing(bool enabled) { emission_lookup_timing().store(enabled, std::memory_order_relaxed); }
+bool emission_lookup_timing_enabled() { return emission_lookup_timing().load(std::memory_order_relaxed); }
 
 double emission_cache_lookup_seconds() {
     return static_cast<double>(emission_cache().lookup_nanos.load(std::memory_order_relaxed)) / 1e9;
@@ -2584,6 +2596,66 @@ void remember_prefilter(UnionPrefilterCache& cache, std::uint64_t key, bool feas
     }
 }
 
+// The same list by an out-of-place scatter: each proposal's start is written into its form's bucket of `scratch`
+// (4 bytes per proposal; the form is the bucket), each bucket sorted and made unique, and the pairs written back in
+// order. Exactly std::sort + std::unique's result. `scratch` must already hold proposed.size() entries of
+// capacity -- the caller's budget decides that, so nothing here allocates it.
+void sort_unique_proposals_scatter(std::vector<std::pair<std::uint32_t, std::uint32_t>>& proposed,
+                                   std::size_t form_count, std::vector<std::uint32_t>& cursor,
+                                   std::vector<std::uint32_t>& bound, std::vector<std::uint32_t>& scratch) {
+    cursor.assign(form_count, 0);
+    for (const auto& item : proposed) ++cursor[item.first];
+    bound.resize(form_count);
+    std::uint32_t running = 0;
+    for (std::size_t form = 0; form < form_count; ++form) {
+        const std::uint32_t size = cursor[form];
+        cursor[form] = running;
+        running += size;
+        bound[form] = running;
+    }
+    scratch.resize(proposed.size());   // within the capacity the caller reserved
+    for (const auto& item : proposed) scratch[cursor[item.first]++] = item.second;
+    std::size_t out = 0;
+    std::size_t begin = 0;
+    for (std::size_t form = 0; form < form_count; ++form) {
+        const std::size_t end = bound[form];
+        if (begin == end) continue;
+        std::uint32_t* first = scratch.data() + begin;
+        std::uint32_t* last = scratch.data() + end;
+        if (end - begin <= 24) {
+            for (std::uint32_t* it = first + 1; it < last; ++it) {
+                const std::uint32_t value = *it;
+                std::uint32_t* hole = it;
+                while (hole > first && value < *(hole - 1)) {
+                    *hole = *(hole - 1);
+                    --hole;
+                }
+                *hole = value;
+            }
+        } else {
+            std::sort(first, last);
+        }
+        for (std::uint32_t* it = first; it < last; ++it) {
+            if (it != first && *it == *(it - 1)) continue;
+            proposed[out++] = {static_cast<std::uint32_t>(form), *it};
+        }
+        begin = end;
+    }
+    proposed.resize(out);
+}
+
+// What the start sorter did over one pass: reset when a pass begins, read when it ends.
+struct StartSortTally {
+    std::atomic<std::uint64_t> out_of_place{0};
+    std::atomic<std::uint64_t> in_place{0};
+    std::atomic<std::uint64_t> fallbacks{0};            // scratch was budgeted but too small for this list
+    std::atomic<std::uint64_t> peak_worker_bytes{0};    // the largest scratch any worker held
+};
+StartSortTally& start_sort_tally() {
+    static StartSortTally tally;
+    return tally;
+}
+
 // MEASUREMENT ONLY: where one collect_form_placements call spent its time, in nanoseconds. A handful of clock
 // reads per call; filled only when a caller passes it.
 struct SeedingTimes {
@@ -2749,9 +2821,37 @@ void collect_form_placements(
     // sorting each form's few starts gives exactly std::sort + std::unique's list (gated), at a fraction of
     // the cost; the storage is the worker's own.
     {
+        // Out of place when the worker's share of the declared scratch budget holds this list (4 bytes a
+        // proposal), in place otherwise; either gives exactly the same list. The worker's scratch only grows, to
+        // at most its share, and is kept across haplotypes.
         thread_local std::vector<std::uint32_t> form_cursor;
         thread_local std::vector<std::uint32_t> form_bound;
-        sort_unique_proposals_bucketed(proposed, forms.size(), form_cursor, form_bound);
+        thread_local std::vector<std::uint32_t> start_scratch;
+        const std::size_t share = options.start_sort_scratch_bytes / std::max<std::size_t>(1, options.threads);
+        StartSortTally& tally = start_sort_tally();
+        const bool fits = !proposed.empty() && share > 0 && proposed.size() * sizeof(std::uint32_t) <= share;
+        if (fits) {
+            if (start_scratch.capacity() < proposed.size()) {
+                std::vector<std::uint32_t>().swap(start_scratch);
+                start_scratch.reserve(proposed.size());
+                if (start_scratch.capacity() * sizeof(std::uint32_t) > share) {
+                    // The allocator rounded past the share: give it back rather than exceed the budget.
+                    std::vector<std::uint32_t>().swap(start_scratch);
+                }
+                const std::uint64_t held = start_scratch.capacity() * sizeof(std::uint32_t);
+                std::uint64_t seen = tally.peak_worker_bytes.load(std::memory_order_relaxed);
+                while (held > seen && !tally.peak_worker_bytes.compare_exchange_weak(seen, held)) {
+                }
+            }
+        }
+        if (fits && start_scratch.capacity() >= proposed.size()) {
+            sort_unique_proposals_scatter(proposed, forms.size(), form_cursor, form_bound, start_scratch);
+            tally.out_of_place.fetch_add(1, std::memory_order_relaxed);
+        } else if (!proposed.empty()) {
+            sort_unique_proposals_bucketed(proposed, forms.size(), form_cursor, form_bound);
+            tally.in_place.fetch_add(1, std::memory_order_relaxed);
+            if (options.start_sort_scratch_bytes > 0) tally.fallbacks.fetch_add(1, std::memory_order_relaxed);
+        }
     }
     // Whether this haplotype strand is all ACGT, established once: with an all-ACGT form, no window check
     // can then fail, and gapped_emission is told so.
@@ -5186,6 +5286,23 @@ FragmentScoringResult score_diplotypes(
     }
     union_origins.max_origins = options.max_union_cached_origins_consumed;
     union_origins.max_states = options.max_union_cached_states_consumed;
+    {
+        StartSortTally& tally = start_sort_tally();
+        tally.out_of_place.store(0);
+        tally.in_place.store(0);
+        tally.fallbacks.store(0);
+        tally.peak_worker_bytes.store(0);
+        result.start_sort.budget_bytes = options.start_sort_scratch_bytes;
+        result.start_sort.workers = std::max<std::size_t>(1, options.threads);
+        result.start_sort.share_bytes = options.start_sort_scratch_bytes / result.start_sort.workers;
+    }
+    const auto start_sort_report = [&](StartSortReport& report) {
+        const StartSortTally& tally = start_sort_tally();
+        report.out_of_place = tally.out_of_place.load();
+        report.in_place = tally.in_place.load();
+        report.fallbacks = tally.fallbacks.load();
+        report.peak_worker_bytes = tally.peak_worker_bytes.load();
+    };
     std::unique_ptr<UnionPrefilterCache> prefilter_cache;
     if (options.union_prefilter_cache_bytes > 0) {
         if (options.max_union_cached_prefilters_consumed == 0) {
@@ -5255,6 +5372,8 @@ FragmentScoringResult score_diplotypes(
             union_origins.states_consumed.load(std::memory_order_relaxed);
         observed_on_failure->union_prefilter_cache = result.union_prefilter_cache;
         prefilter_report(observed_on_failure->union_prefilter_cache);
+        observed_on_failure->start_sort = result.start_sort;
+        start_sort_report(observed_on_failure->start_sort);
     };
 
     result.threads_used_placement =
@@ -5279,6 +5398,7 @@ FragmentScoringResult score_diplotypes(
         result.union_origin_cache.origins_consumed = union_origins.origins_consumed.load(std::memory_order_relaxed);
         result.union_origin_cache.states_consumed = union_origins.states_consumed.load(std::memory_order_relaxed);
         prefilter_report(result.union_prefilter_cache);
+        start_sort_report(result.start_sort);
     } catch (const ResourceExhausted&) {
         note_observed_work();
         throw;
@@ -7186,6 +7306,14 @@ PrefilterDecisions feasibility_prefilter_decisions(const std::string& haplotype,
     out.production_unprepared = window != 0 && feasible_within_band(haplotype, start, window, read, band, nullptr);
     out.production_prepared = window != 0 && feasible_within_band(haplotype, start, window, read, band, &pattern);
     return out;
+}
+
+std::vector<std::pair<std::uint32_t, std::uint32_t>> sort_unique_proposals_scatter_for_test(
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> proposals, std::size_t form_count) {
+    std::vector<std::uint32_t> cursor, bound, scratch;
+    scratch.reserve(proposals.size());
+    sort_unique_proposals_scatter(proposals, form_count, cursor, bound, scratch);
+    return proposals;
 }
 
 std::vector<std::pair<std::uint32_t, std::uint32_t>> sort_unique_proposals_for_test(

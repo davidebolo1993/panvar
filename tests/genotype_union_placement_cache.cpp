@@ -159,6 +159,7 @@ struct Config {
     bool reverse_candidates = false;
     std::size_t prefilter_budget = 0;
     std::uint64_t prefilter_cap = 0;
+    std::size_t sort_scratch = 0;
     std::uint64_t max_physical_origins = 0;   // 0: the default
     std::uint64_t max_state_classes = 0;
     bool record_all_origins = false;
@@ -194,6 +195,7 @@ Run score(const Fixture& f, const Config& config) {
         o.max_union_cached_states_consumed = config.states_cap;
     }
     o.union_prefilter_cache_bytes = config.prefilter_budget;
+    o.start_sort_scratch_bytes = config.sort_scratch;
     o.max_union_cached_prefilters_consumed = config.prefilter_cap;
     if (config.max_physical_origins != 0) o.max_physical_origins = config.max_physical_origins;
     if (config.max_state_classes != 0) o.max_state_classes = config.max_state_classes;
@@ -649,6 +651,41 @@ int main() {
         std::cout << "  ok: prefilter reuse alone, over phase 1 and over phases 1+2; 1/2/4/8 threads, permuted haplotypes, "
                      "reversed requests, forced window-hash collisions, an undersized table, the consumption cap exact "
                      "and one below (1 and 4 threads), a zero cap invalid\n";
+
+        // ---- out-of-place start sorter ---------------------------------------------------------------------
+        {
+            Config full_scratch = p2;
+            full_scratch.prefilter_budget = std::size_t{1} << 24;
+            full_scratch.prefilter_cap = many;
+            for (const std::size_t budget : {std::size_t{64} << 20, std::size_t{1}}) {
+                for (const std::size_t threads : {std::size_t{1}, std::size_t{2}, std::size_t{4}, std::size_t{8}}) {
+                    Config c = full_scratch;
+                    c.sort_scratch = budget;
+                    c.threads = threads;
+                    const Run sorted_run = score(f, c);
+                    const panvar::StartSortReport& s = sorted_run.result.start_sort;
+                    require(s.peak_worker_bytes <= s.share_bytes, "a worker's sort scratch exceeded its share");
+                    if (budget == 1) {
+                        require(s.out_of_place == 0 && s.fallbacks > 0 && s.fallbacks == s.in_place,
+                                "a one-byte scratch budget must order every list in place, counted as fallbacks");
+                    } else {
+                        require(s.out_of_place > 0 && s.fallbacks == 0, "a full scratch budget must order out of place");
+                    }
+                    require_identical(reference, sorted_run, "start sorter, budget " + std::to_string(budget) + ", " +
+                                                                 std::to_string(threads) + " threads");
+                }
+            }
+            Config permuted_scratch = full_scratch;
+            permuted_scratch.sort_scratch = std::size_t{64} << 20;
+            permuted_scratch.order = {3, 0, 4, 2, 1};
+            permuted_scratch.threads = 4;
+            require_identical(reference, score(f, permuted_scratch), "start sorter, permuted haplotypes");
+            permuted_scratch.reverse_candidates = true;
+            require_identical(reference, score(f, permuted_scratch), "start sorter, reversed requests");
+            std::cout << "  ok: out-of-place start sorter within its scratch share, and every list in place (counted as "
+                         "fallbacks) under a one-byte budget, at 1/2/4/8 threads, permuted haplotypes and reversed "
+                         "requests\n";
+        }
 
         panvar::set_origin_cache_self_check(true);
         for (const std::size_t threads : {std::size_t{1}, std::size_t{4}}) {
