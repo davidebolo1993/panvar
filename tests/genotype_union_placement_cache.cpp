@@ -311,9 +311,17 @@ int main() {
         for (const std::size_t threads : {std::size_t{2}, std::size_t{4}, std::size_t{8}}) {
             Config c = p1;
             c.threads = threads;
-            require_identical(reference, score(f, c), std::to_string(threads) + " threads");
+            const Run threaded = score(f, c);
+            require_identical(reference, threaded, std::to_string(threads) + " threads");
+            // The fill's contents, payload and admission do not depend on who filled what.
+            const panvar::UnionPlacementCacheReport& t = threaded.result.union_placement_cache;
+            require(t.admitted_segments == report.admitted_segments && t.declined_segments == report.declined_segments &&
+                        t.placements_enumerated == report.placements_enumerated &&
+                        t.placements_cached == report.placements_cached && t.payload_bytes == report.payload_bytes &&
+                        t.hits == report.hits && t.placements_replayed == report.placements_replayed,
+                    std::to_string(threads) + " threads: the placement cache's contents or payload differ");
         }
-        std::cout << "  ok: 1, 2, 4 and 8 threads\n";
+        std::cout << "  ok: 1, 2, 4 and 8 threads (cache contents, payload and admission invariant)\n";
 
         Config zero = p1;
         zero.placement_budget = 0;

@@ -471,6 +471,43 @@ logical counter on `loo.NA19434.30` equals phase 2's).
   panel verification 308.8 -> 197.0, panel start sort 47.2 -> 40.6; slowest worker 57.9 -> 41.7 s.
   `loo.HG02282.2` 2x full call: 24.1 -> 21.3 s (reuse off), 21.0 -> 19.2 s (on).
 
+## Union hot loop, final phase (2026-09-25): exact; the replay overpredicted
+
+Measured first in the replay-only process (`--union-seeding-profile 16`; `phase4_replay_loo.NA19434.30`), then
+two levers implemented, both exact and always on; the benchmark delivered 2.2%, not the ~10% predicted.
+
+- **Replay, panel (16 haplotypes, 20.9 s single-thread after phase 3).** Prefilter (early) 11.3 s, start sort
+  3.2 s, emission key 2.5 s, cache lookup 1.06 s -- of which the two clock reads 0.29, the shard lock 0.10, the
+  component copy 0.26, the probe 0.43 -- seed scan 0.8 s, DPs 0.7 s.
+- **Emission key: implemented.** The key hash is byte-serial, so its state after "read + separator" is a function
+  of the read: each prepared form carries it (`ReadForm::key_prefix`, taken from the form's own bytes, living
+  with them) and the window resumes from it -- h0 and h1 are key_view_of's exactly, so table, shard, probe order,
+  hits, misses, retention and budget are unchanged, and identity is still full byte comparison. The public
+  `gapped_emission` still hashes the whole read. Replay: key 2.49 -> 1.20 s, 9.28M keys checked equal. The
+  lookup's clock reads were left (they feed the repair's reported `seconds_lookup`).
+- **Multi-lane Myers: rejected.** Streaming 2, 4 and 8 starts of one form through the early kernel, lanes refilled
+  as they decide: 14.9, 23.2 and 25.2 s against the one-start kernel's 11.3 s (143.5M decisions identical). Lane
+  bookkeeping and 128-bit state in memory cost more than the overlap gains; no NEON path was built.
+- **Fill balancing: implemented.** The placement-cache fill ran in batches of 8 segments, each waiting for its
+  longest (7.58 s of batch makespans over 37.5 worker-s). Now bounded batches of 64, claimed longest first from a
+  shared cursor; results land in canonical slots, counters merge in slot order, admission stays canonical after
+  the batch. Simulated from the replay's per-segment times: 4.92 s.
+- **Gates.** `panvar_genotype_seeding_exactness` adds 20,000 resumed keys equal to the full hash (and under forced
+  collisions), and six scorings (full, undersized and one-byte cache budgets, with and without forced
+  collisions) whose mass cells and every emission-cache counter -- prefilters, requests, hits, misses, executed
+  DPs, entries, refusals to retain, payload and budget bytes -- equal those of hashing the whole read. The union
+  fixture now requires the placement cache's contents, payload and admission to be identical at 1/2/4/8 threads.
+  `loo.HG02282.2` (reuse off and on): every table, the trajectory and every status counter equal to phase 3's.
+- **`loo.NA19434.30`** (union-only, phases 1+2): ranking and mass digest identical to the reference, every status
+  counter equal to phase 3's. Union 52.1 -> 51.0 s (1.02x; 3.06x over the reference), wall 54.4 -> 53.4 s,
+  footprint 3.21 -> 3.19 GiB. The fill fell 7.75 -> 6.19 s (simulated 4.92); placement did not move (41.7 -> 42.0 s
+  slowest worker; panel verification 197.0 -> 193.6 worker-s, against ~15 predicted): under eight threads the
+  key hashing the replay removed was not on the critical resource. Run-to-run noise on these per-phase
+  worker-seconds is several seconds.
+- **Wall now** (51.0 s union, 53.4 s job): placement 42.0 s (panel seeding ~83% of worker time: prefilter, then
+  start sort, emission key and lookup), placement-cache fill 6.2 s, diploid combination 1.8 s, origin-cache fill
+  0.7 s, fragment preparation 0.2 s; outside the union, model and markers 2.0 s.
+
 ## Frozen defaults
 
 State limit **256** (production) and **1,024** (diagnostic comparison width) -- counted in allele-prefix

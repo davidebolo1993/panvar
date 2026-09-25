@@ -1682,8 +1682,27 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
         row("dp_timed", &UnionSeedingPhases::dp_timed);
         row("placements", &UnionSeedingPhases::placements);
         row("replayed", &UnionSeedingPhases::replayed);
+        for (const auto& [key, field] : std::vector<std::pair<const char*, std::uint64_t UnionSeedingPhases::*>>{
+                 {"survivors", &UnionSeedingPhases::survivors}, {"key_full_ns", &UnionSeedingPhases::key_full_ns},
+                 {"key_prefix_ns", &UnionSeedingPhases::key_prefix_ns}, {"lookup_ns", &UnionSeedingPhases::lookup_ns},
+                 {"lookup_unclocked_ns", &UnionSeedingPhases::lookup_unclocked_ns},
+                 {"lookup_nolock_ns", &UnionSeedingPhases::lookup_nolock_ns},
+                 {"lookup_nocopy_ns", &UnionSeedingPhases::lookup_nocopy_ns},
+                 {"probe_only_ns", &UnionSeedingPhases::probe_only_ns},
+                 {"clock_pairs_ns", &UnionSeedingPhases::clock_pairs_ns},
+                 {"batched_starts", &UnionSeedingPhases::batched_starts}, {"lanes2_ns", &UnionSeedingPhases::lanes2_ns},
+                 {"lanes4_ns", &UnionSeedingPhases::lanes4_ns}, {"lanes8_ns", &UnionSeedingPhases::lanes8_ns}}) {
+            row(key, field);
+        }
         text << "bucketed_sort_lists_checked\t" << profile.bucketed_sort_checked << "\t\n"
-             << "early_prefilter_decisions_checked\t" << profile.early_prefilter_checked << "\t\n";
+             << "early_prefilter_decisions_checked\t" << profile.early_prefilter_checked << "\t\n"
+             << "lane_decisions_checked\t" << profile.lane_decisions_checked << "\t\n"
+             << "prefix_keys_checked\t" << profile.prefix_keys_checked << "\t\n"
+             << "fill_workers\t" << profile.fill_workers << "\t\n"
+             << "fill_seconds\t" << profile.fill_seconds << "\t\n";
+        for (std::size_t i = 0; i < profile.fill_segments.size(); ++i) {
+            text << "fill_segment\t" << profile.fill_segments[i].first << '\t' << profile.fill_segments[i].second << '\n';
+        }
         for (std::size_t i = 0; i < profile.sampled.size(); ++i) {
             text << "sampled_haplotype\t" << profile.sampled[i] << '\t' << (is_panel[profile.sampled[i]] ? "panel" : "mosaic")
                  << ':' << std::hex << profile.sampled_hashes[i] << std::dec << '\n';

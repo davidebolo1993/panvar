@@ -5,12 +5,17 @@
 //      than the bit-parallel word, bands 0..8 and gaps 0..4;
 //   2  the counting-by-form start set is exactly std::sort + std::unique's list on randomised proposals with heavy
 //      duplication, empty and single-form lists, forms above the insertion-sort threshold, and sparse forms;
-//   3  the ACGT refusal still fires, with the same message, for a non-ACGT base in the window or the read.
+//   3  the ACGT refusal still fires, with the same message, for a non-ACGT base in the window or the read;
+//   4  the emission key resumed from a prepared form's carried hash state equals the full hash in every field,
+//      and scoring with it gives identical mass cells and identical emission-cache hits, misses, executed DPs,
+//      entries, retention refusals and budget bytes as hashing the whole read -- under a full, an undersized
+//      and a zero-room budget, and with every key forced into one hash.
 #include "panvar/fragment_likelihood.hpp"
 #include "panvar/genotype_model.hpp"
 
 #include <algorithm>
 #include <cstdint>
+#include <cstring>
 #include <iostream>
 #include <random>
 #include <stdexcept>
@@ -22,6 +27,19 @@ namespace {
 
 void require(bool condition, const std::string& message) {
     if (!condition) throw std::runtime_error(message);
+}
+
+panvar::SequencingRead read_of(const std::string& name, const std::string& bases) {
+    return {name, bases, std::string(bases.size(), 'I')};
+}
+
+std::string revcomp(const std::string& bases) {
+    std::string out(bases.size(), 'N');
+    for (std::size_t i = 0; i < bases.size(); ++i) {
+        const char base = bases[bases.size() - 1 - i];
+        out[i] = base == 'A' ? 'T' : base == 'C' ? 'G' : base == 'G' ? 'C' : 'A';
+    }
+    return out;
 }
 
 std::string random_bases(std::mt19937_64& rng, std::size_t length) {
@@ -158,6 +176,86 @@ int main() {
         require(refuses(hap_n, read) && refuses(hap, read_n), "a non-ACGT base must still refuse");
         require(!refuses(hap, read), "an all-ACGT window must not refuse");
         std::cout << "  ok: a non-ACGT base in the window or the read still refuses\n";
+        // ---- 4. the emission key ----------------------------------------------------------------------
+        std::uint64_t keys = 0;
+        for (int trial = 0; trial < 20000; ++trial) {
+            const std::string read = random_bases(rng, 1 + rng() % 180);
+            const std::string window = random_bases(rng, rng() % 200);
+            require(panvar::emission_key_prefix_matches(read, window), "a resumed emission key differs from the full hash");
+            ++keys;
+        }
+        panvar::set_emission_cache_hash_collapse(true);
+        require(panvar::emission_key_prefix_matches(unique.substr(0, 100), unique.substr(50, 103)),
+                "under forced collisions the resumed key must equal the full one too");
+        panvar::set_emission_cache_hash_collapse(false);
+        {
+            // A small locus: three haplotypes sharing stretches, fragments drawn from them with errors.
+            std::vector<std::string> haplotypes = {unique.substr(0, 900), unique.substr(300, 600) + repeat.substr(0, 300),
+                                                   period41.substr(0, 500) + unique.substr(0, 400)};
+            std::vector<panvar::ReadPair> fragments;
+            for (std::size_t h = 0; h < haplotypes.size(); ++h) {
+                for (std::size_t start = 0; start + 260 <= haplotypes[h].size(); start += 17) {
+                    std::string forward = haplotypes[h].substr(start, 100);
+                    std::string reverse = revcomp(haplotypes[h].substr(start + 160, 100));
+                    if (rng() % 3 == 0) forward[rng() % 100] = "ACGT"[rng() % 4];
+                    if (rng() % 3 == 0) reverse[rng() % 100] = "ACGT"[rng() % 4];
+                    fragments.push_back({read_of("f/1", forward), read_of("f/2", reverse)});
+                }
+            }
+            std::vector<panvar::MosaicPath> paths;
+            for (std::size_t h = 0; h < haplotypes.size(); ++h) paths.push_back(panvar::MosaicPath{{h}});
+            const panvar::InternedHaplotypes interned = panvar::intern_haplotypes(paths, haplotypes);
+            std::vector<panvar::HaplotypeCandidate> candidates;
+            for (std::size_t x = 0; x < interned.sequences.size(); ++x) {
+                for (std::size_t y = x; y < interned.sequences.size(); ++y) candidates.push_back({x, y});
+            }
+            panvar::LibraryModel pairs = library;
+            pairs.support_sigmas = 3.0;
+            pairs.outlier_weight = 0.005;
+            const auto run = [&](bool prefix, std::size_t budget, bool collapse) {
+                panvar::FragmentScoringOptions o;
+                o.minimum_piece_bp = 10;
+                o.threads = 1;
+                o.emission_cache_bytes = budget;
+                panvar::set_emission_key_prefix(prefix);
+                panvar::set_emission_cache_hash_collapse(collapse);
+                panvar::FragmentScoringResult result = panvar::score_diplotypes(interned, candidates, fragments, pairs, o);
+                panvar::set_emission_cache_hash_collapse(false);
+                panvar::set_emission_key_prefix(true);
+                return result;
+            };
+            std::uint64_t compared = 0;
+            for (const std::size_t budget : {std::size_t{1} << 24, std::size_t{20000}, std::size_t{1}}) {
+                for (const bool collapse : {false, true}) {
+                    const panvar::FragmentScoringResult reference = run(false, budget, collapse);
+                    const panvar::FragmentScoringResult resumed = run(true, budget, collapse);
+                    require(reference.log_mass.size() == resumed.log_mass.size() &&
+                                std::memcmp(reference.log_mass.data(), resumed.log_mass.data(),
+                                            reference.log_mass.size() * sizeof(double)) == 0,
+                            "the resumed key changed a mass cell");
+                    const panvar::EmissionCacheCounters& a = reference.emission_cache;
+                    const panvar::EmissionCacheCounters& b = resumed.emission_cache;
+                    require(a.executed_prefilters == b.executed_prefilters && a.dp_cache_requests == b.dp_cache_requests &&
+                                a.dp_cache_hits == b.dp_cache_hits && a.dp_cache_misses == b.dp_cache_misses &&
+                                a.executed_dps == b.executed_dps && a.entries == b.entries &&
+                                a.entries_not_retained == b.entries_not_retained && a.payload_bytes == b.payload_bytes &&
+                                a.budgeted_bytes_used == b.budgeted_bytes_used,
+                            "the resumed key changed a hit, miss, executed DP, retention or budget decision (budget " +
+                                std::to_string(budget) + (collapse ? ", collapsed)" : ")"));
+                    require(a.dp_cache_requests > 0 && (budget == 1 || a.dp_cache_hits > 0),
+                            "the key fixture must exercise the cache (requests " + std::to_string(a.dp_cache_requests) +
+                                ", hits " + std::to_string(a.dp_cache_hits) + ", entries " + std::to_string(a.entries) + ", misses " + std::to_string(a.dp_cache_misses) +
+                                ", executed " + std::to_string(a.executed_dps) + ", not retained " +
+                                std::to_string(a.entries_not_retained) + ", budgeted " +
+                                std::to_string(a.budgeted_bytes_used) + ")");
+                    if (budget == 1) require(a.entries_not_retained > 0, "a one-byte budget must decline retention");
+                    ++compared;
+                }
+            }
+            std::cout << "  ok: emission key -- " << keys << " resumed keys equal to the full hash; " << compared
+                      << " scorings (full, undersized and one-byte budgets, with and without forced collisions): mass "
+                         "cells and every cache counter identical to hashing the whole read\n";
+        }
         std::cout << "seeding exactness gates passed\n";
         return 0;
     } catch (const std::exception& error) {

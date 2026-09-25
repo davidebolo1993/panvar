@@ -413,6 +413,11 @@ struct ScorerMemoryAccounts {
 // manufactured to order; collapsing the hash exercises the same code path, harder, on every key
 // rather than on one contrived pair. Never set on a production path.
 void set_emission_cache_hash_collapse(bool collapse);
+// TEST ONLY: off, prepared forms hash their whole read into every emission key as the public path does (the
+// reference); on (the default), they resume from the hash state carried with their bytes. The keys are equal.
+void set_emission_key_prefix(bool enabled);
+// Gates only: the resumed key equals key_view_of's for this read and window, in every field.
+bool emission_key_prefix_matches(const std::string& read, const std::string& window);
 
 void begin_emission_cache(std::size_t budget_bytes);
 
@@ -722,6 +727,15 @@ struct UnionSeedingPhases {
     std::uint64_t row_sort_ns = 0;
     std::uint64_t piece_hits = 0, proposals = 0, unique_starts = 0, prefilters = 0, prefilter_rejections = 0;
     std::uint64_t dp_requests = 0, executed_dps = 0, dp_timed = 0, placements = 0, replayed = 0;
+    // The emission key path over the prefilter survivors, every key already cached: key construction by the full
+    // hash and by the carried read-side state (identical h0/h1, checked), the production lookup, and its parts
+    // without the clock reads, without the shard lock, without the component copy, and the probe alone.
+    std::uint64_t survivors = 0;
+    std::uint64_t key_full_ns = 0, key_prefix_ns = 0, lookup_ns = 0, lookup_unclocked_ns = 0;
+    std::uint64_t lookup_nolock_ns = 0, lookup_nocopy_ns = 0, probe_only_ns = 0, clock_pairs_ns = 0;
+    // The early-refusing prefilter over the same eligible starts, streamed through 2, 4 and 8 lanes per read form
+    // (decisions checked identical to the one-start kernel's).
+    std::uint64_t batched_starts = 0, lanes2_ns = 0, lanes4_ns = 0, lanes8_ns = 0;
 };
 struct UnionSeedingProfile {
     UnionSeedingPhases panel, mosaic;
@@ -729,6 +743,13 @@ struct UnionSeedingProfile {
     std::vector<std::uint64_t> sampled_hashes;     // FNV-1a of each sampled haplotype's bytes
     std::uint64_t bucketed_sort_checked = 0;       // proposal lists compared, all identical
     std::uint64_t early_prefilter_checked = 0;     // prefilter decisions compared, all identical
+    std::uint64_t lane_decisions_checked = 0;      // multi-lane decisions compared, all identical
+    std::uint64_t prefix_keys_checked = 0;         // prefix-state keys compared, all identical
+    // The placement-cache fill, per eligible segment in canonical order: wall seconds and length, with the batch
+    // width it ran at -- enough to price another assignment of the same work.
+    std::vector<std::pair<double, std::size_t>> fill_segments;
+    std::size_t fill_workers = 0;
+    double fill_seconds = 0.0;
 };
 
 struct FragmentScoringOptions {

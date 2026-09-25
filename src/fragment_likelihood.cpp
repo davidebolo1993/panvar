@@ -610,6 +610,45 @@ KeyView key_view_of(const std::string& read, const char* window, std::size_t win
     return key;
 }
 
+// The key hash is byte-serial, so its state after "read bytes + 0xff" is a function of the read alone: carried per
+// prepared form, the window's bytes resume from it and give exactly key_view_of's h0 and h1. Identity is still
+// decided by complete byte comparison; only the hashing of the read side is not repeated.
+struct KeyPrefix {
+    std::uint64_t a = 0;
+    std::uint64_t b = 0;
+};
+KeyPrefix key_prefix_of(const std::string& read) {
+    KeyPrefix prefix{1469598103934665603ULL, 0x2545f4914f6cdd1dULL};
+    const auto mix = [&](unsigned char value) {
+        prefix.a = (prefix.a ^ value) * 1099511628211ULL;
+        prefix.b = (prefix.b + value) * 0x9e3779b97f4a7c15ULL;
+        prefix.b ^= prefix.b >> 29;
+    };
+    for (const char c : read) mix(static_cast<unsigned char>(c));
+    mix(0xff);
+    return prefix;
+}
+KeyView key_view_from_prefix(const KeyPrefix& prefix, const std::string& read, const char* window,
+                             std::size_t window_length) {
+    std::uint64_t a = prefix.a;
+    std::uint64_t b = prefix.b;
+    for (std::size_t i = 0; i < window_length; ++i) {
+        const unsigned char value = static_cast<unsigned char>(window[i]);
+        a = (a ^ value) * 1099511628211ULL;
+        b = (b + value) * 0x9e3779b97f4a7c15ULL;
+        b ^= b >> 29;
+    }
+    KeyView key;
+    const bool collapse = cache_hash_collapse().load(std::memory_order_relaxed);
+    key.h0 = collapse ? 0 : a;
+    key.h1 = collapse ? 0 : b;
+    key.read = read.data();
+    key.read_length = static_cast<std::uint32_t>(read.size());
+    key.window = window;
+    key.window_length = static_cast<std::uint32_t>(window_length);
+    return key;
+}
+
 std::size_t slot_hash(std::uint64_t h0, std::uint64_t h1) {
     return static_cast<std::size_t>(h0 ^ (h1 * 0x9e3779b97f4a7c15ULL));
 }
@@ -765,6 +804,27 @@ CacheProbe cache_lookup(const KeyView& key, GappedFit* out, EmissionWork& work) 
         std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - mark)
             .count());
     return answer;
+}
+
+// MEASUREMENT ONLY: the hit path's parts, without the clock reads -- with or without the shard lock, with or
+// without the component copy. Single-threaded replay only (without the lock it races any writer).
+CacheProbe cache_probe_measured(const KeyView& key, GappedFit* out, bool lock, bool copy) {
+    EmissionCache& cache = emission_cache();
+    CacheShard& shard = cache.shards[key.h0 % kCacheShards];
+    std::unique_lock<std::mutex> guard(shard.guard, std::defer_lock);
+    if (lock) guard.lock();
+    const std::size_t at = find_occupied_slot(shard, key);
+    if (at == kNoSlot) return CacheProbe::Miss;
+    const CacheValue& value = shard.table[at].value;
+    if (value.outcome == CacheOutcome::RefusedAfterRecursion) return CacheProbe::HitRefusedAfterRecursion;
+    if (copy) {
+        out->log_emission = value.log_emission;
+        out->consumed_bp = value.consumed_bp;
+        out->edits = value.edits;
+        out->components.assign(shard.arena.begin() + value.component_offset,
+                               shard.arena.begin() + value.component_offset + value.component_count);
+    }
+    return CacheProbe::HitAccepted;
 }
 
 // Shared by both store paths: charge the budget, take the slot, copy the bytes once.
@@ -975,6 +1035,67 @@ bool myers_shw_run_early(const MyersWord peq[4], std::size_t n, const char* targ
         if (score > band + (m - 1 - j)) return false;   // no remaining prefix can come back within the band
     }
     return false;
+}
+
+// Many starts of ONE read form (one pattern) through the early-refusing kernel, `Lanes` at a time: each lane
+// runs exactly myers_shw_run_early's steps on its own start, lanes advance one column per round so their
+// independent dependency chains overlap, and a lane that decides takes the next start at once. Decisions land at
+// their own index; nothing a lane does reads another lane. `windows[i] == 0` is decided false, as the
+// single-start path decides it.
+template <std::size_t Lanes>
+void myers_early_lanes(const MyersWord peq[4], std::size_t n, const char* text, const std::uint32_t* starts,
+                       const std::uint32_t* windows, std::size_t count, std::size_t band, char* out) {
+    MyersWord vp[Lanes], vn[Lanes];
+    std::size_t score[Lanes], column[Lanes], width[Lanes], index[Lanes];
+    const char* target[Lanes];
+    bool live[Lanes];
+    const MyersWord top = MyersWord{1} << (n - 1);
+    std::size_t next = 0;
+    const auto load = [&](std::size_t lane) {
+        while (next < count) {
+            const std::size_t i = next++;
+            const std::size_t m = windows[i];
+            if (m == 0) { out[i] = 0; continue; }
+            if (n <= band) { out[i] = 1; continue; }
+            if (n > band + m) { out[i] = 0; continue; }
+            vp[lane] = ~MyersWord{0};
+            vn[lane] = 0;
+            score[lane] = n;
+            column[lane] = 0;
+            width[lane] = m;
+            index[lane] = i;
+            target[lane] = text + starts[i];
+            return true;
+        }
+        return false;
+    };
+    std::size_t active = 0;
+    for (std::size_t lane = 0; lane < Lanes; ++lane) {
+        live[lane] = load(lane);
+        active += live[lane] ? 1 : 0;
+    }
+    while (active != 0) {
+        for (std::size_t lane = 0; lane < Lanes; ++lane) {
+            if (!live[lane]) continue;
+            const std::size_t j = column[lane];
+            const MyersWord x0 = peq[two_bit_code(target[lane][j])] | vn[lane];
+            const MyersWord d0 = (((x0 & vp[lane]) + vp[lane]) ^ vp[lane]) | x0;
+            const MyersWord hn = vp[lane] & d0;
+            const MyersWord hp = vn[lane] | ~(vp[lane] | d0);
+            if (hp & top) ++score[lane]; else if (hn & top) --score[lane];
+            const MyersWord x1 = (hp << 1) | 1;
+            vn[lane] = x1 & d0;
+            vp[lane] = (hn << 1) | ~(x1 | d0);
+            column[lane] = j + 1;
+            int decided = -1;
+            if (score[lane] <= band) decided = 1;
+            else if (score[lane] > band + (width[lane] - 1 - j)) decided = 0;
+            if (decided < 0) continue;
+            out[index[lane]] = static_cast<char>(decided);
+            live[lane] = load(lane);
+            if (!live[lane]) --active;
+        }
+    }
 }
 
 bool myers_shw_within(const char* query, std::size_t n, const char* target, std::size_t m,
@@ -1479,14 +1600,27 @@ MyersPattern prepare_myers_pattern(const std::string& read) {
     return pattern;
 }
 
-std::optional<GappedFit> gapped_emission(
+namespace {
+std::atomic<bool>& emission_key_prefix_enabled() {
+    static std::atomic<bool> enabled{true};
+    return enabled;
+}
+}  // namespace
+
+void set_emission_key_prefix(bool enabled) { emission_key_prefix_enabled().store(enabled, std::memory_order_relaxed); }
+
+// The one emission body. `key_prefix`, when given, is the hash state after `read` and its separator (taken from
+// the read's own bytes by key_prefix_of, and carried by the prepared form that owns those bytes); the key it
+// resumes is key_view_of's exactly. The public entry point passes none and hashes the read as before.
+std::optional<GappedFit> gapped_emission_core(
     const std::string& haplotype,
     const std::string& read,
     std::size_t start,
     const LibraryModel& library,
     std::size_t mismatch_band,
     const MyersPattern* pattern,
-    bool acgt_known) {
+    bool acgt_known,
+    const KeyPrefix* key_prefix) {
     if (read.empty()) throw std::invalid_argument("gapped emission requires a non-empty read");
     if (start > haplotype.size()) return std::nullopt;
     // ELIGIBILITY is by read length, exactly as the substitution-only model required: the haplotype
@@ -1537,7 +1671,9 @@ std::optional<GappedFit> gapped_emission(
     const bool caching = cache.active.load(std::memory_order_relaxed);
     KeyView key;
     if (caching) {
-        key = key_view_of(read, haplotype.data() + start, window);
+        key = key_prefix != nullptr && emission_key_prefix_enabled().load(std::memory_order_relaxed)
+                  ? key_view_from_prefix(*key_prefix, read, haplotype.data() + start, window)
+                  : key_view_of(read, haplotype.data() + start, window);
         ++work.dp_cache_requests;
         GappedFit cached;
         switch (cache_lookup(key, &cached, work)) {
@@ -1611,6 +1747,25 @@ std::optional<GappedFit> gapped_emission(
         }
     }
     return fit;
+}
+
+std::optional<GappedFit> gapped_emission(
+    const std::string& haplotype,
+    const std::string& read,
+    std::size_t start,
+    const LibraryModel& library,
+    std::size_t mismatch_band,
+    const MyersPattern* pattern,
+    bool acgt_known) {
+    return gapped_emission_core(haplotype, read, start, library, mismatch_band, pattern, acgt_known, nullptr);
+}
+
+bool emission_key_prefix_matches(const std::string& read, const std::string& window) {
+    const KeyView full = key_view_of(read, window.data(), window.size());
+    const KeyView resumed = key_view_from_prefix(key_prefix_of(read), read, window.data(), window.size());
+    return full.h0 == resumed.h0 && full.h1 == resumed.h1 && full.read == resumed.read &&
+           full.read_length == resumed.read_length && full.window == resumed.window &&
+           full.window_length == resumed.window_length;
 }
 
 std::optional<GappedFit> gapped_emission_reference(
@@ -1886,6 +2041,9 @@ struct ReadForm {
     // cost a pass over the read on every one of 1.19 billion verifications.
     MyersPattern pattern;
     bool all_acgt = false;   // every base is ACGT, so no window check can fail on the read's side
+    // The emission key's hash state after these bytes: lives and dies with them, so it can never describe
+    // other bytes. The cache keeps its own copy of every key's bytes, so its lifetime does not depend on this.
+    KeyPrefix key_prefix{};
 };
 
 // piece code -> (form, offset of the piece inside that form)
@@ -2448,8 +2606,9 @@ void collect_form_placements(
         }
         const auto emission_mark = timing ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         const std::optional<GappedFit> fit =
-            gapped_emission(haplotype, forms[item.first].bases, item.second, library, band,
-                            &forms[item.first].pattern, haplotype_acgt && forms[item.first].all_acgt);
+            gapped_emission_core(haplotype, forms[item.first].bases, item.second, library, band,
+                                 &forms[item.first].pattern, haplotype_acgt && forms[item.first].all_acgt,
+                                 &forms[item.first].key_prefix);
         if (timing) {
             const std::uint64_t spent = nanos_since(emission_mark);
             emission_timing().emission_ns += spent;
@@ -2777,6 +2936,7 @@ PreparedFragmentSet prepare_fragment_set(
             form.is_forward_mate_of_first_arm = first_arm;
             form.pattern = prepare_myers_pattern(form.bases);
             form.all_acgt = std::all_of(form.bases.begin(), form.bases.end(), is_acgt);
+            form.key_prefix = key_prefix_of(form.bases);
             into.push_back(std::move(form));
         };
         add_form(out.forward_forms, f, fragments[f].first.bases, true);
@@ -3637,7 +3797,9 @@ void fill_union_cache(const PlacementInputs& in, const std::vector<std::vector<s
                       // Phase 2, when `origin_reuse` is given: origins constructed from the admitted placements.
                       std::size_t origin_budget_bytes = 0, UnionOriginReuse* origin_reuse = nullptr,
                       std::deque<UnionOriginEntry>* origin_entries = nullptr,
-                      UnionOriginCacheReport* origin_report = nullptr) {
+                      UnionOriginCacheReport* origin_report = nullptr,
+                      // MEASUREMENT ONLY: per eligible segment (canonical order), its fill's wall seconds and length.
+                      std::vector<std::pair<double, std::size_t>>* segment_seconds = nullptr) {
     const auto fill_mark = std::chrono::steady_clock::now();
     const PreparedFragmentSet& prepared = *in.prepared;
     const LibraryModel& library = *in.library;
@@ -3728,18 +3890,37 @@ void fill_union_cache(const PlacementInputs& in, const std::vector<std::vector<s
     });
     report.eligible_segments = eligible.size();
     entries.assign(eligible.size(), UnionSegmentEntry{});
+    if (segment_seconds != nullptr) segment_seconds->assign(eligible.size(), {0.0, 0});
     std::vector<char> admitted(eligible.size(), 0);
 
+    // Bounded batches of canonical segments. Within one, the workers claim segments longest first from a shared
+    // cursor, so a long segment no longer holds seven idle workers; each result lands in its canonical slot, the
+    // counters are merged in slot order and admission runs in canonical order after the batch, so what is
+    // computed, counted and retained does not depend on which worker took what. The batch bound caps what is
+    // held before admission decides.
+    constexpr std::size_t kFillBatch = 64;
     const std::size_t workers = std::max<std::size_t>(1, std::min(threads, eligible.size()));
     std::uint64_t held = 0;
     report.peak_bytes = report.index_bytes;
-    for (std::size_t begin = 0; begin < eligible.size(); begin += workers) {
-        const std::size_t end = std::min(begin + workers, eligible.size());
+    for (std::size_t begin = 0; begin < eligible.size(); begin += kFillBatch) {
+        const std::size_t end = std::min(begin + kFillBatch, eligible.size());
         std::vector<FragmentScoringCounters> local(end - begin);
         std::vector<EmissionCacheCounters> local_cache(end - begin);
         std::vector<std::exception_ptr> failures(end - begin);
         const auto fill_one = [&](std::size_t slot) {
             const ActiveWorker active;
+            const auto segment_mark = std::chrono::steady_clock::now();
+            struct Record {
+                std::vector<std::pair<double, std::size_t>>* into;
+                std::size_t at;
+                std::size_t length;
+                std::chrono::steady_clock::time_point mark;
+                ~Record() {
+                    if (into != nullptr) {
+                        (*into)[at] = {std::chrono::duration<double>(std::chrono::steady_clock::now() - mark).count(), length};
+                    }
+                }
+            } record{segment_seconds, begin + slot, distinct[eligible[begin + slot]].bytes.size(), segment_mark};
             const Distinct& d = distinct[eligible[begin + slot]];
             const bool forward = d.strand == 0;
             const auto& forms = forward ? prepared.forward_forms : prepared.reverse_forms;
@@ -3758,17 +3939,30 @@ void fill_union_cache(const PlacementInputs& in, const std::vector<std::vector<s
                 }
             }
         };
-        if (end - begin == 1) {
-            fill_one(0);
+        std::vector<std::size_t> claim_order(end - begin);
+        for (std::size_t slot = 0; slot < claim_order.size(); ++slot) claim_order[slot] = slot;
+        std::stable_sort(claim_order.begin(), claim_order.end(), [&](std::size_t x, std::size_t y) {
+            return distinct[eligible[begin + x]].bytes.size() > distinct[eligible[begin + y]].bytes.size();
+        });
+        const std::size_t batch_workers = std::min(workers, end - begin);
+        if (batch_workers == 1) {
+            for (const std::size_t slot : claim_order) fill_one(slot);
         } else {
+            std::atomic<std::size_t> cursor{0};
             std::vector<std::thread> pool;
-            for (std::size_t slot = 0; slot < end - begin; ++slot) {
-                pool.emplace_back([&, slot]() {
-                    try {
-                        fill_one(slot);
-                    } catch (const PlacementCancelled&) {
-                    } catch (...) {
-                        failures[slot] = std::current_exception();
+            for (std::size_t w = 0; w < batch_workers; ++w) {
+                pool.emplace_back([&]() {
+                    for (std::size_t at = cursor.fetch_add(1); at < claim_order.size(); at = cursor.fetch_add(1)) {
+                        const std::size_t slot = claim_order[at];
+                        try {
+                            fill_one(slot);
+                        } catch (const PlacementCancelled&) {
+                            return;
+                        } catch (...) {
+                            failures[slot] = std::current_exception();
+                            budget.cancel();
+                            return;
+                        }
                     }
                 });
             }
@@ -4950,7 +5144,9 @@ UnionSeedingProfile profile_union_seeding(const InternedHaplotypes& haplotypes, 
     if (reuse) {
         fill_union_cache(inputs, *options.union_segment_lengths, options.union_placement_cache_bytes, 0, options.threads,
                          budget, fill_counters, fill_cache, entries, replay, placement_report,
-                         0, nullptr, &origin_entries, &origin_report);   // seeding reads phase 1's zones only
+                         0, nullptr, &origin_entries, &origin_report, &profile.fill_segments);   // phase 1 only
+        profile.fill_workers = std::max<std::size_t>(1, std::min<std::size_t>(options.threads, placement_report.eligible_segments));
+        profile.fill_seconds = placement_report.seconds_fill;
     }
     const auto code_of = [](char base) { return two_bit(base); };
     std::vector<std::uint8_t> skip;
@@ -5092,6 +5288,117 @@ UnionSeedingProfile profile_union_seeding(const InternedHaplotypes& haplotypes, 
             phases.prefilter_early_ns += ns_since(mark);
             if (early != feasible) throw std::logic_error("seeding profile: the early-refusing prefilter differs");
             profile.early_prefilter_checked += proposed.size();
+
+            // The same eligible starts streamed through 2, 4 and 8 lanes, one read form at a time.
+            {
+                std::vector<std::uint32_t> lane_starts, lane_windows;
+                std::vector<char> lane_out;
+                std::vector<std::pair<std::size_t, std::size_t>> groups;   // [begin, end) in the compacted arrays
+                std::vector<std::size_t> origin_of;                          // compacted -> proposed index
+                std::vector<const ReadForm*> group_form;
+                for (std::size_t i = 0; i < proposed.size();) {
+                    std::size_t k = i;
+                    const std::size_t first = lane_starts.size();
+                    while (k < proposed.size() && proposed[k].first == proposed[i].first) {
+                        if (window_of[k] != 0) {
+                            lane_starts.push_back(proposed[k].second);
+                            lane_windows.push_back(static_cast<std::uint32_t>(window_of[k]));
+                            origin_of.push_back(k);
+                        }
+                        ++k;
+                    }
+                    const ReadForm& form = forms[proposed[i].first];
+                    if (lane_starts.size() > first) {
+                        if (!form.pattern.usable) throw std::logic_error("seeding profile: a form without a pattern");
+                        groups.push_back({first, lane_starts.size()});
+                        group_form.push_back(&form);
+                    }
+                    i = k;
+                }
+                phases.batched_starts += lane_starts.size();
+                const auto run_lanes = [&](auto lanes_tag, std::uint64_t& into) {
+                    constexpr std::size_t kLanes = decltype(lanes_tag)::value;
+                    lane_out.assign(lane_starts.size(), 2);
+                    const auto lane_mark = Clock::now();
+                    for (std::size_t g = 0; g < groups.size(); ++g) {
+                        const MyersPattern& pattern = group_form[g]->pattern;
+                        MyersWord peq[4];
+                        for (int c = 0; c < 4; ++c) peq[c] = myers_word_of(pattern.peq_lo[c], pattern.peq_hi[c]);
+                        myers_early_lanes<kLanes>(peq, pattern.length, text.data(), lane_starts.data() + groups[g].first,
+                                                  lane_windows.data() + groups[g].first,
+                                                  groups[g].second - groups[g].first, band,
+                                                  lane_out.data() + groups[g].first);
+                    }
+                    into += ns_since(lane_mark);
+                    for (std::size_t c = 0; c < lane_out.size(); ++c) {
+                        if (lane_out[c] != early[origin_of[c]]) {
+                            throw std::logic_error("seeding profile: a multi-lane prefilter decision differs");
+                        }
+                    }
+                    profile.lane_decisions_checked += lane_out.size();
+                };
+                run_lanes(std::integral_constant<std::size_t, 2>{}, phases.lanes2_ns);
+                run_lanes(std::integral_constant<std::size_t, 4>{}, phases.lanes4_ns);
+                run_lanes(std::integral_constant<std::size_t, 8>{}, phases.lanes8_ns);
+            }
+
+            // The emission key path over the survivors: every key is cached by the production call above.
+            {
+                std::vector<std::size_t> survivors;
+                for (std::size_t i = 0; i < proposed.size(); ++i) {
+                    if (feasible[i] != 0) survivors.push_back(i);
+                }
+                phases.survivors += survivors.size();
+                std::vector<KeyView> keys(survivors.size());
+                mark = Clock::now();
+                for (std::size_t k = 0; k < survivors.size(); ++k) {
+                    const std::size_t i = survivors[k];
+                    keys[k] = key_view_of(forms[proposed[i].first].bases, text.data() + proposed[i].second, window_of[i]);
+                }
+                phases.key_full_ns += ns_since(mark);
+                std::vector<KeyPrefix> prefix_of(forms.size());
+                std::vector<char> prefixed(forms.size(), 0);
+                mark = Clock::now();
+                for (std::size_t k = 0; k < survivors.size(); ++k) {
+                    const std::size_t i = survivors[k];
+                    const std::uint32_t f = proposed[i].first;
+                    if (prefixed[f] == 0) {
+                        prefix_of[f] = key_prefix_of(forms[f].bases);
+                        prefixed[f] = 1;
+                    }
+                    const KeyView key = key_view_from_prefix(prefix_of[f], forms[f].bases, text.data() + proposed[i].second,
+                                                             window_of[i]);
+                    if (key.h0 != keys[k].h0 || key.h1 != keys[k].h1) {
+                        throw std::logic_error("seeding profile: a prefix-state key differs from the full hash");
+                    }
+                }
+                phases.key_prefix_ns += ns_since(mark);
+                profile.prefix_keys_checked += survivors.size();
+                GappedFit out;
+                EmissionWork scratch_work;
+                std::uint64_t sink = 0;
+                mark = Clock::now();
+                for (const KeyView& key : keys) sink += static_cast<std::uint64_t>(cache_lookup(key, &out, scratch_work));
+                phases.lookup_ns += ns_since(mark);
+                const auto parts = [&](bool lock, bool copy, std::uint64_t& into) {
+                    const auto part_mark = Clock::now();
+                    for (const KeyView& key : keys) sink += static_cast<std::uint64_t>(cache_probe_measured(key, &out, lock, copy));
+                    into += ns_since(part_mark);
+                };
+                parts(true, true, phases.lookup_unclocked_ns);
+                parts(false, true, phases.lookup_nolock_ns);
+                parts(true, false, phases.lookup_nocopy_ns);
+                parts(false, false, phases.probe_only_ns);
+                mark = Clock::now();
+                for (std::size_t k = 0; k < keys.size(); ++k) {
+                    const auto a = Clock::now();
+                    const auto b = Clock::now();
+                    sink += static_cast<std::uint64_t>((b - a).count());
+                }
+                phases.clock_pairs_ns += ns_since(mark);
+                volatile std::uint64_t keep = sink;
+                (void)keep;
+            }
             // Only accepted fits are kept (a fit carries its component array inline; millions of refusals would not).
             std::vector<std::pair<std::size_t, GappedFit>> fits;
             mark = Clock::now();
