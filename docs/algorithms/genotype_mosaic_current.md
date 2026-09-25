@@ -171,12 +171,27 @@ the candidate union, the repair and the pooled rule are unchanged.
 neighbour becomes a branch that continues the same exact repair from it, and a branch that stops at a tie of
 its own splits again. Branches run breadth-first, within a tie in diplotype-identity order
 (`tie_branch_order bfs_canonical_identity_v1`), which no input enumeration or thread schedule can change.
-They share the production search's scoring context -- warm origin and emission caches -- and each tied
-neighbour is created by the exact block delta of a promoted repair from its parent incumbent's census, which
-stays pinned and unmodified (`tie_branch_seeding delta_promoted_shared_context`); sequence digests are
+They share the production search's scoring context -- warm origin and emission caches. A waiting branch is a
+compact descriptor only: its allele paths, the declared score components and prior, the sequence digests, its
+parent tie and history identities (`tie_branch_seeding census_free_just_in_time_shared_context`). Immediately
+before a branch runs, its two haplotypes are spelled from their allele paths, placed in full by the ordinary
+exact path (into released slots) with their censuses retained, and the declared complete score -- every
+component and the prior -- is reproduced bit for bit before any neighbour is scored; a seed that does not
+spell its digests, cannot be placed, or does not reproduce fails the branching closed. Sequence digests are
 memoised by allele path. Each branch has its own visited set (its ancestors' incumbents included), ranking
 state and candidates. Every candidate any branch scores joins the pool; the pooled rule decides, never the
 order branches ran in. Branching runs before the run is claimed, so the watchdog still bounds it.
+
+**Branch memory.** A settle point follows the root tie's recording and every fully processed branch (its result
+copied into the pool and, for a split, its children recorded). At each one the finished branch's search and
+every repair slot are released; the content-keyed origin and emission caches are kept. So at every settle
+point the context holds no slot, sequence, mass column or census for any branch, the frontier grows only in
+descriptors, and at most the running branch's start holds a seed census; every exit (converged, capped,
+refused, failed) closes with the same release. Seed placement is search work: it counts against the
+cumulative caps with everything else. The frontier used before (a census-holding seed per waiting branch,
+built by block delta at its tie and pinned until its branch ran) grew by one census per split and passed
+4 GiB on `loo.HG01573.30`; it survives only as a gate hook, as does the older lifetime that also pinned every
+parent incumbent.
 
 **Calling contract.**
 
@@ -205,7 +220,12 @@ physical origins, seconds). Branch-scored candidates appear in `.mosaic_candidat
 `search_conditional`, `repair_tie_branching`, `repair_tie_max_branches`, `tie_branch_order`,
 `tie_branch_seeding`, `tie_branched`, `tie_ties`, `tie_branches_run`, `tie_distinct_terminal_genotypes`,
 `tie_incomplete_reason`, `tie_branch_physical_origins`, `pool_branch_scored`, `tie_digest_memo_hits`,
-`tie_digest_memo_misses`, `seconds_tie_branching`.
+`tie_digest_memo_misses`, `seconds_tie_branching`, and the seed accounting `tie_seeds_materialised`,
+`tie_seed_haplotypes_placed`, `tie_seed_physical_origins`, `tie_seed_state_classes`, `tie_seed_piece_hits`,
+`tie_seed_latent_pairs`, `seconds_tie_seed_placement`, `tie_seed_peak_live_censuses`,
+`tie_peak_pending_descriptors`. `.tie_branch_memory.tsv` (`.partial.tsv` while branching runs, kept by a
+refused run) has one row per settle point, per materialised seed and at close: slots, sequence, mass-column
+and census bytes, origin-cache payload, footprint, pending descriptors and cumulative physical origins.
 
 **Gates.** Engine fixtures in the command end-to-end test (unique convergence where the winner is not the
 first branch, genotype-equivalent and divergent terminals, nested ties, the branch cap exact and one below,
@@ -214,7 +234,11 @@ the repair from its census equal cold full seeding in every mass cell and in exp
 `tests/genotype_tie_branching_regressions.sh`, five frozen C4 ties (two synthetic mosaics, a low- and a
 high-excess LOO tie, the 14-branch nested case) whose production outputs must equal their frozen v2/post-hoc
 diagnostics: status, pool, pooled top set member for member and score for score, representative, branch
-endpoints, terminal ties and the unchanged production trajectory.
+endpoints, terminal ties and the unchanged production trajectory. `tests/genotype_branch_lifetime.cpp`
+replays a scripted nested branching under the census-free, eager and parent-retaining lifetimes: every seed,
+neighbour and incumbent bit-identical to a fresh placement and between the census-free and eager frontiers;
+at every census-free settle point no census, live slot, or sequence or mass-column growth, however large the
+frontier; released slots reused.
 
 ## Representation-conflict quality guard (2026-09-24)
 

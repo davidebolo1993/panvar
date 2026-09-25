@@ -150,6 +150,14 @@ struct GenotypeCommandOptions {
     // Gate hook only, never a setting: keep the pre-fix branch lifetime (every parent incumbent pinned for the whole
     // branching search, no release at a branch's end), so a gate can compare the two lifetimes on one binary.
     bool test_retain_branch_parents = false;
+    // Gate hook only, never a setting: build every pending branch seed eagerly at its tie, as a census-holding
+    // slot pair derived by block delta from the parent incumbent (the pre-census-free frontier). Production keeps
+    // pending seeds as compact descriptors and materialises a branch's start just before the branch runs.
+    // test_retain_branch_parents implies it.
+    bool test_eager_branch_seeds = false;
+    // Gate hook only: the branch with this id declares a start score one ulp off, so its just-in-time
+    // reproduction must fail closed (-1: off).
+    long test_perturb_branch_seed = -1;
     double test_representation_guard_bound_nats = std::numeric_limits<double>::quiet_NaN();
     // Gate hook: where the marker's best pair is the called pair, take the best other pair as the competitor.
     bool test_representation_guard_runner_up = false;

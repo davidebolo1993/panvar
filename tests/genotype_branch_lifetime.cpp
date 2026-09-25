@@ -1,15 +1,20 @@
 // Branch-local lifetime of tie-branching state in one shared PreparedScoringContext.
 //
 // A scripted branching search -- a root tie seeding six branches, each running rounds of neighbours and a promoted
-// incumbent, one of them splitting into two nested child seeds -- is replayed under two lifetimes:
-//   branch_local     at every settle point (the root seeded, each branch processed) every repair slot is released
-//                    except the seeds still waiting;
-//   retain_parents   the pre-fix lifetime: every parent incumbent stays pinned and nothing is released at a
-//                    branch's end.
+// incumbent, one of them splitting into two nested child seeds -- is replayed under three lifetimes:
+//   census_free      production: a waiting branch is a descriptor (its allele choice) and holds nothing in the
+//                    context; its start is placed in full, censused, just before it runs, and at every settle point
+//                    (the root recorded, each branch processed) every repair slot is released;
+//   branch_local     the eager frontier: every seed is a census-holding slot built by block delta at its tie, and
+//                    at every settle point every repair slot is released except the seeds still waiting;
+//   retain_parents   the pre-fix lifetime: eager seeds, every parent incumbent stays pinned and nothing is released
+//                    at a branch's end.
 // Required: every seed, neighbour and incumbent is bit-identical (mass column and exposure) to a fresh full
-// placement of its sequence, in both lifetimes; a seed stays usable after its parent is released, and so do nested
-// child seeds after theirs; released slots are reused; and under branch_local the censuses held at a settle point
-// are exactly the waiting seeds -- they do not grow with the number of branches already completed.
+// placement of its sequence, in every lifetime, and bit-identical between the census-free and the eager frontier;
+// a seed stays usable after its parent is released, and so do nested child seeds after theirs; released slots are
+// reused; under branch_local the censuses held at a settle point are exactly the waiting seeds; and under
+// census_free no census, sequence, mass column or live slot is held at any settle point however large the frontier,
+// and at most the running branch's start holds a seed census.
 #include "panvar/fragment_likelihood.hpp"
 #include "panvar/genotype_model.hpp"
 
@@ -144,6 +149,7 @@ struct Checker {
         double exposure;
     };
     std::vector<Recorded> recorded;
+    std::vector<Recorded> last;   // the previous run's records, kept for a cross-lifetime comparison
     std::size_t compared = 0;
     explicit Checker(const Locus& locus) : l(locus) {}
     void same(const panvar::PreparedScoringContext& context, std::size_t slot, const std::string& sequence,
@@ -164,20 +170,28 @@ struct Checker {
             }
             ++compared;
         }
+        last = std::move(recorded);
         recorded.clear();
     }
 };
 
 struct Trace {
     std::vector<std::size_t> census_at_settle, pending_at_settle, live_at_settle, total_at_settle;
-    std::vector<std::uint64_t> census_bytes_at_settle;
+    std::vector<std::uint64_t> census_bytes_at_settle, sequence_bytes_at_settle, mass_bytes_at_settle;
     std::size_t reused_slots = 0;
+    std::size_t seeds_materialised = 0;
+    std::size_t peak_live_seed_censuses = 0;
 };
 
-// One scripted branching search in `context`. branch_local selects the lifetime.
-Trace run(const Locus& l, bool branch_local, Checker& check) {
+enum class Lifetime { CensusFree, BranchLocal, RetainParents };
+
+// One scripted branching search in its own context, under one lifetime.
+Trace run(const Locus& l, Lifetime lifetime, Checker& check) {
+    const bool branch_local = lifetime != Lifetime::RetainParents;
+    const bool census_free = lifetime == Lifetime::CensusFree;
     panvar::PreparedScoringContext context(l.fragments, library(), options());
     Trace trace;
+    constexpr std::size_t kNoSlot = static_cast<std::size_t>(-1);
     context.begin_transient_round();
     const Choice root_choice = {};
     const std::size_t root = context.add_haplotypes({spell(l, root_choice)}).front();
@@ -195,12 +209,16 @@ Trace run(const Locus& l, bool branch_local, Checker& check) {
         Choice choice = root_choice;
         choice[b] = b % 3;
         const auto [begin, end] = span_of(l, root_choice, b);
-        const std::size_t slot = context.add_repaired_haplotype(root, begin, end, l.alleles[b][b % 3], nullptr, true);
+        const std::size_t slot = census_free ? kNoSlot
+                                             : context.add_repaired_haplotype(root, begin, end, l.alleles[b][b % 3],
+                                                                              nullptr, true);
         worklist.push_back({choice, slot, b == 1});   // the second branch will split
     }
     const auto pending_slots = [&](std::size_t next) {
         std::vector<std::size_t> pins;
-        for (std::size_t i = next; i < worklist.size(); ++i) pins.push_back(worklist[i].slot);
+        for (std::size_t i = next; i < worklist.size(); ++i) {
+            if (worklist[i].slot != kNoSlot) pins.push_back(worklist[i].slot);
+        }
         return pins;
     };
     const auto settle = [&](std::size_t next) {
@@ -210,17 +228,30 @@ Trace run(const Locus& l, bool branch_local, Checker& check) {
         const panvar::ContextMemoryAccount account = context.memory_account();
         trace.census_at_settle.push_back(account.census_count);
         trace.census_bytes_at_settle.push_back(account.census_bytes);
+        trace.sequence_bytes_at_settle.push_back(account.sequence_bytes);
+        trace.mass_bytes_at_settle.push_back(account.mass_column_bytes);
         trace.pending_at_settle.push_back(worklist.size() - next);
         trace.live_at_settle.push_back(account.slots_live);
         trace.total_at_settle.push_back(account.slots_total);
         for (std::size_t i = next; i < worklist.size(); ++i) {
-            require(context.holds_census(worklist[i].slot), "a waiting seed must keep its census");
+            require(census_free ? worklist[i].slot == kNoSlot : context.holds_census(worklist[i].slot),
+                    census_free ? "a waiting census-free seed must hold no slot" : "a waiting seed must keep its census");
         }
     };
     settle(0);
     if (branch_local) require(!context.holds_census(root), "the root parent is released once its seeds exist");
     for (std::size_t next = 0; next < worklist.size(); ++next) {
-        const Seed seed = worklist[next];
+        Seed seed = worklist[next];
+        if (census_free) {
+            // Just in time: the start spelled from its descriptor, placed in full and censused.
+            require(context.memory_account().census_count == 0, "no census may be held before a branch materialises");
+            seed.slot = context.add_haplotypes({spell(l, seed.choice)}, nullptr, true).front();
+            context.retain_census(seed.slot);
+            if (!seen_slots.insert(seed.slot).second) ++trace.reused_slots;
+            ++trace.seeds_materialised;
+        }
+        trace.peak_live_seed_censuses =
+            std::max(trace.peak_live_seed_censuses, pending_slots(next + 1).size() + 1);
         check.same(context, seed.slot, spell(l, seed.choice), "seed " + std::to_string(next));
         // Two rounds: eight neighbours (no census), then a promoted incumbent (census), then the round's release.
         std::size_t incumbent = seed.slot;
@@ -264,12 +295,14 @@ Trace run(const Locus& l, bool branch_local, Checker& check) {
                 child[block] = (c + 2) % 3;
                 const auto [begin, end] = span_of(l, current, block);
                 const std::size_t slot =
-                    context.add_repaired_haplotype(incumbent, begin, end, l.alleles[block][child[block]], nullptr, true);
+                    census_free ? kNoSlot
+                                : context.add_repaired_haplotype(incumbent, begin, end, l.alleles[block][child[block]],
+                                                                 nullptr, true);
                 worklist.push_back({child, slot, false});
             }
         }
         settle(next + 1);
-        if (branch_local && seed.split) {
+        if (branch_local && !census_free && seed.split) {
             require(!context.holds_census(incumbent), "a split parent is released once its children are seeded");
             for (std::size_t i = worklist.size() - 2; i < worklist.size(); ++i) {
                 const std::size_t block = (i + 7) % l.blocks.size();
@@ -291,10 +324,43 @@ int main() {
     try {
         const Locus l = locus();
         Checker check(l);
-        const Trace local = run(l, true, check);
+        const Trace local = run(l, Lifetime::BranchLocal, check);
         check.verify();
-        const Trace legacy = run(l, false, check);
+        std::vector<Checker::Recorded> eager_records;
+        for (const Checker::Recorded& r : check.last) {
+            if (r.label.rfind("a delta from a nested seed", 0) != 0) eager_records.push_back(r);   // eager-only probes
+        }
+        const Trace legacy = run(l, Lifetime::RetainParents, check);
         check.verify();
+        const Trace jit = run(l, Lifetime::CensusFree, check);
+        check.verify();
+        // The census-free frontier against the eager one: the same seeds, neighbours and incumbents, bit for bit.
+        require(check.last.size() == eager_records.size(), "census-free and eager runs recorded different slot sets");
+        for (std::size_t i = 0; i < eager_records.size(); ++i) {
+            const Checker::Recorded& a = eager_records[i];
+            const Checker::Recorded& b = check.last[i];
+            require(a.label == b.label && a.sequence == b.sequence, "census-free and eager runs diverge at " + a.label);
+            require(std::memcmp(&a.exposure, &b.exposure, sizeof(double)) == 0, a.label + ": exposure differs eager vs census-free");
+            require(std::memcmp(a.mass.data(), b.mass.data(), a.mass.size() * sizeof(double)) == 0,
+                    a.label + ": mass column differs eager vs census-free");
+        }
+        require(jit.pending_at_settle == local.pending_at_settle, "the frontier differs between census-free and eager");
+        require(jit.seeds_materialised == local.pending_at_settle.size() - 1, "every branch materialises exactly one seed");
+        std::size_t peak_frontier = 0;
+        for (std::size_t i = 0; i < jit.census_at_settle.size(); ++i) {
+            require(jit.census_at_settle[i] == 0 && jit.census_bytes_at_settle[i] == 0,
+                    "census_free: a census is held at settle point " + std::to_string(i));
+            require(jit.live_at_settle[i] == 0, "census_free: a slot is live at settle point " + std::to_string(i));
+            require(jit.sequence_bytes_at_settle[i] == jit.sequence_bytes_at_settle[0] &&
+                        jit.mass_bytes_at_settle[i] == jit.mass_bytes_at_settle[0],
+                    "census_free: sequence or mass-column bytes change with the frontier at settle point " + std::to_string(i));
+            peak_frontier = std::max(peak_frontier, jit.pending_at_settle[i]);
+        }
+        require(peak_frontier > 1, "the fixture's frontier must grow for the memory gate to mean anything");
+        require(jit.peak_live_seed_censuses == 1, "census_free: only the running branch's start may hold a seed census");
+        require(jit.reused_slots > 0, "census_free: released slots must be reused");
+        require(jit.total_at_settle.back() <= local.total_at_settle.back(),
+                "census_free: the slot table outgrows the eager frontier's");
         for (std::size_t i = 0; i < local.census_at_settle.size(); ++i) {
             require(local.census_at_settle[i] == local.pending_at_settle[i],
                     "branch_local: the censuses held at settle point " + std::to_string(i) + " are not exactly the waiting seeds (" +
@@ -311,7 +377,20 @@ int main() {
         require(local.reused_slots > 0, "released slots must be reused");
         require(local.total_at_settle.back() <= legacy.total_at_settle.back(), "the branch-local slot table does not outgrow the old one");
         std::cout << "  ok: " << check.compared << " seeds, neighbours, promoted incumbents and nested-seed deltas bit-identical "
-                     "to fresh placements, under both lifetimes\n";
+                     "to fresh placements, under all three lifetimes\n";
+        std::cout << "  ok: " << eager_records.size() << " seeds, neighbours and incumbents bit-identical between the "
+                     "census-free and the eager frontier\n";
+        std::cout << "  ok: census_free at each settle point -- frontier:";
+        for (const std::size_t n : jit.pending_at_settle) std::cout << ' ' << n;
+        std::cout << "; censuses:";
+        for (const std::size_t n : jit.census_at_settle) std::cout << ' ' << n;
+        std::cout << "; live slots:";
+        for (const std::size_t n : jit.live_at_settle) std::cout << ' ' << n;
+        std::cout << "; sequence bytes " << jit.sequence_bytes_at_settle.back() << ", mass-column bytes "
+                  << jit.mass_bytes_at_settle.back() << " throughout\n";
+        std::cout << "  ok: seeds materialised " << jit.seeds_materialised << "; peak live seed censuses census_free "
+                  << jit.peak_live_seed_censuses << ", eager " << local.peak_live_seed_censuses << "; census_free slot table "
+                  << jit.total_at_settle.back() << ", slot reuses " << jit.reused_slots << "\n";
         std::cout << "  ok: censuses beyond the waiting seeds at each settle point -- branch_local:";
         for (std::size_t i = 0; i < local.census_at_settle.size(); ++i) std::cout << ' ' << excess(local, i);
         std::cout << "; retain_parents:";

@@ -3349,6 +3349,9 @@ struct PlacementInputs {
     UnionReplay* replay = nullptr;   // exact union reuse, one-shot passes only
     UnionOriginReuse* origin_reuse = nullptr;   // exact union origin reuse (phase 2), one-shot passes only
     UnionPrefilterCache* prefilter_cache = nullptr;   // exact union prefilter reuse, one-shot passes only
+    // The slots to place, when they are not one contiguous range (released slots reused): the placement range
+    // then indexes this list. Null: the range is the slots themselves.
+    const std::vector<std::size_t>* slot_list = nullptr;
 };
 
 // Where a haplotype's complete origin census is written, when one is wanted. Distinct from
@@ -3849,7 +3852,8 @@ void place_haplotype_range(
     std::vector<std::size_t> zone_cursor;
     const bool reuse_self_check = in.origin_reuse != nullptr && origin_self_check().load(std::memory_order_relaxed);
 
-    for (std::size_t h = first_h; h < last_h; h += stride) {
+    for (std::size_t at = first_h; at < last_h; at += stride) {
+        const std::size_t h = in.slot_list != nullptr ? (*in.slot_list)[at] : at;
         if (budget.stop()) throw PlacementCancelled();
         const std::string& haplotype = (*in.sequences)[h];
         if (prepared.forward_forms.empty()) continue;
@@ -6750,13 +6754,15 @@ PreparedScoringContext::~PreparedScoringContext() {
 
 std::vector<std::size_t> PreparedScoringContext::add_haplotypes(
     const std::vector<std::string>& sequences,
-    IncrementalBatchReport* report) {
+    IncrementalBatchReport* report,
+    bool reuse_released_slots) {
     State& state = *state_;
     state.require_usable();
     const std::size_t before = state.sequences.size();
 
     std::vector<std::size_t> out;
     out.reserve(sequences.size());
+    std::vector<std::size_t> placed;   // the slots this batch places, appended or reused
     std::size_t reused = 0;
     for (const std::string& sequence : sequences) {
         const std::uint64_t hash = hash_materialised(sequence);
@@ -6773,16 +6779,28 @@ std::vector<std::size_t> PreparedScoringContext::add_haplotypes(
             out.push_back(existing);
             continue;
         }
-        const std::size_t slot = state.sequences.size();
+        std::size_t slot = state.sequences.size();
+        if (reuse_released_slots && !state.free_slots.empty()) {
+            // A released slot owns nothing (see allocate_repair_slot): its column restarts at -inf.
+            slot = state.free_slots.back();
+            state.free_slots.pop_back();
+            state.hash_by_slot[slot] = hash;
+            state.sequences[slot] = sequence;
+            state.reversed[slot].assign(sequence.rbegin(), sequence.rend());
+            state.mass_column[slot].assign(state.fragments.size(), kNegInf);
+        } else {
+            state.hash_by_slot.push_back(hash);
+            state.sequences.push_back(sequence);
+            state.reversed.emplace_back(sequence.rbegin(), sequence.rend());
+        }
         state.by_hash.emplace(hash, slot);
-        state.hash_by_slot.push_back(hash);
         ++state.slots_created;
-        state.sequences.push_back(sequence);
-        state.reversed.emplace_back(sequence.rbegin(), sequence.rend());
+        placed.push_back(slot);
         out.push_back(slot);
     }
     const std::size_t after = state.sequences.size();
-    const std::size_t added = after - before;
+    const std::size_t added = placed.size();
+    const bool contiguous = placed.size() == after - before;   // nothing reused: exactly [before, after)
 
     if (!state.fragments.empty() &&
         after > state.options.max_mass_cells / state.fragments.size()) {
@@ -6794,7 +6812,7 @@ std::vector<std::size_t> PreparedScoringContext::add_haplotypes(
 
     state.mass_column.resize(after, std::vector<double>(state.fragments.size(), kNegInf));
     state.exposure.resize(after, 0.0);
-    for (std::size_t h = before; h < after; ++h) {
+    for (const std::size_t h : placed) {
         state.exposure[h] =
             exposure_for_length(state.sequences[h].size(), state.fragments.size(),
                                 state.prepared.fragments_by_floor, state.library_insert);
@@ -6815,11 +6833,12 @@ std::vector<std::size_t> PreparedScoringContext::add_haplotypes(
         inputs.sequences = &state.sequences;
         inputs.reversed = &state.reversed;
         inputs.band = state.options.mismatch_band;
+        if (!contiguous) inputs.slot_list = &placed;
         OriginRecording none;
         try {
-            threads_used = run_placement(inputs, before, after, state.options.threads, false,
-                                         state.budget, state.mass_column, batch, batch_memory,
-                                         batch_cache, none);
+            threads_used = run_placement(inputs, contiguous ? before : 0, contiguous ? after : placed.size(),
+                                         state.options.threads, false, state.budget, state.mass_column, batch,
+                                         batch_memory, batch_cache, none);
         } catch (const ResourceExhausted&) {
             // A refusal invalidates the WHOLE search, not this batch: columns already retained were
             // computed under a budget that has now been exceeded, and ranking from them would present

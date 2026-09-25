@@ -465,6 +465,17 @@ struct RepairReport {
     std::uint64_t pool_branch_scored = 0;
     std::uint64_t tie_digest_memo_hits = 0, tie_digest_memo_misses = 0;
     double seconds_tie_branching = 0.0;
+    // Branch seeds: materialised just in time (production) or eagerly at their tie (a gate hook). The work is
+    // inside the cumulative counters and caps; these isolate it.
+    std::uint64_t tie_seeds_materialised = 0;
+    std::uint64_t tie_seed_haplotypes_placed = 0;
+    std::uint64_t tie_seed_physical_origins = 0;
+    std::uint64_t tie_seed_state_classes = 0;
+    std::uint64_t tie_seed_piece_hits = 0;
+    std::uint64_t tie_seed_latent_pairs = 0;
+    double seconds_tie_seed_placement = 0.0;
+    std::size_t tie_seed_peak_live_censuses = 0;
+    std::size_t tie_peak_pending_descriptors = 0;
     // The representation-conflict guard, over the called blocks (NA for a no-call: never relabelled LowQual).
     std::string locus_filter = "NA";
     std::string lowqual_blocks = "none";
@@ -505,13 +516,21 @@ void write_repair_report(std::ostream& out, const RepairReport& r) {
     out << "call_class\t" << r.call_class << "\nno_call_reason\t" << r.no_call_reason << '\n';
     out << "search_conditional\t" << r.search_conditional << "\nrepair_tie_branching\t"
         << (o.repair_tie_branching ? "true" : "false") << "\nrepair_tie_max_branches\t" << o.repair_tie_max_branches
-        << "\ntie_branch_order\t" << kTieBranchOrder << "\ntie_branch_seeding\tdelta_promoted_shared_context"
+        << "\ntie_branch_order\t" << kTieBranchOrder << "\ntie_branch_seeding\t"
+        << (o.test_eager_branch_seeds || o.test_retain_branch_parents ? "eager_delta_promoted_shared_context"
+                                                                       : "census_free_just_in_time_shared_context")
         << "\ntie_branched\t" << (r.tie_branched ? "true" : "false") << "\ntie_ties\t" << r.tie_ties
         << "\ntie_branches_run\t" << r.tie_branches_run << "\ntie_distinct_terminal_genotypes\t"
         << r.tie_distinct_terminal_genotypes << "\ntie_incomplete_reason\t" << r.tie_incomplete_reason
         << "\ntie_branch_physical_origins\t" << r.tie_branch_physical_origins << "\npool_branch_scored\t"
         << r.pool_branch_scored << "\ntie_digest_memo_hits\t" << r.tie_digest_memo_hits << "\ntie_digest_memo_misses\t"
-        << r.tie_digest_memo_misses << '\n';
+        << r.tie_digest_memo_misses << "\ntie_seeds_materialised\t" << r.tie_seeds_materialised
+        << "\ntie_seed_haplotypes_placed\t" << r.tie_seed_haplotypes_placed << "\ntie_seed_physical_origins\t"
+        << r.tie_seed_physical_origins << "\ntie_seed_state_classes\t" << r.tie_seed_state_classes
+        << "\ntie_seed_piece_hits\t" << r.tie_seed_piece_hits << "\ntie_seed_latent_pairs\t" << r.tie_seed_latent_pairs
+        << "\nseconds_tie_seed_placement\t" << r.seconds_tie_seed_placement << "\ntie_seed_peak_live_censuses\t"
+        << r.tie_seed_peak_live_censuses << "\ntie_peak_pending_descriptors\t" << r.tie_peak_pending_descriptors
+        << '\n';
     out << "representation_guard\t" << (o.representation_guard ? "true" : "false") << "\nrepresentation_guard_rule\t"
         << kRepresentationRule << "\nrepresentation_guard_bound_nats\t" << kRepresentationBoundNats << "\nlocus_filter\t"
         << r.locus_filter << "\nlowqual_blocks\t" << r.lowqual_blocks << "\nnot_evaluated_blocks\t"
@@ -2363,16 +2382,17 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
         };
 
         // ---- 3b. v2: an improving-move tie is branched and pooled, before the run is claimed (the watchdog
-        // still bounds it). Branches share the production search's scoring context: warm origin and emission
-        // caches, each tied neighbour created by the exact block delta of a promoted repair from its parent
-        // incumbent's census; a seed is pinned (reference-counted) until its branch has run.
+        // still bounds it). Branches share the production search's scoring context and its warm origin and
+        // emission caches.
         //
-        // Branch memory invariant: the shared context holds the running branch's slots, the seeds of branches
-        // still waiting, and a parent incumbent only while its tie's seeds are being built (a promoted seed owns
-        // its bytes and its census, so it does not need its parent afterwards). At every settle point -- the root
-        // tie seeded, and each branch fully processed -- every other repair slot is released; the content-keyed
-        // origin and emission caches are kept. So the retained scoring state is bounded by the pending frontier
-        // plus the current branch, not by the branches already run.
+        // Census-free frontier: a waiting branch is its compact descriptor only (allele paths, declared score
+        // components and prior, sequence digests, parent tie, history identities) and holds nothing in the
+        // context. Just before a branch runs, its two haplotypes are spelled, placed by the ordinary exact path and
+        // censused, and its declared score is reproduced bit for bit before any neighbour is scored; a failure
+        // fails the branching closed. At every settle point -- the root tie recorded, and each branch fully
+        // processed -- every repair slot is released, so the context holds scoring state for the running branch
+        // alone and the frontier grows only in descriptors. (The eager frontier, a census-holding seed per waiting
+        // branch built by block delta at its tie, survives as a gate hook.)
         // Each branch has its own visited set, ranking state and candidates; everything any branch scores
         // joins the pool, and the pooled rule below decides -- never the order branches ran in.
         const bool improving_tie = reproduced && !report.converged &&
@@ -2387,38 +2407,42 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
             PreparedScoringContext* shared = search->context();
             const std::uint64_t shared_before = shared != nullptr ? shared->cumulative_counters().physical_origins : 0;
             const std::uint64_t memo_hits_before = digest_memo_hits, memo_misses_before = digest_memo_misses;
-            std::map<DiplotypeIdentity, std::pair<std::size_t, std::size_t>> seed_slots;
-            std::set<std::size_t> legacy_parent_pins;          // the pre-fix lifetime, test hook only
-            const bool legacy_lifetime = options.test_retain_branch_parents;
-            std::map<std::size_t, std::size_t> seed_pins;   // slot -> seeds still waiting on it
+            // Pending seeds. Production keeps each waiting branch as its compact descriptor only -- the BranchStart
+            // the search holds: allele paths, declared score components and prior, sequence digests, parent tie and
+            // history identities -- and nothing in the context. A branch's start is materialised just before it
+            // runs (spelled, placed, censused, its declared score reproduced) and released once it is processed.
+            // The eager frontier is a gate hook: a census-holding slot pair per seed, built by block delta at its tie
+            // and pinned until its branch has run.
+            const bool legacy_lifetime = options.test_retain_branch_parents;   // the pre-fix lifetime, test hook
+            const bool eager_seeds = options.test_eager_branch_seeds || legacy_lifetime;
+            std::map<DiplotypeIdentity, std::pair<std::size_t, std::size_t>> seed_slots;   // eager only
+            std::set<std::size_t> legacy_parent_pins;
+            std::map<std::size_t, std::size_t> seed_pins;   // eager only: slot -> seeds still waiting on it
+            std::set<DiplotypeIdentity> announced;          // every start a tie offered, as the worklist dedupes
+            std::set<DiplotypeIdentity> pending;            // announced and not yet run: the frontier
             std::unique_ptr<CoordinateRepairSearch> live;   // the branch that ran last, alive for its own tie
+            const std::vector<double> seed_switches(block_count - 1, search_options.switch_probability);
             const auto pins_now = [&]() {
                 std::vector<std::size_t> pins(legacy_parent_pins.begin(), legacy_parent_pins.end());
                 for (const auto& seed : seed_pins) pins.push_back(seed.first);
                 return pins;
             };
-            // The branch memory ledger: one row per settle point, kept as a partial file while branching runs
-            // (a refused run keeps it) and finalised with the run.
+            // The branch memory ledger: one row per settle point and per materialised seed, kept as a partial file
+            // while branching runs (a refused run keeps it) and finalised with the run.
             std::ostringstream branch_memory;
             branch_memory << "event\tbranch\tlifetime\tslots_total\tslots_live\tslots_released\tsequence_bytes\t"
                              "segment_bytes\tmass_column_bytes\tcensus_count\tcensus_bytes\torigin_cache_payload\t"
                              "origin_cache_capacity\tmerge_working_bytes\tlogical_total\tcapacity_total\tphys_footprint\t"
-                             "phys_footprint_peak\tpending_seed_slots\tpending_seeds\n";
-            const auto settle = [&](long branch) {
-                if (shared == nullptr) return;
-                if (!legacy_lifetime) {
-                    // Everything the pool needs was copied from the finished branch, and a split's children are
-                    // seeded; the finished branch's search and every repair slot not seeding a waiting branch go.
-                    live.reset();
-                    shared->release_transient(pins_now());
-                }
+                             "phys_footprint_peak\tpending_seed_slots\tpending_seeds\tseeding\tpending_descriptors\t"
+                             "cumulative_physical_origins\n";
+            const auto ledger_row = [&](const char* event, long branch) {
                 const ContextMemoryAccount account = shared->memory_account();
                 const FootprintSample footprint = physical_footprint();
-                std::string pending;
+                std::string waiting;
                 for (const auto& [slot, count] : seed_pins) {
-                    pending += (pending.empty() ? "" : ",") + std::to_string(slot) + ":" + std::to_string(count);
+                    waiting += (waiting.empty() ? "" : ",") + std::to_string(slot) + ":" + std::to_string(count);
                 }
-                branch_memory << (branch < 0 ? "root_seeded" : "branch_settled") << '\t' << branch << '\t'
+                branch_memory << event << '\t' << branch << '\t'
                               << (legacy_lifetime ? "retain_parents" : "branch_local") << '\t' << account.slots_total
                               << '\t' << account.slots_live << '\t' << account.slots_released << '\t'
                               << account.sequence_bytes << '\t' << account.segment_bytes << '\t'
@@ -2427,11 +2451,30 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
                               << account.origin_cache_capacity << '\t' << account.merge_working_bytes << '\t'
                               << account.logical_total << '\t' << account.capacity_total << '\t' << footprint.current
                               << '\t' << footprint.peak << '\t' << seed_pins.size() << '\t'
-                              << (pending.empty() ? "none" : pending) << '\n';
+                              << (waiting.empty() ? "none" : waiting) << '\t'
+                              << (eager_seeds ? "eager" : "just_in_time") << '\t' << pending.size() << '\t'
+                              << shared->cumulative_counters().physical_origins << '\n';
                 atomic_write(prefix + ".tie_branch_memory.partial.tsv", branch_memory.str());
+            };
+            const auto settle = [&](long branch) {
+                if (shared == nullptr) return;
+                if (!legacy_lifetime) {
+                    // Everything the pool needs was copied from the finished branch, and a split's children are
+                    // recorded; the finished branch's search and every repair slot not seeding a waiting branch go
+                    // (census-free: every repair slot).
+                    live.reset();
+                    shared->release_transient(pins_now());
+                }
+                ledger_row(branch < 0 ? "root_seeded" : "branch_settled", branch);
             };
             const auto on_tie = [&](const TieSet& tie) {
                 if (shared == nullptr) throw std::runtime_error("no production scoring context to branch from");
+                for (const TieItem& n : tie.tied) {
+                    const DiplotypeIdentity key = diplotype_identity(n.first, n.second);
+                    if (announced.insert(key).second) pending.insert(key);
+                }
+                report.tie_peak_pending_descriptors = std::max(report.tie_peak_pending_descriptors, pending.size());
+                if (!eager_seeds) return;
                 CoordinateRepairSearch& parent = tie.branch < 0 ? *search : *live;
                 if (legacy_lifetime) {
                     legacy_parent_pins.insert(parent.incumbent_slot_first());
@@ -2440,11 +2483,80 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
                 for (const TieItem& n : tie.tied) {
                     const DiplotypeIdentity key = diplotype_identity(n.first, n.second);
                     if (seed_slots.count(key) != 0) continue;
+                    const Clock::time_point seed_mark = Clock::now();
+                    const FragmentScoringCounters before = shared->cumulative_counters();
+                    const std::size_t slots_before = shared->haplotypes_created();
                     const auto slots = parent.seed_neighbour_by_delta(n.first, n.second);
+                    const FragmentScoringCounters& after = shared->cumulative_counters();
+                    ++report.tie_seeds_materialised;
+                    report.tie_seed_haplotypes_placed += shared->haplotypes_created() - slots_before;
+                    report.tie_seed_physical_origins += after.physical_origins - before.physical_origins;
+                    report.tie_seed_state_classes += after.statistical_state_classes - before.statistical_state_classes;
+                    report.tie_seed_piece_hits += after.piece_hits - before.piece_hits;
+                    report.tie_seed_latent_pairs += after.latent_alignment_pairs - before.latent_alignment_pairs;
+                    report.seconds_tie_seed_placement += seconds_since(seed_mark);
                     seed_slots.emplace(key, slots);
                     ++seed_pins[slots.first];
                     if (slots.second != slots.first) ++seed_pins[slots.second];
                 }
+                // Every pending seed holds its census until its branch runs.
+                report.tie_seed_peak_live_censuses = std::max(report.tie_seed_peak_live_censuses, seed_pins.size());
+            };
+            // Just in time: the branch's two haplotypes spelled from its allele paths, placed in the shared context by
+            // the ordinary exact path (so the work counts against the cumulative caps), their censuses retained, and
+            // the declared complete score reproduced bit for bit before any neighbour is scored. Any failure throws,
+            // which fails the branching closed as tie_branching_incomplete.
+            const auto materialise = [&](const BranchStart& branch) {
+                const std::string which = "branch " + std::to_string(branch.id) + " seed";
+                const Clock::time_point seed_mark = Clock::now();
+                const FragmentScoringCounters before = shared->cumulative_counters();
+                const HaplotypeSequence a = spell_mosaic(model, MosaicPath{branch.start.first});
+                const HaplotypeSequence b = spell_mosaic(model, MosaicPath{branch.start.second});
+                if (!(sequence_digest(a.bases) == branch.start.first_sequence) ||
+                    !(sequence_digest(b.bases) == branch.start.second_sequence)) {
+                    throw std::runtime_error(which + " does not spell its recorded sequences");
+                }
+                std::vector<std::size_t> slots;
+                IncrementalBatchReport placed;
+                try {
+                    slots = shared->add_haplotypes({a.bases, b.bases}, &placed, true);
+                    shared->retain_census(slots[0]);
+                    if (slots[1] != slots[0]) shared->retain_census(slots[1]);
+                } catch (const std::exception& error) {
+                    throw std::runtime_error(which + " could not be materialised: " + error.what());
+                }
+                const FragmentScoringCounters& after = shared->cumulative_counters();
+                ++report.tie_seeds_materialised;
+                report.tie_seed_haplotypes_placed += placed.haplotypes_new;
+                report.tie_seed_physical_origins += after.physical_origins - before.physical_origins;
+                report.tie_seed_state_classes += after.statistical_state_classes - before.statistical_state_classes;
+                report.tie_seed_piece_hits += after.piece_hits - before.piece_hits;
+                report.tie_seed_latent_pairs += after.latent_alignment_pairs - before.latent_alignment_pairs;
+                const FragmentScoringResult scored =
+                    shared->score_candidates({{std::min(slots[0], slots[1]), std::max(slots[0], slots[1])}});
+                const DiplotypeScore& score = scored.scores.front();
+                const double prior = log_unordered_sequence_pair_prior(model, a.bases, b.bases, seed_switches);
+                report.seconds_tie_seed_placement += seconds_since(seed_mark);
+                DiplotypeScore declared = branch.start.score;
+                if (options.test_perturb_branch_seed == static_cast<long>(branch.id)) {
+                    // Gate hook: a declared score one ulp off, which the reproduction guard must refuse.
+                    declared.log_likelihood = std::nextafter(declared.log_likelihood, 0.0);
+                }
+                if (!(score.log_likelihood == declared.log_likelihood && score.fragment_term == declared.fragment_term &&
+                      score.exposure_term == declared.exposure_term &&
+                      score.absolute_term_sum == declared.absolute_term_sum &&
+                      score.fragments_with_mass == declared.fragments_with_mass && prior == branch.start.prior)) {
+                    std::ostringstream why;
+                    why << std::setprecision(17) << which << " did not reproduce its declared score: declared "
+                        << declared.log_likelihood << " + " << branch.start.prior << ", scored " << score.log_likelihood
+                        << " + " << prior;
+                    throw std::runtime_error(why.str());
+                }
+                // Only the running branch's start holds a seed census: nothing is pending in the context.
+                const std::size_t live_seeds = slots[1] != slots[0] ? 2 : 1;
+                report.tie_seed_peak_live_censuses = std::max(report.tie_seed_peak_live_censuses, live_seeds);
+                ledger_row("seed_materialised", static_cast<long>(branch.id));
+                return std::make_pair(slots[0], slots[1]);
             };
             RepairSearchOptions branch_options = search_options;
             branch_options.external_context = true;
@@ -2455,7 +2567,8 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
                 const Clock::time_point mark = Clock::now();
                 const std::uint64_t before = shared->cumulative_counters().physical_origins;
                 const DiplotypeIdentity key = diplotype_identity(branch.start.first, branch.start.second);
-                const auto seeded = seed_slots.at(key);
+                pending.erase(key);
+                const auto seeded = eager_seeds ? seed_slots.at(key) : materialise(branch);
                 live = std::make_unique<CoordinateRepairSearch>(model, emissions, fragments, library, repair_scoring,
                                                                 branch_options);
                 live->attach_context(shared);
@@ -2479,6 +2592,7 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
                 };
                 const bool branch_reproduced = live->run(hooks);
                 for (const std::size_t slot : {seeded.first, seeded.second}) {
+                    if (!eager_seeds) break;
                     const auto pin = seed_pins.find(slot);
                     if (pin != seed_pins.end() && --pin->second == 0) seed_pins.erase(pin);
                     if (seeded.second == seeded.first) break;
@@ -2525,6 +2639,14 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
                 branched.incomplete = std::string("tie branching failed: ") + error.what();
             }
             live.reset();
+            // Every exit -- converged, capped, refused or failed -- closes with no seed slot or census retained;
+            // the content-keyed origin and emission caches stay for the representation guard.
+            if (shared != nullptr && !shared->refused()) {
+                seed_pins.clear();
+                legacy_parent_pins.clear();
+                shared->release_transient({});
+                ledger_row("branching_closed", -1);
+            }
             atomic_write(prefix + ".tie_branch_memory.tsv", branch_memory.str());
             std::remove((prefix + ".tie_branch_memory.partial.tsv").c_str());
             tie_incomplete = branched.incomplete;

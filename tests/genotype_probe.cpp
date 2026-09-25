@@ -5839,6 +5839,14 @@ int tie_branch(const Args& args) {
         options.test_retain_branch_parents = true;   // the pre-fix branch lifetime, for a comparison gate
         options.overridden_settings.push_back("test_retain_branch_parents=1");
     }
+    if (args.get("eager-branch-seeds", "0") != "0") {
+        options.test_eager_branch_seeds = true;   // the pre-fix frontier (census-holding seeds), for a comparison gate
+        options.overridden_settings.push_back("test_eager_branch_seeds=1");
+    }
+    if (args.get("perturb-branch-seed", "-1") != "-1") {
+        options.test_perturb_branch_seed = std::stol(args.get("perturb-branch-seed", "-1"));
+        options.overridden_settings.push_back("test_perturb_branch_seed=" + std::to_string(options.test_perturb_branch_seed));
+    }
     if (args.get("representation-guard-force-context", "0") != "0") {
         options.test_representation_guard_force_context = true;
         options.overridden_settings.push_back("test_representation_guard_force_context=1");

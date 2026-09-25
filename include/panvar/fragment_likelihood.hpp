@@ -1583,8 +1583,12 @@ public:
     // Places and scores only the sequences not already held; returns one haplotype index per offered
     // sequence, in the order offered. Duplicate bytes within the batch resolve to one column, exactly
     // as intern_haplotypes collapses them in the one-shot path.
+    // `reuse_released_slots` places new sequences into released repair slots before appending any, as a repair
+    // does, so a caller that places and releases repeatedly (a tie-branch start materialised just in time) does
+    // not grow the slot table. Off by default: every other caller's slot numbering is unchanged.
     std::vector<std::size_t> add_haplotypes(const std::vector<std::string>& sequences,
-                                            IncrementalBatchReport* report = nullptr);
+                                            IncrementalBatchReport* report = nullptr,
+                                            bool reuse_released_slots = false);
 
     // Combination from the retained columns. No placement happens here, so this is cheap and may be
     // rerun over any candidate set the context already holds haplotypes for.
