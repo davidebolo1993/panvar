@@ -508,6 +508,76 @@ two levers implemented, both exact and always on; the benchmark delivered 2.2%, 
   start sort, emission key and lookup), placement-cache fill 6.2 s, diploid combination 1.8 s, origin-cache fill
   0.7 s, fragment preparation 0.2 s; outside the union, model and markers 2.0 s.
 
+## Structural assessment and union prefilter reuse (2026-09-25): exact, off, bound by no profile
+
+- **Census** (`--union-verification-census <dir>`, a union-only diagnostic that replays instead of scoring;
+  `census_union_verification`). Every direct verification request of `loo.NA19434.30` after phase 1 zones is
+  identified by (read content, window content): read contents interned by byte equality, window contents --
+  every eligible window of every haplotype strand, length min(available, read + max_gap_bp), which is exactly
+  the clamp the emission's normaliser uses -- by byte equality against a representative (hashes choose slots
+  only). Every repetition of an identity reproduced its decision and its column count. The stream reconciles
+  exactly: 417,066,267 prefilters + the fill's 52,134,015 = production's 469,200,282.
+  - 128,127,356 eligible windows hold only 743,408 distinct contents; 417.07M requests hold 8,573,016 distinct
+    identities: 97.9% of requests repeat an identity (66.5% at multiplicity 65-128 -- once per panel
+    haplotype; maximum 868). Mosaic requests (7.2M) are all repeats of panel identities.
+  - Production kernel, 8 threads: panel accepted 37.2 worker-s, rejected 108.5; mosaic 2.2. The time spent on
+    repetitions -- the exact upper bound on what remembering the first decision can remove -- is ~106 (panel
+    rejected, by columns) + ~37 (accepted) + ~2 (mosaic) worker-s.
+  - Accumulation: one panel haplotype holds 411,726 distinct windows; 128 hold 743,408 (fit
+    411,726 + 38,728 (n-1)^0.449, within 1.3% at 64 and 128).
+- **Implemented: union prefilter reuse** (`union_prefilter_cache_bytes`, `max_union_cached_prefilters_consumed`;
+  off; the cap must be positive when on; one read length required). Per pass, an in-memory window-content
+  index (256 sharded tables; each distinct window's bytes copied into the index's own 64 KiB slabs; identity by
+  length and complete byte comparison) gives every eligible start a window ID; read forms carry their content
+  ID. A fixed lock-free table keyed by (read content ID << 27 | window ID) -- exact integers, no hash decides
+  equality -- holds each decision, feasible or refused, filled to half its slots and then declining (the kernel
+  runs). A held decision replaces only the kernel: `gapped_emission_core` moves every logical counter as before
+  and `executed_prefilters` counts kernels run; hits are published in batches against their own cap, and the
+  exact merged total is what acceptance sees. Serves the placement-cache fill too.
+- **Gates.** Union fixture: prefilter reuse alone, over phase 1 and over phases 1+2, compared with the same
+  configuration without it -- mass cells, exposure, components, ranking, winner set, logical placement/origin/
+  class totals and every logical verification counter identical, executed prefilters + served decisions equal
+  to the kernels run without reuse -- at 1/2/4/8 threads, permuted haplotypes, reversed requests, forced
+  window-hash collisions, an undersized table, the consumption cap exact and one below (1 and 4 threads), a
+  zero cap invalid. `loo.HG02282.2`: reuse off and phases 1+2+prefilter on each equal to phase 4 in every table,
+  the 12-round trajectory and every status counter (executed-prefilter and the caches' own keys apart).
+- **`loo.NA19434.30`** (union-only, phases 1+2, 128 MiB decision table, cap 2e9): ranking and mass digest
+  identical to the reference; every status counter equal to phase 4's apart from executed prefilters.
+  Executed prefilters 469,200,282 -> 10,965,482 (458,234,800 served; 8,388,608 decisions held -- the table's
+  half-load limit -- 487,756 declined). Union 51.0 -> 33.7 s (1.51x; 4.62x over the reference's 155.8 s), job
+  wall 53.4 -> 35.9 s, CPU 366 -> 242 s, placement-cache fill 6.2 -> 4.4 s, footprint 3.19 -> 3.41 GiB (index
+  128 MiB, table 128 MiB). Window indexing 14.8 worker-s. `loo.HG02282.2` with reuse on: 18.95 -> 19.90 s (+5.0%),
+  footprint 0.66 -> 0.91 GiB; reuse off unchanged.
+- **Persistent graph-side index: specified, not built.** The per-pass index costs ~15 worker-s (~2 s of wall) at
+  C4, the most a persistent one could save here. Design, for larger panels: an immutable file holding only
+  graph-derived content -- schema version; provenance (graph sha256, reference path, block model and spelling
+  parameters, panel curation, builder version); canonical path identities (allele paths and the sha256 of each
+  spelled haplotype); per window length W = read length + max_gap_bp it was built for, the distinct window
+  contents (bytes, length, end flag) with their IDs and every occurrence (path, strand, offset). No read, sample
+  or decision is stored. A run loads it only when the graph sha256 and every window-defining parameter (W,
+  max_gap_bp, the spelling parameters) match its header; any mismatch refuses with an explicit error, and it is
+  never rebuilt or updated in place by a caller. LZO uses every indexed path; LOO uses the same index with the
+  held-out donor's paths masked (window IDs are content classes, so masking removes occurrences, never
+  identities). A proposed or synthetic mosaic's windows are looked up by content (hash to a slot, bytes
+  compared against the stored copy); a window the index lacks takes a per-run ID above the stored range, so its
+  first request runs the kernel exactly as now. Another read length or gap width is another W: refused unless
+  the index was built for it. With no index the per-pass in-memory index (or none) runs, and the call is
+  unchanged: identical decisions either way, because IDs only ever name exact byte contents.
+- **Remaining opportunities, measured (not implemented).** Out-of-place counting start set: replay 0.89 s vs
+  3.19 s in-place over 16 panel haplotypes; it needs a scratch copy of each worker's proposals (~40 MB x 8), which
+  puts the NA19434 footprint above the v4 profiles' 3.5 GiB watchdog (not above 4 GiB); after prefilter reuse the
+  start sort and window indexing are ~58 of 198 worker-seconds. A 12 s sample of the 8-thread placement (87,805
+  top-of-stack samples, ~20% idle waits): the start set (in-place permutation 15.3% + its per-form introsort 6.2%),
+  the seeding body inlined in collect_form_placements 18.1%, the emission key for accepted requests 6.4%, the
+  cache lookup's clock reads 4.6%, window identities and their shard locks ~5%; the pairing map does not appear
+  among the top frames (pairing and reduction together are a few percent) -- replacing it is not material.
+  Thread scaling of the final configuration (union-only, rankings identical at every count): 143.5 / 77.6 /
+  46.2 / 33.7 s at 1 / 2 / 4 / 8 threads (1.85x / 3.11x / 4.26x). Haplotype-count scaling (projection from the census fit, not measured): distinct
+  windows 0.88M / 1.05M / 1.28M at 256 / 512 / 1,024 panel haplotypes (1.18x / 1.41x / 1.73x of 128); the decision
+  table and index grow with them (~226 + ~185 MiB at 1,024). Per-haplotype work outside the kernel -- seed scan,
+  start sort, indexing, probes, pairing -- stays linear in the haplotype count: prefilter reuse lowers the per-
+  panel-haplotype cost from 2.18 to 1.27 worker-seconds, a constant factor, not a change of order.
+
 ## Frozen defaults
 
 State limit **256** (production) and **1,024** (diagnostic comparison width) -- counted in allele-prefix

@@ -340,6 +340,7 @@ struct CandidateSetReport {
     // Exact union placement reuse, as the union pass reported it (or as far as it got before a refusal).
     UnionPlacementCacheReport union_placement_cache;
     UnionOriginCacheReport union_origin_cache;
+    UnionPrefilterCacheReport union_prefilter_cache;
     // True when no beam ran at all: K = 0, no phase audit and no positive development prefix, so the
     // candidate set is exactly the panel and nothing about it is conditional on a search. Reported as
     // candidate_scope PANEL_ONLY, which is neither COMPLETE nor CONDITIONAL -- both of those describe
@@ -822,6 +823,20 @@ void write_status(
                 << "\nunion_origin_cache_index_bytes\t" << o.index_bytes
                 << "\nunion_origin_cache_peak_bytes\t" << o.peak_bytes
                 << "\nseconds_union_origin_cache_fill\t" << o.seconds_fill << '\n';
+            // Exact union prefilter reuse: decisions served instead of a kernel are counted and capped here; the
+            // logical prefilter counters above are unchanged, emission_cache_executed_prefilters counts kernels run.
+            const UnionPrefilterCacheReport& f = candidate_set->union_prefilter_cache;
+            out << "union_prefilter_cache\t" << (f.active ? "on" : "off") << "\nunion_prefilter_cache_budget_bytes\t"
+                << f.budget_bytes << "\nmax_union_cached_prefilters_consumed\t" << f.max_consumed
+                << "\nunion_prefilter_cache_read_length\t" << f.read_length << "\nunion_prefilter_cache_window_length\t"
+                << f.window_length << "\nunion_prefilter_cache_window_contents\t" << f.window_contents
+                << "\nunion_prefilter_cache_window_index_bytes\t" << f.window_index_bytes
+                << "\nunion_prefilter_cache_positions_indexed\t" << f.positions_indexed
+                << "\nunion_prefilter_cache_decision_table_bytes\t" << f.decision_table_bytes
+                << "\nunion_prefilter_cache_decisions_held\t" << f.decisions_held
+                << "\nunion_prefilter_cache_decisions_not_retained\t" << f.decisions_not_retained
+                << "\nunion_cached_prefilters_consumed\t" << f.hits << "\nunion_prefilter_cache_misses\t" << f.misses
+                << "\nworker_seconds_union_prefilter_index\t" << f.worker_seconds_index << '\n';
         }
         // Derived once, here, and used verbatim by every block row.
         out << "candidate_scope\t"
@@ -1022,6 +1037,8 @@ void apply_genotype_profile(const std::string& path, GenotypeCommandOptions& opt
         else if (key == "union_origin_cache_bytes") options.union_origin_cache_bytes = u();
         else if (key == "max_union_cached_origins_consumed") options.max_union_cached_origins_consumed = u();
         else if (key == "max_union_cached_states_consumed") options.max_union_cached_states_consumed = u();
+        else if (key == "union_prefilter_cache_bytes") options.union_prefilter_cache_bytes = u();
+        else if (key == "max_union_cached_prefilters_consumed") options.max_union_cached_prefilters_consumed = u();
         else if (key == "representation_guard") {
             if (value != "0" && value != "1") throw std::runtime_error("profile " + path + ": 'representation_guard' is 0 or 1: " + value);
             options.representation_guard = value == "1";
@@ -1560,14 +1577,17 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
         scoring_options.max_union_cached_origins_consumed = options.max_union_cached_origins_consumed;
         scoring_options.max_union_cached_states_consumed = options.max_union_cached_states_consumed;
     }
+    scoring_options.union_prefilter_cache_bytes = options.union_prefilter_cache_bytes;
+    scoring_options.max_union_cached_prefilters_consumed = options.max_union_cached_prefilters_consumed;
     FragmentScoringResult scored;
     std::string rescore_failure;
     std::vector<HaplotypeWork> union_work;
     if (options.diagnostic_union_work_trace) scoring_options.record_haplotype_work = &union_work;
     // DIAGNOSTIC ONLY: a seeding-profile run replays the seeding path instead of scoring the union at all.
-    const bool seeding_profile_only = options.diagnostic_union_seeding_profile > 0;
+    const bool seeding_profile_only =
+        options.diagnostic_union_seeding_profile > 0 || !options.diagnostic_union_verification_census.empty();
     if (seeding_profile_only && !options.diagnostic_union_only) {
-        throw std::invalid_argument("the union seeding profile is a union-only diagnostic (set diagnostic_union_only)");
+        throw std::invalid_argument("the union seeding profile and census are union-only diagnostics (set diagnostic_union_only)");
     }
     if (any_ranked && !seeding_profile_only) {
         try {
@@ -1581,11 +1601,13 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
             candidate_report.candidate_fragment_evaluations = scored.candidate_fragment_evaluations;
             candidate_report.union_placement_cache = scored.union_placement_cache;
             candidate_report.union_origin_cache = scored.union_origin_cache;
+            candidate_report.union_prefilter_cache = scored.union_prefilter_cache;
         } catch (const ResourceExhausted& error) {
             rescore_failure = error.what();
             candidate_report.observed_valid = true;
             candidate_report.union_placement_cache = candidate_report.observed.union_placement_cache;
             candidate_report.union_origin_cache = candidate_report.observed.union_origin_cache;
+            candidate_report.union_prefilter_cache = candidate_report.observed.union_prefilter_cache;
             // The phases that did run, up to the refusal. Without these a refused run reports its
             // whole duration under seconds_rescoring and 0.000 for each of the three parts, which is
             // precisely the breakdown a refusal needs.
@@ -1635,7 +1657,58 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
         }
         atomic_write(options.out_prefix + ".union_haplotype_work.tsv", text.str());
     }
-    if (seeding_profile_only && any_ranked) {
+    if (!options.diagnostic_union_verification_census.empty() && any_ranked) {
+        std::set<std::vector<std::size_t>> panel_paths(model.panel().template_alleles.begin(),
+                                                       model.panel().template_alleles.end());
+        std::vector<char> is_panel(interned.sequences.size(), 0);
+        for (const auto& [alleles, slot] : slot_of_path) {
+            if (panel_paths.count(alleles) != 0) is_panel[interned.index_of[slot]] = 1;
+        }
+        const UnionVerificationCensus census = census_union_verification(
+            interned, fragments, library, scoring_options, is_panel, options.diagnostic_union_verification_census);
+        std::ostringstream text;
+        text << "# DIAGNOSTIC ONLY: exact census of the union's direct verification stream (phase-1 zones applied)\n"
+             << "key\tpanel\tmosaic\n";
+        const auto row = [&](const char* key, std::uint64_t UnionCensusClass::*field) {
+            text << key << '\t' << census.panel.*field << '\t' << census.mosaic.*field << '\n';
+        };
+        row("haplotypes", &UnionCensusClass::haplotypes);
+        row("requests", &UnionCensusClass::requests);
+        row("ineligible", &UnionCensusClass::ineligible);
+        row("accepted", &UnionCensusClass::accepted);
+        row("rejected", &UnionCensusClass::rejected);
+        row("first_accepted", &UnionCensusClass::first_accepted);
+        row("first_rejected", &UnionCensusClass::first_rejected);
+        row("repeated_accepted", &UnionCensusClass::repeated_accepted);
+        row("repeated_rejected", &UnionCensusClass::repeated_rejected);
+        row("columns_accepted", &UnionCensusClass::columns_accepted);
+        row("columns_rejected", &UnionCensusClass::columns_rejected);
+        row("columns_repeated_accepted", &UnionCensusClass::columns_repeated_accepted);
+        row("columns_repeated_rejected", &UnionCensusClass::columns_repeated_rejected);
+        row("prefilter_accepted_ns", &UnionCensusClass::prefilter_accepted_ns);
+        row("prefilter_rejected_ns", &UnionCensusClass::prefilter_rejected_ns);
+        row("identities_first_here", &UnionCensusClass::identities_first_here);
+        text << "read_length\t" << census.read_length << "\t\nwindow_length\t" << census.window_length
+             << "\t\nread_forms\t" << census.read_forms << "\t\nread_contents\t" << census.read_contents
+             << "\t\nwindow_positions\t" << census.window_positions << "\t\nwindow_contents\t" << census.window_contents
+             << "\t\nwindow_table_bytes\t" << census.window_table_bytes << "\t\nwindow_index_bytes\t"
+             << census.window_index_bytes << "\t\nidentities\t" << census.identities << "\t\nrecord_bytes\t"
+             << census.record_bytes << "\t\nfill_executed_prefilters\t" << census.fill_executed_prefilters
+             << "\t\nfill_verifications\t" << census.fill_verifications << "\t\ndecisions_checked\t"
+             << census.decisions_checked << "\t\nseconds_windows\t" << census.seconds_windows << "\t\nseconds_stream\t"
+             << census.seconds_stream << "\t\nseconds_aggregate\t" << census.seconds_aggregate << "\t\n";
+        for (const auto& [occurrences, identities] : census.multiplicity) {
+            text << "multiplicity\t" << occurrences << '\t' << identities << '\n';
+        }
+        for (std::size_t i = 0; i < census.accumulation_panel.size(); ++i) {
+            text << "accumulation_panel\t" << i + 1 << '\t' << census.accumulation_panel[i] << '\n';
+        }
+        for (std::size_t i = 0; i < census.accumulation_mosaic.size(); ++i) {
+            text << "accumulation_mosaic\t" << i + 1 << '\t' << census.accumulation_mosaic[i] << '\n';
+        }
+        atomic_write(options.out_prefix + ".union_verification_census.tsv", text.str());
+    }
+    if (options.diagnostic_union_seeding_profile > 0 && any_ranked) {
         // DIAGNOSTIC ONLY: a deterministic replay of the seeding path over evenly spaced panel and mosaic haplotypes.
         std::set<std::vector<std::size_t>> panel_paths(model.panel().template_alleles.begin(),
                                                        model.panel().template_alleles.end());
@@ -3375,11 +3448,12 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
             return GenotypeRunStatus::RescoreIncomplete;
         }
 
-        if (options.diagnostic_union_only && options.diagnostic_union_seeding_profile > 0) {
+        if (options.diagnostic_union_only &&
+            (options.diagnostic_union_seeding_profile > 0 || !options.diagnostic_union_verification_census.empty())) {
             timings.total = seconds_since(started);
             write_status(status_path, GenotypeRunStatus::UnionDiagnosticOnly, fingerprint, options, library, timings,
                          &built.report, &panel, (panel_only ? nullptr : &beam), nullptr,
-                         "DIAGNOSTIC ONLY: union seeding profile; the union pass was replayed, not scored",
+                         "DIAGNOSTIC ONLY: union seeding profile or census; the union pass was replayed, not scored",
                          nullptr, &depth, &candidate_report);
             return GenotypeRunStatus::UnionDiagnosticOnly;
         }

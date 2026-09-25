@@ -20,6 +20,9 @@
 #include <condition_variable>
 #include <stdexcept>
 #include <unordered_map>
+#include <string_view>
+#include <cstdio>
+#include <filesystem>
 
 #include "edlib.h"
 
@@ -1037,6 +1040,33 @@ bool myers_shw_run_early(const MyersWord peq[4], std::size_t n, const char* targ
     return false;
 }
 
+// MEASUREMENT ONLY: myers_shw_run_early, also reporting the columns it scanned before deciding (0 when it decided
+// before the first column) -- a per-request cost proxy for the census.
+bool myers_shw_run_early_columns(const MyersWord peq[4], std::size_t n, const char* target, std::size_t m,
+                                 std::size_t band, std::uint32_t& columns) {
+    MyersWord vp = ~MyersWord{0};
+    MyersWord vn = 0;
+    std::size_t score = n;
+    columns = 0;
+    if (score <= band) return true;
+    if (score > band + m) return false;
+    const MyersWord top = MyersWord{1} << (n - 1);
+    for (std::size_t j = 0; j < m; ++j) {
+        const MyersWord x0 = peq[two_bit_code(target[j])] | vn;
+        const MyersWord d0 = (((x0 & vp) + vp) ^ vp) | x0;
+        const MyersWord hn = vp & d0;
+        const MyersWord hp = vn | ~(vp | d0);
+        if (hp & top) ++score; else if (hn & top) --score;
+        const MyersWord x1 = (hp << 1) | 1;
+        vn = x1 & d0;
+        vp = (hn << 1) | ~(x1 | d0);
+        columns = static_cast<std::uint32_t>(j + 1);
+        if (score <= band) return true;
+        if (score > band + (m - 1 - j)) return false;
+    }
+    return false;
+}
+
 // Many starts of ONE read form (one pattern) through the early-refusing kernel, `Lanes` at a time: each lane
 // runs exactly myers_shw_run_early's steps on its own start, lanes advance one column per round so their
 // independent dependency chains overlap, and a lane that decides takes the next start at once. Decisions land at
@@ -1620,7 +1650,12 @@ std::optional<GappedFit> gapped_emission_core(
     std::size_t mismatch_band,
     const MyersPattern* pattern,
     bool acgt_known,
-    const KeyPrefix* key_prefix) {
+    const KeyPrefix* key_prefix,
+    // The prefilter's decision for exactly this (read, window) content, when the caller already holds it (the
+    // union prefilter cache): -1 unknown. A known decision skips only the kernel; every logical counter moves
+    // as if it had run, and executed_prefilters counts only kernels that ran.
+    int known_feasible = -1,
+    bool* feasible_out = nullptr) {
     if (read.empty()) throw std::invalid_argument("gapped emission requires a non-empty read");
     if (start > haplotype.size()) return std::nullopt;
     // ELIGIBILITY is by read length, exactly as the substitution-only model required: the haplotype
@@ -1653,11 +1688,15 @@ std::optional<GappedFit> gapped_emission_core(
     // 30x), so making them pay for a key -- and then retaining them in the same representation as a
     // recursion result -- spent the whole budget on the cheap stream and collapsed the hit rate to
     // 37.8%. A refusal now returns here, having touched no table at all.
-    ++work.executed_prefilters;
-    const bool timing = emission_timing_active().load(std::memory_order_relaxed);
-    const auto prefilter_mark = timing ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-    const bool feasible = feasible_within_band(haplotype, start, window, read, mismatch_band, pattern);
-    if (timing) emission_timing().prefilter_ns += nanos_since(prefilter_mark);
+    bool feasible = known_feasible > 0;
+    if (known_feasible < 0) {
+        ++work.executed_prefilters;
+        const bool timing = emission_timing_active().load(std::memory_order_relaxed);
+        const auto prefilter_mark = timing ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        feasible = feasible_within_band(haplotype, start, window, read, mismatch_band, pattern);
+        if (timing) emission_timing().prefilter_ns += nanos_since(prefilter_mark);
+    }
+    if (feasible_out != nullptr) *feasible_out = feasible;
     if (!feasible) {
         ++work.prefilter_rejections;
         census_record(read, haplotype.data() + start, window, false, sizeof(double));
@@ -2044,6 +2083,8 @@ struct ReadForm {
     // The emission key's hash state after these bytes: lives and dies with them, so it can never describe
     // other bytes. The cache keeps its own copy of every key's bytes, so its lifetime does not depend on this.
     KeyPrefix key_prefix{};
+    // Equal for two forms exactly when their bytes are equal (interned at preparation by byte comparison).
+    std::uint32_t content_id = 0;
 };
 
 // piece code -> (form, offset of the piece inside that form)
@@ -2388,6 +2429,161 @@ void sort_unique_proposals_bucketed(std::vector<std::pair<std::uint32_t, std::ui
     proposed.resize(out);
 }
 
+// ---- the union prefilter cache ---------------------------------------------------------------------------
+//
+// The prefilter's decision is a function of the read's bytes and the window's bytes alone (the window's length,
+// min(available, read + max_gap_bp), carries the end condition). The census found the union's direct stream
+// made of few such pairs, each requested ~50 times: remembered once, a pair's decision is exact every time.
+// Identity is by ID: read contents interned at preparation, window contents interned here -- each distinct
+// window's bytes copied into this index's own storage, found by a hash that only chooses where to look and
+// confirmed by length and complete byte comparison. The decision table is keyed by the two IDs, exact integers.
+struct UnionPrefilterCache {
+    struct Stored {
+        std::uint64_t hash = 0;
+        const char* bytes = nullptr;
+        std::uint32_t length = 0;
+        std::uint32_t id = 0;
+    };
+    struct Shard {
+        std::mutex guard;
+        std::vector<Stored> table;   // open addressing, at most half full
+        std::size_t occupied = 0;
+        std::vector<std::unique_ptr<char[]>> slabs;
+        std::size_t slab_used = 0;
+        std::uint64_t bytes = 0;
+    };
+    static constexpr std::size_t kShards = 256;
+    static constexpr std::size_t kWindowBits = 27;
+    std::array<Shard, kShards> shards;
+    std::atomic<std::uint32_t> next_window{0};
+    std::size_t read_length = 0;
+    std::size_t window_length = 0;
+    // Decisions: ((key + 1) << 1) | feasible, key = read content << kWindowBits | window content; 0 is empty.
+    std::unique_ptr<std::atomic<std::uint64_t>[]> slots;
+    std::uint64_t slot_bits = 0;
+    std::atomic<std::uint64_t> held{0};
+    std::uint64_t max_held = 0;   // half the slots: admission stops there, and misses run the kernel
+    std::atomic<std::uint64_t> not_retained{0};
+    std::atomic<std::uint64_t> consumed{0};   // hits, published in batches of publish_batch
+    std::uint64_t max_consumed = 0;
+    std::uint64_t publish_batch = 4096;
+    std::atomic<std::uint64_t> misses{0};
+    std::atomic<std::uint64_t> positions_indexed{0};
+    std::atomic<std::uint64_t> index_nanos{0};
+};
+std::atomic<bool>& union_prefilter_hash_collapse() {
+    static std::atomic<bool> collapse{false};
+    return collapse;
+}
+
+std::uint32_t window_content_id(UnionPrefilterCache& cache, const char* bytes, std::size_t length, std::uint64_t hash) {
+    if (union_prefilter_hash_collapse().load(std::memory_order_relaxed)) hash = 0;
+    UnionPrefilterCache::Shard& shard = cache.shards[hash >> 56];
+    const std::lock_guard<std::mutex> guard(shard.guard);
+    if (shard.table.empty() || (shard.occupied + 1) * 2 > shard.table.size()) {
+        std::vector<UnionPrefilterCache::Stored> next(shard.table.empty() ? 1024 : shard.table.size() * 2);
+        const std::size_t mask = next.size() - 1;
+        for (const UnionPrefilterCache::Stored& stored : shard.table) {
+            if (stored.bytes == nullptr) continue;
+            std::size_t at = (stored.hash * 0x9e3779b97f4a7c15ULL) & mask;
+            while (next[at].bytes != nullptr) at = (at + 1) & mask;
+            next[at] = stored;
+        }
+        shard.table.swap(next);
+    }
+    const std::size_t mask = shard.table.size() - 1;
+    std::size_t at = (hash * 0x9e3779b97f4a7c15ULL) & mask;
+    for (;;) {
+        UnionPrefilterCache::Stored& stored = shard.table[at];
+        if (stored.bytes == nullptr) break;
+        if (stored.hash == hash && stored.length == length && std::memcmp(stored.bytes, bytes, length) == 0) {
+            return stored.id;
+        }
+        at = (at + 1) & mask;
+    }
+    constexpr std::size_t kSlab = 1u << 16;   // 256 shards: a large slab each would idle ~256 MB on a small locus
+    if (shard.slabs.empty() || shard.slab_used + length > kSlab) {
+        shard.slabs.push_back(std::make_unique<char[]>(kSlab));
+        shard.slab_used = 0;
+        shard.bytes += kSlab;
+    }
+    char* copy = shard.slabs.back().get() + shard.slab_used;
+    std::memcpy(copy, bytes, length);
+    shard.slab_used += length;
+    const std::uint32_t id = cache.next_window.fetch_add(1, std::memory_order_relaxed);
+    if (id >= (std::uint32_t{1} << UnionPrefilterCache::kWindowBits)) {
+        throw ResourceExhausted("the union prefilter cache's window index outgrew its 27-bit identities");
+    }
+    shard.table[at] = {hash, copy, static_cast<std::uint32_t>(length), id};
+    ++shard.occupied;
+    return id;
+}
+
+// Every eligible start's window content ID on one text (eligible: at least read_length bases remain).
+void window_content_ids(UnionPrefilterCache& cache, const std::string& text, std::vector<std::uint32_t>& ids) {
+    const auto mark = std::chrono::steady_clock::now();
+    const std::size_t r = cache.read_length;
+    const std::size_t W = cache.window_length;
+    const std::size_t N = text.size();
+    ids.assign(N >= r ? N - r + 1 : 0, 0);
+    constexpr std::uint64_t kBase = 0x100000001b3ULL;
+    std::uint64_t base_power = 1;
+    for (std::size_t i = 1; i < W; ++i) base_power *= kBase;
+    const auto code = [](char c) -> std::uint64_t { return static_cast<unsigned char>(c); };
+    std::uint64_t rolling = 0;
+    if (N >= W) for (std::size_t i = 0; i < W; ++i) rolling = rolling * kBase + code(text[i]);
+    for (std::size_t pos = 0; pos + r <= N; ++pos) {
+        const std::size_t length = std::min(N - pos, W);
+        std::uint64_t hash = 0;
+        if (length == W) {
+            if (pos > 0) rolling = (rolling - code(text[pos - 1]) * base_power) * kBase + code(text[pos + W - 1]);
+            hash = rolling;
+        } else {
+            for (std::size_t i = 0; i < length; ++i) hash = hash * kBase + code(text[pos + i]);
+        }
+        hash ^= static_cast<std::uint64_t>(length) * 0xbf58476d1ce4e5b9ULL;
+        ids[pos] = window_content_id(cache, text.data() + pos, length, hash);
+    }
+    cache.positions_indexed.fetch_add(ids.size(), std::memory_order_relaxed);
+    cache.index_nanos.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                    std::chrono::steady_clock::now() - mark).count()),
+                                std::memory_order_relaxed);
+}
+
+std::size_t decision_slot(const UnionPrefilterCache& cache, std::uint64_t key) {
+    return static_cast<std::size_t>((key * 0x9e3779b97f4a7c15ULL) >> (64 - cache.slot_bits));
+}
+
+// -1 unknown, else the remembered decision.
+int prefilter_decision(const UnionPrefilterCache& cache, std::uint64_t key) {
+    const std::uint64_t want = key + 1;
+    const std::size_t mask = (std::size_t{1} << cache.slot_bits) - 1;
+    for (std::size_t at = decision_slot(cache, key);; at = (at + 1) & mask) {
+        const std::uint64_t entry = cache.slots[at].load(std::memory_order_acquire);
+        if (entry == 0) return -1;
+        if ((entry >> 1) == want) return static_cast<int>(entry & 1);
+    }
+}
+
+void remember_prefilter(UnionPrefilterCache& cache, std::uint64_t key, bool feasible) {
+    if (cache.held.load(std::memory_order_relaxed) >= cache.max_held) {
+        cache.not_retained.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    const std::uint64_t packed = ((key + 1) << 1) | (feasible ? 1u : 0u);
+    const std::size_t mask = (std::size_t{1} << cache.slot_bits) - 1;
+    for (std::size_t at = decision_slot(cache, key);; at = (at + 1) & mask) {
+        std::uint64_t entry = cache.slots[at].load(std::memory_order_acquire);
+        if (entry == 0) {
+            if (cache.slots[at].compare_exchange_strong(entry, packed, std::memory_order_acq_rel)) {
+                cache.held.fetch_add(1, std::memory_order_relaxed);
+                return;
+            }
+        }
+        if ((entry >> 1) == key + 1) return;   // another worker remembered it first: the same decision
+    }
+}
+
 // MEASUREMENT ONLY: where one collect_form_placements call spent its time, in nanoseconds. A handful of clock
 // reads per call; filled only when a caller passes it.
 struct SeedingTimes {
@@ -2431,7 +2627,8 @@ void collect_form_placements(
     const std::vector<ReplayZone>* zones = nullptr,
     std::vector<std::uint8_t>* skip = nullptr,
     UnionReplay* replay = nullptr,
-    SeedingTimes* times = nullptr) {
+    SeedingTimes* times = nullptr,
+    UnionPrefilterCache* prefilter_cache = nullptr) {
     auto phase_mark = times != nullptr ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const auto lap = [&](std::uint64_t SeedingTimes::*field) {
         if (times == nullptr) return;
@@ -2559,6 +2756,23 @@ void collect_form_placements(
     // Whether this haplotype strand is all ACGT, established once: with an all-ACGT form, no window check
     // can then fail, and gapped_emission is told so.
     const bool haplotype_acgt = !proposed.empty() && std::all_of(haplotype.begin(), haplotype.end(), is_acgt);
+    // The prefilter cache serves ACGT texts only (its window identities are taken over whole texts).
+    UnionPrefilterCache* const remembered = haplotype_acgt ? prefilter_cache : nullptr;
+    thread_local std::vector<std::uint32_t> window_ids;
+    if (remembered != nullptr) window_content_ids(*remembered, haplotype, window_ids);
+    std::uint64_t unpublished_hits = 0;
+    std::uint64_t local_misses = 0;
+    const auto publish_hits = [&]() {
+        if (remembered == nullptr || unpublished_hits == 0) return;
+        const std::uint64_t total =
+            remembered->consumed.fetch_add(unpublished_hits, std::memory_order_relaxed) + unpublished_hits;
+        unpublished_hits = 0;
+        if (total > remembered->max_consumed) {
+            budget.cancel();
+            throw ResourceExhausted(
+                "fragment scoring reached its cached-prefilter consumption cap; no partial ranking is returned");
+        }
+    };
     counters.unique_starts += proposed.size();
     if (budget.stop()) throw PlacementCancelled();
     lap(&SeedingTimes::sort_ns);
@@ -2605,10 +2819,28 @@ void collect_form_placements(
             prefilter_before = emission_timing().prefilter_ns;
         }
         const auto emission_mark = timing ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        // A remembered decision stands in for the kernel on exactly the same (read, window) content.
+        int known = -1;
+        std::uint64_t decision_key = 0;
+        bool consult = false;
+        if (remembered != nullptr && forms[item.first].all_acgt && forms[item.first].bases.size() == remembered->read_length &&
+            item.second <= haplotype.size() && haplotype.size() - item.second >= remembered->read_length) {
+            consult = true;
+            decision_key = (static_cast<std::uint64_t>(forms[item.first].content_id) << UnionPrefilterCache::kWindowBits) |
+                           window_ids[item.second];
+            known = prefilter_decision(*remembered, decision_key);
+            if (known >= 0) {
+                if (++unpublished_hits >= remembered->publish_batch) publish_hits();
+            } else {
+                ++local_misses;
+            }
+        }
+        bool computed = false;
         const std::optional<GappedFit> fit =
             gapped_emission_core(haplotype, forms[item.first].bases, item.second, library, band,
                                  &forms[item.first].pattern, haplotype_acgt && forms[item.first].all_acgt,
-                                 &forms[item.first].key_prefix);
+                                 &forms[item.first].key_prefix, known, consult && known < 0 ? &computed : nullptr);
+        if (consult && known < 0) remember_prefilter(*remembered, decision_key, computed);
         if (timing) {
             const std::uint64_t spent = nanos_since(emission_mark);
             emission_timing().emission_ns += spent;
@@ -2717,6 +2949,8 @@ void collect_form_placements(
     cache_work.dp_cache_hits += emission.dp_cache_hits;
     cache_work.dp_cache_misses += emission.dp_cache_misses;
     cache_work.executed_dps += emission.executed_dps;
+    publish_hits();
+    if (remembered != nullptr) remembered->misses.fetch_add(local_misses, std::memory_order_relaxed);
     lap(&SeedingTimes::verify_ns);
 
     // Exact union reuse: the cached placements of every zone, translated to this haplotype. Appended before
@@ -2965,6 +3199,15 @@ PreparedFragmentSet prepare_fragment_set(
     for (std::size_t i = 0; i < out.reverse_forms.size(); ++i) {
         out.reverse_componentise[i] = out.floor_binds[out.reverse_forms[i].fragment];
     }
+    {
+        std::unordered_map<std::string_view, std::uint32_t> content_of;
+        for (std::deque<ReadForm>* forms : {&out.forward_forms, &out.reverse_forms}) {
+            for (ReadForm& form : *forms) {
+                form.content_id = content_of.emplace(std::string_view(form.bases),
+                                                     static_cast<std::uint32_t>(content_of.size())).first->second;
+            }
+        }
+    }
     out.forward_indexes = out.forward_forms.empty()
         ? std::vector<PieceIndex>{}
         : build_piece_indexes(out.forward_forms, band, options.minimum_piece_bp);
@@ -3005,6 +3248,7 @@ struct PlacementInputs {
     std::size_t band = 0;
     UnionReplay* replay = nullptr;   // exact union reuse, one-shot passes only
     UnionOriginReuse* origin_reuse = nullptr;   // exact union origin reuse (phase 2), one-shot passes only
+    UnionPrefilterCache* prefilter_cache = nullptr;   // exact union prefilter reuse, one-shot passes only
 };
 
 // Where a haplotype's complete origin census is written, when one is wanted. Distinct from
@@ -3523,7 +3767,7 @@ void place_haplotype_range(
                                 prepared.forward_indexes, budget, band, library, forward_placements,
                                 proposed_scratch, counters, cache_work, options, nullptr,
                                 in.replay != nullptr ? &in.replay->forward[h] : nullptr, &replay_skip, in.replay,
-                                timed);
+                                timed, in.prefilter_cache);
         memory.proposed_starts_peak =
             std::max<std::uint64_t>(memory.proposed_starts_peak, proposed_scratch.size());
         memory.proposed_starts_capacity_bytes_peak = std::max<std::uint64_t>(
@@ -3536,7 +3780,7 @@ void place_haplotype_range(
                                 prepared.reverse_componentise, prepared.reverse_indexes, budget, band,
                                 library, reverse_placements, proposed_scratch, counters, cache_work,
                                 options, nullptr, in.replay != nullptr ? &in.replay->reverse[h] : nullptr,
-                                &replay_skip, in.replay, timed);
+                                &replay_skip, in.replay, timed, in.prefilter_cache);
         memory.proposed_starts_peak =
             std::max<std::uint64_t>(memory.proposed_starts_peak, proposed_scratch.size());
         memory.proposed_starts_capacity_bytes_peak = std::max<std::uint64_t>(
@@ -3929,7 +4173,8 @@ void fill_union_cache(const PlacementInputs& in, const std::vector<std::vector<s
             (void)take_gapped_emission_counters();
             collect_form_placements(d.bytes, forms, forward ? prepared.forward_componentise : prepared.reverse_componentise,
                                     forward ? prepared.forward_indexes : prepared.reverse_indexes, budget, in.band,
-                                    library, rows, proposed, local[slot], local_cache[slot], *in.options);
+                                    library, rows, proposed, local[slot], local_cache[slot], *in.options, nullptr,
+                                    nullptr, nullptr, nullptr, nullptr, in.prefilter_cache);
             const std::size_t length = d.bytes.size();
             std::vector<CachedPlacement>& out = entries[begin + slot].placements;
             for (std::size_t f = 0; f < rows.size(); ++f) {
@@ -4941,6 +5186,52 @@ FragmentScoringResult score_diplotypes(
     }
     union_origins.max_origins = options.max_union_cached_origins_consumed;
     union_origins.max_states = options.max_union_cached_states_consumed;
+    std::unique_ptr<UnionPrefilterCache> prefilter_cache;
+    if (options.union_prefilter_cache_bytes > 0) {
+        if (options.max_union_cached_prefilters_consumed == 0) {
+            throw std::invalid_argument("union prefilter reuse needs a positive consumption cap");
+        }
+        prefilter_cache = std::make_unique<UnionPrefilterCache>();
+        std::size_t r = 0;
+        for (const auto* forms : {&prepared.forward_forms, &prepared.reverse_forms}) {
+            for (const ReadForm& form : *forms) {
+                if (r == 0) r = form.bases.size();
+                if (form.bases.size() != r) throw std::invalid_argument("union prefilter reuse needs one read length");
+            }
+        }
+        prefilter_cache->read_length = r;
+        prefilter_cache->window_length = r + library.max_gap_bp;
+        std::uint64_t slots = 1024;
+        while (slots * 2 * sizeof(std::uint64_t) <= options.union_prefilter_cache_bytes) slots *= 2;
+        prefilter_cache->slot_bits = 0;
+        while ((std::uint64_t{1} << prefilter_cache->slot_bits) < slots) ++prefilter_cache->slot_bits;
+        prefilter_cache->slots.reset(new std::atomic<std::uint64_t>[slots]());
+        prefilter_cache->max_held = slots / 2;
+        prefilter_cache->max_consumed = options.max_union_cached_prefilters_consumed;
+        prefilter_cache->publish_batch = std::max<std::uint64_t>(1, options.piece_hit_publish_batch);
+        inputs.prefilter_cache = prefilter_cache.get();
+        UnionPrefilterCacheReport& report = result.union_prefilter_cache;
+        report.active = true;
+        report.budget_bytes = options.union_prefilter_cache_bytes;
+        report.max_consumed = options.max_union_cached_prefilters_consumed;
+        report.read_length = r;
+        report.window_length = r + library.max_gap_bp;
+        report.decision_table_bytes = slots * sizeof(std::uint64_t);
+    }
+    const auto prefilter_report = [&](UnionPrefilterCacheReport& report) {
+        if (!prefilter_cache) return;
+        report.window_contents = prefilter_cache->next_window.load(std::memory_order_relaxed);
+        report.window_index_bytes = 0;
+        for (UnionPrefilterCache::Shard& shard : prefilter_cache->shards) {
+            report.window_index_bytes += shard.bytes + shard.table.capacity() * sizeof(UnionPrefilterCache::Stored);
+        }
+        report.positions_indexed = prefilter_cache->positions_indexed.load(std::memory_order_relaxed);
+        report.decisions_held = prefilter_cache->held.load(std::memory_order_relaxed);
+        report.decisions_not_retained = prefilter_cache->not_retained.load(std::memory_order_relaxed);
+        report.hits = prefilter_cache->consumed.load(std::memory_order_relaxed);
+        report.misses = prefilter_cache->misses.load(std::memory_order_relaxed);
+        report.worker_seconds_index = static_cast<double>(prefilter_cache->index_nanos.load(std::memory_order_relaxed)) * 1e-9;
+    };
 
     const auto note_observed_work = [&]() {
         if (observed_on_failure == nullptr) return;
@@ -4962,6 +5253,8 @@ FragmentScoringResult score_diplotypes(
             union_origins.origins_consumed.load(std::memory_order_relaxed);
         observed_on_failure->union_origin_cache.states_consumed =
             union_origins.states_consumed.load(std::memory_order_relaxed);
+        observed_on_failure->union_prefilter_cache = result.union_prefilter_cache;
+        prefilter_report(observed_on_failure->union_prefilter_cache);
     };
 
     result.threads_used_placement =
@@ -4985,6 +5278,7 @@ FragmentScoringResult score_diplotypes(
         result.union_placement_cache.placements_replayed = union_replay.consumed.load(std::memory_order_relaxed);
         result.union_origin_cache.origins_consumed = union_origins.origins_consumed.load(std::memory_order_relaxed);
         result.union_origin_cache.states_consumed = union_origins.states_consumed.load(std::memory_order_relaxed);
+        prefilter_report(result.union_prefilter_cache);
     } catch (const ResourceExhausted&) {
         note_observed_work();
         throw;
@@ -5464,6 +5758,392 @@ UnionSeedingProfile profile_union_seeding(const InternedHaplotypes& haplotypes, 
         }
     }
     return profile;
+}
+
+UnionVerificationCensus census_union_verification(const InternedHaplotypes& haplotypes,
+                                                  const std::vector<ReadPair>& fragments, const LibraryModel& library,
+                                                  const FragmentScoringOptions& options,
+                                                  const std::vector<char>& is_panel, const std::string& scratch_dir) {
+    using Clock = std::chrono::steady_clock;
+    validate_library_model(library);
+    UnionVerificationCensus census;
+    const std::size_t band = options.mismatch_band;
+    const std::size_t g = library.max_gap_bp;
+    const DiscreteInsertDistribution library_insert = build_library_insert_distribution(library);
+    const PreparedFragmentSet prepared = prepare_fragment_set(fragments, library, options);
+    std::deque<std::string> sequences;
+    std::deque<std::string> reversed_sequences;
+    for (const std::string& sequence : haplotypes.sequences) {
+        sequences.push_back(sequence);
+        reversed_sequences.emplace_back(sequence.rbegin(), sequence.rend());
+    }
+    const std::size_t unique = sequences.size();
+    // One read length: then every eligible start has exactly one window.
+    std::size_t r = 0;
+    for (const auto* forms : {&prepared.forward_forms, &prepared.reverse_forms}) {
+        for (const ReadForm& form : *forms) {
+            if (r == 0) r = form.bases.size();
+            if (form.bases.size() != r) throw std::invalid_argument("the verification census needs one read length");
+            if (!form.pattern.usable || !form.all_acgt) throw std::invalid_argument("the census needs prepared ACGT reads");
+        }
+    }
+    for (const std::string& sequence : sequences) {
+        if (sequence.size() >= (std::size_t{1} << 19)) throw std::invalid_argument("the census packs haplotypes below 2^19 bp");
+        if (!std::all_of(sequence.begin(), sequence.end(), is_acgt)) {
+            throw std::invalid_argument("the census needs ACGT haplotypes");
+        }
+    }
+    if (unique >= (std::size_t{1} << 9)) throw std::invalid_argument("the census packs at most 511 haplotypes");
+    if (unique >= (std::size_t{1} << 12)) throw std::invalid_argument("the census orders at most 4095 haplotypes");
+    census.read_length = r;
+    census.window_length = r + g;
+
+    // Phase-1 zones, exactly as the pass builds them (the fill's own verification work is recorded apart).
+    PlacementBudget budget;
+    budget.max_piece_hits = std::numeric_limits<std::uint64_t>::max();
+    budget.max_physical_origins = std::numeric_limits<std::uint64_t>::max();
+    PlacementInputs inputs;
+    inputs.prepared = &prepared;
+    inputs.fragments = &fragments;
+    inputs.library = &library;
+    inputs.library_insert = &library_insert;
+    inputs.options = &options;
+    inputs.sequences = &sequences;
+    inputs.reversed = &reversed_sequences;
+    inputs.band = band;
+    UnionReplay replay;
+    std::vector<UnionSegmentEntry> entries;
+    std::deque<UnionOriginEntry> origin_entries;
+    UnionPlacementCacheReport placement_report;
+    UnionOriginCacheReport origin_report;
+    const bool reuse = options.union_segment_lengths != nullptr && options.union_placement_cache_bytes > 0;
+    if (reuse) {
+        FragmentScoringCounters fill_counters;
+        EmissionCacheCounters fill_cache;
+        // The emission cache changes how fast the fill runs, never which placements it keeps, so it stays off here:
+        // its tables would otherwise stay resident through the census.
+        begin_emission_cache(0);
+        fill_union_cache(inputs, *options.union_segment_lengths, options.union_placement_cache_bytes, 0, options.threads,
+                         budget, fill_counters, fill_cache, entries, replay, placement_report, 0, nullptr,
+                         &origin_entries, &origin_report);
+        (void)end_emission_cache();
+        census.fill_executed_prefilters = fill_cache.executed_prefilters;
+        census.fill_verifications = fill_counters.full_read_verifications;
+    }
+
+    // Read contents, by complete byte equality.
+    std::unordered_map<std::string_view, std::uint32_t> read_id_of_bytes;
+    std::vector<std::uint32_t> read_ids[2];
+    for (int strand = 0; strand < 2; ++strand) {
+        const auto& forms = strand == 0 ? prepared.forward_forms : prepared.reverse_forms;
+        for (const ReadForm& form : forms) {
+            const auto inserted = read_id_of_bytes.emplace(std::string_view(form.bases),
+                                                           static_cast<std::uint32_t>(read_id_of_bytes.size()));
+            read_ids[strand].push_back(inserted.first->second);
+        }
+        census.read_forms += forms.size();
+    }
+    census.read_contents = read_id_of_bytes.size();
+
+    // Window contents: every eligible window (N - p >= r) of every strand, length min(N - p, r + g).
+    auto mark = Clock::now();
+    const std::size_t W = r + g;
+    std::size_t positions = 0;
+    for (const std::string& sequence : sequences) positions += 2 * (sequence.size() >= r ? sequence.size() - r + 1 : 0);
+    census.window_positions = positions;
+    std::size_t bits = 20;
+    while ((std::size_t{1} << bits) < positions) ++bits;   // load <= 1/2 even if every window were distinct
+    std::vector<std::uint64_t> table(std::size_t{1} << bits, 0);
+    census.window_table_bytes = table.size() * sizeof(std::uint64_t);
+    const std::uint64_t mask = (std::uint64_t{1} << bits) - 1;
+    const auto text_of = [&](std::size_t h, int strand) -> const std::string& {
+        return strand == 0 ? sequences[h] : reversed_sequences[h];
+    };
+    std::vector<std::vector<std::uint32_t>> window_ids(2 * unique);
+    std::uint64_t next_id = 0;
+    constexpr std::uint64_t kBase = 0x100000001b3ULL;
+    std::uint64_t base_power = 1;   // kBase^(W-1)
+    for (std::size_t i = 1; i < W; ++i) base_power *= kBase;
+    const auto code = [](char c) -> std::uint64_t { return static_cast<unsigned char>(c); };
+    for (std::size_t h = 0; h < unique; ++h) {
+        for (int strand = 0; strand < 2; ++strand) {
+            const std::string& text = text_of(h, strand);
+            const std::size_t N = text.size();
+            std::vector<std::uint32_t>& ids = window_ids[2 * h + strand];
+            if (N < r) continue;
+            ids.assign(N - r + 1, 0);
+            std::uint64_t rolling = 0;
+            if (N >= W) for (std::size_t i = 0; i < W; ++i) rolling = rolling * kBase + code(text[i]);
+            for (std::size_t pos = 0; pos + r <= N; ++pos) {
+                const std::size_t length = std::min(N - pos, W);
+                std::uint64_t hash = 0;
+                if (length == W) {
+                    if (pos > 0) rolling = (rolling - code(text[pos - 1]) * base_power) * kBase + code(text[pos + W - 1]);
+                    hash = rolling;
+                } else {
+                    for (std::size_t i = 0; i < length; ++i) hash = hash * kBase + code(text[pos + i]);
+                }
+                hash ^= static_cast<std::uint64_t>(length) * 0x9e3779b97f4a7c15ULL;
+                std::uint64_t slot = (hash * 0xbf58476d1ce4e5b9ULL) >> (64 - bits);
+                for (;;) {
+                    const std::uint64_t entry = table[slot];
+                    if (entry == 0) {
+                        const std::uint64_t rep = (static_cast<std::uint64_t>(h) << 20) |
+                                                  (static_cast<std::uint64_t>(strand) << 19) | pos;
+                        table[slot] = ((next_id + 1) << 37) | (static_cast<std::uint64_t>(length) << 29) | rep;
+                        ids[pos] = static_cast<std::uint32_t>(next_id++);
+                        break;
+                    }
+                    const std::size_t entry_length = (entry >> 29) & 0xff;
+                    if (entry_length == length) {
+                        const std::uint64_t rep = entry & ((std::uint64_t{1} << 29) - 1);
+                        const std::string& other = text_of(rep >> 20, static_cast<int>((rep >> 19) & 1));
+                        if (std::memcmp(other.data() + (rep & ((1u << 19) - 1)), text.data() + pos, length) == 0) {
+                            ids[pos] = static_cast<std::uint32_t>((entry >> 37) - 1);
+                            break;
+                        }
+                    }
+                    slot = (slot + 1) & mask;
+                }
+            }
+        }
+    }
+    if (next_id >= (std::uint64_t{1} << 27) - 1) throw std::logic_error("the census window ids overflow 27 bits");
+    census.window_contents = next_id;
+    census.window_index_bytes = positions * sizeof(std::uint32_t);
+    std::vector<std::uint64_t>().swap(table);
+    {
+        std::vector<char> seen(next_id, 0);
+        std::uint64_t distinct[2] = {0, 0};
+        for (std::size_t h = 0; h < unique; ++h) {
+            const int cls = h < is_panel.size() && is_panel[h] != 0 ? 0 : 1;
+            for (int strand = 0; strand < 2; ++strand) {
+                for (const std::uint32_t id : window_ids[2 * h + strand]) {
+                    if (seen[id] & (1 << cls)) continue;
+                    seen[id] |= static_cast<char>(1 << cls);
+                    ++distinct[cls];
+                }
+            }
+            (cls == 0 ? census.accumulation_panel : census.accumulation_mosaic).push_back(distinct[cls]);
+        }
+    }
+    census.seconds_windows = std::chrono::duration<double>(Clock::now() - mark).count();
+
+    // The stream: every haplotype's unique starts, as the pass proposes and orders them, each request's decision
+    // and columns written to one of kParts partitions by its identity.
+    struct Record {
+        std::uint64_t key;      // read id << 27 | window id
+        std::uint32_t order;    // haplotype << 20 | strand << 19 | start: the canonical first occurrence is the least
+        std::uint16_t columns;
+        std::uint16_t flags;    // 1 accepted, 2 panel
+    };
+    static_assert(sizeof(Record) == 16, "a census record is 16 bytes");
+    constexpr std::size_t kParts = 64;
+    std::filesystem::create_directories(scratch_dir);
+    std::vector<std::FILE*> files(kParts, nullptr);
+    std::vector<std::mutex> file_guard(kParts);
+    for (std::size_t part = 0; part < kParts; ++part) {
+        files[part] = std::fopen((scratch_dir + "/part" + std::to_string(part) + ".bin").c_str(), "wb");
+        if (files[part] == nullptr) throw std::runtime_error("the census cannot write its scratch partitions");
+    }
+    mark = Clock::now();
+    std::atomic<std::size_t> next_haplotype{0};
+    std::vector<UnionCensusClass> local_classes(2 * std::max<std::size_t>(1, options.threads));
+    std::vector<std::uint64_t> local_checked(std::max<std::size_t>(1, options.threads), 0);
+    std::vector<std::exception_ptr> failures(std::max<std::size_t>(1, options.threads));
+    const auto work = [&](std::size_t worker) {
+        try {
+            std::vector<std::vector<Record>> buffers(kParts);
+            const auto flush = [&](std::size_t part) {
+                if (buffers[part].empty()) return;
+                const std::lock_guard<std::mutex> guard(file_guard[part]);
+                std::fwrite(buffers[part].data(), sizeof(Record), buffers[part].size(), files[part]);
+                buffers[part].clear();
+            };
+            std::vector<std::pair<std::uint32_t, std::uint32_t>> proposed;
+            std::vector<std::uint32_t> cursor, bound;
+            std::vector<std::uint8_t> skip;
+            std::vector<std::uint32_t> accepted_list, rejected_list;
+            for (std::size_t h = next_haplotype.fetch_add(1); h < unique; h = next_haplotype.fetch_add(1)) {
+                const int cls = h < is_panel.size() && is_panel[h] != 0 ? 0 : 1;
+                UnionCensusClass& into = local_classes[2 * worker + cls];
+                ++into.haplotypes;
+                for (int strand = 0; strand < 2; ++strand) {
+                    const std::string& text = text_of(h, strand);
+                    const auto& forms = strand == 0 ? prepared.forward_forms : prepared.reverse_forms;
+                    const auto& indexes = strand == 0 ? prepared.forward_indexes : prepared.reverse_indexes;
+                    const std::vector<ReplayZone>* zones = reuse ? &(strand == 0 ? replay.forward : replay.reverse)[h] : nullptr;
+                    const bool replaying = zones != nullptr && !zones->empty();
+                    if (replaying) {
+                        skip.assign(text.size() + g + 2, 0);
+                        for (const ReplayZone& zone : *zones) {
+                            std::fill(skip.begin() + zone.lo, skip.begin() + zone.hi + 1, static_cast<std::uint8_t>(1));
+                        }
+                    }
+                    proposed.clear();
+                    for (const PieceIndex& index : indexes) {   // collect_form_placements' scan, verbatim in effect
+                        const std::size_t piece = index.piece_bp;
+                        if (text.size() < piece) continue;
+                        const std::uint64_t piece_mask =
+                            piece == 32 ? std::numeric_limits<std::uint64_t>::max() : ((std::uint64_t{1} << (2 * piece)) - 1);
+                        std::uint64_t rolling_code = 0;
+                        std::size_t run = 0;
+                        for (std::size_t at = 0; at < text.size(); ++at) {
+                            const std::uint64_t bits2 = two_bit(text[at]);
+                            if (bits2 == kNoCode) { run = 0; rolling_code = 0; continue; }
+                            rolling_code = ((rolling_code << 2) | bits2) & piece_mask;
+                            if (++run < piece) continue;
+                            const std::size_t piece_start = at + 1 - piece;
+                            const auto range = std::equal_range(
+                                index.entries.begin(), index.entries.end(), rolling_code, [](const auto& lhs, const auto& rhs) {
+                                    if constexpr (std::is_same_v<std::decay_t<decltype(lhs)>, PieceEntry>) {
+                                        return lhs.code < rhs;
+                                    } else {
+                                        return lhs < rhs.code;
+                                    }
+                                });
+                            for (auto it = range.first; it != range.second; ++it) {
+                                if (it->offset > piece_start) continue;
+                                const std::size_t implied = piece_start - it->offset;
+                                const std::size_t lo = implied > g ? implied - g : 0;
+                                for (std::size_t shifted = lo; shifted <= implied + g; ++shifted) {
+                                    if (replaying && shifted < skip.size() && skip[shifted] != 0) continue;
+                                    proposed.emplace_back(it->form, static_cast<std::uint32_t>(shifted));
+                                }
+                            }
+                        }
+                    }
+                    sort_unique_proposals_bucketed(proposed, forms.size(), cursor, bound);
+                    const std::vector<std::uint32_t>& ids = window_ids[2 * h + strand];
+                    accepted_list.clear();
+                    rejected_list.clear();
+                    for (std::size_t i = 0; i < proposed.size(); ++i) {
+                        const std::uint32_t form_index = proposed[i].first;
+                        const std::size_t start = proposed[i].second;
+                        ++into.requests;
+                        if (start > text.size() || text.size() - start < r) {
+                            ++into.ineligible;
+                            continue;
+                        }
+                        const std::size_t window = std::min(text.size() - start, W);
+                        const MyersPattern& pattern = forms[form_index].pattern;
+                        MyersWord peq[4];
+                        for (int c = 0; c < 4; ++c) peq[c] = myers_word_of(pattern.peq_lo[c], pattern.peq_hi[c]);
+                        std::uint32_t columns = 0;
+                        const bool accepted = myers_shw_run_early_columns(peq, pattern.length, text.data() + start, window,
+                                                                          band, columns);
+                        (accepted ? accepted_list : rejected_list).push_back(static_cast<std::uint32_t>(i));
+                        (accepted ? into.accepted : into.rejected) += 1;
+                        (accepted ? into.columns_accepted : into.columns_rejected) += columns;
+                        Record record;
+                        record.key = (static_cast<std::uint64_t>(read_ids[strand][form_index]) << 27) | ids[start];
+                        record.order = static_cast<std::uint32_t>((h << 20) | (static_cast<std::size_t>(strand) << 19) | start);
+                        record.columns = static_cast<std::uint16_t>(columns);
+                        record.flags = static_cast<std::uint16_t>((accepted ? 1 : 0) | (cls == 0 ? 2 : 0));
+                        const std::size_t part = (record.key * 0x9e3779b97f4a7c15ULL) >> 58;
+                        buffers[part].push_back(record);
+                        if (buffers[part].size() >= 8192) flush(part);
+                    }
+                    // The production kernel, timed by decision, and checked against the recorded decisions.
+                    for (int accepted = 0; accepted < 2; ++accepted) {
+                        const std::vector<std::uint32_t>& list = accepted != 0 ? accepted_list : rejected_list;
+                        std::size_t agree = 0;
+                        const auto timed = Clock::now();
+                        for (const std::uint32_t i : list) {
+                            const std::size_t start = proposed[i].second;
+                            const ReadForm& form = forms[proposed[i].first];
+                            agree += feasible_within_band(text, start, std::min(text.size() - start, W), form.bases, band,
+                                                          &form.pattern) == (accepted != 0) ? 1 : 0;
+                        }
+                        (accepted != 0 ? into.prefilter_accepted_ns : into.prefilter_rejected_ns) += static_cast<std::uint64_t>(
+                            std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - timed).count());
+                        if (agree != list.size()) throw std::logic_error("the census kernel disagrees with the prefilter");
+                        local_checked[worker] += list.size();
+                    }
+                }
+            }
+            for (std::size_t part = 0; part < kParts; ++part) flush(part);
+        } catch (...) {
+            failures[worker] = std::current_exception();
+        }
+    };
+    {
+        const std::size_t workers = std::max<std::size_t>(1, options.threads);
+        std::vector<std::thread> pool;
+        for (std::size_t w = 0; w < workers; ++w) pool.emplace_back(work, w);
+        for (std::thread& worker : pool) worker.join();
+        for (std::FILE* file : files) std::fclose(file);
+        for (const std::exception_ptr& failure : failures) {
+            if (failure) std::rethrow_exception(failure);
+        }
+    }
+    for (std::size_t w = 0; w < local_classes.size(); ++w) {
+        UnionCensusClass& into = (w % 2 == 0) ? census.panel : census.mosaic;
+        const UnionCensusClass& from = local_classes[w];
+        into.haplotypes += from.haplotypes;
+        into.requests += from.requests;
+        into.ineligible += from.ineligible;
+        into.accepted += from.accepted;
+        into.rejected += from.rejected;
+        into.columns_accepted += from.columns_accepted;
+        into.columns_rejected += from.columns_rejected;
+        into.prefilter_accepted_ns += from.prefilter_accepted_ns;
+        into.prefilter_rejected_ns += from.prefilter_rejected_ns;
+    }
+    for (const std::uint64_t checked : local_checked) census.decisions_checked += checked;
+    census.seconds_stream = std::chrono::duration<double>(Clock::now() - mark).count();
+
+    // Aggregation, one partition at a time: sort by (identity, order); the least order is the first occurrence.
+    mark = Clock::now();
+    for (std::size_t part = 0; part < kParts; ++part) {
+        const std::string path = scratch_dir + "/part" + std::to_string(part) + ".bin";
+        std::vector<Record> records;
+        {
+            std::FILE* file = std::fopen(path.c_str(), "rb");
+            if (file == nullptr) throw std::runtime_error("the census cannot read its scratch partition");
+            std::fseek(file, 0, SEEK_END);
+            const long size = std::ftell(file);
+            std::fseek(file, 0, SEEK_SET);
+            records.resize(static_cast<std::size_t>(size) / sizeof(Record));
+            if (std::fread(records.data(), sizeof(Record), records.size(), file) != records.size()) {
+                throw std::runtime_error("the census read a short partition");
+            }
+            std::fclose(file);
+            std::filesystem::remove(path);
+        }
+        census.record_bytes += records.size() * sizeof(Record);
+        std::sort(records.begin(), records.end(), [](const Record& a, const Record& b) {
+            return a.key != b.key ? a.key < b.key : a.order < b.order;
+        });
+        for (std::size_t i = 0; i < records.size();) {
+            std::size_t j = i;
+            while (j < records.size() && records[j].key == records[i].key) ++j;
+            ++census.identities;
+            ++census.multiplicity[j - i];
+            ((records[i].flags & 2) != 0 ? census.panel : census.mosaic).identities_first_here += 1;
+            for (std::size_t k = i; k < j; ++k) {
+                const Record& record = records[k];
+                if (record.columns != records[i].columns || (record.flags & 1) != (records[i].flags & 1)) {
+                    throw std::logic_error("the census found one identity with two decisions or two costs");
+                }
+                UnionCensusClass& into = (record.flags & 2) != 0 ? census.panel : census.mosaic;
+                const bool accepted = (record.flags & 1) != 0;
+                if (k == i) {
+                    (accepted ? into.first_accepted : into.first_rejected) += 1;
+                } else if (accepted) {
+                    ++into.repeated_accepted;
+                    into.columns_repeated_accepted += record.columns;
+                } else {
+                    ++into.repeated_rejected;
+                    into.columns_repeated_rejected += record.columns;
+                }
+            }
+            i = j;
+        }
+    }
+    std::filesystem::remove(scratch_dir);
+    census.seconds_aggregate = std::chrono::duration<double>(Clock::now() - mark).count();
+    return census;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -6931,6 +7611,10 @@ ContextMemoryAccount PreparedScoringContext::memory_account() const {
 
 void set_origin_cache_self_check(bool enabled) {
     scoring_detail::origin_self_check().store(enabled, std::memory_order_relaxed);
+}
+
+void set_union_prefilter_cache_hash_collapse(bool collapse) {
+    union_prefilter_hash_collapse().store(collapse, std::memory_order_relaxed);
 }
 
 void set_union_placement_cache_hash_collapse(bool collapse) {

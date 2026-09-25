@@ -157,6 +157,8 @@ struct Config {
     std::uint64_t origins_cap = 0;
     std::uint64_t states_cap = 0;
     bool reverse_candidates = false;
+    std::size_t prefilter_budget = 0;
+    std::uint64_t prefilter_cap = 0;
     std::uint64_t max_physical_origins = 0;   // 0: the default
     std::uint64_t max_state_classes = 0;
     bool record_all_origins = false;
@@ -191,6 +193,8 @@ Run score(const Fixture& f, const Config& config) {
         o.max_union_cached_origins_consumed = config.origins_cap;
         o.max_union_cached_states_consumed = config.states_cap;
     }
+    o.union_prefilter_cache_bytes = config.prefilter_budget;
+    o.max_union_cached_prefilters_consumed = config.prefilter_cap;
     if (config.max_physical_origins != 0) o.max_physical_origins = config.max_physical_origins;
     if (config.max_state_classes != 0) o.max_state_classes = config.max_state_classes;
     if (config.record_all_origins) {
@@ -264,6 +268,21 @@ void require_identical(const Run& reference, const Run& other, const std::string
     // The logical placement, origin, pair and state work is the reference's; only executed work may be lower.
     require(logical(reference) == logical(other),
             label + ": logical accepted placements, physical origins, latent pairs, valid states or state classes differ");
+}
+
+// Prefilter reuse against the same configuration without it: identical scores (require_identical) and identical
+// logical verification counters; only kernels executed may fall.
+void require_prefilter_exact(const Run& without, const Run& with, const std::string& label) {
+    require_identical(without, with, label);
+    const panvar::FragmentScoringCounters& a = without.result.counters;
+    const panvar::FragmentScoringCounters& b = with.result.counters;
+    require(a.full_read_verifications == b.full_read_verifications && a.prefilter_rejections == b.prefilter_rejections &&
+                a.dp_evaluations == b.dp_evaluations && a.proposed_starts == b.proposed_starts &&
+                a.unique_starts == b.unique_starts,
+            label + ": a logical verification counter moved");
+    const panvar::UnionPrefilterCacheReport& p = with.result.union_prefilter_cache;
+    require(with.result.emission_cache.executed_prefilters + p.hits == without.result.emission_cache.executed_prefilters,
+            label + ": executed prefilters + decisions served must equal the kernels run without reuse");
 }
 
 bool refuses(const Fixture& f, const Config& config) {
@@ -562,6 +581,74 @@ int main() {
         require_identical(reference, score(f, p2_whole), "origin reuse, whole-haplotype segments");
         std::cout << "  ok: origin reuse under forced collisions, permuted haplotypes, reversed requests, wrong and "
                   << "whole-haplotype segmentations\n";
+
+        // ---- prefilter reuse --------------------------------------------------------------------------
+        const std::uint64_t many = std::uint64_t{1} << 40;
+        for (const Config* base : std::initializer_list<const Config*>{&off, &p1, &p2}) {
+            Config with = *base;
+            with.prefilter_budget = std::size_t{1} << 24;
+            with.prefilter_cap = many;
+            const Run plain = score(f, *base);
+            const Run served_run = score(f, with);
+            const panvar::UnionPrefilterCacheReport& p = served_run.result.union_prefilter_cache;
+            require(p.active && p.hits > 0 && p.window_contents > 0 && p.decisions_held > 0,
+                    "the fixture must actually serve prefilter decisions");
+            require_prefilter_exact(plain, served_run, "prefilter reuse");
+            require_identical(reference, served_run, "prefilter reuse against the reference");
+            if (base == &p2) {
+                std::cout << "  ok: prefilter reuse over phases 1+2 -- " << p.window_contents << " window contents, "
+                          << p.decisions_held << " decisions held, " << p.hits << " served, " << p.misses
+                          << " kernels run (without reuse "
+                          << plain.result.emission_cache.executed_prefilters << ")\n";
+                for (const std::size_t threads : {std::size_t{2}, std::size_t{4}, std::size_t{8}}) {
+                    Config c = with;
+                    c.threads = threads;
+                    require_prefilter_exact(plain, score(f, c), "prefilter reuse, " + std::to_string(threads) + " threads");
+                }
+                Config permuted = with;
+                permuted.order = {3, 0, 4, 2, 1};
+                permuted.threads = 4;
+                require_identical(reference, score(f, permuted), "prefilter reuse, permuted haplotypes");
+                Config requests = with;
+                requests.reverse_candidates = true;
+                require_identical(reference, score(f, requests), "prefilter reuse, reversed requests");
+                panvar::set_union_prefilter_cache_hash_collapse(true);
+                const Run collided_run = score(f, with);
+                panvar::set_union_prefilter_cache_hash_collapse(false);
+                require(collided_run.result.union_prefilter_cache.window_contents == p.window_contents &&
+                            collided_run.result.union_prefilter_cache.hits == p.hits,
+                        "forced window-hash collisions must intern the same contents and serve the same decisions");
+                require_prefilter_exact(plain, collided_run, "prefilter reuse, forced hash collisions");
+                Config tiny = with;
+                tiny.prefilter_budget = 1;   // the smallest table: admission stops at once, the kernel runs instead
+                const Run tiny_run = score(f, tiny);
+                require(tiny_run.result.union_prefilter_cache.decisions_not_retained > 0,
+                        "a tiny decision table must decline to retain");
+                require_prefilter_exact(plain, tiny_run, "prefilter reuse, undersized table");
+                Config at_cap = with;
+                at_cap.prefilter_cap = p.hits;
+                require_prefilter_exact(plain, score(f, at_cap), "prefilter consumption cap exact");
+                Config below = with;
+                below.prefilter_cap = p.hits - 1;
+                require(refuses(f, below), "one served decision below the cap must refuse with no ranking");
+                below.threads = 4;
+                const Run four = score(f, [&] { Config c = with; c.threads = 4; return c; }());
+                below.prefilter_cap = four.result.union_prefilter_cache.hits - 1;
+                require(refuses(f, below), "the prefilter cap refuses at 4 threads too");
+                Config zero_cap = with;
+                zero_cap.prefilter_cap = 0;
+                bool invalid = false;
+                try {
+                    (void)score(f, zero_cap);
+                } catch (const std::invalid_argument&) {
+                    invalid = true;
+                }
+                require(invalid, "prefilter reuse without a positive cap is refused as a configuration");
+            }
+        }
+        std::cout << "  ok: prefilter reuse alone, over phase 1 and over phases 1+2; 1/2/4/8 threads, permuted haplotypes, "
+                     "reversed requests, forced window-hash collisions, an undersized table, the consumption cap exact "
+                     "and one below (1 and 4 threads), a zero cap invalid\n";
 
         panvar::set_origin_cache_self_check(true);
         for (const std::size_t threads : {std::size_t{1}, std::size_t{4}}) {

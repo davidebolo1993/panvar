@@ -752,6 +752,29 @@ struct UnionSeedingProfile {
     double fill_seconds = 0.0;
 };
 
+// Exact union prefilter reuse (one-shot passes). The feasibility prefilter's decision depends on the read's bytes and
+// the window's bytes alone (the window's length carries the end condition), and the union's direct stream repeats
+// the same pairs many times. Read contents are interned at preparation and window contents per pass -- both by
+// complete byte equality -- and each (read, window) decision is remembered in a fixed table keyed by the two exact
+// IDs; a remembered decision stands in for the kernel. Scores, placements and every logical counter are unchanged;
+// executed_prefilters counts only kernels that ran. Hits are held to their own consumption cap.
+struct UnionPrefilterCacheReport {
+    bool active = false;
+    std::uint64_t budget_bytes = 0;
+    std::uint64_t max_consumed = 0;
+    std::size_t read_length = 0, window_length = 0;
+    std::uint64_t window_contents = 0;       // distinct window contents interned
+    std::uint64_t window_index_bytes = 0;    // their copies and tables
+    std::uint64_t positions_indexed = 0;     // eligible starts given a window identity
+    std::uint64_t decision_table_bytes = 0;
+    std::uint64_t decisions_held = 0;
+    std::uint64_t decisions_not_retained = 0;   // the table was full: the kernel ran and nothing was stored
+    std::uint64_t hits = 0;                  // consumed: decisions served instead of a kernel
+    std::uint64_t misses = 0;                // the kernel ran
+    double worker_seconds_index = 0.0;       // window identities, summed over workers
+};
+void set_union_prefilter_cache_hash_collapse(bool collapse);   // TEST ONLY: one hash for every window
+
 struct FragmentScoringOptions {
     // The declared band of the truncated model. Fixed for a run: changing it changes the model.
     std::size_t mismatch_band = 6;
@@ -827,6 +850,10 @@ struct FragmentScoringOptions {
     std::size_t union_origin_cache_bytes = 0;
     std::uint64_t max_union_cached_origins_consumed = 0;
     std::uint64_t max_union_cached_states_consumed = 0;
+    // Exact union prefilter reuse (see UnionPrefilterCacheReport): off unless given a byte budget, which bounds the
+    // decision table; the consumption cap bounds decisions served and must then be positive. Needs one read length.
+    std::size_t union_prefilter_cache_bytes = 0;
+    std::uint64_t max_union_cached_prefilters_consumed = 0;
     // Workers for the diploid combination phase. Candidates are partitioned into fixed contiguous
     // ranges and each worker writes only its own complete DiplotypeScore entries, so the result does
     // not depend on the thread count: no cross-thread floating-point reduction exists to reorder.
@@ -895,6 +922,7 @@ struct DiplotypeScore {
 struct FragmentScoringResult {
     UnionPlacementCacheReport union_placement_cache;
     UnionOriginCacheReport union_origin_cache;
+    UnionPrefilterCacheReport union_prefilter_cache;
     std::vector<DiplotypeScore> scores;     // parallel to the requested candidates
     // Row-major [fragment * unique_haplotypes + haplotype]: the summed log placement mass of one
     // fragment on one chromosome copy of one haplotype. Retained because it is what the exhaustive
@@ -959,6 +987,7 @@ struct FragmentScoringObservation {
     double seconds_diploid_combination = 0.0;
     UnionPlacementCacheReport union_placement_cache;   // what the reuse did before the refusal
     UnionOriginCacheReport union_origin_cache;
+    UnionPrefilterCacheReport union_prefilter_cache;
 };
 
 // A measurement, not an optimisation. Oriented read forms repeat -- four forms per fragment, and at
@@ -993,6 +1022,40 @@ PieceHitCensus census_piece_hits(
 
 // `observed_on_failure`, when given, receives the work performed when a cap was reached, so a refused
 // run can report what it actually did rather than nothing at all.
+// DIAGNOSTIC ONLY: an exact census of the union's direct verification stream (phase-1 zones applied, as the pass
+// runs it). Every request is identified by (read content, window content): read contents interned by complete
+// byte equality, window contents -- every eligible window of every haplotype strand, its length min(available,
+// read + max_gap_bp) carrying the end condition the emission's normaliser depends on -- by complete byte
+// equality against a representative, hashes only choosing where to look. Every request's early-refusing
+// prefilter decision and the columns it scanned are recorded; every repetition of an identity must reproduce
+// both. Requests are aggregated through `scratch_dir` (removed afterwards). Requires one read length.
+struct UnionCensusClass {
+    std::uint64_t haplotypes = 0, requests = 0, ineligible = 0, accepted = 0, rejected = 0;
+    std::uint64_t first_accepted = 0, first_rejected = 0, repeated_accepted = 0, repeated_rejected = 0;
+    std::uint64_t columns_accepted = 0, columns_rejected = 0, columns_repeated_rejected = 0;
+    std::uint64_t columns_repeated_accepted = 0;
+    std::uint64_t prefilter_accepted_ns = 0, prefilter_rejected_ns = 0;   // production kernel, timed by decision
+    std::uint64_t identities_first_here = 0;
+};
+struct UnionVerificationCensus {
+    UnionCensusClass panel, mosaic;
+    std::size_t read_length = 0, window_length = 0;
+    std::uint64_t read_forms = 0, read_contents = 0;
+    std::uint64_t window_positions = 0, window_contents = 0, window_table_bytes = 0, window_index_bytes = 0;
+    std::uint64_t identities = 0;
+    std::map<std::uint64_t, std::uint64_t> multiplicity;   // occurrences -> identities with that many
+    // Cumulative distinct window contents after each haplotype of a class, in interned order.
+    std::vector<std::uint64_t> accumulation_panel, accumulation_mosaic;
+    std::uint64_t fill_executed_prefilters = 0, fill_verifications = 0;
+    std::uint64_t decisions_checked = 0;
+    std::uint64_t record_bytes = 0;
+    double seconds_windows = 0.0, seconds_stream = 0.0, seconds_aggregate = 0.0;
+};
+UnionVerificationCensus census_union_verification(const InternedHaplotypes& haplotypes,
+                                                  const std::vector<ReadPair>& fragments, const LibraryModel& library,
+                                                  const FragmentScoringOptions& options,
+                                                  const std::vector<char>& is_panel, const std::string& scratch_dir);
+
 // See UnionSeedingProfile. `options` must carry the union segmentation and both reuse budgets as the pass ran.
 UnionSeedingProfile profile_union_seeding(const InternedHaplotypes& haplotypes, const std::vector<ReadPair>& fragments,
                                           const LibraryModel& library, const FragmentScoringOptions& options,

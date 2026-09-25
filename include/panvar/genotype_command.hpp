@@ -134,6 +134,10 @@ struct GenotypeCommandOptions {
     std::size_t union_origin_cache_bytes = 0;
     std::uint64_t max_union_cached_origins_consumed = 0;
     std::uint64_t max_union_cached_states_consumed = 0;
+    // Exact union prefilter reuse (performance only; every score and logical counter is the reference's). 0: off;
+    // when on, the consumption cap must be positive.
+    std::size_t union_prefilter_cache_bytes = 0;
+    std::uint64_t max_union_cached_prefilters_consumed = 0;
     // Gate hooks only, never settings: score every competitor in the live context even when the pool holds
     // it (the outside-pool path), and replace the declared threshold (NaN: kRepresentationBoundNats).
     bool test_representation_guard_force_context = false;
@@ -182,6 +186,10 @@ struct GenotypeCommandOptions {
     // spaced panel and as many mosaic unique haplotypes, timing each phase and exact alternatives in isolation;
     // writes <prefix>.union_seeding_profile.tsv. 0: off. Changes no score, order or counter.
     std::size_t diagnostic_union_seeding_profile = 0;
+    // DIAGNOSTIC ONLY: after the union is spelled, take the exact census of its direct verification stream
+    // (census_union_verification) with this scratch directory, instead of scoring; writes
+    // <prefix>.union_verification_census.tsv. Empty: off. A union-only diagnostic, never a call.
+    std::string diagnostic_union_verification_census;
     // DIAGNOSTIC branch-speed pilot. Warm branches share the production search's scoring context: each
     // tied neighbour is created by the exact block delta of a promoted repair from its parent incumbent's
     // census (pinned, never mutated), instead of a fresh context placing the start in full. The digest

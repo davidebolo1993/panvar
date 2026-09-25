@@ -5804,6 +5804,7 @@ int tie_branch(const Args& args) {
     options.diagnostic_union_work_trace = args.get("union-work-trace", "0") != "0";
     options.diagnostic_union_only = args.get("union-only", "0") != "0";
     options.diagnostic_union_seeding_profile = std::stoul(args.get("union-seeding-profile", "0"));
+    options.diagnostic_union_verification_census = args.get("union-verification-census", "");
     options.diagnostic_warm_branches = args.get("warm-branches", "0") != "0";
     options.diagnostic_digest_memo = args.get("digest-memo", "0") != "0";
     options.diagnostic_digest_memo_check = args.get("digest-memo-check", "0") != "0";
@@ -5829,7 +5830,8 @@ int tie_branch(const Args& args) {
     for (const char* key : {"repair-max-physical-origins", "repair-tie-max-branches", "repair-rounds",
                             "time-limit-seconds", "union-placement-cache-bytes",
                             "max-union-cached-placements-consumed", "union-origin-cache-bytes",
-                            "max-union-cached-origins-consumed", "max-union-cached-states-consumed"}) {
+                            "max-union-cached-origins-consumed", "max-union-cached-states-consumed",
+                            "union-prefilter-cache-bytes", "max-union-cached-prefilters-consumed"}) {
         const std::string value = args.get(key, "");
         if (value.empty()) continue;
         const std::string name_of = key;
@@ -5846,6 +5848,10 @@ int tie_branch(const Args& args) {
         }
         else if (name_of == "max-union-cached-states-consumed") {
             options.max_union_cached_states_consumed = std::stoull(value);
+        }
+        else if (name_of == "union-prefilter-cache-bytes") options.union_prefilter_cache_bytes = std::stoull(value);
+        else if (name_of == "max-union-cached-prefilters-consumed") {
+            options.max_union_cached_prefilters_consumed = std::stoull(value);
         }
         else options.time_limit_seconds = std::stod(value);
         std::string name = key;
