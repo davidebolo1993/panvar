@@ -5835,6 +5835,10 @@ int tie_branch(const Args& args) {
     // v2 production gates: overrides are recorded; the reversal is a test hook, never a setting.
     options.test_reverse_tie_branch_order = args.get("tie-reverse", "0") != "0";
     // Gate hooks for the outside-pool guard path; recorded as overrides.
+    if (args.get("retain-branch-parents", "0") != "0") {
+        options.test_retain_branch_parents = true;   // the pre-fix branch lifetime, for a comparison gate
+        options.overridden_settings.push_back("test_retain_branch_parents=1");
+    }
     if (args.get("representation-guard-force-context", "0") != "0") {
         options.test_representation_guard_force_context = true;
         options.overridden_settings.push_back("test_representation_guard_force_context=1");

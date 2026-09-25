@@ -147,6 +147,9 @@ struct GenotypeCommandOptions {
     // Gate hooks only, never settings: score every competitor in the live context even when the pool holds
     // it (the outside-pool path), and replace the declared threshold (NaN: kRepresentationBoundNats).
     bool test_representation_guard_force_context = false;
+    // Gate hook only, never a setting: keep the pre-fix branch lifetime (every parent incumbent pinned for the whole
+    // branching search, no release at a branch's end), so a gate can compare the two lifetimes on one binary.
+    bool test_retain_branch_parents = false;
     double test_representation_guard_bound_nats = std::numeric_limits<double>::quiet_NaN();
     // Gate hook: where the marker's best pair is the called pair, take the best other pair as the competitor.
     bool test_representation_guard_runner_up = false;

@@ -2214,6 +2214,72 @@ TieRun run_scripted(ScriptedTies scripted, const std::vector<panvar::TieItem>& r
     return out;
 }
 
+// The branch lifecycle points run_tie_branching gives its caller: after the root tie is recorded and seeded (-1), and
+// after each branch is fully processed -- a split only once its own tie is recorded and its children seeded. At each,
+// the seeds still waiting are exactly the branches not yet run, so a caller releasing everything else keeps the
+// frontier and nothing a finished branch owned.
+void test_tie_branch_settle_points() {
+    const panvar::TieItem I = tie_item(2, {0, 0, 0}, {1, 1, 1}, -1000.0, -5.0);
+    const panvar::TieItem a0 = tie_item(2, {0, 2, 0}, {1, 3, 1}, -990.0, -5.0);
+    const panvar::TieItem a1 = tie_item(2, {0, 3, 0}, {1, 2, 1}, -990.0, -5.0);
+    const std::vector<panvar::TieItem> root_items = {I, a0, a1};
+    const auto key = [](const panvar::TieItem& x) { return panvar::diplotype_identity(x.first, x.second); };
+    std::map<panvar::DiplotypeIdentity, panvar::BranchResult> script;
+    panvar::BranchResult split;
+    split.outcome = panvar::BranchOutcome::Split;
+    split.items = {tie_item(1, {0, 2, 0}, {1, 3, 1}, -990.0, -5.0), tie_item(1, {0, 2, 8}, {1, 3, 1}, -985.0, -5.0),
+                   tie_item(1, {0, 2, 1}, {1, 3, 8}, -985.0, -5.0)};
+    split.rounds = 1;
+    split.last_round = 1;
+    split.stop = "rescore_incomplete";
+    split.terminal_first = {0, 2, 0};
+    split.terminal_second = {1, 3, 1};
+    script[key(a0)] = split;
+    script[key(a1)] = converged_at(1, a1, tie_item(0, {0, 3, 0}, {1, 2, 9}, -995.0, -5.0));
+    script[key(split.items[1])] = converged_at(1, split.items[1], tie_item(0, {0, 2, 8}, {1, 3, 6}, -975.0, -5.0));
+    script[key(split.items[2])] = converged_at(1, split.items[2], tie_item(0, {0, 2, 6}, {1, 3, 8}, -975.0, -5.0));
+    std::set<std::set<std::string>> terminal_sets;
+    for (const bool reverse : {false, true}) {
+        std::vector<std::string> events;
+        std::set<std::string> waiting;   // seeds built and not yet run
+        const panvar::TieSet root = panvar::terminal_tie(root_items, 2, 10, 6);
+        const auto on_tie = [&](const panvar::TieSet& tie) {
+            for (const panvar::TieItem& n : tie.tied) waiting.insert(identity_text(n));
+            events.push_back("tie" + std::to_string(tie.id));
+        };
+        const auto run_branch = [&](const panvar::BranchStart& start) {
+            require(waiting.count(identity_text(start.start)) == 1, "a branch must start from a built, waiting seed");
+            waiting.erase(identity_text(start.start));
+            events.push_back("run" + std::to_string(start.id));
+            return script.at(key(start.start));
+        };
+        std::vector<std::size_t> frontier;
+        const auto settled = [&](long branch) {
+            events.push_back("settle" + std::to_string(branch));
+            frontier.push_back(waiting.size());
+        };
+        const panvar::TieBranchingReport report =
+            panvar::run_tie_branching(root, {}, 16, 10, 6, run_branch, on_tie, reverse, settled);
+        require(report.incomplete.empty() && report.branches.size() == 4, "four branches, complete");
+        require(events.front() == "tie0" && events[1] == "settle-1", "the root settles after its seeds are built");
+        for (std::size_t i = 0; i < events.size(); ++i) {
+            if (events[i] != "tie1") continue;
+            require(i + 1 < events.size() && events[i + 1].rfind("settle", 0) == 0,
+                    "a split branch settles only after its own tie is recorded and its children seeded");
+        }
+        // Canonical: the split a0 runs first and adds two seeds; reversed: a1 converges first, then a0 splits.
+        const std::vector<std::size_t> want = reverse ? std::vector<std::size_t>{2, 1, 2, 1, 0}
+                                                      : std::vector<std::size_t>{2, 3, 2, 1, 0};
+        require(frontier == want, "the waiting seeds at each settle point are the branches not yet run");
+        require(frontier.back() == 0, "nothing waits once every branch has run");
+        std::set<std::string> terminals(report.terminal_genotypes.begin(), report.terminal_genotypes.end());
+        terminal_sets.insert(terminals);
+    }
+    require(terminal_sets.size() == 1, "canonical and reversed branch orders reach the same terminals");
+    std::cout << "  tie-branch settle points: root, then each branch after processing (a split after its children are "
+                 "seeded); the waiting seeds are the frontier; both orders agree\n";
+}
+
 void test_tie_branching_engine() {
     // The production tie: incumbent I, two improving phase assignments a0 / a1 of one pair, tied.
     const panvar::TieItem I = tie_item(2, {0, 0, 0}, {1, 1, 1}, -1000.0, -5.0);
@@ -2802,6 +2868,7 @@ int main(int argc, char** argv) {
         test_pooled_decision_rule();
         test_phase_switch_symmetry();
         test_tie_branching_engine();
+        test_tie_branch_settle_points();
         test_representation_guard();
         test_adaptive_completion();
         test_representation_guard_outside_pool();

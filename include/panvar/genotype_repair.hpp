@@ -441,7 +441,13 @@ struct TieBranchingReport {
 TieBranchingReport run_tie_branching(const TieSet& root, const std::vector<DiplotypeIdentity>& root_history,
                                      std::size_t max_branches, std::size_t fragments, std::size_t mismatch_band,
                                      const std::function<BranchResult(const BranchStart&)>& run_branch,
-                                     const std::function<void(const TieSet&)>& on_tie, bool reverse = false);
+                                     const std::function<void(const TieSet&)>& on_tie, bool reverse = false,
+                                     // The branch lifecycle point: called once the root tie is recorded and its
+                                     // seeds built (with -1), and after every branch has been fully processed -- its
+                                     // result taken and, for a split, its tie recorded and its children's seeds built
+                                     // -- with that branch's id. Nothing this search still needs lives only in the
+                                     // finished branch at that point, so the caller may release its working state.
+                                     const std::function<void(long)>& on_settled = {});
 
 // The calling contract of a tie-branched pool: incomplete -> REPAIR_INCOMPLETE tie_branching_incomplete;
 // otherwise the pooled rule's decision with search_conditional=tie_branched, a distinct top set as the no-call

@@ -1406,8 +1406,12 @@ TieSet terminal_tie(const std::vector<TieItem>& items, std::size_t round, std::s
 TieBranchingReport run_tie_branching(const TieSet& root, const std::vector<DiplotypeIdentity>& root_history,
                                      std::size_t max_branches, std::size_t fragments, std::size_t mismatch_band,
                                      const std::function<BranchResult(const BranchStart&)>& run_branch,
-                                     const std::function<void(const TieSet&)>& on_tie, bool reverse) {
+                                     const std::function<void(const TieSet&)>& on_tie, bool reverse,
+                                     const std::function<void(long)>& on_settled) {
     TieBranchingReport report;
+    const auto settled = [&](long branch) {
+        if (on_settled) on_settled(branch);
+    };
     std::vector<BranchStart> worklist;
     std::set<DiplotypeIdentity> started;
     const auto record = [&](TieSet tie, const std::vector<DiplotypeIdentity>& history) {
@@ -1432,6 +1436,7 @@ TieBranchingReport run_tie_branching(const TieSet& root, const std::vector<Diplo
         report.incomplete = std::string("the production tie could not be branched: ") + error.what();
         return report;
     }
+    settled(-1);
     for (std::size_t next = 0; next < worklist.size(); ++next) {
         if (report.branches.size() >= max_branches) {
             report.incomplete = "branch cap " + std::to_string(max_branches) + " binds (" +
@@ -1450,8 +1455,10 @@ TieBranchingReport run_tie_branching(const TieSet& root, const std::vector<Diplo
         }
         report.branches.push_back(entry);
         const BranchRecord& done = report.branches.back();
+        const long done_id = static_cast<long>(done.start.id);
         if (done.result.outcome == BranchOutcome::Incomplete) {
             report.incomplete = "branch " + std::to_string(done.start.id) + ": " + done.result.why;
+            settled(done_id);
             break;
         }
         if (done.result.outcome == BranchOutcome::Converged) {
@@ -1461,6 +1468,7 @@ TieBranchingReport run_tie_branching(const TieSet& root, const std::vector<Diplo
                 text += (b == 0 ? "" : ",") + std::to_string(pair.first) + "/" + std::to_string(pair.second);
             }
             report.terminal_genotypes.insert(text);
+            settled(done_id);
             continue;
         }
         std::vector<DiplotypeIdentity> history = done.start.history;
@@ -1472,8 +1480,10 @@ TieBranchingReport run_tie_branching(const TieSet& root, const std::vector<Diplo
             record(nested, history);
         } catch (const std::exception& error) {
             report.incomplete = "branch " + std::to_string(done.start.id) + ": " + error.what();
+            settled(done_id);
             break;
         }
+        settled(done_id);
     }
     return report;
 }

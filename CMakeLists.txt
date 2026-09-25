@@ -297,6 +297,11 @@ if(PANVAR_BUILD_TESTING)
         target_link_libraries(genotype_block_quality_test PRIVATE panvarlib)
         target_compile_options(genotype_block_quality_test PRIVATE -Wall -Wextra -Wpedantic)
         add_test(NAME panvar_genotype_block_quality COMMAND genotype_block_quality_test)
+        # Tie branches' scoring state is branch-local: bounded by the waiting seeds, exact after release.
+        add_executable(genotype_branch_lifetime_test tests/genotype_branch_lifetime.cpp)
+        target_link_libraries(genotype_branch_lifetime_test PRIVATE panvarlib)
+        target_compile_options(genotype_branch_lifetime_test PRIVATE -Wall -Wextra -Wpedantic)
+        add_test(NAME panvar_genotype_branch_lifetime COMMAND genotype_branch_lifetime_test)
 
         add_executable(genotype_mosaic_proposal_test tests/genotype_mosaic_proposal.cpp)
         target_link_libraries(genotype_mosaic_proposal_test PRIVATE panvarlib)
