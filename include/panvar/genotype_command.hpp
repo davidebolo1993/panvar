@@ -178,6 +178,10 @@ struct GenotypeCommandOptions {
     // DIAGNOSTIC ONLY: stop after the union pass is scored and ranked. Writes <prefix>.union_diagnostic_ranking.tsv
     // and a status UNION_DIAGNOSTIC_ONLY; no repair, no genotype artefact, never a call.
     bool diagnostic_union_only = false;
+    // DIAGNOSTIC ONLY: after a completed union pass, replay its seeding path single-threaded over this many evenly
+    // spaced panel and as many mosaic unique haplotypes, timing each phase and exact alternatives in isolation;
+    // writes <prefix>.union_seeding_profile.tsv. 0: off. Changes no score, order or counter.
+    std::size_t diagnostic_union_seeding_profile = 0;
     // DIAGNOSTIC branch-speed pilot. Warm branches share the production search's scoring context: each
     // tied neighbour is created by the exact block delta of a promoted repair from its parent incumbent's
     // census (pinned, never mutated), instead of a fresh context placing the start in full. The digest

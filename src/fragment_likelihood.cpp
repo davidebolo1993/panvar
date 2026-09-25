@@ -949,6 +949,34 @@ bool myers_shw_run(const MyersWord peq[4], std::size_t n, const char* target, st
     return false;
 }
 
+// The same kernel with an exact early refusal. The last-row score is the full query's edit distance to the
+// target prefix consumed so far, and adjacent prefixes differ by at most one edit, so after column j no later
+// prefix can score below score - (m - 1 - j). Once that bound exceeds the band no prefix can fit it and the
+// answer is already false -- the same answer the full scan returns, reached earlier. Acceptances are untouched:
+// they return at the first prefix within the band exactly as before.
+bool myers_shw_run_early(const MyersWord peq[4], std::size_t n, const char* target, std::size_t m,
+                         std::size_t band) {
+    MyersWord vp = ~MyersWord{0};
+    MyersWord vn = 0;
+    std::size_t score = n;
+    if (score <= band) return true;
+    if (score > band + m) return false;
+    const MyersWord top = MyersWord{1} << (n - 1);
+    for (std::size_t j = 0; j < m; ++j) {
+        const MyersWord x0 = peq[two_bit_code(target[j])] | vn;
+        const MyersWord d0 = (((x0 & vp) + vp) ^ vp) | x0;
+        const MyersWord hn = vp & d0;
+        const MyersWord hp = vn | ~(vp | d0);
+        if (hp & top) ++score; else if (hn & top) --score;
+        const MyersWord x1 = (hp << 1) | 1;
+        vn = x1 & d0;
+        vp = (hn << 1) | ~(x1 | d0);
+        if (score <= band) return true;
+        if (score > band + (m - 1 - j)) return false;   // no remaining prefix can come back within the band
+    }
+    return false;
+}
+
 bool myers_shw_within(const char* query, std::size_t n, const char* target, std::size_t m,
                       std::size_t band) {
     MyersWord peq[4] = {0, 0, 0, 0};
@@ -960,12 +988,11 @@ MyersWord myers_word_of(std::uint64_t low, std::uint64_t high) {
     return (static_cast<MyersWord>(high) << 64) | static_cast<MyersWord>(low);
 }
 
-bool feasible_within_band(const std::string& haplotype, std::size_t start, std::size_t window,
-                          const std::string& read, std::size_t band,
-                          const MyersPattern* pattern) {
+// The prefilter as it was: every column scanned. Kept as the reference the early-refusing kernel is gated
+// against (and timed against in the seeding profile).
+bool feasible_within_band_reference(const std::string& haplotype, std::size_t start, std::size_t window,
+                                    const std::string& read, std::size_t band, const MyersPattern* pattern) {
     if (window == 0) return false;
-    // Prepared: the masks were built once for this form during fragment preparation. Rebuilding
-    // them here cost a pass over the read on every one of 1.19 billion verifications.
     if (pattern != nullptr && pattern->usable) {
         MyersWord peq[4];
         for (int i = 0; i < 4; ++i) peq[i] = myers_word_of(pattern->peq_lo[i], pattern->peq_hi[i]);
@@ -973,6 +1000,34 @@ bool feasible_within_band(const std::string& haplotype, std::size_t start, std::
     }
     if (read.size() <= kMyersWidth) {
         return myers_shw_within(read.data(), read.size(), haplotype.data() + start, window, band);
+    }
+    const EdlibAlignConfig config = edlibNewAlignConfig(
+        static_cast<int>(band), EDLIB_MODE_SHW, EDLIB_TASK_DISTANCE, nullptr, 0);
+    EdlibAlignResult result =
+        edlibAlign(read.data(), static_cast<int>(read.size()), haplotype.data() + start,
+                   static_cast<int>(window), config);
+    const bool feasible = result.status == EDLIB_STATUS_OK && result.editDistance >= 0;
+    edlibFreeAlignResult(result);
+    return feasible;
+}
+
+bool feasible_within_band(const std::string& haplotype, std::size_t start, std::size_t window,
+                          const std::string& read, std::size_t band,
+                          const MyersPattern* pattern) {
+    if (window == 0) return false;
+    // Prepared: the masks were built once for this form during fragment preparation. Rebuilding
+    // them here cost a pass over the read on every one of 1.19 billion verifications. The kernel refuses
+    // early -- exactly (see myers_shw_run_early): most starts are refusals, and most refusals are decided
+    // long before the last column.
+    if (pattern != nullptr && pattern->usable) {
+        MyersWord peq[4];
+        for (int i = 0; i < 4; ++i) peq[i] = myers_word_of(pattern->peq_lo[i], pattern->peq_hi[i]);
+        return myers_shw_run_early(peq, pattern->length, haplotype.data() + start, window, band);
+    }
+    if (read.size() <= kMyersWidth) {
+        MyersWord peq[4] = {0, 0, 0, 0};
+        for (std::size_t i = 0; i < read.size(); ++i) peq[two_bit_code(read[i])] |= MyersWord{1} << i;
+        return myers_shw_run_early(peq, read.size(), haplotype.data() + start, window, band);
     }
     const EdlibAlignConfig config = edlibNewAlignConfig(
         static_cast<int>(band), EDLIB_MODE_SHW, EDLIB_TASK_DISTANCE, nullptr, 0);
@@ -1430,7 +1485,8 @@ std::optional<GappedFit> gapped_emission(
     std::size_t start,
     const LibraryModel& library,
     std::size_t mismatch_band,
-    const MyersPattern* pattern) {
+    const MyersPattern* pattern,
+    bool acgt_known) {
     if (read.empty()) throw std::invalid_argument("gapped emission requires a non-empty read");
     if (start > haplotype.size()) return std::nullopt;
     // ELIGIBILITY is by read length, exactly as the substitution-only model required: the haplotype
@@ -1450,7 +1506,9 @@ std::optional<GappedFit> gapped_emission(
     // The recursion can touch at most this much haplotype from the anchor, so this is the window the
     // refusal contract and the prefilter both apply to.
     const std::size_t window = std::min(available, read.size() + library.max_gap_bp);
-    require_acgt_window(haplotype, start, window, read);
+    // A caller that has already established the whole haplotype and the whole read are ACGT may say so: the
+    // check below then cannot fail, and repeating it cost ~11% of the union's seeding on 203 bytes per start.
+    if (!acgt_known) require_acgt_window(haplotype, start, window, read);
 
     EmissionWork& work = emission_work();
     EmissionCache& cache = emission_cache();
@@ -1827,6 +1885,7 @@ struct ReadForm {
     // Built once during fragment preparation. Rebuilding the masks inside the hot feasibility test
     // cost a pass over the read on every one of 1.19 billion verifications.
     MyersPattern pattern;
+    bool all_acgt = false;   // every base is ACGT, so no window check can fail on the read's side
 };
 
 // piece code -> (form, offset of the piece inside that form)
@@ -2109,6 +2168,78 @@ std::atomic<bool>& union_hash_collapse() {
     return collapse;
 }
 
+// Proposed (form, start) pairs sorted ascending and deduplicated, without a comparison sort over the whole list:
+// an in-place counting permutation by form (the forms are dense indices; American-flag cycle leading, so no
+// second copy of the list is held), then each form's few starts sorted and made unique in place. The result is
+// exactly std::sort + std::unique's -- the same pairs in the same order -- and depends on nothing but the
+// multiset of proposals. `cursor` and `bound` are worker storage, one entry per form.
+void sort_unique_proposals_bucketed(std::vector<std::pair<std::uint32_t, std::uint32_t>>& proposed,
+                                    std::size_t form_count, std::vector<std::uint32_t>& cursor,
+                                    std::vector<std::uint32_t>& bound) {
+    cursor.assign(form_count, 0);
+    for (const auto& item : proposed) ++cursor[item.first];
+    bound.resize(form_count);
+    std::uint32_t running = 0;
+    for (std::size_t form = 0; form < form_count; ++form) {
+        const std::uint32_t size = cursor[form];
+        cursor[form] = running;   // the next unfilled slot of this form's bucket
+        running += size;
+        bound[form] = running;    // its end
+    }
+    for (std::size_t form = 0; form < form_count; ++form) {
+        while (cursor[form] < bound[form]) {
+            auto value = proposed[cursor[form]];
+            if (value.first == form) {
+                ++cursor[form];
+                continue;
+            }
+            // Carry the displaced pair to its own bucket, and whatever it displaces onward, until one lands here.
+            do {
+                std::swap(value, proposed[cursor[value.first]++]);
+            } while (value.first != form);
+            proposed[cursor[form]++] = value;
+        }
+    }
+    std::size_t out = 0;
+    std::size_t begin = 0;
+    for (std::size_t form = 0; form < form_count; ++form) {
+        const std::size_t end = bound[form];
+        if (begin == end) continue;
+        auto* first = proposed.data() + begin;
+        auto* last = proposed.data() + end;
+        if (end - begin <= 24) {
+            for (auto* it = first + 1; it < last; ++it) {   // insertion sort: a form holds a few dozen starts
+                const auto value = *it;
+                auto* hole = it;
+                while (hole > first && value.second < (hole - 1)->second) {
+                    *hole = *(hole - 1);
+                    --hole;
+                }
+                *hole = value;
+            }
+        } else {
+            std::sort(first, last, [](const auto& a, const auto& b) { return a.second < b.second; });
+        }
+        // Compaction: out <= begin always, so a form's pairs never overwrite ones not yet read.
+        for (auto* it = first; it < last; ++it) {
+            if (out != 0 && proposed[out - 1] == *it) continue;
+            proposed[out++] = *it;
+        }
+        begin = end;
+    }
+    proposed.resize(out);
+}
+
+// MEASUREMENT ONLY: where one collect_form_placements call spent its time, in nanoseconds. A handful of clock
+// reads per call; filled only when a caller passes it.
+struct SeedingTimes {
+    std::uint64_t scan_ns = 0;        // piece scan, index lookups and start generation
+    std::uint64_t sort_ns = 0;        // start ordering and deduplication
+    std::uint64_t verify_ns = 0;      // per start: window checks, prefilter, emission lookup, DP, row storage
+    std::uint64_t replay_ns = 0;      // phase-1 cached placements appended
+    std::uint64_t row_sort_ns = 0;    // the final (start, consumed) row sort
+};
+
 // Scan one haplotype once per piece-length bucket, turning every piece hit into an implied read
 // start. This is the inversion the design calls for: the haplotype is walked, not queried once per
 // read against a position hash the size of the locus.
@@ -2141,7 +2272,16 @@ void collect_form_placements(
     // replayed instead, and counted against `replay`'s consumption cap. `skip` is worker scratch.
     const std::vector<ReplayZone>* zones = nullptr,
     std::vector<std::uint8_t>* skip = nullptr,
-    UnionReplay* replay = nullptr) {
+    UnionReplay* replay = nullptr,
+    SeedingTimes* times = nullptr) {
+    auto phase_mark = times != nullptr ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    const auto lap = [&](std::uint64_t SeedingTimes::*field) {
+        if (times == nullptr) return;
+        const auto now = std::chrono::steady_clock::now();
+        times->*field += static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(now - phase_mark).count());
+        phase_mark = now;
+    };
     proposed.clear();   // keeps capacity: the point of hoisting it
     const bool replaying = zones != nullptr && !zones->empty();
     if (replaying) {
@@ -2242,6 +2382,7 @@ void collect_form_placements(
     // Drain whatever this haplotype counted below the last batch boundary, so the shared total is the
     // true total rather than a multiple of publish_batch, and the merged totals stay exact.
     publish_piece_hits();
+    lap(&SeedingTimes::scan_ns);
 
     // Sorting and full-read verification are the rest of this haplotype's cost and neither touches the
     // budget, so without these checks a worker cancelled by someone else's refusal would still pay for
@@ -2249,11 +2390,20 @@ void collect_form_placements(
     if (budget.stop()) throw PlacementCancelled();
 
     // Several pieces of one read can rediscover one physical placement. Deduplicate before
-    // verifying, so a placement found three ways is verified once and counted once.
-    std::sort(proposed.begin(), proposed.end());
-    proposed.erase(std::unique(proposed.begin(), proposed.end()), proposed.end());
+    // verifying, so a placement found three ways is verified once and counted once. Counting by form and
+    // sorting each form's few starts gives exactly std::sort + std::unique's list (gated), at a fraction of
+    // the cost; the storage is the worker's own.
+    {
+        thread_local std::vector<std::uint32_t> form_cursor;
+        thread_local std::vector<std::uint32_t> form_bound;
+        sort_unique_proposals_bucketed(proposed, forms.size(), form_cursor, form_bound);
+    }
+    // Whether this haplotype strand is all ACGT, established once: with an all-ACGT form, no window check
+    // can then fail, and gapped_emission is told so.
+    const bool haplotype_acgt = !proposed.empty() && std::all_of(haplotype.begin(), haplotype.end(), is_acgt);
     counters.unique_starts += proposed.size();
     if (budget.stop()) throw PlacementCancelled();
+    lap(&SeedingTimes::sort_ns);
 
     // MEASUREMENT ONLY: the shadow piece screen and emission timing. Neither changes a verdict.
     const bool shadow = piece_screen_shadow_active().load(std::memory_order_relaxed);
@@ -2299,7 +2449,7 @@ void collect_form_placements(
         const auto emission_mark = timing ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         const std::optional<GappedFit> fit =
             gapped_emission(haplotype, forms[item.first].bases, item.second, library, band,
-                            &forms[item.first].pattern);
+                            &forms[item.first].pattern, haplotype_acgt && forms[item.first].all_acgt);
         if (timing) {
             const std::uint64_t spent = nanos_since(emission_mark);
             emission_timing().emission_ns += spent;
@@ -2408,6 +2558,7 @@ void collect_form_placements(
     cache_work.dp_cache_hits += emission.dp_cache_hits;
     cache_work.dp_cache_misses += emission.dp_cache_misses;
     cache_work.executed_dps += emission.executed_dps;
+    lap(&SeedingTimes::verify_ns);
 
     // Exact union reuse: the cached placements of every zone, translated to this haplotype. Appended before
     // the sort below, which puts every row in (start, consumed) order -- unique within a row -- so the rows
@@ -2433,6 +2584,7 @@ void collect_form_placements(
                 "fragment scoring reached its cached-placement consumption cap; no partial ranking is returned");
         }
     }
+    lap(&SeedingTimes::replay_ns);
 
     // Sorted by start first, so the pairing below can walk one left endpoint's classes as a group,
     // and by consumed span within it so the row order is fixed rather than insertion-dependent.
@@ -2448,6 +2600,7 @@ void collect_form_placements(
     } else {
         for (std::vector<FormPlacement>& list : out) sort_row(list);
     }
+    lap(&SeedingTimes::row_sort_ns);
 }
 
 } // namespace scoring_detail
@@ -2623,6 +2776,7 @@ PreparedFragmentSet prepare_fragment_set(
             form.bases = std::move(bases);
             form.is_forward_mate_of_first_arm = first_arm;
             form.pattern = prepare_myers_pattern(form.bases);
+            form.all_acgt = std::all_of(form.bases.begin(), form.bases.end(), is_acgt);
             into.push_back(std::move(form));
         };
         add_form(out.forward_forms, f, fragments[f].first.bases, true);
@@ -3203,10 +3357,13 @@ void place_haplotype_range(
 
         for (std::vector<FormPlacement>& row : forward_placements) row.clear();
         const std::uint64_t rows_before = counters.accepted_mate_placements;
+        SeedingTimes seeding_times;
+        SeedingTimes* const timed = trace_work ? &seeding_times : nullptr;
         collect_form_placements(haplotype, prepared.forward_forms, prepared.forward_componentise,
                                 prepared.forward_indexes, budget, band, library, forward_placements,
                                 proposed_scratch, counters, cache_work, options, nullptr,
-                                in.replay != nullptr ? &in.replay->forward[h] : nullptr, &replay_skip, in.replay);
+                                in.replay != nullptr ? &in.replay->forward[h] : nullptr, &replay_skip, in.replay,
+                                timed);
         memory.proposed_starts_peak =
             std::max<std::uint64_t>(memory.proposed_starts_peak, proposed_scratch.size());
         memory.proposed_starts_capacity_bytes_peak = std::max<std::uint64_t>(
@@ -3219,7 +3376,7 @@ void place_haplotype_range(
                                 prepared.reverse_componentise, prepared.reverse_indexes, budget, band,
                                 library, reverse_placements, proposed_scratch, counters, cache_work,
                                 options, nullptr, in.replay != nullptr ? &in.replay->reverse[h] : nullptr,
-                                &replay_skip, in.replay);
+                                &replay_skip, in.replay, timed);
         memory.proposed_starts_peak =
             std::max<std::uint64_t>(memory.proposed_starts_peak, proposed_scratch.size());
         memory.proposed_starts_capacity_bytes_peak = std::max<std::uint64_t>(
@@ -3449,6 +3606,11 @@ void place_haplotype_range(
             work.reused_state_aggregates = counters.reused_state_aggregates - work_before.reused_state_aggregates;
             work.merged_state_classes = counters.merged_state_classes - work_before.merged_state_classes;
             work.seconds_cached_merge = merge_seconds;
+            work.seconds_seed_scan = static_cast<double>(seeding_times.scan_ns) * 1e-9;
+            work.seconds_start_sort = static_cast<double>(seeding_times.sort_ns) * 1e-9;
+            work.seconds_verification = static_cast<double>(seeding_times.verify_ns) * 1e-9;
+            work.seconds_replay = static_cast<double>(seeding_times.replay_ns) * 1e-9;
+            work.seconds_row_sort = static_cast<double>(seeding_times.row_sort_ns) * 1e-9;
             work.seconds_seeding_and_emission = std::chrono::duration<double>(work_seeded - work_mark).count();
             work.seconds_pairing_and_reduction = std::chrono::duration<double>(work_done - work_seeded).count();
         }
@@ -4739,6 +4901,264 @@ FragmentScoringResult score_diplotypes(
     return result;
 }
 
+UnionSeedingProfile profile_union_seeding(const InternedHaplotypes& haplotypes, const std::vector<ReadPair>& fragments,
+                                          const LibraryModel& library, const FragmentScoringOptions& options,
+                                          const std::vector<std::size_t>& sample, const std::vector<char>& is_panel) {
+    using Clock = std::chrono::steady_clock;
+    const auto ns_since = [](Clock::time_point mark) {
+        return static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - mark).count());
+    };
+    validate_library_model(library);
+    UnionSeedingProfile profile;
+    const std::size_t band = options.mismatch_band;
+    const DiscreteInsertDistribution library_insert = build_library_insert_distribution(library);
+    const PreparedFragmentSet prepared = prepare_fragment_set(fragments, library, options);
+    std::deque<std::string> sequences;
+    std::deque<std::string> reversed_sequences;
+    for (const std::string& sequence : haplotypes.sequences) {
+        sequences.push_back(sequence);
+        reversed_sequences.emplace_back(sequence.rbegin(), sequence.rend());
+    }
+    struct EmissionCacheScope {
+        explicit EmissionCacheScope(std::size_t bytes) { begin_emission_cache(bytes); }
+        ~EmissionCacheScope() { (void)end_emission_cache(); }
+    } emission_cache_scope(options.emission_cache_bytes);
+    PlacementBudget budget;
+    budget.max_piece_hits = std::numeric_limits<std::uint64_t>::max();
+    budget.max_physical_origins = std::numeric_limits<std::uint64_t>::max();
+    PlacementInputs inputs;
+    inputs.prepared = &prepared;
+    inputs.fragments = &fragments;
+    inputs.library = &library;
+    inputs.library_insert = &library_insert;
+    inputs.options = &options;
+    inputs.sequences = &sequences;
+    inputs.reversed = &reversed_sequences;
+    inputs.band = band;
+    UnionReplay replay;
+    std::vector<UnionSegmentEntry> entries;
+    UnionOriginReuse origin_reuse;
+    origin_reuse.max_origins = std::numeric_limits<std::uint64_t>::max();
+    origin_reuse.max_states = std::numeric_limits<std::uint64_t>::max();
+    std::deque<UnionOriginEntry> origin_entries;
+    UnionPlacementCacheReport placement_report;
+    UnionOriginCacheReport origin_report;
+    FragmentScoringCounters fill_counters;
+    EmissionCacheCounters fill_cache;
+    const bool reuse = options.union_segment_lengths != nullptr && options.union_placement_cache_bytes > 0;
+    if (reuse) {
+        fill_union_cache(inputs, *options.union_segment_lengths, options.union_placement_cache_bytes, 0, options.threads,
+                         budget, fill_counters, fill_cache, entries, replay, placement_report,
+                         0, nullptr, &origin_entries, &origin_report);   // seeding reads phase 1's zones only
+    }
+    const auto code_of = [](char base) { return two_bit(base); };
+    std::vector<std::uint8_t> skip;
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> proposed, generated, sorted;
+    std::vector<std::uint32_t> counts, bounds;
+    for (const std::size_t h : sample) {
+        if (h >= sequences.size()) throw std::invalid_argument("seeding profile samples an unknown haplotype");
+        profile.sampled.push_back(h);
+        std::uint64_t hash = 1469598103934665603ULL;
+        for (const char base : sequences[h]) hash = (hash ^ static_cast<unsigned char>(base)) * 1099511628211ULL;
+        profile.sampled_hashes.push_back(hash);
+        UnionSeedingPhases& phases = (h < is_panel.size() && is_panel[h] != 0) ? profile.panel : profile.mosaic;
+        ++phases.haplotypes;
+        for (int strand = 0; strand < 2; ++strand) {
+            const std::string& text = strand == 0 ? sequences[h] : reversed_sequences[h];
+            const auto& forms = strand == 0 ? prepared.forward_forms : prepared.reverse_forms;
+            const auto& componentise = strand == 0 ? prepared.forward_componentise : prepared.reverse_componentise;
+            const auto& indexes = strand == 0 ? prepared.forward_indexes : prepared.reverse_indexes;
+            const std::vector<ReplayZone>* zones =
+                reuse ? &(strand == 0 ? replay.forward : replay.reverse)[h] : nullptr;
+            const bool replaying = zones != nullptr && !zones->empty();
+
+            // The production call, as the pass makes it (it also warms the emission cache for these keys).
+            std::vector<std::vector<FormPlacement>> rows(forms.size());
+            FragmentScoringCounters counters;
+            EmissionCacheCounters cache_work;
+            (void)take_gapped_emission_counters();
+            auto mark = Clock::now();
+            collect_form_placements(text, forms, componentise, indexes, budget, band, library, rows, proposed, counters,
+                                    cache_work, options, nullptr, zones, &skip, replaying ? &replay : nullptr);
+            phases.production_ns += ns_since(mark);
+            phases.piece_hits += counters.piece_hits;
+            phases.proposals += counters.proposed_starts;
+            phases.unique_starts += counters.unique_starts;
+            phases.prefilters += cache_work.executed_prefilters;
+            phases.prefilter_rejections += counters.prefilter_rejections;
+            phases.dp_requests += counters.dp_evaluations;
+            phases.executed_dps += cache_work.executed_dps;
+
+            // Seed scan alone, then the same scan generating starts: the difference is generation.
+            if (replaying) {
+                skip.assign(text.size() + library.max_gap_bp + 2, 0);
+                for (const ReplayZone& zone : *zones) {
+                    std::fill(skip.begin() + zone.lo, skip.begin() + zone.hi + 1, static_cast<std::uint8_t>(1));
+                }
+            }
+            for (int generate = 0; generate < 2; ++generate) {
+                generated.clear();
+                std::uint64_t sink = 0;
+                mark = Clock::now();
+                for (const PieceIndex& index : indexes) {
+                    const std::size_t piece = index.piece_bp;
+                    if (text.size() < piece) continue;
+                    const std::uint64_t mask =
+                        piece == 32 ? std::numeric_limits<std::uint64_t>::max() : ((std::uint64_t{1} << (2 * piece)) - 1);
+                    std::uint64_t code = 0;
+                    std::size_t run = 0;
+                    for (std::size_t at = 0; at < text.size(); ++at) {
+                        const std::uint64_t bits = code_of(text[at]);
+                        if (bits == kNoCode) { run = 0; code = 0; continue; }
+                        code = ((code << 2) | bits) & mask;
+                        if (++run < piece) continue;
+                        const std::size_t piece_start = at + 1 - piece;
+                        const auto range = std::equal_range(
+                            index.entries.begin(), index.entries.end(), code, [](const auto& lhs, const auto& rhs) {
+                                if constexpr (std::is_same_v<std::decay_t<decltype(lhs)>, PieceEntry>) {
+                                    return lhs.code < rhs;
+                                } else {
+                                    return lhs < rhs.code;
+                                }
+                            });
+                        for (auto it = range.first; it != range.second; ++it) {
+                            if (it->offset > piece_start) continue;
+                            const std::size_t implied = piece_start - it->offset;
+                            const std::size_t lo = implied > library.max_gap_bp ? implied - library.max_gap_bp : 0;
+                            const std::size_t hi = implied + library.max_gap_bp;
+                            if (generate == 0) {
+                                sink += lo + hi;
+                                continue;
+                            }
+                            for (std::size_t shifted = lo; shifted <= hi; ++shifted) {
+                                if (replaying && shifted < skip.size() && skip[shifted] != 0) continue;
+                                generated.emplace_back(it->form, static_cast<std::uint32_t>(shifted));
+                            }
+                        }
+                    }
+                }
+                (generate == 0 ? phases.scan_ns : phases.scan_and_generate_ns) += ns_since(mark);
+                if (generate == 0) {
+                    volatile std::uint64_t keep = sink;   // keeps the scan-only loop from being elided
+                    (void)keep;
+                }
+            }
+            if (generated.size() != counters.proposed_starts) {
+                throw std::logic_error("seeding profile: the replayed scan proposed a different number of starts");
+            }
+            // Start ordering: production's sort + unique, and the bucketed alternative, on the same proposals.
+            sorted = generated;
+            mark = Clock::now();
+            std::sort(sorted.begin(), sorted.end());
+            sorted.erase(std::unique(sorted.begin(), sorted.end()), sorted.end());
+            phases.start_sort_ns += ns_since(mark);
+            if (sorted != proposed) throw std::logic_error("seeding profile: the replayed sort differs from production");
+            std::vector<std::pair<std::uint32_t, std::uint32_t>> bucketed = generated;
+            mark = Clock::now();
+            sort_unique_proposals_bucketed(bucketed, forms.size(), counts, bounds);
+            phases.start_sort_bucketed_ns += ns_since(mark);
+            if (bucketed != proposed) throw std::logic_error("seeding profile: the bucketed start set differs");
+            ++profile.bucketed_sort_checked;
+
+            // Per unique start: the window checks, the prefilter (both kernels), the emission call and the storage.
+            std::vector<std::size_t> window_of(proposed.size(), 0);
+            mark = Clock::now();
+            for (std::size_t i = 0; i < proposed.size(); ++i) {
+                const std::string& read = forms[proposed[i].first].bases;
+                const std::size_t start = proposed[i].second;
+                if (start > text.size() || text.size() - start < read.size()) continue;
+                const std::size_t window = std::min(text.size() - start, read.size() + library.max_gap_bp);
+                require_acgt_window(text, start, window, read);
+                window_of[i] = window;
+            }
+            phases.window_check_ns += ns_since(mark);
+            std::vector<char> feasible(proposed.size(), 0);
+            mark = Clock::now();
+            for (std::size_t i = 0; i < proposed.size(); ++i) {
+                if (window_of[i] == 0) continue;
+                const ReadForm& form = forms[proposed[i].first];
+                feasible[i] = feasible_within_band_reference(text, proposed[i].second, window_of[i], form.bases, band,
+                                                             &form.pattern) ? 1 : 0;
+            }
+            phases.prefilter_ns += ns_since(mark);
+            std::vector<char> early(proposed.size(), 0);
+            mark = Clock::now();
+            for (std::size_t i = 0; i < proposed.size(); ++i) {
+                if (window_of[i] == 0) continue;
+                const ReadForm& form = forms[proposed[i].first];
+                early[i] = feasible_within_band(text, proposed[i].second, window_of[i], form.bases, band, &form.pattern) ? 1 : 0;
+            }
+            phases.prefilter_early_ns += ns_since(mark);
+            if (early != feasible) throw std::logic_error("seeding profile: the early-refusing prefilter differs");
+            profile.early_prefilter_checked += proposed.size();
+            // Only accepted fits are kept (a fit carries its component array inline; millions of refusals would not).
+            std::vector<std::pair<std::size_t, GappedFit>> fits;
+            mark = Clock::now();
+            for (std::size_t i = 0; i < proposed.size(); ++i) {
+                const ReadForm& form = forms[proposed[i].first];
+                std::optional<GappedFit> fit =
+                    gapped_emission(text, form.bases, proposed[i].second, library, band, &form.pattern);
+                if (fit.has_value() && fit->log_emission != kNegInf) fits.emplace_back(i, std::move(*fit));
+            }
+            phases.emission_call_ns += ns_since(mark);
+            (void)take_gapped_emission_counters();
+            // Direct recursions over a fixed prefix of the survivors, for a per-DP cost.
+            std::size_t timed = 0;
+            mark = Clock::now();
+            for (std::size_t i = 0; i < proposed.size() && timed < 2000; ++i) {
+                if (feasible[i] == 0) continue;
+                const ReadForm& form = forms[proposed[i].first];
+                GappedFit fit;
+                (void)gap_recursion_scaled(&text, &form.bases, proposed[i].second, form.bases.size(),
+                                           text.size() - proposed[i].second, band, library, true, &fit.components);
+                ++timed;
+            }
+            phases.dp_timed_ns += ns_since(mark);
+            phases.dp_timed += timed;
+            // Storage, replay and the row sort, on fresh rows.
+            for (std::vector<FormPlacement>& row : rows) row.clear();
+            mark = Clock::now();
+            for (const auto& [i, accepted] : fits) {
+                const GappedFit* fit = &accepted;
+                const std::uint32_t form = proposed[i].first;
+                if (componentise[form] != 0) {
+                    for (const GappedComponent& component : fit->components) {
+                        if (component.log_emission == kNegInf) continue;
+                        rows[form].push_back({proposed[i].second, static_cast<std::uint32_t>(component.consumed_bp),
+                                              static_cast<std::uint32_t>(component.edits), component.log_emission});
+                        ++phases.placements;
+                    }
+                    continue;
+                }
+                rows[form].push_back({proposed[i].second, static_cast<std::uint32_t>(fit->consumed_bp),
+                                      static_cast<std::uint32_t>(fit->edits), fit->log_emission});
+                ++phases.placements;
+            }
+            phases.storage_ns += ns_since(mark);
+            mark = Clock::now();
+            if (replaying) {
+                for (const ReplayZone& zone : *zones) {
+                    for (const CachedPlacement& cached : zone.entry->placements) {
+                        rows[cached.form].push_back(
+                            {cached.start + zone.shift, cached.consumed, cached.mismatches, cached.emission});
+                        ++phases.replayed;
+                    }
+                }
+            }
+            phases.replay_ns += ns_since(mark);
+            mark = Clock::now();
+            for (std::vector<FormPlacement>& list : rows) {
+                std::sort(list.begin(), list.end(), [](const FormPlacement& lhs, const FormPlacement& rhs) {
+                    return std::tie(lhs.start, lhs.consumed) < std::tie(rhs.start, rhs.consumed);
+                });
+            }
+            phases.row_sort_ns += ns_since(mark);
+        }
+    }
+    return profile;
+}
+
 // ---------------------------------------------------------------------------------------------
 // PreparedScoringContext
 // ---------------------------------------------------------------------------------------------
@@ -5767,6 +6187,30 @@ bool feasibility_prefilter_admits(const std::string& haplotype, std::size_t star
     const std::size_t window = prefilter_window(haplotype, start, read, max_gap_bp);
     if (window == 0) return false;
     return feasible_within_band(haplotype, start, window, read, band, nullptr);
+}
+
+PrefilterDecisions feasibility_prefilter_decisions(const std::string& haplotype, std::size_t start,
+                                                   const std::string& read, std::size_t band, std::size_t max_gap_bp) {
+    PrefilterDecisions out;
+    const std::size_t window = prefilter_window(haplotype, start, read, max_gap_bp);
+    const MyersPattern pattern = prepare_myers_pattern(read);
+    out.reference_unprepared = window != 0 && feasible_within_band_reference(haplotype, start, window, read, band, nullptr);
+    out.reference_prepared = window != 0 && feasible_within_band_reference(haplotype, start, window, read, band, &pattern);
+    out.production_unprepared = window != 0 && feasible_within_band(haplotype, start, window, read, band, nullptr);
+    out.production_prepared = window != 0 && feasible_within_band(haplotype, start, window, read, band, &pattern);
+    return out;
+}
+
+std::vector<std::pair<std::uint32_t, std::uint32_t>> sort_unique_proposals_for_test(
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> proposals, std::size_t form_count, bool bucketed) {
+    if (bucketed) {
+        std::vector<std::uint32_t> cursor, bound;
+        sort_unique_proposals_bucketed(proposals, form_count, cursor, bound);
+    } else {
+        std::sort(proposals.begin(), proposals.end());
+        proposals.erase(std::unique(proposals.begin(), proposals.end()), proposals.end());
+    }
+    return proposals;
 }
 
 DemandWindow PreparedScoringContext::demand_window(std::uint64_t key_hash) const {

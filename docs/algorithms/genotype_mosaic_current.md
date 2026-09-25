@@ -429,6 +429,48 @@ phase and filters are the reference scorer's bit for bit; no v1-v4 profile binds
   the placement cache up to 0.23 GiB, and about 0.45 GiB of freed large blocks the allocator keeps dirty
   (`vmmap`: MALLOC_LARGE empty) -- not a leak, not yet reduced.
 
+## Union seeding, phase 3 (2026-09-25): exact, always on
+
+With phases 1+2 on, the union's cost is panel-haplotype seeding. Phase 3 changes how three exact steps are
+computed, never what they compute; it needs no setting and changes no counter's meaning (every executed and
+logical counter on `loo.NA19434.30` equals phase 2's).
+
+- **Measurement.** One instrumented union-only run (per-haplotype block timers: seed scan, start sort,
+  verification, replay, row sort; trace columns `seconds_seed_scan` ... `seconds_row_sort`) and one
+  deterministic single-thread replay (`--union-seeding-profile N`, a union-only diagnostic that replays instead
+  of scoring; `<prefix>.union_seeding_profile.tsv` binds the sampled haplotypes by index and FNV hash). Over 16
+  evenly spaced panel haplotypes (30.4 s single-thread; 16 mosaics 1.5 s): Myers prefilter 53%, emission key and
+  cache lookup 16%, start sort + unique 14%, window ACGT validation 11%, seed scan and generation 3%, DPs 2.5%
+  (65k executed, 11.4 us each), storage, replay and row sort <1%.
+- **Early-refusing prefilter.** The Myers last-row score is the whole read's edit distance to the target prefix
+  so far, and adjacent prefixes differ by at most one edit; once score > band + remaining columns no prefix can
+  come within the band, and the scan returns false -- the full scan's answer, earlier. Acceptances return where
+  they did. `feasible_within_band_reference` keeps the full scan.
+- **ACGT validation hoisted.** Each read form's all-ACGT flag is taken at preparation and each haplotype strand's
+  once per call; when both hold, the per-window check (203 bytes per start) cannot fail and is skipped. Any
+  non-ACGT byte keeps the per-window check, so a refusal fires exactly where it did.
+- **Start set.** std::sort + std::unique over (form, start) replaced by an in-place counting permutation by form
+  (American-flag cycle leading) and per-form insertion sorts: the same list. The replay's out-of-place version
+  was 4.9x faster than the sort, but its scratch copy of each worker's proposals cost ~0.5 GiB and tripped the
+  3.5 GiB footprint limit; the in-place version saves 14% of the sort in production.
+- **Not done, not measured.** Batching several starts through one kernel pass, and SIMD/NEON: not attempted (an
+  anchored Myers scan per start shares no state with its neighbours as written; whether a batched layout pays was
+  not tested). A necessary-condition screen: not repeated (the earlier piece screen saved little net). The
+  emission key and lookup (16% before phase 3) is the largest untouched share.
+- **Gates.** `panvar_genotype_seeding_exactness`: 85,931 prefilter decisions over adversarial edit scripts
+  (substitution/insertion/deletion/mixed, on piece boundaries, +/-4 around the true start), repeats, unrelated
+  sequence, windows cut by the haplotype end, reads above the 128-bit word, bands 0-8, gaps 0-4 -- the early and
+  full kernels agree, prepared and unprepared; 3,000 randomised proposal lists (duplicates, empty, one form,
+  forms above the insertion threshold) equal to std::sort + std::unique; non-ACGT window or read still refuses.
+  The replay compared 64 real proposal lists and 47.9M real prefilter decisions: identical. The phase 1+2 fixture
+  (threads, orders, caps) and `loo.HG02282.2` (reuse off and on: every table, the trajectory and every status
+  counter equal to phase 2's) pass.
+- **`loo.NA19434.30`** (union-only, phases 1+2, v4 campaign-local, 700M cap, 8 threads): ranking and mass digest
+  identical to the reference; union 72.4 -> 52.1 s (1.39x; 2.99x over the reference's 155.8 s), wall 74.8 ->
+  54.4 s, CPU 500 -> 357 s, placement fill 10.2 -> 7.8 s, footprint 3.07 -> 3.21 GiB. Worker-seconds 423 -> 305:
+  panel verification 308.8 -> 197.0, panel start sort 47.2 -> 40.6; slowest worker 57.9 -> 41.7 s.
+  `loo.HG02282.2` 2x full call: 24.1 -> 21.3 s (reuse off), 21.0 -> 19.2 s (on).
+
 ## Frozen defaults
 
 State limit **256** (production) and **1,024** (diagnostic comparison width) -- counted in allele-prefix

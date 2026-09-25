@@ -5803,6 +5803,7 @@ int tie_branch(const Args& args) {
     options.diagnostic_reuse_trace = args.get("reuse-trace", "0") != "0";
     options.diagnostic_union_work_trace = args.get("union-work-trace", "0") != "0";
     options.diagnostic_union_only = args.get("union-only", "0") != "0";
+    options.diagnostic_union_seeding_profile = std::stoul(args.get("union-seeding-profile", "0"));
     options.diagnostic_warm_branches = args.get("warm-branches", "0") != "0";
     options.diagnostic_digest_memo = args.get("digest-memo", "0") != "0";
     options.diagnostic_digest_memo_check = args.get("digest-memo-check", "0") != "0";

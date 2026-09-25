@@ -1564,7 +1564,12 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
     std::string rescore_failure;
     std::vector<HaplotypeWork> union_work;
     if (options.diagnostic_union_work_trace) scoring_options.record_haplotype_work = &union_work;
-    if (any_ranked) {
+    // DIAGNOSTIC ONLY: a seeding-profile run replays the seeding path instead of scoring the union at all.
+    const bool seeding_profile_only = options.diagnostic_union_seeding_profile > 0;
+    if (seeding_profile_only && !options.diagnostic_union_only) {
+        throw std::invalid_argument("the union seeding profile is a union-only diagnostic (set diagnostic_union_only)");
+    }
+    if (any_ranked && !seeding_profile_only) {
         try {
             scored = score_diplotypes(interned, scored_pairs, fragments, library, scoring_options,
                                       &candidate_report.observed);
@@ -1614,7 +1619,8 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
              << "haplotype\tclass\tallele_paths\trecorded\thaplotype_bp\tpiece_hits\tproposed_starts\tunique_starts\t"
                 "full_read_verifications\tprefilter_rejections\tdp_evaluations\texecuted_dps\taccepted_mate_placements\t"
                 "physical_origins\tstatistical_state_classes\tseconds_seeding_and_emission\tseconds_pairing_and_reduction\t"
-                "reused_physical_origins\treused_state_aggregates\tmerged_state_classes\tseconds_cached_merge\n";
+                "reused_physical_origins\treused_state_aggregates\tmerged_state_classes\tseconds_cached_merge\t"
+                "seconds_seed_scan\tseconds_start_sort\tseconds_verification\tseconds_replay\tseconds_row_sort\n";
         for (std::size_t h = 0; h < union_work.size(); ++h) {
             const HaplotypeWork& w = union_work[h];
             text << h << '\t' << (is_panel[h] ? "panel" : "mosaic") << '\t' << paths_of[h] << '\t'
@@ -1624,9 +1630,65 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
                  << w.accepted_mate_placements << '\t' << w.physical_origins << '\t' << w.statistical_state_classes
                  << '\t' << w.seconds_seeding_and_emission << '\t' << w.seconds_pairing_and_reduction << '\t'
                  << w.reused_physical_origins << '\t' << w.reused_state_aggregates << '\t' << w.merged_state_classes
-                 << '\t' << w.seconds_cached_merge << '\n';
+                 << '\t' << w.seconds_cached_merge << '\t' << w.seconds_seed_scan << '\t' << w.seconds_start_sort
+                 << '\t' << w.seconds_verification << '\t' << w.seconds_replay << '\t' << w.seconds_row_sort << '\n';
         }
         atomic_write(options.out_prefix + ".union_haplotype_work.tsv", text.str());
+    }
+    if (seeding_profile_only && any_ranked) {
+        // DIAGNOSTIC ONLY: a deterministic replay of the seeding path over evenly spaced panel and mosaic haplotypes.
+        std::set<std::vector<std::size_t>> panel_paths(model.panel().template_alleles.begin(),
+                                                       model.panel().template_alleles.end());
+        std::vector<char> is_panel(interned.sequences.size(), 0);
+        for (const auto& [alleles, slot] : slot_of_path) {
+            if (panel_paths.count(alleles) != 0) is_panel[interned.index_of[slot]] = 1;
+        }
+        std::vector<std::size_t> of_class[2];
+        for (std::size_t h = 0; h < interned.sequences.size(); ++h) of_class[is_panel[h] != 0 ? 0 : 1].push_back(h);
+        std::vector<std::size_t> sample;
+        for (const std::vector<std::size_t>& members : of_class) {
+            const std::size_t n = std::min(options.diagnostic_union_seeding_profile, members.size());
+            for (std::size_t i = 0; i < n; ++i) sample.push_back(members[i * members.size() / n]);
+        }
+        const UnionSeedingProfile profile =
+            profile_union_seeding(interned, fragments, library, scoring_options, sample, is_panel);
+        std::ostringstream text;
+        text << "# DIAGNOSTIC ONLY: single-thread replay of the union seeding path; nanoseconds over both strands\n"
+             << "key\tpanel\tmosaic\n";
+        const auto row = [&](const char* key, std::uint64_t UnionSeedingPhases::*field) {
+            text << key << '\t' << profile.panel.*field << '\t' << profile.mosaic.*field << '\n';
+        };
+        row("haplotypes", &UnionSeedingPhases::haplotypes);
+        row("production_ns", &UnionSeedingPhases::production_ns);
+        row("scan_ns", &UnionSeedingPhases::scan_ns);
+        row("scan_and_generate_ns", &UnionSeedingPhases::scan_and_generate_ns);
+        row("start_sort_ns", &UnionSeedingPhases::start_sort_ns);
+        row("start_sort_bucketed_ns", &UnionSeedingPhases::start_sort_bucketed_ns);
+        row("window_check_ns", &UnionSeedingPhases::window_check_ns);
+        row("prefilter_ns", &UnionSeedingPhases::prefilter_ns);
+        row("prefilter_early_ns", &UnionSeedingPhases::prefilter_early_ns);
+        row("emission_call_ns", &UnionSeedingPhases::emission_call_ns);
+        row("dp_timed_ns", &UnionSeedingPhases::dp_timed_ns);
+        row("storage_ns", &UnionSeedingPhases::storage_ns);
+        row("replay_ns", &UnionSeedingPhases::replay_ns);
+        row("row_sort_ns", &UnionSeedingPhases::row_sort_ns);
+        row("piece_hits", &UnionSeedingPhases::piece_hits);
+        row("proposals", &UnionSeedingPhases::proposals);
+        row("unique_starts", &UnionSeedingPhases::unique_starts);
+        row("prefilters", &UnionSeedingPhases::prefilters);
+        row("prefilter_rejections", &UnionSeedingPhases::prefilter_rejections);
+        row("dp_requests", &UnionSeedingPhases::dp_requests);
+        row("executed_dps", &UnionSeedingPhases::executed_dps);
+        row("dp_timed", &UnionSeedingPhases::dp_timed);
+        row("placements", &UnionSeedingPhases::placements);
+        row("replayed", &UnionSeedingPhases::replayed);
+        text << "bucketed_sort_lists_checked\t" << profile.bucketed_sort_checked << "\t\n"
+             << "early_prefilter_decisions_checked\t" << profile.early_prefilter_checked << "\t\n";
+        for (std::size_t i = 0; i < profile.sampled.size(); ++i) {
+            text << "sampled_haplotype\t" << profile.sampled[i] << '\t' << (is_panel[profile.sampled[i]] ? "panel" : "mosaic")
+                 << ':' << std::hex << profile.sampled_hashes[i] << std::dec << '\n';
+        }
+        atomic_write(options.out_prefix + ".union_seeding_profile.tsv", text.str());
     }
 
     // Exact-path prior cache, shared by every ranked set: the primary one, each development prefix and
@@ -3294,6 +3356,14 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
             return GenotypeRunStatus::RescoreIncomplete;
         }
 
+        if (options.diagnostic_union_only && options.diagnostic_union_seeding_profile > 0) {
+            timings.total = seconds_since(started);
+            write_status(status_path, GenotypeRunStatus::UnionDiagnosticOnly, fingerprint, options, library, timings,
+                         &built.report, &panel, (panel_only ? nullptr : &beam), nullptr,
+                         "DIAGNOSTIC ONLY: union seeding profile; the union pass was replayed, not scored",
+                         nullptr, &depth, &candidate_report);
+            return GenotypeRunStatus::UnionDiagnosticOnly;
+        }
         if (options.diagnostic_union_only) {
             // DIAGNOSTIC ONLY: the union pass's certified ranking, exact to the bit, and a digest of every mass
             // cell and exposure; the run stops here -- no repair, no genotype, no haplotype, never a call.

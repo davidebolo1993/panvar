@@ -272,7 +272,10 @@ std::optional<GappedFit> gapped_emission(
     std::size_t start,
     const LibraryModel& library,
     std::size_t mismatch_band,
-    const MyersPattern* pattern = nullptr);
+    const MyersPattern* pattern = nullptr,
+    // True only when the caller has established that the whole haplotype and the whole read are ACGT, so the
+    // per-window ACGT refusal cannot fire. Never changes a result; a caller unsure passes false.
+    bool acgt_known = false);
 
 // The committed log-space recursion, retained verbatim as the REFERENCE the optimised path is
 // certified against. It is never called in production: gapped_emission computes the same quantities
@@ -612,6 +615,11 @@ struct HaplotypeWork {
     double seconds_seeding_and_emission = 0.0;   // exact seeds, prefilter, gapped emission, both strands
     double seconds_pairing_and_reduction = 0.0;  // mate pairing, physical origins, StateKey reduction
     double seconds_cached_merge = 0.0;           // of which merging served state aggregates (phase 2)
+    // Of seconds_seeding_and_emission, both strands: piece scan and start generation, start ordering and
+    // deduplication, per-start verification (window checks, prefilter, emission lookup, DP, row storage), phase-1
+    // replay, and the final row sort. The rest is the reverse rows' coordinate turn.
+    double seconds_seed_scan = 0.0, seconds_start_sort = 0.0, seconds_verification = 0.0;
+    double seconds_replay = 0.0, seconds_row_sort = 0.0;
 };
 
 // Exact union placement reuse (one-shot passes). A start whose whole dependency window -- the bases its seeds
@@ -690,6 +698,37 @@ struct UnionOriginCacheReport {
     std::uint64_t index_bytes = 0;                // the per-haplotype zone tables
     std::uint64_t peak_bytes = 0;                 // payload + index + the batch being filled, at its peak
     double seconds_fill = 0.0;                    // cached-origin construction (wall)
+};
+
+// DIAGNOSTIC ONLY: a deterministic single-thread replay of the union pass's seeding path over sampled unique
+// haplotypes, after the production phase-1/2 fills, splitting its cost into phases by repeating each phase in
+// isolation over the same inputs; and timing exact alternatives against it -- each alternative's output is
+// compared with the production path's and any difference throws. Nanoseconds, summed over the sampled
+// haplotypes' two strands. Nothing here enters a score.
+struct UnionSeedingPhases {
+    std::uint64_t haplotypes = 0;
+    std::uint64_t production_ns = 0;          // the production collect_form_placements calls, as one
+    std::uint64_t scan_ns = 0;                // seed scan and index lookups alone (no start generated)
+    std::uint64_t scan_and_generate_ns = 0;   // the same scan generating every proposed start
+    std::uint64_t start_sort_ns = 0;          // std::sort + std::unique of the proposals
+    std::uint64_t start_sort_bucketed_ns = 0; // the counting-by-form alternative (exact)
+    std::uint64_t window_check_ns = 0;        // eligibility, window and ACGT validation per unique start
+    std::uint64_t prefilter_ns = 0;           // the exact feasibility prefilter per unique start
+    std::uint64_t prefilter_early_ns = 0;     // the early-refusing kernel (exact)
+    std::uint64_t emission_call_ns = 0;       // gapped_emission per unique start, every DP already cached
+    std::uint64_t dp_timed_ns = 0;            // gap recursions timed directly (a prefix of the survivors)
+    std::uint64_t storage_ns = 0;             // FormPlacement construction and row storage
+    std::uint64_t replay_ns = 0;              // phase-1 cached placements appended
+    std::uint64_t row_sort_ns = 0;
+    std::uint64_t piece_hits = 0, proposals = 0, unique_starts = 0, prefilters = 0, prefilter_rejections = 0;
+    std::uint64_t dp_requests = 0, executed_dps = 0, dp_timed = 0, placements = 0, replayed = 0;
+};
+struct UnionSeedingProfile {
+    UnionSeedingPhases panel, mosaic;
+    std::vector<std::size_t> sampled;              // unique haplotype indices, in replay order
+    std::vector<std::uint64_t> sampled_hashes;     // FNV-1a of each sampled haplotype's bytes
+    std::uint64_t bucketed_sort_checked = 0;       // proposal lists compared, all identical
+    std::uint64_t early_prefilter_checked = 0;     // prefilter decisions compared, all identical
 };
 
 struct FragmentScoringOptions {
@@ -933,6 +972,11 @@ PieceHitCensus census_piece_hits(
 
 // `observed_on_failure`, when given, receives the work performed when a cap was reached, so a refused
 // run can report what it actually did rather than nothing at all.
+// See UnionSeedingProfile. `options` must carry the union segmentation and both reuse budgets as the pass ran.
+UnionSeedingProfile profile_union_seeding(const InternedHaplotypes& haplotypes, const std::vector<ReadPair>& fragments,
+                                          const LibraryModel& library, const FragmentScoringOptions& options,
+                                          const std::vector<std::size_t>& sample, const std::vector<char>& is_panel);
+
 FragmentScoringResult score_diplotypes(
     const InternedHaplotypes& haplotypes,
     const std::vector<HaplotypeCandidate>& candidates,
@@ -1330,6 +1374,18 @@ bool piece_screen_count_passes(const std::string& haplotype, std::size_t start, 
                                std::size_t band, std::size_t max_gap_bp, std::size_t pieces);
 bool feasibility_prefilter_admits(const std::string& haplotype, std::size_t start,
                                   const std::string& read, std::size_t band, std::size_t max_gap_bp);
+// Gates only: the prefilter's decision by the reference (every column) and the production (early-refusing)
+// kernels, each with the read's masks prepared ahead and built on the spot. Exactness means all four agree.
+struct PrefilterDecisions {
+    bool reference_unprepared = false, reference_prepared = false;
+    bool production_unprepared = false, production_prepared = false;
+};
+PrefilterDecisions feasibility_prefilter_decisions(const std::string& haplotype, std::size_t start,
+                                                   const std::string& read, std::size_t band, std::size_t max_gap_bp);
+// Gates only: proposed (form, start) pairs ordered and deduplicated by std::sort + std::unique (bucketed false) or
+// by the production counting-by-form path (true). Exactness means the two lists are equal.
+std::vector<std::pair<std::uint32_t, std::uint32_t>> sort_unique_proposals_for_test(
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> proposals, std::size_t form_count, bool bucketed);
 
 // ---- MEASUREMENT ONLY: one window's enumeration split across fragment ranges ---------------------
 struct WindowEnumerationBench {

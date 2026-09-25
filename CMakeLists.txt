@@ -287,6 +287,11 @@ if(PANVAR_BUILD_TESTING)
         target_link_libraries(genotype_union_placement_cache_test PRIVATE panvarlib)
         target_compile_options(genotype_union_placement_cache_test PRIVATE -Wall -Wextra -Wpedantic)
         add_test(NAME panvar_genotype_union_placement_cache COMMAND genotype_union_placement_cache_test)
+        # The seeding path's exact optimisations against the paths they replaced.
+        add_executable(genotype_seeding_exactness_test tests/genotype_seeding_exactness.cpp)
+        target_link_libraries(genotype_seeding_exactness_test PRIVATE panvarlib)
+        target_compile_options(genotype_seeding_exactness_test PRIVATE -Wall -Wextra -Wpedantic)
+        add_test(NAME panvar_genotype_seeding_exactness COMMAND genotype_seeding_exactness_test)
 
         add_executable(genotype_mosaic_proposal_test tests/genotype_mosaic_proposal.cpp)
         target_link_libraries(genotype_mosaic_proposal_test PRIVATE panvarlib)
