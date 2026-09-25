@@ -1703,6 +1703,9 @@ public:
     // Bytes currently held by transient sequences, mass columns and censuses, so a caller can check
     // that storage returns to its previous level after every round instead of trusting that it does.
     std::uint64_t transient_payload_bytes() const;
+    // What one slot holds right now -- sequence, reversed copy, segment, mass column and census -- counted exactly as
+    // transient_payload_bytes counts it; 0 for a released slot. What a caller keeping the slot alive retains.
+    std::uint64_t slot_payload_bytes(std::size_t slot) const;
     std::uint64_t retained_census_bytes() const;
 
 private:

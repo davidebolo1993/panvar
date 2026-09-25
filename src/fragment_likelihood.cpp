@@ -8833,6 +8833,19 @@ std::uint64_t PreparedScoringContext::transient_payload_bytes() const {
     return total;
 }
 
+std::uint64_t PreparedScoringContext::slot_payload_bytes(std::size_t slot) const {
+    const State& state = *state_;
+    if (slot >= state.sequences.size()) throw std::invalid_argument("payload requested for an unknown haplotype");
+    if (state.sequences[slot].empty() && state.mass_column[slot].empty() && state.segments.count(slot) == 0) return 0;
+    std::uint64_t total = state.sequences[slot].capacity() + state.reversed[slot].capacity();
+    const auto segment = state.segments.find(slot);
+    if (segment != state.segments.end()) total += segment->second.replacement.capacity() + sizeof(SegmentedSequence);
+    total += static_cast<std::uint64_t>(state.mass_column[slot].capacity()) * sizeof(double);
+    const auto census = state.censuses.find(slot);
+    if (census != state.censuses.end()) total += census->second.payload_bytes();
+    return total;
+}
+
 std::uint64_t PreparedScoringContext::retained_census_bytes() const {
     std::uint64_t total = 0;
     for (const auto& item : state_->censuses) total += item.second.payload_bytes();

@@ -2361,6 +2361,34 @@ void test_tie_branching_engine() {
             "one branch below what the ties need refuses");
     require(capped.verdict.status == "REPAIR_INCOMPLETE" && capped.verdict.no_call_reason == "tie_branching_incomplete",
             "incompleteness -> REPAIR_INCOMPLETE tie_branching_incomplete");
+    // 5b. the cap is proven insufficient, not exhausted: once a0 splits the worklist holds four unique starts against
+    // a cap of three, so the search stops right there -- no further branch runs and no further tie is seen.
+    require(capped.ran.size() == 1 && capped.ran[0] == identity_text(a0) && capped.report.branches.size() == 1 &&
+                capped.report.ties.size() == 2,
+            "the cap-bound search stops as soon as its unique starts exceed the cap, running nothing after that");
+    require(capped.report.incomplete.find("at least 4 branches required; proven after 1 branches") != std::string::npos,
+            "the refusal names the proven lower bound and where it was proven");
+    {
+        // A root tie alone wider than the cap: refused before any branch runs.
+        const TieRun root_only = run_scripted(nested, root, 1, false);
+        require(root_only.ran.empty() && root_only.report.branches.empty() &&
+                    root_only.report.incomplete.find("branch cap 1 binds (at least 2") != std::string::npos,
+                "a root tie wider than the cap is refused before any branch runs");
+        // Reversed order reaches the same verdict (it may prove it at a different branch).
+        const TieRun capped_reversed = run_scripted(nested, root, 3, true);
+        require(capped_reversed.verdict.status == capped.verdict.status &&
+                    capped_reversed.verdict.no_call_reason == capped.verdict.no_call_reason &&
+                    capped_reversed.report.incomplete.find("branch cap 3 binds") != std::string::npos,
+                "forward and reversed enumeration reach the same cap-bound verdict");
+        // The semantics are those of any other incomplete branching (a throwing branch below).
+        ScriptedTies s = nested;
+        s.throw_for = identity_text(a1);
+        const TieRun thrown = run_scripted(s, root, 16, false);
+        require(thrown.verdict.status == capped.verdict.status && thrown.verdict.call_class == capped.verdict.call_class &&
+                    thrown.verdict.no_call_reason == capped.verdict.no_call_reason &&
+                    thrown.verdict.search_conditional == capped.verdict.search_conditional,
+                "a cap-bound stop has exactly the status, call class, reason and conditional of any incomplete branching");
+    }
     // 6. an exception inside a branch fails closed
     {
         ScriptedTies s = nested;

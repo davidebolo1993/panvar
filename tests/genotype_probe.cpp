@@ -5861,7 +5861,7 @@ int tie_branch(const Args& args) {
     }
     // DIAGNOSTIC-ONLY overrides (recorded in settings_overridden_after_profile): the repair round limit and the
     // run's wall limit, e.g. to ask whether a round-capped search converges given more rounds.
-    for (const char* key : {"repair-max-physical-origins", "repair-tie-max-branches", "repair-rounds",
+    for (const char* key : {"repair-max-physical-origins", "repair-tie-max-branches", "repair-tie-seed-cache-bytes", "repair-rounds",
                             "time-limit-seconds", "union-placement-cache-bytes",
                             "max-union-cached-placements-consumed", "union-origin-cache-bytes",
                             "max-union-cached-origins-consumed", "max-union-cached-states-consumed",
@@ -5872,6 +5872,7 @@ int tie_branch(const Args& args) {
         const std::string name_of = key;
         if (name_of == "repair-max-physical-origins") options.repair_max_physical_origins = std::stoull(value);
         else if (name_of == "repair-tie-max-branches") options.repair_tie_max_branches = std::stoul(value);
+        else if (name_of == "repair-tie-seed-cache-bytes") options.repair_tie_seed_cache_bytes = std::stoull(value);
         else if (name_of == "repair-rounds") options.repair_rounds = std::stoul(value);
         else if (name_of == "union-placement-cache-bytes") options.union_placement_cache_bytes = std::stoull(value);
         else if (name_of == "max-union-cached-placements-consumed") {

@@ -1438,6 +1438,15 @@ TieBranchingReport run_tie_branching(const TieSet& root, const std::vector<Diplo
     }
     settled(-1);
     for (std::size_t next = 0; next < worklist.size(); ++next) {
+        // Every unique start in the worklist -- run or waiting -- needs a branch of its own, so once there are more of
+        // them than the cap allows, completing within the cap is impossible: fail closed now, before any further
+        // seed is materialised or scored. With the worklist at or below the cap the search proceeds unchanged.
+        if (worklist.size() > max_branches) {
+            report.incomplete = "branch cap " + std::to_string(max_branches) + " binds (at least " +
+                                std::to_string(worklist.size()) + " branches required; proven after " +
+                                std::to_string(report.branches.size()) + " branches)";
+            break;
+        }
         if (report.branches.size() >= max_branches) {
             report.incomplete = "branch cap " + std::to_string(max_branches) + " binds (" +
                                 std::to_string(worklist.size()) + " branches required)";

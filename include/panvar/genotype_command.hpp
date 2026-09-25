@@ -116,6 +116,10 @@ struct GenotypeCommandOptions {
     // exact block delta of a promoted repair; every candidate joins the pool and the pooled rule decides.
     bool repair_tie_branching = false;
     std::size_t repair_tie_max_branches = 16;
+    // Bytes of pending tie-branch seeds kept as census-holding slots (built by the exact block delta when their tie is
+    // recorded, admitted in canonical tie order while they fit, released when their branch runs); every other seed is
+    // materialised just in time. 0 (the default): no seed is kept, the census-free frontier.
+    std::uint64_t repair_tie_seed_cache_bytes = 0;
     bool test_reverse_tie_branch_order = false;   // gate hook only: the pooled result must not depend on it
     // Representation-conflict quality guard (an annotation; it never changes a call, a score or a phase).
     // A called block is LOWQUAL_REPRESENTATION_CONFLICT when the marker (depth) channel prefers another

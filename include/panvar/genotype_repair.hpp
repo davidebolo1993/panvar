@@ -437,7 +437,9 @@ struct TieBranchingReport {
 // `run_branch` runs one branch to its stop; an exception it throws makes the run incomplete. `on_tie` is
 // called for every recorded tie before any of its branches runs -- immediately after the branch that stopped
 // at it returns, so that branch's state is still live -- and may throw (fail closed). `reverse` is a gate
-// hook only: it reverses the order within every tie, which must not change the pooled result.
+// hook only: it reverses the order within every tie, which must not change the pooled result. The cap is exact:
+// the search stops incomplete as soon as the worklist holds more unique starts than `max_branches` (each needs a
+// branch), and never earlier; a worklist of exactly `max_branches` starts runs to its end.
 TieBranchingReport run_tie_branching(const TieSet& root, const std::vector<DiplotypeIdentity>& root_history,
                                      std::size_t max_branches, std::size_t fragments, std::size_t mismatch_band,
                                      const std::function<BranchResult(const BranchStart&)>& run_branch,

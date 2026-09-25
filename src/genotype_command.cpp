@@ -476,6 +476,9 @@ struct RepairReport {
     double seconds_tie_seed_placement = 0.0;
     std::size_t tie_seed_peak_live_censuses = 0;
     std::size_t tie_peak_pending_descriptors = 0;
+    std::uint64_t tie_seed_cache_built = 0, tie_seed_cache_admitted = 0, tie_seed_cache_rejected = 0;
+    std::uint64_t tie_seed_cache_hits = 0, tie_seed_cache_physical_origins = 0, tie_seed_cache_peak_bytes = 0;
+    double seconds_tie_seed_cache_build = 0.0;
     // The representation-conflict guard, over the called blocks (NA for a no-call: never relabelled LowQual).
     std::string locus_filter = "NA";
     std::string lowqual_blocks = "none";
@@ -516,9 +519,11 @@ void write_repair_report(std::ostream& out, const RepairReport& r) {
     out << "call_class\t" << r.call_class << "\nno_call_reason\t" << r.no_call_reason << '\n';
     out << "search_conditional\t" << r.search_conditional << "\nrepair_tie_branching\t"
         << (o.repair_tie_branching ? "true" : "false") << "\nrepair_tie_max_branches\t" << o.repair_tie_max_branches
+        << "\nrepair_tie_seed_cache_bytes\t" << o.repair_tie_seed_cache_bytes
         << "\ntie_branch_order\t" << kTieBranchOrder << "\ntie_branch_seeding\t"
         << (o.test_eager_branch_seeds || o.test_retain_branch_parents ? "eager_delta_promoted_shared_context"
-                                                                       : "census_free_just_in_time_shared_context")
+            : o.repair_tie_seed_cache_bytes > 0 ? "bounded_seed_cache_then_just_in_time_shared_context"
+                                                : "census_free_just_in_time_shared_context")
         << "\ntie_branched\t" << (r.tie_branched ? "true" : "false") << "\ntie_ties\t" << r.tie_ties
         << "\ntie_branches_run\t" << r.tie_branches_run << "\ntie_distinct_terminal_genotypes\t"
         << r.tie_distinct_terminal_genotypes << "\ntie_incomplete_reason\t" << r.tie_incomplete_reason
@@ -530,7 +535,10 @@ void write_repair_report(std::ostream& out, const RepairReport& r) {
         << "\ntie_seed_piece_hits\t" << r.tie_seed_piece_hits << "\ntie_seed_latent_pairs\t" << r.tie_seed_latent_pairs
         << "\nseconds_tie_seed_placement\t" << r.seconds_tie_seed_placement << "\ntie_seed_peak_live_censuses\t"
         << r.tie_seed_peak_live_censuses << "\ntie_peak_pending_descriptors\t" << r.tie_peak_pending_descriptors
-        << '\n';
+        << "\ntie_seed_cache_built\t" << r.tie_seed_cache_built << "\ntie_seed_cache_admitted\t" << r.tie_seed_cache_admitted
+        << "\ntie_seed_cache_rejected\t" << r.tie_seed_cache_rejected << "\ntie_seed_cache_hits\t" << r.tie_seed_cache_hits
+        << "\ntie_seed_cache_physical_origins\t" << r.tie_seed_cache_physical_origins << "\ntie_seed_cache_peak_bytes\t"
+        << r.tie_seed_cache_peak_bytes << "\nseconds_tie_seed_cache_build\t" << r.seconds_tie_seed_cache_build << '\n';
     out << "representation_guard\t" << (o.representation_guard ? "true" : "false") << "\nrepresentation_guard_rule\t"
         << kRepresentationRule << "\nrepresentation_guard_bound_nats\t" << kRepresentationBoundNats << "\nlocus_filter\t"
         << r.locus_filter << "\nlowqual_blocks\t" << r.lowqual_blocks << "\nnot_evaluated_blocks\t"
@@ -1115,6 +1123,7 @@ void apply_genotype_profile(const std::string& path, GenotypeCommandOptions& opt
             options.repair_tie_branching = value == "1";
         }
         else if (key == "repair_tie_max_branches") options.repair_tie_max_branches = u();
+        else if (key == "repair_tie_seed_cache_bytes") options.repair_tie_seed_cache_bytes = u();
         else if (key == "union_placement_cache_bytes") options.union_placement_cache_bytes = u();
         else if (key == "max_union_cached_placements_consumed") options.max_union_cached_placements_consumed = u();
         else if (key == "union_origin_cache_bytes") options.union_origin_cache_bytes = u();
@@ -2415,9 +2424,16 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
             // and pinned until its branch has run.
             const bool legacy_lifetime = options.test_retain_branch_parents;   // the pre-fix lifetime, test hook
             const bool eager_seeds = options.test_eager_branch_seeds || legacy_lifetime;
-            std::map<DiplotypeIdentity, std::pair<std::size_t, std::size_t>> seed_slots;   // eager only
+            // The bounded seed cache: seeds built by block delta when their tie is recorded, admitted in canonical tie
+            // order while their slots' exact payload fits the budget, held until their branch runs. The eager frontier
+            // is the same cache without a budget.
+            const std::uint64_t seed_cache_budget =
+                eager_seeds ? std::numeric_limits<std::uint64_t>::max() : options.repair_tie_seed_cache_bytes;
+            std::map<DiplotypeIdentity, std::pair<std::size_t, std::size_t>> seed_slots;   // cached seeds
             std::set<std::size_t> legacy_parent_pins;
-            std::map<std::size_t, std::size_t> seed_pins;   // eager only: slot -> seeds still waiting on it
+            std::map<std::size_t, std::size_t> seed_pins;        // slot -> cached seeds still waiting on it
+            std::map<std::size_t, std::uint64_t> seed_slot_bytes;   // slot -> its payload when first pinned
+            std::uint64_t seed_cache_bytes = 0;
             std::set<DiplotypeIdentity> announced;          // every start a tie offered, as the worklist dedupes
             std::set<DiplotypeIdentity> pending;            // announced and not yet run: the frontier
             std::unique_ptr<CoordinateRepairSearch> live;   // the branch that ran last, alive for its own tie
@@ -2434,7 +2450,7 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
                              "segment_bytes\tmass_column_bytes\tcensus_count\tcensus_bytes\torigin_cache_payload\t"
                              "origin_cache_capacity\tmerge_working_bytes\tlogical_total\tcapacity_total\tphys_footprint\t"
                              "phys_footprint_peak\tpending_seed_slots\tpending_seeds\tseeding\tpending_descriptors\t"
-                             "cumulative_physical_origins\n";
+                             "cumulative_physical_origins\tseed_cache_bytes\n";
             const auto ledger_row = [&](const char* event, long branch) {
                 const ContextMemoryAccount account = shared->memory_account();
                 const FootprintSample footprint = physical_footprint();
@@ -2452,8 +2468,9 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
                               << account.logical_total << '\t' << account.capacity_total << '\t' << footprint.current
                               << '\t' << footprint.peak << '\t' << seed_pins.size() << '\t'
                               << (waiting.empty() ? "none" : waiting) << '\t'
-                              << (eager_seeds ? "eager" : "just_in_time") << '\t' << pending.size() << '\t'
-                              << shared->cumulative_counters().physical_origins << '\n';
+                              << (eager_seeds ? "eager" : seed_cache_budget > 0 ? "seed_cache" : "just_in_time") << '\t'
+                              << pending.size() << '\t' << shared->cumulative_counters().physical_origins << '\t'
+                              << seed_cache_bytes << '\n';
                 atomic_write(prefix + ".tie_branch_memory.partial.tsv", branch_memory.str());
             };
             const auto settle = [&](long branch) {
@@ -2469,74 +2486,61 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
             };
             const auto on_tie = [&](const TieSet& tie) {
                 if (shared == nullptr) throw std::runtime_error("no production scoring context to branch from");
+                std::vector<const TieItem*> fresh;   // starts this tie offers first, in canonical tie order
                 for (const TieItem& n : tie.tied) {
                     const DiplotypeIdentity key = diplotype_identity(n.first, n.second);
-                    if (announced.insert(key).second) pending.insert(key);
+                    if (announced.insert(key).second) {
+                        pending.insert(key);
+                        fresh.push_back(&n);
+                    }
                 }
                 report.tie_peak_pending_descriptors = std::max(report.tie_peak_pending_descriptors, pending.size());
-                if (!eager_seeds) return;
+                if (seed_cache_budget == 0) return;
                 CoordinateRepairSearch& parent = tie.branch < 0 ? *search : *live;
                 if (legacy_lifetime) {
                     legacy_parent_pins.insert(parent.incumbent_slot_first());
                     legacy_parent_pins.insert(parent.incumbent_slot_second());
                 }
-                for (const TieItem& n : tie.tied) {
-                    const DiplotypeIdentity key = diplotype_identity(n.first, n.second);
-                    if (seed_slots.count(key) != 0) continue;
+                for (const TieItem* n : fresh) {
+                    const DiplotypeIdentity key = diplotype_identity(n->first, n->second);
                     const Clock::time_point seed_mark = Clock::now();
-                    const FragmentScoringCounters before = shared->cumulative_counters();
-                    const std::size_t slots_before = shared->haplotypes_created();
-                    const auto slots = parent.seed_neighbour_by_delta(n.first, n.second);
-                    const FragmentScoringCounters& after = shared->cumulative_counters();
-                    ++report.tie_seeds_materialised;
-                    report.tie_seed_haplotypes_placed += shared->haplotypes_created() - slots_before;
-                    report.tie_seed_physical_origins += after.physical_origins - before.physical_origins;
-                    report.tie_seed_state_classes += after.statistical_state_classes - before.statistical_state_classes;
-                    report.tie_seed_piece_hits += after.piece_hits - before.piece_hits;
-                    report.tie_seed_latent_pairs += after.latent_alignment_pairs - before.latent_alignment_pairs;
-                    report.seconds_tie_seed_placement += seconds_since(seed_mark);
+                    const std::uint64_t before = shared->cumulative_counters().physical_origins;
+                    const auto slots = parent.seed_neighbour_by_delta(n->first, n->second);
+                    ++report.tie_seed_cache_built;
+                    report.tie_seed_cache_physical_origins += shared->cumulative_counters().physical_origins - before;
+                    report.seconds_tie_seed_cache_build += seconds_since(seed_mark);
+                    // What admitting it retains: every slot it needs that no admitted seed already holds, exactly.
+                    std::uint64_t added = 0;
+                    std::map<std::size_t, std::uint64_t> new_slots;
+                    for (const std::size_t slot : {slots.first, slots.second}) {
+                        if (seed_pins.count(slot) != 0 || new_slots.count(slot) != 0) continue;
+                        new_slots[slot] = shared->slot_payload_bytes(slot);
+                        added += new_slots[slot];
+                    }
+                    if (!eager_seeds && added > seed_cache_budget - seed_cache_bytes) {
+                        ++report.tie_seed_cache_rejected;   // released at the next settle point; runs just in time
+                        continue;
+                    }
+                    ++report.tie_seed_cache_admitted;
+                    seed_cache_bytes += added;
+                    seed_slot_bytes.insert(new_slots.begin(), new_slots.end());
+                    report.tie_seed_cache_peak_bytes = std::max(report.tie_seed_cache_peak_bytes, seed_cache_bytes);
                     seed_slots.emplace(key, slots);
                     ++seed_pins[slots.first];
                     if (slots.second != slots.first) ++seed_pins[slots.second];
                 }
-                // Every pending seed holds its census until its branch runs.
+                // Every cached seed holds its census until its branch runs.
                 report.tie_seed_peak_live_censuses = std::max(report.tie_seed_peak_live_censuses, seed_pins.size());
             };
-            // Just in time: the branch's two haplotypes spelled from its allele paths, placed in the shared context by
-            // the ordinary exact path (so the work counts against the cumulative caps), their censuses retained, and
-            // the declared complete score reproduced bit for bit before any neighbour is scored. Any failure throws,
-            // which fails the branching closed as tie_branching_incomplete.
-            const auto materialise = [&](const BranchStart& branch) {
-                const std::string which = "branch " + std::to_string(branch.id) + " seed";
-                const Clock::time_point seed_mark = Clock::now();
-                const FragmentScoringCounters before = shared->cumulative_counters();
-                const HaplotypeSequence a = spell_mosaic(model, MosaicPath{branch.start.first});
-                const HaplotypeSequence b = spell_mosaic(model, MosaicPath{branch.start.second});
-                if (!(sequence_digest(a.bases) == branch.start.first_sequence) ||
-                    !(sequence_digest(b.bases) == branch.start.second_sequence)) {
-                    throw std::runtime_error(which + " does not spell its recorded sequences");
-                }
-                std::vector<std::size_t> slots;
-                IncrementalBatchReport placed;
-                try {
-                    slots = shared->add_haplotypes({a.bases, b.bases}, &placed, true);
-                    shared->retain_census(slots[0]);
-                    if (slots[1] != slots[0]) shared->retain_census(slots[1]);
-                } catch (const std::exception& error) {
-                    throw std::runtime_error(which + " could not be materialised: " + error.what());
-                }
-                const FragmentScoringCounters& after = shared->cumulative_counters();
-                ++report.tie_seeds_materialised;
-                report.tie_seed_haplotypes_placed += placed.haplotypes_new;
-                report.tie_seed_physical_origins += after.physical_origins - before.physical_origins;
-                report.tie_seed_state_classes += after.statistical_state_classes - before.statistical_state_classes;
-                report.tie_seed_piece_hits += after.piece_hits - before.piece_hits;
-                report.tie_seed_latent_pairs += after.latent_alignment_pairs - before.latent_alignment_pairs;
+            // A branch start, just materialised or taken from the cache, must reproduce its declared complete score --
+            // every component and the prior -- bit for bit before any neighbour is scored; otherwise the branching
+            // fails closed as tie_branching_incomplete.
+            const auto verify_start = [&](const BranchStart& branch, std::size_t slot_a, std::size_t slot_b,
+                                          const std::string& a, const std::string& b, const std::string& which) {
                 const FragmentScoringResult scored =
-                    shared->score_candidates({{std::min(slots[0], slots[1]), std::max(slots[0], slots[1])}});
+                    shared->score_candidates({{std::min(slot_a, slot_b), std::max(slot_a, slot_b)}});
                 const DiplotypeScore& score = scored.scores.front();
-                const double prior = log_unordered_sequence_pair_prior(model, a.bases, b.bases, seed_switches);
-                report.seconds_tie_seed_placement += seconds_since(seed_mark);
+                const double prior = log_unordered_sequence_pair_prior(model, a, b, seed_switches);
                 DiplotypeScore declared = branch.start.score;
                 if (options.test_perturb_branch_seed == static_cast<long>(branch.id)) {
                     // Gate hook: a declared score one ulp off, which the reproduction guard must refuse.
@@ -2552,8 +2556,45 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
                         << " + " << prior;
                     throw std::runtime_error(why.str());
                 }
-                // Only the running branch's start holds a seed census: nothing is pending in the context.
-                const std::size_t live_seeds = slots[1] != slots[0] ? 2 : 1;
+            };
+            const auto spell_start = [&](const BranchStart& branch, const std::string& which) {
+                HaplotypeSequence a = spell_mosaic(model, MosaicPath{branch.start.first});
+                HaplotypeSequence b = spell_mosaic(model, MosaicPath{branch.start.second});
+                if (!(sequence_digest(a.bases) == branch.start.first_sequence) ||
+                    !(sequence_digest(b.bases) == branch.start.second_sequence)) {
+                    throw std::runtime_error(which + " does not spell its recorded sequences");
+                }
+                return std::make_pair(std::move(a.bases), std::move(b.bases));
+            };
+            // Just in time: the branch's two haplotypes spelled from its allele paths, placed in the shared context by
+            // the ordinary exact path (so the work counts against the cumulative caps), their censuses retained, and
+            // the declared complete score reproduced bit for bit before any neighbour is scored. Any failure throws,
+            // which fails the branching closed as tie_branching_incomplete.
+            const auto materialise = [&](const BranchStart& branch) {
+                const std::string which = "branch " + std::to_string(branch.id) + " seed";
+                const Clock::time_point seed_mark = Clock::now();
+                const FragmentScoringCounters before = shared->cumulative_counters();
+                const auto spelled = spell_start(branch, which);
+                std::vector<std::size_t> slots;
+                IncrementalBatchReport placed;
+                try {
+                    slots = shared->add_haplotypes({spelled.first, spelled.second}, &placed, true);
+                    shared->retain_census(slots[0]);
+                    if (slots[1] != slots[0]) shared->retain_census(slots[1]);
+                } catch (const std::exception& error) {
+                    throw std::runtime_error(which + " could not be materialised: " + error.what());
+                }
+                const FragmentScoringCounters& after = shared->cumulative_counters();
+                ++report.tie_seeds_materialised;
+                report.tie_seed_haplotypes_placed += placed.haplotypes_new;
+                report.tie_seed_physical_origins += after.physical_origins - before.physical_origins;
+                report.tie_seed_state_classes += after.statistical_state_classes - before.statistical_state_classes;
+                report.tie_seed_piece_hits += after.piece_hits - before.piece_hits;
+                report.tie_seed_latent_pairs += after.latent_alignment_pairs - before.latent_alignment_pairs;
+                report.seconds_tie_seed_placement += seconds_since(seed_mark);
+                verify_start(branch, slots[0], slots[1], spelled.first, spelled.second, which);
+                // The running branch's start and the cached seeds are the only seed censuses in the context.
+                const std::size_t live_seeds = (slots[1] != slots[0] ? 2 : 1) + seed_pins.size();
                 report.tie_seed_peak_live_censuses = std::max(report.tie_seed_peak_live_censuses, live_seeds);
                 ledger_row("seed_materialised", static_cast<long>(branch.id));
                 return std::make_pair(slots[0], slots[1]);
@@ -2568,7 +2609,19 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
                 const std::uint64_t before = shared->cumulative_counters().physical_origins;
                 const DiplotypeIdentity key = diplotype_identity(branch.start.first, branch.start.second);
                 pending.erase(key);
-                const auto seeded = eager_seeds ? seed_slots.at(key) : materialise(branch);
+                const auto cached = seed_slots.find(key);
+                const bool hit = cached != seed_slots.end();
+                std::pair<std::size_t, std::size_t> seeded;
+                if (hit) {
+                    ++report.tie_seed_cache_hits;
+                    seeded = cached->second;
+                    const std::string which = "branch " + std::to_string(branch.id) + " cached seed";
+                    const auto spelled = spell_start(branch, which);
+                    verify_start(branch, seeded.first, seeded.second, spelled.first, spelled.second, which);
+                    ledger_row("seed_cached", static_cast<long>(branch.id));
+                } else {
+                    seeded = materialise(branch);
+                }
                 live = std::make_unique<CoordinateRepairSearch>(model, emissions, fragments, library, repair_scoring,
                                                                 branch_options);
                 live->attach_context(shared);
@@ -2591,11 +2644,18 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
                                          std::to_string(round.index) + " committed");
                 };
                 const bool branch_reproduced = live->run(hooks);
-                for (const std::size_t slot : {seeded.first, seeded.second}) {
-                    if (!eager_seeds) break;
-                    const auto pin = seed_pins.find(slot);
-                    if (pin != seed_pins.end() && --pin->second == 0) seed_pins.erase(pin);
-                    if (seeded.second == seeded.first) break;
+                if (hit) {
+                    // Consumed: the seed leaves the cache, and each slot no other cached seed holds with it.
+                    seed_slots.erase(key);
+                    for (const std::size_t slot : {seeded.first, seeded.second}) {
+                        const auto pin = seed_pins.find(slot);
+                        if (pin != seed_pins.end() && --pin->second == 0) {
+                            seed_pins.erase(pin);
+                            seed_cache_bytes -= seed_slot_bytes.at(slot);
+                            seed_slot_bytes.erase(slot);
+                        }
+                        if (seeded.second == seeded.first) break;
+                    }
                 }
                 out.rounds = live->rounds().size();
                 for (const RepairRound& round : live->rounds()) {
@@ -2643,6 +2703,9 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
             // the content-keyed origin and emission caches stay for the representation guard.
             if (shared != nullptr && !shared->refused()) {
                 seed_pins.clear();
+                seed_slots.clear();
+                seed_slot_bytes.clear();
+                seed_cache_bytes = 0;
                 legacy_parent_pins.clear();
                 shared->release_transient({});
                 ledger_row("branching_closed", -1);
@@ -4202,6 +4265,7 @@ int run_genotype_command(const std::vector<std::string>& args) {
         else if (flag == "--max-mosaic-candidates") options.max_mosaic_candidates = std::stoul(need(i));
         // The repair's planned origin-cache budget, for a diagnostic comparison; recorded as an override.
         else if (flag == "--repair-origin-cache-bytes") options.repair_origin_cache_bytes = std::stoull(need(i));
+        else if (flag == "--repair-tie-seed-cache-bytes") options.repair_tie_seed_cache_bytes = std::stoull(need(i));
         else if (flag == "--max-candidates") {
             throw std::runtime_error("--max-candidates is now --max-mosaic-candidates: every panel diplotype is "
                                      "always a candidate, and K counts only the off-panel mosaics added to it");
@@ -4263,6 +4327,10 @@ int run_genotype_command(const std::vector<std::string>& args) {
             if (flag == "--repair-origin-cache-bytes") {
                 options.overridden_settings.push_back("repair_origin_cache_bytes=" +
                                                       std::to_string(options.repair_origin_cache_bytes));
+            }
+            if (flag == "--repair-tie-seed-cache-bytes") {
+                options.overridden_settings.push_back("repair_tie_seed_cache_bytes=" +
+                                                      std::to_string(options.repair_tie_seed_cache_bytes));
             }
         }
     }
