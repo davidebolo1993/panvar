@@ -114,8 +114,10 @@ plan() {
   profile_chain || exit 1
   build_commit="$(production_build "$build")" || exit 1
   # A fresh directory, named from the build: never the frozen v1 campaign, never one a campaign has run in.
-  local resolved; resolved="$(cd "$(dirname "$out")" 2>/dev/null && pwd)/$(basename "$out")"
+  mkdir -p "$(dirname "$out")"
+  local resolved; resolved="$(cd "$(dirname "$out")" && pwd)/$(basename "$out")"
   [ "$resolved" != "$OLD_CAMPAIGN" ] || { echo "REFUSED: $out is the frozen bc5dd97 campaign" >&2; exit 1; }
+  out="$resolved"   # every path in jobs.tsv is absolute, so the runner may be started from anywhere
   [ "$(basename "$out")" = "genotype_c4_production_${build_commit:0:7}" ] \
     || { echo "REFUSED: the plan directory must be named genotype_c4_production_${build_commit:0:7}" >&2; exit 1; }
   local used

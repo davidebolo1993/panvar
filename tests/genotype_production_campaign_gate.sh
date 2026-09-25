@@ -54,6 +54,10 @@ same "jobs_sha256 is jobs.tsv's" "$(key "$S" jobs_sha256)" "$(sha "$PLAN/jobs.ts
 same "launched" "$(key "$S" launched)" "false"
 same "HG00096 LOO jobs" "$(awk -F'\t' '$2=="loo" && $3=="HG00096"' "$PLAN/jobs.tsv" | wc -l | tr -d ' ')" "0"
 same "coverages per subject" "$(awk -F'\t' 'NR>1{print $4}' "$PLAN/jobs.tsv" | sort -un | tr '\n' ' ')" "2 5 10 30 "
+# Path columns: model, reads, library, curation, truth, the three sources, and the output prefix.
+same "every path in jobs.tsv is absolute" "$(awk -F'\t' 'NR>1{for(i=7;i<=18;i++) if(i!=16 && i!=17 && $i!="none" && $i!="harness" && substr($i,1,1)!="/") n++} END{print n+0}' "$PLAN/jobs.tsv")" "0"
+(cd "$WORK" && bash "$HARNESS" plan "rel/genotype_c4_production_$P7" "$WORK/prod/build" > "$WORK/plan_rel.log" 2>&1)
+same "a relative plan directory yields absolute job paths" "$(awk -F'\t' 'NR==2{print substr($18,1,1)}' "$WORK/rel/genotype_c4_production_$P7/jobs.tsv")" "/"
 same "every job writes inside the plan directory" "$(awk -F'\t' -v p="$PLAN/" 'NR>1 && index($18, p)!=1' "$PLAN/jobs.tsv" | wc -l | tr -d ' ')" "0"
 
 echo "== profiles and provenance"
