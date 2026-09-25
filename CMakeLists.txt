@@ -376,6 +376,9 @@ if(PANVAR_BUILD_TESTING)
         # The v5 campaign-local profile differs from v4 by exactly the reviewed speed and memory settings.
         add_test(NAME panvar_genotype_v5_profile
                  COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/genotype_v5_profile_gate.sh)
+        # The v6 campaign-local profile differs from v5 only in the measured repair origin-cache budget.
+        add_test(NAME panvar_genotype_v6_profile
+                 COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/genotype_v6_profile_gate.sh)
 
         # repair-pilot's construction and certification must not depend on candidate order or on which
         # homologue of a seed is written first. Both are checked from the scores its single pass already

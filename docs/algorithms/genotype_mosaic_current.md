@@ -646,6 +646,27 @@ fail-closed values); the e2e test checks every block table its runs write (69 ta
 sealed `loo.NA19434.30` table derives 7 PASS and 4 LOW_QUALITY blocks (ctx:0, sv:1, sv:7, ctx:8, each
 no_read_support), matching its high-quality view.
 
+## v6: repair origin-cache budget 768 MiB (2026-09-25)
+
+`profiles/genotype_c4_v6_campaign_local.tsv` is v5 key for key except `repair_origin_cache_bytes` 805306368 (768 MiB;
+v5 384 MiB); `panvar_genotype_v6_profile` proves that is the whole difference. v5 stays frozen; no global default moved.
+`panvar genotype --repair-origin-cache-bytes` overrides the budget and is recorded as an override.
+
+- **Analysis from the sealed v5 pilot ledgers (projection).** With 384 MiB, rounds 2-6 of the main search each spent
+  7.4-9.0 s re-enumerating windows the planned cache could not keep (43.2 s in all; 264-303 distinct windows a round,
+  180-216 retained, 67-88 unselected); round 1's demand was 1.9 GB over 297 windows. The repair phase peaked at 2.57 GiB
+  and the process at 3.37 GiB (union). A byte-proportional projection gave 768 MiB -11.7% total and -13.9% repair,
+  with a footprint of at most 3.37 GiB; 768 MiB, the largest listed budget under 3.85 GiB, was chosen for the pilot.
+  The branches have no per-round ledger, so their share was an assumption.
+- **Comparison pilot (measured)**, `loo.NA19434.30`, v5 profile with only the budget overridden, clean f43710a build:
+  union ranking, pooled candidates, scores and winner, the six-round main trajectory, branch starts, rounds, stops and
+  terminals, genotype and block tables (apart from the new quality columns), the equivalence set and FASTA identical;
+  the sealed evaluation identical (distance 26,430, floor 219, excess 26,211; high quality 7 blocks, excess 0).
+  Repair 164.0 -> 127.7 s (-22.1%), total 194.8 -> 159.0 s (-18.4%), CPU 920 -> 716 s; re-enumeration 7.4-9.0 ->
+  5.8-6.0 s a round; branches 67.2 -> 45.3 s; repair physical origins 1.061e9 -> 0.822e9. Footprint 3.54 GiB (repair
+  phase 2.57 -> 3.43 GiB): the projection's 3.37 GiB was low -- the cache's growth cost ~2.2x its bytes -- but it
+  stays under 3.85 GiB.
+
 ## Frozen defaults
 
 State limit **256** (production) and **1,024** (diagnostic comparison width) -- counted in allele-prefix
