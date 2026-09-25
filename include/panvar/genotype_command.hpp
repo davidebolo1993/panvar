@@ -128,6 +128,12 @@ struct GenotypeCommandOptions {
     // The cap bounds cached placements CONSUMED over the union pass (0: none); crossing it refuses.
     std::size_t union_placement_cache_bytes = 0;
     std::uint64_t max_union_cached_placements_consumed = 0;
+    // Exact union origin reuse, on top of placement reuse (performance only; every score is the reference's bit for
+    // bit). 0: off. When on, both consumption caps must be positive: served origins and served state aggregates
+    // are not executed work and are bounded apart, and crossing either refuses with no ranking.
+    std::size_t union_origin_cache_bytes = 0;
+    std::uint64_t max_union_cached_origins_consumed = 0;
+    std::uint64_t max_union_cached_states_consumed = 0;
     // Gate hooks only, never settings: score every competitor in the live context even when the pool holds
     // it (the outside-pool path), and replace the declared threshold (NaN: kRepresentationBoundNats).
     bool test_representation_guard_force_context = false;
@@ -169,6 +175,9 @@ struct GenotypeCommandOptions {
     // MEASUREMENT ONLY: <prefix>.union_haplotype_work.tsv, the union pass's placement work per unique haplotype
     // (panel or mosaic), written whether the pass completes or refuses. Changes no score, order or counter.
     bool diagnostic_union_work_trace = false;
+    // DIAGNOSTIC ONLY: stop after the union pass is scored and ranked. Writes <prefix>.union_diagnostic_ranking.tsv
+    // and a status UNION_DIAGNOSTIC_ONLY; no repair, no genotype artefact, never a call.
+    bool diagnostic_union_only = false;
     // DIAGNOSTIC branch-speed pilot. Warm branches share the production search's scoring context: each
     // tied neighbour is created by the exact block delta of a promoted repair from its parent incumbent's
     // census (pinned, never mutated), instead of a fresh context placing the start in full. The digest
@@ -206,6 +215,9 @@ enum class GenotypeRunStatus {
     // Written by the watchdog as the process stops; a run never returns these.
     TimeLimit,
     ResourceRefusal,
+    // DIAGNOSTIC ONLY (diagnostic_union_only): the union pass was scored and ranked and the run stopped there --
+    // no repair, no genotype, no haplotype. Never a call.
+    UnionDiagnosticOnly,
 };
 
 const char* genotype_run_status_name(GenotypeRunStatus status);

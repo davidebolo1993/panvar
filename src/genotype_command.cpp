@@ -339,6 +339,7 @@ struct CandidateSetReport {
     bool observed_valid = false;
     // Exact union placement reuse, as the union pass reported it (or as far as it got before a refusal).
     UnionPlacementCacheReport union_placement_cache;
+    UnionOriginCacheReport union_origin_cache;
     // True when no beam ran at all: K = 0, no phase audit and no positive development prefix, so the
     // candidate set is exactly the panel and nothing about it is conditional on a search. Reported as
     // candidate_scope PANEL_ONLY, which is neither COMPLETE nor CONDITIONAL -- both of those describe
@@ -797,6 +798,30 @@ void write_status(
                 << "\nunion_placement_cache_index_bytes\t" << u.index_bytes
                 << "\nunion_placement_cache_peak_bytes\t" << u.peak_bytes
                 << "\nseconds_union_placement_cache_fill\t" << u.seconds_fill << '\n';
+            // Exact union origin reuse: served origins and aggregates are not executed work, so they are counted
+            // and capped here, apart from physical_origins and statistical_state_classes.
+            const UnionOriginCacheReport& o = candidate_set->union_origin_cache;
+            out << "union_origin_cache\t" << (o.active ? "on" : "off") << "\nunion_origin_cache_budget_bytes\t"
+                << o.budget_bytes << "\nmax_union_cached_origins_consumed\t" << o.max_origins_consumed
+                << "\nmax_union_cached_states_consumed\t" << o.max_states_consumed
+                << "\nunion_origin_cache_segment_occurrences\t" << o.segment_occurrences
+                << "\nunion_origin_cache_eligible_segments\t" << o.eligible_segments
+                << "\nunion_origin_cache_admitted_segments\t" << o.admitted_segments
+                << "\nunion_origin_cache_declined_segments\t" << o.declined_segments
+                << "\nunion_origin_cache_evictions\t" << o.evictions << "\nunion_origin_cache_hits\t" << o.hits
+                << "\nunion_origin_cache_misses\t" << o.misses
+                << "\nunion_origin_cache_origins_constructed\t" << o.origins_constructed
+                << "\nunion_origin_cache_state_aggregates_constructed\t" << o.state_aggregates_constructed
+                << "\nunion_origin_cache_latent_pairs_constructed\t" << o.latent_pairs_constructed
+                << "\nunion_origin_cache_valid_states_constructed\t" << o.valid_states_constructed
+                << "\nunion_origin_cache_origin_records_held\t" << o.origin_records_held
+                << "\nunion_origin_cache_origins_held\t" << o.origins_held
+                << "\nunion_cached_origins_consumed\t" << o.origins_consumed
+                << "\nunion_cached_states_consumed\t" << o.states_consumed
+                << "\nunion_origin_cache_payload_bytes\t" << o.payload_bytes
+                << "\nunion_origin_cache_index_bytes\t" << o.index_bytes
+                << "\nunion_origin_cache_peak_bytes\t" << o.peak_bytes
+                << "\nseconds_union_origin_cache_fill\t" << o.seconds_fill << '\n';
         }
         // Derived once, here, and used verbatim by every block row.
         out << "candidate_scope\t"
@@ -865,6 +890,12 @@ void write_status(
         out << "valid_fr_states\t" << counters.valid_fr_states << '\n';
         out << "physical_origins\t" << counters.physical_origins << '\n';
         out << "statistical_state_classes\t" << counters.statistical_state_classes << '\n';
+        // Served by union origin reuse, not executed (0 without it); merged_state_classes is the logical census.
+        out << "reused_physical_origins\t" << counters.reused_physical_origins << '\n';
+        out << "reused_state_aggregates\t" << counters.reused_state_aggregates << '\n';
+        out << "reused_latent_alignment_pairs\t" << counters.reused_latent_alignment_pairs << '\n';
+        out << "reused_valid_fr_states\t" << counters.reused_valid_fr_states << '\n';
+        out << "merged_state_classes\t" << counters.merged_state_classes << '\n';
     }
     out << std::fixed << std::setprecision(3);
     out << "seconds_model\t" << timings.model << '\n';
@@ -897,6 +928,7 @@ const char* genotype_run_status_name(GenotypeRunStatus status) {
         case GenotypeRunStatus::RepairIncomplete: return "REPAIR_INCOMPLETE";
         case GenotypeRunStatus::TimeLimit: return "TIME_LIMIT";
         case GenotypeRunStatus::ResourceRefusal: return "RESOURCE_REFUSAL";
+        case GenotypeRunStatus::UnionDiagnosticOnly: return "UNION_DIAGNOSTIC_ONLY";
     }
     return "MODEL_INCOMPLETE";
 }
@@ -987,6 +1019,9 @@ void apply_genotype_profile(const std::string& path, GenotypeCommandOptions& opt
         else if (key == "repair_tie_max_branches") options.repair_tie_max_branches = u();
         else if (key == "union_placement_cache_bytes") options.union_placement_cache_bytes = u();
         else if (key == "max_union_cached_placements_consumed") options.max_union_cached_placements_consumed = u();
+        else if (key == "union_origin_cache_bytes") options.union_origin_cache_bytes = u();
+        else if (key == "max_union_cached_origins_consumed") options.max_union_cached_origins_consumed = u();
+        else if (key == "max_union_cached_states_consumed") options.max_union_cached_states_consumed = u();
         else if (key == "representation_guard") {
             if (value != "0" && value != "1") throw std::runtime_error("profile " + path + ": 'representation_guard' is 0 or 1: " + value);
             options.representation_guard = value == "1";
@@ -1521,6 +1556,9 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
         scoring_options.union_segment_lengths = &union_segments;
         scoring_options.union_placement_cache_bytes = options.union_placement_cache_bytes;
         scoring_options.max_union_cached_placements_consumed = options.max_union_cached_placements_consumed;
+        scoring_options.union_origin_cache_bytes = options.union_origin_cache_bytes;
+        scoring_options.max_union_cached_origins_consumed = options.max_union_cached_origins_consumed;
+        scoring_options.max_union_cached_states_consumed = options.max_union_cached_states_consumed;
     }
     FragmentScoringResult scored;
     std::string rescore_failure;
@@ -1537,10 +1575,12 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
             candidate_report.threads_used_placement = scored.threads_used_placement;
             candidate_report.candidate_fragment_evaluations = scored.candidate_fragment_evaluations;
             candidate_report.union_placement_cache = scored.union_placement_cache;
+            candidate_report.union_origin_cache = scored.union_origin_cache;
         } catch (const ResourceExhausted& error) {
             rescore_failure = error.what();
             candidate_report.observed_valid = true;
             candidate_report.union_placement_cache = candidate_report.observed.union_placement_cache;
+            candidate_report.union_origin_cache = candidate_report.observed.union_origin_cache;
             // The phases that did run, up to the refusal. Without these a refused run reports its
             // whole duration under seconds_rescoring and 0.000 for each of the three parts, which is
             // precisely the breakdown a refusal needs.
@@ -1573,7 +1613,8 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
         text << std::setprecision(9)
              << "haplotype\tclass\tallele_paths\trecorded\thaplotype_bp\tpiece_hits\tproposed_starts\tunique_starts\t"
                 "full_read_verifications\tprefilter_rejections\tdp_evaluations\texecuted_dps\taccepted_mate_placements\t"
-                "physical_origins\tstatistical_state_classes\tseconds_seeding_and_emission\tseconds_pairing_and_reduction\n";
+                "physical_origins\tstatistical_state_classes\tseconds_seeding_and_emission\tseconds_pairing_and_reduction\t"
+                "reused_physical_origins\treused_state_aggregates\tmerged_state_classes\tseconds_cached_merge\n";
         for (std::size_t h = 0; h < union_work.size(); ++h) {
             const HaplotypeWork& w = union_work[h];
             text << h << '\t' << (is_panel[h] ? "panel" : "mosaic") << '\t' << paths_of[h] << '\t'
@@ -1581,7 +1622,9 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
                  << w.proposed_starts << '\t' << w.unique_starts << '\t' << w.full_read_verifications << '\t'
                  << w.prefilter_rejections << '\t' << w.dp_evaluations << '\t' << w.executed_dps << '\t'
                  << w.accepted_mate_placements << '\t' << w.physical_origins << '\t' << w.statistical_state_classes
-                 << '\t' << w.seconds_seeding_and_emission << '\t' << w.seconds_pairing_and_reduction << '\n';
+                 << '\t' << w.seconds_seeding_and_emission << '\t' << w.seconds_pairing_and_reduction << '\t'
+                 << w.reused_physical_origins << '\t' << w.reused_state_aggregates << '\t' << w.merged_state_classes
+                 << '\t' << w.seconds_cached_merge << '\n';
         }
         atomic_write(options.out_prefix + ".union_haplotype_work.tsv", text.str());
     }
@@ -3249,6 +3292,46 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
                              rescore_failure,
                          nullptr, &depth, &candidate_report);
             return GenotypeRunStatus::RescoreIncomplete;
+        }
+
+        if (options.diagnostic_union_only) {
+            // DIAGNOSTIC ONLY: the union pass's certified ranking, exact to the bit, and a digest of every mass
+            // cell and exposure; the run stops here -- no repair, no genotype, no haplotype, never a call.
+            SetRanking diagnostic = rank_set(beam);
+            std::uint64_t digest = 1469598103934665603ULL;
+            const auto mix = [&digest](const double value) {
+                unsigned char bytes[sizeof(double)];
+                std::memcpy(bytes, &value, sizeof(double));
+                for (const unsigned char b : bytes) digest = (digest ^ b) * 1099511628211ULL;
+            };
+            for (const double value : scored.log_mass) mix(value);
+            for (const double value : scored.exposure) mix(value);
+            std::ostringstream text;
+            text << "# DIAGNOSTIC ONLY: union-pass ranking; not a genotype call\n"
+                 << "# ranking_status\t" << (diagnostic.ranking.status == RescoreStatus::Complete ? "COMPLETE" : "TIED")
+                 << "\n# winner_set_size\t" << diagnostic.ranking.winner_set.size() << "\n# mass_cells\t"
+                 << scored.log_mass.size() << "\n# union_mass_digest\t" << std::hex << digest << std::dec
+                 << "\nrank\thap1_sequence\thap2_sequence\tscore\tfragment_term\texposure_term\tprior\t"
+                    "numeric_error_bound\tfragments_with_mass\n";
+            const auto exact = [](const double value) {
+                char buffer[64];
+                std::snprintf(buffer, sizeof(buffer), "%a", value);
+                return std::string(buffer);
+            };
+            for (std::size_t i = 0; i < diagnostic.ranking.candidates.size(); ++i) {
+                const CertifiedCandidate& entry = diagnostic.ranking.candidates[i];
+                const SequenceCandidate& pair = diagnostic.sequence_candidates[entry.candidate_id];
+                text << i << '\t' << pair.first << '\t' << pair.second << '\t' << exact(entry.score) << '\t'
+                     << exact(entry.fragment_term) << '\t' << exact(entry.exposure_term) << '\t' << exact(entry.prior)
+                     << '\t' << exact(entry.numeric_error_bound) << '\t' << entry.fragments_with_mass << '\n';
+            }
+            atomic_write(options.out_prefix + ".union_diagnostic_ranking.tsv", text.str());
+            timings.total = seconds_since(started);
+            write_status(status_path, GenotypeRunStatus::UnionDiagnosticOnly, fingerprint, options, library, timings,
+                         &built.report, &panel, (panel_only ? nullptr : &beam), &diagnostic.ranking,
+                         "DIAGNOSTIC ONLY: the union pass was scored and ranked; no repair and no genotype",
+                         nullptr, &depth, &candidate_report);
+            return GenotypeRunStatus::UnionDiagnosticOnly;
         }
 
         SetRanking primary = rank_set(beam);

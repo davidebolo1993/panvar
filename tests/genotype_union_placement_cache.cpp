@@ -1,5 +1,6 @@
-// Exact union placement reuse: every haploid mass cell, exposure, candidate component and ranking must equal
-// the reference scorer's (reuse off) bit for bit, whatever the segmentation, budget, thread count or order.
+// Exact union placement reuse (phase 1) and origin reuse (phase 2): every haploid mass cell, exposure, candidate
+// component and ranking must equal the reference scorer's (reuse off) bit for bit, whatever the segmentation,
+// budget, cap, thread count or order, and the logical placement, origin and state totals must reconcile with it.
 #include "panvar/fragment_likelihood.hpp"
 #include "panvar/genotype_model.hpp"
 
@@ -9,6 +10,7 @@
 #include <iostream>
 #include <map>
 #include <random>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -76,11 +78,14 @@ panvar::ReadPair fragment_at(const std::string& source, std::size_t start, std::
 
 // A locus of five haplotypes built from segments: shared long segments at different coordinates and twice
 // within one haplotype; substitution, insertion, deletion and empty alleles; short segments a read crosses
-// several of; a tandem repeat; shared segments at both locus ends.
+// several of; a tandem repeat; shared segments at both locus ends; and a segment holding two copies of one
+// stretch a base apart, so one fragment has origins of equal insert and orientation but different latent mass.
 struct Fixture {
     std::vector<std::string> haplotypes;
     std::vector<std::vector<std::uint32_t>> segments;
     std::vector<panvar::ReadPair> fragments;
+    std::vector<std::pair<std::size_t, std::size_t>> near_duplicate;   // (haplotype, offset) of each D
+    std::size_t near_duplicate_bp = 0;
 };
 
 Fixture fixture() {
@@ -98,18 +103,24 @@ Fixture fixture() {
     std::string T;
     for (int i = 0; i < 10; ++i) T += unit;
     const std::string empty;
+    const std::string X = random_bases(rng, 330);
+    std::string X_mut = X;
+    X_mut[170] = X_mut[170] == 'G' ? 'T' : 'G';
+    const std::string D = X + random_bases(rng, 60) + X_mut;
     const std::vector<std::vector<const std::string*>> layout = {
         {&A, &S1, &C, &T, &B},
-        {&A, &S2, &C_sub, &T, &B},
-        {&B, &S1, &C_ins, &A},
+        {&A, &S2, &C_sub, &T, &D, &B},
+        {&B, &S1, &C_ins, &D, &A},
         {&A, &C_del, &empty, &A, &B},
-        {&T, &S1, &S2, &C, &A},
+        {&T, &S1, &S2, &C, &D, &A},
     };
     Fixture out;
+    out.near_duplicate_bp = D.size();
     for (const auto& parts : layout) {
         std::string haplotype;
         std::vector<std::uint32_t> lengths;
         for (const std::string* part : parts) {
+            if (part == &D) out.near_duplicate.push_back({out.haplotypes.size(), haplotype.size()});
             haplotype += *part;
             lengths.push_back(static_cast<std::uint32_t>(part->size()));
         }
@@ -136,34 +147,75 @@ struct Run {
     panvar::CertifiedRanking ranking;
 };
 
-Run score(const Fixture& f, const std::vector<std::size_t>& order, std::size_t threads,
-          const std::vector<std::vector<std::uint32_t>>* segments, std::size_t budget, std::uint64_t cap) {
+struct Config {
+    std::vector<std::size_t> order = {0, 1, 2, 3, 4};
+    std::size_t threads = 1;
+    const std::vector<std::vector<std::uint32_t>>* segments = nullptr;
+    std::size_t placement_budget = 0;
+    std::uint64_t placement_cap = 0;
+    std::size_t origin_budget = 0;
+    std::uint64_t origins_cap = 0;
+    std::uint64_t states_cap = 0;
+    bool reverse_candidates = false;
+    std::uint64_t max_physical_origins = 0;   // 0: the default
+    std::uint64_t max_state_classes = 0;
+    bool record_all_origins = false;
+};
+
+Run score(const Fixture& f, const Config& config) {
     Run run;
     std::vector<panvar::MosaicPath> paths;
     std::vector<std::string> sequences;
-    for (std::size_t i = 0; i < order.size(); ++i) {
+    for (std::size_t i = 0; i < config.order.size(); ++i) {
         paths.push_back(panvar::MosaicPath{{i}});
-        sequences.push_back(f.haplotypes[order[i]]);
+        sequences.push_back(f.haplotypes[config.order[i]]);
     }
     run.interned = panvar::intern_haplotypes(paths, sequences);
     for (std::size_t x = 0; x < run.interned.sequences.size(); ++x) {
         for (std::size_t y = x; y < run.interned.sequences.size(); ++y) run.candidates.push_back({x, y});
     }
+    if (config.reverse_candidates) std::reverse(run.candidates.begin(), run.candidates.end());
     std::vector<std::vector<std::uint32_t>> ordered;
-    if (segments != nullptr) {
+    if (config.segments != nullptr) {
         ordered.resize(run.interned.sequences.size());
-        for (std::size_t i = 0; i < order.size(); ++i) ordered[run.interned.index_of[i]] = (*segments)[order[i]];
+        for (std::size_t i = 0; i < config.order.size(); ++i) {
+            ordered[run.interned.index_of[i]] = (*config.segments)[config.order[i]];
+        }
     }
-    panvar::FragmentScoringOptions o = options(threads);
-    if (segments != nullptr) {
+    panvar::FragmentScoringOptions o = options(config.threads);
+    if (config.segments != nullptr) {
         o.union_segment_lengths = &ordered;
-        o.union_placement_cache_bytes = budget;
-        o.max_union_cached_placements_consumed = cap;
+        o.union_placement_cache_bytes = config.placement_budget;
+        o.max_union_cached_placements_consumed = config.placement_cap;
+        o.union_origin_cache_bytes = config.origin_budget;
+        o.max_union_cached_origins_consumed = config.origins_cap;
+        o.max_union_cached_states_consumed = config.states_cap;
+    }
+    if (config.max_physical_origins != 0) o.max_physical_origins = config.max_physical_origins;
+    if (config.max_state_classes != 0) o.max_state_classes = config.max_state_classes;
+    if (config.record_all_origins) {
+        for (std::size_t i = 0; i < f.fragments.size(); ++i) o.record_origins_for_fragments.push_back(i);
     }
     run.result = panvar::score_diplotypes(run.interned, run.candidates, f.fragments, library(), o);
     run.ranking = panvar::certify_scored_ranking(run.result.scores, f.fragments.size(), o.mismatch_band,
                                                  run.result.counters, panvar::CertificationOptions{});
     return run;
+}
+
+// The reference's totals recovered from a run: executed, minus what phase 2 constructed once, plus what it served.
+struct Logical {
+    std::uint64_t accepted = 0, origins = 0, pairs = 0, valid = 0, classes = 0;
+    bool operator==(const Logical& o) const {
+        return accepted == o.accepted && origins == o.origins && pairs == o.pairs && valid == o.valid &&
+               classes == o.classes;
+    }
+};
+Logical logical(const Run& run) {
+    const panvar::FragmentScoringCounters& c = run.result.counters;
+    const panvar::UnionOriginCacheReport& o = run.result.union_origin_cache;
+    return {c.accepted_mate_placements, c.physical_origins - o.origins_constructed + c.reused_physical_origins,
+            c.latent_alignment_pairs - o.latent_pairs_constructed + c.reused_latent_alignment_pairs,
+            c.valid_fr_states - o.valid_states_constructed + c.reused_valid_fr_states, c.merged_state_classes};
 }
 
 // Compares two runs by haplotype SEQUENCE and candidate sequence pair, so permuted orders can be compared.
@@ -209,11 +261,18 @@ void require_identical(const Run& reference, const Run& other, const std::string
     std::sort(ws_ref.begin(), ws_ref.end());
     std::sort(ws_other.begin(), ws_other.end());
     require(ws_ref == ws_other, label + ": winner set differs");
-    // The logical placement and origin work is the reference's; only executed seeding may be lower.
-    require(reference.result.counters.accepted_mate_placements == other.result.counters.accepted_mate_placements &&
-                reference.result.counters.physical_origins == other.result.counters.physical_origins &&
-                reference.result.counters.statistical_state_classes == other.result.counters.statistical_state_classes,
-            label + ": accepted placements, physical origins or state classes differ");
+    // The logical placement, origin, pair and state work is the reference's; only executed work may be lower.
+    require(logical(reference) == logical(other),
+            label + ": logical accepted placements, physical origins, latent pairs, valid states or state classes differ");
+}
+
+bool refuses(const Fixture& f, const Config& config) {
+    try {
+        (void)score(f, config);
+    } catch (const panvar::ResourceExhausted&) {
+        return true;
+    }
+    return false;
 }
 
 }  // namespace
@@ -221,19 +280,28 @@ void require_identical(const Run& reference, const Run& other, const std::string
 int main() {
     try {
         const Fixture f = fixture();
-        const std::vector<std::size_t> natural = {0, 1, 2, 3, 4};
-        const Run reference = score(f, natural, 1, nullptr, 0, 0);
+        const Config off;
+        const Run reference = score(f, off);
+        require(reference.result.counters.merged_state_classes == reference.result.counters.statistical_state_classes &&
+                    reference.result.counters.reused_physical_origins == 0,
+                "the reference path's merged classes are its classes, and it serves nothing");
         std::cout << "  reference: " << f.fragments.size() << " fragments, " << reference.interned.sequences.size()
                   << " haplotypes, " << reference.result.counters.accepted_mate_placements << " accepted placements, "
-                  << reference.result.counters.physical_origins << " physical origins\n";
+                  << reference.result.counters.physical_origins << " physical origins, "
+                  << reference.result.counters.statistical_state_classes << " state classes\n";
 
+        // ---- phase 1: placement reuse -------------------------------------------------------------------
         const std::size_t full = std::size_t{1} << 30;
-        const Run retained = score(f, natural, 1, &f.segments, full, 0);
+        Config p1;
+        p1.segments = &f.segments;
+        p1.placement_budget = full;
+        const Run retained = score(f, p1);
         const panvar::UnionPlacementCacheReport& report = retained.result.union_placement_cache;
         require(report.active && report.admitted_segments > 0 && report.hits > 0 && report.placements_replayed > 0,
                 "the fixture must actually reuse placements");
         require(retained.result.counters.full_read_verifications < reference.result.counters.full_read_verifications,
                 "reuse must execute fewer verifications");
+        require(!retained.result.union_origin_cache.active, "phase 2 is off without its budget");
         require_identical(reference, retained, "fully retained");
         std::cout << "  ok: fully retained -- " << report.admitted_segments << " segments, " << report.hits << " hits, "
                   << report.placements_replayed << " placements replayed, verifications "
@@ -241,11 +309,15 @@ int main() {
                   << reference.result.counters.full_read_verifications << "\n";
 
         for (const std::size_t threads : {std::size_t{2}, std::size_t{4}, std::size_t{8}}) {
-            require_identical(reference, score(f, natural, threads, &f.segments, full, 0), std::to_string(threads) + " threads");
+            Config c = p1;
+            c.threads = threads;
+            require_identical(reference, score(f, c), std::to_string(threads) + " threads");
         }
         std::cout << "  ok: 1, 2, 4 and 8 threads\n";
 
-        const Run disabled = score(f, natural, 1, &f.segments, 0, 0);
+        Config zero = p1;
+        zero.placement_budget = 0;
+        const Run disabled = score(f, zero);
         require(!disabled.result.union_placement_cache.active &&
                     disabled.result.counters.full_read_verifications == reference.result.counters.full_read_verifications,
                 "a zero budget must be the reference path");
@@ -254,35 +326,38 @@ int main() {
 
         // Byte budget exact and one below: exact retains everything; one below declines at least one segment.
         const std::uint64_t exact = report.payload_bytes;
-        const Run at_exact = score(f, natural, 1, &f.segments, exact, 0);
+        Config c_exact = p1;
+        c_exact.placement_budget = exact;
+        const Run at_exact = score(f, c_exact);
         require(at_exact.result.union_placement_cache.declined_segments == 0 &&
                     at_exact.result.union_placement_cache.payload_bytes == exact,
                 "exactly the needed bytes must retain every eligible segment");
         require_identical(reference, at_exact, "budget exact");
-        const Run below = score(f, natural, 1, &f.segments, exact - 1, 0);
+        Config c_below = p1;
+        c_below.placement_budget = exact - 1;
+        const Run below = score(f, c_below);
         require(below.result.union_placement_cache.declined_segments >= 1 &&
                     below.result.union_placement_cache.payload_bytes <= exact - 1,
                 "one byte below must decline a segment and hold the budget");
         require_identical(reference, below, "budget one below");
-        const Run undersized = score(f, natural, 1, &f.segments, exact / 3, 0);
+        Config c_under = p1;
+        c_under.placement_budget = exact / 3;
+        const Run undersized = score(f, c_under);
         require(undersized.result.union_placement_cache.payload_bytes <= exact / 3, "an undersized cache holds its budget");
         require_identical(reference, undersized, "undersized");
         std::cout << "  ok: byte budget exact (" << exact << ") and one below, undersized (" << exact / 3 << ")\n";
 
         // Consumption cap exact and one below.
         const std::uint64_t consumed = report.placements_replayed;
-        require_identical(reference, score(f, natural, 1, &f.segments, full, consumed), "consumption cap exact");
-        bool refused = false;
-        try {
-            (void)score(f, natural, 1, &f.segments, full, consumed - 1);
-        } catch (const panvar::ResourceExhausted&) {
-            refused = true;
-        }
-        require(refused, "one cached placement below the consumption cap must refuse with no ranking");
+        Config c_cap = p1;
+        c_cap.placement_cap = consumed;
+        require_identical(reference, score(f, c_cap), "consumption cap exact");
+        c_cap.placement_cap = consumed - 1;
+        require(refuses(f, c_cap), "one cached placement below the consumption cap must refuse with no ranking");
         std::cout << "  ok: cached-placement consumption cap exact (" << consumed << ") accepts, one below refuses\n";
 
         panvar::set_union_placement_cache_hash_collapse(true);
-        const Run collided = score(f, natural, 1, &f.segments, full, 0);
+        const Run collided = score(f, p1);
         panvar::set_union_placement_cache_hash_collapse(false);
         require(collided.result.union_placement_cache.distinct_segments == report.distinct_segments &&
                     collided.result.union_placement_cache.hits == report.hits,
@@ -290,8 +365,10 @@ int main() {
         require_identical(reference, collided, "forced hash collisions");
         std::cout << "  ok: forced hash collisions\n";
 
-        const std::vector<std::size_t> permuted = {3, 0, 4, 2, 1};
-        require_identical(reference, score(f, permuted, 4, &f.segments, full, 0), "permuted order");
+        Config c_perm = p1;
+        c_perm.order = {3, 0, 4, 2, 1};
+        c_perm.threads = 4;
+        require_identical(reference, score(f, c_perm), "permuted order");
         std::cout << "  ok: haplotype and candidate order permuted\n";
 
         // The segmentation is a hint: a wrong one (arbitrary cut points) stays exact, it only reuses less.
@@ -300,11 +377,192 @@ int main() {
             const std::uint32_t L = static_cast<std::uint32_t>(h.size());
             wrong.push_back({L / 3, L / 3, L - 2 * (L / 3)});
         }
-        require_identical(reference, score(f, natural, 2, &wrong, full, 0), "wrong segmentation");
+        Config c_wrong = p1;
+        c_wrong.segments = &wrong;
+        c_wrong.threads = 2;
+        require_identical(reference, score(f, c_wrong), "wrong segmentation");
         std::vector<std::vector<std::uint32_t>> whole;
         for (const std::string& h : f.haplotypes) whole.push_back({static_cast<std::uint32_t>(h.size())});
-        require_identical(reference, score(f, natural, 2, &whole, full, 0), "one segment per haplotype");
+        Config c_whole = c_wrong;
+        c_whole.segments = &whole;
+        require_identical(reference, score(f, c_whole), "one segment per haplotype");
         std::cout << "  ok: a wrong segmentation and whole-haplotype segments stay exact\n";
+
+        // ---- phase 2: origin reuse ----------------------------------------------------------------------
+        const std::uint64_t unbounded = std::uint64_t{1} << 62;
+        Config p2 = p1;
+        p2.origin_budget = full;
+        p2.origins_cap = unbounded;
+        p2.states_cap = unbounded;
+        const Run served = score(f, p2);
+        const panvar::UnionOriginCacheReport& oreport = served.result.union_origin_cache;
+        const panvar::FragmentScoringCounters& sc = served.result.counters;
+        require(oreport.active && oreport.admitted_segments > 0 && oreport.hits > 0 && sc.reused_physical_origins > 0 &&
+                    sc.reused_state_aggregates > 0,
+                "the fixture must actually serve origins");
+        require(oreport.hits > oreport.admitted_segments, "every admitted segment is served at several occurrences");
+        require(sc.physical_origins < reference.result.counters.physical_origins &&
+                    sc.statistical_state_classes < reference.result.counters.statistical_state_classes,
+                "origin reuse must execute fewer origins and state classes");
+        require(oreport.declined_segments == 0 && oreport.evictions == 0 &&
+                    oreport.misses == oreport.segment_occurrences - oreport.hits,
+                "a full budget declines and evicts nothing");
+        require_identical(reference, served, "origin reuse");
+        std::cout << "  ok: origin reuse -- " << oreport.admitted_segments << " of " << oreport.eligible_segments
+                  << " segments, " << oreport.hits << " hits, " << oreport.misses << " misses; origins executed "
+                  << sc.physical_origins << " (" << oreport.origins_constructed << " constructed once) + "
+                  << sc.reused_physical_origins << " served = reference " << reference.result.counters.physical_origins
+                  << "; state classes executed " << sc.statistical_state_classes << ", aggregates served "
+                  << sc.reused_state_aggregates << ", merged " << sc.merged_state_classes << "\n";
+
+        // A fragment with two origins of equal insert and orientation but different latent mass, both inside the
+        // served interior of one near-duplicate segment D (copies a base apart): the reference's census, recorded
+        // origin by origin, must contain one, so the merge is shown to keep such classes apart.
+        {
+            Config recorded;
+            recorded.record_all_origins = true;
+            const Run named = score(f, recorded);
+            const std::size_t R = 100;
+            const std::size_t g = library().max_gap_bp;
+            std::size_t found = 0;
+            for (const auto& [key, origins] : named.result.recorded_origins) {
+                const std::string& sequence = named.interned.sequences[key.second];
+                for (const auto& [h, offset] : f.near_duplicate) {
+                    if (f.haplotypes[h] != sequence) continue;
+                    std::map<std::pair<std::size_t, int>, std::set<double>> masses;
+                    for (const panvar::FragmentPlacement& origin : origins) {
+                        const std::size_t start = origin.forward_start;
+                        const std::size_t end = start + origin.insert_bp;
+                        if (start < offset + g || start > offset + f.near_duplicate_bp - R - g) continue;
+                        if (end < offset + R + g || end > offset + f.near_duplicate_bp - g) continue;
+                        masses[{origin.insert_bp, static_cast<int>(origin.orientation)}].insert(origin.log_latent_mass);
+                    }
+                    for (const auto& item : masses) found += item.second.size() > 1 ? 1 : 0;
+                }
+            }
+            require(found > 0, "the near-duplicate segment must give some fragment origins of equal insert and "
+                               "orientation but different latent mass inside a served interior");
+            std::cout << "  ok: " << found << " (fragment, occurrence, insert, orientation) classes inside served "
+                      << "near-duplicate interiors carry more than one latent mass\n";
+        }
+
+        for (const std::size_t threads : {std::size_t{2}, std::size_t{4}, std::size_t{8}}) {
+            Config c = p2;
+            c.threads = threads;
+            require_identical(reference, score(f, c), "origin reuse, " + std::to_string(threads) + " threads");
+        }
+        std::cout << "  ok: origin reuse at 1, 2, 4 and 8 threads\n";
+
+        Config p2_zero = p2;
+        p2_zero.origin_budget = 0;
+        const Run p2_disabled = score(f, p2_zero);
+        require(!p2_disabled.result.union_origin_cache.active && p2_disabled.result.counters.reused_physical_origins == 0,
+                "a zero origin budget is phase 1 alone");
+        require_identical(reference, p2_disabled, "origin reuse disabled");
+
+        const std::uint64_t oexact = oreport.payload_bytes;
+        Config p2_exact = p2;
+        p2_exact.origin_budget = oexact;
+        const Run o_exact = score(f, p2_exact);
+        require(o_exact.result.union_origin_cache.declined_segments == 0 &&
+                    o_exact.result.union_origin_cache.payload_bytes == oexact,
+                "exactly the needed origin bytes retain every eligible segment");
+        require_identical(reference, o_exact, "origin budget exact");
+        Config p2_below = p2;
+        p2_below.origin_budget = oexact - 1;
+        const Run o_below = score(f, p2_below);
+        require(o_below.result.union_origin_cache.declined_segments >= 1 &&
+                    o_below.result.union_origin_cache.payload_bytes <= oexact - 1,
+                "one origin byte below declines a segment and holds the budget");
+        require_identical(reference, o_below, "origin budget one below");
+        Config p2_under = p2;
+        p2_under.origin_budget = oexact / 4;
+        const Run o_under = score(f, p2_under);
+        require(o_under.result.union_origin_cache.payload_bytes <= oexact / 4, "an undersized origin cache holds its budget");
+        require_identical(reference, o_under, "origin cache undersized");
+        // Phase 2 needs both strands of a segment from phase 1: an undersized placement cache serves fewer origins.
+        Config p2_p1under = p2;
+        p2_p1under.placement_budget = exact / 3;
+        require_identical(reference, score(f, p2_p1under), "origin reuse over an undersized placement cache");
+        std::cout << "  ok: origin cache disabled, exact (" << oexact << ") and one below, undersized, and over an "
+                  << "undersized placement cache\n";
+
+        Config p2_cap = p2;
+        p2_cap.origins_cap = sc.reused_physical_origins;
+        p2_cap.states_cap = sc.reused_state_aggregates;
+        require_identical(reference, score(f, p2_cap), "origin and state consumption caps exact");
+        Config p2_origins_below = p2_cap;
+        p2_origins_below.origins_cap = sc.reused_physical_origins - 1;
+        require(refuses(f, p2_origins_below), "one served origin below its cap must refuse with no ranking");
+        Config p2_states_below = p2_cap;
+        p2_states_below.states_cap = sc.reused_state_aggregates - 1;
+        require(refuses(f, p2_states_below), "one served state aggregate below its cap must refuse with no ranking");
+        for (const std::size_t threads : {std::size_t{4}}) {
+            Config c = p2_origins_below;
+            c.threads = threads;
+            require(refuses(f, c), "the served-origin cap refuses at 4 threads too");
+        }
+        Config p2_nocap = p2;
+        p2_nocap.states_cap = 0;
+        bool invalid = false;
+        try {
+            (void)score(f, p2_nocap);
+        } catch (const std::invalid_argument&) {
+            invalid = true;
+        }
+        require(invalid, "origin reuse without a positive consumption cap is refused as a configuration");
+        std::cout << "  ok: served-origin cap exact (" << sc.reused_physical_origins << ") and served-state cap exact ("
+                  << sc.reused_state_aggregates << ") accept, one below each refuses; a zero cap is invalid\n";
+
+        // The executed caps bind executed work only: the executed origins and classes are exactly enough under
+        // reuse, one fewer refuses, and the reference refuses at the same caps.
+        Config p2_exec = p2;
+        p2_exec.max_physical_origins = sc.physical_origins;
+        p2_exec.max_state_classes = sc.statistical_state_classes;
+        require_identical(reference, score(f, p2_exec), "executed caps exact under origin reuse");
+        Config p2_exec_origins = p2_exec;
+        p2_exec_origins.max_physical_origins = sc.physical_origins - 1;
+        require(refuses(f, p2_exec_origins), "one executed origin below max_physical_origins refuses");
+        Config p2_exec_states = p2_exec;
+        p2_exec_states.max_state_classes = sc.statistical_state_classes - 1;
+        require(refuses(f, p2_exec_states), "one executed class below max_state_classes refuses");
+        Config ref_at_exec = off;
+        ref_at_exec.max_physical_origins = sc.physical_origins;
+        require(refuses(f, ref_at_exec), "the reference, which executes every origin, refuses at the reused run's cap");
+        std::cout << "  ok: max_physical_origins (" << sc.physical_origins << ") and max_state_classes ("
+                  << sc.statistical_state_classes << ") bind executed work: exact accepts, one below refuses\n";
+
+        panvar::set_union_placement_cache_hash_collapse(true);
+        const Run o_collided = score(f, p2);
+        panvar::set_union_placement_cache_hash_collapse(false);
+        require(o_collided.result.union_origin_cache.hits == oreport.hits, "forced collisions serve the same occurrences");
+        require_identical(reference, o_collided, "origin reuse, forced hash collisions");
+
+        Config p2_perm = p2;
+        p2_perm.order = {3, 0, 4, 2, 1};
+        p2_perm.threads = 4;
+        require_identical(reference, score(f, p2_perm), "origin reuse, permuted haplotypes");
+        Config p2_req = p2;
+        p2_req.reverse_candidates = true;
+        p2_req.threads = 2;
+        require_identical(reference, score(f, p2_req), "origin reuse, reversed candidate requests");
+        Config p2_wrong = p2;
+        p2_wrong.segments = &wrong;
+        require_identical(reference, score(f, p2_wrong), "origin reuse, wrong segmentation");
+        Config p2_whole = p2;
+        p2_whole.segments = &whole;
+        require_identical(reference, score(f, p2_whole), "origin reuse, whole-haplotype segments");
+        std::cout << "  ok: origin reuse under forced collisions, permuted haplotypes, reversed requests, wrong and "
+                  << "whole-haplotype segmentations\n";
+
+        panvar::set_origin_cache_self_check(true);
+        for (const std::size_t threads : {std::size_t{1}, std::size_t{4}}) {
+            Config c = p2;
+            c.threads = threads;
+            require_identical(reference, score(f, c), "origin reuse self-check");
+        }
+        panvar::set_origin_cache_self_check(false);
+        std::cout << "  ok: every served fragment census equals a fresh enumeration (self-check, 1 and 4 threads)\n";
         std::cout << "union placement cache gates passed\n";
         return 0;
     } catch (const std::exception& error) {

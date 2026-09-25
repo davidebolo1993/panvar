@@ -1067,6 +1067,9 @@ void test_candidate_prefixes_match_standalone() {
                     "candidate_bases_scanned", "piece_hits", "proposed_starts", "unique_starts",
                     "full_read_verifications", "accepted_mate_placements", "valid_fr_states",
                     "physical_origins", "statistical_state_classes",
+                    // The union origin reuse's served work and the merged census count describe the pass too.
+                    "reused_physical_origins", "reused_state_aggregates", "reused_latent_alignment_pairs",
+                    "reused_valid_fr_states", "merged_state_classes",
                     // The exact-path prior cache is shared by every ranked set, so a prefix view counts
                     // the paths interned while ranking the prefixes before it, where a standalone run
                     // starts empty. Deliberately cumulative: the invariants these prove are run-level --

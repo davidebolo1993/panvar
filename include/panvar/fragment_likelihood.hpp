@@ -606,8 +606,12 @@ struct HaplotypeWork {
     std::uint64_t piece_hits = 0, proposed_starts = 0, unique_starts = 0, full_read_verifications = 0;
     std::uint64_t prefilter_rejections = 0, dp_evaluations = 0, executed_dps = 0, accepted_mate_placements = 0;
     std::uint64_t physical_origins = 0, statistical_state_classes = 0;
+    // Phase 2 (union origin reuse): origins and state aggregates served from the cache, and the StateKey classes
+    // of the merged census -- executed plus served reconcile with the reference's physical_origins and classes.
+    std::uint64_t reused_physical_origins = 0, reused_state_aggregates = 0, merged_state_classes = 0;
     double seconds_seeding_and_emission = 0.0;   // exact seeds, prefilter, gapped emission, both strands
     double seconds_pairing_and_reduction = 0.0;  // mate pairing, physical origins, StateKey reduction
+    double seconds_cached_merge = 0.0;           // of which merging served state aggregates (phase 2)
 };
 
 // Exact union placement reuse (one-shot passes). A start whose whole dependency window -- the bases its seeds
@@ -644,6 +648,49 @@ struct UnionPlacementCacheReport {
 };
 // TEST ONLY: collapse every union segment key's hash, so byte comparison alone separates segments.
 void set_union_placement_cache_hash_collapse(bool collapse);
+
+// Exact union ORIGIN reuse (phase 2; one-shot passes, on top of phase 1). A physical origin is (fragment, arm,
+// forward start s, insert I), and its latent mass sums the forward placements starting at s against the reverse
+// placements ending at e = s + I -- nothing else. When s lies in the forward interior zone of one segment
+// occurrence, [o + g, o + L - R - g], and e in the same occurrence's reverse interior zone, [o + R + g, o + L - g],
+// every one of those placements is a phase-1 replayed placement of that segment, so the origin -- insert,
+// orientation, latent mass, summed in the same order -- is a function of the segment's bytes alone. Such origins
+// are constructed once per distinct segment (both strands admitted by phase 1) as sorted per-fragment StateKey
+// multiplicities, and merged at every occurrence; each occurrence contributes its own copies, so multiplicity is
+// preserved. Every other pair -- across a boundary, near the locus ends, in a short or declined segment -- is
+// paired directly. The partition is by (s, e) alone, so it is disjoint and exhaustive; the reduction runs over the
+// merged sorted census in ascending StateKey order, exactly as the reference's map does.
+//
+// Resource semantics: physical_origins, statistical_state_classes, latent_alignment_pairs and valid_fr_states
+// count EXECUTED work (direct pairing plus the one-time construction), and max_physical_origins and
+// max_state_classes bind those. Served origins and aggregates are counted apart (reused_* in the counters) and
+// bound by max_union_cached_origins_consumed and max_union_cached_states_consumed; crossing either refuses before
+// any ranking. The reference's totals are recovered exactly as executed - constructed + reused.
+struct UnionOriginCacheReport {
+    bool active = false;
+    std::uint64_t budget_bytes = 0;
+    std::uint64_t max_origins_consumed = 0;
+    std::uint64_t max_states_consumed = 0;
+    std::uint64_t segment_occurrences = 0;        // forward segment occurrences with a non-empty interior zone
+    std::uint64_t eligible_segments = 0;          // distinct segments with both strands admitted by phase 1
+    std::uint64_t admitted_segments = 0;
+    std::uint64_t declined_segments = 0;          // did not fit the byte budget: paired directly
+    std::uint64_t evictions = 0;                  // nothing admitted is ever evicted
+    std::uint64_t hits = 0;                       // occurrences served
+    std::uint64_t misses = 0;                     // occurrences paired directly
+    std::uint64_t origins_constructed = 0;        // physical origins built once, while filling (every eligible segment)
+    std::uint64_t state_aggregates_constructed = 0;
+    std::uint64_t latent_pairs_constructed = 0;
+    std::uint64_t valid_states_constructed = 0;
+    std::uint64_t origin_records_held = 0;        // aggregates retained (admitted segments)
+    std::uint64_t origins_held = 0;               // physical origins those stand for, per occurrence
+    std::uint64_t origins_consumed = 0;           // served over the pass (held to max_origins_consumed)
+    std::uint64_t states_consumed = 0;            // aggregates served over the pass (held to max_states_consumed)
+    std::uint64_t payload_bytes = 0;
+    std::uint64_t index_bytes = 0;                // the per-haplotype zone tables
+    std::uint64_t peak_bytes = 0;                 // payload + index + the batch being filled, at its peak
+    double seconds_fill = 0.0;                    // cached-origin construction (wall)
+};
 
 struct FragmentScoringOptions {
     // The declared band of the truncated model. Fixed for a run: changing it changes the model.
@@ -715,6 +762,11 @@ struct FragmentScoringOptions {
     // A cap on cached placements CONSUMED over the pass (0: none). Replayed placements are not executed work
     // and are not charged as such, so reuse needs a bound of its own: exceeding it refuses, with no ranking.
     std::uint64_t max_union_cached_placements_consumed = 0;
+    // Exact union origin reuse (see UnionOriginCacheReport): off unless phase 1 is on and a byte budget is given.
+    // Both consumption caps are then required to be positive -- a served origin is not free.
+    std::size_t union_origin_cache_bytes = 0;
+    std::uint64_t max_union_cached_origins_consumed = 0;
+    std::uint64_t max_union_cached_states_consumed = 0;
     // Workers for the diploid combination phase. Candidates are partitioned into fixed contiguous
     // ranges and each worker writes only its own complete DiplotypeScore entries, so the result does
     // not depend on the thread count: no cross-thread floating-point reduction exists to reorder.
@@ -760,6 +812,14 @@ struct FragmentScoringCounters {
     std::uint64_t fragments_with_floor_binding = 0;
     std::uint64_t physical_origins = 0;
     std::uint64_t statistical_state_classes = 0;
+    // Phase-2 union origin reuse only (zero otherwise): what was SERVED rather than executed. The reference's
+    // physical_origins is physical_origins - constructed + reused_physical_origins (likewise the latent pairs and
+    // valid states), and its statistical_state_classes is merged_state_classes.
+    std::uint64_t reused_physical_origins = 0;
+    std::uint64_t reused_state_aggregates = 0;
+    std::uint64_t reused_latent_alignment_pairs = 0;
+    std::uint64_t reused_valid_fr_states = 0;
+    std::uint64_t merged_state_classes = 0;
 };
 
 // Exact relative to the declared truncated model. `absolute_term_sum` is the sum of the magnitudes
@@ -774,6 +834,7 @@ struct DiplotypeScore {
 
 struct FragmentScoringResult {
     UnionPlacementCacheReport union_placement_cache;
+    UnionOriginCacheReport union_origin_cache;
     std::vector<DiplotypeScore> scores;     // parallel to the requested candidates
     // Row-major [fragment * unique_haplotypes + haplotype]: the summed log placement mass of one
     // fragment on one chromosome copy of one haplotype. Retained because it is what the exhaustive
@@ -837,6 +898,7 @@ struct FragmentScoringObservation {
     double seconds_placement_and_mass = 0.0;
     double seconds_diploid_combination = 0.0;
     UnionPlacementCacheReport union_placement_cache;   // what the reuse did before the refusal
+    UnionOriginCacheReport union_origin_cache;
 };
 
 // A measurement, not an optimisation. Oriented read forms repeat -- four forms per fragment, and at

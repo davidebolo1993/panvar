@@ -2677,6 +2677,8 @@ double exposure_for_length(
     return total;
 }
 
+struct UnionOriginReuse;
+
 // Everything placement reads and never writes.
 struct PlacementInputs {
     const PreparedFragmentSet* prepared = nullptr;
@@ -2688,6 +2690,7 @@ struct PlacementInputs {
     const std::deque<std::string>* reversed = nullptr;
     std::size_t band = 0;
     UnionReplay* replay = nullptr;   // exact union reuse, one-shot passes only
+    UnionOriginReuse* origin_reuse = nullptr;   // exact union origin reuse (phase 2), one-shot passes only
 };
 
 // Where a haplotype's complete origin census is written, when one is wanted. Distinct from
@@ -3057,6 +3060,99 @@ struct OriginRecording {
     std::map<std::pair<std::size_t, std::size_t>, std::vector<FragmentPlacement>>* recorded = nullptr;
 };
 
+// ---- exact union origin reuse (phase 2) ------------------------------------------------------------
+//
+// One distinct segment's interior origins -- forward start in its forward zone, reverse end in its reverse
+// zone -- as sorted per-fragment StateKey multiplicities over both arms: the census of ONE occurrence.
+struct UnionOriginEntry {
+    StateAggregateSet states;
+    std::uint64_t origins = 0;        // physical origins one occurrence stands for (the counts' sum)
+    std::uint64_t latent_pairs = 0;   // latent alignment pairs tested inside one occurrence
+    std::uint64_t valid_states = 0;   // of those, valid FR states
+};
+// One served occurrence, in forward haplotype coordinates: a pair is served exactly when its forward start is in
+// [start_lo, start_hi] and its reverse end in [end_lo, end_hi] of the SAME zone.
+struct OriginZone {
+    std::uint32_t start_lo = 0, start_hi = 0;
+    std::uint32_t end_lo = 0, end_hi = 0;
+    const UnionOriginEntry* entry = nullptr;
+};
+struct UnionOriginReuse {
+    std::vector<std::vector<OriginZone>> zones;   // per haplotype, ascending and disjoint
+    std::atomic<std::uint64_t> origins_consumed{0};
+    std::atomic<std::uint64_t> states_consumed{0};
+    std::uint64_t max_origins = 0;
+    std::uint64_t max_states = 0;
+};
+
+// A contiguous row of placements, sorted by (start, consumed).
+struct RowView {
+    const FormPlacement* data = nullptr;
+    std::size_t size = 0;
+    const FormPlacement* begin() const { return data; }
+    const FormPlacement* end() const { return data + size; }
+    bool empty() const { return size == 0; }
+};
+
+// The ONE pairing of a fragment's mate placements into physical origins, shared by the reference path, the
+// phase-2 direct path, the phase-2 construction and its self-check, so none of them can pair differently. Per
+// arm and per forward start (ascending), every reverse placement ending in [start + min_bp, start + max_bp] is
+// tested, forward rows outer and reverse rows inner, and the valid pairs are summed per insert; `emit` receives
+// each origin once, in ascending insert. With `zones`, the pairs a zone serves are skipped -- the start inside
+// the zone's forward range and the end inside its reverse range -- and nothing else changes: an origin fixes
+// its end (e = start + insert), so it is skipped whole or not at all, and a kept origin sums the same pairs in
+// the same order.
+template <typename Emit>
+void pair_fragment(const RowView (&forward_rows)[2], const RowView (&reverse_rows)[2], const InsertSupport& support,
+                   const OriginZone* zones, std::size_t zone_count, std::map<std::uint32_t, OriginAccumulator>& origins,
+                   std::uint64_t& latent_pairs, std::uint64_t& valid_states, Emit&& emit) {
+    const auto start_below = [](const FormPlacement& lhs, std::size_t value) { return lhs.start < value; };
+    const auto start_above = [](std::size_t value, const FormPlacement& rhs) { return value < rhs.start; };
+    for (std::size_t arm = 0; arm < 2; ++arm) {
+        const RowView& forward = forward_rows[arm];
+        const RowView& reverse = reverse_rows[arm];
+        if (forward.empty() || reverse.empty()) continue;
+        std::size_t zone = 0;
+        for (std::size_t first_row = 0; first_row < forward.size;) {
+            const std::uint32_t forward_start = forward.data[first_row].start;
+            std::size_t last_row = first_row;
+            while (last_row < forward.size && forward.data[last_row].start == forward_start) ++last_row;
+            const std::size_t lo_end = static_cast<std::size_t>(forward_start) + support.min_bp;
+            const std::size_t hi_end = static_cast<std::size_t>(forward_start) + support.max_bp;
+            const FormPlacement* begin = std::lower_bound(reverse.begin(), reverse.end(), lo_end, start_below);
+            const FormPlacement* end = std::upper_bound(begin, reverse.end(), hi_end, start_above);
+            const FormPlacement* skip_begin = end;
+            const FormPlacement* skip_end = end;
+            while (zone < zone_count && zones[zone].start_hi < forward_start) ++zone;
+            if (zone < zone_count && zones[zone].start_lo <= forward_start) {
+                skip_begin = std::lower_bound(begin, end, static_cast<std::size_t>(zones[zone].end_lo), start_below);
+                skip_end = std::upper_bound(skip_begin, end, static_cast<std::size_t>(zones[zone].end_hi), start_above);
+            }
+
+            origins.clear();
+            for (std::size_t row = first_row; row < last_row; ++row) {
+                const FormPlacement& mate = forward.data[row];
+                const auto pair_range = [&](const FormPlacement* from, const FormPlacement* to) {
+                    for (const FormPlacement* it = from; it != to; ++it) {
+                        ++latent_pairs;
+                        const std::optional<std::size_t> insert = fr_insert_from_endpoints(
+                            forward_start, mate.consumed, it->start, it->consumed, support);
+                        if (!insert.has_value()) continue;
+                        ++valid_states;
+                        origins[static_cast<std::uint32_t>(*insert)].add(
+                            mate.emission + it->emission, it->start - it->consumed, mate.consumed, it->consumed,
+                            mate.mismatches, it->mismatches);
+                    }
+                };
+                pair_range(begin, skip_begin);
+                pair_range(skip_end, end);
+            }
+            for (const auto& item : origins) emit(arm, forward_start, item.first, item.second);
+            first_row = last_row;
+        }
+    }
+}
+
 // Places haplotypes [first_h, last_h) and writes their mass COLUMNS. Column storage rather than the
 // row-major matrix is what makes a later batch appendable: a new haplotype adds a column and moves
 // nothing, whereas a row-major matrix restrides every existing cell when the haplotype count grows.
@@ -3066,6 +3162,7 @@ void place_haplotype_range(
     const PlacementInputs& in,
     std::size_t first_h,
     std::size_t last_h,
+    std::size_t stride,
     PlacementBudget& budget,
     std::vector<std::vector<double>>& mass_column,
     FragmentScoringCounters& counters,
@@ -3088,8 +3185,13 @@ void place_haplotype_range(
     std::vector<std::vector<FormPlacement>> reverse_placements(prepared.reverse_forms.size());
     std::vector<std::pair<std::uint32_t, std::uint32_t>> proposed_scratch;
     std::vector<std::uint8_t> replay_skip;
+    // Phase 2 worker scratch: the direct origins' keys, their census, the merged census, and per-zone cursors.
+    std::vector<StateKey> direct_keys;
+    std::vector<StateCount> direct_counts, merged_counts, merge_scratch;
+    std::vector<std::size_t> zone_cursor;
+    const bool reuse_self_check = in.origin_reuse != nullptr && origin_self_check().load(std::memory_order_relaxed);
 
-    for (std::size_t h = first_h; h < last_h; ++h) {
+    for (std::size_t h = first_h; h < last_h; h += stride) {
         if (budget.stop()) throw PlacementCancelled();
         const std::string& haplotype = (*in.sequences)[h];
         if (prepared.forward_forms.empty()) continue;
@@ -3148,51 +3250,129 @@ void place_haplotype_range(
             }
         }
 
+        // Phase 2: the occurrences this haplotype is served, charged whole before any of them is merged, so a
+        // consumption cap refuses before a partial census exists.
+        const std::vector<OriginZone>* origin_zones =
+            in.origin_reuse != nullptr ? &in.origin_reuse->zones[h] : nullptr;
+        const bool reusing = origin_zones != nullptr && !origin_zones->empty();
+        double merge_seconds = 0.0;
+        if (reusing) {
+            std::uint64_t served_origins = 0, served_states = 0;
+            for (const OriginZone& zone : *origin_zones) {
+                served_origins += zone.entry->origins;
+                served_states += zone.entry->states.states.size();
+                counters.reused_latent_alignment_pairs += zone.entry->latent_pairs;
+                counters.reused_valid_fr_states += zone.entry->valid_states;
+            }
+            counters.reused_physical_origins += served_origins;
+            counters.reused_state_aggregates += served_states;
+            const std::uint64_t origins_total =
+                in.origin_reuse->origins_consumed.fetch_add(served_origins, std::memory_order_relaxed) + served_origins;
+            const std::uint64_t states_total =
+                in.origin_reuse->states_consumed.fetch_add(served_states, std::memory_order_relaxed) + served_states;
+            if (origins_total > in.origin_reuse->max_origins) {
+                budget.cancel();
+                throw ResourceExhausted("fragment scoring reached its cached-origin consumption cap; no partial ranking "
+                                        "is returned");
+            }
+            if (states_total > in.origin_reuse->max_states) {
+                budget.cancel();
+                throw ResourceExhausted("fragment scoring reached its cached-state consumption cap; no partial ranking "
+                                        "is returned");
+            }
+            zone_cursor.assign(origin_zones->size(), 0);
+        }
+
         for (std::size_t f = 0; f < fragments.size(); ++f) {
             if (budget.stop()) throw PlacementCancelled();
             const InsertSupport& support = prepared.support_by_fragment[f];
             if (support.empty()) continue;
+            const RowView forward_rows[2] = {
+                {forward_placements[form_slot(f, 0)].data(), forward_placements[form_slot(f, 0)].size()},
+                {forward_placements[form_slot(f, 1)].data(), forward_placements[form_slot(f, 1)].size()}};
+            const RowView reverse_rows[2] = {
+                {reverse_placements[form_slot(f, 0)].data(), reverse_placements[form_slot(f, 0)].size()},
+                {reverse_placements[form_slot(f, 1)].data(), reverse_placements[form_slot(f, 1)].size()}};
+
+            if (reusing) {
+                // Direct: every pair no zone serves, charged as executed work.
+                direct_keys.clear();
+                pair_fragment(forward_rows, reverse_rows, support, origin_zones->data(), origin_zones->size(), origins,
+                              counters.latent_alignment_pairs, counters.valid_fr_states,
+                              [&](std::size_t arm, std::uint32_t, std::uint32_t insert, const OriginAccumulator& origin) {
+                                  ++counters.physical_origins;
+                                  const std::uint64_t seen =
+                                      budget.physical_origins.fetch_add(1, std::memory_order_relaxed) + 1;
+                                  if (seen > budget.max_physical_origins) {
+                                      budget.cancel();
+                                      throw ResourceExhausted(
+                                          "fragment scoring reached its physical-origin cap; no partial "
+                                          "ranking is returned");
+                                  }
+                                  if (budget.stop()) throw PlacementCancelled();
+                                  StateKey key;
+                                  key.insert_bp = insert;
+                                  key.orientation = static_cast<std::uint32_t>(arm);
+                                  key.log_latent_mass = origin.log_latent_mass;
+                                  direct_keys.push_back(key);
+                              });
+                direct_counts.clear();
+                sort_and_count(direct_keys, direct_counts, 0);
+                counters.statistical_state_classes += direct_counts.size();
+                // Served: each occurrence's census added in, copies kept apart by adding their multiplicities.
+                const auto merge_mark = std::chrono::steady_clock::now();
+                merged_counts.assign(direct_counts.begin(), direct_counts.end());
+                for (std::size_t z = 0; z < origin_zones->size(); ++z) {
+                    const StateAggregateSet& cached = (*origin_zones)[z].entry->states;
+                    std::size_t& at = zone_cursor[z];
+                    while (at < cached.fragments.size() && cached.fragments[at] < f) ++at;
+                    if (at == cached.fragments.size() || cached.fragments[at] != f) continue;
+                    const StateCount* first = cached.states.data() + cached.starts[at];
+                    const StateCount* last = cached.states.data() + cached.starts[at + 1];
+                    merge_sorted(merged_counts.data(), merged_counts.data() + merged_counts.size(), first, last,
+                                 merge_scratch);
+                    merged_counts.swap(merge_scratch);
+                }
+                merge_seconds += std::chrono::duration<double>(std::chrono::steady_clock::now() - merge_mark).count();
+                if (reuse_self_check) {
+                    // Fresh enumeration of the whole fragment, no zone skipped, reduced as the reference reduces.
+                    std::uint64_t unused_pairs = 0, unused_states = 0;
+                    states.clear();
+                    pair_fragment(forward_rows, reverse_rows, support, nullptr, 0, origins, unused_pairs, unused_states,
+                                  [&](std::size_t arm, std::uint32_t, std::uint32_t insert, const OriginAccumulator& origin) {
+                                      StateKey key;
+                                      key.insert_bp = insert;
+                                      key.orientation = static_cast<std::uint32_t>(arm);
+                                      key.log_latent_mass = origin.log_latent_mass;
+                                      ++states[key];
+                                  });
+                    bool same = states.size() == merged_counts.size();
+                    std::size_t k = 0;
+                    for (auto it = states.begin(); same && it != states.end(); ++it, ++k) {
+                        const StateCount& merged = merged_counts[k];
+                        same = merged.key.insert_bp == it->first.insert_bp &&
+                               merged.key.orientation == it->first.orientation &&
+                               std::memcmp(&merged.key.log_latent_mass, &it->first.log_latent_mass, sizeof(double)) == 0 &&
+                               merged.count == it->second;
+                    }
+                    if (!same) {
+                        throw std::logic_error("union origin reuse self-check: the merged census of fragment " +
+                                               std::to_string(f) + " on haplotype " + std::to_string(h) +
+                                               " differs from a fresh enumeration");
+                    }
+                }
+                if (merged_counts.empty()) continue;
+                counters.merged_state_classes += merged_counts.size();
+                mass_column[h][f] = reduce_sorted(merged_counts.data(), merged_counts.data() + merged_counts.size(),
+                                                  library_insert);
+                continue;
+            }
+
             states.clear();
-
-            for (std::size_t arm = 0; arm < 2; ++arm) {
-                const std::vector<FormPlacement>& forward = forward_placements[form_slot(f, arm)];
-                const std::vector<FormPlacement>& reverse = reverse_placements[form_slot(f, arm)];
-                if (forward.empty() || reverse.empty()) continue;
-
-                for (std::size_t first_row = 0; first_row < forward.size();) {
-                    const std::uint32_t forward_start = forward[first_row].start;
-                    std::size_t last_row = first_row;
-                    while (last_row < forward.size() && forward[last_row].start == forward_start) {
-                        ++last_row;
-                    }
-                    const std::size_t lo_end =
-                        static_cast<std::size_t>(forward_start) + support.min_bp;
-                    const std::size_t hi_end =
-                        static_cast<std::size_t>(forward_start) + support.max_bp;
-                    const auto begin = std::lower_bound(
-                        reverse.begin(), reverse.end(), lo_end,
-                        [](const FormPlacement& lhs, std::size_t value) { return lhs.start < value; });
-                    const auto end = std::upper_bound(
-                        begin, reverse.end(), hi_end,
-                        [](std::size_t value, const FormPlacement& rhs) { return value < rhs.start; });
-
-                    origins.clear();
-                    for (std::size_t row = first_row; row < last_row; ++row) {
-                        for (auto it = begin; it != end; ++it) {
-                            ++counters.latent_alignment_pairs;
-                            const std::optional<std::size_t> insert = fr_insert_from_endpoints(
-                                forward_start, forward[row].consumed, it->start, it->consumed,
-                                support);
-                            if (!insert.has_value()) continue;
-                            ++counters.valid_fr_states;
-                            origins[static_cast<std::uint32_t>(*insert)].add(
-                                forward[row].emission + it->emission, it->start - it->consumed,
-                                forward[row].consumed, it->consumed, forward[row].mismatches,
-                                it->mismatches);
-                        }
-                    }
-
-                    for (const auto& item : origins) {
+            pair_fragment(forward_rows, reverse_rows, support, nullptr, 0, origins, counters.latent_alignment_pairs,
+                          counters.valid_fr_states,
+                          [&](std::size_t arm, std::uint32_t forward_start, std::uint32_t insert,
+                              const OriginAccumulator& origin) {
                         ++counters.physical_origins;
                         const std::uint64_t seen =
                             budget.physical_origins.fetch_add(1, std::memory_order_relaxed) + 1;
@@ -3204,14 +3384,13 @@ void place_haplotype_range(
                         }
                         if (budget.stop()) throw PlacementCancelled();
                         StateKey key;
-                        key.insert_bp = item.first;
+                        key.insert_bp = insert;
                         key.orientation = static_cast<std::uint32_t>(arm);
-                        key.log_latent_mass = item.second.log_latent_mass;
+                        key.log_latent_mass = origin.log_latent_mass;
                         ++states[key];
                         if (census != nullptr) {
                             census->origins_by_fragment[f].push_back(
-                                {forward_start, item.first, static_cast<std::uint32_t>(arm),
-                                 item.second.log_latent_mass});
+                                {forward_start, insert, static_cast<std::uint32_t>(arm), origin.log_latent_mass});
                         }
                         const bool want_named =
                             origins_out.record_origins != nullptr &&
@@ -3219,14 +3398,14 @@ void place_haplotype_range(
                         if (origins_out.summary || want_named) {
                             FragmentPlacement placement;
                             placement.forward_start = forward_start;
-                            placement.insert_bp = item.first;
-                            placement.log_latent_mass = item.second.log_latent_mass;
-                            placement.latent_alignments = item.second.latent_alignments;
-                            placement.reverse_start = item.second.reverse_start;
-                            placement.forward_mismatches = item.second.forward_mismatches;
-                            placement.reverse_mismatches = item.second.reverse_mismatches;
-                            placement.forward_consumed_bp = item.second.forward_consumed_bp;
-                            placement.reverse_consumed_bp = item.second.reverse_consumed_bp;
+                            placement.insert_bp = insert;
+                            placement.log_latent_mass = origin.log_latent_mass;
+                            placement.latent_alignments = origin.latent_alignments;
+                            placement.reverse_start = origin.reverse_start;
+                            placement.forward_mismatches = origin.forward_mismatches;
+                            placement.reverse_mismatches = origin.reverse_mismatches;
+                            placement.forward_consumed_bp = origin.forward_consumed_bp;
+                            placement.reverse_consumed_bp = origin.reverse_consumed_bp;
                             placement.orientation = arm == 0 ? MateOrientation::FirstForward
                                                              : MateOrientation::SecondForward;
                             if (origins_out.summary && origins_out.summaries != nullptr) {
@@ -3234,8 +3413,8 @@ void place_haplotype_range(
                                     (*origins_out.summaries)[f * origins_out.unique_stride + h];
                                 ++summary.origins;
                                 const double term = kLogMateOrientationPrior +
-                                                    library_insert.log_probability(item.first) +
-                                                    item.second.log_latent_mass;
+                                                    library_insert.log_probability(insert) +
+                                                    origin.log_latent_mass;
                                 if (term > summary.best_log_term) {
                                     summary.best_log_term = term;
                                     summary.best = placement;
@@ -3245,12 +3424,10 @@ void place_haplotype_range(
                                 (*origins_out.recorded)[{f, h}].push_back(placement);
                             }
                         }
-                    }
-                    first_row = last_row;
-                }
-            }
+                    });
             if (states.empty()) continue;
             counters.statistical_state_classes += states.size();
+            counters.merged_state_classes += states.size();
             mass_column[h][f] = reduce_states(states, library_insert);
         }
         if (trace_work && h < options.record_haplotype_work->size()) {
@@ -3268,6 +3445,10 @@ void place_haplotype_range(
             work.accepted_mate_placements = counters.accepted_mate_placements - work_before.accepted_mate_placements;
             work.physical_origins = counters.physical_origins - work_before.physical_origins;
             work.statistical_state_classes = counters.statistical_state_classes - work_before.statistical_state_classes;
+            work.reused_physical_origins = counters.reused_physical_origins - work_before.reused_physical_origins;
+            work.reused_state_aggregates = counters.reused_state_aggregates - work_before.reused_state_aggregates;
+            work.merged_state_classes = counters.merged_state_classes - work_before.merged_state_classes;
+            work.seconds_cached_merge = merge_seconds;
             work.seconds_seeding_and_emission = std::chrono::duration<double>(work_seeded - work_mark).count();
             work.seconds_pairing_and_reduction = std::chrono::duration<double>(work_done - work_seeded).count();
         }
@@ -3290,7 +3471,11 @@ void fill_union_cache(const PlacementInputs& in, const std::vector<std::vector<s
                       std::size_t budget_bytes, std::uint64_t max_consumed, std::size_t threads,
                       PlacementBudget& budget, FragmentScoringCounters& counters, EmissionCacheCounters& cache_work,
                       std::vector<UnionSegmentEntry>& entries, UnionReplay& replay,
-                      UnionPlacementCacheReport& report) {
+                      UnionPlacementCacheReport& report,
+                      // Phase 2, when `origin_reuse` is given: origins constructed from the admitted placements.
+                      std::size_t origin_budget_bytes = 0, UnionOriginReuse* origin_reuse = nullptr,
+                      std::deque<UnionOriginEntry>* origin_entries = nullptr,
+                      UnionOriginCacheReport* origin_report = nullptr) {
     const auto fill_mark = std::chrono::steady_clock::now();
     const PreparedFragmentSet& prepared = *in.prepared;
     const LibraryModel& library = *in.library;
@@ -3317,6 +3502,7 @@ void fill_union_cache(const PlacementInputs& in, const std::vector<std::vector<s
         int strand = 0;
         std::string bytes;
         std::vector<Occurrence> occurrences;
+        std::size_t partner = static_cast<std::size_t>(-1);   // a forward segment's reverse strand
     };
     std::vector<Distinct> distinct;
     std::unordered_multimap<std::uint64_t, std::size_t> by_hash;
@@ -3330,6 +3516,7 @@ void fill_union_cache(const PlacementInputs& in, const std::vector<std::vector<s
         std::uint32_t offset = 0;
         for (const std::uint32_t length : lengths[h]) {
             if (length >= minimum) {
+                std::size_t forward_distinct = 0;
                 for (int strand = 0; strand < 2; ++strand) {
                     const std::uint32_t at = strand == 0 ? offset : static_cast<std::uint32_t>(forward.size() - offset - length);
                     const std::string& text = strand == 0 ? forward : (*in.reversed)[h];
@@ -3352,6 +3539,10 @@ void fill_union_cache(const PlacementInputs& in, const std::vector<std::vector<s
                         by_hash.emplace(key, found);
                     }
                     distinct[found].occurrences.push_back({h, at});
+                    // The reverse strand's bytes are a function of the forward bytes, so a forward segment has
+                    // exactly one partner, and the two share their occurrences mirrored.
+                    if (strand == 0) forward_distinct = found;
+                    else distinct[forward_distinct].partner = found;
                 }
             }
             offset += length;
@@ -3482,7 +3673,217 @@ void fill_union_cache(const PlacementInputs& in, const std::vector<std::vector<s
         }
     }
     report.misses = report.segment_occurrences - report.hits;
-    report.seconds_fill = std::chrono::duration<double>(std::chrono::steady_clock::now() - fill_mark).count();
+    if (origin_reuse == nullptr) {
+        report.seconds_fill = std::chrono::duration<double>(std::chrono::steady_clock::now() - fill_mark).count();
+        return;
+    }
+    // ---- phase 2: interior origins, constructed from the admitted placements of both strands ---------------
+    const auto origin_mark = std::chrono::steady_clock::now();
+    UnionOriginCacheReport& oreport = *origin_report;
+    oreport.active = true;
+    oreport.budget_bytes = origin_budget_bytes;
+    oreport.max_origins_consumed = origin_reuse->max_origins;
+    oreport.max_states_consumed = origin_reuse->max_states;
+    origin_reuse->zones.assign(unique, {});
+    std::vector<std::size_t> position_of(distinct.size(), static_cast<std::size_t>(-1));
+    for (std::size_t e = 0; e < eligible.size(); ++e) position_of[eligible[e]] = e;
+    // Candidates in the canonical order phase 1 used, forward strands only; both strands must be admitted.
+    std::vector<std::size_t> candidates;   // positions in `eligible`
+    for (std::size_t e = 0; e < eligible.size(); ++e) {
+        const Distinct& d = distinct[eligible[e]];
+        if (d.strand != 0) continue;
+        oreport.segment_occurrences += d.occurrences.size();
+        if (admitted[e] == 0 || d.partner == static_cast<std::size_t>(-1)) continue;
+        const std::size_t partner = position_of[d.partner];
+        if (partner == static_cast<std::size_t>(-1) || admitted[partner] == 0) continue;
+        candidates.push_back(e);
+    }
+    for (const Distinct& d : distinct) {
+        if (d.strand == 0 && d.occurrences.size() < 2) oreport.segment_occurrences += d.occurrences.size();
+    }
+    oreport.eligible_segments = candidates.size();
+    origin_entries->clear();
+    std::vector<UnionOriginEntry*> built(candidates.size(), nullptr);
+    std::vector<char> kept(candidates.size(), 0);
+    const std::size_t form_count = prepared.forward_forms.size();
+    const std::size_t fragment_count = in.fragments->size();
+    const std::size_t oworkers = std::max<std::size_t>(1, std::min(threads, candidates.size()));
+    std::uint64_t oheld = 0;
+    oreport.peak_bytes = 0;
+    const auto entry_bytes = [](const UnionOriginEntry& entry) -> std::uint64_t {
+        return sizeof(UnionOriginEntry) +
+               static_cast<std::uint64_t>(entry.states.fragments.size() + entry.states.starts.size()) *
+                   sizeof(std::uint32_t) +
+               static_cast<std::uint64_t>(entry.states.states.size()) * sizeof(StateCount);
+    };
+    // Per-slot scratch, reused across batches: an entry is built here and copied out once at its exact size, so
+    // the fill leaves no trail of doubled and abandoned arrays behind the retained ones.
+    std::vector<StateAggregateSet> slot_scratch(oworkers);
+    for (std::size_t begin = 0; begin < candidates.size(); begin += oworkers) {
+        const std::size_t end = std::min(begin + oworkers, candidates.size());
+        std::vector<UnionOriginEntry> batch(end - begin);
+        std::vector<std::uint64_t> batch_origins(end - begin, 0);
+        std::vector<std::exception_ptr> failures(end - begin);
+        const auto build_one = [&](std::size_t slot) {
+            const ActiveWorker active;
+            const std::size_t e = candidates[begin + slot];
+            const Distinct& d = distinct[eligible[e]];
+            const std::size_t length = d.bytes.size();
+            const std::vector<CachedPlacement>& forward_cached = entries[e].placements;
+            const std::vector<CachedPlacement>& reverse_cached = entries[position_of[d.partner]].placements;
+            // Rows per form: forward placements as cached (already (start, consumed) within a form); reverse ones
+            // turned to forward coordinates -- the end, length - start -- and re-sorted, as the direct path does.
+            std::vector<FormPlacement> forward_rows(forward_cached.size());
+            std::vector<std::size_t> forward_at(form_count + 1, 0);
+            for (std::size_t i = 0; i < forward_cached.size(); ++i) {
+                const CachedPlacement& c = forward_cached[i];
+                forward_rows[i] = {c.start, c.consumed, c.mismatches, c.emission};
+                ++forward_at[c.form + 1];
+            }
+            std::vector<FormPlacement> reverse_rows(reverse_cached.size());
+            std::vector<std::size_t> reverse_at(form_count + 1, 0);
+            for (std::size_t i = 0; i < reverse_cached.size(); ++i) {
+                const CachedPlacement& c = reverse_cached[i];
+                reverse_rows[i] = {static_cast<std::uint32_t>(length - c.start), c.consumed, c.mismatches, c.emission};
+                ++reverse_at[c.form + 1];
+            }
+            for (std::size_t form = 0; form < form_count; ++form) {
+                forward_at[form + 1] += forward_at[form];
+                reverse_at[form + 1] += reverse_at[form];
+            }
+            for (std::size_t form = 0; form < form_count; ++form) {
+                std::sort(reverse_rows.begin() + static_cast<std::ptrdiff_t>(reverse_at[form]),
+                          reverse_rows.begin() + static_cast<std::ptrdiff_t>(reverse_at[form + 1]),
+                          [](const FormPlacement& lhs, const FormPlacement& rhs) {
+                              return std::tie(lhs.start, lhs.consumed) < std::tie(rhs.start, rhs.consumed);
+                          });
+            }
+            const auto row = [](const std::vector<FormPlacement>& rows, const std::vector<std::size_t>& at,
+                                std::size_t form) {
+                return RowView{rows.data() + at[form], at[form + 1] - at[form]};
+            };
+            UnionOriginEntry& entry = batch[slot];
+            StateAggregateSet& built_states = slot_scratch[slot];
+            built_states.clear();
+            std::map<std::uint32_t, OriginAccumulator> origins;
+            std::vector<StateKey> keys;
+            for (std::size_t f = 0; f < fragment_count; ++f) {
+                if (budget.stop()) throw PlacementCancelled();
+                const InsertSupport& support = prepared.support_by_fragment[f];
+                if (support.empty()) continue;
+                const RowView forward_view[2] = {row(forward_rows, forward_at, 2 * f), row(forward_rows, forward_at, 2 * f + 1)};
+                const RowView reverse_view[2] = {row(reverse_rows, reverse_at, 2 * f), row(reverse_rows, reverse_at, 2 * f + 1)};
+                if ((forward_view[0].empty() || reverse_view[0].empty()) &&
+                    (forward_view[1].empty() || reverse_view[1].empty())) {
+                    continue;
+                }
+                keys.clear();
+                pair_fragment(forward_view, reverse_view, support, nullptr, 0, origins, entry.latent_pairs,
+                              entry.valid_states,
+                              [&](std::size_t arm, std::uint32_t, std::uint32_t insert, const OriginAccumulator& origin) {
+                                  const std::uint64_t seen =
+                                      budget.physical_origins.fetch_add(1, std::memory_order_relaxed) + 1;
+                                  if (seen > budget.max_physical_origins) {
+                                      budget.cancel();
+                                      throw ResourceExhausted(
+                                          "fragment scoring reached its physical-origin cap; no partial "
+                                          "ranking is returned");
+                                  }
+                                  StateKey key;
+                                  key.insert_bp = insert;
+                                  key.orientation = static_cast<std::uint32_t>(arm);
+                                  key.log_latent_mass = origin.log_latent_mass;
+                                  keys.push_back(key);
+                              });
+                if (keys.empty()) continue;
+                batch_origins[slot] += keys.size();
+                const std::size_t first = built_states.states.size();
+                sort_and_count(keys, built_states.states, first);
+                built_states.fragments.push_back(static_cast<std::uint32_t>(f));
+                built_states.starts.push_back(static_cast<std::uint32_t>(first));
+            }
+            built_states.starts.push_back(static_cast<std::uint32_t>(built_states.states.size()));
+            entry.states.fragments.assign(built_states.fragments.begin(), built_states.fragments.end());
+            entry.states.starts.assign(built_states.starts.begin(), built_states.starts.end());
+            entry.states.states.assign(built_states.states.begin(), built_states.states.end());
+            entry.origins = batch_origins[slot];
+        };
+        if (end - begin == 1) {
+            build_one(0);
+        } else {
+            std::vector<std::thread> pool;
+            for (std::size_t slot = 0; slot < end - begin; ++slot) {
+                pool.emplace_back([&, slot]() {
+                    try {
+                        build_one(slot);
+                    } catch (const PlacementCancelled&) {
+                    } catch (...) {
+                        failures[slot] = std::current_exception();
+                    }
+                });
+            }
+            for (std::thread& worker : pool) worker.join();
+            for (const std::exception_ptr& failure : failures) {
+                if (failure) std::rethrow_exception(failure);
+            }
+            if (budget.stop()) throw PlacementCancelled();
+        }
+        // Executed work, merged in slot order; then admission in canonical order.
+        std::uint64_t transient = 0;
+        for (std::size_t slot = 0; slot < end - begin; ++slot) {
+            const UnionOriginEntry& entry = batch[slot];
+            counters.physical_origins += entry.origins;
+            counters.statistical_state_classes += entry.states.states.size();
+            counters.latent_alignment_pairs += entry.latent_pairs;
+            counters.valid_fr_states += entry.valid_states;
+            oreport.origins_constructed += entry.origins;
+            oreport.state_aggregates_constructed += entry.states.states.size();
+            oreport.latent_pairs_constructed += entry.latent_pairs;
+            oreport.valid_states_constructed += entry.valid_states;
+            transient += entry_bytes(entry);
+        }
+        oreport.peak_bytes = std::max<std::uint64_t>(oreport.peak_bytes, oheld + transient);
+        for (std::size_t slot = 0; slot < end - begin; ++slot) {
+            UnionOriginEntry& entry = batch[slot];
+            const std::uint64_t bytes = entry_bytes(entry);
+            if (oheld + bytes <= origin_budget_bytes) {
+                oheld += bytes;
+                kept[begin + slot] = 1;
+                ++oreport.admitted_segments;
+                oreport.origin_records_held += entry.states.states.size();
+                oreport.origins_held += entry.origins;
+                origin_entries->push_back(std::move(entry));
+                built[begin + slot] = &origin_entries->back();
+            } else {
+                ++oreport.declined_segments;
+            }
+        }
+    }
+    oreport.payload_bytes = oheld;
+    for (std::size_t c = 0; c < candidates.size(); ++c) {
+        if (kept[c] == 0) continue;
+        const Distinct& d = distinct[eligible[candidates[c]]];
+        const std::uint32_t length = static_cast<std::uint32_t>(d.bytes.size());
+        for (const Occurrence& occurrence : d.occurrences) {
+            OriginZone zone;
+            zone.start_lo = occurrence.offset + static_cast<std::uint32_t>(g);
+            zone.start_hi = occurrence.offset + length - static_cast<std::uint32_t>(R + g);
+            zone.end_lo = occurrence.offset + static_cast<std::uint32_t>(R + g);
+            zone.end_hi = occurrence.offset + length - static_cast<std::uint32_t>(g);
+            zone.entry = built[c];
+            origin_reuse->zones[occurrence.haplotype].push_back(zone);
+            ++oreport.hits;
+        }
+    }
+    for (std::vector<OriginZone>& zones : origin_reuse->zones) {
+        std::sort(zones.begin(), zones.end(),
+                  [](const OriginZone& x, const OriginZone& y) { return x.start_lo < y.start_lo; });
+        oreport.index_bytes += zones.size() * sizeof(OriginZone);
+    }
+    oreport.peak_bytes = std::max<std::uint64_t>(oreport.peak_bytes, oheld + oreport.index_bytes);
+    oreport.misses = oreport.segment_occurrences - oreport.hits;
+    oreport.seconds_fill = std::chrono::duration<double>(std::chrono::steady_clock::now() - origin_mark).count();
+    report.seconds_fill = std::chrono::duration<double>(origin_mark - fill_mark).count();
 }
 
 // Runs placement over [0, unique) with the declared worker count, merging in thread-index order so
@@ -3508,11 +3909,16 @@ std::size_t run_placement(
             : std::max<std::size_t>(1, std::min(requested_threads, span_count));
     if (threads <= 1) {
         const ActiveWorker active;
-        place_haplotype_range(in, first_h, last_h, budget, mass_column, counters, memory, cache_work,
+        place_haplotype_range(in, first_h, last_h, 1, budget, mass_column, counters, memory, cache_work,
                               origins_out, census_out);
         return threads;
     }
     const std::size_t span = (span_count + threads - 1) / threads;
+    // Under union origin reuse the haplotypes are dealt round-robin rather than in contiguous spans: served
+    // haplotypes cost a fraction of unserved ones, and the interned order groups them. Each column is still
+    // computed whole by one worker, and every counter is an integer sum or a maximum, so the assignment changes
+    // the schedule and nothing else.
+    const bool interleave = in.origin_reuse != nullptr;
     std::vector<FragmentScoringCounters> local(threads);
     std::vector<ScorerMemoryAccounts> local_memory(threads);
     std::vector<EmissionCacheCounters> local_cache(threads);
@@ -3520,12 +3926,13 @@ std::size_t run_placement(
     std::vector<std::thread> workers;
     workers.reserve(threads);
     for (std::size_t t = 0; t < threads; ++t) {
-        const std::size_t lo = std::min(first_h + t * span, last_h);
-        const std::size_t hi = std::min(lo + span, last_h);
-        workers.emplace_back([&, t, lo, hi]() {
+        const std::size_t lo = interleave ? std::min(first_h + t, last_h) : std::min(first_h + t * span, last_h);
+        const std::size_t hi = interleave ? last_h : std::min(lo + span, last_h);
+        const std::size_t stride = interleave ? threads : 1;
+        workers.emplace_back([&, t, lo, hi, stride]() {
             const ActiveWorker active;
             try {
-                place_haplotype_range(in, lo, hi, budget, mass_column, local[t], local_memory[t],
+                place_haplotype_range(in, lo, hi, stride, budget, mass_column, local[t], local_memory[t],
                                       local_cache[t], origins_out, census_out);
             } catch (const PlacementCancelled&) {
             } catch (...) {
@@ -3567,6 +3974,11 @@ std::size_t run_placement(
         counters.latent_alignment_pairs += part.latent_alignment_pairs;
         counters.physical_origins += part.physical_origins;
         counters.statistical_state_classes += part.statistical_state_classes;
+        counters.reused_physical_origins += part.reused_physical_origins;
+        counters.reused_state_aggregates += part.reused_state_aggregates;
+        counters.reused_latent_alignment_pairs += part.reused_latent_alignment_pairs;
+        counters.reused_valid_fr_states += part.reused_valid_fr_states;
+        counters.merged_state_classes += part.merged_state_classes;
     }
     return threads;
 }
@@ -4156,6 +4568,23 @@ FragmentScoringResult score_diplotypes(
     const bool origins_force_serial = !options.record_origins_for_fragments.empty();
     UnionReplay union_replay;
     std::vector<UnionSegmentEntry> union_entries;
+    UnionOriginReuse union_origins;
+    std::deque<UnionOriginEntry> union_origin_entries;
+    const bool union_phase_one = options.union_segment_lengths != nullptr && options.union_placement_cache_bytes > 0;
+    const bool union_phase_two = union_phase_one && options.union_origin_cache_bytes > 0;
+    if (options.union_origin_cache_bytes > 0) {
+        if (!union_phase_one) {
+            throw std::invalid_argument("union origin reuse needs union placement reuse (a segmentation and its budget)");
+        }
+        if (options.max_union_cached_origins_consumed == 0 || options.max_union_cached_states_consumed == 0) {
+            throw std::invalid_argument("union origin reuse needs both of its consumption caps, positive");
+        }
+        if (options.record_origin_summary || !options.record_origins_for_fragments.empty()) {
+            throw std::invalid_argument("union origin reuse does not record per-origin diagnostics");
+        }
+    }
+    union_origins.max_origins = options.max_union_cached_origins_consumed;
+    union_origins.max_states = options.max_union_cached_states_consumed;
 
     const auto note_observed_work = [&]() {
         if (observed_on_failure == nullptr) return;
@@ -4172,6 +4601,11 @@ FragmentScoringResult score_diplotypes(
         observed_on_failure->seconds_diploid_combination = 0.0;
         observed_on_failure->union_placement_cache = result.union_placement_cache;
         observed_on_failure->union_placement_cache.placements_replayed = union_replay.consumed.load(std::memory_order_relaxed);
+        observed_on_failure->union_origin_cache = result.union_origin_cache;
+        observed_on_failure->union_origin_cache.origins_consumed =
+            union_origins.origins_consumed.load(std::memory_order_relaxed);
+        observed_on_failure->union_origin_cache.states_consumed =
+            union_origins.states_consumed.load(std::memory_order_relaxed);
     };
 
     result.threads_used_placement =
@@ -4180,17 +4614,21 @@ FragmentScoringResult score_diplotypes(
             : std::max<std::size_t>(1, std::min(options.threads, unique));
     try {
         if (options.record_haplotype_work != nullptr) options.record_haplotype_work->assign(unique, HaplotypeWork{});
-        if (options.union_segment_lengths != nullptr && options.union_placement_cache_bytes > 0 && unique > 0 &&
-            !prepared.forward_forms.empty()) {
+        if (union_phase_one && unique > 0 && !prepared.forward_forms.empty()) {
             fill_union_cache(inputs, *options.union_segment_lengths, options.union_placement_cache_bytes,
                              options.max_union_cached_placements_consumed, options.threads, budget, counters,
-                             result.emission_cache, union_entries, union_replay, result.union_placement_cache);
+                             result.emission_cache, union_entries, union_replay, result.union_placement_cache,
+                             options.union_origin_cache_bytes, union_phase_two ? &union_origins : nullptr,
+                             &union_origin_entries, &result.union_origin_cache);
             inputs.replay = &union_replay;
+            if (union_phase_two) inputs.origin_reuse = &union_origins;
         }
         result.threads_used_placement =
             run_placement(inputs, 0, unique, options.threads, origins_force_serial, budget,
                           mass_column, counters, result.memory, result.emission_cache, origins_out);
         result.union_placement_cache.placements_replayed = union_replay.consumed.load(std::memory_order_relaxed);
+        result.union_origin_cache.origins_consumed = union_origins.origins_consumed.load(std::memory_order_relaxed);
+        result.union_origin_cache.states_consumed = union_origins.states_consumed.load(std::memory_order_relaxed);
     } catch (const ResourceExhausted&) {
         note_observed_work();
         throw;
@@ -5841,7 +6279,7 @@ void PreparedScoringContext::retain_census(std::size_t haplotype) {
     EmissionCacheCounters cache_work;
     std::vector<std::vector<double>> scratch = state.mass_column;
     try {
-        place_haplotype_range(inputs, haplotype, haplotype + 1, state.budget, scratch, counters,
+        place_haplotype_range(inputs, haplotype, haplotype + 1, 1, state.budget, scratch, counters,
                               memory, cache_work, none, &capture);
     } catch (const ResourceExhausted&) {
         state.refused = true;

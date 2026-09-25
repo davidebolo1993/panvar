@@ -361,6 +361,74 @@ calls, phase and filters are the reference scorer's, which stays the oracle.
   worker-seconds 3.56x, wall 167.7 -> 101.5 s, CPU 1,164 -> 473 s, footprint 2.16 -> 2.02 GiB. At 2x
   (`loo.HG02282.2`) there is no overhead: wall 23.8 -> 22.2 s, footprint 0.57 -> 0.62 GiB.
 
+## Union origin reuse, phase 2 (2026-09-25): implemented, off, bound by no profile
+
+Phase 2 serves the physical origins wholly inside a repeated segment, on top of phase 1. Scores, ranking, calls,
+phase and filters are the reference scorer's bit for bit; no v1-v4 profile binds it and no v5 exists.
+
+- **The partition.** An origin is (fragment, arm, forward start s, insert I); its latent mass sums the forward
+  placements starting at s against the reverse placements ending at e = s + I, and nothing else. When s is in
+  one segment occurrence's forward interior zone [o + g, o + L - R - g] and e in the same occurrence's reverse
+  interior zone [o + R + g, o + L - g], every one of those placements is a phase-1 replayed placement (both
+  strands admitted), so the origin -- insert, orientation, latent mass summed in the same order -- depends on the
+  segment's bytes alone. Those (s, e) pairs are skipped by the direct pairing and served; every other pair --
+  across a segment or block boundary, near a locus end, in a short, declined or single-occurrence segment -- is
+  paired directly. The rule is on (s, e) alone, so the two sets are disjoint and exhaustive.
+- **Representation and arithmetic.** Per distinct segment, the served origins are built once from its cached
+  placements with the same pairing routine the direct path uses (`pair_fragment`, shared by the reference path,
+  the direct path, the construction and the self-check) and stored as sorted per-fragment StateKey
+  multiplicities (`StateAggregateSet`, the repair cache's merge representation). Each occurrence adds its own
+  copies, so multiplicity is preserved. Per (fragment, haplotype) the direct StateKeys are sorted and counted, the
+  served aggregates merged in (`merge_sorted`), and the mass reduced with `reduce_sorted` -- ascending StateKey,
+  one `log_add_exp` per key, exactly what `reduce_states` does over the reference's map. Self-check
+  (`set_origin_cache_self_check`): every served fragment census is compared to a fresh enumeration.
+- **Admission.** Canonical phase-1 order; admitted while the payload fits `union_origin_cache_bytes`; declined
+  segments are paired directly; no eviction.
+- **Resources.** `physical_origins`, `statistical_state_classes`, `latent_alignment_pairs` and `valid_fr_states`
+  count executed work -- direct pairing plus the one-time construction -- and `max_physical_origins` and
+  `max_state_classes` bind that. Served work is counted apart (`reused_physical_origins`,
+  `reused_state_aggregates`, `reused_latent_alignment_pairs`, `reused_valid_fr_states`) and bound by
+  `max_union_cached_origins_consumed` and `max_union_cached_states_consumed`, both required positive when phase 2
+  is on; a haplotype's served occurrences are charged before any is merged, and crossing either cap refuses with
+  no ranking. Logical totals: reference origins = executed - constructed + served (likewise pairs and valid
+  states); reference classes = `merged_state_classes`. Status keys `union_origin_cache_*`,
+  `union_cached_origins_consumed`, `union_cached_states_consumed`, `seconds_union_origin_cache_fill`; trace
+  columns `reused_physical_origins`, `reused_state_aggregates`, `merged_state_classes`, `seconds_cached_merge`.
+- **Schedule.** With phase 2 on, union haplotypes are dealt to workers round-robin instead of in contiguous
+  spans (each column is still computed whole by one worker; counters are integer sums or maxima). Needed for
+  the wall target: served mosaics cost a fraction of panel haplotypes and the interned order groups them -- on
+  `loo.NA19434.30` the slowest worker would take 110.9 s dealt contiguously against 59.5 s round-robin.
+- **Union-only diagnostic** (`diagnostic_union_only`, probe `--union-only 1`): stops after the union pass is
+  scored and ranked, writes `<prefix>.union_diagnostic_ranking.tsv` (every ranked candidate's score, terms and
+  prior in `%a`, plus a digest of every mass cell and exposure) and status `UNION_DIAGNOSTIC_ONLY`; never a call.
+- **Gates.** `panvar_genotype_union_placement_cache` now also covers phase 2: substitution/insertion/deletion/
+  empty alleles, long interiors and short blocks, inserts crossing one or several boundaries, flush locus ends,
+  a tandem repeat, identical segments at offsets and twice in one haplotype, both arms, a near-duplicate segment
+  whose fragments have origins of equal insert and orientation but different latent mass (1,635 such classes
+  inside served interiors), forced hash collisions, origin cache off/exact/one byte below/undersized and over an
+  undersized placement cache, both consumption caps exact and one below (also at 4 threads) and zero (invalid),
+  the executed caps exact and one below (the reference refuses at the reused run's origin cap), 1/2/4/8
+  threads, permuted haplotypes, reversed candidate requests, wrong and whole-haplotype segmentations, and the
+  self-check -- mass cells, exposure, components, totals, ranking, winner set and the logical placement, origin,
+  pair, valid-state and class totals equal to the reference's.
+- **`loo.HG02282.2`** (full v4 call, 8 threads, phase 1+2 on vs off): every table, the 12-round repair
+  trajectory and the status apart from executed work, timings and the caches' keys identical; origins 28,921,915
+  = 15,252,027 executed (1,623,619 constructed once) + 15,293,507 served; classes 25,158,698 = merged; executed
+  origins 1.90x fewer. Wall 24.1 -> 21.0 s, footprint 0.58 -> 0.66 GiB. The new build's reference path equals
+  the phase-1 (07cd4b2) off run in every table and status key.
+- **`loo.NA19434.30`** (union-only diagnostic, v4 campaign-local, unchanged 700M executed-origin cap, 512 MiB
+  placement cache, 1 GiB origin cache, both served caps 2e9, 300 s): the union COMPLETES at 276,056,754 executed
+  origins (39.4% of the cap). The reference (reuse off, diagnostic cap raised to 2e9) needs 700,039,154 logical
+  origins -- 39,154 over the cap, which is why v4 refuses it -- and 551,131,166 classes; phase 2 reconciles to
+  both exactly (executed 276.1M incl. 26.2M constructed + 450.2M served; classes 226.2M executed, 347.9M
+  aggregates served, 551.1M merged). Executed origins 2.54x fewer, classes 2.44x. The certified ranking of all
+  8,384 sequence candidates (TIED, winner set 16) and the digest of all 10.45M mass cells are bit-identical to
+  the reference's. Union pass 72.4 s (reference 155.8 s), wall 74.8 s, CPU 500 s (1,213 s); worker-seconds
+  434.5 (1,210.5). Origin cache 138 of 138 segments, 2,166 hits, 545 misses, 22.9M aggregates, payload 554.0 MB,
+  fill 0.66 s; placement cache fill 10.2 s. Footprint 3.07 GiB (reference 1.93 GiB): the origin cache 0.52 GiB,
+  the placement cache up to 0.23 GiB, and about 0.45 GiB of freed large blocks the allocator keeps dirty
+  (`vmmap`: MALLOC_LARGE empty) -- not a leak, not yet reduced.
+
 ## Frozen defaults
 
 State limit **256** (production) and **1,024** (diagnostic comparison width) -- counted in allele-prefix
