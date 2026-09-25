@@ -469,6 +469,13 @@ def launch(args):
     for name, value in bound.items():
         if settings.get(name) != value:
             raise Defect(f"launch refused: the plan's {name} is {settings.get(name)}, this launch has {value}")
+    # The campaign's own code and profiles are the reviewed ones: every repository file the plan hashed is unchanged.
+    for name, value in settings.items():
+        if not name.endswith("_sha256") or "/" not in name:
+            continue
+        path = REPO / name[: -len("_sha256")]
+        if not path.exists() or sha256(path) != value:
+            raise Defect(f"launch refused: {path.relative_to(REPO)} is not the file the plan reviewed")
     launch_file = out / "launch.tsv"
     # The production binary, the profile, the plan and the scheduler are fixed for the whole campaign. The
     # EVALUATOR (genotype_probe) may be corrected between launches -- it never touches a call -- and every

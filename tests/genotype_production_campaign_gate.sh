@@ -186,6 +186,13 @@ fake_build "$WORK/other" "$PRODUCTION_COMMIT" other
 GENOTYPE_C4_CAMPAIGN_APPROVED="$APPROVED" bash "$HARNESS" launch "$WORK/other/build" "$PLAN" > "$WORK/launch_binary.log" 2>&1
 same "launch with a binary that is not the plan's" "$?" "2"
 same "  refused for the binary" "$(grep -c "production_binary_sha256" "$WORK/launch_binary.log")" "1"
+# A campaign file changed after review (here: the plan's record of the runner's hash) is refused.
+cp "$PLAN/settings.tsv" "$WORK/settings.reviewed"
+sed -i.bak -e 's/^\(scripts\/c4_production_campaign.py_sha256\t\).*/\1changed/' "$PLAN/settings.tsv" && rm -f "$PLAN/settings.tsv.bak"
+GENOTYPE_C4_CAMPAIGN_APPROVED="$APPROVED" bash "$HARNESS" launch "$WORK/prod/build" "$PLAN" > "$WORK/launch_file.log" 2>&1
+same "launch after a campaign file changed" "$?" "2"
+same "  refused for that file" "$(grep -c "scripts/c4_production_campaign.py is not the file the plan reviewed" "$WORK/launch_file.log")" "1"
+cp "$WORK/settings.reviewed" "$PLAN/settings.tsv"
 # A resume whose previous launch ran another profile is refused before anything is staged.
 printf "key\tvalue\npanvar_sha256\t%s\nprofile\tprofiles/genotype_c4_v6_campaign_local.tsv\nprofile_sha256\tstale\njobs\t1\nthreads\t8\njobs_sha256\t%s\n" \
   "$(sha "$WORK/prod/build/panvar")" "$APPROVED" > "$PLAN/launch.tsv"
