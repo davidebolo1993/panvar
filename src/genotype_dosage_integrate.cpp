@@ -161,6 +161,7 @@ const std::vector<std::string>& legacy_call_outputs() {
 const std::vector<std::string>& dosage_stage_outputs() {
     static const std::vector<std::string> suffixes = [] {
         std::vector<std::string> s = {".locus_genotype.tsv",
+                                      ".library_estimate.tsv",
                                       ".dosage_census.tsv",
                                       ".dosage_features.tsv",
                                       ".dosage_feature_copies.tsv",

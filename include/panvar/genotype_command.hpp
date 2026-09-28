@@ -233,6 +233,9 @@ struct GenotypeCommandOptions {
     std::string dosage_mode = "off";
     // SHADOW ONLY: the allocation observability test inside the shadow audit (off until its cost is reviewed).
     bool dosage_allocation_test = false;
+    // DIAGNOSTIC ONLY (docs/algorithms/library_estimate.md): after the run, estimate the library from the reads and the
+    // model and write <prefix>.library_estimate.tsv beside the declared library. Never used by the call. Off by default.
+    bool library_diagnostic = false;
 };
 
 // What the dosage stage and the locus table need from a run: the prepared model and the sorted graph's node sequences.

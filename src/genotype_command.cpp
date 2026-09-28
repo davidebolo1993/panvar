@@ -1,6 +1,7 @@
 #include "panvar/genotype_command.hpp"
 #include "panvar/genotype_dosage_integrate.hpp"
 #include "panvar/genotype_dosage_repair.hpp"
+#include "panvar/library_estimate.hpp"
 
 #include "panvar/bubbles.hpp"
 #include "panvar/fragment_likelihood.hpp"
@@ -4286,6 +4287,7 @@ int run_genotype_command(const std::vector<std::string>& args) {
             if (v != "off" && v != "shadow") throw std::runtime_error("--dosage-audit takes off or shadow");
             options.dosage_mode = v == "shadow" ? "audit" : "off";
         }
+        else if (flag == "--library-diagnostic") options.library_diagnostic = true;
         else if (flag == "--dosage-mode") {
             options.dosage_mode = need(i);
             if (options.dosage_mode != "off" && options.dosage_mode != "audit" && options.dosage_mode != "repair") {
@@ -4332,6 +4334,8 @@ int run_genotype_command(const std::vector<std::string>& args) {
                 "also replaces a block's genotype where the stage found a complete diplotype repair,\n"
                 "keeping the caller's outputs as .original.*. A dosage-content correction that is not\n"
                 "a resolved diplotype is reported beside the caller's genotype, never in place of it.\n\n"
+                "--library-diagnostic (off by default) also writes .library_estimate.tsv, a library\n"
+                "estimated from the reads and the model beside the declared one; the call never uses it.\n\n"
                 "--panel-curation takes a manifest of panel templates to exclude: one template name\n"
                 "per line, '#' opening a comment line. It is recorded with the reason, the manifest\n"
                 "path and a digest, and a manifest naming an absent template is refused.\n\n"
@@ -4439,6 +4443,17 @@ int run_genotype_command(const std::vector<std::string>& args) {
                                       audit_status == "COMPLETE" ? &summary : nullptr, audit_status, audit_note,
                                       library ? &filters : nullptr);
         dosage::write_locus_genotype(model, options.out_prefix, integration);
+        if (options.library_diagnostic && model) {
+            std::optional<double> ignored;
+            const LibraryModel declared = read_library(options.library_path, ignored);
+            const std::vector<ReadPair> pairs = fragments.empty() ? read_fragments(options.reads1_path, options.reads2_path) : fragments;
+            LibraryEstimateOptions estimate_options;
+            estimate_options.threads = options.threads;
+            estimate_options.marker_kmer = options.kmer_size;
+            estimate_options.marker_syncmer = options.syncmer_s;
+            atomic_write(options.out_prefix + ".library_estimate.tsv",
+                         library_estimate_table(estimate_library(*model, pairs, estimate_options, &declared), &declared));
+        }
     } catch (const std::exception& error) {
         std::cerr << "[genotype] locus output failed: " << error.what() << '\n';
         return 2;

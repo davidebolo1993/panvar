@@ -138,6 +138,7 @@ add_library(panvarlib
     src/genotype_dosage_repair.cpp
     src/genotype_dosage_shadow.cpp
     src/genotype_dosage_integrate.cpp
+    src/library_estimate.cpp
     src/genotype_dosage_provenance.cpp
     src/fragment_likelihood.cpp
     src/bubble_path.cpp
@@ -243,6 +244,12 @@ if(PANVAR_BUILD_TESTING)
         target_link_libraries(genotype_dosage_test PRIVATE panvarlib)
         target_compile_options(genotype_dosage_test PRIVATE -Wall -Wextra -Wpedantic)
         add_test(NAME panvar_genotype_dosage COMMAND genotype_dosage_test)
+
+        # Automatic-library diagnostic fixtures (docs/algorithms/library_estimate.md).
+        add_executable(library_estimate_test tests/library_estimate.cpp)
+        target_link_libraries(library_estimate_test PRIVATE panvarlib)
+        target_compile_options(library_estimate_test PRIVATE -Wall -Wextra -Wpedantic)
+        add_test(NAME panvar_library_estimate COMMAND library_estimate_test)
 
         add_executable(genotype_mosaic_core_test tests/genotype_mosaic_core.cpp)
         target_link_libraries(genotype_mosaic_core_test PRIVATE panvarlib)

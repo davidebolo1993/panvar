@@ -17,6 +17,7 @@
 #include "panvar/genotype_dosage.hpp"
 #include "panvar/genotype_dosage_integrate.hpp"
 #include "panvar/genotype_dosage_repair.hpp"
+#include "panvar/library_estimate.hpp"
 #include "panvar/genotype_locus.hpp"
 #include "panvar/genotype_model.hpp"
 #include "panvar/genotype_repair.hpp"
@@ -6299,6 +6300,38 @@ int dosage_synthetic(const Args& args) {
     return 0;
 }
 
+// library-estimate: the automatic-library diagnostic (docs/algorithms/library_estimate.md) on one read set against one
+// model, beside an optional declared library; writes <out>.library_estimate.tsv and <out>.library_inserts.tsv (every
+// accepted insert, sample order). Truth-free; genotypes nothing.
+int library_estimate(const Args& args) {
+    const std::string out = args.required("out");
+    struct Staged { std::string path; ~Staged() { std::error_code e; std::filesystem::remove(path, e); } } staged{out + ".model.sorted.gfa"};
+    const std::string curation = args.get("panel-curation", "");
+    const auto t0 = std::chrono::steady_clock::now();
+    const LoadedModel loaded = load_model(args.required("model-gfa"), args.required("reference"), staged.path, 50,
+                                          curation.empty() || curation == "none" ? std::vector<std::string>{} : read_panel_curation(curation));
+    const double seconds_model = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    const std::vector<panvar::ReadPair> reads = read_pairs(args.required("reads1"), args.required("reads2"));
+    std::optional<panvar::LibraryModel> declared;
+    if (!args.get("library", "").empty()) declared = read_library_file(args.get("library", ""));
+    panvar::LibraryEstimateOptions options;
+    options.threads = std::stoul(args.get("threads", "8"));
+    options.max_pairs = std::stoul(args.get("max-pairs", std::to_string(options.max_pairs)));
+    options.min_accepted_pairs = std::stoul(args.get("min-accepted", std::to_string(options.min_accepted_pairs)));
+    options.anchor_sampling = std::stoul(args.get("anchor-sampling", std::to_string(options.anchor_sampling)));
+    const panvar::LibraryEstimate e = panvar::estimate_library(*loaded.model, reads, options, declared ? &*declared : nullptr);
+    atomic_write(out + ".library_estimate.tsv", panvar::library_estimate_table(e, declared ? &*declared : nullptr));
+    std::ostringstream ins;
+    ins << "insert\n";
+    for (long v : e.accepted_inserts) ins << v << '\n';
+    atomic_write(out + ".library_inserts.tsv", ins.str());
+    std::cout << std::setprecision(6) << "library-estimate: pairs " << e.pairs_total << ", sampled " << e.pairs_sampled << ", accepted "
+              << e.accepted << ", insert median " << e.insert_median << " robust sd " << e.insert_robust_sd << ", mean " << e.insert_mean
+              << " sd " << e.insert_sd << ", error " << e.invariant_mismatch_rate << ", lambda " << e.fragment_start_intensity << ", "
+              << e.seconds_total << " s (model " << seconds_model << " s); model fingerprint " << loaded.fingerprint << '\n';
+    return 0;
+}
+
 int main(int argc, char** argv) {
     try {
         if (argc < 2) {
@@ -6311,6 +6344,7 @@ int main(int argc, char** argv) {
         if (command == "loo-gfa") return loo_gfa(args);
         if (command == "evaluate") return evaluate(args);
         if (command == "dosage-synthetic") return dosage_synthetic(args);
+        if (command == "library-estimate") return library_estimate(args);
         if (command == "compare") return compare(args);
         if (command == "genotype") return genotype(args);
         if (command == "trace") return trace(args);
