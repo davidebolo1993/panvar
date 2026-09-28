@@ -245,6 +245,11 @@ struct PersistedCall {
 };
 std::optional<PersistedCall> read_persisted_call(const std::string& run_prefix);
 
+// The exact score of in.call, computed as the repair's reproduction guard computes it (same context, same settings):
+// total = likelihood + unordered sequence-pair prior. For building a synthetic run whose persisted scores the guard
+// must reproduce (the known-truth repair gate); never used by a call.
+PersistedScore score_reported_diplotype(const ScoringInputs& in, double& prior);
+
 struct DosageShadowOptions {
     bool repair = true;
     bool provenance = true;
@@ -259,9 +264,21 @@ struct DosageShadowOptions {
     std::size_t chunk_haplotypes = 128;
 };
 
+// One COMPLETE_DIPLOTYPE_REPAIR, as repair mode needs it: the chosen block sequences in reported-homologue order
+// (seq1 in hap1), their panel allele ids when the block has an allele with that exact sequence, and the exact scores
+// of the reported diplotype with only this block replaced.
+struct CompleteRepair {
+    std::size_t block = 0;
+    std::string block_id, route, seq1, seq2;
+    std::optional<std::size_t> allele1, allele2;
+    double fragment_term = 0.0, exposure_term = 0.0, likelihood = 0.0, prior = 0.0, repair_separation = 0.0;
+    bool orientation_tie = false;
+};
+
 struct DosageShadowSummary {
     std::string audit_status = "COMPLETE";   // COMPLETE, NOT_RUN (no persisted call), REFUSED_LIBRARY
     std::string note;
+    std::vector<CompleteRepair> complete_repairs;
     std::size_t molecule_span_bp = 0, m = 0, sensitive_blocks = 0, repairs = 0, repairs_conditional = 0, allocation_blocks_tested = 0;
     std::map<std::string, std::size_t> status_counts, reason_counts, repair_classes;
     double seconds_census = 0.0, seconds_features = 0.0, seconds_estimate = 0.0, seconds_repair = 0.0, seconds_provenance = 0.0, seconds_allocation = 0.0,

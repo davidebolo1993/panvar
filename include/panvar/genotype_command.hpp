@@ -225,15 +225,17 @@ struct GenotypeCommandOptions {
     bool diagnostic_digest_memo_check = false;
     std::uint64_t diagnostic_branch_request_order_seed = 0;   // gate hook: permutes branch requests
     bool diagnostic_pool_dump = false;                        // gate hook: the whole pool, bit-exact
-    // SHADOW ONLY (docs/algorithms/genotype_dosage.md): "off" (default) or "shadow". Shadow audits the call after
-    // every existing output is committed and writes only <prefix>.dosage_*.tsv; it never changes a call, a score,
-    // a status value or an existing file. Last, so positional fixtures stay aligned.
-    std::string dosage_audit = "off";
+    // docs/algorithms/genotype_dosage.md sections 20 and 22: "off" (default), "audit" or "repair". Audit runs the
+    // dosage stage after every existing output is committed and writes only <prefix>.dosage_*; it never changes a call,
+    // a score, a status value or an existing file. Repair also applies COMPLETE_DIPLOTYPE_REPAIR blocks to the reported
+    // genotype, keeping the caller's outputs as <prefix>.original.*. `--dosage-audit shadow` is audit. Last, so
+    // positional fixtures stay aligned.
+    std::string dosage_mode = "off";
     // SHADOW ONLY: the allocation observability test inside the shadow audit (off until its cost is reviewed).
     bool dosage_allocation_test = false;
 };
 
-// What the shadow dosage audit needs from a run, captured only when it is requested.
+// What the dosage stage and the locus table need from a run: the prepared model and the sorted graph's node sequences.
 struct GenotypeDosageCapture {
     std::optional<PreparedGenotypeModel> model;
     std::unordered_map<std::string, std::string> node_sequences;

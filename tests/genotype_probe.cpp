@@ -15,6 +15,7 @@
 #include "panvar/fragment_likelihood.hpp"
 #include "panvar/genotype_command.hpp"
 #include "panvar/genotype_dosage.hpp"
+#include "panvar/genotype_dosage_integrate.hpp"
 #include "panvar/genotype_dosage_repair.hpp"
 #include "panvar/genotype_locus.hpp"
 #include "panvar/genotype_model.hpp"
@@ -686,6 +687,17 @@ int evaluate(const Args& args) {
         }
         if (hap1.size() != model.blocks().size() || hap2.size() != model.blocks().size()) {
             throw std::runtime_error("could not recover the winner's allele paths from the run");
+        }
+        // A dosage repair (--dosage-mode repair) reports a genotype the search's winner row does not carry: the locus
+        // table's ordered block paths are then the call, and the summary says so. Every other run is scored exactly
+        // as before, from the search's winner.
+        if (std::ifstream(run + ".locus_genotype.tsv")) {
+            const auto locus = read_table(run + ".locus_genotype.tsv");
+            if (!locus.empty() && locus.front().at("reported_genotype_source") == "caller_with_dosage_repair") {
+                hap1 = parse_alleles(locus.front().at("hap1_block_path"));
+                hap2 = parse_alleles(locus.front().at("hap2_block_path"));
+                summary << "call_source\tlocus_genotype_dosage_repaired\n";
+            }
         }
     }
 
@@ -6025,11 +6037,185 @@ int dosage_replay(const Args& args) {
         pc->score.total += std::stod(args.get("perturb-persisted-total", "0"));
         override_call = pc;
     }
+    const std::string mode = args.get("mode", "");
+    if (!mode.empty()) {
+        // the integrated stage replayed over a sealed run (docs/algorithms/genotype_dosage.md section 22): exactly what
+        // panvar genotype --dosage-mode <mode> does after its call, with the caller's outputs copied from --run to --out
+        if (!args.get("call", "").empty()) throw std::runtime_error("--mode replays the persisted call only");
+        if (read_key_values(run + ".mosaic_status.tsv").at("model_fingerprint") != loaded.fingerprint) {
+            throw std::runtime_error("the run was not scored on this model");
+        }
+        options.repair = true;
+        options.provenance = true;
+        const auto status = read_key_values(run + ".mosaic_status.tsv");
+        const std::string cls = status.count("call_class") ? status.at("call_class") : "no_call";
+        panvar::dosage::DosageShadowSummary s;
+        std::string audit_status = "NOT_RUN", audit_note = "none";
+        if (mode != "off") {
+            if (cls != "strict_call" && cls != "genotype_equivalent_call") {
+                audit_note = "the run emitted no genotype (" + status.at("status") + ")";
+                atomic_write(out + ".dosage_status.tsv",
+                             "key\tvalue\ndosage_audit\tshadow\ndosage_audit_status\tNOT_RUN\ndosage_audit_note\t" + audit_note + "\n");
+            } else {
+                // override_call is set here only by the --perturb-persisted-total refusal hook
+                s = panvar::dosage::run_dosage_shadow(model, loaded.sorted.gfa.seq, reads, library, scoring, switches, run, out, options,
+                                                      override_call);
+                audit_status = s.audit_status;
+                audit_note = s.note.empty() ? "none" : s.note;
+            }
+        }
+        const panvar::dosage::DosageIntegration d = panvar::dosage::apply_dosage_mode(
+            &model, mode, run, out, audit_status == "COMPLETE" ? &s : nullptr, audit_status, audit_note);
+        panvar::dosage::write_locus_genotype(&model, out, d);
+        std::cout << "dosage-replay --mode " << mode << ": " << audit_status << ", applied " << d.applied.size() << ", not applied "
+                  << d.not_applied.size() << ", " << s.seconds_total << " s\n";
+        return 0;
+    }
     const panvar::dosage::DosageShadowSummary s =
         panvar::dosage::run_dosage_shadow(model, loaded.sorted.gfa.seq, reads, library, scoring, switches, run, out, options, override_call);
     std::cout << "dosage-replay: " << s.audit_status << ", m " << s.m << ", span " << s.molecule_span_bp << ", repairs " << s.repairs
               << " (" << s.repairs_conditional << " conditional), " << s.seconds_total << " s; model fingerprint " << loaded.fingerprint << '\n';
     return s.audit_status == "COMPLETE" ? 0 : 3;
+}
+
+// dosage-synthetic: a known-truth fixture for the COMPLETE_DIPLOTYPE_REPAIR gate (docs/algorithms/genotype_dosage.md
+// section 22.6). From a real run whose call is exact at --block, writes a synthetic run prefix whose reported call carries
+// --alleles "<hap1>|<hap2>" at that block instead, scored exactly as the repair's guard scores it, so the integrated
+// repair must find the original (true) pair again. Every file is labelled synthetic; it is never a call.
+int dosage_synthetic(const Args& args) {
+    const std::string out = args.required("out");
+    const std::string run = args.required("run");
+    struct Staged { std::string path; ~Staged() { std::error_code e; std::filesystem::remove(path, e); } } staged{out + ".model.sorted.gfa"};
+    const std::string curation = args.get("panel-curation", "");
+    const LoadedModel loaded = load_model(args.required("model-gfa"), args.required("reference"), staged.path, 50,
+                                          curation.empty() || curation == "none" ? std::vector<std::string>{} : read_panel_curation(curation));
+    const panvar::PreparedGenotypeModel& model = *loaded.model;
+    const auto status = read_key_values(run + ".mosaic_status.tsv");
+    if (status.at("model_fingerprint") != loaded.fingerprint) throw std::runtime_error("the run was not scored on this model");
+    const std::optional<panvar::dosage::PersistedCall> real = panvar::dosage::read_persisted_call(run);
+    if (!real) throw std::runtime_error("no persisted call");
+    std::size_t b = model.blocks().size();
+    for (std::size_t i = 0; i < model.blocks().size(); ++i) if (model.blocks()[i].block_id == args.required("block")) b = i;
+    if (b == model.blocks().size()) throw std::runtime_error("no block " + args.required("block"));
+    const std::string spec = args.required("alleles");
+    const std::size_t bar = spec.find('|');
+    panvar::MosaicPath first = real->first, second = real->second;
+    first.alleles.at(b) = std::stoul(spec.substr(0, bar));
+    second.alleles.at(b) = std::stoul(spec.substr(bar + 1));
+    const panvar::LibraryModel library = read_library_file(args.required("library"));
+    const std::vector<panvar::ReadPair> reads = read_pairs(args.required("reads1"), args.required("reads2"));
+    const auto get = [&](const char* key) { const auto it = status.find(key); return it == status.end() ? 0ULL : std::stoull(it->second); };
+    panvar::dosage::ScoringInputs in;
+    const panvar::dosage::ReportedCall call = panvar::dosage::reported_call(model, first, second);
+    in.model = &model; in.first = first; in.second = second; in.call = &call; in.reads = &reads; in.library = &library;
+    in.options.mismatch_band = std::stoul(status.at("mismatch_band"));
+    in.options.minimum_piece_bp = 12;
+    in.options.max_piece_hits = get("max_piece_hits");
+    in.options.max_proposed_starts_per_haplotype = get("max_proposed_starts_per_haplotype");
+    in.options.max_physical_origins = get("max_physical_origins");
+    in.options.max_state_classes = get("max_state_classes");
+    in.options.max_mass_cells = get("max_mass_cells");
+    in.options.emission_cache_bytes = static_cast<std::size_t>(get("emission_cache_bytes"));
+    in.options.threads = std::stoul(args.get("threads", "8"));
+    in.repair_max_physical_origins = get("repair_max_physical_origins");
+    in.repair_max_state_classes = get("repair_max_state_classes");
+    in.repair_max_piece_hits = get("repair_max_piece_hits");
+    in.repair_max_latent_pairs = get("repair_max_latent_pairs");
+    in.switch_probability.assign(model.blocks().size() - 1, std::stod(args.get("switch-probability", "0.01")));
+    double prior = 0.0;
+    const panvar::dosage::PersistedScore score = panvar::dosage::score_reported_diplotype(in, prior);
+
+    const auto slurp = [](const std::string& path) {
+        std::ifstream f(path, std::ios::binary);
+        if (!f) throw std::runtime_error("cannot read " + path);
+        std::ostringstream o; o << f.rdbuf(); return o.str();
+    };
+    const auto cells = [](const std::string& line) {
+        std::vector<std::string> f; std::stringstream row(line);
+        for (std::string c; std::getline(row, c, '\t');) f.push_back(c);
+        return f;
+    };
+    const auto joined = [](const std::vector<std::string>& f) {
+        std::string o; for (std::size_t i = 0; i < f.size(); ++i) o += (i ? "\t" : "") + f[i]; return o;
+    };
+    // rewrite a TSV: fn(header, row) edits one row in place; rows for which keep() is false are dropped
+    const auto rewrite = [&](const std::string& suffix, const std::function<bool(const std::vector<std::string>&, std::vector<std::string>&)>& fn) {
+        std::istringstream text(slurp(run + suffix));
+        std::string line, o;
+        std::getline(text, line);
+        const std::vector<std::string> header = cells(line);
+        o = line + "\n";
+        while (std::getline(text, line)) {
+            std::vector<std::string> row = cells(line);
+            if (fn(header, row)) o += joined(row) + "\n";
+        }
+        atomic_write(out + suffix, o);
+    };
+    const auto at = [](const std::vector<std::string>& header, const std::string& name) {
+        return static_cast<std::size_t>(std::find(header.begin(), header.end(), name) - header.begin());
+    };
+    const auto join_alleles = [](const std::vector<std::size_t>& a) {
+        std::string o; for (std::size_t i = 0; i < a.size(); ++i) o += (i ? "," : "") + std::to_string(a[i]); return o;
+    };
+    const std::string hap1 = join_alleles(first.alleles), hap2 = join_alleles(second.alleles);
+    std::string representative;
+    rewrite(".equivalence_set.tsv", [&](const std::vector<std::string>& h, std::vector<std::string>& r) {
+        if (r[at(h, "rank")] != "1" || r[at(h, "representative")] != "true") return false;
+        representative = r[at(h, "candidate_id")];
+        std::ostringstream v; v << std::setprecision(17);
+        r[at(h, "hap1_alleles")] = hap1; r[at(h, "hap2_alleles")] = hap2;
+        r[at(h, "source")] = "synthetic_injection"; r[at(h, "scored_in")] = "synthetic";
+        for (const auto& [col, x] : {std::make_pair("score", score.total), std::make_pair("fragment_term", score.fragment),
+                                     std::make_pair("exposure_term", score.exposure), std::make_pair("sequence_pair_prior", prior)}) {
+            std::ostringstream c; c << std::setprecision(17) << x; r[at(h, col)] = c.str();
+        }
+        r[at(h, "exact_path_prior")] = "NA";
+        return true;
+    });
+    rewrite(".mosaic_candidates.tsv", [&](const std::vector<std::string>& h, std::vector<std::string>& r) {
+        if (r[at(h, "candidate_id")] == representative) { r[at(h, "hap1_alleles")] = hap1; r[at(h, "hap2_alleles")] = hap2; }
+        return true;
+    });
+    rewrite(".mosaic_scores.tsv", [&](const std::vector<std::string>&, std::vector<std::string>&) { return true; });
+    const panvar::PreparedGenotypeBlock& block = model.blocks()[b];
+    for (const std::string suffix : {".genotypes.tsv", ".block_genotypes.tsv"}) {
+        rewrite(suffix, [&](const std::vector<std::string>& h, std::vector<std::string>& r) {
+            if (r[at(h, "block_id")] != block.block_id) return true;
+            const std::size_t a1 = first.alleles[b], a2 = second.alleles[b];
+            r[at(h, "allele1")] = std::to_string(a1); r[at(h, "allele2")] = std::to_string(a2);
+            r[at(h, "allele1_bp")] = std::to_string(block.alleles[a1].sequence.size());
+            r[at(h, "allele2_bp")] = std::to_string(block.alleles[a2].sequence.size());
+            r[at(h, "zygosity")] = a1 == a2 ? "HOM" : "HET";
+            if (at(h, "allele1_sources") < h.size()) {
+                std::string s1, s2;
+                for (const std::string& x : block.alleles[a1].source_ids) s1 += (s1.empty() ? "" : ",") + x;
+                for (const std::string& x : block.alleles[a2].source_ids) s2 += (s2.empty() ? "" : ",") + x;
+                r[at(h, "allele1_sources")] = s1; r[at(h, "allele2_sources")] = s2;
+            }
+            return true;
+        });
+    }
+    {
+        std::istringstream fa(slurp(run + ".mosaic_haplotypes.fa"));
+        std::vector<std::string> headers;
+        for (std::string line; std::getline(fa, line);) if (!line.empty() && line[0] == '>') headers.push_back(line);
+        if (headers.size() != 2) throw std::runtime_error("the run has no two-haplotype FASTA");
+        std::ostringstream o;
+        for (int h = 0; h < 2; ++h) {
+            const std::string bases = panvar::spell_mosaic(model, h == 0 ? first : second).bases;
+            std::string head = headers[h];
+            const std::size_t p = head.find(" bp="), e = head.find(' ', p + 1);
+            head = head.substr(0, p) + " bp=" + std::to_string(bases.size()) + (e == std::string::npos ? "" : head.substr(e));
+            o << head << " synthetic_injection=" << block.block_id << '\n';
+            for (std::size_t k = 0; k < bases.size(); k += 60) o << bases.substr(k, 60) << '\n';
+        }
+        atomic_write(out + ".mosaic_haplotypes.fa", o.str());
+    }
+    atomic_write(out + ".mosaic_status.tsv", slurp(run + ".mosaic_status.tsv") + "synthetic_dosage_injection\t" + block.block_id + "=" +
+                                                 spec + "\nsynthetic_source_run\t" + run + "\n");
+    std::cout << std::setprecision(17) << "dosage-synthetic: " << block.block_id << " " << real->first.alleles[b] << "|" << real->second.alleles[b]
+              << " -> " << spec << "; total " << score.total << " (real " << real->score.total << ")\n";
+    return 0;
 }
 
 int main(int argc, char** argv) {
@@ -6043,6 +6229,7 @@ int main(int argc, char** argv) {
         if (command == "simulate") return simulate(args);
         if (command == "loo-gfa") return loo_gfa(args);
         if (command == "evaluate") return evaluate(args);
+        if (command == "dosage-synthetic") return dosage_synthetic(args);
         if (command == "compare") return compare(args);
         if (command == "genotype") return genotype(args);
         if (command == "trace") return trace(args);

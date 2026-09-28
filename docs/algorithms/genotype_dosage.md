@@ -786,3 +786,148 @@ The single repair scope is replaced by four fields on every repair, each in ever
 - 4 COMPLETE_DIPLOTYPE_REPAIR (pair route, HG03456 sv:1);
 - 48 CONDITIONAL_DOSAGE_CONTENT;
 - 2 TRIGGERED_UNREPAIRED (fresh HG01352.2 and NA20847.2, content-conditional).
+
+## 22. Production integration (2026-09-28; implements §20, with the amendments marked)
+
+`src/genotype_dosage_integrate.cpp`. Both `panvar genotype` and `genotype_probe dosage-replay --mode` run the same code
+after the caller's outputs are committed, reading them back from disk. The replay therefore integrates a sealed run
+exactly as a fresh run would be integrated.
+
+### 22.1 Modes
+
+- **Flag:** `--dosage-mode off|audit|repair`, default `off`. `--dosage-audit shadow` is kept as the spelling of `audit`.
+- **off:** no dosage work. Every pre-existing output is byte-identical to the pre-dosage command.
+- **audit:** the §12 stage (census, features, classification, repair search, provenance). It writes only
+  `<prefix>.dosage_*`.
+- **repair:** as audit, then §22.2.
+- **In every mode** the run also writes `<prefix>.locus_genotype.tsv` (§22.3). *Amends §20.1, which listed no new file
+  for off.*
+- **At start** a run removes every dosage, locus and `.original.*` file under its prefix, as it already removes its
+  other outputs.
+
+### 22.2 What repair mode changes
+
+- **An applied COMPLETE_DIPLOTYPE_REPAIR** replaces the block's genotype columns in `genotypes.tsv` and
+  `block_genotypes.tsv`:
+  - `allele1`/`allele2` in homologue order, their bp, sources and zygosity;
+  - `conditional_genotype_posterior` and `conditional_GQ` become NA.
+  - It also respells both haplotypes in `mosaic_haplotypes.fa`. Each header keeps its fields, updates `bp=`, and
+    gains `dosage_repaired_blocks=<ids> dosage_repair_role=RESOLVED`.
+- **Every other block** keeps every caller column. `filter`, `quality_filter` and `phase_support` are never rewritten
+  (§20.4). An orientation tie leaves phase unchanged (§8, rule 4).
+- **Trailing columns** are appended to every row of both block tables, in this order:
+  - `dosage_status`, `dosage_reason`, `dosage_filter`, `dosage_filter_reason`, `repair_class`, `dosage_repair_applied`;
+  - `dosage_content_scope`, `diplotype_scope`, `allocation_equivalence_scope`, `serialization_representative`;
+  - `original_allele1`, `original_allele2` (the caller's), `original_content`, `corrected_content`,
+    `admissible_content_vectors`;
+  - `allocation_status`, `original_GQ`, `gq_status`, `repair_separation`, `conditional_repair_gap`.
+  - No repaired allele identity appears in these columns. A conditional representative stays in `dosage_blocks.tsv`,
+    `dosage_repaired*.fa` and the equivalence table only.
+- **`dosage_filter`** is as §20.4, plus one value. `DOSAGE_REPAIR_NOT_APPLIED` marks a COMPLETE_DIPLOTYPE_REPAIR that
+  was not applied, with its reason.
+- **Fail-closed eligibility** (*amendment*: cases §20 does not cover exactly). A COMPLETE_DIPLOTYPE_REPAIR is applied
+  only when all of these hold; otherwise the block keeps the caller's genotype with `DOSAGE_REPAIR_NOT_APPLIED` and the
+  reason:
+  - the run is a strict call (`not_a_strict_call`);
+    - A repair is scored in the representative's phase context. A genotype-equivalent set's other members were not
+      rescored.
+  - it is the only COMPLETE repair in the run (`several_complete_repairs_not_jointly_scored`);
+    - Each repair is scored against the caller's other blocks. Two repairs together were never scored.
+  - both repaired block sequences are panel alleles of that block (`repaired_allele_not_a_panel_allele`);
+    - The block tables and the evaluator address alleles by panel ID. A novel constructed allele has none.
+  - the caller's representative paths respell the committed FASTA exactly (`reported_haplotypes_not_reproduced`).
+
+  None of these cases occurs in the C4 replay (§22.5). Each is covered by a fixture.
+- **Status:** `mosaic_status.tsv` keeps every caller line, in order, and gains these keys after them:
+  - `dosage_mode`, `dosage_policy`, `dosage_audit_status`, `dosage_molecule_span_bp`, `dosage_m`;
+  - `dosage_repair_class_*`;
+  - `dosage_repaired_blocks`, `dosage_repair_not_applied_blocks`, `dosage_content_corrected_blocks`,
+    `dosage_triggered_unrepaired_blocks`;
+  - `dosage_reported_genotype` (`caller` or `caller_with_dosage_repair`), `dosage_search_winner_superseded`.
+- **The search record is not rewritten** (*amendment*):
+  - `mosaic_scores.tsv`, `mosaic_candidates.tsv`, `equivalence_set.tsv` and the repair trajectory record what the
+    caller scored. `in_winner_set` still marks the caller's winner.
+  - A repaired diplotype is not a ranked candidate: it was chosen under the dosage constraint, and its total can be
+    below the caller's winner.
+  - The reported genotype is the locus table and the block tables. `dosage_search_winner_superseded true` says they
+    differ from the search's winner.
+- **Recoverability** (*amends §20.5's file names*):
+  - Every existing caller call-bearing output is copied byte for byte to `<prefix>.original.<suffix>` before anything
+    is rewritten: `genotypes.tsv`, `block_genotypes.tsv`, `mosaic_haplotypes.fa`, `mosaic_status.tsv`,
+    `mosaic_scores.tsv`, `mosaic_candidates.tsv`, `equivalence_set.tsv`.
+  - `<prefix>.original` is then a complete legacy prefix, which the evaluator scores unchanged.
+  - The originals are written in every repair-mode run. They are never partial: all rewritten contents are built in
+    memory, then the originals are written, then the rewrites.
+- **Refusal inside the stage** (guard, caps) is TRIGGERED_UNREPAIRED as before. It has no candidate rows and changes no
+  genotype.
+
+### 22.3 `<prefix>.locus_genotype.tsv`
+
+One header row and one data row, 60 columns in this order:
+- **Run and call:** `prefix`, `run_status`, `call_class`, `no_call_reason`, `locus_filter`, `quality_rule`,
+  `quality_pass_blocks`, `quality_lowqual_blocks`, `phase_support`, `candidate_scope`, `search_conditional`,
+  `reported_genotype_source` (`caller`, `caller_with_dosage_repair` or `none`).
+- **Haplotypes:** `hap{1,2}_{id,sha256,bp,block_path}`.
+  - The ID is the FASTA record name.
+  - The digest is the SHA-256 of the main FASTA's sequence.
+  - The block path is the ordered panel allele IDs.
+- **Genotype:** `unordered_genotype`, every block as `<block>=<low>/<high>`, and `equivalence_members`.
+- **Scores:** `total_score`, `fragment_term`, `exposure_term`, `sequence_pair_prior`, `score_basis`
+  (`caller_winner` | `dosage_repaired_block_rescored`), `caller_total_score`.
+- **Separation:** `separation`, `separation_basis` (`caller_genotype_separation_gap` | `dosage_repair_separation`),
+  `separation_certified` (NA for a repaired locus).
+- **Switches:** `hap{1,2}_switches`, `hap{1,2}_switch_blocks`, `switch_basis`.
+  - Each count is the minimum number of panel-template switches along that homologue's block path.
+  - The positions are the blocks where a new segment starts, under the canonical left-greedy decomposition.
+  - A genotype-equivalent call has none (`phase_not_claimed`).
+- **Dosage:**
+  - `dosage_mode`, `dosage_audit_status`;
+  - `dosage_complete_class_blocks`, `dosage_complete_applied_blocks`/`_block_ids`,
+    `dosage_complete_not_applied_blocks`/`_detail`;
+  - `dosage_content_corrected_blocks`/`_block_ids`, `dosage_triggered_unrepaired_blocks`/`_block_ids`;
+  - `dosage_suspect_blocks`, `dosage_underpowered_blocks`, `dosage_orientation_tied_block_ids`.
+- **Whole-locus repair scope:** `locus_repair_scope`.
+  - NOT_RUN, or NONE_TRIGGERED.
+  - COMPLETE when every triggered block is a complete diplotype repair (applied, in repair mode).
+  - Otherwise CONDITIONAL.
+- **Links** (file names beside the table, NA when absent): `block_table`, `genotypes_table`, `main_fasta`,
+  `original_fasta`, `original_block_table`, `dosage_blocks_table`, `dosage_representative_fasta`,
+  `dosage_equivalence_table`, `call_equivalence_set`.
+
+**By call class:**
+- **Strict call:** paths, digests and switches as above.
+- **Genotype-equivalent call:** `unordered_genotype` and the equivalence set only. The haplotype fields and
+  `main_fasta` are NA, and no phase is claimed.
+- **No-call:** status and reason. Every genotype, haplotype and FASTA field is NA.
+
+**The block tables remain the per-block decomposition.**
+
+**Evaluator:** when `reported_genotype_source` is `caller_with_dosage_repair`, `genotype_probe evaluate` takes the call
+from the locus table's block paths, and its summary adds `call_source locus_genotype_dosage_repaired`. Every other run
+is scored exactly as before, from the search's winner.
+
+### 22.4 Gates
+
+- **`tests/genotype_dosage_mode_gate.py`** re-runs a cell end to end in each arm (flag absent, off, audit, repair, and
+  repair at 1/2/4 threads). It checks:
+  - identity against the sealed 11fe681 outputs, normalised as the shadow gate normalises them;
+  - that audit adds only dosage files;
+  - repair: every block that is not applied equals audit in every caller column; an applied block changes only its
+    genotype columns; the search record is unchanged; the status is audit's plus the dosage keys;
+  - the round trip: `.original.*` equals audit;
+  - the trailing and locus schemas;
+  - no conditional representative in the main FASTA or the locus digests;
+  - the locus table against the block table, the FASTA and the equivalence set;
+  - the evaluator: the originals score exactly as audit does;
+  - 1/2/4/8-thread identity of every deterministic file.
+    - `scorer_placement_capacity_bytes_peak` is a memory gauge and is added to the status normalisation.
+- **`tests/genotype_dosage_synthetic_gate.sh`** is the known-truth COMPLETE_DIPLOTYPE_REPAIR gate.
+  - It takes a leave-zero-out call exact at sv:1 and injects a pair with a dosage error, scored by
+    `score_reported_diplotype`, exactly as the guard scores it.
+  - Repair mode must restore the real pair and haplotypes, and the evaluator must score the repaired prefix exactly as
+    it scores the real call.
+- **Fixtures** (`genotype_dosage_test`):
+  - template switches;
+  - the applied rewrite, with byte-identical originals and the locus row;
+  - each fail-closed reason;
+  - audit leaving every file untouched.

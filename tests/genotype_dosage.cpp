@@ -3,7 +3,10 @@
 // allocation rules, nearest-panel ties and panel-order invariance, display-id collisions, and thread identity.
 
 #include "panvar/genotype_dosage.hpp"
+#include "panvar/genotype_dosage_integrate.hpp"
 #include "panvar/genotype_dosage_repair.hpp"
+#include "panvar/genotype_repair.hpp"
+#include "panvar/mosaic_spelling.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -17,6 +20,8 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+#include <map>
+#include <unistd.h>
 
 namespace {
 
@@ -332,6 +337,169 @@ void test_provenance() {
 
 } // namespace
 
+// ---------------------------------------------------------------------------------------------- repair mode (section 22)
+
+// ctx:0 (one allele) | sv:1 {a, b} | ctx:2 {c, d}; templates t1 = (c0, a, c) and t2 = (c0, b, d).
+PreparedGenotypeModel two_template_model(std::uint64_t seed) {
+    std::mt19937_64 rng(seed);
+    StructuralLocusInput in;
+    in.locus_id = "integration-fixture";
+    in.invariant_segments = {"", "", "", ""};
+    in.blocks = {{"ctx:0", {{"c0", random_dna(rng, 300)}}, GenotypeBlockKind::Context},
+                 {"sv:1", {{"a", random_dna(rng, 200)}, {"b", random_dna(rng, 260)}}, GenotypeBlockKind::Variant},
+                 {"ctx:2", {{"c", random_dna(rng, 300)}, {"d", random_dna(rng, 310)}}, GenotypeBlockKind::Context}};
+    in.templates = {{"t1", TemplateFrameStatus::Complete, {"c0", "a", "c"}, ChainOrientation::Forward, ""},
+                    {"t2", TemplateFrameStatus::Complete, {"c0", "b", "d"}, ChainOrientation::Forward, ""}};
+    return prepare_genotype_model(in);
+}
+
+void test_template_switches() {
+    const PreparedGenotypeModel m = two_template_model(11);
+    const std::size_t a = allele_id(m, 1, "a"), b = allele_id(m, 1, "b"), c = allele_id(m, 2, "c"), d = allele_id(m, 2, "d");
+    const auto sw = [&](std::size_t x, std::size_t y) { return template_switches(m, MosaicPath{{0, x, y}}); };
+    require(sw(a, c) && sw(a, c)->count == 0 && sw(a, c)->blocks.empty(), "a panel template's own path has no switch");
+    require(sw(a, d) && sw(a, d)->count == 1 && sw(a, d)->blocks == std::vector<std::size_t>{2}, "one switch, at the block that starts the new segment");
+    require(sw(b, c) && sw(b, c)->count == 1 && sw(b, c)->blocks == std::vector<std::size_t>{2}, "the switch is placed by the left-greedy rule");
+    require(!template_switches(m, MosaicPath{{0, a, 99}}), "an allele no template carries has no decomposition");
+}
+
+std::string slurp_file(const std::string& path) {
+    std::ifstream in(path, std::ios::binary);
+    std::ostringstream s; s << in.rdbuf(); return s.str();
+}
+
+// A synthetic committed run: status, equivalence set, block tables, FASTA and a dosage block table, for a strict call
+// (hap1, hap2) whose sv:1 the dosage stage classes as `sv1_status`.
+void write_synthetic_run(const PreparedGenotypeModel& m, const std::string& prefix, const MosaicPath& h1, const MosaicPath& h2,
+                         const std::string& run_status, const std::string& sv1_status, const std::string& sv1_class) {
+    const std::string cls = run_status == "COMPLETE" ? "strict_call" : "genotype_equivalent_call";
+    atomic_write(prefix + ".mosaic_status.tsv", "key\tvalue\nstatus\t" + run_status + "\ncall_class\t" + cls +
+                                                    "\nno_call_reason\tnone\nphase_support\tREADS_WITHIN_CANDIDATES\n");
+    const auto path = [](const MosaicPath& p) {
+        std::string o; for (std::size_t i = 0; i < p.alleles.size(); ++i) o += (i ? "," : "") + std::to_string(p.alleles[i]); return o;
+    };
+    atomic_write(prefix + ".equivalence_set.tsv", "rank\tcandidate_id\trepresentative\thap1_alleles\thap2_alleles\tscore\tfragment_term\t"
+                                                  "exposure_term\tsequence_pair_prior\n1\t0\ttrue\t" + path(h1) + "\t" + path(h2) +
+                                                  "\t-10.5\t-8\t-1.5\t-1\n");
+    std::string bg = "block_id\tkind\tallele1\tallele2\tallele1_bp\tallele2_bp\tzygosity\tconditional_genotype_posterior\tconditional_GQ\tfilter\n";
+    std::string gt = "block_id\tkind\tallele1\tallele2\tallele1_bp\tallele2_bp\tallele1_sources\tallele2_sources\tzygosity\t"
+                     "conditional_genotype_posterior\tconditional_GQ\tfilter\n";
+    std::string db = "block_id\tdosage_status\tdosage_reason\trepair_class\torientation_tie\n";
+    for (std::size_t b = 0; b < m.blocks().size(); ++b) {
+        const PreparedGenotypeBlock& k = m.blocks()[b];
+        const std::size_t x = h1.alleles[b], y = h2.alleles[b];
+        const std::string row = k.block_id + "\t" + (b == 1 ? "SV" : "context") + "\t" + std::to_string(x) + "\t" + std::to_string(y) + "\t" +
+                                std::to_string(k.alleles[x].sequence.size()) + "\t" + std::to_string(k.alleles[y].sequence.size());
+        bg += row + "\t" + (x == y ? "HOM" : "HET") + "\t0.9\t10\tPASS\n";
+        if (b == 1) gt += row + "\tsrc\tsrc\t" + (x == y ? "HOM" : "HET") + "\t0.9\t10\tPASS\n";
+        db += k.block_id + "\t" + (b == 1 ? sv1_status : "NOT_SENSITIVE") + "\tnone\t" + (b == 1 ? sv1_class : "NA") + "\tfalse\n";
+    }
+    atomic_write(prefix + ".block_genotypes.tsv", bg);
+    atomic_write(prefix + ".genotypes.tsv", gt);
+    atomic_write(prefix + ".dosage_blocks.tsv", db);
+    std::string fa;
+    for (const auto& [name, p] : {std::make_pair("hap1", &h1), std::make_pair("hap2", &h2)}) {
+        const std::string s = spell_mosaic(m, *p).bases;
+        fa += ">" + prefix + "_" + name + " fingerprint=f bp=" + std::to_string(s.size()) + " phase_support=READS_WITHIN_CANDIDATES\n" + s + "\n";
+    }
+    atomic_write(prefix + ".mosaic_haplotypes.fa", fa);
+}
+
+void test_repair_mode_integration() {
+    const PreparedGenotypeModel m = two_template_model(12);
+    const std::size_t a = allele_id(m, 1, "a"), b = allele_id(m, 1, "b"), c = allele_id(m, 2, "c"), d = allele_id(m, 2, "d");
+    const std::filesystem::path dir = std::filesystem::temp_directory_path() / ("panvar_dosage_integration_" + std::to_string(::getpid()));
+    std::filesystem::create_directories(dir);
+    const MosaicPath h1{{0, a, c}}, h2{{0, a, d}};
+    const auto repair_to = [&](std::size_t x, std::size_t y) {
+        CompleteRepair r;
+        r.block = 1; r.block_id = "sv:1"; r.route = "pair";
+        r.seq1 = m.blocks()[1].alleles[x].sequence; r.seq2 = m.blocks()[1].alleles[y].sequence;
+        r.allele1 = x; r.allele2 = y;
+        r.fragment_term = -7; r.exposure_term = -1; r.prior = -2; r.repair_separation = 0.5;
+        return r;
+    };
+    const std::vector<std::string> legacy = {".genotypes.tsv", ".block_genotypes.tsv", ".mosaic_haplotypes.fa", ".mosaic_status.tsv",
+                                             ".equivalence_set.tsv"};
+    {   // an applied COMPLETE_DIPLOTYPE_REPAIR: sv:1 a/a -> a/b; the originals are the inputs byte for byte
+        const std::string p = (dir / "applied").string();
+        write_synthetic_run(m, p, h1, h2, "COMPLETE", "REPAIRED", "COMPLETE_DIPLOTYPE_REPAIR");
+        std::map<std::string, std::string> before;
+        for (const std::string& s : legacy) before[s] = slurp_file(p + s);
+        DosageShadowSummary summary;
+        summary.complete_repairs = {repair_to(a, b)};
+        const DosageIntegration done = apply_dosage_mode(&m, "repair", p, p, &summary, "COMPLETE", "none");
+        require(done.applied == std::vector<std::string>{"sv:1"} && done.not_applied.empty(), "an eligible complete repair is applied");
+        for (const std::string& s : legacy) require(slurp_file(p + ".original" + s) == before[s], "original" + s + " is the caller's file");
+        const std::string bg = slurp_file(p + ".block_genotypes.tsv");
+        require(bg.find("sv:1\tSV\t" + std::to_string(a) + "\t" + std::to_string(b) + "\t") != std::string::npos, "the repaired pair is the block genotype");
+        require(bg.find("\tNA\tNA\tPASS\tREPAIRED\t") != std::string::npos, "the repaired block's posterior and GQ are withdrawn");
+        require(slurp_file(p + ".equivalence_set.tsv") == before[".equivalence_set.tsv"], "the search record is not rewritten");
+        std::string fa_bases;
+        { std::istringstream fa(slurp_file(p + ".mosaic_haplotypes.fa")); for (std::string l; std::getline(fa, l);) if (l.empty() || l[0] != '>') fa_bases += l; }
+        require(fa_bases == spell_mosaic(m, h1).bases + spell_mosaic(m, MosaicPath{{0, b, d}}).bases, "hap2 is respelled with the repaired allele");
+        require(slurp_file(p + ".mosaic_status.tsv").rfind(before[".mosaic_status.tsv"], 0) == 0, "the status keeps every caller line, first");
+        write_locus_genotype(&m, p, done);
+        const std::string locus = slurp_file(p + ".locus_genotype.tsv");
+        std::vector<std::string> head, row;
+        { std::istringstream l(locus); std::string h, r; std::getline(l, h); std::getline(l, r);
+          std::stringstream hs(h), rs(r); for (std::string x; std::getline(hs, x, '\t');) head.push_back(x); for (std::string x; std::getline(rs, x, '\t');) row.push_back(x); }
+        require(head == locus_genotype_columns() && row.size() == head.size(), "the locus table has its declared columns");
+        std::map<std::string, std::string> v;
+        for (std::size_t i = 0; i < head.size() && i < row.size(); ++i) v[head[i]] = row[i];
+        require(v["reported_genotype_source"] == "caller_with_dosage_repair" && v["hap2_block_path"] == "0," + std::to_string(b) + "," + std::to_string(d),
+                "the locus paths carry the repair");
+        require(v["hap2_sha256"] == sha256_bytes(spell_mosaic(m, MosaicPath{{0, b, d}}).bases), "the locus digest is the respelled haplotype's");
+        require(v["hap2_switches"] == "0" && v["hap1_switches"] == "0", "both repaired homologues are panel templates here");
+        require(v["total_score"] == "-10" && v["score_basis"] == "dosage_repaired_block_rescored", "the locus score is the repaired diplotype's");
+        require(v["locus_repair_scope"] == "COMPLETE" && v["dosage_complete_applied_blocks"] == "1", "the whole-locus repair scope");
+    }
+    const auto refused = [&](const std::string& name, const std::string& run_status, std::vector<CompleteRepair> repairs,
+                             const std::string& reason, bool corrupt_fasta) {
+        const std::string p = (dir / name).string();
+        write_synthetic_run(m, p, h1, h2, run_status, "REPAIRED", "COMPLETE_DIPLOTYPE_REPAIR");
+        if (corrupt_fasta) {
+            std::string fa = slurp_file(p + ".mosaic_haplotypes.fa");
+            const std::size_t at = fa.find('\n') + 1;
+            fa[at] = fa[at] == 'A' ? 'C' : 'A';
+            atomic_write(p + ".mosaic_haplotypes.fa", fa);
+        }
+        std::map<std::string, std::string> before;
+        for (const std::string& s : legacy) before[s] = slurp_file(p + s);
+        DosageShadowSummary summary;
+        summary.complete_repairs = repairs;
+        const DosageIntegration done = apply_dosage_mode(&m, "repair", p, p, &summary, "COMPLETE", "none");
+        require(done.applied.empty() && done.not_applied.count("sv:1") && done.not_applied.at("sv:1") == reason, name + ": refused as " + reason);
+        require(slurp_file(p + ".mosaic_haplotypes.fa") == before[".mosaic_haplotypes.fa"], name + ": FASTA untouched");
+        const std::string bg = slurp_file(p + ".block_genotypes.tsv");
+        require(bg.find("sv:1\tcontext") == std::string::npos && bg.find("sv:1\tSV\t" + std::to_string(a) + "\t" + std::to_string(a) + "\t") != std::string::npos,
+                name + ": the caller's genotype stays");
+        require(bg.find("DOSAGE_REPAIR_NOT_APPLIED\t" + reason) != std::string::npos, name + ": the block says why");
+        for (const std::string& s : legacy) require(slurp_file(p + ".original" + s) == before[s], name + ": original" + s);
+    };
+    CompleteRepair second = repair_to(a, b);
+    second.block = 2; second.block_id = "ctx:2";
+    refused("two", "COMPLETE", {repair_to(a, b), second}, "several_complete_repairs_not_jointly_scored", false);
+    refused("equivalent", "CONDITIONAL_GENOTYPE_EQUIVALENT", {repair_to(a, b)}, "not_a_strict_call", false);
+    CompleteRepair novel = repair_to(a, b);
+    novel.allele2.reset();
+    refused("novel", "COMPLETE", {novel}, "repaired_allele_not_a_panel_allele", false);
+    refused("fasta", "COMPLETE", {repair_to(a, b)}, "reported_haplotypes_not_reproduced", true);
+    {   // audit never touches a file; off copies nothing onto itself
+        const std::string p = (dir / "audit").string();
+        write_synthetic_run(m, p, h1, h2, "COMPLETE", "REPAIRED", "COMPLETE_DIPLOTYPE_REPAIR");
+        std::map<std::string, std::string> before;
+        for (const std::string& s : legacy) before[s] = slurp_file(p + s);
+        DosageShadowSummary summary;
+        summary.complete_repairs = {repair_to(a, b)};
+        const DosageIntegration done = apply_dosage_mode(&m, "audit", p, p, &summary, "COMPLETE", "none");
+        require(done.applied.empty(), "audit applies nothing");
+        for (const std::string& s : legacy) require(slurp_file(p + s) == before[s], "audit leaves " + s);
+        require(!std::filesystem::exists(p + ".original.genotypes.tsv"), "audit writes no originals");
+    }
+    std::filesystem::remove_all(dir);
+}
+
 int main() {
     try {
         test_python_random_and_quantile();
@@ -342,6 +510,8 @@ int main() {
         test_unsupported_library();
         test_choice_rules();
         test_provenance();
+        test_template_switches();
+        test_repair_mode_integration();
     } catch (const std::exception& e) {
         std::cerr << "FAIL: exception " << e.what() << '\n';
         return 1;

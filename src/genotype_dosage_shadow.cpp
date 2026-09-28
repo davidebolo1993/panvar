@@ -319,6 +319,19 @@ DosageShadowSummary run_dosage_shadow(const PreparedGenotypeModel& model, const 
             const std::string h2 = call.haplotypes[1].substr(0, call.intervals[1][ba.block].begin) + c->ctx2_sequence +
                                    call.haplotypes[1].substr(call.intervals[1][ba.block].end);
             const double prior = log_unordered_sequence_pair_prior(model, h1, h2, switch_probability);
+            if (r->repair_class == "COMPLETE_DIPLOTYPE_REPAIR") {
+                CompleteRepair cr;
+                cr.block = ba.block; cr.block_id = ba.block_id; cr.route = r->route;
+                cr.seq1 = c->ctx1_sequence; cr.seq2 = c->ctx2_sequence;
+                const std::vector<CanonicalBlockAllele>& alleles = model.blocks()[ba.block].alleles;
+                for (std::size_t a = 0; a < alleles.size(); ++a) {
+                    if (!cr.allele1 && alleles[a].sequence == cr.seq1) cr.allele1 = a;
+                    if (!cr.allele2 && alleles[a].sequence == cr.seq2) cr.allele2 = a;
+                }
+                cr.fragment_term = c->fragment_term; cr.exposure_term = c->exposure_term; cr.likelihood = c->likelihood;
+                cr.prior = prior; cr.repair_separation = r->repair_separation; cr.orientation_tie = r->orientation_tie;
+                summary.complete_repairs.push_back(cr);
+            }
             o << c->fragment_term << '\t' << c->exposure_term << '\t' << c->likelihood << '\t' << prior << '\t'
               << (std::isinf(prior) ? "false" : "true") << '\t' << r->repair_separation << '\t';
             if (r->gap_defined) o << r->conditional_repair_gap; else o << "NA";

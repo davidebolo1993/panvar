@@ -1,4 +1,5 @@
 #include "panvar/genotype_command.hpp"
+#include "panvar/genotype_dosage_integrate.hpp"
 #include "panvar/genotype_dosage_repair.hpp"
 
 #include "panvar/bubbles.hpp"
@@ -1189,6 +1190,7 @@ namespace {
 
 void remove_run_outputs(const std::string& out_prefix) {
     for (const char* suffix : kFinalOutputs) std::remove((out_prefix + suffix).c_str());
+    for (const std::string& suffix : dosage::dosage_stage_outputs()) std::remove((out_prefix + suffix).c_str());
     for (const char* suffix : kPartialOutputs) std::remove((out_prefix + suffix).c_str());
     std::remove((out_prefix + ".mosaic_status.tsv").c_str());
 }
@@ -4279,9 +4281,15 @@ int run_genotype_command(const std::vector<std::string>& args) {
         }
         else if (flag == "--dosage-allocation-test") options.dosage_allocation_test = true;
         else if (flag == "--dosage-audit") {
-            options.dosage_audit = need(i);
-            if (options.dosage_audit != "off" && options.dosage_audit != "shadow") {
-                throw std::runtime_error("--dosage-audit takes off or shadow");
+            // the shadow-port spelling of --dosage-mode off|audit
+            const std::string v = need(i);
+            if (v != "off" && v != "shadow") throw std::runtime_error("--dosage-audit takes off or shadow");
+            options.dosage_mode = v == "shadow" ? "audit" : "off";
+        }
+        else if (flag == "--dosage-mode") {
+            options.dosage_mode = need(i);
+            if (options.dosage_mode != "off" && options.dosage_mode != "audit" && options.dosage_mode != "repair") {
+                throw std::runtime_error("--dosage-mode takes off, audit or repair");
             }
         }
         else if (flag == "-q" || flag == "--quiet") options.quiet = true;
@@ -4317,7 +4325,13 @@ int run_genotype_command(const std::vector<std::string>& args) {
                 "the status says RUNNING and committed repair rounds are in .repair_rounds.partial.tsv;\n"
                 "a run stopped by the profile's footprint or time limit keeps only those and says\n"
                 "RESOURCE_REFUSAL or TIME_LIMIT. An incomplete run never presents a partial ranking\n"
-                "as a result. Exit status 0 when a genotype was emitted, 1 otherwise.\n\n"
+                "as a result. Exit status 0 when a genotype was emitted, 1 otherwise. Every run\n"
+                "also writes .locus_genotype.tsv, the locus-level call.\n\n"
+                "--dosage-mode off|audit|repair (default off; docs/algorithms/genotype_dosage.md):\n"
+                "audit writes the dosage stage's .dosage_* files and changes nothing else; repair\n"
+                "also replaces a block's genotype where the stage found a complete diplotype repair,\n"
+                "keeping the caller's outputs as .original.*. A dosage-content correction that is not\n"
+                "a resolved diplotype is reported beside the caller's genotype, never in place of it.\n\n"
                 "--panel-curation takes a manifest of panel templates to exclude: one template name\n"
                 "per line, '#' opening a comment line. It is recorded with the reason, the manifest\n"
                 "path and a digest, and a manifest naming an absent template is refused.\n\n"
@@ -4348,18 +4362,21 @@ int run_genotype_command(const std::vector<std::string>& args) {
             }
         }
     }
-    const bool shadow = options.dosage_audit == "shadow";
+    // The dosage stage and the locus table run after every existing output is committed (sections 20 and 22).
+    const std::string& mode = options.dosage_mode;
     GenotypeDosageCapture capture;
-    const GenotypeRunStatus status = run_genotype(options, shadow ? &capture : nullptr);
+    const GenotypeRunStatus status = run_genotype(options, &capture);
     const bool called = status == GenotypeRunStatus::Complete || status == GenotypeRunStatus::ConditionalGenotypeEquivalent;
-    if (shadow) {
-        // After every existing output is committed: the shadow audit writes only its own files and never changes
-        // the exit status, a call or an existing output. A failure is recorded in its own status file.
+    dosage::DosageShadowSummary summary;
+    std::string audit_status = "NOT_RUN", audit_note = "none";
+    if (mode != "off") {
+        // Audit writes only its own files and never changes the exit status, a call or an existing output. A failure
+        // is recorded in its own status file.
         try {
             if (!called || !capture.model) {
+                audit_note = std::string("the run emitted no genotype (") + genotype_run_status_name(status) + ")";
                 atomic_write(options.out_prefix + ".dosage_status.tsv",
-                             std::string("key\tvalue\ndosage_audit\tshadow\ndosage_audit_status\tNOT_RUN\ndosage_audit_note\t") +
-                                 "the run emitted no genotype (" + genotype_run_status_name(status) + ")\n");
+                             "key\tvalue\ndosage_audit\tshadow\ndosage_audit_status\tNOT_RUN\ndosage_audit_note\t" + audit_note + "\n");
             } else {
                 std::optional<double> ignored;
                 const LibraryModel library = read_library(options.library_path, ignored);
@@ -4382,14 +4399,30 @@ int run_genotype_command(const std::vector<std::string>& args) {
                 shadow_options.repair_max_piece_hits = options.repair_max_piece_hits;
                 shadow_options.repair_max_latent_pairs = options.repair_max_latent_pairs;
                 shadow_options.repair_origin_cache_bytes = 0;   // path on, nothing retained (measured: 2.77 vs 3.74 GiB)
-                dosage::run_dosage_shadow(*capture.model, capture.node_sequences, fragments, library, scoring, switches,
-                                          options.out_prefix, options.out_prefix, shadow_options);
+                summary = dosage::run_dosage_shadow(*capture.model, capture.node_sequences, fragments, library, scoring, switches,
+                                                    options.out_prefix, options.out_prefix, shadow_options);
+                audit_status = summary.audit_status;
+                audit_note = summary.note.empty() ? "none" : summary.note;
             }
         } catch (const std::exception& error) {
+            audit_status = "FAILED";
+            audit_note = error.what();
             atomic_write(options.out_prefix + ".dosage_status.tsv",
                          std::string("key\tvalue\ndosage_audit\tshadow\ndosage_audit_status\tFAILED\ndosage_audit_note\t") +
                              error.what() + "\n");
         }
+    }
+    // Repair mode's rewrite builds every file before writing the first, so a refusal here leaves the caller's outputs
+    // as they are; the locus table is the primary locus-level output in every mode.
+    try {
+        const PreparedGenotypeModel* model = capture.model ? &*capture.model : nullptr;
+        const dosage::DosageIntegration integration =
+            dosage::apply_dosage_mode(model, mode, options.out_prefix, options.out_prefix,
+                                      audit_status == "COMPLETE" ? &summary : nullptr, audit_status, audit_note);
+        dosage::write_locus_genotype(model, options.out_prefix, integration);
+    } catch (const std::exception& error) {
+        std::cerr << "[genotype] locus output failed: " << error.what() << '\n';
+        return 2;
     }
     return called ? 0 : 1;
 }
