@@ -289,6 +289,9 @@ DosageShadowSummary run_dosage_shadow(const PreparedGenotypeModel& model, const 
             templates.push_back({model.panel().template_names[t], spell_panel_template(model, t).bases});
         }
         const std::string template_digest = panel_digest(templates);
+        std::ostringstream searched;   // every panel sequence a nearest-sequence search may compare against
+        searched << "level\tblock_id\tpanel_id\tsha256\tbp\n";
+        for (const PanelSequence& t : templates) searched << "full_haplotype\tNA\t" << t.id << '\t' << sha256_hex(t.sequence) << '\t' << t.sequence.size() << '\n';
         std::ostringstream repaired_fa, original_fa, pv;
         pv << std::setprecision(17);
         pv << "block_id\thomologue\trepaired_sha256\toriginal_sha256\tlevel\trank\tpanel_id\tpanel_sha256\traw_distance\t"
@@ -305,6 +308,7 @@ DosageShadowSummary run_dosage_shadow(const PreparedGenotypeModel& model, const 
             std::vector<PanelSequence> alleles;
             for (const CanonicalBlockAllele& a : block.alleles) alleles.push_back({std::to_string(a.id), a.sequence});
             const std::string allele_digest = panel_digest(alleles);
+            for (const PanelSequence& a : alleles) searched << "block_allele\t" << block_id << '\t' << a.id << '\t' << sha256_hex(a.sequence) << '\t' << a.sequence.size() << '\n';
             std::optional<UnitLibrary> lib;
             if (r.route == "repeated_unit") lib = build_unit_library(block, nodes, RepairSettings{});
             for (int h = 0; h < 2; ++h) {
@@ -351,6 +355,7 @@ DosageShadowSummary run_dosage_shadow(const PreparedGenotypeModel& model, const 
         atomic_write(out_prefix + ".dosage_repaired.fa", repaired_fa.str());
         atomic_write(out_prefix + ".dosage_original.fa", original_fa.str());
         atomic_write(out_prefix + ".dosage_provenance.tsv", pv.str());
+        atomic_write(out_prefix + ".dosage_provenance_panel.tsv", searched.str());
         summary.seconds_provenance = seconds_since(tp);
     }
     atomic_write(out_prefix + ".dosage_census.tsv", cen.str());
