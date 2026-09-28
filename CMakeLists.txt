@@ -136,6 +136,8 @@ add_library(panvarlib
     src/genotype_repair.cpp
     src/genotype_dosage.cpp
     src/genotype_dosage_repair.cpp
+    src/genotype_dosage_shadow.cpp
+    src/genotype_dosage_provenance.cpp
     src/fragment_likelihood.cpp
     src/bubble_path.cpp
     src/bubbles.cpp

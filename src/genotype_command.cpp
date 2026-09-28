@@ -1,4 +1,5 @@
 #include "panvar/genotype_command.hpp"
+#include "panvar/genotype_dosage_repair.hpp"
 
 #include "panvar/bubbles.hpp"
 #include "panvar/fragment_likelihood.hpp"
@@ -1205,7 +1206,9 @@ MosaicBeamResult candidate_prefix(const MosaicBeamResult& beam, std::size_t k) {
 
 } // namespace
 
-GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
+GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) { return run_genotype(options, nullptr); }
+
+GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options, GenotypeDosageCapture* capture) {
     set_emission_lookup_timing(options.emission_lookup_timing);
     const Clock::time_point started = Clock::now();
     StageTimings timings;
@@ -1414,6 +1417,10 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
         fingerprint = model_fingerprint(*prepared);
         // A model a node split would change is not scored. The round trip cannot see this case.
         require_representation_independent(built.report);
+        if (capture != nullptr) {
+            capture->model = *prepared;
+            capture->node_sequences = gfa.seq;
+        }
     } catch (const std::exception& error) {
         timings.model = seconds_since(mark);
         timings.total = seconds_since(started);
@@ -4270,6 +4277,12 @@ int run_genotype_command(const std::vector<std::string>& args) {
             throw std::runtime_error("--max-candidates is now --max-mosaic-candidates: every panel diplotype is "
                                      "always a candidate, and K counts only the off-panel mosaics added to it");
         }
+        else if (flag == "--dosage-audit") {
+            options.dosage_audit = need(i);
+            if (options.dosage_audit != "off" && options.dosage_audit != "shadow") {
+                throw std::runtime_error("--dosage-audit takes off or shadow");
+            }
+        }
         else if (flag == "-q" || flag == "--quiet") options.quiet = true;
         else if (flag == "-h" || flag == "--help") {
             std::cout <<
@@ -4334,8 +4347,44 @@ int run_genotype_command(const std::vector<std::string>& args) {
             }
         }
     }
-    const GenotypeRunStatus status = run_genotype(options);
-    return status == GenotypeRunStatus::Complete || status == GenotypeRunStatus::ConditionalGenotypeEquivalent ? 0 : 1;
+    const bool shadow = options.dosage_audit == "shadow";
+    GenotypeDosageCapture capture;
+    const GenotypeRunStatus status = run_genotype(options, shadow ? &capture : nullptr);
+    const bool called = status == GenotypeRunStatus::Complete || status == GenotypeRunStatus::ConditionalGenotypeEquivalent;
+    if (shadow) {
+        // After every existing output is committed: the shadow audit writes only its own files and never changes
+        // the exit status, a call or an existing output. A failure is recorded in its own status file.
+        try {
+            if (!called || !capture.model) {
+                atomic_write(options.out_prefix + ".dosage_status.tsv",
+                             std::string("key\tvalue\ndosage_audit\tshadow\ndosage_audit_status\tNOT_RUN\ndosage_audit_note\t") +
+                                 "the run emitted no genotype (" + genotype_run_status_name(status) + ")\n");
+            } else {
+                std::optional<double> ignored;
+                const LibraryModel library = read_library(options.library_path, ignored);
+                const std::vector<ReadPair> fragments = read_fragments(options.reads1_path, options.reads2_path);
+                FragmentScoringOptions scoring;
+                scoring.mismatch_band = options.mismatch_band;
+                scoring.minimum_piece_bp = options.minimum_piece_bp;
+                scoring.max_piece_hits = options.max_piece_hits;
+                scoring.max_proposed_starts_per_haplotype = options.max_proposed_starts_per_haplotype;
+                scoring.max_physical_origins = options.max_physical_origins;
+                scoring.max_state_classes = options.max_state_classes;
+                scoring.max_mass_cells = options.max_mass_cells;
+                scoring.emission_cache_bytes = options.emission_cache_bytes;
+                const std::vector<double> switches(capture.model->blocks().size() - 1, options.switch_probability);
+                dosage::DosageShadowOptions shadow_options;
+                shadow_options.threads = options.threads;
+                dosage::run_dosage_shadow(*capture.model, capture.node_sequences, fragments, library, scoring, switches,
+                                          options.out_prefix, options.out_prefix, shadow_options);
+            }
+        } catch (const std::exception& error) {
+            atomic_write(options.out_prefix + ".dosage_status.tsv",
+                         std::string("key\tvalue\ndosage_audit\tshadow\ndosage_audit_status\tFAILED\ndosage_audit_note\t") +
+                             error.what() + "\n");
+        }
+    }
+    return called ? 0 : 1;
 }
 
 } // namespace panvar

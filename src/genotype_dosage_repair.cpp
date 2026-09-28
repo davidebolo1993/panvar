@@ -884,7 +884,7 @@ std::string repair_blocks_table(const std::vector<std::pair<std::string, RepairR
          "multisets_retained\thaploid\tdiploid\tm_range\tinternal_capable\tterminal_capable\tbeta\tphi\tem_iterations\ttop_set_size\t"
          "orientation_tie\tallocation_tie\tchosen_label\trepaired_ctx1_id\trepaired_ctx2_id\toriginal_fragment_term\t"
          "original_exposure_term\toriginal_likelihood\trepaired_fragment_term\trepaired_exposure_term\trepaired_likelihood\t"
-         "repair_separation\tconditional_repair_gap\tseconds_construct\tseconds_score\n";
+         "repair_separation\tconditional_repair_gap\n";
     for (const auto& [block_id, r] : repairs) {
         std::string mr;
         for (int m : r.m_range) mr += (mr.empty() ? "" : ",") + std::to_string(m);
@@ -897,8 +897,9 @@ std::string repair_blocks_table(const std::vector<std::pair<std::string, RepairR
           << (c ? c->ctx2_id : "NA") << '\t' << r.original_fragment << '\t' << r.original_exposure << '\t' << r.original_likelihood << '\t';
         if (c) o << c->fragment_term << '\t' << c->exposure_term << '\t' << c->likelihood << '\t' << r.repair_separation << '\t';
         else o << "NA\tNA\tNA\tNA\t";
-        o << (c && r.gap_defined ? std::to_string(r.conditional_repair_gap) : std::string("NA")) << '\t' << r.seconds_construct << '\t'
-          << r.seconds_score << '\n';
+        if (c && r.gap_defined) o << r.conditional_repair_gap;
+        else o << "NA";
+        o << '\n';
     }
     return o.str();
 }

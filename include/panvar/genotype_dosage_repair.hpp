@@ -11,6 +11,8 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <map>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -121,5 +123,65 @@ std::string repair_candidates_table(const std::vector<std::pair<std::string, Rep
 std::string repair_blocks_table(const std::vector<std::pair<std::string, RepairResult>>& repairs);
 
 std::string sha256_hex(const std::string& bytes);
+
+// ---------------------------------------------------------------------------------------------- provenance
+
+// A panel sequence the provenance may compare against: only the panel supplied to the caller.
+struct PanelSequence {
+    std::string id;          // template name (full haplotypes) or block allele id
+    std::string sequence;
+};
+
+struct NearestPanel {
+    std::string id;
+    std::string sha256;
+    long distance = 0;                  // global edit distance, unit costs
+    std::size_t alignment_columns = 0;  // '=' + 'X' + 'I' + 'D' columns of the reported alignment
+    double normalized = 0.0;            // distance / alignment_columns
+    std::string cigar;                  // extended CIGAR, query = the repaired sequence, target = the panel sequence
+};
+
+// Every panel sequence at the minimal global edit distance from `query`, ordered by (SHA-256 of the sequence, id):
+// invariant to the panel's order. Ties are all reported.
+std::vector<NearestPanel> nearest_panel_sequences(const std::string& query, const std::vector<PanelSequence>& panel);
+
+// SHA-256 of the sorted (id, sequence SHA-256) list: what was searched, independent of its order.
+std::string panel_digest(const std::vector<PanelSequence>& panel);
+
+// ---------------------------------------------------------------------------------------------- shadow audit
+
+// The call a finished run reports: the equivalence set's rank-1 representative, with its persisted scores.
+struct PersistedCall {
+    MosaicPath first, second;
+    std::string hap1, hap2;
+    PersistedScore score;
+    double prior = 0.0;
+};
+std::optional<PersistedCall> read_persisted_call(const std::string& run_prefix);
+
+struct DosageShadowOptions {
+    bool repair = true;
+    bool provenance = true;
+    std::size_t threads = 1;
+    std::size_t chunk_haplotypes = 128;
+};
+
+struct DosageShadowSummary {
+    std::string audit_status = "COMPLETE";   // COMPLETE, NOT_RUN (no persisted call), REFUSED_LIBRARY
+    std::string note;
+    std::size_t molecule_span_bp = 0, m = 0, sensitive_blocks = 0, repairs = 0, repairs_conditional = 0;
+    std::map<std::string, std::size_t> status_counts, reason_counts;
+    double seconds_census = 0.0, seconds_features = 0.0, seconds_estimate = 0.0, seconds_repair = 0.0, seconds_provenance = 0.0,
+           seconds_total = 0.0;
+};
+
+// Runs census, features, estimate, classification and (optionally) repair of the call persisted at run_prefix, and
+// writes out_prefix.dosage_{census,features,blocks,repairs,repair_candidates,status}.tsv. Writes no other file and
+// changes no call. Truth-free.
+DosageShadowSummary run_dosage_shadow(const PreparedGenotypeModel& model, const NodeSequences& nodes,
+                                      const std::vector<ReadPair>& reads, const LibraryModel& library,
+                                      const FragmentScoringOptions& scoring, const std::vector<double>& switch_probability,
+                                      const std::string& run_prefix, const std::string& out_prefix,
+                                      const DosageShadowOptions& options);
 
 } // namespace panvar::dosage
