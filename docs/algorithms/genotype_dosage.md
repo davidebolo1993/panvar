@@ -139,8 +139,10 @@ robust sd, robust z, the admissible set, whether c_j is outside, and the trigger
 **Dosage-admissible candidate:** a diploid block genotype whose copy number of every tested feature lies in that
 feature's admissible set.
 
-**Exact score.** Every candidate is spliced into the reported homologues at the block's intervals, in both
-orientations (one if the two block sequences are equal). It is scored by the production likelihood: fragment term +
+**Exact score.** Every candidate is spliced into the reported homologues at the block's intervals.
+- **Pair route:** both orientations (one if the two block sequences are equal).
+- **Repeated-unit route:** one orientation, as the prototype scored it: the lexicographically smaller unit tuple goes
+  in the first reported homologue (§18). It is scored by the production likelihood: fragment term +
 exposure term, with the run's own scoring settings. The **likelihood** is that sum. The prior is recorded but never
 ranks.
 
@@ -303,8 +305,8 @@ table. Comparisons use only the panel supplied to the caller (in LOO validation,
 
 **Generated-sequence ID.** The complete lowercase SHA-256 of the sequence.
 - A display ID (the first 12 hex digits) may be shown alongside it.
-- The run fails closed (`resource_refusal`, with reason detail `display_id_collision`) if two distinct generated
-  sequences share a display ID.
+- If two distinct generated sequences share a display ID, the shadow audit fails closed: `dosage_audit_status FAILED`,
+  note `display_id_collision`.
 
 ## 10. Genotype quality after repair
 
@@ -562,3 +564,45 @@ The ten amendments are listed in §17.
 8. **Evaluation:** the correction outcome is reported as four separate facts (§15).
 9. **Reasons list** extended (§11).
 10. **Allocation test** shadow-only, with measured cost (§8.3).
+
+## 18. Implementation record (shadow port, 2026-09-28/29; for review)
+
+**Code.** Branch `genotype-dosage`, worktree `panvar-worktrees/dosage-dev`.
+- **Library:** `genotype_dosage.{hpp,cpp}` (census, features, estimate, policy v2), `genotype_dosage_repair.cpp`
+  (routes, choice, allocation test), `genotype_dosage_provenance.cpp`, `genotype_dosage_shadow.cpp` (the one entry
+  point).
+- **`panvar genotype --dosage-audit shadow [--dosage-allocation-test]`** calls the shadow after every existing output
+  is committed.
+- **Validation entry:** `genotype_probe dosage-replay` calls the same function on a persisted run.
+- **Fixtures:** `tests/genotype_dosage.cpp` (ctest `panvar_genotype_dosage`).
+- **Gates:** `tests/genotype_dosage_shadow_identity.sh` and `tests/genotype_dosage_thread_identity.sh`.
+
+**Findings that bind the contract:**
+1. **Orientation on the repeated-unit route.** The prototype scored structures in one orientation, and §8 now says
+   so. The pair route scores both.
+2. **Exact allocation ties.** In 35 of 50 LOO unit repairs (campaign 18 of 31, fresh 17 of 19), several distinct
+   genotypes of the chosen content tie exactly on both panel prior and likelihood at the allocation pick. §8.2's last
+   key, structure rank, then chooses among them.
+   - Every such block reports `allocation_tie` = the number of tied genotypes, and flags each tied candidate.
+   - Post hoc, the tied alternatives differ from truth by 6–140 bp, and none changes solved versus unsolved (< 1 kb).
+   - The prototype broke the tie by label string instead. That differs from structure rank in one block
+     (`loo.NA20847.30`: prototype 108 bp, structure rank 26 bp).
+   - **Open for review:** keep structure rank; choose by sequence (smallest SHA-256 pair), which makes the choice
+     independent of IDs; or report such blocks as allocation-unresolved representatives.
+3. **Numerics.** The dosage sources are compiled without floating-point contraction (`-ffp-contract=off`), so the
+   proposal likelihoods equal numpy's bit for bit. Two multisets with mathematically equal likelihoods otherwise
+   swapped ranks in `loo.HG04217.2`. Only the normal quantile contracts, because CPython builds it with contraction.
+4. **Outputs.**
+   - Status keys go to `<prefix>.dosage_status.tsv`, never into `mosaic_status.tsv`, so shadow mode leaves every
+     existing file byte-identical.
+   - `<prefix>.dosage_feature_copies.tsv` gives each tested feature's per-allele copies and admissible set.
+   - The audit runs on the equivalence set's rank-1 representative. A run without one (a no-call) gets
+     `dosage_audit_status NOT_RUN`.
+5. **Identity normalisation.** The same rule as the tie-branch gate: status keys for wall time, memory, worker gauges
+   and scheduling-dependent cache counters are excluded; repair rounds are compared on columns 1–28; the FASTA header
+   path is replaced.
+6. **HG01573.30 (§12.1).** Decided from the frozen run without changing the branch search.
+   - The root evidence is identical across its three representatives and all six of their orderings.
+   - Every tie is a phase tie, and all 18 starts the early cap stop required are dosage-admissible.
+   - The constraint therefore removes nothing: at least 18 branches are still needed against the cap of 16, and the
+     no-call stands.
