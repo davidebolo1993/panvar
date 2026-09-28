@@ -162,6 +162,10 @@ target_include_directories(panvarlib
         ${ABPOA_DIR}/include
 )
 
+# The dosage audit reproduces the numpy prototype bit for bit (docs/algorithms/genotype_dosage.md section 14), so its
+# arithmetic is never contracted into fused multiply-adds, which numpy's elementwise loops do not use.
+set_source_files_properties(src/genotype_dosage.cpp src/genotype_dosage_repair.cpp PROPERTIES COMPILE_OPTIONS "-ffp-contract=off")
+
 # SYSTEM: minimap2's and minigraph's headers use C99 flexible array members, which our -Wpedantic flags
 # in C++. The vendored sources are not ours to fix, so exempt them as the other vendored targets are.
 target_include_directories(panvarlib SYSTEM PRIVATE ${MINIMAP2_DIR} ${MINIGRAPH_DIR})

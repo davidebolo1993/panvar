@@ -67,7 +67,9 @@ std::uint32_t PythonRandom::randrange(std::uint32_t n) {
 // ------------------------------------------------------------------------------------------------ normal quantile
 
 double normal_inverse_cdf(double p) {
-    // CPython statistics._normal_dist_inv_cdf (Wichura AS241, PPND16), mu 0, sigma 1.
+    // CPython statistics._normal_dist_inv_cdf (Wichura AS241, PPND16), mu 0, sigma 1. CPython evaluates it in C built
+    // with clang's default contraction on arm64, so this one function contracts (the rest of the file does not).
+#pragma clang fp contract(on)
     if (!(p > 0.0 && p < 1.0)) throw std::invalid_argument("normal_inverse_cdf needs 0 < p < 1");
     const double q = p - 0.5;
     if (std::fabs(q) <= 0.425) {
