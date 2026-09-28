@@ -19,7 +19,8 @@ fail=0; n=0
 # Normalisation, as the tie-branch gate defines it: the status apart from wall time, process memory, worker gauges,
 # the scheduling-dependent emission-cache split and path-bearing provenance lines; repair rounds apart from their
 # wall and memory columns (1-28 kept); the FASTA with the output path in its header replaced; the memory ledger
-# (repair_memory.tsv) is process memory only and is not compared.
+# (repair_memory.tsv, tie_branch_memory.tsv) is process memory only and is not compared; tie branches are compared
+# apart from their wall-time column (1-14 kept).
 status_science() {
   grep -vE '^(seconds_|resources_|threads_|phys_footprint|rss_|emission_cache_dp_hits|emission_cache_dp_misses|emission_cache_executed_dps|emission_cache_executed_prefilters|scorer_emission_cache_arena_bytes|union_cached_prefilters_consumed|union_prefilter_cache_misses|worker_seconds_|sha256_|profile|settings_overridden)' "$1" | grep -v "$2"
 }
@@ -27,13 +28,14 @@ norm() {   # norm <file> <prefix>
   case "$1" in
     *.mosaic_status.tsv) status_science "$1" "$2" ;;
     *.repair_rounds.tsv) cut -f1-28 "$1" ;;
+    *.tie_branches.tsv) cut -f1-14 "$1" ;;
     *.mosaic_haplotypes.fa) sed "s#^>$2#>PREFIX#" "$1" ;;
     *) cat "$1" ;;
   esac
 }
 for f in "$prefix".*; do
   suf=${f#"$prefix"}
-  case "$suf" in .eval.*|.evaluate.log|.command.txt|.log|.time|.done|.repair_memory.tsv) continue;; esac
+  case "$suf" in .eval.*|.evaluate.log|.command.txt|.log|.time|.done|.repair_memory.tsv|.tie_branch_memory.tsv) continue;; esac
   a=$(norm "$f" "$prefix" | shasum -a 256 | cut -c1-16)
   for arm in off shadow; do
     b=$(norm "$OUT/$arm$suf" "$OUT/$arm" 2>/dev/null | shasum -a 256 | cut -c1-16)
