@@ -931,3 +931,18 @@ is scored exactly as before, from the search's winner.
   - the applied rewrite, with byte-identical originals and the locus row;
   - each fail-closed reason;
   - audit leaving every file untouched.
+
+### 22.5 Integrated replay (2026-09-28; `integration_62b7c50/`, seal 70ceae7e)
+
+`genotype_probe_62b7c50 dosage-replay --mode repair` over all 649 sealed cells (484 campaign, 165 fresh), with no fresh
+genotyping, at 2 processes × 4 threads:
+- **Wall:** 29 min 32 s in total. The per-cell walls sum to 3,504 s; the 54 repair cells account for 2,027 s of it.
+  The worst cell is `loo.NA20847.30` at 170.6 s, and the peak footprint is 2.84 GiB (`loo.NA19434.30`).
+- **Identical to the sealed runs in 649 of 649 cells:** the caller's copies, `.original.*`, the search record, and
+  every block not repaired.
+- **Identical to the sealed shadow replays:** the classification in 647 of 647 cells, and every dosage table of the 54
+  repair cells.
+- **Classes:** 4 COMPLETE_DIPLOTYPE_REPAIR, 48 CONDITIONAL_DOSAGE_CONTENT, 2 TRIGGERED_UNREPAIRED. The COMPLETE
+  repairs are the 4 HG03456 sv:1 blocks.
+  - All 4 are applied, and none is refused by the §22.2 eligibility rules.
+  - Truth is undefined at that block, so no evaluated distance changes.
