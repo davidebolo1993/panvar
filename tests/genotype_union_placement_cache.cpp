@@ -633,10 +633,35 @@ int main() {
                 Config below = with;
                 below.prefilter_cap = p.hits - 1;
                 require(refuses(f, below), "one served decision below the cap must refuse with no ranking");
+                // Above one thread the SERVED count is scheduling-dependent: a worker may miss a decision another
+                // worker has not stored yet (measured under load: 11823..11905 served of 26638 requests, against 11905
+                // at one thread), so no fixed cap near the served count has a schedule-independent outcome, and the
+                // cap's exact boundary is asserted at one thread above. At four threads the gate asserts only what
+                // holds in every schedule: with nothing declined, concurrency can only lower the served count, so the
+                // one-thread count as the cap always accepts exactly; and one below it, a run either refuses with no
+                // ranking or completes having served no more than its cap, with the reference's scores.
+                require(p.decisions_not_retained == 0, "the four-thread bound needs every decision retained");
+                Config four_at = with;
+                four_at.threads = 4;
+                four_at.prefilter_cap = p.hits;
+                const Run four_ok = score(f, four_at);
+                require(four_ok.result.union_prefilter_cache.hits <= p.hits,
+                        "four threads never serve more decisions than one thread");
+                require_prefilter_exact(plain, four_ok, "prefilter consumption cap at the one-thread count, 4 threads");
                 below.threads = 4;
-                const Run four = score(f, [&] { Config c = with; c.threads = 4; return c; }());
-                below.prefilter_cap = four.result.union_prefilter_cache.hits - 1;
-                require(refuses(f, below), "the prefilter cap refuses at 4 threads too");
+                below.prefilter_cap = p.hits - 1;
+                for (int rep = 0; rep < 8; ++rep) {
+                    bool refused = false;
+                    try {
+                        const Run r = score(f, below);
+                        require(r.result.union_prefilter_cache.hits <= below.prefilter_cap,
+                                "a completing four-thread run served no more than its prefilter cap");
+                        require_prefilter_exact(plain, r, "prefilter cap one below, 4 threads, completing schedule");
+                    } catch (const panvar::ResourceExhausted&) {
+                        refused = true;
+                    }
+                    (void)refused;   // either outcome is sound; neither may return a partial ranking
+                }
                 Config zero_cap = with;
                 zero_cap.prefilter_cap = 0;
                 bool invalid = false;
