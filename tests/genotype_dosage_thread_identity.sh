@@ -15,7 +15,8 @@ fail=0
 for f in "$OUT"/t1.dosage_*; do
   suf=${f#"$OUT/t1"}
   case "$suf" in .dosage_status.tsv|.dosage_repair_scoring.tsv) continue;; esac
-  for t in 2 4 8; do cmp -s "$f" "$OUT/t$t$suf" || { echo "FAIL $suf differs at $t threads"; fail=1; }; done
+  # output-prefix paths inside FASTA headers (the equivalence-set link) are replaced, as the shadow identity gate does
+  for t in 2 4 8; do cmp -s <(sed "s#$OUT/t1#PREFIX#g" "$f") <(sed "s#$OUT/t$t#PREFIX#g" "$OUT/t$t$suf") || { echo "FAIL $suf differs at $t threads"; fail=1; }; done
 done
 n=$(ls "$OUT"/t1.dosage_* | grep -vc status)
 [ $fail -eq 0 ] && echo "PASS $CELL: $n dosage tables byte-identical at 1/2/4/8 threads" || echo "FAILED $CELL"
