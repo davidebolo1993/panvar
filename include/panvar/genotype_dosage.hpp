@@ -110,7 +110,7 @@ struct ReportedCall {
 ReportedCall reported_call(const PreparedGenotypeModel& model, const MosaicPath& first, const MosaicPath& second);
 
 enum class DosageStatus { Consistent, Repaired, TriggeredUnrepaired, AutoRepair, Suspect, Underpowered, NotSensitive,
-                          NotEvaluated };
+                          NotEvaluated, ContentRepaired };
 const char* dosage_status_name(DosageStatus status);
 
 struct FeatureAudit {

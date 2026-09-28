@@ -553,6 +553,36 @@ Genotype unordered(const std::string& a, const std::string& b) { return a <= b ?
 
 // ---------------------------------------------------------------------------------------------- repair
 
+void classify_repair_scope(RepairResult& res, CensusRoute route) {
+    // Sol, 2026-09-28: dosage content, exact diplotype and allocation completeness are separate facts
+    const bool pair = route == CensusRoute::Pair;
+    res.dosage_content_scope = pair || res.content_complete ? "COMPLETE" : "CONDITIONAL";
+    res.diplotype_scope = res.scope == "COMPLETE" ? "COMPLETE" : "CONDITIONAL";
+    res.allocation_equivalence_scope = pair ? "NOT_APPLICABLE" : res.diplotype_scope;
+    if (res.outcome != "REPAIRED") {
+        res.repair_class = "TRIGGERED_UNREPAIRED";
+        res.serialization_representative = false;
+        return;
+    }
+    if (res.dosage_content_scope != "COMPLETE") {
+        // the dosage content itself is not established: keep the original genotype and claim no correction
+        res.repair_class = "TRIGGERED_UNREPAIRED";
+        res.outcome = "TRIGGERED_UNREPAIRED";
+        res.reason = "dosage_content_conditional";
+        res.chosen = -1;
+        for (BlockCandidate& c : res.candidates) c.chosen = false;   // no candidate is claimed
+        res.serialization_representative = false;
+        return;
+    }
+    if (res.diplotype_scope == "COMPLETE") {
+        res.repair_class = "COMPLETE_DIPLOTYPE_REPAIR";
+        res.serialization_representative = res.representative_only;
+    } else {
+        res.repair_class = "CONDITIONAL_DOSAGE_CONTENT";
+        res.serialization_representative = true;   // the exact allele sequences and allocation are not authoritative
+    }
+}
+
 void choose_repair(RepairResult& res, CensusRoute route, double tie_tolerance_nats) {
     // merge by unordered spelled block genotype; the top set is every genotype within the tolerance of the maximum
     double best = -std::numeric_limits<double>::infinity();
@@ -648,6 +678,7 @@ RepairResult repair_block(const BlockAudit& audit, const CensusBlock& census, co
     const auto refuse = [&](const std::string& reason) {
         res.outcome = "TRIGGERED_UNREPAIRED";
         res.reason = reason;
+        classify_repair_scope(res, census.route);
         return res;
     };
 
@@ -1020,8 +1051,9 @@ RepairResult repair_block(const BlockAudit& audit, const CensusBlock& census, co
             res.scope_reason.clear();
             for (const std::string& x : why) res.scope_reason += (res.scope_reason.empty() ? "" : ",") + x;
         }
-        if (rs.space_audit) {
-            // exact sizes of the candidate space, without scoring (see CandidateSpace)
+        {
+            // exact sizes of the candidate space, without scoring (see CandidateSpace); always counted, because the
+            // dosage-content scope of the repair rests on it
             const auto t_space = std::chrono::steady_clock::now();
             CandidateSpace& sp = res.space;
             sp.internal_capable = inte.size(); sp.terminal_capable = term.size();
@@ -1118,9 +1150,13 @@ RepairResult repair_block(const BlockAudit& audit, const CensusBlock& census, co
             sp.dosage_vectors.assign(vectors.begin(), vectors.end());
             sp.module_state_counts.assign(states.begin(), states.end());
             sp.seconds = seconds_since(t_space);
-            res.outcome = "SPACE_AUDIT";
-            res.candidates.clear();
-            return res;
+            // the content every admissible candidate of the full library carries, when it is unique
+            res.content_complete = sp.dosage_vectors.size() == 1 && sp.module_state_counts.size() == 1;
+            if (rs.space_audit) {
+                res.outcome = "SPACE_AUDIT";
+                res.candidates.clear();
+                return res;
+            }
         }
         if (refused) return refuse("cap_refused");
         // structures in (multiset rank, key) order; one orientation (the prototype's: the smaller unit tuple first)
@@ -1186,6 +1222,7 @@ RepairResult repair_block(const BlockAudit& audit, const CensusBlock& census, co
     }
 
     choose_repair(res, census.route, rs.tie_tolerance_nats);
+    classify_repair_scope(res, census.route);
     return res;
 }
 
@@ -1368,7 +1405,8 @@ std::string repair_blocks_table(const std::vector<std::pair<std::string, RepairR
     o << std::setprecision(17);
     o << "block_id\troute\toutcome\treason\trepair_scope\trepair_scope_reason\tcap_reached\tcandidates\tmultisets_evaluated\t"
          "multisets_retained\thaploid\tdiploid\tm_range\tinternal_capable\tterminal_capable\tbeta\tphi\tem_iterations\ttop_set_size\t"
-         "orientation_tie\tallocation_tie\tallocation_representative_only\tchosen_label\trepaired_ctx1_id\trepaired_ctx2_id\toriginal_fragment_term\t"
+         "orientation_tie\tallocation_tie\tallocation_representative_only\trepair_class\tdosage_content_scope\tdiplotype_scope\t"
+         "allocation_equivalence_scope\tserialization_representative\tchosen_label\trepaired_ctx1_id\trepaired_ctx2_id\toriginal_fragment_term\t"
          "original_exposure_term\toriginal_likelihood\trepaired_fragment_term\trepaired_exposure_term\trepaired_likelihood\t"
          "repair_separation\tconditional_repair_gap\n";
     for (const auto& [block_id, r] : repairs) {
@@ -1379,7 +1417,9 @@ std::string repair_blocks_table(const std::vector<std::pair<std::string, RepairR
           << r.cap_reached << '\t' << r.candidates.size() << '\t' << r.multisets_evaluated << '\t' << r.multisets_retained << '\t' << r.haploid
           << '\t' << r.diploid << '\t' << (mr.empty() ? "NA" : mr) << '\t' << r.internal_capable << '\t' << r.terminal_capable << '\t' << r.beta
           << '\t' << r.phi << '\t' << r.em_iterations << '\t' << r.top_set_size << '\t' << (r.orientation_tie ? "true" : "false") << '\t'
-          << r.allocation_tie << '\t' << (r.representative_only ? "true" : "false") << '\t' << (c ? c->label + "/" + c->orientation : "NA") << '\t' << (c ? c->ctx1_id : "NA") << '\t'
+          << r.allocation_tie << '\t' << (r.representative_only ? "true" : "false") << '\t' << r.repair_class << '\t' << r.dosage_content_scope
+          << '\t' << r.diplotype_scope << '\t' << r.allocation_equivalence_scope << '\t' << (r.serialization_representative ? "true" : "false")
+          << '\t' << (c ? c->label + "/" + c->orientation : "NA") << '\t' << (c ? c->ctx1_id : "NA") << '\t'
           << (c ? c->ctx2_id : "NA") << '\t' << r.original_fragment << '\t' << r.original_exposure << '\t' << r.original_likelihood << '\t';
         if (c) o << c->fragment_term << '\t' << c->exposure_term << '\t' << c->likelihood << '\t' << r.repair_separation << '\t';
         else o << "NA\tNA\tNA\tNA\t";

@@ -306,6 +306,7 @@ const char* dosage_status_name(DosageStatus status) {
         case DosageStatus::Underpowered: return "UNDERPOWERED";
         case DosageStatus::NotSensitive: return "NOT_SENSITIVE";
         case DosageStatus::NotEvaluated: return "NOT_EVALUATED";
+        case DosageStatus::ContentRepaired: return "CONTENT_REPAIRED";
     }
     return "UNKNOWN";
 }

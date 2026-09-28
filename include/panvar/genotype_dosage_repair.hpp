@@ -155,6 +155,11 @@ struct RepairResult {
     double seconds_em = 0.0, seconds_enumerate = 0.0, seconds_loglik = 0.0;
     RepairScoringStats scoring;
     CandidateSpace space;
+    // completeness, split (Sol, 2026-09-28)
+    bool content_complete = false;
+    std::string dosage_content_scope = "NA", diplotype_scope = "NA", allocation_equivalence_scope = "NA";
+    bool serialization_representative = false;
+    std::string repair_class = "NA";   // COMPLETE_DIPLOTYPE_REPAIR, CONDITIONAL_DOSAGE_CONTENT, TRIGGERED_UNREPAIRED
 };
 
 RepairResult repair_block(const BlockAudit& audit, const CensusBlock& census, const BlockFeatureModel& features,
@@ -164,6 +169,8 @@ RepairResult repair_block(const BlockAudit& audit, const CensusBlock& census, co
 // The choice among exactly scored candidates (spec section 8): the top-genotype rule, orientation ties, and on the
 // repeated-unit route the panel-structure allocation within one content multiset. Sets outcome/reason on a tie.
 void choose_repair(RepairResult& result, CensusRoute route, double tie_tolerance_nats);
+// The split completeness fields and the repair class, from the outcome, the scope and the full-library content count.
+void classify_repair_scope(RepairResult& result, CensusRoute route);
 
 std::string repair_candidates_table(const std::vector<std::pair<std::string, RepairResult>>& repairs);
 std::string repair_blocks_table(const std::vector<std::pair<std::string, RepairResult>>& repairs);
@@ -256,7 +263,7 @@ struct DosageShadowSummary {
     std::string audit_status = "COMPLETE";   // COMPLETE, NOT_RUN (no persisted call), REFUSED_LIBRARY
     std::string note;
     std::size_t molecule_span_bp = 0, m = 0, sensitive_blocks = 0, repairs = 0, repairs_conditional = 0, allocation_blocks_tested = 0;
-    std::map<std::string, std::size_t> status_counts, reason_counts;
+    std::map<std::string, std::size_t> status_counts, reason_counts, repair_classes;
     double seconds_census = 0.0, seconds_features = 0.0, seconds_estimate = 0.0, seconds_repair = 0.0, seconds_provenance = 0.0, seconds_allocation = 0.0,
            seconds_total = 0.0;
 };

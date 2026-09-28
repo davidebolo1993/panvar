@@ -115,6 +115,7 @@ DosageShadowSummary run_dosage_shadow(const PreparedGenotypeModel& model, const 
           << "dosage_allocation_blocks_tested\t" << summary.allocation_blocks_tested << '\n';
         for (const auto& [k, v] : summary.status_counts) o << "dosage_status_" << k << '\t' << v << '\n';
         for (const auto& [k, v] : summary.reason_counts) o << "dosage_reason_" << k << '\t' << v << '\n';
+        for (const auto& [k, v] : summary.repair_classes) o << "dosage_repair_class_" << k << '\t' << v << '\n';
         summary.seconds_total = seconds_since(started);
         o << "seconds_dosage_census\t" << summary.seconds_census << '\n'
           << "seconds_dosage_features\t" << summary.seconds_features << '\n'
@@ -190,9 +191,13 @@ DosageShadowSummary run_dosage_shadow(const PreparedGenotypeModel& model, const 
             repairs.push_back({ba.block_id, repair_block(ba, census[ba.block], features[ba.block], nodes, in, settings, rs)});
             const RepairResult& r = repairs.back().second;
             if (r.outcome == "SPACE_AUDIT") continue;
-            ba.status = r.outcome == "REPAIRED" ? DosageStatus::Repaired : DosageStatus::TriggeredUnrepaired;
+            // COMPLETE_DIPLOTYPE_REPAIR replaces nothing here (shadow) but is a resolved repair; CONDITIONAL_DOSAGE_CONTENT
+            // corrects the dosage content only, and must never read as a resolved allele call
+            ba.status = r.repair_class == "COMPLETE_DIPLOTYPE_REPAIR" ? DosageStatus::Repaired
+                      : r.repair_class == "CONDITIONAL_DOSAGE_CONTENT" ? DosageStatus::ContentRepaired : DosageStatus::TriggeredUnrepaired;
             ba.reason = r.reason;
             if (r.outcome == "REPAIRED") { ++summary.repairs; if (r.scope == "CONDITIONAL") ++summary.repairs_conditional; }
+            ++summary.repair_classes[r.repair_class];
         }
         summary.seconds_repair = seconds_since(t);
     }
@@ -203,6 +208,7 @@ DosageShadowSummary run_dosage_shadow(const PreparedGenotypeModel& model, const 
     // not apply (pair route, or fewer than three units)
     std::map<std::size_t, AllocationTestResult> allocation;
     std::map<std::size_t, std::pair<std::string, std::string>> allocation_status;   // block -> (status, basis)
+    std::map<std::size_t, std::string> unit_counts;   // block -> the reported call's "<units>u/<I-state units>I"
     {
         const auto ta = std::chrono::steady_clock::now();
         ScoringInputs in;
@@ -228,6 +234,12 @@ DosageShadowSummary run_dosage_shadow(const PreparedGenotypeModel& model, const 
             if (repaired) {
                 u1 = r->candidates[static_cast<std::size_t>(r->chosen)].units_a;
                 u2 = r->candidates[static_cast<std::size_t>(r->chosen)].units_b;
+            }
+            {
+                const std::vector<std::size_t> o1 = lib.panel.at(ba.call_alleles[0]), o2 = lib.panel.at(ba.call_alleles[1]);
+                std::size_t nI = 0;
+                for (const auto* h : {&o1, &o2}) for (std::size_t u : *h) nI += lib.units[u].state == 'I';
+                unit_counts[ba.block] = std::to_string(o1.size() + o2.size()) + "u/" + std::to_string(nI) + "I";
             }
             if (u1.size() + u2.size() < 3 || u1.empty() || u2.empty()) { allocation_status[ba.block] = {"NOT_APPLICABLE", "fewer_than_three_units"}; continue; }
             if (options.allocation_test) {
@@ -275,7 +287,9 @@ DosageShadowSummary run_dosage_shadow(const PreparedGenotypeModel& model, const 
          "original_fragment_term\toriginal_exposure_term\toriginal_likelihood\toriginal_prior\toriginal_total\t"
          "repaired_fragment_term\trepaired_exposure_term\trepaired_likelihood\trepaired_prior\trepaired_prior_spellable\t"
          "repair_separation\tconditional_repair_gap\toriginal_GQ\toriginal_gq_status\trepaired_GQ\tgq_status\t"
-         "allocation_basis\tallocation_equivalence_size\tallocation_representative\n";
+         "allocation_basis\tallocation_equivalence_size\tallocation_representative\trepair_class\tdosage_content_scope\tdiplotype_scope\t"
+         "allocation_equivalence_scope\tserialization_representative\trepaired_alleles_role\toriginal_content\tcorrected_content\t"
+         "admissible_content_vectors\n";
     for (const BlockAudit& ba : audit.blocks) {
         const std::map<std::string, std::string> g = bg.count(ba.block_id) ? bg.at(ba.block_id) : std::map<std::string, std::string>{};
         const RepairResult* r = repair_of.count(ba.block) ? &repairs[repair_of.at(ba.block)].second : nullptr;
@@ -311,7 +325,7 @@ DosageShadowSummary run_dosage_shadow(const PreparedGenotypeModel& model, const 
         } else {
             o << "NA\tNA\tNA\tNA\tNA\tNA\tNA";
         }
-        const bool repaired = ba.status == DosageStatus::Repaired;
+        const bool repaired = ba.status == DosageStatus::Repaired || ba.status == DosageStatus::ContentRepaired;
         o << '\t' << field(g, "conditional_GQ") << '\t' << "conditional_uncalibrated" << '\t' << (repaired ? "NA" : field(g, "conditional_GQ"))
           << '\t' << (repaired ? "UNAVAILABLE_REPAIRED" : "UNCHANGED_CONDITIONAL") << '\t' << allocation_status.at(ba.block).second << '\t';
         if (r && r->route == "repeated_unit" && c) {
@@ -319,7 +333,36 @@ DosageShadowSummary run_dosage_shadow(const PreparedGenotypeModel& model, const 
         } else {
             o << "NA\tNA";
         }
-        o << '\n';
+        // split completeness and content (Sol, 2026-09-28)
+        std::string original_content = "NA", corrected = "NA", vectors = "NA";
+        {
+            std::string cv;
+            for (const FeatureAudit& fa : ba.features) cv += (cv.empty() ? "" : ",") + std::to_string(fa.call_cn);
+            original_content = "features=" + (cv.empty() ? std::string("NA") : cv);
+            if (ba.route == CensusRoute::RepeatedUnit && unit_counts.count(ba.block)) original_content += " units=" + unit_counts.at(ba.block);
+        }
+        if (r && r->route == "repeated_unit" && !r->space.dosage_vectors.empty()) {
+            vectors.clear();
+            for (std::size_t i = 0; i < r->space.dosage_vectors.size(); ++i) vectors += (i ? ";" : "") + std::string("features=") + r->space.dosage_vectors[i];
+            vectors += " | ";
+            for (std::size_t i = 0; i < r->space.module_state_counts.size(); ++i) vectors += (i ? ";" : "") + r->space.module_state_counts[i];
+            if (r->content_complete) corrected = "features=" + r->space.dosage_vectors[0] + " units=" + r->space.module_state_counts[0];
+        } else if (r && r->route == "pair" && c) {
+            std::string cv;
+            for (std::size_t t = 0; t < ba.features.size(); ++t) {
+                const auto& copies = features[ba.block].features[ba.features[t].pooled_index].copies;
+                cv += (t ? "," : "") + std::to_string(copies.at(c->allele_a) + copies.at(c->allele_b));
+            }
+            corrected = "features=" + cv;
+        }
+        if (r) {
+            o << '\t' << r->repair_class << '\t' << r->dosage_content_scope << '\t' << r->diplotype_scope << '\t' << r->allocation_equivalence_scope
+              << '\t' << (r->serialization_representative ? "true" : "false") << '\t'
+              << (!c ? "NA" : r->repair_class == "COMPLETE_DIPLOTYPE_REPAIR" && !r->serialization_representative ? "RESOLVED" : "REPRESENTATIVE_ONLY_NOT_RESOLVED");
+        } else {
+            o << "\tNA\tNA\tNA\tNA\tfalse\tNA";
+        }
+        o << '\t' << original_content << '\t' << corrected << '\t' << vectors << '\n';
     }
     std::ostringstream cen;
     cen << "block_id\talleles\tmax_node_multiplicity\tmax_repeated_bp\tdosage_only_pairs\tcensus_route\tpooled_features\n";
@@ -367,10 +410,14 @@ DosageShadowSummary run_dosage_shadow(const PreparedGenotypeModel& model, const 
                 if (!register_display_id(display, rid)) throw std::runtime_error("display_id_collision " + shown);
                 const std::string hom = h == 0 ? "hap1" : "hap2";
                 repaired_fa << '>' << rid << " display=" << shown << " block=" << block_id << " homologue=" << hom << " bp=" << full.size()
-                            << " repair_scope=" << r.scope << " allocation_status=" << allocation_status.at(b).first;
-                if (r.representative_only) {
-                    repaired_fa << " allocation=REPRESENTATIVE_ONLY equivalence_set=" << out_prefix << ".dosage_allocation_equivalence.tsv#" << block_id
-                                << " equivalence_size=" << r.allocation_tie;
+                            << " repair_class=" << r.repair_class << " dosage_content_scope=" << r.dosage_content_scope << " diplotype_scope="
+                            << r.diplotype_scope << " allocation_equivalence_scope=" << r.allocation_equivalence_scope << " repair_scope=" << r.scope
+                            << " allocation_status=" << allocation_status.at(b).first;
+                if (r.serialization_representative) {
+                    repaired_fa << " role=REPRESENTATIVE_ONLY_NOT_RESOLVED equivalence_set=" << out_prefix << ".dosage_allocation_equivalence.tsv#"
+                                << block_id << " equivalence_size=" << r.allocation_tie;
+                } else {
+                    repaired_fa << " role=RESOLVED";
                 }
                 repaired_fa << '\n';
                 for (std::size_t at = 0; at < full.size(); at += 60) repaired_fa << full.substr(at, 60) << '\n';
@@ -405,6 +452,20 @@ DosageShadowSummary run_dosage_shadow(const PreparedGenotypeModel& model, const 
             }
         }
         atomic_write(out_prefix + ".dosage_repaired.fa", repaired_fa.str());
+        std::ostringstream bfa;
+        for (const auto& entry : repairs) {
+            const RepairResult& r = entry.second;
+            if (r.outcome != "REPAIRED" || r.chosen < 0) continue;
+            const BlockCandidate& c = r.candidates[static_cast<std::size_t>(r.chosen)];
+            for (int h = 0; h < 2; ++h) {
+                const std::string& seq = h == 0 ? c.ctx1_sequence : c.ctx2_sequence;
+                bfa << '>' << sha256_hex(seq) << " block=" << entry.first << " homologue=" << (h == 0 ? "hap1" : "hap2") << " bp=" << seq.size()
+                    << " repair_class=" << r.repair_class << " role="
+                    << (r.serialization_representative ? "REPRESENTATIVE_ONLY_NOT_RESOLVED" : "RESOLVED") << '\n';
+                for (std::size_t at = 0; at < seq.size(); at += 60) bfa << seq.substr(at, 60) << '\n';
+            }
+        }
+        atomic_write(out_prefix + ".dosage_repaired_block_alleles.fa", bfa.str());
         atomic_write(out_prefix + ".dosage_original.fa", original_fa.str());
         atomic_write(out_prefix + ".dosage_provenance.tsv", pv.str());
         atomic_write(out_prefix + ".dosage_provenance_panel.tsv", searched.str());
@@ -431,7 +492,7 @@ DosageShadowSummary run_dosage_shadow(const PreparedGenotypeModel& model, const 
         // every distinct unordered genotype of each repair's allocation-equivalence set; the representative only
         // serialises the set (smallest canonical SHA-256 pair) and is not a resolved allocation
         std::ostringstream eq;
-        eq << std::setprecision(17) << "block_id\trepair_scope\tequivalence_size\tmember\tcanonical_sha256_a\tcanonical_sha256_b\t"
+        eq << std::setprecision(17) << "block_id\trepair_scope\tallocation_equivalence_scope\tequivalence_size\tmember\tcanonical_sha256_a\tcanonical_sha256_b\t"
                                          "units_a\tunits_b\tstates\tpanel_log_prior\tlikelihood\tserialization_representative\n";
         for (const auto& entry : repairs) {
             const RepairResult& r = entry.second;
@@ -453,7 +514,7 @@ DosageShadowSummary run_dosage_shadow(const PreparedGenotypeModel& model, const 
                 std::string ua, ub;
                 for (std::size_t u : c.units_a) ua += (ua.empty() ? "" : "-") + std::to_string(u);
                 for (std::size_t u : c.units_b) ub += (ub.empty() ? "" : "-") + std::to_string(u);
-                eq << entry.first << '\t' << r.scope << '\t' << members.size() << '\t' << i << '\t' << key.first << '\t' << key.second << '\t'
+                eq << entry.first << '\t' << r.scope << '\t' << r.allocation_equivalence_scope << '\t' << members.size() << '\t' << i << '\t' << key.first << '\t' << key.second << '\t'
                    << ua << '\t' << ub << '\t' << c.states << '\t' << c.panel_log_prior << '\t' << c.likelihood << '\t'
                    << (c.chosen ? (r.representative_only ? "REPRESENTATIVE_ONLY_NOT_RESOLVED" : "SINGLE_ARRANGEMENT_AT_PICK") : "member") << '\n';
             }
