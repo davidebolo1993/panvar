@@ -15,6 +15,7 @@
 #include "panvar/fragment_likelihood.hpp"
 #include "panvar/genotype_command.hpp"
 #include "panvar/genotype_dosage.hpp"
+#include "panvar/genotype_dosage_repair.hpp"
 #include "panvar/genotype_locus.hpp"
 #include "panvar/genotype_model.hpp"
 #include "panvar/genotype_repair.hpp"
@@ -5927,6 +5928,7 @@ int dosage_replay(const Args& args) {
                                           curation.empty() || curation == "none" ? std::vector<std::string>{} : read_panel_curation(curation));
     const panvar::PreparedGenotypeModel& model = *loaded.model;
     std::string hap1 = args.get("hap1", ""), hap2 = args.get("hap2", "");
+    panvar::dosage::PersistedScore persisted;
     if (hap1.empty() || hap2.empty()) {
         const std::string eq = args.required("run") + ".equivalence_set.tsv";
         std::ifstream in(eq);
@@ -5940,12 +5942,17 @@ int dosage_replay(const Args& args) {
             if (it == header.end()) throw std::runtime_error(eq + " has no column " + name);
             return static_cast<std::size_t>(it - header.begin());
         };
-        const std::size_t c_rank = col("rank"), c_rep = col("representative"), c_h1 = col("hap1_alleles"), c_h2 = col("hap2_alleles");
+        const std::size_t c_rank = col("rank"), c_rep = col("representative"), c_h1 = col("hap1_alleles"), c_h2 = col("hap2_alleles"),
+                          c_tot = col("score"), c_frag = col("fragment_term"), c_expo = col("exposure_term");
         while (std::getline(in, line)) {
             std::vector<std::string> f;
             std::stringstream row(line);
             for (std::string c; std::getline(row, c, '\t');) f.push_back(c);
-            if (f.size() > std::max({c_rank, c_rep, c_h1, c_h2}) && f[c_rank] == "1" && f[c_rep] == "true") { hap1 = f[c_h1]; hap2 = f[c_h2]; break; }
+            if (f.size() > std::max({c_rank, c_rep, c_h1, c_h2, c_tot, c_frag, c_expo}) && f[c_rank] == "1" && f[c_rep] == "true") {
+                hap1 = f[c_h1]; hap2 = f[c_h2];
+                persisted = {std::stod(f[c_tot]), std::stod(f[c_frag]), std::stod(f[c_expo])};
+                break;
+            }
         }
         if (hap1.empty()) throw std::runtime_error(eq + " has no rank-1 representative (no call to audit)");
     }
@@ -5972,6 +5979,40 @@ int dosage_replay(const Args& args) {
         c << b.block_id << '\t' << b.alleles << '\t' << b.max_node_multiplicity << '\t' << b.max_repeated_bp << '\t' << b.dosage_only_pairs
           << '\t' << panvar::dosage::census_route_name(b.route) << '\t' << features[b.block].features.size() << '\n';
     }
+    // repair of every AUTO_REPAIR block (--repair 1): exact scoring with the run's own scoring settings
+    std::vector<std::pair<std::string, panvar::dosage::RepairResult>> repairs;
+    double seconds_repair = 0.0;
+    if (args.get("repair", "0") != "0") {
+        const auto tr = std::chrono::steady_clock::now();
+        const auto status = read_key_values(args.required("run") + ".mosaic_status.tsv");
+        if (status.at("model_fingerprint") != loaded.fingerprint) throw std::runtime_error("the run was not scored on this model");
+        panvar::dosage::ScoringInputs in;
+        in.model = &model; in.first = w1; in.second = w2; in.call = &call; in.reads = &reads; in.library = &library;
+        in.options.threads = threads;
+        in.options.mismatch_band = std::stoul(status.at("mismatch_band"));
+        in.options.minimum_piece_bp = 12;
+        in.options.max_piece_hits = std::stoull(status.at("max_piece_hits"));
+        in.options.max_proposed_starts_per_haplotype = std::stoull(status.at("max_proposed_starts_per_haplotype"));
+        in.options.max_physical_origins = std::stoull(status.at("max_physical_origins"));
+        in.options.max_state_classes = std::stoull(status.at("max_state_classes"));
+        in.options.max_mass_cells = std::stoull(status.at("max_mass_cells"));
+        in.options.emission_cache_bytes = static_cast<std::size_t>(std::stoull(status.at("emission_cache_bytes")));
+        in.switch_probability.assign(model.blocks().size() - 1, std::stod(args.get("switch-probability", "0.01")));
+        in.persisted = persisted;
+        panvar::dosage::RepairSettings rs;
+        rs.chunk_haplotypes = std::stoul(args.get("chunk-haplotypes", "128"));
+        for (const auto& ba : audit.blocks) {
+            if (ba.status != panvar::dosage::DosageStatus::AutoRepair) continue;
+            repairs.push_back({ba.block_id, panvar::dosage::repair_block(ba, census[ba.block], features[ba.block], loaded.sorted.gfa.seq,
+                                                                         in, settings, rs)});
+            const auto& r = repairs.back().second;
+            std::cout << "dosage-replay: " << ba.block_id << " " << r.route << " " << r.outcome << " " << r.reason << " scope " << r.scope
+                      << " candidates " << r.candidates.size() << '\n';
+        }
+        seconds_repair = std::chrono::duration<double>(std::chrono::steady_clock::now() - tr).count();
+        atomic_write(out + ".dosage_repairs.tsv", panvar::dosage::repair_blocks_table(repairs));
+        atomic_write(out + ".dosage_repair_candidates.tsv", panvar::dosage::repair_candidates_table(repairs));
+    }
     atomic_write(out + ".dosage_census.tsv", c.str());
     atomic_write(out + ".dosage_features.tsv", panvar::dosage::dosage_features_table(audit));
     atomic_write(out + ".dosage_blocks.tsv", panvar::dosage::dosage_blocks_table(audit));
@@ -5979,7 +6020,7 @@ int dosage_replay(const Args& args) {
     std::ostringstream r;
     r << std::setprecision(6) << "key\tvalue\nhap1\t" << hap1 << "\nhap2\t" << hap2 << "\nmodel_fingerprint\t" << loaded.fingerprint
       << "\nmolecule_span_bp\t" << *span << "\nreads\t" << reads.size() << "\nthreads\t" << threads << "\nseconds_census\t" << sec(t0, t1)
-      << "\nseconds_features\t" << sec(t1, t2) << "\nseconds_estimate\t" << sec(t3, t4) << "\nseconds_total\t"
+      << "\nseconds_features\t" << sec(t1, t2) << "\nseconds_estimate\t" << sec(t3, t4) << "\nseconds_repair\t" << seconds_repair << "\nseconds_total\t"
       << sec(started, std::chrono::steady_clock::now()) << '\n';
     atomic_write(out + ".dosage_replay.tsv", r.str());
     std::cout << "dosage-replay: m " << audit.m << ", " << audit.blocks.size() << " blocks, span " << *span << ", "

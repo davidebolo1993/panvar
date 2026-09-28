@@ -204,6 +204,12 @@ std::string sha256_file(const std::string& path) {
     return hash.hex();
 }
 
+std::string sha256_bytes(const std::string& bytes) {
+    Sha256 hash;
+    hash.update(reinterpret_cast<const unsigned char*>(bytes.data()), bytes.size());
+    return hash.hex();
+}
+
 // ---- the search --------------------------------------------------------------------------------
 
 DiplotypeIdentity diplotype_identity(const std::vector<std::size_t>& a, const std::vector<std::size_t>& b) {

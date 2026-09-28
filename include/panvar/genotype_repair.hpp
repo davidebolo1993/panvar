@@ -40,6 +40,8 @@ std::uint64_t release_free_pages();
 void atomic_write(const std::string& path, const std::string& content);
 // SHA-256 of a file's bytes, lowercase hex. Provenance only.
 std::string sha256_file(const std::string& path);
+// SHA-256 of a byte string, lowercase hex.
+std::string sha256_bytes(const std::string& bytes);
 
 // ---- the search --------------------------------------------------------------------------------
 // OneShot scores every round cold; Context keeps one PreparedScoringContext; Delta additionally
