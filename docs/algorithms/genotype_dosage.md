@@ -1,15 +1,19 @@
-# Dosage audit and repair: normative specification (draft for review, 2026-09-28)
+# Dosage audit and repair: normative specification (approved with amendments, 2026-09-28)
 
 This document is the contract for the C++ port of the dosage audit and repair add-on to `panvar genotype`. It freezes
-the design Sol accepted on 2026-09-28. The Python prototype is the executable reference:
-`tests/results/genotype_c4_production_11fe681_dosage_repair/`.
+the design Sol accepted on 2026-09-28, with Sol's ten amendments of the same day (§17). The Python prototype is the
+executable reference: `tests/results/genotype_c4_production_11fe681_dosage_repair/`.
 - **The sealed reference outputs** are the policy v2 tables `contiguity/class_baseline_{campaign,fresh}.*` and the
   repairs in `phase1/` and `policyC_test/`.
 - **Normative words.** "Must" and "never" are requirements. A value in `code` is a frozen constant, and changing it is
   a new design, not a tuning step.
 
 The add-on is truth-free. It reads the prepared model, the call the caller reports, the reads and the library, and
-nothing else.
+nothing else. It is a **short-read** specification. Nothing in it applies to a long-read model; a run whose library
+does not declare the short-read keys of §2 is refused (§11).
+
+**Exact tie.** Two scores are tied when they differ by at most `1e-9` nats. This is the production
+`CertificationOptions::minimum_tie_tolerance_nats`; the prototype's top sets use the same tolerance.
 
 ## 1. Scope and states
 
@@ -25,23 +29,29 @@ Repair never happens for any other reason. In particular:
 
 Blocks that the census (§2) does not mark as copy-number-sensitive are never examined: `dosage_status NOT_SENSITIVE`.
 
-## 2. Census: copy-number-sensitive blocks (graph only, once per model)
+## 2. Census: copy-number-sensitive blocks (graph and library, once per run)
+
+**Molecule span.** S = ⌈`insert_mean_bp` + 4 × `insert_sd_bp`⌉, from the run's short-read library.
+- C4's libraries declare 350 and 40, so S = 510, the prototype's value.
+- S is recorded in the status (`dosage_molecule_span_bp`) and in every dosage block row.
 
 For each block, over its panel alleles as the prepared model holds them (each allele's node path; node weight = node
 length in bp):
 
 - **len(a):** the allele's length, i.e. the sum of node weights with multiplicity.
 - **novel(a, b):** the bp of distinct nodes present in `a` and absent from `b`.
-- **Dosage-only pair (a, b):** len(b) − len(a) ≥ `510` bp, and novel(a, b) ≤ `50` bp. The shorter allele differs
-  from the longer one essentially by missing sequence, which is what copy number measures.
+- **Dosage-only pair (a, b):** len(b) − len(a) ≥ S, and novel(a, b) ≤ `50` bp.
+  - The shorter allele differs from the longer one essentially by missing sequence, which is what copy number
+    measures.
+  - `50` bp is the minimum structural variant size. It is declared separately from S.
 - **Copy-number-sensitive:** the block has at least one dosage-only pair.
 - **Repeated-unit route** (§8.2): the block is copy-number-sensitive, some allele visits a node at least twice, and
-  that allele's repeated sequence exceeds `510` bp. The repeated sequence is the bp of nodes visited ≥ 2 times in one
+  that allele's repeated sequence exceeds S bp. The repeated sequence is the bp of nodes visited ≥ 2 times in one
   allele. Otherwise a sensitive block uses the **pair route** (§8.1).
 - **Census-invariant:** every other block. These blocks provide the single-copy reference (§4).
 
 The census uses no reads, calls or truth. C4 yields sv:1 (pair route) and sv:7 (repeated-unit route) in all 66
-models. `510` is the maximum fragment span of the library (insert 350 + 4 × 40). `50` is the minimum variant size.
+models.
 
 ## 3. Pooled dosage features (graph, then per call)
 
@@ -53,7 +63,10 @@ models. `510` is the maximum fragment span of the library (insert 350 + 4 × 40)
   ascending allele ID and positions left to right.
 - **Per-call exclusion.** For the reported genotype, remove from every feature the k-mers occurring anywhere in
   either reported homologue outside this block's interval. A feature left with ≥ `500` k-mers is **tested**.
+- **No tested feature.** A sensitive block with no tested feature is `NOT_EVALUATED` / `no_tested_feature`.
 - **m** for a sample = the number of tested features summed over all copy-number-sensitive blocks of the locus.
+  - m counts only blocks that reach the estimate; blocks that fail closed in §3–§5 contribute nothing.
+  - If m = 0, no z_critical is computed: `z_critical NA`, and every sensitive block keeps its fail-closed status.
 - **Call copy number** of feature j: c_j = s_j[allele1] + s_j[allele2], using the two reported block alleles.
 - **Feasible range:** [2·min s_j, 2·max s_j].
 
@@ -68,8 +81,7 @@ The reference R is the set of canonical k-mers that satisfy all of the following
 - they occur exactly once in each full reported homologue;
 - they are absent from every panel allele of the block being audited.
 
-If R is empty, or the reads hit R zero times, the block is `NOT_EVALUATED` (reason `no_reference`). That is a fail
-closed state, never CONSISTENT.
+If R is empty, the block is `NOT_EVALUATED` / `no_reference`.
 
 ## 5. Estimate and bootstrap
 
@@ -77,16 +89,21 @@ closed state, never CONSISTENT.
   0) or to the tested feature holding it. A read pair contributes a count vector v = (v_0, v_1, …).
 - **Retained pairs.** Pairs whose vector is all zero are dropped. The retained pairs, in input order, are the
   bootstrap population P of size n.
-- **Point estimate.** T_j = Σ v_j over P. Then CN_j = 2 · (T_j / |F_j|) / (T_0 / |R|), evaluated in this order in
-  IEEE double.
+- **Point estimate.** T_j = Σ v_j over P. If T_0 = 0 (this includes n = 0), the block is `NOT_EVALUATED` /
+  `no_reference_hits`. Otherwise CN_j = 2 · (T_j / |F_j|) / (T_0 / |R|), evaluated in this order in IEEE double.
 - **Bootstrap.**
   - `200` replicates; each draws n indices uniformly with replacement and recomputes CN_j by the same formula.
   - The generator is the Python `random.Random(20260925)` stream (MT19937, `init_by_array` seeding, `randrange` by
     `getrandbits` rejection). It is re-seeded for every block and drawn sequentially: replicate r, then index i.
   - This is frozen so the port reproduces the prototype bit for bit. Draw order is independent of thread count.
+- **Zero reference in a replicate.** If any replicate has zero reference hits, the block is `NOT_EVALUATED` /
+  `bootstrap_zero_reference`.
+  - No replicate value is computed from a zero denominator, and no NaN or infinity reaches a quantile.
+  - The prototype has no rule for this case: it would have raised ZeroDivisionError, and no sealed run raised it.
+    Failing closed is therefore a new, declared rule, not a change to replayed behaviour.
 - **Quantiles.** q(p) = sorted replicates[⌊p·(200 − 1)⌋] for p ∈ {0.05, 0.25, 0.50, 0.75, 0.95}.
 - **Robust sd** = (q(0.75) − q(0.25)) / 1.349. **Robust z** = |c_j − q(0.50)| / robust sd. If robust sd = 0, then
-  z = 0 when c_j = q(0.50), else +∞.
+  z = 0 when c_j = q(0.50), else +∞. That infinity is an explicit rule, never the result of a division.
 - **Admissible set** (the declared 90% interval):
   - the integers in [⌈q(0.05)⌉, ⌊q(0.95)⌋] that lie in the feasible range;
   - if there are none, the single feasible integer nearest to the interval (distance to the nearer end, then the
@@ -129,15 +146,46 @@ ranks.
 
 **Winner guard.** Before any candidate is scored, the reported diplotype alone must reproduce its persisted total,
 fragment term and exposure term within 1e-6 in the same scoring context. Otherwise the repair fails closed:
-`TRIGGERED_UNREPAIRED`, reason `winner_not_reproduced`.
+`TRIGGERED_UNREPAIRED` / `winner_not_reproduced`.
+
+**Resource refusal.** If scoring hits a cumulative scorer cap or the run's watchdog, the block ends
+`TRIGGERED_UNREPAIRED` / `resource_refusal`, and the reported genotype is kept.
+
+**Top-genotype rule** (both routes). Numeric IDs and ranks may order enumeration, but never choose between distinct
+unordered block genotypes.
+1. **Merge.** Scored candidates are grouped by their unordered pair of spelled block sequences. A group's score is
+   its best orientation.
+2. **Top set.** The top set is every group within the tie tolerance of the maximal likelihood.
+3. **Distinct genotypes tied.** If the top set holds more than one group, the reported genotype is kept:
+   `TRIGGERED_UNREPAIRED` / `top_genotype_tie`, with every tied candidate reported.
+   - **Exception:** on the repeated-unit route, top-set groups that share one content multiset are resolved by the
+     allocation rule (§8.2). That rule never resolves a tie between different content multisets.
+4. **Orientation ties.** A tie between the two orientations of one unordered block genotype is not a genotype tie.
+   Orientation AB (the first block sequence in the first reported homologue) is taken and `orientation_tie` is
+   recorded. Orientation carries no block-genotype information, and `phase_support` is unchanged.
+
+In the sealed prototype repairs, every top-set tie (39 blocks) lay within one content multiset, so this rule changes
+none of them.
+
+**Repair scope.** Every repair records `repair_scope` and `repair_scope_reason`.
+- **COMPLETE:** every dosage-admissible candidate of the declared candidate model was constructed and exactly scored.
+- **CONDITIONAL** otherwise. The reasons, in canonical order, comma-joined:
+  - `pool_truncated`: some internal- or terminal-capable unit fell outside the 36-unit pool;
+  - `cap_multisets`, `cap_haploid`, `cap_diploid`: a construction cap stopped expansion;
+  - `proposal_ranked`: admissible multisets beyond those constructed exist, ordered only by the proposal
+    likelihood, which is not an upper bound on the exact score.
+- A proposal rank or a screening weight is never treated as proof that an omitted candidate cannot win.
+- The shadow implementation reproduces the prototype, conditional repairs included. The integration decision reports
+  how many repairs are conditional.
 
 ### 8.1 Pair route
 
 - **Candidates:** every unordered pair {a, b} (a = b allowed) of the block's panel alleles with s_j[a] + s_j[b]
-  admissible for every tested feature. Cap: `4096` pairs; above it, `TRIGGERED_UNREPAIRED`, reason `cap_pairs`. None:
-  `TRIGGERED_UNREPAIRED`, reason `no_admissible_candidate`. In both cases the reported genotype is kept.
-- **Choice:** maximal likelihood. Ties go to (smaller allele ID pair, then orientation AB before BA). An exact tie at
-  the top is recorded (`repair_top_ties`).
+  admissible for every tested feature.
+- **Cap:** `4096` pairs. Above it: `TRIGGERED_UNREPAIRED` / `cap_pairs`.
+- **None:** `TRIGGERED_UNREPAIRED` / `no_admissible_candidate`.
+- In both cases the reported genotype is kept.
+- **Choice:** the top-genotype rule. When the pairs are scored completely, `repair_scope COMPLETE`.
 - **Allocation:** `allocation_status NOT_APPLICABLE`. The block alleles are whole panel alleles.
 
 ### 8.2 Repeated-unit route
@@ -165,7 +213,7 @@ fragment term and exposure term within 1e-6 in the same scoring context. Otherwi
   internal-capable units, and the I term is 0 when M = 2.
 - **Admissible multiset** (2 terminal + M − 2 internal units): round(Σ u_j) is admissible for every feature.
 
-**Screening (count model).** This matches the prototype, which is itself documented in `phase1/proposal_general.py`.
+**Screening (count model).** This matches the prototype, `phase1/proposal_general.py`.
 - **Profile classes:** unit k-mers with a non-constant count across units. Excluded: k-mers that can span a unit
   junction (left flank | unit, unit | entry, unit | right flank), and k-mers in the reported homologues outside the
   block.
@@ -183,18 +231,20 @@ fragment term and exposure term within 1e-6 in the same scoring context. Otherwi
 - **Candidates:** every admissible multiset over the pool with M in the M range and M − 2 ≤ 2(KMAX − 1). They are
   ranked by composite log-likelihood descending, then multiset ascending.
 
-**Construction.** Multisets are taken in rank order and expanded into arrangements (below). Caps: `64` multisets,
-`256` haploid sequences, `4096` diploid structures.
+**Construction.** Multisets are taken in rank order and expanded into arrangements. Caps: `64` multisets, `256`
+haploid sequences, `4096` diploid structures.
 - Construction stops at the first cap.
-- A cap reached at the first multiset, or at an exact likelihood tie across the boundary, refuses:
-  `TRIGGERED_UNREPAIRED`, reason `cap_refused`.
+- A cap reached at the first multiset, or at an exact proposal-likelihood tie across the boundary, refuses:
+  `TRIGGERED_UNREPAIRED` / `cap_refused`.
 - Arrangements are both terminal assignments × every split of the internal units between homologues × every order
   within a homologue. Each homologue holds ≤ KMAX units, and each homologue's first unit is anchor-compatible.
   Structures with identical spelled sequences are merged.
+- These caps and the pool make the scope `CONDITIONAL` (§8) unless the reasons listed there are all absent.
 
 **Choice.**
-1. **Content:** the multiset of the maximal-likelihood exactly scored structure (ties: structure rank, then
-   orientation).
+1. **Content:** the top-genotype rule over all scored structures.
+   - A top set within one content multiset fixes the content.
+   - A top set spanning several multisets ends in `top_genotype_tie`.
 2. **Allocation, the split between homologues:** among the scored structures of that multiset, maximise the **panel
    structure log-prior** log((f(σ_a) + 0.5)/N) + log((f(σ_b) + 0.5)/N).
    - σ is a homologue's unit-state string (e.g. `IO`), f(σ) the number of panel alleles with that state string, and
@@ -203,9 +253,11 @@ fragment term and exposure term within 1e-6 in the same scoring context. Otherwi
    - Reason: the transposition test shows that 350 bp-insert fragments cannot see the split. The likelihood and the
      original call's split are therefore uninformative about it. Of the rules compared, panel frequency was best on
      both datasets.
-3. The reported block genotype is that structure in its best-scoring orientation.
+   - This is the only place a declared non-likelihood rule chooses between distinct block genotypes, and it applies
+     only within one content multiset.
+3. The reported block genotype is that structure, oriented by the orientation rule above.
 
-### 8.3 Allocation observability test (annotation only)
+### 8.3 Allocation observability test (annotation only; shadow-only)
 
 It applies to the reported genotype of every repeated-unit block (repaired or not) whose two homologues hold ≥ 3
 units in total. Every other block is `NOT_APPLICABLE`.
@@ -226,32 +278,45 @@ units in total. Every other block is `NOT_APPLICABLE`.
 - It is never evidence that the genotype is wrong.
 - It never triggers repair and never changes a call.
 
-## 9. Repaired-sequence provenance
+**Cost.** The test stays in shadow and off by default until Sol reviews its measured cost: incremental wall time, peak
+memory and the number of blocks tested. Its switch is `--dosage-allocation-test`.
 
-This covers every haplotype the repair constructs that differs from both reported homologues. Comparisons use only
-the panel supplied to the caller (in LOO validation, the LOO panel).
+## 9. Repaired-sequence provenance (chosen repaired haplotypes)
 
-- the repaired and the original haplotype sequences (FASTA; the original is the reported homologue it replaces);
-- **Nearest panel sequences at two levels:**
-  - the full haplotype against every spelled panel haplotype;
-  - the repaired block allele against every panel allele of the block.
-- **Distance:** global edit distance (unit costs; edlib, the existing submodule). Raw, and normalised by the
-  repaired sequence's length.
-- **Ties:** every panel sequence at the minimal distance is reported. They are ordered by sequence SHA-256, then by
-  panel ID, so the output is invariant to panel ordering.
-- the extended CIGAR (`=`, `X`, `I`, `D`) against each reported nearest sequence;
-- **Unit provenance:** each unit in order, with its unit ID, its sequence digest and every panel allele and position
+This covers the **chosen** repaired haplotypes of every REPAIRED block. Losing candidates appear only in the candidate
+table. Comparisons use only the panel supplied to the caller (in LOO validation, the LOO panel).
+
+**Emitted for each chosen repaired haplotype:**
+- the repaired full-haplotype FASTA, and the original full-haplotype FASTA (the reported homologue it replaces);
+- **all equally nearest model-panel sequences, at two levels:**
+  - full haplotypes: the full repaired haplotype against every spelled panel template haplotype;
+  - block alleles: the repaired block allele against every panel allele of the block.
+- **Distance:** raw global edit distance (unit costs; edlib, the existing submodule).
+- **Normalised distance:** raw / global alignment length, where the length counts the `=`, `X`, `I` and `D` columns.
+- **Deterministic extended CIGAR** (`=`, `X`, `I`, `D`) against each reported nearest sequence.
+  - The alignment is edlib's global path, and the gate replays it.
+  - Among equal-cost paths, edlib's traceback is deterministic for fixed inputs.
+- **Ties:** every panel sequence at the minimal distance is reported. They are ordered by full SHA-256 of the
+  sequence, then by panel ID, so the output is invariant to panel ordering.
+- **Unit provenance:** each unit in order, with its unit ID, its sequence SHA-256 and every panel allele and position
   that carries it (repeated-unit route); or the two panel allele IDs (pair route).
+
+**Generated-sequence ID.** The complete lowercase SHA-256 of the sequence.
+- A display ID (the first 12 hex digits) may be shown alongside it.
+- The run fails closed (`resource_refusal`, with reason detail `display_id_collision`) if two distinct generated
+  sequences share a display ID.
 
 ## 10. Genotype quality after repair
 
 - **Unrepaired blocks:** the production `conditional_GQ` keeps its production meaning. It is conditional on the
   scored candidate set and uncalibrated: `gq_status UNCHANGED_CONDITIONAL`.
 - **REPAIRED blocks:** the ordinary GQ is **not** reused. The repaired genotype was chosen inside a different,
-  dosage-constrained candidate set, and a repaired non-panel haplotype may have no spellable atomic prior. So:
-  - `gq_status UNAVAILABLE_REPAIRED` and `repaired_GQ NA`;
+  dosage-constrained candidate set, and a repaired non-panel haplotype may have no spellable atomic prior.
+  - `original_GQ` and `original_gq_status`: the production value and its conditional status, retained. Never
+    overwritten.
+  - `repaired_GQ NA`; `gq_status UNAVAILABLE_REPAIRED`.
   - `conditional_repair_gap` = likelihood(chosen) − likelihood(best admissible candidate with a different unordered
-    block genotype), in nats; NA if there is none;
+    block genotype), in nats; NA if there is none. It is conditional on the repair's candidate set and its scope.
   - `repair_separation` = likelihood(chosen) − likelihood(the original call), in nats. It can be negative: the
     likelihood alone is not a reliable judge of dosage, which is why repair is dosage-constrained.
 
@@ -265,38 +330,51 @@ Existing outputs are unchanged. The audit writes new files next to them, and eac
 | field | values |
 |---|---|
 | block_id, census_route | pair / repeated_unit / not_sensitive |
+| molecule_span_bp | S (§2) |
 | dosage_status | CONSISTENT, REPAIRED, TRIGGERED_UNREPAIRED, SUSPECT, UNDERPOWERED, NOT_SENSITIVE, NOT_EVALUATED |
-| dosage_reason | none, no_admissible_candidate, cap_pairs, cap_refused, winner_not_reproduced, no_reference |
-| allocation_status | RESOLVED, UNRESOLVED, INCONCLUSIVE, NOT_APPLICABLE |
+| dosage_reason | see the reasons list below |
+| allocation_status | RESOLVED, UNRESOLVED, INCONCLUSIVE, NOT_APPLICABLE, NOT_RUN (test switched off) |
 | read_support_status | the call's `genotype_support`, copied |
 | representation_status | the call's representation `filter`, copied |
-| alpha, m, z_critical, features_tested, max_robust_z | |
+| alpha, m, z_critical, features_tested, max_robust_z | z_critical NA when m = 0 |
 | original_allele1, original_allele2 | the reported block alleles |
-| repaired_allele1, repaired_allele2 | NA unless REPAIRED; generated alleles get content IDs `r<sha256 prefix>` |
+| repaired_allele1, repaired_allele2 | NA unless REPAIRED; generated alleles by full SHA-256 |
 | repair_route, candidate_source | pair / repeated_unit; panel_pair / unit_multiset |
-| candidates_constructed, candidates_scored, repair_top_ties, cap_reached | |
+| repair_scope, repair_scope_reason | COMPLETE / CONDITIONAL; reasons per §8 |
+| candidates_constructed, candidates_scored, top_set_size, orientation_tie, cap_reached | |
 | original_fragment_term, original_exposure_term, original_likelihood, original_prior, original_total | |
 | repaired_fragment_term, repaired_exposure_term, repaired_likelihood, repaired_prior, repaired_prior_spellable | |
 | repair_separation, conditional_repair_gap | §10 |
-| gq_status, reported_GQ | UNCHANGED_CONDITIONAL with the production value, or UNAVAILABLE_REPAIRED with NA |
+| original_GQ, original_gq_status, repaired_GQ, gq_status | §10 |
 
-**`<out>.dosage_features.tsv`**, one row per tested feature: the §7 fields.
+**Reasons** (`dosage_reason`): `none`, `no_tested_feature`, `no_reference`, `no_reference_hits`,
+`bootstrap_zero_reference`, `no_admissible_candidate`, `cap_pairs`, `cap_refused`, `winner_not_reproduced`,
+`top_genotype_tie`, `resource_refusal`, `root_evidence_noninvariant` (§12.1), `unsupported_library`.
 
-**`<out>.dosage_repair_candidates.tsv`**, one row per scored candidate orientation:
-- the route, label, rank, the unit tuples or allele pair, the state strings;
-- the proposal log-likelihood (repeated-unit route), fragment term, exposure term, likelihood, prior;
-- the panel-structure log-prior;
-- whether it was chosen for content and for allocation.
+**Other files:**
+- **`<out>.dosage_features.tsv`**, one row per tested feature: the §7 fields.
+- **`<out>.dosage_repair_candidates.tsv`**, one row per scored candidate orientation:
+  - the route, label, rank, the unit tuples or allele pair, the state strings;
+  - the proposal log-likelihood (repeated-unit route), fragment term, exposure term, likelihood, prior;
+  - the panel-structure log-prior;
+  - `in_top_set`, and whether it was chosen for content and for allocation.
+- **`<out>.dosage_allocation.tsv`**, one row per transposition: A, A′, the fragment-vector hashes (bitwise and 1e-9
+  grid), the exposure delta, and whether it is identical.
+- **Provenance:**
+  - `<out>.dosage_repaired.fa` and `<out>.dosage_original.fa`;
+  - `<out>.dosage_provenance.tsv`: §9, one row per (chosen repaired haplotype, level, nearest panel sequence), with the
+    CIGAR.
 
-**`<out>.dosage_allocation.tsv`**, one row per transposition: A, A′, the fragment-vector hashes (bitwise and 1e-9
-grid), the exposure delta, and whether it is identical.
+**Status keys:**
+- `dosage_audit` (off/shadow), `dosage_audit_status` (COMPLETE / REFUSED_LIBRARY), `dosage_policy`
+  (`dosage_policy_v2`), `dosage_molecule_span_bp`;
+- `dosage_census_sensitive_blocks`, `dosage_m`, `dosage_z_critical`;
+- per-status and per-reason counts, and `dosage_repairs_conditional`;
+- `dosage_allocation_test` with its blocks tested;
+- `seconds_dosage_{census,features,estimate,repair,allocation,provenance}`.
 
-**Provenance files:**
-- `<out>.dosage_repaired.fa` and `<out>.dosage_original.fa`;
-- `<out>.dosage_provenance.tsv`: §9, one row per (repaired haplotype, level, nearest panel sequence), with the CIGAR.
-
-**Status keys:** `dosage_audit` (off/shadow), `dosage_policy` (`dosage_policy_v2`), `dosage_census_sensitive_blocks`,
-`dosage_m`, `dosage_z_critical`, per-status counts, and `seconds_dosage_{census,features,estimate,repair,allocation}`.
+A library without `insert_mean_bp` and `insert_sd_bp` (e.g. a future long-read model) gives
+`dosage_audit_status REFUSED_LIBRARY`, and every block is `NOT_EVALUATED` / `unsupported_library`.
 
 ## 12. Architecture and configuration
 
@@ -310,8 +388,8 @@ grid), the exposure delta, and whether it is identical.
   - Off: the run is byte-identical to today's.
   - Shadow: the audit runs after the call and writes only the §11 files and status keys; every existing output stays
     byte-identical.
-  - Integration into the reported genotype (replacing the call) is a later, separately gated step, never a second
-    required executable.
+  - Repaired calls are **not** integrated into the reported genotype in this phase. Integration is a later,
+    separately gated step, never a second required executable.
 - **Replay entry (validation only).** `genotype_probe dosage-replay` rebuilds a persisted run's call, guarded by the
   winner-reproduction check, and calls the same library on the persisted reads. It does not re-genotype.
 - **Threads.**
@@ -325,17 +403,24 @@ grid), the exposure delta, and whether it is identical.
 
 ### 12.1 Tie branches without a completed call (targeted gate, `loo.HG01573.30`)
 
-When tie branching is active (v2+ profiles):
-- **Evidence without a call.** Dosage evidence is computed from the **root tie's incumbent**: the diplotype at which
-  the repair stopped, in place of a reported call. This uses §3–§6 unchanged, including exclusion and reference from
-  the incumbent's homologues.
-- **Constraint on branches.** Each branch start, and each neighbour a branch would move to, is kept only if its block
-  genotype at every sensitive block is dosage-admissible (§8, every tested feature).
-- **Cap.** The existing cap of `16` branches is unchanged. The gate records whether the admissible branch tree
-  completes within it.
-- If it does not complete, the fail-closed no-call is kept. A branch is never selected merely to obtain a call.
-- This mode is a separate switch (`--dosage-tie-constraint`, default off) and is reported only as the gate result
-  until reviewed.
+When tie branching is active (v2+ profiles), the procedure is:
+
+1. **Root representatives.** Every tied neighbour at the root improving-move tie, plus the root incumbent.
+2. **Evidence per representative.** §3–§6 are computed for each representative, in place of a reported call:
+   exclusion and reference from its homologues. This gives its feature sets, reference, estimates and admissible
+   sets.
+3. **Invariance check.**
+   - **Identical across representatives:** the tested features (their k-mer sets), the reference set, the hit
+     totals, the quantiles and the admissible sets. Then the constraint is that common admissible system.
+   - **Otherwise:** `root_evidence_noninvariant` is reported, and the branch search runs unchanged.
+4. **Constraint.** Each branch start, and each neighbour a branch would move to, is kept only if its block genotype
+   at every sensitive block is dosage-admissible under the common system.
+5. **Cap.** The existing cap of `16` branches is unchanged. The gate records whether the constrained tree completes
+   within it.
+6. If it does not complete, the fail-closed no-call is kept. A branch is never selected merely to obtain a call.
+
+This mode is a separate switch (`--dosage-tie-constraint`, default off) and is reported only as a gate result until
+reviewed.
 
 ## 13. Known limitations and rejected alternatives
 
@@ -358,7 +443,7 @@ When tie branching is active (v2+ profiles):
   - fixed numeric thresholds, replaced by the family-wise policy;
   - likelihood-only sequence polishing: it overfits.
 
-## 14. Replay and identity gates (acceptance for the port)
+## 14. Replay, identity and fixture gates (acceptance for the shadow port)
 
 These use existing artifacts only: no genotyping and no campaign rerun.
 
@@ -370,6 +455,7 @@ These use existing artifacts only: no genotyping and no campaign rerun.
    - **Real quantities:** equal to the sealed Python tables at their printed precision (4 decimals). Any decision
      within that precision of its boundary is listed; the smallest observed margins are 0.059 (z_critical), 0.009
      (2.5) and 0.0003 (power).
+   - **Molecule span:** derived as 510 from every C4 library, with an identical census.
 2. **Counts, content errors:**
    - campaign: 31 AUTO, 5 SUSPECT, 3 UNDERPOWERED, 0 silent;
    - fresh: 19 AUTO, 1 SUSPECT, 2 UNDERPOWERED, 1 silent (HG01596.5);
@@ -377,27 +463,54 @@ These use existing artifacts only: no genotyping and no campaign rerun.
 3. **Repairs.** For every AUTO block, the prototype's results must be reproduced:
    - the admissible pairs or M range, the multisets, the pool, the retained structures, the caps;
    - the exact scores, bitwise, since they come from the same scorer;
-   - the content choice, the allocation choice and the refusals.
+   - the top sets, the content choice, the allocation choice and the refusals;
+   - `repair_scope` for each repair, with the count of CONDITIONAL repairs reported.
    - Numpy-computed screening quantities (EM weights, proposal log-likelihoods) must agree within 1e-9 relative, and
      every rank and set derived from them must be identical.
+   - Any divergence caused by an amendment is listed by cell. For the top-genotype rule, none is expected (§8).
 4. **Allocation test** on the self-review subset (`sv7_selfreview/allocation_test.tsv`): identical statuses and
-   identical-transposition counts.
+   identical-transposition counts. It also reports the incremental wall time, peak memory and number of blocks
+   tested over the full replay.
 5. **Byte identity.**
    - `--dosage-audit off` and the flag absent are byte-identical to the 11fe681 outputs on the end-to-end fixtures.
    - In shadow mode every pre-existing file is byte-identical, and the only additions are the §11 files.
 6. **Threads.** Every §11 file is byte-identical at 1, 2, 4 and 8 threads.
 7. **Provenance.**
-   - A fixture with two equally nearest panel sequences reports both.
+   - A fixture with two equally nearest panel sequences reports both, at both levels.
    - Permuting the panel order leaves every provenance row identical.
-   - The LOO replay never references a withheld allele.
+   - The LOO replay's nearest-sequence search visits exactly the LOO model's panel: the set of compared panel IDs
+     equals the model's panel, recorded as a digest. The withheld donor is never among them.
+   - The CIGAR re-derives both sequences and the raw distance.
+   - Display-ID collision detection is exercised on a forced collision.
 8. **Truth isolation.** A test that the audit's sources and replay harness read no evaluation or truth path, and
    that the evaluation step refuses unsealed inputs.
-9. **HG01573.30 targeted gate** (§12.1), reported as: completes / does not complete within 16, the branches
-   required, and the admissible starts.
+9. **Undefined-estimator fixtures:**
+   - `no_tested_feature`, `no_reference`, `no_reference_hits`, `bootstrap_zero_reference`;
+   - m = 0 (z_critical NA);
+   - robust sd = 0 with the call at and off the median;
+   - `unsupported_library`.
+10. **Tie fixtures:**
+    - distinct genotypes tied (→ `top_genotype_tie`, all reported);
+    - duplicate spelled genotypes merged;
+    - orientation-only tie;
+    - a same-multiset allocation tie, resolved by the prior;
+    - a cross-multiset tie, refused.
+11. **HG01573.30 targeted gate** (§12.1), reported as:
+    - the root representatives and whether their evidence is invariant;
+    - completes / does not complete within 16, with the branches required and the admissible starts.
+    - Its companion gate permutes the root representatives and requires identical results.
 
 ## 15. Quality reporting (prepared, not the final scientific table)
 
 The evaluation is truth-joined after sealing.
+
+**Correction outcome.** For every block call, four facts are reported separately:
+1. whether the original call was erroneous;
+2. whether the dosage trigger detected it;
+3. whether the final call (repaired or kept) is correct;
+4. the change in distance to truth after repair (improved / unchanged / worsened, with the bp).
+
+A triggered or repaired original error counts as a successful correction only when fact 3 holds.
 
 **Per individual annotation:**
 - `dosage_status` values;
@@ -415,7 +528,8 @@ The evaluation is truth-joined after sealing.
 - error-detection precision and recall for incorrect calls (content errors, and all errors ≥ 1 kb);
 - correct-call retention;
 - stratified by coverage and by block;
-- repaired, warned (SUSPECT), underpowered and unresolved counts, each separately.
+- repaired, warned (SUSPECT), underpowered and unresolved counts, each separately;
+- COMPLETE and CONDITIONAL repairs separately.
 
 UNDERPOWERED, PRIOR_ONLY and ALLOCATION_UNRESOLVED describe information limits. They are **never** counted as false
 positives when the genotype is correct. Two views are reported:
@@ -423,19 +537,28 @@ positives when the genotype is correct. Two views are reported:
    representation conflict);
 2. high-confidence retention: the correct calls carrying none of the information-limit or error annotations.
 
-## 16. Decisions requested at review
+## 16. Review record
 
-1. **Two extra dosage_status values beyond the four listed:**
-   - `TRIGGERED_UNREPAIRED`: a trigger with no admissible candidate, a cap or a failed guard. The prototype
-     had one under its earlier 3-sd trigger: fresh NA24385.5 sv:1, with no admissible pair;
-   - `NOT_EVALUATED`: no reference.
-   - With `NOT_SENSITIVE` for census-invariant blocks. None of the three can be expressed as one of the four listed
-     statuses without losing meaning.
-2. **Tie-breaks.** §8.1 and §8.2 fix numeric tie-breaks where the prototype sorted string labels. They matter only at
-   an exact top tie; the replay lists any such case.
-3. **β reference.** §8.2 generalises it as the adjacent context blocks, with no named block IDs. For C4 it reproduces
-   the prototype exactly.
-4. **Allocation test scope.** It covers every reported repeated-unit genotype with ≥ 3 units, not only repaired
-   ones. That is extra exact scoring, measured before any adoption.
-5. **§12.1 is a gate only.** The tie constraint changes calls, so it stays a separate, default-off switch until
-   reviewed.
+**2026-09-28: Sol approved** the specification and its five design choices:
+- the extra statuses;
+- GQ unavailable on repair;
+- the β reference generalised as the adjacent context blocks;
+- the expanded allocation test;
+- §12.1 as a gate only.
+
+The ten amendments are listed in §17.
+
+## 17. Amendments (Sol, 2026-09-28)
+
+1. **Exact top ties** (§8, top-genotype rule): IDs never choose between distinct tied genotypes, and a
+   cross-multiset tie refuses.
+2. **Candidate completeness:** `repair_scope` COMPLETE / CONDITIONAL, with reasons (§8).
+3. **HG01573 root-tie invariance:** evidence is computed for every root representative, and the constraint applies
+   only if it is invariant (§12.1).
+4. **Undefined estimator cases** fail closed (§3, §4, §5).
+5. **Molecule span** derived from the library; short-read only (§2).
+6. **Provenance** only for the chosen haplotypes; normalised by alignment length; full SHA-256 IDs (§9).
+7. **Original GQ** retained on repair (§10).
+8. **Evaluation:** the correction outcome is reported as four separate facts (§15).
+9. **Reasons list** extended (§11).
+10. **Allocation test** shadow-only, with measured cost (§8.3).
