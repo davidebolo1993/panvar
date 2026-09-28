@@ -426,8 +426,8 @@ positives when the genotype is correct. Two views are reported:
 ## 16. Decisions requested at review
 
 1. **Two extra dosage_status values beyond the four listed:**
-   - `TRIGGERED_UNREPAIRED`: a trigger with no admissible candidate, a cap or a failed guard (the prototype's
-     NA24385.5 sv:1 case);
+   - `TRIGGERED_UNREPAIRED`: a trigger with no admissible candidate, a cap or a failed guard. The prototype
+     had one under its earlier 3-sd trigger: fresh NA24385.5 sv:1, with no admissible pair;
    - `NOT_EVALUATED`: no reference.
    - With `NOT_SENSITIVE` for census-invariant blocks. None of the three can be expressed as one of the four listed
      statuses without losing meaning.
