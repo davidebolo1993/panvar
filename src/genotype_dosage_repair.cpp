@@ -2,6 +2,7 @@
 
 #include "panvar/genotype_repair.hpp"
 #include "panvar/ls_hmm.hpp"
+#include "panvar/parallel.hpp"
 
 #include <algorithm>
 #include <cstring>
@@ -14,6 +15,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <unordered_map>
+#include <tuple>
 #include <unordered_set>
 
 namespace panvar::dosage {
@@ -365,6 +367,159 @@ std::vector<ExactScore> score_block_candidates(const ScoringInputs& in, std::siz
     return out;
 }
 
+// The context lifecycle (Sol, 2026-09-28, part C). Same scores as score_block_candidates, bit for bit (gated), from
+// one PreparedScoringContext: the reported homologues are placed once with retained censuses and must reproduce their
+// persisted scores first; each distinct repaired haplotype is placed once by the exact block delta from its homologue
+// and reused by every diplotype that holds it; the emission and origin caches persist across batches; a column is
+// released once no pending candidate needs it, and released slots are reused. Caps are cumulative over the repair
+// (the profile's repair caps); a cap refuses the whole repair (ResourceExhausted), with no partial output.
+std::vector<ExactScore> score_block_candidates_context(const ScoringInputs& in, std::size_t block,
+                                                       const std::vector<std::pair<std::string, std::string>>& ctx,
+                                                       const RepairSettings& rs, ExactScore& original,
+                                                       std::vector<std::vector<long long>>* grids, RepairScoringStats* stats) {
+    const auto t0 = std::chrono::steady_clock::now();
+    RepairScoringStats local;
+    RepairScoringStats& st = stats ? *stats : local;
+    st.lifecycle = "context";
+    st.candidates = ctx.size();
+    const ReportedCall& call = *in.call;
+    FragmentScoringOptions opt = in.options;
+    if (in.repair_max_physical_origins) opt.max_physical_origins = in.repair_max_physical_origins;
+    if (in.repair_max_state_classes) opt.max_state_classes = in.repair_max_state_classes;
+    if (in.repair_max_piece_hits) opt.max_piece_hits = in.repair_max_piece_hits;
+    if (in.repair_max_latent_pairs) opt.max_latent_alignment_pairs = in.repair_max_latent_pairs;
+    PreparedScoringContext context(*in.reads, *in.library, opt);
+    if (in.repair_origin_cache_path) {
+        context.enable_origin_cache_path(true);
+        context.set_origin_cache_limits(in.repair_origin_cache_bytes, 0);
+    }
+    context.begin_transient_round();
+    const std::vector<std::size_t> base = context.add_haplotypes({call.haplotypes[0], call.haplotypes[1]});
+    context.retain_census(base[0]);
+    if (base[1] != base[0]) context.retain_census(base[1]);
+    // the reproduction guard, first and exact, before any repaired haplotype exists
+    {
+        const FragmentScoringResult g = context.score_candidates({{std::min(base[0], base[1]), std::max(base[0], base[1])}});
+        const double prior = log_unordered_sequence_pair_prior(*in.model, call.haplotypes[0], call.haplotypes[1], in.switch_probability);
+        const DiplotypeScore& w = g.scores.front();
+        const double dt = w.log_likelihood + prior - in.persisted.total, df = w.fragment_term - in.persisted.fragment,
+                     de = w.exposure_term - in.persisted.exposure;
+        if (!(std::fabs(dt) <= rs.guard_tolerance && std::fabs(df) <= rs.guard_tolerance && std::fabs(de) <= rs.guard_tolerance)) {
+            std::ostringstream m;
+            m << std::setprecision(17) << "the reported call did not reproduce (total " << dt << ", fragment " << df << ", exposure " << de << ")";
+            throw GuardFailure(m.str());
+        }
+        original = {w.fragment_term, w.exposure_term, w.log_likelihood};
+    }
+    st.seconds_base = seconds_since(t0);
+    std::array<std::string, 2> own;
+    for (int h = 0; h < 2; ++h) {
+        const SequenceInterval iv = call.intervals[h][block];
+        own[h] = call.haplotypes[h].substr(iv.begin, iv.end - iv.begin);
+    }
+    using Key = std::pair<std::string, int>;
+    std::map<Key, std::size_t> pending;           // references still to be scored, per repaired haplotype
+    for (const auto& c : ctx) {
+        for (int h = 0; h < 2; ++h) {
+            const std::string& seq = h == 0 ? c.first : c.second;
+            if (seq == own[h]) { ++st.base_references; continue; }
+            ++pending[{seq, h}];
+            ++st.column_references;
+        }
+    }
+    st.unique_repaired_haplotypes = pending.size();
+    std::map<Key, std::size_t> slot_of;
+    std::vector<double> backgrounds;
+    if (grids != nullptr) {
+        grids->assign(ctx.size(), {});
+        for (const ReadPair& f : *in.reads) backgrounds.push_back(log_background_probability(f));
+    }
+    std::vector<ExactScore> out(ctx.size());
+    const std::size_t B = std::max<std::size_t>(1, rs.batch_candidates);
+    for (std::size_t next = 0; next < ctx.size(); next += B) {
+        const std::size_t end = std::min(ctx.size(), next + B);
+        const auto tp = std::chrono::steady_clock::now();
+        std::vector<HaplotypeCandidate> batch;
+        for (std::size_t k = next; k < end; ++k) {
+            std::array<std::size_t, 2> slots{};
+            for (int h = 0; h < 2; ++h) {
+                const std::string& seq = h == 0 ? ctx[k].first : ctx[k].second;
+                if (seq == own[h]) { slots[h] = base[h]; continue; }
+                auto it = slot_of.find({seq, h});
+                if (it == slot_of.end()) {
+                    const SequenceInterval iv = call.intervals[h][block];
+                    BlockDeltaWork work;
+                    const std::size_t slot = context.add_repaired_haplotype(base[h], iv.begin, iv.end, seq, &work, false);
+                    st.origins_reused += work.origins_reused;
+                    st.origins_recomputed += work.origins_recomputed;
+                    st.origin_cache_hits += work.origin_cache_hits;
+                    st.origin_cache_misses += work.origin_cache_misses;
+                    ++st.columns_built;
+                    it = slot_of.emplace(Key{seq, h}, slot).first;
+                }
+                slots[h] = it->second;
+            }
+            batch.push_back({std::min(slots[0], slots[1]), std::max(slots[0], slots[1])});
+        }
+        st.seconds_placement += seconds_since(tp);
+        const auto tc = std::chrono::steady_clock::now();
+        const FragmentScoringResult scored = context.score_candidates(batch);
+        for (std::size_t k = next; k < end; ++k) {
+            const DiplotypeScore& s = scored.scores[k - next];
+            out[k] = {s.fragment_term, s.exposure_term, s.log_likelihood};
+            if (grids != nullptr) {
+                const HaplotypeCandidate& c = batch[k - next];
+                std::vector<long long>& g = (*grids)[k];
+                g.resize(in.reads->size());
+                for (std::size_t f = 0; f < in.reads->size(); ++f) {
+                    const double m = log_add_exp(context.mass_of(f, c.first), context.mass_of(f, c.second));
+                    g[f] = std::llround(log_fragment_contribution(m, backgrounds[f], *in.library) * 1e9);
+                }
+            }
+        }
+        st.seconds_combination += seconds_since(tc);
+        ++st.batches;
+        st.peak_transient_bytes = std::max(st.peak_transient_bytes, context.transient_payload_bytes());
+        // release every repaired column no pending candidate needs
+        bool any_released = false;
+        for (std::size_t k = next; k < end; ++k) {
+            for (int h = 0; h < 2; ++h) {
+                const std::string& seq = h == 0 ? ctx[k].first : ctx[k].second;
+                if (seq == own[h]) continue;
+                if (--pending[{seq, h}] == 0) any_released = true;
+            }
+        }
+        if (any_released) {
+            std::vector<std::size_t> keep = {base[0], base[1]};
+            for (auto it = slot_of.begin(); it != slot_of.end();) {
+                if (pending[it->first] == 0) it = slot_of.erase(it);
+                else { keep.push_back(it->second); ++it; }
+            }
+            context.release_transient(keep);
+            ++st.releases;
+        }
+    }
+    const FragmentScoringCounters& cc = context.cumulative_counters();
+    const EmissionCacheCounters& ec = context.cumulative_emission_cache();
+    st.physical_origins = cc.physical_origins;
+    st.piece_hits = cc.piece_hits;
+    st.state_classes = cc.statistical_state_classes;
+    st.dp_executions = ec.executed_dps;
+    st.dp_requests = ec.dp_cache_requests;
+    st.dp_hits = ec.dp_cache_hits;
+    st.prefilters = ec.executed_prefilters;
+    st.emission_cache_bytes = ec.payload_bytes;
+    st.emission_cache_entries = ec.entries;
+    st.origin_cache_entries = context.origin_cache_entries();
+    st.origin_cache_bytes = context.origin_cache_bytes();
+    st.slots = context.unique_haplotypes();
+    st.haplotypes_created = context.haplotypes_created();
+    st.footprint_peak_bytes = physical_footprint().peak;
+    st.seconds_total = seconds_since(t0);
+    if (context.refused()) throw ResourceExhausted("the repair context refused at a declared cap");
+    return out;
+}
+
 // the tested features of a block for this call, recomputed exactly as audit_dosage builds them
 std::vector<std::vector<Kmer>> tested_feature_kmers(const BlockAudit& audit, const BlockFeatureModel& fm, const ReportedCall& call,
                                                     const DosageSettings& settings, std::vector<std::size_t>& feature_index) {
@@ -671,20 +826,27 @@ RepairResult repair_block(const BlockAudit& audit, const CensusBlock& census, co
         res.beta = beta; res.phi = phi;
         std::vector<double> Umax(ncls, 0.0);
         for (std::size_t c = 0; c < ncls; ++c) Umax[c] = *std::max_element(U[c].begin(), U[c].end());
-        // screening: Poisson EM over unit weights
+        // screening: Poisson EM over unit weights. Sparse over U's nonzero entries, visited in the dense loops' index
+        // order: a skipped term is an exact zero, so every sum -- and so every weight -- is bit-identical to the dense form.
+        const auto t_em = std::chrono::steady_clock::now();
         const double M0 = static_cast<double>(res.m_range.front());
-        std::vector<double> wt(nm, M0 / static_cast<double>(nm)), wn(nm), denom(nm, 0.0), eps(ncls), lam(ncls), g(nm);
+        std::vector<double> wt(nm, M0 / static_cast<double>(nm)), wn(nm), denom(nm, 0.0), eps(ncls), lam(ncls), g(nm), ratio(ncls);
+        std::vector<std::vector<std::pair<std::size_t, double>>> by_class(ncls), by_unit(nm);
+        for (std::size_t c = 0; c < ncls; ++c) for (std::size_t u = 0; u < nm; ++u) if (U[c][u] != 0.0) by_class[c].push_back({u, U[c][u]});
+        for (std::size_t u = 0; u < nm; ++u) for (std::size_t c = 0; c < ncls; ++c) if (U[c][u] != 0.0) by_unit[u].push_back({c, U[c][u]});
         for (std::size_t c = 0; c < ncls; ++c) eps[c] = e_k * beta * Umax[c] * M0;
-        for (std::size_t u = 0; u < nm; ++u) { double s = 0.0; for (std::size_t c = 0; c < ncls; ++c) s += U[c][u]; denom[u] = beta * s; }
+        for (std::size_t u = 0; u < nm; ++u) { double s = 0.0; for (const auto& [c, x] : by_unit[u]) s += x; denom[u] = beta * s; }
         std::size_t it = 0;
         for (; it < rs.em_iterations; ++it) {
-            for (std::size_t c = 0; c < ncls; ++c) { double s = 0.0; for (std::size_t u = 0; u < nm; ++u) s += U[c][u] * wt[u]; lam[c] = beta * s + eps[c]; }
-            for (std::size_t u = 0; u < nm; ++u) { double s = 0.0; for (std::size_t c = 0; c < ncls; ++c) s += U[c][u] * (y[c] / lam[c]); g[u] = s; }
+            for (std::size_t c = 0; c < ncls; ++c) { double s = 0.0; for (const auto& [u, x] : by_class[c]) s += x * wt[u]; lam[c] = beta * s + eps[c]; }
+            for (std::size_t c = 0; c < ncls; ++c) ratio[c] = y[c] / lam[c];
+            for (std::size_t u = 0; u < nm; ++u) { double s = 0.0; for (const auto& [c, x] : by_unit[u]) s += x * ratio[c]; g[u] = s; }
             double mx = 0.0;
             for (std::size_t u = 0; u < nm; ++u) { wn[u] = wt[u] * (beta * g[u]) / (denom[u] > 0 ? denom[u] : 1.0); mx = std::max(mx, std::fabs(wn[u] - wt[u])); }
             wt = wn;
             if (mx < rs.em_tolerance) break;
         }
+        res.seconds_em = seconds_since(t_em);
         res.em_iterations = std::min(it + 1, rs.em_iterations);
         std::vector<std::size_t> rank_int = inte, rank_term = term;
         const auto by_weight = [&](std::size_t a, std::size_t c) { return wt[a] != wt[c] ? wt[a] > wt[c] : a < c; };
@@ -692,8 +854,22 @@ RepairResult repair_block(const BlockAudit& audit, const CensusBlock& census, co
         std::sort(rank_term.begin(), rank_term.end(), by_weight);
         const std::vector<std::size_t> pool_i(rank_int.begin(), rank_int.begin() + static_cast<long>(std::min(rs.unit_pool, rank_int.size())));
         const std::vector<std::size_t> pool_t(rank_term.begin(), rank_term.begin() + static_cast<long>(std::min(rs.unit_pool, rank_term.size())));
-        // exhaustive admissible multisets over the pool
-        struct Cand { std::vector<std::size_t> tp, ip, ms; };
+        // exhaustive admissible multisets over the pool, as compact fixed-width records (tens of millions of them at 30x:
+        // three heap vectors each exceeded the footprint budget). Order and comparisons are the vector forms' exactly.
+        const auto t_enum = std::chrono::steady_clock::now();
+        constexpr std::size_t MAXM = 8;
+        if (2 * kmax > MAXM || nm > 65535) throw std::runtime_error("repair: unit library exceeds the compact candidate record");
+        struct Cand {
+            std::array<std::uint16_t, 2> tp{};
+            std::array<std::uint16_t, MAXM> ip{}, ms{};
+            std::uint8_t ni = 0, nms = 0;
+            std::vector<std::size_t> tp_vec() const { return {tp[0], tp[1]}; }
+            std::vector<std::size_t> ip_vec() const { return std::vector<std::size_t>(ip.begin(), ip.begin() + ni); }
+            std::vector<std::size_t> ms_vec() const { return std::vector<std::size_t>(ms.begin(), ms.begin() + nms); }
+        };
+        const auto ms_less = [](const Cand& a, const Cand& b) {   // std::vector<std::size_t>::operator<
+            return std::lexicographical_compare(a.ms.begin(), a.ms.begin() + a.nms, b.ms.begin(), b.ms.begin() + b.nms);
+        };
         std::vector<Cand> cand;
         const std::size_t nf = tested.size();
         for (int Mv : res.m_range) {
@@ -708,24 +884,32 @@ RepairResult repair_block(const BlockAudit& audit, const CensusBlock& census, co
                 Fi.push_back(std::move(f));
             });
             combinations_with_replacement(pool_t.size(), 2, [&](const std::vector<std::size_t>& tidx) {
-                const std::vector<std::size_t> tp = {pool_t[tidx[0]], pool_t[tidx[1]]};
+                const std::size_t t0 = pool_t[tidx[0]], t1 = pool_t[tidx[1]];
                 for (std::size_t r = 0; r < combos.size(); ++r) {
                     bool ok = true;
                     for (std::size_t t = 0; t < nf && ok; ++t) {
-                        const double tot = std::nearbyint((Fi[r][t] + fmat[tp[0]][t]) + fmat[tp[1]][t]);
+                        const double tot = std::nearbyint((Fi[r][t] + fmat[t0][t]) + fmat[t1][t]);
                         ok = admissible(audit.features[t].admissible, static_cast<long>(tot));
                     }
                     if (!ok) continue;
-                    std::vector<std::size_t> ms = tp;
-                    ms.insert(ms.end(), combos[r].begin(), combos[r].end());
-                    std::sort(ms.begin(), ms.end());
-                    cand.push_back({tp, combos[r], ms});
+                    Cand c;
+                    c.tp = {static_cast<std::uint16_t>(t0), static_cast<std::uint16_t>(t1)};
+                    c.ni = static_cast<std::uint8_t>(combos[r].size());
+                    for (std::size_t i = 0; i < combos[r].size(); ++i) c.ip[i] = static_cast<std::uint16_t>(combos[r][i]);
+                    c.nms = static_cast<std::uint8_t>(2 + combos[r].size());
+                    c.ms[0] = c.tp[0]; c.ms[1] = c.tp[1];
+                    for (std::size_t i = 0; i < c.ni; ++i) c.ms[2 + i] = c.ip[i];
+                    std::sort(c.ms.begin(), c.ms.begin() + c.nms);
+                    cand.push_back(c);
                 }
             });
         }
         res.multisets_evaluated = cand.size();
+        res.seconds_enumerate = seconds_since(t_enum);
         if (cand.empty()) return refuse("no_admissible_candidate");
-        // composite NB log-likelihood (prototype loglik_matrix), classes varying across the pool summed per candidate
+        // composite NB log-likelihood (prototype loglik_matrix), classes varying across the pool summed per candidate;
+        // candidates are independent, so they are evaluated in parallel, each into its own slot
+        const auto t_ll = std::chrono::steady_clock::now();
         std::vector<std::size_t> cols;
         { std::set<std::size_t> s(pool_i.begin(), pool_i.end()); s.insert(pool_t.begin(), pool_t.end()); cols.assign(s.begin(), s.end()); }
         std::vector<std::size_t> vary, fixed;
@@ -734,10 +918,10 @@ RepairResult repair_block(const BlockAudit& audit, const CensusBlock& census, co
             for (std::size_t u : cols) { mn = std::min(mn, U[c][u]); mx = std::max(mx, U[c][u]); }
             (mx != mn ? vary : fixed).push_back(c);
         }
-        const auto loglik = [&](const std::vector<std::size_t>& cls, const std::vector<std::pair<std::size_t, double>>& n) {
+        const auto loglik = [&](const std::vector<std::size_t>& cls, const std::vector<std::pair<std::size_t, double>>& n, std::vector<double>& term) {
             double Mtot = 0.0;
             for (const auto& [u, k] : n) Mtot += k;
-            std::vector<double> term(cls.size());
+            term.resize(cls.size());
             for (std::size_t i = 0; i < cls.size(); ++i) {
                 const std::size_t c = cls[i];
                 double dot = 0.0;
@@ -750,21 +934,34 @@ RepairResult repair_block(const BlockAudit& audit, const CensusBlock& census, co
             return s;
         };
         std::map<int, double> const_M;
-        for (int Mv : res.m_range) const_M[Mv] = fixed.empty() ? 0.0 : loglik(fixed, {{cols.front(), static_cast<double>(Mv)}});
-        std::vector<double> ll(cand.size());
-        for (std::size_t r = 0; r < cand.size(); ++r) {
-            std::vector<std::pair<std::size_t, double>> n;
-            for (std::size_t u : cols) {
-                const double k = static_cast<double>(std::count(cand[r].ms.begin(), cand[r].ms.end(), u));
-                if (k != 0.0) n.push_back({u, k});
-            }
-            ll[r] = loglik(vary, n) + const_M[static_cast<int>(cand[r].ms.size())];
+        {
+            std::vector<double> term;
+            for (int Mv : res.m_range) const_M[Mv] = fixed.empty() ? 0.0 : loglik(fixed, {{cols.front(), static_cast<double>(Mv)}}, term);
         }
-        std::vector<std::size_t> order(cand.size());
-        for (std::size_t i = 0; i < order.size(); ++i) order[i] = i;
-        std::stable_sort(order.begin(), order.end(), [&](std::size_t a, std::size_t c) {
-            return ll[a] != ll[c] ? ll[a] > ll[c] : cand[a].ms < cand[c].ms;
+        std::vector<double> ll(cand.size());
+        const std::size_t ll_chunks = std::max<std::size_t>(1, std::min<std::size_t>(cand.size(), 256));
+        run_parallel(ll_chunks, in.options.threads, [&](std::size_t ci) {
+            std::vector<double> term;
+            std::vector<std::pair<std::size_t, double>> n;
+            for (std::size_t r = cand.size() * ci / ll_chunks; r < cand.size() * (ci + 1) / ll_chunks; ++r) {
+                // unit counts in ascending unit order (cols and ms are both ascending), as the dense column scan gives
+                n.clear();
+                const Cand& cd = cand[r];
+                for (std::size_t i = 0; i < cd.nms;) {
+                    std::size_t j = i;
+                    while (j < cd.nms && cd.ms[j] == cd.ms[i]) ++j;
+                    n.push_back({cd.ms[i], static_cast<double>(j - i)});
+                    i = j;
+                }
+                ll[r] = loglik(vary, n, term) + const_M.at(static_cast<int>(cd.nms));
+            }
         });
+        std::vector<std::uint32_t> order(cand.size());
+        for (std::size_t i = 0; i < order.size(); ++i) order[i] = static_cast<std::uint32_t>(i);
+        std::stable_sort(order.begin(), order.end(), [&](std::uint32_t a, std::uint32_t c) {
+            return ll[a] != ll[c] ? ll[a] > ll[c] : ms_less(cand[a], cand[c]);
+        });
+        res.seconds_loglik = seconds_since(t_ll);
         // bounded structural construction, k-best order, stop at the first cap
         std::set<std::vector<std::size_t>> alleles;
         std::map<std::pair<std::vector<std::size_t>, std::vector<std::size_t>>, std::pair<std::size_t, std::size_t>> diplos;  // key -> (multiset rank, cand)
@@ -778,11 +975,12 @@ RepairResult repair_block(const BlockAudit& audit, const CensusBlock& census, co
                 break;
             }
             const Cand& cd = cand[r];
+            const std::vector<std::size_t> cd_tp = cd.tp_vec(), cd_ip = cd.ip_vec();
             std::set<std::vector<std::size_t>> new_a;
             std::map<std::pair<std::vector<std::size_t>, std::vector<std::size_t>>, std::pair<std::size_t, std::size_t>> new_d;
-            std::set<std::pair<std::size_t, std::size_t>> term_orders = {{cd.tp[0], cd.tp[1]}, {cd.tp[1], cd.tp[0]}};
+            std::set<std::pair<std::size_t, std::size_t>> term_orders = {{cd_tp[0], cd_tp[1]}, {cd_tp[1], cd_tp[0]}};
             for (const auto& [ta, tb] : term_orders) {
-                const std::vector<std::size_t>& ipl = cd.ip;
+                const std::vector<std::size_t>& ipl = cd_ip;
                 for (std::size_t mask = 0; mask < (std::size_t{1} << ipl.size()); ++mask) {
                     std::vector<std::size_t> A, Bm;
                     for (std::size_t i = 0; i < ipl.size(); ++i) ((mask >> i) & 1 ? A : Bm).push_back(ipl[i]);
@@ -822,6 +1020,108 @@ RepairResult repair_block(const BlockAudit& audit, const CensusBlock& census, co
             res.scope_reason.clear();
             for (const std::string& x : why) res.scope_reason += (res.scope_reason.empty() ? "" : ",") + x;
         }
+        if (rs.space_audit) {
+            // exact sizes of the candidate space, without scoring (see CandidateSpace)
+            const auto t_space = std::chrono::steady_clock::now();
+            CandidateSpace& sp = res.space;
+            sp.internal_capable = inte.size(); sp.terminal_capable = term.size();
+            sp.pool_internal = pool_i.size(); sp.pool_terminal = pool_t.size();
+            sp.pool_multisets = cand.size();
+            sp.retained_multisets = retained; sp.constructed_haploid = alleles.size(); sp.constructed_diploid = diplos.size();
+            sp.cap_reached = res.cap_reached;
+            // feature sums in half-copies (unit counts are medians: whole or half)
+            const auto halves = [&](std::size_t u, std::size_t t) { return static_cast<long>(std::llround(2.0 * fmat[u][t])); };
+            const auto admissible_total = [&](const std::vector<long>& h2) {   // h2: summed half-copies per feature
+                for (std::size_t t = 0; t < nf; ++t) {
+                    if (!admissible(audit.features[t].admissible, static_cast<long>(std::nearbyint(static_cast<double>(h2[t]) / 2.0)))) return false;
+                }
+                return true;
+            };
+            std::set<int> mset(res.m_range.begin(), res.m_range.end());
+            // (terminal pair, internal multiset) counts by DP over units: the prototype's candidate unit
+            const auto count_multisets = [&](const std::vector<std::size_t>& I, const std::vector<std::size_t>& T) {
+                const std::size_t kmax_int = 2 * (kmax - 1);
+                std::vector<std::map<std::vector<long>, std::uint64_t>> dp(kmax_int + 1);
+                dp[0][std::vector<long>(nf, 0)] = 1;
+                for (std::size_t u : I) {   // multisets: add any number of copies of u, units in a fixed order
+                    std::vector<std::map<std::vector<long>, std::uint64_t>> nx = dp;
+                    for (std::size_t k = 0; k <= kmax_int; ++k) {
+                        for (const auto& [sv, c] : dp[k]) {
+                            std::vector<long> v = sv;
+                            for (std::size_t add = 1; k + add <= kmax_int; ++add) {
+                                for (std::size_t t = 0; t < nf; ++t) v[t] += halves(u, t);
+                                nx[k + add][v] += c;
+                            }
+                        }
+                    }
+                    dp = std::move(nx);
+                }
+                std::map<std::vector<long>, std::uint64_t> tp;
+                for (std::size_t a = 0; a < T.size(); ++a) for (std::size_t b = a; b < T.size(); ++b) {
+                    std::vector<long> v(nf);
+                    for (std::size_t t = 0; t < nf; ++t) v[t] = halves(T[a], t) + halves(T[b], t);
+                    ++tp[v];
+                }
+                std::uint64_t total = 0;
+                for (std::size_t k = 0; k <= kmax_int; ++k) {
+                    if (!mset.count(static_cast<int>(k + 2))) continue;
+                    for (const auto& [si, ci] : dp[k]) for (const auto& [st, ct] : tp) {
+                        std::vector<long> v(nf);
+                        for (std::size_t t = 0; t < nf; ++t) v[t] = si[t] + st[t];
+                        if (admissible_total(v)) total += ci * ct;
+                    }
+                }
+                return total;
+            };
+            sp.pool_multisets_dp = count_multisets(pool_i, pool_t);
+            sp.full_multisets = count_multisets(inte, term);
+            // every valid haploid tuple of the full library: (internal..., terminal), <= KMAX units, the first
+            // anchor-compatible; histogrammed by (feature half-sums, units, I-state units)
+            std::map<std::tuple<std::vector<long>, int, int>, std::uint64_t> hist;
+            std::vector<std::size_t> first_int;
+            for (std::size_t u : inte) if (lib.units[u].anchor_compatible) first_int.push_back(u);
+            const auto add_haploid = [&](const std::vector<std::size_t>& tuple) {
+                std::vector<long> v(nf, 0);
+                int nI = 0;
+                for (std::size_t u : tuple) { for (std::size_t t = 0; t < nf; ++t) v[t] += halves(u, t); nI += lib.units[u].state == 'I'; }
+                ++hist[{v, static_cast<int>(tuple.size()), nI}];
+                ++sp.full_haploid_valid;
+            };
+            for (std::size_t tt : term) {
+                if (lib.units[tt].anchor_compatible) add_haploid({tt});
+                if (kmax >= 2) for (std::size_t a : first_int) {
+                    add_haploid({a, tt});
+                    if (kmax >= 3) for (std::size_t b : inte) add_haploid({a, b, tt});
+                    if (kmax >= 4) throw std::runtime_error("space audit: KMAX > 3 is not enumerated");
+                }
+            }
+            std::vector<std::pair<std::tuple<std::vector<long>, int, int>, std::uint64_t>> H(hist.begin(), hist.end());
+            std::vector<char> partnered(H.size(), 0);
+            std::set<std::string> vectors, states;
+            for (std::size_t a = 0; a < H.size(); ++a) {
+                for (std::size_t b = a; b < H.size(); ++b) {
+                    const auto& [ka, ca] = H[a];
+                    const auto& [kb, cb] = H[b];
+                    if (!mset.count(std::get<1>(ka) + std::get<1>(kb))) continue;
+                    std::vector<long> v(nf);
+                    for (std::size_t t = 0; t < nf; ++t) v[t] = std::get<0>(ka)[t] + std::get<0>(kb)[t];
+                    if (!admissible_total(v)) continue;
+                    sp.full_diploid += a == b ? ca * (ca + 1) / 2 : ca * cb;
+                    partnered[a] = partnered[b] = 1;
+                    std::string vs;
+                    for (std::size_t t = 0; t < nf; ++t) vs += (t ? "," : "") + std::to_string(static_cast<long>(std::nearbyint(static_cast<double>(v[t]) / 2.0)));
+                    vectors.insert(vs);
+                    states.insert(std::to_string(std::get<1>(ka) + std::get<1>(kb)) + "u/" + std::to_string(std::get<2>(ka) + std::get<2>(kb)) + "I");
+                }
+            }
+            for (std::size_t a = 0; a < H.size(); ++a) if (partnered[a]) sp.full_haploid_in_admissible += H[a].second;
+            sp.dosage_vectors.assign(vectors.begin(), vectors.end());
+            sp.module_state_counts.assign(states.begin(), states.end());
+            sp.seconds = seconds_since(t_space);
+            res.outcome = "SPACE_AUDIT";
+            res.candidates.clear();
+            return res;
+        }
         if (refused) return refuse("cap_refused");
         // structures in (multiset rank, key) order; one orientation (the prototype's: the smaller unit tuple first)
         std::vector<std::pair<std::pair<std::vector<std::size_t>, std::vector<std::size_t>>, std::pair<std::size_t, std::size_t>>> st(diplos.begin(), diplos.end());
@@ -838,7 +1138,7 @@ RepairResult repair_block(const BlockAudit& audit, const CensusBlock& census, co
             bc.label = "s" + std::to_string(n);
             bc.rank = n;
             bc.units_a = key.first; bc.units_b = key.second;
-            bc.multiset = cand[meta.second].ms;
+            bc.multiset = cand[meta.second].ms_vec();
             bc.multiset_rank = meta.first;
             bc.proposal_loglik = ll[order[meta.first - 1]];
             std::string sa, sb;
@@ -867,10 +1167,14 @@ RepairResult repair_block(const BlockAudit& audit, const CensusBlock& census, co
     ExactScore original;
     std::vector<ExactScore> scores;
     try {
-        scores = score_block_candidates(in, b, ctx, rs, original);
+        scores = rs.lifecycle == "cold" ? score_block_candidates(in, b, ctx, rs, original)
+                                          : score_block_candidates_context(in, b, ctx, rs, original, nullptr, &res.scoring);
+        if (rs.lifecycle == "cold") res.scoring.lifecycle = "cold";
     } catch (const GuardFailure&) {
+        res.candidates.clear();   // no partial output
         return refuse("winner_not_reproduced");
     } catch (const ResourceExhausted&) {
+        res.candidates.clear();   // no partial output: a refused repair reports no candidate or score
         return refuse("resource_refusal");
     }
     res.seconds_score = seconds_since(t_score);
@@ -999,7 +1303,8 @@ AllocationTestResult allocation_observability_test(const UnitLibrary& lib, const
     }
     ExactScore original;
     std::vector<std::vector<long long>> grids;
-    const std::vector<ExactScore> scores = score_block_candidates(in, block, ctx, rs, original, &grids);
+    const std::vector<ExactScore> scores = rs.lifecycle == "cold" ? score_block_candidates(in, block, ctx, rs, original, &grids)
+                                                                  : score_block_candidates_context(in, block, ctx, rs, original, &grids, nullptr);
     const auto fnv = [](const std::vector<long long>& g) {
         std::uint64_t h = 1469598103934665603ULL;
         for (long long q : g) {

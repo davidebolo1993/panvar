@@ -28,6 +28,40 @@ struct RepairSettings {
     double tie_tolerance_nats = 1e-9;       // CertificationOptions::minimum_tie_tolerance_nats
     double guard_tolerance = 1e-6;
     std::size_t chunk_haplotypes = 128;
+    // Scoring lifecycle: "context" (default) scores every candidate in one PreparedScoringContext -- the reported
+    // homologues placed once with their censuses, each distinct repaired haplotype block-delta'd once and reused by
+    // every diplotype holding it, caches retained, columns released once no pending candidate needs them. "cold" is
+    // the earlier one-shot score_diplotypes chunks, kept as the timing and identity reference.
+    std::string lifecycle = "context";
+    std::size_t batch_candidates = 64;
+    // Candidate-space audit (Sol, 2026-09-28, part E): construct and count, score nothing.
+    bool space_audit = false;
+};
+
+// Exact sizes of a repeated-unit repair's candidate space (no candidate is scored or materialised beyond the pool).
+struct CandidateSpace {
+    std::size_t internal_capable = 0, terminal_capable = 0, pool_internal = 0, pool_terminal = 0;
+    std::uint64_t pool_multisets = 0, pool_multisets_dp = 0;          // enumerated over the pool, and the DP recount
+    std::uint64_t full_multisets = 0;                                   // (terminal pair, internal multiset), full library
+    std::uint64_t full_haploid_valid = 0, full_haploid_in_admissible = 0, full_diploid = 0;
+    std::uint64_t full_distinct_unit_multisets_lower_bound = 0;
+    std::size_t retained_multisets = 0, constructed_haploid = 0, constructed_diploid = 0;
+    std::string cap_reached;
+    std::vector<std::string> dosage_vectors;                             // distinct rounded feature copy vectors, admissible
+    std::vector<std::string> module_state_counts;                        // distinct (units, I-state units), admissible
+    double seconds = 0.0;
+};
+
+// What one repair's exact scoring did (context lifecycle; the cold lifecycle fills what it can).
+struct RepairScoringStats {
+    std::string lifecycle;
+    std::size_t candidates = 0, unique_repaired_haplotypes = 0, columns_built = 0, column_references = 0, base_references = 0;
+    std::size_t batches = 0, releases = 0, slots = 0, haplotypes_created = 0;
+    std::uint64_t physical_origins = 0, origins_reused = 0, origins_recomputed = 0, piece_hits = 0, state_classes = 0;
+    std::uint64_t dp_executions = 0, dp_requests = 0, dp_hits = 0, prefilters = 0, emission_cache_bytes = 0, emission_cache_entries = 0;
+    std::uint64_t origin_cache_hits = 0, origin_cache_misses = 0, origin_cache_entries = 0, origin_cache_bytes = 0;
+    std::uint64_t peak_transient_bytes = 0, footprint_peak_bytes = 0;
+    double seconds_base = 0.0, seconds_placement = 0.0, seconds_combination = 0.0, seconds_total = 0.0;
 };
 
 // ---------------------------------------------------------------------------------------------- unit library
@@ -67,7 +101,11 @@ struct ScoringInputs {
     const ReportedCall* call = nullptr;
     const std::vector<ReadPair>* reads = nullptr;
     const LibraryModel* library = nullptr;
-    FragmentScoringOptions options;
+    FragmentScoringOptions options;          // the run's scoring settings (cold lifecycle: per-call caps)
+    // Cumulative caps of the context lifecycle: the profile's repair caps (0: keep options' value).
+    std::uint64_t repair_max_physical_origins = 0, repair_max_state_classes = 0, repair_max_piece_hits = 0, repair_max_latent_pairs = 0;
+    bool repair_origin_cache_path = true;       // the context lifecycle's stage-6 origin path (exact)
+    std::size_t repair_origin_cache_bytes = 0;   // what that path may retain (0: retain nothing, recompute every window)
     std::vector<double> switch_probability;
     PersistedScore persisted;
 };
@@ -114,6 +152,9 @@ struct RepairResult {
     double conditional_repair_gap = 0.0;
     bool gap_defined = false;
     double seconds_construct = 0.0, seconds_score = 0.0;
+    double seconds_em = 0.0, seconds_enumerate = 0.0, seconds_loglik = 0.0;
+    RepairScoringStats scoring;
+    CandidateSpace space;
 };
 
 RepairResult repair_block(const BlockAudit& audit, const CensusBlock& census, const BlockFeatureModel& features,
@@ -201,6 +242,12 @@ struct DosageShadowOptions {
     bool repair = true;
     bool provenance = true;
     bool allocation_test = false;   // shadow-only, off until its measured cost is reviewed
+    std::string lifecycle = "context";
+    std::size_t batch_candidates = 64;
+    bool space_audit = false;       // count the candidate space of every AUTO repair and score nothing
+    bool repair_origin_cache_path = true;
+    std::size_t repair_origin_cache_bytes = 0;
+    std::uint64_t repair_max_physical_origins = 0, repair_max_state_classes = 0, repair_max_piece_hits = 0, repair_max_latent_pairs = 0;
     std::size_t threads = 1;
     std::size_t chunk_haplotypes = 128;
 };

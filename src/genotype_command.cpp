@@ -4377,6 +4377,11 @@ int run_genotype_command(const std::vector<std::string>& args) {
                 dosage::DosageShadowOptions shadow_options;
                 shadow_options.threads = options.threads;
                 shadow_options.allocation_test = options.dosage_allocation_test;
+                shadow_options.repair_max_physical_origins = options.repair_max_physical_origins;
+                shadow_options.repair_max_state_classes = options.repair_max_state_classes;
+                shadow_options.repair_max_piece_hits = options.repair_max_piece_hits;
+                shadow_options.repair_max_latent_pairs = options.repair_max_latent_pairs;
+                shadow_options.repair_origin_cache_bytes = 0;   // path on, nothing retained (measured: 2.77 vs 3.74 GiB)
                 dosage::run_dosage_shadow(*capture.model, capture.node_sequences, fragments, library, scoring, switches,
                                           options.out_prefix, options.out_prefix, shadow_options);
             }

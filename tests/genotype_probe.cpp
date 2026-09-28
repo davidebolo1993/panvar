@@ -5988,6 +5988,23 @@ int dosage_replay(const Args& args) {
     options.repair = args.get("repair", "0") != "0";
     options.provenance = args.get("provenance", "1") != "0";
     options.allocation_test = args.get("allocation-test", "0") != "0";
+    options.lifecycle = args.get("repair-scoring", "context");
+    if (options.lifecycle != "context" && options.lifecycle != "cold") throw std::runtime_error("--repair-scoring takes context or cold");
+    options.batch_candidates = std::stoul(args.get("repair-batch", "64"));
+    options.space_audit = args.get("space-audit", "0") != "0";
+    {
+        const auto status = read_key_values(run + ".mosaic_status.tsv");
+        const auto get = [&](const char* key) { const auto it = status.find(key); return it == status.end() ? 0ULL : std::stoull(it->second); };
+        options.repair_max_physical_origins = get("repair_max_physical_origins");
+        options.repair_max_state_classes = get("repair_max_state_classes");
+        options.repair_max_piece_hits = get("repair_max_piece_hits");
+        options.repair_max_latent_pairs = get("repair_max_latent_pairs");
+        // --repair-origin-cache off | profile | <bytes>: the stage-6 origin path, and what it may retain
+        const std::string oc = args.get("repair-origin-cache", "0");
+        options.repair_origin_cache_path = oc != "off";
+        options.repair_origin_cache_bytes = oc == "off" ? 0 : oc == "profile" ? static_cast<std::size_t>(get("repair_origin_cache_bytes")) : std::stoull(oc);
+        if (!args.get("repair-max-physical-origins", "").empty()) options.repair_max_physical_origins = std::stoull(args.get("repair-max-physical-origins", ""));
+    }
     options.threads = std::stoul(args.get("threads", "8"));
     options.chunk_haplotypes = std::stoul(args.get("chunk-haplotypes", "128"));
     std::optional<panvar::dosage::PersistedCall> override_call;
@@ -5999,6 +6016,13 @@ int dosage_replay(const Args& args) {
         pc.hap1 = c.substr(0, bar); pc.hap2 = c.substr(bar + 1);
         pc.first = panvar::MosaicPath{parse_alleles(pc.hap1)}; pc.second = panvar::MosaicPath{parse_alleles(pc.hap2)};
         if (options.repair) throw std::runtime_error("--call is for classification only (no persisted scores to guard a repair)");
+        override_call = pc;
+    }
+    if (!args.get("perturb-persisted-total", "").empty()) {
+        // gate hook: the persisted call's total, shifted, so the reproduction guard must refuse before anything is placed
+        std::optional<panvar::dosage::PersistedCall> pc = override_call ? override_call : panvar::dosage::read_persisted_call(run);
+        if (!pc) throw std::runtime_error("no persisted call to perturb");
+        pc->score.total += std::stod(args.get("perturb-persisted-total", "0"));
         override_call = pc;
     }
     const panvar::dosage::DosageShadowSummary s =

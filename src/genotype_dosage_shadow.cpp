@@ -175,11 +175,21 @@ DosageShadowSummary run_dosage_shadow(const PreparedGenotypeModel& model, const 
         in.persisted = persisted->score;
         RepairSettings rs;
         rs.chunk_haplotypes = options.chunk_haplotypes;
+        rs.lifecycle = options.lifecycle;
+        rs.batch_candidates = options.batch_candidates;
+        in.repair_max_physical_origins = options.repair_max_physical_origins;
+        in.repair_max_state_classes = options.repair_max_state_classes;
+        in.repair_max_piece_hits = options.repair_max_piece_hits;
+        in.repair_max_latent_pairs = options.repair_max_latent_pairs;
+        in.repair_origin_cache_path = options.repair_origin_cache_path;
+        in.repair_origin_cache_bytes = options.repair_origin_cache_bytes;
         for (BlockAudit& ba : audit.blocks) {
             if (ba.status != DosageStatus::AutoRepair) continue;
             repair_of[ba.block] = repairs.size();
+            rs.space_audit = options.space_audit;
             repairs.push_back({ba.block_id, repair_block(ba, census[ba.block], features[ba.block], nodes, in, settings, rs)});
             const RepairResult& r = repairs.back().second;
+            if (r.outcome == "SPACE_AUDIT") continue;
             ba.status = r.outcome == "REPAIRED" ? DosageStatus::Repaired : DosageStatus::TriggeredUnrepaired;
             ba.reason = r.reason;
             if (r.outcome == "REPAIRED") { ++summary.repairs; if (r.scope == "CONDITIONAL") ++summary.repairs_conditional; }
@@ -201,6 +211,14 @@ DosageShadowSummary run_dosage_shadow(const PreparedGenotypeModel& model, const 
         in.persisted = persisted->score;
         RepairSettings rs;
         rs.chunk_haplotypes = options.chunk_haplotypes;
+        rs.lifecycle = options.lifecycle;
+        rs.batch_candidates = options.batch_candidates;
+        in.repair_max_physical_origins = options.repair_max_physical_origins;
+        in.repair_max_state_classes = options.repair_max_state_classes;
+        in.repair_max_piece_hits = options.repair_max_piece_hits;
+        in.repair_max_latent_pairs = options.repair_max_latent_pairs;
+        in.repair_origin_cache_path = options.repair_origin_cache_path;
+        in.repair_origin_cache_bytes = options.repair_origin_cache_bytes;
         for (const BlockAudit& ba : audit.blocks) {
             if (ba.route != CensusRoute::RepeatedUnit) { allocation_status[ba.block] = {"NOT_APPLICABLE", "not_repeated_unit"}; continue; }
             const UnitLibrary lib = build_unit_library(model.blocks()[ba.block], nodes, rs);
@@ -445,6 +463,46 @@ DosageShadowSummary run_dosage_shadow(const PreparedGenotypeModel& model, const 
     if (options.repair) {
         atomic_write(out_prefix + ".dosage_repairs.tsv", repair_blocks_table(repairs));
         atomic_write(out_prefix + ".dosage_repair_candidates.tsv", repair_candidates_table(repairs));
+        std::ostringstream sc;   // work and wall per repair: exempt from identity gates (wall time, scheduling-dependent hits)
+        sc << std::setprecision(10) << "block_id\trepair_scope\tlifecycle\tcandidates\tunique_repaired_haplotypes\tcolumns_built\t"
+              "column_references\tbase_references\tcolumns_reused\tbatches\treleases\tslots\thaplotypes_created\tphysical_origins\t"
+              "origins_reused\torigins_recomputed\tpiece_hits\tstate_classes\tdp_executions\tdp_requests\tdp_hits\tdp_hit_rate\t"
+              "prefilters\temission_cache_bytes\temission_cache_entries\tpeak_transient_bytes\tfootprint_peak_bytes\tseconds_base\t"
+              "seconds_placement\tseconds_combination\tseconds_scoring\tseconds_construct\tseconds_em\tseconds_enumerate\tseconds_loglik\t"
+              "origin_cache_hits\torigin_cache_misses\torigin_cache_entries\torigin_cache_bytes\n";
+        for (const auto& [bid, r] : repairs) {
+            const RepairScoringStats& x = r.scoring;
+            sc << bid << '\t' << r.scope << '\t' << (x.lifecycle.empty() ? "none" : x.lifecycle) << '\t' << x.candidates << '\t'
+               << x.unique_repaired_haplotypes << '\t' << x.columns_built << '\t' << x.column_references << '\t' << x.base_references << '\t'
+               << (x.column_references + x.base_references - x.columns_built) << '\t' << x.batches << '\t' << x.releases << '\t' << x.slots
+               << '\t' << x.haplotypes_created << '\t' << x.physical_origins << '\t' << x.origins_reused << '\t' << x.origins_recomputed
+               << '\t' << x.piece_hits << '\t' << x.state_classes << '\t' << x.dp_executions << '\t' << x.dp_requests << '\t' << x.dp_hits
+               << '\t' << (x.dp_requests ? static_cast<double>(x.dp_hits) / static_cast<double>(x.dp_requests) : 0.0) << '\t' << x.prefilters
+               << '\t' << x.emission_cache_bytes << '\t' << x.emission_cache_entries << '\t' << x.peak_transient_bytes << '\t'
+               << x.footprint_peak_bytes << '\t' << x.seconds_base << '\t' << x.seconds_placement << '\t' << x.seconds_combination << '\t'
+               << r.seconds_score << '\t' << r.seconds_construct << '\t' << r.seconds_em << '\t' << r.seconds_enumerate << '\t' << r.seconds_loglik << '\t' << x.origin_cache_hits
+               << '\t' << x.origin_cache_misses << '\t' << x.origin_cache_entries << '\t' << x.origin_cache_bytes << '\n';
+        }
+        atomic_write(out_prefix + ".dosage_repair_scoring.tsv", sc.str());
+        if (options.space_audit) {
+            std::ostringstream sp;
+            sp << "block_id\troute\tinternal_capable\tterminal_capable\tpool_internal\tpool_terminal\tomitted_internal\tomitted_terminal\t"
+                  "pool_multisets\tpool_multisets_dp\tfull_multisets\tretained_multisets\tconstructed_haploid\tconstructed_diploid\t"
+                  "full_haploid_valid\tfull_haploid_in_admissible\tfull_diploid\tcap_reached\tdosage_vectors\tmodule_state_counts\tseconds\n";
+            for (const auto& [bid, r] : repairs) {
+                const CandidateSpace& x = r.space;
+                std::string dv, ms;
+                for (const std::string& v : x.dosage_vectors) dv += (dv.empty() ? "" : ";") + v;
+                for (const std::string& v : x.module_state_counts) ms += (ms.empty() ? "" : ";") + v;
+                sp << bid << '\t' << r.route << '\t' << x.internal_capable << '\t' << x.terminal_capable << '\t' << x.pool_internal << '\t'
+                   << x.pool_terminal << '\t' << (x.internal_capable - x.pool_internal) << '\t' << (x.terminal_capable - x.pool_terminal) << '\t'
+                   << x.pool_multisets << '\t' << x.pool_multisets_dp << '\t' << x.full_multisets << '\t' << x.retained_multisets << '\t'
+                   << x.constructed_haploid << '\t' << x.constructed_diploid << '\t' << x.full_haploid_valid << '\t' << x.full_haploid_in_admissible
+                   << '\t' << x.full_diploid << '\t' << x.cap_reached << '\t' << (dv.empty() ? "NA" : dv) << '\t' << (ms.empty() ? "NA" : ms) << '\t'
+                   << x.seconds << '\n';
+            }
+            atomic_write(out_prefix + ".dosage_space.tsv", sp.str());
+        }
     }
     write_status();
     return summary;

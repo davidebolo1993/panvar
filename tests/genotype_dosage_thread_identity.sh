@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Thread identity gate (docs/algorithms/genotype_dosage.md section 14.6): the shadow audit of one persisted campaign call,
 # with repair, provenance and the allocation test, at 1, 2, 4 and 8 threads. Every dosage table must be byte-identical;
-# only dosage_status.tsv (wall times) is exempt. Usage: <genotype_probe> <jobs.tsv> <cell> <scratch dir>
+# only dosage_status.tsv and dosage_repair_scoring.tsv (wall times, scheduling-dependent cache hits) are exempt. Usage: <genotype_probe> <jobs.tsv> <cell> <scratch dir>
 set -uo pipefail
 PROBE=$1; JOBS=$2; CELL=$3; OUT=$4
 mkdir -p "$OUT"
@@ -14,7 +14,7 @@ done
 fail=0
 for f in "$OUT"/t1.dosage_*; do
   suf=${f#"$OUT/t1"}
-  [ "$suf" = ".dosage_status.tsv" ] && continue
+  case "$suf" in .dosage_status.tsv|.dosage_repair_scoring.tsv) continue;; esac
   for t in 2 4 8; do cmp -s "$f" "$OUT/t$t$suf" || { echo "FAIL $suf differs at $t threads"; fail=1; }; done
 done
 n=$(ls "$OUT"/t1.dosage_* | grep -vc status)
