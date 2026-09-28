@@ -14,6 +14,7 @@
 #include "panvar/bubbles.hpp"
 #include "panvar/fragment_likelihood.hpp"
 #include "panvar/genotype_command.hpp"
+#include "panvar/genotype_dosage.hpp"
 #include "panvar/genotype_locus.hpp"
 #include "panvar/genotype_model.hpp"
 #include "panvar/genotype_repair.hpp"
@@ -5911,6 +5912,81 @@ int tie_branch(const Args& args) {
     return 0;
 }
 
+// ------------------------------------------------------------------------------------------------
+// dosage-replay: the dosage audit of a persisted run -- VALIDATION ONLY, truth-free
+// ------------------------------------------------------------------------------------------------
+// Rebuilds the persisted call (the equivalence set's rank-1 representative, or --hap1/--hap2), and runs the library
+// audit (docs/algorithms/genotype_dosage.md) on the persisted reads. It does not genotype. Writes
+// <out>.dosage_census.tsv, <out>.dosage_features.tsv, <out>.dosage_blocks.tsv and <out>.dosage_replay.tsv (timings).
+int dosage_replay(const Args& args) {
+    const std::string out = args.required("out");
+    const auto started = std::chrono::steady_clock::now();
+    struct Staged { std::string path; ~Staged() { std::error_code e; std::filesystem::remove(path, e); } } staged{out + ".model.sorted.gfa"};
+    const std::string curation = args.get("panel-curation", "");
+    const LoadedModel loaded = load_model(args.required("model-gfa"), args.required("reference"), staged.path, 50,
+                                          curation.empty() || curation == "none" ? std::vector<std::string>{} : read_panel_curation(curation));
+    const panvar::PreparedGenotypeModel& model = *loaded.model;
+    std::string hap1 = args.get("hap1", ""), hap2 = args.get("hap2", "");
+    if (hap1.empty() || hap2.empty()) {
+        const std::string eq = args.required("run") + ".equivalence_set.tsv";
+        std::ifstream in(eq);
+        if (!in) throw std::runtime_error("cannot read " + eq);
+        std::string line;
+        std::getline(in, line);
+        std::vector<std::string> header;
+        { std::stringstream h(line); for (std::string c; std::getline(h, c, '\t');) header.push_back(c); }
+        const auto col = [&](const std::string& name) {
+            const auto it = std::find(header.begin(), header.end(), name);
+            if (it == header.end()) throw std::runtime_error(eq + " has no column " + name);
+            return static_cast<std::size_t>(it - header.begin());
+        };
+        const std::size_t c_rank = col("rank"), c_rep = col("representative"), c_h1 = col("hap1_alleles"), c_h2 = col("hap2_alleles");
+        while (std::getline(in, line)) {
+            std::vector<std::string> f;
+            std::stringstream row(line);
+            for (std::string c; std::getline(row, c, '\t');) f.push_back(c);
+            if (f.size() > std::max({c_rank, c_rep, c_h1, c_h2}) && f[c_rank] == "1" && f[c_rep] == "true") { hap1 = f[c_h1]; hap2 = f[c_h2]; break; }
+        }
+        if (hap1.empty()) throw std::runtime_error(eq + " has no rank-1 representative (no call to audit)");
+    }
+    const panvar::MosaicPath w1{parse_alleles(hap1)}, w2{parse_alleles(hap2)};
+    const panvar::LibraryModel library = read_library_file(args.required("library"));
+    const panvar::dosage::DosageSettings settings;
+    const std::optional<std::size_t> span = panvar::dosage::molecule_span_bp(library.insert_mean_bp, library.insert_sd_bp, settings);
+    if (!span) throw std::runtime_error("dosage-replay: the library declares no short-read insert distribution");
+    const std::size_t threads = std::stoul(args.get("threads", "8"));
+    const auto t0 = std::chrono::steady_clock::now();
+    const std::vector<panvar::dosage::CensusBlock> census = panvar::dosage::run_census(model, loaded.sorted.gfa.seq, *span, settings);
+    const auto t1 = std::chrono::steady_clock::now();
+    std::vector<panvar::dosage::BlockFeatureModel> features(model.blocks().size());
+    for (const auto& c : census) if (c.sensitive()) features[c.block] = panvar::dosage::pooled_features(model.blocks()[c.block], settings);
+    const auto t2 = std::chrono::steady_clock::now();
+    const panvar::dosage::ReportedCall call = panvar::dosage::reported_call(model, w1, w2);
+    const std::vector<panvar::ReadPair> reads = read_pairs(args.required("reads1"), args.required("reads2"));
+    const auto t3 = std::chrono::steady_clock::now();
+    const panvar::dosage::DosageAudit audit = panvar::dosage::audit_dosage(model, census, features, call, reads, *span, settings, threads);
+    const auto t4 = std::chrono::steady_clock::now();
+    std::ostringstream c;
+    c << "block_id\talleles\tmax_node_multiplicity\tmax_repeated_bp\tdosage_only_pairs\tcensus_route\tpooled_features\n";
+    for (const auto& b : census) {
+        c << b.block_id << '\t' << b.alleles << '\t' << b.max_node_multiplicity << '\t' << b.max_repeated_bp << '\t' << b.dosage_only_pairs
+          << '\t' << panvar::dosage::census_route_name(b.route) << '\t' << features[b.block].features.size() << '\n';
+    }
+    atomic_write(out + ".dosage_census.tsv", c.str());
+    atomic_write(out + ".dosage_features.tsv", panvar::dosage::dosage_features_table(audit));
+    atomic_write(out + ".dosage_blocks.tsv", panvar::dosage::dosage_blocks_table(audit));
+    const auto sec = [](auto a, auto b) { return std::chrono::duration<double>(b - a).count(); };
+    std::ostringstream r;
+    r << std::setprecision(6) << "key\tvalue\nhap1\t" << hap1 << "\nhap2\t" << hap2 << "\nmodel_fingerprint\t" << loaded.fingerprint
+      << "\nmolecule_span_bp\t" << *span << "\nreads\t" << reads.size() << "\nthreads\t" << threads << "\nseconds_census\t" << sec(t0, t1)
+      << "\nseconds_features\t" << sec(t1, t2) << "\nseconds_estimate\t" << sec(t3, t4) << "\nseconds_total\t"
+      << sec(started, std::chrono::steady_clock::now()) << '\n';
+    atomic_write(out + ".dosage_replay.tsv", r.str());
+    std::cout << "dosage-replay: m " << audit.m << ", " << audit.blocks.size() << " blocks, span " << *span << ", "
+              << sec(started, std::chrono::steady_clock::now()) << " s\n";
+    return 0;
+}
+
 int main(int argc, char** argv) {
     try {
         if (argc < 2) {
@@ -5940,6 +6016,7 @@ int main(int argc, char** argv) {
         if (command == "repair-search") return repair_search(args);
         if (command == "window-bench") return window_bench(args);
         if (command == "tie-branch") return tie_branch(args);
+        if (command == "dosage-replay") return dosage_replay(args);
         std::cerr << "unknown probe command: " << command << '\n';
         return 2;
     } catch (const std::exception& error) {

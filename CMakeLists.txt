@@ -134,6 +134,7 @@ add_library(panvarlib
     src/genotype_locus.cpp
     src/genotype_command.cpp
     src/genotype_repair.cpp
+    src/genotype_dosage.cpp
     src/fragment_likelihood.cpp
     src/bubble_path.cpp
     src/bubbles.cpp
