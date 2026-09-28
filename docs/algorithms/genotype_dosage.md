@@ -606,3 +606,64 @@ The ten amendments are listed in §17.
    - Every tie is a phase tie, and all 18 starts the early cap stop required are dosage-admissible.
    - The constraint therefore removes nothing: at least 18 branches are still needed against the cap of 16, and the
      no-call stands.
+
+## 19. Second review record (Sol, 2026-09-28): allocation semantics, scoring lifecycle, candidate space
+
+**Decisions.**
+- Allocation ties use the 1e-9-nat tolerance, and every tied allocation is reported.
+- The allocation observability test stays off by default.
+- CONDITIONAL repeated-unit repairs never replace production calls, and repaired genotypes are not integrated
+  (`--dosage-audit shadow` is the only enabled mode).
+- HG01573.30 stays a fail-closed no-call.
+- Nearest-panel provenance is accepted.
+
+**Allocation semantics (normative; replaces the last key of §8.2).**
+1. **Equivalence set.** Within the chosen content multiset, take the maximal panel-structure prior (exact). Every
+   arrangement within 1e-9 nats of the best likelihood among those is one **allocation-equivalence set**. It is
+   reported in full, one row per distinct unordered spelled genotype, in `<prefix>.dosage_allocation_equivalence.tsv`.
+2. **Representative.** The member with the smallest canonical SHA-256 pair is the **serialization representative**
+   only. It is labelled `REPRESENTATIVE_ONLY_NOT_RESOLVED` whenever the set has more than one member, and it is never
+   described as the called diplotype.
+   - Repaired FASTA headers carry `repair_scope`, `allocation_status` and, for such a set,
+     `allocation=REPRESENTATIVE_ONLY` with a link to the equivalence set.
+3. **allocation_status.**
+   - `UNRESOLVED` when the observability test proves it, or when the set has more than one member (basis
+     `tied_allocation_equivalence_set`).
+   - `NOT_TESTED` when an eligible repeated-unit genotype (≥ 3 units) was not tested.
+   - `NOT_APPLICABLE` only for the pair route or fewer than three units.
+4. **Declared corrections, not replay failures.** The prototype's choice in this step depended on label strings and on
+   pandas' float parser. Two cells showed it:
+   - `loo.NA20847.30`: an exact tie broken by label string;
+   - fresh `loo.NA19384.5`: likelihoods 1.5e-11 nats apart, merged by the parser.
+   - Across all 54 sealed repairs the approved rule leaves the content multiset unchanged and always contains the
+     prototype's pick.
+   - The representative differs from that pick in 18 repairs, a serialization choice only.
+5. **Scope.** `repair_scope` (COMPLETE for the pair route, CONDITIONAL otherwise) is carried in every table and in
+   every FASTA header.
+
+**Scoring lifecycle (a lifecycle change only; scores bit-identical).**
+- **One context per repair.** Each repair is scored in one `PreparedScoringContext`:
+  - the reported homologues are placed once with retained censuses;
+  - the reproduction guard is scored first;
+  - each distinct repaired haplotype is placed once by the exact block delta and reused by every diplotype holding
+    it;
+  - columns are released once no pending candidate needs them, and released slots are reused.
+- **Caps.** The profile's repair caps (`repair_max_*`) are cumulative over the repair. A cap refuses the repair with
+  no partial output.
+- **Origin cache.** The stage-6 origin path is on with retention budget 0: nothing is retained, every window is
+  recomputed exactly, and the path's merge is kept. With the profile's 768 MiB budget, NA19434.30 peaked at 3.74 GiB
+  for no hits.
+- **Construction.** Compact fixed-width multiset records, a sparse EM over nonzero entries in the dense index order,
+  and parallel proposal likelihoods into per-candidate slots. All three leave every value bit-identical. The earlier
+  one-shot path stays selectable (`--repair-scoring cold`) as the reference.
+
+**Candidate space (exact counts, nothing scored).**
+- **Pool truncation.** The 36-unit pools omit 71–75 of 107–111 internal-capable and 69–70 of 105–106
+  terminal-capable units in every repair.
+- **Full-library sizes.** Admissible multisets number 1.0e5–1.5e10, and the theoretical diploid structures
+  2.0e5–3.3e11. Only 123–1,128 structures are constructed.
+- **Proposal ranking is not a bound.** The chosen content's proposal rank is 1 in only 11 of 50 repairs, and up to 61.
+- **Dosage content is determined by the constraint alone** in 48 of 50 repairs: every admissible candidate of the
+  full library has the same rounded feature-copy vector and the same (units, I-state units) count.
+- **Junction-signature classes are exact.** Classes of equal content and equal unit-junction multiset agree in
+  likelihood within 6e-11 nats, but they collapse the constructed structures by only 1%.
