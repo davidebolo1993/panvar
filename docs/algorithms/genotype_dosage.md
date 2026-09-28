@@ -667,3 +667,91 @@ The ten amendments are listed in §17.
   full library has the same rounded feature-copy vector and the same (units, I-state units) count.
 - **Junction-signature classes are exact.** Classes of equal content and equal unit-junction multiset agree in
   likelihood within 6e-11 nats, but they collapse the constructed structures by only 1%.
+
+## 20. Integration contract: `panvar genotype --dosage-mode off|audit|repair` (written 2026-09-28; repair not enabled)
+
+**Scope.** One genotyping command; no second executable.
+- The dosage stage runs inside `panvar genotype` after the call is decided.
+- It uses the same scoring context settings, the profile's repair caps and the same model.
+- `--dosage-audit shadow`, the validation mode of §12, becomes `--dosage-mode audit` with identical outputs.
+- **Default `off`.**
+- **`repair` is specified here and not enabled.** The command refuses it until reviewed.
+
+### 20.1 Modes
+
+| mode | dosage work | reported genotype | new files |
+|---|---|---|---|
+| `off` | none | the caller's | none; every output byte-identical to the build without the stage |
+| `audit` | census, features, classification, repair search, provenance | the caller's, unchanged | `<prefix>.dosage_*` (§11, §19) |
+| `repair` | as audit | changed only by COMPLETE_DIPLOTYPE_REPAIR blocks (20.2) | as audit, plus `<prefix>.original_*` (20.5) |
+
+### 20.2 What each repair class does in `repair` mode
+
+| repair class | block genotype written | haplotype FASTA | block row `dosage_status` |
+|---|---|---|---|
+| (not AUTO_REPAIR) | the caller's | the caller's | CONSISTENT / SUSPECT / UNDERPOWERED / NOT_SENSITIVE / NOT_EVALUATED |
+| COMPLETE_DIPLOTYPE_REPAIR | the repaired pair replaces the block's alleles (pair route: panel allele IDs) | the repaired full haplotypes, headers `role=RESOLVED` | REPAIRED |
+| CONDITIONAL_DOSAGE_CONTENT | **the caller's**, kept, with the corrected content reported beside it (20.3) | the caller's; the representative only in `<prefix>.dosage_repaired.fa`, headers `role=REPRESENTATIVE_ONLY_NOT_RESOLVED` | CONTENT_REPAIRED |
+| TRIGGERED_UNREPAIRED | the caller's | the caller's | TRIGGERED_UNREPAIRED (with reason) |
+
+A conditional representative is never written as the block's `allele1`/`allele2`, never enters the main haplotype
+FASTA, and never raises a call class. The exact allele sequences and allocation stay non-authoritative.
+
+### 20.3 Block tables (`genotypes.tsv`, `block_genotypes.tsv`)
+
+The existing columns keep their meaning. New trailing columns, so positional readers of the old columns are
+unaffected:
+- `dosage_status`, `dosage_reason`, `repair_class`;
+- `dosage_content_scope`, `diplotype_scope`, `allocation_equivalence_scope`, `serialization_representative`;
+- `original_allele1`, `original_allele2`: always the caller's, even after a COMPLETE_DIPLOTYPE_REPAIR;
+- `original_content`, `corrected_content`, `admissible_content_vectors`;
+- `allocation_status`;
+- `original_GQ`, `gq_status`: UNCHANGED_CONDITIONAL, or UNAVAILABLE_REPAIRED with `conditional_GQ` NA;
+- `repair_separation`, `conditional_repair_gap` (diagnostics).
+
+**For a CONDITIONAL_DOSAGE_CONTENT block:**
+- `allele1`/`allele2` are the caller's;
+- `corrected_content` is authoritative within the declared model (units, I-state units, feature copy vector);
+- `conditional_GQ` stays the caller's value, labelled as describing the original genotype;
+- the representative's identity is in `dosage_blocks.tsv` and in the equivalence set only.
+
+### 20.4 FILTER, quality and call class
+
+- **`filter` (representation) and `quality_filter` (read support)** are unchanged and computed as today. Dosage never
+  rewrites them.
+- **A new per-block `dosage_filter`:**
+  - `PASS`: CONSISTENT, NOT_SENSITIVE, or REPAIRED;
+  - `DOSAGE_CONTENT_CORRECTED`: CONTENT_REPAIRED, i.e. the original alleles contradict the complete dosage content;
+  - `DOSAGE_TRIGGERED_UNREPAIRED`;
+  - `DOSAGE_SUSPECT`, `DOSAGE_UNDERPOWERED`, `DOSAGE_NOT_EVALUATED`;
+  - information limits and warnings are listed as reasons, never merged into LOW_QUALITY.
+- **The run's call class** (`strict_call`, `genotype_equivalent_call`, `no_call`) is unchanged by audit. In repair
+  mode only COMPLETE_DIPLOTYPE_REPAIR changes a genotype.
+  - A strict call whose repaired block came from a pair-route complete repair stays `strict_call`, with
+    `dosage_repaired_blocks` listed.
+  - A call with any CONDITIONAL_DOSAGE_CONTENT block keeps its class. The status records
+    `dosage_content_corrected_blocks`, and that block's `dosage_filter` is DOSAGE_CONTENT_CORRECTED.
+
+### 20.5 Status file and recoverability
+
+- **`mosaic_status.tsv` in repair mode** gains:
+  - `dosage_mode`, `dosage_policy`, `dosage_audit_status`;
+  - per-class counts;
+  - `dosage_repaired_blocks`, `dosage_content_corrected_blocks`;
+  - the molecule span and m.
+- **In audit mode these stay in `<prefix>.dosage_status.tsv` only**, so audit remains byte-identical in every existing
+  file.
+- **Original call and sequences stay recoverable:**
+  - `<prefix>.original_genotypes.tsv`, `<prefix>.original_block_genotypes.tsv` and `<prefix>.original_haplotypes.fa`
+    are written whenever repair mode changes any block;
+  - the equivalence set and `<prefix>.dosage_original.fa` hold the pre-repair homologues;
+  - every repaired sequence is identified by its full SHA-256.
+
+### 20.6 Gates required before `repair` is enabled
+
+- **Identity:** `off` and `audit` byte-identical as today. `repair` identical to `audit` in every block that is not
+  COMPLETE_DIPLOTYPE_REPAIR.
+- **Round trip:** the original files reproduce the audit-mode outputs exactly.
+- **Threads:** 1/2/4/8-thread identity of every file.
+- **Downstream:** a schema gate over the new trailing columns.
+- **Evaluation:** the frozen evaluator scores `original_*` and the repaired outputs separately.
