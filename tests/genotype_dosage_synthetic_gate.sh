@@ -28,7 +28,7 @@ echo "$BLOCK: real $real, injected $inj, repaired $got"
 [ "$got" = "$real" ] || { echo "FAIL the repair did not restore the real pair"; fail=1; }
 cmp -s <(grep -v '>' "$prefix.mosaic_haplotypes.fa") <(grep -v '>' "$OUT/repaired.mosaic_haplotypes.fa") || { echo "FAIL repaired haplotypes differ from the real call's"; fail=1; }
 for v in repaired repaired.original; do
-  "$PROBE" evaluate --scheme "$scheme" --donor "$donor" --reference "$REF" --run-prefix "$OUT/$v" --model-gfa "$model" --truth-gfa "$truth" \
+  "$PROBE" evaluate --scheme "$scheme" --donor "$lab" --reference "$REF" --run-prefix "$OUT/$v" --model-gfa "$model" --truth-gfa "$truth" \
     --out "$OUT/$v.eval" > "$OUT/$v.evaluate.log" 2>&1 || { echo "FAIL evaluate $v"; fail=1; }
 done
 d_orig=$(awk -F'\t' -v b="$BLOCK" '$4==b{print $10}' "$OUT/repaired.original.eval.blocks.tsv")
