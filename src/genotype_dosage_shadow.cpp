@@ -91,7 +91,7 @@ DosageShadowSummary run_dosage_shadow(const PreparedGenotypeModel& model, const 
                                       const std::vector<ReadPair>& reads, const LibraryModel& library,
                                       const FragmentScoringOptions& scoring, const std::vector<double>& switch_probability,
                                       const std::string& run_prefix, const std::string& out_prefix,
-                                      const DosageShadowOptions& options) {
+                                      const DosageShadowOptions& options, const std::optional<PersistedCall>& call_override) {
     const auto started = std::chrono::steady_clock::now();
     DosageShadowSummary summary;
     const DosageSettings settings;
@@ -131,7 +131,7 @@ DosageShadowSummary run_dosage_shadow(const PreparedGenotypeModel& model, const 
         return summary;
     }
     summary.molecule_span_bp = *span;
-    const std::optional<PersistedCall> persisted = read_persisted_call(run_prefix);
+    const std::optional<PersistedCall> persisted = call_override ? call_override : read_persisted_call(run_prefix);
     if (!persisted) {
         summary.audit_status = "NOT_RUN";
         summary.note = "the run reports no rank-1 representative (no call to audit)";
@@ -355,6 +355,20 @@ DosageShadowSummary run_dosage_shadow(const PreparedGenotypeModel& model, const 
     }
     atomic_write(out_prefix + ".dosage_census.tsv", cen.str());
     atomic_write(out_prefix + ".dosage_features.tsv", dosage_features_table(audit));
+    {
+        // per-allele copy vector of every tested feature, so any block genotype's admissibility can be checked
+        std::ostringstream fc;
+        fc << "block_id\tfeature\tpooled_index\tcopies_by_allele\tadmissible\n";
+        for (const BlockAudit& ba : audit.blocks) {
+            for (const FeatureAudit& fa : ba.features) {
+                std::string copies, adm;
+                for (std::uint16_t v : features[ba.block].features[fa.pooled_index].copies) copies += (copies.empty() ? "" : ",") + std::to_string(v);
+                for (int a : fa.admissible) adm += (adm.empty() ? "" : ",") + std::to_string(a);
+                fc << ba.block_id << '\t' << fa.feature << '\t' << fa.pooled_index << '\t' << copies << '\t' << adm << '\n';
+            }
+        }
+        atomic_write(out_prefix + ".dosage_feature_copies.tsv", fc.str());
+    }
     atomic_write(out_prefix + ".dosage_blocks.tsv", o.str());
     if (options.repair) {
         atomic_write(out_prefix + ".dosage_repairs.tsv", repair_blocks_table(repairs));

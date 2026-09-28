@@ -465,6 +465,7 @@ DosageAudit audit_dosage(const PreparedGenotypeModel& model, const std::vector<C
             const PooledFeature& pf = fm.features[tested[f].index];
             FeatureAudit fa;
             fa.feature = f;
+            fa.pooled_index = tested[f].index;
             fa.kmers = tested[f].kmers.size();
             fa.copy_values = pf.copies;
             std::sort(fa.copy_values.begin(), fa.copy_values.end());

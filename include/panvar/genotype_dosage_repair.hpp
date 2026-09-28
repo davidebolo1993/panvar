@@ -220,6 +220,7 @@ DosageShadowSummary run_dosage_shadow(const PreparedGenotypeModel& model, const 
                                       const std::vector<ReadPair>& reads, const LibraryModel& library,
                                       const FragmentScoringOptions& scoring, const std::vector<double>& switch_probability,
                                       const std::string& run_prefix, const std::string& out_prefix,
-                                      const DosageShadowOptions& options);
+                                      const DosageShadowOptions& options,
+                                      const std::optional<PersistedCall>& call_override = std::nullopt);
 
 } // namespace panvar::dosage

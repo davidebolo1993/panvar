@@ -5990,8 +5990,19 @@ int dosage_replay(const Args& args) {
     options.allocation_test = args.get("allocation-test", "0") != "0";
     options.threads = std::stoul(args.get("threads", "8"));
     options.chunk_haplotypes = std::stoul(args.get("chunk-haplotypes", "128"));
+    std::optional<panvar::dosage::PersistedCall> override_call;
+    if (!args.get("call", "").empty()) {
+        // an explicit diplotype "<hap1 alleles>|<hap2 alleles>" in place of the persisted call (classification only)
+        const std::string c = args.get("call", "");
+        const std::size_t bar = c.find('|');
+        panvar::dosage::PersistedCall pc;
+        pc.hap1 = c.substr(0, bar); pc.hap2 = c.substr(bar + 1);
+        pc.first = panvar::MosaicPath{parse_alleles(pc.hap1)}; pc.second = panvar::MosaicPath{parse_alleles(pc.hap2)};
+        if (options.repair) throw std::runtime_error("--call is for classification only (no persisted scores to guard a repair)");
+        override_call = pc;
+    }
     const panvar::dosage::DosageShadowSummary s =
-        panvar::dosage::run_dosage_shadow(model, loaded.sorted.gfa.seq, reads, library, scoring, switches, run, out, options);
+        panvar::dosage::run_dosage_shadow(model, loaded.sorted.gfa.seq, reads, library, scoring, switches, run, out, options, override_call);
     std::cout << "dosage-replay: " << s.audit_status << ", m " << s.m << ", span " << s.molecule_span_bp << ", repairs " << s.repairs
               << " (" << s.repairs_conditional << " conditional), " << s.seconds_total << " s; model fingerprint " << loaded.fingerprint << '\n';
     return s.audit_status == "COMPLETE" ? 0 : 3;

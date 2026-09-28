@@ -115,6 +115,7 @@ const char* dosage_status_name(DosageStatus status);
 
 struct FeatureAudit {
     std::size_t feature = 0;
+    std::size_t pooled_index = 0;             // index into the block's pooled features (graph)
     std::size_t kmers = 0;
     std::vector<std::uint16_t> copy_values;   // distinct values of the copy vector, ascending
     int call_cn = 0;
