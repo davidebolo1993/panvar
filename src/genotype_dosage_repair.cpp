@@ -437,27 +437,32 @@ void choose_repair(RepairResult& res, CensusRoute route, double tie_tolerance_na
         }
         if (multisets.size() > 1) return refuse_tie();
         const std::vector<std::size_t> content = *multisets.begin();
-        // allocation within the content multiset: panel-structure prior, then likelihood, then structure rank
+        // allocation within the content multiset (Sol, 2026-09-28): the panel-structure prior first (exact), then every
+        // arrangement within the tie tolerance of the best likelihood among them is one allocation-equivalence set;
+        // the smallest canonical SHA-256 pair only serialises it and is not a resolved allocation
+        double best_prior = -std::numeric_limits<double>::infinity();
+        for (BlockCandidate& c : res.candidates) {
+            if (c.multiset != content) continue;
+            c.chosen_content = true;
+            best_prior = std::max(best_prior, c.panel_log_prior);
+        }
+        double best_ll = -std::numeric_limits<double>::infinity();
+        for (const BlockCandidate& c : res.candidates) {
+            if (c.multiset == content && c.panel_log_prior == best_prior) best_ll = std::max(best_ll, c.likelihood);
+        }
+        std::set<Genotype> tied;
+        std::pair<std::string, std::string> smallest;
         bool first = true;
         for (std::size_t i = 0; i < res.candidates.size(); ++i) {
             BlockCandidate& c = res.candidates[i];
-            if (c.multiset != content) continue;
-            c.chosen_content = true;
-            const BlockCandidate& p = res.candidates[pick];
-            if (first || c.panel_log_prior > p.panel_log_prior ||
-                (c.panel_log_prior == p.panel_log_prior && (c.likelihood > p.likelihood || (c.likelihood == p.likelihood && c.rank < p.rank)))) {
-                pick = i;
-                first = false;
-            }
-        }
-        std::set<Genotype> tied;
-        for (BlockCandidate& c : res.candidates) {
-            if (c.multiset == content && c.panel_log_prior == res.candidates[pick].panel_log_prior && c.likelihood == res.candidates[pick].likelihood) {
-                c.allocation_tied = true;
-                tied.insert(unordered(c.ctx1_sequence, c.ctx2_sequence));
-            }
+            if (c.multiset != content || c.panel_log_prior != best_prior || c.likelihood < best_ll - tie_tolerance_nats) continue;
+            c.allocation_tied = true;
+            tied.insert(unordered(c.ctx1_sequence, c.ctx2_sequence));
+            const auto key = c.ctx1_id <= c.ctx2_id ? std::make_pair(c.ctx1_id, c.ctx2_id) : std::make_pair(c.ctx2_id, c.ctx1_id);
+            if (first || key < smallest) { smallest = key; pick = i; first = false; }
         }
         res.allocation_tie = tied.size();
+        res.representative_only = tied.size() > 1;
     }
     res.chosen = static_cast<long>(pick);
     BlockCandidate& chosen = res.candidates[pick];
@@ -1035,18 +1040,19 @@ std::string join_sizes(const std::vector<std::size_t>& v, const char* sep = "-")
 std::string repair_candidates_table(const std::vector<std::pair<std::string, RepairResult>>& repairs) {
     std::ostringstream o;
     o << std::setprecision(17);
-    o << "block_id\troute\tlabel\trank\torientation\tctx1_id\tctx2_id\tctx1_bp\tctx2_bp\tunits_a\tunits_b\tmultiset\tmultiset_rank\t"
+    o << "block_id\troute\trepair_scope\tlabel\trank\torientation\tctx1_id\tctx2_id\tctx1_bp\tctx2_bp\tunits_a\tunits_b\tmultiset\tmultiset_rank\t"
          "proposal_loglik\tstates\tpanel_log_prior\tfragment_term\texposure_term\tlikelihood\tin_top_set\tchosen_content\t"
-         "allocation_tied\tchosen\n";
+         "allocation_tied\tchosen\tserialization_representative\n";
     for (const auto& [block_id, r] : repairs) {
         for (const BlockCandidate& c : r.candidates) {
-            o << block_id << '\t' << r.route << '\t' << c.label << '\t' << c.rank << '\t' << c.orientation << '\t' << c.ctx1_id << '\t'
+            o << block_id << '\t' << r.route << '\t' << r.scope << '\t' << c.label << '\t' << c.rank << '\t' << c.orientation << '\t' << c.ctx1_id << '\t'
               << c.ctx2_id << '\t' << c.ctx1_sequence.size() << '\t' << c.ctx2_sequence.size() << '\t'
               << (c.units_a.empty() ? "NA" : join_sizes(c.units_a)) << '\t' << (c.units_b.empty() ? "NA" : join_sizes(c.units_b)) << '\t'
               << (c.multiset.empty() ? "NA" : join_sizes(c.multiset, "+")) << '\t' << c.multiset_rank << '\t' << c.proposal_loglik << '\t'
               << (c.states.empty() ? "NA" : c.states) << '\t' << c.panel_log_prior << '\t' << c.fragment_term << '\t' << c.exposure_term
               << '\t' << c.likelihood << '\t' << (c.in_top_set ? "true" : "false") << '\t' << (c.chosen_content ? "true" : "false") << '\t'
-              << (c.allocation_tied ? "true" : "false") << '\t' << (c.chosen ? "true" : "false") << '\n';
+              << (c.allocation_tied ? "true" : "false") << '\t' << (c.chosen ? "true" : "false") << '\t'
+              << (c.chosen && r.representative_only ? "REPRESENTATIVE_ONLY_NOT_RESOLVED" : c.chosen ? "chosen" : "NA") << '\n';
         }
     }
     return o.str();
@@ -1057,7 +1063,7 @@ std::string repair_blocks_table(const std::vector<std::pair<std::string, RepairR
     o << std::setprecision(17);
     o << "block_id\troute\toutcome\treason\trepair_scope\trepair_scope_reason\tcap_reached\tcandidates\tmultisets_evaluated\t"
          "multisets_retained\thaploid\tdiploid\tm_range\tinternal_capable\tterminal_capable\tbeta\tphi\tem_iterations\ttop_set_size\t"
-         "orientation_tie\tallocation_tie\tchosen_label\trepaired_ctx1_id\trepaired_ctx2_id\toriginal_fragment_term\t"
+         "orientation_tie\tallocation_tie\tallocation_representative_only\tchosen_label\trepaired_ctx1_id\trepaired_ctx2_id\toriginal_fragment_term\t"
          "original_exposure_term\toriginal_likelihood\trepaired_fragment_term\trepaired_exposure_term\trepaired_likelihood\t"
          "repair_separation\tconditional_repair_gap\n";
     for (const auto& [block_id, r] : repairs) {
@@ -1068,7 +1074,7 @@ std::string repair_blocks_table(const std::vector<std::pair<std::string, RepairR
           << r.cap_reached << '\t' << r.candidates.size() << '\t' << r.multisets_evaluated << '\t' << r.multisets_retained << '\t' << r.haploid
           << '\t' << r.diploid << '\t' << (mr.empty() ? "NA" : mr) << '\t' << r.internal_capable << '\t' << r.terminal_capable << '\t' << r.beta
           << '\t' << r.phi << '\t' << r.em_iterations << '\t' << r.top_set_size << '\t' << (r.orientation_tie ? "true" : "false") << '\t'
-          << r.allocation_tie << '\t' << (c ? c->label + "/" + c->orientation : "NA") << '\t' << (c ? c->ctx1_id : "NA") << '\t'
+          << r.allocation_tie << '\t' << (r.representative_only ? "true" : "false") << '\t' << (c ? c->label + "/" + c->orientation : "NA") << '\t' << (c ? c->ctx1_id : "NA") << '\t'
           << (c ? c->ctx2_id : "NA") << '\t' << r.original_fragment << '\t' << r.original_exposure << '\t' << r.original_likelihood << '\t';
         if (c) o << c->fragment_term << '\t' << c->exposure_term << '\t' << c->likelihood << '\t' << r.repair_separation << '\t';
         else o << "NA\tNA\tNA\tNA\t";

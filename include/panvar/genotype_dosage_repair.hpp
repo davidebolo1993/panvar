@@ -102,7 +102,8 @@ struct RepairResult {
     long chosen = -1;
     std::size_t top_set_size = 0;
     bool orientation_tie = false;
-    std::size_t allocation_tie = 0;         // distinct genotypes tied on (panel prior, likelihood) at the pick
+    std::size_t allocation_tie = 0;         // distinct genotypes in the allocation-equivalence set (prior, then likelihood within tolerance)
+    bool representative_only = false;      // the chosen arrangement only serialises an unresolved allocation-equivalence set
     std::size_t multisets_evaluated = 0, multisets_retained = 0, haploid = 0, diploid = 0;
     std::vector<int> m_range;
     std::size_t internal_capable = 0, terminal_capable = 0;

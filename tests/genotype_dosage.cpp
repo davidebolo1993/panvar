@@ -259,6 +259,18 @@ void test_choice_rules() {
         require(r.outcome == "REPAIRED" && r.allocation_tie == 2 && r.candidates[0].allocation_tied && r.candidates[1].allocation_tied,
                 "an exact allocation tie is recorded with both genotypes");
     }
+    {   // allocation-equivalence set within 1e-9 after the prior; the smallest canonical SHA-256 pair serialises it
+        RepairResult r;
+        r.candidates = {cand("A", "B", -10.0, "AB", {1, 1, 2}, -1.0, 0), cand("C", "D", -10.0 + 5e-10, "AB", {1, 1, 2}, -1.0, 1),
+                        cand("E", "F", -10.0 - 5e-9, "AB", {1, 1, 2}, -1.0, 2)};
+        r.candidates[0].ctx1_id = "ff"; r.candidates[0].ctx2_id = "ee";
+        r.candidates[1].ctx1_id = "dd"; r.candidates[1].ctx2_id = "cc";
+        r.candidates[2].ctx1_id = "00"; r.candidates[2].ctx2_id = "01";
+        choose_repair(r, CensusRoute::RepeatedUnit, 1e-9);
+        require(r.outcome == "REPAIRED" && r.allocation_tie == 2 && r.representative_only, "a within-tolerance allocation set is unresolved");
+        require(r.chosen == 1, "the representative is the smallest canonical SHA-256 pair, not the rank or the likelihood");
+        require(!r.candidates[2].allocation_tied, "an arrangement beyond the tolerance is not in the set");
+    }
     {   // different content multisets tied: never resolved by the allocation rule
         RepairResult r;
         r.candidates = {cand("A", "B", -10.0, "AB", {1, 1, 2}, -1.0, 0), cand("C", "D", -10.0, "AB", {1, 2, 2}, 0.0, 1)};

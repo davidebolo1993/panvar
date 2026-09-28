@@ -4,7 +4,9 @@
 #include "panvar/ls_hmm.hpp"
 #include "panvar/mosaic_spelling.hpp"
 
+#include <algorithm>
 #include <chrono>
+#include <set>
 #include <fstream>
 #include <iomanip>
 #include <sstream>
@@ -185,9 +187,13 @@ DosageShadowSummary run_dosage_shadow(const PreparedGenotypeModel& model, const 
         summary.seconds_repair = seconds_since(t);
     }
 
-    // allocation observability (spec section 8.3): shadow-only, off unless requested
+    // allocation (spec section 8.3 and Sol's 2026-09-28 semantics): every repeated-unit block's reported units, the
+    // observability test when requested, and the final status -- UNRESOLVED when the test proves it or when several
+    // allocations remain tied, NOT_TESTED when an eligible test was not run, NOT_APPLICABLE only where allocation does
+    // not apply (pair route, or fewer than three units)
     std::map<std::size_t, AllocationTestResult> allocation;
-    if (options.allocation_test) {
+    std::map<std::size_t, std::pair<std::string, std::string>> allocation_status;   // block -> (status, basis)
+    {
         const auto ta = std::chrono::steady_clock::now();
         ScoringInputs in;
         in.model = &model; in.first = persisted->first; in.second = persisted->second; in.call = &call; in.reads = &reads;
@@ -196,26 +202,33 @@ DosageShadowSummary run_dosage_shadow(const PreparedGenotypeModel& model, const 
         RepairSettings rs;
         rs.chunk_haplotypes = options.chunk_haplotypes;
         for (const BlockAudit& ba : audit.blocks) {
-            if (ba.route != CensusRoute::RepeatedUnit) continue;
+            if (ba.route != CensusRoute::RepeatedUnit) { allocation_status[ba.block] = {"NOT_APPLICABLE", "not_repeated_unit"}; continue; }
             const UnitLibrary lib = build_unit_library(model.blocks()[ba.block], nodes, rs);
             std::vector<std::size_t> u1 = lib.panel.at(ba.call_alleles[0]), u2 = lib.panel.at(ba.call_alleles[1]);
-            if (repair_of.count(ba.block)) {
-                const RepairResult& r = repairs[repair_of.at(ba.block)].second;
-                if (r.outcome == "REPAIRED" && r.chosen >= 0) {
-                    u1 = r.candidates[static_cast<std::size_t>(r.chosen)].units_a;
-                    u2 = r.candidates[static_cast<std::size_t>(r.chosen)].units_b;
+            const RepairResult* r = repair_of.count(ba.block) ? &repairs[repair_of.at(ba.block)].second : nullptr;
+            const bool repaired = r && r->outcome == "REPAIRED" && r->chosen >= 0;
+            if (repaired) {
+                u1 = r->candidates[static_cast<std::size_t>(r->chosen)].units_a;
+                u2 = r->candidates[static_cast<std::size_t>(r->chosen)].units_b;
+            }
+            if (u1.size() + u2.size() < 3 || u1.empty() || u2.empty()) { allocation_status[ba.block] = {"NOT_APPLICABLE", "fewer_than_three_units"}; continue; }
+            if (options.allocation_test) {
+                try {
+                    allocation[ba.block] = allocation_observability_test(lib, u1, u2, ba.block, in, rs);
+                } catch (const std::exception& e) {
+                    AllocationTestResult failed;
+                    failed.status = "INCONCLUSIVE";
+                    allocation[ba.block] = failed;
                 }
+                ++summary.allocation_blocks_tested;
             }
-            try {
-                allocation[ba.block] = allocation_observability_test(lib, u1, u2, ba.block, in, rs);
-            } catch (const std::exception& e) {
-                AllocationTestResult failed;
-                failed.status = "INCONCLUSIVE";
-                allocation[ba.block] = failed;
-            }
-            if (allocation[ba.block].status != "NOT_APPLICABLE") ++summary.allocation_blocks_tested;
+            if (repaired && r->allocation_tie > 1) allocation_status[ba.block] = {"UNRESOLVED", "tied_allocation_equivalence_set"};
+            else if (allocation.count(ba.block)) allocation_status[ba.block] = {allocation.at(ba.block).status, "observability_test"};
+            else allocation_status[ba.block] = {"NOT_TESTED", "test_not_run"};
         }
         summary.seconds_allocation = seconds_since(ta);
+    }
+    if (options.allocation_test) {
         std::ostringstream al;
         al << std::setprecision(17) << "block_id\tstatus\tcopies\tswitch_coordinate\treference_fnv64_1e9\tarrangement\tflank_order\tshape\t"
                                          "fragment_fnv64_1e9\tfragments_differing\texposure_delta\tlikelihood_delta\tidentical\n";
@@ -243,7 +256,8 @@ DosageShadowSummary run_dosage_shadow(const PreparedGenotypeModel& model, const 
          "repair_scope_reason\tcandidates_scored\ttop_set_size\torientation_tie\tallocation_tie\tcap_reached\t"
          "original_fragment_term\toriginal_exposure_term\toriginal_likelihood\toriginal_prior\toriginal_total\t"
          "repaired_fragment_term\trepaired_exposure_term\trepaired_likelihood\trepaired_prior\trepaired_prior_spellable\t"
-         "repair_separation\tconditional_repair_gap\toriginal_GQ\toriginal_gq_status\trepaired_GQ\tgq_status\n";
+         "repair_separation\tconditional_repair_gap\toriginal_GQ\toriginal_gq_status\trepaired_GQ\tgq_status\t"
+         "allocation_basis\tallocation_equivalence_size\tallocation_representative\n";
     for (const BlockAudit& ba : audit.blocks) {
         const std::map<std::string, std::string> g = bg.count(ba.block_id) ? bg.at(ba.block_id) : std::map<std::string, std::string>{};
         const RepairResult* r = repair_of.count(ba.block) ? &repairs[repair_of.at(ba.block)].second : nullptr;
@@ -251,7 +265,7 @@ DosageShadowSummary run_dosage_shadow(const PreparedGenotypeModel& model, const 
         ++summary.status_counts[dosage_status_name(ba.status)];
         if (ba.reason != "none") ++summary.reason_counts[ba.reason];
         o << ba.block_id << '\t' << census_route_name(ba.route) << '\t' << *span << '\t' << dosage_status_name(ba.status) << '\t' << ba.reason
-          << '\t' << (ba.route != CensusRoute::RepeatedUnit ? std::string("NOT_APPLICABLE") : allocation.count(ba.block) ? allocation.at(ba.block).status : std::string("NOT_RUN")) << '\t' << field(g, "genotype_support") << '\t'
+          << '\t' << allocation_status.at(ba.block).first << '\t' << field(g, "genotype_support") << '\t'
           << field(g, "filter") << '\t' << audit.alpha << '\t' << audit.m << '\t';
         if (audit.z_critical) o << *audit.z_critical; else o << "NA";
         o << '\t' << ba.features.size() << '\t' << ba.max_robust_z << '\t' << ba.reference_kmers << '\t' << ba.reference_hits << '\t'
@@ -281,7 +295,13 @@ DosageShadowSummary run_dosage_shadow(const PreparedGenotypeModel& model, const 
         }
         const bool repaired = ba.status == DosageStatus::Repaired;
         o << '\t' << field(g, "conditional_GQ") << '\t' << "conditional_uncalibrated" << '\t' << (repaired ? "NA" : field(g, "conditional_GQ"))
-          << '\t' << (repaired ? "UNAVAILABLE_REPAIRED" : "UNCHANGED_CONDITIONAL") << '\n';
+          << '\t' << (repaired ? "UNAVAILABLE_REPAIRED" : "UNCHANGED_CONDITIONAL") << '\t' << allocation_status.at(ba.block).second << '\t';
+        if (r && r->route == "repeated_unit" && c) {
+            o << r->allocation_tie << '\t' << (r->representative_only ? "REPRESENTATIVE_ONLY_NOT_RESOLVED" : "SINGLE_ARRANGEMENT_AT_PICK");
+        } else {
+            o << "NA\tNA";
+        }
+        o << '\n';
     }
     std::ostringstream cen;
     cen << "block_id\talleles\tmax_node_multiplicity\tmax_repeated_bp\tdosage_only_pairs\tcensus_route\tpooled_features\n";
@@ -302,7 +322,7 @@ DosageShadowSummary run_dosage_shadow(const PreparedGenotypeModel& model, const 
         for (const PanelSequence& t : templates) searched << "full_haplotype\tNA\t" << t.id << '\t' << sha256_hex(t.sequence) << '\t' << t.sequence.size() << '\n';
         std::ostringstream repaired_fa, original_fa, pv;
         pv << std::setprecision(17);
-        pv << "block_id\thomologue\trepaired_sha256\toriginal_sha256\tlevel\trank\tpanel_id\tpanel_sha256\traw_distance\t"
+        pv << "block_id\trepair_scope\thomologue\trepaired_sha256\toriginal_sha256\tlevel\trank\tpanel_id\tpanel_sha256\traw_distance\t"
               "alignment_columns\tnormalized_distance\tcigar\tpanel_size\tpanel_digest\tdetail\n";
         std::map<std::string, std::string> display;   // display id -> full id, for collision detection
         for (const auto& entry : repairs) {
@@ -328,13 +348,19 @@ DosageShadowSummary run_dosage_shadow(const PreparedGenotypeModel& model, const 
                 const std::string shown = rid.substr(0, 12);
                 if (!register_display_id(display, rid)) throw std::runtime_error("display_id_collision " + shown);
                 const std::string hom = h == 0 ? "hap1" : "hap2";
-                repaired_fa << '>' << rid << " display=" << shown << " block=" << block_id << " homologue=" << hom << " bp=" << full.size() << '\n';
+                repaired_fa << '>' << rid << " display=" << shown << " block=" << block_id << " homologue=" << hom << " bp=" << full.size()
+                            << " repair_scope=" << r.scope << " allocation_status=" << allocation_status.at(b).first;
+                if (r.representative_only) {
+                    repaired_fa << " allocation=REPRESENTATIVE_ONLY equivalence_set=" << out_prefix << ".dosage_allocation_equivalence.tsv#" << block_id
+                                << " equivalence_size=" << r.allocation_tie;
+                }
+                repaired_fa << '\n';
                 for (std::size_t at = 0; at < full.size(); at += 60) repaired_fa << full.substr(at, 60) << '\n';
                 original_fa << '>' << oid << " block=" << block_id << " homologue=" << hom << " bp=" << call.haplotypes[h].size() << '\n';
                 for (std::size_t at = 0; at < call.haplotypes[h].size(); at += 60) original_fa << call.haplotypes[h].substr(at, 60) << '\n';
                 const auto emit = [&](const char* level, const std::vector<NearestPanel>& near, std::size_t size, const std::string& digest) {
                     for (std::size_t k = 0; k < near.size(); ++k) {
-                        pv << block_id << '\t' << hom << '\t' << rid << '\t' << oid << '\t' << level << '\t' << k << '\t' << near[k].id << '\t'
+                        pv << block_id << '\t' << r.scope << '\t' << hom << '\t' << rid << '\t' << oid << '\t' << level << '\t' << k << '\t' << near[k].id << '\t'
                            << near[k].sha256 << '\t' << near[k].distance << '\t' << near[k].alignment_columns << '\t' << near[k].normalized << '\t'
                            << near[k].cigar << '\t' << size << '\t' << digest << "\tnearest\n";
                     }
@@ -349,12 +375,12 @@ DosageShadowSummary run_dosage_shadow(const PreparedGenotypeModel& model, const 
                         for (const auto& cr : u.carriers) {
                             carriers += (carriers.empty() ? "" : ";") + std::to_string(cr[0]) + ":" + std::to_string(cr[1]) + "/" + std::to_string(cr[2]);
                         }
-                        pv << block_id << '\t' << hom << '\t' << rid << '\t' << oid << "\tunit\t" << k << '\t' << u.id << '\t' << sha256_hex(u.sequence)
+                        pv << block_id << '\t' << r.scope << '\t' << hom << '\t' << rid << '\t' << oid << "\tunit\t" << k << '\t' << u.id << '\t' << sha256_hex(u.sequence)
                            << "\tNA\tNA\tNA\tNA\t" << lib->units.size() << "\tNA\tstate=" << u.state << ",carriers(allele:position/units)=" << carriers << '\n';
                     }
                 } else {
                     const std::string& aid = h == 0 ? c.ctx1_id : c.ctx2_id;
-                    pv << block_id << '\t' << hom << '\t' << rid << '\t' << oid << "\tsource_allele\t0\t" << aid << '\t'
+                    pv << block_id << '\t' << r.scope << '\t' << hom << '\t' << rid << '\t' << oid << "\tsource_allele\t0\t" << aid << '\t'
                        << sha256_hex(block.alleles.at(std::stoul(aid)).sequence) << "\tNA\tNA\tNA\tNA\t" << alleles.size() << '\t'
                        << allele_digest << "\tpanel_pair\n";
                 }
@@ -383,6 +409,39 @@ DosageShadowSummary run_dosage_shadow(const PreparedGenotypeModel& model, const 
         atomic_write(out_prefix + ".dosage_feature_copies.tsv", fc.str());
     }
     atomic_write(out_prefix + ".dosage_blocks.tsv", o.str());
+    if (options.repair) {
+        // every distinct unordered genotype of each repair's allocation-equivalence set; the representative only
+        // serialises the set (smallest canonical SHA-256 pair) and is not a resolved allocation
+        std::ostringstream eq;
+        eq << std::setprecision(17) << "block_id\trepair_scope\tequivalence_size\tmember\tcanonical_sha256_a\tcanonical_sha256_b\t"
+                                         "units_a\tunits_b\tstates\tpanel_log_prior\tlikelihood\tserialization_representative\n";
+        for (const auto& entry : repairs) {
+            const RepairResult& r = entry.second;
+            if (r.route != "repeated_unit" || r.outcome != "REPAIRED") continue;
+            std::vector<const BlockCandidate*> members;
+            std::set<std::pair<std::string, std::string>> seen;
+            for (const BlockCandidate& c : r.candidates) {
+                if (!c.allocation_tied) continue;
+                const auto key = c.ctx1_id <= c.ctx2_id ? std::make_pair(c.ctx1_id, c.ctx2_id) : std::make_pair(c.ctx2_id, c.ctx1_id);
+                if (seen.insert(key).second) members.push_back(&c);
+            }
+            std::sort(members.begin(), members.end(), [](const BlockCandidate* a, const BlockCandidate* b) {
+                const auto ka = std::minmax(a->ctx1_id, a->ctx2_id), kb = std::minmax(b->ctx1_id, b->ctx2_id);
+                return ka < kb;
+            });
+            for (std::size_t i = 0; i < members.size(); ++i) {
+                const BlockCandidate& c = *members[i];
+                const auto key = std::minmax(c.ctx1_id, c.ctx2_id);
+                std::string ua, ub;
+                for (std::size_t u : c.units_a) ua += (ua.empty() ? "" : "-") + std::to_string(u);
+                for (std::size_t u : c.units_b) ub += (ub.empty() ? "" : "-") + std::to_string(u);
+                eq << entry.first << '\t' << r.scope << '\t' << members.size() << '\t' << i << '\t' << key.first << '\t' << key.second << '\t'
+                   << ua << '\t' << ub << '\t' << c.states << '\t' << c.panel_log_prior << '\t' << c.likelihood << '\t'
+                   << (c.chosen ? (r.representative_only ? "REPRESENTATIVE_ONLY_NOT_RESOLVED" : "SINGLE_ARRANGEMENT_AT_PICK") : "member") << '\n';
+            }
+        }
+        atomic_write(out_prefix + ".dosage_allocation_equivalence.tsv", eq.str());
+    }
     if (options.repair) {
         atomic_write(out_prefix + ".dosage_repairs.tsv", repair_blocks_table(repairs));
         atomic_write(out_prefix + ".dosage_repair_candidates.tsv", repair_candidates_table(repairs));
