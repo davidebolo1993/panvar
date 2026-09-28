@@ -755,3 +755,34 @@ unaffected:
 - **Threads:** 1/2/4/8-thread identity of every file.
 - **Downstream:** a schema gate over the new trailing columns.
 - **Evaluation:** the frozen evaluator scores `original_*` and the repaired outputs separately.
+
+## 21. Split completeness (Sol, 2026-09-28; normative)
+
+The single repair scope is replaced by four fields on every repair, each in every table and repaired FASTA header.
+
+**The scopes:**
+- **`dosage_content_scope`.** COMPLETE when exhaustive counting over the full declared unit library proves that every
+  dosage-admissible candidate has the same total unit count, I-state count and dosage-feature copy vector. The pair
+  route is always COMPLETE (every admissible pair is scored). This is completeness within the declared model and the
+  bootstrap-derived admissible sets. It is not a guarantee of truth.
+- **`diplotype_scope`.** COMPLETE when every admissible exact spelled diplotype was constructed and exactly scored:
+  the pair route. Otherwise CONDITIONAL, with the §8 reasons.
+- **`allocation_equivalence_scope`.** COMPLETE only when the listed equivalence set covers the complete candidate
+  universe. NOT_APPLICABLE on the pair route.
+- **`serialization_representative`.** True when the written arrangement only serialises a set that is not resolved.
+
+**Repair classes:**
+- **COMPLETE_DIPLOTYPE_REPAIR:** content and diplotype COMPLETE. `dosage_status` REPAIRED; alleles role RESOLVED.
+- **CONDITIONAL_DOSAGE_CONTENT:** content COMPLETE, diplotype CONDITIONAL. `dosage_status` CONTENT_REPAIRED.
+  - The original block genotype is kept, and `corrected_content` is authoritative within the model.
+  - The chosen candidate is emitted only as `REPRESENTATIVE_ONLY_NOT_RESOLVED`, in FASTA whose headers link to the
+    scored equivalence set and state the conditional scopes.
+  - No ordinary repaired GQ; `repair_separation` and `conditional_repair_gap` are kept as diagnostics.
+- **TRIGGERED_UNREPAIRED:** every refusal, and a repair whose content is itself CONDITIONAL (reason
+  `dosage_content_conditional`). The original genotype is kept, every admissible content vector is listed, and no
+  correction is claimed.
+
+**Replay** (accelerated scorer, all 54 AUTO blocks, binary `0003050`, `cpp_shadow/repairs_accel`, sealed 28e1212a):
+- 4 COMPLETE_DIPLOTYPE_REPAIR (pair route, HG03456 sv:1);
+- 48 CONDITIONAL_DOSAGE_CONTENT;
+- 2 TRIGGERED_UNREPAIRED (fresh HG01352.2 and NA20847.2, content-conditional).
