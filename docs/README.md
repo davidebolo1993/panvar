@@ -22,5 +22,6 @@ Documentation for the `panvar` CLI.
 6. [modules/describe.md](modules/describe.md) — per-bubble variant, k-mer and node/edge features.
 7. [modules/associate.md](modules/associate.md) — association testing on the `describe` features.
 
+- [modules/genotype.md](modules/genotype.md) — structural-locus diplotype genotyping from short reads (adaptive completion; optional dosage audit/repair).
 - [modules/inspect.md](modules/inspect.md) — clustering, path FASTA, and node/edge matrices for a called bubble.
 - [modules/benchmark.md](modules/benchmark.md) — truth-event discovery, carrier assignment, and sequence reconstruction from caller output.

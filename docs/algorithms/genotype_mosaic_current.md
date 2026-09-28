@@ -4,6 +4,17 @@ The first document to read. `genotype_mosaic.md` is the contract; `genotype_mosa
 archive of how we got here and is consulted only when a specific round's reasoning is needed. This file
 carries only what is true now.
 
+## C4 short-read freeze (26401b4, 2026-09-28)
+
+Sol accepted the C4 short-read scientific freeze at `26401b4`. The freeze manifest is at
+`tests/results/c4_freeze_26401b4/FREEZE_MANIFEST.md`.
+
+**Where things are:**
+- **The frozen invocation:** profile `genotype_c4_v6_campaign_local.tsv` with `--dosage-mode repair`.
+- **The dosage stage:** `genotype_dosage.md` §20–23.
+- **User-facing facts:** `../modules/genotype.md`.
+- **The planned command and presets (design only):** `genotype_cli.md`.
+
 ## Model and output contract
 
 The locus is a chain of blocks alternating SV bubbles (>= 50 bp) with context blocks. A panel template is
