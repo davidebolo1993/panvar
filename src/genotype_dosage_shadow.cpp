@@ -109,7 +109,8 @@ DosageShadowSummary run_dosage_shadow(const PreparedGenotypeModel& model, const 
           << "dosage_repair\t" << (options.repair ? "on" : "off") << '\n'
           << "dosage_repairs\t" << summary.repairs << '\n'
           << "dosage_repairs_conditional\t" << summary.repairs_conditional << '\n'
-          << "dosage_allocation_test\toff\n";
+          << "dosage_allocation_test\t" << (options.allocation_test ? "on" : "off") << '\n'
+          << "dosage_allocation_blocks_tested\t" << summary.allocation_blocks_tested << '\n';
         for (const auto& [k, v] : summary.status_counts) o << "dosage_status_" << k << '\t' << v << '\n';
         for (const auto& [k, v] : summary.reason_counts) o << "dosage_reason_" << k << '\t' << v << '\n';
         summary.seconds_total = seconds_since(started);
@@ -118,6 +119,7 @@ DosageShadowSummary run_dosage_shadow(const PreparedGenotypeModel& model, const 
           << "seconds_dosage_estimate\t" << summary.seconds_estimate << '\n'
           << "seconds_dosage_repair\t" << summary.seconds_repair << '\n'
           << "seconds_dosage_provenance\t" << summary.seconds_provenance << '\n'
+          << "seconds_dosage_allocation\t" << summary.seconds_allocation << '\n'
           << "seconds_dosage_total\t" << summary.seconds_total << '\n';
         atomic_write(out_prefix + ".dosage_status.tsv", o.str());
     };
@@ -175,6 +177,54 @@ DosageShadowSummary run_dosage_shadow(const PreparedGenotypeModel& model, const 
         summary.seconds_repair = seconds_since(t);
     }
 
+    // allocation observability (spec section 8.3): shadow-only, off unless requested
+    std::map<std::size_t, AllocationTestResult> allocation;
+    if (options.allocation_test) {
+        const auto ta = std::chrono::steady_clock::now();
+        ScoringInputs in;
+        in.model = &model; in.first = persisted->first; in.second = persisted->second; in.call = &call; in.reads = &reads;
+        in.library = &library; in.options = scoring; in.options.threads = options.threads; in.switch_probability = switch_probability;
+        in.persisted = persisted->score;
+        RepairSettings rs;
+        rs.chunk_haplotypes = options.chunk_haplotypes;
+        for (const BlockAudit& ba : audit.blocks) {
+            if (ba.route != CensusRoute::RepeatedUnit) continue;
+            const UnitLibrary lib = build_unit_library(model.blocks()[ba.block], nodes, rs);
+            std::vector<std::size_t> u1 = lib.panel.at(ba.call_alleles[0]), u2 = lib.panel.at(ba.call_alleles[1]);
+            if (repair_of.count(ba.block)) {
+                const RepairResult& r = repairs[repair_of.at(ba.block)].second;
+                if (r.outcome == "REPAIRED" && r.chosen >= 0) {
+                    u1 = r.candidates[static_cast<std::size_t>(r.chosen)].units_a;
+                    u2 = r.candidates[static_cast<std::size_t>(r.chosen)].units_b;
+                }
+            }
+            try {
+                allocation[ba.block] = allocation_observability_test(lib, u1, u2, ba.block, in, rs);
+            } catch (const std::exception& e) {
+                AllocationTestResult failed;
+                failed.status = "INCONCLUSIVE";
+                allocation[ba.block] = failed;
+            }
+            if (allocation[ba.block].status != "NOT_APPLICABLE") ++summary.allocation_blocks_tested;
+        }
+        summary.seconds_allocation = seconds_since(ta);
+        std::ostringstream al;
+        al << std::setprecision(17) << "block_id\tstatus\tcopies\tswitch_coordinate\treference_fnv64_1e9\tarrangement\tflank_order\tshape\t"
+                                         "fragment_fnv64_1e9\tfragments_differing\texposure_delta\tlikelihood_delta\tidentical\n";
+        for (const auto& [b, a] : allocation) {
+            if (a.rows.empty()) {
+                al << model.blocks()[b].block_id << '\t' << a.status << '\t' << a.copies << '\t' << a.switch_coordinate << "\tNA\tNA\tNA\tNA\tNA\tNA\tNA\tNA\tNA\n";
+            }
+            for (const AllocationRow& r : a.rows) {
+                al << model.blocks()[b].block_id << '\t' << a.status << '\t' << a.copies << '\t' << a.switch_coordinate << '\t' << std::hex
+                   << a.reference_fnv64_1e9 << '\t' << std::dec << r.arrangement << '\t' << r.flank_order << '\t' << r.shape << '\t' << std::hex
+                   << r.fragment_fnv64_1e9 << std::dec << '\t' << r.fragments_differing << '\t' << r.exposure_delta << '\t' << r.likelihood_delta
+                   << '\t' << (r.identical ? "true" : "false") << '\n';
+            }
+        }
+        atomic_write(out_prefix + ".dosage_allocation.tsv", al.str());
+    }
+
     // the dosage block table: separate fields, never collapsed (spec section 11)
     const auto bg = read_block_genotypes(run_prefix + ".block_genotypes.tsv");
     std::ostringstream o;
@@ -193,7 +243,7 @@ DosageShadowSummary run_dosage_shadow(const PreparedGenotypeModel& model, const 
         ++summary.status_counts[dosage_status_name(ba.status)];
         if (ba.reason != "none") ++summary.reason_counts[ba.reason];
         o << ba.block_id << '\t' << census_route_name(ba.route) << '\t' << *span << '\t' << dosage_status_name(ba.status) << '\t' << ba.reason
-          << '\t' << (ba.route == CensusRoute::RepeatedUnit ? "NOT_RUN" : "NOT_APPLICABLE") << '\t' << field(g, "genotype_support") << '\t'
+          << '\t' << (ba.route != CensusRoute::RepeatedUnit ? std::string("NOT_APPLICABLE") : allocation.count(ba.block) ? allocation.at(ba.block).status : std::string("NOT_RUN")) << '\t' << field(g, "genotype_support") << '\t'
           << field(g, "filter") << '\t' << audit.alpha << '\t' << audit.m << '\t';
         if (audit.z_critical) o << *audit.z_critical; else o << "NA";
         o << '\t' << ba.features.size() << '\t' << ba.max_robust_z << '\t' << ba.reference_kmers << '\t' << ba.reference_hits << '\t'

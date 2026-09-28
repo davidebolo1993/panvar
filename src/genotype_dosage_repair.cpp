@@ -4,6 +4,7 @@
 #include "panvar/ls_hmm.hpp"
 
 #include <algorithm>
+#include <cstring>
 #include <chrono>
 #include <cmath>
 #include <iomanip>
@@ -286,10 +287,16 @@ std::string splice(const ReportedCall& call, int h, std::size_t block, const std
 // before any candidate score is used (GuardFailure). A resource cap halves the chunk, down to 8 haplotypes.
 std::vector<ExactScore> score_block_candidates(const ScoringInputs& in, std::size_t block,
                                                const std::vector<std::pair<std::string, std::string>>& ctx,
-                                               const RepairSettings& rs, ExactScore& original) {
+                                               const RepairSettings& rs, ExactScore& original,
+                                               std::vector<std::vector<long long>>* grids = nullptr) {
     const ReportedCall& call = *in.call;
     const double winner_prior = log_unordered_sequence_pair_prior(*in.model, call.haplotypes[0], call.haplotypes[1], in.switch_probability);
     std::vector<ExactScore> out(ctx.size());
+    std::vector<double> backgrounds;
+    if (grids != nullptr) {
+        grids->assign(ctx.size(), {});
+        for (const ReadPair& f : *in.reads) backgrounds.push_back(log_background_probability(f));
+    }
     std::size_t chunk_cap = rs.chunk_haplotypes;
     std::size_t next = 0;
     bool guarded = false;
@@ -342,6 +349,16 @@ std::vector<ExactScore> score_block_candidates(const ScoringInputs& in, std::siz
         for (std::size_t k = next; k < end; ++k) {
             const DiplotypeScore& s = scored.scores[k - next];
             out[k] = {s.fragment_term, s.exposure_term, s.log_likelihood};
+            if (grids != nullptr) {
+                // per-fragment diploid contributions on a 1e-9-nat grid (the prototype's fragment_vector_fnv64_1e-9)
+                const HaplotypeCandidate& c = candidates[k - next];
+                std::vector<long long>& g = (*grids)[k];
+                g.resize(in.reads->size());
+                for (std::size_t f = 0; f < in.reads->size(); ++f) {
+                    const double m = log_add_exp(scored.mass_of(f, c.first), scored.mass_of(f, c.second));
+                    g[f] = std::llround(log_fragment_contribution(m, backgrounds[f], *in.library) * 1e9);
+                }
+            }
         }
         next = end;
     }
@@ -860,6 +877,148 @@ RepairResult repair_block(const BlockAudit& audit, const CensusBlock& census, co
     }
 
     choose_repair(res, census.route, rs.tie_tolerance_nats);
+    return res;
+}
+
+// ---------------------------------------------------------------------------------------------- allocation test
+
+AllocationTestResult allocation_observability_test(const UnitLibrary& lib, const std::vector<std::size_t>& hap1_units,
+                                                   const std::vector<std::size_t>& hap2_units, std::size_t block,
+                                                   const ScoringInputs& in, const RepairSettings& rs) {
+    const auto started = std::chrono::steady_clock::now();
+    AllocationTestResult res;
+    struct Copy { std::string seq; bool terminal; };
+    std::vector<Copy> copies;
+    for (const auto* h : {&hap1_units, &hap2_units}) {
+        for (std::size_t i = 0; i < h->size(); ++i) copies.push_back({lib.units.at((*h)[i]).sequence, i + 1 == h->size()});
+    }
+    res.copies = copies.size();
+    if (copies.size() < 3 || hap1_units.empty() || hap2_units.empty()) { res.seconds = seconds_since(started); return res; }
+    const std::size_t la = hap1_units.size(), M = copies.size();
+    std::vector<std::size_t> A0, A1;
+    for (std::size_t i = 0; i < M; ++i) (i < la ? A0 : A1).push_back(i);
+    // the anchor: the unit bases inside the left anchor trim
+    const long lock = static_cast<long>(lib.trim_left) - static_cast<long>(lib.flank_left.size());
+    std::string anchor;
+    for (const Unit& u : lib.units) if (u.anchor_compatible) { anchor = u.sequence.substr(0, static_cast<std::size_t>(std::max(0L, lock))); break; }
+    // a common switch window: 2 x 600 bp of copy 0, centred at 250..20000 step 25, occurring exactly once in every copy
+    const std::size_t FL = 600;
+    std::vector<std::size_t> offs;
+    {
+        const std::string& ref = copies[0].seq;
+        const std::size_t hi = std::min<std::size_t>(20000, ref.size() > FL ? ref.size() - FL : 0);
+        for (std::size_t p = std::max<std::size_t>(250, FL); p < hi; p += 25) {
+            const std::string w = ref.substr(p - FL, 2 * FL);
+            std::vector<std::size_t> o;
+            for (const Copy& c : copies) {
+                const std::size_t i = c.seq.find(w);
+                if (i == std::string::npos || c.seq.find(w, i + 1) != std::string::npos) break;
+                o.push_back(i + FL);
+            }
+            if (o.size() == M) { offs = std::move(o); break; }
+        }
+    }
+    if (offs.empty()) { res.status = "INCONCLUSIVE"; res.seconds = seconds_since(started); return res; }
+    res.switch_coordinate = static_cast<long>(offs[0]);
+    std::vector<std::string> start(M), body(M);
+    for (std::size_t i = 0; i < M; ++i) { start[i] = copies[i].seq.substr(0, offs[i]); body[i] = copies[i].seq.substr(offs[i]); }
+    std::map<std::size_t, std::string> nxt;
+    const std::array<std::string, 2> flank_starts = {start[A0.front()], start[A1.front()]};
+    for (const auto* h : {&A0, &A1}) for (std::size_t j = 0; j + 1 < h->size(); ++j) nxt[(*h)[j]] = start[(*h)[j + 1]];
+    // alternative allocations: the construction rules (one terminal copy last per homologue, <= KMAX per homologue,
+    // anchor-compatible first copies), deduplicated by sequence, in the prototype's enumeration order
+    std::vector<std::size_t> terms, ints;
+    for (std::size_t i = 0; i < M; ++i) (copies[i].terminal ? terms : ints).push_back(i);
+    if (terms.size() != 2) throw std::runtime_error("allocation test: a genotype needs exactly two terminal copies");
+    std::vector<std::pair<std::vector<std::size_t>, std::vector<std::size_t>>> arrangements;
+    std::set<std::pair<std::vector<std::string>, std::vector<std::string>>> seen;
+    for (const auto& [ta, tb] : {std::make_pair(terms[0], terms[1]), std::make_pair(terms[1], terms[0])}) {
+        for (std::size_t mask = 0; mask < (std::size_t{1} << ints.size()); ++mask) {
+            std::vector<std::size_t> A, Bm;
+            for (std::size_t i = 0; i < ints.size(); ++i) ((mask >> i) & 1 ? A : Bm).push_back(ints[i]);
+            if (A.size() + 1 > lib.kmax || Bm.size() + 1 > lib.kmax) continue;
+            std::vector<std::size_t> oa = A;
+            do {
+                std::vector<std::size_t> ob = Bm;
+                do {
+                    std::vector<std::size_t> ha = oa, hb = ob;
+                    ha.push_back(ta); hb.push_back(tb);
+                    if (copies[ha[0]].seq.compare(0, anchor.size(), anchor) != 0 || copies[hb[0]].seq.compare(0, anchor.size(), anchor) != 0) continue;
+                    std::pair<std::vector<std::string>, std::vector<std::string>> key;
+                    for (std::size_t i : ha) key.first.push_back(copies[i].seq);
+                    for (std::size_t i : hb) key.second.push_back(copies[i].seq);
+                    if (!seen.insert(key).second) continue;
+                    arrangements.push_back({ha, hb});
+                } while (std::next_permutation(ob.begin(), ob.end()));
+            } while (std::next_permutation(oa.begin(), oa.end()));
+        }
+    }
+    const auto block_of = [&](const std::vector<std::string>& seqs) {
+        std::string s = lib.flank_left;
+        for (const std::string& x : seqs) s += x;
+        s += lib.flank_right;
+        return s.substr(lib.trim_left, s.size() - lib.trim_left - lib.trim_right);
+    };
+    std::vector<std::pair<std::string, std::string>> ctx;
+    {
+        std::vector<std::string> a, b;
+        for (std::size_t i : A0) a.push_back(copies[i].seq);
+        for (std::size_t i : A1) b.push_back(copies[i].seq);
+        ctx.push_back({block_of(a), block_of(b)});
+    }
+    const auto keyA = A0 <= A1 ? std::make_pair(A0, A1) : std::make_pair(A1, A0);
+    for (const auto& ap : arrangements) {
+        const auto k = ap.first <= ap.second ? std::make_pair(ap.first, ap.second) : std::make_pair(ap.second, ap.first);
+        if (k == keyA) continue;
+        for (int fo = 0; fo < 2; ++fo) {
+            std::array<std::vector<std::string>, 2> homs;
+            const std::array<const std::vector<std::size_t>*, 2> hh = {&ap.first, &ap.second};
+            for (int hi = 0; hi < 2; ++hi) {
+                const std::vector<std::size_t>& h = *hh[static_cast<std::size_t>(hi)];
+                for (std::size_t j = 0; j < h.size(); ++j) {
+                    const std::string& st = j == 0 ? flank_starts[static_cast<std::size_t>((hi + fo) % 2)] : nxt.at(h[j - 1]);
+                    homs[static_cast<std::size_t>(hi)].push_back(st + body[h[j]]);
+                }
+            }
+            ctx.push_back({block_of(homs[0]), block_of(homs[1])});
+            AllocationRow row;
+            std::string arr;
+            for (std::size_t i = 0; i < ap.first.size(); ++i) arr += (i ? "-" : "") + std::to_string(ap.first[i]);
+            arr += "|";
+            for (std::size_t i = 0; i < ap.second.size(); ++i) arr += (i ? "-" : "") + std::to_string(ap.second[i]);
+            row.arrangement = arr;
+            row.flank_order = fo;
+            row.shape = std::to_string(ap.first.size()) + "+" + std::to_string(ap.second.size());
+            res.rows.push_back(row);
+        }
+    }
+    ExactScore original;
+    std::vector<std::vector<long long>> grids;
+    const std::vector<ExactScore> scores = score_block_candidates(in, block, ctx, rs, original, &grids);
+    const auto fnv = [](const std::vector<long long>& g) {
+        std::uint64_t h = 1469598103934665603ULL;
+        for (long long q : g) {
+            unsigned char b[sizeof(long long)];
+            std::memcpy(b, &q, sizeof(long long));
+            for (unsigned char x : b) { h ^= x; h *= 1099511628211ULL; }
+        }
+        return h;
+    };
+    res.reference_fnv64_1e9 = fnv(grids[0]);
+    res.reference_likelihood = scores[0].likelihood;
+    bool any = false;
+    for (std::size_t r = 0; r < res.rows.size(); ++r) {
+        AllocationRow& row = res.rows[r];
+        const std::vector<long long>& g = grids[r + 1];
+        row.fragment_fnv64_1e9 = fnv(g);
+        for (std::size_t f = 0; f < g.size(); ++f) row.fragments_differing += g[f] != grids[0][f];
+        row.exposure_delta = scores[r + 1].exposure - scores[0].exposure;
+        row.likelihood_delta = scores[r + 1].likelihood - scores[0].likelihood;
+        row.identical = row.fragments_differing == 0 && std::fabs(row.exposure_delta) <= 1e-9;
+        any |= row.identical;
+    }
+    res.status = any ? "UNRESOLVED" : "RESOLVED";
+    res.seconds = seconds_since(started);
     return res;
 }
 

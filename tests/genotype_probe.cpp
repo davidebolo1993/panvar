@@ -5946,9 +5946,48 @@ int dosage_replay(const Args& args) {
         scoring.emission_cache_bytes = static_cast<std::size_t>(std::stoull(status.at("emission_cache_bytes")));
     }
     const std::vector<double> switches(model.blocks().size() - 1, std::stod(args.get("switch-probability", "0.01")));
+    if (!args.get("allocation-units", "").empty()) {
+        // the allocation test on explicit unit tuples "<hap1 units>|<hap2 units>" (ids '-'-joined), for the replay of the
+        // prototype's sealed candidates
+        const std::optional<panvar::dosage::PersistedCall> pc = panvar::dosage::read_persisted_call(run);
+        if (!pc) throw std::runtime_error("no persisted call");
+        const panvar::dosage::ReportedCall call = panvar::dosage::reported_call(model, pc->first, pc->second);
+        std::size_t b = model.blocks().size();
+        for (std::size_t i = 0; i < model.blocks().size(); ++i) if (model.blocks()[i].block_id == args.required("allocation-block")) b = i;
+        if (b == model.blocks().size()) throw std::runtime_error("no block " + args.required("allocation-block"));
+        const std::string spec = args.required("allocation-units");
+        const auto parse_units = [](const std::string& x) {
+            std::vector<std::size_t> u;
+            std::stringstream ss(x);
+            for (std::string t; std::getline(ss, t, '-');) u.push_back(std::stoul(t));
+            return u;
+        };
+        const std::size_t bar = spec.find('|');
+        panvar::dosage::ScoringInputs in;
+        in.model = &model; in.first = pc->first; in.second = pc->second; in.call = &call; in.reads = &reads; in.library = &library;
+        in.options = scoring; in.options.threads = std::stoul(args.get("threads", "8")); in.switch_probability = switches; in.persisted = pc->score;
+        panvar::dosage::RepairSettings rs;
+        const panvar::dosage::UnitLibrary lib = panvar::dosage::build_unit_library(model.blocks()[b], loaded.sorted.gfa.seq, rs);
+        const panvar::dosage::AllocationTestResult a =
+            panvar::dosage::allocation_observability_test(lib, parse_units(spec.substr(0, bar)), parse_units(spec.substr(bar + 1)), b, in, rs);
+        std::size_t identical = 0;
+        std::set<std::string> shapes;
+        for (const auto& r : a.rows) if (r.identical) { ++identical; shapes.insert(r.shape); }
+        std::ostringstream o;
+        o << std::setprecision(17) << "units\tstatus\tcopies\tswitch_coordinate\treference_likelihood\ttranspositions\tidentical\tidentical_shapes\tseconds\n"
+          << spec << '\t' << a.status << '\t' << a.copies << '\t' << a.switch_coordinate << '\t' << a.reference_likelihood << '\t' << a.rows.size()
+          << '\t' << identical << '\t';
+        std::string sh;
+        for (const std::string& x : shapes) sh += (sh.empty() ? "" : ",") + x;
+        o << (sh.empty() ? "-" : sh) << '\t' << a.seconds << '\n';
+        atomic_write(out + ".allocation_units.tsv", o.str());
+        std::cout << o.str();
+        return 0;
+    }
     panvar::dosage::DosageShadowOptions options;
     options.repair = args.get("repair", "0") != "0";
     options.provenance = args.get("provenance", "1") != "0";
+    options.allocation_test = args.get("allocation-test", "0") != "0";
     options.threads = std::stoul(args.get("threads", "8"));
     options.chunk_haplotypes = std::stoul(args.get("chunk-haplotypes", "128"));
     const panvar::dosage::DosageShadowSummary s =

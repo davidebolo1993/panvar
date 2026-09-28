@@ -156,6 +156,35 @@ bool register_display_id(std::map<std::string, std::string>& shown, const std::s
 // SHA-256 of the sorted (id, sequence SHA-256) list: what was searched, independent of its order.
 std::string panel_digest(const std::vector<PanelSequence>& panel);
 
+// ---------------------------------------------------------------------------------------------- allocation test
+
+// Truth-free allocation observability (spec section 8.3; prototype sv7_selfreview/alloc_test.py): every alternative
+// allocation of the reported unit copies is rebuilt as a junction-preserving transposition and scored exactly; an
+// identical per-fragment contribution vector (1e-9-nat grid) and exposure (1e-9) means no fragment separates the two
+// allocations. An identifiability annotation only: it never changes a call or triggers repair.
+struct AllocationRow {
+    std::string arrangement;     // "<hap1 copy indices>|<hap2 copy indices>"
+    int flank_order = 0;
+    std::string shape;
+    std::uint64_t fragment_fnv64_1e9 = 0;
+    std::size_t fragments_differing = 0;
+    double exposure_delta = 0.0;
+    double likelihood_delta = 0.0;
+    bool identical = false;
+};
+struct AllocationTestResult {
+    std::string status = "NOT_APPLICABLE";   // RESOLVED, UNRESOLVED, INCONCLUSIVE, NOT_APPLICABLE
+    long switch_coordinate = -1;
+    std::size_t copies = 0;
+    std::uint64_t reference_fnv64_1e9 = 0;
+    double reference_likelihood = 0.0;
+    std::vector<AllocationRow> rows;
+    double seconds = 0.0;
+};
+AllocationTestResult allocation_observability_test(const UnitLibrary& lib, const std::vector<std::size_t>& hap1_units,
+                                                   const std::vector<std::size_t>& hap2_units, std::size_t block,
+                                                   const ScoringInputs& scoring, const RepairSettings& settings);
+
 // ---------------------------------------------------------------------------------------------- shadow audit
 
 // The call a finished run reports: the equivalence set's rank-1 representative, with its persisted scores.
@@ -170,6 +199,7 @@ std::optional<PersistedCall> read_persisted_call(const std::string& run_prefix);
 struct DosageShadowOptions {
     bool repair = true;
     bool provenance = true;
+    bool allocation_test = false;   // shadow-only, off until its measured cost is reviewed
     std::size_t threads = 1;
     std::size_t chunk_haplotypes = 128;
 };
@@ -177,9 +207,9 @@ struct DosageShadowOptions {
 struct DosageShadowSummary {
     std::string audit_status = "COMPLETE";   // COMPLETE, NOT_RUN (no persisted call), REFUSED_LIBRARY
     std::string note;
-    std::size_t molecule_span_bp = 0, m = 0, sensitive_blocks = 0, repairs = 0, repairs_conditional = 0;
+    std::size_t molecule_span_bp = 0, m = 0, sensitive_blocks = 0, repairs = 0, repairs_conditional = 0, allocation_blocks_tested = 0;
     std::map<std::string, std::size_t> status_counts, reason_counts;
-    double seconds_census = 0.0, seconds_features = 0.0, seconds_estimate = 0.0, seconds_repair = 0.0, seconds_provenance = 0.0,
+    double seconds_census = 0.0, seconds_features = 0.0, seconds_estimate = 0.0, seconds_repair = 0.0, seconds_provenance = 0.0, seconds_allocation = 0.0,
            seconds_total = 0.0;
 };
 

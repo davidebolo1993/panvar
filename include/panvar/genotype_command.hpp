@@ -229,6 +229,8 @@ struct GenotypeCommandOptions {
     // every existing output is committed and writes only <prefix>.dosage_*.tsv; it never changes a call, a score,
     // a status value or an existing file. Last, so positional fixtures stay aligned.
     std::string dosage_audit = "off";
+    // SHADOW ONLY: the allocation observability test inside the shadow audit (off until its cost is reviewed).
+    bool dosage_allocation_test = false;
 };
 
 // What the shadow dosage audit needs from a run, captured only when it is requested.

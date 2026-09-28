@@ -4277,6 +4277,7 @@ int run_genotype_command(const std::vector<std::string>& args) {
             throw std::runtime_error("--max-candidates is now --max-mosaic-candidates: every panel diplotype is "
                                      "always a candidate, and K counts only the off-panel mosaics added to it");
         }
+        else if (flag == "--dosage-allocation-test") options.dosage_allocation_test = true;
         else if (flag == "--dosage-audit") {
             options.dosage_audit = need(i);
             if (options.dosage_audit != "off" && options.dosage_audit != "shadow") {
@@ -4375,6 +4376,7 @@ int run_genotype_command(const std::vector<std::string>& args) {
                 const std::vector<double> switches(capture.model->blocks().size() - 1, options.switch_probability);
                 dosage::DosageShadowOptions shadow_options;
                 shadow_options.threads = options.threads;
+                shadow_options.allocation_test = options.dosage_allocation_test;
                 dosage::run_dosage_shadow(*capture.model, capture.node_sequences, fragments, library, scoring, switches,
                                           options.out_prefix, options.out_prefix, shadow_options);
             }
