@@ -233,6 +233,12 @@ if(PANVAR_BUILD_TESTING)
         # Mathematical foundation of the replacement mosaic genotyper. This is a direct C++ test so
         # model code is certified before a CLI exists: immutable block preparation, strict mosaic
         # spelling, fragment-specific insert normalization, and exact Li-Stephens marginalization.
+        # Dosage audit and repair fixtures (docs/algorithms/genotype_dosage.md section 14).
+        add_executable(genotype_dosage_test tests/genotype_dosage.cpp src/cli_utils.cpp)
+        target_link_libraries(genotype_dosage_test PRIVATE panvarlib)
+        target_compile_options(genotype_dosage_test PRIVATE -Wall -Wextra -Wpedantic)
+        add_test(NAME panvar_genotype_dosage COMMAND genotype_dosage_test)
+
         add_executable(genotype_mosaic_core_test tests/genotype_mosaic_core.cpp)
         target_link_libraries(genotype_mosaic_core_test PRIVATE panvarlib)
         target_compile_options(genotype_mosaic_core_test PRIVATE -Wall -Wextra -Wpedantic)

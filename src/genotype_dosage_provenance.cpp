@@ -23,6 +23,14 @@ long edit_distance_bounded(const std::string& q, const std::string& t, long boun
 
 } // namespace
 
+bool register_display_id(std::map<std::string, std::string>& shown, const std::string& full_id, std::size_t length) {
+    const std::string d = full_id.substr(0, length);
+    const auto it = shown.find(d);
+    if (it != shown.end()) return it->second == full_id;
+    shown[d] = full_id;
+    return true;
+}
+
 std::string panel_digest(const std::vector<PanelSequence>& panel) {
     std::vector<std::pair<std::string, std::string>> rows;
     for (const PanelSequence& p : panel) rows.push_back({p.id, sha256_hex(p.sequence)});

@@ -264,8 +264,7 @@ DosageShadowSummary run_dosage_shadow(const PreparedGenotypeModel& model, const 
                 if (full == call.haplotypes[h]) continue;   // this homologue is unchanged: no new haplotype
                 const std::string rid = sha256_hex(full), oid = sha256_hex(call.haplotypes[h]);
                 const std::string shown = rid.substr(0, 12);
-                if (display.count(shown) && display[shown] != rid) throw std::runtime_error("display_id_collision " + shown);
-                display[shown] = rid;
+                if (!register_display_id(display, rid)) throw std::runtime_error("display_id_collision " + shown);
                 const std::string hom = h == 0 ? "hap1" : "hap2";
                 repaired_fa << '>' << rid << " display=" << shown << " block=" << block_id << " homologue=" << hom << " bp=" << full.size() << '\n';
                 for (std::size_t at = 0; at < full.size(); at += 60) repaired_fa << full.substr(at, 60) << '\n';

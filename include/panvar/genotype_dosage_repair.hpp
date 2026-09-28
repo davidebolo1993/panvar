@@ -119,6 +119,10 @@ RepairResult repair_block(const BlockAudit& audit, const CensusBlock& census, co
                           const NodeSequences& nodes, const ScoringInputs& scoring, const DosageSettings& settings,
                           const RepairSettings& repair_settings);
 
+// The choice among exactly scored candidates (spec section 8): the top-genotype rule, orientation ties, and on the
+// repeated-unit route the panel-structure allocation within one content multiset. Sets outcome/reason on a tie.
+void choose_repair(RepairResult& result, CensusRoute route, double tie_tolerance_nats);
+
 std::string repair_candidates_table(const std::vector<std::pair<std::string, RepairResult>>& repairs);
 std::string repair_blocks_table(const std::vector<std::pair<std::string, RepairResult>>& repairs);
 
@@ -144,6 +148,10 @@ struct NearestPanel {
 // Every panel sequence at the minimal global edit distance from `query`, ordered by (SHA-256 of the sequence, id):
 // invariant to the panel's order. Ties are all reported.
 std::vector<NearestPanel> nearest_panel_sequences(const std::string& query, const std::vector<PanelSequence>& panel);
+
+// Registers a generated sequence's display id (the first `length` hex digits of its full SHA-256). False on a
+// collision: two distinct full ids sharing one display id, which fails the run closed.
+bool register_display_id(std::map<std::string, std::string>& shown, const std::string& full_id, std::size_t length = 12);
 
 // SHA-256 of the sorted (id, sequence SHA-256) list: what was searched, independent of its order.
 std::string panel_digest(const std::vector<PanelSequence>& panel);

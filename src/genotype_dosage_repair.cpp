@@ -381,6 +381,81 @@ Genotype unordered(const std::string& a, const std::string& b) { return a <= b ?
 
 // ---------------------------------------------------------------------------------------------- repair
 
+void choose_repair(RepairResult& res, CensusRoute route, double tie_tolerance_nats) {
+    // merge by unordered spelled block genotype; the top set is every genotype within the tolerance of the maximum
+    double best = -std::numeric_limits<double>::infinity();
+    for (const BlockCandidate& c : res.candidates) best = std::max(best, c.likelihood);
+    std::map<Genotype, std::vector<std::size_t>> top;
+    for (std::size_t i = 0; i < res.candidates.size(); ++i) {
+        if (res.candidates[i].likelihood >= best - tie_tolerance_nats) {
+            res.candidates[i].in_top_set = true;
+            top[unordered(res.candidates[i].ctx1_sequence, res.candidates[i].ctx2_sequence)].push_back(i);
+        }
+    }
+    res.top_set_size = top.size();
+    const auto refuse_tie = [&]() {
+        res.outcome = "TRIGGERED_UNREPAIRED";
+        res.reason = "top_genotype_tie";
+        res.chosen = -1;
+    };
+    if (top.empty()) { res.outcome = "TRIGGERED_UNREPAIRED"; res.reason = "no_admissible_candidate"; return; }
+    std::size_t pick = 0;
+    if (route == CensusRoute::Pair) {
+        if (top.size() > 1) return refuse_tie();
+        const std::vector<std::size_t>& g = top.begin()->second;
+        pick = g.front();
+        for (std::size_t i : g) if (res.candidates[i].likelihood > res.candidates[pick].likelihood) pick = i;
+        if (g.size() > 1) {   // both orientations of one genotype tied: orientation carries no block-genotype information
+            res.orientation_tie = true;
+            for (std::size_t i : g) if (res.candidates[i].orientation == "AB") pick = i;
+        }
+        res.candidates[pick].chosen_content = true;
+    } else {
+        // the content multiset of the top set; several multisets across distinct tied genotypes refuse
+        std::set<std::vector<std::size_t>> multisets;
+        for (const auto& [gt, idx] : top) {
+            std::size_t b = idx.front();
+            for (std::size_t i : idx) if (res.candidates[i].likelihood > res.candidates[b].likelihood) b = i;
+            multisets.insert(res.candidates[b].multiset);
+        }
+        if (multisets.size() > 1) return refuse_tie();
+        const std::vector<std::size_t> content = *multisets.begin();
+        // allocation within the content multiset: panel-structure prior, then likelihood, then structure rank
+        bool first = true;
+        for (std::size_t i = 0; i < res.candidates.size(); ++i) {
+            BlockCandidate& c = res.candidates[i];
+            if (c.multiset != content) continue;
+            c.chosen_content = true;
+            const BlockCandidate& p = res.candidates[pick];
+            if (first || c.panel_log_prior > p.panel_log_prior ||
+                (c.panel_log_prior == p.panel_log_prior && (c.likelihood > p.likelihood || (c.likelihood == p.likelihood && c.rank < p.rank)))) {
+                pick = i;
+                first = false;
+            }
+        }
+        std::set<Genotype> tied;
+        for (BlockCandidate& c : res.candidates) {
+            if (c.multiset == content && c.panel_log_prior == res.candidates[pick].panel_log_prior && c.likelihood == res.candidates[pick].likelihood) {
+                c.allocation_tied = true;
+                tied.insert(unordered(c.ctx1_sequence, c.ctx2_sequence));
+            }
+        }
+        res.allocation_tie = tied.size();
+    }
+    res.chosen = static_cast<long>(pick);
+    BlockCandidate& chosen = res.candidates[pick];
+    chosen.chosen = true;
+    res.repair_separation = chosen.likelihood - res.original_likelihood;
+    const Genotype cg = unordered(chosen.ctx1_sequence, chosen.ctx2_sequence);
+    double other = -std::numeric_limits<double>::infinity();
+    for (const BlockCandidate& c : res.candidates) {
+        if (unordered(c.ctx1_sequence, c.ctx2_sequence) != cg) other = std::max(other, c.likelihood);
+    }
+    res.gap_defined = std::isfinite(other);
+    res.conditional_repair_gap = res.gap_defined ? chosen.likelihood - other : 0.0;
+}
+
+
 RepairResult repair_block(const BlockAudit& audit, const CensusBlock& census, const BlockFeatureModel& fm,
                           const NodeSequences& nodes, const ScoringInputs& in, const DosageSettings& settings,
                           const RepairSettings& rs) {
@@ -784,66 +859,7 @@ RepairResult repair_block(const BlockAudit& audit, const CensusBlock& census, co
         res.candidates[i].likelihood = scores[i].likelihood;
     }
 
-    // top-genotype rule
-    double best = -std::numeric_limits<double>::infinity();
-    for (const BlockCandidate& c : res.candidates) best = std::max(best, c.likelihood);
-    std::map<Genotype, std::vector<std::size_t>> top;
-    for (std::size_t i = 0; i < res.candidates.size(); ++i) {
-        if (res.candidates[i].likelihood >= best - rs.tie_tolerance_nats) {
-            res.candidates[i].in_top_set = true;
-            top[unordered(res.candidates[i].ctx1_sequence, res.candidates[i].ctx2_sequence)].push_back(i);
-        }
-    }
-    res.top_set_size = top.size();
-    std::size_t pick = 0;
-    if (census.route == CensusRoute::Pair) {
-        if (top.size() > 1) return refuse("top_genotype_tie");
-        const std::vector<std::size_t>& g = top.begin()->second;
-        pick = g.front();
-        for (std::size_t i : g) if (res.candidates[i].likelihood > res.candidates[pick].likelihood) pick = i;
-        if (g.size() > 1) {
-            res.orientation_tie = true;
-            for (std::size_t i : g) if (res.candidates[i].orientation == "AB") pick = i;
-        }
-        res.candidates[pick].chosen_content = true;
-    } else {
-        std::set<std::vector<std::size_t>> multisets;
-        for (const auto& [gt, idx] : top) for (std::size_t i : idx) multisets.insert(res.candidates[i].multiset);
-        if (multisets.size() > 1) return refuse("top_genotype_tie");
-        const std::vector<std::size_t> content = *multisets.begin();
-        // allocation: panel-structure prior, then likelihood, then structure rank, within the content multiset
-        bool first = true;
-        for (std::size_t i = 0; i < res.candidates.size(); ++i) {
-            BlockCandidate& c = res.candidates[i];
-            if (c.multiset != content) continue;
-            c.chosen_content = true;
-            const BlockCandidate& p = res.candidates[pick];
-            if (first || c.panel_log_prior > p.panel_log_prior ||
-                (c.panel_log_prior == p.panel_log_prior && (c.likelihood > p.likelihood || (c.likelihood == p.likelihood && c.rank < p.rank)))) {
-                pick = i;
-                first = false;
-            }
-        }
-        std::set<Genotype> tied;
-        for (BlockCandidate& c : res.candidates) {
-            if (c.multiset == content && c.panel_log_prior == res.candidates[pick].panel_log_prior && c.likelihood == res.candidates[pick].likelihood) {
-                c.allocation_tied = true;
-                tied.insert(unordered(c.ctx1_sequence, c.ctx2_sequence));
-            }
-        }
-        res.allocation_tie = tied.size();
-    }
-    res.chosen = static_cast<long>(pick);
-    BlockCandidate& chosen = res.candidates[pick];
-    chosen.chosen = true;
-    res.repair_separation = chosen.likelihood - res.original_likelihood;
-    const Genotype cg = unordered(chosen.ctx1_sequence, chosen.ctx2_sequence);
-    double other = -std::numeric_limits<double>::infinity();
-    for (const BlockCandidate& c : res.candidates) {
-        if (unordered(c.ctx1_sequence, c.ctx2_sequence) != cg) other = std::max(other, c.likelihood);
-    }
-    res.gap_defined = std::isfinite(other);
-    res.conditional_repair_gap = res.gap_defined ? chosen.likelihood - other : 0.0;
+    choose_repair(res, census.route, rs.tie_tolerance_nats);
     return res;
 }
 
