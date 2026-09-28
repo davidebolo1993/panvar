@@ -92,7 +92,8 @@ def main():
     job = next(l.rstrip("\n").split("\t") for l in open(a.jobs) if l.split("\t")[0] == a.cell)
     model, r1, r2, lib, cur, truth, sealed = job[6], job[7], job[8], job[9], job[10], job[11], job[-1]
     donor, scheme = job[2], job[4]
-    profile = re.search(r"--profile (\S+)", open(sealed + ".command.txt").read()).group(1)
+    # the profile the sealed run was configured by, as its status records it (fresh cells keep no command.txt)
+    profile = next(l.rstrip("\n").split("\t")[1] for l in open(sealed + ".mosaic_status.tsv") if l.startswith("profile\t"))
     base = ["--profile", profile, "--gfa", model, "--reference-path", REFERENCE, "--reads1", r1, "--reads2", r2, "--library", lib, "--quiet"]
     if cur != "none": base += ["--panel-curation", cur]
     arms = {"absent": [], "off": ["--dosage-mode", "off"], "audit": ["--dosage-mode", "audit"], "repair": ["--dosage-mode", "repair"]}
