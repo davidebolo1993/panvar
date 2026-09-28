@@ -127,6 +127,14 @@ DosageShadowSummary run_dosage_shadow(const PreparedGenotypeModel& model, const 
     if (!span) {
         summary.audit_status = "REFUSED_LIBRARY";
         summary.note = "the library declares no short-read insert distribution (unsupported_library)";
+        std::ostringstream o;
+        o << "block_id\tdosage_status\tdosage_reason\n";
+        for (const PreparedGenotypeBlock& b : model.blocks()) {
+            o << b.block_id << "\tNOT_EVALUATED\tunsupported_library\n";
+            ++summary.status_counts["NOT_EVALUATED"];
+            ++summary.reason_counts["unsupported_library"];
+        }
+        atomic_write(out_prefix + ".dosage_blocks.tsv", o.str());
         write_status();
         return summary;
     }

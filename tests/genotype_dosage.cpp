@@ -198,6 +198,15 @@ void test_unsupported_library() {
     const std::string out = (std::filesystem::temp_directory_path() / "panvar_dosage_fixture").string();
     const DosageShadowSummary s = run_dosage_shadow(*L.model, {}, {}, lib, FragmentScoringOptions{}, {0.01, 0.01}, out, out, DosageShadowOptions{});
     require(s.audit_status == "REFUSED_LIBRARY", "unsupported_library refuses the audit");
+    {
+        std::ifstream in(out + ".dosage_blocks.tsv");
+        std::string line;
+        std::size_t rows = 0, refused = 0;
+        std::getline(in, line);
+        while (std::getline(in, line)) { ++rows; refused += line.find("\tNOT_EVALUATED\tunsupported_library") != std::string::npos; }
+        require(rows == 3 && refused == 3, "every block is NOT_EVALUATED / unsupported_library");
+        std::filesystem::remove(out + ".dosage_blocks.tsv");
+    }
     LibraryModel ok;
     ok.insert_mean_bp = 350; ok.insert_sd_bp = 40;
     const DosageShadowSummary n = run_dosage_shadow(*L.model, {}, {}, ok, FragmentScoringOptions{}, {0.01, 0.01}, out + "_absent", out, DosageShadowOptions{});
