@@ -5931,6 +5931,36 @@ int tie_branch(const Args& args) {
 // Rebuilds the persisted call (the equivalence set's rank-1 representative, or --hap1/--hap2), and runs the library
 // audit (docs/algorithms/genotype_dosage.md) on the persisted reads. It does not genotype. Writes
 // <out>.dosage_census.tsv, <out>.dosage_features.tsv, <out>.dosage_blocks.tsv and <out>.dosage_replay.tsv (timings).
+// What re-annotating a repaired genotype needs, as the sealed run was configured (its status) and its library declares
+// (marker_background, when the library file carries it).
+panvar::dosage::ReportedFilterInputs reported_filter_inputs(const std::map<std::string, std::string>& status,
+                                                            const std::vector<panvar::ReadPair>& reads, const panvar::LibraryModel& library,
+                                                            const Args& args, const panvar::FragmentScoringOptions& scoring) {
+    panvar::dosage::ReportedFilterInputs f;
+    f.reads = &reads;
+    f.library = &library;
+    {
+        std::ifstream lib(args.required("library"));
+        for (std::string line; std::getline(lib, line);) {
+            std::stringstream row(line);
+            std::string key, v;
+            if (row >> key >> v && key == "marker_background") f.declared_marker_background = std::stod(v);
+        }
+    }
+    const auto get = [&](const char* key) { const auto it = status.find(key); return it == status.end() ? 0ULL : std::stoull(it->second); };
+    f.kmer_size = get("kmer_size");
+    f.syncmer_s = get("syncmer_s");
+    f.scoring = scoring;
+    f.scoring.threads = std::stoul(args.get("threads", "8"));
+    f.repair_max_physical_origins = get("repair_max_physical_origins");
+    f.repair_max_state_classes = get("repair_max_state_classes");
+    f.repair_max_piece_hits = get("repair_max_piece_hits");
+    f.repair_max_latent_pairs = get("repair_max_latent_pairs");
+    f.switch_probability = std::stod(status.at("switch_probability"));
+    f.representation_guard = status.count("representation_guard") && status.at("representation_guard") == "true";
+    return f;
+}
+
 int dosage_replay(const Args& args) {
     const std::string out = args.required("out");
     struct Staged { std::string path; ~Staged() { std::error_code e; std::filesystem::remove(path, e); } } staged{out + ".model.sorted.gfa"};
@@ -6064,8 +6094,9 @@ int dosage_replay(const Args& args) {
                 audit_note = s.note.empty() ? "none" : s.note;
             }
         }
+        const panvar::dosage::ReportedFilterInputs filters = reported_filter_inputs(status, reads, library, args, scoring);
         const panvar::dosage::DosageIntegration d = panvar::dosage::apply_dosage_mode(
-            &model, mode, run, out, audit_status == "COMPLETE" ? &s : nullptr, audit_status, audit_note);
+            &model, mode, run, out, audit_status == "COMPLETE" ? &s : nullptr, audit_status, audit_note, &filters);
         panvar::dosage::write_locus_genotype(&model, out, d);
         std::cout << "dosage-replay --mode " << mode << ": " << audit_status << ", applied " << d.applied.size() << ", not applied "
                   << d.not_applied.size() << ", " << s.seconds_total << " s\n";
@@ -6176,10 +6207,50 @@ int dosage_synthetic(const Args& args) {
         if (r[at(h, "candidate_id")] == representative) { r[at(h, "hap1_alleles")] = hap1; r[at(h, "hap2_alleles")] = hap2; }
         return true;
     });
-    rewrite(".mosaic_scores.tsv", [&](const std::vector<std::string>&, std::vector<std::string>&) { return true; });
+    rewrite(".mosaic_scores.tsv", [&](const std::vector<std::string>& h, std::vector<std::string>& r) {
+        if (r[at(h, "in_winner_set")] != "true") return true;
+        for (const auto& [col, x] : {std::make_pair("score", score.total), std::make_pair("fragment_term", score.fragment),
+                                     std::make_pair("exposure_term", score.exposure), std::make_pair("sequence_pair_prior", prior)}) {
+            std::ostringstream c; c << std::setprecision(12) << x; r[at(h, col)] = c.str();
+        }
+        return true;
+    });
+    // the injected call's own annotation, by the caller's rules as the integration re-evaluates them: the guard over
+    // every block, and read support against the ranked rivals (the injected diplotype takes the winner's row)
+    const std::size_t nb = model.blocks().size();
+    const panvar::dosage::ReportedFilterInputs filters = reported_filter_inputs(status, reads, library, args, in.options);
+    const panvar::PreparedProposalEmissions emissions = panvar::dosage::rebuild_marker_emissions(model, filters);
+    const std::vector<panvar::dosage::GuardRow> guard = panvar::dosage::representation_guard_rows(
+        model, emissions, filters, first, second, panvar::DiplotypeScore{score.fragment + score.exposure, score.fragment, score.exposure, 0.0, 0}, prior);
+    std::vector<panvar::dosage::RankedCandidate> ranking = panvar::dosage::read_caller_ranking(run);
+    std::vector<panvar::dosage::Rival> rivals;
+    for (std::size_t i = 1; i < ranking.size(); ++i) {
+        panvar::dosage::Rival v{ranking[i].fragment_term, ranking[i].error_bound, std::vector<bool>(nb, false)};
+        for (std::size_t k = 0; k < nb; ++k) v.differs[k] = ranking[i].genotype[k] != std::minmax(first.alleles[k], second.alleles[k]);
+        rivals.push_back(v);
+    }
+    const std::vector<bool> supported = panvar::dosage::read_support(score.fragment, ranking.front().error_bound, rivals, nb);
+    std::map<std::string, std::vector<std::string>> annotation;   // block id -> guard cells, support, quality, reason
+    std::vector<std::string> ids, fs, ss, qs;
+    for (std::size_t k = 0; k < nb; ++k) {
+        std::vector<std::string> cells = panvar::dosage::guard_cells(guard[k]);
+        const std::string support = supported[k] ? "READS" : "PRIOR_ONLY";
+        const panvar::BlockQuality q = panvar::block_quality(guard[k].filter, support);
+        cells.push_back(support); cells.push_back(q.filter); cells.push_back(q.reason);
+        annotation[model.blocks()[k].block_id] = cells;
+        ids.push_back(model.blocks()[k].block_id); fs.push_back(guard[k].filter); ss.push_back(support); qs.push_back(q.filter);
+    }
     const panvar::PreparedGenotypeBlock& block = model.blocks()[b];
     for (const std::string suffix : {".genotypes.tsv", ".block_genotypes.tsv"}) {
         rewrite(suffix, [&](const std::vector<std::string>& h, std::vector<std::string>& r) {
+            const std::vector<std::string>& note = annotation.at(r[at(h, "block_id")]);
+            static const char* guard_columns[] = {"filter", "filter_reason", "representation_marker_margin", "representation_competitor_pair",
+                                                  "representation_fragment_diff", "representation_exposure_diff",
+                                                  "representation_likelihood_margin", "representation_conflict_statistic"};
+            for (std::size_t k = 0; k < 8; ++k) r[at(h, guard_columns[k])] = note[k];
+            if (at(h, "genotype_support") < h.size()) r[at(h, "genotype_support")] = note[8];
+            r[at(h, "quality_filter")] = note[9];
+            r[at(h, "quality_reason")] = note[10];
             if (r[at(h, "block_id")] != block.block_id) return true;
             const std::size_t a1 = first.alleles[b], a2 = second.alleles[b];
             r[at(h, "allele1")] = std::to_string(a1); r[at(h, "allele2")] = std::to_string(a2);
@@ -6211,8 +6282,18 @@ int dosage_synthetic(const Args& args) {
         }
         atomic_write(out + ".mosaic_haplotypes.fa", o.str());
     }
-    atomic_write(out + ".mosaic_status.tsv", slurp(run + ".mosaic_status.tsv") + "synthetic_dosage_injection\t" + block.block_id + "=" +
-                                                 spec + "\nsynthetic_source_run\t" + run + "\n");
+    {
+        // the status's filter-derived lines describe the injected call
+        const auto summary = panvar::dosage::locus_filter_summary(ids, fs, ss, qs);
+        std::istringstream text(slurp(run + ".mosaic_status.tsv"));
+        std::string o;
+        for (std::string line; std::getline(text, line);) {
+            const std::string key = line.substr(0, line.find('\t'));
+            for (const auto& [k, v] : summary) if (k == key) line = k + "\t" + v;
+            o += line + "\n";
+        }
+        atomic_write(out + ".mosaic_status.tsv", o + "synthetic_dosage_injection\t" + block.block_id + "=" + spec + "\nsynthetic_source_run\t" + run + "\n");
+    }
     std::cout << std::setprecision(17) << "dosage-synthetic: " << block.block_id << " " << real->first.alleles[b] << "|" << real->second.alleles[b]
               << " -> " << spec << "; total " << score.total << " (real " << real->score.total << ")\n";
     return 0;

@@ -37,5 +37,23 @@ echo "evaluator distance at $BLOCK: injected $d_orig, repaired $d_rep"
 [ "${d_orig:-0}" -gt 0 ] 2>/dev/null || { echo "FAIL the injected call is not wrong at $BLOCK"; fail=1; }
 cmp -s "$prefix.eval.blocks.tsv" "$OUT/repaired.eval.blocks.tsv" || { echo "FAIL the repaired prefix does not evaluate as the real call"; fail=1; }
 grep -q "^call_source	locus_genotype_dosage_repaired" "$OUT/repaired.eval.summary.tsv" || { echo "FAIL the evaluator did not read the repaired call"; fail=1; }
+# the repaired genotype's filters are computed for it (section 23) and agree with the genuine call's, block by block
+basis=$(awk -F'\t' '$1=="dosage_filters_basis"{print $2}' "$OUT/repaired.mosaic_status.tsv")
+[ "$basis" = recomputed_for_reported_genotype ] || { echo "FAIL filters basis '$basis'"; fail=1; }
+cols='filter filter_reason representation_competitor_pair genotype_support quality_filter quality_reason'
+disagree=$(python3 - "$prefix.block_genotypes.tsv" "$OUT/repaired.block_genotypes.tsv" $cols <<'PY'
+import sys, csv
+real = {r["block_id"]: r for r in csv.DictReader(open(sys.argv[1]), delimiter="\t")}
+rep = {r["block_id"]: r for r in csv.DictReader(open(sys.argv[2]), delimiter="\t")}
+for b in real:
+    for c in sys.argv[3:]:
+        if real[b][c] != rep[b][c]: print(f"{b}:{c}:{real[b][c]}->{rep[b][c]}")
+PY
+)
+[ -z "$disagree" ] && echo "repaired filters equal the genuine call's at every block" || { echo "FAIL filters differ from the genuine call: $disagree"; fail=1; }
+for k in locus_filter quality_pass_blocks quality_lowqual_blocks blocks_genotype_read_supported; do
+  a=$(awk -F'\t' -v k=$k '$1==k{print $2; exit}' "$prefix.mosaic_status.tsv"); b=$(awk -F'\t' -v k=$k '$1==k{print $2; exit}' "$OUT/repaired.mosaic_status.tsv")
+  [ "$a" = "$b" ] || { echo "FAIL status $k: genuine $a, repaired $b"; fail=1; }
+done
 [ $fail -eq 0 ] && echo "PASS $CELL $BLOCK $INJECT" || echo "FAILED $CELL"
 exit $fail

@@ -249,6 +249,10 @@ std::optional<PersistedCall> read_persisted_call(const std::string& run_prefix);
 // total = likelihood + unordered sequence-pair prior. For building a synthetic run whose persisted scores the guard
 // must reproduce (the known-truth repair gate); never used by a call.
 PersistedScore score_reported_diplotype(const ScoringInputs& in, double& prior);
+// Exact scores of explicit diplotypes (block sequences already spliced into whole haplotypes), in one scoring context
+// with in's settings and repair caps, in input order. For annotating a reported repaired genotype after the repair
+// is decided (docs/algorithms/genotype_dosage.md section 23); never used to choose one.
+std::vector<DiplotypeScore> score_diplotypes_exact(const ScoringInputs& in, const std::vector<std::pair<std::string, std::string>>& diplotypes);
 
 struct DosageShadowOptions {
     bool repair = true;
@@ -273,6 +277,10 @@ struct CompleteRepair {
     std::optional<std::size_t> allele1, allele2;
     double fragment_term = 0.0, exposure_term = 0.0, likelihood = 0.0, prior = 0.0, repair_separation = 0.0;
     bool orientation_tie = false;
+    // every other scored repair candidate at this block (its block sequences and fragment term), for the read-support
+    // rule of the reported repaired genotype
+    struct Alternative { std::string seq1, seq2; double fragment_term = 0.0; };
+    std::vector<Alternative> alternatives;
 };
 
 struct DosageShadowSummary {

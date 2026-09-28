@@ -330,6 +330,10 @@ DosageShadowSummary run_dosage_shadow(const PreparedGenotypeModel& model, const 
                 }
                 cr.fragment_term = c->fragment_term; cr.exposure_term = c->exposure_term; cr.likelihood = c->likelihood;
                 cr.prior = prior; cr.repair_separation = r->repair_separation; cr.orientation_tie = r->orientation_tie;
+                for (const BlockCandidate& alt : r->candidates) {
+                    if (&alt == c) continue;
+                    cr.alternatives.push_back({alt.ctx1_sequence, alt.ctx2_sequence, alt.fragment_term});
+                }
                 summary.complete_repairs.push_back(cr);
             }
             o << c->fragment_term << '\t' << c->exposure_term << '\t' << c->likelihood << '\t' << prior << '\t'

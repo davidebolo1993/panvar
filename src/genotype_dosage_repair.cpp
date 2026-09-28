@@ -1452,4 +1452,27 @@ PersistedScore score_reported_diplotype(const ScoringInputs& in, double& prior) 
     return {w.log_likelihood + prior, w.fragment_term, w.exposure_term};
 }
 
+std::vector<DiplotypeScore> score_diplotypes_exact(const ScoringInputs& in, const std::vector<std::pair<std::string, std::string>>& diplotypes) {
+    FragmentScoringOptions opt = in.options;
+    if (in.repair_max_physical_origins) opt.max_physical_origins = in.repair_max_physical_origins;
+    if (in.repair_max_state_classes) opt.max_state_classes = in.repair_max_state_classes;
+    if (in.repair_max_piece_hits) opt.max_piece_hits = in.repair_max_piece_hits;
+    if (in.repair_max_latent_pairs) opt.max_latent_alignment_pairs = in.repair_max_latent_pairs;
+    PreparedScoringContext context(*in.reads, *in.library, opt);
+    if (in.repair_origin_cache_path) {
+        context.enable_origin_cache_path(true);
+        context.set_origin_cache_limits(in.repair_origin_cache_bytes, 0);
+    }
+    if (diplotypes.empty()) return {};
+    context.begin_transient_round();
+    std::vector<std::string> haplotypes;
+    for (const auto& [a, b] : diplotypes) { haplotypes.push_back(a); haplotypes.push_back(b); }
+    const std::vector<std::size_t> slots = context.add_haplotypes(haplotypes);
+    std::vector<HaplotypeCandidate> pairs;
+    for (std::size_t i = 0; i < diplotypes.size(); ++i) {
+        pairs.push_back({std::min(slots[2 * i], slots[2 * i + 1]), std::max(slots[2 * i], slots[2 * i + 1])});
+    }
+    return context.score_candidates(pairs).scores;
+}
+
 } // namespace panvar::dosage

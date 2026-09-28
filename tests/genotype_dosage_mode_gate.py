@@ -27,9 +27,10 @@ SEARCH_RECORD = [".mosaic_scores.tsv", ".mosaic_candidates.tsv", ".equivalence_s
 DOSAGE_COLS = ["dosage_status", "dosage_reason", "dosage_filter", "dosage_filter_reason", "repair_class", "dosage_repair_applied",
                "dosage_content_scope", "diplotype_scope", "allocation_equivalence_scope", "serialization_representative",
                "original_allele1", "original_allele2", "original_content", "corrected_content", "admissible_content_vectors",
-               "allocation_status", "original_GQ", "gq_status", "repair_separation", "conditional_repair_gap"]
+               "allocation_status", "original_GQ", "gq_status", "repair_separation", "conditional_repair_gap", "original_filter",
+               "original_quality_filter", "original_genotype_support", "filter_basis", "quality_filter_basis"]
 LOCUS_COLS = ["prefix", "run_status", "call_class", "no_call_reason", "locus_filter", "quality_rule", "quality_pass_blocks",
-              "quality_lowqual_blocks", "phase_support", "candidate_scope", "search_conditional", "reported_genotype_source",
+              "quality_lowqual_blocks", "filter_basis", "phase_support", "candidate_scope", "search_conditional", "reported_genotype_source",
               "hap1_id", "hap1_sha256", "hap1_bp", "hap1_block_path", "hap2_id", "hap2_sha256", "hap2_bp", "hap2_block_path",
               "unordered_genotype", "equivalence_members", "total_score", "fragment_term", "exposure_term", "sequence_pair_prior",
               "score_basis", "caller_total_score", "separation", "separation_basis", "separation_certified", "hap1_switches",
@@ -42,6 +43,13 @@ LOCUS_COLS = ["prefix", "run_status", "call_class", "no_call_reason", "locus_fil
               "dosage_representative_fasta", "dosage_equivalence_table", "call_equivalence_set"]
 GENOTYPE_COLS = {"allele1", "allele2", "allele1_bp", "allele2_bp", "zygosity", "conditional_genotype_posterior", "conditional_GQ",
                  "allele1_sources", "allele2_sources"}
+# the reported genotype's own annotation, recomputed on every block of a run whose genotype a repair changed (section 23)
+FILTER_COLS = {"filter", "filter_reason", "representation_marker_margin", "representation_competitor_pair", "representation_fragment_diff",
+               "representation_exposure_diff", "representation_likelihood_margin", "representation_conflict_statistic",
+               "genotype_support", "quality_filter", "quality_reason"}
+SUMMARY_KEYS = {"locus_filter", "lowqual_blocks", "not_evaluated_blocks", "representation_guard_complete", "quality_pass_blocks",
+                "quality_lowqual_blocks", "quality_pass_block_ids", "quality_lowqual_block_ids", "quality_reason_representation_conflict",
+                "quality_reason_representation_not_evaluated", "quality_reason_no_read_support", "blocks_genotype_read_supported"}
 STATUS_VOLATILE = re.compile(r"^(seconds_|resources_|threads_|phys_footprint|rss_|emission_cache_dp_hits|emission_cache_dp_misses|"
                              r"emission_cache_executed_dps|emission_cache_executed_prefilters|scorer_emission_cache_arena_bytes|"
                              r"union_cached_prefilters_consumed|union_prefilter_cache_misses|union_prefilter_cache_decisions_not_retained|worker_seconds_|sha256_|profile|"
@@ -168,11 +176,25 @@ def main():
         else:
             check(l["hap1_sha256"] == "NA" and l["hap1_block_path"] == "NA" and l["main_fasta"] == "NA", f"{arm} equivalence call claims phase")
     check(locus["off"]["dosage_mode"] == "off" and locus["off"]["locus_repair_scope"] == "NOT_RUN", "off locus dosage fields")
+    for arm in ("off", "audit", "repair"):   # the locus filter and quality counts reconcile with the final block table
+        l = locus[arm]
+        if l["call_class"] == "no_call" or not os.path.exists(P[arm] + ".block_genotypes.tsv"): continue
+        bh, brows = table(P[arm] + ".block_genotypes.tsv")
+        f = [r[bh.index("filter")] for r in brows]; q = [r[bh.index("quality_filter")] for r in brows]
+        want = "LOWQUAL_REPRESENTATION_CONFLICT" if "LOWQUAL_REPRESENTATION_CONFLICT" in f else "PASS" if all(x == "PASS" for x in f) else "NOT_EVALUATED"
+        check(l["locus_filter"] == want, f"{arm} locus_filter {l['locus_filter']} does not reconcile with the block table ({want})")
+        check(l["quality_pass_blocks"] == str(q.count("PASS")) and l["quality_lowqual_blocks"] == str(len(q) - q.count("PASS")),
+              f"{arm} locus quality counts do not reconcile with the block table")
+        if l["call_class"] == "strict_call":
+            heads = [h for h, _ in fasta(P[arm] + ".mosaic_haplotypes.fa")]
+            check(all(f"locus_filter={want}" in h for h in heads), f"{arm} FASTA locus_filter disagrees with the block table")
+    check(L["filter_basis"] == ("caller" if not applied else L["filter_basis"]) and (L["filter_basis"] != "caller") == bool(applied),
+          "repair locus filter_basis does not follow the applied repair")
     for k in LOCUS_COLS:
         if k.startswith("dosage_") or k in ("locus_repair_scope", "original_fasta", "original_block_table", "dosage_blocks_table",
                                             "dosage_representative_fasta", "dosage_equivalence_table"): continue
         check(locus["off"][k] == locus["audit"][k], f"audit locus {k} differs from off")
-        if not applied: check(locus["audit"][k] == L[k], f"repair locus {k} differs from audit without an applied repair")
+        if not applied and k != "filter_basis": check(locus["audit"][k] == L[k], f"repair locus {k} differs from audit without an applied repair")
 
     # repair: round trip, search record, status, block tables, FASTA, leakage
     for s in LEGACY:
@@ -185,7 +207,18 @@ def main():
         if s.startswith(".dosage_") and s not in (".dosage_status.tsv", ".dosage_repair_scoring.tsv"):
             check(norm(P["repair"] + s, P["repair"]) == norm(P["audit"] + s, P["audit"]), f"repair{s} differs from audit")
     sa, sr = norm(P["audit"] + ".mosaic_status.tsv", P["audit"]).rstrip("\n"), norm(P["repair"] + ".mosaic_status.tsv", P["repair"]).rstrip("\n")
-    check(sr.startswith(sa) and all(x.startswith("dosage_") for x in sr[len(sa):].strip("\n").split("\n")), "repair status is not audit's plus dosage keys")
+    if not applied:
+        check(sr.startswith(sa) and all(x.startswith("dosage_") for x in sr[len(sa):].strip("\n").split("\n")), "repair status is not audit's plus dosage keys")
+    else:
+        al, rl = sa.split("\n"), sr.split("\n")
+        check(len(rl) >= len(al), "repair status shorter than audit's")
+        changed = {a_.split("\t")[0] for a_, r_ in zip(al, rl) if a_ != r_}
+        check(changed <= SUMMARY_KEYS and all(r_.split("\t")[0] == a_.split("\t")[0] for a_, r_ in zip(al, rl)),
+              f"repair status changed caller lines outside the filter summary: {sorted(changed - SUMMARY_KEYS)}")
+        tail = rl[len(al):]
+        check(all(x.startswith("dosage_") or x.startswith("original_") for x in tail if x), "repair status appends only dosage_ and original_ keys")
+        for a_ in al:
+            if a_.split("\t")[0] in SUMMARY_KEYS: check("original_" + a_ in tail, f"original value of {a_.split(chr(9))[0]} not kept")
     dosage_rows = {}
     if os.path.exists(P["repair"] + ".dosage_blocks.tsv"):
         dh, drows = table(P["repair"] + ".dosage_blocks.tsv")
@@ -199,11 +232,24 @@ def main():
             bid = ar[0]
             lead = dict(zip(ah, rr[:len(ah)])); old = dict(zip(ah, ar)); tail = dict(zip(DOSAGE_COLS, rr[len(ah):]))
             changed = {k for k in ah if lead[k] != old[k]}
+            if applied:
+                check(tail["filter_basis"] != "caller" and tail["quality_filter_basis"] != "caller", f"repair{s} {bid}: filters still the caller's")
+                check((tail["original_filter"], tail["original_quality_filter"]) == (old["filter"], old["quality_filter"]),
+                      f"repair{s} {bid}: original filters not kept")
+                if "genotype_support" in old: check(tail["original_genotype_support"] == old["genotype_support"], f"repair{s} {bid}: original support")
+                if bid not in applied:
+                    check(changed <= FILTER_COLS, f"repair{s} {bid}: columns beyond the filters changed {sorted(changed - FILTER_COLS)}")
+            else:
+                check(tail["filter_basis"] == "caller" and tail["quality_filter_basis"] == "caller" and tail["original_filter"] == old["filter"]
+                      and tail["original_quality_filter"] == old["quality_filter"], f"repair{s} {bid}: filter provenance without a repair")
             if bid in applied:
-                check(changed <= GENOTYPE_COLS, f"repair{s} {bid}: non-genotype columns changed {sorted(changed - GENOTYPE_COLS)}")
+                check(changed <= GENOTYPE_COLS | FILTER_COLS, f"repair{s} {bid}: non-genotype columns changed {sorted(changed - GENOTYPE_COLS - FILTER_COLS)}")
+                comp = lead["representation_competitor_pair"]
+                reported = "/".join(sorted([lead["allele1"], lead["allele2"]], key=int))
+                check(comp != reported, f"repair{s} {bid}: the representation competitor is the reported pair itself (a stale filter)")
                 check(tail["gq_status"] == "UNAVAILABLE_REPAIRED" and lead["conditional_GQ"] == "NA", f"repair{s} {bid}: GQ not withdrawn")
                 check(tail["dosage_status"] == "REPAIRED" and tail["dosage_repair_applied"] == "true", f"repair{s} {bid}: status")
-            else:
+            elif not applied:
                 check(not changed, f"repair{s} {bid}: legacy columns changed {sorted(changed)} without an applied repair")
             check((tail["original_allele1"], tail["original_allele2"]) == (old["allele1"], old["allele2"]), f"repair{s} {bid}: original alleles")
             if bid in dosage_rows:
@@ -219,8 +265,8 @@ def main():
             check(norm(P["audit"] + ".mosaic_haplotypes.fa", P["audit"]) == norm(P["repair"] + ".mosaic_haplotypes.fa", P["repair"]), "repair FASTA changed without a repair")
         else:
             for (ha, sa_), (hr, sr_) in zip(fa_a, fa_r):
-                ta = [t for t in ha.replace(P["audit"], "PREFIX").split() if not t.startswith("bp=")]
-                tr = [t for t in hr.replace(P["repair"], "PREFIX").split() if not t.startswith("bp=")]
+                ta = [t for t in ha.replace(P["audit"], "PREFIX").split() if not t.startswith(("bp=", "locus_filter="))]
+                tr = [t for t in hr.replace(P["repair"], "PREFIX").split() if not t.startswith(("bp=", "locus_filter="))]
                 check(tr[:len(ta)] == ta and all(t.startswith("dosage_") for t in tr[len(ta):]), "repaired FASTA header")
         reps = set()
         if os.path.exists(P["repair"] + ".dosage_repaired.fa"):

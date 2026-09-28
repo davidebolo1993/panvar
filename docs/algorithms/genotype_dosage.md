@@ -946,3 +946,57 @@ genotyping, at 2 processes × 4 threads:
   repairs are the 4 HG03456 sv:1 blocks.
   - All 4 are applied, and none is refused by the §22.2 eligibility rules.
   - Truth is undefined at that block, so no evaluated distance changes.
+
+## 23. Filters describe the reported genotype (Sol, 2026-09-28; required before the C4 freeze)
+
+When a COMPLETE_DIPLOTYPE_REPAIR changes a run's reported genotype, the primary `filter`, `quality_filter` and the
+locus-level summaries describe the reported diplotype, not the caller's. This is an annotation only: nothing here
+feeds a dosage or repair decision.
+
+**Every block of a repaired run is re-annotated**, because every block's guard competitor and read-support rivals are
+defined relative to the whole reported diplotype.
+
+- **Representation guard** (`representation_conflict_rule_v1`, unchanged): `representation_guard_rows`.
+  - The caller's marker emissions are rebuilt from the model, the reads and the library exactly as `panvar genotype`
+    builds them: marker panel, observations, depth fit, proposal parameters.
+  - The guard is then run on the reported repaired diplotype. Its called score is the repair's exact score; decisive
+    competitors are scored exactly in both assignments (`score_diplotypes_exact`, the repair caps).
+- **Read support** (the caller's rule, `read_support`): a block is READS-supported unless some rival whose fragment term
+  is not below the reported diplotype's, within both error bounds, carries another genotype there.
+  - The rivals are every caller-ranked candidate, including the original winner, and every other scored repair
+  candidate at the repaired block.
+  - The reported diplotype carries the caller winner's error bound.
+- **Block quality:** `block_quality` (block_quality_rule_v1), from the two.
+- **Reproduction first.** Before re-annotating, both rules are applied to the caller's own call and must reproduce the
+  caller's written filter, marker margin, competitor and statistic, and genotype support at every block.
+  - If they do not, or an input is missing, the diagnostic is `NOT_EVALUATED_AFTER_DOSAGE_REPAIR` with its reason.
+  - The quality is then `NOT_EVALUATED_AFTER_DOSAGE_REPAIR` too. It is never copied and never PASS.
+  - A guard that was off stays NOT_EVALUATED/`guard_off`.
+
+**Outputs of a repaired run:**
+- **Both block tables:** the guard columns (`filter` … `representation_conflict_statistic`), `genotype_support`,
+  `quality_filter` and `quality_reason` are the reported genotype's.
+- **Five trailing columns** are added on every repair-mode row: `original_filter`, `original_quality_filter`,
+  `original_genotype_support`, `filter_basis`, `quality_filter_basis`.
+  - Basis `caller` when no repair changed the run.
+  - Otherwise `recomputed_for_reported_genotype`, `not_evaluated_after_dosage_repair` or `guard_off`.
+- **`mosaic_status.tsv`:** the filter-derived caller lines are replaced in place, in order: `locus_filter`,
+  `lowqual_blocks`, `not_evaluated_blocks`, `representation_guard_complete`, the `quality_*` counts and ids, and
+  `blocks_genotype_read_supported`. The caller's values follow as `original_<key>` lines, with `dosage_filters_basis`
+  and `dosage_filters_note`.
+- **Main FASTA headers:** `locus_filter=` is updated.
+- **Locus table:** a `filter_basis` column after `quality_lowqual_blocks` (61 columns).
+- **Unchanged:** the `.original.*` files keep the caller's values byte for byte. `phase_support` is unchanged (§8,
+  rule 4).
+
+**Gates:**
+- **Mode gate:**
+  - an applied run's filter columns and status summary lines are the only caller values that change;
+  - each is kept as `original_*`;
+  - no applied block names the reported pair as its own competitor;
+  - the locus filter, the quality counts and the FASTA `locus_filter` reconcile with the final block table in every
+    arm;
+  - an unrepaired run keeps basis `caller` everywhere.
+- **Synthetic gate:** the restored 30/44 of `lzo.HG00358.30` has the genuine 30/44 call's filter, competitor,
+  genotype support and quality at every block, and the same locus filter and quality counts.
+  - The injected fixture is annotated by the same functions (`dosage-synthetic`).

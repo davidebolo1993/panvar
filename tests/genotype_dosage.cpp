@@ -433,7 +433,12 @@ void test_repair_mode_integration() {
         for (const std::string& s : legacy) require(slurp_file(p + ".original" + s) == before[s], "original" + s + " is the caller's file");
         const std::string bg = slurp_file(p + ".block_genotypes.tsv");
         require(bg.find("sv:1\tSV\t" + std::to_string(a) + "\t" + std::to_string(b) + "\t") != std::string::npos, "the repaired pair is the block genotype");
-        require(bg.find("\tNA\tNA\tPASS\tREPAIRED\t") != std::string::npos, "the repaired block's posterior and GQ are withdrawn");
+        require(bg.find("\tNA\tNA\tNOT_EVALUATED_AFTER_DOSAGE_REPAIR\tREPAIRED\t") != std::string::npos,
+                "the repaired block's posterior and GQ are withdrawn, and its filter is never the caller's without the reads");
+        require(bg.find("\tPASS\tNA\tNA\tnot_evaluated_after_dosage_repair\tnot_evaluated_after_dosage_repair\n") != std::string::npos,
+                "the caller's filter is kept as original_filter, with the basis");
+        require(slurp_file(p + ".mosaic_status.tsv").find("dosage_filters_basis\tnot_evaluated_after_dosage_repair\n") != std::string::npos,
+                "the status says the reported genotype's filters were not evaluated");
         require(slurp_file(p + ".equivalence_set.tsv") == before[".equivalence_set.tsv"], "the search record is not rewritten");
         std::string fa_bases;
         { std::istringstream fa(slurp_file(p + ".mosaic_haplotypes.fa")); for (std::string l; std::getline(fa, l);) if (l.empty() || l[0] != '>') fa_bases += l; }

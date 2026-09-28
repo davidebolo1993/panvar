@@ -1,9 +1,12 @@
 #include "panvar/genotype_dosage_integrate.hpp"
 
+#include "panvar/genotype_command.hpp"
 #include "panvar/genotype_repair.hpp"
+#include "panvar/ls_hmm.hpp"
 #include "panvar/mosaic_spelling.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <fstream>
 #include <iomanip>
 #include <set>
@@ -186,14 +189,15 @@ const std::vector<std::string>& dosage_block_columns() {
         "dosage_repair_applied", "dosage_content_scope", "diplotype_scope",      "allocation_equivalence_scope",
         "serialization_representative", "original_allele1", "original_allele2", "original_content", "corrected_content",
         "admissible_content_vectors", "allocation_status", "original_GQ",       "gq_status",            "repair_separation",
-        "conditional_repair_gap"};
+        "conditional_repair_gap", "original_filter", "original_quality_filter", "original_genotype_support", "filter_basis",
+        "quality_filter_basis"};
     return columns;
 }
 
 const std::vector<std::string>& locus_genotype_columns() {
     static const std::vector<std::string> columns = {
         "prefix", "run_status", "call_class", "no_call_reason", "locus_filter", "quality_rule", "quality_pass_blocks",
-        "quality_lowqual_blocks", "phase_support", "candidate_scope", "search_conditional", "reported_genotype_source",
+        "quality_lowqual_blocks", "filter_basis", "phase_support", "candidate_scope", "search_conditional", "reported_genotype_source",
         "hap1_id", "hap1_sha256", "hap1_bp", "hap1_block_path", "hap2_id", "hap2_sha256", "hap2_bp", "hap2_block_path",
         "unordered_genotype", "equivalence_members", "total_score", "fragment_term", "exposure_term", "sequence_pair_prior",
         "score_basis", "caller_total_score", "separation", "separation_basis", "separation_certified", "hap1_switches",
@@ -230,10 +234,129 @@ std::optional<TemplateSwitches> template_switches(const PreparedGenotypeModel& m
     return out;
 }
 
+PreparedProposalEmissions rebuild_marker_emissions(const PreparedGenotypeModel& model, const ReportedFilterInputs& in) {
+    const PreparedMarkerPanel panel = build_marker_panel(model, in.kmer_size, in.syncmer_s);
+    const MarkerObservations observations = count_marker_observations(panel, *in.reads);
+    const MarkerDepthEstimate depth = estimate_marker_depth(panel, observations, in.declared_marker_background);
+    if (!depth.converged) throw std::runtime_error("marker depth fit did not converge");
+    return build_proposal_emissions(panel, observations, proposal_marker_parameters(depth, in.kmer_size, in.syncmer_s));
+}
+
+std::vector<GuardRow> representation_guard_rows(const PreparedGenotypeModel& model, const PreparedProposalEmissions& emissions,
+                                                const ReportedFilterInputs& in, const MosaicPath& first, const MosaicPath& second,
+                                                const DiplotypeScore& called, double called_prior) {
+    const std::size_t blocks = model.blocks().size();
+    const std::vector<double> switches(blocks - 1, in.switch_probability);
+    ScoringInputs si;
+    si.model = &model; si.reads = in.reads; si.library = in.library; si.options = in.scoring;
+    si.repair_max_physical_origins = in.repair_max_physical_origins; si.repair_max_state_classes = in.repair_max_state_classes;
+    si.repair_max_piece_hits = in.repair_max_piece_hits; si.repair_max_latent_pairs = in.repair_max_latent_pairs;
+    std::vector<GuardRow> out(blocks);
+    for (std::size_t b = 0; b < blocks; ++b) {
+        GuardRow& g = out[b];
+        const BlockProposalEmissions& emission = emissions.blocks[b];
+        const auto pair = std::minmax(first.alleles[b], second.alleles[b]);
+        const std::pair<std::size_t, std::size_t> top = marker_best_pair(emission);
+        g.marker_margin = emission.at(top.first, top.second) - emission.at(pair.first, pair.second);
+        if (top == std::make_pair(pair.first, pair.second) || !(g.marker_margin >= kRepresentationBoundNats)) continue;
+        g.competitor = std::to_string(top.first) + "/" + std::to_string(top.second);
+        std::vector<std::pair<std::string, std::string>> diplotypes;
+        for (int assignment = 0; assignment < 2; ++assignment) {
+            if (assignment == 1 && top.first == top.second) break;
+            MosaicPath a = first, c = second;
+            a.alleles[b] = assignment == 0 ? top.first : top.second;
+            c.alleles[b] = assignment == 0 ? top.second : top.first;
+            diplotypes.push_back({spell_mosaic(model, a).bases, spell_mosaic(model, c).bases});
+        }
+        std::vector<RepresentationAssignment> assignments;
+        try {
+            const std::vector<DiplotypeScore> scores = score_diplotypes_exact(si, diplotypes);
+            for (std::size_t i = 0; i < diplotypes.size(); ++i) {
+                assignments.push_back({scores[i], log_unordered_sequence_pair_prior(model, diplotypes[i].first, diplotypes[i].second, switches)});
+            }
+        } catch (const std::exception& error) {
+            g.filter = "NOT_EVALUATED";
+            g.reason = std::string("competitor_not_scored: ") + error.what();
+            continue;
+        }
+        const RepresentationEvidence e = representation_conflict(g.marker_margin, called, called_prior, assignments);
+        g.fragment_diff = e.fragment_diff; g.exposure_diff = e.exposure_diff; g.likelihood_margin = e.likelihood_margin; g.statistic = e.statistic;
+        if (e.conflict) {
+            g.filter = "LOWQUAL_REPRESENTATION_CONFLICT";
+            g.reason = "marker_and_exposure_prefer_competitor_fragment_term_prefers_call";
+        }
+    }
+    return out;
+}
+
+std::vector<std::string> guard_cells(const GuardRow& g) {
+    const auto number = [](double v) {
+        if (std::isnan(v)) return std::string("NA");
+        std::ostringstream text;
+        text << std::setprecision(12) << v;
+        return text.str();
+    };
+    return {g.filter, g.reason, g.reason == "guard_off" || g.filter == "NOT_EVALUATED_AFTER_DOSAGE_REPAIR" ? std::string("NA") : number(g.marker_margin),
+            g.competitor, number(g.fragment_diff), number(g.exposure_diff), number(g.likelihood_margin), number(g.statistic)};
+}
+
+std::vector<bool> read_support(double fragment_term, double error_bound, const std::vector<Rival>& rivals, std::size_t blocks) {
+    std::vector<bool> supported(blocks, true);
+    for (const Rival& r : rivals) {
+        if (r.fragment_term + r.error_bound < fragment_term - error_bound) continue;   // the reads alone put it below
+        for (std::size_t b = 0; b < blocks; ++b) if (r.differs[b]) supported[b] = false;
+    }
+    return supported;
+}
+
+std::vector<RankedCandidate> read_caller_ranking(const std::string& prefix) {
+    const Table scores = read_table(prefix + ".mosaic_scores.tsv"), candidates = read_table(prefix + ".mosaic_candidates.tsv");
+    std::map<std::string, std::pair<std::string, std::string>> paths;
+    for (const auto& r : candidates.rows) paths[r.at(candidates.col("candidate_id"))] = {r.at(candidates.col("hap1_alleles")), r.at(candidates.col("hap2_alleles"))};
+    std::vector<RankedCandidate> out;
+    for (const auto& r : scores.rows) {
+        RankedCandidate c;
+        c.fragment_term = std::stod(r.at(scores.col("fragment_term")));
+        c.error_bound = std::stod(r.at(scores.col("numeric_error_bound")));
+        c.winner = r.at(scores.col("in_winner_set")) == "true";
+        const auto& p = paths.at(r.at(scores.col("representative_beam_candidate")));
+        const std::vector<std::string> a = split(p.first, ','), b = split(p.second, ',');
+        for (std::size_t k = 0; k < a.size(); ++k) c.genotype.push_back(std::minmax(std::stoul(a[k]), std::stoul(b[k])));
+        out.push_back(c);
+    }
+    return out;
+}
+
+std::vector<std::pair<std::string, std::string>> locus_filter_summary(const std::vector<std::string>& block_ids,
+                                                                      const std::vector<std::string>& filters,
+                                                                      const std::vector<std::string>& supports,
+                                                                      const std::vector<std::string>& qualities) {
+    std::vector<std::string> lowqual, unevaluated, pass_ids, low_ids;
+    std::size_t unsupported = 0, supported = 0;
+    for (std::size_t b = 0; b < block_ids.size(); ++b) {
+        if (filters[b] == "LOWQUAL_REPRESENTATION_CONFLICT") lowqual.push_back(block_ids[b]);
+        else if (filters[b] != "PASS") unevaluated.push_back(block_ids[b]);
+        (qualities[b] == "PASS" ? pass_ids : low_ids).push_back(block_ids[b]);
+        if (supports[b] == "READS") ++supported; else ++unsupported;
+    }
+    return {{"locus_filter", !lowqual.empty() ? "LOWQUAL_REPRESENTATION_CONFLICT" : !unevaluated.empty() ? "NOT_EVALUATED" : "PASS"},
+            {"lowqual_blocks", ids_or_none(lowqual)},
+            {"not_evaluated_blocks", ids_or_none(unevaluated)},
+            {"representation_guard_complete", unevaluated.empty() ? "true" : "false"},
+            {"quality_pass_blocks", std::to_string(pass_ids.size())},
+            {"quality_lowqual_blocks", std::to_string(low_ids.size())},
+            {"quality_pass_block_ids", ids_or_none(pass_ids)},
+            {"quality_lowqual_block_ids", ids_or_none(low_ids)},
+            {"quality_reason_representation_conflict", std::to_string(lowqual.size())},
+            {"quality_reason_representation_not_evaluated", std::to_string(unevaluated.size())},
+            {"quality_reason_no_read_support", std::to_string(unsupported)},
+            {"blocks_genotype_read_supported", std::to_string(supported)}};
+}
+
 DosageIntegration apply_dosage_mode(const PreparedGenotypeModel* model, const std::string& mode,
                                     const std::string& run_prefix, const std::string& out_prefix,
                                     const DosageShadowSummary* summary, const std::string& audit_status,
-                                    const std::string& audit_note) {
+                                    const std::string& audit_note, const ReportedFilterInputs* filters) {
     if (mode != "off" && mode != "audit" && mode != "repair") throw std::runtime_error("dosage mode must be off, audit or repair");
     DosageIntegration d;
     d.mode = mode;
@@ -294,6 +417,120 @@ DosageIntegration apply_dosage_mode(const PreparedGenotypeModel* model, const st
     }
     const std::set<std::string> applied(d.applied.begin(), d.applied.end());
 
+    // The reported genotype's own filters (section 23). Only a run whose genotype a repair changed is re-annotated; the
+    // guard and the read-support rule must first reproduce the caller's own annotation of its own call, or the reported
+    // genotype's diagnostics are NOT_EVALUATED_AFTER_DOSAGE_REPAIR. An annotation only: nothing here feeds a decision.
+    static const std::string kNotEvaluated = "NOT_EVALUATED_AFTER_DOSAGE_REPAIR";
+    struct Reported { std::vector<std::string> guard; std::string support, quality, quality_reason; };
+    std::map<std::string, Reported> reported;
+    std::map<std::string, std::map<std::string, std::string>> caller;   // block_genotypes.tsv rows, as the caller wrote them
+    if (exists(out_prefix + ".block_genotypes.tsv")) {
+        const Table t = read_table(out_prefix + ".block_genotypes.tsv");
+        for (const auto& r : t.rows) {
+            std::map<std::string, std::string> row;
+            for (std::size_t i = 0; i < t.header.size() && i < r.size(); ++i) row[t.header[i]] = r[i];
+            caller[row.at("block_id")] = row;
+        }
+    }
+    if (!applied.empty()) {
+        const std::size_t nb = model->blocks().size();
+        const CompleteRepair& r = *eligible.front();
+        std::vector<GuardRow> rows(nb);
+        std::string guard_note = "none", support_note = "none";
+        const auto guard_not_evaluated = [&](const std::string& why) {
+            for (GuardRow& g : rows) { g = GuardRow{}; g.filter = kNotEvaluated; g.reason = why; }
+            guard_note = why;
+        };
+        if (!filters || !filters->reads || !filters->library) {
+            guard_not_evaluated("inputs_unavailable");
+        } else if (!filters->representation_guard) {
+            for (GuardRow& g : rows) { g = GuardRow{}; g.filter = "NOT_EVALUATED"; g.reason = "guard_off"; }
+        } else {
+            try {
+                const PreparedProposalEmissions emissions = rebuild_marker_emissions(*model, *filters);
+                const DiplotypeScore original{call->score.fragment + call->score.exposure, call->score.fragment, call->score.exposure, 0.0, 0};
+                const std::vector<GuardRow> again = representation_guard_rows(*model, emissions, *filters, call->first, call->second, original, call->prior);
+                std::string mismatch;
+                for (std::size_t b = 0; b < nb && mismatch.empty(); ++b) {
+                    const auto& row = caller.at(model->blocks()[b].block_id);
+                    const std::vector<std::string> cells = guard_cells(again[b]);
+                    bool same = cells[0] == value(row, "filter") && cells[2] == value(row, "representation_marker_margin") &&
+                                cells[3] == value(row, "representation_competitor_pair");
+                    const double want = std::atof(value(row, "representation_conflict_statistic").c_str());
+                    if (same && cells[7] != "NA") same = std::fabs(again[b].statistic - want) <= 1e-4 * std::max(1.0, std::fabs(want));
+                    if (same && cells[7] == "NA") same = value(row, "representation_conflict_statistic") == "NA";
+                    if (!same) mismatch = model->blocks()[b].block_id;
+                }
+                if (!mismatch.empty()) guard_not_evaluated("guard_not_reproduced_at_" + mismatch);
+                else rows = representation_guard_rows(*model, emissions, *filters, first, second, DiplotypeScore{r.likelihood, r.fragment_term, r.exposure_term, 0.0, 0}, r.prior);
+            } catch (const std::exception& error) {
+                guard_not_evaluated(std::string("guard_failed: ") + error.what());
+            }
+        }
+        std::vector<std::string> support(nb, kNotEvaluated);
+        try {
+            const std::vector<RankedCandidate> ranking = read_caller_ranking(out_prefix);
+            if (ranking.empty() || !ranking.front().winner) throw std::runtime_error("no ranked winner");
+            const auto genotype_of = [&](const MosaicPath& x, const MosaicPath& y) {
+                std::vector<std::pair<std::size_t, std::size_t>> g;
+                for (std::size_t b = 0; b < nb; ++b) g.push_back(std::minmax(x.alleles[b], y.alleles[b]));
+                return g;
+            };
+            const auto rivals_of = [&](const std::vector<std::pair<std::size_t, std::size_t>>& gt, std::size_t from) {
+                std::vector<Rival> out;
+                for (std::size_t i = from; i < ranking.size(); ++i) {
+                    Rival v{ranking[i].fragment_term, ranking[i].error_bound, std::vector<bool>(nb, false)};
+                    for (std::size_t b = 0; b < nb; ++b) v.differs[b] = ranking[i].genotype[b] != gt[b];
+                    out.push_back(v);
+                }
+                return out;
+            };
+            const std::vector<bool> again = read_support(ranking[0].fragment_term, ranking[0].error_bound,
+                                                         rivals_of(genotype_of(call->first, call->second), 1), nb);
+            std::string mismatch;
+            for (std::size_t b = 0; b < nb && mismatch.empty(); ++b) {
+                if ((again[b] ? "READS" : "PRIOR_ONLY") != value(caller.at(model->blocks()[b].block_id), "genotype_support")) mismatch = model->blocks()[b].block_id;
+            }
+            if (!mismatch.empty()) {
+                support_note = "read_support_not_reproduced_at_" + mismatch;
+            } else {
+                // every caller candidate (the original winner included) and every other scored repair candidate is a
+                // rival of the reported repaired diplotype; the repaired diplotype carries the caller winner's bound
+                std::vector<Rival> rivals = rivals_of(genotype_of(first, second), 0);
+                const auto unordered_seq = [](const std::string& x, const std::string& y) { return x <= y ? std::make_pair(x, y) : std::make_pair(y, x); };
+                for (const CompleteRepair::Alternative& alt : r.alternatives) {
+                    Rival v{alt.fragment_term, ranking[0].error_bound, std::vector<bool>(nb, false)};
+                    v.differs[r.block] = unordered_seq(alt.seq1, alt.seq2) != unordered_seq(r.seq1, r.seq2);
+                    rivals.push_back(v);
+                }
+                const std::vector<bool> s = read_support(r.fragment_term, ranking[0].error_bound, rivals, nb);
+                for (std::size_t b = 0; b < nb; ++b) support[b] = s[b] ? "READS" : "PRIOR_ONLY";
+            }
+        } catch (const std::exception& error) {
+            support_note = std::string("read_support_failed: ") + error.what();
+        }
+        for (std::size_t b = 0; b < nb; ++b) {
+            Reported x;
+            x.guard = guard_cells(rows[b]);
+            x.support = support[b];
+            if (rows[b].filter == kNotEvaluated || support[b] == kNotEvaluated) {
+                x.quality = kNotEvaluated;
+                std::string why;
+                if (rows[b].filter == kNotEvaluated) why = "representation_not_evaluated_after_dosage_repair";
+                if (support[b] == kNotEvaluated) why += (why.empty() ? "" : ",") + std::string("read_support_not_evaluated_after_dosage_repair");
+                x.quality_reason = why;
+            } else {
+                const BlockQuality q = block_quality(rows[b].filter, support[b]);
+                x.quality = q.filter; x.quality_reason = q.reason;
+            }
+            reported[model->blocks()[b].block_id] = x;
+        }
+        const bool complete = guard_note == "none" && support_note == "none";
+        d.filter_basis = complete ? "recomputed_for_reported_genotype" : "not_evaluated_after_dosage_repair";
+        d.filter_note = complete ? "none" : (guard_note != "none" ? guard_note : "") + (guard_note != "none" && support_note != "none" ? ";" : "") +
+                                                (support_note != "none" ? support_note : "");
+    }
+
     std::map<std::string, std::string> writes;   // path -> content, written only after every one is built
     const auto block_of = [&](const std::string& id) -> std::size_t {
         for (std::size_t b = 0; model && b < model->blocks().size(); ++b) {
@@ -347,13 +584,47 @@ DosageIntegration apply_dosage_mode(const PreparedGenotypeModel* model, const st
                 cell("admissible_content_vectors"), cell("allocation_status"), caller_gq,
                 is_applied ? "UNAVAILABLE_REPAIRED" : "UNCHANGED_CONDITIONAL", cell("repair_separation"),
                 cell("conditional_repair_gap")};
-            row.insert(row.end(), extra.begin(), extra.end());
+            // the reported genotype's filters: the caller's where no repair changed the genotype, recomputed otherwise
+            const std::string caller_filter = t.has("filter") ? row.at(t.col("filter")) : "NA";
+            const std::string caller_quality = t.has("quality_filter") ? row.at(t.col("quality_filter")) : "NA";
+            const std::string caller_support = caller.count(id) ? value(caller.at(id), "genotype_support") : "NA";
+            std::string filter_basis = "caller", quality_basis = "caller";
+            const auto rep = reported.find(id);
+            if (rep != reported.end()) {
+                static const char* guard_columns[] = {"filter", "filter_reason", "representation_marker_margin", "representation_competitor_pair",
+                                                      "representation_fragment_diff", "representation_exposure_diff",
+                                                      "representation_likelihood_margin", "representation_conflict_statistic"};
+                for (std::size_t k = 0; k < 8; ++k) if (t.has(guard_columns[k])) row.at(t.col(guard_columns[k])) = rep->second.guard[k];
+                if (t.has("genotype_support")) row.at(t.col("genotype_support")) = rep->second.support;
+                if (t.has("quality_filter")) row.at(t.col("quality_filter")) = rep->second.quality;
+                if (t.has("quality_reason")) row.at(t.col("quality_reason")) = rep->second.quality_reason;
+                filter_basis = rep->second.guard[0] == kNotEvaluated ? "not_evaluated_after_dosage_repair"
+                             : rep->second.guard[1] == "guard_off" ? "guard_off" : "recomputed_for_reported_genotype";
+                quality_basis = rep->second.quality == kNotEvaluated ? "not_evaluated_after_dosage_repair" : "recomputed_for_reported_genotype";
+            }
+            for (const std::string& v : {caller_filter, caller_quality, caller_support, filter_basis, quality_basis}) row.push_back(v);
+            row.insert(row.end() - 5, extra.begin(), extra.end());
         }
         t.header.insert(t.header.end(), dosage_block_columns().begin(), dosage_block_columns().end());
         writes[path] = t.text();
     };
     rewrite_block_table(".genotypes.tsv", true);
     rewrite_block_table(".block_genotypes.tsv", false);
+    // locus-level summaries of the reported genotype, recomputed from the reported block rows exactly as the caller
+    // derives them from its own (locus filter fails closed; quality counts over every block)
+    std::vector<std::pair<std::string, std::string>> summaries;   // status key -> reported value, caller's order
+    if (!reported.empty()) {
+        std::vector<std::string> ids, fs, ss, qs;
+        for (const PreparedGenotypeBlock& blk : model->blocks()) {
+            const Reported& x = reported.at(blk.block_id);
+            ids.push_back(blk.block_id); fs.push_back(x.guard[0]); ss.push_back(x.support); qs.push_back(x.quality);
+        }
+        summaries = locus_filter_summary(ids, fs, ss, qs);
+    }
+    const auto summary_of = [&](const std::string& key) {
+        for (const auto& [k, v] : summaries) if (k == key) return v;
+        return std::string();
+    };
     if (!applied.empty()) {
         std::vector<FastaRecord> fa = read_fasta(out_prefix + ".mosaic_haplotypes.fa");
         std::ostringstream o;
@@ -362,6 +633,7 @@ DosageIntegration apply_dosage_mode(const PreparedGenotypeModel* model, const st
             std::vector<std::string> tokens = split(fa[h].header, ' ');
             for (std::string& tok : tokens) {
                 if (tok.rfind("bp=", 0) == 0) tok = "bp=" + std::to_string(bases.size());
+                if (tok.rfind("locus_filter=", 0) == 0 && !summaries.empty()) tok = "locus_filter=" + summary_of("locus_filter");
             }
             o << '>' << join(tokens, " ") << " dosage_repaired_blocks=" << join(d.applied, ",") << " dosage_repair_role=RESOLVED\n";
             for (std::size_t at = 0; at < bases.size(); at += 60) o << bases.substr(at, 60) << '\n';
@@ -387,9 +659,26 @@ DosageIntegration apply_dosage_mode(const PreparedGenotypeModel* model, const st
         o << "dosage_repaired_blocks\t" << ids_or_none(d.applied) << "\ndosage_repair_not_applied_blocks\t" << ids_or_none(refused)
           << "\ndosage_content_corrected_blocks\t" << ids_or_none(conditional) << "\ndosage_triggered_unrepaired_blocks\t"
           << ids_or_none(triggered) << "\ndosage_reported_genotype\t" << (applied.empty() ? "caller" : "caller_with_dosage_repair")
-          << "\ndosage_search_winner_superseded\t" << (applied.empty() ? "false" : "true") << '\n';
+          << "\ndosage_search_winner_superseded\t" << (applied.empty() ? "false" : "true") << '\n'
+          << "dosage_filters_basis\t" << d.filter_basis << "\ndosage_filters_note\t" << d.filter_note << '\n';
         const std::string path = out_prefix + ".mosaic_status.tsv";
-        if (exists(path)) writes[path] = slurp(path) + o.str();
+        if (exists(path)) {
+            // the caller's filter-derived lines describe the reported genotype; the caller's values follow as original_<key>
+            std::string text = slurp(path), originals;
+            if (!summaries.empty()) {
+                std::vector<std::string> lines = split(text.substr(0, text.size() - (text.empty() || text.back() != '\n' ? 0 : 1)), '\n');
+                for (std::string& line : lines) {
+                    const std::size_t tab = line.find('\t');
+                    if (tab == std::string::npos) continue;
+                    const std::string key = line.substr(0, tab), replacement = summary_of(key);
+                    if (replacement.empty()) continue;
+                    originals += "original_" + line + "\n";
+                    line = key + "\t" + replacement;
+                }
+                text = join(lines, "\n") + "\n";
+            }
+            writes[path] = text + o.str() + originals;
+        }
     }
     for (const std::string& s : legacy_call_outputs()) {
         if (exists(out_prefix + s)) atomic_write(out_prefix + ".original" + s, slurp(out_prefix + s));
@@ -413,6 +702,7 @@ void write_locus_genotype(const PreparedGenotypeModel* model, const std::string&
     v["quality_rule"] = value(status, "quality_rule");
     v["quality_pass_blocks"] = value(status, "quality_pass_blocks");
     v["quality_lowqual_blocks"] = value(status, "quality_lowqual_blocks");
+    v["filter_basis"] = status.count("dosage_filters_basis") ? value(status, "dosage_filters_basis") : "caller";
     v["phase_support"] = value(status, "phase_support");
     v["candidate_scope"] = status.count("final_candidate_scope") ? value(status, "final_candidate_scope") : value(status, "candidate_scope");
     v["search_conditional"] = value(status, "search_conditional");

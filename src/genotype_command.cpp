@@ -4369,6 +4369,10 @@ int run_genotype_command(const std::vector<std::string>& args) {
     const bool called = status == GenotypeRunStatus::Complete || status == GenotypeRunStatus::ConditionalGenotypeEquivalent;
     dosage::DosageShadowSummary summary;
     std::string audit_status = "NOT_RUN", audit_note = "none";
+    std::optional<double> declared_marker_background;
+    std::optional<LibraryModel> library;
+    std::vector<ReadPair> fragments;
+    FragmentScoringOptions scoring;
     if (mode != "off") {
         // Audit writes only its own files and never changes the exit status, a call or an existing output. A failure
         // is recorded in its own status file.
@@ -4378,10 +4382,8 @@ int run_genotype_command(const std::vector<std::string>& args) {
                 atomic_write(options.out_prefix + ".dosage_status.tsv",
                              "key\tvalue\ndosage_audit\tshadow\ndosage_audit_status\tNOT_RUN\ndosage_audit_note\t" + audit_note + "\n");
             } else {
-                std::optional<double> ignored;
-                const LibraryModel library = read_library(options.library_path, ignored);
-                const std::vector<ReadPair> fragments = read_fragments(options.reads1_path, options.reads2_path);
-                FragmentScoringOptions scoring;
+                library = read_library(options.library_path, declared_marker_background);
+                fragments = read_fragments(options.reads1_path, options.reads2_path);
                 scoring.mismatch_band = options.mismatch_band;
                 scoring.minimum_piece_bp = options.minimum_piece_bp;
                 scoring.max_piece_hits = options.max_piece_hits;
@@ -4399,7 +4401,7 @@ int run_genotype_command(const std::vector<std::string>& args) {
                 shadow_options.repair_max_piece_hits = options.repair_max_piece_hits;
                 shadow_options.repair_max_latent_pairs = options.repair_max_latent_pairs;
                 shadow_options.repair_origin_cache_bytes = 0;   // path on, nothing retained (measured: 2.77 vs 3.74 GiB)
-                summary = dosage::run_dosage_shadow(*capture.model, capture.node_sequences, fragments, library, scoring, switches,
+                summary = dosage::run_dosage_shadow(*capture.model, capture.node_sequences, fragments, *library, scoring, switches,
                                                     options.out_prefix, options.out_prefix, shadow_options);
                 audit_status = summary.audit_status;
                 audit_note = summary.note.empty() ? "none" : summary.note;
@@ -4416,9 +4418,26 @@ int run_genotype_command(const std::vector<std::string>& args) {
     // as they are; the locus table is the primary locus-level output in every mode.
     try {
         const PreparedGenotypeModel* model = capture.model ? &*capture.model : nullptr;
+        dosage::ReportedFilterInputs filters;
+        if (library) {
+            filters.reads = &fragments;
+            filters.library = &*library;
+            filters.declared_marker_background = declared_marker_background;
+            filters.kmer_size = options.kmer_size;
+            filters.syncmer_s = options.syncmer_s;
+            filters.scoring = scoring;
+            filters.scoring.threads = options.threads;
+            filters.repair_max_physical_origins = options.repair_max_physical_origins;
+            filters.repair_max_state_classes = options.repair_max_state_classes;
+            filters.repair_max_piece_hits = options.repair_max_piece_hits;
+            filters.repair_max_latent_pairs = options.repair_max_latent_pairs;
+            filters.switch_probability = options.switch_probability;
+            filters.representation_guard = options.representation_guard;
+        }
         const dosage::DosageIntegration integration =
             dosage::apply_dosage_mode(model, mode, options.out_prefix, options.out_prefix,
-                                      audit_status == "COMPLETE" ? &summary : nullptr, audit_status, audit_note);
+                                      audit_status == "COMPLETE" ? &summary : nullptr, audit_status, audit_note,
+                                      library ? &filters : nullptr);
         dosage::write_locus_genotype(model, options.out_prefix, integration);
     } catch (const std::exception& error) {
         std::cerr << "[genotype] locus output failed: " << error.what() << '\n';
