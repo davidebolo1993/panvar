@@ -255,7 +255,7 @@ def runtime_groups(ctx):
     holds more than one group shows them separately."""
     rows = []
     for g, r in ctx.runs.groupby("compat_group", sort=True):
-        rows.append({"compat_group": g, "runs": len(r), "settings_digest": ";".join(sorted(r.settings_digest.unique())),
+        rows.append({**({"modality": ";".join(sorted(r.modality.unique()))} if ctx.strata else {}), "compat_group": g, "runs": len(r), "settings_digest": ";".join(sorted(r.settings_digest.unique())),
                      "profile_name": ";".join(sorted(r.profile_name.unique())), "preset": ";".join(sorted(r.preset.unique())),
                      "threads_requested": ";".join(sorted(r.threads_requested.unique())),
                      "execution_group": ";".join(sorted(r.execution_group.unique())),

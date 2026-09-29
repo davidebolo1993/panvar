@@ -56,7 +56,8 @@ is recorded.
 `modality` and an `execution_group`. Without it every run is in one group.
 
 **Modality:**
-- When run metadata supplies a modality, it leads every aggregate's grouping.
+- When run metadata supplies a modality, it leads every aggregate's grouping. The exception is `switch_map.tsv`, which
+  describes the supplied plans rather than aggregating runs.
 - With several modalities, every figure is drawn once per modality (`<figure>.<modality>.png`), and runtime is never
   pooled across them.
 - With one modality, every figure is byte-identical to a run without the column.
