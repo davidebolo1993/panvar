@@ -35,7 +35,11 @@ The frozen C4 invocation:
   - A failed validation refuses the run as `LIBRARY_REFUSED` and names `--library FILE`.
   - The sources are written to `<prefix>.library_estimate.tsv`.
   - **It is not the default,** and it changes calls at low coverage: see
-    [`algorithms/library_estimate.md`](../algorithms/library_estimate.md) §5.
+    [`algorithms/library_estimate.md`](../algorithms/library_estimate.md) §5–6.
+  - **The sensitivity audit** (`library_sensitivity_audit_v1`, §7): the call is also followed at 0.9× and 1.1× the
+    estimated intensity. A block whose unordered genotype differs there becomes LOW_QUALITY `library_sensitive`, and
+    the locus filter gains `LOWQUAL_LIBRARY_SENSITIVE`. The call itself never changes. The record is in
+    `<prefix>.library_sensitivity.tsv`, written on every run (NOT_APPLICABLE for `--library FILE`).
 
 **`--library-diagnostic`,** off by default, writes an estimate beside a `--library FILE` run and is never used by the
 call.
@@ -98,9 +102,9 @@ Each filter describes the **reported** genotype. After an applied repair, the ca
 |---|---|---|
 | `filter` (representation) | `PASS`, `LOWQUAL_REPRESENTATION_CONFLICT`, `NOT_EVALUATED` | the marker depth and the exposure term prefer another pair while the fragment term prefers the call, each by ≥ ln 1000 (`representation_conflict_rule_v1`) |
 | `genotype_support` | `READS`, `PRIOR_ONLY` | whether the reads alone put every rival of another genotype at this block below the reported diplotype |
-| `quality_filter` | `PASS`, `LOW_QUALITY` | `block_quality_rule_v1`: PASS only for representation PASS with READS support |
+| `quality_filter` | `PASS`, `LOW_QUALITY` | `block_quality_rule_v1`: PASS only for representation PASS with READS support and, under `--library auto`, no library sensitivity (reason `library_sensitive`) |
 | `dosage_filter` (repair mode) | `PASS`, `DOSAGE_CONTENT_CORRECTED`, `DOSAGE_TRIGGERED_UNREPAIRED`, `DOSAGE_SUSPECT`, `DOSAGE_UNDERPOWERED`, `DOSAGE_NOT_EVALUATED`, `DOSAGE_REPAIR_NOT_APPLIED` | the dosage stage's verdict on the reported block; information limits are reasons, never merged into `quality_filter` |
-| `locus_filter` | `PASS`, `LOWQUAL_REPRESENTATION_CONFLICT`, `NOT_EVALUATED` | fails closed over the blocks |
+| `locus_filter` | `PASS`, `LOWQUAL_REPRESENTATION_CONFLICT`, `LOWQUAL_LIBRARY_SENSITIVE` (both flags joined by `;`), `NOT_EVALUATED` | fails closed over the blocks; a flag wins over NOT_EVALUATED |
 
 A repaired run's filters are recomputed on the repaired diplotype. If the caller's own annotation cannot first be
 reproduced, the value is `NOT_EVALUATED_AFTER_DOSAGE_REPAIR`: never copied, never PASS.
@@ -141,6 +145,7 @@ Genotyping: the sealed 484-job campaign, per job.
   passes. The repaired pairs are dosage-supported, not read-supported (`PRIOR_ONLY`).
 
 **Inputs and builds:**
-- **Automatic library estimation is a diagnostic only.**
+- **`--library auto` is opt-in.** Its sensitivity audit detects likelihood-rank sensitivity only. The §6 genotype
+  change at `loo.HG03456.2` (0.9×) is a search-path effect the frozen rule does not flag (`library_estimate.md` §7).
 - **Rebuilds are not byte-identical.** A rebuilt `panvar` differs from the frozen binary only in the Mach-O UUID,
   debug map and code signature; the code and data sections are identical.

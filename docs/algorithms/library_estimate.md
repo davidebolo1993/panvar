@@ -256,3 +256,69 @@ start.
 
 **Decision (the frozen rule):** a primary genotype changed inside ±10%, so `--library auto` stays opt-in and an omitted
 `--library` does not mean auto. `--library FILE` remains the reproducibility path.
+
+## 7. The library-intensity sensitivity audit (`library_sensitivity_audit_v1`; 2026-09-29; `f64733c`; auto stays opt-in)
+
+The contract was frozen before implementation: `tests/results/library_sensitivity_audit/SPEC.md`, seal `a100d8bb…`.
+
+**What it does (under `--library auto` only):**
+- The reported call is also followed at 0.9× and 1.1× the marker-fit intensity, with every other library value
+  identical. The central value alone decides the reported genotype.
+- **One combination pass, three views.** Every diploid combination (union and prepared context) also scores the two
+  endpoint libraries from the same mass columns. This is gated bit-identical to a run declaring each library, and the
+  run's own scores are unchanged. Nothing is placed again because λ changed.
+- **Shared trajectories.**
+  - Each repair round's move rule is evaluated at every view from the already-scored neighbourhood.
+  - While an endpoint decides as the call did, it shares the call's trajectory and scores nothing.
+  - At its first different decision, the endpoint either stops (that round's items are already scored) or forks from
+    its winner into the shared context. The same applies to its anchor and to every central tie branch.
+  - Tie branching runs per view under the production rule.
+- **Verdict.**
+  - The common pool (the union plus everything any trajectory scored) is reranked at each view.
+  - A block is library-sensitive when a view's top-set representatives do not carry exactly the reported unordered
+    pair. Row order, phase, representatives and scores are not grounds.
+  - Any incomplete view makes the verdict NOT_EVALUATED.
+- **Filters.**
+  - SENSITIVE puts `library_sensitive` into `quality_reason` (LOW_QUALITY) of the affected blocks only, and adds
+    `LOWQUAL_LIBRARY_SENSITIVE` to the locus filter. The call itself never changes.
+  - The record is in `<prefix>.library_sensitivity.tsv`, written on every run (NOT_APPLICABLE for `--library FILE`),
+    and in the status under auto.
+- **Recorded beside the verdict (diagnostic only):** each endpoint's independent call. That is its own pool (union set,
+  trunk and branches) decided at its own view, which is what a run declaring that intensity reports.
+
+**Acceptance on the 8 sentinels** (`gates.py`, frozen binary `f64733c`; outputs sealed at `7e408a2c…`, 346 files,
+before truth):
+
+| gate | result |
+|---|---|
+| central call identical to the `af4c2ce` auto run | 8 of 8, every deterministic file |
+| audit on against audit off (same binary) | 8 of 8 identical but for the new record |
+| `--library FILE` | byte-identical to the sealed campaign (2 cells); NOT_APPLICABLE; no new status line |
+| threads 1/2/4/8 (`loo.HG03456.2`) | identical |
+| stable cells not flagged for row order or phase | 8 of 8 STABLE; no `phase_or_representative_only` |
+| **`loo.HG03456.2` detected SENSITIVE** | **fails: STABLE** |
+| cells whose trajectories never fork: added placement and DP work | 0 on 6 of 6 (4 of them reuse or stop-fork central tie branches) |
+| those six cells: wall, audit on over off (median) | 0.99–1.04 (audit section 0.15–0.32 s) |
+| anchor-fork cells, reported separately | `loo.HG03456.2` +5.0 s (1.28×; 1,992 haplotypes placed, 0 new DPs); `loo.HG03456.30` +21.7 s (1.24×; 2,077 placed, 0 new DPs) |
+| unit fixtures (`library_sensitivity_test`) | pass |
+
+**Why `loo.HG03456.2` is STABLE:**
+- At 0.9× the repair anchor flips (§6). The endpoint forks at its anchor and converges.
+- Its independent call reproduces the study's 0.9× genotype exactly: ctx:0 4/6, sv:1 6/17, ctx:2 44/74, ctx:6 90/100
+  and sv:7 6/100.
+- But at 0.9× itself the reported call scores −33623.216 and the independent call −33624.095. The reported genotype is
+  still the 0.9× likelihood's best candidate among everything scored, by 0.88 nats.
+- The §6 change is therefore a search-path effect: a different anchor reaches a lower local optimum. It is not a
+  genotype the 0.9× likelihood prefers. `loo.HG03456.30` forks at its anchor the same way, and its independent call
+  agrees with the reported one.
+
+**Truth (post-seal, `truth_eval.py`):**
+- The frozen rule flags nothing. All 88 blocks are retained (75 exact); no block changed against `af4c2ce` auto; there
+  is no new catastrophic error; the LOO excess totals are identical.
+- The recorded independent-call diagnostic would flag the 5 `loo.HG03456.2` blocks. Of the 4 with defined truth, 3
+  have an inexact reported call (ctx:0, ctx:6 and sv:7; excess 1, 1 and 2 bp) and ctx:2 is exact. sv:1's truth is
+  undefined.
+
+**Decision (the frozen rule):** the known sensitive cell was not identified, so an omitted `--library` does not mean
+`--library auto`. The audit stays on under `--library auto`. Whether the verdict should be likelihood-rank sensitivity
+(the frozen common-pool rule) or pipeline sensitivity (the recorded independent call) is open.
