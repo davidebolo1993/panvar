@@ -71,7 +71,24 @@ struct RepairSearchOptions {
     // DIAGNOSTIC (tie branching): the search builds no context of its own; the caller attaches one that
     // another search owns and keeps alive (attach_context).
     bool external_context = false;
+    // Which scored view the search decides by (library_sensitivity_audit_v1): 0, the run's library; k >= 1, the k-th
+    // of FragmentScoringOptions::audit_libraries. Every view is scored in the same pass; only the decisions differ.
+    std::size_t score_view = 0;
 };
+
+// A candidate's complete identity: its unordered pair of allele paths.
+using DiplotypeIdentity = std::pair<std::vector<std::size_t>, std::vector<std::size_t>>;
+
+// One round's move rule evaluated at one scored view, from the round's already-scored neighbourhood: certification,
+// then the production rule (complete, winner, uniqueness, improvement, visited). `stop` is "moved" when it moves.
+struct RoundVerdict {
+    bool complete = false, unique_best = false, incumbent_in_top_set = false, moved = false;
+    std::string stop = "none";
+    DiplotypeIdentity winner;
+    double incumbent_total = 0.0, winner_total = 0.0;
+};
+// Two views decide a round identically: the same move or stop, the same winner, and the same certification flags.
+bool same_decision(const RoundVerdict& a, const RoundVerdict& b);
 
 // One committed round, with every work and resource column the rounds table reports.
 struct RepairRound {
@@ -122,10 +139,9 @@ struct RepairRound {
     std::uint64_t plan_distinct = 0, plan_known = 0, plan_selected = 0, plan_selected_bytes = 0;
     std::uint64_t plan_retained = 0, plan_evicted = 0, plan_evicted_bytes = 0, oc_not_selected = 0;
     std::uint64_t oc_group_reuses = 0, oc_evicted = 0, oc_evicted_bytes = 0;
+    // One verdict per scored view (empty when only the run's library is scored).
+    std::vector<RoundVerdict> verdicts;
 };
-
-// A candidate's complete identity: its unordered pair of allele paths.
-using DiplotypeIdentity = std::pair<std::vector<std::size_t>, std::vector<std::size_t>>;
 DiplotypeIdentity diplotype_identity(const std::vector<std::size_t>& a, const std::vector<std::size_t>& b);
 
 struct RepairHooks {
@@ -135,6 +151,9 @@ struct RepairHooks {
                        const std::string& first_bases, const std::string& second_bases,
                        const DiplotypeScore& score, double prior)>
         on_scored;
+    // Called immediately after on_scored for the same candidate, with its score at every scored view (the run's
+    // library first). Set only by the library sensitivity audit.
+    std::function<void(const std::vector<DiplotypeScore>& views)> on_scored_views;
     // After each round is committed to rounds(). May throw (a caller's own resource bound); the
     // exception leaves the search where it stands.
     std::function<void(const RepairRound& round)> on_round;
@@ -395,6 +414,7 @@ struct TieItem {
     SequenceDigest first_sequence, second_sequence;
     DiplotypeScore score;
     double prior = 0.0;
+    std::vector<DiplotypeScore> views;        // the score at every scored view (library sensitivity audit only)
 };
 struct TieSet {
     std::size_t id = 0;
@@ -464,6 +484,35 @@ struct TieBranchVerdict {
 };
 TieBranchVerdict tie_branch_verdict(bool incomplete, TopSetDecision decision);
 
+
+// ---- library-intensity sensitivity (library_sensitivity_audit_v1) --------------------------------------------------
+// The reported genotype G (the central view's call) against the common pool reranked at each declared intensity. A
+// block is library-sensitive when, at some view, the unordered pairs its numerical top set's representatives carry
+// there are not exactly {G(b)}. Row order, phase, the representative among equivalent candidates and the scores are
+// not grounds: only the unordered genotype is compared. Any view whose exploration did not complete makes the verdict
+// NOT_EVALUATED; nothing is inferred from a partial search.
+constexpr const char* kLibrarySensitivityRule = "library_sensitivity_audit_v1";
+struct LibraryAuditView {
+    std::string incomplete;                   // empty: this view's exploration completed
+    const PooledDecision* decision = nullptr; // the common pool reranked at this view (null when incomplete)
+    std::string anchor = "NA";                // the repair anchor this view's rule chose (recorded, not a criterion)
+};
+struct LibrarySensitivity {
+    std::string status = "NOT_EVALUATED";     // STABLE, SENSITIVE or NOT_EVALUATED
+    std::string reason = "none";
+    std::vector<std::size_t> sensitive_blocks;
+    // [view][block]: the unordered pairs of the top set's representatives (empty for an incomplete view)
+    std::vector<std::vector<std::set<std::pair<std::size_t, std::size_t>>>> projections;
+    std::vector<std::string> call_class;       // per view: strict_call, genotype_equivalent_call, no_call or incomplete
+    std::vector<std::size_t> top_set_size;     // candidates (all members) in the numerical top set
+    std::vector<std::string> top_set_digest;   // SHA-256 of the sorted member identities, 16 hex characters
+    std::vector<std::string> representative_digest;
+    std::size_t distinct_anchors = 0;
+    bool phase_or_representative_only = false; // genotype-stable, yet the top-set identities or representatives differ
+    bool central_matches_primary = false;      // the central view's projection is exactly G at every block
+};
+LibrarySensitivity classify_library_sensitivity(const std::vector<std::pair<std::size_t, std::size_t>>& primary,
+                                                const std::vector<LibraryAuditView>& views);
 
 // ---- representation-conflict quality guard (an annotation; never changes a call) ---------------------------
 // representation_conflict_rule_v1. At one called block, the marker (depth) channel's best available pair is

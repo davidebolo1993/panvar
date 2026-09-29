@@ -1950,6 +1950,83 @@ double expected_signal_fragments(double exposure_sum, const LibraryModel& librar
     return (1.0 - library.outlier_weight) * library.fragment_start_intensity * exposure_sum;
 }
 
+namespace {
+// One audit library's combination constants: each is the exact subexpression log_fragment_contribution and
+// expected_signal_fragments evaluate, in the same association, so an audit score is bit for bit the score a run
+// declaring that library computes.
+struct AuditCombination {
+    double log_signal_scale = 0.0;   // log1p(-w) + log(lambda)
+    double log_outlier = 0.0;        // log(w)
+    bool outlier_free = false;
+    double exposure_scale = 0.0;     // (1 - w) * lambda
+};
+constexpr std::size_t kMaxAuditLibraries = 4;
+std::vector<AuditCombination> audit_combinations(const std::vector<LibraryModel>& libraries) {
+    if (libraries.size() > kMaxAuditLibraries) throw std::invalid_argument("at most four audit libraries");
+    std::vector<AuditCombination> out;
+    for (const LibraryModel& library : libraries) {
+        validate_library_model(library);
+        AuditCombination c;
+        c.log_signal_scale = std::log1p(-library.outlier_weight) + std::log(library.fragment_start_intensity);
+        c.outlier_free = library.outlier_weight == 0.0;
+        c.log_outlier = c.outlier_free ? 0.0 : std::log(library.outlier_weight);
+        c.exposure_scale = (1.0 - library.outlier_weight) * library.fragment_start_intensity;
+        out.push_back(c);
+    }
+    return out;
+}
+// One candidate's diploid combination under the run's library and every audit library, in one pass over its two
+// mass columns. The run's own score is computed by exactly the expressions of the audit-free loop.
+void combine_with_audits(const std::vector<double>& mass_a, const std::vector<double>& mass_b,
+                         const std::vector<double>& background, std::size_t fragments, double exposure_sum,
+                         const LibraryModel& library, const std::vector<AuditCombination>& audits, DiplotypeScore& score,
+                         std::vector<std::vector<DiplotypeScore>>& audit_scores, std::size_t candidate) {
+    const std::size_t views = audits.size();
+    score.exposure_term = -expected_signal_fragments(exposure_sum, library);
+    score.absolute_term_sum = std::abs(score.exposure_term);
+    double term[kMaxAuditLibraries] = {};
+    double absolute[kMaxAuditLibraries] = {};
+    for (std::size_t k = 0; k < views; ++k) {
+        DiplotypeScore& audit = audit_scores[k][candidate];
+        audit.exposure_term = -(audits[k].exposure_scale * exposure_sum);
+        absolute[k] = std::abs(audit.exposure_term);
+    }
+    double fragment_term = 0.0;
+    for (std::size_t f = 0; f < fragments; ++f) {
+        const double combined = log_add_exp(mass_a[f], mass_b[f]);
+        if (combined != kNegInf) ++score.fragments_with_mass;
+        const double contribution = log_fragment_contribution(combined, background[f], library);
+        fragment_term += contribution;
+        score.absolute_term_sum += std::abs(contribution);
+        for (std::size_t k = 0; k < views; ++k) {
+            const AuditCombination& c = audits[k];
+            const double signal = combined == kNegInf ? kNegInf : c.log_signal_scale + combined;
+            double value = signal;
+            if (c.outlier_free) {
+                if (signal == kNegInf) {
+                    throw std::invalid_argument(
+                        "a fragment with no accepted placement and no outlier mixture makes every candidate "
+                        "impossible; declare a positive outlier weight or refuse the fragment upstream");
+                }
+            } else {
+                value = log_add_exp(signal, c.log_outlier + background[f]);
+            }
+            term[k] += value;
+            absolute[k] += std::abs(value);
+        }
+    }
+    score.fragment_term = fragment_term;
+    score.log_likelihood = score.exposure_term + fragment_term;
+    for (std::size_t k = 0; k < views; ++k) {
+        DiplotypeScore& audit = audit_scores[k][candidate];
+        audit.fragment_term = term[k];
+        audit.log_likelihood = audit.exposure_term + term[k];
+        audit.absolute_term_sum = absolute[k];
+        audit.fragments_with_mass = score.fragments_with_mass;
+    }
+}
+} // namespace
+
 std::vector<FragmentPlacement> enumerate_placements_exhaustive(
     const std::string& haplotype,
     const ReadPair& fragment,
@@ -5414,8 +5491,16 @@ FragmentScoringResult score_diplotypes(
         std::chrono::duration<double>(std::chrono::steady_clock::now() - placement_mark).count();
 
     const auto combination_mark = std::chrono::steady_clock::now();
+    const std::vector<AuditCombination> audits = audit_combinations(options.audit_libraries);
+    result.audit_scores.assign(audits.size(), std::vector<DiplotypeScore>(candidates.size()));
     const auto combine_range = [&](std::size_t begin, std::size_t end) {
-        for (std::size_t c = begin; c < end; ++c) {
+        for (std::size_t c = begin; c < end && !audits.empty(); ++c) {
+            const std::size_t a = candidates[c].first;
+            const std::size_t b = candidates[c].second;
+            combine_with_audits(mass_column[a], mass_column[b], prepared.background_by_fragment, fragments.size(),
+                                exposure[a] + exposure[b], library, audits, result.scores[c], result.audit_scores, c);
+        }
+        for (std::size_t c = begin; c < end && audits.empty(); ++c) {
             const std::size_t a = candidates[c].first;
             const std::size_t b = candidates[c].second;
             DiplotypeScore& score = result.scores[c];
@@ -6926,8 +7011,17 @@ FragmentScoringResult PreparedScoringContext::score_candidates(
 
     const std::vector<ReadPair>& fragments = state.fragments;
     const auto combination_mark = std::chrono::steady_clock::now();
+    const std::vector<AuditCombination> audits = audit_combinations(state.options.audit_libraries);
+    result.audit_scores.assign(audits.size(), std::vector<DiplotypeScore>(candidates.size()));
     const auto combine_range = [&](std::size_t begin, std::size_t end) {
-        for (std::size_t c = begin; c < end; ++c) {
+        for (std::size_t c = begin; c < end && !audits.empty(); ++c) {
+            const std::size_t a = candidates[c].first;
+            const std::size_t b = candidates[c].second;
+            combine_with_audits(state.mass_column[a], state.mass_column[b], state.prepared.background_by_fragment,
+                                fragments.size(), state.exposure[a] + state.exposure[b], state.library, audits,
+                                result.scores[c], result.audit_scores, c);
+        }
+        for (std::size_t c = begin; c < end && audits.empty(); ++c) {
             const std::size_t a = candidates[c].first;
             const std::size_t b = candidates[c].second;
             DiplotypeScore& score = result.scores[c];

@@ -236,6 +236,10 @@ struct GenotypeCommandOptions {
     // DIAGNOSTIC ONLY (docs/algorithms/library_estimate.md): after the run, estimate the library from the reads and the
     // model and write <prefix>.library_estimate.tsv beside the declared library. Never used by the call. Off by default.
     bool library_diagnostic = false;
+    // library_sensitivity_audit_v1 (docs/algorithms/library_estimate.md section 7): under --library auto, the call is
+    // followed at 0.9x and 1.1x the estimated fragment-start intensity and a genotype that changes is annotated. On by
+    // default; the profile key library_sensitivity_audit 0 turns it off (measurement only). No effect on --library FILE.
+    bool library_sensitivity_audit = true;
     // The technology preset applied before the profile and the flags (docs/algorithms/genotype_cli.md section 3), and
     // the keys it set. Empty: none. A preset never names a locus.
     std::string preset_name;
@@ -289,14 +293,17 @@ const char* genotype_run_status_name(GenotypeRunStatus status);
 // the representation filter and the genotype support. PASS only for representation PASS with READS support;
 // otherwise LOW_QUALITY, with every applying reason in canonical order -- representation_conflict (the filter is
 // LOWQUAL_REPRESENTATION_CONFLICT), representation_not_evaluated (any other non-PASS filter: fail closed),
-// no_read_support (support other than READS) -- joined by ','. It annotates; it never changes a call.
+// no_read_support (support other than READS), library_sensitive (library_sensitivity_audit_v1 found this block's
+// unordered genotype different at a declared alternative fragment-start intensity) -- joined by ','. It annotates;
+// it never changes a call.
 // conditional_GQ is not part of it: that quality is conditional on the scored candidate set and is not enough
 // for high-quality status.
 struct BlockQuality {
     std::string filter;   // PASS or LOW_QUALITY
     std::string reason;   // none, or the reasons in canonical order
 };
-BlockQuality block_quality(const std::string& representation_filter, const std::string& genotype_support);
+BlockQuality block_quality(const std::string& representation_filter, const std::string& genotype_support,
+                           bool library_sensitive = false);
 
 // The phase claim after an audit. A read-supported phase within the primary candidates becomes READS_AUDITED
 // only when the audit set was ranked to completion, agrees on the winner and on every block genotype, and is

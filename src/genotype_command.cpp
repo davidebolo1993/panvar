@@ -54,7 +54,7 @@ double seconds_since(Clock::time_point from) {
 const char* const kFinalOutputs[] = {".genotypes.tsv", ".block_genotypes.tsv", ".mosaic_candidates.tsv",
                                      ".mosaic_scores.tsv", ".mosaic_haplotypes.fa", ".equivalence_set.tsv",
                                      ".repair_rounds.tsv", ".repair_memory.tsv", ".tie_branches.tsv",
-                                     ".tie_terminal_ties.tsv", ".tie_branch_memory.tsv"};
+                                     ".tie_terminal_ties.tsv", ".tie_branch_memory.tsv", ".library_sensitivity.tsv"};
 const char* const kPartialOutputs[] = {".repair_rounds.partial.tsv", ".repair_memory.partial.tsv",
                                        ".tie_branch_memory.partial.tsv"};
 // The representation-conflict filter columns, appended to both genotype tables on every path; a path that
@@ -415,8 +415,8 @@ struct RankingSummary {
 
 // Records one block's combined quality in the summary and returns its two table columns.
 std::string quality_columns(RankingSummary& summary, const std::string& block_id, const std::string& representation_filter,
-                            const std::string& genotype_support) {
-    const BlockQuality quality = block_quality(representation_filter, genotype_support);
+                            const std::string& genotype_support, bool library_sensitive = false) {
+    const BlockQuality quality = block_quality(representation_filter, genotype_support, library_sensitive);
     summary.quality_block_ids.push_back(block_id);
     summary.block_qualities.push_back(quality);
     return "\t" + quality.filter + "\t" + quality.reason;
@@ -504,6 +504,8 @@ struct RepairReport {
     std::size_t enumeration_workers = 0;
     double seconds = 0.0;
     double seconds_scoring = 0.0;
+    // library_sensitivity_audit_v1: the rendered record (status lines), empty when the audit did not run.
+    std::string library_sensitivity_text;
 };
 
 void write_repair_report(std::ostream& out, const RepairReport& r) {
@@ -644,10 +646,27 @@ void write_status(
         for (const std::string& k : options.preset_keys) keys += (keys.empty() ? "" : ",") + k;
         out << "preset\t" << options.preset_name << "\npreset_keys\t" << (keys.empty() ? "none" : keys) << '\n';
     }
+    // library_sensitivity_audit_v1: the record under --library auto; <prefix>.library_sensitivity.tsv on every run.
+    std::string sensitivity = "library_sensitivity\tNOT_APPLICABLE\nlibrary_sensitivity_reason\tdeclared_library\n";
     if (options.library_path == "auto") {
         out << "library_mode\tauto\nlibrary_insert_source\tplacement_estimate\nlibrary_intensity_source\tmarker_fit_estimate\n"
                "library_other_source\tshort_read_preset\n";
+        if (repair != nullptr && !repair->library_sensitivity_text.empty()) {
+            sensitivity = repair->library_sensitivity_text;
+        } else {
+            sensitivity = std::string("library_sensitivity\tNOT_EVALUATED\nlibrary_sensitivity_reason\t") +
+                          (!options.library_sensitivity_audit ? "audit_off"
+                           : status == GenotypeRunStatus::LibraryRefused ? "library_refused"
+                           : options.repair_rounds == 0                  ? "not_adaptive_completion"
+                           : repair != nullptr                           ? "primary_no_call"
+                                                                         : "call_not_reached") +
+                          "\n";
+        }
+        out << sensitivity;
     }
+    atomic_write(options.out_prefix + ".library_sensitivity.tsv",
+                 "key\tvalue\nlibrary_mode\t" + std::string(options.library_path == "auto" ? "auto" : "file") + "\n" +
+                     sensitivity);
     out << "kmer_size\t" << options.kmer_size << '\n';
     out << "syncmer_s\t" << options.syncmer_s << '\n';
     out << "min_variant_bp\t" << options.min_variant_bp << '\n';
@@ -1022,7 +1041,8 @@ void write_status(
 
 } // namespace
 
-BlockQuality block_quality(const std::string& representation_filter, const std::string& genotype_support) {
+BlockQuality block_quality(const std::string& representation_filter, const std::string& genotype_support,
+                           bool library_sensitive) {
     std::string reason;
     const auto add = [&reason](const char* item) { reason += (reason.empty() ? "" : ",") + std::string(item); };
     if (representation_filter == "LOWQUAL_REPRESENTATION_CONFLICT") {
@@ -1031,6 +1051,7 @@ BlockQuality block_quality(const std::string& representation_filter, const std::
         add("representation_not_evaluated");   // NOT_EVALUATED, NA or anything else: fail closed
     }
     if (genotype_support != "READS") add("no_read_support");
+    if (library_sensitive) add("library_sensitive");
     if (reason.empty()) return {"PASS", "none"};
     return {"LOW_QUALITY", reason};
 }
@@ -1139,6 +1160,10 @@ void apply_genotype_setting(const std::string& context, const std::string& key, 
         options.emission_lookup_timing = value == "1";
     }
     else if (key == "max_union_cached_prefilters_consumed") options.max_union_cached_prefilters_consumed = u();
+    else if (key == "library_sensitivity_audit") {
+        if (value != "0" && value != "1") throw std::runtime_error(context + ": 'library_sensitivity_audit' is 0 or 1: " + value);
+        options.library_sensitivity_audit = value == "1";
+    }
     else if (key == "representation_guard") {
         if (value != "0" && value != "1") throw std::runtime_error(context + ": 'representation_guard' is 0 or 1: " + value);
         options.representation_guard = value == "1";
@@ -1519,6 +1544,16 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options, GenotypeDo
         }
         library = built_library.library;
     }
+    // library_sensitivity_audit_v1: the accepted auto library at 0.9x and 1.1x its estimated fragment-start intensity,
+    // every other value identical. Scored beside it in every combination; never behind the reported genotype.
+    std::vector<LibraryModel> audit_libraries;
+    if (auto_library && options.library_sensitivity_audit) {
+        for (const double factor : {0.9, 1.1}) {
+            LibraryModel endpoint = library;
+            endpoint.fragment_start_intensity = factor * library.fragment_start_intensity;
+            audit_libraries.push_back(endpoint);
+        }
+    }
     if (capture != nullptr) capture->library = library;
     const PreparedMarkerPanel panel =
         build_marker_panel(model, options.kmer_size, options.syncmer_s);
@@ -1724,6 +1759,7 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options, GenotypeDo
     write_running_status("union_scoring");
     mark = Clock::now();
     FragmentScoringOptions scoring_options;
+    scoring_options.audit_libraries = audit_libraries;
     // Candidates partition into fixed contiguous ranges, each worker owning complete score entries, so
     // the thread count changes the schedule and nothing else. Gated byte-identical at 1, 2 and 4.
     scoring_options.threads = options.threads;
@@ -1998,7 +2034,7 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options, GenotypeDo
         CertifiedRanking ranking;
         RankingSummary summary;
     };
-    const auto rank_set = [&](const MosaicBeamResult& beam) {
+    const auto rank_set = [&](const MosaicBeamResult& beam, std::size_t view = 0) {
         // The candidate set: the whole panel baseline first, then this target's mosaics.
         std::vector<MosaicCandidate> candidates = panel_candidates;
         candidates.insert(candidates.end(), beam.candidates.begin(), beam.candidates.end());
@@ -2058,7 +2094,7 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options, GenotypeDo
             sequence_prior.push_back(haploid_sequence_prior[candidate.first] +
                                      haploid_sequence_prior[candidate.second] +
                                      (candidate.first != candidate.second ? std::log(2.0) : 0.0));
-            scores.push_back(scored.scores[scored_index.at({candidate.first, candidate.second})]);
+            scores.push_back((view == 0 ? scored.scores : scored.audit_scores.at(view - 1))[scored_index.at({candidate.first, candidate.second})]);
 
             // Projection needs one allele path per haplotype. Take the member with the highest exact path
             // prior, ties to candidate order, and flag the call if any member projects to different block
@@ -2313,6 +2349,37 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options, GenotypeDo
             pool_at.emplace(key, pool.size());
             pool.push_back(std::move(entry));
         };
+        // library_sensitivity_audit_v1: every pooled identity's score at every view (the run's library first), from the
+        // same combination passes that scored it. A second scoring of one identity must agree at every view, bit for bit.
+        const std::size_t view_count = 1 + scoring_options.audit_libraries.size();
+        const bool audit_on = view_count > 1;
+        std::map<DiplotypeIdentity, std::vector<DiplotypeScore>> pool_views;
+        std::uint64_t view_mismatches = 0;
+        const auto same_score = [&](const DiplotypeScore& x, const DiplotypeScore& y) {
+            return bitwise_equal(x.log_likelihood, y.log_likelihood) && bitwise_equal(x.fragment_term, y.fragment_term) &&
+                   bitwise_equal(x.exposure_term, y.exposure_term) &&
+                   bitwise_equal(x.absolute_term_sum, y.absolute_term_sum) &&
+                   x.fragments_with_mass == y.fragments_with_mass;
+        };
+        const auto note_views = [&](const DiplotypeIdentity& key, const std::vector<DiplotypeScore>& views) {
+            const auto placed = pool_views.emplace(key, views);
+            if (placed.second) return;
+            for (std::size_t v = 0; v < view_count; ++v) {
+                if (placed.first->second.size() != view_count || views.size() != view_count ||
+                    !same_score(placed.first->second[v], views[v])) {
+                    ++view_mismatches;
+                    break;
+                }
+            }
+        };
+        const auto union_views = [&](std::size_t index) {
+            std::vector<DiplotypeScore> views{scored.scores[index]};
+            for (const std::vector<DiplotypeScore>& audit : scored.audit_scores) views.push_back(audit[index]);
+            return views;
+        };
+        // The candidate the last pool_scored call recorded, so the views hook that follows it can attach its views.
+        DiplotypeIdentity last_scored;
+        std::vector<TieItem>* last_items = nullptr;
         {
             std::vector<SequenceDigest> digest(interned.sequences.size());
             for (std::size_t h = 0; h < interned.sequences.size(); ++h) digest[h] = sequence_digest(interned.sequences[h]);
@@ -2326,6 +2393,10 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options, GenotypeDo
                 add(c.diplotype.first.alleles, c.diplotype.second.alleles, digest[x], digest[y],
                     scored.scores[scored_index.at(key)], prior, chosen.path_prior[i], i < panel_count ? "panel" : "mosaic",
                     "union", true, i);
+                if (audit_on) {
+                    note_views(diplotype_identity(c.diplotype.first.alleles, c.diplotype.second.alleles),
+                               union_views(scored_index.at(key)));
+                }
             }
         }
         // The union pass's mass matrix is not needed again; release it before the repair context exists.
@@ -2393,8 +2464,22 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options, GenotypeDo
             const SequenceDigest da = digest_of(a, sa, memo);
             const SequenceDigest db = digest_of(b, sb, memo);
             add(a, b, da, db, score, prior, path, source, scored_in, false, 0);
-            if (items != nullptr) items->push_back({round, a, b, da, db, score, prior});
+            if (items != nullptr) items->push_back({round, a, b, da, db, score, prior, {}});
+            last_scored = diplotype_identity(a, b);
+            last_items = items;
         };
+        // The views hook: the candidate pool_scored just recorded, at every view.
+        const auto record_views = [&](const std::vector<DiplotypeScore>& views) {
+            note_views(last_scored, views);
+            if (last_items != nullptr) last_items->back().views = views;
+        };
+        // Central tie branches, by start and history, as each ran: what an endpoint that decides identically reuses.
+        struct CentralBranch {
+            BranchResult result;
+            std::vector<bool> agree;               // per view: every round decided as the branch did
+            std::vector<double> terminal_totals;   // per view
+        };
+        std::map<std::pair<DiplotypeIdentity, std::vector<DiplotypeIdentity>>, CentralBranch> central_branches;
         try {
             search = std::make_unique<CoordinateRepairSearch>(model, emissions, fragments, library, repair_scoring,
                                                               search_options);
@@ -2406,9 +2491,12 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options, GenotypeDo
                 ++report.pool_repair_scored;
                 const std::size_t round = search->rounds().size() + 1;
                 pool_scored(a, b, sa, sb, score, prior, "repair", "round" + std::to_string(round),
-                            options.diagnostic_tie_branching || options.repair_tie_branching ? &production_items : nullptr,
+                            options.diagnostic_tie_branching || options.repair_tie_branching || audit_on
+                                ? &production_items
+                                : nullptr,
                             round);
             };
+            if (audit_on) hooks.on_scored_views = record_views;
             hooks.on_round = [&](const RepairRound& round) {
                 commit_partial(prefix + ".repair_rounds.partial.tsv", search->render_rounds(search->rounds()));
                 if (search->memory_on()) commit_partial(prefix + ".repair_memory.partial.tsv", search->memory_text());
@@ -2717,6 +2805,7 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options, GenotypeDo
                                 "branch" + std::to_string(branch.id) + "_round" + std::to_string(round), &out.items,
                                 round, true);
                 };
+                if (audit_on) hooks.on_scored_views = record_views;
                 hooks.on_round = [&](const RepairRound& round) {
                     write_running_status("tie branch " + std::to_string(branch.id) + " round " +
                                          std::to_string(round.index) + " committed");
@@ -2758,6 +2847,24 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options, GenotypeDo
                 } else {
                     out.outcome = BranchOutcome::Incomplete;
                     out.why = "stopped at " + out.stop;
+                }
+                if (audit_on) {
+                    CentralBranch record;
+                    record.result = out;
+                    record.agree.assign(view_count, true);
+                    record.terminal_totals.assign(view_count, std::numeric_limits<double>::quiet_NaN());
+                    for (const RepairRound& round : live->rounds()) {
+                        for (std::size_t v = 0; v < view_count && !round.verdicts.empty(); ++v) {
+                            if (!same_decision(round.verdicts[v], round.verdicts[0])) record.agree[v] = false;
+                        }
+                    }
+                    if (!live->rounds().empty() && !live->rounds().back().verdicts.empty()) {
+                        for (std::size_t v = 0; v < view_count; ++v) {
+                            const RoundVerdict& last = live->rounds().back().verdicts[v];
+                            record.terminal_totals[v] = last.moved ? last.winner_total : last.incumbent_total;
+                        }
+                    }
+                    central_branches[{key, branch.history}] = std::move(record);
                 }
                 return out;
             };
@@ -3718,6 +3825,472 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options, GenotypeDo
             }
             report.seconds_representation_guard = seconds_since(guard_mark);
         }
+        // ---- library_sensitivity_audit_v1 (docs/algorithms/library_estimate.md section 7). The call is decided and
+        // annotated; the same algorithm is now followed at 0.9x and 1.1x the estimated fragment-start intensity. Every
+        // candidate the call scored already carries its score at both (one combination pass), so an endpoint that
+        // decides as the call did -- its anchor, every round, every branch -- adds no scoring at all. Where it decides
+        // differently it continues alone, in the shared context: what that holds is reused, only what is new is
+        // placed. The common pool is then reranked at each view, and only unordered genotypes are compared.
+        std::set<std::size_t> library_sensitive;
+        if (audit_on) {
+            const Clock::time_point audit_mark = Clock::now();
+            PreparedScoringContext* shared = search->context();
+            const FragmentScoringCounters work_before = shared->cumulative_counters();
+            const std::size_t created_before = shared->haplotypes_created();
+            const std::uint64_t dps_before = read_emission_cache_counters().executed_dps;
+            const std::size_t band = scoring_options.mismatch_band;
+            const std::vector<double> start_switches(block_count - 1, search_options.switch_probability);
+            const char* const view_name[] = {"central", "low", "high"};
+            std::vector<LibraryAuditView> views(view_count);
+            std::vector<std::string> fork_of(view_count, "none"), trunk_stop(view_count, report.stop_reason);
+            std::vector<std::size_t> reused_of(view_count, 0), run_of(view_count, 0);
+            std::vector<TieItem> endpoint_items;                  // what the endpoints scored themselves
+            // DIAGNOSTIC (recorded, never the verdict): each endpoint's own pool -- its union set, its trunk and every
+            // branch it used -- which is what an independent run at that intensity pools and decides over.
+            std::vector<std::vector<TieItem>> own_items(view_count);
+            std::vector<std::unique_ptr<SetRanking>> endpoint_sets;   // the union set each endpoint ranked
+            std::vector<const SetRanking*> set_of_view(view_count, nullptr);
+            const auto identity_text = [&](const std::vector<std::size_t>& a, const std::vector<std::size_t>& b) {
+                const DiplotypeIdentity key = diplotype_identity(a, b);
+                return join_alleles(key.first) + "|" + join_alleles(key.second);
+            };
+            views[0].anchor = identity_text(anchor_diplotype.first.alleles, anchor_diplotype.second.alleles);
+            const DiplotypeIdentity central_anchor =
+                diplotype_identity(anchor_diplotype.first.alleles, anchor_diplotype.second.alleles);
+            // The union ranked at one view by the production rule, the full-beam tie audit included. Ranking is
+            // bookkeeping only; the run's own accumulated counters and timings are restored.
+            const auto rank_view = [&](std::size_t view) {
+                const StageTimings saved = run_timings;
+                const std::size_t saved_evaluations = haploid_prior_evaluations, saved_lookups = diploid_prior_lookups;
+                const CandidateSetReport saved_report = candidate_report;
+                auto ranked = std::make_unique<SetRanking>(rank_set(beam, view));
+                if (ranked->ranking.status != RescoreStatus::Complete && mosaics.search_exhaustive &&
+                    mosaics.candidates.size() > beam.candidates.size()) {
+                    ranked = std::make_unique<SetRanking>(rank_set(mosaics, view));
+                }
+                run_timings = saved;
+                haploid_prior_evaluations = saved_evaluations;
+                diploid_prior_lookups = saved_lookups;
+                candidate_report = saved_report;
+                return ranked;
+            };
+            // An endpoint start placed in the shared context, its census retained, and its declared score at that
+            // view reproduced bit for bit before any neighbour is scored.
+            const auto materialise_at = [&](std::size_t view, const TieItem& start) {
+                const std::string a = spell_mosaic(model, MosaicPath{start.first}).bases;
+                const std::string b = spell_mosaic(model, MosaicPath{start.second}).bases;
+                const std::vector<std::size_t> slots = shared->add_haplotypes({a, b}, nullptr, true);
+                shared->retain_census(slots[0]);
+                if (slots[1] != slots[0]) shared->retain_census(slots[1]);
+                const FragmentScoringResult again =
+                    shared->score_candidates({{std::min(slots[0], slots[1]), std::max(slots[0], slots[1])}});
+                const DiplotypeScore& got = view == 0 ? again.scores.front() : again.audit_scores.at(view - 1).front();
+                if (!same_score(got, start.views.at(view)) ||
+                    log_unordered_sequence_pair_prior(model, a, b, start_switches) != start.prior) {
+                    throw std::runtime_error("an endpoint start did not reproduce its declared score");
+                }
+                return std::make_pair(slots[0], slots[1]);
+            };
+            // One leg of an endpoint's own trajectory: the exact repair at that view, attached to the shared context.
+            struct Leg {
+                bool reproduced = false, converged = false;
+                std::string stop = "none";
+                std::size_t rounds = 0, last_round = 0;
+                std::vector<DiplotypeIdentity> moves;
+                std::vector<std::size_t> terminal_first, terminal_second;
+                double terminal_total = 0.0;
+            };
+            const auto run_leg = [&](std::size_t view, const TieItem* start, const MosaicDiplotype* anchor_start,
+                                     double anchor_total, std::size_t first_round,
+                                     const std::vector<DiplotypeIdentity>& visited, std::vector<TieItem>& items) {
+                RepairSearchOptions leg_options = search_options;
+                leg_options.external_context = true;
+                leg_options.memory_log = false;
+                leg_options.score_view = view;
+                leg_options.first_round = first_round;
+                leg_options.max_rounds = options.repair_rounds + 1 - first_round;
+                CoordinateRepairSearch leg_search(model, emissions, fragments, library, repair_scoring, leg_options);
+                leg_search.attach_context(shared);
+                if (start != nullptr) {
+                    const auto slots = materialise_at(view, *start);
+                    leg_search.start_from_slots(start->first, start->second,
+                                                start->views.at(view).log_likelihood + start->prior, slots.first,
+                                                slots.second);
+                } else {
+                    leg_search.start(anchor_start->first.alleles, anchor_start->second.alleles, anchor_total);
+                }
+                for (const DiplotypeIdentity& seen : visited) leg_search.add_visited(seen.first, seen.second);
+                RepairHooks hooks;
+                hooks.on_scored = [&](const std::vector<std::size_t>& a, const std::vector<std::size_t>& b,
+                                      const std::string& sa, const std::string& sb, const DiplotypeScore& score,
+                                      double prior) {
+                    items.push_back({first_round + leg_search.rounds().size(), a, b, digest_of(a, sa, true),
+                                     digest_of(b, sb, true), score, prior, {}});
+                };
+                hooks.on_scored_views = [&](const std::vector<DiplotypeScore>& all) { items.back().views = all; };
+                Leg leg;
+                leg.reproduced = leg_search.run(hooks);
+                leg.converged = leg_search.converged();
+                leg.stop = leg_search.stop_reason();
+                leg.rounds = leg_search.rounds().size();
+                leg.last_round = leg_search.rounds().empty() ? first_round : leg_search.rounds().back().index;
+                for (const RepairRound& round : leg_search.rounds()) {
+                    if (round.moved) leg.moves.push_back(diplotype_identity(round.first, round.second));
+                }
+                leg.terminal_first = leg_search.incumbent_first();
+                leg.terminal_second = leg_search.incumbent_second();
+                leg.terminal_total = leg_search.incumbent_total();
+                shared->release_transient({});
+                return leg;
+            };
+            const auto at_view = [](TieItem item, std::size_t view) {
+                item.score = item.views.at(view);
+                return item;
+            };
+            for (std::size_t k = 1; k < view_count; ++k) {
+                try {
+                    // (1) the anchor at this view
+                    const std::unique_ptr<SetRanking> ranked = rank_view(k);
+                    std::size_t a = npos, a_rank = 0;
+                    for (std::size_t p = 0; p < ranked->ranking.candidates.size() && a == npos; ++p) {
+                        for (const std::size_t member :
+                             ranked->sequence_candidates[ranked->ranking.candidates[p].candidate_id].members) {
+                            if (member >= panel_count) continue;
+                            if (a == npos || ranked->path_prior[member] > ranked->path_prior[a]) a = member;
+                        }
+                        if (a != npos) a_rank = p;
+                    }
+                    if (a == npos) throw std::runtime_error("no_panel_anchor");
+                    const MosaicDiplotype anchor_k = ranked->candidates[a].diplotype;
+                    const double anchor_total = ranked->ranking.candidates[a_rank].score;
+                    views[k].anchor = identity_text(anchor_k.first.alleles, anchor_k.second.alleles);
+                    const DiplotypeIdentity anchor_key =
+                        diplotype_identity(anchor_k.first.alleles, anchor_k.second.alleles);
+                    endpoint_sets.push_back(std::make_unique<SetRanking>(*ranked));
+                    set_of_view[k] = endpoint_sets.back().get();
+
+                    // (2) the trunk: shared with the call while every decision agrees, then its own
+                    std::vector<TieItem> trunk;                        // at view k
+                    std::vector<DiplotypeIdentity> history{anchor_key};   // its incumbents: the anchor, every move
+                    std::string stop;
+                    bool in_top = false;
+                    std::size_t last_round = 0;
+                    const auto take_leg = [&](const Leg& leg, std::vector<TieItem>& own) {
+                        if (!leg.reproduced) throw std::runtime_error("start_not_reproduced");
+                        for (const TieItem& item : own) trunk.push_back(item);
+                        endpoint_items.insert(endpoint_items.end(), own.begin(), own.end());
+                        history.insert(history.end(), leg.moves.begin(), leg.moves.end());
+                        stop = leg.stop;
+                        in_top = leg.converged && leg.stop == "rescore_incomplete";
+                        last_round = leg.last_round;
+                    };
+                    const std::vector<RepairRound>& rounds = search->rounds();
+                    if (anchor_key != central_anchor) {
+                        fork_of[k] = "anchor";
+                        std::vector<TieItem> own;
+                        take_leg(run_leg(k, nullptr, &anchor_k, anchor_total, 1, {}, own), own);
+                    } else {
+                        std::size_t r = npos;
+                        for (std::size_t i = 0; i < rounds.size() && r == npos; ++i) {
+                            if (!rounds[i].verdicts.empty() && !same_decision(rounds[i].verdicts[k], rounds[i].verdicts[0])) r = i;
+                        }
+                        const std::size_t shared_rounds = r == npos ? rounds.size() : r + 1;
+                        const std::size_t shared_through = shared_rounds == 0 ? 0 : rounds[shared_rounds - 1].index;
+                        for (const TieItem& item : production_items) {
+                            if (item.round <= shared_through) trunk.push_back(at_view(item, k));
+                        }
+                        for (std::size_t i = 0; i < (r == npos ? rounds.size() : r); ++i) {
+                            if (rounds[i].moved) history.push_back(diplotype_identity(rounds[i].first, rounds[i].second));
+                        }
+                        if (r == npos) {
+                            stop = search->stop_reason();
+                            in_top = !rounds.empty() && rounds.back().incumbent_in_top_set;
+                            last_round = rounds.empty() ? 0 : rounds.back().index;
+                        } else {
+                            const RoundVerdict& verdict = rounds[r].verdicts[k];
+                            fork_of[k] = "round" + std::to_string(rounds[r].index);
+                            last_round = rounds[r].index;
+                            if (!verdict.moved) {
+                                stop = verdict.stop;
+                                in_top = verdict.incumbent_in_top_set;
+                            } else if (rounds[r].index >= search->last_round()) {
+                                stop = "round_cap";
+                            } else {
+                                const TieItem* winner = nullptr;
+                                for (const TieItem& item : production_items) {
+                                    if (item.round == rounds[r].index && diplotype_identity(item.first, item.second) == verdict.winner) {
+                                        winner = &item;
+                                        break;
+                                    }
+                                }
+                                if (winner == nullptr) throw std::logic_error("the endpoint's winning move was not recorded");
+                                history.push_back(verdict.winner);
+                                std::vector<TieItem> own;
+                                take_leg(run_leg(k, winner, nullptr, 0.0, rounds[r].index + 1, history, own), own);
+                            }
+                        }
+                    }
+                    trunk_stop[k] = stop;
+                    own_items[k] = trunk;
+                    const bool converged = stop == "no_improvement" || stop == "no_unvisited_neighbour" ||
+                                           (stop == "rescore_incomplete" && in_top);
+                    const bool improving_tie = !converged && (stop == "rescore_incomplete" || stop == "tie_at_best");
+                    if (!converged && !improving_tie) throw std::runtime_error("trunk_stopped_at_" + stop);
+                    if (improving_tie && !options.repair_tie_branching) throw std::runtime_error("improving_move_tie");
+
+                    // (3) exact tie branching at this view: a central branch is reused when it started identically
+                    // and decided every round identically here; any other branch runs at this view
+                    if (improving_tie) {
+                        const TieSet root = terminal_tie(trunk, last_round, fragments.size(), band);
+                        const auto run_branch_k = [&](const BranchStart& branch) {
+                            const auto found =
+                                central_branches.find({diplotype_identity(branch.start.first, branch.start.second), branch.history});
+                            if (found != central_branches.end() && found->second.agree[k]) {
+                                ++reused_of[k];
+                                BranchResult out = found->second.result;
+                                for (TieItem& item : out.items) item = at_view(item, k);
+                                out.terminal_total = found->second.terminal_totals[k];
+                                own_items[k].insert(own_items[k].end(), out.items.begin(), out.items.end());
+                                return out;
+                            }
+                            ++run_of[k];
+                            BranchResult out;
+                            std::vector<TieItem> own;
+                            const Leg leg = run_leg(k, &branch.start, nullptr, 0.0, 1, branch.history, own);
+                            endpoint_items.insert(endpoint_items.end(), own.begin(), own.end());
+                            own_items[k].insert(own_items[k].end(), own.begin(), own.end());
+                            out.items = own;
+                            out.rounds = leg.rounds;
+                            out.moves = leg.moves.size();
+                            out.moved_to = leg.moves;
+                            out.stop = leg.stop;
+                            out.last_round = leg.last_round;
+                            out.terminal_first = leg.terminal_first;
+                            out.terminal_second = leg.terminal_second;
+                            out.terminal_total = leg.terminal_total;
+                            if (!leg.reproduced) {
+                                out.outcome = BranchOutcome::Incomplete;
+                                out.why = "its start did not reproduce";
+                            } else if (leg.converged) {
+                                out.outcome = BranchOutcome::Converged;
+                            } else if (leg.stop == "rescore_incomplete" || leg.stop == "tie_at_best") {
+                                out.outcome = BranchOutcome::Split;
+                            } else {
+                                out.outcome = BranchOutcome::Incomplete;
+                                out.why = "stopped at " + leg.stop;
+                            }
+                            return out;
+                        };
+                        const TieBranchingReport branched_k = run_tie_branching(
+                            root, history, options.repair_tie_max_branches, fragments.size(), band, run_branch_k,
+                            [](const TieSet&) {}, false, [&](long) { shared->release_transient({}); });
+                        if (!branched_k.incomplete.empty()) throw std::runtime_error("tie_branching_incomplete: " + branched_k.incomplete);
+                    }
+                } catch (const std::exception& error) {
+                    views[k].incomplete = error.what();
+                    if (views[k].incomplete.empty()) views[k].incomplete = "failed";
+                }
+            }
+
+            // (4) the common pool: the call's pool, every union set an endpoint ranked, everything an endpoint scored
+            struct AuditEntry {
+                PoolCandidate candidate;
+                std::vector<DiplotypeScore> views;
+            };
+            std::map<DiplotypeIdentity, AuditEntry> common;
+            std::uint64_t audit_mismatches = view_mismatches;
+            const auto admit = [&](const PoolCandidate& candidate, const std::vector<DiplotypeScore>& all) {
+                if (all.size() != view_count) {
+                    ++audit_mismatches;
+                    return;
+                }
+                const DiplotypeIdentity key = diplotype_identity(candidate.first, candidate.second);
+                const auto found = common.find(key);
+                if (found == common.end()) {
+                    common.emplace(key, AuditEntry{candidate, all});
+                    return;
+                }
+                bool same = bitwise_equal(found->second.candidate.sequence_prior, candidate.sequence_prior);
+                for (std::size_t v = 0; v < view_count; ++v) same = same && same_score(found->second.views[v], all[v]);
+                if (!same) ++audit_mismatches;
+            };
+            for (const PoolEntry& entry : pool) {
+                const auto found = pool_views.find(diplotype_identity(entry.candidate.first, entry.candidate.second));
+                admit(entry.candidate, found == pool_views.end() ? std::vector<DiplotypeScore>{} : found->second);
+            }
+            const std::size_t central_pool = common.size();
+            const auto union_candidate = [&](const SetRanking& set, std::size_t i) {
+                const MosaicCandidate& c = set.candidates[i];
+                const std::size_t x = interned.index_of[slot_of_path.at(c.diplotype.first.alleles)];
+                const std::size_t y = interned.index_of[slot_of_path.at(c.diplotype.second.alleles)];
+                const auto key = sequence_pair(c);
+                PoolCandidate candidate;
+                candidate.first = c.diplotype.first.alleles;
+                candidate.second = c.diplotype.second.alleles;
+                candidate.first_sequence = sequence_digest(interned.sequences[x]);
+                candidate.second_sequence = sequence_digest(interned.sequences[y]);
+                candidate.score = scored.scores[scored_index.at(key)];
+                candidate.sequence_prior = haploid_sequence_prior[key.first] + haploid_sequence_prior[key.second] +
+                                           (key.first != key.second ? std::log(2.0) : 0.0);
+                candidate.path_prior = set.path_prior[i];
+                return std::make_pair(candidate, union_views(scored_index.at(key)));
+            };
+            const auto item_candidate = [&](const TieItem& item) {
+                PoolCandidate candidate;
+                candidate.first = item.first;
+                candidate.second = item.second;
+                candidate.first_sequence = item.first_sequence;
+                candidate.second_sequence = item.second_sequence;
+                candidate.score = item.views.empty() ? item.score : item.views.front();
+                candidate.sequence_prior = item.prior;
+                const double pa = cached_haploid_prior(MosaicPath{item.first});
+                const double pb = cached_haploid_prior(MosaicPath{item.second});
+                const double negative_infinity = -std::numeric_limits<double>::infinity();
+                candidate.path_prior = pa == negative_infinity || pb == negative_infinity
+                                           ? negative_infinity
+                                           : pa + pb + (item.first != item.second ? std::log(2.0) : 0.0);
+                return candidate;
+            };
+            for (const std::unique_ptr<SetRanking>& set : endpoint_sets) {
+                for (std::size_t i = 0; i < set->candidates.size(); ++i) {
+                    const auto made = union_candidate(*set, i);
+                    admit(made.first, made.second);
+                }
+            }
+            // DIAGNOSTIC: each endpoint's own pool decided at its own view (what an independent run would call).
+            std::vector<std::string> own_differs(view_count, "NA"), own_top_score(view_count, "NA"),
+                common_top_score(view_count, "NA");
+            for (std::size_t k = 1; k < view_count; ++k) {
+                if (!views[k].incomplete.empty() || set_of_view[k] == nullptr) continue;
+                std::map<DiplotypeIdentity, PoolCandidate> own;
+                for (std::size_t i = 0; i < set_of_view[k]->candidates.size(); ++i) {
+                    const auto made = union_candidate(*set_of_view[k], i);
+                    PoolCandidate candidate = made.first;
+                    candidate.score = made.second.at(k);
+                    own.emplace(diplotype_identity(candidate.first, candidate.second), candidate);
+                }
+                for (const TieItem& item : own_items[k]) {
+                    PoolCandidate candidate = item_candidate(item);
+                    candidate.score = item.views.at(k);
+                    own.emplace(diplotype_identity(candidate.first, candidate.second), candidate);
+                }
+                std::vector<PoolCandidate> at;
+                for (const auto& [key, candidate] : own) at.push_back(candidate);
+                const PooledDecision independent = decide_pooled_genotype(std::move(at), block_count, fragments.size(), band);
+                std::string differs;
+                for (std::size_t b = 0; b < block_count; ++b) {
+                    std::set<std::pair<std::size_t, std::size_t>> pairs;
+                    for (const std::size_t g : independent.top_groups) {
+                        const PoolCandidate& rep = independent.candidates[independent.representative[g]];
+                        pairs.insert(std::minmax(rep.first[b], rep.second[b]));
+                    }
+                    if (pairs != std::set<std::pair<std::size_t, std::size_t>>{decided.genotype[b]}) {
+                        std::string set;
+                        for (const auto& pair : pairs) set += (set.empty() ? "" : "+") + std::to_string(pair.first) + "/" + std::to_string(pair.second);
+                        differs += (differs.empty() ? "" : ",") + model.blocks()[b].block_id + ":" + set;
+                    }
+                }
+                own_differs[k] = differs.empty() ? "none" : differs;
+                std::ostringstream number;
+                number << std::setprecision(17) << independent.ranking.candidates.front().score;
+                own_top_score[k] = number.str();
+            }
+            for (const TieItem& item : endpoint_items) admit(item_candidate(item), item.views);
+
+            // (5) the common pool reranked at each view, and the verdict
+            std::vector<PooledDecision> decisions(view_count);
+            for (std::size_t v = 0; v < view_count; ++v) {
+                if (audit_mismatches != 0) {
+                    views[v].incomplete = "pool_score_mismatch";
+                    continue;
+                }
+                if (!views[v].incomplete.empty()) continue;
+                std::vector<PoolCandidate> at;
+                at.reserve(common.size());
+                for (const auto& [key, entry] : common) {
+                    at.push_back(entry.candidate);
+                    at.back().score = entry.views[v];
+                }
+                decisions[v] = decide_pooled_genotype(std::move(at), block_count, fragments.size(), band);
+                if (decisions[v].score_mismatches != 0) {
+                    views[v].incomplete = "sequence_score_mismatch";
+                    continue;
+                }
+                views[v].decision = &decisions[v];
+                std::ostringstream number;
+                number << std::setprecision(17) << decisions[v].ranking.candidates.front().score;
+                common_top_score[v] = number.str();
+            }
+            // views[0] is the call's own view; [1] and [2] are the endpoints, reported as low and high
+            const LibrarySensitivity verdict = classify_library_sensitivity(decided.genotype, views);
+            if (verdict.status == "SENSITIVE") library_sensitive.insert(verdict.sensitive_blocks.begin(), verdict.sensitive_blocks.end());
+
+            const FragmentScoringCounters& work_after = shared->cumulative_counters();
+            std::ostringstream text;
+            text << std::setprecision(17);
+            text << "library_sensitivity\t" << verdict.status << "\nlibrary_sensitivity_reason\t" << verdict.reason
+                 << "\nlibrary_sensitivity_rule\t" << kLibrarySensitivityRule << "\nlibrary_sensitivity_lambdas\t"
+                 << scoring_options.audit_libraries[0].fragment_start_intensity << ','
+                 << library.fragment_start_intensity << ',' << scoring_options.audit_libraries[1].fragment_start_intensity
+                 << '\n';
+            std::string ids, pairs;
+            for (const std::size_t b : verdict.sensitive_blocks) {
+                const std::string& id = model.blocks()[b].block_id;
+                ids += (ids.empty() ? "" : ",") + id;
+                std::string per_view;
+                for (const std::size_t v : {std::size_t{1}, std::size_t{0}, std::size_t{2}}) {
+                    std::string set;
+                    for (const auto& pair : verdict.projections[v][b]) {
+                        set += (set.empty() ? "" : "+") + std::to_string(pair.first) + "/" + std::to_string(pair.second);
+                    }
+                    per_view += std::string(per_view.empty() ? "" : ";") + view_name[v] + "=" + set;
+                }
+                pairs += (pairs.empty() ? "" : ",") + id + ":" + per_view;
+            }
+            text << "library_sensitive_blocks\t" << (ids.empty() ? "none" : ids) << "\nlibrary_sensitive_block_pairs\t"
+                 << (pairs.empty() ? "none" : pairs) << "\nlibrary_sensitivity_phase_or_representative_only\t"
+                 << (verdict.phase_or_representative_only ? "true" : "false")
+                 << "\nlibrary_sensitivity_central_matches_primary\t" << (verdict.central_matches_primary ? "true" : "false")
+                 << "\nlibrary_sensitivity_distinct_anchors\t" << verdict.distinct_anchors;
+            std::size_t trajectories = 1;
+            for (std::size_t v = 1; v < view_count; ++v) trajectories += fork_of[v] != "none" ? 1 : 0;
+            text << "\nlibrary_sensitivity_trajectories\t" << trajectories << '\n';
+            for (const std::size_t v : {std::size_t{1}, std::size_t{0}, std::size_t{2}}) {
+                const std::string name = std::string("library_sensitivity_") + view_name[v];
+                text << name << "_lambda\t"
+                     << (v == 0 ? library.fragment_start_intensity
+                                : scoring_options.audit_libraries[v - 1].fragment_start_intensity)
+                     << '\n'
+                     << name << "_anchor\t" << views[v].anchor << '\n'
+                     << name << "_fork\t" << fork_of[v] << '\n'
+                     << name << "_trunk_stop\t" << trunk_stop[v] << '\n'
+                     << name << "_incomplete\t" << (views[v].incomplete.empty() ? "none" : views[v].incomplete) << '\n'
+                     << name << "_call_class\t" << verdict.call_class[v] << '\n'
+                     << name << "_top_set_size\t" << verdict.top_set_size[v] << '\n'
+                     << name << "_top_set_digest\t" << verdict.top_set_digest[v] << '\n'
+                     << name << "_representative_digest\t" << verdict.representative_digest[v] << '\n'
+                     << name << "_top_score\t" << common_top_score[v] << '\n'
+                     << name << "_independent_top_score\t" << own_top_score[v] << '\n'
+                     << name << "_independent_differs_blocks\t" << own_differs[v] << '\n'
+                     << name << "_branches_reused\t" << reused_of[v] << '\n'
+                     << name << "_branches_run\t" << run_of[v] << '\n';
+            }
+            text << "library_sensitivity_pool_identities\t" << common.size() << "\nlibrary_sensitivity_pool_added\t"
+                 << common.size() - central_pool << "\nlibrary_sensitivity_added_haplotypes_placed\t"
+                 << shared->haplotypes_created() - created_before << "\nlibrary_sensitivity_added_physical_origins\t"
+                 << work_after.physical_origins - work_before.physical_origins
+                 << "\nlibrary_sensitivity_added_state_classes\t"
+                 << work_after.statistical_state_classes - work_before.statistical_state_classes
+                 << "\nlibrary_sensitivity_added_executed_dps\t" << read_emission_cache_counters().executed_dps - dps_before
+                 << "\nseconds_library_sensitivity\t" << std::fixed << std::setprecision(3) << seconds_since(audit_mark)
+                 << '\n';
+            report.library_sensitivity_text = text.str();
+            if (!library_sensitive.empty()) {
+                report.locus_filter = report.locus_filter == "LOWQUAL_REPRESENTATION_CONFLICT"
+                                          ? "LOWQUAL_REPRESENTATION_CONFLICT;LOWQUAL_LIBRARY_SENSITIVE"
+                                          : "LOWQUAL_LIBRARY_SENSITIVE";
+            }
+        }
         const auto filter_columns = [&](std::size_t b) {
             const BlockFilter& bf = block_filter[b];
             const auto number = [](double v) {
@@ -3744,7 +4317,8 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options, GenotypeDo
         std::vector<std::string> genotype_quality(block_count);
         for (std::size_t b = 0; b < block_count; ++b) {
             genotype_quality[b] = quality_columns(summary, model.blocks()[b].block_id, block_filter[b].filter,
-                                                  summary.block_genotype_read_supported[b] ? "READS" : "PRIOR_ONLY");
+                                                  summary.block_genotype_read_supported[b] ? "READS" : "PRIOR_ONLY",
+                                                  library_sensitive.count(b) != 0);
         }
         {
             std::ofstream out = open_output(prefix + ".genotypes.tsv");

@@ -877,6 +877,11 @@ struct FragmentScoringOptions {
     // not depend on the thread count: no cross-thread floating-point reduction exists to reorder.
     // Defaults to serial, so every existing caller keeps its behaviour without being touched.
     std::size_t threads = 1;
+    // The library-intensity sensitivity audit (library_sensitivity_audit_v1): further libraries whose scores every
+    // diploid combination also computes, from the same mass columns and exposures in the same pass. Nothing is placed
+    // again: the library enters only the combination. The run's own scores are unchanged, and each audit score is,
+    // bit for bit, what a run declaring that library computes. Empty: no audit views.
+    std::vector<LibraryModel> audit_libraries;
 };
 
 struct OriginSummary {
@@ -943,6 +948,8 @@ struct FragmentScoringResult {
     UnionPrefilterCacheReport union_prefilter_cache;
     StartSortReport start_sort;
     std::vector<DiplotypeScore> scores;     // parallel to the requested candidates
+    // [audit library][candidate]: the same candidates under FragmentScoringOptions::audit_libraries.
+    std::vector<std::vector<DiplotypeScore>> audit_scores;
     // Row-major [fragment * unique_haplotypes + haplotype]: the summed log placement mass of one
     // fragment on one chromosome copy of one haplotype. Retained because it is what the exhaustive
     // oracle certifies directly; recovering it from a candidate score would compare the two paths

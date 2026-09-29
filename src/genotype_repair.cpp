@@ -372,6 +372,12 @@ void CoordinateRepairSearch::add_visited(const std::vector<std::size_t>& first, 
     visited_.insert(diplotype_identity(first, second));
 }
 
+bool same_decision(const RoundVerdict& a, const RoundVerdict& b) {
+    return a.complete == b.complete && a.unique_best == b.unique_best &&
+           a.incumbent_in_top_set == b.incumbent_in_top_set && a.moved == b.moved && a.stop == b.stop &&
+           a.winner == b.winner;
+}
+
 bool CoordinateRepairSearch::converged() const {
     if (stop_reason_ == "no_improvement" || stop_reason_ == "no_unvisited_neighbour") return true;
     // A round tie with the incumbent inside the top set: nothing improves on it beyond error.
@@ -699,6 +705,12 @@ bool CoordinateRepairSearch::run(const RepairHooks& hooks) {
         const auto mark = std::chrono::steady_clock::now();
         const FragmentScoringResult scored = context ? context->score_candidates(scored_pairs)
                                                      : score_diplotypes(*interned, scored_pairs, fragments_, library_, scoring_);
+        const std::size_t view_count = 1 + scored.audit_scores.size();
+        if (options_.score_view >= view_count) throw std::logic_error("the repair search's score view was not scored");
+        const auto view_of = [&](std::size_t v) -> const std::vector<DiplotypeScore>& {
+            return v == 0 ? scored.scores : scored.audit_scores[v - 1];
+        };
+        const std::vector<DiplotypeScore>& own = view_of(options_.score_view);
         rec.seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - mark).count();
         if (context) rec.seconds += batch.seconds_placement_and_mass;
         // The deltas ran while slots were being resolved, which is before `mark`.
@@ -778,7 +790,7 @@ bool CoordinateRepairSearch::run(const RepairHooks& hooks) {
         // ---- the guard: the incumbent must still score what it scored before any neighbour is read.
         // Round 1 checks against the start's declared score, which is what ties the search to the
         // ranking it continues rather than to one it produced itself.
-        const double incumbent = scored.scores[pair_of_item[0]].log_likelihood + prior_of_pair[pair_of_item[0]];
+        const double incumbent = own[pair_of_item[0]].log_likelihood + prior_of_pair[pair_of_item[0]];
         if (std::fabs(incumbent - cur_total_) > 1e-6) {
             failed_round_ = round;
             failed_expected_ = cur_total_;
@@ -797,12 +809,17 @@ bool CoordinateRepairSearch::run(const RepairHooks& hooks) {
                 const std::size_t s2 = item == 0 ? cur_s2 : neighbours[item - 1].s2;
                 hooks.on_scored(item == 0 ? cur_first_ : neighbours[item - 1].first,
                                 item == 0 ? cur_second_ : neighbours[item - 1].second, sequences[s1], sequences[s2],
-                                scored.scores[at], prior_of_pair[at]);
+                                own[at], prior_of_pair[at]);
+                if (hooks.on_scored_views) {
+                    std::vector<DiplotypeScore> views;
+                    for (std::size_t v = 0; v < view_count; ++v) views.push_back(view_of(v)[at]);
+                    hooks.on_scored_views(views);
+                }
             }
         }
 
         // ---- certify the round with production's own certifier, in presentation order
-        const auto certify = [&](bool reversed) {
+        const auto certify = [&](bool reversed, const std::vector<DiplotypeScore>& view_scores) {
             std::vector<std::size_t> order(pair_of_item.size());
             for (std::size_t i = 0; i < order.size(); ++i) order[i] = i;
             if (reversed) std::reverse(order.begin(), order.end());
@@ -813,7 +830,7 @@ bool CoordinateRepairSearch::run(const RepairHooks& hooks) {
             for (const std::size_t i : order) {
                 const std::size_t slot = pair_of_item[i];
                 if (!taken.insert(slot).second) continue;
-                scores.push_back(scored.scores[slot]);
+                scores.push_back(view_scores[slot]);
                 priors.push_back(prior_of_pair[slot]);
                 item_of_local.push_back(i);
             }
@@ -821,7 +838,7 @@ bool CoordinateRepairSearch::run(const RepairHooks& hooks) {
                 scores, fragments_.size(), scoring_.mismatch_band, scored.counters, CertificationOptions{}, priors);
             return std::make_pair(ranking, item_of_local);
         };
-        const auto forward = certify(false);
+        const auto forward = certify(false, own);
         const CertifiedRanking& ranking = forward.first;
         const std::size_t winner_item = forward.second[ranking.candidates.front().candidate_id];
         rec.complete = ranking.status == RescoreStatus::Complete;
@@ -834,7 +851,7 @@ bool CoordinateRepairSearch::run(const RepairHooks& hooks) {
 
         // Order invariance, from the scores already computed: no new likelihood call.
         {
-            const auto back = certify(true);
+            const auto back = certify(true, own);
             const std::size_t back_item = back.second[back.first.candidates.front().candidate_id];
             const auto alleles_of = [&](std::size_t item) {
                 if (item == 0) return std::minmax(cur_first_, cur_second_);
@@ -879,16 +896,16 @@ bool CoordinateRepairSearch::run(const RepairHooks& hooks) {
             rec.allele_y = best.y;
             rec.first = best.first;
             rec.second = best.second;
-            rec.fragment = scored.scores[slot].fragment_term;
-            rec.exposure = scored.scores[slot].exposure_term;
+            rec.fragment = own[slot].fragment_term;
+            rec.exposure = own[slot].exposure_term;
             rec.prior = prior_of_pair[slot];
-            rec.total = scored.scores[slot].log_likelihood + prior_of_pair[slot];
+            rec.total = own[slot].log_likelihood + prior_of_pair[slot];
         } else {
             rec.first = cur_first_;
             rec.second = cur_second_;
             const std::size_t slot = pair_of_item[0];
-            rec.fragment = scored.scores[slot].fragment_term;
-            rec.exposure = scored.scores[slot].exposure_term;
+            rec.fragment = own[slot].fragment_term;
+            rec.exposure = own[slot].exposure_term;
             rec.prior = prior_of_pair[slot];
             rec.total = incumbent;
         }
@@ -905,6 +922,49 @@ bool CoordinateRepairSearch::run(const RepairHooks& hooks) {
             stop_reason_ = "cycle";                                  // suppression should preclude this
         } else {
             rec.moved = true;
+        }
+        // ---- the same round at every scored view (library_sensitivity_audit_v1). The neighbourhood is already scored
+        // under each audit library, so each view's move rule is certification and comparison only; the search itself
+        // follows its own view. A view whose rule disagrees with the search's own decision is where its trajectory forks.
+        if (view_count > 1 && !holding_) {
+            rec.verdicts.resize(view_count);
+            for (std::size_t v = 0; v < view_count; ++v) {
+                const std::vector<DiplotypeScore>& at = view_of(v);
+                const auto certified = certify(false, at);
+                const CertifiedRanking& r = certified.first;
+                const std::size_t w = certified.second[r.candidates.front().candidate_id];
+                RoundVerdict& verdict = rec.verdicts[v];
+                verdict.complete = r.status == RescoreStatus::Complete;
+                verdict.unique_best = r.winner_set.size() == 1;
+                for (const std::size_t id : r.winner_set) {
+                    if (certified.second[id] == 0) verdict.incumbent_in_top_set = true;
+                }
+                verdict.incumbent_total = at[pair_of_item[0]].log_likelihood + prior_of_pair[pair_of_item[0]];
+                verdict.winner_total = at[pair_of_item[w]].log_likelihood + prior_of_pair[pair_of_item[w]];
+                verdict.winner = w == 0 ? key_of(cur_first_, cur_second_)
+                                        : key_of(neighbours[w - 1].first, neighbours[w - 1].second);
+                if (!verdict.complete) {
+                    verdict.stop = "rescore_incomplete";
+                } else if (w == 0) {
+                    verdict.stop = "no_improvement";
+                } else if (!verdict.unique_best) {
+                    verdict.stop = "tie_at_best";
+                } else if (verdict.winner_total <= verdict.incumbent_total) {
+                    verdict.stop = "no_improvement";
+                } else if (visited_.count(verdict.winner) != 0) {
+                    verdict.stop = "cycle";
+                } else {
+                    verdict.moved = true;
+                    verdict.stop = "moved";
+                }
+            }
+            // The search's own view must reproduce the decision the search just made, or the replay is not the rule.
+            const RoundVerdict& self = rec.verdicts[options_.score_view];
+            const bool agrees = self.moved == rec.moved && self.complete == rec.complete &&
+                                self.unique_best == rec.unique_best &&
+                                self.incumbent_in_top_set == rec.incumbent_in_top_set &&
+                                (rec.moved ? self.winner == key_of(rec.first, rec.second) : self.stop == stop_reason_);
+            if (!agrees) throw std::logic_error("a round's verdict at the search's own view does not reproduce its decision");
         }
         if (use_delta) {
             std::vector<std::size_t> keep;
@@ -1501,6 +1561,89 @@ TieBranchingReport run_tie_branching(const TieSet& root, const std::vector<Diplo
         settled(done_id);
     }
     return report;
+}
+
+LibrarySensitivity classify_library_sensitivity(const std::vector<std::pair<std::size_t, std::size_t>>& primary,
+                                                const std::vector<LibraryAuditView>& views) {
+    LibrarySensitivity out;
+    const std::size_t blocks = primary.size();
+    out.projections.assign(views.size(), {});
+    out.call_class.assign(views.size(), "incomplete");
+    out.top_set_size.assign(views.size(), 0);
+    out.top_set_digest.assign(views.size(), "NA");
+    out.representative_digest.assign(views.size(), "NA");
+    std::set<std::string> anchors;
+    std::string incomplete;
+    const auto identity_line = [](const PoolCandidate& c) {
+        const DiplotypeIdentity key = diplotype_identity(c.first, c.second);
+        std::string line;
+        for (const std::size_t a : key.first) line += std::to_string(a) + ",";
+        line += "|";
+        for (const std::size_t a : key.second) line += std::to_string(a) + ",";
+        return line;
+    };
+    const auto digest_of = [](std::vector<std::string> lines) {
+        std::sort(lines.begin(), lines.end());
+        std::string text;
+        for (const std::string& line : lines) text += line + "\n";
+        return sha256_bytes(text).substr(0, 16);
+    };
+    for (std::size_t v = 0; v < views.size(); ++v) {
+        const LibraryAuditView& view = views[v];
+        anchors.insert(view.anchor);
+        if (!view.incomplete.empty() || view.decision == nullptr) {
+            if (incomplete.empty()) incomplete = "view_" + std::to_string(v) + ":" + (view.incomplete.empty() ? "no_decision" : view.incomplete);
+            continue;
+        }
+        const PooledDecision& d = *view.decision;
+        out.call_class[v] = d.decision == TopSetDecision::Unique               ? "strict_call"
+                            : d.decision == TopSetDecision::GenotypeEquivalent ? "genotype_equivalent_call"
+                                                                               : "no_call";
+        out.projections[v].assign(blocks, {});
+        std::vector<std::string> members, representatives;
+        for (const std::size_t g : d.top_groups) {
+            const PoolCandidate& rep = d.candidates[d.representative[g]];
+            representatives.push_back(identity_line(rep));
+            for (std::size_t b = 0; b < blocks; ++b) out.projections[v][b].insert(std::minmax(rep.first[b], rep.second[b]));
+            for (const std::size_t m : d.groups[g]) members.push_back(identity_line(d.candidates[m]));
+        }
+        out.top_set_size[v] = members.size();
+        out.top_set_digest[v] = digest_of(members);
+        out.representative_digest[v] = digest_of(representatives);
+    }
+    out.distinct_anchors = anchors.size();
+    if (!views.empty() && !out.projections.front().empty()) {
+        out.central_matches_primary = true;
+        for (std::size_t b = 0; b < blocks; ++b) {
+            if (out.projections.front()[b] != std::set<std::pair<std::size_t, std::size_t>>{primary[b]}) {
+                out.central_matches_primary = false;
+            }
+        }
+    }
+    if (!incomplete.empty()) {
+        out.status = "NOT_EVALUATED";
+        out.reason = incomplete;
+        return out;
+    }
+    for (std::size_t b = 0; b < blocks; ++b) {
+        const std::set<std::pair<std::size_t, std::size_t>> reference{primary[b]};
+        for (std::size_t v = 0; v < views.size(); ++v) {
+            if (out.projections[v][b] != reference) {
+                out.sensitive_blocks.push_back(b);
+                break;
+            }
+        }
+    }
+    out.status = out.sensitive_blocks.empty() ? "STABLE" : "SENSITIVE";
+    if (out.sensitive_blocks.empty()) {
+        for (std::size_t v = 1; v < views.size(); ++v) {
+            if (out.top_set_digest[v] != out.top_set_digest[0] ||
+                out.representative_digest[v] != out.representative_digest[0]) {
+                out.phase_or_representative_only = true;
+            }
+        }
+    }
+    return out;
 }
 
 TieBranchVerdict tie_branch_verdict(bool incomplete, TopSetDecision decision) {

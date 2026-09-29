@@ -89,11 +89,13 @@ std::vector<RankedCandidate> read_caller_ranking(const std::string& prefix);
 // The caller's filter columns for one block, formatted as the caller writes them (12 significant digits, NA for NaN;
 // the marker margin NA only when the guard is off).
 std::vector<std::string> guard_cells(const GuardRow& row);
-// The caller's locus-level filter and quality summary (status keys, in the caller's order) from per-block rows.
+// The caller's locus-level filter and quality summary (status keys, in the caller's order) from per-block rows, and the
+// library-sensitive blocks of the reported genotype (library_sensitivity_audit_v1), which add their locus flag.
 std::vector<std::pair<std::string, std::string>> locus_filter_summary(const std::vector<std::string>& block_ids,
                                                                       const std::vector<std::string>& filters,
                                                                       const std::vector<std::string>& supports,
-                                                                      const std::vector<std::string>& qualities);
+                                                                      const std::vector<std::string>& qualities,
+                                                                      const std::vector<std::string>& library_sensitive = {});
 
 // off / audit: copies the caller's outputs from run_prefix to out_prefix when they differ, and changes nothing.
 // repair: additionally writes <out>.original<suffix>, then applies every eligible COMPLETE_DIPLOTYPE_REPAIR to the

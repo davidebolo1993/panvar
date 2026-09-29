@@ -331,7 +331,8 @@ std::vector<RankedCandidate> read_caller_ranking(const std::string& prefix) {
 std::vector<std::pair<std::string, std::string>> locus_filter_summary(const std::vector<std::string>& block_ids,
                                                                       const std::vector<std::string>& filters,
                                                                       const std::vector<std::string>& supports,
-                                                                      const std::vector<std::string>& qualities) {
+                                                                      const std::vector<std::string>& qualities,
+                                                                      const std::vector<std::string>& library_sensitive) {
     std::vector<std::string> lowqual, unevaluated, pass_ids, low_ids;
     std::size_t unsupported = 0, supported = 0;
     for (std::size_t b = 0; b < block_ids.size(); ++b) {
@@ -340,7 +341,15 @@ std::vector<std::pair<std::string, std::string>> locus_filter_summary(const std:
         (qualities[b] == "PASS" ? pass_ids : low_ids).push_back(block_ids[b]);
         if (supports[b] == "READS") ++supported; else ++unsupported;
     }
-    return {{"locus_filter", !lowqual.empty() ? "LOWQUAL_REPRESENTATION_CONFLICT" : !unevaluated.empty() ? "NOT_EVALUATED" : "PASS"},
+    // library_sensitivity_audit_v1: a library-sensitive block of the reported genotype adds its flag; a flag wins over
+    // NOT_EVALUATED, and two flags are both kept.
+    std::string locus = !lowqual.empty() ? "LOWQUAL_REPRESENTATION_CONFLICT" : !unevaluated.empty() ? "NOT_EVALUATED" : "PASS";
+    if (!library_sensitive.empty()) {
+        locus = locus == "LOWQUAL_REPRESENTATION_CONFLICT" ? "LOWQUAL_REPRESENTATION_CONFLICT;LOWQUAL_LIBRARY_SENSITIVE"
+                                                           : "LOWQUAL_LIBRARY_SENSITIVE";
+    }
+    return {{"locus_filter", locus},
+            {"library_sensitive_blocks", ids_or_none(library_sensitive)},
             {"lowqual_blocks", ids_or_none(lowqual)},
             {"not_evaluated_blocks", ids_or_none(unevaluated)},
             {"representation_guard_complete", unevaluated.empty() ? "true" : "false"},
@@ -417,6 +426,18 @@ DosageIntegration apply_dosage_mode(const PreparedGenotypeModel* model, const st
         d.reported_separation = r.repair_separation;
     }
     const std::set<std::string> applied(d.applied.begin(), d.applied.end());
+    // library_sensitivity_audit_v1: the caller's library-sensitive blocks. A block an applied repair replaced was not
+    // audited in its reported form, so it carries no library reason and is listed as not evaluated.
+    std::set<std::string> library_sensitive;
+    bool library_audited = false;
+    if (exists(out_prefix + ".mosaic_status.tsv")) {
+        const std::map<std::string, std::string> caller_status = read_key_values(out_prefix + ".mosaic_status.tsv");
+        const auto found = caller_status.find("library_sensitive_blocks");
+        library_audited = found != caller_status.end();
+        if (library_audited && found->second != "none") {
+            for (const std::string& id : split(found->second, ',')) library_sensitive.insert(id);
+        }
+    }
 
     // The reported genotype's own filters (section 23). Only a run whose genotype a repair changed is re-annotated; the
     // guard and the read-support rule must first reproduce the caller's own annotation of its own call, or the reported
@@ -521,7 +542,9 @@ DosageIntegration apply_dosage_mode(const PreparedGenotypeModel* model, const st
                 if (support[b] == kNotEvaluated) why += (why.empty() ? "" : ",") + std::string("read_support_not_evaluated_after_dosage_repair");
                 x.quality_reason = why;
             } else {
-                const BlockQuality q = block_quality(rows[b].filter, support[b]);
+                const std::string& id = model->blocks()[b].block_id;
+                const BlockQuality q =
+                    block_quality(rows[b].filter, support[b], library_sensitive.count(id) != 0 && applied.count(id) == 0);
                 x.quality = q.filter; x.quality_reason = q.reason;
             }
             reported[model->blocks()[b].block_id] = x;
@@ -615,12 +638,13 @@ DosageIntegration apply_dosage_mode(const PreparedGenotypeModel* model, const st
     // derives them from its own (locus filter fails closed; quality counts over every block)
     std::vector<std::pair<std::string, std::string>> summaries;   // status key -> reported value, caller's order
     if (!reported.empty()) {
-        std::vector<std::string> ids, fs, ss, qs;
+        std::vector<std::string> ids, fs, ss, qs, sensitive;
         for (const PreparedGenotypeBlock& blk : model->blocks()) {
             const Reported& x = reported.at(blk.block_id);
             ids.push_back(blk.block_id); fs.push_back(x.guard[0]); ss.push_back(x.support); qs.push_back(x.quality);
+            if (library_sensitive.count(blk.block_id) != 0 && applied.count(blk.block_id) == 0) sensitive.push_back(blk.block_id);
         }
-        summaries = locus_filter_summary(ids, fs, ss, qs);
+        summaries = locus_filter_summary(ids, fs, ss, qs, sensitive);
     }
     const auto summary_of = [&](const std::string& key) {
         for (const auto& [k, v] : summaries) if (k == key) return v;
@@ -662,6 +686,13 @@ DosageIntegration apply_dosage_mode(const PreparedGenotypeModel* model, const st
           << ids_or_none(triggered) << "\ndosage_reported_genotype\t" << (applied.empty() ? "caller" : "caller_with_dosage_repair")
           << "\ndosage_search_winner_superseded\t" << (applied.empty() ? "false" : "true") << '\n'
           << "dosage_filters_basis\t" << d.filter_basis << "\ndosage_filters_note\t" << d.filter_note << '\n';
+        if (library_audited) {
+            std::vector<std::string> unaudited;
+            for (const std::string& id : d.applied) {
+                if (library_sensitive.count(id) != 0) unaudited.push_back(id);
+            }
+            o << "library_sensitivity_not_evaluated_blocks\t" << ids_or_none(unaudited) << '\n';
+        }
         const std::string path = out_prefix + ".mosaic_status.tsv";
         if (exists(path)) {
             // the caller's filter-derived lines describe the reported genotype; the caller's values follow as original_<key>

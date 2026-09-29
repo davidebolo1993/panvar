@@ -315,6 +315,12 @@ if(PANVAR_BUILD_TESTING)
         target_compile_options(genotype_seeding_exactness_test PRIVATE -Wall -Wextra -Wpedantic)
         add_test(NAME panvar_genotype_seeding_exactness COMMAND genotype_seeding_exactness_test)
         # The combined per-block quality rule (block_quality_rule_v1).
+        # library_sensitivity_audit_v1: audit scores bit-identical to declared libraries; the genotype-only verdict.
+        add_executable(library_sensitivity_test tests/library_sensitivity.cpp src/cli_utils.cpp)
+        target_link_libraries(library_sensitivity_test PRIVATE panvarlib)
+        target_compile_options(library_sensitivity_test PRIVATE -Wall -Wextra -Wpedantic)
+        add_test(NAME panvar_library_sensitivity COMMAND library_sensitivity_test)
+
         add_executable(genotype_block_quality_test tests/genotype_block_quality.cpp src/cli_utils.cpp)
         target_link_libraries(genotype_block_quality_test PRIVATE panvarlib)
         target_compile_options(genotype_block_quality_test PRIVATE -Wall -Wextra -Wpedantic)
