@@ -2476,7 +2476,7 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options, GenotypeDo
         // Central tie branches, by start and history, as each ran: what an endpoint that decides identically reuses.
         struct CentralBranch {
             BranchResult result;
-            std::vector<bool> agree;               // per view: every round decided as the branch did
+            std::vector<RepairRound> rounds;       // its rounds, each with its verdict at every view
             std::vector<double> terminal_totals;   // per view
         };
         std::map<std::pair<DiplotypeIdentity, std::vector<DiplotypeIdentity>>, CentralBranch> central_branches;
@@ -2851,13 +2851,8 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options, GenotypeDo
                 if (audit_on) {
                     CentralBranch record;
                     record.result = out;
-                    record.agree.assign(view_count, true);
+                    record.rounds = live->rounds();
                     record.terminal_totals.assign(view_count, std::numeric_limits<double>::quiet_NaN());
-                    for (const RepairRound& round : live->rounds()) {
-                        for (std::size_t v = 0; v < view_count && !round.verdicts.empty(); ++v) {
-                            if (!same_decision(round.verdicts[v], round.verdicts[0])) record.agree[v] = false;
-                        }
-                    }
                     if (!live->rounds().empty() && !live->rounds().back().verdicts.empty()) {
                         for (std::size_t v = 0; v < view_count; ++v) {
                             const RoundVerdict& last = live->rounds().back().verdicts[v];
@@ -3947,6 +3942,97 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options, GenotypeDo
                 item.score = item.views.at(view);
                 return item;
             };
+            // A recorded trajectory -- the call's trunk or one of its branches -- continued at view k: shared while
+            // every round decides at k as it did, then, at the first round that does not, either stopped there (its
+            // items are already scored) or forked from k's winner as a leg of its own. Nothing shared is scored again.
+            struct Continued {
+                std::vector<TieItem> items;             // at view k: the shared rounds', then the leg's
+                std::vector<DiplotypeIdentity> moves;   // the incumbents moved to, in order
+                std::string stop = "none";
+                bool in_top = false, forked = false;
+                std::size_t rounds = 0, last_round = 0, fork_round = 0;
+                std::vector<std::size_t> terminal_first, terminal_second;
+                double terminal_total = 0.0;
+            };
+            const auto continue_at = [&](std::size_t k, const std::vector<RepairRound>& rounds,
+                                         const std::vector<TieItem>& items, const std::string& recorded_stop,
+                                         const std::vector<std::size_t>& start_first,
+                                         const std::vector<std::size_t>& start_second,
+                                         const std::vector<std::size_t>& recorded_first,
+                                         const std::vector<std::size_t>& recorded_second, double recorded_total,
+                                         std::vector<DiplotypeIdentity> visited) {
+                Continued c;
+                std::size_t r = npos;
+                for (std::size_t i = 0; i < rounds.size() && r == npos; ++i) {
+                    if (!rounds[i].verdicts.empty() && !same_decision(rounds[i].verdicts[k], rounds[i].verdicts[0])) r = i;
+                }
+                const std::size_t shared_rounds = r == npos ? rounds.size() : r + 1;
+                const std::size_t shared_through = shared_rounds == 0 ? 0 : rounds[shared_rounds - 1].index;
+                for (const TieItem& item : items) {
+                    if (item.round <= shared_through) c.items.push_back(at_view(item, k));
+                }
+                std::vector<std::size_t> first = start_first, second = start_second;
+                for (std::size_t i = 0; i < (r == npos ? rounds.size() : r); ++i) {
+                    if (!rounds[i].moved) continue;
+                    c.moves.push_back(diplotype_identity(rounds[i].first, rounds[i].second));
+                    first = rounds[i].first;
+                    second = rounds[i].second;
+                }
+                c.rounds = shared_rounds;
+                if (r == npos) {
+                    c.stop = recorded_stop;
+                    c.in_top = !rounds.empty() && rounds.back().incumbent_in_top_set;
+                    c.last_round = rounds.empty() ? 0 : rounds.back().index;
+                    c.terminal_first = recorded_first;
+                    c.terminal_second = recorded_second;
+                    c.terminal_total = recorded_total;
+                    return c;
+                }
+                const RoundVerdict& verdict = rounds[r].verdicts[k];
+                c.forked = true;
+                c.fork_round = rounds[r].index;
+                c.last_round = rounds[r].index;
+                c.terminal_first = first;
+                c.terminal_second = second;
+                c.terminal_total = verdict.incumbent_total;
+                if (!verdict.moved) {
+                    c.stop = verdict.stop;
+                    c.in_top = verdict.incumbent_in_top_set;
+                    return c;
+                }
+                const TieItem* winner = nullptr;
+                for (const TieItem& item : items) {
+                    if (item.round == rounds[r].index && diplotype_identity(item.first, item.second) == verdict.winner) {
+                        winner = &item;
+                        break;
+                    }
+                }
+                if (winner == nullptr) throw std::logic_error("the endpoint's winning move was not recorded");
+                c.moves.push_back(verdict.winner);
+                c.terminal_first = winner->first;
+                c.terminal_second = winner->second;
+                c.terminal_total = verdict.winner_total;
+                if (rounds[r].index >= options.repair_rounds) {
+                    c.stop = "round_cap";
+                    return c;
+                }
+                visited.insert(visited.end(), c.moves.begin(), c.moves.end());
+                std::vector<TieItem> own;
+                const Leg leg = run_leg(k, winner, nullptr, 0.0, rounds[r].index + 1, visited, own);
+                if (!leg.reproduced) throw std::runtime_error("fork_start_not_reproduced");
+                endpoint_items.insert(endpoint_items.end(), own.begin(), own.end());
+                c.items.insert(c.items.end(), own.begin(), own.end());
+                c.moves.insert(c.moves.end(), leg.moves.begin(), leg.moves.end());
+                c.rounds += leg.rounds;
+                c.stop = leg.stop;
+                c.in_top = leg.converged && leg.stop == "rescore_incomplete";
+                c.last_round = leg.last_round;
+                c.terminal_first = leg.terminal_first;
+                c.terminal_second = leg.terminal_second;
+                c.terminal_total = leg.terminal_total;
+                return c;
+            };
+            std::vector<std::size_t> branch_forks_of(view_count, 0);
             for (std::size_t k = 1; k < view_count; ++k) {
                 try {
                     // (1) the anchor at this view
@@ -3990,45 +4076,16 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options, GenotypeDo
                         std::vector<TieItem> own;
                         take_leg(run_leg(k, nullptr, &anchor_k, anchor_total, 1, {}, own), own);
                     } else {
-                        std::size_t r = npos;
-                        for (std::size_t i = 0; i < rounds.size() && r == npos; ++i) {
-                            if (!rounds[i].verdicts.empty() && !same_decision(rounds[i].verdicts[k], rounds[i].verdicts[0])) r = i;
-                        }
-                        const std::size_t shared_rounds = r == npos ? rounds.size() : r + 1;
-                        const std::size_t shared_through = shared_rounds == 0 ? 0 : rounds[shared_rounds - 1].index;
-                        for (const TieItem& item : production_items) {
-                            if (item.round <= shared_through) trunk.push_back(at_view(item, k));
-                        }
-                        for (std::size_t i = 0; i < (r == npos ? rounds.size() : r); ++i) {
-                            if (rounds[i].moved) history.push_back(diplotype_identity(rounds[i].first, rounds[i].second));
-                        }
-                        if (r == npos) {
-                            stop = search->stop_reason();
-                            in_top = !rounds.empty() && rounds.back().incumbent_in_top_set;
-                            last_round = rounds.empty() ? 0 : rounds.back().index;
-                        } else {
-                            const RoundVerdict& verdict = rounds[r].verdicts[k];
-                            fork_of[k] = "round" + std::to_string(rounds[r].index);
-                            last_round = rounds[r].index;
-                            if (!verdict.moved) {
-                                stop = verdict.stop;
-                                in_top = verdict.incumbent_in_top_set;
-                            } else if (rounds[r].index >= search->last_round()) {
-                                stop = "round_cap";
-                            } else {
-                                const TieItem* winner = nullptr;
-                                for (const TieItem& item : production_items) {
-                                    if (item.round == rounds[r].index && diplotype_identity(item.first, item.second) == verdict.winner) {
-                                        winner = &item;
-                                        break;
-                                    }
-                                }
-                                if (winner == nullptr) throw std::logic_error("the endpoint's winning move was not recorded");
-                                history.push_back(verdict.winner);
-                                std::vector<TieItem> own;
-                                take_leg(run_leg(k, winner, nullptr, 0.0, rounds[r].index + 1, history, own), own);
-                            }
-                        }
+                        const Continued c = continue_at(k, rounds, production_items, search->stop_reason(),
+                                                        anchor_diplotype.first.alleles, anchor_diplotype.second.alleles,
+                                                        search->incumbent_first(), search->incumbent_second(),
+                                                        search->incumbent_total(), history);
+                        if (c.forked) fork_of[k] = "round" + std::to_string(c.fork_round);
+                        trunk = c.items;
+                        history.insert(history.end(), c.moves.begin(), c.moves.end());
+                        stop = c.stop;
+                        in_top = c.in_top;
+                        last_round = c.last_round;
                     }
                     trunk_stop[k] = stop;
                     own_items[k] = trunk;
@@ -4045,11 +4102,36 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options, GenotypeDo
                         const auto run_branch_k = [&](const BranchStart& branch) {
                             const auto found =
                                 central_branches.find({diplotype_identity(branch.start.first, branch.start.second), branch.history});
-                            if (found != central_branches.end() && found->second.agree[k]) {
-                                ++reused_of[k];
-                                BranchResult out = found->second.result;
-                                for (TieItem& item : out.items) item = at_view(item, k);
-                                out.terminal_total = found->second.terminal_totals[k];
+                            if (found != central_branches.end()) {
+                                const CentralBranch& recorded = found->second;
+                                std::vector<DiplotypeIdentity> visited = branch.history;
+                                visited.push_back(diplotype_identity(branch.start.first, branch.start.second));
+                                const Continued c = continue_at(
+                                    k, recorded.rounds, recorded.result.items, recorded.result.stop, branch.start.first,
+                                    branch.start.second, recorded.result.terminal_first, recorded.result.terminal_second,
+                                    recorded.terminal_totals[k], visited);
+                                ++(c.forked ? branch_forks_of[k] : reused_of[k]);
+                                BranchResult out = recorded.result;
+                                out.items = c.items;
+                                out.rounds = c.rounds;
+                                out.moves = c.moves.size();
+                                out.moved_to = c.moves;
+                                out.stop = c.stop;
+                                out.last_round = c.last_round;
+                                out.terminal_first = c.terminal_first;
+                                out.terminal_second = c.terminal_second;
+                                out.terminal_total = c.terminal_total;
+                                out.why.clear();
+                                const bool converged = c.stop == "no_improvement" || c.stop == "no_unvisited_neighbour" ||
+                                                       (c.stop == "rescore_incomplete" && c.in_top);
+                                if (converged) {
+                                    out.outcome = BranchOutcome::Converged;
+                                } else if (c.stop == "rescore_incomplete" || c.stop == "tie_at_best") {
+                                    out.outcome = BranchOutcome::Split;
+                                } else {
+                                    out.outcome = BranchOutcome::Incomplete;
+                                    out.why = "stopped at " + c.stop;
+                                }
                                 own_items[k].insert(own_items[k].end(), out.items.begin(), out.items.end());
                                 return out;
                             }
@@ -4260,7 +4342,7 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options, GenotypeDo
                  << "\nlibrary_sensitivity_central_matches_primary\t" << (verdict.central_matches_primary ? "true" : "false")
                  << "\nlibrary_sensitivity_distinct_anchors\t" << verdict.distinct_anchors;
             std::size_t trajectories = 1;
-            for (std::size_t v = 1; v < view_count; ++v) trajectories += fork_of[v] != "none" ? 1 : 0;
+            for (std::size_t v = 1; v < view_count; ++v) trajectories += (fork_of[v] != "none" ? 1 : 0) + branch_forks_of[v];
             text << "\nlibrary_sensitivity_trajectories\t" << trajectories << '\n';
             for (const std::size_t v : {std::size_t{1}, std::size_t{0}, std::size_t{2}}) {
                 const std::string name = std::string("library_sensitivity_") + view_name[v];
@@ -4280,6 +4362,7 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options, GenotypeDo
                      << name << "_independent_top_score\t" << own_top_score[v] << '\n'
                      << name << "_independent_differs_blocks\t" << own_differs[v] << '\n'
                      << name << "_branches_reused\t" << reused_of[v] << '\n'
+                     << name << "_branches_forked\t" << branch_forks_of[v] << '\n'
                      << name << "_branches_run\t" << run_of[v] << '\n';
             }
             text << "library_sensitivity_pool_identities\t" << common.size() << "\nlibrary_sensitivity_pool_added\t"
