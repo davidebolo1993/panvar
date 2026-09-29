@@ -4,6 +4,10 @@
 
 #include "panvar/genotype_headline.hpp"
 
+#include <cstdio>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <stdexcept>
 #include <string>
@@ -94,6 +98,26 @@ int main() {
         require(all_na.status == "NOT_APPLICABLE" && all_na.reasons == "NOT_DOSAGE_SENSITIVE@ctx:0,ctx:2", "all not applicable");
         const Aggregate lq_ne = aggregate({{"sv:1", lq}, {"sv:7", ne}});
         require(lq_ne.status == "NOT_EVALUATED", "locus precedence is fail-closed");
+        // file level: a development-view run's status has no call_class; a COMPLETE run is still a strict call
+        {
+            const std::string dir = std::string(std::getenv("TMPDIR") ? std::getenv("TMPDIR") : "/tmp") + "/panvar_headline_test";
+            std::filesystem::create_directories(dir);
+            const std::string p = dir + "/run";
+            std::ofstream(p + ".mosaic_status.tsv") << "key\tvalue\nstatus\tCOMPLETE\nphase_support\tPRIOR_ONLY\nlibrary_provenance\tdeclared: x\n";
+            std::ofstream(p + ".block_genotypes.tsv") << "block_id\tzygosity\tfilter\nctx:0\tHET\tPASS\nsv:1\tHET\tNOT_EVALUATED\n";
+            std::remove((p + ".genotypes.tsv").c_str());
+            const LocusHeadline h = apply_headline(p, {"ctx:0", "sv:1"}, "off", "NA");
+            require(h.genotype.status == "NOT_EVALUATED" && h.genotype.counts.at("PASS") == 1 && h.genotype.counts.at("NOT_EVALUATED") == 1 &&
+                        h.phase.status == "LOW_QUALITY" && h.dosage.status == "NOT_EVALUATED",
+                    "development-view run: headline " + h.call_summary);
+            std::ifstream in(p + ".block_genotypes.tsv"); std::string header; std::getline(in, header);
+            require(header.find("\tgenotype_filter\tgenotype_filter_reasons\tdosage_filter\tdosage_filter_reasons") != std::string::npos,
+                    "block columns appended");
+            std::ofstream(p + ".mosaic_status.tsv") << "key\tvalue\nstatus\tREPAIR_INCOMPLETE\ncall_class\tno_call\nno_call_reason\ttie_branching_incomplete\n";
+            const LocusHeadline n = apply_headline(p, {"ctx:0", "sv:1"}, "repair", "NA");
+            require(n.call_summary == "GENOTYPE_NO_CALL;DOSAGE_NO_CALL;PHASE_NO_CALL" && n.genotype.units == 2 && n.phase.units == 1,
+                    "no-call run: " + n.call_summary);
+        }
     } catch (const std::exception& e) {
         std::cerr << "FAIL  " << e.what() << '\n';
         return 1;

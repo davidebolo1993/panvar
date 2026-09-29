@@ -43,6 +43,12 @@
 | the dosage stage ran and found the reported alleles dosage-inconsistent without resolving the exact diplotype | LOW_QUALITY | `EXACT_DIPLOTYPE_UNRESOLVED` |
 | otherwise | PASS | none |
 
+"The run emitted a genotype" means the status `call_class` is strict_call or genotype_equivalent_call. A run with
+adaptive repair off (the development view) writes no `call_class`; the headline then derives it from the run
+`status`: COMPLETE is a strict call, CONDITIONAL_GENOTYPE_EQUIVALENT a genotype-equivalent call, and any other status
+is a no-call with reason `status_<status>`. The component `call_class` column of locus_genotype.tsv is left as the
+run wrote it (NA).
+
 **What counts as dosage-inconsistent and unresolved:**
 - a content correction (`CONTENT_REPAIRED`);
 - a triggered block left unrepaired;

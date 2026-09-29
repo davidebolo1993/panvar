@@ -225,8 +225,16 @@ LocusHeadline apply_headline(const std::string& out_prefix, const std::vector<st
         const auto found = status.find(key);
         return found == status.end() ? fallback : found->second;
     };
-    locus.call_class = get("call_class", "no_call");
-    locus.no_call_reason = get("no_call_reason", "NA");
+    // The call class; a development-view run (no adaptive repair) writes none, so it is derived from the run status:
+    // COMPLETE is a strict call, CONDITIONAL_GENOTYPE_EQUIVALENT a genotype-equivalent one, anything else no genotype.
+    const std::string run_status = get("status", "NA");
+    locus.call_class = get("call_class", run_status == "COMPLETE"                          ? "strict_call"
+                                         : run_status == "CONDITIONAL_GENOTYPE_EQUIVALENT" ? "genotype_equivalent_call"
+                                                                                           : "no_call");
+    if (locus.call_class == "no_call" && get("no_call_reason", "").empty() && run_status != "NA") {
+        locus.no_call_reason = "status_" + run_status;
+    }
+    if (locus.no_call_reason == "NA") locus.no_call_reason = get("no_call_reason", "NA");
     locus.phase_support = get("phase_support", "NA");
     locus.dosage_mode = dosage_mode;
     locus.dosage_audit_status = dosage_audit_status;
