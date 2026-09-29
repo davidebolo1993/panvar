@@ -387,16 +387,15 @@ DosageIntegration apply_dosage_mode(const PreparedGenotypeModel* model, const st
             if (exists(run_prefix + s)) atomic_write(out_prefix + s, slurp(run_prefix + s));
         }
     }
-    if (mode != "repair") return d;
+    if (mode == "off") return d;
 
-    // Everything is decided and built in memory first; the originals are written, then the rewrites.
     const std::map<std::string, std::string> status = read_key_values(out_prefix + ".mosaic_status.tsv");
-    const auto dosage = read_dosage_blocks(out_prefix + ".dosage_blocks.tsv");
     const bool stage_ran = summary != nullptr && audit_status == "COMPLETE";
     const std::optional<PersistedCall> call = read_persisted_call(out_prefix);
 
     // eligibility of each COMPLETE_DIPLOTYPE_REPAIR (section 22.2): fail closed on anything the frozen contract does
-    // not cover exactly
+    // not cover exactly. Evaluated in audit mode too, as a record only: there a complete repair that repair mode would
+    // apply is available but not applied because of the mode, and one a guard refuses carries the guard's reason.
     std::vector<const CompleteRepair*> eligible;
     if (stage_ran) {
         std::string refuse;
@@ -411,12 +410,18 @@ DosageIntegration apply_dosage_mode(const PreparedGenotypeModel* model, const st
                 refuse = "reported_haplotypes_not_reproduced";
             }
         }
+        std::map<std::string, std::string>& refused = mode == "repair" ? d.not_applied : d.audit_not_applied;
         for (const CompleteRepair& r : summary->complete_repairs) {
-            if (!refuse.empty()) d.not_applied[r.block_id] = refuse;
-            else if (!r.allele1 || !r.allele2) d.not_applied[r.block_id] = "repaired_allele_not_a_panel_allele";
-            else eligible.push_back(&r);
+            if (!refuse.empty()) refused[r.block_id] = refuse;
+            else if (!r.allele1 || !r.allele2) refused[r.block_id] = "repaired_allele_not_a_panel_allele";
+            else if (mode == "repair") eligible.push_back(&r);
+            else d.audit_not_applied[r.block_id] = headline::kAuditModeNotApplied;
         }
     }
+    if (mode != "repair") return d;
+
+    // Everything is decided and built in memory first; the originals are written, then the rewrites.
+    const auto dosage = read_dosage_blocks(out_prefix + ".dosage_blocks.tsv");
     MosaicPath first, second;
     if (!eligible.empty()) {
         first = call->first;
@@ -737,7 +742,8 @@ void write_locus_genotype(const PreparedGenotypeModel* model, const std::string&
     // before anything below reads them, and the locus values join this table (headline_filters_v2).
     std::vector<std::string> block_ids;
     if (model) for (const PreparedGenotypeBlock& b : model->blocks()) block_ids.push_back(b.block_id);
-    const headline::LocusHeadline headline = headline::apply_headline(out_prefix, block_ids, d.mode, d.audit_status);
+    const headline::LocusHeadline headline =
+        headline::apply_headline(out_prefix, block_ids, d.mode, d.audit_status, d.mode == "audit" ? d.audit_not_applied : d.not_applied);
     const std::map<std::string, std::string> status = read_key_values(out_prefix + ".mosaic_status.tsv");
     const std::string base = basename_of(out_prefix);
     const auto link = [&](const std::string& suffix) { return exists(out_prefix + suffix) ? base + suffix : std::string("NA"); };

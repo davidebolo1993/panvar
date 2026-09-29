@@ -22,7 +22,7 @@ fail=0; n=0
 # (repair_memory.tsv, tie_branch_memory.tsv) is process memory only and is not compared; tie branches are compared
 # apart from their wall-time column (1-14 kept).
 status_science() {
-  grep -vE '^(seconds_|resources_|threads_|phys_footprint|rss_|emission_cache_dp_hits|emission_cache_dp_misses|emission_cache_executed_dps|emission_cache_executed_prefilters|scorer_emission_cache_arena_bytes|union_cached_prefilters_consumed|union_prefilter_cache_misses|worker_seconds_|sha256_|profile|settings_overridden)' "$1" | grep -v "$2"
+  grep -vE '^(seconds_|resources_|threads_|phys_footprint|rss_|emission_cache_dp_hits|emission_cache_dp_misses|emission_cache_executed_dps|emission_cache_executed_prefilters|scorer_emission_cache_arena_bytes|union_cached_prefilters_consumed|union_prefilter_cache_misses|worker_seconds_|sha256_|profile|preset|settings_overridden)' "$1" | grep -v "$2"
 }
 norm() {   # norm <file> <prefix>
   case "$1" in

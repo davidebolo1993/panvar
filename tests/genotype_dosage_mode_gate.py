@@ -66,7 +66,7 @@ SUMMARY_KEYS = {"locus_filter", "lowqual_blocks", "not_evaluated_blocks", "repre
                 "quality_reason_representation_not_evaluated", "quality_reason_no_read_support", "blocks_genotype_read_supported"}
 STATUS_VOLATILE = re.compile(r"^(seconds_|resources_|threads_|phys_footprint|rss_|emission_cache_dp_hits|emission_cache_dp_misses|"
                              r"emission_cache_executed_dps|emission_cache_executed_prefilters|scorer_emission_cache_arena_bytes|"
-                             r"union_cached_prefilters_consumed|union_prefilter_cache_misses|union_prefilter_cache_decisions_not_retained|worker_seconds_|sha256_|profile|"
+                             r"union_cached_prefilters_consumed|union_prefilter_cache_misses|union_prefilter_cache_decisions_not_retained|worker_seconds_|sha256_|profile|preset|"
                              r"settings_overridden|scorer_placement_capacity_bytes_peak)")
 SKIP = (".eval.", ".gate_eval", ".evaluate.log", ".command.txt", ".log", ".time", ".done", ".repair_memory.tsv", ".tie_branch_memory.tsv")
 REFERENCE = "HG00096#1#haplotype1-0000024:31848049-32074186"

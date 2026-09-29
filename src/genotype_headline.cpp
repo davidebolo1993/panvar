@@ -76,10 +76,16 @@ Verdict dosage_verdict(const LocusFacts& locus, const BlockFacts& block) {
     if (locus.dosage_audit_status != "COMPLETE") return v("NOT_EVALUATED", "DOSAGE_NOT_EVALUATED:audit_" + locus.dosage_audit_status);
     const std::string& s = block.dosage_status;
     if (s == "CONSISTENT") return v("PASS", "DOSAGE_CONSISTENT");
-    if (s == "REPAIRED" && block.repair_class == "COMPLETE_DIPLOTYPE_REPAIR" && block.dosage_repair_applied) {
-        return v("PASS", "COMPLETE_REPAIR_APPLIED");
+    if (s == "REPAIRED") {
+        const bool complete = block.repair_class == "COMPLETE_DIPLOTYPE_REPAIR";
+        if (complete && block.dosage_repair_applied) return v("PASS", "COMPLETE_REPAIR_APPLIED");
+        // audit mode: the resolved repair is usable dosage content; only the selected mode kept it from the genotype
+        if (complete && locus.dosage_mode == "audit" && block.repair_not_applied_reason == kAuditModeNotApplied) {
+            return v("PASS", "COMPLETE_REPAIR_AVAILABLE_NOT_APPLIED");
+        }
+        // an eligibility, reproduction or safety guard refused it (repair mode, or repair mode's guards in audit mode)
+        return v("LOW_QUALITY", "COMPLETE_REPAIR_NOT_APPLIED:" + block.repair_not_applied_reason);
     }
-    if (s == "REPAIRED") return v("LOW_QUALITY", "COMPLETE_REPAIR_NOT_APPLIED");
     if (s == "CONTENT_REPAIRED" && block.dosage_content_scope == "COMPLETE") return v("PASS", "CONTENT_CORRECTED_EXACT_DIPLOTYPE_UNRESOLVED");
     if (s == "CONTENT_REPAIRED") return v("LOW_QUALITY", "CONTENT_CORRECTION_CONDITIONAL");
     if (s == "SUSPECT") return v("LOW_QUALITY", "DOSAGE_SUSPECT");
@@ -218,7 +224,8 @@ void rewrite_block_table(const std::string& path, const std::map<std::string, st
 } // namespace
 
 LocusHeadline apply_headline(const std::string& out_prefix, const std::vector<std::string>& block_ids,
-                             const std::string& dosage_mode, const std::string& dosage_audit_status) {
+                             const std::string& dosage_mode, const std::string& dosage_audit_status,
+                             const std::map<std::string, std::string>& repair_not_applied) {
     const std::map<std::string, std::string> status = read_status(out_prefix + ".mosaic_status.tsv");
     LocusFacts locus;
     const auto get = [&](const std::string& key, const std::string& fallback) {
@@ -271,6 +278,11 @@ LocusHeadline apply_headline(const std::string& out_prefix, const std::vector<st
             b.repair_class = pick("repair_class");
             b.dosage_content_scope = pick("dosage_content_scope");
             b.dosage_repair_applied = bg.cell(r, "dosage_repair_applied", "NA") == "true";
+            const auto why = repair_not_applied.find(b.block_id);
+            if (why != repair_not_applied.end()) b.repair_not_applied_reason = why->second;
+            else if (bg.cell(r, "dosage_stage_filter", "") == "DOSAGE_REPAIR_NOT_APPLIED") {
+                b.repair_not_applied_reason = bg.cell(r, "dosage_stage_filter_reason");
+            }
             blocks.push_back(b);
         }
     }

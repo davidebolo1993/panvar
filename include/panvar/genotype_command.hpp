@@ -252,6 +252,7 @@ struct GenotypeCommandOptions {
     // The technology preset applied before the profile and the flags (docs/algorithms/genotype_cli.md section 3), and
     // the keys it set. Empty: none. A preset never names a locus.
     std::string preset_name;
+    bool preset_explicit = false;   // false: the command line's default preset (an omitted --preset means short-read)
     std::vector<std::string> preset_keys;
 };
 

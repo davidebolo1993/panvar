@@ -13,7 +13,10 @@
 - **`headline_filters_v2`:**
   - the advanced scientific flags (`--help-advanced`), each exactly its profile key;
   - per-setting source records in `<prefix>.settings.tsv`;
-  - the three headline filters (`genotype_headline_filters.md`).
+  - the three headline filters (`genotype_headline_filters.md`);
+  - an omitted `--preset` means `--preset short-read` (the §2 default), recorded as `preset short-read (default)`;
+    the unrepaired development view needs `--adaptive-repair off`;
+  - `--phase-audit-candidates` is a development-only control, refused under adaptive repair.
 
 **Not implemented:**
 - **The resource predictor** (§3).
@@ -21,7 +24,11 @@
 **Existing flags keep working unchanged.**
 - `--library FILE` reproduces the frozen calls unchanged (gated).
 - The block and locus tables gain trailing headline columns.
-- The repair-mode `dosage_filter` component is renamed `dosage_stage_filter`.
+- The repair-mode `dosage_filter` component is renamed `dosage_stage_filter`. Frozen historical tables (the sealed
+  campaign, replay and packages) keep the old name.
+- **One intended behaviour change:** a command with neither `--preset` nor a profile used to give the unrepaired
+  development view; it now runs the production algorithm. Profile runs and explicit `--preset short-read` runs are
+  unchanged.
 
 ## 1. The basic command
 

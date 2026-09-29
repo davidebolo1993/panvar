@@ -645,7 +645,8 @@ void write_status(
     if (!options.preset_name.empty()) {
         std::string keys;
         for (const std::string& k : options.preset_keys) keys += (keys.empty() ? "" : ",") + k;
-        out << "preset\t" << options.preset_name << "\npreset_keys\t" << (keys.empty() ? "none" : keys) << '\n';
+        out << "preset\t" << options.preset_name << "\npreset_source\t" << (options.preset_explicit ? "flag" : "default")
+            << "\npreset_keys\t" << (keys.empty() ? "none" : keys) << '\n';
     }
     // library_sensitivity_audit_v1: the record under --library auto; <prefix>.library_sensitivity.tsv on every run.
     std::string sensitivity = "library_sensitivity\tNOT_APPLICABLE\nlibrary_sensitivity_reason\tdeclared_library\n"
@@ -5169,6 +5170,7 @@ struct AdvancedFlag {
     const char* key;
     bool on_off;
     const char* help;
+    bool development_only = false;   // refused under adaptive repair, the production default
 };
 const AdvancedFlag kAdvancedFlags[] = {
     {"--kmer-size", "kmer_size", false, "marker k-mer length, 1..31"},
@@ -5177,7 +5179,8 @@ const AdvancedFlag kAdvancedFlags[] = {
     {"--switch-probability", "switch_probability", false, "per-boundary template-switch prior, in (0, 0.5]"},
     {"--proposal-state-limit", "proposal_state_limit", false, "mosaic proposal beam width"},
     {"--mismatch-band", "mismatch_band", false, "read-placement mismatch band of the truncated model"},
-    {"--phase-audit-candidates", "phase_audit_candidates", false, "candidates in the phase audit set (0: none)"},
+    {"--phase-audit-candidates", "phase_audit_candidates", false,
+     "candidates in the phase audit set (0: none); at least --mosaic-candidates", true},
     {"--repair-local-pairs", "repair_local_pairs", false, "allele pairs per block in a repair neighbourhood"},
     {"--repair-max-neighbours", "repair_max_neighbours", false, "declared bound on one repair neighbourhood (0: none)"},
     {"--repair-tie-branching", "repair_tie_branching", true, "exact branch-and-pool at improving-move ties"},
@@ -5197,12 +5200,20 @@ int run_genotype_command(const std::vector<std::string>& args) {
         return args[++i];
     };
     // A technology preset is applied first, then the profile, wherever they appear; a flag given beside them overrides
-    // both and is recorded as an override, so the status always says what the run actually ran under.
+    // both and is recorded as an override, so the status always says what the run actually ran under. An omitted
+    // --preset means --preset short-read: the production algorithm is the default, and the unrepaired development view
+    // needs an explicit --adaptive-repair off. The preset is applied once, the last --preset given or the default.
+    options.preset_name = "short-read";
+    options.preset_explicit = false;
     for (std::size_t i = 0; i < args.size(); ++i) {
         if (args[i] != "--preset") continue;
         options.preset_name = need(i);
+        options.preset_explicit = true;
+    }
+    {
+        const std::string context = "preset " + options.preset_name + (options.preset_explicit ? "" : " (default)");
         for (const auto& [key, value] : genotype_preset_settings(options.preset_name)) {
-            apply_genotype_setting("preset " + options.preset_name, key, value, options);
+            apply_genotype_setting(context, key, value, options);
             options.preset_keys.push_back(key);
         }
     }
@@ -5278,7 +5289,8 @@ int run_genotype_command(const std::vector<std::string>& args) {
                 "Genotypes one structural locus from paired short reads: a diplotype (two whole-locus haplotypes)\n"
                 "over the graph's panel, projected to one allele pair per block.\n\n"
                 "Options:\n"
-                "  --preset short-read        the production algorithm and short-read constants (long-read: refused)\n"
+                "  --preset short-read        the production algorithm and short-read constants; the default when\n"
+                "                             omitted (long-read: refused, not implemented)\n"
                 "  --library auto|FILE        omitted means auto: insert and fragment-start intensity estimated from the\n"
                 "                             reads, refused (LIBRARY_REFUSED) if invalid, never a fallback. FILE declares\n"
                 "                             every value and is the exact reproducibility route (no estimate, no audit).\n"
@@ -5287,7 +5299,8 @@ int run_genotype_command(const std::vector<std::string>& args) {
                 "  --bubbles FILE             precomputed bubbles CSV (default: detected from the graph)\n"
                 "  --threads N                workers\n"
                 "  --mosaic-candidates K      off-panel mosaics scored beside every panel diplotype\n"
-                "  --adaptive-repair on|off   the exact coordinate repair (on under the preset)\n"
+                "  --adaptive-repair on|off   the exact coordinate repair (default on); off gives the unrepaired\n"
+                "                             development view\n"
                 "  --repair-rounds N          the repair's round cap\n"
                 "  --dosage-mode off|audit|repair   the dosage stage (default off)\n"
                 "  --profile FILE             a validated settings profile\n"
@@ -5314,16 +5327,26 @@ int run_genotype_command(const std::vector<std::string>& args) {
             GenotypeCommandOptions defaults;
             std::cout <<
                 "panvar genotype: advanced settings\n\n"
-                "Precedence: explicit flag > profile (--profile) > preset (--preset) > built-in default, whatever the\n"
-                "argument order. Every effective setting and its source is written to <prefix>.settings.tsv.\n\n"
+                "Precedence: explicit flag > profile (--profile) > preset > built-in default, whatever the argument\n"
+                "order. The preset is --preset short-read whether or not it is given. Every effective setting and its\n"
+                "source is written to <prefix>.settings.tsv.\n\n"
                 "Scientific flags (each is exactly its profile key: same parser, same validation):\n";
-            for (const AdvancedFlag& f : kAdvancedFlags) {
+            const auto preset = genotype_preset_settings("short-read");
+            const auto show = [&](const AdvancedFlag& f) {
                 std::string head = std::string("  ") + f.flag + (f.on_off ? " on|off" : " N");
                 head.resize(std::max<std::size_t>(head.size() + 1, 34), ' ');
-                const std::string d = genotype_setting_value(defaults, f.key);
-                std::cout << head << f.help << "\n" << std::string(34, ' ') << "profile key " << f.key
-                          << "; built-in default " << (f.on_off ? (d == "1" ? "on" : "off") : d) << "\n";
-            }
+                const auto word = [&](const std::string& v) { return f.on_off ? std::string(v == "1" ? "on" : "off") : v; };
+                const std::string built_in = word(genotype_setting_value(defaults, f.key));
+                const auto in_preset = std::find_if(preset.begin(), preset.end(), [&](const auto& kv) { return kv.first == f.key; });
+                std::cout << head << f.help << "\n" << std::string(34, ' ') << "profile key " << f.key << "; "
+                          << (in_preset == preset.end() ? "built-in default " + built_in
+                                                        : "short-read preset " + word(in_preset->second) + " (built-in " + built_in + ")")
+                          << "\n";
+            };
+            for (const AdvancedFlag& f : kAdvancedFlags) if (!f.development_only) show(f);
+            std::cout << "\nDevelopment-only scientific control: refused under adaptive repair (the production default, whose\n"
+                         "pooled rerank replaces the audit); it needs --adaptive-repair off:\n";
+            for (const AdvancedFlag& f : kAdvancedFlags) if (f.development_only) show(f);
             const auto list = [](const std::vector<std::string>& keys) {
                 std::string out = "  ";
                 std::size_t width = 2;
@@ -5347,8 +5370,8 @@ int run_genotype_command(const std::vector<std::string>& args) {
                 "\nLibrary parameters belong to --library FILE, one per line: insert_mean_bp, insert_sd_bp,\n"
                 "support_sigmas, substitution_error, outlier_weight, fragment_start_intensity and optionally\n"
                 "marker_background.\n\n"
-                "Development views: without a profile or preset the unrepaired proposal call is made; --adaptive-repair\n"
-                "off gives the same. Diagnostic and test hooks are not user settings and are not listed.\n";
+                "Development view: --adaptive-repair off gives the unrepaired proposal call (no repair rounds, no tie\n"
+                "branching). Diagnostic and test hooks are not user settings and are not listed.\n";
             return 0;
                 } else {
             throw std::runtime_error("unknown genotype option: " + flag);

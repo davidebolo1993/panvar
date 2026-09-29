@@ -4,6 +4,7 @@
 
 #include "panvar/genotype_dosage.hpp"
 #include "panvar/genotype_dosage_integrate.hpp"
+#include "panvar/genotype_headline.hpp"
 #include "panvar/genotype_dosage_repair.hpp"
 #include "panvar/genotype_repair.hpp"
 #include "panvar/mosaic_spelling.hpp"
@@ -374,7 +375,8 @@ void write_synthetic_run(const PreparedGenotypeModel& m, const std::string& pref
                          const std::string& run_status, const std::string& sv1_status, const std::string& sv1_class) {
     const std::string cls = run_status == "COMPLETE" ? "strict_call" : "genotype_equivalent_call";
     atomic_write(prefix + ".mosaic_status.tsv", "key\tvalue\nstatus\t" + run_status + "\ncall_class\t" + cls +
-                                                    "\nno_call_reason\tnone\nphase_support\tREADS_WITHIN_CANDIDATES\n");
+                                                    "\nno_call_reason\tnone\nphase_support\tREADS_WITHIN_CANDIDATES\n"
+                                                    "library_provenance\tdeclared: synthetic\n");
     const auto path = [](const MosaicPath& p) {
         std::string o; for (std::size_t i = 0; i < p.alleles.size(); ++i) o += (i ? "," : "") + std::to_string(p.alleles[i]); return o;
     };
@@ -403,6 +405,34 @@ void write_synthetic_run(const PreparedGenotypeModel& m, const std::string& pref
         fa += ">" + prefix + "_" + name + " fingerprint=f bp=" + std::to_string(s.size()) + " phase_support=READS_WITHIN_CANDIDATES\n" + s + "\n";
     }
     atomic_write(prefix + ".mosaic_haplotypes.fa", fa);
+}
+
+// One block's cells of a block table, by column name.
+std::map<std::string, std::string> block_row(const std::string& path, const std::string& block_id) {
+    std::istringstream in(slurp_file(path));
+    std::vector<std::string> head;
+    std::map<std::string, std::string> out;
+    for (std::string line; std::getline(in, line);) {
+        std::vector<std::string> f;
+        std::stringstream ls(line);
+        for (std::string x; std::getline(ls, x, '\t');) f.push_back(x);
+        if (head.empty()) { head = f; continue; }
+        if (f.empty() || f[0] != block_id) continue;
+        for (std::size_t i = 0; i < head.size() && i < f.size(); ++i) out[head[i]] = f[i];
+    }
+    return out;
+}
+
+// The headline of one block after write_locus_genotype, against the expected filters and reasons.
+void require_headline(const std::string& prefix, const std::string& block_id, const std::string& genotype, const std::string& genotype_reasons,
+                      const std::string& dosage, const std::string& dosage_reasons, const std::string& what) {
+    for (const char* table : {".block_genotypes.tsv", ".genotypes.tsv"}) {
+        auto r = block_row(prefix + table, block_id);
+        require(r["genotype_filter"] == genotype && r["genotype_filter_reasons"] == genotype_reasons && r["dosage_filter"] == dosage &&
+                    r["dosage_filter_reasons"] == dosage_reasons,
+                what + table + ": got " + r["genotype_filter"] + "/" + r["genotype_filter_reasons"] + " " + r["dosage_filter"] + "/" +
+                    r["dosage_filter_reasons"]);
+    }
 }
 
 void test_repair_mode_integration() {
@@ -481,6 +511,11 @@ void test_repair_mode_integration() {
                 name + ": the caller's genotype stays");
         require(bg.find("DOSAGE_REPAIR_NOT_APPLIED\t" + reason) != std::string::npos, name + ": the block says why");
         for (const std::string& s : legacy) require(slurp_file(p + ".original" + s) == before[s], name + ": original" + s);
+        // headline: a guard refused the candidate; the unchanged genotype is dosage-inconsistent and the dosage content
+        // unconfirmed
+        write_locus_genotype(&m, p, done);
+        require_headline(p, "sv:1", "LOW_QUALITY", "EXACT_DIPLOTYPE_UNRESOLVED", "LOW_QUALITY", "COMPLETE_REPAIR_NOT_APPLIED:" + reason,
+                         name + ": repair-mode refusal headline ");
     };
     CompleteRepair second = repair_to(a, b);
     second.block = 2; second.block_id = "ctx:2";
@@ -498,9 +533,32 @@ void test_repair_mode_integration() {
         DosageShadowSummary summary;
         summary.complete_repairs = {repair_to(a, b)};
         const DosageIntegration done = apply_dosage_mode(&m, "audit", p, p, &summary, "COMPLETE", "none");
-        require(done.applied.empty(), "audit applies nothing");
+        require(done.applied.empty() && done.not_applied.empty(), "audit applies nothing");
+        require(done.audit_not_applied == std::map<std::string, std::string>{{"sv:1", headline::kAuditModeNotApplied}},
+                "audit records the eligible complete repair as available, not applied because of the mode");
         for (const std::string& s : legacy) require(slurp_file(p + s) == before[s], "audit leaves " + s);
         require(!std::filesystem::exists(p + ".original.genotypes.tsv"), "audit writes no originals");
+        // headline: usable dosage content, an unchanged dosage-inconsistent genotype
+        write_locus_genotype(&m, p, done);
+        require_headline(p, "sv:1", "LOW_QUALITY", "EXACT_DIPLOTYPE_UNRESOLVED", "PASS", "COMPLETE_REPAIR_AVAILABLE_NOT_APPLIED",
+                         "audit-mode available repair headline ");
+        require(block_row(p + ".block_genotypes.tsv", "sv:1")["allele2"] == std::to_string(a), "audit keeps the caller's genotype");
+    }
+    {   // audit mode, where repair mode's guard would refuse the repair: the guard's reason, never PASS
+        const std::string p = (dir / "audit_refused").string();
+        write_synthetic_run(m, p, h1, h2, "COMPLETE", "REPAIRED", "COMPLETE_DIPLOTYPE_REPAIR");
+        std::string fa = slurp_file(p + ".mosaic_haplotypes.fa");
+        const std::size_t at = fa.find('\n') + 1;
+        fa[at] = fa[at] == 'A' ? 'C' : 'A';
+        atomic_write(p + ".mosaic_haplotypes.fa", fa);
+        DosageShadowSummary summary;
+        summary.complete_repairs = {repair_to(a, b)};
+        const DosageIntegration done = apply_dosage_mode(&m, "audit", p, p, &summary, "COMPLETE", "none");
+        require(done.applied.empty() && done.audit_not_applied == std::map<std::string, std::string>{{"sv:1", "reported_haplotypes_not_reproduced"}},
+                "audit records the guard's reason");
+        write_locus_genotype(&m, p, done);
+        require_headline(p, "sv:1", "LOW_QUALITY", "EXACT_DIPLOTYPE_UNRESOLVED", "LOW_QUALITY",
+                         "COMPLETE_REPAIR_NOT_APPLIED:reported_haplotypes_not_reproduced", "audit-mode refused repair headline ");
     }
     std::filesystem::remove_all(dir);
 }

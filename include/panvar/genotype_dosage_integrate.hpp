@@ -34,6 +34,9 @@ struct DosageIntegration {
     // not, with the fail-closed reason
     std::vector<std::string> applied;
     std::map<std::string, std::string> not_applied;
+    // audit mode only, a record for the headline filters: each COMPLETE_DIPLOTYPE_REPAIR block with the guard reason
+    // repair mode would refuse it for, or headline::kAuditModeNotApplied when repair mode would apply it
+    std::map<std::string, std::string> audit_not_applied;
     std::optional<MosaicPath> reported_first, reported_second;   // set only when a repair was applied
     double reported_fragment = 0.0, reported_exposure = 0.0, reported_prior = 0.0, reported_separation = 0.0;
     bool originals_written = false;

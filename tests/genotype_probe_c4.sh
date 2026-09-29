@@ -52,7 +52,8 @@ rss_of() {   # bytes, from either BSD or GNU time output
 run_and_evaluate() {   # scheme graph K
   local scheme="$1" graph="$2" k="$3" prefix="$OUT/$1/K$3"
   set +e
-  /usr/bin/time "$TIME_FLAG" "$PANVAR" genotype --gfa "$graph" --reference-path "$REF" \
+  # the unrepaired caller this ladder was built on: explicit since the short-read preset became the default
+  /usr/bin/time "$TIME_FLAG" "$PANVAR" genotype --adaptive-repair off --gfa "$graph" --reference-path "$REF" \
     --reads1 "$OUT/sim/reads_1.fq" --reads2 "$OUT/sim/reads_2.fq" --library "$OUT/sim/library.txt" \
     --out-prefix "$prefix" --max-mosaic-candidates "$k" -q 2> "$prefix.time"
   set -e

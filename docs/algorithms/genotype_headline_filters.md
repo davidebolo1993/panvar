@@ -44,7 +44,7 @@
 | otherwise | PASS | none |
 
 "The run emitted a genotype" means the status `call_class` is strict_call or genotype_equivalent_call. A run with
-adaptive repair off (the development view) writes no `call_class`; the headline then derives it from the run
+`--adaptive-repair off` (the development view) writes no `call_class`; the headline then derives it from the run
 `status`: COMPLETE is a strict call, CONDITIONAL_GENOTYPE_EQUIVALENT a genotype-equivalent call, and any other status
 is a no-call with reason `status_<status>`. The component `call_class` column of locus_genotype.tsv is left as the
 run wrote it (NA).
@@ -52,7 +52,8 @@ run wrote it (NA).
 **What counts as dosage-inconsistent and unresolved:**
 - a content correction (`CONTENT_REPAIRED`);
 - a triggered block left unrepaired;
-- a complete repair that was not applied (audit mode, or failing an eligibility rule).
+- a complete repair that was not applied, whether audit mode kept it out or a guard refused it. The reported alleles
+  stay the caller's in both cases.
 
 **Rules outside the table:**
 - `genotype_support=PRIOR_ONLY` is reported and does not alone fail the filter.
@@ -66,7 +67,8 @@ run wrote it (NA).
 | stage did not complete | NOT_EVALUATED | `DOSAGE_NOT_EVALUATED:audit_<status>` |
 | CONSISTENT | PASS | `DOSAGE_CONSISTENT` |
 | complete diplotype repair, applied | PASS | `COMPLETE_REPAIR_APPLIED` |
-| complete diplotype repair, not applied | LOW_QUALITY | `COMPLETE_REPAIR_NOT_APPLIED` |
+| complete diplotype repair, audit mode, eligible (repair mode would apply it) | PASS | `COMPLETE_REPAIR_AVAILABLE_NOT_APPLIED` |
+| complete diplotype repair refused by an eligibility, reproduction or safety guard (repair mode, or repair mode's guards evaluated in audit mode) | LOW_QUALITY | `COMPLETE_REPAIR_NOT_APPLIED:<reason>` |
 | content correction, content scope COMPLETE | PASS | `CONTENT_CORRECTED_EXACT_DIPLOTYPE_UNRESOLVED` |
 | content correction, content scope conditional | LOW_QUALITY | `CONTENT_CORRECTION_CONDITIONAL` |
 | SUSPECT | LOW_QUALITY | `DOSAGE_SUSPECT` |
@@ -75,6 +77,15 @@ run wrote it (NA).
 | NOT_SENSITIVE | NOT_APPLICABLE | `NOT_DOSAGE_SENSITIVE` |
 | unrecognised | NOT_EVALUATED | `DOSAGE_NOT_EVALUATED` |
 | no-call | NO_CALL | `RUN_NO_CALL` |
+
+**A complete repair audit mode did not apply** has usable dosage content: the stage resolved the whole diplotype and
+repair mode's guards (strict call, a single complete repair, panel alleles, reproduced haplotypes) all hold. Only the
+selected mode kept it from the reported genotype, which stays the caller's and dosage-inconsistent, so the genotype is
+LOW_QUALITY `EXACT_DIPLOTYPE_UNRESOLVED`. A guard's refusal is different: the repair could not be confirmed, so the
+dosage is LOW_QUALITY with the guard's reason (`not_a_strict_call`, `several_complete_repairs_not_jointly_scored`,
+`repaired_allele_not_a_panel_allele`, `reported_haplotypes_not_reproduced`). A reason that was not recorded reads
+`COMPLETE_REPAIR_NOT_APPLIED:not_recorded`, never PASS. Audit mode evaluates the guards as a record only
+(genotype_dosage.md §22.2); no candidate, repair decision or reported genotype changes.
 
 **A content-only correction is never an exact allele call.** Its genotype is LOW_QUALITY `EXACT_DIPLOTYPE_UNRESOLVED`
 and its dosage is PASS. The reported alleles stay the caller's, and the corrected content is reported only in the dosage
@@ -152,11 +163,19 @@ reads. At `loo.NA19650` 10× and 30× the call is:
 **Scientific settings** are exposed as named flags (`panvar genotype --help-advanced`). Each is exactly its profile
 key: the same parser and the same range validation.
 
-**Precedence** is `flag > profile > preset > built-in default`, whatever the argument order.
+**Precedence** is `flag > profile > preset > built-in default`, whatever the argument order, applied once.
+
+**The preset is short-read by default.** An omitted `--preset` means `--preset short-read`, so the plain command runs
+the production algorithm (adaptive repair, exact tie branching, the representation guard). An explicit
+`--preset short-read` is equivalent; `--preset long-read` is refused as unimplemented. A profile still overrides the
+preset, key by key. The unrepaired development view needs an explicit `--adaptive-repair off`.
+`--phase-audit-candidates` is a development-only control: adaptive repair refuses it, because its pooled rerank
+replaces the audit.
 
 **Resource caps, caches and time and footprint limits** stay profile keys.
 
 **Provenance:** `<prefix>.settings.tsv` records every public setting's effective value and its source (`default`,
-`preset short-read`, `profile <path>` or `flag --…`).
+`preset short-read (default)` when the preset was not given, `preset short-read` when it was, `profile <path>` or
+`flag --…`). `mosaic_status.tsv` records `preset`, `preset_source` (`default` or `flag`) and `preset_keys`.
 
 **Invalid values** are refused before any work, and no output is written.

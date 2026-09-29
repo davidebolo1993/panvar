@@ -719,7 +719,8 @@ unaffected:
 
 - **`filter` (representation) and `quality_filter` (read support)** are unchanged and computed as today. Dosage never
   rewrites them.
-- **A new per-block `dosage_filter`:**
+- **A new per-block `dosage_stage_filter`** (named `dosage_filter` before `headline_filters_v2`, whose headline column
+  now carries that name):
   - `PASS`: CONSISTENT, NOT_SENSITIVE, or REPAIRED;
   - `DOSAGE_CONTENT_CORRECTED`: CONTENT_REPAIRED, i.e. the original alleles contradict the complete dosage content;
   - `DOSAGE_TRIGGERED_UNREPAIRED`;
@@ -730,7 +731,7 @@ unaffected:
   - A strict call whose repaired block came from a pair-route complete repair stays `strict_call`, with
     `dosage_repaired_blocks` listed.
   - A call with any CONDITIONAL_DOSAGE_CONTENT block keeps its class. The status records
-    `dosage_content_corrected_blocks`, and that block's `dosage_filter` is DOSAGE_CONTENT_CORRECTED.
+    `dosage_content_corrected_blocks`, and that block's `dosage_stage_filter` is DOSAGE_CONTENT_CORRECTED.
 
 ### 20.5 Status file and recoverability
 
@@ -839,6 +840,11 @@ exactly as a fresh run would be integrated.
   - the caller's representative paths respell the committed FASTA exactly (`reported_haplotypes_not_reproduced`).
 
   None of these cases occurs in the C4 replay (§22.5). Each is covered by a fixture.
+
+  Audit mode evaluates the same eligibility as a record only (`headline_filters_v2`): it applies nothing and writes no
+  component column. A COMPLETE_DIPLOTYPE_REPAIR that repair mode would apply is recorded as `dosage_mode_audit`
+  (available, not applied because of the mode), and one a guard would refuse carries the guard's reason. Only the
+  headline DOSAGE_FILTER reads the record.
 - **Status:** `mosaic_status.tsv` keeps every caller line, in order, and gains these keys after them:
   - `dosage_mode`, `dosage_policy`, `dosage_audit_status`, `dosage_molecule_span_bp`, `dosage_m`;
   - `dosage_repair_class_*`;

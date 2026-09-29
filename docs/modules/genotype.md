@@ -6,12 +6,13 @@ Genotypes a structural locus from paired short reads against the locus pangenome
 This page states what is frozen at `26401b4`, the C4 short-read freeze. The contracts are in
 [`algorithms/genotype_mosaic.md`](../algorithms/genotype_mosaic.md) and
 [`algorithms/genotype_dosage.md`](../algorithms/genotype_dosage.md). The planned user-facing command and presets are in
-[`algorithms/genotype_cli.md`](../algorithms/genotype_cli.md). It is partly implemented: `--preset short-read`, the
-basic flags, and automatic library estimation with its sensitivity audit as the default.
+[`algorithms/genotype_cli.md`](../algorithms/genotype_cli.md). It is partly implemented: `--preset short-read` (the
+default), the basic flags, and automatic library estimation with its sensitivity audit as the default.
 
 ## One adaptive algorithm
 
-There is one production algorithm, **panel-anchored adaptive completion**, selected by a profile.
+There is one production algorithm, **panel-anchored adaptive completion**. It is the default; a profile or the
+short-read preset selects it too.
 - It scores every panel diplotype and up to K off-panel mosaics built from the graph's alleles.
 - It repairs the incumbent by exact neighbour search, branching exactly at improving-move ties.
 - It certifies the winner against every rival beyond floating-point error.
@@ -56,11 +57,14 @@ The frozen C4 invocation:
 **`--library-diagnostic`,** off by default, writes an estimate beside a `--library FILE` run and is never used by the
 call.
 
-**The basic command:** `--graph G --reads1 R1 --reads2 R2 --out PREFIX --preset short-read [--library FILE]
---threads N`.
-- `--preset short-read` switches on the production algorithm with short-read technology constants. It sets no locus,
-  resource or dosage value.
+**The basic command:** `--graph G --reads1 R1 --reads2 R2 --out PREFIX [--library FILE] --threads N`.
+- **An omitted `--preset` means `--preset short-read`:** the production algorithm with short-read technology
+  constants. It sets no locus, resource or dosage value, and a profile overrides it key by key. An explicit
+  `--preset short-read` is equivalent. `settings.tsv` records the source as `preset short-read (default)` or
+  `preset short-read`.
 - `--preset long-read` is refused as not implemented.
+- **The unrepaired development view** needs `--adaptive-repair off`. `--phase-audit-candidates` is development-only:
+  adaptive repair refuses it.
 - Without `--reference-path`, the graph's declared reference sample (`RS:Z`) is used. With none declared, the run
   refuses and lists the candidates. The C4 graph declares none.
 
@@ -73,7 +77,10 @@ call.
 | `repair` | as audit. A block whose dosage repair is complete and resolved (COMPLETE_DIPLOTYPE_REPAIR) gets the repaired genotype; the caller's outputs are kept as `<prefix>.original.*`, a complete prefix the evaluator scores unchanged |
 
 `repair` changes a genotype only under the four eligibility rules of `genotype_dosage.md` §22.2. Otherwise the block
-is marked `DOSAGE_REPAIR_NOT_APPLIED` with the reason.
+is marked `DOSAGE_REPAIR_NOT_APPLIED` with the reason, and its headline DOSAGE_FILTER is LOW_QUALITY
+`COMPLETE_REPAIR_NOT_APPLIED:<reason>`. In `audit` mode an eligible complete repair is not applied because of the
+mode only: DOSAGE_FILTER PASS `COMPLETE_REPAIR_AVAILABLE_NOT_APPLIED`, GENOTYPE_FILTER LOW_QUALITY
+`EXACT_DIPLOTYPE_UNRESOLVED`.
 
 ## Outputs: locus level and block level
 
@@ -137,7 +144,7 @@ Each filter describes the **reported** genotype. After an applied repair, the ca
 | `filter` (representation) | `PASS`, `LOWQUAL_REPRESENTATION_CONFLICT`, `NOT_EVALUATED` | the marker depth and the exposure term prefer another pair while the fragment term prefers the call, each by ≥ ln 1000 (`representation_conflict_rule_v1`) |
 | `genotype_support` | `READS`, `PRIOR_ONLY` | whether the reads alone put every rival of another genotype at this block below the reported diplotype |
 | `quality_filter` | `PASS`, `LOW_QUALITY` | `block_quality_rule_v1`: PASS only for representation PASS with READS support and, under `--library auto`, no library sensitivity (reason `library_sensitive`) |
-| `dosage_stage_filter` (repair mode; was `dosage_filter` before `headline_filters_v2`) | `PASS`, `DOSAGE_CONTENT_CORRECTED`, `DOSAGE_TRIGGERED_UNREPAIRED`, `DOSAGE_SUSPECT`, `DOSAGE_UNDERPOWERED`, `DOSAGE_NOT_EVALUATED`, `DOSAGE_REPAIR_NOT_APPLIED` | the dosage stage's own verdict on the reported block; information limits are reasons, never merged into `quality_filter` |
+| `dosage_stage_filter` (repair mode; was `dosage_filter` before `headline_filters_v2`, and frozen historical tables keep that name) | `PASS`, `DOSAGE_CONTENT_CORRECTED`, `DOSAGE_TRIGGERED_UNREPAIRED`, `DOSAGE_SUSPECT`, `DOSAGE_UNDERPOWERED`, `DOSAGE_NOT_EVALUATED`, `DOSAGE_REPAIR_NOT_APPLIED` | the dosage stage's own verdict on the reported block; information limits are reasons, never merged into `quality_filter` |
 | `locus_filter` | `PASS`, `LOWQUAL_REPRESENTATION_CONFLICT`, `LOWQUAL_LIBRARY_SENSITIVE`, `NOT_EVALUATED`, `NOT_EVALUATED_LIBRARY_SENSITIVITY` (several joined by `;`) | fails closed over the blocks; a flag wins over NOT_EVALUATED; an incomplete library audit is a locus-level warning |
 
 A repaired run's filters are recomputed on the repaired diplotype. If the caller's own annotation cannot first be
@@ -166,7 +173,8 @@ Genotyping: the sealed 484-job campaign, per job.
   `--repair-tie-branching on|off`, `--repair-tie-max-branches` and `--representation-guard on|off`).
 - **Each flag is exactly its profile key:** the same parser and the same validation.
 - **Resource caps, caches and time and footprint limits** stay profile keys.
-- **Precedence** is flag > profile > preset > built-in default, whatever the argument order.
+- **Precedence** is flag > profile > preset > built-in default, whatever the argument order. The preset is
+  short-read unless another is named.
 - **Provenance:** every effective setting and its source is in `<prefix>.settings.tsv`.
 - **Invalid values** refuse before any work.
 

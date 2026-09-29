@@ -47,9 +47,20 @@ int main() {
         BlockFacts rep = block("sv:1", "REPAIRED"); rep.repair_class = "COMPLETE_DIPLOTYPE_REPAIR"; rep.dosage_repair_applied = true;
         expect(genotype_verdict(L, rep), "PASS", "none", "applied repair: genotype");
         expect(dosage_verdict(L, rep), "PASS", "COMPLETE_REPAIR_APPLIED", "applied repair: dosage");
-        BlockFacts unapplied = rep; unapplied.dosage_repair_applied = false;
-        expect(genotype_verdict(L, unapplied), "LOW_QUALITY", "EXACT_DIPLOTYPE_UNRESOLVED", "unapplied complete repair: genotype");
-        expect(dosage_verdict(L, unapplied), "LOW_QUALITY", "COMPLETE_REPAIR_NOT_APPLIED", "unapplied complete repair: dosage");
+        // repair mode, a guard refused the candidate: dosage LOW_QUALITY with the guard's reason
+        BlockFacts unapplied = rep; unapplied.dosage_repair_applied = false; unapplied.repair_not_applied_reason = "not_a_strict_call";
+        expect(genotype_verdict(L, unapplied), "LOW_QUALITY", "EXACT_DIPLOTYPE_UNRESOLVED", "refused complete repair: genotype");
+        expect(dosage_verdict(L, unapplied), "LOW_QUALITY", "COMPLETE_REPAIR_NOT_APPLIED:not_a_strict_call", "refused complete repair: dosage");
+        BlockFacts unrecorded = rep; unrecorded.dosage_repair_applied = false;
+        expect(dosage_verdict(L, unrecorded), "LOW_QUALITY", "COMPLETE_REPAIR_NOT_APPLIED:not_recorded", "no recorded reason: never PASS");
+        // audit mode, the repair is available and only the mode kept it out: usable dosage content, unresolved genotype
+        const LocusFacts audit = strict("PRIOR_ONLY", "audit");
+        BlockFacts available = unapplied; available.repair_not_applied_reason = kAuditModeNotApplied;
+        expect(genotype_verdict(audit, available), "LOW_QUALITY", "EXACT_DIPLOTYPE_UNRESOLVED", "audit-available repair: genotype");
+        expect(dosage_verdict(audit, available), "PASS", "COMPLETE_REPAIR_AVAILABLE_NOT_APPLIED", "audit-available repair: dosage");
+        expect(dosage_verdict(L, available), "LOW_QUALITY", "COMPLETE_REPAIR_NOT_APPLIED:dosage_mode_audit",
+               "the audit reason is PASS only in audit mode");
+        expect(dosage_verdict(audit, unapplied), "LOW_QUALITY", "COMPLETE_REPAIR_NOT_APPLIED:not_a_strict_call", "audit mode, guard refused");
         expect(dosage_verdict(L, block("sv:7", "SUSPECT")), "LOW_QUALITY", "DOSAGE_SUSPECT", "suspect");
         expect(dosage_verdict(L, block("sv:7", "UNDERPOWERED")), "NOT_EVALUATED", "DOSAGE_UNDERPOWERED", "underpowered");
         expect(dosage_verdict(L, block("ctx:0")), "NOT_APPLICABLE", "NOT_DOSAGE_SENSITIVE", "not sensitive");

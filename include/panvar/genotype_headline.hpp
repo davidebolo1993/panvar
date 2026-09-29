@@ -52,7 +52,13 @@ struct BlockFacts {
     std::string repair_class = "NA";
     std::string dosage_content_scope = "NA";
     bool dosage_repair_applied = false;
+    // why a COMPLETE_DIPLOTYPE_REPAIR was not applied: a guard's reason, or kAuditModeNotApplied when it is available and
+    // only the audit mode kept it from the reported genotype
+    std::string repair_not_applied_reason = "not_recorded";
 };
+
+// The reason of a complete repair that repair mode would apply, not applied because --dosage-mode audit was selected.
+inline constexpr const char* kAuditModeNotApplied = "dosage_mode_audit";
 
 Verdict genotype_verdict(const LocusFacts& locus, const BlockFacts& block);
 Verdict dosage_verdict(const LocusFacts& locus, const BlockFacts& block);
@@ -75,8 +81,11 @@ struct LocusHeadline {
 // .block_genotypes.tsv, .genotypes.tsv, .dosage_blocks.tsv), appends the four block columns (genotype_filter,
 // genotype_filter_reasons, dosage_filter, dosage_filter_reasons) to both block tables, replacing them if present, and
 // returns the locus values. `block_ids` names the model's blocks for a run with no block table (a no-call).
+// `repair_not_applied` is the dosage stage's record of the complete repairs it did not apply (block -> reason); a block
+// it does not name falls back to the block table's dosage_stage_filter_reason (repair mode).
 LocusHeadline apply_headline(const std::string& out_prefix, const std::vector<std::string>& block_ids,
-                             const std::string& dosage_mode, const std::string& dosage_audit_status);
+                             const std::string& dosage_mode, const std::string& dosage_audit_status,
+                             const std::map<std::string, std::string>& repair_not_applied = {});
 
 // The locus-table columns the headline adds, in order, and their values.
 const std::vector<std::string>& locus_columns();
