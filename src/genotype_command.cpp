@@ -5284,6 +5284,7 @@ int run_genotype_command(const std::vector<std::string>& args) {
                 "                             every value and is the exact reproducibility route (no estimate, no audit).\n"
                 "  --reference-path NAME      the coordinate reference (default: the graph's RS:Z sample)\n"
                 "  --panel-curation FILE      panel templates to exclude\n"
+                "  --bubbles FILE             precomputed bubbles CSV (default: detected from the graph)\n"
                 "  --threads N                workers\n"
                 "  --mosaic-candidates K      off-panel mosaics scored beside every panel diplotype\n"
                 "  --adaptive-repair on|off   the exact coordinate repair (on under the preset)\n"
@@ -5327,8 +5328,8 @@ int run_genotype_command(const std::vector<std::string>& args) {
                 std::string out = "  ";
                 std::size_t width = 2;
                 for (const std::string& key : keys) {
-                    if (width + key.size() + 2 > 104) { out += "\n  "; width = 2; }
-                    out += key + "  ";
+                    if (width > 2 && width + key.size() + 2 > 104) { out += "\n  "; width = 2; }
+                    out += (width > 2 ? "  " : "") + key;
                     width += key.size() + 2;
                 }
                 return out + "\n";
@@ -5343,7 +5344,7 @@ int run_genotype_command(const std::vector<std::string>& args) {
             std::cout << "\nResource caps, caches and limits: profile keys only (key<TAB>value in a --profile file):\n"
                       << list(resource) << "Measurement keys (profile only; not for production calls):\n" << list(measurement);
             std::cout <<
-                "\n\nLibrary parameters belong to --library FILE, one per line: insert_mean_bp, insert_sd_bp,\n"
+                "\nLibrary parameters belong to --library FILE, one per line: insert_mean_bp, insert_sd_bp,\n"
                 "support_sigmas, substitution_error, outlier_weight, fragment_start_intensity and optionally\n"
                 "marker_background.\n\n"
                 "Development views: without a profile or preset the unrepaired proposal call is made; --adaptive-repair\n"
