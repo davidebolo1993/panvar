@@ -4119,6 +4119,13 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options, GenotypeDo
                 admit(entry.candidate, found == pool_views.end() ? std::vector<DiplotypeScore>{} : found->second);
             }
             const std::size_t central_pool = common.size();
+            // A union haplotype's digest, computed at most once: a set holds thousands of candidates over far fewer
+            // haplotypes of ~200 kb each.
+            std::vector<std::optional<SequenceDigest>> union_digest(interned.sequences.size());
+            const auto digest_at = [&](std::size_t h) {
+                if (!union_digest[h]) union_digest[h] = sequence_digest(interned.sequences[h]);
+                return *union_digest[h];
+            };
             const auto union_candidate = [&](const SetRanking& set, std::size_t i) {
                 const MosaicCandidate& c = set.candidates[i];
                 const std::size_t x = interned.index_of[slot_of_path.at(c.diplotype.first.alleles)];
@@ -4127,8 +4134,8 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options, GenotypeDo
                 PoolCandidate candidate;
                 candidate.first = c.diplotype.first.alleles;
                 candidate.second = c.diplotype.second.alleles;
-                candidate.first_sequence = sequence_digest(interned.sequences[x]);
-                candidate.second_sequence = sequence_digest(interned.sequences[y]);
+                candidate.first_sequence = digest_at(x);
+                candidate.second_sequence = digest_at(y);
                 candidate.score = scored.scores[scored_index.at(key)];
                 candidate.sequence_prior = haploid_sequence_prior[key.first] + haploid_sequence_prior[key.second] +
                                            (key.first != key.second ? std::log(2.0) : 0.0);
