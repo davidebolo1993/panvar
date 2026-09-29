@@ -203,3 +203,56 @@ intensity.
 **Decision: auto stays off by omission** (the batch's stop condition).
 - A fixed preset intensity cannot represent samples of different depth.
 - The intensity has to be declared, or inferred after the deferred sensitivity study.
+
+## 6. `--library auto` with the marker-fit intensity (2026-09-29; `af4c2ce`; auto stays opt-in)
+
+Frozen before any call: `tests/results/library_auto_lambda_study/SPEC.md`, seal `889f4fc6…`.
+
+**What changed:**
+- `--library auto` takes the fragment-start intensity from the invariant-marker depth fit.
+- The anchor-depth estimate and the ratio of the two are recorded as diagnostics.
+- The run refuses (`LIBRARY_REFUSED`, naming `--library FILE`) when the fit did not converge or the intensity is not
+  finite and positive.
+- The fixed preset intensity is no longer used by auto.
+
+**Experiment** (8 sentinels, frozen reads, C4 profile, dosage off). Its outputs were sealed (`seal_outputs.sha256`,
+431 files) before the frozen evaluator was run.
+
+| arm | what it is | scientific outputs against A |
+|---|---|---|
+| A | the sealed explicit-library campaign output (not rerun) | — |
+| B | declared library, marker-fit intensity | unchanged in 8 of 8 |
+| C | full auto | primary call unchanged in 8 of 8; secondary differences in 3, below |
+
+**The secondary differences in C:**
+- `lzo.HG00096.2`: ctx:0 read support READS → PRIOR_ONLY. This is the insert-estimate knife-edge of §5.
+- `mosaic.dense_switching_1.30` and `loo.NA19650.30`: the genotype-equivalent sets have the same members and the same
+  unordered genotype. Only row order among tied members, or the phase-unresolved representative, changes.
+
+**The intensity estimates:** marker-fit against declared ranges from 0.885 to 1.000, and marker-fit against anchor
+from 0.92 to 1.07 (`comparison.tsv`).
+
+**Other gates:**
+- **Threads:** at 1/2/4/8 threads every output of the auto candidate is identical.
+- **`--library FILE`:** byte-identical to the sealed campaign (2 cells rerun with the new binary).
+- **Truth** (post-seal): no new catastrophic error, no LZO or mosaic call made inexact, and no LOO excess regression in
+  any arm.
+
+**Sensitivity** (auto insert fixed, λ at 0.9, 1.0 and 1.1 × the marker-fit estimate; 4 cells):
+- Stable on 3 of 4: `lzo.HG00096.2`, `lzo.HG00096.30` and `loo.NA19650.30`.
+- **Changed on `loo.HG03456.2` at 0.9×:** 5 block genotypes changed. ctx:0 4/9 → 4/6, sv:1 6/16 → 6/17, ctx:2 74/45 →
+  74/44, ctx:6 90/110 → 90/100 and sv:7 6/91 → 6/100 are 1–2 bp allele swaps, and ctx:10 lost read support.
+  - Against truth it is no worse: excess 4 → 2 bp, sv:1 truth undefined.
+  - But it is a primary genotype change.
+
+**Score decomposition (`hg03456_2_start_decomposition.tsv`).** The two best panel diplotypes compete for the repair's
+start.
+- The fragment term prefers the 0.9× start by 120.58 nats at every λ.
+- The exposure term prefers the 1.0× start by 116.68, 129.64 and 142.61 nats at 0.9, 1.0 and 1.1 × λ, which is linear
+  in λ.
+- The prior is flat (0.0005 nats).
+- The start therefore flips at about 0.93 × the estimate, and the repair then follows each start's lineage.
+- §3 measured the marker-fit estimate as up to 11% low at 2×, so the flip lies inside the estimator's own uncertainty.
+
+**Decision (the frozen rule):** a primary genotype changed inside ±10%, so `--library auto` stays opt-in and an omitted
+`--library` does not mean auto. `--library FILE` remains the reproducibility path.
