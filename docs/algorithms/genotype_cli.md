@@ -1,12 +1,20 @@
-# `panvar genotype`: user-facing command contract and presets (normative design, 2026-09-28)
+# `panvar genotype`: user-facing command contract and presets (normative design, 2026-09-28; partly implemented 2026-09-29)
 
-This is a design, written before any default changes. Nothing here is implemented at `26401b4`.
+**Implemented at `c758ae2`:**
+- **`--preset short-read`:** §3 kind 2, only the production-algorithm and technology keys.
+- **`--preset long-read`:** refused as not implemented.
+- **`--library auto|FILE`:** §4, and `library_estimate.md` §5.
+- **The normal-user flags:** `--graph`, `--out`, `--mosaic-candidates`, `--adaptive-repair on|off` and
+  `--repair-rounds`.
+- **Declared-reference resolution:** an `RS:Z` header tag, or a refusal that lists the candidates.
 
-- **The current command** is `panvar genotype --profile FILE --gfa … --reference-path … --library FILE …`. Its flags
-  and its frozen C4 invocation are unchanged.
-- **What each part below needs before it lands:**
-  - the automatic library (§4) needs its measurement review (`library_estimate.md`);
-  - the renamed flags need a compatibility gate: every existing flag keeps working and is byte-identical in output.
+**Not implemented:**
+- **`--library auto` as the default.** An omitted `--library` is still an error.
+- **Per-setting source records** beyond `preset` / `preset_keys` / `library_mode` and the profile's
+  `overridden_settings`.
+- **The resource predictor** (§3).
+
+**Existing flags keep working unchanged.** `--library FILE` reproduces the frozen path byte for byte (gated).
 
 ## 1. The basic command
 
@@ -79,6 +87,18 @@ The preset names a technology's assumptions and nothing about a locus. Each sett
 | **2. Technology preset** (transfers between loci) | `substitution_error` 0.002; `gap_open` 1e-4; `gap_extend` 0.5; `outlier_weight` 0.001; `support_sigmas` 4; `kmer_size` 31; `syncmer_s` 15; `mismatch_band` 6; `switch_probability` 0.01; `proposal_state_limit` 256; `max_mosaic_candidates` 128; `repair_rounds` 32; `repair_local_pairs` 32; `repair_tie_branching` on; `repair_tie_max_branches` 16; `representation_guard` on; `phase_audit_candidates` 0 | declared constants of the preset |
 | **3. Locus / model-derived** | blocks (`min_variant_bp` 50 is the block rule's threshold, a model parameter); graph paths; the marker census and anchors; panel size; the resource predictions | the graph and the model built from it |
 | **4. Expert overrides** | every scientifically meaningful control above | flags, `--profile` |
+
+**As implemented (`c758ae2`, `genotype_preset_settings`):**
+- **Keys the preset sets:** `repair_rounds` 32, `repair_tie_branching` 1 and `representation_guard` 1, which switch on
+  the production algorithm.
+- **Keys it restates, equal to the built-in defaults:** `kmer_size` 31, `syncmer_s` 15, `min_variant_bp` 50,
+  `mismatch_band` 6, `switch_probability` 0.01, `proposal_state_limit` 256, `phase_audit_candidates` 0.
+- **Keys it leaves at the built-in defaults, never the C4 profile's values:** `max_mosaic_candidates`,
+  `repair_local_pairs`, `repair_tie_max_branches`, every cap, every cache budget, and the footprint and time limits
+  (no limit unless given). The status lists the preset's keys (`preset_keys`).
+- **Library constants** (`genotype_preset_library`): support 4, substitution 0.002, outlier 0.001, the built-in gap
+  model, and fragment-start intensity 0.05.
+  - The intensity is a declared convention: λ = depth / (4 L) at 30× with 2 × 150 bp pairs. It is not inferred.
 
 **Rules the preset keeps:**
 - **No C4 resource cap enters `short-read`.** The frozen profile's caps, cache budgets, and footprint and time limits

@@ -150,3 +150,56 @@ The declared intensity is the realised fragment count ÷ 2 × locus length.
    k/s, and the dosage policy.
 6. **`--library auto` stays off.** It needs item 4's check. It also needs the insert refusal path tested on real data
    whose placements are insufficient or multimodal; none exists in the C4 set.
+
+## 5. `--library auto` (implemented `c758ae2`; not the default)
+
+**What `auto` uses:**
+- **Insert centre and spread:** the estimator of §2, taking the mean and sd within 6 robust sd.
+- **Validation:** at most 20,000 pairs are examined, and at least 500 must be accepted. The run is refused
+  (`LIBRARY_REFUSED`, naming `--library FILE`) when the estimate is:
+  - insufficient;
+  - multimodal;
+  - contaminated in the insert, with more than 5% beyond 6 robust sd;
+  - contaminated in orientation, with more than 5% of anchored pairs not inward-facing FR.
+- **Every other value from `--preset short-read`:** support 4, substitution 0.002, outlier 0.001, the built-in gap
+  model, and fragment-start intensity 0.05. That intensity is a declared convention, λ = depth / (4 L) at 30× with
+  2 × 150 bp pairs. It is not inferred.
+- **Records:** `<prefix>.library_estimate.tsv` holds the estimate and a `library.<parameter>` row with the value and
+  source of every used value (`placement_estimate`, `short_read_preset`, `reads`). The status carries `library_mode
+  auto` and the provenance.
+- **`--library FILE`** is unchanged.
+- **Fixtures:** acceptance, each of the four refusals and its message, and the preset's scope are fixtures in
+  `tests/library_estimate.cpp`.
+
+**Sentinel gates** (`tests/results/library_auto_gates_c758ae2`):
+- **Setup:** frozen C4 profile, dosage off. Each sentinel runs with `--library FILE` and with `--library auto`.
+- **`--library FILE`** reproduces the sealed campaign byte for byte in 8 of 8.
+- **Estimate determinism:** identical at 1/2/4/8 threads.
+- **LZO against LOO, identical reads (HG03456 2×):** 346.59 ± 41.72 bp against 346.74 ± 41.77 bp. The anchor sets
+  differ, so the two are close but not identical.
+
+**`--library auto` changed scientific outputs in 6 of 8 sentinels.** Unchanged: `lzo.HG00096.30` and
+`mosaic.dense_switching_1.30`.
+
+| sentinel | changed |
+|---|---|
+| `loo.HG03456.2` | 4 block genotypes, trajectory, tie branches, locus filter |
+| `lzo.HG03456.2` | block genotypes, trajectory |
+| `mosaic.dense_switching_1.2` | block genotypes, trajectory |
+| `loo.HG03456.30` | filters, trajectory |
+| `lzo.HG00096.2` | one block's read support |
+| `loo.NA19650.30` | the equivalence set's winner rows (same unordered genotype) |
+
+The winner's exposure term moves by about −18,700 nats at 2× and +10,500 to +12,100 at 30×.
+
+**Attribution:** arm A is the estimated insert with every declared value; arm B is the declared insert with the preset
+intensity.
+- **The preset intensity (B) reproduces every genotype, trajectory and tie-branch change,** and the 30× filter and
+  winner changes. Against the declared intensity it is 10× too high at 2× and 1.5× too low at 30×.
+- **The estimated insert (A) changes no genotype, trajectory or winner in any of the 6 cells tested.** Its only effect
+  is the `lzo.HG00096.2` ctx:0 read-support flip: a fragment-contender rival crosses the error bound after a 3.5 bp
+  shift in the insert centre.
+
+**Decision: auto stays off by omission** (the batch's stop condition).
+- A fixed preset intensity cannot represent samples of different depth.
+- The intensity has to be declared, or inferred after the deferred sensitivity study.

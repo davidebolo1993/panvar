@@ -6,7 +6,8 @@ Genotypes a structural locus from paired short reads against the locus pangenome
 This page states what is frozen at `26401b4`, the C4 short-read freeze. The contracts are in
 [`algorithms/genotype_mosaic.md`](../algorithms/genotype_mosaic.md) and
 [`algorithms/genotype_dosage.md`](../algorithms/genotype_dosage.md). The planned user-facing command and presets are in
-[`algorithms/genotype_cli.md`](../algorithms/genotype_cli.md), which is a design and not yet implemented.
+[`algorithms/genotype_cli.md`](../algorithms/genotype_cli.md). It is partly implemented at `c758ae2`:
+`--preset short-read`, `--library auto` and the basic flags.
 
 ## One adaptive algorithm
 
@@ -25,9 +26,27 @@ The frozen C4 invocation:
       --gfa <graph> --reference-path <reference path> --reads1 R1.fq --reads2 R2.fq \
       --library library.txt --threads 8 --out-prefix <prefix> [--panel-curation <manifest>]
 
-Today `--library` is required: a declared insert distribution, error, outlier and fragment-start intensity.
-`--library-diagnostic`, off by default, writes an estimate beside the run and is never used by the call
-([`algorithms/library_estimate.md`](../algorithms/library_estimate.md)).
+**`--library` is required.** It takes one of two values:
+- **`--library FILE`:** a declared insert distribution, error, outlier and fragment-start intensity. This is the
+  reproducibility path, unchanged.
+- **`--library auto`** (`c758ae2`): estimates the insert centre and spread from decisively placed pairs (at most
+  20,000 examined, at least 500 required).
+  - Every other value comes from `--preset short-read`, including the fragment-start intensity, which is not inferred.
+  - A failed validation refuses the run as `LIBRARY_REFUSED` and names `--library FILE`.
+  - The sources are written to `<prefix>.library_estimate.tsv`.
+  - **It is not the default,** and it changes calls at low coverage: see
+    [`algorithms/library_estimate.md`](../algorithms/library_estimate.md) §5.
+
+**`--library-diagnostic`,** off by default, writes an estimate beside a `--library FILE` run and is never used by the
+call.
+
+**The basic command:** `--graph G --reads1 R1 --reads2 R2 --out PREFIX --preset short-read --library FILE|auto
+--threads N`.
+- `--preset short-read` switches on the production algorithm with short-read technology constants. It sets no locus,
+  resource or dosage value.
+- `--preset long-read` is refused as not implemented.
+- Without `--reference-path`, the graph's declared reference sample (`RS:Z`) is used. With none declared, the run
+  refuses and lists the candidates. The C4 graph declares none.
 
 ## `--dosage-mode off|audit|repair` (default `off`)
 
