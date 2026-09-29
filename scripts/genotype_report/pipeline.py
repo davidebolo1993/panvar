@@ -217,8 +217,10 @@ class Report:
                                for r in T["runtime_groups"].itertuples())
             self.figure("qc_runtime", "QC", ["runtime"], lambda t: P.fig_runtime(t, i),
                         "Wall time, peak physical footprint, repair rounds and dosage-stage time per run. Colour is the "
-                        "compatibility group (settings digest, threads, execution group); groups are never pooled. The "
-                        f"genotyper records no host or binary identity, so those come only from run metadata. Groups: {groups}.")
+                        "compatibility group (settings digest, threads, execution group, and modality when supplied); groups "
+                        "are never pooled. The genotyper records no host or binary identity: execution_group, from the run "
+                        "metadata, must distinguish machine, environment and comparable workload conditions whenever runtime "
+                        f"is compared. Groups: {groups}.")
         else:
             self.skip("qc_runtime", "no run records seconds_total")
         self.figure("qc_library", "QC", ["library"], lambda t: P.fig_library(t, i),
@@ -246,13 +248,14 @@ class Report:
         for metric, label in A.METRICS:
             if metric == "normalized_excess" and not c.has_normalization:
                 self.skip("eval_block_normalized_excess_*", "the evaluation lacks truth1_bp, truth2_bp, called1_bp, "
-                          "called2_bp: the normalisation denominator is unavailable, so normalised excess is refused")
+                          "called2_bp: the diploid length denominator is unavailable, so length-normalised excess is refused")
                 continue
             for s in sets:
                 sub = pts if s == "all called blocks" else pts[pts.exact_genotype_usable == True]  # noqa: E712
                 slug = "all" if s == "all called blocks" else "exact_genotype_usable"
                 rule = "" if s == "all called blocks" else f" EXACT_GENOTYPE_USABLE is exactly: {EXACT_GENOTYPE_USABLE_RULE}."
-                formula = f" Normalised excess = {NORMALIZED_EXCESS_FORMULA}." if metric == "normalized_excess" else ""
+                formula = (f" Diploid-length-normalised excess = {NORMALIZED_EXCESS_FORMULA}, a deterministic length scale, not an "
+                           "observed alignment length." if metric == "normalized_excess" else "")
                 main = " For leave-one-out rows excess is the primary accuracy metric; raw distance is shown separately." if metric != "distance" else \
                     " Raw distance includes what the panel cannot spell; for leave-one-out rows read the excess figures."
                 self.figure(f"eval_block_{metric}_{slug}", "Ordered block performance", ["block_evaluation"],
@@ -329,14 +332,15 @@ class Report:
             note = ("A plan alternates each homologue between its two selected source templates (A and B) at the listed "
                     "boundaries; it does not draw a new donor at each switch.")
             self.figure("mosaic_switch_map", "Mosaic switches", ["switch_map"], lambda t: P.fig_switch_map(t, i, classes),
-                        "Predefined truth switch boundaries per plan, from the supplied switch metadata. " + note)
+                        "Predefined truth switch boundaries per plan, from the supplied switch metadata. The symbols are "
+                        "truth-boundary annotations, not error observations. " + note)
             self.figure("mosaic_callability", "Mosaic switches", ["mosaic_callability"],
                         lambda t: P.fig_mosaic_callability(t, i, classes), "Call class by switch class and coverage. " + note)
             if c.evaluation is not None:
                 pts = T["block_evaluation"]
                 self.figure("mosaic_excess_by_class", "Mosaic switches", ["block_evaluation"],
                             lambda t: P.fig_mosaic_excess(t[t.switch_class.fillna("") != ""], i, classes),
-                            "Excess and normalised excess per block by switch class and coverage (summaries in "
+                            "Excess and diploid-length-normalised excess per block by switch class and coverage (summaries in "
                             "data/mosaic_excess_summary.tsv). " + note)
                 plans = T["switch_map"]
                 markers = {}
@@ -349,8 +353,9 @@ class Report:
                                 lambda t, m=metric, lab=label: P.fig_ordered_blocks(
                                     t[t.switch_class.fillna("") != ""], i, m, lab, "all called blocks",
                                     [(k, k) for k in classes], "switch_class", markers),
-                                f"{label} by block, one row per switch class; markers mark each plan's switch boundaries "
-                                "(triangle up: haplotype 1, down: haplotype 2, diamond: both). " + note)
+                                f"{label} by block, one row per switch class. The switch symbols in the top margin are "
+                                "truth-boundary annotations from the switch metadata (triangle up: haplotype 1, down: "
+                                "haplotype 2, diamond: both), one per plan; they are not error observations. " + note)
         # ---- phase
         sps = T["strict_phase_support"]
         self.figure("phase_callability", "Phase", ["phase_support"], lambda t: P.fig_phase_callability(t, i),
@@ -448,16 +453,19 @@ class Report:
                   "`unordered_distance`; availability floor = `availability_floor`; excess = `excess` (the leave-one-out "
                   "metric). Floor attained = excess 0. A block is truth-defined when the evaluator records both truth "
                   "allele lengths.",
-                  f"- **Normalised excess:** `{NORMALIZED_EXCESS_FORMULA}`, from the evaluator's recorded allele lengths "
-                  "(the fewest alignment columns any alignment of the pair can have). Refused when those lengths are absent.",
+                  f"- **Diploid-length-normalised excess:** `{NORMALIZED_EXCESS_FORMULA}` (field `normalized_excess`; its "
+                  "denominator is `diploid_length_denominator_bp`), from the evaluator's recorded allele lengths. The "
+                  "denominator is a deterministic diploid length scale, not an observed alignment length. Refused when "
+                  "those lengths are absent.",
                   f"- **Catastrophic:** excess >= {c.catastrophic_bp:g} bp.",
                   "- **Intervals:** 95% Wilson score intervals.",
                   "- **GQ:** conditional on the scored candidate set and not globally calibrated; no threshold is recommended.",
                   "- **Axes:** distance and excess use a symlog axis (linear in [0, 1] bp, logarithmic above) so zero-valued "
-                  "calls and catastrophic outliers both stay visible; normalised excess uses linear [0, 1e-4], logarithmic above.",
+                  "calls and catastrophic outliers both stay visible; length-normalised excess uses linear [0, 1e-4], logarithmic above.",
                   "- **Runtime pooling:** runs are pooled only within a compatibility group (settings digest, threads, "
                   "execution group" + (", modality" if c.modalities else "") + "); the genotyper records no host or "
-                  "binary identity.", ""]
+                  "binary identity, so `execution_group` must distinguish machine, environment and comparable workload "
+                  "conditions whenever runtime is compared.", ""]
         lines += ["## Figures", ""]
         section = None
         for sec, name, caption, data in self.figures:

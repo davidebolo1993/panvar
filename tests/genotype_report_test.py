@@ -125,7 +125,7 @@ class Report(unittest.TestCase):
         e = self.data("a", "block_evaluation")
         r = e[(e.run_id == "r5") & (e.block_id == "sv:1")].iloc[0]
         # excess 5 / max(100 + 120, 90 + 150) = 5 / 240
-        self.assertEqual(r.alignment_denominator_bp, "240.0")
+        self.assertEqual(r.diploid_length_denominator_bp, "240.0")
         self.assertEqual(float(r.normalized_excess), 5 / 240)   # written and read back exactly
         u = e[(e.run_id == "r4") & (e.block_id == "ctx:2")].iloc[0]
         self.assertEqual((u.truth_defined, u.normalized_excess, u.excess), ("False", "NA", "NA"))
@@ -155,7 +155,8 @@ class Report(unittest.TestCase):
         self.assertFalse(any(n.startswith("eval_") for _, n, _, _ in r.figures))
         self.assertTrue(any("truth is never inferred" in why for _, why in r.skipped))
         self.assertFalse(os.path.exists(os.path.join(self.out("qc"), "data", "block_evaluation.tsv")))
-        text = open(os.path.join(self.out("qc"), "report.md")).read()
+        with open(os.path.join(self.out("qc"), "report.md")) as f:
+            text = f.read()
         self.assertIn("truth-free QC report", text)
 
     def test_refusals(self):
@@ -186,7 +187,7 @@ class Report(unittest.TestCase):
         short = os.path.join(self.tmp, "meta", "short_eval.tsv")
         e.drop(columns=["truth1_bp", "truth2_bp", "called1_bp", "called2_bp"]).to_csv(short, sep="\t", index=False)
         r = run_cli(["--input", self.pkg, "--out-dir", self.out("n"), "--run-metadata", self.meta, "--evaluation-blocks", short])
-        self.assertTrue(any("normalisation denominator is unavailable" in why for _, why in r.skipped))
+        self.assertTrue(any("diploid length denominator is unavailable" in why for _, why in r.skipped))
         self.assertFalse(any("normalized_excess" in n for _, n, _, _ in r.figures))
 
     # ---------------------------------------------------------------------------------------------- modality

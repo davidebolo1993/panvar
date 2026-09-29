@@ -20,9 +20,9 @@ EXACT_GENOTYPE_USABLE_RULE = "GENOTYPE_FILTER == PASS and DOSAGE_FILTER in {PASS
 DOSAGE_CONTENT_USABLE_RULE = "DOSAGE_FILTER == PASS"
 PHASED_GENOTYPE_USABLE_RULE = "EXACT_GENOTYPE_USABLE and PHASE_FILTER == PASS"
 
-# The normalised-excess denominator, as the sealed C4 evaluation package defines it (evaluate_integration.py): the
-# fewest alignment columns any alignment of the two unordered allele pairs can have, from the evaluator's recorded
-# allele lengths.
+# The normalised-excess denominator, as the sealed C4 evaluation package defines it (evaluate_integration.py): a
+# deterministic diploid length scale from the evaluator's recorded allele lengths, the larger of the two haplotypes'
+# summed truth lengths and summed called lengths. It is not an observed alignment length.
 NORMALIZED_EXCESS_FORMULA = "excess / max(truth1_bp + truth2_bp, called1_bp + called2_bp)"
 NORMALIZATION_COLUMNS = ["truth1_bp", "truth2_bp", "called1_bp", "called2_bp"]
 

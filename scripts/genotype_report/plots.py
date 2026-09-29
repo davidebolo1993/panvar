@@ -35,6 +35,13 @@ def save(fig, path_stem):
     plt.close(fig)
 
 
+def _legend(ax, **kwargs):
+    """A legend only when the axes has labelled artists (an empty legend call warns)."""
+    handles, labels = ax.get_legend_handles_labels()
+    if handles:
+        ax.legend(**kwargs)
+
+
 def _err(value, low, high):
     """Error-bar lengths from an interval, clipped at 0 against floating-point rounding."""
     return [[max(0.0, value - low)], [max(0.0, high - value)]]
@@ -85,7 +92,7 @@ def stacked_status(ax, table, cells, category, order, colors, value, title, deno
     ax.set_title(title)
     ax.set_ylim(0, max(bottom.max() * 1.12, 1))
     if legend:
-        ax.legend(loc="upper left", bbox_to_anchor=(1.0, 1.0), frameon=False)
+        _legend(ax, loc="upper left", bbox_to_anchor=(1.0, 1.0), frameon=False)
 
 
 # ------------------------------------------------------------------------------------------------ QC
@@ -137,7 +144,7 @@ def fig_reasons(t, info):
         ax.set_xlabel("blocks carrying the reason")
         ax.set_title(f"{f} reasons (a block may carry several)")
         if f == filters[0]:
-            ax.legend(frameon=False)
+            _legend(ax, frameon=False)
     fig.tight_layout()
     return fig
 
@@ -267,7 +274,7 @@ def fig_provenance(t, info):
     ax.invert_yaxis()
     ax.set_xlabel("runs")
     ax.set_title("Settings provenance: preset, profile and settings digest (runs)")
-    ax.legend(frameon=False, loc="lower right")
+    _legend(ax, frameon=False, loc="lower right")
     fig.tight_layout()
     return fig
 
@@ -398,7 +405,7 @@ def fig_accuracy_intervals(t, info, sets):
             ax.set_title(f"{p} - {sname}", fontsize=8)
             if si == 0:
                 ax.set_ylabel("floor-attainment rate")
-    axes[0, -1].legend(frameon=False, loc="upper left", bbox_to_anchor=(1, 1))
+    _legend(axes[0, -1], frameon=False, loc="upper left", bbox_to_anchor=(1, 1))
     fig.suptitle("Floor attainment by block and coverage with 95% Wilson intervals (denominators in the backing TSV)", fontsize=9)
     fig.tight_layout()
     return fig
@@ -424,7 +431,7 @@ def fig_filter_counts(t, info):
         ax.set_title(f"{p}  [{s.correctness_basis.iloc[0]}]", fontsize=8, loc="left")
         ax.set_ylabel("units")
         ax.set_ylim(0, max(bottom.max() * 1.15, 1))
-    axes[0, 0].legend(frameon=False, loc="upper left", bbox_to_anchor=(1, 1))
+    _legend(axes[0, 0], frameon=False, loc="upper left", bbox_to_anchor=(1, 1))
     fig.tight_layout()
     return fig
 
@@ -444,7 +451,7 @@ def fig_filter_rates(t, info):
         ax.set_ylim(-0.03, 1.05)
         ax.set_title(p, fontsize=8, loc="left")
     axes[-1, 0].set_xticks(range(len(cells)), [_cell_text(e, c) for e, c in cells], fontsize=6)
-    axes[0, 0].legend(frameon=False, loc="upper left", bbox_to_anchor=(1, 1))
+    _legend(axes[0, 0], frameon=False, loc="upper left", bbox_to_anchor=(1, 1))
     fig.suptitle("Retention, precision among retained, and bad-call detection sensitivity by experiment and coverage", fontsize=9)
     fig.tight_layout()
     return fig
@@ -469,7 +476,7 @@ def fig_filter_catastrophic(t, info, catastrophic_bp):
     ax.set_xticks(range(len(cols)), cols)
     ax.set_ylabel(f"catastrophic blocks (excess >= {catastrophic_bp:g} bp)")
     ax.set_title("Catastrophic errors retained (solid) and filtered (light); labels: retained / all", fontsize=8)
-    ax.legend(frameon=False, loc="upper left", bbox_to_anchor=(1, 1))
+    _legend(ax, frameon=False, loc="upper left", bbox_to_anchor=(1, 1))
     fig.tight_layout()
     return fig
 
@@ -491,7 +498,7 @@ def fig_filter_by_block(t, info):
         ax.set_ylim(-0.03, 1.15)
         ax.set_title(f"{e} (units per block above)", fontsize=8, loc="left")
     axes[-1, 0].set_xticks(range(len(info.block_order)), info.block_order)
-    axes[0, 0].legend(frameon=False, loc="upper left", bbox_to_anchor=(1, 1))
+    _legend(axes[0, 0], frameon=False, loc="upper left", bbox_to_anchor=(1, 1))
     fig.suptitle("EXACT_GENOTYPE_USABLE by block (GENOTYPE_FILTER == PASS and DOSAGE_FILTER in {PASS, NOT_APPLICABLE})", fontsize=9)
     fig.tight_layout()
     return fig
@@ -515,7 +522,7 @@ def fig_mosaic_callability(t, info, classes):
 def fig_mosaic_excess(points, info, classes):
     covs = info.coverages
     ccol = coverage_colors(covs)
-    metrics = [("excess", "excess (bp)")] + ([("normalized_excess", "normalised excess")] if points.normalized_excess.notna().any() else [])
+    metrics = [("excess", "excess (bp)")] + ([("normalized_excess", "diploid-length-normalised excess")] if points.normalized_excess.notna().any() else [])
     fig, axes = plt.subplots(len(metrics), 1, figsize=(max(7, 1.2 * len(classes) + 3), 2.8 * len(metrics)), squeeze=False)
     w = 0.8 / max(1, len(covs))
     for ax, (m, lab) in zip(axes[:, 0], metrics):
@@ -580,7 +587,7 @@ def fig_dosage_content(t, info):
     for i in range(len(cells)):
         axes[0].text(i, sens[i], f"{int(ret[i])}/{int(sens[i])}", ha="center", va="bottom", fontsize=6)
     axes[0].set_title("DOSAGE_CONTENT_USABLE retention (retained / dosage-sensitive blocks)", fontsize=8, loc="left")
-    axes[0].legend(frameon=False, loc="upper left", bbox_to_anchor=(1, 1))
+    _legend(axes[0], frameon=False, loc="upper left", bbox_to_anchor=(1, 1))
     bottom = np.zeros(len(cells))
     for k, col in (("retained_content_correct", OUTCOME_COLORS["retained_correct"]),
                    ("retained_content_incorrect", OUTCOME_COLORS["retained_incorrect"]),
@@ -593,7 +600,7 @@ def fig_dosage_content(t, info):
     for i in range(len(cells)):
         axes[1].text(i, bottom[i], f"n={int(bottom[i])}" + (f"\nundef={int(und[i])}" if und[i] else ""), ha="center", va="bottom", fontsize=5.5)
     axes[1].set_title("Dosage content correctness (content-truth-defined blocks; undefined excluded and counted)", fontsize=8, loc="left")
-    axes[1].legend(frameon=False, loc="upper left", bbox_to_anchor=(1, 1))
+    _legend(axes[1], frameon=False, loc="upper left", bbox_to_anchor=(1, 1))
     for ax in axes:
         ax.set_xticks(x, [_cell_text(e, c) for e, c in cells], fontsize=6)
         ax.set_ylim(0, max(ax.get_ylim()[1] * 1.12, 1))
@@ -638,7 +645,7 @@ def fig_representatives(t, info):
     ax.set_ylabel("representative phased distance + 1 (bp, log)")
     ax.set_title("NON-AUTHORITATIVE: conditional representatives' sequence distance\n(a serialisation of an unresolved set, never a call)",
                  fontsize=8)
-    ax.legend(frameon=False, fontsize=6)
+    _legend(ax, frameon=False, fontsize=6)
     fig.tight_layout()
     return fig
 
@@ -680,7 +687,7 @@ def fig_phase_accuracy(t, info):
         axes[0].text(i, ok[i] + err[i], f"{int(err[i])}/{int(ok[i] + err[i])}", ha="center", va="bottom", fontsize=6)
     axes[0].set_ylabel("assessable boundaries")
     axes[0].set_ylim(0, max((ok + err).max() * 1.15, 1))
-    axes[0].legend(frameon=False, loc="upper left", bbox_to_anchor=(1, 1))
+    _legend(axes[0], frameon=False, loc="upper left", bbox_to_anchor=(1, 1))
     axes[0].set_title("Assessable boundaries: switch errors / assessable", fontsize=8, loc="left")
     for i, (e, c) in enumerate(cells):
         r = t[(t.experiment == e) & (t.coverage == c)].iloc[0]
@@ -730,7 +737,7 @@ def fig_phase_by_boundary_type(t, info):
     ax.set_xticks(range(len(exps)), exps)
     ax.set_ylabel("assessable boundaries (red: switch errors)")
     ax.set_title("Phase at boundaries by truth switch type (from the switch metadata; labels: errors / assessable)", fontsize=8)
-    ax.legend(frameon=False, loc="upper left", bbox_to_anchor=(1, 1))
+    _legend(ax, frameon=False, loc="upper left", bbox_to_anchor=(1, 1))
     fig.tight_layout()
     return fig
 
@@ -750,7 +757,7 @@ def fig_phase_locus(t, info):
     ax.set_xticks(x, [_cell_text(e, c) for e, c in cells], fontsize=6)
     ax.set_ylabel("runs")
     ax.set_title("Full-locus phased-call status", fontsize=8)
-    ax.legend(frameon=False, loc="upper left", bbox_to_anchor=(1, 1))
+    _legend(ax, frameon=False, loc="upper left", bbox_to_anchor=(1, 1))
     fig.tight_layout()
     return fig
 

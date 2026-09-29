@@ -228,7 +228,7 @@ def load_run_metadata(path, runs):
 
 def load_evaluation(path, runs, blocks):
     """The evaluator's per-block fields: a consolidated TSV (run key, block_id, unordered_distance, availability_floor,
-    excess and, for normalised excess, truth1_bp, truth2_bp, called1_bp, called2_bp), or a manifest (run key, path) of
+    excess and, for diploid-length-normalised excess, truth1_bp, truth2_bp, called1_bp, called2_bp), or a manifest (run key, path) of
     per-run evaluator block tables. Every row must match a reported block."""
     t = read_tsv(path, "evaluation blocks")
     sources = [path]
@@ -268,8 +268,8 @@ def load_evaluation(path, runs, blocks):
             out[c] = to_number(t[c])
         out["truth_defined"] = out.truth1_bp.notna() & out.truth2_bp.notna()
         cols = pd.concat([out.truth1_bp + out.truth2_bp, out.called1_bp + out.called2_bp], axis=1).max(axis=1)
-        out["alignment_denominator_bp"] = cols.where(out.truth_defined)
-        out["normalized_excess"] = (out.excess / out.alignment_denominator_bp).where(out.truth_defined & (cols > 0))
+        out["diploid_length_denominator_bp"] = cols.where(out.truth_defined)
+        out["normalized_excess"] = (out.excess / out.diploid_length_denominator_bp).where(out.truth_defined & (cols > 0))
     else:
         out["truth_defined"] = out.distance.notna()
     # a truth-undefined block has no distance: it is neither correct nor incorrect

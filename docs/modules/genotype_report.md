@@ -46,7 +46,7 @@ is recorded.
 
 | option | content |
 |---|---|
-| `--evaluation-blocks` | The evaluator's per-block fields (`unordered_distance`, `availability_floor`, `excess`, and for normalised excess `truth1_bp`, `truth2_bp`, `called1_bp`, `called2_bp`). Either one table with a run key and `block_id`, or a manifest (run key, `path`) of per-run evaluator block tables. |
+| `--evaluation-blocks` | The evaluator's per-block fields (`unordered_distance`, `availability_floor`, `excess`, and for diploid-length-normalised excess `truth1_bp`, `truth2_bp`, `called1_bp`, `called2_bp`). Either one table with a run key and `block_id`, or a manifest (run key, `path`) of per-run evaluator block tables. |
 | `--dosage-content-evaluation` | `content_correct` (and `content_truth_source`) per block. |
 | `--representative-diagnostics` | Conditional representatives' sequence distances. Non-authoritative. |
 | `--switch-metadata` | Mosaic plans: `subject`, `switch_class`, and `switch_before_block_hap1` and `switch_before_block_hap2`. Each lists the 0-based block indices i at which that homologue switches source template, between blocks i−1 and i. `source_a` and `source_b` are optional. |
@@ -67,9 +67,12 @@ is recorded.
 
 - **Raw distance, floor and excess** are the evaluator's `unordered_distance`, `availability_floor` and `excess`, used
   as they are. Excess is the leave-one-out accuracy metric. Floor attained means excess 0.
-- **Normalised excess** is `excess / max(truth1_bp + truth2_bp, called1_bp + called2_bp)`, from the evaluator's recorded
-  allele lengths: the fewest alignment columns any alignment of the pair can have. The figures are refused when those
-  lengths are absent.
+- **Diploid-length-normalised excess** (field `normalized_excess`) is
+  `excess / max(truth1_bp + truth2_bp, called1_bp + called2_bp)`, from the evaluator's recorded allele lengths.
+  - The denominator, `diploid_length_denominator_bp`, is a deterministic diploid length scale: the larger of the two
+    haplotypes' summed truth lengths and summed called lengths.
+  - It is not an observed alignment length.
+  - The figures are refused when those lengths are absent.
 - **A truth-undefined block**, where the evaluator records no truth length, is excluded from every accuracy denominator
   and counted.
 - **EXACT_GENOTYPE_USABLE** is exactly `GENOTYPE_FILTER == PASS and DOSAGE_FILTER in {PASS, NOT_APPLICABLE}`.
@@ -78,8 +81,10 @@ is recorded.
 - **Catastrophic** means `excess >= --catastrophic-bp`, 1,000 by default.
 - **Intervals** are 95% Wilson intervals.
 - **GQ** is conditional on the scored candidate set. It is shown only as a diagnostic, and no threshold is recommended.
-- **Runtime** is pooled only within a compatibility group: settings digest, threads, execution group and modality. The
-  outputs record no host or binary identity, so supply it as `execution_group`.
+- **Runtime** is pooled only within a compatibility group: settings digest, threads, execution group and modality.
+  - The outputs record no host or binary identity.
+  - Whenever runtime comparisons are intended, `execution_group` must distinguish the machine, the environment and
+    comparable workload conditions, such as concurrent processes.
 
 ## Output
 
@@ -104,7 +109,8 @@ refused with exit status 2.
     python3 scripts/plot_genotype_results.py --input results/genotype_runs --out-dir report_qc \
       --run-metadata runs_metadata.tsv --title "Cohort QC"
 
-**Truth evaluation** (the C4 report; the inputs are joined from sealed tables by a separate adapter):
+**Truth evaluation** (the C4 report). The inputs are joined from sealed tables by the tracked adapter in
+`tests/analysis/c4_genotype_report/`, which also reconciles and validates the report (see its README):
 
     python3 scripts/plot_genotype_results.py --input c4_inputs/package --out-dir c4_report \
       --run-metadata c4_inputs/run_metadata.tsv --evaluation-blocks c4_inputs/evaluation_manifest.tsv \

@@ -306,7 +306,7 @@ def evaluated_blocks(ctx):
     if ctx.switch_plans is not None:
         b["switch_class"] = _switch_class(ctx, b)
     keep = ctx.G + ["panel", "run_id", "call_class", "block_index", "block_id", "kind", "evaluated", "truth_defined", "distance",
-                    "floor", "excess", "normalized_excess", "alignment_denominator_bp", "floor_attained", "exact", "catastrophic",
+                    "floor", "excess", "normalized_excess", "diploid_length_denominator_bp", "floor_attained", "exact", "catastrophic",
                     "conditional_GQ_value", "genotype_filter", "dosage_filter", "exact_genotype_usable", "switch_class"]
     for c in keep:
         if c not in b.columns:
@@ -321,7 +321,7 @@ def _sets(frame, ctx):
 
 
 METRICS = [("distance", "raw diploid distance (bp)"), ("excess", "excess over the availability floor (bp)"),
-           ("normalized_excess", "alignment-length-normalised excess")]
+           ("normalized_excess", "diploid-length-normalised excess")]
 
 
 def block_metric_summary(ctx, points, by="panel"):
