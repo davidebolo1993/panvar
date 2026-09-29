@@ -240,6 +240,8 @@ struct GenotypeCommandOptions {
     // followed at 0.9x and 1.1x the estimated fragment-start intensity and a genotype that changes is annotated. On by
     // default; the profile key library_sensitivity_audit 0 turns it off (measurement only). No effect on --library FILE.
     bool library_sensitivity_audit = true;
+    // --library was omitted on the command line, which means --library auto (recorded as library_invocation).
+    bool library_omitted = false;
     // TEST HOOK (gates only): the audit's endpoint 1 (0.9x) or 2 (1.1x) fails before any work, to gate that an
     // incomplete endpoint is reported NOT_EVALUATED and changes nothing. 0: off.
     std::size_t test_library_sensitivity_fail_view = 0;
@@ -307,6 +309,12 @@ struct BlockQuality {
 };
 BlockQuality block_quality(const std::string& representation_filter, const std::string& genotype_support,
                            bool library_sensitive = false);
+// The locus filter with a library-sensitivity flag added (library_sensitivity_audit_v2): LOWQUAL_LIBRARY_SENSITIVE (some
+// block's genotype differs at an endpoint) or NOT_EVALUATED_LIBRARY_SENSITIVITY (the audit did not complete; a
+// locus-level warning, no block is accused). PASS, NA and empty become the flag; LOWQUAL_LIBRARY_SENSITIVE also
+// replaces NOT_EVALUATED (a flag wins); anything else keeps its value and gains ";<flag>". Adding a present flag is a
+// no-op.
+std::string with_library_flag(const std::string& locus_filter, const std::string& flag);
 
 // The phase claim after an audit. A read-supported phase within the primary candidates becomes READS_AUDITED
 // only when the audit set was ranked to completion, agrees on the winner and on every block genotype, and is

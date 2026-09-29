@@ -95,7 +95,8 @@ std::vector<std::pair<std::string, std::string>> locus_filter_summary(const std:
                                                                       const std::vector<std::string>& filters,
                                                                       const std::vector<std::string>& supports,
                                                                       const std::vector<std::string>& qualities,
-                                                                      const std::vector<std::string>& library_sensitive = {});
+                                                                      const std::vector<std::string>& library_sensitive = {},
+                                                                      bool library_not_evaluated = false);
 
 // off / audit: copies the caller's outputs from run_prefix to out_prefix when they differ, and changes nothing.
 // repair: additionally writes <out>.original<suffix>, then applies every eligible COMPLETE_DIPLOTYPE_REPAIR to the

@@ -648,14 +648,20 @@ void write_status(
         out << "preset\t" << options.preset_name << "\npreset_keys\t" << (keys.empty() ? "none" : keys) << '\n';
     }
     // library_sensitivity_audit_v1: the record under --library auto; <prefix>.library_sensitivity.tsv on every run.
-    std::string sensitivity = "library_sensitivity\tNOT_APPLICABLE\nlibrary_sensitivity_reason\tdeclared_library\n";
+    std::string sensitivity = "library_sensitivity\tNOT_APPLICABLE\nlibrary_sensitivity_reason\tdeclared_library\n"
+                              "library_sensitivity_status\tNOT_APPLICABLE\nlibrary_sensitivity_filter\tNOT_APPLICABLE\n";
     if (options.library_path == "auto") {
         out << "library_mode\tauto\nlibrary_insert_source\tplacement_estimate\nlibrary_intensity_source\tmarker_fit_estimate\n"
                "library_other_source\tshort_read_preset\n";
+        out << "library_invocation\t" << (options.library_omitted ? "omitted_means_auto" : "explicit_auto") << '\n';
         if (repair != nullptr && !repair->library_sensitivity_text.empty()) {
             sensitivity = repair->library_sensitivity_text;
         } else {
-            sensitivity = std::string("library_sensitivity\tNOT_EVALUATED\nlibrary_sensitivity_reason\t") +
+            // No completed audit behind this run: never presented as evaluated.
+            sensitivity = std::string("library_sensitivity\tNOT_EVALUATED\nlibrary_sensitivity_reason\t"
+                                      "LIBRARY_SENSITIVITY_NOT_EVALUATED\nlibrary_sensitivity_status\tNOT_EVALUATED\n"
+                                      "library_sensitivity_filter\tNOT_EVALUATED_LIBRARY_SENSITIVITY\n"
+                                      "library_sensitivity_incomplete_endpoint\tnone\nlibrary_sensitivity_incomplete\t") +
                           (!options.library_sensitivity_audit ? "audit_off"
                            : status == GenotypeRunStatus::LibraryRefused ? "library_refused"
                            : options.repair_rounds == 0                  ? "not_adaptive_completion"
@@ -1059,6 +1065,13 @@ BlockQuality block_quality(const std::string& representation_filter, const std::
     return {"LOW_QUALITY", reason};
 }
 
+std::string with_library_flag(const std::string& locus_filter, const std::string& flag) {
+    if ((";" + locus_filter + ";").find(";" + flag + ";") != std::string::npos) return locus_filter;
+    if (locus_filter.empty() || locus_filter == "PASS" || locus_filter == "NA") return flag;
+    if (flag == "LOWQUAL_LIBRARY_SENSITIVE" && locus_filter == "NOT_EVALUATED") return flag;
+    return locus_filter + ";" + flag;
+}
+
 const char* genotype_run_status_name(GenotypeRunStatus status) {
     switch (status) {
         case GenotypeRunStatus::Complete: return "COMPLETE";
@@ -1428,7 +1441,7 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options, GenotypeDo
     if (options.gfa_path.empty() || options.reads1_path.empty() || options.reads2_path.empty() ||
         options.reference_path.empty() || options.library_path.empty()) {
         throw std::runtime_error(
-            "genotype requires --gfa, --reads1, --reads2, --reference-path and --library");
+            "genotype requires --gfa, --reads1, --reads2, --reference-path and --library (a file, or auto)");
     }
 
     // --library auto: the short-read preset's constants now, the insert estimated from the reads once the model and
@@ -3831,6 +3844,7 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options, GenotypeDo
         // differently it continues alone, in the shared context: what that holds is reused, only what is new is
         // placed. The common pool is then reranked at each view, and only unordered genotypes are compared.
         std::set<std::size_t> library_sensitive;
+        bool library_not_evaluated = options.library_path == "auto" && !audit_on;   // auto without a completed audit
         if (audit_on) {
             const Clock::time_point audit_mark = Clock::now();
             PreparedScoringContext* shared = search->context();
@@ -4344,8 +4358,21 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options, GenotypeDo
             }
             std::ostringstream text;
             text << std::setprecision(17);
+            std::string incomplete_endpoint = "none", incomplete_reason = verdict.incomplete;
+            for (std::size_t v = 0; v < view_count && incomplete_endpoint == "none"; ++v) {
+                if (!views[v].incomplete.empty()) {
+                    incomplete_endpoint = view_name[v];
+                    incomplete_reason = views[v].incomplete;
+                }
+            }
+            library_not_evaluated = verdict.status == "NOT_EVALUATED";
             text << "library_sensitivity\t" << verdict.status << "\nlibrary_sensitivity_reason\t" << verdict.reason
-                 << "\nlibrary_sensitivity_incomplete\t" << verdict.incomplete << "\nlibrary_sensitivity_rule\t"
+                 << "\nlibrary_sensitivity_status\t" << verdict.status << "\nlibrary_sensitivity_filter\t"
+                 << (verdict.status == "STABLE"      ? "PASS"
+                     : verdict.status == "SENSITIVE" ? "LOWQUAL_LIBRARY_SENSITIVE"
+                                                     : "NOT_EVALUATED_LIBRARY_SENSITIVITY")
+                 << "\nlibrary_sensitivity_incomplete_endpoint\t" << incomplete_endpoint
+                 << "\nlibrary_sensitivity_incomplete\t" << incomplete_reason << "\nlibrary_sensitivity_rule\t"
                  << kLibrarySensitivityRule << "\nlibrary_sensitivity_lambdas\t"
                  << scoring_options.audit_libraries[0].fragment_start_intensity << ','
                  << library.fragment_start_intensity << ',' << scoring_options.audit_libraries[1].fragment_start_intensity
@@ -4425,12 +4452,10 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options, GenotypeDo
                 }
                 atomic_write(prefix + ".library_sensitivity_blocks.tsv", table.str());
             }
-            if (!library_sensitive.empty()) {
-                report.locus_filter = report.locus_filter == "LOWQUAL_REPRESENTATION_CONFLICT"
-                                          ? "LOWQUAL_REPRESENTATION_CONFLICT;LOWQUAL_LIBRARY_SENSITIVE"
-                                          : "LOWQUAL_LIBRARY_SENSITIVE";
-            }
+            if (!library_sensitive.empty()) report.locus_filter = with_library_flag(report.locus_filter, "LOWQUAL_LIBRARY_SENSITIVE");
         }
+        // An incomplete audit is a locus-level warning: no block is accused, block quality is unchanged.
+        if (library_not_evaluated) report.locus_filter = with_library_flag(report.locus_filter, "NOT_EVALUATED_LIBRARY_SENSITIVITY");
         const auto filter_columns = [&](std::size_t b) {
             const BlockFilter& bf = block_filter[b];
             const auto number = [](double v) {
@@ -5098,7 +5123,7 @@ int run_genotype_command(const std::vector<std::string>& args) {
             std::cout <<
                 "Usage:\n"
                 "  panvar genotype --profile <profile.tsv> --gfa <graph.gfa> --reference-path <name> \\\n"
-                "                  --reads1 <r1.fq> --reads2 <r2.fq> --library <params.txt> \\\n"
+                "                  --reads1 <r1.fq> --reads2 <r2.fq> [--library auto|<params.txt>] \\\n"
                 "                  --out-prefix <prefix> [--panel-curation <manifest.tsv>] [--bubbles <bubbles.csv>]\n\n"
                 "Calls a pair of whole-locus haplotypes and projects them to one allele pair per SV\n"
                 "block. Paired reads only. The command never asks what kind of sample it is given.\n\n"
@@ -5133,19 +5158,22 @@ int run_genotype_command(const std::vector<std::string>& args) {
                 "also replaces a block's genotype where the stage found a complete diplotype repair,\n"
                 "keeping the caller's outputs as .original.*. A dosage-content correction that is not\n"
                 "a resolved diplotype is reported beside the caller's genotype, never in place of it.\n\n"
-                "Basic use: --graph G --reads1 R1 --reads2 R2 --out PREFIX --preset short-read --library auto\n"
-                "[--threads N]. --preset short-read sets the production algorithm (adaptive repair, exact tie\n"
-                "branching, representation guard) and short-read technology constants, and nothing about a locus;\n"
-                "--preset long-read is reserved and refused. --library auto estimates the insert centre and spread\n"
-                "from decisively placed pairs (at most 20,000 examined, at least 500 required) and the fragment-start\n"
-                "intensity from the invariant-marker depth fit, and takes the other library values from the preset; an\n"
-                "estimate that fails validation refuses the run (LIBRARY_REFUSED) and names --library FILE. Under auto\n"
-                "the call is also followed at 0.9x and 1.1x the estimated intensity (library_sensitivity_audit_v2): a\n"
-                "block whose unordered genotype differs there -- by likelihood rank or by the endpoint's independent\n"
-                "pipeline call (search path) -- becomes LOW_QUALITY (library_sensitive) and the locus filter gains\n"
-                "LOWQUAL_LIBRARY_SENSITIVE; an incomplete endpoint is LIBRARY_SENSITIVITY_NOT_EVALUATED; the call itself\n"
-                "never changes; the record is in .library_sensitivity.tsv (NOT_APPLICABLE for --library FILE). auto is\n"
-                "opt-in: --library is required. Without --reference-path the graph's declared reference sample (RS:Z) is\n"
+                "Basic use: --graph G --reads1 R1 --reads2 R2 --out PREFIX --preset short-read [--threads N].\n"
+                "--preset short-read sets the production algorithm (adaptive repair, exact tie branching,\n"
+                "representation guard) and short-read technology constants, and nothing about a locus;\n"
+                "--preset long-read is reserved and refused.\n\n"
+                "--library: omitted means auto. auto estimates the insert centre and spread from decisively placed\n"
+                "pairs (at most 20,000 examined, at least 500 required) and the fragment-start intensity from the\n"
+                "invariant-marker depth fit, and takes the other library values from the preset; an estimate that\n"
+                "fails validation refuses the run (LIBRARY_REFUSED) -- there is no fallback. --library FILE declares\n"
+                "every value and is the exact reproducibility route; it runs no estimate and no audit.\n"
+                "Under auto the call is followed at 0.9x and 1.1x the estimated intensity (library_sensitivity_audit_v2).\n"
+                "A block is library-sensitive when its unordered genotype differs there, by likelihood rank (the scored\n"
+                "pool reranked) or by search path (the endpoint's own independent call): it becomes LOW_QUALITY\n"
+                "(library_sensitive) and the locus filter gains LOWQUAL_LIBRARY_SENSITIVE. An audit that cannot\n"
+                "complete accuses no block: the locus filter gains NOT_EVALUATED_LIBRARY_SENSITIVITY. The call itself\n"
+                "never changes. The record is .library_sensitivity.tsv (and .library_sensitivity_blocks.tsv).\n"
+                "Without --reference-path the graph's declared reference sample (RS:Z) is\n"
                 "used, or the run refuses and lists candidates. --mosaic-candidates K, --adaptive-repair on|off and\n"
                 "--repair-rounds N override the preset. A profile (--profile) overrides the preset; flags override both.\n\n"
                 "--library-diagnostic (off by default) also writes .library_estimate.tsv, a library\n"
@@ -5216,6 +5244,12 @@ int run_genotype_command(const std::vector<std::string>& args) {
                                                                 : "the graph's reference sample '" + sample + "' has " + std::to_string(of_sample.size()) + " paths") +
                                      "; name the coordinate reference with --reference-path. Candidates:" + listed);
         }
+    }
+    // An omitted --library is --library auto: the estimate, its validation (LIBRARY_REFUSED, never a fallback) and the
+    // sensitivity audit. --library FILE is the exact reproducibility route.
+    if (options.library_path.empty()) {
+        options.library_path = "auto";
+        options.library_omitted = true;
     }
     // The dosage stage and the locus table run after every existing output is committed (sections 20 and 22).
     const std::string& mode = options.dosage_mode;

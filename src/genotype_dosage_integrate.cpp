@@ -332,7 +332,8 @@ std::vector<std::pair<std::string, std::string>> locus_filter_summary(const std:
                                                                       const std::vector<std::string>& filters,
                                                                       const std::vector<std::string>& supports,
                                                                       const std::vector<std::string>& qualities,
-                                                                      const std::vector<std::string>& library_sensitive) {
+                                                                      const std::vector<std::string>& library_sensitive,
+                                                                      bool library_not_evaluated) {
     std::vector<std::string> lowqual, unevaluated, pass_ids, low_ids;
     std::size_t unsupported = 0, supported = 0;
     for (std::size_t b = 0; b < block_ids.size(); ++b) {
@@ -344,12 +345,13 @@ std::vector<std::pair<std::string, std::string>> locus_filter_summary(const std:
     // library_sensitivity_audit_v1: a library-sensitive block of the reported genotype adds its flag; a flag wins over
     // NOT_EVALUATED, and two flags are both kept.
     std::string locus = !lowqual.empty() ? "LOWQUAL_REPRESENTATION_CONFLICT" : !unevaluated.empty() ? "NOT_EVALUATED" : "PASS";
-    if (!library_sensitive.empty()) {
-        locus = locus == "LOWQUAL_REPRESENTATION_CONFLICT" ? "LOWQUAL_REPRESENTATION_CONFLICT;LOWQUAL_LIBRARY_SENSITIVE"
-                                                           : "LOWQUAL_LIBRARY_SENSITIVE";
-    }
+    if (!library_sensitive.empty()) locus = with_library_flag(locus, "LOWQUAL_LIBRARY_SENSITIVE");
+    if (library_not_evaluated) locus = with_library_flag(locus, "NOT_EVALUATED_LIBRARY_SENSITIVITY");
     return {{"locus_filter", locus},
             {"library_sensitive_blocks", ids_or_none(library_sensitive)},
+            {"library_sensitivity_filter", !library_sensitive.empty() ? "LOWQUAL_LIBRARY_SENSITIVE"
+                                           : library_not_evaluated    ? "NOT_EVALUATED_LIBRARY_SENSITIVITY"
+                                                                      : "PASS"},
             {"quality_reason_library_sensitive", std::to_string(library_sensitive.size())},
             {"lowqual_blocks", ids_or_none(lowqual)},
             {"not_evaluated_blocks", ids_or_none(unevaluated)},
@@ -430,11 +432,13 @@ DosageIntegration apply_dosage_mode(const PreparedGenotypeModel* model, const st
     // library_sensitivity_audit_v1: the caller's library-sensitive blocks. A block an applied repair replaced was not
     // audited in its reported form, so it carries no library reason and is listed as not evaluated.
     std::set<std::string> library_sensitive;
-    bool library_audited = false;
+    bool library_audited = false, library_unevaluated = false;
     if (exists(out_prefix + ".mosaic_status.tsv")) {
         const std::map<std::string, std::string> caller_status = read_key_values(out_prefix + ".mosaic_status.tsv");
         const auto found = caller_status.find("library_sensitive_blocks");
         library_audited = found != caller_status.end();
+        const auto filter = caller_status.find("library_sensitivity_filter");
+        library_unevaluated = filter != caller_status.end() && filter->second == "NOT_EVALUATED_LIBRARY_SENSITIVITY";
         if (library_audited && found->second != "none") {
             for (const std::string& id : split(found->second, ',')) library_sensitive.insert(id);
         }
@@ -645,7 +649,8 @@ DosageIntegration apply_dosage_mode(const PreparedGenotypeModel* model, const st
             ids.push_back(blk.block_id); fs.push_back(x.guard[0]); ss.push_back(x.support); qs.push_back(x.quality);
             if (library_sensitive.count(blk.block_id) != 0 && applied.count(blk.block_id) == 0) sensitive.push_back(blk.block_id);
         }
-        summaries = locus_filter_summary(ids, fs, ss, qs, sensitive);
+        // A reported genotype an applied repair changed was not audited in that form: its locus is not fully evaluated.
+        summaries = locus_filter_summary(ids, fs, ss, qs, sensitive, library_unevaluated || (library_audited && !d.applied.empty()));
     }
     const auto summary_of = [&](const std::string& key) {
         for (const auto& [k, v] : summaries) if (k == key) return v;
@@ -732,6 +737,12 @@ void write_locus_genotype(const PreparedGenotypeModel* model, const std::string&
     v["call_class"] = value(status, "call_class");
     v["no_call_reason"] = value(status, "no_call_reason");
     v["locus_filter"] = value(status, "locus_filter");
+    // library_sensitivity_audit_v2: a call without a completed audit (auto) carries the locus-level warning.
+    if (status.count("library_sensitivity_filter") != 0 &&
+        value(status, "library_sensitivity_filter") == "NOT_EVALUATED_LIBRARY_SENSITIVITY" &&
+        (value(status, "call_class") == "strict_call" || value(status, "call_class") == "genotype_equivalent_call")) {
+        v["locus_filter"] = with_library_flag(v["locus_filter"], "NOT_EVALUATED_LIBRARY_SENSITIVITY");
+    }
     v["quality_rule"] = value(status, "quality_rule");
     v["quality_pass_blocks"] = value(status, "quality_pass_blocks");
     v["quality_lowqual_blocks"] = value(status, "quality_lowqual_blocks");

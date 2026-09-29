@@ -6,8 +6,8 @@ Genotypes a structural locus from paired short reads against the locus pangenome
 This page states what is frozen at `26401b4`, the C4 short-read freeze. The contracts are in
 [`algorithms/genotype_mosaic.md`](../algorithms/genotype_mosaic.md) and
 [`algorithms/genotype_dosage.md`](../algorithms/genotype_dosage.md). The planned user-facing command and presets are in
-[`algorithms/genotype_cli.md`](../algorithms/genotype_cli.md). It is partly implemented at `c758ae2`:
-`--preset short-read`, `--library auto` and the basic flags.
+[`algorithms/genotype_cli.md`](../algorithms/genotype_cli.md). It is partly implemented: `--preset short-read`, the
+basic flags, and automatic library estimation with its sensitivity audit as the default.
 
 ## One adaptive algorithm
 
@@ -26,30 +26,37 @@ The frozen C4 invocation:
       --gfa <graph> --reference-path <reference path> --reads1 R1.fq --reads2 R2.fq \
       --library library.txt --threads 8 --out-prefix <prefix> [--panel-curation <manifest>]
 
-**`--library` is required.** It takes one of two values:
-- **`--library FILE`:** a declared insert distribution, error, outlier and fragment-start intensity. This is the
-  reproducibility path, unchanged.
-- **`--library auto`** (`c758ae2`): estimates the insert centre and spread from decisively placed pairs (at most
-  20,000 examined, at least 500 required).
-  - Every other value comes from `--preset short-read`, including the fragment-start intensity, which is not inferred.
-  - A failed validation refuses the run as `LIBRARY_REFUSED` and names `--library FILE`.
-  - The sources are written to `<prefix>.library_estimate.tsv`.
-  - **It is not the default,** and it changes calls at low coverage: see
-    [`algorithms/library_estimate.md`](../algorithms/library_estimate.md) §5–6.
-  - **The sensitivity audit** (`library_sensitivity_audit_v2`, §8): the call is also followed at 0.9× and 1.1× the
-    estimated intensity.
-    - A block is sensitive when the common pool reranked at an endpoint (LIKELIHOOD_RANK) or the endpoint's
-      independent pipeline call (SEARCH_PATH) carries another unordered genotype there; BOTH when both do.
-    - A sensitive block becomes LOW_QUALITY `library_sensitive`, and the locus filter gains
-      `LOWQUAL_LIBRARY_SENSITIVE`. The call itself never changes.
-    - An incomplete endpoint gives NOT_EVALUATED / `LIBRARY_SENSITIVITY_NOT_EVALUATED` and flags nothing.
-    - The record is in `<prefix>.library_sensitivity.tsv`, written on every run (NOT_APPLICABLE for `--library FILE`).
-      A completed audit also writes the block table `<prefix>.library_sensitivity_blocks.tsv`.
+**`--library`: omitted means `auto`.** There are two routes:
+- **`--library FILE`:** a declared insert distribution, error, outlier and fragment-start intensity. This is the exact
+  reproducibility route, unchanged. It runs no estimate and no audit, and its sensitivity record says NOT_APPLICABLE.
+- **Omitted, or `--library auto`:**
+  - It estimates the insert centre and spread from decisively placed pairs (at most 20,000 examined, at least 500
+    required) and the fragment-start intensity from the invariant-marker depth fit. The other values come from
+    `--preset short-read`.
+  - An estimate that fails validation refuses the run as `LIBRARY_REFUSED` and names `--library FILE`. There is no
+    fallback.
+  - The estimates and their sources go to `<prefix>.library_estimate.tsv`, and `library_invocation` records whether
+    `--library` was omitted.
+- **The sensitivity audit** (`library_sensitivity_audit_v2`; see
+  [`algorithms/library_estimate.md`](../algorithms/library_estimate.md) §8). It runs under auto: the call is also
+  followed at 0.9× and 1.1× the estimated intensity.
+  - A block is sensitive when its unordered genotype differs there, by LIKELIHOOD_RANK (the common scored pool reranked
+    at the endpoint), by SEARCH_PATH (the endpoint's independent pipeline call), or by BOTH.
+  - `library_sensitivity_status` is STABLE, SENSITIVE, NOT_EVALUATED or NOT_APPLICABLE.
+  - `library_sensitivity_filter` is PASS, LOWQUAL_LIBRARY_SENSITIVE, NOT_EVALUATED_LIBRARY_SENSITIVITY or
+    NOT_APPLICABLE.
+  - **SENSITIVE:** only the identified blocks become LOW_QUALITY `library_sensitive`, and the locus filter gains
+    `LOWQUAL_LIBRARY_SENSITIVE`.
+  - **An audit that cannot complete** (a cap, a refusal, incomplete tie branching) accuses no block. Block quality is
+    unchanged, no block table is written, and the locus filter gains `NOT_EVALUATED_LIBRARY_SENSITIVITY`. The endpoint
+    and the exact reason are recorded.
+  - The call itself never changes. The record is in `<prefix>.library_sensitivity.tsv`, and a completed audit also
+    writes `<prefix>.library_sensitivity_blocks.tsv`.
 
 **`--library-diagnostic`,** off by default, writes an estimate beside a `--library FILE` run and is never used by the
 call.
 
-**The basic command:** `--graph G --reads1 R1 --reads2 R2 --out PREFIX --preset short-read --library FILE|auto
+**The basic command:** `--graph G --reads1 R1 --reads2 R2 --out PREFIX --preset short-read [--library FILE]
 --threads N`.
 - `--preset short-read` switches on the production algorithm with short-read technology constants. It sets no locus,
   resource or dosage value.
@@ -109,7 +116,7 @@ Each filter describes the **reported** genotype. After an applied repair, the ca
 | `genotype_support` | `READS`, `PRIOR_ONLY` | whether the reads alone put every rival of another genotype at this block below the reported diplotype |
 | `quality_filter` | `PASS`, `LOW_QUALITY` | `block_quality_rule_v1`: PASS only for representation PASS with READS support and, under `--library auto`, no library sensitivity (reason `library_sensitive`) |
 | `dosage_filter` (repair mode) | `PASS`, `DOSAGE_CONTENT_CORRECTED`, `DOSAGE_TRIGGERED_UNREPAIRED`, `DOSAGE_SUSPECT`, `DOSAGE_UNDERPOWERED`, `DOSAGE_NOT_EVALUATED`, `DOSAGE_REPAIR_NOT_APPLIED` | the dosage stage's verdict on the reported block; information limits are reasons, never merged into `quality_filter` |
-| `locus_filter` | `PASS`, `LOWQUAL_REPRESENTATION_CONFLICT`, `LOWQUAL_LIBRARY_SENSITIVE` (both flags joined by `;`), `NOT_EVALUATED` | fails closed over the blocks; a flag wins over NOT_EVALUATED |
+| `locus_filter` | `PASS`, `LOWQUAL_REPRESENTATION_CONFLICT`, `LOWQUAL_LIBRARY_SENSITIVE`, `NOT_EVALUATED`, `NOT_EVALUATED_LIBRARY_SENSITIVITY` (several joined by `;`) | fails closed over the blocks; a flag wins over NOT_EVALUATED; an incomplete library audit is a locus-level warning |
 
 A repaired run's filters are recomputed on the repaired diplotype. If the caller's own annotation cannot first be
 reproduced, the value is `NOT_EVALUATED_AFTER_DOSAGE_REPAIR`: never copied, never PASS.
@@ -150,8 +157,8 @@ Genotyping: the sealed 484-job campaign, per job.
   passes. The repaired pairs are dosage-supported, not read-supported (`PRIOR_ONLY`).
 
 **Inputs and builds:**
-- **`--library auto` is opt-in.** On the 8 sentinels its audit flags `loo.HG03456.2` as SEARCH_PATH-sensitive at 5
-  blocks (`library_estimate.md` §8). There the central genotype is still the 0.9× likelihood's best scored candidate,
-  but an independent 0.9× run reaches another local optimum.
+- **Automatic library estimation is the default.** On the 8 C4 sentinels its audit flags `loo.HG03456.2` as
+  SEARCH_PATH-sensitive at 5 blocks (`library_estimate.md` §8). There the central genotype is still the 0.9×
+  likelihood's best scored candidate, but an independent 0.9× run reaches another local optimum.
 - **Rebuilds are not byte-identical.** A rebuilt `panvar` differs from the frozen binary only in the Mach-O UUID,
   debug map and code signature; the code and data sections are identical.
