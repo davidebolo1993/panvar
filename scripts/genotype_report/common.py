@@ -84,8 +84,17 @@ def attach_block_id(frame, what):
     return frame
 
 
+def _float(v):
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return float("nan")
+
+
 def to_number(series):
-    return pd.to_numeric(series.replace({"NA": None, "": None, "none": None}), errors="coerce")
+    """Exact decimal-to-float parsing (Python's float): pandas' fast string parser can round the last digits, which
+    would make a table read back from disk differ from the one written. NA, empty and 'none' read as NaN."""
+    return series.map(_float).astype(float)
 
 
 def to_bool(series):

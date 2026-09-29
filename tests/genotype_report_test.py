@@ -126,7 +126,7 @@ class Report(unittest.TestCase):
         r = e[(e.run_id == "r5") & (e.block_id == "sv:1")].iloc[0]
         # excess 5 / max(100 + 120, 90 + 150) = 5 / 240
         self.assertEqual(r.alignment_denominator_bp, "240.0")
-        self.assertAlmostEqual(float(r.normalized_excess), 5 / 240)
+        self.assertEqual(float(r.normalized_excess), 5 / 240)   # written and read back exactly
         u = e[(e.run_id == "r4") & (e.block_id == "ctx:2")].iloc[0]
         self.assertEqual((u.truth_defined, u.normalized_excess, u.excess), ("False", "NA", "NA"))
 
