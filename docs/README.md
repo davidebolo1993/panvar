@@ -23,5 +23,6 @@ Documentation for the `panvar` CLI.
 7. [modules/associate.md](modules/associate.md) — association testing on the `describe` features.
 
 - [modules/genotype.md](modules/genotype.md) — structural-locus diplotype genotyping from short reads (adaptive completion; optional dosage audit/repair).
+- [modules/genotype_report.md](modules/genotype_report.md) — summary tables, figures and a report from many `panvar genotype` outputs (truth-free QC; evaluation only from supplied truth).
 - [modules/inspect.md](modules/inspect.md) — clustering, path FASTA, and node/edge matrices for a called bubble.
 - [modules/benchmark.md](modules/benchmark.md) — truth-event discovery, carrier assignment, and sequence reconstruction from caller output.

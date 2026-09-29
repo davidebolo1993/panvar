@@ -84,6 +84,8 @@ mode only: DOSAGE_FILTER PASS `COMPLETE_REPAIR_AVAILABLE_NOT_APPLIED`, GENOTYPE_
 
 ## Outputs: locus level and block level
 
+To summarise many runs as tables, figures and a report, see [`genotype_report.md`](genotype_report.md).
+
 - **`<prefix>.locus_genotype.tsv`: the locus-level call,** one row, written in every mode.
   - Run status and no-call reason, call class, locus filter, quality counts, phase support, and candidate and search
     scope.

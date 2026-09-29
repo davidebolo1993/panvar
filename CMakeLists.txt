@@ -394,6 +394,10 @@ if(PANVAR_BUILD_TESTING)
         add_test(NAME panvar_genotype_ladder_selection
                  COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/tests/genotype_select_ladder_test.py
                          ${CMAKE_CURRENT_SOURCE_DIR}/scripts/select_genotype_ladder.py)
+        # The genotype reporting tool on synthetic tables: counts, refusals, the modality contract, byte-identical reruns.
+        add_test(NAME panvar_genotype_report
+                 COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/tests/genotype_report_test.py
+                         ${CMAKE_CURRENT_SOURCE_DIR}/scripts)
         # The LOO development campaign's input binding and completeness accounting. Changed read
         # content, a salted thinning, a missing mate, a failed call, a failed evaluation and a missing
         # status must each REFUSE rather than report: an earlier revision swallowed evaluate failures
