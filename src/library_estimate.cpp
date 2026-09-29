@@ -352,6 +352,7 @@ LibraryEstimate estimate_library(const PreparedGenotypeModel& model, const std::
     try {
         const PreparedMarkerPanel panel = build_marker_panel(model, options.marker_kmer, options.marker_syncmer);
         const MarkerDepthEstimate fit = estimate_marker_depth(panel, count_marker_observations(panel, reads), std::nullopt);
+        est.marker_fit_converged = fit.converged;
         if (fit.converged) {
             fit_rate = fit.rate_per_copy;
             const double w = read_len - static_cast<double>(options.marker_kmer) + 1.0;
@@ -468,6 +469,12 @@ AutoLibrary build_auto_library(const LibraryEstimate& e, const LibraryModel& pre
         why = "the pairs are contaminated (" + num(100.0 * discordant, 3) + "% of anchored pairs are not inward-facing FR; at most " +
               num(100.0 * options.max_discordant_fraction, 3) + "% allowed)";
     }
+    const double lambda = e.marker_fit_intensity;
+    if (why.empty() && !e.marker_fit_converged) {
+        why = "the fragment-start intensity could not be estimated: the invariant-marker depth fit did not converge";
+    } else if (why.empty() && !(std::isfinite(lambda) && lambda > 0.0)) {
+        why = "the fragment-start intensity could not be estimated: the marker-fit estimate is " + num(lambda) + " (it must be finite and positive)";
+    }
     if (!why.empty()) {
         a.refusal = "automatic library estimation refused: " + why +
                     ". Declare the library instead with --library FILE (insert_mean_bp, insert_sd_bp, support_sigmas, substitution_error, "
@@ -478,14 +485,27 @@ AutoLibrary build_auto_library(const LibraryEstimate& e, const LibraryModel& pre
     a.library = preset;
     a.library.insert_mean_bp = e.insert_mean;
     a.library.insert_sd_bp = e.insert_sd;
+    a.library.fragment_start_intensity = lambda;
+    a.anchor_intensity = e.fragment_start_intensity;
     a.library.provenance = "auto: insert from " + std::to_string(e.accepted) + " decisive pairs (median " + num(e.insert_median) + ", robust sd " +
-                           num(e.insert_robust_sd) + "); other values " + preset.provenance;
+                           num(e.insert_robust_sd) + "); fragment-start intensity " + num(lambda) + " from the marker depth fit (anchor-depth "
+                           "diagnostic " + num(e.fragment_start_intensity) + ", ratio " + num(lambda / e.fragment_start_intensity) + "); other values " +
+                           preset.provenance;
     validate_library_model(a.library);
     a.sources = {{"insert_mean_bp", "placement_estimate"}, {"insert_sd_bp", "placement_estimate"}, {"support_sigmas", "short_read_preset"},
                  {"substitution_error", "short_read_preset"}, {"outlier_weight", "short_read_preset"},
-                 {"fragment_start_intensity", "short_read_preset"}, {"gap_open", "short_read_preset"}, {"gap_extend", "short_read_preset"},
+                 {"fragment_start_intensity", "marker_fit_estimate"}, {"gap_open", "short_read_preset"}, {"gap_extend", "short_read_preset"},
                  {"read1_length_median", "reads"}, {"read2_length_median", "reads"}};
     return a;
+}
+
+std::string library_used_rows(const AutoLibrary& a) {
+    std::ostringstream o;
+    o << library_used_rows(a.library, a.sources)
+      << "library.fragment_start_intensity_anchor_diagnostic\t" << num(a.anchor_intensity) << "\tanchor_depth_not_used\t0\t0\tNA\tDIAGNOSTIC\tnone\tanchor_depth_estimate\tNA\n"
+      << "library.fragment_start_intensity_ratio_marker_to_anchor\t" << num(a.library.fragment_start_intensity / a.anchor_intensity)
+      << "\tratio\t0\t0\tNA\tDIAGNOSTIC\tnone\tderived\tNA\n";
+    return o.str();
 }
 
 std::string library_used_rows(const LibraryModel& used, const std::vector<std::pair<std::string, std::string>>& sources) {

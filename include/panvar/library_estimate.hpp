@@ -47,6 +47,7 @@ struct LibraryEstimate {
     double read1_length_median = 0.0, read2_length_median = 0.0;
     double invariant_mismatch_rate = 0.0, phred_error_mean = 0.0, anchor_depth_per_copy = 0.0, fragment_start_intensity = 0.0,
            marker_fit_intensity = 0.0;
+    bool marker_fit_converged = false;
     bool multimodal = false;
     double seconds_index = 0.0, seconds_placement = 0.0, seconds_total = 0.0;
 };
@@ -60,21 +61,25 @@ LibraryEstimate estimate_library(const PreparedGenotypeModel& model, const std::
 // declared_value.
 std::string library_estimate_table(const LibraryEstimate& estimate, const LibraryModel* declared);
 
-// --library auto (docs/algorithms/library_estimate.md section 5). The insert centre and spread come from the estimate
-// (mean and sd of the accepted inserts within the outlier bound); every other library value comes from `preset`. The
-// estimate is refused -- never used, never replaced by a guess -- when accepted pairs are fewer than min_accepted_pairs,
-// the insert distribution is multimodal, or the outlier or orientation-discordant fraction exceeds its bound; the
-// refusal names --library FILE.
+// --library auto (docs/algorithms/library_estimate.md sections 5-6). The insert centre and spread come from the estimate
+// (mean and sd of the accepted inserts within the outlier bound); the fragment-start intensity is the marker-fit estimate
+// (the caller's invariant-marker depth fit); every other library value comes from `preset`. The estimate is refused --
+// never used, never replaced by a guess -- when accepted pairs are fewer than min_accepted_pairs, the insert distribution
+// is multimodal, the outlier or orientation-discordant fraction exceeds its bound, or the marker-depth fit did not
+// converge or gave no finite positive intensity; the refusal names --library FILE.
 struct AutoLibrary {
     bool accepted = false;
     LibraryModel library;
     std::string refusal;                                              // empty when accepted
-    std::vector<std::pair<std::string, std::string>> sources;        // parameter -> reads | placement_estimate | short_read_preset | explicit_override
+    std::vector<std::pair<std::string, std::string>> sources;        // parameter -> reads | placement_estimate | marker_fit_estimate | short_read_preset
+    double anchor_intensity = 0.0;                                     // the independent diagnostic, never used by the call
 };
 AutoLibrary build_auto_library(const LibraryEstimate& estimate, const LibraryModel& preset, const LibraryEstimateOptions& options);
 
 // The rows appended to <out>.library_estimate.tsv for the library the call used: one per parameter, with its value and
 // source (parameter "library.<name>", status USED).
 std::string library_used_rows(const LibraryModel& used, const std::vector<std::pair<std::string, std::string>>& sources);
+// The auto library's rows, the intensity diagnostic and the ratio of the two intensity estimates included.
+std::string library_used_rows(const AutoLibrary& automatic);
 
 } // namespace panvar

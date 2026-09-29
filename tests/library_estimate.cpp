@@ -36,14 +36,18 @@ std::string revcomp(const std::string& s) {
     return o;
 }
 
-// ctx:0 (6 kb) | sv:1 {short 400 bp, long 400 bp + 1.2 kb} | ctx:2 (6 kb); two templates
+// ctx:0 (6.6 kb, with an 800 bp segment twice) | sv:1 {short 400 bp, long 400 bp + 1.2 kb} | ctx:2 (6 kb); two templates
 PreparedGenotypeModel locus(std::uint64_t seed) {
     std::mt19937_64 rng(seed);
     StructuralLocusInput in;
     in.locus_id = "library-fixture";
     in.invariant_segments = {"", "", "", ""};
     const std::string x = random_dna(rng, 400);
-    in.blocks = {{"ctx:0", {{"c0", random_dna(rng, 6000)}}, GenotypeBlockKind::Context},
+    // an invariant segment present twice per haplotype, so the invariant markers carry two copy numbers and the marker
+    // depth fit can separate rate from background, as it does on a real locus
+    const std::string repeat = random_dna(rng, 800);
+    const std::string c0 = random_dna(rng, 3000) + repeat + random_dna(rng, 2000) + repeat;
+    in.blocks = {{"ctx:0", {{"c0", c0}}, GenotypeBlockKind::Context},
                  {"sv:1", {{"short", x}, {"long", x + random_dna(rng, 1200)}}, GenotypeBlockKind::Variant},
                  {"ctx:2", {{"c2", random_dna(rng, 6000)}}, GenotypeBlockKind::Context}};
     in.templates = {{"t-short", TemplateFrameStatus::Complete, {"c0", "short", "c2"}, ChainOrientation::Forward, ""},
@@ -147,17 +151,31 @@ int main() {
         const std::vector<ReadPair> reads = simulate(m, 4000, [&](std::mt19937_64& r) { return n350(r); }, 0.002, 11);
         const LibraryEstimate e = estimate_library(m, reads, opt, nullptr);
         const AutoLibrary a = build_auto_library(e, preset, opt);
-        require(a.accepted && a.refusal.empty(), "a clean estimate is accepted");
+        require(a.accepted && a.refusal.empty(), "a clean estimate is accepted (" + a.refusal + ")");
         require(a.library.insert_mean_bp == e.insert_mean && a.library.insert_sd_bp == e.insert_sd, "auto takes the insert from the estimate");
-        require(a.library.fragment_start_intensity == preset.fragment_start_intensity && a.library.substitution_error == preset.substitution_error &&
-                a.library.outlier_weight == preset.outlier_weight && a.library.support_sigmas == preset.support_sigmas,
-                "every other value is the preset's; the intensity is never inferred");
-        bool insert_placed = false, lambda_preset = false;
+        require(e.marker_fit_converged && a.library.fragment_start_intensity == e.marker_fit_intensity &&
+                a.library.fragment_start_intensity != preset.fragment_start_intensity, "auto takes the marker-fit intensity, never the preset's");
+        require(a.library.substitution_error == preset.substitution_error && a.library.outlier_weight == preset.outlier_weight &&
+                a.library.support_sigmas == preset.support_sigmas, "every other value is the preset's");
+        require(a.anchor_intensity == e.fragment_start_intensity, "the anchor-depth diagnostic is carried beside it");
+        bool insert_placed = false, lambda_fit = false;
         for (const auto& [k, v] : a.sources) {
             if (k == "insert_mean_bp") insert_placed = v == "placement_estimate";
-            if (k == "fragment_start_intensity") lambda_preset = v == "short_read_preset";
+            if (k == "fragment_start_intensity") lambda_fit = v == "marker_fit_estimate";
         }
-        require(insert_placed && lambda_preset, "the sources are recorded");
+        require(insert_placed && lambda_fit, "the sources are recorded");
+        require(library_used_rows(a).find("fragment_start_intensity_ratio_marker_to_anchor") != std::string::npos, "the ratio row is written");
+        // a failed intensity estimate refuses, names --library FILE and carries no library out
+        const auto intensity_refused = [&](const std::string& name, LibraryEstimate f) {
+            const AutoLibrary r = build_auto_library(f, preset, opt);
+            require(!r.accepted && r.refusal.find("fragment-start intensity") != std::string::npos && r.refusal.find("--library FILE") != std::string::npos,
+                    name + ": refused, naming --library FILE (" + r.refusal + ")");
+            require(r.library.fragment_start_intensity == 0.0 && r.sources.empty(), name + ": no library survives");
+        };
+        LibraryEstimate f = e; f.marker_fit_converged = false; intensity_refused("fit_not_converged", f);
+        f = e; f.marker_fit_intensity = std::nan(""); intensity_refused("intensity_nan", f);
+        f = e; f.marker_fit_intensity = 0.0; intensity_refused("intensity_zero", f);
+        f = e; f.marker_fit_intensity = -1e-3; intensity_refused("intensity_negative", f);
     }
     const auto refused = [&](const std::string& name, const std::vector<ReadPair>& reads, const std::string& phrase) {
         const AutoLibrary a = build_auto_library(estimate_library(m, reads, opt, nullptr), preset, opt);

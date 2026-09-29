@@ -645,7 +645,8 @@ void write_status(
         out << "preset\t" << options.preset_name << "\npreset_keys\t" << (keys.empty() ? "none" : keys) << '\n';
     }
     if (options.library_path == "auto") {
-        out << "library_mode\tauto\nlibrary_insert_source\tplacement_estimate\nlibrary_other_source\tshort_read_preset\n";
+        out << "library_mode\tauto\nlibrary_insert_source\tplacement_estimate\nlibrary_intensity_source\tmarker_fit_estimate\n"
+               "library_other_source\tshort_read_preset\n";
     }
     out << "kmer_size\t" << options.kmer_size << '\n';
     out << "syncmer_s\t" << options.syncmer_s << '\n';
@@ -1506,7 +1507,7 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options, GenotypeDo
         const LibraryEstimate estimate = estimate_library(model, fragments, estimate_options, nullptr);
         const AutoLibrary built_library = build_auto_library(estimate, genotype_preset_library("short-read"), estimate_options);
         atomic_write(options.out_prefix + ".library_estimate.tsv",
-                     library_estimate_table(estimate, nullptr) + (built_library.accepted ? library_used_rows(built_library.library, built_library.sources) : ""));
+                     library_estimate_table(estimate, nullptr) + (built_library.accepted ? library_used_rows(built_library) : ""));
         if (!built_library.accepted) {
             timings.markers = seconds_since(mark);
             timings.total = seconds_since(started);
