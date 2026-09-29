@@ -139,6 +139,7 @@ add_library(panvarlib
     src/genotype_dosage_shadow.cpp
     src/genotype_dosage_integrate.cpp
     src/library_estimate.cpp
+    src/genotype_headline.cpp
     src/genotype_dosage_provenance.cpp
     src/fragment_likelihood.cpp
     src/bubble_path.cpp
@@ -315,6 +316,15 @@ if(PANVAR_BUILD_TESTING)
         target_compile_options(genotype_seeding_exactness_test PRIVATE -Wall -Wextra -Wpedantic)
         add_test(NAME panvar_genotype_seeding_exactness COMMAND genotype_seeding_exactness_test)
         # The combined per-block quality rule (block_quality_rule_v1).
+        # headline_filters_v2: every mapping row, fail-closed precedence, aggregation and reconciled counts.
+        add_executable(genotype_headline_test tests/genotype_headline.cpp src/cli_utils.cpp)
+        target_link_libraries(genotype_headline_test PRIVATE panvarlib)
+        target_compile_options(genotype_headline_test PRIVATE -Wall -Wextra -Wpedantic)
+        add_test(NAME panvar_genotype_headline COMMAND genotype_headline_test)
+        # Gate tool only (reads sealed campaign outputs; not a test): the headline function on copies of sealed prefixes.
+        add_executable(genotype_headline_replay tests/genotype_headline_replay.cpp src/cli_utils.cpp)
+        target_link_libraries(genotype_headline_replay PRIVATE panvarlib)
+
         # library_sensitivity_audit_v1: audit scores bit-identical to declared libraries; the genotype-only verdict.
         add_executable(library_sensitivity_test tests/library_sensitivity.cpp src/cli_utils.cpp)
         target_link_libraries(library_sensitivity_test PRIVATE panvarlib)

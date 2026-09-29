@@ -24,11 +24,25 @@ LEGACY = [".genotypes.tsv", ".block_genotypes.tsv", ".mosaic_haplotypes.fa", ".m
           ".mosaic_candidates.tsv", ".equivalence_set.tsv"]
 SEARCH_RECORD = [".mosaic_scores.tsv", ".mosaic_candidates.tsv", ".equivalence_set.tsv", ".repair_rounds.tsv",
                  ".tie_branches.tsv", ".tie_terminal_ties.tsv"]
-DOSAGE_COLS = ["dosage_status", "dosage_reason", "dosage_filter", "dosage_filter_reason", "repair_class", "dosage_repair_applied",
+DOSAGE_COLS = ["dosage_status", "dosage_reason", "dosage_stage_filter", "dosage_stage_filter_reason", "repair_class", "dosage_repair_applied",
                "dosage_content_scope", "diplotype_scope", "allocation_equivalence_scope", "serialization_representative",
                "original_allele1", "original_allele2", "original_content", "corrected_content", "admissible_content_vectors",
                "allocation_status", "original_GQ", "gq_status", "repair_separation", "conditional_repair_gap", "original_filter",
                "original_quality_filter", "original_genotype_support", "filter_basis", "quality_filter_basis"]
+# headline_filters_v2: trailing columns every mode writes; they legitimately differ between dosage modes, so the
+# legacy comparisons below strip them, and the headline gate (tests/results/headline_filters_impl) checks them.
+HEADLINE_BLOCK_COLS = ["genotype_filter", "genotype_filter_reasons", "dosage_filter", "dosage_filter_reasons"]
+HEADLINE_LOCUS_COLS = ["headline_rule", "genotype_filter", "genotype_filter_reasons", "dosage_filter", "dosage_filter_reasons",
+                       "phase_filter", "phase_filter_reasons", "call_summary"] + \
+                      [f"{f}_filter_{s}" for f in ("genotype", "dosage", "phase")
+                       for s in ("units", "applicable", "pass", "low_quality", "not_evaluated", "no_call", "not_applicable")]
+def strip_headline(text, path):
+    drop = HEADLINE_BLOCK_COLS if path.endswith((".genotypes.tsv", ".block_genotypes.tsv")) else \
+           HEADLINE_LOCUS_COLS if path.endswith(".locus_genotype.tsv") else None
+    if drop is None or not text: return text
+    rows = [l.split("\t") for l in text.split("\n")]
+    keep = [i for i, c in enumerate(rows[0]) if c not in drop]
+    return "\n".join("\t".join(r[i] for i in keep if i < len(r)) if r != [""] else "" for r in rows)
 LOCUS_COLS = ["prefix", "run_status", "call_class", "no_call_reason", "locus_filter", "quality_rule", "quality_pass_blocks",
               "quality_lowqual_blocks", "filter_basis", "phase_support", "candidate_scope", "search_conditional", "reported_genotype_source",
               "hap1_id", "hap1_sha256", "hap1_bp", "hap1_block_path", "hap2_id", "hap2_sha256", "hap2_bp", "hap2_block_path",
@@ -65,7 +79,7 @@ def check(ok, what):
     return ok
 
 def norm(path, prefix, threads_exempt=False):
-    text = open(path).read().replace(prefix, "PREFIX")
+    text = strip_headline(open(path).read().replace(prefix, "PREFIX"), path)
     if path.endswith(".mosaic_status.tsv"):
         lines = [l for l in text.split("\n") if not STATUS_VOLATILE.match(l) and "PREFIX" not in l]
         if threads_exempt: lines = [l for l in lines if not l.startswith("threads")]
@@ -75,7 +89,7 @@ def norm(path, prefix, threads_exempt=False):
     return text
 
 def table(path):
-    rows = [l.split("\t") for l in open(path).read().rstrip("\n").split("\n")]
+    rows = [l.split("\t") for l in strip_headline(open(path).read(), path).rstrip("\n").split("\n")]
     return rows[0], rows[1:]
 
 def fasta(path):
@@ -258,7 +272,7 @@ def main():
                 want = {"CONSISTENT": "PASS", "NOT_SENSITIVE": "PASS", "CONTENT_REPAIRED": "DOSAGE_CONTENT_CORRECTED",
                         "TRIGGERED_UNREPAIRED": "DOSAGE_TRIGGERED_UNREPAIRED", "SUSPECT": "DOSAGE_SUSPECT", "UNDERPOWERED": "DOSAGE_UNDERPOWERED",
                         "NOT_EVALUATED": "DOSAGE_NOT_EVALUATED", "REPAIRED": "PASS" if bid in applied else "DOSAGE_REPAIR_NOT_APPLIED"}.get(st)
-                check(tail["dosage_filter"] == want, f"repair{s} {bid}: dosage_filter {tail['dosage_filter']} for {st}")
+                check(tail["dosage_stage_filter"] == want, f"repair{s} {bid}: dosage_stage_filter {tail['dosage_stage_filter']} for {st}")
     if cls == "strict_call":
         fa_a, fa_r = fasta(P["audit"] + ".mosaic_haplotypes.fa"), fasta(P["repair"] + ".mosaic_haplotypes.fa")
         if not applied:

@@ -55,7 +55,7 @@ const char* const kFinalOutputs[] = {".genotypes.tsv", ".block_genotypes.tsv", "
                                      ".mosaic_scores.tsv", ".mosaic_haplotypes.fa", ".equivalence_set.tsv",
                                      ".repair_rounds.tsv", ".repair_memory.tsv", ".tie_branches.tsv",
                                      ".tie_terminal_ties.tsv", ".tie_branch_memory.tsv", ".library_sensitivity.tsv",
-                                     ".library_sensitivity_blocks.tsv"};
+                                     ".library_sensitivity_blocks.tsv", ".settings.tsv"};
 const char* const kPartialOutputs[] = {".repair_rounds.partial.tsv", ".repair_memory.partial.tsv",
                                        ".tie_branch_memory.partial.tsv"};
 // The representation-conflict filter columns, appended to both genotype tables on every path; a path that
@@ -671,6 +671,16 @@ void write_status(
         }
         out << sensitivity;
     }
+    {
+        // Every public setting's effective value and where it came from (flag > profile > preset > default).
+        std::string table = "key\tvalue\tsource\n";
+        for (const std::string& key : genotype_public_settings()) {
+            const auto source = options.setting_sources.find(key);
+            table += key + "\t" + genotype_setting_value(options, key) + "\t" +
+                     (source == options.setting_sources.end() ? std::string("default") : source->second) + "\n";
+        }
+        atomic_write(options.out_prefix + ".settings.tsv", table);
+    }
     atomic_write(options.out_prefix + ".library_sensitivity.tsv",
                  "key\tvalue\nlibrary_mode\t" + std::string(options.library_path == "auto" ? "auto" : "file") + "\n" +
                      sensitivity);
@@ -1121,7 +1131,12 @@ void apply_genotype_setting(const std::string& context, const std::string& key, 
                             GenotypeCommandOptions& options) {
     const auto whole_u64 = [&](const std::string& key, const std::string& text) {
         std::size_t used = 0;
-        const unsigned long long value = std::stoull(text, &used);
+        unsigned long long value = 0;
+        try {
+            value = std::stoull(text, &used);
+        } catch (const std::exception&) {
+            throw std::runtime_error(context + ": '" + key + "' is not a non-negative integer: " + text);
+        }
         if (used != text.size() || text.empty() || text[0] == '-') {
             throw std::runtime_error(context + ": '" + key + "' is not a non-negative integer: " + text);
         }
@@ -1129,7 +1144,12 @@ void apply_genotype_setting(const std::string& context, const std::string& key, 
     };
     const auto whole_double = [&](const std::string& key, const std::string& text) {
         std::size_t used = 0;
-        const double value = std::stod(text, &used);
+        double value = 0.0;
+        try {
+            value = std::stod(text, &used);
+        } catch (const std::exception&) {
+            throw std::runtime_error(context + ": '" + key + "' is not a finite non-negative number: " + text);
+        }
         if (used != text.size() || !std::isfinite(value) || value < 0.0) {
             throw std::runtime_error(context + ": '" + key + "' is not a finite non-negative number: " + text);
         }
@@ -1188,6 +1208,92 @@ void apply_genotype_setting(const std::string& context, const std::string& key, 
     else if (key == "footprint_limit_bytes") options.footprint_limit_bytes = u();
     else if (key == "time_limit_seconds") options.time_limit_seconds = whole_double(key, value);
     else throw std::runtime_error(context + ": unknown setting '" + key + "'");
+    // Ranges, the same for a profile key and its flag, checked before any work (syncmer_s <= kmer_size is checked once
+    // every source has been applied: validate_genotype_settings).
+    const auto in_range = [&](bool ok, const char* rule) {
+        if (!ok) throw std::runtime_error(context + ": '" + key + "' " + rule + ": " + value);
+    };
+    if (key == "kmer_size") in_range(options.kmer_size >= 1 && options.kmer_size <= 31, "must be 1..31");
+    if (key == "syncmer_s") in_range(options.syncmer_s >= 1 && options.syncmer_s <= 31, "must be 1..31");
+    if (key == "min_variant_bp") in_range(options.min_variant_bp >= 1, "must be at least 1");
+    if (key == "switch_probability") in_range(options.switch_probability > 0.0 && options.switch_probability <= 0.5, "must be in (0, 0.5]");
+    if (key == "proposal_state_limit") in_range(options.proposal_state_limit >= 1, "must be at least 1");
+    if (key == "repair_local_pairs") in_range(options.repair_local_pairs >= 1, "must be at least 1");
+    if (key == "repair_tie_max_branches") in_range(options.repair_tie_max_branches >= 1, "must be at least 1");
+    if (key == "threads") in_range(options.threads >= 1, "must be at least 1");
+    options.setting_sources[key] = context;
+}
+
+const std::vector<std::string>& genotype_public_settings() {
+    static const std::vector<std::string> keys = {
+        // scientific, each also a named flag (panvar genotype --help-advanced)
+        "kmer_size", "syncmer_s", "min_variant_bp", "switch_probability", "proposal_state_limit", "mismatch_band",
+        "phase_audit_candidates", "max_mosaic_candidates", "repair_rounds", "repair_local_pairs", "repair_max_neighbours",
+        "repair_tie_branching", "repair_tie_max_branches", "representation_guard", "threads",
+        // resource caps, caches and limits: profile keys only
+        "max_piece_hits", "max_physical_origins", "max_state_classes", "max_mass_cells", "emission_cache_bytes",
+        "repair_origin_cache_bytes", "repair_max_physical_origins", "repair_max_state_classes", "repair_max_piece_hits",
+        "repair_max_latent_pairs", "repair_tie_seed_cache_bytes", "union_placement_cache_bytes",
+        "max_union_cached_placements_consumed", "union_origin_cache_bytes", "max_union_cached_origins_consumed",
+        "max_union_cached_states_consumed", "union_prefilter_cache_bytes", "start_sort_scratch_bytes",
+        "max_union_cached_prefilters_consumed", "emission_lookup_timing", "library_sensitivity_audit",
+        "footprint_limit_bytes", "time_limit_seconds"};
+    return keys;
+}
+
+std::string genotype_setting_value(const GenotypeCommandOptions& o, const std::string& key) {
+    std::ostringstream out;
+    out << std::setprecision(17);
+    const auto b = [](bool x) { return std::string(x ? "1" : "0"); };
+    if (key == "kmer_size") out << o.kmer_size;
+    else if (key == "syncmer_s") out << o.syncmer_s;
+    else if (key == "min_variant_bp") out << o.min_variant_bp;
+    else if (key == "switch_probability") out << o.switch_probability;
+    else if (key == "proposal_state_limit") out << o.proposal_state_limit;
+    else if (key == "mismatch_band") out << o.mismatch_band;
+    else if (key == "phase_audit_candidates") out << o.phase_audit_candidates;
+    else if (key == "max_mosaic_candidates") out << o.max_mosaic_candidates;
+    else if (key == "repair_rounds") out << o.repair_rounds;
+    else if (key == "repair_local_pairs") out << o.repair_local_pairs;
+    else if (key == "repair_max_neighbours") out << o.repair_max_neighbours;
+    else if (key == "repair_tie_branching") return b(o.repair_tie_branching);
+    else if (key == "repair_tie_max_branches") out << o.repair_tie_max_branches;
+    else if (key == "representation_guard") return b(o.representation_guard);
+    else if (key == "threads") out << o.threads;
+    else if (key == "max_piece_hits") out << o.max_piece_hits;
+    else if (key == "max_physical_origins") out << o.max_physical_origins;
+    else if (key == "max_state_classes") out << o.max_state_classes;
+    else if (key == "max_mass_cells") out << o.max_mass_cells;
+    else if (key == "emission_cache_bytes") out << o.emission_cache_bytes;
+    else if (key == "repair_origin_cache_bytes") out << o.repair_origin_cache_bytes;
+    else if (key == "repair_max_physical_origins") out << o.repair_max_physical_origins;
+    else if (key == "repair_max_state_classes") out << o.repair_max_state_classes;
+    else if (key == "repair_max_piece_hits") out << o.repair_max_piece_hits;
+    else if (key == "repair_max_latent_pairs") out << o.repair_max_latent_pairs;
+    else if (key == "repair_tie_seed_cache_bytes") out << o.repair_tie_seed_cache_bytes;
+    else if (key == "union_placement_cache_bytes") out << o.union_placement_cache_bytes;
+    else if (key == "max_union_cached_placements_consumed") out << o.max_union_cached_placements_consumed;
+    else if (key == "union_origin_cache_bytes") out << o.union_origin_cache_bytes;
+    else if (key == "max_union_cached_origins_consumed") out << o.max_union_cached_origins_consumed;
+    else if (key == "max_union_cached_states_consumed") out << o.max_union_cached_states_consumed;
+    else if (key == "union_prefilter_cache_bytes") out << o.union_prefilter_cache_bytes;
+    else if (key == "start_sort_scratch_bytes") out << o.start_sort_scratch_bytes;
+    else if (key == "max_union_cached_prefilters_consumed") out << o.max_union_cached_prefilters_consumed;
+    else if (key == "emission_lookup_timing") return b(o.emission_lookup_timing);
+    else if (key == "library_sensitivity_audit") return b(o.library_sensitivity_audit);
+    else if (key == "footprint_limit_bytes") out << o.footprint_limit_bytes;
+    else if (key == "time_limit_seconds") out << o.time_limit_seconds;
+    else throw std::invalid_argument("not a public setting: " + key);
+    return out.str();
+}
+
+void validate_genotype_settings(const GenotypeCommandOptions& o) {
+    if (o.syncmer_s > o.kmer_size) {
+        throw std::runtime_error("syncmer_s (" + std::to_string(o.syncmer_s) + ", from " +
+                                 (o.setting_sources.count("syncmer_s") ? o.setting_sources.at("syncmer_s") : std::string("default")) +
+                                 ") must not exceed kmer_size (" + std::to_string(o.kmer_size) + ", from " +
+                                 (o.setting_sources.count("kmer_size") ? o.setting_sources.at("kmer_size") : std::string("default")) + ")");
+    }
 }
 
 std::vector<std::pair<std::string, std::string>> genotype_preset_settings(const std::string& name) {
@@ -5055,6 +5161,35 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options, GenotypeDo
     return last;
 }
 
+namespace {
+// The advanced scientific settings exposed as named flags (panvar genotype --help-advanced). Each is exactly its profile
+// key: same parser, same validation, and precedence flag > profile > preset > default whatever the argument order.
+struct AdvancedFlag {
+    const char* flag;
+    const char* key;
+    bool on_off;
+    const char* help;
+};
+const AdvancedFlag kAdvancedFlags[] = {
+    {"--kmer-size", "kmer_size", false, "marker k-mer length, 1..31"},
+    {"--syncmer-s", "syncmer_s", false, "marker syncmer s, 1..k"},
+    {"--min-variant-bp", "min_variant_bp", false, "smallest allele-length difference that makes a variant block"},
+    {"--switch-probability", "switch_probability", false, "per-boundary template-switch prior, in (0, 0.5]"},
+    {"--proposal-state-limit", "proposal_state_limit", false, "mosaic proposal beam width"},
+    {"--mismatch-band", "mismatch_band", false, "read-placement mismatch band of the truncated model"},
+    {"--phase-audit-candidates", "phase_audit_candidates", false, "candidates in the phase audit set (0: none)"},
+    {"--repair-local-pairs", "repair_local_pairs", false, "allele pairs per block in a repair neighbourhood"},
+    {"--repair-max-neighbours", "repair_max_neighbours", false, "declared bound on one repair neighbourhood (0: none)"},
+    {"--repair-tie-branching", "repair_tie_branching", true, "exact branch-and-pool at improving-move ties"},
+    {"--repair-tie-max-branches", "repair_tie_max_branches", false, "tie-branching cap; beyond it the run no-calls"},
+    {"--representation-guard", "representation_guard", true, "the representation-conflict annotation"},
+};
+const AdvancedFlag* advanced_setting(const std::string& flag) {
+    for (const AdvancedFlag& a : kAdvancedFlags) if (flag == a.flag) return &a;
+    return nullptr;
+}
+} // namespace
+
 int run_genotype_command(const std::vector<std::string>& args) {
     GenotypeCommandOptions options;
     const auto need = [&](std::size_t& i) {
@@ -5085,17 +5220,34 @@ int run_genotype_command(const std::vector<std::string>& args) {
         else if (flag == "--reference-path" || flag == "-r") options.reference_path = need(i);
         else if (flag == "--out-prefix" || flag == "--out" || flag == "-o") options.out_prefix = need(i);
         else if (flag == "--library") options.library_path = need(i);
-        else if (flag == "--threads") options.threads = std::stoul(need(i));   // workers for diploid combination
+        else if (flag == "--threads") apply_genotype_setting("flag --threads", "threads", need(i), options);   // workers
         else if (flag == "--panel-curation") options.curation_manifest_path = need(i);
-        else if (flag == "--max-mosaic-candidates" || flag == "--mosaic-candidates") options.max_mosaic_candidates = std::stoul(need(i));
-        else if (flag == "--repair-rounds") options.repair_rounds = std::stoul(need(i));
+        else if (flag == "--max-mosaic-candidates" || flag == "--mosaic-candidates") {
+            apply_genotype_setting("flag " + flag, "max_mosaic_candidates", need(i), options);
+        }
+        else if (flag == "--repair-rounds") apply_genotype_setting("flag --repair-rounds", "repair_rounds", need(i), options);
         else if (flag == "--adaptive-repair") {
             // off: the unrepaired development view (no repair rounds, no tie branching); on: the adaptive repair, with
             // the preset's 32 rounds when nothing else set a round cap
             const std::string v = need(i);
-            if (v == "off") { options.repair_rounds = 0; options.repair_tie_branching = false; }
-            else if (v == "on") { if (options.repair_rounds == 0) options.repair_rounds = 32; }
-            else throw std::runtime_error("--adaptive-repair takes on or off");
+            if (v == "off") {
+                apply_genotype_setting("flag --adaptive-repair", "repair_rounds", "0", options);
+                apply_genotype_setting("flag --adaptive-repair", "repair_tie_branching", "0", options);
+            } else if (v == "on") {
+                if (options.repair_rounds == 0) apply_genotype_setting("flag --adaptive-repair", "repair_rounds", "32", options);
+            } else {
+                throw std::runtime_error("--adaptive-repair takes on or off");
+            }
+        }
+        else if (advanced_setting(flag) != nullptr) {
+            // An advanced scientific setting: the profile key's own parser and validation, recorded as a flag.
+            const AdvancedFlag& a = *advanced_setting(flag);
+            std::string v = need(i);
+            if (a.on_off) {
+                if (v != "on" && v != "off") throw std::runtime_error(flag + " takes on or off: " + v);
+                v = v == "on" ? "1" : "0";
+            }
+            apply_genotype_setting("flag " + flag, a.key, v, options);
         }
         // The repair's planned origin-cache budget, for a diagnostic comparison; recorded as an override.
         else if (flag == "--repair-origin-cache-bytes") options.repair_origin_cache_bytes = std::stoull(need(i));
@@ -5122,71 +5274,82 @@ int run_genotype_command(const std::vector<std::string>& args) {
         else if (flag == "-h" || flag == "--help") {
             std::cout <<
                 "Usage:\n"
-                "  panvar genotype --profile <profile.tsv> --gfa <graph.gfa> --reference-path <name> \\\n"
-                "                  --reads1 <r1.fq> --reads2 <r2.fq> [--library auto|<params.txt>] \\\n"
-                "                  --out-prefix <prefix> [--panel-curation <manifest.tsv>] [--bubbles <bubbles.csv>]\n\n"
-                "Calls a pair of whole-locus haplotypes and projects them to one allele pair per SV\n"
-                "block. Paired reads only. The command never asks what kind of sample it is given.\n\n"
-                "With a profile (the C4 production profile is profiles/genotype_c4.tsv) the call is\n"
-                "panel-anchored adaptive completion:\n"
-                "  1. every unordered pair of panel haplotypes and up to K grouped-prefix mosaics are\n"
-                "     exactly scored;\n"
-                "  2. the best exactly scored panel diplotype anchors an exact one-block coordinate\n"
-                "     repair, which moves to the best improving neighbour until none improves;\n"
-                "  3. the union and every candidate the repair scored are pooled and exactly reranked;\n"
-                "  4. one candidate at the top calls (status COMPLETE); several tied on total score\n"
-                "     with one unordered genotype at every block emit that genotype unphased\n"
-                "     (CONDITIONAL_GENOTYPE_EQUIVALENT, no FASTA); tied candidates that disagree at\n"
-                "     any block refuse. A round cap, resource refusal or interruption emits no genotype.\n"
-                "The candidate set is always CONDITIONAL: the search is local, never exhaustive, and\n"
-                "conditional_GQ is uncalibrated. phase_support is reported separately: PRIOR_ONLY\n"
-                "means the reads give no preference between phase alternatives, and the FASTA of\n"
-                "such a call is a prior-selected haplotype representation, not a read-phased result.\n\n"
-                "Without a profile the unrepaired call from the proposal's candidate set is made\n"
-                "(a development view). --max-mosaic-candidates sets K (0: the panel alone) and\n"
-                "--threads the workers; given beside a profile, either is recorded as an override.\n\n"
-                "Outputs <prefix>.genotypes.tsv, .block_genotypes.tsv, .mosaic_candidates.tsv,\n"
-                ".mosaic_scores.tsv, .mosaic_status.tsv and .mosaic_haplotypes.fa; with a profile\n"
-                "also .equivalence_set.tsv, .repair_rounds.tsv and .repair_memory.tsv. While running,\n"
-                "the status says RUNNING and committed repair rounds are in .repair_rounds.partial.tsv;\n"
-                "a run stopped by the profile's footprint or time limit keeps only those and says\n"
-                "RESOURCE_REFUSAL or TIME_LIMIT. An incomplete run never presents a partial ranking\n"
-                "as a result. Exit status 0 when a genotype was emitted, 1 otherwise. Every run\n"
-                "also writes .locus_genotype.tsv, the locus-level call.\n\n"
-                "--dosage-mode off|audit|repair (default off; docs/algorithms/genotype_dosage.md):\n"
-                "audit writes the dosage stage's .dosage_* files and changes nothing else; repair\n"
-                "also replaces a block's genotype where the stage found a complete diplotype repair,\n"
-                "keeping the caller's outputs as .original.*. A dosage-content correction that is not\n"
-                "a resolved diplotype is reported beside the caller's genotype, never in place of it.\n\n"
-                "Basic use: --graph G --reads1 R1 --reads2 R2 --out PREFIX --preset short-read [--threads N].\n"
-                "--preset short-read sets the production algorithm (adaptive repair, exact tie branching,\n"
-                "representation guard) and short-read technology constants, and nothing about a locus;\n"
-                "--preset long-read is reserved and refused.\n\n"
-                "--library: omitted means auto. auto estimates the insert centre and spread from decisively placed\n"
-                "pairs (at most 20,000 examined, at least 500 required) and the fragment-start intensity from the\n"
-                "invariant-marker depth fit, and takes the other library values from the preset; an estimate that\n"
-                "fails validation refuses the run (LIBRARY_REFUSED) -- there is no fallback. --library FILE declares\n"
-                "every value and is the exact reproducibility route; it runs no estimate and no audit.\n"
-                "Under auto the call is followed at 0.9x and 1.1x the estimated intensity (library_sensitivity_audit_v2).\n"
-                "A block is library-sensitive when its unordered genotype differs there, by likelihood rank (the scored\n"
-                "pool reranked) or by search path (the endpoint's own independent call): it becomes LOW_QUALITY\n"
-                "(library_sensitive) and the locus filter gains LOWQUAL_LIBRARY_SENSITIVE. An audit that cannot\n"
-                "complete accuses no block: the locus filter gains NOT_EVALUATED_LIBRARY_SENSITIVITY. The call itself\n"
-                "never changes. The record is .library_sensitivity.tsv (and .library_sensitivity_blocks.tsv).\n"
-                "Without --reference-path the graph's declared reference sample (RS:Z) is\n"
-                "used, or the run refuses and lists candidates. --mosaic-candidates K, --adaptive-repair on|off and\n"
-                "--repair-rounds N override the preset. A profile (--profile) overrides the preset; flags override both.\n\n"
-                "--library-diagnostic (off by default) also writes .library_estimate.tsv, a library\n"
-                "estimated from the reads and the model beside the declared one; the call never uses it.\n\n"
-                "--panel-curation takes a manifest of panel templates to exclude: one template name\n"
-                "per line, '#' opening a comment line. It is recorded with the reason, the manifest\n"
-                "path and a digest, and a manifest naming an absent template is refused.\n\n"
-                "--library declares insert_mean_bp, insert_sd_bp, support_sigmas,\n"
-                "substitution_error, outlier_weight and fragment_start_intensity, one per line,\n"
-                "and optionally marker_background (estimated from invariant anchors when absent).\n"
-                "Version one does not estimate these from the data.\n";
+                "  panvar genotype --graph <graph.gfa> --reads1 <r1.fq> --reads2 <r2.fq> --out <prefix> [options]\n\n"
+                "Genotypes one structural locus from paired short reads: a diplotype (two whole-locus haplotypes)\n"
+                "over the graph's panel, projected to one allele pair per block.\n\n"
+                "Options:\n"
+                "  --preset short-read        the production algorithm and short-read constants (long-read: refused)\n"
+                "  --library auto|FILE        omitted means auto: insert and fragment-start intensity estimated from the\n"
+                "                             reads, refused (LIBRARY_REFUSED) if invalid, never a fallback. FILE declares\n"
+                "                             every value and is the exact reproducibility route (no estimate, no audit).\n"
+                "  --reference-path NAME      the coordinate reference (default: the graph's RS:Z sample)\n"
+                "  --panel-curation FILE      panel templates to exclude\n"
+                "  --threads N                workers\n"
+                "  --mosaic-candidates K      off-panel mosaics scored beside every panel diplotype\n"
+                "  --adaptive-repair on|off   the exact coordinate repair (on under the preset)\n"
+                "  --repair-rounds N          the repair's round cap\n"
+                "  --dosage-mode off|audit|repair   the dosage stage (default off)\n"
+                "  --profile FILE             a validated settings profile\n"
+                "  -q, --quiet\n"
+                "  --help-advanced            advanced scientific flags, profile keys and precedence\n\n"
+                "Headline filters, three independent verdicts (every detailed field is also reported):\n"
+                "  GENOTYPE_FILTER, DOSAGE_FILTER, PHASE_FILTER: PASS, LOW_QUALITY, NOT_EVALUATED, NO_CALL or NOT_APPLICABLE,\n"
+                "  with reasons; CALL_SUMMARY=GENOTYPE_<s>;DOSAGE_<s>;PHASE_<s>. Per block in .block_genotypes.tsv\n"
+                "  (genotype_filter, dosage_filter); per locus in .locus_genotype.tsv (all three, reasons and per-status\n"
+                "  counts). Under --dosage-mode off DOSAGE_FILTER is NOT_EVALUATED. PHASE_FILTER is PASS only for\n"
+                "  read-supported phase; a prior-selected phase is LOW_QUALITY (MODEL_ONLY_PHASE).\n"
+                "  Usage policies (downstream selections, not filters): exact genotype = GENOTYPE PASS and DOSAGE PASS or\n"
+                "  NOT_APPLICABLE; dosage content = DOSAGE PASS; phased genotype = exact genotype and PHASE PASS.\n\n"
+                "Under --library auto the call is also followed at 0.9x and 1.1x the estimated intensity; a block whose\n"
+                "unordered genotype differs there (likelihood rank or search path) is LOW_QUALITY (LIBRARY_SENSITIVE), and\n"
+                "an audit that cannot complete leaves the locus filter NOT_EVALUATED_LIBRARY_SENSITIVITY. The call itself\n"
+                "never changes.\n\n"
+                "Outputs: .locus_genotype.tsv (the locus-level call), .block_genotypes.tsv and .genotypes.tsv (per block),\n"
+                ".mosaic_haplotypes.fa (a strict call's haplotypes), .mosaic_status.tsv, .settings.tsv (every effective\n"
+                "setting and its source) and the search record. Exit status 0 when a genotype was emitted, 1 otherwise.\n";
             return 0;
-        } else {
+        }
+        else if (flag == "--help-advanced") {
+            GenotypeCommandOptions defaults;
+            std::cout <<
+                "panvar genotype: advanced settings\n\n"
+                "Precedence: explicit flag > profile (--profile) > preset (--preset) > built-in default, whatever the\n"
+                "argument order. Every effective setting and its source is written to <prefix>.settings.tsv.\n\n"
+                "Scientific flags (each is exactly its profile key: same parser, same validation):\n";
+            for (const AdvancedFlag& f : kAdvancedFlags) {
+                std::string head = std::string("  ") + f.flag + (f.on_off ? " on|off" : " N");
+                head.resize(std::max<std::size_t>(head.size() + 1, 34), ' ');
+                const std::string d = genotype_setting_value(defaults, f.key);
+                std::cout << head << f.help << "\n" << std::string(34, ' ') << "profile key " << f.key
+                          << "; built-in default " << (f.on_off ? (d == "1" ? "on" : "off") : d) << "\n";
+            }
+            const auto list = [](const std::vector<std::string>& keys) {
+                std::string out = "  ";
+                std::size_t width = 2;
+                for (const std::string& key : keys) {
+                    if (width + key.size() + 2 > 104) { out += "\n  "; width = 2; }
+                    out += key + "  ";
+                    width += key.size() + 2;
+                }
+                return out + "\n";
+            };
+            std::vector<std::string> resource, measurement;
+            bool after_flags = false;
+            for (const std::string& key : genotype_public_settings()) {
+                if (key == "max_piece_hits") after_flags = true;
+                if (!after_flags) continue;
+                (key == "emission_lookup_timing" || key == "library_sensitivity_audit" ? measurement : resource).push_back(key);
+            }
+            std::cout << "\nResource caps, caches and limits: profile keys only (key<TAB>value in a --profile file):\n"
+                      << list(resource) << "Measurement keys (profile only; not for production calls):\n" << list(measurement);
+            std::cout <<
+                "\n\nLibrary parameters belong to --library FILE, one per line: insert_mean_bp, insert_sd_bp,\n"
+                "support_sigmas, substitution_error, outlier_weight, fragment_start_intensity and optionally\n"
+                "marker_background.\n\n"
+                "Development views: without a profile or preset the unrepaired proposal call is made; --adaptive-repair\n"
+                "off gives the same. Diagnostic and test hooks are not user settings and are not listed.\n";
+            return 0;
+                } else {
             throw std::runtime_error("unknown genotype option: " + flag);
         }
     }
@@ -5209,8 +5372,12 @@ int run_genotype_command(const std::vector<std::string>& args) {
                 options.overridden_settings.push_back("repair_tie_seed_cache_bytes=" +
                                                       std::to_string(options.repair_tie_seed_cache_bytes));
             }
+            if (const AdvancedFlag* a = advanced_setting(flag)) {
+                options.overridden_settings.push_back(std::string(a->key) + "=" + genotype_setting_value(options, a->key));
+            }
         }
     }
+    validate_genotype_settings(options);   // every source applied: cross-field rules, before any work
     if (options.reference_path.empty() && !options.gfa_path.empty()) {
         // The graph's declared reference sample (a header RS:Z tag): its single path is the coordinate reference. No
         // declaration, or several paths for it, is refused with the candidates listed; nothing is picked silently.

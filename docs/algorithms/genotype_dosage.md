@@ -816,14 +816,15 @@ exactly as a fresh run would be integrated.
 - **Every other block** keeps every caller column. `filter`, `quality_filter` and `phase_support` are never rewritten
   (§20.4). An orientation tie leaves phase unchanged (§8, rule 4).
 - **Trailing columns** are appended to every row of both block tables, in this order:
-  - `dosage_status`, `dosage_reason`, `dosage_filter`, `dosage_filter_reason`, `repair_class`, `dosage_repair_applied`;
+  - `dosage_status`, `dosage_reason`, `dosage_stage_filter`, `dosage_stage_filter_reason` (named `dosage_filter` and
+    `dosage_filter_reason` before `headline_filters_v2`), `repair_class`, `dosage_repair_applied`;
   - `dosage_content_scope`, `diplotype_scope`, `allocation_equivalence_scope`, `serialization_representative`;
   - `original_allele1`, `original_allele2` (the caller's), `original_content`, `corrected_content`,
     `admissible_content_vectors`;
   - `allocation_status`, `original_GQ`, `gq_status`, `repair_separation`, `conditional_repair_gap`.
   - No repaired allele identity appears in these columns. A conditional representative stays in `dosage_blocks.tsv`,
     `dosage_repaired*.fa` and the equivalence table only.
-- **`dosage_filter`** is as §20.4, plus one value. `DOSAGE_REPAIR_NOT_APPLIED` marks a COMPLETE_DIPLOTYPE_REPAIR that
+- **`dosage_stage_filter`** (formerly `dosage_filter`) is as §20.4, plus one value. `DOSAGE_REPAIR_NOT_APPLIED` marks a COMPLETE_DIPLOTYPE_REPAIR that
   was not applied, with its reason.
 - **Fail-closed eligibility** (*amendment*: cases §20 does not cover exactly). A COMPLETE_DIPLOTYPE_REPAIR is applied
   only when all of these hold; otherwise the block keeps the caller's genotype with `DOSAGE_REPAIR_NOT_APPLIED` and the

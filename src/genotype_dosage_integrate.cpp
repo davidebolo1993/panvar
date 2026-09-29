@@ -1,6 +1,7 @@
 #include "panvar/genotype_dosage_integrate.hpp"
 
 #include "panvar/genotype_command.hpp"
+#include "panvar/genotype_headline.hpp"
 #include "panvar/genotype_repair.hpp"
 #include "panvar/ls_hmm.hpp"
 #include "panvar/mosaic_spelling.hpp"
@@ -186,7 +187,7 @@ const std::vector<std::string>& dosage_stage_outputs() {
 
 const std::vector<std::string>& dosage_block_columns() {
     static const std::vector<std::string> columns = {
-        "dosage_status",         "dosage_reason",      "dosage_filter",          "dosage_filter_reason", "repair_class",
+        "dosage_status",         "dosage_reason",      "dosage_stage_filter",    "dosage_stage_filter_reason", "repair_class",
         "dosage_repair_applied", "dosage_content_scope", "diplotype_scope",      "allocation_equivalence_scope",
         "serialization_representative", "original_allele1", "original_allele2", "original_content", "corrected_content",
         "admissible_content_vectors", "allocation_status", "original_GQ",       "gq_status",            "repair_separation",
@@ -209,7 +210,12 @@ const std::vector<std::string>& locus_genotype_columns() {
         "dosage_suspect_blocks", "dosage_underpowered_blocks", "dosage_orientation_tied_block_ids", "locus_repair_scope",
         "block_table", "genotypes_table", "main_fasta", "original_fasta", "original_block_table", "dosage_blocks_table",
         "dosage_representative_fasta", "dosage_equivalence_table", "call_equivalence_set"};
-    return columns;
+    static const std::vector<std::string> with_headline = [] {
+        std::vector<std::string> c = columns;
+        c.insert(c.end(), headline::locus_columns().begin(), headline::locus_columns().end());
+        return c;
+    }();
+    return with_headline;
 }
 
 std::optional<TemplateSwitches> template_switches(const PreparedGenotypeModel& model, const MosaicPath& path) {
@@ -727,6 +733,11 @@ DosageIntegration apply_dosage_mode(const PreparedGenotypeModel* model, const st
 }
 
 void write_locus_genotype(const PreparedGenotypeModel* model, const std::string& out_prefix, const DosageIntegration& d) {
+    // The three headline filters, from the run's final outputs: the block columns are appended to both block tables
+    // before anything below reads them, and the locus values join this table (headline_filters_v2).
+    std::vector<std::string> block_ids;
+    if (model) for (const PreparedGenotypeBlock& b : model->blocks()) block_ids.push_back(b.block_id);
+    const headline::LocusHeadline headline = headline::apply_headline(out_prefix, block_ids, d.mode, d.audit_status);
     const std::map<std::string, std::string> status = read_key_values(out_prefix + ".mosaic_status.tsv");
     const std::string base = basename_of(out_prefix);
     const auto link = [&](const std::string& suffix) { return exists(out_prefix + suffix) ? base + suffix : std::string("NA"); };
@@ -872,6 +883,7 @@ void write_locus_genotype(const PreparedGenotypeModel* model, const std::string&
     v["dosage_representative_fasta"] = link(".dosage_repaired.fa");
     v["dosage_equivalence_table"] = link(".dosage_allocation_equivalence.tsv");
     v["call_equivalence_set"] = link(".equivalence_set.tsv");
+    for (const auto& [key, text] : headline::locus_values(headline)) v[key] = text;
 
     std::vector<std::string> row;
     for (const std::string& c : locus_genotype_columns()) row.push_back(v.at(c));

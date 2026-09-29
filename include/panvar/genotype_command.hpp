@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <limits>
 #include <optional>
+#include <map>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -180,6 +181,9 @@ struct GenotypeCommandOptions {
     std::string profile_sha256;
     std::string profile_name;
     std::vector<std::string> overridden_settings;
+    // Where every setting a preset, profile or flag set came from ("preset short-read", "profile <path>",
+    // "flag --kmer-size"); a key not listed took its built-in default. Written to <prefix>.settings.tsv.
+    std::map<std::string, std::string> setting_sources;
     // Development harness only; not a command-line option. Stops the process through the time-limit
     // path after this many committed repair rounds that moved, so the interruption contract -- partial
     // rounds kept, no final output, TIME_LIMIT -- is testable deterministically. 0: never.
@@ -366,6 +370,12 @@ void apply_genotype_profile(const std::string& path, GenotypeCommandOptions& opt
 // One named setting, validated exactly as a profile line is; context names the source in every error.
 void apply_genotype_setting(const std::string& context, const std::string& key, const std::string& value,
                             GenotypeCommandOptions& options);
+// The public settings (every profile key except test and diagnostic hooks), in a fixed order, and a setting's effective
+// value as the run records it. Cross-field constraints (syncmer_s <= kmer_size) are checked once every source has been
+// applied, before any work.
+const std::vector<std::string>& genotype_public_settings();
+std::string genotype_setting_value(const GenotypeCommandOptions& options, const std::string& key);
+void validate_genotype_settings(const GenotypeCommandOptions& options);
 
 // The technology presets (docs/algorithms/genotype_cli.md section 3). "short-read": the production algorithm and the
 // short-read technology constants, as (key, value) settings, and the short-read library-model constants. The insert

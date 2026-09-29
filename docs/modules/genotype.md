@@ -106,7 +106,29 @@ is marked `DOSAGE_REPAIR_NOT_APPLIED` with the reason.
   - It is never a call.
   - It never enters the allele columns, the locus digests or the main FASTA.
 
-## Filters
+## Headline filters
+
+Three independent verdicts, GENOTYPE_FILTER, DOSAGE_FILTER and PHASE_FILTER, rendered as
+`CALL_SUMMARY=GENOTYPE_<s>;DOSAGE_<s>;PHASE_<s>`. There is no global PASS/FAIL. The full specification is
+[`algorithms/genotype_headline_filters.md`](../algorithms/genotype_headline_filters.md).
+
+- **Values:** PASS, LOW_QUALITY, NOT_EVALUATED, NO_CALL and NOT_APPLICABLE.
+- **Precedence is fail-closed:** NO_CALL > NOT_EVALUATED > LOW_QUALITY > PASS > NOT_APPLICABLE. Every reason is kept.
+- **Per block** (`block_genotypes.tsv`, `genotypes.tsv`): `genotype_filter`, `dosage_filter` and their reasons.
+- **Per locus** (`locus_genotype.tsv`): all three filters, `REASON@ids` reason lists, and per-status unit counts. The
+  counts show how many blocks (or boundaries) are usable when the fail-closed headline is not PASS.
+- **Genotype:** fails on no-call, representation conflict or not evaluated, library sensitivity, or an exact diplotype
+  left unresolved by the dosage stage. `genotype_support=PRIOR_ONLY` alone does not fail it.
+- **Dosage:** NOT_EVALUATED under `--dosage-mode off` (the default). A complete content correction is dosage PASS and
+  genotype LOW_QUALITY (`EXACT_DIPLOTYPE_UNRESOLVED`); its reported alleles stay the caller's.
+- **Phase:** a boundary verdict from the locus `phase_support`. It is PASS only when the reads support the phase;
+  prior-selected phase is LOW_QUALITY (`MODEL_ONLY_PHASE`).
+- **Usage policies** are documented selections, not filters:
+  - `EXACT_GENOTYPE_USABLE` = genotype PASS and dosage PASS or NOT_APPLICABLE;
+  - `DOSAGE_CONTENT_USABLE` = dosage PASS;
+  - `PHASED_GENOTYPE_USABLE` = exact genotype usable and phase PASS.
+
+## Component filters
 
 Each filter describes the **reported** genotype. After an applied repair, the caller's values are in `original_*`.
 
@@ -115,7 +137,7 @@ Each filter describes the **reported** genotype. After an applied repair, the ca
 | `filter` (representation) | `PASS`, `LOWQUAL_REPRESENTATION_CONFLICT`, `NOT_EVALUATED` | the marker depth and the exposure term prefer another pair while the fragment term prefers the call, each by ≥ ln 1000 (`representation_conflict_rule_v1`) |
 | `genotype_support` | `READS`, `PRIOR_ONLY` | whether the reads alone put every rival of another genotype at this block below the reported diplotype |
 | `quality_filter` | `PASS`, `LOW_QUALITY` | `block_quality_rule_v1`: PASS only for representation PASS with READS support and, under `--library auto`, no library sensitivity (reason `library_sensitive`) |
-| `dosage_filter` (repair mode) | `PASS`, `DOSAGE_CONTENT_CORRECTED`, `DOSAGE_TRIGGERED_UNREPAIRED`, `DOSAGE_SUSPECT`, `DOSAGE_UNDERPOWERED`, `DOSAGE_NOT_EVALUATED`, `DOSAGE_REPAIR_NOT_APPLIED` | the dosage stage's verdict on the reported block; information limits are reasons, never merged into `quality_filter` |
+| `dosage_stage_filter` (repair mode; was `dosage_filter` before `headline_filters_v2`) | `PASS`, `DOSAGE_CONTENT_CORRECTED`, `DOSAGE_TRIGGERED_UNREPAIRED`, `DOSAGE_SUSPECT`, `DOSAGE_UNDERPOWERED`, `DOSAGE_NOT_EVALUATED`, `DOSAGE_REPAIR_NOT_APPLIED` | the dosage stage's own verdict on the reported block; information limits are reasons, never merged into `quality_filter` |
 | `locus_filter` | `PASS`, `LOWQUAL_REPRESENTATION_CONFLICT`, `LOWQUAL_LIBRARY_SENSITIVE`, `NOT_EVALUATED`, `NOT_EVALUATED_LIBRARY_SENSITIVITY` (several joined by `;`) | fails closed over the blocks; a flag wins over NOT_EVALUATED; an incomplete library audit is a locus-level warning |
 
 A repaired run's filters are recomputed on the repaired diplotype. If the caller's own annotation cannot first be
@@ -136,6 +158,18 @@ Genotyping: the sealed 484-job campaign, per job.
 - The worst cell took 165.9 s.
 - The peak footprint was 2.85 GiB.
 
+## Settings
+
+- **Basic help:** `panvar genotype --help`. **Advanced:** `panvar genotype --help-advanced`, which lists the scientific
+  flags (`--kmer-size`, `--syncmer-s`, `--min-variant-bp`, `--switch-probability`, `--proposal-state-limit`,
+  `--mismatch-band`, `--phase-audit-candidates`, `--repair-local-pairs`, `--repair-max-neighbours`,
+  `--repair-tie-branching on|off`, `--repair-tie-max-branches` and `--representation-guard on|off`).
+- **Each flag is exactly its profile key:** the same parser and the same validation.
+- **Resource caps, caches and time and footprint limits** stay profile keys.
+- **Precedence** is flag > profile > preset > built-in default, whatever the argument order.
+- **Provenance:** every effective setting and its source is in `<prefix>.settings.tsv`.
+- **Invalid values** refuse before any work.
+
 ## Known limitations
 
 **Scope of validation:**
@@ -148,6 +182,12 @@ Genotyping: the sealed 484-job campaign, per job.
 **Calls:**
 - **Two no-calls in the frozen C4 set,** both `tie_branching_incomplete`: `loo.HG01573.30`, and fresh `loo.HG01573.5`.
 - **HG00096 is the C4 coordinate reference.** Leave-one-out on it is not a supported scenario.
+
+**Allocation:** which homologue carries each HERV-bearing C4 module cannot be seen from short reads.
+- At `loo.NA19650` 10× and 30× a catastrophic allocation error is dosage-CONSISTENT, read-supported and passes
+  `EXACT_GENOTYPE_USABLE`.
+- No truth-free field identifies it, and no exception is made. Treat allocation as unverified unless `allocation_status`
+  is resolved.
 
 **Dosage:**
 - **Which module carries a HERV (allocation) cannot be seen from short reads.** Conditional representatives are

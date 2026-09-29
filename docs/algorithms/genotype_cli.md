@@ -8,13 +8,20 @@
   `--repair-rounds`.
 - **Declared-reference resolution:** an `RS:Z` header tag, or a refusal that lists the candidates.
 
+**Implemented since:**
+- **`5b1f059`:** an omitted `--library` means `--library auto`.
+- **`headline_filters_v2`:**
+  - the advanced scientific flags (`--help-advanced`), each exactly its profile key;
+  - per-setting source records in `<prefix>.settings.tsv`;
+  - the three headline filters (`genotype_headline_filters.md`).
+
 **Not implemented:**
-- **`--library auto` as the default.** An omitted `--library` is still an error.
-- **Per-setting source records** beyond `preset` / `preset_keys` / `library_mode` and the profile's
-  `overridden_settings`.
 - **The resource predictor** (§3).
 
-**Existing flags keep working unchanged.** `--library FILE` reproduces the frozen path byte for byte (gated).
+**Existing flags keep working unchanged.**
+- `--library FILE` reproduces the frozen calls unchanged (gated).
+- The block and locus tables gain trailing headline columns.
+- The repair-mode `dosage_filter` component is renamed `dosage_stage_filter`.
 
 ## 1. The basic command
 
