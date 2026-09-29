@@ -240,6 +240,9 @@ struct GenotypeCommandOptions {
     // followed at 0.9x and 1.1x the estimated fragment-start intensity and a genotype that changes is annotated. On by
     // default; the profile key library_sensitivity_audit 0 turns it off (measurement only). No effect on --library FILE.
     bool library_sensitivity_audit = true;
+    // TEST HOOK (gates only): the audit's endpoint 1 (0.9x) or 2 (1.1x) fails before any work, to gate that an
+    // incomplete endpoint is reported NOT_EVALUATED and changes nothing. 0: off.
+    std::size_t test_library_sensitivity_fail_view = 0;
     // The technology preset applied before the profile and the flags (docs/algorithms/genotype_cli.md section 3), and
     // the keys it set. Empty: none. A preset never names a locus.
     std::string preset_name;

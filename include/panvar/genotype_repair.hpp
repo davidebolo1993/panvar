@@ -485,31 +485,38 @@ struct TieBranchVerdict {
 TieBranchVerdict tie_branch_verdict(bool incomplete, TopSetDecision decision);
 
 
-// ---- library-intensity sensitivity (library_sensitivity_audit_v1) --------------------------------------------------
-// The reported genotype G (the central view's call) against the common pool reranked at each declared intensity. A
-// block is library-sensitive when, at some view, the unordered pairs its numerical top set's representatives carry
-// there are not exactly {G(b)}. Row order, phase, the representative among equivalent candidates and the scores are
-// not grounds: only the unordered genotype is compared. Any view whose exploration did not complete makes the verdict
-// NOT_EVALUATED; nothing is inferred from a partial search.
-constexpr const char* kLibrarySensitivityRule = "library_sensitivity_audit_v1";
+// ---- library-intensity sensitivity (library_sensitivity_audit_v2) --------------------------------------------------
+// The reported genotype G (the central view's call) against each endpoint intensity, by two truth-free components:
+//   likelihood_rank_sensitive -- the common scored pool reranked at the endpoint: its top set's representatives do not
+//                                carry exactly {G(b)} at block b;
+//   pipeline_sensitive       -- the endpoint's independent pipeline call (its own pool decided at its own view) does
+//                                not carry exactly {G(b)} at b.
+// A block is LIKELIHOOD_RANK, SEARCH_PATH (pipeline only), BOTH or STABLE. Row order, homologue exchange, phase and the
+// representative among equivalent candidates are never grounds: only unordered pairs are compared. Any endpoint whose
+// computation did not complete makes the verdict NOT_EVALUATED; nothing is inferred from a partial search.
+constexpr const char* kLibrarySensitivityRule = "library_sensitivity_audit_v2";
 struct LibraryAuditView {
-    std::string incomplete;                   // empty: this view's exploration completed
-    const PooledDecision* decision = nullptr; // the common pool reranked at this view (null when incomplete)
-    std::string anchor = "NA";                // the repair anchor this view's rule chose (recorded, not a criterion)
+    std::string incomplete;                      // empty: this view's computation completed
+    const PooledDecision* decision = nullptr;    // the common pool reranked at this view (null when incomplete)
+    const PooledDecision* independent = nullptr; // endpoints: its own pool decided at its view (null when incomplete)
+    std::string anchor = "NA";                   // the repair anchor this view's rule chose (recorded, not a criterion)
 };
 struct LibrarySensitivity {
-    std::string status = "NOT_EVALUATED";     // STABLE, SENSITIVE or NOT_EVALUATED
-    std::string reason = "none";
-    std::vector<std::size_t> sensitive_blocks;
+    std::string status = "NOT_EVALUATED";        // STABLE, SENSITIVE or NOT_EVALUATED
+    std::string reason = "LIBRARY_SENSITIVITY_NOT_EVALUATED";   // STABLE, LIKELIHOOD_RANK, SEARCH_PATH or BOTH
+    std::string incomplete = "none";             // why, when NOT_EVALUATED
+    std::vector<std::size_t> sensitive_blocks, rank_blocks, pipeline_blocks;
+    std::vector<std::string> block_reason;       // per block (empty when NOT_EVALUATED)
     // [view][block]: the unordered pairs of the top set's representatives (empty for an incomplete view)
-    std::vector<std::vector<std::set<std::pair<std::size_t, std::size_t>>>> projections;
-    std::vector<std::string> call_class;       // per view: strict_call, genotype_equivalent_call, no_call or incomplete
-    std::vector<std::size_t> top_set_size;     // candidates (all members) in the numerical top set
-    std::vector<std::string> top_set_digest;   // SHA-256 of the sorted member identities, 16 hex characters
-    std::vector<std::string> representative_digest;
+    std::vector<std::vector<std::set<std::pair<std::size_t, std::size_t>>>> projections, independent_projections;
+    std::vector<std::string> call_class, independent_call_class;   // per view: strict_call, genotype_equivalent_call,
+                                                                   // no_call, incomplete (or NA for the central view)
+    std::vector<std::size_t> top_set_size;       // candidates (all members) in the numerical top set
+    std::vector<std::string> top_set_digest;     // SHA-256 of the sorted member identities, 16 hex characters
+    std::vector<std::string> representative_digest, independent_digest;
     std::size_t distinct_anchors = 0;
-    bool phase_or_representative_only = false; // genotype-stable, yet the top-set identities or representatives differ
-    bool central_matches_primary = false;      // the central view's projection is exactly G at every block
+    bool phase_or_representative_only = false;   // genotype-stable, yet top-set identities or representatives differ
+    bool central_matches_primary = false;        // the central view's projection is exactly G at every block
 };
 LibrarySensitivity classify_library_sensitivity(const std::vector<std::pair<std::size_t, std::size_t>>& primary,
                                                 const std::vector<LibraryAuditView>& views);

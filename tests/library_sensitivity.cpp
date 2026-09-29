@@ -1,16 +1,20 @@
-// Gates for the library-intensity sensitivity audit (library_sensitivity_audit_v1).
+// Gates for the library-intensity sensitivity audit (library_sensitivity_audit_v2).
 //
 //   1  audit scores are exact: an audit library's score, computed beside the run's own in one combination pass, is
 //      bit for bit the score a run declaring that library computes -- one-shot and prepared-context scoring, 1 and 4
 //      threads -- and the run's own scores are unchanged by the audit.
-//   2  the verdict compares unordered genotypes only:
-//        a  the endpoints anchored differently but their top sets carry the reported genotype: STABLE;
-//        b  an endpoint's top set carries another genotype at one block: SENSITIVE at exactly that block;
-//        c  an endpoint's top set is a phase switch of the call (same unordered genotype): STABLE, and recorded as
-//           phase_or_representative_only;
-//        d  a tie of the call and its phase switch at one endpoint (genotype-equivalent): STABLE;
-//        e  an endpoint tie that disagrees at a block: SENSITIVE there;
-//        f  an endpoint whose exploration did not complete: NOT_EVALUATED, whatever the others say.
+//   2  the verdict compares unordered genotypes only, by two components (the common pool reranked at an endpoint:
+//      LIKELIHOOD_RANK; the endpoint's independent pipeline call: SEARCH_PATH):
+//        a  endpoints anchored differently, both components carry the reported genotype: STABLE;
+//        b  the rank component carries another genotype at one block: LIKELIHOOD_RANK at exactly that block;
+//        c  a phase switch of the call (same unordered genotype), in the rank or the pipeline call: STABLE, recorded
+//           as phase_or_representative_only;
+//        d  a tie of the call and its phase switch (genotype-equivalent): STABLE;
+//        e  a rank-component tie that disagrees at a block: sensitive there;
+//        f  an endpoint (rank or pipeline) that did not complete: NOT_EVALUATED, nothing flagged;
+//        g  only the pipeline call differs: SEARCH_PATH at exactly that block;
+//        h  both components differ at one block: BOTH;
+//        i  the components differ at different blocks: per-block reasons, locus BOTH.
 
 #include "panvar/fragment_likelihood.hpp"
 #include "panvar/genotype_model.hpp"
@@ -174,15 +178,20 @@ void gate_classification() {
     const std::vector<std::pair<std::size_t, std::size_t>> call{{0, 1}, {0, 1}};
     const panvar::PooledDecision central = decide(-100.0, -103.0, -110.0);
     require(central.decision == panvar::TopSetDecision::Unique && central.genotype == call, "fixture: the call is A");
+    // By default each endpoint's pipeline call is the call itself (the trajectories agreed).
     const auto views = [&](const panvar::PooledDecision& low, const panvar::PooledDecision& high,
-                           const std::string& low_anchor, const std::string& incomplete = "") {
+                           const std::string& low_anchor, const std::string& incomplete = "",
+                           const panvar::PooledDecision* low_pipeline = nullptr,
+                           const panvar::PooledDecision* high_pipeline = nullptr) {
         std::vector<panvar::LibraryAuditView> v(3);
         v[0].decision = &central;
         v[0].anchor = "anchor_A";
         v[1].decision = incomplete.empty() ? &low : nullptr;
+        v[1].independent = incomplete.empty() ? (low_pipeline != nullptr ? low_pipeline : &central) : nullptr;
         v[1].incomplete = incomplete;
         v[1].anchor = low_anchor;
         v[2].decision = &high;
+        v[2].independent = high_pipeline != nullptr ? high_pipeline : &central;
         v[2].anchor = "anchor_A";
         return v;
     };
@@ -198,8 +207,9 @@ void gate_classification() {
     {
         const panvar::PooledDecision low = decide(-100.0, -104.0, -95.0), high = decide(-100.0, -102.0, -112.0);
         const panvar::LibrarySensitivity r = panvar::classify_library_sensitivity(call, views(low, high, "anchor_A"));
-        require(r.status == "SENSITIVE" && r.sensitive_blocks == std::vector<std::size_t>{1},
-                "b: a differing endpoint genotype is SENSITIVE at exactly its block");
+        require(r.status == "SENSITIVE" && r.sensitive_blocks == std::vector<std::size_t>{1} &&
+                    r.reason == "LIKELIHOOD_RANK" && r.block_reason[1] == "LIKELIHOOD_RANK" && r.pipeline_blocks.empty(),
+                "b: a differing rank genotype is LIKELIHOOD_RANK at exactly its block");
         require(r.call_class[1] == "strict_call" && r.projections[1][1].count({0, 2}) == 1, "b: the endpoint pair is recorded");
     }
     // c: the low endpoint's top is the phase switch
@@ -231,11 +241,57 @@ void gate_classification() {
         const panvar::PooledDecision low = decide(-100.0, -104.0, -110.0), high = decide(-100.0, -102.0, -90.0);
         const panvar::LibrarySensitivity r =
             panvar::classify_library_sensitivity(call, views(low, high, "anchor_A", "tie_branching_incomplete"));
-        require(r.status == "NOT_EVALUATED" && r.sensitive_blocks.empty() && r.reason.find("tie_branching_incomplete") != std::string::npos,
+        require(r.status == "NOT_EVALUATED" && r.reason == "LIBRARY_SENSITIVITY_NOT_EVALUATED" && r.sensitive_blocks.empty() &&
+                    r.incomplete.find("tie_branching_incomplete") != std::string::npos,
                 "f: an incomplete view is NOT_EVALUATED");
+        // an endpoint whose pipeline call is missing is incomplete too, even when its rank call is complete
+        std::vector<panvar::LibraryAuditView> v = views(low, high, "anchor_A");
+        v[2].independent = nullptr;
+        const panvar::LibrarySensitivity missing = panvar::classify_library_sensitivity(call, v);
+        require(missing.status == "NOT_EVALUATED" && missing.sensitive_blocks.empty(),
+                "f: a missing pipeline call is NOT_EVALUATED");
     }
-    std::cout << "PASS  classification: converging anchors STABLE, a differing block SENSITIVE (exactly that block), "
-                 "phase-only and genotype-equivalent STABLE, a distinct endpoint tie SENSITIVE, incomplete NOT_EVALUATED\n";
+    // g: only the low pipeline call differs (it stopped at B, which the common pool ranks below the call)
+    {
+        const panvar::PooledDecision low = decide(-100.0, -104.0, -101.0), high = decide(-100.0, -102.0, -112.0);
+        const panvar::PooledDecision pipeline = panvar::decide_pooled_genotype({candidate({0, 0}, {1, 2}, -101.0)}, 2, 10, 6);
+        const panvar::LibrarySensitivity r =
+            panvar::classify_library_sensitivity(call, views(low, high, "anchor_B", "", &pipeline));
+        require(r.status == "SENSITIVE" && r.reason == "SEARCH_PATH" && r.sensitive_blocks == std::vector<std::size_t>{1} &&
+                    r.rank_blocks.empty() && r.pipeline_blocks == std::vector<std::size_t>{1} && r.block_reason[0] == "STABLE",
+                "g: a differing pipeline call alone is SEARCH_PATH at exactly its block");
+    }
+    // h: both components differ at block 1
+    {
+        const panvar::PooledDecision low = decide(-100.0, -104.0, -95.0), high = decide(-100.0, -102.0, -112.0);
+        const panvar::PooledDecision pipeline = panvar::decide_pooled_genotype({candidate({0, 0}, {1, 2}, -95.0)}, 2, 10, 6);
+        const panvar::LibrarySensitivity r =
+            panvar::classify_library_sensitivity(call, views(low, high, "anchor_A", "", &pipeline));
+        require(r.status == "SENSITIVE" && r.reason == "BOTH" && r.block_reason[1] == "BOTH",
+                "h: both components at one block are BOTH");
+    }
+    // i: rank at block 1 (high endpoint), pipeline at block 0 (low endpoint)
+    {
+        const panvar::PooledDecision low = decide(-100.0, -104.0, -110.0), high = decide(-100.0, -102.0, -95.0);
+        const panvar::PooledDecision pipeline = panvar::decide_pooled_genotype({candidate({2, 0}, {1, 1}, -99.0)}, 2, 10, 6);
+        const panvar::LibrarySensitivity r =
+            panvar::classify_library_sensitivity(call, views(low, high, "anchor_A", "", &pipeline));
+        require(r.status == "SENSITIVE" && r.reason == "BOTH" && r.block_reason[0] == "SEARCH_PATH" &&
+                    r.block_reason[1] == "LIKELIHOOD_RANK" && r.sensitive_blocks == std::vector<std::size_t>({0, 1}),
+                "i: components at different blocks give per-block reasons and locus BOTH");
+    }
+    // c': a phase switch as the pipeline call is not a sensitivity
+    {
+        const panvar::PooledDecision low = decide(-100.0, -104.0, -110.0), high = decide(-100.0, -102.0, -112.0);
+        const panvar::PooledDecision pipeline = panvar::decide_pooled_genotype({candidate({0, 1}, {1, 0}, -99.0)}, 2, 10, 6);
+        const panvar::LibrarySensitivity r =
+            panvar::classify_library_sensitivity(call, views(low, high, "anchor_A", "", &pipeline));
+        require(r.status == "STABLE" && r.reason == "STABLE" && r.phase_or_representative_only,
+                "c': a phase-only pipeline call is STABLE");
+    }
+    std::cout << "PASS  classification: converging anchors STABLE; rank-only LIKELIHOOD_RANK, pipeline-only SEARCH_PATH, "
+                 "both BOTH, split components locus BOTH (exactly those blocks); phase-only and genotype-equivalent "
+                 "STABLE; a distinct endpoint tie sensitive; incomplete or missing NOT_EVALUATED\n";
 }
 
 } // namespace

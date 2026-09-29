@@ -1565,13 +1565,17 @@ TieBranchingReport run_tie_branching(const TieSet& root, const std::vector<Diplo
 
 LibrarySensitivity classify_library_sensitivity(const std::vector<std::pair<std::size_t, std::size_t>>& primary,
                                                 const std::vector<LibraryAuditView>& views) {
+    using PairSet = std::set<std::pair<std::size_t, std::size_t>>;
     LibrarySensitivity out;
     const std::size_t blocks = primary.size();
     out.projections.assign(views.size(), {});
+    out.independent_projections.assign(views.size(), {});
     out.call_class.assign(views.size(), "incomplete");
+    out.independent_call_class.assign(views.size(), "NA");
     out.top_set_size.assign(views.size(), 0);
     out.top_set_digest.assign(views.size(), "NA");
     out.representative_digest.assign(views.size(), "NA");
+    out.independent_digest.assign(views.size(), "NA");
     std::set<std::string> anchors;
     std::string incomplete;
     const auto identity_line = [](const PoolCandidate& c) {
@@ -1588,57 +1592,84 @@ LibrarySensitivity classify_library_sensitivity(const std::vector<std::pair<std:
         for (const std::string& line : lines) text += line + "\n";
         return sha256_bytes(text).substr(0, 16);
     };
-    for (std::size_t v = 0; v < views.size(); ++v) {
-        const LibraryAuditView& view = views[v];
-        anchors.insert(view.anchor);
-        if (!view.incomplete.empty() || view.decision == nullptr) {
-            if (incomplete.empty()) incomplete = "view_" + std::to_string(v) + ":" + (view.incomplete.empty() ? "no_decision" : view.incomplete);
-            continue;
-        }
-        const PooledDecision& d = *view.decision;
-        out.call_class[v] = d.decision == TopSetDecision::Unique               ? "strict_call"
-                            : d.decision == TopSetDecision::GenotypeEquivalent ? "genotype_equivalent_call"
-                                                                               : "no_call";
-        out.projections[v].assign(blocks, {});
+    const auto class_of = [](const PooledDecision& d) {
+        return d.decision == TopSetDecision::Unique               ? "strict_call"
+               : d.decision == TopSetDecision::GenotypeEquivalent ? "genotype_equivalent_call"
+                                                                  : "no_call";
+    };
+    // The unordered pairs the top set's representatives carry at each block, and the digests of its identities.
+    const auto project = [&](const PooledDecision& d, std::vector<PairSet>& at, std::string* members_digest,
+                             std::string* representatives_digest, std::size_t* size) {
+        at.assign(blocks, {});
         std::vector<std::string> members, representatives;
         for (const std::size_t g : d.top_groups) {
             const PoolCandidate& rep = d.candidates[d.representative[g]];
             representatives.push_back(identity_line(rep));
-            for (std::size_t b = 0; b < blocks; ++b) out.projections[v][b].insert(std::minmax(rep.first[b], rep.second[b]));
+            for (std::size_t b = 0; b < blocks; ++b) at[b].insert(std::minmax(rep.first[b], rep.second[b]));
             for (const std::size_t m : d.groups[g]) members.push_back(identity_line(d.candidates[m]));
         }
-        out.top_set_size[v] = members.size();
-        out.top_set_digest[v] = digest_of(members);
-        out.representative_digest[v] = digest_of(representatives);
+        if (members_digest != nullptr) *members_digest = digest_of(members);
+        if (representatives_digest != nullptr) *representatives_digest = digest_of(representatives);
+        if (size != nullptr) *size = members.size();
+    };
+    for (std::size_t v = 0; v < views.size(); ++v) {
+        const LibraryAuditView& view = views[v];
+        anchors.insert(view.anchor);
+        const bool missing = view.decision == nullptr || (v > 0 && view.independent == nullptr);
+        if (!view.incomplete.empty() || missing) {
+            if (incomplete.empty()) {
+                incomplete = "view_" + std::to_string(v) + ":" + (view.incomplete.empty() ? "no_decision" : view.incomplete);
+            }
+            continue;
+        }
+        out.call_class[v] = class_of(*view.decision);
+        project(*view.decision, out.projections[v], &out.top_set_digest[v], &out.representative_digest[v],
+                &out.top_set_size[v]);
+        if (v > 0) {
+            out.independent_call_class[v] = class_of(*view.independent);
+            project(*view.independent, out.independent_projections[v], &out.independent_digest[v], nullptr, nullptr);
+        }
     }
     out.distinct_anchors = anchors.size();
     if (!views.empty() && !out.projections.front().empty()) {
         out.central_matches_primary = true;
         for (std::size_t b = 0; b < blocks; ++b) {
-            if (out.projections.front()[b] != std::set<std::pair<std::size_t, std::size_t>>{primary[b]}) {
-                out.central_matches_primary = false;
-            }
+            if (out.projections.front()[b] != PairSet{primary[b]}) out.central_matches_primary = false;
         }
     }
     if (!incomplete.empty()) {
-        out.status = "NOT_EVALUATED";
-        out.reason = incomplete;
-        return out;
+        out.incomplete = incomplete;
+        return out;   // NOT_EVALUATED, LIBRARY_SENSITIVITY_NOT_EVALUATED: nothing flagged
     }
+    out.block_reason.assign(blocks, "STABLE");
     for (std::size_t b = 0; b < blocks; ++b) {
-        const std::set<std::pair<std::size_t, std::size_t>> reference{primary[b]};
-        for (std::size_t v = 0; v < views.size(); ++v) {
-            if (out.projections[v][b] != reference) {
-                out.sensitive_blocks.push_back(b);
-                break;
-            }
+        const PairSet reference{primary[b]};
+        bool rank = false, pipeline = false;
+        for (std::size_t v = 1; v < views.size(); ++v) {
+            if (out.projections[v][b] != reference) rank = true;
+            if (out.independent_projections[v][b] != reference) pipeline = true;
         }
+        if (rank) out.rank_blocks.push_back(b);
+        if (pipeline) out.pipeline_blocks.push_back(b);
+        if (rank || pipeline) out.sensitive_blocks.push_back(b);
+        out.block_reason[b] = rank && pipeline ? "BOTH" : rank ? "LIKELIHOOD_RANK" : pipeline ? "SEARCH_PATH" : "STABLE";
     }
+    const bool any_rank = !out.rank_blocks.empty(), any_pipeline = !out.pipeline_blocks.empty();
+    const bool any_search_path_only =
+        std::find(out.block_reason.begin(), out.block_reason.end(), "SEARCH_PATH") != out.block_reason.end();
+    const bool any_rank_only =
+        std::find(out.block_reason.begin(), out.block_reason.end(), "LIKELIHOOD_RANK") != out.block_reason.end();
+    const bool any_both = std::find(out.block_reason.begin(), out.block_reason.end(), "BOTH") != out.block_reason.end();
     out.status = out.sensitive_blocks.empty() ? "STABLE" : "SENSITIVE";
+    out.reason = any_both || (any_rank_only && any_search_path_only) ? "BOTH"
+                 : any_rank                                          ? "LIKELIHOOD_RANK"
+                 : any_pipeline                                      ? "SEARCH_PATH"
+                                                                     : "STABLE";
     if (out.sensitive_blocks.empty()) {
         for (std::size_t v = 1; v < views.size(); ++v) {
             if (out.top_set_digest[v] != out.top_set_digest[0] ||
-                out.representative_digest[v] != out.representative_digest[0]) {
+                out.representative_digest[v] != out.representative_digest[0] ||
+                out.independent_digest[v] != out.top_set_digest[0]) {
                 out.phase_or_representative_only = true;
             }
         }

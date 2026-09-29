@@ -54,7 +54,8 @@ double seconds_since(Clock::time_point from) {
 const char* const kFinalOutputs[] = {".genotypes.tsv", ".block_genotypes.tsv", ".mosaic_candidates.tsv",
                                      ".mosaic_scores.tsv", ".mosaic_haplotypes.fa", ".equivalence_set.tsv",
                                      ".repair_rounds.tsv", ".repair_memory.tsv", ".tie_branches.tsv",
-                                     ".tie_terminal_ties.tsv", ".tie_branch_memory.tsv", ".library_sensitivity.tsv"};
+                                     ".tie_terminal_ties.tsv", ".tie_branch_memory.tsv", ".library_sensitivity.tsv",
+                                     ".library_sensitivity_blocks.tsv"};
 const char* const kPartialOutputs[] = {".repair_rounds.partial.tsv", ".repair_memory.partial.tsv",
                                        ".tie_branch_memory.partial.tsv"};
 // The representation-conflict filter columns, appended to both genotype tables on every path; a path that
@@ -957,7 +958,7 @@ void write_status(
                        "quality_reason_representation_not_evaluated\tNA\nquality_reason_no_read_support\tNA\n";
             } else {
                 std::string pass_ids, low_ids;
-                std::size_t pass = 0, low = 0, conflict = 0, unevaluated = 0, unsupported = 0;
+                std::size_t pass = 0, low = 0, conflict = 0, unevaluated = 0, unsupported = 0, library_sensitive = 0;
                 for (std::size_t i = 0; i < summary->block_qualities.size(); ++i) {
                     const BlockQuality& quality = summary->block_qualities[i];
                     std::string& ids = quality.filter == "PASS" ? pass_ids : low_ids;
@@ -967,6 +968,7 @@ void write_status(
                     if (with_commas.find(",representation_conflict,") != std::string::npos) ++conflict;
                     if (with_commas.find(",representation_not_evaluated,") != std::string::npos) ++unevaluated;
                     if (with_commas.find(",no_read_support,") != std::string::npos) ++unsupported;
+                    if (with_commas.find(",library_sensitive,") != std::string::npos) ++library_sensitive;
                 }
                 out << "quality_pass_blocks\t" << pass << "\nquality_lowqual_blocks\t" << low
                     << "\nquality_pass_block_ids\t" << (pass_ids.empty() ? "none" : pass_ids)
@@ -974,6 +976,7 @@ void write_status(
                     << "\nquality_reason_representation_conflict\t" << conflict
                     << "\nquality_reason_representation_not_evaluated\t" << unevaluated
                     << "\nquality_reason_no_read_support\t" << unsupported << '\n';
+                if (options.library_path == "auto") out << "quality_reason_library_sensitive\t" << library_sensitive << '\n';
             }
             out << "sequence_candidates\t" << summary->sequence_candidates << '\n';
             out << "consensus_blocks_called\t" << summary->consensus_blocks_called << '\n';
@@ -1160,6 +1163,7 @@ void apply_genotype_setting(const std::string& context, const std::string& key, 
         options.emission_lookup_timing = value == "1";
     }
     else if (key == "max_union_cached_prefilters_consumed") options.max_union_cached_prefilters_consumed = u();
+    else if (key == "test_library_sensitivity_fail_view") options.test_library_sensitivity_fail_view = u();
     else if (key == "library_sensitivity_audit") {
         if (value != "0" && value != "1") throw std::runtime_error(context + ": 'library_sensitivity_audit' is 0 or 1: " + value);
         options.library_sensitivity_audit = value == "1";
@@ -3949,7 +3953,7 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options, GenotypeDo
                 std::vector<TieItem> items;             // at view k: the shared rounds', then the leg's
                 std::vector<DiplotypeIdentity> moves;   // the incumbents moved to, in order
                 std::string stop = "none";
-                bool in_top = false, forked = false;
+                bool in_top = false, forked = false, leg = false;
                 std::size_t rounds = 0, last_round = 0, fork_round = 0;
                 std::vector<std::size_t> terminal_first, terminal_second;
                 double terminal_total = 0.0;
@@ -4019,6 +4023,7 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options, GenotypeDo
                 visited.insert(visited.end(), c.moves.begin(), c.moves.end());
                 std::vector<TieItem> own;
                 const Leg leg = run_leg(k, winner, nullptr, 0.0, rounds[r].index + 1, visited, own);
+                c.leg = true;
                 if (!leg.reproduced) throw std::runtime_error("fork_start_not_reproduced");
                 endpoint_items.insert(endpoint_items.end(), own.begin(), own.end());
                 c.items.insert(c.items.end(), own.begin(), own.end());
@@ -4032,9 +4037,12 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options, GenotypeDo
                 c.terminal_total = leg.terminal_total;
                 return c;
             };
-            std::vector<std::size_t> branch_forks_of(view_count, 0);
+            std::vector<std::size_t> branch_forks_of(view_count, 0), legs_of(view_count, 0);
             for (std::size_t k = 1; k < view_count; ++k) {
                 try {
+                    if (options.test_library_sensitivity_fail_view == k) {
+                        throw std::runtime_error("test hook: endpoint failed before any work");
+                    }
                     // (1) the anchor at this view
                     const std::unique_ptr<SetRanking> ranked = rank_view(k);
                     std::size_t a = npos, a_rank = 0;
@@ -4073,6 +4081,7 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options, GenotypeDo
                     const std::vector<RepairRound>& rounds = search->rounds();
                     if (anchor_key != central_anchor) {
                         fork_of[k] = "anchor";
+                        ++legs_of[k];
                         std::vector<TieItem> own;
                         take_leg(run_leg(k, nullptr, &anchor_k, anchor_total, 1, {}, own), own);
                     } else {
@@ -4081,6 +4090,7 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options, GenotypeDo
                                                         search->incumbent_first(), search->incumbent_second(),
                                                         search->incumbent_total(), history);
                         if (c.forked) fork_of[k] = "round" + std::to_string(c.fork_round);
+                        if (c.leg) ++legs_of[k];
                         trunk = c.items;
                         history.insert(history.end(), c.moves.begin(), c.moves.end());
                         stop = c.stop;
@@ -4111,6 +4121,7 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options, GenotypeDo
                                     branch.start.second, recorded.result.terminal_first, recorded.result.terminal_second,
                                     recorded.terminal_totals[k], visited);
                                 ++(c.forked ? branch_forks_of[k] : reused_of[k]);
+                                if (c.leg) ++legs_of[k];
                                 BranchResult out = recorded.result;
                                 out.items = c.items;
                                 out.rounds = c.rounds;
@@ -4136,6 +4147,7 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options, GenotypeDo
                                 return out;
                             }
                             ++run_of[k];
+                            ++legs_of[k];
                             BranchResult out;
                             std::vector<TieItem> own;
                             const Leg leg = run_leg(k, &branch.start, nullptr, 0.0, 1, branch.history, own);
@@ -4246,9 +4258,11 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options, GenotypeDo
                     admit(made.first, made.second);
                 }
             }
-            // DIAGNOSTIC: each endpoint's own pool decided at its own view (what an independent run would call).
-            std::vector<std::string> own_differs(view_count, "NA"), own_top_score(view_count, "NA"),
-                common_top_score(view_count, "NA");
+            // (4b) each endpoint's independent pipeline call: its own pool -- its union set, its trunk and every branch it
+            // used or ran -- decided at its own view. This is what a run declaring that intensity reports.
+            std::vector<PooledDecision> independents(view_count);
+            std::vector<std::string> own_top_score(view_count, "NA"), common_top_score(view_count, "NA"),
+                called_score(view_count, "NA");
             for (std::size_t k = 1; k < view_count; ++k) {
                 if (!views[k].incomplete.empty() || set_of_view[k] == nullptr) continue;
                 std::map<DiplotypeIdentity, PoolCandidate> own;
@@ -4265,29 +4279,22 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options, GenotypeDo
                 }
                 std::vector<PoolCandidate> at;
                 for (const auto& [key, candidate] : own) at.push_back(candidate);
-                const PooledDecision independent = decide_pooled_genotype(std::move(at), block_count, fragments.size(), band);
-                std::string differs;
-                for (std::size_t b = 0; b < block_count; ++b) {
-                    std::set<std::pair<std::size_t, std::size_t>> pairs;
-                    for (const std::size_t g : independent.top_groups) {
-                        const PoolCandidate& rep = independent.candidates[independent.representative[g]];
-                        pairs.insert(std::minmax(rep.first[b], rep.second[b]));
-                    }
-                    if (pairs != std::set<std::pair<std::size_t, std::size_t>>{decided.genotype[b]}) {
-                        std::string set;
-                        for (const auto& pair : pairs) set += (set.empty() ? "" : "+") + std::to_string(pair.first) + "/" + std::to_string(pair.second);
-                        differs += (differs.empty() ? "" : ",") + model.blocks()[b].block_id + ":" + set;
-                    }
+                independents[k] = decide_pooled_genotype(std::move(at), block_count, fragments.size(), band);
+                if (independents[k].score_mismatches != 0) {
+                    views[k].incomplete = "independent_sequence_score_mismatch";
+                    continue;
                 }
-                own_differs[k] = differs.empty() ? "none" : differs;
+                views[k].independent = &independents[k];
                 std::ostringstream number;
-                number << std::setprecision(17) << independent.ranking.candidates.front().score;
+                number << std::setprecision(17) << independents[k].ranking.candidates.front().score;
                 own_top_score[k] = number.str();
             }
             for (const TieItem& item : endpoint_items) admit(item_candidate(item), item.views);
 
-            // (5) the common pool reranked at each view, and the verdict
+            // (5) the common pool reranked at each view, and the verdict. The reported call is never rescored from this
+            // pool: endpoint candidates only describe the endpoints.
             std::vector<PooledDecision> decisions(view_count);
+            const auto called_key = common.find(diplotype_identity(called.first, called.second));
             for (std::size_t v = 0; v < view_count; ++v) {
                 if (audit_mismatches != 0) {
                     views[v].incomplete = "pool_score_mismatch";
@@ -4309,43 +4316,63 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options, GenotypeDo
                 std::ostringstream number;
                 number << std::setprecision(17) << decisions[v].ranking.candidates.front().score;
                 common_top_score[v] = number.str();
+                if (called_key != common.end()) {
+                    number.str("");
+                    number << called_key->second.views[v].log_likelihood + called_key->second.candidate.sequence_prior;
+                    called_score[v] = number.str();
+                }
             }
             // views[0] is the call's own view; [1] and [2] are the endpoints, reported as low and high
             const LibrarySensitivity verdict = classify_library_sensitivity(decided.genotype, views);
             if (verdict.status == "SENSITIVE") library_sensitive.insert(verdict.sensitive_blocks.begin(), verdict.sensitive_blocks.end());
 
+            const auto pairs_text = [](const std::set<std::pair<std::size_t, std::size_t>>& pairs) {
+                std::string set;
+                for (const auto& pair : pairs) set += (set.empty() ? "" : "+") + std::to_string(pair.first) + "/" + std::to_string(pair.second);
+                return set.empty() ? std::string("NA") : set;
+            };
+            const auto ids_text = [&](const std::vector<std::size_t>& blocks_of) {
+                std::string ids;
+                for (const std::size_t b : blocks_of) ids += (ids.empty() ? "" : ",") + model.blocks()[b].block_id;
+                return ids.empty() ? std::string("none") : ids;
+            };
             const FragmentScoringCounters& work_after = shared->cumulative_counters();
+            std::size_t diverged = 0, legs = 0;
+            for (std::size_t v = 1; v < view_count; ++v) {
+                diverged += (fork_of[v] != "none" ? 1 : 0) + branch_forks_of[v] + run_of[v];
+                legs += legs_of[v];
+            }
             std::ostringstream text;
             text << std::setprecision(17);
             text << "library_sensitivity\t" << verdict.status << "\nlibrary_sensitivity_reason\t" << verdict.reason
-                 << "\nlibrary_sensitivity_rule\t" << kLibrarySensitivityRule << "\nlibrary_sensitivity_lambdas\t"
+                 << "\nlibrary_sensitivity_incomplete\t" << verdict.incomplete << "\nlibrary_sensitivity_rule\t"
+                 << kLibrarySensitivityRule << "\nlibrary_sensitivity_lambdas\t"
                  << scoring_options.audit_libraries[0].fragment_start_intensity << ','
                  << library.fragment_start_intensity << ',' << scoring_options.audit_libraries[1].fragment_start_intensity
-                 << '\n';
-            std::string ids, pairs;
+                 << "\nlibrary_sensitive_blocks\t" << ids_text(verdict.sensitive_blocks)
+                 << "\nlibrary_sensitivity_rank_blocks\t" << ids_text(verdict.rank_blocks)
+                 << "\nlibrary_sensitivity_pipeline_blocks\t" << ids_text(verdict.pipeline_blocks);
+            std::string reasons;
             for (const std::size_t b : verdict.sensitive_blocks) {
-                const std::string& id = model.blocks()[b].block_id;
-                ids += (ids.empty() ? "" : ",") + id;
-                std::string per_view;
-                for (const std::size_t v : {std::size_t{1}, std::size_t{0}, std::size_t{2}}) {
-                    std::string set;
-                    for (const auto& pair : verdict.projections[v][b]) {
-                        set += (set.empty() ? "" : "+") + std::to_string(pair.first) + "/" + std::to_string(pair.second);
-                    }
-                    per_view += std::string(per_view.empty() ? "" : ";") + view_name[v] + "=" + set;
-                }
-                pairs += (pairs.empty() ? "" : ",") + id + ":" + per_view;
+                reasons += (reasons.empty() ? "" : ",") + model.blocks()[b].block_id + ":" + verdict.block_reason[b];
             }
-            text << "library_sensitive_blocks\t" << (ids.empty() ? "none" : ids) << "\nlibrary_sensitive_block_pairs\t"
-                 << (pairs.empty() ? "none" : pairs) << "\nlibrary_sensitivity_phase_or_representative_only\t"
+            text << "\nlibrary_sensitive_block_reasons\t" << (reasons.empty() ? "none" : reasons)
+                 << "\nlibrary_sensitivity_phase_or_representative_only\t"
                  << (verdict.phase_or_representative_only ? "true" : "false")
                  << "\nlibrary_sensitivity_central_matches_primary\t" << (verdict.central_matches_primary ? "true" : "false")
-                 << "\nlibrary_sensitivity_distinct_anchors\t" << verdict.distinct_anchors;
-            std::size_t trajectories = 1;
-            for (std::size_t v = 1; v < view_count; ++v) trajectories += (fork_of[v] != "none" ? 1 : 0) + branch_forks_of[v];
-            text << "\nlibrary_sensitivity_trajectories\t" << trajectories << '\n';
+                 << "\nlibrary_sensitivity_distinct_anchors\t" << verdict.distinct_anchors
+                 << "\nlibrary_sensitivity_trajectory_forked\t" << (diverged > 0 ? "true" : "false")
+                 << "\nlibrary_sensitivity_divergences\t" << diverged << "\nlibrary_sensitivity_fork_legs\t" << legs
+                 << '\n';
             for (const std::size_t v : {std::size_t{1}, std::size_t{0}, std::size_t{2}}) {
                 const std::string name = std::string("library_sensitivity_") + view_name[v];
+                std::string rank_call, pipeline_call;
+                for (std::size_t b = 0; b < block_count && !verdict.projections[v].empty(); ++b) {
+                    rank_call += (rank_call.empty() ? "" : ",") + pairs_text(verdict.projections[v][b]);
+                }
+                for (std::size_t b = 0; b < block_count && !verdict.independent_projections[v].empty(); ++b) {
+                    pipeline_call += (pipeline_call.empty() ? "" : ",") + pairs_text(verdict.independent_projections[v][b]);
+                }
                 text << name << "_lambda\t"
                      << (v == 0 ? library.fragment_start_intensity
                                 : scoring_options.audit_libraries[v - 1].fragment_start_intensity)
@@ -4354,16 +4381,21 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options, GenotypeDo
                      << name << "_fork\t" << fork_of[v] << '\n'
                      << name << "_trunk_stop\t" << trunk_stop[v] << '\n'
                      << name << "_incomplete\t" << (views[v].incomplete.empty() ? "none" : views[v].incomplete) << '\n'
-                     << name << "_call_class\t" << verdict.call_class[v] << '\n'
+                     << name << "_rank_call_class\t" << verdict.call_class[v] << '\n'
+                     << name << "_rank_call\t" << (rank_call.empty() ? "NA" : rank_call) << '\n'
+                     << name << "_pipeline_call_class\t" << verdict.independent_call_class[v] << '\n'
+                     << name << "_pipeline_call\t" << (pipeline_call.empty() ? "NA" : pipeline_call) << '\n'
                      << name << "_top_set_size\t" << verdict.top_set_size[v] << '\n'
                      << name << "_top_set_digest\t" << verdict.top_set_digest[v] << '\n'
                      << name << "_representative_digest\t" << verdict.representative_digest[v] << '\n'
-                     << name << "_top_score\t" << common_top_score[v] << '\n'
-                     << name << "_independent_top_score\t" << own_top_score[v] << '\n'
-                     << name << "_independent_differs_blocks\t" << own_differs[v] << '\n'
+                     << name << "_pipeline_digest\t" << verdict.independent_digest[v] << '\n'
+                     << name << "_reported_call_score\t" << called_score[v] << '\n'
+                     << name << "_rank_top_score\t" << common_top_score[v] << '\n'
+                     << name << "_pipeline_top_score\t" << own_top_score[v] << '\n'
                      << name << "_branches_reused\t" << reused_of[v] << '\n'
                      << name << "_branches_forked\t" << branch_forks_of[v] << '\n'
-                     << name << "_branches_run\t" << run_of[v] << '\n';
+                     << name << "_branches_run\t" << run_of[v] << '\n'
+                     << name << "_fork_legs\t" << legs_of[v] << '\n';
             }
             text << "library_sensitivity_pool_identities\t" << common.size() << "\nlibrary_sensitivity_pool_added\t"
                  << common.size() - central_pool << "\nlibrary_sensitivity_added_haplotypes_placed\t"
@@ -4375,6 +4407,24 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options, GenotypeDo
                  << "\nseconds_library_sensitivity\t" << std::fixed << std::setprecision(3) << seconds_since(audit_mark)
                  << '\n';
             report.library_sensitivity_text = text.str();
+            // The per-block table, whole or not at all, and only for a completed verdict.
+            if (verdict.status != "NOT_EVALUATED") {
+                std::ostringstream table;
+                table << "block_id\treported\tlow_rank\tlow_pipeline\thigh_rank\thigh_pipeline\tlikelihood_rank_sensitive\t"
+                         "pipeline_sensitive\treason\n";
+                for (std::size_t b = 0; b < block_count; ++b) {
+                    const auto pair = decided.genotype[b];
+                    const bool rank = std::find(verdict.rank_blocks.begin(), verdict.rank_blocks.end(), b) != verdict.rank_blocks.end();
+                    const bool pipeline =
+                        std::find(verdict.pipeline_blocks.begin(), verdict.pipeline_blocks.end(), b) != verdict.pipeline_blocks.end();
+                    table << model.blocks()[b].block_id << '\t' << pair.first << '/' << pair.second << '\t'
+                          << pairs_text(verdict.projections[1][b]) << '\t' << pairs_text(verdict.independent_projections[1][b])
+                          << '\t' << pairs_text(verdict.projections[2][b]) << '\t'
+                          << pairs_text(verdict.independent_projections[2][b]) << '\t' << (rank ? "true" : "false") << '\t'
+                          << (pipeline ? "true" : "false") << '\t' << verdict.block_reason[b] << '\n';
+                }
+                atomic_write(prefix + ".library_sensitivity_blocks.tsv", table.str());
+            }
             if (!library_sensitive.empty()) {
                 report.locus_filter = report.locus_filter == "LOWQUAL_REPRESENTATION_CONFLICT"
                                           ? "LOWQUAL_REPRESENTATION_CONFLICT;LOWQUAL_LIBRARY_SENSITIVE"

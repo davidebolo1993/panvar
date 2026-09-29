@@ -350,6 +350,7 @@ std::vector<std::pair<std::string, std::string>> locus_filter_summary(const std:
     }
     return {{"locus_filter", locus},
             {"library_sensitive_blocks", ids_or_none(library_sensitive)},
+            {"quality_reason_library_sensitive", std::to_string(library_sensitive.size())},
             {"lowqual_blocks", ids_or_none(lowqual)},
             {"not_evaluated_blocks", ids_or_none(unevaluated)},
             {"representation_guard_complete", unevaluated.empty() ? "true" : "false"},
