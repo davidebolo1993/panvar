@@ -322,3 +322,77 @@ before truth):
 **Decision (the frozen rule):** the known sensitive cell was not identified, so an omitted `--library` does not mean
 `--library auto`. The audit stays on under `--library auto`. Whether the verdict should be likelihood-rank sensitivity
 (the frozen common-pool rule) or pipeline sensitivity (the recorded independent call) is open.
+
+## 8. Audit v2: pipeline sensitivity (`library_sensitivity_audit_v2`; 2026-09-29; `4733033`; auto stays opt-in)
+
+The contract was frozen before code: `tests/results/library_sensitivity_audit_v2/SPEC.md`, seal `aa3c52a5…`. §7's
+common-pool verdict measured only the likelihood rank. The audit must measure the complete production pipeline.
+
+**Two truth-free components per block, compared on unordered pairs only:**
+- `likelihood_rank_sensitive`: §7's rule, the common scored pool reranked at an endpoint.
+- `pipeline_sensitive`: the endpoint's independent pipeline call differs. That call is its own union set, trunk and
+  tie branches, shared or forked, decided at its own view: what a run declaring that λ reports.
+
+**Classification:**
+- Per block: LIKELIHOOD_RANK, SEARCH_PATH (pipeline only), BOTH or STABLE.
+- Locus `library_sensitivity_reason`: STABLE, LIKELIHOOD_RANK, SEARCH_PATH or BOTH.
+- Any incomplete endpoint makes the verdict NOT_EVALUATED / `LIBRARY_SENSITIVITY_NOT_EVALUATED`, with nothing flagged.
+  It is never STABLE or SENSITIVE.
+
+**Outputs:**
+- Endpoint candidates never enter or change the reported call.
+- The block table `<prefix>.library_sensitivity_blocks.tsv` holds, per block, the reported pair, each endpoint's rank
+  pairs and pipeline pairs, both flags and the reason.
+- `<prefix>.library_sensitivity.tsv` holds the fork information (`trajectory_forked`, divergences, fork legs), each
+  endpoint's rank and pipeline calls, and the score comparisons. Those are the reported call's score, the rank top
+  score and the pipeline top score, each at the endpoint.
+
+**Performance contract:**
+- A cell with no fork leg adds zero placement and zero DP work.
+- A trajectory may fork and reconverge: the cell stays genotype-STABLE with `trajectory_forked=true` and reports its
+  added work.
+
+**Gates** (8 sentinels, frozen binary `4733033`, outputs sealed at `d66ad4c1…`, 334 files, before truth): all pass.
+
+| gate | result |
+|---|---|
+| audit off = `af4c2ce` auto, every deterministic file | 8 of 8 |
+| audit on = audit off + exactly the prescribed filter and quality changes | 8 of 8 |
+| `--library FILE` | byte-identical (2 cells); NOT_APPLICABLE; no status line; no block table |
+| threads 1/2/4/8 (`loo.HG03456.2`) | identical |
+| fail-closed (hook at each endpoint, `lzo.HG00096.2`) | NOT_EVALUATED / `LIBRARY_SENSITIVITY_NOT_EVALUATED`; nothing flagged; no block table; outputs = audit off |
+| partial or temporary files | none |
+| phase, order and genotype-equivalent differences | never flagged (unit fixtures; genotype-equivalent sentinels STABLE) |
+| **`loo.HG03456.2`** | **SENSITIVE, SEARCH_PATH at exactly ctx:0, sv:1, ctx:2, ctx:6 and sv:7** (no rank blocks) |
+| the other 7 | STABLE |
+
+**`loo.HG03456.2` interpretation:**
+- The central genotype remains the 0.9× endpoint likelihood's best scored candidate: it scores −33623.216, which is
+  also the rank top, against −33624.095 for the independent call, a margin of 0.88 nats.
+- But the independent 0.9× pipeline starts from another anchor and reaches another local optimum, with 1–2 bp allele
+  swaps at the five blocks.
+- The locus filter is `LOWQUAL_REPRESENTATION_CONFLICT;LOWQUAL_LIBRARY_SENSITIVE`, and the five blocks are LOW_QUALITY
+  `library_sensitive`.
+
+**Forks and cost:**
+
+| cell | verdict | fork | added work | wall, audit on over off |
+|---|---|---|---|---|
+| `loo.HG03456.2` | SENSITIVE | one anchor-fork leg | 1,992 haplotypes, 740,820 origins, 0 DPs | 1.26× (+4.4 s) |
+| `loo.HG03456.30` | STABLE, `trajectory_forked=true` | anchor fork, reconverged | 2,077 haplotypes, 10.7M origins, 0 DPs | 1.30× (+24 s) |
+| `mosaic.dense_switching_1.30` | STABLE, `trajectory_forked=true` | 4 stop-forks inside tie branches, no leg | 0 | 1.00× |
+| `loo.NA19650.30` | STABLE, `trajectory_forked=true` | 1 stop-fork inside a tie branch, no leg | 0 | see note |
+| the other 4 | STABLE, no divergence | none | 0 | 0.99–1.03× |
+
+- **Cells with no fork leg:** the audit section takes 0.15–0.32 s.
+- **Note on `loo.NA19650.30`:** its audit-off run was slow (276 s against 165 s), so its 0.60× ratio is noise. The
+  audit section itself took 0.29 s.
+
+**Descriptive truth (post-seal).** Sensitivity is not an error claim.
+- Of the 5 flagged blocks, the reported call is inexact at 3 of the 4 with defined truth: ctx:0, ctx:6 and sv:7, with
+  excess 1, 1 and 2 bp. ctx:2 is exact but unstable. sv:1's truth is undefined.
+- 73 of the 83 retained blocks are exact.
+- No block changed; there is no new catastrophic error; the LOO excess totals are equal to `af4c2ce` auto.
+
+**Status:** `--library` stays required. Whether an omitted `--library` becomes auto with this audit on by default is
+Sol's decision.

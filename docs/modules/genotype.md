@@ -36,10 +36,15 @@ The frozen C4 invocation:
   - The sources are written to `<prefix>.library_estimate.tsv`.
   - **It is not the default,** and it changes calls at low coverage: see
     [`algorithms/library_estimate.md`](../algorithms/library_estimate.md) §5–6.
-  - **The sensitivity audit** (`library_sensitivity_audit_v1`, §7): the call is also followed at 0.9× and 1.1× the
-    estimated intensity. A block whose unordered genotype differs there becomes LOW_QUALITY `library_sensitive`, and
-    the locus filter gains `LOWQUAL_LIBRARY_SENSITIVE`. The call itself never changes. The record is in
-    `<prefix>.library_sensitivity.tsv`, written on every run (NOT_APPLICABLE for `--library FILE`).
+  - **The sensitivity audit** (`library_sensitivity_audit_v2`, §8): the call is also followed at 0.9× and 1.1× the
+    estimated intensity.
+    - A block is sensitive when the common pool reranked at an endpoint (LIKELIHOOD_RANK) or the endpoint's
+      independent pipeline call (SEARCH_PATH) carries another unordered genotype there; BOTH when both do.
+    - A sensitive block becomes LOW_QUALITY `library_sensitive`, and the locus filter gains
+      `LOWQUAL_LIBRARY_SENSITIVE`. The call itself never changes.
+    - An incomplete endpoint gives NOT_EVALUATED / `LIBRARY_SENSITIVITY_NOT_EVALUATED` and flags nothing.
+    - The record is in `<prefix>.library_sensitivity.tsv`, written on every run (NOT_APPLICABLE for `--library FILE`).
+      A completed audit also writes the block table `<prefix>.library_sensitivity_blocks.tsv`.
 
 **`--library-diagnostic`,** off by default, writes an estimate beside a `--library FILE` run and is never used by the
 call.
@@ -145,7 +150,8 @@ Genotyping: the sealed 484-job campaign, per job.
   passes. The repaired pairs are dosage-supported, not read-supported (`PRIOR_ONLY`).
 
 **Inputs and builds:**
-- **`--library auto` is opt-in.** Its sensitivity audit detects likelihood-rank sensitivity only. The §6 genotype
-  change at `loo.HG03456.2` (0.9×) is a search-path effect the frozen rule does not flag (`library_estimate.md` §7).
+- **`--library auto` is opt-in.** On the 8 sentinels its audit flags `loo.HG03456.2` as SEARCH_PATH-sensitive at 5
+  blocks (`library_estimate.md` §8). There the central genotype is still the 0.9× likelihood's best scored candidate,
+  but an independent 0.9× run reaches another local optimum.
 - **Rebuilds are not byte-identical.** A rebuilt `panvar` differs from the frozen binary only in the Mach-O UUID,
   debug map and code signature; the code and data sections are identical.
