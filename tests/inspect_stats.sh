@@ -237,6 +237,20 @@ rep2=$(awk -F'\t' 'NR>1 && $2==2{print $3}' "$OUT/repord2_i.bubble_1.clusters.ts
 [ "$?" -ne 0 ] && ok "an explicit output colliding with a DERIVED one is refused" \
                || bad "an explicit --table-out naming a derived output was accepted"
 
+# The paths-walk companion is also derived from an explicit FASTA name, and the genotype mode adds
+# two more derived companions. They belong in the same preflight: StagedOutputs is transactional, but
+# registering the same destination twice cannot define which logical output should win.
+"$BIN" inspect -i "$OUT/ab.sorted.gfa" -c "$OUT/ab.bubbles.csv" --bubble-id 1 \
+       --fasta-out "$OUT/collwalk.fa.gz" --table-out "$OUT/collwalk.walks.fa.gz" \
+       -o "$OUT/collwalk" -q >/dev/null 2>&1
+[ "$?" -ne 0 ] && ok "an explicit output colliding with the derived paths walk is refused" \
+               || bad "an explicit output naming the derived paths walk was accepted"
+"$BIN" inspect -i "$OUT/ab.sorted.gfa" -c "$OUT/ab.bubbles.csv" --bubble-id 1 \
+       --table-out "$OUT/collgt.bubble_1.nodes.json.gz" --genotype-table \
+       -o "$OUT/collgt" -q >/dev/null 2>&1
+[ "$?" -ne 0 ] && ok "an explicit output colliding with a derived genotype companion is refused" \
+               || bad "an explicit output naming the derived node dictionary was accepted"
+
 # 2. The bubbles CSV names nodes that DO exist in the graph, but no path crosses the pair. That used
 #    to produce a header-only count table and exit 0, which reads as "this site has no variation"
 #    rather than "this CSV does not describe this graph".
@@ -266,6 +280,145 @@ warn=$("$BIN" inspect -i "$OUT/two.gfa" -c "$OUT/b3.bubbles.csv" -o "$OUT/stale"
 quiet=$("$BIN" inspect -i "$OUT/b3.sorted.gfa" -c "$OUT/b3.bubbles.csv" -o "$OUT/fresh" 2>&1 | grep -c "path_support=")
 [ "$quiet" = "0" ] && ok "and a matching panel produces no such warning" \
                    || bad "the stale-panel warning fires on a matching panel"
+
+# ------------------------------------------------------------- --genotype-table / --samples
+# full and full2 spell the same allele; rev crosses on the opposite strand, so once canonicalized it
+# spells the same 30 bp and must share that allele too; del is the pure deletion; other never crosses.
+# Node 3 ends in T so a reverse complement is distinguishable from the forward spelling.
+{ printf 'H\tVN:Z:1.0\nS\t1\tAAAAAAAAAA\nS\t2\tCCCCCCCCCC\nS\t3\tGGGGGGGGGT\n'
+  printf 'L\t1\t+\t2\t+\t0M\nL\t2\t+\t3\t+\t0M\nL\t1\t+\t3\t+\t0M\n'
+  printf 'P\tfull\t1+,2+,3+\t*\nP\tfull2\t1+,2+,3+\t*\nP\tdel\t1+,3+\t*\nP\trev\t3-,2-,1-\t*\nP\tother\t2+\t*\n'; } > "$OUT/gt.gfa"
+"$BIN" bubble -i "$OUT/gt.gfa" -r full -o "$OUT/gb" --min-variant-bp 0 -q >/dev/null 2>&1
+"$BIN" inspect -i "$OUT/gb.sorted.gfa" -c "$OUT/gb.bubbles.csv" --bubble-id 1 -o "$OUT/g0" -q >/dev/null 2>&1
+"$BIN" inspect -i "$OUT/gb.sorted.gfa" -c "$OUT/gb.bubbles.csv" --bubble-id 1 -o "$OUT/g" --genotype-table -q >/dev/null 2>&1
+GT="$OUT/g.bubble_1.genotypes.tsv.gz"; AL="$OUT/g.bubble_1.alleles.fa.gz"
+[ "$(heads "$AL")" = "2" ] && ok "identical sequences share an allele (5 paths, 2 alleles)" \
+                          || bad "expected 2 alleles, got $(heads "$AL")"
+hdr "$AL" | grep -qx 'allele1 full,full2,rev' \
+  && ok "allele1 is the 3-haplotype allele and lists its haplotypes, the reverse walk included" \
+  || bad "allele1 header wrong: $(hdr "$AL" | head -1)"
+hdr "$AL" | grep -qx 'allele2 del' && ok "allele2 is the deletion" || bad "allele2 header wrong: $(hdr "$AL" | sed -n 2p)"
+[ "$(gzip -dc "$GT" | head -1)" = "$(printf 'haplotype\tallele1\tallele2')" ] \
+  && ok "table columns are the FASTA ids" || bad "table header wrong: $(gzip -dc "$GT" | head -1)"
+[ "$(gzip -dc "$GT" | awk -F'\t' '$1=="del"{print $2 $3} $1=="rev"{print $2 $3}' | tr '\n' ' ')" = "01 10 " ] \
+  && ok "haplotype rows are 0/1 indicators of the allele they spell" \
+  || bad "haplotype rows wrong: $(gzip -dc "$GT")"
+[ "$(gzip -dc "$GT" | awk -F'\t' '$1=="other"{print $2 $3}')" = "NANA" ] \
+  && ok "a haplotype that does not cross the bubble reads NA" || bad "non-crossing row wrong: $(gzip -dc "$GT")"
+[ "$(gzip -dc "$AL" | awk 'NR==2')" = "AAAAAAAAAACCCCCCCCCCGGGGGGGGGT" ] \
+  && ok "without --reference-path alleles are spelled source->sink" \
+  || bad "allele1 sequence wrong: $(gzip -dc "$AL" | awk 'NR==2')"
+cmp -s <(gzip -dc "$OUT/g0.bubble_1.paths.fa.gz") <(gzip -dc "$OUT/g.bubble_1.paths.fa.gz") \
+  && cmp -s "$OUT/g0.bubble_1.node_counts.tsv" "$OUT/g.bubble_1.node_counts.tsv" \
+  && ok "--genotype-table leaves the existing outputs byte-identical" \
+  || bad "--genotype-table changed paths.fa.gz or node_counts.tsv"
+
+"$BIN" inspect -i "$OUT/gb.sorted.gfa" -c "$OUT/gb.bubbles.csv" --bubble-id 1 -o "$OUT/grev" --genotype-table -r rev -q >/dev/null 2>&1
+[ "$(gzip -dc "$OUT/grev.bubble_1.alleles.fa.gz" | awk 'NR==2')" = "ACCCCCCCCCGGGGGGGGGGTTTTTTTTTT" ] \
+  && ok "a reference crossing sink->source reverse-complements every allele" \
+  || bad "reference-oriented allele1 wrong: $(gzip -dc "$OUT/grev.bubble_1.alleles.fa.gz" | awk 'NR==2')"
+"$BIN" inspect -i "$OUT/gb.sorted.gfa" -c "$OUT/gb.bubbles.csv" --bubble-id 1 -o "$OUT/gfwd" --genotype-table -r full2 -q >/dev/null 2>&1
+[ "$(gzip -dc "$OUT/gfwd.bubble_1.alleles.fa.gz" | awk 'NR==2')" = "AAAAAAAAAACCCCCCCCCCGGGGGGGGGT" ] \
+  && ok "a reference crossing source->sink keeps the spelling" \
+  || bad "forward reference flipped allele1: $(gzip -dc "$OUT/gfwd.bubble_1.alleles.fa.gz" | awk 'NR==2')"
+# Walks: every record of the paths FASTA and of the allele FASTA has a companion walk under the same
+# header, and the walk spells exactly that record's sequence -- in whatever orientation -r gave it.
+walks_spell() {   # walks_spell <gfa> <sequence fasta.gz> <walk fasta.gz>
+  python3 - "$1" "$2" "$3" <<'PY'
+import gzip, sys
+nodes = {}
+for line in open(sys.argv[1]):
+    f = line.rstrip("\n").split("\t")
+    if f[0] == "S": nodes[f[1]] = f[2]
+def records(path):
+    out, name = [], None
+    for line in gzip.open(path, "rt"):
+        line = line.rstrip("\n")
+        if line.startswith(">"): name = line[1:]; out.append([name, ""])
+        else: out[-1][1] += line
+    return out
+comp = str.maketrans("ACGT", "TGCA")
+seqs, walks = records(sys.argv[2]), records(sys.argv[3])
+headers_seq = [n for n, _ in seqs]; headers_walk = [n for n, _ in walks]
+if headers_seq != headers_walk: print(f"headers differ: {headers_seq} vs {headers_walk}"); sys.exit(1)
+for (name, seq), (_, walk) in zip(seqs, walks):
+    spelled = "".join(nodes[t[:-1]] if t[-1] == "+" else nodes[t[:-1]][::-1].translate(comp) for t in walk.split(","))
+    if spelled != seq: print(f"{name}: walk {walk} spells {spelled}, not {seq}"); sys.exit(1)
+PY
+}
+msg=$(walks_spell "$OUT/gb.sorted.gfa" "$OUT/g.bubble_1.paths.fa.gz" "$OUT/g.bubble_1.walks.fa.gz") \
+  && ok "each path's walk (1+,2+,3+ form) sits under its FASTA header and spells its sequence" || bad "path walks: $msg"
+msg=$(walks_spell "$OUT/gb.sorted.gfa" "$OUT/g0.bubble_1.paths.fa.gz" "$OUT/g0.bubble_1.walks.fa.gz") \
+  && ok "the path walks are written without --genotype-table too" || bad "path walks without --genotype-table: $msg"
+msg=$(walks_spell "$OUT/gb.sorted.gfa" "$OUT/g.bubble_1.alleles.fa.gz" "$OUT/g.bubble_1.alleles.walks.fa.gz") \
+  && ok "each allele's walk sits under the allele FASTA header and spells the allele" || bad "allele walks: $msg"
+msg=$(walks_spell "$OUT/gb.sorted.gfa" "$OUT/grev.bubble_1.alleles.fa.gz" "$OUT/grev.bubble_1.alleles.walks.fa.gz") \
+  && ok "a sink->source reference reverses the allele walks with the alleles" || bad "reversed allele walks: $msg"
+[ ! -e "$OUT/g0.bubble_1.nodes.json.gz" ] && [ ! -e "$OUT/g0.bubble_1.alleles.walks.fa.gz" ] \
+  && ok "the node dictionary and allele walks are written only with --genotype-table" \
+  || bad "node dictionary or allele walks written without --genotype-table"
+# Node dictionary: every walk node, its GFA sequence, visiting haplotypes, and reference position.
+"$BIN" inspect -i "$OUT/gb.sorted.gfa" -c "$OUT/gb.bubbles.csv" --bubble-id 1 -o "$OUT/gdel" --genotype-table -r del -q >/dev/null 2>&1
+msg=$(python3 - "$OUT/gb.sorted.gfa" "$OUT/gfwd.bubble_1.nodes.json.gz" "$OUT/gdel.bubble_1.nodes.json.gz" "$OUT/g.bubble_1.nodes.json.gz" <<'PY'
+import gzip, json, sys
+seq = {f[1]: f[2] for f in (l.rstrip("\n").split("\t") for l in open(sys.argv[1])) if f[0] == "S"}
+by_seq = {v: k for k, v in seq.items()}
+A, C, G = by_seq["AAAAAAAAAA"], by_seq["CCCCCCCCCC"], by_seq["GGGGGGGGGT"]
+full, dele, bare = (json.load(gzip.open(p, "rt")) for p in sys.argv[2:5])
+def fail(m): print(m); sys.exit(1)
+for d in (full, dele, bare):
+    if set(d["nodes"]) != {A, C, G}: fail(f"nodes {sorted(d['nodes'])}")
+    for k, v in d["nodes"].items():
+        if v["seq"] != seq[k] or v["length"] != len(seq[k]): fail(f"node {k} sequence wrong")
+    if (d["nodes"][A]["haplotypes"], d["nodes"][C]["haplotypes"], d["nodes"][G]["haplotypes"]) != (4, 3, 4): fail("haplotype counts")
+n = full["nodes"]
+if not all(n[x]["on_reference"] for x in (A, C, G)): fail("full visits every node")
+if [n[x]["ref_offset"] for x in (A, C, G)] != [0, 10, 20] or [n[x]["order"] for x in (A, C, G)] != [0, 1, 2]: fail("offsets/order along full")
+if full["reference_strand"] != "source_to_sink" or "ref_start" in n[A]: fail("strand or a coordinate without an interval")
+m = dele["nodes"]
+if m[C]["on_reference"] or m[C]["between"] != [A, G] or m[C]["between_ref_offsets"] != [9, 10]: fail(f"off-reference node {m[C]}")
+if [m[x]["order"] for x in (A, C, G)] != [0, 1, 2]: fail("order with an off-reference node")
+if bare["reference_path"] is not None or bare["nodes"][A]["on_reference"] is not None: fail("no reference must mean null positions")
+PY
+) && ok "the node dictionary carries every walk node, its sequence, haplotype counts and reference positions" \
+  || bad "node dictionary: $msg"
+# A path named chr:start-end gives 1-based positions on that interval.
+{ printf 'H\tVN:Z:1.0\nS\t1\tAAAAAAAAAA\nS\t2\tCCCCCCCCCC\nS\t3\tGGGGGGGGGT\nS\t4\tTTTTTTTTTT\nS\t0\tACGTACGTAC\n'
+  printf 'L\t0\t+\t1\t+\t0M\nL\t1\t+\t2\t+\t0M\nL\t2\t+\t3\t+\t0M\nL\t1\t+\t3\t+\t0M\nL\t3\t+\t4\t+\t0M\n'
+  printf 'P\tref#1#chr1:101-150\t0+,1+,2+,3+,4+\t*\nP\talt\t0+,1+,3+,4+\t*\n'; } > "$OUT/pos.gfa"
+"$BIN" bubble -i "$OUT/pos.gfa" -r 'ref#1#chr1:101-150' -o "$OUT/pb" --min-variant-bp 0 -q >/dev/null 2>&1
+"$BIN" inspect -i "$OUT/pb.sorted.gfa" -c "$OUT/pb.bubbles.csv" -o "$OUT/pi" --genotype-table -r 'ref#1#chr1:101-150' -q >/dev/null 2>&1
+pos=$(python3 - "$OUT/pb.sorted.gfa" "$OUT"/pi.bubble_*.nodes.json.gz <<'PY'
+import gzip, json, sys
+seq = {f[1]: f[2] for f in (l.rstrip("\n").split("\t") for l in open(sys.argv[1])) if f[0] == "S"}
+d = json.load(gzip.open(sys.argv[2], "rt"))
+print(" ".join(f"{seq[k][:1]}{v.get('ref_start')}-{v.get('ref_end')}" for k, v in d["nodes"].items()))
+PY
+)
+[ "$pos" = "A111-120 C121-130 G131-140" ] && ok "positions are 1-based on the reference path's chr:start-end interval" \
+  || bad "interval positions wrong: $pos"
+
+# grep -c, not grep -q: -q exits at the first match and pipefail then reports inspect's SIGPIPE.
+miss=$("$BIN" inspect -i "$OUT/gb.sorted.gfa" -c "$OUT/gb.bubbles.csv" --bubble-id 1 -o "$OUT/goth" --genotype-table -r other 2>&1 \
+  | grep -c "does not cross bubble 1")
+[ "$miss" -ge 1 ] && ok "a reference that does not cross the bubble is named" \
+                  || bad "no warning for a reference that misses the bubble"
+"$BIN" inspect -i "$OUT/gb.sorted.gfa" -c "$OUT/gb.bubbles.csv" --bubble-id 1 -o "$OUT/gnr" -r full -q >/dev/null 2>&1
+[ "$?" -ne 0 ] && ok "--reference-path without --genotype-table is refused, not ignored" \
+               || bad "--reference-path without --genotype-table exited 0"
+
+# Samples: het, the same haplotype twice, two haplotypes sharing an allele, and one missing the bubble.
+printf 'sample\thaplotype_1\thaplotype_2\nhet\tfull\tdel\nsame\tfull\tfull\nshared\tfull\trev\nmiss\tfull\tother\n' > "$OUT/cosigt.tsv"
+"$BIN" inspect -i "$OUT/gb.sorted.gfa" -c "$OUT/gb.bubbles.csv" --bubble-id 1 -o "$OUT/gs" --samples "$OUT/cosigt.tsv" -q >/dev/null 2>&1
+[ "$(gzip -dc "$OUT/gs.bubble_1.genotypes.tsv.gz" | awk -F'\t' 'NR>1{printf "%s=%s%s ", $1, $2, $3}')" = "het=11 same=20 shared=20 miss=NANA " ] \
+  && ok "sample rows count allele copies (sum 2) and read NA when a haplotype misses the bubble" \
+  || bad "sample rows wrong: $(gzip -dc "$OUT/gs.bubble_1.genotypes.tsv.gz")"
+[ "$(gzip -dc "$OUT/gs.bubble_1.genotypes.tsv.gz" | head -1 | cut -f1)" = "sample" ] \
+  && ok "--samples implies --genotype-table and labels rows as samples" || bad "sample table header wrong"
+printf 'sample\thaplotype_1\thaplotype_2\nbad\tfull\tnope\n' > "$OUT/cosigt_bad.tsv"
+"$BIN" inspect -i "$OUT/gb.sorted.gfa" -c "$OUT/gb.bubbles.csv" --bubble-id 1 -o "$OUT/gsb" --samples "$OUT/cosigt_bad.tsv" -q >/dev/null 2>&1
+[ "$?" -ne 0 ] && ok "a cosigt haplotype absent from the graph is refused" \
+               || bad "an unknown cosigt haplotype exited 0"
 
 echo
 if [ "$fails" -eq 0 ]; then echo "inspect_stats: all assertions passed"; exit 0; fi

@@ -149,6 +149,7 @@ add_library(panvarlib
     src/gene_cn_kmer.cpp
     src/minimap2_align.cpp
     src/variant_call.cpp
+    src/cosigt.cpp
     src/describe.cpp
     src/panphorte.cpp
     src/poa.cpp

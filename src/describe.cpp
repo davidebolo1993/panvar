@@ -5,6 +5,7 @@
 #include "panvar/bubble_path.hpp"
 #include "panvar/variant_nodes.hpp"
 #include "panvar/cli_utils.hpp"
+#include "panvar/cosigt.hpp"
 #include "panvar/gfa.hpp"
 #include "panvar/graph_utils.hpp"
 #include "panvar/output.hpp"
@@ -1574,70 +1575,6 @@ std::string info_value(const std::string& info, const std::string& key) {
     return std::string();
 }
 
-// Parse a cosigt sample->haplotype table: "sample<TAB>hap1,hap2<TAB>..." (header row tolerated).
-// Returns (haplotype-path -> samples carrying it, sample column order). Shared by the k-mer/graph
-// SAMPLE-level export and the variant-level export so the diploid summation is defined in one place.
-std::pair<std::unordered_map<std::string, std::vector<std::string>>, std::vector<std::string>>
-read_cosigt_table(const std::string& path,
-                  const std::unordered_set<std::string>* known_haplotypes = nullptr,
-                  const char* known_label = "") {
-    std::ifstream sin(path);
-    if (!sin) throw std::runtime_error("Failed to open --samples file: " + path);
-    std::unordered_map<std::string, std::vector<std::string>> path_to_samples;
-    std::vector<std::string> sample_order;
-    std::unordered_set<std::string> seen_samples;
-    std::unordered_map<std::string, std::size_t> ploidy;
-    std::string line;
-    bool first = true;
-    while (std::getline(sin, line)) {
-        if (!line.empty() && line.back() == '\r') line.pop_back();
-        if (line.empty()) continue;
-        std::vector<std::string> fields = split_on(line, '\t');
-        if (fields.empty()) continue;
-        if (first) {
-            first = false;
-            std::string h = fields[0];
-            for (char& c : h) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-            if (h == "sample" || h == "sample.id" || h == "sample_id" || (!h.empty() && h[0] == '#')) continue;
-        }
-        const std::string& sample = fields[0];
-        if (sample.empty())
-            throw std::runtime_error("describe --samples: " + path + " has a row with an empty sample id");
-        if (!seen_samples.insert(sample).second)
-            throw std::runtime_error("describe --samples: duplicate sample id '" + sample + "' in " + path +
-                                     "; which row's haplotypes a sample gets would depend on file order");
-        sample_order.push_back(sample);
-        std::size_t assigned = 0;
-        for (std::size_t fi = 1; fi < fields.size(); ++fi)
-            for (const std::string& hap : split_on(fields[fi], ',')) {
-                if (hap.empty()) continue;
-                // A name that matches nothing contributes silently nothing, which looks exactly like a
-                // sample with no signal. Reject it instead.
-                if (known_haplotypes != nullptr && !known_haplotypes->count(hap))
-                    throw std::runtime_error("describe --samples: sample '" + sample + "' names haplotype '" +
-                                             hap + "', which is not " + known_label);
-                path_to_samples[hap].push_back(sample);
-                ++assigned;
-            }
-        if (assigned == 0)
-            throw std::runtime_error("describe --samples: sample '" + sample + "' has no haplotype "
-                                     "assignment; a row with no haplotypes cannot be genotyped");
-        ploidy[sample] = assigned;
-    }
-    // Ploidy is not assumed. The dosage is a SUM over a sample's assigned haplotypes and every one of
-    // them must be observed, so any fixed arity works -- but a table that is not uniformly diploid is
-    // worth saying out loud rather than silently averaging over.
-    std::size_t lo = 0, hi = 0;
-    for (const auto& [sm, n] : ploidy) {
-        if (lo == 0 || n < lo) lo = n;
-        if (n > hi) hi = n;
-    }
-    if (lo != hi)
-        std::cerr << "[describe] note: --samples has mixed ploidy (" << lo << ".." << hi
-                  << " haplotypes per sample); dosage is the sum over each sample's own assignments\n";
-    return {std::move(path_to_samples), std::move(sample_order)};
-}
-
 // Variant-level BIMBAM: the SV calls as the GWAS unit. Reads call's VCF (FORMAT GT[:CN]), one dosage
 // row per variant (per ALT for multiallelic): CN (DUP) / allele indicator (multiallelic) / GT 0|1 else;
 // GT=. -> NA. Same format/NA semantics as the k-mer/graph BIMBAM, but the unit is the variant -- an
@@ -1894,7 +1831,7 @@ void emit_variant_substrate(const DescribeOptions& options, DescribeSummary& sum
         // silently incomplete sample genotype -- a diploid missing one homologue, reported as covered
         // at half its dosage -- where every other substrate would have refused the input outright.
         std::unordered_set<std::string> vcf_haps(hap_order.begin(), hap_order.end());
-        const auto cosigt = read_cosigt_table(options.samples_path, &vcf_haps,
+        const auto cosigt = read_cosigt_table(options.samples_path, "describe", &vcf_haps,
                                               "a haplotype column in --variant-vcf");
         const auto& path_to_samples = cosigt.first;
         const auto& sample_order = cosigt.second;
@@ -2254,7 +2191,7 @@ void describe_kmers_from_graph(
     if (!options.samples_path.empty()) {
         std::unordered_set<std::string> graph_haps;
         for (const auto& pr : graph.paths) graph_haps.insert(pr.name);
-        const auto cosigt = read_cosigt_table(options.samples_path, &graph_haps,
+        const auto cosigt = read_cosigt_table(options.samples_path, "describe", &graph_haps,
                                               "a path in the input graph");
         const std::unordered_map<std::string, std::vector<std::string>>& path_to_samples = cosigt.first;
         const std::vector<std::string>& sample_order_s = cosigt.second;  // sample (column) order

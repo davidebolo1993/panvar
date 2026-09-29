@@ -1,6 +1,6 @@
 # Module `inspect` - algorithm
 
-Mechanism for the `inspect` utility's `--cluster` mode. For usage/flags see [modules/inspect.md](../modules/inspect.md); references in [references.md](../references.md#inspect).
+Mechanism for the `inspect` utility's `--cluster` and `--genotype-table` modes. For usage/flags see [modules/inspect.md](../modules/inspect.md); references in [references.md](../references.md#inspect).
 
 `--cluster` groups haplotypes crossing a bubble by how similarly they traverse it and selects one representative per connected group. Identical walks are collapsed before comparison; additional walks can cluster when their similarity reaches the chosen threshold. A walk is a sequence of oriented node steps, compared through shared windowed content.
 
@@ -67,3 +67,27 @@ cluster_id  n_paths  representative_path  members
 1           1        h3                   h3
 2           1        h4                   h4
 ```
+
+## Genotype table
+
+`--genotype-table` turns each bubble into a small genotype matrix over its distinct alleles.
+
+1. Spell each crossing path. The walk is the same `source → sink` walk the per-path FASTA spells, so a haplotype crossing on the opposite strand is reverse-complemented into the bubble's orientation and a pure deletion is the source and sink alone.
+2. Collapse identical sequences. Haplotypes spelling the same bases share one allele, whatever walk produced them.
+3. Number the alleles by descending haplotype count, ties by the first path carrying them in GFA order, so `allele1` is the most common and the numbering never depends on hashing.
+4. Orient. With `--reference-path`, the reference's step indices through the bubble are compared: running backwards means the reference crosses `sink → source`, and every allele is reverse-complemented once, so all alleles share the reference strand. Dedup is unaffected, since a reverse complement is a bijection.
+5. Fill rows. A haplotype row marks the one allele it spells. A sample row, from a cosigt table, adds its haplotypes' indicators, so the row sums to the sample's ploidy. A haplotype that does not cross the bubble has no allele to mark, and its row, or any sample row using it, is `NA` throughout: a partial sum would read as a real low count.
+
+Trace, on the fixture in `tests/inspect_stats.sh`: `full` and `full2` walk `1+ 2+ 3+`, `rev` walks `3- 2- 1-`, `del` walks `1+ 3+`, and `other` never reaches the bubble.
+
+```text
+alleles.fa.gz                    genotypes.tsv.gz (haplotypes)    with --samples
+>allele1 full,full2,rev          haplotype allele1 allele2        sample  allele1 allele2
+AAAAAAAAAACCCCCCCCCCGGGGGGGGGT   full      1       0              het     1       1      (full, del)
+>allele2 del                     full2     1       0              same    2       0      (full, full)
+AAAAAAAAAAGGGGGGGGGT             del       0       1              shared  2       0      (full, rev)
+                                 rev       1       0              miss    NA      NA     (full, other)
+                                 other     NA      NA
+```
+
+With `--reference-path rev` the same alleles are written reverse-complemented (`allele1` becomes `ACCCCCCCCCGGGGGGGGGGTTTTTTTTTT`), because `rev` crosses `sink → source`.
