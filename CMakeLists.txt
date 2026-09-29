@@ -246,7 +246,7 @@ if(PANVAR_BUILD_TESTING)
         add_test(NAME panvar_genotype_dosage COMMAND genotype_dosage_test)
 
         # Automatic-library diagnostic fixtures (docs/algorithms/library_estimate.md).
-        add_executable(library_estimate_test tests/library_estimate.cpp)
+        add_executable(library_estimate_test tests/library_estimate.cpp src/cli_utils.cpp)
         target_link_libraries(library_estimate_test PRIVATE panvarlib)
         target_compile_options(library_estimate_test PRIVATE -Wall -Wextra -Wpedantic)
         add_test(NAME panvar_library_estimate COMMAND library_estimate_test)

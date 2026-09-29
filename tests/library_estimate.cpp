@@ -2,6 +2,7 @@
 // distribution, read lengths and error rate on a synthetic locus; the failure conditions (insufficient placements, a
 // two-mode insert distribution, outward-facing pairs); and 1/2/4/8-thread identity.
 
+#include "panvar/genotype_command.hpp"
 #include "panvar/genotype_model.hpp"
 #include "panvar/library_estimate.hpp"
 #include "panvar/mosaic_spelling.hpp"
@@ -139,6 +140,63 @@ int main() {
         const std::vector<ReadPair> reads = simulate(m, 2000, [&](std::mt19937_64& r) { return n350(r); }, 0.002, 4, true);
         const LibraryEstimate e = estimate_library(m, reads, opt, &declared);
         require(e.accepted == 0 && e.orientation_discordant > 1000, "outward pairs are discordant, none accepted");
+    }
+    // --library auto: accepted estimates and each refusal (docs/algorithms/library_estimate.md section 5)
+    const LibraryModel preset = genotype_preset_library("short-read");
+    {
+        const std::vector<ReadPair> reads = simulate(m, 4000, [&](std::mt19937_64& r) { return n350(r); }, 0.002, 11);
+        const LibraryEstimate e = estimate_library(m, reads, opt, nullptr);
+        const AutoLibrary a = build_auto_library(e, preset, opt);
+        require(a.accepted && a.refusal.empty(), "a clean estimate is accepted");
+        require(a.library.insert_mean_bp == e.insert_mean && a.library.insert_sd_bp == e.insert_sd, "auto takes the insert from the estimate");
+        require(a.library.fragment_start_intensity == preset.fragment_start_intensity && a.library.substitution_error == preset.substitution_error &&
+                a.library.outlier_weight == preset.outlier_weight && a.library.support_sigmas == preset.support_sigmas,
+                "every other value is the preset's; the intensity is never inferred");
+        bool insert_placed = false, lambda_preset = false;
+        for (const auto& [k, v] : a.sources) {
+            if (k == "insert_mean_bp") insert_placed = v == "placement_estimate";
+            if (k == "fragment_start_intensity") lambda_preset = v == "short_read_preset";
+        }
+        require(insert_placed && lambda_preset, "the sources are recorded");
+    }
+    const auto refused = [&](const std::string& name, const std::vector<ReadPair>& reads, const std::string& phrase) {
+        const AutoLibrary a = build_auto_library(estimate_library(m, reads, opt, nullptr), preset, opt);
+        require(!a.accepted, name + ": refused");
+        require(a.refusal.find(phrase) != std::string::npos, name + ": says why (" + a.refusal + ")");
+        require(a.refusal.find("--library FILE") != std::string::npos, name + ": names --library FILE");
+        require(std::isnan(a.library.insert_mean_bp) || a.library.insert_mean_bp == 0.0, name + ": no insert is carried out of a refusal");
+    };
+    refused("insufficient", simulate(m, 300, [&](std::mt19937_64& r) { return n350(r); }, 0.002, 12), "decisively placed");
+    {
+        std::normal_distribution<double> a(300.0, 30.0), b(700.0, 30.0);
+        refused("multimodal", simulate(m, 4000, [&](std::mt19937_64& r) { return (r() % 2) ? a(r) : b(r); }, 0.002, 13), "more than one mode");
+    }
+    {   // 10% of fragments far outside the library: contaminated inserts
+        std::uniform_real_distribution<double> wide(1500.0, 4500.0);
+        refused("contaminated_inserts", simulate(m, 4000, [&](std::mt19937_64& r) { return (r() % 10 == 0) ? wide(r) : n350(r); }, 0.002, 14),
+                "contaminated");
+    }
+    {   // 20% outward-facing pairs mixed in: contaminated orientation
+        std::vector<ReadPair> reads = simulate(m, 3200, [&](std::mt19937_64& r) { return n350(r); }, 0.002, 15);
+        const std::vector<ReadPair> out = simulate(m, 800, [&](std::mt19937_64& r) { return n350(r); }, 0.002, 16, true);
+        for (ReadPair p : out) { p.first.name = "o" + p.first.name; p.second.name = "o" + p.second.name; reads.push_back(p); }
+        refused("contaminated_orientation", reads, "not inward-facing");
+    }
+    // the preset: technology only, long-read refused
+    {
+        bool threw = false;
+        try { genotype_preset_settings("long-read"); } catch (const std::exception& error) { threw = std::string(error.what()).find("not implemented") != std::string::npos; }
+        require(threw, "--preset long-read is refused as not implemented");
+        threw = false;
+        try { genotype_preset_settings("c4"); } catch (const std::exception&) { threw = true; }
+        require(threw, "an unknown preset (no locus presets) is refused");
+        for (const auto& [k, v] : genotype_preset_settings("short-read")) {
+            const bool forbidden = k.find("max_") == 0 || k.find("cache") != std::string::npos || k.find("limit") != std::string::npos ||
+                                   k.find("consumed") != std::string::npos || k.find("repair_max_") == 0 || k == "max_mosaic_candidates" ||
+                                   k.find("dosage") != std::string::npos || k.find("reference") != std::string::npos || k == "repair_max_neighbours";
+            require(!forbidden || k == "proposal_state_limit", "the preset sets no resource, candidate-count, dosage or reference key (" + k + ")");
+        }
+        require(std::isnan(genotype_preset_library("short-read").insert_mean_bp), "the preset declares no insert");
     }
     if (failures) { std::cerr << failures << " failure(s)\n"; return 1; }
     std::cout << "library_estimate: all fixtures pass\n";

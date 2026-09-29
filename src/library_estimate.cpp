@@ -451,4 +451,60 @@ std::string library_estimate_table(const LibraryEstimate& estimate, const Librar
     return o.str();
 }
 
+AutoLibrary build_auto_library(const LibraryEstimate& e, const LibraryModel& preset, const LibraryEstimateOptions& options) {
+    AutoLibrary a;
+    const double outliers = e.accepted ? static_cast<double>(e.outliers) / static_cast<double>(e.accepted) : 0.0;
+    const double discordant = e.both_anchored ? static_cast<double>(e.orientation_discordant) / static_cast<double>(e.both_anchored) : 0.0;
+    std::string why;
+    if (e.accepted < options.min_accepted_pairs) {
+        why = "only " + std::to_string(e.accepted) + " decisively placed concordant pairs (at least " + std::to_string(options.min_accepted_pairs) +
+              " are required; " + std::to_string(e.pairs_sampled) + " pairs examined)";
+    } else if (e.multimodal) {
+        why = "the insert distribution has more than one mode";
+    } else if (outliers > options.max_outlier_fraction) {
+        why = "the insert distribution is contaminated (" + num(100.0 * outliers, 3) + "% of accepted inserts beyond " + num(options.outlier_sds, 2) +
+              " robust sd; at most " + num(100.0 * options.max_outlier_fraction, 3) + "% allowed)";
+    } else if (discordant > options.max_discordant_fraction) {
+        why = "the pairs are contaminated (" + num(100.0 * discordant, 3) + "% of anchored pairs are not inward-facing FR; at most " +
+              num(100.0 * options.max_discordant_fraction, 3) + "% allowed)";
+    }
+    if (!why.empty()) {
+        a.refusal = "automatic library estimation refused: " + why +
+                    ". Declare the library instead with --library FILE (insert_mean_bp, insert_sd_bp, support_sigmas, substitution_error, "
+                    "outlier_weight, fragment_start_intensity).";
+        return a;
+    }
+    a.accepted = true;
+    a.library = preset;
+    a.library.insert_mean_bp = e.insert_mean;
+    a.library.insert_sd_bp = e.insert_sd;
+    a.library.provenance = "auto: insert from " + std::to_string(e.accepted) + " decisive pairs (median " + num(e.insert_median) + ", robust sd " +
+                           num(e.insert_robust_sd) + "); other values " + preset.provenance;
+    validate_library_model(a.library);
+    a.sources = {{"insert_mean_bp", "placement_estimate"}, {"insert_sd_bp", "placement_estimate"}, {"support_sigmas", "short_read_preset"},
+                 {"substitution_error", "short_read_preset"}, {"outlier_weight", "short_read_preset"},
+                 {"fragment_start_intensity", "short_read_preset"}, {"gap_open", "short_read_preset"}, {"gap_extend", "short_read_preset"},
+                 {"read1_length_median", "reads"}, {"read2_length_median", "reads"}};
+    return a;
+}
+
+std::string library_used_rows(const LibraryModel& used, const std::vector<std::pair<std::string, std::string>>& sources) {
+    const auto value = [&](const std::string& p) -> std::string {
+        if (p == "insert_mean_bp") return num(used.insert_mean_bp);
+        if (p == "insert_sd_bp") return num(used.insert_sd_bp);
+        if (p == "support_sigmas") return num(used.support_sigmas);
+        if (p == "substitution_error") return num(used.substitution_error);
+        if (p == "outlier_weight") return num(used.outlier_weight);
+        if (p == "fragment_start_intensity") return num(used.fragment_start_intensity);
+        if (p == "gap_open") return num(used.gap_open);
+        if (p == "gap_extend") return num(used.gap_extend);
+        return "see_row_" + p;
+    };
+    std::ostringstream o;
+    for (const auto& [p, source] : sources) {
+        o << "library." << p << '\t' << value(p) << "\tused_by_call\t0\t0\tNA\tUSED\tnone\t" << source << "\tNA\n";
+    }
+    return o.str();
+}
+
 } // namespace panvar

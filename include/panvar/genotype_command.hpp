@@ -236,12 +236,18 @@ struct GenotypeCommandOptions {
     // DIAGNOSTIC ONLY (docs/algorithms/library_estimate.md): after the run, estimate the library from the reads and the
     // model and write <prefix>.library_estimate.tsv beside the declared library. Never used by the call. Off by default.
     bool library_diagnostic = false;
+    // The technology preset applied before the profile and the flags (docs/algorithms/genotype_cli.md section 3), and
+    // the keys it set. Empty: none. A preset never names a locus.
+    std::string preset_name;
+    std::vector<std::string> preset_keys;
 };
 
 // What the dosage stage and the locus table need from a run: the prepared model and the sorted graph's node sequences.
 struct GenotypeDosageCapture {
     std::optional<PreparedGenotypeModel> model;
     std::unordered_map<std::string, std::string> node_sequences;
+    // The library the run scored with: the declared one, or the one --library auto built.
+    std::optional<LibraryModel> library;
 };
 
 // A run that cannot complete emits its diagnostics and says so. It never presents a partial ranking
@@ -272,6 +278,9 @@ enum class GenotypeRunStatus {
     // DIAGNOSTIC ONLY (diagnostic_union_only): the union pass was scored and ranked and the run stopped there --
     // no repair, no genotype, no haplotype. Never a call.
     UnionDiagnosticOnly,
+    // --library auto could not validate its estimate (too few decisive pairs, several insert modes, or a contaminated
+    // pair distribution). Nothing is scored; the message names --library FILE.
+    LibraryRefused,
 };
 
 const char* genotype_run_status_name(GenotypeRunStatus status);
@@ -335,6 +344,17 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options, GenotypeDo
 // option; an unknown key, a repeated key or an unparsable value refuses. Records the profile's path,
 // name and SHA-256 in the options so every run states what it was configured by.
 void apply_genotype_profile(const std::string& path, GenotypeCommandOptions& options);
+
+// One named setting, validated exactly as a profile line is; context names the source in every error.
+void apply_genotype_setting(const std::string& context, const std::string& key, const std::string& value,
+                            GenotypeCommandOptions& options);
+
+// The technology presets (docs/algorithms/genotype_cli.md section 3). "short-read": the production algorithm and the
+// short-read technology constants, as (key, value) settings, and the short-read library-model constants. The insert
+// is not a preset value (NaN): it comes from --library auto or --library FILE. "long-read" is reserved and refused as
+// not implemented; any other name is refused.
+std::vector<std::pair<std::string, std::string>> genotype_preset_settings(const std::string& name);
+LibraryModel genotype_preset_library(const std::string& name);
 
 int run_genotype_command(const std::vector<std::string>& args);
 

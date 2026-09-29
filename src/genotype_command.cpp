@@ -1,6 +1,7 @@
 #include "panvar/genotype_command.hpp"
 #include "panvar/genotype_dosage_integrate.hpp"
 #include "panvar/genotype_dosage_repair.hpp"
+#include "panvar/gz_reader.hpp"
 #include "panvar/library_estimate.hpp"
 
 #include "panvar/bubbles.hpp"
@@ -638,6 +639,14 @@ void write_status(
     }
     out << "gfa\t" << options.gfa_path << '\n';
     out << "reference_path\t" << options.reference_path << '\n';
+    if (!options.preset_name.empty()) {
+        std::string keys;
+        for (const std::string& k : options.preset_keys) keys += (keys.empty() ? "" : ",") + k;
+        out << "preset\t" << options.preset_name << "\npreset_keys\t" << (keys.empty() ? "none" : keys) << '\n';
+    }
+    if (options.library_path == "auto") {
+        out << "library_mode\tauto\nlibrary_insert_source\tplacement_estimate\nlibrary_other_source\tshort_read_preset\n";
+    }
     out << "kmer_size\t" << options.kmer_size << '\n';
     out << "syncmer_s\t" << options.syncmer_s << '\n';
     out << "min_variant_bp\t" << options.min_variant_bp << '\n';
@@ -1038,6 +1047,7 @@ const char* genotype_run_status_name(GenotypeRunStatus status) {
         case GenotypeRunStatus::TimeLimit: return "TIME_LIMIT";
         case GenotypeRunStatus::ResourceRefusal: return "RESOURCE_REFUSAL";
         case GenotypeRunStatus::UnionDiagnosticOnly: return "UNION_DIAGNOSTIC_ONLY";
+        case GenotypeRunStatus::LibraryRefused: return "LIBRARY_REFUSED";
     }
     return "MODEL_INCOMPLETE";
 }
@@ -1068,14 +1078,14 @@ std::vector<BlockConsensusCall> block_consensus(
     return out;
 }
 
-void apply_genotype_profile(const std::string& path, GenotypeCommandOptions& options) {
-    std::ifstream file(path);
-    if (!file) throw std::runtime_error("cannot open genotype profile: " + path);
+// One named setting, validated as a profile validates it; context names the source in every error.
+void apply_genotype_setting(const std::string& context, const std::string& key, const std::string& value,
+                            GenotypeCommandOptions& options) {
     const auto whole_u64 = [&](const std::string& key, const std::string& text) {
         std::size_t used = 0;
         const unsigned long long value = std::stoull(text, &used);
         if (used != text.size() || text.empty() || text[0] == '-') {
-            throw std::runtime_error("profile " + path + ": '" + key + "' is not a non-negative integer: " + text);
+            throw std::runtime_error(context + ": '" + key + "' is not a non-negative integer: " + text);
         }
         return static_cast<std::uint64_t>(value);
     };
@@ -1083,10 +1093,89 @@ void apply_genotype_profile(const std::string& path, GenotypeCommandOptions& opt
         std::size_t used = 0;
         const double value = std::stod(text, &used);
         if (used != text.size() || !std::isfinite(value) || value < 0.0) {
-            throw std::runtime_error("profile " + path + ": '" + key + "' is not a finite non-negative number: " + text);
+            throw std::runtime_error(context + ": '" + key + "' is not a finite non-negative number: " + text);
         }
         return value;
     };
+    const auto u = [&]() { return whole_u64(key, value); };
+    if (key == "proposal_state_limit") options.proposal_state_limit = u();
+    else if (key == "max_mosaic_candidates") options.max_mosaic_candidates = u();
+    else if (key == "phase_audit_candidates") options.phase_audit_candidates = u();
+    else if (key == "threads") options.threads = u();
+    else if (key == "kmer_size") options.kmer_size = u();
+    else if (key == "syncmer_s") options.syncmer_s = u();
+    else if (key == "min_variant_bp") options.min_variant_bp = u();
+    else if (key == "switch_probability") options.switch_probability = whole_double(key, value);
+    else if (key == "mismatch_band") options.mismatch_band = u();
+    else if (key == "max_piece_hits") options.max_piece_hits = u();
+    else if (key == "max_physical_origins") options.max_physical_origins = u();
+    else if (key == "max_state_classes") options.max_state_classes = u();
+    else if (key == "max_mass_cells") options.max_mass_cells = u();
+    else if (key == "emission_cache_bytes") options.emission_cache_bytes = u();
+    else if (key == "repair_rounds") options.repair_rounds = u();
+    else if (key == "repair_local_pairs") options.repair_local_pairs = u();
+    else if (key == "repair_origin_cache_bytes") options.repair_origin_cache_bytes = u();
+    else if (key == "repair_max_neighbours") options.repair_max_neighbours = u();
+    else if (key == "repair_max_physical_origins") options.repair_max_physical_origins = u();
+    else if (key == "repair_max_state_classes") options.repair_max_state_classes = u();
+    else if (key == "repair_max_piece_hits") options.repair_max_piece_hits = u();
+    else if (key == "repair_max_latent_pairs") options.repair_max_latent_pairs = u();
+    else if (key == "repair_tie_branching") {
+        if (value != "0" && value != "1") throw std::runtime_error(context + ": 'repair_tie_branching' is 0 or 1: " + value);
+        options.repair_tie_branching = value == "1";
+    }
+    else if (key == "repair_tie_max_branches") options.repair_tie_max_branches = u();
+    else if (key == "repair_tie_seed_cache_bytes") options.repair_tie_seed_cache_bytes = u();
+    else if (key == "union_placement_cache_bytes") options.union_placement_cache_bytes = u();
+    else if (key == "max_union_cached_placements_consumed") options.max_union_cached_placements_consumed = u();
+    else if (key == "union_origin_cache_bytes") options.union_origin_cache_bytes = u();
+    else if (key == "max_union_cached_origins_consumed") options.max_union_cached_origins_consumed = u();
+    else if (key == "max_union_cached_states_consumed") options.max_union_cached_states_consumed = u();
+    else if (key == "union_prefilter_cache_bytes") options.union_prefilter_cache_bytes = u();
+    else if (key == "start_sort_scratch_bytes") options.start_sort_scratch_bytes = u();
+    else if (key == "emission_lookup_timing") {
+        if (value != "0" && value != "1") throw std::runtime_error(context + ": 'emission_lookup_timing' is 0 or 1: " + value);
+        options.emission_lookup_timing = value == "1";
+    }
+    else if (key == "max_union_cached_prefilters_consumed") options.max_union_cached_prefilters_consumed = u();
+    else if (key == "representation_guard") {
+        if (value != "0" && value != "1") throw std::runtime_error(context + ": 'representation_guard' is 0 or 1: " + value);
+        options.representation_guard = value == "1";
+    }
+    else if (key == "footprint_limit_bytes") options.footprint_limit_bytes = u();
+    else if (key == "time_limit_seconds") options.time_limit_seconds = whole_double(key, value);
+    else throw std::runtime_error(context + ": unknown setting '" + key + "'");
+}
+
+std::vector<std::pair<std::string, std::string>> genotype_preset_settings(const std::string& name) {
+    if (name == "long-read") throw std::runtime_error("--preset long-read: long-read scoring is not implemented");
+    if (name != "short-read") throw std::runtime_error("unknown --preset '" + name + "' (available: short-read)");
+    // The production algorithm (adaptive repair, exact tie branching, the representation guard) and the short-read
+    // technology constants. No resource cap, cache budget, time or footprint limit, candidate count or dosage setting:
+    // those stay at the built-in defaults unless a profile or a flag sets them (genotype_cli.md section 3).
+    return {{"repair_rounds", "32"}, {"repair_tie_branching", "1"}, {"representation_guard", "1"},
+            {"kmer_size", "31"}, {"syncmer_s", "15"}, {"min_variant_bp", "50"}, {"mismatch_band", "6"},
+            {"switch_probability", "0.01"}, {"proposal_state_limit", "256"}, {"phase_audit_candidates", "0"}};
+}
+
+LibraryModel genotype_preset_library(const std::string& name) {
+    genotype_preset_settings(name);   // refuses long-read and unknown names
+    LibraryModel m;
+    m.insert_mean_bp = std::numeric_limits<double>::quiet_NaN();
+    m.insert_sd_bp = std::numeric_limits<double>::quiet_NaN();
+    m.support_sigmas = 4.0;
+    m.substitution_error = 0.002;
+    m.outlier_weight = 0.001;
+    // A declared technology convention, not an estimate: 30x diploid depth with 2 x 150 bp pairs, lambda = depth / (4 L).
+    // The sample's own intensity is not inferred (library_estimate.md section 4, item 4).
+    m.fragment_start_intensity = 0.05;
+    m.provenance = "preset short-read";
+    return m;
+}
+
+void apply_genotype_profile(const std::string& path, GenotypeCommandOptions& options) {
+    std::ifstream file(path);
+    if (!file) throw std::runtime_error("cannot open genotype profile: " + path);
     std::set<std::string> seen;
     std::string line;
     while (std::getline(file, line)) {
@@ -1097,55 +1186,8 @@ void apply_genotype_profile(const std::string& path, GenotypeCommandOptions& opt
         const std::string key = line.substr(0, tab);
         const std::string value = line.substr(tab + 1);
         if (!seen.insert(key).second) throw std::runtime_error("profile " + path + ": '" + key + "' is set twice");
-        const auto u = [&]() { return whole_u64(key, value); };
         if (key == "profile") options.profile_name = value;
-        else if (key == "proposal_state_limit") options.proposal_state_limit = u();
-        else if (key == "max_mosaic_candidates") options.max_mosaic_candidates = u();
-        else if (key == "phase_audit_candidates") options.phase_audit_candidates = u();
-        else if (key == "threads") options.threads = u();
-        else if (key == "kmer_size") options.kmer_size = u();
-        else if (key == "syncmer_s") options.syncmer_s = u();
-        else if (key == "min_variant_bp") options.min_variant_bp = u();
-        else if (key == "switch_probability") options.switch_probability = whole_double(key, value);
-        else if (key == "mismatch_band") options.mismatch_band = u();
-        else if (key == "max_piece_hits") options.max_piece_hits = u();
-        else if (key == "max_physical_origins") options.max_physical_origins = u();
-        else if (key == "max_state_classes") options.max_state_classes = u();
-        else if (key == "max_mass_cells") options.max_mass_cells = u();
-        else if (key == "emission_cache_bytes") options.emission_cache_bytes = u();
-        else if (key == "repair_rounds") options.repair_rounds = u();
-        else if (key == "repair_local_pairs") options.repair_local_pairs = u();
-        else if (key == "repair_origin_cache_bytes") options.repair_origin_cache_bytes = u();
-        else if (key == "repair_max_neighbours") options.repair_max_neighbours = u();
-        else if (key == "repair_max_physical_origins") options.repair_max_physical_origins = u();
-        else if (key == "repair_max_state_classes") options.repair_max_state_classes = u();
-        else if (key == "repair_max_piece_hits") options.repair_max_piece_hits = u();
-        else if (key == "repair_max_latent_pairs") options.repair_max_latent_pairs = u();
-        else if (key == "repair_tie_branching") {
-            if (value != "0" && value != "1") throw std::runtime_error("profile " + path + ": 'repair_tie_branching' is 0 or 1: " + value);
-            options.repair_tie_branching = value == "1";
-        }
-        else if (key == "repair_tie_max_branches") options.repair_tie_max_branches = u();
-        else if (key == "repair_tie_seed_cache_bytes") options.repair_tie_seed_cache_bytes = u();
-        else if (key == "union_placement_cache_bytes") options.union_placement_cache_bytes = u();
-        else if (key == "max_union_cached_placements_consumed") options.max_union_cached_placements_consumed = u();
-        else if (key == "union_origin_cache_bytes") options.union_origin_cache_bytes = u();
-        else if (key == "max_union_cached_origins_consumed") options.max_union_cached_origins_consumed = u();
-        else if (key == "max_union_cached_states_consumed") options.max_union_cached_states_consumed = u();
-        else if (key == "union_prefilter_cache_bytes") options.union_prefilter_cache_bytes = u();
-        else if (key == "start_sort_scratch_bytes") options.start_sort_scratch_bytes = u();
-        else if (key == "emission_lookup_timing") {
-            if (value != "0" && value != "1") throw std::runtime_error("profile " + path + ": 'emission_lookup_timing' is 0 or 1: " + value);
-            options.emission_lookup_timing = value == "1";
-        }
-        else if (key == "max_union_cached_prefilters_consumed") options.max_union_cached_prefilters_consumed = u();
-        else if (key == "representation_guard") {
-            if (value != "0" && value != "1") throw std::runtime_error("profile " + path + ": 'representation_guard' is 0 or 1: " + value);
-            options.representation_guard = value == "1";
-        }
-        else if (key == "footprint_limit_bytes") options.footprint_limit_bytes = u();
-        else if (key == "time_limit_seconds") options.time_limit_seconds = whole_double(key, value);
-        else throw std::runtime_error("profile " + path + ": unknown setting '" + key + "'");
+        else apply_genotype_setting("profile " + path, key, value, options);
     }
     if (seen.count("profile") == 0) throw std::runtime_error("profile " + path + " does not name itself ('profile')");
     options.profile_path = path;
@@ -1359,8 +1401,12 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options, GenotypeDo
             "genotype requires --gfa, --reads1, --reads2, --reference-path and --library");
     }
 
+    // --library auto: the short-read preset's constants now, the insert estimated from the reads once the model and
+    // the reads exist (stage 2), before anything is scored. --library FILE: exactly as declared.
+    const bool auto_library = options.library_path == "auto";
     std::optional<double> declared_marker_background;
-    const LibraryModel library = read_library(options.library_path, declared_marker_background);
+    LibraryModel library = auto_library ? genotype_preset_library("short-read") : read_library(options.library_path, declared_marker_background);
+    if (auto_library) library.provenance = "auto: pending the insert estimate";
 
     // ---- stage 1: structural model -------------------------------------------------------------
     // Fail closed. Anything that stops the structural model being built, verified, or accepted as
@@ -1452,6 +1498,27 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options, GenotypeDo
     mark = Clock::now();
     const std::vector<ReadPair> fragments =
         read_fragments(options.reads1_path, options.reads2_path);
+    if (auto_library) {
+        LibraryEstimateOptions estimate_options;
+        estimate_options.threads = options.threads;
+        estimate_options.marker_kmer = options.kmer_size;
+        estimate_options.marker_syncmer = options.syncmer_s;
+        const LibraryEstimate estimate = estimate_library(model, fragments, estimate_options, nullptr);
+        const AutoLibrary built_library = build_auto_library(estimate, genotype_preset_library("short-read"), estimate_options);
+        atomic_write(options.out_prefix + ".library_estimate.tsv",
+                     library_estimate_table(estimate, nullptr) + (built_library.accepted ? library_used_rows(built_library.library, built_library.sources) : ""));
+        if (!built_library.accepted) {
+            timings.markers = seconds_since(mark);
+            timings.total = seconds_since(started);
+            library.provenance = "auto: refused";
+            write_status(status_path, GenotypeRunStatus::LibraryRefused, fingerprint, options, library, timings, &built.report, nullptr, nullptr,
+                         nullptr, built_library.refusal);
+            if (!options.quiet) std::cerr << "[genotype] LIBRARY_REFUSED  " << built_library.refusal << '\n';
+            return GenotypeRunStatus::LibraryRefused;
+        }
+        library = built_library.library;
+    }
+    if (capture != nullptr) capture->library = library;
     const PreparedMarkerPanel panel =
         build_marker_panel(model, options.kmer_size, options.syncmer_s);
     const MarkerObservations observations = count_marker_observations(panel, fragments);
@@ -4254,25 +4321,42 @@ int run_genotype_command(const std::vector<std::string>& args) {
         if (i + 1 >= args.size()) throw std::runtime_error("missing value for " + args[i]);
         return args[++i];
     };
-    // The profile is applied first, wherever it appears; a flag given beside it overrides it and is
-    // recorded as an override, so the status always says what the run actually ran under.
+    // A technology preset is applied first, then the profile, wherever they appear; a flag given beside them overrides
+    // both and is recorded as an override, so the status always says what the run actually ran under.
+    for (std::size_t i = 0; i < args.size(); ++i) {
+        if (args[i] != "--preset") continue;
+        options.preset_name = need(i);
+        for (const auto& [key, value] : genotype_preset_settings(options.preset_name)) {
+            apply_genotype_setting("preset " + options.preset_name, key, value, options);
+            options.preset_keys.push_back(key);
+        }
+    }
     for (std::size_t i = 0; i < args.size(); ++i) {
         if (args[i] == "--profile") apply_genotype_profile(need(i), options);
     }
     const bool profiled = !options.profile_path.empty();
     for (std::size_t i = 0; i < args.size(); ++i) {
         const std::string& flag = args[i];
-        if (flag == "--profile") { ++i; continue; }
-        if (flag == "--gfa" || flag == "-i") options.gfa_path = need(i);
+        if (flag == "--profile" || flag == "--preset") { ++i; continue; }
+        if (flag == "--gfa" || flag == "--graph" || flag == "-i") options.gfa_path = need(i);
         else if (flag == "--bubbles") options.bubbles_path = need(i);
         else if (flag == "--reads1") options.reads1_path = need(i);
         else if (flag == "--reads2") options.reads2_path = need(i);
         else if (flag == "--reference-path" || flag == "-r") options.reference_path = need(i);
-        else if (flag == "--out-prefix" || flag == "-o") options.out_prefix = need(i);
+        else if (flag == "--out-prefix" || flag == "--out" || flag == "-o") options.out_prefix = need(i);
         else if (flag == "--library") options.library_path = need(i);
         else if (flag == "--threads") options.threads = std::stoul(need(i));   // workers for diploid combination
         else if (flag == "--panel-curation") options.curation_manifest_path = need(i);
-        else if (flag == "--max-mosaic-candidates") options.max_mosaic_candidates = std::stoul(need(i));
+        else if (flag == "--max-mosaic-candidates" || flag == "--mosaic-candidates") options.max_mosaic_candidates = std::stoul(need(i));
+        else if (flag == "--repair-rounds") options.repair_rounds = std::stoul(need(i));
+        else if (flag == "--adaptive-repair") {
+            // off: the unrepaired development view (no repair rounds, no tie branching); on: the adaptive repair, with
+            // the preset's 32 rounds when nothing else set a round cap
+            const std::string v = need(i);
+            if (v == "off") { options.repair_rounds = 0; options.repair_tie_branching = false; }
+            else if (v == "on") { if (options.repair_rounds == 0) options.repair_rounds = 32; }
+            else throw std::runtime_error("--adaptive-repair takes on or off");
+        }
         // The repair's planned origin-cache budget, for a diagnostic comparison; recorded as an override.
         else if (flag == "--repair-origin-cache-bytes") options.repair_origin_cache_bytes = std::stoull(need(i));
         else if (flag == "--repair-tie-seed-cache-bytes") options.repair_tie_seed_cache_bytes = std::stoull(need(i));
@@ -4334,6 +4418,15 @@ int run_genotype_command(const std::vector<std::string>& args) {
                 "also replaces a block's genotype where the stage found a complete diplotype repair,\n"
                 "keeping the caller's outputs as .original.*. A dosage-content correction that is not\n"
                 "a resolved diplotype is reported beside the caller's genotype, never in place of it.\n\n"
+                "Basic use: --graph G --reads1 R1 --reads2 R2 --out PREFIX --preset short-read --library auto\n"
+                "[--threads N]. --preset short-read sets the production algorithm (adaptive repair, exact tie\n"
+                "branching, representation guard) and short-read technology constants, and nothing about a locus;\n"
+                "--preset long-read is reserved and refused. --library auto estimates the insert centre and spread\n"
+                "from decisively placed pairs (at most 20,000 examined, at least 500 required) and takes every other\n"
+                "library value from the preset; an estimate that fails validation refuses the run (LIBRARY_REFUSED)\n"
+                "and names --library FILE. Without --reference-path the graph's declared reference sample (RS:Z) is\n"
+                "used, or the run refuses and lists candidates. --mosaic-candidates K, --adaptive-repair on|off and\n"
+                "--repair-rounds N override the preset. A profile (--profile) overrides the preset; flags override both.\n\n"
                 "--library-diagnostic (off by default) also writes .library_estimate.tsv, a library\n"
                 "estimated from the reads and the model beside the declared one; the call never uses it.\n\n"
                 "--panel-curation takes a manifest of panel templates to exclude: one template name\n"
@@ -4352,7 +4445,10 @@ int run_genotype_command(const std::vector<std::string>& args) {
         // Every setting a flag gave beside the profile, with the value it took.
         for (const std::string& flag : args) {
             if (flag == "--threads") options.overridden_settings.push_back("threads=" + std::to_string(options.threads));
-            if (flag == "--max-mosaic-candidates") {
+            if (flag == "--repair-rounds" || flag == "--adaptive-repair") {
+                options.overridden_settings.push_back("repair_rounds=" + std::to_string(options.repair_rounds));
+            }
+            if (flag == "--max-mosaic-candidates" || flag == "--mosaic-candidates") {
                 options.overridden_settings.push_back("max_mosaic_candidates=" +
                                                       std::to_string(options.max_mosaic_candidates));
             }
@@ -4364,6 +4460,40 @@ int run_genotype_command(const std::vector<std::string>& args) {
                 options.overridden_settings.push_back("repair_tie_seed_cache_bytes=" +
                                                       std::to_string(options.repair_tie_seed_cache_bytes));
             }
+        }
+    }
+    if (options.reference_path.empty() && !options.gfa_path.empty()) {
+        // The graph's declared reference sample (a header RS:Z tag): its single path is the coordinate reference. No
+        // declaration, or several paths for it, is refused with the candidates listed; nothing is picked silently.
+        GzLineReader reader(options.gfa_path);
+        if (!reader.ok()) throw std::runtime_error("cannot read " + options.gfa_path);
+        std::string line, sample;
+        std::vector<std::string> paths;
+        while (reader.getline(line)) {
+            if (line.rfind("H\t", 0) == 0) {
+                const std::size_t at = line.find("RS:Z:");
+                if (at != std::string::npos) sample = line.substr(at + 5, line.find('\t', at) == std::string::npos ? std::string::npos : line.find('\t', at) - at - 5);
+            } else if (line.rfind("P\t", 0) == 0) {
+                paths.push_back(line.substr(2, line.find('\t', 2) - 2));
+            } else if (line.rfind("W\t", 0) == 0) {
+                std::vector<std::string> f;
+                std::stringstream row(line);
+                for (std::string c; std::getline(row, c, '\t');) f.push_back(c);
+                if (f.size() > 5) paths.push_back(f[1] + "#" + f[2] + "#" + f[3] + ":" + f[4] + "-" + f[5]);
+            }
+        }
+        std::vector<std::string> of_sample;
+        for (const std::string& p : paths) if (!sample.empty() && (p == sample || p.rfind(sample + "#", 0) == 0)) of_sample.push_back(p);
+        if (of_sample.size() == 1) {
+            options.reference_path = of_sample.front();
+        } else {
+            std::string listed;
+            const std::vector<std::string>& show = of_sample.empty() ? paths : of_sample;
+            for (std::size_t k = 0; k < show.size() && k < 8; ++k) listed += "\n  " + show[k];
+            if (show.size() > 8) listed += "\n  ... (" + std::to_string(show.size()) + " paths)";
+            throw std::runtime_error(std::string(sample.empty() ? "the graph declares no reference sample (no RS:Z header tag)"
+                                                                : "the graph's reference sample '" + sample + "' has " + std::to_string(of_sample.size()) + " paths") +
+                                     "; name the coordinate reference with --reference-path. Candidates:" + listed);
         }
     }
     // The dosage stage and the locus table run after every existing output is committed (sections 20 and 22).
@@ -4386,7 +4516,9 @@ int run_genotype_command(const std::vector<std::string>& args) {
                 atomic_write(options.out_prefix + ".dosage_status.tsv",
                              "key\tvalue\ndosage_audit\tshadow\ndosage_audit_status\tNOT_RUN\ndosage_audit_note\t" + audit_note + "\n");
             } else {
-                library = read_library(options.library_path, declared_marker_background);
+                // --library auto: the library the run estimated and scored with; --library FILE: re-read exactly as declared
+                library = options.library_path == "auto" && capture.library ? *capture.library
+                                                                           : read_library(options.library_path, declared_marker_background);
                 fragments = read_fragments(options.reads1_path, options.reads2_path);
                 scoring.mismatch_band = options.mismatch_band;
                 scoring.minimum_piece_bp = options.minimum_piece_bp;
@@ -4443,7 +4575,7 @@ int run_genotype_command(const std::vector<std::string>& args) {
                                       audit_status == "COMPLETE" ? &summary : nullptr, audit_status, audit_note,
                                       library ? &filters : nullptr);
         dosage::write_locus_genotype(model, options.out_prefix, integration);
-        if (options.library_diagnostic && model) {
+        if (options.library_diagnostic && model && options.library_path != "auto") {   // auto writes its own table
             std::optional<double> ignored;
             const LibraryModel declared = read_library(options.library_path, ignored);
             const std::vector<ReadPair> pairs = fragments.empty() ? read_fragments(options.reads1_path, options.reads2_path) : fragments;
