@@ -317,8 +317,9 @@ def _symlog(ax, metric, top=None):
     ax.axhline(0, color="#bbbbbb", lw=0.5, zorder=0)
 
 
-COUNT_FONT = 5.5
-COUNT_GAP_IN = 0.05
+COUNT_FONT = 4.5        # the per-coverage count labels only; every other text keeps its size
+COUNT_GAP_IN = 0.03
+BLOCK_DODGE = 0.9       # the share of a block the dodged coverages span in the ordered-block figures
 
 
 def _count_labels(summary, set_name, metric, row_key, rows, blocks, covs):
@@ -340,35 +341,27 @@ def _count_labels(summary, set_name, metric, row_key, rows, blocks, covs):
 
 
 def count_layout(labels, ncov):
-    """Levels (1, or 2 when adjacent coverages alternate heights) and inches per block such that labels on one level
-    never overlap: the closest same-level centres, across a block boundary included, are one label width plus a gap
+    """Inches per block such that the count labels, all on one baseline, never overlap: the closest label centres
+    (adjacent coverages, or the last coverage of a block and the first of the next) are one label width plus a gap
     apart."""
-    width = max([text_width_in(t, COUNT_FONT, "bold") for t in labels] or [0]) + COUNT_GAP_IN
-    w = 0.8 / max(1, ncov)
-    xs = [b + (ci - (ncov - 1) / 2) * w for b in (0, 1) for ci in range(ncov)]
-
-    def unit(levels):
-        gaps = [abs(xs[i] - xs[j]) for i in range(len(xs)) for j in range(i + 1, len(xs))
-                if (i % ncov) % levels == (j % ncov) % levels]
-        return width / min(gaps) if gaps else 0
-    return (1, unit(1)) if unit(1) <= 1.3 else (2, unit(2))
+    width = max([text_width_in(t, COUNT_FONT) for t in labels] or [0]) + COUNT_GAP_IN
+    w = BLOCK_DODGE / max(1, ncov)
+    closest = min(w, 1 - BLOCK_DODGE + w) if ncov > 1 else 1.0
+    return width / closest
 
 
 def fig_ordered_blocks(points, summary, info, metric, label, set_name, rows, row_key, markers=None, lengths=None):
     """rows: [(row label, filter value)]; points: evaluation point table; summary: its block_metric_summary (the source
     of every n / zero / undefined label). Every block in model order, coverages dodged, each call a point, the median a
-    black bar; above each block one label per coverage at its dodged position, in its colour."""
+    black bar; above each block one label per coverage at its dodged position, in its colour, all on one baseline."""
     covs = info.coverages
     ccol = coverage_colors(covs)
     nb = len(info.block_order)
-    w = 0.8 / max(1, len(covs))
+    w = BLOCK_DODGE / max(1, len(covs))
     counts = _count_labels(summary, set_name, metric, row_key, rows, info.block_order, covs)
-    levels, count_unit = count_layout(list(counts.values()), len(covs))
     ticks = block_labels(info.block_order, lengths)
-    unit = max(count_unit, block_unit_in(ticks, 7, 0.9))
-    lines = max([t.count("\n") + 1 for t in counts.values()] or [1])
-    level_pt = lines * COUNT_FONT * 1.25 + 1.5
-    band_pt = 2 + levels * level_pt
+    unit = max(count_layout(list(counts.values()), len(covs)), block_unit_in(ticks, 7, 0.9))
+    band_pt = 2 + COUNT_FONT * 1.25 + 1.5
     fig, axes = plt.subplots(len(rows), 1, figsize=(unit * nb + 2.6, (2.4 + band_pt / 72) * len(rows) + 0.6),
                              squeeze=False, sharex=True)
     shown = points[points[row_key].isin([v for _, v in rows]) & points.truth_defined & points.evaluated]
@@ -386,9 +379,8 @@ def fig_ordered_blocks(points, summary, info, metric, label, set_name, rows, row
                     ax.plot([x0 - w * 0.4, x0 + w * 0.4], [g[metric].median()] * 2, color="black", lw=1)
                 if (rval, b, c) in counts:
                     ax.annotate(counts[(rval, b, c)], (x0, 1.0), xycoords=ax.get_xaxis_transform(),
-                                xytext=(0, 2 + (ci % levels) * level_pt), textcoords="offset points", ha="center",
-                                va="bottom", fontsize=COUNT_FONT, fontweight="bold", color=ccol[c], linespacing=1.1,
-                                annotation_clip=False, gid="block_count")
+                                xytext=(0, 2), textcoords="offset points", ha="center", va="baseline",
+                                fontsize=COUNT_FONT, color=ccol[c], annotation_clip=False, gid="block_count")
         _symlog(ax, metric, top)
         ax.set_xlim(-0.5, nb - 0.5)
         ax.set_ylabel(label, fontsize=7)

@@ -87,8 +87,8 @@ is recorded.
   - The parentheses hold the number at exactly zero (the availability floor attained for excess and normalised excess;
     an exact sequence distance of zero for raw distance). When present, they also hold the number of additional
     truth-undefined observations, which stay excluded from n, zero and every accuracy denominator.
-  - No-calls contribute no block observations. With many coverages, adjacent labels alternate between two heights so
-    that they never overlap.
+  - No-calls contribute no block observations. All count labels above a block share one baseline; with many
+    coverages the figure widens so that they never overlap.
 - **Figure titles** name only the metric or comparison and the plotted set. Axis scales, filter rules, denominators
   and other methodological notes are in each figure's caption in `report.md`.
 - **Block length labels:** in evaluation mode, each block ID in a model-order figure carries a second line: the observed

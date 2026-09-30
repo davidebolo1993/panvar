@@ -287,7 +287,7 @@ class Report(unittest.TestCase):
         fig = P.fig_ordered_blocks(pts, r.tables["block_metric_summary"], r.info, metric, dict(A.METRICS)[metric], set_name, rows, row_key,
                                    lengths=r.tables.get("block_lengths"))
         ccol = P.coverage_colors(r.info.coverages)
-        w = 0.8 / len(r.info.coverages)
+        w = P.BLOCK_DODGE / len(r.info.coverages)
         out = {}
         for ax, (_, rval) in zip(fig.axes, rows):
             for t in [c for c in ax.get_children() if c.get_gid() == "block_count"]:
@@ -421,7 +421,11 @@ class Report(unittest.TestCase):
         rd = fig.canvas.get_renderer()
         boxes = []
         for ax in fig.axes:
-            labels = [c.get_window_extent(rd) for c in ax.get_children() if c.get_gid() == "block_count"]
+            texts = [c for c in ax.get_children() if c.get_gid() == "block_count"]
+            # one common vertical level: the same anchor and offset for every label, so the same baseline
+            self.assertLessEqual(len({(t.xy[1], t.xyann) for t in texts}), 1, "count labels on more than one level")
+            self.assertTrue(all(t.get_va() == "baseline" for t in texts))
+            labels = [t.get_window_extent(rd) for t in texts]
             others = [ax.title.get_window_extent(rd)] + ([fig._suptitle.get_window_extent(rd)] if fig._suptitle else [])
             for i, a in enumerate(labels):
                 self.assertTrue(fig.bbox.contains(a.x0, a.y0) and fig.bbox.contains(a.x1, a.y1), "label outside the figure")
@@ -435,14 +439,20 @@ class Report(unittest.TestCase):
         return len(boxes)
 
     def test_count_label_layout_1_2_4_coverages(self):
+        """All count labels above a block share one baseline, at their dodged positions, and never overlap, for 1, 2 and
+        4 coverages, in the general and the mosaic ordered-block figures."""
         m = pd.read_csv(self.meta, sep="\t", dtype=str)
+        sw = os.path.join(self.tmp, "meta", "switch.tsv")
+        write(sw, [{"subject": "sr4", "switch_class": "one_switch", "switch_before_block_hap1": "2", "switch_before_block_hap2": "none"},
+                   {"subject": "sr5", "switch_class": "control", "switch_before_block_hap1": "none", "switch_before_block_hap2": "none"}],
+              ["subject", "switch_class", "switch_before_block_hap1", "switch_before_block_hap2"])
         for covs in (["30"] * 6, None, ["1", "2", "5", "30", "5", "1"]):
             path = self.meta
             if covs:
                 path = os.path.join(self.tmp, "meta", f"cov{len(set(covs))}.tsv")
                 m.assign(coverage=covs).to_csv(path, sep="\t", index=False)
             name = f"lay{len(set(covs)) if covs else 2}"
-            r = self.full(name, path)
+            r = self.full(name, path, extra=["--switch-metadata", sw])
             fig, ex = self.counts(r, "excess", "all called blocks")
             present = {(e.panel, e.coverage) for e in r.tables["block_metric_summary"].itertuples()}
             self.assertEqual(len(ex), len(present) * len(BLOCKS), name)
@@ -455,9 +465,17 @@ class Report(unittest.TestCase):
                                        [(p, p) for p, _ in r.ctx.panels], "panel", lengths=r.tables["block_lengths"])
             self.assertEqual(self.assert_no_overlap(fig), len(ex), name)
             P.plt.close(fig)
-        # four coverages in the data: the per-coverage labels alternate between two heights
-        self.assertEqual(P.count_layout(["n=88888(88888,88888)"], 4)[0], 2)
-        self.assertEqual(P.count_layout(["n=1(1)"], 1)[0], 1)
+            # the mosaic-by-block figure: rows are switch classes, counts from mosaic_block_metric_summary
+            classes = A.switch_class_order(r.ctx)
+            ms = r.tables["mosaic_block_metric_summary"]
+            fig = P.fig_ordered_blocks(r.tables["block_evaluation"][r.tables["block_evaluation"].switch_class.fillna("") != ""], ms,
+                                       r.info, "excess", "excess", "all called blocks", [(k, k) for k in classes],
+                                       "switch_class", lengths=r.tables["block_lengths"])
+            present = {(e.switch_class, e.coverage) for e in ms.itertuples()}
+            self.assertEqual(self.assert_no_overlap(fig), len(present) * len(BLOCKS), name + " mosaic")
+            P.plt.close(fig)
+        # the widest label fits on one baseline by widening the block, never by a second level
+        self.assertGreater(P.count_layout(["n=88888(88888,88888)"], 4), P.count_layout(["n=1(1)"], 4))
 
 
 if __name__ == "__main__":
