@@ -81,7 +81,9 @@ def main():
 
     rows, called_runs = [], set(runs.run_id[runs.call_class != "no_call"])
     for ds, jp in jobs.items():
-        for job in csv.DictReader(open(jp), delimiter="\t"):
+        with open(jp, newline="") as fh:
+            job_rows = list(csv.DictReader(fh, delimiter="\t"))
+        for job in job_rows:
             rid = f"{ds}/{job['job']}"
             if rid not in called_runs:
                 continue

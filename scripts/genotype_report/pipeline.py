@@ -41,12 +41,18 @@ def _slug(text):
 
 
 def count_caption(metric, table):
+    """The ordered-block caption's axis, row-heading and count-label definitions (moved out of the figure titles)."""
     zero = "exact sequence distance zero" if metric == "distance" else "availability floor attained"
-    return (f"Above each block, one label per coverage at that coverage's dodged position and in its colour: n = the "
-            "observations in that row, block and coverage that are called, evaluated, truth-defined, retained by the "
-            f"plotted set and non-missing for the metric; zero = those among n whose plotted value is exactly 0 ({zero}). "
-            "Truth-undefined observations are excluded and, when present, counted as undefined=k for that coverage; "
-            f"no-calls contribute no block observations. n and zero are coverage-specific, read from data/{table}.tsv.")
+    axis = P.SYMLOG_NOTE["norm" if metric == "normalized_excess" else "bp"]
+    return (f"Axis: {axis}. R in each row heading is the number of called run instances plotted in that row (one donor "
+            "or synthetic genotype under one dataset and coverage condition), not the number of unique biological "
+            "donors; no-call runs are excluded. Above each block there is one label per coverage, at that coverage's "
+            "dodged position and in its colour. n = truth-defined observations plotted; parentheses contain the number "
+            "at zero and, when present, the number of additional truth-undefined observations. The n observations are "
+            "called, evaluated, truth-defined, retained by the plotted set and non-missing for the metric; zero means "
+            f"a value of exactly 0 ({zero}). Truth-undefined observations stay excluded from n, zero and every accuracy "
+            "denominator, and no-calls contribute no block observations. The counts are coverage-specific and are read "
+            f"from data/{table}.tsv.")
 
 
 class Report:
@@ -182,7 +188,7 @@ class Report:
                 frames.append(t)
             fig = draw(*frames)
             if modality is not None:
-                fig.suptitle((fig._suptitle.get_text() + " | " if fig._suptitle else "") + f"modality: {modality}", fontsize=9)
+                fig.suptitle((fig._suptitle.get_text() + " \u2014 " if fig._suptitle else "") + f"modality: {modality}", fontsize=9)
             fname = name + (suffix or "")
             P.save(fig, os.path.join(self.out, "figures", fname))
             self.figures.append((section, fname, caption + (f" Modality: {modality}." if modality else ""), data))
@@ -207,11 +213,12 @@ class Report:
                         "see qc_callability). A status is the filter's verdict on the evidence, not an accuracy label.")
             self.figure("qc_headline_locus_status", "QC", ["headline_locus_status"],
                         lambda t: P.fig_status_panels(t, i, ["GENOTYPE_FILTER", "DOSAGE_FILTER", "PHASE_FILTER"], "runs",
-                                                      "Headline filters per locus (fail-closed: the worst unit)"),
-                        "Locus-level headline filters: each is the worst of its units, so one non-PASS block makes the locus "
-                        "non-PASS. Truth-free.")
+                                                      "Headline filters per locus"),
+                        "Locus-level headline filters, fail-closed: each is the worst of its units, so one non-PASS block "
+                        "makes the locus non-PASS. Truth-free.")
             self.figure("qc_headline_reasons", "QC", ["headline_block_reasons"], lambda t: P.fig_reasons(t, i),
-                        "Reasons attached to block-level headline verdicts, by experiment. Truth-free.")
+                        "Reasons attached to block-level headline verdicts, by experiment; a block may carry several. "
+                        "Truth-free.")
         else:
             for f in ("qc_headline_block_status", "qc_headline_locus_status", "qc_headline_reasons"):
                 self.skip(f, "the outputs carry no headline filters (produced before headline_filters_v2)")
@@ -219,7 +226,7 @@ class Report:
                     "Conditional GQ of reported blocks. GQ is conditional on the scored candidate set and is not globally "
                     "calibrated. Truth-free: no accuracy is implied.")
         self.figure("qc_support", "QC", ["genotype_support", "phase_support"], lambda g, p: P.fig_support(g, p, i),
-                    "Genotype support of reported blocks and phase support of runs by call class. Truth-free.")
+                    "Genotype support of reported blocks of called runs and phase support of runs by call class. Truth-free.")
         self.figure("qc_dosage_states", "QC", ["dosage_states"], lambda t: P.fig_dosage_states(t, i, A.DOSAGE_OUTCOMES),
                     "Dosage-stage state of reported blocks: complete repair (applied, available in audit mode, or refused by a "
                     "guard), content-only correction, triggered unrepaired, SUSPECT, UNDERPOWERED, CONSISTENT, not "
@@ -233,7 +240,8 @@ class Report:
             groups = "; ".join(f"{r.compat_group} ({r.runs} runs, {r.distinct_graphs} graph digest(s))"
                                for r in T["runtime_groups"].itertuples())
             self.figure("qc_runtime", "QC", ["runtime"], lambda t: P.fig_runtime(t, i),
-                        "Wall time, peak physical footprint, repair rounds and dosage-stage time per run. Colour is the "
+                        "Wall time, peak physical footprint, repair rounds and dosage-stage time per run, never pooled "
+                        "across compatibility groups. Colour is the "
                         "compatibility group (settings digest, threads, execution group, and modality when supplied); groups "
                         "are never pooled. The genotyper records no host or binary identity: execution_group, from the run "
                         "metadata, must distinguish machine, environment and comparable workload conditions whenever runtime "
@@ -291,7 +299,8 @@ class Report:
                     lambda t, *l: P.fig_accuracy_heatmap(t, i, sets, l[0] if l else None),
                     "Floor attainment (excess 0; for leave-zero-out and mosaic cells the floor is 0 wherever the truth is "
                     "spellable, so this is exactness) by block and coverage, all called blocks versus EXACT_GENOTYPE_USABLE "
-                    f"({EXACT_GENOTYPE_USABLE_RULE}). Cells: attained / denominator. {denom}{lcap}")
+                    f"({EXACT_GENOTYPE_USABLE_RULE}). Cells: attained / denominator (truth-defined evaluated blocks). "
+                    f"{denom}{lcap}")
         self.figure("eval_block_accuracy_intervals", "Block accuracy", ["block_accuracy"] + ld,
                     lambda t, *l: P.fig_accuracy_intervals(t, i, sets, l[0] if l else None),
                     "The same rates as points with 95% Wilson intervals; numerators and denominators are in "
@@ -303,18 +312,20 @@ class Report:
                         "Sequence policies: correct = excess 0 over evaluated truth-defined blocks. DOSAGE_CONTENT_USABLE "
                         f"({DOSAGE_CONTENT_USABLE_RULE}) is judged on the supplied dosage-content truth over dosage-sensitive "
                         "blocks. PHASE_FILTER is a separate use dimension, judged only on phase truth (data/filter_performance.tsv, "
-                        "run level) and never folded into the exact-genotype policies.")
+                        "run level) and never folded into the exact-genotype policies. Each policy's correctness basis is "
+                        "its correctness_basis column in data/filter_performance.tsv.")
             self.figure("eval_filter_rates", "Headline-filter performance", ["filter_performance"],
                         lambda t: P.fig_filter_rates(t, i),
                         "Retention (retained / units), precision among retained, and bad-call detection sensitivity "
                         "(filtered incorrect / incorrect) by experiment and coverage.")
             self.figure("eval_filter_catastrophic", "Headline-filter performance", ["filter_performance"],
                         lambda t: P.fig_filter_catastrophic(t, i, c.catastrophic_bp),
-                        f"Catastrophic errors (excess >= {c.catastrophic_bp:g} bp) retained and filtered per sequence policy.")
+                        f"Catastrophic errors (excess >= {c.catastrophic_bp:g} bp) retained and filtered per sequence policy: "
+                        "solid bars retained, light bars filtered; labels are retained / all.")
             self.figure("eval_filter_by_block", "Headline-filter performance", ["filter_performance"] + ld,
                         lambda t, *l: P.fig_filter_by_block(t, i, l[0] if l else None),
-                        f"EXACT_GENOTYPE_USABLE ({EXACT_GENOTYPE_USABLE_RULE}) retention and precision by block and experiment."
-                        + lcap)
+                        f"EXACT_GENOTYPE_USABLE ({EXACT_GENOTYPE_USABLE_RULE}) retention and precision by block and experiment. "
+                        "The number above each block is its units (truth-defined evaluated blocks)." + lcap)
         else:
             self.skip("eval_filter_*", "no headline filters in the outputs")
         self.figure("eval_gq_diagnostic", "GQ diagnostic", ["gq_diagnostic"],
@@ -326,7 +337,9 @@ class Report:
             self.figure("dosage_content_usable", "Dosage", ["dosage_content_usable"], lambda t: P.fig_dosage_content(t, i),
                         f"DOSAGE_CONTENT_USABLE ({DOSAGE_CONTENT_USABLE_RULE}) over dosage-sensitive blocks (DOSAGE_FILTER not "
                         "NOT_APPLICABLE or NO_CALL): retention, and correctness of the reported dosage content against the "
-                        "supplied content truth. Content is kept separate from exact sequence.")
+                        "supplied content truth. Retention = retained / dosage-sensitive blocks; correctness is over "
+                        "content-truth-defined blocks, with content-truth-undefined blocks excluded and counted (undef=). "
+                        "Content is kept separate from exact sequence.")
             self.figure("dosage_content_vs_exact", "Dosage", ["dosage_content_vs_exact"], lambda t: P.fig_content_vs_exact(t, i),
                         "Correct dosage content versus exact-diplotype resolution (excess 0), for blocks where both truths "
                         "are defined: a correct content does not imply an exact diplotype.")
@@ -363,7 +376,8 @@ class Report:
                 self.figure("mosaic_excess_by_class", "Mosaic switches", ["block_evaluation"],
                             lambda t: P.fig_mosaic_excess(t[t.switch_class.fillna("") != ""], i, classes),
                             "Excess and diploid-length-normalised excess per block by switch class and coverage (summaries in "
-                            "data/mosaic_excess_summary.tsv). " + note)
+                            f"data/mosaic_excess_summary.tsv). Axes: excess {P.SYMLOG_NOTE['bp']}; normalised excess "
+                            f"{P.SYMLOG_NOTE['norm']}. " + note)
                 plans = T["switch_map"]
                 markers = {}
                 for k in classes:
@@ -398,12 +412,13 @@ class Report:
                         f"Correct boundaries and switch errors among assessable primary boundaries, with the switch-error "
                         f"rate (95% Wilson). {zero} {support} {ge}")
             self.figure("phase_by_boundary_type", "Phase", ["phase_by_boundary_type"], lambda t: P.fig_phase_by_boundary_type(t, i),
-                        "Boundaries by truth switch type (from the switch metadata, not from predictions). " + zero)
+                        "Boundaries by truth switch type (from the switch metadata, not from predictions); labels are "
+                        "errors / assessable. " + zero)
             if c.switch_plans is not None:
                 classes = A.switch_class_order(c)
                 self.figure("phase_by_switch_class", "Phase", ["phase_by_switch_class"],
                             lambda t: P.fig_phase_by_class(t, i, classes),
-                            f"Switch-error rate by mosaic switch class and coverage. {zero} {ge}")
+                            f"Switch-error rate by mosaic switch class and coverage; labels are errors / assessable. {zero} {ge}")
             else:
                 self.skip("phase_by_switch_class", "no --switch-metadata")
         if c.phase_calls is not None:
@@ -491,10 +506,15 @@ class Report:
                   "conditions whenever runtime is compared.", ""]
         if c.evaluation is not None:
             lines.insert(len(lines) - 1,   # the definitions end with a blank line
-                         "- **Block counts (ordered block figures):** n and zero are coverage-specific: one label per "
-                         "coverage above each block, from `block_metric_summary.tsv` (n: called, evaluated, truth-defined, "
-                         "retained by the plotted set, non-missing; zero: among n, value exactly 0 - availability floor "
-                         "attained for excess and normalised excess, exact sequence distance zero for raw distance).")
+                         "- **Ordered block figures:** R in a row heading is the number of called run instances plotted "
+                         "in that row (one donor or synthetic genotype under one dataset and coverage condition; not "
+                         "unique biological donors; no-calls excluded). Count labels are coverage-specific, one per "
+                         "coverage above each block, from `block_metric_summary.tsv`: `n=<n>(<zero>)`, or "
+                         "`n=<n>(<zero>,<undefined>)` when truth-undefined observations are present. n = truth-defined "
+                         "observations plotted; parentheses contain the number at zero (availability floor attained for "
+                         "excess and normalised excess, exact sequence distance zero for raw distance) and, when present, "
+                         "the number of additional truth-undefined observations, which stay excluded from n, zero and every "
+                         "accuracy denominator.")
         if "block_lengths" in T:
             lines.insert(len(lines) - 1, "- **Block length labels:** " + BLOCK_LENGTH_CAPTION)
         lines += ["## Figures", ""]

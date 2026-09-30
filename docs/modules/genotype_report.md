@@ -75,15 +75,22 @@ is recorded.
   - The figures are refused when those lengths are absent.
 - **A truth-undefined block**, where the evaluator records no truth length, is excluded from every accuracy denominator
   and counted.
-- **Block counts in the ordered block figures** are coverage-specific. Above each block there is one label per coverage,
-  at that coverage's dodged position and in its colour, read from `block_metric_summary.tsv`:
-  - `n` counts the observations in that row, block and coverage that are called, evaluated, truth-defined, retained by
-    the plotted set and non-missing for the metric;
-  - `zero` counts those among `n` whose value is exactly 0: the availability floor attained for excess and normalised
-    excess, an exact sequence distance of zero for raw distance;
-  - `undefined=k` counts truth-undefined observations, when there are any. They are excluded from `n`, and no-calls
-    contribute no block observations.
-  With many coverages, adjacent labels alternate between two heights so that they never overlap.
+- **Ordered block figures: row headings and count labels.**
+  - A row heading such as `LOO (R=328)` gives R, the number of called run instances plotted in that row: one donor or
+    synthetic genotype under one dataset and coverage condition. R is not the number of unique biological donors, and
+    no-call runs are excluded.
+  - Above each block there is one label per coverage, at that coverage's dodged position and in its colour, read from
+    `block_metric_summary.tsv`. The label is `n=<n>(<zero>)`, or `n=<n>(<zero>,<undefined>)` when there are
+    truth-undefined observations.
+  - n = truth-defined observations plotted: called, evaluated, retained by the plotted set and non-missing for the
+    metric.
+  - The parentheses hold the number at exactly zero (the availability floor attained for excess and normalised excess;
+    an exact sequence distance of zero for raw distance). When present, they also hold the number of additional
+    truth-undefined observations, which stay excluded from n, zero and every accuracy denominator.
+  - No-calls contribute no block observations. With many coverages, adjacent labels alternate between two heights so
+    that they never overlap.
+- **Figure titles** name only the metric or comparison and the plotted set. Axis scales, filter rules, denominators
+  and other methodological notes are in each figure's caption in `report.md`.
 - **Block length labels:** in evaluation mode, each block ID in a model-order figure carries a second line: the observed
   truth-allele length range. It is taken over every `truth1_bp` and `truth2_bp` of the truth-defined evaluation rows.
   - It is not a reference span, and it may miss alleles absent from the evaluated dataset.
@@ -150,7 +157,9 @@ refused with exit status 2.
 - byte-identical reruns;
 - unmodified inputs;
 - directory-mode loading of outputs from before the headline filters;
-- per-coverage `n` / `zero` labels against hand counts, for all called blocks and for EXACT_GENOTYPE_USABLE;
+- per-coverage `n=<n>(<zero>[,<undefined>])` labels and row R against hand counts, for all called blocks and for
+  EXACT_GENOTYPE_USABLE;
+- figure titles free of methodological text, which the captions carry instead;
 - block-length minimum, median and maximum on variable-length alleles, and the range format;
 - no block-length information in truth-free mode;
 - label layout without overlap for 1, 2 and 4 coverages, including five-digit counts.

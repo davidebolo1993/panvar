@@ -284,7 +284,7 @@ class Report(unittest.TestCase):
         rows = rows or [(p, p) for p, _ in r.ctx.panels]
         pts = r.tables["block_evaluation"]
         pts = pts if set_name == "all called blocks" else pts[pts.exact_genotype_usable == True]  # noqa: E712
-        fig = P.fig_ordered_blocks(pts, r.tables["block_metric_summary"], r.info, metric, metric, set_name, rows, row_key,
+        fig = P.fig_ordered_blocks(pts, r.tables["block_metric_summary"], r.info, metric, dict(A.METRICS)[metric], set_name, rows, row_key,
                                    lengths=r.tables.get("block_lengths"))
         ccol = P.coverage_colors(r.info.coverages)
         w = 0.8 / len(r.info.coverages)
@@ -303,29 +303,64 @@ class Report(unittest.TestCase):
         r = self.full("c")
         _, ex = self.counts(r, "excess", "all called blocks")
         # B: r4 at 2x; r5, r6 at 10x. r6 ctx:0 excess 3, r5 sv:1 excess 5, r4 ctx:2 truth-undefined
-        self.assertEqual(ex[("B", "ctx:0", "2")], "n=1\nzero=1")
-        self.assertEqual(ex[("B", "ctx:0", "10")], "n=2\nzero=1")
-        self.assertEqual(ex[("B", "sv:1", "10")], "n=2\nzero=1")
-        self.assertEqual(ex[("B", "ctx:2", "2")], "n=0\nzero=0\nundefined=1")
-        self.assertEqual(ex[("B", "ctx:2", "10")], "n=2\nzero=2")
+        self.assertEqual(ex[("B", "ctx:0", "2")], "n=1(1)")
+        self.assertEqual(ex[("B", "ctx:0", "10")], "n=2(1)")
+        self.assertEqual(ex[("B", "sv:1", "10")], "n=2(1)")
+        self.assertEqual(ex[("B", "ctx:2", "2")], "n=0(0,1)")
+        self.assertEqual(ex[("B", "ctx:2", "10")], "n=2(2)")
         # A: r1 at 2x (r2 is a no-call and contributes nothing), r3 at 10x; r1 sv:1 excess 2000
-        self.assertEqual(ex[("A", "sv:1", "2")], "n=1\nzero=0")
-        self.assertEqual(ex[("A", "sv:1", "10")], "n=1\nzero=1")
+        self.assertEqual(ex[("A", "sv:1", "2")], "n=1(0)")
+        self.assertEqual(ex[("A", "sv:1", "10")], "n=1(1)")
         self.assertEqual(len(ex), 2 * 3 * 2)   # rows x blocks x coverages
         # raw distance is excess + 1 here, so no exact sequence distance zero anywhere
         _, di = self.counts(r, "distance", "all called blocks")
-        self.assertEqual(di[("B", "ctx:0", "10")], "n=2\nzero=0")
-        self.assertTrue(all("zero=0" in v for v in di.values()))
+        self.assertEqual(di[("B", "ctx:0", "10")], "n=2(0)")
+        self.assertTrue(all(v.split("(")[1].split(",")[0].rstrip(")") == "0" for v in di.values()))
         # EXACT_GENOTYPE_USABLE drops r1 sv:1 and r5 sv:1 (GENOTYPE_FILTER LOW_QUALITY)
         _, us = self.counts(r, "excess", "EXACT_GENOTYPE_USABLE")
-        self.assertEqual(us[("B", "sv:1", "10")], "n=1\nzero=1")
-        self.assertEqual(us[("A", "sv:1", "2")], "n=0\nzero=0")
+        self.assertEqual(us[("B", "sv:1", "10")], "n=1(1)")
+        self.assertEqual(us[("A", "sv:1", "2")], "n=0(0)")
         self.assertEqual(us[("B", "sv:1", "2")], ex[("B", "sv:1", "2")])
         self.assertEqual(us[("B", "ctx:0", "10")], ex[("B", "ctx:0", "10")])
+        # row headings: R = called run instances plotted in the row (A: r1, r3; r2 is a no-call; B: r4, r5, r6)
+        fig, _ = self.counts(r, "excess", "all called blocks")
+        self.assertEqual([ax.get_title(loc="left") for ax in fig.axes if ax.get_title(loc="left")], ["A (R=2)", "B (R=3)"])
+        self.assertEqual(fig._suptitle.get_text(), "Excess over the availability floor (bp) by block \u2014 all called blocks")
+        P.plt.close(fig)
         # the labels are the summary table's values, as written to data/
         sm = self.data("c", "block_metric_summary")
         g = sm[(sm.panel == "B") & (sm.block_id == "sv:1") & (sm.coverage == "10") & (sm.metric == "excess")].set_index("set")
         self.assertEqual((g.loc["all called blocks", "n"], g.loc["EXACT_GENOTYPE_USABLE", "n"]), ("2", "1"))
+
+    def test_titles_state_only_the_comparison(self):
+        """Every figure title names the metric or comparison and the plotted set; axis, filter and denominator
+        explanations live in the captions."""
+        titles, save = [], P.save
+
+        def record(fig, stem):
+            titles.extend([fig._suptitle.get_text()] if fig._suptitle else [])
+            titles.extend(ax.get_title(loc=k) for ax in fig.axes for k in ("left", "center") if ax.get_title(loc=k))
+            save(fig, stem)
+        P.save = record
+        try:
+            sw = os.path.join(self.tmp, "meta", "switch.tsv")
+            write(sw, [{"subject": "sr4", "switch_class": "one_switch", "switch_before_block_hap1": "2", "switch_before_block_hap2": "none"}],
+                  ["subject", "switch_class", "switch_before_block_hap1", "switch_before_block_hap2"])
+            r = self.full("t", extra=["--switch-metadata", sw])
+        finally:
+            P.save = save
+        self.assertGreater(len(titles), 20)
+        # (policy names such as "GENOTYPE_FILTER == PASS" are the plotted set and may appear)
+        banned = ("symlog", "linear in", "Wilson", "USABLE (", "denominator", "cells:", "labels:", "(solid)", "never pooled",
+                  "fail-closed", "may carry", "conditional on", "called runs", "units per block", "[", "\n")
+        self.assertEqual([t for t in titles if any(b in t for b in banned)], [])
+        # the explanations moved to the captions
+        caps = " ".join(cap for _, _, cap, _ in r.figures)
+        for phrase in ("symlog axis: linear in [0, 1] bp", "95% Wilson", "worst of its units", "may carry several",
+                       "never pooled", "labels are retained / all", "n = truth-defined observations plotted; parentheses "
+                       "contain the number at zero and, when present, the number of additional truth-undefined observations.",
+                       "not the number of unique biological donors"):
+            self.assertIn(phrase, caps)
 
     def test_length_range_format(self):
         cases = {(117, 117): "117 bp", (1, 69): "1\u201369 bp", (12306, 12402): "12.3\u201312.4 kb",
@@ -421,8 +456,8 @@ class Report(unittest.TestCase):
             self.assertEqual(self.assert_no_overlap(fig), len(ex), name)
             P.plt.close(fig)
         # four coverages in the data: the per-coverage labels alternate between two heights
-        self.assertEqual(P.count_layout(["n=88888\nzero=88888"], 4)[0], 2)
-        self.assertEqual(P.count_layout(["n=1\nzero=1"], 1)[0], 1)
+        self.assertEqual(P.count_layout(["n=88888(88888,88888)"], 4)[0], 2)
+        self.assertEqual(P.count_layout(["n=1(1)"], 1)[0], 1)
 
 
 if __name__ == "__main__":

@@ -167,7 +167,7 @@ def fig_reasons(t, info):
         ax.set_yticks(y, reasons, fontsize=6)
         ax.invert_yaxis()
         ax.set_xlabel("blocks carrying the reason")
-        ax.set_title(f"{f} reasons (a block may carry several)")
+        ax.set_title(f"{f} reasons")
         if f == filters[0]:
             _legend(ax, frameon=False)
     fig.tight_layout()
@@ -188,7 +188,7 @@ def fig_gq(points, info):
         ax.text(i, 1.02, f"n={len(v)}", transform=ax.get_xaxis_transform(), ha="center", fontsize=6)
     ax.set_xticks(range(len(cells)), [_cell_text(e, c) for e, c in cells], fontsize=6)
     ax.set_ylabel("conditional GQ")
-    ax.set_title("Conditional GQ of reported blocks (conditional on the scored candidate set)", pad=14)
+    ax.set_title("Conditional GQ of reported blocks", pad=14)
     fig.tight_layout()
     return fig
 
@@ -198,7 +198,7 @@ def fig_support(gs, ps, info):
     fig, axes = plt.subplots(2, 1, figsize=(max(7, 0.45 * max(len(cells_g), len(cells_p)) + 6), 5.4))
     g_order = sorted(gs.genotype_support.unique())
     stacked_status(axes[0], gs, cells_g, "genotype_support", g_order, categorical_colors(g_order), "blocks",
-                   "Genotype support (blocks of called runs)")
+                   "Genotype support (blocks)")
     ps = ps.copy()
     ps["category"] = ps.call_class + ": " + ps.phase_support
     p_order = sorted(ps.category.unique())
@@ -264,7 +264,7 @@ def fig_runtime(t, info):
     handles = [Patch(color=gcol[g], label=g) for g in groups]
     handles += [Line2D([], [], marker=markers[c], ls="", color="#444444", label=c) for c in markers if c in set(t.call_class)]
     axes[0, 0].legend(handles=handles, frameon=False, loc="upper left", bbox_to_anchor=(1, 1))
-    fig.suptitle("Runtime and resources per run (never pooled across compatibility groups)", fontsize=9)
+    fig.suptitle("Runtime and resources per run", fontsize=9)
     fig.tight_layout()
     return fig
 
@@ -322,8 +322,9 @@ COUNT_GAP_IN = 0.05
 
 
 def _count_labels(summary, set_name, metric, row_key, rows, blocks, covs):
-    """{(row, block, coverage): label} from block_metric_summary, for the coverages a row has in that table (a block
-    with no row for such a coverage has n=0). n, zero and truth_undefined are read, never recomputed."""
+    """{(row, block, coverage): 'n=<n>(<zero>)', or 'n=<n>(<zero>,<undefined>)' when truth-undefined observations are
+    present} from block_metric_summary, for the coverages a row has in that table (a block with no row for such a
+    coverage has n=0). n, zero and truth_undefined are read, never recomputed."""
     s = summary[(summary["set"] == set_name) & (summary.metric == metric)]
     out = {}
     for _, rval in rows:
@@ -334,7 +335,7 @@ def _count_labels(summary, set_name, metric, row_key, rows, blocks, covs):
             for c in present:
                 g = cells.get((b, c))
                 n, z, u = (0, 0, 0) if g is None else (int(g.n.iloc[0]), int(g.zero.iloc[0]), int(g.truth_undefined.iloc[0]))
-                out[(rval, b, c)] = f"n={n}\nzero={z}" + (f"\nundefined={u}" if u else "")
+                out[(rval, b, c)] = f"n={n}({z},{u})" if u else f"n={n}({z})"
     return out
 
 
@@ -391,8 +392,7 @@ def fig_ordered_blocks(points, summary, info, metric, label, set_name, rows, row
         _symlog(ax, metric, top)
         ax.set_xlim(-0.5, nb - 0.5)
         ax.set_ylabel(label, fontsize=7)
-        runs = s.run_id.nunique()
-        ax.set_title(f"{rlabel} ({runs} called runs)", loc="left", fontsize=8, pad=band_pt + 3)
+        ax.set_title(f"{rlabel} (R={d.run_id.nunique()})", loc="left", fontsize=8, pad=band_pt + 3)   # plotted run IDs
         for bi in range(nb - 1):
             ax.axvline(bi + 0.5, color="#e5e5e5", lw=0.5, zorder=0)
         if markers is not None and rval in markers:
@@ -404,10 +404,13 @@ def fig_ordered_blocks(points, summary, info, metric, label, set_name, rows, row
     if markers is not None:
         handles += [Line2D([], [], marker=m, ls="", color=col, label=lab) for m, col, lab in SWITCH_MARKERS.values()]
     axes[0, 0].legend(handles=handles, frameon=False, loc="upper left", bbox_to_anchor=(1.0, 1.0))
-    note = SYMLOG_NOTE["norm" if metric == "normalized_excess" else "bp"]
-    fig.suptitle(f"{label} by block - {set_name} ({note}; n and zero per coverage, in its colour)", fontsize=9)
+    fig.suptitle(f"{_cap(label)} by block \u2014 {set_name}", fontsize=9)
     fig.tight_layout()
     return fig
+
+
+def _cap(text):
+    return text[:1].upper() + text[1:]
 
 
 def _switch_markers(ax, plan_cats):
@@ -445,10 +448,10 @@ def fig_accuracy_heatmap(t, info, sets, lengths=None):
             im = ax.imshow(np.ma.masked_invalid(M), cmap=cmap, vmin=0, vmax=1, aspect="auto")
             ax.set_yticks(range(len(info.coverages)), [f"{c}x" if c != "all" else "all" for c in info.coverages])
             ax.set_xticks(range(len(info.block_order)), ticks, rotation=90, fontsize=6)
-            ax.set_title(f"{p} - {sname}", fontsize=8)
+            ax.set_title(f"{p} \u2014 {sname}", fontsize=8)
     fig.subplots_adjust(left=0.07, right=0.86, top=1 - 0.9 / fig.get_figheight(), bottom=bottom_in / fig.get_figheight(), hspace=0.35, wspace=0.12)
     fig.colorbar(im, ax=axes.ravel().tolist(), shrink=0.6, label="floor-attainment rate (excess 0)")
-    fig.suptitle("Floor attainment by block and coverage (cells: attained / truth-defined evaluated blocks)", fontsize=9)
+    fig.suptitle("Floor attainment by block and coverage", fontsize=9)
     return fig
 
 
@@ -476,11 +479,11 @@ def fig_accuracy_intervals(t, info, sets, lengths=None):
                     ax.errorbar(xs, ys, yerr=[lo, hi], fmt="o", ms=2.5, color=ccol[c], elinewidth=0.7, label=f"{c}x")
             ax.set_ylim(-0.03, 1.03)
             ax.set_xticks(range(len(info.block_order)), ticks, rotation=90, fontsize=6)
-            ax.set_title(f"{p} - {sname}", fontsize=8)
+            ax.set_title(f"{p} \u2014 {sname}", fontsize=8)
             if si == 0:
                 ax.set_ylabel("floor-attainment rate")
     _legend(axes[0, -1], frameon=False, loc="upper left", bbox_to_anchor=(1, 1))
-    fig.suptitle("Floor attainment by block and coverage with 95% Wilson intervals (denominators in the backing TSV)", fontsize=9)
+    fig.suptitle("Floor-attainment rate by block and coverage", fontsize=9)
     fig.tight_layout()
     return fig
 
@@ -502,7 +505,7 @@ def fig_filter_counts(t, info):
         for i, c in enumerate(cols):
             ax.text(i, bottom[i], f"n={int(bottom[i])}", ha="center", va="bottom", fontsize=6)
         ax.set_xticks(x, cols, fontsize=7)
-        ax.set_title(f"{p}  [{s.correctness_basis.iloc[0]}]", fontsize=8, loc="left")
+        ax.set_title(p, fontsize=8, loc="left")
         ax.set_ylabel("units")
         ax.set_ylim(0, max(bottom.max() * 1.15, 1))
     _legend(axes[0, 0], frameon=False, loc="upper left", bbox_to_anchor=(1, 1))
@@ -549,7 +552,7 @@ def fig_filter_catastrophic(t, info, catastrophic_bp):
             ax.text(x, kept + filt, f"{int(kept)}/{int(kept + filt)}", ha="center", va="bottom", fontsize=5)
     ax.set_xticks(range(len(cols)), cols)
     ax.set_ylabel(f"catastrophic blocks (excess >= {catastrophic_bp:g} bp)")
-    ax.set_title("Catastrophic errors retained (solid) and filtered (light); labels: retained / all", fontsize=8)
+    ax.set_title("Catastrophic errors retained and filtered by policy", fontsize=8)
     _legend(ax, frameon=False, loc="upper left", bbox_to_anchor=(1, 1))
     fig.tight_layout()
     return fig
@@ -572,10 +575,10 @@ def fig_filter_by_block(t, info, lengths=None):
             if b in s.index:
                 ax.text(i, 1.06, f"{int(s.loc[b, 'units'])}", ha="center", fontsize=5.5)
         ax.set_ylim(-0.03, 1.15)
-        ax.set_title(f"{e} (units per block above)", fontsize=8, loc="left")
+        ax.set_title(e, fontsize=8, loc="left")
     axes[-1, 0].set_xticks(range(len(info.block_order)), ticks)
     _legend(axes[0, 0], frameon=False, loc="upper left", bbox_to_anchor=(1, 1))
-    fig.suptitle("EXACT_GENOTYPE_USABLE by block (GENOTYPE_FILTER == PASS and DOSAGE_FILTER in {PASS, NOT_APPLICABLE})", fontsize=9)
+    fig.suptitle("EXACT_GENOTYPE_USABLE retention and precision by block", fontsize=9)
     fig.tight_layout()
     return fig
 
@@ -615,7 +618,7 @@ def fig_mosaic_excess(points, info, classes):
         _symlog(ax, m, d[m].max() if len(d) else 0)
         ax.set_xticks(range(len(classes)), classes, fontsize=7)
         ax.set_ylabel(lab + " per block")
-        ax.set_title(f"{lab} by switch class and coverage ({SYMLOG_NOTE['norm' if m == 'normalized_excess' else 'bp']})",
+        ax.set_title(f"{_cap(lab)} by switch class and coverage",
                      fontsize=8, loc="left", pad=12)
     handles = [Line2D([], [], marker="o", ls="", color=ccol[c], label=f"{c}x") for c in covs]
     axes[0, 0].legend(handles=handles, frameon=False, loc="upper left", bbox_to_anchor=(1, 1))
@@ -648,7 +651,7 @@ def fig_switch_map(t, info, classes, lengths=None):
     ax.set_xlabel("block (model order); markers sit on the boundary where the homologue changes source template")
     handles = [Line2D([], [], marker=m, ls="", color=col, label=lab) for m, col, lab in SWITCH_MARKERS.values()]
     ax.legend(handles=handles, frameon=False, loc="upper left", bbox_to_anchor=(1, 1))
-    ax.set_title("Truth switch map: each plan alternates between its two source templates (A / B) at these boundaries", fontsize=8)
+    ax.set_title("Truth switch map by plan", fontsize=8)
     fig.tight_layout()
     return fig
 
@@ -664,7 +667,7 @@ def fig_dosage_content(t, info):
     axes[0].bar(x, ret, color="#1d5a85", label="retained (DOSAGE_FILTER == PASS)")
     for i in range(len(cells)):
         axes[0].text(i, sens[i], f"{int(ret[i])}/{int(sens[i])}", ha="center", va="bottom", fontsize=6)
-    axes[0].set_title("DOSAGE_CONTENT_USABLE retention (retained / dosage-sensitive blocks)", fontsize=8, loc="left")
+    axes[0].set_title("DOSAGE_CONTENT_USABLE retention", fontsize=8, loc="left")
     _legend(axes[0], frameon=False, loc="upper left", bbox_to_anchor=(1, 1))
     bottom = np.zeros(len(cells))
     for k, col in (("retained_content_correct", OUTCOME_COLORS["retained_correct"]),
@@ -677,7 +680,7 @@ def fig_dosage_content(t, info):
     und = get("content_truth_undefined")
     for i in range(len(cells)):
         axes[1].text(i, bottom[i], f"n={int(bottom[i])}" + (f"\nundef={int(und[i])}" if und[i] else ""), ha="center", va="bottom", fontsize=5.5)
-    axes[1].set_title("Dosage content correctness (content-truth-defined blocks; undefined excluded and counted)", fontsize=8, loc="left")
+    axes[1].set_title("Dosage content correctness", fontsize=8, loc="left")
     _legend(axes[1], frameon=False, loc="upper left", bbox_to_anchor=(1, 1))
     for ax in axes:
         ax.set_xticks(x, [_cell_text(e, c) for e, c in cells], fontsize=6)
@@ -703,7 +706,7 @@ def fig_content_vs_exact(t, info):
         ax.set_xticks([0, 1], ["exact diplotype\n(floor attained)", "not exact"], fontsize=6)
         ax.set_yticks([0, 1], ["content correct", "content incorrect"], fontsize=6)
         ax.set_title(p, fontsize=8)
-    fig.suptitle("Dosage content versus exact-diplotype resolution (blocks with both truths defined)", fontsize=9)
+    fig.suptitle("Dosage content versus exact-diplotype resolution", fontsize=9)
     fig.tight_layout()
     return fig
 
@@ -721,8 +724,7 @@ def fig_representatives(t, info):
     ax.set_yscale("log")
     ax.set_xlabel("reported-genotype distance + 1 (bp, log)")
     ax.set_ylabel("representative phased distance + 1 (bp, log)")
-    ax.set_title("NON-AUTHORITATIVE: conditional representatives' sequence distance\n(a serialisation of an unresolved set, never a call)",
-                 fontsize=8)
+    ax.set_title("NON-AUTHORITATIVE diagnostic: conditional representatives' sequence distance", fontsize=8)
     _legend(ax, frameon=False, fontsize=6)
     fig.tight_layout()
     return fig
@@ -766,7 +768,7 @@ def fig_phase_accuracy(t, info):
     axes[0].set_ylabel("assessable boundaries")
     axes[0].set_ylim(0, max((ok + err).max() * 1.15, 1))
     _legend(axes[0], frameon=False, loc="upper left", bbox_to_anchor=(1, 1))
-    axes[0].set_title("Assessable boundaries: switch errors / assessable", fontsize=8, loc="left")
+    axes[0].set_title("Switch errors among assessable boundaries", fontsize=8, loc="left")
     for i, (e, c) in enumerate(cells):
         r = t[(t.experiment == e) & (t.coverage == c)].iloc[0]
         if r.assessable > 0:
@@ -791,7 +793,7 @@ def fig_phase_by_class(t, info, classes):
     ax.set_xticks(range(len(cells)), [f"{k}\n{c}x" for k, c in cells], fontsize=5.5, rotation=90)
     ax.set_ylim(-0.02, 1.0)
     ax.set_ylabel("switch-error rate (95% Wilson)")
-    ax.set_title("Switch-error rate by mosaic switch class and coverage (labels: errors / assessable)", fontsize=8, pad=14)
+    ax.set_title("Switch-error rate by mosaic switch class and coverage", fontsize=8, pad=14)
     fig.tight_layout()
     return fig
 
@@ -814,7 +816,7 @@ def fig_phase_by_boundary_type(t, info):
             ax.text(x, r.correct + r.switch_errors, f"{int(r.switch_errors)}/{int(r.assessable)}", ha="center", va="bottom", fontsize=5)
     ax.set_xticks(range(len(exps)), exps)
     ax.set_ylabel("assessable boundaries (red: switch errors)")
-    ax.set_title("Phase at boundaries by truth switch type (from the switch metadata; labels: errors / assessable)", fontsize=8)
+    ax.set_title("Phase at boundaries by truth switch type", fontsize=8)
     _legend(ax, frameon=False, loc="upper left", bbox_to_anchor=(1, 1))
     fig.tight_layout()
     return fig
@@ -851,7 +853,7 @@ def fig_phase_projected(t, info):
     ax.set_xticks(range(len(cells)), [_cell_text(e, c) for e, c in cells], fontsize=6)
     ax.set_ylim(0, 1.05)
     ax.set_ylabel("sequence-projected concordance")
-    ax.set_title("SECONDARY diagnostic: sequence-projected phase concordance (not primary phase accuracy)", fontsize=8, pad=14)
+    ax.set_title("SECONDARY diagnostic: sequence-projected phase concordance", fontsize=8, pad=14)
     fig.tight_layout()
     return fig
 
@@ -872,7 +874,6 @@ def fig_gq_diagnostic(t, info, labels):
         ax.set_ylim(-0.03, 1.03)
         ax.set_title(p, fontsize=8, pad=26)
     axes[0, 0].set_ylabel("floor-attainment rate (95% Wilson)")
-    fig.suptitle("DIAGNOSTIC ONLY: floor attainment by conditional-GQ bin. GQ is conditional on the scored candidate set\n"
-                 "and not globally calibrated; no threshold is recommended.", fontsize=8)
+    fig.suptitle("DIAGNOSTIC ONLY: floor attainment by conditional-GQ bin", fontsize=9)
     fig.tight_layout()
     return fig
