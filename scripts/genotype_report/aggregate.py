@@ -9,7 +9,8 @@ from dataclasses import dataclass, field
 import numpy as np
 import pandas as pd
 
-from .common import CALL_CLASSES, CALLED, STATUSES, Refusal, coverage_order, ordered_unique, to_number, wilson
+from .common import (CALL_CLASSES, CALLED, STATUSES, Refusal, coverage_order, format_length_range, ordered_unique,
+                     to_number, wilson)
 
 GQ_BINS = [0, 10, 20, 30, 40, 60, 80, 99, np.inf]
 GQ_LABELS = ["[0,10)", "[10,20)", "[20,30)", "[30,40)", "[40,60)", "[60,80)", "[80,99)", ">=99"]
@@ -355,6 +356,31 @@ def block_accuracy(ctx, points, by="panel"):
                          "truth_undefined": int((g.evaluated & ~g.truth_defined).sum()), "denominator": n,
                          "floor_attained": k, "rate": k / n if n else np.nan, "ci_low": lo, "ci_high": hi,
                          "exact_distance_zero": int((d.distance == 0).sum())})
+    return sort_frame(pd.DataFrame(rows), ctx)
+
+
+def block_lengths(ctx):
+    """The observed truth-allele lengths of every block: each truth1_bp and truth2_bp of the truth-defined evaluation rows
+    (two observations per row), as minimum, median and maximum, and the compact range the block labels show. A
+    property of the evaluated dataset, not a reference span. None when the evaluation records no truth lengths."""
+    e = ctx.evaluation
+    if e is None or not {"truth1_bp", "truth2_bp"} <= set(e.columns):
+        return None
+    e = e[e.truth_defined & e.truth1_bp.notna() & e.truth2_bp.notna()].merge(ctx.runs[["run_id"] + ctx.strata], on="run_id")
+    index = dict(zip(ctx.blocks.block_id, ctx.blocks.block_index))
+    strata = [()] if not ctx.strata else [(m,) for m in ctx.modalities]
+    rows = []
+    for key in strata:
+        s = e[e.modality == key[0]] if ctx.strata else e
+        for b in ctx.block_order:
+            g = s[s.block_id == b]
+            v = pd.concat([g.truth1_bp, g.truth2_bp], ignore_index=True)
+            rows.append({**dict(zip(ctx.strata, key)), "block_index": index[b], "block_id": b,
+                         "truth_allele_observations": len(v),
+                         "truth_allele_bp_min": v.min() if len(v) else np.nan,
+                         "truth_allele_bp_median": v.median() if len(v) else np.nan,
+                         "truth_allele_bp_max": v.max() if len(v) else np.nan,
+                         "displayed_length_range": format_length_range(v.min(), v.max()) if len(v) else np.nan})
     return sort_frame(pd.DataFrame(rows), ctx)
 
 

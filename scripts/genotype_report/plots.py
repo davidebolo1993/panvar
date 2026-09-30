@@ -6,6 +6,8 @@ import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
+from matplotlib.backends.backend_agg import RendererAgg  # noqa: E402
+from matplotlib.font_manager import FontProperties  # noqa: E402
 from matplotlib.lines import Line2D  # noqa: E402
 from matplotlib.patches import Patch  # noqa: E402
 
@@ -45,6 +47,29 @@ def _legend(ax, **kwargs):
 def _err(value, low, high):
     """Error-bar lengths from an interval, clipped at 0 against floating-point rounding."""
     return [[max(0.0, value - low)], [max(0.0, high - value)]]
+
+
+_MEASURE = RendererAgg(10, 10, 720)
+
+
+def text_width_in(text, size, weight="normal"):
+    """The rendered width in inches of the widest line of `text` in the report font (deterministic: the Agg renderer)."""
+    prop = FontProperties(family=plt.rcParams["font.family"], size=size, weight=weight)
+    return max(_MEASURE.get_text_width_height_descent(line, prop, ismath=False)[0] for line in text.split("\n")) / 720
+
+
+def block_labels(block_order, lengths=None):
+    """Block tick labels in model order: the block ID, and below it the observed truth-allele length range when a
+    block_lengths table is supplied (evaluation mode only) and the block has truth-defined observations."""
+    if lengths is None or not len(lengths):
+        return list(block_order)
+    shown = {b: r for b, r in zip(lengths.block_id, lengths.displayed_length_range) if isinstance(r, str) and r != "NA"}
+    return [f"{b}\n{shown[b]}" if b in shown else b for b in block_order]
+
+
+def block_unit_in(labels, size, minimum):
+    """Inches per block so horizontal block labels never touch their neighbours."""
+    return max(minimum, max(text_width_in(t, size) for t in labels) + 0.12)
 
 
 def categorical_colors(values):
@@ -292,14 +317,59 @@ def _symlog(ax, metric, top=None):
     ax.axhline(0, color="#bbbbbb", lw=0.5, zorder=0)
 
 
-def fig_ordered_blocks(points, info, metric, label, set_name, rows, row_key, markers=None):
-    """rows: [(row label, filter value)]; points: evaluation point table. Every block in model order, coverages dodged,
-    each call a point, the median a black bar; n (truth-defined, evaluated) above each block."""
+COUNT_FONT = 5.5
+COUNT_GAP_IN = 0.05
+
+
+def _count_labels(summary, set_name, metric, row_key, rows, blocks, covs):
+    """{(row, block, coverage): label} from block_metric_summary, for the coverages a row has in that table (a block
+    with no row for such a coverage has n=0). n, zero and truth_undefined are read, never recomputed."""
+    s = summary[(summary["set"] == set_name) & (summary.metric == metric)]
+    out = {}
+    for _, rval in rows:
+        r = s[s[row_key] == rval]
+        present = [c for c in covs if (r.coverage == c).any()]
+        cells = {(b, c): g for (b, c), g in r.groupby(["block_id", "coverage"], sort=False)}
+        for b in blocks:
+            for c in present:
+                g = cells.get((b, c))
+                n, z, u = (0, 0, 0) if g is None else (int(g.n.iloc[0]), int(g.zero.iloc[0]), int(g.truth_undefined.iloc[0]))
+                out[(rval, b, c)] = f"n={n}\nzero={z}" + (f"\nundefined={u}" if u else "")
+    return out
+
+
+def count_layout(labels, ncov):
+    """Levels (1, or 2 when adjacent coverages alternate heights) and inches per block such that labels on one level
+    never overlap: the closest same-level centres, across a block boundary included, are one label width plus a gap
+    apart."""
+    width = max([text_width_in(t, COUNT_FONT, "bold") for t in labels] or [0]) + COUNT_GAP_IN
+    w = 0.8 / max(1, ncov)
+    xs = [b + (ci - (ncov - 1) / 2) * w for b in (0, 1) for ci in range(ncov)]
+
+    def unit(levels):
+        gaps = [abs(xs[i] - xs[j]) for i in range(len(xs)) for j in range(i + 1, len(xs))
+                if (i % ncov) % levels == (j % ncov) % levels]
+        return width / min(gaps) if gaps else 0
+    return (1, unit(1)) if unit(1) <= 1.3 else (2, unit(2))
+
+
+def fig_ordered_blocks(points, summary, info, metric, label, set_name, rows, row_key, markers=None, lengths=None):
+    """rows: [(row label, filter value)]; points: evaluation point table; summary: its block_metric_summary (the source
+    of every n / zero / undefined label). Every block in model order, coverages dodged, each call a point, the median a
+    black bar; above each block one label per coverage at its dodged position, in its colour."""
     covs = info.coverages
     ccol = coverage_colors(covs)
     nb = len(info.block_order)
     w = 0.8 / max(1, len(covs))
-    fig, axes = plt.subplots(len(rows), 1, figsize=(max(8, 0.9 * nb + 2), 2.4 * len(rows) + 0.6), squeeze=False, sharex=True)
+    counts = _count_labels(summary, set_name, metric, row_key, rows, info.block_order, covs)
+    levels, count_unit = count_layout(list(counts.values()), len(covs))
+    ticks = block_labels(info.block_order, lengths)
+    unit = max(count_unit, block_unit_in(ticks, 7, 0.9))
+    lines = max([t.count("\n") + 1 for t in counts.values()] or [1])
+    level_pt = lines * COUNT_FONT * 1.25 + 1.5
+    band_pt = 2 + levels * level_pt
+    fig, axes = plt.subplots(len(rows), 1, figsize=(unit * nb + 2.6, (2.4 + band_pt / 72) * len(rows) + 0.6),
+                             squeeze=False, sharex=True)
     shown = points[points[row_key].isin([v for _, v in rows]) & points.truth_defined & points.evaluated]
     top = shown[metric].max() if shown[metric].notna().any() else 0
     for ax, (rlabel, rval) in zip(axes[:, 0], rows):
@@ -313,20 +383,21 @@ def fig_ordered_blocks(points, info, metric, label, set_name, rows, row_key, mar
                     xs = [x0 + stable_jitter(f"{r}|{b}", w * 0.7) for r in g.run_id]
                     ax.scatter(xs, g[metric], s=5, color=ccol[c], linewidths=0, alpha=0.8)
                     ax.plot([x0 - w * 0.4, x0 + w * 0.4], [g[metric].median()] * 2, color="black", lw=1)
-            nd = len(d[d.block_id == b])
-            nz = int((d[d.block_id == b][metric] == 0).sum())
-            und = int((s[(s.block_id == b)].evaluated & ~s[s.block_id == b].truth_defined).sum())
-            ax.text(bi, 1.01, f"n={nd} zero={nz}" + (f"\nundefined={und}" if und else ""), transform=ax.get_xaxis_transform(),
-                    ha="center", va="bottom", fontsize=5.5)
+                if (rval, b, c) in counts:
+                    ax.annotate(counts[(rval, b, c)], (x0, 1.0), xycoords=ax.get_xaxis_transform(),
+                                xytext=(0, 2 + (ci % levels) * level_pt), textcoords="offset points", ha="center",
+                                va="bottom", fontsize=COUNT_FONT, fontweight="bold", color=ccol[c], linespacing=1.1,
+                                annotation_clip=False, gid="block_count")
         _symlog(ax, metric, top)
+        ax.set_xlim(-0.5, nb - 0.5)
         ax.set_ylabel(label, fontsize=7)
         runs = s.run_id.nunique()
-        ax.set_title(f"{rlabel} ({runs} called runs)", loc="left", fontsize=8, pad=16)
+        ax.set_title(f"{rlabel} ({runs} called runs)", loc="left", fontsize=8, pad=band_pt + 3)
         for bi in range(nb - 1):
             ax.axvline(bi + 0.5, color="#e5e5e5", lw=0.5, zorder=0)
         if markers is not None and rval in markers:
             _switch_markers(ax, markers[rval])
-    axes[-1, 0].set_xticks(range(nb), info.block_order, rotation=0)
+    axes[-1, 0].set_xticks(range(nb), ticks, rotation=0)
     axes[-1, 0].set_xlabel("block (model order)")
     handles = [Line2D([], [], marker="o", ls="", color=ccol[c], label=f"{c}x" if c != "all" else "all") for c in covs]
     handles.append(Line2D([], [], color="black", lw=1, label="median"))
@@ -334,7 +405,7 @@ def fig_ordered_blocks(points, info, metric, label, set_name, rows, row_key, mar
         handles += [Line2D([], [], marker=m, ls="", color=col, label=lab) for m, col, lab in SWITCH_MARKERS.values()]
     axes[0, 0].legend(handles=handles, frameon=False, loc="upper left", bbox_to_anchor=(1.0, 1.0))
     note = SYMLOG_NOTE["norm" if metric == "normalized_excess" else "bp"]
-    fig.suptitle(f"{label} by block - {set_name} ({note})", fontsize=9)
+    fig.suptitle(f"{label} by block - {set_name} ({note}; n and zero per coverage, in its colour)", fontsize=9)
     fig.tight_layout()
     return fig
 
@@ -351,10 +422,12 @@ def _switch_markers(ax, plan_cats):
 
 
 # ------------------------------------------------------------------------------------------------ block accuracy
-def fig_accuracy_heatmap(t, info, sets):
+def fig_accuracy_heatmap(t, info, sets, lengths=None):
     rows = [p for p, _ in info.panels]
+    ticks = block_labels(info.block_order, lengths)
+    bottom_in = max(0.8, text_width_in("\n".join(ticks), 6) + 0.25)
     fig, axes = plt.subplots(len(rows), len(sets), figsize=(0.55 * len(info.block_order) * len(sets) + 2.5,
-                                                             1.4 + (0.38 * len(info.coverages) + 0.7) * len(rows)),
+                                                             bottom_in + 0.6 + (0.38 * len(info.coverages) + 0.7) * len(rows)),
                              squeeze=False, sharex=True)
     cmap = matplotlib.colormaps["YlGnBu"].with_extremes(bad="#eeeeee")
     for ri, p in enumerate(rows):
@@ -371,16 +444,17 @@ def fig_accuracy_heatmap(t, info, sets):
                                 va="center", fontsize=5, color="black" if g.rate.iloc[0] < 0.7 else "white")
             im = ax.imshow(np.ma.masked_invalid(M), cmap=cmap, vmin=0, vmax=1, aspect="auto")
             ax.set_yticks(range(len(info.coverages)), [f"{c}x" if c != "all" else "all" for c in info.coverages])
-            ax.set_xticks(range(len(info.block_order)), info.block_order, rotation=90, fontsize=6)
+            ax.set_xticks(range(len(info.block_order)), ticks, rotation=90, fontsize=6)
             ax.set_title(f"{p} - {sname}", fontsize=8)
-    fig.subplots_adjust(left=0.07, right=0.86, top=1 - 0.9 / fig.get_figheight(), bottom=0.8 / fig.get_figheight(), hspace=0.35, wspace=0.12)
+    fig.subplots_adjust(left=0.07, right=0.86, top=1 - 0.9 / fig.get_figheight(), bottom=bottom_in / fig.get_figheight(), hspace=0.35, wspace=0.12)
     fig.colorbar(im, ax=axes.ravel().tolist(), shrink=0.6, label="floor-attainment rate (excess 0)")
     fig.suptitle("Floor attainment by block and coverage (cells: attained / truth-defined evaluated blocks)", fontsize=9)
     return fig
 
 
-def fig_accuracy_intervals(t, info, sets):
+def fig_accuracy_intervals(t, info, sets, lengths=None):
     rows = [p for p, _ in info.panels]
+    ticks = block_labels(info.block_order, lengths)
     covs = info.coverages
     ccol = coverage_colors(covs)
     w = 0.8 / max(1, len(covs))
@@ -401,7 +475,7 @@ def fig_accuracy_intervals(t, info, sets):
                 if xs:
                     ax.errorbar(xs, ys, yerr=[lo, hi], fmt="o", ms=2.5, color=ccol[c], elinewidth=0.7, label=f"{c}x")
             ax.set_ylim(-0.03, 1.03)
-            ax.set_xticks(range(len(info.block_order)), info.block_order, rotation=90, fontsize=6)
+            ax.set_xticks(range(len(info.block_order)), ticks, rotation=90, fontsize=6)
             ax.set_title(f"{p} - {sname}", fontsize=8)
             if si == 0:
                 ax.set_ylabel("floor-attainment rate")
@@ -481,10 +555,12 @@ def fig_filter_catastrophic(t, info, catastrophic_bp):
     return fig
 
 
-def fig_filter_by_block(t, info):
+def fig_filter_by_block(t, info, lengths=None):
     t = t[(t.stratum == "experiment_block") & (t.policy == "EXACT_GENOTYPE_USABLE")]
     exps = [e for e in info.experiments if (t.experiment == e).any()]
-    fig, axes = plt.subplots(len(exps), 1, figsize=(max(8, 0.8 * len(info.block_order) + 2), 2.0 * len(exps) + 0.5), squeeze=False, sharex=True)
+    ticks = block_labels(info.block_order, lengths)
+    unit = block_unit_in(ticks, 7, 0.8)
+    fig, axes = plt.subplots(len(exps), 1, figsize=(max(8, unit * len(info.block_order) + 2), 2.0 * len(exps) + 0.5), squeeze=False, sharex=True)
     for ax, e in zip(axes[:, 0], exps):
         s = t[t.experiment == e].set_index("block_id")
         x = np.arange(len(info.block_order))
@@ -497,7 +573,7 @@ def fig_filter_by_block(t, info):
                 ax.text(i, 1.06, f"{int(s.loc[b, 'units'])}", ha="center", fontsize=5.5)
         ax.set_ylim(-0.03, 1.15)
         ax.set_title(f"{e} (units per block above)", fontsize=8, loc="left")
-    axes[-1, 0].set_xticks(range(len(info.block_order)), info.block_order)
+    axes[-1, 0].set_xticks(range(len(info.block_order)), ticks)
     _legend(axes[0, 0], frameon=False, loc="upper left", bbox_to_anchor=(1, 1))
     fig.suptitle("EXACT_GENOTYPE_USABLE by block (GENOTYPE_FILTER == PASS and DOSAGE_FILTER in {PASS, NOT_APPLICABLE})", fontsize=9)
     fig.tight_layout()
@@ -547,12 +623,14 @@ def fig_mosaic_excess(points, info, classes):
     return fig
 
 
-def fig_switch_map(t, info, classes):
+def fig_switch_map(t, info, classes, lengths=None):
     plans = []
     for k in classes:
         plans += [(k, p) for p in sorted(t[t.switch_class == k].plan.unique())]
     nb = len(info.block_order)
-    fig, ax = plt.subplots(figsize=(max(8, 0.8 * nb + 3), 0.6 + 0.3 * len(plans)))
+    ticks = block_labels(info.block_order, lengths)
+    unit = block_unit_in(ticks, 7, 0.8)
+    fig, ax = plt.subplots(figsize=(max(8, unit * nb + 3), 0.6 + 0.3 * len(plans) + (0.15 if lengths is not None else 0)))
     for yi, (k, p) in enumerate(plans):
         s = t[t.plan == p]
         for r in s.itertuples():
@@ -563,7 +641,7 @@ def fig_switch_map(t, info, classes):
     src = {p: (t[t.plan == p].source_a.iloc[0], t[t.plan == p].source_b.iloc[0]) for _, p in plans}
     ax.set_yticks(range(len(plans)), [f"{p} (A {src[p][0]} / B {src[p][1]})" for k, p in plans], fontsize=6)
     ax.invert_yaxis()
-    ax.set_xticks(range(nb), info.block_order)
+    ax.set_xticks(range(nb), ticks)
     ax.set_xlim(-0.5, nb - 0.5)
     for bi in range(nb - 1):
         ax.axvline(bi + 0.5, color="#f0f0f0", lw=0.5, zorder=0)

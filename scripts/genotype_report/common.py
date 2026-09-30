@@ -6,6 +6,7 @@ line terminator, and every ordering is explicit.
 import hashlib
 import math
 import os
+from decimal import ROUND_HALF_UP, Decimal
 
 import pandas as pd
 
@@ -27,6 +28,11 @@ NORMALIZED_EXCESS_FORMULA = "excess / max(truth1_bp + truth2_bp, called1_bp + ca
 NORMALIZATION_COLUMNS = ["truth1_bp", "truth2_bp", "called1_bp", "called2_bp"]
 
 FLOAT_FORMAT = None   # the shortest representation that round-trips (repr): exact and deterministic
+
+# The caption of every model-order block figure whose block labels carry the observed truth-allele length range.
+BLOCK_LENGTH_CAPTION = ("Length below each block ID is the observed truth-allele length range across truth-defined "
+                        "evaluation observations. It is not a reference span and may not include alleles absent from "
+                        "the evaluated dataset. Exact minimum, median and maximum values are in data/block_lengths.tsv.")
 
 
 class Refusal(Exception):
@@ -141,3 +147,28 @@ def stable_jitter(key, width):
     on row order or a random state."""
     h = int(hashlib.sha256(key.encode()).hexdigest()[:8], 16)
     return (h / 0xFFFFFFFF - 0.5) * width
+
+
+def _plain(d):
+    """A Decimal in plain notation without a trailing exponent or superfluous zeros ('117', '117.5')."""
+    return format(d.normalize(), "f")
+
+
+def format_length_range(lo, hi):
+    """A compact length range for a block label; the exact values stay in the table.
+    Equal ends: one value ('117 bp', '48.0 kb'). Both below 1,000 bp: bp ('1–69 bp'). Otherwise kb with one decimal,
+    rounded half up, with an exact 0 written '0' ('12.3–12.4 kb', '0–7.7 kb'); when two different ends would
+    print identically at one decimal, decimals are added (up to three, exact for whole bp) until they differ."""
+    a, b = Decimal(repr(float(lo))), Decimal(repr(float(hi)))
+
+    def kb(v, places):
+        return "0" if v == 0 else str((v / 1000).quantize(Decimal(1).scaleb(-places), rounding=ROUND_HALF_UP))
+
+    if a == b:
+        return f"{_plain(a)} bp" if a < 1000 else f"{kb(a, 1)} kb"
+    if a < 1000 and b < 1000:
+        return f"{_plain(a)}–{_plain(b)} bp"
+    places = 1
+    while places < 3 and kb(a, places) == kb(b, places):
+        places += 1
+    return f"{kb(a, places)}–{kb(b, places)} kb"

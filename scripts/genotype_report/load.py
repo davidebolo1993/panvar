@@ -272,6 +272,9 @@ def load_evaluation(path, runs, blocks):
         out["normalized_excess"] = (out.excess / out.diploid_length_denominator_bp).where(out.truth_defined & (cols > 0))
     else:
         out["truth_defined"] = out.distance.notna()
+        for c in ("truth1_bp", "truth2_bp"):   # the observed truth-allele lengths (block_lengths.tsv) need only these
+            if c in t.columns:
+                out[c] = to_number(t[c])
     # a truth-undefined block has no distance: it is neither correct nor incorrect
     for c in ("distance", "floor", "excess"):
         out[c] = out[c].where(out.truth_defined)

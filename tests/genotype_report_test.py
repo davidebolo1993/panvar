@@ -2,7 +2,9 @@
 """Unit tests for scripts/plot_genotype_results.py (the panvar genotype reporting tool), on small synthetic tables:
 aggregation counts and denominators computed by hand, the normalised-excess formula, truth-undefined exclusion, every
 refusal, the modality contract (absent: no column; one: figures identical to absent; several: faceted), byte-identical
-reruns, and directory-mode loading (including pre-headline outputs). Usage: genotype_report_test.py [scripts dir]."""
+reruns, directory-mode loading (including pre-headline outputs), the per-coverage n / zero block labels (read from
+block_metric_summary, laid out without overlap for 1, 2 and 4 coverages) and the observed truth-allele length ranges
+under the block IDs (evaluation only). Usage: genotype_report_test.py [scripts dir]."""
 import hashlib
 import os
 import shutil
@@ -17,7 +19,8 @@ sys.path.insert(0, SCRIPTS)
 import plot_genotype_results as cli  # noqa: E402
 from genotype_report import aggregate as A  # noqa: E402
 from genotype_report import load as L  # noqa: E402
-from genotype_report.common import Refusal, wilson  # noqa: E402
+from genotype_report import plots as P  # noqa: E402
+from genotype_report.common import Refusal, format_length_range, wilson  # noqa: E402
 
 BLOCKS = ["ctx:0", "sv:1", "ctx:2"]
 
@@ -274,6 +277,152 @@ class Report(unittest.TestCase):
               ["subject", "switch_class", "switch_before_block_hap1", "switch_before_block_hap2"])
         with self.assertRaisesRegex(Refusal, "outside the 3-block model"):
             self.full("swb", extra=["--switch-metadata", bad])
+
+    # ---------------------------------------------------------------------------------------------- block labels
+    def counts(self, r, metric, set_name, row_key="panel", rows=None):
+        """{(row, block, coverage): (text, x, colour)} of the n / zero labels the ordered-block figure draws."""
+        rows = rows or [(p, p) for p, _ in r.ctx.panels]
+        pts = r.tables["block_evaluation"]
+        pts = pts if set_name == "all called blocks" else pts[pts.exact_genotype_usable == True]  # noqa: E712
+        fig = P.fig_ordered_blocks(pts, r.tables["block_metric_summary"], r.info, metric, metric, set_name, rows, row_key,
+                                   lengths=r.tables.get("block_lengths"))
+        ccol = P.coverage_colors(r.info.coverages)
+        w = 0.8 / len(r.info.coverages)
+        out = {}
+        for ax, (_, rval) in zip(fig.axes, rows):
+            for t in [c for c in ax.get_children() if c.get_gid() == "block_count"]:
+                x = t.xy[0]
+                bi = int(round(x))
+                ci = int(round((x - bi) / w + (len(r.info.coverages) - 1) / 2))
+                c = r.info.coverages[ci]
+                self.assertEqual(t.get_color(), ccol[c])   # drawn in its coverage's colour, at its dodged position
+                out[(rval, r.info.block_order[bi], c)] = t.get_text()
+        return fig, out
+
+    def test_per_coverage_counts_by_hand(self):
+        r = self.full("c")
+        _, ex = self.counts(r, "excess", "all called blocks")
+        # B: r4 at 2x; r5, r6 at 10x. r6 ctx:0 excess 3, r5 sv:1 excess 5, r4 ctx:2 truth-undefined
+        self.assertEqual(ex[("B", "ctx:0", "2")], "n=1\nzero=1")
+        self.assertEqual(ex[("B", "ctx:0", "10")], "n=2\nzero=1")
+        self.assertEqual(ex[("B", "sv:1", "10")], "n=2\nzero=1")
+        self.assertEqual(ex[("B", "ctx:2", "2")], "n=0\nzero=0\nundefined=1")
+        self.assertEqual(ex[("B", "ctx:2", "10")], "n=2\nzero=2")
+        # A: r1 at 2x (r2 is a no-call and contributes nothing), r3 at 10x; r1 sv:1 excess 2000
+        self.assertEqual(ex[("A", "sv:1", "2")], "n=1\nzero=0")
+        self.assertEqual(ex[("A", "sv:1", "10")], "n=1\nzero=1")
+        self.assertEqual(len(ex), 2 * 3 * 2)   # rows x blocks x coverages
+        # raw distance is excess + 1 here, so no exact sequence distance zero anywhere
+        _, di = self.counts(r, "distance", "all called blocks")
+        self.assertEqual(di[("B", "ctx:0", "10")], "n=2\nzero=0")
+        self.assertTrue(all("zero=0" in v for v in di.values()))
+        # EXACT_GENOTYPE_USABLE drops r1 sv:1 and r5 sv:1 (GENOTYPE_FILTER LOW_QUALITY)
+        _, us = self.counts(r, "excess", "EXACT_GENOTYPE_USABLE")
+        self.assertEqual(us[("B", "sv:1", "10")], "n=1\nzero=1")
+        self.assertEqual(us[("A", "sv:1", "2")], "n=0\nzero=0")
+        self.assertEqual(us[("B", "sv:1", "2")], ex[("B", "sv:1", "2")])
+        self.assertEqual(us[("B", "ctx:0", "10")], ex[("B", "ctx:0", "10")])
+        # the labels are the summary table's values, as written to data/
+        sm = self.data("c", "block_metric_summary")
+        g = sm[(sm.panel == "B") & (sm.block_id == "sv:1") & (sm.coverage == "10") & (sm.metric == "excess")].set_index("set")
+        self.assertEqual((g.loc["all called blocks", "n"], g.loc["EXACT_GENOTYPE_USABLE", "n"]), ("2", "1"))
+
+    def test_length_range_format(self):
+        cases = {(117, 117): "117 bp", (1, 69): "1\u201369 bp", (12306, 12402): "12.3\u201312.4 kb",
+                 (26346, 98187): "26.3\u201398.2 kb", (0, 7670): "0\u20137.7 kb", (0, 69): "0\u201369 bp",
+                 (12350, 12350): "12.4 kb", (999, 1000): "0.999\u20131.000 kb",
+                 (47951, 48003): "47.95\u201348.00 kb", (117.5, 420): "117.5\u2013420 bp"}
+        for (lo, hi), want in cases.items():
+            self.assertEqual(format_length_range(lo, hi), want, (lo, hi))
+
+    def test_block_lengths_variable_alleles(self):
+        e = pd.read_csv(self.ev, sep="\t", dtype=str, keep_default_na=False)
+        lengths = {"ctx:0": {"r1": (1000, 1100), "r3": (1000, 1250), "r4": (990, 1000), "r5": (1000, 1000), "r6": (1100, 1300)},
+                   "sv:1": {"r1": (0, 7), "r3": (69, 1), "r4": (7, 7), "r5": (3, 0), "r6": (4, 50)},
+                   "ctx:2": {"r1": (12306, 12402), "r3": (12350, 12350), "r5": (12400, 12306), "r6": (12402, 12380)}}
+        for i, row in e.iterrows():
+            t = lengths[row.block_id].get(row.run_id)
+            if t:   # r4 ctx:2 stays truth-undefined (NA) and is excluded
+                e.loc[i, ["truth1_bp", "truth2_bp"]] = [str(t[0]), str(t[1])]
+        var = os.path.join(self.tmp, "meta", "var_eval.tsv")
+        e.to_csv(var, sep="\t", index=False)
+        r = run_cli(["--input", self.pkg, "--out-dir", self.out("len"), "--run-metadata", self.meta, "--evaluation-blocks", var])
+        bl = self.data("len", "block_lengths").set_index("block_id")
+        # ctx:0: 990, 1000 x5, 1100 x2, 1250, 1300 -> median (1000 + 1000) / 2
+        self.assertEqual(bl.loc["ctx:0"].tolist(), ["0", "10", "990.0", "1000.0", "1300.0", "1.0\u20131.3 kb"])
+        # sv:1: 0 0 1 3 4 7 7 7 50 69 -> median (4 + 7) / 2 = 5.5
+        self.assertEqual(bl.loc["sv:1"].tolist(), ["1", "10", "0.0", "5.5", "69.0", "0\u201369 bp"])
+        # ctx:2: 8 observations (r4 undefined): 12306 12306 12350 12350 12380 12400 12402 12402 -> median 12365
+        self.assertEqual(bl.loc["ctx:2"].tolist(), ["2", "8", "12306.0", "12365.0", "12402.0", "12.3\u201312.4 kb"])
+        self.assertEqual(list(self.data("len", "block_lengths").columns),
+                         ["block_index", "block_id", "truth_allele_observations", "truth_allele_bp_min", "truth_allele_bp_median",
+                          "truth_allele_bp_max", "displayed_length_range"])
+        # every model-order block figure names the table and shows two-line labels
+        for name in ("eval_block_excess_all", "eval_block_accuracy_heatmap", "eval_block_accuracy_intervals", "eval_filter_by_block"):
+            self.assertIn("block_lengths", [d for _, n, _, ds in r.figures if n == name for d in ds], name)
+        self.assertEqual(P.block_labels(r.info.block_order, r.tables["block_lengths"]),
+                         ["ctx:0\n1.0\u20131.3 kb", "sv:1\n0\u201369 bp", "ctx:2\n12.3\u201312.4 kb"])
+        with open(os.path.join(self.out("len"), "report.md")) as f:
+            self.assertIn("It is not a reference span", f.read())
+
+    def test_truth_free_has_no_block_lengths(self):
+        r = run_cli(["--input", self.pkg, "--out-dir", self.out("qc"), "--run-metadata", self.meta])
+        self.assertFalse(os.path.exists(os.path.join(self.out("qc"), "data", "block_lengths.tsv")))
+        self.assertNotIn("block_lengths", [d for _, _, _, ds in r.figures for d in ds])
+        with open(os.path.join(self.out("qc"), "report.md")) as f:
+            text = f.read()
+        self.assertNotIn("truth-allele", text)
+        self.assertNotIn("block_lengths", text)
+        self.assertEqual(P.block_labels(r.info.block_order, r.tables.get("block_lengths")), BLOCKS)
+        # an evaluation without truth lengths has none either
+        e = pd.read_csv(self.ev, sep="\t", dtype=str)
+        short = os.path.join(self.tmp, "meta", "short_eval.tsv")
+        e.drop(columns=["truth1_bp", "truth2_bp", "called1_bp", "called2_bp"]).to_csv(short, sep="\t", index=False)
+        run_cli(["--input", self.pkg, "--out-dir", self.out("nolen"), "--run-metadata", self.meta, "--evaluation-blocks", short])
+        self.assertFalse(os.path.exists(os.path.join(self.out("nolen"), "data", "block_lengths.tsv")))
+
+    def assert_no_overlap(self, fig):
+        fig.canvas.draw()
+        rd = fig.canvas.get_renderer()
+        boxes = []
+        for ax in fig.axes:
+            labels = [c.get_window_extent(rd) for c in ax.get_children() if c.get_gid() == "block_count"]
+            others = [ax.title.get_window_extent(rd)] + ([fig._suptitle.get_window_extent(rd)] if fig._suptitle else [])
+            for i, a in enumerate(labels):
+                self.assertTrue(fig.bbox.contains(a.x0, a.y0) and fig.bbox.contains(a.x1, a.y1), "label outside the figure")
+                for b in labels[i + 1:] + others:
+                    self.assertFalse(a.overlaps(b), "overlapping labels")
+            boxes += labels
+            ticks = [t.get_window_extent(rd) for t in ax.get_xticklabels() if t.get_text()]
+            for i, a in enumerate(ticks):
+                for b in ticks[i + 1:]:
+                    self.assertFalse(a.overlaps(b), "overlapping block labels")
+        return len(boxes)
+
+    def test_count_label_layout_1_2_4_coverages(self):
+        m = pd.read_csv(self.meta, sep="\t", dtype=str)
+        for covs in (["30"] * 6, None, ["1", "2", "5", "30", "5", "1"]):
+            path = self.meta
+            if covs:
+                path = os.path.join(self.tmp, "meta", f"cov{len(set(covs))}.tsv")
+                m.assign(coverage=covs).to_csv(path, sep="\t", index=False)
+            name = f"lay{len(set(covs)) if covs else 2}"
+            r = self.full(name, path)
+            fig, ex = self.counts(r, "excess", "all called blocks")
+            present = {(e.panel, e.coverage) for e in r.tables["block_metric_summary"].itertuples()}
+            self.assertEqual(len(ex), len(present) * len(BLOCKS), name)
+            self.assertEqual(self.assert_no_overlap(fig), len(ex), name)
+            P.plt.close(fig)
+            # the widest counts a cohort could have: every label at five digits, with an undefined line
+            sm = r.tables["block_metric_summary"].copy()
+            sm[["n", "zero", "truth_undefined"]] = 88888
+            fig = P.fig_ordered_blocks(r.tables["block_evaluation"], sm, r.info, "excess", "excess", "all called blocks",
+                                       [(p, p) for p, _ in r.ctx.panels], "panel", lengths=r.tables["block_lengths"])
+            self.assertEqual(self.assert_no_overlap(fig), len(ex), name)
+            P.plt.close(fig)
+        # four coverages in the data: the per-coverage labels alternate between two heights
+        self.assertEqual(P.count_layout(["n=88888\nzero=88888"], 4)[0], 2)
+        self.assertEqual(P.count_layout(["n=1\nzero=1"], 1)[0], 1)
 
 
 if __name__ == "__main__":

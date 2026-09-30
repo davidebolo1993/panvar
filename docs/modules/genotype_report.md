@@ -75,6 +75,23 @@ is recorded.
   - The figures are refused when those lengths are absent.
 - **A truth-undefined block**, where the evaluator records no truth length, is excluded from every accuracy denominator
   and counted.
+- **Block counts in the ordered block figures** are coverage-specific. Above each block there is one label per coverage,
+  at that coverage's dodged position and in its colour, read from `block_metric_summary.tsv`:
+  - `n` counts the observations in that row, block and coverage that are called, evaluated, truth-defined, retained by
+    the plotted set and non-missing for the metric;
+  - `zero` counts those among `n` whose value is exactly 0: the availability floor attained for excess and normalised
+    excess, an exact sequence distance of zero for raw distance;
+  - `undefined=k` counts truth-undefined observations, when there are any. They are excluded from `n`, and no-calls
+    contribute no block observations.
+  With many coverages, adjacent labels alternate between two heights so that they never overlap.
+- **Block length labels:** in evaluation mode, each block ID in a model-order figure carries a second line: the observed
+  truth-allele length range. It is taken over every `truth1_bp` and `truth2_bp` of the truth-defined evaluation rows.
+  - It is not a reference span, and it may miss alleles absent from the evaluated dataset.
+  - Format: one value when the minimum equals the maximum (`117 bp`); bp when both are below 1,000 (`1–69 bp`);
+    otherwise kb with one decimal, rounded half up (`12.3–12.4 kb`, `0–7.7 kb`).
+  - When two different ends would print alike at one decimal, decimals are added until they differ (`47.95–48.00 kb`).
+  - The exact minimum, median and maximum are in `data/block_lengths.tsv`.
+  - A truth-free report has no block-length information.
 - **EXACT_GENOTYPE_USABLE** is exactly `GENOTYPE_FILTER == PASS and DOSAGE_FILTER in {PASS, NOT_APPLICABLE}`.
 - **DOSAGE_CONTENT_USABLE** is `DOSAGE_FILTER == PASS`, judged on dosage content.
 - **PHASE_FILTER** is judged only against phase truth. It is never folded into exact-genotype filtering.
@@ -132,4 +149,8 @@ refused with exit status 2.
 - the modality contract;
 - byte-identical reruns;
 - unmodified inputs;
-- directory-mode loading of outputs from before the headline filters.
+- directory-mode loading of outputs from before the headline filters;
+- per-coverage `n` / `zero` labels against hand counts, for all called blocks and for EXACT_GENOTYPE_USABLE;
+- block-length minimum, median and maximum on variable-length alleles, and the range format;
+- no block-length information in truth-free mode;
+- label layout without overlap for 1, 2 and 4 coverages, including five-digit counts.

@@ -16,8 +16,8 @@ import pandas as pd
 from . import aggregate as A
 from . import load as L
 from . import plots as P
-from .common import (CALLED, DOSAGE_CONTENT_USABLE_RULE, EXACT_GENOTYPE_USABLE_RULE, NORMALIZED_EXCESS_FORMULA,
-                     PHASED_GENOTYPE_USABLE_RULE, Refusal, sha256_file, write_tsv)
+from .common import (BLOCK_LENGTH_CAPTION, CALLED, DOSAGE_CONTENT_USABLE_RULE, EXACT_GENOTYPE_USABLE_RULE,
+                     NORMALIZED_EXCESS_FORMULA, PHASED_GENOTYPE_USABLE_RULE, Refusal, sha256_file, write_tsv)
 
 TOOL = "panvar genotype report"
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -38,6 +38,15 @@ def _inside(a, b):
 
 def _slug(text):
     return re.sub(r"[^A-Za-z0-9_.-]+", "_", text).strip("_") or "x"
+
+
+def count_caption(metric, table):
+    zero = "exact sequence distance zero" if metric == "distance" else "availability floor attained"
+    return (f"Above each block, one label per coverage at that coverage's dodged position and in its colour: n = the "
+            "observations in that row, block and coverage that are called, evaluated, truth-defined, retained by the "
+            f"plotted set and non-missing for the metric; zero = those among n whose plotted value is exactly 0 ({zero}). "
+            "Truth-undefined observations are excluded and, when present, counted as undefined=k for that coverage; "
+            f"no-calls contribute no block observations. n and zero are coverage-specific, read from data/{table}.tsv.")
 
 
 class Report:
@@ -128,6 +137,9 @@ class Report:
         self.table("provenance", A.provenance(c))
         if c.evaluation is not None:
             pts = self.table("block_evaluation", A.evaluated_blocks(c))
+            lengths = A.block_lengths(c)
+            if lengths is not None:
+                self.table("block_lengths", lengths)
             self.table("block_metric_summary", A.block_metric_summary(c, pts))
             self.table("block_accuracy", A.block_accuracy(c, pts))
             self.table("gq_diagnostic", A.gq_diagnostic(c, pts))
@@ -174,6 +186,11 @@ class Report:
             fname = name + (suffix or "")
             P.save(fig, os.path.join(self.out, "figures", fname))
             self.figures.append((section, fname, caption + (f" Modality: {modality}." if modality else ""), data))
+
+    def _lengths(self):
+        """The block_lengths table as extra figure data, and the caption sentence, when it exists (evaluation with
+        truth lengths); nothing otherwise, so a truth-free report shows no block-length information."""
+        return (["block_lengths"], " " + BLOCK_LENGTH_CAPTION) if "block_lengths" in self.tables else ([], "")
 
     def draw(self):
         c, i = self.ctx, self.info
@@ -244,6 +261,7 @@ class Report:
         ne = int((~pts.evaluated).sum())
         denom = (f"Denominators: evaluated truth-defined blocks of called runs ({und} truth-undefined and {ne} unevaluated "
                  "blocks are excluded and counted; no-call runs contribute no blocks).")
+        ld, lcap = self._lengths()
         sets = ["all called blocks"] + (["EXACT_GENOTYPE_USABLE"] if c.has_headline else [])
         for metric, label in A.METRICS:
             if metric == "normalized_excess" and not c.has_normalization:
@@ -258,25 +276,26 @@ class Report:
                            "observed alignment length." if metric == "normalized_excess" else "")
                 main = " For leave-one-out rows excess is the primary accuracy metric; raw distance is shown separately." if metric != "distance" else \
                     " Raw distance includes what the panel cannot spell; for leave-one-out rows read the excess figures."
-                self.figure(f"eval_block_{metric}_{slug}", "Ordered block performance", ["block_evaluation"],
-                            lambda t, m=metric, lab=label, sn=s: P.fig_ordered_blocks(
-                                t if sn == "all called blocks" else t[t.exact_genotype_usable == True], i, m, lab, sn, rows, "panel"),  # noqa: E712
+                self.figure(f"eval_block_{metric}_{slug}", "Ordered block performance", ["block_evaluation", "block_metric_summary"] + ld,
+                            lambda t, sm, *l, m=metric, lab=label, sn=s: P.fig_ordered_blocks(
+                                t if sn == "all called blocks" else t[t.exact_genotype_usable == True], sm, i, m, lab, sn,  # noqa: E712
+                                rows, "panel", lengths=l[0] if l else None),
                             f"{label} per reported block, every block in model order, one row per experiment group "
                             f"({'; '.join(f'{p}: {", ".join(m)}' for p, m in c.panels)}); coverages dodged, medians black."
-                            f"{rule}{formula}{main} {denom}")
+                            f"{rule}{formula}{main} {count_caption(metric, 'block_metric_summary')} {denom}{lcap}")
         if c.has_headline:
             pass
         else:
             self.skip("eval_block_*_exact_genotype_usable", "no headline filters: EXACT_GENOTYPE_USABLE cannot be formed")
-        self.figure("eval_block_accuracy_heatmap", "Block accuracy", ["block_accuracy"],
-                    lambda t: P.fig_accuracy_heatmap(t, i, sets),
+        self.figure("eval_block_accuracy_heatmap", "Block accuracy", ["block_accuracy"] + ld,
+                    lambda t, *l: P.fig_accuracy_heatmap(t, i, sets, l[0] if l else None),
                     "Floor attainment (excess 0; for leave-zero-out and mosaic cells the floor is 0 wherever the truth is "
                     "spellable, so this is exactness) by block and coverage, all called blocks versus EXACT_GENOTYPE_USABLE "
-                    f"({EXACT_GENOTYPE_USABLE_RULE}). Cells: attained / denominator. {denom}")
-        self.figure("eval_block_accuracy_intervals", "Block accuracy", ["block_accuracy"],
-                    lambda t: P.fig_accuracy_intervals(t, i, sets),
+                    f"({EXACT_GENOTYPE_USABLE_RULE}). Cells: attained / denominator. {denom}{lcap}")
+        self.figure("eval_block_accuracy_intervals", "Block accuracy", ["block_accuracy"] + ld,
+                    lambda t, *l: P.fig_accuracy_intervals(t, i, sets, l[0] if l else None),
                     "The same rates as points with 95% Wilson intervals; numerators and denominators are in "
-                    "data/block_accuracy.tsv.")
+                    "data/block_accuracy.tsv." + lcap)
         if c.has_headline:
             self.figure("eval_filter_counts", "Headline-filter performance", ["filter_performance"],
                         lambda t: P.fig_filter_counts(t, i),
@@ -292,9 +311,10 @@ class Report:
             self.figure("eval_filter_catastrophic", "Headline-filter performance", ["filter_performance"],
                         lambda t: P.fig_filter_catastrophic(t, i, c.catastrophic_bp),
                         f"Catastrophic errors (excess >= {c.catastrophic_bp:g} bp) retained and filtered per sequence policy.")
-            self.figure("eval_filter_by_block", "Headline-filter performance", ["filter_performance"],
-                        lambda t: P.fig_filter_by_block(t, i),
-                        f"EXACT_GENOTYPE_USABLE ({EXACT_GENOTYPE_USABLE_RULE}) retention and precision by block and experiment.")
+            self.figure("eval_filter_by_block", "Headline-filter performance", ["filter_performance"] + ld,
+                        lambda t, *l: P.fig_filter_by_block(t, i, l[0] if l else None),
+                        f"EXACT_GENOTYPE_USABLE ({EXACT_GENOTYPE_USABLE_RULE}) retention and precision by block and experiment."
+                        + lcap)
         else:
             self.skip("eval_filter_*", "no headline filters in the outputs")
         self.figure("eval_gq_diagnostic", "GQ diagnostic", ["gq_diagnostic"],
@@ -331,9 +351,11 @@ class Report:
             classes = A.switch_class_order(c)
             note = ("A plan alternates each homologue between its two selected source templates (A and B) at the listed "
                     "boundaries; it does not draw a new donor at each switch.")
-            self.figure("mosaic_switch_map", "Mosaic switches", ["switch_map"], lambda t: P.fig_switch_map(t, i, classes),
+            ld, lcap = self._lengths()
+            self.figure("mosaic_switch_map", "Mosaic switches", ["switch_map"] + ld,
+                        lambda t, *l: P.fig_switch_map(t, i, classes, l[0] if l else None),
                         "Predefined truth switch boundaries per plan, from the supplied switch metadata. The symbols are "
-                        "truth-boundary annotations, not error observations. " + note)
+                        "truth-boundary annotations, not error observations. " + note + lcap)
             self.figure("mosaic_callability", "Mosaic switches", ["mosaic_callability"],
                         lambda t: P.fig_mosaic_callability(t, i, classes), "Call class by switch class and coverage. " + note)
             if c.evaluation is not None:
@@ -349,13 +371,14 @@ class Report:
                 for metric, label in A.METRICS:
                     if metric == "normalized_excess" and not c.has_normalization:
                         continue
-                    self.figure(f"mosaic_block_{metric}", "Mosaic switches", ["block_evaluation"],
-                                lambda t, m=metric, lab=label: P.fig_ordered_blocks(
-                                    t[t.switch_class.fillna("") != ""], i, m, lab, "all called blocks",
-                                    [(k, k) for k in classes], "switch_class", markers),
-                                f"{label} by block, one row per switch class. The switch symbols in the top margin are "
-                                "truth-boundary annotations from the switch metadata (triangle up: haplotype 1, down: "
-                                "haplotype 2, diamond: both), one per plan; they are not error observations. " + note)
+                    self.figure(f"mosaic_block_{metric}", "Mosaic switches", ["block_evaluation", "mosaic_block_metric_summary"] + ld,
+                                lambda t, sm, *l, m=metric, lab=label: P.fig_ordered_blocks(
+                                    t[t.switch_class.fillna("") != ""], sm, i, m, lab, "all called blocks",
+                                    [(k, k) for k in classes], "switch_class", markers, l[0] if l else None),
+                                f"{label} by block, one row per switch class. The switch symbols inside the top of each "
+                                "panel are truth-boundary annotations from the switch metadata (triangle up: haplotype 1, "
+                                "down: haplotype 2, diamond: both), one per plan; they are not error observations. "
+                                + count_caption(metric, "mosaic_block_metric_summary") + " " + note + lcap)
         # ---- phase
         sps = T["strict_phase_support"]
         self.figure("phase_callability", "Phase", ["phase_support"], lambda t: P.fig_phase_callability(t, i),
@@ -466,6 +489,14 @@ class Report:
                   "execution group" + (", modality" if c.modalities else "") + "); the genotyper records no host or "
                   "binary identity, so `execution_group` must distinguish machine, environment and comparable workload "
                   "conditions whenever runtime is compared.", ""]
+        if c.evaluation is not None:
+            lines.insert(len(lines) - 1,   # the definitions end with a blank line
+                         "- **Block counts (ordered block figures):** n and zero are coverage-specific: one label per "
+                         "coverage above each block, from `block_metric_summary.tsv` (n: called, evaluated, truth-defined, "
+                         "retained by the plotted set, non-missing; zero: among n, value exactly 0 - availability floor "
+                         "attained for excess and normalised excess, exact sequence distance zero for raw distance).")
+        if "block_lengths" in T:
+            lines.insert(len(lines) - 1, "- **Block length labels:** " + BLOCK_LENGTH_CAPTION)
         lines += ["## Figures", ""]
         section = None
         for sec, name, caption, data in self.figures:

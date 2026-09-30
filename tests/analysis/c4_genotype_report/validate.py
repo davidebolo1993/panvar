@@ -11,9 +11,11 @@ reconciliation.tsv, run_record.tsv (provenance) and validation.txt. Every output
      in-memory tables are discarded) is byte-identical to the original
   V5 modality: run metadata with modality=short-read for every run gives the same aggregates (plus the modality column)
      and byte-identical figures
-  V6 truth-free mode reads no truth input and draws no accuracy figure
-  V7 (with --reference-report) the same scientific values as an earlier report: every data/ table equal, after
-     applying --rename OLD=NEW column renames to the reference
+  V6 truth-free mode reads no truth input, draws no accuracy figure and shows no block-length information
+  V7 (with --reference-report) the same scientific values as an earlier report: every data/ table of the reference
+     equal, after applying --rename OLD=NEW column renames to it; the only tables it lacks are the --new-table ones
+  V8 block_lengths.tsv: recomputed independently from the evaluator tables the manifest lists (every truth1_bp and
+     truth2_bp of a row with both defined), and its minimum and maximum equal the C4 ranges in C4_TRUTH_ALLELE_RANGES
 Exit 1 on any failure.
 """
 import os
@@ -28,6 +30,12 @@ import c4_common as C
 
 lines = []
 
+# The observed C4 truth-allele length ranges (bp) of the evaluated dataset, per block: the expected values the report's
+# block labels must show. C4-specific, so they live here and never in the generic tool.
+C4_TRUTH_ALLELE_RANGES = {"ctx:0": (12306, 12402), "sv:1": (0, 7670), "ctx:2": (20576, 20927), "sv:3": (117, 420),
+                          "ctx:4": (325, 375), "sv:5": (0, 117), "ctx:6": (47951, 48003), "sv:7": (26346, 98187),
+                          "ctx:8": (14267, 14431), "sv:9": (0, 69), "ctx:10": (63396, 63467)}
+
 
 def report(ok, what):
     lines.append(("PASS " if ok else "FAIL ") + what)
@@ -40,10 +48,36 @@ def tree(d, sub):
     return {f: C.sha256(os.path.join(base, f)) for f in sorted(os.listdir(base))}
 
 
+def check_block_lengths(out, inputs):
+    """V8: the table against the evaluator tables themselves (read as text, parsed with float), and against the
+    expected C4 ranges."""
+    man = pd.read_csv(os.path.join(inputs, "evaluation_manifest.tsv"), sep="\t", dtype=str, keep_default_na=False)
+    vals = {}
+    for p in man.path:
+        e = pd.read_csv(os.path.join(inputs, p), sep="\t", dtype=str, keep_default_na=False)
+        for r in e.itertuples():
+            if r.truth1_bp not in ("NA", "") and r.truth2_bp not in ("NA", ""):
+                vals.setdefault(r.block_id, []).extend([float(r.truth1_bp), float(r.truth2_bp)])
+    t = pd.read_csv(os.path.join(out, "data", "block_lengths.tsv"), sep="\t", dtype=str, keep_default_na=False).set_index("block_id")
+    same = sorted(t.index) == sorted(vals) and all(
+        int(t.loc[b, "truth_allele_observations"]) == len(v) and float(t.loc[b, "truth_allele_bp_min"]) == min(v)
+        and float(t.loc[b, "truth_allele_bp_max"]) == max(v) and float(t.loc[b, "truth_allele_bp_median"]) == float(np.median(v))
+        for b, v in vals.items())
+    ok = report(same, f"V8 block_lengths.tsv ({len(t)} blocks, {sum(len(v) for v in vals.values())} truth-allele "
+                      f"observations) equals an independent recomputation from the {len(man)} evaluator tables")
+    got = {b: (float(t.loc[b, "truth_allele_bp_min"]), float(t.loc[b, "truth_allele_bp_max"])) for b in t.index}
+    bad = [b for b, r in C4_TRUTH_ALLELE_RANGES.items() if got.get(b) != r]
+    ok &= report(not bad and len(got) == len(C4_TRUTH_ALLELE_RANGES),
+                 f"V8 the minimum and maximum of all {len(C4_TRUTH_ALLELE_RANGES)} blocks equal the expected C4 ranges; "
+                 f"differing: {bad or 'none'}; labels: " + ", ".join(f"{b} {t.loc[b, 'displayed_length_range']}" for b in t.index))
+    return ok
+
+
 def main():
     p = C.parser(__doc__.split("\n")[0])
     p.add_argument("--reference-report", help="an earlier report directory whose data/ values must be reproduced")
     p.add_argument("--rename", action="append", default=[], help="OLD=NEW: a column renamed since the reference report")
+    p.add_argument("--new-table", action="append", default=[], help="NAME: a data table added since the reference report")
     args = p.parse_args()
     repo, results = C.roots(args)
     sys.path.insert(0, os.path.join(repo, "scripts"))
@@ -147,18 +181,27 @@ def main():
     ok &= report(not acc and not truth_read and truth_free and not os.path.exists(os.path.join(q.out, "data", "block_evaluation.tsv")),
                  f"V6 truth-free run: {len(names)} figures, no accuracy figure, no truth input read "
                  f"({len(qin[qin.kind == 'input'])} inputs, all package or run metadata), {len(q.skipped)} skipped with reasons")
+    with open(os.path.join(q.out, "report.md")) as fh:
+        qtext = fh.read()
+    ok &= report(not os.path.exists(os.path.join(q.out, "data", "block_lengths.tsv")) and "truth-allele" not in qtext
+                 and not any("block_lengths" in ds for _, _, _, ds in q.figures),
+                 "V6 truth-free run: no block_lengths.tsv, no figure drawn from it, no block-length text in report.md")
     if args.reference_report:
         ref = os.path.join(os.path.abspath(args.reference_report), "data")
         renames = dict(r.split("=", 1) for r in args.rename)
+        new = sorted(n + ".tsv" for n in args.new_table)
         fr, fa = sorted(os.listdir(ref)), sorted(os.listdir(os.path.join(a.out, "data")))
         differ = []
-        for f in fa:
-            x = pd.read_csv(os.path.join(ref, f), sep="\t", dtype=str, keep_default_na=False).rename(columns=renames) if f in fr else None
-            y = pd.read_csv(os.path.join(a.out, "data", f), sep="\t", dtype=str, keep_default_na=False)
-            if x is None or not x.equals(y):
+        for f in fr:
+            x = pd.read_csv(os.path.join(ref, f), sep="\t", dtype=str, keep_default_na=False).rename(columns=renames)
+            y = pd.read_csv(os.path.join(a.out, "data", f), sep="\t", dtype=str, keep_default_na=False) if f in fa else None
+            if y is None or not x.equals(y):
                 differ.append(f)
-        ok &= report(fr == fa and not differ, f"V7 all {len(fa)} data tables equal the reference report "
-                     f"{args.reference_report} after renames {renames or 'none'}; differing: {differ or 'none'}")
+        added = sorted(set(fa) - set(fr))
+        ok &= report(not differ and added == new, f"V7 all {len(fr)} data tables of the reference report "
+                     f"{args.reference_report} are present and equal after renames {renames or 'none'} (differing: "
+                     f"{differ or 'none'}); tables added: {added or 'none'}, declared new: {new or 'none'}")
+    ok &= check_block_lengths(a.out, inputs)
     after = {p: C.sha256(p) for p in inputs_before}
     ok &= report(after == inputs_before, f"V1 all {len(after)} input files unchanged after five runs")
     ok &= report(C.verify_seals(results), "V1 every seal verifies after the runs")

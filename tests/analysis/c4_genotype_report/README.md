@@ -7,7 +7,7 @@ sealed C4 tables. They never genotype, and they only read the sealed packages.
 | script | role |
 |---|---|
 | `build_inputs.py` | Verifies the seals, then joins the sealed sources into `<work-dir>/inputs`: a truth-free package, the run metadata, an evaluator manifest and the mosaic switch plans. |
-| `validate.py` | Writes the report to `<work-dir>/report`, then runs the gates: determinism, reconciliation, redraw from `data/`, modality, truth-free mode, and unchanged inputs and seals. It writes `run_record.tsv` and `validation.txt`. |
+| `validate.py` | Writes the report to `<work-dir>/report`, then runs the gates: determinism, reconciliation, redraw from `data/`, modality, truth-free mode, block lengths (recomputed independently and compared with the expected C4 ranges), and unchanged inputs and seals. With `--reference-report`, it also checks value identity with an earlier report; `--new-table` names each table added since then. It writes `run_record.tsv` and `validation.txt`. |
 | `reconcile.py` | Checks the report's `data/` against the 484-job campaign, the 649-cell replay package, the headline audit and the phase evaluation. |
 | `c4_common.py` | Roots, seals, re-rooting of recorded paths, and provenance. |
 
