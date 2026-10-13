@@ -574,13 +574,47 @@ void classify_repair_scope(RepairResult& res, CensusRoute route) {
         res.serialization_representative = false;
         return;
     }
-    if (res.diplotype_scope == "COMPLETE") {
+    // Search coverage is not uniqueness. When the allocation-equivalence set holds more than one distinct unordered
+    // spelled genotype, the chosen arrangement only serialises the set: the dosage content is resolved, the diplotype is
+    // not, so the block is conditional content even though the candidate enumeration (diplotype_scope) and the
+    // allocation-equivalence coverage stay COMPLETE.
+    if (res.diplotype_scope == "COMPLETE" && !res.representative_only) {
         res.repair_class = "COMPLETE_DIPLOTYPE_REPAIR";
-        res.serialization_representative = res.representative_only;
+        res.serialization_representative = false;
     } else {
         res.repair_class = "CONDITIONAL_DOSAGE_CONTENT";
         res.serialization_representative = true;   // the exact allele sequences and allocation are not authoritative
+        if (res.diplotype_scope == "COMPLETE") res.reason = "unresolved_allocation_equivalence_set";
     }
+}
+
+bool resolved_diplotype_repair(const RepairResult& res) {
+    return res.repair_class == "COMPLETE_DIPLOTYPE_REPAIR" && !res.serialization_representative;
+}
+
+const char* repaired_alleles_role(const RepairResult& res) {
+    return resolved_diplotype_repair(res) ? "RESOLVED" : "REPRESENTATIVE_ONLY_NOT_RESOLVED";
+}
+
+DosageStatus repair_dosage_status(const RepairResult& res) {
+    return res.repair_class == "COMPLETE_DIPLOTYPE_REPAIR"    ? DosageStatus::Repaired
+         : res.repair_class == "CONDITIONAL_DOSAGE_CONTENT" ? DosageStatus::ContentRepaired
+                                                             : DosageStatus::TriggeredUnrepaired;
+}
+
+std::string repaired_block_alleles_fasta(const std::vector<std::pair<std::string, RepairResult>>& repairs) {
+    std::ostringstream o;
+    for (const auto& [block_id, r] : repairs) {
+        if (r.outcome != "REPAIRED" || r.chosen < 0) continue;
+        const BlockCandidate& c = r.candidates[static_cast<std::size_t>(r.chosen)];
+        for (int h = 0; h < 2; ++h) {
+            const std::string& seq = h == 0 ? c.ctx1_sequence : c.ctx2_sequence;
+            o << '>' << sha256_hex(seq) << " block=" << block_id << " homologue=" << (h == 0 ? "hap1" : "hap2") << " bp=" << seq.size()
+              << " repair_class=" << r.repair_class << " role=" << repaired_alleles_role(r) << '\n';
+            for (std::size_t at = 0; at < seq.size(); at += 60) o << seq.substr(at, 60) << '\n';
+        }
+    }
+    return o.str();
 }
 
 void choose_repair(RepairResult& res, CensusRoute route, double tie_tolerance_nats) {

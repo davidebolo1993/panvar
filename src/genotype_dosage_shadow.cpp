@@ -193,8 +193,7 @@ DosageShadowSummary run_dosage_shadow(const PreparedGenotypeModel& model, const 
             if (r.outcome == "SPACE_AUDIT") continue;
             // COMPLETE_DIPLOTYPE_REPAIR replaces nothing here (shadow) but is a resolved repair; CONDITIONAL_DOSAGE_CONTENT
             // corrects the dosage content only, and must never read as a resolved allele call
-            ba.status = r.repair_class == "COMPLETE_DIPLOTYPE_REPAIR" ? DosageStatus::Repaired
-                      : r.repair_class == "CONDITIONAL_DOSAGE_CONTENT" ? DosageStatus::ContentRepaired : DosageStatus::TriggeredUnrepaired;
+            ba.status = repair_dosage_status(r);
             ba.reason = r.reason;
             if (r.outcome == "REPAIRED") { ++summary.repairs; if (r.scope == "CONDITIONAL") ++summary.repairs_conditional; }
             ++summary.repair_classes[r.repair_class];
@@ -330,6 +329,7 @@ DosageShadowSummary run_dosage_shadow(const PreparedGenotypeModel& model, const 
                 }
                 cr.fragment_term = c->fragment_term; cr.exposure_term = c->exposure_term; cr.likelihood = c->likelihood;
                 cr.prior = prior; cr.repair_separation = r->repair_separation; cr.orientation_tie = r->orientation_tie;
+                cr.serialization_representative = r->serialization_representative;
                 for (const BlockCandidate& alt : r->candidates) {
                     if (&alt == c) continue;
                     cr.alternatives.push_back({alt.ctx1_sequence, alt.ctx2_sequence, alt.fragment_term});
@@ -375,7 +375,7 @@ DosageShadowSummary run_dosage_shadow(const PreparedGenotypeModel& model, const 
         if (r) {
             o << '\t' << r->repair_class << '\t' << r->dosage_content_scope << '\t' << r->diplotype_scope << '\t' << r->allocation_equivalence_scope
               << '\t' << (r->serialization_representative ? "true" : "false") << '\t'
-              << (!c ? "NA" : r->repair_class == "COMPLETE_DIPLOTYPE_REPAIR" && !r->serialization_representative ? "RESOLVED" : "REPRESENTATIVE_ONLY_NOT_RESOLVED");
+              << (!c ? "NA" : repaired_alleles_role(*r));
         } else {
             o << "\tNA\tNA\tNA\tNA\tfalse\tNA";
         }
@@ -430,11 +430,10 @@ DosageShadowSummary run_dosage_shadow(const PreparedGenotypeModel& model, const 
                             << " repair_class=" << r.repair_class << " dosage_content_scope=" << r.dosage_content_scope << " diplotype_scope="
                             << r.diplotype_scope << " allocation_equivalence_scope=" << r.allocation_equivalence_scope << " repair_scope=" << r.scope
                             << " allocation_status=" << allocation_status.at(b).first;
+                repaired_fa << " role=" << repaired_alleles_role(r);
                 if (r.serialization_representative) {
-                    repaired_fa << " role=REPRESENTATIVE_ONLY_NOT_RESOLVED equivalence_set=" << out_prefix << ".dosage_allocation_equivalence.tsv#"
-                                << block_id << " equivalence_size=" << r.allocation_tie;
-                } else {
-                    repaired_fa << " role=RESOLVED";
+                    repaired_fa << " equivalence_set=" << out_prefix << ".dosage_allocation_equivalence.tsv#" << block_id
+                                << " equivalence_size=" << r.allocation_tie;
                 }
                 repaired_fa << '\n';
                 for (std::size_t at = 0; at < full.size(); at += 60) repaired_fa << full.substr(at, 60) << '\n';
@@ -469,20 +468,7 @@ DosageShadowSummary run_dosage_shadow(const PreparedGenotypeModel& model, const 
             }
         }
         atomic_write(out_prefix + ".dosage_repaired.fa", repaired_fa.str());
-        std::ostringstream bfa;
-        for (const auto& entry : repairs) {
-            const RepairResult& r = entry.second;
-            if (r.outcome != "REPAIRED" || r.chosen < 0) continue;
-            const BlockCandidate& c = r.candidates[static_cast<std::size_t>(r.chosen)];
-            for (int h = 0; h < 2; ++h) {
-                const std::string& seq = h == 0 ? c.ctx1_sequence : c.ctx2_sequence;
-                bfa << '>' << sha256_hex(seq) << " block=" << entry.first << " homologue=" << (h == 0 ? "hap1" : "hap2") << " bp=" << seq.size()
-                    << " repair_class=" << r.repair_class << " role="
-                    << (r.serialization_representative ? "REPRESENTATIVE_ONLY_NOT_RESOLVED" : "RESOLVED") << '\n';
-                for (std::size_t at = 0; at < seq.size(); at += 60) bfa << seq.substr(at, 60) << '\n';
-            }
-        }
-        atomic_write(out_prefix + ".dosage_repaired_block_alleles.fa", bfa.str());
+        atomic_write(out_prefix + ".dosage_repaired_block_alleles.fa", repaired_block_alleles_fasta(repairs));
         atomic_write(out_prefix + ".dosage_original.fa", original_fa.str());
         atomic_write(out_prefix + ".dosage_provenance.tsv", pv.str());
         atomic_write(out_prefix + ".dosage_provenance_panel.tsv", searched.str());

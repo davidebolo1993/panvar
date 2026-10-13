@@ -418,7 +418,10 @@ DosageIntegration apply_dosage_mode(const PreparedGenotypeModel* model, const st
             return false;
         };
         for (const CompleteRepair& r : summary->complete_repairs) {
-            if (!refuse.empty()) refused[r.block_id] = refuse;
+            // Defence in depth: a serialization representative of an unresolved allocation-equivalence set is never a
+            // resolved diplotype, whatever its class says; it is refused before any other check and never applied.
+            if (r.serialization_representative) refused[r.block_id] = "unresolved_allocation_equivalence_set";
+            else if (!refuse.empty()) refused[r.block_id] = refuse;
             else if (!r.allele1 || !r.allele2) refused[r.block_id] = "repaired_allele_not_a_panel_allele";
             else if (model && !(carried(r.block, *r.allele1) && carried(r.block, *r.allele2))) {
                 // Defence in depth: both repaired alleles must be carried by a retained panel template (the active,

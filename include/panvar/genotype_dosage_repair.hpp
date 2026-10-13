@@ -170,10 +170,23 @@ RepairResult repair_block(const BlockAudit& audit, const CensusBlock& census, co
 // repeated-unit route the panel-structure allocation within one content multiset. Sets outcome/reason on a tie.
 void choose_repair(RepairResult& result, CensusRoute route, double tie_tolerance_nats);
 // The split completeness fields and the repair class, from the outcome, the scope and the full-library content count.
+// COMPLETE_DIPLOTYPE_REPAIR requires a complete enumeration and a single member in the allocation-equivalence set; a
+// complete enumeration whose set has several distinct unordered genotypes is CONDITIONAL_DOSAGE_CONTENT.
 void classify_repair_scope(RepairResult& result, CensusRoute route);
+// True only for a COMPLETE_DIPLOTYPE_REPAIR that is not a serialization representative: the one result whose alleles
+// may be reported as resolved.
+bool resolved_diplotype_repair(const RepairResult& result);
+// RESOLVED for a resolved diplotype repair, REPRESENTATIVE_ONLY_NOT_RESOLVED for every other chosen arrangement.
+const char* repaired_alleles_role(const RepairResult& result);
+// The block's dosage status after a repair: REPAIRED for COMPLETE_DIPLOTYPE_REPAIR, CONTENT_REPAIRED for
+// CONDITIONAL_DOSAGE_CONTENT, TRIGGERED_UNREPAIRED otherwise.
+DosageStatus repair_dosage_status(const RepairResult& result);
 
 std::string repair_candidates_table(const std::vector<std::pair<std::string, RepairResult>>& repairs);
 std::string repair_blocks_table(const std::vector<std::pair<std::string, RepairResult>>& repairs);
+// The dosage diagnostic FASTA of each repair's chosen block sequences (<out>.dosage_repaired_block_alleles.fa), with
+// the repair class and the role of the alleles in every header.
+std::string repaired_block_alleles_fasta(const std::vector<std::pair<std::string, RepairResult>>& repairs);
 
 std::string sha256_hex(const std::string& bytes);
 
@@ -277,6 +290,8 @@ struct CompleteRepair {
     std::optional<std::size_t> allele1, allele2;
     double fragment_term = 0.0, exposure_term = 0.0, likelihood = 0.0, prior = 0.0, repair_separation = 0.0;
     bool orientation_tie = false;
+    // the result only serialises an unresolved allocation-equivalence set; repair mode never applies such a result
+    bool serialization_representative = false;
     // every other scored repair candidate at this block (its block sequences and fragment term), for the read-support
     // rule of the reported repaired genotype
     struct Alternative { std::string seq1, seq2; double fragment_term = 0.0; };

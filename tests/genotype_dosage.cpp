@@ -563,6 +563,204 @@ void test_repair_mode_integration() {
     std::filesystem::remove_all(dir);
 }
 
+// The dosage block row the stage writes for sv:1 from a classified repair: the fields integration and the headline read.
+void write_dosage_row(const PreparedGenotypeModel& m, const std::string& prefix, const RepairResult& r) {
+    std::string db = "block_id\tdosage_status\tdosage_reason\trepair_class\torientation_tie\tdosage_content_scope\tdiplotype_scope\t"
+                     "allocation_equivalence_scope\tserialization_representative\trepaired_alleles_role\tallocation_status\n";
+    for (std::size_t b = 0; b < m.blocks().size(); ++b) {
+        if (b != 1) { db += m.blocks()[b].block_id + "\tNOT_SENSITIVE\tnone\tNA\tfalse\tNA\tNA\tNA\tfalse\tNA\tNOT_APPLICABLE\n"; continue; }
+        db += m.blocks()[b].block_id + "\t" + dosage_status_name(repair_dosage_status(r)) + "\t" + r.reason + "\t" + r.repair_class + "\tfalse\t" +
+              r.dosage_content_scope + "\t" + r.diplotype_scope + "\t" + r.allocation_equivalence_scope + "\t" +
+              (r.serialization_representative ? "true" : "false") + "\t" + repaired_alleles_role(r) + "\tUNRESOLVED\n";
+    }
+    atomic_write(prefix + ".dosage_blocks.tsv", db);
+}
+
+// An unresolved allocation-equivalence set (repeated-unit route, complete dosage content, complete candidate
+// enumeration, two allocation-equivalent distinct unordered genotypes) is conditional content: never a resolved
+// diplotype, never in the primary block tables or FASTA, labelled REPRESENTATIVE_ONLY_NOT_RESOLVED in the dosage
+// diagnostics. Plus the integration guard against a misclassified COMPLETE_DIPLOTYPE_REPAIR representative.
+void test_unresolved_allocation() {
+    const PreparedGenotypeModel m = two_template_model(13);
+    const std::size_t a = allele_id(m, 1, "a"), b = allele_id(m, 1, "b"), c = allele_id(m, 2, "c"), d = allele_id(m, 2, "d");
+    const std::string sa = m.blocks()[1].alleles[a].sequence, sb = m.blocks()[1].alleles[b].sequence;
+    // two arrangements of one content multiset, equal panel prior and likelihood: the set has two distinct genotypes
+    const auto tied_result = [&](const std::string& scope) {
+        RepairResult r;
+        r.route = "repeated_unit";
+        r.scope = scope;                 // COMPLETE: complete candidate enumeration
+        r.content_complete = true;       // complete dosage content
+        r.candidates = {cand(sa, sb, -10.0, "AB", {1, 1, 2}, -1.0, 0), cand(sb, sb, -10.0, "AB", {1, 1, 2}, -1.0, 1)};
+        r.candidates[0].ctx1_id = "00"; r.candidates[0].ctx2_id = "01";   // the smallest canonical pair serialises the set
+        r.candidates[1].ctx1_id = "01"; r.candidates[1].ctx2_id = "01";
+        r.candidates[0].units_a = {0}; r.candidates[0].units_b = {1, 2};
+        r.candidates[1].units_a = {1}; r.candidates[1].units_b = {0, 2};
+        choose_repair(r, CensusRoute::RepeatedUnit, 1e-9);
+        classify_repair_scope(r, CensusRoute::RepeatedUnit);
+        return r;
+    };
+    const RepairResult r = tied_result("COMPLETE");
+    require(r.outcome == "REPAIRED" && r.chosen == 0 && r.allocation_tie == 2 && r.representative_only,
+            "fixture: a complete enumeration whose allocation-equivalence set has two distinct genotypes");
+    require(r.repair_class == "CONDITIONAL_DOSAGE_CONTENT", "an unresolved allocation-equivalence set is CONDITIONAL_DOSAGE_CONTENT, got " + r.repair_class);
+    require(r.serialization_representative && !resolved_diplotype_repair(r) &&
+                std::string(repaired_alleles_role(r)) == "REPRESENTATIVE_ONLY_NOT_RESOLVED",
+            "the representative is labelled REPRESENTATIVE_ONLY_NOT_RESOLVED");
+    require(r.dosage_content_scope == "COMPLETE" && r.diplotype_scope == "COMPLETE" && r.allocation_equivalence_scope == "COMPLETE",
+            "search and content coverage stay COMPLETE: coverage is not uniqueness");
+    require(r.reason == "unresolved_allocation_equivalence_set", "the reason names the unresolved set");
+    require(repair_dosage_status(r) == DosageStatus::ContentRepaired, "the block's dosage status is CONTENT_REPAIRED");
+    {   // controls: a single arrangement, and the pair route, stay complete and resolved
+        RepairResult one;
+        one.route = "repeated_unit"; one.scope = "COMPLETE"; one.content_complete = true;
+        one.candidates = {cand(sa, sb, -10.0, "AB", {1, 1, 2}, -1.0, 0), cand(sb, sb, -12.0, "AB", {1, 1, 2}, -1.0, 1)};
+        choose_repair(one, CensusRoute::RepeatedUnit, 1e-9);
+        classify_repair_scope(one, CensusRoute::RepeatedUnit);
+        require(one.repair_class == "COMPLETE_DIPLOTYPE_REPAIR" && !one.serialization_representative && resolved_diplotype_repair(one) &&
+                    std::string(repaired_alleles_role(one)) == "RESOLVED" && repair_dosage_status(one) == DosageStatus::Repaired,
+                "a single allocation is a resolved complete repair");
+        RepairResult pr;
+        pr.route = "pair"; pr.scope = "COMPLETE";
+        pr.candidates = {cand(sa, sb, -10.0, "AB"), cand(sb, sa, -10.0, "BA")};
+        choose_repair(pr, CensusRoute::Pair, 1e-9);
+        classify_repair_scope(pr, CensusRoute::Pair);
+        require(pr.repair_class == "COMPLETE_DIPLOTYPE_REPAIR" && !pr.serialization_representative && pr.allocation_equivalence_scope == "NOT_APPLICABLE",
+                "a pair-route repair with an orientation tie only is still a resolved complete repair");
+        const RepairResult cond = tied_result("CONDITIONAL");
+        require(cond.repair_class == "CONDITIONAL_DOSAGE_CONTENT" && cond.reason == "none" && cond.diplotype_scope == "CONDITIONAL",
+                "a conditional enumeration keeps its class and reason");
+    }
+    // the dosage diagnostics carry the representative, and only with its label
+    const std::vector<std::pair<std::string, RepairResult>> repairs = {{"sv:1", r}};
+    const std::string bfa = repaired_block_alleles_fasta(repairs);
+    require(bfa.find("role=REPRESENTATIVE_ONLY_NOT_RESOLVED") != std::string::npos && bfa.find("role=RESOLVED") == std::string::npos &&
+                bfa.find("repair_class=CONDITIONAL_DOSAGE_CONTENT") != std::string::npos,
+            "dosage_repaired_block_alleles.fa labels the representative REPRESENTATIVE_ONLY_NOT_RESOLVED");
+    {
+        std::string bases;
+        std::istringstream in(bfa);
+        for (std::string l; std::getline(in, l);) bases += l.empty() || l[0] == '>' ? "\n" : l;
+        require(bases.find(sb) != std::string::npos, "the representative's sequence is in the dosage diagnostic FASTA");
+    }
+    require(repair_blocks_table(repairs).find("\tCONDITIONAL_DOSAGE_CONTENT\tCOMPLETE\tCOMPLETE\tCOMPLETE\ttrue\t") != std::string::npos,
+            "dosage_repairs.tsv: conditional class, complete coverage scopes, serialization representative");
+    require(repair_candidates_table(repairs).find("\ttrue\tREPRESENTATIVE_ONLY_NOT_RESOLVED\n") != std::string::npos,
+            "dosage_repair_candidates.tsv: the chosen row is REPRESENTATIVE_ONLY_NOT_RESOLVED");
+
+    const std::filesystem::path dir = std::filesystem::temp_directory_path() / ("panvar_dosage_unresolved_" + std::to_string(::getpid()));
+    std::filesystem::create_directories(dir);
+    const MosaicPath h1{{0, a, c}}, h2{{0, a, d}};   // the caller's sv:1 is a/a; the representative is a/b
+    const std::vector<std::string> legacy = {".genotypes.tsv", ".block_genotypes.tsv", ".mosaic_haplotypes.fa", ".mosaic_status.tsv",
+                                             ".equivalence_set.tsv"};
+    const std::string represented = spell_mosaic(m, MosaicPath{{0, b, d}}).bases;
+    for (const std::string mode : {"repair", "audit", "off"}) {
+        const std::string p = (dir / mode).string();
+        write_synthetic_run(m, p, h1, h2, "COMPLETE", "NA", "NA");
+        write_dosage_row(m, p, r);
+        std::map<std::string, std::string> before;
+        for (const std::string& s : legacy) before[s] = slurp_file(p + s);
+        // the stage records a CompleteRepair only for COMPLETE_DIPLOTYPE_REPAIR: this block contributes none
+        DosageShadowSummary summary;
+        require(r.repair_class != "COMPLETE_DIPLOTYPE_REPAIR", mode + ": no complete repair is recorded");
+        const DosageIntegration done = apply_dosage_mode(&m, mode, p, p, &summary, "COMPLETE", "none");
+        require(done.applied.empty() && done.not_applied.empty() && done.audit_not_applied.empty(), mode + ": nothing is applied or refused");
+        const std::string fa = slurp_file(p + ".mosaic_haplotypes.fa");
+        require(fa == before[".mosaic_haplotypes.fa"], mode + ": the primary haplotype FASTA is unchanged");
+        require(fa.find("dosage_repair_role=RESOLVED") == std::string::npos && fa.find("RESOLVED") == std::string::npos,
+                mode + ": no primary FASTA header claims a resolved repair");
+        {
+            std::string bases;
+            std::istringstream in(fa);
+            for (std::string l; std::getline(in, l);) if (l.empty() || l[0] != '>') bases += l;
+            require(bases.find(represented) == std::string::npos, mode + ": the representative haplotype is not in the primary FASTA");
+        }
+        for (const char* table : {".block_genotypes.tsv", ".genotypes.tsv"}) {
+            auto row = block_row(p + table, "sv:1");
+            require(row["allele1"] == std::to_string(a) && row["allele2"] == std::to_string(a), mode + table + ": the caller's alleles stay");
+            if (mode != "repair") continue;   // audit and off add no dosage columns to the caller's tables
+            require(row["repair_class"] == "CONDITIONAL_DOSAGE_CONTENT" && row["dosage_repair_applied"] == "NA" &&
+                        row["serialization_representative"] == "true" && row["dosage_content_scope"] == "COMPLETE" &&
+                        row["dosage_stage_filter"] == "DOSAGE_CONTENT_CORRECTED" &&
+                        row["dosage_stage_filter_reason"] == "unresolved_allocation_equivalence_set",
+                    mode + table + ": the conditional-content dosage fields");
+        }
+        if (mode == "off") {
+            for (const std::string& s : legacy) require(slurp_file(p + s) == before[s], "off leaves " + s + " byte-identical");
+        } else if (mode == "audit") {
+            for (const std::string& s : legacy) require(slurp_file(p + s) == before[s], "audit leaves " + s + " byte-identical");
+        } else {
+            // repair mode annotates the block tables and the status; the FASTA and the search record are the caller's
+            for (const std::string& s : legacy) require(slurp_file(p + ".original" + s) == before[s], "repair: original" + s + " is the caller's file");
+            require(slurp_file(p + ".equivalence_set.tsv") == before[".equivalence_set.tsv"], "repair: the search record is not rewritten");
+            const std::string st = slurp_file(p + ".mosaic_status.tsv");
+            require(st.find("dosage_reported_genotype\tcaller\n") != std::string::npos && st.find("dosage_content_corrected_blocks\tsv:1\n") != std::string::npos &&
+                        st.find("dosage_repaired_blocks\tnone\n") != std::string::npos,
+                    "repair: the status reports the caller's genotype and a content correction at sv:1");
+        }
+        write_locus_genotype(&m, p, done);
+        if (mode == "off") {
+            require_headline(p, "sv:1", "PASS", "none", "NOT_EVALUATED", "DOSAGE_NOT_EVALUATED:dosage_mode_off", "off: unresolved-allocation headline ");
+            continue;
+        }
+        // conditional content: the content is authoritative within the model, the exact diplotype is not resolved
+        require_headline(p, "sv:1", "LOW_QUALITY", "EXACT_DIPLOTYPE_UNRESOLVED", "PASS", "CONTENT_CORRECTED_EXACT_DIPLOTYPE_UNRESOLVED",
+                         mode + ": unresolved-allocation headline ");
+        std::map<std::string, std::string> v;
+        {
+            std::istringstream l(slurp_file(p + ".locus_genotype.tsv"));
+            std::string h, row;
+            std::getline(l, h); std::getline(l, row);
+            std::stringstream hs(h), rs(row);
+            std::vector<std::string> head, cells;
+            for (std::string x; std::getline(hs, x, '\t');) head.push_back(x);
+            for (std::string x; std::getline(rs, x, '\t');) cells.push_back(x);
+            for (std::size_t i = 0; i < head.size() && i < cells.size(); ++i) v[head[i]] = cells[i];
+        }
+        require(v["reported_genotype_source"] == "caller" && v["dosage_complete_class_blocks"] == "0" &&
+                    v["dosage_complete_applied_blocks"] == "0" && v["dosage_content_corrected_block_ids"] == "sv:1" &&
+                    v["locus_repair_scope"] == "CONDITIONAL",
+                mode + ": the locus reports the caller's genotype, no complete repair and a content correction at sv:1");
+        require(v["hap2_sha256"] == sha256_bytes(spell_mosaic(m, h2).bases), mode + ": the locus haplotype is the caller's");
+    }
+    {   // defence in depth: a misclassified COMPLETE_DIPLOTYPE_REPAIR that is a serialization representative is refused
+        for (const std::string mode : {"repair", "audit"}) {
+            const std::string p = (dir / ("misclassified_" + mode)).string();
+            write_synthetic_run(m, p, h1, h2, "COMPLETE", "REPAIRED", "COMPLETE_DIPLOTYPE_REPAIR");
+            std::map<std::string, std::string> before;
+            for (const std::string& s : legacy) before[s] = slurp_file(p + s);
+            CompleteRepair cr;
+            cr.block = 1; cr.block_id = "sv:1"; cr.route = "repeated_unit";
+            cr.seq1 = sa; cr.seq2 = sb; cr.allele1 = a; cr.allele2 = b;   // panel alleles: every other guard would pass
+            cr.fragment_term = -7; cr.exposure_term = -1; cr.prior = -2; cr.repair_separation = 0.5;
+            cr.serialization_representative = true;
+            DosageShadowSummary summary;
+            summary.complete_repairs = {cr};
+            const DosageIntegration done = apply_dosage_mode(&m, mode, p, p, &summary, "COMPLETE", "none");
+            const auto& refused = mode == "repair" ? done.not_applied : done.audit_not_applied;
+            require(done.applied.empty() && refused == std::map<std::string, std::string>{{"sv:1", "unresolved_allocation_equivalence_set"}},
+                    mode + ": a misclassified representative is refused as unresolved_allocation_equivalence_set");
+            const std::string fa = slurp_file(p + ".mosaic_haplotypes.fa");
+            require(fa == before[".mosaic_haplotypes.fa"] && fa.find("dosage_repair_role=RESOLVED") == std::string::npos,
+                    mode + ": the primary FASTA is unchanged and never says dosage_repair_role=RESOLVED");
+            require(block_row(p + ".block_genotypes.tsv", "sv:1")["allele2"] == std::to_string(a), mode + ": the caller's genotype stays");
+            write_locus_genotype(&m, p, done);
+            require_headline(p, "sv:1", "LOW_QUALITY", "EXACT_DIPLOTYPE_UNRESOLVED", "LOW_QUALITY",
+                             "COMPLETE_REPAIR_NOT_APPLIED:unresolved_allocation_equivalence_set", mode + ": misclassified representative headline ");
+        }
+        // the guard takes precedence over run-level eligibility too: the reason is the representative's
+        const std::string p = (dir / "misclassified_equivalent").string();
+        write_synthetic_run(m, p, h1, h2, "CONDITIONAL_GENOTYPE_EQUIVALENT", "REPAIRED", "COMPLETE_DIPLOTYPE_REPAIR");
+        CompleteRepair cr;
+        cr.block = 1; cr.block_id = "sv:1"; cr.seq1 = sa; cr.seq2 = sb; cr.allele1 = a; cr.allele2 = b; cr.serialization_representative = true;
+        DosageShadowSummary summary;
+        summary.complete_repairs = {cr};
+        const DosageIntegration done = apply_dosage_mode(&m, "repair", p, p, &summary, "COMPLETE", "none");
+        require(done.applied.empty() && done.not_applied.at("sv:1") == "unresolved_allocation_equivalence_set",
+                "the representative guard is checked before run-level eligibility");
+    }
+    std::filesystem::remove_all(dir);
+}
+
 int main() {
     try {
         test_python_random_and_quantile();
@@ -575,6 +773,7 @@ int main() {
         test_provenance();
         test_template_switches();
         test_repair_mode_integration();
+        test_unresolved_allocation();
     } catch (const std::exception& e) {
         std::cerr << "FAIL: exception " << e.what() << '\n';
         return 1;

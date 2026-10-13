@@ -58,8 +58,8 @@ This runs `--preset short-read`, the default preset. Settings are applied in a f
 | `repair` | as `audit`, and applies each eligible complete diplotype repair; the caller's outputs are kept as `<prefix>.original.*` |
 
 A dosage-sensitive block ends in one of four states:
-- **Complete diplotype repair** (`COMPLETE_DIPLOTYPE_REPAIR`): the repaired content and diplotype are complete within the declared model and search scope. "Complete" describes that scope, not biological truth. In repair mode it is applied when the run is a strict call, it is the only one at the locus, the reported haplotypes reproduce, and both repaired alleles belong to the active panel; otherwise the reason it was not applied is recorded. When several repeated-unit arrangements fit equally, the result keeps this class with `serialization_representative=true`, and its allocation is not resolved.
-- **Conditional dosage content** (`CONDITIONAL_DOSAGE_CONTENT`): the corrected copy numbers are determined but the arrangement is not. The reported alleles stay the caller's. A representative arrangement is written only to `<prefix>.dosage_repaired.fa`, labelled `REPRESENTATIVE_ONLY_NOT_RESOLVED`.
+- **Complete diplotype repair** (`COMPLETE_DIPLOTYPE_REPAIR`): the repaired content is complete and the diplotype is uniquely resolved within the declared model and search: the enumeration is complete and, for repeated units, only one arrangement fits. "Complete" describes that scope, not biological truth. In repair mode it replaces the caller's block only when the run is a strict call, it is the only one at the locus, the reported haplotypes reproduce, and both repaired alleles belong to the active panel; otherwise the reason it was not applied is recorded.
+- **Conditional dosage content** (`CONDITIONAL_DOSAGE_CONTENT`): the corrected copy numbers are determined but the diplotype is not. This includes an unresolved allocation-equivalence set (`dosage_reason=unresolved_allocation_equivalence_set`): several distinct arrangements of the same content fit equally, even when every one of them was enumerated, so the coverage scopes can all read `COMPLETE`. The reported alleles and FASTA stay the caller's. A representative arrangement (`serialization_representative=true`) is written only to the dosage diagnostics (`<prefix>.dosage_repaired.fa`, `.dosage_repaired_block_alleles.fa`, `.dosage_allocation_equivalence.tsv`), labelled `REPRESENTATIVE_ONLY_NOT_RESOLVED`.
 - **Triggered but unrepaired:** the copy numbers are contradicted but no admissible correction was found.
 - **Consistent, not evaluated, or not dosage-sensitive.**
 
@@ -90,15 +90,15 @@ What a run writes depends on its outcome:
 - **Strict call** (`COMPLETE`): one best pair of haplotypes. A *genotype-equivalent call* (`CONDITIONAL_GENOTYPE_EQUIVALENT`) has several best pairs that agree on every block's unordered genotype but not on phase, so it reports no FASTA and no phase.
 - **No-call:** the reason is in `no_call_reason`, for example `distinct_tie`, `tie_branching_incomplete` or `neighbourhood_bound`.
 - **Panel alleles:** every reported block allele is an active panel allele, and `allele*_sources` names its panel sources. A whole haplotype may still be off-panel as a mosaic.
-- **FASTA headers:** they carry `phase_support` and `representation=`, which say how far the `hap1`/`hap2` order is read-supported. An applied repair adds `dosage_repair_role=RESOLVED`.
+- **FASTA headers:** they carry `phase_support` and `representation=`, which say how far the `hap1`/`hap2` order is read-supported. An applied complete repair adds `dosage_repair_role=RESOLVED`. A serialization representative never reaches this file: integration refuses any result with `serialization_representative=true` (`unresolved_allocation_equivalence_set`), whatever its class.
 - **Dosage provenance:** sequences produced by the dosage stage are compared with the panel in `<prefix>.dosage_provenance.tsv`.
 
 **Headline filters.** There is no single PASS/FAIL. `call_summary` is `GENOTYPE_<s>;DOSAGE_<s>;PHASE_<s>`. Each filter takes the most severe applicable status per unit, ranked NO_CALL > NOT_EVALUATED > LOW_QUALITY > PASS > NOT_APPLICABLE, and the locus takes the worst unit, with reasons as `REASON@ids`.
 
 | filter | unit | PASS | other outcomes |
 |---|---|---|---|
-| GENOTYPE_FILTER | block | representation check passed, no library sensitivity, and the dosage stage, if run, left no exact diplotype unresolved | LOW_QUALITY for a representation conflict, a library-sensitive block, or an unresolved exact diplotype; NOT_EVALUATED when the representation check or the library audit could not complete |
-| DOSAGE_FILTER | block | consistent; a complete repair applied, or available in audit mode; or a content correction whose content is complete (the reported alleles stay the caller's, so GENOTYPE_FILTER is LOW_QUALITY) | LOW_QUALITY for a complete repair not applied, suspect or triggered-unrepaired; NOT_EVALUATED for mode `off`, an incomplete stage, or underpowered; NOT_APPLICABLE when not dosage-sensitive |
+| GENOTYPE_FILTER | block | representation check passed, no library sensitivity, and the dosage stage, if run, left no exact diplotype unresolved | LOW_QUALITY for a representation conflict, a library-sensitive block, or an unresolved exact diplotype (conditional content, including an unresolved allocation-equivalence set; triggered-unrepaired; a complete repair not applied); NOT_EVALUATED when the representation check or the library audit could not complete |
+| DOSAGE_FILTER | block | consistent; a complete repair applied, or available in audit mode; or conditional content whose content is complete (the reported alleles stay the caller's, so GENOTYPE_FILTER is LOW_QUALITY) | LOW_QUALITY for a complete repair not applied, suspect or triggered-unrepaired; NOT_EVALUATED for mode `off`, an incomplete stage, or underpowered; NOT_APPLICABLE when not dosage-sensitive |
 | PHASE_FILTER | adjacent pair of heterozygous blocks | read-supported phase | LOW_QUALITY `MODEL_ONLY_PHASE` for prior-only phase; NO_CALL for unresolved phase; NOT_APPLICABLE next to a homozygous block |
 
 - **A no-call** is NO_CALL in all three filters. A run that stopped before its blocks existed reports one `locus` unit per filter.
@@ -115,7 +115,7 @@ What a run writes depends on its outcome:
 - Only paired short reads are supported.
 - Reported block alleles are active panel alleles. A sequence absent from the active panel cannot be reported as an authoritative panel allele; the caller may select a representable alternative or make a no-call.
 - GQ and the conditional posterior are conditional on the evaluated candidates and are not externally calibrated.
-- Conditional dosage content corrects copy numbers, not the exact diplotype. A complete diplotype repair with `serialization_representative=true` does not resolve which homologue carries each repeated unit.
+- Conditional dosage content corrects copy numbers, not the exact diplotype. When several arrangements of repeated units fit equally, which homologue carries each unit stays unresolved, and the caller's alleles are reported.
 - Resource use grows with the active panel, the reads and the repair search. A repair neighbourhood larger than `--repair-max-neighbours` ends in a no-call (`neighbourhood_bound`).
 
 ## Example

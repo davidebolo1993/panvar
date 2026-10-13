@@ -47,19 +47,20 @@ A haplotype is a path of block alleles copied from the `n` active panel haplotyp
 - **Transitions between blocks:** stay with probability `1 − ρ + ρ/n`, move to a given other haplotype with probability `ρ/n`, where `ρ` is `--switch-probability`. This applies at every boundary, context boundaries included.
 - **Emission:** 1 when the copied haplotype carries the path's allele, and 0 otherwise.
 
-The forward recursion sums over copying histories. Ranking uses the sequence prior `h(s)`, which sums over every allele path spelling the same bytes:
+The forward recursion sums the probability mass `P_LS(p)` of an allele path `p` over its copying histories. Ranking works with log probabilities. The log sequence prior `ℓ(s)` sums that mass over every allele path spelling the same bytes `s`, and the log prior of an unordered pair adds `log 2` when the two sequences differ, for the two orders in which they can be drawn:
 
 ```text
-prior(s1, s2) = h(s1) + h(s2) + ln 2·[s1 ≠ s2]
+ℓ(s)            = log Σ_{p spells s} P_LS(p)
+log P({s1, s2}) = ℓ(s1) + ℓ(s2) + 1[s1 ≠ s2]·log 2
 ```
 
-A path through any allele that no active haplotype carries has prior 0, which is why such an allele can never be proposed.
+A path through an allele that no active haplotype carries has probability mass 0 (log prior `−∞`), which is why such an allele can never be proposed.
 
 ### 5. Construct candidates
 
 Candidates come from two sources:
 - **Panel baseline:** every unordered pair of active panel haplotypes, always evaluated.
-- **Mosaics:** a beam over blocks keeps the best `--proposal-state-limit` allele-prefix pairs. A pair is scored by `Σ_b S_b + ln Σu_p1 + ln Σu_p2 + ln 2·[p1 ≠ p2]`. Here `u_p(i)` is the Li–Stephens mass of the paths spelling prefix `p` that end on haplotype `i`.
+- **Mosaics:** a beam over blocks keeps the best `--proposal-state-limit` allele-prefix pairs. A pair is scored by `Σ_b S_b + log Σ_i u_p1(i) + log Σ_i u_p2(i) + 1[p1 ≠ p2]·log 2`. Here `u_p(i)` is the Li–Stephens probability mass of the paths spelling prefix `p` that end on haplotype `i`.
 
 The first `--mosaic-candidates` complete diplotypes that are not panel pairs join the baseline to form the evaluated union. A beam that exceeds its work or memory budget stops the run (`CANDIDATE_INCOMPLETE`).
 
@@ -90,7 +91,7 @@ Placements are seeded by pigeonhole pieces of each mate, then verified by dynami
 
 ### 7. Rank, repair and branch at ties
 
-**Ranking.** The score is `log L + prior`. Candidates spelling the same unordered pair of sequences are ranked once. Two scores tie when their difference is within `δ_c = max((F + 16)·ε_double·(Σ|terms_c| + |prior_c|), 0.5e-9)`. The best candidate and every rival within the bounds form the top set.
+**Ranking.** The score is `log L + log P({s1, s2})`. Candidates spelling the same unordered pair of sequences are ranked once. Two scores tie when their difference is within `δ_c = max((F + 16)·ε_double·(Σ|terms_c| + |prior_c|), 0.5e-9)`. The best candidate and every rival within the bounds form the top set.
 
 **Repair.** The search starts from the best-ranked group containing a panel pair (the anchor). Each round does the following:
 - for every block, takes the `--repair-local-pairs` best allele pairs by marker evidence;
@@ -150,12 +151,21 @@ suspect ⇔ z ≥ 2.5        underpowered ⇔ robust_sd > 1/(z_c + Φ⁻¹(0.90)
 - **Pair route:** panel allele pairs.
 - **Repeated-unit route:** alleles built from unit multisets.
 
-Each alternative is spliced into the call and scored by the likelihood of stage 6. The likelihood alone chooses, and the top set is everything within 1e-9 nats. The outcome is classified as follows:
-- **Complete diplotype repair:** both the copy-number content and the diplotype are complete within the search. When several unit arrangements fit equally, it is still in this class, with `serialization_representative=true`.
-- **Conditional dosage content:** the content is complete but the diplotype is not.
-- **Triggered but unrepaired:** no admissible correction was found, or the content itself is conditional.
+Each alternative is spliced into the call and scored by the likelihood of stage 6. The likelihood alone chooses the content: the top set is every genotype within 1e-9 nats of the best.
+- **Pair route:** more than one genotype in the top set leaves the block unrepaired. A tie between the two orders of one genotype is not a genotype tie.
+- **Repeated-unit route:** top-set genotypes with different unit contents leave the block unrepaired. Otherwise every arrangement of that content is ranked by its panel-structure prior. The arrangements at the best prior within 1e-9 nats of the best likelihood among them form the allocation-equivalence set. When the set holds more than one distinct unordered genotype, the reported arrangement (the smallest canonical SHA-256 pair) only serialises it: the arrangement carries `serialization_representative=true` and is not a resolved diplotype.
 
-In repair mode, a complete diplotype repair replaces the block under the eligibility rules in [modules/genotype.md](../modules/genotype.md#dosage-modes); conditional content never does. After an applied repair, the stage-8 annotations are recomputed on the reported genotype. Each must first reproduce the caller's own result, else it is `NOT_EVALUATED_AFTER_DOSAGE_REPAIR`.
+Three coverage fields are recorded separately:
+- `dosage_content_scope`: whether the corrected copy-number content is established.
+- `diplotype_scope`: whether the candidate enumeration was complete.
+- `allocation_equivalence_scope`: whether the allocation-equivalence set was enumerated completely.
+
+Coverage is not uniqueness: a set enumerated completely can still have several members. The outcome is classified as follows:
+- **Complete diplotype repair** (`COMPLETE_DIPLOTYPE_REPAIR`): the content is complete, the enumeration is complete, and on the repeated-unit route the allocation-equivalence set has a single member, so the repaired diplotype is uniquely resolved within the model and search. It is the only class whose arrangement has the role `RESOLVED`.
+- **Conditional dosage content** (`CONDITIONAL_DOSAGE_CONTENT`): the content is complete but the diplotype is not resolved, either because the enumeration was conditional or because the allocation-equivalence set has several members (`dosage_reason=unresolved_allocation_equivalence_set`; the coverage scopes may all be `COMPLETE`). The arrangement is written only to the dosage diagnostics, labelled `REPRESENTATIVE_ONLY_NOT_RESOLVED`.
+- **Triggered but unrepaired:** no admissible correction was found, the top set held a tie that the route cannot resolve, or the content itself is conditional.
+
+In repair mode, only a complete, uniquely resolved diplotype repair can replace the block, under the eligibility rules in [modules/genotype.md](../modules/genotype.md#dosage-modes). Conditional content never does. As a second guard, integration refuses any result marked `serialization_representative=true`, whatever its class, with the reason `unresolved_allocation_equivalence_set`. After an applied repair, the stage-8 annotations are recomputed on the reported genotype. Each must first reproduce the caller's own result, else it is `NOT_EVALUATED_AFTER_DOSAGE_REPAIR`.
 
 ### 10. Derive the outputs and headline filters
 
@@ -174,7 +184,7 @@ The locus has five blocks, with variant blocks `sv:1` (alleles `a`, `b`) and `sv
 
 1. **Blocks and panel.** Five blocks. The two `(a,c)` paths spell the same bytes.
 2. **Markers.** An `a`-only marker seen 20 times at `r = 11.28`, `bg = 0.01` gives `S(a,a) = 131.9`, `S(a,b) = 129.3` and `S(b,b) = 0`.
-3. **Prior.** `ln h(ac) = −0.70` and `ln h(ad) = −5.30`. The mosaic `(a,d)` needs one switch, so `{ac,ad}` trails `{ac,bd}` by 4.6 nats in the prior.
+3. **Prior.** `ℓ(ac) = −0.70` and `ℓ(ad) = −5.30`. The mosaic `(a,d)` needs one switch, so `{ac,ad}` trails `{ac,bd}` by 4.6 nats in the prior.
 4. **Candidates.** The panel pairs, plus the mosaic `{ac,ad}` from the beam.
 5. **Likelihood.** If `b` is 1,700 bp longer than `a`, `{ac,bd}` predicts about 85 nats more unseen fragment starts at `λ = 0.05`, which outweighs the prior deficit.
 6. **Decision.** The repair from anchor `{ac,bd}` reaches `{ac,ad}`, and the top set is one group: a strict call. Phase across `sv:1` is not informative, because `sv:1` is homozygous.
