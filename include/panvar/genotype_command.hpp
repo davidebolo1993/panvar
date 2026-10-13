@@ -4,6 +4,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <iosfwd>
 #include <limits>
 #include <optional>
 #include <map>
@@ -384,6 +385,20 @@ void validate_genotype_settings(const GenotypeCommandOptions& options);
 // not implemented; any other name is refused.
 std::vector<std::pair<std::string, std::string>> genotype_preset_settings(const std::string& name);
 LibraryModel genotype_preset_library(const std::string& name);
+
+// A declared library file (--library FILE): one `key value` per line; blank lines and lines whose first non-space
+// character is '#' are skipped, and a value may be followed only by a '#' comment. The six required keys are
+// insert_mean_bp, insert_sd_bp, support_sigmas, substitution_error, outlier_weight and fragment_start_intensity;
+// marker_background is optional. An unknown key, a repeated key, a missing key, trailing content or a value that is not
+// a finite number is refused with the file, line and key named. The gap model is fixed and cannot be declared.
+LibraryModel read_library(const std::string& path, std::optional<double>& marker_background);
+
+// Resolves the command line into options: the preset, then every --profile, then the flags, independent of argument
+// order. --adaptive-repair and --repair-rounds are resolved together after every flag is read; an explicit
+// contradiction between them is refused. Returns the exit status when the arguments asked for help (printed to out),
+// and nothing otherwise.
+std::optional<int> parse_genotype_arguments(const std::vector<std::string>& args, GenotypeCommandOptions& options,
+                                            std::ostream& out);
 
 int run_genotype_command(const std::vector<std::string>& args);
 

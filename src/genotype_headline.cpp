@@ -299,6 +299,13 @@ LocusHeadline apply_headline(const std::string& out_prefix, const std::vector<st
         for (std::size_t i = 0; i + 1 < block_ids.size(); ++i) {
             p.push_back({block_ids[i] + ">" + block_ids[i + 1], phase_boundary_verdict(locus, none, none)});
         }
+        // A run that stopped before its blocks were built (no model) is still a no-call: one locus-level unit per
+        // filter, so the public summary reads NO_CALL with the run's reason, never three empty NOT_APPLICABLE values.
+        if (no_call(locus)) {
+            if (g.empty()) g.push_back({kLocusUnit, genotype_verdict(locus, none)});
+            if (d.empty()) d.push_back({kLocusUnit, dosage_verdict(locus, none)});
+            if (p.empty()) p.push_back({kLocusUnit, phase_boundary_verdict(locus, none, none)});
+        }
     } else {
         for (const BlockFacts& b : blocks) {
             const Verdict gv = genotype_verdict(locus, b), dv = dosage_verdict(locus, b);

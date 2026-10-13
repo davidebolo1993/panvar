@@ -21,6 +21,8 @@
 namespace panvar::headline {
 
 constexpr const char* kHeadlineRule = "headline_filters_v2";
+// The single unit of a no-call that stopped before its blocks were built (no model): every filter is NO_CALL there.
+constexpr const char* kLocusUnit = "locus";
 extern const std::array<const char*, 5> kStatuses;   // NO_CALL, NOT_EVALUATED, LOW_QUALITY, PASS, NOT_APPLICABLE
 int severity(const std::string& status);
 

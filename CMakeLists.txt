@@ -322,6 +322,13 @@ if(PANVAR_BUILD_TESTING)
         target_link_libraries(genotype_headline_test PRIVATE panvarlib)
         target_compile_options(genotype_headline_test PRIVATE -Wall -Wextra -Wpedantic)
         add_test(NAME panvar_genotype_headline COMMAND genotype_headline_test)
+        # The command's release contract: the declared-library file, order-independent repair options, the diagnostic
+        # cache flags' provenance, the help text, and a pre-block no-call's headline.
+        add_executable(genotype_cli_contract_test tests/genotype_cli_contract.cpp src/cli_utils.cpp)
+        target_link_libraries(genotype_cli_contract_test PRIVATE panvarlib)
+        target_compile_options(genotype_cli_contract_test PRIVATE -Wall -Wextra -Wpedantic)
+        add_test(NAME panvar_genotype_cli_contract
+                 COMMAND genotype_cli_contract_test ${CMAKE_CURRENT_BINARY_DIR}/genotype_cli_contract)
         # Gate tool only (reads sealed campaign outputs; not a test): the headline function on copies of sealed prefixes.
         add_executable(genotype_headline_replay tests/genotype_headline_replay.cpp src/cli_utils.cpp)
         target_link_libraries(genotype_headline_replay PRIVATE panvarlib)
