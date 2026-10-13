@@ -1,6 +1,6 @@
 #pragma once
 
-// The three public headline filters (docs/algorithms/genotype_headline_filters.md; the frozen design is SPEC_v2 of the
+// The three public headline filters (docs/algorithms/genotype.md, stage 15; the frozen design is SPEC_v2 of the
 // C4 headline-filter audit): GENOTYPE_FILTER, DOSAGE_FILTER and PHASE_FILTER, with deterministic reasons and
 // CALL_SUMMARY. They are derived summaries of the fields the run already reports -- the representation filter,
 // library sensitivity, the dosage stage's status and repair fields, zygosity and phase_support -- and replace none of

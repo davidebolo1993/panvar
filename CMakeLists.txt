@@ -166,7 +166,7 @@ target_include_directories(panvarlib
         ${ABPOA_DIR}/include
 )
 
-# The dosage audit reproduces the numpy prototype bit for bit (docs/algorithms/genotype_dosage.md section 14), so its
+# The dosage audit reproduces the numpy prototype bit for bit (docs/algorithms/genotype.md, stage 11), so its
 # arithmetic is never contracted into fused multiply-adds, which numpy's elementwise loops do not use.
 set_source_files_properties(src/genotype_dosage.cpp src/genotype_dosage_repair.cpp PROPERTIES COMPILE_OPTIONS "-ffp-contract=off")
 
@@ -241,13 +241,13 @@ if(PANVAR_BUILD_TESTING)
         # Mathematical foundation of the replacement mosaic genotyper. This is a direct C++ test so
         # model code is certified before a CLI exists: immutable block preparation, strict mosaic
         # spelling, fragment-specific insert normalization, and exact Li-Stephens marginalization.
-        # Dosage audit and repair fixtures (docs/algorithms/genotype_dosage.md section 14).
+        # Dosage audit and repair fixtures (docs/algorithms/genotype.md, stages 11-12).
         add_executable(genotype_dosage_test tests/genotype_dosage.cpp src/cli_utils.cpp)
         target_link_libraries(genotype_dosage_test PRIVATE panvarlib)
         target_compile_options(genotype_dosage_test PRIVATE -Wall -Wextra -Wpedantic)
         add_test(NAME panvar_genotype_dosage COMMAND genotype_dosage_test)
 
-        # Automatic-library diagnostic fixtures (docs/algorithms/library_estimate.md).
+        # Automatic-library estimate fixtures (docs/algorithms/genotype.md, stage 3).
         add_executable(library_estimate_test tests/library_estimate.cpp src/cli_utils.cpp)
         target_link_libraries(library_estimate_test PRIVATE panvarlib)
         target_compile_options(library_estimate_test PRIVATE -Wall -Wextra -Wpedantic)

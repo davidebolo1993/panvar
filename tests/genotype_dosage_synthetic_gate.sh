@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Known-truth COMPLETE_DIPLOTYPE_REPAIR gate (docs/algorithms/genotype_dosage.md section 22.6). The four C4 pair-route
+# Known-truth COMPLETE_DIPLOTYPE_REPAIR gate (docs/algorithms/genotype.md, stage 12). The four C4 pair-route
 # repairs have no defined truth at sv:1, so this gate makes one: a leave-zero-out call that is exact at <block> gets a
 # dosage error injected there (dosage-synthetic, scored exactly as the repair guard scores it), and repair mode must
 # find the true pair again. Checks: the stage classes the block COMPLETE_DIPLOTYPE_REPAIR and applies it; the repaired

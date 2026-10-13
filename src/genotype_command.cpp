@@ -1339,7 +1339,7 @@ std::vector<std::pair<std::string, std::string>> genotype_preset_settings(const 
     if (name != "short-read") throw std::runtime_error("unknown --preset '" + name + "' (available: short-read)");
     // The production algorithm (adaptive repair, exact tie branching, the representation guard) and the short-read
     // technology constants. No resource cap, cache budget, time or footprint limit, candidate count or dosage setting:
-    // those stay at the built-in defaults unless a profile or a flag sets them (genotype_cli.md section 3).
+    // those stay at the built-in defaults unless a profile or a flag sets them (docs/modules/genotype.md, Required inputs).
     return {{"repair_rounds", "32"}, {"repair_tie_branching", "1"}, {"representation_guard", "1"},
             {"kmer_size", "31"}, {"syncmer_s", "15"}, {"min_variant_bp", "50"}, {"mismatch_band", "6"},
             {"switch_probability", "0.01"}, {"proposal_state_limit", "256"}, {"phase_audit_candidates", "0"}};
@@ -1354,7 +1354,7 @@ LibraryModel genotype_preset_library(const std::string& name) {
     m.substitution_error = 0.002;
     m.outlier_weight = 0.001;
     // A declared technology convention, not an estimate: 30x diploid depth with 2 x 150 bp pairs, lambda = depth / (4 L).
-    // The sample's own intensity is not inferred (library_estimate.md section 4, item 4).
+    // Under --library auto the marker-fit intensity replaces it (docs/algorithms/genotype.md, stage 3).
     m.fragment_start_intensity = 0.05;
     m.provenance = "preset short-read";
     return m;
@@ -3981,7 +3981,7 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options, GenotypeDo
             }
             report.seconds_representation_guard = seconds_since(guard_mark);
         }
-        // ---- library_sensitivity_audit_v1 (docs/algorithms/library_estimate.md section 7). The call is decided and
+        // ---- library_sensitivity_audit_v2 (docs/algorithms/genotype.md, stage 9). The call is decided and
         // annotated; the same algorithm is now followed at 0.9x and 1.1x the estimated fragment-start intensity. Every
         // candidate the call scored already carries its score at both (one combination pass), so an endpoint that
         // decides as the call did -- its anchor, every round, every branch -- adds no scoring at all. Where it decides

@@ -5,7 +5,7 @@ Input (--input) is either a directory holding many output prefixes (<prefix>.loc
 run_id is the prefix path relative to the directory) or a consolidated package directory with runs.tsv and blocks.tsv.
 
 Truth-free QC needs nothing else. Accuracy figures are drawn only from explicitly supplied evaluation tables and are
-refused otherwise; truth is never inferred from sample or run names. See docs/modules/genotype_report.md.
+refused otherwise; truth is never inferred from sample or run names. See docs/modules/genotype.md (Reporting) and --help.
 
 Writes <out-dir>/data/*.tsv, <out-dir>/figures/*.png|pdf, <out-dir>/report.md and <out-dir>/manifest.tsv. The inputs
 are only read; an --out-dir inside an input location, or one that is not empty, is refused.

@@ -1,7 +1,8 @@
 #pragma once
 
-// Automatic library estimation, DIAGNOSTIC ONLY (docs/algorithms/library_estimate.md). Nothing here is used by a call:
-// the estimate is written beside a run, or by genotype_probe library-estimate, and compared with the declared library.
+// Automatic library estimation (docs/algorithms/genotype.md, stage 3). Under --library auto, the default when --library
+// is omitted, build_auto_library turns the estimate into the run's library. Beside --library FILE it is diagnostic only:
+// written by --library-diagnostic or genotype_probe library-estimate and compared with the declared library.
 //
 // Read-level quantities come from the reads directly. The insert (fragment) distribution comes from pairs placed
 // decisively against the model's panel templates: both mates hit anchor k-mers (present exactly once, on one strand,
@@ -20,7 +21,7 @@ struct LibraryEstimateOptions {
     std::size_t k = 31;
     std::size_t anchor_sampling = 4;          // keep anchor k-mers whose hash is 0 modulo this (index size)
     std::size_t max_pairs = 20000;            // deterministic sample: the pairs with the smallest salted name hashes
-    std::size_t min_accepted_pairs = 500;     // fewer accepted placements: the insert falls back (measured, library_estimate.md)
+    std::size_t min_accepted_pairs = 500;     // fewer accepted placements: the insert falls back (measured; docs/algorithms/genotype.md, stage 3)
     std::size_t error_pairs = 2000;           // accepted pairs used for the invariant-site mismatch rate
     double outlier_sds = 6.0;                 // |insert - median| beyond this many robust sd: outlier
     double max_outlier_fraction = 0.05;       // above: contamination warning (--library auto refuses)
@@ -61,7 +62,7 @@ LibraryEstimate estimate_library(const PreparedGenotypeModel& model, const std::
 // declared_value.
 std::string library_estimate_table(const LibraryEstimate& estimate, const LibraryModel* declared);
 
-// --library auto (docs/algorithms/library_estimate.md sections 5-6). The insert centre and spread come from the estimate
+// --library auto (docs/algorithms/genotype.md, stage 3). The insert centre and spread come from the estimate
 // (mean and sd of the accepted inserts within the outlier bound); the fragment-start intensity is the marker-fit estimate
 // (the caller's invariant-marker depth fit); every other library value comes from `preset`. The estimate is refused --
 // never used, never replaced by a guess -- when accepted pairs are fewer than min_accepted_pairs, the insert distribution

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""--dosage-mode integration gate (docs/algorithms/genotype_dosage.md section 22.6), on one C4 campaign cell re-run
+"""--dosage-mode integration gate (docs/modules/genotype.md, Dosage modes), on one C4 campaign cell re-run
 end to end with `panvar genotype`:
 
   identity   the flag absent and `--dosage-mode off` equal the sealed 11fe681 outputs (normalised as the shadow gate

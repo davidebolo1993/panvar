@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Truth isolation gate (docs/algorithms/genotype_dosage.md section 14.8): the dosage audit's sources and headers read no
+# Truth isolation gate (docs/algorithms/genotype.md, stage 11): the dosage audit's sources and headers read no
 # truth or evaluation input. They take no path argument other than the run prefix they audit and the prefix they write;
 # no truth GFA, evaluation table or truth-named field appears in them. Usage: <source root>
 set -uo pipefail

@@ -10,13 +10,13 @@ from decimal import ROUND_HALF_UP, Decimal
 
 import pandas as pd
 
-# The headline filters' values, in the fail-closed precedence order of genotype_headline_filters.md section 2
+# The headline filters' values, in the fail-closed precedence order of docs/algorithms/genotype.md, stage 15
 # (worst first), and the call classes of the locus table.
 STATUSES = ["NO_CALL", "NOT_EVALUATED", "LOW_QUALITY", "PASS", "NOT_APPLICABLE"]
 CALL_CLASSES = ["strict_call", "genotype_equivalent_call", "no_call", "NA"]
 CALLED = ("strict_call", "genotype_equivalent_call")
 
-# The documented usage policies (genotype_headline_filters.md section 7). They are downstream selections, not filters.
+# The documented usage policies (docs/modules/genotype.md, Reading the call). They are downstream selections, not filters.
 EXACT_GENOTYPE_USABLE_RULE = "GENOTYPE_FILTER == PASS and DOSAGE_FILTER in {PASS, NOT_APPLICABLE}"
 DOSAGE_CONTENT_USABLE_RULE = "DOSAGE_FILTER == PASS"
 PHASED_GENOTYPE_USABLE_RULE = "EXACT_GENOTYPE_USABLE and PHASE_FILTER == PASS"

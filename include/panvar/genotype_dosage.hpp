@@ -1,6 +1,6 @@
 #pragma once
 
-// Dosage audit (docs/algorithms/genotype_dosage.md, sections 2-7): a graph census of copy-number-sensitive blocks,
+// Dosage audit (docs/algorithms/genotype.md, stage 11): a graph census of copy-number-sensitive blocks,
 // pooled copy-count features, a single-copy reference, a bootstrap copy-number estimate and the family-wise
 // classification (policy v2). Truth-free: the inputs are the prepared model, the graph's node sequences, the call the
 // caller reports, the reads and the library. Nothing here changes a call.

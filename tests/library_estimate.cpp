@@ -1,4 +1,4 @@
-// Fixtures for the automatic-library diagnostic (docs/algorithms/library_estimate.md): recovery of a declared insert
+// Fixtures for the automatic-library diagnostic (docs/algorithms/genotype.md, stage 3): recovery of a declared insert
 // distribution, read lengths and error rate on a synthetic locus; the failure conditions (insufficient placements, a
 // two-mode insert distribution, outward-facing pairs); and 1/2/4/8-thread identity.
 
@@ -145,7 +145,7 @@ int main() {
         const LibraryEstimate e = estimate_library(m, reads, opt, &declared);
         require(e.accepted == 0 && e.orientation_discordant > 1000, "outward pairs are discordant, none accepted");
     }
-    // --library auto: accepted estimates and each refusal (docs/algorithms/library_estimate.md section 5)
+    // --library auto: accepted estimates and each refusal (docs/modules/genotype.md, Required inputs)
     const LibraryModel preset = genotype_preset_library("short-read");
     {
         const std::vector<ReadPair> reads = simulate(m, 4000, [&](std::mt19937_64& r) { return n350(r); }, 0.002, 11);

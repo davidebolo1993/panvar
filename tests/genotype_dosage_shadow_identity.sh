@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Shadow byte-identity gate (docs/algorithms/genotype_dosage.md section 14.5): one C4 campaign cell re-run with the
+# Shadow byte-identity gate (docs/algorithms/genotype.md, stage 11): one C4 campaign cell re-run with the
 # dosage flag absent and with --dosage-audit shadow. Every pre-existing output must equal the frozen 11fe681 campaign
 # output byte for byte, except the status file's wall-time, memory and binary-provenance lines; shadow may add only
 # <prefix>.dosage_*.tsv. Usage: genotype_dosage_shadow_identity.sh <panvar binary> <campaign root> <cell> <scratch dir>

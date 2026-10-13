@@ -1,4 +1,4 @@
-// Fixtures for the dosage audit (docs/algorithms/genotype_dosage.md sections 5, 8, 9, 14): the frozen Python random
+// Fixtures for the dosage audit (docs/algorithms/genotype.md, stages 11, 12 and 14): the frozen Python random
 // stream and normal quantile, every undefined-estimator case, the robust-z rules at zero spread, the top-genotype and
 // allocation rules, nearest-panel ties and panel-order invariance, display-id collisions, and thread identity.
 

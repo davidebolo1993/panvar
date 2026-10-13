@@ -481,7 +481,7 @@ class Report:
                   "- **Call class:** strict_call (a phased diplotype), genotype_equivalent_call (an unordered genotype, "
                   "unphased), no_call (no genotype; the reason is recorded).",
                   "- **Headline filters:** GENOTYPE_FILTER, DOSAGE_FILTER and PHASE_FILTER, each PASS, LOW_QUALITY, "
-                  "NOT_EVALUATED, NO_CALL or NOT_APPLICABLE (genotype_headline_filters.md). A locus value is the worst of "
+                  "NOT_EVALUATED, NO_CALL or NOT_APPLICABLE (docs/algorithms/genotype.md, stage 15). A locus value is the worst of "
                   "its units.",
                   f"- **EXACT_GENOTYPE_USABLE:** exactly `{EXACT_GENOTYPE_USABLE_RULE}`. It is never called \"high quality\".",
                   f"- **DOSAGE_CONTENT_USABLE:** `{DOSAGE_CONTENT_USABLE_RULE}`, judged on dosage content, not sequence.",

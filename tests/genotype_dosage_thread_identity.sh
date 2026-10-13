@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Thread identity gate (docs/algorithms/genotype_dosage.md section 14.6): the shadow audit of one persisted campaign call,
+# Thread identity gate (docs/algorithms/genotype.md, stage 11): the shadow audit of one persisted campaign call,
 # with repair, provenance and the allocation test, at 1, 2, 4 and 8 threads. Every dosage table must be byte-identical;
 # only dosage_status.tsv and dosage_repair_scoring.tsv (wall times, scheduling-dependent cache hits) are exempt. Usage: <genotype_probe> <jobs.tsv> <cell> <scratch dir>
 set -uo pipefail

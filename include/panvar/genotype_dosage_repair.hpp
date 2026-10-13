@@ -1,6 +1,6 @@
 #pragma once
 
-// Dosage repair (docs/algorithms/genotype_dosage.md, section 8): for an AUTO_REPAIR block, dosage-admissible
+// Dosage repair (docs/algorithms/genotype.md, stage 12): for an AUTO_REPAIR block, dosage-admissible
 // candidates are constructed (pair route: panel allele pairs; repeated-unit route: unit multisets screened by the
 // declared count model), spliced into the reported homologues, scored exactly by the production likelihood, and
 // chosen by the top-genotype rule and, within one content multiset, the panel-structure allocation rule. Shadow only:
@@ -251,7 +251,7 @@ std::optional<PersistedCall> read_persisted_call(const std::string& run_prefix);
 PersistedScore score_reported_diplotype(const ScoringInputs& in, double& prior);
 // Exact scores of explicit diplotypes (block sequences already spliced into whole haplotypes), in one scoring context
 // with in's settings and repair caps, in input order. For annotating a reported repaired genotype after the repair
-// is decided (docs/algorithms/genotype_dosage.md section 23); never used to choose one.
+// is decided (docs/algorithms/genotype.md, stage 13); never used to choose one.
 std::vector<DiplotypeScore> score_diplotypes_exact(const ScoringInputs& in, const std::vector<std::pair<std::string, std::string>>& diplotypes);
 
 struct DosageShadowOptions {

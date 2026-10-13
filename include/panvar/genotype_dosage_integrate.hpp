@@ -1,6 +1,6 @@
 #pragma once
 
-// panvar genotype --dosage-mode off|audit|repair (docs/algorithms/genotype_dosage.md sections 20 and 22) and the
+// panvar genotype --dosage-mode off|audit|repair (docs/algorithms/genotype.md, stages 12-14) and the
 // primary locus-level output, <prefix>.locus_genotype.tsv. Everything here runs after the caller's outputs are
 // committed and reads them back from disk, so the same code integrates a fresh run and replays a sealed one.
 

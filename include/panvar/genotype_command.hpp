@@ -230,7 +230,7 @@ struct GenotypeCommandOptions {
     bool diagnostic_digest_memo_check = false;
     std::uint64_t diagnostic_branch_request_order_seed = 0;   // gate hook: permutes branch requests
     bool diagnostic_pool_dump = false;                        // gate hook: the whole pool, bit-exact
-    // docs/algorithms/genotype_dosage.md sections 20 and 22: "off" (default), "audit" or "repair". Audit runs the
+    // docs/modules/genotype.md, Dosage modes: "off" (default), "audit" or "repair". Audit runs the
     // dosage stage after every existing output is committed and writes only <prefix>.dosage_*; it never changes a call,
     // a score, a status value or an existing file. Repair also applies COMPLETE_DIPLOTYPE_REPAIR blocks to the reported
     // genotype, keeping the caller's outputs as <prefix>.original.*. `--dosage-audit shadow` is audit. Last, so
@@ -238,10 +238,10 @@ struct GenotypeCommandOptions {
     std::string dosage_mode = "off";
     // SHADOW ONLY: the allocation observability test inside the shadow audit (off until its cost is reviewed).
     bool dosage_allocation_test = false;
-    // DIAGNOSTIC ONLY (docs/algorithms/library_estimate.md): after the run, estimate the library from the reads and the
+    // Diagnostic only (docs/algorithms/genotype.md, stage 3): after the run, estimate the library from the reads and the
     // model and write <prefix>.library_estimate.tsv beside the declared library. Never used by the call. Off by default.
     bool library_diagnostic = false;
-    // library_sensitivity_audit_v1 (docs/algorithms/library_estimate.md section 7): under --library auto, the call is
+    // library_sensitivity_audit_v2 (docs/algorithms/genotype.md, stage 9): under --library auto, the call is
     // followed at 0.9x and 1.1x the estimated fragment-start intensity and a genotype that changes is annotated. On by
     // default; the profile key library_sensitivity_audit 0 turns it off (measurement only). No effect on --library FILE.
     bool library_sensitivity_audit = true;
@@ -250,7 +250,7 @@ struct GenotypeCommandOptions {
     // TEST HOOK (gates only): the audit's endpoint 1 (0.9x) or 2 (1.1x) fails before any work, to gate that an
     // incomplete endpoint is reported NOT_EVALUATED and changes nothing. 0: off.
     std::size_t test_library_sensitivity_fail_view = 0;
-    // The technology preset applied before the profile and the flags (docs/algorithms/genotype_cli.md section 3), and
+    // The technology preset applied before the profile and the flags (docs/modules/genotype.md, Required inputs), and
     // the keys it set. Empty: none. A preset never names a locus.
     std::string preset_name;
     bool preset_explicit = false;   // false: the command line's default preset (an omitted --preset means short-read)
@@ -379,7 +379,7 @@ const std::vector<std::string>& genotype_public_settings();
 std::string genotype_setting_value(const GenotypeCommandOptions& options, const std::string& key);
 void validate_genotype_settings(const GenotypeCommandOptions& options);
 
-// The technology presets (docs/algorithms/genotype_cli.md section 3). "short-read": the production algorithm and the
+// The technology presets (docs/modules/genotype.md, Required inputs). "short-read": the production algorithm and the
 // short-read technology constants, as (key, value) settings, and the short-read library-model constants. The insert
 // is not a preset value (NaN): it comes from --library auto or --library FILE. "long-read" is reserved and refused as
 // not implemented; any other name is refused.
