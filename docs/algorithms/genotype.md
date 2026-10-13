@@ -22,6 +22,11 @@ The model fails closed, with status `MODEL_INCOMPLETE`, if any of the following 
 
 Identical allele sequences within a block are collapsed to one canonical allele.
 
+**Curation.** `--panel-curation` separates structure from the callable panel:
+- **Structure.** Frames, the divergence trim and the representation checks use every path, so the blocks are the same with or without curation.
+- **Callable alleles.** A block's source allele stays callable only when a retained template carries it. An allele carried only by curated templates is dropped from the block before the model is built, so no later stage can reach it. A sequence-identical allele on a retained template keeps only its retained sources.
+- **Refusal.** A block left without any active allele refuses the run, as does a panel of fewer than two retained templates.
+
 A declared library (`--library FILE`) is parsed strictly: the six required keys and the optional `marker_background`, each once, every value a finite number. It is then validated:
 - `μ > 0` and `σ > 0`;
 - `0 < substitution_error < 0.75`;

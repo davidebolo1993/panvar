@@ -530,6 +530,19 @@ LocusInputResult build_locus_input(
     }
     report.boundary_bases_moved_to_context = moved_bases;
 
+    // The active panel. Curation removes named templates from the callable panel, not only from the panel-pair
+    // search: a block's source allele stays callable only when a retained template with a complete frame carries it.
+    // The graph's structure (frames, the divergence trim above, bypass and representation checks) still sees every
+    // path, so the block decomposition is the same with or without curation; an allele carried only by curated
+    // templates is simply not an allele of the model. A sequence-identical allele carried by a retained template stays,
+    // under the retained template's source only. Without curation nothing is filtered.
+    const std::set<std::string> curated(options.excluded_templates.begin(), options.excluded_templates.end());
+    std::vector<std::set<std::string>> retained_sources(chain.size());
+    for (std::size_t pi = 0; pi < graph.paths.size(); ++pi) {
+        if (!complete[pi] || curated.count(graph.paths[pi].name) != 0) continue;
+        for (std::size_t bi = 0; bi < chain.size(); ++bi) retained_sources[bi].insert(allele_source_by_template[pi][bi]);
+    }
+
     for (std::size_t bi = 0; bi < chain.size(); ++bi) {
         const bool is_variant = chain[bi].kind == ChainBlockKind::Bubble;
         const BlockSequences& sequences = block_sequences[bi];
@@ -550,16 +563,31 @@ LocusInputResult build_locus_input(
         block_report.representation_dependent = dependent[bi];
         if (dependent[bi]) report.representation_dependent_blocks.push_back(block_report.block_id);
 
-        std::set<std::string> distinct_sequences;
+        std::set<std::string> distinct_sequences, inactive_sequences;
         for (std::size_t a = 0; a < sequences.source_ids.size(); ++a) {
+            if (!curated.empty() && retained_sources[bi].count(sequences.source_ids[a]) == 0) {
+                ++block_report.curation_inactive_source_alleles;
+                inactive_sequences.insert(sequences.sequences[a]);
+                continue;
+            }
             out.alleles.push_back({sequences.source_ids[a], sequences.sequences[a]});
             distinct_sequences.insert(sequences.sequences[a]);
             const std::size_t size = sequences.sequences[a].size();
-            if (a == 0 || size < block_report.min_bp) block_report.min_bp = size;
+            if (out.alleles.size() == 1 || size < block_report.min_bp) block_report.min_bp = size;
             block_report.max_bp = std::max(block_report.max_bp, size);
+        }
+        if (!curated.empty() && out.alleles.empty()) {
+            throw std::invalid_argument("curation leaves block " + out.block_id +
+                                        " with no allele carried by a retained template; the active panel cannot "
+                                        "spell the locus, and curated templates never supply callable sequence");
         }
         block_report.source_alleles = out.alleles.size();
         block_report.canonical_alleles = distinct_sequences.size();
+        for (const std::string& s : inactive_sequences) {
+            if (distinct_sequences.count(s) == 0) ++block_report.curation_inactive_canonical_alleles;
+        }
+        report.total_curation_inactive_source_alleles += block_report.curation_inactive_source_alleles;
+        report.total_curation_inactive_canonical_alleles += block_report.curation_inactive_canonical_alleles;
 
         report.total_source_alleles += block_report.source_alleles;
         report.total_canonical_alleles += block_report.canonical_alleles;

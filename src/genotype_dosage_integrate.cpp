@@ -411,9 +411,20 @@ DosageIntegration apply_dosage_mode(const PreparedGenotypeModel* model, const st
             }
         }
         std::map<std::string, std::string>& refused = mode == "repair" ? d.not_applied : d.audit_not_applied;
+        const auto carried = [&](std::size_t block, std::size_t allele) {
+            for (const auto& row : model->panel().template_alleles) {
+                if (block < row.size() && row[block] == allele) return true;
+            }
+            return false;
+        };
         for (const CompleteRepair& r : summary->complete_repairs) {
             if (!refuse.empty()) refused[r.block_id] = refuse;
             else if (!r.allele1 || !r.allele2) refused[r.block_id] = "repaired_allele_not_a_panel_allele";
+            else if (model && !(carried(r.block, *r.allele1) && carried(r.block, *r.allele2))) {
+                // Defence in depth: both repaired alleles must be carried by a retained panel template (the active,
+                // post-curation panel); membership in a block's allele list is not enough on its own.
+                refused[r.block_id] = "repaired_allele_not_in_active_panel";
+            }
             else if (mode == "repair") eligible.push_back(&r);
             else d.audit_not_applied[r.block_id] = headline::kAuditModeNotApplied;
         }

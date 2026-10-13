@@ -42,7 +42,7 @@ It runs the default `--preset short-read`, which is the production algorithm wit
 | `--dosage-mode off\|audit\|repair` | the [dosage stage](#dosage-modes) | `off` |
 | `--threads <N>` | worker threads; results do not depend on the thread count | `1` |
 | `--mosaic-candidates <K>` | off-panel mosaics scored beside every panel pair; `0` scores panel pairs only | `128` |
-| `--panel-curation <file>` | panel haplotypes to exclude, one path name per line (`#` starts a comment) | — |
+| `--panel-curation <file>` | panel haplotypes to exclude from the callable panel, one path name per line (`#` starts a comment); see [below](#panel-curation) | — |
 | `--bubbles <file>` | a precomputed bubbles CSV instead of detecting variant sites | detected |
 | `--reference-path <name>` | the coordinate reference path | graph `RS:Z` |
 | `--profile <file>` | a validated `key<TAB>value` settings file that names itself with a `profile` line | — |
@@ -63,6 +63,15 @@ It runs the default `--preset short-read`, which is the production algorithm wit
 | `--representation-guard` | `on` |
 
 Resource caps, caches, and time and memory limits are profile keys only. `--phase-audit-candidates` is a development-only control for the unrepaired view; adaptive repair refuses a non-zero value.
+
+### Panel curation
+
+`--panel-curation` removes the named haplotypes from the callable panel, not only from the panel-pair search:
+- **Excluded-only alleles are inactive.** An allele carried only by excluded haplotypes is not an allele of the model. No stage can call, propose, repair or report it: not the panel pairs, the mosaics, the repair search, the dosage census, features or repair routes, nor any provenance.
+- **Shared alleles stay.** A sequence-identical allele carried by a retained haplotype stays callable, and its provenance names only retained sources.
+- **Structure is unchanged.** The excluded paths still take part in graph validation and block definition, so curation never changes the blocks.
+- **Refusal.** An active panel too small to spell the locus (fewer than two retained haplotypes, or a block no retained haplotype carries) refuses the run (`MODEL_INCOMPLETE`).
+- **Provenance.** The status records `templates_curated_out`, `curation_digest` and the inactive allele counts. The order of names in the file does not matter.
 
 ### Dosage modes
 

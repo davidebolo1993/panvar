@@ -805,6 +805,11 @@ void write_status(
         for (const LocusInputReport::CuratedExclusion& excluded : model_report->curated_exclusions) {
             out << "curated_exclusion\t" << excluded.template_name << '\t' << excluded.reason << '\n';
         }
+        if (!model_report->curated_exclusions.empty()) {
+            // The active panel: alleles only curated templates carried are not callable (not in the model).
+            out << "curation_inactive_source_alleles\t" << model_report->total_curation_inactive_source_alleles << '\n';
+            out << "curation_inactive_canonical_alleles\t" << model_report->total_curation_inactive_canonical_alleles << '\n';
+        }
         out << "boundary_bases_moved_to_context\t"
             << model_report->boundary_bases_moved_to_context << '\n';
         std::string dependent;

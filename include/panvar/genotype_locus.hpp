@@ -37,6 +37,10 @@ struct LocusBlockReport {
     std::size_t bubble_id = 0;             // 0 for a context block
     std::size_t source_alleles = 0;        // distinct walks, before sequence collapse
     std::size_t canonical_alleles = 0;     // distinct sequences, after collapse
+    // Curation: source alleles (and distinct sequences) carried only by curated templates. They shaped the block's
+    // structure (frame, divergence trim) but are not callable: absent from the block's alleles above.
+    std::size_t curation_inactive_source_alleles = 0;
+    std::size_t curation_inactive_canonical_alleles = 0;
     std::size_t min_bp = 0;
     std::size_t max_bp = 0;
     std::size_t bypass_templates = 0;      // templates that do not walk this block at all
@@ -93,6 +97,8 @@ struct LocusInputReport {
     std::size_t context_blocks = 0;
     std::size_t total_source_alleles = 0;
     std::size_t total_canonical_alleles = 0;
+    std::size_t total_curation_inactive_source_alleles = 0;
+    std::size_t total_curation_inactive_canonical_alleles = 0;
     std::size_t forward_templates = 0;
     std::size_t reverse_templates = 0;
     // Templates that do not span the chain in a consistent direction. They are reported as partial
