@@ -1,7 +1,7 @@
 # C4 genotype report: the audited analysis
 
 These scripts build the C4 truth-evaluation report with the generic, locus-independent tool
-(`scripts/plot_genotype_results.py`, documented in `docs/modules/genotype_report.md`). They check the report against the
+(`scripts/plot_genotype_results.py`, summarised in `docs/modules/genotype.md`; options under its `--help`). They check the report against the
 sealed C4 tables. They never genotype, and they only read the sealed packages.
 
 | script | role |

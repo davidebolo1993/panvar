@@ -1,214 +1,156 @@
-# `panvar genotype`
+# Module `genotype`
 
-Genotypes a structural locus from paired short reads against the locus pangenome graph. It reports the diplotype
-(two whole-locus haplotypes) over the graph's panel, and optionally corrects dosage (unit copy number) errors.
+CLI: `panvar genotype`
 
-This page states what is frozen at `26401b4`, the C4 short-read freeze. The contracts are in
-[`algorithms/genotype_mosaic.md`](../algorithms/genotype_mosaic.md) and
-[`algorithms/genotype_dosage.md`](../algorithms/genotype_dosage.md). The planned user-facing command and presets are in
-[`algorithms/genotype_cli.md`](../algorithms/genotype_cli.md). It is partly implemented: `--preset short-read` (the
-default), the basic flags, and automatic library estimation with its sensitivity audit as the default.
+## What it does
 
-## One adaptive algorithm
+Genotypes one structural locus from paired short reads. It is a general graph genotyper, not specific to any locus. The locus is described by a pangenome graph whose paths are the panel haplotypes. The call is a diplotype: two whole-locus haplotypes, built from the panel's block alleles, then projected to one allele pair per block.
 
-There is one production algorithm, **panel-anchored adaptive completion**. It is the default; a profile or the
-short-read preset selects it too.
-- It scores every panel diplotype and up to K off-panel mosaics built from the graph's alleles.
-- It repairs the incumbent by exact neighbour search, branching exactly at improving-move ties.
-- It certifies the winner against every rival beyond floating-point error.
-- A representation guard and a combined block quality annotate the call.
+- Every unordered pair of panel haplotypes is scored, together with up to `--mosaic-candidates` off-panel mosaics. A mosaic switches between panel haplotypes at block boundaries.
+- Read pairs are placed on each candidate, and the candidates are ranked by an exact paired-read likelihood plus a Li–Stephens recombination prior.
+- The best panel pair is then repaired by exact search over single-block changes, branching exactly where moves tie. The decision is made over every candidate scored.
+- The call is annotated, never changed, by a representation check, read support and phase support, and (under automatic library estimation) a library-sensitivity audit.
+- An optional dosage stage asks whether the reads contradict the copy numbers the call implies. With `--dosage-mode repair` it replaces a block's genotype when a complete correction is found.
 
-Leave-zero-out, leave-one-out and synthetic-mosaic runs are **evaluation scenarios**, not modes. They differ only in
-the graph and curation supplied.
+Algorithm and worked trace: [algorithms/genotype.md](../algorithms/genotype.md).
 
-The frozen C4 invocation:
+`genotype` reads a locus graph directly, for example one built by `rebuild` or a graph builder. It does not need `bubble`, `panphorte` or `call` output: without `--bubbles`, it finds the variant sites itself.
 
-    panvar genotype --profile profiles/genotype_c4_v6_campaign_local.tsv --dosage-mode repair \
-      --gfa <graph> --reference-path <reference path> --reads1 R1.fq --reads2 R2.fq \
-      --library library.txt --threads 8 --out-prefix <prefix> [--panel-curation <manifest>]
+## Required inputs
 
-**`--library`: omitted means `auto`.** There are two routes:
-- **`--library FILE`:** a declared insert distribution, error, outlier and fragment-start intensity. This is the exact
-  reproducibility route, unchanged. It runs no estimate and no audit, and its sensitivity record says NOT_APPLICABLE.
-- **Omitted, or `--library auto`:**
-  - It estimates the insert centre and spread from decisively placed pairs (at most 20,000 examined, at least 500
-    required) and the fragment-start intensity from the invariant-marker depth fit. The other values come from
-    `--preset short-read`.
-  - An estimate that fails validation refuses the run as `LIBRARY_REFUSED` and names `--library FILE`. There is no
-    fallback.
-  - The estimates and their sources go to `<prefix>.library_estimate.tsv`, and `library_invocation` records whether
-    `--library` was omitted.
-- **The sensitivity audit** (`library_sensitivity_audit_v2`; see
-  [`algorithms/library_estimate.md`](../algorithms/library_estimate.md) §8). It runs under auto: the call is also
-  followed at 0.9× and 1.1× the estimated intensity.
-  - A block is sensitive when its unordered genotype differs there, by LIKELIHOOD_RANK (the common scored pool reranked
-    at the endpoint), by SEARCH_PATH (the endpoint's independent pipeline call), or by BOTH.
-  - `library_sensitivity_status` is STABLE, SENSITIVE, NOT_EVALUATED or NOT_APPLICABLE.
-  - `library_sensitivity_filter` is PASS, LOWQUAL_LIBRARY_SENSITIVE, NOT_EVALUATED_LIBRARY_SENSITIVITY or
-    NOT_APPLICABLE.
-  - **SENSITIVE:** only the identified blocks become LOW_QUALITY `library_sensitive`, and the locus filter gains
-    `LOWQUAL_LIBRARY_SENSITIVE`.
-  - **An audit that cannot complete** (a cap, a refusal, incomplete tie branching) accuses no block. Block quality is
-    unchanged, no block table is written, and the locus filter gains `NOT_EVALUATED_LIBRARY_SENSITIVITY`. The endpoint
-    and the exact reason are recorded.
-  - The call itself never changes. The record is in `<prefix>.library_sensitivity.tsv`, and a completed audit also
-    writes `<prefix>.library_sensitivity_blocks.tsv`.
+- `--graph <graph.gfa>` (alias `--gfa`): the locus graph. Every path (`P` or `W` line) is a panel haplotype and must cross the whole locus; a haplotype that covers only part of it refuses the run.
+- `--reads1 <r1.fq>` and `--reads2 <r2.fq>`: paired reads, FASTQ, optionally gzipped, mates in the same order. With the default `--mismatch-band 6`, reads shorter than 84 bp cannot be seeded.
+- `--out <prefix>` (alias `--out-prefix`; default `genotype`). A run first removes every earlier `genotype` output under the prefix.
+- The coordinate reference. Without `--reference-path`, the graph's declared reference sample (`RS:Z` header tag) is used. It must name exactly one path; otherwise the run refuses and lists the candidates.
+- The read library: the insert-size distribution and the fragment-start intensity.
+  - **`--library` omitted, or `--library auto`:** both are estimated from the reads. Inserts come from read pairs placed identically on every panel haplotype: at most 20,000 pairs examined, at least 500 required. The intensity comes from the marker depth fit. The other library constants come from the short-read preset. An estimate that fails validation refuses the run (`LIBRARY_REFUSED`), and there is no fallback. The validation fails on: fewer than 500 pairs; a multimodal insert distribution; more than 5% insert outliers; more than 5% non-FR pairs; or a depth fit that does not converge.
+  - **`--library FILE`:** declares the library, one `key value` per line. Required keys: `insert_mean_bp`, `insert_sd_bp`, `support_sigmas`, `substitution_error`, `outlier_weight`, `fragment_start_intensity`. `marker_background` is optional. Nothing is estimated and no sensitivity audit runs, so this is the exactly reproducible route.
 
-**`--library-diagnostic`,** off by default, writes an estimate beside a `--library FILE` run and is never used by the
-call.
+The simplest production command is:
 
-**The basic command:** `--graph G --reads1 R1 --reads2 R2 --out PREFIX [--library FILE] --threads N`.
-- **An omitted `--preset` means `--preset short-read`:** the production algorithm with short-read technology
-  constants. It sets no locus, resource or dosage value, and a profile overrides it key by key. An explicit
-  `--preset short-read` is equivalent. `settings.tsv` records the source as `preset short-read (default)` or
-  `preset short-read`.
-- `--preset long-read` is refused as not implemented.
-- **The unrepaired development view** needs `--adaptive-repair off`. `--phase-audit-candidates` is development-only:
-  adaptive repair refuses it.
-- Without `--reference-path`, the graph's declared reference sample (`RS:Z`) is used. With none declared, the run
-  refuses and lists the candidates. The C4 graph declares none.
+```bash
+panvar genotype --graph locus.gfa --reads1 R1.fq.gz --reads2 R2.fq.gz --out sample
+```
 
-## `--dosage-mode off|audit|repair` (default `off`)
+It runs the default `--preset short-read`, which is the production algorithm with short-read constants. The preset sets the scientific defaults below; it sets no locus-specific, resource or dosage value. A profile overrides it key by key. The precedence, whatever the argument order, is: flag, then `--profile`, then preset, then built-in default. Every effective setting and its source is written to `<prefix>.settings.tsv`. Invalid values refuse the run before any work. `--preset long-read` is refused as not implemented.
+
+## Key options
+
+| flag | what it does | default |
+|------|--------------|---------|
+| `--library auto\|FILE` | estimate the library from the reads, or declare it ([above](#required-inputs)) | `auto` |
+| `--dosage-mode off\|audit\|repair` | the [dosage stage](#dosage-modes) | `off` |
+| `--threads <N>` | worker threads; results do not depend on the thread count | `1` |
+| `--mosaic-candidates <K>` | off-panel mosaics scored beside every panel pair; `0` scores panel pairs only | `128` |
+| `--panel-curation <file>` | panel haplotypes to exclude, one path name per line (`#` starts a comment) | — |
+| `--bubbles <file>` | a precomputed bubbles CSV instead of detecting variant sites | detected |
+| `--reference-path <name>` | the coordinate reference path | graph `RS:Z` |
+| `--profile <file>` | a validated `key<TAB>value` settings file that names itself with a `profile` line | — |
+| `--adaptive-repair on\|off` / `--repair-rounds <N>` | the exact repair and its round cap; `off` gives the unrepaired development view | `on` / `32` |
+| `-q, --quiet` | no progress messages | off |
+
+`panvar genotype --help-advanced` lists the scientific flags, each identical to its profile key:
+
+| flag | short-read preset |
+|------|-------------------|
+| `--kmer-size`, `--syncmer-s` | `31`, `15` |
+| `--min-variant-bp` | `50` |
+| `--switch-probability` | `0.01` |
+| `--proposal-state-limit` | `256` |
+| `--mismatch-band` | `6` |
+| `--repair-local-pairs`, `--repair-max-neighbours` | `32`, `670` |
+| `--repair-tie-branching`, `--repair-tie-max-branches` | `on`, `16` |
+| `--representation-guard` | `on` |
+
+Resource caps, caches, and time and memory limits are profile keys only. `--phase-audit-candidates` is a development-only control for the unrepaired view; adaptive repair refuses a non-zero value.
+
+### Dosage modes
 
 | mode | what it does |
-|---|---|
-| `off` | no dosage work; every output is byte-identical to the caller without the dosage stage |
-| `audit` | runs the dosage stage (census, features, classification, repair search, provenance) and writes only `<prefix>.dosage_*`; the call is unchanged |
-| `repair` | as audit. A block whose dosage repair is complete and resolved (COMPLETE_DIPLOTYPE_REPAIR) gets the repaired genotype; the caller's outputs are kept as `<prefix>.original.*`, a complete prefix the evaluator scores unchanged |
+|------|--------------|
+| `off` | no dosage work; DOSAGE_FILTER is NOT_EVALUATED |
+| `audit` | runs the dosage stage and writes `<prefix>.dosage_*`; the reported genotype is unchanged |
+| `repair` | as `audit`, and a block with an eligible complete repair gets the repaired genotype; the caller's outputs are kept as `<prefix>.original.*` |
 
-`repair` changes a genotype only under the four eligibility rules of `genotype_dosage.md` §22.2. Otherwise the block
-is marked `DOSAGE_REPAIR_NOT_APPLIED` with the reason, and its headline DOSAGE_FILTER is LOW_QUALITY
-`COMPLETE_REPAIR_NOT_APPLIED:<reason>`. In `audit` mode an eligible complete repair is not applied because of the
-mode only: DOSAGE_FILTER PASS `COMPLETE_REPAIR_AVAILABLE_NOT_APPLIED`, GENOTYPE_FILTER LOW_QUALITY
-`EXACT_DIPLOTYPE_UNRESOLVED`.
+The stage separates three kinds of result, which are never mixed:
+- **Ordinary call:** the caller's block alleles and haplotypes.
+- **Complete repair** (`repair_class=COMPLETE_DIPLOTYPE_REPAIR`): the reads determine both repaired block alleles. In repair mode it replaces the block's genotype when the run is a strict call, it is the only complete repair at the locus, the reported haplotypes are reproduced, and both repaired sequences are panel alleles. Otherwise it is recorded with the reason it was not applied.
+- **Conditional dosage content** (`CONDITIONAL_DOSAGE_CONTENT`): the reads determine the corrected copy numbers (`corrected_content`) but not which arrangement carries them. The block keeps the caller's alleles; a representative arrangement is written only to `<prefix>.dosage_repaired.fa`, marked `REPRESENTATIVE_ONLY_NOT_RESOLVED`, and is never a call.
 
-## Outputs: locus level and block level
+## Outputs
 
-To summarise many runs as tables, figures and a report, see [`genotype_report.md`](genotype_report.md).
+| file | contents |
+|------|----------|
+| `<prefix>.locus_genotype.tsv` | the locus-level call, one row, written in every mode: run status, call class and no-call reason; the two haplotypes (IDs, SHA-256, lengths, block paths); the unordered genotype and its score and separation; panel-template switch counts; dosage summary; the three headline filters with reasons and per-status counts; links to the other files |
+| `<prefix>.block_genotypes.tsv` | one row per block, context blocks included (`kind`, `reportable`): the allele pair, lengths, zygosity, read and phase support, conditional posterior and GQ, the representation fields, block quality, and the per-block headline filters |
+| `<prefix>.genotypes.tsv` | the same per-block call for variant blocks only, with each allele's panel source alleles |
+| `<prefix>.mosaic_haplotypes.fa` | the two whole-locus haplotypes of a strict call |
+| `<prefix>.mosaic_status.tsv` | `key value` run record: status, provenance digests, model, markers, search, ranking and repair details |
+| `<prefix>.settings.tsv` | every effective setting and its source (`default`, `preset short-read`, `profile <path>`, `flag --…`) |
+| `<prefix>.mosaic_candidates.tsv`, `.mosaic_scores.tsv`, `.equivalence_set.tsv`, `.repair_rounds.tsv`, `.tie_*.tsv` | the search record: every candidate scored, its terms, the top set and the repair trajectory |
+| `<prefix>.library_estimate.tsv`, `.library_sensitivity.tsv`, `.library_sensitivity_blocks.tsv` | under `--library auto`: the estimate and the 0.9×/1.1× intensity audit |
+| `<prefix>.dosage_*`, `<prefix>.original.*` | with `--dosage-mode audit\|repair` / `repair` |
 
-- **`<prefix>.locus_genotype.tsv`: the locus-level call,** one row, written in every mode.
-  - Run status and no-call reason, call class, locus filter, quality counts, phase support, and candidate and search
-    scope.
-  - The two haplotypes: IDs, SHA-256 digests, lengths and ordered block paths.
-  - The unordered genotype, score and separation (with their basis), and panel-template switch counts and positions.
-  - The dosage counts, the whole-locus repair scope, and links to every related file.
-  - **By call class:** a genotype-equivalent call reports the unordered genotype only, with no phase and no
-    haplotypes. A no-call reports status and reason only.
-- **`<prefix>.block_genotypes.tsv` and `<prefix>.genotypes.tsv`: the per-block decomposition.** In repair mode they
-  carry trailing dosage and provenance columns.
-- **`<prefix>.mosaic_haplotypes.fa`: the two haplotypes of a strict call.** The `hap1`/`hap2` labels assert phase only
-  where `phase_support` is `READS_WITHIN_CANDIDATES` or `READS_AUDITED`.
-- **`mosaic_scores.tsv`, `mosaic_candidates.tsv`, `equivalence_set.tsv` and the repair trajectory: the search record.**
-  They describe what the caller scored. After a dosage repair they still mark the caller's winner, and
-  `dosage_search_winner_superseded true` says so.
+Exit status is 0 when a genotype was emitted (strict or genotype-equivalent call) and 1 for a no-call. Invalid arguments and unreadable inputs exit 2; the optional time and memory limits (profile keys `time_limit_seconds`, `footprint_limit_bytes`) exit 124 and 125.
 
-## Three kinds of result, never mixed
+### Reading the call
 
-- **Exact genotype.** The reported block alleles and haplotypes: the caller's, or an applied COMPLETE_DIPLOTYPE_REPAIR
-  (`dosage_repair_role=RESOLVED`).
-- **Dosage content** (`corrected_content`, for `CONDITIONAL_DOSAGE_CONTENT`). The corrected unit count, HERV (I-state)
-  count and feature copy vector, authoritative within the declared model.
-  - The block keeps the caller's alleles.
-  - "Complete" means every admissible candidate shares that content. It does not mean the content is correct.
-- **Conditional representative.** One arrangement serialising a set of arrangements the reads cannot distinguish:
-  `REPRESENTATIVE_ONLY_NOT_RESOLVED`, only in `dosage_repaired*.fa` and the equivalence table.
-  - It is never a call.
-  - It never enters the allele columns, the locus digests or the main FASTA.
+**Call class.** A *strict call* (`run_status=COMPLETE`) has one best pair of haplotypes. A *genotype-equivalent call* (`CONDITIONAL_GENOTYPE_EQUIVALENT`) has several best pairs that agree on every block's unordered genotype but not on phase: it reports the unordered genotype only, with no FASTA and no phase. A *no-call* reports its status and `no_call_reason`, for example `distinct_tie` (best candidates disagree at a block) or `tie_branching_incomplete`, and writes no genotype tables.
 
-## Headline filters
+**Haplotype sequences.** Each block's two alleles are panel block alleles: `allele1_sources` and `allele2_sources` name the panel alleles, and the locus table counts the fewest switches between panel haplotypes needed to spell each haplotype. A haplotype can therefore be off-panel as a whole, while every block of it is a panel allele. The FASTA header's `phase_support` and `representation=` say how far its `hap1`/`hap2` order is supported. After an applied complete repair the header gains `dosage_repair_role=RESOLVED`. Sequences generated by the dosage stage are compared with the panel in `<prefix>.dosage_provenance.tsv`, which reports the nearest panel haplotype and allele by edit distance.
 
-Three independent verdicts, GENOTYPE_FILTER, DOSAGE_FILTER and PHASE_FILTER, rendered as
-`CALL_SUMMARY=GENOTYPE_<s>;DOSAGE_<s>;PHASE_<s>`. There is no global PASS/FAIL. The full specification is
-[`algorithms/genotype_headline_filters.md`](../algorithms/genotype_headline_filters.md).
+**Headline filters.** There is no single PASS/FAIL. Three independent verdicts summarise the call, rendered together as `call_summary=GENOTYPE_<s>;DOSAGE_<s>;PHASE_<s>`:
 
-- **Values:** PASS, LOW_QUALITY, NOT_EVALUATED, NO_CALL and NOT_APPLICABLE.
-- **Precedence is fail-closed:** NO_CALL > NOT_EVALUATED > LOW_QUALITY > PASS > NOT_APPLICABLE. Every reason is kept.
-- **Per block** (`block_genotypes.tsv`, `genotypes.tsv`): `genotype_filter`, `dosage_filter` and their reasons.
-- **Per locus** (`locus_genotype.tsv`): all three filters, `REASON@ids` reason lists, and per-status unit counts. The
-  counts show how many blocks (or boundaries) are usable when the fail-closed headline is not PASS.
-- **Genotype:** fails on no-call, representation conflict or not evaluated, library sensitivity, or an exact diplotype
-  left unresolved by the dosage stage. `genotype_support=PRIOR_ONLY` alone does not fail it.
-- **Dosage:** NOT_EVALUATED under `--dosage-mode off` (the default). A complete content correction is dosage PASS and
-  genotype LOW_QUALITY (`EXACT_DIPLOTYPE_UNRESOLVED`); its reported alleles stay the caller's.
-- **Phase:** a boundary verdict from the locus `phase_support`. It is PASS only when the reads support the phase;
-  prior-selected phase is LOW_QUALITY (`MODEL_ONLY_PHASE`).
-- **Usage policies** are documented selections, not filters:
-  - `EXACT_GENOTYPE_USABLE` = genotype PASS and dosage PASS or NOT_APPLICABLE;
-  - `DOSAGE_CONTENT_USABLE` = dosage PASS;
-  - `PHASED_GENOTYPE_USABLE` = exact genotype usable and phase PASS.
-
-## Component filters
-
-Each filter describes the **reported** genotype. After an applied repair, the caller's values are in `original_*`.
-
-| field | values | meaning |
+| filter | unit | PASS means |
 |---|---|---|
-| `filter` (representation) | `PASS`, `LOWQUAL_REPRESENTATION_CONFLICT`, `NOT_EVALUATED` | the marker depth and the exposure term prefer another pair while the fragment term prefers the call, each by ≥ ln 1000 (`representation_conflict_rule_v1`) |
-| `genotype_support` | `READS`, `PRIOR_ONLY` | whether the reads alone put every rival of another genotype at this block below the reported diplotype |
-| `quality_filter` | `PASS`, `LOW_QUALITY` | `block_quality_rule_v1`: PASS only for representation PASS with READS support and, under `--library auto`, no library sensitivity (reason `library_sensitive`) |
-| `dosage_stage_filter` (repair mode; was `dosage_filter` before `headline_filters_v2`, and frozen historical tables keep that name) | `PASS`, `DOSAGE_CONTENT_CORRECTED`, `DOSAGE_TRIGGERED_UNREPAIRED`, `DOSAGE_SUSPECT`, `DOSAGE_UNDERPOWERED`, `DOSAGE_NOT_EVALUATED`, `DOSAGE_REPAIR_NOT_APPLIED` | the dosage stage's own verdict on the reported block; information limits are reasons, never merged into `quality_filter` |
-| `locus_filter` | `PASS`, `LOWQUAL_REPRESENTATION_CONFLICT`, `LOWQUAL_LIBRARY_SENSITIVE`, `NOT_EVALUATED`, `NOT_EVALUATED_LIBRARY_SENSITIVITY` (several joined by `;`) | fails closed over the blocks; a flag wins over NOT_EVALUATED; an incomplete library audit is a locus-level warning |
+| GENOTYPE_FILTER | block | the representation check passed; under `--library auto`, the genotype was stable at both audit intensities; and, if the dosage stage ran, it did not leave the exact diplotype unresolved |
+| DOSAGE_FILTER | block | the dosage stage ran and found the copy numbers consistent, or a complete repair resolved them |
+| PHASE_FILTER | adjacent pair of heterozygous blocks | the reads, not only the prior, support the phase |
 
-A repaired run's filters are recomputed on the repaired diplotype. If the caller's own annotation cannot first be
-reproduced, the value is `NOT_EVALUATED_AFTER_DOSAGE_REPAIR`: never copied, never PASS.
+Each takes the most severe applicable status: NO_CALL, then NOT_EVALUATED, then LOW_QUALITY, then PASS, then NOT_APPLICABLE. The locus value is the worst unit, with reasons listed as `REASON@ids`.
+- **LOW_QUALITY:** a call was made, but a check flagged it, e.g. `REPRESENTATION_CONFLICT`, `LIBRARY_SENSITIVE`, or `MODEL_ONLY_PHASE` when the phase rests on the prior.
+- **NOT_EVALUATED:** the check could not be made, e.g. `DOSAGE_NOT_EVALUATED:dosage_mode_off` (the default), or an incomplete library audit.
+- **NO_CALL:** nothing was called.
+- **NOT_APPLICABLE:** the check does not apply, e.g. a block that is not dosage-sensitive, or a boundary next to a homozygous block.
 
-## C4 timing and memory (M4, 8 threads)
+The usage policies are selections, not filters. An exact genotype is usable when GENOTYPE_FILTER is PASS and DOSAGE_FILTER is PASS or NOT_APPLICABLE; with `--dosage-mode off` it therefore needs the dosage stage first. Dosage content is usable when DOSAGE_FILTER is PASS. A phased genotype is usable when it is an exact genotype and PHASE_FILTER is PASS.
 
-Genotyping: the sealed 484-job campaign, per job.
+The headline filters summarise component annotations that stay in the tables: `filter` (the representation check), `genotype_support` (`READS` or `PRIOR_ONLY`), `quality_filter`, the library-sensitivity fields and, in repair mode, `dosage_stage_filter`. A component can be stricter than the headline. For example, `quality_filter` is LOW_QUALITY for `PRIOR_ONLY` read support, while GENOTYPE_FILTER does not use read support. After an applied repair the components describe the reported genotype; the caller's values are kept in `original_*` columns.
 
-| scenario | 2× median / max | 30× median / p90 / max | peak footprint at 30× |
-|---|---|---|---|
-| leave-zero-out | 13.2 / 23.2 s | 72.1 / 96.9 / 112.5 s | 3.45 GiB |
-| synthetic mosaic | 26.3 / 35.2 s | 146.4 / 295.4 / 347.3 s | 3.13 GiB |
-| leave-one-out | 17.1 / 38.5 s | 117.5 / 231.5 / 306.7 s | 3.58 GiB |
+### Reporting
 
-**Dosage stage, repair mode** (649-cell replay at `26401b4`, 4 threads):
-- The per-cell mean is 2.7–8.0 s.
-- The worst cell took 165.9 s.
-- The peak footprint was 2.85 GiB.
+`scripts/plot_genotype_results.py` summarises many runs as tables, figures and a short report. It reads a directory of `panvar genotype` prefixes or a two-table package. It never changes a call. Without truth tables it is truth-free QC: call classes, headline filters, support, dosage states, runtime. Accuracy figures need explicit truth tables (`--evaluation-blocks`, `--dosage-content-evaluation`, `--phase-boundaries`). Reruns are byte-identical. Its options are documented under `--help`.
 
-## Settings
+## Limitations
 
-- **Basic help:** `panvar genotype --help`. **Advanced:** `panvar genotype --help-advanced`, which lists the scientific
-  flags (`--kmer-size`, `--syncmer-s`, `--min-variant-bp`, `--switch-probability`, `--proposal-state-limit`,
-  `--mismatch-band`, `--phase-audit-candidates`, `--repair-local-pairs`, `--repair-max-neighbours`,
-  `--repair-tie-branching on|off`, `--repair-tie-max-branches` and `--representation-guard on|off`).
-- **Each flag is exactly its profile key:** the same parser and the same validation.
-- **Resource caps, caches and time and footprint limits** stay profile keys.
-- **Precedence** is flag > profile > preset > built-in default, whatever the argument order. The preset is
-  short-read unless another is named.
-- **Provenance:** every effective setting and its source is in `<prefix>.settings.tsv`.
-- **Invalid values** refuse before any work.
+- **The panel bounds the answer.** Every reported block allele is a panel allele. A sequence absent from the panel cannot be called; the closest representable allele is called instead. A switch between panel haplotypes can only occur at a block boundary.
+- **Allocation is unresolved.** Short reads may establish how many copies of a repeated unit a sample carries without showing which homologue carries each copy. A complete repair with an unresolved allocation is reported as such, and conditional dosage content never becomes a call.
+- **Some sequence is structurally unobservable.** Where the alternatives differ only beyond the reach of a read pair, the reads cannot separate them. The call is then decided by the prior (`PRIOR_ONLY`, `MODEL_ONLY_PHASE`), or the run no-calls on a tie. GQ is conditional on the scored candidates and uncalibrated.
+- **No long-read support.** Only paired short reads are modelled, and `--preset long-read` is refused. Single-end reads are not supported.
+- **Validation scope.** The method and the resource caps have been studied in depth on one complex locus with simulated reads, which carry constant base qualities. The dosage stage is off by default for that reason.
+- **Resources.** These figures are an example, not a guarantee: on that locus, the median 30× sample took 1–2.5 minutes, and the peak memory was up to 3.6 GiB, at 8 threads. Larger panels and more alleles per block cost more. A repair neighbourhood larger than `--repair-max-neighbours` refuses the run (`neighbourhood_bound`).
 
-## Known limitations
+## Example
 
-**Scope of validation:**
-- **Validated on one locus (C4), with simulated short reads and a declared library.** The simulator writes constant base
-  qualities.
-- **Resource caps are sized on C4.** The dosage default is `off` until other loci validate it.
-- **Leave-one-out accuracy is limited by availability.** The truth is often not spellable from the panel, so read
-  excess, not raw distance. The floor is attained in 58/67/75/84% of blocks at 2/5/10/30×.
+A minimal run, with the library estimated from the reads:
 
-**Calls:**
-- **Two no-calls in the frozen C4 set,** both `tie_branching_incomplete`: `loo.HG01573.30`, and fresh `loo.HG01573.5`.
-- **HG00096 is the C4 coordinate reference.** Leave-one-out on it is not a supported scenario.
+```bash
+panvar genotype --graph locus.gfa --reads1 R1.fq.gz --reads2 R2.fq.gz --out sample --threads 8
+```
 
-**Allocation:** which homologue carries each HERV-bearing C4 module cannot be seen from short reads.
-- At `loo.NA19650` 10× and 30× a catastrophic allocation error is dosage-CONSISTENT, read-supported and passes
-  `EXACT_GENOTYPE_USABLE`.
-- No truth-free field identifies it, and no exception is made. Treat allocation as unverified unless `allocation_status`
-  is resolved.
+The same run with a declared library and dosage repair:
 
-**Dosage:**
-- **Which module carries a HERV (allocation) cannot be seen from short reads.** Conditional representatives are
-  non-authoritative.
-- **Dosage content can be complete but wrong** when the bootstrap interval excludes the truth (fresh `loo.NA19434.2`).
-- **The four applied C4 complete repairs (HG03456 sv:1) have no defined truth.** A synthetic known-truth repair
-  passes. The repaired pairs are dosage-supported, not read-supported (`PRIOR_ONLY`).
-
-**Inputs and builds:**
-- **Automatic library estimation is the default.** On the 8 C4 sentinels its audit flags `loo.HG03456.2` as
-  SEARCH_PATH-sensitive at 5 blocks (`library_estimate.md` §8). There the central genotype is still the 0.9×
-  likelihood's best scored candidate, but an independent 0.9× run reaches another local optimum.
-- **Rebuilds are not byte-identical.** A rebuilt `panvar` differs from the frozen binary only in the Mach-O UUID,
-  debug map and code signature; the code and data sections are identical.
+```bash
+cat > library.txt <<'EOF'
+insert_mean_bp 400
+insert_sd_bp 50
+support_sigmas 4
+substitution_error 0.002
+outlier_weight 0.001
+fragment_start_intensity 0.05
+EOF
+panvar genotype --graph locus.gfa --reads1 R1.fq.gz --reads2 R2.fq.gz --out sample \
+  --library library.txt --dosage-mode repair --threads 8
+cut -f1-5 sample.block_genotypes.tsv
+awk -F'\t' 'NR==1{for(i=1;i<=NF;i++)c[$i]=i} NR==2{print $c["call_class"], $c["call_summary"]}' sample.locus_genotype.tsv
+```
