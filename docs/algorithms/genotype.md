@@ -22,7 +22,7 @@ The model fails closed, with status `MODEL_INCOMPLETE`, if any of the following 
 
 Identical allele sequences within a block are collapsed to one canonical allele.
 
-A declared library (`--library FILE`) is validated:
+A declared library (`--library FILE`) is parsed strictly: the six required keys and the optional `marker_background`, each once, every value a finite number. It is then validated:
 - `μ > 0` and `σ > 0`;
 - `0 < substitution_error < 0.75`;
 - `0 ≤ outlier_weight < 1`;
@@ -294,7 +294,7 @@ For example, `m = 4` gives `z_c = 3.662` and an underpowered threshold of 0.202.
 
 ### 12. Repair dosage: complete diplotype or conditional content
 
-Each `AUTO_REPAIR` block searches for dosage-admissible alternatives. Each alternative is spliced into the reported homologues and scored with the exact likelihood of stage 6. The reported diplotype must first reproduce its own terms within 1e-6.
+Each `AUTO_REPAIR` block searches for dosage-admissible alternatives. The search runs in `audit` and `repair` mode alike; only `repair` applies its result. Each alternative is spliced into the reported homologues and scored with the exact likelihood of stage 6. The reported diplotype must first reproduce its own terms within 1e-6.
 - **Pair route.** Every panel allele pair whose copy numbers are admissible for every feature, scored in both orientations (at most 4,096 pairs).
 - **Repeated-unit route.** New alleles are built from multisets of the repeated units. A negative-binomial screen ranks them under construction caps of 64 multisets, 256 haploids and 4,096 diploids.
 
@@ -333,7 +333,7 @@ If the caller's own annotation cannot be reproduced, the value is `NOT_EVALUATED
 
 The dosage stage's repaired sequences are compared with the panel in `dosage_provenance.tsv`. It reports the nearest panel haplotype and the nearest panel block allele, by global unit-cost edit distance (all tied nearest sequences, ordered by SHA-256), with the alignment's CIGAR and the distance divided by the alignment columns.
 
-The run's status is written to `mosaic_status.tsv` and every effective setting to `settings.tsv`. A no-call writes no genotype tables. The exit status is 0 for a strict or genotype-equivalent call and 1 for a no-call.
+The run's status is written to `mosaic_status.tsv` and every effective setting to `settings.tsv`. A no-call writes no genotype tables. The exit status is 0 for a strict or genotype-equivalent call, 1 for a no-call, 2 for an argument, input or output error, and 124 or 125 when the optional time or footprint limit stops the run.
 
 ### 15. Derive the headline filters
 
@@ -376,6 +376,8 @@ Each of the three filters gives every unit the most severe applicable status: `N
 | `PRIOR_ONLY` | LOW_QUALITY `MODEL_ONLY_PHASE` |
 
 A boundary next to an applied repair is NOT_EVALUATED (`PHASE_NOT_ASSESSED_AFTER_DOSAGE_REPAIR`).
+
+A no-call is NO_CALL in every unit of all three filters. A run that stopped before its blocks were built has no block units, so each filter gets a single `locus` unit, and the summary is `GENOTYPE_NO_CALL;DOSAGE_NO_CALL;PHASE_NO_CALL`.
 
 `call_summary` is `GENOTYPE_<s>;DOSAGE_<s>;PHASE_<s>`. The per-status unit counts beside each filter show how many blocks or boundaries are usable when the locus value is not PASS. `genotype_support`, `quality_filter` and GQ do not enter the headline.
 

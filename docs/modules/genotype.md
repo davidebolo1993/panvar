@@ -24,7 +24,7 @@ Algorithm and worked trace: [algorithms/genotype.md](../algorithms/genotype.md).
 - The coordinate reference. Without `--reference-path`, the graph's declared reference sample (`RS:Z` header tag) is used. It must name exactly one path; otherwise the run refuses and lists the candidates.
 - The read library: the insert-size distribution and the fragment-start intensity.
   - **`--library` omitted, or `--library auto`:** both are estimated from the reads. Inserts come from read pairs placed identically on every panel haplotype: at most 20,000 pairs examined, at least 500 required. The intensity comes from the marker depth fit. The other library constants come from the short-read preset. An estimate that fails validation refuses the run (`LIBRARY_REFUSED`), and there is no fallback. The validation fails on: fewer than 500 pairs; a multimodal insert distribution; more than 5% insert outliers; more than 5% non-FR pairs; or a depth fit that does not converge.
-  - **`--library FILE`:** declares the library, one `key value` per line. Required keys: `insert_mean_bp`, `insert_sd_bp`, `support_sigmas`, `substitution_error`, `outlier_weight`, `fragment_start_intensity`. `marker_background` is optional. Nothing is estimated and no sensitivity audit runs, so this is the exactly reproducible route.
+  - **`--library FILE`:** declares the library, one `key value` per line. It takes exactly six required keys (`insert_mean_bp`, `insert_sd_bp`, `support_sigmas`, `substitution_error`, `outlier_weight`, `fragment_start_intensity`) and the optional `marker_background`, each at most once. Blank lines and lines starting with `#` are skipped, and a value may be followed by a `#` comment. An unknown, repeated or missing key, any other trailing content, or a value that is not a finite number refuses the run, naming the file, line and key. The gap model (`gap_open`, `gap_extend` and the maximum displacement) is fixed by the short-read model and cannot be declared. Nothing is estimated and no sensitivity audit runs, so this is the exactly reproducible route.
 
 The simplest production command is:
 
@@ -46,7 +46,7 @@ It runs the default `--preset short-read`, which is the production algorithm wit
 | `--bubbles <file>` | a precomputed bubbles CSV instead of detecting variant sites | detected |
 | `--reference-path <name>` | the coordinate reference path | graph `RS:Z` |
 | `--profile <file>` | a validated `key<TAB>value` settings file that names itself with a `profile` line | — |
-| `--adaptive-repair on\|off` / `--repair-rounds <N>` | the exact repair and its round cap; `off` gives the unrepaired development view | `on` / `32` |
+| `--adaptive-repair on\|off` / `--repair-rounds <N>` | the exact repair and its round cap; `off`, or `--repair-rounds 0`, gives the unrepaired development view. The two are resolved together whatever their order, and an explicit contradiction (`off` with N > 0, `on` with 0) is refused | `on` / `32` |
 | `-q, --quiet` | no progress messages | off |
 
 `panvar genotype --help-advanced` lists the scientific flags, each identical to its profile key:
@@ -54,10 +54,10 @@ It runs the default `--preset short-read`, which is the production algorithm wit
 | flag | short-read preset |
 |------|-------------------|
 | `--kmer-size`, `--syncmer-s` | `31`, `15` |
-| `--min-variant-bp` | `50` |
+| `--min-variant-bp`: a candidate variant site is kept when some path spans at least N bp inside it (an interior span, not an allele-length difference) | `50` |
 | `--switch-probability` | `0.01` |
 | `--proposal-state-limit` | `256` |
-| `--mismatch-band` | `6` |
+| `--mismatch-band`: the per-mate edit budget of the banded gapped placement model, counting substitutions and gap bases | `6` |
 | `--repair-local-pairs`, `--repair-max-neighbours` | `32`, `670` |
 | `--repair-tie-branching`, `--repair-tie-max-branches` | `on`, `16` |
 | `--representation-guard` | `on` |
@@ -69,7 +69,7 @@ Resource caps, caches, and time and memory limits are profile keys only. `--phas
 | mode | what it does |
 |------|--------------|
 | `off` | no dosage work; DOSAGE_FILTER is NOT_EVALUATED |
-| `audit` | runs the dosage stage and writes `<prefix>.dosage_*`; the reported genotype is unchanged |
+| `audit` | runs the dosage stage, including the same repair candidate search as `repair`, and writes `<prefix>.dosage_*`; it never applies a repair, so the reported genotype is unchanged. It is not necessarily cheaper than `repair` |
 | `repair` | as `audit`, and a block with an eligible complete repair gets the repaired genotype; the caller's outputs are kept as `<prefix>.original.*` |
 
 The stage separates three kinds of result, which are never mixed:
@@ -83,7 +83,7 @@ The stage separates three kinds of result, which are never mixed:
 |------|----------|
 | `<prefix>.locus_genotype.tsv` | the locus-level call, one row, written in every mode: run status, call class and no-call reason; the two haplotypes (IDs, SHA-256, lengths, block paths); the unordered genotype and its score and separation; panel-template switch counts; dosage summary; the three headline filters with reasons and per-status counts; links to the other files |
 | `<prefix>.block_genotypes.tsv` | one row per block, context blocks included (`kind`, `reportable`): the allele pair, lengths, zygosity, read and phase support, conditional posterior and GQ, the representation fields, block quality, and the per-block headline filters |
-| `<prefix>.genotypes.tsv` | the same per-block call for variant blocks only, with each allele's panel source alleles |
+| `<prefix>.genotypes.tsv` | the same per-block call for variant blocks only, with each allele's panel source alleles; it carries the same per-block headline columns (`genotype_filter`, `dosage_filter` and their reasons) |
 | `<prefix>.mosaic_haplotypes.fa` | the two whole-locus haplotypes of a strict call |
 | `<prefix>.mosaic_status.tsv` | `key value` run record: status, provenance digests, model, markers, search, ranking and repair details |
 | `<prefix>.settings.tsv` | every effective setting and its source (`default`, `preset short-read`, `profile <path>`, `flag --…`) |
@@ -109,8 +109,8 @@ Exit status is 0 when a genotype was emitted (strict or genotype-equivalent call
 
 Each takes the most severe applicable status: NO_CALL, then NOT_EVALUATED, then LOW_QUALITY, then PASS, then NOT_APPLICABLE. The locus value is the worst unit, with reasons listed as `REASON@ids`.
 - **LOW_QUALITY:** a call was made, but a check flagged it, e.g. `REPRESENTATION_CONFLICT`, `LIBRARY_SENSITIVE`, or `MODEL_ONLY_PHASE` when the phase rests on the prior.
-- **NOT_EVALUATED:** the check could not be made, e.g. `DOSAGE_NOT_EVALUATED:dosage_mode_off` (the default), or an incomplete library audit.
-- **NO_CALL:** nothing was called.
+- **NOT_EVALUATED:** the check could not be made, e.g. `DOSAGE_NOT_EVALUATED:dosage_mode_off` (the default for a call). Under `--library auto`, a sensitivity audit that cannot complete makes GENOTYPE_FILTER NOT_EVALUATED (`LIBRARY_SENSITIVITY_NOT_EVALUATED`) at every block, not only the locus filter.
+- **NO_CALL:** nothing was called. A no-call is NO_CALL in all three filters, DOSAGE_FILTER included even under `--dosage-mode off`. A run that stopped before its blocks were built reports one locus-level unit per filter: `GENOTYPE_NO_CALL;DOSAGE_NO_CALL;PHASE_NO_CALL` with the run's reason.
 - **NOT_APPLICABLE:** the check does not apply, e.g. a block that is not dosage-sensitive, or a boundary next to a homozygous block.
 
 The usage policies are selections, not filters. An exact genotype is usable when GENOTYPE_FILTER is PASS and DOSAGE_FILTER is PASS or NOT_APPLICABLE; with `--dosage-mode off` it therefore needs the dosage stage first. Dosage content is usable when DOSAGE_FILTER is PASS. A phased genotype is usable when it is an exact genotype and PHASE_FILTER is PASS.
