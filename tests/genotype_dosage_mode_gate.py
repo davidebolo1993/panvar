@@ -3,12 +3,15 @@
 end to end with `panvar genotype`:
 
   identity   the flag absent and `--dosage-mode off` equal the sealed 11fe681 outputs (normalised as the shadow gate
-             normalises them) and add only <prefix>.locus_genotype.tsv; audit leaves every pre-existing output equal to
-             off and adds only <prefix>.dosage_*;
+             normalises them) and add exactly the ordinary outputs written since that campaign: <prefix>.locus_genotype.tsv,
+             .settings.tsv and .library_sensitivity.tsv in every run, and under --library auto the library estimate and,
+             for a completed audit, the per-block sensitivity table; audit leaves every pre-existing output equal to off
+             and adds only <prefix>.dosage_*;
   repair     every block that is not an applied COMPLETE_DIPLOTYPE_REPAIR equals audit in every legacy column; an
              applied block differs only in its genotype columns; the search record (scores, candidates, equivalence
              set, trajectory) is unchanged; the status is audit's with dosage keys appended;
-  round trip <prefix>.original.* equal audit's outputs;
+  round trip repair writes audit's files plus exactly one <prefix>.original copy of each caller output, and each
+             <prefix>.original.* equals audit's output;
   schema     the trailing block columns and the locus table's columns, in order;
   leakage    no conditional representative in a primary allele column, the locus digests or the main FASTA;
   locus      the locus table agrees with the block table, the FASTA and the equivalence set;
@@ -70,6 +73,11 @@ STATUS_VOLATILE = re.compile(r"^(seconds_|resources_|threads_|phys_footprint|rss
                              r"settings_overridden|scorer_placement_capacity_bytes_peak)")
 SKIP = (".eval.", ".gate_eval", ".evaluate.log", ".command.txt", ".log", ".time", ".done", ".repair_memory.tsv", ".tie_branch_memory.tsv")
 REFERENCE = "HG00096#1#haplotype1-0000024:31848049-32074186"
+# Ordinary outputs every run writes beyond the sealed 11fe681 campaign's set (the locus table, the settings record and
+# the library-sensitivity record), and those only --library auto adds (the estimate; the per-block table when the
+# sensitivity audit completes).
+ORDINARY_OUTPUTS = {".locus_genotype.tsv", ".settings.tsv", ".library_sensitivity.tsv"}
+AUTO_LIBRARY_OUTPUTS = {".library_estimate.tsv", ".library_sensitivity_blocks.tsv"}
 
 failures = []
 def check(ok, what):
@@ -140,7 +148,9 @@ def main():
         for s in sealed_files:
             check(os.path.exists(P[arm] + s) and norm(sealed + s, sealed) == norm(P[arm] + s, P[arm]), f"{arm}{s} differs from the campaign")
         extra = set(files(P[arm])) - set(files(sealed)) - {".log"}
-        check(extra == {".locus_genotype.tsv"}, f"{arm} adds {sorted(extra)}")
+        check(ORDINARY_OUTPUTS <= extra <= ORDINARY_OUTPUTS | (AUTO_LIBRARY_OUTPUTS if lib == "auto" else set()),
+              f"{arm} adds {sorted(extra)}; expected exactly {sorted(ORDINARY_OUTPUTS)}"
+              + (f" and optionally {sorted(AUTO_LIBRARY_OUTPUTS)}" if lib == "auto" else ""))
     for s in (files(P["off"]) if "absent" in P else []):
         if s == ".log" or any(x in s for x in SKIP): continue
         check(norm(P["absent"] + s, P["absent"]) == norm(P["off"] + s, P["off"]), f"absent{s} != off{s}")
@@ -214,6 +224,12 @@ def main():
     for s in LEGACY:
         if os.path.exists(P["audit"] + s):
             check(norm(P["repair"] + ".original" + s, P["repair"]) == norm(P["audit"] + s, P["audit"]), f"repair.original{s} != audit{s}")
+    # repair writes audit's files plus one .original copy of each caller output, nothing else (the contract keeps the
+    # caller's outputs recoverable whether or not a repair was applied)
+    kept = lambda fs: {x for x in fs if not any(k in x for k in SKIP)}
+    want_repair = kept(files(P["audit"])) | {".original" + x for x in LEGACY if os.path.exists(P["audit"] + x)}
+    got_repair = kept(files(P["repair"]))
+    check(got_repair == want_repair, f"repair file set: unexpected {sorted(got_repair - want_repair)}, missing {sorted(want_repair - got_repair)}")
     for s in SEARCH_RECORD:
         if os.path.exists(P["audit"] + s):
             check(norm(P["repair"] + s, P["repair"]) == norm(P["audit"] + s, P["audit"]), f"repair{s} (search record) changed")
