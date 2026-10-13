@@ -138,7 +138,7 @@ void test_repair_option_order() {
         {"on", on, {}, ok(32, true)},
         {"off", off, {}, ok(0, false)},
         {"rounds 5", r5, {}, ok(5, true)},
-        {"rounds 0", r0, {}, ok(0, true)},
+        {"rounds 0", r0, {}, ok(0, false)},
         {"on + rounds 5", on, r5, ok(5, true)},
         {"on + rounds 0", on, r0, refuse},
         {"off + rounds 5", off, r5, refuse},
@@ -146,6 +146,10 @@ void test_repair_option_order() {
         {"off + tie on", off, tie_on, refuse},
         {"off + tie off", off, tie_off, ok(0, false)},
         {"on + tie off", on, tie_off, ok(32, false)},
+        {"rounds 0 + tie on", r0, tie_on, refuse},
+        {"rounds 0 + tie off", r0, tie_off, ok(0, false)},
+        {"rounds 5 + tie on", r5, tie_on, ok(5, true)},
+        {"rounds 5 + tie off", r5, tie_off, ok(5, false)},
     };
     for (const Case& c : cases) {
         Args ab = c.a, ba = c.b;
@@ -165,6 +169,14 @@ void test_repair_option_order() {
     require(parse({"--profile", path("rounds11.tsv"), "--adaptive-repair", "on"}) == ok(11, true), "profile cap kept by on");
     require(parse({"--adaptive-repair", "on", "--profile", path("rounds0.tsv")}) == ok(32, true), "profile 0 with on gives 32");
     require(parse({"--profile", path("rounds11.tsv")}) == ok(11, true), "profile alone");
+    // A round cap of 0 from any source is the unrepaired view: tie branching off, recorded with the cap's source.
+    panvar::GenotypeCommandOptions zero;
+    require(parse({"--repair-rounds", "0"}, &zero) == ok(0, false) &&
+                zero.setting_sources.at("repair_tie_branching") == "flag --repair-rounds",
+            "--repair-rounds 0 records tie branching off from the flag");
+    require(parse({"--profile", path("rounds0.tsv")}, &zero) == ok(0, false) &&
+                zero.setting_sources.at("repair_tie_branching").rfind("profile ", 0) == 0,
+            "a profile's 0 rounds turns tie branching off, recorded from the profile");
     std::cout << "  repair options: " << cases.size() << " combinations, both orders identical; contradictions refused\n";
 }
 
@@ -204,7 +216,7 @@ void test_help_text() {
     require(h.find("FILE declares\n") == std::string::npos && h.find("declares every value") == std::string::npos,
             "--help must not claim the file declares every value");
     for (const char* needle : {"some path spans at least N bp inside it", "per-mate edit budget", "substitutions + gap bases",
-                               "cannot be supplied in the file", "explicit contradiction"}) {
+                               "cannot be supplied in the file", "explicit contradiction", "tie branching on with no rounds"}) {
         require(a.find(needle) != std::string::npos, std::string("--help-advanced must say: ") + needle);
     }
     require(a.find("--repair-origin-cache-bytes") == std::string::npos && h.find("--repair-origin-cache-bytes") == std::string::npos,

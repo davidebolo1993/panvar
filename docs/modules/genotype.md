@@ -46,7 +46,7 @@ It runs the default `--preset short-read`, which is the production algorithm wit
 | `--bubbles <file>` | a precomputed bubbles CSV instead of detecting variant sites | detected |
 | `--reference-path <name>` | the coordinate reference path | graph `RS:Z` |
 | `--profile <file>` | a validated `key<TAB>value` settings file that names itself with a `profile` line | — |
-| `--adaptive-repair on\|off` / `--repair-rounds <N>` | the exact repair and its round cap; `off`, or `--repair-rounds 0`, gives the unrepaired development view. The two are resolved together whatever their order, and an explicit contradiction (`off` with N > 0, `on` with 0) is refused | `on` / `32` |
+| `--adaptive-repair on\|off` / `--repair-rounds <N>` | the exact repair and its round cap; `off`, or `--repair-rounds 0`, gives the unrepaired development view, with tie branching off. These and `--repair-tie-branching` are resolved together whatever their order, and an explicit contradiction (`off` with N > 0, `on` with 0, tie branching on with 0 rounds) is refused | `on` / `32` |
 | `-q, --quiet` | no progress messages | off |
 
 `panvar genotype --help-advanced` lists the scientific flags, each identical to its profile key:

@@ -5425,9 +5425,10 @@ std::optional<int> parse_genotype_arguments(const std::vector<std::string>& args
                 "optionally marker_background, each once; '#' starts a comment. gap_open, gap_extend and the maximum\n"
                 "displacement are fixed by the short-read model and cannot be supplied in the file.\n\n"
                 "Development view: --adaptive-repair off gives the unrepaired proposal call (no repair rounds, no tie\n"
-                "branching); --repair-rounds 0 alone does the same. --adaptive-repair and --repair-rounds are resolved\n"
-                "together whatever their order; an explicit contradiction (off with N > 0 rounds, on with 0 rounds) is\n"
-                "refused. Diagnostic and test hooks are not user settings and are not listed.\n";
+                "branching); --repair-rounds 0 is the same view, with tie branching off. --adaptive-repair, --repair-rounds\n"
+                "and --repair-tie-branching are resolved together whatever their order; an explicit contradiction (off\n"
+                "with N > 0 rounds, on with 0 rounds, tie branching on with no rounds) is refused. Diagnostic and test\n"
+                "hooks are not user settings and are not listed.\n";
             return 0;
                 } else {
             throw std::runtime_error("unknown genotype option: " + flag);
@@ -5456,6 +5457,18 @@ std::optional<int> parse_genotype_arguments(const std::vector<std::string>& args
                                      "least one round (use --adaptive-repair off for the unrepaired view)");
         }
         if (options.repair_rounds == 0) apply_genotype_setting("flag --adaptive-repair", "repair_rounds", "32", options);
+    }
+    // No repair rounds is the unrepaired view, whatever set it: tie branching belongs to the repair, so its effective value
+    // is off too (in the settings record as in execution). An explicit --repair-tie-branching on beside it is refused.
+    if (options.repair_rounds == 0 && options.repair_tie_branching) {
+        if (tie_branching_flag && *tie_branching_flag == "1") {
+            throw std::runtime_error("--repair-tie-branching on contradicts a repair round cap of 0 (" +
+                                     options.setting_sources["repair_rounds"] +
+                                     "): tie branching is part of the adaptive repair");
+        }
+        const auto source = options.setting_sources.find("repair_rounds");
+        apply_genotype_setting(source == options.setting_sources.end() ? std::string("default") : source->second,
+                               "repair_tie_branching", "0", options);
     }
     if (profiled) {
         // Every setting a flag gave beside the profile, with the value it took.

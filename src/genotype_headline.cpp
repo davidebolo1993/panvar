@@ -87,6 +87,10 @@ Verdict dosage_verdict(const LocusFacts& locus, const BlockFacts& block) {
         return v("LOW_QUALITY", "COMPLETE_REPAIR_NOT_APPLIED:" + block.repair_not_applied_reason);
     }
     if (s == "CONTENT_REPAIRED" && block.dosage_content_scope == "COMPLETE") return v("PASS", "CONTENT_CORRECTED_EXACT_DIPLOTYPE_UNRESOLVED");
+    // Inconsistent-input guard, not a pipeline state: the dosage stage writes CONTENT_REPAIRED only for the class
+    // CONDITIONAL_DOSAGE_CONTENT, which classify_repair_scope assigns only when the dosage content scope is COMPLETE
+    // (genotype_dosage_repair.cpp). A CONTENT_REPAIRED row without that scope can come only from a hand-built or damaged
+    // table; it fails closed rather than reading as PASS. No producer emits it.
     if (s == "CONTENT_REPAIRED") return v("LOW_QUALITY", "CONTENT_CORRECTION_CONDITIONAL");
     if (s == "SUSPECT") return v("LOW_QUALITY", "DOSAGE_SUSPECT");
     if (s == "TRIGGERED_UNREPAIRED") return v("LOW_QUALITY", "TRIGGERED_UNREPAIRED");
