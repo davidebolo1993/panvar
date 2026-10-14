@@ -416,6 +416,133 @@ def _switch_markers(ax, plan_cats):
                 ax.scatter([bi + 0.5], [0.95 - 0.07 * k], marker=m, color=col, s=14, transform=trans, clip_on=False, zorder=5)
 
 
+# ------------------------------------------------------------------------------------------------ block rainclouds
+RAINCLOUD_GRID = 256          # density evaluation points per distribution
+RAINCLOUD_HALF = 0.42         # the half violin's maximum width, as a share of one coverage slot
+RAINCLOUD_GAP = 0.06          # space between the violin's flat edge and the first jitter column, same unit
+RAINCLOUD_JITTER = 0.34       # width of the jittered point band on the open side, same unit
+SYMLOG_BP = {"linthresh": 1.0, "linscale": 0.5, "base": 10}   # the accepted bp treatment: linear in [0, 1], log above
+
+
+def display_transform(scale):
+    """(forward, inverse) maps between data values and the axis's displayed coordinate: identity for 'linear', the
+    matplotlib symlog transform for 'symlog_bp'. Densities are estimated in the displayed coordinate so their shape is
+    the one the reader sees."""
+    if scale == "linear":
+        return (lambda v: np.asarray(v, dtype=float)), (lambda t: np.asarray(t, dtype=float))
+    if scale == "symlog_bp":
+        from matplotlib.scale import SymmetricalLogTransform
+        fwd = SymmetricalLogTransform(SYMLOG_BP["base"], SYMLOG_BP["linthresh"], SYMLOG_BP["linscale"])
+        inv = fwd.inverted()
+        return (lambda v: fwd.transform_non_affine(np.asarray(v, dtype=float))), \
+               (lambda t: inv.transform_non_affine(np.asarray(t, dtype=float)))
+    raise ValueError(f"unknown scale {scale}")
+
+
+def half_violin(values, scale, grid=RAINCLOUD_GRID):
+    """The density outline of one distribution: (y data values, width in [0, 1]) with the maximum width 1, so every
+    violin has the same maximum width whatever its sample size.
+
+    A Gaussian kernel density with Scott's bandwidth (sd * n^(-1/5), sample sd) is estimated in the displayed
+    coordinate and evaluated only over the observed range [min, max] (no tails beyond the data, so never below zero for
+    non-negative values). Fewer than two observations, or zero variance in the displayed coordinate, return the explicit
+    degenerate outline: a single flat bar at the common value (kind 'point_mass'), never a kernel spread around it."""
+    v = np.asarray(values, dtype=float)
+    if not len(v):
+        return {"kind": "empty", "y": np.array([]), "width": np.array([])}
+    fwd, inv = display_transform(scale)
+    t = fwd(v)
+    lo, hi = float(t.min()), float(t.max())
+    sd = float(t.std(ddof=1)) if len(t) > 1 else 0.0
+    if len(t) < 2 or sd == 0.0 or hi == lo:
+        y = float(inv(np.array([lo]))[0])
+        return {"kind": "point_mass", "y": np.array([y, y]), "width": np.array([1.0, 1.0])}
+    h = sd * len(t) ** (-1 / 5)
+    g = np.linspace(lo, hi, grid)
+    dens = np.exp(-0.5 * ((g[:, None] - t[None, :]) / h) ** 2).sum(axis=1)
+    return {"kind": "kde", "y": inv(g), "width": dens / dens.max()}
+
+
+def quartiles(values):
+    """Q1, median, Q3 by linear interpolation between order statistics (numpy's default percentile method)."""
+    q1, med, q3 = np.percentile(np.asarray(values, dtype=float), [25, 50, 75])
+    return float(q1), float(med), float(q3)
+
+
+def count_triple_label(c, z, u):
+    """The per-block, per-coverage label: always all three values, U included when 0."""
+    return f"n=({c},{z},{u})"
+
+
+def fig_block_raincloud(points, block_order, coverages, panels, counts, title, ticks, xlabel="block (genomic order)"):
+    """One figure of vertically aligned panels sharing the ordered block axis; in every block one raincloud per
+    coverage: a half violin (left), the same observations as deterministic jittered points on the open (right) side,
+    and Q1 / median / Q3 marks across the violin (the median thicker).
+
+    points: one row per plotted observation with run_id, block_id, coverage and one column per panel metric;
+    panels: [(metric, y label, 'symlog_bp' | 'linear')]; counts: {(block, coverage): (C, Z, U)} printed above the top
+    panel. Every value is plotted (no capping): the axis always reaches the largest observation.
+    Returns (figure, drawn) where drawn lists every point as (metric, run_id, block_id, coverage, x, y) and every
+    violin as (metric, block_id, coverage, kind, n, q1, median, q3)."""
+    covs = list(coverages)
+    ccol = coverage_colors(covs)
+    nb = len(block_order)
+    w = BLOCK_DODGE / max(1, len(covs))
+    labels = [count_triple_label(*counts[(b, c)]) for b in block_order for c in covs if (b, c) in counts]
+    unit = max(count_layout(labels, len(covs)), block_unit_in(ticks, 7, 0.9))
+    band_pt = 2 + COUNT_FONT * 1.25 + 1.5
+    fig, axes = plt.subplots(len(panels), 1, figsize=(unit * nb + 2.4, 2.5 * len(panels) + band_pt / 72 + 0.9),
+                             squeeze=False, sharex=True)
+    drawn_points, drawn_violins = [], []
+    for ax, (metric, ylabel, scale) in zip(axes[:, 0], panels):
+        for bi, b in enumerate(block_order):
+            for ci, c in enumerate(covs):
+                x0 = bi + (ci - (len(covs) - 1) / 2) * w
+                g = points[(points.block_id == b) & (points.coverage == c) & points[metric].notna()]
+                g = g.sort_values("run_id", kind="stable")
+                if len(g):
+                    vals = g[metric].to_numpy(dtype=float)
+                    hv = half_violin(vals, scale)
+                    half = RAINCLOUD_HALF * w
+                    if hv["kind"] == "kde":
+                        ax.fill_betweenx(hv["y"], x0 - half * hv["width"], x0, color=ccol[c], alpha=0.45, lw=0.4,
+                                         edgecolor=ccol[c], zorder=2)
+                    else:   # zero variance: a flat bar at the common value, the full violin width
+                        ax.plot([x0 - half, x0], hv["y"], color=ccol[c], lw=2.2, solid_capstyle="butt", zorder=2)
+                    q1, med, q3 = quartiles(vals)
+                    for q, lw in ((q1, 0.7), (q3, 0.7), (med, 1.8)):
+                        ax.plot([x0 - half, x0], [q, q], color="#222222", lw=lw, solid_capstyle="butt", zorder=4)
+                    band = RAINCLOUD_JITTER * w
+                    xs = [x0 + RAINCLOUD_GAP * w + band / 2 + stable_jitter(f"{r}|{b}", band) for r in g.run_id]
+                    ax.scatter(xs, vals, s=4, color=ccol[c], linewidths=0, alpha=0.85, zorder=3)
+                    drawn_points += [(metric, r, b, c, x, y) for r, x, y in zip(g.run_id, xs, vals)]
+                    drawn_violins.append((metric, b, c, hv["kind"], len(vals), q1, med, q3))
+                if ax is axes[0, 0] and (b, c) in counts:
+                    ax.annotate(count_triple_label(*counts[(b, c)]), (x0, 1.0), xycoords=ax.get_xaxis_transform(),
+                                xytext=(0, 2), textcoords="offset points", ha="center", va="baseline",
+                                fontsize=COUNT_FONT, color=ccol[c], annotation_clip=False, gid="block_count")
+        top = points[metric].max() if points[metric].notna().any() else 0.0
+        if scale == "symlog_bp":
+            _symlog(ax, "excess", top)
+        else:
+            span = max(float(top), 1e-2)
+            ax.set_ylim(-0.03 * span, span * 1.08)
+            ax.axhline(0, color="#bbbbbb", lw=0.5, zorder=0)
+        ax.set_xlim(-0.5, nb - 0.5)
+        ax.set_ylabel(ylabel, fontsize=7)
+        for bi in range(nb - 1):
+            ax.axvline(bi + 0.5, color="#e5e5e5", lw=0.5, zorder=0)
+    axes[0, 0].set_title(" ", pad=band_pt + 2)   # room for the count labels above the top panel
+    axes[-1, 0].set_xticks(range(nb), ticks, rotation=0)
+    axes[-1, 0].set_xlabel(xlabel)
+    handles = [Patch(facecolor=ccol[c], edgecolor=ccol[c], alpha=0.6, label=f"{c}x" if c != "all" else "all") for c in covs]
+    handles += [Line2D([], [], color="#222222", lw=1.8, label="median"), Line2D([], [], color="#222222", lw=0.7, label="Q1, Q3")]
+    axes[0, 0].legend(handles=handles, frameon=False, loc="upper left", bbox_to_anchor=(1.0, 1.0), title="coverage")
+    fig.suptitle(title, fontsize=9)
+    fig.tight_layout()
+    return fig, {"points": drawn_points, "violins": drawn_violins}
+
+
 # ------------------------------------------------------------------------------------------------ block accuracy
 def fig_accuracy_heatmap(t, info, sets, lengths=None):
     rows = [p for p, _ in info.panels]

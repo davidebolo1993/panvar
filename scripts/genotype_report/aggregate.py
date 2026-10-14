@@ -699,3 +699,89 @@ def gq_diagnostic(ctx, points):
         rows.append({**dict(zip(ctx.strata + ["panel", "gq_bin"], keys)), "denominator": n, "floor_attained": k,
                      "rate": k / n if n else np.nan, "ci_low": lo, "ci_high": hi})
     return sort_frame(pd.DataFrame(rows), ctx)
+
+
+# ------------------------------------------------------------------------------------------------ block rainclouds
+POINT_COLUMNS = ["run_id", "row", "coverage", "block_index", "block_id", "truth_defined", "availability_floor", "excess",
+                 "normalized_excess"]
+
+
+def validate_block_points(points, run_counts, expected=None):
+    """Refuse a block-point table that cannot support the raincloud figures: every called run must report the same
+    blocks once each; a truth-defined observation must carry its metrics and an undefined one none; excess and
+    normalised excess are never negative; the called runs per (row, coverage) must equal run_counts (and `expected`
+    when given), so each block's C is exactly the called-run count."""
+    missing = [c for c in POINT_COLUMNS if c not in points.columns]
+    if missing:
+        raise Refusal(f"block points lack column(s) {', '.join(missing)}")
+    if points.duplicated(["run_id", "block_id"]).any():
+        raise Refusal("a (run, block) observation appears twice")
+    blocks = set(points.block_id)
+    per_run = points.groupby("run_id").block_id.apply(set)
+    if not all(s == blocks for s in per_run):
+        raise Refusal("not every called run reports every block")
+    td = points.truth_defined
+    for m in ("excess", "normalized_excess", "availability_floor"):
+        if points.loc[td, m].isna().any():
+            raise Refusal(f"a truth-defined observation has no {m}")
+        if points.loc[~td, m].notna().any():
+            raise Refusal(f"a truth-undefined observation carries {m}")
+        if (points.loc[td, m] < 0).any():
+            raise Refusal(f"negative {m}")
+    called = points.groupby(["row", "coverage"]).run_id.nunique()
+    rc = run_counts.set_index(["row", "coverage"]).called_runs
+    if dict(called) != {k: int(v) for k, v in rc.items()}:
+        raise Refusal(f"called runs per row and coverage {dict(called)} differ from the run counts {dict(rc)}")
+    if expected is not None:
+        ex = expected.set_index(["row", "coverage"]).called_runs
+        if dict(called) != {k: int(v) for k, v in ex.items()}:
+            raise Refusal(f"called runs per row and coverage {dict(called)} differ from the expected counts {dict(ex)}")
+
+
+def block_call_counts(points):
+    """Per (row, coverage, block): C = called block observations (truth-undefined included), Z = truth-defined with
+    excess exactly 0, U = truth undefined (no distance plotted), and plotted = C - U."""
+    rows = []
+    for (r, c, bi, b), g in points.groupby(["row", "coverage", "block_index", "block_id"], sort=True):
+        td = g.truth_defined
+        C, U = len(g), int((~td).sum())
+        rows.append({"row": r, "coverage": c, "block_index": bi, "block_id": b, "C": C, "Z": int((g.excess[td] == 0).sum()),
+                     "U": U, "plotted": C - U})
+    return pd.DataFrame(rows)
+
+
+def locus_accuracy(points, run_counts, modes, phase_calls=None, phase_projected=None):
+    """Per (row, coverage), over called runs: fully truth-assessable runs (every block truth-defined), runs excluded
+    because some block truth is undefined, and the all-block count over the assessable runs. modes[row] is
+    'sequence_correct' (every block excess 0 and availability floor 0: the panel holds the truth, so the sequence is
+    exact; phase ignored) or 'floor_attaining' (every block excess 0: each block reaches the best panel approximation;
+    not an exact-genotype claim). phase_calls (run_id, exact_phased_locus) adds exact phased-locus runs for
+    'sequence_correct' rows; phase_projected (run_id, projected_status, projected_concordant) adds boundary-level
+    sequence-projected phase for 'floor_attaining' rows. Nothing is reported for a mode it does not apply to."""
+    out = []
+    per_run = points.groupby(["row", "coverage", "run_id"])
+    runs = pd.DataFrame([{"row": r, "coverage": c, "run_id": rid, "assessable": bool(g.truth_defined.all()),
+                          "all_zero_excess": bool(g.truth_defined.all() and (g.excess == 0).all()),
+                          "all_zero_floor": bool(g.truth_defined.all() and (g.availability_floor == 0).all())}
+                         for (r, c, rid), g in per_run])
+    rc = run_counts.set_index(["row", "coverage"])
+    for (r, c), g in runs.groupby(["row", "coverage"], sort=True):
+        mode = modes[r]
+        a = g[g.assessable]
+        k = int((a.all_zero_excess & a.all_zero_floor).sum()) if mode == "sequence_correct" else int(a.all_zero_excess.sum())
+        row = {"row": r, "coverage": c, "basis": "all-block sequence-correct (phase ignored)" if mode == "sequence_correct"
+               else "every truth-defined block attains its availability floor", "called_runs": len(g),
+               "no_call_runs": int(rc.loc[(r, c), "no_call_runs"]), "fully_truth_assessable_runs": len(a),
+               "excluded_truth_undefined_runs": int((~g.assessable).sum()), "all_block_runs": k,
+               "all_block_fraction": f"{k}/{len(a)}", "exact_phased_locus_runs": "NA", "phase_table_runs": "NA",
+               "projected_boundaries_evaluated": "NA", "projected_boundaries_concordant": "NA"}
+        if mode == "sequence_correct" and phase_calls is not None:
+            p = phase_calls[phase_calls.run_id.isin(g.run_id)]
+            row["phase_table_runs"] = len(p)
+            row["exact_phased_locus_runs"] = int(p.exact_phased_locus.sum())
+        if mode == "floor_attaining" and phase_projected is not None:
+            p = phase_projected[phase_projected.run_id.isin(g.run_id) & (phase_projected.projected_status == "EVALUATED")]
+            row["projected_boundaries_evaluated"] = len(p)
+            row["projected_boundaries_concordant"] = int(p.projected_concordant.sum())
+        out.append(row)
+    return pd.DataFrame(out)

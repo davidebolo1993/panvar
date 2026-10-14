@@ -4,7 +4,9 @@ aggregation counts and denominators computed by hand, the normalised-excess form
 refusal, the modality contract (absent: no column; one: figures identical to absent; several: faceted), byte-identical
 reruns, directory-mode loading (including pre-headline outputs), the per-coverage n / zero block labels (read from
 block_metric_summary, laid out without overlap for 1, 2 and 4 coverages) and the observed truth-allele length ranges
-under the block IDs (evaluation only). Usage: genotype_report_test.py [scripts dir]."""
+under the block IDs (evaluation only); and the ordered-block raincloud figures of scripts/plot_genotype_block_error.py
+(n=(C,Z,U) counts by hand, point-mass and observed-range densities, points equal to the violins' observations, refusals,
+byte-identical redraws, no run count in titles, the locus companion table). Usage: genotype_report_test.py [scripts dir]."""
 import hashlib
 import os
 import shutil
@@ -476,6 +478,161 @@ class Report(unittest.TestCase):
             P.plt.close(fig)
         # the widest label fits on one baseline by widening the block, never by a second level
         self.assertGreater(P.count_layout(["n=88888(88888,88888)"], 4), P.count_layout(["n=1(1)"], 4))
+
+
+# ---------------------------------------------------------------------------------------------- block rainclouds
+import plot_genotype_block_error as rain  # noqa: E402
+
+
+def rain_points(undefined=(("q2", "sv:1"),)):
+    """Two rows (G1 at 2x and 10x, G2 at 2x), three blocks; G1 2x ctx:0 has zero variance, q2 sv:1 has undefined truth."""
+    pts = []
+    spec = {"q1": ("G1", 2), "q2": ("G1", 2), "q3": ("G1", 2), "q4": ("G1", 10), "q5": ("G1", 10), "q6": ("G2", 2)}
+    excess = {("q2", "ctx:2"): 1200.0, ("q3", "ctx:2"): 3.0, ("q4", "sv:1"): 0.5, ("q5", "sv:1"): 40.0, ("q6", "ctx:2"): 7.0}
+    for rid, (row, cov) in spec.items():
+        for i, b in enumerate(BLOCKS):
+            undef = (rid, b) in undefined
+            e = excess.get((rid, b), 0.0)
+            pts.append({"run_id": rid, "row": row, "coverage": cov, "block_index": i, "block_id": b,
+                        "truth_defined": "false" if undef else "true", "availability_floor": "NA" if undef else 0.0,
+                        "excess": "NA" if undef else e, "normalized_excess": "NA" if undef else e / 2000.0})
+    return pts
+
+
+class BlockRaincloud(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="genotype_raincloud_test_")
+        d = os.path.join(self.tmp, "in")
+        write(os.path.join(d, "points.tsv"), rain_points(), list(rain_points()[0]))
+        write(os.path.join(d, "lengths.tsv"), [{"block_id": b, "displayed_length_range": f"{i}–{i + 1} kb"} for i, b in enumerate(BLOCKS)],
+              ["block_id", "displayed_length_range"])
+        write(os.path.join(d, "rows.tsv"), [{"row": "G1", "title": "G1 — raw block-call error", "stem": "g1", "locus_mode": "sequence_correct"},
+                                            {"row": "G2", "title": "G2 — raw block-call error", "stem": "g2", "locus_mode": "floor_attaining"}],
+              ["row", "title", "stem", "locus_mode"])
+        self.counts = [{"row": "G1", "coverage": 2, "called_runs": 3, "no_call_runs": 1}, {"row": "G1", "coverage": 10, "called_runs": 2, "no_call_runs": 0},
+                       {"row": "G2", "coverage": 2, "called_runs": 1, "no_call_runs": 0}]
+        write(os.path.join(d, "counts.tsv"), self.counts, ["row", "coverage", "called_runs", "no_call_runs"])
+        self.d = d
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp)
+
+    def cli(self, out, extra=()):
+        d = self.d
+        return rain.run(["--points", os.path.join(d, "points.tsv"), "--block-lengths", os.path.join(d, "lengths.tsv"),
+                         "--rows", os.path.join(d, "rows.tsv"), "--run-counts", os.path.join(d, "counts.tsv"),
+                         "--out-dir", os.path.join(self.tmp, out)] + list(extra))
+
+    def table(self, out, name):
+        return pd.read_csv(os.path.join(self.tmp, out, name), sep="\t", keep_default_na=False)
+
+    def test_count_triple_always_three_values(self):
+        self.assertEqual(P.count_triple_label(5, 5, 0), "n=(5,5,0)")
+        self.assertEqual(P.count_triple_label(3, 1, 2), "n=(3,1,2)")
+
+    def test_counts_by_hand(self):
+        """C counts every called observation (undefined included), Z truth-defined excess 0, U undefined; plotted = C - U."""
+        self.cli("o")
+        c = self.table("o", "block_counts.tsv").set_index(["row", "coverage", "block_id"])
+        self.assertEqual(tuple(c.loc[("G1", 2, "sv:1"), ["C", "Z", "U", "plotted"]]), (3, 2, 1, 2))
+        self.assertEqual(tuple(c.loc[("G1", 2, "ctx:2"), ["C", "Z", "U", "plotted"]]), (3, 1, 0, 3))
+        self.assertEqual(tuple(c.loc[("G1", 10, "sv:1"), ["C", "Z", "U", "plotted"]]), (2, 0, 0, 2))
+        self.assertEqual(tuple(c.loc[("G2", 2, "ctx:2"), ["C", "Z", "U", "plotted"]]), (1, 0, 0, 1))
+
+    def test_zero_variance_is_a_point_mass(self):
+        for vals, scale in (([0.0, 0.0, 0.0], "symlog_bp"), ([4.0], "symlog_bp"), ([0.0, 0.0], "linear")):
+            hv = P.half_violin(vals, scale)
+            self.assertEqual(hv["kind"], "point_mass")
+            self.assertTrue((hv["y"] == vals[0]).all())
+
+    def test_density_within_observed_range(self):
+        """Estimated in the displayed coordinate, evaluated only over [min, max]: never below zero or beyond the
+        largest value, with maximum width exactly 1 whatever the sample size."""
+        for vals, scale in (([0, 0, 0, 1, 5, 1000], "symlog_bp"), ([0, 0, 0.2, 0.9], "linear"), ([0, 3] * 40, "symlog_bp")):
+            hv = P.half_violin(vals, scale)
+            self.assertEqual(hv["kind"], "kde")
+            self.assertGreaterEqual(hv["y"].min(), 0.0)
+            self.assertAlmostEqual(hv["y"].min(), min(vals), places=9)
+            self.assertAlmostEqual(hv["y"].max(), max(vals), delta=1e-9 * max(vals))
+            self.assertEqual(hv["width"].max(), 1.0)
+            self.assertGreaterEqual(hv["width"].min(), 0.0)
+
+    def test_points_and_violins_are_the_same_observations(self):
+        self.cli("o")
+        pts, vio = self.table("o", "plotted_points.tsv"), self.table("o", "violins.tsv")
+        src = pd.DataFrame(rain_points())
+        src = src[src.truth_defined == "true"]
+        self.assertEqual(len(pts), 2 * len(src))   # every truth-defined observation, in both panels, nothing else
+        for v in vio.itertuples():
+            g = pts[(pts.row == v.row) & (pts.metric == v.metric) & (pts.block_id == v.block_id) & (pts.coverage == v.coverage)]
+            self.assertEqual(len(g), v.n)
+            q = P.quartiles(g.y)
+            self.assertEqual((round(q[0], 12), round(q[1], 12), round(q[2], 12)), (round(v.q1, 12), round(v.median, 12), round(v.q3, 12)))
+        ctx0 = vio[(vio.row == "G1") & (vio.block_id == "ctx:0") & (vio.coverage == 2)]
+        self.assertTrue((ctx0.kind == "point_mass").all())
+        # points sit on the open side of their violin
+        covs = {"G1": [2, 10], "G2": [2]}
+        for r in pts.itertuples():
+            n = len(covs[r.row]); w = P.BLOCK_DODGE / n
+            x0 = BLOCKS.index(r.block_id) + (covs[r.row].index(r.coverage) - (n - 1) / 2) * w
+            self.assertTrue(x0 < r.x <= x0 + (P.RAINCLOUD_GAP + P.RAINCLOUD_JITTER) * w)
+
+    def test_refusals(self):
+        bad = os.path.join(self.d, "expected.tsv")
+        write(bad, [dict(c, called_runs=c["called_runs"] + (1 if c["coverage"] == 10 else 0)) for c in self.counts],
+              ["row", "coverage", "called_runs"])
+        with self.assertRaises(Refusal):
+            self.cli("x1", ["--expected-called", bad])
+        pts = rain_points()
+        pts[0]["excess"] = -1.0
+        write(os.path.join(self.d, "points.tsv"), pts, list(pts[0]))
+        with self.assertRaises(Refusal):
+            self.cli("x2")
+        pts = rain_points()
+        pts[4]["normalized_excess"] = 0.1   # q2 sv:1 is truth-undefined
+        write(os.path.join(self.d, "points.tsv"), pts, list(pts[0]))
+        with self.assertRaises(Refusal):
+            self.cli("x3")
+        pts = [p for p in rain_points() if not (p["run_id"] == "q6" and p["block_id"] == "sv:1")]
+        write(os.path.join(self.d, "points.tsv"), pts, list(pts[0]))
+        with self.assertRaises(Refusal):
+            self.cli("x4")
+
+    def test_redraw_byte_identical_and_wording(self):
+        self.cli("a"); self.cli("b")
+        for sub in ("figures", ""):
+            fa = sorted(f for f in os.listdir(os.path.join(self.tmp, "a", sub)) if os.path.isfile(os.path.join(self.tmp, "a", sub, f)))
+            self.assertTrue(fa)
+            for f in fa:
+                self.assertEqual(sha(os.path.join(self.tmp, "a", sub, f)), sha(os.path.join(self.tmp, "b", sub, f)), f)
+        with open(os.path.join(self.tmp, "a", "captions.md")) as f:
+            cap = f.read()
+        self.assertIn("n=(C,Z,U)", cap)
+        self.assertNotIn("unassigned", cap.lower())
+        self.assertNotIn("R=", cap)
+        self.assertIn("excluded from C: 2x: 1, 10x: 0", cap)
+
+    def test_titles_and_labels_carry_no_run_count(self):
+        pts = pd.DataFrame(rain_points())
+        pts = pts[pts.truth_defined == "true"].astype({"excess": float, "normalized_excess": float})
+        cnt = {(b, c): (3, 0, 0) for b in BLOCKS for c in (2, 10)}
+        fig, _ = P.fig_block_raincloud(pts[pts.row == "G1"], BLOCKS, [2, 10],
+                                       [("excess", "Excess", "symlog_bp"), ("normalized_excess", "Norm", "linear")], cnt, "G1 title",
+                                       P.block_labels(BLOCKS))
+        texts = [t.get_text() for ax in fig.axes for t in ax.texts] + [ax.get_title() for ax in fig.axes] + [fig._suptitle.get_text()]
+        self.assertFalse(any("R=" in t for t in texts))
+        self.assertEqual(sum(t.startswith("n=(") for t in texts), len(cnt))
+        Report.assert_no_overlap(self, fig)
+        P.plt.close(fig)
+
+    def test_locus_accuracy_by_hand(self):
+        self.cli("o", [])
+        t = self.table("o", "locus_accuracy.tsv").set_index(["row", "coverage"])
+        # G1 2x: q2 has an undefined block -> excluded; q1 all zero; q3 has excess 3 -> not all-block
+        self.assertEqual(tuple(t.loc[("G1", 2), ["called_runs", "fully_truth_assessable_runs", "excluded_truth_undefined_runs", "all_block_runs"]]),
+                         (3, 2, 1, 1))
+        self.assertEqual(t.loc[("G1", 10), "all_block_fraction"], "0/2")
+        self.assertEqual(t.loc[("G2", 2), "basis"], "every truth-defined block attains its availability floor")
 
 
 if __name__ == "__main__":
