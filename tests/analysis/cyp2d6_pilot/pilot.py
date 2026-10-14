@@ -23,6 +23,7 @@ import hashlib
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -38,7 +39,14 @@ SIM = {"seed": "20260921", "read-length": "100", "insert-mean": "350", "insert-s
        "error": "0.002", "outlier": "0.001"}
 THREADS = 4
 PARALLEL = 2
-BACKSTOP_SECONDS = 1500          # the caller's own time_limit_seconds (1200) is the limit; this only reaps a hang
+# One authoritative per-cell time limit: the profile's time_limit_seconds, which the caller enforces itself (exit 124).
+# The runner's process-group backstop fires EXIT_ALLOWANCE_SECONDS later, so the caller's own limit always acts first and
+# records its outcome; the backstop only reaps a cell that failed to stop. (STOP_4: the old 1500 s backstop, below the
+# 2700 s limit, killed only the time wrapper and orphaned the caller.)
+CELL_TIME_LIMIT_SECONDS = 2700
+EXIT_ALLOWANCE_SECONDS = 60
+TERM_GRACE_SECONDS = 15
+REAP_SECONDS = 30
 COMP = str.maketrans("ACGTacgtNn", "TGCAtgcaNn")
 
 
@@ -311,6 +319,74 @@ def evaluate(job, pkg, build, layer, eval_dir="eval"):
     return code
 
 
+def profile_time_limit(path):
+    for line in open(path):
+        p = line.rstrip("\n").split("\t")
+        if p[0] == "time_limit_seconds":
+            return int(p[1])
+    fail(f"{path} declares no time_limit_seconds")
+
+
+def group_members(pgid):
+    """Live (non-zombie) pids whose process group is pgid. killpg(pgid, 0) cannot answer this on macOS: a group that
+    holds only zombies returns EPERM."""
+    out = subprocess.run(["ps", "-A", "-o", "pid=,pgid=,stat="], capture_output=True, text=True, check=True).stdout
+    members = []
+    for line in out.splitlines():
+        p = line.split()
+        if len(p) >= 3 and p[1] == str(pgid) and not p[2].startswith("Z"):
+            members.append(int(p[0]))
+    return members
+
+
+def group_alive(pgid):
+    return bool(group_members(pgid))
+
+
+def signal_group(pgid, sig):
+    try:
+        os.killpg(pgid, sig)
+    except (ProcessLookupError, PermissionError):
+        pass     # nothing left, or only zombies awaiting their parent
+
+
+def reap_group(pgid, seconds):
+    deadline = time.monotonic() + seconds
+    while group_alive(pgid):
+        if time.monotonic() > deadline:
+            return False
+        time.sleep(0.2)
+    return True
+
+
+def run_timed(cmd, log, timeout, term_grace=TERM_GRACE_SECONDS, reap=REAP_SECONDS):
+    """Runs cmd in its own session (its own process group, which every descendant inherits). On timeout the whole
+    group is sent SIGTERM, then SIGKILL after term_grace, and the call returns only once no process of the group
+    remains (RuntimeError otherwise). Returns (exit code or "timeout", timed_out)."""
+    proc = subprocess.Popen([str(c) for c in cmd], stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+    pgid = proc.pid
+    try:
+        code, timed_out = proc.wait(timeout=timeout), False
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        signal_group(pgid, signal.SIGTERM)
+        try:
+            proc.wait(timeout=term_grace)
+        except subprocess.TimeoutExpired:
+            pass
+        if not reap_group(pgid, term_grace):
+            signal_group(pgid, signal.SIGKILL)
+        proc.wait()
+        code = "timeout"
+    # every descendant must be gone before the slot is released, whether the cell finished or timed out
+    if not reap_group(pgid, reap):
+        signal_group(pgid, signal.SIGKILL)
+        if not reap_group(pgid, reap):
+            raise RuntimeError(f"process group {pgid} survived SIGKILL; refusing to start another cell")
+        code = code if timed_out else f"{code}_descendants_killed"
+    return code, timed_out
+
+
 def one(job, pkg, build, profile=None, evaluate_after=True):
     prefix = os.path.join(pkg, job["out_prefix"])
     if os.path.exists(prefix + ".run.tsv"):
@@ -321,10 +397,10 @@ def one(job, pkg, build, profile=None, evaluate_after=True):
     with open(prefix + ".call.log", "w") as log:
         log.write("$ " + " ".join(cmd) + "\n")
         log.flush()
-        try:
-            code = subprocess.run(cmd, stdout=log, stderr=subprocess.STDOUT, timeout=BACKSTOP_SECONDS).returncode
-        except subprocess.TimeoutExpired:
-            code = "backstop_timeout"
+        limit = profile_time_limit(profile or os.path.join(pkg, "resource_profile.tsv"))
+        if profile is not None and limit != CELL_TIME_LIMIT_SECONDS:
+            fail(f"{profile}: time_limit_seconds {limit}, not the authoritative {CELL_TIME_LIMIT_SECONDS}")
+        code, _ = run_timed(cmd, log, limit + EXIT_ALLOWANCE_SECONDS)
     wall = time.monotonic() - t0
     text = open(prefix + ".call.log").read()
     m = re.search(r"(\d+)\s+maximum resident set size", text)
