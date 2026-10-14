@@ -388,6 +388,11 @@ if(PANVAR_BUILD_TESTING)
         add_test(NAME panvar_genotype_heldout_mosaic_manifest
                  COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/genotype_c4_heldout_mosaic.sh
                          --check-manifest)
+        # mosaic-truth's two-route self-check on minus-strand paths: a synthetic locus read on the '-' strand, the
+        # emitted mosaic against an independently expected sequence, an orientation flip that must break the match.
+        add_test(NAME panvar_genotype_mosaic_truth_orientation
+                 COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/tests/genotype_mosaic_truth_orientation_test.py
+                         $<TARGET_FILE:genotype_probe>)
         # The held-out harness's refusal machinery: a stale read, a changed caller setting, curation or
         # binary, a broken nested subset and a missing arm output must each refuse interpretation rather
         # than be interpreted. Runs on stub files in seconds; it does NOT run the ten-plan experiment.

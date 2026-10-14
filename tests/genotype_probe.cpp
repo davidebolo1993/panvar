@@ -2723,7 +2723,8 @@ int mosaic_truth(const Args& args) {
     }
 
     // The two routes must agree. This is the check that the splice reproduces the allele path, rather
-    // than something plausible that merely looks like a haplotype.
+    // than something plausible that merely looks like a haplotype. A '-' step reads its node on the
+    // reverse strand, so it contributes the reverse complement of the stored sequence.
     for (std::size_t h = 0; h < 2; ++h) {
         std::string walked;
         for (const panvar::PathStep& step : walks[h]) {
@@ -2731,7 +2732,7 @@ int mosaic_truth(const Args& args) {
             if (found == loaded.sorted.gfa.seq.end()) {
                 throw std::runtime_error("spliced walk names an unknown node " + step.node_id);
             }
-            walked += found->second;
+            walked += step.reverse ? panvar::reverse_complement(found->second) : found->second;
         }
         const std::string spelled = panvar::spell_mosaic(model, mosaic_paths[h]).bases;
         if (walked != spelled) {
