@@ -43,6 +43,8 @@ def parse(argv):
     p.add_argument("--xlabel", default="block (genomic order)")
     p.add_argument("--colorbar-label", default="Conditional GQ")
     p.add_argument("--caption-note", default="")
+    p.add_argument("--slide", action="store_true", help="16:9 presentation layout (13.333 x 7.5 in), slide-size type")
+    p.add_argument("--footer", default="", help="footer line of the --slide figure")
     return p.parse_args(argv)
 
 
@@ -112,10 +114,16 @@ def run(argv):
     ticks = P.block_labels(order, lengths)
     covs = coverage_order(pts.coverage)
     fig, drawn = P.fig_block_gq(pts, order, rows, covs, ticks, a.title, ylabel=a.ylabel, xlabel=a.xlabel,
-                                cbar_label=a.colorbar_label)
+                                cbar_label=a.colorbar_label, slide=a.slide, footer=a.footer or None)
     os.makedirs(os.path.join(a.out_dir, "figures"), exist_ok=True)
     axes_tab = pd.DataFrame(fig.panel_axes, columns=["row", "ymin", "ymax", "yscale"])
-    P.save(fig, os.path.join(a.out_dir, "figures", a.stem))
+    if a.slide:
+        clipped, overlapping = P.text_layout_problems(fig)
+        write_tsv(pd.DataFrame([{"figure": a.stem, "width_in": fig.get_figwidth(), "height_in": fig.get_figheight(),
+                                 "clipped_texts": len(clipped), "overlapping_text_pairs": len(overlapping),
+                                 "detail": "; ".join(clipped + overlapping) or "none"}]),
+                  os.path.join(a.out_dir, "layout_check.tsv"))
+    P.save(fig, os.path.join(a.out_dir, "figures", a.stem), dpi=P.SLIDE["dpi"] if a.slide else None)
     write_tsv(axes_tab, os.path.join(a.out_dir, "panel_axes.tsv"))
     d = pd.DataFrame(drawn, columns=["row", "run_id", "block_id", "coverage", "x", "excess", "conditional_GQ", "color_value_log10_1p_gq",
                                      "color_hex", "gq_class"])

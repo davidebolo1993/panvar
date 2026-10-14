@@ -8,7 +8,8 @@ under the block IDs (evaluation only); and the ordered-block raincloud figures o
 (n=(C,Z,U) counts by hand, point-mass and observed-range densities, points equal to the violins' observations, refusals,
 byte-identical redraws, no run count in titles, the locus companion table); and the conditional-GQ point figure of
 scripts/plot_genotype_block_gq.py (log10(1 + GQ) colours, missing and infinite GQ, no filtering, axes equal to the
-raincloud's). Usage: genotype_report_test.py [scripts dir]."""
+raincloud's); and the 16:9 --slide layouts of both (exact canvas, no count labels, nothing clipped or
+overlapping, the same tables as the audit layout). Usage: genotype_report_test.py [scripts dir]."""
 import hashlib
 import math
 import os
@@ -630,6 +631,33 @@ class BlockRaincloud(unittest.TestCase):
         Report.assert_no_overlap(self, fig)
         P.plt.close(fig)
 
+    def test_slide_layout_changes_layout_only(self):
+        """--slide: exact 16:9 canvas (3200 x 1800 px), no count labels, nothing clipped or overlapping, and the same
+        points, violins and counts as the audit layout."""
+        self.cli("audit"); self.cli("slide", ["--slide"])
+        for f in ("plotted_points.tsv", "violins.tsv", "block_counts.tsv", "locus_accuracy.tsv"):
+            self.assertEqual(sha(os.path.join(self.tmp, "audit", f)), sha(os.path.join(self.tmp, "slide", f)), f)
+        lay = self.table("slide", "layout_check.tsv")
+        self.assertEqual(list(lay.figure), ["g1_slide", "g2_slide"])
+        self.assertTrue((lay.clipped_texts == 0).all() and (lay.overlapping_text_pairs == 0).all(), lay.detail.tolist())
+        import struct
+        for stem in ("g1_slide", "g2_slide"):
+            with open(os.path.join(self.tmp, "slide", "figures", stem + ".png"), "rb") as f:
+                self.assertEqual(struct.unpack(">II", f.read(24)[16:24]), (3200, 1800))
+        pts = pd.DataFrame(rain_points())
+        pts = pts[pts.truth_defined == "true"].astype({"excess": float, "normalized_excess": float})
+        fig, _ = P.fig_block_raincloud(pts[pts.row == "G1"], BLOCKS, [2, 10], [("excess", "E", "symlog_bp"), ("normalized_excess", "N", "linear")],
+                                       {(b, c): (3, 0, 0) for b in BLOCKS for c in (2, 10)}, "G1", P.block_labels(BLOCKS), slide=True, footer="f")
+        texts = [t.get_text() for t in fig.findobj(P.matplotlib.text.Text)]
+        self.assertFalse(any(t.startswith("n=(") for t in texts))
+        self.assertEqual(fig.get_size_inches().tolist(), [40 / 3, 7.5])
+        self.assertTrue(all(t.get_fontsize() >= 8 for ax in fig.axes for t in ax.get_xticklabels() + ax.get_yticklabels() if t.get_text()))
+        P.plt.close(fig)
+        with open(os.path.join(self.tmp, "slide", "captions.md")) as f:
+            cap = f.read()
+        self.assertIn("no count labels are drawn on this slide", cap)
+        self.assertIn("Truth-undefined observations, not plotted: sv:1 (2x: 1)", cap)
+
     def test_locus_accuracy_by_hand(self):
         self.cli("o", [])
         t = self.table("o", "locus_accuracy.tsv").set_index(["row", "coverage"])
@@ -750,6 +778,19 @@ class BlockGQ(unittest.TestCase):
             with self.assertRaises(Refusal):
                 self.cli("x")
             shutil.rmtree(os.path.join(self.tmp, "x"), ignore_errors=True)
+
+    def test_slide_layout_changes_layout_only(self):
+        self.cli("audit")
+        gqcli.run(["--points", os.path.join(self.d, "points.tsv"), "--block-lengths", os.path.join(self.d, "lengths.tsv"),
+                   "--rows", os.path.join(self.d, "rows.tsv"), "--out-dir", os.path.join(self.tmp, "slide"), "--stem", "gq",
+                   "--slide", "--footer", "every point plotted"])
+        for f in ("plotted_points_gq.tsv", "gq_counts.tsv", "panel_axes.tsv"):
+            self.assertEqual(sha(os.path.join(self.tmp, "audit", f)), sha(os.path.join(self.tmp, "slide", f)), f)
+        lay = self.table("slide", "layout_check.tsv")
+        self.assertEqual((int(lay.clipped_texts[0]), int(lay.overlapping_text_pairs[0])), (0, 0), lay.detail.tolist())
+        import struct
+        with open(os.path.join(self.tmp, "slide", "figures", "gq.png"), "rb") as f:
+            self.assertEqual(struct.unpack(">II", f.read(24)[16:24]), (3200, 1800))
 
     def test_redraw_byte_identical(self):
         self.cli("a"); self.cli("b")

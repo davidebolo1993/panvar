@@ -31,8 +31,8 @@ SWITCH_MARKERS = {"hap1_only": ("^", "#1d5a85", "haplotype 1 switches"), "hap2_o
 SYMLOG_NOTE = {"bp": "symlog axis: linear in [0, 1] bp, logarithmic above", "norm": "symlog axis: linear in [0, 1e-4], logarithmic above"}
 
 
-def save(fig, path_stem):
-    fig.savefig(path_stem + ".png", metadata={"Software": None})
+def save(fig, path_stem, dpi=None):
+    fig.savefig(path_stem + ".png", metadata={"Software": None}, **({"dpi": dpi} if dpi else {}))
     fig.savefig(path_stem + ".pdf", metadata={"CreationDate": None, "ModDate": None, "Producer": None, "Creator": None})
     plt.close(fig)
 
@@ -417,6 +417,10 @@ def _switch_markers(ax, plan_cats):
 
 
 # ------------------------------------------------------------------------------------------------ block rainclouds
+# Presentation layout: a fixed 16:9 canvas (13.333 x 7.5 in; PNG 3200 x 1800 px at 240 dpi, PDF 960 x 540 pt), slide-size
+# type, no per-cell count labels (their denominators go to a companion table). Values, scales and marks are unchanged.
+SLIDE = {"figsize": (40 / 3, 7.5), "dpi": 240, "title": 13, "label": 10, "tick": 9, "block": 8, "legend": 9, "footer": 8.5,
+         "raincloud_point": 7, "gq_point": 14}
 RAINCLOUD_GRID = 256          # density evaluation points per distribution
 RAINCLOUD_HALF = 0.42         # the half violin's maximum width, as a share of one coverage slot
 RAINCLOUD_GAP = 0.06          # space between the violin's flat edge and the first jitter column, same unit
@@ -474,7 +478,8 @@ def count_triple_label(c, z, u):
     return f"n=({c},{z},{u})"
 
 
-def fig_block_raincloud(points, block_order, coverages, panels, counts, title, ticks, xlabel="block (genomic order)"):
+def fig_block_raincloud(points, block_order, coverages, panels, counts, title, ticks, xlabel="block (genomic order)", slide=False,
+                        footer=None):
     """One figure of vertically aligned panels sharing the ordered block axis; in every block one raincloud per
     coverage: a half violin (left), the same observations as deterministic jittered points on the open (right) side,
     and Q1 / median / Q3 marks across the violin (the median thicker).
@@ -483,16 +488,22 @@ def fig_block_raincloud(points, block_order, coverages, panels, counts, title, t
     panels: [(metric, y label, 'symlog_bp' | 'linear')]; counts: {(block, coverage): (C, Z, U)} printed above the top
     panel. Every value is plotted (no capping): the axis always reaches the largest observation.
     Returns (figure, drawn) where drawn lists every point as (metric, run_id, block_id, coverage, x, y) and every
-    violin as (metric, block_id, coverage, kind, n, q1, median, q3)."""
+    violin as (metric, block_id, coverage, kind, n, q1, median, q3).
+    slide=True: the SLIDE canvas and type, no count labels above the axes, the coverage legend above the panels and an
+    optional footer line; every value, density, quartile, jitter and axis limit is the same as in the audit layout."""
     covs = list(coverages)
     ccol = coverage_colors(covs)
     nb = len(block_order)
     w = BLOCK_DODGE / max(1, len(covs))
-    labels = [count_triple_label(*counts[(b, c)]) for b in block_order for c in covs if (b, c) in counts]
-    unit = max(count_layout(labels, len(covs)), block_unit_in(ticks, 7, 0.9))
-    band_pt = 2 + COUNT_FONT * 1.25 + 1.5
-    fig, axes = plt.subplots(len(panels), 1, figsize=(unit * nb + 2.4, 2.5 * len(panels) + band_pt / 72 + 0.9),
-                             squeeze=False, sharex=True)
+    if slide:
+        fig, axes = plt.subplots(len(panels), 1, figsize=SLIDE["figsize"], squeeze=False, sharex=True, layout="constrained")
+        counts = {}
+    else:
+        labels = [count_triple_label(*counts[(b, c)]) for b in block_order for c in covs if (b, c) in counts]
+        unit = max(count_layout(labels, len(covs)), block_unit_in(ticks, 7, 0.9))
+        band_pt = 2 + COUNT_FONT * 1.25 + 1.5
+        fig, axes = plt.subplots(len(panels), 1, figsize=(unit * nb + 2.4, 2.5 * len(panels) + band_pt / 72 + 0.9),
+                                 squeeze=False, sharex=True)
     drawn_points, drawn_violins = [], []
     for ax, (metric, ylabel, scale) in zip(axes[:, 0], panels):
         for bi, b in enumerate(block_order):
@@ -514,7 +525,7 @@ def fig_block_raincloud(points, block_order, coverages, panels, counts, title, t
                         ax.plot([x0 - half, x0], [q, q], color="#222222", lw=lw, solid_capstyle="butt", zorder=4)
                     band = RAINCLOUD_JITTER * w
                     xs = [x0 + RAINCLOUD_GAP * w + band / 2 + stable_jitter(f"{r}|{b}", band) for r in g.run_id]
-                    ax.scatter(xs, vals, s=4, color=ccol[c], linewidths=0, alpha=0.85, zorder=3)
+                    ax.scatter(xs, vals, s=SLIDE["raincloud_point"] if slide else 4, color=ccol[c], linewidths=0, alpha=0.85, zorder=3)
                     drawn_points += [(metric, r, b, c, x, y) for r, x, y in zip(g.run_id, xs, vals)]
                     drawn_violins.append((metric, b, c, hv["kind"], len(vals), q1, med, q3))
                 if ax is axes[0, 0] and (b, c) in counts:
@@ -529,18 +540,63 @@ def fig_block_raincloud(points, block_order, coverages, panels, counts, title, t
             ax.set_ylim(-0.03 * span, span * 1.08)
             ax.axhline(0, color="#bbbbbb", lw=0.5, zorder=0)
         ax.set_xlim(-0.5, nb - 0.5)
-        ax.set_ylabel(ylabel, fontsize=7)
+        ax.set_ylabel(ylabel, fontsize=SLIDE["label"] if slide else 7)
+        if slide:
+            ax.tick_params(axis="y", labelsize=SLIDE["tick"])
         for bi in range(nb - 1):
             ax.axvline(bi + 0.5, color="#e5e5e5", lw=0.5, zorder=0)
+    handles = [Patch(facecolor=ccol[c], edgecolor=ccol[c], alpha=0.6, label=f"{c}x" if c != "all" else "all") for c in covs]
+    handles += [Line2D([], [], color="#222222", lw=1.8, label="median"), Line2D([], [], color="#222222", lw=0.7, label="Q1, Q3")]
+    if slide:
+        axes[-1, 0].set_xticks(range(nb), ticks, rotation=0, fontsize=SLIDE["block"])
+        axes[-1, 0].set_xlabel(xlabel, fontsize=SLIDE["label"])
+        _slide_frame(fig, title, handles, "coverage", footer)
+        return fig, {"points": drawn_points, "violins": drawn_violins}
     axes[0, 0].set_title(" ", pad=band_pt + 2)   # room for the count labels above the top panel
     axes[-1, 0].set_xticks(range(nb), ticks, rotation=0)
     axes[-1, 0].set_xlabel(xlabel)
-    handles = [Patch(facecolor=ccol[c], edgecolor=ccol[c], alpha=0.6, label=f"{c}x" if c != "all" else "all") for c in covs]
-    handles += [Line2D([], [], color="#222222", lw=1.8, label="median"), Line2D([], [], color="#222222", lw=0.7, label="Q1, Q3")]
     axes[0, 0].legend(handles=handles, frameon=False, loc="upper left", bbox_to_anchor=(1.0, 1.0), title="coverage")
     fig.suptitle(title, fontsize=9)
     fig.tight_layout()
     return fig, {"points": drawn_points, "violins": drawn_violins}
+
+
+def _slide_frame(fig, title, handles, legend_title, footer):
+    """Slide title, one legend row above the panels (its title as a leading label, so it never stacks into the figure
+    title) and an optional footer line, all inside the constrained layout."""
+    fig.suptitle(title, fontsize=SLIDE["title"])
+    lead = Line2D([], [], ls="", marker="", label=f"{legend_title}:")
+    top = fig.axes[0]
+    top.legend(handles=[lead] + list(handles), loc="lower right", bbox_to_anchor=(1.0, 1.0), ncol=len(handles) + 1, frameon=False,
+               fontsize=SLIDE["legend"], handlelength=1.4, columnspacing=1.2, borderaxespad=0.2)
+    if footer:
+        fig.get_layout_engine().set(rect=(0, 0.035, 1, 0.965))
+        fig.text(0.005, 0.006, footer, ha="left", va="bottom", fontsize=SLIDE["footer"], color="#333333", gid="slide_footer")
+
+
+def text_layout_problems(fig):
+    """Every visible text of a drawn figure (titles, axis labels, tick labels, legend entries, colour-bar text, footer):
+    the ones outside the canvas, and the pairs of distinct texts whose rendered boxes overlap. Returns (clipped,
+    overlapping) as lists of strings; both empty means nothing is clipped or overlapping."""
+    fig.canvas.draw()
+    rd = fig.canvas.get_renderer()
+    undrawn = set()   # tick labels outside their axis's view interval exist but are never drawn
+    for ax in fig.axes:
+        for axis in (ax.xaxis, ax.yaxis):
+            lo, hi = sorted(axis.get_view_interval())
+            for tick in axis.get_major_ticks() + axis.get_minor_ticks():
+                if not (lo - 1e-12 * max(1.0, abs(lo)) <= tick.get_loc() <= hi + 1e-12 * max(1.0, abs(hi))):
+                    undrawn.update((id(tick.label1), id(tick.label2)))
+    texts = [t for t in fig.findobj(matplotlib.text.Text) if t.get_visible() and t.get_text().strip() and id(t) not in undrawn]
+    boxes = [(t, t.get_window_extent(rd)) for t in texts]
+    W, H = fig.bbox.width, fig.bbox.height
+    clipped = [t.get_text() for t, b in boxes if b.x0 < -0.5 or b.y0 < -0.5 or b.x1 > W + 0.5 or b.y1 > H + 0.5]
+    overlapping = []
+    for i, (t, a) in enumerate(boxes):
+        for u, b in boxes[i + 1:]:
+            if a.overlaps(b) and a.width > 0 and b.width > 0:
+                overlapping.append(f"{t.get_text()!r} / {u.get_text()!r}")
+    return clipped, overlapping
 
 
 # ------------------------------------------------------------------------------------------------ block GQ points
@@ -582,20 +638,25 @@ def gq_point_colors(gq, norm, cmap):
 
 
 def fig_block_gq(points, block_order, rows, coverages, ticks, title, metric="excess", ylabel="excess (bp)",
-                 xlabel="block (genomic order)", cbar_label="Conditional GQ"):
+                 xlabel="block (genomic order)", cbar_label="Conditional GQ", slide=False, footer=None):
     """Vertically stacked panels (rows: [(row value, panel label)]), ordered blocks on x, `metric` on the symlog bp axis
     with each panel's limits set exactly as in fig_block_raincloud's top panel for the same row, coverage dodged and
     encoded by marker shape, every point coloured continuously by conditional GQ through log10(1 + GQ) with the colour
     bar labelled in GQ. Missing GQ: grey; +inf: top colour with a black outline. No point is dropped for its GQ.
     Returns (figure, drawn): one (row, run_id, block_id, coverage, x, y, gq, colour value, hex colour, gq_class) per
-    point; figure.panel_axes lists (row, ymin, ymax, yscale) per panel."""
+    point; figure.panel_axes lists (row, ymin, ymax, yscale) per panel.
+    slide=True: the SLIDE canvas and type, the coverage legend above the panels, larger markers and an optional footer;
+    every value, x position, colour and axis limit is the same as in the audit layout."""
     covs = list(coverages)
     marker = {c: COVERAGE_MARKERS[i % len(COVERAGE_MARKERS)] for i, c in enumerate(covs)}
     nb = len(block_order)
     w = BLOCK_DODGE / max(1, len(covs))
     norm, cmap, cticks = gq_color_scale(points.conditional_GQ)
-    unit = block_unit_in(ticks, 7, 0.9)
-    fig, axes = plt.subplots(len(rows), 1, figsize=(max(unit * nb, 6) + 2.6, 2.4 * len(rows) + 0.9), squeeze=False, sharex=True)
+    if slide:
+        fig, axes = plt.subplots(len(rows), 1, figsize=SLIDE["figsize"], squeeze=False, sharex=True, layout="constrained")
+    else:
+        unit = block_unit_in(ticks, 7, 0.9)
+        fig, axes = plt.subplots(len(rows), 1, figsize=(max(unit * nb, 6) + 2.6, 2.4 * len(rows) + 0.9), squeeze=False, sharex=True)
     drawn = []
     any_missing = any_inf = False
     for ax, (rval, rlabel) in zip(axes[:, 0], rows):
@@ -611,7 +672,7 @@ def fig_block_gq(points, block_order, rows, coverages, ticks, title, metric="exc
                 cols = gq_point_colors(gq, norm, cmap)
                 cls = ["missing" if np.isnan(x) else "+inf" if np.isposinf(x) else "finite" for x in gq]
                 edge = ["black" if k == "+inf" else "none" for k in cls]
-                ax.scatter(xs, g[metric], s=9, c=cols, marker=marker[c], edgecolors=edge, linewidths=[0.6 if e == "black" else 0 for e in edge],
+                ax.scatter(xs, g[metric], s=SLIDE["gq_point"] if slide else 9, c=cols, marker=marker[c], edgecolors=edge, linewidths=[0.6 if e == "black" else 0 for e in edge],
                            zorder=3)
                 any_missing |= "missing" in cls
                 any_inf |= "+inf" in cls
@@ -621,17 +682,32 @@ def fig_block_gq(points, block_order, rows, coverages, ticks, title, metric="exc
         top = d[metric].max() if d[metric].notna().any() else 0.0
         _symlog(ax, "excess", top)
         ax.set_xlim(-0.5, nb - 0.5)
-        ax.set_ylabel(ylabel, fontsize=7)
-        ax.set_title(rlabel, loc="left", fontsize=8)
+        if not slide:
+            ax.set_ylabel(ylabel, fontsize=7)
+        ax.set_title(rlabel, loc="left", fontsize=SLIDE["label"] if slide else 8)
+        if slide:
+            ax.tick_params(axis="y", labelsize=SLIDE["tick"])
         for bi in range(nb - 1):
             ax.axvline(bi + 0.5, color="#e5e5e5", lw=0.5, zorder=0)
-    axes[-1, 0].set_xticks(range(nb), ticks, rotation=0)
-    axes[-1, 0].set_xlabel(xlabel)
     handles = [Line2D([], [], marker=marker[c], ls="", color="#555555", label=f"{c}x" if c != "all" else "all") for c in covs]
     if any_missing:
         handles.append(Line2D([], [], marker="o", ls="", color=GQ_MISSING_COLOR, label="GQ missing"))
     if any_inf:
         handles.append(Line2D([], [], marker="o", ls="", color=cmap(1.0), markeredgecolor="black", label="GQ = +∞"))
+    if slide:
+        axes[-1, 0].set_xticks(range(nb), ticks, rotation=0, fontsize=SLIDE["block"])
+        axes[-1, 0].set_xlabel(xlabel, fontsize=SLIDE["label"])
+        fig.supylabel(ylabel, fontsize=SLIDE["label"])   # one label for the stacked panels
+        _slide_frame(fig, title, handles, "coverage", footer)
+        sm = matplotlib.cm.ScalarMappable(norm=norm, cmap=cmap)
+        cb = fig.colorbar(sm, ax=list(axes[:, 0]), fraction=0.02, pad=0.01, aspect=35)
+        cb.set_ticks([float(np.log10(1 + t)) for t in cticks], labels=[f"{t:g}" for t in cticks])
+        cb.ax.tick_params(labelsize=SLIDE["tick"])
+        cb.set_label(cbar_label, fontsize=SLIDE["label"])
+        fig.panel_axes = [(rval, *ax.get_ylim(), ax.get_yscale()) for ax, (rval, _) in zip(axes[:, 0], rows)]
+        return fig, drawn
+    axes[-1, 0].set_xticks(range(nb), ticks, rotation=0)
+    axes[-1, 0].set_xlabel(xlabel)
     axes[0, 0].legend(handles=handles, frameon=False, loc="upper left", bbox_to_anchor=(1.0, 1.0), title="coverage")
     fig.suptitle(title, fontsize=9)
     fig.tight_layout()
