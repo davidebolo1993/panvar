@@ -480,6 +480,69 @@ def count_triple_label(c, z, u):
     return f"n=({c},{z},{u})"
 
 
+def _raincloud_cell(ax, g, metric, scale, x0, w, color, b, c, slide):
+    """One raincloud at slot x0: the half violin of g[metric] (left), Q1/median/Q3 marks across it and the same
+    observations as deterministic jittered points on the open side. g is sorted by run_id. Returns (points, violin)."""
+    vals = g[metric].to_numpy(dtype=float)
+    hv = half_violin(vals, scale)
+    half = RAINCLOUD_HALF * w
+    if hv["kind"] == "kde":
+        ax.fill_betweenx(hv["y"], x0 - half * hv["width"], x0, color=color, alpha=0.45, lw=0.4,
+                         edgecolor=color, zorder=2)
+    else:   # zero variance: a flat bar at the common value, the full violin width
+        ax.plot([x0 - half, x0], hv["y"], color=color, lw=2.2, solid_capstyle="butt", zorder=2)
+    q1, med, q3 = quartiles(vals)
+    for q, lw in ((q1, 0.7), (q3, 0.7), (med, 1.8)):
+        ax.plot([x0 - half, x0], [q, q], color="#222222", lw=lw, solid_capstyle="butt", zorder=4)
+    band = RAINCLOUD_JITTER * w
+    xs = [x0 + RAINCLOUD_GAP * w + band / 2 + stable_jitter(f"{r}|{b}", band) for r in g.run_id]
+    ax.scatter(xs, vals, s=SLIDE["raincloud_point"] if slide else 4, color=color, linewidths=0, alpha=0.85, zorder=3)
+    return [(metric, r, b, c, x, y) for r, x, y in zip(g.run_id, xs, vals)], (metric, b, c, hv["kind"], len(vals), q1, med, q3)
+
+
+def fig_block_raincloud_rows(points, block_order, rows, coverages, ticks, title, ylims, metric="excess",
+                             ylabel="Excess over the availability floor (bp)", xlabel="block (genomic order)", footer=None):
+    """Slide (SLIDE canvas): one symlog-bp raincloud panel per row (rows: [(row value, panel label)]), stacked on the
+    shared ordered block axis, with each panel's y-limits FIXED to ylims[row] (e.g. a reference figure's, so a subset
+    is never autoscaled; a point outside them is refused). Violins and quartiles summarize exactly the points given;
+    points keep the raincloud's deterministic positions. Returns (figure, drawn) as fig_block_raincloud, with the row
+    prepended to every point and violin."""
+    covs = list(coverages)
+    ccol = coverage_colors(covs)
+    nb = len(block_order)
+    w = BLOCK_DODGE / max(1, len(covs))
+    fig, axes = plt.subplots(len(rows), 1, figsize=SLIDE["figsize"], squeeze=False, sharex=True, layout="constrained")
+    drawn_points, drawn_violins = [], []
+    for ax, (rval, rlabel) in zip(axes[:, 0], rows):
+        d = points[(points.row == rval) & points[metric].notna()]
+        lo, hi = ylims[rval]
+        if len(d) and (d[metric].min() < lo or d[metric].max() > hi):
+            raise ValueError(f"{rval}: a point lies outside the fixed y-limits ({lo}, {hi})")
+        for bi, b in enumerate(block_order):
+            for ci, c in enumerate(covs):
+                g = d[(d.block_id == b) & (d.coverage == c)].sort_values("run_id", kind="stable")
+                if len(g):
+                    p, v = _raincloud_cell(ax, g, metric, "symlog_bp", bi + (ci - (len(covs) - 1) / 2) * w, w, ccol[c], b, c, True)
+                    drawn_points += [(rval,) + x for x in p]
+                    drawn_violins.append((rval,) + v)
+        _symlog(ax, "excess", 0.0)
+        ax.set_ylim(lo, hi)
+        ax.set_xlim(-0.5, nb - 0.5)
+        ax.set_title(rlabel, loc="left", fontsize=SLIDE["label"])
+        ax.tick_params(axis="y", labelsize=SLIDE["tick"])
+        _slide_plain_ticks(ax)
+        for bi in range(nb - 1):
+            ax.axvline(bi + 0.5, color="#e5e5e5", lw=0.5, zorder=0)
+    axes[-1, 0].set_xticks(range(nb), ticks, rotation=0, fontsize=SLIDE["block"])
+    axes[-1, 0].set_xlabel(xlabel, fontsize=SLIDE["label"])
+    fig.supylabel(ylabel, fontsize=SLIDE["label"])
+    handles = [Patch(facecolor=ccol[c], edgecolor=ccol[c], alpha=0.6, label=f"{c}x" if c != "all" else "all") for c in covs]
+    handles += [Line2D([], [], color="#222222", lw=1.8, label="median"), Line2D([], [], color="#222222", lw=0.7, label="Q1, Q3")]
+    _slide_frame(fig, title, handles, "coverage", footer)
+    fig.panel_axes = [(rval, *ax.get_ylim(), ax.get_yscale()) for ax, (rval, _) in zip(axes[:, 0], rows)]
+    return fig, {"points": drawn_points, "violins": drawn_violins}
+
+
 def fig_block_raincloud(points, block_order, coverages, panels, counts, title, ticks, xlabel="block (genomic order)", slide=False,
                         footer=None):
     """One figure of vertically aligned panels sharing the ordered block axis; in every block one raincloud per
@@ -514,22 +577,9 @@ def fig_block_raincloud(points, block_order, coverages, panels, counts, title, t
                 g = points[(points.block_id == b) & (points.coverage == c) & points[metric].notna()]
                 g = g.sort_values("run_id", kind="stable")
                 if len(g):
-                    vals = g[metric].to_numpy(dtype=float)
-                    hv = half_violin(vals, scale)
-                    half = RAINCLOUD_HALF * w
-                    if hv["kind"] == "kde":
-                        ax.fill_betweenx(hv["y"], x0 - half * hv["width"], x0, color=ccol[c], alpha=0.45, lw=0.4,
-                                         edgecolor=ccol[c], zorder=2)
-                    else:   # zero variance: a flat bar at the common value, the full violin width
-                        ax.plot([x0 - half, x0], hv["y"], color=ccol[c], lw=2.2, solid_capstyle="butt", zorder=2)
-                    q1, med, q3 = quartiles(vals)
-                    for q, lw in ((q1, 0.7), (q3, 0.7), (med, 1.8)):
-                        ax.plot([x0 - half, x0], [q, q], color="#222222", lw=lw, solid_capstyle="butt", zorder=4)
-                    band = RAINCLOUD_JITTER * w
-                    xs = [x0 + RAINCLOUD_GAP * w + band / 2 + stable_jitter(f"{r}|{b}", band) for r in g.run_id]
-                    ax.scatter(xs, vals, s=SLIDE["raincloud_point"] if slide else 4, color=ccol[c], linewidths=0, alpha=0.85, zorder=3)
-                    drawn_points += [(metric, r, b, c, x, y) for r, x, y in zip(g.run_id, xs, vals)]
-                    drawn_violins.append((metric, b, c, hv["kind"], len(vals), q1, med, q3))
+                    p, v = _raincloud_cell(ax, g, metric, scale, x0, w, ccol[c], b, c, slide)
+                    drawn_points += p
+                    drawn_violins.append(v)
                 if ax is axes[0, 0] and (b, c) in counts:
                     ax.annotate(count_triple_label(*counts[(b, c)]), (x0, 1.0), xycoords=ax.get_xaxis_transform(),
                                 xytext=(0, 2), textcoords="offset points", ha="center", va="baseline",

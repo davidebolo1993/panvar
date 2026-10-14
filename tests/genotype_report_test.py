@@ -11,7 +11,8 @@ scripts/plot_genotype_block_gq.py (log10(1 + GQ) colours, missing and infinite G
 raincloud's); and the 16:9 --slide layouts of both (exact canvas, no count labels, nothing clipped or
 overlapping, the same tables as the audit layout); and the mosaic design slides of
 scripts/plot_genotype_mosaic_design.py (A/B source toggling, refusals, exact clean reproducible canvases); and the outcome-category point slide of
-scripts/plot_genotype_block_categories.py (rule mapping and refusals, positions equal to the GQ figure, subsets keeping the reference geometry). Usage: genotype_report_test.py [scripts dir]."""
+scripts/plot_genotype_block_categories.py (rule mapping and refusals, positions equal to the GQ figure, subsets keeping the reference geometry); and the retained-call raincloud slide of
+scripts/plot_genotype_block_retained.py (truth-free membership, fixed limits, violins from retained calls only). Usage: genotype_report_test.py [scripts dir]."""
 import hashlib
 import math
 import os
@@ -1015,6 +1016,85 @@ class BlockCategories(unittest.TestCase):
             self.assertEqual(sha(os.path.join(self.tmp, "a", sub, f)), sha(os.path.join(self.tmp, "b", sub, f)), f)
         with open(os.path.join(self.tmp, "a", "figures", "cat.png"), "rb") as h:
             self.assertEqual(struct.unpack(">II", h.read(24)[16:24]), (3200, 1800))
+
+
+# ---------------------------------------------------------------------------------------------- retained-call raincloud slide
+import plot_genotype_block_retained as retcli  # noqa: E402
+
+
+class BlockRetained(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="genotype_retained_test_")
+        self.d = os.path.join(self.tmp, "in")
+        pts = [dict(p) for p in rain_points() if p["truth_defined"] == "true"]
+        for i, p in enumerate(pts):
+            p["GENOTYPE_FILTER"] = "LOW_QUALITY" if i % 4 == 1 else "PASS"
+            for k in ("truth_defined", "availability_floor", "normalized_excess"):
+                p.pop(k)
+        self.pts = pts
+        self.write("points.tsv", pts)
+        write(os.path.join(self.d, "rows.tsv"), [{"row": "G1", "label": "G1"}, {"row": "G2", "label": "G2"}], ["row", "label"])
+        write(os.path.join(self.d, "lengths.tsv"), [{"block_id": b, "displayed_length_range": f"{i}–{i + 1} kb"} for i, b in enumerate(BLOCKS)],
+              ["block_id", "displayed_length_range"])
+        self.write("axes.tsv", [{"row": "G1", "ymin": -0.4, "ymax": 2160.0}, {"row": "G2", "ymin": -0.4, "ymax": 18.0}])
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp)
+
+    def write(self, name, rows):
+        write(os.path.join(self.d, name), rows, list(rows[0]))
+
+    def cli(self, out, axes="axes.tsv"):
+        return retcli.run(["--points", os.path.join(self.d, "points.tsv"), "--rows", os.path.join(self.d, "rows.tsv"),
+                           "--block-lengths", os.path.join(self.d, "lengths.tsv"), "--panel-axes", os.path.join(self.d, axes),
+                           "--coverages", "2,10", "--retain-column", "GENOTYPE_FILTER", "--retain-value", "PASS",
+                           "--out-dir", os.path.join(self.tmp, out), "--stem", "ret", "--footer", "kept"])
+
+    def table(self, out, name):
+        return pd.read_csv(os.path.join(self.tmp, out, name), sep="\t", keep_default_na=False, float_precision="round_trip")
+
+    def test_retained_membership_positions_and_violins(self):
+        """Exactly the rule's calls are drawn, at the raincloud's positions; violins summarize only them; limits fixed."""
+        self.cli("o")
+        d = self.table("o", "retained_points.tsv")
+        kept = {(p["run_id"], p["block_id"]) for p in self.pts if p["GENOTYPE_FILTER"] == "PASS"}
+        self.assertEqual(set(zip(d.run_id, d.block_id)), kept)
+        ex = self.table("o", "excluded_calls.tsv")
+        self.assertEqual(len(ex), len(self.pts) - len(kept))
+        self.assertTrue((ex.GENOTYPE_FILTER != "PASS").all())
+        w = P.BLOCK_DODGE / 2
+        for r in d.itertuples():   # the raincloud's deterministic open-side position
+            x0 = BLOCKS.index(r.block_id) + ([2, 10].index(r.coverage) - 0.5) * w
+            band = P.RAINCLOUD_JITTER * w
+            self.assertEqual(r.x, x0 + P.RAINCLOUD_GAP * w + band / 2 + P.stable_jitter(f"{r.run_id}|{r.block_id}", band))
+        v = self.table("o", "retained_violins.tsv")
+        for r in v.itertuples():
+            ys = d[(d.row == r.row) & (d.block_id == r.block_id) & (d.coverage == r.coverage)].excess
+            self.assertEqual(int(r.n), len(ys))
+            self.assertEqual(tuple(round(x, 12) for x in P.quartiles(ys)), (round(r.q1, 12), round(r.median, 12), round(r.q3, 12)))
+        self.assertEqual(self.table("o", "panel_axes.tsv")[["ymin", "ymax"]].values.tolist(), [[-0.4, 2160.0], [-0.4, 18.0]])
+        c = self.table("o", "retention_counts.tsv")
+        self.assertEqual((int(c.total.sum()), int(c.retained.sum()), int(c.excluded.sum())), (len(self.pts), len(kept), len(self.pts) - len(kept)))
+        lay = self.table("o", "layout_check.tsv")
+        self.assertEqual((int(lay.clipped_texts[0]), int(lay.overlapping_text_pairs[0])), (0, 0), lay.detail.tolist())
+
+    def test_membership_ignores_truth(self):
+        """Changing every excess leaves the retained set unchanged: the rule reads only the retain column."""
+        self.cli("a")
+        for p in self.pts:
+            p["excess"] = float(p["excess"]) + 1.0
+        self.write("points.tsv", self.pts)
+        self.cli("b")
+        a, b = self.table("a", "retained_points.tsv"), self.table("b", "retained_points.tsv")
+        self.assertEqual(sorted(zip(a.run_id, a.block_id)), sorted(zip(b.run_id, b.block_id)))
+
+    def test_fixed_limits_refuse_and_redraw_identical(self):
+        self.write("tight.tsv", [{"row": "G1", "ymin": -0.4, "ymax": 5.0}, {"row": "G2", "ymin": -0.4, "ymax": 18.0}])
+        with self.assertRaises(Refusal):
+            self.cli("x", "tight.tsv")
+        self.cli("a"); self.cli("b")
+        for f in ("figures/ret.png", "figures/ret.pdf", "retained_points.tsv", "retained_violins.tsv"):
+            self.assertEqual(sha(os.path.join(self.tmp, "a", f)), sha(os.path.join(self.tmp, "b", f)), f)
 
 
 if __name__ == "__main__":
