@@ -9,7 +9,8 @@ under the block IDs (evaluation only); and the ordered-block raincloud figures o
 byte-identical redraws, no run count in titles, the locus companion table); and the conditional-GQ point figure of
 scripts/plot_genotype_block_gq.py (log10(1 + GQ) colours, missing and infinite GQ, no filtering, axes equal to the
 raincloud's); and the 16:9 --slide layouts of both (exact canvas, no count labels, nothing clipped or
-overlapping, the same tables as the audit layout). Usage: genotype_report_test.py [scripts dir]."""
+overlapping, the same tables as the audit layout); and the mosaic design slides of
+scripts/plot_genotype_mosaic_design.py (A/B source toggling, refusals, exact clean reproducible canvases). Usage: genotype_report_test.py [scripts dir]."""
 import hashlib
 import math
 import os
@@ -801,6 +802,84 @@ class BlockGQ(unittest.TestCase):
         for sub in ("figures", ""):
             for f in sorted(x for x in os.listdir(os.path.join(self.tmp, "a", sub)) if os.path.isfile(os.path.join(self.tmp, "a", sub, x))):
                 self.assertEqual(sha(os.path.join(self.tmp, "a", sub, f)), sha(os.path.join(self.tmp, "b", sub, f)), f)
+
+
+# ---------------------------------------------------------------------------------------------- mosaic design slides
+import plot_genotype_mosaic_design as mdcli  # noqa: E402
+
+MBLOCKS = ["b0", "b1", "b2", "b3"]
+
+
+def switch_rows(plan, cls, h1, h2, a="dA", b="dB"):
+    """Switch-map rows of one plan over MBLOCKS; h1/h2 are the boundary indices where that homologue switches."""
+    out = []
+    for i in range(len(MBLOCKS) - 1):
+        s1, s2 = i in h1, i in h2
+        out.append({"switch_class": cls, "plan": plan, "source_a": a, "source_b": b, "boundary_index": i,
+                    "boundary": f"{MBLOCKS[i]}>{MBLOCKS[i + 1]}", "hap1_switch": str(s1), "hap2_switch": str(s2),
+                    "category": "both" if s1 and s2 else "hap1_only" if s1 else "hap2_only" if s2 else "none"})
+    return out
+
+
+class MosaicDesign(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="genotype_mosaic_design_test_")
+        self.rows = (switch_rows("ctl_1", "ctl", [], []) + switch_rows("ctl_2", "ctl", [], [], "dC", "dD") +
+                     switch_rows("two_1", "two", [0, 2], [1]) + switch_rows("two_2", "two", [1], [0, 1, 2], "dE", "dF"))
+        self.write(self.rows)
+        write(os.path.join(self.tmp, "classes.tsv"), [{"class": "ctl", "label": "Control", "example_plan": "ctl_1"},
+                                                      {"class": "two", "label": "Two", "example_plan": "two_1"}], ["class", "label", "example_plan"])
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp)
+
+    def write(self, rows):
+        write(os.path.join(self.tmp, "map.tsv"), rows, list(rows[0]))
+
+    def cli(self, out, classes="classes.tsv"):
+        return mdcli.run(["--switch-map", os.path.join(self.tmp, "map.tsv"), "--classes", os.path.join(self.tmp, classes),
+                          "--out-dir", os.path.join(self.tmp, out), "--note", "n = 4 per coverage"])
+
+    def test_tracks_toggle_between_two_sources(self):
+        order, tr = A.switch_source_tracks(pd.DataFrame(self.rows))
+        self.assertEqual(order, MBLOCKS)
+        src = lambda plan, hom: "".join(tr[(tr.plan == plan) & (tr.homologue == hom)].sort_values("block_index").source)
+        self.assertEqual((src("two_1", "H1"), src("two_1", "H2")), ("ABBA", "AABB"))   # switch, stay, switch back: no third source
+        self.assertEqual((src("two_2", "H1"), src("two_2", "H2")), ("AABB", "ABAB"))
+        self.assertEqual(src("ctl_1", "H1") + src("ctl_1", "H2"), "A" * 8)
+        s = A.switch_plan_summary(tr).set_index("plan")
+        self.assertEqual((s.loc["two_1", "h1_switch_before_block"], s.loc["two_1", "h2_switches"]), ("1,3", 1))
+        self.assertEqual((s.loc["ctl_2", "h1_switches"], s.loc["ctl_2", "h2_switch_before_block"]), (0, "none"))
+
+    def test_refusals(self):
+        bad = [dict(r) for r in self.rows]
+        bad[1]["boundary"] = "b2>b1"   # does not chain
+        self.write(bad)
+        with self.assertRaises(Refusal):
+            self.cli("x1")
+        self.write(self.rows)
+        write(os.path.join(self.tmp, "wrong.tsv"), [{"class": "ctl", "label": "C", "example_plan": "two_1"},
+                                                    {"class": "two", "label": "T", "example_plan": "two_2"}], ["class", "label", "example_plan"])
+        with self.assertRaises(Refusal):
+            self.cli("x2", "wrong.tsv")
+
+    def test_slides_exact_clean_and_reproducible(self):
+        self.cli("a"); self.cli("b")
+        import struct
+        for stem in ("mosaic_benchmark_design_slide", "mosaic_switch_map_full_slide"):
+            with open(os.path.join(self.tmp, "a", "figures", stem + ".png"), "rb") as f:
+                self.assertEqual(struct.unpack(">II", f.read(24)[16:24]), (3200, 1800))
+            for ext in (".png", ".pdf"):
+                self.assertEqual(sha(os.path.join(self.tmp, "a", "figures", stem + ext)), sha(os.path.join(self.tmp, "b", "figures", stem + ext)))
+        lay = pd.read_csv(os.path.join(self.tmp, "a", "layout_check.tsv"), sep="\t")
+        self.assertTrue((lay.clipped_texts == 0).all() and (lay.overlapping_text_pairs == 0).all(), lay.detail.tolist())
+        tr = pd.read_csv(os.path.join(self.tmp, "a", "mosaic_design_tracks.tsv"), sep="\t", keep_default_na=False)
+        self.assertEqual(sorted(tr[tr.example_plan == True].plan.unique()), ["ctl_1", "two_1"])   # noqa: E712
+        with open(os.path.join(self.tmp, "a", "captions.md")) as f:
+            cap = f.read()
+        self.assertIn("4 plans in 2 classes", cap)
+        self.assertIn("2 have no switch (controls)", cap)
+        self.assertIn("two_2: A = dE, B = dF", cap)
 
 
 if __name__ == "__main__":

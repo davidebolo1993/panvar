@@ -11,6 +11,7 @@ from matplotlib.font_manager import FontProperties  # noqa: E402
 from matplotlib.lines import Line2D  # noqa: E402
 from matplotlib.patches import Patch  # noqa: E402
 import matplotlib.ticker  # noqa: E402
+import matplotlib.patches  # noqa: E402
 
 from .common import STATUSES, stable_jitter  # noqa: E402
 
@@ -960,6 +961,89 @@ def fig_switch_map(t, info, classes, lengths=None):
     ax.legend(handles=handles, frameon=False, loc="upper left", bbox_to_anchor=(1, 1))
     ax.set_title("Truth switch map by plan", fontsize=8)
     fig.tight_layout()
+    return fig
+
+
+SOURCE_COLORS = {"A": "#1d5a85", "B": "#e0a030"}   # the two source templates of a mosaic plan
+
+
+def fig_mosaic_design(tracks, block_order, rows, title, notes=(), source_labels=("source A", "source B")):
+    """Slide schematic of mosaic plans: per row (plan, label) two narrow tracks, H1 and H2, divided into the ordered
+    blocks and coloured by source (A or B); a switch is drawn at the boundary between blocks as a black notch with a
+    triangle. `notes` are short text lines set under the tracks. Returns the figure."""
+    nb = len(block_order)
+    fig, ax = plt.subplots(figsize=SLIDE["figsize"], layout="constrained")
+    bar, gap, row_gap, label_w = 0.55, 0.8, 1.35, 3.6
+    y = 0.0
+    yt, ylab = [], []
+    for plan, label in rows:
+        ax.text(-label_w, y - 0.75, label, ha="left", va="center", fontsize=SLIDE["label"], fontweight="bold")
+        for hom in ("H1", "H2"):
+            h = tracks[(tracks.plan == plan) & (tracks.homologue == hom)].sort_values("block_index")
+            for r in h.itertuples():
+                ax.add_patch(matplotlib.patches.Rectangle((r.block_index, y - bar / 2), 1, bar, facecolor=SOURCE_COLORS[r.source],
+                                                          edgecolor="white", lw=0.8))
+                if r.switch_before_block:
+                    ax.plot([r.block_index, r.block_index], [y - bar / 2 - 0.08, y + bar / 2 + 0.08], color="black", lw=2.2,
+                            solid_capstyle="butt", zorder=4)
+                    ax.scatter([r.block_index], [y - bar / 2 - 0.2 if hom == "H1" else y + bar / 2 + 0.2],
+                               marker="v" if hom == "H1" else "^", color="black", s=22, zorder=4)
+            ax.text(-0.12, y, hom, ha="right", va="center", fontsize=SLIDE["tick"])
+            yt.append(y)
+            ylab.append(hom)
+            y += gap
+        y += row_gap
+    ax.set_xlim(-label_w - 0.1, nb + 0.1)
+    ax.set_ylim(y - row_gap + 0.1, -1.35)
+    ax.set_yticks([])
+    ax.set_xticks([i + 0.5 for i in range(nb)], block_order, fontsize=SLIDE["block"] + 1)
+    ax.tick_params(axis="x", length=0)
+    for side in ("left", "right", "top"):
+        ax.spines[side].set_visible(False)
+    ax.spines["bottom"].set_bounds(0, nb)
+    ax.set_xlabel("block (genomic order); switches sit on the boundary between blocks", fontsize=SLIDE["label"])
+    handles = [Patch(facecolor=SOURCE_COLORS["A"], label=source_labels[0]), Patch(facecolor=SOURCE_COLORS["B"], label=source_labels[1]),
+               Line2D([], [], color="black", lw=2.2, marker="v", markersize=5, label="switch (toggles A \u2194 B)")]
+    ax.legend(handles=handles, loc="lower right", bbox_to_anchor=(1.0, 1.0), ncol=3, frameon=False, fontsize=SLIDE["legend"],
+              borderaxespad=0.2)
+    fig.suptitle(title, fontsize=SLIDE["title"])
+    if notes:
+        fig.get_layout_engine().set(rect=(0, 0.075, 1, 0.925))
+        fig.text(0.005, 0.006, "\n".join(notes), ha="left", va="bottom", fontsize=SLIDE["legend"], color="#222222", linespacing=1.35)
+    return fig
+
+
+def fig_switch_map_slide(summary_tracks, block_order, plans, title):
+    """Slide map of every plan's switch boundaries: plans on y (names only), boundaries on x between the ordered blocks,
+    one marker per boundary where a homologue switches: H1 only, H2 only, or both."""
+    nb = len(block_order)
+    fig, ax = plt.subplots(figsize=SLIDE["figsize"], layout="constrained")
+    for yi, plan in enumerate(plans):
+        h = summary_tracks[summary_tracks.plan == plan]
+        s1 = set(h[(h.homologue == "H1") & h.switch_before_block].block_index)
+        s2 = set(h[(h.homologue == "H2") & h.switch_before_block].block_index)
+        for b in sorted(s1 | s2):
+            cat = "both" if b in s1 and b in s2 else "hap1_only" if b in s1 else "hap2_only"
+            m, col, _ = SWITCH_MARKERS[cat]
+            ax.scatter([b], [yi], marker=m, color=col, s=90, zorder=3)
+        ax.axhline(yi, color="#e8e8e8", lw=0.8, zorder=0)
+    classes = summary_tracks.drop_duplicates("plan").set_index("plan").switch_class
+    for yi in range(1, len(plans)):
+        if classes[plans[yi]] != classes[plans[yi - 1]]:
+            ax.axhline(yi - 0.5, color="#999999", lw=0.8, zorder=0)
+    ax.set_yticks(range(len(plans)), plans, fontsize=SLIDE["tick"])
+    ax.set_ylim(len(plans) - 0.5, -0.5)
+    ax.set_xticks([i + 0.5 for i in range(nb)], block_order, fontsize=SLIDE["block"] + 1)
+    ax.set_xlim(0, nb)
+    for b in range(1, nb):
+        ax.axvline(b, color="#f0f0f0", lw=0.8, zorder=0)
+    ax.tick_params(axis="x", length=0)
+    ax.set_xlabel("block (genomic order); markers sit on the boundary where the homologue changes source", fontsize=SLIDE["label"])
+    labels = {"hap1_only": "H1 switches", "hap2_only": "H2 switches", "both": "H1 and H2 switch"}
+    handles = [Line2D([], [], marker=m, ls="", color=col, markersize=8, label=labels[k]) for k, (m, col, _) in SWITCH_MARKERS.items()]
+    ax.legend(handles=handles, loc="lower right", bbox_to_anchor=(1.0, 1.0), ncol=3, frameon=False, fontsize=SLIDE["legend"],
+              borderaxespad=0.2)
+    fig.suptitle(title, fontsize=SLIDE["title"])
     return fig
 
 

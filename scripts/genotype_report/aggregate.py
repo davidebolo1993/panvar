@@ -785,3 +785,58 @@ def locus_accuracy(points, run_counts, modes, phase_calls=None, phase_projected=
             row["projected_boundaries_concordant"] = int(p.projected_concordant.sum())
         out.append(row)
     return pd.DataFrame(out)
+
+
+# ------------------------------------------------------------------------------------------------ mosaic design
+SWITCH_MAP_COLUMNS = ["switch_class", "plan", "source_a", "source_b", "boundary_index", "boundary", "hap1_switch", "hap2_switch"]
+
+
+def switch_source_tracks(t):
+    """Per plan, homologue and block, the source template (A or B) of a mosaic truth haplotype, from a switch map
+    (one row per plan and block boundary 'left>right', with hap1_switch / hap2_switch). Both homologues start on
+    source A and toggle at every boundary where they switch: a later switch returns to the other source, never to a
+    third. Returns (block order, tracks frame with switch_class, plan, homologue, block_index, block_id, source,
+    switch_before_block)."""
+    missing = [c for c in SWITCH_MAP_COLUMNS if c not in t.columns]
+    if missing:
+        raise Refusal(f"switch map lacks column(s) {', '.join(missing)}")
+    t = t.copy()
+    t["boundary_index"] = t.boundary_index.astype(int)
+    rows = []
+    order = None
+    for plan, g in t.groupby("plan", sort=False):
+        g = g.sort_values("boundary_index")
+        if list(g.boundary_index) != list(range(len(g))):
+            raise Refusal(f"{plan}: boundaries are not 0..{len(g) - 1}")
+        pairs = [b.split(">") for b in g.boundary]
+        blocks = [pairs[0][0]] + [p[1] for p in pairs]
+        if any(pairs[i][1] != pairs[i + 1][0] for i in range(len(pairs) - 1)):
+            raise Refusal(f"{plan}: boundaries do not chain block to block")
+        if order is None:
+            order = blocks
+        elif blocks != order:
+            raise Refusal(f"{plan}: block order differs from the other plans")
+        for hom, col in (("H1", "hap1_switch"), ("H2", "hap2_switch")):
+            flips = [str(v) in ("True", "true", "1") for v in g[col]]
+            src = "A"
+            for bi, b in enumerate(blocks):
+                switched = bi > 0 and flips[bi - 1]
+                if switched:
+                    src = "B" if src == "A" else "A"
+                rows.append({"switch_class": g.switch_class.iloc[0], "plan": plan, "homologue": hom, "block_index": bi,
+                             "block_id": b, "source": src, "switch_before_block": switched,
+                             "source_a": g.source_a.iloc[0], "source_b": g.source_b.iloc[0]})
+    return order, pd.DataFrame(rows)
+
+
+def switch_plan_summary(tracks):
+    """Per plan: donors, the switch positions of each homologue (as 'switch before block' indices) and their counts."""
+    out = []
+    for plan, g in tracks.groupby("plan", sort=False):
+        r = {"switch_class": g.switch_class.iloc[0], "plan": plan, "source_a": g.source_a.iloc[0], "source_b": g.source_b.iloc[0]}
+        for hom in ("H1", "H2"):
+            h = g[(g.homologue == hom) & g.switch_before_block]
+            r[f"{hom.lower()}_switch_before_block"] = ",".join(str(i) for i in h.block_index) or "none"
+            r[f"{hom.lower()}_switches"] = len(h)
+        out.append(r)
+    return pd.DataFrame(out)
