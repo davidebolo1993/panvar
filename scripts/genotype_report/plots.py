@@ -10,6 +10,7 @@ from matplotlib.backends.backend_agg import RendererAgg  # noqa: E402
 from matplotlib.font_manager import FontProperties  # noqa: E402
 from matplotlib.lines import Line2D  # noqa: E402
 from matplotlib.patches import Patch  # noqa: E402
+import matplotlib.ticker  # noqa: E402
 
 from .common import STATUSES, stable_jitter  # noqa: E402
 
@@ -543,6 +544,7 @@ def fig_block_raincloud(points, block_order, coverages, panels, counts, title, t
         ax.set_ylabel(ylabel, fontsize=SLIDE["label"] if slide else 7)
         if slide:
             ax.tick_params(axis="y", labelsize=SLIDE["tick"])
+            _slide_plain_ticks(ax)
         for bi in range(nb - 1):
             ax.axvline(bi + 0.5, color="#e5e5e5", lw=0.5, zorder=0)
     handles = [Patch(facecolor=ccol[c], edgecolor=ccol[c], alpha=0.6, label=f"{c}x" if c != "all" else "all") for c in covs]
@@ -559,6 +561,14 @@ def fig_block_raincloud(points, block_order, coverages, panels, counts, title, t
     fig.suptitle(title, fontsize=9)
     fig.tight_layout()
     return fig, {"points": drawn_points, "violins": drawn_violins}
+
+
+def _slide_plain_ticks(ax):
+    """Slide axes print symlog ticks as plain numbers (0, 1, 10, 1,000): the same tick positions, no superscript
+    exponents set at 70 % of the tick size."""
+    if ax.get_yscale() == "symlog":
+        ax.yaxis.set_major_formatter(matplotlib.ticker.FuncFormatter(lambda v, _: f"{v:,.0f}" if v >= 1 or v == 0 else f"{v:g}"))
+        ax.yaxis.set_minor_formatter(matplotlib.ticker.NullFormatter())
 
 
 def _slide_frame(fig, title, handles, legend_title, footer):
@@ -687,6 +697,7 @@ def fig_block_gq(points, block_order, rows, coverages, ticks, title, metric="exc
         ax.set_title(rlabel, loc="left", fontsize=SLIDE["label"] if slide else 8)
         if slide:
             ax.tick_params(axis="y", labelsize=SLIDE["tick"])
+            _slide_plain_ticks(ax)
         for bi in range(nb - 1):
             ax.axvline(bi + 0.5, color="#e5e5e5", lw=0.5, zorder=0)
     handles = [Line2D([], [], marker=marker[c], ls="", color="#555555", label=f"{c}x" if c != "all" else "all") for c in covs]
@@ -701,6 +712,7 @@ def fig_block_gq(points, block_order, rows, coverages, ticks, title, metric="exc
         _slide_frame(fig, title, handles, "coverage", footer)
         sm = matplotlib.cm.ScalarMappable(norm=norm, cmap=cmap)
         cb = fig.colorbar(sm, ax=list(axes[:, 0]), fraction=0.02, pad=0.01, aspect=35)
+        cb.solids.set_rasterized(False)   # a vector colour bar in the slide PDF
         cb.set_ticks([float(np.log10(1 + t)) for t in cticks], labels=[f"{t:g}" for t in cticks])
         cb.ax.tick_params(labelsize=SLIDE["tick"])
         cb.set_label(cbar_label, fontsize=SLIDE["label"])

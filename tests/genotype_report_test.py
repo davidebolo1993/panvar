@@ -651,7 +651,9 @@ class BlockRaincloud(unittest.TestCase):
         texts = [t.get_text() for t in fig.findobj(P.matplotlib.text.Text)]
         self.assertFalse(any(t.startswith("n=(") for t in texts))
         self.assertEqual(fig.get_size_inches().tolist(), [40 / 3, 7.5])
+        fig.canvas.draw()
         self.assertTrue(all(t.get_fontsize() >= 8 for ax in fig.axes for t in ax.get_xticklabels() + ax.get_yticklabels() if t.get_text()))
+        self.assertFalse(any("^" in t.get_text() or "mathdefault" in t.get_text() for t in fig.axes[0].get_yticklabels()))
         P.plt.close(fig)
         with open(os.path.join(self.tmp, "slide", "captions.md")) as f:
             cap = f.read()
@@ -788,6 +790,8 @@ class BlockGQ(unittest.TestCase):
             self.assertEqual(sha(os.path.join(self.tmp, "audit", f)), sha(os.path.join(self.tmp, "slide", f)), f)
         lay = self.table("slide", "layout_check.tsv")
         self.assertEqual((int(lay.clipped_texts[0]), int(lay.overlapping_text_pairs[0])), (0, 0), lay.detail.tolist())
+        with open(os.path.join(self.tmp, "slide", "figures", "gq.pdf"), "rb") as f:
+            self.assertNotIn(b"/Subtype /Image", f.read())   # the colour bar is vector too
         import struct
         with open(os.path.join(self.tmp, "slide", "figures", "gq.png"), "rb") as f:
             self.assertEqual(struct.unpack(">II", f.read(24)[16:24]), (3200, 1800))
