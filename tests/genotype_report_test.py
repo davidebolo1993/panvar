@@ -6,8 +6,11 @@ reruns, directory-mode loading (including pre-headline outputs), the per-coverag
 block_metric_summary, laid out without overlap for 1, 2 and 4 coverages) and the observed truth-allele length ranges
 under the block IDs (evaluation only); and the ordered-block raincloud figures of scripts/plot_genotype_block_error.py
 (n=(C,Z,U) counts by hand, point-mass and observed-range densities, points equal to the violins' observations, refusals,
-byte-identical redraws, no run count in titles, the locus companion table). Usage: genotype_report_test.py [scripts dir]."""
+byte-identical redraws, no run count in titles, the locus companion table); and the conditional-GQ point figure of
+scripts/plot_genotype_block_gq.py (log10(1 + GQ) colours, missing and infinite GQ, no filtering, axes equal to the
+raincloud's). Usage: genotype_report_test.py [scripts dir]."""
 import hashlib
+import math
 import os
 import shutil
 import sys
@@ -635,6 +638,124 @@ class BlockRaincloud(unittest.TestCase):
                          (3, 2, 1, 1))
         self.assertEqual(t.loc[("G1", 10), "all_block_fraction"], "0/2")
         self.assertEqual(t.loc[("G2", 2), "basis"], "every truth-defined block attains its availability floor")
+
+
+# ---------------------------------------------------------------------------------------------- block GQ points
+import plot_genotype_block_gq as gqcli  # noqa: E402
+
+
+def gq_points(special=True):
+    """The truth-defined raincloud points with a conditional GQ each: spread over orders of magnitude, plus (when
+    `special`) one missing and one infinite GQ."""
+    pts = [dict(p) for p in rain_points() if p["truth_defined"] == "true"]
+    for i, p in enumerate(pts):
+        p["conditional_GQ"] = f"{1.5 * 10 ** (i % 5):.6g}"
+        p["experiment"] = "e" + p["row"]
+        p.pop("truth_defined"); p.pop("availability_floor"); p.pop("normalized_excess")
+    if special:
+        pts[1]["conditional_GQ"] = "NA"
+        pts[2]["conditional_GQ"] = "inf"
+    return pts
+
+
+class BlockGQ(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="genotype_gq_test_")
+        self.d = os.path.join(self.tmp, "in")
+        self.write_points(gq_points())
+        write(os.path.join(self.d, "lengths.tsv"), [{"block_id": b, "displayed_length_range": f"{i}–{i + 1} kb"} for i, b in enumerate(BLOCKS)],
+              ["block_id", "displayed_length_range"])
+        write(os.path.join(self.d, "rows.tsv"), [{"row": "G1", "label": "G1"}, {"row": "G2", "label": "G2"}], ["row", "label"])
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp)
+
+    def write_points(self, pts):
+        write(os.path.join(self.d, "points.tsv"), pts, list(pts[0]))
+
+    def cli(self, out):
+        return gqcli.run(["--points", os.path.join(self.d, "points.tsv"), "--block-lengths", os.path.join(self.d, "lengths.tsv"),
+                          "--rows", os.path.join(self.d, "rows.tsv"), "--out-dir", os.path.join(self.tmp, out), "--stem", "gq"])
+
+    def table(self, out, name):
+        return pd.read_csv(os.path.join(self.tmp, out, name), sep="\t", keep_default_na=False)
+
+    def test_color_value_and_ticks(self):
+        v = P.gq_color_value([0.0, 9.0, 99.0, float("nan"), float("inf")])
+        self.assertEqual(list(v[:3]), [0.0, 1.0, 2.0])
+        self.assertTrue(math.isnan(v[3]) and math.isinf(v[4]))
+        norm, cmap, ticks = P.gq_color_scale([0.0, 9.0, 1500.0, float("nan"), float("inf")])
+        self.assertAlmostEqual(norm.vmax, math.log10(1501.0))   # the largest finite GQ, never the infinite one
+        self.assertEqual(ticks, [0.0, 1.0, 10.0, 100.0, 1000.0])
+
+    def test_every_point_drawn_with_missing_and_infinite(self):
+        """No point is dropped for its GQ; missing is grey, +inf the top colour, both counted and stated."""
+        self.cli("o")
+        d = self.table("o", "plotted_points_gq.tsv")
+        self.assertEqual(len(d), len(gq_points()))
+        self.assertEqual(sorted(d.gq_class.value_counts().items()), [("+inf", 1), ("finite", len(d) - 2), ("missing", 1)])
+        self.assertTrue((d[d.gq_class == "missing"].color_hex == P.GQ_MISSING_COLOR).all())
+        top = P.matplotlib.colors.to_hex(P.matplotlib.colormaps[P.GQ_CMAP](1.0))
+        self.assertTrue((d[d.gq_class == "+inf"].color_hex == top).all())
+        c = self.table("o", "gq_counts.tsv")
+        self.assertEqual((int(c.missing.sum()), int(c.infinite.sum()), int(c.points.sum())), (1, 1, len(d)))
+        with open(os.path.join(self.tmp, "o", "captions.md")) as f:
+            cap = f.read()
+        self.assertIn("1 missing and 1 infinite", cap)
+        self.assertIn("not a calibrated probability", cap)
+        self.assertNotIn("low GQ", cap); self.assertNotIn("high GQ", cap.replace("a high GQ cannot", ""))
+
+    def test_colors_reproduce_source_values(self):
+        self.cli("o")
+        d = self.table("o", "plotted_points_gq.tsv")
+        f = d[d.gq_class == "finite"]
+        norm, cmap, _ = P.gq_color_scale(gqcli.gq_number(pd.Series([p["conditional_GQ"] for p in gq_points()])))
+        for r in f.itertuples():
+            g = float(r.conditional_GQ_text)
+            self.assertEqual(float(r.conditional_GQ), g)
+            self.assertAlmostEqual(float(r.color_value_log10_1p_gq), math.log10(1 + g), places=12)
+            self.assertEqual(r.color_hex, P.matplotlib.colors.to_hex(cmap(norm(math.log10(1 + g)))))
+
+    def test_axes_and_x_groups_match_the_raincloud(self):
+        """Each panel's y-limits equal the raincloud's raw-excess panel for the same row; each point stays in its
+        (block, coverage) slot."""
+        self.cli("o")
+        ax = self.table("o", "panel_axes.tsv").set_index("row")
+        src = pd.DataFrame(rain_points())
+        src = src[src.truth_defined == "true"].astype({"excess": float, "normalized_excess": float})
+        for row in ("G1", "G2"):
+            s = src[src.row == row]
+            covs = sorted(s.coverage.unique())
+            fig, _ = P.fig_block_raincloud(s, BLOCKS, covs, [("excess", "e", "symlog_bp")],
+                                           {(b, c): (1, 0, 0) for b in BLOCKS for c in covs}, "t", P.block_labels(BLOCKS))
+            lo, hi = fig.axes[0].get_ylim()
+            P.plt.close(fig)
+            self.assertEqual((float(ax.loc[row, "ymin"]), float(ax.loc[row, "ymax"]), ax.loc[row, "yscale"]), (lo, hi, "symlog"))
+        d = self.table("o", "plotted_points_gq.tsv")
+        covs = {"G1": [2, 10], "G2": [2]}
+        for r in d.itertuples():
+            n = len(covs[r.row]); w = P.BLOCK_DODGE / n
+            x0 = BLOCKS.index(r.block_id) + (covs[r.row].index(r.coverage) - (n - 1) / 2) * w
+            self.assertLessEqual(abs(r.x - x0), w * P.GQ_POINT_JITTER / 2)
+
+    def test_refusals(self):
+        for mutate in (lambda p: p.append(dict(p[0])),                         # duplicate (run, block)
+                       lambda p: p[0].update(conditional_GQ="high"),           # not a number
+                       lambda p: p[0].update(conditional_GQ="-3"),             # negative
+                       lambda p: p[0].update(excess="NA"),                     # an unevaluated observation
+                       lambda p: p[0].update(row="G9")):                       # a row not listed
+            pts = gq_points()
+            mutate(pts)
+            self.write_points(pts)
+            with self.assertRaises(Refusal):
+                self.cli("x")
+            shutil.rmtree(os.path.join(self.tmp, "x"), ignore_errors=True)
+
+    def test_redraw_byte_identical(self):
+        self.cli("a"); self.cli("b")
+        for sub in ("figures", ""):
+            for f in sorted(x for x in os.listdir(os.path.join(self.tmp, "a", sub)) if os.path.isfile(os.path.join(self.tmp, "a", sub, x))):
+                self.assertEqual(sha(os.path.join(self.tmp, "a", sub, f)), sha(os.path.join(self.tmp, "b", sub, f)), f)
 
 
 if __name__ == "__main__":

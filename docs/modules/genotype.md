@@ -108,7 +108,7 @@ What a run writes depends on its outcome:
   - a phased genotype also needs PHASE PASS.
 - **Component fields:** `filter`, `genotype_support`, `quality_filter`, the library-sensitivity fields and `dosage_stage_filter` remain in the tables. `quality_filter` also requires read support, which GENOTYPE_FILTER does not.
 
-`scripts/plot_genotype_results.py` summarises many runs as tables, figures and a short report. It is truth-free unless truth tables are given; see its `--help`. `scripts/plot_genotype_block_error.py` draws ordered-block raincloud figures of excess and normalised excess from a block-evaluation table; see its `--help`.
+`scripts/plot_genotype_results.py` summarises many runs as tables, figures and a short report. It is truth-free unless truth tables are given; see its `--help`. `scripts/plot_genotype_block_error.py` draws ordered-block raincloud figures of excess and normalised excess from a block-evaluation table; see its `--help`. `scripts/plot_genotype_block_gq.py` draws the same blocks as points coloured by conditional GQ; see its `--help`.
 
 ## Limitations
 

@@ -543,6 +543,106 @@ def fig_block_raincloud(points, block_order, coverages, panels, counts, title, t
     return fig, {"points": drawn_points, "violins": drawn_violins}
 
 
+# ------------------------------------------------------------------------------------------------ block GQ points
+COVERAGE_MARKERS = ["o", "s", "^", "D", "v", "P", "X", "h"]
+GQ_CMAP = "viridis"
+GQ_MISSING_COLOR = "#9a9a9a"
+GQ_POINT_JITTER = 0.7   # share of one coverage slot the jittered points span, centred on the slot
+
+
+def gq_color_value(gq):
+    """The colour coordinate log10(1 + GQ): NaN for a missing GQ, +inf for an infinite one."""
+    g = np.asarray(gq, dtype=float)
+    with np.errstate(invalid="ignore"):
+        return np.where(np.isnan(g), np.nan, np.where(np.isposinf(g), np.inf, np.log10(1.0 + g)))
+
+
+def gq_color_scale(gq):
+    """(norm, colormap, colorbar ticks as actual GQ values). The scale spans log10(1 + GQ) from 0 to the largest finite
+    GQ; ticks are 0 and the powers of ten 1, 10, 100, ... up to the largest finite GQ."""
+    v = gq_color_value(gq)
+    finite = v[np.isfinite(v)]
+    top = float(finite.max()) if len(finite) else 1.0
+    top = max(top, np.log10(2.0))
+    norm = matplotlib.colors.Normalize(vmin=0.0, vmax=top)
+    ticks = [0.0] + [10.0 ** k for k in range(0, 12) if np.log10(1 + 10.0 ** k) <= top + 1e-12]
+    return norm, matplotlib.colormaps[GQ_CMAP], ticks
+
+
+def gq_point_colors(gq, norm, cmap):
+    """Hex RGBA per point: missing -> the neutral grey, +inf -> the top of the scale, finite -> cmap(norm(log10(1+GQ)))."""
+    v = gq_color_value(gq)
+    out = []
+    for x in v:
+        if np.isnan(x):
+            out.append(GQ_MISSING_COLOR)
+        else:
+            out.append(matplotlib.colors.to_hex(cmap(norm(norm.vmax if np.isinf(x) else x)), keep_alpha=False))
+    return out
+
+
+def fig_block_gq(points, block_order, rows, coverages, ticks, title, metric="excess", ylabel="excess (bp)",
+                 xlabel="block (genomic order)", cbar_label="Conditional GQ"):
+    """Vertically stacked panels (rows: [(row value, panel label)]), ordered blocks on x, `metric` on the symlog bp axis
+    with each panel's limits set exactly as in fig_block_raincloud's top panel for the same row, coverage dodged and
+    encoded by marker shape, every point coloured continuously by conditional GQ through log10(1 + GQ) with the colour
+    bar labelled in GQ. Missing GQ: grey; +inf: top colour with a black outline. No point is dropped for its GQ.
+    Returns (figure, drawn): one (row, run_id, block_id, coverage, x, y, gq, colour value, hex colour, gq_class) per
+    point; figure.panel_axes lists (row, ymin, ymax, yscale) per panel."""
+    covs = list(coverages)
+    marker = {c: COVERAGE_MARKERS[i % len(COVERAGE_MARKERS)] for i, c in enumerate(covs)}
+    nb = len(block_order)
+    w = BLOCK_DODGE / max(1, len(covs))
+    norm, cmap, cticks = gq_color_scale(points.conditional_GQ)
+    unit = block_unit_in(ticks, 7, 0.9)
+    fig, axes = plt.subplots(len(rows), 1, figsize=(max(unit * nb, 6) + 2.6, 2.4 * len(rows) + 0.9), squeeze=False, sharex=True)
+    drawn = []
+    any_missing = any_inf = False
+    for ax, (rval, rlabel) in zip(axes[:, 0], rows):
+        d = points[points.row == rval]
+        for bi, b in enumerate(block_order):
+            for ci, c in enumerate(covs):
+                g = d[(d.block_id == b) & (d.coverage == c)].sort_values("run_id", kind="stable")
+                if not len(g):
+                    continue
+                x0 = bi + (ci - (len(covs) - 1) / 2) * w
+                xs = [x0 + stable_jitter(f"{r}|{b}", w * GQ_POINT_JITTER) for r in g.run_id]
+                gq = g.conditional_GQ.to_numpy(dtype=float)
+                cols = gq_point_colors(gq, norm, cmap)
+                cls = ["missing" if np.isnan(x) else "+inf" if np.isposinf(x) else "finite" for x in gq]
+                edge = ["black" if k == "+inf" else "none" for k in cls]
+                ax.scatter(xs, g[metric], s=9, c=cols, marker=marker[c], edgecolors=edge, linewidths=[0.6 if e == "black" else 0 for e in edge],
+                           zorder=3)
+                any_missing |= "missing" in cls
+                any_inf |= "+inf" in cls
+                vals = gq_color_value(gq)
+                drawn += [(rval, r, b, c, x, y, q, v, col, k) for r, x, y, q, v, col, k in
+                          zip(g.run_id, xs, g[metric], gq, vals, cols, cls)]
+        top = d[metric].max() if d[metric].notna().any() else 0.0
+        _symlog(ax, "excess", top)
+        ax.set_xlim(-0.5, nb - 0.5)
+        ax.set_ylabel(ylabel, fontsize=7)
+        ax.set_title(rlabel, loc="left", fontsize=8)
+        for bi in range(nb - 1):
+            ax.axvline(bi + 0.5, color="#e5e5e5", lw=0.5, zorder=0)
+    axes[-1, 0].set_xticks(range(nb), ticks, rotation=0)
+    axes[-1, 0].set_xlabel(xlabel)
+    handles = [Line2D([], [], marker=marker[c], ls="", color="#555555", label=f"{c}x" if c != "all" else "all") for c in covs]
+    if any_missing:
+        handles.append(Line2D([], [], marker="o", ls="", color=GQ_MISSING_COLOR, label="GQ missing"))
+    if any_inf:
+        handles.append(Line2D([], [], marker="o", ls="", color=cmap(1.0), markeredgecolor="black", label="GQ = +∞"))
+    axes[0, 0].legend(handles=handles, frameon=False, loc="upper left", bbox_to_anchor=(1.0, 1.0), title="coverage")
+    fig.suptitle(title, fontsize=9)
+    fig.tight_layout()
+    sm = matplotlib.cm.ScalarMappable(norm=norm, cmap=cmap)
+    cb = fig.colorbar(sm, ax=list(axes[:, 0]), fraction=0.015, pad=0.09, aspect=40)
+    cb.set_ticks([float(np.log10(1 + t)) for t in cticks], labels=[f"{t:g}" for t in cticks])
+    cb.set_label(cbar_label, fontsize=7)
+    fig.panel_axes = [(rval, *ax.get_ylim(), ax.get_yscale()) for ax, (rval, _) in zip(axes[:, 0], rows)]
+    return fig, drawn
+
+
 # ------------------------------------------------------------------------------------------------ block accuracy
 def fig_accuracy_heatmap(t, info, sets, lengths=None):
     rows = [p for p, _ in info.panels]
