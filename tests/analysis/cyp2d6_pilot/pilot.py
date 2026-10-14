@@ -7,6 +7,12 @@
   pilot.py reads <pkg> <build>        30x once per truth sample, 5x nested by subsample; checks -> data/reads.tsv
   pilot.py run <pkg> <build> <job>... calls (<= 2 at a time, 4 threads each) then evaluates the raw (.original) and
                                       reported layers; per-cell wall time and peak RSS -> data/runs/<job>.run.tsv
+                                      (the original design, profile resource_profile.tsv; used by the STOP_3 sentinels)
+  pilot.py call <pkg> <build> <profile> <tag> <job>...
+                                      AMENDMENT_3: calls only, with the named profile, into data/runs_<tag>/<job>;
+                                      no evaluation (truth is not read until the call outputs are sealed)
+  pilot.py evaluate <pkg> <build> <tag> <job>...
+                                      raw (.original) and reported evaluations of data/runs_<tag> -> data/eval_<tag>
 
 No truth file is on a caller command line. The LZO and LOO arms of one donor share the same read files.
 """
@@ -269,10 +275,19 @@ def kv_space(path):
 
 # ---- calls and evaluation -------------------------------------------------------------------------------
 
-def call_cmd(job, pkg, build):
+def tagged(job, tag):
+    """The job with its outputs under data/runs_<tag>/ (tag None: the original data/runs/)."""
+    if tag is None:
+        return job
+    job = dict(job)
+    job["out_prefix"] = job["out_prefix"].replace("data/runs/", f"data/runs_{tag}/", 1)
+    return job
+
+
+def call_cmd(job, pkg, build, profile=None):
     j = lambda k: os.path.join(pkg, job[k])   # noqa: E731
     cmd = [os.path.join(build, "panvar"), "genotype", "--preset", "short-read",
-           "--profile", os.path.join(pkg, "resource_profile.tsv"), "--threads", str(THREADS),
+           "--profile", profile or os.path.join(pkg, "resource_profile.tsv"), "--threads", str(THREADS),
            "--graph", j("model_gfa"), "--reference-path", REF, "--panel-curation", os.path.join(REPO, job["curation"]),
            "--reads1", j("reads1"), "--reads2", j("reads2"), "--library", j("library"),
            "--dosage-mode", "repair", "--out", j("out_prefix"), "--quiet"]
@@ -281,9 +296,10 @@ def call_cmd(job, pkg, build):
     return cmd
 
 
-def evaluate(job, pkg, build, layer):
+def evaluate(job, pkg, build, layer, eval_dir="eval"):
     prefix = os.path.join(pkg, job["out_prefix"]) + (".original" if layer == "raw" else "")
-    out = os.path.join(pkg, "data", "eval", job["job"] + (".raw" if layer == "raw" else ".reported"))
+    os.makedirs(os.path.join(pkg, "data", eval_dir), exist_ok=True)
+    out = os.path.join(pkg, "data", eval_dir, job["job"] + (".raw" if layer == "raw" else ".reported"))
     cmd = [os.path.join(build, "genotype_probe"), "evaluate", "--scheme", job["scheme"], "--donor", job["eval_donor"],
            "--reference", REF, "--run-prefix", prefix, "--model-gfa", os.path.join(pkg, job["model_gfa"]),
            "--truth-gfa", os.path.join(pkg, job["truth_gfa"]),
@@ -295,11 +311,12 @@ def evaluate(job, pkg, build, layer):
     return code
 
 
-def one(job, pkg, build):
+def one(job, pkg, build, profile=None, evaluate_after=True):
     prefix = os.path.join(pkg, job["out_prefix"])
+    if os.path.exists(prefix + ".run.tsv"):
+        fail(f"{job['job']}: {prefix}.run.tsv exists; a finished cell is never rerun into the same place")
     os.makedirs(os.path.dirname(prefix), exist_ok=True)
-    os.makedirs(os.path.join(pkg, "data", "eval"), exist_ok=True)
-    cmd = ["/usr/bin/time", "-l"] + call_cmd(job, pkg, build)
+    cmd = ["/usr/bin/time", "-l"] + call_cmd(job, pkg, build, profile)
     t0 = time.monotonic()
     with open(prefix + ".call.log", "w") as log:
         log.write("$ " + " ".join(cmd) + "\n")
@@ -315,7 +332,7 @@ def one(job, pkg, build):
     m = re.search(r"(\d+)\s+peak memory footprint", text)
     footprint = int(m.group(1)) if m else -1
     ev = {}
-    if code in (0, 1):
+    if code in (0, 1) and evaluate_after:
         for layer in ("raw", "reported"):
             ev[layer] = evaluate(job, pkg, build, layer)
     rec = {"job": job["job"], "exit": code, "wall_seconds": f"{wall:.1f}", "peak_rss_bytes": rss,
@@ -327,16 +344,43 @@ def one(job, pkg, build):
     return rec
 
 
-def run_jobs(pkg, build, names):
+def run_jobs(pkg, build, names, profile=None, tag=None, evaluate_after=True):
     table = load_jobs(pkg)
     missing = [n for n in names if n not in table]
     if missing:
         fail(f"unknown jobs {missing}")
     with concurrent.futures.ThreadPoolExecutor(max_workers=PARALLEL) as pool:
-        recs = list(pool.map(lambda n: one(table[n], pkg, build), names))
-    bad = [r for r in recs if r["exit"] not in (0, 1) or r["eval_raw_exit"] != 0 or r["eval_reported_exit"] != 0]
-    print(f"{len(recs)} cells, {len(bad)} not completed and evaluated")
+        recs = list(pool.map(lambda n: one(tagged(table[n], tag), pkg, build, profile, evaluate_after), names))
+    if evaluate_after:
+        bad = [r for r in recs if r["exit"] not in (0, 1) or r["eval_raw_exit"] != 0 or r["eval_reported_exit"] != 0]
+        print(f"{len(recs)} cells, {len(bad)} not completed and evaluated")
+    else:
+        bad = [r for r in recs if r["exit"] not in (0, 1)]
+        print(f"{len(recs)} cells, {len(bad)} not completed (exit other than 0 or 1)")
     return 1 if bad else 0
+
+
+def evaluate_jobs(pkg, build, tag, names):
+    table = load_jobs(pkg)
+    bad = []
+    for n in names:
+        job = tagged(table[n], tag)
+        rec = tsv_row(os.path.join(pkg, job["out_prefix"] + ".run.tsv"))
+        if rec["exit"] not in ("0", "1"):
+            print(f"{n}: exit {rec['exit']}, not evaluated")
+            continue
+        for layer in ("raw", "reported"):
+            code = evaluate(job, pkg, build, layer, f"eval_{tag}")
+            if code != 0:
+                bad.append((n, layer))
+        print(f"{n}: evaluated", flush=True)
+    print(f"{len(names)} cells, {len(bad)} evaluation failures {bad}")
+    return 1 if bad else 0
+
+
+def tsv_row(path):
+    lines = open(path).read().splitlines()
+    return dict(zip(lines[0].split("\t"), lines[1].split("\t")))
 
 
 if __name__ == "__main__":
@@ -349,5 +393,10 @@ if __name__ == "__main__":
         reads(pkg, os.path.abspath(sys.argv[3]))
     elif cmd == "run":
         sys.exit(run_jobs(pkg, os.path.abspath(sys.argv[3]), sys.argv[4:]))
+    elif cmd == "call":
+        sys.exit(run_jobs(pkg, os.path.abspath(sys.argv[3]), sys.argv[6:], profile=os.path.abspath(sys.argv[4]),
+                          tag=sys.argv[5], evaluate_after=False))
+    elif cmd == "evaluate":
+        sys.exit(evaluate_jobs(pkg, os.path.abspath(sys.argv[3]), sys.argv[4], sys.argv[5:]))
     else:
         fail(f"unknown command {cmd}")
