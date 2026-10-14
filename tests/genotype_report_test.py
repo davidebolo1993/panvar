@@ -10,7 +10,8 @@ byte-identical redraws, no run count in titles, the locus companion table); and 
 scripts/plot_genotype_block_gq.py (log10(1 + GQ) colours, missing and infinite GQ, no filtering, axes equal to the
 raincloud's); and the 16:9 --slide layouts of both (exact canvas, no count labels, nothing clipped or
 overlapping, the same tables as the audit layout); and the mosaic design slides of
-scripts/plot_genotype_mosaic_design.py (A/B source toggling, refusals, exact clean reproducible canvases). Usage: genotype_report_test.py [scripts dir]."""
+scripts/plot_genotype_mosaic_design.py (A/B source toggling, refusals, exact clean reproducible canvases); and the outcome-category point slide of
+scripts/plot_genotype_block_categories.py (rule mapping and refusals, positions equal to the GQ figure). Usage: genotype_report_test.py [scripts dir]."""
 import hashlib
 import math
 import os
@@ -880,6 +881,100 @@ class MosaicDesign(unittest.TestCase):
         self.assertIn("4 plans in 2 classes", cap)
         self.assertIn("2 have no switch (controls)", cap)
         self.assertIn("two_2: A = dE, B = dF", cap)
+
+
+# ---------------------------------------------------------------------------------------------- outcome-category points
+import plot_genotype_block_categories as catcli  # noqa: E402
+
+CAT_RULES = [{"category": "quiet", "label": "No repair needed", "dosage_status": "NOT_SENSITIVE,CONSISTENT", "repair_applied": "any",
+              "color": "#c4c4c4", "size": "7", "edge": "none"},
+             {"category": "content", "label": "Content corrected", "dosage_status": "CONTENT_REPAIRED", "repair_applied": "any",
+              "color": "#7b3fa0", "size": "36", "edge": "#1a1a1a"},
+             {"category": "applied", "label": "Complete repair applied", "dosage_status": "REPAIRED", "repair_applied": "true",
+              "color": "#2ca02c", "size": "36", "edge": "#1a1a1a"}]
+
+
+def cat_points():
+    pts = [dict(p) for p in gq_points(special=False)]
+    for i, p in enumerate(pts):
+        p["dosage_status"] = "CONTENT_REPAIRED" if i % 7 == 3 else "CONSISTENT" if i % 2 else "NOT_SENSITIVE"
+        p["dosage_repair_applied"] = "NA"
+        p.pop("conditional_GQ")
+    return pts
+
+
+class BlockCategories(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="genotype_categories_test_")
+        self.d = os.path.join(self.tmp, "in")
+        self.write("points.tsv", cat_points())
+        self.write("rules.tsv", CAT_RULES)
+        write(os.path.join(self.d, "rows.tsv"), [{"row": "G1", "label": "G1"}, {"row": "G2", "label": "G2"}], ["row", "label"])
+        write(os.path.join(self.d, "lengths.tsv"), [{"block_id": b, "displayed_length_range": f"{i}–{i + 1} kb"} for i, b in enumerate(BLOCKS)],
+              ["block_id", "displayed_length_range"])
+        self.write("unplotted.tsv", [{"run_id": "q2", "block_id": "sv:1", "row": "G1", "reason": "truth undefined"}])
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp)
+
+    def write(self, name, rows):
+        write(os.path.join(self.d, name), rows, list(rows[0]))
+
+    def cli(self, out, extra=()):
+        return catcli.run(["--points", os.path.join(self.d, "points.tsv"), "--rules", os.path.join(self.d, "rules.tsv"),
+                           "--rows", os.path.join(self.d, "rows.tsv"), "--block-lengths", os.path.join(self.d, "lengths.tsv"),
+                           "--out-dir", os.path.join(self.tmp, out), "--stem", "cat"] + list(extra))
+
+    def table(self, out, name):
+        return pd.read_csv(os.path.join(self.tmp, out, name), sep="\t", keep_default_na=False, float_precision="round_trip")
+
+    def test_every_point_categorized_and_positioned_as_gq(self):
+        """Every observation is drawn once, in its rule's category, at the conditional-GQ figure's x and y."""
+        self.cli("o", ["--unplotted", os.path.join(self.d, "unplotted.tsv"), "--unplotted-note", "{n} applied repair(s) not plotted."])
+        d = self.table("o", "plotted_points.tsv")
+        src = pd.DataFrame(cat_points())
+        self.assertEqual(len(d), len(src))
+        want = {(r["run_id"], r["block_id"]): ("content" if r["dosage_status"] == "CONTENT_REPAIRED" else "quiet") for r in cat_points()}
+        self.assertTrue(all(want[(r.run_id, r.block_id)] == r.category for r in d.itertuples()))
+        gq = pd.DataFrame(gq_points(special=False)).astype({"coverage": int, "block_index": int, "excess": float})
+        gq["conditional_GQ"] = gq.conditional_GQ.astype(float)
+        fig, drawn = P.fig_block_gq(gq, BLOCKS, [("G1", "G1"), ("G2", "G2")], [2, 10], P.block_labels(BLOCKS), "t", slide=True)
+        P.plt.close(fig)
+        gx = {(r, b): (x, y) for _, r, b, _, x, y, *_ in drawn}
+        self.assertTrue(all(gx[(r.run_id, r.block_id)] == (r.x, r.excess) for r in d.itertuples()))
+        self.assertEqual(self.table("o", "panel_axes.tsv").values.tolist(), [[a, b, c, e] for a, b, c, e in fig.panel_axes])
+        self.assertEqual(self.table("o", "unplotted.tsv").run_id.tolist(), ["q2"])
+        with open(os.path.join(self.tmp, "o", "captions.md")) as f:
+            self.assertIn("1 applied repair(s) not plotted.", f.read())
+        lay = self.table("o", "layout_check.tsv")
+        self.assertEqual((int(lay.clipped_texts[0]), int(lay.overlapping_text_pairs[0])), (0, 0), lay.detail.tolist())
+
+    def test_refusals(self):
+        pts = cat_points(); pts[0]["dosage_status"] = "SUSPECT"            # no rule covers it
+        self.write("points.tsv", pts)
+        with self.assertRaises(Refusal):
+            self.cli("x1")
+        pts = cat_points(); pts[0]["dosage_status"] = "REPAIRED"           # REPAIRED but not applied: the rule needs true
+        self.write("points.tsv", pts)
+        with self.assertRaises(Refusal):
+            self.cli("x2")
+        self.write("points.tsv", cat_points())
+        self.write("rules.tsv", CAT_RULES + [dict(CAT_RULES[0], category="dup")])   # a status in two rules
+        with self.assertRaises(Refusal):
+            self.cli("x3")
+        self.write("rules.tsv", CAT_RULES)
+        self.write("unplotted.tsv", [{"run_id": "q1", "block_id": "sv:1", "row": "G1", "reason": "x"}])   # also plotted
+        with self.assertRaises(Refusal):
+            self.cli("x4", ["--unplotted", os.path.join(self.d, "unplotted.tsv")])
+
+    def test_redraw_byte_identical_16_9(self):
+        self.cli("a"); self.cli("b")
+        import struct
+        for f in sorted(os.listdir(os.path.join(self.tmp, "a", "figures"))) + ["plotted_points.tsv", "category_counts.tsv"]:
+            sub = "figures" if f.startswith("cat.") else ""
+            self.assertEqual(sha(os.path.join(self.tmp, "a", sub, f)), sha(os.path.join(self.tmp, "b", sub, f)), f)
+        with open(os.path.join(self.tmp, "a", "figures", "cat.png"), "rb") as h:
+            self.assertEqual(struct.unpack(">II", h.read(24)[16:24]), (3200, 1800))
 
 
 if __name__ == "__main__":

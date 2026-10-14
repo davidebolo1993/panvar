@@ -585,6 +585,63 @@ def _slide_frame(fig, title, handles, legend_title, footer):
         fig.text(0.005, 0.006, footer, ha="left", va="bottom", fontsize=SLIDE["footer"], color="#333333", gid="slide_footer")
 
 
+def fig_block_categories(points, block_order, rows, coverages, ticks, title, categories, metric="excess",
+                         ylabel="Excess over the availability floor (bp)", xlabel="block (genomic order)", footer=None):
+    """Slide figure (SLIDE canvas): vertically stacked panels (rows: [(row value, panel label)]), ordered blocks on x,
+    `metric` on the symlog bp axis with the same per-panel limits and the same coverage dodge, marker shapes and
+    deterministic jitter as fig_block_gq, every point coloured by its presentation category.
+    categories: [(key, legend label, colour, marker size, edge colour or None)] in drawing order (first drawn first, so
+    the last are on top); points carry a `category` column with those keys. Two legends: categories (with counts) and
+    coverage shapes. Returns (figure, drawn) with one (row, run_id, block_id, coverage, x, y, category) per point;
+    figure.panel_axes lists (row, ymin, ymax, yscale)."""
+    covs = list(coverages)
+    marker = {c: COVERAGE_MARKERS[i % len(COVERAGE_MARKERS)] for i, c in enumerate(covs)}
+    nb = len(block_order)
+    w = BLOCK_DODGE / max(1, len(covs))
+    fig, axes = plt.subplots(len(rows), 1, figsize=SLIDE["figsize"], squeeze=False, sharex=True, layout="constrained")
+    drawn = []
+    xpos = {}
+    for r in points.itertuples():
+        x0 = block_order.index(r.block_id) + (covs.index(r.coverage) - (len(covs) - 1) / 2) * w
+        xpos[(r.run_id, r.block_id)] = x0 + stable_jitter(f"{r.run_id}|{r.block_id}", w * GQ_POINT_JITTER)
+    for ax, (rval, rlabel) in zip(axes[:, 0], rows):
+        d = points[points.row == rval]
+        for z, (key, _, col, size, edge) in enumerate(categories):
+            for c in covs:
+                g = d[(d.category == key) & (d.coverage == c)].sort_values(["block_index", "run_id"], kind="stable")
+                if not len(g):
+                    continue
+                xs = [xpos[(r, b)] for r, b in zip(g.run_id, g.block_id)]
+                ax.scatter(xs, g[metric], s=size, color=col, marker=marker[c], edgecolors=edge or "none",
+                           linewidths=0.8 if edge else 0, zorder=3 + z)
+                drawn += [(rval, r, b, c, x, y, key) for r, b, x, y in zip(g.run_id, g.block_id, xs, g[metric])]
+        top = d[metric].max() if d[metric].notna().any() else 0.0
+        _symlog(ax, "excess", top)
+        ax.set_xlim(-0.5, nb - 0.5)
+        ax.set_title(rlabel, loc="left", fontsize=SLIDE["label"])
+        ax.tick_params(axis="y", labelsize=SLIDE["tick"])
+        _slide_plain_ticks(ax)
+        for bi in range(nb - 1):
+            ax.axvline(bi + 0.5, color="#e5e5e5", lw=0.5, zorder=0)
+    axes[-1, 0].set_xticks(range(nb), ticks, rotation=0, fontsize=SLIDE["block"])
+    axes[-1, 0].set_xlabel(xlabel, fontsize=SLIDE["label"])
+    fig.supylabel(ylabel, fontsize=SLIDE["label"])
+    counts = points.category.value_counts()
+    cat_handles = [Line2D([], [], marker="o", ls="", color=col, markeredgecolor=edge or col, markersize=7,
+                          label=f"{lab} ({int(counts.get(key, 0)):,})") for key, lab, col, _, edge in categories]
+    # one bottom band, reserved from the panels, holds the category legend (two rows) above the footer line
+    band = 0.085 + (0.035 if footer else 0.0)
+    fig.get_layout_engine().set(rect=(0, band, 1, 1 - band))
+    fig.legend(handles=cat_handles, loc="lower center", bbox_to_anchor=(0.5, 0.035 if footer else 0.004), ncol=3, frameon=False,
+               fontsize=SLIDE["legend"], handletextpad=0.3, columnspacing=1.4, borderaxespad=0.0)
+    cov_handles = [Line2D([], [], marker=marker[c], ls="", color="#555555", label=f"{c}x") for c in covs]
+    _slide_frame(fig, title, cov_handles, "coverage", None)
+    if footer:
+        fig.text(0.005, 0.006, footer, ha="left", va="bottom", fontsize=SLIDE["footer"], color="#333333", gid="slide_footer")
+    fig.panel_axes = [(rval, *ax.get_ylim(), ax.get_yscale()) for ax, (rval, _) in zip(axes[:, 0], rows)]
+    return fig, drawn
+
+
 def text_layout_problems(fig):
     """Every visible text of a drawn figure (titles, axis labels, tick labels, legend entries, colour-bar text, footer):
     the ones outside the canvas, and the pairs of distinct texts whose rendered boxes overlap. Returns (clipped,
