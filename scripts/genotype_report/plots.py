@@ -635,8 +635,9 @@ def fig_block_categories(points, block_order, rows, coverages, ticks, title, cat
     counts = points.category.value_counts()
     cat_handles = [Line2D([], [], marker="o", ls="", color=col, markeredgecolor=edge or col, markersize=7,
                           label=f"{lab} ({int(counts.get(key, 0)):,})") for key, lab, col, _, edge in categories]
-    # one bottom band, reserved from the panels, holds the category legend (two rows) above the footer line
-    band = 0.085 + (0.035 if footer else 0.0)
+    # one bottom band, reserved from the panels, holds the category legend (3 entries per row) above the footer line
+    legend_rows = -(-len(cat_handles) // 3)
+    band = 0.045 + 0.04 * (legend_rows - 1) + (0.035 if footer else 0.0)
     fig.get_layout_engine().set(rect=(0, band, 1, 1 - band))
     fig.legend(handles=cat_handles, loc="lower center", bbox_to_anchor=(0.5, 0.035 if footer else 0.004), ncol=3, frameon=False,
                fontsize=SLIDE["legend"], handletextpad=0.3, columnspacing=1.4, borderaxespad=0.0)
