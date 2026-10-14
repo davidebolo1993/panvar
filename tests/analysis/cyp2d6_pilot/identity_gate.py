@@ -12,7 +12,11 @@ compared separately) must exist in both runs and be byte-identical after removin
 Everything else (genotype and equivalence set, scores and ranking, block and locus tables, filters, repair trajectory
 and its scientific counters, FASTA) must be byte-identical. A file whose normalised content differs fails the gate.
 
-Usage: identity_gate.py <out tsv> <declared keys, comma list> <run dir A> <profile A> <run dir B> <profile B> <job>...
+Usage: identity_gate.py [--caller-exit-a JOB]... <out tsv> <declared keys, comma list> <run dir A> <profile A>
+                        <run dir B> <profile B> <job>...
+--caller-exit-a JOB: run A's runner record for JOB is not trusted (STOP_4: the old runner lost a caller that then
+finished on its own); its exit is read from the caller's final status instead (0 for a strict or genotype-equivalent
+call, 1 for a no-call), and the substitution is printed in the detail.
 """
 import os
 import re
@@ -65,17 +69,26 @@ def files_of(run_dir, job):
     return sorted(f for f in os.listdir(run_dir) if f.startswith(job + ".") and f not in skip)
 
 
-def exit_of(run_dir, job):
+def exit_of(run_dir, job, from_status=False):
+    if from_status:
+        status = {}
+        for line in open(os.path.join(run_dir, job + ".mosaic_status.tsv")).read().splitlines():
+            p = line.split("\t")
+            if len(p) >= 2:
+                status[p[0]] = p[1]
+        if status.get("status") in (None, "RUNNING") or "seconds_total" not in status:
+            raise RuntimeError(f"{run_dir}/{job}: no final caller status to read an exit from")
+        return "0" if status.get("call_class") in ("strict_call", "genotype_equivalent_call") else "1"
     lines = open(os.path.join(run_dir, job + ".run.tsv")).read().splitlines()
     return dict(zip(lines[0].split("\t"), lines[1].split("\t")))["exit"]
 
 
-def compare(job, dir_a, profile_a, dir_b, profile_b, declared):
+def compare(job, dir_a, profile_a, dir_b, profile_b, declared, caller_exit_a=False):
     """Returns (ok, detail)."""
     fa, fb = files_of(dir_a, job), files_of(dir_b, job)
     if fa != fb:
         return False, f"file sets differ: {sorted(set(fa) ^ set(fb))}"
-    ea, eb = exit_of(dir_a, job), exit_of(dir_b, job)
+    ea, eb = exit_of(dir_a, job, caller_exit_a), exit_of(dir_b, job)
     if ea != eb:
         return False, f"exit codes differ: {ea} vs {eb}"
     identical, normalised_equal, differing, problems = 0, 0, [], []
@@ -92,17 +105,21 @@ def compare(job, dir_a, profile_a, dir_b, profile_b, declared):
         else:
             differing.append(f)
     ok = not differing and not problems
-    return ok, (f"exit {ea}; {len(fa)} files: {identical} byte-identical, {normalised_equal} identical after removing "
+    return ok, (f"exit {ea}" + (" (run A exit read from caller status)" if caller_exit_a else "") + f"; {len(fa)} files: {identical} byte-identical, {normalised_equal} identical after removing "
                 f"declared differences" + (f"; DIFFER: {differing}" if differing else "")
                 + (f"; declared-value problems: {problems}" if problems else ""))
 
 
 def main():
-    out, declared, dir_a, profile_a, dir_b, profile_b = sys.argv[1:7]
+    argv, caller_exit = sys.argv[1:], set()
+    while argv and argv[0] == "--caller-exit-a":
+        caller_exit.add(argv[1])
+        argv = argv[2:]
+    out, declared, dir_a, profile_a, dir_b, profile_b = argv[:6]
     declared = {k for k in declared.split(",") if k}
     rows = []
-    for job in sys.argv[7:]:
-        ok, detail = compare(job, dir_a, profile_a, dir_b, profile_b, declared)
+    for job in argv[6:]:
+        ok, detail = compare(job, dir_a, profile_a, dir_b, profile_b, declared, job in caller_exit)
         rows.append((job, "PASS" if ok else "FAIL", detail))
         print("\t".join(rows[-1]))
     with open(out, "w") as f:
