@@ -990,6 +990,23 @@ class BlockCategories(unittest.TestCase):
         with self.assertRaises(Refusal):
             self.cli("x", ["--panel-axes", os.path.join(self.d, "tight_axes.tsv")])
 
+    def test_category_column_classifies_another_field(self):
+        """--category-column classifies any column; the dosage fields are then not needed."""
+        pts = cat_points()
+        for i, p in enumerate(pts):
+            p["representation_filter"] = "LOWQUAL_REPRESENTATION_CONFLICT" if i % 5 == 0 else "PASS"
+            p.pop("dosage_status"); p.pop("dosage_repair_applied")
+        self.write("points.tsv", pts)
+        self.write("rules.tsv", [{"category": "pass", "label": "No conflict", "values": "PASS", "repair_applied": "any", "color": "#cfcfcf",
+                                  "size": "7", "edge": "none"},
+                                 {"category": "conflict", "label": "Conflict", "values": "LOWQUAL_REPRESENTATION_CONFLICT", "repair_applied": "any",
+                                  "color": "#d62728", "size": "20", "edge": "none"}])
+        self.cli("rep", ["--category-column", "representation_filter"])
+        d = self.table("rep", "plotted_points.tsv")
+        want = {(p["run_id"], p["block_id"]): "conflict" if p["representation_filter"] != "PASS" else "pass" for p in pts}
+        self.assertTrue(all(want[(r.run_id, r.block_id)] == r.category for r in d.itertuples()))
+        self.assertEqual(len(d), len(pts))
+
     def test_redraw_byte_identical_16_9(self):
         self.cli("a"); self.cli("b")
         import struct

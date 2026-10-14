@@ -5,10 +5,13 @@ coverage dodge, marker shapes and deterministic jitter as the conditional-GQ fig
 coloured by the presentation category its dosage status (and repair flag) maps to.
 
 Inputs (TSV):
-  --points      run_id, row, coverage, block_index, block_id, excess, dosage_status, dosage_repair_applied: one row
-                per plotted observation (excess present on every row); other columns are carried into the outputs
-  --rules       category, label, dosage_status (comma list), repair_applied (any | true | false), color, size,
-                edge (a colour or none): in drawing order; every point must match exactly one rule
+  --points      run_id, row, coverage, block_index, block_id, excess and the --category-column (default dosage_status);
+                dosage_repair_applied when a rule conditions on it: one row per plotted observation (excess present on
+                every row); other columns are carried into the outputs
+  --rules       category, label, values (comma list of --category-column values; the column may also be named
+                dosage_status), repair_applied (any | true | false), color, size, edge (a colour or none): in drawing
+                order; every point must match exactly one rule
+  --category-column  the points column the rules classify (default dosage_status)
   --rows        row, label
   --block-lengths block_id, displayed_length_range
   --unplotted   (optional) observations of the same layer that cannot be plotted (no defined error value), with
@@ -35,8 +38,8 @@ import pandas as pd  # noqa: E402
 from genotype_report import plots as P  # noqa: E402
 from genotype_report.common import Refusal, coverage_order, read_tsv, require_columns, to_number, write_tsv  # noqa: E402
 
-REQUIRED = ["run_id", "row", "coverage", "block_index", "block_id", "excess", "dosage_status", "dosage_repair_applied"]
-RULE_COLUMNS = ["category", "label", "dosage_status", "repair_applied", "color", "size", "edge"]
+REQUIRED = ["run_id", "row", "coverage", "block_index", "block_id", "excess"]
+RULE_COLUMNS = ["category", "label", "repair_applied", "color", "size", "edge"]
 
 
 def parse(argv):
@@ -54,25 +57,30 @@ def parse(argv):
     p.add_argument("--coverages")
     p.add_argument("--blocks-from-lengths", action="store_true")
     p.add_argument("--footer", default="")
+    p.add_argument("--category-column", default="dosage_status")
     return p.parse_args(argv)
 
 
-def categorize(pts, rules):
-    """The category of every point: the one rule whose dosage statuses contain its status and whose repair condition
-    holds. A point matching no rule, or several, is refused."""
+def categorize(pts, rules, column="dosage_status"):
+    """The category of every point: the one rule whose values contain the point's `column` value and whose repair
+    condition holds. A point matching no rule, or several, is refused."""
     hits = []
-    applied = pts.dosage_repair_applied.astype(str).str.lower() == "true"
+    vcol = "values" if "values" in rules.columns else "dosage_status"
+    needs_flag = (rules.repair_applied != "any").any()
+    if needs_flag and "dosage_repair_applied" not in pts.columns:
+        raise Refusal("a rule conditions on dosage_repair_applied, which the points lack")
+    applied = (pts.dosage_repair_applied.astype(str).str.lower() == "true") if needs_flag else pd.Series(False, index=pts.index)
     for r in rules.itertuples():
-        statuses = {s.strip() for s in r.dosage_status.split(",")}
+        statuses = {s.strip() for s in getattr(r, vcol).split(",")}
         cond = {"any": pd.Series(True, index=pts.index), "true": applied, "false": ~applied}.get(r.repair_applied)
         if cond is None:
             raise Refusal(f"rule {r.category}: repair_applied must be any, true or false")
-        hits.append(pts.dosage_status.isin(statuses) & cond)
+        hits.append(pts[column].isin(statuses) & cond)
     m = pd.concat(hits, axis=1)
     m.columns = list(rules.category)
     n = m.sum(axis=1)
     if (n == 0).any():
-        raise Refusal(f"no rule covers dosage status(es) {', '.join(sorted(set(pts.dosage_status[n == 0])))}")
+        raise Refusal(f"no rule covers {column} value(s) {', '.join(sorted(set(pts[column][n == 0])))}")
     if (n > 1).any():
         raise Refusal("a point matches more than one category rule")
     return m.idxmax(axis=1)
@@ -83,7 +91,7 @@ def run(argv):
     if os.path.exists(a.out_dir) and os.listdir(a.out_dir):
         raise Refusal(f"--out-dir {a.out_dir} exists and is not empty")
     pts = read_tsv(a.points, "points")
-    require_columns(pts, REQUIRED, "points")
+    require_columns(pts, REQUIRED + [a.category_column], "points")
     if pts.duplicated(["run_id", "block_id"]).any():
         raise Refusal("a (run, block) observation appears twice")
     for c in ("coverage", "block_index"):
@@ -93,7 +101,9 @@ def run(argv):
         raise Refusal("every plotted observation needs a non-negative excess")
     rules = read_tsv(a.rules, "category rules")
     require_columns(rules, RULE_COLUMNS, "category rules")
-    pts["category"] = categorize(pts, rules)
+    if "values" not in rules.columns and "dosage_status" not in rules.columns:
+        raise Refusal("category rules need a values (or dosage_status) column")
+    pts["category"] = categorize(pts, rules, a.category_column)
     rtab = read_tsv(a.rows, "rows")
     rows = list(zip(rtab.row, rtab.label))
     if set(pts.row) - set(rtab.row):
