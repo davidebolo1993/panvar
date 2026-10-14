@@ -281,6 +281,11 @@ if(PANVAR_BUILD_TESTING)
         target_link_libraries(genotype_probe PRIVATE panvarlib edlib)
         target_compile_options(genotype_probe PRIVATE -Wall -Wextra -Wpedantic)
 
+        # CYP2D6/D7 pilot diagnostic: a model's block alleles (no reads, no truth); never installed.
+        add_executable(cyp2d6_block_alleles tests/analysis/cyp2d6_pilot/block_alleles_dump.cpp src/cli_utils.cpp)
+        target_link_libraries(cyp2d6_block_alleles PRIVATE panvarlib)
+        target_compile_options(cyp2d6_block_alleles PRIVATE -Wall -Wextra -Wpedantic)
+
         add_executable(genotype_fragment_oracle_test tests/genotype_fragment_oracle.cpp)
         target_link_libraries(genotype_fragment_oracle_test PRIVATE panvarlib)
         target_compile_options(genotype_fragment_oracle_test PRIVATE -Wall -Wextra -Wpedantic)
