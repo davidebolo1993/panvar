@@ -12,7 +12,14 @@ Inputs (TSV):
   --rows        row, label
   --block-lengths block_id, displayed_length_range
   --unplotted   (optional) observations of the same layer that cannot be plotted (no defined error value), with
-                run_id, block_id, row and a reason column; counted in the outputs and the footer, never drawn
+                run_id, block_id, row and a reason column; counted in the outputs (and the footer, unless
+                --unplotted-note is empty), never drawn
+  --panel-axes  (optional) row, ymin, ymax: fixed y-limits per panel (e.g. a reference figure's panel_axes.tsv), so a
+                subset of points keeps that figure's axes; a point outside them is refused
+  --coverages   (optional) comma list: the coverage dodge order, so a subset keeps the reference positions
+  --blocks-from-lengths  take the x-axis blocks, in order, from --block-lengths (a subset may miss some blocks); the
+                points' block_index must equal the position there
+  --footer      (optional) a footer line; joined with the unplotted note when both are given
 
 Writes <out-dir>/figures/<stem>.png|pdf (16:9 slide), plotted_points.tsv, category_counts.tsv (row, coverage, block,
 category), panel_axes.tsv, layout_check.tsv, unplotted.tsv (when given) and captions.md. Exit 0, or 2 on a refusal.
@@ -43,6 +50,10 @@ def parse(argv):
     p.add_argument("--title", default="Block calls by outcome")
     p.add_argument("--xlabel", default="block (genomic order)")
     p.add_argument("--caption-note", default="")
+    p.add_argument("--panel-axes")
+    p.add_argument("--coverages")
+    p.add_argument("--blocks-from-lengths", action="store_true")
+    p.add_argument("--footer", default="")
     return p.parse_args(argv)
 
 
@@ -88,20 +99,40 @@ def run(argv):
     if set(pts.row) - set(rtab.row):
         raise Refusal("points in rows not listed in --rows")
     lengths = read_tsv(a.block_lengths, "block lengths")
-    order = list(pts.sort_values("block_index").drop_duplicates("block_id").block_id)
+    if a.blocks_from_lengths:
+        order = list(lengths.block_id)
+        pos = {b: i for i, b in enumerate(order)}
+        if any(b not in pos or pos[b] != i for b, i in zip(pts.block_id, pts.block_index)):
+            raise Refusal("a point's block is missing from, or at another position in, the block-length table")
+    else:
+        order = list(pts.sort_values("block_index").drop_duplicates("block_id").block_id)
     ticks = P.block_labels(order, lengths)
     covs = coverage_order(pts.coverage)
+    if a.coverages:
+        covs = [int(c) for c in a.coverages.split(",")]
+        if set(pts.coverage) - set(covs):
+            raise Refusal("points at a coverage not listed in --coverages")
+    ylims = None
+    if a.panel_axes:
+        ax = read_tsv(a.panel_axes, "panel axes")
+        ylims = {r.row: (float(r.ymin), float(r.ymax)) for r in ax.itertuples()}
+        if set(rtab.row) - set(ylims):
+            raise Refusal("--panel-axes lacks a row of --rows")
     unplotted = None
-    footer = None
+    footer = a.footer or None
     if a.unplotted:
         unplotted = read_tsv(a.unplotted, "unplotted observations")
         require_columns(unplotted, ["run_id", "block_id", "row", "reason"], "unplotted observations")
         clash = set(zip(unplotted.run_id, unplotted.block_id)) & set(zip(pts.run_id, pts.block_id))
         if clash:
             raise Refusal(f"{len(clash)} unplotted observation(s) are also in --points")
-        footer = a.unplotted_note.replace("{n}", str(len(unplotted)))
+        note = a.unplotted_note.replace("{n}", str(len(unplotted)))
+        footer = " ".join(x for x in (a.footer, note) if x) or None
     cats = [(r.category, r.label, r.color, float(r.size), None if r.edge == "none" else r.edge) for r in rules.itertuples()]
-    fig, drawn = P.fig_block_categories(pts, order, rows, covs, ticks, a.title, cats, xlabel=a.xlabel, footer=footer)
+    try:
+        fig, drawn = P.fig_block_categories(pts, order, rows, covs, ticks, a.title, cats, xlabel=a.xlabel, footer=footer, ylims=ylims)
+    except ValueError as e:
+        raise Refusal(str(e))
     clipped, overlapping = P.text_layout_problems(fig)
     os.makedirs(os.path.join(a.out_dir, "figures"), exist_ok=True)
     axes_tab = pd.DataFrame(fig.panel_axes, columns=["row", "ymin", "ymax", "yscale"])

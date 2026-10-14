@@ -586,14 +586,15 @@ def _slide_frame(fig, title, handles, legend_title, footer):
 
 
 def fig_block_categories(points, block_order, rows, coverages, ticks, title, categories, metric="excess",
-                         ylabel="Excess over the availability floor (bp)", xlabel="block (genomic order)", footer=None):
+                         ylabel="Excess over the availability floor (bp)", xlabel="block (genomic order)", footer=None, ylims=None):
     """Slide figure (SLIDE canvas): vertically stacked panels (rows: [(row value, panel label)]), ordered blocks on x,
     `metric` on the symlog bp axis with the same per-panel limits and the same coverage dodge, marker shapes and
     deterministic jitter as fig_block_gq, every point coloured by its presentation category.
     categories: [(key, legend label, colour, marker size, edge colour or None)] in drawing order (first drawn first, so
     the last are on top); points carry a `category` column with those keys. Two legends: categories (with counts) and
     coverage shapes. Returns (figure, drawn) with one (row, run_id, block_id, coverage, x, y, category) per point;
-    figure.panel_axes lists (row, ymin, ymax, yscale)."""
+    figure.panel_axes lists (row, ymin, ymax, yscale). ylims {row: (ymin, ymax)} replaces the limits derived from the
+    plotted points (so a subset keeps a reference figure's axes); a point outside them is refused, never clipped."""
     covs = list(coverages)
     marker = {c: COVERAGE_MARKERS[i % len(COVERAGE_MARKERS)] for i, c in enumerate(covs)}
     nb = len(block_order)
@@ -617,6 +618,11 @@ def fig_block_categories(points, block_order, rows, coverages, ticks, title, cat
                 drawn += [(rval, r, b, c, x, y, key) for r, b, x, y in zip(g.run_id, g.block_id, xs, g[metric])]
         top = d[metric].max() if d[metric].notna().any() else 0.0
         _symlog(ax, "excess", top)
+        if ylims is not None:
+            lo, hi = ylims[rval]
+            if len(d) and (d[metric].min() < lo or d[metric].max() > hi):
+                raise ValueError(f"{rval}: a point lies outside the fixed y-limits ({lo}, {hi})")
+            ax.set_ylim(lo, hi)
         ax.set_xlim(-0.5, nb - 0.5)
         ax.set_title(rlabel, loc="left", fontsize=SLIDE["label"])
         ax.tick_params(axis="y", labelsize=SLIDE["tick"])

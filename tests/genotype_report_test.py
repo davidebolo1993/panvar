@@ -11,7 +11,7 @@ scripts/plot_genotype_block_gq.py (log10(1 + GQ) colours, missing and infinite G
 raincloud's); and the 16:9 --slide layouts of both (exact canvas, no count labels, nothing clipped or
 overlapping, the same tables as the audit layout); and the mosaic design slides of
 scripts/plot_genotype_mosaic_design.py (A/B source toggling, refusals, exact clean reproducible canvases); and the outcome-category point slide of
-scripts/plot_genotype_block_categories.py (rule mapping and refusals, positions equal to the GQ figure). Usage: genotype_report_test.py [scripts dir]."""
+scripts/plot_genotype_block_categories.py (rule mapping and refusals, positions equal to the GQ figure, subsets keeping the reference geometry). Usage: genotype_report_test.py [scripts dir]."""
 import hashlib
 import math
 import os
@@ -966,6 +966,29 @@ class BlockCategories(unittest.TestCase):
         self.write("unplotted.tsv", [{"run_id": "q1", "block_id": "sv:1", "row": "G1", "reason": "x"}])   # also plotted
         with self.assertRaises(Refusal):
             self.cli("x4", ["--unplotted", os.path.join(self.d, "unplotted.tsv")])
+
+    def test_subset_keeps_reference_geometry(self):
+        """A subset rendered with --blocks-from-lengths, --coverages and --panel-axes keeps the full figure's x positions,
+        block axis and y-limits; a point outside the fixed limits is refused, never clipped."""
+        self.cli("full")
+        full = self.table("full", "plotted_points.tsv").set_index(["run_id", "block_id"])
+        sub = [p for p in cat_points() if p["dosage_status"] == "CONTENT_REPAIRED"]
+        self.write("points.tsv", sub)
+        args = ["--blocks-from-lengths", "--coverages", "2,10", "--panel-axes", os.path.join(self.tmp, "full", "panel_axes.tsv"),
+                "--footer", "only flagged calls"]
+        self.cli("sub", args)
+        d = self.table("sub", "plotted_points.tsv")
+        self.assertEqual(len(d), len(sub))
+        self.assertTrue(all(full.loc[(r.run_id, r.block_id), "x"] == r.x for r in d.itertuples()))
+        self.assertEqual(self.table("sub", "panel_axes.tsv").values.tolist(), self.table("full", "panel_axes.tsv").values.tolist())
+        with open(os.path.join(self.tmp, "sub", "captions.md")) as f:
+            self.assertIn("only flagged calls", f.read())
+        ax = self.table("full", "panel_axes.tsv")
+        ax.loc[0, "ymax"] = 0.5   # below a plotted value
+        ax.to_csv(os.path.join(self.d, "tight_axes.tsv"), sep="\t", index=False)
+        self.write("points.tsv", cat_points())
+        with self.assertRaises(Refusal):
+            self.cli("x", ["--panel-axes", os.path.join(self.d, "tight_axes.tsv")])
 
     def test_redraw_byte_identical_16_9(self):
         self.cli("a"); self.cli("b")
