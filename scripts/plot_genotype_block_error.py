@@ -17,7 +17,7 @@ Inputs (TSV):
   --expected-called (optional) row, coverage, called_runs: refuse unless the points match
   --phase-calls   (optional) run_id, exact_phased_locus
   --phase-projected (optional) run_id, projected_status, projected_concordant
-  --layer-note, --length-note, --normalization-note: caption text describing the inputs
+  --layer-note, --length-note, --normalization-note, --xlabel: caption and axis text describing the inputs
 
 Writes <out-dir>/figures/<stem>.png|pdf, block_counts.tsv, plotted_points.tsv, violins.tsv, <locus-table> and
 captions.md. An --out-dir that exists and is not empty is refused. Exit 0 on success, 2 on a refusal.
@@ -35,7 +35,8 @@ from genotype_report import plots as P  # noqa: E402
 from genotype_report.common import Refusal, coverage_order, read_tsv, require_columns, to_bool, to_number, write_tsv  # noqa: E402
 
 EXCESS_LABEL = "Excess over the availability floor (bp)"
-NORMALIZED_LABEL = "Alignment-length-normalized excess"
+NORMALIZED_LABEL = "Diploid-length-normalized excess"   # excess / max(truth1+truth2, called1+called2) bp
+XLABEL = "block (genomic order)"
 
 
 def parse(argv):
@@ -50,6 +51,7 @@ def parse(argv):
     p.add_argument("--normalization-note", default="")
     p.add_argument("--excess-label", default=EXCESS_LABEL)
     p.add_argument("--normalized-label", default=NORMALIZED_LABEL)
+    p.add_argument("--xlabel", default=XLABEL, help="x-axis label; say what the range under each block ID is")
     return p.parse_args(argv)
 
 
@@ -122,7 +124,7 @@ def run(argv):
         plotted = d[d.truth_defined]
         fig, drawn = P.fig_block_raincloud(plotted, order, covs,
                                            [("excess", a.excess_label, "symlog_bp"), ("normalized_excess", a.normalized_label, "linear")],
-                                           cnt, row["title"], ticks)
+                                           cnt, row["title"], ticks, xlabel=a.xlabel)
         P.save(fig, os.path.join(a.out_dir, "figures", row["stem"]))
         drawn_pts += [(row["row"],) + p for p in drawn["points"]]
         drawn_v += [(row["row"],) + v for v in drawn["violins"]]

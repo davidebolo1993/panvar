@@ -609,6 +609,8 @@ class BlockRaincloud(unittest.TestCase):
             cap = f.read()
         self.assertIn("n=(C,Z,U)", cap)
         self.assertNotIn("unassigned", cap.lower())
+        self.assertIn("diploid-length-normalized excess", cap)   # max(truth, called) diploid length, not an alignment length
+        self.assertNotIn("alignment-length", cap.lower())
         self.assertNotIn("R=", cap)
         self.assertIn("excluded from C: 2x: 1, 10x: 0", cap)
 
