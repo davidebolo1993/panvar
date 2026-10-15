@@ -1,6 +1,6 @@
 # Sequence, block-genotype and representation-ambiguity reporting: prospective design (no caller change yet)
 
-**Status:** a design note, written 2026-10-15 after the CYP2D6/D7 pilot (sealed diagnostic baseline). It is not implemented.
+**Status:** a design note, written 2026-10-15 after the CYP2D6/D7 pilot (sealed diagnostic baseline). It is not implemented. Sections 1–5 are version 1. **Section 6 is version 2 (S0 v2, 2026-10-15): the sequence-first output and confidence contract.** Where they differ, section 6 supersedes; nothing in sections 1–5 is withdrawn except where section 6 says so.
 
 **Gate for implementation:** caller behaviour stays unchanged until the adversarial fixtures below exist, their current-behaviour baseline is recorded, and this contract is accepted. Implementation is then a versioned output-contract change with its own baseline; historical freezes keep their recorded implementation.
 
@@ -84,3 +84,113 @@ Each is a small synthetic locus, a graph plus a panel, with a donor whose reads 
 2. **Annotations:** projection sets per candidate and per sequence group, plus the C2 support/GQ correction, behind a schema version flag. The fixtures and real-data cases run old against new.
 3. **Downstream:** the new outputs (sequence status, interval rows, FASTA flags), then phase and dosage handling of intervals.
 4. **Validation:** a separate versioned validation of the changed outputs. This is never mixed with performance patches.
+
+## 6. Version 2: sequence-first output and confidence contract (S0 v2)
+
+**Scope:** an output contract only. No caller, default or scoring change is made in S0. Everything below is conditional on the explored candidate pool unless a completeness certificate says otherwise.
+
+### 6.1 Principles
+
+1. **Predict, then qualify.** Scientific uncertainty keeps the best available prediction and lowers its confidence. It does not by itself produce a no-call. A locus produces no prediction only for a hard failure: invalid input, model refusal, or no admissible candidate.
+2. **Labels are not sequence.** Uncertainty about panel labels (which block carries a repeat unit, which alias a donor is) is reported separately and never lowers sequence confidence. Sequence-identical candidates are pooled before any confidence is computed: they are one sequence group, counted once.
+3. **Small and material differences are different.** The difference between two diploid sequence predictions is the minimum, over the two homologue pairings, of the per-haplotype distances. It is classified as:
+   - `IDENTICAL`;
+   - `SMALL`: every difference shorter than 50 bp, the model's `min_variant_bp`, and no change to copy structure or allocation;
+   - `MATERIAL`: any SV-scale difference, any copy-number or block-structure change, or any change in which chromosome copy carries a unit.
+4. **One headline confidence.** Users read one confidence value and one filter. Diagnostics, alternatives and component scores go to the advanced outputs. Users never combine filters themselves.
+5. **Completed and provisional results are never confused.** A search that stopped at a cap or a time limit reports its best prediction so far as `PROVISIONAL`. Its confidence is marked uncalibrated.
+
+### 6.2 Outcome classes (locus `sequence_status`)
+
+| class | meaning | reported prediction | block rows | CYP pilot cells (sealed, 36) |
+|---|---|---|---|---|
+| `RESOLVED` | one unordered sequence pair in the decision set (labellings pooled) | that pair | every block with a unique projection; one interval row per representation interval with all label tuples and no chosen tuple | 22 current calls, unchanged; **8 current label-ambiguity no-calls** (sv:3..sv:5 interval row) |
+| `GENOTYPE_RESOLVED_SEQUENCE_SET` | distinct sequence pairs in the decision set share every block genotype: they differ in phase, or in label-equivalent placement only | the representative pair (6.4) | all blocks, with phase sets; phase across unlinked blocks marked unknown | 5 current genotype-equivalent calls |
+| `PARTIALLY_RESOLVED` | the decision set's sequence pairs agree on some blocks and differ at others | the representative pair | agreeing blocks identified; differing blocks `GENOTYPE_UNRESOLVED`, with the alternatives in advanced output | none in the pilot (distinct from the tie below only in how many blocks agree) |
+| `SEQUENCE_TIED` | distinct sequence pairs with different block genotypes tie within tolerance | the representative pair, at low confidence | blocks on which every tied pair agrees under every projection; all others `GENOTYPE_UNRESOLVED` | 1 (mosaic three_2 at 30×, 9 tied members; truth among them) |
+| `PROVISIONAL` (orthogonal flag) | the search did not complete | best prediction so far, together with the class it would have had | as for that class | none at A5. At A3, all 30× cells would have been `PROVISIONAL`, not no-calls |
+
+`PARTIALLY_RESOLVED` and `SEQUENCE_TIED` are kept apart because users act differently on "most of the locus is known" and "two different structures are equally likely". Both retain a prediction.
+
+### 6.3 Headline confidence: target and calibration
+
+- **Correctness target.** `structure_confidence` is the probability that the reported unordered diploid sequence pair is within `SMALL` of the truth:
+  - same copy structure;
+  - same chromosome allocation;
+  - every difference shorter than 50 bp.
+
+  A second, advanced-only quantity, `exact_sequence_confidence`, targets byte identity. The headline is the structural one because it is what users act on (star alleles, CNV, hybrids). Exactness is also not attainable under availability limits, such as a truth that cannot be spelled under leave-one-out.
+- **Model estimate.** The decision-pool posterior is the sum over sequence groups g of P(g | reads, pool) · 1[d(g, reported) ≤ SMALL]. It is computed from:
+  - pooled, label-collapsed sequence-group masses;
+  - the existing joint likelihood and prior;
+  - the normalisation over the explored pool.
+
+  It is candidate-conditional. Omitted mass (truth not in the pool) is not bounded today, so the raw value is an upper bound. It is shown in advanced output as `pool_conditional_posterior`.
+- **Calibration.** Map the raw estimate, plus a small set of declared covariates (coverage, completion, leave-one-out exposure of the active panel), to `structure_confidence`:
+  - fit a monotone (isotonic) map on development cells with truth, by scenario: panel-present (LZO), mosaic, and leave-one-out;
+  - report reliability curves and the calibration error per scenario;
+  - leave-one-out is the scenario that governs production claims;
+  - held-out cells are used once, for a final reliability check only, never for fitting.
+
+  Until a calibration exists, the headline field is `NA` with reason `UNCALIBRATED`, and the raw estimate is advanced-only.
+- **Filter.** The single `FILTER` value is one of:
+  - `PASS`: `structure_confidence` ≥ the declared threshold and the result is complete;
+  - `LOW_CONFIDENCE`;
+  - `PROVISIONAL`;
+  - `NO_PREDICTION` (hard failure only).
+
+  The current headline filters (GQ floors, dosage flags, representation flags) become calibration covariates or advanced diagnostics. They are not separate gates a user must combine.
+
+### 6.4 The representative prediction
+
+**Rule.** Report the pool member that minimises expected structural loss, the minimum-Bayes-risk (MBR) representative. Over pool sequence groups g′ with posterior w(g′), it is argmin over g of Σ_{g′} w(g′)·loss(g, g′), where:
+- loss = 0 for `IDENTICAL`;
+- loss = a small value for `SMALL`;
+- loss = 1 for `MATERIAL`.
+
+**Why MBR rather than the highest-scoring pair:**
+- When one group dominates, MBR and the top-scoring pair coincide.
+- In a tie between structurally clustered alternatives, MBR picks the member closest to the others. That raises the probability of being structurally right without claiming more.
+- It is the selection rule the headline confidence is defined against.
+
+**Status.** Whether MBR beats top-score on real cells is an empirical question. It can be checked post hoc on the sealed pilot and C4 equivalence sets (these outputs list every tied member). That check must be labelled post hoc. The representative is always a pool member, never a synthesised consensus.
+
+### 6.5 Advanced outputs
+
+- **Alternatives table:** the top sequence groups, each with:
+  - pool-conditional posterior;
+  - distance class and size to the representative;
+  - block-genotype projections;
+  - representation intervals.
+- **Label-equivalence sets** per interval.
+- **Per-block conditional GQ** (projection-aware, C2).
+- **Phase sets.**
+- **Raw components:** fragment, exposure and prior.
+- **Completion and caps record.**
+- **Status mapping:** the old `call_class` and status names, kept for comparison with history.
+
+### 6.6 What changes for the sealed CYP2D6 pilot (reporting projection only; `tests/results/s0_v2_20261015/cyp_pilot_contract_projection.tsv`)
+
+**Label-ambiguity no-calls.** The 8 label-ambiguity no-calls become `RESOLVED` predictions, reported with an sv:3..sv:5 interval row. Post hoc, 7 of them spell the true sequence. One is wrong at 8 blocks: leave-one-out HG02953 at 30×, where the truth cannot be spelled from that model. This shows why a resolved label must not raise confidence by itself. **No callability gain is claimed** until these cells' calibrated `structure_confidence` exists. A label rule converts a no-call into a prediction. It does not make the prediction right.
+
+**Distinct-sequence tie (1 cell).** It stays tied. It now carries an MBR representative at low confidence, plus the blocks its 9 members agree on.
+
+**Genotype-equivalent calls (5).** Their block genotypes are unchanged. The sequence pair becomes an explicitly chosen representative with its own confidence, no longer an implicit one.
+
+**The 22 strict calls.**
+- Blocks and sequences are unchanged.
+- Three of the 27 current calls carry 12 kb sv:9 errors (NA19983 ×2, excluded by today's filter; NA19650 at 5×, retained). These are `MATERIAL` errors under the target, so a calibrated confidence must account for them.
+- No threshold may be tuned on these three cells. They are development cells, not a test.
+
+### 6.7 Demonstrations and the remaining gate
+
+**Distinctions already covered:**
+- resolved sequence with ambiguous labels: F1/F2;
+- distinct sequence pairs sharing block genotypes, or phase: F3;
+- a combination of both: F4;
+- order independence: the permuted variants;
+- sum versus best history, non-Markov allele states, neutral subdivision and distant-factor rank: `tests/genotype_mosaic_core.cpp`, `test_conceded_counterexamples`, each with a negative control.
+
+**Missing:** `PARTIALLY_RESOLVED` with a `MATERIAL` alternative, and a `PROVISIONAL` fixture. Add them when the output change is implemented, not before.
+
+**Gate.** Implementation of section 6 is a versioned output-schema change. It follows the order in section 5, plus a calibration study that has its own pre-registered split.
