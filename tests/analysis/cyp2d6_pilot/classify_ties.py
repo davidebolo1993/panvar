@@ -9,7 +9,8 @@ SEQUENCE_IDENTICAL_BLOCK_LABEL_AMBIGUITY only when every member of its top tied 
   4. differs from the first member only at blocks lying inside a model-derived degeneracy interval
      (degeneracy/degeneracy_summary.tsv), i.e. only in the allocation of allele labels among blocks;
   5. and no distinct sequence is present in the top set (implied by 1 and 3, checked separately).
-Any other tie is DISTINCT_SEQUENCE_TIE; other no-calls keep their reason; calls are CALL_<call_class>.
+Every tie no-call (caller reasons distinct_tie and divergent_tie) is examined; a tie failing any criterion is
+DISTINCT_SEQUENCE_TIE. Other no-calls keep their reason; calls are CALL_<call_class>.
 The classification picks no canonical allele combination and invents no block genotype.
 
 Usage: classify_ties.py <pilot package> <runs dir name> <out tsv> <job>...
@@ -73,7 +74,7 @@ def classify(pkg, runs, job, jobrow):
     if exit_code != "1":
         out["classification"] = f"NOT_COMPLETED_exit_{exit_code}"
         return out
-    if st.get("no_call_reason") != "distinct_tie":
+    if st.get("no_call_reason") not in ("distinct_tie", "divergent_tie"):
         reason = st.get("no_call_reason", "NA")
         out["classification"] = f"NO_CALL_{reason if reason != 'NA' else st.get('status', 'NA')}"
         return out
