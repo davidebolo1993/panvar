@@ -2,7 +2,8 @@
 """CYP2D6/D7 pilot (AMENDMENT_5): classify each cell's outcome from call outputs and the model alone (no truth).
 
 The caller's status is kept unchanged. A no-call is additionally classified
-SEQUENCE_IDENTICAL_BLOCK_LABEL_AMBIGUITY only when every member of its top tied set (equivalence_set.tsv, rank 1):
+SEQUENCE_IDENTICAL_BLOCK_LABEL_AMBIGUITY only when every member of its tied set (every row of the caller's
+equivalence_set.tsv for a tie no-call; a divergent_tie ranks its tied members 1..n although their totals are equal):
   1. shares one sequence_candidate_id;
   2. has identical score (total), fragment_term, exposure_term and sequence_pair_prior (exact text);
   3. spells the same unordered diploid sequence (each haplotype spelled from the call model's block alleles);
@@ -79,7 +80,7 @@ def classify(pkg, runs, job, jobrow):
         out["classification"] = f"NO_CALL_{reason if reason != 'NA' else st.get('status', 'NA')}"
         return out
     with open(prefix + ".equivalence_set.tsv") as f:
-        top = [r for r in csv.DictReader(f, delimiter="\t") if r["rank"] == "1"]
+        top = list(csv.DictReader(f, delimiter="\t"))
     blocks, ids = model_alleles(pkg, model)
     ivs = intervals(pkg, model, ids)
     spell = lambda alleles: "".join(blocks[b][int(a)] for b, a in enumerate(alleles.split(",")))  # noqa: E731
