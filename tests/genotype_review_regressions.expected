@@ -1,0 +1,11 @@
+# Current behaviour at the CYP2D6 pilot production sources (identical to cee58de src/include), recorded 2026-10-15.
+# holds=0 marks a reproduced defect (the correct property does not hold); every control must read 1.
+# Fixing a defect changes its line here in the same commit.
+C1_panel_two_block 0
+C1_multi_short_block_panel_only 1
+C1_multi_short_block 0
+C1_control 1
+C2_lower_group_projection 0
+C2_control 1
+C3_dosage_route_representation 0
+C3_control 1

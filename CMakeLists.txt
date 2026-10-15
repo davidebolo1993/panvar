@@ -286,6 +286,18 @@ if(PANVAR_BUILD_TESTING)
         target_link_libraries(cyp2d6_block_alleles PRIVATE panvarlib)
         target_compile_options(cyp2d6_block_alleles PRIVATE -Wall -Wextra -Wpedantic)
 
+        # Review finding C1 impact audit (model-only); never installed.
+        add_executable(genotype_marker_boundary_audit tests/analysis/review_impact/marker_boundary_audit.cpp src/cli_utils.cpp)
+        target_link_libraries(genotype_marker_boundary_audit PRIVATE panvarlib)
+
+        # Regression fixtures for the 2026-10-14 short-read code review (C1-C3); the expectation file records current
+        # behaviour, so a fix changes it explicitly.
+        add_executable(genotype_review_regressions tests/genotype_review_regressions.cpp src/cli_utils.cpp)
+        target_link_libraries(genotype_review_regressions PRIVATE panvarlib)
+        target_compile_options(genotype_review_regressions PRIVATE -Wall -Wextra -Wpedantic)
+        add_test(NAME panvar_genotype_review_regressions
+                 COMMAND genotype_review_regressions ${CMAKE_CURRENT_SOURCE_DIR}/tests/genotype_review_regressions.expected)
+
         add_executable(genotype_fragment_oracle_test tests/genotype_fragment_oracle.cpp)
         target_link_libraries(genotype_fragment_oracle_test PRIVATE panvarlib)
         target_compile_options(genotype_fragment_oracle_test PRIVATE -Wall -Wextra -Wpedantic)
