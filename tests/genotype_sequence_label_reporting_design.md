@@ -95,7 +95,7 @@ Each is a small synthetic locus, a graph plus a panel, with a donor whose reads 
 2. **Labels are not sequence.** Uncertainty about panel labels (which block carries a repeat unit, which alias a donor is) is reported separately and never lowers sequence confidence. Sequence-identical candidates are pooled before any confidence is computed: they are one sequence group, counted once.
 3. **Small and material differences are different.** The difference between two diploid sequence predictions is the minimum, over the two homologue pairings, of the per-haplotype distances. It is classified as:
    - `IDENTICAL`;
-   - `SMALL`: every difference shorter than 50 bp, the model's `min_variant_bp`, and no change to copy structure or allocation;
+   - `SMALL`: every difference shorter than a tolerance τ, with no change to copy structure or allocation. **τ is not yet set.** The 50 bp `min_variant_bp` is a graph-construction cutoff, not an approved correctness tolerance (correction C1, 6.8);
    - `MATERIAL`: any SV-scale difference, any copy-number or block-structure change, or any change in which chromosome copy carries a unit.
 4. **One headline confidence.** Users read one confidence value and one filter. Diagnostics, alternatives and component scores go to the advanced outputs. Users never combine filters themselves.
 5. **Completed and provisional results are never confused.** A search that stopped at a cap or a time limit reports its best prediction so far as `PROVISIONAL`. Its confidence is marked uncalibrated.
@@ -117,7 +117,7 @@ Each is a small synthetic locus, a graph plus a panel, with a donor whose reads 
 - **Correctness target.** `structure_confidence` is the probability that the reported unordered diploid sequence pair is within `SMALL` of the truth:
   - same copy structure;
   - same chromosome allocation;
-  - every difference shorter than 50 bp.
+  - every difference shorter than τ (undeclared; 6.1, C1).
 
   A second, advanced-only quantity, `exact_sequence_confidence`, targets byte identity. The headline is the structural one because it is what users act on (star alleles, CNV, hybrids). Exactness is also not attainable under availability limits, such as a truth that cannot be spelled under leave-one-out.
 - **Model estimate.** The decision-pool posterior is the sum over sequence groups g of P(g | reads, pool) · 1[d(g, reported) ≤ SMALL]. It is computed from:
@@ -125,11 +125,11 @@ Each is a small synthetic locus, a graph plus a panel, with a donor whose reads 
   - the existing joint likelihood and prior;
   - the normalisation over the explored pool.
 
-  It is candidate-conditional. Omitted mass (truth not in the pool) is not bounded today, so the raw value is an upper bound. It is shown in advanced output as `pool_conditional_posterior`.
-- **Calibration.** Map the raw estimate, plus a small set of declared covariates (coverage, completion, leave-one-out exposure of the active panel), to `structure_confidence`:
-  - fit a monotone (isotonic) map on development cells with truth, by scenario: panel-present (LZO), mosaic, and leave-one-out;
-  - report reliability curves and the calibration error per scenario;
-  - leave-one-out is the scenario that governs production claims;
+  It is candidate-conditional, and **not a bound in either direction** (C2). Candidates outside the pool can carry mass inside the reported pair's tolerance as well as outside it, so renormalising over the explored pool can overstate or understate the full-space value. It is shown in advanced output as `pool_conditional_posterior`.
+- **Calibration.** Map the raw estimate, plus a small set of declared covariates **observable at prediction time** (coverage, completion, score margins, pool and search diagnostics, model features), to `structure_confidence`:
+  - LZO, mosaic and leave-one-out are **evaluation strata, not inputs** (C3). A production calibrator never knows which stratum a sample belongs to, so it may not condition on it;
+  - fit a monotone map on development cells with truth, pooled over strata in declared proportions;
+  - report reliability curves and the calibration error **per stratum**. Leave-one-out is the stratum that governs production claims, because it reflects panel availability;
   - held-out cells are used once, for a final reliability check only, never for fitting.
 
   Until a calibration exists, the headline field is `NA` with reason `UNCALIBRATED`, and the raw estimate is advanced-only.
@@ -143,17 +143,19 @@ Each is a small synthetic locus, a graph plus a panel, with a donor whose reads 
 
 ### 6.4 The representative prediction
 
-**Rule.** Report the pool member that minimises expected structural loss, the minimum-Bayes-risk (MBR) representative. Over pool sequence groups g′ with posterior w(g′), it is argmin over g of Σ_{g′} w(g′)·loss(g, g′), where:
+**Rule for the first reporting implementation:** keep the current score-based estimator, the caller's pooled decision with its existing tie rules (C4). The confidence is then defined against that estimator.
+
+**Experimental alternative, not to be implemented first:** report the pool member that minimises expected structural loss, the minimum-Bayes-risk (MBR) representative. Over pool sequence groups g′ with posterior w(g′), it is argmin over g of Σ_{g′} w(g′)·loss(g, g′), where:
 - loss = 0 for `IDENTICAL`;
 - loss = a small value for `SMALL`;
 - loss = 1 for `MATERIAL`.
 
-**Why MBR rather than the highest-scoring pair:**
+**Why MBR might do better than the highest-scoring pair:**
 - When one group dominates, MBR and the top-scoring pair coincide.
 - In a tie between structurally clustered alternatives, MBR picks the member closest to the others. That raises the probability of being structurally right without claiming more.
-- It is the selection rule the headline confidence is defined against.
+- If it were adopted, the headline confidence would have to be redefined against it.
 
-**Status.** Whether MBR beats top-score on real cells is an empirical question. It can be checked post hoc on the sealed pilot and C4 equivalence sets (these outputs list every tied member). That check must be labelled post hoc. The representative is always a pool member, never a synthesised consensus.
+**Status.** Experimental. Whether MBR beats top-score on real cells is an empirical question. It can be checked post hoc on the sealed pilot and C4 equivalence sets (these outputs list every tied member). That check must be labelled post hoc. The representative is always a pool member, never a synthesised consensus.
 
 ### 6.5 Advanced outputs
 
@@ -171,9 +173,16 @@ Each is a small synthetic locus, a graph plus a panel, with a donor whose reads 
 
 ### 6.6 What changes for the sealed CYP2D6 pilot (reporting projection only; `tests/results/s0_v2_20261015/cyp_pilot_contract_projection.tsv`)
 
+**Three separate measures (C5).** Every comparison reports them separately, never one figure for all three:
+- **prediction yield:** cells with any prediction;
+- **high-confidence yield:** cells whose prediction passes the declared confidence threshold;
+- **accuracy:** of all predictions, and of high-confidence predictions, each with its own denominator.
+
+The changes below affect prediction yield. High-confidence yield cannot be stated until a calibrated confidence exists.
+
 **Label-ambiguity no-calls.** The 8 label-ambiguity no-calls become `RESOLVED` predictions, reported with an sv:3..sv:5 interval row. Post hoc, 7 of them spell the true sequence. One is wrong at 8 blocks: leave-one-out HG02953 at 30×, where the truth cannot be spelled from that model. This shows why a resolved label must not raise confidence by itself. **No callability gain is claimed** until these cells' calibrated `structure_confidence` exists. A label rule converts a no-call into a prediction. It does not make the prediction right.
 
-**Distinct-sequence tie (1 cell).** It stays tied. It now carries an MBR representative at low confidence, plus the blocks its 9 members agree on.
+**Distinct-sequence tie (1 cell).** It stays tied. It now carries the score-based representative at low confidence, plus the blocks its 9 members agree on.
 
 **Genotype-equivalent calls (5).** Their block genotypes are unchanged. The sequence pair becomes an explicitly chosen representative with its own confidence, no longer an implicit one.
 
@@ -194,3 +203,16 @@ Each is a small synthetic locus, a graph plus a panel, with a donor whose reads 
 **Missing:** `PARTIALLY_RESOLVED` with a `MATERIAL` alternative, and a `PROVISIONAL` fixture. Add them when the output change is implemented, not before.
 
 **Gate.** Implementation of section 6 is a versioned output-schema change. It follows the order in section 5, plus a calibration study that has its own pre-registered split.
+
+### 6.8 Corrections (Sol's review of S0 v2, 2026-10-15)
+
+Section 6 above has been amended in place. The original statements and their corrections:
+
+- **C1.** "SMALL: shorter than 50 bp, the model's `min_variant_bp`." The 50 bp construction cutoff is not an approved correctness tolerance. τ is a decision still to be made, with its own justification.
+- **C2.** "Omitted mass is not bounded, so the raw value is an upper bound." A candidate-conditional posterior is not generally an upper bound. Omitted candidates can add mass inside the tolerance as well as outside it.
+- **C3.** Calibration "by scenario" with "leave-one-out exposure" as a covariate. LZO, mosaic and leave-one-out are evaluation strata. That information is not available to a production calibrator. They are used only to report calibration.
+- **C4.** MBR as "the rule". Minimum-expected-loss selection stays experimental. The first reporting implementation keeps the current score-based estimator.
+- **C5.** Yield and accuracy were not separated. Prediction yield, high-confidence yield and accuracy are now reported separately.
+- **C6** (S0 v2 measurements, `tests/results/s0_v2_20261015/README.md`). The distant-evidence "minor-side mass share" is a descriptive statistic of the explored pool. It is not a bound, and it does not permit distant evidence to be discarded.
+- **C7** (same README). The proposed CYP2D6 sv:9 depth diagnostic needs expected counts produced by the same read-selection process as its observed counts. The 701 fragments were selected because they discriminate between pool candidates. They cannot be compared with a whole-block exposure term.
+
