@@ -480,9 +480,10 @@ def count_triple_label(c, z, u):
     return f"n=({c},{z},{u})"
 
 
-def _raincloud_cell(ax, g, metric, scale, x0, w, color, b, c, slide):
+def _raincloud_cell(ax, g, metric, scale, x0, w, color, b, c, slide, marker="o"):
     """One raincloud at slot x0: the half violin of g[metric] (left), Q1/median/Q3 marks across it and the same
-    observations as deterministic jittered points on the open side. g is sorted by run_id. Returns (points, violin)."""
+    observations as deterministic jittered points on the open side, drawn with `marker`. g is sorted by run_id.
+    Returns (points, violin)."""
     vals = g[metric].to_numpy(dtype=float)
     hv = half_violin(vals, scale)
     half = RAINCLOUD_HALF * w
@@ -496,19 +497,23 @@ def _raincloud_cell(ax, g, metric, scale, x0, w, color, b, c, slide):
         ax.plot([x0 - half, x0], [q, q], color="#222222", lw=lw, solid_capstyle="butt", zorder=4)
     band = RAINCLOUD_JITTER * w
     xs = [x0 + RAINCLOUD_GAP * w + band / 2 + stable_jitter(f"{r}|{b}", band) for r in g.run_id]
-    ax.scatter(xs, vals, s=SLIDE["raincloud_point"] if slide else 4, color=color, linewidths=0, alpha=0.85, zorder=3)
+    ax.scatter(xs, vals, s=SLIDE["raincloud_point"] if slide else 4, color=color, marker=marker, linewidths=0, alpha=0.85,
+               zorder=3)
     return [(metric, r, b, c, x, y) for r, x, y in zip(g.run_id, xs, vals)], (metric, b, c, hv["kind"], len(vals), q1, med, q3)
 
 
 def fig_block_raincloud_rows(points, block_order, rows, coverages, ticks, title, ylims, metric="excess",
-                             ylabel="Excess over the availability floor (bp)", xlabel="block (genomic order)", footer=None):
+                             ylabel="Excess over the availability floor (bp)", xlabel="block (genomic order)", footer=None,
+                             coverage_markers=False):
     """Slide (SLIDE canvas): one symlog-bp raincloud panel per row (rows: [(row value, panel label)]), stacked on the
     shared ordered block axis, with each panel's y-limits FIXED to ylims[row] (e.g. a reference figure's, so a subset
     is never autoscaled; a point outside them is refused). Violins and quartiles summarize exactly the points given;
     points keep the raincloud's deterministic positions. Returns (figure, drawn) as fig_block_raincloud, with the row
-    prepended to every point and violin."""
+    prepended to every point and violin. coverage_markers=True also distinguishes the coverages by point shape
+    (COVERAGE_MARKERS, in coverage order), shown in the legend."""
     covs = list(coverages)
     ccol = coverage_colors(covs)
+    mk = {c: COVERAGE_MARKERS[i % len(COVERAGE_MARKERS)] if coverage_markers else "o" for i, c in enumerate(covs)}
     nb = len(block_order)
     w = BLOCK_DODGE / max(1, len(covs))
     fig, axes = plt.subplots(len(rows), 1, figsize=SLIDE["figsize"], squeeze=False, sharex=True, layout="constrained")
@@ -522,7 +527,8 @@ def fig_block_raincloud_rows(points, block_order, rows, coverages, ticks, title,
             for ci, c in enumerate(covs):
                 g = d[(d.block_id == b) & (d.coverage == c)].sort_values("run_id", kind="stable")
                 if len(g):
-                    p, v = _raincloud_cell(ax, g, metric, "symlog_bp", bi + (ci - (len(covs) - 1) / 2) * w, w, ccol[c], b, c, True)
+                    p, v = _raincloud_cell(ax, g, metric, "symlog_bp", bi + (ci - (len(covs) - 1) / 2) * w, w, ccol[c], b, c, True,
+                                           mk[c])
                     drawn_points += [(rval,) + x for x in p]
                     drawn_violins.append((rval,) + v)
         _symlog(ax, "excess", 0.0)
@@ -536,7 +542,11 @@ def fig_block_raincloud_rows(points, block_order, rows, coverages, ticks, title,
     axes[-1, 0].set_xticks(range(nb), ticks, rotation=0, fontsize=SLIDE["block"])
     axes[-1, 0].set_xlabel(xlabel, fontsize=SLIDE["label"])
     fig.supylabel(ylabel, fontsize=SLIDE["label"])
-    handles = [Patch(facecolor=ccol[c], edgecolor=ccol[c], alpha=0.6, label=f"{c}x" if c != "all" else "all") for c in covs]
+    if coverage_markers:
+        handles = [Line2D([], [], marker=mk[c], ls="", color=ccol[c], markersize=7, label=f"{c}x" if c != "all" else "all")
+                   for c in covs]
+    else:
+        handles = [Patch(facecolor=ccol[c], edgecolor=ccol[c], alpha=0.6, label=f"{c}x" if c != "all" else "all") for c in covs]
     handles += [Line2D([], [], color="#222222", lw=1.8, label="median"), Line2D([], [], color="#222222", lw=0.7, label="Q1, Q3")]
     _slide_frame(fig, title, handles, "coverage", footer)
     fig.panel_axes = [(rval, *ax.get_ylim(), ax.get_yscale()) for ax, (rval, _) in zip(axes[:, 0], rows)]
