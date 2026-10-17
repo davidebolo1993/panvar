@@ -279,6 +279,10 @@ struct DosageShadowOptions {
     std::uint64_t repair_max_physical_origins = 0, repair_max_state_classes = 0, repair_max_piece_hits = 0, repair_max_latent_pairs = 0;
     std::size_t threads = 1;
     std::size_t chunk_haplotypes = 128;
+    // I2-J (EXPERIMENTAL): the block census's implementation; declared, the status records it with the census's coarse
+    // stage timers and work counters.
+    CensusBackend census_backend = CensusBackend::reference;
+    bool census_backend_declared = false;
 };
 
 // One COMPLETE_DIPLOTYPE_REPAIR, as repair mode needs it: the chosen block sequences in reported-homologue order
@@ -306,6 +310,7 @@ struct DosageShadowSummary {
     std::map<std::string, std::size_t> status_counts, reason_counts, repair_classes;
     double seconds_census = 0.0, seconds_features = 0.0, seconds_estimate = 0.0, seconds_repair = 0.0, seconds_provenance = 0.0, seconds_allocation = 0.0,
            seconds_total = 0.0;
+    CensusWork census_work;   // I2-J: filled when the census backend is declared
 };
 
 // Runs census, features, estimate, classification and (optionally) repair of the call persisted at run_prefix, and

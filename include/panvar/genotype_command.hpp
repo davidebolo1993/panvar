@@ -151,6 +151,57 @@ struct GenotypeCommandOptions {
     // Scratch for the union's out-of-place start sorter, over all workers (performance only; the list is the same).
     // 0: in place always.
     std::size_t start_sort_scratch_bytes = 0;
+    // I2-A (EXPERIMENTAL, profile keys only, never public settings): the backend of the initial one-shot union pass.
+    // "reference" (the default) is score_diplotypes, unchanged. "indexed_fine_experimental" scores the same pass
+    // through the I1.4 content index (score_diplotypes_indexed_union) with the same scores and the same refusal
+    // semantics; indexed_union_store_bytes (required positive then) bounds its placement store. Only the union pass
+    // changes: the adaptive repair (PreparedScoringContext) and the dosage stage keep their own scorers.
+    std::string union_scoring_backend = "reference";
+    std::size_t indexed_union_store_bytes = 0;
+    // I2-C: the indexed union's placement-store layout: "exact" (default; capacity-charged, exact-sized rows) or
+    // "legacy_i2a" (the I2-A layout, for comparison only). Valid only with the indexed backend.
+    std::string indexed_union_store_layout = "exact";
+    // I4-B (EXPERIMENTAL, profile key only): the one-shot union store's evidence representation: "reconstructed"
+    // (default; coarse interior rows copied from their fine pieces) or "fine_views_experimental" (coarse units served as
+    // views over the fine units' shared rows). Valid only with the indexed backend and the exact store layout.
+    std::string indexed_union_evidence_layout = "reconstructed";
+    // I2-C (measurement key): report the detailed stage attribution block (seconds_detail_*). Timers always run.
+    bool timing_detail = false;
+    // I2-D (EXPERIMENTAL, profile key only): seed the adaptive search's anchor pair -- scored columns and censuses -- in
+    // one placement pass. Off (default): score, then retain each census by a second full placement. Setting the key
+    // explicitly (either value) reports adaptive_fused_seed and adaptive_full_placements in the status.
+    bool adaptive_fused_seed = false;
+    // I2-E (EXPERIMENTAL, profile key only): exact reuse of marker-proposal contributions in build_proposal_emissions,
+    // with this per-block table budget in bytes (allocated capacity). 0 (default): off, every term evaluated directly.
+    // When set, the status reports the marker_proposal_reuse_* block. The dosage stage's emissions are not affected.
+    std::size_t marker_proposal_reuse_table_bytes = 0;
+    // I2-F (EXPERIMENTAL, profile key only): candidate combination uses the run's library terms prepared once per
+    // combination call (FragmentScoringOptions::prepared_library_terms) in the initial union pass and the adaptive search;
+    // the dosage stage keeps the scalar path. Setting the key (either value) reports the combination_* block.
+    bool combination_prepared_library_terms = false;
+    // I2-G (MEASUREMENT key, never for timing runs): sample every N-th verification request into the verify_profile_*
+    // status block (union pass and whole run). 0 (default): off.
+    std::uint32_t verification_profile_period = 0;
+    // I2-I (MEASUREMENT key, never for timing runs): the verification-request census (verification_census.hpp), sampling
+    // 1 in N read contents into <prefix>.verification_census.tsv; 64 MiB of census storage at most. 0 (default): off.
+    std::uint32_t verification_census_period = 0;
+    // I2-H (EXPERIMENTAL, profile key only): `gap_recursion_backend scaled_reference|fixed_geometry_experimental`, the
+    // emitting gapped recursion's implementation for the run's scoring (FragmentScoringOptions::gap_recursion_backend):
+    // the union pass, the adaptive search and dosage. Exact, bit for bit; setting the key reports it in the status.
+    bool gap_recursion_fixed_geometry = false;
+    // I2-K (EXPERIMENTAL, profile key only): `adaptive_emission_handoff 0|1` -- the indexed union pass's emission results
+    // handed to the adaptive search's scoring context (FragmentScoringOptions::emission_handoff_out/_in). Exact; setting
+    // the key reports the handoff in the status.
+    bool adaptive_emission_handoff = false;
+    // I2-B (EXPERIMENTAL, profile keys only, never public settings): how the adaptive search's window enumeration builds
+    // its placement rows. "reference" (the default) scans each enumerated window whole, unchanged. "fine_experimental"
+    // builds the same rows from a round-local, per-worker fine store (PreparedScoringContext::
+    // enable_fine_window_discovery): adaptive_fine_store_bytes bounds its allocated capacity and
+    // adaptive_fine_max_served_placements caps what it serves over the search (both required positive then). Setting
+    // the key explicitly, either value, adds the adaptive_window_* report block to the status.
+    std::string adaptive_window_discovery = "reference";
+    std::size_t adaptive_fine_store_bytes = 0;
+    std::uint64_t adaptive_fine_max_served_placements = 0;
     // Per-lookup emission-cache timing (two clock reads a lookup). Off: no clock is read and lookup time is reported
     // as not measured.
     bool emission_lookup_timing = false;
@@ -238,6 +289,9 @@ struct GenotypeCommandOptions {
     std::string dosage_mode = "off";
     // SHADOW ONLY: the allocation observability test inside the shadow audit (off until its cost is reviewed).
     bool dosage_allocation_test = false;
+    // I2-J (EXPERIMENTAL, profile key only): `dosage_census_backend reference|interned_experimental`, the dosage block
+    // census's implementation (dosage::CensusBackend). Exact; setting the key records it with the census timers.
+    bool dosage_census_interned = false;
     // Diagnostic only (docs/algorithms/genotype.md, stage 3): after the run, estimate the library from the reads and the
     // model and write <prefix>.library_estimate.tsv beside the declared library. Never used by the call. Off by default.
     bool library_diagnostic = false;

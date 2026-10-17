@@ -181,21 +181,29 @@ struct Trace {
     std::size_t reused_slots = 0;
     std::size_t seeds_materialised = 0;
     std::size_t peak_live_seed_censuses = 0;
+    panvar::FineWindowReport fine;   // I2-B: the fine run's window discovery
 };
 
 enum class Lifetime { CensusFree, BranchLocal, RetainParents };
 
 // One scripted branching search in its own context, under one lifetime.
-Trace run(const Locus& l, Lifetime lifetime, Checker& check) {
+// `fine` (I2-B): each round's neighbours are scored as one add_repaired_haplotypes batch with round-local fine window
+// discovery, as the production search issues them.
+// `fused_root` (I2-D): the root is placed and censused in one pass (add_haplotypes with retain_censuses).
+Trace run(const Locus& l, Lifetime lifetime, Checker& check, bool fine = false, bool fused_root = false) {
     const bool branch_local = lifetime != Lifetime::RetainParents;
     const bool census_free = lifetime == Lifetime::CensusFree;
     panvar::PreparedScoringContext context(l.fragments, library(), options());
+    if (fine) context.enable_fine_window_discovery(std::size_t{1} << 26, std::uint64_t{1} << 40);
     Trace trace;
     constexpr std::size_t kNoSlot = static_cast<std::size_t>(-1);
     context.begin_transient_round();
     const Choice root_choice = {};
-    const std::size_t root = context.add_haplotypes({spell(l, root_choice)}).front();
+    const std::size_t root = context.add_haplotypes({spell(l, root_choice)}, nullptr, false, fused_root).front();
+    const std::uint64_t placements_before_retain = context.full_placement_count();
     context.retain_census(root);
+    require(!fused_root || context.full_placement_count() == placements_before_retain,
+            "I2-D: retain_census after a fused root must place nothing");
     std::set<std::size_t> legacy_pins = {root};
     std::set<std::size_t> seen_slots = {root};
     // The root tie: six seeds, each the root with one block replaced (a promoted repair: census retained).
@@ -257,16 +265,30 @@ Trace run(const Locus& l, Lifetime lifetime, Checker& check) {
         std::size_t incumbent = seed.slot;
         Choice current = seed.choice;
         for (std::size_t round = 0; round < 2; ++round) {
+            std::vector<panvar::RepairRequest> requests;
+            std::vector<std::pair<Choice, bool>> requested;
             for (std::size_t j = 0; j < 8; ++j) {
                 const std::size_t block = (next + round + j) % l.blocks.size();
                 Choice choice = current;
                 choice[block] = (j + round) % 3;
                 if (choice == current) continue;
                 const auto [begin, end] = span_of(l, current, block);
+                if (fine) {
+                    requests.push_back({incumbent, begin, end, l.alleles[block][choice[block]]});
+                    requested.push_back({choice, j % 3 == 0});
+                    continue;
+                }
                 const std::size_t slot =
                     context.add_repaired_haplotype(incumbent, begin, end, l.alleles[block][choice[block]], nullptr, false);
                 if (!seen_slots.insert(slot).second) ++trace.reused_slots;
                 if (j % 3 == 0) check.same(context, slot, spell(l, choice), "neighbour");
+            }
+            if (fine) {
+                const std::vector<std::size_t> slots = context.add_repaired_haplotypes(requests);
+                for (std::size_t k = 0; k < slots.size(); ++k) {
+                    if (!seen_slots.insert(slots[k]).second) ++trace.reused_slots;
+                    if (requested[k].second) check.same(context, slots[k], spell(l, requested[k].first), "neighbour");
+                }
             }
             const std::size_t block = (next + 5 + round) % l.blocks.size();
             Choice won = current;
@@ -315,10 +337,98 @@ Trace run(const Locus& l, Lifetime lifetime, Checker& check) {
             }
         }
     }
+    trace.fine = context.fine_window_report();
     return trace;
 }
 
 }  // namespace
+
+
+// I4-C: the bounded seed cache's admission and release, on the context primitives the production driver uses. Seeds are
+// built by exact block delta (census retained) from a census-holding root; a budget admits the first ones whose exact
+// payload fits; every rejected seed gives back EXACTLY its own new slots at once (never a pre-existing one); a later
+// just-in-time placement then reuses a recycled slot. Required: admitted and recycled columns bit-identical to fresh
+// placements; release_slots touches nothing else; a seed whose sequence the context already holds (an identical
+// sequence under another label) resolves to that slot and is never released by a rejection; reversed homologue order
+// scores bit-identically; release_slots refuses a non-live slot. At 1 and 4 threads.
+void test_bounded_seed_release(const Locus& l, Checker& check, std::size_t threads) {
+    panvar::FragmentScoringOptions o = options();
+    o.threads = threads;
+    panvar::PreparedScoringContext context(l.fragments, library(), o);
+    context.begin_transient_round();
+    const std::size_t root = context.add_haplotypes({spell(l, {})}, nullptr, false).front();
+    context.retain_census(root);
+    std::vector<std::size_t> admitted;
+    std::vector<Choice> rejected;
+    std::uint64_t cache_bytes = 0, budget = 0;
+    std::size_t released_total = 0;
+    for (std::size_t b = 0; b < 6; ++b) {
+        Choice choice;
+        choice[b] = b % 3;
+        const auto [begin, end] = span_of(l, {}, b);
+        const std::vector<std::size_t> before = context.live_transient_slots();
+        const std::uint64_t held_before = context.transient_payload_bytes();
+        const std::size_t slot = context.add_repaired_haplotype(root, begin, end, l.alleles[b][b % 3], nullptr, true);
+        const std::uint64_t payload = context.slot_payload_bytes(slot);
+        if (b == 0) budget = 2 * payload + payload / 2;   // admits two seeds of this size, rejects the rest
+        if (cache_bytes + payload <= budget) {
+            cache_bytes += payload;
+            admitted.push_back(slot);
+            check.same(context, slot, spell(l, choice), "I4-C admitted seed " + std::to_string(b));
+            continue;
+        }
+        // rejected: exactly the build's new slots go back, and the context returns to what it held before
+        std::vector<std::size_t> fresh;
+        for (const std::size_t x : context.live_transient_slots())
+            if (!std::binary_search(before.begin(), before.end(), x)) fresh.push_back(x);
+        require(fresh == std::vector<std::size_t>{slot}, "I4-C: a rejected seed's build creates exactly its own slot");
+        context.release_slots(fresh);
+        require(context.slot_payload_bytes(slot) == 0 && !context.holds_census(slot) &&
+                    context.live_transient_slots() == before && context.transient_payload_bytes() == held_before,
+                "I4-C: releasing a rejected seed gives back exactly its slot and nothing else");
+        ++released_total;
+        rejected.push_back(choice);
+    }
+    require(admitted.size() == 2 && rejected.size() == 4, "I4-C fixture: two seeds admitted, four rejected");
+    for (const std::size_t slot : admitted) require(context.holds_census(slot), "I4-C: admitted seeds keep their census");
+    // an identical sequence under another label: the same replacement again resolves to the admitted seed's slot, so a
+    // "rejection" of it finds no new slot to release
+    {
+        const auto [begin, end] = span_of(l, {}, 0);
+        const std::vector<std::size_t> before = context.live_transient_slots();
+        const std::size_t again = context.add_repaired_haplotype(root, begin, end, l.alleles[0][0], nullptr, true);
+        require(again == admitted[0] && context.live_transient_slots() == before,
+                "I4-C: an identical sequence resolves to the slot already held and creates nothing to release");
+    }
+    // just in time: each rejected start placed in full reuses a recycled slot and is bit-identical to a fresh placement
+    std::size_t recycled = 0;
+    for (const Choice& choice : rejected) {
+        const std::size_t total_before = context.memory_account().slots_total;
+        const std::size_t slot = context.add_haplotypes({spell(l, choice)}, nullptr, true).front();
+        context.retain_census(slot);
+        if (context.memory_account().slots_total == total_before) ++recycled;
+        check.same(context, slot, spell(l, choice), "I4-C recycled just-in-time seed");
+    }
+    require(recycled > 0, "I4-C: the released slots must be recycled");
+    // reversed homologue order
+    const panvar::FragmentScoringResult ab = context.score_candidates({{admitted[0], admitted[1]}});
+    const panvar::FragmentScoringResult ba = context.score_candidates({{admitted[1], admitted[0]}});
+    const auto bits = [](double x, double y) { return std::memcmp(&x, &y, sizeof(double)) == 0; };
+    require(bits(ab.scores[0].log_likelihood, ba.scores[0].log_likelihood) && bits(ab.scores[0].fragment_term, ba.scores[0].fragment_term) &&
+                bits(ab.scores[0].exposure_term, ba.scores[0].exposure_term) && ab.scores[0].fragments_with_mass == ba.scores[0].fragments_with_mass,
+            "I4-C: reversed homologue order must score bit-identically");
+    // refusals
+    bool refused = false;
+    try {
+        context.release_slots({context.memory_account().slots_total + 5});
+    } catch (const std::invalid_argument&) {
+        refused = true;
+    }
+    require(refused, "I4-C: release_slots must refuse a slot that is not a live transient haplotype");
+    std::cout << "  ok: I4-C bounded seed admission at " << threads << " thread(s): 2 admitted, " << released_total
+              << " rejected seeds released at once (exactly their own slots), " << recycled << " recycled just-in-time "
+                 "starts; identical sequence shares its slot; reversed homologue order bit-identical\n";
+}
 
 int main() {
     try {
@@ -345,6 +455,33 @@ int main() {
                     a.label + ": mass column differs eager vs census-free");
         }
         require(jit.pending_at_settle == local.pending_at_settle, "the frontier differs between census-free and eager");
+        // I2-B: the census-free branching search again, every round a batch with fine window discovery, each window's
+        // rows checked against the reference scans; then every record against fresh placements and against the
+        // census-free run's own, bit for bit, with the same frontier, slot reuse and seed materialisation.
+        {
+            const std::vector<Checker::Recorded> jit_records = check.last;
+            panvar::set_fine_window_row_check(true);
+            const Trace fine = run(l, Lifetime::CensusFree, check, true, true);   // I2-D: with a fused root too
+            panvar::set_fine_window_row_check(false);
+            check.verify();
+            require(check.last.size() == jit_records.size(), "I2-B: the fine branching run recorded a different slot set");
+            for (std::size_t i = 0; i < jit_records.size(); ++i) {
+                const Checker::Recorded& a = jit_records[i];
+                const Checker::Recorded& b = check.last[i];
+                require(a.label == b.label && a.sequence == b.sequence, "I2-B: the fine branching run diverges at " + a.label);
+                require(std::memcmp(&a.exposure, &b.exposure, sizeof(double)) == 0 &&
+                            std::memcmp(a.mass.data(), b.mass.data(), a.mass.size() * sizeof(double)) == 0,
+                        "I2-B: " + a.label + " differs between the fine and the reference branching run");
+            }
+            require(fine.pending_at_settle == jit.pending_at_settle && fine.seeds_materialised == jit.seeds_materialised &&
+                        fine.reused_slots > 0 && fine.census_at_settle == jit.census_at_settle,
+                    "I2-B: the frontier, materialisation, slot reuse and censuses must be the census-free run's");
+            require(fine.fine.rounds > 0 && fine.fine.units_served > 0 && fine.fine.fallback_windows == 0,
+                    "I2-B: the branching run must serve shared fine units");
+            std::cout << "  ok: I2-B/I2-D tie-branching replay with fine window discovery and a fused root seed -- " << fine.fine.rounds << " rounds, "
+                      << fine.fine.worker_windows << " windows (row-checked), " << fine.fine.units_served
+                      << " units served; every record equals the census-free reference run and fresh placements\n";
+        }
         require(jit.seeds_materialised == local.pending_at_settle.size() - 1, "every branch materialises exactly one seed");
         std::size_t peak_frontier = 0;
         for (std::size_t i = 0; i < jit.census_at_settle.size(); ++i) {
@@ -401,6 +538,10 @@ int main() {
         for (std::size_t i = 0; i < legacy.census_at_settle.size(); ++i) std::cout << ' ' << legacy.census_at_settle[i];
         std::cout << "\n  ok: released slots reused " << local.reused_slots << " times; slot table " << local.total_at_settle.back()
                   << " (retain_parents " << legacy.total_at_settle.back() << ")\n";
+        for (const std::size_t threads : {std::size_t{1}, std::size_t{4}}) {
+            test_bounded_seed_release(l, check, threads);
+            check.verify();
+        }
         std::cout << "branch lifetime gates passed\n";
         return 0;
     } catch (const std::exception& error) {

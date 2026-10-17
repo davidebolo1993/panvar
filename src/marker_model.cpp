@@ -3,6 +3,8 @@
 #include "panvar/syncmer.hpp"
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cmath>
 #include <limits>
 #include <queue>
@@ -139,6 +141,16 @@ double poisson_log_probability(std::uint64_t observed, double mean) {
            std::lgamma(static_cast<double>(observed) + 1.0);
 }
 
+// One marker's contribution to an allele pair: the original expression, verbatim, shared by the direct path and the
+// I2-E table so both evaluate exactly the same arithmetic.
+double marker_contribution(std::uint64_t observed, const MarkerModelParameters& parameters, std::uint32_t fixed,
+                           std::uint64_t copies, double baseline) {
+    const double mean = parameters.background_observations +
+        parameters.expected_observations_per_copy *
+            (2.0 * static_cast<double>(fixed) + static_cast<double>(copies));
+    return poisson_log_kernel(observed, mean) - baseline;
+}
+
 } // namespace
 
 double BlockProposalEmissions::at(std::size_t allele1, std::size_t allele2) const {
@@ -186,10 +198,20 @@ MarkerModelParameters proposal_marker_parameters(
     return parameters;
 }
 
+namespace {
+std::atomic<std::uint64_t>& marker_panel_build_counter() {
+    static std::atomic<std::uint64_t> count{0};
+    return count;
+}
+}  // namespace
+
+std::uint64_t marker_panel_builds() { return marker_panel_build_counter().load(); }
+
 PreparedMarkerPanel build_marker_panel(
     const PreparedGenotypeModel& model,
     std::size_t kmer_size,
     std::size_t syncmer_s) {
+    ++marker_panel_build_counter();   // I3-D: execution counter (once per call; negligible)
     if (kmer_size == 0 || kmer_size > 31 || syncmer_s == 0 || syncmer_s > kmer_size) {
         throw std::invalid_argument("marker parameters must satisfy 1 <= s <= k <= 31");
     }
@@ -396,6 +418,20 @@ PreparedProposalEmissions build_proposal_emissions(
     const PreparedMarkerPanel& panel,
     const MarkerObservations& observations,
     const MarkerModelParameters& parameters) {
+    return build_proposal_emissions(panel, observations, parameters, ProposalReuseOptions{}, nullptr);
+}
+
+PreparedProposalEmissions build_proposal_emissions(
+    const PreparedMarkerPanel& panel,
+    const MarkerObservations& observations,
+    const MarkerModelParameters& parameters,
+    const ProposalReuseOptions& reuse,
+    ProposalReuseReport* report) {
+    using Clock = std::chrono::steady_clock;
+    const auto started = Clock::now();
+    ProposalReuseReport tally;
+    tally.enabled = reuse.enabled;
+    tally.table_budget_bytes = reuse.table_budget_bytes;
     validate_marker_parameters(parameters);
     if (parameters.kmer_size != panel.kmer_size || parameters.syncmer_s != panel.syncmer_s) {
         throw std::invalid_argument("marker parameters do not match the prepared panel");
@@ -432,6 +468,81 @@ PreparedProposalEmissions build_proposal_emissions(
                 poisson_log_probability(observations.counts[slot], baseline_mean);
         }
 
+        // I2-E: this block's contribution table (reuse on only). Per marker: the first entry's index and the number of
+        // entries (copies 1 .. 2 * the marker's largest copy count); markers are admitted in index order while the
+        // allocated capacity of the three vectors fits the budget; the rest are evaluated directly.
+        constexpr std::uint32_t kUntabled = std::numeric_limits<std::uint32_t>::max();
+        std::vector<std::uint32_t> table_offset, table_range;
+        std::vector<double> table;
+        if (reuse.enabled) {
+            const auto build_mark = Clock::now();
+            const std::size_t markers = block.marker_slots.size();
+            std::vector<std::uint32_t> largest(markers, 0);
+            for (const auto& allele : block.allele_markers) {
+                for (const auto& [marker, copies] : allele) {
+                    if (marker < markers) largest[marker] = std::max(largest[marker], copies);
+                }
+            }
+            const std::uint64_t index_bytes = 2 * static_cast<std::uint64_t>(markers) * sizeof(std::uint32_t);
+            // admission is decided before anything is allocated, so the block's storage never exceeds the budget; a block
+            // whose index vectors alone do not fit, or that admits no marker, allocates nothing and evaluates directly
+            std::vector<std::uint64_t> admitted_offset(markers, kUntabled);
+            std::uint64_t entries = 0, admitted = 0;
+            for (std::size_t marker = 0; marker < markers; ++marker) {
+                const std::uint64_t want = 2 * static_cast<std::uint64_t>(largest[marker]);
+                if (want == 0) continue;
+                if (index_bytes > reuse.table_budget_bytes ||
+                    index_bytes + (entries + want) * sizeof(double) > reuse.table_budget_bytes ||
+                    entries + want > kUntabled) {
+                    ++tally.markers_not_tabled;
+                    continue;
+                }
+                admitted_offset[marker] = entries;
+                entries += want;
+                ++admitted;
+            }
+            tally.peak_planning_bytes = std::max<std::uint64_t>(
+                tally.peak_planning_bytes, largest.capacity() * sizeof(std::uint32_t) +
+                                               admitted_offset.capacity() * sizeof(std::uint64_t));
+            if (admitted != 0) {
+                table_offset.reserve(markers);
+                table_range.reserve(markers);
+                table_offset.assign(markers, kUntabled);
+                table_range.assign(markers, 0);
+                for (std::size_t marker = 0; marker < markers; ++marker) {
+                    if (admitted_offset[marker] == kUntabled) continue;
+                    table_offset[marker] = static_cast<std::uint32_t>(admitted_offset[marker]);
+                    table_range[marker] = static_cast<std::uint32_t>(2 * static_cast<std::uint64_t>(largest[marker]));
+                }
+                table.reserve(static_cast<std::size_t>(entries));
+                table.assign(static_cast<std::size_t>(entries), std::numeric_limits<double>::quiet_NaN());
+                tally.markers_tabled += admitted;
+            }
+            tally.peak_table_bytes = std::max<std::uint64_t>(
+                tally.peak_table_bytes, table.capacity() * sizeof(double) +
+                                            (table_offset.capacity() + table_range.capacity()) * sizeof(std::uint32_t));
+            tally.seconds_table_build += std::chrono::duration<double>(Clock::now() - build_mark).count();
+        }
+        const auto contribution = [&](std::uint32_t marker, std::uint64_t copies, std::uint32_t slot) {
+            ++tally.visits;
+            if (reuse.enabled && !table_offset.empty() && table_offset[marker] != kUntabled && copies >= 1 &&
+                copies <= table_range[marker]) {
+                double& entry = table[table_offset[marker] + copies - 1];
+                if (std::isnan(entry)) {
+                    entry = marker_contribution(observations.counts[slot], parameters,
+                                                block.fixed_haploid_multiplicity[marker], copies, baseline_kernel[marker]);
+                    ++tally.executed;
+                } else {
+                    ++tally.reused;
+                }
+                return entry;
+            }
+            ++tally.executed;
+            if (reuse.enabled) ++tally.fallback;
+            return marker_contribution(observations.counts[slot], parameters, block.fixed_haploid_multiplicity[marker],
+                                       copies, baseline_kernel[marker]);
+        };
+
         for (std::size_t allele1 = 0; allele1 < block.allele_count; ++allele1) {
             for (std::size_t allele2 = allele1; allele2 < block.allele_count; ++allele2) {
                 const auto& first = block.allele_markers[allele1];
@@ -461,12 +572,7 @@ PreparedProposalEmissions build_proposal_emissions(
                         throw std::invalid_argument("allele marker index is outside its block");
                     }
                     const std::uint32_t slot = block.marker_slots[marker];
-                    const double mean = parameters.background_observations +
-                        parameters.expected_observations_per_copy *
-                            (2.0 * static_cast<double>(block.fixed_haploid_multiplicity[marker]) +
-                             static_cast<double>(copies));
-                    score += poisson_log_kernel(observations.counts[slot], mean) -
-                             baseline_kernel[marker];
+                    score += contribution(marker, copies, slot);
                 }
                 emission.log_score[allele1 * block.allele_count + allele2] = score;
                 emission.log_score[allele2 * block.allele_count + allele1] = score;
@@ -474,6 +580,8 @@ PreparedProposalEmissions build_proposal_emissions(
         }
         result.blocks.push_back(std::move(emission));
     }
+    tally.seconds_total = std::chrono::duration<double>(Clock::now() - started).count();
+    if (report != nullptr) *report = tally;
     return result;
 }
 

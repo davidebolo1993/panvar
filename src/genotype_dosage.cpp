@@ -1,5 +1,7 @@
 #include "panvar/genotype_dosage.hpp"
 
+#include <chrono>
+
 #include "panvar/parallel.hpp"
 
 #include <algorithm>
@@ -185,14 +187,27 @@ const char* census_route_name(CensusRoute route) {
     return "unknown";
 }
 
-std::vector<CensusBlock> run_census(const PreparedGenotypeModel& model, const NodeSequences& nodes,
-                                    std::size_t molecule_span_bp, const DosageSettings& settings) {
+const char* census_backend_name(CensusBackend backend) {
+    return backend == CensusBackend::interned_experimental ? "interned_experimental" : "reference";
+}
+
+namespace {
+double census_seconds_since(std::chrono::steady_clock::time_point mark) {
+    return std::chrono::duration<double>(std::chrono::steady_clock::now() - mark).count();
+}
+}  // namespace
+
+// THE REFERENCE census (I2-J keeps it unchanged apart from the optional coarse timers and counters).
+std::vector<CensusBlock> run_census_reference(const PreparedGenotypeModel& model, const NodeSequences& nodes,
+                                              std::size_t molecule_span_bp, const DosageSettings& settings,
+                                              CensusWork* work) {
     std::vector<CensusBlock> out;
     for (std::size_t b = 0; b < model.blocks().size(); ++b) {
         const PreparedGenotypeBlock& block = model.blocks()[b];
         CensusBlock row;
         row.block = b;
         row.block_id = block.block_id;
+        auto mark = std::chrono::steady_clock::now();
         std::vector<std::map<std::string, std::size_t>> counts;   // allele -> node -> visits
         for (const CanonicalBlockAllele& allele : block.alleles) {
             const std::vector<NodeStep> walk = primary_walk(allele);
@@ -200,6 +215,10 @@ std::vector<CensusBlock> run_census(const PreparedGenotypeModel& model, const No
             std::map<std::string, std::size_t> c;
             for (const NodeStep& s : walk) ++c[s.node];
             counts.push_back(std::move(c));
+        }
+        if (work != nullptr) {
+            work->seconds_walks += census_seconds_since(mark);
+            mark = std::chrono::steady_clock::now();
         }
         row.alleles = counts.size();
         const auto weight = [&](const std::string& node) -> std::size_t {
@@ -217,9 +236,17 @@ std::vector<CensusBlock> run_census(const PreparedGenotypeModel& model, const No
             }
             row.max_repeated_bp = std::max(row.max_repeated_bp, repeated);
         }
+        if (work != nullptr) {
+            work->seconds_summaries += census_seconds_since(mark);
+            mark = std::chrono::steady_clock::now();
+            work->alleles += counts.size();
+            work->ordered_pairs += counts.size() * counts.size();
+        }
+        std::uint64_t compared = 0;
         for (std::size_t i = 0; i < counts.size(); ++i) {
             for (std::size_t j = 0; j < counts.size(); ++j) {
                 if (length[j] < length[i] + molecule_span_bp) continue;
+                ++compared;
                 std::size_t novel = 0;   // bp of distinct nodes in i absent from j
                 for (const auto& [node, visits] : counts[i]) {
                     if (!counts[j].count(node)) novel += weight(node);
@@ -231,9 +258,144 @@ std::vector<CensusBlock> run_census(const PreparedGenotypeModel& model, const No
             row.route = row.max_node_multiplicity >= 2 && row.max_repeated_bp > molecule_span_bp ? CensusRoute::RepeatedUnit
                                                                                                   : CensusRoute::Pair;
         }
+        if (work != nullptr) {
+            work->seconds_pairs += census_seconds_since(mark);
+            work->pairs_compared += compared;
+        }
         out.push_back(std::move(row));
     }
     return out;
+}
+
+// I2-J (EXPERIMENTAL, off by default): the same census with integer node identities.
+//
+// Every definition is the reference's. Walks come from the same primary_walk (so every source walk is still parsed and
+// a malformed one still refuses), orientation is ignored, and an allele with an empty walk is skipped. Node names are
+// interned per block through an exact-equality string table (no assumption that names are numeric or that a hash is
+// collision-free). Each allele becomes its sorted (node id, visits) list: visits give the length and the multiplicity
+// summaries exactly as before; the absent-node sum counts each distinct node of i missing from j once, by a merge of the
+// two sorted lists. A missing node sequence refuses with the reference's message, naming the node the reference would
+// name: the lexicographically first missing node of the first allele (in order) that has one. Pairs stay ordered,
+// including i == j, with the identical length test. Novel bases accumulate only while they can still decide the pair:
+// the decision is novel <= max_novel_bp and every weight is non-negative, so once the sum exceeds the threshold the
+// pair is decided; the sum of distinct node lengths of one allele cannot overflow (it is bounded by the sequence held
+// in memory), so stopping early never changes a decision. All outputs are integers or the route.
+std::vector<CensusBlock> run_census_interned(const PreparedGenotypeModel& model, const NodeSequences& nodes,
+                                             std::size_t molecule_span_bp, const DosageSettings& settings,
+                                             CensusWork* work) {
+    std::vector<CensusBlock> out;
+    for (std::size_t b = 0; b < model.blocks().size(); ++b) {
+        const PreparedGenotypeBlock& block = model.blocks()[b];
+        CensusBlock row;
+        row.block = b;
+        row.block_id = block.block_id;
+        auto mark = std::chrono::steady_clock::now();
+        std::unordered_map<std::string, std::uint32_t> id_of;   // exact string equality
+        std::vector<std::string> name_of;
+        std::vector<std::vector<std::pair<std::uint32_t, std::size_t>>> counts;   // allele -> sorted (node id, visits)
+        std::vector<std::uint32_t> steps;
+        for (const CanonicalBlockAllele& allele : block.alleles) {
+            const std::vector<NodeStep> walk = primary_walk(allele);
+            if (walk.empty()) continue;
+            steps.clear();
+            for (const NodeStep& s : walk) {
+                const auto [it, added] = id_of.emplace(s.node, static_cast<std::uint32_t>(name_of.size()));
+                if (added) name_of.push_back(s.node);
+                steps.push_back(it->second);
+            }
+            std::sort(steps.begin(), steps.end());
+            std::vector<std::pair<std::uint32_t, std::size_t>> c;
+            for (std::size_t k = 0; k < steps.size();) {
+                std::size_t m = k;
+                while (m < steps.size() && steps[m] == steps[k]) ++m;
+                c.emplace_back(steps[k], m - k);
+                k = m;
+            }
+            counts.push_back(std::move(c));
+        }
+        if (work != nullptr) {
+            work->seconds_walks += census_seconds_since(mark);
+            mark = std::chrono::steady_clock::now();
+            std::uint64_t bytes = name_of.capacity() * sizeof(std::string) + steps.capacity() * sizeof(std::uint32_t) +
+                                  counts.capacity() * sizeof(counts[0]);
+            for (const auto& c : counts) bytes += c.capacity() * sizeof(c[0]);
+            work->peak_temporary_bytes = std::max(work->peak_temporary_bytes, bytes);
+        }
+        row.alleles = counts.size();
+        // Weights, resolved once per node; a missing node refuses as the reference does.
+        std::vector<std::size_t> weight(name_of.size(), 0);
+        std::vector<char> present(name_of.size(), 0);
+        for (std::size_t id = 0; id < name_of.size(); ++id) {
+            const auto found = nodes.find(name_of[id]);
+            if (found == nodes.end()) continue;
+            weight[id] = found->second.size();
+            present[id] = 1;
+        }
+        for (const auto& c : counts) {
+            const std::string* first_missing = nullptr;
+            for (const auto& [id, visits] : c) {
+                if (present[id] == 0 && (first_missing == nullptr || name_of[id] < *first_missing)) first_missing = &name_of[id];
+            }
+            if (first_missing != nullptr) throw std::runtime_error("census: walk node " + *first_missing + " has no sequence");
+        }
+        std::vector<std::size_t> length(counts.size(), 0);
+        for (std::size_t a = 0; a < counts.size(); ++a) {
+            std::size_t repeated = 0;
+            for (const auto& [id, visits] : counts[a]) {
+                length[a] += visits * weight[id];
+                row.max_node_multiplicity = std::max(row.max_node_multiplicity, visits);
+                if (visits >= 2) repeated += weight[id];
+            }
+            row.max_repeated_bp = std::max(row.max_repeated_bp, repeated);
+        }
+        if (work != nullptr) {
+            work->seconds_summaries += census_seconds_since(mark);
+            mark = std::chrono::steady_clock::now();
+            work->alleles += counts.size();
+            work->ordered_pairs += counts.size() * counts.size();
+        }
+        std::uint64_t compared = 0;
+        for (std::size_t i = 0; i < counts.size(); ++i) {
+            const auto& ci = counts[i];
+            for (std::size_t j = 0; j < counts.size(); ++j) {
+                if (length[j] < length[i] + molecule_span_bp) continue;
+                ++compared;
+                const auto& cj = counts[j];
+                std::size_t novel = 0;   // bp of distinct nodes in i absent from j
+                bool decided_out = false;
+                std::size_t q = 0;
+                for (const auto& [id, visits] : ci) {
+                    while (q < cj.size() && cj[q].first < id) ++q;
+                    if (q < cj.size() && cj[q].first == id) continue;
+                    novel += weight[id];
+                    if (novel > settings.max_novel_bp) {
+                        decided_out = true;
+                        break;
+                    }
+                }
+                if (!decided_out && novel <= settings.max_novel_bp) ++row.dosage_only_pairs;
+            }
+        }
+        if (row.dosage_only_pairs > 0) {
+            row.route = row.max_node_multiplicity >= 2 && row.max_repeated_bp > molecule_span_bp ? CensusRoute::RepeatedUnit
+                                                                                                  : CensusRoute::Pair;
+        }
+        if (work != nullptr) {
+            work->seconds_pairs += census_seconds_since(mark);
+            work->pairs_compared += compared;
+        }
+        out.push_back(std::move(row));
+    }
+    return out;
+}
+
+std::vector<CensusBlock> run_census(const PreparedGenotypeModel& model, const NodeSequences& nodes,
+                                    std::size_t molecule_span_bp, const DosageSettings& settings, CensusBackend backend,
+                                    CensusWork* work) {
+    if (backend == CensusBackend::interned_experimental) {
+        return run_census_interned(model, nodes, molecule_span_bp, settings, work);
+    }
+    return run_census_reference(model, nodes, molecule_span_bp, settings, work);
 }
 
 // ------------------------------------------------------------------------------------------------ features

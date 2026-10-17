@@ -9,6 +9,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
+#include <cstring>
 #include <functional>
 #include <iostream>
 #include <random>
@@ -1063,6 +1065,212 @@ void test_multiplicity_counts_places_not_alignments() {
 
 } // namespace
 
+
+// ---- I2-F: prepared main-library combination terms ----------------------------------------------------------------------
+// The run's library prepared once per combination call must reproduce the scalar reference (log_fragment_contribution,
+// expected_signal_fragments) in every score component, bit for bit: one-shot, retained-context and indexed combination;
+// finite and missing masses; zero, small, boundary-near and ordinary outlier weights; several intensities; per-fragment
+// backgrounds varying with read length; no, two and four audit libraries; successive calls with different libraries;
+// 1 and 4 threads. Errors (invalid libraries, impossible fragments) must be the same.
+bool same_bits(double a, double b) { return std::memcmp(&a, &b, sizeof(double)) == 0; }
+void require_same_scores(const panvar::FragmentScoringResult& a, const panvar::FragmentScoringResult& b, const std::string& label) {
+    require(a.scores.size() == b.scores.size() && a.audit_scores.size() == b.audit_scores.size(), label + ": shapes differ");
+    const auto same = [&](const panvar::DiplotypeScore& x, const panvar::DiplotypeScore& y, const std::string& what) {
+        require(same_bits(x.log_likelihood, y.log_likelihood) && same_bits(x.fragment_term, y.fragment_term) &&
+                    same_bits(x.exposure_term, y.exposure_term) && same_bits(x.absolute_term_sum, y.absolute_term_sum) &&
+                    x.fragments_with_mass == y.fragments_with_mass,
+                label + ": " + what + " differs");
+    };
+    for (std::size_t i = 0; i < a.scores.size(); ++i) same(a.scores[i], b.scores[i], "score " + std::to_string(i));
+    for (std::size_t k = 0; k < a.audit_scores.size(); ++k)
+        for (std::size_t i = 0; i < a.audit_scores[k].size(); ++i)
+            same(a.audit_scores[k][i], b.audit_scores[k][i], "audit " + std::to_string(k) + "/" + std::to_string(i));
+}
+
+std::string error_of(const std::function<void()>& f) {
+    try {
+        f();
+    } catch (const std::exception& e) {
+        return e.what();
+    }
+    return "";
+}
+
+void test_prepared_library_terms() {
+    std::mt19937_64 rng(4242);
+    const std::string backbone = random_bases(rng, 900);
+    std::string variant = backbone;
+    for (const std::size_t at : {120u, 333u, 610u}) variant[at] = variant[at] == 'A' ? 'G' : 'A';
+    const std::string other = random_bases(rng, 700) + backbone.substr(0, 200);   // most fragments miss it
+    std::vector<panvar::ReadPair> placeable;
+    for (std::size_t start = 0, n = 0; start + 130 <= backbone.size(); start += 23, ++n) {
+        const std::size_t length = n % 3 == 0 ? 45 : 60;   // mixed read lengths: per-fragment backgrounds differ
+        placeable.push_back({read("p" + std::to_string(n) + "/1", backbone.substr(start, length)),
+                             read("p" + std::to_string(n) + "/2", revcomp(backbone.substr(start + 120 - length, length)))});
+    }
+    std::vector<panvar::ReadPair> with_unplaceable = placeable;
+    with_unplaceable.push_back({read("u/1", random_bases(rng, 60)), read("u/2", random_bases(rng, 60))});
+    const panvar::InternedHaplotypes interned = intern({backbone, variant, other});
+    std::vector<panvar::HaplotypeCandidate> candidates;
+    for (std::size_t a = 0; a < interned.sequences.size(); ++a)
+        for (std::size_t b = a; b < interned.sequences.size(); ++b) candidates.push_back({a, b});
+    const std::vector<panvar::HaplotypeCandidate> candidates_all = candidates;
+
+    const auto variant_library = [](double w, double lambda) {
+        panvar::LibraryModel m = library();
+        m.outlier_weight = w;
+        m.fragment_start_intensity = lambda;
+        return m;
+    };
+    struct Case {
+        std::string name;
+        panvar::LibraryModel lib;
+        bool unplaceable;
+    };
+    const std::vector<Case> cases = {
+        {"ordinary", variant_library(0.005, 0.01), true},
+        {"zero outlier", variant_library(0.0, 0.01), false},
+        {"tiny outlier", variant_library(1e-300, 0.01), true},
+        {"boundary-near outlier", variant_library(std::nextafter(1.0, 0.0), 0.01), true},
+        {"small intensity", variant_library(0.02, 1e-9), true},
+        {"large intensity", variant_library(0.3, 50.0), true},
+    };
+    std::uint64_t compared = 0;
+    // under a zero outlier weight every candidate must explain every fragment: drop the (other, other) pair there
+    std::vector<panvar::HaplotypeCandidate> explaining;
+    for (const auto& cand : candidates) {
+        if (!(cand.first == 2 && cand.second == 2)) explaining.push_back(cand);
+    }
+    for (const Case& c : cases) {
+        const std::vector<panvar::ReadPair>& fragments = c.unplaceable ? with_unplaceable : placeable;
+        const std::vector<panvar::HaplotypeCandidate>& candidates = c.unplaceable ? candidates_all : explaining;
+        for (const std::size_t audits : {std::size_t{0}, std::size_t{2}, std::size_t{4}}) {
+            for (const std::size_t threads : {std::size_t{1}, std::size_t{4}}) {
+                panvar::FragmentScoringOptions options;
+                options.mismatch_band = 2;
+                options.minimum_piece_bp = 8;
+                options.threads = threads;
+                for (std::size_t k = 0; k < audits; ++k) {
+                    panvar::LibraryModel audit = c.lib;
+                    audit.fragment_start_intensity *= 0.5 + 0.4 * static_cast<double>(k);
+                    if (!c.unplaceable && k % 2 == 1) audit.outlier_weight = 0.0;
+                    else if (k == 3) audit.outlier_weight = 0.1;
+                    options.audit_libraries.push_back(audit);
+                }
+                const std::string label = c.name + ", " + std::to_string(audits) + " audits, " + std::to_string(threads) + " threads";
+                panvar::FragmentScoringOptions prepared = options;
+                prepared.prepared_library_terms = true;
+                // one-shot
+                const auto ref = panvar::score_diplotypes(interned, candidates, fragments, c.lib, options);
+                panvar::reset_prepared_library_terms_tally();
+                const auto got = panvar::score_diplotypes(interned, candidates, fragments, c.lib, prepared);
+                require_same_scores(ref, got, label + " (one-shot)");
+                const panvar::PreparedLibraryTermsTally t = panvar::prepared_library_terms_tally();
+                const std::uint64_t terms = candidates.size() * fragments.size();
+                // I2-G correction: the scalar reference's logarithms, counted from its own fragments_with_mass
+                std::uint64_t with_mass = 0;
+                for (const auto& score : ref.scores) with_mass += score.fragments_with_mass;
+                const bool w_positive = c.lib.outlier_weight > 0.0;
+                const std::uint64_t hypothetical = 2 * with_mass + (w_positive ? terms : 0);
+                const std::uint64_t prepared_logs = w_positive ? 3 : 2;
+                require(t.combinations == 1 && t.terms == terms && t.hypothetical_scalar_logs == hypothetical &&
+                            t.prepared_logs == prepared_logs &&
+                            t.net_logs_avoided == static_cast<std::int64_t>(hypothetical) - static_cast<std::int64_t>(prepared_logs) &&
+                            t.hypothetical_scalar_validations == terms + candidates.size() && t.prepared_validations == 1 &&
+                            t.net_validations_avoided == static_cast<std::int64_t>(terms + candidates.size()) - 1,
+                        label + ": the tally must count the scalar reference's work from its fragments_with_mass");
+                require(with_mass < terms || !c.unplaceable, label + ": fixture: missing masses must be exercised");
+                // retained context: placed once, combined under both settings
+                {
+                    panvar::PreparedScoringContext reference_context(fragments, c.lib, options);
+                    reference_context.add_haplotypes(interned.sequences);
+                    const auto r = reference_context.score_candidates(candidates);
+                    require_same_scores(ref, r, label + " (context reference)");
+                }
+                {
+                    panvar::PreparedScoringContext prepared_context(fragments, c.lib, prepared);
+                    prepared_context.add_haplotypes(interned.sequences);
+                    require_same_scores(ref, prepared_context.score_candidates(candidates), label + " (context prepared)");
+                    require_same_scores(ref, prepared_context.score_candidates(candidates), label + " (context prepared, repeat)");
+                }
+                // indexed combination (the I1 batch's shared combination)
+                {
+                    std::size_t max_read = 1;
+                    for (const auto& f : fragments) max_read = std::max({max_read, f.first.bases.size(), f.second.bases.size()});
+                    panvar::ContentPlacementIndex index(max_read, c.lib.max_gap_bp, true);
+                    for (const std::string& h : interned.sequences) index.add_haplotype(h, {static_cast<std::uint32_t>(h.size())});
+                    panvar::ContentIndexBatch batch(index, fragments, c.lib, prepared);
+                    batch.discover();
+                    require_same_scores(ref, batch.score(candidates), label + " (indexed prepared)");
+                }
+                compared += 4;
+            }
+        }
+    }
+    // successive calls with different libraries in one process: each equals its own reference
+    {
+        const panvar::LibraryModel first = variant_library(0.005, 0.01), second = variant_library(0.2, 3.0);
+        panvar::FragmentScoringOptions prepared;
+        prepared.mismatch_band = 2;
+        prepared.minimum_piece_bp = 8;
+        prepared.prepared_library_terms = true;
+        panvar::FragmentScoringOptions scalar = prepared;
+        scalar.prepared_library_terms = false;
+        for (const panvar::LibraryModel& lib : {first, second, first}) {
+            require_same_scores(panvar::score_diplotypes(interned, candidates, with_unplaceable, lib, scalar),
+                                panvar::score_diplotypes(interned, candidates, with_unplaceable, lib, prepared),
+                                "successive libraries");
+        }
+    }
+    // errors: an impossible fragment under a zero outlier weight, and invalid libraries, refuse identically
+    {
+        panvar::FragmentScoringOptions scalar;
+        scalar.mismatch_band = 2;
+        scalar.minimum_piece_bp = 8;
+        panvar::FragmentScoringOptions prepared = scalar;
+        prepared.prepared_library_terms = true;
+        const panvar::LibraryModel zero = variant_library(0.0, 0.01);
+        const std::string a = error_of([&] { (void)panvar::score_diplotypes(interned, candidates, with_unplaceable, zero, scalar); });
+        const std::string b = error_of([&] { (void)panvar::score_diplotypes(interned, candidates, with_unplaceable, zero, prepared); });
+        require(!a.empty() && a == b && a.find("impossible") != std::string::npos,
+                "an impossible fragment must refuse identically on both paths");
+        for (const auto& item : std::vector<std::pair<std::string, panvar::LibraryModel>>{
+                 {"outlier 1", variant_library(1.0, 0.01)}, {"negative outlier", variant_library(-0.1, 0.01)},
+                 {"zero intensity", variant_library(0.01, 0.0)}, {"non-finite intensity", variant_library(0.01, std::nan(""))}}) {
+            const std::string& name = item.first;
+            const panvar::LibraryModel& bad = item.second;
+            const std::string x = error_of([&] { (void)panvar::score_diplotypes(interned, candidates, placeable, bad, scalar); });
+            const std::string y = error_of([&] { (void)panvar::score_diplotypes(interned, candidates, placeable, bad, prepared); });
+            require(!x.empty() && x == y, "an invalid library (" + name + ") must refuse identically");
+            // the public scalar functions keep validating
+            require(!error_of([&] { (void)panvar::log_fragment_contribution(-1.0, -2.0, bad); }).empty() &&
+                        !error_of([&] { (void)panvar::expected_signal_fragments(10.0, bad); }).empty(),
+                    "the public scalar functions must keep validating (" + name + ")");
+        }
+    }
+    // I2-G correction: the tally on empty candidate sets and zero fragments (preparation may exceed the reference)
+    {
+        panvar::FragmentScoringOptions prepared;
+        prepared.mismatch_band = 2;
+        prepared.minimum_piece_bp = 8;
+        prepared.prepared_library_terms = true;
+        panvar::reset_prepared_library_terms_tally();
+        (void)panvar::score_diplotypes(interned, {}, placeable, library(), prepared);
+        panvar::PreparedLibraryTermsTally t = panvar::prepared_library_terms_tally();
+        require(t.combinations == 0 && t.prepared_logs == 0 && t.net_logs_avoided == 0,
+                "an empty candidate set prepares nothing and counts nothing");
+        panvar::reset_prepared_library_terms_tally();
+        (void)panvar::score_diplotypes(interned, {{0, 0}}, {}, library(), prepared);   // zero fragments
+        t = panvar::prepared_library_terms_tally();
+        require(t.combinations == 1 && t.terms == 0 && t.hypothetical_scalar_logs == 0 && t.prepared_logs == 3 &&
+                    t.net_logs_avoided == -3 && t.hypothetical_scalar_validations == 1 && t.net_validations_avoided == 0,
+                "zero fragments: preparation exceeds the reference and the net is reported negative, not wrapped");
+    }
+    std::cout << "  ok: prepared library terms = the scalar reference in " << compared << " comparisons (one-shot, context, "
+                 "repeat, indexed; 6 libraries incl. zero, 1e-300 and boundary-near outlier weights; 0/2/4 audits; 1/4 "
+                 "threads); successive libraries; impossible-fragment and invalid-library errors identical; tally exact\n";
+}
+
 int main() {
     try {
         test_candidate_neutral_disposition();
@@ -1085,6 +1293,7 @@ int main() {
         test_winner_requires_proof();
         test_candidate_set_probability();
         test_proposal_cannot_reach_fragment_score();
+        test_prepared_library_terms();
         std::cout << "genotype fragment scorer: PASS\n";
         return 0;
     } catch (const std::exception& error) {

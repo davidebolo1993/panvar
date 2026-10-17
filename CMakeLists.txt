@@ -113,6 +113,23 @@ if(NOT EXISTS ${EIGEN_DIR}/Eigen/Dense)
         "Run: git submodule update --init --recursive")
 endif()
 
+# I3-C: the persistent prepared-locus index records the git state when CMake configured the build (provenance only,
+# labelled configure-time because it can be stale relative to the sources compiled; never used for compatibility).
+execute_process(COMMAND git rev-parse HEAD WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+                OUTPUT_VARIABLE PANVAR_CONFIGURE_COMMIT OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+execute_process(COMMAND git status --porcelain --untracked-files=no WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+                OUTPUT_VARIABLE PANVAR_CONFIGURE_STATUS OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+if(NOT PANVAR_CONFIGURE_COMMIT)
+    set(PANVAR_CONFIGURE_COMMIT "unknown")
+endif()
+if(PANVAR_CONFIGURE_STATUS)
+    set(PANVAR_CONFIGURE_DIRTY "1")
+else()
+    set(PANVAR_CONFIGURE_DIRTY "0")
+endif()
+set_source_files_properties(src/prepared_locus_file.cpp PROPERTIES COMPILE_DEFINITIONS
+    "PANVAR_CONFIGURE_COMMIT=\"${PANVAR_CONFIGURE_COMMIT}\";PANVAR_CONFIGURE_DIRTY=\"${PANVAR_CONFIGURE_DIRTY}\"")
+
 add_library(panvarlib
     src/gfa.cpp
     src/gfa_io.cpp
@@ -133,6 +150,7 @@ add_library(panvarlib
     src/mosaic_beam_grouped.cpp
     src/genotype_locus.cpp
     src/genotype_command.cpp
+    src/prepared_locus_file.cpp
     src/genotype_repair.cpp
     src/genotype_dosage.cpp
     src/genotype_dosage_repair.cpp
@@ -142,6 +160,7 @@ add_library(panvarlib
     src/genotype_headline.cpp
     src/genotype_dosage_provenance.cpp
     src/fragment_likelihood.cpp
+    src/verification_census.cpp
     src/bubble_path.cpp
     src/bubbles.cpp
     src/ref_path.cpp
@@ -302,6 +321,28 @@ if(PANVAR_BUILD_TESTING)
         target_link_libraries(genotype_fragment_oracle_test PRIVATE panvarlib)
         target_compile_options(genotype_fragment_oracle_test PRIVATE -Wall -Wextra -Wpedantic)
         add_test(NAME panvar_genotype_fragment_oracle COMMAND genotype_fragment_oracle_test)
+        # I3-A: the prepared-locus development driver (successive samples in one process; not a test).
+        add_executable(genotype_prepared_locus_driver tests/genotype_prepared_locus_driver.cpp src/cli_utils.cpp)
+        target_link_libraries(genotype_prepared_locus_driver PRIVATE panvarlib)
+        target_compile_options(genotype_prepared_locus_driver PRIVATE -Wall -Wextra -Wpedantic)
+        # I3-A.1: the same driver with its portable (non-macOS) metrics forced, so that branch is built and run here too.
+        if(APPLE)
+            add_executable(genotype_prepared_locus_driver_portable tests/genotype_prepared_locus_driver.cpp src/cli_utils.cpp)
+            target_link_libraries(genotype_prepared_locus_driver_portable PRIVATE panvarlib)
+            target_compile_definitions(genotype_prepared_locus_driver_portable PRIVATE PANVAR_DRIVER_FORCE_PORTABLE)
+            target_compile_options(genotype_prepared_locus_driver_portable PRIVATE -Wall -Wextra -Wpedantic)
+        endif()
+        # I3-A.1: the batch resource contract and the between-sample release.
+        add_executable(genotype_batch_resource_test tests/genotype_batch_resource.cpp src/cli_utils.cpp)
+        target_link_libraries(genotype_batch_resource_test PRIVATE panvarlib)
+        target_compile_options(genotype_batch_resource_test PRIVATE -Wall -Wextra -Wpedantic)
+        add_test(NAME panvar_genotype_batch_resource COMMAND genotype_batch_resource_test)
+        # I3-C: the persistent prepared-locus index v1 (codec, bounded loading, accounting, publication).
+        add_executable(genotype_prepared_locus_file_test tests/genotype_prepared_locus_file.cpp src/cli_utils.cpp)
+        target_link_libraries(genotype_prepared_locus_file_test PRIVATE panvarlib)
+        target_compile_options(genotype_prepared_locus_file_test PRIVATE -Wall -Wextra -Wpedantic)
+        add_test(NAME panvar_genotype_prepared_locus_file
+                 COMMAND genotype_prepared_locus_file_test ${CMAKE_CURRENT_BINARY_DIR}/prepared_locus_file)
 
         add_executable(genotype_fragment_scorer_test tests/genotype_fragment_scorer.cpp)
         target_link_libraries(genotype_fragment_scorer_test PRIVATE panvarlib)

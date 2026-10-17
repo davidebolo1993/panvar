@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <limits>
 #include <map>
+#include <tuple>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -289,6 +290,35 @@ std::optional<GappedFit> gapped_emission_reference(
     const LibraryModel& library,
     std::size_t mismatch_band);
 
+// I2-H: which implementation computes the EMITTING gapped recursion. The scaled recursion is the reference and
+// the control; the experimental backend must agree with it bit for bit, and falls back to it for any
+// configuration it does not support. The normaliser (the non-emitting pass) always uses the reference.
+enum class GapRecursionBackend { scaled_reference, fixed_geometry_experimental };
+
+// I2-H (benchmark and gates only; not a production entry point).
+namespace gapped_dp_test {
+// The emitting recursion alone: the raw (unnormalised) total in log space, and its consumed-span components
+// when `components` is given. `available` is how many haplotype bases may be consumed from `start`.
+double recursion(const std::string& haplotype, const std::string& read, std::size_t start, std::size_t available,
+                 std::size_t band, const LibraryModel& library, ComponentList* components, GapRecursionBackend backend);
+// The complete emission operation for a request whose prefilter decision is already known to be feasible:
+// recursion, components, normaliser lookup, normalisation, and the emission cache's key, lookup and store
+// whenever the cache is armed. The haplotype window and read must be ACGT (not re-checked).
+std::optional<GappedFit> emission_known_feasible(const std::string& haplotype, const std::string& read,
+                                                 std::size_t start, const LibraryModel& library, std::size_t band,
+                                                 GapRecursionBackend backend);
+// The public emission (prechecks, refusal of non-ACGT input, prefilter, cache) with the backend chosen.
+std::optional<GappedFit> emission(const std::string& haplotype, const std::string& read, std::size_t start,
+                                  const LibraryModel& library, std::size_t band, GapRecursionBackend backend);
+// Whether the experimental backend has a fixed-geometry recursion for this band and gap allowance (otherwise it
+// computes with the reference), and how many fixed-geometry recursions this thread has executed.
+bool fixed_geometry_supported(std::size_t band, const LibraryModel& library);
+std::uint64_t fixed_geometry_executions();
+// The exact feasibility prefilter, as gapped_emission applies it.
+bool feasible(const std::string& haplotype, const std::string& read, std::size_t start, const LibraryModel& library,
+              std::size_t band);
+}  // namespace gapped_dp_test
+
 // Work performed by the emission on THIS thread since the counters were last taken. Reading them
 // resets them, so a caller accumulates its own share without coordinating with any other thread.
 struct GappedEmissionCounters {
@@ -428,6 +458,60 @@ void begin_emission_cache(std::size_t budget_bytes);
 EmissionCacheCounters read_emission_cache_counters();
 
 EmissionCacheCounters end_emission_cache();
+
+// I2-K (EXPERIMENTAL, off by default): the union pass's emission results, handed to the adaptive search.
+//
+// Not a second cache: the process-global emission cache's own shards (entry tables, key-byte slabs, component arenas)
+// are MOVED into this object when union discovery would otherwise discard them, together with the cache's budget
+// accounting and the scoring context the results were computed under. The caller owns it; destroying it frees them.
+// The adaptive PreparedScoringContext adopts it -- moves the shards back -- only under an exactly compatible scoring
+// context (library error and gap model, mismatch band, recursion backend) and only when the inherited budgeted bytes
+// fit its own unchanged cache budget; otherwise it discards it and starts empty. Adoption consumes it. Entries keep
+// their exact identity (read and window bytes, compared byte for byte); placement rows, origins and decisions are never
+// part of it. Inherited entries are marked so that hits on them are counted.
+class EmissionCacheHandoff {
+public:
+    EmissionCacheHandoff();
+    ~EmissionCacheHandoff();
+    EmissionCacheHandoff(const EmissionCacheHandoff&) = delete;
+    EmissionCacheHandoff& operator=(const EmissionCacheHandoff&) = delete;
+    bool holds() const;
+    std::uint64_t entries() const;
+    std::uint64_t allocated_bytes() const;   // table capacity + slabs + component-arena capacity
+    std::uint64_t budgeted_bytes() const;
+    void clear();
+    struct Contents;
+    std::unique_ptr<Contents> contents;
+};
+
+// What the most recent handoff did (process-wide; reset with reset_emission_handoff_report, at the start of a run).
+struct EmissionHandoffReport {
+    bool detached = false, offered = false, adopted = false;
+    std::string refusal = "none";   // none, not_offered, context, budget, cache_disabled
+    std::uint64_t entries = 0, allocated_bytes = 0, budgeted_bytes = 0;
+    std::uint64_t inherited_hits = 0;   // cache hits served by inherited entries (live while the adopting context lives)
+};
+EmissionHandoffReport emission_handoff_report();
+void reset_emission_handoff_report();
+
+// I3-A.1: process-global storage a finished sample can leave behind (capacity of process-global containers, plus the
+// calling thread's own scratch), as allocated capacity in bytes. Worker threads' thread-locals end with the workers.
+struct RetainedProcessStorage {
+    std::uint64_t emission_cache_table_bytes = 0;      // entry-table capacity, kept by end_emission_cache's clear()
+    std::uint64_t emission_cache_component_bytes = 0;  // component-arena capacity, likewise
+    std::uint64_t emission_cache_slab_bytes = 0;       // key-byte slabs (freed by end_emission_cache; 0 between samples)
+    std::uint64_t emission_census_bytes = 0;           // the measurement-only emission census table (buckets and nodes)
+    std::uint64_t calling_thread_scratch_bytes = 0;    // this thread's gapped-recursion scratch
+    bool emission_cache_armed = false;
+    std::uint64_t total() const {
+        return emission_cache_table_bytes + emission_cache_component_bytes + emission_cache_slab_bytes +
+               emission_census_bytes + calling_thread_scratch_bytes;
+    }
+};
+RetainedProcessStorage retained_process_storage();
+// Releases that storage (returns what it held before). Refuses -- std::logic_error -- while the emission cache is armed
+// or pinned by a live PreparedScoringContext: it is only for the gap between finished samples.
+RetainedProcessStorage release_sample_retained_storage();
 
 // What the most recently completed scoring pass's cache did. end_emission_cache() tears the table
 // down before any status writer runs, so the figures are retained here rather than recovered by
@@ -882,7 +966,66 @@ struct FragmentScoringOptions {
     // again: the library enters only the combination. The run's own scores are unchanged, and each audit score is,
     // bit for bit, what a run declaring that library computes. Empty: no audit views.
     std::vector<LibraryModel> audit_libraries;
+    // I2-F (EXPERIMENTAL, off by default): the run's own library's combination constants -- log1p(-w) + log(lambda),
+    // log(w), (1 - w) * lambda -- are prepared ONCE per combination call (validated there, through the audit views' own
+    // preparation) instead of being re-validated and re-evaluated per (candidate, fragment) term by the scalar
+    // log_fragment_contribution / expected_signal_fragments. Each prepared constant is the exact subexpression those
+    // functions evaluate, in the same association, so every score component is unchanged bit for bit.
+    bool prepared_library_terms = false;
+    // I2-H (EXPERIMENTAL, off by default): the emitting gapped recursion's implementation for every placement this
+    // run's scoring performs. fixed_geometry_experimental computes the same cells with compile-time geometry and
+    // single assignment, bit for bit; geometries it does not support, and the normaliser, use the scaled reference.
+    GapRecursionBackend gap_recursion_backend = GapRecursionBackend::scaled_reference;
+    // I2-K (EXPERIMENTAL, off by default): the indexed union batch detaches its emission cache into this handoff
+    // instead of discarding it; an adaptive PreparedScoringContext adopts it under an exactly compatible context.
+    EmissionCacheHandoff* emission_handoff_out = nullptr;
+    EmissionCacheHandoff* emission_handoff_in = nullptr;
 };
+
+// I2-F: what preparing the main library's terms removed, summed over combination calls since the last reset (counted
+// once per call from its candidate and fragment counts, never per term). Process-wide; measurement only.
+// I2-G correction: the scalar reference evaluates log1p(-w) and log(lambda) only for terms whose combined mass is finite
+// (fragments_with_mass, already computed per candidate), and log(w) for every term when w > 0; it validates once per
+// term and once per candidate. Preparation evaluates those logarithms and one validation once per call that combines any
+// term. The counts are taken once per call after the combination -- never per term -- and the net is SIGNED: preparation
+// can exceed an empty or nearly empty reference.
+struct PreparedLibraryTermsTally {
+    std::uint64_t combinations = 0;                  // combination calls that used prepared terms
+    std::uint64_t terms = 0;                         // (candidate, fragment) terms combined with them
+    std::uint64_t hypothetical_scalar_logs = 0;      // logarithms the scalar reference would have evaluated
+    std::uint64_t prepared_logs = 0;                 // logarithms preparation evaluated
+    std::int64_t net_logs_avoided = 0;               // hypothetical minus prepared (may be negative)
+    std::uint64_t hypothetical_scalar_validations = 0;
+    std::uint64_t prepared_validations = 0;
+    std::int64_t net_validations_avoided = 0;
+};
+PreparedLibraryTermsTally prepared_library_terms_tally();
+
+// ---- I2-G (MEASUREMENT ONLY): sampled attribution of per-start verification --------------------------------------------
+// Every `period`-th verification request on each worker (deterministic, by a per-worker counter) is split by clock reads
+// into: the union prefilter-decision cache (identity and lookup, plus remembering a new decision), the eligibility and
+// window checks, the executed feasibility kernel, the emission-cache key and lookup, the gapped-emission computation
+// (recursion, normaliser, cache store) and placement-row construction; the rest of the request is reported as such.
+// Executed kernels also record read length, window length, band, verdict and kernel path. Unsampled requests pay one
+// counter increment and a branch. Nothing here changes a verdict, a row or a counter. Off (period 0) by default.
+struct VerificationProfile {
+    std::uint32_t period = 0;
+    std::uint64_t requests = 0;   // every request seen while profiling (sampled or not)
+    std::uint64_t sampled = 0;
+    std::uint64_t ns_total = 0, ns_decision = 0, ns_prechecks = 0, ns_kernel = 0, ns_emission_lookup = 0, ns_dp = 0;
+    std::uint64_t ns_rows = 0;    // of sampled requests; ns_total minus the named parts is the request's remainder
+    std::uint64_t sampled_decision_served = 0, sampled_decision_missed = 0, sampled_decision_unavailable = 0;
+    std::uint64_t sampled_kernels = 0, sampled_kernel_feasible = 0;
+    std::uint64_t sampled_emission_hits = 0, sampled_dps = 0, sampled_accepted = 0, sampled_rows = 0;
+    std::uint64_t kernel_prepared_pattern = 0, kernel_short_read = 0, kernel_edlib = 0;   // sampled kernels by path
+    std::map<std::pair<std::uint32_t, std::uint32_t>, std::pair<std::uint64_t, std::uint64_t>> kernel_shapes;
+    // (read length, window length) -> (sampled executed kernels, of which feasible)
+    std::size_t band = 0;
+};
+void set_verification_profile_period(std::uint32_t period);   // 0: off
+void reset_verification_profile();
+VerificationProfile verification_profile_snapshot();
+void reset_prepared_library_terms_tally();
 
 struct OriginSummary {
     std::uint64_t origins = 0;
@@ -1547,6 +1690,28 @@ struct ParallelEnumerationStats {
     std::uint64_t duplicate_scan_bases = 0;     // window scanning repeated by workers 1..W-1
 };
 
+// I2-B (EXPERIMENTAL): round-local fine discovery inside the adaptive search's window enumeration
+// (PreparedScoringContext::enable_fine_window_discovery). Tallies are cumulative over the search. seconds_rows /
+// seconds_pairing time every production window enumeration, either path, summed over enumeration workers (worker
+// elapsed); `enumerations` counts windows enumerated.
+struct FineWindowReport {
+    bool enabled = false;
+    std::uint64_t budget_bytes = 0, served_cap = 0;
+    std::uint64_t rounds = 0;
+    std::uint64_t worker_windows = 0, fallback_windows = 0;   // per worker store: windows built, of which by the reference
+    std::uint64_t units_discovered = 0, units_served = 0, units_not_retained = 0;
+    std::uint64_t placements_discovered = 0, placements_served = 0, hash_collisions = 0;
+    // A container ledger, not process memory. RETAINED (held, what the budget bounds): the held units' byte capacity, their
+    // rows' allocated capacity, an ESTIMATED 48 bytes per hash node and the bucket array. TEMPORARY: the reusable discovery
+    // scratch (rows, proposals, touched lists), units used once and not retained, and each window's candidate unit copies.
+    // Each is the max over rounds of the workers' summed per-round peaks (the workers' peaks need not coincide in time).
+    std::uint64_t round_peak_bytes = 0;            // retained + temporary
+    std::uint64_t round_peak_held_bytes = 0;       // retained only
+    std::uint64_t round_peak_temporary_bytes = 0;  // temporary only
+    std::uint64_t enumerations = 0;
+    double seconds_rows = 0.0, seconds_pairing = 0.0;
+};
+
 struct ContextMemoryAccount {
     std::uint64_t slots_total = 0;
     std::uint64_t slots_live = 0;
@@ -1593,9 +1758,17 @@ public:
     // `reuse_released_slots` places new sequences into released repair slots before appending any, as a repair
     // does, so a caller that places and releases repeatedly (a tie-branch start materialised just in time) does
     // not grow the slot table. Off by default: every other caller's slot numbering is unchanged.
+    // `retain_censuses` (I2-D): the batch's resulting slots also keep their origin censuses, captured during the SAME
+    // placement pass for every slot this batch places (one placement per distinct new sequence; byte-identical
+    // sequences share one slot and one census). A slot that was already held without a census is censused as
+    // retain_census does; one already holding a census is left as it is. Off: unchanged.
     std::vector<std::size_t> add_haplotypes(const std::vector<std::string>& sequences,
                                             IncrementalBatchReport* report = nullptr,
-                                            bool reuse_released_slots = false);
+                                            bool reuse_released_slots = false,
+                                            bool retain_censuses = false);
+    // I2-D: full haplotype placements this context has performed (one per slot add_haplotypes places, one per
+    // retain_census that places). Measurement and gates only.
+    std::uint64_t full_placement_count() const;
 
     // Combination from the retained columns. No placement happens here, so this is cheap and may be
     // rerun over any candidate set the context already holds haplotypes for.
@@ -1648,6 +1821,14 @@ public:
     // Routes add_repaired_haplotype through the window-origin cache and the preaggregated sorted
     // merge. Off by default, in which case the stage-5 code runs unchanged.
     void enable_origin_cache_path(bool enabled);
+    // I2-B (EXPERIMENTAL, off by default): within each add_repaired_haplotypes round, every window enumeration builds its
+    // raw placement rows from a round-local, per-enumeration-worker fine store (FineWindowReport) instead of scanning the
+    // whole window; pairing, filtering, merging and reduction are unchanged, and so is every row. `budget_bytes` bounds
+    // the stores' allocated capacity (split evenly across workers); `max_served_placements` caps placements served from
+    // them over the search (crossing it refuses). Single add_repaired_haplotype calls outside a round, full placements
+    // and every self-check keep the reference path.
+    void enable_fine_window_discovery(std::size_t budget_bytes, std::uint64_t max_served_placements);
+    FineWindowReport fine_window_report() const;
     // Bytes the origin cache may retain (0: retain nothing, recompute every window exactly), and a cap
     // on cached origin records CONSUMED over the search (0: none). Crossing the budget stops
     // retention only; crossing the consumption cap refuses, like every other declared cap.
@@ -1701,6 +1882,13 @@ public:
     // Retains an origin census for this haplotype, so a later round may delta from it.
     void retain_census(std::size_t haplotype);
     bool holds_census(std::size_t haplotype) const;
+    // MEASUREMENT ONLY (S0 diagnostics): the retained census of `haplotype`, or null when none is held. Read-only;
+    // never consulted by a score, a delta or a cache.
+    const HaploidOriginCensus* census_view(std::size_t haplotype) const;
+    // MEASUREMENT ONLY (S0 diagnostics): appends `sequences` (no dedup against held slots; the caller passes distinct
+    // bytes) and places them in parallel exactly as add_haplotypes does, with a census captured for every one.
+    // Returns the slots, in order. Same placement core, band and caps; never used by a caller of the scorer.
+    std::vector<std::size_t> add_haplotypes_with_censuses(const std::vector<std::string>& sequences);
 
     // Releases every haplotype added since the last checkpoint that is not named in `keep`: its
     // sequence, its reversed copy, its mass column and its census. Safe because every cache entry
@@ -1714,10 +1902,227 @@ public:
     // transient_payload_bytes counts it; 0 for a released slot. What a caller keeping the slot alive retains.
     std::uint64_t slot_payload_bytes(std::size_t slot) const;
     std::uint64_t retained_census_bytes() const;
+    // I4-C: the transient slots that currently hold anything (sequence, mass column, segment or census), ascending.
+    std::vector<std::size_t> live_transient_slots() const;
+    // I4-C: releases exactly the named transient slots (each must be a live slot added since the last checkpoint), with
+    // the same per-slot release as release_transient -- and the group and full aggregates keyed by them as incumbent.
+    // Nothing else is touched. Used to give back a rejected tie-branch seed's own slots at once.
+    void release_slots(const std::vector<std::size_t>& slots);
 
 private:
+    void release_slot_storage(std::size_t slot);   // I4-C: the one per-slot release both public releases use
     struct State;
     std::unique_ptr<State> state_;
 };
+
+// ---- EXPERIMENTAL (I1): shared-content placement index -------------------------------------------------------------
+//
+// Outside every production route. A start s of a read form on a strand text T is proposed and verified from the bytes of
+// D(s) = [s - g, s + L + g) alone (piece hits implying s lie in it; the verification window is [s, s + min(available,
+// L + g)), with the normaliser clamped at L + g), plus clipping where D(s) meets an end of T. So each strand of each
+// haplotype decomposes into content UNITS, each evaluated once per read batch with the scorer's own proposal and
+// verification (collect_form_placements) and then expanded to every occurrence:
+//   * a segment interior (strand, bytes): it keeps the starts whose whole D(s) lies inside the segment;
+//   * a boundary window (strand, bytes of T[b - W, b + W) clipped to T, whether that clip reached either end of T, and b's
+//     offset in the window), W = max read length + 2g, for every segment boundary b and both ends of T: it keeps the
+//     starts whose D(s) crosses b -- all of D(s) lies in the window, so the result is the text's own.
+// Every start falls in one of the two (D(s) crosses some boundary or end, or lies inside one segment); a start owned by
+// several windows is the same placement and is kept once. Copies are separate occurrences at separate starts, so copy
+// multiplicity is kept. Unit keys are compared byte for byte (the hash only selects). Pairing, physical origins,
+// reduction, exposure and the diploid combination are the scorer's own.
+struct ContentIndexReport {
+    std::uint64_t haplotypes = 0;
+    std::uint64_t segment_occurrences = 0, window_occurrences = 0;   // registered, both strands
+    std::uint64_t interior_units = 0, window_units = 0;              // distinct
+    std::uint64_t unit_bytes = 0;                                    // distinct unit bytes held
+    std::uint64_t occurrence_bytes = 0;
+    std::uint64_t hash_collisions = 0;                               // equal hash, different key: separated by bytes
+    double seconds_registration = 0.0;                               // cumulative add_haplotype wall time
+    // I1.4 fine discovery: distinct fine units, their text bytes and owned core bytes; fine pieces registered over all
+    // distinct coarse interiors; distinct coarse interior and window bytes.
+    std::uint64_t fine_units = 0, fine_unit_bytes = 0, fine_core_bytes = 0, fine_occurrences = 0;
+    std::uint64_t coarse_interior_bytes = 0, window_bytes = 0;
+};
+
+class ContentPlacementIndex {
+public:
+    // Bound to a maximum read length and max_gap_bp: windows are sized from both, and a batch with longer reads or a
+    // different gap is refused.
+    // fine_discovery (I1.4): coarse interior segments are discovered through content-defined fine units (owned cores
+    // with their dependency context) and their placement rows reconstructed; everything downstream is unchanged.
+    ContentPlacementIndex(std::size_t max_read_bp, std::size_t max_gap_bp, bool fine_discovery = false);
+    ~ContentPlacementIndex();
+    ContentPlacementIndex(const ContentPlacementIndex&) = delete;
+    ContentPlacementIndex& operator=(const ContentPlacementIndex&) = delete;
+    // Registers one distinct haplotype sequence with a segmentation (lengths summing to its length; zeros allowed) and
+    // returns its slot. Any segmentation is exact; a finer one shares more.
+    std::size_t add_haplotype(const std::string& bases, const std::vector<std::uint32_t>& segment_lengths);
+    std::size_t haplotype_count() const;
+    std::size_t unit_count() const;
+    ContentIndexReport report() const;
+    struct State;
+    std::unique_ptr<State> state_;
+};
+
+void set_content_index_hash_collapse(bool collapse);   // TEST ONLY: one hash for every content unit
+// I2-C TEST ONLY: request spare capacity per stored vector (unused capacity the ledger must charge), and the negative
+// control that charges occupied rows only.
+void set_store_spare_capacity(std::size_t slots);
+void set_store_charge_rows_only(bool on);
+// I2-B TEST ONLY: compare every fine window's raw rows with the reference's two scans (throws std::logic_error on a
+// difference); and deliberately break ownership or context (0: none; 1 overlap; 2 left context; 3 right context; 4 end
+// window) so the comparison can be shown to catch it.
+void set_fine_window_row_check(bool on);
+void set_fine_window_mutation(int mutation);
+
+struct ContentBatchReport {
+    std::uint64_t units_evaluated = 0, unit_bases_scanned = 0, discovery_calls = 0;
+    std::uint64_t proposed_starts = 0, unique_starts = 0, full_read_verifications = 0, dp_evaluations = 0;
+    std::uint64_t unit_placements_accepted = 0, unit_placements_kept = 0, placement_store_bytes = 0;
+    // I2-K (measurement): the emission cache as discovery left it, just before it was discarded -- entries held and the
+    // storage actually allocated (table capacity, key-byte slabs, component-arena capacity) and the budgeted bytes.
+    std::uint64_t emission_cache_entries_held = 0, emission_cache_table_bytes = 0, emission_cache_slab_bytes = 0,
+                  emission_cache_component_bytes = 0, emission_cache_budgeted_bytes = 0;
+    double seconds_discovery = 0.0;                       // wall, cumulative over discover() calls
+    double worker_seconds_scan = 0.0, worker_seconds_sort = 0.0, worker_seconds_verification = 0.0;
+    double seconds_expansion_and_pairing = 0.0;           // wall, last score()
+    double worker_seconds_expansion = 0.0, worker_seconds_pairing = 0.0;
+    std::uint64_t expanded_placements = 0, duplicate_placements_removed = 0, physical_origins = 0, state_classes = 0;
+    double seconds_candidate_scoring = 0.0;
+    // I1.1: the read batch's exact prefilter-decision cache (FragmentScoringOptions::union_prefilter_cache_bytes):
+    // "on", "off", or an explicit fallback to uncached discovery; its report is cumulative over discover() calls.
+    std::string prefilter_status = "off";
+    UnionPrefilterCacheReport prefilter;
+    std::uint64_t executed_prefilters = 0, executed_dps = 0, prefilter_rejections = 0;   // executed work    // I1.2: interior-origin reuse (FragmentScoringOptions::union_origin_cache_bytes as the batch's declared budget):
+    // aggregates built from this batch's verified unit placements by the reference's own phase-2 builder, merged at
+    // every occurrence through guarded zones. physical_origins is then direct + served (logical).
+    std::string origin_reuse_status = "off";
+    std::uint64_t origin_budget_bytes = 0, origin_held_bytes = 0;
+    std::uint64_t origin_entities_eligible = 0, origin_entities_built = 0, origin_entities_admitted = 0, origin_entities_declined = 0;
+    std::uint64_t origins_constructed = 0, direct_physical_origins = 0, served_physical_origins = 0, zones_applied = 0;
+    double seconds_origin_construction = 0.0;
+    // I1.3: retention (append-only, within this context). *_last: the last score() call; *_total: cumulative.
+    // physical_origins, state_classes, expanded_placements and the origin split are totals over every completed slot.
+    std::uint64_t columns_computed_last = 0, columns_computed_total = 0, columns_retained_last = 0;
+    std::uint64_t pairs_requested_last = 0, pairs_computed_last = 0, pairs_computed_total = 0, retained_pairs = 0;
+    std::uint64_t retained_column_bytes = 0, retained_pair_bytes = 0;
+    double seconds_pair_lookup_and_combination = 0.0, seconds_materialisation = 0.0;
+    // I1.4: discovery work under fine units
+    std::uint64_t units_discovered_directly = 0, owned_starts_skipped_before_verification = 0;
+    std::uint64_t coarse_units_reconstructed = 0, reconstructed_placements = 0;
+    double seconds_reconstruction = 0.0;
+    // I2-A: guards and executed work, in the reference's terms. Discovery: piece hits and haplotype bases walked
+    // (cumulative), the placement store charged against its declared budget (stored rows, coarse plus fine, x row size;
+    // 0: no budget) and the workers that ran. score(): `counters_last` is the last call's EXECUTED work -- discovery's
+    // (cumulative) seeding counters, and the origins, state classes, latent pairs and valid states actually enumerated
+    // by direct pairing and by aggregate construction -- with what was SERVED in its reused_* fields and the merged
+    // (logical) census in merged_state_classes, as the reference reports its phase-2 pass. The acceptance caps are held
+    // to these executed totals; the served and expanded quantities are held to the consumption caps.
+    std::uint64_t piece_hits = 0, candidate_bases_scanned = 0;
+    std::uint64_t store_budget_bytes = 0, store_charged_bytes = 0;
+    std::size_t threads_used_discovery = 0, threads_used_pairing = 0;
+    FragmentScoringCounters counters_last;
+    std::uint64_t placements_consumed_last = 0;   // expanded placements served from the store (cap: cached placements)
+    std::uint64_t origins_consumed_last = 0, states_consumed_last = 0;   // served at zones (caps: cached origins/states)
+    std::uint64_t physical_origins_observed = 0;  // the shared in-flight origin count (what a refusal saw)
+    EmissionCacheCounters emission_cache;         // cumulative over discover() calls
+    // I2-C: the placement-store ledger (see ContentIndexBatch::State): per-unit rows' allocated capacity plus the per-unit
+    // container's capacity -- a container ledger, NOT process memory. live: now; peak: the most held at once (fine and
+    // coarse rows overlap during reconstruction); allocated / released: cumulative. worker_scratch_bytes: the workers'
+    // temporary discovery buffers (rows, proposals, the per-unit buffer) held at once, plus reconstruction's use counts --
+    // temporary, outside the budget. store_charged_bytes is what the budget was charged: allocated capacity (exact
+    // layout) or occupied rows (legacy).
+    std::string store_layout = "exact";
+    std::uint64_t store_live_bytes = 0, store_peak_bytes = 0, store_allocated_bytes = 0, store_released_bytes = 0;
+    std::uint64_t reconstruction_peak_bytes = 0, worker_scratch_bytes = 0;
+    // I4-B (EXPERIMENTAL): "reconstructed" (coarse interior rows copied from their fine pieces) or "fine_views" (coarse
+    // interior units served as views over the fine units' shared rows; nothing copied). Under views: the coarse units
+    // served as views, the rows they represent (what reconstruction would have copied), the view table's charged bytes
+    // (store metadata), and the origin-zone gathers -- the representation's transition-time copies, charged to the store
+    // ledger while they exist -- their peak simultaneous bytes, cumulative bytes and gather time.
+    std::string evidence_layout = "reconstructed";
+    std::uint64_t view_coarse_units = 0, view_rows_represented = 0, view_table_bytes = 0;
+    std::uint64_t view_zone_temporary_peak_bytes = 0, view_zone_temporary_bytes_total = 0;
+    double seconds_view_zone_gather = 0.0;
+};
+
+class ContentIndexBatch {
+public:
+    // One read batch over a prepared index (the index is shared, not copied; it must outlive the batch).
+    ContentIndexBatch(const ContentPlacementIndex& index, std::vector<ReadPair> fragments, LibraryModel library,
+                      FragmentScoringOptions options);
+    ~ContentIndexBatch();
+    ContentIndexBatch(const ContentIndexBatch&) = delete;
+    ContentIndexBatch& operator=(const ContentIndexBatch&) = delete;
+    // Proposes and verifies every unit of the index this batch has not evaluated yet (all, first; only new units after
+    // the index grew).
+    void discover();
+    // Expands, pairs and scores; candidate members are index slots. Requires every unit discovered.
+    FragmentScoringResult score(const std::vector<HaplotypeCandidate>& candidates);
+    // I1.3: completed slot columns and pair likelihoods are retained across score() calls (the default). false
+    // reproduces I1.2: every call re-expands and re-pairs every slot and recombines every requested pair.
+    void set_retention(bool retain);
+    // I2-A: a declared byte budget for the placement store (stored rows x row size, fine and coarse); crossing it
+    // refuses with ResourceExhausted and no ranking. 0 (the default): no budget, as before.
+    void set_placement_store_budget(std::size_t bytes);
+    // I2-A: one discovery pass only. After it the fine units' rows -- needed only to reconstruct coarse units added
+    // later -- are released, and a later discover() that finds new units is refused (std::logic_error).
+    void set_one_shot(bool one_shot);
+    // I2-C: the I2-A layout (push_back growth, the budget charging occupied rows), for comparison only. Default: exact.
+    void set_legacy_store_layout(bool legacy);
+    // I4-B (EXPERIMENTAL): serve coarse interior units as views over their fine pieces' rows instead of reconstructing
+    // copied coarse rows (fine discovery and the exact layout only). The fine rows are then kept until the batch ends.
+    // Masses, exposures, scores and every cap's executed and served work are unchanged; the store holds the distinct
+    // evidence (fine and window rows), the view table and in-flight origin-zone gathers.
+    void set_fine_views(bool on);
+    // TEST ONLY: an independent recount of the placement containers' allocated capacity (what the ledger must equal).
+    std::uint64_t store_capacity_recount() const;
+    const ContentBatchReport& report() const;
+    // TEST ONLY: every discovered coarse interior unit's placement rows, keyed by strand and bytes.
+    std::map<std::string, std::vector<std::tuple<std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t, double>>>
+    interior_placement_rows() const;
+    struct State;
+    std::unique_ptr<State> state_;
+};
+
+// ---- I2-A (EXPERIMENTAL): the I1.4 indexed route at the caller's one-shot union boundary ----------------------------
+// A thin adapter with score_diplotypes' contract: the same inputs, the same result structure (scores, audit scores,
+// masses, exposures, counters, phase timings, workers, cache reports) and the same refusal semantics -- a declared cap
+// throws ResourceExhausted with no ranking, after filling `observed_on_failure`. It builds a fine-discovery
+// ContentPlacementIndex over `segments` (per unique haplotype, summing to its length) and one ContentIndexBatch,
+// discovers once and scores once, then releases both before returning or rethrowing: nothing indexed outlives the call.
+//
+// Guards, each the reference's own where one applies:
+//   * input validation and positive caps (score_diplotypes' rules); per-origin and per-haplotype diagnostics refused;
+//   * max_mass_cells, before any column is allocated;
+//   * max_piece_hits in flight (shared, batched publication) during discovery; max_proposed_starts_per_haplotype per
+//     discovered TEXT (a unit is a substring of a haplotype, so it bounds the same per-call buffer, but a haplotype the
+//     reference would refuse may pass: no refusal equivalence is claimed);
+//   * max_physical_origins in flight over direct pairing AND aggregate construction (both executed work);
+//   * the acceptance caps (piece hits, physical origins, state classes, latent pairs) on the merged executed totals;
+//   * union_origin_cache_bytes bounds the held aggregates; served origins and state aggregates are charged to
+//     max_union_cached_origins_consumed / max_union_cached_states_consumed (both required positive when it is on);
+//   * every expanded placement is served from the store, so all of them are charged to
+//     max_union_cached_placements_consumed (required positive);
+//   * union_prefilter_cache_bytes / max_union_cached_prefilters_consumed: the shared decision cache and its in-flight
+//     cap; mixed read lengths are refused exactly as the reference refuses them (no silent uncached fallback);
+//   * `store_budget_bytes` (required positive) bounds the placement store, fine and reconstructed coarse rows.
+// Counters are EXECUTED work (ContentBatchReport::counters_last); they need not equal the reference's, and a cap can
+// refuse on one route and not on the other. Score identity is not resource-policy equivalence.
+struct IndexedUnionReport {
+    std::size_t max_read_bp = 0, store_budget_bytes = 0;
+    double seconds_index_build = 0.0, seconds_preparation = 0.0, seconds_release = 0.0;
+    std::string refusal;   // the ResourceExhausted message, if the call was refused
+    ContentIndexReport index;
+    ContentBatchReport batch;
+};
+FragmentScoringResult score_diplotypes_indexed_union(const InternedHaplotypes& haplotypes,
+                                                     const std::vector<HaplotypeCandidate>& candidates,
+                                                     const std::vector<ReadPair>& fragments, const LibraryModel& library,
+                                                     const FragmentScoringOptions& options,
+                                                     const std::vector<std::vector<std::uint32_t>>& segments,
+                                                     std::size_t store_budget_bytes, IndexedUnionReport* report = nullptr,
+                                                     FragmentScoringObservation* observed_on_failure = nullptr,
+                                                     bool legacy_store_layout = false, bool fine_views = false);
 
 } // namespace panvar

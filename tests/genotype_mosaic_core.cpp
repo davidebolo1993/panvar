@@ -584,6 +584,99 @@ void test_sequence_equivalent_prior_aggregation() {
 
 } // namespace
 
+// The conceded review points (Astra, 2026-10-15), as mathematical counterexamples on the production prior and the
+// existing brute-force history helpers. Each has a negative control that a wrong implementation or a wrong premise
+// would fail. Verified quantities are named in each message.
+void test_conceded_counterexamples() {
+    // (a) Distant evidence does not factorize along an adjacent chain. One fragment with additive placement mass
+    // m1(a1) + m3(a3) on blocks 1 and 3 (block 2 monomorphic between them) contributes c*(m1 + m3) + beta. With
+    // m1 = (1, 2), m3 = (2, 3), c = 1, beta = 0 that factor is [[3,4],[4,5]]: rank 2, so no g(a1)*h(a3) through
+    // the single block-2 state equals it. Control: a distant component that is invariant across the pool (m3 equal
+    // for both alleles) leaves a rank-1 factor, which does factorize -- invariant contributions only shift beta.
+    {
+        const auto factor = [](const double m1[2], const double m3[2], double c, double beta) {
+            std::vector<std::vector<double>> f(2, std::vector<double>(2));
+            for (int a = 0; a < 2; ++a) for (int b = 0; b < 2; ++b) f[a][b] = c * (m1[a] + m3[b]) + beta;
+            return f;
+        };
+        const double m1[2] = {1.0, 2.0}, varying[2] = {2.0, 3.0}, invariant[2] = {2.5, 2.5};
+        const auto f = factor(m1, varying, 1.0, 0.0);
+        require(f[0][0] == 3.0 && f[0][1] == 4.0 && f[1][0] == 4.0 && f[1][1] == 5.0, "(a) fixture is [[3,4],[4,5]]");
+        const double det = f[0][0] * f[1][1] - f[0][1] * f[1][0];
+        require(det != 0.0, "(a) a varying distant component must give a rank-2 (non-factorizable) evidence factor");
+        // the best attempt through one chain state: g(a1) = f[a1][0], h(a3) = f[0][a3] / f[0][0] -- fails at (1,1)
+        require(std::abs(f[1][0] * f[0][1] / f[0][0] - f[1][1]) > 0.3, "(a) chain reconstruction must fail");
+        const auto g = factor(m1, invariant, 1.0, 0.0);
+        require(std::abs(g[0][0] * g[1][1] - g[0][1] * g[1][0]) < 1e-12,
+                "(a) control: an invariant distant component must leave a rank-1 factor");
+    }
+
+    // (b) Allele states are not Markov under Li-Stephens copying. Donors 000 and 101: after a1 = 1, a2 = 0 the copied
+    // donor is most likely 101, so a3 = 1 is likely; after a1 = 0, a2 = 0 it is most likely 000. P(a3 | a2, a1) then
+    // depends on a1. Control: r = 1 copies every block independently, and the dependence vanishes.
+    {
+        panvar::PanelAlleleMatrix panel;
+        panel.template_names = {"d000", "d101"};
+        panel.template_alleles = {{0, 0, 0}, {1, 0, 1}};
+        const auto conditional = [&](double r, std::size_t a1) {
+            const std::vector<double> rr{r, r};
+            const double p1 = std::exp(panvar::log_haploid_mosaic_prior(panel, panvar::MosaicPath{{a1, 0, 1}}, rr));
+            const double p0 = std::exp(panvar::log_haploid_mosaic_prior(panel, panvar::MosaicPath{{a1, 0, 0}}, rr));
+            return p1 / (p0 + p1);   // P(a3 = 1 | a1, a2 = 0)
+        };
+        const double after1 = conditional(0.1, 1), after0 = conditional(0.1, 0);
+        require(after1 > 0.9 && after0 < 0.1,
+                "(b) P(a3=1 | a2=0) must depend on a1 under copying (allele states are not a Markov chain)");
+        require(std::abs(conditional(1.0, 1) - conditional(1.0, 0)) < 1e-12,
+                "(b) control: at r = 1 the allele process is independent and the dependence must vanish");
+    }
+
+    // (c) Summed history probability and best history rank sequences differently. Panel (5 templates, 4 blocks,
+    // r = 0.9): 0101 has the larger summed prior but 0001 (a duplicated donor) has the larger single history. The
+    // production prior must rank as the sum (it is the sum, brute-checked), so a best-history implementation is
+    // detectably wrong on this fixture. Control: at r = 0 every sequence is one donor copy and the two orders agree.
+    {
+        panvar::PanelAlleleMatrix panel;
+        panel.template_names = {"t0", "t1", "t2", "t3", "t4"};
+        panel.template_alleles = {{1, 1, 1, 0}, {0, 0, 0, 1}, {0, 1, 1, 1}, {0, 0, 0, 1}, {1, 1, 0, 1}};
+        const std::vector<double> r(3, 0.9);
+        const panvar::MosaicPath summed_winner{{0, 1, 0, 1}}, best_history_winner{{0, 0, 0, 1}};
+        const long double sum_a = brute_haploid_prior(panel, summed_winner, r);
+        const long double sum_b = brute_haploid_prior(panel, best_history_winner, r);
+        const long double best_a = brute_best_haploid_history(panel, summed_winner, r);
+        const long double best_b = brute_best_haploid_history(panel, best_history_winner, r);
+        require(sum_a > sum_b * 1.1L && best_b > best_a * 1.5L, "(c) fixture must flip the sum and max orders");
+        require(panvar::log_haploid_mosaic_prior(panel, summed_winner, r) >
+                    panvar::log_haploid_mosaic_prior(panel, best_history_winner, r),
+                "(c) the production prior must rank by summed histories, not by the best history");
+        const std::vector<double> r0(3, 0.0);
+        const panvar::MosaicPath donor{{0, 0, 0, 1}}, other{{1, 1, 1, 0}};
+        require((brute_haploid_prior(panel, donor, r0) > brute_haploid_prior(panel, other, r0)) ==
+                    (brute_best_haploid_history(panel, donor, r0) >= brute_best_haploid_history(panel, other, r0)),
+                "(c) control: at r = 0 the summed and best-history orders must agree");
+    }
+
+    // (d) Neutral subdivision is not neutral. Inserting a monomorphic block between two blocks composes two copying
+    // steps of r into one of 1 - (1 - r)^2: 0.01 becomes 0.0199. Control: r = 1 is a fixed point of the composition.
+    {
+        panvar::PanelAlleleMatrix two, three;
+        two.template_names = three.template_names = {"h0", "h1", "h2"};
+        two.template_alleles = {{0, 0}, {1, 1}, {0, 1}};
+        three.template_alleles = {{0, 7, 0}, {1, 7, 1}, {0, 7, 1}};
+        for (const panvar::MosaicPath& p : {panvar::MosaicPath{{1, 0}}, panvar::MosaicPath{{0, 0}}}) {
+            const panvar::MosaicPath p3{{p.alleles[0], 7, p.alleles[1]}};
+            const double subdivided = panvar::log_haploid_mosaic_prior(three, p3, {0.01, 0.01});
+            require_close(subdivided, panvar::log_haploid_mosaic_prior(two, p, {0.0199}), 1e-14,
+                          "(d) a monomorphic subdivision must compose r = 0.01 into 0.0199");
+            require(std::abs(subdivided - panvar::log_haploid_mosaic_prior(two, p, {0.01})) > 1e-4,
+                    "(d) the subdivided prior must differ from the undivided one at r = 0.01");
+            require_close(panvar::log_haploid_mosaic_prior(three, p3, {1.0, 1.0}),
+                          panvar::log_haploid_mosaic_prior(two, p, {1.0}), 1e-14,
+                          "(d) control: r = 1 is invariant under subdivision");
+        }
+    }
+}
+
 int main() {
     try {
         test_library_model();
@@ -591,6 +684,7 @@ int main() {
         test_mosaic_spelling();
         test_li_stephens_prior();
         test_sequence_equivalent_prior_aggregation();
+        test_conceded_counterexamples();
         std::cout << "genotype mosaic core: PASS\n";
         return 0;
     } catch (const std::exception& error) {

@@ -3,6 +3,8 @@
 // presenting a partial ranking, and the model fingerprint identifies the model rather than the run.
 
 #include "panvar/genotype_command.hpp"
+#include "panvar/prepared_locus.hpp"
+#include "panvar/prepared_locus_file.hpp"
 #include "panvar/integrated_snarls.hpp"
 #include "panvar/graph_sort.hpp"
 #include "panvar/gfa_io.hpp"
@@ -16,7 +18,9 @@
 // number keeps the test honest if the batch is ever retuned.
 #include "panvar/fragment_likelihood.hpp"
 #include "panvar/genotype_repair.hpp"
+#include "panvar/verification_census.hpp"
 
+#include <cstdlib>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -32,6 +36,7 @@
 #include <set>
 #include <optional>
 #include <random>
+#include <regex>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -2869,12 +2874,1076 @@ void test_profile(const std::string& source_dir) {
     std::cout << "  profile: committed C4 profile applied and hashed; malformed profiles refused\n";
 }
 
+
+// ---- I2-A (EXPERIMENTAL): the indexed union backend at the caller -------------------------------------------------
+// Default off and invisible; when selected, every scientific output equals the reference backend's in the same binary
+// (byte for byte, files and status) at 1 and 4 threads, through the adaptive repair; only backend provenance, executed
+// work, cache, memory and time keys may differ. A refusal on the indexed route ends RESCORE_INCOMPLETE with no ranking.
+void with_union_caches(panvar::GenotypeCommandOptions& o) {
+    o.union_placement_cache_bytes = std::size_t{64} << 20;
+    o.max_union_cached_placements_consumed = std::uint64_t{1} << 40;
+    o.union_origin_cache_bytes = std::size_t{64} << 20;
+    o.max_union_cached_origins_consumed = std::uint64_t{1} << 40;
+    o.max_union_cached_states_consumed = std::uint64_t{1} << 40;
+    o.union_prefilter_cache_bytes = std::size_t{16} << 20;
+    o.max_union_cached_prefilters_consumed = std::uint64_t{1} << 40;
+}
+
+bool indexed_allowed_key(const std::string& key) {
+    // perf_compare.py's DIAGNOSTIC class (time, memory, cache, executed work, profile identity), plus the indexed
+    // backend's own provenance block and the executed accepted-placement count
+    static const std::regex diagnostic(
+        "(^seconds|_seconds$|seconds_|wall|rss|footprint|phys_|_gib|timing|cache|cached|scratch|_hits$|_misses$|"
+        "^profile$|^profile_name$|^profile_sha256$|^physical_origins$|^statistical_state_classes$|^merged_state_classes$|"
+        "^piece_hits$|^reused_|^scorer_|^threads_peak|^resources_|^repair_cumulative_|^repair_margin_|_peak_bytes$|"
+        "^max_union_|^union_|^emission_|^start_sort|^repair_origin_cache|^tie_seed_|^tie_branch_physical|"
+        "^representation_guard_physical_origins$|^marker_lookup|^seeding_|"
+        "^candidate_bases_scanned$|^dp_evaluations$|^full_read_verifications$|^prefilter_rejections$|^proposed_starts$|"
+        "^unique_starts$|^valid_fr_states$|^threads_start_sort_|"
+        "^indexed_union_|^threads_indexed_union_|^union_scoring_backend|^accepted_mate_placements$|"
+        // I2-B: the adaptive window-discovery block (provenance, work, memory, time)
+        "^adaptive_window_|^adaptive_fine_|^worker_seconds_adaptive_|"
+        // I2-D: the fused-seed provenance key and its full-placement work counter
+        "^adaptive_fused_seed$|^adaptive_full_placements$|"
+        // I2-E: the marker-proposal reuse block (work and storage)
+        "^marker_proposal_|"
+        // I2-F: the prepared-combination block (provenance and work)
+        "^combination_|"
+        // I2-H: the recursion-backend provenance keys
+        "^gap_recursion_backend|"
+        // I2-K: the emission-handoff provenance and work block
+        "^adaptive_emission_handoff|"
+        // I3-A: the prepared-locus provenance
+        "^prepared_locus)");
+    return std::regex_search(key, diagnostic);
+}
+
+void require_same_science(const std::string& a, const std::string& b, const std::string& label) {
+    for (const char* suffix : {".genotypes.tsv", ".block_genotypes.tsv", ".mosaic_candidates.tsv", ".mosaic_scores.tsv",
+                               ".mosaic_haplotypes.fa", ".equivalence_set.tsv", ".locus_genotype.tsv",
+                               ".library_sensitivity.tsv"}) {
+        require(exists(path(a + suffix)) == exists(path(b + suffix)), label + ": " + suffix + " present in one run only");
+        if (exists(path(a + suffix))) {
+            // the run's own prefix (FASTA record names, haplotype ids) differs by name only
+            const auto placeheld = [](std::string text, const std::string& prefix) {
+                for (std::size_t at = text.find(prefix); at != std::string::npos; at = text.find(prefix, at + 5)) {
+                    text.replace(at, prefix.size(), "<RUN>");
+                }
+                return text;
+            };
+            require(placeheld(slurp(path(a + suffix)), path(a)) == placeheld(slurp(path(b + suffix)), path(b)),
+                    label + ": " + suffix + " differs");
+        }
+    }
+    const auto sa = read_status(path(a + ".mosaic_status.tsv")), sb = read_status(path(b + ".mosaic_status.tsv"));
+    std::set<std::string> keys;
+    for (const auto& kv : sa) keys.insert(kv.first);
+    for (const auto& kv : sb) keys.insert(kv.first);
+    for (const std::string& key : keys) {
+        if (indexed_allowed_key(key)) continue;
+        const auto x = sa.find(key), y = sb.find(key);
+        require(x != sa.end() && y != sb.end(), label + ": status key '" + key + "' present in one run only");
+        // the run's own output prefix differs by name only
+        std::string vx = x->second, vy = y->second;
+        for (std::string* v : {&vx, &vy}) {
+            for (const std::string& name : {a, b}) {
+                const std::size_t at = v->find(path(name));
+                if (at != std::string::npos) v->replace(at, path(name).size(), "<RUN>");
+            }
+        }
+        require(vx == vy, label + ": status key '" + key + "' differs: " + x->second + " vs " + y->second);
+    }
+}
+
+void test_indexed_union_backend() {
+    const std::string r1 = path("r1.fq"), r2 = path("r2.fq");
+    // default off: no backend key in the status or the settings table
+    panvar::GenotypeCommandOptions plain = tiny_options("ix_default", r1, r2);
+    with_union_caches(plain);
+    require(panvar::run_genotype(plain) == panvar::GenotypeRunStatus::Complete, "fixture: the default run must call");
+    const auto plain_status = read_status(path("ix_default.mosaic_status.tsv"));
+    for (const auto& kv : plain_status) {
+        require(kv.first.rfind("indexed_union_", 0) != 0 && kv.first.rfind("union_scoring_backend", 0) != 0 &&
+                    kv.first.rfind("threads_indexed_union_", 0) != 0,
+                "a default run must not report the experimental backend (" + kv.first + ")");
+    }
+    require(slurp(path("ix_default.settings.tsv")).find("union_scoring_backend") == std::string::npos &&
+                slurp(path("ix_default.settings.tsv")).find("indexed_union_store_bytes") == std::string::npos,
+            "a default run's settings table must not list the experimental keys");
+
+    // selected: same science at 1 and 4 threads, without and with the adaptive repair
+    const auto indexed = [&](panvar::GenotypeCommandOptions o) {
+        o.union_scoring_backend = "indexed_fine_experimental";
+        o.indexed_union_store_bytes = std::size_t{256} << 20;
+        o.setting_sources["union_scoring_backend"] = "profile test";
+        o.setting_sources["indexed_union_store_bytes"] = "profile test";
+        return o;
+    };
+    for (const std::size_t threads : {std::size_t{1}, std::size_t{4}}) {
+        const std::string name = "ix_indexed_t" + std::to_string(threads);
+        panvar::GenotypeCommandOptions o = tiny_options(name, r1, r2);
+        with_union_caches(o);
+        o.threads = threads;
+        panvar::GenotypeCommandOptions ref = tiny_options("ix_ref_t" + std::to_string(threads), r1, r2);
+        with_union_caches(ref);
+        ref.threads = threads;
+        require(panvar::run_genotype(ref) == panvar::GenotypeRunStatus::Complete, "fixture: the reference must call");
+        require(panvar::run_genotype(indexed(o)) == panvar::GenotypeRunStatus::Complete, "the indexed backend must call");
+        require_same_science("ix_ref_t" + std::to_string(threads), name,
+                             "indexed backend, " + std::to_string(threads) + " thread(s)");
+        const auto st = read_status(path(name + ".mosaic_status.tsv"));
+        require(st.at("union_scoring_backend") == "indexed_fine_experimental" &&
+                    st.at("union_scoring_backend_stages") == "initial_union_pass" && st.at("indexed_union_refusal") == "none" &&
+                    std::stoull(st.at("indexed_union_store_charged_bytes")) > 0,
+                "the indexed run must record its backend, the stage it served and its store");
+        const std::string settings = slurp(path(name + ".settings.tsv"));
+        require(settings.find("union_scoring_backend\tindexed_fine_experimental\tprofile test") != std::string::npos &&
+                    settings.find("indexed_union_store_bytes\t268435456\tprofile test") != std::string::npos,
+                "the experimental keys must be recorded with their source");
+    }
+    {
+        const std::string pr1 = path("phaseable_r1.fq"), pr2 = path("phaseable_r2.fq");
+        panvar::GenotypeCommandOptions ref = repair_options("ix_repair_ref", pr1, pr2, "tiny_phaseable.gfa");
+        ref.max_mosaic_candidates = 0;
+        with_union_caches(ref);
+        panvar::GenotypeCommandOptions ix = ref;
+        ix.out_prefix = path("ix_repair_idx");
+        require(panvar::run_genotype(ref) == panvar::GenotypeRunStatus::Complete &&
+                    panvar::run_genotype(indexed(ix)) == panvar::GenotypeRunStatus::Complete,
+                "fixture: both adaptive runs must call");
+        require_same_science("ix_repair_ref", "ix_repair_idx", "indexed backend through the adaptive repair");
+        // the repair trajectory's scientific columns (perf_compare.py's SCIENTIFIC_ROUND_COLUMNS: the first 28)
+        const auto science = [](const std::string& file) {
+            std::ifstream in(file);
+            std::string line, out;
+            while (std::getline(in, line)) {
+                std::size_t at = 0;
+                for (int k = 0; k < 28 && at != std::string::npos; ++k) at = line.find('\t', at + 1);
+                out += line.substr(0, at) + "\n";
+            }
+            return out;
+        };
+        require(science(path("ix_repair_ref.repair_rounds.tsv")) == science(path("ix_repair_idx.repair_rounds.tsv")),
+                "the repair trajectory must be the reference's");
+        require(read_status(path("ix_repair_idx.mosaic_status.tsv")).at("pool_score_mismatches") == "0",
+                "the repair must score the indexed union's candidates identically");
+    }
+    // refusals on the indexed route end RESCORE_INCOMPLETE, with no ranking and the refusal recorded
+    {
+        panvar::GenotypeCommandOptions capped = tiny_options("ix_refused_origins", r1, r2);
+        with_union_caches(capped);
+        capped.max_physical_origins = 1;
+        require(panvar::run_genotype(indexed(capped)) == panvar::GenotypeRunStatus::RescoreIncomplete,
+                "an exhausted physical-origin cap on the indexed route must end RESCORE_INCOMPLETE");
+        const auto st = read_status(path("ix_refused_origins.mosaic_status.tsv"));
+        require(st.at("note").find("resource cap") != std::string::npos &&
+                    st.at("indexed_union_refusal").find("physical-origin cap") != std::string::npos &&
+                    std::stoull(st.at("observed_physical_origins")) > 1 && st.count("observed_threads_used_placement"),
+                "the refusal must be named and its observed work reported");
+        require(no_ranking_or_call("ix_refused_origins") && no_final_outputs("ix_refused_origins"),
+                "a refused indexed pass must leave no ranking, no call and no final table");
+
+        panvar::GenotypeCommandOptions store = tiny_options("ix_refused_store", r1, r2);
+        with_union_caches(store);
+        store = indexed(store);
+        store.indexed_union_store_bytes = 1;
+        require(panvar::run_genotype(store) == panvar::GenotypeRunStatus::RescoreIncomplete,
+                "an exhausted placement-store budget must end RESCORE_INCOMPLETE");
+        require(read_status(path("ix_refused_store.mosaic_status.tsv")).at("indexed_union_refusal").find("placement store") !=
+                        std::string::npos &&
+                    no_ranking_or_call("ix_refused_store"),
+                "the store refusal must be named, with no ranking or call");
+    }
+    // declared requirements
+    {
+        panvar::GenotypeCommandOptions bad;
+        bool threw = false;
+        try {
+            panvar::apply_genotype_setting("profile test", "union_scoring_backend", "fast", bad);
+        } catch (const std::exception&) {
+            threw = true;
+        }
+        require(threw, "an unknown union backend must be refused");
+        for (int which = 0; which < 3; ++which) {
+            panvar::GenotypeCommandOptions o = tiny_options("ix_invalid", r1, r2);
+            with_union_caches(o);
+            if (which == 0) o = indexed(o), o.indexed_union_store_bytes = 0;
+            if (which == 1) o.indexed_union_store_bytes = 1;   // without the indexed backend
+            if (which == 2) o = indexed(o), o.max_union_cached_placements_consumed = 0;
+            threw = false;
+            try {
+                (void)panvar::run_genotype(o);
+            } catch (const std::exception&) {
+                threw = true;
+            }
+            require(threw, "an inconsistent experimental backend setting must be refused before any work");
+        }
+    }
+    std::cout << "  indexed union backend: default off and unrecorded; same science at 1 and 4 threads and through the "
+                 "repair; refusals RESCORE_INCOMPLETE with no ranking; inconsistent settings refused\n";
+}
+
+
+// ---- I2-B (EXPERIMENTAL): fine window discovery in the adaptive search, at the caller -----------------------------
+// Control: the I2-A indexed union with the reference adaptive search (key set explicitly to "reference"); fine: the same
+// with adaptive_window_discovery fine_experimental. Same science, the complete repair trajectory's scientific columns,
+// at 2 and 4 threads; a served-cap refusal stops the adaptive search with no genotype; inconsistent settings refused.
+void test_adaptive_fine_windows() {
+    const std::string pr1 = path("phaseable_r1.fq"), pr2 = path("phaseable_r2.fq");
+    // default off: no adaptive_window block
+    {
+        const auto st = read_status(path("ix_repair_ref.mosaic_status.tsv"));
+        for (const auto& kv : st) {
+            require(kv.first.rfind("adaptive_window_", 0) != 0 && kv.first.rfind("adaptive_fine_", 0) != 0,
+                    "a default run must not report the adaptive window block (" + kv.first + ")");
+        }
+    }
+    const auto arm = [&](const std::string& name, bool fine, std::size_t threads) {
+        panvar::GenotypeCommandOptions o = repair_options(name, pr1, pr2, "tiny_phaseable.gfa");
+        o.max_mosaic_candidates = 0;
+        o.threads = threads;
+        with_union_caches(o);
+        o.union_scoring_backend = "indexed_fine_experimental";
+        o.indexed_union_store_bytes = std::size_t{256} << 20;
+        o.adaptive_window_discovery = fine ? "fine_experimental" : "reference";
+        o.setting_sources["adaptive_window_discovery"] = "profile test";
+        if (fine) {
+            o.adaptive_fine_store_bytes = std::size_t{64} << 20;
+            o.adaptive_fine_max_served_placements = std::uint64_t{1} << 40;
+        }
+        return o;
+    };
+    const auto science = [](const std::string& file) {
+        std::ifstream in(file);
+        std::string line, out;
+        while (std::getline(in, line)) {
+            std::size_t at = 0;
+            for (int k = 0; k < 28 && at != std::string::npos; ++k) at = line.find('\t', at + 1);
+            out += line.substr(0, at) + "\n";
+        }
+        return out;
+    };
+    for (const std::size_t threads : {std::size_t{2}, std::size_t{4}}) {
+        const std::string c = "fw_control_t" + std::to_string(threads), f = "fw_fine_t" + std::to_string(threads);
+        require(panvar::run_genotype(arm(c, false, threads)) == panvar::GenotypeRunStatus::Complete &&
+                    panvar::run_genotype(arm(f, true, threads)) == panvar::GenotypeRunStatus::Complete,
+                "fixture: both adaptive arms must call");
+        require_same_science(c, f, "fine adaptive windows, " + std::to_string(threads) + " threads");
+        require(science(path(c + ".repair_rounds.tsv")) == science(path(f + ".repair_rounds.tsv")),
+                "the complete adaptive trajectory must be the control's");
+        const auto sc = read_status(path(c + ".mosaic_status.tsv")), sf = read_status(path(f + ".mosaic_status.tsv"));
+        require(sf.at("pool_score_mismatches") == "0" && sc.at("adaptive_window_discovery") == "reference" &&
+                    sf.at("adaptive_window_discovery") == "fine_experimental" && sc.at("adaptive_fine_units_served") == "0" &&
+                    std::stoull(sf.at("adaptive_fine_units_discovered")) > 0 &&
+                    sc.at("adaptive_window_enumerations") == sf.at("adaptive_window_enumerations"),
+                "both arms must report their path; the fine arm must discover; both enumerate the same windows");
+    }
+    // a served-placement cap refusal: typed, the adaptive search stops, no genotype is written
+    {
+        panvar::GenotypeCommandOptions o = arm("fw_refused", true, 2);
+        o.adaptive_fine_max_served_placements = 1;
+        const panvar::GenotypeRunStatus status = panvar::run_genotype(o);
+        const auto st = read_status(path("fw_refused.mosaic_status.tsv"));
+        require(status != panvar::GenotypeRunStatus::Complete && no_final_outputs("fw_refused") &&
+                    st.at("no_call_reason") == "cumulative_cap",
+                "a served-placement refusal must stop the adaptive search with no genotype");
+    }
+    // declared requirements
+    {
+        bool threw = false;
+        panvar::GenotypeCommandOptions bad;
+        try {
+            panvar::apply_genotype_setting("profile test", "adaptive_window_discovery", "fast", bad);
+        } catch (const std::exception&) {
+            threw = true;
+        }
+        require(threw, "an unknown adaptive window path must be refused");
+        for (int which = 0; which < 2; ++which) {
+            panvar::GenotypeCommandOptions o = arm("fw_invalid", which == 0, 2);
+            if (which == 0) o.adaptive_fine_store_bytes = 0;            // fine without a store budget
+            if (which == 1) o.adaptive_fine_store_bytes = 1 << 20;      // a budget without the fine path
+            threw = false;
+            try {
+                (void)panvar::run_genotype(o);
+            } catch (const std::exception&) {
+                threw = true;
+            }
+            require(threw, "an inconsistent adaptive window setting must be refused before any work");
+        }
+    }
+    std::cout << "  adaptive fine windows: default off; same science and trajectory at 2 and 4 threads; served-cap refusal "
+                 "stops with no genotype; inconsistent settings refused\n";
+}
+
+
+// ---- I2-C: the union store layouts and the stage attribution block, at the caller ------------------------------------
+void test_store_layout_and_timing_detail() {
+    const std::string pr1 = path("phaseable_r1.fq"), pr2 = path("phaseable_r2.fq");
+    const auto arm = [&](const std::string& name, const std::string& layout, bool timing) {
+        panvar::GenotypeCommandOptions o = repair_options(name, pr1, pr2, "tiny_phaseable.gfa");
+        o.max_mosaic_candidates = 0;
+        with_union_caches(o);
+        o.union_scoring_backend = "indexed_fine_experimental";
+        o.indexed_union_store_bytes = std::size_t{256} << 20;
+        o.indexed_union_store_layout = layout;
+        o.adaptive_window_discovery = "fine_experimental";
+        o.setting_sources["adaptive_window_discovery"] = "profile test";
+        o.adaptive_fine_store_bytes = std::size_t{64} << 20;
+        o.adaptive_fine_max_served_placements = std::uint64_t{1} << 40;
+        o.timing_detail = timing;
+        if (timing) o.setting_sources["timing_detail"] = "profile test";
+        return o;
+    };
+    require(panvar::run_genotype(arm("sl_legacy", "legacy_i2a", true)) == panvar::GenotypeRunStatus::Complete &&
+                panvar::run_genotype(arm("sl_exact", "exact", true)) == panvar::GenotypeRunStatus::Complete &&
+                panvar::run_genotype(arm("sl_plain", "exact", false)) == panvar::GenotypeRunStatus::Complete,
+            "fixture: every layout arm must call");
+    require_same_science("sl_legacy", "sl_exact", "exact against legacy store layout");
+    const auto legacy = read_status(path("sl_legacy.mosaic_status.tsv")), exact = read_status(path("sl_exact.mosaic_status.tsv"));
+    require(legacy.at("indexed_union_store_layout") == "legacy_i2a" && exact.at("indexed_union_store_layout") == "exact" &&
+                exact.at("indexed_union_store_budget_basis") == "allocated_capacity" &&
+                std::stoull(exact.at("indexed_union_store_peak_bytes")) < std::stoull(legacy.at("indexed_union_store_peak_bytes")),
+            "both layouts report themselves; the exact layout peaks lower");
+    // the attribution block: present only when asked for, disjoint parts, remainders reported (never negative)
+    for (const auto& kv : read_status(path("sl_plain.mosaic_status.tsv"))) {
+        require(kv.first.rfind("seconds_detail_", 0) != 0, "the attribution block must be absent without timing_detail");
+    }
+    for (const char* key : {"seconds_detail_model_graph_load_sort_parse", "seconds_detail_markers_read_fastq",
+                            "seconds_detail_model_unattributed", "seconds_detail_markers_unattributed",
+                            "seconds_detail_adaptive_seed_placement_census", "seconds_detail_adaptive_neighbour_priors",
+                            "seconds_detail_adaptive_pool_hook", "seconds_detail_adaptive_round_unattributed",
+                            "seconds_detail_adaptive_post_search"}) {
+        require(exact.count(key) != 0, std::string("the attribution block must report ") + key);
+    }
+    for (const char* key : {"seconds_detail_model_unattributed", "seconds_detail_markers_unattributed",
+                            "seconds_detail_adaptive_round_unattributed", "seconds_detail_adaptive_run_outside_rounds",
+                            "seconds_detail_adaptive_post_search"}) {
+        require(std::stod(exact.at(key)) > -0.005, std::string("a remainder cannot be materially negative: ") + key);
+    }
+    bool threw = false;
+    try {
+        panvar::GenotypeCommandOptions o = tiny_options("sl_invalid", path("r1.fq"), path("r2.fq"));
+        o.indexed_union_store_layout = "legacy_i2a";   // without the indexed backend
+        (void)panvar::run_genotype(o);
+    } catch (const std::exception&) {
+        threw = true;
+    }
+    require(threw, "a store layout without the indexed backend must be refused");
+    std::cout << "  store layouts and attribution: exact = legacy science, exact peaks lower; detail block only when asked, "
+                 "remainders reported; a stray layout key refused\n";
+}
+
+
+// ---- I2-D: fused anchor seeding at the caller --------------------------------------------------------------------------
+void test_fused_anchor_seeding() {
+    const std::string pr1 = path("phaseable_r1.fq"), pr2 = path("phaseable_r2.fq");
+    const auto arm = [&](const std::string& name, bool fused, std::size_t threads) {
+        panvar::GenotypeCommandOptions o = repair_options(name, pr1, pr2, "tiny_phaseable.gfa");
+        o.max_mosaic_candidates = 0;
+        o.threads = threads;
+        with_union_caches(o);
+        o.union_scoring_backend = "indexed_fine_experimental";
+        o.indexed_union_store_bytes = std::size_t{256} << 20;
+        o.adaptive_window_discovery = "fine_experimental";
+        o.setting_sources["adaptive_window_discovery"] = "profile test";
+        o.adaptive_fine_store_bytes = std::size_t{64} << 20;
+        o.adaptive_fine_max_served_placements = std::uint64_t{1} << 40;
+        o.adaptive_fused_seed = fused;
+        o.setting_sources["adaptive_fused_seed"] = "profile test";
+        return o;
+    };
+    const auto science = [](const std::string& file) {
+        std::ifstream in(file);
+        std::string line, out;
+        while (std::getline(in, line)) {
+            std::size_t at = 0;
+            for (int k = 0; k < 28 && at != std::string::npos; ++k) at = line.find('\t', at + 1);
+            out += line.substr(0, at) + "\n";
+        }
+        return out;
+    };
+    for (const std::size_t threads : {std::size_t{2}, std::size_t{4}}) {
+        const std::string c = "fs_control_t" + std::to_string(threads), f = "fs_fused_t" + std::to_string(threads);
+        require(panvar::run_genotype(arm(c, false, threads)) == panvar::GenotypeRunStatus::Complete &&
+                    panvar::run_genotype(arm(f, true, threads)) == panvar::GenotypeRunStatus::Complete,
+                "fixture: both seeding arms must call");
+        require_same_science(c, f, "fused seeding, " + std::to_string(threads) + " threads");
+        require(science(path(c + ".repair_rounds.tsv")) == science(path(f + ".repair_rounds.tsv")),
+                "the complete adaptive trajectory must be the control's");
+        const auto sc = read_status(path(c + ".mosaic_status.tsv")), sf = read_status(path(f + ".mosaic_status.tsv"));
+        const std::uint64_t pc = std::stoull(sc.at("adaptive_full_placements")), pf = std::stoull(sf.at("adaptive_full_placements"));
+        const std::uint64_t seeded = sc.at("repair_anchor_hap1") == sc.at("repair_anchor_hap2") ? 1 : 2;
+        require(sf.at("adaptive_fused_seed") == "1" && sc.at("adaptive_fused_seed") == "0" && pc == pf + seeded &&
+                    sf.at("pool_score_mismatches") == "0",
+                "the fused arm must place each distinct anchor once fewer, with nothing else changed");
+    }
+    std::cout << "  fused anchor seeding: same science and trajectory at 2 and 4 threads; one fewer full placement per "
+                 "distinct anchor\n";
+}
+
+
+// ---- I2-E: marker-proposal contribution reuse at the caller --------------------------------------------------------------
+void test_marker_proposal_reuse() {
+    const std::string pr1 = path("phaseable_r1.fq"), pr2 = path("phaseable_r2.fq");
+    const auto arm = [&](const std::string& name, std::size_t budget) {
+        panvar::GenotypeCommandOptions o = repair_options(name, pr1, pr2, "tiny_phaseable.gfa");
+        o.max_mosaic_candidates = 8;   // the beam runs, so its candidates come from these emissions
+        o.marker_proposal_reuse_table_bytes = budget;
+        o.setting_sources["marker_proposal_reuse_table_bytes"] = "profile test";
+        return o;
+    };
+    require(panvar::run_genotype(arm("mp_off", 0)) == panvar::GenotypeRunStatus::Complete &&
+                panvar::run_genotype(arm("mp_on", std::size_t{4} << 20)) == panvar::GenotypeRunStatus::Complete &&
+                panvar::run_genotype(arm("mp_tiny", 16)) == panvar::GenotypeRunStatus::Complete,
+            "fixture: every reuse arm must call");
+    require_same_science("mp_off", "mp_on", "marker-proposal reuse");
+    require_same_science("mp_off", "mp_tiny", "marker-proposal reuse, tiny budget");
+    const auto off = read_status(path("mp_off.mosaic_status.tsv")), on = read_status(path("mp_on.mosaic_status.tsv")),
+               tiny = read_status(path("mp_tiny.mosaic_status.tsv"));
+    // (this fixture's terms are each needed once, so reuse serves none here; the unit gates prove reuse itself)
+    require(off.at("marker_proposal_reuse") == "off" && on.at("marker_proposal_reuse") == "on" &&
+                std::stoull(on.at("marker_proposal_contributions_executed")) +
+                        std::stoull(on.at("marker_proposal_contributions_reused")) ==
+                    std::stoull(on.at("marker_proposal_contribution_visits")) &&
+                on.at("marker_proposal_contribution_visits") == off.at("marker_proposal_contribution_visits") &&
+                tiny.at("marker_proposal_contributions_fallback") == tiny.at("marker_proposal_contribution_visits") &&
+                std::stoull(tiny.at("marker_proposal_reuse_peak_table_bytes")) <= 16,
+            "the reuse block must account for every visit; a tiny budget falls back for all and allocates within it");
+    for (const auto& kv : read_status(path("ix_default.mosaic_status.tsv"))) {
+        require(kv.first.rfind("marker_proposal_", 0) != 0, "a default run must not report the reuse block");
+    }
+    std::cout << "  marker-proposal reuse: same science (candidate tables included) on, off and at a tiny budget; work "
+                 "reported; default runs unchanged\n";
+}
+
+
+// ---- I2-F: prepared main-library combination terms at the caller --------------------------------------------------------
+void test_prepared_combination_terms() {
+    const std::string pr1 = path("phaseable_r1.fq"), pr2 = path("phaseable_r2.fq");
+    const auto science = [](const std::string& file) {
+        std::ifstream in(file);
+        std::string line, out;
+        while (std::getline(in, line)) {
+            std::size_t at = 0;
+            for (int k = 0; k < 28 && at != std::string::npos; ++k) at = line.find('\t', at + 1);
+            out += line.substr(0, at) + "\n";
+        }
+        return out;
+    };
+    for (const std::size_t threads : {std::size_t{1}, std::size_t{4}}) {
+        const auto arm = [&](const std::string& name, bool prepared) {
+            panvar::GenotypeCommandOptions o = repair_options(name, pr1, pr2, "tiny_phaseable.gfa");
+            o.max_mosaic_candidates = 8;
+            o.threads = threads;
+            o.combination_prepared_library_terms = prepared;
+            o.setting_sources["combination_prepared_library_terms"] = "profile test";
+            return o;
+        };
+        const std::string c = "pc_scalar_t" + std::to_string(threads), p = "pc_prepared_t" + std::to_string(threads);
+        require(panvar::run_genotype(arm(c, false)) == panvar::GenotypeRunStatus::Complete &&
+                    panvar::run_genotype(arm(p, true)) == panvar::GenotypeRunStatus::Complete,
+                "fixture: both combination arms must call");
+        require_same_science(c, p, "prepared combination terms, " + std::to_string(threads) + " threads");
+        require(science(path(c + ".repair_rounds.tsv")) == science(path(p + ".repair_rounds.tsv")),
+                "the adaptive trajectory must be the scalar path's");
+        const auto sc = read_status(path(c + ".mosaic_status.tsv")), sp = read_status(path(p + ".mosaic_status.tsv"));
+        require(sc.at("combination_prepared_calls") == "0" && std::stoull(sp.at("combination_prepared_calls")) >= 2 &&
+                    std::stoll(sp.at("combination_net_validations_avoided")) > 0 &&
+                    std::stoll(sp.at("combination_net_logs_avoided")) > 0 &&
+                    std::stoull(sp.at("combination_hypothetical_scalar_logs")) >= std::stoull(sp.at("combination_prepared_logs")),
+                "the prepared arm must report the union and adaptive combinations it prepared");
+    }
+    for (const auto& kv : read_status(path("ix_default.mosaic_status.tsv"))) {
+        require(kv.first.rfind("combination_", 0) != 0, "a default run must not report the combination block");
+    }
+    std::cout << "  prepared combination terms: same science and trajectory at 1 and 4 threads; union and adaptive "
+                 "combinations prepared; default runs unchanged\n";
+}
+
+
+// ---- I2-H: the fixed-geometry emitting recursion at the caller ----------------------------------------------------------
+void test_gap_recursion_backend() {
+    const std::string pr1 = path("phaseable_r1.fq"), pr2 = path("phaseable_r2.fq");
+    const auto science = [](const std::string& file) {
+        std::ifstream in(file);
+        std::string line, out;
+        while (std::getline(in, line)) {
+            std::size_t at = 0;
+            for (int k = 0; k < 28 && at != std::string::npos; ++k) at = line.find('\t', at + 1);
+            out += line.substr(0, at) + "\n";
+        }
+        return out;
+    };
+    for (const std::size_t threads : {std::size_t{1}, std::size_t{4}}) {
+        const auto arm = [&](const std::string& name, bool fixed) {
+            panvar::GenotypeCommandOptions o = repair_options(name, pr1, pr2, "tiny_phaseable.gfa");
+            with_union_caches(o);
+            o.max_mosaic_candidates = 8;
+            o.threads = threads;
+            o.gap_recursion_fixed_geometry = fixed;
+            o.setting_sources["gap_recursion_backend"] = "profile test";
+            return o;
+        };
+        const std::string c = "gr_scaled_t" + std::to_string(threads), e = "gr_fixed_t" + std::to_string(threads);
+        require(panvar::run_genotype(arm(c, false)) == panvar::GenotypeRunStatus::Complete &&
+                    panvar::run_genotype(arm(e, true)) == panvar::GenotypeRunStatus::Complete,
+                "fixture: both recursion arms must call");
+        require_same_science(c, e, "gap recursion backend, " + std::to_string(threads) + " threads");
+        require(science(path(c + ".repair_rounds.tsv")) == science(path(e + ".repair_rounds.tsv")),
+                "the adaptive trajectory must be the reference recursion's");
+        const auto sc = read_status(path(c + ".mosaic_status.tsv")), se = read_status(path(e + ".mosaic_status.tsv"));
+        require(sc.at("gap_recursion_backend") == "scaled_reference" &&
+                    se.at("gap_recursion_backend") == "fixed_geometry_experimental" &&
+                    se.at("gap_recursion_backend_scope") == "union_adaptive_dosage",
+                "each arm must record its recursion backend");
+        require(std::stoull(se.at("dp_evaluations")) > 0, "the fixture must reach the recursion (vacuous otherwise)");
+    }
+    for (const auto& kv : read_status(path("ix_default.mosaic_status.tsv"))) {
+        require(kv.first.rfind("gap_recursion_", 0) != 0, "a default run must not report the recursion backend");
+    }
+    std::cout << "  gap recursion backend: same science and trajectory at 1 and 4 threads; recorded; default runs unchanged\n";
+}
+
+
+// ---- I2-I: the verification census at the caller, and the fixed-geometry recursion inside dosage -----------------------
+void test_verification_census() {
+    const std::string pr1 = path("phaseable_r1.fq"), pr2 = path("phaseable_r2.fq");
+    const auto science = [](const std::string& file) {
+        std::ifstream in(file);
+        std::string line, out;
+        while (std::getline(in, line)) {
+            std::size_t at = 0;
+            for (int k = 0; k < 28 && at != std::string::npos; ++k) at = line.find('\t', at + 1);
+            out += line.substr(0, at) + "\n";
+        }
+        return out;
+    };
+    for (const std::size_t threads : {std::size_t{1}, std::size_t{4}}) {
+        const auto arm = [&](const std::string& name) {
+            panvar::GenotypeCommandOptions o = repair_options(name, pr1, pr2, "tiny_phaseable.gfa");
+            with_union_caches(o);
+            o.max_mosaic_candidates = 8;
+            o.threads = threads;
+            o.gap_recursion_fixed_geometry = true;
+            o.setting_sources["gap_recursion_backend"] = "profile test";
+            return o;
+        };
+        const std::string off = "vc_off_t" + std::to_string(threads), on = "vc_on_t" + std::to_string(threads);
+        require(panvar::run_genotype(arm(off)) == panvar::GenotypeRunStatus::Complete, "fixture: the census-off arm must call");
+        panvar::begin_verification_census(1, std::uint64_t{64} << 20);
+        const panvar::GenotypeRunStatus status = panvar::run_genotype(arm(on));
+        panvar::set_verification_census_stage(panvar::CensusStage::other);
+        const panvar::VerificationCensusReport census = panvar::end_verification_census();
+        require(status == panvar::GenotypeRunStatus::Complete, "fixture: the census-on arm must call");
+        require_same_science(off, on, "verification census on/off, " + std::to_string(threads) + " threads");
+        require(science(path(off + ".repair_rounds.tsv")) == science(path(on + ".repair_rounds.tsv")),
+                "the adaptive trajectory must not depend on the census");
+        const auto st = read_status(path(on + ".mosaic_status.tsv"));
+        const panvar::CensusExact& u = census.exact[static_cast<std::size_t>(panvar::CensusGroup::union_discovery)];
+        require(census.complete && u.requests == std::stoull(st.at("full_read_verifications")) &&
+                    census.sampled[static_cast<std::size_t>(panvar::CensusGroup::union_discovery)].requests == u.requests,
+                "the census sees every union verification request (period 1)");
+        const std::uint64_t adaptive =
+            census.exact[static_cast<std::size_t>(panvar::CensusGroup::adaptive_full)].requests +
+            census.exact[static_cast<std::size_t>(panvar::CensusGroup::adaptive_window)].requests;
+        require(adaptive > 0, "the census sees the adaptive search's requests");
+    }
+    std::cout << "  verification census: same science and trajectory on and off at 1 and 4 threads; every union request "
+                 "counted; adaptive requests attributed\n";
+}
+
+
+// ---- I2-K: the union pass's emission results handed to the adaptive search ---------------------------------------------
+void test_emission_handoff() {
+    const std::string pr1 = path("phaseable_r1.fq"), pr2 = path("phaseable_r2.fq");
+    const auto science = [](const std::string& file) {
+        std::ifstream in(file);
+        std::string line, out;
+        while (std::getline(in, line)) {
+            std::size_t at = 0;
+            for (int k = 0; k < 28 && at != std::string::npos; ++k) at = line.find('\t', at + 1);
+            out += line.substr(0, at) + "\n";
+        }
+        return out;
+    };
+    for (const std::size_t threads : {std::size_t{1}, std::size_t{4}}) {
+        const auto arm = [&](const std::string& name, bool handoff) {
+            panvar::GenotypeCommandOptions o = repair_options(name, pr1, pr2, "tiny_phaseable.gfa");
+            with_union_caches(o);
+            o.max_mosaic_candidates = 8;
+            o.threads = threads;
+            o.union_scoring_backend = "indexed_fine_experimental";   // the batch that detaches its emission results
+            o.indexed_union_store_bytes = std::size_t{256} << 20;
+            o.setting_sources["union_scoring_backend"] = "profile test";
+            o.setting_sources["indexed_union_store_bytes"] = "profile test";
+            o.adaptive_window_discovery = "fine_experimental";
+            o.adaptive_fine_store_bytes = std::size_t{64} << 20;
+            o.adaptive_fine_max_served_placements = 2000000000;
+            o.setting_sources["adaptive_window_discovery"] = "profile test";
+            o.setting_sources["adaptive_fine_store_bytes"] = "profile test";
+            o.setting_sources["adaptive_fine_max_served_placements"] = "profile test";
+            o.adaptive_fused_seed = true;
+            o.setting_sources["adaptive_fused_seed"] = "profile test";
+            o.repair_tie_branching = true;   // any branch context starts empty: the handoff is adopted once
+            o.emission_cache_bytes = std::size_t{64} << 20;   // both arms: the cache whose results are handed over
+            o.adaptive_emission_handoff = handoff;
+            o.setting_sources["adaptive_emission_handoff"] = "profile test";
+            return o;
+        };
+        const std::string c = "eh_off_t" + std::to_string(threads), e = "eh_on_t" + std::to_string(threads);
+        require(panvar::run_genotype(arm(c, false)) == panvar::GenotypeRunStatus::Complete &&
+                    panvar::run_genotype(arm(e, true)) == panvar::GenotypeRunStatus::Complete,
+                "fixture: both handoff arms must call");
+        require_same_science(c, e, "emission handoff, " + std::to_string(threads) + " threads");
+        require(science(path(c + ".repair_rounds.tsv")) == science(path(e + ".repair_rounds.tsv")),
+                "the adaptive trajectory must be the cold search's");
+        const auto sc = read_status(path(c + ".mosaic_status.tsv")), se = read_status(path(e + ".mosaic_status.tsv"));
+        require(sc.at("adaptive_emission_handoff") == "0" && sc.at("adaptive_emission_handoff_detached") == "0" &&
+                    sc.at("adaptive_emission_handoff_inherited_hits") == "0",
+                "the off arm detaches and inherits nothing");
+        require(se.at("adaptive_emission_handoff_detached") == "1" && se.at("adaptive_emission_handoff_adopted") == "1" &&
+                    se.at("adaptive_emission_handoff_refusal") == "none" &&
+                    std::stoull(se.at("adaptive_emission_handoff_entries")) > 0 &&
+                    std::stoull(se.at("adaptive_emission_handoff_inherited_hits")) > 0,
+                "the on arm must adopt the union's results and serve hits from them");
+        // a sequential sample in the same process: a fresh run with the handoff off reports and inherits nothing
+        require(panvar::run_genotype(arm(c + "_again", false)) == panvar::GenotypeRunStatus::Complete,
+                "fixture: a sequential run must call");
+        require_same_science(c, c + "_again", "sequential sample after a handoff run");
+        require(read_status(path(c + "_again.mosaic_status.tsv")).at("adaptive_emission_handoff_inherited_hits") == "0",
+                "a sequential sample inherits nothing");
+    }
+    std::cout << "  emission handoff: same science and trajectory at 1 and 4 threads (rounds, fused seed, fine windows, tie "
+                 "branching on); adopted with inherited hits; a sequential sample inherits nothing\n";
+}
+
+
+// ---- I3-A: one prepared locus, successive samples -----------------------------------------------------------------------
+// Two genuinely different samples (an off-panel phaseable truth, and a pair of panel haplotypes from another seed) on one
+// graph, analysed against ONE prepared locus in A-B-A, reversed and repeated orders, at 1 and 4 threads, with two
+// declared libraries and with --library auto. Every prepared run must equal the ordinary (cold) run of the same sample
+// and settings; the object must be prepared once and stay byte-identical (digest); incompatible graph, reference,
+// bubbles, curation and marker or bubble settings must be refused before any output; a failing sample must not affect
+// the next; and the command path (dosage, locus table) must agree too.
+void test_prepared_locus() {
+    const TinyLocus locus = write_tiny_locus("prep_locus.gfa", 80, 70);
+    const auto truths = spell_truths(locus);
+    simulate(truths.first, truths.second, path("prep_A_r1.fq"), path("prep_A_r2.fq"), 123);
+    simulate(locus.haplotypes.front(), locus.haplotypes.back(), path("prep_B_r1.fq"), path("prep_B_r2.fq"), 456);
+    {
+        std::ofstream lib2(path("prep_lib2.txt"));
+        lib2 << "insert_mean_bp 290\ninsert_sd_bp 35\nsupport_sigmas 4\nsubstitution_error 0.004\noutlier_weight 0.002\n"
+                "fragment_start_intensity 0.08\nmarker_background 0.01\n";
+    }
+    const auto sample = [&](const std::string& name, char which, std::size_t threads, const std::string& library) {
+        const std::string r1 = path(std::string("prep_") + which + "_r1.fq"), r2 = path(std::string("prep_") + which + "_r2.fq");
+        panvar::GenotypeCommandOptions o = repair_options(name, r1, r2, "prep_locus.gfa");
+        o.max_mosaic_candidates = 8;
+        o.threads = threads;
+        o.library_path = library;
+        return o;
+    };
+    const std::string lib1 = path("lib.txt"), lib2 = path("prep_lib2.txt");
+    const auto trajectory = [](const std::string& file) {   // the rounds' scientific columns (timing and memory follow)
+        std::ifstream in(file);
+        std::string line, out;
+        while (std::getline(in, line)) {
+            std::size_t at = 0;
+            for (int k = 0; k < 28 && at != std::string::npos; ++k) at = line.find('\t', at + 1);
+            out += line.substr(0, at) + "\n";
+        }
+        return out;
+    };
+    // the cold (ordinary) runs, one per distinct sample configuration
+    struct Config { char which; std::size_t threads; std::string library, tag; };
+    const std::vector<Config> configs = {{'A', 1, lib1, "A_t1"}, {'B', 1, lib1, "B_t1"}, {'A', 4, lib1, "A_t4"},
+                                         {'B', 4, lib1, "B_t4"}, {'B', 1, lib2, "B_lib2"}, {'A', 1, "auto", "A_auto"}};
+    std::map<std::string, panvar::GenotypeRunStatus> cold_status;
+    for (const Config& c : configs) {
+        cold_status[c.tag] = panvar::run_genotype(sample("prep_cold_" + c.tag, c.which, c.threads, c.library));
+        require(read_status(path("prep_cold_" + c.tag + ".mosaic_status.tsv")).count("prepared_locus") == 0,
+                "an ordinary run reports no prepared locus");
+    }
+    require(cold_status["A_t1"] == panvar::GenotypeRunStatus::Complete && cold_status["B_t1"] == panvar::GenotypeRunStatus::Complete,
+            "fixture: both samples must call");
+    require(slurp(path("prep_cold_A_t1.genotypes.tsv")) != slurp(path("prep_cold_B_t1.genotypes.tsv")),
+            "fixture: the two samples must be genuinely different (different calls)");
+
+    // prepare once
+    const std::uint64_t builds_before = panvar::prepared_locus_builds();
+    const std::shared_ptr<const panvar::PreparedLocus> prepared = panvar::prepare_genotype_locus(sample("prep_prepare", 'A', 1, lib1));
+    const std::string digest = prepared->digest();
+    require(panvar::prepared_locus_builds() == builds_before + 1, "one preparation");
+    require(prepared->fingerprint() == read_status(path("prep_cold_A_t1.mosaic_status.tsv")).at("model_fingerprint"),
+            "the prepared model is the ordinary run's model");
+    // A-B-A, then reversed, then repeated, then libraries; every one against the same object
+    const std::vector<std::string> order = {"A_t1", "B_t1", "A_t1", "B_t4", "A_t4", "A_t4", "B_t1", "B_lib2", "A_auto", "B_lib2"};
+    std::size_t runs = 0;
+    for (const std::string& tag : order) {
+        const Config& c = *std::find_if(configs.begin(), configs.end(), [&](const Config& x) { return x.tag == tag; });
+        const std::string name = "prep_run" + std::to_string(runs++) + "_" + tag;
+        const panvar::GenotypeRunStatus status = panvar::run_genotype_prepared(sample(name, c.which, c.threads, c.library), *prepared);
+        require(status == cold_status[tag], name + ": the run status must be the cold run's");
+        require_same_science("prep_cold_" + tag, name, "prepared locus, " + name);
+        require(exists(path("prep_cold_" + tag + ".repair_rounds.tsv")) == exists(path(name + ".repair_rounds.tsv")),
+                name + ": the adaptive trajectory must exist in both or neither");
+        if (exists(path("prep_cold_" + tag + ".repair_rounds.tsv"))) {
+            require(trajectory(path("prep_cold_" + tag + ".repair_rounds.tsv")) == trajectory(path(name + ".repair_rounds.tsv")),
+                    name + ": the adaptive trajectory must be the cold run's (scientific columns)");
+        }
+        const auto st = read_status(path(name + ".mosaic_status.tsv"));
+        require(st.at("prepared_locus") == "1" && st.at("prepared_locus_id") == std::to_string(prepared->id()),
+                name + ": the status must record the prepared locus it used");
+        require(prepared->digest() == digest, name + ": the prepared locus must be unchanged by an analysis");
+    }
+    // a failing sample (unreadable reads), then a valid one
+    {
+        panvar::GenotypeCommandOptions broken = sample("prep_broken", 'A', 1, lib1);
+        broken.reads1_path = path("prep_missing_r1.fq");
+        bool failed = false;
+        try {
+            failed = panvar::run_genotype_prepared(broken, *prepared) != panvar::GenotypeRunStatus::Complete;
+        } catch (const std::exception&) {
+            failed = true;
+        }
+        require(failed, "fixture: a sample with unreadable reads must fail");
+        require(panvar::run_genotype_prepared(sample("prep_after_broken", 'B', 1, lib1), *prepared) == cold_status["B_t1"],
+                "the sample after a failure must run");
+        require_same_science("prep_cold_B_t1", "prep_after_broken", "after a failing sample");
+    }
+    // incompatible inputs and settings: refused before any output, never analysed against the object
+    {
+        write_tiny_locus("prep_other.gfa", 80, 71);
+        {
+            std::ofstream curation(path("prep_curation.txt"));
+            curation << locus.reference_name << '\n';
+        }
+        {
+            std::ofstream bubbles(path("prep_bubbles.csv"));
+            bubbles << "not,used\n";
+        }
+        const std::vector<std::pair<std::string, std::function<void(panvar::GenotypeCommandOptions&)>>> changes = {
+            {"graph", [&](panvar::GenotypeCommandOptions& o) { o.gfa_path = path("prep_other.gfa"); }},
+            {"reference", [&](panvar::GenotypeCommandOptions& o) { o.reference_path = "sampleA#1#chr1:0-101"; }},
+            {"bubbles", [&](panvar::GenotypeCommandOptions& o) { o.bubbles_path = path("prep_bubbles.csv"); }},
+            {"min_variant_bp", [&](panvar::GenotypeCommandOptions& o) { o.min_variant_bp = 40; }},
+            {"curation", [&](panvar::GenotypeCommandOptions& o) { o.curation_manifest_path = path("prep_curation.txt"); }},
+            {"kmer", [&](panvar::GenotypeCommandOptions& o) { o.kmer_size = 23; }},
+            {"syncmer", [&](panvar::GenotypeCommandOptions& o) { o.syncmer_s = 9; }},
+        };
+        for (const auto& [what, change] : changes) {
+            panvar::GenotypeCommandOptions o = sample("prep_changed_" + what, 'A', 1, lib1);
+            change(o);
+            std::filesystem::remove(path("prep_changed_" + what + ".mosaic_status.tsv"));   // a scratch dir may hold an old run
+            bool refused = false;
+            try {
+                (void)panvar::run_genotype_prepared(o, *prepared);
+            } catch (const panvar::PreparedLocusMismatch&) {
+                refused = true;
+            }
+            require(refused, "a changed " + what + " must refuse the prepared locus");
+            require(!exists(path("prep_changed_" + what + ".mosaic_status.tsv")), "a refused sample writes no output (" + what + ")");
+        }
+        // after the refusals, the object still serves the valid samples
+        require(panvar::run_genotype_prepared(sample("prep_after_refusals", 'A', 1, lib1), *prepared) == cold_status["A_t1"],
+                "the object still serves after refusals");
+        require_same_science("prep_cold_A_t1", "prep_after_refusals", "after refusals");
+        // a changed graph needs its own preparation (one more build), and then runs
+        panvar::GenotypeCommandOptions other = sample("prep_other_cold", 'A', 1, lib1);
+        other.gfa_path = path("prep_other.gfa");
+        const panvar::GenotypeRunStatus other_cold = panvar::run_genotype(other);
+        const std::uint64_t before_other = panvar::prepared_locus_builds();
+        const auto other_prepared = panvar::prepare_genotype_locus(other);
+        require(panvar::prepared_locus_builds() == before_other + 1, "a changed graph is prepared again");
+        other.out_prefix = path("prep_other_prepared");
+        require(panvar::run_genotype_prepared(other, *other_prepared) == other_cold, "the re-prepared graph runs");
+        require_same_science("prep_other_cold", "prep_other_prepared", "re-prepared graph");
+    }
+    // the command path (genotype, dosage, locus table) against the prepared locus, at the CLI's own defaults. Its outputs
+    // go in a subdirectory: the command appends the headline filter columns, which test_block_quality_columns (a scan of
+    // the scratch directory's run_genotype tables) does not expect.
+    {
+        std::filesystem::create_directories(path("prep_cmd"));
+        const auto args = [&](const std::string& prefix, char which) {
+            return std::vector<std::string>{"--graph", path("prep_locus.gfa"), "--reference-path", "sampleA#1#chr1:0-100",
+                                            "--reads1", path(std::string("prep_") + which + "_r1.fq"), "--reads2",
+                                            path(std::string("prep_") + which + "_r2.fq"), "--library", lib1, "--kmer-size",
+                                            "21", "--syncmer-s", "11", "--max-mosaic-candidates", "8", "--threads", "1",
+                                            "--quiet", "--out", path(prefix)};
+        };
+        const std::uint64_t before_cmd = panvar::prepared_locus_builds();
+        const auto command_locus = panvar::prepare_genotype_locus(args("prep_cmd/prepare", 'A'));
+        const std::string command_digest = command_locus->digest();
+        for (const char which : {'A', 'B', 'A'}) {
+            const std::string cold = std::string("prep_cmd/cold_") + which, warm = std::string("prep_cmd/warm_") + which;
+            const int a = panvar::run_genotype_command(args(cold, which));
+            const int b = panvar::run_genotype_command_prepared(args(warm, which), *command_locus);
+            require(a == b, std::string("command exit codes must agree for sample ") + which);
+            const auto sa = read_status(path(cold + ".mosaic_status.tsv")), sb = read_status(path(warm + ".mosaic_status.tsv"));
+            std::set<std::string> keys;
+            for (const auto& kv : sa) keys.insert(kv.first);
+            for (const auto& kv : sb) keys.insert(kv.first);
+            for (const std::string& k : keys) {
+                const auto x = sa.find(k), y = sb.find(k);
+                const bool same = x != sa.end() && y != sb.end() && x->second == y->second;
+                require(same || indexed_allowed_key(k) || k == "prefix" || k == "out_prefix",
+                        std::string("command path, sample ") + which + ": status key " + k + " differs");
+            }
+            for (const char* suffix : {".genotypes.tsv", ".block_genotypes.tsv", ".mosaic_candidates.tsv", ".mosaic_scores.tsv",
+                                       ".mosaic_haplotypes.fa", ".equivalence_set.tsv", ".library_sensitivity.tsv",
+                                       ".dosage_status.tsv", ".dosage_blocks.tsv", ".dosage_census.tsv", ".dosage_features.tsv",
+                                       ".dosage_repairs.tsv", ".locus_genotype.tsv"}) {
+                require(exists(path(cold + suffix)) == exists(path(warm + suffix)), std::string("command path: ") + suffix + " presence");
+                if (!exists(path(cold + suffix))) continue;
+                std::string x = slurp(path(cold + suffix)), y = slurp(path(warm + suffix));
+                if (std::string(suffix) == ".dosage_status.tsv") {   // its timing rows differ by run
+                    const auto strip = [](const std::string& t) {
+                        std::string out;
+                        std::istringstream in(t);
+                        for (std::string line; std::getline(in, line);) if (line.rfind("seconds_", 0) != 0) out += line + "\n";
+                        return out;
+                    };
+                    x = strip(x);
+                    y = strip(y);
+                }
+                const auto placeheld = [](std::string text, const std::string& prefix) {   // the run's own name only
+                    for (std::size_t at = text.find(prefix); at != std::string::npos; at = text.find(prefix, at + 5)) {
+                        text.replace(at, prefix.size(), "<RUN>");
+                    }
+                    return text;
+                };
+                const auto base = [](const std::string& prefix) { return prefix.substr(prefix.rfind('/') + 1); };
+                x = placeheld(placeheld(placeheld(x, path(cold)), cold), base(cold));
+                y = placeheld(placeheld(placeheld(y, path(warm)), warm), base(warm));
+                require(x == y, std::string("command path: ") + suffix + " differs for sample " + which);
+            }
+        }
+        require(panvar::prepared_locus_builds() == before_cmd + 1 && command_locus->digest() == command_digest,
+                "the command route prepares once and leaves the object unchanged");
+    }
+    require(prepared->digest() == digest, "the prepared locus is unchanged after every analysis");
+    std::cout << "  prepared locus: " << runs << " prepared runs (A-B-A, reversed, repeated; 1 and 4 threads; two declared "
+              << "libraries and auto) equal their cold runs; prepared once; digest unchanged; 7 incompatible changes refused "
+                 "before output; a failing sample then a valid one; a changed graph re-prepared; command path (dosage, "
+                 "locus table) identical\n";
+}
+
+
+// ---- I3-A.1: between-sample cleanup is scientifically invisible ---------------------------------------------------------
+// The same distinct samples as test_prepared_locus (run after it, reusing its cold references made WITHOUT any cleanup):
+// A-B-A against one prepared locus with release_between_samples() after every sample, a failing sample followed by a
+// valid one, 1 and 4 threads, and cold runs with the release between them. Every result must equal its cold reference
+// (science, status, trajectory); the release must empty the process-global residue; the prepared locus must be
+// untouched (digest) and not rebuilt.
+void test_prepared_locus_cleanup() {
+    const std::string lib1 = path("lib.txt");
+    const auto sample = [&](const std::string& name, char which, std::size_t threads) {
+        panvar::GenotypeCommandOptions o = repair_options(name, path(std::string("prep_") + which + "_r1.fq"),
+                                                          path(std::string("prep_") + which + "_r2.fq"), "prep_locus.gfa");
+        o.max_mosaic_candidates = 8;
+        o.threads = threads;
+        o.library_path = lib1;
+        return o;
+    };
+    const auto trajectory = [](const std::string& file) {
+        std::ifstream in(file);
+        std::string line, out;
+        while (std::getline(in, line)) {
+            std::size_t at = 0;
+            for (int k = 0; k < 28 && at != std::string::npos; ++k) at = line.find('\t', at + 1);
+            out += line.substr(0, at) + "\n";
+        }
+        return out;
+    };
+    const auto same_as_cold = [&](const std::string& cold, const std::string& run) {
+        require_same_science(cold, run, "cleanup, " + run);
+        require(exists(path(cold + ".repair_rounds.tsv")) == exists(path(run + ".repair_rounds.tsv")) &&
+                    (!exists(path(cold + ".repair_rounds.tsv")) ||
+                     trajectory(path(cold + ".repair_rounds.tsv")) == trajectory(path(run + ".repair_rounds.tsv"))),
+                run + ": the adaptive trajectory must be the cold run's");
+    };
+    const auto release = [&](const std::string& after) {
+        const panvar::BetweenSampleCleanup c = panvar::release_between_samples();
+        require(panvar::retained_process_storage().total() == 0, after + ": the release must empty the process-global residue");
+        return c.released.total();
+    };
+    const std::shared_ptr<const panvar::PreparedLocus> prepared = panvar::prepare_genotype_locus(sample("clean_prepare", 'A', 1));
+    const std::string digest = prepared->digest();
+    const std::uint64_t builds = panvar::prepared_locus_builds();
+    std::uint64_t released = 0;
+    const std::vector<std::pair<std::string, std::string>> order = {{"A_t1", "clean_run0"}, {"B_t1", "clean_run1"},
+                                                                    {"A_t1", "clean_run2"}, {"B_t4", "clean_run3"},
+                                                                    {"A_t4", "clean_run4"}};
+    for (const auto& [tag, name] : order) {
+        const char which = tag[0];
+        const std::size_t threads = tag.back() == '4' ? 4 : 1;
+        (void)panvar::run_genotype_prepared(sample(name, which, threads), *prepared);
+        same_as_cold("prep_cold_" + tag, name);
+        released += release(name);
+        require(prepared->digest() == digest, name + ": the prepared locus is untouched by the release");
+    }
+    // a failing sample, the release, then a valid one
+    {
+        panvar::GenotypeCommandOptions broken = sample("clean_broken", 'A', 1);
+        broken.reads1_path = path("prep_missing_r1.fq");
+        try {
+            (void)panvar::run_genotype_prepared(broken, *prepared);
+        } catch (const std::exception&) {
+        }
+        released += release("clean_broken");
+        (void)panvar::run_genotype_prepared(sample("clean_after_broken", 'B', 1), *prepared);
+        same_as_cold("prep_cold_B_t1", "clean_after_broken");
+    }
+    // cold runs with the release between them
+    for (const std::string tag : {"A_t1", "B_t1", "A_t4"}) {
+        const std::string name = "clean_cold_" + tag;
+        (void)panvar::run_genotype(sample(name, tag[0], tag.back() == '4' ? 4 : 1));
+        same_as_cold("prep_cold_" + tag, name);
+        released += release(name);
+    }
+    require(panvar::prepared_locus_builds() == builds && prepared->digest() == digest, "prepared once, untouched");
+    require(released > 0, "the samples must leave process-global residue for the release to remove (vacuous otherwise)");
+    std::cout << "  prepared locus cleanup: A-B-A, threads 1/4, a failure then success and cold runs, each with the "
+              << "between-sample release (" << released << " bytes of residue released in total), equal their cold "
+                 "references; the prepared locus untouched and not rebuilt\n";
+}
+
+// ---- I3-C: a persistent prepared-locus index, written once and loaded ------------------------------------------------
+// The same distinct samples (cold references from test_prepared_locus): two independent preparations write identical
+// bytes; the written index reads, rewrites byte-identically and loads to an object equal to the prepared one; samples
+// A-B-A, 1 and 4 threads, a second declared library and --library auto analysed against the LOADED object equal their
+// cold runs (science, status, trajectory); the status records the origin and the file checksum; a changed graph is
+// refused before output.
+void test_prepared_locus_index() {
+    const std::string lib1 = path("lib.txt"), lib2 = path("prep_lib2.txt");
+    const auto sample = [&](const std::string& name, char which, std::size_t threads, const std::string& library) {
+        panvar::GenotypeCommandOptions o = repair_options(name, path(std::string("prep_") + which + "_r1.fq"),
+                                                          path(std::string("prep_") + which + "_r2.fq"), "prep_locus.gfa");
+        o.max_mosaic_candidates = 8;
+        o.threads = threads;
+        o.library_path = library;
+        return o;
+    };
+    const auto trajectory = [](const std::string& file) {
+        std::ifstream in(file);
+        std::string line, out;
+        while (std::getline(in, line)) {
+            std::size_t at = 0;
+            for (int k = 0; k < 28 && at != std::string::npos; ++k) at = line.find('\t', at + 1);
+            out += line.substr(0, at) + "\n";
+        }
+        return out;
+    };
+    const panvar::PreparedLocusPreparation one = panvar::prepare_genotype_locus_record(sample("index_prepare1", 'A', 1, lib1));
+    const panvar::PreparedLocusPreparation two = panvar::prepare_genotype_locus_record(sample("index_prepare2", 'B', 4, lib2));
+    const std::string bytes = panvar::encode_prepared_locus(one.record);
+    require(panvar::encode_prepared_locus(two.record) == bytes, "independent preparations (other sample options) write identical bytes");
+    const std::string file = path("prep_index.pvpl"), rewrite = path("prep_index_rewrite.pvpl");
+    std::filesystem::remove(file);      // one named file each: an earlier run of this test may have left them
+    std::filesystem::remove(rewrite);
+    panvar::write_prepared_locus(one.record, file);
+    panvar::write_prepared_locus(panvar::read_prepared_locus_record(file, panvar::PreparedLocusLoadLimits{}), rewrite);
+    require(slurp(rewrite) == bytes && slurp(file) == bytes, "write, read, rewrite: byte-identical");
+    panvar::PreparedLocusLoadReport report;
+    const std::uint64_t builds = panvar::prepared_locus_builds();
+    const std::shared_ptr<const panvar::PreparedLocus> loaded = panvar::load_prepared_locus(file, panvar::PreparedLocusLoadLimits{}, &report);
+    require(panvar::prepared_locus_builds() == builds, "loading is not preparing");
+    require(loaded->digest() == one.locus->digest() && loaded->fingerprint() == one.locus->fingerprint() &&
+                panvar::prepared_locus_model_content_sha256(loaded->model()) == one.record.model_content_sha256 &&
+                panvar::prepared_locus_panel_content_sha256(loaded->panel()) == one.record.panel_content_sha256,
+            "the loaded object equals the prepared one");
+    const std::string digest = loaded->digest();
+    struct Run { std::string tag; char which; std::size_t threads; std::string library; };
+    const std::vector<Run> order = {{"A_t1", 'A', 1, lib1}, {"B_t1", 'B', 1, lib1}, {"A_t1", 'A', 1, lib1}, {"B_t4", 'B', 4, lib1},
+                                    {"A_t4", 'A', 4, lib1}, {"B_lib2", 'B', 1, lib2}, {"A_auto", 'A', 1, "auto"}};
+    std::size_t runs = 0;
+    for (const Run& r : order) {
+        const std::string name = "index_run" + std::to_string(runs++) + "_" + r.tag;
+        (void)panvar::run_genotype_prepared(sample(name, r.which, r.threads, r.library), *loaded);
+        require_same_science("prep_cold_" + r.tag, name, "loaded index, " + name);
+        require(exists(path("prep_cold_" + r.tag + ".repair_rounds.tsv")) == exists(path(name + ".repair_rounds.tsv")) &&
+                    (!exists(path(name + ".repair_rounds.tsv")) ||
+                     trajectory(path("prep_cold_" + r.tag + ".repair_rounds.tsv")) == trajectory(path(name + ".repair_rounds.tsv"))),
+                name + ": the adaptive trajectory must be the cold run's");
+        const auto st = read_status(path(name + ".mosaic_status.tsv"));
+        require(st.at("prepared_locus") == "1" && st.at("prepared_locus_origin") == "loaded" &&
+                    st.at("prepared_locus_file_sha256") == report.file_checksum &&
+                    st.at("prepared_locus_id") == std::to_string(loaded->id()),
+                name + ": the status records a loaded index, its checksum and the runtime id");
+        require(loaded->digest() == digest, name + ": the loaded locus is unchanged by an analysis");
+    }
+    {   // a changed graph: refused before any output
+        panvar::GenotypeCommandOptions o = sample("index_changed_graph", 'A', 1, lib1);
+        o.gfa_path = path("prep_other.gfa");
+        std::filesystem::remove(path("index_changed_graph.mosaic_status.tsv"));
+        bool refused = false;
+        try {
+            (void)panvar::run_genotype_prepared(o, *loaded);
+        } catch (const panvar::PreparedLocusMismatch&) {
+            refused = true;
+        }
+        require(refused && !exists(path("index_changed_graph.mosaic_status.tsv")), "a changed graph refuses the loaded index before output");
+    }
+    // I3-D: the same samples against an index carrying the persisted panel: loaded without a pre-count or a build, every
+    // panel field equal to the prepared (freshly built) panel, and every analysis equal to its cold run
+    const panvar::PreparedLocusPreparation with_panel = panvar::prepare_genotype_locus_record(sample("index_prepare_panel", 'A', 1, lib1), true);
+    const std::string panel_file = path("prep_index_panel.pvpl");
+    std::filesystem::remove(panel_file);
+    panvar::write_prepared_locus(with_panel.record, panel_file);
+    const std::uint64_t panel_builds = panvar::marker_panel_builds(), precounts = panvar::prepared_locus_panel_precounts();
+    panvar::PreparedLocusLoadReport panel_report;
+    const auto panel_loaded = panvar::load_prepared_locus(panel_file, panvar::PreparedLocusLoadLimits{}, &panel_report);
+    require(panvar::marker_panel_builds() == panel_builds && panvar::prepared_locus_panel_precounts() == precounts &&
+                panel_loaded->panel_source() == "loaded",
+            "the panel route loads without a pre-count or a panel build");
+    require(panvar::prepared_marker_panel_difference(panel_loaded->panel(), with_panel.locus->panel()).empty() &&
+                panel_loaded->digest() == one.locus->digest(),
+            "the persisted panel equals the freshly built one, field by field");
+    require(loaded->panel_source() == "rebuilt", "the v1 index's panel is rebuilt");
+    std::size_t panel_runs = 0;
+    for (const Run& r : order) {
+        const std::string name = "index_panel_run" + std::to_string(panel_runs++) + "_" + r.tag;
+        (void)panvar::run_genotype_prepared(sample(name, r.which, r.threads, r.library), *panel_loaded);
+        require_same_science("prep_cold_" + r.tag, name, "panel-loaded index, " + name);
+        require(exists(path("prep_cold_" + r.tag + ".repair_rounds.tsv")) == exists(path(name + ".repair_rounds.tsv")) &&
+                    (!exists(path(name + ".repair_rounds.tsv")) ||
+                     trajectory(path("prep_cold_" + r.tag + ".repair_rounds.tsv")) == trajectory(path(name + ".repair_rounds.tsv"))),
+                name + ": the adaptive trajectory must be the cold run's");
+        const auto st = read_status(path(name + ".mosaic_status.tsv"));
+        require(st.at("prepared_locus_origin") == "loaded" && st.at("prepared_locus_panel_source") == "loaded" &&
+                    st.at("prepared_locus_file_sha256") == panel_report.file_checksum,
+                name + ": the status records the panel-loaded index");
+    }
+    require(read_status(path("index_run0_A_t1.mosaic_status.tsv")).at("prepared_locus_panel_source") == "rebuilt",
+            "the v1-loaded runs record a rebuilt panel");
+    std::cout << "  prepared locus index: independent preparations byte-identical (" << bytes.size() << " B); write/read/"
+              << "rewrite identical; " << runs << " analyses against the LOADED index (A-B-A, threads 1/4, two declared "
+              << "libraries and auto) equal their cold runs; origin and file checksum in the status; a changed graph refused; "
+              << panel_runs << " analyses against the PANEL-loaded index (no pre-count, no panel build; panel field-equal to a "
+              << "fresh build) equal their cold runs\n";
+}
+
 int main(int argc, char** argv) {
     if (argc < 2) {
         std::cerr << "usage: genotype_command_e2e_test <scratch dir> [source dir]\n";
         return 2;
     }
     dir = argv[1];
+    // I3-C: a focused run of the prepared-locus gates only (they need nothing but the declared library)
+    if (const char* only = std::getenv("PANVAR_E2E_ONLY"); only != nullptr && std::string(only) == "prepared_locus") {
+        try {
+            std::filesystem::create_directories(dir);
+            write_library(path("lib.txt"));
+            test_prepared_locus();
+            test_prepared_locus_cleanup();
+            test_prepared_locus_index();
+            std::cout << "genotype command e2e (prepared_locus only): PASS\n";
+            return 0;
+        } catch (const std::exception& error) {
+            std::cerr << "genotype command e2e (prepared_locus only): FAIL: " << error.what() << '\n';
+            return 1;
+        }
+    }
     try {
         test_end_to_end();
         test_refusals();
@@ -2901,6 +3970,18 @@ int main(int argc, char** argv) {
         test_adaptive_completion();
         test_representation_guard_outside_pool();
         test_watchdog_and_interruption();
+        test_indexed_union_backend();
+        test_adaptive_fine_windows();
+        test_store_layout_and_timing_detail();
+        test_fused_anchor_seeding();
+        test_marker_proposal_reuse();
+        test_prepared_combination_terms();
+        test_gap_recursion_backend();
+        test_verification_census();
+        test_emission_handoff();
+        test_prepared_locus();
+        test_prepared_locus_cleanup();
+        test_prepared_locus_index();
         if (argc >= 3) test_profile(argv[2]);
         test_block_quality_columns();
         std::cout << "genotype command end-to-end: PASS\n";

@@ -123,6 +123,9 @@ MarkerModelParameters proposal_marker_parameters(
     std::size_t kmer_size,
     std::size_t syncmer_s);
 
+// I3-D: completed-or-attempted build_marker_panel executions in this process (tests prove a route never built one).
+std::uint64_t marker_panel_builds();
+
 PreparedMarkerPanel build_marker_panel(
     const PreparedGenotypeModel& model,
     std::size_t kmer_size,
@@ -136,5 +139,42 @@ PreparedProposalEmissions build_proposal_emissions(
     const PreparedMarkerPanel& panel,
     const MarkerObservations& observations,
     const MarkerModelParameters& parameters);
+
+// ---- I2-E (EXPERIMENTAL): exact reuse of marker-proposal contributions -------------------------------------------------
+// Within one block of one call, a marker's contribution to an allele pair -- poisson_log_kernel(count, mean) minus the
+// marker's baseline kernel, mean = background + per_copy * (2 * fixed + copies) -- depends only on the marker and the
+// pair's combined variable copies, so the allele-pair loop recomputes the same term many times. With reuse on, each
+// block holds a lazily filled table: per marker, entries for copies 1 .. 2 * (the marker's largest copy count among the
+// block's alleles), each evaluated once by the SAME helper the direct path uses and then served. The traversal, the
+// sparse merge and the summation order are the direct path's own (one shared loop). The table is per call and per block
+// (built from this call's observations and parameters, released after the block); its budget bounds the RETAINED
+// storage only -- the allocated capacity of the table and its two per-marker index vectors -- and markers whose range
+// does not fit (admitted in marker order) are evaluated directly. It does not bound the temporary planning arrays (each
+// marker's largest copy count and its tentative offset) that every enabled block allocates to decide admission, even
+// when nothing is admitted; those are reported apart (peak_planning_bytes). Off (the default and the three-argument
+// overload): every term evaluated directly, and nothing is allocated for reuse.
+struct ProposalReuseOptions {
+    bool enabled = false;
+    std::size_t table_budget_bytes = 0;   // per block
+};
+struct ProposalReuseReport {
+    bool enabled = false;
+    std::uint64_t table_budget_bytes = 0;
+    std::uint64_t visits = 0;     // marker visits in the allele-pair merge: one contribution each
+    std::uint64_t executed = 0;   // contributions evaluated (table fills plus direct evaluations)
+    std::uint64_t reused = 0;     // contributions served from a table
+    std::uint64_t fallback = 0;   // of executed: direct because the marker's range was not tabled
+    std::uint64_t markers_tabled = 0, markers_not_tabled = 0;
+    std::uint64_t peak_table_bytes = 0;     // the largest block's retained table and index, allocated capacity (budgeted)
+    std::uint64_t peak_planning_bytes = 0;  // the largest block's temporary planning arrays (not budgeted)
+    double seconds_table_build = 0.0;     // range scan and allocation, summed over blocks
+    double seconds_total = 0.0;
+};
+PreparedProposalEmissions build_proposal_emissions(
+    const PreparedMarkerPanel& panel,
+    const MarkerObservations& observations,
+    const MarkerModelParameters& parameters,
+    const ProposalReuseOptions& reuse,
+    ProposalReuseReport* report = nullptr);
 
 } // namespace panvar

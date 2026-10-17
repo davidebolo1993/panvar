@@ -1,4 +1,8 @@
 #include "panvar/genotype_command.hpp"
+#include "panvar/prepared_locus.hpp"
+#include "panvar/prepared_locus_file.hpp"
+#include "prepared_locus_parts.hpp"
+#include "panvar/verification_census.hpp"
 #include "panvar/genotype_dosage_integrate.hpp"
 #include "panvar/genotype_dosage_repair.hpp"
 #include "panvar/gz_reader.hpp"
@@ -90,6 +94,20 @@ struct RunWatch {
 RunWatch* g_watch = nullptr;
 // Provenance of the inputs, by content, for the run in flight.
 std::vector<std::pair<std::string, std::string>> g_input_hashes;
+// I2-E: what the marker-proposal contribution reuse did in this run (reported when its key is set)
+ProposalReuseReport g_proposal_reuse;
+// I2-G: the sampled verification profile of the initial union pass alone
+VerificationProfile g_union_verification;
+std::uint64_t g_union_end_footprint = 0;   // I2-K (measurement): physical footprint right after the union pass
+// I3-A: what the status says about a prepared locus this run used (reset at every run start).
+struct PreparedLocusUse {
+    bool used = false;
+    std::uint64_t id = 0;
+    std::string key_sha256;
+    std::string origin, file_checksum;   // I3-C: "prepared" or "loaded"; a loaded index's header SHA-256
+    std::string panel_source;            // I3-D: "prepared", "loaded" or "rebuilt"
+};
+PreparedLocusUse g_prepared_use;
 
 std::string minimal_status(const RunWatch& watch, const std::string& state, const std::string& note) {
     const FootprintSample footprint = physical_footprint();
@@ -203,7 +221,19 @@ struct StageTimings {
     double rescoring_placement_and_mass = 0.0;
     double rescoring_diploid_combination = 0.0;
     double total = 0.0;
+    // I2-C (measurement only): disjoint wall sub-stages, reported under the timing_detail key as seconds_detail_<name>
+    std::vector<std::pair<std::string, double>> detail;
 };
+
+// I2-H: the profile key's value names.
+const char* gap_recursion_backend_name(bool fixed_geometry) {
+    return fixed_geometry ? "fixed_geometry_experimental" : "scaled_reference";
+}
+
+GapRecursionBackend gap_recursion_backend_of(const GenotypeCommandOptions& options) {
+    return options.gap_recursion_fixed_geometry ? GapRecursionBackend::fixed_geometry_experimental
+                                                : GapRecursionBackend::scaled_reference;
+}
 
 // The candidate set's scope, derived ONCE and shared by the status and every per-block row. PANEL_ONLY
 // is not a kind of COMPLETE: both COMPLETE and CONDITIONAL describe what a search returned, and in a
@@ -387,6 +417,9 @@ struct CandidateSetReport {
     UnionPlacementCacheReport union_placement_cache;
     UnionOriginCacheReport union_origin_cache;
     UnionPrefilterCacheReport union_prefilter_cache;
+    // I2-A: set when the initial union pass ran on the experimental indexed backend (whether it completed or refused)
+    bool indexed_union = false;
+    IndexedUnionReport indexed;
     StartSortReport start_sort;
     // True when no beam ran at all: K = 0, no phase audit and no positive development prefix, so the
     // candidate set is exactly the panel and nothing about it is conditional on a search. Reported as
@@ -520,6 +553,10 @@ struct RepairReport {
     std::size_t tie_peak_pending_descriptors = 0;
     std::uint64_t tie_seed_cache_built = 0, tie_seed_cache_admitted = 0, tie_seed_cache_rejected = 0;
     std::uint64_t tie_seed_cache_hits = 0, tie_seed_cache_physical_origins = 0, tie_seed_cache_peak_bytes = 0;
+    // I4-C: a rejected seed's own new slots are released at once (their work stays charged); the bytes given back, the
+    // most held at once counting a just-built seed before its admission decision, and the charged seed metadata
+    std::uint64_t tie_seed_cache_rejected_released_bytes = 0, tie_seed_cache_transient_peak_bytes = 0;
+    std::uint64_t tie_seed_cache_metadata_bytes = 0;
     double seconds_tie_seed_cache_build = 0.0;
     // The representation-conflict guard, over the called blocks (NA for a no-call: never relabelled LowQual).
     std::string locus_filter = "NA";
@@ -539,6 +576,12 @@ struct RepairReport {
     FragmentScoringCounters cumulative;
     std::uint64_t footprint_at_repair_start = 0;
     std::uint64_t origin_cache_bytes_end = 0;
+    FineWindowReport fine_window;   // I2-B: the adaptive search context's window enumeration (either path)
+    // I2-C (measurement only): the adaptive search's wall, split without overlap
+    bool timed = false;
+    double seconds_pre_search = 0.0, seconds_search_construction = 0.0, seconds_search_run = 0.0, seconds_post_search = 0.0;
+    RepairStageSeconds stages;
+    std::uint64_t full_placements = 0;   // I2-D: full haplotype placements by the search's context
     std::size_t enumeration_workers = 0;
     double seconds = 0.0;
     double seconds_scoring = 0.0;
@@ -560,6 +603,65 @@ void write_repair_report(std::ostream& out, const RepairReport& r) {
         << "\nrepair_max_physical_origins\t" << o.repair_max_physical_origins << "\nrepair_max_state_classes\t"
         << o.repair_max_state_classes << "\nrepair_max_piece_hits\t" << o.repair_max_piece_hits
         << "\nrepair_max_latent_pairs\t" << o.repair_max_latent_pairs << '\n';
+    if (o.setting_sources.count("adaptive_fused_seed") != 0) {
+        out << "adaptive_fused_seed\t" << (o.adaptive_fused_seed ? "1" : "0") << "\nadaptive_full_placements\t"
+            << r.full_placements << '\n';
+    }
+    if (o.timing_detail && r.timed) {
+        // I2-C (measurement only): the adaptive search's wall without overlap (all wall seconds; worker-elapsed figures
+        // carry the worker_seconds_ prefix elsewhere). pre_search: from the stage's start to the search's construction
+        // (neighbourhood bound, the union pool); construction: the search and its scoring context (fragment preparation);
+        // run: the search's rounds, split below; post_search: from the search's return to the status, less tie branching
+        // and the representation guard (reported apart): the pooled decision, phase and outputs.
+        const RepairStageSeconds& g = r.stages;
+        out << std::fixed << std::setprecision(3)
+            << "seconds_detail_adaptive_pre_search\t" << r.seconds_pre_search
+            << "\nseconds_detail_adaptive_search_construction\t" << r.seconds_search_construction
+            << "\nseconds_detail_adaptive_search_run\t" << r.seconds_search_run
+            << "\nseconds_detail_adaptive_post_search\t" << r.seconds_post_search
+            << "\nseconds_detail_adaptive_seed_placement_census\t" << g.seed_placement_census
+            << "\nseconds_detail_adaptive_incumbent_spelling\t" << g.incumbent_spelling
+            << "\nseconds_detail_adaptive_neighbour_generation\t" << g.neighbour_generation
+            << "\nseconds_detail_adaptive_neighbour_spelling\t" << g.neighbour_spelling
+            << "\nseconds_detail_adaptive_neighbour_priors\t" << g.neighbour_priors
+            << "\nseconds_detail_adaptive_scoring\t" << g.scoring
+            << "\nseconds_detail_adaptive_scored_pair_priors\t" << g.scored_pair_priors
+            << "\nseconds_detail_adaptive_pool_hook\t" << g.pool_hook
+            << "\nseconds_detail_adaptive_certification_and_move\t" << g.certification_and_move
+            << "\nseconds_detail_adaptive_promotion_release\t" << g.promotion_release
+            << "\nseconds_detail_adaptive_memory_snapshots\t" << g.memory_snapshots
+            << "\nseconds_detail_adaptive_trajectory_hook\t" << g.trajectory_hook
+            << "\nseconds_detail_adaptive_rounds_wall\t" << g.rounds_wall
+            << "\nseconds_detail_adaptive_round_unattributed\t" << g.round_remainder()
+            << "\nseconds_detail_adaptive_run_outside_rounds\t" << r.seconds_search_run - g.rounds_wall << '\n';
+        out.unsetf(std::ios::floatfield);
+        out << std::setprecision(17);
+    }
+    if (o.setting_sources.count("adaptive_window_discovery") != 0) {
+        // I2-B (EXPERIMENTAL): the adaptive search's window enumeration, reported whenever the profile named its path
+        // (either value), so a control run and a fine run report the same split. Provenance, work, memory and time only.
+        const FineWindowReport& w = r.fine_window;
+        out << "adaptive_window_discovery\t" << o.adaptive_window_discovery
+            << "\nadaptive_window_discovery_scope\tadd_repaired_haplotypes_rounds"
+            << "\nadaptive_window_enumerations\t" << w.enumerations
+            << "\nworker_seconds_adaptive_window_rows\t" << w.seconds_rows
+            << "\nworker_seconds_adaptive_window_pairing\t" << w.seconds_pairing
+            << "\nadaptive_fine_store_budget_bytes\t" << w.budget_bytes
+            << "\nadaptive_fine_max_served_placements\t" << w.served_cap
+            << "\nadaptive_fine_rounds\t" << w.rounds
+            << "\nadaptive_fine_worker_windows\t" << w.worker_windows
+            << "\nadaptive_fine_fallback_windows\t" << w.fallback_windows
+            << "\nadaptive_fine_units_discovered\t" << w.units_discovered
+            << "\nadaptive_fine_units_served\t" << w.units_served
+            << "\nadaptive_fine_units_not_retained\t" << w.units_not_retained
+            << "\nadaptive_fine_placements_discovered\t" << w.placements_discovered
+            << "\nadaptive_fine_placements_served\t" << w.placements_served
+            << "\nadaptive_fine_hash_collisions\t" << w.hash_collisions
+            << "\nadaptive_fine_round_peak_bytes\t" << w.round_peak_bytes
+            << "\nadaptive_fine_round_peak_held_bytes\t" << w.round_peak_held_bytes
+            << "\nadaptive_fine_round_peak_temporary_bytes\t" << w.round_peak_temporary_bytes
+            << "\nadaptive_fine_ledger_scope\tcontainers_only_not_process_memory\n";
+    }
     out << "call_class\t" << r.call_class << "\nno_call_reason\t" << r.no_call_reason << '\n';
     out << "search_conditional\t" << r.search_conditional << "\nrepair_tie_branching\t"
         << (o.repair_tie_branching ? "true" : "false") << "\nrepair_tie_max_branches\t" << o.repair_tie_max_branches
@@ -582,7 +684,10 @@ void write_repair_report(std::ostream& out, const RepairReport& r) {
         << "\ntie_seed_cache_built\t" << r.tie_seed_cache_built << "\ntie_seed_cache_admitted\t" << r.tie_seed_cache_admitted
         << "\ntie_seed_cache_rejected\t" << r.tie_seed_cache_rejected << "\ntie_seed_cache_hits\t" << r.tie_seed_cache_hits
         << "\ntie_seed_cache_physical_origins\t" << r.tie_seed_cache_physical_origins << "\ntie_seed_cache_peak_bytes\t"
-        << r.tie_seed_cache_peak_bytes << "\nseconds_tie_seed_cache_build\t" << r.seconds_tie_seed_cache_build << '\n';
+        << r.tie_seed_cache_peak_bytes << "\nseconds_tie_seed_cache_build\t" << r.seconds_tie_seed_cache_build
+        << "\ntie_seed_cache_rejected_released_bytes\t" << r.tie_seed_cache_rejected_released_bytes
+        << "\ntie_seed_cache_transient_peak_bytes\t" << r.tie_seed_cache_transient_peak_bytes
+        << "\ntie_seed_cache_metadata_bytes\t" << r.tie_seed_cache_metadata_bytes << '\n';
     out << "representation_guard\t" << (o.representation_guard ? "true" : "false") << "\nrepresentation_guard_rule\t"
         << kRepresentationRule << "\nrepresentation_guard_bound_nats\t" << kRepresentationBoundNats << "\nlocus_filter\t"
         << r.locus_filter << "\nlowqual_blocks\t" << r.lowqual_blocks << "\nnot_evaluated_blocks\t"
@@ -716,6 +821,41 @@ void write_status(
             const auto source = options.setting_sources.find(key);
             table += key + "\t" + genotype_setting_value(options, key) + "\t" +
                      (source == options.setting_sources.end() ? std::string("default") : source->second) + "\n";
+        }
+        // I2-A: the experimental union backend, recorded whenever a profile set it (absent from a default run's table)
+        for (const char* key : {"union_scoring_backend", "indexed_union_store_bytes", "adaptive_window_discovery",
+                                "adaptive_fine_store_bytes", "adaptive_fine_max_served_placements",
+                                "indexed_union_store_layout", "indexed_union_evidence_layout", "timing_detail", "adaptive_fused_seed",
+                                "marker_proposal_reuse_table_bytes", "combination_prepared_library_terms",
+                                "verification_profile_period", "gap_recursion_backend", "verification_census_period",
+                                "dosage_census_backend", "adaptive_emission_handoff"}) {
+            const auto source = options.setting_sources.find(key);
+            if (source == options.setting_sources.end()) continue;
+            const std::string k = key;
+            const std::string value = k == "union_scoring_backend"       ? options.union_scoring_backend
+                                      : k == "indexed_union_store_bytes" ? std::to_string(options.indexed_union_store_bytes)
+                                      : k == "adaptive_window_discovery" ? options.adaptive_window_discovery
+                                      : k == "adaptive_fine_store_bytes" ? std::to_string(options.adaptive_fine_store_bytes)
+                                      : k == "indexed_union_store_layout" ? options.indexed_union_store_layout
+                                      : k == "indexed_union_evidence_layout" ? options.indexed_union_evidence_layout
+                                      : k == "timing_detail"              ? std::string(options.timing_detail ? "1" : "0")
+                                      : k == "adaptive_fused_seed"        ? std::string(options.adaptive_fused_seed ? "1" : "0")
+                                      : k == "marker_proposal_reuse_table_bytes"
+                                          ? std::to_string(options.marker_proposal_reuse_table_bytes)
+                                      : k == "combination_prepared_library_terms"
+                                          ? std::string(options.combination_prepared_library_terms ? "1" : "0")
+                                      : k == "verification_profile_period"
+                                          ? std::to_string(options.verification_profile_period)
+                                      : k == "verification_census_period"
+                                          ? std::to_string(options.verification_census_period)
+                                      : k == "dosage_census_backend"
+                                          ? std::string(options.dosage_census_interned ? "interned_experimental" : "reference")
+                                      : k == "adaptive_emission_handoff"
+                                          ? std::string(options.adaptive_emission_handoff ? "1" : "0")
+                                      : k == "gap_recursion_backend"
+                                          ? std::string(gap_recursion_backend_name(options.gap_recursion_fixed_geometry))
+                                                                         : std::to_string(options.adaptive_fine_max_served_placements);
+            table += k + "\t" + value + "\t" + source->second + "\n";
         }
         atomic_write(options.out_prefix + ".settings.tsv", table);
     }
@@ -982,6 +1122,94 @@ void write_status(
                 << q.out_of_place << "\nstart_sort_in_place\t" << q.in_place << "\nstart_sort_fallbacks\t"
                 << q.fallbacks << "\nthreads_start_sort_peak_worker_bytes\t" << q.peak_worker_bytes << '\n';
         }
+        if (candidate_set->indexed_union) {
+            // I2-A (EXPERIMENTAL): which stage used the indexed backend, its guards and what it did. Present only
+            // when the profile selected it; every key here is backend provenance, executed work, memory or time.
+            const IndexedUnionReport& x = candidate_set->indexed;
+            const ContentIndexReport& ix = x.index;
+            const ContentBatchReport& b = x.batch;
+            const std::ios_base::fmtflags saved_flags = out.flags();
+            const std::streamsize saved_precision = out.precision();
+            out << "union_scoring_backend\tindexed_fine_experimental\n"
+                << "union_scoring_backend_stages\tinitial_union_pass\n"
+                << "union_scoring_backend_unchanged_stages\tadaptive_repair_prepared_context,dosage,phase_audit_rerank\n"
+                << "indexed_union_refusal\t" << (x.refusal.empty() ? std::string("none") : x.refusal) << '\n'
+                << "indexed_union_store_budget_bytes\t" << x.store_budget_bytes
+                << "\nindexed_union_store_charged_bytes\t" << b.store_charged_bytes
+                << "\nindexed_union_store_held_bytes_after_discovery\t" << b.placement_store_bytes
+                << "\nindexed_union_store_layout\t" << b.store_layout
+                << "\nindexed_union_evidence_layout\t" << b.evidence_layout
+                << "\nindexed_union_view_coarse_units\t" << b.view_coarse_units
+                << "\nindexed_union_view_rows_represented\t" << b.view_rows_represented
+                << "\nindexed_union_view_table_bytes\t" << b.view_table_bytes
+                << "\nindexed_union_view_zone_temporary_peak_bytes\t" << b.view_zone_temporary_peak_bytes
+                << "\nindexed_union_view_zone_temporary_bytes_total\t" << b.view_zone_temporary_bytes_total
+                << "\nseconds_indexed_union_view_zone_gather\t" << b.seconds_view_zone_gather
+                << "\nindexed_union_store_budget_basis\t" << (b.store_layout == "exact" ? "allocated_capacity" : "occupied_rows")
+                << "\nindexed_union_store_live_bytes_after_discovery\t" << b.store_live_bytes
+                << "\nindexed_union_store_peak_bytes\t" << b.store_peak_bytes
+                << "\nindexed_union_store_allocated_bytes_total\t" << b.store_allocated_bytes
+                << "\nindexed_union_store_released_bytes_total\t" << b.store_released_bytes
+                << "\nindexed_union_reconstruction_peak_bytes\t" << b.reconstruction_peak_bytes
+                << "\nindexed_union_worker_scratch_bytes\t" << b.worker_scratch_bytes
+                << "\nindexed_union_index_metadata_bytes\t" << ix.unit_bytes + ix.occurrence_bytes
+                << "\nindexed_union_max_read_bp\t" << x.max_read_bp
+                << "\nindexed_union_prefilter_status\t" << b.prefilter_status
+                << "\nindexed_union_origin_reuse_status\t" << b.origin_reuse_status
+                << "\nindexed_union_haplotypes\t" << ix.haplotypes
+                << "\nindexed_union_segment_occurrences\t" << ix.segment_occurrences
+                << "\nindexed_union_window_occurrences\t" << ix.window_occurrences
+                << "\nindexed_union_interior_units\t" << ix.interior_units << "\nindexed_union_window_units\t" << ix.window_units
+                << "\nindexed_union_fine_units\t" << ix.fine_units << "\nindexed_union_fine_occurrences\t" << ix.fine_occurrences
+                << "\nindexed_union_unit_bytes\t" << ix.unit_bytes << "\nindexed_union_fine_unit_bytes\t" << ix.fine_unit_bytes
+                << "\nindexed_union_coarse_interior_bytes\t" << ix.coarse_interior_bytes
+                << "\nindexed_union_window_bytes\t" << ix.window_bytes << "\nindexed_union_hash_collisions\t" << ix.hash_collisions
+                << "\nindexed_union_units_discovered_directly\t" << b.units_discovered_directly
+                << "\nindexed_union_unit_bases_scanned\t" << b.unit_bases_scanned
+                << "\nindexed_union_executed_piece_hits\t" << b.piece_hits
+                << "\nindexed_union_executed_proposed_starts\t" << b.proposed_starts
+                << "\nindexed_union_owned_starts_skipped_before_verification\t" << b.owned_starts_skipped_before_verification
+                << "\nindexed_union_executed_unique_starts\t" << b.unique_starts
+                << "\nindexed_union_executed_full_read_verifications\t" << b.full_read_verifications
+                << "\nindexed_union_executed_prefilters\t" << b.executed_prefilters
+                << "\nindexed_union_executed_dps\t" << b.executed_dps
+                << "\nindexed_union_emission_cache_entries_held\t" << b.emission_cache_entries_held
+                << "\nindexed_union_emission_cache_table_bytes\t" << b.emission_cache_table_bytes
+                << "\nindexed_union_emission_cache_slab_bytes\t" << b.emission_cache_slab_bytes
+                << "\nindexed_union_emission_cache_component_bytes\t" << b.emission_cache_component_bytes
+                << "\nindexed_union_emission_cache_budgeted_bytes\t" << b.emission_cache_budgeted_bytes
+                << "\nunion_end_phys_footprint_bytes\t" << g_union_end_footprint
+                << "\nindexed_union_unit_placements_kept\t" << b.unit_placements_kept
+                << "\nindexed_union_coarse_units_reconstructed\t" << b.coarse_units_reconstructed
+                << "\nindexed_union_reconstructed_placements\t" << b.reconstructed_placements
+                << "\nindexed_union_expanded_placements\t" << b.expanded_placements
+                << "\nindexed_union_cached_placements_consumed\t" << b.placements_consumed_last
+                << "\nindexed_union_executed_physical_origins\t" << b.counters_last.physical_origins
+                << "\nindexed_union_direct_physical_origins\t" << b.direct_physical_origins
+                << "\nindexed_union_served_physical_origins\t" << b.served_physical_origins
+                << "\nindexed_union_origins_constructed\t" << b.origins_constructed
+                << "\nindexed_union_origin_entities_eligible\t" << b.origin_entities_eligible
+                << "\nindexed_union_origin_entities_admitted\t" << b.origin_entities_admitted
+                << "\nindexed_union_origin_entities_declined\t" << b.origin_entities_declined
+                << "\nindexed_union_origin_held_bytes\t" << b.origin_held_bytes
+                << "\nindexed_union_columns_computed\t" << b.columns_computed_total
+                << "\nindexed_union_pairs_computed\t" << b.pairs_computed_total
+                << "\nthreads_indexed_union_discovery\t" << b.threads_used_discovery
+                << "\nthreads_indexed_union_pairing\t" << b.threads_used_pairing
+                << std::fixed << std::setprecision(3)
+                << "\nseconds_indexed_union_index_build\t" << x.seconds_index_build
+                << "\nseconds_indexed_union_preparation\t" << x.seconds_preparation
+                << "\nseconds_indexed_union_discovery\t" << b.seconds_discovery
+                << "\nseconds_indexed_union_reconstruction\t" << b.seconds_reconstruction
+                << "\nseconds_indexed_union_origin_construction\t" << b.seconds_origin_construction
+                << "\nseconds_indexed_union_expansion_and_pairing\t" << b.seconds_expansion_and_pairing
+                << "\nseconds_indexed_union_combination\t" << b.seconds_candidate_scoring
+                << "\nseconds_indexed_union_release\t" << x.seconds_release
+                << "\nworker_seconds_indexed_union_verification\t" << b.worker_seconds_verification
+                << "\nworker_seconds_indexed_union_pairing\t" << b.worker_seconds_pairing << '\n';
+            out.flags(saved_flags);
+            out.precision(saved_precision);
+        }
         // Derived once, here, and used verbatim by every block row.
         out << "candidate_scope\t"
             << candidate_scope_name(candidate_set->panel_only,
@@ -1097,6 +1325,102 @@ void write_status(
     out << "seconds_prior\t" << timings.prior << '\n';
     out << "seconds_ranking\t" << timings.ranking << '\n';
     out << "seconds_total\t" << timings.total << '\n';
+    if (g_prepared_use.used) {
+        // I3-A: this sample was analysed against a prepared locus (stage 1 and the marker panel were not rebuilt)
+        out << "prepared_locus\t1\nprepared_locus_id\t" << g_prepared_use.id << "\nprepared_locus_key_sha256\t"
+            << g_prepared_use.key_sha256 << '\n';
+        // I3-C: runtime facts only (the index itself never records who loaded it)
+        out << "prepared_locus_origin\t" << g_prepared_use.origin << '\n';
+        if (!g_prepared_use.file_checksum.empty()) out << "prepared_locus_file_sha256\t" << g_prepared_use.file_checksum << '\n';
+        out << "prepared_locus_panel_source\t" << g_prepared_use.panel_source << '\n';   // I3-D
+    }
+    if (options.setting_sources.count("adaptive_emission_handoff") != 0) {
+        // I2-K (EXPERIMENTAL): what the union-to-adaptive emission handoff did (inherited entries are not stage work)
+        const EmissionHandoffReport h = emission_handoff_report();
+        out << "adaptive_emission_handoff\t" << (options.adaptive_emission_handoff ? "1" : "0")
+            << "\nadaptive_emission_handoff_detached\t" << (h.detached ? "1" : "0")
+            << "\nadaptive_emission_handoff_offered\t" << (h.offered ? "1" : "0")
+            << "\nadaptive_emission_handoff_adopted\t" << (h.adopted ? "1" : "0")
+            << "\nadaptive_emission_handoff_refusal\t" << h.refusal
+            << "\nadaptive_emission_handoff_entries\t" << h.entries
+            << "\nadaptive_emission_handoff_allocated_bytes\t" << h.allocated_bytes
+            << "\nadaptive_emission_handoff_budgeted_bytes\t" << h.budgeted_bytes
+            << "\nadaptive_emission_handoff_inherited_hits\t" << h.inherited_hits << '\n';
+    }
+    if (options.setting_sources.count("gap_recursion_backend") != 0) {
+        out << "gap_recursion_backend\t" << gap_recursion_backend_name(options.gap_recursion_fixed_geometry)
+            << "\ngap_recursion_backend_scope\tunion_adaptive_dosage\n";
+    }
+    if (options.verification_profile_period != 0) {
+        // I2-G (MEASUREMENT ONLY): sampled verification attribution, the union pass and the whole run (sampled sums in
+        // nanoseconds; multiply by the period for an estimate of the whole stream's worker time)
+        const auto write = [&](const char* scope, const VerificationProfile& v) {
+            const std::string k = std::string("verify_profile_") + scope + "_";
+            out << k << "period\t" << v.period << '\n' << k << "requests\t" << v.requests << '\n' << k << "sampled\t" << v.sampled
+                << '\n' << k << "ns_total\t" << v.ns_total << '\n' << k << "ns_decision_cache\t" << v.ns_decision << '\n' << k
+                << "ns_prechecks\t" << v.ns_prechecks << '\n' << k << "ns_feasibility_kernel\t" << v.ns_kernel << '\n' << k
+                << "ns_emission_cache_lookup\t" << v.ns_emission_lookup << '\n' << k << "ns_gapped_emission\t" << v.ns_dp << '\n'
+                << k << "ns_row_construction\t" << v.ns_rows << '\n' << k << "ns_unattributed\t"
+                << static_cast<std::int64_t>(v.ns_total) -
+                       static_cast<std::int64_t>(v.ns_decision + v.ns_prechecks + v.ns_kernel + v.ns_emission_lookup + v.ns_dp + v.ns_rows)
+                << '\n' << k << "decision_served\t" << v.sampled_decision_served << '\n' << k << "decision_missed\t"
+                << v.sampled_decision_missed << '\n' << k << "decision_unavailable\t" << v.sampled_decision_unavailable << '\n'
+                << k << "kernels\t" << v.sampled_kernels << '\n' << k << "kernels_feasible\t" << v.sampled_kernel_feasible << '\n'
+                << k << "kernel_paths\tpattern=" << v.kernel_prepared_pattern << ",short_read=" << v.kernel_short_read
+                << ",edlib=" << v.kernel_edlib << '\n' << k << "emission_cache_hits\t" << v.sampled_emission_hits << '\n' << k
+                << "gapped_emissions\t" << v.sampled_dps << '\n' << k << "accepted\t" << v.sampled_accepted << '\n' << k
+                << "band\t" << v.band << '\n';
+            std::vector<std::pair<std::uint64_t, std::string>> shapes;
+            for (const auto& [shape, counts] : v.kernel_shapes) {
+                shapes.push_back({counts.first, std::to_string(shape.first) + ":" + std::to_string(shape.second) + "=" +
+                                                    std::to_string(counts.first) + "/" + std::to_string(counts.second)});
+            }
+            std::sort(shapes.rbegin(), shapes.rend());
+            std::string top;
+            for (std::size_t i = 0; i < shapes.size() && i < 6; ++i) top += (top.empty() ? "" : ",") + shapes[i].second;
+            out << k << "kernel_shapes_distinct\t" << shapes.size() << '\n' << k
+                << "kernel_shapes_top\t" << (top.empty() ? "none" : top) << "\n";
+        };
+        write("union", g_union_verification);
+        write("run", verification_profile_snapshot());
+    }
+    if (options.setting_sources.count("combination_prepared_library_terms") != 0) {
+        // I2-F (EXPERIMENTAL): what preparing the run's library terms removed (counted per combination call)
+        const PreparedLibraryTermsTally t = prepared_library_terms_tally();
+        out << "combination_prepared_library_terms\t" << (options.combination_prepared_library_terms ? "1" : "0")
+            << "\ncombination_prepared_scope\tunion_and_adaptive_combination_not_dosage"
+            << "\ncombination_prepared_calls\t" << t.combinations << "\ncombination_prepared_terms\t" << t.terms
+            << "\ncombination_hypothetical_scalar_logs\t" << t.hypothetical_scalar_logs
+            << "\ncombination_prepared_logs\t" << t.prepared_logs
+            << "\ncombination_net_logs_avoided\t" << t.net_logs_avoided
+            << "\ncombination_hypothetical_scalar_validations\t" << t.hypothetical_scalar_validations
+            << "\ncombination_prepared_validations\t" << t.prepared_validations
+            << "\ncombination_net_validations_avoided\t" << t.net_validations_avoided << '\n';
+    }
+    if (options.setting_sources.count("marker_proposal_reuse_table_bytes") != 0) {
+        // I2-E (EXPERIMENTAL): the proposal emissions' contribution reuse -- work and storage only
+        const ProposalReuseReport& q = g_proposal_reuse;
+        out << "marker_proposal_reuse\t" << (q.enabled ? "on" : "off") << "\nmarker_proposal_reuse_table_budget_bytes\t"
+            << q.table_budget_bytes << "\nmarker_proposal_contribution_visits\t" << q.visits
+            << "\nmarker_proposal_contributions_executed\t" << q.executed << "\nmarker_proposal_contributions_reused\t"
+            << q.reused << "\nmarker_proposal_contributions_fallback\t" << q.fallback
+            << "\nmarker_proposal_reuse_markers_tabled\t" << q.markers_tabled << "\nmarker_proposal_reuse_markers_not_tabled\t"
+            << q.markers_not_tabled << "\nmarker_proposal_reuse_peak_table_bytes\t" << q.peak_table_bytes
+            << "\nmarker_proposal_reuse_peak_planning_bytes\t" << q.peak_planning_bytes
+            << "\nmarker_proposal_reuse_budget_scope\tretained_table_and_index_only"
+            << "\nseconds_marker_proposal_reuse_table_build\t" << q.seconds_table_build
+            << "\nseconds_marker_proposal_emissions_total\t" << q.seconds_total << '\n';
+    }
+    if (options.timing_detail) {
+        // I2-C (measurement only): disjoint wall sub-stages of the model and marker stages, and their unattributed rest
+        double model_named = 0.0, markers_named = 0.0;
+        for (const auto& [name, value] : timings.detail) {
+            out << "seconds_detail_" << name << '\t' << value << '\n';
+            (name.rfind("model_", 0) == 0 ? model_named : markers_named) += value;
+        }
+        out << "seconds_detail_model_unattributed\t" << timings.model - model_named << '\n';
+        out << "seconds_detail_markers_unattributed\t" << timings.markers - markers_named << '\n';
+    }
     if (repair != nullptr) write_repair_report(out, *repair);
     commit_status(path, out.str());
 }
@@ -1199,7 +1523,65 @@ void apply_genotype_setting(const std::string& context, const std::string& key, 
         return value;
     };
     const auto u = [&]() { return whole_u64(key, value); };
-    if (key == "proposal_state_limit") options.proposal_state_limit = u();
+    if (key == "union_scoring_backend") {
+        if (value != "reference" && value != "indexed_fine_experimental") {
+            throw std::runtime_error(context + ": 'union_scoring_backend' is reference or indexed_fine_experimental: " + value);
+        }
+        options.union_scoring_backend = value;
+    }
+    else if (key == "indexed_union_store_bytes") options.indexed_union_store_bytes = u();
+    else if (key == "indexed_union_store_layout") {
+        if (value != "exact" && value != "legacy_i2a") {
+            throw std::runtime_error(context + ": 'indexed_union_store_layout' is exact or legacy_i2a: " + value);
+        }
+        options.indexed_union_store_layout = value;
+    }
+    else if (key == "indexed_union_evidence_layout") {   // I4-B (EXPERIMENTAL)
+        if (value != "reconstructed" && value != "fine_views_experimental") {
+            throw std::runtime_error(context + ": 'indexed_union_evidence_layout' is reconstructed or fine_views_experimental: " + value);
+        }
+        options.indexed_union_evidence_layout = value;
+    }
+    else if (key == "marker_proposal_reuse_table_bytes") options.marker_proposal_reuse_table_bytes = u();
+    else if (key == "verification_profile_period") options.verification_profile_period = static_cast<std::uint32_t>(u());
+    else if (key == "verification_census_period") options.verification_census_period = static_cast<std::uint32_t>(u());
+    else if (key == "adaptive_emission_handoff") {
+        if (value != "0" && value != "1") throw std::runtime_error(context + ": 'adaptive_emission_handoff' is 0 or 1: " + value);
+        options.adaptive_emission_handoff = value == "1";
+    }
+    else if (key == "dosage_census_backend") {
+        if (value == "reference") options.dosage_census_interned = false;
+        else if (value == "interned_experimental") options.dosage_census_interned = true;
+        else throw std::runtime_error(context + ": 'dosage_census_backend' is reference or interned_experimental: " + value);
+    }
+    else if (key == "gap_recursion_backend") {
+        if (value == "scaled_reference") options.gap_recursion_fixed_geometry = false;
+        else if (value == "fixed_geometry_experimental") options.gap_recursion_fixed_geometry = true;
+        else throw std::runtime_error(context + ": 'gap_recursion_backend' is scaled_reference or fixed_geometry_experimental: " + value);
+    }
+    else if (key == "combination_prepared_library_terms") {
+        if (value != "0" && value != "1") {
+            throw std::runtime_error(context + ": 'combination_prepared_library_terms' is 0 or 1: " + value);
+        }
+        options.combination_prepared_library_terms = value == "1";
+    }
+    else if (key == "adaptive_fused_seed") {
+        if (value != "0" && value != "1") throw std::runtime_error(context + ": 'adaptive_fused_seed' is 0 or 1: " + value);
+        options.adaptive_fused_seed = value == "1";
+    }
+    else if (key == "timing_detail") {
+        if (value != "0" && value != "1") throw std::runtime_error(context + ": 'timing_detail' is 0 or 1: " + value);
+        options.timing_detail = value == "1";
+    }
+    else if (key == "adaptive_window_discovery") {
+        if (value != "reference" && value != "fine_experimental") {
+            throw std::runtime_error(context + ": 'adaptive_window_discovery' is reference or fine_experimental: " + value);
+        }
+        options.adaptive_window_discovery = value;
+    }
+    else if (key == "adaptive_fine_store_bytes") options.adaptive_fine_store_bytes = u();
+    else if (key == "adaptive_fine_max_served_placements") options.adaptive_fine_max_served_placements = u();
+    else if (key == "proposal_state_limit") options.proposal_state_limit = u();
     else if (key == "max_mosaic_candidates") options.max_mosaic_candidates = u();
     else if (key == "phase_audit_candidates") options.phase_audit_candidates = u();
     else if (key == "threads") options.threads = u();
@@ -1331,6 +1713,43 @@ std::string genotype_setting_value(const GenotypeCommandOptions& o, const std::s
 }
 
 void validate_genotype_settings(const GenotypeCommandOptions& o) {
+    // I2-A: the experimental union backend's own requirements, before any work
+    if (o.union_scoring_backend == "indexed_fine_experimental") {
+        if (o.indexed_union_store_bytes == 0) {
+            throw std::runtime_error("union_scoring_backend indexed_fine_experimental needs a positive indexed_union_store_bytes");
+        }
+        if (o.max_union_cached_placements_consumed == 0) {
+            throw std::runtime_error("union_scoring_backend indexed_fine_experimental needs a positive "
+                                     "max_union_cached_placements_consumed (every expanded placement is served from its store)");
+        }
+        if (o.diagnostic_union_work_trace || o.diagnostic_union_seeding_profile > 0 ||
+            !o.diagnostic_union_verification_census.empty()) {
+            throw std::runtime_error("the union diagnostics need union_scoring_backend reference");
+        }
+    } else if (o.indexed_union_store_bytes != 0) {
+        throw std::runtime_error("indexed_union_store_bytes applies only to union_scoring_backend indexed_fine_experimental");
+    }
+    if (o.indexed_union_store_layout != "exact" && o.union_scoring_backend != "indexed_fine_experimental") {
+        throw std::runtime_error("indexed_union_store_layout applies only to union_scoring_backend indexed_fine_experimental");
+    }
+    if (o.indexed_union_evidence_layout != "reconstructed") {   // I4-B
+        if (o.union_scoring_backend != "indexed_fine_experimental") {
+            throw std::runtime_error("indexed_union_evidence_layout applies only to union_scoring_backend indexed_fine_experimental");
+        }
+        if (o.indexed_union_store_layout != "exact") {
+            throw std::runtime_error("indexed_union_evidence_layout fine_views_experimental needs indexed_union_store_layout exact");
+        }
+    }
+    // I2-B: the experimental adaptive window discovery's own requirements
+    if (o.adaptive_window_discovery == "fine_experimental") {
+        if (o.adaptive_fine_store_bytes == 0 || o.adaptive_fine_max_served_placements == 0) {
+            throw std::runtime_error("adaptive_window_discovery fine_experimental needs a positive adaptive_fine_store_bytes "
+                                     "and a positive adaptive_fine_max_served_placements");
+        }
+    } else if (o.adaptive_fine_store_bytes != 0 || o.adaptive_fine_max_served_placements != 0) {
+        throw std::runtime_error("adaptive_fine_store_bytes and adaptive_fine_max_served_placements apply only to "
+                                 "adaptive_window_discovery fine_experimental");
+    }
     if (o.syncmer_s > o.kmer_size) {
         throw std::runtime_error("syncmer_s (" + std::to_string(o.syncmer_s) + ", from " +
                                  (o.setting_sources.count("syncmer_s") ? o.setting_sources.at("syncmer_s") : std::string("default")) +
@@ -1445,8 +1864,343 @@ MosaicBeamResult candidate_prefix(const MosaicBeamResult& beam, std::size_t k) {
 
 GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) { return run_genotype(options, nullptr); }
 
+
+// ---- I3-A: the prepared locus -------------------------------------------------------------------------------------------
+// Stage 1, shared by the ordinary run (built inline for one sample) and prepare_genotype_locus (built once). Fills `out`
+// as it goes, so a caller that catches a failure can report how far it got.
+struct LocusModelBuild {
+    LocusInputResult built;
+    std::optional<PreparedGenotypeModel> model;
+    std::string fingerprint = "NA";
+    std::string resolved;
+    std::unordered_map<std::string, std::string> node_sequences;
+};
+
+void build_locus_model(const GenotypeCommandOptions& options, const std::string& staged, LocusModelBuild& out,
+                       std::vector<std::pair<std::string, double>>& detail) {
+    const Clock::time_point mark = Clock::now();
+    GfaModel gfa = read_gfa_model(options.gfa_path);
+    GraphSortOptions sort_options;
+    sort_options.reference_path = options.reference_path;
+    sort_options.flip = true;
+    const std::string resolved = sort_graph_reference(gfa, sort_options).resolved_reference;
+    if (g_watch != nullptr) {
+        // Under the watch lock: a watchdog stop either sees the finished file and removes it, or
+        // stops the process before it is begun. It can never leave one half-written behind.
+        std::lock_guard<std::mutex> lock(g_watch->mutex);
+        write_gfa_model(staged, gfa);
+    } else {
+        write_gfa_model(staged, gfa);
+    }
+    ParseGfaOptions parse_options;
+    const Graph graph = parse_gfa(staged, parse_options);
+    validate_graph_paths(graph, "genotype", true, true);
+    detail.emplace_back("model_graph_load_sort_parse", seconds_since(mark));
+    const Clock::time_point bubbles_mark = Clock::now();
+
+    std::vector<Bubble> bubbles;
+    if (options.bubbles_path.empty()) {
+        BubbleCallOptions bubble_options;
+        bubble_options.reference_path = resolved;
+        bubble_options.quiet = true;
+        bubble_options.min_variant_bp = options.min_variant_bp;
+        bubble_options.snarl_pairs_override =
+            find_top_level_snarls_cactus(snarl_input_from_model(gfa));
+        bubble_options.snarl_source_supplied = true;
+        bubbles = call_bubbles(graph, bubble_options);
+    } else {
+        bubbles = read_bubbles_csv(options.bubbles_path);
+    }
+
+    detail.emplace_back("model_bubbles", seconds_since(bubbles_mark));
+    const Clock::time_point build_mark = Clock::now();
+    LocusInputOptions locus_options;
+    // The locus identity is the graph's own reference frame, never the output path: a fingerprint
+    // that moved when the user renamed their output would be useless for saying whether two runs
+    // scored the same model.
+    locus_options.locus_id = resolved;
+    locus_options.reference_path_name = resolved;
+    if (!options.curation_manifest_path.empty()) {
+        locus_options.excluded_templates = read_curation_manifest(options.curation_manifest_path);
+    }
+    out.built = build_locus_input(graph, bubbles, locus_options);
+    out.model.emplace(prepare_genotype_model(out.built.input));
+    // The authoritative check, on real input, before any statistic is computed from these blocks.
+    verify_complete_panel_round_trip(*out.model, out.built.authoritative);
+    out.fingerprint = model_fingerprint(*out.model);
+    // A model a node split would change is not scored. The round trip cannot see this case.
+    require_representation_independent(out.built.report);
+    detail.emplace_back("model_locus_build_prepare_verify", seconds_since(build_mark));
+    out.resolved = resolved;
+    out.node_sequences = std::move(gfa.seq);
+}
+
+PreparedLocus::PreparedLocus(Parts&& parts) : parts_(std::make_unique<Parts>(std::move(parts))) {}
+PreparedLocus::~PreparedLocus() = default;
+const PreparedLocusKey& PreparedLocus::key() const { return parts_->key; }
+const PreparedGenotypeModel& PreparedLocus::model() const { return *parts_->model; }
+const std::string& PreparedLocus::fingerprint() const { return parts_->fingerprint; }
+const LocusInputReport& PreparedLocus::report() const { return parts_->report; }
+const std::string& PreparedLocus::resolved_reference() const { return parts_->resolved; }
+const std::unordered_map<std::string, std::string>& PreparedLocus::node_sequences() const { return parts_->node_sequences; }
+const PreparedMarkerPanel& PreparedLocus::panel() const { return *parts_->panel; }
+const std::vector<std::pair<std::string, double>>& PreparedLocus::preparation_seconds() const { return parts_->seconds; }
+std::uint64_t PreparedLocus::id() const { return parts_->id; }
+const std::string& PreparedLocus::origin() const { return parts_->origin; }
+const std::string& PreparedLocus::file_checksum() const { return parts_->file_checksum; }
+const std::string& PreparedLocus::stored_provenance() const { return parts_->stored_provenance; }
+const std::string& PreparedLocus::panel_source() const { return parts_->panel_source; }
+
+std::string PreparedLocus::digest() const {
+    std::ostringstream o;
+    o << "model\t" << model_fingerprint(*parts_->model) << "\nfingerprint\t" << parts_->fingerprint << "\nresolved\t"
+      << parts_->resolved << "\nkey\t" << parts_->key.describe() << '\n';
+    const LocusInputReport& r = parts_->report;
+    o << "report\t" << r.variant_blocks << ',' << r.context_blocks << ',' << r.total_source_alleles << ','
+      << r.total_canonical_alleles << ',' << r.forward_templates << ',' << r.reverse_templates << ','
+      << r.refused_templates.size() << ',' << r.blocks.size() << '\n';
+    std::vector<const std::pair<const std::string, std::string>*> nodes;
+    for (const auto& item : parts_->node_sequences) nodes.push_back(&item);
+    std::sort(nodes.begin(), nodes.end(), [](const auto* a, const auto* b) { return a->first < b->first; });
+    for (const auto* item : nodes) o << item->first << '\t' << item->second << '\n';
+    const PreparedMarkerPanel& m = *parts_->panel;
+    o << "panel\t" << m.kmer_size << ',' << m.syncmer_s << ',' << m.total_alleles << ',' << m.scored_alleles << ','
+      << m.dropped_multiblock_markers << '\n';
+    for (const std::uint64_t c : m.codes) o << c << ',';
+    o << '\n';
+    for (const std::uint32_t a : m.anchor_slots) o << a << ',';
+    o << '\n';
+    for (const std::uint32_t a : m.anchor_haploid_multiplicity) o << a << ',';
+    o << '\n';
+    for (const BlockMarkerInventory& b : m.blocks) {
+        o << b.block_id << '\t' << b.allele_count << '\t';
+        for (const std::uint32_t x : b.marker_slots) o << x << ',';
+        o << '\t';
+        for (const std::uint32_t x : b.fixed_haploid_multiplicity) o << x << ',';
+        o << '\t';
+        for (const auto& allele : b.allele_markers) {
+            for (const auto& [slot, copies] : allele) o << slot << ':' << copies << ',';
+            o << '|';
+        }
+        o << '\n';
+    }
+    return sha256_bytes(o.str());
+}
+
+std::string PreparedLocusKey::describe() const {
+    std::ostringstream o;
+    o << "gfa_sha256=" << gfa_sha256 << ";reference_path=" << reference_path << ";bubbles=" << bubbles
+      << ";min_variant_bp=" << min_variant_bp << ";curation=" << curation << ";kmer_size=" << kmer_size
+      << ";syncmer_s=" << syncmer_s;
+    return o.str();
+}
+
+std::string PreparedLocusKey::mismatch(const PreparedLocusKey& other) const {
+    if (gfa_sha256 != other.gfa_sha256) return "graph content (GFA SHA-256)";
+    if (reference_path != other.reference_path) return "reference path";
+    if (bubbles != other.bubbles) return "bubbles (supplied CSV content, or computed)";
+    if (min_variant_bp != other.min_variant_bp) return "min_variant_bp";
+    if (curation != other.curation) return "panel curation (manifest content)";
+    if (kmer_size != other.kmer_size) return "marker kmer_size";
+    if (syncmer_s != other.syncmer_s) return "marker syncmer_s";
+    return "";
+}
+
+namespace {
+std::atomic<std::uint64_t>& prepared_locus_counter() {
+    static std::atomic<std::uint64_t> count{0};
+    return count;
+}
+std::atomic<std::uint64_t>& prepared_locus_id_counter() {   // I3-C: ids are shared by prepared and loaded objects
+    static std::atomic<std::uint64_t> count{0};
+    return count;
+}
+
+// The key from a hasher of input files ("unreadable" never equals a real digest, so it refuses).
+template <typename Hash>
+PreparedLocusKey key_with(const GenotypeCommandOptions& options, Hash&& hash) {
+    PreparedLocusKey key;
+    key.gfa_sha256 = hash(options.gfa_path);
+    key.reference_path = options.reference_path;
+    key.bubbles = options.bubbles_path.empty() ? std::string("computed") : "sha256:" + hash(options.bubbles_path);
+    key.min_variant_bp = options.min_variant_bp;
+    key.curation = options.curation_manifest_path.empty() ? std::string("none") : "sha256:" + hash(options.curation_manifest_path);
+    key.kmer_size = options.kmer_size;
+    key.syncmer_s = options.syncmer_s;
+    return key;
+}
+
+// The run's own provenance hashes (computed once per run for the status) give the same key without hashing again.
+PreparedLocusKey key_from_run_hashes(const GenotypeCommandOptions& options) {
+    return key_with(options, [&](const std::string& file) -> std::string {
+        const std::string name = file == options.gfa_path ? "gfa" : file == options.bubbles_path ? "bubbles" : "panel_curation";
+        for (const auto& item : g_input_hashes) {
+            if (item.first == name) return item.second;
+        }
+        return std::string("unreadable");
+    });
+}
+
+}  // namespace
+
+PreparedLocusKey prepared_locus_key(const GenotypeCommandOptions& options) {
+    return key_with(options, [](const std::string& file) {
+        try {
+            return sha256_file(file);
+        } catch (const std::exception&) {
+            return std::string("unreadable");
+        }
+    });
+}
+
+std::uint64_t prepared_locus_builds() { return prepared_locus_counter().load(); }
+std::uint64_t next_prepared_locus_id() { return ++prepared_locus_id_counter(); }
+
+BetweenSampleCleanup release_between_samples() {
+    BetweenSampleCleanup out;
+    const Clock::time_point mark = Clock::now();
+    out.released = release_sample_retained_storage();
+    out.free_pages_released = release_free_pages();
+    out.seconds = seconds_since(mark);
+    return out;
+}
+
+const char* batch_resource_verdict_name(BatchResourceVerdict verdict) {
+    switch (verdict) {
+        case BatchResourceVerdict::compliant: return "RESOURCE_COMPLIANT";
+        case BatchResourceVerdict::ceiling_exceeded: return "RESOURCE_CEILING_EXCEEDED";
+        case BatchResourceVerdict::unverified: return "RESOURCE_UNVERIFIED";
+    }
+    return "RESOURCE_UNVERIFIED";
+}
+
+BatchResourceLedger::BatchResourceLedger(std::uint64_t ceiling_bytes, std::string metric)
+    : ceiling_(ceiling_bytes), metric_(std::move(metric)) {}
+
+bool BatchResourceLedger::record(const std::string& phase, std::optional<std::uint64_t> current_bytes,
+                                 std::optional<std::uint64_t> lifetime_peak_bytes) {
+    Phase p;
+    p.name = phase;
+    p.current = current_bytes;
+    p.peak = lifetime_peak_bytes;
+    p.verified = current_bytes.has_value() && lifetime_peak_bytes.has_value();
+    if (lifetime_peak_bytes) {
+        const std::uint64_t before = max_peak_.value_or(0);
+        p.peak_increase = *lifetime_peak_bytes > before ? *lifetime_peak_bytes - before : 0;
+        max_peak_ = std::max(before, *lifetime_peak_bytes);
+    }
+    if (!p.verified) ++unverified_;
+    // An observed breach, by either reading actually taken, is permanent; a missing reading is never zero.
+    const bool breach = (lifetime_peak_bytes && *lifetime_peak_bytes > ceiling_) || (current_bytes && *current_bytes > ceiling_);
+    if (!exceeded_ && breach) {
+        exceeded_ = true;
+        exceeded_during_ = phase;
+    }
+    phases_.push_back(p);
+    return !exceeded_;
+}
+
+BatchResourceVerdict BatchResourceLedger::verdict() const {
+    if (exceeded_) return BatchResourceVerdict::ceiling_exceeded;
+    if (phases_.empty() || unverified_ > 0) return BatchResourceVerdict::unverified;
+    return BatchResourceVerdict::compliant;
+}
+
+namespace {
+// I3-C: the one preparation behind prepare_genotype_locus and prepare_genotype_locus_record. `record`, when given,
+// receives the complete persistent content: the structural input MOVES into it (the locus never owns it), the report and
+// node sequences are copied, and both complete content digests are computed from the prepared model and panel.
+std::shared_ptr<const PreparedLocus> prepare_locus(const GenotypeCommandOptions& options, PreparedLocusRecord* record,
+                                                   bool persist_panel) {
+    PreparedLocus::Parts parts;
+    parts.key = prepared_locus_key(options);
+    const std::string staged = options.out_prefix + ".prepared_locus.sorted.gfa";
+    struct Remove {
+        std::string path;
+        ~Remove() {
+            std::error_code ignored;
+            std::filesystem::remove(path, ignored);
+        }
+    } remove_staged{staged};
+    LocusModelBuild built;
+    build_locus_model(options, staged, built, parts.seconds);
+    parts.model = std::move(built.model);
+    parts.fingerprint = built.fingerprint;
+    parts.resolved = built.resolved;
+    if (record != nullptr) {
+        record->key = parts.key;
+        record->resolved_reference = built.resolved;
+        record->preparation_algorithm_version = kPreparationAlgorithmVersion;
+        // build_locus_model throws unless the round trip and the representation-independence check both passed
+        record->round_trip_passed = true;
+        record->representation_independent = true;
+        record->provenance = current_prepared_locus_provenance();
+        record->input = std::move(built.built.input);
+        record->report = built.built.report;
+        record->nodes.assign(built.node_sequences.begin(), built.node_sequences.end());
+        std::sort(record->nodes.begin(), record->nodes.end(),
+                  [](const auto& a, const auto& b) { return a.first < b.first; });
+        record->model_fingerprint = built.fingerprint;
+    }
+    parts.report = std::move(built.built.report);   // the locus input and authoritative sequences are not kept
+    parts.node_sequences = std::move(built.node_sequences);
+    const Clock::time_point mark = Clock::now();
+    parts.panel.emplace(build_marker_panel(*parts.model, options.kmer_size, options.syncmer_s));
+    parts.seconds.emplace_back("markers_panel_build", seconds_since(mark));
+    if (record != nullptr) {
+        record->model_content_sha256 = prepared_locus_model_content_sha256(*parts.model);
+        record->panel_content_sha256 = prepared_locus_panel_content_sha256(*parts.panel);
+        if (persist_panel) record->panel = *parts.panel;   // I3-D: a transient copy for the writer only
+    }
+    parts.id = next_prepared_locus_id();
+    ++prepared_locus_counter();
+    return std::make_shared<const PreparedLocus>(std::move(parts));
+}
+}  // namespace
+
+std::shared_ptr<const PreparedLocus> prepare_genotype_locus(const GenotypeCommandOptions& options) {
+    return prepare_locus(options, nullptr, false);
+}
+
+PreparedLocusPreparation prepare_genotype_locus_record(const GenotypeCommandOptions& options, bool persist_panel) {
+    PreparedLocusPreparation out;
+    out.locus = prepare_locus(options, &out.record, persist_panel);
+    return out;
+}
+
+GenotypeRunStatus run_genotype_body(const GenotypeCommandOptions& options, GenotypeDosageCapture* capture,
+                                    const PreparedLocus* locus);
+
 GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options, GenotypeDosageCapture* capture) {
+    return run_genotype_body(options, capture, nullptr);
+}
+
+GenotypeRunStatus run_genotype_prepared(const GenotypeCommandOptions& options, const PreparedLocus& locus,
+                                        GenotypeDosageCapture* capture) {
+    return run_genotype_body(options, capture, &locus);
+}
+
+// One body for both: `locus`, when given, replaces stage 1 and the marker-panel build (I3-A).
+GenotypeRunStatus run_genotype_body(const GenotypeCommandOptions& options, GenotypeDosageCapture* capture,
+                                    const PreparedLocus* locus) {
+    if (locus != nullptr) {
+        // I3-A: compatibility first, from the inputs' content and the preparation settings -- before any output is
+        // removed or written, so a refused sample leaves its prefix exactly as it was.
+        const std::string differs = locus->key().mismatch(prepared_locus_key(options));
+        if (!differs.empty()) {
+            throw PreparedLocusMismatch("the prepared locus does not match this sample's " + differs +
+                                        "; prepare the locus again for these inputs and settings");
+        }
+    }
     set_emission_lookup_timing(options.emission_lookup_timing);
+    g_proposal_reuse = ProposalReuseReport{};   // I2-E: never a previous run's figures
+    reset_prepared_library_terms_tally();         // I2-F: likewise
+    set_verification_profile_period(options.verification_profile_period);   // I2-G (measurement only)
+    reset_verification_profile();
+    g_union_verification = VerificationProfile{};
+    g_union_end_footprint = 0;
+    reset_emission_handoff_report();   // I2-K: nothing from an earlier run is reported or adopted
+    g_prepared_use = PreparedLocusUse{};   // I3-A
     const Clock::time_point started = Clock::now();
     StageTimings timings;
     const std::string status_path = options.out_prefix + ".mosaic_status.tsv";
@@ -1470,6 +2224,13 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options, GenotypeDo
     // now refused rather than reported back as threads_used 1.
     if (options.threads < 1) {
         throw std::runtime_error("--threads must be at least 1");
+    }
+    // I2-A: the experimental union backend's requirements hold for library callers too, before any work
+    if (options.union_scoring_backend != "reference" || options.indexed_union_store_bytes != 0 ||
+        options.indexed_union_store_layout != "exact" || options.indexed_union_evidence_layout != "reconstructed" ||
+        options.adaptive_window_discovery != "reference" || options.adaptive_fine_store_bytes != 0 ||
+        options.adaptive_fine_max_served_placements != 0) {
+        validate_genotype_settings(options);
     }
 
     // The adaptive completion is one algorithm over one candidate set: a development ladder of prefixes
@@ -1605,72 +2366,47 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options, GenotypeDo
     // representation-independent ends the run as MODEL_INCOMPLETE with the reason, rather than escaping
     // as an exception that leaves no status behind.
     Clock::time_point mark = Clock::now();
-    Graph graph;
-    LocusInputResult built;
-    std::optional<PreparedGenotypeModel> prepared;
+    // I3-A: stage 1 is build_locus_model, shared with prepare_genotype_locus; a compatible prepared locus replaces it.
+    LocusModelBuild local;
     std::string fingerprint = "NA";
-    try {
-        GfaModel gfa = read_gfa_model(options.gfa_path);
-        GraphSortOptions sort_options;
-        sort_options.reference_path = options.reference_path;
-        sort_options.flip = true;
-        const std::string resolved = sort_graph_reference(gfa, sort_options).resolved_reference;
-        const std::string staged = options.out_prefix + ".sorted.gfa";
-        if (g_watch != nullptr) {
-            // Under the watch lock: a watchdog stop either sees the finished file and removes it, or
-            // stops the process before it is begun. It can never leave one half-written behind.
-            std::lock_guard<std::mutex> lock(g_watch->mutex);
-            write_gfa_model(staged, gfa);
-        } else {
-            write_gfa_model(staged, gfa);
+    if (locus != nullptr) {
+        // Checked again against the run's own provenance hashes (an input changed since the first check refuses here).
+        const std::string differs = locus->key().mismatch(key_from_run_hashes(options));
+        if (!differs.empty()) {
+            throw PreparedLocusMismatch("the prepared locus does not match this sample's " + differs +
+                                        " (changed during the run); prepare the locus again");
         }
-        ParseGfaOptions parse_options;
-        graph = parse_gfa(staged, parse_options);
-        validate_graph_paths(graph, "genotype", true, true);
-
-        std::vector<Bubble> bubbles;
-        if (options.bubbles_path.empty()) {
-            BubbleCallOptions bubble_options;
-            bubble_options.reference_path = resolved;
-            bubble_options.quiet = true;
-            bubble_options.min_variant_bp = options.min_variant_bp;
-            bubble_options.snarl_pairs_override =
-                find_top_level_snarls_cactus(snarl_input_from_model(gfa));
-            bubble_options.snarl_source_supplied = true;
-            bubbles = call_bubbles(graph, bubble_options);
-        } else {
-            bubbles = read_bubbles_csv(options.bubbles_path);
-        }
-
-        LocusInputOptions locus_options;
-        // The locus identity is the graph's own reference frame, never the output path: a fingerprint
-        // that moved when the user renamed their output would be useless for saying whether two runs
-        // scored the same model.
-        locus_options.locus_id = resolved;
-        locus_options.reference_path_name = resolved;
-        if (!options.curation_manifest_path.empty()) {
-            locus_options.excluded_templates = read_curation_manifest(options.curation_manifest_path);
-        }
-        built = build_locus_input(graph, bubbles, locus_options);
-        prepared.emplace(prepare_genotype_model(built.input));
-        // The authoritative check, on real input, before any statistic is computed from these blocks.
-        verify_complete_panel_round_trip(*prepared, built.authoritative);
-        fingerprint = model_fingerprint(*prepared);
-        // A model a node split would change is not scored. The round trip cannot see this case.
-        require_representation_independent(built.report);
+        fingerprint = locus->fingerprint();
+        g_prepared_use.used = true;
+        g_prepared_use.id = locus->id();
+        g_prepared_use.key_sha256 = sha256_bytes(locus->key().describe());
+        g_prepared_use.origin = locus->origin();
+        g_prepared_use.file_checksum = locus->file_checksum();
+        g_prepared_use.panel_source = locus->panel_source();
+        timings.detail.emplace_back("model_prepared_locus_reused", seconds_since(mark));
         if (capture != nullptr) {
-            capture->model = *prepared;
-            capture->node_sequences = gfa.seq;
+            capture->model = locus->model();
+            capture->node_sequences = locus->node_sequences();
         }
-    } catch (const std::exception& error) {
-        timings.model = seconds_since(mark);
-        timings.total = seconds_since(started);
-        write_status(status_path, GenotypeRunStatus::ModelIncomplete, fingerprint, options, library,
-                     timings, built.input.blocks.empty() ? nullptr : &built.report, nullptr, nullptr,
-                     nullptr, std::string("the structural model could not be built: ") + error.what());
-        return GenotypeRunStatus::ModelIncomplete;
+    } else {
+        try {
+            build_locus_model(options, options.out_prefix + ".sorted.gfa", local, timings.detail);
+            fingerprint = local.fingerprint;
+            if (capture != nullptr) {
+                capture->model = *local.model;
+                capture->node_sequences = local.node_sequences;
+            }
+        } catch (const std::exception& error) {
+            timings.model = seconds_since(mark);
+            timings.total = seconds_since(started);
+            write_status(status_path, GenotypeRunStatus::ModelIncomplete, local.fingerprint, options, library,
+                         timings, local.built.input.blocks.empty() ? nullptr : &local.built.report, nullptr, nullptr,
+                         nullptr, std::string("the structural model could not be built: ") + error.what());
+            return GenotypeRunStatus::ModelIncomplete;
+        }
     }
-    const PreparedGenotypeModel& model = *prepared;
+    const PreparedGenotypeModel& model = locus != nullptr ? locus->model() : *local.model;
+    const LocusInputReport& locus_report = locus != nullptr ? locus->report() : local.built.report;
     timings.model = seconds_since(mark);
     if (g_watch != nullptr) {
         std::lock_guard<std::mutex> lock(g_watch->mutex);
@@ -1681,7 +2417,7 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options, GenotypeDo
     if (model.blocks().size() < 2 || model.panel().template_count() < 2) {
         timings.total = seconds_since(started);
         write_status(status_path, GenotypeRunStatus::ModelIncomplete, fingerprint, options, library,
-                     timings, &built.report, nullptr, nullptr, nullptr,
+                     timings, &locus_report, nullptr, nullptr, nullptr,
                      "the locus does not carry at least two blocks and two panel templates");
         return GenotypeRunStatus::ModelIncomplete;
     }
@@ -1690,6 +2426,8 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options, GenotypeDo
     mark = Clock::now();
     const std::vector<ReadPair> fragments =
         read_fragments(options.reads1_path, options.reads2_path);
+    timings.detail.emplace_back("markers_read_fastq", seconds_since(mark));
+    Clock::time_point marker_lap = Clock::now();
     if (auto_library) {
         LibraryEstimateOptions estimate_options;
         estimate_options.threads = options.threads;
@@ -1703,7 +2441,7 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options, GenotypeDo
             timings.markers = seconds_since(mark);
             timings.total = seconds_since(started);
             library.provenance = "auto: refused";
-            write_status(status_path, GenotypeRunStatus::LibraryRefused, fingerprint, options, library, timings, &built.report, nullptr, nullptr,
+            write_status(status_path, GenotypeRunStatus::LibraryRefused, fingerprint, options, library, timings, &locus_report, nullptr, nullptr,
                          nullptr, built_library.refusal);
             if (!options.quiet) std::cerr << "[genotype] LIBRARY_REFUSED  " << built_library.refusal << '\n';
             return GenotypeRunStatus::LibraryRefused;
@@ -1721,9 +2459,16 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options, GenotypeDo
         }
     }
     if (capture != nullptr) capture->library = library;
-    const PreparedMarkerPanel panel =
-        build_marker_panel(model, options.kmer_size, options.syncmer_s);
+    timings.detail.emplace_back("markers_library_estimate", seconds_since(marker_lap));
+    marker_lap = Clock::now();
+    std::optional<PreparedMarkerPanel> local_panel;   // I3-A: built here unless the prepared locus holds it
+    if (locus == nullptr) local_panel.emplace(build_marker_panel(model, options.kmer_size, options.syncmer_s));
+    const PreparedMarkerPanel& panel = locus != nullptr ? locus->panel() : *local_panel;
+    timings.detail.emplace_back("markers_panel_build", seconds_since(marker_lap));
+    marker_lap = Clock::now();
     const MarkerObservations observations = count_marker_observations(panel, fragments);
+    timings.detail.emplace_back("markers_observation_counting", seconds_since(marker_lap));
+    marker_lap = Clock::now();
     // Per-copy depth from the invariant anchors, whose diploid copy number is known whatever the
     // sample's genotype. Variable markers cannot be used: their expected count depends on the very
     // genotype being inferred.
@@ -1734,7 +2479,7 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options, GenotypeDo
         timings.markers = seconds_since(mark);
         timings.total = seconds_since(started);
         write_status(status_path, GenotypeRunStatus::CandidateIncomplete, fingerprint, options,
-                     library, timings, &built.report, &panel, nullptr, nullptr,
+                     library, timings, &locus_report, &panel, nullptr, nullptr,
                      std::string("marker depth could not be estimated: ") + error.what());
         return GenotypeRunStatus::CandidateIncomplete;
     }
@@ -1744,7 +2489,7 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options, GenotypeDo
         timings.markers = seconds_since(mark);
         timings.total = seconds_since(started);
         write_status(status_path, GenotypeRunStatus::CandidateIncomplete, fingerprint, options, library,
-                     timings, &built.report, &panel, nullptr, nullptr,
+                     timings, &locus_report, &panel, nullptr, nullptr,
                      "marker depth fit did not converge (" + depth.termination +
                          "); declare marker_background to use the one-dimensional fit",
                      nullptr, &depth);
@@ -1752,10 +2497,16 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options, GenotypeDo
     }
     // The fitted or declared background, unchanged: the fit and the emission share one model floor. This
     // used to raise a fitted 1e-9 to 1e-6 here, a log(1000) change per zero-copy marker observation.
+    timings.detail.emplace_back("markers_depth_fit", seconds_since(marker_lap));
+    marker_lap = Clock::now();
     const MarkerModelParameters marker_parameters =
         proposal_marker_parameters(depth, options.kmer_size, options.syncmer_s);
+    ProposalReuseOptions proposal_reuse;
+    proposal_reuse.enabled = options.marker_proposal_reuse_table_bytes != 0;
+    proposal_reuse.table_budget_bytes = options.marker_proposal_reuse_table_bytes;
     const PreparedProposalEmissions emissions =
-        build_proposal_emissions(panel, observations, marker_parameters);
+        build_proposal_emissions(panel, observations, marker_parameters, proposal_reuse, &g_proposal_reuse);
+    timings.detail.emplace_back("markers_proposal_emissions", seconds_since(marker_lap));
     timings.markers = seconds_since(mark);
 
     // ---- stage 3a: protected panel baseline --------------------------------------------------------------
@@ -1774,7 +2525,7 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options, GenotypeDo
         panel_candidates.size() > options.max_panel_pair_fragment_evaluations / fragments.size()) {
         timings.total = seconds_since(started);
         write_status(status_path, GenotypeRunStatus::CandidateIncomplete, fingerprint, options, library,
-                     timings, &built.report, &panel, nullptr, nullptr,
+                     timings, &locus_report, &panel, nullptr, nullptr,
                      "the panel-diplotype baseline would exceed its declared scoring budget (" +
                          std::to_string(panel_candidates.size()) + " pairs x " +
                          std::to_string(fragments.size()) + " fragments); no partial baseline is scored",
@@ -1827,7 +2578,7 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options, GenotypeDo
             timings.proposal = seconds_since(mark);
             timings.total = seconds_since(started);
             write_status(status_path, GenotypeRunStatus::CandidateIncomplete, fingerprint, options, library,
-                         timings, &built.report, &panel, nullptr, nullptr,
+                         timings, &locus_report, &panel, nullptr, nullptr,
                          std::string("the proposal exceeded its declared resource budget: ") + error.what(),
                          nullptr, &depth, &candidate_report);
             return GenotypeRunStatus::CandidateIncomplete;
@@ -1923,8 +2674,11 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options, GenotypeDo
     timings.spelling = seconds_since(mark);
 
     write_running_status("union_scoring");
+    set_verification_census_stage(CensusStage::union_discovery);   // I2-I (measurement only; inert when off)
     mark = Clock::now();
     FragmentScoringOptions scoring_options;
+    // I2-K (EXPERIMENTAL): owned here for this sample only; destroyed on every exit, adopted at most once
+    EmissionCacheHandoff union_emissions;
     scoring_options.audit_libraries = audit_libraries;
     // Candidates partition into fixed contiguous ranges, each worker owning complete score entries, so
     // the thread count changes the schedule and nothing else. Gated byte-identical at 1, 2 and 4.
@@ -1937,6 +2691,8 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options, GenotypeDo
     scoring_options.max_state_classes = options.max_state_classes;
     scoring_options.max_mass_cells = options.max_mass_cells;
     scoring_options.emission_cache_bytes = options.emission_cache_bytes;
+    scoring_options.prepared_library_terms = options.combination_prepared_library_terms;   // I2-F
+    scoring_options.gap_recursion_backend = gap_recursion_backend_of(options);   // I2-H
     // Exact union placement reuse: one segmentation per unique haplotype (its first path's blocks).
     std::vector<std::vector<std::uint32_t>> union_segments;
     if (options.union_placement_cache_bytes > 0 && any_ranked) {
@@ -1955,6 +2711,20 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options, GenotypeDo
         scoring_options.max_union_cached_origins_consumed = options.max_union_cached_origins_consumed;
         scoring_options.max_union_cached_states_consumed = options.max_union_cached_states_consumed;
     }
+    // I2-A: the indexed backend takes the same segmentation (first path's blocks per unique haplotype) as its own
+    // argument; scoring_options -- which the repair stage copies -- is not touched.
+    const bool indexed_union = options.union_scoring_backend == "indexed_fine_experimental";
+    std::vector<std::vector<std::uint32_t>> indexed_segments;
+    if (indexed_union && any_ranked) {
+        indexed_segments.assign(interned.sequences.size(), {});
+        std::vector<char> filled(interned.sequences.size(), 0);
+        for (std::size_t slot = 0; slot < paths.size(); ++slot) {
+            const std::size_t h = interned.index_of[slot];
+            if (filled[h] != 0) continue;
+            filled[h] = 1;
+            indexed_segments[h] = segment_lengths_of_slot[slot];
+        }
+    }
     scoring_options.union_prefilter_cache_bytes = options.union_prefilter_cache_bytes;
     scoring_options.start_sort_scratch_bytes = options.start_sort_scratch_bytes;
     scoring_options.max_union_cached_prefilters_consumed = options.max_union_cached_prefilters_consumed;
@@ -1970,8 +2740,27 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options, GenotypeDo
     }
     if (any_ranked && !seeding_profile_only) {
         try {
-            scored = score_diplotypes(interned, scored_pairs, fragments, library, scoring_options,
-                                      &candidate_report.observed);
+            candidate_report.indexed_union = indexed_union;
+            reset_verification_profile();   // I2-G: the union pass's own verification profile
+            if (indexed_union) {
+                // I2-A (EXPERIMENTAL): the same pass through the indexed route; same result structure and refusals
+                FragmentScoringOptions indexed_options = scoring_options;
+                if (options.adaptive_emission_handoff) indexed_options.emission_handoff_out = &union_emissions;   // I2-K
+                indexed_options.union_segment_lengths = nullptr;
+                indexed_options.union_placement_cache_bytes = 0;
+                indexed_options.max_union_cached_placements_consumed = options.max_union_cached_placements_consumed;
+                indexed_options.union_origin_cache_bytes = options.union_origin_cache_bytes;
+                indexed_options.max_union_cached_origins_consumed = options.max_union_cached_origins_consumed;
+                indexed_options.max_union_cached_states_consumed = options.max_union_cached_states_consumed;
+                scored = score_diplotypes_indexed_union(interned, scored_pairs, fragments, library, indexed_options,
+                                                        indexed_segments, options.indexed_union_store_bytes,
+                                                        &candidate_report.indexed, &candidate_report.observed,
+                                                        options.indexed_union_store_layout == "legacy_i2a",
+                                                        options.indexed_union_evidence_layout == "fine_views_experimental");
+            } else {
+                scored = score_diplotypes(interned, scored_pairs, fragments, library, scoring_options,
+                                          &candidate_report.observed);
+            }
             timings.rescoring_fragment_preparation = scored.seconds_fragment_preparation;
             timings.rescoring_placement_and_mass = scored.seconds_placement_and_mass;
             timings.rescoring_diploid_combination = scored.seconds_diploid_combination;
@@ -1982,6 +2771,8 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options, GenotypeDo
             candidate_report.union_origin_cache = scored.union_origin_cache;
             candidate_report.union_prefilter_cache = scored.union_prefilter_cache;
             candidate_report.start_sort = scored.start_sort;
+            g_union_verification = verification_profile_snapshot();
+            g_union_end_footprint = physical_footprint().current;
         } catch (const ResourceExhausted& error) {
             rescore_failure = error.what();
             candidate_report.observed_valid = true;
@@ -2381,6 +3172,9 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options, GenotypeDo
     const auto adaptive_completion = [&](const MosaicBeamResult& beam, const SetRanking& chosen,
                                          CandidateSetReport set_report, StageTimings timings) -> GenotypeRunStatus {
         const Clock::time_point repair_mark = Clock::now();
+        // I2-C: where the search began, was built and returned (measurement only)
+        Clock::time_point search_begin = repair_mark, search_built = repair_mark, search_end = repair_mark;
+        bool search_started = false, search_returned = false;
         const std::vector<MosaicCandidate>& candidates = chosen.candidates;
         const std::size_t panel_count = panel_candidates.size();
         const CertifiedRanking& union_ranking = chosen.ranking;
@@ -2413,12 +3207,25 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options, GenotypeDo
             set_report.haploid_prior_evaluations = candidate_report.haploid_prior_evaluations;
             set_report.diploid_prior_lookups = candidate_report.diploid_prior_lookups;
             report.seconds = seconds_since(repair_mark);
+            if (search_started) {
+                const auto between = [](Clock::time_point a, Clock::time_point b) {
+                    return std::chrono::duration<double>(b - a).count();
+                };
+                const Clock::time_point stop = Clock::now();
+                const Clock::time_point returned = search_returned ? search_end : stop;
+                report.timed = true;
+                report.seconds_pre_search = between(repair_mark, search_begin);
+                report.seconds_search_construction = between(search_begin, search_built);
+                report.seconds_search_run = between(search_built, returned);
+                report.seconds_post_search = between(returned, stop) - report.seconds_tie_branching -
+                                             report.seconds_representation_guard;
+            }
             report.call_class = status == GenotypeRunStatus::Complete                        ? "strict_call"
                                 : status == GenotypeRunStatus::ConditionalGenotypeEquivalent ? "genotype_equivalent_call"
                                                                                              : "no_call";
             if (report.call_class != "no_call") report.no_call_reason = "none";
             timings.total = seconds_since(started);
-            write_status(status_path, status, fingerprint, options, library, timings, &built.report, &panel, beam_view,
+            write_status(status_path, status, fingerprint, options, library, timings, &locus_report, &panel, beam_view,
                          ranking, note, summary, &depth, &set_report, &report);
             if (!options.quiet) {
                 std::cerr << "[genotype] " << genotype_run_status_name(status) << "  fingerprint=" << fingerprint
@@ -2575,6 +3382,7 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options, GenotypeDo
 
         // ---- 3. the exact coordinate repair from the anchor
         FragmentScoringOptions repair_scoring = scoring_options;
+        if (options.adaptive_emission_handoff) repair_scoring.emission_handoff_in = &union_emissions;   // I2-K
         repair_scoring.max_physical_origins = options.repair_max_physical_origins;
         repair_scoring.max_state_classes = options.repair_max_state_classes;
         repair_scoring.max_piece_hits = options.repair_max_piece_hits;
@@ -2586,10 +3394,16 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options, GenotypeDo
         search_options.origin_cache = true;
         search_options.planned_cache = true;
         search_options.origin_cache_bytes = options.repair_origin_cache_bytes;
+        if (options.adaptive_window_discovery == "fine_experimental") {
+            search_options.fine_window_bytes = options.adaptive_fine_store_bytes;
+            search_options.fine_window_served_cap = options.adaptive_fine_max_served_placements;
+        }
+        search_options.fused_seed = options.adaptive_fused_seed;
         search_options.switch_probability = options.switch_probability;
         search_options.declared_neighbour_cap = options.repair_max_neighbours;
         search_options.memory_log = true;
         write_running_status("repair");
+        set_verification_census_stage(CensusStage::adaptive);   // I2-I (measurement only; inert when off)
         std::unique_ptr<CoordinateRepairSearch> search;
         std::string refusal;
         bool reproduced = true;
@@ -2647,9 +3461,12 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options, GenotypeDo
         };
         std::map<std::pair<DiplotypeIdentity, std::vector<DiplotypeIdentity>>, CentralBranch> central_branches;
         try {
+            search_begin = Clock::now();
+            search_started = true;
             search = std::make_unique<CoordinateRepairSearch>(model, emissions, fragments, library, repair_scoring,
                                                               search_options);
             search->start(anchor_diplotype.first.alleles, anchor_diplotype.second.alleles, anchor_score);
+            search_built = Clock::now();
             RepairHooks hooks;
             hooks.on_scored = [&](const std::vector<std::size_t>& a, const std::vector<std::size_t>& b,
                                   const std::string& sa, const std::string& sb, const DiplotypeScore& score,
@@ -2680,7 +3497,13 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options, GenotypeDo
                 }
             };
             reproduced = search->run(hooks);
+            search_end = Clock::now();
+            search_returned = true;
+            report.stages = search->stage_seconds();
         } catch (const ResourceExhausted& error) {
+            search_end = Clock::now();
+            search_returned = true;
+            if (search) report.stages = search->stage_seconds();
             refusal = error.what();
         } catch (const std::exception& error) {
             report.no_call_reason = "repair_failed";
@@ -2700,6 +3523,8 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options, GenotypeDo
             if (search->context() != nullptr) {
                 report.cumulative = search->context()->cumulative_counters();
                 report.origin_cache_bytes_end = search->context()->origin_cache_bytes();
+                report.fine_window = search->context()->fine_window_report();
+                report.full_placements = search->context()->full_placement_count();
                 report.enumeration_workers = search->context()->parallel_enumeration_stats().workers;
             }
             report.seconds_scoring = search->cumulative_seconds();
@@ -2765,6 +3590,7 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options, GenotypeDo
             std::set<std::size_t> legacy_parent_pins;
             std::map<std::size_t, std::size_t> seed_pins;        // slot -> cached seeds still waiting on it
             std::map<std::size_t, std::uint64_t> seed_slot_bytes;   // slot -> its payload when first pinned
+            std::map<DiplotypeIdentity, std::uint64_t> seed_metadata;   // I4-C: each cached seed's charged bookkeeping
             std::uint64_t seed_cache_bytes = 0;
             std::set<DiplotypeIdentity> announced;          // every start a tie offered, as the worklist dedupes
             std::set<DiplotypeIdentity> pending;            // announced and not yet run: the frontier
@@ -2837,6 +3663,10 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options, GenotypeDo
                     const DiplotypeIdentity key = diplotype_identity(n->first, n->second);
                     const Clock::time_point seed_mark = Clock::now();
                     const std::uint64_t before = shared->cumulative_counters().physical_origins;
+                    // I4-C: the live transient slots before the build, so the build's NEW slots are known exactly (a
+                    // seed may resolve to an incumbent's slot or, through the sequence hash, to a slot already held)
+                    const std::vector<std::size_t> live_before = eager_seeds ? std::vector<std::size_t>()
+                                                                             : shared->live_transient_slots();
                     const auto slots = parent.seed_neighbour_by_delta(n->first, n->second);
                     ++report.tie_seed_cache_built;
                     report.tie_seed_cache_physical_origins += shared->cumulative_counters().physical_origins - before;
@@ -2849,15 +3679,39 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options, GenotypeDo
                         new_slots[slot] = shared->slot_payload_bytes(slot);
                         added += new_slots[slot];
                     }
+                    // I4-C: the cache's own bookkeeping for this seed is charged too -- its seed_slots entry (the
+                    // identity's two allele paths) and one pin and one payload record per new slot (tree nodes)
+                    const std::uint64_t node = 48;   // red-black node header plus allocator slack, per map entry
+                    const std::uint64_t metadata =
+                        node + sizeof(std::pair<const DiplotypeIdentity, std::pair<std::size_t, std::size_t>>) +
+                        (key.first.capacity() + key.second.capacity()) * sizeof(std::size_t) +
+                        new_slots.size() * 2 * (node + sizeof(std::pair<const std::size_t, std::uint64_t>));
+                    added += metadata;
+                    report.tie_seed_cache_transient_peak_bytes =
+                        std::max(report.tie_seed_cache_transient_peak_bytes, seed_cache_bytes + added);
                     if (!eager_seeds && added > seed_cache_budget - seed_cache_bytes) {
-                        ++report.tie_seed_cache_rejected;   // released at the next settle point; runs just in time
+                        // I4-C: rejected. Its own new slots go back now (not at the next settle point), except any an
+                        // admitted seed or the parent's incumbent holds; the work it executed stays charged. The branch
+                        // is materialised just in time as before.
+                        ++report.tie_seed_cache_rejected;
+                        std::vector<std::size_t> release;
+                        for (const auto& [slot, bytes] : new_slots) {
+                            if (std::binary_search(live_before.begin(), live_before.end(), slot)) continue;
+                            if (slot == parent.incumbent_slot_first() || slot == parent.incumbent_slot_second()) continue;
+                            if (legacy_parent_pins.count(slot) != 0) continue;
+                            release.push_back(slot);
+                            report.tie_seed_cache_rejected_released_bytes += bytes;
+                        }
+                        if (!release.empty()) shared->release_slots(release);
                         continue;
                     }
                     ++report.tie_seed_cache_admitted;
+                    report.tie_seed_cache_metadata_bytes += metadata;
                     seed_cache_bytes += added;
                     seed_slot_bytes.insert(new_slots.begin(), new_slots.end());
                     report.tie_seed_cache_peak_bytes = std::max(report.tie_seed_cache_peak_bytes, seed_cache_bytes);
                     seed_slots.emplace(key, slots);
+                    seed_metadata.emplace(key, metadata);
                     ++seed_pins[slots.first];
                     if (slots.second != slots.first) ++seed_pins[slots.second];
                 }
@@ -2979,6 +3833,8 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options, GenotypeDo
                 const bool branch_reproduced = live->run(hooks);
                 if (hit) {
                     // Consumed: the seed leaves the cache, and each slot no other cached seed holds with it.
+                    seed_cache_bytes -= seed_metadata.at(key);   // I4-C: its charged bookkeeping
+                    seed_metadata.erase(key);
                     seed_slots.erase(key);
                     for (const std::size_t slot : {seeded.first, seeded.second}) {
                         const auto pin = seed_pins.find(slot);
@@ -3051,6 +3907,7 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options, GenotypeDo
                 seed_pins.clear();
                 seed_slots.clear();
                 seed_slot_bytes.clear();
+                seed_metadata.clear();
                 seed_cache_bytes = 0;
                 legacy_parent_pins.clear();
                 shared->release_transient({});
@@ -3070,6 +3927,7 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options, GenotypeDo
             if (shared != nullptr) {
                 report.cumulative = shared->cumulative_counters();   // the caps bind production and branches together
                 report.origin_cache_bytes_end = shared->origin_cache_bytes();
+                report.fine_window = shared->fine_window_report();
             }
             report.pool_identities = pool.size();
             report.pool_repair_only = 0;
@@ -3983,6 +4841,7 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options, GenotypeDo
                     guard_context->cumulative_counters().physical_origins - guard_origins_before;
                 report.cumulative = guard_context->cumulative_counters();
                 report.origin_cache_bytes_end = guard_context->origin_cache_bytes();
+                report.fine_window = guard_context->fine_window_report();
             }
             report.seconds_representation_guard = seconds_since(guard_mark);
         }
@@ -4717,7 +5576,7 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options, GenotypeDo
         if (!rescore_failure.empty()) {
             timings.total = seconds_since(started);
             write_status(status_path, GenotypeRunStatus::RescoreIncomplete, fingerprint, options, library,
-                         timings, &built.report, &panel, (panel_only ? nullptr : &beam), nullptr,
+                         timings, &locus_report, &panel, (panel_only ? nullptr : &beam), nullptr,
                          "rescoring stopped at a declared resource cap and returned no ranking: " +
                              rescore_failure,
                          nullptr, &depth, &candidate_report);
@@ -4728,7 +5587,7 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options, GenotypeDo
             (options.diagnostic_union_seeding_profile > 0 || !options.diagnostic_union_verification_census.empty())) {
             timings.total = seconds_since(started);
             write_status(status_path, GenotypeRunStatus::UnionDiagnosticOnly, fingerprint, options, library, timings,
-                         &built.report, &panel, (panel_only ? nullptr : &beam), nullptr,
+                         &locus_report, &panel, (panel_only ? nullptr : &beam), nullptr,
                          "DIAGNOSTIC ONLY: union seeding profile or census; the union pass was replayed, not scored",
                          nullptr, &depth, &candidate_report);
             return GenotypeRunStatus::UnionDiagnosticOnly;
@@ -4767,7 +5626,7 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options, GenotypeDo
             atomic_write(options.out_prefix + ".union_diagnostic_ranking.tsv", text.str());
             timings.total = seconds_since(started);
             write_status(status_path, GenotypeRunStatus::UnionDiagnosticOnly, fingerprint, options, library, timings,
-                         &built.report, &panel, (panel_only ? nullptr : &beam), &diagnostic.ranking,
+                         &locus_report, &panel, (panel_only ? nullptr : &beam), &diagnostic.ranking,
                          "DIAGNOSTIC ONLY: the union pass was scored and ranked; no repair and no genotype",
                          nullptr, &depth, &candidate_report);
             return GenotypeRunStatus::UnionDiagnosticOnly;
@@ -5062,7 +5921,7 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options, GenotypeDo
                 }
                 timings.total = seconds_since(started);
                 write_status(status_path, GenotypeRunStatus::BlockConsensus, fingerprint, options,
-                             library, timings, &built.report, &panel, (panel_only ? nullptr : &beam),
+                             library, timings, &locus_report, &panel, (panel_only ? nullptr : &beam),
                              &ranking,
                              "no whole-locus winner could be separated from its rivals beyond "
                              "floating-point error; blocks on which every tied candidate agrees are "
@@ -5079,7 +5938,7 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options, GenotypeDo
 
             timings.total = seconds_since(started);
             write_status(status_path, GenotypeRunStatus::RescoreIncomplete, fingerprint, options,
-                         library, timings, &built.report, &panel, (panel_only ? nullptr : &beam), &ranking,
+                         library, timings, &locus_report, &panel, (panel_only ? nullptr : &beam), &ranking,
                          std::string("the best candidate cannot be separated from every rival by more "
                                      "than floating-point error; the equivalence set is reported instead "
                                      "of a call") +
@@ -5178,7 +6037,7 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options, GenotypeDo
         set_report.diploid_prior_lookups = candidate_report.diploid_prior_lookups;
         timings.total = seconds_since(started);
         write_status(status_path, GenotypeRunStatus::Complete, fingerprint, options, library, timings,
-                     &built.report, &panel, (panel_only ? nullptr : &beam), &ranking, "", &summary,
+                     &locus_report, &panel, (panel_only ? nullptr : &beam), &ranking, "", &summary,
                      &depth, &set_report);
         if (!options.quiet) {
             std::cerr << "[genotype] COMPLETE  fingerprint=" << fingerprint
@@ -5498,8 +6357,10 @@ std::optional<int> parse_genotype_arguments(const std::vector<std::string>& args
     return std::nullopt;
 }
 
-int run_genotype_command(const std::vector<std::string>& args) {
-    GenotypeCommandOptions options;
+namespace {
+// The command's argument resolution: parsing, the graph's declared reference sample, the library default. Returns an
+// exit code when parsing ends the command (help), otherwise fills `options`.
+std::optional<int> resolve_genotype_command(const std::vector<std::string>& args, GenotypeCommandOptions& options) {
     if (const std::optional<int> help = parse_genotype_arguments(args, options, std::cout)) return *help;
     if (options.reference_path.empty() && !options.gfa_path.empty()) {
         // The graph's declared reference sample (a header RS:Z tag): its single path is the coordinate reference. No
@@ -5541,10 +6402,22 @@ int run_genotype_command(const std::vector<std::string>& args) {
         options.library_path = "auto";
         options.library_omitted = true;
     }
+    return std::nullopt;
+}
+}  // namespace
+
+// The per-sample command after resolution -- genotype, dosage, locus table -- shared by the ordinary command and the
+// prepared-locus route (I3-A).
+int execute_genotype_command(const GenotypeCommandOptions& options, const PreparedLocus* locus) {
     // The dosage stage and the locus table run after every existing output is committed (sections 20 and 22).
     const std::string& mode = options.dosage_mode;
     GenotypeDosageCapture capture;
-    const GenotypeRunStatus status = run_genotype(options, &capture);
+    // I2-I (MEASUREMENT ONLY): the census spans the whole command -- caller and dosage -- and writes its own file.
+    if (options.verification_census_period != 0) {
+        begin_verification_census(options.verification_census_period, std::uint64_t{64} << 20);
+    }
+    const GenotypeRunStatus status = run_genotype_body(options, &capture, locus);
+    set_verification_census_stage(CensusStage::dosage);
     const bool called = status == GenotypeRunStatus::Complete || status == GenotypeRunStatus::ConditionalGenotypeEquivalent;
     dosage::DosageShadowSummary summary;
     std::string audit_status = "NOT_RUN", audit_note = "none";
@@ -5573,10 +6446,14 @@ int run_genotype_command(const std::vector<std::string>& args) {
                 scoring.max_state_classes = options.max_state_classes;
                 scoring.max_mass_cells = options.max_mass_cells;
                 scoring.emission_cache_bytes = options.emission_cache_bytes;
+                scoring.gap_recursion_backend = gap_recursion_backend_of(options);   // I2-H: dosage too
                 const std::vector<double> switches(capture.model->blocks().size() - 1, options.switch_probability);
                 dosage::DosageShadowOptions shadow_options;
                 shadow_options.threads = options.threads;
                 shadow_options.allocation_test = options.dosage_allocation_test;
+                shadow_options.census_backend = options.dosage_census_interned ? dosage::CensusBackend::interned_experimental
+                                                                               : dosage::CensusBackend::reference;   // I2-J
+                shadow_options.census_backend_declared = options.setting_sources.count("dosage_census_backend") != 0;
                 shadow_options.repair_max_physical_origins = options.repair_max_physical_origins;
                 shadow_options.repair_max_state_classes = options.repair_max_state_classes;
                 shadow_options.repair_max_piece_hits = options.repair_max_piece_hits;
@@ -5635,7 +6512,36 @@ int run_genotype_command(const std::vector<std::string>& args) {
         std::cerr << "[genotype] locus output failed: " << error.what() << '\n';
         return 2;
     }
+    if (options.verification_census_period != 0) {
+        set_verification_census_stage(CensusStage::other);
+        atomic_write(options.out_prefix + ".verification_census.tsv", verification_census_table(end_verification_census()));
+    }
     return called ? 0 : 1;
+}
+
+int run_genotype_command(const std::vector<std::string>& args) {
+    GenotypeCommandOptions options;
+    if (const std::optional<int> done = resolve_genotype_command(args, options)) return *done;
+    return execute_genotype_command(options, nullptr);
+}
+
+// I3-A: the same command against a prepared locus (no public CLI; development driver and tests).
+int run_genotype_command_prepared(const std::vector<std::string>& args, const PreparedLocus& locus) {
+    GenotypeCommandOptions options;
+    if (const std::optional<int> done = resolve_genotype_command(args, options)) return *done;
+    return execute_genotype_command(options, &locus);
+}
+
+std::shared_ptr<const PreparedLocus> prepare_genotype_locus(const std::vector<std::string>& args) {
+    GenotypeCommandOptions options;
+    if (resolve_genotype_command(args, options)) throw std::invalid_argument("prepare_genotype_locus: the command line ends in help");
+    return prepare_genotype_locus(options);
+}
+
+PreparedLocusPreparation prepare_genotype_locus_record(const std::vector<std::string>& args, bool persist_panel) {
+    GenotypeCommandOptions options;
+    if (resolve_genotype_command(args, options)) throw std::invalid_argument("prepare_genotype_locus_record: the command line ends in help");
+    return prepare_genotype_locus_record(options, persist_panel);
 }
 
 } // namespace panvar

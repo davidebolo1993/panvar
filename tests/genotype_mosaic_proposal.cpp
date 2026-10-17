@@ -7,6 +7,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <set>
+#include <cstring>
 #include <iostream>
 #include <limits>
 #include <map>
@@ -907,6 +909,207 @@ void test_panel_baseline_retains_a_pruned_pair() {
 
 } // namespace
 
+
+// ---- I2-E: exact reuse of marker-proposal contributions ----------------------------------------------------------------
+// Synthetic panels exercising repeated markers, varying copy multiplicities, fixed copies outside the block, empty
+// inventories, zero observations and markers absent from one allele. Reuse on must equal reuse off bit for bit (every
+// emission entry, every constant, every count), under successive calls with different observations and parameters, at
+// every budget (tiny budgets fall back exactly), and downstream proposals must be identical.
+panvar::PreparedMarkerPanel synthetic_panel(std::uint64_t seed, std::size_t blocks) {
+    std::mt19937_64 rng(seed);
+    panvar::PreparedMarkerPanel panel;
+    panel.kmer_size = 31;
+    panel.syncmer_s = 15;
+    std::uint32_t next_slot = 0;
+    for (std::size_t b = 0; b < blocks; ++b) {
+        panvar::BlockMarkerInventory block;
+        block.block_id = "b" + std::to_string(b);
+        const std::size_t markers = b == 1 ? 0 : 5 + rng() % 40;              // block 1: an empty marker inventory
+        block.allele_count = b == 2 ? 1 : 2 + rng() % 9;                       // block 2: a single allele
+        for (std::size_t m = 0; m < markers; ++m) {
+            block.marker_slots.push_back(next_slot++);
+            block.fixed_haploid_multiplicity.push_back(static_cast<std::uint32_t>(rng() % 4));   // fixed copies elsewhere
+        }
+        block.allele_markers.resize(block.allele_count);
+        for (std::size_t a = 0; a < block.allele_count; ++a) {
+            if (a == 0 && block.allele_count > 2) continue;                    // an allele carrying no marker
+            for (std::uint32_t m = 0; m < markers; ++m) {
+                if (rng() % 3 == 0) continue;                                  // absent from this allele
+                const std::uint32_t copies = 1 + static_cast<std::uint32_t>(rng() % 5 == 0 ? rng() % 7 : rng() % 2);
+                block.allele_markers[a].emplace_back(m, copies);
+            }
+        }
+        panel.total_alleles += block.allele_count;
+        panel.scored_alleles += block.allele_count;
+        panel.blocks.push_back(std::move(block));
+    }
+    panel.codes.resize(next_slot);
+    for (std::uint32_t i = 0; i < next_slot; ++i) panel.codes[i] = i;
+    return panel;
+}
+
+panvar::MarkerObservations synthetic_observations(const panvar::PreparedMarkerPanel& panel, std::uint64_t seed) {
+    std::mt19937_64 rng(seed);
+    panvar::MarkerObservations o;
+    o.counts.resize(panel.codes.size());
+    for (auto& c : o.counts) c = rng() % 4 == 0 ? 0 : rng() % 30;   // zero observations included
+    return o;
+}
+
+void require_bitwise_emissions(const panvar::PreparedProposalEmissions& a, const panvar::PreparedProposalEmissions& b,
+                               const std::string& label) {
+    require(a.total_alleles == b.total_alleles && a.scored_alleles == b.scored_alleles && a.blocks.size() == b.blocks.size(),
+            label + ": emission metadata differs");
+    for (std::size_t k = 0; k < a.blocks.size(); ++k) {
+        const auto& x = a.blocks[k];
+        const auto& y = b.blocks[k];
+        require(x.allele_count == y.allele_count && x.scored_alleles == y.scored_alleles && x.log_score.size() == y.log_score.size(),
+                label + ": block metadata differs");
+        require(std::memcmp(&x.candidate_independent_log_constant, &y.candidate_independent_log_constant, sizeof(double)) == 0,
+                label + ": candidate-independent constant differs");
+        require(x.log_score.empty() ||
+                    std::memcmp(x.log_score.data(), y.log_score.data(), x.log_score.size() * sizeof(double)) == 0,
+                label + ": an emission entry differs in block " + std::to_string(k));
+    }
+}
+
+std::uint64_t distinct_terms(const panvar::PreparedMarkerPanel& panel) {
+    std::uint64_t total = 0;
+    for (const auto& block : panel.blocks) {
+        std::vector<std::set<std::uint64_t>> single(block.marker_slots.size()), need(block.marker_slots.size());
+        for (const auto& allele : block.allele_markers) for (const auto& [m, c] : allele) single[m].insert(c);
+        // copies a pair can present at a marker: one allele's alone (the other lacks it) or both alleles' summed, the
+        // homozygous pair included -- only for allele pairs that actually occur
+        for (std::size_t x = 0; x < block.allele_count; ++x) {
+            for (std::size_t y = x; y < block.allele_count; ++y) {
+                std::map<std::uint32_t, std::uint64_t> sum;
+                for (const auto& [m, c] : block.allele_markers[x]) sum[m] += c;
+                for (const auto& [m, c] : block.allele_markers[y]) sum[m] += c;
+                for (const auto& [m, c] : sum) need[m].insert(c);
+            }
+        }
+        for (const auto& n : need) total += n.size();
+    }
+    return total;
+}
+
+void test_contribution_reuse() {
+    for (const std::uint64_t seed : {11u, 12u, 13u}) {
+        const panvar::PreparedMarkerPanel panel = synthetic_panel(seed, 6);
+        const std::vector<std::pair<panvar::MarkerObservations, panvar::MarkerModelParameters>> calls = [&] {
+            std::vector<std::pair<panvar::MarkerObservations, panvar::MarkerModelParameters>> out;
+            for (int k = 0; k < 3; ++k) {
+                panvar::MarkerModelParameters p;
+                p.kmer_size = 31;
+                p.syncmer_s = 15;
+                p.expected_observations_per_copy = k == 1 ? 3.7 : 1.25;   // different fitted parameters in successive calls
+                p.background_observations = k == 2 ? 0.02 : 1e-6;
+                p.provenance = "fixture: synthetic call " + std::to_string(k);
+                out.push_back({synthetic_observations(panel, seed * 10 + static_cast<std::uint64_t>(k % 2)), p});
+            }
+            return out;
+        }();
+        for (std::size_t c = 0; c < calls.size(); ++c) {
+            const auto& [obs, params] = calls[c];
+            const std::string label = "seed " + std::to_string(seed) + ", call " + std::to_string(c);
+            panvar::ProposalReuseReport off_report, on_report, tiny_report, partial_report;
+            const auto direct = panvar::build_proposal_emissions(panel, obs, params, panvar::ProposalReuseOptions{}, &off_report);
+            require_bitwise_emissions(direct, panvar::build_proposal_emissions(panel, obs, params), label + ": overloads");
+            const auto reused = panvar::build_proposal_emissions(panel, obs, params, {true, std::size_t{1} << 20}, &on_report);
+            require_bitwise_emissions(direct, reused, label + ": reuse on");
+            require(on_report.executed + on_report.reused == on_report.visits && on_report.visits == off_report.visits &&
+                        off_report.executed == off_report.visits && on_report.fallback == 0 && on_report.reused > 0,
+                    label + ": accounting");
+            require(on_report.executed == distinct_terms(panel),
+                    label + ": each required term must be evaluated exactly once");
+            // tiny budget: nothing tabled, every term direct, identical
+            const auto tiny = panvar::build_proposal_emissions(panel, obs, params, {true, 16}, &tiny_report);
+            require_bitwise_emissions(direct, tiny, label + ": tiny budget");
+            require(tiny_report.markers_tabled == 0 && tiny_report.fallback == tiny_report.visits && tiny_report.reused == 0 &&
+                        tiny_report.peak_table_bytes <= 16,
+                    label + ": a tiny budget must fall back for every term and retain nothing beyond it");
+            // I2-F correction: the planning arrays are temporary, allocated even when nothing is admitted, and reported
+            // apart from the budgeted retained storage
+            std::size_t largest_markers = 0;
+            for (const auto& block : panel.blocks) largest_markers = std::max(largest_markers, block.marker_slots.size());
+            require(tiny_report.peak_planning_bytes == largest_markers * (sizeof(std::uint32_t) + sizeof(std::uint64_t)) &&
+                        tiny_report.peak_planning_bytes > 16,
+                    label + ": the tiny budget's planning scratch must be reported, outside the budget");
+            require(off_report.peak_planning_bytes == 0 && off_report.peak_table_bytes == 0, label + ": reuse off allocates nothing");
+            require(on_report.peak_table_bytes <= (std::size_t{1} << 20), label + ": the table must stay within its budget");
+            // a partial budget: some markers tabled, the rest direct, identical
+            const std::size_t partial = static_cast<std::size_t>(on_report.peak_table_bytes / 2);
+            const auto half = panvar::build_proposal_emissions(panel, obs, params, {true, partial}, &partial_report);
+            require_bitwise_emissions(direct, half, label + ": partial budget");
+            require(partial_report.markers_tabled > 0 && partial_report.markers_not_tabled > 0 && partial_report.fallback > 0 &&
+                        partial_report.peak_table_bytes <= partial,
+                    label + ": a partial budget must table some markers, fall back for the rest and stay within it");
+        }
+        // downstream proposals: identical candidates and scores from either emission table
+        panvar::PanelAlleleMatrix templates;
+        std::mt19937_64 rng(seed + 99);
+        for (std::size_t t = 0; t < 5; ++t) {
+            templates.template_names.push_back("t" + std::to_string(t));
+            std::vector<std::size_t> path;
+            for (const auto& block : panel.blocks) path.push_back(rng() % block.allele_count);
+            templates.template_alleles.push_back(path);
+        }
+        const auto& [obs, params] = calls[0];
+        const auto a = panvar::propose_mosaic_diplotypes(templates, panvar::build_proposal_emissions(panel, obs, params),
+                                                         {0.2, 0.2, 0.2, 0.2, 0.2}, {12, 4096});
+        const auto b = panvar::propose_mosaic_diplotypes(
+            templates, panvar::build_proposal_emissions(panel, obs, params, {true, std::size_t{1} << 20}), {0.2, 0.2, 0.2, 0.2, 0.2},
+            {12, 4096});
+        require(a.candidates.size() == b.candidates.size() && a.unique_candidates_found == b.unique_candidates_found &&
+                    a.states_pruned == b.states_pruned,
+                "downstream proposal shapes must be identical");
+        for (std::size_t i = 0; i < a.candidates.size(); ++i) {
+            const auto& x = a.candidates[i];
+            const auto& y = b.candidates[i];
+            require(x.diplotype.first.alleles == y.diplotype.first.alleles && x.diplotype.second.alleles == y.diplotype.second.alleles &&
+                        std::memcmp(&x.best_proposal_score, &y.best_proposal_score, sizeof(double)) == 0 &&
+                        std::memcmp(&x.retained_logsum_proposal_score, &y.retained_logsum_proposal_score, sizeof(double)) == 0 &&
+                        x.equivalent_retained_histories == y.equivalent_retained_histories,
+                    "downstream proposals must be identical, rank by rank");
+        }
+    }
+    // the hand fixture's real model, and error handling identical in both modes
+    {
+        const panvar::PreparedGenotypeModel model = panvar::prepare_genotype_model(marker_fixture(true));
+        const panvar::PreparedMarkerPanel panel = panvar::build_marker_panel(model, 3, 3);
+        const std::vector<panvar::ReadPair> fragments = {{read("f/1", "AAAAACGTAC"), read("f/2", "AAACCGGTTT")}};
+        const panvar::MarkerObservations obs = panvar::count_marker_observations(panel, fragments);
+        panvar::MarkerModelParameters p;
+        p.kmer_size = 3;
+        p.syncmer_s = 3;
+        p.expected_observations_per_copy = 0.5;
+        p.background_observations = 0.5;
+        p.provenance = "fixture: explicit";
+        require_bitwise_emissions(panvar::build_proposal_emissions(panel, obs, p),
+                                  panvar::build_proposal_emissions(panel, obs, p, {true, 4096}), "hand fixture");
+        panvar::PreparedMarkerPanel broken = synthetic_panel(21, 3);
+        broken.blocks[0].allele_markers[1].emplace_back(static_cast<std::uint32_t>(broken.blocks[0].marker_slots.size() + 5), 1);
+        const panvar::MarkerObservations bobs = synthetic_observations(broken, 5);
+        panvar::MarkerModelParameters bp = p;
+        bp.kmer_size = 31;
+        bp.syncmer_s = 15;
+        std::string off_error, on_error;
+        try { (void)panvar::build_proposal_emissions(broken, bobs, bp); } catch (const std::exception& e) { off_error = e.what(); }
+        try { (void)panvar::build_proposal_emissions(broken, bobs, bp, {true, 1u << 20}); } catch (const std::exception& e) { on_error = e.what(); }
+        require(!off_error.empty() && off_error == on_error, "an out-of-block marker must be refused identically in both modes");
+        panvar::MarkerModelParameters invalid = bp;
+        invalid.expected_observations_per_copy = -1.0;
+        off_error.clear();
+        on_error.clear();
+        try { (void)panvar::build_proposal_emissions(broken, bobs, invalid); } catch (const std::exception& e) { off_error = e.what(); }
+        try { (void)panvar::build_proposal_emissions(broken, bobs, invalid, {true, 1u << 20}); } catch (const std::exception& e) { on_error = e.what(); }
+        require(!off_error.empty() && off_error == on_error, "invalid parameters must be refused identically in both modes");
+    }
+    std::cout << "  contribution reuse: bitwise-identical emissions and constants over 3 panels x 3 successive calls (different "
+                 "observations and parameters), each required term evaluated once; tiny and partial budgets fall back exactly; "
+                 "downstream proposals identical; errors identical\n";
+}
+
 int main() {
     try {
         test_marker_model();
@@ -915,6 +1118,7 @@ int main() {
         test_marker_background_reaches_proposal();
         test_depth_fit_matches_profile_oracle();
         test_panel_baseline_retains_a_pruned_pair();
+        test_contribution_reuse();
         std::cout << "genotype mosaic proposal: PASS\n";
         return 0;
     } catch (const std::exception& error) {

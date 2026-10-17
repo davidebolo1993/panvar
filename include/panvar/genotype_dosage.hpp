@@ -86,8 +86,23 @@ struct CensusBlock {
     bool sensitive() const noexcept { return route != CensusRoute::NotSensitive; }
 };
 
+// I2-J: which implementation computes the census. The reference is the original; the experimental backend must
+// produce every CensusBlock field identically (off by default).
+enum class CensusBackend { reference, interned_experimental };
+const char* census_backend_name(CensusBackend backend);
+
+// I2-J (MEASUREMENT): coarse stage timers and work counters of one census, summed over blocks. Never per pair.
+struct CensusWork {
+    double seconds_walks = 0.0;       // walk parsing and node-count preparation (experimental: plus interning)
+    double seconds_summaries = 0.0;   // allele lengths, multiplicities and repeated bases (missing nodes refused here)
+    double seconds_pairs = 0.0;       // the ordered allele-pair comparisons and the route
+    std::uint64_t alleles = 0, ordered_pairs = 0, pairs_compared = 0;   // pairs passing the length test are compared
+    std::uint64_t peak_temporary_bytes = 0;   // experimental only: the largest block's prepared vectors (capacity)
+};
+
 std::vector<CensusBlock> run_census(const PreparedGenotypeModel& model, const NodeSequences& nodes,
-                                    std::size_t molecule_span_bp, const DosageSettings& settings);
+                                    std::size_t molecule_span_bp, const DosageSettings& settings,
+                                    CensusBackend backend = CensusBackend::reference, CensusWork* work = nullptr);
 
 // Pooled features of one block (graph only): groups of varying k-mers sharing one copy-count column, >= min k-mers,
 // ordered by first occurrence (alleles by ascending ID, positions left to right).

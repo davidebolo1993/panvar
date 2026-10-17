@@ -42,6 +42,19 @@ void atomic_write(const std::string& path, const std::string& content);
 std::string sha256_file(const std::string& path);
 // SHA-256 of a byte string, lowercase hex.
 std::string sha256_bytes(const std::string& bytes);
+// I3-C: the same SHA-256, streaming (for content digests that must not first serialise their whole input).
+class Sha256Stream {
+public:
+    Sha256Stream();
+    ~Sha256Stream();
+    Sha256Stream(const Sha256Stream&) = delete;
+    Sha256Stream& operator=(const Sha256Stream&) = delete;
+    void update(const void* data, std::size_t size);
+    std::string hex();   // finalises; call once
+private:
+    struct State;
+    std::unique_ptr<State> state_;
+};
 
 // ---- the search --------------------------------------------------------------------------------
 // OneShot scores every round cold; Context keeps one PreparedScoringContext; Delta additionally
@@ -58,6 +71,12 @@ struct RepairSearchOptions {
     bool planned_cache = true;           // planned retention; false: first_fit
     std::size_t origin_cache_bytes = 0;
     std::uint64_t origin_cache_records = 0;
+    // I2-B (experimental): round-local fine window discovery in the search's own context (0: off, the reference).
+    std::size_t fine_window_bytes = 0;
+    std::uint64_t fine_window_served_cap = 0;
+    // I2-D (experimental): seed the anchor pair's scored columns AND censuses in one placement pass (off: score, then
+    // retain each census by a second full placement, as before).
+    bool fused_seed = false;
     double switch_probability = 0.01;
     // 0: none. A round's neighbourhood above this is refused before any allocation.
     std::uint64_t declared_neighbour_cap = 0;
@@ -163,6 +182,22 @@ struct RepairHooks {
 // of up to `local_pairs` unordered allele pairs. Computable before anything is allocated.
 std::uint64_t repair_neighbour_bound(const PreparedGenotypeModel& model, std::size_t local_pairs);
 
+// I2-C (measurement only): wall seconds of the search's own work, non-overlapping, summed over every round it ran.
+// rounds_wall is each round from its start to its end, the trajectory hook included; round_remainder() is what no named
+// part covers. Scoring is the round's wall from slot resolution through candidate combination (parallel enumeration
+// inside it is wall here; worker-elapsed figures are reported apart).
+struct RepairStageSeconds {
+    double seed_placement_census = 0.0, incumbent_spelling = 0.0, neighbour_generation = 0.0, neighbour_spelling = 0.0;
+    double neighbour_priors = 0.0, scoring = 0.0, scored_pair_priors = 0.0, pool_hook = 0.0, certification_and_move = 0.0;
+    double promotion_release = 0.0, memory_snapshots = 0.0, trajectory_hook = 0.0, rounds_wall = 0.0;
+    double named() const {
+        return seed_placement_census + incumbent_spelling + neighbour_generation + neighbour_spelling + neighbour_priors +
+               scoring + scored_pair_priors + pool_hook + certification_and_move + promotion_release + memory_snapshots +
+               trajectory_hook;
+    }
+    double round_remainder() const { return rounds_wall - named(); }
+};
+
 class CoordinateRepairSearch {
 public:
     CoordinateRepairSearch(const PreparedGenotypeModel& model, const PreparedProposalEmissions& emissions,
@@ -226,6 +261,7 @@ public:
     bool converged() const;
     std::size_t hold_index() const { return hold_index_; }
     double cumulative_seconds() const { return cumulative_seconds_; }
+    const RepairStageSeconds& stage_seconds() const { return stage_seconds_; }
     std::uint64_t cumulative_pairs() const { return cumulative_pairs_; }
     std::uint64_t neighbour_bound() const { return neighbour_bound_; }
     std::size_t last_round() const { return options_.first_round + options_.max_rounds - 1; }
@@ -271,6 +307,7 @@ private:
     std::size_t hold_index_ = 0;
     bool holding_ = false;
     double cumulative_seconds_ = 0.0;
+    RepairStageSeconds stage_seconds_;
     std::uint64_t cumulative_pairs_ = 0;
     std::size_t failed_round_ = 0;
     double failed_expected_ = 0.0;

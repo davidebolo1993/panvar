@@ -7,11 +7,14 @@
 #include "panvar/genotype_headline.hpp"
 #include "panvar/genotype_dosage_repair.hpp"
 #include "panvar/genotype_repair.hpp"
+#include "panvar/fragment_likelihood.hpp"
+#include "panvar/verification_census.hpp"
 #include "panvar/mosaic_spelling.hpp"
 
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -179,6 +182,291 @@ void test_zero_spread() {
     const DosageAudit het = audit_of(L, "short", "long", reads);
     require(std::isinf(het.blocks[1].features[0].robust_z), "robust z is +inf when the call is off the median, by rule");
     require(het.blocks[1].status == DosageStatus::AutoRepair, "a call off a zero-spread median outside its interval triggers");
+}
+
+// I2-H's disclosed gap, closed: the fixed-geometry recursion must actually EXECUTE inside dosage, not merely leave the
+// dosage tables unchanged. The zero-spread fixture's heterozygous call triggers an AUTO repair; repair_block scores
+// its candidates exactly through the dosage stage's own scoring lifecycle. Single-threaded, so the existing per-thread
+// execution hook sees every recursion; the census attributes them to the dosage stage. Both backends must choose the
+// same repair from bit-identical candidate scores.
+void test_fixed_recursion_inside_dosage() {
+    const Locus L = make_locus(1500, false, 5);
+    const PreparedGenotypeModel& m = *L.model;
+    std::vector<ReadPair> reads;
+    for (int i = 0; i < 30; ++i) {
+        ReadPair p = pair_of(L.ctx0.substr(20 * i, 100), L.ctx2.substr(20 * i, 100));
+        p.first.name = "r" + std::to_string(i) + "/1";
+        p.second.name = "r" + std::to_string(i) + "/2";
+        p.first.qualities = p.second.qualities = std::string(100, 'I');
+        reads.push_back(p);
+    }
+    const DosageAudit audit = audit_of(L, "short", "long", reads);
+    require(audit.blocks[1].status == DosageStatus::AutoRepair, "fixture: the call triggers an AUTO repair");
+    const std::vector<CensusBlock> census = census_of(m);
+    std::vector<BlockFeatureModel> features(3);
+    features[1] = pooled_features(m.blocks()[1], DosageSettings{});
+    const MosaicPath h1{{0, allele_id(m, 1, "short"), 0}}, h2{{0, allele_id(m, 1, "long"), 0}};
+    const ReportedCall call = reported_call(m, h1, h2);
+    LibraryModel library;
+    library.insert_mean_bp = 350.0;
+    library.insert_sd_bp = 40.0;
+    library.support_sigmas = 4.0;
+    library.substitution_error = 0.002;
+    library.outlier_weight = 0.001;
+    library.fragment_start_intensity = 0.05;
+    library.provenance = "fixture: declared";
+    RepairResult result[2];
+    std::uint64_t executions[2] = {0, 0}, census_fixed[2] = {0, 0}, census_requests[2] = {0, 0};
+    for (int arm = 0; arm < 2; ++arm) {
+        ScoringInputs in;
+        in.model = &m;
+        in.first = h1;
+        in.second = h2;
+        in.call = &call;
+        in.reads = &reads;
+        in.library = &library;
+        in.options.threads = 1;
+        in.options.mismatch_band = 6;
+        in.options.minimum_piece_bp = 10;
+        in.options.gap_recursion_backend = arm == 0 ? GapRecursionBackend::scaled_reference
+                                                    : GapRecursionBackend::fixed_geometry_experimental;
+        in.switch_probability = std::vector<double>(m.blocks().size() - 1, 0.01);
+        double prior = 0.0;
+        in.persisted = score_reported_diplotype(in, prior);   // what the run persisted for its reported call
+        begin_verification_census(1, std::uint64_t{64} << 20);
+        set_verification_census_stage(CensusStage::dosage);
+        const std::uint64_t before = gapped_dp_test::fixed_geometry_executions();
+        result[arm] = repair_block(audit.blocks[1], census[1], features[1], {}, in, DosageSettings{}, RepairSettings{});
+        executions[arm] = gapped_dp_test::fixed_geometry_executions() - before;
+        set_verification_census_stage(CensusStage::other);
+        const VerificationCensusReport report = end_verification_census();
+        for (const std::size_t g : {static_cast<std::size_t>(CensusGroup::dosage_full), static_cast<std::size_t>(CensusGroup::dosage_window)}) {
+            census_fixed[arm] += report.exact[g].fixed_recursions;
+            census_requests[arm] += report.exact[g].requests;
+        }
+    }
+    require(result[1].outcome == "REPAIRED" && !result[1].candidates.empty() && census_requests[1] > 0,
+            "the repair must reproduce the reported call and score candidates (vacuous otherwise)");
+    require(executions[0] == 0 && census_fixed[0] == 0, "the reference backend runs no fixed-geometry recursion in dosage");
+    require(executions[1] > 0 && census_fixed[1] == executions[1],
+            "the fixed-geometry recursion must execute inside dosage's repair scoring, all of it attributed to dosage");
+    const auto bits = [](double x) { std::uint64_t u; std::memcpy(&u, &x, sizeof u); return u; };
+    require(result[0].outcome == result[1].outcome && result[0].chosen == result[1].chosen &&
+                result[0].candidates.size() == result[1].candidates.size() && result[0].top_set_size == result[1].top_set_size,
+            "both backends must reach the same repair");
+    for (std::size_t c = 0; c < result[0].candidates.size(); ++c) {
+        const BlockCandidate& a = result[0].candidates[c];
+        const BlockCandidate& b = result[1].candidates[c];
+        require(a.label == b.label && bits(a.fragment_term) == bits(b.fragment_term) &&
+                    bits(a.exposure_term) == bits(b.exposure_term) && bits(a.likelihood) == bits(b.likelihood) &&
+                    a.chosen == b.chosen && a.in_top_set == b.in_top_set,
+                "every repair candidate's exact score must agree bit for bit");
+    }
+    std::cout << "  fixed-geometry recursion inside dosage: " << executions[1] << " executed in repair scoring of "
+              << result[1].candidates.size() << " candidates (" << census_requests[1]
+              << " dosage verification requests); candidate scores and the repair bit-identical to the reference\n";
+}
+
+// ---- I2-J: the interned census backend must equal the reference in every CensusBlock field ----------------------------
+// A census outcome, or the exact refusal message.
+struct CensusOutcome {
+    std::vector<CensusBlock> rows;
+    std::string error;
+};
+
+CensusOutcome census_with(const PreparedGenotypeModel& m, const NodeSequences& nodes, std::size_t span,
+                          const DosageSettings& s, CensusBackend backend) {
+    CensusOutcome out;
+    try {
+        out.rows = run_census(m, nodes, span, s, backend);
+    } catch (const std::exception& e) {
+        out.error = e.what();
+    }
+    return out;
+}
+
+bool same_census(const CensusOutcome& a, const CensusOutcome& b) {
+    if (a.error != b.error || a.rows.size() != b.rows.size()) return false;
+    for (std::size_t i = 0; i < a.rows.size(); ++i) {
+        const CensusBlock& x = a.rows[i];
+        const CensusBlock& y = b.rows[i];
+        if (x.block != y.block || x.block_id != y.block_id || x.alleles != y.alleles ||
+            x.max_node_multiplicity != y.max_node_multiplicity || x.dosage_only_pairs != y.dosage_only_pairs ||
+            x.max_repeated_bp != y.max_repeated_bp || x.route != y.route) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// One block of alleles, each a walk (empty: no walk source) with extra source walks aliasing the same sequence.
+struct WalkAllele {
+    std::string walk;                    // "a+,b-,..." or "" for an allele with no walk source
+    std::vector<std::string> aliases;    // further source walks spelling the same sequence (the first walk is primary)
+};
+
+PreparedGenotypeModel walk_model(const std::vector<std::vector<WalkAllele>>& blocks, std::mt19937_64& rng) {
+    StructuralLocusInput in;
+    in.locus_id = "census-gate";
+    std::size_t widest = 0;
+    for (std::size_t b = 0; b < blocks.size(); ++b) {
+        GenotypeBlockInput block;
+        block.block_id = "sv:" + std::to_string(b);
+        block.kind = GenotypeBlockKind::Variant;
+        for (std::size_t a = 0; a < blocks[b].size(); ++a) {
+            const std::string sequence = random_dna(rng, 8) + std::to_string(b) + "_" + std::to_string(a);   // distinct
+            const std::string seq = sequence.substr(0, 8) + std::string(a + 1, "ACGT"[b % 4]);
+            // A unique tag before "walk:" keeps duplicate walks apart as source ids; primary_walk reads what follows it.
+            const std::string source = blocks[b][a].walk.empty() ? "nowalk" + std::to_string(a)
+                                                                 : "a" + std::to_string(a) + "|walk:" + blocks[b][a].walk;
+            block.alleles.push_back({source, seq});
+            for (std::size_t k = 0; k < blocks[b][a].aliases.size(); ++k) {
+                block.alleles.push_back({"a" + std::to_string(a) + "x" + std::to_string(k) + "|walk:" + blocks[b][a].aliases[k], seq});
+            }
+        }
+        widest = std::max(widest, blocks[b].size());
+        in.blocks.push_back(block);
+    }
+    in.invariant_segments.assign(blocks.size() + 1, "");
+    for (std::size_t t = 0; t < widest; ++t) {
+        PanelTemplateInput row;
+        row.name = "t" + std::to_string(t);
+        row.frame_status = TemplateFrameStatus::Complete;
+        for (std::size_t b = 0; b < blocks.size(); ++b) {
+            const std::size_t a = t % blocks[b].size();
+            const WalkAllele& allele = blocks[b][a];
+            row.allele_source_ids.push_back(allele.walk.empty() ? "nowalk" + std::to_string(a)
+                                                                : "a" + std::to_string(a) + "|walk:" + allele.walk);
+        }
+        in.templates.push_back(row);
+    }
+    return prepare_genotype_model(in);
+}
+
+void test_census_backends_agree() {
+    std::size_t compared = 0, errors = 0, routes[3] = {0, 0, 0}, boundary = 0;
+    const auto check = [&](const PreparedGenotypeModel& m, const NodeSequences& nodes, std::size_t span,
+                           const DosageSettings& s, const std::string& label) {
+        const CensusOutcome ref = census_with(m, nodes, span, s, CensusBackend::reference);
+        const CensusOutcome exp = census_with(m, nodes, span, s, CensusBackend::interned_experimental);
+        require(same_census(ref, exp), "census backends differ: " + label + (ref.error.empty() ? "" : " (" + ref.error + ")"));
+        ++compared;
+        if (!ref.error.empty()) ++errors;
+        for (const CensusBlock& c : ref.rows) ++routes[static_cast<int>(c.route)];
+    };
+    // existing fixtures: the review regression's repeat models and the dosage locus fixtures (no walks: no alleles)
+    {
+        const NodeSequences nodes = {{"x", std::string(600, 'A')}, {"y", std::string(600, 'A')}, {"z", "CCC"}};
+        for (const bool unrolled : {false, true}) {
+            StructuralLocusInput x;
+            x.locus_id = "repeat";
+            x.blocks = {{"sv:0", {{"walk:x+", std::string(600, 'A')}, {unrolled ? "walk:x+,y+" : "walk:x+,x+", std::string(1200, 'A')}},
+                         GenotypeBlockKind::Variant},
+                        {"ctx:1", {{"walk:z+", "CCC"}}, GenotypeBlockKind::Context}};
+            x.invariant_segments = {"", "", ""};
+            for (const auto& [name, first] : {std::pair<std::string, std::string>{"short", "walk:x+"},
+                                              {"long", unrolled ? "walk:x+,y+" : "walk:x+,x+"}}) {
+                PanelTemplateInput row;
+                row.name = name;
+                row.frame_status = TemplateFrameStatus::Complete;
+                row.allele_source_ids = {first, "walk:z+"};
+                x.templates.push_back(row);
+            }
+            const PreparedGenotypeModel m = prepare_genotype_model(x);
+            for (const std::size_t span : {0, 499, 500, 501, 600, 601}) check(m, nodes, span, DosageSettings{}, "repeat model");
+        }
+        for (const std::uint64_t seed : {1, 2, 5, 12}) {
+            const Locus L = make_locus(1500, seed == 2, seed);
+            check(*L.model, {}, 510, DosageSettings{}, "dosage locus fixture");
+        }
+    }
+    // randomized and adversarial walk models
+    std::mt19937_64 rng(20261016);
+    const std::vector<std::string> names = {"1", "2", "10", "s1", "node:7", "A+B", "x_y", "Δ", "seg-3", "11", "a.b", "Z"};
+    for (int trial = 0; trial < 300; ++trial) {
+        const std::size_t pool = 3 + rng() % (names.size() - 2);   // 3..12 names
+        std::vector<std::vector<WalkAllele>> blocks(1 + rng() % 3);
+        for (auto& block : blocks) {
+            const std::size_t n = 1 + rng() % 7;
+            for (std::size_t a = 0; a < n; ++a) {
+                WalkAllele allele;
+                const std::size_t steps = rng() % 9;   // 0: an allele with no walk
+                for (std::size_t k = 0; k < steps; ++k) {
+                    if (k > 0) allele.walk += ",";
+                    allele.walk += names[rng() % pool] + (rng() % 2 ? "+" : "-");   // both orientations, repeats
+                }
+                if (a > 0 && rng() % 5 == 0) allele.walk = block[rng() % a].walk;   // a duplicate walk
+                if (!allele.walk.empty() && rng() % 4 == 0) allele.aliases.push_back(names[rng() % pool] + "+");
+                block.push_back(allele);
+            }
+        }
+        PreparedGenotypeModel m = walk_model(blocks, rng);
+        NodeSequences nodes;
+        for (std::size_t i = 0; i < pool; ++i) nodes[names[i]] = std::string(1 + rng() % 120, "ACGT"[i % 4]);
+        const bool drop = trial % 17 == 0;   // a missing node
+        if (drop) nodes.erase(names[rng() % pool]);
+        DosageSettings s;
+        s.max_novel_bp = rng() % 3 == 0 ? 0 : rng() % 150;
+        for (const std::size_t span : {std::size_t{0}, std::size_t{1 + rng() % 200}, std::size_t{510}}) {
+            check(m, nodes, span, s, "random trial " + std::to_string(trial));
+        }
+        // thresholds immediately below, at and above a boundary this model actually has: the largest length gap and
+        // the absent-node sum of one pair, computed here independently of both backends
+        if (!drop) {
+            for (const auto& block : m.blocks()) {
+                std::vector<std::map<std::string, std::size_t>> counts;
+                for (const auto& allele : block.alleles) {
+                    const std::vector<NodeStep> walk = primary_walk(allele);
+                    if (walk.empty()) continue;
+                    std::map<std::string, std::size_t> c;
+                    for (const NodeStep& st : walk) ++c[st.node];
+                    counts.push_back(c);
+                }
+                if (counts.size() < 2) continue;
+                std::size_t li = 0, lj = 0, novel = 0;
+                for (const auto& [node, v] : counts[0]) li += v * nodes.at(node).size();
+                for (const auto& [node, v] : counts[1]) lj += v * nodes.at(node).size();
+                for (const auto& [node, v] : counts[0]) if (!counts[1].count(node)) novel += nodes.at(node).size();
+                const std::size_t gap = lj > li ? lj - li : li - lj;
+                for (const std::size_t span : {gap > 0 ? gap - 1 : 0, gap, gap + 1}) {
+                    for (const std::size_t t : {novel > 0 ? novel - 1 : 0, novel, novel + 1}) {
+                        DosageSettings at;
+                        at.max_novel_bp = t;
+                        check(m, nodes, span, at, "boundary, trial " + std::to_string(trial));
+                        ++boundary;
+                    }
+                }
+                break;
+            }
+        }
+        // reordered inputs: the same alleles in reverse order
+        std::vector<std::vector<WalkAllele>> reversed = blocks;
+        for (auto& block : reversed) std::reverse(block.begin(), block.end());
+        check(walk_model(reversed, rng), nodes, 510, s, "reordered trial " + std::to_string(trial));
+    }
+    // a malformed step in a later source walk refuses on both (primary_walk parses every source walk)
+    {
+        StructuralLocusInput in;
+        in.locus_id = "malformed";
+        GenotypeBlockInput block;
+        block.block_id = "sv:0";
+        block.alleles = {{"walk:s1+,s1+", "AAAA"}, {"walk:s1", "AAAA"}, {"walk:s1+", "CCCC"}};
+        in.blocks = {block};
+        in.invariant_segments = {"", ""};
+        for (const std::string& src : {std::string("walk:s1+,s1+"), std::string("walk:s1+")}) {
+            PanelTemplateInput row;
+            row.name = src;
+            row.frame_status = TemplateFrameStatus::Complete;
+            row.allele_source_ids = {src};
+            in.templates.push_back(row);
+        }
+        check(prepare_genotype_model(in), {{"s1", "ACGTACGT"}}, 0, DosageSettings{}, "malformed alias walk");
+    }
+    require(errors > 0 && routes[0] > 0 && routes[1] > 0 && routes[2] > 0 && boundary > 0,
+            "the census gate must exercise refusals, every route and boundary thresholds");
+    std::cout << "  census backends agree on every CensusBlock field in " << compared << " censuses (" << errors
+              << " identical refusals; routes not_sensitive/pair/repeated_unit " << routes[0] << "/" << routes[1] << "/"
+              << routes[2] << "; " << boundary << " boundary-threshold cases)\n";
 }
 
 void test_thread_identity() {
@@ -768,6 +1056,8 @@ int main() {
         test_undefined_estimator_cases();
         test_zero_spread();
         test_thread_identity();
+        test_census_backends_agree();
+        test_fixed_recursion_inside_dosage();
         test_unsupported_library();
         test_choice_rules();
         test_provenance();

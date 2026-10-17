@@ -26,11 +26,13 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <cstdint>
 #include <cstdlib>
 #include <functional>
 #include <iostream>
 #include <new>
 #include <random>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -2240,8 +2242,525 @@ void test_cumulative_caps_through_the_delta() {
 
 }  // namespace
 
+
+// ---- I2-B (experimental): round-local fine discovery in the adaptive window enumeration ------------------------------
+// Rounds go through add_repaired_haplotypes (the production batch); a winner is promoted by delta with its census kept,
+// the rest released, and later rounds deltas from it into reused slots. With the per-window row check on, every window
+// the fine path builds is compared row for row (start, consumed, mismatches, emission bits) with the reference's own two
+// scans over the whole window; the cells, exposures and score components (audit views included) must equal the
+// reference context's bit for bit.
+struct FineHow {
+    bool fine = false;
+    std::size_t budget = std::size_t{1} << 28;
+    std::uint64_t served_cap = std::uint64_t{1} << 40;
+    std::size_t threads = 1;
+    unsigned order_seed = 0;
+    bool origin = true;
+    std::size_t origin_budget = std::size_t{1} << 20;
+    bool audit = false;
+    bool repeat = false;
+    std::uint64_t max_physical_origins = 0;
+    panvar::LibraryModel library_model = library();
+};
+struct FineResult {
+    std::vector<double> cells;
+    std::vector<panvar::DiplotypeScore> scores;
+    std::vector<std::vector<panvar::DiplotypeScore>> audits;
+    std::vector<std::size_t> slots;
+    panvar::FineWindowReport report;
+    std::size_t unique = 0, created = 0;
+};
+
+FineResult fine_search(const Locus& l, const std::vector<Repair>& repairs, std::size_t promote, const FineHow& how) {
+    panvar::FragmentScoringOptions opts = options();
+    opts.threads = how.threads;
+    if (how.max_physical_origins != 0) opts.max_physical_origins = how.max_physical_origins;
+    if (how.audit) {
+        panvar::LibraryModel a = how.library_model, b = how.library_model;
+        a.fragment_start_intensity *= 2.0;
+        b.outlier_weight = 0.02;
+        opts.audit_libraries = {a, b};
+    }
+    panvar::PreparedScoringContext context(l.fragments, how.library_model, opts);
+    context.add_haplotypes({l.base});
+    context.begin_transient_round();
+    context.retain_census(0);
+    if (how.origin) {
+        context.enable_origin_cache_path(true);
+        context.set_origin_cache_limits(how.origin_budget, 0);
+    }
+    if (how.fine) context.enable_fine_window_discovery(how.budget, how.served_cap);
+    std::vector<std::size_t> order(repairs.size());
+    std::iota(order.begin(), order.end(), std::size_t{0});
+    if (how.order_seed != 0) {
+        std::mt19937_64 rng(how.order_seed);
+        std::shuffle(order.begin(), order.end(), rng);
+    }
+    FineResult out;
+    const auto round = [&](std::size_t incumbent, bool skip_promoted) {
+        std::vector<panvar::RepairRequest> requests;
+        std::vector<std::size_t> which;
+        for (const std::size_t i : order) {
+            if (skip_promoted && i == promote) continue;
+            requests.push_back({incumbent, repairs[i].begin, repairs[i].end, repairs[i].allele});
+            which.push_back(i);
+        }
+        if (how.repeat && !requests.empty()) {   // the same request twice in one round
+            requests.push_back(requests.front());
+            which.push_back(which.front());
+        }
+        const std::vector<std::size_t> slots = context.add_repaired_haplotypes(requests);
+        // recorded in repair order, so permuted requests compare position by position
+        std::vector<std::size_t> slot_of(repairs.size(), SIZE_MAX);
+        for (std::size_t k = 0; k < which.size(); ++k) slot_of[which[k]] = slots[k];
+        for (std::size_t i = 0; i < repairs.size(); ++i) {
+            if (slot_of[i] == SIZE_MAX) continue;
+            const std::size_t slot = slot_of[i];
+            for (std::size_t f = 0; f < l.fragments.size(); ++f) out.cells.push_back(context.mass_of(f, slot));
+            out.cells.push_back(context.exposure_of(slot));
+            const panvar::FragmentScoringResult r = context.score_candidates({{incumbent, slot}});
+            out.scores.push_back(r.scores[0]);
+            for (std::size_t k = 0; k < r.audit_scores.size(); ++k) {
+                if (out.audits.size() <= k) out.audits.resize(k + 1);
+                out.audits[k].push_back(r.audit_scores[k][0]);
+            }
+        }
+    };
+    round(0, false);
+    const Repair& chosen = repairs[promote];
+    const std::size_t winner = context.add_repaired_haplotype(0, chosen.begin, chosen.end, chosen.allele, nullptr, true);
+    context.release_transient({winner});
+    for (int r = 0; r < 2; ++r) {
+        round(winner, true);
+        context.release_transient({winner});
+    }
+    out.report = context.fine_window_report();
+    out.unique = context.unique_haplotypes();
+    out.created = context.haplotypes_created();
+    return out;
+}
+
+void require_same_fine(const FineResult& got, const FineResult& want, const std::string& label) {
+    require(got.cells.size() == want.cells.size() && got.scores.size() == want.scores.size() &&
+                got.audits.size() == want.audits.size(),
+            label + ": result shapes differ");
+    for (std::size_t i = 0; i < want.cells.size(); ++i) require_identical(got.cells[i], want.cells[i], label + ": cell " + std::to_string(i));
+    const auto same = [&](const panvar::DiplotypeScore& a, const panvar::DiplotypeScore& b, const std::string& what) {
+        require_identical(a.log_likelihood, b.log_likelihood, what + " log likelihood");
+        require_identical(a.fragment_term, b.fragment_term, what + " fragment term");
+        require_identical(a.exposure_term, b.exposure_term, what + " exposure term");
+        require_identical(a.absolute_term_sum, b.absolute_term_sum, what + " term sum");
+        require(a.fragments_with_mass == b.fragments_with_mass, what + " fragments with mass");
+    };
+    for (std::size_t i = 0; i < want.scores.size(); ++i) same(got.scores[i], want.scores[i], label + ": score " + std::to_string(i));
+    for (std::size_t k = 0; k < want.audits.size(); ++k)
+        for (std::size_t i = 0; i < want.audits[k].size(); ++i)
+            same(got.audits[k][i], want.audits[k][i], label + ": audit " + std::to_string(k) + "/" + std::to_string(i));
+    require(got.unique == want.unique && got.created == want.created, label + ": slot reuse differs");
+}
+
+// Repeated copies, both mate orientations, mixed read lengths, blocks at both locus ends, tiny and empty blocks.
+MultiBlock fine_fixture(std::uint64_t seed) {
+    std::mt19937_64 rng(seed);
+    MultiBlock out;
+    const std::string unit = random_bases(rng, 60);
+    std::string base = random_bases(rng, 1400);
+    for (int i = 0; i < 8; ++i) base += unit;
+    base += random_bases(rng, 1400);
+    out.locus.base = base;
+    std::size_t n = 0;
+    for (std::size_t start = 0; start + 260 <= base.size(); start += 9) {
+        panvar::ReadPair pair = fragment_at(base, start, 260, 100, "x" + std::to_string(n));
+        if (n % 2 == 1) std::swap(pair.first, pair.second);              // both orientations
+        if (n % 7 == 0) {                                                 // mixed read lengths
+            pair.second.bases.resize(93);
+            pair.second.qualities.resize(93);
+        }
+        out.locus.fragments.push_back(pair);
+        ++n;
+    }
+    const std::size_t array = 1400;
+    out.repairs = {
+        {0, 6, random_bases(rng, 6)},                       // the locus start
+        {2, 3, ""},                                          // a tiny block emptied
+        {array + 60, array + 120, random_bases(rng, 60)},   // a copy of the repeat replaced
+        {array + 60, array + 120, ""},                       // one copy deleted
+        {array + 60, array + 120, unit + unit},              // one copy duplicated
+        {700, 700, random_bases(rng, 37)},                   // an empty block filled (a new junction)
+        {900, 950, random_bases(rng, 50)},
+        {900, 950, random_bases(rng, 3)},
+        {base.size() - 5, base.size(), random_bases(rng, 9)},   // the locus end
+    };
+    out.promote = 6;   // same length
+    return out;
+}
+
+void test_fine_window_discovery() {
+    panvar::set_fine_window_row_check(true);
+    std::size_t checked = 0;
+    for (const std::uint64_t seed : {2101u, 2102u}) {
+        const MultiBlock m = seed == 2101u ? multi_block(seed) : fine_fixture(seed);
+        const std::string fixture = seed == 2101u ? "multi-block" : "repeat/orientation/ends";
+        for (const bool origin : {true, false}) {
+            FineHow ref;
+            ref.origin = origin;
+            ref.audit = true;
+            const FineResult want = fine_search(m.locus, m.repairs, m.promote, ref);
+            require(!want.report.enabled && want.report.enumerations > 0, "fixture: the reference enumerates windows");
+            for (const std::size_t threads : {std::size_t{1}, std::size_t{4}}) {
+                FineHow how = ref;
+                how.fine = true;
+                how.threads = threads;
+                FineHow ref_t = ref;
+                ref_t.threads = threads;
+                const FineResult base_t = fine_search(m.locus, m.repairs, m.promote, ref_t);
+                require_same_fine(base_t, want, fixture + ": reference, " + std::to_string(threads) + " threads");
+                const FineResult got = fine_search(m.locus, m.repairs, m.promote, how);
+                const std::string label = fixture + (origin ? ", origin path" : ", stage 5") + ", " + std::to_string(threads) + " threads";
+                require_same_fine(got, want, label);
+                const panvar::FineWindowReport& r = got.report;
+                require(r.enabled && r.rounds == 3 && r.units_discovered > 0 && r.units_served > 0 && r.placements_served > 0 &&
+                            r.fallback_windows == 0 && r.units_not_retained == 0 && r.round_peak_held_bytes <= how.budget,
+                        label + ": the fine path must discover, then serve shared units, within its budget");
+                checked += r.worker_windows;
+                if (threads == 1 && origin) {
+                    std::cout << "  ok: " << fixture << " -- " << r.worker_windows << " windows, " << r.units_discovered
+                              << " units discovered, " << r.units_served << " served (" << r.placements_served
+                              << " placements served of " << r.placements_served + r.placements_discovered
+                              << "), round peak " << r.round_peak_bytes << " bytes\n";
+                }
+            }
+            // permuted and repeated requests
+            for (const unsigned order_seed : {5u, 17u}) {
+                FineHow how = ref;
+                how.fine = true;
+                how.order_seed = order_seed;
+                how.repeat = true;
+                FineHow ref_p = ref;
+                ref_p.order_seed = order_seed;
+                ref_p.repeat = true;
+                require_same_fine(fine_search(m.locus, m.repairs, m.promote, how), fine_search(m.locus, m.repairs, m.promote, ref_p),
+                                  fixture + ": permuted and repeated requests");
+            }
+        }
+    }
+    std::cout << "  ok: fine = reference (cells, exposures, components, audit views, slot reuse) at 1 and 4 threads, origin "
+                 "path and stage 5, permuted and repeated requests; " << checked << " windows checked row for row\n";
+
+    const MultiBlock m = fine_fixture(2103);
+    FineHow ref;
+    const FineResult want = fine_search(m.locus, m.repairs, m.promote, ref);
+    // storage admission: a store too small to hold anything useful closes, and later windows take the reference path
+    {
+        FineHow how;
+        how.fine = true;
+        how.budget = 2048;
+        const FineResult got = fine_search(m.locus, m.repairs, m.promote, how);
+        require_same_fine(got, want, "undersized store");
+        require(got.report.units_not_retained > 0 && got.report.fallback_windows > 0 &&
+                    got.report.round_peak_held_bytes <= how.budget,
+                "an undersized store must decline, fall back explicitly and stay within its budget");
+        std::cout << "  ok: undersized store -- " << got.report.units_not_retained << " units not retained, "
+                  << got.report.fallback_windows << " windows by the reference path, identical\n";
+    }
+    // the served-placement cap refuses, typed, and leaves the context refused
+    {
+        FineHow how;
+        how.fine = true;
+        how.served_cap = 1;
+        bool typed = false;
+        try {
+            (void)fine_search(m.locus, m.repairs, m.promote, how);
+        } catch (const panvar::ResourceExhausted&) {
+            typed = true;
+        } catch (...) {
+        }
+        require(typed, "the served-placement refusal must be ResourceExhausted");
+    }
+    // the existing cumulative caps still refuse, typed, with the fine path on
+    {
+        FineHow how;
+        how.fine = true;
+        how.max_physical_origins = 2000;
+        bool typed = false;
+        try {
+            (void)fine_search(m.locus, m.repairs, m.promote, how);
+        } catch (const panvar::ResourceExhausted&) {
+            typed = true;
+        } catch (...) {
+        }
+        require(typed, "the physical-origin cap must still refuse with the fine path on");
+    }
+    // independent read/library contexts
+    {
+        const MultiBlock other = multi_block(2104);
+        FineHow a, b;
+        b.library_model.insert_sd_bp = 15.0;
+        const FineResult ref_a = fine_search(m.locus, m.repairs, m.promote, a);
+        const FineResult ref_b = fine_search(other.locus, other.repairs, other.promote, b);
+        a.fine = b.fine = true;
+        require_same_fine(fine_search(m.locus, m.repairs, m.promote, a), ref_a, "context A");
+        require_same_fine(fine_search(other.locus, other.repairs, other.promote, b), ref_b, "context B (other reads and library)");
+    }
+    // negative controls: broken ownership or context must be caught by the row check
+    for (const int mutation : {1, 2, 3, 4}) {
+        panvar::set_fine_window_mutation(mutation);
+        FineHow how;
+        how.fine = true;
+        bool caught = false;
+        try {
+            (void)fine_search(m.locus, m.repairs, m.promote, how);
+        } catch (const std::logic_error&) {
+            caught = true;
+        } catch (...) {
+        }
+        panvar::set_fine_window_mutation(0);
+        require(caught, "mutation " + std::to_string(mutation) + " must be caught by the row check");
+    }
+    panvar::set_fine_window_row_check(false);
+    std::cout << "  ok: served cap and physical-origin cap refuse typed; independent contexts; mutations 1-4 (overlap, "
+                 "left context, right context, end window) caught\n";
+}
+
+
+// ---- I2-D: anchor scores and censuses in one placement pass -----------------------------------------------------------
+// The fused route (add_haplotypes with retain_censuses) against score-then-retain: identical slots, cells, exposures,
+// score components (audit views included) and censuses (every origin's coordinates, orientation and latent mass, in
+// order); one full placement per distinct new sequence, none for the later retain_census; executed work halved
+// honestly; and everything downstream (delta rounds with and without fine windows, promotion, release, slot reuse)
+// identical, at 1 and 4 threads.
+struct SeedResult {
+    std::vector<std::size_t> slots;
+    std::vector<double> cells;
+    std::vector<panvar::DiplotypeScore> scores;
+    std::vector<std::vector<panvar::HaploidOrigin>> census;   // [slot-ordered][origins]
+    std::vector<std::size_t> census_lengths;
+    std::uint64_t placements_after_seed = 0, placements_after_retain = 0;
+    panvar::FragmentScoringCounters counters_after_retain;
+    std::vector<double> downstream;
+};
+
+SeedResult seed_route(const Locus& l, const std::string& a, const std::string& b, bool fused, std::size_t threads,
+                      const std::vector<Repair>& repairs, bool fine_windows) {
+    panvar::FragmentScoringOptions opts = options();
+    opts.threads = threads;
+    panvar::LibraryModel x = library(), y = library();
+    x.fragment_start_intensity *= 2.0;
+    y.outlier_weight = 0.02;
+    opts.audit_libraries = {x, y};
+    panvar::PreparedScoringContext context(l.fragments, library(), opts);
+    context.begin_transient_round();
+    context.enable_origin_cache_path(true);
+    context.set_origin_cache_limits(std::size_t{1} << 20, 0);
+    if (fine_windows) context.enable_fine_window_discovery(std::size_t{1} << 26, std::uint64_t{1} << 40);
+    SeedResult out;
+    out.slots = context.add_haplotypes({a, b}, nullptr, false, fused);
+    out.placements_after_seed = context.full_placement_count();
+    for (const std::size_t s : out.slots) context.retain_census(s);
+    out.placements_after_retain = context.full_placement_count();
+    out.counters_after_retain = context.cumulative_counters();
+    std::set<std::size_t> distinct(out.slots.begin(), out.slots.end());
+    for (const std::size_t s : distinct) {
+        for (std::size_t f = 0; f < l.fragments.size(); ++f) out.cells.push_back(context.mass_of(f, s));
+        out.cells.push_back(context.exposure_of(s));
+        const panvar::HaploidOriginCensus* c = context.census_view(s);
+        require(c != nullptr, "every seed slot must hold a census");
+        out.census_lengths.push_back(c->haplotype_length);
+        for (const auto& per_fragment : c->origins_by_fragment) out.census.push_back(per_fragment);
+    }
+    const panvar::FragmentScoringResult r = context.score_candidates({{out.slots[0], out.slots[1]}});
+    out.scores.push_back(r.scores[0]);
+    for (const auto& audit : r.audit_scores) out.scores.push_back(audit[0]);
+    // downstream: a round of deltas from the first anchor, a promotion with census, release, a second round into reused slots
+    const auto round = [&](std::size_t incumbent) {
+        std::vector<panvar::RepairRequest> requests;
+        for (const Repair& rep : repairs) requests.push_back({incumbent, rep.begin, rep.end, rep.allele});
+        const std::vector<std::size_t> got = context.add_repaired_haplotypes(requests);
+        for (const std::size_t s : got) {
+            for (std::size_t f = 0; f < l.fragments.size(); ++f) out.downstream.push_back(context.mass_of(f, s));
+            out.downstream.push_back(context.score_candidates({{incumbent, s}}).scores[0].log_likelihood);
+        }
+    };
+    round(out.slots[0]);
+    const std::size_t winner = context.add_repaired_haplotype(out.slots[0], repairs[0].begin, repairs[0].end, repairs[0].allele, nullptr, true);
+    context.release_transient({winner, out.slots[1]});
+    std::vector<Repair> later(repairs.begin() + 1, repairs.end());
+    std::vector<panvar::RepairRequest> requests;
+    for (const Repair& rep : later) requests.push_back({winner, rep.begin, rep.end, rep.allele});
+    const std::vector<std::size_t> got = context.add_repaired_haplotypes(requests);
+    for (const std::size_t s : got) {
+        for (std::size_t f = 0; f < l.fragments.size(); ++f) out.downstream.push_back(context.mass_of(f, s));
+    }
+    return out;
+}
+
+void require_same_seed(const SeedResult& got, const SeedResult& want, const std::string& label) {
+    require(got.slots == want.slots, label + ": slots differ");
+    require(got.cells.size() == want.cells.size() && got.downstream.size() == want.downstream.size(), label + ": shapes differ");
+    for (std::size_t i = 0; i < want.cells.size(); ++i) require_identical(got.cells[i], want.cells[i], label + ": cell " + std::to_string(i));
+    for (std::size_t i = 0; i < want.scores.size(); ++i) {
+        require_identical(got.scores[i].log_likelihood, want.scores[i].log_likelihood, label + ": score");
+        require_identical(got.scores[i].fragment_term, want.scores[i].fragment_term, label + ": fragment term");
+        require_identical(got.scores[i].exposure_term, want.scores[i].exposure_term, label + ": exposure term");
+        require_identical(got.scores[i].absolute_term_sum, want.scores[i].absolute_term_sum, label + ": term sum");
+        require(got.scores[i].fragments_with_mass == want.scores[i].fragments_with_mass, label + ": fragments with mass");
+    }
+    require(got.census_lengths == want.census_lengths && got.census.size() == want.census.size(), label + ": census shapes differ");
+    for (std::size_t i = 0; i < want.census.size(); ++i) {
+        require(got.census[i].size() == want.census[i].size(), label + ": census origin counts differ");
+        for (std::size_t k = 0; k < want.census[i].size(); ++k) {
+            const panvar::HaploidOrigin& p = got.census[i][k];
+            const panvar::HaploidOrigin& q = want.census[i][k];
+            require(p.forward_start == q.forward_start && p.insert_bp == q.insert_bp && p.orientation == q.orientation &&
+                        std::memcmp(&p.log_latent_mass, &q.log_latent_mass, sizeof(double)) == 0,
+                    label + ": a census origin differs");
+        }
+    }
+    for (std::size_t i = 0; i < want.downstream.size(); ++i) {
+        require_identical(got.downstream[i], want.downstream[i], label + ": downstream value " + std::to_string(i));
+    }
+}
+
+void test_fused_seed() {
+    std::size_t compared = 0;
+    for (const std::uint64_t seed : {2201u, 2202u}) {
+        const MultiBlock m = seed == 2201u ? multi_block(seed) : fine_fixture(seed);
+        const std::string fixture = seed == 2201u ? "multi-block" : "repeat/orientation/mixed lengths/ends/tiny";
+        std::string other = m.locus.base;
+        other.replace(m.repairs[1].begin, m.repairs[1].end - m.repairs[1].begin, m.repairs[1].allele);
+        for (const bool identical : {false, true}) {
+            const std::string& b = identical ? m.locus.base : other;
+            for (const bool fine_windows : {false, true}) {
+                const SeedResult want = seed_route(m.locus, m.locus.base, b, false, 1, m.repairs, fine_windows);
+                for (const std::size_t threads : {std::size_t{1}, std::size_t{4}}) {
+                    const std::string label = fixture + (identical ? ", homozygous" : ", distinct") +
+                                              (fine_windows ? ", fine windows" : "") + ", " + std::to_string(threads) + " threads";
+                    const SeedResult ref = seed_route(m.locus, m.locus.base, b, false, threads, m.repairs, fine_windows);
+                    const SeedResult got = seed_route(m.locus, m.locus.base, b, true, threads, m.repairs, fine_windows);
+                    require_same_seed(ref, want, label + " (reference, threads)");
+                    require_same_seed(got, want, label);
+                    const std::uint64_t distinct = identical ? 1 : 2;
+                    require(got.slots[0] == got.slots[1] ? identical : !identical, label + ": slot sharing must follow byte identity");
+                    require(ref.placements_after_seed == distinct && ref.placements_after_retain == 2 * distinct,
+                            label + ": the reference route places each distinct anchor twice");
+                    require(got.placements_after_seed == distinct && got.placements_after_retain == distinct,
+                            label + ": the fused route places each distinct anchor once; retain_census then places nothing");
+                    require(2 * got.counters_after_retain.physical_origins == ref.counters_after_retain.physical_origins &&
+                                2 * got.counters_after_retain.piece_hits == ref.counters_after_retain.piece_hits,
+                            label + ": executed work must halve honestly");
+                    ++compared;
+                }
+            }
+        }
+    }
+    // an already-held slot without a census, beside a new one, with released-slot reuse (the JIT materialisation shape)
+    {
+        const MultiBlock m = fine_fixture(2203);
+        std::string c = m.locus.base;
+        c.replace(m.repairs[6].begin, m.repairs[6].end - m.repairs[6].begin, m.repairs[6].allele);
+        const auto run = [&](bool fused) {
+            panvar::PreparedScoringContext context(m.locus.fragments, library(), options());
+            context.begin_transient_round();
+            const std::size_t held = context.add_haplotypes({m.locus.base}).front();
+            const std::size_t scratch = context.add_haplotypes({c}).front();
+            context.release_transient({held});   // frees `scratch` for reuse
+            std::vector<std::size_t> slots;
+            if (fused) {
+                slots = context.add_haplotypes({m.locus.base, c}, nullptr, true, true);
+            } else {
+                slots = context.add_haplotypes({m.locus.base, c}, nullptr, true);
+                for (const std::size_t s : slots) context.retain_census(s);
+            }
+            require(slots[0] == held && slots[1] == scratch, "an existing slot is reused by identity, a released one by reuse");
+            std::vector<double> cells;
+            for (const std::size_t s : slots) {
+                for (std::size_t f = 0; f < m.locus.fragments.size(); ++f) cells.push_back(context.mass_of(f, s));
+                require(context.holds_census(s), "every requested slot must hold a census");
+                for (const auto& v : context.census_view(s)->origins_by_fragment) cells.push_back(static_cast<double>(v.size()));
+            }
+            cells.push_back(static_cast<double>(context.full_placement_count()));
+            return cells;
+        };
+        const std::vector<double> a = run(false), b = run(true);
+        require(a.size() == b.size(), "existing/reused slots: shapes differ");
+        for (std::size_t i = 0; i + 1 < a.size(); ++i) require_identical(b[i], a[i], "existing/reused slots: value " + std::to_string(i));
+        require(a.back() == 5 && b.back() == 4, "the held slot is censused once by placement; the reused slot's census comes from its own pass");
+    }
+    // I2-E: a batch with a NEW slot and an already-HELD slot without a census, where the held slot's fallback census
+    // placement crosses the cap: typed, the context permanently refused, and no census from the failed batch owned --
+    // neither the new slot's captured census nor any fallback census.
+    {
+        const MultiBlock m = fine_fixture(2205);
+        std::string fresh = m.locus.base;
+        fresh.replace(m.repairs[6].begin, m.repairs[6].end - m.repairs[6].begin, m.repairs[6].allele);
+        // measure the work: the held slot's placement (X) and the new slot's (Y), uncapped
+        std::uint64_t x = 0, y = 0;
+        {
+            panvar::PreparedScoringContext probe(m.locus.fragments, library(), options());
+            (void)probe.add_haplotypes({m.locus.base});
+            x = probe.cumulative_counters().physical_origins;
+            (void)probe.add_haplotypes({fresh});
+            y = probe.cumulative_counters().physical_origins - x;
+        }
+        require(x > 0 && y > 0, "fixture: both placements must enumerate origins");
+        panvar::FragmentScoringOptions opts = options();
+        opts.max_physical_origins = x + y + x - 1;   // the first pass fits (x + y), the fallback census (+x) does not
+        panvar::PreparedScoringContext context(m.locus.fragments, library(), opts);
+        context.begin_transient_round();
+        const std::size_t held = context.add_haplotypes({m.locus.base}).front();
+        bool typed = false;
+        try {
+            (void)context.add_haplotypes({m.locus.base, fresh}, nullptr, false, true);
+        } catch (const panvar::ResourceExhausted&) {
+            typed = true;
+        }
+        require(typed && context.refused(), "a fallback census placement crossing the cap must refuse, typed, permanently");
+        require(!context.holds_census(held), "the failed fallback must leave no census for the held slot");
+        for (std::size_t slot = 0; slot < context.unique_haplotypes(); ++slot) {
+            require(!context.holds_census(slot), "no census from the failed batch may be owned (slot " + std::to_string(slot) + ")");
+        }
+        bool refused_again = false;
+        try {
+            (void)context.add_haplotypes({fresh});
+        } catch (const panvar::ResourceExhausted&) {
+            refused_again = true;
+        }
+        require(refused_again, "the refused context must refuse every later call");
+    }
+    // a cap refusal during the fused pass: typed, the context refused, no census left behind
+    {
+        const MultiBlock m = fine_fixture(2204);
+        panvar::FragmentScoringOptions opts = options();
+        opts.max_physical_origins = 1000;
+        panvar::PreparedScoringContext context(m.locus.fragments, library(), opts);
+        bool typed = false;
+        try {
+            (void)context.add_haplotypes({m.locus.base}, nullptr, false, true);
+        } catch (const panvar::ResourceExhausted&) {
+            typed = true;
+        }
+        require(typed && context.refused(), "a fused refusal must be typed and refuse the context");
+        require(!context.holds_census(0), "a refused fused pass must leave no census");
+        bool refused_again = false;
+        try {
+            context.retain_census(0);
+        } catch (const panvar::ResourceExhausted&) {
+            refused_again = true;
+        }
+        require(refused_again, "a refused context must refuse every later call");
+    }
+    std::cout << "  ok: fused seeding = score-then-retain in " << compared << " configurations (cells, exposures, components, "
+                 "audit views, every census origin, downstream rounds with and without fine windows, promotion, release, slot "
+                 "reuse); one placement per distinct anchor, none at retain; executed work halved; held/reused slots; refusal "
+                 "leaves no census\n";
+}
+
 int main() {
     try {
+        std::cout << "== I2-D: fused anchor seeding ==\n";
+        test_fused_seed();
+        std::cout << "== I2-B: fine window discovery in the adaptive search ==\n";
+        test_fine_window_discovery();
         std::cout << "== substitutions, insertions, deletions, empty alleles ==\n";
         test_replacement_kinds();
         std::cout << "== first block, last block, length-changing ==\n";

@@ -1,4 +1,5 @@
 #include "panvar/fragment_likelihood.hpp"
+#include "panvar/verification_census.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -13,6 +14,7 @@
 #include <set>
 #include <tuple>
 #include <type_traits>
+#include <utility>
 #include <array>
 #include <cmath>
 #include <cstring>
@@ -20,6 +22,7 @@
 #include <condition_variable>
 #include <stdexcept>
 #include <unordered_map>
+#include <unordered_set>
 #include <string_view>
 #include <cstdio>
 #include <filesystem>
@@ -573,6 +576,8 @@ struct EmissionCache {
     std::atomic<std::uint64_t> entries{0};
     std::atomic<std::uint64_t> payload_bytes{0};
     std::atomic<std::uint64_t> entries_not_retained{0};
+    // I2-K: hits served by entries inherited from the union pass (state 2), counted under the shard lock.
+    std::atomic<std::uint64_t> inherited_hits{0};
     // Nanoseconds inside lookups, folded in per haplotype rather than per lookup: at 8.2M lookups a
     // round a shared counter touched per request would be contention with no decision attached.
     std::atomic<std::uint64_t> lookup_nanos{0};
@@ -795,6 +800,7 @@ CacheProbe cache_lookup(const KeyView& key, GappedFit* out, EmissionWork& work) 
             ++work.dp_cache_misses;
         } else {
             ++work.dp_cache_hits;
+            if (shard.table[at].state == 2) cache.inherited_hits.fetch_add(1, std::memory_order_relaxed);   // I2-K
             const CacheValue& value = shard.table[at].value;
             if (value.outcome == CacheOutcome::RefusedAfterRecursion) {
                 answer = CacheProbe::HitRefusedAfterRecursion;
@@ -927,6 +933,69 @@ void cache_store_fit(const KeyView& key, const GappedFit& fit) {
     ++shard.occupied;
     cache.entries.fetch_add(1, std::memory_order_relaxed);
     cache.payload_bytes.fetch_add(bytes, std::memory_order_relaxed);
+}
+
+// ---- I2-G (measurement only): sampled verification attribution (see VerificationProfile) ----------------------------
+std::atomic<std::uint32_t>& verification_period() {
+    static std::atomic<std::uint32_t> period{0};
+    return period;
+}
+struct VerificationLocal {
+    std::uint64_t counter = 0;
+    bool sampling = false;
+    VerificationProfile p;
+};
+VerificationLocal& verification_local() {
+    thread_local VerificationLocal local;
+    return local;
+}
+std::mutex& verification_mutex() {
+    static std::mutex m;
+    return m;
+}
+VerificationProfile& verification_totals() {
+    static VerificationProfile totals;
+    return totals;
+}
+inline std::uint64_t profile_now_ns() {
+    return static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+// Folds this worker's sampled profile into the process totals (called once per collect_form_placements).
+void flush_verification_local() {
+    VerificationLocal& local = verification_local();
+    if (local.p.requests == 0) return;
+    const std::lock_guard<std::mutex> lock(verification_mutex());
+    VerificationProfile& t = verification_totals();
+    const VerificationProfile& p = local.p;
+    t.requests += p.requests;
+    t.sampled += p.sampled;
+    t.ns_total += p.ns_total;
+    t.ns_decision += p.ns_decision;
+    t.ns_prechecks += p.ns_prechecks;
+    t.ns_kernel += p.ns_kernel;
+    t.ns_emission_lookup += p.ns_emission_lookup;
+    t.ns_dp += p.ns_dp;
+    t.ns_rows += p.ns_rows;
+    t.sampled_decision_served += p.sampled_decision_served;
+    t.sampled_decision_missed += p.sampled_decision_missed;
+    t.sampled_decision_unavailable += p.sampled_decision_unavailable;
+    t.sampled_kernels += p.sampled_kernels;
+    t.sampled_kernel_feasible += p.sampled_kernel_feasible;
+    t.sampled_emission_hits += p.sampled_emission_hits;
+    t.sampled_dps += p.sampled_dps;
+    t.sampled_accepted += p.sampled_accepted;
+    t.sampled_rows += p.sampled_rows;
+    t.kernel_prepared_pattern += p.kernel_prepared_pattern;
+    t.kernel_short_read += p.kernel_short_read;
+    t.kernel_edlib += p.kernel_edlib;
+    for (const auto& [shape, counts] : p.kernel_shapes) {
+        auto& to = t.kernel_shapes[shape];
+        to.first += counts.first;
+        to.second += counts.second;
+    }
+    if (p.band != 0) t.band = p.band;
+    local.p = VerificationProfile{};
 }
 
 void census_record(const std::string& read, const char* window, std::size_t window_length,
@@ -1377,6 +1446,203 @@ double gap_recursion_scaled(
     return std::log(total) + log_scale;
 }
 
+template <typename F, std::size_t... I>
+inline void for_each_index_impl(F&& f, std::index_sequence<I...>) {
+    (f(std::integral_constant<std::size_t, I>{}), ...);
+}
+
+// Calls f(std::integral_constant<std::size_t, i>) for i = 0 .. N-1, in order.
+template <std::size_t N, typename F>
+inline void for_each_index(F&& f) {
+    for_each_index_impl(std::forward<F>(f), std::make_index_sequence<N>{});
+}
+
+// I2-H (EXPERIMENTAL, default off): the EMITTING recursion with its geometry fixed at compile time.
+//
+// The same arithmetic as gap_recursion_scaled(emitting = true), cell for cell; only the bookkeeping differs. In
+// the emitting pass every cell of a row has exactly one writer -- M and I from the previous row, D from this row's
+// M and D one displacement lower -- so each cell is ASSIGNED once (its value, or the zero the reference's fill
+// would have left) instead of zero-filled and then accumulated into. The accumulations removed were all into exact
+// zeros: 0 + x*w rounds once to x*w whether or not it is fused, and 0 + arrived is arrived; every value is
+// non-negative, so no signed zero arises. The data-dependent skips (arrived == 0, w == 0) left exactly the zeros
+// now written, and the row maximum is a maximum over the same non-negative values in another order. Every
+// `arrived` expression is the reference's source text, so floating-point contraction is the same. Rescaling, the
+// terminal reduction and the components are the reference's code on the same layout. Two planes of at most
+// 7 x 3 x 9 doubles live on the stack for one call; no thread-local scratch is touched.
+template <std::size_t Delta, std::size_t Budget>
+double gap_recursion_fixed(const std::string& haplotype, const std::string& read, std::size_t start,
+                           std::size_t read_length, std::size_t available, const LibraryModel& library,
+                           ComponentList* components) {
+    constexpr std::size_t width = 2 * Delta + 1;
+    constexpr std::size_t cells = width * kStates * Budget;
+    const std::size_t delta = Delta;
+    const std::size_t budget = Budget;
+    const double p_match = 1.0 - library.substitution_error;
+    const double p_mismatch = library.substitution_error / 3.0;
+    const double p_insert_emission = 0.25;
+    const double t_continue = library.gap_open > 0.0 ? 1.0 - 2.0 * library.gap_open : 1.0;
+    const double t_open = library.gap_open;
+    const double t_extend = library.gap_extend;
+    const double t_close = 1.0 - library.gap_extend;
+
+    double planes[2][cells];
+    double* previous = planes[0];
+    double* current = planes[1];
+    std::fill(previous, previous + cells, 0.0);
+    const auto at = [](std::size_t displacement, std::size_t state, std::size_t edits) {
+        return (displacement * kStates + state) * Budget + edits;
+    };
+    previous[at(Delta, kMatch, 0)] = 1.0;
+    double log_scale = 0.0;
+
+    for (std::size_t i = 1; i <= read_length; ++i) {
+        double best = 0.0;
+        // This row's M and D one displacement lower, carried for the deletion step.
+        double match_below[Budget];
+        double delete_below[Budget];
+        for_each_index<width>([&](auto displacement) {
+            constexpr std::size_t d = decltype(displacement)::value;
+            constexpr long k = static_cast<long>(d) - static_cast<long>(Delta);
+            constexpr std::size_t lowest = static_cast<std::size_t>(k < 0 ? -k : k);
+            constexpr std::size_t lowest_gap = lowest > 1 ? lowest : 1;
+            double m[Budget];
+            double ins[Budget];
+            double del[Budget];
+            for (std::size_t e = 0; e < Budget; ++e) m[e] = ins[e] = del[e] = 0.0;
+            if constexpr (lowest < Budget) {
+                const long consumed_before = static_cast<long>(i) - 1 + k;
+                const bool in_haplotype =
+                    consumed_before >= 0 && static_cast<std::size_t>(consumed_before) < available;
+                // M: consume one read base and one haplotype base.
+                if (in_haplotype) {
+                    const std::size_t index = start + static_cast<std::size_t>(consumed_before);
+                    const double* from_match = previous + (d * kStates + kMatch) * Budget;
+                    const double* from_insert = previous + (d * kStates + kInsert) * Budget;
+                    const double* from_delete = previous + (d * kStates + kDelete) * Budget;
+                    if (haplotype[index] == read[i - 1]) {
+                        const double w = p_match;
+                        for (std::size_t e = lowest; e < Budget; ++e) {
+                            const std::size_t f = e;
+                            const double arrived = from_match[f] * t_continue +
+                                                   (from_insert[f] + from_delete[f]) * t_close;
+                            m[e] = arrived * w;
+                        }
+                    } else {
+                        const double w = p_mismatch;
+                        for (std::size_t e = lowest_gap; e < Budget; ++e) {
+                            const std::size_t f = e - 1;
+                            const double arrived = from_match[f] * t_continue +
+                                                   (from_insert[f] + from_delete[f]) * t_close;
+                            m[e] = arrived * w;
+                        }
+                    }
+                }
+                // I: consume one read base only; displacement falls by one.
+                if constexpr (d + 1 < width) {
+                    const double* from_match = previous + ((d + 1) * kStates + kMatch) * Budget;
+                    const double* from_insert = previous + ((d + 1) * kStates + kInsert) * Budget;
+                    for (std::size_t e = lowest_gap; e < Budget; ++e) {
+                        const std::size_t f = e - 1;
+                        const double arrived = from_match[f] * t_open + from_insert[f] * t_extend;
+                        ins[e] = arrived * p_insert_emission;
+                    }
+                }
+                // D: consume haplotype only, from this row's M and D one displacement lower.
+                if constexpr (d >= 1) {
+                    if (in_haplotype) {
+                        for (std::size_t e = lowest_gap; e < Budget; ++e) {
+                            const std::size_t f = e - 1;
+                            const double arrived = match_below[f] * t_open + delete_below[f] * t_extend;
+                            del[e] = arrived;
+                        }
+                    }
+                }
+            }
+            double* into_match = current + (d * kStates + kMatch) * Budget;
+            double* into_insert = current + (d * kStates + kInsert) * Budget;
+            double* into_delete = current + (d * kStates + kDelete) * Budget;
+            for (std::size_t e = 0; e < Budget; ++e) {
+                into_match[e] = m[e];
+                into_insert[e] = ins[e];
+                into_delete[e] = del[e];
+                best = std::max(best, m[e]);
+                best = std::max(best, ins[e]);
+                best = std::max(best, del[e]);
+                match_below[e] = m[e];
+                delete_below[e] = del[e];
+            }
+        });
+        if (best == 0.0) return kNegInf;   // nothing admissible survives; the mass is exactly zero
+        if (best < 1e-100 || best > 1e100) {
+            const double inverse = 1.0 / best;
+            for (std::size_t c = 0; c < cells; ++c) current[c] *= inverse;
+            log_scale += std::log(best);
+        }
+        std::swap(previous, current);
+    }
+
+    double total = 0.0;
+    const std::size_t floor_bp = read_length - std::min(read_length, delta);
+    for (std::size_t d = 0; d < width; ++d) {
+        const long k = static_cast<long>(d) - static_cast<long>(delta);
+        const long consumed = static_cast<long>(read_length) + k;
+        if (consumed < 0 || static_cast<std::size_t>(consumed) > available) continue;
+        if (static_cast<std::size_t>(consumed) < floor_bp) continue;
+        double span = 0.0;
+        std::size_t span_edits = budget;
+        for (std::size_t s = 0; s < kStates; ++s) {
+            for (std::size_t e = 0; e < budget; ++e) {
+                const double value = previous[at(d, s, e)];
+                if (value == 0.0) continue;
+                span += value;
+                if (e < span_edits) span_edits = e;
+            }
+        }
+        if (span == 0.0) continue;
+        total += span;
+        if (components != nullptr) {
+            components->push_back(
+                {static_cast<std::size_t>(consumed), std::log(span) + log_scale, span_edits});
+        }
+    }
+    if (total == 0.0) return kNegInf;
+    return std::log(total) + log_scale;
+}
+
+using FixedRecursion = double (*)(const std::string&, const std::string&, std::size_t, std::size_t, std::size_t,
+                                  const LibraryModel&, ComponentList*);
+
+template <std::size_t Delta, std::size_t... Index>
+constexpr std::array<FixedRecursion, sizeof...(Index)> fixed_recursions(std::index_sequence<Index...>) {
+    return {&gap_recursion_fixed<Delta, Index + 2>...};   // mismatch band Index + 1, so Budget Index + 2
+}
+
+// The supported geometries: max_gap_bp 1..3, mismatch band 1..8. Anything else keeps the scaled recursion.
+FixedRecursion fixed_recursion_for(std::size_t max_gap_bp, std::size_t band) {
+    static constexpr std::array<std::array<FixedRecursion, 8>, 3> table = {
+        fixed_recursions<1>(std::make_index_sequence<8>{}), fixed_recursions<2>(std::make_index_sequence<8>{}),
+        fixed_recursions<3>(std::make_index_sequence<8>{})};
+    if (max_gap_bp < 1 || max_gap_bp > 3 || band < 1 || band > 8) return nullptr;
+    return table[max_gap_bp - 1][band - 1];
+}
+
+// Fixed-geometry recursions executed on this thread (gates only: proves the experimental path actually ran).
+thread_local std::uint64_t t_fixed_recursions = 0;
+
+// The emitting recursion, by backend. The experimental backend falls back to the reference for any geometry it
+// does not support; the normaliser never comes here.
+double gap_recursion_emitting(const std::string& haplotype, const std::string& read, std::size_t start,
+                              std::size_t read_length, std::size_t available, std::size_t band,
+                              const LibraryModel& library, ComponentList* components, GapRecursionBackend backend) {
+    if (backend == GapRecursionBackend::fixed_geometry_experimental) {
+        if (const FixedRecursion fixed = fixed_recursion_for(library.max_gap_bp, band)) {
+            ++t_fixed_recursions;
+            return fixed(haplotype, read, start, read_length, available, library, components);
+        }
+    }
+    return gap_recursion_scaled(&haplotype, &read, start, read_length, available, band, library, true, components);
+}
+
 } // namespace
 
 void set_emission_cache_hash_collapse(bool collapse) {
@@ -1490,7 +1756,180 @@ void reset_emission_cache_lookup_seconds() {
     emission_cache().lookup_nanos.store(0, std::memory_order_relaxed);
 }
 
-EmissionCacheCounters end_emission_cache() {
+struct EmissionCacheHandoff::Contents {
+    struct Shard {
+        std::vector<ArenaEntry> table;
+        std::size_t occupied = 0;
+        std::vector<std::unique_ptr<char[]>> slabs;
+        std::size_t slab_used = 0;
+        std::vector<GappedComponent> arena;
+    };
+    std::array<Shard, kCacheShards> shards;
+    std::uint64_t entries = 0, budgeted_bytes = 0, allocated_bytes = 0;
+    // every parameter a cached fit depends on besides its key's bytes (read and window, whose lengths carry the
+    // normaliser's read length and clamped available length)
+    double substitution_error = 0.0, gap_open = 0.0, gap_extend = 0.0;
+    std::size_t max_gap_bp = 0, band = 0;
+    GapRecursionBackend backend = GapRecursionBackend::scaled_reference;
+};
+
+EmissionCacheHandoff::EmissionCacheHandoff() = default;
+EmissionCacheHandoff::~EmissionCacheHandoff() = default;
+bool EmissionCacheHandoff::holds() const { return contents != nullptr; }
+std::uint64_t EmissionCacheHandoff::entries() const { return contents ? contents->entries : 0; }
+std::uint64_t EmissionCacheHandoff::allocated_bytes() const { return contents ? contents->allocated_bytes : 0; }
+std::uint64_t EmissionCacheHandoff::budgeted_bytes() const { return contents ? contents->budgeted_bytes : 0; }
+void EmissionCacheHandoff::clear() { contents.reset(); }
+
+namespace {
+std::mutex& handoff_report_mutex() {
+    static std::mutex m;
+    return m;
+}
+EmissionHandoffReport& handoff_report_slot() {
+    static EmissionHandoffReport r;
+    return r;
+}
+
+bool same_double_bits(double a, double b) { return std::memcmp(&a, &b, sizeof(double)) == 0; }
+
+// The emission cache's teardown. With `keep`, the shards' storage is moved into it instead of being discarded.
+EmissionCacheCounters finish_emission_cache(EmissionCacheHandoff::Contents* keep);
+}  // namespace
+
+EmissionHandoffReport emission_handoff_report() {
+    const std::lock_guard<std::mutex> lock(handoff_report_mutex());
+    EmissionHandoffReport r = handoff_report_slot();
+    if (r.adopted) r.inherited_hits = emission_cache().inherited_hits.load(std::memory_order_relaxed);
+    return r;
+}
+
+void reset_emission_handoff_report() {
+    const std::lock_guard<std::mutex> lock(handoff_report_mutex());
+    handoff_report_slot() = EmissionHandoffReport{};
+    emission_cache().inherited_hits.store(0, std::memory_order_relaxed);
+}
+
+// I2-K: ends the cache as end_emission_cache does, moving its storage into `out` (replacing anything it held).
+void detach_emission_cache(EmissionCacheHandoff& out, const LibraryModel& library, std::size_t band,
+                           GapRecursionBackend backend) {
+    auto contents = std::make_unique<EmissionCacheHandoff::Contents>();
+    contents->budgeted_bytes = emission_cache().budgeted_bytes_used.load(std::memory_order_relaxed);
+    (void)finish_emission_cache(contents.get());
+    for (const auto& shard : contents->shards) {
+        contents->entries += shard.occupied;
+        contents->allocated_bytes += static_cast<std::uint64_t>(shard.table.capacity()) * sizeof(ArenaEntry) +
+                                     static_cast<std::uint64_t>(shard.slabs.size()) * kSlabBytes +
+                                     static_cast<std::uint64_t>(shard.arena.capacity()) * sizeof(GappedComponent);
+    }
+    contents->substitution_error = library.substitution_error;
+    contents->gap_open = library.gap_open;
+    contents->gap_extend = library.gap_extend;
+    contents->max_gap_bp = library.max_gap_bp;
+    contents->band = band;
+    contents->backend = backend;
+    {
+        const std::lock_guard<std::mutex> lock(handoff_report_mutex());
+        EmissionHandoffReport& r = handoff_report_slot();
+        r.detached = true;
+        r.entries = contents->entries;
+        r.allocated_bytes = contents->allocated_bytes;
+        r.budgeted_bytes = contents->budgeted_bytes;
+    }
+    out.contents = std::move(contents);
+}
+
+// I2-K: called right after begin_emission_cache by the adopting context. Consumes the handoff whatever happens.
+void adopt_emission_cache(EmissionCacheHandoff* handoff, const LibraryModel& library, std::size_t band,
+                          GapRecursionBackend backend, std::size_t budget_bytes) {
+    if (handoff == nullptr) return;
+    std::unique_ptr<EmissionCacheHandoff::Contents> c = std::move(handoff->contents);
+    const std::lock_guard<std::mutex> lock(handoff_report_mutex());
+    EmissionHandoffReport& r = handoff_report_slot();
+    if (!c) {   // nothing to adopt; a context created after an adoption leaves that record as it is
+        if (!r.offered) r.refusal = "not_offered";
+        return;
+    }
+    r.offered = true;
+    if (!same_double_bits(c->substitution_error, library.substitution_error) || !same_double_bits(c->gap_open, library.gap_open) ||
+        !same_double_bits(c->gap_extend, library.gap_extend) || c->max_gap_bp != library.max_gap_bp || c->band != band ||
+        c->backend != backend) {
+        r.refusal = "context";
+        return;   // the contents are freed here; the adaptive search computes as without a handoff
+    }
+    EmissionCache& cache = emission_cache();
+    if (budget_bytes == 0 || !cache.active.load(std::memory_order_relaxed)) { r.refusal = "cache_disabled"; return; }
+    if (c->budgeted_bytes > budget_bytes) { r.refusal = "budget"; return; }
+    for (std::size_t i = 0; i < kCacheShards; ++i) {
+        CacheShard& shard = cache.shards[i];
+        auto& from = c->shards[i];
+        const std::lock_guard<std::mutex> guard(shard.guard);
+        shard.table.swap(from.table);
+        shard.occupied = from.occupied;
+        shard.slabs.swap(from.slabs);
+        shard.slab_used = from.slab_used;
+        shard.arena.swap(from.arena);
+        for (ArenaEntry& entry : shard.table) {
+            if (entry.state != 0) entry.state = 2;   // inherited: hits on it are counted
+        }
+    }
+    // The budget governs every retained entry, inherited ones included; the stage's own counters start at zero.
+    cache.budgeted_bytes_used.store(c->budgeted_bytes, std::memory_order_relaxed);
+    cache.inherited_hits.store(0, std::memory_order_relaxed);
+    r.adopted = true;
+    r.refusal = "none";
+}
+
+EmissionCacheCounters end_emission_cache() { return finish_emission_cache(nullptr); }
+
+RetainedProcessStorage retained_process_storage() {
+    RetainedProcessStorage r;
+    EmissionCache& cache = emission_cache();
+    r.emission_cache_armed = cache.active.load(std::memory_order_relaxed) ||
+                             scoring_detail::emission_cache_pinned().load(std::memory_order_relaxed);
+    for (CacheShard& shard : cache.shards) {
+        const std::lock_guard<std::mutex> guard(shard.guard);
+        r.emission_cache_table_bytes += static_cast<std::uint64_t>(shard.table.capacity()) * sizeof(ArenaEntry);
+        r.emission_cache_component_bytes += static_cast<std::uint64_t>(shard.arena.capacity()) * sizeof(GappedComponent);
+        r.emission_cache_slab_bytes += static_cast<std::uint64_t>(shard.slabs.size()) * kSlabBytes;
+    }
+    {
+        const std::lock_guard<std::mutex> guard(census_mutex());
+        auto& table = census_map();
+        r.emission_census_bytes = static_cast<std::uint64_t>(table.bucket_count()) * sizeof(void*) +
+                                  static_cast<std::uint64_t>(table.size()) * (sizeof(CensusKey) + sizeof(CensusEntry) + 2 * sizeof(void*));
+    }
+    const GapScratch& scratch = gap_scratch();
+    r.calling_thread_scratch_bytes = (scratch.first.capacity() + scratch.second.capacity()) * sizeof(double);
+    return r;
+}
+
+RetainedProcessStorage release_sample_retained_storage() {
+    const RetainedProcessStorage before = retained_process_storage();
+    if (before.emission_cache_armed) {
+        throw std::logic_error("release_sample_retained_storage: the emission cache is armed or pinned; release only "
+                               "between finished samples");
+    }
+    for (CacheShard& shard : emission_cache().shards) {
+        const std::lock_guard<std::mutex> guard(shard.guard);
+        std::vector<ArenaEntry>().swap(shard.table);
+        shard.occupied = 0;
+        std::vector<std::unique_ptr<char[]>>().swap(shard.slabs);
+        shard.slab_used = 0;
+        std::vector<GappedComponent>().swap(shard.arena);
+    }
+    {
+        const std::lock_guard<std::mutex> guard(census_mutex());
+        std::unordered_map<CensusKey, CensusEntry, CensusKeyHash>().swap(census_map());
+    }
+    GapScratch& scratch = gap_scratch();
+    std::vector<double>().swap(scratch.first);
+    std::vector<double>().swap(scratch.second);
+    return before;
+}
+
+namespace {
+EmissionCacheCounters finish_emission_cache(EmissionCacheHandoff::Contents* keep) {
     EmissionCache& cache = emission_cache();
     cache.active.store(false, std::memory_order_relaxed);
     // One aggregation path, shared with the non-destructive read, so the two cannot drift.
@@ -1514,8 +1953,17 @@ EmissionCacheCounters end_emission_cache() {
     // exactly the symptom seen -- payload_bytes and entries correct beside five zeroed counters.
     // Direct callers use this function's RETURN value, which is complete for their single thread.
     // Keys own their bytes now, so this is reclaiming memory rather than avoiding dangling reads.
-    for (CacheShard& shard : cache.shards) {
+    for (std::size_t i = 0; i < kCacheShards; ++i) {
+        CacheShard& shard = cache.shards[i];
         const std::lock_guard<std::mutex> guard(shard.guard);
+        if (keep != nullptr) {   // I2-K: the storage moves to the handoff; the shard is left empty
+            auto& to = keep->shards[i];
+            to.table.swap(shard.table);
+            to.occupied = shard.occupied;
+            to.slabs.swap(shard.slabs);
+            to.slab_used = shard.slab_used;
+            to.arena.swap(shard.arena);
+        }
         shard.table.clear();
         shard.occupied = 0;
         shard.slabs.clear();
@@ -1524,6 +1972,7 @@ EmissionCacheCounters end_emission_cache() {
     }
     return out;
 }
+}  // namespace
 
 void begin_emission_census() {
     const std::lock_guard<std::mutex> guard(census_mutex());
@@ -1667,7 +2116,9 @@ std::optional<GappedFit> gapped_emission_core(
     // union prefilter cache): -1 unknown. A known decision skips only the kernel; every logical counter moves
     // as if it had run, and executed_prefilters counts only kernels that ran.
     int known_feasible = -1,
-    bool* feasible_out = nullptr) {
+    bool* feasible_out = nullptr,
+    // I2-H: which implementation computes the emitting recursion (FragmentScoringOptions::gap_recursion_backend).
+    GapRecursionBackend backend = GapRecursionBackend::scaled_reference) {
     if (read.empty()) throw std::invalid_argument("gapped emission requires a non-empty read");
     if (start > haplotype.size()) return std::nullopt;
     // ELIGIBILITY is by read length, exactly as the substitution-only model required: the haplotype
@@ -1690,6 +2141,10 @@ std::optional<GappedFit> gapped_emission_core(
     // A caller that has already established the whole haplotype and the whole read are ACGT may say so: the
     // check below then cannot fail, and repeating it cost ~11% of the union's seeding on 203 bytes per start.
     if (!acgt_known) require_acgt_window(haplotype, start, window, read);
+    // I2-G (measurement only): the sampled request's phases
+    VerificationLocal& vlocal = verification_local();
+    const bool vsample = vlocal.sampling;
+    std::uint64_t vmark = vsample ? profile_now_ns() : 0;
 
     EmissionWork& work = emission_work();
     EmissionCache& cache = emission_cache();
@@ -1705,8 +2160,31 @@ std::optional<GappedFit> gapped_emission_core(
         ++work.executed_prefilters;
         const bool timing = emission_timing_active().load(std::memory_order_relaxed);
         const auto prefilter_mark = timing ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        if (vsample) {
+            const std::uint64_t now = profile_now_ns();
+            vlocal.p.ns_prechecks += now - vmark;
+            vmark = now;
+        }
         feasible = feasible_within_band(haplotype, start, window, read, mismatch_band, pattern);
+        if (vsample) {
+            const std::uint64_t now = profile_now_ns();
+            vlocal.p.ns_kernel += now - vmark;
+            vmark = now;
+            ++vlocal.p.sampled_kernels;
+            if (feasible) ++vlocal.p.sampled_kernel_feasible;
+            if (pattern != nullptr && pattern->usable) ++vlocal.p.kernel_prepared_pattern;
+            else if (read.size() <= kMyersWidth) ++vlocal.p.kernel_short_read;
+            else ++vlocal.p.kernel_edlib;
+            auto& shape = vlocal.p.kernel_shapes[{static_cast<std::uint32_t>(read.size()), static_cast<std::uint32_t>(window)}];
+            ++shape.first;
+            if (feasible) ++shape.second;
+            vlocal.p.band = mismatch_band;
+        }
         if (timing) emission_timing().prefilter_ns += nanos_since(prefilter_mark);
+    } else if (vsample) {
+        const std::uint64_t now = profile_now_ns();
+        vlocal.p.ns_prechecks += now - vmark;
+        vmark = now;
     }
     if (feasible_out != nullptr) *feasible_out = feasible;
     if (!feasible) {
@@ -1721,6 +2199,14 @@ std::optional<GappedFit> gapped_emission_core(
     // Only survivors get a key, and only recursion results are ever retained.
     const bool caching = cache.active.load(std::memory_order_relaxed);
     KeyView key;
+    // I2-G: the emission-cache phase ends at the recursion (or at a hit)
+    const auto close_lookup = [&](bool hit) {
+        if (!vsample) return;
+        const std::uint64_t now = profile_now_ns();
+        vlocal.p.ns_emission_lookup += now - vmark;
+        vmark = now;
+        if (hit) ++vlocal.p.sampled_emission_hits;
+    };
     if (caching) {
         key = key_prefix != nullptr && emission_key_prefix_enabled().load(std::memory_order_relaxed)
                   ? key_view_from_prefix(*key_prefix, read, haplotype.data() + start, window)
@@ -1729,9 +2215,11 @@ std::optional<GappedFit> gapped_emission_core(
         GappedFit cached;
         switch (cache_lookup(key, &cached, work)) {
             case CacheProbe::HitRefusedAfterRecursion:
+                close_lookup(true);
                 census_record(read, haplotype.data() + start, window, true, sizeof(double));
                 return std::nullopt;
             case CacheProbe::HitAccepted:
+                close_lookup(true);
                 census_record(read, haplotype.data() + start, window, true, sizeof(double));
                 return cached;
             default:
@@ -1744,19 +2232,31 @@ std::optional<GappedFit> gapped_emission_core(
                 repeat.refused = earlier->refused;
                 repeat.fit = earlier->fit;
                 deferred->records.push_back(repeat);
+                close_lookup(true);
                 if (repeat.refused) return std::nullopt;
                 return repeat.fit;
             }
         }
     }
 
+    close_lookup(false);
     ++work.executed_dps;
+    if (vsample) ++vlocal.p.sampled_dps;
+    // I2-G: the recursion, normaliser and cache store are timed by the caller as the core's remainder after this point
+    struct DpClock {
+        bool on;
+        VerificationLocal& local;
+        std::uint64_t start;
+        ~DpClock() {
+            if (on) local.p.ns_dp += profile_now_ns() - start;
+        }
+    } dp_clock{vsample, vlocal, vsample ? profile_now_ns() : 0};
 
     GappedFit fit;
     // Filled in place rather than through a scratch vector, so an accepted placement costs one
     // allocation instead of two.
-    const double raw_total = gap_recursion_scaled(&haplotype, &read, start, read.size(), available,
-                                                  mismatch_band, library, true, &fit.components);
+    const double raw_total = gap_recursion_emitting(haplotype, read, start, read.size(), available, mismatch_band,
+                                                    library, &fit.components, backend);
     if (raw_total == kNegInf || fit.components.empty()) {
         // The recursion RAN and found nothing. That is still work a cache would avoid, so it counts
         // against the DP stream rather than the prefilter's -- and it is retained as a refusal,
@@ -1810,6 +2310,37 @@ std::optional<GappedFit> gapped_emission(
     bool acgt_known) {
     return gapped_emission_core(haplotype, read, start, library, mismatch_band, pattern, acgt_known, nullptr);
 }
+
+namespace gapped_dp_test {
+double recursion(const std::string& haplotype, const std::string& read, std::size_t start, std::size_t available,
+                 std::size_t band, const LibraryModel& library, ComponentList* components, GapRecursionBackend backend) {
+    return gap_recursion_emitting(haplotype, read, start, read.size(), available, band, library, components, backend);
+}
+
+std::optional<GappedFit> emission_known_feasible(const std::string& haplotype, const std::string& read,
+                                                 std::size_t start, const LibraryModel& library, std::size_t band,
+                                                 GapRecursionBackend backend) {
+    return gapped_emission_core(haplotype, read, start, library, band, nullptr, true, nullptr, 1, nullptr, backend);
+}
+
+std::optional<GappedFit> emission(const std::string& haplotype, const std::string& read, std::size_t start,
+                                  const LibraryModel& library, std::size_t band, GapRecursionBackend backend) {
+    return gapped_emission_core(haplotype, read, start, library, band, nullptr, false, nullptr, -1, nullptr, backend);
+}
+
+bool fixed_geometry_supported(std::size_t band, const LibraryModel& library) {
+    return fixed_recursion_for(library.max_gap_bp, band) != nullptr;
+}
+
+std::uint64_t fixed_geometry_executions() { return t_fixed_recursions; }
+
+bool feasible(const std::string& haplotype, const std::string& read, std::size_t start, const LibraryModel& library,
+              std::size_t band) {
+    if (read.empty() || start > haplotype.size() || haplotype.size() - start < read.size()) return false;
+    const std::size_t window = std::min(haplotype.size() - start, read.size() + library.max_gap_bp);
+    return feasible_within_band(haplotype, start, window, read, band, nullptr);
+}
+}  // namespace gapped_dp_test
 
 bool emission_key_prefix_matches(const std::string& read, const std::string& window) {
     const KeyView full = key_view_of(read, window.data(), window.size());
@@ -1975,14 +2506,54 @@ std::vector<AuditCombination> audit_combinations(const std::vector<LibraryModel>
     }
     return out;
 }
+// One fragment's contribution from prepared constants: exactly log_fragment_contribution's expressions, in its
+// association (signal = (log1p(-w) + log(lambda)) + mass; log(w) + background; the zero-outlier refusal).
+inline double prepared_contribution(const AuditCombination& c, double combined, double background) {
+    const double signal = combined == kNegInf ? kNegInf : c.log_signal_scale + combined;
+    if (c.outlier_free) {
+        if (signal == kNegInf) {
+            throw std::invalid_argument(
+                "a fragment with no accepted placement and no outlier mixture makes every candidate "
+                "impossible; declare a positive outlier weight or refuse the fragment upstream");
+        }
+        return signal;
+    }
+    return log_add_exp(signal, c.log_outlier + background);
+}
+// I2-F: the tally of what prepared main-library terms removed (one update per combination call)
+struct PreparedTally {
+    std::atomic<std::uint64_t> combinations{0}, terms{0}, hypothetical_logs{0}, prepared_logs{0};
+    std::atomic<std::uint64_t> hypothetical_validations{0}, prepared_validations{0};
+};
+PreparedTally& prepared_tally() {
+    static PreparedTally t;
+    return t;
+}
+// I2-G correction (see PreparedLibraryTermsTally). Called once per prepared call, after the combination, with the call's
+// candidate and fragment counts and the summed fragments_with_mass of its candidates.
+void note_prepared_combination(std::uint64_t candidates, std::uint64_t fragments, std::uint64_t with_mass,
+                               const AuditCombination& main) {
+    const std::uint64_t terms = candidates * fragments;
+    PreparedTally& t = prepared_tally();
+    t.combinations.fetch_add(1, std::memory_order_relaxed);
+    t.terms.fetch_add(terms, std::memory_order_relaxed);
+    // scalar: log1p(-w) + log(lambda) where the combined mass is finite; log(w) on every term when w > 0
+    t.hypothetical_logs.fetch_add(2 * with_mass + (main.outlier_free ? 0 : terms), std::memory_order_relaxed);
+    t.prepared_logs.fetch_add(main.outlier_free ? 2 : 3, std::memory_order_relaxed);
+    // scalar: one validation per term (log_fragment_contribution) and one per candidate (expected_signal_fragments)
+    t.hypothetical_validations.fetch_add(terms + candidates, std::memory_order_relaxed);
+    t.prepared_validations.fetch_add(1, std::memory_order_relaxed);
+}
 // One candidate's diploid combination under the run's library and every audit library, in one pass over its two
-// mass columns. The run's own score is computed by exactly the expressions of the audit-free loop.
+// mass columns. The run's own score is computed by exactly the expressions of the audit-free loop. `main` (I2-F): the
+// run's library prepared once; null: the scalar reference functions per term.
 void combine_with_audits(const std::vector<double>& mass_a, const std::vector<double>& mass_b,
                          const std::vector<double>& background, std::size_t fragments, double exposure_sum,
                          const LibraryModel& library, const std::vector<AuditCombination>& audits, DiplotypeScore& score,
-                         std::vector<std::vector<DiplotypeScore>>& audit_scores, std::size_t candidate) {
+                         std::vector<std::vector<DiplotypeScore>>& audit_scores, std::size_t candidate,
+                         const AuditCombination* main = nullptr) {
     const std::size_t views = audits.size();
-    score.exposure_term = -expected_signal_fragments(exposure_sum, library);
+    score.exposure_term = main != nullptr ? -(main->exposure_scale * exposure_sum) : -expected_signal_fragments(exposure_sum, library);
     score.absolute_term_sum = std::abs(score.exposure_term);
     double term[kMaxAuditLibraries] = {};
     double absolute[kMaxAuditLibraries] = {};
@@ -1995,22 +2566,12 @@ void combine_with_audits(const std::vector<double>& mass_a, const std::vector<do
     for (std::size_t f = 0; f < fragments; ++f) {
         const double combined = log_add_exp(mass_a[f], mass_b[f]);
         if (combined != kNegInf) ++score.fragments_with_mass;
-        const double contribution = log_fragment_contribution(combined, background[f], library);
+        const double contribution = main != nullptr ? prepared_contribution(*main, combined, background[f])
+                                                    : log_fragment_contribution(combined, background[f], library);
         fragment_term += contribution;
         score.absolute_term_sum += std::abs(contribution);
         for (std::size_t k = 0; k < views; ++k) {
-            const AuditCombination& c = audits[k];
-            const double signal = combined == kNegInf ? kNegInf : c.log_signal_scale + combined;
-            double value = signal;
-            if (c.outlier_free) {
-                if (signal == kNegInf) {
-                    throw std::invalid_argument(
-                        "a fragment with no accepted placement and no outlier mixture makes every candidate "
-                        "impossible; declare a positive outlier weight or refuse the fragment upstream");
-                }
-            } else {
-                value = log_add_exp(signal, c.log_outlier + background[f]);
-            }
+            const double value = prepared_contribution(audits[k], combined, background[f]);
             term[k] += value;
             absolute[k] += std::abs(value);
         }
@@ -2026,6 +2587,42 @@ void combine_with_audits(const std::vector<double>& mass_a, const std::vector<do
     }
 }
 } // namespace
+
+void set_verification_profile_period(std::uint32_t period) { verification_period().store(period); }
+void reset_verification_profile() {
+    const std::lock_guard<std::mutex> lock(verification_mutex());
+    verification_totals() = VerificationProfile{};
+}
+VerificationProfile verification_profile_snapshot() {
+    const std::lock_guard<std::mutex> lock(verification_mutex());
+    VerificationProfile out = verification_totals();
+    out.period = verification_period().load();
+    return out;
+}
+
+PreparedLibraryTermsTally prepared_library_terms_tally() {
+    const PreparedTally& t = prepared_tally();
+    PreparedLibraryTermsTally out;
+    out.combinations = t.combinations.load();
+    out.terms = t.terms.load();
+    out.hypothetical_scalar_logs = t.hypothetical_logs.load();
+    out.prepared_logs = t.prepared_logs.load();
+    out.net_logs_avoided = static_cast<std::int64_t>(out.hypothetical_scalar_logs) - static_cast<std::int64_t>(out.prepared_logs);
+    out.hypothetical_scalar_validations = t.hypothetical_validations.load();
+    out.prepared_validations = t.prepared_validations.load();
+    out.net_validations_avoided =
+        static_cast<std::int64_t>(out.hypothetical_scalar_validations) - static_cast<std::int64_t>(out.prepared_validations);
+    return out;
+}
+void reset_prepared_library_terms_tally() {
+    PreparedTally& t = prepared_tally();
+    t.combinations = 0;
+    t.terms = 0;
+    t.hypothetical_logs = 0;
+    t.prepared_logs = 0;
+    t.hypothetical_validations = 0;
+    t.prepared_validations = 0;
+}
 
 std::vector<FragmentPlacement> enumerate_placements_exhaustive(
     const std::string& haplotype,
@@ -2654,10 +3251,11 @@ int prefilter_decision(const UnionPrefilterCache& cache, std::uint64_t key) {
     }
 }
 
-void remember_prefilter(UnionPrefilterCache& cache, std::uint64_t key, bool feasible) {
+// 1 stored, 0 not retained (admission has stopped), 2 another worker had already stored it (I2-I reads this).
+int remember_prefilter(UnionPrefilterCache& cache, std::uint64_t key, bool feasible) {
     if (cache.held.load(std::memory_order_relaxed) >= cache.max_held) {
         cache.not_retained.fetch_add(1, std::memory_order_relaxed);
-        return;
+        return 0;
     }
     const std::uint64_t packed = ((key + 1) << 1) | (feasible ? 1u : 0u);
     const std::size_t mask = (std::size_t{1} << cache.slot_bits) - 1;
@@ -2666,10 +3264,10 @@ void remember_prefilter(UnionPrefilterCache& cache, std::uint64_t key, bool feas
         if (entry == 0) {
             if (cache.slots[at].compare_exchange_strong(entry, packed, std::memory_order_acq_rel)) {
                 cache.held.fetch_add(1, std::memory_order_relaxed);
-                return;
+                return 1;
             }
         }
-        if ((entry >> 1) == key + 1) return;   // another worker remembered it first: the same decision
+        if ((entry >> 1) == key + 1) return 2;   // another worker remembered it first: the same decision
     }
 }
 
@@ -2777,7 +3375,12 @@ void collect_form_placements(
     std::vector<std::uint8_t>* skip = nullptr,
     UnionReplay* replay = nullptr,
     SeedingTimes* times = nullptr,
-    UnionPrefilterCache* prefilter_cache = nullptr) {
+    UnionPrefilterCache* prefilter_cache = nullptr,
+    // EXPERIMENTAL (I1.4): only starts in [first, second) are verified -- the discovery unit's owned core; the rest
+    // are dropped after deduplication and before any verification, and counted in `owned_skipped`.
+    const std::pair<std::uint32_t, std::uint32_t>* owned = nullptr,
+    std::uint64_t* owned_skipped = nullptr) {
+    const CensusUnitScope census_unit;   // I2-I (measurement only): one discovery unit
     auto phase_mark = times != nullptr ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const auto lap = [&](std::uint64_t SeedingTimes::*field) {
         if (times == nullptr) return;
@@ -2950,6 +3553,13 @@ void collect_form_placements(
                 "fragment scoring reached its cached-prefilter consumption cap; no partial ranking is returned");
         }
     };
+    if (owned != nullptr) {
+        const auto keep_end = std::remove_if(proposed.begin(), proposed.end(), [&](const std::pair<std::uint32_t, std::uint32_t>& item) {
+            return item.second < owned->first || item.second >= owned->second;
+        });
+        if (owned_skipped != nullptr) *owned_skipped += static_cast<std::uint64_t>(proposed.end() - keep_end);
+        proposed.erase(keep_end, proposed.end());
+    }
     counters.unique_starts += proposed.size();
     if (budget.stop()) throw PlacementCancelled();
     lap(&SeedingTimes::sort_ns);
@@ -2963,6 +3573,9 @@ void collect_form_placements(
     const std::size_t shadow_pieces[3] = {band + 1, band + 2, 2 * band + 1};
     PieceLayout shadow_layouts[3];
     std::uint32_t shadow_form = std::numeric_limits<std::uint32_t>::max();
+    // I2-I (MEASUREMENT ONLY): the verification-request census. Off, it costs one relaxed load per call.
+    const bool census = verification_census_active();
+    const CensusContext census_context{library.substitution_error, library.gap_open, library.gap_extend, library.max_gap_bp, band};
     for (const auto& item : proposed) {
         // One relaxed load against a full-read comparison: free at this granularity, and verification is
         // where a cancelled worker would otherwise spend the longest.
@@ -2996,6 +3609,19 @@ void collect_form_placements(
             prefilter_before = emission_timing().prefilter_ns;
         }
         const auto emission_mark = timing ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        // I2-G (measurement only): every period-th request is sampled
+        VerificationLocal& vlocal = verification_local();
+        const std::uint32_t vperiod = verification_period().load(std::memory_order_relaxed);
+        bool vsample = false;
+        std::uint64_t vstart = 0, vmark = 0;
+        if (vperiod != 0) {
+            ++vlocal.p.requests;
+            vsample = (++vlocal.counter % vperiod) == 0;
+            if (vsample) {
+                ++vlocal.p.sampled;
+                vstart = vmark = profile_now_ns();
+            }
+        }
         // A remembered decision stands in for the kernel on exactly the same (read, window) content.
         int known = -1;
         std::uint64_t decision_key = 0;
@@ -3013,11 +3639,75 @@ void collect_form_placements(
             }
         }
         bool computed = false;
+        if (vsample) {
+            const std::uint64_t now = profile_now_ns();
+            vlocal.p.ns_decision += now - vmark;
+            vmark = now;
+            if (!consult) ++vlocal.p.sampled_decision_unavailable;
+            else if (known >= 0) ++vlocal.p.sampled_decision_served;
+            else ++vlocal.p.sampled_decision_missed;
+        }
+        vlocal.sampling = vsample;
+        EmissionWork census_before;
+        std::uint64_t census_fixed_before = 0;
+        if (census) {
+            census_before = emission_work();
+            census_fixed_before = t_fixed_recursions;
+        }
         const std::optional<GappedFit> fit =
             gapped_emission_core(haplotype, forms[item.first].bases, item.second, library, band,
                                  &forms[item.first].pattern, haplotype_acgt && forms[item.first].all_acgt,
-                                 &forms[item.first].key_prefix, known, consult && known < 0 ? &computed : nullptr);
-        if (consult && known < 0) remember_prefilter(*remembered, decision_key, computed);
+                                 &forms[item.first].key_prefix, known, consult && known < 0 ? &computed : nullptr,
+                                 options.gap_recursion_backend);
+        vlocal.sampling = false;
+        if (vsample) vmark = profile_now_ns();
+        int census_retained = -1;
+        if (consult && known < 0) census_retained = remember_prefilter(*remembered, decision_key, computed);
+        if (census) {
+            const EmissionWork& after = emission_work();
+            const std::string& read = forms[item.first].bases;
+            const bool eligible = item.second <= haplotype.size() && haplotype.size() - item.second >= read.size();
+            CensusOutcome o;
+            o.consulted = consult;
+            o.served = consult && known >= 0;
+            o.retained = census_retained;
+            o.kernel = after.executed_prefilters != census_before.executed_prefilters;
+            o.feasible = eligible && after.prefilter_rejections == census_before.prefilter_rejections;
+            o.recursion = after.executed_dps != census_before.executed_dps;
+            o.fixed_recursion = t_fixed_recursions != census_fixed_before;
+            o.emission_hit = o.feasible && !o.recursion;
+            o.accepted = fit.has_value() && fit->log_emission != kNegInf;
+            if (o.accepted) {
+                if (componentise[item.first] != 0) {
+                    for (const GappedComponent& component : fit->components) o.rows += component.log_emission != kNegInf ? 1u : 0u;
+                } else {
+                    o.rows = 1;
+                }
+            }
+            const std::size_t window = item.second <= haplotype.size()
+                ? std::min(haplotype.size() - item.second, read.size() + library.max_gap_bp) : 0;
+            census_record(census_context, forms[item.first].key_prefix.a, forms[item.first].key_prefix.b, read.data(),
+                          read.size(), haplotype.data() + std::min<std::size_t>(item.second, haplotype.size()), window,
+                          static_cast<std::uint32_t>(forms[item.first].fragment), o);
+        }
+        if (vsample) {
+            const std::uint64_t now = profile_now_ns();
+            vlocal.p.ns_decision += now - vmark;
+            vmark = now;
+        }
+        // I2-G: the request's row construction (or its refusal) closes the sample, on every exit below
+        struct SampleClose {
+            bool on;
+            VerificationLocal& local;
+            std::uint64_t start, rows_from;
+            ~SampleClose() {
+                if (!on) return;
+                const std::uint64_t now = profile_now_ns();
+                local.p.ns_rows += now - rows_from;
+                local.p.ns_total += now - start;
+            }
+        } sample_close{vsample, vlocal, vstart, vmark};
+        if (vsample && fit.has_value() && fit->log_emission != kNegInf) ++vlocal.p.sampled_accepted;
         if (timing) {
             const std::uint64_t spent = nanos_since(emission_mark);
             emission_timing().emission_ns += spent;
@@ -3128,6 +3818,7 @@ void collect_form_placements(
     cache_work.executed_dps += emission.executed_dps;
     publish_hits();
     if (remembered != nullptr) remembered->misses.fetch_add(local_misses, std::memory_order_relaxed);
+    if (verification_period().load(std::memory_order_relaxed) != 0) flush_verification_local();
     lap(&SeedingTimes::verify_ns);
 
     // Exact union reuse: the cached placements of every zone, translated to this haplotype. Appended before
@@ -3458,6 +4149,236 @@ double reduce_states(const std::map<StateKey, std::uint64_t>& states,
 // Everything one window enumeration needs, owned across calls. The reference built a vector per read
 // form on every candidate -- about 57,000 container constructions each, 36 million a round -- which is
 // what this exists to stop. Rows persist; only the ones the previous window touched are cleared.
+// ---- I1.4 content units (shared with the adaptive window path, I2-B) -------------------------------------------
+struct IndexUnit {
+    std::uint8_t strand = 0;
+    bool interior = false;
+    bool at_start = false, at_end = false;   // windows: the clip reached the text's start / end
+    std::uint32_t boundary = 0;             // windows: b's offset in the window
+    // I1.4 fine discovery unit: owns the starts in [core_lo, core_hi) of its text whose dependency span lies in it
+    bool fine = false;
+    std::uint32_t core_lo = 0, core_hi = 0;
+    std::string bytes;
+};
+struct IndexOccurrence {
+    std::uint32_t unit = 0;
+    std::uint32_t offset = 0;   // the unit's first byte, in its strand's own coordinates
+};
+using StoredPlacement = CachedPlacement;   // (form, start within the unit, consumed, mismatches, emission)
+std::atomic<bool>& content_index_hash_collapse() {
+    static std::atomic<bool> collapse{false};
+    return collapse;
+}
+std::uint64_t unit_hash(const IndexUnit& u) {
+    if (content_index_hash_collapse().load(std::memory_order_relaxed)) return 0;
+    std::uint64_t h = 1469598103934665603ULL;
+    for (const char c : u.bytes) h = (h ^ static_cast<unsigned char>(c)) * 1099511628211ULL;
+    const std::uint64_t tag = (static_cast<std::uint64_t>(u.strand) << 1) ^ (static_cast<std::uint64_t>(u.interior) << 2) ^
+                              (static_cast<std::uint64_t>(u.at_start) << 3) ^ (static_cast<std::uint64_t>(u.at_end) << 4) ^
+                              (static_cast<std::uint64_t>(u.boundary) << 8) ^ (static_cast<std::uint64_t>(u.fine) << 5) ^
+                              (static_cast<std::uint64_t>(u.core_lo) << 24) ^ (static_cast<std::uint64_t>(u.core_hi) << 44);
+    return (h ^ tag) * 1099511628211ULL;
+}
+bool same_unit(const IndexUnit& a, const IndexUnit& b) {
+    return a.strand == b.strand && a.interior == b.interior && a.at_start == b.at_start && a.at_end == b.at_end &&
+           a.boundary == b.boundary && a.fine == b.fine && a.core_lo == b.core_lo && a.core_hi == b.core_hi && a.bytes == b.bytes;
+}
+// I1.4: content-defined cores of one interior segment's bytes (start positions [0, len) partitioned). A gear rolling hash
+// (FastCDC-style: h = (h << 1) + G[byte], so h depends on the last 64 bytes) cuts after position p when the core holds
+// at least kMinCore starts and bits 40..48 of h are zero, or at kMaxCore. Fixed before any read-based measurement. The
+// hash's history is finite (64 bytes), but whether a position may cut also depends on the distance to the PRECEDING cut
+// (the minimum and maximum core sizes), so an edit can move a cut and, through it, later cuts farther away than its hash
+// window: locality is typical, not guaranteed. Exactness never depends on where the cuts fall.
+constexpr std::size_t kMinCore = 256, kMaxCore = 2048;
+constexpr std::uint64_t kCutMask = 511;
+const std::array<std::uint64_t, 256>& gear_table() {
+    static const std::array<std::uint64_t, 256> table = [] {
+        std::array<std::uint64_t, 256> t{};
+        std::uint64_t x = 0x9e3779b97f4a7c15ULL;
+        for (auto& v : t) {   // splitmix64
+            x += 0x9e3779b97f4a7c15ULL;
+            std::uint64_t z = x;
+            z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ULL;
+            z = (z ^ (z >> 27)) * 0x94d049bb133111ebULL;
+            v = z ^ (z >> 31);
+        }
+        return t;
+    }();
+    return table;
+}
+std::vector<std::pair<std::size_t, std::size_t>> content_cores(const std::string& bytes) {
+    const auto& G = gear_table();
+    std::vector<std::pair<std::size_t, std::size_t>> cores;
+    std::uint64_t h = 0;
+    std::size_t last = 0;
+    for (std::size_t p = 0; p < bytes.size(); ++p) {
+        h = (h << 1) + G[static_cast<unsigned char>(bytes[p])];
+        const std::size_t size = p + 1 - last;
+        if ((size >= kMinCore && ((h >> 40) & kCutMask) == 0) || size >= kMaxCore) {
+            cores.push_back({last, p + 1});
+            last = p + 1;
+        }
+    }
+    if (last < bytes.size()) cores.push_back({last, bytes.size()});
+    return cores;
+}
+
+
+// ---- shared discovery helpers: the I1.4 batch and the I2-B adaptive window path use these same functions ----------
+// The fine units of one interior text: each content-defined core with g bytes before it and max_read + g after it
+// (clipped to the text), so every owned start's dependency span [s - g, s + L + g) that lies in the text lies in the
+// fine text. `emit(unit, offset of its text)`.
+template <typename Emit>
+void for_each_fine_piece(const std::string& bytes, std::uint8_t strand, std::size_t gap, std::size_t max_read, Emit&& emit) {
+    for (const auto& [lo, hi] : content_cores(bytes)) {
+        const std::size_t t0 = lo >= gap ? lo - gap : 0;
+        const std::size_t t1 = std::min(bytes.size(), hi + max_read + gap);
+        IndexUnit f;
+        f.strand = strand;
+        f.fine = true;
+        f.core_lo = static_cast<std::uint32_t>(lo - t0);
+        f.core_hi = static_cast<std::uint32_t>(hi - t0);
+        f.bytes = bytes.substr(t0, t1 - t0);
+        emit(std::move(f), static_cast<std::uint32_t>(t0));
+    }
+}
+// The boundary window of `text` at b: [b - window, b + window) clipped to the text; it keeps the starts whose dependency
+// span crosses b. `lo` receives the window's first byte.
+IndexUnit boundary_window_unit(const std::string& text, std::uint8_t strand, std::size_t b, std::size_t window, std::size_t& lo) {
+    const std::size_t n = text.size();
+    lo = b > window ? b - window : 0;
+    const std::size_t hi = std::min(n, b + window);
+    IndexUnit u;
+    u.strand = strand;
+    u.at_start = lo == 0;
+    u.at_end = hi == n;
+    u.boundary = static_cast<std::uint32_t>(b - lo);
+    u.bytes = text.substr(lo, hi - lo);
+    return u;
+}
+// Whether a unit keeps a verified start x of a read form of length L: interior, all of D(x) = [x - g, x + L + g) inside
+// the text; window, D(x) crosses b; fine (I1.4), x in the owned core and all of D(x) inside the fine text.
+bool keep_unit_start(const IndexUnit& unit, std::int64_t x, std::int64_t L, std::int64_t g) {
+    const std::int64_t len = static_cast<std::int64_t>(unit.bytes.size());
+    const std::int64_t b = unit.boundary;
+    return unit.fine ? (x >= unit.core_lo && x < unit.core_hi && x - g >= 0 && x + L + g <= len)
+           : unit.interior ? (x - g >= 0 && x + L + g <= len)
+                           : (x - g < b && b < x + L + g);
+}
+// One unit's placements: proposed and verified on the unit's own bytes (a fine unit verifies only the starts of its
+// owned core), kept by keep_unit_start, and appended to `store` in (form, start, consumed) order. `rows` ([2], one per
+// strand), `proposed` and `touched` are the caller's reusable scratch. Returns the placements accepted before keeping.
+std::uint64_t discover_unit_placements(const IndexUnit& unit, const PreparedFragmentSet& prepared,
+                                       const std::vector<PieceIndex>& forward_indexes,
+                                       const std::vector<PieceIndex>& reverse_indexes, PlacementBudget& budget,
+                                       std::size_t band, const LibraryModel& library, const FragmentScoringOptions& options,
+                                       std::vector<std::vector<FormPlacement>>* rows,
+                                       std::vector<std::pair<std::uint32_t, std::uint32_t>>& proposed,
+                                       std::vector<std::uint32_t>& touched, FragmentScoringCounters& counters,
+                                       EmissionCacheCounters& cache, SeedingTimes* times, UnionPrefilterCache* prefilter,
+                                       std::uint64_t* skipped, std::vector<StoredPlacement>& store) {
+    const bool forward = unit.strand == 0;
+    auto& out = rows[unit.strand];
+    if (out.size() < (forward ? prepared.forward_forms.size() : prepared.reverse_forms.size())) {
+        out.resize(forward ? prepared.forward_forms.size() : prepared.reverse_forms.size());
+    }
+    touched.clear();
+    const std::pair<std::uint32_t, std::uint32_t> core{unit.core_lo, unit.core_hi};
+    const std::pair<std::uint32_t, std::uint32_t>* owned = unit.fine ? &core : nullptr;
+    const CensusSiteScope census_site(CensusSite::indexed_unit);   // I2-I (measurement only)
+    if (forward) {
+        collect_form_placements(unit.bytes, prepared.forward_forms, prepared.forward_componentise, forward_indexes, budget,
+                                band, library, out, proposed, counters, cache, options, &touched, nullptr, nullptr, nullptr,
+                                times, prefilter, owned, skipped);
+    } else {
+        collect_form_placements(unit.bytes, prepared.reverse_forms, prepared.reverse_componentise, reverse_indexes, budget,
+                                band, library, out, proposed, counters, cache, options, &touched, nullptr, nullptr, nullptr,
+                                times, prefilter, owned, skipped);
+    }
+    std::sort(touched.begin(), touched.end());
+    const std::int64_t g = static_cast<std::int64_t>(library.max_gap_bp);
+    std::uint64_t accepted = 0;
+    for (const std::uint32_t form : touched) {
+        const std::int64_t L = static_cast<std::int64_t>(
+            (forward ? prepared.forward_forms[form] : prepared.reverse_forms[form]).bases.size());
+        for (const FormPlacement& p : out[form]) {
+            ++accepted;
+            if (keep_unit_start(unit, static_cast<std::int64_t>(p.start), L, g)) {
+                store.push_back({form, p.start, p.consumed, p.mismatches, p.emission});
+            }
+        }
+        out[form].clear();
+    }
+    return accepted;
+}
+
+// ---- I2-B (EXPERIMENTAL): round-local fine discovery for the adaptive search's window enumeration ----------------
+// A window's raw placement rows -- what collect_form_placements returns on the window's bytes and on its reversal --
+// are the union, over the window treated as one text with one segment, of its two end windows' and its fine units'
+// kept placements (the I1/I1.4 dependency argument: a start depends only on D(s) = [s - g, s + L + g), clipped where it
+// meets an end, and the emission normaliser saturates within it). Units are content keys compared byte for byte, so a
+// unit discovered for one window serves every later window of the round that contains it. The store belongs to one
+// enumeration worker (its fragment range: placements for its own read forms only), lives for one round
+// (add_repaired_haplotypes) and is released at the round's end, refusal or not. Its budget counts allocated capacity
+// and metadata; a unit that does not fit is used once and dropped, and closes the store, after which a window not
+// fully served is enumerated by the reference path (recorded). Served placements are charged to a cumulative cap.
+struct WindowFineStore {
+    bool active = false;
+    std::size_t max_read = 0, gap = 0, window = 0;
+    std::uint64_t budget = 0, served_cap = 0;
+    std::atomic<std::uint64_t>* served_total = nullptr;   // shared by every worker's store, cumulative over the search
+    std::deque<IndexUnit> units;
+    std::deque<std::vector<StoredPlacement>> placements;
+    std::unordered_multimap<std::uint64_t, std::uint32_t> by_hash;
+    std::uint64_t bytes = 0;     // allocated capacity of the held units, their rows and their index entries
+    bool closed = false;
+    // round-local scratch (its capacity is in the memory account, not the budget)
+    std::vector<std::vector<FormPlacement>> rows[2];
+    std::vector<std::uint32_t> touched;
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> proposed;
+    std::deque<std::vector<StoredPlacement>> transient;   // units used once (not retained)
+    struct Piece {
+        const std::vector<StoredPlacement>* rows = nullptr;
+        std::uint32_t offset = 0;
+        std::uint8_t strand = 0;
+        bool skip_left_crossing = false;
+    };
+    std::vector<Piece> pieces;
+    // tallies since the last fold (see PreparedScoringContext::State::end_fine_round)
+    std::uint64_t windows = 0, fallback_windows = 0, units_discovered = 0, units_served = 0, units_not_retained = 0;
+    std::uint64_t placements_served = 0, placements_discovered = 0, hash_collisions = 0, peak_bytes = 0, peak_held = 0;
+    std::uint64_t peak_temporary = 0;   // I2-C: scratch + the window's candidate unit copies, at their largest
+
+    static std::uint64_t entry_bytes(const IndexUnit& unit, const std::vector<StoredPlacement>& rows) {
+        return sizeof(IndexUnit) + unit.bytes.capacity() + sizeof(std::vector<StoredPlacement>) +
+               rows.capacity() * sizeof(StoredPlacement) + 48;   // 48: one hash node, generously
+    }
+    std::uint64_t scratch_bytes() const {
+        std::uint64_t b = touched.capacity() * sizeof(std::uint32_t) + proposed.capacity() * 8 + pieces.capacity() * sizeof(Piece);
+        for (const auto& r : rows) {
+            b += r.capacity() * sizeof(std::vector<FormPlacement>);
+            for (const auto& v : r) b += v.capacity() * sizeof(FormPlacement);
+        }
+        for (const auto& t : transient) b += t.capacity() * sizeof(StoredPlacement) + sizeof(t);
+        return b;
+    }
+    std::uint64_t held_bytes() const { return bytes + by_hash.bucket_count() * sizeof(void*); }
+    std::uint64_t account_bytes() const { return held_bytes() + scratch_bytes(); }
+    void release() {
+        std::deque<IndexUnit>().swap(units);
+        std::deque<std::vector<StoredPlacement>>().swap(placements);
+        std::unordered_multimap<std::uint64_t, std::uint32_t>().swap(by_hash);
+        for (auto& r : rows) std::vector<std::vector<FormPlacement>>().swap(r);
+        std::vector<std::uint32_t>().swap(touched);
+        std::vector<std::pair<std::uint32_t, std::uint32_t>>().swap(proposed);
+        std::deque<std::vector<StoredPlacement>>().swap(transient);
+        std::vector<Piece>().swap(pieces);
+        bytes = 0;
+        closed = false;
+        active = false;
+    }
+};
+
 struct WindowScratch {
     std::vector<std::vector<FormPlacement>> forward_rows;
     std::vector<std::vector<FormPlacement>> reverse_rows;
@@ -3476,6 +4397,12 @@ struct WindowScratch {
     std::uint64_t row_constructions = 0;
     std::uint64_t accumulator_growths = 0;
     std::uint64_t origin_growths = 0;
+    // I2-B: the worker's round-local fine store (inactive unless the context enabled it for the round), and the time this
+    // scratch's windows spent building raw rows (discovery: the reference's two scans, or fine reconstruction) and pairing
+    // them, worker elapsed, both paths. Measurement only.
+    WindowFineStore fine;
+    double seconds_rows = 0.0, seconds_pairing = 0.0;
+    std::uint64_t windows_enumerated = 0;
 
     void ensure_rows(std::size_t forward_count, std::size_t reverse_count) {
         if (forward_rows.size() < forward_count) {
@@ -3891,6 +4818,106 @@ void pair_fragment(const RowView (&forward_rows)[2], const RowView (&reverse_row
     }
 }
 
+// Phase 2: every serving zone's cached census of fragment f merged into `merged_counts` (the direct census on entry),
+// in StateKey order, copies kept apart by adding their multiplicities. `zone_cursor` (one per zone, reset per
+// haplotype) advances monotonically with f. Shared by place_haplotype_range and the EXPERIMENTAL content index (I1.2).
+void merge_served_states(std::size_t f, const OriginZone* zones, std::size_t zone_count, std::vector<std::size_t>& zone_cursor,
+                         std::vector<StateCount>& merged_counts, std::vector<StateCount>& merge_scratch) {
+    for (std::size_t z = 0; z < zone_count; ++z) {
+        const StateAggregateSet& cached = zones[z].entry->states;
+        std::size_t& at = zone_cursor[z];
+        while (at < cached.fragments.size() && cached.fragments[at] < f) ++at;
+        if (at == cached.fragments.size() || cached.fragments[at] != f) continue;
+        const StateCount* first = cached.states.data() + cached.starts[at];
+        const StateCount* last = cached.states.data() + cached.starts[at + 1];
+        merge_sorted(merged_counts.data(), merged_counts.data() + merged_counts.size(), first, last, merge_scratch);
+        merged_counts.swap(merge_scratch);
+    }
+}
+
+// Phase 2: one distinct segment's interior origins -- forward placements (strand-local starts, (form, start, consumed)
+// order) paired with reverse placements (reversed-strand-local starts, turned here to forward ends, length - start) --
+// as sorted per-fragment StateKey multiplicities over both arms: the census of ONE occurrence. Every placement given
+// must lie in its zone. Returns the physical origins constructed. `budget`, when given, charges and caps them.
+std::uint64_t build_origin_entry(const std::vector<CachedPlacement>& forward_cached,
+                                 const std::vector<CachedPlacement>& reverse_cached, std::size_t length,
+                                 std::size_t form_count, std::size_t fragment_count, const PreparedFragmentSet& prepared,
+                                 PlacementBudget* budget, StateAggregateSet& built_states, UnionOriginEntry& entry) {
+    // Rows per form: forward placements as cached (already (start, consumed) within a form); reverse ones
+    // turned to forward coordinates -- the end, length - start -- and re-sorted, as the direct path does.
+    std::vector<FormPlacement> forward_rows(forward_cached.size());
+    std::vector<std::size_t> forward_at(form_count + 1, 0);
+    for (std::size_t i = 0; i < forward_cached.size(); ++i) {
+        const CachedPlacement& c = forward_cached[i];
+        forward_rows[i] = {c.start, c.consumed, c.mismatches, c.emission};
+        ++forward_at[c.form + 1];
+    }
+    std::vector<FormPlacement> reverse_rows(reverse_cached.size());
+    std::vector<std::size_t> reverse_at(form_count + 1, 0);
+    for (std::size_t i = 0; i < reverse_cached.size(); ++i) {
+        const CachedPlacement& c = reverse_cached[i];
+        reverse_rows[i] = {static_cast<std::uint32_t>(length - c.start), c.consumed, c.mismatches, c.emission};
+        ++reverse_at[c.form + 1];
+    }
+    for (std::size_t form = 0; form < form_count; ++form) {
+        forward_at[form + 1] += forward_at[form];
+        reverse_at[form + 1] += reverse_at[form];
+    }
+    for (std::size_t form = 0; form < form_count; ++form) {
+        std::sort(reverse_rows.begin() + static_cast<std::ptrdiff_t>(reverse_at[form]),
+                  reverse_rows.begin() + static_cast<std::ptrdiff_t>(reverse_at[form + 1]),
+                  [](const FormPlacement& lhs, const FormPlacement& rhs) {
+                      return std::tie(lhs.start, lhs.consumed) < std::tie(rhs.start, rhs.consumed);
+                  });
+    }
+    const auto row = [](const std::vector<FormPlacement>& rows, const std::vector<std::size_t>& at, std::size_t form) {
+        return RowView{rows.data() + at[form], at[form + 1] - at[form]};
+    };
+    built_states.clear();
+    std::uint64_t constructed = 0;
+    std::map<std::uint32_t, OriginAccumulator> origins;
+    std::vector<StateKey> keys;
+    for (std::size_t f = 0; f < fragment_count; ++f) {
+        if (budget != nullptr && budget->stop()) throw PlacementCancelled();
+        const InsertSupport& support = prepared.support_by_fragment[f];
+        if (support.empty()) continue;
+        const RowView forward_view[2] = {row(forward_rows, forward_at, 2 * f), row(forward_rows, forward_at, 2 * f + 1)};
+        const RowView reverse_view[2] = {row(reverse_rows, reverse_at, 2 * f), row(reverse_rows, reverse_at, 2 * f + 1)};
+        if ((forward_view[0].empty() || reverse_view[0].empty()) && (forward_view[1].empty() || reverse_view[1].empty())) {
+            continue;
+        }
+        keys.clear();
+        pair_fragment(forward_view, reverse_view, support, nullptr, 0, origins, entry.latent_pairs, entry.valid_states,
+                      [&](std::size_t arm, std::uint32_t, std::uint32_t insert, const OriginAccumulator& origin) {
+                          if (budget != nullptr) {
+                              const std::uint64_t seen = budget->physical_origins.fetch_add(1, std::memory_order_relaxed) + 1;
+                              if (seen > budget->max_physical_origins) {
+                                  budget->cancel();
+                                  throw ResourceExhausted(
+                                      "fragment scoring reached its physical-origin cap; no partial ranking is returned");
+                              }
+                          }
+                          StateKey key;
+                          key.insert_bp = insert;
+                          key.orientation = static_cast<std::uint32_t>(arm);
+                          key.log_latent_mass = origin.log_latent_mass;
+                          keys.push_back(key);
+                      });
+        if (keys.empty()) continue;
+        constructed += keys.size();
+        const std::size_t first = built_states.states.size();
+        sort_and_count(keys, built_states.states, first);
+        built_states.fragments.push_back(static_cast<std::uint32_t>(f));
+        built_states.starts.push_back(static_cast<std::uint32_t>(first));
+    }
+    built_states.starts.push_back(static_cast<std::uint32_t>(built_states.states.size()));
+    entry.states.fragments.assign(built_states.fragments.begin(), built_states.fragments.end());
+    entry.states.starts.assign(built_states.starts.begin(), built_states.starts.end());
+    entry.states.states.assign(built_states.states.begin(), built_states.states.end());
+    entry.origins = constructed;
+    return constructed;
+}
+
 // Places haplotypes [first_h, last_h) and writes their mass COLUMNS. Column storage rather than the
 // row-major matrix is what makes a later batch appendable: a new haplotype adds a column and moves
 // nothing, whereas a row-major matrix restrides every existing cell when the haplotype count grows.
@@ -3944,6 +4971,7 @@ void place_haplotype_range(
         const std::uint64_t rows_before = counters.accepted_mate_placements;
         SeedingTimes seeding_times;
         SeedingTimes* const timed = trace_work ? &seeding_times : nullptr;
+        const CensusSiteScope census_site(CensusSite::full_haplotype);   // I2-I (measurement only)
         collect_form_placements(haplotype, prepared.forward_forms, prepared.forward_componentise,
                                 prepared.forward_indexes, budget, band, library, forward_placements,
                                 proposed_scratch, counters, cache_work, options, nullptr,
@@ -4064,17 +5092,7 @@ void place_haplotype_range(
                 // Served: each occurrence's census added in, copies kept apart by adding their multiplicities.
                 const auto merge_mark = std::chrono::steady_clock::now();
                 merged_counts.assign(direct_counts.begin(), direct_counts.end());
-                for (std::size_t z = 0; z < origin_zones->size(); ++z) {
-                    const StateAggregateSet& cached = (*origin_zones)[z].entry->states;
-                    std::size_t& at = zone_cursor[z];
-                    while (at < cached.fragments.size() && cached.fragments[at] < f) ++at;
-                    if (at == cached.fragments.size() || cached.fragments[at] != f) continue;
-                    const StateCount* first = cached.states.data() + cached.starts[at];
-                    const StateCount* last = cached.states.data() + cached.starts[at + 1];
-                    merge_sorted(merged_counts.data(), merged_counts.data() + merged_counts.size(), first, last,
-                                 merge_scratch);
-                    merged_counts.swap(merge_scratch);
-                }
+                merge_served_states(f, origin_zones->data(), origin_zones->size(), zone_cursor, merged_counts, merge_scratch);
                 merge_seconds += std::chrono::duration<double>(std::chrono::steady_clock::now() - merge_mark).count();
                 if (reuse_self_check) {
                     // Fresh enumeration of the whole fragment, no zone skipped, reduced as the reference reduces.
@@ -4513,82 +5531,9 @@ void fill_union_cache(const PlacementInputs& in, const std::vector<std::vector<s
             const std::size_t length = d.bytes.size();
             const std::vector<CachedPlacement>& forward_cached = entries[e].placements;
             const std::vector<CachedPlacement>& reverse_cached = entries[position_of[d.partner]].placements;
-            // Rows per form: forward placements as cached (already (start, consumed) within a form); reverse ones
-            // turned to forward coordinates -- the end, length - start -- and re-sorted, as the direct path does.
-            std::vector<FormPlacement> forward_rows(forward_cached.size());
-            std::vector<std::size_t> forward_at(form_count + 1, 0);
-            for (std::size_t i = 0; i < forward_cached.size(); ++i) {
-                const CachedPlacement& c = forward_cached[i];
-                forward_rows[i] = {c.start, c.consumed, c.mismatches, c.emission};
-                ++forward_at[c.form + 1];
-            }
-            std::vector<FormPlacement> reverse_rows(reverse_cached.size());
-            std::vector<std::size_t> reverse_at(form_count + 1, 0);
-            for (std::size_t i = 0; i < reverse_cached.size(); ++i) {
-                const CachedPlacement& c = reverse_cached[i];
-                reverse_rows[i] = {static_cast<std::uint32_t>(length - c.start), c.consumed, c.mismatches, c.emission};
-                ++reverse_at[c.form + 1];
-            }
-            for (std::size_t form = 0; form < form_count; ++form) {
-                forward_at[form + 1] += forward_at[form];
-                reverse_at[form + 1] += reverse_at[form];
-            }
-            for (std::size_t form = 0; form < form_count; ++form) {
-                std::sort(reverse_rows.begin() + static_cast<std::ptrdiff_t>(reverse_at[form]),
-                          reverse_rows.begin() + static_cast<std::ptrdiff_t>(reverse_at[form + 1]),
-                          [](const FormPlacement& lhs, const FormPlacement& rhs) {
-                              return std::tie(lhs.start, lhs.consumed) < std::tie(rhs.start, rhs.consumed);
-                          });
-            }
-            const auto row = [](const std::vector<FormPlacement>& rows, const std::vector<std::size_t>& at,
-                                std::size_t form) {
-                return RowView{rows.data() + at[form], at[form + 1] - at[form]};
-            };
             UnionOriginEntry& entry = batch[slot];
-            StateAggregateSet& built_states = slot_scratch[slot];
-            built_states.clear();
-            std::map<std::uint32_t, OriginAccumulator> origins;
-            std::vector<StateKey> keys;
-            for (std::size_t f = 0; f < fragment_count; ++f) {
-                if (budget.stop()) throw PlacementCancelled();
-                const InsertSupport& support = prepared.support_by_fragment[f];
-                if (support.empty()) continue;
-                const RowView forward_view[2] = {row(forward_rows, forward_at, 2 * f), row(forward_rows, forward_at, 2 * f + 1)};
-                const RowView reverse_view[2] = {row(reverse_rows, reverse_at, 2 * f), row(reverse_rows, reverse_at, 2 * f + 1)};
-                if ((forward_view[0].empty() || reverse_view[0].empty()) &&
-                    (forward_view[1].empty() || reverse_view[1].empty())) {
-                    continue;
-                }
-                keys.clear();
-                pair_fragment(forward_view, reverse_view, support, nullptr, 0, origins, entry.latent_pairs,
-                              entry.valid_states,
-                              [&](std::size_t arm, std::uint32_t, std::uint32_t insert, const OriginAccumulator& origin) {
-                                  const std::uint64_t seen =
-                                      budget.physical_origins.fetch_add(1, std::memory_order_relaxed) + 1;
-                                  if (seen > budget.max_physical_origins) {
-                                      budget.cancel();
-                                      throw ResourceExhausted(
-                                          "fragment scoring reached its physical-origin cap; no partial "
-                                          "ranking is returned");
-                                  }
-                                  StateKey key;
-                                  key.insert_bp = insert;
-                                  key.orientation = static_cast<std::uint32_t>(arm);
-                                  key.log_latent_mass = origin.log_latent_mass;
-                                  keys.push_back(key);
-                              });
-                if (keys.empty()) continue;
-                batch_origins[slot] += keys.size();
-                const std::size_t first = built_states.states.size();
-                sort_and_count(keys, built_states.states, first);
-                built_states.fragments.push_back(static_cast<std::uint32_t>(f));
-                built_states.starts.push_back(static_cast<std::uint32_t>(first));
-            }
-            built_states.starts.push_back(static_cast<std::uint32_t>(built_states.states.size()));
-            entry.states.fragments.assign(built_states.fragments.begin(), built_states.fragments.end());
-            entry.states.starts.assign(built_states.starts.begin(), built_states.starts.end());
-            entry.states.states.assign(built_states.states.begin(), built_states.states.end());
-            entry.origins = batch_origins[slot];
+            batch_origins[slot] = build_origin_entry(forward_cached, reverse_cached, length, form_count, fragment_count,
+                                                     prepared, &budget, slot_scratch[slot], entry);
         };
         if (end - begin == 1) {
             build_one(0);
@@ -4934,6 +5879,7 @@ void enumerate_window_origins_reference(
     std::vector<std::vector<FormPlacement>> reverse_placements(prepared.reverse_forms.size());
     std::vector<std::pair<std::uint32_t, std::uint32_t>> proposed_scratch;
 
+    const CensusSiteScope census_site(CensusSite::window);   // I2-I (measurement only)
     collect_form_placements(window.bases, prepared.forward_forms, prepared.forward_componentise,
                             prepared.forward_indexes, budget, band, library, forward_placements,
                             proposed_scratch, counters, cache_work, options);
@@ -5032,6 +5978,227 @@ void enumerate_window_origins_reference(
     }
 }
 
+// I2-B TEST ONLY: an exact per-window comparison of the fine rows with the reference's own two scans, and deliberate
+// ownership/context mutations (1: overlapping ownership, core_hi + 1; 2: left context one byte short; 3: right context
+// two bytes short; 4: the left end window two bytes short) that the comparison must catch.
+std::atomic<bool>& fine_window_row_check() {
+    static std::atomic<bool> on{false};
+    return on;
+}
+std::atomic<int>& fine_window_mutation() {
+    static std::atomic<int> m{0};
+    return m;
+}
+
+// I2-B: a window's raw rows -- exactly what the reference's two collect_form_placements calls write into scratch's
+// forward rows (window coordinates) and reverse rows (reversed-window coordinates), each in (start, consumed) order, with
+// the same touched lists -- built from the worker's round-local fine store. Executed work (the discovery of units not
+// held) is counted in `counters`/`cache_work` and charged to the shared budget by collect_form_placements itself;
+// served placements are tallied apart and charged to the cumulative served cap. `proposed_by_pass` receives the
+// executed proposals of the forward and the reverse pieces. A closed store that does not hold every piece of the window
+// hands it to the reference path (recorded); the result is the same either way.
+void fine_window_rows(const PreparedFragmentSet& prepared, const LibraryModel& library, const FragmentScoringOptions& options,
+                      std::size_t band, const LocalWindow& window, const std::vector<PieceIndex>& forward_indexes,
+                      const std::vector<PieceIndex>& reverse_indexes, PlacementBudget& budget,
+                      FragmentScoringCounters& counters, EmissionCacheCounters& cache_work, WindowScratch& scratch,
+                      std::uint64_t* proposed_by_pass) {
+    WindowFineStore& st = scratch.fine;
+    ++st.windows;
+    // the window as one text with one segment, per strand: its end windows (cuts 0 and n) and, when it can keep an
+    // interior start at all (n > 2g, as add_haplotype requires), its fine units
+    // Each start has exactly one owner: a start whose span crosses BOTH ends (a window shorter than a read's span) is
+    // the left end window's, so the right one, when it reaches the text's start, skips starts below g.
+    struct Candidate {
+        IndexUnit unit;
+        std::uint32_t offset;
+        bool skip_left_crossing;
+    };
+    std::vector<Candidate> candidates;
+    const int mutation = fine_window_mutation().load(std::memory_order_relaxed);
+    for (std::uint8_t strand = 0; strand < 2; ++strand) {
+        const std::string& text = strand == 0 ? window.bases : window.reversed;
+        const std::size_t n = text.size();
+        for (const std::size_t b : {std::size_t{0}, n}) {
+            if (b == n && n == 0) break;
+            std::size_t lo = 0;
+            IndexUnit u = boundary_window_unit(text, strand, b, st.window, lo);
+            if (mutation == 4 && b == 0 && n > 0 && u.bytes.size() > 2) u.bytes.resize(u.bytes.size() - 2);
+            candidates.push_back({std::move(u), static_cast<std::uint32_t>(lo), b == n && n > 0 && lo == 0});
+        }
+        if (n > 2 * st.gap) {
+            for_each_fine_piece(text, strand, st.gap, st.max_read, [&](IndexUnit&& u, std::uint32_t offset) {
+                if (mutation == 1 && u.core_hi < u.bytes.size()) ++u.core_hi;
+                if (mutation == 2 && offset > 0 && u.core_lo > 0) {
+                    u.bytes.erase(0, 1);
+                    --u.core_lo;
+                    --u.core_hi;
+                    ++offset;
+                }
+                if (mutation == 3 && offset + u.bytes.size() < n && u.bytes.size() >= u.core_hi + 2) {
+                    u.bytes.resize(u.bytes.size() - 2);
+                }
+                candidates.push_back({std::move(u), offset, false});
+            });
+        }
+    }
+    const auto find = [&](const IndexUnit& unit, std::uint64_t key) -> long {
+        const auto range = st.by_hash.equal_range(key);
+        for (auto it = range.first; it != range.second; ++it) {
+            if (same_unit(st.units[it->second], unit)) return static_cast<long>(it->second);
+            ++st.hash_collisions;
+        }
+        return -1;
+    };
+    std::vector<std::uint64_t> keys(candidates.size());
+    for (std::size_t i = 0; i < candidates.size(); ++i) keys[i] = unit_hash(candidates[i].unit);
+    if (st.closed) {
+        bool all_held = true;
+        for (std::size_t i = 0; i < candidates.size() && all_held; ++i) all_held = find(candidates[i].unit, keys[i]) >= 0;
+        if (!all_held) {
+            // the reference path, unchanged: the two scans over the whole window
+            ++st.fallback_windows;
+            const std::uint64_t at_start = counters.proposed_starts;
+            const CensusSiteScope census_site(CensusSite::window);   // I2-I (measurement only)
+            collect_form_placements(window.bases, prepared.forward_forms, prepared.forward_componentise, forward_indexes,
+                                    budget, band, library, scratch.forward_rows, scratch.proposed, counters, cache_work,
+                                    options, &scratch.touched_forward);
+            const std::uint64_t after_forward = counters.proposed_starts;
+            collect_form_placements(window.reversed, prepared.reverse_forms, prepared.reverse_componentise, reverse_indexes,
+                                    budget, band, library, scratch.reverse_rows, scratch.proposed, counters, cache_work,
+                                    options, &scratch.touched_reverse);
+            if (proposed_by_pass != nullptr) {
+                proposed_by_pass[0] = after_forward - at_start;
+                proposed_by_pass[1] = counters.proposed_starts - after_forward;
+            }
+            return;
+        }
+    }
+    st.pieces.clear();
+    st.transient.clear();
+    std::uint64_t proposed[2] = {0, 0}, served = 0;
+    for (std::size_t i = 0; i < candidates.size(); ++i) {
+        Candidate& c = candidates[i];
+        const std::uint8_t strand = c.unit.strand;
+        const long held = find(c.unit, keys[i]);
+        if (held >= 0) {
+            const std::vector<StoredPlacement>& rows = st.placements[static_cast<std::size_t>(held)];
+            st.pieces.push_back({&rows, c.offset, strand, c.skip_left_crossing});
+            ++st.units_served;
+            served += rows.size();
+            continue;
+        }
+        std::vector<StoredPlacement> found;
+        const std::uint64_t before = counters.proposed_starts;
+        discover_unit_placements(c.unit, prepared, forward_indexes, reverse_indexes, budget, band, library, options, st.rows,
+                                 st.proposed, st.touched, counters, cache_work, nullptr, nullptr, nullptr, found);
+        proposed[strand] += counters.proposed_starts - before;
+        st.placements_discovered += found.size();
+        std::vector<StoredPlacement> exact(found.begin(), found.end());   // exact capacity: no growth slack is held
+        const std::uint64_t cost = WindowFineStore::entry_bytes(c.unit, exact);
+        const std::uint64_t buckets_after =
+            std::max<std::uint64_t>(st.by_hash.bucket_count(), (st.by_hash.size() + 1) * 2) * sizeof(void*);
+        if (!st.closed && st.bytes + cost + buckets_after <= st.budget) {
+            const std::uint32_t id = static_cast<std::uint32_t>(st.units.size());
+            st.units.push_back(std::move(c.unit));
+            st.placements.push_back(std::move(exact));
+            st.by_hash.emplace(keys[i], id);
+            st.bytes += cost;
+            ++st.units_discovered;
+            st.pieces.push_back({&st.placements.back(), c.offset, strand, c.skip_left_crossing});
+        } else {
+            st.closed = true;   // later windows not fully held take the reference path
+            ++st.units_not_retained;
+            st.transient.push_back(std::move(exact));
+            st.pieces.push_back({&st.transient.back(), c.offset, strand, c.skip_left_crossing});
+        }
+    }
+    if (proposed_by_pass != nullptr) {
+        proposed_by_pass[0] = proposed[0];
+        proposed_by_pass[1] = proposed[1];
+    }
+    if (served != 0) {
+        st.placements_served += served;
+        if (st.served_total != nullptr) {
+            const std::uint64_t total = st.served_total->fetch_add(served, std::memory_order_relaxed) + served;
+            if (st.served_cap != 0 && total > st.served_cap) {
+                budget.cancel();
+                throw ResourceExhausted("the adaptive fine store reached its served-placement cap; no partial ranking is "
+                                        "returned");
+            }
+        }
+    }
+    // reconstruction: every piece's owned placements, shifted to the window, into the raw rows; then the reference's row
+    // order. No deduplication: ownership is exclusive, so a duplicate would be a defect for the row check to catch.
+    const std::uint32_t g32 = static_cast<std::uint32_t>(st.gap);
+    for (const WindowFineStore::Piece& piece : st.pieces) {
+        auto& rows = piece.strand == 0 ? scratch.forward_rows : scratch.reverse_rows;
+        auto& touched = piece.strand == 0 ? scratch.touched_forward : scratch.touched_reverse;
+        for (const StoredPlacement& p : *piece.rows) {
+            if (piece.skip_left_crossing && p.start < g32) continue;   // the left end window owns it
+            std::vector<FormPlacement>& row = rows[p.form];
+            if (row.empty()) touched.push_back(p.form);
+            FormPlacement q;
+            q.start = piece.offset + p.start;
+            q.consumed = p.consumed;
+            q.mismatches = p.mismatches;
+            q.emission = p.emission;
+            row.push_back(q);
+        }
+    }
+    for (int strand = 0; strand < 2; ++strand) {
+        auto& rows = strand == 0 ? scratch.forward_rows : scratch.reverse_rows;
+        for (const std::uint32_t form : strand == 0 ? scratch.touched_forward : scratch.touched_reverse) {
+            std::vector<FormPlacement>& row = rows[form];
+            std::sort(row.begin(), row.end(), [](const FormPlacement& a, const FormPlacement& b) {
+                return std::tie(a.start, a.consumed) < std::tie(b.start, b.consumed);
+            });
+        }
+    }
+    {
+        // I2-C: temporary storage of this window: the reusable scratch plus the candidate units' byte copies and keys
+        std::uint64_t candidate_bytes = candidates.capacity() * sizeof(Candidate) + keys.capacity() * sizeof(std::uint64_t);
+        for (const Candidate& c : candidates) candidate_bytes += c.unit.bytes.capacity();
+        st.peak_temporary = std::max(st.peak_temporary, st.scratch_bytes() + candidate_bytes);
+        st.peak_bytes = std::max(st.peak_bytes, st.held_bytes() + st.scratch_bytes() + candidate_bytes);
+    }
+    st.peak_held = std::max(st.peak_held, st.held_bytes());
+    st.transient.clear();
+    if (fine_window_row_check().load(std::memory_order_relaxed)) {
+        // TEST ONLY: the reference's two scans over the whole window, against a throwaway budget, row for row
+        PlacementBudget spare;
+        spare.max_piece_hits = std::numeric_limits<std::uint64_t>::max();
+        spare.max_physical_origins = std::numeric_limits<std::uint64_t>::max();
+        FragmentScoringCounters spare_counters;
+        EmissionCacheCounters spare_cache;
+        std::vector<std::vector<FormPlacement>> ref[2] = {
+            std::vector<std::vector<FormPlacement>>(prepared.forward_forms.size()),
+            std::vector<std::vector<FormPlacement>>(prepared.reverse_forms.size())};
+        std::vector<std::pair<std::uint32_t, std::uint32_t>> spare_proposed;
+        const CensusSiteScope census_site(CensusSite::window);   // I2-I (measurement only)
+        collect_form_placements(window.bases, prepared.forward_forms, prepared.forward_componentise, forward_indexes, spare,
+                                band, library, ref[0], spare_proposed, spare_counters, spare_cache, options);
+        collect_form_placements(window.reversed, prepared.reverse_forms, prepared.reverse_componentise, reverse_indexes,
+                                spare, band, library, ref[1], spare_proposed, spare_counters, spare_cache, options);
+        for (int strand = 0; strand < 2; ++strand) {
+            const auto& got = strand == 0 ? scratch.forward_rows : scratch.reverse_rows;
+            for (std::size_t form = 0; form < ref[strand].size(); ++form) {
+                const auto& a = ref[strand][form];
+                const auto& b = got[form];
+                bool same = a.size() == b.size();
+                for (std::size_t i = 0; same && i < a.size(); ++i) {
+                    same = a[i].start == b[i].start && a[i].consumed == b[i].consumed && a[i].mismatches == b[i].mismatches &&
+                           std::memcmp(&a[i].emission, &b[i].emission, sizeof(double)) == 0;
+                }
+                if (!same) {
+                    throw std::logic_error("fine window rows differ from the reference at strand " + std::to_string(strand) +
+                                           " form " + std::to_string(form) + " (" + std::to_string(b.size()) + " vs " +
+                                           std::to_string(a.size()) + " rows)");
+                }
+            }
+        }
+    }
+}
+
 // The optimised enumeration. Same placements, same origins, same counters, same order -- the only
 // things that change are who owns the memory and how the per-endpoint sums are addressed.
 //
@@ -5076,7 +6243,17 @@ void enumerate_window_origins(
     scratch.ensure_rows(prepared.forward_forms.size(), prepared.reverse_forms.size());
     scratch.clear_touched();
 
+    const auto rows_mark = std::chrono::steady_clock::now();
+    ++scratch.windows_enumerated;
+    if (scratch.fine.active) {
+        // I2-B (experimental): the same raw rows, from the worker's round-local fine store
+        fine_window_rows(prepared, library, options, band, window,
+                         forward_indexes != nullptr ? *forward_indexes : prepared.forward_indexes,
+                         reverse_indexes != nullptr ? *reverse_indexes : prepared.reverse_indexes, budget, counters,
+                         cache_work, scratch, proposed_by_pass);
+    } else {
     const std::uint64_t proposed_at_start = counters.proposed_starts;
+    const CensusSiteScope census_site(CensusSite::window);   // I2-I (measurement only)
     collect_form_placements(window.bases, prepared.forward_forms, prepared.forward_componentise,
                             forward_indexes != nullptr ? *forward_indexes : prepared.forward_indexes,
                             budget, band, library, scratch.forward_rows,
@@ -5090,6 +6267,9 @@ void enumerate_window_origins(
         proposed_by_pass[0] = proposed_after_forward - proposed_at_start;
         proposed_by_pass[1] = counters.proposed_starts - proposed_after_forward;
     }
+    }
+    const auto pairing_mark = std::chrono::steady_clock::now();
+    scratch.seconds_rows += std::chrono::duration<double>(pairing_mark - rows_mark).count();
     const std::size_t last_fragment = std::min(fragment_end, fragments.size());
 
     const std::size_t width = window.bases.size();
@@ -5212,6 +6392,7 @@ void enumerate_window_origins(
         }
     }
     scratch.offsets[last_fragment] = scratch.origins.size();
+    scratch.seconds_pairing += std::chrono::duration<double>(std::chrono::steady_clock::now() - pairing_mark).count();
 }
 
 // The four acceptance caps, decided on whatever totals the caller holds them against: per call for
@@ -5245,6 +6426,147 @@ void enforce_acceptance_caps(
 }
 
 }  // namespace scoring_detail
+
+// The exact union prefilter-decision cache (UnionPrefilterCacheReport), built once per read set. Shared by
+// score_diplotypes and the EXPERIMENTAL content-index batch (I1.1) so the two cannot configure it differently. Needs one
+// read length (throws otherwise; single_read_length() lets a caller fall back instead) and a positive consumption cap.
+bool single_read_length(const PreparedFragmentSet& prepared, std::size_t& length) {
+    length = 0;
+    for (const auto* forms : {&prepared.forward_forms, &prepared.reverse_forms}) {
+        for (const ReadForm& form : *forms) {
+            if (length == 0) length = form.bases.size();
+            if (form.bases.size() != length) return false;
+        }
+    }
+    return true;
+}
+std::unique_ptr<UnionPrefilterCache> make_union_prefilter_cache(const PreparedFragmentSet& prepared, const LibraryModel& library,
+                                                                const FragmentScoringOptions& options,
+                                                                UnionPrefilterCacheReport& report) {
+    if (options.max_union_cached_prefilters_consumed == 0) {
+        throw std::invalid_argument("union prefilter reuse needs a positive consumption cap");
+    }
+    auto prefilter_cache = std::make_unique<UnionPrefilterCache>();
+    std::size_t r = 0;
+    if (!single_read_length(prepared, r)) throw std::invalid_argument("union prefilter reuse needs one read length");
+    prefilter_cache->read_length = r;
+    prefilter_cache->window_length = r + library.max_gap_bp;
+    std::uint64_t slots = 1024;
+    while (slots * 2 * sizeof(std::uint64_t) <= options.union_prefilter_cache_bytes) slots *= 2;
+    prefilter_cache->slot_bits = 0;
+    while ((std::uint64_t{1} << prefilter_cache->slot_bits) < slots) ++prefilter_cache->slot_bits;
+    prefilter_cache->slots.reset(new std::atomic<std::uint64_t>[slots]());
+    prefilter_cache->max_held = slots / 2;
+    prefilter_cache->max_consumed = options.max_union_cached_prefilters_consumed;
+    prefilter_cache->publish_batch = std::max<std::uint64_t>(1, options.piece_hit_publish_batch);
+    report.active = true;
+    report.budget_bytes = options.union_prefilter_cache_bytes;
+    report.max_consumed = options.max_union_cached_prefilters_consumed;
+    report.read_length = r;
+    report.window_length = r + library.max_gap_bp;
+    report.decision_table_bytes = slots * sizeof(std::uint64_t);
+    return prefilter_cache;
+}
+void fill_union_prefilter_report(UnionPrefilterCache& cache, UnionPrefilterCacheReport& report) {
+    report.window_contents = cache.next_window.load(std::memory_order_relaxed);
+    report.window_index_bytes = 0;
+    for (UnionPrefilterCache::Shard& shard : cache.shards) {
+        report.window_index_bytes += shard.bytes + shard.table.capacity() * sizeof(UnionPrefilterCache::Stored);
+    }
+    report.positions_indexed = cache.positions_indexed.load(std::memory_order_relaxed);
+    report.decisions_held = cache.held.load(std::memory_order_relaxed);
+    report.decisions_not_retained = cache.not_retained.load(std::memory_order_relaxed);
+    report.hits = cache.consumed.load(std::memory_order_relaxed);
+    report.misses = cache.misses.load(std::memory_order_relaxed);
+    report.worker_seconds_index = static_cast<double>(cache.index_nanos.load(std::memory_order_relaxed)) * 1e-9;
+}
+
+// The diploid combination of placed mass columns into candidate scores, shared by score_diplotypes and the
+// EXPERIMENTAL content index (I1) so the two cannot combine differently. Fills result.scores (already sized),
+// result.audit_scores, threads_used_combination, candidate_fragment_evaluations and seconds_diploid_combination.
+void combine_candidate_scores(const std::vector<std::vector<double>>& mass_column, const std::vector<double>& exposure,
+                              const std::vector<double>& background, std::size_t fragment_count,
+                              const LibraryModel& library, const std::vector<HaplotypeCandidate>& candidates,
+                              std::size_t threads, const std::vector<LibraryModel>& audit_libraries,
+                              FragmentScoringResult& result, bool prepared_library_terms = false) {
+    const auto combination_mark = std::chrono::steady_clock::now();
+    const std::vector<AuditCombination> audits = audit_combinations(audit_libraries);
+    // I2-F: the run's library prepared once (validated by audit_combinations), or the scalar reference per term
+    // (prepared only when some term will be combined, so validation happens exactly where the scalar path would first
+    // validate: never for an empty candidate set)
+    const std::vector<AuditCombination> main_terms = prepared_library_terms && !candidates.empty()
+                                                         ? audit_combinations({library})
+                                                         : std::vector<AuditCombination>{};
+    const AuditCombination* main = main_terms.empty() ? nullptr : &main_terms.front();
+    result.audit_scores.assign(audits.size(), std::vector<DiplotypeScore>(candidates.size()));
+    const auto combine_range = [&](std::size_t begin, std::size_t end) {
+        for (std::size_t c = begin; c < end && !audits.empty(); ++c) {
+            const std::size_t a = candidates[c].first;
+            const std::size_t b = candidates[c].second;
+            combine_with_audits(mass_column[a], mass_column[b], background, fragment_count,
+                                exposure[a] + exposure[b], library, audits, result.scores[c], result.audit_scores, c, main);
+        }
+        for (std::size_t c = begin; c < end && audits.empty(); ++c) {
+            const std::size_t a = candidates[c].first;
+            const std::size_t b = candidates[c].second;
+            DiplotypeScore& score = result.scores[c];
+            score.exposure_term = main != nullptr ? -(main->exposure_scale * (exposure[a] + exposure[b]))
+                                                  : -expected_signal_fragments(exposure[a] + exposure[b], library);
+            score.absolute_term_sum = std::abs(score.exposure_term);
+            double fragment_term = 0.0;
+            for (std::size_t f = 0; f < fragment_count; ++f) {
+                const double combined = log_add_exp(mass_column[a][f], mass_column[b][f]);
+                if (combined != kNegInf) ++score.fragments_with_mass;
+                const double contribution = main != nullptr ? prepared_contribution(*main, combined, background[f])
+                                                            : log_fragment_contribution(combined, background[f], library);
+                fragment_term += contribution;
+                score.absolute_term_sum += std::abs(contribution);
+            }
+            score.fragment_term = fragment_term;
+            score.log_likelihood = score.exposure_term + fragment_term;
+        }
+    };
+
+    const std::size_t combination_threads =
+        candidates.empty() ? 1
+                           : std::max<std::size_t>(1, std::min(threads, candidates.size()));
+    result.threads_used_combination = combination_threads;
+    result.candidate_fragment_evaluations =
+        static_cast<std::uint64_t>(candidates.size()) * static_cast<std::uint64_t>(fragment_count);
+
+    if (combination_threads <= 1) {
+        const ActiveWorker active;
+        combine_range(0, candidates.size());
+    } else {
+        const std::size_t span = (candidates.size() + combination_threads - 1) / combination_threads;
+        std::vector<std::exception_ptr> failures(combination_threads);
+        std::vector<std::thread> workers;
+        workers.reserve(combination_threads);
+        for (std::size_t t = 0; t < combination_threads; ++t) {
+            const std::size_t begin = std::min(t * span, candidates.size());
+            const std::size_t end = std::min(begin + span, candidates.size());
+            workers.emplace_back([&, t, begin, end]() {
+                const ActiveWorker active;
+                try {
+                    combine_range(begin, end);
+                } catch (...) {
+                    failures[t] = std::current_exception();
+                }
+            });
+        }
+        for (std::thread& worker : workers) worker.join();
+        for (const std::exception_ptr& failure : failures) {
+            if (failure) std::rethrow_exception(failure);
+        }
+    }
+    if (main != nullptr) {
+        std::uint64_t with_mass = 0;
+        for (const DiplotypeScore& score : result.scores) with_mass += score.fragments_with_mass;
+        note_prepared_combination(candidates.size(), fragment_count, with_mass, *main);
+    }
+    result.seconds_diploid_combination =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - combination_mark).count();
+}
 
 FragmentScoringResult score_diplotypes(
     const InternedHaplotypes& haplotypes,
@@ -5386,49 +6708,11 @@ FragmentScoringResult score_diplotypes(
     };
     std::unique_ptr<UnionPrefilterCache> prefilter_cache;
     if (options.union_prefilter_cache_bytes > 0) {
-        if (options.max_union_cached_prefilters_consumed == 0) {
-            throw std::invalid_argument("union prefilter reuse needs a positive consumption cap");
-        }
-        prefilter_cache = std::make_unique<UnionPrefilterCache>();
-        std::size_t r = 0;
-        for (const auto* forms : {&prepared.forward_forms, &prepared.reverse_forms}) {
-            for (const ReadForm& form : *forms) {
-                if (r == 0) r = form.bases.size();
-                if (form.bases.size() != r) throw std::invalid_argument("union prefilter reuse needs one read length");
-            }
-        }
-        prefilter_cache->read_length = r;
-        prefilter_cache->window_length = r + library.max_gap_bp;
-        std::uint64_t slots = 1024;
-        while (slots * 2 * sizeof(std::uint64_t) <= options.union_prefilter_cache_bytes) slots *= 2;
-        prefilter_cache->slot_bits = 0;
-        while ((std::uint64_t{1} << prefilter_cache->slot_bits) < slots) ++prefilter_cache->slot_bits;
-        prefilter_cache->slots.reset(new std::atomic<std::uint64_t>[slots]());
-        prefilter_cache->max_held = slots / 2;
-        prefilter_cache->max_consumed = options.max_union_cached_prefilters_consumed;
-        prefilter_cache->publish_batch = std::max<std::uint64_t>(1, options.piece_hit_publish_batch);
+        prefilter_cache = make_union_prefilter_cache(prepared, library, options, result.union_prefilter_cache);
         inputs.prefilter_cache = prefilter_cache.get();
-        UnionPrefilterCacheReport& report = result.union_prefilter_cache;
-        report.active = true;
-        report.budget_bytes = options.union_prefilter_cache_bytes;
-        report.max_consumed = options.max_union_cached_prefilters_consumed;
-        report.read_length = r;
-        report.window_length = r + library.max_gap_bp;
-        report.decision_table_bytes = slots * sizeof(std::uint64_t);
     }
     const auto prefilter_report = [&](UnionPrefilterCacheReport& report) {
-        if (!prefilter_cache) return;
-        report.window_contents = prefilter_cache->next_window.load(std::memory_order_relaxed);
-        report.window_index_bytes = 0;
-        for (UnionPrefilterCache::Shard& shard : prefilter_cache->shards) {
-            report.window_index_bytes += shard.bytes + shard.table.capacity() * sizeof(UnionPrefilterCache::Stored);
-        }
-        report.positions_indexed = prefilter_cache->positions_indexed.load(std::memory_order_relaxed);
-        report.decisions_held = prefilter_cache->held.load(std::memory_order_relaxed);
-        report.decisions_not_retained = prefilter_cache->not_retained.load(std::memory_order_relaxed);
-        report.hits = prefilter_cache->consumed.load(std::memory_order_relaxed);
-        report.misses = prefilter_cache->misses.load(std::memory_order_relaxed);
-        report.worker_seconds_index = static_cast<double>(prefilter_cache->index_nanos.load(std::memory_order_relaxed)) * 1e-9;
+        if (prefilter_cache) fill_union_prefilter_report(*prefilter_cache, report);
     };
 
     const auto note_observed_work = [&]() {
@@ -5490,70 +6774,8 @@ FragmentScoringResult score_diplotypes(
     result.seconds_placement_and_mass =
         std::chrono::duration<double>(std::chrono::steady_clock::now() - placement_mark).count();
 
-    const auto combination_mark = std::chrono::steady_clock::now();
-    const std::vector<AuditCombination> audits = audit_combinations(options.audit_libraries);
-    result.audit_scores.assign(audits.size(), std::vector<DiplotypeScore>(candidates.size()));
-    const auto combine_range = [&](std::size_t begin, std::size_t end) {
-        for (std::size_t c = begin; c < end && !audits.empty(); ++c) {
-            const std::size_t a = candidates[c].first;
-            const std::size_t b = candidates[c].second;
-            combine_with_audits(mass_column[a], mass_column[b], prepared.background_by_fragment, fragments.size(),
-                                exposure[a] + exposure[b], library, audits, result.scores[c], result.audit_scores, c);
-        }
-        for (std::size_t c = begin; c < end && audits.empty(); ++c) {
-            const std::size_t a = candidates[c].first;
-            const std::size_t b = candidates[c].second;
-            DiplotypeScore& score = result.scores[c];
-            score.exposure_term = -expected_signal_fragments(exposure[a] + exposure[b], library);
-            score.absolute_term_sum = std::abs(score.exposure_term);
-            double fragment_term = 0.0;
-            for (std::size_t f = 0; f < fragments.size(); ++f) {
-                const double combined = log_add_exp(mass_column[a][f], mass_column[b][f]);
-                if (combined != kNegInf) ++score.fragments_with_mass;
-                const double contribution = log_fragment_contribution(
-                    combined, prepared.background_by_fragment[f], library);
-                fragment_term += contribution;
-                score.absolute_term_sum += std::abs(contribution);
-            }
-            score.fragment_term = fragment_term;
-            score.log_likelihood = score.exposure_term + fragment_term;
-        }
-    };
-
-    const std::size_t combination_threads =
-        candidates.empty() ? 1
-                           : std::max<std::size_t>(1, std::min(options.threads, candidates.size()));
-    result.threads_used_combination = combination_threads;
-    result.candidate_fragment_evaluations =
-        static_cast<std::uint64_t>(candidates.size()) * static_cast<std::uint64_t>(fragments.size());
-
-    if (combination_threads <= 1) {
-        const ActiveWorker active;
-        combine_range(0, candidates.size());
-    } else {
-        const std::size_t span = (candidates.size() + combination_threads - 1) / combination_threads;
-        std::vector<std::exception_ptr> failures(combination_threads);
-        std::vector<std::thread> workers;
-        workers.reserve(combination_threads);
-        for (std::size_t t = 0; t < combination_threads; ++t) {
-            const std::size_t begin = std::min(t * span, candidates.size());
-            const std::size_t end = std::min(begin + span, candidates.size());
-            workers.emplace_back([&, t, begin, end]() {
-                const ActiveWorker active;
-                try {
-                    combine_range(begin, end);
-                } catch (...) {
-                    failures[t] = std::current_exception();
-                }
-            });
-        }
-        for (std::thread& worker : workers) worker.join();
-        for (const std::exception_ptr& failure : failures) {
-            if (failure) std::rethrow_exception(failure);
-        }
-    }
-    result.seconds_diploid_combination =
-        std::chrono::duration<double>(std::chrono::steady_clock::now() - combination_mark).count();
+    combine_candidate_scores(mass_column, exposure, prepared.background_by_fragment, fragments.size(), library,
+                             candidates, options.threads, options.audit_libraries, result, options.prepared_library_terms);
 
     // Flattened to the documented row-major layout. Column storage is an internal choice about what
     // can be appended; the published matrix keeps its shape.
@@ -6530,6 +7752,7 @@ struct PreparedScoringContext::State {
     // -- grew with it: measured at 26 MiB per round on NA20509 10x, the only accounted item that grew.
     std::vector<std::size_t> free_slots;
     std::size_t slots_created = 0;
+    std::uint64_t full_placements = 0;   // I2-D: full haplotype placements performed (measurement and gates)
 
     // ---- window enumeration across workers. Declared after the scratch and caches it writes into.
     struct EnumerationPartition {
@@ -6542,6 +7765,57 @@ struct PreparedScoringContext::State {
     std::vector<EnumerationPartition> partitions;
     std::unique_ptr<EnumerationPool> pool;
     ParallelEnumerationStats parallel_stats;
+
+    // ---- I2-B (experimental): round-local fine window discovery. Stores live in the enumeration workers' scratch.
+    bool fine_enabled = false, fine_round = false;
+    std::uint64_t fine_budget = 0, fine_served_cap = 0;
+    std::atomic<std::uint64_t> fine_served{0};
+    FineWindowReport fine_report;
+    std::uint64_t window_enumerations = 0;
+    std::size_t longest_read() const {
+        std::size_t longest = 0;
+        for (const ReadPair& f : fragments) longest = std::max({longest, f.first.bases.size(), f.second.bases.size()});
+        return longest;
+    }
+    void configure_fine(WindowFineStore& store, std::uint64_t budget_share) {
+        store.max_read = longest_read();
+        store.gap = library.max_gap_bp;
+        store.window = store.max_read + 2 * store.gap;
+        store.budget = budget_share;
+        store.served_cap = fine_served_cap;
+        store.served_total = &fine_served;
+    }
+    std::vector<WindowFineStore*> fine_stores() {
+        std::vector<WindowFineStore*> out{&window_scratch.fine};
+        for (EnumerationPartition& p : partitions) out.push_back(&p.scratch.fine);
+        return out;
+    }
+    // A round's end (completed or not): tallies folded into the report, every store released.
+    void end_fine_round() {
+        std::uint64_t round_peak = 0, round_held = 0, round_temporary = 0;
+        for (WindowFineStore* st : fine_stores()) {
+            round_held += st->peak_held;
+            round_temporary += st->peak_temporary;
+            st->peak_held = 0;
+            st->peak_temporary = 0;
+            fine_report.worker_windows += st->windows;
+            fine_report.fallback_windows += st->fallback_windows;
+            fine_report.units_discovered += st->units_discovered;
+            fine_report.units_served += st->units_served;
+            fine_report.units_not_retained += st->units_not_retained;
+            fine_report.placements_discovered += st->placements_discovered;
+            fine_report.placements_served += st->placements_served;
+            fine_report.hash_collisions += st->hash_collisions;
+            round_peak += st->peak_bytes;
+            st->windows = st->fallback_windows = st->units_discovered = st->units_served = st->units_not_retained = 0;
+            st->placements_discovered = st->placements_served = st->hash_collisions = st->peak_bytes = 0;
+            st->release();
+        }
+        fine_report.round_peak_bytes = std::max(fine_report.round_peak_bytes, round_peak);
+        fine_report.round_peak_held_bytes = std::max(fine_report.round_peak_held_bytes, round_held);
+        fine_report.round_peak_temporary_bytes = std::max(fine_report.round_peak_temporary_bytes, round_temporary);
+        fine_round = false;
+    }
 
     std::size_t enumeration_workers() const {
         return std::max<std::size_t>(1, std::min(options.threads, fragments.size()));
@@ -6626,8 +7900,21 @@ void PreparedScoringContext::State::enumerate_window(const LocalWindow& window, 
     const std::size_t workers = enumeration_workers();
     const std::size_t band = options.mismatch_band;
     parallel_stats.workers = workers;
+    ++window_enumerations;
+    // I2-B: a store is active only for the windows of an open round, and only during this call
+    struct Deactivate {
+        std::vector<WindowFineStore*> stores;
+        ~Deactivate() {
+            for (WindowFineStore* s : stores) s->active = false;
+        }
+    } deactivate;
     if (workers <= 1) {
         const ActiveWorker active;
+        if (fine_round) {
+            if (out.fine.budget == 0) configure_fine(out.fine, fine_budget);
+            out.fine.active = true;
+            deactivate.stores.push_back(&out.fine);
+        }
         enumerate_window_origins(prepared, fragments, library, options, band, window, shared_budget, counters,
                                  cache_work, out);
         return;
@@ -6659,6 +7946,13 @@ void PreparedScoringContext::State::enumerate_window(const LocalWindow& window, 
         }
     }
     if (!pool || pool->size() != workers) pool = std::make_unique<EnumerationPool>(workers);
+    if (fine_round) {
+        for (EnumerationPartition& p : partitions) {
+            if (p.scratch.fine.budget == 0) configure_fine(p.scratch.fine, fine_budget / workers);
+            p.scratch.fine.active = true;
+            deactivate.stores.push_back(&p.scratch.fine);
+        }
+    }
 
     struct Outcome {
         FragmentScoringCounters counters;
@@ -6827,6 +8121,10 @@ PreparedScoringContext::PreparedScoringContext(std::vector<ReadPair> fragments,
     state_->cache_pinned = true;
     scoring_detail::emission_cache_pinned().store(false, std::memory_order_relaxed);
     begin_emission_cache(state_->options.emission_cache_bytes);
+    // I2-K (experimental): the union pass's emission results, under an exactly compatible context only
+    adopt_emission_cache(state_->options.emission_handoff_in, state_->library, state_->options.mismatch_band,
+                         state_->options.gap_recursion_backend, state_->options.emission_cache_bytes);
+    state_->options.emission_handoff_in = nullptr;
     scoring_detail::emission_cache_pinned().store(true, std::memory_order_relaxed);
 }
 
@@ -6837,10 +8135,13 @@ PreparedScoringContext::~PreparedScoringContext() {
     }
 }
 
+std::uint64_t PreparedScoringContext::full_placement_count() const { return state_->full_placements; }
+
 std::vector<std::size_t> PreparedScoringContext::add_haplotypes(
     const std::vector<std::string>& sequences,
     IncrementalBatchReport* report,
-    bool reuse_released_slots) {
+    bool reuse_released_slots,
+    bool retain_censuses) {
     State& state = *state_;
     state.require_usable();
     const std::size_t before = state.sequences.size();
@@ -6907,6 +8208,13 @@ std::vector<std::size_t> PreparedScoringContext::add_haplotypes(
     EmissionCacheCounters batch_cache;
     ScorerMemoryAccounts batch_memory;
     std::size_t threads_used = 1;
+    // I2-D: censuses of the slots this batch places, filled by the same placement pass; owned by the context only once
+    // the batch's work has been accepted
+    std::map<std::size_t, HaploidOriginCensus> fresh_censuses;
+    CensusCapture capture;
+    if (retain_censuses) {
+        for (const std::size_t h : placed) capture.wanted.emplace(h, &fresh_censuses[h]);
+    }
     const auto mark = std::chrono::steady_clock::now();
     if (added != 0) {
         PlacementInputs inputs;
@@ -6923,7 +8231,7 @@ std::vector<std::size_t> PreparedScoringContext::add_haplotypes(
         try {
             threads_used = run_placement(inputs, contiguous ? before : 0, contiguous ? after : placed.size(),
                                          state.options.threads, false, state.budget, state.mass_column, batch,
-                                         batch_memory, batch_cache, none);
+                                         batch_memory, batch_cache, none, retain_censuses ? &capture : nullptr);
         } catch (const ResourceExhausted&) {
             // A refusal invalidates the WHOLE search, not this batch: columns already retained were
             // computed under a budget that has now been exceeded, and ranking from them would present
@@ -6933,6 +8241,7 @@ std::vector<std::size_t> PreparedScoringContext::add_haplotypes(
         }
     }
     const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - mark).count();
+    state.full_placements += added;
 
     // Cumulative first, because the caps bound the whole search rather than any one batch.
     state.cumulative.candidate_bases_scanned += batch.candidate_bases_scanned;
@@ -6959,6 +8268,26 @@ std::vector<std::size_t> PreparedScoringContext::add_haplotypes(
     } catch (const ResourceExhausted&) {
         state.refused = true;
         throw;
+    }
+    if (retain_censuses) {
+        // I2-D: a slot this batch did not place (already held) is censused the existing way unless it already holds one.
+        // I2-E fix: those fallback placements are part of the batch, so they run BEFORE the captured censuses are
+        // published; if one is refused, every census this batch produced -- captured or fallback -- is withdrawn, and the
+        // context stays refused (retain_census marked it). Nothing from a failed batch is ever owned by the context.
+        std::vector<std::size_t> fallback_done;
+        try {
+            for (const std::size_t h : out) {
+                if (state.censuses.count(h) != 0 || fresh_censuses.count(h) != 0) continue;
+                if (std::find(fallback_done.begin(), fallback_done.end(), h) != fallback_done.end()) continue;
+                retain_census(h);
+                fallback_done.push_back(h);
+            }
+        } catch (...) {
+            for (const std::size_t h : fallback_done) state.censuses.erase(h);
+            state.refused = true;
+            throw;
+        }
+        for (auto& [h, census] : fresh_censuses) state.censuses.emplace(h, std::move(census));
     }
 
     if (report != nullptr) {
@@ -7012,6 +8341,11 @@ FragmentScoringResult PreparedScoringContext::score_candidates(
     const std::vector<ReadPair>& fragments = state.fragments;
     const auto combination_mark = std::chrono::steady_clock::now();
     const std::vector<AuditCombination> audits = audit_combinations(state.options.audit_libraries);
+    // I2-F: the run's library prepared once (validated by audit_combinations), or the scalar reference per term
+    const std::vector<AuditCombination> main_terms = state.options.prepared_library_terms && !candidates.empty()
+                                                         ? audit_combinations({state.library})
+                                                         : std::vector<AuditCombination>{};
+    const AuditCombination* main = main_terms.empty() ? nullptr : &main_terms.front();
     result.audit_scores.assign(audits.size(), std::vector<DiplotypeScore>(candidates.size()));
     const auto combine_range = [&](std::size_t begin, std::size_t end) {
         for (std::size_t c = begin; c < end && !audits.empty(); ++c) {
@@ -7019,22 +8353,25 @@ FragmentScoringResult PreparedScoringContext::score_candidates(
             const std::size_t b = candidates[c].second;
             combine_with_audits(state.mass_column[a], state.mass_column[b], state.prepared.background_by_fragment,
                                 fragments.size(), state.exposure[a] + state.exposure[b], state.library, audits,
-                                result.scores[c], result.audit_scores, c);
+                                result.scores[c], result.audit_scores, c, main);
         }
         for (std::size_t c = begin; c < end && audits.empty(); ++c) {
             const std::size_t a = candidates[c].first;
             const std::size_t b = candidates[c].second;
             DiplotypeScore& score = result.scores[c];
             score.exposure_term =
-                -expected_signal_fragments(state.exposure[a] + state.exposure[b], state.library);
+                main != nullptr ? -(main->exposure_scale * (state.exposure[a] + state.exposure[b]))
+                                : -expected_signal_fragments(state.exposure[a] + state.exposure[b], state.library);
             score.absolute_term_sum = std::abs(score.exposure_term);
             double fragment_term = 0.0;
             for (std::size_t f = 0; f < fragments.size(); ++f) {
                 const double combined =
                     log_add_exp(state.mass_column[a][f], state.mass_column[b][f]);
                 if (combined != kNegInf) ++score.fragments_with_mass;
-                const double contribution = log_fragment_contribution(
-                    combined, state.prepared.background_by_fragment[f], state.library);
+                const double contribution =
+                    main != nullptr ? prepared_contribution(*main, combined, state.prepared.background_by_fragment[f])
+                                    : log_fragment_contribution(combined, state.prepared.background_by_fragment[f],
+                                                                state.library);
                 fragment_term += contribution;
                 score.absolute_term_sum += std::abs(contribution);
             }
@@ -7073,6 +8410,11 @@ FragmentScoringResult PreparedScoringContext::score_candidates(
         for (const std::exception_ptr& failure : failures) {
             if (failure) std::rethrow_exception(failure);
         }
+    }
+    if (main != nullptr) {
+        std::uint64_t with_mass = 0;
+        for (const DiplotypeScore& score : result.scores) with_mass += score.fragments_with_mass;
+        note_prepared_combination(candidates.size(), fragments.size(), with_mass, *main);
     }
     result.seconds_diploid_combination =
         std::chrono::duration<double>(std::chrono::steady_clock::now() - combination_mark).count();
@@ -7121,6 +8463,32 @@ const EmissionCacheCounters& PreparedScoringContext::cumulative_emission_cache()
 }
 
 bool PreparedScoringContext::refused() const { return state_->refused; }
+
+void PreparedScoringContext::enable_fine_window_discovery(std::size_t budget_bytes, std::uint64_t max_served_placements) {
+    if (budget_bytes == 0 || max_served_placements == 0) {
+        throw std::invalid_argument("fine window discovery needs a positive store budget and a positive served-placement cap");
+    }
+    State& state = *state_;
+    state.fine_enabled = true;
+    state.fine_budget = budget_bytes;
+    state.fine_served_cap = max_served_placements;
+    state.fine_report.enabled = true;
+    state.fine_report.budget_bytes = budget_bytes;
+    state.fine_report.served_cap = max_served_placements;
+}
+
+FineWindowReport PreparedScoringContext::fine_window_report() const {
+    const State& state = *state_;
+    FineWindowReport r = state.fine_report;
+    r.enumerations = state.window_enumerations;
+    r.seconds_rows = state.window_scratch.seconds_rows;
+    r.seconds_pairing = state.window_scratch.seconds_pairing;
+    for (const auto& p : state.partitions) {
+        r.seconds_rows += p.scratch.seconds_rows;
+        r.seconds_pairing += p.scratch.seconds_pairing;
+    }
+    return r;
+}
 
 void PreparedScoringContext::enable_origin_cache_path(bool enabled) {
     state_->require_usable();
@@ -7290,6 +8658,18 @@ std::vector<std::size_t> PreparedScoringContext::add_repaired_haplotypes(
     });
     std::vector<std::size_t> slots(requests.size(), 0);
     if (works != nullptr) works->assign(requests.size(), BlockDeltaWork{});
+    // I2-B: one round, one set of fine stores, released when the round ends however it ends
+    struct FineRound {
+        State* state = nullptr;
+        ~FineRound() {
+            if (state != nullptr) state->end_fine_round();
+        }
+    } fine_round;
+    if (state.fine_enabled) {
+        state.fine_round = true;
+        ++state.fine_report.rounds;
+        fine_round.state = &state;
+    }
     for (const std::size_t i : order) {
         const RepairRequest& r = requests[i];
         slots[i] = add_repaired_haplotype(r.incumbent, r.block_begin, r.block_end, r.replacement,
@@ -7800,6 +9180,9 @@ ContextMemoryAccount PreparedScoringContext::memory_account() const {
                static_cast<std::uint64_t>(w.accumulators.capacity()) * sizeof(OriginAccumulator) +
                w.accepted.capacity() +
                static_cast<std::uint64_t>(w.origins.capacity()) * sizeof(HaploidOrigin);
+        // I2-B: live fine stores (held + scratch, capacity); zero outside a round, since a round releases them
+        cap += w.fine.account_bytes();
+        for (const auto& p : state.partitions) cap += p.scratch.fine.account_bytes();
         a.window_scratch_capacity = cap;
     }
     {
@@ -7924,6 +9307,60 @@ void PreparedScoringContext::begin_transient_round() {
     state.transient_watermark = state.sequences.size();
 }
 
+std::vector<std::size_t> PreparedScoringContext::add_haplotypes_with_censuses(const std::vector<std::string>& sequences) {
+    State& state = *state_;
+    state.require_usable();
+    const std::size_t before = state.sequences.size();
+    std::vector<std::size_t> out;
+    for (const std::string& sequence : sequences) {
+        const std::uint64_t hash = hash_materialised(sequence);
+        const std::size_t slot = state.sequences.size();
+        state.hash_by_slot.push_back(hash);
+        state.sequences.push_back(sequence);
+        state.reversed.emplace_back(sequence.rbegin(), sequence.rend());
+        state.by_hash.emplace(hash, slot);
+        ++state.slots_created;
+        out.push_back(slot);
+    }
+    const std::size_t after = state.sequences.size();
+    state.mass_column.resize(after, std::vector<double>(state.fragments.size(), kNegInf));
+    state.exposure.resize(after, 0.0);
+    for (std::size_t h = before; h < after; ++h) {
+        state.exposure[h] = exposure_for_length(state.sequences[h].size(), state.fragments.size(),
+                                                state.prepared.fragments_by_floor, state.library_insert);
+    }
+    std::map<std::size_t, HaploidOriginCensus> fresh;
+    CensusCapture capture;
+    for (std::size_t h = before; h < after; ++h) capture.wanted.emplace(h, &fresh[h]);
+    PlacementInputs inputs;
+    inputs.prepared = &state.prepared;
+    inputs.fragments = &state.fragments;
+    inputs.library = &state.library;
+    inputs.library_insert = &state.library_insert;
+    inputs.options = &state.options;
+    inputs.sequences = &state.sequences;
+    inputs.reversed = &state.reversed;
+    inputs.band = state.options.mismatch_band;
+    FragmentScoringCounters counters;
+    EmissionCacheCounters cache_work;
+    ScorerMemoryAccounts memory;
+    OriginRecording none;
+    try {
+        run_placement(inputs, before, after, state.options.threads, false, state.budget, state.mass_column, counters,
+                      memory, cache_work, none, &capture);
+    } catch (const ResourceExhausted&) {
+        state.refused = true;
+        throw;
+    }
+    for (auto& [h, census] : fresh) state.censuses.emplace(h, std::move(census));
+    return out;
+}
+
+const HaploidOriginCensus* PreparedScoringContext::census_view(std::size_t haplotype) const {
+    const auto found = state_->censuses.find(haplotype);
+    return found == state_->censuses.end() ? nullptr : &found->second;
+}
+
 bool PreparedScoringContext::holds_census(std::size_t haplotype) const {
     return state_->censuses.count(haplotype) != 0;
 }
@@ -7954,6 +9391,7 @@ void PreparedScoringContext::retain_census(std::size_t haplotype) {
     ScorerMemoryAccounts memory;
     EmissionCacheCounters cache_work;
     std::vector<std::vector<double>> scratch = state.mass_column;
+    ++state.full_placements;
     try {
         place_haplotype_range(inputs, haplotype, haplotype + 1, 1, state.budget, scratch, counters,
                               memory, cache_work, none, &capture);
@@ -8889,19 +10327,52 @@ void PreparedScoringContext::release_transient(const std::vector<std::size_t>& k
             state.segments.count(slot) == 0) {
             continue;
         }
-        // Safe because cache keys OWN their bytes now: entries this haplotype produced keep serving
-        // after it is gone. That is what removing the freeze bought.
-        const auto range = state.by_hash.equal_range(state.hash_by_slot[slot]);
-        for (auto it = range.first; it != range.second; ++it) {
-            if (it->second == slot) { state.by_hash.erase(it); break; }
-        }
-        state.segments.erase(slot);
-        std::string().swap(state.sequences[slot]);
-        std::string().swap(state.reversed[slot]);
-        std::vector<double>().swap(state.mass_column[slot]);
-        state.censuses.erase(slot);
-        state.free_slots.push_back(slot);
+        release_slot_storage(slot);
     }
+}
+
+void PreparedScoringContext::release_slot_storage(std::size_t slot) {
+    State& state = *state_;
+    // Safe because cache keys OWN their bytes now: entries this haplotype produced keep serving
+    // after it is gone. That is what removing the freeze bought.
+    const auto range = state.by_hash.equal_range(state.hash_by_slot[slot]);
+    for (auto it = range.first; it != range.second; ++it) {
+        if (it->second == slot) { state.by_hash.erase(it); break; }
+    }
+    state.segments.erase(slot);
+    std::string().swap(state.sequences[slot]);
+    std::string().swap(state.reversed[slot]);
+    std::vector<double>().swap(state.mass_column[slot]);
+    state.censuses.erase(slot);
+    state.free_slots.push_back(slot);
+}
+
+std::vector<std::size_t> PreparedScoringContext::live_transient_slots() const {
+    const State& state = *state_;
+    std::vector<std::size_t> out;
+    for (std::size_t slot = state.transient_watermark; slot < state.sequences.size(); ++slot) {
+        if (state.sequences[slot].empty() && state.mass_column[slot].empty() && state.segments.count(slot) == 0) continue;
+        out.push_back(slot);
+    }
+    return out;
+}
+
+void PreparedScoringContext::release_slots(const std::vector<std::size_t>& slots) {
+    State& state = *state_;
+    const std::set<std::size_t> named(slots.begin(), slots.end());
+    for (const std::size_t slot : named) {
+        if (slot < state.transient_watermark || slot >= state.sequences.size() ||
+            (state.sequences[slot].empty() && state.mass_column[slot].empty() && state.segments.count(slot) == 0)) {
+            throw std::invalid_argument("release_slots: a named slot is not a live transient haplotype");
+        }
+    }
+    for (auto it = state.groups.begin(); it != state.groups.end();) {
+        it = named.count(it->first.incumbent) != 0 ? state.groups.erase(it) : std::next(it);
+    }
+    for (auto it = state.full_aggregates.begin(); it != state.full_aggregates.end();) {
+        it = named.count(it->first.first) != 0 ? state.full_aggregates.erase(it) : std::next(it);
+    }
+    for (const std::size_t slot : named) release_slot_storage(slot);
 }
 
 std::uint64_t PreparedScoringContext::transient_payload_bytes() const {
@@ -9051,6 +10522,1394 @@ CertifiedRanking certify_scored_ranking(
         result.winner_set = inseparable;
         result.certified_gap = 0.0;
     }
+    return result;
+}
+
+// ---- EXPERIMENTAL (I1): shared-content placement index (see the header) ----------------------------------------
+namespace {
+}  // namespace
+
+struct ContentPlacementIndex::State {
+    std::size_t max_read = 0, gap = 0, window = 0;
+    std::deque<IndexUnit> units;
+    std::unordered_multimap<std::uint64_t, std::uint32_t> by_hash;
+    std::vector<std::uint32_t> lengths;
+    std::vector<std::vector<IndexOccurrence>> occurrences[2];   // [strand][slot]
+    ContentIndexReport report;
+    // I1.2: segment entities -- a distinct interior segment as its forward and reverse interior units -- and their
+    // occurrences per slot (forward offset, ascending), for interior-origin reuse.
+    struct Entity {
+        std::uint32_t forward_unit = 0, reverse_unit = 0, length = 0, occurrences = 0;
+    };
+    std::vector<Entity> entities;
+    std::unordered_map<std::uint32_t, std::uint32_t> entity_of_forward_unit;
+    std::vector<std::vector<std::pair<std::uint32_t, std::uint32_t>>> entity_occurrences;   // [slot] -> (entity, offset)
+    // I1.4: fine discovery. Each coarse interior unit is discovered through its content-defined fine units (fine unit,
+    // offset of its text in the segment), and its own placement rows are reconstructed from theirs.
+    bool fine_discovery = false;
+    std::unordered_map<std::uint32_t, std::vector<std::pair<std::uint32_t, std::uint32_t>>> fine_of_coarse;
+};
+
+ContentPlacementIndex::ContentPlacementIndex(std::size_t max_read_bp, std::size_t max_gap_bp, bool fine_discovery)
+    : state_(std::make_unique<State>()) {
+    if (max_read_bp == 0) throw std::invalid_argument("the content index needs a positive maximum read length");
+    state_->fine_discovery = fine_discovery;
+    state_->max_read = max_read_bp;
+    state_->gap = max_gap_bp;
+    state_->window = max_read_bp + 2 * max_gap_bp;
+}
+ContentPlacementIndex::~ContentPlacementIndex() = default;
+void set_content_index_hash_collapse(bool collapse) { content_index_hash_collapse().store(collapse); }
+void set_fine_window_row_check(bool on) { fine_window_row_check().store(on); }
+void set_fine_window_mutation(int mutation) { fine_window_mutation().store(mutation); }
+std::size_t ContentPlacementIndex::haplotype_count() const { return state_->lengths.size(); }
+std::size_t ContentPlacementIndex::unit_count() const { return state_->units.size(); }
+ContentIndexReport ContentPlacementIndex::report() const { return state_->report; }
+
+std::size_t ContentPlacementIndex::add_haplotype(const std::string& bases, const std::vector<std::uint32_t>& segment_lengths) {
+    State& st = *state_;
+    const auto mark = std::chrono::steady_clock::now();
+    std::uint64_t sum = 0;
+    for (const std::uint32_t l : segment_lengths) sum += l;
+    if (sum != bases.size()) throw std::invalid_argument("content index: segment lengths must sum to the haplotype length");
+    const std::size_t slot = st.lengths.size();
+    st.lengths.push_back(static_cast<std::uint32_t>(bases.size()));
+    const std::size_t n = bases.size();
+    const auto intern_unit = [&](IndexUnit&& unit, bool& fresh) {
+        fresh = false;
+        const std::uint64_t key = unit_hash(unit);
+        const auto range = st.by_hash.equal_range(key);
+        for (auto it = range.first; it != range.second; ++it) {
+            if (same_unit(st.units[it->second], unit)) return it->second;
+            ++st.report.hash_collisions;
+        }
+        fresh = true;
+        const std::uint32_t id = static_cast<std::uint32_t>(st.units.size());
+        if (unit.fine) {
+            ++st.report.fine_units;
+            st.report.fine_unit_bytes += unit.bytes.size();
+            st.report.fine_core_bytes += unit.core_hi - unit.core_lo;
+        } else {
+            (unit.interior ? st.report.interior_units : st.report.window_units) += 1;
+            (unit.interior ? st.report.coarse_interior_bytes : st.report.window_bytes) += unit.bytes.size();
+        }
+        st.report.unit_bytes += unit.bytes.size();
+        st.units.push_back(std::move(unit));
+        st.by_hash.emplace(key, id);
+        return id;
+    };
+    // I1.4: a fresh coarse interior unit's fine units: each content-defined core with g bytes before it and
+    // max_read + g after it (clipped to the segment), so every owned start's dependency span [s - g, s + L + g) that
+    // lies in the segment lies in the fine text.
+    const auto partition = [&](std::uint32_t coarse) {
+        const std::string bytes = st.units[coarse].bytes;
+        const std::uint8_t strand = st.units[coarse].strand;
+        std::vector<std::pair<std::uint32_t, std::uint32_t>> pieces;
+        for_each_fine_piece(bytes, strand, st.gap, st.max_read, [&](IndexUnit&& f, std::uint32_t t0) {
+            bool fresh = false;
+            pieces.push_back({intern_unit(std::move(f), fresh), t0});
+        });
+        st.report.fine_occurrences += pieces.size();
+        st.fine_of_coarse[coarse] = std::move(pieces);
+    };
+    const auto intern = [&](IndexUnit&& unit) {
+        const bool interior = unit.interior;
+        bool fresh = false;
+        const std::uint32_t id = intern_unit(std::move(unit), fresh);
+        if (fresh && interior && st.fine_discovery) partition(id);
+        return id;
+    };
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> entity_occ;
+    for (std::uint8_t strand = 0; strand < 2; ++strand) {
+        const std::string text = strand == 0 ? bases : std::string(bases.rbegin(), bases.rend());
+        std::vector<std::uint32_t> lengths = segment_lengths;
+        if (strand == 1) std::reverse(lengths.begin(), lengths.end());
+        std::vector<IndexOccurrence> occ;
+        std::vector<std::size_t> cuts{0};
+        std::size_t at = 0;
+        for (const std::uint32_t l : lengths) {
+            // an interior can keep a start only when the segment holds g + 1 + g bytes; shorter ones are covered by windows
+            if (l > 2 * st.gap) {
+                IndexUnit u;
+                u.strand = strand;
+                u.interior = true;
+                u.bytes = text.substr(at, l);
+                const std::string forward_bytes = strand == 0 ? u.bytes : std::string();
+                const std::uint32_t id = intern(std::move(u));
+                occ.push_back({id, static_cast<std::uint32_t>(at)});
+                ++st.report.segment_occurrences;
+                if (strand == 0) {
+                    // the segment's reverse interior unit: the same key the strand-1 pass interns, so the same id
+                    IndexUnit r;
+                    r.strand = 1;
+                    r.interior = true;
+                    r.bytes.assign(forward_bytes.rbegin(), forward_bytes.rend());
+                    const std::uint32_t rid = intern(std::move(r));
+                    auto [it, fresh] = st.entity_of_forward_unit.emplace(id, static_cast<std::uint32_t>(st.entities.size()));
+                    if (fresh) st.entities.push_back({id, rid, l, 0});
+                    ++st.entities[it->second].occurrences;
+                    entity_occ.emplace_back(it->second, static_cast<std::uint32_t>(at));
+                }
+            }
+            at += l;
+            cuts.push_back(at);
+        }
+        cuts.push_back(n);
+        std::sort(cuts.begin(), cuts.end());
+        cuts.erase(std::unique(cuts.begin(), cuts.end()), cuts.end());
+        for (const std::size_t b : cuts) {
+            std::size_t lo = 0;
+            IndexUnit u = boundary_window_unit(text, strand, b, st.window, lo);
+            occ.push_back({intern(std::move(u)), static_cast<std::uint32_t>(lo)});
+            ++st.report.window_occurrences;
+        }
+        st.report.occurrence_bytes += occ.size() * sizeof(IndexOccurrence);
+        st.occurrences[strand].push_back(std::move(occ));
+    }
+    st.entity_occurrences.push_back(std::move(entity_occ));
+    ++st.report.haplotypes;
+    st.report.seconds_registration += std::chrono::duration<double>(std::chrono::steady_clock::now() - mark).count();
+    return slot;
+}
+
+struct ContentIndexBatch::State {
+    const ContentPlacementIndex* index = nullptr;
+    std::vector<ReadPair> fragments;
+    LibraryModel library;
+    FragmentScoringOptions options;
+    DiscreteInsertDistribution library_insert;
+    PreparedFragmentSet prepared;
+    std::vector<std::vector<StoredPlacement>> placements;   // per unit, sorted by (form, start, consumed)
+    std::size_t evaluated = 0;
+    ContentBatchReport report;
+    // I1.1: the exact prefilter-decision cache, owned by this read batch and kept across discover() calls
+    std::unique_ptr<UnionPrefilterCache> prefilter;
+    // I1.2: interior-origin aggregates, one per admitted segment entity, owned by this batch (built from its own
+    // verified unit placements); entity_entry: -1 not built, -2 declined (budget), -3 ineligible, else the entry index.
+    std::deque<UnionOriginEntry> origin_entries;
+    std::vector<long> entity_entry;
+    std::uint64_t origin_held = 0;
+    std::size_t zone_read = 0;   // R: the batch's longest read; zones need it
+    // I1.3: completed calculations, retained within this immutable read/library/scoring context (append-only).
+    // A slot's mass column and exposure depend only on its own sequence, the reads, the library and the options --
+    // never on which other slots exist -- so a completed slot is never recomputed. Pair likelihood components (no
+    // priors, normalisers or selections) are kept per unordered slot pair: log_add_exp and the exposure sum are
+    // symmetric, so (a, b) and (b, a) are the same bits.
+    struct SlotAccounting {
+        std::uint64_t expanded = 0, removed = 0, plain_origins = 0, direct = 0, served = 0, classes = 0, zones = 0;
+    };
+    struct PairResult {
+        DiplotypeScore score;
+        std::vector<DiplotypeScore> audits;
+    };
+    std::vector<std::vector<double>> mass_column;
+    std::vector<double> exposure;
+    std::vector<char> completed;
+    std::vector<SlotAccounting> accounting;
+    std::unordered_map<std::uint64_t, PairResult> pairs;
+    bool retain = true;
+    // I2-A: the placement store's declared byte budget (0: none), the one-shot lifecycle, and discovery's executed
+    // seeding work (cumulative), which every score() reports with its own pairing work.
+    std::uint64_t store_budget = 0;
+    bool one_shot = false, sealed = false;
+    FragmentScoringCounters discovery_counters;
+    // I2-C: the placement-store ledger. It covers exactly the per-unit placement rows' ALLOCATED capacity and the
+    // per-unit container's own capacity (the `placements` vector of vectors) -- nothing else: not the index's unit bytes
+    // and occurrence tables, the prepared reads, the prefilter or emission caches, origin aggregates, mass columns, or the
+    // workers' temporary scratch (reported apart). It is a container ledger, not process memory. Exact layout (default):
+    // every growth's REQUESTED capacity is reserved against the budget before the storage is allocated (lock-free,
+    // overflow-checked; a reservation that would cross the budget refuses). Capacity the vector returns beyond its request
+    // is charged right AFTER the allocation exists (and refuses then), so the ledger may briefly trail the allocator by
+    // that excess; none was observed with exact reserves. The tested guarantee: at every observation point the ledger
+    // equals the recounted capacity, and the budget accepts at the exact peak and refuses one byte below it. Rows are
+    // copied into exact-capacity vectors, coarse rows are
+    // built from their known counts, and a one-shot batch releases each fine unit's rows once the last coarse unit using
+    // it is built. Legacy layout (the I2-A behaviour, kept for comparison): rows grow by push_back and the budget charges
+    // occupied rows; the ledger then only measures capacity.
+    bool exact_store = true;
+    // I4-B (EXPERIMENTAL): coarse interior units served as views over their fine pieces (index-owned fine_of_coarse
+    // entries); view_pieces[u] is null for every other unit. Its capacity is charged to the store ledger (metadata).
+    bool fine_views = false;
+    std::vector<const std::vector<std::pair<std::uint32_t, std::uint32_t>>*> view_pieces;
+    std::uint64_t view_table_charged = 0;
+    std::atomic<std::uint64_t> zone_live{0}, zone_peak{0}, zone_total{0};
+    std::atomic<std::uint64_t> store_live{0}, store_peak{0}, store_allocated{0}, store_released{0};
+    std::uint64_t outer_charged = 0;
+    bool reserve_store(std::uint64_t bytes, bool enforce) {
+        std::uint64_t cur = store_live.load(std::memory_order_relaxed);
+        for (;;) {
+            if (cur > std::numeric_limits<std::uint64_t>::max() - bytes) return false;   // overflow
+            if (enforce && store_budget != 0 && (bytes > store_budget || cur > store_budget - bytes)) return false;
+            if (store_live.compare_exchange_weak(cur, cur + bytes, std::memory_order_relaxed)) break;
+        }
+        store_allocated.fetch_add(bytes, std::memory_order_relaxed);
+        const std::uint64_t now = cur + bytes;
+        std::uint64_t peak = store_peak.load(std::memory_order_relaxed);
+        while (now > peak && !store_peak.compare_exchange_weak(peak, now, std::memory_order_relaxed)) {
+        }
+        return true;
+    }
+    void release_store(std::uint64_t bytes) {
+        store_live.fetch_sub(bytes, std::memory_order_relaxed);
+        store_released.fetch_add(bytes, std::memory_order_relaxed);
+    }
+};
+// TEST ONLY: the exact layout charges occupied rows instead of allocated capacity (a negative control the capacity gate
+// must catch).
+std::atomic<bool>& store_charge_rows_only() {
+    static std::atomic<bool> on{false};
+    return on;
+}
+// TEST ONLY: request this many spare slots per stored vector (unused capacity the ledger must charge).
+std::atomic<std::size_t>& store_spare_capacity() {
+    static std::atomic<std::size_t> spare{0};
+    return spare;
+}
+// The capacity a stored vector of n rows is requested with, and what the ledger charges for it before allocation.
+std::uint64_t requested_slots(std::uint64_t n) { return n + store_spare_capacity().load(std::memory_order_relaxed); }
+std::uint64_t charged_bytes(std::uint64_t n) {
+    return (store_charge_rows_only().load(std::memory_order_relaxed) ? n : requested_slots(n)) * sizeof(StoredPlacement);
+}
+void ContentIndexBatch::set_retention(bool retain) { state_->retain = retain; }
+void ContentIndexBatch::set_placement_store_budget(std::size_t bytes) {
+    state_->store_budget = bytes;
+    state_->report.store_budget_bytes = bytes;
+}
+void ContentIndexBatch::set_one_shot(bool one_shot) { state_->one_shot = one_shot; }
+void ContentIndexBatch::set_legacy_store_layout(bool legacy) { state_->exact_store = !legacy; }
+void ContentIndexBatch::set_fine_views(bool on) {
+    state_->fine_views = on;
+    state_->report.evidence_layout = on ? "fine_views" : "reconstructed";
+}
+void set_store_charge_rows_only(bool on) { store_charge_rows_only().store(on); }
+void set_store_spare_capacity(std::size_t slots) { store_spare_capacity().store(slots); }
+std::uint64_t ContentIndexBatch::store_capacity_recount() const {
+    std::uint64_t b = state_->placements.capacity() * sizeof(std::vector<StoredPlacement>);
+    for (const auto& v : state_->placements) b += v.capacity() * sizeof(StoredPlacement);
+    b += state_->view_pieces.capacity() * sizeof(state_->view_pieces[0]);   // I4-B: the view table
+    return b;
+}
+
+namespace {
+// I2-A: a worker that stopped because another crossed a cap throws PlacementCancelled; the cap actually crossed is what
+// propagates, so the message does not depend on which worker noticed first.
+void rethrow_primary_failure(const std::vector<std::exception_ptr>& failures) {
+    std::exception_ptr cancelled;
+    for (const std::exception_ptr& f : failures) {
+        if (!f) continue;
+        try {
+            std::rethrow_exception(f);
+        } catch (const PlacementCancelled&) {
+            cancelled = f;
+        } catch (...) {
+            throw;
+        }
+    }
+    if (cancelled) std::rethrow_exception(cancelled);
+}
+void add_counters(FragmentScoringCounters& into, const FragmentScoringCounters& c) {
+    into.candidate_bases_scanned += c.candidate_bases_scanned;
+    into.piece_hits += c.piece_hits;
+    into.proposed_starts += c.proposed_starts;
+    into.unique_starts += c.unique_starts;
+    into.full_read_verifications += c.full_read_verifications;
+    into.dp_evaluations += c.dp_evaluations;
+    into.prefilter_rejections += c.prefilter_rejections;
+    into.accepted_mate_placements += c.accepted_mate_placements;
+    into.valid_fr_states += c.valid_fr_states;
+    into.latent_alignment_pairs += c.latent_alignment_pairs;
+    into.physical_origins += c.physical_origins;
+    into.statistical_state_classes += c.statistical_state_classes;
+    into.reused_physical_origins += c.reused_physical_origins;
+    into.reused_state_aggregates += c.reused_state_aggregates;
+    into.reused_latent_alignment_pairs += c.reused_latent_alignment_pairs;
+    into.reused_valid_fr_states += c.reused_valid_fr_states;
+    into.merged_state_classes += c.merged_state_classes;
+}
+}  // namespace
+
+ContentIndexBatch::ContentIndexBatch(const ContentPlacementIndex& index, std::vector<ReadPair> fragments, LibraryModel library,
+                                     FragmentScoringOptions options)
+    : state_(std::make_unique<State>()) {
+    validate_library_model(library);
+    if (library.max_gap_bp != index.state_->gap) throw std::invalid_argument("content index: max_gap_bp differs from the index's");
+    for (const ReadPair& f : fragments) {
+        if (f.first.bases.size() > index.state_->max_read || f.second.bases.size() > index.state_->max_read) {
+            throw std::invalid_argument("content index: a read is longer than the index's maximum read length");
+        }
+    }
+    if (!options.record_origins_for_fragments.empty() || options.record_origin_summary || options.union_segment_lengths != nullptr) {
+        throw std::invalid_argument("content index: origin recording and union caches are not supported");
+    }
+    State& st = *state_;
+    st.index = &index;
+    st.fragments = std::move(fragments);
+    st.library = std::move(library);
+    st.options = std::move(options);
+    st.library_insert = build_library_insert_distribution(st.library);
+    st.prepared = prepare_fragment_set(st.fragments, st.library, st.options);
+    for (const auto* forms : {&st.prepared.forward_forms, &st.prepared.reverse_forms})
+        for (const ReadForm& form : *forms) st.zone_read = std::max(st.zone_read, form.bases.size());
+    st.report.origin_reuse_status = st.options.union_origin_cache_bytes > 0 ? "on" : "off";
+    st.report.origin_budget_bytes = st.options.union_origin_cache_bytes;
+    if (st.options.union_prefilter_cache_bytes > 0) {
+        std::size_t length = 0;
+        if (single_read_length(st.prepared, length)) {
+            st.prefilter = make_union_prefilter_cache(st.prepared, st.library, st.options, st.report.prefilter);
+            st.report.prefilter_status = "on";
+        } else {
+            st.report.prefilter_status = "fallback_uncached_mixed_read_lengths";   // the cache needs one read length
+        }
+    } else {
+        st.report.prefilter_status = "off";
+    }
+}
+ContentIndexBatch::~ContentIndexBatch() = default;
+const ContentBatchReport& ContentIndexBatch::report() const { return state_->report; }
+
+void ContentIndexBatch::discover() {
+    State& st = *state_;
+    const ContentPlacementIndex::State& ix = *st.index->state_;
+    const std::size_t first = st.evaluated, last = ix.units.size();
+    if (first == last) return;
+    if (st.sealed) throw std::logic_error("content index: a one-shot batch was asked to discover new units");
+    if (st.fine_views && !st.exact_store) throw std::invalid_argument("content index: fine views need the exact store layout");
+    const auto mark = std::chrono::steady_clock::now();
+    const char* const kStoreRefusal =
+        "the indexed union's placement store reached its declared byte budget; no partial ranking is returned";
+    // I2-C: the per-unit container grows to exactly `last` entries, its capacity reserved first (and, in the legacy
+    // layout, only measured)
+    if (st.placements.capacity() < last) {
+        const std::uint64_t grow = (static_cast<std::uint64_t>(last) - st.placements.capacity()) * sizeof(std::vector<StoredPlacement>);
+        if (!st.reserve_store(grow, st.exact_store)) throw ResourceExhausted(kStoreRefusal);
+        st.placements.reserve(last);
+        st.outer_charged += grow;
+        if (st.placements.capacity() * sizeof(std::vector<StoredPlacement>) > st.outer_charged) {
+            const std::uint64_t extra = st.placements.capacity() * sizeof(std::vector<StoredPlacement>) - st.outer_charged;
+            if (!st.reserve_store(extra, st.exact_store)) throw ResourceExhausted(kStoreRefusal);
+            st.outer_charged += extra;
+        }
+    }
+    st.placements.resize(last);
+    // I2-A: stored rows charged against the declared store budget as each unit completes (a monotone shared total, so
+    // the verdict does not depend on the schedule: it refuses exactly when the merged total exceeds the budget).
+    // I2-C: the legacy layout only; the exact layout charges allocated capacity through the ledger instead.
+    std::atomic<std::uint64_t> store_charged{st.report.store_charged_bytes};
+    const auto charge_store = [&](std::uint64_t bytes) {
+        const std::uint64_t total = store_charged.fetch_add(bytes, std::memory_order_relaxed) + bytes;
+        if (st.store_budget != 0 && total > st.store_budget) {
+            throw ResourceExhausted("the indexed union's placement store reached its declared byte budget; no partial "
+                                    "ranking is returned");
+        }
+    };
+    begin_emission_cache(st.options.emission_cache_bytes);
+    PlacementBudget budget;
+    budget.max_piece_hits = st.options.max_piece_hits;
+    budget.max_physical_origins = st.options.max_physical_origins;
+    budget.publish_batch = std::max<std::uint64_t>(1, st.options.piece_hit_publish_batch);
+    const std::size_t threads = std::max<std::size_t>(1, std::min(st.options.threads, last - first));
+    std::atomic<std::size_t> next{first};
+    std::vector<FragmentScoringCounters> counters(threads);
+    std::vector<EmissionCacheCounters> cache(threads);
+    std::vector<SeedingTimes> times(threads);
+    std::vector<std::uint64_t> accepted(threads, 0), kept(threads, 0), bases(threads, 0);
+    std::vector<std::uint64_t> skipped(threads, 0), evaluated_units(threads, 0), scratch(threads, 0);
+    std::vector<std::exception_ptr> failures(threads);
+    const auto work = [&](std::size_t t) {
+        const ActiveWorker active;
+        std::vector<std::vector<FormPlacement>> rows[2] = {
+            std::vector<std::vector<FormPlacement>>(st.prepared.forward_forms.size()),
+            std::vector<std::vector<FormPlacement>>(st.prepared.reverse_forms.size())};
+        std::vector<std::pair<std::uint32_t, std::uint32_t>> proposed;
+        std::vector<std::uint32_t> touched;
+        std::vector<StoredPlacement> found;   // I2-C: the worker's reused discovery buffer (temporary, reported apart)
+        const auto scratch_bytes = [&]() {
+            std::uint64_t b = found.capacity() * sizeof(StoredPlacement) + proposed.capacity() * 8 + touched.capacity() * 4;
+            for (const auto& r : rows) {
+                b += r.capacity() * sizeof(std::vector<FormPlacement>);
+                for (const auto& v : r) b += v.capacity() * sizeof(FormPlacement);
+            }
+            return b;
+        };
+        try {
+            for (std::size_t u = next++; u < last; u = next++) {
+                if (budget.stop()) throw PlacementCancelled();
+                const IndexUnit& unit = ix.units[u];
+                if (ix.fine_discovery && unit.interior) continue;   // I1.4: reconstructed from its fine units below
+                std::vector<StoredPlacement>& store = st.placements[u];
+                if (st.exact_store) {
+                    found.clear();
+                    accepted[t] += discover_unit_placements(unit, st.prepared, st.prepared.forward_indexes,
+                                                            st.prepared.reverse_indexes, budget, st.options.mismatch_band,
+                                                            st.library, st.options, rows, proposed, touched, counters[t],
+                                                            cache[t], &times[t], st.prefilter.get(), &skipped[t], found);
+                    const std::uint64_t n = found.size();
+                    if (n > (std::numeric_limits<std::uint64_t>::max() / sizeof(StoredPlacement)) - store_spare_capacity().load()) {
+                        throw ResourceExhausted(kStoreRefusal);
+                    }
+                    if (n != 0 || store_spare_capacity().load() != 0) {
+                        // reserved before the persistent vector is allocated, at the capacity it is requested with
+                        if (!st.reserve_store(charged_bytes(n), true)) {
+                            budget.cancel();
+                            throw ResourceExhausted(kStoreRefusal);
+                        }
+                        std::vector<StoredPlacement> exact;
+                        exact.reserve(static_cast<std::size_t>(requested_slots(n)));
+                        exact.insert(exact.end(), found.begin(), found.end());
+                        store.swap(exact);
+                        // anything allocated beyond the request is charged too (unless the negative control drops it)
+                        if (!store_charge_rows_only().load(std::memory_order_relaxed) && store.capacity() > requested_slots(n) &&
+                            !st.reserve_store((store.capacity() - requested_slots(n)) * sizeof(StoredPlacement), true)) {
+                            budget.cancel();
+                            throw ResourceExhausted(kStoreRefusal);
+                        }
+                    }
+                } else {
+                    accepted[t] += discover_unit_placements(unit, st.prepared, st.prepared.forward_indexes,
+                                                            st.prepared.reverse_indexes, budget, st.options.mismatch_band,
+                                                            st.library, st.options, rows, proposed, touched, counters[t],
+                                                            cache[t], &times[t], st.prefilter.get(), &skipped[t], store);
+                    charge_store(static_cast<std::uint64_t>(store.size()) * sizeof(StoredPlacement));
+                    (void)st.reserve_store(store.capacity() * sizeof(StoredPlacement), false);   // measured only
+                }
+                kept[t] += store.size();
+                ++evaluated_units[t];
+                bases[t] += unit.bytes.size();
+            }
+        } catch (...) {
+            failures[t] = std::current_exception();
+            budget.cancel();
+        }
+        scratch[t] = scratch_bytes();
+    };
+    std::vector<std::thread> workers;
+    for (std::size_t t = 0; t < threads; ++t) workers.emplace_back(work, t);
+    for (std::thread& w : workers) w.join();
+    ContentBatchReport& r = st.report;
+    {
+        const EmissionCacheCounters stored = read_emission_cache_counters();
+        {   // I2-K (measurement): what discovery's cache actually holds before it is discarded
+            EmissionCache& held = emission_cache();
+            r.emission_cache_entries_held = r.emission_cache_table_bytes = r.emission_cache_slab_bytes = 0;
+            r.emission_cache_component_bytes = 0;
+            for (CacheShard& shard : held.shards) {
+                const std::lock_guard<std::mutex> guard(shard.guard);
+                r.emission_cache_entries_held += shard.occupied;
+                r.emission_cache_table_bytes += static_cast<std::uint64_t>(shard.table.capacity()) * sizeof(ArenaEntry);
+                r.emission_cache_slab_bytes += static_cast<std::uint64_t>(shard.slabs.size()) * kSlabBytes;
+                r.emission_cache_component_bytes += static_cast<std::uint64_t>(shard.arena.capacity()) * sizeof(GappedComponent);
+            }
+            r.emission_cache_budgeted_bytes = held.budgeted_bytes_used.load(std::memory_order_relaxed);
+        }
+        if (st.options.emission_handoff_out != nullptr) {   // I2-K (experimental): kept for the adaptive search
+            detach_emission_cache(*st.options.emission_handoff_out, st.library, st.options.mismatch_band,
+                                  st.options.gap_recursion_backend);
+        } else {
+            (void)end_emission_cache();
+        }
+        for (std::size_t t = 0; t < threads; ++t) {
+            r.emission_cache.executed_prefilters += cache[t].executed_prefilters;
+            r.emission_cache.dp_cache_requests += cache[t].dp_cache_requests;
+            r.emission_cache.dp_cache_hits += cache[t].dp_cache_hits;
+            r.emission_cache.dp_cache_misses += cache[t].dp_cache_misses;
+            r.emission_cache.executed_dps += cache[t].executed_dps;
+        }
+        r.emission_cache.payload_bytes = stored.payload_bytes;
+        r.emission_cache.entries = stored.entries;
+        r.emission_cache.entries_not_retained = stored.entries_not_retained;
+        r.emission_cache.budgeted_bytes_used = stored.budgeted_bytes_used;
+    }
+    // I2-A: executed work is merged BEFORE any failure propagates, so a refused pass reports what it did
+    for (std::size_t t = 0; t < threads; ++t) add_counters(st.discovery_counters, counters[t]);
+    r.piece_hits = std::max(st.discovery_counters.piece_hits, budget.piece_hits.load(std::memory_order_relaxed));
+    r.candidate_bases_scanned = st.discovery_counters.candidate_bases_scanned;
+    r.store_charged_bytes = st.exact_store ? st.store_allocated.load(std::memory_order_relaxed)
+                                           : store_charged.load(std::memory_order_relaxed);
+    r.threads_used_discovery = std::max(r.threads_used_discovery, threads);
+    {
+        std::uint64_t sum = 0;
+        for (const std::uint64_t b : scratch) sum += b;
+        r.worker_scratch_bytes = std::max(r.worker_scratch_bytes, sum);   // held at once while the workers ran
+    }
+    const auto note_ledger = [&]() {
+        r.store_layout = st.exact_store ? "exact" : "legacy_i2a";
+        r.store_live_bytes = st.store_live.load(std::memory_order_relaxed);
+        r.store_peak_bytes = st.store_peak.load(std::memory_order_relaxed);
+        r.store_allocated_bytes = st.store_allocated.load(std::memory_order_relaxed);
+        r.store_released_bytes = st.store_released.load(std::memory_order_relaxed);
+    };
+    note_ledger();
+    r.counters_last = st.discovery_counters;   // what a refusal before any score() reports
+    r.counters_last.piece_hits = r.piece_hits;
+    r.counters_last.fragments_with_floor_binding = st.prepared.fragments_with_floor_binding;
+    rethrow_primary_failure(failures);
+    for (std::size_t t = 0; t < threads; ++t) {
+        r.proposed_starts += counters[t].proposed_starts;
+        r.unique_starts += counters[t].unique_starts;
+        r.full_read_verifications += counters[t].full_read_verifications;
+        r.dp_evaluations += counters[t].dp_evaluations;
+        r.executed_prefilters += cache[t].executed_prefilters;
+        r.executed_dps += cache[t].executed_dps;
+        r.prefilter_rejections += counters[t].prefilter_rejections;
+        r.unit_placements_accepted += accepted[t];
+        r.unit_placements_kept += kept[t];
+        r.unit_bases_scanned += bases[t];
+        r.worker_seconds_scan += static_cast<double>(times[t].scan_ns) * 1e-9;
+        r.worker_seconds_sort += static_cast<double>(times[t].sort_ns) * 1e-9;
+        r.worker_seconds_verification += static_cast<double>(times[t].verify_ns + times[t].row_sort_ns) * 1e-9;
+    }
+    r.units_evaluated += last - first;
+    ++r.discovery_calls;
+    for (std::size_t t = 0; t < threads; ++t) {
+        r.owned_starts_skipped_before_verification += skipped[t];
+        r.units_discovered_directly += evaluated_units[t];
+    }
+    if (ix.fine_discovery) {
+        // I1.4: each new coarse interior unit's rows, exactly as coarse discovery would keep them: the union of its fine
+        // units' owned placements, translated to the segment and put in (form, start, consumed) order
+        const auto reconstruct_mark = std::chrono::steady_clock::now();
+        const auto row_order = [](const StoredPlacement& a, const StoredPlacement& b) {
+            return std::tie(a.form, a.start, a.consumed) < std::tie(b.form, b.start, b.consumed);
+        };
+        if (st.fine_views) {
+            // I4-B: no coarse row is copied. Each new coarse interior unit is served as a view over its fine pieces (the
+            // index's fine_of_coarse entry); the fine rows -- the distinct, separately verified evidence -- stay held until
+            // the batch ends. The view table is store metadata: its capacity is charged before it is allocated.
+            if (st.view_pieces.capacity() < last) {
+                const std::uint64_t grow = (static_cast<std::uint64_t>(last) - st.view_pieces.capacity()) * sizeof(st.view_pieces[0]);
+                if (!st.reserve_store(grow, true)) {
+                    note_ledger();
+                    throw ResourceExhausted(kStoreRefusal);
+                }
+                st.view_table_charged += grow;
+                st.view_pieces.reserve(last);
+                const std::uint64_t held = st.view_pieces.capacity() * sizeof(st.view_pieces[0]);
+                if (held > st.view_table_charged) {
+                    if (!st.reserve_store(held - st.view_table_charged, true)) {
+                        note_ledger();
+                        throw ResourceExhausted(kStoreRefusal);
+                    }
+                    st.view_table_charged = held;
+                }
+            }
+            st.view_pieces.resize(last, nullptr);
+            for (std::size_t u = first; u < last; ++u) {
+                if (!ix.units[u].interior) continue;
+                const auto& pieces = ix.fine_of_coarse.at(static_cast<std::uint32_t>(u));
+                st.view_pieces[u] = &pieces;
+                std::uint64_t n = 0;
+                for (const auto& [fine, offset] : pieces) n += st.placements[fine].size();
+                ++r.view_coarse_units;
+                r.view_rows_represented += n;
+            }
+            r.view_table_bytes = st.view_table_charged;
+        } else if (st.exact_store) {
+            // I2-C: each coarse unit sized from its known count and its capacity reserved before it is allocated; in a
+            // one-shot batch a fine unit's rows are released once the last new coarse unit using it is built. Peak = the
+            // fine rows still needed + the coarse rows built so far, never the whole store twice.
+            std::unordered_map<std::uint32_t, std::uint32_t> uses;
+            if (st.one_shot) {
+                for (std::size_t u = first; u < last; ++u) {
+                    if (!ix.units[u].interior) continue;
+                    for (const auto& [fine, offset] : ix.fine_of_coarse.at(static_cast<std::uint32_t>(u))) ++uses[fine];
+                }
+                r.worker_scratch_bytes = std::max<std::uint64_t>(r.worker_scratch_bytes, uses.bucket_count() * sizeof(void*) + uses.size() * 32);
+            }
+            for (std::size_t u = first; u < last; ++u) {
+                if (!ix.units[u].interior) continue;
+                const auto& pieces = ix.fine_of_coarse.at(static_cast<std::uint32_t>(u));
+                std::uint64_t n = 0;
+                for (const auto& [fine, offset] : pieces) n += st.placements[fine].size();
+                if (n > (std::numeric_limits<std::uint64_t>::max() / sizeof(StoredPlacement)) - store_spare_capacity().load() ||
+                    !st.reserve_store(charged_bytes(n), true)) {
+                    note_ledger();
+                    throw ResourceExhausted(kStoreRefusal);
+                }
+                std::vector<StoredPlacement> built;
+                built.reserve(static_cast<std::size_t>(requested_slots(n)));
+                for (const auto& [fine, offset] : pieces) {
+                    for (const StoredPlacement& p : st.placements[fine]) {
+                        StoredPlacement q = p;
+                        q.start = p.start + offset;
+                        built.push_back(q);
+                    }
+                }
+                std::sort(built.begin(), built.end(), row_order);
+                if (!store_charge_rows_only().load(std::memory_order_relaxed) && built.capacity() > requested_slots(n) &&
+                    !st.reserve_store((built.capacity() - requested_slots(n)) * sizeof(StoredPlacement), true)) {
+                    note_ledger();
+                    throw ResourceExhausted(kStoreRefusal);
+                }
+                const std::uint64_t old_capacity = st.placements[u].capacity() * sizeof(StoredPlacement);
+                st.placements[u].swap(built);
+                if (old_capacity != 0) st.release_store(old_capacity);
+                ++r.coarse_units_reconstructed;
+                r.reconstructed_placements += n;
+                if (st.one_shot) {
+                    for (const auto& [fine, offset] : pieces) {
+                        if (--uses[fine] != 0) continue;
+                        const std::uint64_t bytes = st.placements[fine].capacity() * sizeof(StoredPlacement);
+                        std::vector<StoredPlacement>().swap(st.placements[fine]);
+                        st.release_store(bytes);
+                    }
+                }
+            }
+        } else {
+            {
+                // I2-A: the reconstructed rows are charged whole before any is built
+                std::uint64_t rows = 0;
+                for (std::size_t u = first; u < last; ++u) {
+                    if (!ix.units[u].interior) continue;
+                    for (const auto& [fine, offset] : ix.fine_of_coarse.at(static_cast<std::uint32_t>(u))) rows += st.placements[fine].size();
+                }
+                charge_store(rows * sizeof(StoredPlacement));
+                r.store_charged_bytes = store_charged.load(std::memory_order_relaxed);
+            }
+            for (std::size_t u = first; u < last; ++u) {
+                if (!ix.units[u].interior) continue;
+                std::vector<StoredPlacement>& store = st.placements[u];
+                store.clear();
+                for (const auto& [fine, offset] : ix.fine_of_coarse.at(static_cast<std::uint32_t>(u))) {
+                    for (const StoredPlacement& p : st.placements[fine]) {
+                        StoredPlacement q = p;
+                        q.start = p.start + offset;
+                        store.push_back(q);
+                    }
+                }
+                std::sort(store.begin(), store.end(), row_order);
+                (void)st.reserve_store(store.capacity() * sizeof(StoredPlacement), false);   // measured only
+                ++r.coarse_units_reconstructed;
+                r.reconstructed_placements += store.size();
+            }
+            if (st.one_shot) {
+                // I2-A: fine rows exist only to reconstruct coarse units; a one-shot batch never adds any, so release them
+                for (std::size_t u = 0; u < last; ++u) {
+                    if (!ix.units[u].fine) continue;
+                    const std::uint64_t bytes = st.placements[u].capacity() * sizeof(StoredPlacement);
+                    std::vector<StoredPlacement>().swap(st.placements[u]);
+                    st.release_store(bytes);
+                }
+            }
+        }
+        r.reconstruction_peak_bytes = std::max(r.reconstruction_peak_bytes, st.store_peak.load(std::memory_order_relaxed));
+        r.seconds_reconstruction += std::chrono::duration<double>(std::chrono::steady_clock::now() - reconstruct_mark).count();
+    }
+    if (st.one_shot) st.sealed = true;
+    if (st.prefilter) fill_union_prefilter_report(*st.prefilter, r.prefilter);
+    if (st.exact_store) r.store_charged_bytes = st.store_allocated.load(std::memory_order_relaxed);
+    note_ledger();
+    r.placement_store_bytes = 0;
+    for (const auto& v : st.placements) r.placement_store_bytes += v.capacity() * sizeof(StoredPlacement);
+    st.evaluated = last;
+    r.seconds_discovery += std::chrono::duration<double>(std::chrono::steady_clock::now() - mark).count();
+}
+
+FragmentScoringResult ContentIndexBatch::score(const std::vector<HaplotypeCandidate>& candidates) {
+    State& st = *state_;
+    const ContentPlacementIndex::State& ix = *st.index->state_;
+    if (st.evaluated != ix.units.size()) throw std::logic_error("content index: score() before every unit was discovered");
+    const std::size_t unique = ix.lengths.size(), nf = st.fragments.size();
+    for (const HaplotypeCandidate& c : candidates) {
+        if (c.first >= unique || c.second >= unique) throw std::invalid_argument("content index: candidate names an unknown slot");
+    }
+    // I2-A: the reference's mass-cell cap, before any column is allocated
+    if (nf != 0 && unique > st.options.max_mass_cells / nf) {
+        throw ResourceExhausted(
+            "the fragment-by-haplotype mass matrix would exceed its declared cell cap; no partial ranking is returned");
+    }
+    FragmentScoringResult result;
+    result.unique_haplotypes = unique;
+    result.scores.resize(candidates.size());
+    // I2-A: executed pairing work is charged to the shared physical-origin budget as it happens (direct pairing and
+    // aggregate construction alike), and served quantities to their consumption caps (0: no cap, the experimental
+    // benchmark's setting; the caller's adapter requires them positive).
+    PlacementBudget budget;
+    budget.max_piece_hits = st.options.max_piece_hits;
+    budget.max_physical_origins = st.options.max_physical_origins;
+    std::atomic<std::uint64_t> placements_consumed{0}, origins_consumed{0}, states_consumed{0};
+    FragmentScoringCounters built;   // aggregate construction: executed
+    const auto note_consumption = [&]() {
+        st.report.placements_consumed_last = placements_consumed.load(std::memory_order_relaxed);
+        st.report.origins_consumed_last = origins_consumed.load(std::memory_order_relaxed);
+        st.report.states_consumed_last = states_consumed.load(std::memory_order_relaxed);
+        st.report.physical_origins_observed = budget.physical_origins.load(std::memory_order_relaxed);
+    };
+    // I1.3: retained columns; only slots never completed are computed (all of them with retention off: I1.2's behaviour)
+    if (!st.retain) {
+        std::fill(st.completed.begin(), st.completed.end(), 0);
+        st.pairs.clear();
+    }
+    st.mass_column.resize(unique);
+    st.exposure.resize(unique, 0.0);
+    st.completed.resize(unique, 0);
+    st.accounting.resize(unique);
+    std::vector<std::size_t> todo_slots;
+    for (std::size_t h = 0; h < unique; ++h) {
+        if (st.completed[h]) continue;
+        todo_slots.push_back(h);
+        st.mass_column[h].assign(nf, kNegInf);
+        st.exposure[h] = exposure_for_length(ix.lengths[h], nf, st.prepared.fragments_by_floor, st.library_insert);
+    }
+    std::vector<std::vector<double>>& mass_column = st.mass_column;
+    std::vector<double>& exposure = st.exposure;
+    // ---- I1.2: interior-origin aggregates for every eligible entity not yet built (eligible: two or more occurrences
+    // and a nonempty zone), in canonical order (most occurrences, then shorter, then entity id), admitted while they
+    // fit the declared budget; a declined entity is paired directly.
+    const std::uint32_t R = static_cast<std::uint32_t>(st.zone_read), g = static_cast<std::uint32_t>(ix.gap);
+    ContentBatchReport& rr = st.report;
+    if (st.options.union_origin_cache_bytes > 0) {
+        const auto build_mark = std::chrono::steady_clock::now();
+        st.entity_entry.resize(ix.entities.size(), -1);
+        std::vector<std::uint32_t> todo;
+        for (std::uint32_t e = 0; e < ix.entities.size(); ++e) {
+            if (st.entity_entry[e] >= 0 || st.entity_entry[e] == -2) continue;
+            const auto& en = ix.entities[e];
+            const bool eligible = en.occurrences >= 2 && en.length >= R + 2 * g + 1;
+            st.entity_entry[e] = eligible ? -1 : -3;
+            if (eligible) todo.push_back(e);
+        }
+        std::sort(todo.begin(), todo.end(), [&](std::uint32_t a, std::uint32_t b) {
+            const auto& x = ix.entities[a];
+            const auto& y = ix.entities[b];
+            return std::make_tuple(-static_cast<long>(x.occurrences), x.length, a) < std::make_tuple(-static_cast<long>(y.occurrences), y.length, b);
+        });
+        rr.origin_entities_eligible += todo.size();
+        const std::size_t workers = std::max<std::size_t>(1, std::min(st.options.threads, todo.size()));
+        std::vector<StateAggregateSet> scratch(workers);
+        std::vector<double> gather_ns(workers, 0.0);   // I4-B: seconds gathering view zones, per worker slot
+        for (std::size_t begin = 0; begin < todo.size(); begin += workers) {
+            const std::size_t end = std::min(begin + workers, todo.size());
+            std::vector<UnionOriginEntry> made(end - begin);
+            std::vector<std::exception_ptr> failures(end - begin);
+            std::vector<std::pair<std::uint64_t, std::uint64_t>> zone_rows(end - begin, {0, 0});   // I4-B: per-entity counts
+            const auto build_one = [&](std::size_t slot) {
+                const ActiveWorker active;
+                const auto& en = ix.entities[todo[begin + slot]];
+                // the zone's placements only: starts in [g, length - R - g] on each strand
+                const auto in_zone = [&](const std::vector<StoredPlacement>& all) {
+                    std::vector<CachedPlacement> kept;
+                    for (const StoredPlacement& p : all) if (p.start >= g && p.start + R + g <= en.length) kept.push_back(p);
+                    return kept;
+                };
+                if (!st.fine_views) {
+                    build_origin_entry(in_zone(st.placements[en.forward_unit]), in_zone(st.placements[en.reverse_unit]),
+                                       en.length, st.prepared.forward_forms.size(), nf, st.prepared, &budget, scratch[slot],
+                                       made[slot]);
+                    return;
+                }
+                // I4-B: the zone rows gathered from the unit's view (each fine piece's rows at piece offset + start), in
+                // reconstruction's (form, start, consumed) order -- keys are unique within a coarse unit (disjoint owned
+                // cores). These gathers are the views' transition-time copies; the whole batch's were counted and charged
+                // to the store ledger before any worker started (zone_rows), and are released after the batch joins.
+                const auto gather_mark = std::chrono::steady_clock::now();
+                const auto view_zone = [&](std::uint32_t unit, std::uint64_t n) {
+                    const auto* pieces = unit < st.view_pieces.size() ? st.view_pieces[unit] : nullptr;
+                    if (pieces == nullptr) return in_zone(st.placements[unit]);
+                    std::vector<CachedPlacement> kept;
+                    kept.reserve(static_cast<std::size_t>(n));
+                    for (const auto& [fine, offset] : *pieces) {
+                        for (const StoredPlacement& p : st.placements[fine]) {
+                            const std::uint32_t at = p.start + offset;
+                            if (at < g || at + R + g > en.length) continue;
+                            CachedPlacement q = p;
+                            q.start = at;
+                            kept.push_back(q);
+                        }
+                    }
+                    if (kept.size() != n || kept.capacity() != n) {
+                        throw std::logic_error("content index: a view zone gather differs from its charged count");
+                    }
+                    std::sort(kept.begin(), kept.end(), [](const CachedPlacement& x, const CachedPlacement& y) {
+                        return std::tie(x.form, x.start, x.consumed) < std::tie(y.form, y.start, y.consumed);
+                    });
+                    return kept;
+                };
+                const std::vector<CachedPlacement> forward = view_zone(en.forward_unit, zone_rows[slot].first);
+                const std::vector<CachedPlacement> reverse = view_zone(en.reverse_unit, zone_rows[slot].second);
+                gather_ns[slot] += std::chrono::duration<double>(std::chrono::steady_clock::now() - gather_mark).count();
+                build_origin_entry(forward, reverse, en.length, st.prepared.forward_forms.size(), nf, st.prepared, &budget,
+                                   scratch[slot], made[slot]);
+            };
+            // I4-B: under views, each entity's zone rows are counted first (in parallel, no allocation) and the batch's
+            // total is charged to the store ledger before any gather is allocated: the ledger's peak, and so the store
+            // verdict, depend on the thread count only, never on the schedule. Released after the batch joins.
+            std::uint64_t batch_zone_bytes = 0;
+            if (st.fine_views) {
+                std::vector<std::thread> counters_pool;
+                for (std::size_t slot = 0; slot < end - begin; ++slot) {
+                    counters_pool.emplace_back([&, slot]() {
+                        const auto& en = ix.entities[todo[begin + slot]];
+                        const auto count = [&](std::uint32_t unit) -> std::uint64_t {
+                            const auto* pieces = unit < st.view_pieces.size() ? st.view_pieces[unit] : nullptr;
+                            if (pieces == nullptr) return 0;   // not a view: the old uncharged path applies
+                            std::uint64_t n = 0;
+                            for (const auto& [fine, offset] : *pieces) {
+                                for (const StoredPlacement& p : st.placements[fine]) {
+                                    const std::uint32_t at = p.start + offset;
+                                    n += (at >= g && at + R + g <= en.length) ? 1 : 0;
+                                }
+                            }
+                            return n;
+                        };
+                        zone_rows[slot] = {count(en.forward_unit), count(en.reverse_unit)};
+                    });
+                }
+                for (std::thread& w : counters_pool) w.join();
+                for (std::size_t slot = 0; slot < end - begin; ++slot) {
+                    batch_zone_bytes += (zone_rows[slot].first + zone_rows[slot].second) * sizeof(CachedPlacement);
+                }
+                if (batch_zone_bytes != 0 && !st.reserve_store(batch_zone_bytes, true)) {
+                    note_consumption();
+                    throw ResourceExhausted("the indexed union's placement store reached its declared byte budget; no partial "
+                                            "ranking is returned");
+                }
+                const std::uint64_t now = st.zone_live.fetch_add(batch_zone_bytes, std::memory_order_relaxed) + batch_zone_bytes;
+                st.zone_peak.store(std::max(st.zone_peak.load(std::memory_order_relaxed), now), std::memory_order_relaxed);
+                st.zone_total.fetch_add(batch_zone_bytes, std::memory_order_relaxed);
+            }
+            struct ZoneRelease {
+                State& s;
+                std::uint64_t bytes;
+                ~ZoneRelease() {
+                    if (bytes == 0) return;
+                    s.release_store(bytes);
+                    s.zone_live.fetch_sub(bytes, std::memory_order_relaxed);
+                }
+            } zone_release{st, batch_zone_bytes};
+            std::vector<std::thread> pool;
+            for (std::size_t slot = 0; slot < end - begin; ++slot) {
+                pool.emplace_back([&, slot]() {
+                    try { build_one(slot); } catch (...) { failures[slot] = std::current_exception(); budget.cancel(); }
+                });
+            }
+            for (std::thread& w : pool) w.join();
+            if (std::any_of(failures.begin(), failures.end(), [](const std::exception_ptr& f) { return static_cast<bool>(f); })) {
+                note_consumption();
+                rethrow_primary_failure(failures);
+            }
+            for (std::size_t slot = 0; slot < end - begin; ++slot) {
+                UnionOriginEntry& entry = made[slot];
+                built.physical_origins += entry.origins;   // I2-A: construction is executed work, as in the reference
+                built.statistical_state_classes += entry.states.states.size();
+                built.latent_alignment_pairs += entry.latent_pairs;
+                built.valid_fr_states += entry.valid_states;
+                const std::uint64_t bytes = sizeof(UnionOriginEntry) +
+                    static_cast<std::uint64_t>(entry.states.fragments.size() + entry.states.starts.size()) * sizeof(std::uint32_t) +
+                    static_cast<std::uint64_t>(entry.states.states.size()) * sizeof(StateCount);
+                rr.origins_constructed += entry.origins;
+                ++rr.origin_entities_built;
+                if (st.origin_held + bytes <= st.options.union_origin_cache_bytes) {
+                    st.origin_held += bytes;
+                    st.entity_entry[todo[begin + slot]] = static_cast<long>(st.origin_entries.size());
+                    st.origin_entries.push_back(std::move(entry));
+                    ++rr.origin_entities_admitted;
+                } else {
+                    st.entity_entry[todo[begin + slot]] = -2;
+                    ++rr.origin_entities_declined;
+                }
+            }
+        }
+        rr.origin_held_bytes = st.origin_held;
+        for (const double x : gather_ns) rr.seconds_view_zone_gather += x;
+        rr.view_zone_temporary_peak_bytes = st.zone_peak.load(std::memory_order_relaxed);
+        rr.view_zone_temporary_bytes_total = st.zone_total.load(std::memory_order_relaxed);
+        rr.store_peak_bytes = st.store_peak.load(std::memory_order_relaxed);
+        rr.store_live_bytes = st.store_live.load(std::memory_order_relaxed);
+        rr.store_allocated_bytes = st.store_allocated.load(std::memory_order_relaxed);
+        rr.store_released_bytes = st.store_released.load(std::memory_order_relaxed);
+        rr.seconds_origin_construction += std::chrono::duration<double>(std::chrono::steady_clock::now() - build_mark).count();
+    }
+    const bool zoned = st.options.union_origin_cache_bytes > 0;
+
+    const auto mark = std::chrono::steady_clock::now();
+    const std::size_t threads = std::max<std::size_t>(1, std::min(st.options.threads, std::max<std::size_t>(1, todo_slots.size())));
+    std::atomic<std::size_t> next{0};
+    std::vector<double> expansion_ns(threads, 0), pairing_ns(threads, 0);
+    std::vector<std::uint64_t> served(threads, 0), direct(threads, 0), zones_used(threads, 0);
+    std::vector<std::uint64_t> expanded(threads, 0), removed(threads, 0), origins_count(threads, 0), classes(threads, 0);
+    std::vector<FragmentScoringCounters> executed(threads);   // I2-A: the reference's counters, executed work only
+    std::vector<std::exception_ptr> failures(threads);
+    const auto charge_origin = [&]() {
+        const std::uint64_t seen = budget.physical_origins.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (seen > budget.max_physical_origins) {
+            budget.cancel();
+            throw ResourceExhausted("fragment scoring reached its physical-origin cap; no partial ranking is returned");
+        }
+        if (budget.stop()) throw PlacementCancelled();
+    };
+    const auto consume = [&](std::atomic<std::uint64_t>& total, std::uint64_t amount, std::uint64_t cap, const char* message) {
+        const std::uint64_t now = total.fetch_add(amount, std::memory_order_relaxed) + amount;
+        if (cap != 0 && now > cap) {
+            budget.cancel();
+            throw ResourceExhausted(message);
+        }
+    };
+    const auto work = [&](std::size_t t) {
+        const ActiveWorker active;
+        std::vector<std::vector<FormPlacement>> rows[2] = {
+            std::vector<std::vector<FormPlacement>>(st.prepared.forward_forms.size()),
+            std::vector<std::vector<FormPlacement>>(st.prepared.reverse_forms.size())};
+        std::vector<std::uint32_t> touched[2];
+        std::map<StateKey, std::uint64_t> states;
+        std::map<std::uint32_t, OriginAccumulator> origins;
+        std::vector<OriginZone> zones;
+        std::vector<std::size_t> zone_cursor;
+        std::vector<StateKey> direct_keys;
+        std::vector<StateCount> direct_counts, merged_counts, merge_scratch;
+        try {
+            for (std::size_t i = next++; i < todo_slots.size(); i = next++) {
+                if (budget.stop()) throw PlacementCancelled();
+                const std::size_t h = todo_slots[i];
+                const std::uint64_t b_expanded = expanded[t], b_removed = removed[t], b_plain = origins_count[t];
+                const std::uint64_t b_direct = direct[t], b_served = served[t], b_classes = classes[t], b_zones = zones_used[t];
+                const auto e0 = std::chrono::steady_clock::now();
+                const std::uint32_t n = ix.lengths[h];
+                for (int strand = 0; strand < 2; ++strand) {
+                    const auto expand_rows = [&](const std::vector<StoredPlacement>& unit_rows, std::uint32_t offset) {
+                        for (const StoredPlacement& p : unit_rows) {
+                            auto& row = rows[strand][p.form];
+                            if (row.empty()) touched[strand].push_back(p.form);
+                            FormPlacement q;
+                            q.start = offset + p.start;
+                            q.consumed = p.consumed;
+                            q.mismatches = p.mismatches;
+                            q.emission = p.emission;
+                            row.push_back(q);
+                            ++expanded[t];
+                        }
+                    };
+                    for (const IndexOccurrence& occ : ix.occurrences[strand][h]) {
+                        // I4-B: a coarse unit served as a view expands each fine piece's rows at its piece offset: the
+                        // same multiset of placements as its reconstructed rows (the per-form sort below orders them)
+                        const auto* pieces = occ.unit < st.view_pieces.size() ? st.view_pieces[occ.unit] : nullptr;
+                        if (pieces != nullptr) {
+                            for (const auto& [fine, offset] : *pieces) expand_rows(st.placements[fine], occ.offset + offset);
+                        } else {
+                            expand_rows(st.placements[occ.unit], occ.offset);
+                        }
+                    }
+                    for (const std::uint32_t form : touched[strand]) {
+                        auto& row = rows[strand][form];
+                        if (strand == 1) for (FormPlacement& q : row) q.start = n - q.start;   // reverse rows: forward end
+                        std::sort(row.begin(), row.end(), [](const FormPlacement& a, const FormPlacement& b) {
+                            return std::tie(a.start, a.consumed) < std::tie(b.start, b.consumed);
+                        });
+                        const auto end = std::unique(row.begin(), row.end(), [](const FormPlacement& a, const FormPlacement& b) {
+                            return a.start == b.start && a.consumed == b.consumed;
+                        });
+                        removed[t] += static_cast<std::uint64_t>(row.end() - end);
+                        row.erase(end, row.end());
+                    }
+                }
+                const auto e1 = std::chrono::steady_clock::now();
+                // I2-A: every expanded placement is served from the store, not executed: charged whole for the slot
+                consume(placements_consumed, expanded[t] - b_expanded, st.options.max_union_cached_placements_consumed,
+                        "fragment scoring reached its cached-placement consumption cap; no partial ranking is returned");
+                // I1.2: the slot's served zones, one per admitted entity occurrence (ascending, disjoint): a pair is
+                // served exactly when its forward start and reverse end lie in the SAME occurrence's interior zone
+                zones.clear();
+                if (zoned) {
+                    for (const auto& [entity, offset] : ix.entity_occurrences[h]) {
+                        const long entry = st.entity_entry[entity];
+                        if (entry < 0) continue;
+                        const std::uint32_t len = ix.entities[entity].length;
+                        OriginZone z;
+                        z.start_lo = offset + g;
+                        z.start_hi = offset + len - (R + g);
+                        z.end_lo = offset + R + g;
+                        z.end_hi = offset + len - g;
+                        z.entry = &st.origin_entries[static_cast<std::size_t>(entry)];
+                        zones.push_back(z);
+                        served[t] += z.entry->origins;
+                    }
+                    zone_cursor.assign(zones.size(), 0);
+                    zones_used[t] += zones.size();
+                    // I2-A: the occurrences served, charged whole before any is merged (the reference's phase-2 rule)
+                    std::uint64_t served_origins = 0, served_states = 0;
+                    for (const OriginZone& z : zones) {
+                        served_origins += z.entry->origins;
+                        served_states += z.entry->states.states.size();
+                        executed[t].reused_latent_alignment_pairs += z.entry->latent_pairs;
+                        executed[t].reused_valid_fr_states += z.entry->valid_states;
+                    }
+                    executed[t].reused_physical_origins += served_origins;
+                    executed[t].reused_state_aggregates += served_states;
+                    consume(origins_consumed, served_origins, st.options.max_union_cached_origins_consumed,
+                            "fragment scoring reached its cached-origin consumption cap; no partial ranking is returned");
+                    consume(states_consumed, served_states, st.options.max_union_cached_states_consumed,
+                            "fragment scoring reached its cached-state consumption cap; no partial ranking is returned");
+                }
+                std::uint64_t latent_pairs = 0, valid_states = 0;
+                for (std::size_t f = 0; f < nf; ++f) {
+                    const InsertSupport& support = st.prepared.support_by_fragment[f];
+                    if (support.empty()) continue;
+                    if (!zones.empty()) {
+                        const RowView forward_rows[2] = {{rows[0][2 * f].data(), rows[0][2 * f].size()},
+                                                         {rows[0][2 * f + 1].data(), rows[0][2 * f + 1].size()}};
+                        const RowView reverse_rows[2] = {{rows[1][2 * f].data(), rows[1][2 * f].size()},
+                                                         {rows[1][2 * f + 1].data(), rows[1][2 * f + 1].size()}};
+                        direct_keys.clear();
+                        pair_fragment(forward_rows, reverse_rows, support, zones.data(), zones.size(), origins, latent_pairs,
+                                      valid_states,
+                                      [&](std::size_t arm, std::uint32_t, std::uint32_t insert, const OriginAccumulator& origin) {
+                                          ++direct[t];
+                                          charge_origin();
+                                          StateKey key;
+                                          key.insert_bp = insert;
+                                          key.orientation = static_cast<std::uint32_t>(arm);
+                                          key.log_latent_mass = origin.log_latent_mass;
+                                          direct_keys.push_back(key);
+                                      });
+                        direct_counts.clear();
+                        sort_and_count(direct_keys, direct_counts, 0);
+                        executed[t].statistical_state_classes += direct_counts.size();
+                        merged_counts.assign(direct_counts.begin(), direct_counts.end());
+                        merge_served_states(f, zones.data(), zones.size(), zone_cursor, merged_counts, merge_scratch);
+                        if (merged_counts.empty()) continue;
+                        executed[t].merged_state_classes += merged_counts.size();
+                        classes[t] += merged_counts.size();
+                        mass_column[h][f] = reduce_sorted(merged_counts.data(), merged_counts.data() + merged_counts.size(),
+                                                          st.library_insert);
+                        continue;
+                    }
+                    const RowView forward_rows[2] = {{rows[0][2 * f].data(), rows[0][2 * f].size()},
+                                                     {rows[0][2 * f + 1].data(), rows[0][2 * f + 1].size()}};
+                    const RowView reverse_rows[2] = {{rows[1][2 * f].data(), rows[1][2 * f].size()},
+                                                     {rows[1][2 * f + 1].data(), rows[1][2 * f + 1].size()}};
+                    states.clear();
+                    pair_fragment(forward_rows, reverse_rows, support, nullptr, 0, origins, latent_pairs, valid_states,
+                                  [&](std::size_t arm, std::uint32_t, std::uint32_t insert, const OriginAccumulator& origin) {
+                                      ++origins_count[t];
+                                      charge_origin();
+                                      StateKey key;
+                                      key.insert_bp = insert;
+                                      key.orientation = static_cast<std::uint32_t>(arm);
+                                      key.log_latent_mass = origin.log_latent_mass;
+                                      ++states[key];
+                                  });
+                    if (states.empty()) continue;
+                    classes[t] += states.size();
+                    executed[t].statistical_state_classes += states.size();
+                    mass_column[h][f] = reduce_states(states, st.library_insert);
+                }
+                executed[t].latent_alignment_pairs += latent_pairs;
+                executed[t].valid_fr_states += valid_states;
+                for (int strand = 0; strand < 2; ++strand) {
+                    for (const std::uint32_t form : touched[strand]) rows[strand][form].clear();
+                    touched[strand].clear();
+                }
+                const auto e2 = std::chrono::steady_clock::now();
+                expansion_ns[t] += std::chrono::duration<double>(e1 - e0).count();
+                pairing_ns[t] += std::chrono::duration<double>(e2 - e1).count();
+                st.accounting[h] = {expanded[t] - b_expanded, removed[t] - b_removed, origins_count[t] - b_plain,
+                                    direct[t] - b_direct, served[t] - b_served, classes[t] - b_classes, zones_used[t] - b_zones};
+            }
+        } catch (...) {
+            failures[t] = std::current_exception();
+            budget.cancel();
+        }
+    };
+    std::vector<std::thread> workers;
+    for (std::size_t t = 0; t < threads; ++t) workers.emplace_back(work, t);
+    for (std::thread& w : workers) w.join();
+    note_consumption();
+    rr.threads_used_pairing = threads;
+    {
+        // I2-A: this call's executed work (discovery's seeding counters are cumulative), merged before any refusal
+        // propagates; then the reference's acceptance caps on the merged totals
+        FragmentScoringCounters c = st.discovery_counters;
+        c.fragments_with_floor_binding = st.prepared.fragments_with_floor_binding;
+        add_counters(c, built);
+        for (const FragmentScoringCounters& e : executed) add_counters(c, e);
+        for (std::size_t t = 0; t < threads; ++t) c.physical_origins += origins_count[t] + direct[t];
+        rr.counters_last = c;
+        rethrow_primary_failure(failures);
+        enforce_acceptance_caps(c, st.options, [] {});
+    }
+    ContentBatchReport& r = st.report;
+    r.seconds_expansion_and_pairing = std::chrono::duration<double>(std::chrono::steady_clock::now() - mark).count();
+    r.worker_seconds_expansion = r.worker_seconds_pairing = 0;
+    for (std::size_t t = 0; t < threads; ++t) {
+        r.worker_seconds_expansion += expansion_ns[t];
+        r.worker_seconds_pairing += pairing_ns[t];
+    }
+    for (const std::size_t h : todo_slots) st.completed[h] = 1;
+    r.columns_computed_last = todo_slots.size();
+    r.columns_computed_total += todo_slots.size();
+    r.columns_retained_last = unique - todo_slots.size();
+    // totals over every completed slot (each counted once, whenever it was computed)
+    r.expanded_placements = r.duplicate_placements_removed = r.physical_origins = r.state_classes = 0;
+    r.direct_physical_origins = r.served_physical_origins = r.zones_applied = 0;
+    for (std::size_t h = 0; h < unique; ++h) {
+        const auto& a = st.accounting[h];
+        r.expanded_placements += a.expanded;
+        r.duplicate_placements_removed += a.removed;
+        r.direct_physical_origins += a.direct;
+        r.served_physical_origins += a.served;
+        r.zones_applied += a.zones;
+        r.physical_origins += a.plain_origins + a.direct + a.served;   // logical: executed plus served
+        r.state_classes += a.classes;
+    }
+    result.seconds_placement_and_mass = r.seconds_discovery + r.seconds_expansion_and_pairing;
+    // pair likelihoods: each unordered slot pair combined once (shared combination), then served from the cache
+    const auto combination_mark = std::chrono::steady_clock::now();
+    const auto key_of = [](std::size_t a, std::size_t b) {
+        return (static_cast<std::uint64_t>(std::min(a, b)) << 32) | static_cast<std::uint64_t>(std::max(a, b));
+    };
+    std::vector<HaplotypeCandidate> fresh;
+    std::vector<std::uint64_t> fresh_keys;
+    {
+        std::unordered_set<std::uint64_t> seen;
+        for (const HaplotypeCandidate& c : candidates) {
+            const std::uint64_t key = key_of(c.first, c.second);
+            if (st.pairs.count(key) != 0 || !seen.insert(key).second) continue;
+            fresh.push_back({std::min(c.first, c.second), std::max(c.first, c.second)});
+            fresh_keys.push_back(key);
+        }
+    }
+    r.pairs_requested_last = candidates.size();
+    r.pairs_computed_last = fresh.size();
+    r.pairs_computed_total += fresh.size();
+    r.seconds_candidate_scoring = 0.0;
+    if (!fresh.empty()) {
+        FragmentScoringResult computed;
+        computed.scores.resize(fresh.size());
+        combine_candidate_scores(mass_column, exposure, st.prepared.background_by_fragment, nf, st.library, fresh,
+                                 st.options.threads, st.options.audit_libraries, computed, st.options.prepared_library_terms);
+        r.seconds_candidate_scoring = computed.seconds_diploid_combination;
+        result.threads_used_combination = computed.threads_used_combination;
+        result.candidate_fragment_evaluations = computed.candidate_fragment_evaluations;
+        for (std::size_t i = 0; i < fresh.size(); ++i) {
+            State::PairResult pr;
+            pr.score = computed.scores[i];
+            for (const auto& audit : computed.audit_scores) pr.audits.push_back(audit[i]);
+            st.pairs.emplace(fresh_keys[i], std::move(pr));
+        }
+    }
+    const std::size_t audit_count = audit_combinations(st.options.audit_libraries).size();
+    result.audit_scores.assign(audit_count, std::vector<DiplotypeScore>(candidates.size()));
+    for (std::size_t c = 0; c < candidates.size(); ++c) {
+        const State::PairResult& pr = st.pairs.at(key_of(candidates[c].first, candidates[c].second));
+        result.scores[c] = pr.score;
+        for (std::size_t k = 0; k < audit_count; ++k) result.audit_scores[k][c] = pr.audits[k];
+    }
+    result.seconds_diploid_combination = std::chrono::duration<double>(std::chrono::steady_clock::now() - combination_mark).count();
+    r.seconds_pair_lookup_and_combination = result.seconds_diploid_combination;
+    result.counters = r.counters_last;
+    result.threads_used_placement = std::max<std::size_t>(1, std::max(r.threads_used_discovery, threads));
+    // output materialisation: the flattened mass matrix and exposures of every slot
+    const auto materialise_mark = std::chrono::steady_clock::now();
+    result.log_mass.assign(nf * unique, kNegInf);
+    for (std::size_t h = 0; h < unique; ++h)
+        for (std::size_t f = 0; f < nf; ++f) result.log_mass[f * unique + h] = mass_column[h][f];
+    result.exposure = exposure;
+    r.seconds_materialisation = std::chrono::duration<double>(std::chrono::steady_clock::now() - materialise_mark).count();
+    r.retained_column_bytes = 0;
+    for (const auto& column : mass_column) r.retained_column_bytes += column.capacity() * sizeof(double);
+    r.retained_column_bytes += exposure.capacity() * sizeof(double) + st.accounting.capacity() * sizeof(State::SlotAccounting);
+    r.retained_pairs = st.pairs.size();
+    r.retained_pair_bytes = st.pairs.size() * (sizeof(std::uint64_t) + sizeof(State::PairResult) + 32 + audit_count * sizeof(DiplotypeScore)) +
+                            st.pairs.bucket_count() * sizeof(void*);
+    return result;
+}
+
+std::map<std::string, std::vector<std::tuple<std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t, double>>>
+ContentIndexBatch::interior_placement_rows() const {
+    const State& st = *state_;
+    const ContentPlacementIndex::State& ix = *st.index->state_;
+    std::map<std::string, std::vector<std::tuple<std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t, double>>> out;
+    for (std::size_t u = 0; u < st.evaluated; ++u) {
+        if (!ix.units[u].interior) continue;
+        auto& rows = out[std::string(1, static_cast<char>('0' + ix.units[u].strand)) + ix.units[u].bytes];
+        const auto* pieces = u < st.view_pieces.size() ? st.view_pieces[u] : nullptr;
+        if (pieces != nullptr) {   // I4-B: a view, materialised on demand in reconstruction's order
+            std::vector<StoredPlacement> built;
+            for (const auto& [fine, offset] : *pieces) {
+                for (StoredPlacement p : st.placements[fine]) {
+                    p.start += offset;
+                    built.push_back(p);
+                }
+            }
+            std::sort(built.begin(), built.end(), [](const StoredPlacement& a, const StoredPlacement& b) {
+                return std::tie(a.form, a.start, a.consumed) < std::tie(b.form, b.start, b.consumed);
+            });
+            for (const StoredPlacement& p : built) rows.emplace_back(p.form, p.start, p.consumed, p.mismatches, p.emission);
+            continue;
+        }
+        for (const StoredPlacement& p : st.placements[u]) rows.emplace_back(p.form, p.start, p.consumed, p.mismatches, p.emission);
+    }
+    return out;
+}
+
+// ---- I2-A (EXPERIMENTAL): the indexed route at the caller's one-shot union boundary (see the header) -------------------
+namespace {
+UnionOriginCacheReport indexed_origin_report(const ContentBatchReport& b, const FragmentScoringOptions& o) {
+    UnionOriginCacheReport u;
+    u.active = o.union_origin_cache_bytes > 0;
+    u.budget_bytes = o.union_origin_cache_bytes;
+    u.max_origins_consumed = o.max_union_cached_origins_consumed;
+    u.max_states_consumed = o.max_union_cached_states_consumed;
+    u.eligible_segments = b.origin_entities_eligible;   // segment entities with two or more occurrences and a zone
+    u.admitted_segments = b.origin_entities_admitted;
+    u.declined_segments = b.origin_entities_declined;
+    u.hits = b.zones_applied;                            // occurrences served
+    u.origins_constructed = b.origins_constructed;
+    u.origins_consumed = b.origins_consumed_last;
+    u.states_consumed = b.states_consumed_last;
+    u.payload_bytes = b.origin_held_bytes;
+    u.peak_bytes = b.origin_held_bytes;
+    u.seconds_fill = b.seconds_origin_construction;
+    return u;
+}
+}  // namespace
+
+FragmentScoringResult score_diplotypes_indexed_union(const InternedHaplotypes& haplotypes,
+                                                     const std::vector<HaplotypeCandidate>& candidates,
+                                                     const std::vector<ReadPair>& fragments, const LibraryModel& library,
+                                                     const FragmentScoringOptions& options,
+                                                     const std::vector<std::vector<std::uint32_t>>& segments,
+                                                     std::size_t store_budget_bytes, IndexedUnionReport* report,
+                                                     FragmentScoringObservation* observed_on_failure,
+                                                     bool legacy_store_layout, bool fine_views) {
+    using Clock = std::chrono::steady_clock;
+    const auto since = [](Clock::time_point mark) { return std::chrono::duration<double>(Clock::now() - mark).count(); };
+    // score_diplotypes' own validation, then the adapter's declared requirements
+    validate_library_model(library);
+    if (options.minimum_piece_bp == 0) throw std::invalid_argument("minimum indexable piece length must be positive");
+    if (options.max_piece_hits == 0 || options.max_proposed_starts_per_haplotype == 0 || options.max_physical_origins == 0 ||
+        options.max_state_classes == 0 || options.max_mass_cells == 0 || options.max_latent_alignment_pairs == 0) {
+        throw std::invalid_argument("every fragment-scoring resource cap must be positive");
+    }
+    const std::size_t unique = haplotypes.sequences.size();
+    for (const HaplotypeCandidate& c : candidates) {
+        if (c.first >= unique || c.second >= unique) throw std::invalid_argument("diplotype candidate names an unknown haplotype");
+    }
+    if (options.record_origin_summary || !options.record_origins_for_fragments.empty() ||
+        options.record_haplotype_work != nullptr) {
+        throw std::invalid_argument("the indexed union backend records no per-origin or per-haplotype diagnostics");
+    }
+    if (segments.size() != unique) throw std::invalid_argument("the indexed union backend needs one segmentation per unique haplotype");
+    if (store_budget_bytes == 0) throw std::invalid_argument("the indexed union backend needs a positive placement-store budget");
+    if (options.max_union_cached_placements_consumed == 0) {
+        throw std::invalid_argument("the indexed union backend needs a positive cached-placement consumption cap: every "
+                                    "expanded placement is served from its store");
+    }
+    if (options.union_origin_cache_bytes > 0 &&
+        (options.max_union_cached_origins_consumed == 0 || options.max_union_cached_states_consumed == 0)) {
+        throw std::invalid_argument("union origin reuse needs both of its consumption caps, positive");
+    }
+    IndexedUnionReport local;
+    IndexedUnionReport& rep = report != nullptr ? *report : local;
+    rep = IndexedUnionReport{};
+    rep.store_budget_bytes = store_budget_bytes;
+    if (!fragments.empty() && unique > options.max_mass_cells / fragments.size()) {
+        // before any work, as in the reference (whose observation is likewise left at its defaults here)
+        rep.refusal = "the fragment-by-haplotype mass matrix would exceed its declared cell cap; no partial ranking is returned";
+        throw ResourceExhausted(rep.refusal);
+    }
+    rep.max_read_bp = 1;
+    for (const ReadPair& f : fragments) rep.max_read_bp = std::max({rep.max_read_bp, f.first.bases.size(), f.second.bases.size()});
+    FragmentScoringOptions batch_options = options;
+    batch_options.union_segment_lengths = nullptr;     // the index carries the segmentation; no phase-1 replay
+    batch_options.union_placement_cache_bytes = 0;
+    {
+        StartSortTally& tally = start_sort_tally();
+        tally.out_of_place.store(0);
+        tally.in_place.store(0);
+        tally.fallbacks.store(0);
+        tally.peak_worker_bytes.store(0);
+    }
+    const auto start_sort_report = [&]() {
+        StartSortReport q;
+        const StartSortTally& tally = start_sort_tally();
+        q.budget_bytes = options.start_sort_scratch_bytes;
+        q.workers = std::max<std::size_t>(1, options.threads);
+        q.share_bytes = options.start_sort_scratch_bytes / q.workers;
+        q.out_of_place = tally.out_of_place.load();
+        q.in_place = tally.in_place.load();
+        q.fallbacks = tally.fallbacks.load();
+        q.peak_worker_bytes = tally.peak_worker_bytes.load();
+        return q;
+    };
+    std::unique_ptr<ContentPlacementIndex> index;
+    std::unique_ptr<ContentIndexBatch> batch;
+    const auto release = [&]() {
+        const auto mark = Clock::now();
+        batch.reset();
+        index.reset();
+        rep.seconds_release = since(mark);
+    };
+    const auto started = Clock::now();
+    FragmentScoringResult result;
+    try {
+        auto mark = Clock::now();
+        index = std::make_unique<ContentPlacementIndex>(rep.max_read_bp, library.max_gap_bp, true);
+        for (std::size_t h = 0; h < unique; ++h) {
+            if (index->add_haplotype(haplotypes.sequences[h], segments[h]) != h) {
+                throw std::logic_error("the indexed union backend's slots must follow the interned order");
+            }
+        }
+        rep.seconds_index_build = since(mark);
+        mark = Clock::now();
+        batch = std::make_unique<ContentIndexBatch>(*index, fragments, library, batch_options);
+        rep.seconds_preparation = since(mark);
+        // the reference refuses mixed read lengths under the prefilter cache; so does this route (no silent fallback)
+        if (options.union_prefilter_cache_bytes > 0 && batch->report().prefilter_status != "on") {
+            throw std::invalid_argument("union prefilter reuse needs one read length");
+        }
+        batch->set_placement_store_budget(store_budget_bytes);
+        batch->set_legacy_store_layout(legacy_store_layout);
+        batch->set_fine_views(fine_views);   // I4-B (EXPERIMENTAL)
+        batch->set_one_shot(true);
+        batch->discover();
+        result = batch->score(candidates);
+    } catch (const ResourceExhausted& error) {
+        rep.refusal = error.what();
+        if (index) rep.index = index->report();
+        if (batch) rep.batch = batch->report();
+        if (observed_on_failure != nullptr) {
+            FragmentScoringObservation& o = *observed_on_failure;
+            o = FragmentScoringObservation{};
+            o.counters = rep.batch.counters_last;
+            o.counters.physical_origins = std::max(o.counters.physical_origins, rep.batch.physical_origins_observed);
+            o.threads_used_placement =
+                std::max<std::size_t>(1, std::max(rep.batch.threads_used_discovery, rep.batch.threads_used_pairing));
+            o.threads_used_combination = 0;
+            o.seconds_fragment_preparation = rep.seconds_preparation;
+            o.seconds_placement_and_mass = std::max(0.0, since(started) - rep.seconds_preparation);
+            o.seconds_diploid_combination = 0.0;
+            o.union_origin_cache = indexed_origin_report(rep.batch, options);
+            o.union_prefilter_cache = rep.batch.prefilter;
+            o.start_sort = start_sort_report();
+        }
+        release();
+        throw;
+    } catch (...) {
+        release();
+        throw;
+    }
+    rep.index = index->report();
+    rep.batch = batch->report();
+    const ContentBatchReport& b = rep.batch;
+    result.union_origin_cache = indexed_origin_report(b, options);
+    result.union_prefilter_cache = b.prefilter;
+    result.start_sort = start_sort_report();
+    result.emission_cache = b.emission_cache;
+    result.seconds_fragment_preparation = rep.seconds_preparation;
+    result.seconds_placement_and_mass =
+        rep.seconds_index_build + b.seconds_discovery + b.seconds_origin_construction + b.seconds_expansion_and_pairing;
+    // memory accounts, counted from the containers (placement peaks are not tracked on this route and stay 0)
+    result.memory.mass_matrix_bytes = static_cast<std::uint64_t>(result.log_mass.size()) * sizeof(double);
+    result.memory.haplotype_sequence_bytes = rep.index.unit_bytes;
+    for (const auto* forms : {&batch->state_->prepared.forward_forms, &batch->state_->prepared.reverse_forms}) {
+        for (const ReadForm& form : *forms) result.memory.form_sequence_bytes += form.bases.capacity();
+    }
+    for (const auto* indexes : {&batch->state_->prepared.forward_indexes, &batch->state_->prepared.reverse_indexes}) {
+        for (const PieceIndex& pi : *indexes) result.memory.piece_index_bytes += pi.entries.capacity() * sizeof(PieceEntry);
+    }
+    last_memory_slot() = result.memory;
+    last_emission_cache_slot() = result.emission_cache;
+    release();   // nothing indexed outlives the call
     return result;
 }
 

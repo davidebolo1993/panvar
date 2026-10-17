@@ -210,6 +210,16 @@ std::string sha256_bytes(const std::string& bytes) {
     return hash.hex();
 }
 
+struct Sha256Stream::State {
+    Sha256 hash;
+};
+Sha256Stream::Sha256Stream() : state_(std::make_unique<State>()) {}
+Sha256Stream::~Sha256Stream() = default;
+void Sha256Stream::update(const void* data, std::size_t size) {
+    state_->hash.update(static_cast<const unsigned char*>(data), size);
+}
+std::string Sha256Stream::hex() { return state_->hash.hex(); }
+
 // ---- the search --------------------------------------------------------------------------------
 
 DiplotypeIdentity diplotype_identity(const std::vector<std::size_t>& a, const std::vector<std::size_t>& b) {
@@ -275,6 +285,9 @@ void CoordinateRepairSearch::new_context() {
     if (options_.origin_cache) {
         context_->enable_origin_cache_path(true);
         context_->set_origin_cache_limits(options_.origin_cache_bytes, options_.origin_cache_records);
+    }
+    if (options_.fine_window_bytes != 0) {
+        context_->enable_fine_window_discovery(options_.fine_window_bytes, options_.fine_window_served_cap);
     }
     transient_opened_ = false;
     seeding_origins_ = 0;   // seeding work is counted within one context
@@ -444,7 +457,21 @@ bool CoordinateRepairSearch::run(const RepairHooks& hooks) {
         return diplotype_identity(a, b);
     };
 
+    // I2-C: measurement only -- disjoint wall laps, accumulated into stage_seconds_
+    using StageClock = std::chrono::steady_clock;
+    const auto since = [](StageClock::time_point t) { return std::chrono::duration<double>(StageClock::now() - t).count(); };
+    RepairStageSeconds& lap = stage_seconds_;
     for (std::size_t round = first_round; round <= final_round; ++round) {
+        struct RoundClock {
+            double& total;
+            StageClock::time_point start = StageClock::now();
+            ~RoundClock() { total += std::chrono::duration<double>(StageClock::now() - start).count(); }
+        } round_clock{lap.rounds_wall};
+        const auto timed_snapshot = [&](const char* kind, std::size_t index, const char* point, bool alive, bool relief) {
+            const auto t = StageClock::now();
+            snapshot(kind, index, point, alive, relief);
+            lap.memory_snapshots += since(t);
+        };
         RepairRound rec;
         rec.index = round;
         const auto round_mark = std::chrono::steady_clock::now();
@@ -453,8 +480,11 @@ bool CoordinateRepairSearch::run(const RepairHooks& hooks) {
 
         // The incumbent, spelled once per round: its block_intervals are the coordinates every
         // replacement below is expressed in.
+        auto lap_mark = StageClock::now();
         const HaplotypeSequence incumbent_a = spell_mosaic(model_, MosaicPath{cur_first_});
         const HaplotypeSequence incumbent_b = spell_mosaic(model_, MosaicPath{cur_second_});
+        lap.incumbent_spelling += since(lap_mark);
+        lap_mark = StageClock::now();
         if (use_delta && !have_inc_slots_) {
             // The initial pass: place the incumbent in full, then mark everything after it
             // transient. Owned cache keys mean a released haplotype's entries stay valid and keep
@@ -463,7 +493,9 @@ bool CoordinateRepairSearch::run(const RepairHooks& hooks) {
             // it again, and cycle prevention needs only its allele path, which the visited set holds.
             open_transient_round();
             const std::uint64_t seeding_before = context->cumulative_counters().physical_origins;
-            const std::vector<std::size_t> seeded = context->add_haplotypes({incumbent_a.bases, incumbent_b.bases});
+            // I2-D: fused, the censuses come from the same pass and the retain_census calls below place nothing
+            const std::vector<std::size_t> seeded =
+                context->add_haplotypes({incumbent_a.bases, incumbent_b.bases}, nullptr, false, options_.fused_seed);
             inc_slot_a_ = seeded.front();
             inc_slot_b_ = seeded.back();
             role_of_[inc_slot_a_] = inc_slot_a_ == inc_slot_b_ ? "seed_hap1+2" : "seed_hap1";
@@ -473,9 +505,12 @@ bool CoordinateRepairSearch::run(const RepairHooks& hooks) {
             seeding_origins_ += context->cumulative_counters().physical_origins - seeding_before;
             have_inc_slots_ = true;
         }
+        lap.seed_placement_census += since(lap_mark);
         if (use_delta) rec.transient_before = context->transient_payload_bytes();
-        snapshot(kind, snapshot_index, "before_candidates", false, false);
+        timed_snapshot(kind, snapshot_index, "before_candidates", false, false);
         const double lookup_before = emission_cache_lookup_seconds();
+        const auto generation_mark = StageClock::now();
+        double spelling_inside = 0.0, priors_inside = 0.0;
 
         // ---- neighbourhood construction. NO TRUTH IN SCOPE.
         std::vector<MosaicPath> paths;
@@ -487,7 +522,9 @@ bool CoordinateRepairSearch::run(const RepairHooks& hooks) {
             const std::size_t slot = paths.size();
             slot_of_path.emplace(alleles, slot);
             paths.push_back(MosaicPath{alleles});
+            const auto spell_mark = StageClock::now();
             sequences.push_back(spell_mosaic(model_, MosaicPath{alleles}).bases);
+            spelling_inside += since(spell_mark);
             return slot;
         };
         struct Neighbour {
@@ -544,7 +581,9 @@ bool CoordinateRepairSearch::run(const RepairHooks& hooks) {
                     }
                     const std::size_t s1 = slot_with(first, Provenance{false, 0, b, first[b]});
                     const std::size_t s2 = slot_with(second, Provenance{false, 1, b, second[b]});
+                    const auto prior_mark = StageClock::now();
                     const double prior = log_unordered_sequence_pair_prior(model_, sequences[s1], sequences[s2], switches_);
+                    priors_inside += since(prior_mark);
                     if (!std::isfinite(prior)) {
                         ++rec.rejected_prior;
                         continue;
@@ -553,6 +592,9 @@ bool CoordinateRepairSearch::run(const RepairHooks& hooks) {
                 }
             }
         }
+        lap.neighbour_spelling += spelling_inside;
+        lap.neighbour_priors += priors_inside;
+        lap.neighbour_generation += since(generation_mark) - spelling_inside - priors_inside;
         rec.neighbours = neighbours.size();
         if (request_order_seed != 0) {
             std::mt19937_64 rng(request_order_seed * 1000003ULL + round);
@@ -565,6 +607,7 @@ bool CoordinateRepairSearch::run(const RepairHooks& hooks) {
         }
 
         // ---- ONE scoring pass: the current candidate, then its neighbours
+        const auto scoring_mark = StageClock::now();
         std::map<std::pair<std::size_t, std::size_t>, std::size_t> scored_index;
         std::vector<HaplotypeCandidate> scored_pairs;
         std::vector<std::size_t> pair_of_item;
@@ -715,7 +758,8 @@ bool CoordinateRepairSearch::run(const RepairHooks& hooks) {
         if (context) rec.seconds += batch.seconds_placement_and_mass;
         // The deltas ran while slots were being resolved, which is before `mark`.
         if (use_delta) rec.seconds += round_delta.seconds;
-        snapshot(kind, snapshot_index, "after_scoring", true, false);
+        lap.scoring += since(scoring_mark);
+        timed_snapshot(kind, snapshot_index, "after_scoring", true, false);
         rec.rss = peak_rss_gib();
         {
             const FragmentScoringCounters& work = context ? batch.counters : scored.counters;
@@ -780,12 +824,14 @@ bool CoordinateRepairSearch::run(const RepairHooks& hooks) {
             cumulative_pairs_ += scored_pairs.size();
         }
 
+        lap_mark = StageClock::now();
         std::vector<double> prior_of_pair(scored_pairs.size(), 0.0);
         for (std::size_t slot = 0; slot < scored_pairs.size(); ++slot) {
             prior_of_pair[slot] = log_unordered_sequence_pair_prior(
                 model_, *sequence_of_slot.at(scored_pairs[slot].first), *sequence_of_slot.at(scored_pairs[slot].second),
                 switches_);
         }
+        lap.scored_pair_priors += since(lap_mark);
 
         // ---- the guard: the incumbent must still score what it scored before any neighbour is read.
         // Round 1 checks against the start's declared score, which is what ties the search to the
@@ -802,6 +848,7 @@ bool CoordinateRepairSearch::run(const RepairHooks& hooks) {
         // it, possibly through text at finite precision. Adopting it makes a resumed leg byte-identical.
         cur_total_ = incumbent;
         rec.start_total = incumbent;
+        lap_mark = StageClock::now();
         if (hooks.on_scored && !holding_) {
             for (std::size_t item = 0; item < pair_of_item.size(); ++item) {
                 const std::size_t at = pair_of_item[item];
@@ -818,6 +865,8 @@ bool CoordinateRepairSearch::run(const RepairHooks& hooks) {
             }
         }
 
+        lap.pool_hook += since(lap_mark);
+        const auto certification_mark = StageClock::now();
         // ---- certify the round with production's own certifier, in presentation order
         const auto certify = [&](bool reversed, const std::vector<DiplotypeScore>& view_scores) {
             std::vector<std::size_t> order(pair_of_item.size());
@@ -966,6 +1015,9 @@ bool CoordinateRepairSearch::run(const RepairHooks& hooks) {
                                 (rec.moved ? self.winner == key_of(rec.first, rec.second) : self.stop == stop_reason_);
             if (!agrees) throw std::logic_error("a round's verdict at the search's own view does not reproduce its decision");
         }
+        lap.certification_and_move += since(certification_mark);
+        const auto promotion_mark = StageClock::now();
+        const double snapshots_before_promotion = lap.memory_snapshots;
         if (use_delta) {
             std::vector<std::size_t> keep;
             if (rec.moved && winner_item != 0) {
@@ -982,7 +1034,7 @@ bool CoordinateRepairSearch::run(const RepairHooks& hooks) {
             } else {
                 keep = {inc_slot_a_, inc_slot_b_};
             }
-            snapshot(kind, snapshot_index, "after_promotion", true, false);
+            timed_snapshot(kind, snapshot_index, "after_promotion", true, false);
             std::vector<std::size_t> kept = keep;
             kept.insert(kept.end(), pinned_.begin(), pinned_.end());
             context->release_transient(kept);
@@ -994,8 +1046,8 @@ bool CoordinateRepairSearch::run(const RepairHooks& hooks) {
                 }
             }
             rec.transient_after = context->transient_payload_bytes();
-            snapshot(kind, snapshot_index, "after_release", true,
-                     options_.pressure_relief && holding_ && hold_remaining_ == 0);
+            timed_snapshot(kind, snapshot_index, "after_release", true,
+                           options_.pressure_relief && holding_ && hold_remaining_ == 0);
             // Re-read AFTER the promotion: the one materialisation a round performs happens there.
             rec.full_bytes = round_delta.full_haplotype_bytes_materialised;
             rec.key_bytes = round_delta.sequence_key_bytes;
@@ -1016,6 +1068,7 @@ bool CoordinateRepairSearch::run(const RepairHooks& hooks) {
             rec.seconds_enumeration_all = round_delta.seconds_enumeration;
             rec.seconds_reenumeration_all = round_delta.seconds_reenumeration;
         }
+        lap.promotion_release += since(promotion_mark) - (lap.memory_snapshots - snapshots_before_promotion);
         if (context) {
             const FragmentScoringCounters& cumulative = context->cumulative_counters();
             rec.cum_piece_hits = cumulative.piece_hits;
@@ -1037,7 +1090,9 @@ bool CoordinateRepairSearch::run(const RepairHooks& hooks) {
         rec.round_wall_seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - round_mark).count();
         if (!holding_) {
             rounds_.push_back(rec);
+            const auto hook_mark = StageClock::now();
             if (hooks.on_round) hooks.on_round(rounds_.back());
+            lap.trajectory_hook += since(hook_mark);
         }
         if (!rec.moved) {
             if (hold_remaining_ > 0) {

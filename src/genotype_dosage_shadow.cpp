@@ -124,6 +124,16 @@ DosageShadowSummary run_dosage_shadow(const PreparedGenotypeModel& model, const 
           << "seconds_dosage_provenance\t" << summary.seconds_provenance << '\n'
           << "seconds_dosage_allocation\t" << summary.seconds_allocation << '\n'
           << "seconds_dosage_total\t" << summary.seconds_total << '\n';
+        if (options.census_backend_declared) {   // I2-J: provenance, coarse census timers and work counters
+            const CensusWork& w = summary.census_work;
+            o << "dosage_census_backend\t" << census_backend_name(options.census_backend) << '\n'
+              << "seconds_dosage_census_walks\t" << w.seconds_walks << '\n'
+              << "seconds_dosage_census_summaries\t" << w.seconds_summaries << '\n'
+              << "seconds_dosage_census_pairs\t" << w.seconds_pairs << '\n'
+              << "dosage_census_work_alleles\t" << w.alleles << '\n'
+              << "dosage_census_work_ordered_pairs\t" << w.ordered_pairs << '\n'
+              << "dosage_census_work_pairs_compared\t" << w.pairs_compared << '\n';
+        }
         atomic_write(out_prefix + ".dosage_status.tsv", o.str());
     };
     const std::optional<std::size_t> span = molecule_span_bp(library.insert_mean_bp, library.insert_sd_bp, settings);
@@ -150,7 +160,8 @@ DosageShadowSummary run_dosage_shadow(const PreparedGenotypeModel& model, const 
         return summary;
     }
     auto t = std::chrono::steady_clock::now();
-    const std::vector<CensusBlock> census = run_census(model, nodes, *span, settings);
+    const std::vector<CensusBlock> census = run_census(model, nodes, *span, settings, options.census_backend,
+                                                       options.census_backend_declared ? &summary.census_work : nullptr);
     summary.seconds_census = seconds_since(t);
     t = std::chrono::steady_clock::now();
     std::vector<BlockFeatureModel> features(model.blocks().size());

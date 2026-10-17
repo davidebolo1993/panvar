@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <functional>
 #include <iostream>
 #include <map>
@@ -20,6 +21,16 @@
 namespace {
 
 constexpr double kNegInf = -std::numeric_limits<double>::infinity();
+
+// I2-H: the backend the emission gates below run on. main runs the emission oracle suite once per backend, so the
+// independent references (log space, the brute-force normalisation, hand-computed values) certify the experimental
+// recursion at their own existing tolerances -- not merely its agreement with the scaled implementation.
+panvar::GapRecursionBackend g_backend = panvar::GapRecursionBackend::scaled_reference;
+
+std::optional<panvar::GappedFit> emit(const std::string& haplotype, const std::string& read, std::size_t start,
+                                      const panvar::LibraryModel& model, std::size_t band) {
+    return panvar::gapped_dp_test::emission(haplotype, read, start, model, band, g_backend);
+}
 
 void require(bool condition, const std::string& message) {
     if (!condition) throw std::runtime_error(message);
@@ -211,9 +222,9 @@ void test_single_origin() {
     const double admitted =
         std::log(std::pow(1.0 - e, 8) + 8.0 * e * std::pow(1.0 - e, 7));   // F(1, 8)
     const auto exact_at_band_zero =
-        panvar::gapped_emission(haplotype, fragment.first.bases, 4, model, 0);
+        emit(haplotype, fragment.first.bases, 4, model, 0);
     const auto exact_at_band_one =
-        panvar::gapped_emission(haplotype, fragment.first.bases, 4, model, 1);
+        emit(haplotype, fragment.first.bases, 4, model, 1);
     require(exact_at_band_zero.has_value() && exact_at_band_one.has_value(),
             "the planted mate must place under both bands");
     require_close(exact_at_band_zero->log_emission, 0.0, 1e-12,
@@ -494,7 +505,7 @@ void test_gapped_reduces_to_substitution_model() {
                         const char was = bases[j];
                         bases[j] = was == 'A' ? 'C' : 'A';
                     }
-                    const auto fit = panvar::gapped_emission(haplotype, bases, 1, model, band);
+                    const auto fit = emit(haplotype, bases, 1, model, band);
                     const double expected = panvar::log_truncated_emission(length, m, e, band);
                     if (m > band) {
                         require(!fit.has_value() || fit->log_emission == kNegInf,
@@ -532,7 +543,7 @@ void test_gapped_emission_normalises() {
             for (std::size_t code = 0; code < 256; ++code) {
                 std::string bases(length, 'A');
                 for (std::size_t i = 0; i < length; ++i) bases[i] = "ACGT"[(code >> (2 * i)) & 3];
-                const auto fit = panvar::gapped_emission(haplotype, bases, 4, model, band);
+                const auto fit = emit(haplotype, bases, 4, model, band);
                 if (fit.has_value() && fit->log_emission != kNegInf) total += std::exp(fit->log_emission);
                 ++reads;
             }
@@ -562,7 +573,7 @@ void test_one_base_homopolymer_insertion() {
             "fixture: the substitution-only model must FAIL on this read, or the gate proves nothing");
 
     const panvar::LibraryModel model = gap_library(0.002, 2);
-    const auto fit = panvar::gapped_emission(haplotype, bases, 0, model, band);
+    const auto fit = emit(haplotype, bases, 0, model, band);
     require(fit.has_value() && std::isfinite(fit->log_emission),
             "a one-base homopolymer insertion must receive a valid gapped placement");
     require(fit->edits == 1, "it must cost exactly one edit, not a shifted run of substitutions");
@@ -585,7 +596,7 @@ void test_one_base_deletion() {
             "fixture: the substitution-only model must FAIL on this read, or the gate proves nothing");
 
     const panvar::LibraryModel model = gap_library(0.002, 2);
-    const auto fit = panvar::gapped_emission(haplotype, bases, 0, model, band);
+    const auto fit = emit(haplotype, bases, 0, model, band);
     require(fit.has_value() && std::isfinite(fit->log_emission),
             "a one-base deletion must receive a valid gapped placement");
     require(fit->edits == 1, "it must cost exactly one edit");
@@ -696,7 +707,7 @@ std::vector<panvar::FragmentPlacement> collapse_to_best_span(
         const std::string& forward = arm == 0 ? fragment.first.bases : fragment.second.bases;
         const std::string& reverse = arm == 0 ? rc_second : rc_first;
         for (std::size_t fs = 0; fs < haplotype.size(); ++fs) {
-            const auto forward_fit = panvar::gapped_emission(haplotype, forward, fs, model, band);
+            const auto forward_fit = emit(haplotype, forward, fs, model, band);
             if (!forward_fit.has_value() || forward_fit->log_emission == kNegInf) continue;
             for (std::size_t re = 0; re <= haplotype.size(); ++re) {
                 // Right-anchored, exactly as the corrected implementation anchors it. The ONLY thing
@@ -905,7 +916,7 @@ std::size_t floor_exclusions(const std::string& haplotype, const panvar::ReadPai
     const std::string reverse = revcomp(fragment.second.bases);
     for (std::size_t fs = 0; fs < haplotype.size(); ++fs) {
         const auto forward_fit =
-            panvar::gapped_emission(haplotype, fragment.first.bases, fs, model, band);
+            emit(haplotype, fragment.first.bases, fs, model, band);
         if (!forward_fit.has_value()) continue;
         for (std::size_t re = fs + 1; re <= haplotype.size(); ++re) {
             const auto reverse_fit =
@@ -1046,7 +1057,7 @@ void test_component_factorisation_and_collapse() {
         const std::string& forward = arm == 0 ? fragment.first.bases : fragment.second.bases;
         const std::string& reverse = arm == 0 ? rc_second : rc_first;
         for (std::size_t fs = 0; fs < haplotype.size(); ++fs) {
-            const auto forward_fit = panvar::gapped_emission(haplotype, forward, fs, model, band);
+            const auto forward_fit = emit(haplotype, forward, fs, model, band);
             if (!forward_fit.has_value()) continue;
             for (std::size_t re = 0; re <= haplotype.size(); ++re) {
                 const auto reverse_fit =
@@ -1160,7 +1171,7 @@ void test_scaled_emission_matches_the_reference() {
                         }
 
                         const auto fast =
-                            panvar::gapped_emission(haplotype, read, start, model, band);
+                            emit(haplotype, read, start, model, band);
                         const auto reference =
                             panvar::gapped_emission_reference(haplotype, read, start, model, band);
                         ++compared;
@@ -1273,7 +1284,7 @@ void test_emission_cache_matches_the_reference_under_hash_collapse() {
         for (int pass = 0; pass < 2; ++pass) {     // second pass must come from the cache
             for (std::size_t i = 0; i < reads.size(); ++i) {
                 const auto got =
-                    panvar::gapped_emission(haplotype, reads[i], starts[i], model, band);
+                    emit(haplotype, reads[i], starts[i], model, band);
                 require(got.has_value() == expected[i].has_value(),
                         "a totally collided cache must still accept and refuse exactly as the "
                         "reference does");
@@ -1389,23 +1400,211 @@ void test_prepared_myers_pattern_matches_the_unprepared_decision() {
               << " cases (" << admitted << " admitted, " << refused << " refused)\n";
 }
 
+bool same_bits(double a, double b) { return std::memcmp(&a, &b, sizeof(double)) == 0; }
+
+// I2-H: the fixed-geometry emitting recursion against the scaled reference, BIT FOR BIT -- the raw total, every
+// consumed-span component (span, log mass, edits), the normalised emission and the selected span and edit count --
+// and its fallback to the reference wherever it has no fixed geometry. Agreement with the scaled implementation is
+// not model validation: the independent references run on the experimental backend separately (main), at their own
+// tolerances, and this sweep adds a log-space check of its own on a subset.
+void test_fixed_geometry_matches_scaled_bitwise() {
+    using panvar::GapRecursionBackend;
+    namespace dp = panvar::gapped_dp_test;
+    std::mt19937_64 rng(20261016);
+    std::string haplotype(1500, 'A');
+    for (char& base : haplotype) base = "ACGT"[rng() % 4];
+    haplotype.replace(150, 12, std::string(12, 'T'));                                  // a homopolymer
+    for (std::size_t r = 0; r < 8; ++r) haplotype.replace(400 + 5 * r, 5, "CAGGT");   // a tandem repeat
+
+    std::size_t compared = 0, fixed_compared = 0, fallback_compared = 0, accepted = 0, refused = 0;
+    std::size_t refused_after_recursion = 0, multi_component = 0, rescaled = 0, clipped = 0, oracle_checked = 0;
+    double worst_oracle = 0.0;
+    const auto compare = [&](const std::string& hap, const std::string& read, std::size_t start,
+                             const panvar::LibraryModel& model, std::size_t band, bool oracle) {
+        const bool supported = dp::fixed_geometry_supported(band, model);
+        const std::uint64_t runs = dp::fixed_geometry_executions();
+        const std::size_t available = hap.size() - start;
+        panvar::ComponentList ref_c, fix_c;
+        const double ref = dp::recursion(hap, read, start, available, band, model, &ref_c, GapRecursionBackend::scaled_reference);
+        const double fix = dp::recursion(hap, read, start, available, band, model, &fix_c, GapRecursionBackend::fixed_geometry_experimental);
+        require(dp::fixed_geometry_executions() == runs + (supported ? 1 : 0),
+                "the experimental backend must run its fixed geometry exactly where it is supported");
+        require(same_bits(ref, fix), "the raw total must agree bit for bit");
+        require(ref_c.size() == fix_c.size(), "the consumed-span components must agree in number");
+        for (std::size_t c = 0; c < ref_c.size(); ++c) {
+            require(ref_c[c].consumed_bp == fix_c[c].consumed_bp && ref_c[c].edits == fix_c[c].edits &&
+                        same_bits(ref_c[c].log_emission, fix_c[c].log_emission),
+                    "every consumed-span component must agree bit for bit (span, log mass, edits)");
+        }
+        if (ref != kNegInf && ref < std::log(1e-100)) ++rescaled;   // a row maximum fell below the rescaling floor
+        if (available < read.size() + model.max_gap_bp) ++clipped;
+        ++compared;
+        ++(supported ? fixed_compared : fallback_compared);
+        // The complete emission needs a read the haplotype can hold from the start (its eligibility rule).
+        if (read.empty() || available < read.size()) return;
+        const auto ref_fit = dp::emission(hap, read, start, model, band, GapRecursionBackend::scaled_reference);
+        const auto fix_fit = dp::emission(hap, read, start, model, band, GapRecursionBackend::fixed_geometry_experimental);
+        require(ref_fit.has_value() == fix_fit.has_value(), "acceptance and refusal must agree");
+        if (!ref_fit.has_value()) {
+            ++refused;
+            if (ref == kNegInf && dp::feasible(hap, read, start, model, band)) ++refused_after_recursion;
+            return;
+        }
+        ++accepted;
+        if (ref_fit->components.size() > 1) ++multi_component;
+        require(same_bits(ref_fit->log_emission, fix_fit->log_emission) && ref_fit->consumed_bp == fix_fit->consumed_bp &&
+                    ref_fit->edits == fix_fit->edits && ref_fit->components.size() == fix_fit->components.size(),
+                "the normalised emission, selected span and edit count must agree bit for bit");
+        for (std::size_t c = 0; c < ref_fit->components.size(); ++c) {
+            require(ref_fit->components[c].consumed_bp == fix_fit->components[c].consumed_bp &&
+                        ref_fit->components[c].edits == fix_fit->components[c].edits &&
+                        same_bits(ref_fit->components[c].log_emission, fix_fit->components[c].log_emission),
+                    "every normalised component must agree bit for bit");
+        }
+        if (oracle) {
+            const auto logspace = panvar::gapped_emission_reference(hap, read, start, model, band);
+            require(logspace.has_value() && logspace->components.size() == fix_fit->components.size(),
+                    "the log-space reference must accept with the same consumed-span classes");
+            for (std::size_t c = 0; c < fix_fit->components.size(); ++c) {
+                require(logspace->components[c].consumed_bp == fix_fit->components[c].consumed_bp &&
+                            logspace->components[c].edits == fix_fit->components[c].edits,
+                        "spans and edits must match the log-space reference exactly");
+                worst_oracle = std::max(worst_oracle, std::abs(logspace->components[c].log_emission -
+                                                               fix_fit->components[c].log_emission));
+            }
+            worst_oracle = std::max(worst_oracle, std::abs(logspace->log_emission - fix_fit->log_emission));
+            ++oracle_checked;
+        }
+    };
+    const auto variants = [&](const std::string& hap, std::size_t start, std::size_t length, std::size_t band,
+                              std::size_t max_gap) {
+        std::vector<std::string> out;
+        const std::string exact = hap.substr(start, length);
+        out.push_back(exact);
+        for (const std::size_t subs : {band, band + 1}) {   // at and above the band
+            std::string read = exact;
+            for (std::size_t e = 0; e < subs && e < length; ++e) {
+                const std::size_t at = (e * 13 + 5) % length;
+                read[at] = read[at] == 'A' ? 'C' : 'A';
+            }
+            out.push_back(read);
+        }
+        for (std::size_t g = 1; g <= max_gap + 1 && g <= 4; ++g) {   // up to one beyond the gap allowance
+            if (start + length + g > hap.size()) break;
+            std::string ins = exact;
+            ins.insert(length / 3, std::string(g, ins[length / 3]));
+            ins.resize(length);
+            out.push_back(ins);
+            std::string del = hap.substr(start, length + g);
+            del.erase(length / 2, g);
+            out.push_back(del);
+        }
+        std::string impossible(length, 'A');
+        for (char& base : impossible) base = "ACGT"[rng() % 4];
+        out.push_back(impossible);
+        return out;
+    };
+
+    // Every geometry: gap allowances 0..4 (0 and 4 unsupported), bands 0..9 (0 and 9 unsupported), read lengths
+    // around the 64- and 128-bit word boundaries, interior, homopolymer, tandem-repeat and clipped starts.
+    std::size_t case_index = 0;
+    for (std::size_t max_gap = 0; max_gap <= 4; ++max_gap) {
+        const panvar::LibraryModel model = gap_library(0.002, max_gap);
+        for (const std::size_t band : {0, 1, 2, 3, 5, 6, 8, 9}) {
+            require(dp::fixed_geometry_supported(band, model) ==
+                        (max_gap >= 1 && max_gap <= 3 && band >= 1 && band <= 8),
+                    "the supported geometries are exactly max_gap_bp 1..3 and mismatch band 1..8");
+            for (const std::size_t length : {12, 64, 65, 100, 128, 129}) {
+                std::vector<std::size_t> starts = {0, 145, 395};
+                for (std::size_t slack = 0; slack <= max_gap; ++slack) starts.push_back(haplotype.size() - length - slack);
+                for (const std::size_t start : starts) {
+                    for (const std::string& read : variants(haplotype, start, length, band, max_gap)) {
+                        compare(haplotype, read, start, model, band, length <= 65 && (case_index++ % 11) == 0);
+                    }
+                }
+                // A tiny target: the haplotype is exactly the read's source.
+                const std::string tiny = haplotype.substr(700, length);
+                compare(tiny, tiny, 0, model, band, false);
+            }
+        }
+    }
+    // Every probability regime at the production geometry: substitution error, zero and nonzero gap opening, and
+    // gap extension; and long reads at a high error rate, whose row maxima fall below the rescaling floor.
+    for (const double error : {0.002, 0.02, 0.3, 0.7}) {
+        for (const double gap_open : {0.0, 1e-4, 0.05}) {
+            for (const double gap_extend : {0.0, 0.5, 0.9}) {
+                panvar::LibraryModel model = gap_library(error, 3);
+                model.gap_open = gap_open;
+                model.gap_extend = gap_extend;
+                for (const std::size_t length : {100, 250, 400}) {
+                    for (const std::size_t start : {std::size_t{37}, std::size_t{140}, haplotype.size() - length - 1}) {
+                        for (const std::string& read : variants(haplotype, start, length, 6, 3)) {
+                            compare(haplotype, read, start, model, 6, false);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // Invalid input keeps its refusal on both backends.
+    for (const GapRecursionBackend backend :
+         {GapRecursionBackend::scaled_reference, GapRecursionBackend::fixed_geometry_experimental}) {
+        const panvar::LibraryModel model = gap_library(0.002, 3);
+        std::string ambiguous = haplotype.substr(300, 100);
+        ambiguous[50] = 'N';
+        require_throws([&] { (void)dp::emission(haplotype, ambiguous, 300, model, 6, backend); },
+                       "a non-ACGT read must be refused on either backend");
+        require_throws([&] { (void)dp::emission(haplotype, "", 300, model, 6, backend); },
+                       "an empty read must be refused on either backend");
+        std::string bad_window = haplotype;
+        bad_window[320] = 'N';
+        require_throws([&] { (void)dp::emission(bad_window, haplotype.substr(300, 100), 300, model, 6, backend); },
+                       "a non-ACGT haplotype window must be refused on either backend");
+    }
+    require(worst_oracle < 1e-9,
+            "the experimental backend must match the log-space reference within its declared tolerance");
+    require(fixed_compared > 0 && fallback_compared > 0 && accepted > 0 && refused > 0 && refused_after_recursion > 0 &&
+                multi_component > 0 && rescaled > 0 && clipped > 0 && oracle_checked > 0,
+            "the sweep must exercise both paths, acceptance, both refusals, multi-span fits, rescaling, clipped windows "
+            "and the log-space check, or it certifies far less than it appears to");
+    std::cout << "  fixed-geometry recursion bit-identical to the scaled reference on " << compared << " requests ("
+              << fixed_compared << " fixed, " << fallback_compared << " fallback; " << accepted << " accepted, "
+              << refused << " refused, " << refused_after_recursion << " after the recursion; " << multi_component
+              << " multi-span, " << rescaled << " rescaled, " << clipped << " clipped); log-space worst delta "
+              << worst_oracle << " on " << oracle_checked << '\n';
+}
+
+// The emission oracle suite: every gate whose emission goes through emit().
+void run_emission_oracle_suite() {
+    test_scaled_emission_matches_the_reference();
+    test_emission_cache_matches_the_reference_under_hash_collapse();
+    test_gapped_reduces_to_substitution_model();
+    test_gapped_emission_normalises();
+    test_one_base_homopolymer_insertion();
+    test_one_base_deletion();
+    test_signal_density_integrates_to_exposure();
+    test_best_span_collapse_is_rejected();
+    test_component_factorisation_and_collapse();
+    test_single_origin();
+}
+
 int main() {
     try {
         test_prepared_myers_pattern_matches_the_unprepared_decision();
-        test_scaled_emission_matches_the_reference();
-        test_emission_cache_matches_the_reference_under_hash_collapse();
-        test_gapped_reduces_to_substitution_model();
-        test_gapped_emission_normalises();
-        test_one_base_homopolymer_insertion();
-        test_one_base_deletion();
-        test_signal_density_integrates_to_exposure();
-        test_best_span_collapse_is_rejected();
-        test_component_factorisation_and_collapse();
+        run_emission_oracle_suite();
+        // I2-H: the same independent references, at the same tolerances, on the experimental recursion.
+        g_backend = panvar::GapRecursionBackend::fixed_geometry_experimental;
+        const std::uint64_t fixed_before = panvar::gapped_dp_test::fixed_geometry_executions();
+        std::cout << "  emission oracle suite on the fixed-geometry backend:\n";
+        run_emission_oracle_suite();
+        require(panvar::gapped_dp_test::fixed_geometry_executions() > fixed_before,
+                "the oracle suite must actually exercise the fixed-geometry recursion on the experimental backend");
+        g_backend = panvar::GapRecursionBackend::scaled_reference;
+        test_fixed_geometry_matches_scaled_bitwise();
         test_emission();
         test_fr_geometry();
         test_exposure();
         test_fragment_contribution();
-        test_single_origin();
         test_both_orientations();
         test_repeat_multiplicity();
         test_band_is_model();
