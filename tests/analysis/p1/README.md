@@ -151,3 +151,21 @@ python3 tests/analysis/p1/p1_run.py next      # repeat; one process at a time, b
 1. **Explored projection coverage is not completeness.** The block labellings seen among explored candidates do not prove that a sequence's projection is unique, so they do not give unconditional error bounds. A reported bound must be qualified as conditional on the explored candidates, or come from a complete enumeration.
 2. **Representation intervals must include coupled context.** Where alternative labellings of one sequence are coupled across a context block, the interval must include that intervening context. The proposal's maximal runs of adjacent ambiguous blocks are insufficient. An example is CYP2D6 sv:3..sv:5 across ctx:4, where one 59 bp unit can be counted on either side.
 3. **Legacy-output identity needs explicit treatment of new settings and provenance fields.** A new `output_schema` key, and any provenance rows, appear in the settings and status tables. "Byte-identical legacy output" must say whether an unset key writes no row, whether a set `legacy` value writes one, and how the comparison treats them.
+
+## 7. P1.1 validation closure (appended 2026-10-17)
+
+| commit | content |
+|---|---|
+| `3746266` | composer allowlist guard and tests, outcome bookkeeping, wrapper controls, closure runner |
+| `9f5b698` | amendment 1: a control-script fix |
+
+Results are in `tests/results/p11_validation_closure_20261017/README.md`. The implementation under test is still `392fc0b`.
+
+**Verdict: ready for S1.**
+- **Enabled suite complete:** 48 of 48 passed on `392fc0b`, combining recorded individual passes; the 2 disabled tests are preserved.
+- **Mandatory comparisons complete:** all 12 passed. That includes ACOT 5× optimised vs reference, closed by one reference run with a longer declared operational time limit.
+- **High coverage:** C4 and CYP2D6 30× consolidated vs stack both passed. CYP2D6 30× is a completed scientific no-call (`distinct_tie`) on both builds.
+
+**Composer change.** `compose_profile.py` now allows overrides of `time_limit_seconds` and `footprint_limit_bytes` only. All 22 recorded P1 profiles satisfy this.
+
+**Outcome rule.** `p1_compare.py` classes each run as a completed call, a completed scientific no-call, or incomplete. A pair with an incomplete side is UNRESOLVED, and blocks the validation verdict when that pair is mandatory.
