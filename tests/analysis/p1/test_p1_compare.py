@@ -44,8 +44,9 @@ def edit_status(path, changes):
 
 def flip_fasta(path):
     lines = open(path).read().split("\n")
-    seq = lines[1]
-    lines[1] = ("C" if seq[100] != "C" else "G").join([seq[:100], seq[101:]])
+    seq = lines[1]   # the FASTA is wrapped (60 columns): flip a base inside the first sequence line
+    at = len(seq) // 2
+    lines[1] = seq[:at] + ("C" if seq[at] != "C" else "G") + seq[at + 1:]
     open(path, "w").write("\n".join(lines))
 
 

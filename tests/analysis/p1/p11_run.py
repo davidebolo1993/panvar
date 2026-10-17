@@ -60,6 +60,13 @@ MANIFEST += [("r2.acot_5", "cli", "acot_5", "p1", "ref", 300, ""),
              ("o.cyp_30", "cli", "cyp_30", "p1", "opt", 150, ""),
              ("x.cyp_30", "cli", "cyp_30", "stack", "opt", 150, ""),
              ("compare.30x", "compare", "", "", "", 60, "")]
+# Amendment 1 (committed after wrapper.controls failed on its own defect, before any further execution): the control
+# script indexed base 100 of a FASTA line, but the FASTA is wrapped at 60 columns (IndexError after 10 of 18 cases, all 10
+# as required). Fixed to flip the middle base of the first sequence line; wrapper.controls.a1 reruns all cases.
+# wrapper.controls stays recorded as run (exit 1).
+AMENDMENT_1 = [("wrapper.controls.a1", "py", "test_p1_compare.py", "", "", 120, f"{P1}/runs/o.c4_5|{P1}/runs/o.c4_5.r2")]
+ORDER = [m[0] for m in MANIFEST]
+ORDER.insert(ORDER.index("wrapper.controls") + 1, "wrapper.controls.a1")
 # mandatory pairs (a validation-complete verdict needs every one to PASS); run dirs: P1 saved runs or this batch's
 MANDATORY = [
     ("stack", "P1:o.c4_5", "P1:x.c4_5"), ("stack", "P1:o.cyp_5", "P1:x.cyp_5"), ("stack", "P1:o.acot_5", "P1:x.acot_5"),
@@ -197,8 +204,10 @@ def coverage():
 
 
 def run_unit(unit):
-    u, kind, target, build, arm, timeout, extra = next(m for m in MANIFEST if m[0] == unit)
+    u, kind, target, build, arm, timeout, extra = next(m for m in MANIFEST + AMENDMENT_1 if m[0] == unit)
     assert open(f"{OUT}/MANIFEST.tsv").read() and timeout <= 300 and unit not in done()
+    if any(m[0] == unit for m in AMENDMENT_1):
+        assert os.path.exists(f"{OUT}/AMENDMENT_1.tsv"), "freeze amendment 1 first"
     os.makedirs(OUT, exist_ok=True)
     unchanged = cpp_unchanged()
     assert unchanged, "the C++ implementation changed since 392fc0b"
@@ -267,8 +276,14 @@ if __name__ == "__main__":
         if sys.argv[2] == "compare.30x":
             sys.exit(compare([("high_coverage", HIGH_COVERAGE)], "compare_30x.tsv"))
         sys.exit(compare([("mandatory", MANDATORY), ("informational", INFORMATIONAL)], "compare.tsv"))
+    elif arg == "amendment1":
+        text = "".join("\t".join(str(x) for x in m) + "\n" for m in AMENDMENT_1)
+        p = f"{OUT}/AMENDMENT_1.tsv"
+        assert not os.path.exists(p) or open(p).read() == text
+        open(p, "w").write(text)
+        print(text, end="")
     elif arg == "next":
-        todo = [m[0] for m in MANIFEST if m[0] not in done()]
+        todo = [u for u in ORDER if u not in done()]
         sys.exit(run_unit(todo[0]) if todo else print("all units recorded") or 0)
     else:
         sys.exit(run_unit(arg))
