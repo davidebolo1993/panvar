@@ -216,3 +216,56 @@ Section 6 above has been amended in place. The original statements and their cor
 - **C6** (S0 v2 measurements, `tests/results/s0_v2_20261015/README.md`). The distant-evidence "minor-side mass share" is a descriptive statistic of the explored pool. It is not a bound, and it does not permit distant evidence to be discarded.
 - **C7** (same README). The proposed CYP2D6 sv:9 depth diagnostic needs expected counts produced by the same read-selection process as its observed counts. The 701 fragments were selected because they discriminate between pool candidates. They cannot be compared with a whole-block exposure term.
 
+
+## 7. S1-A: the corrected contract for the first reporting implementation (2026-10-17)
+
+**What this section is.** It narrows section 6 to what S1 implements, and corrects assumptions that section 6 left open. Where it differs from section 6, it supersedes. Evidence is in `tests/analysis/s1a/` (fixtures F1–F7 and permutations, current outputs against proposed ones) and `tests/results/s1a_sequence_reporting_20261017/`.
+
+### 7.1 Essential reporting fixes (S1) and later scientific changes (not S1)
+
+| S1: reporting only, no score, prior or search change | later, each with its own study |
+|---|---|
+| keep a prediction after any completed, valid ranking | calibration (`structure_confidence`) and any PASS threshold |
+| pool sequence-identical labellings; label-only ambiguity becomes `REPRESENTATION_AMBIGUOUS` blocks and interval rows, not a locus no-call | a structural tolerance τ, `SMALL`/`MATERIAL` classes, homologue-allocation equivalence |
+| distinct-sequence ties keep a canonical representative plus alternatives; agreeing blocks stay identified | MBR or any other representative rule |
+| `PROVISIONAL` predictions from a valid, exactly scored candidate when the search stops at a declared cap | projection weighting across alternative block labellings, and projection-aware GQ as a probability |
+| conservative projection-aware error-mass bounds for identified blocks (explored pool); the existing GQ kept, labelled as representative-projection GQ | complete projection sets from model-level representation intervals (section 5 step 1) |
+| canonical, order-independent outputs | dosage and phase handling of intervals |
+
+### 7.2 Corrections to section 6
+
+- **K1. The posterior is not an upper bound** (restates C2). The candidate-conditional posterior is not an upper (or lower) bound on biological correctness. It is reported only as the advanced `pool_conditional_posterior` of the representative's sequence group, never as confidence. **RESOLVED does not imply high confidence:** F4 is `RESOLVED` with `pool_conditional_posterior` 0.333, because distinct phase alternatives sit just below the decision set.
+- **K2. Strata are not inputs** (restates C3). LZO, mosaic and LOO are benchmark strata. Nothing in S1 conditions on them, or names them, at prediction time.
+- **K3. No calibrated probability and no new PASS.** S1 introduces no `FILTER=PASS` semantics:
+  - `structure_confidence` is written as `NA` with reason `UNCALIBRATED`;
+  - the existing headline filter columns keep their current definitions and are computed only on identified blocks;
+  - section 6.3's PASS rule is deferred until a calibration study exists.
+- **K4. No tolerance classes in S1** (restates C1). S1 compares sequences only as `IDENTICAL` or `DISTINCT` (by digest). There are no `SMALL`/`MATERIAL` classes, and no claim of structural or homologue-allocation equivalence: a 50 bp cutoff defines neither.
+- **K5. The representative.** Among the decision set's sequence groups, it is the one with the highest certified score, ties broken by the canonical sequence-digest pair (the group order `decide_pooled_genotype` already uses). It never depends on candidate, template or alias order. MBR stays research.
+  - The alternatives table is the decision set plus the top 5 groups by score.
+  - Each alternative is compared with the representative only, block by block. No pairwise sequence distance is computed across the pool.
+- **K6. Projections (review C2).** Every sequence group carries exactly one weight. For an identified block, S1 reports conservative error-mass bounds over the explored pool:
+  - **lower:** groups all of whose projections differ at the block;
+  - **upper:** groups with any projection that differs.
+
+  No point probability is invented for a labelling choice, and a group's weight is never duplicated across labellings to form a probability. The existing `conditional_GQ` is kept, labelled `representative_projection_GQ`.
+  - **F6 shows why.** The current GQs are 35.2 (sv:1) and 15.8 (sv:2) for a symmetric situation, while both blocks' error mass lies in [1.3e-4, 0.026].
+  - **Coverage.** S1 projection sets come from the labellings the caller explored (its sequence groups' members), and are flagged `projection_coverage=EXPLORED`. Complete sets need the model's representation intervals (section 5 step 1). On F1–F7 the explored labellings happened to cover every projection; that is a fixture property, not a guarantee.
+- **K7. `PARTIALLY_RESOLVED` is dropped as a separate S1 class.** Section 6 distinguished it from `SEQUENCE_TIED` only by "how many blocks agree", with no rule. S1 reports `SEQUENCE_TIED` whenever distinct decision-set sequence pairs differ at any block genotype. Partial resolution is carried by the block rows: agreeing blocks `IDENTIFIED`, the others `GENOTYPE_UNRESOLVED` with their alternatives (F5).
+- **K8. When a result is `PROVISIONAL`.**
+  - **Provisional:** only when the search stopped at a declared cap (round cap, cumulative cap) **and** a valid, exactly scored candidate exists — the last committed incumbent. `sequence_status` is then `NOT_DETERMINED`, because no decision set was computed, and no confidence is defined (F7).
+  - **No prediction:** stops by the time or footprint watchdog. The process is stopped from another thread with no safe state to report, so S1 writes no prediction there. Incomplete score accumulation never yields a prediction.
+- **K9. Hard failures** (invalid input, model refusal, no admissible candidate) remain `NO_PREDICTION`.
+
+### 7.3 Status mapping (old names kept for comparison)
+
+| current (`run_status`, `call_class`, `no_call_reason`) | S1 (`prediction`, `sequence_status`) | fixture |
+|---|---|---|
+| COMPLETE, strict_call | PREDICTION, RESOLVED | F6, F7full |
+| CONDITIONAL_GENOTYPE_EQUIVALENT, genotype_equivalent_call | PREDICTION, GENOTYPE_RESOLVED_SEQUENCE_SET (the representative's FASTA is now written) | F3 |
+| RESCORE_INCOMPLETE, no_call, distinct_tie — top set is one sequence group | PREDICTION, RESOLVED, with `REPRESENTATION_AMBIGUOUS` blocks and interval rows | F1, F2, F4 |
+| RESCORE_INCOMPLETE, no_call, distinct_tie — distinct sequence groups | PREDICTION, SEQUENCE_TIED, agreeing blocks identified | F5 |
+| REPAIR_INCOMPLETE, no_call, round_cap or cumulative_cap | PREDICTION, NOT_DETERMINED, provisional | F7 |
+| TIME_LIMIT, RESOURCE_REFUSAL, CANDIDATE_INCOMPLETE, invalid input | NO_PREDICTION | — |
+
+`run_status`, `call_class` and `no_call_reason` keep their current values under the new schema, so history stays comparable.
