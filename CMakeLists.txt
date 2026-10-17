@@ -160,6 +160,7 @@ add_library(panvarlib
     src/genotype_headline.cpp
     src/genotype_dosage_provenance.cpp
     src/fragment_likelihood.cpp
+    src/genotype_sequence_report.cpp
     src/bubble_path.cpp
     src/bubbles.cpp
     src/ref_path.cpp
@@ -336,6 +337,12 @@ if(PANVAR_BUILD_TESTING)
         target_link_libraries(genotype_batch_resource_test PRIVATE panvarlib)
         target_compile_options(genotype_batch_resource_test PRIVATE -Wall -Wextra -Wpedantic)
         add_test(NAME panvar_genotype_batch_resource COMMAND genotype_batch_resource_test)
+        # S1-B: the sequence-first reporting layer on hand-built pooled decisions.
+        add_executable(genotype_sequence_report_test tests/genotype_sequence_report.cpp src/cli_utils.cpp)
+        target_link_libraries(genotype_sequence_report_test PRIVATE panvarlib)
+        target_compile_options(genotype_sequence_report_test PRIVATE -Wall -Wextra -Wpedantic)
+        add_test(NAME panvar_genotype_sequence_report
+                 COMMAND genotype_sequence_report_test ${CMAKE_CURRENT_BINARY_DIR}/genotype_sequence_report_out)
         # I3-C: the persistent prepared-locus index v1 (codec, bounded loading, accounting, publication).
         add_executable(genotype_prepared_locus_file_test tests/genotype_prepared_locus_file.cpp src/cli_utils.cpp)
         target_link_libraries(genotype_prepared_locus_file_test PRIVATE panvarlib)

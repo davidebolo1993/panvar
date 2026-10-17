@@ -187,6 +187,12 @@ struct GenotypeCommandOptions {
     // handed to the adaptive search's scoring context (FragmentScoringOptions::emission_handoff_out/_in). Exact; setting
     // the key reports the handoff in the status.
     bool adaptive_emission_handoff = false;
+    // S1-B (EXPERIMENTAL, opt-in reporting): `output_schema legacy|sequence_first_v1` (profile key or --output-schema).
+    // legacy (the default) changes nothing; explicitly given, it adds exactly one settings row and one status row
+    // (output_schema legacy). sequence_first_v1 adds the <prefix>.sequence_* outputs (genotype_sequence_report.hpp), its
+    // status rows and its exit semantics (0 PREDICTION, 3 PROVISIONAL, 1 NO_PREDICTION); every legacy output is unchanged.
+    // It needs the adaptive repair (the pooled decision); other routes are refused.
+    std::string output_schema = "legacy";
     // I2-B (EXPERIMENTAL, profile keys only, never public settings): how the adaptive search's window enumeration builds
     // its placement rows. "reference" (the default) scans each enumerated window whole, unchanged. "fine_experimental"
     // builds the same rows from a round-local, per-worker fine store (PreparedScoringContext::
@@ -449,5 +455,9 @@ std::optional<int> parse_genotype_arguments(const std::vector<std::string>& args
                                             std::ostream& out);
 
 int run_genotype_command(const std::vector<std::string>& args);
+// The per-sample command after argument resolution (genotype, sequence report, dosage, locus table) -- what
+// run_genotype_command runs; exposed for tests. `locus` is a prepared locus or null.
+class PreparedLocus;
+int execute_genotype_command(const GenotypeCommandOptions& options, const PreparedLocus* locus);
 
 } // namespace panvar

@@ -1,4 +1,5 @@
 #include "panvar/genotype_command.hpp"
+#include "panvar/genotype_sequence_report.hpp"
 #include "panvar/prepared_locus.hpp"
 #include "panvar/prepared_locus_file.hpp"
 #include "prepared_locus_parts.hpp"
@@ -95,6 +96,9 @@ RunWatch* g_watch = nullptr;
 std::vector<std::pair<std::string, std::string>> g_input_hashes;
 // I2-E: what the marker-proposal contribution reuse did in this run (reported when its key is set)
 ProposalReuseReport g_proposal_reuse;
+// S1-B (sequence_first_v1 only): this run's sequence report and its legacy classification (reset per run)
+SequenceReport g_sequence_report;
+SequenceLegacy g_sequence_legacy;
 std::uint64_t g_union_end_footprint = 0;   // I2-K (measurement): physical footprint right after the union pass
 // I3-A: what the status says about a prepared locus this run used (reset at every run start).
 struct PreparedLocusUse {
@@ -825,7 +829,7 @@ void write_status(
                                 "indexed_union_store_layout", "indexed_union_evidence_layout", "timing_detail", "adaptive_fused_seed",
                                 "marker_proposal_reuse_table_bytes", "combination_prepared_library_terms",
                                 "gap_recursion_backend",
-                                "dosage_census_backend", "adaptive_emission_handoff"}) {
+                                "dosage_census_backend", "adaptive_emission_handoff", "output_schema"}) {
             const auto source = options.setting_sources.find(key);
             if (source == options.setting_sources.end()) continue;
             const std::string k = key;
@@ -845,6 +849,7 @@ void write_status(
                                           ? std::string(options.dosage_census_interned ? "interned_experimental" : "reference")
                                       : k == "adaptive_emission_handoff"
                                           ? std::string(options.adaptive_emission_handoff ? "1" : "0")
+                                      : k == "output_schema" ? options.output_schema
                                       : k == "gap_recursion_backend"
                                           ? std::string(gap_recursion_backend_name(options.gap_recursion_fixed_geometry))
                                                                          : std::to_string(options.adaptive_fine_max_served_placements);
@@ -1318,6 +1323,8 @@ void write_status(
     out << "seconds_prior\t" << timings.prior << '\n';
     out << "seconds_ranking\t" << timings.ranking << '\n';
     out << "seconds_total\t" << timings.total << '\n';
+    if (options.setting_sources.count("output_schema") != 0) out << "output_schema\t" << options.output_schema << '\n';
+    if (options.output_schema == "sequence_first_v1") out << sequence_report_status_keys(g_sequence_report);
     if (g_prepared_use.used) {
         // I3-A: this sample was analysed against a prepared locus (stage 1 and the marker panel were not rebuilt)
         out << "prepared_locus\t1\nprepared_locus_id\t" << g_prepared_use.id << "\nprepared_locus_key_sha256\t"
@@ -1503,6 +1510,12 @@ void apply_genotype_setting(const std::string& context, const std::string& key, 
         options.indexed_union_evidence_layout = value;
     }
     else if (key == "marker_proposal_reuse_table_bytes") options.marker_proposal_reuse_table_bytes = u();
+    else if (key == "output_schema") {   // S1-B (EXPERIMENTAL, reporting only)
+        if (value != "legacy" && value != "sequence_first_v1") {
+            throw std::runtime_error(context + ": 'output_schema' is legacy or sequence_first_v1: " + value);
+        }
+        options.output_schema = value;
+    }
     else if (key == "adaptive_emission_handoff") {
         if (value != "0" && value != "1") throw std::runtime_error(context + ": 'adaptive_emission_handoff' is 0 or 1: " + value);
         options.adaptive_emission_handoff = value == "1";
@@ -2152,6 +2165,8 @@ GenotypeRunStatus run_genotype_body(const GenotypeCommandOptions& options, Genot
     }
     set_emission_lookup_timing(options.emission_lookup_timing);
     g_proposal_reuse = ProposalReuseReport{};   // I2-E: never a previous run's figures
+    g_sequence_report = SequenceReport{};          // S1-B: likewise
+    g_sequence_legacy = SequenceLegacy{};
     reset_prepared_library_terms_tally();         // I2-F: likewise
     g_union_end_footprint = 0;
     reset_emission_handoff_report();   // I2-K: nothing from an earlier run is reported or adopted
@@ -3176,6 +3191,7 @@ GenotypeRunStatus run_genotype_body(const GenotypeCommandOptions& options, Genot
                                 : status == GenotypeRunStatus::ConditionalGenotypeEquivalent ? "genotype_equivalent_call"
                                                                                              : "no_call";
             if (report.call_class != "no_call") report.no_call_reason = "none";
+            g_sequence_legacy = {genotype_run_status_name(status), report.call_class, report.no_call_reason};   // S1-B
             timings.total = seconds_since(started);
             write_status(status_path, status, fingerprint, options, library, timings, &locus_report, &panel, beam_view,
                          ranking, note, summary, &depth, &set_report, &report);
@@ -3483,8 +3499,20 @@ GenotypeRunStatus run_genotype_body(const GenotypeCommandOptions& options, Genot
         report.pool_identities = pool.size();
         for (const PoolEntry& entry : pool) report.pool_repair_only += entry.in_union ? 0 : 1;
         report.pool_score_mismatches = mismatches;
+        // S1-B (sequence_first_v1 only): a declared-cap stop keeps the last committed, exactly scored incumbent as
+        // PROVISIONAL -- only after at least one committed round (the anchor reproduced and was rescored).
+        const auto provisional = [&](const std::string& stop, const std::string& note) {
+            if (options.output_schema != "sequence_first_v1" || !search || search->rounds().empty()) return;
+            std::vector<std::string> block_ids;
+            for (const auto& block : model.blocks()) block_ids.push_back(block.block_id);
+            g_sequence_report = provisional_sequence_report(
+                search->incumbent_first(), search->incumbent_second(), search->incumbent_total(), stop, note, block_ids,
+                [&](const std::vector<std::size_t>& labels) { return spell_mosaic(model, MosaicPath{labels}).bases; });
+        };
         if (!refusal.empty()) {
             report.no_call_reason = "cumulative_cap";
+            provisional("cumulative_cap", "the repair search stopped at a declared cumulative cap (" + refusal +
+                                              "); the last committed incumbent, exactly scored; search incomplete");
             // Committed rounds stay as <prefix>.repair_rounds.partial.tsv: a record, never a call.
             return stop_with(GenotypeRunStatus::RescoreIncomplete,
                              "the repair search stopped at a declared cumulative cap and returned no genotype: " +
@@ -3972,6 +4000,10 @@ GenotypeRunStatus run_genotype_body(const GenotypeCommandOptions& options, Genot
             report.no_call_reason =
                 stop == "rescore_incomplete" || stop == "tie_at_best" ? "improving_move_tie" : stop;
             write_trajectory();
+            if (stop == "round_cap") {
+                provisional("round_cap", "the repair search reached its declared round cap without converging; the last "
+                                         "committed incumbent, exactly scored; search incomplete");
+            }
             const GenotypeRunStatus status = stop_with(GenotypeRunStatus::RepairIncomplete,
                              "the repair search stopped without converging (" + report.stop_reason +
                                  "); the trajectory is kept and no genotype is emitted",
@@ -4656,6 +4688,15 @@ GenotypeRunStatus run_genotype_body(const GenotypeCommandOptions& options, Genot
             }
         }
         write_trajectory();
+        // S1-B (sequence_first_v1 only): the sequence report of this completed ranking. Reporting only: it reads the
+        // decision and spells the representative; nothing below depends on it.
+        if (options.output_schema == "sequence_first_v1") {
+            std::vector<std::string> block_ids;
+            for (const auto& block : model.blocks()) block_ids.push_back(block.block_id);
+            g_sequence_report = build_sequence_report(decided, block_ids, [&](const std::vector<std::size_t>& labels) {
+                return spell_mosaic(model, MosaicPath{labels}).bases;
+            });
+        }
 
         if (decided.decision == TopSetDecision::DistinctTie) {
             // After tie branching the pooled top set spans the branches: disagreement there is a divergent tie.
@@ -6091,6 +6132,7 @@ std::optional<int> parse_genotype_arguments(const std::vector<std::string>& args
         else if (flag == "--max-mosaic-candidates" || flag == "--mosaic-candidates") {
             apply_genotype_setting("flag " + flag, "max_mosaic_candidates", need(i), options);
         }
+        else if (flag == "--output-schema") apply_genotype_setting("flag --output-schema", "output_schema", need(i), options);
         else if (flag == "--repair-rounds") repair_rounds_flag = need(i);   // resolved with --adaptive-repair below
         else if (flag == "--adaptive-repair") {
             adaptive_repair_flag = need(i);
@@ -6238,7 +6280,13 @@ std::optional<int> parse_genotype_arguments(const std::vector<std::string>& args
                 "branching); --repair-rounds 0 is the same view, with tie branching off. --adaptive-repair, --repair-rounds\n"
                 "and --repair-tie-branching are resolved together whatever their order; an explicit contradiction (off\n"
                 "with N > 0 rounds, on with 0 rounds, tie branching on with no rounds) is refused. Diagnostic and test\n"
-                "hooks are not user settings and are not listed.\n";
+                "hooks are not user settings and are not listed.\n\n"
+                "Reporting (EXPERIMENTAL, opt-in): --output-schema legacy|sequence_first_v1 (profile key output_schema;\n"
+                "default legacy). sequence_first_v1 adds <prefix>.sequence_locus.tsv, .sequence_blocks.tsv,\n"
+                ".sequence_haplotypes.fa, .representation_intervals.tsv and .sequence_alternatives.tsv, and changes the\n"
+                "exit status to 0 PREDICTION (a completed ranking, even if uncertain), 3 PROVISIONAL (a declared-cap stop\n"
+                "with an exactly scored incumbent), 1 NO_PREDICTION; legacy outputs are unchanged. It needs the adaptive\n"
+                "repair. structure_confidence is NA (UNCALIBRATED); projection_coverage is EXPLORED.\n";
             return 0;
                 } else {
             throw std::runtime_error("unknown genotype option: " + flag);
@@ -6279,6 +6327,16 @@ std::optional<int> parse_genotype_arguments(const std::vector<std::string>& args
         const auto source = options.setting_sources.find("repair_rounds");
         apply_genotype_setting(source == options.setting_sources.end() ? std::string("default") : source->second,
                                "repair_tie_branching", "0", options);
+    }
+    // S1-B: sequence_first_v1 reports the adaptive repair's pooled decision; every other route is refused explicitly.
+    if (options.output_schema == "sequence_first_v1") {
+        if (options.repair_rounds == 0) {
+            throw std::runtime_error("output_schema sequence_first_v1 needs the adaptive repair (repair rounds > 0); the "
+                                     "unrepaired view has no pooled decision to report");
+        }
+        if (options.diagnostic_union_only) {
+            throw std::runtime_error("output_schema sequence_first_v1 is not supported with diagnostic_union_only");
+        }
     }
     if (profiled) {
         // Every setting a flag gave beside the profile, with the value it took.
@@ -6365,6 +6423,25 @@ int execute_genotype_command(const GenotypeCommandOptions& options, const Prepar
     GenotypeDosageCapture capture;
     const GenotypeRunStatus status = run_genotype_body(options, &capture, locus);
     const bool called = status == GenotypeRunStatus::Complete || status == GenotypeRunStatus::ConditionalGenotypeEquivalent;
+    const bool sequence_first = options.output_schema == "sequence_first_v1";
+    if (sequence_first) {
+        // S1-B: written once the caller's own outputs are final; a watchdog stop never reaches here (no prediction).
+        SequenceLegacy legacy = g_sequence_legacy;
+        if (legacy.run_status == "NA") legacy.run_status = genotype_run_status_name(status);
+        // A legacy call without a sequence report would be a route this schema does not cover: said, never hidden.
+        const std::string reason =
+            called && !g_sequence_report.built
+                ? "UNSUPPORTED_ROUTE: the legacy caller emitted a genotype on a route sequence_first_v1 does not report (" +
+                      legacy.run_status + ")"
+                : "no completed ranking and no safely available evaluated candidate (" + legacy.run_status +
+                      (legacy.no_call_reason != "NA" ? ", " + legacy.no_call_reason : "") + ")";
+        try {
+            write_sequence_report(g_sequence_report, legacy, options.out_prefix, reason);
+        } catch (const std::exception& error) {
+            std::cerr << "[genotype] sequence report output failed: " << error.what() << '\n';
+            return 2;
+        }
+    }
     dosage::DosageShadowSummary summary;
     std::string audit_status = "NOT_RUN", audit_note = "none";
     std::optional<double> declared_marker_background;
@@ -6458,6 +6535,7 @@ int execute_genotype_command(const GenotypeCommandOptions& options, const Prepar
         std::cerr << "[genotype] locus output failed: " << error.what() << '\n';
         return 2;
     }
+    if (sequence_first) return sequence_report_exit_code(g_sequence_report);   // S1-B: 0 / 3 / 1
     return called ? 0 : 1;
 }
 

@@ -3874,6 +3874,210 @@ void test_prepared_locus_index() {
               << "fresh build) equal their cold runs\n";
 }
 
+// ---- S1-B: output_schema (opt-in sequence-first reporting) ---------------------------------------------------------
+// Three scenarios (strict call, genotype-equivalent call, round-cap stop), each run with the schema unset, explicitly
+// legacy and sequence_first_v1 in its own directory under the same prefix name. Required: (1) every legacy output is
+// identical across the three arms (directory normalised; status-like files key by key, timing/memory values aside;
+// the trajectory's scientific columns), so scores, rankings, group weights and the trajectory are unchanged; (2) the
+// declared provenance only: explicit legacy adds exactly the settings row and the status row output_schema;
+// sequence_first_v1 adds those plus four sequence status rows and the <prefix>.sequence_* files; (3) the exit codes:
+// legacy 0/0/1, sequence_first_v1 0/0/3 (PROVISIONAL is not success). Then a watchdog stop under sequence_first_v1
+// writes no sequence output, and the prepared-locus route writes the same sequence outputs as the cold route.
+namespace sf {
+std::string normalised(const std::string& file, const std::string& dir) {
+    std::string text = slurp(file);
+    for (std::size_t at = text.find(dir); at != std::string::npos; at = text.find(dir, at)) text.replace(at, dir.size(), "<D>");
+    return text;
+}
+std::map<std::string, std::string> kv(const std::string& file) {
+    std::map<std::string, std::string> out;
+    std::istringstream in(slurp(file));
+    for (std::string line; std::getline(in, line);) {
+        const std::size_t tab = line.find('\t');
+        if (tab != std::string::npos) out[line.substr(0, tab)] = line.substr(tab + 1);
+    }
+    return out;
+}
+bool volatile_key(const std::string& k) {
+    static const std::regex pattern("seconds|footprint|rss|peak|_bytes|timing|worker|threads_|profile_sha256");
+    return std::regex_search(k, pattern);
+}
+std::set<std::string> files(const std::string& dir) {
+    std::set<std::string> out;
+    for (const auto& e : std::filesystem::directory_iterator(dir)) out.insert(e.path().filename().string());
+    return out;
+}
+}  // namespace sf
+
+void test_sequence_first_schema() {
+    namespace fs = std::filesystem;
+    struct Scenario {
+        std::string name, r1, r2, gfa;
+        std::function<void(panvar::GenotypeCommandOptions&)> configure;
+        int legacy_exit, v1_exit;
+        std::string prediction, status;
+    };
+    const std::vector<Scenario> scenarios = {
+        {"strict", path("phaseable_r1.fq"), path("phaseable_r2.fq"), "tiny_phaseable.gfa", [](auto&) {}, 0, 0,
+         "PREDICTION", "RESOLVED"},
+        {"ge", path("unphaseable_r1.fq"), path("unphaseable_r2.fq"), "tiny.gfa", [](auto&) {}, 0, 0, "PREDICTION",
+         "GENOTYPE_RESOLVED_SEQUENCE_SET"},
+        {"cap", path("phaseable_r1.fq"), path("phaseable_r2.fq"), "tiny_phaseable.gfa",
+         [](auto& o) { o.max_mosaic_candidates = 0; o.repair_rounds = 1; }, 1, 3, "PROVISIONAL", "NOT_DETERMINED"},
+    };
+    const std::vector<std::string> sequence_files = {"call.sequence_locus.tsv", "call.sequence_blocks.tsv",
+                                                     "call.representation_intervals.tsv", "call.sequence_alternatives.tsv",
+                                                     "call.sequence_haplotypes.fa"};
+    for (const Scenario& sc : scenarios) {
+        std::map<std::string, std::string> dirs;
+        std::map<std::string, int> exits;
+        for (const std::string arm : {"unset", "legacy", "v1"}) {
+            const std::string rel = "sf_" + sc.name + "_" + arm;
+            fs::remove_all(path(rel));
+            fs::create_directories(path(rel));
+            panvar::GenotypeCommandOptions o = repair_options(rel + "/call", sc.r1, sc.r2, sc.gfa);
+            sc.configure(o);
+            if (arm != "unset") {
+                o.output_schema = arm == "v1" ? "sequence_first_v1" : "legacy";
+                o.setting_sources["output_schema"] = "test";
+            }
+            exits[arm] = panvar::execute_genotype_command(o, nullptr);
+            dirs[arm] = path(rel);
+        }
+        require(exits["unset"] == sc.legacy_exit && exits["legacy"] == sc.legacy_exit,
+                sc.name + ": the legacy exit code is unchanged (unset and explicit legacy)");
+        require(exits["v1"] == sc.v1_exit, sc.name + ": the sequence_first_v1 exit code (" + std::to_string(exits["v1"]) + ")");
+        const std::set<std::string> base = sf::files(dirs["unset"]);
+        require(sf::files(dirs["legacy"]) == base, sc.name + ": explicit legacy writes exactly the same files");
+        std::set<std::string> v1 = sf::files(dirs["v1"]);
+        for (const std::string& f : sequence_files) {
+            const bool expected = f != "call.sequence_haplotypes.fa" || sc.prediction != "NO_PREDICTION";
+            require(v1.count(f) == (expected ? 1u : 0u) && base.count(f) == 0, sc.name + ": sequence file " + f);
+            v1.erase(f);
+        }
+        require(v1 == base, sc.name + ": sequence_first_v1 adds only the sequence files");
+        for (const std::string& f : base) {
+            const std::string a = dirs["unset"] + "/" + f;
+            for (const std::string arm : {"legacy", "v1"}) {
+                const std::string b = dirs[arm] + "/" + f;
+                const std::string what = sc.name + " " + arm + " " + f;
+                if (f.size() > 11 && f.compare(f.size() - 11, 11, "_status.tsv") == 0) {
+                    auto ka = sf::kv(a), kb = sf::kv(b);
+                    if (f == "call.mosaic_status.tsv") {
+                        require(kb.at("output_schema") == (arm == "v1" ? "sequence_first_v1" : "legacy"), what + ": schema row");
+                        kb.erase("output_schema");
+                        if (arm == "v1") {
+                            require(kb.at("sequence_prediction") == sc.prediction && kb.at("sequence_status") == sc.status &&
+                                        kb.at("sequence_exit_code") == std::to_string(sc.v1_exit),
+                                    what + ": the sequence status rows");
+                            for (const char* k : {"sequence_prediction", "sequence_status", "sequence_completion",
+                                                  "sequence_exit_code"}) kb.erase(k);
+                        }
+                    }
+                    std::set<std::string> keys_a, keys_b;
+                    for (const auto& item : ka) keys_a.insert(item.first);
+                    for (const auto& item : kb) keys_b.insert(item.first);
+                    require(keys_a == keys_b, what + ": no other status row is added or removed");
+                    const auto strip = [](std::string text, const std::string& dir) {
+                        for (std::size_t at = text.find(dir); at != std::string::npos; at = text.find(dir, at)) {
+                            text.replace(at, dir.size(), "<D>");
+                        }
+                        return text;
+                    };
+                    for (const auto& [k, v] : ka) {
+                        if (sf::volatile_key(k)) continue;
+                        require(strip(v, dirs["unset"]) == strip(kb.at(k), dirs[arm]),
+                                what + ": status value " + k + " (" + v + " vs " + kb.at(k) + ")");
+                    }
+                } else if (f == "call.settings.tsv") {
+                    const std::string extra = std::string("output_schema\t") + (arm == "v1" ? "sequence_first_v1" : "legacy") +
+                                              "\ttest\n";
+                    std::string text = slurp(b);
+                    const std::size_t at = text.find(extra);
+                    require(at != std::string::npos, what + ": exactly one output_schema settings row");
+                    text.erase(at, extra.size());
+                    require(text == slurp(a), what + ": every other settings row unchanged");
+                } else if (f == "call.repair_rounds.tsv") {
+                    require(rounds_science(a) == rounds_science(b), what + ": the adaptive trajectory is unchanged");
+                } else if (f == "call.repair_memory.tsv" || f == "call.tie_branch_memory.tsv") {
+                    continue;   // memory ledgers: measurements, not results
+                } else {
+                    require(sf::normalised(a, dirs["unset"]) == sf::normalised(b, dirs[arm]), what + ": byte-identical");
+                }
+            }
+        }
+        const auto locus = sf::kv(dirs["v1"] + "/call.sequence_locus.tsv");
+        require(locus.at("prediction") == sc.prediction && locus.at("sequence_status") == sc.status &&
+                    locus.at("structure_confidence") == "NA" && locus.at("structure_confidence_reason") == "UNCALIBRATED" &&
+                    locus.at("projection_coverage") == "EXPLORED",
+                sc.name + ": the sequence locus record");
+        if (sc.name == "ge") {
+            require(!base.count("call.mosaic_haplotypes.fa") &&
+                        slurp(dirs["v1"] + "/call.sequence_haplotypes.fa").find("representative_of_set=yes") != std::string::npos,
+                    "ge: the legacy call writes no FASTA; the sequence report retains a marked representative");
+        }
+        if (sc.name == "cap") {
+            require(locus.at("completion") == "round_cap" && locus.at("decision_scope") == "NOT_DETERMINED" &&
+                        locus.at("legacy_no_call_reason") == "round_cap",
+                    "cap: PROVISIONAL from the round cap, no decision set claimed");
+        }
+    }
+    {   // a watchdog stop under sequence_first_v1: no prediction is written
+        fs::remove_all(path("sf_watchdog"));
+        fs::create_directories(path("sf_watchdog"));
+        panvar::GenotypeCommandOptions o =
+            repair_options("sf_watchdog/call", path("phaseable_r1.fq"), path("phaseable_r2.fq"), "tiny_phaseable.gfa");
+        o.max_mosaic_candidates = 0;
+        o.test_interrupt_after_repair_rounds = 1;
+        o.output_schema = "sequence_first_v1";
+        o.setting_sources["output_schema"] = "test";
+        std::cout.flush();
+        const pid_t child = fork();
+        require(child >= 0, "fork failed");
+        if (child == 0) {
+            try {
+                std::_Exit(panvar::execute_genotype_command(o, nullptr));
+            } catch (...) {
+                std::_Exit(3);
+            }
+        }
+        int wait_status = 0;
+        waitpid(child, &wait_status, 0);
+        require(WIFEXITED(wait_status) && WEXITSTATUS(wait_status) == 124, "watchdog: the time-limit exit");
+        require(read_status(path("sf_watchdog/call.mosaic_status.tsv")).at("status") == "TIME_LIMIT" &&
+                    !exists(path("sf_watchdog/call.sequence_locus.tsv")) &&
+                    !exists(path("sf_watchdog/call.sequence_haplotypes.fa")),
+                "watchdog: TIME_LIMIT and no sequence output (no prediction from a stopped computation)");
+    }
+    {   // the prepared-locus route: the same sequence outputs as the cold route
+        std::map<std::string, std::string> d;
+        for (const std::string route : {"cold", "prepared"}) {
+            const std::string rel = "sf_route_" + route;
+            fs::remove_all(path(rel));
+            fs::create_directories(path(rel));
+            panvar::GenotypeCommandOptions o =
+                repair_options(rel + "/call", path("prep_A_r1.fq"), path("prep_A_r2.fq"), "prep_locus.gfa");
+            o.max_mosaic_candidates = 8;
+            o.output_schema = "sequence_first_v1";
+            o.setting_sources["output_schema"] = "test";
+            if (route == "cold") {
+                require(panvar::execute_genotype_command(o, nullptr) == 0, "route: the cold run predicts");
+            } else {
+                const std::shared_ptr<const panvar::PreparedLocus> locus = panvar::prepare_genotype_locus(o);
+                require(panvar::execute_genotype_command(o, locus.get()) == 0, "route: the prepared run predicts");
+            }
+            d[route] = path(rel);
+        }
+        for (const std::string& f : sequence_files) {
+            require(sf::normalised(d["cold"] + "/" + f, d["cold"]) == sf::normalised(d["prepared"] + "/" + f, d["prepared"]),
+                    "route: " + f + " identical on the prepared-locus route");
+        }
+    }
+    std::cout << "  output_schema: legacy outputs identical across unset/legacy/sequence_first_v1 (strict, genotype-"
+                 "equivalent, round cap); declared provenance only; exits 0/0/1 vs 0/0/3; watchdog writes no prediction; "
+                 "prepared-locus route identical\n";
+}
+
 int main(int argc, char** argv) {
     if (argc < 2) {
         std::cerr << "usage: genotype_command_e2e_test <scratch dir> [source dir]\n";
@@ -3932,6 +4136,7 @@ int main(int argc, char** argv) {
         test_prepared_locus();
         test_prepared_locus_cleanup();
         test_prepared_locus_index();
+        test_sequence_first_schema();
         if (argc >= 3) test_profile(argv[2]);
         test_block_quality_columns();
         std::cout << "genotype command end-to-end: PASS\n";

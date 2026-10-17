@@ -124,6 +124,29 @@ Outcome parse(const std::vector<std::string>& args, panvar::GenotypeCommandOptio
     return out;
 }
 
+// S1-B: output_schema is validated, recorded with its source, and refused where it has no pooled decision to report.
+void test_output_schema() {
+    panvar::GenotypeCommandOptions kept;
+    require(parse({"--output-schema", "sequence_first_v1"}, &kept).error.empty() &&
+                kept.output_schema == "sequence_first_v1" &&
+                kept.setting_sources.at("output_schema") == "flag --output-schema",
+            "--output-schema sequence_first_v1 is accepted and recorded with its source");
+    require(parse({}, &kept).error.empty() && kept.output_schema == "legacy" && kept.setting_sources.count("output_schema") == 0,
+            "unset, the schema is legacy and has no recorded source");
+    require(parse({"--output-schema", "sequence_first"}).error.find("'output_schema' is legacy or sequence_first_v1") !=
+                std::string::npos,
+            "an unknown schema is refused");
+    for (const std::vector<std::string>& unsupported :
+         {std::vector<std::string>{"--output-schema", "sequence_first_v1", "--adaptive-repair", "off"},
+          std::vector<std::string>{"--repair-rounds", "0", "--output-schema", "sequence_first_v1"}}) {
+        require(parse(unsupported).error.find("sequence_first_v1 needs the adaptive repair") != std::string::npos,
+                "sequence_first_v1 without the adaptive repair is refused explicitly, never a silent legacy fallback");
+    }
+    require(parse({"--output-schema", "legacy", "--adaptive-repair", "off"}).error.empty(),
+            "an explicit legacy schema is accepted on every route");
+    std::cout << "  output_schema: validated, recorded with its source, refused without the adaptive repair\n";
+}
+
 void test_repair_option_order() {
     using Args = std::vector<std::string>;
     const Args on = {"--adaptive-repair", "on"}, off = {"--adaptive-repair", "off"};
@@ -287,6 +310,7 @@ int main(int argc, char** argv) {
         test_repair_option_order();
         test_cache_flag_provenance();
         test_help_text();
+        test_output_schema();
         test_pre_block_no_call();
     } catch (const std::exception& error) {
         std::cerr << "FAIL: " << error.what() << '\n';
