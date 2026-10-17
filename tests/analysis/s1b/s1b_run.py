@@ -53,6 +53,21 @@ MANIFEST += [(f"t.{test_name(t)}", "ctest", test_name(t), 60) for t in LIGHT]
 MANIFEST += [("cyp30.v1", "sentinel", "cyp_30", 150), ("cyp30.compare", "compare", "cyp_30", 30)]
 MANIFEST += [(f"t.{test_name(t)}", "ctest", test_name(t), 60) for t in REST_SMALL + OTHER]
 MANIFEST += [(f"t.{t}", "ctest", t, s) for t, s in HEAVY]
+# Amendment 1 (committed after fixtures.A, before any further execution; the units already run stay recorded):
+#   fixture variants found the caller's sequence-pair prior differing in its last bits with sample order, which made the
+#   17-digit alternatives table differ and could make a bitwise "exact tie" depend on panel order. The implementation
+#   now takes the canonical SHA-256 minimum over the whole (numerically tied) decision set and writes score components
+#   with 12 significant digits; the oracle follows the same representative rule and orients labellings by sequence
+#   (its first version compared two distinct sequences' labellings across haplotypes); the harness declares the
+#   status rows for the dosage-stage copy call.original.mosaic_status.tsv too. The C++ changed, so the unit test and the
+#   CLI contract rerun; fixtures A and B run as .a1 units into fixtures_a1 (fixtures.B is superseded, never run).
+AMENDMENT_1 = [("t.genotype_sequence_report.a1", "ctest", "genotype_sequence_report", 30),
+               ("t.genotype_cli_contract.a1", "ctest", "genotype_cli_contract", 30),
+               ("fixtures.A.a1", "fixtures", "F1,F2,F3,F4", 240),
+               ("fixtures.B.a1", "fixtures", "F5,F6,F7,F7full,F9", 240)]
+SUPERSEDED = {"fixtures.B"}
+ORDER = [m[0] for m in MANIFEST[:3]] + [m[0] for m in AMENDMENT_1] + \
+    [m[0] for m in MANIFEST[3:] if m[0] not in SUPERSEDED]
 LEDGER = ("unit\trevision\tdirty_cpp\tdeclared_timeout_seconds\twall_seconds\tpeak_rss_gib\texit\ttimed_out\tnote\n")
 
 
@@ -108,8 +123,10 @@ def cyp_compare():
 
 
 def run_unit(unit):
-    u, kind, target, timeout = next(m for m in MANIFEST if m[0] == unit)
-    assert open(f"{OUT}/MANIFEST.tsv").read() and timeout <= 300 and unit not in done()
+    u, kind, target, timeout = next(m for m in MANIFEST + AMENDMENT_1 if m[0] == unit)
+    assert open(f"{OUT}/MANIFEST.tsv").read() and timeout <= 300 and unit not in done() and unit not in SUPERSEDED
+    if any(m[0] == unit for m in AMENDMENT_1):
+        assert os.path.exists(f"{OUT}/AMENDMENT_1.tsv"), "freeze amendment 1 first"
     rev, dirty = state()
     assert dirty == 0, "the implementation tree must be committed and clean"
     used = spent()
@@ -123,7 +140,8 @@ def run_unit(unit):
     if kind == "ctest":
         cmd = ["nice", "ctest", "--test-dir", BUILD, "-R", f"^panvar_{target}$", "--output-on-failure", "-j1"]
     elif kind == "fixtures":
-        cmd = ["nice", sys.executable, os.path.join(HERE, "s1b_fixtures.py"), f"{OUT}/fixtures", f"{BUILD}/panvar",
+        fixture_dir = f"{OUT}/fixtures_a1" if unit.endswith(".a1") else f"{OUT}/fixtures"
+        cmd = ["nice", sys.executable, os.path.join(HERE, "s1b_fixtures.py"), fixture_dir, f"{BUILD}/panvar",
                f"{BUILD}/cyp2d6_block_alleles", f"{BUILD}/genotype_prepared_locus_driver", target]
     elif kind == "compare":
         cmd = [sys.executable, os.path.abspath(__file__), "_compare"]
@@ -163,8 +181,14 @@ if __name__ == "__main__":
         write_manifest()
     elif arg == "_compare":
         sys.exit(cyp_compare())
+    elif arg == "amendment1":
+        text = "".join("\t".join(str(x) for x in m) + "\n" for m in AMENDMENT_1) + "fixtures.B\tSUPERSEDED\n"
+        p = f"{OUT}/AMENDMENT_1.tsv"
+        assert not os.path.exists(p) or open(p).read() == text
+        open(p, "w").write(text)
+        print(text, end="")
     elif arg == "next":
-        todo = [m[0] for m in MANIFEST if m[0] not in done()]
+        todo = [u for u in ORDER if u not in done()]
         sys.exit(run_unit(todo[0]) if todo else print("all units recorded") or 0)
     else:
         sys.exit(run_unit(arg))

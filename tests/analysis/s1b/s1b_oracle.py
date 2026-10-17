@@ -6,8 +6,9 @@ projections). Where the caller explored every projection of a group the two must
 (projections_unexplored > 0) the oracle shows what EXPLORED coverage misses.
 
 Corrections over S1-A's projection (tests/analysis/s1a/s1a_project.py, kept unchanged as a record):
-  * representative: the highest score in the decision set; EXACT score ties (17-digit scores of equivalence_set.tsv)
-    broken by the sorted pair of full SHA-256 digests of the spelled sequences;
+  * representative: the decision set's canonical member -- every decision-set group is numerically tied with the best
+    under the caller's certified bounds, so the smallest sorted pair of full SHA-256 digests of the spelled sequences
+    (amendment 1: the first version broke only bitwise-equal 17-digit scores, which sample order perturbs);
   * representation intervals: conservative enclosing spans over every pair of a group's labellings (coupled
     alternatives include the unchanged blocks between them), merged when overlapping; tuples are whole observed
     labellings restricted to the span, as unordered haplotype pairs (never per-block Cartesian combinations);
@@ -72,10 +73,14 @@ def oracle(prefix, dump_prefix):
         a, b = sorted(labellings[g])[0]
         s1, s2 = model.spell(a), model.spell(b)
         p1, p2 = model.projections(s1), model.projections(s2)
-        complete = sorted({unordered(x, y) for x in p1 for y in p2}) if s1 != s2 else \
+        # tuples oriented by sequence: A spells the SHA-256-smaller sequence (amendment 1: the first version sorted each
+        # pair, so two distinct sequences' labellings were compared across haplotypes); unordered only for identical ones
+        if sha(s2) < sha(s1):
+            p1, p2 = p2, p1
+        complete = sorted({(tuple(x), tuple(y)) for x in p1 for y in p2}) if s1 != s2 else \
             sorted({unordered(x, y) for x in p1 for y in p1})
         explored = {unordered([int(v) for v in x.split(",")], [int(v) for v in y.split(",")]) for x, y in labellings[g]}
-        out["projections_unexplored"] += len(set(complete) - explored)
+        out["projections_unexplored"] += len({unordered(*t) for t in complete} - explored)
         geno = [{tuple(sorted((t[0][k], t[1][k]))) for t in complete} for k in range(n)]
         groups[g] = {"score": exact.get(g, float(r["score"])), "prob": float(r["candidate_set_probability"]),
                      "top": r["in_winner_set"] == "true", "sha": tuple(sorted((sha(s1), sha(s2)))), "geno": geno,
@@ -83,8 +88,7 @@ def oracle(prefix, dump_prefix):
     if status not in COMPLETED_CALL and not (status == "RESCORE_INCOMPLETE" and reason in ("distinct_tie", "divergent_tie")):
         return out
     top = {g: v for g, v in groups.items() if v["top"]}
-    best = max(v["score"] for v in top.values())
-    rep = min((g for g, v in top.items() if v["score"] == best), key=lambda g: top[g]["sha"])
+    rep = min(top, key=lambda g: top[g]["sha"])
     union = [set().union(*(top[g]["geno"][k] for g in top)) for k in range(n)]
     all_identified = all(len(u) == 1 for u in union)
     out.update(prediction="PREDICTION", rep=top[rep]["sha"], decision_set_groups=len(top),

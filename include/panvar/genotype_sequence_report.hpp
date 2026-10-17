@@ -84,8 +84,9 @@ struct SequenceReport {
     std::vector<std::size_t> representative_first, representative_second;   // one explored labelling, oriented A/B
     std::string hap1_bases, hap2_bases;         // the representative sequence pair, ordered by SHA-256
     std::string hap1_sha256, hap2_sha256;
-    std::string representative_tie_break = "highest_score";   // or canonical_sha256 (exact score ties)
-    std::size_t exact_score_ties = 1;
+    // canonical_sha256 (several decision-set groups, all numerically tied) or highest_score (one group)
+    std::string representative_tie_break = "highest_score";
+    std::size_t exact_score_ties = 1;   // decision-set groups with a bitwise-equal best score (information only)
     std::size_t decision_set_groups = 0, pool_groups = 0, explored_labellings = 0;
     double representative_probability = std::numeric_limits<double>::quiet_NaN();   // candidate-conditional
     double decision_set_probability = std::numeric_limits<double>::quiet_NaN();     // candidate-conditional
@@ -100,7 +101,9 @@ struct SequenceReport {
 using HaplotypeSpeller = std::function<std::string(const std::vector<std::size_t>&)>;
 
 // After a completed, valid ranking. Deterministic and order-independent: the representative is the highest-scoring
-// decision-set group; exact score ties are broken by the sorted pair of SHA-256 digests of the spelled sequences.
+// decision-set group; since every decision-set group is numerically tied with the best (the caller's certified bounds),
+// the tie is broken by the sorted pair of SHA-256 digests of the spelled sequences. Scores are written with 12
+// significant digits (as mosaic_scores.tsv): a prior's last bits depend on the panel's sample order.
 SequenceReport build_sequence_report(const PooledDecision& decided, const std::vector<std::string>& block_ids,
                                      const HaplotypeSpeller& spell, std::size_t alternative_rows = 5);
 

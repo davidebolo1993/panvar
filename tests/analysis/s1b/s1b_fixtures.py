@@ -90,7 +90,9 @@ def legacy_identity(d_legacy, d_v1):
         pa, pb = os.path.join(d_legacy, f), os.path.join(d_v1, f)
         if f.endswith("_status.tsv"):
             ka, kb = kv(pa), kv(pb)
-            if f == "call.mosaic_status.tsv":
+            # the caller's status and its dosage-stage copy (.original, repair mode) carry the same declared rows
+            # (amendment 1: the first version declared them for the main status file only)
+            if f in ("call.mosaic_status.tsv", "call.original.mosaic_status.tsv"):
                 for k in ("output_schema", "sequence_prediction", "sequence_status", "sequence_completion",
                           "sequence_exit_code"):
                     if k not in kb:

@@ -116,13 +116,15 @@ SequenceReport build_sequence_report(const PooledDecision& decided, const std::v
         }
     }
 
-    // ---- the canonical representative: the highest score; exact ties by the sorted SHA-256 pair of the sequences
+    // ---- the canonical representative: the highest-scoring decision-set group. Every decision-set group is tied with
+    // the best under the caller's own certified numerical bounds (that is what puts it in the decision set), so the
+    // tie is broken by the sorted SHA-256 pair of the spelled sequences -- never by discovery order, and never by
+    // floating-point summation noise (sample order changes a prior in its last bits). Bitwise-equal scores are counted
+    // for information only.
     const double best_score = decided.ranking.candidates.front().score;
-    std::vector<std::size_t> tied;
-    for (const std::size_t g : decided.top_groups) {
-        if (entry_of[g]->score == best_score) tied.push_back(g);
-    }
-    r.exact_score_ties = tied.size();
+    const std::vector<std::size_t> tied(decided.top_groups.begin(), decided.top_groups.end());
+    r.exact_score_ties = 0;
+    for (const std::size_t g : decided.top_groups) r.exact_score_ties += entry_of[g]->score == best_score ? 1 : 0;
     std::size_t rep = decided.ranking.candidates.front().candidate_id;
     std::pair<std::string, std::string> rep_key;
     std::pair<std::string, std::string> rep_bases;
@@ -388,7 +390,7 @@ void write_sequence_report(const SequenceReport& r, const SequenceLegacy& legacy
               << "\nrepresentative_labelling_hap1\t" << join(r.representative_first)
               << "\nrepresentative_labelling_hap2\t" << join(r.representative_second)
               << "\nrepresentative_labelling_scope\tone_explored_labelling;alternatives_in_representation_intervals"
-              << "\nrepresentative_score\t" << number(r.representative_score, 17) << "\ndecision_set_groups\t"
+              << "\nrepresentative_score\t" << number(r.representative_score, 12) << "\ndecision_set_groups\t"
               << r.decision_set_groups << "\npool_groups\t" << r.pool_groups << "\nexplored_labellings\t"
               << r.explored_labellings << "\nidentified_blocks\t" << identified << "\nrepresentation_ambiguous_blocks\t"
               << ambiguous << "\ngenotype_unresolved_blocks\t" << unresolved << "\nprovisional_label_blocks\t" << provisional
@@ -449,8 +451,8 @@ void write_sequence_report(const SequenceReport& r, const SequenceLegacy& legacy
         std::string ids;
         for (const std::size_t b : a.blocks_with_other_genotypes) ids += (ids.empty() ? "" : ",") + r.block_ids[b];
         alt << a.rank << '\t' << a.group << '\t' << (a.in_decision_set ? "yes" : "no") << '\t'
-            << (a.representative ? "yes" : "no") << '\t' << number(a.score, 17) << '\t' << number(a.fragment_term, 17)
-            << '\t' << number(a.exposure_term, 17) << '\t' << number(a.prior, 17) << '\t'
+            << (a.representative ? "yes" : "no") << '\t' << number(a.score, 12) << '\t' << number(a.fragment_term, 12)
+            << '\t' << number(a.exposure_term, 12) << '\t' << number(a.prior, 12) << '\t'
             << number(a.numeric_error_bound, 6) << '\t' << number(a.candidate_set_probability, 6) << '\t'
             << a.explored_labellings << '\t' << (a.projection_ambiguous ? "true" : "false") << '\t'
             << digest_hex(a.first) << '\t' << a.first.length << '\t' << digest_hex(a.second) << '\t' << a.second.length
