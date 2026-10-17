@@ -11,8 +11,9 @@ randomness in the reads):
   F7 provisional: three linked bubbles, a two-haplotype panel and an off-panel donor (phase switched at the middle
      bubble), union = panel only, repair_rounds 1 -> the search stops at its round cap with a valid, exactly scored
      incumbent. F7 'full' is the same input with the default round cap (a completed control).
-F2 already holds a lower-ranked projection-ambiguous sequence group with substantial probability (0.336 at the 2026-10-15
-baseline), so no separate fixture is added for that case. Variants rev / ren / sam (P-line order, node ids, sample names)
+  F6 lower-ranked projection-ambiguous group: F1's graph and panel, a donor without the repeat unit ((-,-)/(-,-)), reads
+     omitted wherever a fragment could see the unit -> the winner is unambiguous, while a lower-ranked group carrying one
+     extra unit keeps non-negligible mass and has two projections (the unit in A or in B): the C2 case for block GQ. Variants rev / ren / sam (P-line order, node ids, sample names)
 are run for every fixture; the proposed outputs must be identical across them.
   s1a_fixtures.py <out dir> <panvar> <cyp2d6_block_alleles>
 """
@@ -57,6 +58,13 @@ def build(kind):
                 ("S2#2#c", hap(2, 1)), ("S3#1#c", hap(3, 2))]
         donor = [hap(1, 1), hap(2, 2)]
         gap = (len(L5), len(L5) + 80)   # C on every haplotype
+    elif kind == "F6":
+        nodes, rows = fixtures.build("F1")
+        none = rows[0][1]   # the reference row spells (-,-)
+        donor = [none, none]
+        start = len(fixtures.L)
+        gap = (start, start + len(fixtures.R))   # the context unit; no fragment may see whether a second copy exists
+        return nodes, rows, donor, gap
     else:   # F7
         nl, x, s1, y, s2, z, nrf = node(L7), [node(X1), node(X2)], node(S71), [node(Y1), node(Y2)], node(S72), [node(Z1), node(Z2)], node(RF7)
         hap = lambda a, b, cc: [nl, x[a - 1], s1, y[b - 1], s2, z[cc - 1], nrf]  # noqa: E731
@@ -92,7 +100,7 @@ def tiled_reads(nodes, donor, gap, out, step=13, insert=350, length=100):
     return n
 
 
-def main(out, panvar, dumper):
+def main(out, panvar, dumper, only=None):
     os.makedirs(out, exist_ok=True)
     base_profile = "profile\tfixture-bounds\ntime_limit_seconds\t300\nfootprint_limit_bytes\t4294967296\n"
     open(os.path.join(out, "profile.tsv"), "w").write(base_profile)
@@ -100,6 +108,9 @@ def main(out, panvar, dumper):
     open(os.path.join(out, "profile_k0.tsv"), "w").write(base_profile + "max_mosaic_candidates\t0\n")
     summary, block_rows = [], []
     plan = [("F1", None), ("F2", None), ("F3", None), ("F4", None), ("F5", None), ("F7", "profile_round1.tsv"), ("F7full", "profile_k0.tsv")]
+    plan.insert(5, ("F6", None))
+    if only:
+        plan = [x for x in plan if x[0] in only]
     for kind, profile in plan:
         d = os.path.join(out, kind)
         os.makedirs(d, exist_ok=True)
@@ -152,12 +163,18 @@ def main(out, panvar, dumper):
                                        "error_mass_lower": b[3], "error_mass_upper": b[4], "current_conditional_GQ": b[5]})
             print(kind, name, cur["status"], "->", prop["prediction"], prop["sequence_status"], prop["provisional"],
                   summary[-1]["order_independent"], flush=True)
+    # merge with rows already recorded for other fixtures (a fixture is never re-run into the same rows)
     for name, data in (("current_vs_proposed.tsv", summary), ("proposed_block_rows.tsv", block_rows)):
-        with open(os.path.join(out, name), "w") as f:
+        path = os.path.join(out, name)
+        kept = []
+        if os.path.exists(path):
+            kept = [r for r in csv.DictReader(open(path), delimiter="\t") if r["fixture"] not in {k for k, _ in plan}]
+        with open(path, "w") as f:
             w = csv.DictWriter(f, fieldnames=list(data[0]), delimiter="\t", lineterminator="\n")
             w.writeheader()
-            w.writerows(data)
+            w.writerows(kept + data)
 
 
 if __name__ == "__main__":
-    main(os.path.abspath(sys.argv[1]), os.path.abspath(sys.argv[2]), os.path.abspath(sys.argv[3]))
+    main(os.path.abspath(sys.argv[1]), os.path.abspath(sys.argv[2]), os.path.abspath(sys.argv[3]),
+         sys.argv[4].split(",") if len(sys.argv) > 4 else None)
