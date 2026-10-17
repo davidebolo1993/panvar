@@ -110,6 +110,42 @@ What a run writes depends on its outcome:
 
 `scripts/plot_genotype_results.py` summarises many runs as tables, figures and a short report. It is truth-free unless truth tables are given; see its `--help`. `scripts/plot_genotype_block_error.py` draws ordered-block raincloud figures of excess and normalised excess from a block-evaluation table; see its `--help`. `scripts/plot_genotype_block_gq.py` draws the same blocks as points coloured by conditional GQ; see its `--help`.
 
+### Sequence-first output (experimental, opt-in)
+
+**How to enable it.** Use `--output-schema sequence_first_v1` (profile key `output_schema`; default `legacy`).
+
+**What it adds.** It reports the caller's existing decision by sequence pair instead of by block label. It changes no score, search, legacy output, dosage or phase decision. It needs the adaptive repair; other routes are refused.
+
+**Outputs:**
+- `<prefix>.sequence_locus.tsv`;
+- `<prefix>.sequence_blocks.tsv`;
+- `<prefix>.sequence_haplotypes.fa`, a representative marked as such;
+- `<prefix>.representation_intervals.tsv`;
+- `<prefix>.sequence_alternatives.tsv`.
+
+**The prediction.** After a completed ranking it is the canonical member of the decision set: the highest-scoring sequence pair, with numerical ties broken by SHA-256 of the sequences. Labellings that spell the same pair are pooled. The status is one of:
+- `RESOLVED`: one sequence pair in the decision set (not a confidence claim);
+- `GENOTYPE_RESOLVED_SEQUENCE_SET`;
+- `SEQUENCE_TIED`.
+
+**Block status:** `IDENTIFIED`, `REPRESENTATION_AMBIGUOUS` or `GENOTYPE_UNRESOLVED`. It is computed over the *explored* labellings only (`projection_coverage=EXPLORED`), so an unexplored labelling of the same sequence may exist.
+
+**Identified blocks** carry conditional error-mass bounds, with each sequence pair counted once. The existing GQ is kept as `legacy_representative_GQ`.
+
+**Representation intervals** enclose every block where explored labellings of one sequence pair differ, including unchanged context between coupled alternatives. They list only observed label tuples, and they are not claimed minimal.
+
+**Stops at a declared cap.** A round or cumulative cap after a committed round reports `PROVISIONAL`, from the last exactly scored incumbent, with no decision set and no confidence.
+
+**When nothing is reported.** Watchdog stops, refusals and invalid input give no prediction.
+
+**Exit status under this schema:**
+- 0: a prediction, even when uncertain;
+- 3: provisional;
+- 1: no prediction;
+- 2: errors.
+
+**Confidence.** `structure_confidence` is `NA` (`UNCALIBRATED`).
+
 ## Limitations
 
 - Only paired short reads are supported.
