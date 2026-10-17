@@ -10,7 +10,12 @@ A pair PASSES only if the qualified verdict passes AND no strict problem touches
 the repair trajectory. Every strict problem that remains (settings rows, status keys) is listed with its class:
 key present on one side only ("added"/"removed") or a value change ("changed"). Nothing is hidden.
 
-  p1_compare.py KIND DIR_A DIR_B [PREFIX]      -> one TSV row on stdout; exit 0 iff PASS
+P1.1 outcome bookkeeping: each run is first classed (outcome()) as a completed call, a completed scientific no-call (a
+valid outcome: its status and every scientific record it wrote are compared like a call's), or an interrupted /
+resource-incomplete computation (watchdog stops, refusals, cap stops, unknown reasons). A pair with an incomplete or
+missing side is UNRESOLVED -- never PASS -- because a partial computation cannot establish completed-result equivalence.
+
+  p1_compare.py KIND DIR_A DIR_B [PREFIX]   -> one TSV row on stdout; exit 0 PASS, 1 FAIL, 2 UNRESOLVED
 """
 import importlib.util
 import os
@@ -35,6 +40,31 @@ SCIENCE_STATUS = re.compile(r"^(status|call_class|no_call_reason|phase_support|s
                             r"best_other_genotype_score|alleles_scored|every_allele_scored|blocks_genotype\w*|"
                             r"quality_\w+|dosage_audit\w*|dosage_status_\w+|dosage_repair\w*|dosage_allocation\w*|"
                             r"dosage_policy|dosage_census_sensitive_blocks|dosage_molecule_span_bp|\w*genotype\w*)$")
+
+
+COMPLETED_CALL = {"COMPLETE", "CONDITIONAL_GENOTYPE_EQUIVALENT", "BLOCK_CONSENSUS"}
+# no-calls that are the model's own scientific answer (a tie, or no panel anchor), not a stopped computation
+SCIENTIFIC_NO_CALL = {("RESCORE_INCOMPLETE", "distinct_tie"), ("RESCORE_INCOMPLETE", "divergent_tie"),
+                      ("REPAIR_INCOMPLETE", "improving_move_tie"), ("RESCORE_INCOMPLETE", "no_panel_anchor"),
+                      ("REPAIR_INCOMPLETE", "no_panel_anchor")}
+
+
+def outcome(d, name="call"):
+    """'completed_call', 'scientific_no_call', or 'incomplete:<status>/<no_call_reason>' ('missing' without a status)."""
+    p = os.path.join(d, name + ".mosaic_status.tsv")
+    if not os.path.exists(p):
+        return "missing"
+    st = dict(l.split("\t", 1) for l in open(p).read().split("\n") if "\t" in l)
+    status, reason = st.get("status", "none"), st.get("no_call_reason", "none")
+    if status in COMPLETED_CALL:
+        return "completed_call"
+    if (status, reason) in SCIENTIFIC_NO_CALL:
+        return "scientific_no_call"
+    return f"incomplete:{status}/{reason}"
+
+
+def comparable(o):
+    return o in ("completed_call", "scientific_no_call")
 
 
 def strict_compare(a, b, name):
@@ -62,6 +92,12 @@ def classify(problem):
 def main(argv):
     kind, a, b = argv[0], argv[1], argv[2]
     name = argv[3] if len(argv) > 3 else "call"
+    oa, ob = outcome(a, name), outcome(b, name)
+    label = [kind, os.path.basename(a.rstrip("/")) + "/" + name, os.path.basename(b.rstrip("/")) + "/" + name]
+    if not (comparable(oa) and comparable(ob)):
+        print("\t".join(label + ["UNRESOLVED", "-", "-", "-", "-", "-", "-", "not compared: an incomplete or missing run "
+                                 "cannot establish completed-result equivalence", oa, ob]))
+        return 2
     s_ok, problems, diagnostics, compared = strict_compare(a, b, name)
     q_ok, q_line = qualified_compare(a, b, name)
     def is_status(p):
@@ -71,16 +107,15 @@ def main(argv):
     status_science = [p for p in problems if is_status(p) and len(p.split(": ")) > 2 and
                       SCIENCE_STATUS.match(p.split(": ")[1])]
     ok = q_ok and not science and not status_science
-    row = [kind, os.path.basename(a.rstrip("/")) + "/" + name, os.path.basename(b.rstrip("/")) + "/" + name,
-           "PASS" if ok else "FAIL", "IDENTICAL" if s_ok else "DIFFERENT", str(compared), str(len(diagnostics)),
+    row = label + ["PASS" if ok else "FAIL", "IDENTICAL" if s_ok else "DIFFERENT", str(compared), str(len(diagnostics)),
            str(len(problems)), " | ".join(classify(p) for p in problems) or "none",
-           " | ".join(science + status_science) or "none", q_line]
+           " | ".join(science + status_science) or "none", q_line, oa, ob]
     print("\t".join(row))
     return 0 if ok else 1
 
 
 HEADER = ["kind", "a", "b", "verdict", "strict", "files_compared", "diagnostic_keys_changed", "strict_problems",
-          "strict_problem_list", "science_problems", "qualified_i4c_i4b"]
+          "strict_problem_list", "science_problems", "qualified_i4c_i4b", "outcome_a", "outcome_b"]
 
 if __name__ == "__main__":
     sys.exit(main(sys.argv[1:]))
