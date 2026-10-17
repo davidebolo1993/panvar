@@ -18,7 +18,6 @@
 // number keeps the test honest if the batch is ever retuned.
 #include "panvar/fragment_likelihood.hpp"
 #include "panvar/genotype_repair.hpp"
-#include "panvar/verification_census.hpp"
 
 #include <cstdlib>
 #include <sys/wait.h>
@@ -3405,54 +3404,6 @@ void test_gap_recursion_backend() {
 }
 
 
-// ---- I2-I: the verification census at the caller, and the fixed-geometry recursion inside dosage -----------------------
-void test_verification_census() {
-    const std::string pr1 = path("phaseable_r1.fq"), pr2 = path("phaseable_r2.fq");
-    const auto science = [](const std::string& file) {
-        std::ifstream in(file);
-        std::string line, out;
-        while (std::getline(in, line)) {
-            std::size_t at = 0;
-            for (int k = 0; k < 28 && at != std::string::npos; ++k) at = line.find('\t', at + 1);
-            out += line.substr(0, at) + "\n";
-        }
-        return out;
-    };
-    for (const std::size_t threads : {std::size_t{1}, std::size_t{4}}) {
-        const auto arm = [&](const std::string& name) {
-            panvar::GenotypeCommandOptions o = repair_options(name, pr1, pr2, "tiny_phaseable.gfa");
-            with_union_caches(o);
-            o.max_mosaic_candidates = 8;
-            o.threads = threads;
-            o.gap_recursion_fixed_geometry = true;
-            o.setting_sources["gap_recursion_backend"] = "profile test";
-            return o;
-        };
-        const std::string off = "vc_off_t" + std::to_string(threads), on = "vc_on_t" + std::to_string(threads);
-        require(panvar::run_genotype(arm(off)) == panvar::GenotypeRunStatus::Complete, "fixture: the census-off arm must call");
-        panvar::begin_verification_census(1, std::uint64_t{64} << 20);
-        const panvar::GenotypeRunStatus status = panvar::run_genotype(arm(on));
-        panvar::set_verification_census_stage(panvar::CensusStage::other);
-        const panvar::VerificationCensusReport census = panvar::end_verification_census();
-        require(status == panvar::GenotypeRunStatus::Complete, "fixture: the census-on arm must call");
-        require_same_science(off, on, "verification census on/off, " + std::to_string(threads) + " threads");
-        require(science(path(off + ".repair_rounds.tsv")) == science(path(on + ".repair_rounds.tsv")),
-                "the adaptive trajectory must not depend on the census");
-        const auto st = read_status(path(on + ".mosaic_status.tsv"));
-        const panvar::CensusExact& u = census.exact[static_cast<std::size_t>(panvar::CensusGroup::union_discovery)];
-        require(census.complete && u.requests == std::stoull(st.at("full_read_verifications")) &&
-                    census.sampled[static_cast<std::size_t>(panvar::CensusGroup::union_discovery)].requests == u.requests,
-                "the census sees every union verification request (period 1)");
-        const std::uint64_t adaptive =
-            census.exact[static_cast<std::size_t>(panvar::CensusGroup::adaptive_full)].requests +
-            census.exact[static_cast<std::size_t>(panvar::CensusGroup::adaptive_window)].requests;
-        require(adaptive > 0, "the census sees the adaptive search's requests");
-    }
-    std::cout << "  verification census: same science and trajectory on and off at 1 and 4 threads; every union request "
-                 "counted; adaptive requests attributed\n";
-}
-
-
 // ---- I2-K: the union pass's emission results handed to the adaptive search ---------------------------------------------
 void test_emission_handoff() {
     const std::string pr1 = path("phaseable_r1.fq"), pr2 = path("phaseable_r2.fq");
@@ -3977,7 +3928,6 @@ int main(int argc, char** argv) {
         test_marker_proposal_reuse();
         test_prepared_combination_terms();
         test_gap_recursion_backend();
-        test_verification_census();
         test_emission_handoff();
         test_prepared_locus();
         test_prepared_locus_cleanup();

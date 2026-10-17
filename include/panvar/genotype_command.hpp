@@ -179,12 +179,6 @@ struct GenotypeCommandOptions {
     // combination call (FragmentScoringOptions::prepared_library_terms) in the initial union pass and the adaptive search;
     // the dosage stage keeps the scalar path. Setting the key (either value) reports the combination_* block.
     bool combination_prepared_library_terms = false;
-    // I2-G (MEASUREMENT key, never for timing runs): sample every N-th verification request into the verify_profile_*
-    // status block (union pass and whole run). 0 (default): off.
-    std::uint32_t verification_profile_period = 0;
-    // I2-I (MEASUREMENT key, never for timing runs): the verification-request census (verification_census.hpp), sampling
-    // 1 in N read contents into <prefix>.verification_census.tsv; 64 MiB of census storage at most. 0 (default): off.
-    std::uint32_t verification_census_period = 0;
     // I2-H (EXPERIMENTAL, profile key only): `gap_recursion_backend scaled_reference|fixed_geometry_experimental`, the
     // emitting gapped recursion's implementation for the run's scoring (FragmentScoringOptions::gap_recursion_backend):
     // the union pass, the adaptive search and dosage. Exact, bit for bit; setting the key reports it in the status.

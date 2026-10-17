@@ -1,5 +1,4 @@
 #include "panvar/fragment_likelihood.hpp"
-#include "panvar/verification_census.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -933,69 +932,6 @@ void cache_store_fit(const KeyView& key, const GappedFit& fit) {
     ++shard.occupied;
     cache.entries.fetch_add(1, std::memory_order_relaxed);
     cache.payload_bytes.fetch_add(bytes, std::memory_order_relaxed);
-}
-
-// ---- I2-G (measurement only): sampled verification attribution (see VerificationProfile) ----------------------------
-std::atomic<std::uint32_t>& verification_period() {
-    static std::atomic<std::uint32_t> period{0};
-    return period;
-}
-struct VerificationLocal {
-    std::uint64_t counter = 0;
-    bool sampling = false;
-    VerificationProfile p;
-};
-VerificationLocal& verification_local() {
-    thread_local VerificationLocal local;
-    return local;
-}
-std::mutex& verification_mutex() {
-    static std::mutex m;
-    return m;
-}
-VerificationProfile& verification_totals() {
-    static VerificationProfile totals;
-    return totals;
-}
-inline std::uint64_t profile_now_ns() {
-    return static_cast<std::uint64_t>(
-        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
-}
-// Folds this worker's sampled profile into the process totals (called once per collect_form_placements).
-void flush_verification_local() {
-    VerificationLocal& local = verification_local();
-    if (local.p.requests == 0) return;
-    const std::lock_guard<std::mutex> lock(verification_mutex());
-    VerificationProfile& t = verification_totals();
-    const VerificationProfile& p = local.p;
-    t.requests += p.requests;
-    t.sampled += p.sampled;
-    t.ns_total += p.ns_total;
-    t.ns_decision += p.ns_decision;
-    t.ns_prechecks += p.ns_prechecks;
-    t.ns_kernel += p.ns_kernel;
-    t.ns_emission_lookup += p.ns_emission_lookup;
-    t.ns_dp += p.ns_dp;
-    t.ns_rows += p.ns_rows;
-    t.sampled_decision_served += p.sampled_decision_served;
-    t.sampled_decision_missed += p.sampled_decision_missed;
-    t.sampled_decision_unavailable += p.sampled_decision_unavailable;
-    t.sampled_kernels += p.sampled_kernels;
-    t.sampled_kernel_feasible += p.sampled_kernel_feasible;
-    t.sampled_emission_hits += p.sampled_emission_hits;
-    t.sampled_dps += p.sampled_dps;
-    t.sampled_accepted += p.sampled_accepted;
-    t.sampled_rows += p.sampled_rows;
-    t.kernel_prepared_pattern += p.kernel_prepared_pattern;
-    t.kernel_short_read += p.kernel_short_read;
-    t.kernel_edlib += p.kernel_edlib;
-    for (const auto& [shape, counts] : p.kernel_shapes) {
-        auto& to = t.kernel_shapes[shape];
-        to.first += counts.first;
-        to.second += counts.second;
-    }
-    if (p.band != 0) t.band = p.band;
-    local.p = VerificationProfile{};
 }
 
 void census_record(const std::string& read, const char* window, std::size_t window_length,
@@ -2141,10 +2077,6 @@ std::optional<GappedFit> gapped_emission_core(
     // A caller that has already established the whole haplotype and the whole read are ACGT may say so: the
     // check below then cannot fail, and repeating it cost ~11% of the union's seeding on 203 bytes per start.
     if (!acgt_known) require_acgt_window(haplotype, start, window, read);
-    // I2-G (measurement only): the sampled request's phases
-    VerificationLocal& vlocal = verification_local();
-    const bool vsample = vlocal.sampling;
-    std::uint64_t vmark = vsample ? profile_now_ns() : 0;
 
     EmissionWork& work = emission_work();
     EmissionCache& cache = emission_cache();
@@ -2160,31 +2092,8 @@ std::optional<GappedFit> gapped_emission_core(
         ++work.executed_prefilters;
         const bool timing = emission_timing_active().load(std::memory_order_relaxed);
         const auto prefilter_mark = timing ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-        if (vsample) {
-            const std::uint64_t now = profile_now_ns();
-            vlocal.p.ns_prechecks += now - vmark;
-            vmark = now;
-        }
         feasible = feasible_within_band(haplotype, start, window, read, mismatch_band, pattern);
-        if (vsample) {
-            const std::uint64_t now = profile_now_ns();
-            vlocal.p.ns_kernel += now - vmark;
-            vmark = now;
-            ++vlocal.p.sampled_kernels;
-            if (feasible) ++vlocal.p.sampled_kernel_feasible;
-            if (pattern != nullptr && pattern->usable) ++vlocal.p.kernel_prepared_pattern;
-            else if (read.size() <= kMyersWidth) ++vlocal.p.kernel_short_read;
-            else ++vlocal.p.kernel_edlib;
-            auto& shape = vlocal.p.kernel_shapes[{static_cast<std::uint32_t>(read.size()), static_cast<std::uint32_t>(window)}];
-            ++shape.first;
-            if (feasible) ++shape.second;
-            vlocal.p.band = mismatch_band;
-        }
         if (timing) emission_timing().prefilter_ns += nanos_since(prefilter_mark);
-    } else if (vsample) {
-        const std::uint64_t now = profile_now_ns();
-        vlocal.p.ns_prechecks += now - vmark;
-        vmark = now;
     }
     if (feasible_out != nullptr) *feasible_out = feasible;
     if (!feasible) {
@@ -2199,14 +2108,6 @@ std::optional<GappedFit> gapped_emission_core(
     // Only survivors get a key, and only recursion results are ever retained.
     const bool caching = cache.active.load(std::memory_order_relaxed);
     KeyView key;
-    // I2-G: the emission-cache phase ends at the recursion (or at a hit)
-    const auto close_lookup = [&](bool hit) {
-        if (!vsample) return;
-        const std::uint64_t now = profile_now_ns();
-        vlocal.p.ns_emission_lookup += now - vmark;
-        vmark = now;
-        if (hit) ++vlocal.p.sampled_emission_hits;
-    };
     if (caching) {
         key = key_prefix != nullptr && emission_key_prefix_enabled().load(std::memory_order_relaxed)
                   ? key_view_from_prefix(*key_prefix, read, haplotype.data() + start, window)
@@ -2215,11 +2116,9 @@ std::optional<GappedFit> gapped_emission_core(
         GappedFit cached;
         switch (cache_lookup(key, &cached, work)) {
             case CacheProbe::HitRefusedAfterRecursion:
-                close_lookup(true);
                 census_record(read, haplotype.data() + start, window, true, sizeof(double));
                 return std::nullopt;
             case CacheProbe::HitAccepted:
-                close_lookup(true);
                 census_record(read, haplotype.data() + start, window, true, sizeof(double));
                 return cached;
             default:
@@ -2232,25 +2131,13 @@ std::optional<GappedFit> gapped_emission_core(
                 repeat.refused = earlier->refused;
                 repeat.fit = earlier->fit;
                 deferred->records.push_back(repeat);
-                close_lookup(true);
                 if (repeat.refused) return std::nullopt;
                 return repeat.fit;
             }
         }
     }
 
-    close_lookup(false);
     ++work.executed_dps;
-    if (vsample) ++vlocal.p.sampled_dps;
-    // I2-G: the recursion, normaliser and cache store are timed by the caller as the core's remainder after this point
-    struct DpClock {
-        bool on;
-        VerificationLocal& local;
-        std::uint64_t start;
-        ~DpClock() {
-            if (on) local.p.ns_dp += profile_now_ns() - start;
-        }
-    } dp_clock{vsample, vlocal, vsample ? profile_now_ns() : 0};
 
     GappedFit fit;
     // Filled in place rather than through a scratch vector, so an accepted placement costs one
@@ -2587,18 +2474,6 @@ void combine_with_audits(const std::vector<double>& mass_a, const std::vector<do
     }
 }
 } // namespace
-
-void set_verification_profile_period(std::uint32_t period) { verification_period().store(period); }
-void reset_verification_profile() {
-    const std::lock_guard<std::mutex> lock(verification_mutex());
-    verification_totals() = VerificationProfile{};
-}
-VerificationProfile verification_profile_snapshot() {
-    const std::lock_guard<std::mutex> lock(verification_mutex());
-    VerificationProfile out = verification_totals();
-    out.period = verification_period().load();
-    return out;
-}
 
 PreparedLibraryTermsTally prepared_library_terms_tally() {
     const PreparedTally& t = prepared_tally();
@@ -3251,11 +3126,10 @@ int prefilter_decision(const UnionPrefilterCache& cache, std::uint64_t key) {
     }
 }
 
-// 1 stored, 0 not retained (admission has stopped), 2 another worker had already stored it (I2-I reads this).
-int remember_prefilter(UnionPrefilterCache& cache, std::uint64_t key, bool feasible) {
+void remember_prefilter(UnionPrefilterCache& cache, std::uint64_t key, bool feasible) {
     if (cache.held.load(std::memory_order_relaxed) >= cache.max_held) {
         cache.not_retained.fetch_add(1, std::memory_order_relaxed);
-        return 0;
+        return;
     }
     const std::uint64_t packed = ((key + 1) << 1) | (feasible ? 1u : 0u);
     const std::size_t mask = (std::size_t{1} << cache.slot_bits) - 1;
@@ -3264,10 +3138,10 @@ int remember_prefilter(UnionPrefilterCache& cache, std::uint64_t key, bool feasi
         if (entry == 0) {
             if (cache.slots[at].compare_exchange_strong(entry, packed, std::memory_order_acq_rel)) {
                 cache.held.fetch_add(1, std::memory_order_relaxed);
-                return 1;
+                return;
             }
         }
-        if ((entry >> 1) == key + 1) return 2;   // another worker remembered it first: the same decision
+        if ((entry >> 1) == key + 1) return;   // another worker remembered it first: the same decision
     }
 }
 
@@ -3380,7 +3254,6 @@ void collect_form_placements(
     // are dropped after deduplication and before any verification, and counted in `owned_skipped`.
     const std::pair<std::uint32_t, std::uint32_t>* owned = nullptr,
     std::uint64_t* owned_skipped = nullptr) {
-    const CensusUnitScope census_unit;   // I2-I (measurement only): one discovery unit
     auto phase_mark = times != nullptr ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const auto lap = [&](std::uint64_t SeedingTimes::*field) {
         if (times == nullptr) return;
@@ -3573,9 +3446,6 @@ void collect_form_placements(
     const std::size_t shadow_pieces[3] = {band + 1, band + 2, 2 * band + 1};
     PieceLayout shadow_layouts[3];
     std::uint32_t shadow_form = std::numeric_limits<std::uint32_t>::max();
-    // I2-I (MEASUREMENT ONLY): the verification-request census. Off, it costs one relaxed load per call.
-    const bool census = verification_census_active();
-    const CensusContext census_context{library.substitution_error, library.gap_open, library.gap_extend, library.max_gap_bp, band};
     for (const auto& item : proposed) {
         // One relaxed load against a full-read comparison: free at this granularity, and verification is
         // where a cancelled worker would otherwise spend the longest.
@@ -3609,19 +3479,6 @@ void collect_form_placements(
             prefilter_before = emission_timing().prefilter_ns;
         }
         const auto emission_mark = timing ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-        // I2-G (measurement only): every period-th request is sampled
-        VerificationLocal& vlocal = verification_local();
-        const std::uint32_t vperiod = verification_period().load(std::memory_order_relaxed);
-        bool vsample = false;
-        std::uint64_t vstart = 0, vmark = 0;
-        if (vperiod != 0) {
-            ++vlocal.p.requests;
-            vsample = (++vlocal.counter % vperiod) == 0;
-            if (vsample) {
-                ++vlocal.p.sampled;
-                vstart = vmark = profile_now_ns();
-            }
-        }
         // A remembered decision stands in for the kernel on exactly the same (read, window) content.
         int known = -1;
         std::uint64_t decision_key = 0;
@@ -3639,75 +3496,12 @@ void collect_form_placements(
             }
         }
         bool computed = false;
-        if (vsample) {
-            const std::uint64_t now = profile_now_ns();
-            vlocal.p.ns_decision += now - vmark;
-            vmark = now;
-            if (!consult) ++vlocal.p.sampled_decision_unavailable;
-            else if (known >= 0) ++vlocal.p.sampled_decision_served;
-            else ++vlocal.p.sampled_decision_missed;
-        }
-        vlocal.sampling = vsample;
-        EmissionWork census_before;
-        std::uint64_t census_fixed_before = 0;
-        if (census) {
-            census_before = emission_work();
-            census_fixed_before = t_fixed_recursions;
-        }
         const std::optional<GappedFit> fit =
             gapped_emission_core(haplotype, forms[item.first].bases, item.second, library, band,
                                  &forms[item.first].pattern, haplotype_acgt && forms[item.first].all_acgt,
                                  &forms[item.first].key_prefix, known, consult && known < 0 ? &computed : nullptr,
                                  options.gap_recursion_backend);
-        vlocal.sampling = false;
-        if (vsample) vmark = profile_now_ns();
-        int census_retained = -1;
-        if (consult && known < 0) census_retained = remember_prefilter(*remembered, decision_key, computed);
-        if (census) {
-            const EmissionWork& after = emission_work();
-            const std::string& read = forms[item.first].bases;
-            const bool eligible = item.second <= haplotype.size() && haplotype.size() - item.second >= read.size();
-            CensusOutcome o;
-            o.consulted = consult;
-            o.served = consult && known >= 0;
-            o.retained = census_retained;
-            o.kernel = after.executed_prefilters != census_before.executed_prefilters;
-            o.feasible = eligible && after.prefilter_rejections == census_before.prefilter_rejections;
-            o.recursion = after.executed_dps != census_before.executed_dps;
-            o.fixed_recursion = t_fixed_recursions != census_fixed_before;
-            o.emission_hit = o.feasible && !o.recursion;
-            o.accepted = fit.has_value() && fit->log_emission != kNegInf;
-            if (o.accepted) {
-                if (componentise[item.first] != 0) {
-                    for (const GappedComponent& component : fit->components) o.rows += component.log_emission != kNegInf ? 1u : 0u;
-                } else {
-                    o.rows = 1;
-                }
-            }
-            const std::size_t window = item.second <= haplotype.size()
-                ? std::min(haplotype.size() - item.second, read.size() + library.max_gap_bp) : 0;
-            census_record(census_context, forms[item.first].key_prefix.a, forms[item.first].key_prefix.b, read.data(),
-                          read.size(), haplotype.data() + std::min<std::size_t>(item.second, haplotype.size()), window,
-                          static_cast<std::uint32_t>(forms[item.first].fragment), o);
-        }
-        if (vsample) {
-            const std::uint64_t now = profile_now_ns();
-            vlocal.p.ns_decision += now - vmark;
-            vmark = now;
-        }
-        // I2-G: the request's row construction (or its refusal) closes the sample, on every exit below
-        struct SampleClose {
-            bool on;
-            VerificationLocal& local;
-            std::uint64_t start, rows_from;
-            ~SampleClose() {
-                if (!on) return;
-                const std::uint64_t now = profile_now_ns();
-                local.p.ns_rows += now - rows_from;
-                local.p.ns_total += now - start;
-            }
-        } sample_close{vsample, vlocal, vstart, vmark};
-        if (vsample && fit.has_value() && fit->log_emission != kNegInf) ++vlocal.p.sampled_accepted;
+        if (consult && known < 0) remember_prefilter(*remembered, decision_key, computed);
         if (timing) {
             const std::uint64_t spent = nanos_since(emission_mark);
             emission_timing().emission_ns += spent;
@@ -3818,7 +3612,6 @@ void collect_form_placements(
     cache_work.executed_dps += emission.executed_dps;
     publish_hits();
     if (remembered != nullptr) remembered->misses.fetch_add(local_misses, std::memory_order_relaxed);
-    if (verification_period().load(std::memory_order_relaxed) != 0) flush_verification_local();
     lap(&SeedingTimes::verify_ns);
 
     // Exact union reuse: the cached placements of every zone, translated to this haplotype. Appended before
@@ -4285,7 +4078,6 @@ std::uint64_t discover_unit_placements(const IndexUnit& unit, const PreparedFrag
     touched.clear();
     const std::pair<std::uint32_t, std::uint32_t> core{unit.core_lo, unit.core_hi};
     const std::pair<std::uint32_t, std::uint32_t>* owned = unit.fine ? &core : nullptr;
-    const CensusSiteScope census_site(CensusSite::indexed_unit);   // I2-I (measurement only)
     if (forward) {
         collect_form_placements(unit.bytes, prepared.forward_forms, prepared.forward_componentise, forward_indexes, budget,
                                 band, library, out, proposed, counters, cache, options, &touched, nullptr, nullptr, nullptr,
@@ -4971,7 +4763,6 @@ void place_haplotype_range(
         const std::uint64_t rows_before = counters.accepted_mate_placements;
         SeedingTimes seeding_times;
         SeedingTimes* const timed = trace_work ? &seeding_times : nullptr;
-        const CensusSiteScope census_site(CensusSite::full_haplotype);   // I2-I (measurement only)
         collect_form_placements(haplotype, prepared.forward_forms, prepared.forward_componentise,
                                 prepared.forward_indexes, budget, band, library, forward_placements,
                                 proposed_scratch, counters, cache_work, options, nullptr,
@@ -5879,7 +5670,6 @@ void enumerate_window_origins_reference(
     std::vector<std::vector<FormPlacement>> reverse_placements(prepared.reverse_forms.size());
     std::vector<std::pair<std::uint32_t, std::uint32_t>> proposed_scratch;
 
-    const CensusSiteScope census_site(CensusSite::window);   // I2-I (measurement only)
     collect_form_placements(window.bases, prepared.forward_forms, prepared.forward_componentise,
                             prepared.forward_indexes, budget, band, library, forward_placements,
                             proposed_scratch, counters, cache_work, options);
@@ -6058,7 +5848,6 @@ void fine_window_rows(const PreparedFragmentSet& prepared, const LibraryModel& l
             // the reference path, unchanged: the two scans over the whole window
             ++st.fallback_windows;
             const std::uint64_t at_start = counters.proposed_starts;
-            const CensusSiteScope census_site(CensusSite::window);   // I2-I (measurement only)
             collect_form_placements(window.bases, prepared.forward_forms, prepared.forward_componentise, forward_indexes,
                                     budget, band, library, scratch.forward_rows, scratch.proposed, counters, cache_work,
                                     options, &scratch.touched_forward);
@@ -6174,7 +5963,6 @@ void fine_window_rows(const PreparedFragmentSet& prepared, const LibraryModel& l
             std::vector<std::vector<FormPlacement>>(prepared.forward_forms.size()),
             std::vector<std::vector<FormPlacement>>(prepared.reverse_forms.size())};
         std::vector<std::pair<std::uint32_t, std::uint32_t>> spare_proposed;
-        const CensusSiteScope census_site(CensusSite::window);   // I2-I (measurement only)
         collect_form_placements(window.bases, prepared.forward_forms, prepared.forward_componentise, forward_indexes, spare,
                                 band, library, ref[0], spare_proposed, spare_counters, spare_cache, options);
         collect_form_placements(window.reversed, prepared.reverse_forms, prepared.reverse_componentise, reverse_indexes,
@@ -6253,7 +6041,6 @@ void enumerate_window_origins(
                          cache_work, scratch, proposed_by_pass);
     } else {
     const std::uint64_t proposed_at_start = counters.proposed_starts;
-    const CensusSiteScope census_site(CensusSite::window);   // I2-I (measurement only)
     collect_form_placements(window.bases, prepared.forward_forms, prepared.forward_componentise,
                             forward_indexes != nullptr ? *forward_indexes : prepared.forward_indexes,
                             budget, band, library, scratch.forward_rows,
@@ -9305,55 +9092,6 @@ void PreparedScoringContext::begin_transient_round() {
     // Nothing is frozen. Owned cache keys mean a transient haplotype may be destroyed while the
     // entries it produced keep serving, so all this records is the slot from which release is allowed.
     state.transient_watermark = state.sequences.size();
-}
-
-std::vector<std::size_t> PreparedScoringContext::add_haplotypes_with_censuses(const std::vector<std::string>& sequences) {
-    State& state = *state_;
-    state.require_usable();
-    const std::size_t before = state.sequences.size();
-    std::vector<std::size_t> out;
-    for (const std::string& sequence : sequences) {
-        const std::uint64_t hash = hash_materialised(sequence);
-        const std::size_t slot = state.sequences.size();
-        state.hash_by_slot.push_back(hash);
-        state.sequences.push_back(sequence);
-        state.reversed.emplace_back(sequence.rbegin(), sequence.rend());
-        state.by_hash.emplace(hash, slot);
-        ++state.slots_created;
-        out.push_back(slot);
-    }
-    const std::size_t after = state.sequences.size();
-    state.mass_column.resize(after, std::vector<double>(state.fragments.size(), kNegInf));
-    state.exposure.resize(after, 0.0);
-    for (std::size_t h = before; h < after; ++h) {
-        state.exposure[h] = exposure_for_length(state.sequences[h].size(), state.fragments.size(),
-                                                state.prepared.fragments_by_floor, state.library_insert);
-    }
-    std::map<std::size_t, HaploidOriginCensus> fresh;
-    CensusCapture capture;
-    for (std::size_t h = before; h < after; ++h) capture.wanted.emplace(h, &fresh[h]);
-    PlacementInputs inputs;
-    inputs.prepared = &state.prepared;
-    inputs.fragments = &state.fragments;
-    inputs.library = &state.library;
-    inputs.library_insert = &state.library_insert;
-    inputs.options = &state.options;
-    inputs.sequences = &state.sequences;
-    inputs.reversed = &state.reversed;
-    inputs.band = state.options.mismatch_band;
-    FragmentScoringCounters counters;
-    EmissionCacheCounters cache_work;
-    ScorerMemoryAccounts memory;
-    OriginRecording none;
-    try {
-        run_placement(inputs, before, after, state.options.threads, false, state.budget, state.mass_column, counters,
-                      memory, cache_work, none, &capture);
-    } catch (const ResourceExhausted&) {
-        state.refused = true;
-        throw;
-    }
-    for (auto& [h, census] : fresh) state.censuses.emplace(h, std::move(census));
-    return out;
 }
 
 const HaploidOriginCensus* PreparedScoringContext::census_view(std::size_t haplotype) const {

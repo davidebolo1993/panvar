@@ -160,7 +160,6 @@ add_library(panvarlib
     src/genotype_headline.cpp
     src/genotype_dosage_provenance.cpp
     src/fragment_likelihood.cpp
-    src/verification_census.cpp
     src/bubble_path.cpp
     src/bubbles.cpp
     src/ref_path.cpp

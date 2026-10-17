@@ -8,7 +8,6 @@
 #include "panvar/genotype_dosage_repair.hpp"
 #include "panvar/genotype_repair.hpp"
 #include "panvar/fragment_likelihood.hpp"
-#include "panvar/verification_census.hpp"
 #include "panvar/mosaic_spelling.hpp"
 
 #include <algorithm>
@@ -187,8 +186,8 @@ void test_zero_spread() {
 // I2-H's disclosed gap, closed: the fixed-geometry recursion must actually EXECUTE inside dosage, not merely leave the
 // dosage tables unchanged. The zero-spread fixture's heterozygous call triggers an AUTO repair; repair_block scores
 // its candidates exactly through the dosage stage's own scoring lifecycle. Single-threaded, so the existing per-thread
-// execution hook sees every recursion; the census attributes them to the dosage stage. Both backends must choose the
-// same repair from bit-identical candidate scores.
+// execution hook, read around repair_block alone, sees every recursion of dosage's repair scoring. Both backends must
+// choose the same repair from bit-identical candidate scores.
 void test_fixed_recursion_inside_dosage() {
     const Locus L = make_locus(1500, false, 5);
     const PreparedGenotypeModel& m = *L.model;
@@ -216,7 +215,7 @@ void test_fixed_recursion_inside_dosage() {
     library.fragment_start_intensity = 0.05;
     library.provenance = "fixture: declared";
     RepairResult result[2];
-    std::uint64_t executions[2] = {0, 0}, census_fixed[2] = {0, 0}, census_requests[2] = {0, 0};
+    std::uint64_t executions[2] = {0, 0};
     for (int arm = 0; arm < 2; ++arm) {
         ScoringInputs in;
         in.model = &m;
@@ -233,23 +232,14 @@ void test_fixed_recursion_inside_dosage() {
         in.switch_probability = std::vector<double>(m.blocks().size() - 1, 0.01);
         double prior = 0.0;
         in.persisted = score_reported_diplotype(in, prior);   // what the run persisted for its reported call
-        begin_verification_census(1, std::uint64_t{64} << 20);
-        set_verification_census_stage(CensusStage::dosage);
         const std::uint64_t before = gapped_dp_test::fixed_geometry_executions();
         result[arm] = repair_block(audit.blocks[1], census[1], features[1], {}, in, DosageSettings{}, RepairSettings{});
         executions[arm] = gapped_dp_test::fixed_geometry_executions() - before;
-        set_verification_census_stage(CensusStage::other);
-        const VerificationCensusReport report = end_verification_census();
-        for (const std::size_t g : {static_cast<std::size_t>(CensusGroup::dosage_full), static_cast<std::size_t>(CensusGroup::dosage_window)}) {
-            census_fixed[arm] += report.exact[g].fixed_recursions;
-            census_requests[arm] += report.exact[g].requests;
-        }
     }
-    require(result[1].outcome == "REPAIRED" && !result[1].candidates.empty() && census_requests[1] > 0,
+    require(result[1].outcome == "REPAIRED" && !result[1].candidates.empty(),
             "the repair must reproduce the reported call and score candidates (vacuous otherwise)");
-    require(executions[0] == 0 && census_fixed[0] == 0, "the reference backend runs no fixed-geometry recursion in dosage");
-    require(executions[1] > 0 && census_fixed[1] == executions[1],
-            "the fixed-geometry recursion must execute inside dosage's repair scoring, all of it attributed to dosage");
+    require(executions[0] == 0, "the reference backend runs no fixed-geometry recursion in dosage");
+    require(executions[1] > 0, "the fixed-geometry recursion must execute inside dosage's repair scoring");
     const auto bits = [](double x) { std::uint64_t u; std::memcpy(&u, &x, sizeof u); return u; };
     require(result[0].outcome == result[1].outcome && result[0].chosen == result[1].chosen &&
                 result[0].candidates.size() == result[1].candidates.size() && result[0].top_set_size == result[1].top_set_size,
@@ -263,8 +253,8 @@ void test_fixed_recursion_inside_dosage() {
                 "every repair candidate's exact score must agree bit for bit");
     }
     std::cout << "  fixed-geometry recursion inside dosage: " << executions[1] << " executed in repair scoring of "
-              << result[1].candidates.size() << " candidates (" << census_requests[1]
-              << " dosage verification requests); candidate scores and the repair bit-identical to the reference\n";
+              << result[1].candidates.size() << " candidates; candidate scores and the repair bit-identical to the "
+                 "reference\n";
 }
 
 // ---- I2-J: the interned census backend must equal the reference in every CensusBlock field ----------------------------

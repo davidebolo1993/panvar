@@ -2,7 +2,6 @@
 #include "panvar/prepared_locus.hpp"
 #include "panvar/prepared_locus_file.hpp"
 #include "prepared_locus_parts.hpp"
-#include "panvar/verification_census.hpp"
 #include "panvar/genotype_dosage_integrate.hpp"
 #include "panvar/genotype_dosage_repair.hpp"
 #include "panvar/gz_reader.hpp"
@@ -96,8 +95,6 @@ RunWatch* g_watch = nullptr;
 std::vector<std::pair<std::string, std::string>> g_input_hashes;
 // I2-E: what the marker-proposal contribution reuse did in this run (reported when its key is set)
 ProposalReuseReport g_proposal_reuse;
-// I2-G: the sampled verification profile of the initial union pass alone
-VerificationProfile g_union_verification;
 std::uint64_t g_union_end_footprint = 0;   // I2-K (measurement): physical footprint right after the union pass
 // I3-A: what the status says about a prepared locus this run used (reset at every run start).
 struct PreparedLocusUse {
@@ -827,7 +824,7 @@ void write_status(
                                 "adaptive_fine_store_bytes", "adaptive_fine_max_served_placements",
                                 "indexed_union_store_layout", "indexed_union_evidence_layout", "timing_detail", "adaptive_fused_seed",
                                 "marker_proposal_reuse_table_bytes", "combination_prepared_library_terms",
-                                "verification_profile_period", "gap_recursion_backend", "verification_census_period",
+                                "gap_recursion_backend",
                                 "dosage_census_backend", "adaptive_emission_handoff"}) {
             const auto source = options.setting_sources.find(key);
             if (source == options.setting_sources.end()) continue;
@@ -844,10 +841,6 @@ void write_status(
                                           ? std::to_string(options.marker_proposal_reuse_table_bytes)
                                       : k == "combination_prepared_library_terms"
                                           ? std::string(options.combination_prepared_library_terms ? "1" : "0")
-                                      : k == "verification_profile_period"
-                                          ? std::to_string(options.verification_profile_period)
-                                      : k == "verification_census_period"
-                                          ? std::to_string(options.verification_census_period)
                                       : k == "dosage_census_backend"
                                           ? std::string(options.dosage_census_interned ? "interned_experimental" : "reference")
                                       : k == "adaptive_emission_handoff"
@@ -1351,39 +1344,6 @@ void write_status(
         out << "gap_recursion_backend\t" << gap_recursion_backend_name(options.gap_recursion_fixed_geometry)
             << "\ngap_recursion_backend_scope\tunion_adaptive_dosage\n";
     }
-    if (options.verification_profile_period != 0) {
-        // I2-G (MEASUREMENT ONLY): sampled verification attribution, the union pass and the whole run (sampled sums in
-        // nanoseconds; multiply by the period for an estimate of the whole stream's worker time)
-        const auto write = [&](const char* scope, const VerificationProfile& v) {
-            const std::string k = std::string("verify_profile_") + scope + "_";
-            out << k << "period\t" << v.period << '\n' << k << "requests\t" << v.requests << '\n' << k << "sampled\t" << v.sampled
-                << '\n' << k << "ns_total\t" << v.ns_total << '\n' << k << "ns_decision_cache\t" << v.ns_decision << '\n' << k
-                << "ns_prechecks\t" << v.ns_prechecks << '\n' << k << "ns_feasibility_kernel\t" << v.ns_kernel << '\n' << k
-                << "ns_emission_cache_lookup\t" << v.ns_emission_lookup << '\n' << k << "ns_gapped_emission\t" << v.ns_dp << '\n'
-                << k << "ns_row_construction\t" << v.ns_rows << '\n' << k << "ns_unattributed\t"
-                << static_cast<std::int64_t>(v.ns_total) -
-                       static_cast<std::int64_t>(v.ns_decision + v.ns_prechecks + v.ns_kernel + v.ns_emission_lookup + v.ns_dp + v.ns_rows)
-                << '\n' << k << "decision_served\t" << v.sampled_decision_served << '\n' << k << "decision_missed\t"
-                << v.sampled_decision_missed << '\n' << k << "decision_unavailable\t" << v.sampled_decision_unavailable << '\n'
-                << k << "kernels\t" << v.sampled_kernels << '\n' << k << "kernels_feasible\t" << v.sampled_kernel_feasible << '\n'
-                << k << "kernel_paths\tpattern=" << v.kernel_prepared_pattern << ",short_read=" << v.kernel_short_read
-                << ",edlib=" << v.kernel_edlib << '\n' << k << "emission_cache_hits\t" << v.sampled_emission_hits << '\n' << k
-                << "gapped_emissions\t" << v.sampled_dps << '\n' << k << "accepted\t" << v.sampled_accepted << '\n' << k
-                << "band\t" << v.band << '\n';
-            std::vector<std::pair<std::uint64_t, std::string>> shapes;
-            for (const auto& [shape, counts] : v.kernel_shapes) {
-                shapes.push_back({counts.first, std::to_string(shape.first) + ":" + std::to_string(shape.second) + "=" +
-                                                    std::to_string(counts.first) + "/" + std::to_string(counts.second)});
-            }
-            std::sort(shapes.rbegin(), shapes.rend());
-            std::string top;
-            for (std::size_t i = 0; i < shapes.size() && i < 6; ++i) top += (top.empty() ? "" : ",") + shapes[i].second;
-            out << k << "kernel_shapes_distinct\t" << shapes.size() << '\n' << k
-                << "kernel_shapes_top\t" << (top.empty() ? "none" : top) << "\n";
-        };
-        write("union", g_union_verification);
-        write("run", verification_profile_snapshot());
-    }
     if (options.setting_sources.count("combination_prepared_library_terms") != 0) {
         // I2-F (EXPERIMENTAL): what preparing the run's library terms removed (counted per combination call)
         const PreparedLibraryTermsTally t = prepared_library_terms_tally();
@@ -1543,8 +1503,6 @@ void apply_genotype_setting(const std::string& context, const std::string& key, 
         options.indexed_union_evidence_layout = value;
     }
     else if (key == "marker_proposal_reuse_table_bytes") options.marker_proposal_reuse_table_bytes = u();
-    else if (key == "verification_profile_period") options.verification_profile_period = static_cast<std::uint32_t>(u());
-    else if (key == "verification_census_period") options.verification_census_period = static_cast<std::uint32_t>(u());
     else if (key == "adaptive_emission_handoff") {
         if (value != "0" && value != "1") throw std::runtime_error(context + ": 'adaptive_emission_handoff' is 0 or 1: " + value);
         options.adaptive_emission_handoff = value == "1";
@@ -2195,9 +2153,6 @@ GenotypeRunStatus run_genotype_body(const GenotypeCommandOptions& options, Genot
     set_emission_lookup_timing(options.emission_lookup_timing);
     g_proposal_reuse = ProposalReuseReport{};   // I2-E: never a previous run's figures
     reset_prepared_library_terms_tally();         // I2-F: likewise
-    set_verification_profile_period(options.verification_profile_period);   // I2-G (measurement only)
-    reset_verification_profile();
-    g_union_verification = VerificationProfile{};
     g_union_end_footprint = 0;
     reset_emission_handoff_report();   // I2-K: nothing from an earlier run is reported or adopted
     g_prepared_use = PreparedLocusUse{};   // I3-A
@@ -2674,7 +2629,6 @@ GenotypeRunStatus run_genotype_body(const GenotypeCommandOptions& options, Genot
     timings.spelling = seconds_since(mark);
 
     write_running_status("union_scoring");
-    set_verification_census_stage(CensusStage::union_discovery);   // I2-I (measurement only; inert when off)
     mark = Clock::now();
     FragmentScoringOptions scoring_options;
     // I2-K (EXPERIMENTAL): owned here for this sample only; destroyed on every exit, adopted at most once
@@ -2741,7 +2695,6 @@ GenotypeRunStatus run_genotype_body(const GenotypeCommandOptions& options, Genot
     if (any_ranked && !seeding_profile_only) {
         try {
             candidate_report.indexed_union = indexed_union;
-            reset_verification_profile();   // I2-G: the union pass's own verification profile
             if (indexed_union) {
                 // I2-A (EXPERIMENTAL): the same pass through the indexed route; same result structure and refusals
                 FragmentScoringOptions indexed_options = scoring_options;
@@ -2771,7 +2724,6 @@ GenotypeRunStatus run_genotype_body(const GenotypeCommandOptions& options, Genot
             candidate_report.union_origin_cache = scored.union_origin_cache;
             candidate_report.union_prefilter_cache = scored.union_prefilter_cache;
             candidate_report.start_sort = scored.start_sort;
-            g_union_verification = verification_profile_snapshot();
             g_union_end_footprint = physical_footprint().current;
         } catch (const ResourceExhausted& error) {
             rescore_failure = error.what();
@@ -3403,7 +3355,6 @@ GenotypeRunStatus run_genotype_body(const GenotypeCommandOptions& options, Genot
         search_options.declared_neighbour_cap = options.repair_max_neighbours;
         search_options.memory_log = true;
         write_running_status("repair");
-        set_verification_census_stage(CensusStage::adaptive);   // I2-I (measurement only; inert when off)
         std::unique_ptr<CoordinateRepairSearch> search;
         std::string refusal;
         bool reproduced = true;
@@ -6412,12 +6363,7 @@ int execute_genotype_command(const GenotypeCommandOptions& options, const Prepar
     // The dosage stage and the locus table run after every existing output is committed (sections 20 and 22).
     const std::string& mode = options.dosage_mode;
     GenotypeDosageCapture capture;
-    // I2-I (MEASUREMENT ONLY): the census spans the whole command -- caller and dosage -- and writes its own file.
-    if (options.verification_census_period != 0) {
-        begin_verification_census(options.verification_census_period, std::uint64_t{64} << 20);
-    }
     const GenotypeRunStatus status = run_genotype_body(options, &capture, locus);
-    set_verification_census_stage(CensusStage::dosage);
     const bool called = status == GenotypeRunStatus::Complete || status == GenotypeRunStatus::ConditionalGenotypeEquivalent;
     dosage::DosageShadowSummary summary;
     std::string audit_status = "NOT_RUN", audit_note = "none";
@@ -6511,10 +6457,6 @@ int execute_genotype_command(const GenotypeCommandOptions& options, const Prepar
     } catch (const std::exception& error) {
         std::cerr << "[genotype] locus output failed: " << error.what() << '\n';
         return 2;
-    }
-    if (options.verification_census_period != 0) {
-        set_verification_census_stage(CensusStage::other);
-        atomic_write(options.out_prefix + ".verification_census.tsv", verification_census_table(end_verification_census()));
     }
     return called ? 0 : 1;
 }

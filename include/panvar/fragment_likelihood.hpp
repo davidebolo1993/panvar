@@ -1001,30 +1001,6 @@ struct PreparedLibraryTermsTally {
 };
 PreparedLibraryTermsTally prepared_library_terms_tally();
 
-// ---- I2-G (MEASUREMENT ONLY): sampled attribution of per-start verification --------------------------------------------
-// Every `period`-th verification request on each worker (deterministic, by a per-worker counter) is split by clock reads
-// into: the union prefilter-decision cache (identity and lookup, plus remembering a new decision), the eligibility and
-// window checks, the executed feasibility kernel, the emission-cache key and lookup, the gapped-emission computation
-// (recursion, normaliser, cache store) and placement-row construction; the rest of the request is reported as such.
-// Executed kernels also record read length, window length, band, verdict and kernel path. Unsampled requests pay one
-// counter increment and a branch. Nothing here changes a verdict, a row or a counter. Off (period 0) by default.
-struct VerificationProfile {
-    std::uint32_t period = 0;
-    std::uint64_t requests = 0;   // every request seen while profiling (sampled or not)
-    std::uint64_t sampled = 0;
-    std::uint64_t ns_total = 0, ns_decision = 0, ns_prechecks = 0, ns_kernel = 0, ns_emission_lookup = 0, ns_dp = 0;
-    std::uint64_t ns_rows = 0;    // of sampled requests; ns_total minus the named parts is the request's remainder
-    std::uint64_t sampled_decision_served = 0, sampled_decision_missed = 0, sampled_decision_unavailable = 0;
-    std::uint64_t sampled_kernels = 0, sampled_kernel_feasible = 0;
-    std::uint64_t sampled_emission_hits = 0, sampled_dps = 0, sampled_accepted = 0, sampled_rows = 0;
-    std::uint64_t kernel_prepared_pattern = 0, kernel_short_read = 0, kernel_edlib = 0;   // sampled kernels by path
-    std::map<std::pair<std::uint32_t, std::uint32_t>, std::pair<std::uint64_t, std::uint64_t>> kernel_shapes;
-    // (read length, window length) -> (sampled executed kernels, of which feasible)
-    std::size_t band = 0;
-};
-void set_verification_profile_period(std::uint32_t period);   // 0: off
-void reset_verification_profile();
-VerificationProfile verification_profile_snapshot();
 void reset_prepared_library_terms_tally();
 
 struct OriginSummary {
@@ -1882,13 +1858,9 @@ public:
     // Retains an origin census for this haplotype, so a later round may delta from it.
     void retain_census(std::size_t haplotype);
     bool holds_census(std::size_t haplotype) const;
-    // MEASUREMENT ONLY (S0 diagnostics): the retained census of `haplotype`, or null when none is held. Read-only;
-    // never consulted by a score, a delta or a cache.
+    // The retained census of `haplotype`, or null when none is held. Read-only; never consulted by a score, a delta or
+    // a cache (regression tests compare censuses through it).
     const HaploidOriginCensus* census_view(std::size_t haplotype) const;
-    // MEASUREMENT ONLY (S0 diagnostics): appends `sequences` (no dedup against held slots; the caller passes distinct
-    // bytes) and places them in parallel exactly as add_haplotypes does, with a census captured for every one.
-    // Returns the slots, in order. Same placement core, band and caps; never used by a caller of the scorer.
-    std::vector<std::size_t> add_haplotypes_with_censuses(const std::vector<std::string>& sequences);
 
     // Releases every haplotype added since the last checkpoint that is not named in `keep`: its
     // sequence, its reversed copy, its mass column and its census. Safe because every cache entry
