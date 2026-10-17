@@ -92,6 +92,37 @@ MANIFEST = [
     ("o.cyp_30", "cli", "cyp_30", "p1", "opt", 120, ""),
     ("x.cyp_30", "cli", "cyp_30", "stack", "opt", 120, ""),
 ]
+# Amendment 1 (committed after the first `compare` and `t.comparators` units, before any further execution; the
+# original MANIFEST above and its recorded units are unchanged):
+#   * compare.a1 re-runs the comparisons with two corrections: p1_compare.py's status-file classification (see its
+#     Amendment 1), and a pair is compared only when BOTH runs completed (r.acot_5 stopped at TIME_LIMIT; the first
+#     version compared its partial outputs and reported the missing files as a failure);
+#   * o.c4_5.r2 repeats o.c4_5 unchanged (same build, profile composition and inputs), so that the variation of the
+#     indexed-union executed-work counters between runs can be measured under identical conditions (pair "repeat");
+#   * t.comparators.a1: test_perf_compare.py needs a real scientifically identical pair (its usage line); the first unit
+#     called it without one. It now gets r.c4_5 / p.c4_5 (strictly identical in the first comparison);
+#   * the repository suite is re-partitioned to fit the remaining budget (spent + declared): t.rest and t.heavy are
+#     SUPERSEDED (never run) by t.focused, t.block_delta, t.branch_lifetime and t.other, in that order after t.e2e.
+AMENDMENT_1 = [
+    ("o.c4_5.r2", "cli", "c4_5", "p1", "opt", 45, ""),
+    ("compare.a1", "compare", "", "", "", 60, ""),
+    ("t.comparators.a1", "pytests", "", "", "", 30, ""),
+    ("t.focused", "ctest", "^panvar_(genotype_(prepared_locus_file|batch_resource|union_placement_cache|"
+     "seeding_exactness|scoring_context|fragment_scorer|fragment_oracle|dosage|mosaic_core|mosaic_proposal|"
+     "review_regressions|cli_contract|curation_contract|headline|locus_adapter|block_quality|grouped_beam)|"
+     "library_estimate|library_sensitivity)$", "p1", "", 120, ""),
+    ("t.block_delta", "ctest", "^panvar_genotype_block_delta$", "p1", "", 120, ""),
+    ("t.branch_lifetime", "ctest", "^panvar_genotype_branch_lifetime$", "p1", "", 130, ""),
+    ("t.other", "ctest", "-E:^panvar_(genotype_(command_e2e|block_delta|branch_lifetime|prepared_locus_file|"
+     "batch_resource|union_placement_cache|seeding_exactness|scoring_context|fragment_scorer|fragment_oracle|dosage|"
+     "mosaic_core|mosaic_proposal|review_regressions|cli_contract|curation_contract|headline|locus_adapter|"
+     "block_quality|grouped_beam)|library_estimate|library_sensitivity)$", "p1", "", 180, ""),
+]
+SUPERSEDED = {"t.rest", "t.heavy"}
+ORDER = [m[0] for m in MANIFEST if m[0] not in SUPERSEDED and not m[0].startswith(("t.e2e", "o.c4_30", "x.c4_30",
+                                                                                     "o.cyp_30", "x.cyp_30"))]
+ORDER += ["o.c4_5.r2", "compare.a1", "t.comparators.a1", "t.e2e", "t.focused", "t.block_delta", "t.branch_lifetime",
+          "t.other", "o.c4_30", "x.c4_30", "o.cyp_30", "x.cyp_30"]
 # comparisons, declared before execution: (kind, run A, run B, prefix A, prefix B)
 PAIRS = [
     ("stack", "o.c4_5", "x.c4_5"), ("stack", "o.cyp_5", "x.cyp_5"), ("stack", "o.acot_5", "x.acot_5"),
@@ -101,6 +132,7 @@ PAIRS = [
     ("index", "o.cyp_5", "l.cyp_5:cyp_5"), ("index", "o.acot_5", "l.acot_5.existing:acot_5"),
     ("stack", "o.c4_30", "x.c4_30"), ("stack", "o.cyp_30", "x.cyp_30"),
 ]
+PAIRS_A1 = PAIRS + [("repeat", "o.c4_5", "o.c4_5.r2")]
 
 
 def spent():
@@ -111,6 +143,17 @@ def spent():
 def done():
     p = f"{OUT}/ledger.tsv"
     return {r["unit"] for r in csv.DictReader(open(p), delimiter="\t")} if os.path.exists(p) else set()
+
+
+def write_amendment():
+    text = "unit\tkind\tcells\tbuild\tarm\tdeclared_timeout_seconds\textra\n" + "".join(
+        "\t".join(str(x) for x in m) + "\n" for m in AMENDMENT_1) + "".join(f"{u}\tSUPERSEDED\n" for u in sorted(SUPERSEDED))
+    p = f"{OUT}/AMENDMENT_1.tsv"
+    if os.path.exists(p):
+        assert open(p).read() == text, "a different amendment is already frozen"
+    else:
+        open(p, "w").write(text)
+    print(text, end="")
 
 
 def write_manifest():
@@ -172,8 +215,11 @@ def selfcheck():
 
 
 def run_unit(unit):
-    u, kind, cellspec, build, arm, timeout, extra = next(m for m in MANIFEST if m[0] == unit)
+    u, kind, cellspec, build, arm, timeout, extra = next(m for m in MANIFEST + AMENDMENT_1 if m[0] == unit)
     assert open(f"{OUT}/MANIFEST.tsv").read(), "freeze the manifest first"
+    assert unit not in SUPERSEDED, f"{unit} is superseded by amendment 1"
+    if any(unit == m[0] for m in AMENDMENT_1):
+        assert os.path.exists(f"{OUT}/AMENDMENT_1.tsv"), "freeze amendment 1 first"
     assert timeout <= 300 and unit not in done()
     used = spent()
     if used + timeout > BUDGET:
@@ -193,9 +239,9 @@ def run_unit(unit):
     if kind == "selfcheck":
         cmd = [sys.executable, os.path.abspath(__file__), "_selfcheck"]
     elif kind == "compare":
-        cmd = [sys.executable, os.path.abspath(__file__), "_compare"]
+        cmd = [sys.executable, os.path.abspath(__file__), "_compare", unit]
     elif kind == "pytests":
-        cmd = [sys.executable, os.path.abspath(__file__), "_pytests"]
+        cmd = [sys.executable, os.path.abspath(__file__), "_pytests", unit]
     elif kind == "ctest":
         sel = ["-E", cellspec[3:]] if cellspec.startswith("-E:") else ["-R", cellspec]
         cmd = ["nice", "ctest", "--test-dir", BUILDS[build], *sel, "--output-on-failure", "-j1"]
@@ -275,23 +321,29 @@ def run_dir(spec):
     return (f"{OUT}/runs/{unit}/{sample}" if sample else f"{OUT}/runs/{unit}"), "call"
 
 
-def compare_all():
+def compare_all(unit="compare"):
     import p1_compare
+    amended = unit != "compare"
     rows = ["\t".join(p1_compare.HEADER)]
     failed = 0
-    for kind, a, b in PAIRS:
+    for kind, a, b in (PAIRS_A1 if amended else PAIRS):
         da, na = run_dir(a)
         db, nb = run_dir(b)
         if not (os.path.exists(f"{da}/{na}.mosaic_status.tsv") and os.path.exists(f"{db}/{nb}.mosaic_status.tsv")):
             rows.append("\t".join([kind, a, b, "NOT_AVAILABLE"] + ["-"] * 7))
             continue
+        sa, sb = status_of(f"{da}/{na}").get("status"), status_of(f"{db}/{nb}").get("status")
+        if amended and not (sa == sb == "COMPLETE"):
+            rows.append("\t".join([kind, a, b, f"NOT_COMPARABLE (status {sa} vs {sb})"] + ["-"] * 7))
+            continue
         r = subprocess.run([sys.executable, os.path.join(HERE, "p1_compare.py"), kind, da, db, na],
                            capture_output=True, text=True)
         rows.append(r.stdout.strip() or "\t".join([kind, a, b, "ERROR", r.stderr.strip()[-200:]]))
         failed += r.returncode != 0
-    open(f"{OUT}/compare.tsv", "w").write("\n".join(rows) + "\n")
+    suffix = "_a1" if amended else ""
+    open(f"{OUT}/compare{suffix}.tsv", "w").write("\n".join(rows) + "\n")
     print("\n".join(rows))
-    failed += leakage()
+    failed += leakage(suffix)
     return 1 if failed else 0
 
 
@@ -300,7 +352,7 @@ LEAK_SCOPE = (".block_genotypes.tsv", ".genotypes.tsv", ".locus_genotype.tsv", "
               ".mosaic_scores.tsv", ".equivalence_set.tsv", ".mosaic_haplotypes.fa", ".repair_rounds.tsv")
 
 
-def leakage():
+def leakage(suffix=""):
     """The curated CYP2D6 panel: no template the curation removes may appear in any scientific output of the loaded
     (index) run or of its cold run. Other files that merely LIST the curated names (e.g. a curation record) are
     counted separately, never as leakage."""
@@ -320,17 +372,19 @@ def leakage():
                                                             for n in names)]
         bad += bool(leaks)
         rows.append(f"{spec}\t{len(names)}\t{len(sci)}\t{';'.join(leaks) or 'none'}\t{';'.join(other) or 'none'}")
-    open(f"{OUT}/leakage.tsv", "w").write("\n".join(rows) + "\n")
+    open(f"{OUT}/leakage{suffix}.tsv", "w").write("\n".join(rows) + "\n")
     print("\n".join(rows))
     return bad
 
 
-def pytests():
+def pytests(unit="t.comparators"):
     failed = 0
+    pair = [f"{OUT}/runs/r.c4_5", f"{OUT}/runs/p.c4_5"] if unit != "t.comparators" else []
     tests = sorted(os.path.join(dp, f) for dp, _, fs in os.walk(os.path.join(HERE, "..")) for f in fs
                    if f.startswith("test_") and f.endswith("_compare.py"))
     for t in tests:
-        r = subprocess.run([sys.executable, t], capture_output=True, text=True)
+        extra = pair if os.path.basename(t) == "test_perf_compare.py" else []
+        r = subprocess.run([sys.executable, t, *extra], capture_output=True, text=True)
         print(f"{os.path.relpath(t, HERE)}: {'ok' if r.returncode == 0 else 'FAILED'}")
         if r.returncode != 0:
             print(r.stdout[-800:], r.stderr[-800:])
@@ -344,12 +398,14 @@ if __name__ == "__main__":
         write_manifest()
     elif arg == "_selfcheck":
         sys.exit(selfcheck())
+    elif arg == "amendment1":
+        write_amendment()
     elif arg == "_compare":
-        sys.exit(compare_all())
+        sys.exit(compare_all(sys.argv[2] if len(sys.argv) > 2 else "compare"))
     elif arg == "_pytests":
-        sys.exit(pytests())
+        sys.exit(pytests(sys.argv[2] if len(sys.argv) > 2 else "t.comparators"))
     elif arg == "next":
-        todo = [m[0] for m in MANIFEST if m[0] not in done()]
+        todo = [u for u in ORDER if u not in done()]
         sys.exit(run_unit(todo[0]) if todo else print("all units recorded") or 0)
     else:
         sys.exit(run_unit(arg))

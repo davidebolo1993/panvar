@@ -14,6 +14,7 @@ key present on one side only ("added"/"removed") or a value change ("changed"). 
 """
 import importlib.util
 import os
+import re
 import subprocess
 import sys
 
@@ -24,6 +25,16 @@ ANALYSIS = os.path.join(HERE, "..")
 SCIENCE = (".block_genotypes.tsv", ".genotypes.tsv", ".locus_genotype.tsv", ".mosaic_scores.tsv", ".mosaic_candidates.tsv",
            ".equivalence_set.tsv", ".mosaic_haplotypes.fa", ".dosage", ".library_sensitivity.tsv", ".repair_rounds.tsv",
            ".original")
+# Amendment 1 (declared after the first comparison, before any further execution): (a) a status file -- the
+# .mosaic_status.tsv / .dosage_status.tsv of a run, including their .original copies -- is NOT a scientific output by its
+# file name; the first version's suffix rule matched ".original" and ".dosage" inside those names and so classified
+# executed-work counters of the status copy as science. Status differences are judged key by key instead: (b) the keys
+# below must be strictly identical (this is stricter than the qualified chain alone), and every other status key
+# difference is listed and must pass the qualified chain.
+SCIENCE_STATUS = re.compile(r"^(status|call_class|no_call_reason|phase_support|score_gap_to_runner_up|"
+                            r"best_other_genotype_score|alleles_scored|every_allele_scored|blocks_genotype\w*|"
+                            r"quality_\w+|dosage_audit\w*|dosage_status_\w+|dosage_repair\w*|dosage_allocation\w*|"
+                            r"dosage_policy|dosage_census_sensitive_blocks|dosage_molecule_span_bp|\w*genotype\w*)$")
 
 
 def strict_compare(a, b, name):
@@ -53,9 +64,12 @@ def main(argv):
     name = argv[3] if len(argv) > 3 else "call"
     s_ok, problems, diagnostics, compared = strict_compare(a, b, name)
     q_ok, q_line = qualified_compare(a, b, name)
-    science = [p for p in problems if any(x in p.split(":")[0] for x in SCIENCE) or "file sets differ" in p]
-    status_science = [p for p in problems if p.split(": ")[1:2] and p.split(": ")[1] in
-                      ("status", "call_class", "no_call_reason", "phase_support", "headline_filter", "locus_status")]
+    def is_status(p):
+        return p.split(":")[0].endswith("_status.tsv")
+    science = [p for p in problems if (not is_status(p) and any(x in p.split(":")[0] for x in SCIENCE))
+               or "file sets differ" in p]
+    status_science = [p for p in problems if is_status(p) and len(p.split(": ")) > 2 and
+                      SCIENCE_STATUS.match(p.split(": ")[1])]
     ok = q_ok and not science and not status_science
     row = [kind, os.path.basename(a.rstrip("/")) + "/" + name, os.path.basename(b.rstrip("/")) + "/" + name,
            "PASS" if ok else "FAIL", "IDENTICAL" if s_ok else "DIFFERENT", str(compared), str(len(diagnostics)),
