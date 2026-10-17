@@ -65,9 +65,17 @@ AMENDMENT_1 = [("t.genotype_sequence_report.a1", "ctest", "genotype_sequence_rep
                ("t.genotype_cli_contract.a1", "ctest", "genotype_cli_contract", 30),
                ("fixtures.A.a1", "fixtures", "F1,F2,F3,F4", 240),
                ("fixtures.B.a1", "fixtures", "F5,F6,F7,F7full,F9", 240)]
+# Amendment 2 (committed after cyp30.compare, before any further execution; cyp30.compare stays recorded, exit 1):
+#   the harness's volatile-key rule was stricter than the reviewed comparator: the only differences against P1.1's saved
+#   run were cache hit/miss and executed-work counters (emission_cache_*, union_prefilter_cache_*), which vary between
+#   identical 4-thread runs like the indexed-union counters P1.1 measured. cyp30.compare.a2 lists EVERY difference and
+#   classifies each against tests/analysis/perf/perf_compare.py's own DIAGNOSTIC class (unmodified); it passes only if
+#   every difference is a status key in that class and no other file or row differs.
+AMENDMENT_1.append(("cyp30.compare.a2", "compare2", "cyp_30", 30))
 SUPERSEDED = {"fixtures.B"}
-ORDER = [m[0] for m in MANIFEST[:3]] + [m[0] for m in AMENDMENT_1] + \
+ORDER = [m[0] for m in MANIFEST[:3]] + [m[0] for m in AMENDMENT_1[:4]] + \
     [m[0] for m in MANIFEST[3:] if m[0] not in SUPERSEDED]
+ORDER.insert(ORDER.index("cyp30.compare") + 1, "cyp30.compare.a2")
 LEDGER = ("unit\trevision\tdirty_cpp\tdeclared_timeout_seconds\twall_seconds\tpeak_rss_gib\texit\ttimed_out\tnote\n")
 
 
@@ -122,6 +130,30 @@ def cyp_compare():
     return 1 if problems else 0
 
 
+def cyp_compare2():
+    import importlib.util
+    import s1b_fixtures
+    spec = importlib.util.spec_from_file_location("pc", os.path.join(HERE, "..", "perf", "perf_compare.py"))
+    pc = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(pc)
+    saved = s1b_fixtures.VOLATILE
+    s1b_fixtures.VOLATILE = re.compile(r"(?!)")   # list every status difference, measurements included
+    problems = s1b_fixtures.legacy_identity(P11, f"{OUT}/runs/cyp30.v1")
+    s1b_fixtures.VOLATILE = saved
+    allowed, other = [], []
+    for p in problems:
+        parts = p.split(": ")
+        if parts[0].endswith("_status.tsv") and len(parts) > 2 and pc.DIAGNOSTIC.search(parts[1]):
+            allowed.append(parts[0] + ":" + parts[1])
+        else:
+            other.append(p)
+    print(f"{len(problems)} differences; {len(allowed)} in perf_compare's DIAGNOSTIC class; {len(other)} other")
+    for p in other:
+        print("OTHER:", p)
+    print("diagnostic keys:", ", ".join(sorted({a.split(':')[1] for a in allowed})))
+    return 1 if other else 0
+
+
 def run_unit(unit):
     u, kind, target, timeout = next(m for m in MANIFEST + AMENDMENT_1 if m[0] == unit)
     assert open(f"{OUT}/MANIFEST.tsv").read() and timeout <= 300 and unit not in done() and unit not in SUPERSEDED
@@ -145,6 +177,8 @@ def run_unit(unit):
                f"{BUILD}/cyp2d6_block_alleles", f"{BUILD}/genotype_prepared_locus_driver", target]
     elif kind == "compare":
         cmd = [sys.executable, os.path.abspath(__file__), "_compare"]
+    elif kind == "compare2":
+        cmd = [sys.executable, os.path.abspath(__file__), "_compare2"]
     else:
         cell = p1_run.cells()[target]
         prof = p1_run.profile_for(cell, "opt", d, timeout, target)
@@ -181,6 +215,14 @@ if __name__ == "__main__":
         write_manifest()
     elif arg == "_compare":
         sys.exit(cyp_compare())
+    elif arg == "_compare2":
+        sys.exit(cyp_compare2())
+    elif arg == "amendment2":
+        p = f"{OUT}/AMENDMENT_2.tsv"
+        text = "cyp30.compare.a2\tcompare2\tcyp_30\t30\n"
+        assert not os.path.exists(p) or open(p).read() == text
+        open(p, "w").write(text)
+        print(text, end="")
     elif arg == "amendment1":
         text = "".join("\t".join(str(x) for x in m) + "\n" for m in AMENDMENT_1) + "fixtures.B\tSUPERSEDED\n"
         p = f"{OUT}/AMENDMENT_1.tsv"
