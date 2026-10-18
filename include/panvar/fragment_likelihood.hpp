@@ -2024,6 +2024,14 @@ struct ContentBatchReport {
     std::uint64_t persistent_carried_bytes = 0, persistent_carried_entries = 0;
 };
 
+// S2-E (EXPERIMENTAL): what a fragment block's batch starts from -- the running totals of every executed-work and
+// consumption cap over the blocks before it (memory budgets are per block: they govern storage held at once).
+struct UnionCumulativeCharges {
+    std::uint64_t piece_hits = 0, physical_origins = 0, placements_consumed = 0, origins_consumed = 0, states_consumed = 0,
+                  prefilters_consumed = 0;
+    FragmentScoringCounters executed;   // merged executed counters, for the acceptance caps
+};
+
 class ContentIndexBatch {
 public:
     // One read batch over a prepared index (the index is shared, not copied; it must outlive the batch).
@@ -2071,6 +2079,14 @@ public:
     // destroyed with the batch (or by release_carried_emissions) and never crosses samples. Exclusive with the adaptive
     // emission handoff. A refused or failed selective call poisons the batch: later calls throw std::logic_error.
     void set_persistent_emission_cache(bool on);
+    // ---- S2-E (EXPERIMENTAL, bulk batches): a fragment block's batch. set_cumulative_baseline seeds every executed-work
+    // and consumption cap with the totals of the blocks before it (before discover()). build_columns computes every
+    // slot's mass column for this batch's fragments without combining candidates or exporting a matrix; mass_columns
+    // returns them. charges(): this batch's own charges (excluding the baseline), for the caller to accumulate.
+    void set_cumulative_baseline(const UnionCumulativeCharges& baseline);
+    void build_columns();
+    const std::vector<std::vector<double>>& mass_columns() const;
+    UnionCumulativeCharges charges() const;
     void release_carried_emissions();
     std::size_t units_discovered() const;   // selective: units discovered; bulk: units evaluated
     std::size_t columns_completed() const;
@@ -2125,6 +2141,40 @@ FragmentScoringResult score_diplotypes_indexed_union(const InternedHaplotypes& h
                                                      std::size_t store_budget_bytes, IndexedUnionReport* report = nullptr,
                                                      FragmentScoringObservation* observed_on_failure = nullptr,
                                                      bool legacy_store_layout = false, bool fine_views = false);
+
+// ---- S2-E (EXPERIMENTAL, measurement only): the same indexed union pass over contiguous fragment blocks ----------------
+// One index over every haplotype; per block of `block_fragments` read pairs a fresh batch (the existing discovery,
+// pairing and reduction) builds that block's mass columns, which are folded into each candidate's accumulators in the
+// original fragment order and then released with the batch. Exposure is the whole run's (every fragment's floor), the
+// prefilter-cache read-length condition and the mass-cell cap are checked over the whole run, executed-work and
+// consumption caps are cumulative, memory budgets are per block. Scores are bulk's bit for bit (tests/analysis/s2e/
+// DECOMPOSITION.md). A refusal in any block returns no scores (`completed` false). log_mass/exposure are not exported.
+struct BlockedBlockReport {
+    std::size_t first_fragment = 0, fragments = 0;
+    std::uint64_t units_evaluated = 0, store_peak_bytes = 0, origin_held_bytes = 0, retained_column_bytes = 0;
+    std::uint64_t prefilter_held_bytes = 0, emission_cache_bytes = 0, emission_cache_entries = 0, worker_scratch_bytes = 0;
+    std::uint64_t executed_dps = 0, executed_prefilters = 0, direct_physical_origins = 0, served_physical_origins = 0,
+                  origins_constructed = 0, origin_entities_admitted = 0, origin_entities_declined = 0;
+    std::uint64_t cumulative_physical_origins = 0, cumulative_piece_hits = 0;
+    double seconds = 0.0;
+    std::uint64_t footprint_before = 0, footprint_after = 0;   // set by the caller's hook, if it samples
+};
+struct BlockedUnionResult {
+    FragmentScoringResult result;              // scores, audit scores, summed counters and phase seconds (no matrix)
+    std::vector<BlockedBlockReport> blocks;    // completed blocks
+    bool completed = false;
+    std::string refusal;
+    double seconds_index_build = 0.0, seconds_combination = 0.0;
+    std::uint64_t accumulator_bytes = 0, index_unit_bytes = 0;
+    ContentIndexReport index;
+};
+BlockedUnionResult score_diplotypes_indexed_blocked(const InternedHaplotypes& haplotypes,
+                                                    const std::vector<HaplotypeCandidate>& candidates,
+                                                    const std::vector<ReadPair>& fragments, const LibraryModel& library,
+                                                    const FragmentScoringOptions& options,
+                                                    const std::vector<std::vector<std::uint32_t>>& segments,
+                                                    std::size_t store_budget_bytes, bool fine_views, std::size_t block_fragments,
+                                                    const std::function<void(BlockedBlockReport&, bool before)>& on_block = {});
 
 // ---- S2-C (EXPERIMENTAL, measurement only): the same indexed scorer executed on demand --------------------------------
 // One index over every haplotype (identical slots and segmentation to the bulk adapter) and one selective batch; each

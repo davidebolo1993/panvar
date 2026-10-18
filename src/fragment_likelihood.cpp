@@ -10491,6 +10491,10 @@ struct ContentIndexBatch::State {
     bool persistent_emissions = false;
     EmissionCacheHandoff carried;
     bool poisoned = false;
+    // S2-E: the running totals of the blocks before this batch, and build_columns' no-export mode
+    bool baseline_set = false;
+    UnionCumulativeCharges baseline;
+    bool materialise = true;
     bool reserve_store(std::uint64_t bytes, bool enforce) {
         std::uint64_t cur = store_live.load(std::memory_order_relaxed);
         for (;;) {
@@ -10634,6 +10638,33 @@ void ContentIndexBatch::set_persistent_emission_cache(bool on) {
     state_->persistent_emissions = on;
     state_->report.persistent_emission_status = on ? "on" : "off";
 }
+void ContentIndexBatch::set_cumulative_baseline(const UnionCumulativeCharges& baseline) {
+    if (state_->selective || state_->evaluated != 0) throw std::logic_error("content index: a baseline is set before bulk discovery");
+    state_->baseline_set = true;
+    state_->baseline = baseline;
+    if (state_->prefilter) state_->prefilter->consumed.store(baseline.prefilters_consumed, std::memory_order_relaxed);
+}
+void ContentIndexBatch::build_columns() {
+    if (state_->selective) throw std::logic_error("content index: build_columns() on a selective batch");
+    state_->materialise = false;
+    (void)score_impl({}, false);
+    state_->materialise = true;
+}
+const std::vector<std::vector<double>>& ContentIndexBatch::mass_columns() const { return state_->mass_column; }
+UnionCumulativeCharges ContentIndexBatch::charges() const {
+    const State& st = *state_;
+    UnionCumulativeCharges c;
+    c.executed = st.report.counters_last;   // discovery's and the last score call's executed work (this batch only)
+    c.piece_hits = st.discovery_counters.piece_hits;
+    c.physical_origins = st.report.counters_last.physical_origins;
+    c.placements_consumed = st.report.placements_consumed_last - (st.baseline_set ? st.baseline.placements_consumed : 0);
+    c.origins_consumed = st.report.origins_consumed_last - (st.baseline_set ? st.baseline.origins_consumed : 0);
+    c.states_consumed = st.report.states_consumed_last - (st.baseline_set ? st.baseline.states_consumed : 0);
+    if (st.prefilter) {
+        c.prefilters_consumed = st.prefilter->consumed.load(std::memory_order_relaxed) - (st.baseline_set ? st.baseline.prefilters_consumed : 0);
+    }
+    return c;
+}
 void ContentIndexBatch::release_carried_emissions() {
     state_->report.persistent_carried_bytes = 0;
     state_->report.persistent_carried_entries = 0;
@@ -10758,6 +10789,7 @@ void ContentIndexBatch::discover_impl(const std::vector<std::size_t>* slots) {
     budget.max_physical_origins = st.options.max_physical_origins;
     budget.publish_batch = std::max<std::uint64_t>(1, st.options.piece_hit_publish_batch);
     if (slots != nullptr) budget.piece_hits.store(st.report.piece_hits, std::memory_order_relaxed);   // S2-C: cumulative
+    if (slots == nullptr && st.baseline_set) budget.piece_hits.store(st.baseline.piece_hits, std::memory_order_relaxed);   // S2-E
     const std::size_t work_items = slots == nullptr ? last - first : direct.size();
     const std::size_t threads = std::max<std::size_t>(1, std::min(st.options.threads, std::max<std::size_t>(1, work_items)));
     std::atomic<std::size_t> next{0};
@@ -11144,6 +11176,12 @@ FragmentScoringResult ContentIndexBatch::score_impl(const std::vector<HaplotypeC
     budget.max_piece_hits = st.options.max_piece_hits;
     budget.max_physical_origins = st.options.max_physical_origins;
     std::atomic<std::uint64_t> placements_consumed{0}, origins_consumed{0}, states_consumed{0};
+    if (!selective && st.baseline_set) {   // S2-E: a block's batch starts from the blocks before it
+        budget.physical_origins.store(st.baseline.physical_origins, std::memory_order_relaxed);
+        placements_consumed.store(st.baseline.placements_consumed, std::memory_order_relaxed);
+        origins_consumed.store(st.baseline.origins_consumed, std::memory_order_relaxed);
+        states_consumed.store(st.baseline.states_consumed, std::memory_order_relaxed);
+    }
     if (selective) {   // S2-C: every cap charged cumulatively over the batch's calls, never reset between requests
         budget.physical_origins.store(st.selective_origins, std::memory_order_relaxed);
         placements_consumed.store(st.selective_placements_consumed, std::memory_order_relaxed);
@@ -11566,7 +11604,14 @@ FragmentScoringResult ContentIndexBatch::score_impl(const std::vector<HaplotypeC
         }
         rr.counters_last = c;
         rethrow_primary_failure(failures);
-        enforce_acceptance_caps(c, st.options, [] {});
+        if (!selective && st.baseline_set) {   // S2-E: the acceptance caps hold to the whole union's executed totals
+            FragmentScoringCounters whole = st.baseline.executed;
+            add_counters(whole, c);
+            whole.piece_hits = st.baseline.executed.piece_hits + c.piece_hits;
+            enforce_acceptance_caps(whole, st.options, [] {});
+        } else {
+            enforce_acceptance_caps(c, st.options, [] {});
+        }
     }
     ContentBatchReport& r = st.report;
     r.seconds_expansion_and_pairing = std::chrono::duration<double>(std::chrono::steady_clock::now() - mark).count();
@@ -11643,7 +11688,7 @@ FragmentScoringResult ContentIndexBatch::score_impl(const std::vector<HaplotypeC
     // output materialisation: the flattened mass matrix and exposures of every slot (S2-C: none on the selective route --
     // the scores are returned, the columns stay retained, and nothing is exported)
     const auto materialise_mark = std::chrono::steady_clock::now();
-    if (!selective) {
+    if (!selective && st.materialise) {
         result.log_mass.assign(nf * unique, kNegInf);
         for (std::size_t h = 0; h < unique; ++h)
             for (std::size_t f = 0; f < nf; ++f) result.log_mass[f * unique + h] = mass_column[h][f];
@@ -11857,6 +11902,238 @@ FragmentScoringResult score_diplotypes_indexed_union(const InternedHaplotypes& h
     last_emission_cache_slot() = result.emission_cache;
     release();   // nothing indexed outlives the call
     return result;
+}
+
+BlockedUnionResult score_diplotypes_indexed_blocked(const InternedHaplotypes& haplotypes,
+                                                    const std::vector<HaplotypeCandidate>& candidates,
+                                                    const std::vector<ReadPair>& fragments, const LibraryModel& library,
+                                                    const FragmentScoringOptions& options,
+                                                    const std::vector<std::vector<std::uint32_t>>& segments,
+                                                    std::size_t store_budget_bytes, bool fine_views, std::size_t block_fragments,
+                                                    const std::function<void(BlockedBlockReport&, bool before)>& on_block) {
+    using Clock = std::chrono::steady_clock;
+    const auto since = [](Clock::time_point mark) { return std::chrono::duration<double>(Clock::now() - mark).count(); };
+    // ---- the bulk adapter's validation, over the WHOLE run (splitting must never admit what bulk refuses)
+    validate_library_model(library);
+    if (block_fragments == 0) throw std::invalid_argument("a fragment block needs at least one read pair");
+    if (options.minimum_piece_bp == 0) throw std::invalid_argument("minimum indexable piece length must be positive");
+    if (options.max_piece_hits == 0 || options.max_proposed_starts_per_haplotype == 0 || options.max_physical_origins == 0 ||
+        options.max_state_classes == 0 || options.max_mass_cells == 0 || options.max_latent_alignment_pairs == 0) {
+        throw std::invalid_argument("every fragment-scoring resource cap must be positive");
+    }
+    const std::size_t unique = haplotypes.sequences.size(), nf = fragments.size();
+    for (const HaplotypeCandidate& c : candidates) {
+        if (c.first >= unique || c.second >= unique) throw std::invalid_argument("diplotype candidate names an unknown haplotype");
+    }
+    if (options.record_origin_summary || !options.record_origins_for_fragments.empty() || options.record_haplotype_work != nullptr) {
+        throw std::invalid_argument("the indexed union backend records no per-origin or per-haplotype diagnostics");
+    }
+    if (segments.size() != unique) throw std::invalid_argument("the indexed union backend needs one segmentation per unique haplotype");
+    if (store_budget_bytes == 0) throw std::invalid_argument("the indexed union backend needs a positive placement-store budget");
+    if (options.max_union_cached_placements_consumed == 0) {
+        throw std::invalid_argument("the indexed union backend needs a positive cached-placement consumption cap");
+    }
+    if (options.union_origin_cache_bytes > 0 &&
+        (options.max_union_cached_origins_consumed == 0 || options.max_union_cached_states_consumed == 0)) {
+        throw std::invalid_argument("union origin reuse needs both of its consumption caps, positive");
+    }
+    if (options.emission_handoff_out != nullptr || options.emission_handoff_in != nullptr) {
+        throw std::invalid_argument("the blocked union pass takes no emission handoff");
+    }
+    BlockedUnionResult out;
+    if (nf != 0 && unique > options.max_mass_cells / nf) {   // the whole run's matrix, exactly as bulk refuses it
+        out.refusal = "the fragment-by-haplotype mass matrix would exceed its declared cell cap; no partial ranking is returned";
+        return out;
+    }
+    if (options.union_prefilter_cache_bytes > 0) {   // the cache needs one read length over the WHOLE run, as bulk requires
+        std::size_t length = 0;
+        bool single = true;
+        for (const ReadPair& f : fragments) {
+            for (const std::size_t l : {f.first.bases.size(), f.second.bases.size()}) {
+                if (length == 0) length = l;
+                else if (l != length) single = false;
+            }
+        }
+        if (!single) throw std::invalid_argument("union prefilter reuse needs one read length");
+    }
+    std::size_t max_read_bp = 1;
+    for (const ReadPair& f : fragments) max_read_bp = std::max({max_read_bp, f.first.bases.size(), f.second.bases.size()});
+    FragmentScoringOptions batch_options = options;
+    batch_options.union_segment_lengths = nullptr;
+    batch_options.union_placement_cache_bytes = 0;
+    // ---- one index over every haplotype
+    auto mark = Clock::now();
+    ContentPlacementIndex index(max_read_bp, library.max_gap_bp, true);
+    for (std::size_t h = 0; h < unique; ++h) {
+        if (index.add_haplotype(haplotypes.sequences[h], segments[h]) != h) throw std::logic_error("slots must follow the interned order");
+    }
+    out.seconds_index_build = since(mark);
+    out.index = index.report();
+    out.index_unit_bytes = out.index.unit_bytes;
+    // ---- whole-run quantities: exposure from every fragment's floor; background per fragment
+    const DiscreteInsertDistribution library_insert = build_library_insert_distribution(library);
+    std::map<std::size_t, std::size_t> by_floor;
+    std::vector<double> background(nf);
+    for (std::size_t f = 0; f < nf; ++f) {
+        ++by_floor[std::max(fragments[f].first.bases.size(), fragments[f].second.bases.size())];
+        background[f] = log_background_probability(fragments[f]);
+    }
+    std::vector<double> exposure(unique);
+    for (std::size_t h = 0; h < unique; ++h) exposure[h] = exposure_for_length(haplotypes.sequences[h].size(), nf, by_floor, library_insert);
+    // ---- per-candidate accumulators, seeded exactly as the bulk combination seeds them
+    const std::vector<AuditCombination> audits = audit_combinations(options.audit_libraries);
+    const std::vector<AuditCombination> main_terms = options.prepared_library_terms && !candidates.empty()
+                                                         ? audit_combinations({library})
+                                                         : std::vector<AuditCombination>{};
+    const AuditCombination* main = main_terms.empty() ? nullptr : &main_terms.front();
+    const std::size_t nc = candidates.size(), views = audits.size();
+    std::vector<DiplotypeScore> scores(nc);
+    std::vector<double> fragment_term(nc, 0.0);
+    std::vector<std::vector<DiplotypeScore>> audit_scores(views, std::vector<DiplotypeScore>(nc));
+    std::vector<std::vector<double>> audit_term(views, std::vector<double>(nc, 0.0));
+    for (std::size_t c = 0; c < nc; ++c) {
+        const std::size_t a = candidates[c].first, b = candidates[c].second;
+        DiplotypeScore& score = scores[c];
+        score.exposure_term = main != nullptr ? -(main->exposure_scale * (exposure[a] + exposure[b]))
+                                              : -expected_signal_fragments(exposure[a] + exposure[b], library);
+        score.absolute_term_sum = std::abs(score.exposure_term);
+        for (std::size_t k = 0; k < views; ++k) {
+            audit_scores[k][c].exposure_term = -(audits[k].exposure_scale * (exposure[a] + exposure[b]));
+            audit_scores[k][c].absolute_term_sum = std::abs(audit_scores[k][c].exposure_term);
+        }
+    }
+    out.accumulator_bytes = nc * (sizeof(DiplotypeScore) + sizeof(double)) * (1 + views) + exposure.capacity() * sizeof(double) +
+                            background.capacity() * sizeof(double);
+    const std::size_t threads = std::max<std::size_t>(1, std::min(options.threads, std::max<std::size_t>(1, nc)));
+    UnionCumulativeCharges cumulative;
+    FragmentScoringResult& result = out.result;
+    std::uint64_t floor_binding = 0;
+    try {
+        for (std::size_t begin = 0; begin < nf; begin += block_fragments) {
+            const std::size_t end = std::min(nf, begin + block_fragments);
+            BlockedBlockReport rep;
+            rep.first_fragment = begin;
+            rep.fragments = end - begin;
+            if (on_block) on_block(rep, true);
+            const auto block_mark = Clock::now();
+            {
+                ContentIndexBatch batch(index, std::vector<ReadPair>(fragments.begin() + begin, fragments.begin() + end), library,
+                                        batch_options);
+                batch.set_placement_store_budget(store_budget_bytes);
+                batch.set_fine_views(fine_views);
+                batch.set_one_shot(true);
+                batch.set_cumulative_baseline(cumulative);
+                batch.discover();
+                batch.build_columns();
+                const std::vector<std::vector<double>>& column = batch.mass_columns();
+                // fold this block into every candidate, fragments in their original order (the bulk loop's operations)
+                const auto combine_mark = Clock::now();
+                const auto fold = [&](std::size_t lo, std::size_t hi) {
+                    for (std::size_t c = lo; c < hi; ++c) {
+                        const std::vector<double>& ma = column[candidates[c].first];
+                        const std::vector<double>& mb = column[candidates[c].second];
+                        DiplotypeScore& score = scores[c];
+                        double term = fragment_term[c];
+                        for (std::size_t i = 0; i < end - begin; ++i) {
+                            const double combined = log_add_exp(ma[i], mb[i]);
+                            if (combined != kNegInf) ++score.fragments_with_mass;
+                            const double contribution = main != nullptr ? prepared_contribution(*main, combined, background[begin + i])
+                                                                        : log_fragment_contribution(combined, background[begin + i], library);
+                            term += contribution;
+                            score.absolute_term_sum += std::abs(contribution);
+                            for (std::size_t k = 0; k < views; ++k) {
+                                const double value = prepared_contribution(audits[k], combined, background[begin + i]);
+                                audit_term[k][c] += value;
+                                audit_scores[k][c].absolute_term_sum += std::abs(value);
+                            }
+                        }
+                        fragment_term[c] = term;
+                    }
+                };
+                const std::size_t span = (nc + threads - 1) / threads;
+                std::vector<std::thread> pool;
+                for (std::size_t t = 0; t < threads; ++t) {
+                    const std::size_t lo = std::min(t * span, nc), hi = std::min(lo + span, nc);
+                    if (lo < hi) pool.emplace_back(fold, lo, hi);
+                }
+                for (std::thread& w : pool) w.join();
+                out.seconds_combination += since(combine_mark);
+                const ContentBatchReport& br = batch.report();
+                const UnionCumulativeCharges own = batch.charges();
+                add_counters(cumulative.executed, own.executed);
+                cumulative.piece_hits += own.piece_hits;
+                cumulative.physical_origins += own.physical_origins;
+                cumulative.placements_consumed += own.placements_consumed;
+                cumulative.origins_consumed += own.origins_consumed;
+                cumulative.states_consumed += own.states_consumed;
+                cumulative.prefilters_consumed += own.prefilters_consumed;
+                floor_binding += batch.state_->prepared.fragments_with_floor_binding;
+                rep.units_evaluated = br.units_evaluated;
+                rep.store_peak_bytes = br.store_peak_bytes;
+                rep.origin_held_bytes = br.origin_held_bytes;
+                rep.retained_column_bytes = br.retained_column_bytes;
+                rep.prefilter_held_bytes = br.prefilter.window_index_bytes + br.prefilter.decision_table_bytes;
+                rep.emission_cache_bytes = br.emission_cache_table_bytes + br.emission_cache_slab_bytes + br.emission_cache_component_bytes;
+                rep.emission_cache_entries = br.emission_cache_entries_held;
+                rep.worker_scratch_bytes = br.worker_scratch_bytes;
+                rep.executed_dps = br.executed_dps;
+                rep.executed_prefilters = br.executed_prefilters;
+                rep.direct_physical_origins = br.direct_physical_origins;
+                rep.served_physical_origins = br.served_physical_origins;
+                rep.origins_constructed = br.origins_constructed;
+                rep.origin_entities_admitted = br.origin_entities_admitted;
+                rep.origin_entities_declined = br.origin_entities_declined;
+                rep.cumulative_physical_origins = cumulative.physical_origins;
+                rep.cumulative_piece_hits = cumulative.piece_hits;
+                result.union_origin_cache.origins_constructed += br.origins_constructed;
+                result.union_origin_cache.origins_consumed += br.origins_consumed_last;
+                result.union_origin_cache.hits += br.zones_applied;
+                result.union_origin_cache.admitted_segments += br.origin_entities_admitted;
+                result.union_origin_cache.declined_segments += br.origin_entities_declined;
+                result.union_origin_cache.peak_bytes = std::max(result.union_origin_cache.peak_bytes, br.origin_held_bytes);
+                result.emission_cache.executed_dps += br.emission_cache.executed_dps;
+                result.emission_cache.executed_prefilters += br.emission_cache.executed_prefilters;
+                result.emission_cache.dp_cache_hits += br.emission_cache.dp_cache_hits;
+                result.emission_cache.dp_cache_misses += br.emission_cache.dp_cache_misses;
+                result.emission_cache.dp_cache_requests += br.emission_cache.dp_cache_requests;
+                result.threads_used_placement = std::max(result.threads_used_placement,
+                                                         std::max<std::size_t>(br.threads_used_discovery, br.threads_used_pairing));
+            }   // the block's batch -- its placements, aggregates, caches and columns -- is released here
+            rep.seconds = since(block_mark);
+            if (on_block) on_block(rep, false);
+            out.blocks.push_back(rep);
+        }
+    } catch (const ResourceExhausted& error) {
+        out.refusal = error.what();   // no union ranking: the accumulated partial scores are discarded
+        result.scores.clear();
+        result.audit_scores.clear();
+        result.counters = cumulative.executed;
+        return out;
+    }
+    for (std::size_t c = 0; c < nc; ++c) {
+        scores[c].fragment_term = fragment_term[c];
+        scores[c].log_likelihood = scores[c].exposure_term + fragment_term[c];
+        for (std::size_t k = 0; k < views; ++k) {
+            audit_scores[k][c].fragment_term = audit_term[k][c];
+            audit_scores[k][c].log_likelihood = audit_scores[k][c].exposure_term + audit_term[k][c];
+            audit_scores[k][c].fragments_with_mass = scores[c].fragments_with_mass;
+        }
+    }
+    if (main != nullptr) {   // the I2-F tally, once for the whole combination, as bulk records it
+        std::uint64_t with_mass = 0;
+        for (const DiplotypeScore& score : scores) with_mass += score.fragments_with_mass;
+        note_prepared_combination(nc, nf, with_mass, *main);
+    }
+    result.scores = std::move(scores);
+    result.audit_scores = std::move(audit_scores);
+    result.counters = cumulative.executed;
+    result.counters.fragments_with_floor_binding = floor_binding;
+    result.unique_haplotypes = unique;
+    result.candidate_fragment_evaluations = static_cast<std::uint64_t>(nc) * static_cast<std::uint64_t>(nf);
+    result.threads_used_combination = threads;
+    result.seconds_diploid_combination = out.seconds_combination;
+    out.completed = true;
+    return out;
 }
 
 ProgressiveResult score_diplotypes_indexed_progressive(const InternedHaplotypes& haplotypes,

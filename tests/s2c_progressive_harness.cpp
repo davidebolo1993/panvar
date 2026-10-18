@@ -5,6 +5,8 @@
 //   s2c_progressive_harness progressive <inputs.bin> <reads_1.fq> <reads_2.fq> <out prefix> [prefix_size=31 [footprint_limit_bytes
 //     [per_call|persist]]]   (S2-D: persist carries the emission cache across the batch's discovery calls)
 //     a footprint guard (4 GiB by default, the local envelope) records the completed stages and exits 125 when crossed
+//   s2c_progressive_harness blocked     <inputs.bin> <reads_1.fq> <reads_2.fq> <out prefix> [block=4096 [footprint_limit_bytes]]
+//     S2-E: the fragment-blocked union pass; the footprint guard (4 GiB default) also covers bulk (argument 6 there)
 //   s2c_progressive_harness compare     <inputs.bin> <bulk prefix> <progressive prefix> <out.tsv>
 // The schedule (declared here, before any timing): stage 1 the S2-A early pair; stage 2 the next `prefix_size` pairs by
 // the truth-free proposal score (descending; ties to pool order); stage 3 the rest of the pool in pool order. No pair is
@@ -174,7 +176,7 @@ struct Row {
 int main(int argc, char** argv) {
     try {
         const std::string mode = argc > 1 ? argv[1] : "";
-        if ((mode == "bulk" || mode == "progressive") && argc >= 6) {
+        if ((mode == "bulk" || mode == "progressive" || mode == "blocked") && argc >= 6) {
             const auto t0 = Clock::now();
             Inputs x = read_inputs(argv[2]);
             const auto fragments = load_pairs(argv[3], argv[4]);
@@ -190,7 +192,101 @@ int main(int argc, char** argv) {
             row.put("footprint_after_load", panvar::physical_footprint().current);
             std::vector<panvar::DiplotypeScore> scores(x.pool.size());
             std::vector<char> have(x.pool.size(), 0);
-            if (mode == "bulk") {
+            // S2-E: the footprint guard for bulk and blocked runs (the progressive mode keeps its own below)
+            static std::mutex sample_mutex;
+            static std::vector<std::string> sample_rows;
+            static bool sample_done = false;
+            std::thread guard_thread;
+            const auto t_guard = Clock::now();
+            if (mode == "bulk" || mode == "blocked") {
+                const std::uint64_t limit = mode == "bulk" ? (argc > 6 ? std::stoull(argv[6]) : (std::uint64_t{4} << 30))
+                                                           : (argc > 7 ? std::stoull(argv[7]) : (std::uint64_t{4} << 30));
+                row.put("footprint_limit_bytes", limit);
+                guard_thread = std::thread([&, limit]() {
+                    for (;;) {
+                        {
+                            std::lock_guard<std::mutex> lock(sample_mutex);
+                            if (sample_done) return;
+                            const panvar::FootprintSample fp = panvar::physical_footprint();
+                            if (fp.current > limit) {
+                                std::ofstream f(out + ".tsv");
+                                f << "key\tvalue\n";
+                                for (const auto& [k, v] : row.kv) f << k << '\t' << v << '\n';
+                                for (const std::string& line : sample_rows) f << line;
+                                f << "completed\tno\nrefusal\tharness footprint guard: " << fp.current << " bytes > " << limit
+                                  << "\nseconds_at_refusal\t" << since(t_guard) << "\nfootprint_peak\t" << fp.peak << '\n';
+                                f.close();
+                                std::cerr << "s2c_progressive_harness: footprint guard " << fp.current << " > " << limit << '\n';
+                                std::_Exit(125);
+                            }
+                        }
+                        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                    }
+                });
+            }
+            const auto stop_guard = [&]() {
+                {
+                    std::lock_guard<std::mutex> lock(sample_mutex);
+                    sample_done = true;
+                }
+                if (guard_thread.joinable()) guard_thread.join();
+            };
+            if (mode == "blocked") {
+                const std::size_t block = argc > 6 ? std::stoul(argv[6]) : 4096;
+                row.put("block_fragments", block);
+                const auto t = Clock::now();
+                std::size_t number = 0;
+                const panvar::BlockedUnionResult r = panvar::score_diplotypes_indexed_blocked(
+                    x.haplotypes, x.pool, fragments, x.library, x.options, x.segments, x.store_bytes, x.views, block,
+                    [&](panvar::BlockedBlockReport& rep, bool before) {
+                        const panvar::FootprintSample fp = panvar::physical_footprint();
+                        if (before) { rep.footprint_before = fp.current; return; }
+                        rep.footprint_after = fp.current;
+                        std::lock_guard<std::mutex> lock(sample_mutex);
+                        const std::string k = "block" + std::to_string(++number) + "_";
+                        std::ostringstream o;
+                        o << k << "fragments\t" << rep.fragments << '\n' << k << "units_evaluated\t" << rep.units_evaluated << '\n'
+                          << k << "store_peak_bytes\t" << rep.store_peak_bytes << '\n' << k << "origin_held_bytes\t" << rep.origin_held_bytes
+                          << '\n' << k << "retained_column_bytes\t" << rep.retained_column_bytes << '\n' << k << "prefilter_held_bytes\t"
+                          << rep.prefilter_held_bytes << '\n' << k << "emission_cache_bytes\t" << rep.emission_cache_bytes << '\n' << k
+                          << "emission_cache_entries\t" << rep.emission_cache_entries << '\n' << k << "executed_dps\t" << rep.executed_dps
+                          << '\n' << k << "direct_physical_origins\t" << rep.direct_physical_origins << '\n' << k
+                          << "served_physical_origins\t" << rep.served_physical_origins << '\n' << k << "origins_constructed\t"
+                          << rep.origins_constructed << '\n' << k << "origin_entities_admitted\t" << rep.origin_entities_admitted << '\n'
+                          << k << "origin_entities_declined\t" << rep.origin_entities_declined << '\n' << k
+                          << "cumulative_physical_origins\t" << rep.cumulative_physical_origins << '\n' << k << "footprint_before\t"
+                          << rep.footprint_before << '\n' << k << "footprint_after\t" << rep.footprint_after << '\n' << k
+                          << "footprint_peak_so_far\t" << fp.peak << '\n' << k << "seconds\t" << rep.seconds << '\n' << k
+                          << "seconds_since_start\t" << since(t) << '\n';
+                        sample_rows.push_back(o.str());
+                    });
+                stop_guard();
+                row.put("seconds_total", since(t));
+                row.put("completed", r.completed ? "yes" : "no");
+                row.put("refusal", r.refusal.empty() ? "none" : r.refusal);
+                row.put("seconds_index_build", r.seconds_index_build);
+                row.put("seconds_combination", r.seconds_combination);
+                row.put("blocks", r.blocks.size());
+                row.put("accumulator_bytes", r.accumulator_bytes);
+                row.put("index_unit_bytes", r.index_unit_bytes);
+                row.put("executed_physical_origins", r.result.counters.physical_origins);
+                row.put("executed_dps", r.result.emission_cache.executed_dps);
+                row.put("executed_prefilters", r.result.emission_cache.executed_prefilters);
+                row.put("origins_constructed", r.result.union_origin_cache.origins_constructed);
+                row.put("origin_segments_admitted", r.result.union_origin_cache.admitted_segments);
+                row.put("origin_segments_declined", r.result.union_origin_cache.declined_segments);
+                row.put("full_read_verifications", r.result.counters.full_read_verifications);
+                row.put("state_classes", r.result.counters.statistical_state_classes);
+                for (const std::string& line : sample_rows) {
+                    const std::size_t tab = line.find('\t');
+                    (void)tab;
+                }
+                if (r.completed) {
+                    scores = r.result.scores;
+                    std::fill(have.begin(), have.end(), 1);
+                }
+                row.put("seconds_first_evaluated_candidate", r.completed ? since(t) : -1.0);
+            } else if (mode == "bulk") {
                 const auto t = Clock::now();
                 panvar::IndexedUnionReport rep;
                 std::string refusal;
@@ -219,6 +315,11 @@ int main(int argc, char** argv) {
                 row.put("origin_held_bytes", rep.batch.origin_held_bytes);
                 row.put("retained_column_bytes", rep.batch.retained_column_bytes);
                 row.put("mass_matrix_bytes", static_cast<std::uint64_t>(x.pool.empty() ? 0 : fragments.size() * x.haplotypes.sequences.size() * 8));
+                row.put("executed_physical_origins", rep.batch.counters_last.physical_origins);
+                row.put("origin_segments_admitted", rep.batch.origin_entities_admitted);
+                row.put("origin_segments_declined", rep.batch.origin_entities_declined);
+                row.put("state_classes", rep.batch.counters_last.statistical_state_classes);
+                stop_guard();
             } else {
                 const std::size_t prefix = argc > 6 ? std::stoul(argv[6]) : 31;
                 // the declared schedule
@@ -362,6 +463,10 @@ int main(int argc, char** argv) {
             row.put("peak_rss_bytes", peak_rss_bytes());
             write_scores(out + ".scores.bin", scores, have);
             row.write(out + ".tsv");
+            if (mode == "blocked") {   // the per-block rows after the summary
+                std::ofstream f(out + ".tsv", std::ios::app);
+                for (const std::string& line : sample_rows) f << line;
+            }
             return 0;
         }
         if (mode == "compare" && argc >= 6) {
