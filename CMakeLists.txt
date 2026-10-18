@@ -294,6 +294,12 @@ if(PANVAR_BUILD_TESTING)
                  COMMAND genotype_command_e2e_test ${CMAKE_CURRENT_BINARY_DIR}/genotype_e2e ${CMAKE_CURRENT_SOURCE_DIR})
         file(MAKE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/genotype_e2e)
 
+        # S2-B (MEASUREMENT ONLY): the pre-placement bound prototype; its fixture mode is the admissibility gate.
+        add_executable(s2b_preplacement_bound tests/s2b_preplacement_bound.cpp)
+        target_link_libraries(s2b_preplacement_bound PRIVATE panvarlib)
+        target_compile_options(s2b_preplacement_bound PRIVATE -Wall -Wextra -Wpedantic)
+        add_test(NAME panvar_s2b_preplacement_bound_fixtures COMMAND s2b_preplacement_bound fixtures)
+
         # Developer probe: seeded simulation, leave-one-out graphs and truth evaluation. Not a test and
         # never installed; tests/genotype_probe_c4.sh drives it.
         add_executable(genotype_probe tests/genotype_probe.cpp src/cli_utils.cpp)

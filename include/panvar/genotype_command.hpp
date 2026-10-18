@@ -214,6 +214,12 @@ struct GenotypeCommandOptions {
     // S2-B TEST HOOK (API only): the early candidate's log-likelihood is moved one ulp before the union check, so the
     // check must fail the run explicitly (never a provisional fallback).
     bool test_perturb_early_incumbent_score = false;
+    // S2-B DIAGNOSTIC ONLY (profile key diagnostic_union_evidence_dump 0|1): writes <prefix>.union_evidence.bin once,
+    // from the primary union ranking -- the interned union haplotype sequences, the exact per-(fragment, haplotype) log
+    // placement masses, exposures, backgrounds, per-haplotype sequence priors, every sequence candidate's score, the
+    // numerical top set and the early incumbent's pair (when early_incumbent is on). An evaluator for the pre-placement
+    // bound prototype; it changes no score, ranking, output or status value.
+    bool diagnostic_union_evidence_dump = false;
     // I2-B (EXPERIMENTAL, profile keys only, never public settings): how the adaptive search's window enumeration builds
     // its placement rows. "reference" (the default) scans each enumerated window whole, unchanged. "fine_experimental"
     // builds the same rows from a round-local, per-worker fine store (PreparedScoringContext::

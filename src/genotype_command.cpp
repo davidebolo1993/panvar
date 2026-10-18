@@ -973,7 +973,7 @@ void write_status(
                                 "marker_proposal_reuse_table_bytes", "combination_prepared_library_terms",
                                 "gap_recursion_backend",
                                 "dosage_census_backend", "adaptive_emission_handoff", "output_schema", "early_incumbent",
-                                "test_interrupt_point"}) {
+                                "test_interrupt_point", "diagnostic_union_evidence_dump"}) {
             const auto source = options.setting_sources.find(key);
             if (source == options.setting_sources.end()) continue;
             const std::string k = key;
@@ -996,6 +996,7 @@ void write_status(
                                       : k == "output_schema" ? options.output_schema
                                       : k == "early_incumbent" ? options.early_incumbent
                                       : k == "test_interrupt_point" ? options.test_interrupt_point
+                                      : k == "diagnostic_union_evidence_dump" ? std::string(options.diagnostic_union_evidence_dump ? "1" : "0")
                                       : k == "gap_recursion_backend"
                                           ? std::string(gap_recursion_backend_name(options.gap_recursion_fixed_geometry))
                                                                          : std::to_string(options.adaptive_fine_max_served_placements);
@@ -1691,6 +1692,10 @@ void apply_genotype_setting(const std::string& context, const std::string& key, 
             throw std::runtime_error(context + ": 'output_schema' is legacy, sequence_first_v1 or sequence_first_v2: " + value);
         }
         options.output_schema = value;
+    }
+    else if (key == "diagnostic_union_evidence_dump") {   // S2-B (DIAGNOSTIC ONLY)
+        if (value != "0" && value != "1") throw std::runtime_error(context + ": 'diagnostic_union_evidence_dump' is 0 or 1: " + value);
+        options.diagnostic_union_evidence_dump = value == "1";
     }
     else if (key == "early_incumbent") {   // S2-A (EXPERIMENTAL)
         if (value != "off" && value != "experimental_v1") {
@@ -3399,6 +3404,7 @@ GenotypeRunStatus run_genotype_body(const GenotypeCommandOptions& options, Genot
         CertifiedRanking ranking;
         RankingSummary summary;
     };
+    bool evidence_dump_pending = true;   // S2-B (DIAGNOSTIC ONLY): the union evidence dump is written once
     const auto rank_set = [&](const MosaicBeamResult& beam, std::size_t view = 0) {
         // The candidate set: the whole panel baseline first, then this target's mosaics.
         std::vector<MosaicCandidate> candidates = panel_candidates;
@@ -3484,6 +3490,59 @@ GenotypeRunStatus run_genotype_body(const GenotypeCommandOptions& options, Genot
         const CertifiedRanking ranking = certify_scored_ranking(
             scores, fragments.size(), scoring_options.mismatch_band, scored.counters, CertificationOptions{},
             sequence_prior);
+        // S2-B (DIAGNOSTIC ONLY): the evaluator for the pre-placement bound prototype, once, from the primary ranking
+        if (view == 0 && options.diagnostic_union_evidence_dump && evidence_dump_pending &&
+            scored.log_mass.size() == fragments.size() * interned.sequences.size()) {
+            evidence_dump_pending = false;
+            std::string bin;
+            const auto put = [&](const auto& v) { bin.append(reinterpret_cast<const char*>(&v), sizeof v); };
+            bin.append("PVEV1\0\0\0", 8);
+            put(static_cast<std::uint64_t>(interned.sequences.size()));
+            put(static_cast<std::uint64_t>(fragments.size()));
+            put(static_cast<std::uint64_t>(sequence_candidates.size()));
+            put(library.insert_mean_bp);
+            put(library.insert_sd_bp);
+            put(library.support_sigmas);
+            put(library.substitution_error);
+            put(library.outlier_weight);
+            put(library.fragment_start_intensity);
+            put(library.gap_open);
+            put(library.gap_extend);
+            put(static_cast<std::uint64_t>(library.max_gap_bp));
+            put(static_cast<std::uint64_t>(scoring_options.mismatch_band));
+            for (const std::string& h : interned.sequences) {
+                put(static_cast<std::uint64_t>(h.size()));
+                bin.append(h);
+            }
+            for (const double x : scored.log_mass) put(x);
+            for (const double x : scored.exposure) put(x);
+            for (const ReadPair& f : fragments) put(log_background_probability(f));   // the scorer's own definition
+            for (const double x : haploid_sequence_prior) put(x);
+            for (std::size_t i = 0; i < sequence_candidates.size(); ++i) {
+                put(static_cast<std::uint64_t>(sequence_candidates[i].first));
+                put(static_cast<std::uint64_t>(sequence_candidates[i].second));
+                put(sequence_prior[i]);
+                put(scores[i].log_likelihood);
+                put(scores[i].fragment_term);
+                put(scores[i].exposure_term);
+                put(scores[i].absolute_term_sum);
+                put(static_cast<std::uint64_t>(scores[i].fragments_with_mass));
+            }
+            put(static_cast<std::uint64_t>(ranking.winner_set.size()));
+            for (const std::size_t w : ranking.winner_set) put(static_cast<std::uint64_t>(w));
+            put(static_cast<std::uint64_t>(ranking.candidates.front().candidate_id));
+            std::uint64_t early_first = std::numeric_limits<std::uint64_t>::max(), early_second = early_first;
+            if (!g_incumbent.early_first.empty()) {
+                std::size_t x = interned.index_of[slot_of_path.at(g_incumbent.early_first)];
+                std::size_t y = interned.index_of[slot_of_path.at(g_incumbent.early_second)];
+                if (y < x) std::swap(x, y);
+                early_first = x;
+                early_second = y;
+            }
+            put(early_first);
+            put(early_second);
+            atomic_write(options.out_prefix + ".union_evidence.bin", bin);
+        }
 
         RankingSummary summary;
         summary.sequence_candidates = sequence_candidates.size();
