@@ -123,7 +123,7 @@ What a run writes depends on its outcome:
 - `<prefix>.representation_intervals.tsv`;
 - `<prefix>.sequence_alternatives.tsv`.
 
-**The prediction.** After a completed ranking it is the canonical member of the decision set: the highest-scoring sequence pair, with numerical ties broken by SHA-256 of the sequences. Labellings that spell the same pair are pooled. The status is one of:
+**The prediction.** After a completed ranking it is a representative: the canonical member of the numerically inseparable decision set, chosen by SHA-256 of the sequences. It is not necessarily the strictly highest floating-point score. Labellings that spell the same pair are pooled. `representative_labelling_hap1` spells FASTA hap1, and interval `hapA` is the same sequence (by SHA-256). The status is one of:
 - `RESOLVED`: one sequence pair in the decision set (not a confidence claim);
 - `GENOTYPE_RESOLVED_SEQUENCE_SET`;
 - `SEQUENCE_TIED`.
@@ -136,12 +136,15 @@ What a run writes depends on its outcome:
 
 **Stops at a declared cap.** A round or cumulative cap after a committed round reports `PROVISIONAL`, from the last exactly scored incumbent, with no decision set and no confidence.
 
-**When nothing is reported.** Watchdog stops, refusals and invalid input give no prediction.
+**When nothing is reported.** Watchdog stops, refusals and invalid input give no prediction. The five reports belong to the run: a later run at the same prefix, or a watchdog stop, removes them.
+
+**Dosage.** The report and its FASTA describe the caller's decision *before* the dosage stage (`dosage_scope`, `post_dosage_sequence`, `dosage_mode`). When `--dosage-mode repair` changes the legacy reported genotype, this FASTA is not the post-dosage sequence.
 
 **Exit status under this schema:**
 - 0: a prediction, even when uncertain;
 - 3: provisional;
 - 1: no prediction;
+- 2: the report could not be written completely (nothing partial is left; `sequence_publication FAILED`);
 - 2: errors.
 
 **Confidence.** `structure_confidence` is `NA` (`UNCALIBRATED`).
