@@ -4856,6 +4856,125 @@ void test_early_incumbent_caps() {
                  "candidate as PROVISIONAL; a scoring inconsistency is an explicit no-prediction failure\n";
 }
 
+// ---- S2-D: opt-in progressive scheduling of the indexed union pass (union_progressive_schedule experimental_v1) --------
+void test_progressive_schedule() {
+    namespace fs = std::filesystem;
+    const auto fresh = [&](const std::string& rel, bool progressive) {
+        fs::remove_all(path(rel));
+        fs::create_directories(path(rel));
+        panvar::GenotypeCommandOptions o =
+            repair_options(rel + "/call", path("phaseable_r1.fq"), path("phaseable_r2.fq"), "tiny_phaseable.gfa");
+        o.output_schema = "sequence_first_v2";
+        o.setting_sources["output_schema"] = "test";
+        o.early_incumbent = "experimental_v1";
+        o.setting_sources["early_incumbent"] = "test";
+        o.union_scoring_backend = "indexed_fine_experimental";
+        o.indexed_union_store_bytes = std::size_t{256} << 20;
+        o.max_union_cached_placements_consumed = 2000000000ULL;
+        o.max_union_cached_origins_consumed = 2000000000ULL;
+        o.max_union_cached_states_consumed = 2000000000ULL;
+        o.max_union_cached_prefilters_consumed = 2000000000ULL;
+        o.setting_sources["union_scoring_backend"] = "test";
+        o.setting_sources["indexed_union_store_bytes"] = "test";
+        if (progressive) {
+            o.union_progressive_schedule = "experimental_v1";
+            o.setting_sources["union_progressive_schedule"] = "test";
+        }
+        return o;
+    };
+    // (1) complete runs: every output identical; only declared status/settings rows (and executed-work rows) differ
+    require(panvar::execute_genotype_command(fresh("ps_off", false), nullptr) == 0, "S2-D control predicts");
+    require(panvar::execute_genotype_command(fresh("ps_on", true), nullptr) == 0, "S2-D progressive predicts");
+    require(sf::files(path("ps_off")) == sf::files(path("ps_on")), "S2-D: the same files");
+    for (const std::string& f : sf::files(path("ps_off"))) {
+        if (f == "call.mosaic_status.tsv" || f == "call.settings.tsv" || f == "call.repair_memory.tsv" || f == "call.dosage_status.tsv") continue;
+        if (f == "call.repair_rounds.tsv") {
+            require(rounds_science(path("ps_off/" + f)) == rounds_science(path("ps_on/" + f)), "S2-D: trajectory identical");
+            continue;
+        }
+        require(sf::normalised(path("ps_off/" + f), path("ps_off")) == sf::normalised(path("ps_on/" + f), path("ps_on")),
+                "S2-D: " + f + " identical (scheduling only)");
+    }
+    {
+        const auto a = sf::kv(path("ps_off/call.mosaic_status.tsv")), b = sf::kv(path("ps_on/call.mosaic_status.tsv"));
+        std::vector<std::string> differing;
+        for (const auto& [k, v] : a) {
+            if (sf::volatile_key(k)) continue;
+            const auto it = b.find(k);
+            if (it == b.end() || it->second != v) differing.push_back(k);
+        }
+        std::string list;
+        for (const auto& k : differing) list += k + ",";
+        std::cout << "  S2-D control/progressive status keys differing (non-timing): " << (list.empty() ? "none" : list) << '\n';
+        // what may differ is executed work, cache accounting and store/aggregate peaks -- never a score, call or filter
+        for (const auto& k : differing) {
+            const bool resource = k.rfind("checkpoint_", 0) == 0 ||   // declared: the prefix adds a checkpoint commit
+                                  k.find("emission") != std::string::npos || k.find("executed") != std::string::npos ||
+                                  k.find("indexed_union") != std::string::npos || k.find("cache") != std::string::npos ||
+                                  k.find("store") != std::string::npos || k.find("prefilter") != std::string::npos ||
+                                  k.find("threads") != std::string::npos || k.find("candidate_fragment_evaluations") != std::string::npos;
+            require(resource, "S2-D: status key " + k + " differs and is not a declared resource/work row");
+        }
+        const auto st = read_status(path("ps_on/call.mosaic_status.tsv"));
+        require(st.at("union_progressive_completed") == "yes" && st.at("union_progressive_prefix_checkpoint") == "committed" &&
+                    st.at("early_incumbent_union_check") == "reproduced" && st.at("union_progressive_stage1_candidates") == "1",
+                "S2-D: schedule completed, prefix checkpoint committed, early candidate reproduced by the union");
+    }
+    // (2) a stop right after the prefix checkpoint keeps it as PROVISIONAL; a later stop keeps a later checkpoint
+    const auto stopped = [&](const std::string& rel, const std::string& point, std::size_t threads = 2) {
+        panvar::GenotypeCommandOptions o = fresh(rel, true);
+        o.test_interrupt_point = point;
+        o.threads = threads;
+        return s2a::execute_in_child(o);
+    };
+    {
+        const int code = stopped("ps_prefix", "after_prefix_checkpoint");
+        const auto locus = sf::kv(path("ps_prefix/call.sequence_locus.tsv"));
+        require(code == 3 && locus.at("prediction") == "PROVISIONAL" && locus.at("checkpoint_stage") == "union_prefix_best" &&
+                    locus.at("checkpoint_tied_groups") != "NA" && locus.at("checkpoint_projection_ambiguous") != "NA" &&
+                    locus.at("checkpoint_semantics").find("no_confidence_from_the_evaluated_count") != std::string::npos &&
+                    no_ranking_or_call("ps_prefix/call"),
+                "S2-D: the prefix checkpoint survives a stop as PROVISIONAL, ties and projection recorded (exit " + std::to_string(code) + ")");
+        const int later = stopped("ps_later", "adaptive_refinement");
+        const auto late = sf::kv(path("ps_later/call.sequence_locus.tsv"));
+        require(later == 3 && late.at("checkpoint_stage") != "union_prefix_best" && late.at("checkpoint_stage") != "early_panel_incumbent" &&
+                    std::stod(late.at("checkpoint_total_score")) >= std::stod(locus.at("checkpoint_total_score")),
+                "S2-D: a later stop keeps the last committed checkpoint, never worse than the prefix's");
+        // 1 vs 4 threads: the same prefix checkpoint
+        require(stopped("ps_t1", "after_prefix_checkpoint", 1) == 3 && stopped("ps_t4", "after_prefix_checkpoint", 4) == 3,
+                "S2-D threads: both stop at the prefix checkpoint");
+        auto a = sf::kv(path("ps_t1/call.sequence_locus.tsv")), b = sf::kv(path("ps_t4/call.sequence_locus.tsv"));
+        for (auto* m : {&a, &b}) {
+            m->erase("checkpoint_seconds_first_evaluated_prediction");
+            m->erase("checkpoint_seconds_committed");
+            m->erase("completion_note");
+        }
+        require(a == b, "S2-D threads: the prefix checkpoint is identical at 1 and 4 threads");
+    }
+    // (3) a union cap during the schedule: PROVISIONAL from the last committed checkpoint, never a full ranking
+    {
+        const auto ref = read_status(path("ps_on/call.mosaic_status.tsv"));
+        panvar::GenotypeCommandOptions o = fresh("ps_cap", true);
+        o.max_physical_origins = std::stoull(ref.at("early_incumbent_physical_origins"));
+        const int code = panvar::execute_genotype_command(o, nullptr);
+        const auto locus = sf::kv(path("ps_cap/call.sequence_locus.tsv"));
+        const auto st = read_status(path("ps_cap/call.mosaic_status.tsv"));
+        require(code == 3 && locus.at("completion") == "union_scoring_cap" && st.at("union_progressive_completed") == "no" &&
+                    (locus.at("checkpoint_stage") == "early_panel_incumbent" || locus.at("checkpoint_stage") == "union_prefix_best"),
+                "S2-D: a cap inside the schedule keeps the last committed checkpoint as PROVISIONAL (exit " + std::to_string(code) + ")");
+    }
+    // (4) the contract: progressive scheduling needs the early incumbent and the indexed backend
+    {
+        panvar::GenotypeCommandOptions o = fresh("ps_refused", true);
+        o.union_scoring_backend = "reference";
+        bool refused = false;
+        try { (void)panvar::execute_genotype_command(o, nullptr); } catch (const std::invalid_argument&) { refused = true; }
+        require(refused && sf::files(path("ps_refused")).empty(), "S2-D: progressive scheduling without the indexed backend is refused");
+    }
+    std::cout << "  progressive schedule: complete-run outputs identical to the bulk indexed route; prefix checkpoint "
+                 "PROVISIONAL with ties/projection; later stop and union cap keep the last checkpoint; 1/4 threads; contract\n";
+}
+
 int main(int argc, char** argv) {
     if (argc < 2) {
         std::cerr << "usage: genotype_command_e2e_test <scratch dir> [source dir]\n";
@@ -4903,6 +5022,7 @@ int main(int argc, char** argv) {
             test_sequence_first_v2_contract();
             test_early_incumbent();
             test_early_incumbent_caps();
+            test_progressive_schedule();
             std::cout << "genotype command e2e (sequence_first only): PASS\n";
             return 0;
         } catch (const std::exception& error) {
@@ -4953,6 +5073,7 @@ int main(int argc, char** argv) {
         test_sequence_first_v2_contract();
         test_early_incumbent();
         test_early_incumbent_caps();
+        test_progressive_schedule();
         if (argc >= 3) test_profile(argv[2]);
         test_block_quality_columns();
         std::cout << "genotype command end-to-end: PASS\n";

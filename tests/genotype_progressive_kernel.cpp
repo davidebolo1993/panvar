@@ -216,6 +216,59 @@ int main() {
                 }
             }
         }
+        // S2-D: bounded emission reuse across the batch's discovery calls -- identical scores (default budget, a tiny
+        // budget that evicts/declines, forced hash collisions), real reuse, poisoning after a refusal, no armed cache left
+        {
+            const panvar::FragmentScoringResult bulk = panvar::score_diplotypes_indexed_union(
+                fx.haplotypes, fx.pool, fx.fragments, fx.library, options(2), fx.segments, store, nullptr, nullptr, false, true);
+            std::vector<std::vector<HaplotypeCandidate>> stages(3);
+            stages[0].push_back(fx.pool[5]);
+            for (std::size_t c = 0; c < fx.pool.size(); ++c) {
+                if (c == 5) continue;
+                (stages[1].size() < 4 ? stages[1] : stages[2]).push_back(fx.pool[c]);
+            }
+            for (const int variant : {0, 1, 2}) {
+                panvar::FragmentScoringOptions o = options(2);
+                if (variant == 1) o.emission_cache_bytes = 4096;   // tiny: entries declined or evicted
+                if (variant == 2) panvar::set_emission_cache_hash_collapse(true);
+                const panvar::ProgressiveResult off = panvar::score_diplotypes_indexed_progressive(
+                    fx.haplotypes, stages, fx.fragments, fx.library, o, fx.segments, store, true, {}, false);
+                const panvar::ProgressiveResult on = panvar::score_diplotypes_indexed_progressive(
+                    fx.haplotypes, stages, fx.fragments, fx.library, o, fx.segments, store, true, {}, true);
+                panvar::set_emission_cache_hash_collapse(false);
+                const auto a = flatten(off, stages, fx.pool), b = flatten(on, stages, fx.pool);
+                for (std::size_t c = 0; c < fx.pool.size(); ++c) {
+                    require(same(a[c], b[c]) && same(b[c], bulk.scores[c]), "S2-D: persistent emissions keep every score (variant " + std::to_string(variant) + ")");
+                }
+                std::cout << "  S2-D variant " << variant << ": executed dps per-call " << off.batch.executed_dps << ", persistent "
+                          << on.batch.executed_dps << "; adoptions " << on.batch.persistent_adoptions << ", carried hits "
+                          << on.batch.persistent_inherited_hits << '\n';
+                if (variant == 0) {
+                    require(on.batch.persistent_adoptions == 2 && on.batch.persistent_inherited_hits > 0 &&
+                                on.batch.executed_dps <= off.batch.executed_dps,
+                            "S2-D: the carried cache is adopted by each later discovery and serves hits");
+                }
+                require(!panvar::retained_process_storage().emission_cache_armed, "S2-D: no emission cache is left armed after a schedule");
+            }
+            // a refused selective call poisons the batch, and the global cache is not left armed
+            panvar::ContentPlacementIndex index(100, fx.library.max_gap_bp, true);
+            for (std::size_t h = 0; h < fx.haplotypes.sequences.size(); ++h) index.add_haplotype(fx.haplotypes.sequences[h], fx.segments[h]);
+            panvar::FragmentScoringOptions o = options(2);
+            o.max_piece_hits = 1;   // refuses inside discovery
+            panvar::ContentIndexBatch batch(index, fx.fragments, fx.library, o);
+            batch.set_fine_views(true);
+            batch.set_persistent_emission_cache(true);
+            bool refused = false, poisoned = false;
+            try {
+                batch.discover_for({0, 1});
+                (void)batch.score_selected({{0, 1}});   // the cap may bind at publication or at the acceptance check
+            } catch (const panvar::ResourceExhausted&) {
+                refused = true;
+            }
+            require(refused && !panvar::retained_process_storage().emission_cache_armed, "S2-D: a refusal leaves no armed cache");
+            try { batch.discover_for({2}); } catch (const std::logic_error&) { poisoned = true; }
+            require(poisoned, "S2-D: a refused batch cannot continue on incomplete evidence");
+        }
         // an incomplete column is refused; the selective route exports no matrix; bulk and selective never mix
         {
             panvar::ContentPlacementIndex index(100, fx.library.max_gap_bp, true);

@@ -2,7 +2,8 @@
 // (<prefix>.union_kernel_inputs.bin from the caller, plus the reads). Each mode runs in its own process so peak memory is
 // its own.
 //   s2c_progressive_harness bulk        <inputs.bin> <reads_1.fq> <reads_2.fq> <out prefix>
-//   s2c_progressive_harness progressive <inputs.bin> <reads_1.fq> <reads_2.fq> <out prefix> [prefix_size=31 [footprint_limit_bytes]]
+//   s2c_progressive_harness progressive <inputs.bin> <reads_1.fq> <reads_2.fq> <out prefix> [prefix_size=31 [footprint_limit_bytes
+//     [per_call|persist]]]   (S2-D: persist carries the emission cache across the batch's discovery calls)
 //     a footprint guard (4 GiB by default, the local envelope) records the completed stages and exits 125 when crossed
 //   s2c_progressive_harness compare     <inputs.bin> <bulk prefix> <progressive prefix> <out.tsv>
 // The schedule (declared here, before any timing): stage 1 the S2-A early pair; stage 2 the next `prefix_size` pairs by
@@ -243,6 +244,8 @@ int main(int argc, char** argv) {
                 row.put("prefix_size", prefix);
                 const std::uint64_t limit = argc > 7 ? std::stoull(argv[7]) : (std::uint64_t{4} << 30);
                 row.put("footprint_limit_bytes", limit);
+                const bool persist = argc > 8 && std::string(argv[8]) == "persist";
+                row.put("emission_cache_lifetime", persist ? "persist_across_discovery_calls" : "per_discovery_call");
                 const auto t = Clock::now();
                 // the footprint guard: completed stages are the checkpoint it keeps (no work after the limit)
                 static std::mutex guard_mutex;
@@ -272,7 +275,7 @@ int main(int argc, char** argv) {
                 std::vector<panvar::ProgressiveStageReport> reports;
                 const panvar::ProgressiveResult r = panvar::score_diplotypes_indexed_progressive(
                     x.haplotypes, stages, fragments, x.library, x.options, x.segments, x.store_bytes, x.views,
-                    [&](panvar::ProgressiveStageReport& rep) {
+                    [&](panvar::ProgressiveStageReport& rep, const panvar::FragmentScoringResult&) {
                         const panvar::FootprintSample fp = panvar::physical_footprint();
                         rep.footprint_bytes = fp.current;
                         rep.footprint_peak_bytes = fp.peak;
@@ -285,7 +288,7 @@ int main(int argc, char** argv) {
                           << k << "origin_held_bytes\t" << rep.origin_held_bytes << '\n' << k << "footprint_bytes\t" << fp.current
                           << '\n' << k << "seconds_since_start\t" << rep.seconds_since_start << '\n';
                         done_rows.push_back(o.str());
-                    });
+                    }, persist);
                 {
                     std::lock_guard<std::mutex> lock(guard_mutex);
                     finished = true;
@@ -324,12 +327,22 @@ int main(int argc, char** argv) {
                     row.put(k + "seconds_discovery", st.seconds_discovery);
                     row.put(k + "seconds_scoring", st.seconds_scoring);
                     row.put(k + "seconds_since_start", st.seconds_since_start);
+                    row.put(k + "dp_cache_hits", st.dp_cache_hits);
+                    row.put(k + "dp_cache_misses", st.dp_cache_misses);
+                    row.put(k + "carried_hits", st.carried_hits);
+                    row.put(k + "carried_bytes", st.carried_bytes);
+                    row.put(k + "carried_entries", st.carried_entries);
                     for (std::size_t i = 0; i < stage_index[s].size(); ++i) {
                         scores[stage_index[s][i]] = r.scores[s][i];
                         have[stage_index[s][i]] = 1;
                     }
                 }
                 row.put("seconds_first_evaluated_candidate", r.stages.empty() ? -1.0 : r.stages[0].seconds_since_start);
+                row.put("dp_cache_hits", r.batch.emission_cache.dp_cache_hits);
+                row.put("dp_cache_misses", r.batch.emission_cache.dp_cache_misses);
+                row.put("persistent_adoptions", r.batch.persistent_adoptions);
+                row.put("persistent_adoption_refusals", r.batch.persistent_adoption_refusals);
+                row.put("persistent_carried_hits", r.batch.persistent_inherited_hits);
                 row.put("units_discovered", r.batch.units_evaluated);
                 row.put("columns_computed", r.batch.columns_computed_total);
                 row.put("executed_prefilters", r.batch.executed_prefilters);

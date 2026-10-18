@@ -209,7 +209,8 @@ struct GenotypeCommandOptions {
     // run ends as a typed NO_PREDICTION. Scores, ranking, caps and completed-run conclusions are unchanged.
     std::string early_incumbent = "off";
     // S2-A TEST HOOK (profile key test_interrupt_point): a deterministic time-limit stop at none |
-    // before_first_evaluation | after_checkpoint | union_scoring | adaptive_refinement (after the first committed round).
+    // before_first_evaluation | after_checkpoint | union_scoring | adaptive_refinement (after the first committed round) |
+    // after_prefix_checkpoint (S2-D: right after the progressive schedule's 32-pair checkpoint).
     std::string test_interrupt_point = "none";
     // S2-B TEST HOOK (API only): the early candidate's log-likelihood is moved one ulp before the union check, so the
     // check must fail the run explicitly (never a provisional fallback).
@@ -226,6 +227,14 @@ struct GenotypeCommandOptions {
     // path prior, maximised over the pair's labellings) and its sequence prior, the early incumbent's pair, and the
     // scoring options and library the union pass uses. Input to the S2-C progressive-kernel harness; changes nothing.
     bool diagnostic_union_kernel_dump = false;
+    // S2-D (EXPERIMENTAL, opt-in; profile key union_progressive_schedule off|experimental_v1): the indexed union pass run
+    // as a declared schedule on ONE selective batch -- the S2-A early pair, then the next 31 sequence pairs by the
+    // truth-free proposal score, then the rest of the pool -- reusing every completed unit, column and pair. After the
+    // 32-pair prefix its best fully evaluated pair is checkpointed (PROVISIONAL; ties and projection ambiguity recorded).
+    // Every candidate is still scored; scores, ranking and outputs are the bulk route's. Needs early_incumbent
+    // experimental_v1 and the indexed backend (exact store); refused with the diagnostics that need the full mass
+    // matrix and with the adaptive emission handoff.
+    std::string union_progressive_schedule = "off";
     // I2-B (EXPERIMENTAL, profile keys only, never public settings): how the adaptive search's window enumeration builds
     // its placement rows. "reference" (the default) scans each enumerated window whole, unchanged. "fine_experimental"
     // builds the same rows from a round-local, per-worker fine store (PreparedScoringContext::

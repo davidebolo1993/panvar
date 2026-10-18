@@ -2017,6 +2017,11 @@ struct ContentBatchReport {
     std::uint64_t view_coarse_units = 0, view_rows_represented = 0, view_table_bytes = 0;
     std::uint64_t view_zone_temporary_peak_bytes = 0, view_zone_temporary_bytes_total = 0;
     double seconds_view_zone_gather = 0.0;
+    // S2-D: the batch-owned emission cache carried across selective discovery calls (status, adoptions and refusals,
+    // hits served by carried entries, and what it holds between calls: allocated bytes and entries)
+    std::string persistent_emission_status = "off";
+    std::uint64_t persistent_adoptions = 0, persistent_adoption_refusals = 0, persistent_inherited_hits = 0;
+    std::uint64_t persistent_carried_bytes = 0, persistent_carried_entries = 0;
 };
 
 class ContentIndexBatch {
@@ -2060,6 +2065,13 @@ public:
     // and exposure are left empty). A slot needing an undiscovered unit is refused (std::logic_error) before any work:
     // unknown evidence is never zero mass. Every cap is charged to the batch's cumulative totals.
     FragmentScoringResult score_selected(const std::vector<HaplotypeCandidate>& candidates);
+    // ---- S2-D (EXPERIMENTAL): bounded emission reuse across this batch's selective discovery calls. Off (the default)
+    // is S2-C's per-call cache. On: the cache is detached into a batch-owned object after each selective discovery and
+    // adopted by the next under the same byte budget, only when library, band and recursion backend match; it is
+    // destroyed with the batch (or by release_carried_emissions) and never crosses samples. Exclusive with the adaptive
+    // emission handoff. A refused or failed selective call poisons the batch: later calls throw std::logic_error.
+    void set_persistent_emission_cache(bool on);
+    void release_carried_emissions();
     std::size_t units_discovered() const;   // selective: units discovered; bulk: units evaluated
     std::size_t columns_completed() const;
     const ContentBatchReport& report() const;
@@ -2132,10 +2144,18 @@ struct ProgressiveStageReport {
     std::uint64_t store_live_bytes = 0, store_peak_bytes = 0, retained_column_bytes = 0, origin_held_bytes = 0;
     std::uint64_t worker_scratch_bytes = 0;
     std::uint64_t footprint_bytes = 0, footprint_peak_bytes = 0;   // set by the caller's on_stage hook, if it samples
+    // S2-D: emission cache this stage (hits, misses, hits served by entries carried from earlier stages) and what the
+    // carried cache holds after it (0 with persistence off)
+    std::uint64_t dp_cache_hits = 0, dp_cache_misses = 0, carried_hits = 0, carried_bytes = 0, carried_entries = 0;
+    std::uint64_t candidate_fragment_evaluations = 0;
     double seconds_discovery = 0.0, seconds_scoring = 0.0, seconds_since_start = 0.0;
 };
 struct ProgressiveResult {
     std::vector<std::vector<DiplotypeScore>> scores;   // per completed stage, parallel to its candidates
+    std::vector<std::vector<std::vector<DiplotypeScore>>> audit_scores;   // per completed stage: [audit library][candidate]
+    // S2-D: the run-level fields a caller's union result carries (counters: the batch's cumulative executed work; the
+    // origin, prefilter and start-sort reports; phase seconds summed over stages; workers)
+    FragmentScoringResult summary;
     std::vector<ProgressiveStageReport> stages;        // completed stages
     bool completed = false;
     std::string refusal;                               // the ResourceExhausted message that stopped the schedule
@@ -2149,6 +2169,7 @@ ProgressiveResult score_diplotypes_indexed_progressive(const InternedHaplotypes&
                                                        const FragmentScoringOptions& options,
                                                        const std::vector<std::vector<std::uint32_t>>& segments,
                                                        std::size_t store_budget_bytes, bool fine_views,
-                                                       const std::function<void(ProgressiveStageReport&)>& on_stage = {});
+                                                       const std::function<void(ProgressiveStageReport&, const FragmentScoringResult&)>& on_stage = {},
+                                                       bool persistent_emissions = false);
 
 } // namespace panvar

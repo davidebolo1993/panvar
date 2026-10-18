@@ -38,6 +38,7 @@
 #include <limits>
 #include <map>
 #include <mutex>
+#include <numeric>
 #include <optional>
 #include <set>
 #include <sstream>
@@ -114,6 +115,7 @@ std::string dosage_mode_source(const GenotypeCommandOptions& options) { return o
 // S2-A: the early_incumbent contract (also checked before an API run touches its prefix).
 std::optional<std::string> early_incumbent_refusal(const GenotypeCommandOptions& o) {
     if (o.early_incumbent != "experimental_v1") {
+        if (o.union_progressive_schedule != "off") return std::string("union_progressive_schedule needs early_incumbent experimental_v1");
         if (o.test_interrupt_point != "none") return std::string("test_interrupt_point needs early_incumbent experimental_v1");
         if (o.test_perturb_early_incumbent_score) return std::string("test_perturb_early_incumbent_score needs early_incumbent experimental_v1");
         return std::nullopt;
@@ -126,6 +128,16 @@ std::optional<std::string> early_incumbent_refusal(const GenotypeCommandOptions&
     if (o.repair_rounds == 0) return what + "needs the adaptive repair (repair rounds > 0)";
     if (o.diagnostic_union_only) return what + "is not supported with diagnostic_union_only";
     if (!o.development_candidate_prefixes.empty()) return what + "is not supported with development candidate prefixes";
+    if (o.union_progressive_schedule == "experimental_v1") {   // S2-D
+        const std::string p = "union_progressive_schedule experimental_v1 ";
+        if (o.union_scoring_backend != "indexed_fine_experimental") return p + "needs union_scoring_backend indexed_fine_experimental";
+        if (o.indexed_union_store_layout == "legacy_i2a") return p + "needs the exact indexed store layout";
+        if (o.adaptive_emission_handoff) return p + "is not supported with adaptive_emission_handoff";
+        if (o.diagnostic_union_evidence_dump || o.diagnostic_union_work_trace || o.diagnostic_union_seeding_profile > 0 ||
+            !o.diagnostic_union_verification_census.empty()) {
+            return p + "is not supported with union diagnostics that need the full mass matrix";
+        }
+    }
     return std::nullopt;
 }
 // S2-A: the run's incumbent -- the best fully evaluated candidate so far -- and the early evaluation's account (reset
@@ -163,6 +175,15 @@ struct EarlyIncumbent {
     std::vector<bool> template_reverse;
 };
 EarlyIncumbent g_incumbent;
+// S2-D: the progressive union schedule of the run in flight (reset at every run start)
+struct ProgressiveUnion {
+    bool enabled = false, completed = false, prefix_committed = false;
+    std::vector<ProgressiveStageReport> stages;
+    double seconds_union_start = 0.0, seconds_prefix_checkpoint = std::numeric_limits<double>::quiet_NaN();
+    std::size_t prefix_pairs = 0, prefix_tied_groups = 0;
+    std::string refusal = "none";
+};
+ProgressiveUnion g_progressive;
 // S1-D.1: true while execute_genotype_command runs the body (its dosage stage follows); a caller-only API run
 // (run_genotype, run_genotype_prepared) has no dosage stage, and its v2 report says so rather than naming a mode.
 bool g_dosage_stage_follows = false;
@@ -973,7 +994,8 @@ void write_status(
                                 "marker_proposal_reuse_table_bytes", "combination_prepared_library_terms",
                                 "gap_recursion_backend",
                                 "dosage_census_backend", "adaptive_emission_handoff", "output_schema", "early_incumbent",
-                                "test_interrupt_point", "diagnostic_union_evidence_dump", "diagnostic_union_kernel_dump"}) {
+                                "test_interrupt_point", "diagnostic_union_evidence_dump", "diagnostic_union_kernel_dump",
+                                "union_progressive_schedule"}) {
             const auto source = options.setting_sources.find(key);
             if (source == options.setting_sources.end()) continue;
             const std::string k = key;
@@ -998,6 +1020,7 @@ void write_status(
                                       : k == "test_interrupt_point" ? options.test_interrupt_point
                                       : k == "diagnostic_union_evidence_dump" ? std::string(options.diagnostic_union_evidence_dump ? "1" : "0")
                                       : k == "diagnostic_union_kernel_dump" ? std::string(options.diagnostic_union_kernel_dump ? "1" : "0")
+                                      : k == "union_progressive_schedule" ? options.union_progressive_schedule
                                       : k == "gap_recursion_backend"
                                           ? std::string(gap_recursion_backend_name(options.gap_recursion_fixed_geometry))
                                                                          : std::to_string(options.adaptive_fine_max_served_placements);
@@ -1497,6 +1520,31 @@ void write_status(
                 << "\nearly_incumbent_fragments_with_mass\t" << e.early_score.fragments_with_mass
                 << "\nearly_incumbent_sequence_prior\t" << e.early_prior << std::fixed << std::setprecision(6);
         }
+        if (g_progressive.enabled) {   // S2-D: the schedule's stages, the prefix checkpoint, the repeated early evaluation
+            const ProgressiveUnion& pu = g_progressive;
+            out << "\nunion_progressive_schedule\texperimental_v1\nunion_progressive_completed\t" << (pu.completed ? "yes" : "no")
+                << "\nunion_progressive_refusal\t" << pu.refusal << "\nunion_progressive_prefix_checkpoint\t"
+                << (pu.prefix_committed ? "committed" : "none") << "\nunion_progressive_prefix_pairs\t" << pu.prefix_pairs
+                << "\nunion_progressive_prefix_tied_groups\t" << pu.prefix_tied_groups
+                << "\nunion_progressive_seconds_union_start\t" << pu.seconds_union_start
+                << "\nunion_progressive_seconds_prefix_checkpoint\t" << pu.seconds_prefix_checkpoint;
+            for (std::size_t i = 0; i < pu.stages.size(); ++i) {
+                const ProgressiveStageReport& st = pu.stages[i];
+                const std::string k = "\nunion_progressive_stage" + std::to_string(i + 1) + "_";
+                out << k << "candidates\t" << st.candidates << k << "slots\t" << st.slots << k << "units_discovered\t"
+                    << st.units_discovered << k << "units_reused\t" << st.units_reused << k << "columns_computed\t"
+                    << st.columns_computed << k << "columns_reused\t" << st.columns_reused << k << "executed_dps\t" << st.executed_dps
+                    << k << "direct_physical_origins\t" << st.direct_physical_origins << k << "served_physical_origins\t"
+                    << st.served_physical_origins << k << "origins_constructed\t" << st.origins_constructed << k
+                    << "store_live_bytes\t" << st.store_live_bytes << k << "origin_held_bytes\t" << st.origin_held_bytes << k
+                    << "footprint_bytes\t" << st.footprint_bytes << k << "seconds_since_union_start\t" << st.seconds_since_start;
+            }
+            if (!pu.stages.empty()) {
+                // stage 1 re-evaluates the S2-A early pair inside the union index: repeated work, reported, not hidden
+                out << "\nunion_progressive_repeated_early_evaluation_columns\t" << pu.stages[0].columns_computed
+                    << "\nunion_progressive_repeated_early_evaluation_executed_dps\t" << pu.stages[0].executed_dps;
+            }
+        }
         out << "\ncheckpoint_commits\t" << e.commits
             << "\ncheckpoint_last_stage\t" << e.stage << "\ncheckpoint_evaluated_candidates\t" << e.evaluated
             << "\ncheckpoint_seconds_first_evaluated_prediction\t" << e.seconds_first << "\ncheckpoint_failure\t"
@@ -1694,6 +1742,12 @@ void apply_genotype_setting(const std::string& context, const std::string& key, 
         }
         options.output_schema = value;
     }
+    else if (key == "union_progressive_schedule") {   // S2-D (EXPERIMENTAL)
+        if (value != "off" && value != "experimental_v1") {
+            throw std::runtime_error(context + ": 'union_progressive_schedule' is off or experimental_v1: " + value);
+        }
+        options.union_progressive_schedule = value;
+    }
     else if (key == "diagnostic_union_kernel_dump") {   // S2-C (DIAGNOSTIC ONLY)
         if (value != "0" && value != "1") throw std::runtime_error(context + ": 'diagnostic_union_kernel_dump' is 0 or 1: " + value);
         options.diagnostic_union_kernel_dump = value == "1";
@@ -1710,7 +1764,7 @@ void apply_genotype_setting(const std::string& context, const std::string& key, 
     }
     else if (key == "test_interrupt_point") {   // S2-A TEST HOOK
         if (value != "none" && value != "before_first_evaluation" && value != "after_checkpoint" &&
-            value != "union_scoring" && value != "adaptive_refinement") {
+            value != "union_scoring" && value != "adaptive_refinement" && value != "after_prefix_checkpoint") {
             throw std::runtime_error(context + ": 'test_interrupt_point' is none, before_first_evaluation, after_checkpoint, "
                                      "union_scoring or adaptive_refinement: " + value);
         }
@@ -2368,6 +2422,8 @@ GenotypeRunStatus run_genotype_body(const GenotypeCommandOptions& options, Genot
         throw std::invalid_argument(*refused);
     }
     g_incumbent = EarlyIncumbent{};   // S2-A
+    g_progressive = ProgressiveUnion{};   // S2-D
+    g_progressive.enabled = options.union_progressive_schedule == "experimental_v1";
     g_incumbent.enabled = options.early_incumbent == "experimental_v1";
     set_emission_lookup_timing(options.emission_lookup_timing);
     g_proposal_reuse = ProposalReuseReport{};   // I2-E: never a previous run's figures
@@ -3158,24 +3214,9 @@ GenotypeRunStatus run_genotype_body(const GenotypeCommandOptions& options, Genot
     if (seeding_profile_only && !options.diagnostic_union_only) {
         throw std::invalid_argument("the union seeding profile and census are union-only diagnostics (set diagnostic_union_only)");
     }
-    if (options.diagnostic_union_kernel_dump && any_ranked && indexed_union) {
-        // S2-C (DIAGNOSTIC ONLY): the union pass's exact inputs, for the progressive-kernel harness
-        std::string bin;
-        const auto put = [&](const auto& v) { bin.append(reinterpret_cast<const char*>(&v), sizeof v); };
-        const auto put_library = [&](const LibraryModel& l) {
-            put(l.insert_mean_bp); put(l.insert_sd_bp); put(l.support_sigmas); put(l.substitution_error);
-            put(l.outlier_weight); put(l.fragment_start_intensity); put(l.gap_open); put(l.gap_extend);
-            put(static_cast<std::uint64_t>(l.max_gap_bp));
-        };
-        bin.append("PVKI1\0\0\0", 8);
-        put(static_cast<std::uint64_t>(interned.sequences.size()));
-        for (std::size_t h = 0; h < interned.sequences.size(); ++h) {
-            put(static_cast<std::uint64_t>(interned.sequences[h].size()));
-            bin.append(interned.sequences[h]);
-            put(static_cast<std::uint64_t>(indexed_segments[h].size()));
-            for (const std::uint32_t x : indexed_segments[h]) put(x);
-        }
-        // a truth-free proposal score per sequence pair: the S2-A selection formula, maximised over its labellings
+    // S2-C/S2-D: a truth-free proposal score per sequence pair (the S2-A selection formula: proposal marker emissions plus
+    // the exact path prior, maximised over the pair's labellings) -- the progressive schedule's order and the kernel dump's
+    const auto pair_proposal_scores = [&]() {
         const std::vector<double> sw(model.blocks().size() - 1, options.switch_probability);
         std::map<std::vector<std::size_t>, double> path_prior;
         const auto prior_of = [&](const MosaicPath& path) {
@@ -3194,6 +3235,26 @@ GenotypeRunStatus run_genotype_body(const GenotypeCommandOptions& options, Genot
             double& slot = proposal[scored_index.at(sequence_pair(*candidate))];
             slot = std::max(slot, value);
         }
+        return proposal;
+    };
+    if (options.diagnostic_union_kernel_dump && any_ranked && indexed_union) {
+        // S2-C (DIAGNOSTIC ONLY): the union pass's exact inputs, for the progressive-kernel harness
+        std::string bin;
+        const auto put = [&](const auto& v) { bin.append(reinterpret_cast<const char*>(&v), sizeof v); };
+        const auto put_library = [&](const LibraryModel& l) {
+            put(l.insert_mean_bp); put(l.insert_sd_bp); put(l.support_sigmas); put(l.substitution_error);
+            put(l.outlier_weight); put(l.fragment_start_intensity); put(l.gap_open); put(l.gap_extend);
+            put(static_cast<std::uint64_t>(l.max_gap_bp));
+        };
+        bin.append("PVKI1\0\0\0", 8);
+        put(static_cast<std::uint64_t>(interned.sequences.size()));
+        for (std::size_t h = 0; h < interned.sequences.size(); ++h) {
+            put(static_cast<std::uint64_t>(interned.sequences[h].size()));
+            bin.append(interned.sequences[h]);
+            put(static_cast<std::uint64_t>(indexed_segments[h].size()));
+            for (const std::uint32_t x : indexed_segments[h]) put(x);
+        }
+        const std::vector<double> proposal = pair_proposal_scores();
         put(static_cast<std::uint64_t>(scored_pairs.size()));
         for (std::size_t i = 0; i < scored_pairs.size(); ++i) {
             const HaplotypeCandidate& c = scored_pairs[i];
@@ -3246,11 +3307,162 @@ GenotypeRunStatus run_genotype_body(const GenotypeCommandOptions& options, Genot
                 indexed_options.union_origin_cache_bytes = options.union_origin_cache_bytes;
                 indexed_options.max_union_cached_origins_consumed = options.max_union_cached_origins_consumed;
                 indexed_options.max_union_cached_states_consumed = options.max_union_cached_states_consumed;
+                if (!g_progressive.enabled) {
                 scored = score_diplotypes_indexed_union(interned, scored_pairs, fragments, library, indexed_options,
                                                         indexed_segments, options.indexed_union_store_bytes,
                                                         &candidate_report.indexed, &candidate_report.observed,
                                                         options.indexed_union_store_layout == "legacy_i2a",
                                                         options.indexed_union_evidence_layout == "fine_views_experimental");
+                } else {
+                    // ---- S2-D: the same union pass as a declared schedule on one selective batch (scheduling only)
+                    g_progressive.seconds_union_start = seconds_since(started);
+                    const std::vector<double> proposal = pair_proposal_scores();
+                    const auto pair_of_labels = [&](const std::vector<std::size_t>& a, const std::vector<std::size_t>& b) {
+                        std::size_t x = interned.index_of[slot_of_path.at(a)], y = interned.index_of[slot_of_path.at(b)];
+                        if (y < x) std::swap(x, y);
+                        return scored_index.at({x, y});
+                    };
+                    const auto pair_prior = [&](std::size_t p) {
+                        const HaplotypeCandidate& c = scored_pairs[p];
+                        return haploid_sequence_prior[c.first] + haploid_sequence_prior[c.second] +
+                               (c.first != c.second ? std::log(2.0) : 0.0);
+                    };
+                    std::vector<std::size_t> order(scored_pairs.size());
+                    std::iota(order.begin(), order.end(), 0);
+                    std::stable_sort(order.begin(), order.end(), [&](std::size_t a, std::size_t b) { return proposal[a] > proposal[b]; });
+                    const std::size_t first_pair = !g_incumbent.early_first.empty()
+                                                       ? pair_of_labels(g_incumbent.early_first, g_incumbent.early_second)
+                                                       : order.front();
+                    std::vector<std::vector<std::size_t>> stage_index(3);
+                    stage_index[0].push_back(first_pair);
+                    for (const std::size_t c : order) {
+                        if (c != first_pair && stage_index[1].size() < 31) stage_index[1].push_back(c);
+                    }
+                    {
+                        std::vector<char> placed(scored_pairs.size(), 0);
+                        for (std::size_t st = 0; st < 2; ++st) for (const std::size_t c : stage_index[st]) placed[c] = 1;
+                        for (std::size_t c = 0; c < scored_pairs.size(); ++c) if (!placed[c]) stage_index[2].push_back(c);
+                    }
+                    std::vector<std::vector<HaplotypeCandidate>> stages(3);
+                    for (std::size_t st = 0; st < 3; ++st) for (const std::size_t c : stage_index[st]) stages[st].push_back(scored_pairs[c]);
+                    std::vector<DiplotypeScore> pool_scores(scored_pairs.size());
+                    std::vector<std::vector<DiplotypeScore>> pool_audits;
+                    std::size_t stage_number = 0;
+                    const auto on_stage = [&](ProgressiveStageReport& rep, const FragmentScoringResult& r) {
+                        const FootprintSample fp = physical_footprint();
+                        rep.footprint_bytes = fp.current;
+                        rep.footprint_peak_bytes = fp.peak;
+                        const std::vector<std::size_t>& idx = stage_index[stage_number];
+                        if (pool_audits.size() != r.audit_scores.size()) {
+                            pool_audits.assign(r.audit_scores.size(), std::vector<DiplotypeScore>(scored_pairs.size()));
+                        }
+                        for (std::size_t i = 0; i < idx.size(); ++i) {
+                            pool_scores[idx[i]] = r.scores[i];
+                            for (std::size_t k = 0; k < r.audit_scores.size(); ++k) pool_audits[k][idx[i]] = r.audit_scores[k][i];
+                        }
+                        g_progressive.stages.push_back(rep);
+                        ++stage_number;
+                        if (stage_number != 2) return;
+                        // the 32-pair prefix checkpoint: its best fully evaluated sequence pair, with the prefix's numerical
+                        // ties and the pair's projection ambiguity over its labellings in the union
+                        std::vector<std::size_t> prefix = stage_index[0];
+                        prefix.insert(prefix.end(), stage_index[1].begin(), stage_index[1].end());
+                        std::vector<DiplotypeScore> ps;
+                        std::vector<double> pp;
+                        for (const std::size_t p : prefix) { ps.push_back(pool_scores[p]); pp.push_back(pair_prior(p)); }
+                        const CertifiedRanking ranking = certify_scored_ranking(ps, fragments.size(), scoring_options.mismatch_band,
+                                                                                FragmentScoringCounters{}, CertificationOptions{}, pp);
+                        const std::size_t best = prefix[ranking.candidates.front().candidate_id];
+                        g_progressive.prefix_pairs = prefix.size();
+                        g_progressive.prefix_tied_groups = ranking.winner_set.size();
+                        if (g_incumbent.enabled && !g_incumbent.failed) {
+                            const std::vector<double> sw(model.blocks().size() - 1, options.switch_probability);
+                            const MosaicCandidate* representative = nullptr;
+                            double representative_prior = -std::numeric_limits<double>::infinity();
+                            std::size_t labellings = 0, prefix_labellings = 0;
+                            std::vector<char> in_prefix(scored_pairs.size(), 0);
+                            for (const std::size_t p : prefix) in_prefix[p] = 1;
+                            std::vector<const MosaicCandidate*> members;
+                            for (const MosaicCandidate* c : scored_union) {
+                                const std::size_t p = scored_index.at(sequence_pair(*c));
+                                prefix_labellings += in_prefix[p];
+                                if (p != best) continue;
+                                ++labellings;
+                                members.push_back(c);
+                                const double pa = log_haploid_mosaic_prior(model.panel(), c->diplotype.first, sw);
+                                const double pb = log_haploid_mosaic_prior(model.panel(), c->diplotype.second, sw);
+                                const double path = pa + pb + (c->diplotype.first != c->diplotype.second ? std::log(2.0) : 0.0);
+                                if (representative == nullptr || path > representative_prior) { representative = c; representative_prior = path; }
+                            }
+                            bool ambiguous = false;
+                            for (const MosaicCandidate* c : members) {
+                                for (std::size_t b = 0; b < model.blocks().size(); ++b) {
+                                    if (std::minmax(c->diplotype.first.alleles[b], c->diplotype.second.alleles[b]) !=
+                                        std::minmax(representative->diplotype.first.alleles[b], representative->diplotype.second.alleles[b])) {
+                                        ambiguous = true;
+                                    }
+                                }
+                            }
+                            const double total = pool_scores[best].log_likelihood + pair_prior(best);
+                            g_incumbent.evaluated = std::max(g_incumbent.evaluated, prefix_labellings);
+                            if (!g_incumbent.have || total >= g_incumbent.total) {
+                                g_incumbent.have = true;
+                                g_incumbent.first = representative->diplotype.first.alleles;
+                                g_incumbent.second = representative->diplotype.second.alleles;
+                                g_incumbent.score = pool_scores[best];
+                                g_incumbent.sequence_prior = pair_prior(best);
+                                g_incumbent.total = total;
+                                g_incumbent.stage = "union_prefix_best";
+                                g_incumbent.tied_groups = std::to_string(ranking.winner_set.size());
+                                g_incumbent.projection_ambiguous = ambiguous ? "yes" : "no";
+                                g_incumbent.explored_labellings = std::to_string(labellings);
+                            }
+                            if (commit_checkpoint()) {
+                                g_progressive.prefix_committed = true;
+                                g_progressive.seconds_prefix_checkpoint = seconds_since(started);
+                            } else if (g_incumbent.failed) {
+                                throw std::runtime_error("the progressive prefix checkpoint could not be published (" +
+                                                         g_incumbent.failure + "); an explicit failure, never a fallback");
+                            }
+                        }
+                        if (options.test_interrupt_point == "after_prefix_checkpoint") {   // S2-D TEST HOOK
+                            stop_run("TIME_LIMIT", "test hook: right after the progressive 32-pair checkpoint", 124);
+                        }
+                    };
+                    const ProgressiveResult out = score_diplotypes_indexed_progressive(
+                        interned, stages, fragments, library, indexed_options, indexed_segments, options.indexed_union_store_bytes,
+                        options.indexed_union_evidence_layout == "fine_views_experimental", on_stage, false);
+                    candidate_report.indexed.index = out.index;
+                    candidate_report.indexed.batch = out.batch;
+                    candidate_report.indexed.seconds_index_build = out.seconds_index_build;
+                    candidate_report.indexed.seconds_preparation = out.seconds_preparation;
+                    candidate_report.indexed.store_budget_bytes = options.indexed_union_store_bytes;
+                    candidate_report.indexed.max_read_bp = 1;   // as the bulk adapter reports it
+                    for (const ReadPair& f : fragments) {
+                        candidate_report.indexed.max_read_bp =
+                            std::max({candidate_report.indexed.max_read_bp, f.first.bases.size(), f.second.bases.size()});
+                    }
+                    g_progressive.completed = out.completed;
+                    if (!out.completed) {
+                        g_progressive.refusal = out.refusal;
+                        FragmentScoringObservation& o = candidate_report.observed;
+                        o = FragmentScoringObservation{};
+                        o.counters = out.summary.counters;
+                        o.threads_used_placement = out.summary.threads_used_placement;
+                        o.threads_used_combination = out.summary.threads_used_combination;
+                        o.seconds_fragment_preparation = out.summary.seconds_fragment_preparation;
+                        o.seconds_placement_and_mass = out.summary.seconds_placement_and_mass;
+                        o.seconds_diploid_combination = out.summary.seconds_diploid_combination;
+                        o.union_origin_cache = out.summary.union_origin_cache;
+                        o.union_prefilter_cache = out.summary.union_prefilter_cache;
+                        o.start_sort = out.summary.start_sort;
+                        throw ResourceExhausted(out.refusal);   // the existing refusal path (the checkpoint stays)
+                    }
+                    FragmentScoringResult combined = out.summary;
+                    combined.scores = std::move(pool_scores);
+                    combined.audit_scores = std::move(pool_audits);
+                    scored = std::move(combined);
+                }
             } else {
                 scored = score_diplotypes(interned, scored_pairs, fragments, library, scoring_options,
                                           &candidate_report.observed);
@@ -3818,16 +4030,17 @@ GenotypeRunStatus run_genotype_body(const GenotypeCommandOptions& options, Genot
                 return haploid_sequence_prior[key.first] + haploid_sequence_prior[key.second] +
                        (key.first != key.second ? std::log(2.0) : 0.0);
             };
-            if (g_incumbent.have && g_incumbent.stage == "early_panel_incumbent") {
-                const auto key = sequence_key(g_incumbent.first, g_incumbent.second);
+            if (!g_incumbent.early_first.empty() && g_incumbent.union_check == "not_reached") {
+                // S2-D: against the stored early candidate (the incumbent may already be a later checkpoint)
+                const auto key = sequence_key(g_incumbent.early_first, g_incumbent.early_second);
                 const DiplotypeScore& u = scored.scores[scored_index.at(key)];
-                const DiplotypeScore& e = g_incumbent.score;
+                const DiplotypeScore& e = g_incumbent.early_score;
                 const auto bits = [](double a, double b) { return std::memcmp(&a, &b, sizeof(double)) == 0; };
                 const bool same = bits(u.log_likelihood, e.log_likelihood) && bits(u.fragment_term, e.fragment_term) &&
                                   bits(u.exposure_term, e.exposure_term) &&
                                   bits(u.absolute_term_sum, e.absolute_term_sum) &&
                                   u.fragments_with_mass == e.fragments_with_mass &&
-                                  bits(union_prior(key), g_incumbent.sequence_prior);
+                                  bits(union_prior(key), g_incumbent.early_prior);
                 g_incumbent.union_check = same ? "reproduced" : "MISMATCH";
                 if (!same) {
                     g_incumbent.failed = true;

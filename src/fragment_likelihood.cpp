@@ -1748,7 +1748,7 @@ void reset_emission_handoff_report() {
 
 // I2-K: ends the cache as end_emission_cache does, moving its storage into `out` (replacing anything it held).
 void detach_emission_cache(EmissionCacheHandoff& out, const LibraryModel& library, std::size_t band,
-                           GapRecursionBackend backend) {
+                           GapRecursionBackend backend, bool record = true) {
     auto contents = std::make_unique<EmissionCacheHandoff::Contents>();
     contents->budgeted_bytes = emission_cache().budgeted_bytes_used.load(std::memory_order_relaxed);
     (void)finish_emission_cache(contents.get());
@@ -1764,7 +1764,7 @@ void detach_emission_cache(EmissionCacheHandoff& out, const LibraryModel& librar
     contents->max_gap_bp = library.max_gap_bp;
     contents->band = band;
     contents->backend = backend;
-    {
+    if (record) {
         const std::lock_guard<std::mutex> lock(handoff_report_mutex());
         EmissionHandoffReport& r = handoff_report_slot();
         r.detached = true;
@@ -1776,26 +1776,27 @@ void detach_emission_cache(EmissionCacheHandoff& out, const LibraryModel& librar
 }
 
 // I2-K: called right after begin_emission_cache by the adopting context. Consumes the handoff whatever happens.
-void adopt_emission_cache(EmissionCacheHandoff* handoff, const LibraryModel& library, std::size_t band,
-                          GapRecursionBackend backend, std::size_t budget_bytes) {
-    if (handoff == nullptr) return;
+std::string adopt_emission_cache(EmissionCacheHandoff* handoff, const LibraryModel& library, std::size_t band,
+                                 GapRecursionBackend backend, std::size_t budget_bytes, bool record = true) {
+    if (handoff == nullptr) return "not_offered";
     std::unique_ptr<EmissionCacheHandoff::Contents> c = std::move(handoff->contents);
     const std::lock_guard<std::mutex> lock(handoff_report_mutex());
-    EmissionHandoffReport& r = handoff_report_slot();
+    EmissionHandoffReport scratch;   // S2-D: a batch-owned adoption leaves the process-wide I2-K record untouched
+    EmissionHandoffReport& r = record ? handoff_report_slot() : scratch;
     if (!c) {   // nothing to adopt; a context created after an adoption leaves that record as it is
         if (!r.offered) r.refusal = "not_offered";
-        return;
+        return "not_offered";
     }
     r.offered = true;
     if (!same_double_bits(c->substitution_error, library.substitution_error) || !same_double_bits(c->gap_open, library.gap_open) ||
         !same_double_bits(c->gap_extend, library.gap_extend) || c->max_gap_bp != library.max_gap_bp || c->band != band ||
         c->backend != backend) {
         r.refusal = "context";
-        return;   // the contents are freed here; the adaptive search computes as without a handoff
+        return r.refusal;   // the contents are freed here; the adaptive search computes as without a handoff
     }
     EmissionCache& cache = emission_cache();
-    if (budget_bytes == 0 || !cache.active.load(std::memory_order_relaxed)) { r.refusal = "cache_disabled"; return; }
-    if (c->budgeted_bytes > budget_bytes) { r.refusal = "budget"; return; }
+    if (budget_bytes == 0 || !cache.active.load(std::memory_order_relaxed)) { r.refusal = "cache_disabled"; return r.refusal; }
+    if (c->budgeted_bytes > budget_bytes) { r.refusal = "budget"; return r.refusal; }
     for (std::size_t i = 0; i < kCacheShards; ++i) {
         CacheShard& shard = cache.shards[i];
         auto& from = c->shards[i];
@@ -1814,6 +1815,7 @@ void adopt_emission_cache(EmissionCacheHandoff* handoff, const LibraryModel& lib
     cache.inherited_hits.store(0, std::memory_order_relaxed);
     r.adopted = true;
     r.refusal = "none";
+    return r.refusal;
 }
 
 EmissionCacheCounters end_emission_cache() { return finish_emission_cache(nullptr); }
@@ -7909,7 +7911,7 @@ PreparedScoringContext::PreparedScoringContext(std::vector<ReadPair> fragments,
     scoring_detail::emission_cache_pinned().store(false, std::memory_order_relaxed);
     begin_emission_cache(state_->options.emission_cache_bytes);
     // I2-K (experimental): the union pass's emission results, under an exactly compatible context only
-    adopt_emission_cache(state_->options.emission_handoff_in, state_->library, state_->options.mismatch_band,
+    (void)adopt_emission_cache(state_->options.emission_handoff_in, state_->library, state_->options.mismatch_band,
                          state_->options.gap_recursion_backend, state_->options.emission_cache_bytes);
     state_->options.emission_handoff_in = nullptr;
     scoring_detail::emission_cache_pinned().store(true, std::memory_order_relaxed);
@@ -10481,6 +10483,14 @@ struct ContentIndexBatch::State {
     std::uint64_t selective_origins = 0, selective_placements_consumed = 0, selective_origins_consumed = 0,
                   selective_states_consumed = 0;
     FragmentScoringCounters selective_score_counters;   // executed pairing and aggregate work, summed over calls
+    // S2-D (EXPERIMENTAL): bounded emission reuse across the selective discovery calls of this batch. Between calls the
+    // cache is detached into `carried` (owned here, destroyed with the batch -- never shared across samples); each call
+    // adopts it, under the same byte budget, only if the library, band and recursion backend match (the existing
+    // handoff's identity check; keys carry the read and window bytes). poisoned: a refused or failed selective call
+    // ends the batch -- no later call may continue on incomplete evidence.
+    bool persistent_emissions = false;
+    EmissionCacheHandoff carried;
+    bool poisoned = false;
     bool reserve_store(std::uint64_t bytes, bool enforce) {
         std::uint64_t cur = store_live.load(std::memory_order_relaxed);
         for (;;) {
@@ -10617,13 +10627,32 @@ void ContentIndexBatch::discover() {
     if (state_->selective) throw std::logic_error("content index: bulk discovery on a selective batch");
     discover_impl(nullptr);
 }
+void ContentIndexBatch::set_persistent_emission_cache(bool on) {
+    if (on && state_->options.emission_handoff_out != nullptr) {
+        throw std::invalid_argument("content index: persistent emissions and the adaptive emission handoff are exclusive");
+    }
+    state_->persistent_emissions = on;
+    state_->report.persistent_emission_status = on ? "on" : "off";
+}
+void ContentIndexBatch::release_carried_emissions() {
+    state_->report.persistent_carried_bytes = 0;
+    state_->report.persistent_carried_entries = 0;
+    state_->carried.clear();
+}
 void ContentIndexBatch::discover_for(const std::vector<std::size_t>& slots) {
     State& st = *state_;
+    if (st.poisoned) throw std::logic_error("content index: a refused or failed selective batch cannot continue");
     if (!st.selective && st.evaluated != 0) throw std::logic_error("content index: selective discovery on a bulk batch");
     if (st.one_shot) throw std::invalid_argument("content index: selective discovery needs a batch that is not one-shot");
     if (!st.exact_store) throw std::invalid_argument("content index: selective discovery needs the exact store layout");
     st.selective = true;
-    discover_impl(&slots);
+    try {
+        discover_impl(&slots);
+    } catch (...) {
+        st.poisoned = true;   // S2-D: incomplete evidence never feeds a later call
+        st.carried.clear();
+        throw;
+    }
 }
 std::size_t ContentIndexBatch::units_discovered() const {
     std::size_t n = 0;
@@ -10709,6 +10738,21 @@ void ContentIndexBatch::discover_impl(const std::vector<std::size_t>* slots) {
         }
     };
     begin_emission_cache(st.options.emission_cache_bytes);
+    // S2-D: whatever happens below, the process-global cache is never left armed after this call (an exception between
+    // here and the explicit end/detach ends it here, discarding its contents)
+    struct CacheGuard {
+        bool open = true;
+        ~CacheGuard() {
+            if (open) (void)end_emission_cache();
+        }
+    } cache_guard;
+    const bool persist = slots != nullptr && st.persistent_emissions;
+    if (persist && st.carried.holds()) {
+        const std::string verdict = adopt_emission_cache(&st.carried, st.library, st.options.mismatch_band,
+                                                         st.options.gap_recursion_backend, st.options.emission_cache_bytes, false);
+        if (verdict == "none") ++st.report.persistent_adoptions;
+        else ++st.report.persistent_adoption_refusals;
+    }
     PlacementBudget budget;
     budget.max_piece_hits = st.options.max_piece_hits;
     budget.max_physical_origins = st.options.max_physical_origins;
@@ -10809,7 +10853,14 @@ void ContentIndexBatch::discover_impl(const std::vector<std::size_t>* slots) {
             }
             r.emission_cache_budgeted_bytes = held.budgeted_bytes_used.load(std::memory_order_relaxed);
         }
-        if (st.options.emission_handoff_out != nullptr) {   // I2-K (experimental): kept for the adaptive search
+        st.report.persistent_inherited_hits += emission_cache().inherited_hits.load(std::memory_order_relaxed);   // S2-D
+        cache_guard.open = false;
+        const bool failed = std::any_of(failures.begin(), failures.end(), [](const std::exception_ptr& f) { return static_cast<bool>(f); });
+        if (persist && !failed) {   // S2-D: carried to the batch's next selective discovery (same budget, same identity)
+            detach_emission_cache(st.carried, st.library, st.options.mismatch_band, st.options.gap_recursion_backend, false);
+            st.report.persistent_carried_bytes = st.carried.allocated_bytes();
+            st.report.persistent_carried_entries = st.carried.entries();
+        } else if (st.options.emission_handoff_out != nullptr) {   // I2-K (experimental): kept for the adaptive search
             detach_emission_cache(*st.options.emission_handoff_out, st.library, st.options.mismatch_band,
                                   st.options.gap_recursion_backend);
         } else {
@@ -11020,7 +11071,31 @@ FragmentScoringResult ContentIndexBatch::score(const std::vector<HaplotypeCandid
 }
 FragmentScoringResult ContentIndexBatch::score_selected(const std::vector<HaplotypeCandidate>& candidates) {
     if (!state_->selective) throw std::logic_error("content index: score_selected() before any selective discovery");
-    return score_impl(candidates, true);
+    if (state_->poisoned) throw std::logic_error("content index: a refused or failed selective batch cannot continue");
+    {   // preconditions, checked before any work: a violated one changes nothing and does not poison the batch
+        const ContentPlacementIndex::State& ix = *state_->index->state_;
+        for (const HaplotypeCandidate& c : candidates) {
+            for (const std::size_t h : {c.first, c.second}) {
+                if (h >= ix.lengths.size()) throw std::invalid_argument("content index: candidate names an unknown slot");
+                if (h < state_->completed.size() && state_->completed[h]) continue;
+                for (int strand = 0; strand < 2; ++strand) {
+                    for (const IndexOccurrence& occ : ix.occurrences[strand][h]) {
+                        if (occ.unit >= state_->unit_done.size() || !state_->unit_done[occ.unit]) {
+                            throw std::logic_error("content index: a requested slot needs evidence not yet discovered; an "
+                                                   "incomplete column is never scored");
+                        }
+                    }
+                }
+            }
+        }
+    }
+    try {
+        return score_impl(candidates, true);
+    } catch (...) {
+        state_->poisoned = true;
+        state_->carried.clear();
+        throw;
+    }
 }
 FragmentScoringResult ContentIndexBatch::score_impl(const std::vector<HaplotypeCandidate>& candidates, bool selective) {
     State& st = *state_;
@@ -11790,7 +11865,8 @@ ProgressiveResult score_diplotypes_indexed_progressive(const InternedHaplotypes&
                                                        const FragmentScoringOptions& options,
                                                        const std::vector<std::vector<std::uint32_t>>& segments,
                                                        std::size_t store_budget_bytes, bool fine_views,
-                                                       const std::function<void(ProgressiveStageReport&)>& on_stage) {
+                                                       const std::function<void(ProgressiveStageReport&, const FragmentScoringResult&)>& on_stage,
+                                                       bool persistent_emissions) {
     using Clock = std::chrono::steady_clock;
     const auto since = [](Clock::time_point mark) { return std::chrono::duration<double>(Clock::now() - mark).count(); };
     // the bulk adapter's validation, unchanged
@@ -11839,6 +11915,15 @@ ProgressiveResult score_diplotypes_indexed_progressive(const InternedHaplotypes&
     }
     batch.set_placement_store_budget(store_budget_bytes);
     batch.set_fine_views(fine_views);
+    batch.set_persistent_emission_cache(persistent_emissions);   // S2-D (off: S2-C's per-call cache)
+    {
+        StartSortTally& tally = start_sort_tally();
+        tally.out_of_place.store(0);
+        tally.in_place.store(0);
+        tally.fallbacks.store(0);
+        tally.peak_worker_bytes.store(0);
+    }
+    double seconds_combination = 0.0, seconds_placement = 0.0;
     try {
         for (const auto& stage : stages) {
             ProgressiveStageReport rep;
@@ -11882,18 +11967,51 @@ ProgressiveResult score_diplotypes_indexed_progressive(const InternedHaplotypes&
             rep.retained_column_bytes = after.retained_column_bytes;
             rep.origin_held_bytes = after.origin_held_bytes;
             rep.worker_scratch_bytes = after.worker_scratch_bytes;
+            rep.dp_cache_hits = after.emission_cache.dp_cache_hits - before.emission_cache.dp_cache_hits;
+            rep.dp_cache_misses = after.emission_cache.dp_cache_misses - before.emission_cache.dp_cache_misses;
+            rep.carried_hits = after.persistent_inherited_hits - before.persistent_inherited_hits;
+            rep.carried_bytes = after.persistent_carried_bytes;
+            rep.carried_entries = after.persistent_carried_entries;
+            rep.candidate_fragment_evaluations = r.candidate_fragment_evaluations;
             // footprint_* are left to the caller's on_stage hook (this layer does not sample process memory)
             rep.seconds_since_start = since(started);
-            if (on_stage) on_stage(rep);
+            seconds_combination += r.seconds_diploid_combination;
+            seconds_placement += rep.seconds_discovery + rep.seconds_scoring - r.seconds_diploid_combination;
+            out.summary.candidate_fragment_evaluations += r.candidate_fragment_evaluations;
+            out.summary.threads_used_combination = std::max(out.summary.threads_used_combination, r.threads_used_combination);
+            if (on_stage) on_stage(rep, r);
             out.scores.push_back(std::move(r.scores));
+            out.audit_scores.push_back(std::move(r.audit_scores));
             out.stages.push_back(rep);
         }
         out.completed = true;
     } catch (const ResourceExhausted& error) {
         out.refusal = error.what();   // the completed stages keep their scores; nothing partial is scored
     }
+    batch.release_carried_emissions();   // S2-D: the carried cache ends with the schedule
     out.index = index.report();
     out.batch = batch.report();
+    const ContentBatchReport& b = out.batch;
+    FragmentScoringResult& sum = out.summary;
+    sum.counters = b.counters_last;
+    sum.unique_haplotypes = unique;
+    sum.union_origin_cache = indexed_origin_report(b, options);
+    sum.union_prefilter_cache = b.prefilter;
+    {
+        const StartSortTally& tally = start_sort_tally();
+        sum.start_sort.budget_bytes = options.start_sort_scratch_bytes;
+        sum.start_sort.workers = std::max<std::size_t>(1, options.threads);
+        sum.start_sort.share_bytes = options.start_sort_scratch_bytes / sum.start_sort.workers;
+        sum.start_sort.out_of_place = tally.out_of_place.load();
+        sum.start_sort.in_place = tally.in_place.load();
+        sum.start_sort.fallbacks = tally.fallbacks.load();
+        sum.start_sort.peak_worker_bytes = tally.peak_worker_bytes.load();
+    }
+    sum.emission_cache = b.emission_cache;
+    sum.seconds_fragment_preparation = out.seconds_preparation;
+    sum.seconds_placement_and_mass = out.seconds_index_build + seconds_placement;
+    sum.seconds_diploid_combination = seconds_combination;
+    sum.threads_used_placement = std::max<std::size_t>(1, std::max(b.threads_used_discovery, b.threads_used_pairing));
     return out;
 }
 
