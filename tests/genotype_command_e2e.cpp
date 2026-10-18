@@ -5321,7 +5321,8 @@ void test_refinement_diagnostics() {
         }
         return o;
     };
-    const std::set<std::string> diagnostics = {"call.refinement_memory_live.tsv", "call.refinement_replay_inputs.tsv"};
+    const std::set<std::string> diagnostics = {"call.refinement_memory_live.tsv", "call.refinement_replay_inputs.tsv",
+                                               "call.refinement_seed_report.tsv"};
     // (1) instrumentation leaves every output and the trajectory unchanged
     require(panvar::execute_genotype_command(fresh("rd_off", false), nullptr) == 0, "S2-H: the plain run completes");
     require(panvar::execute_genotype_command(fresh("rd_on", true), nullptr) == 0, "S2-H: the instrumented run completes");
@@ -5367,6 +5368,36 @@ void test_refinement_diagnostics() {
                                   "flattened_mass_matrix_built", "after_promotion", "after_release", "round_committed"}) {
             require(points.count(point) == 1, std::string("S2-H: live point recorded in round 1: ") + point);
         }
+        // S2-I: the allocator column (a number on macOS, "unavailable" elsewhere), the partition accounts and the seed report
+        const auto live = read_rows(path("rd_on/call.refinement_memory_live.tsv"));
+        std::ifstream header_in(path("rd_on/call.refinement_memory_live.tsv"));
+        std::string header;
+        std::getline(header_in, header);
+        std::vector<std::string> names;
+        std::stringstream hs(header);
+        for (std::string cell; std::getline(hs, cell, '\t');) names.push_back(cell);
+        const auto column = [&](const std::string& name) {
+            const auto it = std::find(names.begin(), names.end(), name);
+            require(it != names.end(), "S2-I: live column " + name);
+            return static_cast<std::size_t>(it - names.begin());
+        };
+        const std::size_t in_use = column("allocator_in_use"), extended = column("capacity_total_extended");
+        (void)column("partition_scratch_capacity");
+        (void)column("partition_piece_index_capacity");
+        for (const auto& row : live) {
+            require(row.size() == names.size(), "S2-I: every live row has every column");
+#if defined(__APPLE__)
+            require(row[in_use] != "unavailable" && std::stoull(row[in_use]) > 0, "S2-I: the allocator reports its in-use bytes");
+#else
+            require(row[in_use] == "unavailable", "S2-I: an unsupported platform reports unavailable");
+#endif
+            require(std::stoull(row[extended]) >= std::stoull(row[column("capacity_total")]), "S2-I: the extended total contains the S2-H total");
+        }
+        const auto seed = sf::kv(path("rd_on/call.refinement_seed_report.tsv"));
+        require(seed.at("schema") == "refinement_seed_report_v1" && seed.at("haplotypes_offered") == "2" &&
+                    seed.count("placement_capacity_bytes_peak") == 1 && seed.count("proposed_starts_capacity_bytes_peak") == 1 &&
+                    seed.at("note").find("not simultaneously live") != std::string::npos,
+                "S2-I: the seed placement's batch report is recorded with its peak semantics");
     }
     // (2) the live file survives a stop inside the first round (after the seed census, before any neighbour)
     {
@@ -5383,7 +5414,8 @@ void test_refinement_diagnostics() {
         std::set<std::string> points;
         for (const auto& row : read_rows(path("rd_stop/call.refinement_memory_live.tsv"))) points.insert(row[1]);
         require(points.count("after_census_retention") == 1 && points.count("before_neighbourhood_construction") == 0 &&
-                    points.count("round_committed") == 0 && exists(path("rd_stop/call.refinement_replay_inputs.tsv")),
+                    points.count("round_committed") == 0 && exists(path("rd_stop/call.refinement_replay_inputs.tsv")) &&
+                    exists(path("rd_stop/call.refinement_seed_report.tsv")),
                 "S2-H: the live rows up to the stop survive it; nothing after the stop is recorded");
     }
     // (3) the first-round replay, in a separate process, reproduces the anchor and the full run's first round

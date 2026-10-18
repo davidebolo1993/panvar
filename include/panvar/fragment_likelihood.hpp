@@ -1716,6 +1716,16 @@ struct ContextMemoryAccount {
     std::uint64_t last_scoring_result_bytes = 0; // flattened matrix of the latest score_candidates
     std::uint64_t logical_total = 0;
     std::uint64_t capacity_total = 0;
+    // S2-I: the enumeration workers' storage outside the totals above -- each partition's ordinary WindowScratch
+    // (rows, starts, groups, accumulators, origins, offsets; its fine store is already in window_scratch_capacity and is
+    // not counted again) and its forward/reverse PieceIndex vectors. Size = elements in use, capacity = allocated. The
+    // extended total adds the two capacities to capacity_total (which keeps its S2-H definition).
+    std::uint64_t partition_scratch_bytes = 0;
+    std::uint64_t partition_scratch_capacity = 0;
+    std::uint64_t partition_piece_index_bytes = 0;
+    std::uint64_t partition_piece_index_capacity = 0;
+    std::uint64_t partitions = 0;
+    std::uint64_t capacity_total_extended = 0;
 };
 
 class PreparedScoringContext {
@@ -1819,6 +1829,9 @@ public:
     // state released with the incumbent, not retained across rounds.
     std::uint64_t merge_working_bytes() const;
     ContextMemoryAccount memory_account() const;
+    // S2-I TEST ONLY: an independent recount of the partition storage memory_account adds (scratch capacity without the
+    // fine stores, piece-index capacity), written apart from it, for the gates.
+    std::pair<std::uint64_t, std::uint64_t> recount_partition_storage_for_testing() const;
     // S2-H DIAGNOSTIC: called from add_repaired_haplotypes' own thread at its safe points (windows planned, origin cache
     // planned, a few neighbour-materialisation progress points, done) with (point, requests done, requests total). It
     // must not mutate the context. Measurement only; empty by default.

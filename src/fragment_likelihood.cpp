@@ -9040,7 +9040,69 @@ ContextMemoryAccount PreparedScoringContext::memory_account() const {
                        a.merge_working_capacity + a.window_scratch_capacity +
                        a.origin_scratch_capacity + a.emission_cache_table + a.emission_cache_arena +
                        a.prepared_capacity + a.last_scoring_result_bytes;
+    // S2-I: the partitions' ordinary scratch (fine stores excluded: counted above) and piece indexes
+    a.partitions = state.partitions.size();
+    a.partition_piece_index_capacity = static_cast<std::uint64_t>(state.partitions.capacity()) * sizeof(state.partitions[0]);
+    for (const auto& p : state.partitions) {
+        const WindowScratch& w = p.scratch;
+        std::uint64_t used = 0, cap = 0;
+        cap += static_cast<std::uint64_t>(w.forward_rows.capacity() + w.reverse_rows.capacity()) * sizeof(std::vector<FormPlacement>);
+        used += static_cast<std::uint64_t>(w.forward_rows.size() + w.reverse_rows.size()) * sizeof(std::vector<FormPlacement>);
+        for (const auto& row : w.forward_rows) { cap += row.capacity() * sizeof(FormPlacement); used += row.size() * sizeof(FormPlacement); }
+        for (const auto& row : w.reverse_rows) { cap += row.capacity() * sizeof(FormPlacement); used += row.size() * sizeof(FormPlacement); }
+        cap += static_cast<std::uint64_t>(w.touched_forward.capacity() + w.touched_reverse.capacity()) * sizeof(std::uint32_t) +
+               static_cast<std::uint64_t>(w.proposed.capacity()) * sizeof(std::pair<std::uint32_t, std::uint32_t>) +
+               static_cast<std::uint64_t>(w.group_begin.capacity() + w.group_end.capacity() + w.offsets.capacity()) * sizeof(std::size_t) +
+               static_cast<std::uint64_t>(w.accumulators.capacity()) * sizeof(OriginAccumulator) + w.accepted.capacity() +
+               static_cast<std::uint64_t>(w.origins.capacity()) * sizeof(HaploidOrigin);
+        used += static_cast<std::uint64_t>(w.touched_forward.size() + w.touched_reverse.size()) * sizeof(std::uint32_t) +
+                static_cast<std::uint64_t>(w.proposed.size()) * sizeof(std::pair<std::uint32_t, std::uint32_t>) +
+                static_cast<std::uint64_t>(w.group_begin.size() + w.group_end.size() + w.offsets.size()) * sizeof(std::size_t) +
+                static_cast<std::uint64_t>(w.accumulators.size()) * sizeof(OriginAccumulator) + w.accepted.size() +
+                static_cast<std::uint64_t>(w.origins.size()) * sizeof(HaploidOrigin);
+        a.partition_scratch_capacity += cap;
+        a.partition_scratch_bytes += used;
+        for (const std::vector<PieceIndex>* side : {&p.forward, &p.reverse}) {
+            a.partition_piece_index_capacity += static_cast<std::uint64_t>(side->capacity()) * sizeof(PieceIndex);
+            a.partition_piece_index_bytes += static_cast<std::uint64_t>(side->size()) * sizeof(PieceIndex);
+            for (const PieceIndex& index : *side) {
+                a.partition_piece_index_capacity += index.entries.capacity() * sizeof(PieceEntry);
+                a.partition_piece_index_bytes += index.entries.size() * sizeof(PieceEntry);
+            }
+        }
+    }
+    a.capacity_total_extended = a.capacity_total + a.partition_scratch_capacity + a.partition_piece_index_capacity;
     return a;
+}
+
+std::pair<std::uint64_t, std::uint64_t> PreparedScoringContext::recount_partition_storage_for_testing() const {
+    // Written apart from memory_account: every vector's allocation is visited through one generic adder.
+    std::uint64_t scratch = 0, indexes = state_->partitions.capacity() * sizeof(state_->partitions.front());
+    const auto add = [](std::uint64_t& total, const auto& v) {
+        total += static_cast<std::uint64_t>(v.capacity()) * sizeof(typename std::decay_t<decltype(v)>::value_type);
+    };
+    for (std::size_t i = 0; i < state_->partitions.size(); ++i) {
+        const auto& part = state_->partitions[i];
+        const WindowScratch& w = part.scratch;
+        add(scratch, w.forward_rows);
+        add(scratch, w.reverse_rows);
+        for (std::size_t r = 0; r < w.forward_rows.size(); ++r) add(scratch, w.forward_rows[r]);
+        for (std::size_t r = 0; r < w.reverse_rows.size(); ++r) add(scratch, w.reverse_rows[r]);
+        add(scratch, w.touched_forward);
+        add(scratch, w.touched_reverse);
+        add(scratch, w.proposed);
+        add(scratch, w.group_begin);
+        add(scratch, w.group_end);
+        add(scratch, w.offsets);
+        add(scratch, w.accumulators);
+        add(scratch, w.accepted);
+        add(scratch, w.origins);
+        add(indexes, part.forward);
+        add(indexes, part.reverse);
+        for (std::size_t k = 0; k < part.forward.size(); ++k) add(indexes, part.forward[k].entries);
+        for (std::size_t k = 0; k < part.reverse.size(); ++k) add(indexes, part.reverse[k].entries);
+    }
+    return {scratch, indexes};
 }
 
 void set_origin_cache_self_check(bool enabled) {

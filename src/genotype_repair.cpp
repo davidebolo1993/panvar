@@ -47,6 +47,16 @@ std::uint64_t current_rss_bytes() {
 #endif
 }
 
+std::optional<std::uint64_t> allocator_bytes_in_use() {
+#if defined(__APPLE__)
+    malloc_statistics_t stats{};
+    malloc_zone_statistics(nullptr, &stats);
+    return static_cast<std::uint64_t>(stats.size_in_use);
+#else
+    return std::nullopt;
+#endif
+}
+
 std::uint64_t release_free_pages() {
 #if defined(__APPLE__)
     return static_cast<std::uint64_t>(malloc_zone_pressure_relief(nullptr, 0));
@@ -458,7 +468,9 @@ void CoordinateRepairSearch::live_probe(std::size_t round, const char* point, st
                "origin_scratch\temission_table\temission_arena\temission_entries\temission_entry_metadata\t"
                "emission_content_arena\tprepared\tlast_scoring_result\tlogical_total\tcapacity_total\t"
                "footprint_minus_capacity\thaplotypes_created\tunique_haplotypes\tcum_physical_origins\tcum_state_classes\t"
-               "cum_piece_hits\n";
+               "cum_piece_hits\tallocator_in_use\tpartitions\tpartition_scratch_bytes\tpartition_scratch_capacity\t"
+               "partition_piece_index_bytes\tpartition_piece_index_capacity\tcapacity_total_extended\t"
+               "footprint_minus_capacity_extended\n";
         live_header_written_ = true;
     }
     const ContextMemoryAccount a = context->memory_account();
@@ -477,7 +489,38 @@ void CoordinateRepairSearch::live_probe(std::size_t round, const char* point, st
         << a.last_scoring_result_bytes << '\t' << a.logical_total << '\t' << a.capacity_total << '\t'
         << (static_cast<std::int64_t>(fp.current) - static_cast<std::int64_t>(a.capacity_total)) << '\t'
         << context->haplotypes_created() << '\t' << context->unique_haplotypes() << '\t' << cum.physical_origins << '\t'
-        << cum.statistical_state_classes << '\t' << cum.piece_hits << '\n';
+        << cum.statistical_state_classes << '\t' << cum.piece_hits << '\t';
+    // S2-I: the allocator's own in-use total (a different quantity from the footprint), and the workers' storage
+    const std::optional<std::uint64_t> in_use = allocator_bytes_in_use();
+    out << (in_use ? std::to_string(*in_use) : std::string("unavailable")) << '\t' << a.partitions << '\t'
+        << a.partition_scratch_bytes << '\t' << a.partition_scratch_capacity << '\t' << a.partition_piece_index_bytes << '\t'
+        << a.partition_piece_index_capacity << '\t' << a.capacity_total_extended << '\t'
+        << (static_cast<std::int64_t>(fp.current) - static_cast<std::int64_t>(a.capacity_total_extended)) << '\n';
+}
+
+void CoordinateRepairSearch::write_seed_report(const IncrementalBatchReport& r) {
+    std::string file = options_.memory_live_path;
+    const std::string live = "refinement_memory_live.tsv";
+    if (file.size() >= live.size() && file.compare(file.size() - live.size(), live.size(), live) == 0) {
+        file.replace(file.size() - live.size(), live.size(), "refinement_seed_report.tsv");
+    } else {
+        file += ".seed_report.tsv";
+    }
+    const ScorerMemoryAccounts& m = r.memory;
+    std::ofstream out(file, std::ios::trunc);
+    out << "key\tvalue\nschema\trefinement_seed_report_v1\nnote\tDIAGNOSTIC ONLY: the seed placement's own batch report "
+           "(add_haplotypes). The *_peak values are per-worker transient peaks summed over workers at each worker's own peak: "
+           "not simultaneously live, never part of a live total\n"
+        << "haplotypes_offered\t" << r.haplotypes_offered << "\nhaplotypes_new\t" << r.haplotypes_new << "\nthreads_used_placement\t"
+        << r.threads_used_placement << "\nseconds_placement_and_mass\t" << r.seconds_placement_and_mass
+        << "\nmass_matrix_bytes\t" << m.mass_matrix_bytes << "\nhaplotype_sequence_bytes\t" << m.haplotype_sequence_bytes
+        << "\nform_sequence_bytes\t" << m.form_sequence_bytes << "\npiece_index_bytes\t" << m.piece_index_bytes
+        << "\nemission_cache_table_bytes\t" << m.emission_cache_table_bytes << "\nemission_cache_arena_bytes\t"
+        << m.emission_cache_arena_bytes << "\nplacement_rows_peak\t" << m.placement_rows_peak
+        << "\nplacement_capacity_bytes_peak\t" << m.placement_capacity_bytes_peak << "\nproposed_starts_peak\t"
+        << m.proposed_starts_peak << "\nproposed_starts_capacity_bytes_peak\t" << m.proposed_starts_capacity_bytes_peak
+        << "\nphysical_origins\t" << r.counters.physical_origins << "\nstatistical_state_classes\t"
+        << r.counters.statistical_state_classes << "\nemission_entries\t" << r.emission_cache.entries << '\n';
 }
 
 bool CoordinateRepairSearch::run(const RepairHooks& hooks) {
@@ -546,9 +589,12 @@ bool CoordinateRepairSearch::run(const RepairHooks& hooks) {
             const std::uint64_t seeding_before = context->cumulative_counters().physical_origins;
             live_probe(round, "before_seed_placement");
             // I2-D: fused, the censuses come from the same pass and the retain_census calls below place nothing
+            IncrementalBatchReport seed_report;   // S2-I: an output-only report, captured only for the diagnostic
             const std::vector<std::size_t> seeded =
-                context->add_haplotypes({incumbent_a.bases, incumbent_b.bases}, nullptr, false, options_.fused_seed);
+                context->add_haplotypes({incumbent_a.bases, incumbent_b.bases},
+                                        options_.memory_live_path.empty() ? nullptr : &seed_report, false, options_.fused_seed);
             live_probe(round, "after_seed_placement");
+            if (!options_.memory_live_path.empty()) write_seed_report(seed_report);
             if (hooks.on_checkpoint) hooks.on_checkpoint("initial_incumbent_placed");
             inc_slot_a_ = seeded.front();
             inc_slot_b_ = seeded.back();

@@ -398,6 +398,9 @@ if(PANVAR_BUILD_TESTING)
         target_link_libraries(genotype_block_delta_test PRIVATE panvarlib)
         target_compile_options(genotype_block_delta_test PRIVATE -Wall -Wextra -Wpedantic)
         add_test(NAME panvar_genotype_block_delta COMMAND genotype_block_delta_test)
+        # S2-I: the partition-storage account checks alone
+        add_test(NAME panvar_genotype_partition_accounts COMMAND genotype_block_delta_test)
+        set_tests_properties(panvar_genotype_partition_accounts PROPERTIES ENVIRONMENT "PANVAR_BLOCK_DELTA_ONLY=partition_accounts")
         # Exact union placement reuse: bit-identical to the reference scorer under every segmentation,
         # budget, cap, thread count and order.
         add_executable(genotype_union_placement_cache_test tests/genotype_union_placement_cache.cpp)

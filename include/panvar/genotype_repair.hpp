@@ -14,6 +14,7 @@
 #include <memory>
 #include <map>
 #include <set>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -35,6 +36,10 @@ std::uint64_t current_rss_bytes();
 double peak_rss_gib();
 // DIAGNOSTIC ONLY: asks the allocator to return free pages and reports what it released.
 std::uint64_t release_free_pages();
+// I4-G (ported in S2-I, read-only): the allocator's own live-allocation total (macOS: malloc_zone_statistics over every
+// zone, size_in_use); empty where unsupported -- reported as unavailable, never estimated. It covers malloc'd bytes only,
+// a different quantity from the physical footprint: their difference is not a count of free pages.
+std::optional<std::uint64_t> allocator_bytes_in_use();
 // Whole-file replacement by rename, so a reader -- or a run killed mid-write -- only ever sees the
 // previous complete version or the new complete version, never a torn one.
 void atomic_write(const std::string& path, const std::string& content);
@@ -286,6 +291,8 @@ private:
     void snapshot(const char* kind, std::size_t index, const char* point, bool result_alive, bool relieve);
     // S2-H: one live diagnostic row (memory_live_path), from a safe execution point only
     void live_probe(std::size_t round, const char* point, std::size_t done = 0, std::size_t total = 0);
+    // S2-I: the seed placement's own batch report (transient per-worker peaks), written once beside the live file
+    void write_seed_report(const IncrementalBatchReport& report);
     bool live_header_written_ = false;
 
     const PreparedGenotypeModel& model_;

@@ -2327,7 +2327,8 @@ void remove_run_outputs(const std::string& out_prefix) {
     for (const std::string& suffix : dosage::dosage_stage_outputs()) std::remove((out_prefix + suffix).c_str());
     for (const char* suffix : kPartialOutputs) std::remove((out_prefix + suffix).c_str());
     // S2-H: the refinement diagnostics are run-owned too (removed at the start only: they must survive a stop)
-    for (const char* suffix : {".refinement_memory_live.tsv", ".refinement_replay_inputs.tsv", ".refinement_replay.tsv",
+    for (const char* suffix : {".refinement_memory_live.tsv", ".refinement_seed_report.tsv", ".refinement_replay_inputs.tsv",
+                               ".refinement_replay.tsv",
                                ".refinement_replay_rounds.tsv", ".refinement_replay_scored.tsv"}) {
         std::remove((out_prefix + suffix).c_str());
     }

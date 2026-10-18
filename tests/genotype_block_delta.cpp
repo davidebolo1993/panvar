@@ -2755,7 +2755,56 @@ void test_fused_seed() {
                  "leaves no census\n";
 }
 
+// S2-I: the partition storage memory_account adds (each worker's ordinary WindowScratch and its forward/reverse
+// PieceIndex vectors; the fine stores stay in the existing window-scratch ledger) equals an independent recount, with
+// and without fine window discovery, and the extended total adds exactly the two capacities.
+void test_partition_storage_accounts() {
+    const Locus t = tandem_locus(5153);
+    std::mt19937_64 rng(5154);
+    for (const bool fine : {false, true}) {
+        panvar::FragmentScoringOptions opts = options();
+        opts.threads = 4;
+        panvar::PreparedScoringContext context(t.fragments, library(), opts);
+        context.begin_transient_round();
+        context.add_haplotypes({t.base});
+        context.retain_census(0);
+        context.enable_origin_cache_path(true);
+        context.set_origin_cache_limits(std::size_t{1} << 30, 0);
+        if (fine) context.enable_fine_window_discovery(std::size_t{1} << 26, 2000000000ULL);
+        std::vector<panvar::RepairRequest> requests = {{0, 1000, 1040, random_bases(rng, 40)}, {0, 1100, 1140, random_bases(rng, 55)},
+                                                      {0, 1300, 1340, std::string()}};
+        std::vector<panvar::BlockDeltaWork> works;
+        (void)context.add_repaired_haplotypes(requests, &works, nullptr);
+        const panvar::ContextMemoryAccount a = context.memory_account();
+        const auto recount = context.recount_partition_storage_for_testing();
+        const std::string at = fine ? "fine discovery" : "reference discovery";
+        require(a.partitions > 1, at + ": the repairs enumerated across partitions (" + std::to_string(a.partitions) + ")");
+        require(a.partition_scratch_capacity == recount.first && a.partition_piece_index_capacity == recount.second,
+                at + ": partition capacities equal the independent recount (" + std::to_string(a.partition_scratch_capacity) + "/" +
+                    std::to_string(recount.first) + ", " + std::to_string(a.partition_piece_index_capacity) + "/" +
+                    std::to_string(recount.second) + ")");
+        require(a.partition_piece_index_bytes > 0 && a.partition_piece_index_bytes <= a.partition_piece_index_capacity &&
+                    a.partition_scratch_bytes <= a.partition_scratch_capacity && a.partition_scratch_capacity > 0,
+                at + ": sizes never exceed capacities");
+        require(a.capacity_total_extended == a.capacity_total + a.partition_scratch_capacity + a.partition_piece_index_capacity,
+                at + ": the extended total adds exactly the two partition capacities (fine stores not counted twice)");
+        std::cout << "  " << at << ": partitions " << a.partitions << ", scratch " << a.partition_scratch_bytes << " / "
+                  << a.partition_scratch_capacity << " B, piece indexes " << a.partition_piece_index_bytes << " / "
+                  << a.partition_piece_index_capacity << " B\n";
+    }
+}
+
 int main() {
+    if (const char* only = std::getenv("PANVAR_BLOCK_DELTA_ONLY"); only != nullptr && std::string(only) == "partition_accounts") {
+        try {
+            test_partition_storage_accounts();
+            std::cout << "block delta (partition_accounts only): PASS\n";
+            return 0;
+        } catch (const std::exception& e) {
+            std::cerr << "block delta (partition_accounts only): FAIL: " << e.what() << '\n';
+            return 1;
+        }
+    }
     try {
         std::cout << "== I2-D: fused anchor seeding ==\n";
         test_fused_seed();
