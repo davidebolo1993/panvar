@@ -93,8 +93,10 @@ def legacy_identity(d_legacy, d_v1):
             # the caller's status and its dosage-stage copy (.original, repair mode) carry the same declared rows
             # (amendment 1: the first version declared them for the main status file only)
             if f in ("call.mosaic_status.tsv", "call.original.mosaic_status.tsv"):
-                for k in ("output_schema", "sequence_prediction", "sequence_status", "sequence_completion",
-                          "sequence_exit_code"):
+                # S1-C adds sequence_publication (complete/FAILED); a run without it (S1-B build) is checked as before
+                declared = ("output_schema", "sequence_prediction", "sequence_status", "sequence_completion",
+                            "sequence_exit_code") + (("sequence_publication",) if "sequence_publication" in kb else ())
+                for k in declared:
                     if k not in kb:
                         problems.append(f"{f}: declared row {k} missing")
                     kb.pop(k, None)
