@@ -1548,6 +1548,19 @@ struct OriginCachePlanReport {
     std::uint64_t retained_entries = 0;    // selected and already held
     std::uint64_t evicted_entries = 0;
     std::uint64_t evicted_bytes = 0;
+    // S2-J: under reuse-only admission, the planned windows requested by one distinct new haplotype (never selected,
+    // never retained) and those requested by two or more (eligible)
+    std::uint64_t reuse_only_singleton_windows = 0;
+    std::uint64_t reuse_only_eligible_windows = 0;
+};
+// S2-J (EXPERIMENTAL): what reuse-only admission did, cumulative over the context's life. Plans and misses counted while
+// it was on: planned windows by multiplicity, misses not retained because their planned multiplicity was below two
+// (deliberately, whatever their size), misses retained while it was on.
+struct OriginAdmissionReport {
+    std::uint64_t restricted_plans = 0;
+    std::uint64_t planned_windows = 0, singleton_windows = 0, eligible_windows = 0;
+    std::uint64_t misses_while_restricted = 0, singleton_misses_not_retained = 0, retained_while_restricted = 0;
+    std::uint64_t group_reuses_while_restricted = 0, hits_while_restricted = 0;
 };
 
 // ---- MEASUREMENT ONLY: the necessary-condition piece screen, in shadow ---------------------------
@@ -1837,6 +1850,13 @@ public:
     // must not mutate the context. Measurement only; empty by default.
     void set_progress_probe(std::function<void(const char* point, std::size_t done, std::size_t total)> probe);
     std::vector<OriginDemandRow> origin_demand() const;
+    // S2-J (EXPERIMENTAL, default off): while on, planned selection AND the admission of a previously unseen window
+    // retain an origin-window entry only when the latest plan requests its exact identity for two or more distinct new
+    // haplotypes (plan_origin_cache's multiplicity); an unknown size never bypasses it. Records are still built and used
+    // exactly (group-holder reuse included); only RETENTION changes. The caller scopes it (the repair search: round 1).
+    void set_reuse_only_admission(bool on);
+    bool reuse_only_admission() const;
+    OriginAdmissionReport origin_admission_report() const;
     // Planned selective retention. plan_repaired_window describes the window a repair would request;
     // plan_origin_cache then chooses the round's cache set from those windows and evicts every entry
     // outside it, releasing its storage. Selection is deterministic and independent of request order:

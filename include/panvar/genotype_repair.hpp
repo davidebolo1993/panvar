@@ -92,6 +92,11 @@ struct RepairSearchOptions {
     // appends one row of the context's accounts and process memory to this file, flushed per row so it survives a
     // watchdog stop. Measurement only: no order, batching or result changes.
     std::string memory_live_path;
+    // S2-J (EXPERIMENTAL, default off): during round 1 only (round index 1 of this search), the context retains an
+    // origin-window entry only when the round's complete plan requests it for two or more distinct new haplotypes
+    // (PreparedScoringContext::set_reuse_only_admission). Set on in round 1 and restored when the round ends, however it
+    // ends; later rounds keep the existing policy. Never inherited by tie branches or legs (the caller clears it).
+    bool round1_reuse_only_admission = false;
     // Gate hooks, never production: permute the neighbour and repair-request lists every round, and
     // re-score the final neighbourhood N more times without promoting (hold cycles).
     std::uint64_t request_order_seed = 0;

@@ -5472,6 +5472,124 @@ void test_refinement_diagnostics() {
                  "induced stop; replay reproduces the anchor and round 1 in a separate process; identities and contract enforced\n";
 }
 
+// ---- S2-J: reuse-only round-1 origin-cache admission in the caller (repair_round1_origin_admission) -------------------
+void test_round1_admission_caller() {
+    namespace fs = std::filesystem;
+    const auto fresh = [&](const std::string& rel, bool reuse_only) {
+        fs::remove_all(path(rel));
+        fs::create_directories(path(rel));
+        panvar::GenotypeCommandOptions o =
+            repair_options(rel + "/call", path("phaseable_r1.fq"), path("phaseable_r2.fq"), "tiny_phaseable.gfa");
+        o.diagnostic_refinement_memory = true;
+        o.setting_sources["diagnostic_refinement_memory"] = "test";
+        if (reuse_only) {
+            o.repair_round1_origin_admission = "reuse_only_experimental";
+            o.setting_sources["repair_round1_origin_admission"] = "test";
+        }
+        return o;
+    };
+    require(panvar::execute_genotype_command(fresh("ra_existing", false), nullptr) == 0, "S2-J: the existing policy completes");
+    require(panvar::execute_genotype_command(fresh("ra_reuse", true), nullptr) == 0, "S2-J: reuse-only admission completes");
+    // every output identical except: the settings row, the admission rows and cache-work counters in the status, the rounds
+    // table's non-scientific columns, the memory logs (declared explicitly below)
+    static const std::set<std::string> admission_rows = {
+        "repair_round1_origin_admission", "repair_admission_restricted_plans", "repair_admission_planned_windows",
+        "repair_admission_singleton_windows", "repair_admission_eligible_windows", "repair_admission_misses_while_restricted",
+        "repair_admission_singleton_misses_not_retained", "repair_admission_retained_while_restricted",
+        "repair_admission_hits_while_restricted", "repair_admission_group_reuses_while_restricted"};
+    // executed refinement work and its cap margins: windows not retained in round 1 are enumerated again later (measured)
+    static const std::set<std::string> cache_work = {"repair_cumulative_latent_pairs", "repair_cumulative_physical_origins",
+                                                     "repair_cumulative_piece_hits", "repair_margin_latent_pairs",
+                                                     "repair_margin_physical_origins", "repair_margin_piece_hits"};
+    require(sf::files(path("ra_existing")) == sf::files(path("ra_reuse")), "S2-J: the same output files");
+    std::string listing, bad_keys;
+    for (const std::string& f : sf::files(path("ra_existing"))) {
+        const std::string x = path("ra_existing/" + f), y = path("ra_reuse/" + f);
+        if (f == "call.repair_memory.tsv" || f == "call.refinement_memory_live.tsv" || f == "call.refinement_seed_report.tsv") continue;
+        if (f == "call.mosaic_status.tsv") {
+            const auto a = sf::kv(x), b = sf::kv(y);
+            std::set<std::string> keys;
+            for (const auto& [k, v] : a) keys.insert(k);
+            for (const auto& [k, v] : b) keys.insert(k);
+            for (const std::string& k : keys) {
+                const auto i = a.find(k), j = b.find(k);
+                if (i != a.end() && j != b.end() && i->second == j->second) continue;
+                listing += k + ",";
+                const bool allowed = (i == a.end() && admission_rows.count(k) != 0) ||
+                                     (i != a.end() && j != b.end() && (s2g::shared_volatile(k) || cache_work.count(k) != 0));
+                if (!allowed) bad_keys += k + ",";
+            }
+            require(bad_keys.empty(), "S2-J: status keys differ outside the declared allowances: " + bad_keys);
+            continue;
+        }
+        if (f == "call.settings.tsv") {
+            auto m = sf::kv(y);
+            require(m.erase("repair_round1_origin_admission") == 1 && m == sf::kv(x), "S2-J: settings differ only by the policy row");
+            continue;
+        }
+        if (f == "call.repair_rounds.tsv") {
+            require(rounds_science(x) == rounds_science(y), "S2-J: the trajectory (candidates, scores, moves) is identical");
+            continue;
+        }
+        if (f == "call.dosage_status.tsv") {
+            auto m = sf::kv(x), n = sf::kv(y);
+            for (auto* q : {&m, &n}) for (auto it = q->begin(); it != q->end();) it = it->first.rfind("seconds_", 0) == 0 ? q->erase(it) : std::next(it);
+            require(m == n, "S2-J: dosage status identical (timing aside)");
+            continue;
+        }
+        if (f == "call.refinement_replay_inputs.tsv") {   // the setup text names the policy; everything else identical
+            auto m = sf::kv(x), n = sf::kv(y);
+            require(n.at("repair_setup") == m.at("repair_setup") + ";round1_admission=reuse_only_experimental", "S2-J: the setup names the policy");
+            m.erase("repair_setup");
+            n.erase("repair_setup");
+            require(m == n, "S2-J: replay inputs otherwise identical");
+            continue;
+        }
+        require(sf::normalised(x, path("ra_existing")) == sf::normalised(y, path("ra_reuse")), "S2-J: " + f + " identical");
+    }
+    const auto st = read_status(path("ra_reuse/call.mosaic_status.tsv"));
+    require(std::stoull(st.at("repair_admission_restricted_plans")) == 1, "S2-J: exactly one restricted plan (round 1 only)");
+    std::cout << "  S2-J status keys differing (existing vs reuse-only): " << (listing.empty() ? "none" : listing) << '\n';
+    // the replay: the ONE declared override is allowed (recorded), any other setup difference is still refused
+    {
+        panvar::GenotypeCommandOptions o = fresh("ra_replay", true);
+        o.diagnostic_refinement_replay = path("ra_existing/call.refinement_replay_inputs.tsv");
+        o.setting_sources["diagnostic_refinement_replay"] = "test";
+        (void)s2a::execute_in_child(o);
+        const auto replay = sf::kv(path("ra_replay/call.refinement_replay.tsv"));
+        require(replay.at("anchor_reproduced") == "yes" &&
+                    replay.at("declared_setup_override") == "repair_round1_origin_admission existing->reuse_only_experimental" &&
+                    replay.at("repair_setup_effective") == replay.at("repair_setup_recorded") + ";round1_admission=reuse_only_experimental",
+                "S2-J replay: the declared policy override is accepted and recorded with both setups");
+        const auto first_round = [](const std::string& file) {
+            std::ifstream in(file);
+            std::string header, row;
+            std::getline(in, header);
+            std::getline(in, row);
+            std::string out;
+            for (const std::string* line : {&header, &row}) {
+                std::stringstream cells(*line);
+                std::size_t c = 0;
+                for (std::string cell; std::getline(cells, cell, '\t') && c < 28; ++c) out += cell + '\t';
+                out += '\n';
+            }
+            return out;
+        };
+        require(first_round(path("ra_replay/call.refinement_replay_rounds.tsv")) == first_round(path("ra_existing/call.repair_rounds.tsv")),
+                "S2-J replay: round 1's candidates, scores and decision equal the existing policy's full run");
+        panvar::GenotypeCommandOptions other = fresh("ra_replay_other", true);
+        other.diagnostic_refinement_replay = path("ra_existing/call.refinement_replay_inputs.tsv");
+        other.repair_local_pairs = 31;   // any other setup field
+        bool refused = false;
+        try { (void)panvar::execute_genotype_command(other, nullptr); } catch (const std::runtime_error& e) {
+            refused = std::string(e.what()).find("repair_setup") != std::string::npos;
+        }
+        require(refused, "S2-J replay: a difference outside the declared override is still refused");
+    }
+    std::cout << "  round-1 admission: outputs and trajectory identical to the existing policy; one restricted plan; replay accepts "
+                 "only the declared override\n";
+}
+
 int main(int argc, char** argv) {
     if (argc < 2) {
         std::cerr << "usage: genotype_command_e2e_test <scratch dir> [source dir]\n";
@@ -5503,6 +5621,7 @@ int main(int argc, char** argv) {
             simulate(truths.first, truths.second, path("phaseable_r1.fq"), path("phaseable_r2.fq"), 123);
             test_blocked_union_route();
             test_refinement_diagnostics();
+            test_round1_admission_caller();
             std::cout << "genotype command e2e (blocked_union only): PASS\n";
             return 0;
         } catch (const std::exception& error) {
@@ -5590,6 +5709,7 @@ int main(int argc, char** argv) {
         test_progressive_schedule();
         test_blocked_union_route();
         test_refinement_diagnostics();
+        test_round1_admission_caller();
         if (argc >= 3) test_profile(argv[2]);
         test_block_quality_columns();
         std::cout << "genotype command end-to-end: PASS\n";

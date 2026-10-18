@@ -209,6 +209,7 @@ RepairSetup make_repair_setup(const GenotypeCommandOptions& options, const Fragm
     s.declared_neighbour_cap = options.repair_max_neighbours;
     s.memory_log = true;
     if (options.diagnostic_refinement_memory) s.memory_live_path = options.out_prefix + ".refinement_memory_live.tsv";
+    s.round1_reuse_only_admission = options.repair_round1_origin_admission == "reuse_only_experimental";   // S2-J
     return r;
 }
 std::string hex_double(double value) {
@@ -232,6 +233,7 @@ std::string repair_setup_text(const RepairSetup& r, std::size_t fragments) {
       << ";origin_cache_bytes=" << s.origin_cache_bytes << ";fine_window=" << s.fine_window_bytes << ";fine_served="
       << s.fine_window_served_cap << ";fused_seed=" << s.fused_seed << ";switch=" << hex_double(s.switch_probability)
       << ";neighbour_cap=" << s.declared_neighbour_cap;
+    if (s.round1_reuse_only_admission) t << ";round1_admission=reuse_only_experimental";   // S2-J (absent by default)
     return t.str();
 }
 std::string emissions_digest(const PreparedProposalEmissions& emissions) {
@@ -813,6 +815,9 @@ std::string quality_columns(RankingSummary& summary, const std::string& block_id
 // the search and why it stopped, the pool, and the decision made over it.
 struct RepairReport {
     const GenotypeCommandOptions* options = nullptr;
+    // S2-J: the production search's origin-admission account (reported when the experimental policy is on)
+    bool admission_reported = false;
+    OriginAdmissionReport admission;
     std::uint64_t neighbour_bound = 0;
     std::string union_status = "NA";           // the union ranking before repair
     std::size_t union_winner_set = 0;
@@ -1013,6 +1018,17 @@ void write_repair_report(std::ostream& out, const RepairReport& r) {
     out << "union_ranking_status\t" << r.union_status << "\nunion_winner_set_size\t" << r.union_winner_set
         << "\nunion_certified_gap\t" << r.union_certified_gap << "\nunion_top_score\t" << r.union_top_score
         << "\nunion_top_hap1\t" << r.union_top_hap1 << "\nunion_top_hap2\t" << r.union_top_hap2 << '\n';
+    if (r.admission_reported) {   // S2-J
+        const OriginAdmissionReport& a = r.admission;
+        out << "repair_round1_origin_admission\treuse_only_experimental\nrepair_admission_restricted_plans\t" << a.restricted_plans
+            << "\nrepair_admission_planned_windows\t" << a.planned_windows << "\nrepair_admission_singleton_windows\t"
+            << a.singleton_windows << "\nrepair_admission_eligible_windows\t" << a.eligible_windows
+            << "\nrepair_admission_misses_while_restricted\t" << a.misses_while_restricted
+            << "\nrepair_admission_singleton_misses_not_retained\t" << a.singleton_misses_not_retained
+            << "\nrepair_admission_retained_while_restricted\t" << a.retained_while_restricted
+            << "\nrepair_admission_hits_while_restricted\t" << a.hits_while_restricted
+            << "\nrepair_admission_group_reuses_while_restricted\t" << a.group_reuses_while_restricted << '\n';
+    }
     out << "repair_anchor_candidate_id\t" << r.anchor_candidate_id << "\nrepair_anchor_union_rank\t"
         << r.anchor_union_rank << "\nrepair_anchor_score\t" << r.anchor_score << "\nrepair_anchor_hap1\t"
         << r.anchor_hap1 << "\nrepair_anchor_hap2\t" << r.anchor_hap2 << '\n';
@@ -1149,7 +1165,7 @@ void write_status(
                                 "dosage_census_backend", "adaptive_emission_handoff", "output_schema", "early_incumbent",
                                 "test_interrupt_point", "diagnostic_union_evidence_dump", "diagnostic_union_kernel_dump",
                                 "union_progressive_schedule", "union_fragment_blocks", "diagnostic_refinement_memory",
-                                "diagnostic_refinement_replay"}) {
+                                "diagnostic_refinement_replay", "repair_round1_origin_admission"}) {
             const auto source = options.setting_sources.find(key);
             if (source == options.setting_sources.end()) continue;
             const std::string k = key;
@@ -1178,6 +1194,7 @@ void write_status(
                                       : k == "union_fragment_blocks" ? options.union_fragment_blocks
                                       : k == "diagnostic_refinement_memory" ? std::string(options.diagnostic_refinement_memory ? "1" : "0")
                                       : k == "diagnostic_refinement_replay" ? options.diagnostic_refinement_replay
+                                      : k == "repair_round1_origin_admission" ? options.repair_round1_origin_admission
                                       : k == "gap_recursion_backend"
                                           ? std::string(gap_recursion_backend_name(options.gap_recursion_fixed_geometry))
                                                                          : std::to_string(options.adaptive_fine_max_served_placements);
@@ -1986,6 +2003,12 @@ void apply_genotype_setting(const std::string& context, const std::string& key, 
             throw std::runtime_error(context + ": 'union_progressive_schedule' is off or experimental_v1: " + value);
         }
         options.union_progressive_schedule = value;
+    }
+    else if (key == "repair_round1_origin_admission") {   // S2-J (EXPERIMENTAL)
+        if (value != "existing" && value != "reuse_only_experimental") {
+            throw std::runtime_error(context + ": 'repair_round1_origin_admission' is existing or reuse_only_experimental: " + value);
+        }
+        options.repair_round1_origin_admission = value;
     }
     else if (key == "diagnostic_refinement_memory") {   // S2-H (DIAGNOSTIC ONLY)
         if (value != "0" && value != "1") throw std::runtime_error(context + ": 'diagnostic_refinement_memory' is 0 or 1: " + value);
@@ -3490,10 +3513,19 @@ GenotypeRunStatus run_genotype_body(const GenotypeCommandOptions& options, Genot
         };
         const std::map<std::string, std::string> in = record(options.diagnostic_refinement_replay);
         RepairSetup setup = make_repair_setup(options, scoring_options);
-        // every identity first: model, inputs by content, proposal emissions, the refinement setup
+        // every identity first: model, inputs by content, proposal emissions, the refinement setup. S2-J: the ONE declared
+        // override -- the round-1 origin-admission policy -- is compared at the recorded run's setting; every other field
+        // of the setup must match exactly, and both setup texts are recorded.
+        const std::string effective_setup = repair_setup_text(setup, fragments.size());
+        RepairSetup comparable = setup;
+        comparable.search.round1_reuse_only_admission = false;
+        const std::string comparable_setup = repair_setup_text(comparable, fragments.size());
+        const std::string admission_override = setup.search.round1_reuse_only_admission
+                                                   ? std::string("repair_round1_origin_admission existing->reuse_only_experimental")
+                                                   : std::string("none");
         std::vector<std::pair<std::string, std::string>> expected = {
             {"schema", "diagnostic_refinement_replay_inputs_v1"}, {"model_fingerprint", fingerprint},
-            {"emissions_digest", emissions_digest(emissions)}, {"repair_setup", repair_setup_text(setup, fragments.size())}};
+            {"emissions_digest", emissions_digest(emissions)}, {"repair_setup", comparable_setup}};
         for (const auto& hash : g_input_hashes) expected.push_back({"sha256_" + hash.first, hash.second});
         std::string identities;
         for (const auto& [k, v] : expected) {
@@ -3540,7 +3572,9 @@ GenotypeRunStatus run_genotype_body(const GenotypeCommandOptions& options, Genot
         std::ostringstream t;
         t << "key\tvalue\nschema\tdiagnostic_refinement_replay_v1\nnote\tDIAGNOSTIC ONLY: the first refinement round replayed "
              "from a recorded anchor in a fresh process; no union pass, no genotype\ninputs\t" << options.diagnostic_refinement_replay
-          << "\nidentities_checked\t" << identities << "\nanchor_declared\t" << in.at("anchor_score")
+          << "\nidentities_checked\t" << identities << "\ndeclared_setup_override\t" << admission_override
+          << "\nrepair_setup_recorded\t" << in.at("repair_setup") << "\nrepair_setup_effective\t" << effective_setup
+          << "\nanchor_declared\t" << in.at("anchor_score")
           << "\nanchor_reproduced\t" << (reproduced ? "yes" : "NO") << "\nanchor_scored\t"
           << (search.rounds().empty() ? std::string("NA") : hex_double(search.rounds().front().start_total))
           << "\nrounds_completed\t" << search.rounds().size() << "\nstop_reason\t" << search.stop_reason()
@@ -4759,10 +4793,18 @@ GenotypeRunStatus run_genotype_body(const GenotypeCommandOptions& options, Genot
             search_end = Clock::now();
             search_returned = true;
             report.stages = search->stage_seconds();
+            if (search_options.round1_reuse_only_admission && search->context() != nullptr) {   // S2-J
+                report.admission_reported = true;
+                report.admission = search->context()->origin_admission_report();
+            }
         } catch (const ResourceExhausted& error) {
             search_end = Clock::now();
             search_returned = true;
             if (search) report.stages = search->stage_seconds();
+            if (search && search_options.round1_reuse_only_admission && search->context() != nullptr) {   // S2-J
+                report.admission_reported = true;
+                report.admission = search->context()->origin_admission_report();
+            }
             refusal = error.what();
         } catch (const std::exception& error) {
             report.no_call_reason = "repair_failed";
@@ -5071,6 +5113,8 @@ GenotypeRunStatus run_genotype_body(const GenotypeCommandOptions& options, Genot
             RepairSearchOptions branch_options = search_options;
             branch_options.external_context = true;
             branch_options.memory_log = false;
+            branch_options.memory_live_path.clear();               // S2-H/S2-J: production-search only
+            branch_options.round1_reuse_only_admission = false;
             const auto run_branch = [&](const BranchStart& branch) {
                 live.reset();
                 BranchResult out;
@@ -5555,6 +5599,8 @@ GenotypeRunStatus run_genotype_body(const GenotypeCommandOptions& options, Genot
                     try {
                         if (!warm_failure.empty()) throw std::runtime_error(warm_failure);
                         RepairSearchOptions branch_options = search_options;
+                        branch_options.memory_live_path.clear();               // S2-H/S2-J: production-search only
+                        branch_options.round1_reuse_only_admission = false;
                         branch_options.request_order_seed = options.diagnostic_branch_request_order_seed;
                         branch_options.external_context = warm;
                         if (warm) branch_options.memory_log = false;
@@ -6222,6 +6268,8 @@ GenotypeRunStatus run_genotype_body(const GenotypeCommandOptions& options, Genot
                                      double anchor_total, std::size_t first_round,
                                      const std::vector<DiplotypeIdentity>& visited, std::vector<TieItem>& items) {
                 RepairSearchOptions leg_options = search_options;
+                leg_options.memory_live_path.clear();               // S2-H/S2-J: production-search only
+                leg_options.round1_reuse_only_admission = false;
                 leg_options.external_context = true;
                 leg_options.memory_log = false;
                 leg_options.score_view = view;

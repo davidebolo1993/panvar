@@ -7655,6 +7655,8 @@ struct PreparedScoringContext::State {
     // Planned retention: set by plan_origin_cache, indexed by demand-ledger row. Once planned, a miss is
     // retained only if its row was selected by the latest plan.
     bool origin_planned = false;
+    bool reuse_only = false;                // S2-J (experimental): retention needs a planned multiplicity >= 2
+    OriginAdmissionReport admission;        // S2-J
     std::vector<char> plan_selected;
     std::map<OriginIdentity, std::uint64_t> plan_multiplicity;
     // The group holder: the identity whose records miss_records holds from the latest enumeration.
@@ -8358,6 +8360,19 @@ OriginCachePlanReport PreparedScoringContext::plan_origin_cache(
     report.distinct_windows = requesters.size();
     state.plan_multiplicity.clear();
     for (const auto& item : requesters) state.plan_multiplicity.emplace(item.first, item.second.size());
+    if (state.reuse_only) {   // S2-J: the plan's multiplicities, as the restriction will read them
+        ++state.admission.restricted_plans;
+        for (const auto& item : requesters) {
+            ++state.admission.planned_windows;
+            if (item.second.size() >= 2) {
+                ++state.admission.eligible_windows;
+                ++report.reuse_only_eligible_windows;
+            } else {
+                ++state.admission.singleton_windows;
+                ++report.reuse_only_singleton_windows;
+            }
+        }
+    }
     state.holder_valid = false;
     struct Candidate {
         const Identity* identity = nullptr;
@@ -8376,7 +8391,8 @@ OriginCachePlanReport PreparedScoringContext::plan_origin_cache(
                 row.second.rel_block_begin == std::get<4>(id) && row.second.rel_new_end == std::get<5>(id) &&
                 row.first == std::get<1>(id)) {
                 // Known only once enumerated: entry_bytes is written at a miss, identical at every miss.
-                if (row.second.misses != 0) {
+                // S2-J: under reuse-only admission a window one new haplotype requests is never a candidate.
+                if (row.second.misses != 0 && (!state.reuse_only || item.second.size() >= 2)) {
                     candidates.push_back({&id, item.second.size(), row.second.entry_bytes, row.second.order});
                 }
                 break;
@@ -8898,6 +8914,10 @@ std::uint64_t PreparedScoringContext::merge_working_bytes() const {
     }
     return total;
 }
+
+void PreparedScoringContext::set_reuse_only_admission(bool on) { state_->reuse_only = on; }
+bool PreparedScoringContext::reuse_only_admission() const { return state_->reuse_only; }
+OriginAdmissionReport PreparedScoringContext::origin_admission_report() const { return state_->admission; }
 
 void PreparedScoringContext::set_progress_probe(std::function<void(const char*, std::size_t, std::size_t)> probe) {
     state_->progress_probe = std::move(probe);
@@ -9432,6 +9452,7 @@ std::size_t PreparedScoringContext::add_repaired_haplotype(
         if (entry != nullptr) {
             ++local.origin_cache_hits;
             ++demand->hits;
+            if (state.reuse_only) ++state.admission.hits_while_restricted;   // S2-J
             const std::uint64_t records = entry->records.origins.size();
             // A separate cap on what REUSE consumes. Executed-work caps are not charged for a hit --
             // that work was not performed -- so reuse needs a bound of its own.
@@ -9453,6 +9474,7 @@ std::size_t PreparedScoringContext::add_repaired_haplotype(
             // Like a hit, it executes nothing and is bounded by the consumption cap instead.
             ++local.origin_group_reuses;
             ++demand->group_reuses;
+            if (state.reuse_only) ++state.admission.group_reuses_while_restricted;   // S2-J
             const std::uint64_t records = state.miss_records.origins.size();
             if (state.origin_record_cap != 0 &&
                 state.origin_records_consumed + records > state.origin_record_cap) {
@@ -9514,6 +9536,23 @@ std::size_t PreparedScoringContext::add_repaired_haplotype(
                                           rel_block_begin, rel_new_end};
                 const auto planned = state.plan_multiplicity.find(identity);
                 if (planned != state.plan_multiplicity.end()) multiplicity = planned->second;
+            }
+            // S2-J: reuse-only admission -- a window the plan does not request for two distinct new haplotypes is not
+            // retained, whether or not its size was known (an unknown size never bypasses it)
+            bool singleton_excluded = false;
+            if (state.reuse_only) {
+                ++state.admission.misses_while_restricted;
+                std::uint64_t planned_multiplicity = 0;
+                if (state.origin_planned) {
+                    const auto planned = state.plan_multiplicity.find(OriginIdentity{
+                        key_hash, window.bases, window.at_start, window.at_end, rel_block_begin, rel_new_end});
+                    if (planned != state.plan_multiplicity.end()) planned_multiplicity = planned->second;
+                }
+                if (planned_multiplicity < 2) {
+                    singleton_excluded = true;
+                    selected = false;
+                    replace = false;
+                }
             }
             bool fits = state.origin_cache.bytes + cost <= state.origin_cache_budget;
             if (state.origin_cache_budget != 0 && selected && !fits && replace) {
@@ -9577,12 +9616,14 @@ std::size_t PreparedScoringContext::add_repaired_haplotype(
                 ++local.origin_cache_stored;
                 local.origin_cache_admitted_bytes += cost;
                 demand->admitted = true;
+                if (state.reuse_only) ++state.admission.retained_while_restricted;   // S2-J
                 source = &cache.entries[at].records;   // deque: stable address
                 if (cache.bytes > state.origin_cache_budget) {
                     throw std::logic_error("origin cache exceeded its declared budget");
                 }
             } else if (state.origin_cache_budget != 0 && !selected) {
                 ++local.origin_cache_not_selected;
+                if (singleton_excluded) ++state.admission.singleton_misses_not_retained;   // S2-J
             } else if (state.origin_cache_budget != 0) {
                 // Exhaustion stops RETENTION. The records just built are still used, exactly.
                 ++state.origin_cache.not_retained;

@@ -2794,7 +2794,187 @@ void test_partition_storage_accounts() {
     }
 }
 
+// ---- S2-J: reuse-only origin-cache admission (round 1 of the repair search) ----------------------------------------
+struct AdmissionRun {
+    std::vector<double> cells;
+    std::vector<panvar::OriginDemandRow> demand;
+    std::vector<panvar::OriginCachePlanReport> plans;
+    panvar::OriginAdmissionReport admission;
+    std::uint64_t physical_origins = 0, records_consumed = 0;
+};
+bool same_window(const panvar::OriginDemandRow& a, const panvar::OriginDemandRow& b) {
+    return a.key_hash == b.key_hash && a.window_bytes == b.window_bytes && a.at_start == b.at_start && a.at_end == b.at_end &&
+           a.rel_block_begin == b.rel_block_begin && a.rel_new_end == b.rel_new_end;
+}
+// rounds: each a list of requests against `incumbent`; between rounds the request at promote_after[k] is promoted (census
+// kept) and the rest released, as the search does; reuse-only admission is on for round 0 (and its promotion) only.
+AdmissionRun admission_run(const Locus& l, const std::vector<Repair>& round1, const std::vector<Repair>& round2,
+                           std::size_t promote, bool reuse_only, std::size_t threads, unsigned order_seed,
+                           std::size_t budget = std::size_t{1} << 30) {
+    panvar::FragmentScoringOptions opts = options();
+    opts.threads = threads;
+    panvar::PreparedScoringContext context(l.fragments, library(), opts);
+    context.begin_transient_round();
+    context.add_haplotypes({l.base});
+    context.retain_census(0);
+    context.enable_origin_cache_path(true);
+    context.set_origin_cache_limits(budget, 0);
+    AdmissionRun out;
+    const auto round = [&](std::size_t incumbent, std::vector<Repair> repairs) {
+        if (order_seed != 0) {
+            std::mt19937_64 rng(order_seed);
+            std::shuffle(repairs.begin(), repairs.end(), rng);
+        }
+        std::vector<panvar::RepairRequest> requests;
+        for (const Repair& r : repairs) requests.push_back({incumbent, r.begin, r.end, r.allele});
+        panvar::OriginCachePlanReport plan;
+        std::vector<panvar::BlockDeltaWork> works;
+        const std::vector<std::size_t> slots = context.add_repaired_haplotypes(requests, &works, &plan);
+        out.plans.push_back(plan);
+        // canonical: by the repair's content, so permuted requests compare position by position
+        std::vector<std::pair<std::string, std::size_t>> keyed;
+        for (std::size_t k = 0; k < repairs.size(); ++k) {
+            keyed.push_back({std::to_string(repairs[k].begin) + ":" + std::to_string(repairs[k].end) + ":" + repairs[k].allele, slots[k]});
+        }
+        std::sort(keyed.begin(), keyed.end());
+        for (const auto& [key, slot] : keyed) {
+            for (std::size_t f = 0; f < l.fragments.size(); ++f) out.cells.push_back(context.mass_of(f, slot));
+            out.cells.push_back(context.exposure_of(slot));
+            out.cells.push_back(context.score_candidates({{incumbent, slot}}).scores[0].log_likelihood);
+        }
+        return std::make_pair(slots, repairs);
+    };
+    context.set_reuse_only_admission(reuse_only);
+    const auto first = round(0, round1);
+    std::size_t winner = 0;
+    if (!round2.empty()) {
+        const Repair& chosen = round1[promote];
+        panvar::BlockDeltaWork promoted;
+        winner = context.add_repaired_haplotype(0, chosen.begin, chosen.end, chosen.allele, &promoted, true);
+        context.release_transient({winner});
+    }
+    context.set_reuse_only_admission(false);   // later rounds: the existing policy
+    if (!round2.empty()) (void)round(winner, round2);
+    out.demand = context.origin_demand();
+    out.admission = context.origin_admission_report();
+    out.physical_origins = context.cumulative_counters().physical_origins;
+    out.records_consumed = context.origin_records_consumed();
+    return out;
+}
+
+void test_round1_reuse_only_admission() {
+    // (1) a tandem repeat: two distinct new haplotypes (the same allele one period apart) share one window identity;
+    // a flank repair is requested twice (one haplotype: multiplicity stays one); a second flank repair is single-use
+    std::mt19937_64 rng(7172);
+    Locus t;   // a long period-10 repeat, so a window around its centre lies wholly inside it
+    {
+        const std::string unit = random_bases(rng, 10);
+        t.base = random_bases(rng, 900);
+        for (int i = 0; i < 100; ++i) t.base += unit;
+        t.base += random_bases(rng, 900);
+        std::size_t n = 0;
+        for (std::size_t start = 0; start + 260 <= t.base.size(); start += 23) {
+            t.fragments.push_back(fragment_at(t.base, start, 260, 100, "a" + std::to_string(n++)));
+        }
+    }
+    const std::string allele = random_bases(rng, 10);
+    const std::string flank = random_bases(rng, 40);
+    const std::vector<Repair> round1 = {{1400, 1410, allele}, {1410, 1420, allele}, {400, 440, flank}, {400, 440, flank},
+                                        {2300, 2340, random_bases(rng, 33)}};
+    const AdmissionRun existing = admission_run(t, round1, {}, 0, false, 1, 0);
+    const AdmissionRun restricted = admission_run(t, round1, {}, 0, true, 1, 0);
+    require(restricted.cells.size() == existing.cells.size(), "S2-J tandem: the same cells");
+    for (std::size_t i = 0; i < existing.cells.size(); ++i) require_identical(restricted.cells[i], existing.cells[i], "S2-J tandem: cell " + std::to_string(i));
+    const panvar::OriginCachePlanReport& plan = restricted.plans.front();
+    require(plan.reuse_only_eligible_windows == 1 && plan.reuse_only_singleton_windows == 2 && plan.window_requests == 4,
+            "S2-J tandem: one shared window (two distinct haplotypes), two single-use windows (the duplicated request counts "
+            "once): eligible " + std::to_string(plan.reuse_only_eligible_windows) + ", singleton " +
+                std::to_string(plan.reuse_only_singleton_windows) + ", requests " + std::to_string(plan.window_requests));
+    std::size_t shared = 0, singles_existing = 0, singles_restricted = 0;
+    for (std::size_t k = 0; k < restricted.demand.size(); ++k) {
+        const panvar::OriginDemandRow& r = restricted.demand[k];
+        const panvar::OriginDemandRow& e = existing.demand[k];
+        require(same_window(r, e), "S2-J tandem: the same demand rows in the same order");
+        if (r.requests >= 2) {
+            ++shared;
+            require(r.misses == 1 && r.hits + r.group_reuses == r.requests - 1 && r.admitted,
+                    "S2-J tandem: the shared window is enumerated once, reused, and retained");
+        } else {
+            singles_existing += e.admitted ? 1 : 0;
+            singles_restricted += r.admitted ? 1 : 0;
+        }
+    }
+    require(shared == 1 && singles_existing == 2 && singles_restricted == 0,
+            "S2-J tandem: a single-use window is retained by the existing policy and not by reuse-only admission");
+    require(restricted.admission.singleton_misses_not_retained == 2 && restricted.admission.retained_while_restricted == 1,
+            "S2-J tandem: the admission account (" + std::to_string(restricted.admission.singleton_misses_not_retained) + " not retained, " +
+                std::to_string(restricted.admission.retained_while_restricted) + " retained)");
+    require(restricted.physical_origins == existing.physical_origins,
+            "S2-J tandem: round 1 executes the same origins (no window is enumerated twice within the round)");
+    // forced key-hash collisions, permuted requests and 4 threads: identical cells and admission
+    panvar::set_origin_cache_hash_collapse(true);
+    AdmissionRun collided;
+    try { collided = admission_run(t, round1, {}, 0, true, 1, 0); } catch (...) { panvar::set_origin_cache_hash_collapse(false); throw; }
+    panvar::set_origin_cache_hash_collapse(false);
+    for (const AdmissionRun* other : {&collided}) {
+        for (std::size_t i = 0; i < existing.cells.size(); ++i) require_identical(other->cells[i], existing.cells[i], "S2-J collisions: cell");
+        require(other->admission.singleton_misses_not_retained == 2 && other->admission.retained_while_restricted == 1,
+                "S2-J collisions: the same admission");
+    }
+    for (const auto& [seed, threads] : {std::pair<unsigned, std::size_t>{3u, 1u}, std::pair<unsigned, std::size_t>{11u, 4u}}) {
+        {
+            const AdmissionRun x = admission_run(t, round1, {}, 0, true, threads, seed);
+            for (std::size_t i = 0; i < existing.cells.size(); ++i) require_identical(x.cells[i], existing.cells[i], "S2-J order/threads: cell");
+            require(x.admission.singleton_misses_not_retained == 2 && x.admission.retained_while_restricted == 1 &&
+                        x.physical_origins == existing.physical_origins,
+                    "S2-J order/threads: the same admission and work (seed " + std::to_string(seed) + ", " + std::to_string(threads) + " threads)");
+        }
+    }
+    // (2) multi-block, two rounds: every round-1 window is single-use; after the promotion, round 2 revisits the
+    // windows of the other blocks (same identity). Reuse-only admission retained none of them, so round 2 enumerates
+    // them again -- reported, exactly -- and round 2 (the existing policy) retains singletons again.
+    const MultiBlock m = multi_block(7173);
+    std::vector<Repair> round2;
+    for (std::size_t i = 0; i < m.repairs.size(); ++i) if (i != m.promote) round2.push_back(m.repairs[i]);
+    const AdmissionRun e2 = admission_run(m.locus, m.repairs, round2, m.promote, false, 2, 0);
+    const AdmissionRun r2 = admission_run(m.locus, m.repairs, round2, m.promote, true, 2, 0);
+    for (std::size_t i = 0; i < e2.cells.size(); ++i) require_identical(r2.cells[i], e2.cells[i], "S2-J two rounds: cell " + std::to_string(i));
+    std::uint64_t extra_misses = 0, extra_origins = 0, revisited = 0, readmitted = 0;
+    double extra_seconds = 0.0;
+    require(r2.demand.size() == e2.demand.size(), "S2-J two rounds: the same windows");
+    for (std::size_t k = 0; k < r2.demand.size(); ++k) {
+        const panvar::OriginDemandRow& r = r2.demand[k];
+        const panvar::OriginDemandRow& e = e2.demand[k];
+        require(same_window(r, e) && r.requests == e.requests, "S2-J two rounds: the same requests per window");
+        extra_misses += r.misses - e.misses;
+        extra_origins += r.origins_constructed - e.origins_constructed;
+        extra_seconds += r.seconds_reenumeration;
+        if (r.requests >= 2 && r.misses >= 2) ++revisited;
+        if (r.misses >= 2 && r.admitted) ++readmitted;
+    }
+    require(revisited > 0 && extra_misses > 0, "S2-J two rounds: a window used once in round 1 is revisited in round 2 and enumerated again");
+    require(readmitted > 0, "S2-J two rounds: round 2 admits single-use windows again (the existing policy)");
+    require(r2.physical_origins - e2.physical_origins == extra_origins,
+            "S2-J two rounds: every extra executed origin is a re-enumerated window's (cumulative accounting exact)");
+    require(r2.records_consumed <= e2.records_consumed, "S2-J two rounds: fewer served records, never more");
+    std::cout << "  tandem: 1 shared window retained and reused, 2 single-use windows not retained, identical cells; "
+              << "collisions, permuted requests at 1 and 4 threads identical\n  two rounds: " << revisited << " windows revisited, "
+              << extra_misses << " extra misses, " << extra_origins << " extra executed origins (" << extra_seconds
+              << " s re-enumeration), " << readmitted << " re-admitted in round 2; cells identical\n";
+}
+
+
 int main() {
+    if (const char* only = std::getenv("PANVAR_BLOCK_DELTA_ONLY"); only != nullptr && std::string(only) == "admission") {
+        try {
+            test_round1_reuse_only_admission();
+            std::cout << "block delta (admission only): PASS\n";
+            return 0;
+        } catch (const std::exception& e) {
+            std::cerr << "block delta (admission only): FAIL: " << e.what() << '\n';
+            return 1;
+        }
+    }
     if (const char* only = std::getenv("PANVAR_BLOCK_DELTA_ONLY"); only != nullptr && std::string(only) == "partition_accounts") {
         try {
             test_partition_storage_accounts();

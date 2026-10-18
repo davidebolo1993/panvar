@@ -259,6 +259,11 @@ struct GenotypeCommandOptions {
     // same refinement options. Writes <prefix>.refinement_replay*.tsv and a REFINEMENT_REPLAY_DIAGNOSTIC_ONLY status;
     // never a genotype. Needs output_schema legacy, early_incumbent off and the adaptive repair.
     std::string diagnostic_refinement_replay;
+    // S2-J (EXPERIMENTAL, profile key repair_round1_origin_admission existing|reuse_only_experimental): in the production
+    // refinement's round 1 only, an origin-window entry is retained only when the round's complete plan requests it for
+    // two or more distinct new haplotypes. Cache budget, caps, request order and arithmetic unchanged; later rounds, tie
+    // branches and legs keep the existing policy.
+    std::string repair_round1_origin_admission = "existing";
     // I2-B (EXPERIMENTAL, profile keys only, never public settings): how the adaptive search's window enumeration builds
     // its placement rows. "reference" (the default) scans each enumerated window whole, unchanged. "fine_experimental"
     // builds the same rows from a round-local, per-worker fine store (PreparedScoringContext::

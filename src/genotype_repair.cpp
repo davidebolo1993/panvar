@@ -470,7 +470,10 @@ void CoordinateRepairSearch::live_probe(std::size_t round, const char* point, st
                "footprint_minus_capacity\thaplotypes_created\tunique_haplotypes\tcum_physical_origins\tcum_state_classes\t"
                "cum_piece_hits\tallocator_in_use\tpartitions\tpartition_scratch_bytes\tpartition_scratch_capacity\t"
                "partition_piece_index_bytes\tpartition_piece_index_capacity\tcapacity_total_extended\t"
-               "footprint_minus_capacity_extended\n";
+               "footprint_minus_capacity_extended\treuse_only_admission\tadmission_restricted_plans\t"
+               "admission_singleton_windows\tadmission_eligible_windows\tadmission_misses_while_restricted\t"
+               "admission_singleton_misses_not_retained\tadmission_retained_while_restricted\t"
+               "admission_hits_while_restricted\tadmission_group_reuses_while_restricted\n";
         live_header_written_ = true;
     }
     const ContextMemoryAccount a = context->memory_account();
@@ -495,7 +498,11 @@ void CoordinateRepairSearch::live_probe(std::size_t round, const char* point, st
     out << (in_use ? std::to_string(*in_use) : std::string("unavailable")) << '\t' << a.partitions << '\t'
         << a.partition_scratch_bytes << '\t' << a.partition_scratch_capacity << '\t' << a.partition_piece_index_bytes << '\t'
         << a.partition_piece_index_capacity << '\t' << a.capacity_total_extended << '\t'
-        << (static_cast<std::int64_t>(fp.current) - static_cast<std::int64_t>(a.capacity_total_extended)) << '\n';
+        << (static_cast<std::int64_t>(fp.current) - static_cast<std::int64_t>(a.capacity_total_extended)) << '\t';
+    const OriginAdmissionReport ad = context->origin_admission_report();   // S2-J
+    out << (context->reuse_only_admission() ? 1 : 0) << '\t' << ad.restricted_plans << '\t' << ad.singleton_windows << '\t'
+        << ad.eligible_windows << '\t' << ad.misses_while_restricted << '\t' << ad.singleton_misses_not_retained << '\t'
+        << ad.retained_while_restricted << '\t' << ad.hits_while_restricted << '\t' << ad.group_reuses_while_restricted << '\n';
 }
 
 void CoordinateRepairSearch::write_seed_report(const IncrementalBatchReport& r) {
@@ -615,6 +622,19 @@ bool CoordinateRepairSearch::run(const RepairHooks& hooks) {
         const auto generation_mark = StageClock::now();
         double spelling_inside = 0.0, priors_inside = 0.0;
 
+        // S2-J: reuse-only origin-cache admission in round 1 only, restored when this round ends however it ends
+        struct AdmissionScope {
+            PreparedScoringContext* context = nullptr;
+            bool previous = false;
+            ~AdmissionScope() {
+                if (context != nullptr) context->set_reuse_only_admission(previous);
+            }
+        } admission_scope;
+        if (round == 1 && options_.round1_reuse_only_admission && use_delta && context != nullptr) {
+            admission_scope.context = context;
+            admission_scope.previous = context->reuse_only_admission();
+            context->set_reuse_only_admission(true);
+        }
         live_probe(round, "before_neighbourhood_construction");
         // ---- neighbourhood construction. NO TRUTH IN SCOPE.
         std::vector<MosaicPath> paths;
