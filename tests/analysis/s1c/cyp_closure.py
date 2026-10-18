@@ -153,15 +153,20 @@ def main(a, b):
         ("setting source type profile -> flag",
          lambda d: edit_setting(f"{d}/call.settings.tsv", "max_state_classes", source="flag --max-state-classes"),
          "DIFFERENT"),
-        ("block genotype changed", lambda d: edit_table(f"{d}/call.block_genotypes.tsv", "allele2", lambda x: x + "_x"),
-         "DIFFERENT"),
+        # the legacy run is a scientific no-call (distinct_tie): it writes no block table or FASTA, so the output controls
+        # edit the scientific records it does write (amendment 1: the first version targeted absent files)
+        ("equivalence-set labelling changed", lambda d: edit_table(f"{d}/call.equivalence_set.tsv", "hap1_alleles",
+                                                                   lambda x: x + ",9"), "DIFFERENT"),
+        ("candidate labelling changed", lambda d: edit_table(f"{d}/call.mosaic_candidates.tsv", "hap2_alleles",
+                                                             lambda x: x + ",9"), "DIFFERENT"),
         ("candidate score changed", lambda d: edit_table(f"{d}/call.mosaic_scores.tsv", "score",
                                                          lambda x: repr(float(x) + 0.5)), "DIFFERENT"),
         ("call class changed", lambda d: edit_status(f"{d}/call.mosaic_status.tsv", "call_class", "strict_call"),
          "DIFFERENT"),
-        ("legacy FASTA base changed", lambda d: flip_fasta(f"{d}/call.dosage_original.fa")
-         if os.path.exists(f"{d}/call.dosage_original.fa") else flip_fasta(f"{d}/call.original.mosaic_haplotypes.fa"),
+        ("no-call reason changed", lambda d: edit_status(f"{d}/call.mosaic_status.tsv", "no_call_reason", "round_cap"),
          "DIFFERENT"),
+        ("legacy locus table changed", lambda d: edit_table(f"{d}/call.locus_genotype.tsv", "call_class",
+                                                            lambda x: "strict_call"), "DIFFERENT"),
     ]
     bad = 0
     for name, edit, expect in controls:

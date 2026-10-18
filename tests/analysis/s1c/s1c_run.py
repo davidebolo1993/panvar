@@ -45,6 +45,11 @@ MANIFEST = [("t.genotype_sequence_report", "ctest", "genotype_sequence_report", 
             ("cyp30.closure", "cyp_closure", "", 60)]
 MANIFEST += [(f"t.{tn(t)}", "ctest", tn(t), 60) for t in s1b_run.LIGHT + s1b_run.REST_SMALL + s1b_run.OTHER]
 MANIFEST += [(f"t.{t}", "ctest", t, s) for t, s in s1b_run.HEAVY]
+# Amendment 1 (after t.genotype_command_e2e and cyp30.closure failed on test/tool defects, before further execution;
+# both stay recorded): the S1-B schema e2e test did not declare S1-C's new status row sequence_publication; the CYP closure
+# controls edited a block table and FASTA that a legacy no-call (distinct_tie) never writes. Fixed; rerun as .a1 units.
+AMENDMENT_1 = [("t.genotype_command_e2e.a1", "ctest", "genotype_command_e2e", 300), ("cyp30.closure.a1", "cyp_closure", "", 60)]
+ORDER = [m[0] for m in MANIFEST[:8]] + [m[0] for m in AMENDMENT_1] + [m[0] for m in MANIFEST[8:]]
 LEDGER = "unit\trevision\tdirty_tree\tdeclared_timeout_seconds\twall_seconds\tpeak_rss_gib\texit\ttimed_out\tnote\n"
 
 
@@ -105,7 +110,9 @@ def orientation(d):
 
 
 def run_unit(unit):
-    u, kind, target, timeout = next(m for m in MANIFEST if m[0] == unit)
+    u, kind, target, timeout = next(m for m in MANIFEST + AMENDMENT_1 if m[0] == unit)
+    if any(m[0] == unit for m in AMENDMENT_1):
+        assert os.path.exists(f"{OUT}/AMENDMENT_1.tsv"), "freeze amendment 1 first"
     assert open(f"{OUT}/MANIFEST.tsv").read() and timeout <= 300 and unit not in done()
     rev, dirty = state()
     assert dirty == 0, "the tree must be committed and clean"
@@ -157,8 +164,14 @@ if __name__ == "__main__":
         write_manifest()
     elif arg == "_orientation":
         sys.exit(orientation(sys.argv[2]))
+    elif arg == "amendment1":
+        text = "".join("\t".join(str(x) for x in m) + "\n" for m in AMENDMENT_1)
+        p = f"{OUT}/AMENDMENT_1.tsv"
+        assert not os.path.exists(p) or open(p).read() == text
+        open(p, "w").write(text)
+        print(text, end="")
     elif arg == "next":
-        todo = [m[0] for m in MANIFEST if m[0] not in done()]
+        todo = [u for u in ORDER if u not in done()]
         sys.exit(run_unit(todo[0]) if todo else print("all units recorded") or 0)
     else:
         sys.exit(run_unit(arg))

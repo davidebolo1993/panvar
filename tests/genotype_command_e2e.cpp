@@ -3970,8 +3970,9 @@ void test_sequence_first_schema() {
                             require(kb.at("sequence_prediction") == sc.prediction && kb.at("sequence_status") == sc.status &&
                                         kb.at("sequence_exit_code") == std::to_string(sc.v1_exit),
                                     what + ": the sequence status rows");
+                            require(kb.at("sequence_publication") == "complete", what + ": publication complete (S1-C row)");
                             for (const char* k : {"sequence_prediction", "sequence_status", "sequence_completion",
-                                                  "sequence_exit_code"}) kb.erase(k);
+                                                  "sequence_exit_code", "sequence_publication"}) kb.erase(k);
                         }
                     }
                     std::set<std::string> keys_a, keys_b;
