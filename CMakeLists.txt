@@ -293,6 +293,11 @@ if(PANVAR_BUILD_TESTING)
         add_test(NAME panvar_genotype_command_e2e
                  COMMAND genotype_command_e2e_test ${CMAKE_CURRENT_BINARY_DIR}/genotype_e2e ${CMAKE_CURRENT_SOURCE_DIR})
         file(MAKE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/genotype_e2e)
+        # S2-G: the blocked-route caller gate alone (its own scratch directory)
+        add_test(NAME panvar_genotype_blocked_union_route
+                 COMMAND genotype_command_e2e_test ${CMAKE_CURRENT_BINARY_DIR}/genotype_e2e_blocked ${CMAKE_CURRENT_SOURCE_DIR})
+        set_tests_properties(panvar_genotype_blocked_union_route PROPERTIES ENVIRONMENT "PANVAR_E2E_ONLY=blocked_union")
+        file(MAKE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/genotype_e2e_blocked)
 
         # S2-C (EXPERIMENTAL): the demand-driven indexed scorer against its bulk control
         add_executable(genotype_progressive_kernel_test tests/genotype_progressive_kernel.cpp)

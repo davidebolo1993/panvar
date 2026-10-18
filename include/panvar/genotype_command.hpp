@@ -235,6 +235,18 @@ struct GenotypeCommandOptions {
     // experimental_v1 and the indexed backend (exact store); refused with the diagnostics that need the full mass
     // matrix and with the adaptive emission handoff.
     std::string union_progressive_schedule = "off";
+    // S2-G (EXPERIMENTAL, opt-in; profile key union_fragment_blocks off|fine_core_4096_experimental): the initial union
+    // pass on the existing indexed scorer (fine views, exact store) over 4,096-read-pair fragment blocks, each block's
+    // batch building and owning the I4-E fine-core and whole-segment origin aggregates under the existing half/half
+    // split of union_origin_cache_bytes; every work and consumption cap cumulative across blocks
+    // (score_diplotypes_indexed_blocked). Scores and audit views feed the unchanged ranking, pooling and decisions. A
+    // refusal publishes no union score (the S2-A checkpoint, when on, stays PROVISIONAL) and reports completed-block,
+    // refused-block and whole-attempt work. Needs union_scoring_backend indexed_fine_experimental, the exact store,
+    // indexed_union_evidence_layout fine_views_experimental and origin reuse; refused with union_progressive_schedule,
+    // adaptive_emission_handoff and every diagnostic that needs the full mass matrix (before the prefix is touched).
+    std::string union_fragment_blocks = "off";
+    // S2-G TEST HOOK (API only): the blocked route's fragment block size (0: the declared 4,096 read pairs)
+    std::size_t test_union_fragment_block_pairs = 0;
     // I2-B (EXPERIMENTAL, profile keys only, never public settings): how the adaptive search's window enumeration builds
     // its placement rows. "reference" (the default) scans each enumerated window whole, unchanged. "fine_experimental"
     // builds the same rows from a round-local, per-worker fine store (PreparedScoringContext::

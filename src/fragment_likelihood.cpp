@@ -12462,6 +12462,32 @@ BlockedUnionResult score_diplotypes_indexed_blocked(const InternedHaplotypes& ha
     UnionCumulativeCharges cumulative;
     FragmentScoringResult& result = out.result;
     std::uint64_t floor_binding = 0;
+    {   // S2-G: the run's start-sort tally, over every block (as the bulk adapter reports one pass)
+        StartSortTally& tally = start_sort_tally();
+        tally.out_of_place.store(0);
+        tally.in_place.store(0);
+        tally.fallbacks.store(0);
+        tally.peak_worker_bytes.store(0);
+    }
+    // S2-G: the run-level cache reports over the completed blocks. Counts are summed; held bytes and held entries are the
+    // largest any block held (every block's storage is released before the next exists).
+    UnionOriginCacheReport& origin_cache = result.union_origin_cache;
+    origin_cache.active = options.union_origin_cache_bytes > 0;
+    origin_cache.budget_bytes = options.union_origin_cache_bytes;
+    origin_cache.max_origins_consumed = options.max_union_cached_origins_consumed;
+    origin_cache.max_states_consumed = options.max_union_cached_states_consumed;
+    const auto finish_reports = [&]() {
+        StartSortReport& q = result.start_sort;
+        const StartSortTally& tally = start_sort_tally();
+        q.budget_bytes = options.start_sort_scratch_bytes;
+        q.workers = std::max<std::size_t>(1, options.threads);
+        q.share_bytes = options.start_sort_scratch_bytes / q.workers;
+        q.out_of_place = tally.out_of_place.load();
+        q.in_place = tally.in_place.load();
+        q.fallbacks = tally.fallbacks.load();
+        q.peak_worker_bytes = tally.peak_worker_bytes.load();
+        origin_cache.states_consumed = cumulative.states_consumed;
+    };
     try {
         for (std::size_t begin = 0; begin < nf; begin += block_fragments) {
             const std::size_t end = std::min(nf, begin + block_fragments);
@@ -12596,6 +12622,27 @@ BlockedUnionResult score_diplotypes_indexed_blocked(const InternedHaplotypes& ha
                 result.union_origin_cache.admitted_segments += br.origin_entities_admitted;
                 result.union_origin_cache.declined_segments += br.origin_entities_declined;
                 result.union_origin_cache.peak_bytes = std::max(result.union_origin_cache.peak_bytes, br.origin_held_bytes);
+                origin_cache.eligible_segments += br.origin_entities_eligible;   // S2-G: per block, summed
+                origin_cache.payload_bytes = std::max(origin_cache.payload_bytes, br.origin_held_bytes);
+                origin_cache.seconds_fill += br.seconds_origin_construction;
+                {
+                    UnionPrefilterCacheReport& f = result.union_prefilter_cache;
+                    const UnionPrefilterCacheReport& b = br.prefilter;
+                    f.active = b.active;
+                    f.budget_bytes = b.budget_bytes;
+                    f.max_consumed = b.max_consumed;
+                    f.read_length = b.read_length;
+                    f.window_length = b.window_length;
+                    f.window_contents = std::max(f.window_contents, b.window_contents);
+                    f.window_index_bytes = std::max(f.window_index_bytes, b.window_index_bytes);
+                    f.decision_table_bytes = std::max(f.decision_table_bytes, b.decision_table_bytes);
+                    f.decisions_held = std::max(f.decisions_held, b.decisions_held);
+                    f.positions_indexed += b.positions_indexed;
+                    f.decisions_not_retained += b.decisions_not_retained;
+                    f.hits += b.hits;
+                    f.misses += b.misses;
+                    f.worker_seconds_index += b.worker_seconds_index;
+                }
                 result.emission_cache.executed_dps += br.emission_cache.executed_dps;
                 result.emission_cache.executed_prefilters += br.emission_cache.executed_prefilters;
                 result.emission_cache.dp_cache_hits += br.emission_cache.dp_cache_hits;
@@ -12613,6 +12660,7 @@ BlockedUnionResult score_diplotypes_indexed_blocked(const InternedHaplotypes& ha
         result.scores.clear();
         result.audit_scores.clear();
         result.counters = cumulative.executed;
+        finish_reports();
         // S2-F: completed blocks, the refused block's observed work, and the whole attempt
         out.completed_totals = cumulative;
         out.attempt_totals = cumulative;
@@ -12633,6 +12681,7 @@ BlockedUnionResult score_diplotypes_indexed_blocked(const InternedHaplotypes& ha
     }
     out.completed_totals = cumulative;
     out.attempt_totals = cumulative;
+    finish_reports();
     for (std::size_t c = 0; c < nc; ++c) {
         scores[c].fragment_term = fragment_term[c];
         scores[c].log_likelihood = scores[c].exposure_term + fragment_term[c];

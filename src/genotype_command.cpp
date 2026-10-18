@@ -140,6 +140,63 @@ std::optional<std::string> early_incumbent_refusal(const GenotypeCommandOptions&
     }
     return std::nullopt;
 }
+// S2-G: the blocked union route's contract (also checked before an API run touches its prefix).
+std::optional<std::string> union_fragment_blocks_refusal(const GenotypeCommandOptions& o) {
+    if (o.union_fragment_blocks == "off") {
+        if (o.test_union_fragment_block_pairs != 0) {
+            return std::string("test_union_fragment_block_pairs needs union_fragment_blocks fine_core_4096_experimental");
+        }
+        return std::nullopt;
+    }
+    const std::string p = "union_fragment_blocks fine_core_4096_experimental ";
+    if (o.union_scoring_backend != "indexed_fine_experimental") return p + "needs union_scoring_backend indexed_fine_experimental";
+    if (o.indexed_union_store_layout == "legacy_i2a") return p + "needs the exact indexed store layout";
+    if (o.indexed_union_evidence_layout != "fine_views_experimental") {
+        return p + "needs indexed_union_evidence_layout fine_views_experimental";
+    }
+    if (o.union_origin_cache_bytes == 0) return p + "needs union origin reuse (a positive union_origin_cache_bytes)";
+    if (o.max_union_cached_origins_consumed == 0 || o.max_union_cached_states_consumed == 0) {
+        return p + "needs both union origin consumption caps, positive";
+    }
+    if (o.union_progressive_schedule != "off") return p + "is not supported with union_progressive_schedule";
+    if (o.adaptive_emission_handoff) return p + "is not supported with adaptive_emission_handoff";
+    if (o.diagnostic_union_only) return p + "is not supported with diagnostic_union_only (its digest needs the full mass matrix)";
+    if (o.diagnostic_union_evidence_dump || o.diagnostic_union_work_trace || o.diagnostic_union_seeding_profile > 0 ||
+        !o.diagnostic_union_verification_census.empty()) {
+        return p + "is not supported with union diagnostics that need the full mass matrix";
+    }
+    return std::nullopt;
+}
+// S2-G: small physical-footprint checkpoints of a blocked-route run (stage, bytes, peak, seconds since the run began);
+// recorded only when the route is on, reset at every run start, written to the status (final and stopped).
+struct FootprintCheckpoint {
+    std::string stage;
+    std::uint64_t current = 0, peak = 0;
+    double seconds = 0.0;
+};
+std::mutex g_checkpoint_mutex;
+bool g_checkpoints_on = false;
+Clock::time_point g_checkpoints_started;
+std::vector<FootprintCheckpoint> g_footprint_checkpoints;
+void note_footprint(const std::string& stage) {
+    std::lock_guard<std::mutex> lock(g_checkpoint_mutex);
+    if (!g_checkpoints_on) return;
+    const FootprintSample fp = physical_footprint();
+    g_footprint_checkpoints.push_back({stage, fp.current, fp.peak, seconds_since(g_checkpoints_started)});
+}
+std::string footprint_checkpoint_rows() {
+    std::lock_guard<std::mutex> lock(g_checkpoint_mutex);
+    if (!g_checkpoints_on) return "";
+    std::ostringstream o;
+    o << std::fixed << std::setprecision(3) << "footprint_checkpoints	" << g_footprint_checkpoints.size() << '\n';
+    for (std::size_t i = 0; i < g_footprint_checkpoints.size(); ++i) {
+        const FootprintCheckpoint& c = g_footprint_checkpoints[i];
+        const std::string k = "footprint_checkpoint" + std::to_string(i + 1) + "_";
+        o << k << "stage\t" << c.stage << '\n' << k << "phys_footprint_bytes\t" << c.current << '\n' << k
+          << "phys_footprint_peak_bytes\t" << c.peak << '\n' << k << "seconds\t" << c.seconds << '\n';
+    }
+    return o.str();
+}
 // S2-A: the run's incumbent -- the best fully evaluated candidate so far -- and the early evaluation's account (reset
 // at every run start). Scores and priors are the unchanged scorer's and the ranking's own.
 struct EarlyIncumbent {
@@ -236,6 +293,7 @@ std::string minimal_status(const RunWatch& watch, const std::string& state, cons
                                   "genotype, not a call")
          << '\n';
     for (const auto& hash : g_input_hashes) text << "sha256_" << hash.first << '\t' << hash.second << '\n';
+    text << footprint_checkpoint_rows();   // S2-G (blocked route only)
     if (watch.early_incumbent) {   // S2-A
         text << "early_incumbent\texperimental_v1\ncheckpoint_committed\t" << (watch.checkpoint_committed ? "yes" : "no")
              << "\ncheckpoint_stage\t" << watch.checkpoint_stage << '\n';
@@ -585,6 +643,13 @@ struct CandidateSetReport {
     // I2-A: set when the initial union pass ran on the experimental indexed backend (whether it completed or refused)
     bool indexed_union = false;
     IndexedUnionReport indexed;
+    // S2-G: the blocked union route (union_fragment_blocks), when it ran: its result without the scores (blocks,
+    // completed and refused-block work, totals), the block size, the caps it ran under and its largest per-block footprint
+    bool blocked_route = false;
+    std::size_t blocked_block_pairs = 0;
+    BlockedUnionResult blocked;
+    FragmentScoringOptions blocked_options;
+    std::uint64_t blocked_footprint_max = 0;
     StartSortReport start_sort;
     // True when no beam ran at all: K = 0, no phase audit and no positive development prefix, so the
     // candidate set is exactly the panel and nothing about it is conditional on a search. Reported as
@@ -947,6 +1012,8 @@ void write_status(
         out << "resources_phys_footprint_peak_bytes\t" << footprint.peak << '\n';
         out << "resources_rss_peak_bytes\t" << static_cast<std::uint64_t>(peak_rss_gib() * 1073741824.0) << '\n';
     }
+    note_footprint(std::string("status_written:") + genotype_run_status_name(status));   // S2-G: completion or refusal
+    out << footprint_checkpoint_rows();
     out << "gfa\t" << options.gfa_path << '\n';
     out << "reference_path\t" << options.reference_path << '\n';
     if (!options.preset_name.empty()) {
@@ -995,7 +1062,7 @@ void write_status(
                                 "gap_recursion_backend",
                                 "dosage_census_backend", "adaptive_emission_handoff", "output_schema", "early_incumbent",
                                 "test_interrupt_point", "diagnostic_union_evidence_dump", "diagnostic_union_kernel_dump",
-                                "union_progressive_schedule"}) {
+                                "union_progressive_schedule", "union_fragment_blocks"}) {
             const auto source = options.setting_sources.find(key);
             if (source == options.setting_sources.end()) continue;
             const std::string k = key;
@@ -1021,6 +1088,7 @@ void write_status(
                                       : k == "diagnostic_union_evidence_dump" ? std::string(options.diagnostic_union_evidence_dump ? "1" : "0")
                                       : k == "diagnostic_union_kernel_dump" ? std::string(options.diagnostic_union_kernel_dump ? "1" : "0")
                                       : k == "union_progressive_schedule" ? options.union_progressive_schedule
+                                      : k == "union_fragment_blocks" ? options.union_fragment_blocks
                                       : k == "gap_recursion_backend"
                                           ? std::string(gap_recursion_backend_name(options.gap_recursion_fixed_geometry))
                                                                          : std::to_string(options.adaptive_fine_max_served_placements);
@@ -1291,7 +1359,88 @@ void write_status(
                 << q.out_of_place << "\nstart_sort_in_place\t" << q.in_place << "\nstart_sort_fallbacks\t"
                 << q.fallbacks << "\nthreads_start_sort_peak_worker_bytes\t" << q.peak_worker_bytes << '\n';
         }
-        if (candidate_set->indexed_union) {
+        if (candidate_set->indexed_union && candidate_set->blocked_route) {
+            // S2-G (EXPERIMENTAL): the blocked route's provenance, actual resource settings, per-block work and admission,
+            // and on refusal the completed blocks, the refused block (direct/served breakdown unavailable) and the attempt.
+            const IndexedUnionReport& x = candidate_set->indexed;
+            const ContentIndexReport& ix = x.index;
+            const BlockedUnionResult& r = candidate_set->blocked;
+            const FragmentScoringOptions& o = candidate_set->blocked_options;
+            const std::ios_base::fmtflags saved_flags = out.flags();
+            const std::streamsize saved_precision = out.precision();
+            out << "union_scoring_backend\tindexed_fine_experimental\n"
+                << "union_scoring_backend_stages\tinitial_union_pass\n"
+                << "union_scoring_backend_unchanged_stages\tadaptive_repair_prepared_context,dosage,phase_audit_rerank\n"
+                << "indexed_union_refusal\t" << (x.refusal.empty() ? std::string("none") : x.refusal) << '\n'
+                << "union_route\tblocked_fine_core_experimental\nunion_fragment_block_pairs\t" << candidate_set->blocked_block_pairs
+                << "\nunion_origin_aggregate_policy\tfine_core_partition_experimental\nunion_evidence_layout\tfine_views"
+                << "\nunion_store_layout\texact\nunion_origin_cache_bytes\t" << o.union_origin_cache_bytes
+                << "\nunion_origin_whole_budget_bytes\t" << o.union_origin_cache_bytes / 2
+                << "\nunion_origin_fine_budget_bytes\t" << o.union_origin_cache_bytes - o.union_origin_cache_bytes / 2
+                << "\nindexed_union_store_budget_bytes\t" << x.store_budget_bytes
+                << "\nunion_cap_physical_origins\t" << o.max_physical_origins << "\nunion_cap_state_classes\t" << o.max_state_classes
+                << "\nunion_cap_piece_hits\t" << o.max_piece_hits << "\nunion_cap_latent_alignment_pairs\t" << o.max_latent_alignment_pairs
+                << "\nunion_cap_mass_cells\t" << o.max_mass_cells
+                << "\nunion_cap_cached_placements_consumed\t" << o.max_union_cached_placements_consumed
+                << "\nunion_cap_cached_origins_consumed\t" << o.max_union_cached_origins_consumed
+                << "\nunion_cap_cached_states_consumed\t" << o.max_union_cached_states_consumed
+                << "\nunion_cap_cached_prefilters_consumed\t" << o.max_union_cached_prefilters_consumed
+                << "\nunion_caps_scope\tcumulative_across_blocks"
+                << "\nindexed_union_max_read_bp\t" << x.max_read_bp << "\nindexed_union_haplotypes\t" << ix.haplotypes
+                << "\nindexed_union_index_metadata_bytes\t" << ix.unit_bytes + ix.occurrence_bytes
+                << "\nindexed_union_interior_units\t" << ix.interior_units << "\nindexed_union_window_units\t" << ix.window_units
+                << "\nindexed_union_fine_units\t" << ix.fine_units << "\nindexed_union_hash_collisions\t" << ix.hash_collisions
+                << "\nunion_fragment_blocks_completed\t" << r.blocks.size()
+                << "\nunion_fragment_blocks_run_completed\t" << (r.completed ? "yes" : "no")
+                << "\nunion_fragment_block_footprint_max_bytes\t" << candidate_set->blocked_footprint_max
+                << "\nunion_end_phys_footprint_bytes\t" << g_union_end_footprint << '\n';
+            for (std::size_t i = 0; i < r.blocks.size(); ++i) {
+                const BlockedBlockReport& b = r.blocks[i];
+                const std::string k = "union_block" + std::to_string(i + 1) + "_";
+                out << k << "fragments\t" << b.fragments << '\n' << k << "executed_physical_origins\t" << b.observed_physical_origins
+                    << '\n' << k << "direct_physical_origins\t" << b.direct_physical_origins << '\n' << k << "served_physical_origins\t"
+                    << b.served_physical_origins << '\n' << k << "whole_origins_constructed\t" << b.origins_constructed << '\n' << k
+                    << "fine_origins_constructed\t" << b.fine_origins_constructed << '\n' << k << "whole_entities_admitted\t"
+                    << b.origin_entities_admitted << '\n' << k << "whole_entities_declined\t" << b.origin_entities_declined << '\n'
+                    << k << "whole_held_bytes\t" << b.origin_held_bytes << '\n' << k << "fine_windows_eligible\t"
+                    << b.fine_windows_eligible << '\n' << k << "fine_windows_admitted\t" << b.fine_windows_admitted << '\n' << k
+                    << "fine_windows_declined\t" << b.fine_windows_declined << '\n' << k << "fine_charged_bytes\t"
+                    << b.fine_charged_bytes << '\n' << k << "fine_served_physical_origins\t" << b.fine_served_physical_origins
+                    << '\n' << k << "executed_state_classes\t" << b.state_classes_executed << '\n' << k << "executed_dps\t"
+                    << b.executed_dps << '\n' << k << "phys_footprint_after_bytes\t" << b.footprint_after << '\n';
+            }
+            const auto totals = [&](const char* name, const UnionCumulativeCharges& c) {
+                out << name << "physical_origins\t" << c.physical_origins << '\n' << name << "piece_hits\t" << c.piece_hits << '\n'
+                    << name << "cached_placements_consumed\t" << c.placements_consumed << '\n' << name
+                    << "cached_origins_consumed\t" << c.origins_consumed << '\n' << name << "cached_states_consumed\t"
+                    << c.states_consumed << '\n' << name << "cached_prefilters_consumed\t" << c.prefilters_consumed << '\n'
+                    << name << "state_classes\t" << c.executed.statistical_state_classes << '\n';
+            };
+            totals("union_completed_blocks_", r.completed_totals);
+            if (!r.completed) {
+                out << "union_refused_block\t" << (r.has_refused_block ? std::to_string(r.blocks.size() + 1) : std::string("none")) << '\n';
+                if (r.has_refused_block) {
+                    const BlockedBlockReport& b = r.refused_block;
+                    out << "union_refused_block_stage\t" << b.stage << "\nunion_refused_block_first_fragment\t" << b.first_fragment
+                        << "\nunion_refused_block_fragments\t" << b.fragments
+                        << "\nunion_refused_block_executed_physical_origins\t" << b.observed_physical_origins
+                        << "\nunion_refused_block_piece_hits\t" << b.observed_piece_hits
+                        << "\nunion_refused_block_direct_physical_origins\tunavailable"
+                        << "\nunion_refused_block_served_physical_origins\tunavailable"
+                        << "\nunion_refused_block_cached_origins_consumed\t" << b.origins_consumed
+                        << "\nunion_refused_block_cached_states_consumed\t" << b.states_consumed
+                        << "\nunion_refused_block_cached_placements_consumed\t" << b.placements_consumed
+                        << "\nunion_refused_block_state_classes\t" << b.state_classes_executed
+                        << "\nunion_refused_block_whole_origins_constructed\t" << b.origins_constructed
+                        << "\nunion_refused_block_fine_origins_constructed\t" << b.fine_origins_constructed << '\n';
+                }
+                totals("union_attempt_", r.attempt_totals);
+            }
+            out << std::fixed << std::setprecision(3) << "seconds_indexed_union_index_build\t" << r.seconds_index_build
+                << "\nseconds_union_block_combination\t" << r.seconds_combination << '\n';
+            out.flags(saved_flags);
+            out.precision(saved_precision);
+        } else if (candidate_set->indexed_union) {
             // I2-A (EXPERIMENTAL): which stage used the indexed backend, its guards and what it did. Present only
             // when the profile selected it; every key here is backend provenance, executed work, memory or time.
             const IndexedUnionReport& x = candidate_set->indexed;
@@ -1747,6 +1896,12 @@ void apply_genotype_setting(const std::string& context, const std::string& key, 
             throw std::runtime_error(context + ": 'union_progressive_schedule' is off or experimental_v1: " + value);
         }
         options.union_progressive_schedule = value;
+    }
+    else if (key == "union_fragment_blocks") {   // S2-G (EXPERIMENTAL)
+        if (value != "off" && value != "fine_core_4096_experimental") {
+            throw std::runtime_error(context + ": 'union_fragment_blocks' is off or fine_core_4096_experimental: " + value);
+        }
+        options.union_fragment_blocks = value;
     }
     else if (key == "diagnostic_union_kernel_dump") {   // S2-C (DIAGNOSTIC ONLY)
         if (value != "0" && value != "1") throw std::runtime_error(context + ": 'diagnostic_union_kernel_dump' is 0 or 1: " + value);
@@ -2420,6 +2575,15 @@ GenotypeRunStatus run_genotype_body(const GenotypeCommandOptions& options, Genot
     }
     if (const std::optional<std::string> refused = early_incumbent_refusal(options)) {   // S2-A: before the prefix
         throw std::invalid_argument(*refused);
+    }
+    if (const std::optional<std::string> refused = union_fragment_blocks_refusal(options)) {   // S2-G: before the prefix
+        throw std::invalid_argument(*refused);
+    }
+    {
+        std::lock_guard<std::mutex> lock(g_checkpoint_mutex);   // S2-G: this run's checkpoints only
+        g_checkpoints_on = options.union_fragment_blocks != "off";
+        g_checkpoints_started = Clock::now();
+        g_footprint_checkpoints.clear();
     }
     g_incumbent = EarlyIncumbent{};   // S2-A
     g_progressive = ProgressiveUnion{};   // S2-D
@@ -3307,7 +3471,53 @@ GenotypeRunStatus run_genotype_body(const GenotypeCommandOptions& options, Genot
                 indexed_options.union_origin_cache_bytes = options.union_origin_cache_bytes;
                 indexed_options.max_union_cached_origins_consumed = options.max_union_cached_origins_consumed;
                 indexed_options.max_union_cached_states_consumed = options.max_union_cached_states_consumed;
-                if (!g_progressive.enabled) {
+                if (options.union_fragment_blocks != "off") {
+                    // ---- S2-G: the combined route -- the same indexed scorer over fragment blocks, each block owning its
+                    // whole and fine-core aggregates; scores and audit views as the bulk route's (S2-F gates)
+                    const std::size_t block = options.test_union_fragment_block_pairs != 0 ? options.test_union_fragment_block_pairs : 4096;
+                    candidate_report.blocked_route = true;
+                    candidate_report.blocked_block_pairs = block;
+                    candidate_report.blocked_options = indexed_options;
+                    BlockedUnionResult out = score_diplotypes_indexed_blocked(
+                        interned, scored_pairs, fragments, library, indexed_options, indexed_segments, options.indexed_union_store_bytes,
+                        true, block,
+                        [&](BlockedBlockReport& rep, bool before) {
+                            if (before) return;
+                            rep.footprint_after = physical_footprint().current;
+                            candidate_report.blocked_footprint_max = std::max(candidate_report.blocked_footprint_max, rep.footprint_after);
+                        },
+                        true);
+                    candidate_report.indexed.index = out.index;
+                    candidate_report.indexed.seconds_index_build = out.seconds_index_build;
+                    candidate_report.indexed.store_budget_bytes = options.indexed_union_store_bytes;
+                    candidate_report.indexed.refusal = out.refusal;
+                    candidate_report.indexed.max_read_bp = 1;   // as the bulk adapter reports it
+                    for (const ReadPair& f : fragments) {
+                        candidate_report.indexed.max_read_bp =
+                            std::max({candidate_report.indexed.max_read_bp, f.first.bases.size(), f.second.bases.size()});
+                    }
+                    double block_seconds = 0.0;
+                    for (const BlockedBlockReport& b : out.blocks) block_seconds += b.seconds;
+                    if (!out.completed) {
+                        // no union score is published; the whole attempt's observed work is what the refusal reports
+                        FragmentScoringObservation& o = candidate_report.observed;
+                        o = FragmentScoringObservation{};
+                        o.counters = out.attempt_totals.executed;
+                        o.threads_used_placement = out.result.threads_used_placement;
+                        o.threads_used_combination = out.result.threads_used_combination;
+                        o.seconds_placement_and_mass = block_seconds - out.seconds_combination;
+                        o.seconds_diploid_combination = out.seconds_combination;
+                        o.union_origin_cache = out.result.union_origin_cache;
+                        candidate_report.blocked = std::move(out);
+                        note_footprint("union_refusal");
+                        throw ResourceExhausted(candidate_report.blocked.refusal);   // the existing refusal path (the checkpoint stays)
+                    }
+                    FragmentScoringResult combined = std::move(out.result);
+                    combined.seconds_placement_and_mass = block_seconds - out.seconds_combination;
+                    out.result = FragmentScoringResult{};
+                    candidate_report.blocked = std::move(out);
+                    scored = std::move(combined);
+                } else if (!g_progressive.enabled) {
                 scored = score_diplotypes_indexed_union(interned, scored_pairs, fragments, library, indexed_options,
                                                         indexed_segments, options.indexed_union_store_bytes,
                                                         &candidate_report.indexed, &candidate_report.observed,
@@ -3478,6 +3688,7 @@ GenotypeRunStatus run_genotype_body(const GenotypeCommandOptions& options, Genot
             candidate_report.union_prefilter_cache = scored.union_prefilter_cache;
             candidate_report.start_sort = scored.start_sort;
             g_union_end_footprint = physical_footprint().current;
+            note_footprint("union_completion");   // S2-G
         } catch (const ResourceExhausted& error) {
             rescore_failure = error.what();
             candidate_report.observed_valid = true;
@@ -4212,6 +4423,7 @@ GenotypeRunStatus run_genotype_body(const GenotypeCommandOptions& options, Genot
                 }
             }
         }
+        note_footprint("candidate_pool_constructed");   // S2-G
         // The union pass's mass matrix is not needed again; release it before the repair context exists.
         std::vector<double>().swap(scored.log_mass);
         std::vector<OriginSummary>().swap(scored.origin_summary);
@@ -4304,7 +4516,9 @@ GenotypeRunStatus run_genotype_body(const GenotypeCommandOptions& options, Genot
             search_started = true;
             search = std::make_unique<CoordinateRepairSearch>(model, emissions, fragments, library, repair_scoring,
                                                               search_options);
+            note_footprint("refinement_context_constructed");   // S2-G
             search->start(anchor_diplotype.first.alleles, anchor_diplotype.second.alleles, anchor_score);
+            note_footprint("initial_incumbent_placed");   // S2-G
             search_built = Clock::now();
             RepairHooks hooks;
             hooks.on_scored = [&](const std::vector<std::size_t>& a, const std::vector<std::size_t>& b,
@@ -4341,6 +4555,7 @@ GenotypeRunStatus run_genotype_body(const GenotypeCommandOptions& options, Genot
                     g_watch->repair_rounds_committed = search->rounds().size();
                 }
                 write_running_status("repair round " + std::to_string(round.index) + " committed");
+                if (search->rounds().size() == 1) note_footprint("first_committed_refinement_round");   // S2-G
                 if (g_incumbent.enabled && g_incumbent.dirty && !g_incumbent.failed) (void)commit_checkpoint();   // S2-A
                 if (options.test_interrupt_point == "adaptive_refinement") {   // S2-A TEST HOOK
                     stop_run("TIME_LIMIT", "test hook: during adaptive refinement (after the first committed round)", 124);
@@ -7255,6 +7470,7 @@ std::optional<int> parse_genotype_arguments(const std::vector<std::string>& args
     // resolver execute_genotype_command applies too.
     if (const std::optional<std::string> refused = resolve_dosage_contract(options)) throw std::runtime_error(*refused);
     if (const std::optional<std::string> refused = early_incumbent_refusal(options)) throw std::runtime_error(*refused);
+    if (const std::optional<std::string> refused = union_fragment_blocks_refusal(options)) throw std::runtime_error(*refused);
     if (profiled) {
         // Every setting a flag gave beside the profile, with the value it took.
         for (const std::string& flag : args) {

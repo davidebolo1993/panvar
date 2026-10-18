@@ -4975,6 +4975,338 @@ void test_progressive_schedule() {
                  "PROVISIONAL with ties/projection; later stop and union cap keep the last checkpoint; 1/4 threads; contract\n";
 }
 
+
+// ---- S2-G: the combined blocked route in the caller (union_fragment_blocks fine_core_4096_experimental) ---------------
+namespace s2g {
+// Status keys a combined-route run may differ in from the ordinary (bulk indexed) run, each declared explicitly:
+// route provenance written only by one route, timing, process resources and executed/served work -- never a score,
+// ranking, genotype, phase, filter or sequence key (those are compared byte for byte in their files and here).
+bool integrated_only(const std::string& k) {
+    static const std::set<std::string> names = {
+        "union_route", "union_fragment_block_pairs", "union_origin_aggregate_policy", "union_evidence_layout",
+        "union_store_layout", "union_origin_cache_bytes", "union_origin_whole_budget_bytes", "union_origin_fine_budget_bytes",
+        "union_cap_physical_origins", "union_cap_state_classes", "union_cap_piece_hits", "union_cap_latent_alignment_pairs",
+        "union_cap_mass_cells", "union_cap_cached_placements_consumed", "union_cap_cached_origins_consumed",
+        "union_cap_cached_states_consumed", "union_cap_cached_prefilters_consumed", "union_caps_scope",
+        "union_fragment_blocks_completed", "union_fragment_blocks_run_completed", "union_fragment_block_footprint_max_bytes",
+        "seconds_union_block_combination", "footprint_checkpoints"};
+    static const std::regex block("^union_block[0-9]+_(fragments|executed_physical_origins|direct_physical_origins|"
+                                  "served_physical_origins|whole_origins_constructed|fine_origins_constructed|"
+                                  "whole_entities_admitted|whole_entities_declined|whole_held_bytes|fine_windows_eligible|"
+                                  "fine_windows_admitted|fine_windows_declined|fine_charged_bytes|fine_served_physical_origins|"
+                                  "executed_state_classes|executed_dps|phys_footprint_after_bytes)$");
+    static const std::regex totals("^union_completed_blocks_(physical_origins|piece_hits|cached_placements_consumed|"
+                                   "cached_origins_consumed|cached_states_consumed|cached_prefilters_consumed|state_classes)$");
+    static const std::regex checkpoint("^footprint_checkpoint[0-9]+_(stage|phys_footprint_bytes|phys_footprint_peak_bytes|seconds)$");
+    return names.count(k) != 0 || std::regex_match(k, block) || std::regex_match(k, totals) || std::regex_match(k, checkpoint);
+}
+// the bulk route's single-batch provenance rows (written only by the ordinary indexed route)
+bool ordinary_only(const std::string& k) {
+    static const std::regex batch("^(indexed_union_|seconds_indexed_union_|worker_seconds_indexed_union_|threads_indexed_union_)");
+    return std::regex_search(k, batch);
+}
+// keys both routes write whose values are timing, process resources or executed/served work
+bool shared_volatile(const std::string& k) {
+    static const std::regex timing("^(seconds_|worker_seconds_)|^elapsed_seconds$");
+    static const std::set<std::string> names = {
+        // process resources
+        "resources_phys_footprint_peak_bytes", "resources_rss_peak_bytes", "resources_footprint_at_repair_start_bytes",
+        "union_end_phys_footprint_bytes", "threads_peak_active_workers",
+        // timing and resources of the S2-A early pass and checkpoint (same work, measured again)
+        "checkpoint_seconds_first_evaluated_prediction", "checkpoint_seconds_committed", "early_incumbent_seconds_evaluation",
+        "early_incumbent_seconds_preparation", "early_incumbent_seconds_selection", "early_incumbent_footprint_after_bytes",
+        // the last scorer call's memory accounts (a block's batch under the combined route, never a whole-run matrix)
+        "scorer_mass_matrix_bytes", "scorer_haplotype_sequence_bytes",
+        // executed / served union work, summed over blocks (the route's purpose: different execution, identical science)
+        "candidate_bases_scanned", "start_sort_in_place", "start_sort_out_of_place", "start_sort_fallbacks",
+        "threads_start_sort_peak_worker_bytes", "union_origin_cache_eligible_segments", "union_origin_cache_admitted_segments",
+        "union_origin_cache_declined_segments", "union_origin_cache_hits", "union_origin_cache_origins_constructed",
+        "union_origin_cache_payload_bytes", "union_origin_cache_peak_bytes", "union_cached_origins_consumed",
+        "union_cached_states_consumed", "physical_origins", "statistical_state_classes", "latent_alignment_pairs",
+        "valid_fr_states", "piece_hits", "full_read_verifications", "dp_evaluations", "proposed_starts", "unique_starts",
+        "accepted_mate_placements", "reused_physical_origins", "reused_state_aggregates", "merged_state_classes"};
+    return std::regex_search(k, timing) || names.count(k) != 0;
+}
+// the combined route's own resource rows, when both runs write them (memory and time of the same work)
+bool route_resource(const std::string& k) {
+    static const std::regex rows("^footprint_checkpoint[0-9]+_(phys_footprint_bytes|phys_footprint_peak_bytes|seconds)$|"
+                                 "^union_block[0-9]+_phys_footprint_after_bytes$|^union_fragment_block_footprint_max_bytes$|"
+                                 "^seconds_union_block_combination$");
+    return std::regex_match(k, rows);
+}
+// worker counts, allowed to differ only when the runs declared different thread counts
+bool thread_row(const std::string& k) {
+    static const std::set<std::string> names = {"threads_requested", "threads_used_combination", "threads_used_placement",
+                                                "threads_start_sort_workers", "threads_start_sort_share_bytes",
+                                                "threads_repair_enumeration_workers"};
+    return names.count(k) != 0;
+}
+std::vector<std::string> unexpected_status_differences(const std::string& a, const std::string& b, std::string* listing,
+                                                       bool threads_differ = false, bool profiles_differ = false) {
+    const auto x = sf::kv(a), y = sf::kv(b);
+    std::set<std::string> keys;
+    for (const auto& [k, v] : x) keys.insert(k);
+    for (const auto& [k, v] : y) keys.insert(k);
+    std::vector<std::string> bad;
+    for (const std::string& k : keys) {
+        const auto i = x.find(k), j = y.find(k);
+        if (i != x.end() && j != y.end() && i->second == j->second) continue;
+        if (listing != nullptr && !integrated_only(k) && !ordinary_only(k)) *listing += k + ",";
+        const bool allowed = (i == x.end() && integrated_only(k)) || (j == y.end() && ordinary_only(k)) ||
+                             (i != x.end() && j != y.end() && (shared_volatile(k) || route_resource(k) || (threads_differ && thread_row(k)) ||
+                                                                (profiles_differ && (k == "profile" || k == "profile_name" || k == "profile_sha256"))));
+        if (!allowed) bad.push_back(k);
+    }
+    return bad;
+}
+// every output file identical (paths normalised) except the status (explicit allowances above), the settings record
+// (exactly the route's own row), repair_memory (a timing log) and the dosage status's timing rows
+void require_same_science(const std::string& control, const std::string& integrated, const std::string& what,
+                          bool threads_differ = false, bool profiles_differ = false) {
+    require(sf::files(path(control)) == sf::files(path(integrated)), what + ": the same output files");
+    for (const std::string& f : sf::files(path(control))) {
+        const std::string a = path(control + "/" + f), b = path(integrated + "/" + f);
+        if (f == "call.repair_memory.tsv") continue;
+        if (f == "call.mosaic_status.tsv") {
+            std::string listing;
+            const auto bad = unexpected_status_differences(a, b, &listing, threads_differ, profiles_differ);
+            std::string names;
+            for (const auto& k : bad) names += k + ",";
+            require(bad.empty(), what + ": status keys differ outside the declared allowances: " + names);
+            continue;
+        }
+        if (f == "call.repair_rounds.tsv") {
+            require(rounds_science(a) == rounds_science(b), what + ": the adaptive trajectory is identical");
+            continue;
+        }
+        if (f == "call.settings.tsv") {
+            auto x = sf::kv(a), y = sf::kv(b);
+            if (x.count("union_fragment_blocks") == 0) y.erase("union_fragment_blocks");
+            if (threads_differ) { x.erase("threads"); y.erase("threads"); }
+            if (profiles_differ) {   // two profile files by construction: compare values, not the source column
+                for (auto* m : {&x, &y}) for (auto& [k, v] : *m) v = v.substr(0, v.find('\t'));
+            }
+            require(x == y && sf::kv(b).count("union_fragment_blocks") == 1, what + ": settings differ only by the route's own row");
+            continue;
+        }
+        if (f == "call.dosage_status.tsv") {
+            auto x = sf::kv(a), y = sf::kv(b);
+            for (auto* m : {&x, &y}) for (auto it = m->begin(); it != m->end();) it = it->first.rfind("seconds_", 0) == 0 ? m->erase(it) : std::next(it);
+            require(x == y, what + ": dosage status identical (timing rows aside)");
+            continue;
+        }
+        require(sf::normalised(a, path(control)) == sf::normalised(b, path(integrated)), what + ": " + f + " identical");
+    }
+}
+}  // namespace s2g
+
+void test_blocked_union_route() {
+    namespace fs = std::filesystem;
+    const auto fresh = [&](const std::string& rel, bool blocked, std::size_t block = 37, bool early = true) {
+        fs::remove_all(path(rel));
+        fs::create_directories(path(rel));
+        panvar::GenotypeCommandOptions o =
+            repair_options(rel + "/call", path("phaseable_r1.fq"), path("phaseable_r2.fq"), "tiny_phaseable.gfa");
+        o.output_schema = "sequence_first_v2";
+        o.setting_sources["output_schema"] = "test";
+        if (early) {
+            o.early_incumbent = "experimental_v1";
+            o.setting_sources["early_incumbent"] = "test";
+        }
+        o.union_scoring_backend = "indexed_fine_experimental";
+        o.indexed_union_store_bytes = std::size_t{256} << 20;
+        o.indexed_union_evidence_layout = "fine_views_experimental";
+        o.union_origin_cache_bytes = std::size_t{64} << 20;
+        o.max_union_cached_placements_consumed = 2000000000ULL;
+        o.max_union_cached_origins_consumed = 2000000000ULL;
+        o.max_union_cached_states_consumed = 2000000000ULL;
+        o.max_union_cached_prefilters_consumed = 2000000000ULL;
+        for (const char* k : {"union_scoring_backend", "indexed_union_store_bytes", "indexed_union_evidence_layout"}) o.setting_sources[k] = "test";
+        if (blocked) {
+            o.union_fragment_blocks = "fine_core_4096_experimental";
+            o.setting_sources["union_fragment_blocks"] = "test";
+            o.test_union_fragment_block_pairs = block;
+        }
+        return o;
+    };
+    // (1) complete runs: ordinary (bulk indexed) vs combined at the declared 4,096 (one block here) and at 37 pairs per
+    // block (several blocks), and default-off behaviour
+    require(panvar::execute_genotype_command(fresh("bu_off", false), nullptr) == 0, "S2-G: the ordinary route predicts");
+    require(panvar::execute_genotype_command(fresh("bu_4096", true, 0), nullptr) == 0, "S2-G: the combined route predicts (4,096)");
+    require(panvar::execute_genotype_command(fresh("bu_37", true), nullptr) == 0, "S2-G: the combined route predicts (37)");
+    {
+        std::string listing;
+        (void)s2g::unexpected_status_differences(path("bu_off/call.mosaic_status.tsv"), path("bu_37/call.mosaic_status.tsv"), &listing);
+        std::cout << "  S2-G shared status keys differing (ordinary vs combined): " << (listing.empty() ? "none" : listing) << '\n';
+    }
+    s2g::require_same_science("bu_off", "bu_4096", "S2-G ordinary vs combined (4,096)");
+    s2g::require_same_science("bu_off", "bu_37", "S2-G ordinary vs combined (37 pairs per block)");
+    {
+        const auto off = read_status(path("bu_off/call.mosaic_status.tsv"));
+        const auto on = read_status(path("bu_37/call.mosaic_status.tsv"));
+        const auto settings_off = sf::kv(path("bu_off/call.settings.tsv"));
+        require(off.count("union_route") == 0 && off.count("footprint_checkpoints") == 0 && settings_off.count("union_fragment_blocks") == 0,
+                "S2-G default off: no route row, no checkpoint, no settings row");
+        const std::size_t nblocks = std::stoul(on.at("union_fragment_blocks_completed"));
+        require(on.at("union_route") == "blocked_fine_core_experimental" && on.at("union_fragment_block_pairs") == "37" &&
+                    on.at("union_origin_aggregate_policy") == "fine_core_partition_experimental" &&
+                    on.at("union_fragment_blocks_run_completed") == "yes" && nblocks >= 3 &&
+                    on.at("union_origin_whole_budget_bytes") == std::to_string((std::size_t{64} << 20) / 2) &&
+                    on.at("early_incumbent_union_check") == "reproduced",
+                "S2-G provenance: route, block size, aggregate policy, budget split, blocks, early candidate reproduced");
+        std::set<std::string> stages;
+        for (std::size_t i = 1; i <= std::stoul(on.at("footprint_checkpoints")); ++i) stages.insert(on.at("footprint_checkpoint" + std::to_string(i) + "_stage"));
+        for (const char* s : {"union_completion", "candidate_pool_constructed", "refinement_context_constructed", "initial_incumbent_placed",
+                              "first_committed_refinement_round", "status_written:COMPLETE"}) {
+            require(stages.count(s) == 1, std::string("S2-G footprint checkpoint recorded: ") + s);
+        }
+    }
+    // (2) 1 vs 4 threads (combined, several blocks): identical science
+    {
+        panvar::GenotypeCommandOptions one = fresh("bu_t1", true), four = fresh("bu_t4", true);
+        one.threads = 1;
+        four.threads = 4;
+        require(panvar::execute_genotype_command(one, nullptr) == 0 && panvar::execute_genotype_command(four, nullptr) == 0,
+                "S2-G threads: both predict");
+        s2g::require_same_science("bu_t1", "bu_t4", "S2-G 1 vs 4 threads", true);
+        s2g::require_same_science("bu_off", "bu_t4", "S2-G ordinary (2 threads) vs combined at 4 threads", true);
+    }
+    // (3) the CLI route (profile keys) and the prepared-locus route
+    {
+        fs::remove_all(path("bu_cli"));
+        fs::create_directories(path("bu_cli"));
+        std::ofstream(path("bu_cli_profile.tsv")) << "profile\ts2g-test\nunion_scoring_backend\tindexed_fine_experimental\n"
+                                                     "indexed_union_store_bytes\t268435456\nindexed_union_evidence_layout\tfine_views_experimental\n"
+                                                     "union_origin_cache_bytes\t67108864\nmax_union_cached_placements_consumed\t2000000000\n"
+                                                     "max_union_cached_origins_consumed\t2000000000\nmax_union_cached_states_consumed\t2000000000\n"
+                                                     "max_union_cached_prefilters_consumed\t2000000000\nunion_fragment_blocks\tfine_core_4096_experimental\n";
+        std::ofstream(path("bu_cli_off_profile.tsv")) << "profile\ts2g-test-off\nunion_scoring_backend\tindexed_fine_experimental\n"
+                                                         "indexed_union_store_bytes\t268435456\nindexed_union_evidence_layout\tfine_views_experimental\n"
+                                                         "union_origin_cache_bytes\t67108864\nmax_union_cached_placements_consumed\t2000000000\n"
+                                                         "max_union_cached_origins_consumed\t2000000000\nmax_union_cached_states_consumed\t2000000000\n"
+                                                         "max_union_cached_prefilters_consumed\t2000000000\n";
+        fs::remove_all(path("bu_cli_off"));
+        fs::create_directories(path("bu_cli_off"));
+        const auto cli = [&](const std::string& profile, const std::string& prefix) {
+            return std::vector<std::string>{"--graph", path("tiny_phaseable.gfa"), "--reference-path", "sampleA#1#chr1:0-100",
+                                            "--reads1", path("phaseable_r1.fq"), "--reads2", path("phaseable_r2.fq"),
+                                            "--library", path("lib.txt"), "--kmer-size", "21", "--syncmer-s", "11",
+                                            "--max-mosaic-candidates", "16", "--threads", "2", "--profile", path(profile),
+                                            "--output-schema", "sequence_first_v2", "--quiet", "--out", path(prefix)};
+        };
+        const int a = panvar::run_genotype_command(cli("bu_cli_off_profile.tsv", "bu_cli_off/call"));
+        const int b = panvar::run_genotype_command(cli("bu_cli_profile.tsv", "bu_cli/call"));
+        require(a == b && a == 0, "S2-G CLI: both routes complete with the same exit code");
+        require(sf::kv(path("bu_cli/call.settings.tsv")).at("union_fragment_blocks").rfind("fine_core_4096_experimental", 0) == 0,
+                "S2-G CLI: the profile's route is recorded in the settings");
+        require(read_status(path("bu_cli/call.mosaic_status.tsv")).at("union_fragment_block_pairs") == "4096",
+                "S2-G CLI: the declared 4,096-pair blocks");
+        s2g::require_same_science("bu_cli_off", "bu_cli", "S2-G CLI ordinary vs combined", false, true);
+        // prepared locus: cold and warm runs of the combined route, and the ordinary warm run
+        panvar::GenotypeCommandOptions cold = fresh("bu_prep_cold", true), warm = fresh("bu_prep_warm", true), warm_off = fresh("bu_prep_off", false);
+        const std::shared_ptr<const panvar::PreparedLocus> prepared = panvar::prepare_genotype_locus(cold);
+        const panvar::GenotypeRunStatus sc = panvar::run_genotype(cold);
+        const panvar::GenotypeRunStatus sw = panvar::run_genotype_prepared(warm, *prepared);
+        const panvar::GenotypeRunStatus so = panvar::run_genotype_prepared(warm_off, *prepared);
+        require(sc == sw && sw == so, "S2-G prepared locus: the same status cold, warm and ordinary");
+        for (const char* f : {"call.genotypes.tsv", "call.block_genotypes.tsv", "call.mosaic_scores.tsv", "call.mosaic_candidates.tsv",
+                              "call.sequence_locus.tsv", "call.sequence_haplotypes.tsv", "call.sequence_blocks.tsv"}) {
+            const std::string x = path(std::string("bu_prep_cold/") + f), y = path(std::string("bu_prep_warm/") + f), z = path(std::string("bu_prep_off/") + f);
+            require(exists(x) == exists(y) && exists(y) == exists(z), std::string("S2-G prepared: presence of ") + f);
+            if (!exists(x)) continue;
+            require(sf::normalised(x, path("bu_prep_cold")) == sf::normalised(y, path("bu_prep_warm")) &&
+                        sf::normalised(y, path("bu_prep_warm")) == sf::normalised(z, path("bu_prep_off")),
+                    std::string("S2-G prepared: ") + f + " identical cold/warm/ordinary");
+        }
+        require(read_status(path("bu_prep_warm/call.mosaic_status.tsv")).at("union_route") == "blocked_fine_core_experimental",
+                "S2-G prepared: the warm run took the combined route");
+    }
+    // (4) a cap reached in a later block: the S2-A checkpoint stays PROVISIONAL, no union score is published, and the
+    // completed blocks, the refused block (breakdown unavailable) and the whole attempt are reported
+    {
+        const auto ref = read_status(path("bu_37/call.mosaic_status.tsv"));
+        // the first k >= 2 completed blocks whose origins cover the early pass (which must fit under the cap); block k + 1 refuses
+        const std::uint64_t early = std::stoull(ref.at("early_incumbent_physical_origins"));
+        const std::size_t nblocks = std::stoul(ref.at("union_fragment_blocks_completed"));
+        std::size_t k = 0;
+        std::uint64_t done = 0;
+        while (k < nblocks && (k < 2 || done < early)) done += std::stoull(ref.at("union_block" + std::to_string(++k) + "_executed_physical_origins"));
+        require(k + 1 < nblocks && done >= early, "S2-G refusal fixture: a later block exists after the early pass fits");
+        panvar::GenotypeCommandOptions o = fresh("bu_cap", true);
+        o.max_physical_origins = done + 1;   // blocks 1..k fit, block k + 1 does not
+        const int code = panvar::execute_genotype_command(o, nullptr);
+        const auto locus = sf::kv(path("bu_cap/call.sequence_locus.tsv"));
+        const auto st = read_status(path("bu_cap/call.mosaic_status.tsv"));
+        require(code == 3 && locus.at("prediction") == "PROVISIONAL" && locus.at("completion") == "union_scoring_cap" &&
+                    locus.at("checkpoint_stage") == "early_panel_incumbent" &&
+                    locus.at("checkpoint_log_likelihood") == ref.at("early_incumbent_log_likelihood") && no_ranking_or_call("bu_cap/call"),
+                "S2-G: a later-block refusal keeps the early checkpoint as PROVISIONAL and publishes no union ranking (exit " +
+                    std::to_string(code) + ")");
+        require(st.at("union_fragment_blocks_run_completed") == "no" && st.at("union_fragment_blocks_completed") == std::to_string(k) &&
+                    st.at("union_refused_block") == std::to_string(k + 1) && st.at("union_refused_block_stage") == "columns" &&
+                    st.at("union_refused_block_direct_physical_origins") == "unavailable" &&
+                    st.at("union_refused_block_served_physical_origins") == "unavailable" &&
+                    std::stoull(st.at("union_completed_blocks_physical_origins")) == done &&
+                    std::stoull(st.at("union_attempt_physical_origins")) ==
+                        done + std::stoull(st.at("union_refused_block_executed_physical_origins")) &&
+                    std::stoull(st.at("union_attempt_physical_origins")) > o.max_physical_origins &&
+                    st.count("union_block" + std::to_string(k + 1) + "_fragments") == 0,
+                "S2-G: completed-block, refused-block and whole-attempt work reported distinctly");
+        std::cout << "  S2-G refusal: cap " << o.max_physical_origins << " refused in block " << k + 1 << " of " << nblocks
+                  << "; completed " << done << " + refused " << st.at("union_refused_block_executed_physical_origins") << " = attempt "
+                  << st.at("union_attempt_physical_origins") << '\n';
+        std::set<std::string> stages;
+        for (std::size_t i = 1; i <= std::stoul(st.at("footprint_checkpoints")); ++i) stages.insert(st.at("footprint_checkpoint" + std::to_string(i) + "_stage"));
+        require(stages.count("union_refusal") == 1 && stages.count("union_completion") == 0, "S2-G: the refusal checkpoint is recorded");
+    }
+    // (5) incompatible configurations are refused before the prefix is touched; a prefix holding an earlier run's
+    // outputs is left exactly as it was
+    {
+        const auto snapshot = [&](const std::string& rel) {
+            std::map<std::string, std::string> out;
+            for (const std::string& f : sf::files(path(rel))) out[f] = slurp(path(rel + "/" + f));
+            return out;
+        };
+        struct Bad {
+            std::string name;
+            std::function<void(panvar::GenotypeCommandOptions&)> configure;
+        };
+        const std::vector<Bad> bad = {
+            {"reference backend", [](auto& o) { o.union_scoring_backend = "reference"; o.indexed_union_store_bytes = 0; }},
+            {"legacy store", [](auto& o) { o.indexed_union_store_layout = "legacy_i2a"; }},
+            {"reconstructed evidence", [](auto& o) { o.indexed_union_evidence_layout = "reconstructed"; }},
+            {"no origin reuse", [](auto& o) { o.union_origin_cache_bytes = 0; }},
+            {"progressive schedule", [](auto& o) { o.union_progressive_schedule = "experimental_v1"; }},
+            {"emission handoff", [](auto& o) { o.adaptive_emission_handoff = true; }},
+            {"evidence dump", [](auto& o) { o.diagnostic_union_evidence_dump = true; }},
+            {"union only", [](auto& o) { o.diagnostic_union_only = true; }},
+            {"test hook without the route", [](auto& o) { o.union_fragment_blocks = "off"; o.test_union_fragment_block_pairs = 7; }},
+        };
+        // the prefix first holds the ordinary run's outputs
+        fs::remove_all(path("bu_reuse"));
+        fs::copy(path("bu_off"), path("bu_reuse"), fs::copy_options::recursive);
+        const auto before = snapshot("bu_reuse");
+        for (const Bad& b : bad) {
+            panvar::GenotypeCommandOptions o = fresh("bu_reuse_tmp", true);
+            o.out_prefix = path("bu_reuse/call");
+            b.configure(o);
+            bool refused = false;
+            try { (void)panvar::execute_genotype_command(o, nullptr); } catch (const std::invalid_argument&) { refused = true; }
+            catch (const std::runtime_error&) { refused = true; }
+            require(refused, "S2-G contract: " + b.name + " is refused");
+            require(snapshot("bu_reuse") == before, "S2-G contract: " + b.name + " leaves the prefix untouched");
+        }
+        // and a combined run reusing that prefix replaces every output: the same files and science as a fresh one
+        panvar::GenotypeCommandOptions o = fresh("bu_reuse_tmp", true);
+        o.out_prefix = path("bu_reuse/call");
+        require(panvar::execute_genotype_command(o, nullptr) == 0, "S2-G prefix reuse: the combined run completes");
+        fs::remove_all(path("bu_reuse_tmp"));
+        s2g::require_same_science("bu_37", "bu_reuse", "S2-G prefix reuse vs a fresh combined run");
+    }
+    std::cout << "  blocked union route: ordinary/combined outputs identical (4,096 and 37-pair blocks, 1/4 threads, CLI, prepared "
+                 "locus); default off; later-block refusal keeps the checkpoint PROVISIONAL with distinct work; contract and prefix reuse\n";
+}
+
 int main(int argc, char** argv) {
     if (argc < 2) {
         std::cerr << "usage: genotype_command_e2e_test <scratch dir> [source dir]\n";
@@ -4993,6 +5325,22 @@ int main(int argc, char** argv) {
             return 0;
         } catch (const std::exception& error) {
             std::cerr << "genotype command e2e (prepared_locus only): FAIL: " << error.what() << '\n';
+            return 1;
+        }
+    }
+    // S2-G: a focused run of the blocked-route gate (its fixture written here exactly as the full run writes it)
+    if (const char* only = std::getenv("PANVAR_E2E_ONLY"); only != nullptr && std::string(only) == "blocked_union") {
+        try {
+            std::filesystem::create_directories(dir);
+            write_library(path("lib.txt"));
+            const TinyLocus locus = write_tiny_locus("tiny_phaseable.gfa", 80, 70);
+            const auto truths = spell_truths(locus);
+            simulate(truths.first, truths.second, path("phaseable_r1.fq"), path("phaseable_r2.fq"), 123);
+            test_blocked_union_route();
+            std::cout << "genotype command e2e (blocked_union only): PASS\n";
+            return 0;
+        } catch (const std::exception& error) {
+            std::cerr << "genotype command e2e (blocked_union only): FAIL: " << error.what() << '\n';
             return 1;
         }
     }
@@ -5074,6 +5422,7 @@ int main(int argc, char** argv) {
         test_early_incumbent();
         test_early_incumbent_caps();
         test_progressive_schedule();
+        test_blocked_union_route();
         if (argc >= 3) test_profile(argv[2]);
         test_block_quality_columns();
         std::cout << "genotype command end-to-end: PASS\n";

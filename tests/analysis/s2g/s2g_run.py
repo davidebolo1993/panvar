@@ -8,7 +8,12 @@ two declared validation-only resource extensions, physical-origin cap 1,000,000,
 1,000,000,000, every other setting unchanged -- then a bit-for-bit comparison of all 108,939 candidates' score
 components and the numerical top set against the S2-F combined run (blocked_fine.acot30 at 3ab2a11; the kernel source is
 unchanged since). If another limit binds or the comparison fails: stop.
-Part B (frozen after the integration gates, before its execution): see MANIFEST_B.
+Part B (frozen after the integration gates were developed, before its execution): the gates (caller blocked-route gate,
+the S2-F kernel gates, the full e2e) -> C4 and CYP2D6 5x full-caller control/integrated runs and their explicit-allowance
+comparison (s2g_compare.py) -> ONE integrated ACOT 30x full-caller attempt with the original main-arm caps and unchanged
+refinement (prioritised over ACOT 5x) -> ACOT 5x control/integrated/compare if budget permits. Caller arms: the P1 'opt'
+profile (indexed union backend, fine views, origin reuse; time limit = declared timeout - 20 s; 4 GiB footprint guard),
+sequence_first_v2, early_incumbent experimental_v1; integrated adds union_fragment_blocks fine_core_4096_experimental.
 
   s2g_run.py manifest A|B | next A|B | <unit> | dev <name> <note> -- <command...>
 """
@@ -33,7 +38,19 @@ EXTENDED_ORIGIN_CAP = 1_000_000_000        # declared by Sol (S2-G 1) before exe
 EXTENDED_STATE_CLASS_CAP = 1_000_000_000   # declared by Sol (S2-G 1) before execution; validation only
 MANIFEST_A = [("ref.acot30.ordinary_blocked_ext", "reference", "acot_30", 300),
               ("ref.acot30.compare_vs_combined", "ref_compare", "acot_30", 30)]
-MANIFEST_B = []
+MANIFEST_B = [("t.genotype_blocked_union_route", "ctest", "genotype_blocked_union_route", 60),
+              ("t.genotype_blocked_fine", "ctest", "genotype_blocked_fine", 120),
+              ("t.genotype_blocked_union", "ctest", "genotype_blocked_union", 60),
+              ("t.genotype_command_e2e", "ctest", "genotype_command_e2e", 300)]
+for _cell, _tag, _t in (("c4_5", "c4", 90), ("cyp_5", "cyp", 90)):
+    MANIFEST_B += [(f"caller.{_tag}.control", "caller", f"{_cell}:control", _t),
+                   (f"caller.{_tag}.integrated", "caller", f"{_cell}:integrated", _t),
+                   (f"compare.{_tag}", "compare", _tag, 30)]
+MANIFEST_B += [("caller.acot30.integrated", "caller", "acot_30:integrated", 300),
+               ("caller.acot5.control", "caller", "acot_5:control", 150),
+               ("caller.acot5.integrated", "caller", "acot_5:integrated", 150),
+               ("compare.acot5", "compare", "acot5", 30)]
+TAGS = {"c4_5": "c4", "cyp_5": "cyp", "acot_5": "acot5", "acot_30": "acot30"}
 MANIFESTS = {"A": MANIFEST_A, "B": MANIFEST_B}
 
 
@@ -103,8 +120,33 @@ def tsv(path):
     return out
 
 
+def caller_command(cell_id, arm, timeout, d):
+    cell = p1_run.cells()[cell_id]
+    prof = p1_run.profile_for(cell, "opt", d, timeout, cell_id)
+    args = p1_run.genotype_args(cell, prof, f"{d}/call")
+    i = args.index("--dosage-mode")
+    del args[i:i + 2]   # sequence_first_v2: dosage is audit-only by contract
+    extra = f"{d}/profile.s2g.tsv"
+    text = "profile\ts2g-caller\nearly_incumbent\texperimental_v1\n"
+    if arm == "integrated":
+        text += "union_fragment_blocks\tfine_core_4096_experimental\n"
+    open(extra, "w").write(text)
+    args[args.index("--profile") + 2:args.index("--profile") + 2] = ["--profile", extra]
+    return ["nice", f"{BUILD}/panvar", "genotype", *args, "--output-schema", "sequence_first_v2"]
+
+
 def command(unit, kind, target, timeout, d):
     harness = f"{BUILD}/s2c_progressive_harness"
+    if kind == "ctest":
+        return ["nice", "ctest", "--test-dir", BUILD, "-R", f"^panvar_{target}$", "--output-on-failure", "-j1"], "-"
+    if kind == "caller":
+        cell_id, arm = target.split(":")
+        return caller_command(cell_id, arm, timeout, d), f"caller {arm}"
+    if kind == "compare":
+        a, b = f"{OUT}/runs/caller.{target}.control", f"{OUT}/runs/caller.{target}.integrated"
+        if not (os.path.exists(f"{a}/call.mosaic_status.tsv") and os.path.exists(f"{b}/call.mosaic_status.tsv")):
+            return None, "NOT RUN (condition): a caller arm did not run"
+        return [sys.executable, os.path.join(HERE, "s2g_compare.py"), a, b, f"{d}/compare.tsv"], "-"
     if kind == "reference":
         cell = p1_run.cells()[target]
         inputs = f"{S2C}/dump.acot30/call.union_kernel_inputs.bin"
@@ -170,6 +212,15 @@ if __name__ == "__main__":
         rows = MANIFESTS[sys.argv[2]]
         todo = [m[0] for m in rows if m[0] not in done()]
         sys.exit(run_unit(todo[0]) if todo else print("all units recorded") or 0)
+    elif arg == "devcaller":   # devcaller <name> <cell> <arm> <timeout>: a counted development caller run
+        name, cell_id, arm, timeout = sys.argv[2], sys.argv[3], sys.argv[4], int(sys.argv[5])
+        d = f"{OUT}/dev/{name}"
+        os.makedirs(d)
+        sys.exit(dev(name + ".run", f"caller {cell_id} {arm} (calibration)", caller_command(cell_id, arm, timeout, d)))
+    elif arg == "devcompare":
+        sys.exit(dev(sys.argv[2], "comparator calibration", [sys.executable, os.path.join(HERE, "s2g_compare.py"),
+                                                              f"{OUT}/dev/{sys.argv[3]}", f"{OUT}/dev/{sys.argv[4]}",
+                                                              f"{OUT}/dev/{sys.argv[2]}.tsv"]))
     elif arg == "dev":
         sep = sys.argv.index("--")
         sys.exit(dev(sys.argv[2], sys.argv[3], sys.argv[sep + 1:]))
