@@ -10473,6 +10473,14 @@ struct ContentIndexBatch::State {
     std::atomic<std::uint64_t> zone_live{0}, zone_peak{0}, zone_total{0};
     std::atomic<std::uint64_t> store_live{0}, store_peak{0}, store_allocated{0}, store_released{0};
     std::uint64_t outer_charged = 0;
+    // S2-C (EXPERIMENTAL): the demand-driven route. A batch is either bulk (discover/score) or selective
+    // (discover_for/score_selected), never both. unit_done: per unit, discovered (directly, or a coarse interior built
+    // or viewed from its fine units). Cumulative charges across every selective call, so no cap resets between requests.
+    bool selective = false;
+    std::vector<char> unit_done;
+    std::uint64_t selective_origins = 0, selective_placements_consumed = 0, selective_origins_consumed = 0,
+                  selective_states_consumed = 0;
+    FragmentScoringCounters selective_score_counters;   // executed pairing and aggregate work, summed over calls
     bool reserve_store(std::uint64_t bytes, bool enforce) {
         std::uint64_t cur = store_live.load(std::memory_order_relaxed);
         for (;;) {
@@ -10606,10 +10614,70 @@ ContentIndexBatch::~ContentIndexBatch() = default;
 const ContentBatchReport& ContentIndexBatch::report() const { return state_->report; }
 
 void ContentIndexBatch::discover() {
+    if (state_->selective) throw std::logic_error("content index: bulk discovery on a selective batch");
+    discover_impl(nullptr);
+}
+void ContentIndexBatch::discover_for(const std::vector<std::size_t>& slots) {
+    State& st = *state_;
+    if (!st.selective && st.evaluated != 0) throw std::logic_error("content index: selective discovery on a bulk batch");
+    if (st.one_shot) throw std::invalid_argument("content index: selective discovery needs a batch that is not one-shot");
+    if (!st.exact_store) throw std::invalid_argument("content index: selective discovery needs the exact store layout");
+    st.selective = true;
+    discover_impl(&slots);
+}
+std::size_t ContentIndexBatch::units_discovered() const {
+    std::size_t n = 0;
+    for (const char d : state_->unit_done) n += d != 0;
+    return state_->selective ? n : state_->evaluated;
+}
+std::size_t ContentIndexBatch::columns_completed() const {
+    std::size_t n = 0;
+    for (const char d : state_->completed) n += d != 0;
+    return n;
+}
+void ContentIndexBatch::discover_impl(const std::vector<std::size_t>* slots) {
     State& st = *state_;
     const ContentPlacementIndex::State& ix = *st.index->state_;
     const std::size_t first = st.evaluated, last = ix.units.size();
-    if (first == last) return;
+    // The units evaluated now: `direct` are discovered by proposal and verification; `interior` (fine discovery only)
+    // are coarse interiors built or viewed from their fine units. Bulk: every unit added since the last call, in index
+    // order (exactly as before). Selective (S2-C): the units the requested slots' occurrences name and, under fine
+    // discovery, each coarse interior's fine units -- each at most once per batch.
+    std::vector<std::size_t> direct, interior;
+    if (slots == nullptr) {
+        if (first == last) return;
+        for (std::size_t u = first; u < last; ++u) {
+            if (ix.fine_discovery && ix.units[u].interior) interior.push_back(u);
+            else direct.push_back(u);
+        }
+    } else {
+        st.unit_done.resize(last, 0);
+        std::vector<char> want(last, 0);
+        for (const std::size_t h : *slots) {
+            if (h >= ix.lengths.size()) throw std::invalid_argument("content index: selective discovery names an unknown slot");
+            for (int strand = 0; strand < 2; ++strand) {
+                for (const IndexOccurrence& occ : ix.occurrences[strand][h]) want[occ.unit] = 1;
+            }
+        }
+        std::vector<char> queued(last, 0);
+        for (std::size_t u = 0; u < last; ++u) {
+            if (!want[u] || st.unit_done[u]) continue;
+            if (ix.fine_discovery && ix.units[u].interior) {
+                interior.push_back(u);
+                for (const auto& [fine, offset] : ix.fine_of_coarse.at(static_cast<std::uint32_t>(u))) {
+                    if (!st.unit_done[fine] && !queued[fine]) {
+                        queued[fine] = 1;
+                        direct.push_back(fine);
+                    }
+                }
+            } else if (!queued[u]) {
+                queued[u] = 1;
+                direct.push_back(u);
+            }
+        }
+        std::sort(direct.begin(), direct.end());
+        if (direct.empty() && interior.empty()) return;
+    }
     if (st.sealed) throw std::logic_error("content index: a one-shot batch was asked to discover new units");
     if (st.fine_views && !st.exact_store) throw std::invalid_argument("content index: fine views need the exact store layout");
     const auto mark = std::chrono::steady_clock::now();
@@ -10645,8 +10713,10 @@ void ContentIndexBatch::discover() {
     budget.max_piece_hits = st.options.max_piece_hits;
     budget.max_physical_origins = st.options.max_physical_origins;
     budget.publish_batch = std::max<std::uint64_t>(1, st.options.piece_hit_publish_batch);
-    const std::size_t threads = std::max<std::size_t>(1, std::min(st.options.threads, last - first));
-    std::atomic<std::size_t> next{first};
+    if (slots != nullptr) budget.piece_hits.store(st.report.piece_hits, std::memory_order_relaxed);   // S2-C: cumulative
+    const std::size_t work_items = slots == nullptr ? last - first : direct.size();
+    const std::size_t threads = std::max<std::size_t>(1, std::min(st.options.threads, std::max<std::size_t>(1, work_items)));
+    std::atomic<std::size_t> next{0};
     std::vector<FragmentScoringCounters> counters(threads);
     std::vector<EmissionCacheCounters> cache(threads);
     std::vector<SeedingTimes> times(threads);
@@ -10670,10 +10740,10 @@ void ContentIndexBatch::discover() {
             return b;
         };
         try {
-            for (std::size_t u = next++; u < last; u = next++) {
+            for (std::size_t i = next++; i < direct.size(); i = next++) {
                 if (budget.stop()) throw PlacementCancelled();
-                const IndexUnit& unit = ix.units[u];
-                if (ix.fine_discovery && unit.interior) continue;   // I1.4: reconstructed from its fine units below
+                const std::size_t u = direct[i];
+                const IndexUnit& unit = ix.units[u];   // I1.4: coarse interiors are not here; reconstructed below
                 std::vector<StoredPlacement>& store = st.placements[u];
                 if (st.exact_store) {
                     found.clear();
@@ -10796,7 +10866,7 @@ void ContentIndexBatch::discover() {
         r.worker_seconds_sort += static_cast<double>(times[t].sort_ns) * 1e-9;
         r.worker_seconds_verification += static_cast<double>(times[t].verify_ns + times[t].row_sort_ns) * 1e-9;
     }
-    r.units_evaluated += last - first;
+    r.units_evaluated += slots == nullptr ? last - first : direct.size() + interior.size();
     ++r.discovery_calls;
     for (std::size_t t = 0; t < threads; ++t) {
         r.owned_starts_skipped_before_verification += skipped[t];
@@ -10831,8 +10901,7 @@ void ContentIndexBatch::discover() {
                 }
             }
             st.view_pieces.resize(last, nullptr);
-            for (std::size_t u = first; u < last; ++u) {
-                if (!ix.units[u].interior) continue;
+            for (const std::size_t u : interior) {
                 const auto& pieces = ix.fine_of_coarse.at(static_cast<std::uint32_t>(u));
                 st.view_pieces[u] = &pieces;
                 std::uint64_t n = 0;
@@ -10847,14 +10916,12 @@ void ContentIndexBatch::discover() {
             // fine rows still needed + the coarse rows built so far, never the whole store twice.
             std::unordered_map<std::uint32_t, std::uint32_t> uses;
             if (st.one_shot) {
-                for (std::size_t u = first; u < last; ++u) {
-                    if (!ix.units[u].interior) continue;
+                for (const std::size_t u : interior) {
                     for (const auto& [fine, offset] : ix.fine_of_coarse.at(static_cast<std::uint32_t>(u))) ++uses[fine];
                 }
                 r.worker_scratch_bytes = std::max<std::uint64_t>(r.worker_scratch_bytes, uses.bucket_count() * sizeof(void*) + uses.size() * 32);
             }
-            for (std::size_t u = first; u < last; ++u) {
-                if (!ix.units[u].interior) continue;
+            for (const std::size_t u : interior) {
                 const auto& pieces = ix.fine_of_coarse.at(static_cast<std::uint32_t>(u));
                 std::uint64_t n = 0;
                 for (const auto& [fine, offset] : pieces) n += st.placements[fine].size();
@@ -10938,20 +11005,57 @@ void ContentIndexBatch::discover() {
     note_ledger();
     r.placement_store_bytes = 0;
     for (const auto& v : st.placements) r.placement_store_bytes += v.capacity() * sizeof(StoredPlacement);
-    st.evaluated = last;
+    if (slots == nullptr) {
+        st.evaluated = last;
+    } else {   // S2-C
+        for (const std::size_t u : direct) st.unit_done[u] = 1;
+        for (const std::size_t u : interior) st.unit_done[u] = 1;
+    }
     r.seconds_discovery += std::chrono::duration<double>(std::chrono::steady_clock::now() - mark).count();
 }
 
 FragmentScoringResult ContentIndexBatch::score(const std::vector<HaplotypeCandidate>& candidates) {
+    if (state_->selective) throw std::logic_error("content index: bulk score() on a selective batch");
+    return score_impl(candidates, false);
+}
+FragmentScoringResult ContentIndexBatch::score_selected(const std::vector<HaplotypeCandidate>& candidates) {
+    if (!state_->selective) throw std::logic_error("content index: score_selected() before any selective discovery");
+    return score_impl(candidates, true);
+}
+FragmentScoringResult ContentIndexBatch::score_impl(const std::vector<HaplotypeCandidate>& candidates, bool selective) {
     State& st = *state_;
     const ContentPlacementIndex::State& ix = *st.index->state_;
-    if (st.evaluated != ix.units.size()) throw std::logic_error("content index: score() before every unit was discovered");
+    if (!selective && st.evaluated != ix.units.size()) throw std::logic_error("content index: score() before every unit was discovered");
     const std::size_t unique = ix.lengths.size(), nf = st.fragments.size();
     for (const HaplotypeCandidate& c : candidates) {
         if (c.first >= unique || c.second >= unique) throw std::invalid_argument("content index: candidate names an unknown slot");
     }
-    // I2-A: the reference's mass-cell cap, before any column is allocated
-    if (nf != 0 && unique > st.options.max_mass_cells / nf) {
+    // S2-C: the requested slots; each needs every unit its occurrences name discovered (a coarse interior: built or
+    // viewed). Unknown evidence is never zero mass: an incomplete column is refused before anything is computed.
+    std::vector<char> requested(selective ? unique : 0, 0);
+    std::size_t requested_new = 0;
+    if (selective) {
+        st.completed.resize(unique, 0);
+        for (const HaplotypeCandidate& c : candidates) {
+            for (const std::size_t h : {c.first, c.second}) {
+                if (requested[h]) continue;
+                requested[h] = 1;
+                if (st.completed[h]) continue;
+                ++requested_new;
+                for (int strand = 0; strand < 2; ++strand) {
+                    for (const IndexOccurrence& occ : ix.occurrences[strand][h]) {
+                        if (occ.unit >= st.unit_done.size() || !st.unit_done[occ.unit]) {
+                            throw std::logic_error("content index: a requested slot needs evidence not yet discovered; an "
+                                                   "incomplete column is never scored");
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // I2-A: the reference's mass-cell cap, before any column is allocated (S2-C: the columns held after this call)
+    const std::size_t columns_after = selective ? std::count(st.completed.begin(), st.completed.end(), 1) + requested_new : unique;
+    if (nf != 0 && columns_after > st.options.max_mass_cells / nf) {
         throw ResourceExhausted(
             "the fragment-by-haplotype mass matrix would exceed its declared cell cap; no partial ranking is returned");
     }
@@ -10965,6 +11069,12 @@ FragmentScoringResult ContentIndexBatch::score(const std::vector<HaplotypeCandid
     budget.max_piece_hits = st.options.max_piece_hits;
     budget.max_physical_origins = st.options.max_physical_origins;
     std::atomic<std::uint64_t> placements_consumed{0}, origins_consumed{0}, states_consumed{0};
+    if (selective) {   // S2-C: every cap charged cumulatively over the batch's calls, never reset between requests
+        budget.physical_origins.store(st.selective_origins, std::memory_order_relaxed);
+        placements_consumed.store(st.selective_placements_consumed, std::memory_order_relaxed);
+        origins_consumed.store(st.selective_origins_consumed, std::memory_order_relaxed);
+        states_consumed.store(st.selective_states_consumed, std::memory_order_relaxed);
+    }
     FragmentScoringCounters built;   // aggregate construction: executed
     const auto note_consumption = [&]() {
         st.report.placements_consumed_last = placements_consumed.load(std::memory_order_relaxed);
@@ -10984,6 +11094,7 @@ FragmentScoringResult ContentIndexBatch::score(const std::vector<HaplotypeCandid
     std::vector<std::size_t> todo_slots;
     for (std::size_t h = 0; h < unique; ++h) {
         if (st.completed[h]) continue;
+        if (selective && !requested[h]) continue;   // S2-C: only the requested slots' columns
         todo_slots.push_back(h);
         st.mass_column[h].assign(nf, kNegInf);
         st.exposure[h] = exposure_for_length(ix.lengths[h], nf, st.prepared.fragments_by_floor, st.library_insert);
@@ -10999,7 +11110,14 @@ FragmentScoringResult ContentIndexBatch::score(const std::vector<HaplotypeCandid
         const auto build_mark = std::chrono::steady_clock::now();
         st.entity_entry.resize(ix.entities.size(), -1);
         std::vector<std::uint32_t> todo;
+        // S2-C: only the entities the slots computed now contain (each built at most once per batch)
+        std::vector<char> relevant;
+        if (selective) {
+            relevant.assign(ix.entities.size(), 0);
+            for (const std::size_t h : todo_slots) for (const auto& [entity, offset] : ix.entity_occurrences[h]) relevant[entity] = 1;
+        }
         for (std::uint32_t e = 0; e < ix.entities.size(); ++e) {
+            if (selective && !relevant[e]) continue;
             if (st.entity_entry[e] >= 0 || st.entity_entry[e] == -2) continue;
             const auto& en = ix.entities[e];
             const bool eligible = en.occurrences >= 2 && en.length >= R + 2 * g + 1;
@@ -11357,9 +11475,20 @@ FragmentScoringResult ContentIndexBatch::score(const std::vector<HaplotypeCandid
         // propagates; then the reference's acceptance caps on the merged totals
         FragmentScoringCounters c = st.discovery_counters;
         c.fragments_with_floor_binding = st.prepared.fragments_with_floor_binding;
-        add_counters(c, built);
-        for (const FragmentScoringCounters& e : executed) add_counters(c, e);
-        for (std::size_t t = 0; t < threads; ++t) c.physical_origins += origins_count[t] + direct[t];
+        FragmentScoringCounters call;   // this call's executed pairing and aggregate work
+        add_counters(call, built);
+        for (const FragmentScoringCounters& e : executed) add_counters(call, e);
+        for (std::size_t t = 0; t < threads; ++t) call.physical_origins += origins_count[t] + direct[t];
+        if (selective) {   // S2-C: the acceptance caps hold to the batch's cumulative executed totals
+            add_counters(st.selective_score_counters, call);
+            add_counters(c, st.selective_score_counters);
+            st.selective_origins = budget.physical_origins.load(std::memory_order_relaxed);
+            st.selective_placements_consumed = placements_consumed.load(std::memory_order_relaxed);
+            st.selective_origins_consumed = origins_consumed.load(std::memory_order_relaxed);
+            st.selective_states_consumed = states_consumed.load(std::memory_order_relaxed);
+        } else {
+            add_counters(c, call);
+        }
         rr.counters_last = c;
         rethrow_primary_failure(failures);
         enforce_acceptance_caps(c, st.options, [] {});
@@ -11374,7 +11503,8 @@ FragmentScoringResult ContentIndexBatch::score(const std::vector<HaplotypeCandid
     for (const std::size_t h : todo_slots) st.completed[h] = 1;
     r.columns_computed_last = todo_slots.size();
     r.columns_computed_total += todo_slots.size();
-    r.columns_retained_last = unique - todo_slots.size();
+    r.columns_retained_last = selective ? static_cast<std::uint64_t>(std::count(requested.begin(), requested.end(), 1)) - todo_slots.size()
+                                        : unique - todo_slots.size();
     // totals over every completed slot (each counted once, whenever it was computed)
     r.expanded_placements = r.duplicate_placements_removed = r.physical_origins = r.state_classes = 0;
     r.direct_physical_origins = r.served_physical_origins = r.zones_applied = 0;
@@ -11435,12 +11565,15 @@ FragmentScoringResult ContentIndexBatch::score(const std::vector<HaplotypeCandid
     r.seconds_pair_lookup_and_combination = result.seconds_diploid_combination;
     result.counters = r.counters_last;
     result.threads_used_placement = std::max<std::size_t>(1, std::max(r.threads_used_discovery, threads));
-    // output materialisation: the flattened mass matrix and exposures of every slot
+    // output materialisation: the flattened mass matrix and exposures of every slot (S2-C: none on the selective route --
+    // the scores are returned, the columns stay retained, and nothing is exported)
     const auto materialise_mark = std::chrono::steady_clock::now();
-    result.log_mass.assign(nf * unique, kNegInf);
-    for (std::size_t h = 0; h < unique; ++h)
-        for (std::size_t f = 0; f < nf; ++f) result.log_mass[f * unique + h] = mass_column[h][f];
-    result.exposure = exposure;
+    if (!selective) {
+        result.log_mass.assign(nf * unique, kNegInf);
+        for (std::size_t h = 0; h < unique; ++h)
+            for (std::size_t f = 0; f < nf; ++f) result.log_mass[f * unique + h] = mass_column[h][f];
+        result.exposure = exposure;
+    }
     r.seconds_materialisation = std::chrono::duration<double>(std::chrono::steady_clock::now() - materialise_mark).count();
     r.retained_column_bytes = 0;
     for (const auto& column : mass_column) r.retained_column_bytes += column.capacity() * sizeof(double);
@@ -11649,6 +11782,119 @@ FragmentScoringResult score_diplotypes_indexed_union(const InternedHaplotypes& h
     last_emission_cache_slot() = result.emission_cache;
     release();   // nothing indexed outlives the call
     return result;
+}
+
+ProgressiveResult score_diplotypes_indexed_progressive(const InternedHaplotypes& haplotypes,
+                                                       const std::vector<std::vector<HaplotypeCandidate>>& stages,
+                                                       const std::vector<ReadPair>& fragments, const LibraryModel& library,
+                                                       const FragmentScoringOptions& options,
+                                                       const std::vector<std::vector<std::uint32_t>>& segments,
+                                                       std::size_t store_budget_bytes, bool fine_views,
+                                                       const std::function<void(ProgressiveStageReport&)>& on_stage) {
+    using Clock = std::chrono::steady_clock;
+    const auto since = [](Clock::time_point mark) { return std::chrono::duration<double>(Clock::now() - mark).count(); };
+    // the bulk adapter's validation, unchanged
+    validate_library_model(library);
+    if (options.minimum_piece_bp == 0) throw std::invalid_argument("minimum indexable piece length must be positive");
+    if (options.max_piece_hits == 0 || options.max_proposed_starts_per_haplotype == 0 || options.max_physical_origins == 0 ||
+        options.max_state_classes == 0 || options.max_mass_cells == 0 || options.max_latent_alignment_pairs == 0) {
+        throw std::invalid_argument("every fragment-scoring resource cap must be positive");
+    }
+    const std::size_t unique = haplotypes.sequences.size();
+    for (const auto& stage : stages) {
+        for (const HaplotypeCandidate& c : stage) {
+            if (c.first >= unique || c.second >= unique) throw std::invalid_argument("diplotype candidate names an unknown haplotype");
+        }
+    }
+    if (options.record_origin_summary || !options.record_origins_for_fragments.empty() || options.record_haplotype_work != nullptr) {
+        throw std::invalid_argument("the indexed union backend records no per-origin or per-haplotype diagnostics");
+    }
+    if (segments.size() != unique) throw std::invalid_argument("the indexed union backend needs one segmentation per unique haplotype");
+    if (store_budget_bytes == 0) throw std::invalid_argument("the indexed union backend needs a positive placement-store budget");
+    if (options.max_union_cached_placements_consumed == 0) {
+        throw std::invalid_argument("the indexed union backend needs a positive cached-placement consumption cap");
+    }
+    if (options.union_origin_cache_bytes > 0 &&
+        (options.max_union_cached_origins_consumed == 0 || options.max_union_cached_states_consumed == 0)) {
+        throw std::invalid_argument("union origin reuse needs both of its consumption caps, positive");
+    }
+    std::size_t max_read_bp = 1;
+    for (const ReadPair& f : fragments) max_read_bp = std::max({max_read_bp, f.first.bases.size(), f.second.bases.size()});
+    FragmentScoringOptions batch_options = options;
+    batch_options.union_segment_lengths = nullptr;
+    batch_options.union_placement_cache_bytes = 0;
+    ProgressiveResult out;
+    const auto started = Clock::now();
+    auto mark = Clock::now();
+    ContentPlacementIndex index(max_read_bp, library.max_gap_bp, true);
+    for (std::size_t h = 0; h < unique; ++h) {
+        if (index.add_haplotype(haplotypes.sequences[h], segments[h]) != h) throw std::logic_error("slots must follow the interned order");
+    }
+    out.seconds_index_build = since(mark);
+    mark = Clock::now();
+    ContentIndexBatch batch(index, fragments, library, batch_options);
+    out.seconds_preparation = since(mark);
+    if (options.union_prefilter_cache_bytes > 0 && batch.report().prefilter_status != "on") {
+        throw std::invalid_argument("union prefilter reuse needs one read length");
+    }
+    batch.set_placement_store_budget(store_budget_bytes);
+    batch.set_fine_views(fine_views);
+    try {
+        for (const auto& stage : stages) {
+            ProgressiveStageReport rep;
+            rep.candidates = stage.size();
+            std::vector<std::size_t> slots;
+            for (const HaplotypeCandidate& c : stage) { slots.push_back(c.first); slots.push_back(c.second); }
+            std::sort(slots.begin(), slots.end());
+            slots.erase(std::unique(slots.begin(), slots.end()), slots.end());
+            rep.slots = slots.size();
+            const ContentBatchReport before = batch.report();
+            const std::size_t units_before = batch.units_discovered(), columns_before = batch.columns_completed();
+            std::set<std::uint32_t> needed;
+            for (const std::size_t h : slots) {
+                for (int strand = 0; strand < 2; ++strand) for (const IndexOccurrence& occ : index.state_->occurrences[strand][h]) needed.insert(occ.unit);
+            }
+            for (const std::uint32_t u : needed) {   // the stage's occurrence units already held before it
+                rep.units_reused += u < batch.state_->unit_done.size() && batch.state_->unit_done[u] ? 1 : 0;
+            }
+            const auto d0 = Clock::now();
+            batch.discover_for(slots);
+            rep.seconds_discovery = since(d0);
+            rep.units_discovered = batch.units_discovered() - units_before;   // coarse units and fine dependencies
+            const auto s0 = Clock::now();
+            FragmentScoringResult r = batch.score_selected(stage);
+            rep.seconds_scoring = since(s0);
+            const ContentBatchReport& after = batch.report();
+            rep.columns_computed = batch.columns_completed() - columns_before;
+            rep.columns_reused = slots.size() - rep.columns_computed;
+            rep.pairs_computed = after.pairs_computed_last;
+            rep.pairs_served = stage.size() - std::min<std::uint64_t>(stage.size(), after.pairs_computed_last);
+            rep.executed_prefilters = after.executed_prefilters - before.executed_prefilters;
+            rep.executed_dps = after.executed_dps - before.executed_dps;
+            rep.full_read_verifications = after.full_read_verifications - before.full_read_verifications;
+            rep.piece_hits = after.piece_hits - before.piece_hits;
+            rep.direct_physical_origins = after.direct_physical_origins - before.direct_physical_origins;
+            rep.served_physical_origins = after.served_physical_origins - before.served_physical_origins;
+            rep.origins_constructed = after.origins_constructed - before.origins_constructed;
+            rep.expanded_placements = after.expanded_placements - before.expanded_placements;
+            rep.store_live_bytes = after.store_live_bytes;
+            rep.store_peak_bytes = after.store_peak_bytes;
+            rep.retained_column_bytes = after.retained_column_bytes;
+            rep.origin_held_bytes = after.origin_held_bytes;
+            rep.worker_scratch_bytes = after.worker_scratch_bytes;
+            // footprint_* are left to the caller's on_stage hook (this layer does not sample process memory)
+            rep.seconds_since_start = since(started);
+            if (on_stage) on_stage(rep);
+            out.scores.push_back(std::move(r.scores));
+            out.stages.push_back(rep);
+        }
+        out.completed = true;
+    } catch (const ResourceExhausted& error) {
+        out.refusal = error.what();   // the completed stages keep their scores; nothing partial is scored
+    }
+    out.index = index.report();
+    out.batch = batch.report();
+    return out;
 }
 
 } // namespace panvar

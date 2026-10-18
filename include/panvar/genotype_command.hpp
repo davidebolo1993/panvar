@@ -220,6 +220,12 @@ struct GenotypeCommandOptions {
     // numerical top set and the early incumbent's pair (when early_incumbent is on). An evaluator for the pre-placement
     // bound prototype; it changes no score, ranking, output or status value.
     bool diagnostic_union_evidence_dump = false;
+    // S2-C DIAGNOSTIC ONLY (profile key diagnostic_union_kernel_dump 0|1): writes <prefix>.union_kernel_inputs.bin just
+    // before the union pass -- the interned union sequences and their index segmentation, the sequence-pair pool in union
+    // order with a truth-free proposal score per pair (the S2-A selection formula: proposal marker emissions plus the exact
+    // path prior, maximised over the pair's labellings) and its sequence prior, the early incumbent's pair, and the
+    // scoring options and library the union pass uses. Input to the S2-C progressive-kernel harness; changes nothing.
+    bool diagnostic_union_kernel_dump = false;
     // I2-B (EXPERIMENTAL, profile keys only, never public settings): how the adaptive search's window enumeration builds
     // its placement rows. "reference" (the default) scans each enumerated window whole, unchanged. "fine_experimental"
     // builds the same rows from a round-local, per-worker fine store (PreparedScoringContext::

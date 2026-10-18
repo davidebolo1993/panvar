@@ -973,7 +973,7 @@ void write_status(
                                 "marker_proposal_reuse_table_bytes", "combination_prepared_library_terms",
                                 "gap_recursion_backend",
                                 "dosage_census_backend", "adaptive_emission_handoff", "output_schema", "early_incumbent",
-                                "test_interrupt_point", "diagnostic_union_evidence_dump"}) {
+                                "test_interrupt_point", "diagnostic_union_evidence_dump", "diagnostic_union_kernel_dump"}) {
             const auto source = options.setting_sources.find(key);
             if (source == options.setting_sources.end()) continue;
             const std::string k = key;
@@ -997,6 +997,7 @@ void write_status(
                                       : k == "early_incumbent" ? options.early_incumbent
                                       : k == "test_interrupt_point" ? options.test_interrupt_point
                                       : k == "diagnostic_union_evidence_dump" ? std::string(options.diagnostic_union_evidence_dump ? "1" : "0")
+                                      : k == "diagnostic_union_kernel_dump" ? std::string(options.diagnostic_union_kernel_dump ? "1" : "0")
                                       : k == "gap_recursion_backend"
                                           ? std::string(gap_recursion_backend_name(options.gap_recursion_fixed_geometry))
                                                                          : std::to_string(options.adaptive_fine_max_served_placements);
@@ -1692,6 +1693,10 @@ void apply_genotype_setting(const std::string& context, const std::string& key, 
             throw std::runtime_error(context + ": 'output_schema' is legacy, sequence_first_v1 or sequence_first_v2: " + value);
         }
         options.output_schema = value;
+    }
+    else if (key == "diagnostic_union_kernel_dump") {   // S2-C (DIAGNOSTIC ONLY)
+        if (value != "0" && value != "1") throw std::runtime_error(context + ": 'diagnostic_union_kernel_dump' is 0 or 1: " + value);
+        options.diagnostic_union_kernel_dump = value == "1";
     }
     else if (key == "diagnostic_union_evidence_dump") {   // S2-B (DIAGNOSTIC ONLY)
         if (value != "0" && value != "1") throw std::runtime_error(context + ": 'diagnostic_union_evidence_dump' is 0 or 1: " + value);
@@ -3152,6 +3157,81 @@ GenotypeRunStatus run_genotype_body(const GenotypeCommandOptions& options, Genot
         options.diagnostic_union_seeding_profile > 0 || !options.diagnostic_union_verification_census.empty();
     if (seeding_profile_only && !options.diagnostic_union_only) {
         throw std::invalid_argument("the union seeding profile and census are union-only diagnostics (set diagnostic_union_only)");
+    }
+    if (options.diagnostic_union_kernel_dump && any_ranked && indexed_union) {
+        // S2-C (DIAGNOSTIC ONLY): the union pass's exact inputs, for the progressive-kernel harness
+        std::string bin;
+        const auto put = [&](const auto& v) { bin.append(reinterpret_cast<const char*>(&v), sizeof v); };
+        const auto put_library = [&](const LibraryModel& l) {
+            put(l.insert_mean_bp); put(l.insert_sd_bp); put(l.support_sigmas); put(l.substitution_error);
+            put(l.outlier_weight); put(l.fragment_start_intensity); put(l.gap_open); put(l.gap_extend);
+            put(static_cast<std::uint64_t>(l.max_gap_bp));
+        };
+        bin.append("PVKI1\0\0\0", 8);
+        put(static_cast<std::uint64_t>(interned.sequences.size()));
+        for (std::size_t h = 0; h < interned.sequences.size(); ++h) {
+            put(static_cast<std::uint64_t>(interned.sequences[h].size()));
+            bin.append(interned.sequences[h]);
+            put(static_cast<std::uint64_t>(indexed_segments[h].size()));
+            for (const std::uint32_t x : indexed_segments[h]) put(x);
+        }
+        // a truth-free proposal score per sequence pair: the S2-A selection formula, maximised over its labellings
+        const std::vector<double> sw(model.blocks().size() - 1, options.switch_probability);
+        std::map<std::vector<std::size_t>, double> path_prior;
+        const auto prior_of = [&](const MosaicPath& path) {
+            const auto found = path_prior.find(path.alleles);
+            if (found != path_prior.end()) return found->second;
+            return path_prior.emplace(path.alleles, log_haploid_mosaic_prior(model.panel(), path, sw)).first->second;
+        };
+        std::vector<double> proposal(scored_pairs.size(), -std::numeric_limits<double>::infinity());
+        for (const MosaicCandidate* candidate : scored_union) {
+            const MosaicDiplotype& d = candidate->diplotype;
+            double value = 0.0;
+            for (std::size_t b = 0; b < model.blocks().size(); ++b) value += emissions.blocks[b].at(d.first.alleles[b], d.second.alleles[b]);
+            const double pa = prior_of(d.first), pb = prior_of(d.second);
+            const double ninf = -std::numeric_limits<double>::infinity();
+            value = pa == ninf || pb == ninf ? ninf : value + pa + pb + (d.first != d.second ? std::log(2.0) : 0.0);
+            double& slot = proposal[scored_index.at(sequence_pair(*candidate))];
+            slot = std::max(slot, value);
+        }
+        put(static_cast<std::uint64_t>(scored_pairs.size()));
+        for (std::size_t i = 0; i < scored_pairs.size(); ++i) {
+            const HaplotypeCandidate& c = scored_pairs[i];
+            put(static_cast<std::uint64_t>(c.first));
+            put(static_cast<std::uint64_t>(c.second));
+            put(proposal[i]);
+            put(haploid_sequence_prior[c.first] + haploid_sequence_prior[c.second] + (c.first != c.second ? std::log(2.0) : 0.0));
+        }
+        std::uint64_t early_first = std::numeric_limits<std::uint64_t>::max(), early_second = early_first;
+        if (!g_incumbent.early_first.empty()) {
+            std::size_t x = interned.index_of[slot_of_path.at(g_incumbent.early_first)];
+            std::size_t y = interned.index_of[slot_of_path.at(g_incumbent.early_second)];
+            if (y < x) std::swap(x, y);
+            early_first = x;
+            early_second = y;
+        }
+        put(early_first);
+        put(early_second);
+        put_library(library);
+        const FragmentScoringOptions& o = scoring_options;
+        for (const std::uint64_t x : {static_cast<std::uint64_t>(o.threads), static_cast<std::uint64_t>(o.mismatch_band),
+                                      static_cast<std::uint64_t>(o.minimum_piece_bp), o.max_piece_hits, o.piece_hit_publish_batch,
+                                      o.max_proposed_starts_per_haplotype, o.max_physical_origins, o.max_state_classes,
+                                      o.max_mass_cells, o.max_latent_alignment_pairs, static_cast<std::uint64_t>(o.emission_cache_bytes),
+                                      o.max_union_cached_placements_consumed, static_cast<std::uint64_t>(o.union_origin_cache_bytes),
+                                      o.max_union_cached_origins_consumed, o.max_union_cached_states_consumed,
+                                      static_cast<std::uint64_t>(o.union_prefilter_cache_bytes), o.max_union_cached_prefilters_consumed,
+                                      static_cast<std::uint64_t>(o.start_sort_scratch_bytes),
+                                      static_cast<std::uint64_t>(o.prepared_library_terms ? 1 : 0),
+                                      static_cast<std::uint64_t>(o.gap_recursion_backend == GapRecursionBackend::scaled_reference ? 0 : 1),
+                                      static_cast<std::uint64_t>(options.indexed_union_store_bytes),
+                                      static_cast<std::uint64_t>(options.indexed_union_store_layout == "legacy_i2a" ? 1 : 0),
+                                      static_cast<std::uint64_t>(options.indexed_union_evidence_layout == "fine_views_experimental" ? 1 : 0),
+                                      static_cast<std::uint64_t>(o.audit_libraries.size())}) {
+            put(x);
+        }
+        for (const LibraryModel& l : o.audit_libraries) put_library(l);
+        atomic_write(options.out_prefix + ".union_kernel_inputs.bin", bin);
     }
     if (any_ranked && !seeding_profile_only) {
         try {

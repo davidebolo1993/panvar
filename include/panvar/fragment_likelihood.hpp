@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <functional>
 #include <map>
 #include <tuple>
 #include <memory>
@@ -2049,12 +2050,28 @@ public:
     void set_fine_views(bool on);
     // TEST ONLY: an independent recount of the placement containers' allocated capacity (what the ledger must equal).
     std::uint64_t store_capacity_recount() const;
+    // ---- S2-C (EXPERIMENTAL): the demand-driven route. A batch is bulk (discover/score) or selective, never both.
+    // discover_for: discovers only the units the given slots' occurrences name (under fine discovery, each coarse
+    // interior's fine units, then the interior built or viewed), each at most once per batch; needs the exact store
+    // layout and a batch that is not one-shot. Discovery's caps are charged cumulatively over calls.
+    void discover_for(const std::vector<std::size_t>& slots);
+    // score_selected: scores `candidates`, constructing only their slots' columns and exposures (completed columns and pair
+    // likelihoods are reused), the origin aggregates of entities those slots contain, and no mass-matrix export (log_mass
+    // and exposure are left empty). A slot needing an undiscovered unit is refused (std::logic_error) before any work:
+    // unknown evidence is never zero mass. Every cap is charged to the batch's cumulative totals.
+    FragmentScoringResult score_selected(const std::vector<HaplotypeCandidate>& candidates);
+    std::size_t units_discovered() const;   // selective: units discovered; bulk: units evaluated
+    std::size_t columns_completed() const;
     const ContentBatchReport& report() const;
     // TEST ONLY: every discovered coarse interior unit's placement rows, keyed by strand and bytes.
     std::map<std::string, std::vector<std::tuple<std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t, double>>>
     interior_placement_rows() const;
     struct State;
     std::unique_ptr<State> state_;
+
+private:
+    void discover_impl(const std::vector<std::size_t>* slots);
+    FragmentScoringResult score_impl(const std::vector<HaplotypeCandidate>& candidates, bool selective);
 };
 
 // ---- I2-A (EXPERIMENTAL): the I1.4 indexed route at the caller's one-shot union boundary ----------------------------
@@ -2096,5 +2113,42 @@ FragmentScoringResult score_diplotypes_indexed_union(const InternedHaplotypes& h
                                                      std::size_t store_budget_bytes, IndexedUnionReport* report = nullptr,
                                                      FragmentScoringObservation* observed_on_failure = nullptr,
                                                      bool legacy_store_layout = false, bool fine_views = false);
+
+// ---- S2-C (EXPERIMENTAL, measurement only): the same indexed scorer executed on demand --------------------------------
+// One index over every haplotype (identical slots and segmentation to the bulk adapter) and one selective batch; each
+// stage discovers only its candidates' missing units and constructs only their missing columns, reusing everything a
+// previous stage completed. Stages are a schedule, not a filter: the caller supplies the whole pool across them. A refusal
+// stops the schedule; the stages completed before it keep their scores (`completed` false). Same validation, options and
+// caps as score_diplotypes_indexed_union, charged cumulatively; exact store layout; never one-shot.
+struct ProgressiveStageReport {
+    std::size_t candidates = 0, slots = 0;
+    std::uint64_t units_discovered = 0, units_reused = 0;         // this stage: newly discovered / already held
+    std::uint64_t columns_computed = 0, columns_reused = 0;       // this stage's slots
+    std::uint64_t pairs_computed = 0, pairs_served = 0;
+    // executed work this stage (deltas of the batch's cumulative counters)
+    std::uint64_t executed_prefilters = 0, executed_dps = 0, full_read_verifications = 0, piece_hits = 0;
+    std::uint64_t direct_physical_origins = 0, served_physical_origins = 0, origins_constructed = 0, expanded_placements = 0;
+    // held after the stage
+    std::uint64_t store_live_bytes = 0, store_peak_bytes = 0, retained_column_bytes = 0, origin_held_bytes = 0;
+    std::uint64_t worker_scratch_bytes = 0;
+    std::uint64_t footprint_bytes = 0, footprint_peak_bytes = 0;   // set by the caller's on_stage hook, if it samples
+    double seconds_discovery = 0.0, seconds_scoring = 0.0, seconds_since_start = 0.0;
+};
+struct ProgressiveResult {
+    std::vector<std::vector<DiplotypeScore>> scores;   // per completed stage, parallel to its candidates
+    std::vector<ProgressiveStageReport> stages;        // completed stages
+    bool completed = false;
+    std::string refusal;                               // the ResourceExhausted message that stopped the schedule
+    double seconds_index_build = 0.0, seconds_preparation = 0.0;
+    ContentIndexReport index;
+    ContentBatchReport batch;
+};
+ProgressiveResult score_diplotypes_indexed_progressive(const InternedHaplotypes& haplotypes,
+                                                       const std::vector<std::vector<HaplotypeCandidate>>& stages,
+                                                       const std::vector<ReadPair>& fragments, const LibraryModel& library,
+                                                       const FragmentScoringOptions& options,
+                                                       const std::vector<std::vector<std::uint32_t>>& segments,
+                                                       std::size_t store_budget_bytes, bool fine_views,
+                                                       const std::function<void(ProgressiveStageReport&)>& on_stage = {});
 
 } // namespace panvar

@@ -294,6 +294,15 @@ if(PANVAR_BUILD_TESTING)
                  COMMAND genotype_command_e2e_test ${CMAKE_CURRENT_BINARY_DIR}/genotype_e2e ${CMAKE_CURRENT_SOURCE_DIR})
         file(MAKE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/genotype_e2e)
 
+        # S2-C (EXPERIMENTAL): the demand-driven indexed scorer against its bulk control
+        add_executable(genotype_progressive_kernel_test tests/genotype_progressive_kernel.cpp)
+        target_link_libraries(genotype_progressive_kernel_test PRIVATE panvarlib)
+        target_compile_options(genotype_progressive_kernel_test PRIVATE -Wall -Wextra -Wpedantic)
+        add_test(NAME panvar_genotype_progressive_kernel COMMAND genotype_progressive_kernel_test)
+        add_executable(s2c_progressive_harness tests/s2c_progressive_harness.cpp src/cli_utils.cpp)
+        target_link_libraries(s2c_progressive_harness PRIVATE panvarlib)
+        target_compile_options(s2c_progressive_harness PRIVATE -Wall -Wextra -Wpedantic)
+
         # S2-B (MEASUREMENT ONLY): the pre-placement bound prototype; its fixture mode is the admissibility gate.
         add_executable(s2b_preplacement_bound tests/s2b_preplacement_bound.cpp)
         target_link_libraries(s2b_preplacement_bound PRIVATE panvarlib)
