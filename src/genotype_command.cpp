@@ -261,6 +261,7 @@ struct FootprintCheckpoint {
     std::string stage;
     std::uint64_t current = 0, peak = 0;
     double seconds = 0.0;
+    std::optional<std::uint64_t> allocator;   // S2-K: the allocator's in-use bytes (read-only; unavailable elsewhere)
 };
 std::mutex g_checkpoint_mutex;
 bool g_checkpoints_on = false;
@@ -270,7 +271,7 @@ void note_footprint(const std::string& stage) {
     std::lock_guard<std::mutex> lock(g_checkpoint_mutex);
     if (!g_checkpoints_on) return;
     const FootprintSample fp = physical_footprint();
-    g_footprint_checkpoints.push_back({stage, fp.current, fp.peak, seconds_since(g_checkpoints_started)});
+    g_footprint_checkpoints.push_back({stage, fp.current, fp.peak, seconds_since(g_checkpoints_started), allocator_bytes_in_use()});
 }
 std::string footprint_checkpoint_rows() {
     std::lock_guard<std::mutex> lock(g_checkpoint_mutex);
@@ -281,7 +282,8 @@ std::string footprint_checkpoint_rows() {
         const FootprintCheckpoint& c = g_footprint_checkpoints[i];
         const std::string k = "footprint_checkpoint" + std::to_string(i + 1) + "_";
         o << k << "stage\t" << c.stage << '\n' << k << "phys_footprint_bytes\t" << c.current << '\n' << k
-          << "phys_footprint_peak_bytes\t" << c.peak << '\n' << k << "seconds\t" << c.seconds << '\n';
+          << "phys_footprint_peak_bytes\t" << c.peak << '\n' << k << "seconds\t" << c.seconds << '\n' << k
+          << "allocator_in_use_bytes\t" << (c.allocator ? std::to_string(*c.allocator) : std::string("unavailable")) << '\n';
     }
     return o.str();
 }
@@ -2041,7 +2043,7 @@ void apply_genotype_setting(const std::string& context, const std::string& key, 
     else if (key == "test_interrupt_point") {   // S2-A TEST HOOK
         if (value != "none" && value != "before_first_evaluation" && value != "after_checkpoint" &&
             value != "union_scoring" && value != "adaptive_refinement" && value != "after_prefix_checkpoint" &&
-            value != "refinement_seed_census") {
+            value != "refinement_seed_census" && value != "post_refinement_guard" && value != "post_refinement_outputs") {
             throw std::runtime_error(context + ": 'test_interrupt_point' is none, before_first_evaluation, after_checkpoint, "
                                      "union_scoring or adaptive_refinement: " + value);
         }
@@ -4388,6 +4390,27 @@ GenotypeRunStatus run_genotype_body(const GenotypeCommandOptions& options, Genot
         }
         // A local search from one anchor never makes the candidate set complete.
         set_report.final_candidate_scope = "CONDITIONAL";
+        // S2-K: the repair path's final outputs are prepared in memory while the resource watchdog is still armed, and
+        // published together by flush_outputs: the run is claimed first (the watchdog can no longer stop it), then every
+        // prepared file is written by atomic replacement, then the sequence report and the status (stop_with). A stop
+        // before the claim removes every final output and keeps only what the existing contract keeps (the S2-A
+        // checkpoint, as PROVISIONAL); nothing is written between a stop's cleanup and its exit, because the claim and
+        // the stop exclude each other under the watch mutex.
+        std::deque<std::pair<std::string, std::ostringstream>> pending_outputs;
+        const auto defer_output = [&](const std::string& path) -> std::ostringstream& {
+            pending_outputs.emplace_back(path, std::ostringstream{});
+            return pending_outputs.back().second;
+        };
+        const auto flush_outputs = [&]() {
+            note_footprint("outputs_prepared");
+            if (options.test_interrupt_point == "post_refinement_outputs") {   // S2-K TEST HOOK: a memory stop before the claim
+                stop_run("RESOURCE_REFUSAL", "test hook: post-refinement, outputs prepared and not yet published", 125);
+            }
+            claim_run();
+            for (auto& [path, text] : pending_outputs) atomic_write(path, text.str());
+            pending_outputs.clear();
+            note_footprint("outputs_published");
+        };
         const auto stop_with = [&](GenotypeRunStatus status, const std::string& note, const CertifiedRanking* ranking,
                                    const RankingSummary* summary) {
             timings.candidate_grouping = run_timings.candidate_grouping;
@@ -4422,12 +4445,13 @@ GenotypeRunStatus run_genotype_body(const GenotypeCommandOptions& options, Genot
             }
             // S1-C: the sequence report is published before the status commits it: its files first, its locus record
             // last; a failure leaves no partial report and the status says so.
-            if (g_incumbent.enabled) claim_run();   // S2-A: the watchdog can no longer overwrite the final report
+            flush_outputs();   // S2-K: claim, then the prepared outputs (S2-A: the watchdog can no longer overwrite the report)
             if (sequence_first(options) && !g_sequence_published) {   // S2-A: a failed checkpoint already published
                 publish_sequence_report(g_sequence_report, g_sequence_legacy, options.out_prefix,
                                         "no completed ranking and no safely available evaluated candidate (" +
                                             g_sequence_legacy.run_status + ", " + g_sequence_legacy.no_call_reason + ")");
                 g_sequence_published = true;
+                note_footprint("sequence_report_published");
             }
             timings.total = seconds_since(started);
             write_status(status_path, status, fingerprint, options, library, timings, &locus_report, &panel, beam_view,
@@ -5318,10 +5342,11 @@ GenotypeRunStatus run_genotype_body(const GenotypeCommandOptions& options, Genot
             }
             tie_branches_text = branches_out.str();
         }
-        claim_run();
+        // S2-K: no claim here -- the post-refinement scoring, audits and report preparation stay under the watchdog
+        note_footprint("post_refinement_start");
         if (report.tie_branched) {
-            atomic_write(prefix + ".tie_terminal_ties.tsv", tie_ties_text);
-            atomic_write(prefix + ".tie_branches.tsv", tie_branches_text);
+            defer_output(prefix + ".tie_terminal_ties.tsv") << tie_ties_text;
+            defer_output(prefix + ".tie_branches.tsv") << tie_branches_text;
         }
         if (report.tie_branched && !tie_incomplete.empty()) {
             report.no_call_reason = "tie_branching_incomplete";
@@ -5967,12 +5992,13 @@ GenotypeRunStatus run_genotype_body(const GenotypeCommandOptions& options, Genot
             return true;
         };
 
-        // ---- outputs. The run is claimed: the watchdog can no longer stop it half-written.
+        note_footprint("pool_decision_and_summary");   // S2-K
+        // ---- outputs, prepared in memory (S2-K): published by flush_outputs once the run is claimed.
         {
             std::vector<std::size_t> order(decided.candidates.size());
             for (std::size_t i = 0; i < order.size(); ++i) order[i] = i;
             std::sort(order.begin(), order.end(), [&](std::size_t x, std::size_t y) { return table_id[x] < table_id[y]; });
-            std::ofstream out = open_output(prefix + ".mosaic_candidates.tsv");
+            std::ostringstream& out = defer_output(prefix + ".mosaic_candidates.tsv");
             out << std::setprecision(17)
                 << "candidate_id\tunique_rank\thap1_alleles\thap2_alleles\tbest_proposal_score\t"
                    "retained_logsum_proposal_score\tproposal_emission_component\tproposal_transition_component\t"
@@ -5998,7 +6024,7 @@ GenotypeRunStatus run_genotype_body(const GenotypeCommandOptions& options, Genot
             }
         }
         {
-            std::ofstream out = open_output(prefix + ".mosaic_scores.tsv");
+            std::ostringstream& out = defer_output(prefix + ".mosaic_scores.tsv");
             out << "sequence_candidate_id\trepresentative_beam_candidate\tequivalent_beam_candidates\t"
                    "score\tfragment_term\texposure_term\tsequence_pair_prior\tnumeric_error_bound\t"
                    "fragments_with_mass\tfragments_total\tcandidate_set_probability\tmismatch_band\t"
@@ -6017,7 +6043,7 @@ GenotypeRunStatus run_genotype_body(const GenotypeCommandOptions& options, Genot
         }
         {
             // The complete numerical top set, every member of every tied sequence candidate.
-            std::ofstream out = open_output(prefix + ".equivalence_set.tsv");
+            std::ostringstream& out = defer_output(prefix + ".equivalence_set.tsv");
             out << "rank\tsequence_candidate_id\tcandidate_id\trepresentative\thap1_alleles\thap2_alleles\tsource\t"
                    "scored_in\tscore\tfragment_term\texposure_term\tsequence_pair_prior\tnumeric_error_bound\t"
                    "exact_path_prior\n";
@@ -6187,6 +6213,10 @@ GenotypeRunStatus run_genotype_body(const GenotypeCommandOptions& options, Genot
                 report.fine_window = guard_context->fine_window_report();
             }
             report.seconds_representation_guard = seconds_since(guard_mark);
+            note_footprint("representation_guard_done");   // S2-K
+            if (options.test_interrupt_point == "post_refinement_guard") {   // S2-K TEST HOOK: a time stop after the guard
+                stop_run("TIME_LIMIT", "test hook: post-refinement, after the representation guard", 124);
+            }
         }
         // ---- library_sensitivity_audit_v2 (docs/algorithms/genotype.md, stage 9). The call is decided and
         // annotated; the same algorithm is now followed at 0.9x and 1.1x the estimated fragment-start intensity. Every
@@ -6803,9 +6833,10 @@ GenotypeRunStatus run_genotype_body(const GenotypeCommandOptions& options, Genot
                           << pairs_text(verdict.independent_projections[2][b]) << '\t' << (rank ? "true" : "false") << '\t'
                           << (pipeline ? "true" : "false") << '\t' << verdict.block_reason[b] << '\n';
                 }
-                atomic_write(prefix + ".library_sensitivity_blocks.tsv", table.str());
+                defer_output(prefix + ".library_sensitivity_blocks.tsv") << table.str();
             }
             if (!library_sensitive.empty()) report.locus_filter = with_library_flag(report.locus_filter, "LOWQUAL_LIBRARY_SENSITIVE");
+            note_footprint("library_sensitivity_done");   // S2-K (only when the audit ran)
         }
         // An incomplete audit is a locus-level warning: no block is accused, block quality is unchanged.
         if (library_not_evaluated) report.locus_filter = with_library_flag(report.locus_filter, "NOT_EVALUATED_LIBRARY_SENSITIVITY");
@@ -6839,7 +6870,7 @@ GenotypeRunStatus run_genotype_body(const GenotypeCommandOptions& options, Genot
                                                   library_sensitive.count(b) != 0);
         }
         {
-            std::ofstream out = open_output(prefix + ".genotypes.tsv");
+            std::ostringstream& out = defer_output(prefix + ".genotypes.tsv");
             out << "block_id\tkind\tallele1\tallele2\tallele1_bp\tallele2_bp\tallele1_sources\t"
                    "allele2_sources\tzygosity\tconditional_genotype_posterior\tconditional_GQ" << kFilterHeader
                 << kQualityHeader << '\n';
@@ -6855,7 +6886,7 @@ GenotypeRunStatus run_genotype_body(const GenotypeCommandOptions& options, Genot
             }
         }
         {
-            std::ofstream out = open_output(prefix + ".block_genotypes.tsv");
+            std::ostringstream& out = defer_output(prefix + ".block_genotypes.tsv");
             out << "block_id\tkind\treportable\tallele1\tallele2\tallele1_bp\tallele2_bp\tzygosity\t"
                    "projection_ambiguous\tgenotype_support\tphase_support\tconditional_genotype_posterior\t"
                    "conditional_GQ\tnumerically_separated\tcandidate_scope" << kFilterHeader << kQualityHeader << '\n';
@@ -6880,7 +6911,7 @@ GenotypeRunStatus run_genotype_body(const GenotypeCommandOptions& options, Genot
             // not a read-phased result, and the header says so.
             report.haplotype_representation =
                 summary.phase_support == "PRIOR_ONLY" ? "prior_selected" : "read_supported_within_candidates";
-            std::ofstream out = open_output(prefix + ".mosaic_haplotypes.fa");
+            std::ostringstream& out = defer_output(prefix + ".mosaic_haplotypes.fa");
             const HaplotypeSequence first = spell_mosaic(model, MosaicPath{called.first});
             const HaplotypeSequence second = spell_mosaic(model, MosaicPath{called.second});
             for (const auto& item : {std::make_pair("hap1", &first), std::make_pair("hap2", &second)}) {
@@ -7587,7 +7618,9 @@ std::optional<int> parse_genotype_arguments(const std::vector<std::string>& args
                 ".mosaic_haplotypes.fa (a strict call's haplotypes), .mosaic_status.tsv, .settings.tsv (every effective\n"
                 "setting and its source) and the search record.\n\n"
                 "Exit status: 0 a genotype was emitted; 1 no-call; 2 argument, input or output error; 124 time limit\n"
-                "(time_limit_seconds); 125 footprint limit (footprint_limit_bytes).\n";
+                "(time_limit_seconds); 125 footprint limit (footprint_limit_bytes: a sampled guard -- the physical footprint is "
+                "polled every 100 ms while the run is unclaimed -- not an allocation-level ceiling; a short spike between "
+                "samples can exceed it).\n";
             return 0;
         }
         else if (flag == "--help-advanced") {

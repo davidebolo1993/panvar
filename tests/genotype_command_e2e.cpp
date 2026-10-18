@@ -4997,7 +4997,8 @@ bool integrated_only(const std::string& k) {
                                   "executed_state_classes|executed_dps|phys_footprint_after_bytes)$");
     static const std::regex totals("^union_completed_blocks_(physical_origins|piece_hits|cached_placements_consumed|"
                                    "cached_origins_consumed|cached_states_consumed|cached_prefilters_consumed|state_classes)$");
-    static const std::regex checkpoint("^footprint_checkpoint[0-9]+_(stage|phys_footprint_bytes|phys_footprint_peak_bytes|seconds)$");
+    static const std::regex checkpoint("^footprint_checkpoint[0-9]+_(stage|phys_footprint_bytes|phys_footprint_peak_bytes|seconds|"
+                                       "allocator_in_use_bytes)$");
     return names.count(k) != 0 || std::regex_match(k, block) || std::regex_match(k, totals) || std::regex_match(k, checkpoint);
 }
 // the bulk route's single-batch provenance rows (written only by the ordinary indexed route)
@@ -5029,7 +5030,8 @@ bool shared_volatile(const std::string& k) {
 }
 // the combined route's own resource rows, when both runs write them (memory and time of the same work)
 bool route_resource(const std::string& k) {
-    static const std::regex rows("^footprint_checkpoint[0-9]+_(phys_footprint_bytes|phys_footprint_peak_bytes|seconds)$|"
+    static const std::regex rows("^footprint_checkpoint[0-9]+_(phys_footprint_bytes|phys_footprint_peak_bytes|seconds|"
+                                 "allocator_in_use_bytes)$|"
                                  "^union_block[0-9]+_phys_footprint_after_bytes$|^union_fragment_block_footprint_max_bytes$|"
                                  "^seconds_union_block_combination$");
     return std::regex_match(k, rows);
@@ -5590,6 +5592,93 @@ void test_round1_admission_caller() {
                  "only the declared override\n";
 }
 
+// ---- S2-K: the resource guard covers post-refinement work; publication is claimed, then written ---------------------
+void test_post_refinement_guard() {
+    namespace fs = std::filesystem;
+    const auto fresh = [&](const std::string& rel) {
+        fs::remove_all(path(rel));
+        fs::create_directories(path(rel));
+        panvar::GenotypeCommandOptions o =
+            repair_options(rel + "/call", path("phaseable_r1.fq"), path("phaseable_r2.fq"), "tiny_phaseable.gfa");
+        o.output_schema = "sequence_first_v2";
+        o.setting_sources["output_schema"] = "test";
+        o.early_incumbent = "experimental_v1";
+        o.setting_sources["early_incumbent"] = "test";
+        o.union_scoring_backend = "indexed_fine_experimental";   // the blocked route records the footprint checkpoints
+        o.indexed_union_store_bytes = std::size_t{256} << 20;
+        o.indexed_union_evidence_layout = "fine_views_experimental";
+        o.union_origin_cache_bytes = std::size_t{64} << 20;
+        o.max_union_cached_placements_consumed = o.max_union_cached_origins_consumed = 2000000000ULL;
+        o.max_union_cached_states_consumed = o.max_union_cached_prefilters_consumed = 2000000000ULL;
+        o.union_fragment_blocks = "fine_core_4096_experimental";
+        o.test_union_fragment_block_pairs = 37;
+        for (const char* k : {"union_scoring_backend", "indexed_union_store_bytes", "indexed_union_evidence_layout",
+                              "union_fragment_blocks"}) {
+            o.setting_sources[k] = "test";
+        }
+        return o;
+    };
+    const auto stages = [&](const std::string& status_file) {
+        const auto st = read_status(status_file);
+        std::vector<std::string> out;
+        for (std::size_t i = 1; i <= std::stoul(st.at("footprint_checkpoints")); ++i) {
+            out.push_back(st.at("footprint_checkpoint" + std::to_string(i) + "_stage"));
+            require(st.count("footprint_checkpoint" + std::to_string(i) + "_allocator_in_use_bytes") == 1,
+                    "S2-K: every checkpoint records the allocator's in-use bytes (or unavailable)");
+        }
+        return out;
+    };
+    const auto at = [](const std::vector<std::string>& v, const std::string& x) {
+        return static_cast<std::size_t>(std::find(v.begin(), v.end(), x) - v.begin());
+    };
+    const std::vector<std::string> finals = {"call.genotypes.tsv", "call.block_genotypes.tsv", "call.mosaic_candidates.tsv",
+                                             "call.mosaic_scores.tsv", "call.equivalence_set.tsv", "call.mosaic_haplotypes.fa"};
+    // (1) normal completion: every post-refinement stage runs under the guard, and publication follows the claim
+    {
+        require(panvar::execute_genotype_command(fresh("pg_complete"), nullptr) == 0, "S2-K: the run completes");
+        const auto v = stages(path("pg_complete/call.mosaic_status.tsv"));
+        for (const char* s : {"first_committed_refinement_round", "post_refinement_start", "pool_decision_and_summary",
+                              "representation_guard_done", "outputs_prepared", "outputs_published", "status_written:COMPLETE"}) {
+            require(at(v, s) < v.size(), std::string("S2-K: checkpoint recorded: ") + s);
+        }
+        require(at(v, "post_refinement_start") < at(v, "pool_decision_and_summary") &&
+                    at(v, "pool_decision_and_summary") < at(v, "representation_guard_done") &&
+                    at(v, "representation_guard_done") < at(v, "outputs_prepared") &&
+                    at(v, "outputs_prepared") < at(v, "outputs_published") && at(v, "outputs_published") < at(v, "status_written:COMPLETE"),
+                "S2-K: post-refinement stages in order; outputs published only after they are all prepared");
+        for (const std::string& f : finals) {   // the legacy FASTA is removed under sequence_first_v2 (S1-D policy)
+            if (f != "call.mosaic_haplotypes.fa") require(exists(path("pg_complete/" + f)), "S2-K: final output written: " + f);
+        }
+        require(sf::kv(path("pg_complete/call.sequence_locus.tsv")).at("prediction") == "PREDICTION", "S2-K: a completed prediction");
+    }
+    // (2) a time stop after the representation guard, and (3) a memory stop with every output prepared but unpublished:
+    // no COMPLETE status, no final output, the last committed checkpoint kept as PROVISIONAL
+    for (const auto& [rel, point, state, last, absent] :
+         {std::make_tuple(std::string("pg_guard_stop"), std::string("post_refinement_guard"), std::string("TIME_LIMIT"),
+                          std::string("representation_guard_done"), std::string("outputs_prepared")),
+          std::make_tuple(std::string("pg_output_stop"), std::string("post_refinement_outputs"), std::string("RESOURCE_REFUSAL"),
+                          std::string("outputs_prepared"), std::string("outputs_published"))}) {
+        panvar::GenotypeCommandOptions o = fresh(rel);
+        o.test_interrupt_point = point;
+        const int code = s2a::execute_in_child(o);
+        const auto st = read_status(path(rel + "/call.mosaic_status.tsv"));
+        const auto locus = sf::kv(path(rel + "/call.sequence_locus.tsv"));
+        require(code == 3 && st.at("status") == state && st.at("sequence_prediction") == "PROVISIONAL" &&
+                    locus.at("prediction") == "PROVISIONAL" && locus.at("completion") == "budget_stop",
+                "S2-K " + point + ": a budget stop keeps the last committed checkpoint as PROVISIONAL (exit " + std::to_string(code) +
+                    ", status " + st.at("status") + ")");
+        for (const std::string& f : finals) require(!exists(path(rel + "/" + f)), "S2-K " + point + ": no final output survives: " + f);
+        require(!exists(path(rel + "/call.repair_rounds.tsv")) && !exists(path(rel + "/call.settings.tsv")),
+                "S2-K " + point + ": no other final record survives");
+        std::vector<std::string> v;
+        for (std::size_t i = 1; i <= std::stoul(st.at("footprint_checkpoints")); ++i) v.push_back(st.at("footprint_checkpoint" + std::to_string(i) + "_stage"));
+        require(at(v, last) < v.size() && at(v, absent) == v.size() && at(v, "status_written:COMPLETE") == v.size(),
+                "S2-K " + point + ": the stop happened where declared, before publication");
+    }
+    std::cout << "  post-refinement guard: stages recorded in order under the guard; a time stop after the representation guard "
+                 "and a memory stop before publication leave no final output and keep the checkpoint PROVISIONAL\n";
+}
+
 int main(int argc, char** argv) {
     if (argc < 2) {
         std::cerr << "usage: genotype_command_e2e_test <scratch dir> [source dir]\n";
@@ -5622,6 +5711,7 @@ int main(int argc, char** argv) {
             test_blocked_union_route();
             test_refinement_diagnostics();
             test_round1_admission_caller();
+            test_post_refinement_guard();
             std::cout << "genotype command e2e (blocked_union only): PASS\n";
             return 0;
         } catch (const std::exception& error) {
@@ -5710,6 +5800,7 @@ int main(int argc, char** argv) {
         test_blocked_union_route();
         test_refinement_diagnostics();
         test_round1_admission_caller();
+        test_post_refinement_guard();
         if (argc >= 3) test_profile(argv[2]);
         test_block_quality_columns();
         std::cout << "genotype command end-to-end: PASS\n";
