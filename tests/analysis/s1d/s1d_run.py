@@ -39,8 +39,12 @@ MANIFEST = [("t.genotype_sequence_report", "ctest", "genotype_sequence_report", 
             ("c4.extract", "c4_extract", "c4_5", 60)]
 MANIFEST += [(f"t.{tn(t)}", "ctest", tn(t), 60) for t in s1b_run.LIGHT + s1b_run.REST_SMALL + s1b_run.OTHER]
 MANIFEST += [(f"t.{t}", "ctest", t, s) for t, s in s1b_run.HEAVY]
-AMENDMENT_1 = []
-ORDER = [m[0] for m in MANIFEST]
+# Amendment 1 (after t.genotype_command_e2e failed on a test defect, before further execution; it stays recorded): the
+# S1-D e2e test compared the legacy block table byte for byte between audit and off, but that table's dosage_filter /
+# dosage_filter_reasons columns record the dosage mode by design (off: DOSAGE_NOT_EVALUATED:dosage_mode_off). The test
+# now requires every other column identical and the off record to say not evaluated; rerun as .a1.
+AMENDMENT_1 = [("t.genotype_command_e2e.a1", "ctest", "genotype_command_e2e", 300)]
+ORDER = [m[0] for m in MANIFEST[:5]] + [m[0] for m in AMENDMENT_1] + [m[0] for m in MANIFEST[5:]]
 LEDGER = "unit\trevision\tdirty_tree\tdeclared_timeout_seconds\twall_seconds\tpeak_rss_gib\texit\ttimed_out\tnote\n"
 
 

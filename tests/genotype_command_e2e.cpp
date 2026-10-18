@@ -4275,10 +4275,36 @@ void test_sequence_first_v2() {
     const panvar::GenotypeCommandOptions off = options("sf2_off", "off");
     require(panvar::execute_genotype_command(off, nullptr) == 0, "v2 off: predicts");
     for (const char* f : {"call.sequence_haplotypes.tsv", "call.sequence_blocks.tsv", "call.representation_intervals.tsv",
-                          "call.sequence_alternatives.tsv", "call.block_genotypes.tsv", "call.mosaic_scores.tsv",
-                          "call.mosaic_candidates.tsv", "call.equivalence_set.tsv"}) {
+                          "call.sequence_alternatives.tsv", "call.mosaic_scores.tsv", "call.mosaic_candidates.tsv",
+                          "call.equivalence_set.tsv"}) {
         require(sf::normalised(path("sf2_audit/") + f, path("sf2_audit")) == sf::normalised(path("sf2_off/") + f, path("sf2_off")),
                 std::string("audit vs off: ") + f + " identical");
+    }
+    {   // the legacy block table: every column identical except the dosage filter pair, which records the mode (off:
+        // DOSAGE_NOT_EVALUATED:dosage_mode_off; audit: its finding) -- a diagnostic annotation, never a genotype change
+        const auto table = [&](const std::string& file) {
+            std::vector<std::vector<std::string>> out;
+            std::istringstream in(slurp(file));
+            for (std::string line; std::getline(in, line);) {
+                std::vector<std::string> cells;
+                std::istringstream l(line);
+                for (std::string c; std::getline(l, c, '\t');) cells.push_back(c);
+                out.push_back(cells);
+            }
+            return out;
+        };
+        const auto a = table(path("sf2_audit/call.block_genotypes.tsv")), o = table(path("sf2_off/call.block_genotypes.tsv"));
+        require(a.size() == o.size() && !a.empty() && a.front() == o.front(), "audit vs off: same block rows and columns");
+        for (std::size_t r = 1; r < a.size(); ++r) {
+            for (std::size_t c = 0; c < a.front().size(); ++c) {
+                const std::string& col = a.front()[c];
+                if (col == "dosage_filter" || col == "dosage_filter_reasons") continue;
+                require(a[r][c] == o[r][c], "audit vs off: block column " + col + " unchanged by the audit");
+            }
+            require(o[r][std::find(o.front().begin(), o.front().end(), "dosage_filter_reasons") - o.front().begin()] ==
+                        "DOSAGE_NOT_EVALUATED:dosage_mode_off",
+                    "explicit off is recorded as not evaluated");
+        }
     }
     auto la = sf::kv(path("sf2_audit/call.sequence_locus.tsv")), lo = sf::kv(path("sf2_off/call.sequence_locus.tsv"));
     require(la.at("dosage_mode") == "audit" && lo.at("dosage_mode") == "off", "audit vs off: recorded modes");
