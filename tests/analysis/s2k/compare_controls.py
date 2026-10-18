@@ -67,13 +67,28 @@ def main(out, scratch):
         d = os.path.join(scratch, "control_" + name.replace(" ", "_").replace(":", ""))
         if os.path.exists(d):
             shutil.rmtree(d)
-        shutil.copytree(f"{S2J}/caller.acot5.reuse", d)
+        source = f"{S2J}/caller.acot5.reuse"
+        shutil.copytree(source, d)
+        # Amendment 1: relocate the copy -- every path-bearing value (profile paths, settings sources) names the copy's
+        # own directory, as an output produced there would; otherwise every control differs on the copy's location alone
+        for name in os.listdir(d):
+            path = os.path.join(d, name)
+            text = open(path, errors="surrogateescape").read()
+            if source in text:
+                open(path, "w", errors="surrogateescape").write(text.replace(source, d))
         mutate(os.path.join(d, file))
         code = compare(f"{S2J}/caller.acot5.existing", d, os.path.join(d, "compare.tsv"))
         good = (code == 0) == must_pass
+        reason = "-"
+        for line in open(os.path.join(d, "compare.tsv")):
+            if line.startswith("outputs_identical\t"):
+                reason = line.rstrip("\n").split("\t", 1)[1]
+        # a negative control must fail for ITS change (never for the copy's location)
+        if not must_pass and ("profile" in reason.split("allowances: ")[-1].split(",") or "settings differ" in reason):
+            good = False
         ok &= good
         rows.append(f"control\t{name}\texpected_{'pass' if must_pass else 'fail'}\tobserved_{'pass' if code == 0 else 'fail'}\t"
-                    f"{'OK' if good else 'WRONG'}")
+                    f"{'OK' if good else 'WRONG'}\t{reason}")
     open(f"{out}/controls.tsv", "w").write("\n".join(rows) + "\n")
     print("\n".join(rows))
     return 0 if ok else 1

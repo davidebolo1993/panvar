@@ -37,7 +37,11 @@ MANIFEST_B = [("t.genotype_blocked_union_route", "ctest", "genotype_blocked_unio
               ("caller.acot30.6gib", "caller", "acot_30:reuse_full_6gib", 300),
               ("compare.acot30.6gib_vs_s2j", "compare6", "-", 30)]
 GIB4, GIB6 = 4294967296, 6442450944
-MANIFESTS = {"B": MANIFEST_B}
+# Amendment 1 (declared before further execution): compare.v2_and_controls failed on a harness defect (copies kept the
+# original directory in path-bearing values); the fixed harness runs once as a new unit, which replaces the failed one
+# in the 6 GiB condition. The failed unit stays recorded.
+MANIFEST_A1 = [("compare.v2_and_controls.a1", "controls", "-", 30)]
+MANIFESTS = {"B": MANIFEST_B, "A1": MANIFEST_A1}
 
 
 def ledger_rows():
@@ -147,7 +151,7 @@ def command(unit, kind, target, timeout, d):
             return None, "NOT RUN (condition): the 6 GiB run did not run"
         return [sys.executable, os.path.join(HERE, "compare_6gib.py"), f"{S2J}/runs/caller.acot30.reuse", b,
                 f"{d}/compare.tsv"], "-"
-    gates = [r for r in ledger_rows() if r["unit"].startswith("t.") or r["unit"].startswith("compare.v2")]
+    gates = [r for r in ledger_rows() if r["unit"].startswith("t.") or r["unit"] == "compare.v2_and_controls.a1"]
     if len(gates) < 5 or any(r["exit"] != "0" for r in gates):
         return None, "NOT RUN (condition): a gate or the comparator controls failed"
     cell_id, arm = target.split(":")
