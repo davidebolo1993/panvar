@@ -44,7 +44,17 @@ MANIFEST += [(f"t.{t}", "ctest", t, s) for t, s in s1b_run.HEAVY]
 # dosage_filter_reasons columns record the dosage mode by design (off: DOSAGE_NOT_EVALUATED:dosage_mode_off). The test
 # now requires every other column identical and the off record to say not evaluated; rerun as .a1.
 AMENDMENT_1 = [("t.genotype_command_e2e.a1", "ctest", "genotype_command_e2e", 300)]
-ORDER = [m[0] for m in MANIFEST[:5]] + [m[0] for m in AMENDMENT_1] + [m[0] for m in MANIFEST[5:]]
+# Amendment 2 (after t.genotype_command_e2e.a1 failed, before further execution; it stays recorded): an implementation
+# defect -- the API-level refusal of --dosage-mode repair under sequence_first_v2 sat after the run, so the run wrote
+# outputs before returning 2. Moved before run_genotype_body. The library changed, so the units already run rerun as .a2.
+AMENDMENT_1 += [("t.genotype_sequence_report.a2", "ctest", "genotype_sequence_report", 30),
+                ("t.genotype_cli_contract.a2", "ctest", "genotype_cli_contract", 30),
+                ("fixtures.A.a2", "fixtures", "F3,F9,F1,F7full,F7", 240),
+                ("fixtures.B.a2", "fixtures", "F11u,F11c,F12", 240),
+                ("t.genotype_command_e2e.a2", "ctest", "genotype_command_e2e", 300),
+                ("c4.v2.a2", "c4_v2", "c4_5", 120),
+                ("c4.extract.a2", "c4_extract", "c4_5", 60)]
+ORDER = [m[0] for m in MANIFEST[:5]] + [m[0] for m in AMENDMENT_1] + [m[0] for m in MANIFEST[7:]]
 LEDGER = "unit\trevision\tdirty_tree\tdeclared_timeout_seconds\twall_seconds\tpeak_rss_gib\texit\ttimed_out\tnote\n"
 
 
@@ -87,6 +97,8 @@ def run_unit(unit):
     u, kind, target, timeout = next(m for m in MANIFEST + AMENDMENT_1 if m[0] == unit)
     if any(m[0] == unit for m in AMENDMENT_1):
         assert os.path.exists(f"{OUT}/AMENDMENT_1.tsv"), "freeze amendment 1 first"
+        if unit.endswith(".a2"):
+            assert os.path.exists(f"{OUT}/AMENDMENT_2.tsv"), "freeze amendment 2 first"
     assert open(f"{OUT}/MANIFEST.tsv").read() and timeout <= 300 and unit not in done()
     rev, dirty = state()
     assert dirty == 0, "the tree must be committed and clean"
@@ -102,7 +114,8 @@ def run_unit(unit):
     if kind == "ctest":
         cmd = ["nice", "ctest", "--test-dir", BUILD, "-R", f"^panvar_{target}$", "--output-on-failure", "-j1"]
     elif kind == "fixtures":
-        cmd = ["nice", sys.executable, os.path.join(HERE, "s1d_fixtures.py"), f"{OUT}/fixtures", f"{BUILD}/panvar",
+        cmd = ["nice", sys.executable, os.path.join(HERE, "s1d_fixtures.py"),
+               f"{OUT}/fixtures" + ("_a2" if unit.endswith(".a2") else ""), f"{BUILD}/panvar",
                f"{BUILD}/genotype_prepared_locus_driver", target]
     elif kind == "c4_v2":
         cell = p1_run.cells()[target]
@@ -113,7 +126,7 @@ def run_unit(unit):
         cmd = ["nice", f"{BUILD}/panvar", "genotype", *args, "--output-schema", "sequence_first_v2"]
     else:
         cmd = [sys.executable, os.path.join(HERE, "extract_panel_haplotype.py"), "--check", p1_run.cells()[target]["graph"],
-               f"{OUT}/runs/c4.v2/call.sequence_haplotypes.tsv"]
+               f"{OUT}/runs/c4.v2{'.a2' if unit.endswith('.a2') else ''}/call.sequence_haplotypes.tsv"]
     cmd = ["/usr/bin/time", "-l", *cmd]
     t = time.time()
     with open(f"{d}/run.log", "w") as log:
@@ -139,9 +152,9 @@ if __name__ == "__main__":
     arg = sys.argv[1]
     if arg == "manifest":
         write_manifest()
-    elif arg == "amendment1":
+    elif arg in ("amendment1", "amendment2"):
         text = "".join("\t".join(str(x) for x in m) + "\n" for m in AMENDMENT_1)
-        p = f"{OUT}/AMENDMENT_1.tsv"
+        p = f"{OUT}/AMENDMENT_{arg[-1]}.tsv"
         assert not os.path.exists(p) or open(p).read() == text
         open(p, "w").write(text)
         print(text, end="")

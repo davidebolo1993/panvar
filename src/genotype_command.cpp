@@ -6477,15 +6477,17 @@ std::optional<int> resolve_genotype_command(const std::vector<std::string>& args
 // prepared-locus route (I3-A).
 int execute_genotype_command(const GenotypeCommandOptions& options, const PreparedLocus* locus) {
     // The dosage stage and the locus table run after every existing output is committed (sections 20 and 22).
+    // S1-D: API callers too -- refused before the run touches its prefix (the CLI refuses at argument resolution)
+    if (options.output_schema == "sequence_first_v2" && options.dosage_mode == "repair") {
+        std::cerr << "[genotype] --dosage-mode repair is refused under output_schema sequence_first_v2: dosage is "
+                     "diagnostic there; reproduce historical repair results with the legacy contract\n";
+        return 2;
+    }
     const std::string& mode = options.dosage_mode;
     GenotypeDosageCapture capture;
     const GenotypeRunStatus status = run_genotype_body(options, &capture, locus);
     const bool called = status == GenotypeRunStatus::Complete || status == GenotypeRunStatus::ConditionalGenotypeEquivalent;
     const bool sequence_first = panvar::sequence_first(options);
-    if (options.output_schema == "sequence_first_v2" && options.dosage_mode == "repair") {   // S1-D: API callers too
-        std::cerr << "[genotype] --dosage-mode repair is refused under output_schema sequence_first_v2\n";
-        return 2;
-    }
     if (sequence_first && !g_sequence_published) {
         // S1-B/C: a run that ended without the adaptive completion's stop (no prediction, or an uncovered route)
         // publishes here; a watchdog stop never reaches here (no prediction, and its owned reports were removed).
