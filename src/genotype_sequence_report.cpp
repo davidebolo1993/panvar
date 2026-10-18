@@ -46,27 +46,45 @@ std::string basename_of(const std::string& prefix) {
     return slash == std::string::npos ? prefix : prefix.substr(slash + 1);
 }
 
-// A member's two labellings oriented so that A spells the group's first sequence (canonical digest order); for a
-// pair of identical sequences, the lexicographically smaller labelling comes first.
-std::pair<Labels, Labels> oriented(const PoolCandidate& c) {
+// Orientation (S1-C): haplotype A is the one whose spelled sequence has the smaller SHA-256 -- the representative
+// FASTA's hap1. Each group's two sequences are spelled once and their SHA-256 bound to the caller's digests, so a
+// member's labellings are oriented by sequence identity, never by the internal digest order (which can disagree with
+// SHA-256 order). For two identical sequences the lexicographically smaller labelling is A.
+struct GroupOrientation {
+    SequenceDigest a_digest;            // the digest of haplotype A's sequence
+    bool identical = false;
+    std::string a_sha256, b_sha256, a_bases, b_bases;
+};
+
+GroupOrientation orientation_of(const PoolCandidate& c, const HaplotypeSpeller& spell) {
+    GroupOrientation o;
+    std::string x = spell(c.first), y = spell(c.second);
+    std::string hx = sha256_bytes(x), hy = sha256_bytes(y);
+    o.identical = c.first_sequence == c.second_sequence;
+    if (hy < hx) {
+        o.a_digest = c.second_sequence;
+        o.a_sha256 = std::move(hy);
+        o.b_sha256 = std::move(hx);
+        o.a_bases = std::move(y);
+        o.b_bases = std::move(x);
+    } else {
+        o.a_digest = c.first_sequence;
+        o.a_sha256 = std::move(hx);
+        o.b_sha256 = std::move(hy);
+        o.a_bases = std::move(x);
+        o.b_bases = std::move(y);
+    }
+    return o;
+}
+
+std::pair<Labels, Labels> oriented(const PoolCandidate& c, const GroupOrientation& o) {
     Labels a = c.first, b = c.second;
-    if (c.second_sequence < c.first_sequence) {
-        std::swap(a, b);
-    } else if (c.first_sequence == c.second_sequence && b < a) {
+    if (o.identical) {
+        if (b < a) std::swap(a, b);
+    } else if (!(c.first_sequence == o.a_digest)) {
         std::swap(a, b);
     }
     return {std::move(a), std::move(b)};
-}
-
-void write_or_throw(const std::string& path, const std::string& text) {
-    const std::string temporary = path + ".tmp";
-    {
-        std::ofstream out(temporary, std::ios::binary);
-        if (!out) throw std::runtime_error("cannot write " + temporary);
-        out << text;
-        if (!out) throw std::runtime_error("cannot write " + temporary);
-    }
-    if (std::rename(temporary.c_str(), path.c_str()) != 0) throw std::runtime_error("cannot publish " + path);
 }
 
 std::string fasta_record(const std::string& name, const std::string& header, const std::string& bases) {
@@ -125,95 +143,69 @@ SequenceReport build_sequence_report(const PooledDecision& decided, const std::v
     const std::vector<std::size_t> tied(decided.top_groups.begin(), decided.top_groups.end());
     r.exact_score_ties = 0;
     for (const std::size_t g : decided.top_groups) r.exact_score_ties += entry_of[g]->score == best_score ? 1 : 0;
+    // every decision-set group is spelled once (its representative member); orientation is bound to SHA-256
+    std::map<std::size_t, GroupOrientation> orient;
+    for (const std::size_t g : decided.top_groups) {
+        orient.emplace(g, orientation_of(candidates[decided.representative[g]], spell));
+    }
     std::size_t rep = decided.ranking.candidates.front().candidate_id;
-    std::pair<std::string, std::string> rep_key;
-    std::pair<std::string, std::string> rep_bases;
-    const auto spelled = [&](std::size_t g) {
-        const auto ab = oriented(candidates[decided.representative[g]]);
-        std::string x = spell(ab.first), y = spell(ab.second);
-        std::string hx = sha256_bytes(x), hy = sha256_bytes(y);
-        if (hy < hx) {
-            std::swap(hx, hy);
-            std::swap(x, y);
-        }
-        return std::make_pair(std::make_pair(hx, hy), std::make_pair(std::move(x), std::move(y)));
-    };
     if (tied.size() > 1) {
         r.representative_tie_break = "canonical_sha256";
-        bool first = true;
         for (const std::size_t g : tied) {
-            auto item = spelled(g);
-            if (first || item.first < rep_key) {
-                rep = g;
-                rep_key = item.first;
-                rep_bases = std::move(item.second);
-                first = false;
-            }
+            const GroupOrientation& o = orient.at(g), &best = orient.at(rep);
+            if (std::tie(o.a_sha256, o.b_sha256) < std::tie(best.a_sha256, best.b_sha256)) rep = g;
         }
-    } else {
-        auto item = spelled(rep);
-        rep_key = item.first;
-        rep_bases = std::move(item.second);
     }
     r.representative_group = rep;
     r.representative_member = decided.representative[rep];
     {
-        const auto ab = oriented(candidates[r.representative_member]);
-        r.representative_first = ab.first;
-        r.representative_second = ab.second;
+        GroupOrientation& o = orient.at(rep);
+        const auto ab = oriented(candidates[r.representative_member], o);
+        r.representative_first = ab.first;    // spells hap1 (A)
+        r.representative_second = ab.second;  // spells hap2 (B)
+        r.hap1_sha256 = o.a_sha256;
+        r.hap2_sha256 = o.b_sha256;
+        r.hap1_bases = o.a_bases;
+        r.hap2_bases = o.b_bases;
     }
-    r.hap1_sha256 = rep_key.first;
-    r.hap2_sha256 = rep_key.second;
-    r.hap1_bases = std::move(rep_bases.first);
-    r.hap2_bases = std::move(rep_bases.second);
     r.representative_score = entry_of[rep]->score;
     r.representative_probability = entry_of[rep]->candidate_set_probability;
     r.decision_set_probability = 0.0;
     for (const std::size_t g : decided.top_groups) r.decision_set_probability += entry_of[g]->candidate_set_probability;
 
-    // ---- representation intervals of every decision-set group (conservative enclosing ranges)
+    // ---- representation intervals of every decision-set group: ONE conservative enclosing range per group, from a
+    // linear scan -- the first and last block where any explored labelling differs from the first one (two labellings
+    // differ at a block only if one of them differs from the first there). Unchanged blocks in between are inside the
+    // range, so coupled alternatives keep their context; tuples are the whole observed labellings over the range.
     for (const std::size_t g : decided.top_groups) {
+        const GroupOrientation& o = orient.at(g);
         std::vector<std::pair<Labels, Labels>> members;
-        for (const std::size_t m : decided.groups[g]) members.push_back(oriented(candidates[m]));
-        std::vector<std::pair<std::size_t, std::size_t>> spans;
-        for (std::size_t i = 0; i < members.size(); ++i) {
-            for (std::size_t j = i + 1; j < members.size(); ++j) {
-                std::size_t lo = block_count, hi = 0;
-                for (std::size_t b = 0; b < block_count; ++b) {
-                    if (members[i].first[b] != members[j].first[b] || members[i].second[b] != members[j].second[b]) {
-                        lo = std::min(lo, b);
-                        hi = std::max(hi, b);
-                    }
+        for (const std::size_t m : decided.groups[g]) members.push_back(oriented(candidates[m], o));
+        std::size_t lo = block_count, hi = 0;
+        for (std::size_t i = 1; i < members.size(); ++i) {
+            for (std::size_t b = 0; b < block_count; ++b) {
+                if (members[i].first[b] != members[0].first[b] || members[i].second[b] != members[0].second[b]) {
+                    lo = std::min(lo, b);
+                    hi = std::max(hi, b);
                 }
-                if (lo < block_count) spans.push_back({lo, hi});
             }
         }
-        std::sort(spans.begin(), spans.end());
-        std::vector<std::pair<std::size_t, std::size_t>> merged;
-        for (const auto& s : spans) {
-            if (!merged.empty() && s.first <= merged.back().second) {
-                merged.back().second = std::max(merged.back().second, s.second);
-            } else {
-                merged.push_back(s);
-            }
+        if (lo == block_count) continue;
+        RepresentationInterval interval;
+        interval.group = g;
+        interval.first_block = lo;
+        interval.last_block = hi;
+        interval.hap_a_sha256 = o.a_sha256;
+        interval.hap_b_sha256 = o.b_sha256;
+        std::set<std::pair<Labels, Labels>> tuples;
+        for (const auto& m : members) {
+            Labels a(m.first.begin() + lo, m.first.begin() + hi + 1);
+            Labels b(m.second.begin() + lo, m.second.begin() + hi + 1);
+            if (o.identical && b < a) std::swap(a, b);
+            tuples.insert({std::move(a), std::move(b)});
         }
-        const bool same_sequences = candidates[decided.groups[g].front()].first_sequence ==
-                                    candidates[decided.groups[g].front()].second_sequence;
-        for (const auto& span : merged) {
-            RepresentationInterval interval;
-            interval.group = g;
-            interval.first_block = span.first;
-            interval.last_block = span.second;
-            std::set<std::pair<Labels, Labels>> tuples;
-            for (const auto& m : members) {
-                Labels a(m.first.begin() + span.first, m.first.begin() + span.second + 1);
-                Labels b(m.second.begin() + span.first, m.second.begin() + span.second + 1);
-                if (same_sequences && b < a) std::swap(a, b);
-                tuples.insert({std::move(a), std::move(b)});
-            }
-            interval.tuples.assign(tuples.begin(), tuples.end());
-            r.intervals.push_back(std::move(interval));
-        }
+        interval.tuples.assign(tuples.begin(), tuples.end());
+        r.intervals.push_back(std::move(interval));
     }
 
     // ---- block rows
@@ -342,7 +334,17 @@ SequenceReport provisional_sequence_report(const std::vector<std::size_t>& first
     return r;
 }
 
+const std::vector<std::string>& sequence_report_outputs() {
+    // exact owned suffixes: the five reports and atomic_write's staging name for each
+    static const std::vector<std::string> suffixes = {
+        ".sequence_locus.tsv", ".sequence_blocks.tsv", ".sequence_haplotypes.fa", ".representation_intervals.tsv",
+        ".sequence_alternatives.tsv", ".sequence_locus.tsv.writing", ".sequence_blocks.tsv.writing",
+        ".sequence_haplotypes.fa.writing", ".representation_intervals.tsv.writing", ".sequence_alternatives.tsv.writing"};
+    return suffixes;
+}
+
 int sequence_report_exit_code(const SequenceReport& report) {
+    if (report.publication_failed) return 2;
     if (report.prediction == "PREDICTION") return 0;
     if (report.prediction == "PROVISIONAL") return 3;
     return 1;
@@ -352,7 +354,7 @@ std::string sequence_report_status_keys(const SequenceReport& report) {
     std::ostringstream out;
     out << "sequence_prediction\t" << report.prediction << "\nsequence_status\t" << report.sequence_status
         << "\nsequence_completion\t" << report.completion << "\nsequence_exit_code\t" << sequence_report_exit_code(report)
-        << '\n';
+        << "\nsequence_publication\t" << (report.publication_failed ? "FAILED" : "complete") << '\n';
     return out.str();
 }
 
@@ -379,7 +381,9 @@ void write_sequence_report(const SequenceReport& r, const SequenceLegacy& legacy
           << (predicted ? r.completion_note : no_prediction_reason) << "\ndecision_scope\t"
           << (r.prediction == "PREDICTION" ? "numerical_top_set_of_the_explored_exactly_scored_pool" : "NOT_DETERMINED")
           << "\nresolution_meaning\tRESOLVED_means_one_sequence_pair_within_the_declared_decision_set;"
-             "not_a_confidence_or_correctness_claim\n";
+             "not_a_confidence_or_correctness_claim\n"
+             "representative_scope\tcanonical_member_of_the_numerically_inseparable_decision_set;"
+             "not_necessarily_the_strictly_highest_floating_point_score\n";
     if (predicted) {
         locus << "representative_group\t" << (r.prediction == "PREDICTION" ? std::to_string(r.representative_group) : "NA")
               << "\nrepresentative_of_set\t" << (r.decision_set_groups > 1 ? "yes" : "no")
@@ -406,11 +410,15 @@ void write_sequence_report(const SequenceReport& r, const SequenceLegacy& legacy
              "legacy_phase_support\t"
           << r.legacy_phase_support
           << "\nphase_assertion\tnone_beyond_legacy_phase_support\n"
-             "dosage_scope\tcaller_decision_only;the_dosage_stage_changes_legacy_outputs_only\n"
+             "dosage_scope\tcaller_decision_before_the_dosage_stage;the_dosage_stage_changes_legacy_outputs_only\n"
+             "post_dosage_sequence\tnot_reported:when_dosage_repair_changes_the_legacy_reported_genotype_this_report_"
+             "and_its_FASTA_are_NOT_the_post_dosage_result\n"
+             "dosage_mode\t"
+          << legacy.dosage_mode << "\n"
              "legacy_run_status\t"
           << legacy.run_status << "\nlegacy_call_class\t" << legacy.call_class << "\nlegacy_no_call_reason\t"
           << legacy.no_call_reason << "\nexit_code\t" << (predicted ? sequence_report_exit_code(r) : 1) << '\n';
-    write_or_throw(prefix + ".sequence_locus.tsv", locus.str());
+    const std::string locus_text = locus.str();   // the commit record: published last (S1-C)
 
     std::ostringstream blocks;
     blocks << "block_id\tblock_status\tgenotype\tobserved_genotypes\terror_mass_lower\terror_mass_upper\t"
@@ -427,11 +435,13 @@ void write_sequence_report(const SequenceReport& r, const SequenceLegacy& legacy
                    << '\n';
         }
     }
-    write_or_throw(prefix + ".sequence_blocks.tsv", blocks.str());
+    atomic_write(prefix + ".sequence_blocks.tsv", blocks.str());
 
     std::ostringstream iv;
+    // hapA/hapB: A is the group's sequence with the smaller SHA-256 (for the representative group: FASTA hap1, labelling
+    // representative_labelling_hap1), B the other; their SHA-256 are written on every row.
     iv << "interval\tgroup\trepresentative_group\tfirst_block\tlast_block\tblocks\tinterval_scope\tobserved_tuples\t"
-          "tuples_hapA_hapB\n";
+          "tuples_hapA_hapB\thapA_sha256\thapB_sha256\n";
     for (const RepresentationInterval& i : r.intervals) {
         std::string ids, tuples;
         for (std::size_t b = i.first_block; b <= i.last_block; ++b) ids += (ids.empty() ? "" : ",") + r.block_ids[b];
@@ -439,9 +449,9 @@ void write_sequence_report(const SequenceReport& r, const SequenceLegacy& legacy
         iv << r.block_ids[i.first_block] << ".." << r.block_ids[i.last_block] << '\t' << i.group << '\t'
            << (i.group == r.representative_group ? "yes" : "no") << '\t' << r.block_ids[i.first_block] << '\t'
            << r.block_ids[i.last_block] << '\t' << ids << "\tconservative_enclosing_not_minimal\t" << i.tuples.size()
-           << '\t' << tuples << '\n';
+           << '\t' << tuples << '\t' << i.hap_a_sha256 << '\t' << i.hap_b_sha256 << '\n';
     }
-    write_or_throw(prefix + ".representation_intervals.tsv", iv.str());
+    atomic_write(prefix + ".representation_intervals.tsv", iv.str());
 
     std::ostringstream alt;
     alt << "rank\tgroup\tin_decision_set\trepresentative\tscore\tfragment_term\texposure_term\tsequence_pair_prior\t"
@@ -458,7 +468,7 @@ void write_sequence_report(const SequenceReport& r, const SequenceLegacy& legacy
             << digest_hex(a.first) << '\t' << a.first.length << '\t' << digest_hex(a.second) << '\t' << a.second.length
             << '\t' << a.blocks_with_other_genotypes.size() << '\t' << (ids.empty() ? "none" : ids) << '\n';
     }
-    write_or_throw(prefix + ".sequence_alternatives.tsv", alt.str());
+    atomic_write(prefix + ".sequence_alternatives.tsv", alt.str());
 
     std::string fasta;
     if (predicted) {
@@ -468,16 +478,46 @@ void write_sequence_report(const SequenceReport& r, const SequenceLegacy& legacy
                << " representative_of_set=" << (r.decision_set_groups > 1 ? "yes" : "no")
                << " provisional=" << (r.prediction == "PROVISIONAL" ? "yes" : "no")
                << " representation_intervals=" << (intervals.empty() ? "none" : intervals)
-               << " phase=not_asserted structure_confidence=NA";
+               << " phase=not_asserted structure_confidence=NA scope=caller_decision_before_dosage_stage"
+               << " dosage_mode=" << legacy.dosage_mode;
         fasta = fasta_record(base + "_seq_hap1", "sha256=" + r.hap1_sha256 + " bp=" +
                                                      std::to_string(r.hap1_bases.size()) + " " + header.str(),
                              r.hap1_bases) +
                 fasta_record(base + "_seq_hap2", "sha256=" + r.hap2_sha256 + " bp=" +
                                                      std::to_string(r.hap2_bases.size()) + " " + header.str(),
                              r.hap2_bases);
-        write_or_throw(prefix + ".sequence_haplotypes.fa", fasta);
+        atomic_write(prefix + ".sequence_haplotypes.fa", fasta);
     } else {
         std::remove((prefix + ".sequence_haplotypes.fa").c_str());
+    }
+    atomic_write(prefix + ".sequence_locus.tsv", locus_text);   // only once every required report is complete
+}
+
+bool publish_sequence_report(SequenceReport& r, const SequenceLegacy& legacy, const std::string& prefix,
+                             const std::string& no_prediction_reason) {
+    try {
+        write_sequence_report(r, legacy, prefix, no_prediction_reason);
+        return true;
+    } catch (const std::exception& error) {
+        // Never leave a partial report: remove every owned file of this run, then record the failure (best effort).
+        for (const std::string& suffix : sequence_report_outputs()) std::remove((prefix + suffix).c_str());
+        SequenceReport failed;
+        failed.publication_failed = true;
+        failed.publication_error = error.what();
+        failed.completion = "report_publication_failed";
+        failed.legacy_phase_support = r.legacy_phase_support;
+        r = failed;
+        try {
+            atomic_write(prefix + ".sequence_locus.tsv",
+                         "key\tvalue\nschema_version\tsequence_first_v1\nprediction\tNO_PREDICTION\nsequence_status\tNA\n"
+                         "completion\treport_publication_failed\ncompletion_note\t" + std::string(error.what()) +
+                         "\nlegacy_run_status\t" + legacy.run_status + "\nlegacy_call_class\t" + legacy.call_class +
+                         "\nlegacy_no_call_reason\t" + legacy.no_call_reason + "\nexit_code\t2\n");
+        } catch (const std::exception&) {
+            std::remove((prefix + ".sequence_locus.tsv").c_str());
+            std::remove((prefix + ".sequence_locus.tsv.writing").c_str());
+        }
+        return false;
     }
 }
 

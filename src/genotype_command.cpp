@@ -99,6 +99,7 @@ ProposalReuseReport g_proposal_reuse;
 // S1-B (sequence_first_v1 only): this run's sequence report and its legacy classification (reset per run)
 SequenceReport g_sequence_report;
 SequenceLegacy g_sequence_legacy;
+bool g_sequence_published = false;   // S1-C: the report was published (or its failure recorded) for this run
 std::uint64_t g_union_end_footprint = 0;   // I2-K (measurement): physical footprint right after the union pass
 // I3-A: what the status says about a prepared locus this run used (reset at every run start).
 struct PreparedLocusUse {
@@ -155,6 +156,8 @@ void stop_run(const std::string& state, const std::string& note, int code) {
     g_watch->finished = true;
     std::error_code ignored;
     for (const char* suffix : kFinalOutputs) std::filesystem::remove(g_watch->out_prefix + suffix, ignored);
+    // S1-C: the sequence-first reports are run-owned too; a stopped run never sits beside an earlier prediction
+    for (const std::string& suffix : sequence_report_outputs()) std::filesystem::remove(g_watch->out_prefix + suffix, ignored);
     std::filesystem::remove(g_watch->out_prefix + ".sorted.gfa", ignored);
     atomic_write(g_watch->out_prefix + ".mosaic_status.tsv", minimal_status(*g_watch, state, note));
     std::cerr << "[genotype] " << state << ": " << note << '\n';
@@ -1815,6 +1818,7 @@ namespace {
 
 void remove_run_outputs(const std::string& out_prefix) {
     for (const char* suffix : kFinalOutputs) std::remove((out_prefix + suffix).c_str());
+    for (const std::string& suffix : sequence_report_outputs()) std::remove((out_prefix + suffix).c_str());   // S1-C
     for (const std::string& suffix : dosage::dosage_stage_outputs()) std::remove((out_prefix + suffix).c_str());
     for (const char* suffix : kPartialOutputs) std::remove((out_prefix + suffix).c_str());
     std::remove((out_prefix + ".mosaic_status.tsv").c_str());
@@ -2167,6 +2171,7 @@ GenotypeRunStatus run_genotype_body(const GenotypeCommandOptions& options, Genot
     g_proposal_reuse = ProposalReuseReport{};   // I2-E: never a previous run's figures
     g_sequence_report = SequenceReport{};          // S1-B: likewise
     g_sequence_legacy = SequenceLegacy{};
+    g_sequence_published = false;
     reset_prepared_library_terms_tally();         // I2-F: likewise
     g_union_end_footprint = 0;
     reset_emission_handoff_report();   // I2-K: nothing from an earlier run is reported or adopted
@@ -3191,7 +3196,16 @@ GenotypeRunStatus run_genotype_body(const GenotypeCommandOptions& options, Genot
                                 : status == GenotypeRunStatus::ConditionalGenotypeEquivalent ? "genotype_equivalent_call"
                                                                                              : "no_call";
             if (report.call_class != "no_call") report.no_call_reason = "none";
-            g_sequence_legacy = {genotype_run_status_name(status), report.call_class, report.no_call_reason};   // S1-B
+            g_sequence_legacy = {genotype_run_status_name(status), report.call_class, report.no_call_reason,
+                                 options.dosage_mode};   // S1-B
+            // S1-C: the sequence report is published before the status commits it: its files first, its locus record
+            // last; a failure leaves no partial report and the status says so.
+            if (options.output_schema == "sequence_first_v1") {
+                publish_sequence_report(g_sequence_report, g_sequence_legacy, options.out_prefix,
+                                        "no completed ranking and no safely available evaluated candidate (" +
+                                            g_sequence_legacy.run_status + ", " + g_sequence_legacy.no_call_reason + ")");
+                g_sequence_published = true;
+            }
             timings.total = seconds_since(started);
             write_status(status_path, status, fingerprint, options, library, timings, &locus_report, &panel, beam_view,
                          ranking, note, summary, &depth, &set_report, &report);
@@ -6424,10 +6438,12 @@ int execute_genotype_command(const GenotypeCommandOptions& options, const Prepar
     const GenotypeRunStatus status = run_genotype_body(options, &capture, locus);
     const bool called = status == GenotypeRunStatus::Complete || status == GenotypeRunStatus::ConditionalGenotypeEquivalent;
     const bool sequence_first = options.output_schema == "sequence_first_v1";
-    if (sequence_first) {
-        // S1-B: written once the caller's own outputs are final; a watchdog stop never reaches here (no prediction).
+    if (sequence_first && !g_sequence_published) {
+        // S1-B/C: a run that ended without the adaptive completion's stop (no prediction, or an uncovered route)
+        // publishes here; a watchdog stop never reaches here (no prediction, and its owned reports were removed).
         SequenceLegacy legacy = g_sequence_legacy;
         if (legacy.run_status == "NA") legacy.run_status = genotype_run_status_name(status);
+        legacy.dosage_mode = options.dosage_mode;
         // A legacy call without a sequence report would be a route this schema does not cover: said, never hidden.
         const std::string reason =
             called && !g_sequence_report.built
@@ -6435,12 +6451,11 @@ int execute_genotype_command(const GenotypeCommandOptions& options, const Prepar
                       legacy.run_status + ")"
                 : "no completed ranking and no safely available evaluated candidate (" + legacy.run_status +
                       (legacy.no_call_reason != "NA" ? ", " + legacy.no_call_reason : "") + ")";
-        try {
-            write_sequence_report(g_sequence_report, legacy, options.out_prefix, reason);
-        } catch (const std::exception& error) {
-            std::cerr << "[genotype] sequence report output failed: " << error.what() << '\n';
-            return 2;
-        }
+        publish_sequence_report(g_sequence_report, legacy, options.out_prefix, reason);
+        g_sequence_published = true;
+    }
+    if (sequence_first && g_sequence_report.publication_failed) {
+        std::cerr << "[genotype] sequence report output failed: " << g_sequence_report.publication_error << '\n';
     }
     dosage::DosageShadowSummary summary;
     std::string audit_status = "NOT_RUN", audit_note = "none";

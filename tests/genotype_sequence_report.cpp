@@ -15,6 +15,8 @@
 #include <cmath>
 #include <cstdlib>
 #include <filesystem>
+#include <functional>
+#include <set>
 #include <fstream>
 #include <iostream>
 #include <map>
@@ -216,6 +218,184 @@ void test_outputs(const std::string& dir) {
     std::cout << "  outputs: PREDICTION (0), PROVISIONAL (3, no decision set, no bounds), NO_PREDICTION (1, no FASTA)\n";
 }
 
+// ---- S1-C: labels, bases, hashes and lengths travel together -----------------------------------------------------------
+// Sol's reproduction (one block, alleles A / C, one candidate (A, C)) and every two-allele case whose internal-digest
+// order disagrees with its SHA-256 order: spelling the reported labels must give the FASTA bases, the bases must hash and
+// measure as reported, and swapping the input homologues must not change anything.
+void check_aligned(const SequenceReport& r, const std::function<std::string(const std::vector<std::size_t>&)>& spell,
+                   const std::string& what) {
+    require(spell(r.representative_first) == r.hap1_bases && spell(r.representative_second) == r.hap2_bases,
+            what + ": the reported labels spell the reported sequences (hap1 and hap2)");
+    require(sha256_bytes(r.hap1_bases) == r.hap1_sha256 && sha256_bytes(r.hap2_bases) == r.hap2_sha256,
+            what + ": each sequence hashes as reported");
+    require(r.hap1_sha256 <= r.hap2_sha256, what + ": hap1 is the SHA-256-smaller sequence");
+}
+
+void test_orientation() {
+    {   // the reproduction, exactly
+        PoolCandidate c;
+        c.first = {0};
+        c.second = {1};
+        c.first_sequence = sequence_digest("A");
+        c.second_sequence = sequence_digest("C");
+        c.score.log_likelihood = -1;
+        c.score.fragment_term = -1;
+        c.score.absolute_term_sum = 1;
+        c.score.fragments_with_mass = 10;
+        const auto spell = [](const std::vector<std::size_t>& x) { return x[0] == 0 ? std::string("A") : std::string("C"); };
+        const SequenceReport r = build_sequence_report(decide_pooled_genotype({c}, 1, 10, 6), {"sv:1"}, spell);
+        check_aligned(r, spell, "reproduction");
+    }
+    // two-allele loci over short strings; keep the cases where digest order and SHA-256 order disagree
+    const std::vector<std::string> words = {"A", "C", "G", "T", "AC", "CA", "GT", "TTA", "ACGT", "CCGA", "GATTACA", "TGCA"};
+    std::size_t disagreeing = 0, checked = 0;
+    for (std::size_t i = 0; i < words.size(); ++i) {
+        for (std::size_t j = 0; j < words.size(); ++j) {
+            if (i == j) continue;
+            const std::string& x = words[i];
+            const std::string& y = words[j];
+            const bool digest_first = sequence_digest(x) < sequence_digest(y);
+            const bool sha_first = sha256_bytes(x) < sha256_bytes(y);
+            if (digest_first == sha_first) continue;
+            ++disagreeing;
+            const Toy toy{{{"G"}, {x, y}, {"T"}}, {"ctx:0", "sv:1", "ctx:2"}};
+            const auto spell = [&](const std::vector<std::size_t>& l) { return toy.spell(l); };
+            std::vector<std::string> fingerprints;
+            for (const bool swap : {false, true}) {
+                std::vector<std::size_t> a{0, 0, 0}, b{0, 1, 0};
+                if (swap) std::swap(a, b);
+                const SequenceReport r =
+                    build_sequence_report(decide_pooled_genotype({candidate(toy, a, b, -3.0)}, 3, 10, 6), toy.ids, spell);
+                check_aligned(r, spell, "digest/SHA disagreement " + x + "/" + y);
+                fingerprints.push_back(r.hap1_sha256 + r.hap2_sha256 + std::to_string(r.hap1_bases.size()) + "/" +
+                                       std::to_string(r.hap2_bases.size()));
+                ++checked;
+            }
+            require(fingerprints[0] == fingerprints[1], "an input homologue swap preserves the canonical result");
+        }
+    }
+    require(disagreeing > 0, "fixture: some cases disagree between digest order and SHA-256 order");
+    std::cout << "  orientation: the reproduction plus " << disagreeing << " digest/SHA-256-disagreeing pairs (" << checked
+              << " reports, both homologue orders): labels spell the FASTA sequences, hashes match, swaps invariant\n";
+}
+
+// ---- S1-C: the linear enclosing interval, exhaustively on tiny groups ---------------------------------------------------
+// ctx C | sv {"", A} | ctx AA | sv {"", A} | ctx AA | sv {"", A} | ctx G: one extra A has three labellings, two extra
+// A have three. Every non-empty subset of a group's labellings (identical-sequence and distinct-sequence groups), in
+// two input orders: the reported interval must equal [first, last] of the brute-force union of pairwise differences,
+// contain every block where two labellings differ, and hold exactly the observed restricted tuples.
+void test_linear_interval() {
+    const Toy toy{{{"C"}, {"", "A"}, {"AA"}, {"", "A"}, {"AA"}, {"", "A"}, {"G"}},
+                  {"ctx:0", "sv:1", "ctx:2", "sv:3", "ctx:4", "sv:5", "ctx:6"}};
+    const auto lab = [](int a, int b, int c) {
+        return std::vector<std::size_t>{0, std::size_t(a), 0, std::size_t(b), 0, std::size_t(c), 0};
+    };
+    const std::vector<std::vector<std::size_t>> one = {lab(1, 0, 0), lab(0, 1, 0), lab(0, 0, 1)};
+    const std::vector<std::vector<std::size_t>> two = {lab(1, 1, 0), lab(1, 0, 1), lab(0, 1, 1)};
+    std::vector<std::vector<std::pair<std::vector<std::size_t>, std::vector<std::size_t>>>> groups(2);
+    for (std::size_t i = 0; i < one.size(); ++i) {
+        for (std::size_t j = i; j < one.size(); ++j) groups[0].push_back({one[i], one[j]});   // (S1, S1)
+    }
+    for (const auto& a : one) {
+        for (const auto& b : two) groups[1].push_back({a, b});   // (S1, S2)
+    }
+    std::size_t cases = 0;
+    for (const auto& members : groups) {
+        const std::size_t n = members.size();
+        for (std::size_t mask = 1; mask < (std::size_t{1} << n); ++mask) {
+            std::vector<PoolCandidate> pool;
+            for (std::size_t k = 0; k < n; ++k) {
+                if (mask >> k & 1) pool.push_back(candidate(toy, members[k].first, members[k].second, -4.0));
+            }
+            std::string reference;
+            for (int order = 0; order < 2; ++order) {
+                if (order == 1) std::reverse(pool.begin(), pool.end());
+                const PooledDecision d = decide_pooled_genotype(pool, 7, 10, 6);
+                const SequenceReport r = build_sequence_report(d, toy.ids, [&](const auto& l) { return toy.spell(l); });
+                // brute force over the decision's own members (oriented as the report orients them: by SHA-256)
+                std::vector<std::pair<std::vector<std::size_t>, std::vector<std::size_t>>> m;
+                for (const std::size_t c : d.groups[r.representative_group]) {
+                    auto a = d.candidates[c].first, b = d.candidates[c].second;
+                    const bool identical = d.candidates[c].first_sequence == d.candidates[c].second_sequence;
+                    if (identical ? b < a : sha256_bytes(toy.spell(b)) < sha256_bytes(toy.spell(a))) std::swap(a, b);
+                    m.push_back({a, b});
+                }
+                std::size_t lo = 7, hi = 0;
+                for (std::size_t x = 0; x < m.size(); ++x) {
+                    for (std::size_t y = x + 1; y < m.size(); ++y) {
+                        for (std::size_t b = 0; b < 7; ++b) {
+                            if (m[x].first[b] != m[y].first[b] || m[x].second[b] != m[y].second[b]) {
+                                lo = std::min(lo, b);
+                                hi = std::max(hi, b);
+                            }
+                        }
+                    }
+                }
+                std::string got;
+                if (lo == 7) {
+                    require(r.intervals.empty(), "a group whose labellings never differ has no interval");
+                } else {
+                    require(r.intervals.size() == 1 && r.intervals[0].first_block == lo && r.intervals[0].last_block == hi,
+                            "the linear interval equals the brute-force enclosing range");
+                    std::set<std::pair<std::vector<std::size_t>, std::vector<std::size_t>>> want;
+                    for (const auto& t : m) {
+                        std::vector<std::size_t> a(t.first.begin() + lo, t.first.begin() + hi + 1);
+                        std::vector<std::size_t> b(t.second.begin() + lo, t.second.begin() + hi + 1);
+                        if (members.front().first.size() && toy.spell(t.first) == toy.spell(t.second) && b < a) std::swap(a, b);
+                        want.insert({a, b});
+                    }
+                    require(std::set<std::pair<std::vector<std::size_t>, std::vector<std::size_t>>>(
+                                r.intervals[0].tuples.begin(), r.intervals[0].tuples.end()) == want &&
+                                r.intervals[0].tuples.size() == want.size(),
+                            "the interval holds exactly the observed tuples (no invention, no loss)");
+                    for (std::size_t b = lo; b <= hi; ++b) {
+                        require(r.blocks[b].interval != "none", "every block of the range is marked in the interval");
+                    }
+                    got = std::to_string(lo) + ".." + std::to_string(hi) + ":" + std::to_string(r.intervals[0].tuples.size());
+                }
+                if (order == 0) reference = got;
+                require(got == reference, "the interval never depends on input order");
+                ++cases;
+            }
+        }
+    }
+    std::cout << "  linear enclosing interval: " << cases << " exhaustive subset/order cases equal the brute-force "
+              << "pairwise range, contain every differing block and hold exactly the observed tuples\n";
+}
+
+// ---- S1-C: a publication failure leaves no partial report ----------------------------------------------------------------
+void test_publication_failure(const std::string& dir) {
+    const Toy toy = coupled_toy();
+    const std::vector<std::size_t> x{0, 1, 0, 0, 0}, y{0, 0, 0, 1, 0};
+    const PooledDecision d = decide_pooled_genotype({candidate(toy, x, x, -10.0), candidate(toy, x, y, -10.0)}, 5, 10, 6);
+    SequenceReport r = build_sequence_report(d, toy.ids, [&](const auto& l) { return toy.spell(l); });
+    const std::string p = dir + "/fail";
+    // a non-empty directory where the alternatives table must be staged: that write fails
+    std::filesystem::create_directories(p + ".sequence_alternatives.tsv.writing/blocker");
+    const bool ok = publish_sequence_report(r, {"RESCORE_INCOMPLETE", "no_call", "distinct_tie", "off"}, p, "unused");
+    require(!ok && r.publication_failed && sequence_report_exit_code(r) == 2, "failure: reported, exit 2");
+    for (const char* f : {".sequence_blocks.tsv", ".representation_intervals.tsv", ".sequence_alternatives.tsv",
+                          ".sequence_haplotypes.fa"}) {
+        require(!std::filesystem::exists(p + f), std::string("failure: no partial ") + f + " is left");
+    }
+    if (std::filesystem::exists(p + ".sequence_locus.tsv")) {
+        const auto locus = kv(p + ".sequence_locus.tsv");
+        require(locus.at("prediction") == "NO_PREDICTION" && locus.at("completion") == "report_publication_failed" &&
+                    locus.at("exit_code") == "2",
+                "failure: a locus record, if any, names the failure and claims no prediction");
+    }
+    require(sequence_report_status_keys(r).find("sequence_publication\tFAILED") != std::string::npos,
+            "failure: the status rows say so");
+    std::filesystem::remove_all(p + ".sequence_alternatives.tsv.writing");   // the test's own blocker only
+    SequenceReport again = build_sequence_report(d, toy.ids, [&](const auto& l) { return toy.spell(l); });
+    require(publish_sequence_report(again, {"RESCORE_INCOMPLETE", "no_call", "distinct_tie", "off"}, p, "unused") &&
+                kv(p + ".sequence_locus.tsv").at("prediction") == "PREDICTION" &&
+                std::filesystem::exists(p + ".sequence_haplotypes.fa"),
+            "after the blocker is gone the same prefix publishes completely");
+    std::cout << "  publication failure: no partial report, a NO_PREDICTION record naming the failure, exit 2; a clean "
+                 "retry publishes completely (locus record last)\n";
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -225,6 +405,9 @@ int main(int argc, char** argv) {
     test_genotype_equivalent();
     test_bounds_count_groups_once();
     test_outputs(dir);
+    test_orientation();
+    test_linear_interval();
+    test_publication_failure(dir);
     std::cout << "genotype_sequence_report: all passed\n";
     return 0;
 }

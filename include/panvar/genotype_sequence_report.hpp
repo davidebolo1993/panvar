@@ -54,6 +54,7 @@ struct RepresentationInterval {
     std::size_t first_block = 0;
     std::size_t last_block = 0;
     std::vector<std::pair<std::vector<std::size_t>, std::vector<std::size_t>>> tuples;   // sorted, distinct
+    std::string hap_a_sha256, hap_b_sha256;   // A: the group's sequence with the smaller SHA-256 (FASTA hap1 if representative)
 };
 
 // One row of the alternatives table (the decision set, then the next groups by rank up to a fixed count). Sequences
@@ -81,7 +82,8 @@ struct SequenceReport {
     std::vector<std::string> block_ids;
     std::size_t representative_group = 0;
     std::size_t representative_member = 0;      // index into PooledDecision::candidates (PREDICTION only)
-    std::vector<std::size_t> representative_first, representative_second;   // one explored labelling, oriented A/B
+    // one explored labelling: representative_first spells hap1_bases, representative_second spells hap2_bases (S1-C)
+    std::vector<std::size_t> representative_first, representative_second;
     std::string hap1_bases, hap2_bases;         // the representative sequence pair, ordered by SHA-256
     std::string hap1_sha256, hap2_sha256;
     // canonical_sha256 (several decision-set groups, all numerically tied) or highest_score (one group)
@@ -95,14 +97,17 @@ struct SequenceReport {
     std::vector<SequenceBlockRow> blocks;
     std::vector<RepresentationInterval> intervals;
     std::vector<SequenceAlternative> alternatives;
+    bool publication_failed = false;   // S1-C: writing the report failed; nothing partial is left
+    std::string publication_error;
 };
 
 // Spells one haplotype from its allele labels (the caller's own spelling function).
 using HaplotypeSpeller = std::function<std::string(const std::vector<std::size_t>&)>;
 
-// After a completed, valid ranking. Deterministic and order-independent: the representative is the highest-scoring
-// decision-set group; since every decision-set group is numerically tied with the best (the caller's certified bounds),
-// the tie is broken by the sorted pair of SHA-256 digests of the spelled sequences. Scores are written with 12
+// After a completed, valid ranking. Deterministic and order-independent: the representative is the canonical member of
+// the numerically inseparable decision set (every decision-set group is tied with the best under the caller's
+// certified bounds): the smallest sorted pair of SHA-256 digests of the spelled sequences. It is a representative, not
+// necessarily the strictly highest floating-point score. Scores are written with 12
 // significant digits (as mosaic_scores.tsv): a prior's last bits depend on the panel's sample order.
 SequenceReport build_sequence_report(const PooledDecision& decided, const std::vector<std::string>& block_ids,
                                      const HaplotypeSpeller& spell, std::size_t alternative_rows = 5);
@@ -120,12 +125,20 @@ SequenceReport provisional_sequence_report(const std::vector<std::size_t>& first
 //   <prefix>.representation_intervals.tsv, <prefix>.sequence_alternatives.tsv (PREDICTION only; header-only otherwise)
 struct SequenceLegacy {
     std::string run_status = "NA", call_class = "NA", no_call_reason = "NA";
+    std::string dosage_mode = "NA";   // the run's --dosage-mode (the report is the caller decision BEFORE that stage)
 };
 void write_sequence_report(const SequenceReport& report, const SequenceLegacy& legacy, const std::string& prefix,
                            const std::string& no_prediction_reason);
+// Publishes the report (S1-C): content files first, the locus commit record last. On any failure every owned file of
+// this prefix is removed, a NO_PREDICTION record naming the failure is attempted, `report` is replaced by a failed
+// report (exit 2) and false is returned.
+bool publish_sequence_report(SequenceReport& report, const SequenceLegacy& legacy, const std::string& prefix,
+                             const std::string& no_prediction_reason);
+// The exact suffixes a run owns under its prefix for this report (files and their atomic_write staging names).
+const std::vector<std::string>& sequence_report_outputs();
 // The status keys the caller adds under sequence_first_v1.
 std::string sequence_report_status_keys(const SequenceReport& report);
-// Exit semantics under sequence_first_v1: 0 PREDICTION, 3 PROVISIONAL, 1 NO_PREDICTION.
+// Exit semantics under sequence_first_v1: 0 PREDICTION, 3 PROVISIONAL, 1 NO_PREDICTION, 2 publication failed.
 int sequence_report_exit_code(const SequenceReport& report);
 
 }  // namespace panvar

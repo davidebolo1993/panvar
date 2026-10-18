@@ -4078,6 +4078,132 @@ void test_sequence_first_schema() {
                  "prepared-locus route identical\n";
 }
 
+// ---- S1-C: the sequence-first reports are run-owned (same-prefix lifecycle) ------------------------------------------
+// Each sequence first publishes a PREDICTION at one prefix, then runs the next case at the SAME prefix. Required: no
+// earlier report survives beside a later outcome (legacy, provisional, watchdog stop, normal no-prediction); a prepared-
+// locus compatibility refusal, raised before the run owns its prefix, leaves every existing output byte-identical; a
+// report that cannot be fully written leaves no record claiming a prediction (exit 2, status says FAILED).
+void test_sequence_first_lifecycle() {
+    namespace fs = std::filesystem;
+    const std::string rel = "sf_life", prefix = rel + "/call";
+    const std::vector<std::string> owned = {".sequence_locus.tsv", ".sequence_blocks.tsv", ".sequence_haplotypes.fa",
+                                            ".representation_intervals.tsv", ".sequence_alternatives.tsv"};
+    const auto options = [&](bool v1) {
+        panvar::GenotypeCommandOptions o =
+            repair_options(prefix, path("phaseable_r1.fq"), path("phaseable_r2.fq"), "tiny_phaseable.gfa");
+        if (v1) {
+            o.output_schema = "sequence_first_v1";
+            o.setting_sources["output_schema"] = "test";
+        }
+        return o;
+    };
+    const auto predict = [&]() {
+        fs::remove_all(path(rel));
+        fs::create_directories(path(rel));
+        require(panvar::execute_genotype_command(options(true), nullptr) == 0, "lifecycle: the first run predicts");
+        require(sf::kv(path(prefix + ".sequence_locus.tsv")).at("prediction") == "PREDICTION" &&
+                    exists(path(prefix + ".sequence_haplotypes.fa")),
+                "lifecycle: a published PREDICTION with its FASTA");
+    };
+    // prediction -> legacy
+    predict();
+    require(panvar::execute_genotype_command(options(false), nullptr) == 0, "lifecycle: the legacy run calls");
+    for (const std::string& f : owned) {
+        require(!exists(path(prefix + f)), "prediction -> legacy: no sequence report survives (" + f + ")");
+    }
+    // prediction -> provisional
+    predict();
+    {
+        panvar::GenotypeCommandOptions o = options(true);
+        o.max_mosaic_candidates = 0;
+        o.repair_rounds = 1;
+        require(panvar::execute_genotype_command(o, nullptr) == 3, "prediction -> provisional: exit 3");
+        const auto locus = sf::kv(path(prefix + ".sequence_locus.tsv"));
+        require(locus.at("prediction") == "PROVISIONAL" &&
+                    slurp(path(prefix + ".sequence_haplotypes.fa")).find("prediction=PROVISIONAL") != std::string::npos &&
+                    slurp(path(prefix + ".sequence_blocks.tsv")).find("IDENTIFIED") == std::string::npos &&
+                    read_rows(path(prefix + ".representation_intervals.tsv")).empty(),
+                "prediction -> provisional: only the provisional report, nothing from the earlier prediction");
+    }
+    // prediction -> normal no-prediction outcome (a declared neighbourhood bound refuses before any search)
+    predict();
+    {
+        panvar::GenotypeCommandOptions o = options(true);
+        o.repair_max_neighbours = 1;
+        require(panvar::execute_genotype_command(o, nullptr) == 1, "prediction -> no prediction: exit 1");
+        require(sf::kv(path(prefix + ".sequence_locus.tsv")).at("prediction") == "NO_PREDICTION" &&
+                    !exists(path(prefix + ".sequence_haplotypes.fa")) &&
+                    read_rows(path(prefix + ".sequence_blocks.tsv")).empty(),
+                "prediction -> no prediction: a NO_PREDICTION record, no FASTA, no earlier block rows");
+    }
+    // prediction -> watchdog stop
+    predict();
+    {
+        panvar::GenotypeCommandOptions o = options(true);
+        o.max_mosaic_candidates = 0;
+        o.test_interrupt_after_repair_rounds = 1;
+        std::cout.flush();
+        const pid_t child = fork();
+        require(child >= 0, "fork failed");
+        if (child == 0) {
+            try {
+                std::_Exit(panvar::execute_genotype_command(o, nullptr));
+            } catch (...) {
+                std::_Exit(3);
+            }
+        }
+        int wait_status = 0;
+        waitpid(child, &wait_status, 0);
+        require(WIFEXITED(wait_status) && WEXITSTATUS(wait_status) == 124, "prediction -> watchdog: exit 124");
+        require(read_status(path(prefix + ".mosaic_status.tsv")).at("status") == "TIME_LIMIT",
+                "prediction -> watchdog: TIME_LIMIT status");
+        for (const std::string& f : owned) {
+            require(!exists(path(prefix + f)), "prediction -> watchdog: no earlier report beside TIME_LIMIT (" + f + ")");
+        }
+    }
+    // prediction -> prepared-locus compatibility refusal: nothing at the prefix changes
+    predict();
+    {
+        std::map<std::string, std::string> before;
+        for (const auto& e : fs::directory_iterator(path(rel))) before[e.path().filename().string()] = slurp(e.path().string());
+        panvar::GenotypeCommandOptions other = options(true);
+        other.gfa_path = path("tiny.gfa");   // same reference path, other graph content
+        const std::shared_ptr<const panvar::PreparedLocus> locus = panvar::prepare_genotype_locus(other);
+        bool refused = false;
+        try {
+            (void)panvar::execute_genotype_command(options(true), locus.get());
+        } catch (const panvar::PreparedLocusMismatch&) {
+            refused = true;
+        }
+        require(refused, "prepared refusal: the mismatched prepared locus is refused");
+        std::map<std::string, std::string> after;
+        for (const auto& e : fs::directory_iterator(path(rel))) after[e.path().filename().string()] = slurp(e.path().string());
+        require(after == before, "prepared refusal: every existing output, the sequence reports included, is unchanged");
+    }
+    // a report that cannot be fully written
+    predict();
+    {
+        fs::create_directories(path(prefix + ".sequence_alternatives.tsv.writing/blocker"));
+        const int code = panvar::execute_genotype_command(options(true), nullptr);
+        require(code == 2, "publication failure: exit 2 (got " + std::to_string(code) + ")");
+        const auto status = read_status(path(prefix + ".mosaic_status.tsv"));
+        require(status.at("sequence_prediction") == "NO_PREDICTION" && status.at("sequence_publication") == "FAILED" &&
+                    status.at("sequence_exit_code") == "2",
+                "publication failure: the status claims no prediction and names the failure");
+        for (const char* f : {".sequence_blocks.tsv", ".sequence_haplotypes.fa", ".representation_intervals.tsv",
+                              ".sequence_alternatives.tsv"}) {
+            require(!exists(path(prefix + f)), std::string("publication failure: no partial ") + f);
+        }
+        if (exists(path(prefix + ".sequence_locus.tsv"))) {
+            require(sf::kv(path(prefix + ".sequence_locus.tsv")).at("prediction") == "NO_PREDICTION",
+                    "publication failure: no locus record claims a prediction");
+        }
+        fs::remove_all(path(prefix + ".sequence_alternatives.tsv.writing"));   // the test's own blocker
+    }
+    std::cout << "  sequence-first lifecycle: prediction -> legacy / provisional / no prediction / watchdog leave no "
+                 "earlier report; a prepared refusal changes nothing; a failed publication leaves no prediction claim\n";
+}
+
 int main(int argc, char** argv) {
     if (argc < 2) {
         std::cerr << "usage: genotype_command_e2e_test <scratch dir> [source dir]\n";
@@ -4137,6 +4263,7 @@ int main(int argc, char** argv) {
         test_prepared_locus_cleanup();
         test_prepared_locus_index();
         test_sequence_first_schema();
+        test_sequence_first_lifecycle();
         if (argc >= 3) test_profile(argv[2]);
         test_block_quality_columns();
         std::cout << "genotype command end-to-end: PASS\n";
