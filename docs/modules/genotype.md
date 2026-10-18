@@ -162,13 +162,21 @@ What a run writes depends on its outcome:
   - No prediction means no FASTA (`NO_PREDICTION`).
 
   An intentional absence is recorded as such, never as a failed publication.
+- **The rule covers the whole prefix.** `.sequence_haplotypes.fa` is the only prediction FASTA. The legacy `.mosaic_haplotypes.fa` is removed once the dosage stage and the locus table have read it, and so is every empty dosage FASTA. A non-empty dosage FASTA holds audit diagnostics (repair-candidate representatives), so it stays. In `.locus_genotype.tsv`:
+  - `main_fasta` links `.sequence_haplotypes.fa` when that file exists, and is `NA` otherwise;
+  - `original_fasta` and the haplotype record ids are `NA`;
+  - `dosage_representative_fasta` links only a dosage FASTA that stays.
+
+  Every other legacy table and audit diagnostic is unchanged.
 
 **Dosage is diagnostic under v2:**
 - **default:** `--dosage-mode` defaults to `audit`;
-- **`off`:** allowed, and recorded as not evaluated;
-- **`repair`:** refused. Reproduce historical repair results with the legacy contract.
+- **`off`:** allowed (also as `--dosage-audit off`), and recorded as not evaluated;
+- **`repair`:** refused before the output prefix is touched. Reproduce historical repair results with the legacy contract.
 
-The audit never changes the prediction or its sequences.
+The command line, `execute_genotype_command` and the prepared-locus command route all resolve this through one function, `resolve_dosage_contract`. An API caller declares a mode with `dosage_mode_explicit` or a non-default `dosage_mode`. `dosage_mode_source` records the setting actually used. `run_genotype` and `run_genotype_prepared` call the caller alone, with no dosage stage, and record `dosage_mode not_run`.
+
+The audit never changes the prediction or its sequences. It is not run when the legacy classification is a no-call: `dosage_status.tsv` then says NOT_RUN.
 
 **Extraction:** `tests/analysis/s1d/extract_panel_haplotype.py --check <graph.gfa> <prefix>.sequence_haplotypes.tsv` extracts every listed panel path and checks its hash and length.
 
