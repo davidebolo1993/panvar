@@ -8,8 +8,9 @@
 //   s2c_progressive_harness blocked     <inputs.bin> <reads_1.fq> <reads_2.fq> <out prefix> [block=4096 [footprint_limit_bytes]]
 //     S2-E: the fragment-blocked union pass; the footprint guard (4 GiB default) also covers bulk (argument 6 there)
 //   s2c_progressive_harness blocked_fine <inputs.bin> <reads_1.fq> <reads_2.fq> <out prefix> [block [footprint_limit_bytes
-//     [origin_cap]]]   S2-F: blocked with the I4-E fine-core aggregates per block (blocked takes the same origin_cap:
-//     a declared physical-origin limit replacing the inputs' cap; 0 or absent keeps the inputs' cap)
+//     [origin_cap [state_class_cap]]]]   S2-F: blocked with the I4-E fine-core aggregates per block (blocked takes the
+//     same origin_cap: a declared physical-origin limit replacing the inputs' cap; S2-G: state_class_cap likewise replaces
+//     the executed state-class cap; 0 or absent keeps the inputs' cap)
 //   s2c_progressive_harness compare     <inputs.bin> <bulk prefix> <progressive prefix> <out.tsv>
 // The schedule (declared here, before any timing): stage 1 the S2-A early pair; stage 2 the next `prefix_size` pairs by
 // the truth-free proposal score (descending; ties to pool order); stage 3 the rest of the pool in pool order. No pair is
@@ -242,6 +243,8 @@ int main(int argc, char** argv) {
                 row.put("fine_origin_aggregates", fine_blocks ? 1 : 0);
                 const std::uint64_t origin_cap = argc > 8 ? std::stoull(argv[8]) : 0;
                 if (origin_cap != 0) x.options.max_physical_origins = origin_cap;   // S2-F: a declared extended limit
+                const std::uint64_t class_cap = argc > 9 ? std::stoull(argv[9]) : 0;
+                if (class_cap != 0) x.options.max_state_classes = class_cap;   // S2-G: a declared extended limit
                 row.put("cap_physical_origins", x.options.max_physical_origins);
                 row.put("cap_piece_hits", x.options.max_piece_hits);
                 row.put("cap_state_classes", x.options.max_state_classes);
@@ -312,8 +315,8 @@ int main(int argc, char** argv) {
                     if (r.has_refused_block) {
                         const std::string k = "refused_block" + std::to_string(r.blocks.size() + 1) + "_";
                         o << k << "fragments\t" << r.refused_block.fragments << '\n' << k << "seconds\t" << r.refused_block.seconds << '\n'
-                          << k << "direct_physical_origins\t" << r.refused_block.direct_physical_origins << '\n'
-                          << k << "served_physical_origins\t" << r.refused_block.served_physical_origins << '\n'
+                          << k << "direct_physical_origins\tunavailable\n"   // S2-G: computed after the acceptance check
+                          << k << "served_physical_origins\tunavailable\n"
                           << k << "origins_constructed\t" << r.refused_block.origins_constructed << '\n'
                           << k << "origin_entities_admitted\t" << r.refused_block.origin_entities_admitted << '\n'
                           << k << "origin_held_bytes\t" << r.refused_block.origin_held_bytes << '\n'
