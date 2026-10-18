@@ -7,6 +7,9 @@
 //     a footprint guard (4 GiB by default, the local envelope) records the completed stages and exits 125 when crossed
 //   s2c_progressive_harness blocked     <inputs.bin> <reads_1.fq> <reads_2.fq> <out prefix> [block=4096 [footprint_limit_bytes]]
 //     S2-E: the fragment-blocked union pass; the footprint guard (4 GiB default) also covers bulk (argument 6 there)
+//   s2c_progressive_harness blocked_fine <inputs.bin> <reads_1.fq> <reads_2.fq> <out prefix> [block [footprint_limit_bytes
+//     [origin_cap]]]   S2-F: blocked with the I4-E fine-core aggregates per block (blocked takes the same origin_cap:
+//     a declared physical-origin limit replacing the inputs' cap; 0 or absent keeps the inputs' cap)
 //   s2c_progressive_harness compare     <inputs.bin> <bulk prefix> <progressive prefix> <out.tsv>
 // The schedule (declared here, before any timing): stage 1 the S2-A early pair; stage 2 the next `prefix_size` pairs by
 // the truth-free proposal score (descending; ties to pool order); stage 3 the rest of the pool in pool order. No pair is
@@ -176,7 +179,9 @@ struct Row {
 int main(int argc, char** argv) {
     try {
         const std::string mode = argc > 1 ? argv[1] : "";
-        if ((mode == "bulk" || mode == "progressive" || mode == "blocked") && argc >= 6) {
+        const bool fine_blocks = mode == "blocked_fine";   // S2-F
+        const std::string base_mode = fine_blocks ? "blocked" : mode;
+        if ((mode == "bulk" || mode == "progressive" || mode == "blocked" || fine_blocks) && argc >= 6) {
             const auto t0 = Clock::now();
             Inputs x = read_inputs(argv[2]);
             const auto fragments = load_pairs(argv[3], argv[4]);
@@ -198,7 +203,7 @@ int main(int argc, char** argv) {
             static bool sample_done = false;
             std::thread guard_thread;
             const auto t_guard = Clock::now();
-            if (mode == "bulk" || mode == "blocked") {
+            if (mode == "bulk" || base_mode == "blocked") {
                 const std::uint64_t limit = mode == "bulk" ? (argc > 6 ? std::stoull(argv[6]) : (std::uint64_t{4} << 30))
                                                            : (argc > 7 ? std::stoull(argv[7]) : (std::uint64_t{4} << 30));
                 row.put("footprint_limit_bytes", limit);
@@ -231,9 +236,49 @@ int main(int argc, char** argv) {
                 }
                 if (guard_thread.joinable()) guard_thread.join();
             };
-            if (mode == "blocked") {
+            if (base_mode == "blocked") {
                 const std::size_t block = argc > 6 ? std::stoul(argv[6]) : 4096;
                 row.put("block_fragments", block);
+                row.put("fine_origin_aggregates", fine_blocks ? 1 : 0);
+                const std::uint64_t origin_cap = argc > 8 ? std::stoull(argv[8]) : 0;
+                if (origin_cap != 0) x.options.max_physical_origins = origin_cap;   // S2-F: a declared extended limit
+                row.put("cap_physical_origins", x.options.max_physical_origins);
+                row.put("cap_piece_hits", x.options.max_piece_hits);
+                row.put("cap_state_classes", x.options.max_state_classes);
+                row.put("cap_latent_alignment_pairs", x.options.max_latent_alignment_pairs);
+                row.put("cap_cached_placements_consumed", x.options.max_union_cached_placements_consumed);
+                row.put("cap_cached_origins_consumed", x.options.max_union_cached_origins_consumed);
+                row.put("cap_cached_states_consumed", x.options.max_union_cached_states_consumed);
+                row.put("cap_cached_prefilters_consumed", x.options.max_union_cached_prefilters_consumed);
+                row.put("union_origin_cache_bytes", x.options.union_origin_cache_bytes);
+                const auto block_rows = [](const panvar::BlockedBlockReport& rep, const std::string& k, std::ostringstream& o) {
+                    o << k << "stage\t" << rep.stage << '\n' << k << "first_fragment\t" << rep.first_fragment << '\n'
+                      << k << "observed_physical_origins\t" << rep.observed_physical_origins << '\n'
+                      << k << "observed_piece_hits\t" << rep.observed_piece_hits << '\n'
+                      << k << "placements_consumed\t" << rep.placements_consumed << '\n' << k << "origins_consumed\t" << rep.origins_consumed
+                      << '\n' << k << "states_consumed\t" << rep.states_consumed << '\n' << k << "prefilters_consumed\t"
+                      << rep.prefilters_consumed << '\n' << k << "state_classes_executed\t" << rep.state_classes_executed << '\n'
+                      << k << "origin_entities_eligible\t" << rep.origin_entities_eligible << '\n'
+                      << k << "origin_whole_budget_bytes\t" << rep.origin_whole_budget_bytes << '\n'
+                      << k << "origin_fine_budget_bytes\t" << rep.origin_fine_budget_bytes << '\n'
+                      << k << "fine_windows_distinct\t" << rep.fine_windows_distinct << '\n'
+                      << k << "fine_windows_eligible\t" << rep.fine_windows_eligible << '\n'
+                      << k << "fine_windows_built\t" << rep.fine_windows_built << '\n'
+                      << k << "fine_windows_admitted\t" << rep.fine_windows_admitted << '\n'
+                      << k << "fine_windows_declined\t" << rep.fine_windows_declined << '\n'
+                      << k << "fine_windows_not_built\t" << rep.fine_windows_not_built << '\n'
+                      << k << "fine_origins_constructed\t" << rep.fine_origins_constructed << '\n'
+                      << k << "fine_origins_admitted\t" << rep.fine_origins_admitted << '\n'
+                      << k << "fine_charged_bytes\t" << rep.fine_charged_bytes << '\n'
+                      << k << "fine_zones_applied\t" << rep.fine_zones_applied << '\n'
+                      << k << "fine_served_physical_origins\t" << rep.fine_served_physical_origins << '\n'
+                      << k << "fine_transition_peak_bytes\t" << rep.fine_transition_peak_bytes << '\n'
+                      << k << "fine_enumeration_peak_bytes\t" << rep.fine_enumeration_peak_bytes << '\n'
+                      << k << "fine_construction_scratch_peak_bytes\t" << rep.fine_construction_scratch_peak_bytes << '\n'
+                      << k << "fine_index_peak_bytes\t" << rep.fine_index_peak_bytes << '\n'
+                      << k << "seconds_fine_enumeration\t" << rep.seconds_fine_enumeration << '\n'
+                      << k << "seconds_fine_construction\t" << rep.seconds_fine_construction << '\n';
+                };
                 const auto t = Clock::now();
                 std::size_t number = 0;
                 const panvar::BlockedUnionResult r = panvar::score_diplotypes_indexed_blocked(
@@ -258,9 +303,54 @@ int main(int argc, char** argv) {
                           << rep.footprint_before << '\n' << k << "footprint_after\t" << rep.footprint_after << '\n' << k
                           << "footprint_peak_so_far\t" << fp.peak << '\n' << k << "seconds\t" << rep.seconds << '\n' << k
                           << "seconds_since_start\t" << since(t) << '\n';
+                        block_rows(rep, k, o);
                         sample_rows.push_back(o.str());
-                    });
+                    }, fine_blocks);
                 stop_guard();
+                {   // S2-F: the refused block (observed before its batch was destroyed), completed and attempt totals
+                    std::ostringstream o;
+                    if (r.has_refused_block) {
+                        const std::string k = "refused_block" + std::to_string(r.blocks.size() + 1) + "_";
+                        o << k << "fragments\t" << r.refused_block.fragments << '\n' << k << "seconds\t" << r.refused_block.seconds << '\n'
+                          << k << "direct_physical_origins\t" << r.refused_block.direct_physical_origins << '\n'
+                          << k << "served_physical_origins\t" << r.refused_block.served_physical_origins << '\n'
+                          << k << "origins_constructed\t" << r.refused_block.origins_constructed << '\n'
+                          << k << "origin_entities_admitted\t" << r.refused_block.origin_entities_admitted << '\n'
+                          << k << "origin_held_bytes\t" << r.refused_block.origin_held_bytes << '\n'
+                          << k << "executed_dps\t" << r.refused_block.executed_dps << '\n';
+                        block_rows(r.refused_block, k, o);
+                    }
+                    for (const auto& [name, c] : {std::pair<const char*, const panvar::UnionCumulativeCharges*>{"completed_totals_", &r.completed_totals},
+                                                  std::pair<const char*, const panvar::UnionCumulativeCharges*>{"attempt_totals_", &r.attempt_totals}}) {
+                        o << name << "physical_origins\t" << c->physical_origins << '\n' << name << "piece_hits\t" << c->piece_hits << '\n'
+                          << name << "placements_consumed\t" << c->placements_consumed << '\n' << name << "origins_consumed\t"
+                          << c->origins_consumed << '\n' << name << "states_consumed\t" << c->states_consumed << '\n' << name
+                          << "prefilters_consumed\t" << c->prefilters_consumed << '\n' << name << "state_classes\t"
+                          << c->executed.statistical_state_classes << '\n' << name << "latent_alignment_pairs\t"
+                          << c->executed.latent_alignment_pairs << '\n';
+                    }
+                    sample_rows.push_back(o.str());
+                }
+                {   // run totals over completed blocks: served, constructed (whole + fine), fine admission
+                    std::uint64_t served = 0, constructed = 0, fine_constructed = 0, fine_admitted = 0, fine_served = 0, fine_charged_max = 0;
+                    std::uint64_t whole_held_max = 0;
+                    for (const panvar::BlockedBlockReport& b : r.blocks) {
+                        served += b.served_physical_origins;
+                        constructed += b.origins_constructed;
+                        fine_constructed += b.fine_origins_constructed;
+                        fine_admitted += b.fine_windows_admitted;
+                        fine_served += b.fine_served_physical_origins;
+                        fine_charged_max = std::max(fine_charged_max, b.fine_charged_bytes);
+                        whole_held_max = std::max(whole_held_max, b.origin_held_bytes);
+                    }
+                    row.put("served_physical_origins", served);
+                    row.put("whole_origins_constructed", constructed);
+                    row.put("fine_origins_constructed", fine_constructed);
+                    row.put("fine_windows_admitted", fine_admitted);
+                    row.put("fine_served_physical_origins", fine_served);
+                    row.put("fine_charged_bytes_max_block", fine_charged_max);
+                    row.put("whole_held_bytes_max_block", whole_held_max);
+                }
                 row.put("seconds_total", since(t));
                 row.put("completed", r.completed ? "yes" : "no");
                 row.put("refusal", r.refusal.empty() ? "none" : r.refusal);
@@ -463,7 +553,7 @@ int main(int argc, char** argv) {
             row.put("peak_rss_bytes", peak_rss_bytes());
             write_scores(out + ".scores.bin", scores, have);
             row.write(out + ".tsv");
-            if (mode == "blocked") {   // the per-block rows after the summary
+            if (base_mode == "blocked") {   // the per-block rows after the summary
                 std::ofstream f(out + ".tsv", std::ios::app);
                 for (const std::string& line : sample_rows) f << line;
             }

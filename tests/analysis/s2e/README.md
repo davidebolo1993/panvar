@@ -16,3 +16,5 @@
 - the runner: `s2e_run.py`.
 
 Results: `tests/results/s2e_fragment_blocked_20261018/README.md`.
+
+**Qualification (S2-F, appended).** The results README's "memory is bounded across blocks" means bounded, live block-owned evidence and a low observed footprint through the measured blocks — not a universal allocator-footprint guarantee. The qualification is appended there.

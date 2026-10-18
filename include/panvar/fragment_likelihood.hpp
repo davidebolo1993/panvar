@@ -1938,6 +1938,27 @@ public:
 };
 
 void set_content_index_hash_collapse(bool collapse);   // TEST ONLY: one hash for every content unit
+void set_fine_window_hash_collapse(bool collapse);     // I4-E TEST ONLY (ported in S2-F): one hash for every fine window key
+
+// ---- S2-F: the I4-D.1 fine-core window geometry, ported for the I4-E fine origin aggregates (17f0e8f) ----------------
+// The cores of one distinct segment (an interior unit of length l > 2g), in segment coordinates [0, l): each fine piece's
+// owned core, the owned rectangle of non-crossing pairs (start in [start_lo, start_hi], end <= end_hi; `owns` false when
+// none can exist) and the window [win_lo, win_hi) = [max(0, core start - 2g), min(l, core end + max_insert + 2g)). Every
+// bound is validated before any subtraction; a violation throws std::logic_error naming it.
+struct CoreWindowGeometry {
+    std::uint32_t segment = 0;            // index in the segment list (0 for the one-segment geometry)
+    std::uint32_t seg_lo = 0, seg_hi = 0; // the owning segment [seg_lo, seg_hi)
+    std::uint32_t core_lo = 0, core_hi = 0;
+    std::uint32_t start_lo = 0, start_hi = 0, end_hi = 0;
+    bool owns = false;
+    std::uint32_t win_lo = 0, win_hi = 0;
+};
+std::vector<CoreWindowGeometry> core_window_geometry_of_segment(const ContentPlacementIndex& index,
+                                                                std::uint32_t interior_unit, std::uint32_t max_insert);
+// "" when `cores` satisfies every geometry invariant for this segmentation, else the first violation.
+std::string core_window_geometry_violation(const std::vector<CoreWindowGeometry>& cores,
+                                           const std::vector<std::uint32_t>& segment_lengths, std::uint32_t max_insert,
+                                           std::uint32_t margin);
 // I2-C TEST ONLY: request spare capacity per stored vector (unused capacity the ledger must charge), and the negative
 // control that charges occupied rows only.
 void set_store_spare_capacity(std::size_t slots);
@@ -2017,6 +2038,25 @@ struct ContentBatchReport {
     std::uint64_t view_coarse_units = 0, view_rows_represented = 0, view_table_bytes = 0;
     std::uint64_t view_zone_temporary_peak_bytes = 0, view_zone_temporary_bytes_total = 0;
     double seconds_view_zone_gather = 0.0;
+    // I4-E (EXPERIMENTAL, ported in S2-F): "whole_segment" (the control) or "fine_core_partition_experimental" (tests/
+    // analysis/i4e/PROPOSAL.md): the two partitions of union_origin_cache_bytes; the fine windows (distinct keys, their
+    // positions, eligible, built, admitted, declined, built then discarded at the prefix end, never built); origins
+    // constructed (executed, discarded builds included) and admitted; charged bytes (payload + lookup: records, zone
+    // tables); fine zones applied and the origins served through them (served_physical_origins includes them). Not charged,
+    // reported: enumeration tables, construction scratch (summed worker peaks), the transition peak (charged + the
+    // in-flight batch), the per-fragment indexes (summed worker peaks). Timing: enumeration and construction (wall), index
+    // build and indexed merge (worker seconds; merge timed on fragments with zones only).
+    std::string origin_aggregate_policy = "whole_segment";
+    std::uint64_t origin_whole_budget_bytes = 0, origin_fine_budget_bytes = 0;
+    std::uint64_t fine_windows_distinct = 0, fine_window_positions = 0, fine_windows_eligible = 0, fine_windows_built = 0;
+    std::uint64_t fine_windows_admitted = 0, fine_windows_declined = 0, fine_windows_built_discarded = 0, fine_windows_not_built = 0;
+    std::uint64_t fine_hash_collisions = 0, fine_origins_constructed = 0, fine_origins_admitted = 0;
+    std::uint64_t fine_charged_bytes = 0, fine_payload_bytes = 0, fine_lookup_bytes = 0, fine_zone_positions = 0;
+    std::uint64_t fine_zones_applied = 0, fine_served_physical_origins = 0;
+    std::uint64_t fine_enumeration_peak_bytes = 0, fine_construction_scratch_peak_bytes = 0, fine_transition_peak_bytes = 0;
+    std::uint64_t fine_index_peak_bytes = 0;
+    double seconds_fine_enumeration = 0.0, seconds_fine_construction = 0.0;
+    double worker_seconds_fine_index = 0.0, worker_seconds_fine_merge = 0.0;
     // S2-D: the batch-owned emission cache carried across selective discovery calls (status, adoptions and refusals,
     // hits served by carried entries, and what it holds between calls: allocated bytes and entries)
     std::string persistent_emission_status = "off";
@@ -2061,6 +2101,9 @@ public:
     // Masses, exposures, scores and every cap's executed and served work are unchanged; the store holds the distinct
     // evidence (fine and window rows), the view table and in-flight origin-zone gathers.
     void set_fine_views(bool on);
+    // I4-E (EXPERIMENTAL, ported in S2-F; bulk batches only): fine-core origin aggregates on segments not served whole,
+    // under a fixed half/half partition of union_origin_cache_bytes. Needs fine views and origin reuse. Default off.
+    void set_fine_origin_aggregates(bool on);
     // TEST ONLY: an independent recount of the placement containers' allocated capacity (what the ledger must equal).
     std::uint64_t store_capacity_recount() const;
     // ---- S2-C (EXPERIMENTAL): the demand-driven route. A batch is bulk (discover/score) or selective, never both.
@@ -2087,6 +2130,11 @@ public:
     void build_columns();
     const std::vector<std::vector<double>>& mass_columns() const;
     UnionCumulativeCharges charges() const;
+    // S2-F: this batch's OBSERVED charges at any point, refused or not (excluding the baseline): piece hits and physical
+    // origins as the caps' own counters saw them (an aborted construction or pairing included), consumption and prefilter
+    // counters, and the merged executed counters as far as they were merged (`executed`; a refusal inside aggregate
+    // construction merges discovery's only -- physical_origins is then the authoritative executed count).
+    UnionCumulativeCharges observed_charges() const;
     void release_carried_emissions();
     std::size_t units_discovered() const;   // selective: units discovered; bulk: units evaluated
     std::size_t columns_completed() const;
@@ -2140,7 +2188,8 @@ FragmentScoringResult score_diplotypes_indexed_union(const InternedHaplotypes& h
                                                      const std::vector<std::vector<std::uint32_t>>& segments,
                                                      std::size_t store_budget_bytes, IndexedUnionReport* report = nullptr,
                                                      FragmentScoringObservation* observed_on_failure = nullptr,
-                                                     bool legacy_store_layout = false, bool fine_views = false);
+                                                     bool legacy_store_layout = false, bool fine_views = false,
+                                                     bool fine_origin_aggregates = false);
 
 // ---- S2-E (EXPERIMENTAL, measurement only): the same indexed union pass over contiguous fragment blocks ----------------
 // One index over every haplotype; per block of `block_fragments` read pairs a fresh batch (the existing discovery,
@@ -2149,6 +2198,9 @@ FragmentScoringResult score_diplotypes_indexed_union(const InternedHaplotypes& h
 // prefilter-cache read-length condition and the mass-cell cap are checked over the whole run, executed-work and
 // consumption caps are cumulative, memory budgets are per block. Scores are bulk's bit for bit (tests/analysis/s2e/
 // DECOMPOSITION.md). A refusal in any block returns no scores (`completed` false). log_mass/exposure are not exported.
+// S2-F: fine_origin_aggregates gives every block's batch the I4-E fine-core aggregates (the same total origin budget,
+// split half whole-segment, half fine-core; each block builds and owns its own aggregates; nothing is reused across
+// blocks). A refusal records the refused block's observed work before its batch is destroyed (refused_block).
 struct BlockedBlockReport {
     std::size_t first_fragment = 0, fragments = 0;
     std::uint64_t units_evaluated = 0, store_peak_bytes = 0, origin_held_bytes = 0, retained_column_bytes = 0;
@@ -2158,12 +2210,30 @@ struct BlockedBlockReport {
     std::uint64_t cumulative_physical_origins = 0, cumulative_piece_hits = 0;
     double seconds = 0.0;
     std::uint64_t footprint_before = 0, footprint_after = 0;   // set by the caller's hook, if it samples
+    // S2-F: this block's own observed charges (the caps' counters, baseline excluded; for a refused block, up to the
+    // refusal), its consumption-cap charges, and whole/fine aggregate admission and storage (block-owned, never reused)
+    std::uint64_t observed_piece_hits = 0, observed_physical_origins = 0;
+    std::uint64_t placements_consumed = 0, origins_consumed = 0, states_consumed = 0, prefilters_consumed = 0;
+    std::uint64_t state_classes_executed = 0, latent_alignment_pairs = 0;
+    std::uint64_t origin_entities_eligible = 0, origin_whole_budget_bytes = 0, origin_fine_budget_bytes = 0;
+    std::uint64_t fine_windows_distinct = 0, fine_windows_eligible = 0, fine_windows_built = 0, fine_windows_admitted = 0;
+    std::uint64_t fine_windows_declined = 0, fine_windows_not_built = 0, fine_origins_constructed = 0, fine_origins_admitted = 0;
+    std::uint64_t fine_charged_bytes = 0, fine_zones_applied = 0, fine_served_physical_origins = 0;
+    std::uint64_t fine_transition_peak_bytes = 0, fine_enumeration_peak_bytes = 0, fine_construction_scratch_peak_bytes = 0;
+    std::uint64_t fine_index_peak_bytes = 0, fine_hash_collisions = 0;
+    double seconds_fine_enumeration = 0.0, seconds_fine_construction = 0.0;
+    std::string stage;   // "completed", or where a refused block stopped: "discovery" or "columns"
 };
 struct BlockedUnionResult {
     FragmentScoringResult result;              // scores, audit scores, summed counters and phase seconds (no matrix)
     std::vector<BlockedBlockReport> blocks;    // completed blocks
     bool completed = false;
     std::string refusal;
+    // S2-F refusal reporting: the completed blocks' totals; the refused block's observed work, captured before its batch
+    // is destroyed (refused_block.stage names where); the whole attempt (completed + refused). No scores on refusal.
+    UnionCumulativeCharges completed_totals, attempt_totals;
+    bool has_refused_block = false;
+    BlockedBlockReport refused_block;
     double seconds_index_build = 0.0, seconds_combination = 0.0;
     std::uint64_t accumulator_bytes = 0, index_unit_bytes = 0;
     ContentIndexReport index;
@@ -2174,7 +2244,8 @@ BlockedUnionResult score_diplotypes_indexed_blocked(const InternedHaplotypes& ha
                                                     const FragmentScoringOptions& options,
                                                     const std::vector<std::vector<std::uint32_t>>& segments,
                                                     std::size_t store_budget_bytes, bool fine_views, std::size_t block_fragments,
-                                                    const std::function<void(BlockedBlockReport&, bool before)>& on_block = {});
+                                                    const std::function<void(BlockedBlockReport&, bool before)>& on_block = {},
+                                                    bool fine_origin_aggregates = false);
 
 // ---- S2-C (EXPERIMENTAL, measurement only): the same indexed scorer executed on demand --------------------------------
 // One index over every haplotype (identical slots and segmentation to the bulk adapter) and one selective batch; each
