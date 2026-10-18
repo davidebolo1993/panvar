@@ -7445,6 +7445,7 @@ private:
 };
 
 struct PreparedScoringContext::State {
+    std::function<void(const char*, std::size_t, std::size_t)> progress_probe;   // S2-H (diagnostic)
     std::vector<ReadPair> fragments;
     LibraryModel library;
     FragmentScoringOptions options;
@@ -8126,6 +8127,7 @@ FragmentScoringResult PreparedScoringContext::score_candidates(
     result.unique_haplotypes = unique;
     result.counters = state.cumulative;
     result.emission_cache = state.cumulative_cache;
+    if (state.progress_probe) state.progress_probe("combination_start", 0, candidates.size());   // S2-H (diagnostic)
 
     const std::vector<ReadPair>& fragments = state.fragments;
     const auto combination_mark = std::chrono::steady_clock::now();
@@ -8208,6 +8210,7 @@ FragmentScoringResult PreparedScoringContext::score_candidates(
     result.seconds_diploid_combination =
         std::chrono::duration<double>(std::chrono::steady_clock::now() - combination_mark).count();
     result.seconds_placement_and_mass = state.cumulative_placement_seconds;
+    if (state.progress_probe) state.progress_probe("combination_scores_done", candidates.size(), candidates.size());   // S2-H
 
     result.log_mass.assign(fragments.size() * unique, kNegInf);
     for (std::size_t h = 0; h < unique; ++h) {
@@ -8226,6 +8229,7 @@ FragmentScoringResult PreparedScoringContext::score_candidates(
         static_cast<std::uint64_t>(result.log_mass.capacity() + result.exposure.capacity()) *
             sizeof(double) +
         static_cast<std::uint64_t>(result.scores.capacity()) * sizeof(DiplotypeScore);
+    if (state.progress_probe) state.progress_probe("flattened_mass_matrix_built", unique, unique);   // S2-H (diagnostic)
     return result;
 }
 
@@ -8419,15 +8423,21 @@ std::vector<std::size_t> PreparedScoringContext::add_repaired_haplotypes(
     OriginCachePlanReport* plan) {
     State& state = *state_;
     state.require_usable();
+    const auto probe = [&](const char* point, std::size_t done) {   // S2-H: safe points of this thread only
+        if (state.progress_probe) state.progress_probe(point, done, requests.size());
+    };
+    probe("before_repair_window_planning", 0);
     std::vector<PlannedRepairWindow> planned;
     planned.reserve(requests.size());
     for (const RepairRequest& r : requests) {
         planned.push_back(plan_repaired_window(r.incumbent, r.block_begin, r.block_end, r.replacement));
     }
+    probe("after_repair_window_planning", 0);
     if (state.origin_path) {
         const OriginCachePlanReport report = plan_origin_cache(planned);
         if (plan != nullptr) *plan = report;
     }
+    probe("after_origin_cache_planning", 0);
     // The canonical order: held haplotypes (no window) first, then by window identity so each window's
     // requests are adjacent, then by haplotype and by the request itself. Total, so ties cannot fall
     // back on the caller's order.
@@ -8459,11 +8469,18 @@ std::vector<std::size_t> PreparedScoringContext::add_repaired_haplotypes(
         ++state.fine_report.rounds;
         fine_round.state = &state;
     }
+    std::size_t done = 0;
+    const std::size_t n = requests.size();
     for (const std::size_t i : order) {
         const RepairRequest& r = requests[i];
         slots[i] = add_repaired_haplotype(r.incumbent, r.block_begin, r.block_end, r.replacement,
                                           works != nullptr ? &(*works)[i] : nullptr);
+        ++done;
+        if (state.progress_probe && done < n && (done == 1 || done == n / 4 || done == n / 2 || done == 3 * n / 4)) {
+            probe("neighbour_materialisation", done);
+        }
     }
+    probe("after_neighbour_materialisation", done);
     return slots;
 }
 
@@ -8880,6 +8897,10 @@ std::uint64_t PreparedScoringContext::merge_working_bytes() const {
         total += sizeof(item) + static_cast<std::uint64_t>(item.second.capacity()) * sizeof(StateCount);
     }
     return total;
+}
+
+void PreparedScoringContext::set_progress_probe(std::function<void(const char*, std::size_t, std::size_t)> probe) {
+    state_->progress_probe = std::move(probe);
 }
 
 ContextMemoryAccount PreparedScoringContext::memory_account() const {

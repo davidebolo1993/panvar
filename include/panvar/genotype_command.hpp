@@ -247,6 +247,18 @@ struct GenotypeCommandOptions {
     std::string union_fragment_blocks = "off";
     // S2-G TEST HOOK (API only): the blocked route's fragment block size (0: the declared 4,096 read pairs)
     std::size_t test_union_fragment_block_pairs = 0;
+    // S2-H DIAGNOSTIC ONLY (profile key diagnostic_refinement_memory 0|1): the production refinement search writes
+    // <prefix>.refinement_memory_live.tsv (one row per safe execution point of each round, flushed per row so it survives
+    // a watchdog stop), and the run writes <prefix>.refinement_replay_inputs.tsv when the anchor is selected (input
+    // identities, the anchor's labels and exact score, the refinement setup). Changes no score, decision or output.
+    bool diagnostic_refinement_memory = false;
+    // S2-H DIAGNOSTIC ONLY (profile key diagnostic_refinement_replay <inputs file>): a fresh-process replay of the FIRST
+    // refinement round from a previous run's recorded anchor: the production preparation runs (model, markers, proposal
+    // emissions, the union candidates' spelling), every identity in the inputs file is checked, the union pass and the
+    // early pass are not run, and the production CoordinateRepairSearch runs one round from the recorded anchor with the
+    // same refinement options. Writes <prefix>.refinement_replay*.tsv and a REFINEMENT_REPLAY_DIAGNOSTIC_ONLY status;
+    // never a genotype. Needs output_schema legacy, early_incumbent off and the adaptive repair.
+    std::string diagnostic_refinement_replay;
     // I2-B (EXPERIMENTAL, profile keys only, never public settings): how the adaptive search's window enumeration builds
     // its placement rows. "reference" (the default) scans each enumerated window whole, unchanged. "fine_experimental"
     // builds the same rows from a round-local, per-worker fine store (PreparedScoringContext::
@@ -401,6 +413,9 @@ enum class GenotypeRunStatus {
     // DIAGNOSTIC ONLY (diagnostic_union_only): the union pass was scored and ranked and the run stopped there --
     // no repair, no genotype, no haplotype. Never a call.
     UnionDiagnosticOnly,
+    // DIAGNOSTIC ONLY (diagnostic_refinement_replay): the first refinement round was replayed from a recorded anchor --
+    // no union pass, no genotype, no haplotype. Never a call.
+    RefinementReplayDiagnosticOnly,
     // --library auto could not validate its estimate (too few decisive pairs, several insert modes, or a contaminated
     // pair distribution). Nothing is scored; the message names --library FILE.
     LibraryRefused,

@@ -167,6 +167,92 @@ std::optional<std::string> union_fragment_blocks_refusal(const GenotypeCommandOp
     }
     return std::nullopt;
 }
+// S2-H: the refinement diagnostics' contract (also checked before an API run touches its prefix).
+std::optional<std::string> refinement_diagnostic_refusal(const GenotypeCommandOptions& o) {
+    if (o.diagnostic_refinement_replay.empty()) return std::nullopt;
+    const std::string p = "diagnostic_refinement_replay ";
+    if (o.output_schema != "legacy") return p + "needs output_schema legacy (a diagnostic replay publishes no sequence report)";
+    if (o.early_incumbent != "off") return p + "needs early_incumbent off (no early pass runs before a replayed round)";
+    if (o.repair_rounds == 0) return p + "needs the adaptive repair (repair rounds > 0)";
+    if (o.diagnostic_union_only || o.union_progressive_schedule != "off" || o.adaptive_emission_handoff) {
+        return p + "is not supported with union diagnostics, the progressive schedule or the emission handoff";
+    }
+    if (!o.development_candidate_prefixes.empty()) return p + "is not supported with development candidate prefixes";
+    return std::nullopt;
+}
+// S2-H: the refinement's scoring options and search options, from the run's options and union scoring options -- ONE
+// construction for the production search and the diagnostic replay.
+struct RepairSetup {
+    FragmentScoringOptions scoring;
+    RepairSearchOptions search;
+};
+RepairSetup make_repair_setup(const GenotypeCommandOptions& options, const FragmentScoringOptions& scoring_options) {
+    RepairSetup r;
+    r.scoring = scoring_options;
+    r.scoring.max_physical_origins = options.repair_max_physical_origins;
+    r.scoring.max_state_classes = options.repair_max_state_classes;
+    r.scoring.max_piece_hits = options.repair_max_piece_hits;
+    r.scoring.max_latent_alignment_pairs = options.repair_max_latent_pairs;
+    RepairSearchOptions& s = r.search;
+    s.local_pairs = options.repair_local_pairs;
+    s.max_rounds = options.repair_rounds;
+    s.mode = RepairScoringMode::Delta;
+    s.origin_cache = true;
+    s.planned_cache = true;
+    s.origin_cache_bytes = options.repair_origin_cache_bytes;
+    if (options.adaptive_window_discovery == "fine_experimental") {
+        s.fine_window_bytes = options.adaptive_fine_store_bytes;
+        s.fine_window_served_cap = options.adaptive_fine_max_served_placements;
+    }
+    s.fused_seed = options.adaptive_fused_seed;
+    s.switch_probability = options.switch_probability;
+    s.declared_neighbour_cap = options.repair_max_neighbours;
+    s.memory_log = true;
+    if (options.diagnostic_refinement_memory) s.memory_live_path = options.out_prefix + ".refinement_memory_live.tsv";
+    return r;
+}
+std::string hex_double(double value) {
+    char buffer[64];
+    std::snprintf(buffer, sizeof(buffer), "%a", value);
+    return buffer;
+}
+// S2-H: the refinement setup as text (what a replay must match exactly; max_rounds as configured)
+std::string repair_setup_text(const RepairSetup& r, std::size_t fragments) {
+    const FragmentScoringOptions& o = r.scoring;
+    const RepairSearchOptions& s = r.search;
+    std::ostringstream t;
+    t << "fragments=" << fragments << ";threads=" << o.threads << ";band=" << o.mismatch_band << ";piece=" << o.minimum_piece_bp
+      << ";max_piece_hits=" << o.max_piece_hits << ";max_starts=" << o.max_proposed_starts_per_haplotype
+      << ";max_origins=" << o.max_physical_origins << ";max_classes=" << o.max_state_classes << ";max_cells=" << o.max_mass_cells
+      << ";max_latent=" << o.max_latent_alignment_pairs << ";emission_cache=" << o.emission_cache_bytes
+      << ";prepared_terms=" << o.prepared_library_terms << ";gap_backend=" << static_cast<int>(o.gap_recursion_backend)
+      << ";audits=" << o.audit_libraries.size() << ";union_placement_cache=" << o.union_placement_cache_bytes
+      << ";union_origin_cache=" << o.union_origin_cache_bytes << ";union_prefilter=" << o.union_prefilter_cache_bytes
+      << ";start_sort=" << o.start_sort_scratch_bytes << ";local_pairs=" << s.local_pairs << ";max_rounds=" << s.max_rounds
+      << ";origin_cache_bytes=" << s.origin_cache_bytes << ";fine_window=" << s.fine_window_bytes << ";fine_served="
+      << s.fine_window_served_cap << ";fused_seed=" << s.fused_seed << ";switch=" << hex_double(s.switch_probability)
+      << ";neighbour_cap=" << s.declared_neighbour_cap;
+    return t.str();
+}
+std::string emissions_digest(const PreparedProposalEmissions& emissions) {
+    std::uint64_t h = 1469598103934665603ULL;
+    const auto mix = [&h](const void* data, std::size_t n) {
+        const unsigned char* b = static_cast<const unsigned char*>(data);
+        for (std::size_t k = 0; k < n; ++k) h = (h ^ b[k]) * 1099511628211ULL;
+    };
+    for (const BlockProposalEmissions& e : emissions.blocks) {
+        mix(&e.allele_count, sizeof e.allele_count);
+        for (std::size_t x = 0; x < e.allele_count; ++x) {
+            for (std::size_t y = x; y < e.allele_count; ++y) {
+                const double v = e.at(x, y);
+                mix(&v, sizeof v);
+            }
+        }
+    }
+    std::ostringstream t;
+    t << std::hex << h;
+    return t.str();
+}
 // S2-G: small physical-footprint checkpoints of a blocked-route run (stage, bytes, peak, seconds since the run began);
 // recorded only when the route is on, reset at every run start, written to the status (final and stopped).
 struct FootprintCheckpoint {
@@ -1062,7 +1148,8 @@ void write_status(
                                 "gap_recursion_backend",
                                 "dosage_census_backend", "adaptive_emission_handoff", "output_schema", "early_incumbent",
                                 "test_interrupt_point", "diagnostic_union_evidence_dump", "diagnostic_union_kernel_dump",
-                                "union_progressive_schedule", "union_fragment_blocks"}) {
+                                "union_progressive_schedule", "union_fragment_blocks", "diagnostic_refinement_memory",
+                                "diagnostic_refinement_replay"}) {
             const auto source = options.setting_sources.find(key);
             if (source == options.setting_sources.end()) continue;
             const std::string k = key;
@@ -1089,6 +1176,8 @@ void write_status(
                                       : k == "diagnostic_union_kernel_dump" ? std::string(options.diagnostic_union_kernel_dump ? "1" : "0")
                                       : k == "union_progressive_schedule" ? options.union_progressive_schedule
                                       : k == "union_fragment_blocks" ? options.union_fragment_blocks
+                                      : k == "diagnostic_refinement_memory" ? std::string(options.diagnostic_refinement_memory ? "1" : "0")
+                                      : k == "diagnostic_refinement_replay" ? options.diagnostic_refinement_replay
                                       : k == "gap_recursion_backend"
                                           ? std::string(gap_recursion_backend_name(options.gap_recursion_fixed_geometry))
                                                                          : std::to_string(options.adaptive_fine_max_served_placements);
@@ -1804,6 +1893,7 @@ const char* genotype_run_status_name(GenotypeRunStatus status) {
         case GenotypeRunStatus::TimeLimit: return "TIME_LIMIT";
         case GenotypeRunStatus::ResourceRefusal: return "RESOURCE_REFUSAL";
         case GenotypeRunStatus::UnionDiagnosticOnly: return "UNION_DIAGNOSTIC_ONLY";
+        case GenotypeRunStatus::RefinementReplayDiagnosticOnly: return "REFINEMENT_REPLAY_DIAGNOSTIC_ONLY";
         case GenotypeRunStatus::LibraryRefused: return "LIBRARY_REFUSED";
     }
     return "MODEL_INCOMPLETE";
@@ -1897,6 +1987,14 @@ void apply_genotype_setting(const std::string& context, const std::string& key, 
         }
         options.union_progressive_schedule = value;
     }
+    else if (key == "diagnostic_refinement_memory") {   // S2-H (DIAGNOSTIC ONLY)
+        if (value != "0" && value != "1") throw std::runtime_error(context + ": 'diagnostic_refinement_memory' is 0 or 1: " + value);
+        options.diagnostic_refinement_memory = value == "1";
+    }
+    else if (key == "diagnostic_refinement_replay") {   // S2-H (DIAGNOSTIC ONLY)
+        if (value.empty()) throw std::runtime_error(context + ": 'diagnostic_refinement_replay' needs an inputs file");
+        options.diagnostic_refinement_replay = value;
+    }
     else if (key == "union_fragment_blocks") {   // S2-G (EXPERIMENTAL)
         if (value != "off" && value != "fine_core_4096_experimental") {
             throw std::runtime_error(context + ": 'union_fragment_blocks' is off or fine_core_4096_experimental: " + value);
@@ -1919,7 +2017,8 @@ void apply_genotype_setting(const std::string& context, const std::string& key, 
     }
     else if (key == "test_interrupt_point") {   // S2-A TEST HOOK
         if (value != "none" && value != "before_first_evaluation" && value != "after_checkpoint" &&
-            value != "union_scoring" && value != "adaptive_refinement" && value != "after_prefix_checkpoint") {
+            value != "union_scoring" && value != "adaptive_refinement" && value != "after_prefix_checkpoint" &&
+            value != "refinement_seed_census") {
             throw std::runtime_error(context + ": 'test_interrupt_point' is none, before_first_evaluation, after_checkpoint, "
                                      "union_scoring or adaptive_refinement: " + value);
         }
@@ -2227,6 +2326,11 @@ void remove_run_outputs(const std::string& out_prefix) {
     for (const std::string& suffix : sequence_report_outputs()) std::remove((out_prefix + suffix).c_str());   // S1-C
     for (const std::string& suffix : dosage::dosage_stage_outputs()) std::remove((out_prefix + suffix).c_str());
     for (const char* suffix : kPartialOutputs) std::remove((out_prefix + suffix).c_str());
+    // S2-H: the refinement diagnostics are run-owned too (removed at the start only: they must survive a stop)
+    for (const char* suffix : {".refinement_memory_live.tsv", ".refinement_replay_inputs.tsv", ".refinement_replay.tsv",
+                               ".refinement_replay_rounds.tsv", ".refinement_replay_scored.tsv"}) {
+        std::remove((out_prefix + suffix).c_str());
+    }
     std::remove((out_prefix + ".mosaic_status.tsv").c_str());
 }
 
@@ -2577,6 +2681,9 @@ GenotypeRunStatus run_genotype_body(const GenotypeCommandOptions& options, Genot
         throw std::invalid_argument(*refused);
     }
     if (const std::optional<std::string> refused = union_fragment_blocks_refusal(options)) {   // S2-G: before the prefix
+        throw std::invalid_argument(*refused);
+    }
+    if (const std::optional<std::string> refused = refinement_diagnostic_refusal(options)) {   // S2-H: before the prefix
         throw std::invalid_argument(*refused);
     }
     {
@@ -3368,6 +3475,84 @@ GenotypeRunStatus run_genotype_body(const GenotypeCommandOptions& options, Genot
     scoring_options.union_prefilter_cache_bytes = options.union_prefilter_cache_bytes;
     scoring_options.start_sort_scratch_bytes = options.start_sort_scratch_bytes;
     scoring_options.max_union_cached_prefilters_consumed = options.max_union_cached_prefilters_consumed;
+    if (!options.diagnostic_refinement_replay.empty()) {
+        // ---- S2-H DIAGNOSTIC ONLY: replay the first refinement round from a recorded anchor (no union, no early pass) ----
+        const auto record = [&](const std::string& file) {
+            std::map<std::string, std::string> kv;
+            std::ifstream in(file);
+            if (!in) throw std::runtime_error("diagnostic_refinement_replay: cannot read " + file);
+            for (std::string line; std::getline(in, line);) {
+                const std::size_t tab = line.find('\t');
+                if (tab != std::string::npos) kv[line.substr(0, tab)] = line.substr(tab + 1);
+            }
+            return kv;
+        };
+        const std::map<std::string, std::string> in = record(options.diagnostic_refinement_replay);
+        RepairSetup setup = make_repair_setup(options, scoring_options);
+        // every identity first: model, inputs by content, proposal emissions, the refinement setup
+        std::vector<std::pair<std::string, std::string>> expected = {
+            {"schema", "diagnostic_refinement_replay_inputs_v1"}, {"model_fingerprint", fingerprint},
+            {"emissions_digest", emissions_digest(emissions)}, {"repair_setup", repair_setup_text(setup, fragments.size())}};
+        for (const auto& hash : g_input_hashes) expected.push_back({"sha256_" + hash.first, hash.second});
+        std::string identities;
+        for (const auto& [k, v] : expected) {
+            const auto found = in.find(k);
+            if (found == in.end() || found->second != v) {
+                throw std::runtime_error("diagnostic_refinement_replay: the recorded " + k + " does not match this run (" +
+                                         (found == in.end() ? std::string("absent") : found->second) + " vs " + v + ")");
+            }
+            identities += (identities.empty() ? "" : ",") + k;
+        }
+        const auto alleles = [&](const std::string& key) {
+            std::vector<std::size_t> out;
+            std::stringstream text(in.at(key));
+            for (std::string item; std::getline(text, item, ',');) out.push_back(std::stoull(item));
+            if (out.size() != model.blocks().size()) throw std::runtime_error("diagnostic_refinement_replay: " + key + " has the wrong block count");
+            return out;
+        };
+        const std::vector<std::size_t> hap1 = alleles("anchor_hap1"), hap2 = alleles("anchor_hap2");
+        const double anchor = std::strtod(in.at("anchor_score").c_str(), nullptr);
+        if (hex_double(anchor) != in.at("anchor_score")) throw std::runtime_error("diagnostic_refinement_replay: the anchor score does not round-trip");
+        setup.search.max_rounds = 1;   // declared: the first round only
+        write_running_status("refinement replay");
+        note_footprint("replay_refinement_context_start");
+        CoordinateRepairSearch search(model, emissions, fragments, library, setup.scoring, setup.search);
+        search.start(hap1, hap2, anchor);
+        std::ostringstream scored_rows;
+        scored_rows << "item\thap1\thap2\tlog_likelihood\tfragment_term\texposure_term\tabsolute_term_sum\tfragments_with_mass\tprior\n";
+        std::size_t item = 0;
+        RepairHooks hooks;
+        hooks.on_checkpoint = [](const char* point) { note_footprint(point); };
+        hooks.on_scored = [&](const std::vector<std::size_t>& a, const std::vector<std::size_t>& b, const std::string&,
+                              const std::string&, const DiplotypeScore& score, double prior) {
+            scored_rows << item++ << '\t' << join_alleles(a) << '\t' << join_alleles(b) << '\t' << hex_double(score.log_likelihood)
+                        << '\t' << hex_double(score.fragment_term) << '\t' << hex_double(score.exposure_term) << '\t'
+                        << hex_double(score.absolute_term_sum) << '\t' << score.fragments_with_mass << '\t' << hex_double(prior) << '\n';
+        };
+        const auto replay_mark = Clock::now();
+        const bool reproduced = search.run(hooks);
+        const double replay_seconds = seconds_since(replay_mark);
+        note_footprint("replay_round_done");
+        atomic_write(options.out_prefix + ".refinement_replay_rounds.tsv", search.render_rounds(search.rounds()));
+        atomic_write(options.out_prefix + ".refinement_replay_scored.tsv", scored_rows.str());
+        const FootprintSample fp = physical_footprint();
+        std::ostringstream t;
+        t << "key\tvalue\nschema\tdiagnostic_refinement_replay_v1\nnote\tDIAGNOSTIC ONLY: the first refinement round replayed "
+             "from a recorded anchor in a fresh process; no union pass, no genotype\ninputs\t" << options.diagnostic_refinement_replay
+          << "\nidentities_checked\t" << identities << "\nanchor_declared\t" << in.at("anchor_score")
+          << "\nanchor_reproduced\t" << (reproduced ? "yes" : "NO") << "\nanchor_scored\t"
+          << (search.rounds().empty() ? std::string("NA") : hex_double(search.rounds().front().start_total))
+          << "\nrounds_completed\t" << search.rounds().size() << "\nstop_reason\t" << search.stop_reason()
+          << "\ncandidates_scored\t" << item << "\nseconds_replay\t" << replay_seconds << "\nphys_footprint_bytes\t" << fp.current
+          << "\nphys_footprint_peak_bytes\t" << fp.peak << '\n';
+        atomic_write(options.out_prefix + ".refinement_replay.tsv", t.str());
+        timings.total = seconds_since(started);
+        write_status(status_path, GenotypeRunStatus::RefinementReplayDiagnosticOnly, fingerprint, options, library, timings,
+                     &locus_report, &panel, nullptr, nullptr,
+                     "DIAGNOSTIC ONLY: the first refinement round was replayed from a recorded anchor; no union pass and no "
+                     "genotype", nullptr, &depth, nullptr);
+        return GenotypeRunStatus::RefinementReplayDiagnosticOnly;
+    }
     FragmentScoringResult scored;
     std::string rescore_failure;
     std::vector<HaplotypeWork> union_work;
@@ -4433,27 +4618,21 @@ GenotypeRunStatus run_genotype_body(const GenotypeCommandOptions& options, Genot
         report.footprint_at_repair_start = physical_footprint().current;
 
         // ---- 3. the exact coordinate repair from the anchor
-        FragmentScoringOptions repair_scoring = scoring_options;
+        RepairSetup repair_setup = make_repair_setup(options, scoring_options);   // S2-H: shared with the replay
+        FragmentScoringOptions& repair_scoring = repair_setup.scoring;
         if (options.adaptive_emission_handoff) repair_scoring.emission_handoff_in = &union_emissions;   // I2-K
-        repair_scoring.max_physical_origins = options.repair_max_physical_origins;
-        repair_scoring.max_state_classes = options.repair_max_state_classes;
-        repair_scoring.max_piece_hits = options.repair_max_piece_hits;
-        repair_scoring.max_latent_alignment_pairs = options.repair_max_latent_pairs;
-        RepairSearchOptions search_options;
-        search_options.local_pairs = options.repair_local_pairs;
-        search_options.max_rounds = options.repair_rounds;
-        search_options.mode = RepairScoringMode::Delta;
-        search_options.origin_cache = true;
-        search_options.planned_cache = true;
-        search_options.origin_cache_bytes = options.repair_origin_cache_bytes;
-        if (options.adaptive_window_discovery == "fine_experimental") {
-            search_options.fine_window_bytes = options.adaptive_fine_store_bytes;
-            search_options.fine_window_served_cap = options.adaptive_fine_max_served_placements;
+        RepairSearchOptions& search_options = repair_setup.search;
+        if (options.diagnostic_refinement_memory) {   // S2-H: what a fresh-process replay of round 1 must match
+            std::ostringstream t;
+            t << "key\tvalue\nschema\tdiagnostic_refinement_replay_inputs_v1\nnote\tDIAGNOSTIC ONLY: replay inputs, not a result\n"
+              << "model_fingerprint\t" << fingerprint << '\n';
+            for (const auto& hash : g_input_hashes) t << "sha256_" << hash.first << '\t' << hash.second << '\n';
+            t << "emissions_digest\t" << emissions_digest(emissions) << "\nrepair_setup\t" << repair_setup_text(repair_setup, fragments.size())
+              << "\nanchor_hap1\t" << join_alleles(anchor_diplotype.first.alleles) << "\nanchor_hap2\t"
+              << join_alleles(anchor_diplotype.second.alleles) << "\nanchor_score\t" << hex_double(anchor_score)
+              << "\nanchor_union_rank\t" << anchor_rank + 1 << '\n';
+            atomic_write(options.out_prefix + ".refinement_replay_inputs.tsv", t.str());
         }
-        search_options.fused_seed = options.adaptive_fused_seed;
-        search_options.switch_probability = options.switch_probability;
-        search_options.declared_neighbour_cap = options.repair_max_neighbours;
-        search_options.memory_log = true;
         write_running_status("repair");
         std::unique_ptr<CoordinateRepairSearch> search;
         std::string refusal;
@@ -4518,9 +4697,16 @@ GenotypeRunStatus run_genotype_body(const GenotypeCommandOptions& options, Genot
                                                               search_options);
             note_footprint("refinement_context_constructed");   // S2-G
             search->start(anchor_diplotype.first.alleles, anchor_diplotype.second.alleles, anchor_score);
-            note_footprint("initial_incumbent_placed");   // S2-G
+            note_footprint("repair_search_started");   // S2-H: start() records the anchor; placement happens in run()
             search_built = Clock::now();
             RepairHooks hooks;
+            hooks.on_checkpoint = [&](const char* point) {   // S2-H: the seed's actual placement and census
+                note_footprint(point);
+                if (options.test_interrupt_point == "refinement_seed_census" &&
+                    std::string(point) == "initial_incumbent_census_retained") {   // S2-H TEST HOOK: a stop inside round 1
+                    stop_run("TIME_LIMIT", "test hook: inside the first refinement round, after the seed census", 124);
+                }
+            };
             hooks.on_scored = [&](const std::vector<std::size_t>& a, const std::vector<std::size_t>& b,
                                   const std::string& sa, const std::string& sb, const DiplotypeScore& score,
                                   double prior) {
@@ -7471,6 +7657,7 @@ std::optional<int> parse_genotype_arguments(const std::vector<std::string>& args
     if (const std::optional<std::string> refused = resolve_dosage_contract(options)) throw std::runtime_error(*refused);
     if (const std::optional<std::string> refused = early_incumbent_refusal(options)) throw std::runtime_error(*refused);
     if (const std::optional<std::string> refused = union_fragment_blocks_refusal(options)) throw std::runtime_error(*refused);
+    if (const std::optional<std::string> refused = refinement_diagnostic_refusal(options)) throw std::runtime_error(*refused);
     if (profiled) {
         // Every setting a flag gave beside the profile, with the value it took.
         for (const std::string& flag : args) {

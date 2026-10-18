@@ -1819,6 +1819,10 @@ public:
     // state released with the incumbent, not retained across rounds.
     std::uint64_t merge_working_bytes() const;
     ContextMemoryAccount memory_account() const;
+    // S2-H DIAGNOSTIC: called from add_repaired_haplotypes' own thread at its safe points (windows planned, origin cache
+    // planned, a few neighbour-materialisation progress points, done) with (point, requests done, requests total). It
+    // must not mutate the context. Measurement only; empty by default.
+    void set_progress_probe(std::function<void(const char* point, std::size_t done, std::size_t total)> probe);
     std::vector<OriginDemandRow> origin_demand() const;
     // Planned selective retention. plan_repaired_window describes the window a repair would request;
     // plan_origin_cache then chooses the round's cache set from those windows and evicts every entry

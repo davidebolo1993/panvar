@@ -82,6 +82,11 @@ struct RepairSearchOptions {
     std::uint64_t declared_neighbour_cap = 0;
     // Per-round memory accounts at four fixed points (context modes only).
     bool memory_log = true;
+    // S2-H DIAGNOSTIC: when set, every safe execution point of a round (entry, seed placement and census, neighbourhood
+    // construction, repair-window planning, neighbour materialisation progress, combination, promotion, release, commit)
+    // appends one row of the context's accounts and process memory to this file, flushed per row so it survives a
+    // watchdog stop. Measurement only: no order, batching or result changes.
+    std::string memory_live_path;
     // Gate hooks, never production: permute the neighbour and repair-request lists every round, and
     // re-score the final neighbourhood N more times without promoting (hold cycles).
     std::uint64_t request_order_seed = 0;
@@ -176,6 +181,9 @@ struct RepairHooks {
     // After each round is committed to rounds(). May throw (a caller's own resource bound); the
     // exception leaves the search where it stands.
     std::function<void(const RepairRound& round)> on_round;
+    // S2-H: named placement points of the first round's seed (initial_incumbent_placed, initial_incumbent_census_retained),
+    // for a caller's footprint checkpoints. Measurement only.
+    std::function<void(const char* point)> on_checkpoint;
 };
 
 // The declared bound on ONE round's neighbourhood, from the block shape: per block, both assignments
@@ -276,6 +284,9 @@ public:
 
 private:
     void snapshot(const char* kind, std::size_t index, const char* point, bool result_alive, bool relieve);
+    // S2-H: one live diagnostic row (memory_live_path), from a safe execution point only
+    void live_probe(std::size_t round, const char* point, std::size_t done = 0, std::size_t total = 0);
+    bool live_header_written_ = false;
 
     const PreparedGenotypeModel& model_;
     const std::vector<ReadPair>& fragments_;

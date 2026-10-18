@@ -445,6 +445,41 @@ void CoordinateRepairSearch::snapshot(const char* kind, std::size_t index, const
     memory_text_ += memory_log.str();
 }
 
+void CoordinateRepairSearch::live_probe(std::size_t round, const char* point, std::size_t done, std::size_t total) {
+    if (options_.memory_live_path.empty()) return;
+    PreparedScoringContext* context = this->context();
+    if (context == nullptr) return;
+    std::ofstream out(options_.memory_live_path, std::ios::app);
+    if (!live_header_written_) {
+        out << "round\tpoint\trequests_done\trequests_total\tphys_footprint\tphys_footprint_peak\trss_current\trss_peak\t"
+               "slots_total\tslots_live\tslots_released\tslot_table\tsequence_bytes\tsequence_capacity\tsegment_bytes\t"
+               "mass_bytes\tmass_capacity\tcensus_count\tcensus_bytes\tcensus_capacity\torigin_cache_entries\t"
+               "origin_cache_payload\torigin_cache_capacity\tmerge_bytes\tmerge_capacity\torigin_demand\twindow_scratch\t"
+               "origin_scratch\temission_table\temission_arena\temission_entries\temission_entry_metadata\t"
+               "emission_content_arena\tprepared\tlast_scoring_result\tlogical_total\tcapacity_total\t"
+               "footprint_minus_capacity\thaplotypes_created\tunique_haplotypes\tcum_physical_origins\tcum_state_classes\t"
+               "cum_piece_hits\n";
+        live_header_written_ = true;
+    }
+    const ContextMemoryAccount a = context->memory_account();
+    const FootprintSample fp = physical_footprint();
+    const EmissionCacheCounters cache = read_emission_cache_counters();
+    const FragmentScoringCounters& cum = context->cumulative_counters();
+    out << round << '\t' << point << '\t' << done << '\t' << total << '\t' << fp.current << '\t' << fp.peak << '\t'
+        << current_rss_bytes() << '\t' << static_cast<std::uint64_t>(peak_rss_gib() * 1073741824.0) << '\t' << a.slots_total
+        << '\t' << a.slots_live << '\t' << a.slots_released << '\t' << a.slot_table_bytes << '\t' << a.sequence_bytes << '\t'
+        << a.sequence_capacity << '\t' << a.segment_bytes << '\t' << a.mass_column_bytes << '\t' << a.mass_column_capacity
+        << '\t' << a.census_count << '\t' << a.census_bytes << '\t' << a.census_capacity << '\t' << a.origin_cache_entries
+        << '\t' << a.origin_cache_payload << '\t' << a.origin_cache_capacity << '\t' << a.merge_working_bytes << '\t'
+        << a.merge_working_capacity << '\t' << a.origin_demand_bytes << '\t' << a.window_scratch_capacity << '\t'
+        << a.origin_scratch_capacity << '\t' << a.emission_cache_table << '\t' << a.emission_cache_arena << '\t' << cache.entries
+        << '\t' << cache.entry_metadata_bytes << '\t' << cache.content_arena_bytes << '\t' << a.prepared_capacity << '\t'
+        << a.last_scoring_result_bytes << '\t' << a.logical_total << '\t' << a.capacity_total << '\t'
+        << (static_cast<std::int64_t>(fp.current) - static_cast<std::int64_t>(a.capacity_total)) << '\t'
+        << context->haplotypes_created() << '\t' << context->unique_haplotypes() << '\t' << cum.physical_origins << '\t'
+        << cum.statistical_state_classes << '\t' << cum.piece_hits << '\n';
+}
+
 bool CoordinateRepairSearch::run(const RepairHooks& hooks) {
     const std::size_t blocks = model_.blocks().size();
     const bool use_delta = options_.mode == RepairScoringMode::Delta;
@@ -461,7 +496,23 @@ bool CoordinateRepairSearch::run(const RepairHooks& hooks) {
     using StageClock = std::chrono::steady_clock;
     const auto since = [](StageClock::time_point t) { return std::chrono::duration<double>(StageClock::now() - t).count(); };
     RepairStageSeconds& lap = stage_seconds_;
+    // S2-H (diagnostic): the context's batch-repair safe points feed the live file; removed when run() returns
+    std::size_t probe_round = first_round;
+    struct ProbeGuard {
+        PreparedScoringContext* context = nullptr;
+        ~ProbeGuard() {
+            if (context != nullptr) context->set_progress_probe({});
+        }
+    } probe_guard;
+    if (!options_.memory_live_path.empty() && context != nullptr) {
+        context->set_progress_probe([this, &probe_round](const char* point, std::size_t done, std::size_t total) {
+            live_probe(probe_round, point, done, total);
+        });
+        probe_guard.context = context;
+    }
     for (std::size_t round = first_round; round <= final_round; ++round) {
+        probe_round = round;
+        live_probe(round, "round_entry");
         struct RoundClock {
             double& total;
             StageClock::time_point start = StageClock::now();
@@ -493,15 +544,21 @@ bool CoordinateRepairSearch::run(const RepairHooks& hooks) {
             // it again, and cycle prevention needs only its allele path, which the visited set holds.
             open_transient_round();
             const std::uint64_t seeding_before = context->cumulative_counters().physical_origins;
+            live_probe(round, "before_seed_placement");
             // I2-D: fused, the censuses come from the same pass and the retain_census calls below place nothing
             const std::vector<std::size_t> seeded =
                 context->add_haplotypes({incumbent_a.bases, incumbent_b.bases}, nullptr, false, options_.fused_seed);
+            live_probe(round, "after_seed_placement");
+            if (hooks.on_checkpoint) hooks.on_checkpoint("initial_incumbent_placed");
             inc_slot_a_ = seeded.front();
             inc_slot_b_ = seeded.back();
             role_of_[inc_slot_a_] = inc_slot_a_ == inc_slot_b_ ? "seed_hap1+2" : "seed_hap1";
             if (inc_slot_b_ != inc_slot_a_) role_of_[inc_slot_b_] = "seed_hap2";
+            live_probe(round, "before_census_retention");
             context->retain_census(inc_slot_a_);
             context->retain_census(inc_slot_b_);
+            live_probe(round, "after_census_retention");
+            if (hooks.on_checkpoint) hooks.on_checkpoint("initial_incumbent_census_retained");
             seeding_origins_ += context->cumulative_counters().physical_origins - seeding_before;
             have_inc_slots_ = true;
         }
@@ -512,6 +569,7 @@ bool CoordinateRepairSearch::run(const RepairHooks& hooks) {
         const auto generation_mark = StageClock::now();
         double spelling_inside = 0.0, priors_inside = 0.0;
 
+        live_probe(round, "before_neighbourhood_construction");
         // ---- neighbourhood construction. NO TRUTH IN SCOPE.
         std::vector<MosaicPath> paths;
         std::vector<std::string> sequences;
@@ -596,6 +654,7 @@ bool CoordinateRepairSearch::run(const RepairHooks& hooks) {
         lap.neighbour_priors += priors_inside;
         lap.neighbour_generation += since(generation_mark) - spelling_inside - priors_inside;
         rec.neighbours = neighbours.size();
+        live_probe(round, "after_neighbourhood_construction", 0, neighbours.size());
         if (request_order_seed != 0) {
             std::mt19937_64 rng(request_order_seed * 1000003ULL + round);
             std::shuffle(neighbours.begin(), neighbours.end(), rng);
@@ -745,9 +804,11 @@ bool CoordinateRepairSearch::run(const RepairHooks& hooks) {
         for (const Neighbour& n : neighbours) add_item(n.s1, n.s2);
         rec.scored_pairs = scored_pairs.size();
 
+        live_probe(round, "before_candidate_combination", 0, scored_pairs.size());
         const auto mark = std::chrono::steady_clock::now();
         const FragmentScoringResult scored = context ? context->score_candidates(scored_pairs)
                                                      : score_diplotypes(*interned, scored_pairs, fragments_, library_, scoring_);
+        live_probe(round, "after_candidate_combination", 0, scored_pairs.size());
         const std::size_t view_count = 1 + scored.audit_scores.size();
         if (options_.score_view >= view_count) throw std::logic_error("the repair search's score view was not scored");
         const auto view_of = [&](std::size_t v) -> const std::vector<DiplotypeScore>& {
@@ -1035,6 +1096,7 @@ bool CoordinateRepairSearch::run(const RepairHooks& hooks) {
                 keep = {inc_slot_a_, inc_slot_b_};
             }
             timed_snapshot(kind, snapshot_index, "after_promotion", true, false);
+            live_probe(round, "after_promotion");
             std::vector<std::size_t> kept = keep;
             kept.insert(kept.end(), pinned_.begin(), pinned_.end());
             context->release_transient(kept);
@@ -1048,6 +1110,7 @@ bool CoordinateRepairSearch::run(const RepairHooks& hooks) {
             rec.transient_after = context->transient_payload_bytes();
             timed_snapshot(kind, snapshot_index, "after_release", true,
                            options_.pressure_relief && holding_ && hold_remaining_ == 0);
+            live_probe(round, "after_release");
             // Re-read AFTER the promotion: the one materialisation a round performs happens there.
             rec.full_bytes = round_delta.full_haplotype_bytes_materialised;
             rec.key_bytes = round_delta.sequence_key_bytes;
@@ -1090,6 +1153,7 @@ bool CoordinateRepairSearch::run(const RepairHooks& hooks) {
         rec.round_wall_seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - round_mark).count();
         if (!holding_) {
             rounds_.push_back(rec);
+            live_probe(round, "round_committed");
             const auto hook_mark = StageClock::now();
             if (hooks.on_round) hooks.on_round(rounds_.back());
             lap.trajectory_hook += since(hook_mark);

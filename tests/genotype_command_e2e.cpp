@@ -5307,6 +5307,139 @@ void test_blocked_union_route() {
                  "locus); default off; later-block refusal keeps the checkpoint PROVISIONAL with distinct work; contract and prefix reuse\n";
 }
 
+// ---- S2-H: refinement memory diagnostics and the first-round replay (diagnostic_refinement_memory / _replay) ----------
+void test_refinement_diagnostics() {
+    namespace fs = std::filesystem;
+    const auto fresh = [&](const std::string& rel, bool memory) {
+        fs::remove_all(path(rel));
+        fs::create_directories(path(rel));
+        panvar::GenotypeCommandOptions o =
+            repair_options(rel + "/call", path("phaseable_r1.fq"), path("phaseable_r2.fq"), "tiny_phaseable.gfa");
+        if (memory) {
+            o.diagnostic_refinement_memory = true;
+            o.setting_sources["diagnostic_refinement_memory"] = "test";
+        }
+        return o;
+    };
+    const std::set<std::string> diagnostics = {"call.refinement_memory_live.tsv", "call.refinement_replay_inputs.tsv"};
+    // (1) instrumentation leaves every output and the trajectory unchanged
+    require(panvar::execute_genotype_command(fresh("rd_off", false), nullptr) == 0, "S2-H: the plain run completes");
+    require(panvar::execute_genotype_command(fresh("rd_on", true), nullptr) == 0, "S2-H: the instrumented run completes");
+    {
+        std::set<std::string> a = sf::files(path("rd_off")), b = sf::files(path("rd_on"));
+        for (const std::string& f : diagnostics) require(b.erase(f) == 1, "S2-H: diagnostic file written: " + f);
+        require(a == b, "S2-H: no other output file added or removed");
+        for (const std::string& f : a) {
+            const std::string x = path("rd_off/" + f), y = path("rd_on/" + f);
+            if (f == "call.repair_memory.tsv") continue;   // a memory/timing log
+            if (f == "call.mosaic_status.tsv") {
+                std::string listing;
+                const auto bad = s2g::unexpected_status_differences(x, y, &listing);
+                std::string names;
+                for (const auto& k : bad) names += k + ",";
+                require(bad.empty(), "S2-H: status keys differ outside the declared allowances: " + names);
+                continue;
+            }
+            if (f == "call.settings.tsv") {
+                auto m = sf::kv(y);
+                require(m.erase("diagnostic_refinement_memory") == 1 && m == sf::kv(x), "S2-H: settings differ only by the diagnostic row");
+                continue;
+            }
+            if (f == "call.repair_rounds.tsv") {
+                require(rounds_science(x) == rounds_science(y), "S2-H: the refinement trajectory is unchanged");
+                continue;
+            }
+            if (f == "call.dosage_status.tsv") {
+                auto m = sf::kv(x), n = sf::kv(y);
+                for (auto* q : {&m, &n}) for (auto it = q->begin(); it != q->end();) it = it->first.rfind("seconds_", 0) == 0 ? q->erase(it) : std::next(it);
+                require(m == n, "S2-H: dosage status unchanged (timing aside)");
+                continue;
+            }
+            require(sf::normalised(x, path("rd_off")) == sf::normalised(y, path("rd_on")), "S2-H: " + f + " unchanged");
+        }
+        std::set<std::string> points;
+        for (const auto& row : read_rows(path("rd_on/call.refinement_memory_live.tsv"))) if (row.size() > 1 && row[0] == "1") points.insert(row[1]);
+        for (const char* point : {"round_entry", "before_seed_placement", "after_seed_placement", "before_census_retention",
+                                  "after_census_retention", "before_neighbourhood_construction", "after_neighbourhood_construction",
+                                  "before_repair_window_planning", "after_repair_window_planning", "after_origin_cache_planning",
+                                  "neighbour_materialisation", "after_neighbour_materialisation", "before_candidate_combination",
+                                  "after_candidate_combination", "combination_start", "combination_scores_done",
+                                  "flattened_mass_matrix_built", "after_promotion", "after_release", "round_committed"}) {
+            require(points.count(point) == 1, std::string("S2-H: live point recorded in round 1: ") + point);
+        }
+    }
+    // (2) the live file survives a stop inside the first round (after the seed census, before any neighbour)
+    {
+        panvar::GenotypeCommandOptions o = fresh("rd_stop", true);
+        o.output_schema = "sequence_first_v2";
+        o.setting_sources["output_schema"] = "test";
+        o.early_incumbent = "experimental_v1";
+        o.setting_sources["early_incumbent"] = "test";
+        o.test_interrupt_point = "refinement_seed_census";
+        const int code = s2a::execute_in_child(o);
+        const auto st = read_status(path("rd_stop/call.mosaic_status.tsv"));
+        require(code == 3 && st.at("status") == "TIME_LIMIT" && st.at("repair_rounds_committed") == "0",
+                "S2-H: the induced stop inside round 1 ends the run as a budget stop (exit " + std::to_string(code) + ")");
+        std::set<std::string> points;
+        for (const auto& row : read_rows(path("rd_stop/call.refinement_memory_live.tsv"))) points.insert(row[1]);
+        require(points.count("after_census_retention") == 1 && points.count("before_neighbourhood_construction") == 0 &&
+                    points.count("round_committed") == 0 && exists(path("rd_stop/call.refinement_replay_inputs.tsv")),
+                "S2-H: the live rows up to the stop survive it; nothing after the stop is recorded");
+    }
+    // (3) the first-round replay, in a separate process, reproduces the anchor and the full run's first round
+    {
+        panvar::GenotypeCommandOptions o = fresh("rd_replay", true);
+        o.diagnostic_refinement_replay = path("rd_on/call.refinement_replay_inputs.tsv");
+        o.setting_sources["diagnostic_refinement_replay"] = "test";
+        const int code = s2a::execute_in_child(o);
+        const auto st = read_status(path("rd_replay/call.mosaic_status.tsv"));
+        const auto replay = sf::kv(path("rd_replay/call.refinement_replay.tsv"));
+        require(st.at("status") == "REFINEMENT_REPLAY_DIAGNOSTIC_ONLY" && no_ranking_or_call("rd_replay/call") &&
+                    !exists(path("rd_replay/call.repair_rounds.tsv")),
+                "S2-H replay: a diagnostic status and no genotype output (exit " + std::to_string(code) + ")");
+        const auto inputs = sf::kv(path("rd_on/call.refinement_replay_inputs.tsv"));
+        require(replay.at("anchor_reproduced") == "yes" && replay.at("anchor_scored") == inputs.at("anchor_score") &&
+                    replay.at("rounds_completed") == "1",
+                "S2-H replay: the anchor's exact score is reproduced and one round completes");
+        const auto first_round = [](const std::string& file) {
+            std::ifstream in(file);
+            std::string header, row, out;
+            std::getline(in, header);
+            std::getline(in, row);
+            for (const std::string* line : {&header, &row}) {
+                std::stringstream cells(*line);
+                std::size_t c = 0;
+                for (std::string cell; std::getline(cells, cell, '\t') && c < 28; ++c) out += cell + '\t';
+                out += '\n';
+            }
+            return out;
+        };
+        require(first_round(path("rd_replay/call.refinement_replay_rounds.tsv")) == first_round(path("rd_on/call.repair_rounds.tsv")),
+                "S2-H replay: the first round's candidates, scores and decision equal the full run's");
+        // a tampered identity is refused before the prefix is touched
+        std::string text = slurp(path("rd_on/call.refinement_replay_inputs.tsv"));
+        const std::size_t at = text.find("emissions_digest\t");
+        text.replace(at + 17, 1, text[at + 17] == '0' ? "1" : "0");
+        std::ofstream(path("rd_tampered_inputs.tsv")) << text;
+        panvar::GenotypeCommandOptions bad = fresh("rd_tampered", true);
+        bad.diagnostic_refinement_replay = path("rd_tampered_inputs.tsv");
+        bool refused = false;
+        try { (void)panvar::execute_genotype_command(bad, nullptr); } catch (const std::runtime_error& e) {
+            refused = std::string(e.what()).find("emissions_digest") != std::string::npos;
+        }
+        require(refused && !exists(path("rd_tampered/call.refinement_replay.tsv")), "S2-H replay: a mismatched identity is refused");
+        // the contract
+        panvar::GenotypeCommandOptions v2 = fresh("rd_contract", true);
+        v2.diagnostic_refinement_replay = path("rd_on/call.refinement_replay_inputs.tsv");
+        v2.output_schema = "sequence_first_v2";
+        bool contract = false;
+        try { (void)panvar::execute_genotype_command(v2, nullptr); } catch (const std::invalid_argument&) { contract = true; }
+        require(contract && sf::files(path("rd_contract")).empty(), "S2-H replay: the contract is checked before the prefix");
+    }
+    std::cout << "  refinement diagnostics: outputs and trajectory unchanged; live rows at every round-1 point; rows survive an "
+                 "induced stop; replay reproduces the anchor and round 1 in a separate process; identities and contract enforced\n";
+}
+
 int main(int argc, char** argv) {
     if (argc < 2) {
         std::cerr << "usage: genotype_command_e2e_test <scratch dir> [source dir]\n";
@@ -5337,6 +5470,7 @@ int main(int argc, char** argv) {
             const auto truths = spell_truths(locus);
             simulate(truths.first, truths.second, path("phaseable_r1.fq"), path("phaseable_r2.fq"), 123);
             test_blocked_union_route();
+            test_refinement_diagnostics();
             std::cout << "genotype command e2e (blocked_union only): PASS\n";
             return 0;
         } catch (const std::exception& error) {
@@ -5423,6 +5557,7 @@ int main(int argc, char** argv) {
         test_early_incumbent_caps();
         test_progressive_schedule();
         test_blocked_union_route();
+        test_refinement_diagnostics();
         if (argc >= 3) test_profile(argv[2]);
         test_block_quality_columns();
         std::cout << "genotype command end-to-end: PASS\n";
