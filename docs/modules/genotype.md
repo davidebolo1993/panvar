@@ -180,6 +180,29 @@ The audit never changes the prediction or its sequences. It is not run when the 
 
 **Extraction:** `tests/analysis/s1d/extract_panel_haplotype.py --check <graph.gfa> <prefix>.sequence_haplotypes.tsv` extracts every listed panel path and checks its hash and length.
 
+### Early evaluated incumbent (experimental, opt-in)
+
+**How to enable it.** Set the profile key `early_incumbent experimental_v1`. It requires `sequence_first_v2` and the adaptive repair, and is refused otherwise. Off (the default) changes nothing.
+
+**What happens.**
+- **Selection.** After the markers, before the mosaic proposal and the union pass, one panel diplotype is selected. It is the argmax of the existing proposal marker emissions plus the exact path prior over the panel pairs, with ties going to panel order. This uses table lookups only and is not a winner claim.
+- **Evaluation.** That pair is fully evaluated by the unchanged scorer, through the union's own route and caps, with the ranking's sequence prior.
+- **Checkpoint.** It is checkpointed as a PROVISIONAL report that follows the v2 panel-reference and conditional-FASTA rules. The `checkpoint_*` rows give its stage, score components, evaluated count and semantics: fully evaluated; the best among the candidates evaluated so far; search incomplete. A checkpoint is never a global optimum, a calibrated claim or a confidence.
+- **Replacement.** The checkpoint is replaced only by a better fully evaluated candidate: the union's best once the union pass completes, then any repair-scored candidate, committed at the round commit. The union check requires the union pass to reproduce the early candidate bit for bit.
+
+**When the budget stops the run:**
+
+| situation | outcome |
+|---|---|
+| time or footprint watchdog after a checkpoint | the checkpoint is kept as PROVISIONAL (exit 3); only its locus record is rewritten with the stop |
+| watchdog before any checkpoint | typed NO_PREDICTION, `budget_stop_before_first_evaluated_candidate` (exit 124 or 125) |
+| declared cap after a checkpoint (proposal budget, union cap, repair cumulative or round cap, neighbourhood bound) | the best fully evaluated candidate, as PROVISIONAL |
+| scoring inconsistency, checkpoint publication failure or exception | explicit failure; no checkpoint is offered as a fallback |
+
+**After an external SIGKILL.** The last locus record is the commit record. It names its haplotypes' SHA-256 and labellings. Content files that disagree with it belong to an uncommitted later checkpoint. The status then still reads RUNNING.
+
+**Completed runs and accounting.** Scores, ranking and outputs are unchanged. The early evaluation is accounted in the status (`early_incumbent_*`, `checkpoint_*`), and the run-wide combination tally includes its work.
+
 ## Limitations
 
 - Only paired short reads are supported.
