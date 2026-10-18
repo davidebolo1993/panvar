@@ -103,11 +103,10 @@ SequenceReport g_sequence_report;
 bool sequence_first(const GenotypeCommandOptions& options) {
     return options.output_schema == "sequence_first_v1" || options.output_schema == "sequence_first_v2";
 }
-std::string dosage_mode_source(const GenotypeCommandOptions& options) {
-    return options.dosage_mode_explicit                     ? "flag"
-           : options.output_schema == "sequence_first_v2" ? "contract_default_sequence_first_v2"
-                                                            : "default";
-}
+std::string dosage_mode_source(const GenotypeCommandOptions& options) { return options.dosage_mode_source; }
+// S1-D.1: true while execute_genotype_command runs the body (its dosage stage follows); a caller-only API run
+// (run_genotype, run_genotype_prepared) has no dosage stage, and its v2 report says so rather than naming a mode.
+bool g_dosage_stage_follows = false;
 // S1-D: classifies the report's haplotypes against the active panel (exact sequence identity in the locus frame) and
 // records the graph and model identity -- sequence_first_v2 only; reporting only.
 void annotate_v2(SequenceReport& report, const PreparedGenotypeModel& model, const std::string& fingerprint) {
@@ -3227,6 +3226,10 @@ GenotypeRunStatus run_genotype_body(const GenotypeCommandOptions& options, Genot
             if (report.call_class != "no_call") report.no_call_reason = "none";
             g_sequence_legacy = {genotype_run_status_name(status), report.call_class, report.no_call_reason,
                                  options.dosage_mode, dosage_mode_source(options)};   // S1-B, S1-D
+            if (options.output_schema == "sequence_first_v2" && !g_dosage_stage_follows) {   // S1-D.1
+                g_sequence_legacy.dosage_mode = "not_run";
+                g_sequence_legacy.dosage_mode_source = "caller_only_api_without_dosage_stage";
+            }
             // S1-C: the sequence report is published before the status commits it: its files first, its locus record
             // last; a failure leaves no partial report and the status says so.
             if (sequence_first(options)) {
@@ -6214,11 +6217,14 @@ std::optional<int> parse_genotype_arguments(const std::vector<std::string>& args
             const std::string v = need(i);
             if (v != "off" && v != "shadow") throw std::runtime_error("--dosage-audit takes off or shadow");
             options.dosage_mode = v == "shadow" ? "audit" : "off";
+            options.dosage_mode_explicit = true;   // S1-D.1: a declared mode (sequence_first_v2 keeps it)
+            options.dosage_mode_source = "flag --dosage-audit";
         }
         else if (flag == "--library-diagnostic") options.library_diagnostic = true;
         else if (flag == "--dosage-mode") {
             options.dosage_mode = need(i);
             options.dosage_mode_explicit = true;
+            options.dosage_mode_source = "flag --dosage-mode";
             if (options.dosage_mode != "off" && options.dosage_mode != "audit" && options.dosage_mode != "repair") {
                 throw std::runtime_error("--dosage-mode takes off, audit or repair");
             }
@@ -6384,18 +6390,10 @@ std::optional<int> parse_genotype_arguments(const std::vector<std::string>& args
             throw std::runtime_error("output_schema " + options.output_schema + " is not supported with diagnostic_union_only");
         }
     }
-    // S1-D: under sequence_first_v2 dosage is diagnostic: audit unless --dosage-mode was given; off is allowed (not
-    // evaluated); repair is refused -- historical repair reproduction belongs to the legacy contract.
-    if (options.output_schema == "sequence_first_v2") {
-        if (!options.dosage_mode_explicit) {
-            options.dosage_mode = "audit";
-        } else if (options.dosage_mode == "repair") {
-            throw std::runtime_error("--dosage-mode repair is not available under output_schema sequence_first_v2: dosage "
-                                     "is diagnostic there (audit, or off) and never changes the prediction; reproduce "
-                                     "historical repair results with the legacy contract (omit --output-schema, or "
-                                     "--output-schema legacy)");
-        }
-    }
+    // S1-D: under sequence_first_v2 dosage is diagnostic: audit unless a mode was declared; off is allowed (not
+    // evaluated); repair is refused -- historical repair reproduction belongs to the legacy contract. S1-D.1: the one
+    // resolver execute_genotype_command applies too.
+    if (const std::optional<std::string> refused = resolve_dosage_contract(options)) throw std::runtime_error(*refused);
     if (profiled) {
         // Every setting a flag gave beside the profile, with the value it took.
         for (const std::string& flag : args) {
@@ -6473,19 +6471,79 @@ std::optional<int> resolve_genotype_command(const std::vector<std::string>& args
 }
 }  // namespace
 
+std::optional<std::string> resolve_dosage_contract(GenotypeCommandOptions& options) {
+    if (options.dosage_mode != "off" && options.dosage_mode != "audit" && options.dosage_mode != "repair") {
+        return "dosage_mode takes off, audit or repair (got '" + options.dosage_mode + "')";
+    }
+    const bool defaulted = options.dosage_mode_source == "contract_default_sequence_first_v2";   // resolved before
+    if (!options.dosage_mode_explicit && options.dosage_mode != "off" && !defaulted) {
+        options.dosage_mode_explicit = true;   // an API caller set a non-default mode: declared
+        if (options.dosage_mode_source == "default") options.dosage_mode_source = "caller_options";
+    }
+    if (options.output_schema != "sequence_first_v2") {
+        if (defaulted && !options.dosage_mode_explicit) {   // a v2 default never carries over to another schema
+            options.dosage_mode = "off";
+            options.dosage_mode_source = "default";
+        }
+        return std::nullopt;
+    }
+    if (!options.dosage_mode_explicit) {
+        options.dosage_mode = "audit";
+        options.dosage_mode_source = "contract_default_sequence_first_v2";
+    } else if (options.dosage_mode == "repair") {
+        return "--dosage-mode repair is not available under output_schema sequence_first_v2: dosage is diagnostic there "
+               "(audit, or off) and never changes the prediction; reproduce historical repair results with the legacy "
+               "contract (omit --output-schema, or --output-schema legacy)";
+    } else if (options.dosage_mode_source == "default") {
+        options.dosage_mode_source = "caller_options";   // declared off through dosage_mode_explicit
+    }
+    return std::nullopt;
+}
+
+namespace {
+// S1-D.1: the sequence_first_v2 FASTA policy over the whole prefix. The sequence report's FASTA is the only
+// prediction FASTA: the legacy haplotype FASTA is suppressed (after the dosage stage and the locus table, its internal
+// consumers, have read it), and so is every empty dosage FASTA. A non-empty dosage FASTA is an audit diagnostic
+// (repair-candidate representatives) and stays, linked from the locus table.
+void suppress_empty_dosage_fasta(const std::string& prefix) {
+    for (const char* suffix : {".dosage_repaired.fa", ".dosage_original.fa", ".dosage_repaired_block_alleles.fa"}) {
+        std::error_code ignored;
+        const std::string file = prefix + suffix;
+        if (std::filesystem::exists(file, ignored) && std::filesystem::file_size(file, ignored) == 0) {
+            std::filesystem::remove(file, ignored);
+        }
+    }
+}
+void suppress_legacy_fasta(const std::string& prefix) {
+    std::error_code ignored;
+    std::filesystem::remove(prefix + ".mosaic_haplotypes.fa", ignored);
+    std::filesystem::remove(prefix + ".original.mosaic_haplotypes.fa", ignored);
+}
+struct DosageStageScope {   // S1-D.1: marks the body run as followed by the dosage stage, and always resets it
+    DosageStageScope() { g_dosage_stage_follows = true; }
+    ~DosageStageScope() { g_dosage_stage_follows = false; }
+};
+}  // namespace
+
 // The per-sample command after resolution -- genotype, dosage, locus table -- shared by the ordinary command and the
 // prepared-locus route (I3-A).
-int execute_genotype_command(const GenotypeCommandOptions& options, const PreparedLocus* locus) {
+int execute_genotype_command(const GenotypeCommandOptions& requested, const PreparedLocus* locus) {
     // The dosage stage and the locus table run after every existing output is committed (sections 20 and 22).
-    // S1-D: API callers too -- refused before the run touches its prefix (the CLI refuses at argument resolution)
-    if (options.output_schema == "sequence_first_v2" && options.dosage_mode == "repair") {
-        std::cerr << "[genotype] --dosage-mode repair is refused under output_schema sequence_first_v2: dosage is "
-                     "diagnostic there; reproduce historical repair results with the legacy contract\n";
+    // S1-D.1: the dosage contract is resolved here as at argument resolution, so a direct API caller and the
+    // prepared-locus route get the CLI's defaults; a refused repair returns before the run touches its prefix.
+    GenotypeCommandOptions options = requested;
+    if (const std::optional<std::string> refused = resolve_dosage_contract(options)) {
+        std::cerr << "[genotype] " << *refused << '\n';
         return 2;
     }
+    const bool v2_fasta_policy = options.output_schema == "sequence_first_v2";
     const std::string& mode = options.dosage_mode;
     GenotypeDosageCapture capture;
-    const GenotypeRunStatus status = run_genotype_body(options, &capture, locus);
+    GenotypeRunStatus status;
+    {
+        const DosageStageScope scope;
+        status = run_genotype_body(options, &capture, locus);
+    }
     const bool called = status == GenotypeRunStatus::Complete || status == GenotypeRunStatus::ConditionalGenotypeEquivalent;
     const bool sequence_first = panvar::sequence_first(options);
     if (sequence_first && !g_sequence_published) {
@@ -6581,11 +6639,16 @@ int execute_genotype_command(const GenotypeCommandOptions& options, const Prepar
             filters.switch_probability = options.switch_probability;
             filters.representation_guard = options.representation_guard;
         }
-        const dosage::DosageIntegration integration =
+        dosage::DosageIntegration integration =
             dosage::apply_dosage_mode(model, mode, options.out_prefix, options.out_prefix,
                                       audit_status == "COMPLETE" ? &summary : nullptr, audit_status, audit_note,
                                       library ? &filters : nullptr);
+        if (v2_fasta_policy) {   // S1-D.1: the audit has read the legacy FASTA; the locus table links what stays
+            suppress_empty_dosage_fasta(options.out_prefix);
+            integration.fasta_policy = "sequence_first_v2";
+        }
         dosage::write_locus_genotype(model, options.out_prefix, integration);
+        if (v2_fasta_policy) suppress_legacy_fasta(options.out_prefix);
         if (options.library_diagnostic && model && options.library_path != "auto") {   // auto writes its own table
             std::optional<double> ignored;
             const LibraryModel declared = read_library(options.library_path, ignored);
@@ -6599,6 +6662,10 @@ int execute_genotype_command(const GenotypeCommandOptions& options, const Prepar
         }
     } catch (const std::exception& error) {
         std::cerr << "[genotype] locus output failed: " << error.what() << '\n';
+        if (v2_fasta_policy) {   // S1-D.1: the policy holds on failure too
+            suppress_empty_dosage_fasta(options.out_prefix);
+            suppress_legacy_fasta(options.out_prefix);
+        }
         return 2;
     }
     if (sequence_first) return sequence_report_exit_code(g_sequence_report);   // S1-B: 0 / 3 / 1

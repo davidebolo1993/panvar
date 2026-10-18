@@ -166,7 +166,69 @@ void test_v2_dosage_contract() {
             "sequence_first_v1 still accepts repair (its meaning is unchanged)");
     require(parse({"--output-schema", "sequence_first_v1"}, &kept).error.empty() && kept.dosage_mode == "off",
             "sequence_first_v1 keeps the built-in dosage default");
-    std::cout << "  sequence_first_v2 dosage contract: audit by default, explicit off kept, repair refused only under v2\n";
+    // S1-D.1: provenance names the setting actually used, and --dosage-audit is a declaration too
+    require(parse({"--output-schema", "sequence_first_v2"}, &kept).error.empty() &&
+                kept.dosage_mode_source == "contract_default_sequence_first_v2",
+            "v2 default: source contract_default_sequence_first_v2");
+    require(parse({"--output-schema", "sequence_first_v2", "--dosage-mode", "off"}, &kept).error.empty() &&
+                kept.dosage_mode_source == "flag --dosage-mode",
+            "v2 --dosage-mode off: source names the flag");
+    require(parse({"--output-schema", "sequence_first_v2", "--dosage-audit", "off"}, &kept).error.empty() &&
+                kept.dosage_mode == "off" && kept.dosage_mode_source == "flag --dosage-audit",
+            "v2 --dosage-audit off is a declared off (no longer overridden to audit)");
+    require(parse({"--dosage-audit", "shadow"}, &kept).error.empty() && kept.dosage_mode == "audit",
+            "legacy --dosage-audit shadow is still audit");
+    require(parse({}, &kept).error.empty() && kept.dosage_mode == "off" && kept.dosage_mode_source == "default",
+            "legacy default: off, source default");
+    // S1-D.1: the shared resolver, as the direct command API and the prepared route apply it
+    {
+        panvar::GenotypeCommandOptions o;   // dosage fields as constructed (Sol's reproducer)
+        o.output_schema = "sequence_first_v2";
+        require(!panvar::resolve_dosage_contract(o) && o.dosage_mode == "audit" &&
+                    o.dosage_mode_source == "contract_default_sequence_first_v2",
+                "API: v2 with untouched dosage fields resolves to audit");
+        require(!panvar::resolve_dosage_contract(o) && o.dosage_mode == "audit" &&
+                    o.dosage_mode_source == "contract_default_sequence_first_v2" && !o.dosage_mode_explicit,
+                "API: resolution is idempotent");
+    }
+    {
+        panvar::GenotypeCommandOptions o;
+        o.output_schema = "sequence_first_v2";
+        o.dosage_mode_explicit = true;
+        require(!panvar::resolve_dosage_contract(o) && o.dosage_mode == "off" && o.dosage_mode_source == "caller_options",
+                "API: v2 declared off stays off");
+    }
+    for (const bool flagged : {true, false}) {
+        panvar::GenotypeCommandOptions o;
+        o.output_schema = "sequence_first_v2";
+        o.dosage_mode = "repair";
+        o.dosage_mode_explicit = flagged;
+        const std::optional<std::string> refused = panvar::resolve_dosage_contract(o);
+        require(refused && refused->find("legacy contract") != std::string::npos,
+                std::string("API: v2 repair is refused (") + (flagged ? "declared" : "set by value") + ")");
+    }
+    {
+        panvar::GenotypeCommandOptions o;
+        o.output_schema = "sequence_first_v2";
+        o.dosage_mode = "audit";
+        require(!panvar::resolve_dosage_contract(o) && o.dosage_mode == "audit" && o.dosage_mode_source == "caller_options",
+                "API: v2 audit set by value is a declaration");
+    }
+    for (const std::string schema : {"legacy", "sequence_first_v1"}) {
+        panvar::GenotypeCommandOptions o;
+        o.output_schema = schema;
+        require(!panvar::resolve_dosage_contract(o) && o.dosage_mode == "off" && o.dosage_mode_source == "default",
+                "API: " + schema + " keeps the built-in default");
+        o.dosage_mode = "repair";
+        require(!panvar::resolve_dosage_contract(o) && o.dosage_mode == "repair", "API: " + schema + " accepts repair");
+    }
+    {
+        panvar::GenotypeCommandOptions o;
+        o.dosage_mode = "bogus";
+        require(panvar::resolve_dosage_contract(o).has_value(), "API: an unknown dosage mode is refused");
+    }
+    std::cout << "  sequence_first_v2 dosage contract: audit by default, explicit off kept, repair refused only under v2; "
+                 "one resolver for CLI and API (provenance, idempotence, declared by value)\n";
 }
 
 void test_repair_option_order() {

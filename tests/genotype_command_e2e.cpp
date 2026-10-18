@@ -4337,6 +4337,201 @@ void test_sequence_first_v2() {
               << " pair here); audit leaves prediction and hashes unchanged; repair refused only under v2; prepared route identical\n";
 }
 
+// ---- S1-D.1: the v2 output contract across the whole prefix, and one dosage contract at every command entry --------
+namespace s1d1 {
+// Every FASTA a run left under its prefix (any file of the prefix's directory named <base>.*.fa or <base>.*.fasta).
+std::set<std::string> fasta_inventory(const std::string& dir) {
+    std::set<std::string> out;
+    for (const std::string& f : sf::files(dir)) {
+        const bool fa = f.size() > 3 && (f.compare(f.size() - 3, 3, ".fa") == 0 ||
+                                         (f.size() > 6 && f.compare(f.size() - 6, 6, ".fasta") == 0));
+        if (fa && f.rfind("call.", 0) == 0) out.insert(f);
+    }
+    return out;
+}
+// Every reference an output makes to a prefix file (call.<suffix>.tsv|.fa, also inside absolute paths and before a
+// '#fragment') names a file that exists: nothing points to a suppressed or removed output.
+std::vector<std::string> dangling_references(const std::string& dir) {
+    // (a staging name in an error message, <file>.writing, is not a reference to an output)
+    static const std::regex ref(R"(call\.[A-Za-z0-9_.]+?\.(tsv|fa|fasta)\b(?!\.writing))");
+    std::vector<std::string> out;
+    for (const std::string& f : sf::files(dir)) {
+        if (f.rfind("call.", 0) != 0) continue;
+        const std::string text = slurp(dir + "/" + f);
+        for (auto it = std::sregex_iterator(text.begin(), text.end(), ref); it != std::sregex_iterator(); ++it) {
+            const std::string name = it->str();
+            if (!std::filesystem::exists(dir + "/" + name)) out.push_back(f + " -> " + name);
+        }
+    }
+    return out;
+}
+std::map<std::string, std::string> locus_row(const std::string& file) {
+    std::istringstream in(slurp(file));
+    std::string head, row;
+    std::getline(in, head);
+    std::getline(in, row);
+    std::vector<std::string> cols, cells;
+    std::istringstream h(head), r(row);
+    for (std::string c; std::getline(h, c, '\t');) cols.push_back(c);
+    for (std::string c; std::getline(r, c, '\t');) cells.push_back(c);
+    std::map<std::string, std::string> out;
+    for (std::size_t k = 0; k < cols.size() && k < cells.size(); ++k) out[cols[k]] = cells[k];
+    return out;
+}
+}  // namespace s1d1
+
+// (1) Direct API, default-constructed dosage fields (Sol's S1-D review reproducer): audit runs, and its artefacts
+//     exist. (2) Declared off: not run, no audit artefacts. (3) Repair -- declared, or set by value -- is refused with
+//     exit 2 before the prefix is touched (a sentinel file survives). (4) The prepared-locus command route agrees with
+//     (1)-(3). (5) A caller-only API run (no dosage stage) says so. (6) The FASTA inventory is the policy's: v2 = the
+//     sequence FASTA only for an off-panel pair, nothing else; legacy and v1 keep their FASTA unchanged. (7) No output
+//     references a missing prefix file.
+void test_sequence_first_v2_contract() {
+    namespace fs = std::filesystem;
+    const auto fresh = [&](const std::string& rel, const std::string& schema) {
+        fs::remove_all(path(rel));
+        fs::create_directories(path(rel));
+        panvar::GenotypeCommandOptions o =
+            repair_options(rel + "/call", path("phaseable_r1.fq"), path("phaseable_r2.fq"), "tiny_phaseable.gfa");
+        o.output_schema = schema;   // dosage_mode / dosage_mode_explicit / dosage_mode_source left as constructed
+        return o;
+    };
+    const auto audit_ran = [&](const std::string& rel, const std::string& source, const std::string& what) {
+        const auto locus = sf::kv(path(rel + "/call.sequence_locus.tsv"));
+        require(locus.at("dosage_mode") == "audit" && locus.at("dosage_mode_source") == source,
+                what + ": recorded dosage_mode audit, source " + source + " (got " + locus.at("dosage_mode") + ", " +
+                    locus.at("dosage_mode_source") + ")");
+        require(exists(path(rel + "/call.dosage_status.tsv")) &&
+                    read_status(path(rel + "/call.dosage_status.tsv")).at("dosage_audit_status") == "COMPLETE" &&
+                    exists(path(rel + "/call.dosage_blocks.tsv")),
+                what + ": the audit ran (dosage_status COMPLETE, dosage_blocks written)");
+        const auto row = s1d1::locus_row(path(rel + "/call.locus_genotype.tsv"));
+        require(row.at("dosage_mode") == "audit" && row.at("dosage_audit_status") == "COMPLETE",
+                what + ": the locus table records the audit actually run");
+    };
+    const auto v2_inventory = [&](const std::string& rel, const std::string& what) {
+        const auto locus = sf::kv(path(rel + "/call.sequence_locus.tsv"));
+        const bool off_panel = locus.at("fasta_emitted") == "yes";
+        const std::set<std::string> want =
+            off_panel ? std::set<std::string>{"call.sequence_haplotypes.fa"} : std::set<std::string>{};
+        std::set<std::string> got = s1d1::fasta_inventory(path(rel));
+        for (auto it = got.begin(); it != got.end();) {   // a non-empty dosage FASTA is an audit diagnostic (kept)
+            const bool diagnostic = it->rfind("call.dosage_", 0) == 0 && fs::file_size(path(rel + "/" + *it)) > 0;
+            it = diagnostic ? got.erase(it) : std::next(it);
+        }
+        require(got == want, what + ": v2 FASTA inventory is the policy's (" + std::to_string(got.size()) + " files)");
+        const auto row = s1d1::locus_row(path(rel + "/call.locus_genotype.tsv"));
+        require(row.at("main_fasta") == (off_panel ? "call.sequence_haplotypes.fa" : "NA") && row.at("original_fasta") == "NA" &&
+                    row.at("hap1_id") == "NA" && row.at("hap2_id") == "NA",
+                what + ": the locus table links only the authoritative FASTA");
+        const auto dangling = s1d1::dangling_references(path(rel));
+        require(dangling.empty(), what + ": no dangling output reference" + (dangling.empty() ? "" : " (" + dangling.front() + ")"));
+    };
+    // (1) direct API, dosage untouched
+    const panvar::GenotypeCommandOptions api = fresh("sf21_api", "sequence_first_v2");
+    require(api.dosage_mode == "off" && !api.dosage_mode_explicit, "the reproducer's options: dosage fields as constructed");
+    require(panvar::execute_genotype_command(api, nullptr) == 0, "v2 API default: predicts");
+    audit_ran("sf21_api", "contract_default_sequence_first_v2", "v2 API default");
+    v2_inventory("sf21_api", "v2 API default");
+    // (2) declared off
+    {
+        panvar::GenotypeCommandOptions off = fresh("sf21_off", "sequence_first_v2");
+        off.dosage_mode_explicit = true;
+        require(panvar::execute_genotype_command(off, nullptr) == 0, "v2 API off: predicts");
+        const auto locus = sf::kv(path("sf21_off/call.sequence_locus.tsv"));
+        require(locus.at("dosage_mode") == "off" && locus.at("dosage_mode_source") == "caller_options" &&
+                    !exists(path("sf21_off/call.dosage_status.tsv")) && !exists(path("sf21_off/call.dosage_blocks.tsv")) &&
+                    s1d1::locus_row(path("sf21_off/call.locus_genotype.tsv")).at("dosage_mode") == "off",
+                "v2 API declared off: off recorded and no audit artefact");
+        v2_inventory("sf21_off", "v2 API off");
+    }
+    // (3) repair refused early, declared or by value; the prefix is untouched
+    const auto refused_untouched = [&](panvar::GenotypeCommandOptions o, const panvar::PreparedLocus* locus, const std::string& what) {
+        const std::string sentinel = o.out_prefix + ".mosaic_status.tsv";
+        { std::ofstream(sentinel) << "sentinel\n"; }
+        require(panvar::execute_genotype_command(o, locus) == 2, what + ": exit 2");
+        require(slurp(sentinel) == "sentinel\n" && sf::files(fs::path(sentinel).parent_path().string()).size() == 1,
+                what + ": refused before the prefix was touched");
+    };
+    {
+        panvar::GenotypeCommandOptions rep = fresh("sf21_repair_declared", "sequence_first_v2");
+        rep.dosage_mode = "repair";
+        rep.dosage_mode_explicit = true;
+        refused_untouched(rep, nullptr, "v2 API declared repair");
+        panvar::GenotypeCommandOptions by_value = fresh("sf21_repair_value", "sequence_first_v2");
+        by_value.dosage_mode = "repair";   // not flagged explicit: still a declaration, never silently audit
+        refused_untouched(by_value, nullptr, "v2 API repair by value");
+    }
+    // (4) the prepared-locus command route
+    {
+        const panvar::GenotypeCommandOptions route = fresh("sf21_prepared", "sequence_first_v2");
+        const std::shared_ptr<const panvar::PreparedLocus> prepared = panvar::prepare_genotype_locus(route);
+        require(panvar::execute_genotype_command(route, prepared.get()) == 0, "v2 prepared default: predicts");
+        audit_ran("sf21_prepared", "contract_default_sequence_first_v2", "v2 prepared default");
+        v2_inventory("sf21_prepared", "v2 prepared default");
+        for (const char* f : {"call.sequence_haplotypes.tsv", "call.sequence_locus.tsv", "call.sequence_blocks.tsv",
+                              "call.dosage_blocks.tsv", "call.locus_genotype.tsv"}) {
+            require(sf::normalised(path("sf21_api/") + f, path("sf21_api")) == sf::normalised(path("sf21_prepared/") + f, path("sf21_prepared")),
+                    std::string("v2 prepared default: ") + f + " identical to the direct API route");
+        }
+        require(s1d1::fasta_inventory(path("sf21_api")) == s1d1::fasta_inventory(path("sf21_prepared")),
+                "v2 prepared default: the same FASTA inventory");
+        panvar::GenotypeCommandOptions rep = fresh("sf21_prepared_repair", "sequence_first_v2");
+        rep.dosage_mode = "repair";
+        rep.dosage_mode_explicit = true;
+        refused_untouched(rep, prepared.get(), "v2 prepared repair");
+    }
+    // (5) a caller-only API run has no dosage stage, and its v2 report says so
+    {
+        const panvar::GenotypeCommandOptions only = fresh("sf21_caller_only", "sequence_first_v2");
+        (void)panvar::run_genotype(only);
+        const auto locus = sf::kv(path("sf21_caller_only/call.sequence_locus.tsv"));
+        require(locus.at("dosage_mode") == "not_run" && locus.at("dosage_mode_source") == "caller_only_api_without_dosage_stage" &&
+                    !exists(path("sf21_caller_only/call.dosage_status.tsv")),
+                "caller-only API: the report names no dosage mode it did not run");
+    }
+    // (6) legacy and v1 keep their FASTA exactly (non-regression), and their links
+    for (const std::string schema : {"legacy", "sequence_first_v1"}) {
+        const std::string rel = "sf21_" + schema;
+        panvar::GenotypeCommandOptions o = fresh(rel, schema);
+        o.dosage_mode = "audit";
+        o.dosage_mode_explicit = true;
+        require(panvar::execute_genotype_command(o, nullptr) == 0, schema + ": calls");
+        std::set<std::string> want = {"call.mosaic_haplotypes.fa", "call.dosage_original.fa", "call.dosage_repaired.fa",
+                                      "call.dosage_repaired_block_alleles.fa"};
+        if (schema == "sequence_first_v1") want.insert("call.sequence_haplotypes.fa");
+        require(s1d1::fasta_inventory(path(rel)) == want, schema + ": FASTA inventory unchanged (legacy FASTA and every dosage FASTA kept)");
+        const auto row = s1d1::locus_row(path(rel + "/call.locus_genotype.tsv"));
+        require(row.at("main_fasta") == "call.mosaic_haplotypes.fa" && row.at("hap1_id") != "NA",
+                schema + ": the locus table links the legacy FASTA as before");
+        require(s1d1::dangling_references(path(rel)).empty(), schema + ": no dangling output reference");
+        require(slurp(path("sf21_api/call.mosaic_scores.tsv")).empty() == false &&
+                    sf::normalised(path("sf21_api/call.mosaic_scores.tsv"), path("sf21_api")) ==
+                        sf::normalised(path(rel + "/call.mosaic_scores.tsv"), path(rel)),
+                schema + " vs v2: the caller's scores are identical");
+    }
+    // (8) prefix reuse: an off-panel prediction (FASTA written), then a v2 publication failure at the same prefix: exit
+    //     2 as before, no FASTA of any kind is left, and nothing references a missing file
+    {
+        const panvar::GenotypeCommandOptions first = fresh("sf21_failure", "sequence_first_v2");
+        require(panvar::execute_genotype_command(first, nullptr) == 0 &&
+                    s1d1::fasta_inventory(path("sf21_failure")) == std::set<std::string>{"call.sequence_haplotypes.fa"},
+                "v2 prefix reuse: the off-panel prediction writes its FASTA");
+        fs::create_directories(path("sf21_failure/call.sequence_alternatives.tsv.writing/blocker"));
+        const int code = panvar::execute_genotype_command(first, nullptr);
+        require(code == 2 && read_status(path("sf21_failure/call.mosaic_status.tsv")).at("sequence_publication") == "FAILED",
+                "v2 publication failure: exit 2 and the status names the failure");
+        require(s1d1::fasta_inventory(path("sf21_failure")).empty(), "v2 publication failure: no FASTA is left");
+        const auto row = s1d1::locus_row(path("sf21_failure/call.locus_genotype.tsv"));
+        require(row.at("main_fasta") == "NA", "v2 publication failure: the locus table links no FASTA");
+        require(s1d1::dangling_references(path("sf21_failure")).empty(), "v2 publication failure: no dangling reference");
+        fs::remove_all(path("sf21_failure/call.sequence_alternatives.tsv.writing"));   // the test's own blocker
+    }
+    std::cout << "  sequence_first_v2 contract: API/prepared default audit (artefacts present), declared off, repair "
+                 "refused before the prefix; caller-only API says not_run; v2 FASTA inventory = policy, no dangling "
+                 "reference (also after a publication failure on a reused prefix); legacy/v1 FASTA unchanged\n";
+}
+
 int main(int argc, char** argv) {
     if (argc < 2) {
         std::cerr << "usage: genotype_command_e2e_test <scratch dir> [source dir]\n";
@@ -4355,6 +4550,37 @@ int main(int argc, char** argv) {
             return 0;
         } catch (const std::exception& error) {
             std::cerr << "genotype command e2e (prepared_locus only): FAIL: " << error.what() << '\n';
+            return 1;
+        }
+    }
+    // S1-D.1: a focused run of the sequence-first gates (their fixtures written here exactly as the full run writes them)
+    if (const char* only = std::getenv("PANVAR_E2E_ONLY"); only != nullptr && std::string(only) == "sequence_first") {
+        try {
+            std::filesystem::create_directories(dir);
+            write_library(path("lib.txt"));
+            {
+                const TinyLocus locus = write_tiny_locus("tiny_phaseable.gfa", 80, 70);
+                const auto truths = spell_truths(locus);
+                simulate(truths.first, truths.second, path("phaseable_r1.fq"), path("phaseable_r2.fq"), 123);
+            }
+            {
+                const TinyLocus locus = write_tiny_locus();
+                const auto truths = spell_truths(locus);
+                simulate(truths.first, truths.second, path("unphaseable_r1.fq"), path("unphaseable_r2.fq"), 123);
+            }
+            {   // test_prepared_locus's sample A
+                const TinyLocus locus = write_tiny_locus("prep_locus.gfa", 80, 70);
+                const auto truths = spell_truths(locus);
+                simulate(truths.first, truths.second, path("prep_A_r1.fq"), path("prep_A_r2.fq"), 123);
+            }
+            test_sequence_first_schema();
+            test_sequence_first_lifecycle();
+            test_sequence_first_v2();
+            test_sequence_first_v2_contract();
+            std::cout << "genotype command e2e (sequence_first only): PASS\n";
+            return 0;
+        } catch (const std::exception& error) {
+            std::cerr << "genotype command e2e (sequence_first only): FAIL: " << error.what() << '\n';
             return 1;
         }
     }
@@ -4398,6 +4624,7 @@ int main(int argc, char** argv) {
         test_sequence_first_schema();
         test_sequence_first_lifecycle();
         test_sequence_first_v2();
+        test_sequence_first_v2_contract();
         if (argc >= 3) test_profile(argv[2]);
         test_block_quality_columns();
         std::cout << "genotype command end-to-end: PASS\n";

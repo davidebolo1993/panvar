@@ -43,6 +43,10 @@ struct DosageIntegration {
     // basis of the reported filters: caller, recomputed_for_reported_genotype, or not_evaluated_after_dosage_repair
     std::string filter_basis = "caller";
     std::string filter_note = "none";
+    // S1-D.1: the output schema's FASTA policy for the locus table's links. "legacy" (the default) links the caller's
+    // FASTA; "sequence_first_v2" (whose command removes the legacy FASTA after this table is written) links the
+    // sequence report's FASTA when it was written, NA otherwise, and names no record of the suppressed FASTA.
+    std::string fasta_policy = "legacy";
 };
 
 // What re-annotating a reported repaired genotype needs (section 23): the reads, the library and its declared marker

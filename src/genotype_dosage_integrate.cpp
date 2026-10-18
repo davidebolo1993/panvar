@@ -835,7 +835,8 @@ void write_locus_genotype(const PreparedGenotypeModel* model, const std::string&
         const std::vector<FastaRecord> fa = read_fasta(out_prefix + ".mosaic_haplotypes.fa");
         for (std::size_t h = 0; h < 2 && h < fa.size(); ++h) {
             const std::string hap = h == 0 ? "hap1" : "hap2";
-            v[hap + "_id"] = split(fa[h].header, ' ').front();
+            // S1-D.1: a record of a FASTA the v2 policy suppresses is never named
+            v[hap + "_id"] = d.fasta_policy == "sequence_first_v2" ? std::string("NA") : split(fa[h].header, ' ').front();
             v[hap + "_sha256"] = sha256_bytes(fa[h].sequence);
             v[hap + "_bp"] = std::to_string(fa[h].sequence.size());
         }
@@ -896,8 +897,13 @@ void write_locus_genotype(const PreparedGenotypeModel* model, const std::string&
     }
     v["block_table"] = link(".block_genotypes.tsv");
     v["genotypes_table"] = link(".genotypes.tsv");
-    v["main_fasta"] = strict ? link(".mosaic_haplotypes.fa") : "NA";
-    v["original_fasta"] = strict ? link(".original.mosaic_haplotypes.fa") : "NA";
+    if (d.fasta_policy == "sequence_first_v2") {   // S1-D.1: the sequence report's FASTA is the only prediction FASTA
+        v["main_fasta"] = link(".sequence_haplotypes.fa");
+        v["original_fasta"] = "NA";
+    } else {
+        v["main_fasta"] = strict ? link(".mosaic_haplotypes.fa") : "NA";
+        v["original_fasta"] = strict ? link(".original.mosaic_haplotypes.fa") : "NA";
+    }
     v["original_block_table"] = link(".original.block_genotypes.tsv");
     v["dosage_blocks_table"] = link(".dosage_blocks.tsv");
     v["dosage_representative_fasta"] = link(".dosage_repaired.fa");

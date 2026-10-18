@@ -476,7 +476,9 @@ void write_sequence_report(const SequenceReport& r, const SequenceLegacy& legacy
         };
         locus << "fasta_emitted\t" << (fasta_decision.first ? "yes" : "no") << "\nfasta_reason\t" << fasta_decision.second
               << "\nfasta_policy\tsequence_first_v2:FASTA_only_when_a_predicted_haplotype_is_not_spelled_by_an_active_panel_"
-                 "template;panel_haplotypes_are_reported_by_extraction_reference\nhap1_origin\t"
+                 "template;panel_haplotypes_are_reported_by_extraction_reference\n"
+                 "legacy_fasta\tsuppressed_under_sequence_first_v2:no_mosaic_haplotypes.fa_and_no_empty_dosage_FASTA;"
+                 "a_non_empty_dosage_FASTA_is_an_audit_diagnostic_linked_from_locus_genotype.tsv\nhap1_origin\t"
               << origin(0) << "\nhap1_panel_paths\t" << paths(0) << "\nhap2_origin\t" << origin(1)
               << "\nhap2_panel_paths\t" << paths(1)
               << "\npanel_membership_rule\texact_sequence_identity_in_the_locus_frame_against_the_active_curated_panel;"
