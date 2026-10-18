@@ -72,8 +72,19 @@ struct SequenceAlternative {
     std::vector<std::size_t> blocks_with_other_genotypes;   // vs the representative group, over explored labellings
 };
 
+// S1-D (sequence_first_v2): a predicted haplotype's membership in the ACTIVE (curated) panel, by exact sequence identity
+// in the locus frame. A panel haplotype is identified by every active template that spells it (sequence-equivalent
+// aliases share the match), each with the orientation of its source path relative to the locus chain.
+struct HaplotypeOrigin {
+    bool evaluated = false;
+    bool panel = false;
+    std::vector<std::string> paths;          // sorted template names spelling exactly this sequence
+    std::vector<std::string> orientations;   // per path: forward | reverse_complement (source path vs locus chain)
+};
+
 struct SequenceReport {
     bool built = false;
+    std::string schema = "sequence_first_v1";   // sequence_first_v1 | sequence_first_v2 (S1-D)
     std::string prediction = "NO_PREDICTION";   // PREDICTION | PROVISIONAL | NO_PREDICTION
     // RESOLVED | GENOTYPE_RESOLVED_SEQUENCE_SET | SEQUENCE_TIED (PREDICTION); NOT_DETERMINED (PROVISIONAL); NA
     std::string sequence_status = "NA";
@@ -99,7 +110,19 @@ struct SequenceReport {
     std::vector<SequenceAlternative> alternatives;
     bool publication_failed = false;   // S1-C: writing the report failed; nothing partial is left
     std::string publication_error;
+    // S1-D (sequence_first_v2 only)
+    HaplotypeOrigin origin[2];                  // hap1, hap2
+    std::string graph_sha256 = "NA", model_fingerprint = "NA";
 };
+
+// S1-D: classifies hap1/hap2 against the active panel (template names, their spelled locus-frame sequences, and
+// whether each source path runs opposite to the locus chain). Lookup by SHA-256, membership by exact string equality.
+void annotate_panel_membership(SequenceReport& report, const std::vector<std::string>& template_names,
+                               const std::vector<std::string>& template_sequences,
+                               const std::vector<bool>& template_reverse);
+// S1-D: whether sequence_first_v2 writes the FASTA, and why: OFF_PANEL_PAIR (written), PANEL_REPRESENTED_PAIR or
+// NO_PREDICTION (not written). sequence_first_v1 always writes it for a prediction.
+std::pair<bool, std::string> sequence_fasta_decision(const SequenceReport& report);
 
 // Spells one haplotype from its allele labels (the caller's own spelling function).
 using HaplotypeSpeller = std::function<std::string(const std::vector<std::size_t>&)>;
@@ -126,6 +149,7 @@ SequenceReport provisional_sequence_report(const std::vector<std::size_t>& first
 struct SequenceLegacy {
     std::string run_status = "NA", call_class = "NA", no_call_reason = "NA";
     std::string dosage_mode = "NA";   // the run's --dosage-mode (the report is the caller decision BEFORE that stage)
+    std::string dosage_mode_source = "NA";   // S1-D: flag | contract default (sequence_first_v2)
 };
 void write_sequence_report(const SequenceReport& report, const SequenceLegacy& legacy, const std::string& prefix,
                            const std::string& no_prediction_reason);

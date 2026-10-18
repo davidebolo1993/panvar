@@ -193,6 +193,8 @@ struct GenotypeCommandOptions {
     // status rows and its exit semantics (0 PREDICTION, 3 PROVISIONAL, 1 NO_PREDICTION); every legacy output is unchanged.
     // It needs the adaptive repair (the pooled decision); other routes are refused.
     std::string output_schema = "legacy";
+    // S1-D: true when --dosage-mode was given. sequence_first_v2 defaults dosage to audit when it was not, refuses repair.
+    bool dosage_mode_explicit = false;
     // I2-B (EXPERIMENTAL, profile keys only, never public settings): how the adaptive search's window enumeration builds
     // its placement rows. "reference" (the default) scans each enumerated window whole, unchanged. "fine_experimental"
     // builds the same rows from a round-local, per-worker fine store (PreparedScoringContext::

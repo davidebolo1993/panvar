@@ -4205,6 +4205,112 @@ void test_sequence_first_lifecycle() {
                  "earlier report; a prepared refusal changes nothing; a failed publication leaves no prediction claim\n";
 }
 
+// ---- S1-D: output_schema sequence_first_v2 (panel references, membership FASTA rule, diagnostic dosage) -------------
+// (1) Membership on real caller output: every haplotype row's origin is PANEL exactly when an active panel template of
+//     the same model spells its sequence (independently spelled here from a prepared locus), and its listed paths are
+//     exactly those templates. (2) The dosage audit is diagnostic: audit and off give identical predictions, hashes,
+//     tables and caller outputs (only the recorded dosage mode differs). (3) Explicit repair is refused under v2 (exit 2,
+//     no outputs) and still runs under v1. (4) The prepared-locus route writes the same v2 outputs as the cold route.
+void test_sequence_first_v2() {
+    namespace fs = std::filesystem;
+    const auto options = [&](const std::string& rel, const std::string& dosage) {
+        fs::remove_all(path(rel));
+        fs::create_directories(path(rel));
+        panvar::GenotypeCommandOptions o =
+            repair_options(rel + "/call", path("phaseable_r1.fq"), path("phaseable_r2.fq"), "tiny_phaseable.gfa");
+        o.output_schema = "sequence_first_v2";
+        o.setting_sources["output_schema"] = "test";
+        o.dosage_mode = dosage;
+        o.dosage_mode_explicit = true;
+        return o;
+    };
+    const auto rows = [&](const std::string& file) {
+        std::vector<std::map<std::string, std::string>> out;
+        const auto table = read_rows(file);
+        std::istringstream in(slurp(file));
+        std::string head;
+        std::getline(in, head);
+        std::vector<std::string> cols;
+        std::istringstream h(head);
+        for (std::string c; std::getline(h, c, '\t');) cols.push_back(c);
+        for (std::string line; std::getline(in, line);) {
+            std::map<std::string, std::string> row;
+            std::istringstream l(line);
+            std::size_t k = 0;
+            for (std::string c; std::getline(l, c, '\t'); ++k) row[cols[k]] = c;
+            out.push_back(row);
+        }
+        return out;
+    };
+    // (1) membership, against the model's active panel spelled independently
+    const panvar::GenotypeCommandOptions audit = options("sf2_audit", "audit");
+    require(panvar::execute_genotype_command(audit, nullptr) == 0, "v2: the strict fixture predicts");
+    const std::shared_ptr<const panvar::PreparedLocus> prepared = panvar::prepare_genotype_locus(audit);
+    const panvar::PreparedGenotypeModel& model = prepared->model();
+    std::map<std::string, std::vector<std::string>> panel_by_sha;
+    for (std::size_t t = 0; t < model.panel().template_count(); ++t) {
+        panel_by_sha[panvar::sha256_bytes(panvar::spell_mosaic(model, panvar::MosaicPath{model.panel().template_alleles[t]}).bases)]
+            .push_back(model.panel().template_names[t]);
+    }
+    const auto haps = rows(path("sf2_audit/call.sequence_haplotypes.tsv"));
+    require(haps.size() == 2, "v2: two haplotype rows");
+    bool any_off = false;
+    for (const auto& h : haps) {
+        const auto found = panel_by_sha.find(h.at("sha256"));
+        std::vector<std::string> want = found == panel_by_sha.end() ? std::vector<std::string>{} : found->second;
+        std::sort(want.begin(), want.end());
+        std::string joined;
+        for (const auto& n : want) joined += (joined.empty() ? "" : ",") + n;
+        require(h.at("origin") == (want.empty() ? "OFF_PANEL" : "PANEL") && h.at("panel_paths") == (want.empty() ? "NA" : joined),
+                "v2: membership equals exact identity with the active panel (" + h.at("haplotype") + ")");
+        any_off = any_off || want.empty();
+    }
+    const auto locus = sf::kv(path("sf2_audit/call.sequence_locus.tsv"));
+    require(locus.at("fasta_emitted") == (any_off ? "yes" : "no") &&
+                exists(path("sf2_audit/call.sequence_haplotypes.fa")) == any_off &&
+                locus.at("fasta_reason") == (any_off ? "OFF_PANEL_PAIR" : "PANEL_REPRESENTED_PAIR") &&
+                locus.at("dosage_mode") == "audit",
+            "v2: the FASTA decision follows membership");
+    // (2) audit vs off: nothing but the recorded dosage mode changes
+    const panvar::GenotypeCommandOptions off = options("sf2_off", "off");
+    require(panvar::execute_genotype_command(off, nullptr) == 0, "v2 off: predicts");
+    for (const char* f : {"call.sequence_haplotypes.tsv", "call.sequence_blocks.tsv", "call.representation_intervals.tsv",
+                          "call.sequence_alternatives.tsv", "call.block_genotypes.tsv", "call.mosaic_scores.tsv",
+                          "call.mosaic_candidates.tsv", "call.equivalence_set.tsv"}) {
+        require(sf::normalised(path("sf2_audit/") + f, path("sf2_audit")) == sf::normalised(path("sf2_off/") + f, path("sf2_off")),
+                std::string("audit vs off: ") + f + " identical");
+    }
+    auto la = sf::kv(path("sf2_audit/call.sequence_locus.tsv")), lo = sf::kv(path("sf2_off/call.sequence_locus.tsv"));
+    require(la.at("dosage_mode") == "audit" && lo.at("dosage_mode") == "off", "audit vs off: recorded modes");
+    la.erase("dosage_mode");
+    lo.erase("dosage_mode");
+    require(la == lo, "audit vs off: the locus record is otherwise identical (prediction, hashes, origins)");
+    require(exists(path("sf2_audit/call.dosage_status.tsv")) &&
+                read_status(path("sf2_audit/call.dosage_status.tsv")).at("dosage_audit") == "shadow",
+            "audit: the dosage stage ran as an audit and wrote its own status");
+    // (3) repair refused under v2 only
+    {
+        panvar::GenotypeCommandOptions rep = options("sf2_repair", "repair");
+        require(panvar::execute_genotype_command(rep, nullptr) == 2 && !exists(path("sf2_repair/call.mosaic_status.tsv")),
+                "v2: explicit repair is refused before any output");
+        rep.output_schema = "sequence_first_v1";
+        require(panvar::execute_genotype_command(rep, nullptr) == 0, "v1: repair still runs");
+    }
+    // (4) the prepared-locus route
+    {
+        const panvar::GenotypeCommandOptions route = options("sf2_prepared", "audit");
+        require(panvar::execute_genotype_command(route, prepared.get()) == 0, "v2 prepared: predicts");
+        for (const char* f : {"call.sequence_haplotypes.tsv", "call.sequence_locus.tsv", "call.sequence_blocks.tsv",
+                              "call.representation_intervals.tsv", "call.sequence_alternatives.tsv"}) {
+            require(sf::normalised(path("sf2_audit/") + f, path("sf2_audit")) ==
+                        sf::normalised(path("sf2_prepared/") + f, path("sf2_prepared")),
+                    std::string("v2 prepared route: ") + f + " identical to the cold route");
+        }
+    }
+    std::cout << "  sequence_first_v2: membership = exact identity with the active panel (" << (any_off ? "off-panel" : "panel")
+              << " pair here); audit leaves prediction and hashes unchanged; repair refused only under v2; prepared route identical\n";
+}
+
 int main(int argc, char** argv) {
     if (argc < 2) {
         std::cerr << "usage: genotype_command_e2e_test <scratch dir> [source dir]\n";
@@ -4265,6 +4371,7 @@ int main(int argc, char** argv) {
         test_prepared_locus_index();
         test_sequence_first_schema();
         test_sequence_first_lifecycle();
+        test_sequence_first_v2();
         if (argc >= 3) test_profile(argv[2]);
         test_block_quality_columns();
         std::cout << "genotype command end-to-end: PASS\n";

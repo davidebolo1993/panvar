@@ -339,8 +339,49 @@ const std::vector<std::string>& sequence_report_outputs() {
     static const std::vector<std::string> suffixes = {
         ".sequence_locus.tsv", ".sequence_blocks.tsv", ".sequence_haplotypes.fa", ".representation_intervals.tsv",
         ".sequence_alternatives.tsv", ".sequence_locus.tsv.writing", ".sequence_blocks.tsv.writing",
-        ".sequence_haplotypes.fa.writing", ".representation_intervals.tsv.writing", ".sequence_alternatives.tsv.writing"};
+        ".sequence_haplotypes.fa.writing", ".representation_intervals.tsv.writing", ".sequence_alternatives.tsv.writing",
+        ".sequence_haplotypes.tsv", ".sequence_haplotypes.tsv.writing"};   // the last two: S1-D (sequence_first_v2)
     return suffixes;
+}
+
+void annotate_panel_membership(SequenceReport& r, const std::vector<std::string>& names,
+                               const std::vector<std::string>& sequences, const std::vector<bool>& reverse) {
+    if (names.size() != sequences.size() || names.size() != reverse.size()) {
+        throw std::invalid_argument("panel membership needs one sequence and one orientation per template");
+    }
+    std::map<std::string, std::vector<std::size_t>> by_hash;
+    for (std::size_t t = 0; t < sequences.size(); ++t) by_hash[sha256_bytes(sequences[t])].push_back(t);
+    const std::string* bases[2] = {&r.hap1_bases, &r.hap2_bases};
+    const std::string* hashes[2] = {&r.hap1_sha256, &r.hap2_sha256};
+    for (int h = 0; h < 2; ++h) {
+        HaplotypeOrigin o;
+        o.evaluated = true;
+        const auto found = by_hash.find(*hashes[h]);
+        std::vector<std::pair<std::string, std::string>> matches;
+        if (found != by_hash.end()) {
+            for (const std::size_t t : found->second) {
+                if (sequences[t] == *bases[h]) {   // exact verification, never the hash alone
+                    matches.push_back({names[t], reverse[t] ? "reverse_complement" : "forward"});
+                }
+            }
+        }
+        std::sort(matches.begin(), matches.end());
+        for (const auto& m : matches) {
+            o.paths.push_back(m.first);
+            o.orientations.push_back(m.second);
+        }
+        o.panel = !o.paths.empty();
+        r.origin[h] = std::move(o);
+    }
+}
+
+std::pair<bool, std::string> sequence_fasta_decision(const SequenceReport& r) {
+    const bool predicted = r.built && r.prediction != "NO_PREDICTION" && !r.publication_failed;
+    if (!predicted) return {false, "NO_PREDICTION"};
+    if (r.schema != "sequence_first_v2") return {true, "SEQUENCE_FIRST_V1_ALWAYS"};
+    const bool off = !r.origin[0].panel || !r.origin[1].panel;
+    return off ? std::make_pair(true, std::string("OFF_PANEL_PAIR"))
+               : std::make_pair(false, std::string("PANEL_REPRESENTED_PAIR"));
 }
 
 int sequence_report_exit_code(const SequenceReport& report) {
@@ -355,6 +396,10 @@ std::string sequence_report_status_keys(const SequenceReport& report) {
     out << "sequence_prediction\t" << report.prediction << "\nsequence_status\t" << report.sequence_status
         << "\nsequence_completion\t" << report.completion << "\nsequence_exit_code\t" << sequence_report_exit_code(report)
         << "\nsequence_publication\t" << (report.publication_failed ? "FAILED" : "complete") << '\n';
+    if (report.schema == "sequence_first_v2") {   // S1-D: intentional FASTA absence is never a publication failure
+        const auto [emitted, reason] = sequence_fasta_decision(report);
+        out << "sequence_fasta\t" << (emitted ? "emitted" : "not_emitted") << "\nsequence_fasta_reason\t" << reason << '\n';
+    }
     return out.str();
 }
 
@@ -374,7 +419,7 @@ void write_sequence_report(const SequenceReport& r, const SequenceLegacy& legacy
         intervals += (intervals.empty() ? "" : ",") + r.block_ids[i.first_block] + ".." + r.block_ids[i.last_block];
     }
     std::ostringstream locus;
-    locus << "key\tvalue\nschema_version\tsequence_first_v1\nprediction\t" << (predicted ? r.prediction : "NO_PREDICTION")
+    locus << "key\tvalue\nschema_version\t" << r.schema << "\nprediction\t" << (predicted ? r.prediction : "NO_PREDICTION")
           << "\nsequence_status\t" << (predicted ? r.sequence_status : "NA") << "\nprovisional\t"
           << (r.prediction == "PROVISIONAL" ? "yes" : "no") << "\ncompletion\t"
           << (predicted ? r.completion : legacy.run_status) << "\ncompletion_note\t"
@@ -418,6 +463,30 @@ void write_sequence_report(const SequenceReport& r, const SequenceLegacy& legacy
              "legacy_run_status\t"
           << legacy.run_status << "\nlegacy_call_class\t" << legacy.call_class << "\nlegacy_no_call_reason\t"
           << legacy.no_call_reason << "\nexit_code\t" << (predicted ? sequence_report_exit_code(r) : 1) << '\n';
+    const auto fasta_decision = sequence_fasta_decision(r);
+    if (r.schema == "sequence_first_v2") {
+        // S1-D: panel references, the FASTA decision and the diagnostic dosage contract
+        const auto origin = [&](int h) {
+            return !predicted ? std::string("NA") : r.origin[h].panel ? std::string("PANEL") : std::string("OFF_PANEL");
+        };
+        const auto paths = [&](int h) {
+            std::string out;
+            for (const std::string& p : r.origin[h].paths) out += (out.empty() ? "" : ",") + p;
+            return out.empty() ? std::string("NA") : out;
+        };
+        locus << "fasta_emitted\t" << (fasta_decision.first ? "yes" : "no") << "\nfasta_reason\t" << fasta_decision.second
+              << "\nfasta_policy\tsequence_first_v2:FASTA_only_when_a_predicted_haplotype_is_not_spelled_by_an_active_panel_"
+                 "template;panel_haplotypes_are_reported_by_extraction_reference\nhap1_origin\t"
+              << origin(0) << "\nhap1_panel_paths\t" << paths(0) << "\nhap2_origin\t" << origin(1)
+              << "\nhap2_panel_paths\t" << paths(1)
+              << "\npanel_membership_rule\texact_sequence_identity_in_the_locus_frame_against_the_active_curated_panel;"
+                 "SHA-256_lookup_with_byte_verification;no_truth_labels_or_similarity\ngraph_sha256\t"
+              << r.graph_sha256 << "\nmodel_fingerprint\t" << r.model_fingerprint
+              << "\nprepared_index_identity\tsee_status_prepared_locus_file_sha256_when_loaded\n"
+                 "dosage_contract\tdiagnostic_audit_only;never_modifies_this_prediction;see_dosage_status.tsv\n"
+                 "dosage_mode_source\t"
+              << legacy.dosage_mode_source << '\n';
+    }
     const std::string locus_text = locus.str();   // the commit record: published last (S1-C)
 
     std::ostringstream blocks;
@@ -470,8 +539,59 @@ void write_sequence_report(const SequenceReport& r, const SequenceLegacy& legacy
     }
     atomic_write(prefix + ".sequence_alternatives.tsv", alt.str());
 
+    if (r.schema == "sequence_first_v2") {
+        // S1-D: one row per predicted haplotype -- identity, origin, extraction reference, block-path provenance
+        std::ostringstream hap;
+        hap << "haplotype\tsha256\tlength_bp\torigin\tpanel_paths\tpath_orientations\textraction\tgraph_sha256\t"
+               "model_fingerprint\tblock_path\trepresentation_intervals\tprovisional\n";
+        if (predicted) {
+            const std::string* sha[2] = {&r.hap1_sha256, &r.hap2_sha256};
+            const std::string* bases[2] = {&r.hap1_bases, &r.hap2_bases};
+            const std::vector<std::size_t>* labels[2] = {&r.representative_first, &r.representative_second};
+            for (int h = 0; h < 2; ++h) {
+                const HaplotypeOrigin& o = r.origin[h];
+                std::string ps, os, ex;
+                for (std::size_t k = 0; k < o.paths.size(); ++k) {
+                    ps += (k ? "," : "") + o.paths[k];
+                    os += (k ? "," : "") + o.orientations[k];
+                }
+                if (o.panel) {
+                    ex = "gfa_path=" + o.paths.front() + ";interval=0-" + std::to_string(bases[h]->size()) +
+                         ";orientation=" + o.orientations.front() + ";whole_locus_path";
+                } else {
+                    ex = "not_extractable:off_panel_spelled_candidate_sequence(not_an_assembly);see_FASTA";
+                }
+                hap << "hap" << (h + 1) << '\t' << *sha[h] << '\t' << bases[h]->size() << '\t'
+                    << (o.panel ? "PANEL" : "OFF_PANEL") << '\t' << (ps.empty() ? "NA" : ps) << '\t'
+                    << (os.empty() ? "NA" : os) << '\t' << ex << '\t' << r.graph_sha256 << '\t' << r.model_fingerprint
+                    << '\t' << join(*labels[h]) << '\t' << (intervals.empty() ? "none" : intervals) << '\t'
+                    << (r.prediction == "PROVISIONAL" ? "yes" : "no") << '\n';
+            }
+        }
+        atomic_write(prefix + ".sequence_haplotypes.tsv", hap.str());
+    }
     std::string fasta;
-    if (predicted) {
+    if (fasta_decision.first && r.schema == "sequence_first_v2") {
+        const std::string base = basename_of(prefix);
+        std::ostringstream header;
+        header << "prediction=" << r.prediction << " sequence_status=" << r.sequence_status
+               << " representative_of_set=" << (r.decision_set_groups > 1 ? "yes" : "no")
+               << " provisional=" << (r.prediction == "PROVISIONAL" ? "yes" : "no")
+               << " representation_intervals=" << (intervals.empty() ? "none" : intervals)
+               << " phase=not_asserted structure_confidence=NA scope=caller_decision_before_dosage_stage"
+               << " fasta_reason=OFF_PANEL_PAIR spelled_candidate_not_assembly";
+        const std::string* sha[2] = {&r.hap1_sha256, &r.hap2_sha256};
+        const std::string* bases[2] = {&r.hap1_bases, &r.hap2_bases};
+        for (int h = 0; h < 2; ++h) {
+            const std::string origin = r.origin[h].panel ? "origin=PANEL panel_path=" + r.origin[h].paths.front()
+                                                         : std::string("origin=OFF_PANEL");
+            fasta += fasta_record(base + "_seq_hap" + std::to_string(h + 1), "sha256=" + *sha[h] + " bp=" +
+                                  std::to_string(bases[h]->size()) + " " + origin + " " + header.str(), *bases[h]);
+        }
+        atomic_write(prefix + ".sequence_haplotypes.fa", fasta);
+    } else if (r.schema == "sequence_first_v2") {
+        std::remove((prefix + ".sequence_haplotypes.fa").c_str());   // intentional absence (fasta_reason), not a failure
+    } else if (predicted) {
         const std::string base = basename_of(prefix);
         std::ostringstream header;
         header << "prediction=" << r.prediction << " sequence_status=" << r.sequence_status
@@ -502,6 +622,7 @@ bool publish_sequence_report(SequenceReport& r, const SequenceLegacy& legacy, co
         // Never leave a partial report: remove every owned file of this run, then record the failure (best effort).
         for (const std::string& suffix : sequence_report_outputs()) std::remove((prefix + suffix).c_str());
         SequenceReport failed;
+        failed.schema = r.schema;
         failed.publication_failed = true;
         failed.publication_error = error.what();
         failed.completion = "report_publication_failed";
@@ -509,7 +630,7 @@ bool publish_sequence_report(SequenceReport& r, const SequenceLegacy& legacy, co
         r = failed;
         try {
             atomic_write(prefix + ".sequence_locus.tsv",
-                         "key\tvalue\nschema_version\tsequence_first_v1\nprediction\tNO_PREDICTION\nsequence_status\tNA\n"
+                         "key\tvalue\nschema_version\t" + failed.schema + "\nprediction\tNO_PREDICTION\nsequence_status\tNA\n"
                          "completion\treport_publication_failed\ncompletion_note\t" + std::string(error.what()) +
                          "\nlegacy_run_status\t" + legacy.run_status + "\nlegacy_call_class\t" + legacy.call_class +
                          "\nlegacy_no_call_reason\t" + legacy.no_call_reason + "\nexit_code\t2\n");

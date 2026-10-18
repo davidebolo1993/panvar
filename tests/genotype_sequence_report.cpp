@@ -396,6 +396,145 @@ void test_publication_failure(const std::string& dir) {
                  "retry publishes completely (locus record last)\n";
 }
 
+// ---- S1-D: active-panel membership, panel references and the sequence_first_v2 FASTA rule ---------------------------
+// Toy locus ctx C | sv {T, A} | ctx GG | sv {T, C, G} | ctx A. Panel templates are given as (name, labels, reverse);
+// their sequences are spelled exactly as the caller spells them. Membership is exact sequence identity only.
+struct PanelToy {
+    Toy toy{{{"C"}, {"T", "A"}, {"GG"}, {"T", "C", "G"}, {"A"}}, {"ctx:0", "sv:1", "ctx:2", "sv:3", "ctx:4"}};
+    std::vector<std::string> names, sequences;
+    std::vector<bool> reverse;
+    void add(const std::string& name, const std::vector<std::size_t>& labels, bool rev = false) {
+        names.push_back(name);
+        sequences.push_back(toy.spell(labels));
+        reverse.push_back(rev);
+    }
+};
+
+SequenceReport v2_report(const PanelToy& p, const std::vector<std::size_t>& a, const std::vector<std::size_t>& b) {
+    const PooledDecision d = decide_pooled_genotype({candidate(p.toy, a, b, -3.0)}, 5, 10, 6);
+    SequenceReport r = build_sequence_report(d, p.toy.ids, [&](const auto& l) { return p.toy.spell(l); });
+    r.schema = "sequence_first_v2";
+    annotate_panel_membership(r, p.names, p.sequences, p.reverse);
+    return r;
+}
+
+void test_panel_membership(const std::string& dir) {
+    const std::vector<std::size_t> A{0, 0, 0, 0, 0}, B{0, 1, 0, 1, 0}, C{0, 1, 0, 2, 0}, X{0, 0, 0, 2, 0};
+    PanelToy p;
+    p.add("S1#1#c", A);
+    p.add("S2#1#c", B);
+    p.add("S2#2#c", B);          // a sequence-equivalent alias of S2#1#c
+    p.add("S3#1#c", C, true);    // a template whose source path runs opposite to the locus chain
+    // two panel haplotypes
+    SequenceReport r = v2_report(p, A, B);
+    require(r.origin[0].panel && r.origin[1].panel, "membership: two panel haplotypes");
+    require(sequence_fasta_decision(r) == std::make_pair(false, std::string("PANEL_REPRESENTED_PAIR")),
+            "membership: a panel-represented pair writes no FASTA");
+    const HaplotypeOrigin& alias = r.origin[r.hap1_bases == p.toy.spell(B) ? 0 : 1];
+    require(alias.paths == std::vector<std::string>{"S2#1#c", "S2#2#c"}, "aliases: every equivalent template is listed");
+    // homozygous panel pair
+    r = v2_report(p, A, A);
+    require(r.origin[0].panel && r.origin[1].panel && !sequence_fasta_decision(r).first, "homozygous panel pair");
+    // one panel, one off-panel
+    r = v2_report(p, A, X);
+    require(r.origin[r.hap1_bases == p.toy.spell(X) ? 0 : 1].panel == false &&
+                r.origin[r.hap1_bases == p.toy.spell(A) ? 0 : 1].panel &&
+                sequence_fasta_decision(r) == std::make_pair(true, std::string("OFF_PANEL_PAIR")),
+            "one panel and one off-panel haplotype: FASTA written");
+    // two off-panel
+    PanelToy q;
+    q.add("S1#1#c", A);
+    r = v2_report(q, B, X);
+    require(!r.origin[0].panel && !r.origin[1].panel && sequence_fasta_decision(r).first, "two off-panel haplotypes");
+    // reverse orientation is reported for the matching path
+    r = v2_report(p, C, C);
+    require(r.origin[0].panel && r.origin[0].orientations == std::vector<std::string>{"reverse_complement"},
+            "reverse orientation: the matching template's source orientation is reported");
+    // a switched labelling that spells an existing panel sequence stays panel-represented (sequence, not labels)
+    {
+        const Toy tandem{{{"C"}, {"", "A"}, {"AA"}, {"", "A"}, {"G"}}, {"ctx:0", "sv:1", "ctx:2", "sv:3", "ctx:4"}};
+        const std::vector<std::size_t> left{0, 1, 0, 0, 0}, right{0, 0, 0, 1, 0};
+        const PooledDecision d = decide_pooled_genotype({candidate(tandem, right, right, -2.0)}, 5, 10, 6);
+        SequenceReport s = build_sequence_report(d, tandem.ids, [&](const auto& l) { return tandem.spell(l); });
+        s.schema = "sequence_first_v2";
+        annotate_panel_membership(s, {"P#1#c"}, {tandem.spell(left)}, {false});
+        require(s.origin[0].panel && s.origin[1].panel && s.representative_first == right,
+                "switch history: labels unlike any template that spell a panel sequence are panel-represented");
+    }
+    // curated-out / inactive: a sequence only an excluded template carried is not in the active list -> off-panel
+    {
+        PanelToy active;   // S2#1#c and S2#2#c curated out: only S1#1#c and S3#1#c remain active
+        active.add("S1#1#c", A);
+        active.add("S3#1#c", C, true);
+        r = v2_report(active, A, B);
+        require(!r.origin[r.hap1_bases == active.toy.spell(B) ? 0 : 1].panel && sequence_fasta_decision(r).first,
+                "curated-out: a sequence carried only by inactive templates is off-panel");
+    }
+    // hash collisions cannot create membership: a forged hash entry with other bytes is rejected by byte comparison
+    {
+        SequenceReport f = v2_report(q, A, A);
+        annotate_panel_membership(f, {"forged"}, {std::string("GATTACA")}, {false});
+        require(!f.origin[0].panel, "membership needs byte equality, not a hash entry");
+    }
+    // the v2 writer: references, FASTA only when off-panel, and lifecycle at one prefix (off-panel -> panel-only)
+    const std::string pre = dir + "/v2";
+    SequenceReport off = v2_report(p, A, X);
+    require(publish_sequence_report(off, {"COMPLETE", "strict_call", "none", "audit", "contract_default_sequence_first_v2"},
+                                    pre, "unused"),
+            "v2: off-panel publishes");
+    auto locus = kv(pre + ".sequence_locus.tsv");
+    require(locus.at("schema_version") == "sequence_first_v2" && locus.at("fasta_emitted") == "yes" &&
+                locus.at("fasta_reason") == "OFF_PANEL_PAIR" && std::filesystem::exists(pre + ".sequence_haplotypes.fa") &&
+                slurp(pre + ".sequence_haplotypes.fa").find("origin=OFF_PANEL") != std::string::npos &&
+                slurp(pre + ".sequence_haplotypes.fa").find("origin=PANEL panel_path=S1#1#c") != std::string::npos,
+            "v2: one FASTA with both haplotypes, each annotated with its origin");
+    SequenceReport pan = v2_report(p, A, B);
+    require(publish_sequence_report(pan, {"COMPLETE", "strict_call", "none", "audit", "contract_default_sequence_first_v2"},
+                                    pre, "unused"),
+            "v2: panel pair publishes");
+    locus = kv(pre + ".sequence_locus.tsv");
+    require(locus.at("fasta_emitted") == "no" && locus.at("fasta_reason") == "PANEL_REPRESENTED_PAIR" &&
+                !std::filesystem::exists(pre + ".sequence_haplotypes.fa"),
+            "v2 lifecycle: off-panel -> panel-only removes the earlier FASTA");
+    const std::string table = slurp(pre + ".sequence_haplotypes.tsv");
+    require(table.find("gfa_path=S1#1#c;interval=0-") != std::string::npos &&
+                table.find("gfa_path=S2#1#c;interval=0-") != std::string::npos && table.find("\tS2#1#c,S2#2#c\t") != std::string::npos,
+            "v2: each panel haplotype carries its extraction reference and every equivalent path");
+    require(sequence_report_status_keys(pan).find("sequence_fasta\tnot_emitted\nsequence_fasta_reason\tPANEL_REPRESENTED_PAIR") !=
+                std::string::npos && sequence_report_status_keys(pan).find("sequence_publication\tcomplete") != std::string::npos,
+            "v2: intentional absence is recorded as such, with publication complete");
+    // provisional predictions follow the same rule and keep their status
+    SequenceReport prov = provisional_sequence_report(A, X, -9.0, "round_cap", "stopped", p.toy.ids,
+                                                      [&](const auto& l) { return p.toy.spell(l); });
+    prov.schema = "sequence_first_v2";
+    annotate_panel_membership(prov, p.names, p.sequences, p.reverse);
+    require(publish_sequence_report(prov, {"REPAIR_INCOMPLETE", "no_call", "round_cap", "audit", "flag"}, pre, "unused") &&
+                kv(pre + ".sequence_locus.tsv").at("prediction") == "PROVISIONAL" &&
+                kv(pre + ".sequence_locus.tsv").at("fasta_reason") == "OFF_PANEL_PAIR" &&
+                slurp(pre + ".sequence_haplotypes.fa").find("provisional=yes") != std::string::npos,
+            "v2 provisional: the membership rule applies and provisional status is kept");
+    // no prediction -> no FASTA, reason NO_PREDICTION
+    SequenceReport none;
+    none.schema = "sequence_first_v2";
+    require(publish_sequence_report(none, {"TIME_LIMIT", "no_call", "none", "audit", "flag"}, pre, "why") &&
+                kv(pre + ".sequence_locus.tsv").at("fasta_reason") == "NO_PREDICTION" &&
+                !std::filesystem::exists(pre + ".sequence_haplotypes.fa"),
+            "v2: no prediction writes no FASTA, reason NO_PREDICTION");
+    // v1 is unchanged: it still writes the FASTA for every prediction and no v2 table or keys
+    const std::string pv1 = dir + "/v1keep";
+    SequenceReport v1 = build_sequence_report(decide_pooled_genotype({candidate(p.toy, A, B, -3.0)}, 5, 10, 6), p.toy.ids,
+                                              [&](const auto& l) { return p.toy.spell(l); });
+    require(publish_sequence_report(v1, {"COMPLETE", "strict_call", "none", "off"}, pv1, "unused") &&
+                std::filesystem::exists(pv1 + ".sequence_haplotypes.fa") &&
+                !std::filesystem::exists(pv1 + ".sequence_haplotypes.tsv") &&
+                kv(pv1 + ".sequence_locus.tsv").count("fasta_emitted") == 0 &&
+                sequence_report_status_keys(v1).find("sequence_fasta") == std::string::npos,
+            "v1 unchanged: FASTA for every prediction, no v2 table, rows or status keys");
+    std::cout << "  panel membership (v2): two panel / homozygous / aliases / one off / two off / reverse / switch history "
+                 "/ curated-out / byte verification; references; FASTA only when off-panel; off->panel removes the FASTA; "
+                 "provisional; no prediction; v1 unchanged\n";
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -408,6 +547,7 @@ int main(int argc, char** argv) {
     test_orientation();
     test_linear_interval();
     test_publication_failure(dir);
+    test_panel_membership(dir);
     std::cout << "genotype_sequence_report: all passed\n";
     return 0;
 }

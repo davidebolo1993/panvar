@@ -98,6 +98,34 @@ std::vector<std::pair<std::string, std::string>> g_input_hashes;
 ProposalReuseReport g_proposal_reuse;
 // S1-B (sequence_first_v1 only): this run's sequence report and its legacy classification (reset per run)
 SequenceReport g_sequence_report;
+// S1-D: the sequence-first schemas (v1 reports every prediction's FASTA; v2 adds panel references, the panel-membership
+// FASTA rule and the diagnostic-only dosage contract)
+bool sequence_first(const GenotypeCommandOptions& options) {
+    return options.output_schema == "sequence_first_v1" || options.output_schema == "sequence_first_v2";
+}
+std::string dosage_mode_source(const GenotypeCommandOptions& options) {
+    return options.dosage_mode_explicit                     ? "flag"
+           : options.output_schema == "sequence_first_v2" ? "contract_default_sequence_first_v2"
+                                                            : "default";
+}
+// S1-D: classifies the report's haplotypes against the active panel (exact sequence identity in the locus frame) and
+// records the graph and model identity -- sequence_first_v2 only; reporting only.
+void annotate_v2(SequenceReport& report, const PreparedGenotypeModel& model, const std::string& fingerprint) {
+    report.schema = "sequence_first_v2";
+    std::vector<std::string> sequences;
+    std::vector<bool> reverse;
+    const PanelAlleleMatrix& panel = model.panel();
+    for (std::size_t t = 0; t < panel.template_count(); ++t) {
+        sequences.push_back(spell_mosaic(model, MosaicPath{panel.template_alleles[t]}).bases);
+        reverse.push_back(t < model.template_source_orientations().size() &&
+                          model.template_source_orientations()[t] == ChainOrientation::Reverse);
+    }
+    annotate_panel_membership(report, panel.template_names, sequences, reverse);
+    for (const auto& item : g_input_hashes) {
+        if (item.first == "gfa") report.graph_sha256 = item.second;
+    }
+    report.model_fingerprint = fingerprint;
+}
 SequenceLegacy g_sequence_legacy;
 bool g_sequence_published = false;   // S1-C: the report was published (or its failure recorded) for this run
 std::uint64_t g_union_end_footprint = 0;   // I2-K (measurement): physical footprint right after the union pass
@@ -1327,7 +1355,7 @@ void write_status(
     out << "seconds_ranking\t" << timings.ranking << '\n';
     out << "seconds_total\t" << timings.total << '\n';
     if (options.setting_sources.count("output_schema") != 0) out << "output_schema\t" << options.output_schema << '\n';
-    if (options.output_schema == "sequence_first_v1") out << sequence_report_status_keys(g_sequence_report);
+    if (sequence_first(options)) out << sequence_report_status_keys(g_sequence_report);
     if (g_prepared_use.used) {
         // I3-A: this sample was analysed against a prepared locus (stage 1 and the marker panel were not rebuilt)
         out << "prepared_locus\t1\nprepared_locus_id\t" << g_prepared_use.id << "\nprepared_locus_key_sha256\t"
@@ -1514,8 +1542,8 @@ void apply_genotype_setting(const std::string& context, const std::string& key, 
     }
     else if (key == "marker_proposal_reuse_table_bytes") options.marker_proposal_reuse_table_bytes = u();
     else if (key == "output_schema") {   // S1-B (EXPERIMENTAL, reporting only)
-        if (value != "legacy" && value != "sequence_first_v1") {
-            throw std::runtime_error(context + ": 'output_schema' is legacy or sequence_first_v1: " + value);
+        if (value != "legacy" && value != "sequence_first_v1" && value != "sequence_first_v2") {
+            throw std::runtime_error(context + ": 'output_schema' is legacy, sequence_first_v1 or sequence_first_v2: " + value);
         }
         options.output_schema = value;
     }
@@ -2170,6 +2198,7 @@ GenotypeRunStatus run_genotype_body(const GenotypeCommandOptions& options, Genot
     set_emission_lookup_timing(options.emission_lookup_timing);
     g_proposal_reuse = ProposalReuseReport{};   // I2-E: never a previous run's figures
     g_sequence_report = SequenceReport{};          // S1-B: likewise
+    if (options.output_schema == "sequence_first_v2") g_sequence_report.schema = "sequence_first_v2";   // S1-D
     g_sequence_legacy = SequenceLegacy{};
     g_sequence_published = false;
     reset_prepared_library_terms_tally();         // I2-F: likewise
@@ -3197,10 +3226,10 @@ GenotypeRunStatus run_genotype_body(const GenotypeCommandOptions& options, Genot
                                                                                              : "no_call";
             if (report.call_class != "no_call") report.no_call_reason = "none";
             g_sequence_legacy = {genotype_run_status_name(status), report.call_class, report.no_call_reason,
-                                 options.dosage_mode};   // S1-B
+                                 options.dosage_mode, dosage_mode_source(options)};   // S1-B, S1-D
             // S1-C: the sequence report is published before the status commits it: its files first, its locus record
             // last; a failure leaves no partial report and the status says so.
-            if (options.output_schema == "sequence_first_v1") {
+            if (sequence_first(options)) {
                 publish_sequence_report(g_sequence_report, g_sequence_legacy, options.out_prefix,
                                         "no completed ranking and no safely available evaluated candidate (" +
                                             g_sequence_legacy.run_status + ", " + g_sequence_legacy.no_call_reason + ")");
@@ -3516,12 +3545,13 @@ GenotypeRunStatus run_genotype_body(const GenotypeCommandOptions& options, Genot
         // S1-B (sequence_first_v1 only): a declared-cap stop keeps the last committed, exactly scored incumbent as
         // PROVISIONAL -- only after at least one committed round (the anchor reproduced and was rescored).
         const auto provisional = [&](const std::string& stop, const std::string& note) {
-            if (options.output_schema != "sequence_first_v1" || !search || search->rounds().empty()) return;
+            if (!sequence_first(options) || !search || search->rounds().empty()) return;
             std::vector<std::string> block_ids;
             for (const auto& block : model.blocks()) block_ids.push_back(block.block_id);
             g_sequence_report = provisional_sequence_report(
                 search->incumbent_first(), search->incumbent_second(), search->incumbent_total(), stop, note, block_ids,
                 [&](const std::vector<std::size_t>& labels) { return spell_mosaic(model, MosaicPath{labels}).bases; });
+            if (options.output_schema == "sequence_first_v2") annotate_v2(g_sequence_report, model, fingerprint);
         };
         if (!refusal.empty()) {
             report.no_call_reason = "cumulative_cap";
@@ -4704,12 +4734,13 @@ GenotypeRunStatus run_genotype_body(const GenotypeCommandOptions& options, Genot
         write_trajectory();
         // S1-B (sequence_first_v1 only): the sequence report of this completed ranking. Reporting only: it reads the
         // decision and spells the representative; nothing below depends on it.
-        if (options.output_schema == "sequence_first_v1") {
+        if (sequence_first(options)) {
             std::vector<std::string> block_ids;
             for (const auto& block : model.blocks()) block_ids.push_back(block.block_id);
             g_sequence_report = build_sequence_report(decided, block_ids, [&](const std::vector<std::size_t>& labels) {
                 return spell_mosaic(model, MosaicPath{labels}).bases;
             });
+            if (options.output_schema == "sequence_first_v2") annotate_v2(g_sequence_report, model, fingerprint);
         }
 
         if (decided.decision == TopSetDecision::DistinctTie) {
@@ -6187,6 +6218,7 @@ std::optional<int> parse_genotype_arguments(const std::vector<std::string>& args
         else if (flag == "--library-diagnostic") options.library_diagnostic = true;
         else if (flag == "--dosage-mode") {
             options.dosage_mode = need(i);
+            options.dosage_mode_explicit = true;
             if (options.dosage_mode != "off" && options.dosage_mode != "audit" && options.dosage_mode != "repair") {
                 throw std::runtime_error("--dosage-mode takes off, audit or repair");
             }
@@ -6343,13 +6375,25 @@ std::optional<int> parse_genotype_arguments(const std::vector<std::string>& args
                                "repair_tie_branching", "0", options);
     }
     // S1-B: sequence_first_v1 reports the adaptive repair's pooled decision; every other route is refused explicitly.
-    if (options.output_schema == "sequence_first_v1") {
+    if (sequence_first(options)) {
         if (options.repair_rounds == 0) {
-            throw std::runtime_error("output_schema sequence_first_v1 needs the adaptive repair (repair rounds > 0); the "
+            throw std::runtime_error("output_schema " + options.output_schema + " needs the adaptive repair (repair rounds > 0); the "
                                      "unrepaired view has no pooled decision to report");
         }
         if (options.diagnostic_union_only) {
-            throw std::runtime_error("output_schema sequence_first_v1 is not supported with diagnostic_union_only");
+            throw std::runtime_error("output_schema " + options.output_schema + " is not supported with diagnostic_union_only");
+        }
+    }
+    // S1-D: under sequence_first_v2 dosage is diagnostic: audit unless --dosage-mode was given; off is allowed (not
+    // evaluated); repair is refused -- historical repair reproduction belongs to the legacy contract.
+    if (options.output_schema == "sequence_first_v2") {
+        if (!options.dosage_mode_explicit) {
+            options.dosage_mode = "audit";
+        } else if (options.dosage_mode == "repair") {
+            throw std::runtime_error("--dosage-mode repair is not available under output_schema sequence_first_v2: dosage "
+                                     "is diagnostic there (audit, or off) and never changes the prediction; reproduce "
+                                     "historical repair results with the legacy contract (omit --output-schema, or "
+                                     "--output-schema legacy)");
         }
     }
     if (profiled) {
@@ -6437,17 +6481,22 @@ int execute_genotype_command(const GenotypeCommandOptions& options, const Prepar
     GenotypeDosageCapture capture;
     const GenotypeRunStatus status = run_genotype_body(options, &capture, locus);
     const bool called = status == GenotypeRunStatus::Complete || status == GenotypeRunStatus::ConditionalGenotypeEquivalent;
-    const bool sequence_first = options.output_schema == "sequence_first_v1";
+    const bool sequence_first = panvar::sequence_first(options);
+    if (options.output_schema == "sequence_first_v2" && options.dosage_mode == "repair") {   // S1-D: API callers too
+        std::cerr << "[genotype] --dosage-mode repair is refused under output_schema sequence_first_v2\n";
+        return 2;
+    }
     if (sequence_first && !g_sequence_published) {
         // S1-B/C: a run that ended without the adaptive completion's stop (no prediction, or an uncovered route)
         // publishes here; a watchdog stop never reaches here (no prediction, and its owned reports were removed).
         SequenceLegacy legacy = g_sequence_legacy;
         if (legacy.run_status == "NA") legacy.run_status = genotype_run_status_name(status);
         legacy.dosage_mode = options.dosage_mode;
+        legacy.dosage_mode_source = dosage_mode_source(options);
         // A legacy call without a sequence report would be a route this schema does not cover: said, never hidden.
         const std::string reason =
             called && !g_sequence_report.built
-                ? "UNSUPPORTED_ROUTE: the legacy caller emitted a genotype on a route sequence_first_v1 does not report (" +
+                ? "UNSUPPORTED_ROUTE: the legacy caller emitted a genotype on a route " + options.output_schema + " does not report (" +
                       legacy.run_status + ")"
                 : "no completed ranking and no safely available evaluated candidate (" + legacy.run_status +
                       (legacy.no_call_reason != "NA" ? ", " + legacy.no_call_reason : "") + ")";

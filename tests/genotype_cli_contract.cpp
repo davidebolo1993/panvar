@@ -133,7 +133,7 @@ void test_output_schema() {
             "--output-schema sequence_first_v1 is accepted and recorded with its source");
     require(parse({}, &kept).error.empty() && kept.output_schema == "legacy" && kept.setting_sources.count("output_schema") == 0,
             "unset, the schema is legacy and has no recorded source");
-    require(parse({"--output-schema", "sequence_first"}).error.find("'output_schema' is legacy or sequence_first_v1") !=
+    require(parse({"--output-schema", "sequence_first"}).error.find("'output_schema' is legacy, sequence_first_v1 or sequence_first_v2") !=
                 std::string::npos,
             "an unknown schema is refused");
     for (const std::vector<std::string>& unsupported :
@@ -145,6 +145,28 @@ void test_output_schema() {
     require(parse({"--output-schema", "legacy", "--adaptive-repair", "off"}).error.empty(),
             "an explicit legacy schema is accepted on every route");
     std::cout << "  output_schema: validated, recorded with its source, refused without the adaptive repair\n";
+}
+
+// S1-D: sequence_first_v2 makes dosage diagnostic -- audit by default, off allowed, repair refused (only there).
+void test_v2_dosage_contract() {
+    panvar::GenotypeCommandOptions kept;
+    require(parse({"--output-schema", "sequence_first_v2"}, &kept).error.empty() && kept.dosage_mode == "audit" &&
+                !kept.dosage_mode_explicit,
+            "v2 without --dosage-mode defaults to audit");
+    require(parse({"--output-schema", "sequence_first_v2", "--dosage-mode", "off"}, &kept).error.empty() &&
+                kept.dosage_mode == "off" && kept.dosage_mode_explicit,
+            "v2 with an explicit off keeps off (recorded as not evaluated)");
+    require(parse({"--dosage-mode", "repair", "--output-schema", "sequence_first_v2"}).error.find(
+                "--dosage-mode repair is not available under output_schema sequence_first_v2") != std::string::npos,
+            "v2 refuses an explicit repair, whatever the argument order");
+    require(parse({"--dosage-mode", "repair"}, &kept).error.empty() && kept.dosage_mode == "repair",
+            "legacy (default) still accepts repair");
+    require(parse({"--output-schema", "sequence_first_v1", "--dosage-mode", "repair"}, &kept).error.empty() &&
+                kept.dosage_mode == "repair",
+            "sequence_first_v1 still accepts repair (its meaning is unchanged)");
+    require(parse({"--output-schema", "sequence_first_v1"}, &kept).error.empty() && kept.dosage_mode == "off",
+            "sequence_first_v1 keeps the built-in dosage default");
+    std::cout << "  sequence_first_v2 dosage contract: audit by default, explicit off kept, repair refused only under v2\n";
 }
 
 void test_repair_option_order() {
@@ -311,6 +333,7 @@ int main(int argc, char** argv) {
         test_cache_flag_provenance();
         test_help_text();
         test_output_schema();
+        test_v2_dosage_contract();
         test_pre_block_no_call();
     } catch (const std::exception& error) {
         std::cerr << "FAIL: " << error.what() << '\n';
