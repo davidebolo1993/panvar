@@ -149,6 +149,29 @@ What a run writes depends on its outcome:
 
 **Confidence.** `structure_confidence` is `NA` (`UNCALIBRATED`).
 
+### Sequence-first output v2 (experimental, opt-in)
+
+**How to enable it.** Use `--output-schema sequence_first_v2`. It is a separate contract: `sequence_first_v1` and the default `legacy` are unchanged.
+
+**What it adds to v1:**
+- **Panel membership.** Each predicted haplotype, completed or provisional, is classified by exact sequence identity, in the locus frame, against the active (curated) panel.
+- **Extraction references.** `<prefix>.sequence_haplotypes.tsv` lists each haplotype's SHA-256, length, origin (`PANEL`/`OFF_PANEL`), every sequence-equivalent panel path with its orientation, and an extraction reference. The reference has the form `gfa_path=…;interval=0-<length>;orientation=forward|reverse_complement`, applied to the whole locus path. The table also carries the GFA SHA-256, the model fingerprint and the selected block path.
+- **The FASTA rule.**
+  - When both haplotypes are panel-represented, no FASTA is written (`fasta_reason PANEL_REPRESENTED_PAIR`).
+  - When either is off-panel, one FASTA holds both, each record annotated with its origin (`OFF_PANEL_PAIR`).
+  - No prediction means no FASTA (`NO_PREDICTION`).
+
+  An intentional absence is recorded as such, never as a failed publication.
+
+**Dosage is diagnostic under v2:**
+- **default:** `--dosage-mode` defaults to `audit`;
+- **`off`:** allowed, and recorded as not evaluated;
+- **`repair`:** refused. Reproduce historical repair results with the legacy contract.
+
+The audit never changes the prediction or its sequences.
+
+**Extraction:** `tests/analysis/s1d/extract_panel_haplotype.py --check <graph.gfa> <prefix>.sequence_haplotypes.tsv` extracts every listed panel path and checks its hash and length.
+
 ## Limitations
 
 - Only paired short reads are supported.
