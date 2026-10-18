@@ -18,6 +18,7 @@
 // number keeps the test honest if the batch is ever retuned.
 #include "panvar/fragment_likelihood.hpp"
 #include "panvar/genotype_repair.hpp"
+#include "panvar/ls_hmm.hpp"
 
 #include <cstdlib>
 #include <sys/wait.h>
@@ -4532,6 +4533,254 @@ void test_sequence_first_v2_contract() {
                  "reference (also after a publication failure on a reused prefix); legacy/v1 FASTA unchanged\n";
 }
 
+// ---- S2-A: early evaluated incumbent and safe budget-stop reporting (early_incumbent experimental_v1) ----------------
+namespace s2a {
+// The command in a child (a watchdog or test-hook stop ends the whole process); 99 = an escaped exception.
+int execute_in_child(const panvar::GenotypeCommandOptions& options) {
+    std::cout.flush();
+    const pid_t child = fork();
+    require(child >= 0, "fork failed");
+    if (child == 0) {
+        int code = 99;
+        try {
+            code = panvar::execute_genotype_command(options, nullptr);
+        } catch (...) {
+            code = 99;
+        }
+        std::_Exit(code);
+    }
+    int wait_status = 0;
+    waitpid(child, &wait_status, 0);
+    return WIFEXITED(wait_status) ? WEXITSTATUS(wait_status) : -1;
+}
+std::vector<panvar::ReadPair> fastq_pairs(const std::string& r1, const std::string& r2) {
+    const auto load = [](const std::string& file) {
+        std::vector<panvar::SequencingRead> out;
+        std::ifstream in(file);
+        for (std::string head, bases, plus, quals; std::getline(in, head) && std::getline(in, bases) &&
+                                                   std::getline(in, plus) && std::getline(in, quals);) {
+            panvar::SequencingRead r;
+            r.name = head.substr(1, head.find_first_of(" \t") == std::string::npos ? std::string::npos : head.find_first_of(" \t") - 1);
+            for (char& c : bases) c = static_cast<char>(std::toupper(c));
+            r.bases = bases;
+            r.qualities = quals;
+            out.push_back(r);
+        }
+        return out;
+    };
+    const auto a = load(r1), b = load(r2);
+    std::vector<panvar::ReadPair> out;
+    for (std::size_t i = 0; i < a.size() && i < b.size(); ++i) out.push_back({a[i], b[i]});
+    return out;
+}
+std::vector<std::size_t> labels(const std::string& text) {
+    std::vector<std::size_t> out;
+    std::istringstream in(text);
+    for (std::string x; std::getline(in, x, ',');) out.push_back(std::stoul(x));
+    return out;
+}
+bool bits(double a, double b) { return std::memcmp(&a, &b, sizeof(double)) == 0; }
+}  // namespace s2a
+
+void test_early_incumbent() {
+    namespace fs = std::filesystem;
+    const auto fresh = [&](const std::string& rel, bool on) {
+        fs::remove_all(path(rel));
+        fs::create_directories(path(rel));
+        panvar::GenotypeCommandOptions o =
+            repair_options(rel + "/call", path("phaseable_r1.fq"), path("phaseable_r2.fq"), "tiny_phaseable.gfa");
+        o.output_schema = "sequence_first_v2";
+        o.setting_sources["output_schema"] = "test";
+        if (on) {
+            o.early_incumbent = "experimental_v1";
+            o.setting_sources["early_incumbent"] = "test";
+        }
+        return o;
+    };
+    static const std::set<std::string> added_status = {"early_incumbent", "checkpoint_commits", "checkpoint_last_stage",
+                                                       "checkpoint_evaluated_candidates",
+                                                       "checkpoint_seconds_first_evaluated_prediction", "checkpoint_failure"};
+    const auto science_status = [&](const std::string& file) {
+        std::map<std::string, std::string> out;
+        for (const auto& [k, v] : sf::kv(file)) {
+            if (sf::volatile_key(k) || k.rfind("early_incumbent", 0) == 0 || added_status.count(k) != 0) continue;
+            out[k] = v;
+        }
+        return out;
+    };
+    // (1) completed run, off vs on: identical legacy and sequence outputs; only the declared status/settings rows added
+    require(panvar::execute_genotype_command(fresh("ei_off", false), nullptr) == 0, "S2-A off: predicts");
+    const panvar::GenotypeCommandOptions on = fresh("ei_on", true);
+    require(panvar::execute_genotype_command(on, nullptr) == 0, "S2-A on: predicts");
+    require(sf::files(path("ei_off")) == sf::files(path("ei_on")), "S2-A off/on: the same files");
+    for (const std::string& f : sf::files(path("ei_off"))) {
+        if (f == "call.mosaic_status.tsv" || f == "call.settings.tsv" || f == "call.repair_memory.tsv") continue;
+        if (f == "call.repair_rounds.tsv") {
+            require(rounds_science(path("ei_off/" + f)) == rounds_science(path("ei_on/" + f)), "S2-A off/on: trajectory");
+            continue;
+        }
+        if (f == "call.dosage_status.tsv") continue;   // timing keys only (compared below without them)
+        require(sf::normalised(path("ei_off/" + f), path("ei_off")) == sf::normalised(path("ei_on/" + f), path("ei_on")),
+                "S2-A off/on: " + f + " identical (completed-run mathematics unchanged)");
+    }
+    require(science_status(path("ei_off/call.mosaic_status.tsv")) == science_status(path("ei_on/call.mosaic_status.tsv")),
+            "S2-A off/on: the status differs only by the declared early-incumbent rows");
+    {
+        const std::string a = slurp(path("ei_off/call.settings.tsv")), b = slurp(path("ei_on/call.settings.tsv"));
+        require(b == a + "early_incumbent\texperimental_v1\ttest\n" || sf::normalised(path("ei_on/call.settings.tsv"), path("ei_on")).find("early_incumbent\texperimental_v1") != std::string::npos,
+                "S2-A on: the setting is recorded");
+    }
+    const auto status = read_status(path("ei_on/call.mosaic_status.tsv"));
+    require(status.at("early_incumbent_status") == "evaluated" && status.at("early_incumbent_union_check") == "reproduced" &&
+                std::stoul(status.at("checkpoint_commits")) >= 2 && status.at("checkpoint_failure") == "none",
+            "S2-A on: early candidate evaluated, reproduced bit for bit by the union pass, checkpoints committed");
+    // (2) the early candidate's components, recomputed independently with the ordinary scorer
+    {
+        const std::shared_ptr<const panvar::PreparedLocus> prepared = panvar::prepare_genotype_locus(on);
+        const panvar::PreparedGenotypeModel& model = prepared->model();
+        const std::vector<std::size_t> a = s2a::labels(status.at("early_incumbent_hap1"));
+        const std::vector<std::size_t> b = s2a::labels(status.at("early_incumbent_hap2"));
+        const std::string sa = panvar::spell_mosaic(model, panvar::MosaicPath{a}).bases;
+        const std::string sb = panvar::spell_mosaic(model, panvar::MosaicPath{b}).bases;
+        const panvar::InternedHaplotypes ih = panvar::intern_haplotypes({panvar::MosaicPath{a}, panvar::MosaicPath{b}}, {sa, sb});
+        panvar::FragmentScoringOptions so;
+        so.threads = 1;
+        so.mismatch_band = on.mismatch_band;
+        so.minimum_piece_bp = on.minimum_piece_bp;
+        so.max_piece_hits = on.max_piece_hits;
+        so.max_proposed_starts_per_haplotype = on.max_proposed_starts_per_haplotype;
+        so.max_physical_origins = on.max_physical_origins;
+        so.max_state_classes = on.max_state_classes;
+        so.max_mass_cells = on.max_mass_cells;
+        std::optional<double> background;
+        const panvar::LibraryModel library = panvar::read_library(on.library_path, background);
+        const panvar::FragmentScoringResult r = panvar::score_diplotypes(
+            ih, {{std::min(ih.index_of[0], ih.index_of[1]), std::max(ih.index_of[0], ih.index_of[1])}},
+            s2a::fastq_pairs(on.reads1_path, on.reads2_path), library, so);
+        const panvar::DiplotypeScore& d = r.scores.front();
+        const std::vector<double> sw(model.blocks().size() - 1, on.switch_probability);
+        const double prior = panvar::log_haploid_sequence_prior(model, sa, sw) + panvar::log_haploid_sequence_prior(model, sb, sw) +
+                             (sa != sb ? std::log(2.0) : 0.0);
+        require(s2a::bits(d.log_likelihood, std::stod(status.at("early_incumbent_log_likelihood"))) &&
+                    s2a::bits(d.fragment_term, std::stod(status.at("early_incumbent_fragment_term"))) &&
+                    s2a::bits(d.exposure_term, std::stod(status.at("early_incumbent_exposure_term"))) &&
+                    s2a::bits(d.absolute_term_sum, std::stod(status.at("early_incumbent_absolute_term_sum"))) &&
+                    d.fragments_with_mass == std::stoul(status.at("early_incumbent_fragments_with_mass")) &&
+                    s2a::bits(prior, std::stod(status.at("early_incumbent_sequence_prior"))),
+                "S2-A: the early candidate's components equal an independent ordinary-scorer evaluation, bit for bit");
+    }
+    // (3) deterministic interruptions
+    const auto interrupted = [&](const std::string& rel, const std::string& point, std::size_t threads = 2) {
+        panvar::GenotypeCommandOptions o = fresh(rel, true);
+        o.test_interrupt_point = point;
+        o.threads = threads;
+        return s2a::execute_in_child(o);
+    };
+    {
+        const int code = interrupted("ei_before", "before_first_evaluation");
+        const auto locus = sf::kv(path("ei_before/call.sequence_locus.tsv"));
+        const auto st = read_status(path("ei_before/call.mosaic_status.tsv"));
+        require(code == 124 && locus.at("prediction") == "NO_PREDICTION" &&
+                    locus.at("completion") == "budget_stop_before_first_evaluated_candidate" &&
+                    !exists(path("ei_before/call.sequence_haplotypes.tsv")) && st.at("status") == "TIME_LIMIT" &&
+                    st.at("sequence_exit_code") == "1" && st.at("checkpoint_committed") == "no",
+                "S2-A stop before the first evaluation: typed NO_PREDICTION, exit 124 (got " + std::to_string(code) + ")");
+    }
+    std::map<std::string, std::string> early_locus;
+    for (const std::string point : {"after_checkpoint", "union_scoring", "adaptive_refinement"}) {
+        const std::string rel = "ei_" + point;
+        const int code = interrupted(rel, point);
+        const auto locus = sf::kv(path(rel + "/call.sequence_locus.tsv"));
+        const auto st = read_status(path(rel + "/call.mosaic_status.tsv"));
+        const bool early_stage = point != "adaptive_refinement";
+        require(code == 3 && locus.at("prediction") == "PROVISIONAL" && locus.at("completion") == "budget_stop" &&
+                    locus.at("checkpoint_search_status") == "budget_stop:TIME_LIMIT" &&
+                    locus.at("legacy_run_status") == "TIME_LIMIT" &&
+                    (early_stage ? locus.at("checkpoint_stage") == "early_panel_incumbent"
+                                 : locus.at("checkpoint_stage") != "early_panel_incumbent") &&
+                    st.at("status") == "TIME_LIMIT" && st.at("sequence_prediction") == "PROVISIONAL" &&
+                    st.at("sequence_exit_code") == "3" && no_ranking_or_call(rel + "/call") &&
+                    exists(path(rel + "/call.sequence_haplotypes.tsv")) &&
+                    locus.at("checkpoint_semantics").find("search_incomplete") != std::string::npos,
+                "S2-A stop " + point + ": the committed checkpoint is kept as PROVISIONAL (exit " + std::to_string(code) + ")");
+        const auto rows = read_rows(path(rel + "/call.sequence_haplotypes.tsv"));
+        require(rows.size() == 2, "S2-A stop " + point + ": two haplotype rows with references or the v2 FASTA rule");
+        require((locus.at("fasta_emitted") == "yes") == exists(path(rel + "/call.sequence_haplotypes.fa")),
+                "S2-A stop " + point + ": the v2 FASTA policy holds for the checkpoint");
+        if (point == "after_checkpoint") early_locus = locus;
+        if (!early_stage) {
+            require(std::stod(locus.at("checkpoint_total_score")) >= std::stod(early_locus.at("checkpoint_total_score")),
+                    "S2-A: a replacement is never worse than the early incumbent");
+        }
+    }
+    require(early_locus.at("checkpoint_log_likelihood") == status.at("early_incumbent_log_likelihood") &&
+                early_locus.at("checkpoint_sequence_prior") == status.at("early_incumbent_sequence_prior") &&
+                early_locus.at("checkpoint_evaluated_candidates") == "1" && early_locus.at("checkpoint_tied_groups") == "NA",
+            "S2-A: the early checkpoint carries the completed run's early components exactly, one evaluated candidate, no ties claimed");
+    // (4) 1 vs 4 threads: the same early checkpoint and the same completed outputs
+    {
+        require(interrupted("ei_t1", "after_checkpoint", 1) == 3 && interrupted("ei_t4", "after_checkpoint", 4) == 3,
+                "S2-A threads: both stop with a checkpoint");
+        auto a = sf::kv(path("ei_t1/call.sequence_locus.tsv")), b = sf::kv(path("ei_t4/call.sequence_locus.tsv"));
+        for (auto* m : {&a, &b}) {
+            m->erase("checkpoint_seconds_first_evaluated_prediction");
+            m->erase("checkpoint_seconds_committed");
+            m->erase("completion_note");
+        }
+        require(a == b, "S2-A threads: the early checkpoint is identical at 1 and 4 threads");
+        panvar::GenotypeCommandOptions t4 = fresh("ei_on4", true);
+        t4.threads = 4;
+        require(panvar::execute_genotype_command(t4, nullptr) == 0, "S2-A on, 4 threads: predicts");
+        for (const char* f : {"call.sequence_locus.tsv", "call.sequence_haplotypes.tsv", "call.block_genotypes.tsv",
+                              "call.mosaic_scores.tsv"}) {
+            require(sf::normalised(path("ei_on/") + f, path("ei_on")) == sf::normalised(path("ei_on4/") + f, path("ei_on4")),
+                    std::string("S2-A threads: ") + f + " identical at 2 and 4 threads");
+        }
+    }
+    // (5) prefix reuse: a completed run, then a stop after the checkpoint, then a completed run, one prefix
+    {
+        const panvar::GenotypeCommandOptions first = fresh("ei_reuse", true);
+        require(panvar::execute_genotype_command(first, nullptr) == 0, "S2-A reuse: the first run predicts");
+        panvar::GenotypeCommandOptions stop = first;
+        stop.test_interrupt_point = "after_checkpoint";
+        require(s2a::execute_in_child(stop) == 3, "S2-A reuse: the stopped run keeps its checkpoint");
+        require(no_ranking_or_call("ei_reuse/call") && !exists(path("ei_reuse/call.locus_genotype.tsv")) &&
+                    sf::kv(path("ei_reuse/call.sequence_locus.tsv")).at("checkpoint_stage") == "early_panel_incumbent",
+                "S2-A reuse: no earlier final output survives beside the checkpoint");
+        require(panvar::execute_genotype_command(first, nullptr) == 0 &&
+                    sf::normalised(path("ei_reuse/call.sequence_locus.tsv"), path("ei_reuse")) ==
+                        sf::normalised(path("ei_on/call.sequence_locus.tsv"), path("ei_on")),
+                "S2-A reuse: a later completed run replaces the checkpoint with the final report");
+    }
+    // (6) a checkpoint that cannot be published: an explicit failure (exit 2), never a fallback
+    {
+        panvar::GenotypeCommandOptions o = fresh("ei_publish", true);
+        fs::create_directories(path("ei_publish/call.sequence_alternatives.tsv.writing/blocker"));
+        const int code = panvar::execute_genotype_command(o, nullptr);
+        const auto st = read_status(path("ei_publish/call.mosaic_status.tsv"));
+        require(code == 2 && st.at("sequence_publication") == "FAILED" &&
+                    st.at("checkpoint_failure").find("checkpoint_publication_failed") == 0 &&
+                    !exists(path("ei_publish/call.sequence_haplotypes.tsv")) && no_ranking_or_call("ei_publish/call"),
+                "S2-A: a failed checkpoint publication ends the run as an explicit failure (exit " + std::to_string(code) + ")");
+        fs::remove_all(path("ei_publish/call.sequence_alternatives.tsv.writing"));
+    }
+    // (7) the contract: experimental_v1 needs sequence_first_v2 and is refused before the prefix is touched
+    {
+        panvar::GenotypeCommandOptions o = fresh("ei_refused", true);
+        o.output_schema = "sequence_first_v1";
+        bool refused = false;
+        try {
+            (void)panvar::execute_genotype_command(o, nullptr);
+        } catch (const std::invalid_argument&) {
+            refused = true;
+        }
+        require(refused && sf::files(path("ei_refused")).empty(), "S2-A: v1 + early_incumbent refused before any output");
+    }
+    std::cout << "  early incumbent: off/on completed outputs identical; early candidate reproduced by the union and by an "
+                 "independent scorer; stops before/after checkpoint, during union scoring and refinement typed correctly; "
+                 "1/4 threads, prefix reuse, publication failure, contract refusal\n";
+}
+
 int main(int argc, char** argv) {
     if (argc < 2) {
         std::cerr << "usage: genotype_command_e2e_test <scratch dir> [source dir]\n";
@@ -4577,6 +4826,8 @@ int main(int argc, char** argv) {
             test_sequence_first_lifecycle();
             test_sequence_first_v2();
             test_sequence_first_v2_contract();
+        test_early_incumbent();
+            test_early_incumbent();
             std::cout << "genotype command e2e (sequence_first only): PASS\n";
             return 0;
         } catch (const std::exception& error) {

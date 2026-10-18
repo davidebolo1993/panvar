@@ -89,6 +89,13 @@ struct RunWatch {
     Clock::time_point started = Clock::now();
     std::uint64_t footprint_limit = 0;
     double time_limit = 0.0;
+    // S2-A (early_incumbent experimental_v1): the last committed checkpoint's locus record (what a budget stop keeps,
+    // rewritten with the stop), or a checkpoint publication that failed (an explicit failure, never a fallback)
+    bool early_incumbent = false;
+    bool checkpoint_committed = false;
+    bool checkpoint_failed = false;
+    std::string checkpoint_stage = "none";
+    std::string checkpoint_locus;
 };
 // The one run in flight in this process, or null. Runs are sequential within a process.
 RunWatch* g_watch = nullptr;
@@ -104,6 +111,57 @@ bool sequence_first(const GenotypeCommandOptions& options) {
     return options.output_schema == "sequence_first_v1" || options.output_schema == "sequence_first_v2";
 }
 std::string dosage_mode_source(const GenotypeCommandOptions& options) { return options.dosage_mode_source; }
+// S2-A: the early_incumbent contract (also checked before an API run touches its prefix).
+std::optional<std::string> early_incumbent_refusal(const GenotypeCommandOptions& o) {
+    if (o.early_incumbent != "experimental_v1") {
+        if (o.test_interrupt_point != "none") return std::string("test_interrupt_point needs early_incumbent experimental_v1");
+        return std::nullopt;
+    }
+    const std::string what = "early_incumbent experimental_v1 ";
+    if (o.output_schema != "sequence_first_v2") {
+        return what + "needs output_schema sequence_first_v2 (its checkpoint follows the v2 panel-reference and "
+                      "conditional-FASTA policy)";
+    }
+    if (o.repair_rounds == 0) return what + "needs the adaptive repair (repair rounds > 0)";
+    if (o.diagnostic_union_only) return what + "is not supported with diagnostic_union_only";
+    if (!o.development_candidate_prefixes.empty()) return what + "is not supported with development candidate prefixes";
+    return std::nullopt;
+}
+// S2-A: the run's incumbent -- the best fully evaluated candidate so far -- and the early evaluation's account (reset
+// at every run start). Scores and priors are the unchanged scorer's and the ranking's own.
+struct EarlyIncumbent {
+    bool enabled = false;
+    bool have = false;
+    std::vector<std::size_t> first, second;
+    DiplotypeScore score;
+    double sequence_prior = 0.0, total = 0.0;
+    std::string stage = "none";
+    std::string tied_groups = "NA", projection_ambiguous = "NA", explored_labellings = "NA";
+    std::size_t evaluated = 0;   // fully evaluated labelled diplotypes so far
+    bool dirty = false;          // held incumbent newer than the committed checkpoint
+    std::size_t commits = 0;
+    double seconds_first = std::numeric_limits<double>::quiet_NaN();
+    double seconds_commit = std::numeric_limits<double>::quiet_NaN();
+    bool failed = false;         // scoring inconsistency or checkpoint publication failure
+    std::string failure = "none";
+    // the early evaluation
+    std::string early_status = "not_run";
+    std::string selection = "NA";
+    std::size_t pairs_examined = 0, prior_evaluations = 0;
+    double seconds_preparation = 0.0, seconds_selection = 0.0, seconds_evaluation = 0.0;
+    FragmentScoringCounters early_counters;
+    std::uint64_t early_fragment_evaluations = 0;
+    std::uint64_t footprint_after_early = 0;
+    std::string union_check = "not_reached";   // reproduced | MISMATCH | not_reached
+    std::vector<std::size_t> early_first, early_second;   // the early candidate itself (the incumbent moves on)
+    DiplotypeScore early_score;
+    double early_prior = 0.0;
+    // the active panel spelled once per run, for v2 membership of every checkpoint
+    bool templates_spelled = false;
+    std::vector<std::string> template_sequences;
+    std::vector<bool> template_reverse;
+};
+EarlyIncumbent g_incumbent;
 // S1-D.1: true while execute_genotype_command runs the body (its dosage stage follows); a caller-only API run
 // (run_genotype, run_genotype_prepared) has no dosage stage, and its v2 report says so rather than naming a mode.
 bool g_dosage_stage_follows = false;
@@ -156,7 +214,39 @@ std::string minimal_status(const RunWatch& watch, const std::string& state, cons
                                   "genotype, not a call")
          << '\n';
     for (const auto& hash : g_input_hashes) text << "sha256_" << hash.first << '\t' << hash.second << '\n';
+    if (watch.early_incumbent) {   // S2-A
+        text << "early_incumbent\texperimental_v1\ncheckpoint_committed\t" << (watch.checkpoint_committed ? "yes" : "no")
+             << "\ncheckpoint_stage\t" << watch.checkpoint_stage << '\n';
+        if (state == "FAILED") {   // an exception ended the run: an explicit failure, never a budget stop or fallback
+            text << "sequence_prediction\tNO_PREDICTION\nsequence_completion\trun_failed\nsequence_exit_code\t2\n"
+                    "checkpoint_retained\tno: a failed run keeps no checkpoint as a prediction\n";
+        } else if (state != "RUNNING") {
+            const bool kept = watch.checkpoint_committed && !watch.checkpoint_failed;
+            text << "sequence_prediction\t" << (kept ? "PROVISIONAL" : "NO_PREDICTION") << "\nsequence_completion\t"
+                 << (watch.checkpoint_failed ? "report_publication_failed"
+                     : kept                  ? "budget_stop"
+                                             : "budget_stop_before_first_evaluated_candidate")
+                 << "\nsequence_exit_code\t" << (watch.checkpoint_failed ? 2 : kept ? 3 : 1) << "\ncheckpoint_retained\t"
+                 << (kept ? "yes: <prefix>.sequence_* hold the last committed checkpoint (PROVISIONAL; search incomplete)"
+                          : "no") << '\n';
+        }
+    }
     return text.str();
+}
+
+// S2-A: the line `key<TAB>...` of a key/value record replaced (appended when absent).
+std::string with_key_value(std::string text, const std::string& key, const std::string& value) {
+    const std::string head = key + "\t";
+    std::size_t at = text.rfind("\n" + head);
+    if (at != std::string::npos) {
+        ++at;
+    } else if (text.rfind(head, 0) == 0) {
+        at = 0;
+    } else {
+        return text + head + value + "\n";
+    }
+    const std::size_t end = text.find('\n', at);
+    return text.replace(at, (end == std::string::npos ? text.size() : end) - at, head + value);
 }
 
 // A RUNNING status, only while nothing has claimed the run.
@@ -178,13 +268,35 @@ void claim_run() {
 // Stops the process where it stands, if nothing has claimed the run. _Exit runs no destructor, so the
 // staged graph and any final output are removed here; committed partial rounds stay as the record.
 void stop_run(const std::string& state, const std::string& note, int code) {
+    if (g_watch == nullptr) return;
     std::lock_guard<std::mutex> lock(g_watch->mutex);
     if (g_watch->finished) return;
     g_watch->finished = true;
     std::error_code ignored;
     for (const char* suffix : kFinalOutputs) std::filesystem::remove(g_watch->out_prefix + suffix, ignored);
-    // S1-C: the sequence-first reports are run-owned too; a stopped run never sits beside an earlier prediction
-    for (const std::string& suffix : sequence_report_outputs()) std::filesystem::remove(g_watch->out_prefix + suffix, ignored);
+    if (g_watch->early_incumbent && g_watch->checkpoint_committed && !g_watch->checkpoint_failed) {
+        // S2-A: the last committed checkpoint is kept as the PROVISIONAL prediction. Only its pre-rendered locus
+        // record is rewritten with the stop -- no scoring and no reconstruction here (this may be a memory stop).
+        std::string text = g_watch->checkpoint_locus;
+        text = with_key_value(text, "completion", "budget_stop");
+        text = with_key_value(text, "completion_note", state + ": " + note +
+                                                           "; the last committed checkpoint is kept (search incomplete)");
+        text = with_key_value(text, "legacy_run_status", state);
+        text = with_key_value(text, "checkpoint_search_status", "budget_stop:" + state);
+        atomic_write(g_watch->out_prefix + ".sequence_locus.tsv", text);
+        code = 3;
+    } else if (!(g_watch->early_incumbent && g_watch->checkpoint_failed)) {
+        // S1-C: the sequence-first reports are run-owned too; a stopped run never sits beside an earlier prediction
+        for (const std::string& suffix : sequence_report_outputs()) std::filesystem::remove(g_watch->out_prefix + suffix, ignored);
+        if (g_watch->early_incumbent) {   // S2-A: the budget expired before any candidate was fully evaluated
+            atomic_write(g_watch->out_prefix + ".sequence_locus.tsv",
+                         "key\tvalue\nschema_version\tsequence_first_v2\nprediction\tNO_PREDICTION\nsequence_status\tNA\n"
+                         "completion\tbudget_stop_before_first_evaluated_candidate\ncompletion_note\t" + state + ": " + note +
+                         "\nlegacy_run_status\t" + state + "\ncheckpoint_stage\tnone\nexit_code\t1\n");
+        }
+    } else {
+        code = 2;   // S2-A: a checkpoint publication failed earlier; its failure record stays, never a fallback
+    }
     std::filesystem::remove(g_watch->out_prefix + ".sorted.gfa", ignored);
     atomic_write(g_watch->out_prefix + ".mosaic_status.tsv", minimal_status(*g_watch, state, note));
     std::cerr << "[genotype] " << state << ": " << note << '\n';
@@ -859,7 +971,8 @@ void write_status(
                                 "indexed_union_store_layout", "indexed_union_evidence_layout", "timing_detail", "adaptive_fused_seed",
                                 "marker_proposal_reuse_table_bytes", "combination_prepared_library_terms",
                                 "gap_recursion_backend",
-                                "dosage_census_backend", "adaptive_emission_handoff", "output_schema"}) {
+                                "dosage_census_backend", "adaptive_emission_handoff", "output_schema", "early_incumbent",
+                                "test_interrupt_point"}) {
             const auto source = options.setting_sources.find(key);
             if (source == options.setting_sources.end()) continue;
             const std::string k = key;
@@ -880,6 +993,8 @@ void write_status(
                                       : k == "adaptive_emission_handoff"
                                           ? std::string(options.adaptive_emission_handoff ? "1" : "0")
                                       : k == "output_schema" ? options.output_schema
+                                      : k == "early_incumbent" ? options.early_incumbent
+                                      : k == "test_interrupt_point" ? options.test_interrupt_point
                                       : k == "gap_recursion_backend"
                                           ? std::string(gap_recursion_backend_name(options.gap_recursion_fixed_geometry))
                                                                          : std::to_string(options.adaptive_fine_max_served_placements);
@@ -1355,6 +1470,36 @@ void write_status(
     out << "seconds_total\t" << timings.total << '\n';
     if (options.setting_sources.count("output_schema") != 0) out << "output_schema\t" << options.output_schema << '\n';
     if (sequence_first(options)) out << sequence_report_status_keys(g_sequence_report);
+    if (g_incumbent.enabled) {   // S2-A: the early evaluation's account and the checkpoints (work beside, never reset)
+        const EarlyIncumbent& e = g_incumbent;
+        const FragmentScoringCounters& c = e.early_counters;
+        out << std::setprecision(6) << "early_incumbent\texperimental_v1\nearly_incumbent_status\t" << e.early_status
+            << "\nearly_incumbent_selection\t" << e.selection << "\nearly_incumbent_pairs_examined\t" << e.pairs_examined
+            << "\nearly_incumbent_path_prior_evaluations\t" << e.prior_evaluations
+            << "\nearly_incumbent_seconds_preparation\t" << e.seconds_preparation
+            << "\nearly_incumbent_seconds_selection\t" << e.seconds_selection << "\nearly_incumbent_seconds_evaluation\t"
+            << e.seconds_evaluation << "\nearly_incumbent_candidate_fragment_evaluations\t" << e.early_fragment_evaluations
+            << "\nearly_incumbent_piece_hits\t" << c.piece_hits << "\nearly_incumbent_full_read_verifications\t"
+            << c.full_read_verifications << "\nearly_incumbent_dp_evaluations\t" << c.dp_evaluations
+            << "\nearly_incumbent_accepted_mate_placements\t" << c.accepted_mate_placements
+            << "\nearly_incumbent_physical_origins\t" << c.physical_origins << "\nearly_incumbent_statistical_state_classes\t"
+            << c.statistical_state_classes << "\nearly_incumbent_footprint_after_bytes\t" << e.footprint_after_early
+            << "\nearly_incumbent_union_check\t" << e.union_check;
+        if (!e.early_first.empty()) {   // the early candidate and its components, exact (17 digits round-trip)
+            out << std::defaultfloat << std::setprecision(17) << "\nearly_incumbent_hap1\t" << join_alleles(e.early_first)
+                << "\nearly_incumbent_hap2\t" << join_alleles(e.early_second) << "\nearly_incumbent_log_likelihood\t"
+                << e.early_score.log_likelihood << "\nearly_incumbent_fragment_term\t" << e.early_score.fragment_term
+                << "\nearly_incumbent_exposure_term\t" << e.early_score.exposure_term
+                << "\nearly_incumbent_absolute_term_sum\t" << e.early_score.absolute_term_sum
+                << "\nearly_incumbent_fragments_with_mass\t" << e.early_score.fragments_with_mass
+                << "\nearly_incumbent_sequence_prior\t" << e.early_prior << std::fixed << std::setprecision(6);
+        }
+        out << "\ncheckpoint_commits\t" << e.commits
+            << "\ncheckpoint_last_stage\t" << e.stage << "\ncheckpoint_evaluated_candidates\t" << e.evaluated
+            << "\ncheckpoint_seconds_first_evaluated_prediction\t" << e.seconds_first << "\ncheckpoint_failure\t"
+            << e.failure << '\n';
+        out << std::fixed << std::setprecision(3);
+    }
     if (g_prepared_use.used) {
         // I3-A: this sample was analysed against a prepared locus (stage 1 and the marker panel were not rebuilt)
         out << "prepared_locus\t1\nprepared_locus_id\t" << g_prepared_use.id << "\nprepared_locus_key_sha256\t"
@@ -1545,6 +1690,20 @@ void apply_genotype_setting(const std::string& context, const std::string& key, 
             throw std::runtime_error(context + ": 'output_schema' is legacy, sequence_first_v1 or sequence_first_v2: " + value);
         }
         options.output_schema = value;
+    }
+    else if (key == "early_incumbent") {   // S2-A (EXPERIMENTAL)
+        if (value != "off" && value != "experimental_v1") {
+            throw std::runtime_error(context + ": 'early_incumbent' is off or experimental_v1: " + value);
+        }
+        options.early_incumbent = value;
+    }
+    else if (key == "test_interrupt_point") {   // S2-A TEST HOOK
+        if (value != "none" && value != "before_first_evaluation" && value != "after_checkpoint" &&
+            value != "union_scoring" && value != "adaptive_refinement") {
+            throw std::runtime_error(context + ": 'test_interrupt_point' is none, before_first_evaluation, after_checkpoint, "
+                                     "union_scoring or adaptive_refinement: " + value);
+        }
+        options.test_interrupt_point = value;
     }
     else if (key == "adaptive_emission_handoff") {
         if (value != "0" && value != "1") throw std::runtime_error(context + ": 'adaptive_emission_handoff' is 0 or 1: " + value);
@@ -2194,6 +2353,11 @@ GenotypeRunStatus run_genotype_body(const GenotypeCommandOptions& options, Genot
                                         "; prepare the locus again for these inputs and settings");
         }
     }
+    if (const std::optional<std::string> refused = early_incumbent_refusal(options)) {   // S2-A: before the prefix
+        throw std::invalid_argument(*refused);
+    }
+    g_incumbent = EarlyIncumbent{};   // S2-A
+    g_incumbent.enabled = options.early_incumbent == "experimental_v1";
     set_emission_lookup_timing(options.emission_lookup_timing);
     g_proposal_reuse = ProposalReuseReport{};   // I2-E: never a previous run's figures
     g_sequence_report = SequenceReport{};          // S1-B: likewise
@@ -2289,6 +2453,7 @@ GenotypeRunStatus run_genotype_body(const GenotypeCommandOptions& options, Genot
         watch->started = started;
         watch->footprint_limit = options.footprint_limit_bytes;
         watch->time_limit = options.time_limit_seconds;
+        watch->early_incumbent = g_incumbent.enabled;   // S2-A
         g_watch = watch.get();
         write_running_status("model");
         if (options.footprint_limit_bytes != 0 || options.time_limit_seconds > 0.0) {
@@ -2328,6 +2493,18 @@ GenotypeRunStatus run_genotype_body(const GenotypeCommandOptions& options, Genot
                 // RUNNING behind, which a reader could take for a run still in progress.
                 if (!g_watch->finished && std::uncaught_exceptions() > 0) {
                     try {
+                        if (g_watch->early_incumbent && !g_watch->checkpoint_failed) {
+                            // S2-A: a failure is never a fallback -- no committed checkpoint is left as a prediction
+                            for (const std::string& suffix : sequence_report_outputs()) {
+                                std::remove((g_watch->out_prefix + suffix).c_str());
+                            }
+                            atomic_write(g_watch->out_prefix + ".sequence_locus.tsv",
+                                         "key\tvalue\nschema_version\tsequence_first_v2\nprediction\tNO_PREDICTION\n"
+                                         "sequence_status\tNA\ncompletion\trun_failed\ncompletion_note\tan exception ended the "
+                                         "run before a final status\nlegacy_run_status\tFAILED\ncheckpoint_stage\tnone\n"
+                                         "exit_code\t2\n");
+                            g_watch->checkpoint_committed = false;
+                        }
                         atomic_write(g_watch->out_prefix + ".mosaic_status.tsv",
                                      minimal_status(*g_watch, "FAILED",
                                                     "an exception ended the run before a final status"));
@@ -2549,6 +2726,223 @@ GenotypeRunStatus run_genotype_body(const GenotypeCommandOptions& options, Genot
                             options.phase_audit_candidates == 0 && !positive_prefix_requested;
     candidate_report.panel_only = panel_only;
 
+    // ---- S2-A: the early evaluated incumbent (early_incumbent experimental_v1) ------------------------------
+    // A checkpoint is a PROVISIONAL sequence_first_v2 report of the incumbent: content files first, the locus commit
+    // record last, under the watch mutex (the watchdog sees the previous checkpoint or this one, never a torn one).
+    const auto checkpoint_report = [&](const std::string& completion, const std::string& note) {
+        std::vector<std::string> block_ids;
+        for (const auto& block : model.blocks()) block_ids.push_back(block.block_id);
+        SequenceReport r = provisional_sequence_report(
+            g_incumbent.first, g_incumbent.second, g_incumbent.total, completion, note, block_ids,
+            [&](const std::vector<std::size_t>& labels) { return spell_mosaic(model, MosaicPath{labels}).bases; });
+        if (!g_incumbent.templates_spelled) {   // the active panel, spelled once per run (as annotate_v2 spells it)
+            const PanelAlleleMatrix& active = model.panel();
+            for (std::size_t t = 0; t < active.template_count(); ++t) {
+                g_incumbent.template_sequences.push_back(spell_mosaic(model, MosaicPath{active.template_alleles[t]}).bases);
+                g_incumbent.template_reverse.push_back(t < model.template_source_orientations().size() &&
+                                                       model.template_source_orientations()[t] == ChainOrientation::Reverse);
+            }
+            g_incumbent.templates_spelled = true;
+        }
+        r.schema = "sequence_first_v2";
+        annotate_panel_membership(r, model.panel().template_names, g_incumbent.template_sequences, g_incumbent.template_reverse);
+        for (const auto& item : g_input_hashes) {
+            if (item.first == "gfa") r.graph_sha256 = item.second;
+        }
+        r.model_fingerprint = fingerprint;
+        SequenceCheckpoint& c = r.checkpoint;
+        c.present = true;
+        c.stage = g_incumbent.stage;
+        c.search_status = completion == "checkpoint_search_in_progress" ? "in_progress" : completion;
+        c.selection = g_incumbent.selection;
+        c.evaluated_candidates = g_incumbent.evaluated;
+        c.commits = g_incumbent.commits;
+        c.log_likelihood = g_incumbent.score.log_likelihood;
+        c.fragment_term = g_incumbent.score.fragment_term;
+        c.exposure_term = g_incumbent.score.exposure_term;
+        c.sequence_prior = g_incumbent.sequence_prior;
+        c.total_score = g_incumbent.total;
+        c.fragments_with_mass = g_incumbent.score.fragments_with_mass;
+        c.tied_groups = g_incumbent.tied_groups;
+        c.projection_ambiguous = g_incumbent.projection_ambiguous;
+        c.explored_labellings = g_incumbent.explored_labellings;
+        c.seconds_first = g_incumbent.seconds_first;
+        c.seconds_commit = g_incumbent.seconds_commit;
+        return r;
+    };
+    // Commits the held incumbent; false when the run was already claimed or the publication failed (then the
+    // failure is recorded, the failed report is the run's sequence report, and the caller ends the run).
+    const auto commit_checkpoint = [&]() -> bool {
+        const double now = seconds_since(started);
+        ++g_incumbent.commits;
+        g_incumbent.seconds_commit = now;
+        if (std::isnan(g_incumbent.seconds_first)) g_incumbent.seconds_first = now;
+        SequenceReport r = checkpoint_report("checkpoint_search_in_progress",
+                                             "a fully evaluated candidate, the best among those evaluated so far; the "
+                                             "search continues");
+        SequenceLegacy legacy{"RUNNING", "pending", "NA", options.dosage_mode, dosage_mode_source(options)};
+        if (!g_dosage_stage_follows) {
+            legacy.dosage_mode = "not_run";
+            legacy.dosage_mode_source = "caller_only_api_without_dosage_stage";
+        }
+        std::unique_lock<std::mutex> lock;
+        if (g_watch != nullptr) {
+            lock = std::unique_lock<std::mutex>(g_watch->mutex);
+            if (g_watch->finished) {
+                --g_incumbent.commits;
+                return false;
+            }
+        }
+        if (!publish_sequence_report(r, legacy, options.out_prefix, "")) {
+            g_incumbent.failed = true;
+            g_incumbent.failure = "checkpoint_publication_failed: " + r.publication_error;
+            g_sequence_report = r;   // the failed report (exit 2); its failure record is on disk
+            g_sequence_published = true;
+            if (g_watch != nullptr) {
+                g_watch->checkpoint_committed = false;
+                g_watch->checkpoint_failed = true;
+            }
+            return false;
+        }
+        std::ifstream committed(options.out_prefix + ".sequence_locus.tsv");
+        std::stringstream text;
+        text << committed.rdbuf();
+        if (g_watch != nullptr) {
+            g_watch->checkpoint_committed = true;
+            g_watch->checkpoint_stage = g_incumbent.stage;
+            g_watch->checkpoint_locus = text.str();
+        }
+        g_incumbent.dirty = false;
+        return true;
+    };
+    if (g_incumbent.enabled) {
+        write_running_status("early_incumbent");
+        g_incumbent.seconds_preparation = seconds_since(started);
+        // Selection: the panel pair maximising the existing proposal marker emissions plus the exact path prior (the
+        // ranking's own prior arithmetic), ties to panel order. Table lookups only: nothing is fragment-scored here.
+        const Clock::time_point select_mark = Clock::now();
+        const std::vector<double> early_switch(model.blocks().size() - 1, options.switch_probability);
+        std::map<std::vector<std::size_t>, double> early_path_prior;
+        const auto path_prior_of = [&](const MosaicPath& path) {
+            const auto found = early_path_prior.find(path.alleles);
+            if (found != early_path_prior.end()) return found->second;
+            ++g_incumbent.prior_evaluations;
+            const double value = log_haploid_mosaic_prior(model.panel(), path, early_switch);
+            early_path_prior.emplace(path.alleles, value);
+            return value;
+        };
+        std::size_t chosen = 0;
+        double best = -std::numeric_limits<double>::infinity();
+        for (std::size_t i = 0; i < panel_candidates.size(); ++i) {
+            const MosaicDiplotype& d = panel_candidates[i].diplotype;
+            double value = 0.0;
+            for (std::size_t b = 0; b < model.blocks().size(); ++b) value += emissions.blocks[b].at(d.first.alleles[b], d.second.alleles[b]);
+            const double pa = path_prior_of(d.first), pb = path_prior_of(d.second);
+            const double negative_infinity = -std::numeric_limits<double>::infinity();
+            value = pa == negative_infinity || pb == negative_infinity
+                        ? negative_infinity
+                        : value + pa + pb + (d.first != d.second ? std::log(2.0) : 0.0);
+            ++g_incumbent.pairs_examined;
+            if (i == 0 || value > best) {
+                best = value;
+                chosen = i;
+            }
+        }
+        g_incumbent.selection = "argmax_proposal_marker_emissions_plus_exact_path_prior;panel_pairs_examined=" +
+                                std::to_string(g_incumbent.pairs_examined) + ";ties_to_panel_order;not_a_winner_claim";
+        g_incumbent.seconds_selection = seconds_since(select_mark);
+        if (options.test_interrupt_point == "before_first_evaluation") {
+            stop_run("TIME_LIMIT", "test hook: before the first candidate evaluation completed", 124);
+        }
+        // Full evaluation of that one pair under the unchanged scorer: every fragment, the admitted placements and
+        // paired geometry, exposure (through the union pass's own route and caps), and the ranking's sequence prior.
+        const Clock::time_point evaluate_mark = Clock::now();
+        const MosaicDiplotype& early = panel_candidates[chosen].diplotype;
+        const HaplotypeSequence ea = spell_mosaic(model, early.first), eb = spell_mosaic(model, early.second);
+        const InternedHaplotypes early_interned = intern_haplotypes({early.first, early.second}, {ea.bases, eb.bases});
+        const std::vector<HaplotypeCandidate> early_pair{
+            {std::min(early_interned.index_of[0], early_interned.index_of[1]),
+             std::max(early_interned.index_of[0], early_interned.index_of[1])}};
+        FragmentScoringOptions early_options;
+        early_options.threads = options.threads;
+        early_options.mismatch_band = options.mismatch_band;
+        early_options.minimum_piece_bp = options.minimum_piece_bp;
+        early_options.max_piece_hits = options.max_piece_hits;
+        early_options.max_proposed_starts_per_haplotype = options.max_proposed_starts_per_haplotype;
+        early_options.max_physical_origins = options.max_physical_origins;
+        early_options.max_state_classes = options.max_state_classes;
+        early_options.max_mass_cells = options.max_mass_cells;
+        early_options.emission_cache_bytes = options.emission_cache_bytes;
+        early_options.prepared_library_terms = options.combination_prepared_library_terms;
+        early_options.gap_recursion_backend = gap_recursion_backend_of(options);
+        early_options.union_prefilter_cache_bytes = options.union_prefilter_cache_bytes;
+        early_options.start_sort_scratch_bytes = options.start_sort_scratch_bytes;
+        early_options.max_union_cached_prefilters_consumed = options.max_union_cached_prefilters_consumed;
+        try {
+            FragmentScoringResult early_scored;
+            if (options.union_scoring_backend == "indexed_fine_experimental") {
+                std::vector<std::vector<std::uint32_t>> segments(early_interned.sequences.size());
+                for (std::size_t slot = 0; slot < 2; ++slot) {
+                    const HaplotypeSequence& spelled = slot == 0 ? ea : eb;
+                    std::vector<std::uint32_t>& lengths = segments[early_interned.index_of[slot]];
+                    if (!lengths.empty()) continue;
+                    std::size_t cut = 0;
+                    for (std::size_t b = 1; b < spelled.block_intervals.size(); ++b) {
+                        const std::size_t next = std::max(cut, std::min(spelled.block_intervals[b].begin, spelled.bases.size()));
+                        lengths.push_back(static_cast<std::uint32_t>(next - cut));
+                        cut = next;
+                    }
+                    lengths.push_back(static_cast<std::uint32_t>(spelled.bases.size() - cut));
+                }
+                // the union call's own indexed settings (score identity is gated by the union check below)
+                early_options.max_union_cached_placements_consumed = options.max_union_cached_placements_consumed;
+                early_options.union_origin_cache_bytes = options.union_origin_cache_bytes;
+                early_options.max_union_cached_origins_consumed = options.max_union_cached_origins_consumed;
+                early_options.max_union_cached_states_consumed = options.max_union_cached_states_consumed;
+                early_scored = score_diplotypes_indexed_union(early_interned, early_pair, fragments, library, early_options,
+                                                              segments, options.indexed_union_store_bytes, nullptr, nullptr,
+                                                              options.indexed_union_store_layout == "legacy_i2a",
+                                                              options.indexed_union_evidence_layout == "fine_views_experimental");
+            } else {
+                early_scored = score_diplotypes(early_interned, early_pair, fragments, library, early_options);
+            }
+            g_incumbent.early_counters = early_scored.counters;
+            g_incumbent.early_fragment_evaluations = early_scored.candidate_fragment_evaluations;
+            const double ha = log_haploid_sequence_prior(model, ea.bases, early_switch);
+            const double hb = log_haploid_sequence_prior(model, eb.bases, early_switch);
+            g_incumbent.have = true;
+            g_incumbent.first = early.first.alleles;
+            g_incumbent.second = early.second.alleles;
+            g_incumbent.score = early_scored.scores.front();
+            g_incumbent.sequence_prior = ha + hb + (ea.bases != eb.bases ? std::log(2.0) : 0.0);
+            g_incumbent.total = g_incumbent.score.log_likelihood + g_incumbent.sequence_prior;
+            g_incumbent.stage = "early_panel_incumbent";
+            g_incumbent.evaluated = 1;
+            g_incumbent.dirty = true;
+            g_incumbent.early_status = "evaluated";
+            g_incumbent.early_first = g_incumbent.first;
+            g_incumbent.early_second = g_incumbent.second;
+            g_incumbent.early_score = g_incumbent.score;
+            g_incumbent.early_prior = g_incumbent.sequence_prior;
+        } catch (const ResourceExhausted& error) {
+            g_incumbent.early_status = std::string("refused_at_declared_cap: ") + error.what();
+        }
+        g_incumbent.seconds_evaluation = seconds_since(evaluate_mark);
+        g_incumbent.footprint_after_early = physical_footprint().current;
+        if (g_incumbent.have && !commit_checkpoint() && g_incumbent.failed) {
+            timings.total = seconds_since(started);
+            write_status(status_path, GenotypeRunStatus::RescoreIncomplete, fingerprint, options, library, timings,
+                         &locus_report, &panel, nullptr, nullptr,
+                         "the early incumbent checkpoint could not be published (" + g_incumbent.failure +
+                             "); an explicit failure, never a fallback",
+                         nullptr, &depth, &candidate_report);
+            return GenotypeRunStatus::RescoreIncomplete;
+        }
+        if (options.test_interrupt_point == "after_checkpoint") {
+            stop_run("TIME_LIMIT", "test hook: immediately after the first checkpoint commit", 124);
+        }
+    }
+
     // ---- stage 3b: mosaic proposal --------------------------------------------------------------------------
     write_running_status("proposal");
     mark = Clock::now();
@@ -2580,6 +2974,11 @@ GenotypeRunStatus run_genotype_body(const GenotypeCommandOptions& options, Genot
         } catch (const std::length_error& error) {
             timings.proposal = seconds_since(mark);
             timings.total = seconds_since(started);
+            if (g_incumbent.enabled && g_incumbent.have && !g_incumbent.failed) {   // S2-A: a declared cap stop
+                g_sequence_report = checkpoint_report("proposal_cap", std::string("the mosaic proposal stopped at a declared "
+                                                      "resource budget (") + error.what() + "); the best fully evaluated "
+                                                      "candidate so far; search incomplete");
+            }
             write_status(status_path, GenotypeRunStatus::CandidateIncomplete, fingerprint, options, library,
                          timings, &locus_report, &panel, nullptr, nullptr,
                          std::string("the proposal exceeded its declared resource budget: ") + error.what(),
@@ -2677,6 +3076,9 @@ GenotypeRunStatus run_genotype_body(const GenotypeCommandOptions& options, Genot
     timings.spelling = seconds_since(mark);
 
     write_running_status("union_scoring");
+    if (options.test_interrupt_point == "union_scoring") {   // S2-A TEST HOOK: the union pass has not completed
+        stop_run("TIME_LIMIT", "test hook: during union scoring (before the union pass completed)", 124);
+    }
     mark = Clock::now();
     FragmentScoringOptions scoring_options;
     // I2-K (EXPERIMENTAL): owned here for this sample only; destroyed on every exit, adopted at most once
@@ -3232,7 +3634,8 @@ GenotypeRunStatus run_genotype_body(const GenotypeCommandOptions& options, Genot
             }
             // S1-C: the sequence report is published before the status commits it: its files first, its locus record
             // last; a failure leaves no partial report and the status says so.
-            if (sequence_first(options)) {
+            if (g_incumbent.enabled) claim_run();   // S2-A: the watchdog can no longer overwrite the final report
+            if (sequence_first(options) && !g_sequence_published) {   // S2-A: a failed checkpoint already published
                 publish_sequence_report(g_sequence_report, g_sequence_legacy, options.out_prefix,
                                         "no completed ranking and no safely available evaluated candidate (" +
                                             g_sequence_legacy.run_status + ", " + g_sequence_legacy.no_call_reason + ")");
@@ -3258,6 +3661,67 @@ GenotypeRunStatus run_genotype_body(const GenotypeCommandOptions& options, Genot
             atomic_write(path, text);
         };
 
+        // ---- S2-A: the union pass completed: the early candidate must reproduce there bit for bit, and the union's
+        // best fully evaluated candidate replaces the incumbent (a complete, exactly scored set)
+        if (g_incumbent.enabled && !g_incumbent.failed) {
+            const auto sequence_key = [&](const std::vector<std::size_t>& a, const std::vector<std::size_t>& b) {
+                std::size_t x = interned.index_of[slot_of_path.at(a)], y = interned.index_of[slot_of_path.at(b)];
+                if (y < x) std::swap(x, y);
+                return std::make_pair(x, y);
+            };
+            const auto union_prior = [&](const std::pair<std::size_t, std::size_t>& key) {
+                return haploid_sequence_prior[key.first] + haploid_sequence_prior[key.second] +
+                       (key.first != key.second ? std::log(2.0) : 0.0);
+            };
+            if (g_incumbent.have && g_incumbent.stage == "early_panel_incumbent") {
+                const auto key = sequence_key(g_incumbent.first, g_incumbent.second);
+                const DiplotypeScore& u = scored.scores[scored_index.at(key)];
+                const DiplotypeScore& e = g_incumbent.score;
+                const auto bits = [](double a, double b) { return std::memcmp(&a, &b, sizeof(double)) == 0; };
+                const bool same = bits(u.log_likelihood, e.log_likelihood) && bits(u.fragment_term, e.fragment_term) &&
+                                  bits(u.exposure_term, e.exposure_term) &&
+                                  bits(u.absolute_term_sum, e.absolute_term_sum) &&
+                                  u.fragments_with_mass == e.fragments_with_mass &&
+                                  bits(union_prior(key), g_incumbent.sequence_prior);
+                g_incumbent.union_check = same ? "reproduced" : "MISMATCH";
+                if (!same) {
+                    g_incumbent.failed = true;
+                    g_incumbent.failure = "scoring_inconsistency: the union pass did not reproduce the early incumbent";
+                    report.no_call_reason = "early_incumbent_not_reproduced";
+                    std::ostringstream why;
+                    why << std::setprecision(17) << "scoring inconsistency: the early incumbent scored " << e.log_likelihood
+                        << " and the union pass " << u.log_likelihood << "; an explicit failure, never a fallback";
+                    return stop_with(GenotypeRunStatus::RescoreIncomplete, why.str(), nullptr, nullptr);
+                }
+            }
+            const CertifiedCandidate& top = union_ranking.candidates.front();
+            const SequenceCandidate& group = chosen.sequence_candidates[top.candidate_id];
+            const MosaicDiplotype& best = candidates[group.representative].diplotype;
+            const std::pair<std::size_t, std::size_t> key{group.first, group.second};
+            const DiplotypeScore& score = scored.scores[scored_index.at(key)];
+            const double prior = union_prior(key);
+            g_incumbent.evaluated = candidates.size();
+            if (!g_incumbent.have || score.log_likelihood + prior >= g_incumbent.total) {
+                g_incumbent.have = true;
+                g_incumbent.first = best.first.alleles;
+                g_incumbent.second = best.second.alleles;
+                g_incumbent.score = score;
+                g_incumbent.sequence_prior = prior;
+                g_incumbent.total = score.log_likelihood + prior;
+                g_incumbent.stage = "union_best";
+                g_incumbent.tied_groups = std::to_string(union_ranking.winner_set.size());
+                g_incumbent.projection_ambiguous = group.projection_ambiguous ? "yes" : "no";
+                g_incumbent.explored_labellings = std::to_string(group.members.size());
+            }
+            if (!commit_checkpoint() && g_incumbent.failed) {
+                report.no_call_reason = "checkpoint_publication_failed";
+                return stop_with(GenotypeRunStatus::RescoreIncomplete,
+                                 "the union checkpoint could not be published (" + g_incumbent.failure +
+                                     "); an explicit failure, never a fallback",
+                                 nullptr, nullptr);
+            }
+        }
+
         // ---- 1. the anchor: the best exactly scored panel diplotype, by the union's exact ranking
         std::size_t anchor = npos;
         std::size_t anchor_rank = 0;
@@ -3282,6 +3746,10 @@ GenotypeRunStatus run_genotype_body(const GenotypeCommandOptions& options, Genot
         report.anchor_hap2 = join_alleles(anchor_diplotype.second.alleles);
         if (options.repair_max_neighbours != 0 && report.neighbour_bound > options.repair_max_neighbours) {
             report.no_call_reason = "neighbourhood_bound";
+            if (g_incumbent.enabled && g_incumbent.have && !g_incumbent.failed) {   // S2-A: a declared cap stop
+                g_sequence_report = checkpoint_report("neighbourhood_bound", "the repair neighbourhood exceeds its declared "
+                                                      "bound; the best fully evaluated candidate so far; search incomplete");
+            }
             return stop_with(GenotypeRunStatus::RepairIncomplete,
                              "one repair round's neighbourhood (" + std::to_string(report.neighbour_bound) +
                                  ") exceeds its declared bound " + std::to_string(options.repair_max_neighbours) +
@@ -3491,6 +3959,20 @@ GenotypeRunStatus run_genotype_body(const GenotypeCommandOptions& options, Genot
                                 ? &production_items
                                 : nullptr,
                             round);
+                if (g_incumbent.enabled) {   // S2-A: a fully evaluated candidate; replaces the incumbent only if better
+                    ++g_incumbent.evaluated;
+                    if (score.log_likelihood + prior > g_incumbent.total) {
+                        g_incumbent.have = true;
+                        g_incumbent.first = a;
+                        g_incumbent.second = b;
+                        g_incumbent.score = score;
+                        g_incumbent.sequence_prior = prior;
+                        g_incumbent.total = score.log_likelihood + prior;
+                        g_incumbent.stage = "repair_pool_best";
+                        g_incumbent.tied_groups = g_incumbent.projection_ambiguous = g_incumbent.explored_labellings = "NA";
+                        g_incumbent.dirty = true;
+                    }
+                }
             };
             if (audit_on) hooks.on_scored_views = record_views;
             hooks.on_round = [&](const RepairRound& round) {
@@ -3501,6 +3983,10 @@ GenotypeRunStatus run_genotype_body(const GenotypeCommandOptions& options, Genot
                     g_watch->repair_rounds_committed = search->rounds().size();
                 }
                 write_running_status("repair round " + std::to_string(round.index) + " committed");
+                if (g_incumbent.enabled && g_incumbent.dirty && !g_incumbent.failed) (void)commit_checkpoint();   // S2-A
+                if (options.test_interrupt_point == "adaptive_refinement") {   // S2-A TEST HOOK
+                    stop_run("TIME_LIMIT", "test hook: during adaptive refinement (after the first committed round)", 124);
+                }
                 if (options.test_interrupt_after_repair_rounds != 0 && round.moved &&
                     search->rounds().size() >= options.test_interrupt_after_repair_rounds) {
                     stop_run("TIME_LIMIT",
@@ -3522,6 +4008,13 @@ GenotypeRunStatus run_genotype_body(const GenotypeCommandOptions& options, Genot
             report.no_call_reason = "repair_failed";
             return stop_with(GenotypeRunStatus::RepairIncomplete,
                              std::string("the repair search failed and returned no genotype: ") + error.what(),
+                             nullptr, nullptr);
+        }
+        if (g_incumbent.enabled && g_incumbent.failed) {   // S2-A: a checkpoint publication failed during the search
+            report.no_call_reason = "checkpoint_publication_failed";
+            return stop_with(GenotypeRunStatus::RepairIncomplete,
+                             "a repair checkpoint could not be published (" + g_incumbent.failure +
+                                 "); an explicit failure, never a fallback",
                              nullptr, nullptr);
         }
         if (search) {
@@ -3548,6 +4041,10 @@ GenotypeRunStatus run_genotype_body(const GenotypeCommandOptions& options, Genot
         // S1-B (sequence_first_v1 only): a declared-cap stop keeps the last committed, exactly scored incumbent as
         // PROVISIONAL -- only after at least one committed round (the anchor reproduced and was rescored).
         const auto provisional = [&](const std::string& stop, const std::string& note) {
+            if (g_incumbent.enabled) {   // S2-A: the best fully evaluated candidate so far (never the partial search state)
+                if (g_incumbent.have && !g_incumbent.failed) g_sequence_report = checkpoint_report(stop, note);
+                return;
+            }
             if (!sequence_first(options) || !search || search->rounds().empty()) return;
             std::vector<std::string> block_ids;
             for (const auto& block : model.blocks()) block_ids.push_back(block.block_id);
@@ -5615,6 +6112,11 @@ GenotypeRunStatus run_genotype_body(const GenotypeCommandOptions& options, Genot
         // the missing mosaics are explicit rather than a reason to withhold it.
         if (!rescore_failure.empty()) {
             timings.total = seconds_since(started);
+            if (g_incumbent.enabled && g_incumbent.have && !g_incumbent.failed) {   // S2-A: a declared cap stop
+                g_sequence_report = checkpoint_report("union_scoring_cap", "the union pass stopped at a declared "
+                                                      "resource cap (" + rescore_failure + "); the best fully evaluated "
+                                                      "candidate so far; search incomplete");
+            }
             write_status(status_path, GenotypeRunStatus::RescoreIncomplete, fingerprint, options, library,
                          timings, &locus_report, &panel, (panel_only ? nullptr : &beam), nullptr,
                          "rescoring stopped at a declared resource cap and returned no ranking: " +
@@ -6394,6 +6896,7 @@ std::optional<int> parse_genotype_arguments(const std::vector<std::string>& args
     // evaluated); repair is refused -- historical repair reproduction belongs to the legacy contract. S1-D.1: the one
     // resolver execute_genotype_command applies too.
     if (const std::optional<std::string> refused = resolve_dosage_contract(options)) throw std::runtime_error(*refused);
+    if (const std::optional<std::string> refused = early_incumbent_refusal(options)) throw std::runtime_error(*refused);
     if (profiled) {
         // Every setting a flag gave beside the profile, with the value it took.
         for (const std::string& flag : args) {

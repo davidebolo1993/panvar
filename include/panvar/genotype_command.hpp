@@ -199,6 +199,18 @@ struct GenotypeCommandOptions {
     // S1-D.1: where the dosage mode in effect came from, set by resolve_dosage_contract (and by the dosage flags):
     // "default", "flag --dosage-mode", "flag --dosage-audit", "caller_options" or "contract_default_sequence_first_v2".
     std::string dosage_mode_source = "default";
+    // S2-A (EXPERIMENTAL, opt-in; profile key early_incumbent off|experimental_v1; sequence_first_v2 with the adaptive
+    // repair only): before the mosaic proposal and the union pass, one deterministic panel diplotype -- the argmax of
+    // the existing proposal marker emissions plus the exact path prior over the panel pairs, ties to panel order -- is
+    // fully evaluated by the unchanged scorer and checkpointed as a PROVISIONAL prediction (best among the candidates
+    // evaluated so far; search incomplete). The checkpoint is replaced only by a better fully evaluated candidate
+    // (the union's best, then any repair-scored candidate at a committed round). A declared budget stop after a
+    // checkpoint (the watchdog's time or footprint limit, or a declared cap) keeps it as PROVISIONAL; before one, the
+    // run ends as a typed NO_PREDICTION. Scores, ranking, caps and completed-run conclusions are unchanged.
+    std::string early_incumbent = "off";
+    // S2-A TEST HOOK (profile key test_interrupt_point): a deterministic time-limit stop at none |
+    // before_first_evaluation | after_checkpoint | union_scoring | adaptive_refinement (after the first committed round).
+    std::string test_interrupt_point = "none";
     // I2-B (EXPERIMENTAL, profile keys only, never public settings): how the adaptive search's window enumeration builds
     // its placement rows. "reference" (the default) scans each enumerated window whole, unchanged. "fine_experimental"
     // builds the same rows from a round-local, per-worker fine store (PreparedScoringContext::

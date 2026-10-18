@@ -82,6 +82,26 @@ struct HaplotypeOrigin {
     std::vector<std::string> orientations;   // per path: forward | reverse_complement (source path vs locus chain)
 };
 
+// S2-A (early_incumbent experimental_v1, sequence_first_v2 only): what a checkpointed incumbent is. It is a fully
+// evaluated candidate (every fragment, the admitted placements and paired geometry, exposure, the ranking's sequence
+// prior), the best among the candidates evaluated so far; the search is incomplete. Never a global optimum, a
+// calibrated correctness claim or a confidence.
+struct SequenceCheckpoint {
+    bool present = false;
+    std::string stage;                          // early_panel_incumbent | union_best | repair_pool_best
+    std::string search_status = "in_progress";  // in_progress | the stop that ended the search
+    std::string selection = "NA";               // how the early candidate was chosen (stage early_panel_incumbent)
+    std::size_t evaluated_candidates = 0;       // fully evaluated labelled diplotypes when committed
+    std::size_t commits = 0;                    // checkpoints committed in this run, this one included
+    double log_likelihood = 0.0, fragment_term = 0.0, exposure_term = 0.0, sequence_prior = 0.0, total_score = 0.0;
+    std::size_t fragments_with_mass = 0;
+    std::string tied_groups = "NA";             // union_best: numerically tied groups of the union ranking; else NA
+    std::string projection_ambiguous = "NA";    // union_best: explored labellings of the group disagree somewhere
+    std::string explored_labellings = "NA";     // union_best: labellings of the group in the union
+    double seconds_first = std::numeric_limits<double>::quiet_NaN();    // run start -> first committed checkpoint
+    double seconds_commit = std::numeric_limits<double>::quiet_NaN();   // run start -> this checkpoint
+};
+
 struct SequenceReport {
     bool built = false;
     std::string schema = "sequence_first_v1";   // sequence_first_v1 | sequence_first_v2 (S1-D)
@@ -113,6 +133,7 @@ struct SequenceReport {
     // S1-D (sequence_first_v2 only)
     HaplotypeOrigin origin[2];                  // hap1, hap2
     std::string graph_sha256 = "NA", model_fingerprint = "NA";
+    SequenceCheckpoint checkpoint;              // S2-A: a checkpointed incumbent (PROVISIONAL only)
 };
 
 // S1-D: classifies hap1/hap2 against the active panel (template names, their spelled locus-frame sequences, and

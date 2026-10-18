@@ -488,6 +488,27 @@ void write_sequence_report(const SequenceReport& r, const SequenceLegacy& legacy
                  "dosage_contract\tdiagnostic_audit_only;never_modifies_this_prediction;see_dosage_status.tsv\n"
                  "dosage_mode_source\t"
               << legacy.dosage_mode_source << '\n';
+        if (r.checkpoint.present) {   // S2-A: the checkpointed incumbent, its scope and its score components
+            const SequenceCheckpoint& c = r.checkpoint;
+            const auto exact = [](double v) {
+                std::ostringstream o;
+                o << std::setprecision(17) << v;
+                return o.str();
+            };
+            locus << "checkpoint_stage\t" << c.stage << "\ncheckpoint_semantics\tfully_evaluated_candidate;"
+                     "best_among_candidates_evaluated_so_far;search_incomplete;not_a_global_optimum;"
+                     "no_calibrated_correctness;no_confidence_from_the_evaluated_count\ncheckpoint_search_status\t"
+                  << c.search_status << "\ncheckpoint_selection\t" << c.selection << "\ncheckpoint_evaluated_candidates\t"
+                  << c.evaluated_candidates << "\ncheckpoint_commits\t" << c.commits << "\ncheckpoint_log_likelihood\t"
+                  << exact(c.log_likelihood) << "\ncheckpoint_fragment_term\t" << exact(c.fragment_term)
+                  << "\ncheckpoint_exposure_term\t" << exact(c.exposure_term) << "\ncheckpoint_sequence_prior\t"
+                  << exact(c.sequence_prior) << "\ncheckpoint_total_score\t" << exact(c.total_score)
+                  << "\ncheckpoint_fragments_with_mass\t" << c.fragments_with_mass << "\ncheckpoint_tied_groups\t"
+                  << c.tied_groups << "\ncheckpoint_projection_ambiguous\t" << c.projection_ambiguous
+                  << "\ncheckpoint_explored_labellings\t" << c.explored_labellings
+                  << "\ncheckpoint_seconds_first_evaluated_prediction\t" << exact(c.seconds_first)
+                  << "\ncheckpoint_seconds_committed\t" << exact(c.seconds_commit) << '\n';
+        }
     }
     const std::string locus_text = locus.str();   // the commit record: published last (S1-C)
 
