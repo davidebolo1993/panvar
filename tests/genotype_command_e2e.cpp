@@ -4781,6 +4781,81 @@ void test_early_incumbent() {
                  "1/4 threads, prefix reuse, publication failure, contract refusal\n";
 }
 
+// ---- S2-B: maintained regressions for S2-A's declared-cap stops (after Sol's review reproducer) and the explicit
+// failure on a scoring inconsistency. Each cap stop after a checkpoint publishes the best fully evaluated candidate as
+// PROVISIONAL (exit 3, completion = the cap); the inconsistency is never a provisional fallback.
+void test_early_incumbent_caps() {
+    namespace fs = std::filesystem;
+    const auto fresh = [&](const std::string& rel) {
+        fs::remove_all(path(rel));
+        fs::create_directories(path(rel));
+        panvar::GenotypeCommandOptions o =
+            repair_options(rel + "/call", path("phaseable_r1.fq"), path("phaseable_r2.fq"), "tiny_phaseable.gfa");
+        o.output_schema = "sequence_first_v2";
+        o.setting_sources["output_schema"] = "test";
+        o.early_incumbent = "experimental_v1";
+        o.setting_sources["early_incumbent"] = "test";
+        return o;
+    };
+    // the reference completed run: the early pass's and the union's physical origins (for the union cap)
+    const panvar::GenotypeCommandOptions reference = fresh("eic_reference");
+    require(panvar::execute_genotype_command(reference, nullptr) == 0, "S2-B caps: the reference run predicts");
+    const auto ref_status = read_status(path("eic_reference/call.mosaic_status.tsv"));
+    const std::uint64_t early_origins = std::stoull(ref_status.at("early_incumbent_physical_origins"));
+    const std::uint64_t union_origins = std::stoull(ref_status.at("physical_origins"));
+    require(early_origins > 0 && union_origins > early_origins, "S2-B caps: the union pass places more origins than the early pass");
+    struct Case {
+        std::string name, completion, stage;
+        std::function<void(panvar::GenotypeCommandOptions&)> configure;
+    };
+    const std::vector<Case> cases = {
+        {"proposal", "proposal_cap", "early_panel_incumbent",
+         [](panvar::GenotypeCommandOptions& o) { o.max_mosaic_candidates = 128; o.max_beam_extensions = 1; }},
+        {"union", "union_scoring_cap", "early_panel_incumbent",
+         [&](panvar::GenotypeCommandOptions& o) { o.max_physical_origins = early_origins; }},
+        {"cumulative", "cumulative_cap", "union_best",
+         [](panvar::GenotypeCommandOptions& o) { o.repair_max_physical_origins = 1; }},
+        {"neighbours", "neighbourhood_bound", "union_best",
+         [](panvar::GenotypeCommandOptions& o) { o.repair_max_neighbours = 1; }},
+    };
+    for (const Case& c : cases) {
+        const std::string rel = "eic_" + c.name;
+        panvar::GenotypeCommandOptions o = fresh(rel);
+        c.configure(o);
+        const int code = panvar::execute_genotype_command(o, nullptr);
+        const auto locus = sf::kv(path(rel + "/call.sequence_locus.tsv"));
+        const auto st = read_status(path(rel + "/call.mosaic_status.tsv"));
+        require(code == 3 && locus.at("prediction") == "PROVISIONAL" && locus.at("completion") == c.completion &&
+                    locus.at("checkpoint_stage") == c.stage && locus.at("checkpoint_search_status") == c.completion &&
+                    st.at("sequence_prediction") == "PROVISIONAL" && st.at("sequence_exit_code") == "3" &&
+                    st.at("checkpoint_failure") == "none" && exists(path(rel + "/call.sequence_haplotypes.tsv")),
+                "S2-B caps: " + c.name + " stop keeps the best fully evaluated candidate as PROVISIONAL (exit " +
+                    std::to_string(code) + ", completion " + (locus.count("completion") ? locus.at("completion") : "NA") +
+                    ", stage " + (locus.count("checkpoint_stage") ? locus.at("checkpoint_stage") : "NA") + ")");
+        if (c.stage == "early_panel_incumbent") {
+            require(locus.at("checkpoint_log_likelihood") == ref_status.at("early_incumbent_log_likelihood"),
+                    "S2-B caps: " + c.name + " keeps exactly the early candidate's evaluation");
+        }
+    }
+    // a scoring inconsistency (the early candidate moved one ulp) is an explicit failure, never a provisional fallback
+    {
+        panvar::GenotypeCommandOptions o = fresh("eic_inconsistent");
+        o.test_perturb_early_incumbent_score = true;
+        const int code = panvar::execute_genotype_command(o, nullptr);
+        const auto locus = sf::kv(path("eic_inconsistent/call.sequence_locus.tsv"));
+        const auto st = read_status(path("eic_inconsistent/call.mosaic_status.tsv"));
+        require(code != 0 && code != 3 && locus.at("prediction") == "NO_PREDICTION" &&
+                    locus.at("legacy_no_call_reason") == "early_incumbent_not_reproduced" &&
+                    st.at("early_incumbent_union_check") == "MISMATCH" &&
+                    st.at("checkpoint_failure").rfind("scoring_inconsistency", 0) == 0 &&
+                    read_rows(path("eic_inconsistent/call.sequence_haplotypes.tsv")).empty() &&
+                    no_ranking_or_call("eic_inconsistent/call"),
+                "S2-B: a scoring inconsistency ends the run explicitly with no prediction (exit " + std::to_string(code) + ")");
+    }
+    std::cout << "  early incumbent caps: proposal, union, cumulative and neighbourhood stops keep the best evaluated "
+                 "candidate as PROVISIONAL; a scoring inconsistency is an explicit no-prediction failure\n";
+}
+
 int main(int argc, char** argv) {
     if (argc < 2) {
         std::cerr << "usage: genotype_command_e2e_test <scratch dir> [source dir]\n";
@@ -4826,8 +4901,8 @@ int main(int argc, char** argv) {
             test_sequence_first_lifecycle();
             test_sequence_first_v2();
             test_sequence_first_v2_contract();
-        test_early_incumbent();
             test_early_incumbent();
+            test_early_incumbent_caps();
             std::cout << "genotype command e2e (sequence_first only): PASS\n";
             return 0;
         } catch (const std::exception& error) {
@@ -4876,6 +4951,8 @@ int main(int argc, char** argv) {
         test_sequence_first_lifecycle();
         test_sequence_first_v2();
         test_sequence_first_v2_contract();
+        test_early_incumbent();
+        test_early_incumbent_caps();
         if (argc >= 3) test_profile(argv[2]);
         test_block_quality_columns();
         std::cout << "genotype command end-to-end: PASS\n";

@@ -211,6 +211,9 @@ struct GenotypeCommandOptions {
     // S2-A TEST HOOK (profile key test_interrupt_point): a deterministic time-limit stop at none |
     // before_first_evaluation | after_checkpoint | union_scoring | adaptive_refinement (after the first committed round).
     std::string test_interrupt_point = "none";
+    // S2-B TEST HOOK (API only): the early candidate's log-likelihood is moved one ulp before the union check, so the
+    // check must fail the run explicitly (never a provisional fallback).
+    bool test_perturb_early_incumbent_score = false;
     // I2-B (EXPERIMENTAL, profile keys only, never public settings): how the adaptive search's window enumeration builds
     // its placement rows. "reference" (the default) scans each enumerated window whole, unchanged. "fine_experimental"
     // builds the same rows from a round-local, per-worker fine store (PreparedScoringContext::

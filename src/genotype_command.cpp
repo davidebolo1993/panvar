@@ -115,6 +115,7 @@ std::string dosage_mode_source(const GenotypeCommandOptions& options) { return o
 std::optional<std::string> early_incumbent_refusal(const GenotypeCommandOptions& o) {
     if (o.early_incumbent != "experimental_v1") {
         if (o.test_interrupt_point != "none") return std::string("test_interrupt_point needs early_incumbent experimental_v1");
+        if (o.test_perturb_early_incumbent_score) return std::string("test_perturb_early_incumbent_score needs early_incumbent experimental_v1");
         return std::nullopt;
     }
     const std::string what = "early_incumbent experimental_v1 ";
@@ -2920,6 +2921,11 @@ GenotypeRunStatus run_genotype_body(const GenotypeCommandOptions& options, Genot
             g_incumbent.evaluated = 1;
             g_incumbent.dirty = true;
             g_incumbent.early_status = "evaluated";
+            if (options.test_perturb_early_incumbent_score) {   // S2-B TEST HOOK: an inconsistency the union check must catch
+                g_incumbent.score.log_likelihood =
+                    std::nextafter(g_incumbent.score.log_likelihood, std::numeric_limits<double>::infinity());
+                g_incumbent.total = g_incumbent.score.log_likelihood + g_incumbent.sequence_prior;
+            }
             g_incumbent.early_first = g_incumbent.first;
             g_incumbent.early_second = g_incumbent.second;
             g_incumbent.early_score = g_incumbent.score;
