@@ -72,7 +72,7 @@ identical per-fragment evidence or as biological unidentifiability.
 **Unchanged in both modes:** `genotype_support` (READS / PRIOR_ONLY, legacy fragment-only), `phase_support`,
 `quality_filter`, `quality_reason`, GQ, posterior, `numerically_separated` and every filter.
 
-**Appended to `.block_genotypes.tsv` when experimental:**
+**Added to `.block_genotypes.tsv` when experimental** (after `quality_reason`; the headline stage appends `genotype_filter` / `genotype_filter_reasons` / `dosage_filter` / `dosage_filter_reasons` after them, so they are not the last columns; readers must use column names; corrected in Amendment 1):
 - `genotype_support_v1x`
 - `quality_filter_v1x`, `quality_reason_v1x`
 - `data_support_margin_v1x`, `data_support_certified_v1x`

@@ -50,7 +50,8 @@ MANIFEST_R = ([(f"run.{c}.{arm}", "run", f"{c}:{arm}", TIMEOUT[c] + (30 if arm =
 # gate.support (manifest G) failed on gate fixtures, recorded; the fixtures were corrected (commits 0a9044b..) and the final
 # gate units below run on committed code
 MANIFEST_G2 = [("gate.support.final", "gate_support", "-", 60), ("gate.e2e.final", "gate_e2e", "-", 60)]
-MANIFESTS = {"A": MANIFEST_A, "G": MANIFEST_G, "G2": MANIFEST_G2, "R": MANIFEST_R}
+MANIFEST_A1 = [("compare.a1", "cmp", "-", 30)]   # Amendment 1: block table by column name; profile identity normalised
+MANIFESTS = {"A": MANIFEST_A, "G": MANIFEST_G, "G2": MANIFEST_G2, "R": MANIFEST_R, "A1": MANIFEST_A1}
 CARRIED = 0.0
 INPUTS = {r["cell"] + ":" + r["file"]: r["sha256"] for r in csv.DictReader(open(os.path.join(HERE, "INPUTS.tsv")), delimiter="\t")}
 

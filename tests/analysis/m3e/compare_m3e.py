@@ -29,12 +29,22 @@ def norm(path, run_prefix, suffix):
         cut = head.index("seconds") if "seconds" in head else len(head)
         return [("\t".join(l.split("\t")[:cut])) for l in lines]
     if suffix == ".block_genotypes.tsv":
-        return ["\t".join(l.split("\t")[:29]) for l in lines]
+        # Amendment 1: by column NAME. A later headline stage appends genotype/dosage filter columns after the writer's, so
+        # the 13 v1x columns are not last; every pre-existing column is compared under its own name, and the only columns
+        # allowed to be new are the v1x ones.
+        rows = [l.split("\t") for l in lines if l]
+        head = rows[0]
+        keep = [i for i, h in enumerate(head) if not h.endswith("_v1x")]
+        return ["\t".join(r[i] for i in keep) for r in rows]
     out = []
     for l in lines:
         key = l.split("\t", 1)[0]
         if VOLATILE.match(key) or ADDED.match(key) or (suffix == ".settings.tsv" and key == "block_support_rule"):
             continue
+        if key in ("profile", "profile_sha256"):   # Amendment 1: the profiles differ by design (one added key)
+            continue
+        if suffix == ".settings.tsv":   # Amendment 1: key and value only; the source column names the profile file
+            l = "\t".join(l.split("\t")[:2])
         out.append(l)
     return out
 
