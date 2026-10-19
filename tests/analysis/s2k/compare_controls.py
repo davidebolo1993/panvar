@@ -71,8 +71,8 @@ def main(out, scratch):
         shutil.copytree(source, d)
         # Amendment 1: relocate the copy -- every path-bearing value (profile paths, settings sources) names the copy's
         # own directory, as an output produced there would; otherwise every control differs on the copy's location alone
-        for name in os.listdir(d):
-            path = os.path.join(d, name)
+        for entry in os.listdir(d):   # S2-L: a distinct name, so the control's label is not overwritten
+            path = os.path.join(d, entry)
             text = open(path, errors="surrogateescape").read()
             if source in text:
                 open(path, "w", errors="surrogateescape").write(text.replace(source, d))

@@ -8,7 +8,7 @@ v1 (`tests/analysis/s2j/s2j_compare.py`) and its two failed results are unchange
 - **`union_cached_prefilters_consumed`, `union_completed_blocks_cached_prefilters_consumed`, `union_prefilter_cache_misses`.** These belong to the union prefilter-decision cache. A decision is a pure function of the (read, window) contents, so scores cannot change. The hit/miss split, however, depends on scheduling:
   - two workers can look up the same key before either stores it; both miss and both run the kernel, and `remember_prefilter` keeps the first;
   - once the table is at `max_held`, which keys were admitted depends on store order.
-  
+
   Hits count against `max_union_cached_prefilters_consumed`. Near that cap, the same inputs could therefore refuse in one execution and not in another: resource behaviour is not identical, only the science is. The caps are unchanged.
 
 **Validation of the comparator** (`compare_controls.py`):
