@@ -5920,6 +5920,63 @@ int block_sequences(const Args& args) {
 }
 
 // ------------------------------------------------------------------------------------------------
+// edit-distances: global edit distance for declared sequence pairs (diagnostic evaluator)
+// ------------------------------------------------------------------------------------------------
+
+// Exhaustive nearest-unit and nearest-allele questions are pairwise edit distances between FASTA records,
+// nothing more: <label> <fasta a> <record a> <fasta b> <record b> per line, the same unbanded global edlib
+// distance the evaluator uses, computed on --threads workers and written in input order. A distance says
+// how near two sequences are; it says nothing about a likelihood.
+int edit_distances(const Args& args) {
+    struct Pair {
+        std::string label, fasta_a, record_a, fasta_b, record_b;
+    };
+    std::vector<Pair> pairs;
+    std::map<std::string, std::map<std::string, std::string>> fastas;
+    {
+        std::ifstream file(args.required("pairs"));
+        if (!file) throw std::runtime_error("cannot read " + args.required("pairs"));
+        for (std::string line; std::getline(file, line);) {
+            if (line.empty() || line[0] == '#') continue;
+            std::vector<std::string> f;
+            std::stringstream fields(line);
+            for (std::string item; std::getline(fields, item, '\t');) f.push_back(item);
+            if (f.size() != 5) throw std::runtime_error("each pair needs <label> <fasta a> <record a> <fasta b> <record b>");
+            for (const std::string& fasta : {f[1], f[3]}) {
+                if (!fastas.count(fasta)) fastas[fasta] = read_fasta_records(fasta);
+            }
+            for (const auto& [fasta, record] : {std::make_pair(f[1], f[2]), std::make_pair(f[3], f[4])}) {
+                if (!fastas.at(fasta).count(record)) throw std::runtime_error("no record " + record + " in " + fasta);
+            }
+            pairs.push_back({f[0], f[1], f[2], f[3], f[4]});
+        }
+    }
+    std::vector<long> distance(pairs.size(), -1);
+    std::atomic<std::size_t> next{0};
+    const std::size_t threads = std::max<std::size_t>(1, std::stoul(args.get("threads", "4")));
+    std::vector<std::thread> workers;
+    for (std::size_t t = 0; t < threads; ++t) {
+        workers.emplace_back([&]() {
+            for (std::size_t i = next++; i < pairs.size(); i = next++) {
+                distance[i] = edit_distance(fastas.at(pairs[i].fasta_a).at(pairs[i].record_a),
+                                            fastas.at(pairs[i].fasta_b).at(pairs[i].record_b));
+            }
+        });
+    }
+    for (std::thread& worker : workers) worker.join();
+    std::ostringstream out;
+    out << "label\trecord_a\trecord_b\tbp_a\tbp_b\tdistance\n";
+    for (std::size_t i = 0; i < pairs.size(); ++i) {
+        out << pairs[i].label << '\t' << pairs[i].record_a << '\t' << pairs[i].record_b << '\t'
+            << fastas.at(pairs[i].fasta_a).at(pairs[i].record_a).size() << '\t'
+            << fastas.at(pairs[i].fasta_b).at(pairs[i].record_b).size() << '\t' << distance[i] << '\n';
+    }
+    atomic_write(args.required("out"), out.str());
+    std::cout << "edit-distances: " << pairs.size() << " pairs on " << threads << " threads\n";
+    return 0;
+}
+
+// ------------------------------------------------------------------------------------------------
 // form-census: how much placement work is spent re-scanning read sequence that already occurred
 // ------------------------------------------------------------------------------------------------
 
@@ -6918,7 +6975,7 @@ int library_estimate(const Args& args) {
 int main(int argc, char** argv) {
     try {
         if (argc < 2) {
-            std::cerr << "usage: genotype_probe simulate|loo-gfa|evaluate|compare|genotype|trace|anchors|subsample|preflight|respell|coverage-audit|form-census|mosaic-truth|orientations|panel-alleles|tied-consensus|score-set|block-sequences|mass-reconcile|spell|repair-search --key value ...\n";
+            std::cerr << "usage: genotype_probe simulate|loo-gfa|evaluate|compare|genotype|trace|anchors|subsample|preflight|respell|coverage-audit|form-census|mosaic-truth|orientations|panel-alleles|tied-consensus|score-set|block-sequences|mass-reconcile|spell|edit-distances|repair-search --key value ...\n";
             return 2;
         }
         const std::string command = argv[1];
@@ -6946,6 +7003,7 @@ int main(int argc, char** argv) {
         if (command == "block-sequences") return block_sequences(args);
         if (command == "mass-reconcile") return mass_reconcile(args);
         if (command == "spell") return spell(args);
+        if (command == "edit-distances") return edit_distances(args);
         if (command == "repair-search") return repair_search(args);
         if (command == "window-bench") return window_bench(args);
         if (command == "tie-branch") return tie_branch(args);
