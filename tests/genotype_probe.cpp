@@ -4884,6 +4884,336 @@ int window_bench(const Args& args) {
 }
 
 // ------------------------------------------------------------------------------------------------
+// mass reconciliation: what a recorded origin list reduces to, under two different reductions
+// ------------------------------------------------------------------------------------------------
+
+// The scorer does not sum origins one by one. It keys every accepted origin by its statistical class
+// (insert, orientation, summed latent mass), counts the places carrying each class, and reduces the
+// census in key order: log(count) + orientation prior + insert probability + latent mass, one
+// log_add_exp per class (reduce_states / reduce_sorted in src/fragment_likelihood.cpp). log_add_exp is
+// not associative in floating point, so log_placement_mass -- which adds the same terms one origin at a
+// time in recorded order -- is a different reduction, and bit identity between the two was never
+// owed. This reconstructs BOTH from the recorded origins, so a disagreement can be told apart: the
+// individual sum may differ in its last bits; the canonical reduction must not differ at all, or the
+// recorded origins are not the origins the scorer reduced and nothing placement-level may be read.
+struct CellReconciliation {
+    double individual = -std::numeric_limits<double>::infinity();
+    double canonical = -std::numeric_limits<double>::infinity();
+    std::size_t origins = 0;
+    std::size_t classes = 0;
+    std::uint64_t max_multiplicity = 0;
+    std::size_t duplicate_coordinates = 0;   // (forward_start, insert, orientation) seen twice: one place counted twice
+};
+
+CellReconciliation reconcile_origins(const std::vector<panvar::FragmentPlacement>& origins, const panvar::ReadPair& fragment,
+                                     const panvar::DiscreteInsertDistribution& insert, const panvar::LibraryModel& library) {
+    CellReconciliation out;
+    out.origins = origins.size();
+    if (origins.empty()) return out;
+    out.individual = panvar::log_placement_mass(origins, fragment, insert, library);
+    // Ordered exactly as StateKey: insert_bp (uint32), orientation (uint32; FirstForward = arm 0), latent mass (double <).
+    std::map<std::tuple<std::uint32_t, std::uint32_t, double>, std::uint64_t> census;
+    std::set<std::tuple<std::size_t, std::size_t, int>> places;
+    for (const panvar::FragmentPlacement& o : origins) {
+        const std::uint32_t arm = o.orientation == panvar::MateOrientation::FirstForward ? 0u : 1u;
+        ++census[{static_cast<std::uint32_t>(o.insert_bp), arm, o.log_latent_mass}];
+        if (!places.insert({o.forward_start, o.insert_bp, static_cast<int>(arm)}).second) ++out.duplicate_coordinates;
+    }
+    double total = -std::numeric_limits<double>::infinity();
+    for (const auto& [key, count] : census) {
+        const double term = std::log(static_cast<double>(count)) + panvar::kLogMateOrientationPrior +
+                            insert.log_probability(std::get<0>(key)) + std::get<2>(key);
+        total = panvar::log_add_exp(total, term);
+        out.max_multiplicity = std::max(out.max_multiplicity, count);
+    }
+    out.canonical = total;
+    out.classes = census.size();
+    return out;
+}
+
+bool same_bits(double a, double b) {
+    return std::memcmp(&a, &b, sizeof(double)) == 0;
+}
+
+// Aggregate over cells: bit agreement, the largest finite discrepancy, and disagreements in finiteness
+// (one side -inf, the other finite), which a maximum over finite differences would silently skip.
+struct ReconciliationTally {
+    std::size_t cells = 0, cells_with_origins = 0, origins = 0, classes = 0, duplicate_coordinates = 0;
+    std::uint64_t max_multiplicity = 0;
+    std::size_t individual_bit_equal = 0, canonical_bit_equal = 0;
+    std::size_t individual_nonfinite_disagreements = 0, canonical_nonfinite_disagreements = 0;
+    double individual_max_abs = 0.0, canonical_max_abs = 0.0;
+
+    void add(const CellReconciliation& c, double scorer) {
+        ++cells;
+        if (c.origins) ++cells_with_origins;
+        origins += c.origins;
+        classes += c.classes;
+        duplicate_coordinates += c.duplicate_coordinates;
+        max_multiplicity = std::max(max_multiplicity, c.max_multiplicity);
+        const auto compare = [&](double rebuilt, std::size_t& equal, std::size_t& nonfinite, double& max_abs) {
+            if (same_bits(rebuilt, scorer) || (std::isinf(rebuilt) && std::isinf(scorer) && rebuilt < 0 && scorer < 0)) {
+                ++equal;
+                return;
+            }
+            if (std::isfinite(rebuilt) != std::isfinite(scorer)) {
+                ++nonfinite;
+                return;
+            }
+            max_abs = std::max(max_abs, std::fabs(rebuilt - scorer));
+        };
+        compare(c.individual, individual_bit_equal, individual_nonfinite_disagreements, individual_max_abs);
+        compare(c.canonical, canonical_bit_equal, canonical_nonfinite_disagreements, canonical_max_abs);
+    }
+    bool canonical_exact() const { return canonical_bit_equal == cells && canonical_nonfinite_disagreements == 0; }
+    void write(std::ostream& out, const std::string& prefix) const {
+        out << std::setprecision(17) << prefix << "cells\t" << cells << '\n' << prefix << "cells_with_origins\t"
+            << cells_with_origins << '\n' << prefix << "origins\t" << origins << '\n' << prefix << "state_classes\t" << classes
+            << '\n' << prefix << "max_multiplicity\t" << max_multiplicity << '\n' << prefix << "duplicate_coordinates\t"
+            << duplicate_coordinates << '\n' << prefix << "individual_bit_equal\t" << individual_bit_equal << '\n' << prefix
+            << "individual_max_abs_log_mass_difference\t" << individual_max_abs << '\n' << prefix
+            << "individual_nonfinite_disagreements\t" << individual_nonfinite_disagreements << '\n' << prefix
+            << "canonical_bit_equal\t" << canonical_bit_equal << '\n' << prefix << "canonical_max_abs_log_mass_difference\t"
+            << canonical_max_abs << '\n' << prefix << "canonical_nonfinite_disagreements\t" << canonical_nonfinite_disagreements
+            << '\n' << prefix << "canonical_exact\t" << (canonical_exact() ? "true" : "false") << '\n';
+    }
+};
+
+// mass-reconcile: the reconciliation gated on synthetic fixtures before it is trusted on a real locus.
+// A tandem-repeat haplotype (three copies of one unit, two carrying substitutions and one a 2-bp
+// deletion) beside a one-copy haplotype, with reads drawn from both, so classes with multiplicity > 1,
+// gapped latent masses and cells with no origin all occur. Every cell's canonical reconstruction must
+// be bit-equal to the scorer's mass, and the fragment terms rebuilt from it must be bit-equal too.
+int mass_reconcile(const Args& args) {
+    const std::string out = args.required("out");
+    std::uint64_t state = std::stoull(args.get("seed", "20261019"));
+    const auto next = [&]() {
+        state = state * 6364136223846793005ULL + 1442695040888963407ULL;
+        return state >> 33;
+    };
+    const auto random_bases = [&](std::size_t n) {
+        std::string s;
+        for (std::size_t i = 0; i < n; ++i) s += "ACGT"[next() % 4];
+        return s;
+    };
+    const std::string left = random_bases(500), unit = random_bases(700), right = random_bases(500);
+    std::string unit_b = unit, unit_c = unit;
+    unit_b[100] = unit_b[100] == 'A' ? 'C' : 'A';
+    unit_b[420] = unit_b[420] == 'G' ? 'T' : 'G';
+    unit_c.erase(300, 2);
+    const std::string tandem = left + unit + unit_b + unit_c + right;
+    const std::string single = left + unit + right;
+    const auto revcomp = [](const std::string& s) {
+        std::string r(s.rbegin(), s.rend());
+        for (char& c : r) c = c == 'A' ? 'T' : c == 'C' ? 'G' : c == 'G' ? 'C' : 'A';
+        return r;
+    };
+    std::vector<panvar::ReadPair> fragments;
+    const std::size_t read_bp = 100;
+    for (std::size_t i = 0; i < 400; ++i) {
+        const std::string& hap = i % 3 == 2 ? single : tandem;
+        const std::size_t insert = 260 + next() % 81;
+        const std::size_t start = next() % (hap.size() - insert);
+        std::string first = hap.substr(start, read_bp);
+        std::string second = revcomp(hap.substr(start + insert - read_bp, read_bp));
+        for (std::string* read : {&first, &second}) {
+            for (char& c : *read) {
+                if (next() % 200 == 0) c = c == 'A' ? 'G' : c == 'G' ? 'T' : c == 'T' ? 'C' : 'A';
+            }
+        }
+        panvar::ReadPair pair;
+        pair.first = {"f" + std::to_string(i) + "/1", first, std::string(read_bp, 'I')};
+        pair.second = {"f" + std::to_string(i) + "/2", second, std::string(read_bp, 'I')};
+        if (i % 2 == 1) std::swap(pair.first, pair.second);   // both library orientations
+        fragments.push_back(pair);
+    }
+    panvar::LibraryModel library;
+    library.insert_mean_bp = 300;
+    library.insert_sd_bp = 25;
+    library.support_sigmas = 4;
+    library.substitution_error = 0.005;
+    library.outlier_weight = 0.001;
+    library.fragment_start_intensity = 0.05;
+    const std::vector<panvar::MosaicPath> paths{panvar::MosaicPath{{0}}, panvar::MosaicPath{{1}}};
+    const panvar::InternedHaplotypes interned = panvar::intern_haplotypes(paths, {tandem, single});
+    const std::vector<panvar::HaplotypeCandidate> candidates{{0, 1}, {0, 0}, {1, 1}};
+    panvar::FragmentScoringOptions scoring;
+    scoring.threads = 1;
+    scoring.mismatch_band = 6;
+    scoring.minimum_piece_bp = 12;
+    for (std::size_t f = 0; f < fragments.size(); ++f) scoring.record_origins_for_fragments.push_back(f);
+    const panvar::FragmentScoringResult scored = panvar::score_diplotypes(interned, candidates, fragments, library, scoring);
+    const panvar::DiscreteInsertDistribution insert = panvar::build_library_insert_distribution(library);
+    ReconciliationTally tally;
+    std::vector<std::vector<double>> canonical(2, std::vector<double>(fragments.size()));
+    for (std::size_t h = 0; h < 2; ++h) {
+        for (std::size_t f = 0; f < fragments.size(); ++f) {
+            const auto found = scored.recorded_origins.find({f, h});
+            const std::vector<panvar::FragmentPlacement> none;
+            const CellReconciliation cell =
+                reconcile_origins(found == scored.recorded_origins.end() ? none : found->second, fragments[f], insert, library);
+            tally.add(cell, scored.mass_of(f, h));
+            canonical[h][f] = cell.canonical;
+        }
+    }
+    std::size_t term_bit_equal = 0;
+    std::ostringstream report;
+    report << "key\tvalue\nseed\t" << args.get("seed", "20261019") << "\nhaplotype_bp\t" << tandem.size() << ","
+           << single.size() << "\nfragments\t" << fragments.size() << '\n';
+    tally.write(report, "");
+    for (std::size_t c = 0; c < candidates.size(); ++c) {
+        double term = 0.0;
+        for (std::size_t f = 0; f < fragments.size(); ++f) {
+            term += panvar::log_fragment_contribution(
+                panvar::log_add_exp(canonical[candidates[c].first][f], canonical[candidates[c].second][f]),
+                panvar::log_background_probability(fragments[f]), library);
+        }
+        const bool equal = same_bits(term, scored.scores[c].fragment_term);
+        term_bit_equal += equal;
+        report << "candidate" << c << "_fragment_term_scorer\t" << scored.scores[c].fragment_term << "\ncandidate" << c
+               << "_fragment_term_canonical\t" << term << "\ncandidate" << c << "_fragment_term_difference\t"
+               << (term - scored.scores[c].fragment_term) << '\n';
+    }
+    const bool pass = tally.canonical_exact() && term_bit_equal == candidates.size() && tally.max_multiplicity > 1;
+    report << "fragment_terms_bit_equal\t" << term_bit_equal << "\nmultiplicity_exercised\t"
+           << (tally.max_multiplicity > 1 ? "true" : "false") << "\ngate\t" << (pass ? "PASS" : "FAIL") << '\n';
+    atomic_write(out + ".mass_reconcile.tsv", report.str());
+    std::cout << report.str();
+    return pass ? 0 : 5;
+}
+
+// ------------------------------------------------------------------------------------------------
+// spell: declared allele paths (and, diagnostic only, the truth donor) as complete sequences
+// ------------------------------------------------------------------------------------------------
+
+// The bytes an explicit-sequence evaluation starts from: each declared path candidate spelled exactly as
+// score-set spells it, with the target block's interval, and the donor's truth haplotypes projected onto
+// the same block chain and concatenated (so they live in the frame every candidate lives in). A synthetic
+// sequence built elsewhere is cut from these bytes and nothing else.
+int spell(const Args& args) {
+    const std::string out = args.required("out");
+    const std::string reference = args.required("reference");
+    struct StagedGraphs {
+        std::string prefix;
+        ~StagedGraphs() {
+            std::error_code ignored;
+            std::filesystem::remove(prefix + ".model.sorted.gfa", ignored);
+            std::filesystem::remove(prefix + ".truth.sorted.gfa", ignored);
+        }
+    } staged_graphs{out};
+    const std::string curation = args.get("panel-curation", "");
+    const LoadedModel loaded =
+        load_model(args.required("model-gfa"), reference, out + ".model.sorted.gfa", 50,
+                   curation.empty() ? std::vector<std::string>{} : read_panel_curation(curation));
+    const panvar::PreparedGenotypeModel& model = *loaded.model;
+    const std::size_t blocks = model.blocks().size();
+    std::size_t block = blocks;
+    for (std::size_t b = 0; b < blocks; ++b) {
+        if (model.blocks()[b].block_id == args.required("block")) block = b;
+    }
+    if (block == blocks) throw std::runtime_error("no block " + args.required("block"));
+    std::ostringstream fasta;
+    std::ostringstream table;
+    table << "record\tsource\tbp\tblock_begin\tblock_end\tdetail\n";
+    std::ifstream file(args.required("candidates"));
+    if (!file) throw std::runtime_error("cannot read " + args.required("candidates"));
+    for (std::string line; std::getline(file, line);) {
+        if (line.empty() || line[0] == '#') continue;
+        std::stringstream fields(line);
+        std::string label, first, second;
+        std::getline(fields, label, '\t');
+        std::getline(fields, first, '\t');
+        std::getline(fields, second, '\t');
+        int side = 0;
+        for (const std::string& text : {first, second}) {
+            ++side;
+            const std::vector<std::size_t> alleles = parse_alleles(text);
+            if (alleles.size() != blocks) throw std::runtime_error("candidate " + label + " needs one allele per block");
+            const panvar::HaplotypeSequence spelled = panvar::spell_mosaic(model, panvar::MosaicPath{alleles});
+            const std::string record = label + "." + std::to_string(side);
+            fasta << '>' << record << '\n' << spelled.bases << '\n';
+            table << record << "\tpanel_path\t" << spelled.bases.size() << '\t' << spelled.block_intervals[block].begin << '\t'
+                  << spelled.block_intervals[block].end << '\t' << text << '\n';
+        }
+    }
+    if (!args.get("truth-gfa", "").empty()) {
+        const SortedGraph truth_graph = load_truth_in_model_frame(args.required("truth-gfa"), reference, loaded.sorted,
+                                                                  out + ".truth.sorted.gfa");
+        int side = 0;
+        for (const panvar::PathRecord* path : donor_paths(truth_graph.graph, args.required("donor"))) {
+            ++side;
+            const auto projection =
+                panvar::project_path_onto_locus(truth_graph.graph, loaded.bubbles, loaded.built.report, path->name);
+            if (!projection.has_value()) throw std::runtime_error("truth does not span the block chain");
+            std::string bases;
+            std::size_t begin = 0, end = 0;
+            for (std::size_t b = 0; b < blocks; ++b) {
+                if (!projection->blocks[b].has_value()) throw std::runtime_error("truth has no frame at block " +
+                                                                                 model.blocks()[b].block_id);
+                if (b == block) begin = bases.size();
+                bases += *projection->blocks[b];
+                if (b == block) end = bases.size();
+            }
+            const std::string record = "truth." + std::to_string(side);
+            fasta << '>' << record << '\n' << bases << '\n';
+            table << record << "\ttruth_projection\t" << bases.size() << '\t' << begin << '\t' << end << '\t' << path->name
+                  << '\n';
+        }
+    }
+    atomic_write(out + ".fa", fasta.str());
+    atomic_write(out + ".spelled.tsv", table.str());
+    std::cout << "spell: model fingerprint " << loaded.fingerprint << ", records written to " << out << ".fa\n";
+    return 0;
+}
+
+std::map<std::string, std::string> read_fasta_records(const std::string& path) {
+    std::ifstream file(path);
+    if (!file) throw std::runtime_error("cannot read " + path);
+    std::map<std::string, std::string> records;
+    std::string name;
+    for (std::string line; std::getline(file, line);) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        if (line.empty()) continue;
+        if (line[0] == '>') {
+            name = line.substr(1, line.find_first_of(" \t") - 1);
+            if (records.count(name)) throw std::runtime_error("duplicate FASTA record " + name + " in " + path);
+            records[name];
+            continue;
+        }
+        if (name.empty()) throw std::runtime_error("sequence before the first header in " + path);
+        for (const char c : line) {
+            if (c != 'A' && c != 'C' && c != 'G' && c != 'T') {
+                throw std::runtime_error("record " + name + " in " + path + " holds a non-ACGT base");
+            }
+        }
+        records[name] += line;
+    }
+    return records;
+}
+
+std::uint64_t fnv1a(const void* data, std::size_t bytes) {
+    std::uint64_t hash = 1469598103934665603ULL;
+    const auto* p = static_cast<const unsigned char*>(data);
+    for (std::size_t i = 0; i < bytes; ++i) {
+        hash ^= p[i];
+        hash *= 1099511628211ULL;
+    }
+    return hash;
+}
+
+std::string hex_of(std::uint64_t value) {
+    std::ostringstream text;
+    text << std::hex << std::setw(16) << std::setfill('0') << value;
+    return text.str();
+}
+
+std::string hexfloat(double value) {
+    std::ostringstream text;
+    text << std::hexfloat << value;
+    return text.str();
+}
+
+// ------------------------------------------------------------------------------------------------
 // score-set: exactly score a handful of declared diplotypes, and nothing else
 //
 // A candidate's score depends only on its own two haplotypes, the fragments and the library -- never
@@ -4895,6 +5225,13 @@ int window_bench(const Args& args) {
 // total is given it MUST reproduce, and the command refuses before reporting anything if it does
 // not: a compound result is only interpretable once the candidates it is compared against are shown
 // to be the same ones that were scored before.
+//
+// --explicit adds diagnostic diplotypes given as two complete sequences (<label> <fasta> <record1>
+// <record2> <block begin1> <block end1> <block begin2> <block end2> [expected total]). They go through
+// the same fragment model, library, band and exposure as path candidates. Their prior is the panel's
+// sequence prior, which is -inf for bytes no allele path spells: such a candidate has a likelihood
+// (fragment + exposure) and NO total, reported as prior_support none -- never a neutral prior, and never
+// a total to set beside production rankings.
 //
 // Truth is loaded after every candidate is scored, and only to measure distance.
 int score_set(const Args& args) {
@@ -4925,15 +5262,22 @@ int score_set(const Args& args) {
 
     struct Declared {
         std::string label;
+        bool explicit_pair = false;
         std::vector<std::size_t> first;
         std::vector<std::size_t> second;
+        std::string first_record, second_record;   // explicit: FASTA record names
+        std::string first_bytes, second_bytes;     // explicit: the sequences
+        std::size_t block_begin[2] = {0, 0}, block_end[2] = {0, 0};
         bool has_expected = false;
         double expected = 0.0;
     };
     std::vector<Declared> declared;
-    {
-        std::ifstream file(args.required("candidates"));
-        if (!file) throw std::runtime_error("cannot read " + args.required("candidates"));
+    const std::string candidates_file = args.get("candidates", "");
+    const std::string explicit_file = args.get("explicit", "");
+    if (candidates_file.empty() && explicit_file.empty()) throw std::runtime_error("declare --candidates and/or --explicit");
+    if (!candidates_file.empty()) {
+        std::ifstream file(candidates_file);
+        if (!file) throw std::runtime_error("cannot read " + candidates_file);
         for (std::string line; std::getline(file, line);) {
             if (line.empty() || line[0] == '#') continue;
             std::stringstream fields(line);
@@ -4956,7 +5300,53 @@ int score_set(const Args& args) {
             declared.push_back(std::move(entry));
         }
     }
+    if (!explicit_file.empty()) {
+        std::ifstream file(explicit_file);
+        if (!file) throw std::runtime_error("cannot read " + explicit_file);
+        std::map<std::string, std::map<std::string, std::string>> fastas;
+        for (std::string line; std::getline(file, line);) {
+            if (line.empty() || line[0] == '#') continue;
+            std::vector<std::string> f;
+            std::stringstream fields(line);
+            for (std::string item; std::getline(fields, item, '\t');) f.push_back(item);
+            if (f.size() < 8) {
+                throw std::runtime_error("each explicit candidate needs <label> <fasta> <record1> <record2> <begin1> <end1> "
+                                         "<begin2> <end2> [expected total]");
+            }
+            if (!fastas.count(f[1])) fastas[f[1]] = read_fasta_records(f[1]);
+            const auto& records = fastas.at(f[1]);
+            Declared entry;
+            entry.label = f[0];
+            entry.explicit_pair = true;
+            entry.first_record = f[2];
+            entry.second_record = f[3];
+            for (const std::string& name : {f[2], f[3]}) {
+                if (!records.count(name)) throw std::runtime_error("no record " + name + " in " + f[1]);
+            }
+            entry.first_bytes = records.at(f[2]);
+            entry.second_bytes = records.at(f[3]);
+            entry.block_begin[0] = std::stoull(f[4]);
+            entry.block_end[0] = std::stoull(f[5]);
+            entry.block_begin[1] = std::stoull(f[6]);
+            entry.block_end[1] = std::stoull(f[7]);
+            if (entry.block_end[0] < entry.block_begin[0] || entry.block_end[0] > entry.first_bytes.size() ||
+                entry.block_end[1] < entry.block_begin[1] || entry.block_end[1] > entry.second_bytes.size()) {
+                throw std::runtime_error("explicit candidate " + f[0] + " has a block interval outside its sequence");
+            }
+            if (f.size() > 8 && f[8] != "NA" && !f[8].empty()) {
+                entry.has_expected = true;
+                entry.expected = std::stod(f[8]);
+            }
+            declared.push_back(std::move(entry));
+        }
+    }
     if (declared.empty()) throw std::runtime_error("no candidates declared");
+    {
+        std::set<std::string> labels;
+        for (const Declared& entry : declared) {
+            if (!labels.insert(entry.label).second) throw std::runtime_error("duplicate candidate label " + entry.label);
+        }
+    }
 
     const panvar::LibraryModel library = read_library_file(args.required("library"));
     const std::vector<panvar::ReadPair> fragments =
@@ -5017,9 +5407,13 @@ int score_set(const Args& args) {
         if (args.get("emissions-only", "0") == "1") return 0;
     }
 
+    // Path candidates are spelled; explicit candidates bring their bytes. Explicit sequences get a distinct
+    // placeholder path each, so interning (which keys on bytes) is unchanged: identical bytes are one
+    // haplotype however they were declared.
     std::vector<panvar::MosaicPath> paths;
     std::vector<std::string> sequences;
     std::map<std::vector<std::size_t>, std::size_t> slot_of_path;
+    std::map<std::string, std::size_t> slot_of_bytes;
     const auto slot_for = [&](const std::vector<std::size_t>& alleles) {
         const auto found = slot_of_path.find(alleles);
         if (found != slot_of_path.end()) return found->second;
@@ -5029,8 +5423,21 @@ int score_set(const Args& args) {
         sequences.push_back(panvar::spell_mosaic(model, panvar::MosaicPath{alleles}).bases);
         return slot;
     };
+    const auto slot_for_bytes = [&](const std::string& bytes) {
+        const auto found = slot_of_bytes.find(bytes);
+        if (found != slot_of_bytes.end()) return found->second;
+        const std::size_t slot = paths.size();
+        slot_of_bytes.emplace(bytes, slot);
+        paths.push_back(panvar::MosaicPath{{std::numeric_limits<std::size_t>::max(), slot}});
+        sequences.push_back(bytes);
+        return slot;
+    };
     std::vector<std::pair<std::size_t, std::size_t>> slots;
-    for (const Declared& entry : declared) slots.push_back({slot_for(entry.first), slot_for(entry.second)});
+    for (const Declared& entry : declared) {
+        slots.push_back(entry.explicit_pair
+                            ? std::make_pair(slot_for_bytes(entry.first_bytes), slot_for_bytes(entry.second_bytes))
+                            : std::make_pair(slot_for(entry.first), slot_for(entry.second)));
+    }
 
     const panvar::InternedHaplotypes interned = panvar::intern_haplotypes(paths, sequences);
     std::map<std::pair<std::size_t, std::size_t>, std::size_t> scored_index;
@@ -5055,9 +5462,18 @@ int score_set(const Args& args) {
     scoring.max_state_classes = std::stoull(status.at("max_state_classes"));
     scoring.max_mass_cells = std::stoull(status.at("max_mass_cells"));
     scoring.emission_cache_bytes = static_cast<std::size_t>(std::stoull(status.at("emission_cache_bytes")));
-    // --decompose A,B: the scorer's own accepted origins for every fragment, recorded (not re-derived).
-    const std::string decompose = args.get("decompose", "");
-    if (!decompose.empty()) {
+    // --decompose A,B[;C,D...]: the scorer's own accepted origins for every fragment, recorded (not re-derived).
+    std::vector<std::pair<std::string, std::string>> decompositions;
+    {
+        std::stringstream pairs(args.get("decompose", ""));
+        for (std::string item; std::getline(pairs, item, ';');) {
+            if (item.empty()) continue;
+            const std::size_t comma = item.find(',');
+            if (comma == std::string::npos) throw std::runtime_error("--decompose takes A,B pairs separated by ';'");
+            decompositions.push_back({item.substr(0, comma), item.substr(comma + 1)});
+        }
+    }
+    if (!decompositions.empty()) {
         for (std::size_t f = 0; f < fragments.size(); ++f) scoring.record_origins_for_fragments.push_back(f);
     }
     const auto mark = std::chrono::steady_clock::now();
@@ -5073,7 +5489,8 @@ int score_set(const Args& args) {
             interned.sequences[scored_pairs[slot].second], switches);
     }
 
-    // Reproduction first: a declared expectation that does not reproduce refuses the whole report.
+    // Reproduction first: a declared expectation that does not reproduce refuses the whole report. A candidate
+    // without panel prior support has no total, so an expectation declared for one cannot reproduce.
     std::size_t checked = 0;
     std::size_t failed = 0;
     double worst = 0.0;
@@ -5081,7 +5498,8 @@ int score_set(const Args& args) {
         if (!declared[i].has_expected) continue;
         const std::size_t slot = pair_of_declared[i];
         const double total = scored.scores[slot].log_likelihood + prior_of_pair[slot];
-        const double delta = std::fabs(total - declared[i].expected);
+        const double delta = std::isfinite(total) ? std::fabs(total - declared[i].expected)
+                                                  : std::numeric_limits<double>::infinity();
         ++checked;
         if (delta > 1e-6) {
             ++failed;
@@ -5094,180 +5512,261 @@ int score_set(const Args& args) {
         return 4;
     }
 
-    // The truth-free score table is written, and its digest printed, before truth is loaded.
+    const auto join = [](const std::vector<std::size_t>& v) {
+        std::string text;
+        for (std::size_t i = 0; i < v.size(); ++i) {
+            if (i != 0) text += ',';
+            text += std::to_string(v[i]);
+        }
+        return text;
+    };
+    // The truth-free tables are written, and their digests printed, before truth is loaded. The hexfloat
+    // columns and the haplotype table carry exact bits, so a second run can be compared without rounding.
     {
         std::ostringstream free_table;
         free_table << std::setprecision(17)
                    << "label\tsequence_pair\thap1_alleles\thap2_alleles\tfragment_term\texposure_term\tprior\ttotal\t"
-                      "expected_total\n";
+                      "expected_total\tkind\tlikelihood\tprior_support\thap1_unique\thap2_unique\thap1_bp\thap2_bp\t"
+                      "fragment_term_hex\texposure_term_hex\n";
         for (std::size_t i = 0; i < declared.size(); ++i) {
+            const Declared& d = declared[i];
             const std::size_t slot = pair_of_declared[i];
-            std::string h1, h2;
-            for (std::size_t b = 0; b < blocks; ++b) {
-                h1 += (b ? "," : "") + std::to_string(declared[i].first[b]);
-                h2 += (b ? "," : "") + std::to_string(declared[i].second[b]);
-            }
-            free_table << declared[i].label << '\t' << slot << '\t' << h1 << '\t' << h2 << '\t'
-                       << scored.scores[slot].fragment_term << '\t' << scored.scores[slot].exposure_term << '\t'
-                       << prior_of_pair[slot] << '\t' << (scored.scores[slot].log_likelihood + prior_of_pair[slot])
-                       << '\t' << (declared[i].has_expected ? std::to_string(declared[i].expected) : std::string("NA"))
+            const double prior = prior_of_pair[slot];
+            const bool supported = std::isfinite(prior);
+            const std::size_t u1 = interned.index_of[slots[i].first], u2 = interned.index_of[slots[i].second];
+            free_table << d.label << '\t' << slot << '\t' << (d.explicit_pair ? "explicit:" + d.first_record : join(d.first))
+                       << '\t' << (d.explicit_pair ? "explicit:" + d.second_record : join(d.second)) << '\t'
+                       << scored.scores[slot].fragment_term << '\t' << scored.scores[slot].exposure_term << '\t';
+            if (supported) free_table << prior; else free_table << "-inf";
+            free_table << '\t';
+            if (supported) free_table << (scored.scores[slot].log_likelihood + prior); else free_table << "NA";
+            free_table << '\t' << (d.has_expected ? std::to_string(d.expected) : std::string("NA")) << '\t'
+                       << (d.explicit_pair ? "explicit" : "panel_path") << '\t' << scored.scores[slot].log_likelihood << '\t'
+                       << (supported ? "defined" : "none") << '\t' << u1 << '\t' << u2 << '\t'
+                       << interned.sequences[u1].size() << '\t' << interned.sequences[u2].size() << '\t'
+                       << hexfloat(scored.scores[slot].fragment_term) << '\t' << hexfloat(scored.scores[slot].exposure_term)
                        << '\n';
         }
         atomic_write(out + ".scores_truth_free.tsv", free_table.str());
+        std::ostringstream haplotypes;
+        haplotypes << "unique\tbp\tsequence_fnv64\texposure_hex\tmass_column_fnv64\tfragments_with_mass\n";
+        for (std::size_t h = 0; h < interned.sequences.size(); ++h) {
+            std::vector<double> column(fragments.size());
+            std::size_t with_mass = 0;
+            for (std::size_t f = 0; f < fragments.size(); ++f) {
+                column[f] = scored.mass_of(f, h);
+                with_mass += std::isfinite(column[f]) ? 1 : 0;
+            }
+            haplotypes << h << '\t' << interned.sequences[h].size() << '\t'
+                       << hex_of(fnv1a(interned.sequences[h].data(), interned.sequences[h].size())) << '\t'
+                       << hexfloat(scored.exposure[h]) << '\t' << hex_of(fnv1a(column.data(), column.size() * sizeof(double)))
+                       << '\t' << with_mass << '\n';
+        }
+        atomic_write(out + ".haplotypes.tsv", haplotypes.str());
         std::cout << "score-set " << donor << ": truth-free table sha256 "
                   << panvar::sha256_file(out + ".scores_truth_free.tsv") << '\n';
     }
-    // ---- --decompose A,B (truth-free): the fragment-term difference A - B, fragment by fragment, with each
-    // haplotype's origins, collapsed states, placement class against --decompose-block, orientation and insert
-    // geometry, and each mass cell rebuilt from its recorded origins to check they are counted exactly once.
-    if (!decompose.empty()) {
-        const std::size_t comma = decompose.find(',');
-        const std::string label_a = decompose.substr(0, comma);
-        const std::string label_b = decompose.substr(comma + 1);
-        std::size_t ia = declared.size(), ib = declared.size();
-        for (std::size_t i = 0; i < declared.size(); ++i) {
-            if (declared[i].label == label_a) ia = i;
-            if (declared[i].label == label_b) ib = i;
-        }
-        if (ia == declared.size() || ib == declared.size()) throw std::runtime_error("--decompose names an undeclared label");
+    // ---- --decompose (truth-free): for each pair A,B, the fragment-term difference A - B fragment by fragment,
+    // from the scorer's own masses. The placement class of each fragment (inside the --decompose-block on a
+    // haplotype, across its junction, or outside) is read from the recorded origins, which is trusted only
+    // when those origins reduce, under the scorer's own canonical reduction, to the scorer's masses bit for
+    // bit (`placement_evidence_interpretable`). The full per-fragment table is compact (four numbers and a
+    // class); origin detail is written only for the 200 largest |delta| fragments.
+    if (!decompositions.empty()) {
         const std::string block_id = args.required("decompose-block");
         std::size_t block = blocks;
         for (std::size_t b = 0; b < blocks; ++b) {
             if (model.blocks()[b].block_id == block_id) block = b;
         }
         if (block == blocks) throw std::runtime_error("no block " + block_id);
+        const auto index_of_label = [&](const std::string& label) {
+            for (std::size_t i = 0; i < declared.size(); ++i) {
+                if (declared[i].label == label) return i;
+            }
+            throw std::runtime_error("--decompose names an undeclared label " + label);
+        };
         struct Hap {
             std::string name;
             std::size_t unique = 0;
             std::size_t block_begin = 0, block_end = 0, length = 0;
         };
-        std::vector<Hap> haps;
-        for (const auto& [name, i, side] : std::vector<std::tuple<std::string, std::size_t, int>>{
-                 {"A1", ia, 0}, {"A2", ia, 1}, {"B1", ib, 0}, {"B2", ib, 1}}) {
-            const std::vector<std::size_t>& path = side == 0 ? declared[i].first : declared[i].second;
-            const panvar::HaplotypeSequence spelled = panvar::spell_mosaic(model, panvar::MosaicPath{path});
+        const auto side = [&](std::size_t i, int s, const std::string& name) {
             Hap hap;
             hap.name = name;
-            hap.unique = interned.index_of[slot_of_path.at(path)];
-            hap.block_begin = spelled.block_intervals[block].begin;
-            hap.block_end = spelled.block_intervals[block].end;
-            hap.length = spelled.bases.size();
-            haps.push_back(hap);
-        }
-        const panvar::DiscreteInsertDistribution insert = panvar::build_library_insert_distribution(library);
-        std::ostringstream rows;
-        rows << std::setprecision(17) << "fragment\tlog_background";
-        for (const Hap& h : haps) {
-            rows << '\t' << h.name << "_log_mass\t" << h.name << "_rebuilt_equal\t" << h.name << "_origins\t" << h.name
-                 << "_collapsed_states\t" << h.name << "_exact_duplicates\t" << h.name << "_in_block\t" << h.name
-                 << "_junction\t" << h.name << "_outside\t" << h.name << "_first_forward\t" << h.name << "_mean_insert";
-        }
-        rows << "\tcontribution_A\tcontribution_B\tdelta\tclass\n";
-        struct ClassSum {
-            std::size_t fragments = 0;
-            double delta = 0.0;
-            std::vector<double> deltas;
-        };
-        std::map<std::string, ClassSum> classes;
-        std::vector<double> all_deltas;
-        std::size_t rebuilt_mismatches = 0, duplicate_origins = 0;
-        double sum_a = 0.0, sum_b = 0.0;
-        for (std::size_t f = 0; f < fragments.size(); ++f) {
-            const double background = panvar::log_background_probability(fragments[f]);
-            rows << f << '\t' << background;
-            std::vector<std::size_t> in_block(4, 0), junction(4, 0);
-            for (std::size_t k = 0; k < haps.size(); ++k) {
-                const Hap& h = haps[k];
-                const double mass = scored.mass_of(f, h.unique);
-                const auto found = scored.recorded_origins.find({f, h.unique});
-                const std::vector<panvar::FragmentPlacement> none;
-                const std::vector<panvar::FragmentPlacement>& origins =
-                    found == scored.recorded_origins.end() ? none : found->second;
-                const double rebuilt = origins.empty() ? -std::numeric_limits<double>::infinity()
-                                                       : panvar::log_placement_mass(origins, fragments[f], insert, library);
-                const bool equal = std::memcmp(&rebuilt, &mass, sizeof(double)) == 0 ||
-                                   (std::isinf(rebuilt) && std::isinf(mass));
-                if (!equal) ++rebuilt_mismatches;
-                std::set<std::tuple<std::size_t, std::size_t, int>> positions;
-                std::set<std::tuple<std::size_t, int, std::uint64_t>> states;
-                std::size_t duplicates = 0, outside = 0, forward = 0;
-                double insert_sum = 0.0;
-                for (const panvar::FragmentPlacement& o : origins) {
-                    if (!positions.insert({o.forward_start, o.insert_bp, static_cast<int>(o.orientation)}).second) ++duplicates;
-                    std::uint64_t bits = 0;
-                    std::memcpy(&bits, &o.log_latent_mass, sizeof(bits));
-                    states.insert({o.insert_bp, static_cast<int>(o.orientation), bits});
-                    const std::size_t left = o.forward_start, right = o.forward_start + o.insert_bp;
-                    if (left >= h.block_begin && right <= h.block_end) ++in_block[k];
-                    else if (right <= h.block_begin || left >= h.block_end) ++outside;
-                    else ++junction[k];
-                    if (o.orientation == panvar::MateOrientation::FirstForward) ++forward;
-                    insert_sum += static_cast<double>(o.insert_bp);
-                }
-                duplicate_origins += duplicates;
-                rows << '\t' << mass << '\t' << (equal ? "true" : "false") << '\t' << origins.size() << '\t'
-                     << states.size() << '\t' << duplicates << '\t' << in_block[k] << '\t' << junction[k] << '\t'
-                     << outside << '\t' << forward << '\t'
-                     << (origins.empty() ? 0.0 : insert_sum / static_cast<double>(origins.size()));
+            hap.unique = interned.index_of[s == 0 ? slots[i].first : slots[i].second];
+            hap.length = interned.sequences[hap.unique].size();
+            if (declared[i].explicit_pair) {
+                hap.block_begin = declared[i].block_begin[s];
+                hap.block_end = declared[i].block_end[s];
+            } else {
+                const panvar::HaplotypeSequence spelled =
+                    panvar::spell_mosaic(model, panvar::MosaicPath{s == 0 ? declared[i].first : declared[i].second});
+                hap.block_begin = spelled.block_intervals[block].begin;
+                hap.block_end = spelled.block_intervals[block].end;
             }
-            const double ma = panvar::log_add_exp(scored.mass_of(f, haps[0].unique), scored.mass_of(f, haps[1].unique));
-            const double mb = panvar::log_add_exp(scored.mass_of(f, haps[2].unique), scored.mass_of(f, haps[3].unique));
-            const double ca = panvar::log_fragment_contribution(ma, background, library);
-            const double cb = panvar::log_fragment_contribution(mb, background, library);
-            sum_a += ca;
-            sum_b += cb;
-            const std::size_t block_a = in_block[0] + in_block[1] + junction[0] + junction[1];
-            const std::size_t block_b = in_block[2] + in_block[3] + junction[2] + junction[3];
-            std::string kind;
-            if (block_a == 0 && block_b == 0) kind = "outside_block_on_all";
-            else if (block_b == 0) kind = "block_on_A_only";
-            else if (block_a == 0) kind = "block_on_B_only";
-            else if (junction[0] + junction[1] + junction[2] + junction[3] == 0) kind = "block_interior_on_both";
-            else kind = "block_junction_on_both";
-            ClassSum& sum = classes[kind];
-            ++sum.fragments;
-            sum.delta += ca - cb;
-            sum.deltas.push_back(ca - cb);
-            all_deltas.push_back(ca - cb);
-            rows << '\t' << ca << '\t' << cb << '\t' << (ca - cb) << '\t' << kind << '\n';
+            return hap;
+        };
+        const panvar::DiscreteInsertDistribution insert = panvar::build_library_insert_distribution(library);
+        std::vector<double> background(fragments.size());
+        for (std::size_t f = 0; f < fragments.size(); ++f) background[f] = panvar::log_background_probability(fragments[f]);
+        // Reconciliation, once per unique haplotype that any decomposition uses.
+        std::map<std::size_t, std::vector<CellReconciliation>> cells;
+        ReconciliationTally tally;
+        for (const auto& [label_a, label_b] : decompositions) {
+            for (const std::size_t i : {index_of_label(label_a), index_of_label(label_b)}) {
+                for (const std::size_t u : {interned.index_of[slots[i].first], interned.index_of[slots[i].second]}) {
+                    if (cells.count(u)) continue;
+                    std::vector<CellReconciliation>& column = cells[u];
+                    column.resize(fragments.size());
+                    for (std::size_t f = 0; f < fragments.size(); ++f) {
+                        const auto found = scored.recorded_origins.find({f, u});
+                        const std::vector<panvar::FragmentPlacement> none;
+                        column[f] = reconcile_origins(found == scored.recorded_origins.end() ? none : found->second,
+                                                      fragments[f], insert, library);
+                        tally.add(column[f], scored.mass_of(f, u));
+                    }
+                }
+            }
         }
-        atomic_write(out + ".fragment_decomposition.tsv", rows.str());
-        std::ostringstream summary;
-        summary << std::setprecision(12) << "key\tvalue\nlabel_A\t" << label_a << "\nlabel_B\t" << label_b << "\nblock\t"
-                << block_id << "\nfragments\t" << fragments.size() << "\nfragment_term_A\t" << sum_a
-                << "\nfragment_term_A_scorer\t" << scored.scores[pair_of_declared[ia]].fragment_term << "\nfragment_term_B\t"
-                << sum_b << "\nfragment_term_B_scorer\t" << scored.scores[pair_of_declared[ib]].fragment_term
-                << "\nfragment_delta\t" << (sum_a - sum_b) << "\nrebuilt_mass_mismatches\t" << rebuilt_mismatches
-                << "\nexact_duplicate_origins\t" << duplicate_origins << "\nintensity_per_bp_copy\t"
-                << library.fragment_start_intensity << "\noutlier_weight\t" << library.outlier_weight << '\n';
-        for (const Hap& h : haps) {
-            summary << h.name << "_length\t" << h.length << '\n' << h.name << "_block_bp\t" << (h.block_end - h.block_begin)
-                    << '\n' << h.name << "_exposure\t" << scored.exposure[h.unique] << '\n' << h.name
-                    << "_expected_signal_fragments\t" << panvar::expected_signal_fragments(scored.exposure[h.unique], library)
-                    << '\n';
+        {
+            std::ostringstream text;
+            text << "key\tvalue\nunique_haplotypes_reconciled\t" << cells.size() << "\nfragments\t" << fragments.size() << '\n';
+            tally.write(text, "");
+            text << "placement_evidence_interpretable\t" << (tally.canonical_exact() ? "true" : "false") << '\n';
+            atomic_write(out + ".mass_reconciliation.tsv", text.str());
+            std::cout << "score-set " << donor << ": mass reconciliation over " << cells.size()
+                      << " haplotypes: canonical exact " << (tally.canonical_exact() ? "yes" : "NO")
+                      << ", individual max |diff| " << tally.individual_max_abs << ", canonical max |diff| "
+                      << tally.canonical_max_abs << '\n';
         }
-        summary << "exposure_term_A\t" << scored.scores[pair_of_declared[ia]].exposure_term << "\nexposure_term_B\t"
-                << scored.scores[pair_of_declared[ib]].exposure_term << '\n';
-        std::vector<double> magnitude = all_deltas;
-        std::sort(magnitude.begin(), magnitude.end(), [](double x, double y) { return std::fabs(x) > std::fabs(y); });
-        for (const std::size_t top : {1, 10, 50, 200}) {
-            double part = 0.0;
-            for (std::size_t i = 0; i < std::min(top, magnitude.size()); ++i) part += magnitude[i];
-            summary << "top" << top << "_fragments_delta\t" << part << '\n';
+        for (const auto& [label_a, label_b] : decompositions) {
+            const std::size_t ia = index_of_label(label_a), ib = index_of_label(label_b);
+            const std::vector<Hap> haps{side(ia, 0, "A1"), side(ia, 1, "A2"), side(ib, 0, "B1"), side(ib, 1, "B2")};
+            const std::string stem = out + ".decomp." + label_a + "__" + label_b;
+            struct Row {
+                std::size_t fragment;
+                double ca, cb;
+                std::string kind;
+                std::vector<std::size_t> origins, in_block, junction, outside;
+            };
+            std::vector<Row> rows;
+            rows.reserve(fragments.size());
+            std::map<std::string, std::vector<double>> by_class;
+            double sum_a = 0.0, sum_b = 0.0, canonical_a = 0.0, canonical_b = 0.0, individual_a = 0.0, individual_b = 0.0;
+            for (std::size_t f = 0; f < fragments.size(); ++f) {
+                Row row;
+                row.fragment = f;
+                for (const Hap& h : haps) {
+                    const auto found = scored.recorded_origins.find({f, h.unique});
+                    std::size_t inside = 0, across = 0, away = 0, count = 0;
+                    if (found != scored.recorded_origins.end()) {
+                        for (const panvar::FragmentPlacement& o : found->second) {
+                            ++count;
+                            const std::size_t left = o.forward_start, right = o.forward_start + o.insert_bp;
+                            if (left >= h.block_begin && right <= h.block_end) ++inside;
+                            else if (right <= h.block_begin || left >= h.block_end) ++away;
+                            else ++across;
+                        }
+                    }
+                    row.origins.push_back(count);
+                    row.in_block.push_back(inside);
+                    row.junction.push_back(across);
+                    row.outside.push_back(away);
+                }
+                const auto contribution = [&](double m1, double m2) {
+                    return panvar::log_fragment_contribution(panvar::log_add_exp(m1, m2), background[f], library);
+                };
+                row.ca = contribution(scored.mass_of(f, haps[0].unique), scored.mass_of(f, haps[1].unique));
+                row.cb = contribution(scored.mass_of(f, haps[2].unique), scored.mass_of(f, haps[3].unique));
+                canonical_a += contribution(cells[haps[0].unique][f].canonical, cells[haps[1].unique][f].canonical);
+                canonical_b += contribution(cells[haps[2].unique][f].canonical, cells[haps[3].unique][f].canonical);
+                individual_a += contribution(cells[haps[0].unique][f].individual, cells[haps[1].unique][f].individual);
+                individual_b += contribution(cells[haps[2].unique][f].individual, cells[haps[3].unique][f].individual);
+                sum_a += row.ca;
+                sum_b += row.cb;
+                const std::size_t block_a = row.in_block[0] + row.in_block[1] + row.junction[0] + row.junction[1];
+                const std::size_t block_b = row.in_block[2] + row.in_block[3] + row.junction[2] + row.junction[3];
+                if (block_a == 0 && block_b == 0) row.kind = "outside_block_on_all";
+                else if (block_b == 0) row.kind = "block_on_A_only";
+                else if (block_a == 0) row.kind = "block_on_B_only";
+                else if (row.junction[0] + row.junction[1] + row.junction[2] + row.junction[3] == 0) row.kind = "block_interior_on_both";
+                else row.kind = "block_junction_on_both";
+                by_class[row.kind].push_back(row.ca - row.cb);
+                rows.push_back(std::move(row));
+            }
+            {
+                std::ostringstream compact;
+                compact << std::setprecision(17) << "fragment\tcontribution_A\tcontribution_B\tdelta\tclass\n";
+                for (const Row& r : rows) compact << r.fragment << '\t' << r.ca << '\t' << r.cb << '\t' << (r.ca - r.cb) << '\t' << r.kind << '\n';
+                atomic_write(stem + ".fragments.tsv", compact.str());
+            }
+            std::vector<std::size_t> order(rows.size());
+            std::iota(order.begin(), order.end(), 0);
+            std::sort(order.begin(), order.end(), [&](std::size_t x, std::size_t y) {
+                const double dx = std::fabs(rows[x].ca - rows[x].cb), dy = std::fabs(rows[y].ca - rows[y].cb);
+                return dx != dy ? dx > dy : x < y;
+            });
+            {
+                std::ostringstream top;
+                top << std::setprecision(17) << "rank\tfragment\tdelta\tclass";
+                for (const Hap& h : haps) top << '\t' << h.name << "_origins\t" << h.name << "_in_block\t" << h.name << "_junction\t" << h.name << "_outside";
+                top << '\n';
+                for (std::size_t r = 0; r < std::min<std::size_t>(200, order.size()); ++r) {
+                    const Row& row = rows[order[r]];
+                    top << (r + 1) << '\t' << row.fragment << '\t' << (row.ca - row.cb) << '\t' << row.kind;
+                    for (std::size_t k = 0; k < 4; ++k) top << '\t' << row.origins[k] << '\t' << row.in_block[k] << '\t' << row.junction[k] << '\t' << row.outside[k];
+                    top << '\n';
+                }
+                atomic_write(stem + ".top_fragments.tsv", top.str());
+            }
+            std::ostringstream summary;
+            summary << std::setprecision(12) << "key\tvalue\nlabel_A\t" << label_a << "\nlabel_B\t" << label_b << "\nblock\t"
+                    << block_id << "\nfragments\t" << fragments.size() << "\nfragment_term_A\t" << sum_a
+                    << "\nfragment_term_A_scorer\t" << scored.scores[pair_of_declared[ia]].fragment_term << "\nfragment_term_B\t"
+                    << sum_b << "\nfragment_term_B_scorer\t" << scored.scores[pair_of_declared[ib]].fragment_term
+                    << "\nfragment_delta\t" << (sum_a - sum_b)
+                    << "\nfragment_term_A_from_canonical_minus_scorer\t" << (canonical_a - scored.scores[pair_of_declared[ia]].fragment_term)
+                    << "\nfragment_term_B_from_canonical_minus_scorer\t" << (canonical_b - scored.scores[pair_of_declared[ib]].fragment_term)
+                    << "\nfragment_term_A_from_individual_minus_scorer\t" << (individual_a - scored.scores[pair_of_declared[ia]].fragment_term)
+                    << "\nfragment_term_B_from_individual_minus_scorer\t" << (individual_b - scored.scores[pair_of_declared[ib]].fragment_term)
+                    << "\nplacement_evidence_interpretable\t" << (tally.canonical_exact() ? "true" : "false") << '\n';
+            for (const Hap& h : haps) {
+                summary << h.name << "_length\t" << h.length << '\n' << h.name << "_block_bp\t" << (h.block_end - h.block_begin)
+                        << '\n' << h.name << "_exposure\t" << scored.exposure[h.unique] << '\n';
+            }
+            summary << "exposure_term_A\t" << scored.scores[pair_of_declared[ia]].exposure_term << "\nexposure_term_B\t"
+                    << scored.scores[pair_of_declared[ib]].exposure_term << '\n';
+            std::size_t favour_a = 0, favour_b = 0;
+            for (const Row& r : rows) {
+                if (r.ca - r.cb > 1e-9) ++favour_a;
+                if (r.ca - r.cb < -1e-9) ++favour_b;
+            }
+            summary << "fragments_favouring_A\t" << favour_a << "\nfragments_favouring_B\t" << favour_b << '\n';
+            for (const std::size_t top : {1, 10, 50, 200, 1000}) {
+                double part = 0.0;
+                for (std::size_t r = 0; r < std::min(top, order.size()); ++r) part += rows[order[r]].ca - rows[order[r]].cb;
+                summary << "top" << top << "_fragments_delta\t" << part << '\n';
+            }
+            for (auto& [kind, deltas] : by_class) {
+                std::sort(deltas.begin(), deltas.end());
+                const double total = std::accumulate(deltas.begin(), deltas.end(), 0.0);
+                summary << "class_" << kind << "_fragments\t" << deltas.size() << "\nclass_" << kind << "_delta\t" << total
+                        << "\nclass_" << kind << "_median_delta\t" << deltas[deltas.size() / 2] << "\nclass_" << kind
+                        << "_min_delta\t" << deltas.front() << "\nclass_" << kind << "_max_delta\t" << deltas.back() << '\n';
+            }
+            atomic_write(stem + ".summary.tsv", summary.str());
+            std::cout << "score-set " << donor << ": decomposition " << label_a << " - " << label_b << " fragment delta "
+                      << (sum_a - sum_b) << '\n';
         }
-        for (auto& [kind, sum] : classes) {
-            std::sort(sum.deltas.begin(), sum.deltas.end());
-            summary << "class_" << kind << "_fragments\t" << sum.fragments << "\nclass_" << kind << "_delta\t" << sum.delta
-                    << "\nclass_" << kind << "_median_delta\t" << sum.deltas[sum.deltas.size() / 2] << '\n';
-        }
-        atomic_write(out + ".decomposition_summary.tsv", summary.str());
-        std::cout << "score-set " << donor << ": decomposition " << label_a << " - " << label_b << " fragment delta "
-                  << (sum_a - sum_b) << ", rebuilt-mass mismatches " << rebuilt_mismatches << ", duplicate origins "
-                  << duplicate_origins << '\n';
     }
-    if (args.get("truth-gfa", "").empty()) return 0;
+    if (args.get("truth-gfa", "").empty()) {
+        std::cout << "score-set " << donor << ": " << declared.size() << " declared, " << scored_pairs.size()
+                  << " distinct diplotypes, " << interned.sequences.size() << " unique haplotypes, " << checked
+                  << " expectations reproduced, " << seconds << "s scoring\n";
+        return 0;
+    }
 
-    // Truth enters only now.
+    // Truth enters only now (path candidates only: an explicit candidate has no allele path to project).
     const SortedGraph truth_graph = load_truth_in_model_frame(
         args.required("truth-gfa"), reference, loaded.sorted, out + ".truth.sorted.gfa");
     std::vector<panvar::PathProjection> truth;
@@ -5303,15 +5802,8 @@ int score_set(const Args& args) {
              "total\texpected_total\treproduced\tdistance\tfloor\texcess\n";
     std::ofstream per_block(out + ".blocks.tsv");
     per_block << "label\tblock\tblock_id\tkind\tallele1\tallele2\tblock_distance\tblock_floor\tblock_excess\n";
-    const auto join = [](const std::vector<std::size_t>& v) {
-        std::string text;
-        for (std::size_t i = 0; i < v.size(); ++i) {
-            if (i != 0) text += ',';
-            text += std::to_string(v[i]);
-        }
-        return text;
-    };
     for (std::size_t i = 0; i < declared.size(); ++i) {
+        if (declared[i].explicit_pair) continue;
         const std::size_t slot = pair_of_declared[i];
         const double total = scored.scores[slot].log_likelihood + prior_of_pair[slot];
         long distance = 0;
@@ -6425,7 +6917,7 @@ int library_estimate(const Args& args) {
 int main(int argc, char** argv) {
     try {
         if (argc < 2) {
-            std::cerr << "usage: genotype_probe simulate|loo-gfa|evaluate|compare|genotype|trace|anchors|subsample|preflight|respell|coverage-audit|form-census|mosaic-truth|orientations|panel-alleles|tied-consensus|score-set|block-sequences|repair-search --key value ...\n";
+            std::cerr << "usage: genotype_probe simulate|loo-gfa|evaluate|compare|genotype|trace|anchors|subsample|preflight|respell|coverage-audit|form-census|mosaic-truth|orientations|panel-alleles|tied-consensus|score-set|block-sequences|mass-reconcile|spell|repair-search --key value ...\n";
             return 2;
         }
         const std::string command = argv[1];
@@ -6451,6 +6943,8 @@ int main(int argc, char** argv) {
         if (command == "repair-pilot") return repair_pilot(args);
         if (command == "score-set") return score_set(args);
         if (command == "block-sequences") return block_sequences(args);
+        if (command == "mass-reconcile") return mass_reconcile(args);
+        if (command == "spell") return spell(args);
         if (command == "repair-search") return repair_search(args);
         if (command == "window-bench") return window_bench(args);
         if (command == "tie-branch") return tie_branch(args);
