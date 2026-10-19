@@ -27,8 +27,8 @@ MANIFEST_P = ([("prepare", "prepare", "-", 30), ("gates", "gates", "-", 120)] + 
 MANIFESTS = {"P": MANIFEST_P}
 INPUTS = [   # panel-derived inputs (frozen digests); the fixtures are synthetic
     {"file": f"{M1D}/inventory.a1/inventory.fa", "sha256": "8f425a37e811428616d1d40b707fe6813e0f710b79ef36cabcb44215deb470c4"},
-    {"file": f"{M6F}/prepare/copies.tsv", "sha256": "51b6c1bacf47744b067c940e1a5c592a7680f0898281c645183185cfb11da6d9"},
-    {"file": f"{M6F}/align/events.tsv", "sha256": "04e83134a0922bab601e34835b0498565654ddedb65a77991d9a5aac8455122c"},
+    {"file": f"{M6F}/runs/prepare/copies.tsv", "sha256": "51b6c1bacf47744b067c940e1a5c592a7680f0898281c645183185cfb11da6d9"},
+    {"file": f"{M6F}/runs/align/events.tsv", "sha256": "04e83134a0922bab601e34835b0498565654ddedb65a77991d9a5aac8455122c"},
 ]
 
 

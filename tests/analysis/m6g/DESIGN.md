@@ -98,3 +98,10 @@ side. A best-state log likelihood is reported as a labelled diagnostic only.
 - 600 s counting every attempt; 4 threads.
 - **Declared timeouts:** prepare 30 s, gates 120 s, each fixture 120 s, summary 30 s.
 - Failures are retained.
+
+## Amendment 1 (declared before any unit ran; 0 s spent)
+
+**What failed.** The runner's pre-unit input verification pointed at `{M6F}/prepare/...` and `{M6F}/align/...` instead of
+`{M6F}/runs/...`. It raised before any unit started, so nothing was recorded or executed.
+
+**Fix.** The input paths are corrected. The digests, units, timeouts, model, fixtures and criteria are unchanged.
