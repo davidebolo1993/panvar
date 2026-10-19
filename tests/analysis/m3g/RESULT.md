@@ -86,3 +86,16 @@ carriers behind the −10.2 to −17.0 prior).
 - the prior and the proposal are not the cause.
 
 Solving this small context error does not address that allocation problem.
+
+## Qualifications appended at M3-H (2026-10-19; Sol's review; the record above is not rewritten)
+
+1. **No global optimum is established.** The truth correction loses in every *tested* context (R, W1, W2): fixed
+   substitutions in three contexts. That does not show a global optimum, or that no other context exists in which
+   (14,56) wins.
+2. **"Not binding" is specific to what was tested.** The shortlist omission (rank 90) does not bind for *these tested
+   corrections*. It is not a general statement about the shortlist.
+3. **The unrefined union winner is a separate search limitation.** Convergence of the refinement trunk does not
+   establish local optimality of the final pooled call: a one-block move inside W1/W2 scores +0.613 above it. That move
+   is still wrong at ctx:0, so it is recorded separately and does not explain this error.
+4. **One coverage pair does not establish calibration.** The 5× twin calling (14,56) DATA_SUPPORTED is consistent with
+   low-depth uncertainty at 2×.
