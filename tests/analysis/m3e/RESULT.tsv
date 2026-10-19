@@ -1,0 +1,11 @@
+item	lzo_5x (control)	mosaic_5x (control)	mosaic_2x
+legacy genotype_support (joint off -> on)	READS 3, PRIOR_ONLY 8 -> PRIOR_ONLY 11	READS 11 -> PRIOR_ONLY 11	READS 4, PRIOR_ONLY 7 -> PRIOR_ONLY 11
+genotype_support_v1x (joint off -> on)	DATA_SUPPORTED 8, PRIOR_DEPENDENT 3 -> identical	DATA_SUPPORTED 11 -> identical	DATA_SUPPORTED 7, PRIOR_DEPENDENT 4 -> DATA_SUPPORTED 10, PRIOR_DEPENDENT 1
+quality_filter legacy -> v1x (joint on)	LOW_QUALITY 11 -> PASS 8, LOW_QUALITY 3 (prior_dependent)	LOW_QUALITY 11 -> PASS 11	LOW_QUALITY 11 -> PASS 10, LOW_QUALITY 1 (prior_dependent)
+PRIOR_DEPENDENT blocks (call-minus-strongest competitor dL / dP)	ctx:0, sv:1, ctx:4: dL -2.79, dP +35.66 (both arms; the call is exact: the prior was right)	none	off: ctx:0, sv:1, ctx:2, sv:3: dL -14.81 (the incumbent is wrong at ctx:0/sv:1); on: ctx:2 only: dL -2.84, dP +26.46
+phase_support (unchanged rule)	PRIOR_ONLY both arms	PRIOR_ONLY both arms	PRIOR_ONLY both arms
+phase contenders: genotype-changing / -preserving / mixed (off -> on)	27/8/0 -> 109/8/0	0/7/0 -> 82/7/0	176/7/0 -> 134/9/0
+annotation-only check vs M3-D (compare.a1)	identical (both arms)	identical (both arms)	identical (both arms)
+C++ vs independent saved-table audit	labels and margins agree on all 22 blocks	agree (22)	agree (22)
+gates	shared function 7 gate groups PASS (exposure, prior dependence, phase alternatives, one-block disagreement, equivalent/ambiguous projections, ties and bounds, order invariance); caller: annotation-only + 1/4 threads PASS	-	-
+budget	176.3 of 600 s (incl. 5 counted development gate runs; gate.support and compare exit 1 recorded; Amendment 1)	-	-
