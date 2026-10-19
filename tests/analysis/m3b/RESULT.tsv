@@ -7,7 +7,7 @@ incumbent saved total reproduced (<= 1e-6)	yes (-32559.722640)	yes in both parts
 winner	INCUMBENT (rank 1; 0 candidates above it)	INCUMBENT (= truth; 0 above; best alternative -8.06)	-
 best two-block move vs incumbent (fragment / exposure / prior / total)	ctx:0 36>4 + sv:1 67>24: +10.90 / +0.02 / -17.15 / -6.24	ctx:2 9>11 + sv:5 6>3: -3.46 / +0.01 / -14.07 / -17.52	-
 its single-block intermediates vs incumbent	ctx:0 36>4: -5.55; sv:1 67>24: -10.16	ctx:2 9>11: -8.06; sv:5 6>3: -16.84	-
-truth generated?	NO: truth = h0 ctx:0 36>40 + sv:1 67>24; ctx:0 allele 40 is proposal rank 12 of 66 (emission 5.83 below the best, tied with ranks 10-11); sv:1 allele 24 is rank 1	truth is the incumbent	-
+truth generated?	NO: truth = h0 ctx:0 36>40 + sv:1 67>24; ctx:0 allele 40 is proposal rank 12 of 67 alternatives (emission 5.83 below the best, tied with ranks 10-11); sv:1 allele 24 is rank 1	truth is the incumbent	-
 truth intermediates	sv:1 67>24 alone: -10.16 (rejected); ctx:0 36>40 alone: not generated (M1-A: -3.30); truth joint: +2.78 over the incumbent (M1-A, evaluator) -- outside the catalogue	-	-
 accuracy of the best catalogue joint (c0049)	1 block wrong (ctx:0, 9 bp unordered) vs incumbent 2 blocks (13 bp): closer to truth but scores 6.24 LOWER (prior -17.15 outweighs fragment +10.90): it is not the truth allele	-	-
 phase diagnostic (winner)	0 disagreement blocks (phase ungraded in the saved evaluation)	0	-
