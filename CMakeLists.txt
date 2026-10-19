@@ -153,6 +153,7 @@ add_library(panvarlib
     src/prepared_locus_file.cpp
     src/genotype_repair.cpp
     src/genotype_joint_search.cpp
+    src/genotype_block_support.cpp
     src/genotype_dosage.cpp
     src/genotype_dosage_repair.cpp
     src/genotype_dosage_shadow.cpp
@@ -281,6 +282,10 @@ if(PANVAR_BUILD_TESTING)
         target_link_libraries(genotype_joint_search_test PRIVATE panvarlib)
         target_compile_options(genotype_joint_search_test PRIVATE -Wall -Wextra -Wpedantic)
         add_test(NAME panvar_genotype_joint_search COMMAND genotype_joint_search_test)
+        add_executable(genotype_block_support_test tests/genotype_block_support.cpp)
+        target_link_libraries(genotype_block_support_test PRIVATE panvarlib)
+        target_compile_options(genotype_block_support_test PRIVATE -Wall -Wextra -Wpedantic)
+        add_test(NAME panvar_genotype_block_support COMMAND genotype_block_support_test)
         add_executable(genotype_joint_search_e2e_test tests/genotype_joint_search_e2e.cpp src/cli_utils.cpp)
         target_link_libraries(genotype_joint_search_e2e_test PRIVATE panvarlib)
         target_compile_options(genotype_joint_search_e2e_test PRIVATE -Wall -Wextra -Wpedantic)

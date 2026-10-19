@@ -99,7 +99,7 @@ The representation and library terms are unchanged. Nothing is called "prior onl
 - the label counts
 - `phase_competitors_genotype_changing`, `phase_competitors_genotype_preserving`, `phase_competitors_mixed`
 
-Block tables written by the consensus or plain fallbacks carry `NOT_EVALUATED` in the experimental columns.
+The consensus fallback's block table carries `NOT_EVALUATED` in the experimental columns; the main (pooled) and plain (unpooled) tables carry the computed values. (Corrected before any integration run: the plain table is the unpooled path's.)
 
 **Implementation.** One library function, `block_data_support_v1` (`include/panvar/genotype_block_support.hpp`), is
 called by both the pooled (`decide_pooled_genotype` inputs) and the unpooled summary path. Legacy code is untouched.

@@ -21,6 +21,7 @@
 #include "panvar/integrated_snarls.hpp"
 #include "panvar/ls_hmm.hpp"
 #include "panvar/marker_model.hpp"
+#include "panvar/genotype_block_support.hpp"
 #include "panvar/genotype_joint_search.hpp"
 #include "panvar/mosaic_beam.hpp"
 #include "panvar/mosaic_spelling.hpp"
@@ -782,6 +783,10 @@ struct CandidateSetReport {
 };
 
 struct RankingSummary {
+    // M3-E (EXPERIMENTAL): full-data-likelihood block support (empty unless block_support_rule is experimental and the
+    // summary path computed it); competitor paths for reporting, by group index.
+    DataSupportResult data_support;
+    std::vector<std::string> data_support_competitor_paths;
     std::size_t sequence_candidates = 0;
     std::size_t collapsed_beam_candidates = 0;
     // READS_WITHIN_CANDIDATES: no retained rival is a fragment contender -- a claim about this candidate set
@@ -825,6 +830,45 @@ std::string quality_columns(RankingSummary& summary, const std::string& block_id
     summary.quality_block_ids.push_back(block_id);
     summary.block_qualities.push_back(quality);
     return "\t" + quality.filter + "\t" + quality.reason;
+}
+
+// M3-E (EXPERIMENTAL): the versioned support columns appended to a block table (block_support_rule experimental only).
+const char* const kDataSupportHeader =
+    "\tgenotype_support_v1x\tquality_filter_v1x\tquality_reason_v1x\tdata_support_margin_v1x\tdata_support_certified_v1x\t"
+    "competitor_group_v1x\tcompetitor_paths_v1x\tcompetitor_delta_fragment_v1x\tcompetitor_delta_exposure_v1x\t"
+    "competitor_delta_likelihood_v1x\tcompetitor_delta_prior_v1x\tdisagreeing_groups_v1x\tmixed_groups_v1x";
+// The legacy quality combination with only the genotype-support term replaced by the experimental label's term.
+std::string data_support_columns(const RankingSummary& summary, std::size_t b, const std::string& representation_filter,
+                                 bool library_sensitive, bool evaluated) {
+    if (!evaluated || b >= summary.data_support.blocks.size()) {
+        return "\tNOT_EVALUATED\tNOT_EVALUATED\tsupport_not_evaluated\tNA\tNA\tNA\tNA\tNA\tNA\tNA\tNA\tNA\tNA";
+    }
+    const BlockDataSupport& s = summary.data_support.blocks[b];
+    std::string reason;
+    const auto add = [&reason](const std::string& item) { reason += (reason.empty() ? "" : ",") + item; };
+    if (representation_filter == "LOWQUAL_REPRESENTATION_CONFLICT") add("representation_conflict");
+    else if (representation_filter != "PASS") add("representation_not_evaluated");
+    if (!data_support_quality_reason(s.label).empty()) add(data_support_quality_reason(s.label));
+    if (library_sensitive) add("library_sensitive");
+    std::ostringstream out;
+    out << std::setprecision(12) << '\t' << s.label << '\t' << (reason.empty() ? "PASS" : "LOW_QUALITY") << '\t'
+        << (reason.empty() ? std::string("none") : reason) << '\t';
+    const auto num = [&out](double v) {
+        if (std::isnan(v)) out << "NA"; else out << v;
+    };
+    num(s.margin);
+    out << '\t' << (s.competitor < 0 ? "NA" : (s.certified ? "true" : "false")) << '\t'
+        << (s.competitor < 0 ? std::string("NA") : std::to_string(s.competitor)) << '\t'
+        << (s.competitor < 0 ? std::string("NA") : summary.data_support_competitor_paths.at(static_cast<std::size_t>(s.competitor))) << '\t';
+    num(s.delta_fragment);
+    out << '\t';
+    num(s.delta_exposure);
+    out << '\t';
+    num(s.delta_likelihood);
+    out << '\t';
+    num(s.delta_prior);
+    out << '\t' << s.disagreeing << '\t' << s.mixed;
+    return out.str();
 }
 
 // What the panel-anchored adaptive completion did, for the status. Every fact separately: the anchor,
@@ -1223,7 +1267,7 @@ void write_status(
                                 "dosage_census_backend", "adaptive_emission_handoff", "output_schema", "early_incumbent",
                                 "test_interrupt_point", "diagnostic_union_evidence_dump", "diagnostic_union_kernel_dump",
                                 "union_progressive_schedule", "union_fragment_blocks", "diagnostic_refinement_memory",
-                                "diagnostic_refinement_replay", "repair_round1_origin_admission", "repair_joint_search"}) {
+                                "diagnostic_refinement_replay", "repair_round1_origin_admission", "repair_joint_search", "block_support_rule"}) {
             const auto source = options.setting_sources.find(key);
             if (source == options.setting_sources.end()) continue;
             const std::string k = key;
@@ -1254,6 +1298,7 @@ void write_status(
                                       : k == "diagnostic_refinement_replay" ? options.diagnostic_refinement_replay
                                       : k == "repair_round1_origin_admission" ? options.repair_round1_origin_admission
                                       : k == "repair_joint_search" ? options.repair_joint_search
+                                      : k == "block_support_rule" ? options.block_support_rule
                                       : k == "gap_recursion_backend"
                                           ? std::string(gap_recursion_backend_name(options.gap_recursion_fixed_geometry))
                                                                          : std::to_string(options.adaptive_fine_max_served_placements);
@@ -1765,6 +1810,18 @@ void write_status(
             out << "phase_audit_same_block_genotypes\t" << summary->phase_audit_same_block_genotypes << '\n';
             out << "phase_audit_phase_support\t" << summary->phase_audit_phase_support << '\n';
             out << "fragment_contenders\t" << summary->fragment_contenders << '\n';
+            if (options.block_support_rule != "legacy") {   // M3-E (EXPERIMENTAL): recorded only when the experiment is on
+                std::map<std::string, std::size_t> counts;
+                for (const BlockDataSupport& b : summary->data_support.blocks) ++counts[b.label];
+                std::string labels;
+                for (const auto& [k, v] : counts) labels += (labels.empty() ? "" : ",") + k + ":" + std::to_string(v);
+                out << "block_support_rule\t" << options.block_support_rule << "\nblock_support_scope\t"
+                    << "conditional_on_evaluated_candidates_not_calibrated\nblock_support_labels_v1x\t"
+                    << (labels.empty() ? std::string("NOT_EVALUATED") : labels) << "\nphase_competitors_genotype_changing\t"
+                    << summary->data_support.phase.genotype_changing << "\nphase_competitors_genotype_preserving\t"
+                    << summary->data_support.phase.genotype_preserving << "\nphase_competitors_mixed\t"
+                    << summary->data_support.phase.mixed << '\n';
+            }
             std::size_t supported = 0;
             for (const bool block : summary->block_genotype_read_supported) supported += block ? 1 : 0;
             out << "blocks_genotype_read_supported\t" << supported << '\n';
@@ -2062,6 +2119,12 @@ void apply_genotype_setting(const std::string& context, const std::string& key, 
             throw std::runtime_error(context + ": 'union_progressive_schedule' is off or experimental_v1: " + value);
         }
         options.union_progressive_schedule = value;
+    }
+    else if (key == "block_support_rule") {   // M3-E (EXPERIMENTAL)
+        if (value != "legacy" && value != "full_data_likelihood_v1_experimental") {
+            throw std::runtime_error(context + ": 'block_support_rule' is legacy or full_data_likelihood_v1_experimental: " + value);
+        }
+        options.block_support_rule = value;
     }
     else if (key == "repair_joint_search") {   // M3-D (EXPERIMENTAL)
         if (value != "off" && value != "experimental_v1") {
@@ -4377,6 +4440,32 @@ GenotypeRunStatus run_genotype_body(const GenotypeCommandOptions& options, Genot
                                     : summary.fragment_contenders == 0          ? "READS_WITHIN_CANDIDATES"
                                                                                 : "PRIOR_ONLY";
             summary.projection_ambiguous = sequence_candidates[best.candidate_id].projection_ambiguous;
+            if (options.block_support_rule != "legacy") {   // M3-E (EXPERIMENTAL): the same shared function, unpooled inputs
+                const std::size_t blocks_here = model.blocks().size();
+                std::vector<SupportGroup> groups(sequence_candidates.size());
+                for (std::size_t g = 0; g < sequence_candidates.size(); ++g) {
+                    std::set<BlockGenotypeRow> rows;
+                    for (const std::size_t m : sequence_candidates[g].members) {
+                        BlockGenotypeRow row;
+                        for (std::size_t b = 0; b < blocks_here; ++b) {
+                            row.push_back(std::minmax(candidates[m].diplotype.first.alleles[b], candidates[m].diplotype.second.alleles[b]));
+                        }
+                        rows.insert(row);
+                    }
+                    groups[g].rows.assign(rows.begin(), rows.end());
+                }
+                summary.data_support_competitor_paths.assign(sequence_candidates.size(), "NA");
+                for (const CertifiedCandidate& c : ranking.candidates) {
+                    SupportGroup& g = groups[c.candidate_id];
+                    g.fragment = c.fragment_term;
+                    g.exposure = c.exposure_term;
+                    g.prior = c.prior;
+                    g.bound = c.numeric_error_bound;
+                    const MosaicDiplotype& rep = candidates[sequence_candidates[c.candidate_id].representative].diplotype;
+                    summary.data_support_competitor_paths[c.candidate_id] = join_alleles(rep.first.alleles) + "|" + join_alleles(rep.second.alleles);
+                }
+                summary.data_support = block_data_support_v1(groups, best.candidate_id, blocks_here);
+            }
         }
         {
             // Per block, conditional on the retained candidate set: posterior and GQ of the winner's unordered
@@ -6202,6 +6291,31 @@ GenotypeRunStatus run_genotype_body(const GenotypeCommandOptions& options, Genot
         summary.block_genotype_posterior = decided.block_genotype_posterior;
         summary.block_genotype_quality = decided.block_genotype_quality;
         summary.block_numerically_separated = decided.block_numerically_separated;
+        if (options.block_support_rule != "legacy") {   // M3-E (EXPERIMENTAL): the shared full-data-likelihood support
+            std::vector<SupportGroup> groups(decided.groups.size());
+            for (std::size_t g = 0; g < decided.groups.size(); ++g) {
+                std::set<BlockGenotypeRow> rows;
+                for (const std::size_t m : decided.groups[g]) {
+                    BlockGenotypeRow row;
+                    for (std::size_t b = 0; b < block_count; ++b) {
+                        row.push_back(std::minmax(decided.candidates[m].first[b], decided.candidates[m].second[b]));
+                    }
+                    rows.insert(row);
+                }
+                groups[g].rows.assign(rows.begin(), rows.end());
+            }
+            summary.data_support_competitor_paths.assign(decided.groups.size(), "NA");
+            for (const CertifiedCandidate& c : decided.ranking.candidates) {
+                SupportGroup& g = groups[c.candidate_id];
+                g.fragment = c.fragment_term;
+                g.exposure = c.exposure_term;
+                g.prior = c.prior;
+                g.bound = c.numeric_error_bound;
+                const PoolCandidate& rep = decided.candidates[decided.representative[c.candidate_id]];
+                summary.data_support_competitor_paths[c.candidate_id] = join_alleles(rep.first) + "|" + join_alleles(rep.second);
+            }
+            summary.data_support = block_data_support_v1(groups, best.candidate_id, block_count);
+        }
 
         // Table identities: union candidates keep theirs; repair-only candidates follow, canonically.
         std::vector<std::size_t> table_id(decided.candidates.size());
@@ -7128,7 +7242,8 @@ GenotypeRunStatus run_genotype_body(const GenotypeCommandOptions& options, Genot
             std::ostringstream& out = defer_output(prefix + ".block_genotypes.tsv");
             out << "block_id\tkind\treportable\tallele1\tallele2\tallele1_bp\tallele2_bp\tzygosity\t"
                    "projection_ambiguous\tgenotype_support\tphase_support\tconditional_genotype_posterior\t"
-                   "conditional_GQ\tnumerically_separated\tcandidate_scope" << kFilterHeader << kQualityHeader << '\n';
+                   "conditional_GQ\tnumerically_separated\tcandidate_scope" << kFilterHeader << kQualityHeader
+                << (options.block_support_rule != "legacy" ? kDataSupportHeader : "") << '\n';
             for (std::size_t b = 0; b < block_count; ++b) {
                 const PreparedGenotypeBlock& block = model.blocks()[b];
                 const bool variant = block.kind == GenotypeBlockKind::Variant;
@@ -7141,7 +7256,11 @@ GenotypeRunStatus run_genotype_body(const GenotypeCommandOptions& options, Genot
                     << summary.phase_support << '\t' << std::setprecision(12) << summary.block_genotype_posterior[b]
                     << '\t' << summary.block_genotype_quality[b] << std::setprecision(6) << '\t'
                     << (summary.block_numerically_separated[b] ? "true" : "false") << '\t'
-                    << set_report.final_candidate_scope << filter_columns(b) << genotype_quality[b] << '\n';
+                    << set_report.final_candidate_scope << filter_columns(b) << genotype_quality[b]
+                    << (options.block_support_rule != "legacy"
+                            ? data_support_columns(summary, b, block_filter[b].filter, library_sensitive.count(b) != 0, true)
+                            : std::string())
+                    << '\n';
             }
         }
         if (unique) {
@@ -7514,7 +7633,7 @@ GenotypeRunStatus run_genotype_body(const GenotypeCommandOptions& options, Genot
                     out << "block_id\tkind\treportable\tallele1\tallele2\tallele1_bp\tallele2_bp\t"
                            "zygosity\tprojection_ambiguous\tgenotype_support\tphase_support\t"
                            "conditional_genotype_posterior\tconditional_GQ\tnumerically_separated\t"
-                           "candidate_scope" << kFilterHeader << kQualityHeader << '\n';
+                           "candidate_scope" << kFilterHeader << kQualityHeader << (options.block_support_rule != "legacy" ? kDataSupportHeader : "") << '\n';
                     for (std::size_t b = 0; b < block_count; ++b) {
                         const PreparedGenotypeBlock& block = model.blocks()[b];
                         const bool variant = block.kind == GenotypeBlockKind::Variant;
@@ -7523,6 +7642,7 @@ GenotypeRunStatus run_genotype_body(const GenotypeCommandOptions& options, Genot
                         if (!agreed[b]) {
                             out << ".\t.\t.\t.\tNOCALL\tfalse\tNOCALL\tUNRESOLVED\tNA\tNA\tfalse\t"
                                 << set_report.final_candidate_scope << kFilterNotEvaluated << consensus_quality[b]
+                                << (options.block_support_rule != "legacy" ? data_support_columns(summary, b, "", false, false) : std::string())
                                 << '\n';
                             continue;
                         }
@@ -7536,7 +7656,9 @@ GenotypeRunStatus run_genotype_body(const GenotypeCommandOptions& options, Genot
                             << summary.block_genotype_posterior[b] << '\t'
                             << summary.block_genotype_quality[b] << std::setprecision(6) << '\t'
                             << (summary.block_numerically_separated[b] ? "true" : "false") << '\t'
-                            << set_report.final_candidate_scope << kFilterNotEvaluated << consensus_quality[b] << '\n';
+                            << set_report.final_candidate_scope << kFilterNotEvaluated << consensus_quality[b]
+                            << (options.block_support_rule != "legacy" ? data_support_columns(summary, b, "", false, false) : std::string())
+                            << '\n';
                     }
                 }
                 timings.total = seconds_since(started);
@@ -7616,7 +7738,8 @@ GenotypeRunStatus run_genotype_body(const GenotypeCommandOptions& options, Genot
             std::ofstream out = open_output(options.out_prefix + ".block_genotypes.tsv");
             out << "block_id\tkind\treportable\tallele1\tallele2\tallele1_bp\tallele2_bp\tzygosity\t"
                    "projection_ambiguous\tgenotype_support\tphase_support\tconditional_genotype_posterior\t"
-                   "conditional_GQ\tnumerically_separated\tcandidate_scope" << kFilterHeader << kQualityHeader << '\n';
+                   "conditional_GQ\tnumerically_separated\tcandidate_scope" << kFilterHeader << kQualityHeader
+                << (options.block_support_rule != "legacy" ? kDataSupportHeader : "") << '\n';
             const bool ambiguous = sequence_candidates[winner].projection_ambiguous;
             for (std::size_t b = 0; b < model.blocks().size(); ++b) {
                 const PreparedGenotypeBlock& block = model.blocks()[b];
@@ -7631,7 +7754,10 @@ GenotypeRunStatus run_genotype_body(const GenotypeCommandOptions& options, Genot
                     << summary.phase_support << '\t' << std::setprecision(12)
                     << summary.block_genotype_posterior[b] << '\t' << summary.block_genotype_quality[b]
                     << std::setprecision(6) << '\t' << (summary.block_numerically_separated[b] ? "true" : "false")
-                    << '\t' << set_report.final_candidate_scope << kFilterNotEvaluated << plain_quality[b] << '\n';
+                    << '\t' << set_report.final_candidate_scope << kFilterNotEvaluated << plain_quality[b]
+                    << (options.block_support_rule != "legacy" ? data_support_columns(summary, b, "NOT_EVALUATED", false, true)
+                                                               : std::string())
+                    << '\n';
             }
         }
         {

@@ -288,6 +288,36 @@ int main() {
             }
             require(refused, "the experiment with the library sensitivity audit must be refused before any output");
         }
+        // M3-E: the experimental support annotation is annotation-only (every pre-existing output unchanged) and thread-invariant
+        {
+            auto sup1 = options(l, "sup1", true);
+            sup1.block_support_rule = "full_data_likelihood_v1_experimental";
+            auto sup4 = sup1;
+            sup4.out_prefix = path("sup4");
+            sup4.threads = 4;
+            require(panvar::run_genotype(sup1) == panvar::GenotypeRunStatus::Complete && panvar::run_genotype(sup4) == panvar::GenotypeRunStatus::Complete,
+                    "support runs must complete");
+            for (const char* suffix : {".genotypes.tsv", ".mosaic_scores.tsv", ".mosaic_haplotypes.fa", ".mosaic_candidates.tsv"}) {
+                require(slurp(path("on") + suffix, false) == slurp(path("sup1") + suffix, false),
+                        std::string("support annotation must leave ") + suffix + " unchanged");
+            }
+            const auto legacy_cols = [&](const std::string& prefix) {   // the first 29 block columns are the pre-existing ones
+                std::ifstream in(prefix + ".block_genotypes.tsv");
+                std::string out, line;
+                while (std::getline(in, line)) {
+                    std::size_t at = 0;
+                    for (int k = 0; k < 29 && at != std::string::npos; ++k) at = line.find('\t', at + 1);
+                    out += line.substr(0, at) + '\n';
+                }
+                return out;
+            };
+            require(legacy_cols(path("on")) == legacy_cols(path("sup1")), "support annotation must leave the legacy block columns unchanged");
+            require(slurp(path("sup1") + ".block_genotypes.tsv", false) == slurp(path("sup4") + ".block_genotypes.tsv", false),
+                    "the support columns must not depend on the thread count");
+            const auto st = status(path("sup1"));
+            require(st.at("block_support_rule") == "full_data_likelihood_v1_experimental" && st.count("block_support_labels_v1x") == 1,
+                    "the support status rows must be written");
+        }
         std::cout << "genotype joint search e2e: PASS\n";
         return 0;
     } catch (const std::exception& e) {

@@ -271,6 +271,10 @@ struct GenotypeCommandOptions {
     // exhaustive search or an optimality certificate. Not supported with the library sensitivity audit, diagnostic tie
     // branching, the refinement replay or diagnostic_union_only (refused before any output).
     std::string repair_joint_search = "off";
+    // M3-E (EXPERIMENTAL, profile key block_support_rule legacy|full_data_likelihood_v1_experimental; default legacy):
+    // appends separately versioned block-genotype support columns computed under the full data likelihood (fragment +
+    // exposure, prior excluded; genotype_block_support.hpp). Every existing column, filter and decision is unchanged.
+    std::string block_support_rule = "legacy";
     // I2-B (EXPERIMENTAL, profile keys only, never public settings): how the adaptive search's window enumeration builds
     // its placement rows. "reference" (the default) scans each enumerated window whole, unchanged. "fine_experimental"
     // builds the same rows from a round-local, per-worker fine store (PreparedScoringContext::
