@@ -24,7 +24,10 @@ MANIFEST_P = [("prepare", "prepare", "-", 30), ("align", "align", "-", 120), ("a
 # Amendment 1 (declared after `analyse` exited 1 at 3.5 s spent): the input guard refused the script's read-back of its own
 # summary for the final print (all outputs were already written); reads under the unit's own directory are allowed. analyse.a1.
 MANIFEST_A1 = [("analyse.a1", "analyse", "-", 90)]
-MANIFESTS = {"P": MANIFEST_P, "A1": MANIFEST_A1}
+# Amendment 2 (declared after analyse.a1, 5.2 s spent): panel-only measurements for the state-count estimate and structural
+# layer (length classes, arrangements, local distinct patterns per window, non-simple interval signatures). extra.a2.
+MANIFEST_A2 = [("extra.a2", "extra", "-", 60)]
+MANIFESTS = {"P": MANIFEST_P, "A1": MANIFEST_A1, "A2": MANIFEST_A2}
 INPUTS = [   # panel-only inputs (frozen digests); nothing else is read
     {"file": f"{M1D}/inventory.a1/inventory.tsv", "sha256": "e890464ef2a1d6b91cb15b2d53a1577ddcdc032ec85f698033a1cc57a99b1039"},
     {"file": f"{M1D}/inventory.a1/inventory.fa", "sha256": "8f425a37e811428616d1d40b707fe6813e0f710b79ef36cabcb44215deb470c4"},
@@ -90,6 +93,9 @@ def command(kind, target, d):
     if kind == "analyse":
         assert ok("align"), "analyse runs only after align passed"
         return [sys.executable, os.path.join(HERE, "analyse.py"), f"{OUT}/runs/prepare", f"{OUT}/runs/align/events.tsv", f"{d}/m6e"], "measurements"
+    if kind == "extra":
+        assert ok("analyse.a1"), "extra runs only after analyse.a1 passed"
+        return [sys.executable, os.path.join(HERE, "extra.py"), f"{OUT}/runs/prepare", f"{OUT}/runs/align/events.tsv", f"{OUT}/runs/analyse.a1/m6e", f"{d}/m6e_extra"], "state-count measurements"
     raise ValueError(kind)
 
 

@@ -114,3 +114,20 @@ measurement.
 
 **Units.** Manifest A1: `analyse.a1` (90 s). `analyse` stays recorded as failed. Its outputs were not inspected before this
 amendment.
+
+## Amendment 2 (declared after `analyse.a1`; 5.2 s spent)
+
+**Why.** Item 4 asks for a realistic state count, and the structural layer needs arrangement frequencies. The frozen
+measurements give neither the number of distinct local sequences per fragment-length window nor the haplotype
+arrangements.
+
+**Added unit `extra.a2`** (60 s; `extra.py`; panel only, with the same allowlist plus analyse.a1's own tables):
+1. length-class frequencies by physical copy, haplotype and donor;
+2. haplotype arrangements: copy count and length-class pattern per template, by haplotype and donor, and diploid totals
+   by donor;
+3. 400-bp and 800-bp windows (step 200 bp) over each reference: SIMPLE sites per window, and distinct local allele
+   patterns among the unique components;
+4. per non-simple interval: distinct local event signatures among the unique components. These are an upper bound on
+   distinct local sequences, since co-optimal alignments can split one sequence into several signatures.
+
+Nothing already measured is changed.
