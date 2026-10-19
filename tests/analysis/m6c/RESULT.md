@@ -107,3 +107,27 @@ best joint hypotheses. That is effectively optimising edits per hypothesis. M6-C
 
 **Synthetic success here does not solve real C4.** The F2 failures show that, even in a two-site world, the nuisance
 prior can override weak structural evidence.
+
+## Qualifications appended at M6-D (2026-10-19; Sol's review; the record above is not rewritten)
+
+The arithmetic above is accepted. **The model is not approved for caller integration.**
+
+1. **Best-state columns are not a decomposition of the marginal.** `best_state_fragment`, `best_state_exposure` and
+   `best_state_log_prior` describe the single nuisance state with the highest posterior. They do not decompose the
+   marginal.
+   - The F2 readings above ("8 corrections cost −23.97", "2+2 beats 2+3 on likelihood by about 6.3 nats", "the
+     decompositions show the actual driver: the nuisance prior") are best-state statements.
+   - The exact marginal decomposition is log m = E_q[log L] − KL(q ‖ prior), reported in M6-D.
+2. **The no-change state alone does not establish a copy-number preference.** "0.95^(2n), 0.10 nats per extra copy"
+   concerns that one state. Each copy's nuisance prior sums to one, so this is not a marginal copy-number preference by
+   itself.
+3. **Uniform allocation weights induce a prior on total copy number.** Uniform weights over the nine allocations give
+   prior masses **2/9, 3/9 and 4/9** to totals 3, 4 and 5. Total 5 carries twice the prior mass of total 3. This bears
+   directly on the runs that leaned toward total 5: F1 seed 11 and F2a seed 11.
+4. **Exact factorisation is unproved.** "Mathematically feasible" refers to complete enumeration in this tiny state space.
+   Exact site-local factorisation of the paired-fragment likelihood remains unproved.
+
+**Unchanged:**
+- F2a and F2b remain failures. F2a was prior-driven (truth posterior about 1e-11); F2b chose the wrong dosage (2+3 or 3+2).
+- F1, F3 and F6 remain unresolved.
+- F4 true 3+1, seed 11, remains under-confident (0.82).

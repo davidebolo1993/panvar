@@ -295,6 +295,10 @@ if(PANVAR_BUILD_TESTING)
         add_executable(nuisance_structural tests/nuisance_structural.cpp)
         target_link_libraries(nuisance_structural PRIVATE panvarlib)
         target_compile_options(nuisance_structural PRIVATE -Wall -Wextra -Wpedantic)
+        # M6-D diagnostic (not a ctest): candidate-centred vs common-content nuisance prior, synthetic only
+        add_executable(nuisance_prior_audit tests/nuisance_prior_audit.cpp)
+        target_link_libraries(nuisance_prior_audit PRIVATE panvarlib)
+        target_compile_options(nuisance_prior_audit PRIVATE -Wall -Wextra -Wpedantic)
         # M6-A diagnostic (not a ctest): count-fit comparator core gates
         add_executable(count_fit_gates tests/count_fit_gates.cpp)
         target_compile_options(count_fit_gates PRIVATE -Wall -Wextra -Wpedantic)
