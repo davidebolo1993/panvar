@@ -63,7 +63,12 @@ V31_PAIRS = {"compare.c4_30", "compare.cyp_30", "compare.acot_30", "compare.acot
 # every pair unit not yet run uses v3.2.
 MANIFEST_A2 = [("compare.v32_controls", "controls32", "-", 30)] + [
     (f"recompare_v32.{t}", "pair32", f"control.{t}:combined.{t}", 30) for t in ("c4_5", "cyp_5", "acot_5")]
-MANIFESTS = {"B": MANIFEST_B, "A1": MANIFEST_A1, "A2": MANIFEST_A2}
+# Amendment 3 (declared before further execution): the pair condition required a legacy completed status, so the CYP2D6
+# 30x pair -- both arms a completed ranking ending in the known sv:3/sv:5 tie (legacy RESCORE_INCOMPLETE, distinct_tie;
+# sequence-first PREDICTION RESOLVED, completed_ranking; exit 0) -- was skipped (compare.cyp_30 NOT RUN, recorded). The
+# condition now also accepts a completed ranking; every pair unit not yet run uses it; one new unit compares CYP2D6 30x.
+MANIFEST_A3 = [("compare_a3.cyp_30", "pair32", "control.cyp_30:combined.cyp_30", 30)]
+MANIFESTS = {"B": MANIFEST_B, "A1": MANIFEST_A1, "A2": MANIFEST_A2, "A3": MANIFEST_A3}
 
 
 def ledger_rows():
@@ -166,7 +171,12 @@ def command(unit, kind, target, timeout, d):
             return None, "NOT RUN (condition): an arm did not run"
         sx, sy = tsv(f"{x}/call.mosaic_status.tsv"), tsv(f"{y}/call.mosaic_status.tsv")
         done = ("COMPLETE", "CONDITIONAL_GENOTYPE_EQUIVALENT", "BLOCK_CONSENSUS")
-        if sx.get("status") not in done or sy.get("status") not in done:
+        # Amendment 3: a completed search that ends in a genuine tie (legacy RESCORE_INCOMPLETE / distinct_tie) is a completed
+        # outcome when the sequence-first report records a completed ranking; resource stops never are
+        lx, ly = tsv(f"{x}/call.sequence_locus.tsv"), tsv(f"{y}/call.sequence_locus.tsv")
+        completed = lambda s, l: s.get("status") in done or (  # noqa: E731
+            l.get("completion") == "completed_ranking" and s.get("status") not in ("TIME_LIMIT", "RESOURCE_REFUSAL"))
+        if not (completed(sx, lx) and completed(sy, ly)):
             return None, (f"NOT RUN (condition): not both completed ({sx.get('status')} / {sy.get('status')}); "
                           "a refusal is a resource limitation, not an equivalence")
         cats = "operational,profile,checkpoints" if target.endswith(".repeat") else "operational,profile,route,admission,checkpoints"
