@@ -127,3 +127,16 @@ everywhere.
 - **Recorded separately for later work:**
   - the unrefined-pool-winner issue (the ts1 2× call is again a union winner never refined);
   - the trunk sensitivity seen here.
+
+## Closure appended at M5-A (2026-10-19; Sol's review; the record above is not rewritten)
+
+1. **Six unchanged prediction pairs; five evaluated accuracy comparisons.** ACOT's two arms produced byte-identical
+   predictions, but its accuracy is **unassessed**: the evaluator exceeded its declared timeout. It was not rerun.
+2. **Hazard matching is a geometry experiment, not parameter calibration.** λ_HM redistributes the legacy total hazard
+   by distance. It says nothing about the value a physically interpretable copying length should take. Fitting the
+   copying length stays deferred.
+3. **Distance mode stays experimental and default-off.**
+4. **The transition and geometry state is process-global.** `g_transitions` and `g_geometry` follow the caller's
+   existing `g_*` pattern: reset at the start of each run, set once per run. They are not safe for concurrent runs in
+   one process. Per-run ownership, the state carried by the run rather than a global, is required before any concurrent
+   multi-sample use. The ownership is not redesigned here.
