@@ -6661,10 +6661,14 @@ int two_block_lik_gate(const Args& args) {
         opt.threads = 4;
         opt.mismatch_band = 6;
         for (int homologue = 0; homologue < 2; ++homologue) {
-            // reference: cold placement of the complete joint sequence in a fresh context
-            panvar::PreparedScoringContext cold(fragments, m3c::Lib::toy(), opt);
-            const auto cs = cold.add_haplotypes({joint, other});
-            const panvar::FragmentScoringResult cr = cold.score_candidates({homologue == 0 ? panvar::HaplotypeCandidate{cs[0], cs[1]} : panvar::HaplotypeCandidate{cs[1], cs[0]}});
+            // reference: cold placement of the complete joint sequence in a fresh context, destroyed before the incremental
+            // context exists (Amendment 1: the library allows one live context per process -- it owns the emission cache)
+            panvar::FragmentScoringResult cr;
+            {
+                panvar::PreparedScoringContext cold(fragments, m3c::Lib::toy(), opt);
+                const auto cs = cold.add_haplotypes({joint, other});
+                cr = cold.score_candidates({homologue == 0 ? panvar::HaplotypeCandidate{cs[0], cs[1]} : panvar::HaplotypeCandidate{cs[1], cs[0]}});
+            }
             for (int order = 0; order < 2; ++order) {
                 panvar::PreparedScoringContext ctx(fragments, m3c::Lib::toy(), opt);
                 const auto slots = ctx.add_haplotypes({base, other}, nullptr, false, true);

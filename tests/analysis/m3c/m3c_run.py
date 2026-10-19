@@ -36,7 +36,8 @@ M3B = "/Users/davide.bolognini/panvar/tests/results/m3b_two_block_20261019/runs"
 ORDER = ["lzo_5x", "mosaic_5x", "mosaic_2x"]   # LZO control first; the 5x twin's budget reserved before the 2x case
 MANIFEST_B = ([("gate", "gate", "-", 60)] + [(f"lik.{c}", "lik", c, 180) for c in ORDER] + [("rank", "rank", "-", 30),
               ("compare.m3b", "cmp", "-", 30)] + [(f"eval.{c}", "eval", c, 60) for c in ORDER])
-MANIFESTS = {"B": MANIFEST_B}
+MANIFEST_A1 = [("gate.a1", "gate", "-", 60)]   # Amendment 1: gate fixture context lifetime (one live context per process)
+MANIFESTS = {"B": MANIFEST_B, "A1": MANIFEST_A1}
 CARRIED = 0.0
 INPUTS = {r["cell"] + ":" + r["file"]: r["sha256"] for r in csv.DictReader(open(os.path.join(HERE, "INPUTS.tsv")), delimiter="\t")}
 
