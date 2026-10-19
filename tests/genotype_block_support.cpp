@@ -121,7 +121,81 @@ int main() {
         require(panvar::data_support_quality_reason("DATA_SUPPORTED").empty() && panvar::data_support_quality_reason("NO_EVALUATED_ALTERNATIVE").empty() &&
                     panvar::data_support_quality_reason("PRIOR_DEPENDENT") == "prior_dependent" && panvar::data_support_quality_reason("DATA_TIED") == "data_tied",
                 "the frozen label-to-quality mapping");
-        std::cout << "genotype block support: PASS\n";
+        // ================= v2 (M3-E.1): envelope certification and mixed-projection semantics =================
+        {
+            const BlockGenotypeRow call{{0, 1}}, alt{{2, 2}}, alt2{{3, 3}};
+            const auto one = [](std::vector<BlockGenotypeRow> rows, double L, double P, double u) { return group(std::move(rows), L, 0.0, P, u); };
+            const auto label = [](const std::vector<SupportGroup>& g, std::size_t w) { return panvar::block_data_support_v2(g, w, 1).blocks[0]; };
+            // every permutation of a fixture gives identical labels, certification, gaps and reported competitor content
+            const auto permutations_agree = [&](std::vector<SupportGroup> g) {
+                std::vector<std::size_t> idx(g.size());
+                std::iota(idx.begin(), idx.end(), 0);
+                const auto ref = label(g, 0);
+                const auto content = [&](const std::vector<SupportGroup>& gs, long k) {
+                    return k < 0 ? std::string("none") : std::to_string(gs[static_cast<std::size_t>(k)].fragment) + "/" + std::to_string(gs[static_cast<std::size_t>(k)].bound);
+                };
+                const std::string ref_competitor = content(g, ref.competitor);
+                do {
+                    std::vector<SupportGroup> p;
+                    for (const std::size_t k : idx) p.push_back(g[k]);
+                    const std::size_t w = static_cast<std::size_t>(std::find(idx.begin(), idx.end(), std::size_t{0}) - idx.begin());
+                    const auto x = label(p, w);
+                    const bool gaps = (std::isnan(x.support_gap) && std::isnan(ref.support_gap)) || x.support_gap == ref.support_gap;
+                    if (x.label != ref.label || x.certified != ref.certified || !gaps || content(p, x.competitor) != ref_competitor) return false;
+                } while (std::next_permutation(idx.begin(), idx.end()));
+                return true;
+            };
+            const auto w = one({call}, -100, 0, 1e-9);
+            // R1 (Sol): equal point likelihoods, different bounds -- same label in both orders (DATA_TIED: the large bound reaches above S_lo)
+            const auto small = one({alt}, -100.000001, -10, 1e-9), large = one({alt}, -100.000001, -10, 2e-6);
+            require(label({w, small, large}, 0).label == "DATA_TIED" && label({w, large, small}, 0).label == "DATA_TIED",
+                    "v2 R1: tied competitors with different bounds must be DATA_TIED in both orders");
+            require(permutations_agree({w, small, large}), "v2 R1: order-independent");
+            // R2 (Sol): a mixed competitor only -- AMBIGUOUS_COMPETITOR with a non-empty LOW_QUALITY reason
+            const auto mixed_high = one({call, alt}, -99, -10, 1e-9);
+            require(label({w, mixed_high}, 0).label == "AMBIGUOUS_COMPETITOR" &&
+                        panvar::data_support_quality_reason_v2("AMBIGUOUS_COMPETITOR") == "ambiguous_competitor",
+                    "v2 R2: a mixed competitor alone must not disappear");
+            // R3 (Sol): the mixed competitor has the highest likelihood -- never PRIOR_DEPENDENT
+            const auto definite_high = one({alt}, -99.5, -10, 1e-9);
+            require(label({w, definite_high, mixed_high}, 0).label == "AMBIGUOUS_COMPETITOR", "v2 R3: no prior dependence under a stronger mixed group");
+            require(permutations_agree({w, definite_high, mixed_high}), "v2 R3: order-independent");
+            // heterogeneous bounds on both sides
+            const auto s2 = one({call}, -100.5, -1, 1.0);
+            const auto d1 = one({alt}, -100.2, -9, 1e-6), d2 = one({alt2}, -101.0, -9, 0.9);
+            require(label({w, s2, d1, d2}, 0).label == "DATA_SUPPORTED" && permutations_agree({w, s2, d1, d2}),
+                    "v2 bounds: every competing upper bound below the same-genotype lower bound -> supported, any order");
+            const auto d2_wide = one({alt2}, -101.0, -9, 1.0);   // upper bound -100.0 reaches above S_lo
+            require(label({w, s2, d1, d2_wide}, 0).label == "DATA_TIED" && permutations_agree({w, s2, d1, d2_wide}),
+                    "v2 bounds: one wide competitor interval reaching above S_lo -> DATA_TIED, any order");
+            // near ties just outside / inside the envelopes
+            require(label({w, one({alt}, -100 - 3e-9, -9, 1e-9)}, 0).label == "DATA_SUPPORTED", "v2 near tie: 1e-9 clear of the envelopes is certified");
+            require(label({w, one({alt}, -100 - 1.5e-9, -9, 1e-9)}, 0).label == "DATA_TIED", "v2 near tie: overlapping envelopes are DATA_TIED");
+            require(label({w, one({alt}, -100 + 3e-9, -9, 1e-9)}, 0).label == "PRIOR_DEPENDENT", "v2 near tie: a definite group clear above is PRIOR_DEPENDENT");
+            // mixed groups: safely below (support and prior dependence kept), between, above both
+            const auto mixed_low = one({call, alt}, -105, -10, 1e-9);
+            require(label({w, one({alt}, -101, -9, 1e-9), mixed_low}, 0).label == "DATA_SUPPORTED", "v2 mixed below: support kept");
+            require(label({w, one({alt}, -98, -9, 1e-9), mixed_low}, 0).label == "PRIOR_DEPENDENT", "v2 mixed below: prior dependence kept");
+            const auto mixed_between = one({call, alt}, -99, -10, 1e-9);
+            require(label({w, one({alt}, -98, -9, 1e-9), mixed_between}, 0).label == "PRIOR_DEPENDENT",
+                    "v2 mixed between S and the definite competitor: the definite evidence is the strongest -> PRIOR_DEPENDENT");
+            require(label({w, one({alt}, -101, -9, 1e-9), mixed_between}, 0).label == "AMBIGUOUS_COMPETITOR",
+                    "v2 mixed above both definite classes -> AMBIGUOUS_COMPETITOR");
+            require(label({w, mixed_low}, 0).label == "DATA_SUPPORTED", "v2 mixed alone, safely below -> supported");
+            require(permutations_agree({w, one({alt}, -98, -9, 1e-9), mixed_between, mixed_low}), "v2 mixed: order-independent");
+            // absent comparison: non-affirmative
+            const auto absent = label({w, one({call}, -101, -5, 1e-9)}, 0);
+            require(absent.label == "NO_EVALUATED_ALTERNATIVE" && !absent.certified &&
+                        panvar::data_support_quality_reason_v2("NO_EVALUATED_ALTERNATIVE") == "no_evaluated_alternative" &&
+                        panvar::data_support_quality_reason_v2("DATA_SUPPORTED").empty(),
+                    "v2 absent: NO_EVALUATED_ALTERNATIVE is non-affirmative (its own quality term, never PASS)");
+            // projection-ambiguous winner
+            require(label({one({call, alt}, -100, 0, 1e-9), one({alt2}, -101, 0, 1e-9)}, 0).label == "AMBIGUOUS_PROJECTION",
+                    "v2: a projection-ambiguous call is never resolved by a representative");
+            // the full v1 fixture under v2: phase classes identical to v1
+            require(panvar::block_data_support_v2(gs, 0, 5).phase.genotype_changing == r.phase.genotype_changing, "v2 shares v1's phase classes");
+        }
+        std::cout << "genotype block support (v1 + v2): PASS\n";
         return 0;
     } catch (const std::exception& e) {
         std::cerr << "genotype block support: FAIL: " << e.what() << '\n';

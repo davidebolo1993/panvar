@@ -21,6 +21,7 @@
 #include "panvar/genotype_locus.hpp"
 #include "panvar/genotype_model.hpp"
 #include "panvar/genotype_repair.hpp"
+#include "panvar/genotype_block_support.hpp"
 #include "panvar/genotype_joint_search.hpp"
 #include "panvar/gfa.hpp"
 #include "panvar/gfa_io.hpp"
@@ -7094,6 +7095,50 @@ int joint_bounds(const Args& args) {
     return 0;
 }
 
+// support-audit (M3-E.1): the C++ block_data_support_v2 on a saved run's (rounded) score and candidate tables -- the same
+// inputs the independent Python audit reads. No model, no reads, no rescoring.
+int support_audit(const Args& args) {
+    const std::string run = args.required("run");
+    std::map<std::string, std::size_t> index;
+    std::vector<panvar::SupportGroup> groups;
+    std::size_t winner = 0;
+    std::vector<std::string> ids;
+    for (const auto& row : read_table(run + ".mosaic_scores.tsv")) {
+        index[row.at("sequence_candidate_id")] = groups.size();
+        panvar::SupportGroup g;
+        g.fragment = std::stod(row.at("fragment_term"));
+        g.exposure = std::stod(row.at("exposure_term"));
+        g.prior = std::stod(row.at("sequence_pair_prior"));
+        g.bound = std::stod(row.at("numeric_error_bound"));
+        if (row.at("in_winner_set") == "true") winner = groups.size();
+        groups.push_back(g);
+        ids.push_back(row.at("sequence_candidate_id"));
+    }
+    std::vector<std::set<panvar::BlockGenotypeRow>> rows(groups.size());
+    for (const auto& row : read_table(run + ".mosaic_candidates.tsv")) {
+        const auto found = index.find(row.at("sequence_candidate_id"));
+        if (found == index.end()) continue;
+        const auto a = parse_alleles(row.at("hap1_alleles")), b = parse_alleles(row.at("hap2_alleles"));
+        panvar::BlockGenotypeRow r;
+        for (std::size_t k = 0; k < a.size(); ++k) r.push_back(std::minmax(a[k], b[k]));
+        rows[found->second].insert(r);
+    }
+    for (std::size_t g = 0; g < groups.size(); ++g) groups[g].rows.assign(rows[g].begin(), rows[g].end());
+    std::vector<std::string> block_ids;
+    for (const auto& row : read_table(run + ".block_genotypes.tsv")) block_ids.push_back(row.at("block_id"));
+    const panvar::DataSupportResultV2 r = panvar::block_data_support_v2(groups, winner, block_ids.size());
+    std::ostringstream out;
+    out << std::setprecision(12) << "block\tlabel\tcertified\tsupport_gap\tcompetitor_sequence_candidate\tdisagreeing\tmixed\n";
+    for (std::size_t b = 0; b < block_ids.size(); ++b) {
+        const auto& x = r.blocks[b];
+        out << block_ids[b] << '\t' << x.label << '\t' << x.certified << '\t' << x.support_gap << '\t'
+            << (x.competitor < 0 ? std::string("NA") : ids[static_cast<std::size_t>(x.competitor)]) << '\t' << x.disagreeing << '\t' << x.mixed << '\n';
+    }
+    atomic_write(args.required("out") + ".support_v2.tsv", out.str());
+    std::cout << out.str();
+    return 0;
+}
+
 int block_sequences(const Args& args) {
     const std::string out = args.required("out");
     const std::string reference = args.required("reference");
@@ -8229,7 +8274,7 @@ int library_estimate(const Args& args) {
 int main(int argc, char** argv) {
     try {
         if (argc < 2) {
-            std::cerr << "usage: genotype_probe simulate|loo-gfa|evaluate|compare|genotype|trace|anchors|subsample|preflight|respell|coverage-audit|form-census|mosaic-truth|orientations|panel-alleles|tied-consensus|score-set|block-sequences|prior-pool|two-block-catalogue|two-block-eval|two-block-lik|two-block-lik-gate|joint-bounds|mass-reconcile|spell|edit-distances|repair-search --key value ...\n";
+            std::cerr << "usage: genotype_probe simulate|loo-gfa|evaluate|compare|genotype|trace|anchors|subsample|preflight|respell|coverage-audit|form-census|mosaic-truth|orientations|panel-alleles|tied-consensus|score-set|block-sequences|prior-pool|two-block-catalogue|two-block-eval|two-block-lik|two-block-lik-gate|joint-bounds|support-audit|mass-reconcile|spell|edit-distances|repair-search --key value ...\n";
             return 2;
         }
         const std::string command = argv[1];
@@ -8261,6 +8306,7 @@ int main(int argc, char** argv) {
         if (command == "two-block-lik") return two_block_lik(args);
         if (command == "two-block-lik-gate") return two_block_lik_gate(args);
         if (command == "joint-bounds") return joint_bounds(args);
+        if (command == "support-audit") return support_audit(args);
         if (command == "mass-reconcile") return mass_reconcile(args);
         if (command == "spell") return spell(args);
         if (command == "edit-distances") return edit_distances(args);

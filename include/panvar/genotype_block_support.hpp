@@ -57,4 +57,34 @@ DataSupportResult block_data_support_v1(const std::vector<SupportGroup>& groups,
 // The genotype-support term the experimental quality filter adds for a label: "" (none) or its reason.
 std::string data_support_quality_reason(const std::string& label);
 
+// ---- v2 (M3-E.1; profile value full_data_likelihood_v2_experimental; contract tests/analysis/m3e1/CONTRACT_V2.md) ----
+// Certification by uncertainty ENVELOPES over every relevant group (order-independent): S / D / M = same / disagreeing /
+// mixed groups at the block, each group's interval [L - u, L + u]; S_lo, S_hi, D_lo, D_hi, M_lo, M_hi = class maxima.
+//   AMBIGUOUS_PROJECTION     the called group's members disagree at the block
+//   NO_EVALUATED_ALTERNATIVE D and M empty (non-affirmative: quality UNASSESSED, never PASS)
+//   DATA_SUPPORTED           S_lo > D_hi (D non-empty) and S_lo > M_hi (M non-empty)
+//   PRIOR_DEPENDENT          D non-empty, D_lo > S_hi, and (M empty or D_lo > M_hi)
+//   AMBIGUOUS_COMPETITOR     M non-empty and M_hi >= S_lo
+//   DATA_TIED                otherwise
+// The reported strongest definite competitor (largest L + u; stable content tie-break) never affects a label.
+struct BlockDataSupportV2 {
+    std::string label = "NOT_EVALUATED";
+    bool certified = false;
+    double support_gap = std::numeric_limits<double>::quiet_NaN();     // S_lo - max(D_hi, M_hi)
+    double point_margin = std::numeric_limits<double>::quiet_NaN();    // max L over S - max L over D and M
+    double mixed_upper_minus_same_lower = std::numeric_limits<double>::quiet_NaN();   // M_hi - S_lo
+    long competitor = -1;                                              // strongest definite competitor (reporting only)
+    double delta_fragment = std::numeric_limits<double>::quiet_NaN(), delta_exposure = std::numeric_limits<double>::quiet_NaN(),
+           delta_likelihood = std::numeric_limits<double>::quiet_NaN(), delta_prior = std::numeric_limits<double>::quiet_NaN();
+    std::size_t disagreeing = 0, mixed = 0;
+};
+struct DataSupportResultV2 {
+    std::vector<BlockDataSupportV2> blocks;
+    PhaseCompetitorClasses phase;   // the same classification as v1 (the phase rule is not revised)
+};
+DataSupportResultV2 block_data_support_v2(const std::vector<SupportGroup>& groups, std::size_t winner, std::size_t block_count);
+// v2 quality term: "" for DATA_SUPPORTED; "no_evaluated_alternative" (UNASSESSED when it is the only failing term); else the
+// label's LOW_QUALITY reason.
+std::string data_support_quality_reason_v2(const std::string& label);
+
 }  // namespace panvar

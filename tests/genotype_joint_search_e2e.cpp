@@ -4,6 +4,7 @@
 // contract; the library-sensitivity audit is refused with the experiment.
 #include "panvar/genotype_command.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <filesystem>
 #include <fstream>
@@ -324,6 +325,63 @@ int main() {
             const auto st = status(path("sup1"));
             require(st.at("block_support_rule") == "full_data_likelihood_v1_experimental" && st.count("block_support_labels_v1x") == 1,
                     "the support status rows must be written");
+        }
+        // M3-E.1: v2 annotation-only (legacy columns, by name) and thread-invariant; absent comparisons never PASS
+        {
+            auto v2a = options(l, "v2a", true);
+            v2a.block_support_rule = "full_data_likelihood_v2_experimental";
+            auto v2b = v2a;
+            v2b.out_prefix = path("v2b");
+            v2b.threads = 4;
+            require(panvar::run_genotype(v2a) == panvar::GenotypeRunStatus::Complete && panvar::run_genotype(v2b) == panvar::GenotypeRunStatus::Complete,
+                    "v2 runs must complete");
+            for (const char* suffix : {".genotypes.tsv", ".mosaic_scores.tsv", ".mosaic_haplotypes.fa", ".mosaic_candidates.tsv"}) {
+                require(slurp(path("on") + suffix, false) == slurp(path("v2a") + suffix, false), std::string("v2 must leave ") + suffix + " unchanged");
+            }
+            const auto by_name = [](const std::string& file, bool drop_experimental) {
+                std::ifstream in(file);
+                std::string line, out;
+                std::vector<std::string> head;
+                bool first = true;
+                std::vector<std::size_t> keep;
+                while (std::getline(in, line)) {
+                    std::vector<std::string> f;
+                    std::stringstream ss(line);
+                    for (std::string x; std::getline(ss, x, '\t');) f.push_back(x);
+                    if (first) {
+                        for (std::size_t i = 0; i < f.size(); ++i) {
+                            const bool exp = f[i].size() > 4 && (f[i].substr(f[i].size() - 4) == "_v1x" || f[i].substr(f[i].size() - 4) == "_v2x");
+                            if (!(drop_experimental && exp)) keep.push_back(i);
+                        }
+                        first = false;
+                    }
+                    for (const std::size_t i : keep) out += (i < f.size() ? f[i] : "") + "\t";
+                    out += "\n";
+                }
+                return out;
+            };
+            require(by_name(path("on") + ".block_genotypes.tsv", true) == by_name(path("v2a") + ".block_genotypes.tsv", true),
+                    "v2 must leave every legacy block column unchanged");
+            require(slurp(path("v2a") + ".block_genotypes.tsv", false) == slurp(path("v2b") + ".block_genotypes.tsv", false),
+                    "v2 columns must not depend on the thread count");
+            std::ifstream in(path("v2a") + ".block_genotypes.tsv");
+            std::string header, row;
+            std::getline(in, header);
+            std::vector<std::string> h;
+            {
+                std::stringstream ss(header);
+                for (std::string x; std::getline(ss, x, '\t');) h.push_back(x);
+            }
+            const std::size_t label_col = static_cast<std::size_t>(std::find(h.begin(), h.end(), "genotype_support_v2x") - h.begin());
+            const std::size_t quality_col = static_cast<std::size_t>(std::find(h.begin(), h.end(), "quality_filter_v2x") - h.begin());
+            require(label_col < h.size() && quality_col < h.size(), "v2 columns must be present");
+            while (std::getline(in, row)) {
+                std::vector<std::string> f;
+                std::stringstream ss(row);
+                for (std::string x; std::getline(ss, x, '\t');) f.push_back(x);
+                if (f[label_col] == "NO_EVALUATED_ALTERNATIVE") require(f[quality_col] != "PASS", "an absent comparison must never PASS");
+            }
+            require(status(path("v2a")).count("block_support_labels_v2x") == 1, "v2 status rows must be written");
         }
         std::cout << "genotype joint search e2e: PASS\n";
         return 0;

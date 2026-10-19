@@ -45,7 +45,10 @@ M3D = "/Users/davide.bolognini/panvar/tests/results/m3d_joint_search_20261019/ru
 M3E = "/Users/davide.bolognini/panvar/tests/results/m3e_support_semantics_20261019/runs"
 REPRO_BIN = f"{OUT}/bin/repro_v1"
 MANIFEST_P = [("repro.v1", "repro", "-", 30)]
-MANIFESTS = {"P": MANIFEST_P}
+RUNS6 = [f"{c}.{arm}" for c in ("lzo_5x", "mosaic_5x", "mosaic_2x") for arm in ("off", "on")]
+MANIFEST_V = [("gate.support.v2", "gate_support", "-", 60), ("gate.e2e.v2", "gate_e2e", "-", 60), ("repro.v1.after", "repro_after", "-", 30),
+              ("audit.v2", "audit_v2", "-", 60), ("audit.cpp_v2", "audit_cpp", "-", 60), ("crosscheck.v2", "cross", "-", 30)]
+MANIFESTS = {"P": MANIFEST_P, "V": MANIFEST_V}
 CARRIED = 0.0
 INPUTS = {}
 
@@ -129,6 +132,22 @@ def verify(cell):
 
 
 def command(unit, kind, target, timeout, d):
+    if kind == "gate_support":
+        return [f"{BUILD}/genotype_block_support_test"], "support gates v1 (unchanged) + v2"
+    if kind == "gate_e2e":
+        return [f"{BUILD}/genotype_joint_search_e2e_test"], "focused caller checks (v1 and v2 annotation-only, threads, absent never PASS)"
+    if kind == "repro_after":
+        return [f"{OUT}/bin/repro_v1_after"], "Sol's reproducer rebuilt against the M3-E.1 library: v1 must behave as before"
+    if kind == "audit_v2":
+        runs = [f"{r}={M3D}/run.{r}/call" for r in RUNS6]
+        return [sys.executable, os.path.join(HERE, "audit_saved_v2.py"), f"{d}/audit_v2", f"{M3E}/audit.saved/audit.blocks.tsv", *runs], \
+            "independent Python v2 audit of the saved M3-D tables"
+    if kind == "audit_cpp":
+        cmds = " && ".join(f"{BUILD}/genotype_probe support-audit --run {M3D}/run.{r}/call --out {d}/{r} > /dev/null" for r in RUNS6)
+        return ["/bin/bash", "-c", cmds], "C++ block_data_support_v2 on the same saved tables"
+    if kind == "cross":
+        return [sys.executable, os.path.join(HERE, "cross_v2.py"), f"{OUT}/runs/audit.v2/audit_v2.blocks.tsv", f"{OUT}/runs/audit.cpp_v2",
+                f"{d}/cross.tsv"], "C++ v2 vs Python v2"
     if kind == "repro":
         return [REPRO_BIN], "Sol's reproducer (unchanged source) against the current shared function (v1)"
     raise ValueError(kind)

@@ -1,5 +1,7 @@
 #include "panvar/genotype_block_support.hpp"
 
+#include <algorithm>
+#include <limits>
 #include <set>
 #include <stdexcept>
 
@@ -99,6 +101,96 @@ std::string data_support_quality_reason(const std::string& label) {
     if (label == "AMBIGUOUS_PROJECTION") return "ambiguous_projection";
     if (label == "AMBIGUOUS_COMPETITOR") return "ambiguous_competitor";
     return "support_not_evaluated";
+}
+
+DataSupportResultV2 block_data_support_v2(const std::vector<SupportGroup>& groups, std::size_t winner, std::size_t block_count) {
+    // Validation and the phase classification are shared with v1 (unchanged semantics).
+    const DataSupportResult v1 = block_data_support_v1(groups, winner, block_count);
+    const double ninf = -std::numeric_limits<double>::infinity();
+    const auto likelihood = [](const SupportGroup& g) { return g.fragment + g.exposure; };
+    const SupportGroup& w = groups[winner];
+    DataSupportResultV2 out;
+    out.phase = v1.phase;
+    out.blocks.resize(block_count);
+    for (std::size_t b = 0; b < block_count; ++b) {
+        BlockDataSupportV2& r = out.blocks[b];
+        std::set<std::pair<std::size_t, std::size_t>> called;
+        for (const BlockGenotypeRow& row : w.rows) called.insert(row[b]);
+        if (called.size() != 1) {
+            r.label = "AMBIGUOUS_PROJECTION";
+            continue;
+        }
+        const auto g = *called.begin();
+        double s_lo = ninf, s_hi = ninf, d_lo = ninf, d_hi = ninf, m_lo = ninf, m_hi = ninf, s_pt = ninf, c_pt = ninf;
+        long best = -1;
+        const auto stronger = [&](std::size_t x, std::size_t y) {   // stable, content-based: larger L+u, L, smaller u, larger P, rows
+            const SupportGroup& a = groups[x];
+            const SupportGroup& c = groups[y];
+            if (likelihood(a) + a.bound != likelihood(c) + c.bound) return likelihood(a) + a.bound > likelihood(c) + c.bound;
+            if (likelihood(a) != likelihood(c)) return likelihood(a) > likelihood(c);
+            if (a.bound != c.bound) return a.bound < c.bound;
+            if (a.prior != c.prior) return a.prior > c.prior;
+            return a.rows < c.rows;
+        };
+        for (std::size_t k = 0; k < groups.size(); ++k) {
+            const SupportGroup& x = groups[k];
+            bool carries = false, lacks = false;
+            for (const BlockGenotypeRow& row : x.rows) (row[b] == g ? carries : lacks) = true;
+            const double lo = likelihood(x) - x.bound, hi = likelihood(x) + x.bound;
+            if (carries && !lacks) {
+                s_lo = std::max(s_lo, lo);
+                s_hi = std::max(s_hi, hi);
+                s_pt = std::max(s_pt, likelihood(x));
+            } else if (lacks && !carries) {
+                ++r.disagreeing;
+                d_lo = std::max(d_lo, lo);
+                d_hi = std::max(d_hi, hi);
+                c_pt = std::max(c_pt, likelihood(x));
+                if (best < 0 || stronger(k, static_cast<std::size_t>(best))) best = static_cast<long>(k);
+            } else {
+                ++r.mixed;
+                m_lo = std::max(m_lo, lo);
+                m_hi = std::max(m_hi, hi);
+                c_pt = std::max(c_pt, likelihood(x));
+            }
+        }
+        (void)m_lo;
+        if (r.disagreeing == 0 && r.mixed == 0) {
+            r.label = "NO_EVALUATED_ALTERNATIVE";
+            continue;
+        }
+        r.support_gap = s_lo - std::max(d_hi, m_hi);
+        r.point_margin = s_pt - c_pt;
+        if (r.mixed > 0) r.mixed_upper_minus_same_lower = m_hi - s_lo;
+        if (best >= 0) {
+            const SupportGroup& d = groups[static_cast<std::size_t>(best)];
+            r.competitor = best;
+            r.delta_fragment = w.fragment - d.fragment;
+            r.delta_exposure = w.exposure - d.exposure;
+            r.delta_likelihood = likelihood(w) - likelihood(d);
+            r.delta_prior = w.prior - d.prior;
+        }
+        const bool supported = (r.disagreeing == 0 || s_lo > d_hi) && (r.mixed == 0 || s_lo > m_hi);
+        const bool prior_dependent = r.disagreeing > 0 && d_lo > s_hi && (r.mixed == 0 || d_lo > m_hi);
+        if (supported) {
+            r.label = "DATA_SUPPORTED";
+            r.certified = true;
+        } else if (prior_dependent) {
+            r.label = "PRIOR_DEPENDENT";
+            r.certified = true;
+        } else if (r.mixed > 0 && m_hi >= s_lo) {
+            r.label = "AMBIGUOUS_COMPETITOR";
+        } else {
+            r.label = "DATA_TIED";
+        }
+    }
+    return out;
+}
+
+std::string data_support_quality_reason_v2(const std::string& label) {
+    if (label == "DATA_SUPPORTED") return "";
+    if (label == "NO_EVALUATED_ALTERNATIVE") return "no_evaluated_alternative";
+    return data_support_quality_reason(label);
 }
 
 }  // namespace panvar

@@ -786,6 +786,7 @@ struct RankingSummary {
     // M3-E (EXPERIMENTAL): full-data-likelihood block support (empty unless block_support_rule is experimental and the
     // summary path computed it); competitor paths for reporting, by group index.
     DataSupportResult data_support;
+    DataSupportResultV2 data_support_v2;   // M3-E.1: block_support_rule full_data_likelihood_v2_experimental
     std::vector<std::string> data_support_competitor_paths;
     std::size_t sequence_candidates = 0;
     std::size_t collapsed_beam_candidates = 0;
@@ -837,9 +838,58 @@ const char* const kDataSupportHeader =
     "\tgenotype_support_v1x\tquality_filter_v1x\tquality_reason_v1x\tdata_support_margin_v1x\tdata_support_certified_v1x\t"
     "competitor_group_v1x\tcompetitor_paths_v1x\tcompetitor_delta_fragment_v1x\tcompetitor_delta_exposure_v1x\t"
     "competitor_delta_likelihood_v1x\tcompetitor_delta_prior_v1x\tdisagreeing_groups_v1x\tmixed_groups_v1x";
+const char* const kDataSupportHeaderV2 =
+    "\tgenotype_support_v2x\tquality_filter_v2x\tquality_reason_v2x\tsupport_certified_v2x\tsupport_gap_v2x\tpoint_margin_v2x\t"
+    "mixed_upper_minus_same_lower_v2x\tcompetitor_group_v2x\tcompetitor_paths_v2x\tcompetitor_delta_fragment_v2x\t"
+    "competitor_delta_exposure_v2x\tcompetitor_delta_likelihood_v2x\tcompetitor_delta_prior_v2x\tdisagreeing_groups_v2x\tmixed_groups_v2x";
+std::string data_support_header(const std::string& rule) {
+    return rule == "full_data_likelihood_v1_experimental" ? kDataSupportHeader
+           : rule == "full_data_likelihood_v2_experimental" ? kDataSupportHeaderV2
+                                                             : "";
+}
+// v2 (M3-E.1): envelope certification; quality PASS / LOW_QUALITY / UNASSESSED (an absent comparison is never PASS).
+std::string data_support_columns_v2(const RankingSummary& summary, std::size_t b, const std::string& representation_filter,
+                                    bool library_sensitive, bool evaluated) {
+    if (!evaluated || b >= summary.data_support_v2.blocks.size()) {
+        return "\tNOT_EVALUATED\tNOT_EVALUATED\tsupport_not_evaluated\tNA\tNA\tNA\tNA\tNA\tNA\tNA\tNA\tNA\tNA\tNA\tNA";
+    }
+    const BlockDataSupportV2& s = summary.data_support_v2.blocks[b];
+    std::vector<std::string> failing;
+    if (representation_filter == "LOWQUAL_REPRESENTATION_CONFLICT") failing.push_back("representation_conflict");
+    else if (representation_filter != "PASS") failing.push_back("representation_not_evaluated");
+    const std::string term = data_support_quality_reason_v2(s.label);
+    const bool unassessed_term = term == "no_evaluated_alternative";
+    if (!term.empty() && !unassessed_term) failing.push_back(term);
+    if (library_sensitive) failing.push_back("library_sensitive");
+    std::string reason;
+    for (const std::string& f : failing) reason += (reason.empty() ? "" : ",") + f;
+    if (unassessed_term) reason += (reason.empty() ? "" : ",") + term;
+    const std::string filter = !failing.empty() ? "LOW_QUALITY" : unassessed_term ? "UNASSESSED" : "PASS";
+    std::ostringstream out;
+    out << std::setprecision(12) << '\t' << s.label << '\t' << filter << '\t' << (reason.empty() ? std::string("none") : reason) << '\t'
+        << (s.label == "NO_EVALUATED_ALTERNATIVE" || s.label == "AMBIGUOUS_PROJECTION" ? "NA" : (s.certified ? "true" : "false"));
+    const auto num = [&out](double v) {
+        out << '\t';
+        if (std::isnan(v)) out << "NA"; else out << v;
+    };
+    num(s.support_gap);
+    num(s.point_margin);
+    num(s.mixed_upper_minus_same_lower);
+    out << '\t' << (s.competitor < 0 ? std::string("NA") : std::to_string(s.competitor)) << '\t'
+        << (s.competitor < 0 ? std::string("NA") : summary.data_support_competitor_paths.at(static_cast<std::size_t>(s.competitor)));
+    num(s.delta_fragment);
+    num(s.delta_exposure);
+    num(s.delta_likelihood);
+    num(s.delta_prior);
+    out << '\t' << s.disagreeing << '\t' << s.mixed;
+    return out.str();
+}
 // The legacy quality combination with only the genotype-support term replaced by the experimental label's term.
-std::string data_support_columns(const RankingSummary& summary, std::size_t b, const std::string& representation_filter,
-                                 bool library_sensitive, bool evaluated) {
+std::string data_support_columns(const std::string& rule, const RankingSummary& summary, std::size_t b,
+                                 const std::string& representation_filter, bool library_sensitive, bool evaluated) {
+    if (rule == "full_data_likelihood_v2_experimental") {
+        return data_support_columns_v2(summary, b, representation_filter, library_sensitive, evaluated);
+    }
     if (!evaluated || b >= summary.data_support.blocks.size()) {
         return "\tNOT_EVALUATED\tNOT_EVALUATED\tsupport_not_evaluated\tNA\tNA\tNA\tNA\tNA\tNA\tNA\tNA\tNA\tNA";
     }
@@ -1813,14 +1863,16 @@ void write_status(
             if (options.block_support_rule != "legacy") {   // M3-E (EXPERIMENTAL): recorded only when the experiment is on
                 std::map<std::string, std::size_t> counts;
                 for (const BlockDataSupport& b : summary->data_support.blocks) ++counts[b.label];
+                for (const BlockDataSupportV2& b : summary->data_support_v2.blocks) ++counts[b.label];
+                const PhaseCompetitorClasses& phase_classes = options.block_support_rule == "full_data_likelihood_v2_experimental"
+                                                                  ? summary->data_support_v2.phase : summary->data_support.phase;
                 std::string labels;
                 for (const auto& [k, v] : counts) labels += (labels.empty() ? "" : ",") + k + ":" + std::to_string(v);
                 out << "block_support_rule\t" << options.block_support_rule << "\nblock_support_scope\t"
-                    << "conditional_on_evaluated_candidates_not_calibrated\nblock_support_labels_v1x\t"
+                    << "conditional_on_evaluated_candidates_not_calibrated\n" << (options.block_support_rule == "full_data_likelihood_v2_experimental" ? "block_support_labels_v2x" : "block_support_labels_v1x") << "\t"
                     << (labels.empty() ? std::string("NOT_EVALUATED") : labels) << "\nphase_competitors_genotype_changing\t"
-                    << summary->data_support.phase.genotype_changing << "\nphase_competitors_genotype_preserving\t"
-                    << summary->data_support.phase.genotype_preserving << "\nphase_competitors_mixed\t"
-                    << summary->data_support.phase.mixed << '\n';
+                    << phase_classes.genotype_changing << "\nphase_competitors_genotype_preserving\t"
+                    << phase_classes.genotype_preserving << "\nphase_competitors_mixed\t" << phase_classes.mixed << '\n';
             }
             std::size_t supported = 0;
             for (const bool block : summary->block_genotype_read_supported) supported += block ? 1 : 0;
@@ -2121,8 +2173,9 @@ void apply_genotype_setting(const std::string& context, const std::string& key, 
         options.union_progressive_schedule = value;
     }
     else if (key == "block_support_rule") {   // M3-E (EXPERIMENTAL)
-        if (value != "legacy" && value != "full_data_likelihood_v1_experimental") {
-            throw std::runtime_error(context + ": 'block_support_rule' is legacy or full_data_likelihood_v1_experimental: " + value);
+        if (value != "legacy" && value != "full_data_likelihood_v1_experimental" && value != "full_data_likelihood_v2_experimental") {
+            throw std::runtime_error(context + ": 'block_support_rule' is legacy, full_data_likelihood_v1_experimental or "
+                                               "full_data_likelihood_v2_experimental: " + value);
         }
         options.block_support_rule = value;
     }
@@ -4464,7 +4517,11 @@ GenotypeRunStatus run_genotype_body(const GenotypeCommandOptions& options, Genot
                     const MosaicDiplotype& rep = candidates[sequence_candidates[c.candidate_id].representative].diplotype;
                     summary.data_support_competitor_paths[c.candidate_id] = join_alleles(rep.first.alleles) + "|" + join_alleles(rep.second.alleles);
                 }
-                summary.data_support = block_data_support_v1(groups, best.candidate_id, blocks_here);
+                if (options.block_support_rule == "full_data_likelihood_v2_experimental") {
+                    summary.data_support_v2 = block_data_support_v2(groups, best.candidate_id, blocks_here);
+                } else {
+                    summary.data_support = block_data_support_v1(groups, best.candidate_id, blocks_here);
+                }
             }
         }
         {
@@ -6314,7 +6371,11 @@ GenotypeRunStatus run_genotype_body(const GenotypeCommandOptions& options, Genot
                 const PoolCandidate& rep = decided.candidates[decided.representative[c.candidate_id]];
                 summary.data_support_competitor_paths[c.candidate_id] = join_alleles(rep.first) + "|" + join_alleles(rep.second);
             }
-            summary.data_support = block_data_support_v1(groups, best.candidate_id, block_count);
+            if (options.block_support_rule == "full_data_likelihood_v2_experimental") {
+                summary.data_support_v2 = block_data_support_v2(groups, best.candidate_id, block_count);
+            } else {
+                summary.data_support = block_data_support_v1(groups, best.candidate_id, block_count);
+            }
         }
 
         // Table identities: union candidates keep theirs; repair-only candidates follow, canonically.
@@ -7243,7 +7304,7 @@ GenotypeRunStatus run_genotype_body(const GenotypeCommandOptions& options, Genot
             out << "block_id\tkind\treportable\tallele1\tallele2\tallele1_bp\tallele2_bp\tzygosity\t"
                    "projection_ambiguous\tgenotype_support\tphase_support\tconditional_genotype_posterior\t"
                    "conditional_GQ\tnumerically_separated\tcandidate_scope" << kFilterHeader << kQualityHeader
-                << (options.block_support_rule != "legacy" ? kDataSupportHeader : "") << '\n';
+                << data_support_header(options.block_support_rule) << '\n';
             for (std::size_t b = 0; b < block_count; ++b) {
                 const PreparedGenotypeBlock& block = model.blocks()[b];
                 const bool variant = block.kind == GenotypeBlockKind::Variant;
@@ -7258,7 +7319,7 @@ GenotypeRunStatus run_genotype_body(const GenotypeCommandOptions& options, Genot
                     << (summary.block_numerically_separated[b] ? "true" : "false") << '\t'
                     << set_report.final_candidate_scope << filter_columns(b) << genotype_quality[b]
                     << (options.block_support_rule != "legacy"
-                            ? data_support_columns(summary, b, block_filter[b].filter, library_sensitive.count(b) != 0, true)
+                            ? data_support_columns(options.block_support_rule, summary, b, block_filter[b].filter, library_sensitive.count(b) != 0, true)
                             : std::string())
                     << '\n';
             }
@@ -7633,7 +7694,7 @@ GenotypeRunStatus run_genotype_body(const GenotypeCommandOptions& options, Genot
                     out << "block_id\tkind\treportable\tallele1\tallele2\tallele1_bp\tallele2_bp\t"
                            "zygosity\tprojection_ambiguous\tgenotype_support\tphase_support\t"
                            "conditional_genotype_posterior\tconditional_GQ\tnumerically_separated\t"
-                           "candidate_scope" << kFilterHeader << kQualityHeader << (options.block_support_rule != "legacy" ? kDataSupportHeader : "") << '\n';
+                           "candidate_scope" << kFilterHeader << kQualityHeader << data_support_header(options.block_support_rule) << '\n';
                     for (std::size_t b = 0; b < block_count; ++b) {
                         const PreparedGenotypeBlock& block = model.blocks()[b];
                         const bool variant = block.kind == GenotypeBlockKind::Variant;
@@ -7642,7 +7703,7 @@ GenotypeRunStatus run_genotype_body(const GenotypeCommandOptions& options, Genot
                         if (!agreed[b]) {
                             out << ".\t.\t.\t.\tNOCALL\tfalse\tNOCALL\tUNRESOLVED\tNA\tNA\tfalse\t"
                                 << set_report.final_candidate_scope << kFilterNotEvaluated << consensus_quality[b]
-                                << (options.block_support_rule != "legacy" ? data_support_columns(summary, b, "", false, false) : std::string())
+                                << (options.block_support_rule != "legacy" ? data_support_columns(options.block_support_rule, summary, b, "", false, false) : std::string())
                                 << '\n';
                             continue;
                         }
@@ -7657,7 +7718,7 @@ GenotypeRunStatus run_genotype_body(const GenotypeCommandOptions& options, Genot
                             << summary.block_genotype_quality[b] << std::setprecision(6) << '\t'
                             << (summary.block_numerically_separated[b] ? "true" : "false") << '\t'
                             << set_report.final_candidate_scope << kFilterNotEvaluated << consensus_quality[b]
-                            << (options.block_support_rule != "legacy" ? data_support_columns(summary, b, "", false, false) : std::string())
+                            << (options.block_support_rule != "legacy" ? data_support_columns(options.block_support_rule, summary, b, "", false, false) : std::string())
                             << '\n';
                     }
                 }
@@ -7739,7 +7800,7 @@ GenotypeRunStatus run_genotype_body(const GenotypeCommandOptions& options, Genot
             out << "block_id\tkind\treportable\tallele1\tallele2\tallele1_bp\tallele2_bp\tzygosity\t"
                    "projection_ambiguous\tgenotype_support\tphase_support\tconditional_genotype_posterior\t"
                    "conditional_GQ\tnumerically_separated\tcandidate_scope" << kFilterHeader << kQualityHeader
-                << (options.block_support_rule != "legacy" ? kDataSupportHeader : "") << '\n';
+                << data_support_header(options.block_support_rule) << '\n';
             const bool ambiguous = sequence_candidates[winner].projection_ambiguous;
             for (std::size_t b = 0; b < model.blocks().size(); ++b) {
                 const PreparedGenotypeBlock& block = model.blocks()[b];
@@ -7755,7 +7816,7 @@ GenotypeRunStatus run_genotype_body(const GenotypeCommandOptions& options, Genot
                     << summary.block_genotype_posterior[b] << '\t' << summary.block_genotype_quality[b]
                     << std::setprecision(6) << '\t' << (summary.block_numerically_separated[b] ? "true" : "false")
                     << '\t' << set_report.final_candidate_scope << kFilterNotEvaluated << plain_quality[b]
-                    << (options.block_support_rule != "legacy" ? data_support_columns(summary, b, "NOT_EVALUATED", false, true)
+                    << (options.block_support_rule != "legacy" ? data_support_columns(options.block_support_rule, summary, b, "NOT_EVALUATED", false, true)
                                                                : std::string())
                     << '\n';
             }
