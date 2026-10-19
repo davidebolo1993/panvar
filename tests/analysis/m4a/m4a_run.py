@@ -94,8 +94,12 @@ def command(kind, target, d):
         cmd = ["nice", f"{BUILD}/genotype_probe", "prior-geometry", "--out", f"{d}/geom", "--model-gfa", gfa, "--reference", ref]
         return (cmd + (["--panel-curation", cur] if cur else [])), "model geometry (truth-, read- and candidate-free)"
     if kind == "compare":
+        # Amendment 2: a model whose geometry unit wrote no summary (geometry.cyp_uncurated: the uncurated CYP2D6 model is
+        # unbuildable -- partial template frames) is left out, and so is every pair naming it; nothing is substituted
+        have = [k for k in GEOM if os.path.exists(f"{OUT}/runs/geometry.{k}/geom.boundaries.tsv")]
+        pairs = [p for p in PAIRS if all(x in have for x in p.split(","))]
         return [sys.executable, os.path.join(HERE, "geometry_compare.py"), f"{d}/geometry",
-                *[f"{k}={OUT}/runs/geometry.{k}/geom" for k in GEOM], "--", *PAIRS], "geometry comparison"
+                *[f"{k}={OUT}/runs/geometry.{k}/geom" for k in have], "--", *pairs], "geometry comparison (models with geometry only)"
     raise ValueError(kind)
 
 

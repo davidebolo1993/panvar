@@ -90,3 +90,15 @@ G9 rows were therefore **not** emitted in the A1 run, and `gates.m4a.a1` exited 
 - CONTROL panel_mean 0.5, PASS.
 
 **What changed in substance.** Nothing: no contract gate changed, and every non-G9 row is identical in both runs.
+
+## Amendment 2 (declared after `geometry.cyp_uncurated` and before `geometry.compare`; 12.3 s spent)
+
+**What failed.** `geometry.cyp_uncurated` exited 1. The uncurated CYP2D6 model cannot be built: panel template
+NA18989#1 has a partial chain frame (missing right-terminal coverage at ctx:16, sv:17 and ctx:18). This is the reason
+the CYP2D6 curation exists, so the refusal is a result.
+
+**Change.** `geometry.compare` uses only the models whose geometry unit wrote output, and drops every pair naming a
+missing model: here the curated/uncurated CYP2D6 pair.
+
+**Consequence.** The same-graph curation comparison rests on ts1 alone. The rebuilt-LOO comparisons (C4, CYP2D6) are
+unaffected. Nothing is substituted, and the failed unit stays recorded.
