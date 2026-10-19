@@ -8,6 +8,7 @@ order among exact ties is label order. Writes <out>.selection.tsv, <out>.top.tsv
   rank.py <runs dir> <out prefix> cell...
 """
 import csv
+import os
 import hashlib
 import re
 import sys
@@ -22,11 +23,11 @@ def rows(p):
 sel, top, dec = [], [], []
 for cell in cells:
     import os
-    scores = rows(f"{runs}/lik.{cell}/lik.scores.tsv")
+    scores = rows(f"{runs}/{os.environ.get('LIKPREFIX', 'lik')}.{cell}/lik.scores.tsv")
     with open(f"{os.path.dirname(prefix)}/merged.{cell}.tsv", "w") as out:
-        out.write(open(f"{runs}/lik.{cell}/lik.scores.tsv").read())
-    prov = {r["label"]: r for r in rows(f"{runs}/lik.{cell}/lik.provenance.tsv")}
-    pre = dict(r for r in (l.rstrip("\n").split("\t", 1) for l in open(f"{runs}/lik.{cell}/lik.preflight.tsv")) if len(r) == 2)
+        out.write(open(f"{runs}/{os.environ.get('LIKPREFIX', 'lik')}.{cell}/lik.scores.tsv").read())
+    prov = {r["label"]: r for r in rows(f"{runs}/{os.environ.get('LIKPREFIX', 'lik')}.{cell}/lik.provenance.tsv")}
+    pre = dict(r for r in (l.rstrip("\n").split("\t", 1) for l in open(f"{runs}/{os.environ.get('LIKPREFIX', 'lik')}.{cell}/lik.preflight.tsv")) if len(r) == 2)
     for r in scores:
         r["t"] = float(r["total"])
     ranked = sorted(scores, key=lambda r: (-r["t"], r["label"]))

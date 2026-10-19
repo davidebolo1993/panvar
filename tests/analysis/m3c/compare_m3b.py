@@ -19,7 +19,7 @@ def key(r):
 
 lines, failed = [], 0
 for cell in cells:
-    new = {key(r): r for r in csv.DictReader(open(f"{m3c}/lik.{cell}/lik.scores.tsv"), delimiter="\t")}
+    new = {key(r): r for r in csv.DictReader(open(f"{m3c}/{os.environ.get('LIKPREFIX', 'lik')}.{cell}/lik.scores.tsv"), delimiter="\t")}
     if cell not in REF:
         lines.append((cell, "matched", 0, "no M3-B reference scores (cell not scored in M3-B)"))
         continue

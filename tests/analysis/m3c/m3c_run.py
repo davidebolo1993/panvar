@@ -37,7 +37,10 @@ ORDER = ["lzo_5x", "mosaic_5x", "mosaic_2x"]   # LZO control first; the 5x twin'
 MANIFEST_B = ([("gate", "gate", "-", 60)] + [(f"lik.{c}", "lik", c, 180) for c in ORDER] + [("rank", "rank", "-", 30),
               ("compare.m3b", "cmp", "-", 30)] + [(f"eval.{c}", "eval", c, 60) for c in ORDER])
 MANIFEST_A1 = [("gate.a1", "gate", "-", 60)]   # Amendment 1: gate fixture context lifetime (one live context per process)
-MANIFESTS = {"B": MANIFEST_B, "A1": MANIFEST_A1}
+# Amendment 2: the caller's refinement-context configuration (repair caps, origin cache, batched replacements)
+MANIFEST_A2 = ([("gate.a2", "gate_batch", "-", 60)] + [(f"lik.a2.{c}", "lik", c, 180) for c in ORDER] +
+               [("rank.a2", "rank", "-", 30), ("compare.a2", "cmp", "-", 30)] + [(f"eval.a2.{c}", "eval", c, 60) for c in ORDER])
+MANIFESTS = {"B": MANIFEST_B, "A1": MANIFEST_A1, "A2": MANIFEST_A2}
 CARRIED = 0.0
 INPUTS = {r["cell"] + ":" + r["file"]: r["sha256"] for r in csv.DictReader(open(os.path.join(HERE, "INPUTS.tsv")), delimiter="\t")}
 
@@ -114,6 +117,9 @@ def common(c):
 
 
 def command(unit, kind, target, timeout, d):
+    if kind == "gate_batch":
+        return ["nice", f"{BUILD}/genotype_probe", "two-block-lik-gate", "--out", f"{d}/gate", "--path", "batch_cache"], \
+            "reuse gate under the batched origin-cache path (Amendment 2)"
     if kind == "gate":
         return ["nice", f"{BUILD}/genotype_probe", "two-block-lik-gate", "--out", f"{d}/gate"], "reuse gate: incremental two-step replacement vs cold scoring"
     if kind == "lik":
@@ -121,17 +127,20 @@ def command(unit, kind, target, timeout, d):
         c = CELL[target]
         return ["nice", f"{BUILD}/genotype_probe", "two-block-lik", "--out", f"{d}/lik", "--run", c["run"], *common(c),
                 "--reads1", f"{c['reads']}/reads_1.fq", "--reads2", f"{c['reads']}/reads_2.fq", "--library", f"{c['reads']}/library.txt",
-                "--top", "4", "--single-limit", "2048", "--limit", "2048", "--threads", "4"], "likelihood shortlist + incremental joint scoring"
+                "--top", "4", "--single-limit", "2048", "--limit", "2048", "--threads", "4",
+                "--config", "repair" if unit.startswith("lik.a2.") else "reference"], "likelihood shortlist + incremental joint scoring"
+    pre = "lik.a2" if unit.endswith(".a2") or ".a2." in unit else "lik"
+    os.environ["LIKPREFIX"] = pre
     if kind == "rank":
-        done_cells = [c for c in ORDER if os.path.exists(f"{OUT}/runs/lik.{c}/lik.scores.tsv")]
+        done_cells = [c for c in ORDER if os.path.exists(f"{OUT}/runs/{pre}.{c}/lik.scores.tsv")]
         return [sys.executable, os.path.join(HERE, "rank.py"), f"{OUT}/runs", f"{d}/m3c", *done_cells], "truth-free selection (frozen before evaluation)"
     if kind == "cmp":
-        done_cells = [c for c in ORDER if os.path.exists(f"{OUT}/runs/lik.{c}/lik.scores.tsv")]
+        done_cells = [c for c in ORDER if os.path.exists(f"{OUT}/runs/{pre}.{c}/lik.scores.tsv")]
         return [sys.executable, os.path.join(HERE, "compare_m3b.py"), f"{OUT}/runs", M3B, f"{d}/compare.tsv", *done_cells], "cross-check vs M3-B reference scores"
     if kind == "eval":
-        rank_dir = f"{OUT}/runs/rank"
+        rank_dir = f"{OUT}/runs/rank.a2" if pre == "lik.a2" else f"{OUT}/runs/rank"
         assert os.path.exists(f"{rank_dir}/m3c.selection.sha256"), "evaluation needs the frozen selection"
-        sc = f"{OUT}/runs/lik.{target}/lik.scores.tsv"
+        sc = f"{OUT}/runs/{pre}.{target}/lik.scores.tsv"
         if not os.path.exists(sc):
             return None, "NOT RUN: not scored"
         c = CELL[target]
@@ -142,7 +151,7 @@ def command(unit, kind, target, timeout, d):
                     labels.add(r.get("winner") or r.get("label"))
         labels.discard("absent")
         return ["nice", f"{BUILD}/genotype_probe", "two-block-eval", "--out", f"{d}/eval", *common(c), "--scores", sc, *c["truth"],
-                "--ranks", f"{OUT}/runs/lik.{target}/lik.singles.tsv", "--labels", ",".join(sorted(x for x in labels if x))], "evaluation (truth; after selection)"
+                "--ranks", f"{OUT}/runs/{pre}.{target}/lik.singles.tsv", "--labels", ",".join(sorted(x for x in labels if x))], "evaluation (truth; after selection)"
     raise ValueError(kind)
 
 

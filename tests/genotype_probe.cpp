@@ -6633,6 +6633,9 @@ std::vector<panvar::ReadPair> reads_from(const std::vector<std::string>& haps, s
 // cold joint bytes (byte identity through the context's own byte-confirmed dedupe); both edit orders must give one slot.
 int two_block_lik_gate(const Args& args) {
     const std::string out = args.required("out");
+    // Amendment 2: --path batch_cache runs every delta through the caller's repair configuration (origin-cache path,
+    // planned add_repaired_haplotypes batches); --path reference keeps the single-request stage-5 path.
+    const bool batch = args.get("path", "reference") == "batch_cache";
     std::uint64_t seed = 31337;
     const std::string base = m3c::rnd(seed, 8000), other = m3c::rnd(seed, 7600);
     struct Case {
@@ -6671,22 +6674,30 @@ int two_block_lik_gate(const Args& args) {
             }
             for (int order = 0; order < 2; ++order) {
                 panvar::PreparedScoringContext ctx(fragments, m3c::Lib::toy(), opt);
+                if (batch) {
+                    ctx.enable_origin_cache_path(true);
+                    ctx.set_origin_cache_limits(805306368, 0);
+                }
                 const auto slots = ctx.add_haplotypes({base, other}, nullptr, false, true);
+                const auto second = [&](std::size_t source, std::size_t b, std::size_t e, const std::string& r) {
+                    if (!batch) return ctx.add_repaired_haplotype(source, b, e, r);
+                    return ctx.add_repaired_haplotypes({panvar::RepairRequest{source, b, e, r}})[0];
+                };
                 const std::uint64_t placed_before = ctx.full_placement_count();
                 std::size_t mid = 0, fin = 0, fin_other_order = 0;
                 if (order == 0) {   // earlier block first; the later block's coordinates shift by the first change
                     mid = ctx.add_repaired_haplotype(slots[0], c.b0, c.e0, r0, nullptr, true);
                     const long shift = static_cast<long>(r0.size()) - static_cast<long>(c.e0 - c.b0);
-                    fin = ctx.add_repaired_haplotype(mid, static_cast<std::size_t>(static_cast<long>(c.b1) + shift),
+                    fin = second(mid, static_cast<std::size_t>(static_cast<long>(c.b1) + shift),
                                                      static_cast<std::size_t>(static_cast<long>(c.e1) + shift), r1);
                     const std::size_t mid2 = ctx.add_repaired_haplotype(slots[0], c.b1, c.e1, r1, nullptr, true);
-                    fin_other_order = ctx.add_repaired_haplotype(mid2, c.b0, c.e0, r0);
+                    fin_other_order = second(mid2, c.b0, c.e0, r0);
                 } else {            // later block first; the earlier block's coordinates do not move
                     mid = ctx.add_repaired_haplotype(slots[0], c.b1, c.e1, r1, nullptr, true);
-                    fin = ctx.add_repaired_haplotype(mid, c.b0, c.e0, r0);
+                    fin = second(mid, c.b0, c.e0, r0);
                     const std::size_t mid2 = ctx.add_repaired_haplotype(slots[0], c.b0, c.e0, r0, nullptr, true);
                     const long shift = static_cast<long>(r0.size()) - static_cast<long>(c.e0 - c.b0);
-                    fin_other_order = ctx.add_repaired_haplotype(mid2, static_cast<std::size_t>(static_cast<long>(c.b1) + shift),
+                    fin_other_order = second(mid2, static_cast<std::size_t>(static_cast<long>(c.b1) + shift),
                                                                  static_cast<std::size_t>(static_cast<long>(c.e1) + shift), r1);
                 }
                 const std::uint64_t placed_delta = ctx.full_placement_count() - placed_before;
@@ -6696,7 +6707,7 @@ int two_block_lik_gate(const Args& args) {
                 const double de = std::fabs(ir.scores[0].exposure_term - cr.scores[0].exposure_term);
                 const bool pass = cold_slot == fin && fin == fin_other_order && df <= 1e-9 && de <= 1e-9 && placed_delta == 0;
                 failed += pass ? 0 : 1;
-                rep << c.name << '\t' << (order == 0 ? "earlier_first" : "later_first") << '\t' << homologue << '\t' << (cold_slot == fin) << '\t'
+                rep << c.name << (batch ? "[batch_cache]" : "") << '\t' << (order == 0 ? "earlier_first" : "later_first") << '\t' << homologue << '\t' << (cold_slot == fin) << '\t'
                     << (fin == fin_other_order) << '\t' << df << '\t' << de << '\t' << placed_delta << '\t' << (pass ? "PASS" : "FAIL") << '\n';
             }
         }
@@ -6775,12 +6786,25 @@ int two_block_lik(const Args& args) {
     scoring.max_state_classes = std::stoull(status.at("max_state_classes"));
     scoring.max_mass_cells = std::stoull(status.at("max_mass_cells"));
     scoring.emission_cache_bytes = static_cast<std::size_t>(std::stoull(status.at("emission_cache_bytes")));
+    // Amendment 2: the caller's refinement context (make_repair_setup): repair caps replace the union caps, and the
+    // origin-cache path with the run's declared budget serves batched, planned block replacements.
+    const bool repair_config = args.get("config", "repair") == "repair";
+    if (repair_config) {
+        scoring.max_physical_origins = std::stoull(status.at("repair_max_physical_origins"));
+        scoring.max_state_classes = std::stoull(status.at("repair_max_state_classes"));
+        scoring.max_piece_hits = std::stoull(status.at("repair_max_piece_hits"));
+        scoring.max_latent_alignment_pairs = std::stoull(status.at("repair_max_latent_pairs"));
+    }
     const std::vector<double> switches(blocks - 1, std::stod(status.at("switch_probability")));
     // incumbents (one full placement each, census retained)
     const auto prep_mark = std::chrono::steady_clock::now();
     const panvar::HaplotypeSequence s0 = panvar::spell_mosaic(model, panvar::MosaicPath{inc[0]});
     const panvar::HaplotypeSequence s1 = panvar::spell_mosaic(model, panvar::MosaicPath{inc[1]});
     panvar::PreparedScoringContext ctx(fragments, library, scoring);
+    if (repair_config) {
+        ctx.enable_origin_cache_path(true);
+        ctx.set_origin_cache_limits(static_cast<std::size_t>(std::stoull(status.at("repair_origin_cache_bytes"))), 0);
+    }
     const std::vector<std::size_t> islot = ctx.add_haplotypes({s0.bases, s1.bases}, nullptr, false, true);
     const panvar::HaplotypeSequence* spelled[2] = {&s0, &s1};
     std::map<std::vector<std::size_t>, double> hprior;
@@ -6831,17 +6855,33 @@ int two_block_lik(const Args& args) {
     };
     std::vector<Single> singles;
     std::vector<panvar::HaplotypeCandidate> sc;
-    for (int h = 0; h < 2; ++h) {
-        for (std::size_t b = 0; b < blocks; ++b) {
-            const panvar::SequenceInterval iv = spelled[h]->block_intervals[b];
-            for (std::size_t a = 0; a < model.blocks()[b].alleles.size(); ++a) {
-                if (a == inc[h][b]) continue;
-                panvar::BlockDeltaWork w;
-                const std::size_t slot = ctx.add_repaired_haplotype(islot[h], iv.begin, iv.end, model.blocks()[b].alleles[a].sequence, &w);
-                add_work(sum_single, w);
-                singles.push_back({h, b, a, slot});
-                sc.push_back(h == 0 ? panvar::HaplotypeCandidate{slot, islot[1]} : panvar::HaplotypeCandidate{islot[0], slot});
+    {
+        std::vector<panvar::RepairRequest> requests;
+        for (int h = 0; h < 2; ++h) {
+            for (std::size_t b = 0; b < blocks; ++b) {
+                const panvar::SequenceInterval iv = spelled[h]->block_intervals[b];
+                for (std::size_t a = 0; a < model.blocks()[b].alleles.size(); ++a) {
+                    if (a == inc[h][b]) continue;
+                    singles.push_back({h, b, a, 0});
+                    requests.push_back({islot[h], iv.begin, iv.end, model.blocks()[b].alleles[a].sequence});
+                }
             }
+        }
+        std::vector<std::size_t> got;
+        if (repair_config) {
+            std::vector<panvar::BlockDeltaWork> works;
+            got = ctx.add_repaired_haplotypes(requests, &works);
+            for (const auto& w : works) add_work(sum_single, w);
+        } else {
+            for (const auto& rq : requests) {
+                panvar::BlockDeltaWork w;
+                got.push_back(ctx.add_repaired_haplotype(rq.incumbent, rq.block_begin, rq.block_end, rq.replacement, &w));
+                add_work(sum_single, w);
+            }
+        }
+        for (std::size_t i = 0; i < singles.size(); ++i) {
+            singles[i].slot = got[i];
+            sc.push_back(singles[i].h == 0 ? panvar::HaplotypeCandidate{got[i], islot[1]} : panvar::HaplotypeCandidate{islot[0], got[i]});
         }
     }
     {
@@ -6917,6 +6957,13 @@ int two_block_lik(const Args& args) {
         }
     }
     std::size_t joint_deltas = 0;
+    struct JointPending {
+        int h;
+        std::vector<std::size_t> path;
+        std::string move;
+    };
+    std::vector<JointPending> pending;
+    std::vector<panvar::RepairRequest> jrequests;
     for (int h = 0; h < 2; ++h) {
         for (std::size_t b = 0; b < blocks; ++b) {
             for (std::size_t c = b + 1; c < blocks; ++c) {
@@ -6927,21 +6974,33 @@ int two_block_lik(const Args& args) {
                     const long shift = static_cast<long>(model.blocks()[b].alleles[singles[i].a].sequence.size()) -
                                        static_cast<long>(model.blocks()[b].alleles[inc[h][b]].sequence.size());
                     for (const std::size_t j : kc->second) {
-                        panvar::BlockDeltaWork w;
-                        const std::size_t slot = ctx.add_repaired_haplotype(
-                            singles[i].slot, static_cast<std::size_t>(static_cast<long>(ic.begin) + shift),
-                            static_cast<std::size_t>(static_cast<long>(ic.end) + shift), model.blocks()[c].alleles[singles[j].a].sequence, &w);
-                        add_work(sum_joint, w);
+                        jrequests.push_back({singles[i].slot, static_cast<std::size_t>(static_cast<long>(ic.begin) + shift),
+                                             static_cast<std::size_t>(static_cast<long>(ic.end) + shift), model.blocks()[c].alleles[singles[j].a].sequence});
                         ++joint_deltas;
                         std::vector<std::size_t> p = inc[h];
                         p[b] = singles[i].a;
                         p[c] = singles[j].a;
-                        add_cand(h, p, slot, "pair:" + mv(h, b, inc[h][b], singles[i].a, singles[i].rank) + "+" +
-                                                 mv(h, c, inc[h][c], singles[j].a, singles[j].rank).substr(3));
+                        pending.push_back({h, p, "pair:" + mv(h, b, inc[h][b], singles[i].a, singles[i].rank) + "+" +
+                                                     mv(h, c, inc[h][c], singles[j].a, singles[j].rank).substr(3)});
                     }
                 }
             }
         }
+    }
+    {
+        std::vector<std::size_t> got;
+        if (repair_config) {
+            std::vector<panvar::BlockDeltaWork> works;
+            got = ctx.add_repaired_haplotypes(jrequests, &works);
+            for (const auto& w : works) add_work(sum_joint, w);
+        } else {
+            for (const auto& rq : jrequests) {
+                panvar::BlockDeltaWork w;
+                got.push_back(ctx.add_repaired_haplotype(rq.incumbent, rq.block_begin, rq.block_end, rq.replacement, &w));
+                add_work(sum_joint, w);
+            }
+        }
+        for (std::size_t k = 0; k < pending.size(); ++k) add_cand(pending[k].h, pending[k].path, got[k], pending[k].move);
     }
     const double seconds_joint = since(joint_mark);
     // ---- final scoring (combination from retained columns) + sequence-level prior
@@ -6991,6 +7050,10 @@ int two_block_lik(const Args& args) {
         << "\npromote_dp_executions\t" << sum_promote.dp_executions << "\npromote_full_bytes_materialised\t" << sum_promote.full_haplotype_bytes_materialised
         << "\njoint_origins_reused\t" << sum_joint.origins_reused << "\njoint_origins_recomputed\t" << sum_joint.origins_recomputed
         << "\njoint_dp_executions\t" << sum_joint.dp_executions << "\njoint_local_window_bases\t" << sum_joint.local_window_bases
+        << "\nconfig\t" << (repair_config ? "repair (repair caps, origin cache, batched add_repaired_haplotypes)" : "reference single-request")
+        << "\norigin_cache_bytes_end\t" << ctx.origin_cache_bytes() << "\norigin_records_consumed\t" << ctx.origin_records_consumed()
+        << "\ncumulative_state_classes\t" << ctx.cumulative_counters().statistical_state_classes
+        << "\ncumulative_physical_origins\t" << ctx.cumulative_counters().physical_origins
         << "\ncensus_count_end\t" << mem.census_count << "\ncensus_bytes_end\t" << mem.census_bytes << "\ncontext_capacity_total_bytes\t" << mem.capacity_total
         << "\nseconds_context_and_incumbent\t" << seconds_prep << "\nseconds_singles\t" << seconds_singles << "\nseconds_promotion\t" << seconds_promote
         << "\nseconds_joint\t" << seconds_joint << "\nseconds_combination\t" << seconds_score << "\nseconds_prior\t" << seconds_prior
