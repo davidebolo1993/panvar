@@ -1,0 +1,18 @@
+item	lzo_5x (correct control; run first)	mosaic_5x (correct twin)	mosaic_2x (search failure)
+reuse gate	gate.a1 (reference path) and gate.a2 (batched origin-cache path): 24/24 each, fragment/exposure differences 0, byte-identical joints, both orders one slot, 0 full placements	-	-
+incumbent saved total reproduced	exact (|d| = 0)	exact (0)	exact (0)
+single-block alternatives scored (extra work vs M3-B)	1,378 (all, both homologues)	1,378	1,378
+catalogue (kept singles + same-homologue pairs), bounds 2,048 / 2,048	1,848 unique	1,848 unique	1,848 unique
+cross-check vs M3-B cold reference scores (1e-6)	no M3-B scores	906 matched, max |d| = 0	874 matched, max |d| = 0
+winner	INCUMBENT (= truth); 0 above; best alternative -7.37	INCUMBENT (= truth); 0 above; best alternative -8.06	c0101 = h0 ctx:0 36>40 (likelihood rank 4) + sv:1 67>24 (rank 1): +2.78 over the incumbent; 1 candidate above the incumbent; no tie
+winner decomposition vs incumbent (fragment / exposure / prior)	-	-	+12.25 / -0.005 / -9.47
+its intermediates vs incumbent	-	-	ctx:0 36>40 alone -3.30; sv:1 67>24 alone -10.16 (both would be rejected by single-block refinement)
+evaluation (after the frozen selection)	exact; no deterioration	exact; no deterioration	winner = TRUTH: exact sequence pair, 0 blocks wrong, 0 bp (incumbent: 2 blocks, 13 bp); phase diagnostic 0 disagreements
+truth allele likelihood ranks (afterwards)	-	-	ctx:0 allele 40: rank 4 of 67 (kept, at the cutoff); sv:1 allele 24: rank 1 (M3-B emission ranks: 12 and 1)
+wall / peak RSS (whole unit)	27.1 s / 2.02 GiB	36.1 s / 2.63 GiB	17.3 s / 1.84 GiB
+time split: context+incumbent / singles / promotion / joints / combination+prior	1.3 / 18.6 / 0.4 / 5.6 / 0.3 s	- / 26.7 / 0.6 / 6.1 / - s	- / 12.3 / 0.2 / 3.1 / - s
+full placements	2 (incumbents); 0 fallback	2; 0 fallback	2; 0 fallback
+origins reused / recomputed (singles; joints)	317.7M / 67.1M; 425.3M / 62.2M	345.5M / 70.9M; 461.8M / 67.2M	138.8M / 28.6M; 185.8M / 27.0M
+censuses retained at end / bytes	90 (2 incumbents + 88 promoted) / 596 MB	90 / 647 MB	90 / 260 MB
+cost comparison	M3-B cold scoring of the 1,848-member catalogue alone: ~300 s projected (not run)	M3-B cold: 269.7 s (two parts)	M3-B cold: 126.0 s
+budget	167.3 of 600 s; 12 units (2 failed and recorded: gate harness, union-cap configuration); Amendments 1-2	-	-
