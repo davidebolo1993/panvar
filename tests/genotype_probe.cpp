@@ -5760,6 +5760,64 @@ int score_set(const Args& args) {
                       << (sum_a - sum_b) << '\n';
         }
     }
+    // ---- --contrast A,B[;C,D...] (truth-free, no origin recording): the fragment-term difference A - B fragment by
+    // fragment from the scorer's own masses, summarised compactly -- how many fragments carry it and how concentrated it
+    // is. Placement classes need recorded origins and are not reported here; use --decompose for those.
+    {
+        std::stringstream pairs(args.get("contrast", ""));
+        for (std::string item; std::getline(pairs, item, ';');) {
+            if (item.empty()) continue;
+            const std::size_t comma = item.find(',');
+            if (comma == std::string::npos) throw std::runtime_error("--contrast takes A,B pairs separated by ';'");
+            const std::string label_a = item.substr(0, comma), label_b = item.substr(comma + 1);
+            std::size_t ia = declared.size(), ib = declared.size();
+            for (std::size_t i = 0; i < declared.size(); ++i) {
+                if (declared[i].label == label_a) ia = i;
+                if (declared[i].label == label_b) ib = i;
+            }
+            if (ia == declared.size() || ib == declared.size()) throw std::runtime_error("--contrast names an undeclared label");
+            const std::size_t a1 = interned.index_of[slots[ia].first], a2 = interned.index_of[slots[ia].second];
+            const std::size_t b1 = interned.index_of[slots[ib].first], b2 = interned.index_of[slots[ib].second];
+            std::vector<double> deltas(fragments.size());
+            double sum = 0.0;
+            std::size_t favour_a = 0, favour_b = 0;
+            for (std::size_t f = 0; f < fragments.size(); ++f) {
+                const double background = panvar::log_background_probability(fragments[f]);
+                const double ca = panvar::log_fragment_contribution(
+                    panvar::log_add_exp(scored.mass_of(f, a1), scored.mass_of(f, a2)), background, library);
+                const double cb = panvar::log_fragment_contribution(
+                    panvar::log_add_exp(scored.mass_of(f, b1), scored.mass_of(f, b2)), background, library);
+                deltas[f] = ca - cb;
+                sum += deltas[f];
+                if (deltas[f] > 1e-9) ++favour_a;
+                if (deltas[f] < -1e-9) ++favour_b;
+            }
+            std::vector<std::size_t> order(fragments.size());
+            std::iota(order.begin(), order.end(), 0);
+            std::sort(order.begin(), order.end(), [&](std::size_t x, std::size_t y) {
+                const double dx = std::fabs(deltas[x]), dy = std::fabs(deltas[y]);
+                return dx != dy ? dx > dy : x < y;
+            });
+            std::ostringstream summary;
+            summary << std::setprecision(12) << "key\tvalue\nlabel_A\t" << label_a << "\nlabel_B\t" << label_b
+                    << "\nfragment_delta\t" << sum << "\nfragment_delta_scorer\t"
+                    << (scored.scores[pair_of_declared[ia]].fragment_term - scored.scores[pair_of_declared[ib]].fragment_term)
+                    << "\nexposure_delta\t"
+                    << (scored.scores[pair_of_declared[ia]].exposure_term - scored.scores[pair_of_declared[ib]].exposure_term)
+                    << "\nfragments_favouring_A\t" << favour_a << "\nfragments_favouring_B\t" << favour_b << '\n';
+            for (const std::size_t top : {1, 10, 50, 200, 1000}) {
+                double part = 0.0;
+                for (std::size_t r = 0; r < std::min(top, order.size()); ++r) part += deltas[order[r]];
+                summary << "top" << top << "_fragments_delta\t" << part << '\n';
+            }
+            summary << "largest_fragments\t";
+            for (std::size_t r = 0; r < std::min<std::size_t>(10, order.size()); ++r) {
+                summary << (r ? "," : "") << order[r] << ':' << deltas[order[r]];
+            }
+            summary << '\n';
+            atomic_write(out + ".contrast." + label_a + "__" + label_b + ".tsv", summary.str());
+        }
+    }
     if (args.get("truth-gfa", "").empty()) {
         std::cout << "score-set " << donor << ": " << declared.size() << " declared, " << scored_pairs.size()
                   << " distinct diplotypes, " << interned.sequences.size() << " unique haplotypes, " << checked
