@@ -7411,7 +7411,8 @@ int count_fit(const Args& args) {
         mid_entries += mid1.back().v.size() + mid2.back().v.size();
     }
     const auto cands = countfit::score_all(y, base1, base2, mid1, mid2);
-    const auto groups = countfit::group_profiles(cands);
+    std::size_t hash_collision_buckets = 0;   // M6-B: exact grouping (hash = lookup only)
+    const auto groups = countfit::group_profiles(cands, mid1, mid2, ~std::uint64_t(0), &hash_collision_buckets);
     const double t_cands = secs(mark);
     const std::size_t ca = ctx[0][tb], cb = ctx[1][tb];
     std::size_t caller_rank = 0, caller_group = 0;
@@ -7441,7 +7442,8 @@ int count_fit(const Args& args) {
     s << "target_block_index\t" << tb << "\ncontext_hap1\t" << join_alleles(ctx[0]) << "\ncontext_hap2\t" << join_alleles(ctx[1]) << '\n';
     s << "context_source\trank-1 representative of " << run << ".equivalence_set.tsv (score " << ctx_score << ")\ncaller_target_alleles\t" << ca << ',' << cb
       << "\ncaller_group_rank\t" << caller_rank + 1 << "\ncaller_loss_minus_best\t" << cands[groups[caller_group][0]].loss - best << "\ngroups\t" << groups.size()
-      << "\nbest_group_size\t" << groups[0].size() << "\nbest_loss\t" << best << "\nbest_window_loss\t" << bi << "\nbest_window_kmers\t" << bw
+      << "\nbest_group_size\t" << groups[0].size() << "\ngrouping\texact_profile_equality_hash_lookup\nhash_collision_buckets\t" << hash_collision_buckets
+      << "\nbest_loss\t" << best << "\nbest_window_loss\t" << bi << "\nbest_window_kmers\t" << bw
       << "\nbest_window_kmers_abs_residual_gt1\t" << bb << "\ncaller_window_loss\t" << ci << "\ncaller_window_kmers\t" << cw
       << "\ncaller_window_kmers_abs_residual_gt1\t" << cbig << "\nmiddle_sparse_entries\t" << mid_entries
       << "\nseconds_dictionary\t" << t_dict << "\nseconds_reads\t" << t_reads << "\nseconds_candidates\t" << t_cands << "\nseconds_total\t" << secs(t0)
@@ -7459,6 +7461,256 @@ int count_fit(const Args& args) {
     atomic_write(out + ".candidates.tsv", ct_out.str());
     atomic_write(out + ".summary.tsv", s.str());
     std::cout << s.str();
+    return 0;
+}
+
+// count-attrib (M6-B, DIAGNOSTIC; truth-derived candidates are ORACLE ONLY and never enter a prediction catalogue): the
+// M6-A count objective, unchanged (same dictionary, stable-copy depth, loss), applied to a frozen list of candidates in
+// the run's fixed context, with per-k-mer contrast decomposition and noiseless oracle profiles.
+//   --candidates FILE: label \t kind \t spec1 \t spec2 \t oracle(0|1)
+//       kind alleles: spec = target-block allele id (homologue 1, homologue 2)
+//       kind block:   spec = record names in --block-fasta: target-block bytes substituted into the context
+//       kind full:    spec = record:begin:end in --full-fasta: a complete haplotype whose bytes outside [begin,end) must
+//                     equal the context (binding check; a mismatch refuses that candidate) -- its block bytes are used
+//   --contrasts "A,B;...": loss(A) - loss(B) decomposed over every dictionary k-mer whose predicted count differs, by the
+//       union of its occurrence locations in both candidates: target_interior_only | target_junction_only | outside_only |
+//       shared (more than one location class); the contributions must reconstruct the difference.
+//   --oracle-context LABEL: noiseless profile 1 = that candidate's predicted counts (unit depth);
+//   --truth-full FASTA (records truth.1, truth.2): noiseless profile 2 = the complete true diplotype's counts.
+// Each profile (real reads/depth, oracle 1, oracle 2) scores every listed candidate AND the unchanged active catalogue.
+int count_attrib(const Args& args) {
+    using clock = std::chrono::steady_clock;
+    const auto t0 = clock::now();
+    const std::string out = args.required("out");
+    const std::string run = args.required("run");
+    const std::string block_id = args.required("block");
+    const std::string curation = args.get("panel-curation", "");
+    const LoadedModel loaded = load_model(args.required("model-gfa"), args.required("reference"), out + ".model.sorted.gfa", 50,
+                                          curation.empty() ? std::vector<std::string>{} : read_panel_curation(curation));
+    std::filesystem::remove(out + ".model.sorted.gfa");
+    const panvar::PreparedGenotypeModel& model = *loaded.model;
+    const auto status = read_key_values(run + ".mosaic_status.tsv");
+    if (status.at("model_fingerprint") != loaded.fingerprint) throw std::runtime_error("the run was not scored on the rebuilt model");
+    const std::size_t blocks = model.blocks().size();
+    std::size_t tb = blocks;
+    for (std::size_t b = 0; b < blocks; ++b) if (model.blocks()[b].block_id == block_id) tb = b;
+    if (tb == blocks) throw std::runtime_error("no block " + block_id);
+    const auto& alleles = model.blocks()[tb].alleles;
+    std::vector<std::size_t> ctx[2];
+    for (const auto& row : read_table(run + ".equivalence_set.tsv")) {
+        if (row.at("rank") == "1" && row.at("representative") == "true") { ctx[0] = parse_alleles(row.at("hap1_alleles")); ctx[1] = parse_alleles(row.at("hap2_alleles")); }
+    }
+    if (ctx[0].size() != blocks) throw std::runtime_error("no rank-1 representative");
+    countfit::Context context;
+    for (int h = 0; h < 2; ++h) {
+        const panvar::HaplotypeSequence sp = panvar::spell_mosaic(model, panvar::MosaicPath{ctx[h]});
+        context.left[h] = sp.bases.substr(0, sp.block_intervals[tb].begin);
+        context.right[h] = sp.bases.substr(sp.block_intervals[tb].end);
+    }
+    // ---- dictionary and stable-copy k-mers: the count-fit construction, unchanged
+    const auto& panel = model.panel();
+    countfit::Dictionary dict;
+    std::vector<std::uint32_t> present, minc, maxc;
+    std::vector<char> in_block;
+    for (std::size_t t = 0; t < panel.template_count(); ++t) {
+        const std::vector<std::size_t> row(panel.template_alleles[t].begin(), panel.template_alleles[t].end());
+        const panvar::HaplotypeSequence sp = panvar::spell_mosaic(model, panvar::MosaicPath{row});
+        const std::size_t lo = sp.block_intervals[tb].begin, hi = sp.block_intervals[tb].end;
+        std::unordered_map<std::uint32_t, std::uint32_t> local;
+        countfit::for_each_kmer(sp.bases, [&](std::uint64_t k, std::size_t pos) {
+            const std::uint32_t id = dict.add(k);
+            if (id >= present.size()) { present.push_back(0); minc.push_back(UINT32_MAX); maxc.push_back(0); in_block.push_back(0); }
+            ++local[id];
+            if (pos < hi && pos + countfit::K > lo) in_block[id] = 1;
+        });
+        for (const auto& [id, c] : local) { ++present[id]; minc[id] = std::min(minc[id], c); maxc[id] = std::max(maxc[id], c); }
+    }
+    const std::size_t D = dict.kmer.size();
+    std::vector<char> stable(D, 0);
+    std::size_t n_stable = 0;
+    for (std::size_t i = 0; i < D; ++i) if (present[i] == panel.template_count() && minc[i] == 1 && maxc[i] == 1 && !in_block[i]) { stable[i] = 1; ++n_stable; }
+    const std::vector<panvar::ReadPair> fragments = read_pairs(args.required("reads1"), args.required("reads2"));
+    std::vector<double> obs(D, 0.0);
+    for (const auto& f : fragments) for (const panvar::SequencingRead* r : {&f.first, &f.second}) {
+        countfit::for_each_kmer(r->bases, [&](std::uint64_t k, std::size_t) { const long i = dict.find(k); if (i >= 0) obs[i] += 1.0; });
+    }
+    double ssum = 0.0;
+    for (std::size_t i = 0; i < D; ++i) if (stable[i]) ssum += obs[i];
+    const double depth = ssum / (2.0 * static_cast<double>(n_stable));
+    std::vector<double> y_real(D);
+    for (std::size_t i = 0; i < D; ++i) y_real[i] = obs[i] / depth;
+    // ---- candidates
+    const auto fasta_of = [](const std::string& path) { return path.empty() ? std::map<std::string, std::string>{} : read_fasta_records(path); };
+    const auto block_fa = fasta_of(args.get("block-fasta", "")), full_fa = fasta_of(args.get("full-fasta", ""));
+    struct Cand {
+        std::string label, kind;
+        bool oracle = false, bound = true;
+        std::string block[2], why;
+        std::vector<double> pred;                 // dense over D
+        std::unordered_map<std::uint32_t, std::uint8_t> loc;   // 1 interior, 2 junction, 4 outside
+        std::uint64_t outside_dict_target = 0;
+    };
+    std::vector<Cand> cands;
+    {
+        std::ifstream in(args.required("candidates"));
+        for (std::string line; std::getline(in, line);) {
+            if (line.empty() || line[0] == '#') continue;
+            std::vector<std::string> f;
+            std::stringstream ss(line);
+            for (std::string x; std::getline(ss, x, '\t');) f.push_back(x);
+            Cand c;
+            c.label = f.at(0);
+            c.kind = f.at(1);
+            c.oracle = f.at(4) == "1";
+            for (int h = 0; h < 2; ++h) {
+                const std::string& spec = f.at(2 + h);
+                if (c.kind == "alleles") c.block[h] = alleles.at(std::stoul(spec)).sequence;
+                else if (c.kind == "block") c.block[h] = block_fa.at(spec);
+                else if (c.kind == "full") {
+                    const std::size_t a = spec.find(':'), b = spec.rfind(':');
+                    const std::string& full = full_fa.at(spec.substr(0, a));
+                    const std::size_t begin = std::stoul(spec.substr(a + 1, b - a - 1)), end = std::stoul(spec.substr(b + 1));
+                    if (full.substr(0, begin) != context.left[h] || full.substr(end) != context.right[h]) {
+                        c.bound = false;
+                        c.why = "homologue " + std::to_string(h + 1) + " flanks differ from the fixed context";
+                    }
+                    c.block[h] = full.substr(begin, end - begin);
+                } else throw std::runtime_error("unknown candidate kind " + c.kind);
+            }
+            cands.push_back(std::move(c));
+        }
+    }
+    for (Cand& c : cands) {
+        c.pred.assign(D, 0.0);
+        for (int h = 0; h < 2; ++h) {
+            const std::string hap = context.left[h] + c.block[h] + context.right[h];
+            const std::size_t s = context.left[h].size(), e = s + c.block[h].size();
+            countfit::for_each_kmer(hap, [&](std::uint64_t k, std::size_t p) {
+                const long i = dict.find(k);
+                const bool interior = p >= s && p + countfit::K <= e;
+                const bool junction = !interior && (e > s ? (p < e && p + countfit::K > s) : (p < s && p + countfit::K > s));
+                if (i < 0) { if (interior || junction) ++c.outside_dict_target; return; }
+                c.pred[i] += 1.0;
+                c.loc[static_cast<std::uint32_t>(i)] |= interior ? 1 : junction ? 2 : 4;
+            });
+        }
+    }
+    // ---- noiseless oracle profiles (unit depth)
+    std::vector<std::pair<std::string, std::vector<double>>> profiles{{"real", y_real}};
+    const std::string oc = args.get("oracle-context", "");
+    for (const Cand& c : cands) if (c.label == oc) profiles.push_back({"oracle_truth_block_in_context", c.pred});
+    std::vector<double> truth_full(D, 0.0);
+    std::ostringstream st;
+    st << std::setprecision(10);
+    if (!args.get("truth-full", "").empty()) {
+        const auto tf = read_fasta_records(args.get("truth-full", ""));
+        std::uint64_t outside_dict = 0;
+        for (const char* r : {"truth.1", "truth.2"}) {
+            countfit::for_each_kmer(tf.at(r), [&](std::uint64_t k, std::size_t) { const long i = dict.find(k); if (i >= 0) truth_full[i] += 1.0; else ++outside_dict; });
+        }
+        profiles.push_back({"oracle_complete_true_diplotype", truth_full});
+        std::size_t hist[4] = {0, 0, 0, 0};
+        double msum = 0.0;
+        for (std::size_t i = 0; i < D; ++i) if (stable[i]) { ++hist[std::min<std::size_t>(3, static_cast<std::size_t>(truth_full[i]))]; msum += truth_full[i]; }
+        st << "truth_kmers_outside_dictionary\t" << outside_dict << "\nstable_kmers_truth_multiplicity_0\t" << hist[0] << "\nstable_kmers_truth_multiplicity_1\t" << hist[1]
+           << "\nstable_kmers_truth_multiplicity_2\t" << hist[2] << "\nstable_kmers_truth_multiplicity_3plus\t" << hist[3] << "\nstable_kmers_truth_mean_multiplicity\t"
+           << msum / static_cast<double>(n_stable) << "\nimplied_depth_scale_bias(mean/2)\t" << msum / (2.0 * static_cast<double>(n_stable)) << '\n';
+    }
+    const auto loss = [&](const std::vector<double>& y, const std::vector<double>& p) {
+        double s = 0.0;
+        for (std::size_t i = 0; i < D; ++i) s += (y[i] - p[i]) * (y[i] - p[i]);
+        return s;
+    };
+    std::ostringstream ct;
+    ct << std::setprecision(12) << "label\tkind\toracle\tbound\twhy\tblock1_bp\tblock2_bp\ttarget_kmers_outside_dictionary";
+    for (const auto& pr : profiles) ct << "\tloss_" << pr.first;
+    ct << '\n';
+    for (const Cand& c : cands) {
+        ct << c.label << '\t' << c.kind << '\t' << c.oracle << '\t' << c.bound << '\t' << (c.why.empty() ? "-" : c.why) << '\t' << c.block[0].size() << '\t'
+           << c.block[1].size() << '\t' << c.outside_dict_target;
+        for (const auto& pr : profiles) ct << '\t' << loss(pr.second, c.pred);
+        ct << '\n';
+    }
+    // ---- contrasts
+    std::ostringstream cx;
+    cx << std::setprecision(12) << "contrast\tprofile\tdelta_loss\treconstructed\tkmers_differing\tcategory\tcategory_kmers\tcategory_delta\ttop10_share\ttop100_share\ttop1000_share\n";
+    std::stringstream cs(args.get("contrasts", ""));
+    for (std::string item; std::getline(cs, item, ';');) {
+        if (item.empty()) continue;
+        const std::string la = item.substr(0, item.find(',')), lb = item.substr(item.find(',') + 1);
+        const auto pick = [&](const std::string& l) -> const Cand& {
+            for (const Cand& c : cands) if (c.label == l) return c;
+            throw std::runtime_error("contrast names an unknown candidate " + l);
+        };
+        const Cand& A = pick(la);
+        const Cand& B = pick(lb);
+        for (const auto& pr : profiles) {
+            const std::vector<double>& y = pr.second;
+            std::map<std::string, std::pair<std::size_t, double>> cat;
+            std::vector<double> contrib;
+            double total = 0.0;
+            for (std::size_t i = 0; i < D; ++i) {
+                if (A.pred[i] == B.pred[i]) continue;
+                const double c = (y[i] - A.pred[i]) * (y[i] - A.pred[i]) - (y[i] - B.pred[i]) * (y[i] - B.pred[i]);
+                std::uint8_t m = 0;
+                if (auto f = A.loc.find(static_cast<std::uint32_t>(i)); f != A.loc.end()) m |= f->second;
+                if (auto f = B.loc.find(static_cast<std::uint32_t>(i)); f != B.loc.end()) m |= f->second;
+                const std::string name = m == 1 ? "target_interior_only" : m == 2 ? "target_junction_only" : m == 4 ? "outside_only" : "shared";
+                cat[name].first += 1;
+                cat[name].second += c;
+                contrib.push_back(c);
+                total += c;
+            }
+            std::sort(contrib.begin(), contrib.end(), [](double x, double z) { return std::fabs(x) > std::fabs(z); });
+            double absum = 0.0;
+            for (double x : contrib) absum += std::fabs(x);
+            const auto share = [&](std::size_t n) {
+                double s = 0.0;
+                for (std::size_t i = 0; i < std::min(n, contrib.size()); ++i) s += std::fabs(contrib[i]);
+                return absum > 0 ? s / absum : 0.0;
+            };
+            const double direct = loss(y, A.pred) - loss(y, B.pred);
+            for (const char* name : {"target_interior_only", "target_junction_only", "shared", "outside_only"}) {
+                const auto it = cat.find(name);
+                cx << la << " - " << lb << '\t' << pr.first << '\t' << direct << '\t' << total << '\t' << contrib.size() << '\t' << name << '\t'
+                   << (it == cat.end() ? 0 : it->second.first) << '\t' << (it == cat.end() ? 0.0 : it->second.second) << '\t' << share(10) << '\t'
+                   << share(100) << '\t' << share(1000) << '\n';
+            }
+        }
+    }
+    // ---- the unchanged active catalogue against every profile (exact groups)
+    const auto merged = [&](const std::string& a, const std::string& b) {
+        countfit::Sparse x = countfit::count_string(a, dict), z = countfit::count_string(b, dict);
+        countfit::Sparse s = countfit::sum_sparse(x, z);
+        s.hash = x.hash + z.hash;
+        return s;
+    };
+    const countfit::Sparse base1 = merged(context.left[0], context.right[0]), base2 = merged(context.left[1], context.right[1]);
+    std::vector<countfit::Sparse> mid1, mid2;
+    for (const auto& a : alleles) {
+        mid1.push_back(countfit::count_string(countfit::middle_window(context.left[0], a.sequence, context.right[0]), dict));
+        mid2.push_back(countfit::count_string(countfit::middle_window(context.left[1], a.sequence, context.right[1]), dict));
+    }
+    std::ostringstream cat_out;
+    cat_out << std::setprecision(12) << "profile\tgroup_rank\tgroup_size\tallele_h1\tallele_h2\tloss\tloss_minus_best\tis_caller\n";
+    for (const auto& pr : profiles) {
+        const auto cs2 = countfit::score_all(pr.second, base1, base2, mid1, mid2);
+        const auto groups = countfit::group_profiles(cs2, mid1, mid2);
+        const double best = cs2[groups[0][0]].loss;
+        for (std::size_t g = 0; g < groups.size(); ++g) for (std::size_t i : groups[g]) {
+            const auto& c = cs2[i];
+            cat_out << pr.first << '\t' << g + 1 << '\t' << groups[g].size() << '\t' << c.a << '\t' << c.b << '\t' << c.loss << '\t' << c.loss - best << '\t'
+                    << (c.a == ctx[0][tb] && c.b == ctx[1][tb] ? "true" : "false") << '\n';
+        }
+    }
+    st << "model_fingerprint\t" << loaded.fingerprint << "\ndictionary_kmers\t" << D << "\nstable_copy_kmers\t" << n_stable << "\ndepth_haploid_kmer_mean\t" << depth
+       << "\ncandidates\t" << cands.size() << "\nprofiles\t" << profiles.size() << "\nseconds_total\t"
+       << std::chrono::duration<double>(clock::now() - t0).count() << "\nphys_footprint_peak_bytes\t" << physical_footprint().peak << '\n';
+    atomic_write(out + ".candidates.tsv", ct.str());
+    atomic_write(out + ".contrasts.tsv", cx.str());
+    atomic_write(out + ".catalogue.tsv", cat_out.str());
+    atomic_write(out + ".summary.tsv", "key\tvalue\n" + st.str());
+    std::cout << "key\tvalue\n" << st.str() << ct.str();
     return 0;
 }
 
@@ -8676,6 +8928,7 @@ int main(int argc, char** argv) {
         if (command == "support-audit") return support_audit(args);
         if (command == "prior-geometry") return prior_geometry(args);
         if (command == "count-fit") return count_fit(args);
+        if (command == "count-attrib") return count_attrib(args);
         if (command == "mass-reconcile") return mass_reconcile(args);
         if (command == "spell") return spell(args);
         if (command == "edit-distances") return edit_distances(args);

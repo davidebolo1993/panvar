@@ -102,3 +102,23 @@ separate depth fit sees the dosage decisively (Δ 4,056.8).
 - The loss is uncalibrated and noise-dominated at low depth.
 
 **Not done, per the brief:** no further loss, k change or Ctyper/Locityper replacement was added.
+
+## Qualifications appended at M6-B (2026-10-19; Sol's review; the record above is not rewritten)
+
+1. **The floor is the closest available sequence, not exact content.** "Floor-attaining 2+2" means the candidate reaches
+   the block's availability floor: the closest available sequence (sv:7 distance 36 = floor, not 0). It does not mean the
+   exact truth content is in the catalogue. "Not missing block content" above should read "the closest available block
+   content is in the catalogue".
+2. **M1-C/E's mechanism is not excluded.** M1-C and M1-E showed that small residual sequence changes can substantially
+   change the allocation comparison: in M1-E, the 23-bp T1 correction alone moved 2+2 vs 1+3 by 7.6 at 10×. M6-A does
+   not exclude that mechanism.
+3. **Phase is not always tied.** Swapping the target alleles between fixed, *different* flanks changes the junction
+   counts. CYP2D6 NA19650's best count group has a single member: (22,77) and (77,22) score differently. The statement
+   "phase is never resolved: both assignments always share one profile group" is wrong in general. It held where the two
+   context flanks are identical around the target.
+4. **Swapping the two complete haplotypes is invariant** (M6-B gate G8). It is a different operation from swapping
+   target alleles inside fixed contexts.
+5. **A unique local count profile does not establish whole-locus phase.**
+
+**Unchanged:** the positive CYP2D6 NA19650 dosage result (count-best 3+2, sv:9 block excess 0), and the sequence-level
+control regression (CYP2D6 HG02769: count-best block excess 14 where the caller is exact).

@@ -150,15 +150,43 @@ inline std::vector<Candidate> score_all(const std::vector<double>& y, const Spar
     return out;
 }
 
-// Candidates grouped by identical predicted count profile (same hash). A group is ONE count-model state: every member
-// (sequence pair, allocation) stays attached, and a multi-member group never establishes a unique allocation or genotype.
-inline std::vector<std::vector<std::size_t>> group_profiles(const std::vector<Candidate>& c) {
-    std::map<std::uint64_t, std::vector<std::size_t>> by;
-    for (std::size_t i = 0; i < c.size(); ++i) by[c[i].profile].push_back(i);
+// Candidates grouped by IDENTICAL predicted count profile (M6-B: exact). The 64-bit linear hash is only a lookup key
+// (masked by `hash_mask`; a test sets 0 to force every candidate into one bucket); within a bucket, candidates are split
+// by equality of the complete predicted profile M1[a] + M2[b] (the base is shared by every candidate). A group is ONE
+// count-model state: every member (sequence pair, allocation) stays attached, and a multi-member group never establishes a
+// unique allocation or genotype. `collisions` counts buckets that held more than one distinct profile.
+inline Sparse sum_sparse(const Sparse& x, const Sparse& y) {
+    Sparse out;
+    std::size_t i = 0, j = 0;
+    while (i < x.v.size() || j < y.v.size()) {
+        if (j == y.v.size() || (i < x.v.size() && x.v[i].first < y.v[j].first)) out.v.push_back(x.v[i++]);
+        else if (i == x.v.size() || y.v[j].first < x.v[i].first) out.v.push_back(y.v[j++]);
+        else { out.v.push_back({x.v[i].first, x.v[i].second + y.v[j].second}); ++i; ++j; }
+    }
+    return out;
+}
+inline std::vector<std::vector<std::size_t>> group_profiles(const std::vector<Candidate>& c, const std::vector<Sparse>& mid1, const std::vector<Sparse>& mid2,
+                                                            std::uint64_t hash_mask = ~std::uint64_t(0), std::size_t* collisions = nullptr) {
+    std::map<std::uint64_t, std::vector<std::size_t>> bucket;
+    for (std::size_t i = 0; i < c.size(); ++i) bucket[c[i].profile & hash_mask].push_back(i);
     std::vector<std::vector<std::size_t>> groups;
-    for (auto& [h, v] : by) groups.push_back(v);
+    std::size_t multi = 0;
+    for (auto& [h, members] : bucket) {
+        std::vector<std::pair<Sparse, std::vector<std::size_t>>> distinct;
+        for (std::size_t i : members) {
+            const Sparse p = sum_sparse(mid1[c[i].a], mid2[c[i].b]);
+            auto it = std::find_if(distinct.begin(), distinct.end(), [&](const auto& d) { return d.first.v == p.v; });
+            if (it == distinct.end()) distinct.push_back({p, {i}});
+            else it->second.push_back(i);
+        }
+        multi += distinct.size() > 1 ? 1 : 0;
+        for (auto& d : distinct) groups.push_back(std::move(d.second));
+    }
+    if (collisions) *collisions = multi;
     std::sort(groups.begin(), groups.end(), [&](const auto& x, const auto& y) {
-        return c[x[0]].loss != c[y[0]].loss ? c[x[0]].loss < c[y[0]].loss : c[x[0]].profile < c[y[0]].profile;
+        if (c[x[0]].loss != c[y[0]].loss) return c[x[0]].loss < c[y[0]].loss;
+        if (c[x[0]].profile != c[y[0]].profile) return c[x[0]].profile < c[y[0]].profile;   // the M6-A tie order
+        return x[0] < y[0];
     });
     return groups;
 }

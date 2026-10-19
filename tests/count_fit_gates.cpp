@@ -122,7 +122,7 @@ void g3_pooled_allocation() {
     const auto& two = find(c, 1, 1), &tri = find(c, 2, 0), &tri2 = find(c, 0, 2);
     row("G3_allocation", "2+2 and 3+1 same profile hash", static_cast<double>(two.profile == tri.profile && tri.profile == tri2.profile), "1", two.profile == tri.profile && tri.profile == tri2.profile);
     row("G3_allocation", "|loss(3+1) - loss(2+2)|", std::fabs(tri.loss - two.loss), "<= 1e-9 (identical count scores)", std::fabs(tri.loss - two.loss) <= 1e-9);
-    const auto groups = group_profiles(c);
+    const auto groups = group_profiles(c, f.m1, f.m2);
     bool together = false;
     for (const auto& g : groups) {
         std::set<std::pair<std::size_t, std::size_t>> m;
@@ -198,6 +198,75 @@ void g6_oracle_and_order() {
     for (const auto& x : cp) od = std::max(od, std::fabs(x.loss - find(c, perm[x.a], perm[x.b]).loss));
     row("G6_order", "candidate-order invariance (max abs diff)", od, "0", od == 0.0);
 }
+// M6-B: exact grouping under FORCED hash collisions, and complete-haplotype swap invariance.
+void g7_exact_grouping() {
+    const std::string U = rnd(50);
+    std::string V = U;
+    V[20] = V[20] == 'A' ? 'G' : 'A';
+    Fixture f;
+    f.ctx.left[0] = f.ctx.left[1] = rnd(250);
+    f.ctx.right[0] = f.ctx.right[1] = rnd(250);
+    f.alleles = {rep(U, 1), rep(U, 2), rep(U, 3), U + V, V + U};
+    f.build();
+    const auto y = exact_y(f.d, f.hap(0, 1), f.hap(1, 1));
+    const auto c = score_all(y, f.b1, f.b2, f.m1, f.m2);
+    std::size_t col_default = 0, col_forced = 0;
+    const auto normal = group_profiles(c, f.m1, f.m2, ~std::uint64_t(0), &col_default);
+    const auto forced = group_profiles(c, f.m1, f.m2, 0, &col_forced);   // every candidate shares one hash bucket
+    // ground truth: distinct complete profiles by direct comparison
+    std::vector<Sparse> profiles;
+    for (const auto& x : c) {
+        const Sparse p = sum_sparse(f.m1[x.a], f.m2[x.b]);
+        if (std::none_of(profiles.begin(), profiles.end(), [&](const Sparse& q) { return q.v == p.v; })) profiles.push_back(p);
+    }
+    const auto as_sets = [&](const std::vector<std::vector<std::size_t>>& g) {
+        std::set<std::set<std::size_t>> s;
+        for (const auto& v : g) s.insert(std::set<std::size_t>(v.begin(), v.end()));
+        return s;
+    };
+    row("G7_exact_grouping", "forced collisions: groups == distinct complete profiles", static_cast<double>(forced.size()), std::to_string(profiles.size()),
+        forced.size() == profiles.size());
+    row("G7_exact_grouping", "forced collisions: same partition as the default hash", static_cast<double>(as_sets(forced) == as_sets(normal)), "1", as_sets(forced) == as_sets(normal));
+    row("G7_exact_grouping", "forced bucket reports the collision; default reports none", static_cast<double>(col_forced * 10 + col_default), "10", col_forced == 1 && col_default == 0);
+    bool equal_grouped = false;
+    for (const auto& g : forced) {
+        std::set<std::pair<std::size_t, std::size_t>> m;
+        for (std::size_t i : g) m.insert({c[i].a, c[i].b});
+        equal_grouped = equal_grouped || (m.count({1, 1}) && m.count({2, 0}) && m.count({0, 2}));
+    }
+    row("G7_exact_grouping", "equal profiles (2+2, 3+1, 1+3) still grouped under forced collisions", static_cast<double>(equal_grouped), "1", equal_grouped);
+}
+void g8_haplotype_swap() {
+    Fixture f, g;
+    f.ctx.left[0] = rnd(300);
+    f.ctx.left[1] = rnd(300);
+    f.ctx.right[0] = rnd(300);
+    f.ctx.right[1] = rnd(300);
+    f.alleles = {rnd(60), rnd(80), ""};
+    g.ctx.left[0] = f.ctx.left[1];
+    g.ctx.left[1] = f.ctx.left[0];
+    g.ctx.right[0] = f.ctx.right[1];
+    g.ctx.right[1] = f.ctx.right[0];
+    g.alleles = f.alleles;
+    f.build();
+    g.build();
+    const auto y = exact_y(f.d, f.hap(0, 0), f.hap(1, 1));
+    const auto cf = score_all(y, f.b1, f.b2, f.m1, f.m2);
+    std::vector<double> yg(g.d.kmer.size(), 0.0);
+    for (std::size_t i = 0; i < f.d.kmer.size(); ++i) yg[static_cast<std::size_t>(g.d.find(f.d.kmer[i]))] = y[i];
+    const auto cg = score_all(yg, g.b1, g.b2, g.m1, g.m2);
+    double worst = 0.0;
+    bool profiles = true;
+    for (const auto& x : cf) {
+        const auto& z = find(cg, x.b, x.a);   // the complete haplotypes swapped: (ctx1+a, ctx2+b) == (ctx2+b, ctx1+a)
+        worst = std::max(worst, std::fabs(x.loss - z.loss));
+        profiles = profiles && x.profile == z.profile;
+    }
+    row("G8_haplotype_swap", "swapping the two complete haplotypes leaves loss and profile unchanged", worst, "0", worst == 0.0 && profiles);
+    // target-allele swap with fixed, different flanks is NOT invariant in general (junctions differ)
+    row("G8_haplotype_swap", "target swap (a,b) vs (b,a) under different flanks changes the profile", static_cast<double>(find(cf, 0, 1).profile != find(cf, 1, 0).profile),
+        "1 (junction counts differ)", find(cf, 0, 1).profile != find(cf, 1, 0).profile);
+}
 }  // namespace
 
 int main() {
@@ -207,6 +276,8 @@ int main() {
     g4_junction();
     g5_alias();
     g6_oracle_and_order();
+    g7_exact_grouping();
+    g8_haplotype_swap();
     std::cout << "test\titem\tvalue\texpectation\tresult\n" << g_rows.str() << "count_fit_gates\t" << (g_failed ? "FAIL" : "PASS") << '\n';
     return g_failed ? 1 : 0;
 }

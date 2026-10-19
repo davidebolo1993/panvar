@@ -1,0 +1,20 @@
+# M6-B frozen C4 NA19650 LOO 10x comparison, fixed context = M1-B call.c4_10 rank-1 representative.
+# oracle=1: TRUTH-DERIVED OR TRUTH-GUIDED DIAGNOSTIC ONLY -- never a prediction-catalogue member.
+reported	alleles	41	47	0
+floor2x2	alleles	37	46	0
+truth_a	block	truth1	truth2	1
+truth_b	block	truth2	truth1	1
+m1e_reported	full	reported.1:89544:187730	reported.2:89547:122261	1
+m1e_a22_none	full	a22_none.1:89544:154996	a22_none.2:89547:154996	1
+m1e_e13_none	full	e13_none.1:89544:122258	e13_none.2:89547:187734	1
+m1e_a22_U1	full	a22_U1.1:89544:154996	a22_U1.2:89547:154996	1
+m1e_e13_U1	full	e13_U1.1:89544:122258	e13_U1.2:89547:187734	1
+m1e_a22_T1	full	a22_T1.1:89544:154996	a22_T1.2:89547:154996	1
+m1e_e13_T1	full	e13_T1.1:89544:122258	e13_T1.2:89547:187734	1
+m1e_a22_U2	full	a22_U2.1:89544:154996	a22_U2.2:89547:154996	1
+m1e_e13_U2	full	e13_U2.1:89544:122258	e13_U2.2:89547:187734	1
+m1e_a22_T2	full	a22_T2.1:89544:154996	a22_T2.2:89547:154996	1
+m1e_e13_T2	full	e13_T2.1:89544:122258	e13_T2.2:89547:187734	1
+m1e_a22_all	full	a22_all.1:89544:154996	a22_all.2:89547:154996	1
+m1e_e13_all	full	e13_all.1:89544:122258	e13_all.2:89547:187734	1
+m1e_truthblock	full	truthblock.1:89544:154996	truthblock.2:89547:154996	1
