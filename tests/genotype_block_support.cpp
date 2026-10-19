@@ -68,12 +68,13 @@ int main() {
         // (4) a rival disagreeing at one block affects only that block (group 1 only at block 0, group 2 only at block 1)
         require(r.blocks[2].disagreeing == 0 && r.blocks[3].disagreeing == 0, "gate 4: no disagreement leaks to other blocks");
         // (6) numerical tie inside the bounds -> DATA_TIED; the same distance outside the bounds -> certified
-        // (fixture without the same-genotype phase alternative, which would support block 4 through its higher L)
+        // (isolated fixture)
         {
-            std::vector<SupportGroup> g6{gs[0], gs[1], gs[2], gs[4]};
+            std::vector<SupportGroup> g6{gs[0], gs[4]};   // only the call and the tied competitor: any other group carrying the
+                                                          // call's genotype at block 4 with higher L would support it (frozen rule)
             const auto x = panvar::block_data_support_v1(g6, 0, 5);
             require(x.blocks[4].label == "DATA_TIED" && !x.blocks[4].certified, "gate 6: a tie within bounds is DATA_TIED");
-            g6[3].exposure = -10.0 - 1e-6;   // 1e-6 below: outside 2e-9 of bounds
+            g6[1].exposure = -10.0 - 1e-6;   // 1e-6 below: outside 2e-9 of bounds
             require(panvar::block_data_support_v1(g6, 0, 5).blocks[4].label == "DATA_SUPPORTED", "gate 6: beyond the bounds it is certified");
         }
         // gate 3, the other direction: a same-genotype group with HIGHER L supports the genotype even when the call has lower L
