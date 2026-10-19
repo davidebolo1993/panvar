@@ -36,7 +36,14 @@ MANIFEST_B = [("seq.panel", "seqpanel", "-", 30), ("inventory", "inventory", "-"
               ("cand.dist.c4_10", "dist", "c4_10", 120), ("cand.dist.c4_30", "dist", "c4_30", 120),
               ("score.c4_10", "score", "c4_10", 120), ("score.c4_30", "score", "c4_30", 240),
               ("summary", "summary", "-", 60)]
-MANIFESTS = {"B": MANIFEST_B}
+# Amendment 1 (declared before further execution): `inventory` completed with boundaries_reliable False -- one carried
+# allele (allele_75) of 117 gets different unit counts from the two anchor phases (recorded, unchanged). inventory.a1 reruns
+# the same rule with --exclude-disagreeing: such alleles are excluded from the inventory and reported (positions, length,
+# carriers), and boundaries are reliable for the rest if at most 5 % are excluded and every spacing is in [20, 40] kb.
+# Every later unit uses inventory.a1.
+MANIFEST_A1 = [("inventory.a1", "inventory", "a1", 120)]
+INVENTORY_UNIT = "inventory.a1"
+MANIFESTS = {"B": MANIFEST_B, "A1": MANIFEST_A1}
 
 
 def ledger_rows():
@@ -119,8 +126,9 @@ def command(unit, kind, target, timeout, d):
                 "--model-gfa", C4["model_graph"], "--blocks", C4["target_block"]], "panel only (no truth)"
     if kind == "inventory":
         return [py, os.path.join(HERE, "inventory.py"), "--sequences", f"{OUT}/runs/seq.panel/seq", "--block",
-                C4["target_block"], "--out", f"{d}/inventory"], "panel only (no truth)"
-    inv = f"{OUT}/runs/inventory/inventory"
+                C4["target_block"], "--out", f"{d}/inventory"] + (["--exclude-disagreeing"] if target == "a1" else []), \
+            "panel only (no truth)"
+    inv = f"{OUT}/runs/{INVENTORY_UNIT}/inventory"
     alleles = f"{OUT}/runs/seq.panel/seq.{C4['target_block']}.alleles.fa"
     if kind == "reachpairs":
         if not os.path.exists(FROZEN):

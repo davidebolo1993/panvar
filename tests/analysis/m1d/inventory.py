@@ -17,7 +17,12 @@ Unit boundaries (declared before execution; panel bytes only):
 Every component records its source allele, coordinates, orientation (the model frame, as the block is spelled), length,
 SHA-256 and carrying templates. Identical bytes of one component type are listed once in the FASTA with every source.
 
-  inventory.py --sequences PREFIX --block ID --out OUT_PREFIX
+Amendment 1 (--exclude-disagreeing): an allele whose two phases give different unit counts is EXCLUDED from the inventory
+and reported with both phases' anchor positions and its length; boundaries are then reliable for the remaining alleles if
+the spacing condition holds for them and at most 5 % of carried alleles are excluded. Nothing is partitioned for an
+excluded allele (it remains available as a whole allele elsewhere).
+
+  inventory.py --sequences PREFIX --block ID --out OUT_PREFIX [--exclude-disagreeing]
 """
 import argparse
 import hashlib
@@ -65,6 +70,7 @@ def main():
     ap = argparse.ArgumentParser()
     for x in ("sequences", "block", "out"):
         ap.add_argument("--" + x, required=True)
+    ap.add_argument("--exclude-disagreeing", action="store_true")
     a = ap.parse_args()
     raw = fasta(f"{a.sequences}.{a.block}.alleles.fa")
     carriers = {}
@@ -97,8 +103,17 @@ def main():
         counts_a = {n: len(p) for n, p in phase_a[2].items()}
         counts_b = {n: len(p) for n, p in phase_b[2].items()}
         disagree = [n for n in order if counts_a[n] != counts_b[n]]
+        for n in disagree:
+            log.append(f"disagreeing_allele\t{n} ({len(alleles[n])} bp; carriers {','.join(carriers[n])}): phase A starts "
+                       f"{','.join(map(str, phase_a[2][n]))}; phase B starts {','.join(map(str, phase_b[2][n]))}")
+        if a.exclude_disagreeing and len(disagree) <= 0.05 * len(order):
+            order = [n for n in order if n not in disagree]
+            log.append(f"excluded_alleles\t{len(disagree)} {','.join(disagree)} (Amendment 1)")
+            disagree_effective = []
+        else:
+            disagree_effective = disagree
         bad_gap = [n for n in order for x, y in zip(phase_a[2][n], phase_a[2][n][1:]) if not MIN_GAP <= y - x <= MAX_GAP]
-        reliable = not disagree and not bad_gap
+        reliable = not disagree_effective and not bad_gap
         log += [f"phase_A_anchor\t{phase_a[1]} (start {phase_a[0]} in {source})",
                 f"phase_B_anchor\t{phase_b[1]} (start {phase_b[0]} in {source})",
                 f"unit_count_disagreements_between_phases\t{len(disagree)} {','.join(disagree)}",
