@@ -44,7 +44,16 @@ MANIFEST_B = [("check.inputs", "inputs", "-", 60),
               ("structure.c4_10", "structure", "c4_10", 30), ("structure.c4_30", "structure", "c4_30", 30),
               ("structure.cyp_5", "structure", "cyp_5", 30), ("structure.cyp_30", "structure", "cyp_30", 30),
               ("outcome", "outcome", "-", 30)]
-MANIFESTS = {"B": MANIFEST_B}
+# Amendment 1 (declared before further execution; every manifest-B error PERSISTS): alternatives for the persistent cases
+# by the frozen rule in alternatives.py (<= 12 each), then the unchanged reference scorer (score-set) on the fresh run with
+# truth loaded only after the truth-free table, and --decompose reported vs the best saved true-class candidate (else
+# sub_truth_a) at the target block. cyp_30 (correct unit pair) is a contrast: the 5x report scored on 30x reads.
+TWIN = {"cyp_5": ("cyp_30", "30x"), "cyp_30": ("cyp_5", "5x")}
+MANIFEST_A1 = [("alts.c4_10", "alts", "c4_10", 20), ("score.c4_10", "score", "c4_10", 90),
+               ("alts.c4_30", "alts", "c4_30", 20), ("score.c4_30", "score", "c4_30", 180),
+               ("alts.cyp_5", "alts", "cyp_5", 20), ("score.cyp_5", "score", "cyp_5", 60),
+               ("alts.cyp_30", "alts", "cyp_30", 20), ("score.cyp_30", "score", "cyp_30", 120)]
+MANIFESTS = {"B": MANIFEST_B, "A1": MANIFEST_A1}
 
 
 def ledger_rows():
@@ -149,6 +158,24 @@ def command(unit, kind, target, timeout, d):
         return [sys.executable, os.path.join(HERE, "structure.py"), "--case", target, "--block", c["target_block"],
                 "--sequences", f"{OUT}/runs/seq.{locus}/seq", "--hist-eval", c["historical_eval"] + ".blocks.tsv",
                 "--fresh-eval", fresh, "--out", f"{d}/{target}"], "diagnostic evaluator (truth)"
+    if kind == "alts":
+        cmd = [sys.executable, os.path.join(HERE, "alternatives.py"), "--run", f"{OUT}/runs/call.{target}/call", "--units",
+               f"{OUT}/runs/structure.{target}/{target}.units.tsv", "--eval-blocks", f"{OUT}/runs/eval.{target}/eval.blocks.tsv",
+               "--block", c["target_block"], "--out", f"{d}/{target}"]
+        if target in TWIN:
+            cmd += ["--twin", f"{OUT}/runs/call.{TWIN[target][0]}/call", "--twin-label", TWIN[target][1]]
+        return cmd, "diagnostic evaluator (truth-selected alternatives)"
+    if kind == "score":
+        alts = f"{OUT}/runs/alts.{target}/{target}"
+        if not os.path.exists(alts + ".candidates.tsv"):
+            return None, "NOT RUN (condition): no declared alternatives"
+        pair = open(alts + ".decompose.txt").read().strip()
+        reads = os.path.dirname(c["reads1"])
+        return ["nice", f"{BUILD}/genotype_probe", "score-set", "--out", f"{d}/score", "--reference", c["reference"],
+                "--donor", c["sample"], "--run", f"{OUT}/runs/call.{target}/call", "--model-gfa", c["model_graph"],
+                *curation_args(c), "--candidates", alts + ".candidates.tsv", "--library", c["library"],
+                "--reads1", c["reads1"], "--reads2", c["reads2"], "--threads", "4", "--truth-gfa", c["truth_graph"],
+                "--decompose", pair, "--decompose-block", c["target_block"]], f"isolated reference scorer ({reads})"
     raise ValueError(kind)
 
 
