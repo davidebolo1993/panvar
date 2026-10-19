@@ -1,0 +1,12 @@
+coverage	alternative	what_differs_from_reported	pooled_content_vs_reported_k31	pooled_content_vs_reported_k151	d_fragment	d_exposure	d_likelihood	prior_support	fragments_carrying_the_difference
+10x	realloc_B_p1 = p2 (bit-equal)	allocation only: one reported unit moved to the 1-unit homologue, mid-unit cut	0	0	-5.507	0.000	-5.507	none (off-panel)	9 fragments (8 favour reported), all block interior
+10x	realloc_A_p1 = p2 (bit-equal)	allocation + new junction content (cut near the unit start)	0	222	-13.854	0.000	-13.854	none	20 fragments; 11.08 at block junctions
+10x	truthblock_in_reported_a = b (bit-equal)	sv:7 bytes replaced by truth's 2+2 (either homologue assignment)	494.5	2414.5	+280.499	-0.025	+280.474	none	block interior only
+10x	reportedblock_in_truth_a = b (bit-equal) vs truth	the same sv:7 swap in truth flanks	-	-	-280.499 (vs truth)	-0.025	-280.474 (vs truth)	none	block interior only: additive across flank contexts
+10x	truth	everything (whole-locus truth pair)	989.5	5487.5	+688.582	+2.875	+691.457	none	block interior +280.50; outside the block +408.08
+10x	saved_2+2	panel 2+2 comparator (M1-B)	1558.5	6916.5	-252.416	-0.075	-252.491	defined (total -153,581.709)	block interior 244.80
+30x	realloc_B_p1 = p2 (bit-equal)	allocation only, mid-unit cut	0	0	-1.957	0.000	-1.957	none	24 fragments (21 / 3); top 10 by magnitude net -6.32 (favour the reallocation)
+30x	realloc_A_p1 = p2 (bit-equal)	allocation + new junction content	0	222	-42.255	0.000	-42.255	none	64 fragments; 31.17 at block junctions
+30x	truthblock_in_reported_a = b (bit-equal)	sv:7 bytes replaced by truth's	494.5	2414.5	+837.712	-0.075	+837.637	none	block interior only
+30x	truth	everything	981	5429	+2810.458	+3.600	+2814.058	none	block interior +837.71; outside the block +1972.75
+30x	saved_2+2	panel 2+2 comparator	1055	4329	-736.001	0.000	-736.001	defined (total -420,817.053)	block interior 735.31
