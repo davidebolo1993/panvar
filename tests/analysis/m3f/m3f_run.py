@@ -59,7 +59,9 @@ MANIFEST_E = ([(f"run.{c}.{arm}", "run", f"{c}:{arm}", TIMEOUT[c][i]) for c in E
 MANIFEST_D = ([(f"lik.{c}", "lik", c, 120) for c in ("ds1_2", "ts1_2")] +
               [(f"tbeval.{c}", "tbeval", c, 40) for c in ("ds1_2", "ts1_2")] +
               [("structure.loo_na19650_10", "structure", "loo_na19650_10", 30), ("attribution", "attr", "-", 30)])
-MANIFESTS = {"C": MANIFEST_C, "E": MANIFEST_E, "D": MANIFEST_D}
+# Amendment 1: accuracy re-run with the partial-table fix (the failed 'accuracy' unit stays recorded)
+MANIFEST_A1 = [("accuracy.a1", "acc", "all", 30)]
+MANIFESTS = {"C": MANIFEST_C, "E": MANIFEST_E, "A1": MANIFEST_A1, "D": MANIFEST_D}
 CARRIED = 0.0
 INPUTS = [r for r in csv.DictReader(open(os.path.join(HERE, "INPUTS.tsv")), delimiter="\t")]
 
@@ -206,8 +208,12 @@ def command(unit, kind, target, timeout, d):
                 "--labels", "incumbent"], "diagnostic (truth): is the truth in the catalogue, and where"
     if kind == "structure":
         offe, one = (f"{OUT}/runs/eval.{target}.{arm}/eval.blocks.tsv" for arm in ("off", "on"))
-        if not (os.path.exists(offe) and os.path.exists(one)):
-            return None, "NOT RUN (condition): an arm was not evaluated"
+        # Amendment 1: an arm whose evaluation failed (no summary) is replaced by the off table in the 'fresh' column, which
+        # is then ignored; the attribution reads only the 'historical' (off) column in that case
+        if not os.path.exists(f"{OUT}/runs/eval.{target}.on/eval.summary.tsv"):
+            one = offe
+        if not os.path.exists(offe):
+            return None, "NOT RUN (condition): the off arm was not evaluated"
         verify("m1b_seq")
         # structure.py labels its two tables 'historical' and 'fresh': here historical = OFF arm, fresh = ON arm
         return [sys.executable, os.path.join(WT, "tests", "analysis", "m1b", "structure.py"), "--case", target, "--block", "sv:7",

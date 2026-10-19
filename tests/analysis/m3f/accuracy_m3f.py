@@ -66,7 +66,8 @@ for cell in cells:
             rows.append((cell, arm, k, ev.get(k, "-")))
         rows.append((cell, arm, "caller_status", st.get("status", "-")))
         calls = {r["block_id"]: r for r in table(f"{runs}/run.{cell}.{arm}/call.block_genotypes.tsv")}
-        for b in table(f"{runs}/eval.{cell}.{arm}/eval.blocks.tsv"):
+        # Amendment 1: a failed evaluation (no summary) can leave a partial block table; it contributes no blocks
+        for b in (table(f"{runs}/eval.{cell}.{arm}/eval.blocks.tsv") if ev else []):
             c = calls.get(b["block_id"], {})
             exact = "exact" if b.get("excess") == "0" else "wrong"
             support[(cell, arm, c.get("genotype_support_v2x", "-"), c.get("quality_filter_v2x", "-"), b.get("kind", "-"), exact)] += 1

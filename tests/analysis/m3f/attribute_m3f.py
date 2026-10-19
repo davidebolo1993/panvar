@@ -48,12 +48,27 @@ for cell in cells:
            "pool_floor_attained_on": ev_on.get("floor_attained_in_candidates", "-"),
            "pool_closest_total_gap_on": ev_on.get("closest_candidate_total_score_gap_to_winner", "-")}
     detail = []
-    if x_on in (None, "NA", "-"):
-        cls = "NOT_ATTRIBUTED (no evaluable on call)"
+    x_off = ev_off.get("excess_over_floor_total")
+    if x_off in (None, "NA", "-", "0") and x_on in (None, "NA", "-", "0"):
+        cls = "NOT_ATTRIBUTED (no error in either arm)"
     elif x_on == "0":
         cls = "NOT_ATTRIBUTED (on arm excess 0)"
+    elif x_on in (None, "NA", "-"):
+        # Amendment 1: the on arm wrote no evaluable call; a refusal inside the joint pass is the pass not completing
+        if st_on.get("status") == "RESOURCE_REFUSAL" and st_on.get("phase") == "joint search":
+            cls = "PASS_SKIPPED_OR_INCOMPLETE"
+            detail.append(f"on arm RESOURCE_REFUSAL ({st_on.get('no_call_reason')}) in phase 'joint search'; the off error stands with no on call")
+        else:
+            cls = "NOT_ATTRIBUTED (no evaluable on call: " + st_on.get("status", "-") + ")"
+        rec["joint_search_status"] = rec["joint_search_status"] if rec["joint_search_status"] != "-" else "refused_in_pass"
+        detail.append(f"off arm: floor attained by a scored candidate {ev_off.get('floor_attained_in_candidates')}, closest total gap "
+                      f"{ev_off.get('closest_candidate_total_score_gap_to_winner')}, availability floor {ev_off.get('availability_floor_total')}")
+        s = kv(f"{runs}/structure.{cell}/{cell}.structure.tsv")
+        if s:
+            detail.append(f"sv:7 truth units {s.get('truth_total_units')}; off {s.get('historical_called_units')} {s.get('historical_structure_verdict')}")
     elif not rec["joint_search_status"].startswith("complete"):
         cls = "PASS_SKIPPED_OR_INCOMPLETE"
+        detail.append(f"joint pass {rec['joint_search_status']}")
     elif cell.startswith("loo"):
         if ev_on.get("floor_attained_in_candidates") == "true":
             cls = "EVALUATED_ALTERNATIVE_LOSES"
