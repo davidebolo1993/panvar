@@ -99,7 +99,8 @@ def run_unit(unit):
     rev, dirty = state()
     assert dirty == 0, "the tree must be committed and clean"
     used = spent()
-    if used + timeout > BUDGET:
+    reserve = 30 if kind == "run" else 0   # Amendment 2: the summary's 30 s stay reserved while fixture runs are admitted
+    if used + timeout + reserve > BUDGET:
         record(unit, rev, dirty, timeout, 0.0, 0.0, "not_run", 0, f"NOT RUN: {used:.1f} s + {timeout} s > {BUDGET} s")
         print(f"{unit}: NOT RUN")
         return 3

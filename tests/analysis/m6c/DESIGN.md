@@ -79,3 +79,10 @@ could exhaust the 600-s budget before the last fixtures (F6, F7) ran.
 **Change: order only.** The remaining runs follow manifest A1: every fixture at seed 11, then seed 23, then seed 37. The
 units, seeds, timeouts, model, fixtures and classification are unchanged, and the completed unit stays recorded. Any
 unit the budget refuses is recorded as NOT RUN.
+
+## Amendment 2 (declared after seed 23 completed, before any seed-37 unit; 429.1 s spent)
+
+**Why.** The plain budget rule would admit seed-37 fixture runs that leave less than the summary's declared 30 s.
+
+**Change.** A fixture run is admitted only if spent + its timeout + 30 s ≤ 600. Refused runs are recorded NOT RUN. The
+summary rule is unchanged, and so is everything else.
