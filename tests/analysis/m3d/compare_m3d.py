@@ -21,6 +21,11 @@ import sys
 runs, ledger_path, prefix, cells = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4:]
 VOLATILE = re.compile(r"^(seconds_|threads_|resources_|time_|wall_|peak_|binary|panvar_|build_|command|hostname|pid|date|started|"
                       r"finished|write_|running_|.*footprint|.*rss|.*_seconds|.*memory|.*_bytes_end|allocator|checkpoint)", re.I)
+# Amendment 1 (only when M3D_CACHE_COUNTERS_VOLATILE=1): the emission/prefilter cache work counters, shown to vary between two
+# runs of the SAME baseline binary on the same inputs (scheduling-dependent cache races at 4 threads)
+CACHE = re.compile(r"^(emission_cache_dp_hits|emission_cache_dp_misses|emission_cache_executed_prefilters|emission_cache_executed_dps|"
+                   r"scorer_emission_cache_arena_bytes|union_cached_prefilters_consumed|union_prefilter_cache_misses)$")
+CACHE_VOLATILE = os.environ.get("M3D_CACHE_COUNTERS_VOLATILE") == "1"
 RESOURCE_FILES = (".repair_memory.tsv", ".time", ".log")
 ledger = {r["unit"]: r for r in csv.DictReader(open(ledger_path), delimiter="\t")}
 
@@ -39,7 +44,7 @@ def normalised(path, run_prefix, suffix):
     keep = []
     for l in lines:
         key = l.split("\t", 1)[0]
-        if VOLATILE.match(key):
+        if VOLATILE.match(key) or (CACHE_VOLATILE and CACHE.match(key)):
             continue
         keep.append(l)
     return "\n".join(keep)

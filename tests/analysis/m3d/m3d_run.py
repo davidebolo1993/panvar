@@ -45,7 +45,11 @@ MANIFEST_G = [("gate.library", "gate_lib", "-", 60), ("gate.e2e", "gate_e2e", "-
 MANIFEST_R = ([(f"run.{c}.{arm}", "run", f"{c}:{arm}", TIMEOUT[c] + (30 if arm == "on" else 0)) for c in ORDER for arm in ("baseline", "off", "on")] +
               [(f"eligible.{k}", "eligible", k, 60) for k in ELIGIBLE] + [("compare", "cmp", "-", 30)] +
               [(f"eval.{c}.{arm}", "eval", f"{c}:{arm}", 60) for c in ORDER for arm in ("off", "on")])
-MANIFESTS = {"G": MANIFEST_G, "R": MANIFEST_R}
+# Amendment 1: a repeat of the baseline binary on mosaic_2x shows whether the cache work counters vary run to run; compare.a1
+# then treats exactly those seven keys as volatile (compare stays recorded with exit 1)
+MANIFEST_A1 = [("run.mosaic_2x.baseline_repeat", "run", "mosaic_2x:baseline_repeat", 120), ("repeat.check", "repeat", "-", 30),
+               ("compare.a1", "cmp", "-", 30)] + [(f"eval.a1.{c}.{arm}", "eval", f"{c}:{arm}", 60) for c in ORDER for arm in ("off", "on")]
+MANIFESTS = {"G": MANIFEST_G, "R": MANIFEST_R, "A1": MANIFEST_A1}
 CARRIED = 0.0
 INPUTS = {r["cell"] + ":" + r["file"]: r["sha256"] for r in csv.DictReader(open(os.path.join(HERE, "INPUTS.tsv")), delimiter="\t")}
 
@@ -140,26 +144,33 @@ def command(unit, kind, target, timeout, d):
         cell, arm = target.split(":")
         verify(cell)
         c = CELL[cell]
-        binary = BASELINE_BIN if arm == "baseline" else f"{BUILD}/panvar"
+        binary = BASELINE_BIN if arm.startswith("baseline") else f"{BUILD}/panvar"
         profile = JOINT_PROFILE if arm == "on" else V6
         cmd = ["nice", binary, "genotype", "--profile", profile, "--threads", "4", "--gfa", c["gfa"], "--reference-path", REF,
                "--reads1", f"{c['reads']}/reads_1.fq", "--reads2", f"{c['reads']}/reads_2.fq", "--library", f"{c['reads']}/library.txt",
                "--out-prefix", f"{d}/call"]
         if c["curation"] != "none":
             cmd += ["--panel-curation", c["curation"]]
-        return cmd, f"caller ({arm}; {'baseline binary' if arm == 'baseline' else 'M3-D binary'})"
+        return cmd, f"caller ({arm}; {'baseline binary' if arm.startswith('baseline') else 'M3-D binary'})"
     if kind == "eligible":
         gfa, ref, cur = ELIGIBLE[target]
         cmd = [f"{BUILD}/genotype_probe", "joint-bounds", "--out", f"{d}/bounds", "--model-gfa", gfa, "--reference", ref]
         if cur != "none":
             cmd += ["--panel-curation", cur]
         return cmd, "model-only joint-search eligibility"
+    if kind == "repeat":
+        a, b = f"{OUT}/runs/run.mosaic_2x.baseline/call", f"{OUT}/runs/run.mosaic_2x.baseline_repeat/call"
+        return ["/bin/bash", "-c", f"diff <(sed 's#{a}#P#g' {a}.mosaic_status.tsv) <(sed 's#{b}#P#g' {b}.mosaic_status.tsv) | grep '^[<>]' | "
+                f"grep -vE 'seconds_|threads_|resources_|footprint|rss|_bytes_end|memory|allocator' > {d}/baseline_vs_repeat.txt; cat {d}/baseline_vs_repeat.txt"], \
+            "baseline vs baseline repeat: non-volatile status differences"
     if kind == "cmp":
+        if unit == "compare.a1":
+            os.environ["M3D_CACHE_COUNTERS_VOLATILE"] = "1"
         return [sys.executable, os.path.join(HERE, "compare_m3d.py"), f"{OUT}/runs", f"{OUT}/ledger.tsv", f"{d}/m3d", *ORDER], \
             "truth-free matched comparison + selection freeze"
     if kind == "eval":
         cell, arm = target.split(":")
-        assert os.path.exists(f"{OUT}/runs/compare/m3d.selection.sha256"), "evaluation needs the frozen selection"
+        assert os.path.exists(f"{OUT}/runs/compare.a1/m3d.selection.sha256"), "evaluation needs the frozen selection (compare.a1)"
         c = CELL[cell]
         scheme = "lzo" if cell == "lzo_5x" else "mosaic"
         truth_gfa = c["gfa"]
