@@ -276,6 +276,10 @@ if(PANVAR_BUILD_TESTING)
         target_link_libraries(genotype_mosaic_core_test PRIVATE panvarlib)
         target_compile_options(genotype_mosaic_core_test PRIVATE -Wall -Wextra -Wpedantic)
         add_test(NAME panvar_genotype_mosaic_core COMMAND genotype_mosaic_core_test)
+        # M3-A diagnostic (not a ctest): copying-prior representation tests reusing the mosaic-core oracles
+        add_executable(m3a_prior_representation tests/m3a_prior_representation.cpp)
+        target_link_libraries(m3a_prior_representation PRIVATE panvarlib)
+        target_compile_options(m3a_prior_representation PRIVATE -Wall -Wextra -Wpedantic)
 
         # bubbles.cpp draws its progress bar from cli_utils, which otherwise only the panvar
         # executable compiles; this test is the first to link the bubble caller on its own.

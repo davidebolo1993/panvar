@@ -5898,6 +5898,330 @@ int score_set(const Args& args) {
 // counts are taken from: each allele of each named block with the panel templates that carry it, and,
 // when --truth-gfa is given, the donor's two truth haplotypes projected onto the same blocks. Nothing is
 // scored and no caller reads this output; truth enters only this diagnostic evaluator.
+// ------------------------------------------------------------------------------------------------
+// prior-pool (M3-A): the copying prior re-evaluated on a FIXED, already-scored candidate pool
+// ------------------------------------------------------------------------------------------------
+// The pool is every sequence candidate a saved caller run scored (<run>.mosaic_scores.tsv, with the allele paths of
+// <run>.mosaic_candidates.tsv). Fragment and exposure terms are read from the run and never recomputed; only the
+// sequence-pair prior changes. Before anything is reported the current prior (constant r = 0.01, the run's setting) is
+// recomputed for every candidate and must reproduce the saved sequence_pair_prior, or the command refuses.
+//
+// Prior models (declared in tests/analysis/m3a/DESIGN.md before execution):
+//   const_<r>     every boundary r, r in {0.001, 0.003, 0.01 (current), 0.03, 0.1}
+//   zero          r = 0 (diagnostic: only sequences one template spells whole keep a finite prior)
+//   dist_matched  r_b = 1 - exp(-d_b / L): d_b = panel-mean span (bp) from the start of block b-1 to the start of block b
+//                 = mean over templates of len(allele at b-1) + len(invariant segment b); d_b = 0 gives r_b = 0;
+//                 L = sum_b d_b / ((B-1) * -ln(1 - 0.01)), so the total hazard equals the current model's
+//                 (redistribution of switch opportunities, not a change of strength). Composes exactly under neutral
+//                 subdivision: 1 - (1-r1)(1-r2) = 1 - exp(-(d1+d2)/L).
+// This is a sensitivity analysis on a fixed pool: it says nothing about what a fresh search would find, and it is not a
+// calibration. Truth is never loaded; --counterfactual rows (evaluator-only, e.g. a truth diplotype scored elsewhere)
+// go to a SEPARATE table and never enter the pool statistics.
+int prior_pool(const Args& args) {
+    const std::string out = args.required("out");
+    const std::string cell = args.required("cell");
+    const std::string run = args.required("run");
+    const std::string reference = args.required("reference");
+    struct Staged {
+        std::string prefix;
+        ~Staged() {
+            std::error_code ignored;
+            std::filesystem::remove(prefix + ".model.sorted.gfa", ignored);
+        }
+    } staged{out};
+    const std::string curation = args.get("panel-curation", "");
+    const LoadedModel loaded = load_model(args.required("model-gfa"), reference, out + ".model.sorted.gfa", 50,
+                                          curation.empty() ? std::vector<std::string>{} : read_panel_curation(curation));
+    const panvar::PreparedGenotypeModel& model = *loaded.model;
+    if (read_key_values(run + ".mosaic_status.tsv").at("model_fingerprint") != loaded.fingerprint) {
+        throw std::runtime_error("the run was not scored on the rebuilt model");
+    }
+    const panvar::PanelAlleleMatrix& panel = model.panel();
+    const std::size_t blocks = model.blocks().size(), templates = panel.template_count();
+    const double ninf = -std::numeric_limits<double>::infinity();
+
+    // ---- the pool
+    std::map<std::size_t, std::pair<std::vector<std::size_t>, std::vector<std::size_t>>> paths;   // beam candidate -> paths
+    std::map<std::size_t, std::string> source_of;
+    for (const auto& row : read_table(run + ".mosaic_candidates.tsv")) {
+        const std::size_t id = std::stoull(row.at("candidate_id"));
+        paths[id] = {parse_alleles(row.at("hap1_alleles")), parse_alleles(row.at("hap2_alleles"))};
+        source_of[id] = row.at("source");
+    }
+    struct Item {
+        std::size_t seq_id = 0, rep = 0;
+        double fragment = 0, exposure = 0, saved_prior = 0, saved_total = 0;
+        bool called = false;
+        std::size_t h1 = 0, h2 = 0;   // unique sequence indices
+        std::string source;
+    };
+    std::vector<Item> pool;
+    std::vector<std::string> sequences;
+    std::map<std::string, std::size_t> seq_index;
+    const auto intern = [&](const std::string& s) {
+        const auto found = seq_index.find(s);
+        if (found != seq_index.end()) return found->second;
+        seq_index.emplace(s, sequences.size());
+        sequences.push_back(s);
+        return sequences.size() - 1;
+    };
+    for (const auto& row : read_table(run + ".mosaic_scores.tsv")) {
+        Item it;
+        it.seq_id = std::stoull(row.at("sequence_candidate_id"));
+        it.rep = std::stoull(row.at("representative_beam_candidate"));
+        it.fragment = std::stod(row.at("fragment_term"));
+        it.exposure = std::stod(row.at("exposure_term"));
+        it.saved_prior = std::stod(row.at("sequence_pair_prior"));
+        it.saved_total = std::stod(row.at("score"));
+        it.called = row.at("carries_called_genotype") == "true";
+        const auto& p = paths.at(it.rep);
+        it.source = source_of.at(it.rep);
+        it.h1 = intern(panvar::spell_mosaic(model, panvar::MosaicPath{p.first}).bases);
+        it.h2 = intern(panvar::spell_mosaic(model, panvar::MosaicPath{p.second}).bases);
+        pool.push_back(it);
+    }
+    if (pool.empty()) throw std::runtime_error("empty pool");
+    std::set<std::size_t> template_seq;   // sequences some panel template spells whole (an "intact" haplotype)
+    for (std::size_t h = 0; h < templates; ++h) {
+        const std::vector<std::size_t> row(panel.template_alleles[h].begin(), panel.template_alleles[h].end());
+        const auto found = seq_index.find(panvar::spell_mosaic(model, panvar::MosaicPath{row}).bases);
+        if (found != seq_index.end()) template_seq.insert(found->second);
+    }
+
+    // ---- prior models
+    std::vector<double> d(blocks - 1, 0.0);
+    double span_total = 0.0;
+    std::size_t zero_span = 0;
+    for (std::size_t b = 1; b < blocks; ++b) {
+        double mean = 0.0;
+        for (std::size_t h = 0; h < templates; ++h) mean += static_cast<double>(model.blocks()[b - 1].alleles[panel.template_alleles[h][b - 1]].sequence.size());
+        d[b - 1] = mean / static_cast<double>(templates) + static_cast<double>(model.invariant_segments()[b].size());
+        span_total += d[b - 1];
+        zero_span += d[b - 1] == 0.0 ? 1 : 0;
+    }
+    const double scale = blocks > 1 ? span_total / (static_cast<double>(blocks - 1) * -std::log1p(-0.01)) : 1.0;
+    struct PriorModel {
+        std::string name;
+        std::vector<double> r;
+    };
+    std::vector<PriorModel> models;
+    for (const double r : {0.001, 0.003, 0.01, 0.03, 0.1}) {
+        std::ostringstream n;
+        n << "const_" << r;
+        models.push_back({n.str(), std::vector<double>(blocks - 1, r)});
+    }
+    models.push_back({"zero", std::vector<double>(blocks - 1, 0.0)});
+    {
+        PriorModel m{"dist_matched", {}};
+        for (const double x : d) m.r.push_back(x > 0.0 ? -std::expm1(-x / scale) : 0.0);
+        models.push_back(m);
+    }
+    std::ostringstream mdesc;
+    mdesc << std::setprecision(10) << "cell\tmodel\tboundaries\tr_min\tr_max\tr_mean\ttotal_hazard\tscale_bp\tzero_span_boundaries\n";
+    for (const PriorModel& m : models) {
+        double lo = 1, hi = 0, sum = 0, hazard = 0;
+        for (const double r : m.r) {
+            lo = std::min(lo, r);
+            hi = std::max(hi, r);
+            sum += r;
+            hazard += r < 1.0 ? -std::log1p(-r) : std::numeric_limits<double>::infinity();
+        }
+        mdesc << cell << '\t' << m.name << '\t' << m.r.size() << '\t' << lo << '\t' << hi << '\t' << sum / std::max<std::size_t>(1, m.r.size())
+              << '\t' << hazard << '\t' << (m.name == "dist_matched" ? scale : std::numeric_limits<double>::quiet_NaN()) << '\t'
+              << (m.name == "dist_matched" ? zero_span : 0) << '\n';
+    }
+
+    const auto pair_priors = [&](const std::vector<double>& r) {
+        std::vector<double> hp(sequences.size());
+        for (std::size_t s = 0; s < sequences.size(); ++s) hp[s] = panvar::log_haploid_sequence_prior(model, sequences[s], r);
+        std::vector<double> pp(pool.size());
+        for (std::size_t i = 0; i < pool.size(); ++i) {
+            const double a = hp[pool[i].h1], b = hp[pool[i].h2];
+            pp[i] = (a == ninf || b == ninf) ? ninf : a + b + (pool[i].h1 != pool[i].h2 ? std::log(2.0) : 0.0);
+        }
+        return pp;
+    };
+
+    // ---- gate: the current prior reproduces every saved prior (and total) before anything is reported
+    std::ostringstream gate;
+    gate << std::setprecision(12) << "key\tvalue\n";
+    {
+        const std::vector<double> current = pair_priors(models[2].r);
+        double worst_prior = 0.0, worst_total = 0.0;
+        std::size_t mismatched = 0;
+        for (std::size_t i = 0; i < pool.size(); ++i) {
+            const double dp = std::fabs(current[i] - pool[i].saved_prior);
+            const double dt = std::fabs(pool[i].fragment + pool[i].exposure + current[i] - pool[i].saved_total);
+            worst_prior = std::max(worst_prior, dp);
+            worst_total = std::max(worst_total, dt);
+            if (!(dp <= 1e-8 * std::max(1.0, std::fabs(pool[i].saved_prior))) || !(dt <= 1e-6 * std::max(1.0, std::fabs(pool[i].saved_total)))) ++mismatched;
+        }
+        gate << cell << "_pool_candidates\t" << pool.size() << '\n' << cell << "_unique_haplotypes\t" << sequences.size() << '\n'
+             << cell << "_intact_haplotypes_in_pool\t" << template_seq.size() << '\n' << cell << "_templates\t" << templates << '\n'
+             << cell << "_blocks\t" << blocks << '\n' << cell << "_current_prior_max_abs_diff\t" << worst_prior << '\n'
+             << cell << "_current_total_max_abs_diff\t" << worst_total << '\n' << cell << "_current_prior_mismatches\t" << mismatched << '\n';
+        if (mismatched) {
+            atomic_write(out + ".gate.tsv", gate.str());
+            std::cout << gate.str() << "prior-pool " << cell << ": REFUSED (saved priors not reproduced)\n";
+            return 4;
+        }
+    }
+
+    // ---- per model: ranking, decomposition, intact vs mosaic, ambiguity
+    std::size_t call = pool.size();
+    for (std::size_t i = 0; i < pool.size(); ++i) {
+        if (pool[i].called && (call == pool.size() || pool[i].saved_total > pool[call].saved_total)) call = i;
+    }
+    if (call == pool.size()) throw std::runtime_error("no candidate carries the called genotype");
+    const auto intact = [&](const Item& it) { return template_seq.count(it.h1) && template_seq.count(it.h2); };
+    std::ostringstream summary, top;
+    summary << std::setprecision(10)
+            << "cell\tmodel\tfinite\twinner_seq_id\twinner_source\twinner_intact\twinner_is_call\tcall_rank\twinner_minus_call_total\t"
+               "winner_minus_call_fragment\twinner_minus_call_exposure\twinner_minus_call_prior\twinner_probability\twithin_1nat\t"
+               "gap_to_second\tbest_intact_minus_best_mosaic\tcall_prior\tcall_total\n";
+    top << std::setprecision(10) << "cell\tmodel\trank\tseq_id\tsource\tintact\tcalled\tfragment\texposure\tprior\ttotal\n";
+    std::map<std::string, std::vector<double>> prior_by_model;
+    for (const PriorModel& m : models) {
+        const std::vector<double> pp = pair_priors(m.r);
+        prior_by_model[m.name] = pp;
+        std::vector<double> total(pool.size());
+        std::size_t finite = 0;
+        for (std::size_t i = 0; i < pool.size(); ++i) {
+            total[i] = pp[i] == ninf ? ninf : pool[i].fragment + pool[i].exposure + pp[i];
+            finite += pp[i] == ninf ? 0 : 1;
+        }
+        std::vector<std::size_t> order(pool.size());
+        std::iota(order.begin(), order.end(), 0);
+        std::stable_sort(order.begin(), order.end(), [&](std::size_t x, std::size_t y) {
+            return total[x] != total[y] ? total[x] > total[y] : pool[x].seq_id < pool[y].seq_id;
+        });
+        const std::size_t w = order[0];
+        std::size_t call_rank = 0;
+        for (std::size_t k = 0; k < order.size(); ++k) if (order[k] == call) call_rank = k + 1;
+        double z = ninf;
+        std::size_t within = 0;
+        for (std::size_t i = 0; i < pool.size(); ++i) {
+            z = panvar::log_add_exp(z, total[i]);
+            within += total[i] >= total[w] - 1.0 ? 1 : 0;
+        }
+        double best_intact = ninf, best_mosaic = ninf;
+        for (std::size_t i = 0; i < pool.size(); ++i) (intact(pool[i]) ? best_intact : best_mosaic) = std::max(intact(pool[i]) ? best_intact : best_mosaic, total[i]);
+        const bool call_finite = total[call] != ninf;
+        summary << cell << '\t' << m.name << '\t' << finite << '\t' << pool[w].seq_id << '\t' << pool[w].source << '\t' << intact(pool[w]) << '\t'
+                << (w == call) << '\t' << (call_finite ? std::to_string(call_rank) : std::string("inf_prior")) << '\t'
+                << (call_finite ? total[w] - total[call] : std::numeric_limits<double>::infinity()) << '\t' << pool[w].fragment - pool[call].fragment << '\t'
+                << pool[w].exposure - pool[call].exposure << '\t' << pp[w] - pp[call] << '\t' << std::exp(total[w] - z) << '\t' << within << '\t'
+                << (order.size() > 1 ? total[w] - total[order[1]] : std::numeric_limits<double>::quiet_NaN()) << '\t'
+                << best_intact - best_mosaic << '\t' << pp[call] << '\t' << total[call] << '\n';
+        for (std::size_t k = 0; k < std::min<std::size_t>(10, order.size()); ++k) {
+            const Item& it = pool[order[k]];
+            top << cell << '\t' << m.name << '\t' << k + 1 << '\t' << it.seq_id << '\t' << it.source << '\t' << intact(it) << '\t' << (order[k] == call) << '\t'
+                << it.fragment << '\t' << it.exposure << '\t' << pp[order[k]] << '\t' << total[order[k]] << '\n';
+        }
+    }
+
+    // ---- prior-side flank association (path level): call vs declared and automatic contrasts. Target blocks are the
+    // blocks where the two diplotypes differ (as unordered block-allele pairs); the target-marginal prior treats every
+    // other block as monomorphic (transitions kept, emission constraint removed), so log P(full) - log P(target-marginal)
+    // is the flank alleles' association with the target through the copying prior. Fragment terms are NOT decomposed here.
+    struct Contrast {
+        std::string label;
+        std::vector<std::size_t> a1, a2;
+        bool evaluator_only = false;
+        double fragment = std::numeric_limits<double>::quiet_NaN(), exposure = std::numeric_limits<double>::quiet_NaN();
+    };
+    std::vector<Contrast> contrasts;
+    {   // automatic: the best saved alternative to the call (truth-free)
+        std::size_t best = pool.size();
+        for (std::size_t i = 0; i < pool.size(); ++i) {
+            if (i == call) continue;
+            if (best == pool.size() || pool[i].saved_total > pool[best].saved_total) best = i;
+        }
+        if (best != pool.size()) {
+            const auto& p = paths.at(pool[best].rep);
+            contrasts.push_back({"best_saved_alternative(seq" + std::to_string(pool[best].seq_id) + ")", p.first, p.second, false,
+                                 pool[best].fragment, pool[best].exposure});
+        }
+    }
+    const auto read_declared = [&](const std::string& file, bool evaluator_only) {
+        if (file.empty()) return;
+        std::ifstream in(file);
+        if (!in) throw std::runtime_error("cannot read " + file);
+        for (std::string line; std::getline(in, line);) {
+            if (line.empty() || line[0] == '#') continue;
+            std::vector<std::string> f;
+            std::stringstream fields(line);
+            for (std::string x; std::getline(fields, x, '\t');) f.push_back(x);
+            if (f.size() < 3) throw std::runtime_error("each declared row needs <label> <hap1> <hap2> [fragment exposure]");
+            Contrast c{f[0], parse_alleles(f[1]), parse_alleles(f[2]), evaluator_only};
+            if (f.size() >= 5) {
+                c.fragment = std::stod(f[3]);
+                c.exposure = std::stod(f[4]);
+            }
+            if (c.a1.size() != blocks || c.a2.size() != blocks) throw std::runtime_error("declared row " + f[0] + " needs one allele per block");
+            contrasts.push_back(c);
+        }
+    };
+    read_declared(args.get("contrasts", ""), false);
+    read_declared(args.get("counterfactual", ""), true);
+    const auto& cp = paths.at(pool[call].rep);
+    std::ostringstream flank, counter;
+    flank << std::setprecision(10) << "cell\tcontrast\tmodel\ttarget_blocks\tdelta_prior_full_path\tdelta_prior_target_marginal\tdelta_flank_association\n";
+    counter << std::setprecision(10) << "cell\tcounterfactual\tmodel\tsequence_pair_prior\ttotal\tminus_pool_winner_total\tminus_call_total\n";
+    const auto diplotype_path_prior = [&](const panvar::PanelAlleleMatrix& pm, const std::vector<std::size_t>& x, const std::vector<std::size_t>& y,
+                                          const std::vector<double>& r) {
+        const double a = panvar::log_haploid_mosaic_prior(pm, panvar::MosaicPath{x}, r);
+        const double b = panvar::log_haploid_mosaic_prior(pm, panvar::MosaicPath{y}, r);
+        return (a == ninf || b == ninf) ? ninf : a + b + (x != y ? std::log(2.0) : 0.0);
+    };
+    for (const Contrast& c : contrasts) {
+        std::vector<char> target(blocks, 0);
+        std::string tb;
+        for (std::size_t b = 0; b < blocks; ++b) {
+            const auto x = std::minmax(cp.first[b], cp.second[b]), y = std::minmax(c.a1[b], c.a2[b]);
+            if (x != y) {
+                target[b] = 1;
+                tb += (tb.empty() ? "" : ",") + model.blocks()[b].block_id;
+            }
+        }
+        panvar::PanelAlleleMatrix marginal = panel;
+        for (auto& row : marginal.template_alleles) for (std::size_t b = 0; b < blocks; ++b) if (!target[b]) row[b] = 0;
+        const auto mask = [&](std::vector<std::size_t> v) {
+            for (std::size_t b = 0; b < blocks; ++b) if (!target[b]) v[b] = 0;
+            return v;
+        };
+        for (const PriorModel& m : models) {
+            if (m.name == "zero") continue;
+            const double full = diplotype_path_prior(panel, c.a1, c.a2, m.r) - diplotype_path_prior(panel, cp.first, cp.second, m.r);
+            const double tgt = diplotype_path_prior(marginal, mask(c.a1), mask(c.a2), m.r) -
+                               diplotype_path_prior(marginal, mask(cp.first), mask(cp.second), m.r);
+            flank << cell << '\t' << c.label << (c.evaluator_only ? "[evaluator-only]" : "") << '\t' << m.name << '\t' << (tb.empty() ? "-" : tb) << '\t'
+                  << full << '\t' << tgt << '\t' << full - tgt << '\n';
+        }
+        if (c.evaluator_only) {
+            const std::string s1 = panvar::spell_mosaic(model, panvar::MosaicPath{c.a1}).bases, s2 = panvar::spell_mosaic(model, panvar::MosaicPath{c.a2}).bases;
+            for (const PriorModel& m : models) {
+                const double a = panvar::log_haploid_sequence_prior(model, s1, m.r), b = panvar::log_haploid_sequence_prior(model, s2, m.r);
+                const double prior = (a == ninf || b == ninf) ? ninf : a + b + (s1 != s2 ? std::log(2.0) : 0.0);
+                const double t = c.fragment + c.exposure + prior;
+                const std::vector<double>& pp = prior_by_model.at(m.name);
+                double best = ninf;
+                for (std::size_t i = 0; i < pool.size(); ++i) if (pp[i] != ninf) best = std::max(best, pool[i].fragment + pool[i].exposure + pp[i]);
+                const double call_total = pp[call] == ninf ? ninf : pool[call].fragment + pool[call].exposure + pp[call];
+                counter << cell << '\t' << c.label << '\t' << m.name << '\t' << prior << '\t' << t << '\t' << t - best << '\t' << t - call_total << '\n';
+            }
+        }
+    }
+    atomic_write(out + ".gate.tsv", gate.str());
+    atomic_write(out + ".models.tsv", mdesc.str());
+    atomic_write(out + ".summary.tsv", summary.str());
+    atomic_write(out + ".top.tsv", top.str());
+    atomic_write(out + ".flank_prior.tsv", flank.str());
+    if (!args.get("counterfactual", "").empty()) atomic_write(out + ".counterfactual_evaluator_only.tsv", counter.str());
+    std::cout << gate.str() << summary.str();
+    return 0;
+}
+
 int block_sequences(const Args& args) {
     const std::string out = args.required("out");
     const std::string reference = args.required("reference");
@@ -7033,7 +7357,7 @@ int library_estimate(const Args& args) {
 int main(int argc, char** argv) {
     try {
         if (argc < 2) {
-            std::cerr << "usage: genotype_probe simulate|loo-gfa|evaluate|compare|genotype|trace|anchors|subsample|preflight|respell|coverage-audit|form-census|mosaic-truth|orientations|panel-alleles|tied-consensus|score-set|block-sequences|mass-reconcile|spell|edit-distances|repair-search --key value ...\n";
+            std::cerr << "usage: genotype_probe simulate|loo-gfa|evaluate|compare|genotype|trace|anchors|subsample|preflight|respell|coverage-audit|form-census|mosaic-truth|orientations|panel-alleles|tied-consensus|score-set|block-sequences|prior-pool|mass-reconcile|spell|edit-distances|repair-search --key value ...\n";
             return 2;
         }
         const std::string command = argv[1];
@@ -7059,6 +7383,7 @@ int main(int argc, char** argv) {
         if (command == "repair-pilot") return repair_pilot(args);
         if (command == "score-set") return score_set(args);
         if (command == "block-sequences") return block_sequences(args);
+        if (command == "prior-pool") return prior_pool(args);
         if (command == "mass-reconcile") return mass_reconcile(args);
         if (command == "spell") return spell(args);
         if (command == "edit-distances") return edit_distances(args);
