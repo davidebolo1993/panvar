@@ -99,3 +99,13 @@ Solving this small context error does not address that allocation problem.
    is still wrong at ctx:0, so it is recorded separately and does not explain this error.
 4. **One coverage pair does not establish calibration.** The 5× twin calling (14,56) DATA_SUPPORTED is consistent with
    low-depth uncertainty at 2×.
+
+## Qualification appended at M5-A (2026-10-19; the record above is not rewritten)
+
+**Reachability of the +0.613 observation.** The "+0.613 one-block move inside W1/W2" reported above, and repeated in
+M3-H and M4-B as an unrefined-pool-winner limitation, sets ctx:0 to (40,52). That pair ranks 723rd by proposal emission,
+outside the existing 32-pair shortlist.
+- M5-A ran the ordinary single-block engine from both winning roots with the caller's settings.
+- Neither root has an improving neighbour: the best in-shortlist move loses by 2.37.
+- The reported winner is therefore a local optimum of the existing move set, although it was never refined.
+- The substitution was a diagnostic construction, not a move the ordinary engine can make.
