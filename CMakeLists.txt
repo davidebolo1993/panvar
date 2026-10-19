@@ -299,6 +299,10 @@ if(PANVAR_BUILD_TESTING)
         add_executable(nuisance_prior_audit tests/nuisance_prior_audit.cpp)
         target_link_libraries(nuisance_prior_audit PRIVATE panvarlib)
         target_compile_options(nuisance_prior_audit PRIVATE -Wall -Wextra -Wpedantic)
+        # M6-E diagnostic (not a ctest): edlib global-alignment events of panel component pairs
+        add_executable(unit_correspondence tests/unit_correspondence.cpp)
+        target_link_libraries(unit_correspondence PRIVATE edlib Threads::Threads)
+        target_compile_options(unit_correspondence PRIVATE -Wall -Wextra -Wpedantic)
         # M6-A diagnostic (not a ctest): count-fit comparator core gates
         add_executable(count_fit_gates tests/count_fit_gates.cpp)
         target_compile_options(count_fit_gates PRIVATE -Wall -Wextra -Wpedantic)
