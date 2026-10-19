@@ -25,7 +25,11 @@ FIXTURES = ["F1_control_2+2", "F2a_missing_variants_invisible_allocation", "F2b_
 SEEDS = [11, 23, 37]   # frozen
 MANIFEST_G = [("gates", "gates", "-", 120)]
 MANIFEST_R = [(f"run.{f}.{s}", "run", f"{f}:{s}", 60) for f in FIXTURES for s in SEEDS] + [("summary", "summary", "-", 30)]
-MANIFESTS = {"G": MANIFEST_G, "R": MANIFEST_R}
+# Amendment 1 (declared after run.F1_control_2+2.11 at 30.9 s spent): runs take ~21 s, so the frozen fixture-major order could
+# exhaust the budget before the last fixtures; the remaining runs go seed-major (every fixture at seed 11, then 23, then 37).
+# Same units, timeouts and seeds; only the order changes. The completed unit stays recorded.
+MANIFEST_A1 = [(f"run.{f}.{s}", "run", f"{f}:{s}", 60) for s in SEEDS for f in FIXTURES if (f, s) != ("F1_control_2+2", 11)] + [("summary", "summary", "-", 30)]
+MANIFESTS = {"G": MANIFEST_G, "R": MANIFEST_R, "A1": MANIFEST_A1}
 INPUTS = []
 
 
@@ -90,7 +94,7 @@ def exit_of_gates():
 
 
 def run_unit(unit):
-    part, (u, kind, target, timeout) = next((p, m) for p, rows in MANIFESTS.items() for m in rows if m[0] == unit)
+    part, (u, kind, target, timeout) = next((p, m) for p, rows in reversed(list(MANIFESTS.items())) for m in rows if m[0] == unit)
     assert os.path.exists(f"{OUT}/MANIFEST_{part}.tsv") and unit not in done()
     rev, dirty = state()
     assert dirty == 0, "the tree must be committed and clean"

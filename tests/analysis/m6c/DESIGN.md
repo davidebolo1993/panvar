@@ -70,3 +70,12 @@ Failures are reported as they are; there is no tuning, no added states and no fi
 - 600 s counting every attempt, 4 threads.
 - **Declared timeouts:** gates 120 s; each fixture run 60 s; summary 30 s.
 - The fixtures run only after the gates pass. Builds are not counted.
+
+## Amendment 1 (declared after `run.F1_control_2+2.11`, before any further unit; 30.9 s spent)
+
+**Why.** The first fixture run took 20.9 s. Under the frozen fixture-major order, the 26 remaining runs, plus the summary,
+could exhaust the 600-s budget before the last fixtures (F6, F7) ran.
+
+**Change: order only.** The remaining runs follow manifest A1: every fixture at seed 11, then seed 23, then seed 37. The
+units, seeds, timeouts, model, fixtures and classification are unchanged, and the completed unit stays recorded. Any
+unit the budget refuses is recorded as NOT RUN.
