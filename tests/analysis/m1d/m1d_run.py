@@ -43,7 +43,15 @@ MANIFEST_B = [("seq.panel", "seqpanel", "-", 30), ("inventory", "inventory", "-"
 # Every later unit uses inventory.a1.
 MANIFEST_A1 = [("inventory.a1", "inventory", "a1", 120)]
 INVENTORY_UNIT = "inventory.a1"
-MANIFESTS = {"B": MANIFEST_B, "A1": MANIFEST_A1}
+# Amendment 2 (declared before further execution): construct.c4_10/c4_30 failed (KeyError 'whole.truth.1') on a naming
+# defect -- the reachability records are named after the M1-B truth file (truth1/truth2), construct.py expected the spell
+# naming (truth.1/truth.2) -- and cand.dist.c4_10/c4_30 then failed on the missing construction (all four recorded,
+# unchanged). construct.py now uses the reachability names and asserts that both truth sources carry identical sv:7 bytes;
+# the selection rule, candidates and every later unit are unchanged. New units rerun construction and distances; the
+# score and summary units of manifest B read the .a2 outputs.
+MANIFEST_A2 = [("construct.c4_10.a2", "construct", "c4_10", 60), ("construct.c4_30.a2", "construct", "c4_30", 60),
+               ("cand.dist.c4_10.a2", "dist", "c4_10", 120), ("cand.dist.c4_30.a2", "dist", "c4_30", 120)]
+MANIFESTS = {"B": MANIFEST_B, "A1": MANIFEST_A1, "A2": MANIFEST_A2}
 
 
 def ledger_rows():
@@ -136,7 +144,7 @@ def command(unit, kind, target, timeout, d):
         return [py, os.path.join(HERE, "reach.py"), "pairs", "--inventory", inv, "--frozen", FROZEN, "--truth", TRUTH_BLOCKS,
                 "--alleles", alleles, "--out", f"{d}/reach"], "diagnostic evaluator (truth)"
     if kind == "dist":
-        pairs = f"{OUT}/runs/reach.pairs/reach.pairs.tsv" if target == "reach" else f"{OUT}/runs/construct.{target}/candidates.pairs.tsv"
+        pairs = f"{OUT}/runs/reach.pairs/reach.pairs.tsv" if target == "reach" else f"{OUT}/runs/construct.{target}.a2/candidates.pairs.tsv"
         return ["nice", f"{BUILD}/genotype_probe", "edit-distances", "--pairs", pairs, "--threads", "4", "--out",
                 f"{d}/distances.tsv"], "diagnostic evaluator (truth)"
     if kind == "reachselect":
@@ -145,14 +153,15 @@ def command(unit, kind, target, timeout, d):
                 f"{OUT}/runs/reach.pairs/reach.truth_components.fa", "--out", f"{d}/reach"], "diagnostic evaluator (truth)"
     if kind == "construct":
         return [py, os.path.join(HERE, "construct.py"), "--spell", f"{M1C}/runs/spell.{target}/spell", "--inventory", inv,
-                "--reach", f"{OUT}/runs/reach.select/reach", "--out", f"{d}/candidates", "--expected-reported",
+                "--reach", f"{OUT}/runs/reach.select/reach", "--truth-blocks", TRUTH_BLOCKS, "--out", f"{d}/candidates",
+                "--expected-reported",
                 reported_total(target), "--expected-comparator", comparator_total(target)], "oracle construction (truth)"
     if kind == "score":
         c = CASES[target]
         return ["nice", f"{BUILD}/genotype_probe", "score-set", "--out", f"{d}/score", "--reference", c["reference"],
                 "--donor", c["sample"], "--run", f"{M1B}/runs/call.{target}/call", "--model-gfa", c["model_graph"],
                 "--library", c["library"], "--reads1", c["reads1"], "--reads2", c["reads2"], "--threads", "4",
-                "--explicit", f"{OUT}/runs/construct.{target}/candidates.explicit.tsv"], "explicit-sequence scoring"
+                "--explicit", f"{OUT}/runs/construct.{target}.a2/candidates.explicit.tsv"], "explicit-sequence scoring"
     if kind == "summary":
         return [py, os.path.join(HERE, "summary.py"), f"{OUT}/runs", f"{d}/m1d"], "-"
     raise ValueError(kind)

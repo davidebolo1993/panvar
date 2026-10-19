@@ -19,7 +19,7 @@ c/d31/e13 use exactly the composed a/b unit inventory (asserted). Every candidat
 reported right flank (asserted); every component equals its frozen inventory record (SHA-256 asserted); every join's
 62-bp context is recorded.
 
-  construct.py --spell PREFIX --inventory PREFIX --reach PREFIX --out OUT_PREFIX --expected-reported X --expected-comparator Y
+  construct.py --spell PREFIX --inventory PREFIX --reach PREFIX --truth-blocks FA --out OUT_PREFIX --expected-reported X --expected-comparator Y
 """
 import argparse
 import collections
@@ -45,7 +45,7 @@ def sha(s):
 
 def main():
     ap = argparse.ArgumentParser()
-    for x in ("spell", "inventory", "reach", "out", "expected_reported", "expected_comparator"):
+    for x in ("spell", "inventory", "reach", "truth_blocks", "out", "expected_reported", "expected_comparator"):
         ap.add_argument("--" + x.replace("_", "-"), required=True)
     a = ap.parse_args()
     seq = fasta(a.spell + ".fa")
@@ -64,6 +64,10 @@ def main():
     composed = fasta(a.reach + ".composed.fa")
     structure = {r["record"]: r["components"].split("+") for r in csv.DictReader(open(a.reach + ".composed_structure.tsv"), delimiter="\t")}
     blk = {r: seq[r][iv[r][0]:iv[r][1]] for r in seq}
+    # Amendment 2: the reachability step read truth from the M1-B block file (records truth1/truth2); the spelled truth
+    # (truth.1/truth.2) must carry the identical sv:7 bytes.
+    reach_truth = fasta(a.truth_blocks)
+    assert blk["truth.1"] == reach_truth["truth1"] and blk["truth.2"] == reach_truth["truth2"], "the two truth sources differ"
     assert blk["reported.1"].count(anchor) == 3 and blk["reported.2"].count(anchor) == 1, "side 1 must be the 3-unit homologue"
     flank = {s: (seq[f"reported.{s}"][:iv[f"reported.{s}"][0]], seq[f"reported.{s}"][iv[f"reported.{s}"][1]:]) for s in (1, 2)}
     log, alts = [], []
@@ -90,18 +94,18 @@ def main():
     alts.append(("saved_2+2", [(seq["saved_2+2.1"], iv["saved_2+2.1"]), (seq["saved_2+2.2"], iv["saved_2+2.2"])],
                  a.expected_comparator, blk["saved_2+2.1"], blk["saved_2+2.2"]))
     put("truthblock_a", blk["truth.1"], blk["truth.2"], "truth.1 block", "truth.2 block")
-    put("whole_nearest_a", composed["whole.truth.1"], composed["whole.truth.2"], structure["whole.truth.1"][0],
-        structure["whole.truth.2"][0])
-    if "periodonly.truth.1" in composed and "periodonly.truth.2" in composed:
-        put("periodonly_a", composed["periodonly.truth.1"], composed["periodonly.truth.2"],
-            "+".join(structure["periodonly.truth.1"]), "+".join(structure["periodonly.truth.2"]))
+    put("whole_nearest_a", composed["whole.truth1"], composed["whole.truth2"], structure["whole.truth1"][0],
+        structure["whole.truth2"][0])
+    if "periodonly.truth1" in composed and "periodonly.truth2" in composed:
+        put("periodonly_a", composed["periodonly.truth1"], composed["periodonly.truth2"],
+            "+".join(structure["periodonly.truth1"]), "+".join(structure["periodonly.truth2"]))
     else:
         log.append("periodonly_a\tNOT CONSTRUCTED: a nearest whole allele has a different unit count")
-    c1, c2 = structure["compose.truth.1"], structure["compose.truth.2"]
+    c1, c2 = structure["compose.truth1"], structure["compose.truth2"]
     if len(c1) == 3 and len(c2) == 3:
         p1, u1, t1 = c1
         p2, u2, t2 = c2
-        assert comp(c1) == composed["compose.truth.1"] and comp(c2) == composed["compose.truth.2"]
+        assert comp(c1) == composed["compose.truth1"] and comp(c2) == composed["compose.truth2"]
         variants = {"oracle_compose_a": ([p1, u1, t1], [p2, u2, t2]), "oracle_compose_b": ([p2, u2, t2], [p1, u1, t1]),
                     "oracle_compose_c": ([p1, u2, t1], [p2, u1, t2]), "oracle_compose_d31": ([p1, u1, u2, t1], [p2, t2]),
                     "oracle_compose_e13": ([p1, t1], [p2, u1, u2, t2])}

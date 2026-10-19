@@ -51,9 +51,9 @@ def main(runs, out):
             continue
         rows = {r["label"]: r for r in csv.DictReader(open(sp), delimiter="\t")}
         dist = {}
-        for r in csv.DictReader(open(f"{runs}/cand.dist.{cov}/distances.tsv"), delimiter="\t"):
+        for r in csv.DictReader(open(f"{runs}/cand.dist.{cov}.a2/distances.tsv"), delimiter="\t"):
             dist[(r["record_a"], r["record_b"])] = int(r["distance"])
-        blocks = fasta(f"{runs}/construct.{cov}/candidates.blocks.fa")
+        blocks = fasta(f"{runs}/construct.{cov}.a2/candidates.blocks.fa")
         content = {}
         for k in (31, 151):
             cache = {}
