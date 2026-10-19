@@ -35,7 +35,11 @@ MANIFEST_B = [("gate.mass_fixture.s1", "fixture", "20261019", 30), ("gate.mass_f
               ("score.c4_10", "score", "c4_10", 150), ("score.c4_30", "score", "c4_30", 300),
               ("content.c4_10", "content", "c4_10", 90), ("content.c4_30", "content", "c4_30", 90),
               ("summary", "summary", "-", 30)]
-MANIFESTS = {"B": MANIFEST_B}
+# Amendment 1 (declared before further execution): both fixture units failed before scoring on a harness defect -- the
+# fixture's LibraryModel had no provenance string, which validate_library_model refuses (recorded, unchanged). The fixture
+# now declares one; nothing else changed. New units rerun the two fixtures; the rest of manifest B continues unchanged.
+MANIFEST_A1 = [("gate.mass_fixture.s1.a1", "fixture", "20261019", 30), ("gate.mass_fixture.s2.a1", "fixture", "7", 30)]
+MANIFESTS = {"B": MANIFEST_B, "A1": MANIFEST_A1}
 
 
 def ledger_rows():

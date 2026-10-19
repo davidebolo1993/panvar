@@ -5034,6 +5034,7 @@ int mass_reconcile(const Args& args) {
     library.substitution_error = 0.005;
     library.outlier_weight = 0.001;
     library.fragment_start_intensity = 0.05;
+    library.provenance = "declared: mass-reconcile synthetic fixture";
     const std::vector<panvar::MosaicPath> paths{panvar::MosaicPath{{0}}, panvar::MosaicPath{{1}}};
     const panvar::InternedHaplotypes interned = panvar::intern_haplotypes(paths, {tandem, single});
     const std::vector<panvar::HaplotypeCandidate> candidates{{0, 1}, {0, 0}, {1, 1}};
