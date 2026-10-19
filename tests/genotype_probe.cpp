@@ -6222,6 +6222,358 @@ int prior_pool(const Args& args) {
     return 0;
 }
 
+// ------------------------------------------------------------------------------------------------
+// two-block-catalogue (M3-B): a bounded joint-move neighbourhood of a saved incumbent. TRUTH-FREE.
+// ------------------------------------------------------------------------------------------------
+// From the saved final incumbent (rank-1 representative of <run>.equivalence_set.tsv, full-precision total), for every
+// block b and homologue h the alternative alleles a != incumbent are ranked by the caller's own read-derived proposal
+// emission with the OTHER homologue's allele fixed: emission.at(a, other) descending, ties by allele index (the marker
+// panel, observations, depth fit and emissions are built exactly as score-set --rank-blocks builds them, k and s from the
+// run). The top --top (4) are kept. Candidates: every single-block move, and every combination changing two DIFFERENT
+// blocks on the SAME homologue (all block pairs), whatever the single-block intermediates score. Deduplicated by
+// unordered complete sequence pair (keyed by two independent 64-bit hashes and the length of each haplotype), keeping
+// every equivalent path and its provenance. If the raw count exceeds --limit (2,048) the command stops before writing a
+// catalogue (exit 5): nothing is trimmed. The unrestricted one- and two-block counts are reported, never materialised.
+int two_block_catalogue(const Args& args) {
+    const std::string out = args.required("out");
+    const std::string run = args.required("run");
+    const std::size_t top = std::stoul(args.get("top", "4"));
+    const std::size_t limit = std::stoul(args.get("limit", "2048"));
+    struct Staged {
+        std::string prefix;
+        ~Staged() {
+            std::error_code ignored;
+            std::filesystem::remove(prefix + ".model.sorted.gfa", ignored);
+        }
+    } staged{out};
+    const std::string curation = args.get("panel-curation", "");
+    const LoadedModel loaded = load_model(args.required("model-gfa"), args.required("reference"), out + ".model.sorted.gfa", 50,
+                                          curation.empty() ? std::vector<std::string>{} : read_panel_curation(curation));
+    const panvar::PreparedGenotypeModel& model = *loaded.model;
+    const auto status = read_key_values(run + ".mosaic_status.tsv");
+    if (status.at("model_fingerprint") != loaded.fingerprint) throw std::runtime_error("the run was not scored on the rebuilt model");
+    const std::size_t blocks = model.blocks().size();
+    // incumbent
+    std::vector<std::size_t> inc[2];
+    std::string inc_total;
+    for (const auto& row : read_table(run + ".equivalence_set.tsv")) {
+        if (row.at("rank") == "1" && row.at("representative") == "true") {
+            inc[0] = parse_alleles(row.at("hap1_alleles"));
+            inc[1] = parse_alleles(row.at("hap2_alleles"));
+            inc_total = row.at("score");
+        }
+    }
+    if (inc[0].size() != blocks || inc[1].size() != blocks) throw std::runtime_error("no rank-1 representative incumbent");
+    // emissions, as score-set --rank-blocks builds them
+    const std::vector<panvar::ReadPair> fragments = read_pairs(args.required("reads1"), args.required("reads2"));
+    const std::size_t k = std::stoul(status.at("kmer_size")), s = std::stoul(status.at("syncmer_s"));
+    const panvar::PreparedMarkerPanel markers = panvar::build_marker_panel(model, k, s);
+    const panvar::MarkerObservations observations = panvar::count_marker_observations(markers, fragments);
+    std::optional<double> declared_background;
+    {
+        std::ifstream library_file(args.required("library"));
+        std::string key;
+        double value = 0.0;
+        for (std::string line; std::getline(library_file, line);) {
+            std::istringstream fields(line);
+            if (fields >> key >> value && key == "marker_background") declared_background = value;
+        }
+    }
+    const panvar::MarkerDepthEstimate depth = panvar::estimate_marker_depth(markers, observations, declared_background);
+    if (!depth.converged) throw std::runtime_error("the depth fit did not converge: " + depth.termination);
+    const panvar::PreparedProposalEmissions emissions =
+        panvar::build_proposal_emissions(markers, observations, panvar::proposal_marker_parameters(depth, k, s));
+    // rankings per (homologue, block)
+    std::ostringstream ranks;
+    ranks << std::setprecision(12) << "homologue\tblock_id\tblock\tincumbent\tother\trank\tallele\temission\tbelow_best\tkept\n";
+    std::vector<std::size_t> kept[2][64];
+    if (blocks > 64) throw std::runtime_error("more than 64 blocks");
+    double one_block = 0, two_block_same = 0;
+    for (std::size_t b = 0; b < blocks; ++b) one_block += 2.0 * static_cast<double>(model.blocks()[b].alleles.size() - 1);
+    for (std::size_t b = 0; b < blocks; ++b) for (std::size_t c = b + 1; c < blocks; ++c)
+        two_block_same += 2.0 * static_cast<double>(model.blocks()[b].alleles.size() - 1) * static_cast<double>(model.blocks()[c].alleles.size() - 1);
+    for (int h = 0; h < 2; ++h) {
+        for (std::size_t b = 0; b < blocks; ++b) {
+            const panvar::BlockProposalEmissions& e = emissions.blocks[b];
+            const std::size_t other = inc[1 - h][b];
+            std::vector<std::pair<double, std::size_t>> alt;
+            for (std::size_t a = 0; a < e.allele_count; ++a) if (a != inc[h][b]) alt.push_back({e.at(a, other), a});
+            std::sort(alt.begin(), alt.end(), [](const auto& x, const auto& y) { return x.first != y.first ? x.first > y.first : x.second < y.second; });
+            for (std::size_t r = 0; r < alt.size(); ++r) {
+                if (r < top) kept[h][b].push_back(alt[r].second);
+                ranks << h << '\t' << model.blocks()[b].block_id << '\t' << b << '\t' << inc[h][b] << '\t' << other << '\t' << r + 1 << '\t'
+                      << alt[r].second << '\t' << alt[r].first << '\t' << alt.front().first - alt[r].first << '\t' << (r < top ? "true" : "false") << '\n';
+            }
+        }
+    }
+    std::size_t singles = 0, pairs = 0;
+    for (int h = 0; h < 2; ++h) {
+        for (std::size_t b = 0; b < blocks; ++b) singles += kept[h][b].size();
+        for (std::size_t b = 0; b < blocks; ++b) for (std::size_t c = b + 1; c < blocks; ++c) pairs += kept[h][b].size() * kept[h][c].size();
+    }
+    std::ostringstream pre;
+    pre << std::setprecision(15) << "key\tvalue\nblocks\t" << blocks << "\ntop\t" << top << "\nlimit\t" << limit
+        << "\nunrestricted_one_block_changes\t" << one_block << "\nunrestricted_two_block_same_homologue_changes\t" << two_block_same
+        << "\nraw_single_moves\t" << singles << "\nraw_two_block_moves\t" << pairs << "\nraw_candidates\t" << singles + pairs
+        << "\nincumbent_total\t" << inc_total << "\nkmer_size\t" << k << "\nsyncmer_s\t" << s << '\n';
+    atomic_write(out + ".emission_ranks.tsv", ranks.str());
+    if (singles + pairs > limit) {
+        pre << "decision\tSTOP: raw candidates exceed the declared limit; no catalogue written\n";
+        atomic_write(out + ".preflight.tsv", pre.str());
+        std::cout << pre.str();
+        return 5;
+    }
+    // materialise and deduplicate
+    const auto key_of = [&](const std::vector<std::size_t>& path) {
+        const std::string bases = panvar::spell_mosaic(model, panvar::MosaicPath{path}).bases;
+        return std::make_tuple(fnv1a(bases.data(), bases.size()), std::hash<std::string>{}(bases), bases.size());
+    };
+    using HapKey = std::tuple<std::uint64_t, std::size_t, std::size_t>;
+    std::map<std::vector<std::size_t>, HapKey> hap_cache;
+    const auto hap_key = [&](const std::vector<std::size_t>& p) {
+        const auto f = hap_cache.find(p);
+        if (f != hap_cache.end()) return f->second;
+        return hap_cache.emplace(p, key_of(p)).first->second;
+    };
+    struct Entry {
+        std::vector<std::size_t> p0, p1;
+        std::vector<std::string> moves;
+    };
+    std::map<std::pair<HapKey, HapKey>, Entry> unique;
+    std::vector<std::pair<HapKey, HapKey>> order;
+    const auto pair_key = [&](const std::vector<std::size_t>& a, const std::vector<std::size_t>& b) {
+        HapKey x = hap_key(a), y = hap_key(b);
+        if (y < x) std::swap(x, y);
+        return std::make_pair(x, y);
+    };
+    const auto incumbent_key = pair_key(inc[0], inc[1]);
+    std::size_t equal_incumbent = 0;
+    const auto add = [&](std::vector<std::size_t> p0, std::vector<std::size_t> p1, const std::string& move) {
+        const auto key = pair_key(p0, p1);
+        if (key == incumbent_key) {
+            ++equal_incumbent;
+            return;
+        }
+        auto it = unique.find(key);
+        if (it == unique.end()) {
+            order.push_back(key);
+            it = unique.emplace(key, Entry{p0, p1, {}}).first;
+        }
+        it->second.moves.push_back(move);
+    };
+    const auto rank_of = [&](int h, std::size_t b, std::size_t a) {
+        for (std::size_t r = 0; r < kept[h][b].size(); ++r) if (kept[h][b][r] == a) return r + 1;
+        return std::size_t{0};
+    };
+    for (int h = 0; h < 2; ++h) {
+        for (std::size_t b = 0; b < blocks; ++b) {
+            for (const std::size_t a : kept[h][b]) {
+                std::vector<std::size_t> p = inc[h];
+                p[b] = a;
+                std::ostringstream m;
+                m << "single:h" << h << ":" << model.blocks()[b].block_id << ":" << inc[h][b] << ">" << a << ":r" << rank_of(h, b, a);
+                add(h == 0 ? p : inc[0], h == 1 ? p : inc[1], m.str());
+            }
+        }
+        for (std::size_t b = 0; b < blocks; ++b) for (std::size_t c = b + 1; c < blocks; ++c) {
+            for (const std::size_t a : kept[h][b]) for (const std::size_t d : kept[h][c]) {
+                std::vector<std::size_t> p = inc[h];
+                p[b] = a;
+                p[c] = d;
+                std::ostringstream m;
+                m << "pair:h" << h << ":" << model.blocks()[b].block_id << ":" << inc[h][b] << ">" << a << ":r" << rank_of(h, b, a) << "+"
+                  << model.blocks()[c].block_id << ":" << inc[h][c] << ">" << d << ":r" << rank_of(h, c, d);
+                add(h == 0 ? p : inc[0], h == 1 ? p : inc[1], m.str());
+            }
+        }
+    }
+    const auto join = [](const std::vector<std::size_t>& v) {
+        std::string s;
+        for (std::size_t i = 0; i < v.size(); ++i) s += (i ? "," : "") + std::to_string(v[i]);
+        return s;
+    };
+    std::ostringstream cat, prov;
+    cat << "incumbent\t" << join(inc[0]) << '\t' << join(inc[1]) << '\t' << inc_total << '\n';
+    prov << "label\tn_equivalent_moves\tfirst_move_kind\tmoves\n";
+    std::size_t idx = 0;
+    std::set<HapKey> distinct;
+    distinct.insert(incumbent_key.first);
+    distinct.insert(incumbent_key.second);
+    for (const auto& key : order) {
+        const Entry& e = unique.at(key);
+        std::ostringstream label;
+        label << "c" << std::setw(4) << std::setfill('0') << ++idx;
+        cat << label.str() << '\t' << join(e.p0) << '\t' << join(e.p1) << '\n';
+        std::string moves;
+        for (const std::string& m : e.moves) moves += (moves.empty() ? "" : "|") + m;
+        prov << label.str() << '\t' << e.moves.size() << '\t' << e.moves.front().substr(0, e.moves.front().find(':')) << '\t' << moves << '\n';
+        distinct.insert(key.first);
+        distinct.insert(key.second);
+    }
+    pre << "candidates_equal_to_incumbent\t" << equal_incumbent << "\nunique_candidates_excluding_incumbent\t" << unique.size()
+        << "\ndistinct_haplotypes_including_incumbent\t" << distinct.size() << "\ndecision\tWITHIN LIMIT: catalogue frozen\n";
+    atomic_write(out + ".catalogue.tsv", cat.str());
+    atomic_write(out + ".provenance.tsv", prov.str());
+    atomic_write(out + ".preflight.tsv", pre.str());
+    std::cout << pre.str();
+    return 0;
+}
+
+// two-block-eval (M3-B): AFTER selection is frozen. Truth enters here only. The truth diplotype is given either by a
+// mosaic truth table (<truth.tsv>: per block, the first carrier template present in the model gives the allele) or by
+// two panel template names (an LZO donor). For each declared candidate label (winner, incumbent, intermediates, ...):
+// exact sequence-pair match, block projection (blocks whose unordered allele pair differs), unordered per-block edit
+// distance (min over the two pairings per block), and a phase diagnostic (global homologue assignment vs per-block
+// pairing: blocks where they disagree). Also: whether the truth pair was generated, its rank and score, and, when absent,
+// the proposal ranks of the truth alleles at the differing blocks.
+int two_block_eval(const Args& args) {
+    const std::string out = args.required("out");
+    struct Staged {
+        std::string prefix;
+        ~Staged() {
+            std::error_code ignored;
+            std::filesystem::remove(prefix + ".model.sorted.gfa", ignored);
+        }
+    } staged{out};
+    const std::string curation = args.get("panel-curation", "");
+    const LoadedModel loaded = load_model(args.required("model-gfa"), args.required("reference"), out + ".model.sorted.gfa", 50,
+                                          curation.empty() ? std::vector<std::string>{} : read_panel_curation(curation));
+    const panvar::PreparedGenotypeModel& model = *loaded.model;
+    const std::size_t blocks = model.blocks().size();
+    const auto& panel = model.panel();
+    const auto row_of = [&](const std::string& name) -> const std::vector<std::size_t>* {
+        for (std::size_t t = 0; t < panel.template_count(); ++t) if (panel.template_names[t] == name) return &panel.template_alleles[t];
+        return nullptr;
+    };
+    std::vector<std::size_t> truth[2] = {std::vector<std::size_t>(blocks), std::vector<std::size_t>(blocks)};
+    if (!args.get("truth-tsv", "").empty()) {
+        const auto rows = read_table(args.required("truth-tsv"));
+        if (rows.size() != blocks) throw std::runtime_error("truth table has a different block count");
+        for (std::size_t b = 0; b < blocks; ++b) {
+            if (rows[b].at("block_id") != model.blocks()[b].block_id) throw std::runtime_error("truth block order differs");
+            for (int h = 0; h < 2; ++h) {
+                std::string list = rows[b].at(h == 0 ? "hap1_carriers" : "hap2_carriers");
+                list = list.substr(list.find(':') + 1);
+                bool found = false;
+                std::stringstream names(list);
+                for (std::string n; std::getline(names, n, ',');) {
+                    if (n == "...") break;
+                    if (const auto* r = row_of(n)) {
+                        truth[h][b] = (*r)[b];
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found) throw std::runtime_error("no listed carrier of truth block " + model.blocks()[b].block_id + " is in the model");
+            }
+        }
+    } else {
+        std::stringstream names(args.required("truth-templates"));
+        for (int h = 0; h < 2; ++h) {
+            std::string n;
+            std::getline(names, n, ',');
+            const auto* r = row_of(n);
+            if (!r) throw std::runtime_error("truth template not in the model: " + n);
+            truth[h] = std::vector<std::size_t>(r->begin(), r->end());
+        }
+    }
+    const auto spell = [&](const std::vector<std::size_t>& p) { return panvar::spell_mosaic(model, panvar::MosaicPath{p}).bases; };
+    const std::string t0 = spell(truth[0]), t1 = spell(truth[1]);
+    std::map<std::string, std::pair<std::vector<std::size_t>, std::vector<std::size_t>>> cand;
+    std::map<std::string, double> total, fragment, exposure, prior;
+    std::vector<std::pair<double, std::string>> ranking;
+    for (const auto& row : read_table(args.required("scores"))) {
+        cand[row.at("label")] = {parse_alleles(row.at("hap1_alleles")), parse_alleles(row.at("hap2_alleles"))};
+        total[row.at("label")] = std::stod(row.at("total"));
+        fragment[row.at("label")] = std::stod(row.at("fragment_term"));
+        exposure[row.at("label")] = std::stod(row.at("exposure_term"));
+        prior[row.at("label")] = std::stod(row.at("prior"));
+        ranking.push_back({std::stod(row.at("total")), row.at("label")});
+    }
+    std::stable_sort(ranking.begin(), ranking.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+    std::map<std::string, std::size_t> rank;
+    for (std::size_t i = 0; i < ranking.size(); ++i) rank[ranking[i].second] = i + 1;
+    const auto allele_seq = [&](std::size_t b, std::size_t a) -> const std::string& { return model.blocks()[b].alleles[a].sequence; };
+    std::ostringstream ev;
+    ev << std::setprecision(12) << "label\trank\ttotal\tfragment\texposure\tprior\texact_sequence_pair\tblocks_differing\tdiffering_blocks\t"
+          "unordered_block_distance_bp\tphased_distance_bp\tphase_disagreement_blocks\n";
+    std::string truth_label = "absent";
+    for (const auto& [label, p] : cand) {
+        const std::string s0 = spell(p.first), s1 = spell(p.second);
+        const bool exact = (s0 == t0 && s1 == t1) || (s0 == t1 && s1 == t0);
+        if (exact && truth_label == "absent") truth_label = label;
+        const std::string& want = args.get("labels", "");
+        bool report = want.empty() || exact;
+        {
+            std::stringstream w(want);
+            for (std::string x; std::getline(w, x, ',');) report = report || x == label;
+        }
+        if (!report) continue;
+        std::size_t differ = 0, phase_dis = 0;
+        long unordered = 0, straight_total = 0, swapped_total = 0;
+        std::string which;
+        std::vector<int> best_pairing(blocks, 0);
+        for (std::size_t b = 0; b < blocks; ++b) {
+            const long ds = edit_distance(allele_seq(b, p.first[b]), allele_seq(b, truth[0][b])) + edit_distance(allele_seq(b, p.second[b]), allele_seq(b, truth[1][b]));
+            const long dx = edit_distance(allele_seq(b, p.first[b]), allele_seq(b, truth[1][b])) + edit_distance(allele_seq(b, p.second[b]), allele_seq(b, truth[0][b]));
+            unordered += std::min(ds, dx);
+            straight_total += ds;
+            swapped_total += dx;
+            best_pairing[b] = ds <= dx ? 0 : 1;
+            if (std::minmax(p.first[b], p.second[b]) != std::minmax(truth[0][b], truth[1][b])) {
+                ++differ;
+                which += (which.empty() ? "" : ",") + model.blocks()[b].block_id;
+            }
+        }
+        const int global = straight_total <= swapped_total ? 0 : 1;
+        for (std::size_t b = 0; b < blocks; ++b) {
+            const bool informative = p.first[b] != p.second[b] && truth[0][b] != truth[1][b];   // both heterozygous
+            if (informative && best_pairing[b] != global) ++phase_dis;
+        }
+        ev << label << '\t' << rank[label] << '\t' << total[label] << '\t' << fragment[label] << '\t' << exposure[label] << '\t' << prior[label] << '\t'
+           << exact << '\t' << differ << '\t' << (which.empty() ? "-" : which) << '\t' << unordered << '\t' << std::min(straight_total, swapped_total)
+           << '\t' << phase_dis << '\n';
+    }
+    std::ostringstream summ;
+    summ << "key\tvalue\ntruth_hap1_path\t";
+    for (std::size_t b = 0; b < blocks; ++b) summ << (b ? "," : "") << truth[0][b];
+    summ << "\ntruth_hap2_path\t";
+    for (std::size_t b = 0; b < blocks; ++b) summ << (b ? "," : "") << truth[1][b];
+    summ << "\ntruth_generated_label\t" << truth_label << "\ntruth_rank\t" << (truth_label == "absent" ? std::string("absent") : std::to_string(rank[truth_label]))
+         << "\ncatalogue_scored\t" << ranking.size() << "\nwinner_label\t" << ranking.front().second << '\n';
+    // proposal ranks of the truth alleles (relative to the incumbent's homologues), from the frozen truth-free ranking table
+    if (!args.get("ranks", "").empty() && cand.count("incumbent")) {
+        const auto& ip = cand.at("incumbent");
+        const bool straight = [&] {
+            long a = 0, c = 0;
+            for (std::size_t b = 0; b < blocks; ++b) {
+                a += (ip.first[b] != truth[0][b]) + (ip.second[b] != truth[1][b]);
+                c += (ip.first[b] != truth[1][b]) + (ip.second[b] != truth[0][b]);
+            }
+            return a <= c;
+        }();
+        const auto ranks = read_table(args.get("ranks", ""));
+        for (int h = 0; h < 2; ++h) {
+            const auto& ih = h == 0 ? ip.first : ip.second;
+            const auto& th = (h == 0) == straight ? truth[0] : truth[1];
+            for (std::size_t b = 0; b < blocks; ++b) {
+                if (ih[b] == th[b]) continue;
+                std::string r = "not_ranked";
+                for (const auto& row : ranks) {
+                    if (std::stoi(row.at("homologue")) == h && std::stoul(row.at("block")) == b && std::stoul(row.at("allele")) == th[b]) {
+                        r = row.at("rank") + (row.at("kept") == "true" ? " (kept)" : " (not kept)");
+                    }
+                }
+                summ << "truth_allele_proposal_rank_h" << h << "_" << model.blocks()[b].block_id << '\t' << ih[b] << ">" << th[b] << ": rank " << r << '\n';
+            }
+        }
+    }
+    atomic_write(out + ".eval.tsv", ev.str());
+    atomic_write(out + ".eval_summary.tsv", summ.str());
+    std::cout << summ.str() << ev.str();
+    return 0;
+}
+
 int block_sequences(const Args& args) {
     const std::string out = args.required("out");
     const std::string reference = args.required("reference");
@@ -7357,7 +7709,7 @@ int library_estimate(const Args& args) {
 int main(int argc, char** argv) {
     try {
         if (argc < 2) {
-            std::cerr << "usage: genotype_probe simulate|loo-gfa|evaluate|compare|genotype|trace|anchors|subsample|preflight|respell|coverage-audit|form-census|mosaic-truth|orientations|panel-alleles|tied-consensus|score-set|block-sequences|prior-pool|mass-reconcile|spell|edit-distances|repair-search --key value ...\n";
+            std::cerr << "usage: genotype_probe simulate|loo-gfa|evaluate|compare|genotype|trace|anchors|subsample|preflight|respell|coverage-audit|form-census|mosaic-truth|orientations|panel-alleles|tied-consensus|score-set|block-sequences|prior-pool|two-block-catalogue|two-block-eval|mass-reconcile|spell|edit-distances|repair-search --key value ...\n";
             return 2;
         }
         const std::string command = argv[1];
@@ -7384,6 +7736,8 @@ int main(int argc, char** argv) {
         if (command == "score-set") return score_set(args);
         if (command == "block-sequences") return block_sequences(args);
         if (command == "prior-pool") return prior_pool(args);
+        if (command == "two-block-catalogue") return two_block_catalogue(args);
+        if (command == "two-block-eval") return two_block_eval(args);
         if (command == "mass-reconcile") return mass_reconcile(args);
         if (command == "spell") return spell(args);
         if (command == "edit-distances") return edit_distances(args);
