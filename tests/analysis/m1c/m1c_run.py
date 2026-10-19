@@ -132,11 +132,33 @@ def scorer(c, case, d, extra):
             "--library", c["library"], "--reads1", c["reads1"], "--reads2", c["reads2"], "--threads", "4", *extra]
 
 
+def scorepart(target, d):
+    if exit_of("gate.explicit_compare") != "0":
+        return None, "NOT RUN (condition): the explicit-sequence gate did not pass"
+    case, part = target.split(":")
+    c = CASES[case]
+    keep = PARTS[part]
+    src = f"{OUT}/runs/construct.{case}/alternatives.explicit.tsv"
+    rows = [l for l in open(src) if not l.startswith("#") and l.strip() and l.split("\t")[0] in keep]
+    open(f"{d}/alternatives.part{part}.explicit.tsv", "w").write("".join(rows))
+    labels = [l.split("\t")[0] for l in rows]
+    pairs = [f"reported,{x}" for x in labels if x.startswith("realloc_")]
+    pairs += [f"reported,{x}" for x in ("truth", "saved_2+2", "truthblock_in_reported_a") if x in labels]
+    if "reportedblock_in_truth_a" in labels:
+        pairs.append("truth,reportedblock_in_truth_a")
+    return scorer(c, case, d, ["--explicit", f"{d}/alternatives.part{part}.explicit.tsv", "--decompose", ";".join(pairs),
+                               "--decompose-block", c["target_block"]]), f"explicit allocation alternatives, part {part}"
+
+
 def command(unit, kind, target, timeout, d):
     if kind == "fixture":
         return ["nice", f"{BUILD}/genotype_probe", "mass-reconcile", "--out", f"{d}/fixture", "--seed", target], "synthetic fixture"
     if kind == "summary":
         return [sys.executable, os.path.join(HERE, "summary.py"), f"{OUT}/runs", f"{d}/m1c"], "-"
+    if unit in WITHDRAWN:
+        return None, WITHDRAWN[unit]
+    if kind == "scorepart":
+        return scorepart(target, d)
     c = CASES[target]
     cands = f"{M1B}/runs/alts.{target}/{target}.candidates.tsv"
     if kind == "massc4":
@@ -158,24 +180,6 @@ def command(unit, kind, target, timeout, d):
         return [sys.executable, os.path.join(HERE, "construct.py"), "--spell", f"{OUT}/runs/spell.{target}/spell", "--out",
                 f"{d}/alternatives", "--expected-reported", reported_total(target), "--expected-comparator",
                 comparator_total(target)], "diagnostic construction (truth)"
-    if unit in WITHDRAWN:
-        return None, WITHDRAWN[unit]
-    if kind == "scorepart":
-        if exit_of("gate.explicit_compare") != "0":
-            return None, "NOT RUN (condition): the explicit-sequence gate did not pass"
-        case, part = target.split(":")
-        c = CASES[case]
-        keep = PARTS[part]
-        src = f"{OUT}/runs/construct.{case}/alternatives.explicit.tsv"
-        rows = [l for l in open(src) if not l.startswith("#") and l.strip() and l.split("\t")[0] in keep]
-        open(f"{d}/alternatives.part{part}.explicit.tsv", "w").write("".join(rows))
-        labels = [l.split("\t")[0] for l in rows]
-        pairs = [f"reported,{x}" for x in labels if x.startswith("realloc_")]
-        pairs += [f"reported,{x}" for x in ("truth", "saved_2+2", "truthblock_in_reported_a") if x in labels]
-        if "reportedblock_in_truth_a" in labels:
-            pairs.append("truth,reportedblock_in_truth_a")
-        return scorer(c, case, d, ["--explicit", f"{d}/alternatives.part{part}.explicit.tsv", "--decompose", ";".join(pairs),
-                                   "--decompose-block", c["target_block"]]), f"explicit allocation alternatives, part {part}"
     if kind == "score":
         if exit_of("gate.explicit_compare") != "0":
             return None, "NOT RUN (condition): the explicit-sequence gate did not pass"
