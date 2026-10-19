@@ -297,3 +297,15 @@ placement sets do not exist yet, and this is the main implementation cost.
 - Signature counts in non-simple intervals are upper bounds.
 - There is no pedigree metadata in the panel.
 - One reference per type: the sensitivity arm changed the SNV site count by 6 of 270.
+
+## Qualifications appended at M6-F (2026-10-20; Sol's review; the record above is not rewritten)
+
+M6-E's measurements are accepted, with four qualifications.
+
+1. **Within-copy linkage supports testing a linked model, but does not show κ is needed.** Within-copy site linkage supports
+   testing a linked sequence model. It does **not** establish that cross-copy coupling κ is necessary.
+2. **The copy-count frequencies are descriptive.** They are not a fitted, pedigree-adjusted structural prior.
+3. **Two pieces remain unspecified for production:** the escape distribution, and the coupling to the existing block-level
+   copying prior.
+4. **The exhaustive-enumeration runtime is not a lower bound.** Exhaustive enumeration is expensive, but its estimated
+   runtime is not a lower bound for other inference methods.
