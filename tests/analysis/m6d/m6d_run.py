@@ -26,7 +26,10 @@ RUNS = [("F2a_missing_variants_invisible_allocation", 23), ("F2b_missing_variant
 TIMEOUT = {"F2a_missing_variants_invisible_allocation": 50}             # 600-bp unit (M6-C: 20.6 s); others 30 s (M6-C <= 11 s)
 MANIFEST_G = [("gates", "gates", "-", 60)]
 MANIFEST_R = [(f"run.{f}.{s}", "run", f"{f}:{s}", TIMEOUT.get(f, 30)) for f, s in RUNS] + [("summary", "summary", "-", 30)]
-MANIFESTS = {"G": MANIFEST_G, "R": MANIFEST_R}
+# Amendment 1 (declared after `gates` failed, 4.3 s spent): numerics only (compensated sums; explicit posterior normalisation and
+# centred log q in the KL identity, executable and summary); tolerances unchanged. gates.a1, then the frozen runs and summary.
+MANIFEST_A1 = [("gates.a1", "gates", "-", 60)] + MANIFEST_R
+MANIFESTS = {"G": MANIFEST_G, "R": MANIFEST_R, "A1": MANIFEST_A1}
 INPUTS = []
 
 
@@ -86,8 +89,8 @@ def command(kind, target, d):
     raise ValueError(kind)
 
 
-def exit_of_gates():
-    return next((r["exit"] for r in ledger_rows() if r["unit"] == "gates"), None)
+def exit_of_gates():   # the latest recorded gates unit (Amendment 1: gates.a1 supersedes the failed gates)
+    return next((r["exit"] for r in reversed(ledger_rows()) if r["unit"] in ("gates", "gates.a1")), None)
 
 
 def run_unit(unit):

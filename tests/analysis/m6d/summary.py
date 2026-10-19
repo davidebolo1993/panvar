@@ -59,12 +59,16 @@ for d in sorted(glob.glob(f"{runs}/run.*")):
         for pr in PRIORS:
             lp = [float(r[PRIOR_COL[pr]]) for r in rows]
             terms = [a + b for a, b in zip(lp, ll)]
-            m = lse(terms)
-            q = [math.exp(t - m) for t in terms]
+            # Amendment 1: explicit normalisation and centred log q (not through the rounding of log m)
+            top = max(terms)
+            w = [math.exp(t - top) for t in terms]
+            W = math.fsum(w)
+            m = top + math.log(W)
+            q = [wi / W for wi in w]
             el = math.fsum(qi * li for qi, li in zip(q, ll))
-            kl = math.fsum(qi * (t - m - p) for qi, t, p in zip(q, terms, lp) if qi > 0)
+            kl = math.fsum(qi * ((t - top) - math.log(W) - p) for qi, t, p in zip(q, terms, lp) if qi > 0)
             alt_mean = sum(qi * int(r["alt_count"]) for qi, r in zip(q, rows))
-            mass = sum(math.exp(p) for p in lp)
+            mass = math.fsum(math.exp(p) for p in lp)
             res[(lab, pr)] = dict(m=m, el=el, kl=kl, alt=alt_mean, states=len(rows), base=exe[(lab, pr)]["base_allele"])
             checks.append((fx, seed, lab, pr, "C1_recompute", m - float(exe[(lab, pr)]["log_marginal"]), 1e-6))
             checks.append((fx, seed, lab, pr, "C3_kl_identity", m - (el - kl), 1e-9))

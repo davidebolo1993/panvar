@@ -234,27 +234,52 @@ struct Marginal {
     double top_state_posterior = 0, effective_states = 0;
 };
 
+// Amendment 1: Neumaier-compensated summation (long double is 64-bit on this arm64 build, so it adds no precision).
+struct Sum {
+    long double s = 0, c = 0;
+    void add(long double x) {
+        const long double t = s + x;
+        c += std::fabs(s) >= std::fabs(x) ? (s - t) + x : (x - t) + s;
+        s = t;
+    }
+    long double value() const { return s + c; }
+};
+
+// Amendment 1: the posterior is normalised explicitly (q = w / sum w, w = exp(term - max)) and log q is formed in the
+// centred form (term - max) - log sum w, so the identity is not evaluated through the rounding of log m itself.
 Marginal marginalise(const std::vector<double>& logl, const std::vector<long double>& lp) {
     Marginal m;
     std::vector<long double> terms(logl.size());
     std::size_t best = 0;
+    Sum mass;
     for (std::size_t t = 0; t < logl.size(); ++t) {
-        m.prior_mass += std::exp(lp[t]);
+        mass.add(std::exp(lp[t]));
         terms[t] = lp[t] + logl[t];
         if (terms[t] > terms[best]) best = t;
     }
-    m.log_marginal = logsumexp(terms);
-    long double h = 0;
+    m.prior_mass = mass.value();
+    const long double top = terms[best];
+    std::vector<long double> w(logl.size(), 0);
+    Sum ws;
     for (std::size_t t = 0; t < logl.size(); ++t) {
-        if (!std::isfinite(static_cast<double>(terms[t]))) continue;
-        const long double q = std::exp(terms[t] - m.log_marginal);
-        m.posterior_mean_log_likelihood += q * logl[t];
-        m.kl += q * (terms[t] - m.log_marginal - lp[t]);   // q log(q / prior), with log q = lp + logL - log m
-        h += q * q;
+        if (std::isfinite(static_cast<double>(terms[t]))) w[t] = std::exp(terms[t] - top);
+        ws.add(w[t]);
     }
+    const long double W = ws.value(), logW = std::log(W);
+    m.log_marginal = top + logW;
+    Sum el, kl, h;
+    for (std::size_t t = 0; t < logl.size(); ++t) {
+        if (w[t] == 0) continue;
+        const long double q = w[t] / W, logq = (terms[t] - top) - logW;
+        el.add(q * logl[t]);
+        kl.add(q * (logq - lp[t]));   // q log(q / prior)
+        h.add(q * q);
+    }
+    m.posterior_mean_log_likelihood = el.value();
+    m.kl = kl.value();
     m.identity_residual = m.log_marginal - (m.posterior_mean_log_likelihood - m.kl);
-    m.top_state_posterior = static_cast<double>(std::exp(terms[best] - m.log_marginal));
-    m.effective_states = static_cast<double>(1.0L / h);
+    m.top_state_posterior = static_cast<double>(w[best] / W);
+    m.effective_states = static_cast<double>(1.0L / h.value());
     return m;
 }
 
@@ -312,14 +337,14 @@ int gates() {
         for (int base = 0; base <= 1; ++base)
             for (const Scaffold& g : catalogue(base, base)) {
                 const int bits = 2 * (g.nA + g.nB);
-                long double mo = 0, mc = 0;
+                Sum mo, mc;   // Amendment 1: compensated
                 for (std::size_t t = 0; t < (std::size_t(1) << bits); ++t) {
                     std::vector<std::array<int, 2>> al = g.base;
                     for (int b = 0; b < bits; ++b) if ((t >> b) & 1u) al[b / 2][b % 2] ^= 1;
-                    mo += std::exp(log_prior_original(al, g, kNuisanceFlip));
-                    mc += std::exp(log_prior_common(al, kQ));
+                    mo.add(std::exp(log_prior_original(al, g, kNuisanceFlip)));
+                    mc.add(std::exp(log_prior_common(al, kQ)));
                 }
-                worst = std::max({worst, std::fabs(static_cast<double>(mo) - 1.0), std::fabs(static_cast<double>(mc) - 1.0)});
+                worst = std::max({worst, std::fabs(static_cast<double>(mo.value()) - 1.0), std::fabs(static_cast<double>(mc.value()) - 1.0)});
             }
         row("HA_normalisation", "max |sum P(theta|G) - 1| over 9 allocations x 2 base annotations x 2 priors", worst, "<= 1e-15", worst <= 1e-15);
     }
@@ -362,8 +387,9 @@ int gates() {
             std::vector<double> ll(T.unique_diplotypes, 0);
             for (std::size_t t = 0; t < T.states; ++t) { mass[T.slot[t]] += std::exp(lp[t]); ll[T.slot[t]] = T.log_likelihood[t]; }
             std::vector<long double> lm;
-            long double tot = 0;
-            for (auto x : mass) { lm.push_back(std::log(x)); tot += x; }
+            Sum tots;
+            for (auto x : mass) { lm.push_back(std::log(x)); tots.add(x); }
+            const long double tot = tots.value();
             const Marginal mer = marginalise(ll, lm);
             // split: every label into two labels of half its mass
             std::vector<double> l2;

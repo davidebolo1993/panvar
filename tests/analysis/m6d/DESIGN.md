@@ -109,3 +109,26 @@ Ties are read from the log marginals only. Pooled-content equality is never assu
 - **Declared timeouts:** gates 60 s; F2a 50 s; F2b and each F4 run 30 s; summary 30 s.
 - **Admission rule:** gates and runs are admitted only if spent + timeout + 30 s (summary reserve) ≤ 300.
 - Runs execute only after the gates pass. Builds are not counted. Failed units stay recorded.
+
+## Amendment 1 (declared after `gates` failed; 4.3 s spent)
+
+**What failed.** `gates` exited 1. Every gate passed except two.
+- **HA:** max |Σ P(θ | G) − 1| = 2.15e-14 against 1e-15. The 1,024 prior masses were summed naively. `long double` is
+  64-bit on this arm64 build (M6-C's "long double" accumulation adds no precision), so the error is ordinary
+  double-summation rounding.
+- **HG** (2+1, base alt): identity residuals of 1.37e-9 (original) and −2.32e-9 (common-content) against 1e-9.
+  - The posterior was formed as q = exp(term − log m). log m carries its own rounding of about ulp(|log m|)/2 ≈ 2e-13
+    at |log m| ≈ 3,000, so Σq ≠ 1 by that amount.
+  - The identity's evaluation then carries |log m|·(1 − Σq), about 1e-9.
+  - `summary.py`'s frozen C3 uses the same form and would fail in the same way at |log m| ≈ 4,500.
+
+**Fix: numerics only, tolerances unchanged.**
+- Compensated (Neumaier) summation for prior masses, the posterior weights, E_q log L, the KL and Σq².
+- The posterior is normalised explicitly: q = w / Σw, with w = exp(term − max).
+- log q is formed in the centred form (term − max) − log Σw.
+- `summary.py`: the same centred form with `math.fsum` (C3), and the prior mass via `math.fsum` (C0).
+
+The model, priors, gates, tolerances, fixtures, runs and classification are unchanged.
+
+**Units.** Manifest A1: `gates.a1` (60 s), then manifest R's frozen runs and summary, unchanged. `gates` stays recorded as
+failed.
