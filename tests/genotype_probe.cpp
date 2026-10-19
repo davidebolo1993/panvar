@@ -5338,6 +5338,95 @@ int score_set(const Args& args) {
 }
 
 // ------------------------------------------------------------------------------------------------
+// block-sequences: every allele at the named blocks, and (diagnostic only) the truth donor's block bytes
+// ------------------------------------------------------------------------------------------------
+
+// A structural error at a repeat block is described by lengths in the evaluator (98,186 + 32,714 called
+// against 65,452 + 65,449 true), and lengths alone do not say how many repeat units each haplotype carries
+// or whether total dosage or its allocation between homologues is wrong. This writes the bytes those
+// counts are taken from: each allele of each named block with the panel templates that carry it, and,
+// when --truth-gfa is given, the donor's two truth haplotypes projected onto the same blocks. Nothing is
+// scored and no caller reads this output; truth enters only this diagnostic evaluator.
+int block_sequences(const Args& args) {
+    const std::string out = args.required("out");
+    const std::string reference = args.required("reference");
+    struct StagedGraphs {
+        std::string prefix;
+        ~StagedGraphs() {
+            std::error_code ignored;
+            std::filesystem::remove(prefix + ".model.sorted.gfa", ignored);
+            std::filesystem::remove(prefix + ".truth.sorted.gfa", ignored);
+        }
+    } staged_graphs{out};
+    const std::string curation = args.get("panel-curation", "");
+    const LoadedModel loaded =
+        load_model(args.required("model-gfa"), reference, out + ".model.sorted.gfa", 50,
+                   curation.empty() ? std::vector<std::string>{} : read_panel_curation(curation));
+    const panvar::PreparedGenotypeModel& model = *loaded.model;
+    const panvar::PanelAlleleMatrix& panel = model.panel();
+    std::vector<std::size_t> wanted;
+    {
+        std::stringstream ids(args.required("blocks"));
+        for (std::string id; std::getline(ids, id, ',');) {
+            std::size_t b = model.blocks().size();
+            for (std::size_t i = 0; i < model.blocks().size(); ++i) {
+                if (model.blocks()[i].block_id == id) b = i;
+            }
+            if (b == model.blocks().size()) throw std::runtime_error("no block " + id);
+            wanted.push_back(b);
+        }
+    }
+    std::ostringstream table;
+    table << "block_id\tsource\tindex\tname\tbp\ttemplates\n";
+    for (const std::size_t b : wanted) {
+        const std::string& id = model.blocks()[b].block_id;
+        std::ostringstream fasta;
+        for (std::size_t a = 0; a < model.blocks()[b].alleles.size(); ++a) {
+            std::string carriers;
+            std::size_t count = 0;
+            for (std::size_t t = 0; t < panel.template_count(); ++t) {
+                if (panel.template_alleles[t][b] != a) continue;
+                carriers += (count++ ? "," : "") + panel.template_names[t];
+            }
+            const std::string& bases = model.blocks()[b].alleles[a].sequence;
+            fasta << ">allele_" << a << '\n' << bases << '\n';
+            table << id << "\tpanel\t" << a << "\tallele_" << a << '\t' << bases.size() << '\t'
+                  << (count ? carriers : std::string("-")) << '\n';
+        }
+        atomic_write(out + "." + id + ".alleles.fa", fasta.str());
+    }
+    if (!args.get("truth-gfa", "").empty()) {
+        const SortedGraph truth_graph = load_truth_in_model_frame(
+            args.required("truth-gfa"), reference, loaded.sorted, out + ".truth.sorted.gfa");
+        std::size_t k = 0;
+        std::vector<std::ostringstream> fasta(wanted.size());
+        for (const panvar::PathRecord* path : donor_paths(truth_graph.graph, args.required("donor"))) {
+            ++k;
+            const auto projection = panvar::project_path_onto_locus(truth_graph.graph, loaded.bubbles,
+                                                                    loaded.built.report, path->name);
+            if (!projection.has_value()) throw std::runtime_error("truth does not span the block chain");
+            for (std::size_t w = 0; w < wanted.size(); ++w) {
+                const std::size_t b = wanted[w];
+                if (!projection->blocks[b].has_value()) {
+                    table << model.blocks()[b].block_id << "\ttruth\t" << k << '\t' << path->name << "\tNA\t-\n";
+                    continue;
+                }
+                fasta[w] << ">truth" << k << ' ' << path->name << '\n' << *projection->blocks[b] << '\n';
+                table << model.blocks()[b].block_id << "\ttruth\t" << k << '\t' << path->name << '\t'
+                      << projection->blocks[b]->size() << "\t-\n";
+            }
+        }
+        for (std::size_t w = 0; w < wanted.size(); ++w) {
+            atomic_write(out + "." + model.blocks()[wanted[w]].block_id + ".truth.fa", fasta[w].str());
+        }
+    }
+    atomic_write(out + ".block_sequences.tsv", table.str());
+    std::cout << "block-sequences: model fingerprint " << loaded.fingerprint << ", " << wanted.size()
+              << " block(s) written\n";
+    return 0;
+}
+
+// ------------------------------------------------------------------------------------------------
 // form-census: how much placement work is spent re-scanning read sequence that already occurred
 // ------------------------------------------------------------------------------------------------
 
@@ -6336,7 +6425,7 @@ int library_estimate(const Args& args) {
 int main(int argc, char** argv) {
     try {
         if (argc < 2) {
-            std::cerr << "usage: genotype_probe simulate|loo-gfa|evaluate|compare|genotype|trace|anchors|subsample|preflight|respell|coverage-audit|form-census|mosaic-truth|orientations|panel-alleles|tied-consensus|score-set|repair-search --key value ...\n";
+            std::cerr << "usage: genotype_probe simulate|loo-gfa|evaluate|compare|genotype|trace|anchors|subsample|preflight|respell|coverage-audit|form-census|mosaic-truth|orientations|panel-alleles|tied-consensus|score-set|block-sequences|repair-search --key value ...\n";
             return 2;
         }
         const std::string command = argv[1];
@@ -6361,6 +6450,7 @@ int main(int argc, char** argv) {
         if (command == "tied-consensus") return tied_consensus(args);
         if (command == "repair-pilot") return repair_pilot(args);
         if (command == "score-set") return score_set(args);
+        if (command == "block-sequences") return block_sequences(args);
         if (command == "repair-search") return repair_search(args);
         if (command == "window-bench") return window_bench(args);
         if (command == "tie-branch") return tie_branch(args);
