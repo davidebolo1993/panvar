@@ -78,3 +78,15 @@ failed.
 **Expectation for the original rows.** In the A1 run, the original G9 rows still appear, unchanged. Their CONTROL row
 still reads FAIL, because the original fixture cannot exercise it. It is kept, not edited. The A1 run therefore exits 1
 on that row only. A1 is judged on its `A1:` rows plus every other row.
+
+### Amendment 1 correction (appended after `gates.m4a.a1`; the declaration above is not edited)
+
+**The declaration did not match the code.** The code that ran returns from G9 after the three `A1:` rows. The original
+G9 rows were therefore **not** emitted in the A1 run, and `gates.m4a.a1` exited 0, not 1 as the declaration predicted.
+
+**Where the original rows live.** They remain in the recorded output of `gates.m4a` (`runs/gates.m4a/run.log`):
+- frame_cores 0, PASS;
+- CONTROL callable_cores 0, FAIL;
+- CONTROL panel_mean 0.5, PASS.
+
+**What changed in substance.** Nothing: no contract gate changed, and every non-G9 row is identical in both runs.
