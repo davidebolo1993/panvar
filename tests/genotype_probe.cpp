@@ -21,6 +21,7 @@
 #include "panvar/genotype_locus.hpp"
 #include "panvar/genotype_model.hpp"
 #include "panvar/genotype_repair.hpp"
+#include "panvar/genotype_joint_search.hpp"
 #include "panvar/gfa.hpp"
 #include "panvar/gfa_io.hpp"
 #include "panvar/graph_sort.hpp"
@@ -7066,6 +7067,33 @@ int two_block_lik(const Args& args) {
     return 0;
 }
 
+// joint-bounds (M3-D): model-only eligibility for the joint-block experiment -- single-block alternatives and catalogue
+// candidates under the frozen rule (top 4; bounds 2,048 / 2,048). No read is touched.
+int joint_bounds(const Args& args) {
+    const std::string out = args.required("out");
+    struct Staged {
+        std::string prefix;
+        ~Staged() {
+            std::error_code ignored;
+            std::filesystem::remove(prefix + ".model.sorted.gfa", ignored);
+        }
+    } staged{out};
+    const std::string curation = args.get("panel-curation", "");
+    const LoadedModel loaded = load_model(args.required("model-gfa"), args.required("reference"), out + ".model.sorted.gfa", 50,
+                                          curation.empty() ? std::vector<std::string>{} : read_panel_curation(curation));
+    const panvar::PreparedGenotypeModel& model = *loaded.model;
+    const panvar::JointSearchBounds b = panvar::joint_search_bounds(model, panvar::JointSearchOptions{});
+    std::size_t max_alleles = 0;
+    for (const auto& block : model.blocks()) max_alleles = std::max(max_alleles, block.alleles.size());
+    std::ostringstream t;
+    t << "key\tvalue\nmodel_fingerprint\t" << loaded.fingerprint << "\nblocks\t" << model.blocks().size() << "\ntemplates\t"
+      << model.panel().template_count() << "\nmax_alleles_per_block\t" << max_alleles << "\nsingle_alternatives\t" << b.single_alternatives
+      << "\nsingle_limit\t2048\ncatalogue_raw\t" << b.catalogue_raw << "\ncatalogue_limit\t2048\neligible\t" << (b.within ? "true" : "false") << '\n';
+    atomic_write(out + ".joint_bounds.tsv", t.str());
+    std::cout << t.str();
+    return 0;
+}
+
 int block_sequences(const Args& args) {
     const std::string out = args.required("out");
     const std::string reference = args.required("reference");
@@ -8201,7 +8229,7 @@ int library_estimate(const Args& args) {
 int main(int argc, char** argv) {
     try {
         if (argc < 2) {
-            std::cerr << "usage: genotype_probe simulate|loo-gfa|evaluate|compare|genotype|trace|anchors|subsample|preflight|respell|coverage-audit|form-census|mosaic-truth|orientations|panel-alleles|tied-consensus|score-set|block-sequences|prior-pool|two-block-catalogue|two-block-eval|two-block-lik|two-block-lik-gate|mass-reconcile|spell|edit-distances|repair-search --key value ...\n";
+            std::cerr << "usage: genotype_probe simulate|loo-gfa|evaluate|compare|genotype|trace|anchors|subsample|preflight|respell|coverage-audit|form-census|mosaic-truth|orientations|panel-alleles|tied-consensus|score-set|block-sequences|prior-pool|two-block-catalogue|two-block-eval|two-block-lik|two-block-lik-gate|joint-bounds|mass-reconcile|spell|edit-distances|repair-search --key value ...\n";
             return 2;
         }
         const std::string command = argv[1];
@@ -8232,6 +8260,7 @@ int main(int argc, char** argv) {
         if (command == "two-block-eval") return two_block_eval(args);
         if (command == "two-block-lik") return two_block_lik(args);
         if (command == "two-block-lik-gate") return two_block_lik_gate(args);
+        if (command == "joint-bounds") return joint_bounds(args);
         if (command == "mass-reconcile") return mass_reconcile(args);
         if (command == "spell") return spell(args);
         if (command == "edit-distances") return edit_distances(args);

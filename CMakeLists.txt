@@ -152,6 +152,7 @@ add_library(panvarlib
     src/genotype_command.cpp
     src/prepared_locus_file.cpp
     src/genotype_repair.cpp
+    src/genotype_joint_search.cpp
     src/genotype_dosage.cpp
     src/genotype_dosage_repair.cpp
     src/genotype_dosage_shadow.cpp
@@ -276,6 +277,14 @@ if(PANVAR_BUILD_TESTING)
         target_link_libraries(genotype_mosaic_core_test PRIVATE panvarlib)
         target_compile_options(genotype_mosaic_core_test PRIVATE -Wall -Wextra -Wpedantic)
         add_test(NAME panvar_genotype_mosaic_core COMMAND genotype_mosaic_core_test)
+        add_executable(genotype_joint_search_test tests/genotype_joint_search.cpp)
+        target_link_libraries(genotype_joint_search_test PRIVATE panvarlib)
+        target_compile_options(genotype_joint_search_test PRIVATE -Wall -Wextra -Wpedantic)
+        add_test(NAME panvar_genotype_joint_search COMMAND genotype_joint_search_test)
+        add_executable(genotype_joint_search_e2e_test tests/genotype_joint_search_e2e.cpp src/cli_utils.cpp)
+        target_link_libraries(genotype_joint_search_e2e_test PRIVATE panvarlib)
+        target_compile_options(genotype_joint_search_e2e_test PRIVATE -Wall -Wextra -Wpedantic)
+        add_test(NAME panvar_genotype_joint_search_e2e COMMAND genotype_joint_search_e2e_test)
         # M3-A diagnostic (not a ctest): copying-prior representation tests reusing the mosaic-core oracles
         add_executable(m3a_prior_representation tests/m3a_prior_representation.cpp)
         target_link_libraries(m3a_prior_representation PRIVATE panvarlib)

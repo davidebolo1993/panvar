@@ -264,6 +264,13 @@ struct GenotypeCommandOptions {
     // two or more distinct new haplotypes. Cache budget, caps, request order and arithmetic unchanged; later rounds, tie
     // branches and legs keep the existing policy.
     std::string repair_round1_origin_admission = "existing";
+    // M3-D (EXPERIMENTAL, profile key repair_joint_search off|experimental_v1; default off): after a uniquely resolved,
+    // converged refinement trunk, ONE bounded likelihood-guided joint-block pass (genotype_joint_search.hpp) in the
+    // refinement's own context; its catalogue joins the candidate pool, and an improving move resumes ordinary single-block
+    // refinement for the remaining declared rounds (never another joint pass). A bounded heuristic neighbourhood, not an
+    // exhaustive search or an optimality certificate. Not supported with the library sensitivity audit, diagnostic tie
+    // branching, the refinement replay or diagnostic_union_only (refused before any output).
+    std::string repair_joint_search = "off";
     // I2-B (EXPERIMENTAL, profile keys only, never public settings): how the adaptive search's window enumeration builds
     // its placement rows. "reference" (the default) scans each enumerated window whole, unchanged. "fine_experimental"
     // builds the same rows from a round-local, per-worker fine store (PreparedScoringContext::
@@ -311,6 +318,9 @@ struct GenotypeCommandOptions {
     // path after this many committed repair rounds that moved, so the interruption contract -- partial
     // rounds kept, no final output, TIME_LIMIT -- is testable deterministically. 0: never.
     std::size_t test_interrupt_after_repair_rounds = 0;
+    // M3-D TEST HOOK (API only, never a profile key): when non-zero, replaces the joint pass's frozen single-alternative
+    // bound (2,048), so a gate can exercise the model-derived skip on a small locus. 0: the frozen bound.
+    std::size_t test_joint_search_single_limit = 0;
 
     // ---- DIAGNOSTIC ONLY (v2/post-hoc): improving-move-tie branching. Not a command-line option, off by
     // default, and never part of a call. When on, a run that stops on an improving-move tie first writes

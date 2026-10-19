@@ -21,6 +21,7 @@
 #include "panvar/integrated_snarls.hpp"
 #include "panvar/ls_hmm.hpp"
 #include "panvar/marker_model.hpp"
+#include "panvar/genotype_joint_search.hpp"
 #include "panvar/mosaic_beam.hpp"
 #include "panvar/mosaic_spelling.hpp"
 #include "panvar/output.hpp"
@@ -165,6 +166,19 @@ std::optional<std::string> union_fragment_blocks_refusal(const GenotypeCommandOp
         !o.diagnostic_union_verification_census.empty()) {
         return p + "is not supported with union diagnostics that need the full mass matrix";
     }
+    return std::nullopt;
+}
+// M3-D: the joint-search experiment's contract (checked before an API run touches its prefix).
+std::optional<std::string> joint_search_refusal(const GenotypeCommandOptions& o) {
+    if (o.repair_joint_search == "off") return std::nullopt;
+    const std::string p = "repair_joint_search experimental_v1 ";
+    if (o.repair_rounds == 0) return p + "needs the adaptive repair (repair rounds > 0)";
+    if (o.library_path == "auto" && o.library_sensitivity_audit) {
+        return p + "is not supported with the library sensitivity audit (set library_sensitivity_audit 0 or --library FILE)";
+    }
+    if (o.diagnostic_tie_branching) return p + "is not supported with diagnostic tie branching";
+    if (!o.diagnostic_refinement_replay.empty()) return p + "is not supported with the refinement replay";
+    if (o.diagnostic_union_only) return p + "is not supported with diagnostic_union_only";
     return std::nullopt;
 }
 // S2-H: the refinement diagnostics' contract (also checked before an API run touches its prefix).
@@ -863,6 +877,17 @@ struct RepairReport {
     std::uint64_t pool_branch_scored = 0;
     std::uint64_t tie_digest_memo_hits = 0, tie_digest_memo_misses = 0;
     double seconds_tie_branching = 0.0;
+    // M3-D (EXPERIMENTAL): the joint-block pass and its single continuation leg ("off" when the option is off).
+    std::string joint_search_status = "off";
+    JointSearchResult joint;
+    bool joint_continued = false;
+    std::size_t joint_leg_first_round = 0, joint_leg_rounds = 0, joint_leg_moves = 0;
+    std::string joint_leg_stop = "none";
+    bool joint_leg_converged = false;
+    std::uint64_t pool_joint_scored = 0, pool_joint_leg_scored = 0;
+    std::uint64_t joint_physical_origins = 0, joint_state_classes = 0, joint_leg_physical_origins = 0;
+    std::uint64_t joint_footprint_peak = 0;
+    double seconds_joint_search = 0.0, seconds_joint_leg = 0.0;
     // Branch seeds: materialised just in time (production) or eagerly at their tie (a gate hook). The work is
     // inside the cumulative counters and caps; these isolate it.
     std::uint64_t tie_seeds_materialised = 0;
@@ -986,6 +1011,37 @@ void write_repair_report(std::ostream& out, const RepairReport& r) {
             << "\nadaptive_fine_ledger_scope\tcontainers_only_not_process_memory\n";
     }
     out << "call_class\t" << r.call_class << "\nno_call_reason\t" << r.no_call_reason << '\n';
+    if (o.repair_joint_search != "off") {   // M3-D (EXPERIMENTAL): recorded only when the experiment is on
+        const JointSearchResult& j = r.joint;
+        out << "repair_joint_search\t" << o.repair_joint_search << "\njoint_search_scope\tbounded_heuristic_neighbourhood_not_exhaustive"
+            << "\njoint_search_status\t" << r.joint_search_status << "\njoint_search_decision\t" << j.decision
+            << "\njoint_search_top\t4\njoint_search_single_limit\t2048\njoint_search_catalogue_limit\t2048"
+            << "\njoint_search_single_alternatives\t" << j.bounds.single_alternatives << "\njoint_search_catalogue_raw\t"
+            << j.bounds.catalogue_raw << "\njoint_search_bounds_within\t" << (j.bounds.within ? "true" : "false")
+            << "\njoint_search_singles_scored\t" << j.singles_scored << "\njoint_search_promoted\t" << j.promoted
+            << "\njoint_search_joint_requests\t" << j.joint_requests << "\njoint_search_catalogue_unique\t" << j.catalogue.size()
+            << "\njoint_search_winner_set_size\t" << j.winner_set_size << "\njoint_search_incumbent_in_top_set\t"
+            << (j.incumbent_in_top_set ? "true" : "false") << "\njoint_search_certified_gap\t" << j.certified_gap
+            << "\njoint_search_moved\t" << (j.moved ? "true" : "false") << "\njoint_search_move\t"
+            << (j.moved ? j.catalogue[j.winner].move : std::string("none")) << "\njoint_search_incumbent_total\t"
+            << hex_double(j.incumbent_total) << "\njoint_search_winner_total\t"
+            << (j.moved ? hex_double(j.catalogue[j.winner].score.log_likelihood + j.catalogue[j.winner].prior) : std::string("NA"))
+            << "\njoint_search_origins_reused\t" << j.origins_reused << "\njoint_search_origins_recomputed\t" << j.origins_recomputed
+            << "\njoint_search_dp_executions\t" << j.dp_executions << "\njoint_search_window_bases\t" << j.window_bases
+            << "\njoint_search_full_placements\t" << j.full_placements << "\njoint_search_census_bytes_peak\t" << j.census_bytes_peak
+            << "\njoint_search_transient_bytes_peak\t" << j.transient_bytes_peak << "\njoint_search_transient_bytes_after\t"
+            << j.transient_bytes_after << "\njoint_search_slots_created\t" << j.slots_created << "\njoint_search_live_transient_after\t"
+            << j.live_transient_after << "\njoint_search_physical_origins\t" << r.joint_physical_origins
+            << "\njoint_search_state_classes\t" << r.joint_state_classes << "\njoint_search_footprint_peak\t" << r.joint_footprint_peak
+            << "\npool_joint_scored\t" << r.pool_joint_scored << "\njoint_continued\t" << (r.joint_continued ? "true" : "false")
+            << "\njoint_leg_first_round\t" << r.joint_leg_first_round << "\njoint_leg_rounds\t" << r.joint_leg_rounds
+            << "\njoint_leg_moves\t" << r.joint_leg_moves << "\njoint_leg_stop\t" << r.joint_leg_stop << "\njoint_leg_converged\t"
+            << (r.joint_leg_converged ? "true" : "false") << "\npool_joint_leg_scored\t" << r.pool_joint_leg_scored
+            << "\njoint_leg_physical_origins\t" << r.joint_leg_physical_origins << "\nseconds_joint_search\t" << r.seconds_joint_search
+            << "\nseconds_joint_search_singles\t" << j.seconds_singles << "\nseconds_joint_search_promotion\t" << j.seconds_promotion
+            << "\nseconds_joint_search_joint\t" << j.seconds_joint << "\nseconds_joint_search_scoring\t" << j.seconds_scoring
+            << "\nseconds_joint_search_priors\t" << j.seconds_priors << "\nseconds_joint_leg\t" << r.seconds_joint_leg << '\n';
+    }
     out << "search_conditional\t" << r.search_conditional << "\nrepair_tie_branching\t"
         << (o.repair_tie_branching ? "true" : "false") << "\nrepair_tie_max_branches\t" << o.repair_tie_max_branches
         << "\nrepair_tie_seed_cache_bytes\t" << o.repair_tie_seed_cache_bytes
@@ -1167,7 +1223,7 @@ void write_status(
                                 "dosage_census_backend", "adaptive_emission_handoff", "output_schema", "early_incumbent",
                                 "test_interrupt_point", "diagnostic_union_evidence_dump", "diagnostic_union_kernel_dump",
                                 "union_progressive_schedule", "union_fragment_blocks", "diagnostic_refinement_memory",
-                                "diagnostic_refinement_replay", "repair_round1_origin_admission"}) {
+                                "diagnostic_refinement_replay", "repair_round1_origin_admission", "repair_joint_search"}) {
             const auto source = options.setting_sources.find(key);
             if (source == options.setting_sources.end()) continue;
             const std::string k = key;
@@ -1197,6 +1253,7 @@ void write_status(
                                       : k == "diagnostic_refinement_memory" ? std::string(options.diagnostic_refinement_memory ? "1" : "0")
                                       : k == "diagnostic_refinement_replay" ? options.diagnostic_refinement_replay
                                       : k == "repair_round1_origin_admission" ? options.repair_round1_origin_admission
+                                      : k == "repair_joint_search" ? options.repair_joint_search
                                       : k == "gap_recursion_backend"
                                           ? std::string(gap_recursion_backend_name(options.gap_recursion_fixed_geometry))
                                                                          : std::to_string(options.adaptive_fine_max_served_placements);
@@ -2006,6 +2063,12 @@ void apply_genotype_setting(const std::string& context, const std::string& key, 
         }
         options.union_progressive_schedule = value;
     }
+    else if (key == "repair_joint_search") {   // M3-D (EXPERIMENTAL)
+        if (value != "off" && value != "experimental_v1") {
+            throw std::runtime_error(context + ": 'repair_joint_search' is off or experimental_v1: " + value);
+        }
+        options.repair_joint_search = value;
+    }
     else if (key == "repair_round1_origin_admission") {   // S2-J (EXPERIMENTAL)
         if (value != "existing" && value != "reuse_only_experimental") {
             throw std::runtime_error(context + ": 'repair_round1_origin_admission' is existing or reuse_only_experimental: " + value);
@@ -2710,6 +2773,9 @@ GenotypeRunStatus run_genotype_body(const GenotypeCommandOptions& options, Genot
         throw std::invalid_argument(*refused);
     }
     if (const std::optional<std::string> refused = refinement_diagnostic_refusal(options)) {   // S2-H: before the prefix
+        throw std::invalid_argument(*refused);
+    }
+    if (const std::optional<std::string> refused = joint_search_refusal(options)) {   // M3-D: before the prefix
         throw std::invalid_argument(*refused);
     }
     {
@@ -4889,12 +4955,183 @@ GenotypeRunStatus run_genotype_body(const GenotypeCommandOptions& options, Genot
                                  refusal,
                              nullptr, nullptr);
         }
-        // Every stop that returned normally leaves its whole trajectory under the final name.
+        // Every stop that returned normally leaves its whole trajectory under the final name. M3-D: a joint continuation
+        // leg's rounds follow the trunk's, numbered on from it (its header line dropped).
+        std::string joint_leg_rounds_text;
         const auto write_trajectory = [&]() {
-            atomic_write(prefix + ".repair_rounds.tsv", search->render_rounds(search->rounds()));
+            atomic_write(prefix + ".repair_rounds.tsv", search->render_rounds(search->rounds()) + joint_leg_rounds_text);
             if (search->memory_on()) atomic_write(prefix + ".repair_memory.tsv", search->memory_text());
             for (const char* suffix : kPartialOutputs) std::remove((prefix + suffix).c_str());
         };
+
+        // ---- 3a. M3-D (EXPERIMENTAL, repair_joint_search experimental_v1): ONE bounded joint-block pass after a uniquely
+        // resolved, converged trunk, in the refinement's own context (never a second live context; caps cumulative and
+        // unchanged). Its complete catalogue joins the pool; an improving move resumes ordinary single-block refinement for
+        // the remaining declared rounds (no second joint pass). Unresolved or tied trunks, a missing delta context and the
+        // model-derived bounds skip it, recorded by name; a cap crossed inside it keeps the existing incomplete contract.
+        if (options.repair_joint_search == "experimental_v1") {
+            const Clock::time_point joint_mark = Clock::now();
+            PreparedScoringContext* shared = search->context();
+            JointSearchOptions joint_options;
+            joint_options.switch_probability = options.switch_probability;
+            joint_options.request_order_seed = search_options.request_order_seed;   // gate hook only (0 in production)
+            if (options.test_joint_search_single_limit != 0) joint_options.single_limit = options.test_joint_search_single_limit;
+            report.joint.bounds = joint_search_bounds(model, joint_options);
+            const bool last_unique = !search->rounds().empty() && search->rounds().back().unique_best;
+            const auto note_incumbent = [&](const std::vector<std::size_t>& a, const std::vector<std::size_t>& b,
+                                            const DiplotypeScore& score, double prior, const char* stage) {
+                if (!g_incumbent.enabled) return;   // S2-A: a fully evaluated candidate replaces the incumbent only if better
+                ++g_incumbent.evaluated;
+                if (score.log_likelihood + prior > g_incumbent.total) {
+                    g_incumbent.have = true;
+                    g_incumbent.first = a;
+                    g_incumbent.second = b;
+                    g_incumbent.score = score;
+                    g_incumbent.sequence_prior = prior;
+                    g_incumbent.total = score.log_likelihood + prior;
+                    g_incumbent.stage = stage;
+                    g_incumbent.tied_groups = g_incumbent.projection_ambiguous = g_incumbent.explored_labellings = "NA";
+                    g_incumbent.dirty = true;
+                }
+            };
+            if (!reproduced) {
+                report.joint_search_status = "skipped_trunk_not_reproduced";
+            } else if (!report.converged) {
+                report.joint_search_status = "skipped_trunk_unresolved_" + report.stop_reason;
+            } else if (!last_unique) {
+                report.joint_search_status = "skipped_trunk_tied_at_incumbent";
+            } else if (shared == nullptr || search_options.mode != RepairScoringMode::Delta) {
+                report.joint_search_status = "skipped_no_delta_context";
+            } else if (!report.joint.bounds.within) {
+                report.joint_search_status = "skipped_bounds";
+                report.joint.status = "skipped_bounds";
+                report.joint.decision = "skipped";
+            } else {
+                write_running_status("joint search");
+                const FragmentScoringCounters before = shared->cumulative_counters();
+                try {
+                    report.joint = run_joint_block_search(
+                        *shared, model, search->incumbent_first(), search->incumbent_second(), search->incumbent_slot_first(),
+                        search->incumbent_slot_second(), search->incumbent_total(), fragments.size(), repair_scoring.mismatch_band,
+                        joint_options,
+                        [&](const JointCandidate& c, const std::string& sa, const std::string& sb) {
+                            ++report.pool_joint_scored;
+                            pool_scored(c.first, c.second, sa, sb, c.score, c.prior, "joint", "joint_pass", nullptr, 0);
+                            note_incumbent(c.first, c.second, c.score, c.prior, "joint_pool_best");
+                        },
+                        {});
+                } catch (const ResourceExhausted& error) {
+                    refusal = error.what();
+                }
+                report.joint_physical_origins = shared->cumulative_counters().physical_origins - before.physical_origins;
+                report.joint_state_classes = shared->cumulative_counters().statistical_state_classes - before.statistical_state_classes;
+                report.joint_footprint_peak = physical_footprint().peak;
+                if (!refusal.empty()) {
+                    report.joint_search_status = "refused_cumulative_cap";
+                    report.no_call_reason = "cumulative_cap";
+                    provisional("cumulative_cap", "the joint-block pass stopped at a declared cumulative cap (" + refusal +
+                                                      "); the last committed incumbent, exactly scored; search incomplete");
+                    return stop_with(GenotypeRunStatus::RescoreIncomplete,
+                                     "the joint-block pass stopped at a declared cumulative cap and returned no genotype: " + refusal,
+                                     nullptr, nullptr);
+                }
+                report.joint_search_status = report.joint.status + "_" + report.joint.decision;
+                if (report.joint.moved) {
+                    const JointCandidate& w = report.joint.catalogue[report.joint.winner];
+                    const std::size_t first_round = search->rounds().back().index + 1;
+                    report.joint_leg_first_round = first_round;
+                    report.moves += 1;   // the joint move itself
+                    report.final_incumbent_score = w.score.log_likelihood + w.prior;
+                    report.final_incumbent_hap1 = join_alleles(w.first);
+                    report.final_incumbent_hap2 = join_alleles(w.second);
+                    if (first_round > options.repair_rounds) {
+                        // No declared round remains to confirm the moved incumbent: it is not a converged optimum.
+                        report.joint_leg_stop = "no_rounds_remaining";
+                        report.stop_reason = "round_cap";
+                        report.converged = false;
+                    } else {
+                        const Clock::time_point leg_mark = Clock::now();
+                        RepairSearchOptions leg_options = search_options;
+                        leg_options.external_context = true;
+                        leg_options.memory_log = false;
+                        leg_options.memory_live_path.clear();
+                        leg_options.round1_reuse_only_admission = false;
+                        leg_options.first_round = first_round;
+                        leg_options.max_rounds = options.repair_rounds + 1 - first_round;
+                        CoordinateRepairSearch leg(model, emissions, fragments, library, repair_scoring, leg_options);
+                        leg.attach_context(shared);
+                        leg.start_from_slots(w.first, w.second, w.score.log_likelihood + w.prior, w.slot_first, w.slot_second);
+                        leg.add_visited(anchor_diplotype.first.alleles, anchor_diplotype.second.alleles);
+                        for (const RepairRound& round : search->rounds()) {
+                            if (round.moved) leg.add_visited(round.first, round.second);
+                        }
+                        RepairHooks leg_hooks;
+                        leg_hooks.on_scored = [&](const std::vector<std::size_t>& a, const std::vector<std::size_t>& b,
+                                                  const std::string& sa, const std::string& sb, const DiplotypeScore& score,
+                                                  double prior) {
+                            ++report.pool_joint_leg_scored;
+                            pool_scored(a, b, sa, sb, score, prior, "joint_leg",
+                                        "round" + std::to_string(first_round + leg.rounds().size()), nullptr, 0);
+                            note_incumbent(a, b, score, prior, "joint_leg_pool_best");
+                        };
+                        leg_hooks.on_round = [&](const RepairRound& round) {
+                            write_running_status("joint continuation round " + std::to_string(round.index) + " committed");
+                        };
+                        const FragmentScoringCounters leg_before = shared->cumulative_counters();
+                        bool leg_reproduced = false;
+                        try {
+                            leg_reproduced = leg.run(leg_hooks);
+                        } catch (const ResourceExhausted& error) {
+                            refusal = error.what();
+                        }
+                        report.joint_continued = true;
+                        report.joint_leg_physical_origins = shared->cumulative_counters().physical_origins - leg_before.physical_origins;
+                        report.joint_leg_rounds = leg.rounds().size();
+                        for (const RepairRound& round : leg.rounds()) report.joint_leg_moves += round.moved ? 1 : 0;
+                        {
+                            const std::string text = leg.render_rounds(leg.rounds());
+                            const std::size_t newline = text.find('\n');
+                            joint_leg_rounds_text = newline == std::string::npos ? std::string() : text.substr(newline + 1);
+                        }
+                        report.joint_footprint_peak = physical_footprint().peak;
+                        report.seconds_joint_leg = seconds_since(leg_mark);
+                        if (!refusal.empty()) {
+                            report.joint_search_status += "_leg_refused_cumulative_cap";
+                            report.no_call_reason = "cumulative_cap";
+                            provisional("cumulative_cap", "the joint continuation stopped at a declared cumulative cap (" + refusal +
+                                                              "); the last committed incumbent, exactly scored; search incomplete");
+                            return stop_with(GenotypeRunStatus::RescoreIncomplete,
+                                             "the joint continuation stopped at a declared cumulative cap and returned no genotype: " +
+                                                 refusal,
+                                             nullptr, nullptr);
+                        }
+                        if (!leg_reproduced) {
+                            report.no_call_reason = "joint_leg_start_not_reproduced";
+                            write_trajectory();
+                            return stop_with(GenotypeRunStatus::RepairIncomplete,
+                                             "the joint continuation's start did not reproduce its score; no genotype", nullptr,
+                                             nullptr);
+                        }
+                        report.joint_leg_stop = leg.stop_reason();
+                        report.joint_leg_converged = leg.converged();
+                        report.stop_reason = leg.stop_reason();
+                        report.converged = leg.converged();
+                        report.rounds_run += leg.rounds().size();
+                        report.moves += report.joint_leg_moves;
+                        report.final_incumbent_score = leg.incumbent_total();
+                        report.final_incumbent_hap1 = join_alleles(leg.incumbent_first());
+                        report.final_incumbent_hap2 = join_alleles(leg.incumbent_second());
+                        shared->release_transient({});
+                    }
+                }
+            }
+            report.seconds_joint_search = seconds_since(joint_mark);
+            if (shared != nullptr) {   // the run's cumulative counters include the pass and its leg
+                report.cumulative = shared->cumulative_counters();
+                report.origin_cache_bytes_end = shared->origin_cache_bytes();
+                report.full_placements = shared->full_placement_count();
+            }
+        }
 
         // ---- 3b. v2: an improving-move tie is branched and pooled, before the run is claimed (the watchdog
         // still bounds it). Branches share the production search's scoring context and its warm origin and
@@ -4910,7 +5147,9 @@ GenotypeRunStatus run_genotype_body(const GenotypeCommandOptions& options, Genot
         // branch built by block delta at its tie, survives as a gate hook.)
         // Each branch has its own visited set, ranking state and candidates; everything any branch scores
         // joins the pool, and the pooled rule below decides -- never the order branches ran in.
-        const bool improving_tie = reproduced && !report.converged &&
+        // M3-D: tie branching is rooted at the trunk search, so it never runs after a joint continuation; a continuation that
+        // ends in an improving tie fails closed below (improving_move_tie), never choosing a tied sequence.
+        const bool improving_tie = reproduced && !report.converged && !report.joint_continued &&
                                    (report.stop_reason == "rescore_incomplete" || report.stop_reason == "tie_at_best");
         std::string tie_ties_text, tie_branches_text;
         std::string tie_incomplete;
@@ -7740,6 +7979,7 @@ std::optional<int> parse_genotype_arguments(const std::vector<std::string>& args
     if (const std::optional<std::string> refused = early_incumbent_refusal(options)) throw std::runtime_error(*refused);
     if (const std::optional<std::string> refused = union_fragment_blocks_refusal(options)) throw std::runtime_error(*refused);
     if (const std::optional<std::string> refused = refinement_diagnostic_refusal(options)) throw std::runtime_error(*refused);
+    if (const std::optional<std::string> refused = joint_search_refusal(options)) throw std::runtime_error(*refused);
     if (profiled) {
         // Every setting a flag gave beside the profile, with the value it took.
         for (const std::string& flag : args) {
