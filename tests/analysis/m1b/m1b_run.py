@@ -53,7 +53,11 @@ MANIFEST_A1 = [("alts.c4_10", "alts", "c4_10", 20), ("score.c4_10", "score", "c4
                ("alts.c4_30", "alts", "c4_30", 20), ("score.c4_30", "score", "c4_30", 180),
                ("alts.cyp_5", "alts", "cyp_5", 20), ("score.cyp_5", "score", "cyp_5", 60),
                ("alts.cyp_30", "alts", "cyp_30", 20), ("score.cyp_30", "score", "cyp_30", 120)]
-MANIFESTS = {"B": MANIFEST_B, "A1": MANIFEST_A1}
+# Amendment 2 (declared before further execution; Amendment 1 complete): read-visible content of each declared alternative at
+# the target block against truth (content.py: pooled = allocation-blind, per_hap = allocation-aware k-mer discrepancy,
+# k = 31 and 151), to separate a content-driven competition from an arrangement-driven one. Diagnostic evaluator only.
+MANIFEST_A2 = [(f"content.{c}", "content", c, 30) for c in ("c4_10", "c4_30", "cyp_5", "cyp_30")]
+MANIFESTS = {"B": MANIFEST_B, "A1": MANIFEST_A1, "A2": MANIFEST_A2}
 
 
 def ledger_rows():
@@ -176,6 +180,11 @@ def command(unit, kind, target, timeout, d):
                 *curation_args(c), "--candidates", alts + ".candidates.tsv", "--library", c["library"],
                 "--reads1", c["reads1"], "--reads2", c["reads2"], "--threads", "4", "--truth-gfa", c["truth_graph"],
                 "--decompose", pair, "--decompose-block", c["target_block"]], f"isolated reference scorer ({reads})"
+    if kind == "content":
+        locus = "c4" if target.startswith("c4") else "cyp"
+        return [sys.executable, os.path.join(HERE, "content.py"), "--sequences", f"{OUT}/runs/seq.{locus}/seq", "--block",
+                c["target_block"], "--candidates", f"{OUT}/runs/alts.{target}/{target}.candidates.tsv", "--out",
+                f"{d}/{target}"], "diagnostic evaluator (truth content)"
     raise ValueError(kind)
 
 
