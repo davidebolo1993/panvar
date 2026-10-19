@@ -86,3 +86,14 @@ unit the budget refuses is recorded as NOT RUN.
 
 **Change.** A fixture run is admitted only if spent + its timeout + 30 s ≤ 600. Refused runs are recorded NOT RUN. The
 summary rule is unchanged, and so is everything else.
+
+## Amendment 3 (declared after `summary` failed; 533.3 s spent)
+
+**What failed.** `summary` exited 1. A structural posterior underflowed to 0.0, and the tie test took `math.log` of it.
+
+**Fix.** Ties (within 1e-6) are now decided on the log marginals directly. The classification thresholds and attribution
+rules are unchanged.
+
+**Dry run.** The fixed script was run once on the recorded outputs (to the scratchpad, not counted as a unit).
+
+**Units.** Manifest A3, `summary.a3` (30 s). `summary` stays recorded as failed.

@@ -29,7 +29,9 @@ MANIFEST_R = [(f"run.{f}.{s}", "run", f"{f}:{s}", 60) for f in FIXTURES for s in
 # exhaust the budget before the last fixtures; the remaining runs go seed-major (every fixture at seed 11, then 23, then 37).
 # Same units, timeouts and seeds; only the order changes. The completed unit stays recorded.
 MANIFEST_A1 = [(f"run.{f}.{s}", "run", f"{f}:{s}", 60) for s in SEEDS for f in FIXTURES if (f, s) != ("F1_control_2+2", 11)] + [("summary", "summary", "-", 30)]
-MANIFESTS = {"G": MANIFEST_G, "R": MANIFEST_R, "A1": MANIFEST_A1}
+# Amendment 3: summary failed on log(0) for an underflowed posterior; ties now decided on log marginals; summary.a3
+MANIFEST_A3 = [("summary.a3", "summary", "-", 30)]
+MANIFESTS = {"G": MANIFEST_G, "R": MANIFEST_R, "A1": MANIFEST_A1, "A3": MANIFEST_A3}
 INPUTS = []
 
 

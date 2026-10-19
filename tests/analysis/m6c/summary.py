@@ -31,9 +31,10 @@ KV = lambda p: {l.split("\t")[0]: l.rstrip("\n").split("\t")[1] for l in open(p)
 led = {r["unit"]: r for r in T(ledger)}
 
 
-def classify(post, truth):
-    top = max(post, key=post.get)
-    tied = [k for k in post if abs(math.log(post[k]) - math.log(post[top])) <= 1e-6] if post[top] > 0 else [top]
+def classify(post, truth, logs):
+    # Amendment 3: ties are decided on the log marginals (a posterior can underflow to 0; log(0) failed)
+    top = max(logs, key=logs.get)
+    tied = [k for k in logs if abs(logs[k] - logs[top]) <= 1e-6]
     if post.get(truth, 0) >= 0.95:
         return "CORRECT", tied
     if truth in tied and len(tied) > 1:
@@ -61,8 +62,8 @@ for d in sorted(glob.glob(f"{runs}/run.*")):
     marg = {r["scaffold"]: float(r["log_marginal"]) for r in rows}
     fixd = {r["scaffold"]: float(r["log_fixed"]) for r in rows}
     pm, pf = posterior(marg), posterior(fixd)
-    cm, tm = classify(pm, truth)
-    cf, tf = classify(pf, truth)
+    cm, tm = classify(pm, truth, marg)
+    cf, tf = classify(pf, truth, fixd)
     order = sorted(rows, key=lambda r: -float(r["log_marginal"]))
     w, ru = order[0], order[1]
     dF = float(w["best_state_fragment"]) - float(ru["best_state_fragment"])
