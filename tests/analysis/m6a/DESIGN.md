@@ -110,3 +110,16 @@ No gate assumes every structural difference is visible to 31-mers; G3 asserts th
   - freeze 30 s; block-sequences 60 s; units 60 s; score-set 120 s; summary 30 s.
 - Builds are not counted.
 - Not done: no simulation, campaign, ACOT, merge or push.
+
+## Amendment 1 (declared after `summary` failed and before any further unit; 45.7 s spent)
+
+**What failed.** `summary` exited 1 on a parsing defect. Its arguments are `cell:block`, and block ids contain ":"
+(`sv:7`), so `spec.split(":")` returned three parts.
+
+**Fix.** `spec.split(":", 1)`. No verdict rule changes, and nothing else in the script changes. Every count, structure
+and fragment unit had already completed under the frozen rules.
+
+**Dry run.** The fixed script was run once on the recorded outputs (to the scratchpad, not counted as a unit) before the
+re-run.
+
+**Units.** Manifest A1, `summary.a1` (30 s). `summary` stays recorded as failed.

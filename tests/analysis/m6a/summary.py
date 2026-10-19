@@ -27,7 +27,7 @@ out = ["cell\tdepth\tcandidates\tgroups\tbest_group_size\tbest_structure\talloca
        "caller_units\tcaller_structure\tcaller_group_rank\tcaller_loss_minus_best\tverdict_vs_caller\tcountfit_seconds\tcountfit_peak_footprint_gib"]
 detail = ["cell\tlabel\tunits\tstructure\tcount_group\tloss_minus_best\tfragment\texposure\tprior\ttotal\ttotal_minus_caller\tblock_excess"]
 for spec in specs:
-    cell, block = spec.split(":")
+    cell, block = spec.split(":", 1)   # Amendment 1: block ids contain ":" (sv:7)
     s = KV(f"{runs}/countfit.{cell}/cf.summary.tsv")
     cands = T(f"{runs}/countfit.{cell}/cf.candidates.tsv")
     units = {r["name"]: r["unit_copies"] for r in T(f"{runs}/units.{cell}/units.tsv")}

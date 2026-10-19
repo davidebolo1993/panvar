@@ -41,7 +41,9 @@ MANIFEST_G = [("gate.count_fit", "exe", "count_fit_gates", 60)]
 MANIFEST_C = [(f"countfit.{c}", "countfit", c, TO[c]) for c in ORDER] + [("freeze", "freeze", "-", 30)]
 MANIFEST_E = ([(f"blockseq.{c}", "blockseq", c, 60) for c in ORDER] + [(f"units.{c}", "units", c, 60) for c in ORDER] +
               [(f"fragscore.{c}", "fragscore", c, 120) for c in ORDER] + [("summary", "summary", "-", 30)])
-MANIFESTS = {"G": MANIFEST_G, "C": MANIFEST_C, "E": MANIFEST_E}
+# Amendment 1: summary failed on a parsing defect (block ids contain ":"); re-run as summary.a1
+MANIFEST_A1 = [("summary.a1", "summary", "-", 30)]
+MANIFESTS = {"G": MANIFEST_G, "C": MANIFEST_C, "E": MANIFEST_E, "A1": MANIFEST_A1}
 INPUTS = list(csv.DictReader(open(os.path.join(HERE, "INPUTS.tsv")), delimiter="\t"))
 
 
