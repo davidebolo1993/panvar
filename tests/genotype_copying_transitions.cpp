@@ -190,8 +190,10 @@ void g4_shared_affix() {
     const auto t = transitions(in), tm = transitions(moved), tc = transitions(carved);
     row("G4_shared_affix", "moved_into_invariant:distances_equal", static_cast<double>(tm.distance_bp == t.distance_bp), "1", tm.distance_bp == t.distance_bp);
     same_priors("G4_shared_affix", "moved_into_invariant", m, t.r, mm, tm.r);
-    row("G4_shared_affix", "carved_mono_block:distances_compose", tc.distance_bp[0] + tc.distance_bp[1] - t.distance_bp[0], "0",
-        tc.distance_bp[1] == t.distance_bp[0] - tc.distance_bp[0] && tc.distance_bp[2] == t.distance_bp[1]);
+    // Amendment 1: the carved neutral block precedes b0, so the ORIGINAL blocks' distances are unchanged (the M4-B freeze
+    // asserted tc[1] == t[0] - tc[0], a test defect); the neutral state's own boundary does not enter any prior
+    row("G4_shared_affix", "A1:carved_mono_block:original_distances_unchanged", (tc.distance_bp[1] - t.distance_bp[0]) + (tc.distance_bp[2] - t.distance_bp[1]),
+        "0", tc.distance_bp[1] == t.distance_bp[0] && tc.distance_bp[2] == t.distance_bp[1]);
     same_priors("G4_shared_affix", "carved_mono_block", m, t.r, mc, tc.r);
 }
 

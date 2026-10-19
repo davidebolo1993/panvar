@@ -133,3 +133,18 @@ Neither class is read as better or worse.
   profiles 6 GiB / 900 s. These guards are not the envelope.
 - A unit is refused when the time spent plus its declared timeout exceeds the budget.
 - Builds are not counted, as in earlier batches. Inputs are hashed in INPUTS.tsv.
+
+## Amendment 1 (declared after `gate.lib` and before any further unit; 0.5 s spent)
+
+**What failed.** `gate.lib` exited 1 on one row, `G4_shared_affix carved_mono_block:distances_compose`, which printed
+1.5 against an expected 0. Every other row passed, including the same case's sequence-level prior comparison
+(`carved_mono_block:max_abs_prior_difference`, ≤ 1e-12).
+
+**Cause: an assertion defect.** The carved neutral block precedes b0. The correct property is that the original blocks'
+distances are unchanged: tc[1] = t[0] and tc[2] = t[1]. The assertion instead required tc[1] = t[0] − tc[0]. The neutral
+state's own boundary enters no prior.
+
+**Fix.** The assertion is corrected as row `A1:carved_mono_block:original_distances_unchanged`. Nothing else changes in
+the test or the library.
+
+**Units.** Manifest A1, `gate.lib.a1` (60 s). `gate.lib` stays recorded as failed.
