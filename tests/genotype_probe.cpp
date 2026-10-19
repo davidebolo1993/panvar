@@ -6574,6 +6574,431 @@ int two_block_eval(const Args& args) {
     return 0;
 }
 
+// ------------------------------------------------------------------------------------------------
+// M3-C: likelihood-guided shortlisting with incremental scoring (diagnostic)
+// ------------------------------------------------------------------------------------------------
+// Both commands use ONLY the existing PreparedScoringContext machinery: add_haplotypes (incumbents, with censuses),
+// add_repaired_haplotype (the coordinate repair's block replacement; stage-5 reference path, the default), the same call
+// with retain_census = true to promote a kept single (fills the existing slot's census and materialises it, as the repair
+// promotes its winner), and score_candidates. No likelihood is reimplemented and no scoring mathematics changes.
+
+namespace m3c {
+struct Lib {
+    static panvar::LibraryModel toy() {
+        panvar::LibraryModel lib;
+        lib.insert_mean_bp = 300;
+        lib.insert_sd_bp = 30;
+        lib.support_sigmas = 4;
+        lib.substitution_error = 0.002;
+        lib.outlier_weight = 0.001;
+        lib.fragment_start_intensity = 0.15;
+        lib.provenance = "declared: M3-C gate fixture";
+        return lib;
+    }
+};
+std::string rnd(std::uint64_t& s, std::size_t n) {
+    std::string out;
+    for (std::size_t i = 0; i < n; ++i) {
+        s = s * 6364136223846793005ULL + 1442695040888963407ULL;
+        out += "ACGT"[(s >> 33) % 4];
+    }
+    return out;
+}
+std::string revcomp(const std::string& x) {
+    std::string r(x.rbegin(), x.rend());
+    for (char& c : r) c = c == 'A' ? 'T' : c == 'C' ? 'G' : c == 'G' ? 'C' : 'A';
+    return r;
+}
+std::vector<panvar::ReadPair> reads_from(const std::vector<std::string>& haps, std::uint64_t seed, std::size_t per_hap) {
+    std::vector<panvar::ReadPair> out;
+    std::uint64_t s = seed;
+    const auto next = [&]() { s = s * 6364136223846793005ULL + 1442695040888963407ULL; return s >> 17; };
+    for (std::size_t h = 0; h < haps.size(); ++h) {
+        for (std::size_t k = 0; k < per_hap; ++k) {
+            const std::size_t ins = 270 + next() % 61;
+            const std::size_t start = next() % (haps[h].size() - ins);
+            panvar::ReadPair p;
+            const std::string id = "f" + std::to_string(h) + "_" + std::to_string(k);
+            p.first = {id + "/1", haps[h].substr(start, 100), std::string(100, 'I')};
+            p.second = {id + "/2", revcomp(haps[h].substr(start + ins - 100, 100)), std::string(100, 'I')};
+            out.push_back(p);
+        }
+    }
+    return out;
+}
+}  // namespace m3c
+
+// Gate: tiny fixtures, incremental two-step replacement vs cold scoring of the complete joint sequence. Frozen tolerance:
+// |fragment| and |exposure| differences <= 1e-9 (absolute); the joint slot must be the slot the context assigns to the
+// cold joint bytes (byte identity through the context's own byte-confirmed dedupe); both edit orders must give one slot.
+int two_block_lik_gate(const Args& args) {
+    const std::string out = args.required("out");
+    std::uint64_t seed = 31337;
+    const std::string base = m3c::rnd(seed, 8000), other = m3c::rnd(seed, 7600);
+    struct Case {
+        std::string name;
+        std::size_t b0, e0, b1, e1;   // two blocks on the incumbent, b0 < b1, non-overlapping
+        int len0, len1;               // replacement length change
+    };
+    const std::vector<Case> cases{
+        {"distant_equal_length", 1000, 1100, 5000, 5150, 0, 0},
+        {"adjacent_equal_length", 1000, 1100, 1100, 1250, 0, 0},
+        {"overlapping_windows", 1000, 1100, 1250, 1350, 0, 0},
+        {"distant_length_change", 1000, 1100, 5000, 5150, 37, -23},
+        {"adjacent_length_change", 1000, 1100, 1100, 1250, -41, 29},
+        {"overlapping_windows_length_change", 2000, 2120, 2260, 2300, 55, -30},
+    };
+    std::ostringstream rep;
+    rep << std::setprecision(17) << "case\torder\thomologue\tslot_equal_cold_bytes\torders_same_slot\tfragment_diff\texposure_diff\tfull_placements_delta_path\tpass\n";
+    std::size_t failed = 0;
+    for (const Case& c : cases) {
+        std::uint64_t rs = 777 + c.b0 + c.b1;
+        const std::string r0 = m3c::rnd(rs, static_cast<std::size_t>(static_cast<long>(c.e0 - c.b0) + c.len0));
+        const std::string r1 = m3c::rnd(rs, static_cast<std::size_t>(static_cast<long>(c.e1 - c.b1) + c.len1));
+        const std::string joint = base.substr(0, c.b0) + r0 + base.substr(c.e0, c.b1 - c.e0) + r1 + base.substr(c.e1);
+        const auto fragments = m3c::reads_from({joint, other}, 4242 + c.b1, 900);
+        panvar::FragmentScoringOptions opt;
+        opt.threads = 4;
+        opt.mismatch_band = 6;
+        for (int homologue = 0; homologue < 2; ++homologue) {
+            // reference: cold placement of the complete joint sequence in a fresh context
+            panvar::PreparedScoringContext cold(fragments, m3c::Lib::toy(), opt);
+            const auto cs = cold.add_haplotypes({joint, other});
+            const panvar::FragmentScoringResult cr = cold.score_candidates({homologue == 0 ? panvar::HaplotypeCandidate{cs[0], cs[1]} : panvar::HaplotypeCandidate{cs[1], cs[0]}});
+            for (int order = 0; order < 2; ++order) {
+                panvar::PreparedScoringContext ctx(fragments, m3c::Lib::toy(), opt);
+                const auto slots = ctx.add_haplotypes({base, other}, nullptr, false, true);
+                const std::uint64_t placed_before = ctx.full_placement_count();
+                std::size_t mid = 0, fin = 0, fin_other_order = 0;
+                if (order == 0) {   // earlier block first; the later block's coordinates shift by the first change
+                    mid = ctx.add_repaired_haplotype(slots[0], c.b0, c.e0, r0, nullptr, true);
+                    const long shift = static_cast<long>(r0.size()) - static_cast<long>(c.e0 - c.b0);
+                    fin = ctx.add_repaired_haplotype(mid, static_cast<std::size_t>(static_cast<long>(c.b1) + shift),
+                                                     static_cast<std::size_t>(static_cast<long>(c.e1) + shift), r1);
+                    const std::size_t mid2 = ctx.add_repaired_haplotype(slots[0], c.b1, c.e1, r1, nullptr, true);
+                    fin_other_order = ctx.add_repaired_haplotype(mid2, c.b0, c.e0, r0);
+                } else {            // later block first; the earlier block's coordinates do not move
+                    mid = ctx.add_repaired_haplotype(slots[0], c.b1, c.e1, r1, nullptr, true);
+                    fin = ctx.add_repaired_haplotype(mid, c.b0, c.e0, r0);
+                    const std::size_t mid2 = ctx.add_repaired_haplotype(slots[0], c.b0, c.e0, r0, nullptr, true);
+                    const long shift = static_cast<long>(r0.size()) - static_cast<long>(c.e0 - c.b0);
+                    fin_other_order = ctx.add_repaired_haplotype(mid2, static_cast<std::size_t>(static_cast<long>(c.b1) + shift),
+                                                                 static_cast<std::size_t>(static_cast<long>(c.e1) + shift), r1);
+                }
+                const std::uint64_t placed_delta = ctx.full_placement_count() - placed_before;
+                const panvar::FragmentScoringResult ir = ctx.score_candidates({homologue == 0 ? panvar::HaplotypeCandidate{fin, slots[1]} : panvar::HaplotypeCandidate{slots[1], fin}});
+                const std::size_t cold_slot = ctx.add_haplotypes({joint})[0];   // byte identity through the context's dedupe
+                const double df = std::fabs(ir.scores[0].fragment_term - cr.scores[0].fragment_term);
+                const double de = std::fabs(ir.scores[0].exposure_term - cr.scores[0].exposure_term);
+                const bool pass = cold_slot == fin && fin == fin_other_order && df <= 1e-9 && de <= 1e-9 && placed_delta == 0;
+                failed += pass ? 0 : 1;
+                rep << c.name << '\t' << (order == 0 ? "earlier_first" : "later_first") << '\t' << homologue << '\t' << (cold_slot == fin) << '\t'
+                    << (fin == fin_other_order) << '\t' << df << '\t' << de << '\t' << placed_delta << '\t' << (pass ? "PASS" : "FAIL") << '\n';
+            }
+        }
+    }
+    rep << "gate\t-\t-\t-\t-\t-\t-\t-\t" << (failed ? "FAIL" : "PASS") << '\n';
+    atomic_write(out + ".gate.tsv", rep.str());
+    std::cout << rep.str();
+    return failed ? 6 : 0;
+}
+
+// The run: every single-block alternative (other homologue fixed) scored by delta from the incumbent and ranked by
+// fragment + exposure (no prior); the top --top (4) per block and homologue are promoted (census by delta) and every
+// same-homologue two-block combination is scored by a second delta from the promoted single at the earlier block (the
+// later block's coordinates shifted by the first replacement's length change). Final totals add the sequence-level pair
+// prior at r = 0.01. TRUTH-FREE. Bounds: --single-limit and --limit (2,048 each), checked before any delta is scored.
+int two_block_lik(const Args& args) {
+    const std::string out = args.required("out");
+    const std::string run = args.required("run");
+    const std::size_t top = std::stoul(args.get("top", "4"));
+    const std::size_t single_limit = std::stoul(args.get("single-limit", "2048"));
+    const std::size_t limit = std::stoul(args.get("limit", "2048"));
+    const auto t0 = std::chrono::steady_clock::now();
+    const auto since = [](std::chrono::steady_clock::time_point m) { return std::chrono::duration<double>(std::chrono::steady_clock::now() - m).count(); };
+    struct Staged {
+        std::string prefix;
+        ~Staged() {
+            std::error_code ignored;
+            std::filesystem::remove(prefix + ".model.sorted.gfa", ignored);
+        }
+    } staged{out};
+    const std::string curation = args.get("panel-curation", "");
+    const LoadedModel loaded = load_model(args.required("model-gfa"), args.required("reference"), out + ".model.sorted.gfa", 50,
+                                          curation.empty() ? std::vector<std::string>{} : read_panel_curation(curation));
+    const panvar::PreparedGenotypeModel& model = *loaded.model;
+    const auto status = read_key_values(run + ".mosaic_status.tsv");
+    if (status.at("model_fingerprint") != loaded.fingerprint) throw std::runtime_error("the run was not scored on the rebuilt model");
+    const std::size_t blocks = model.blocks().size();
+    std::vector<std::size_t> inc[2];
+    double inc_saved = 0.0;
+    for (const auto& row : read_table(run + ".equivalence_set.tsv")) {
+        if (row.at("rank") == "1" && row.at("representative") == "true") {
+            inc[0] = parse_alleles(row.at("hap1_alleles"));
+            inc[1] = parse_alleles(row.at("hap2_alleles"));
+            inc_saved = std::stod(row.at("score"));
+        }
+    }
+    if (inc[0].size() != blocks || inc[1].size() != blocks) throw std::runtime_error("no rank-1 representative incumbent");
+    std::size_t singles_total = 0, catalogue_total = 0;
+    std::vector<std::size_t> kcount(blocks);
+    for (std::size_t b = 0; b < blocks; ++b) {
+        singles_total += 2 * (model.blocks()[b].alleles.size() - 1);
+        kcount[b] = std::min(top, model.blocks()[b].alleles.size() - 1);
+    }
+    for (int h = 0; h < 2; ++h) {
+        for (std::size_t b = 0; b < blocks; ++b) catalogue_total += kcount[b];
+        for (std::size_t b = 0; b < blocks; ++b) for (std::size_t c = b + 1; c < blocks; ++c) catalogue_total += kcount[b] * kcount[c];
+    }
+    std::ostringstream pre;
+    pre << std::setprecision(17) << "key\tvalue\nblocks\t" << blocks << "\ntop\t" << top << "\nsingle_limit\t" << single_limit << "\nlimit\t" << limit
+        << "\nsingle_block_alternatives\t" << singles_total << "\nraw_catalogue_candidates\t" << catalogue_total << '\n';
+    if (singles_total > single_limit || catalogue_total > limit) {
+        pre << "decision\tSTOP: a preflight bound is exceeded; nothing scored\n";
+        atomic_write(out + ".preflight.tsv", pre.str());
+        std::cout << pre.str();
+        return 5;
+    }
+    const panvar::LibraryModel library = read_library_file(args.required("library"));
+    const std::vector<panvar::ReadPair> fragments = read_pairs(args.required("reads1"), args.required("reads2"));
+    panvar::FragmentScoringOptions scoring;
+    scoring.threads = std::stoul(args.get("threads", "4"));
+    scoring.mismatch_band = std::stoul(status.at("mismatch_band"));
+    scoring.minimum_piece_bp = 12;
+    scoring.max_piece_hits = std::stoull(status.at("max_piece_hits"));
+    scoring.max_proposed_starts_per_haplotype = std::stoull(status.at("max_proposed_starts_per_haplotype"));
+    scoring.max_physical_origins = std::stoull(status.at("max_physical_origins"));
+    scoring.max_state_classes = std::stoull(status.at("max_state_classes"));
+    scoring.max_mass_cells = std::stoull(status.at("max_mass_cells"));
+    scoring.emission_cache_bytes = static_cast<std::size_t>(std::stoull(status.at("emission_cache_bytes")));
+    const std::vector<double> switches(blocks - 1, std::stod(status.at("switch_probability")));
+    // incumbents (one full placement each, census retained)
+    const auto prep_mark = std::chrono::steady_clock::now();
+    const panvar::HaplotypeSequence s0 = panvar::spell_mosaic(model, panvar::MosaicPath{inc[0]});
+    const panvar::HaplotypeSequence s1 = panvar::spell_mosaic(model, panvar::MosaicPath{inc[1]});
+    panvar::PreparedScoringContext ctx(fragments, library, scoring);
+    const std::vector<std::size_t> islot = ctx.add_haplotypes({s0.bases, s1.bases}, nullptr, false, true);
+    const panvar::HaplotypeSequence* spelled[2] = {&s0, &s1};
+    std::map<std::vector<std::size_t>, double> hprior;
+    const auto haploid_prior = [&](const std::vector<std::size_t>& p) {
+        const auto f = hprior.find(p);
+        if (f != hprior.end()) return f->second;
+        return hprior.emplace(p, panvar::log_haploid_sequence_prior(model, panvar::spell_mosaic(model, panvar::MosaicPath{p}).bases, switches)).first->second;
+    };
+    std::map<std::vector<std::size_t>, std::string> bytes_cache;
+    const auto pair_prior = [&](const std::vector<std::size_t>& a, const std::vector<std::size_t>& b) {
+        // sequence-level: log 2 decided on bytes
+        const std::string& x = bytes_cache.count(a) ? bytes_cache[a] : (bytes_cache[a] = panvar::spell_mosaic(model, panvar::MosaicPath{a}).bases);
+        const std::string& y = bytes_cache.count(b) ? bytes_cache[b] : (bytes_cache[b] = panvar::spell_mosaic(model, panvar::MosaicPath{b}).bases);
+        const double pa = haploid_prior(a), pb = haploid_prior(b);
+        if (!std::isfinite(pa) || !std::isfinite(pb)) return -std::numeric_limits<double>::infinity();
+        return pa + pb + (x != y ? std::log(2.0) : 0.0);
+    };
+    const panvar::FragmentScoringResult ir = ctx.score_candidates({{islot[0], islot[1]}});
+    const double inc_total = ir.scores[0].log_likelihood + pair_prior(inc[0], inc[1]);
+    const double seconds_prep = since(prep_mark);
+    pre << "incumbent_saved_total\t" << inc_saved << "\nincumbent_recomputed_total\t" << inc_total << "\nincumbent_abs_diff\t" << std::fabs(inc_total - inc_saved) << '\n';
+    if (!(std::fabs(inc_total - inc_saved) <= 1e-6)) {
+        pre << "decision\tREFUSED: the incumbent's saved total did not reproduce\n";
+        atomic_write(out + ".preflight.tsv", pre.str());
+        std::cout << pre.str();
+        return 4;
+    }
+    panvar::BlockDeltaWork sum_single, sum_promote, sum_joint;
+    const auto add_work = [](panvar::BlockDeltaWork& s, const panvar::BlockDeltaWork& w) {
+        s.origins_reused += w.origins_reused;
+        s.origins_recomputed += w.origins_recomputed;
+        s.local_window_bases += w.local_window_bases;
+        s.piece_hits += w.piece_hits;
+        s.dp_executions += w.dp_executions;
+        s.cache_requests += w.cache_requests;
+        s.cache_hits += w.cache_hits;
+        s.cache_misses += w.cache_misses;
+        s.full_haplotype_bytes_materialised += w.full_haplotype_bytes_materialised;
+    };
+    const std::uint64_t placements_after_incumbents = ctx.full_placement_count();
+    // ---- singles: every alternative, other homologue fixed
+    const auto single_mark = std::chrono::steady_clock::now();
+    struct Single {
+        int h;
+        std::size_t b, a, slot;
+        double fragment = 0, exposure = 0, lik = 0;
+        std::size_t rank = 0;
+    };
+    std::vector<Single> singles;
+    std::vector<panvar::HaplotypeCandidate> sc;
+    for (int h = 0; h < 2; ++h) {
+        for (std::size_t b = 0; b < blocks; ++b) {
+            const panvar::SequenceInterval iv = spelled[h]->block_intervals[b];
+            for (std::size_t a = 0; a < model.blocks()[b].alleles.size(); ++a) {
+                if (a == inc[h][b]) continue;
+                panvar::BlockDeltaWork w;
+                const std::size_t slot = ctx.add_repaired_haplotype(islot[h], iv.begin, iv.end, model.blocks()[b].alleles[a].sequence, &w);
+                add_work(sum_single, w);
+                singles.push_back({h, b, a, slot});
+                sc.push_back(h == 0 ? panvar::HaplotypeCandidate{slot, islot[1]} : panvar::HaplotypeCandidate{islot[0], slot});
+            }
+        }
+    }
+    {
+        const panvar::FragmentScoringResult r = ctx.score_candidates(sc);
+        for (std::size_t i = 0; i < singles.size(); ++i) {
+            singles[i].fragment = r.scores[i].fragment_term;
+            singles[i].exposure = r.scores[i].exposure_term;
+            singles[i].lik = r.scores[i].log_likelihood;
+        }
+    }
+    const double seconds_singles = since(single_mark);
+    // ranks per (h, b): fragment + exposure descending, ties by allele index
+    std::map<std::pair<int, std::size_t>, std::vector<std::size_t>> group;
+    for (std::size_t i = 0; i < singles.size(); ++i) group[{singles[i].h, singles[i].b}].push_back(i);
+    std::map<std::pair<int, std::size_t>, std::vector<std::size_t>> kept;   // single indices, rank order
+    for (auto& [key, idx] : group) {
+        std::sort(idx.begin(), idx.end(), [&](std::size_t x, std::size_t y) {
+            return singles[x].lik != singles[y].lik ? singles[x].lik > singles[y].lik : singles[x].a < singles[y].a;
+        });
+        for (std::size_t r = 0; r < idx.size(); ++r) {
+            singles[idx[r]].rank = r + 1;
+            if (r < top) kept[key].push_back(idx[r]);
+        }
+    }
+    // ---- promote kept singles (census by delta; materialised)
+    const auto promote_mark = std::chrono::steady_clock::now();
+    std::size_t promoted = 0;
+    for (const auto& [key, idx] : kept) {
+        const int h = key.first;
+        const std::size_t b = key.second;
+        const panvar::SequenceInterval iv = spelled[h]->block_intervals[b];
+        for (const std::size_t i : idx) {
+            panvar::BlockDeltaWork w;
+            const std::size_t slot = ctx.add_repaired_haplotype(islot[h], iv.begin, iv.end, model.blocks()[b].alleles[singles[i].a].sequence, &w, true);
+            if (slot != singles[i].slot) throw std::runtime_error("promotion did not return the scored slot");
+            add_work(sum_promote, w);
+            ++promoted;
+        }
+    }
+    const double seconds_promote = since(promote_mark);
+    const std::uint64_t placements_after_promotion = ctx.full_placement_count();
+    // ---- joint candidates: second delta from the promoted single at the earlier block
+    const auto joint_mark = std::chrono::steady_clock::now();
+    struct Cand {
+        std::vector<std::size_t> p0, p1;
+        std::size_t slot0, slot1;
+        std::vector<std::string> moves;
+    };
+    std::map<std::pair<std::size_t, std::size_t>, std::size_t> by_slots;
+    std::vector<Cand> cands;
+    const auto add_cand = [&](int h, std::vector<std::size_t> path, std::size_t slot, const std::string& move) {
+        const std::size_t a0 = h == 0 ? slot : islot[0], a1 = h == 1 ? slot : islot[1];
+        const auto key = std::minmax(a0, a1);
+        const auto f = by_slots.find(key);
+        if (f != by_slots.end()) {
+            cands[f->second].moves.push_back(move);
+            return;
+        }
+        if (key == std::minmax(islot[0], islot[1])) return;   // equal to the incumbent pair
+        by_slots[key] = cands.size();
+        cands.push_back({h == 0 ? path : inc[0], h == 1 ? path : inc[1], a0, a1, {move}});
+    };
+    const auto mv = [&](int h, std::size_t b, std::size_t from, std::size_t to, std::size_t rank) {
+        std::ostringstream m;
+        m << "h" << h << ":" << model.blocks()[b].block_id << ":" << from << ">" << to << ":r" << rank;
+        return m.str();
+    };
+    for (const auto& [key, idx] : kept) {
+        for (const std::size_t i : idx) {
+            std::vector<std::size_t> p = inc[key.first];
+            p[key.second] = singles[i].a;
+            add_cand(key.first, p, singles[i].slot, "single:" + mv(key.first, key.second, inc[key.first][key.second], singles[i].a, singles[i].rank));
+        }
+    }
+    std::size_t joint_deltas = 0;
+    for (int h = 0; h < 2; ++h) {
+        for (std::size_t b = 0; b < blocks; ++b) {
+            for (std::size_t c = b + 1; c < blocks; ++c) {
+                const auto kb = kept.find({h, b}), kc = kept.find({h, c});
+                if (kb == kept.end() || kc == kept.end()) continue;
+                const panvar::SequenceInterval ic = spelled[h]->block_intervals[c];
+                for (const std::size_t i : kb->second) {
+                    const long shift = static_cast<long>(model.blocks()[b].alleles[singles[i].a].sequence.size()) -
+                                       static_cast<long>(model.blocks()[b].alleles[inc[h][b]].sequence.size());
+                    for (const std::size_t j : kc->second) {
+                        panvar::BlockDeltaWork w;
+                        const std::size_t slot = ctx.add_repaired_haplotype(
+                            singles[i].slot, static_cast<std::size_t>(static_cast<long>(ic.begin) + shift),
+                            static_cast<std::size_t>(static_cast<long>(ic.end) + shift), model.blocks()[c].alleles[singles[j].a].sequence, &w);
+                        add_work(sum_joint, w);
+                        ++joint_deltas;
+                        std::vector<std::size_t> p = inc[h];
+                        p[b] = singles[i].a;
+                        p[c] = singles[j].a;
+                        add_cand(h, p, slot, "pair:" + mv(h, b, inc[h][b], singles[i].a, singles[i].rank) + "+" +
+                                                 mv(h, c, inc[h][c], singles[j].a, singles[j].rank).substr(3));
+                    }
+                }
+            }
+        }
+    }
+    const double seconds_joint = since(joint_mark);
+    // ---- final scoring (combination from retained columns) + sequence-level prior
+    const auto score_mark = std::chrono::steady_clock::now();
+    std::vector<panvar::HaplotypeCandidate> fc{{islot[0], islot[1]}};
+    for (const Cand& c : cands) fc.push_back({c.slot0, c.slot1});
+    const panvar::FragmentScoringResult fr = ctx.score_candidates(fc);
+    const double seconds_score = since(score_mark);
+    const auto prior_mark = std::chrono::steady_clock::now();
+    const auto join = [](const std::vector<std::size_t>& v) {
+        std::string s;
+        for (std::size_t i = 0; i < v.size(); ++i) s += (i ? "," : "") + std::to_string(v[i]);
+        return s;
+    };
+    std::ostringstream table, prov, stab;
+    table << std::setprecision(17) << "label\thap1_alleles\thap2_alleles\tfragment_term\texposure_term\tprior\ttotal\n";
+    prov << "label\tn_equivalent_moves\tfirst_move_kind\tmoves\n";
+    table << "incumbent\t" << join(inc[0]) << '\t' << join(inc[1]) << '\t' << fr.scores[0].fragment_term << '\t' << fr.scores[0].exposure_term << '\t'
+          << pair_prior(inc[0], inc[1]) << '\t' << fr.scores[0].log_likelihood + pair_prior(inc[0], inc[1]) << '\n';
+    for (std::size_t i = 0; i < cands.size(); ++i) {
+        std::ostringstream label;
+        label << "c" << std::setw(4) << std::setfill('0') << i + 1;
+        const double prior = pair_prior(cands[i].p0, cands[i].p1);
+        table << label.str() << '\t' << join(cands[i].p0) << '\t' << join(cands[i].p1) << '\t' << fr.scores[i + 1].fragment_term << '\t'
+              << fr.scores[i + 1].exposure_term << '\t' << prior << '\t' << fr.scores[i + 1].log_likelihood + prior << '\n';
+        std::string moves;
+        for (const std::string& m : cands[i].moves) moves += (moves.empty() ? "" : "|") + m;
+        prov << label.str() << '\t' << cands[i].moves.size() << '\t' << cands[i].moves.front().substr(0, cands[i].moves.front().find(':')) << '\t' << moves << '\n';
+    }
+    const double seconds_prior = since(prior_mark);
+    stab << std::setprecision(17) << "homologue\tblock_id\tblock\tincumbent\tallele\tfragment\texposure\tlikelihood\tlikelihood_minus_incumbent\trank\tkept\n";
+    for (const Single& s : singles) {
+        stab << s.h << '\t' << model.blocks()[s.b].block_id << '\t' << s.b << '\t' << inc[s.h][s.b] << '\t' << s.a << '\t' << s.fragment << '\t' << s.exposure << '\t'
+             << s.lik << '\t' << s.lik - ir.scores[0].log_likelihood << '\t' << s.rank << '\t' << (s.rank <= top ? "true" : "false") << '\n';
+    }
+    const panvar::ContextMemoryAccount mem = ctx.memory_account();
+    const auto& counters = ctx.cumulative_counters();
+    (void)counters;
+    pre << "single_deltas\t" << singles.size() << "\npromotions_census_by_delta\t" << promoted << "\njoint_deltas\t" << joint_deltas
+        << "\nunique_candidates_excluding_incumbent\t" << cands.size() << "\nslots_created\t" << ctx.haplotypes_created()
+        << "\nfull_placements_incumbents\t" << placements_after_incumbents << "\nfull_placements_during_singles_and_promotion\t"
+        << placements_after_promotion - placements_after_incumbents << "\nfull_placements_total\t" << ctx.full_placement_count()
+        << "\nfallback_full_placements_beyond_incumbents\t" << ctx.full_placement_count() - placements_after_incumbents
+        << "\nsingle_origins_reused\t" << sum_single.origins_reused << "\nsingle_origins_recomputed\t" << sum_single.origins_recomputed
+        << "\nsingle_dp_executions\t" << sum_single.dp_executions << "\nsingle_local_window_bases\t" << sum_single.local_window_bases
+        << "\npromote_origins_reused\t" << sum_promote.origins_reused << "\npromote_origins_recomputed\t" << sum_promote.origins_recomputed
+        << "\npromote_dp_executions\t" << sum_promote.dp_executions << "\npromote_full_bytes_materialised\t" << sum_promote.full_haplotype_bytes_materialised
+        << "\njoint_origins_reused\t" << sum_joint.origins_reused << "\njoint_origins_recomputed\t" << sum_joint.origins_recomputed
+        << "\njoint_dp_executions\t" << sum_joint.dp_executions << "\njoint_local_window_bases\t" << sum_joint.local_window_bases
+        << "\ncensus_count_end\t" << mem.census_count << "\ncensus_bytes_end\t" << mem.census_bytes << "\ncontext_capacity_total_bytes\t" << mem.capacity_total
+        << "\nseconds_context_and_incumbent\t" << seconds_prep << "\nseconds_singles\t" << seconds_singles << "\nseconds_promotion\t" << seconds_promote
+        << "\nseconds_joint\t" << seconds_joint << "\nseconds_combination\t" << seconds_score << "\nseconds_prior\t" << seconds_prior
+        << "\nseconds_total_in_command\t" << since(t0) << "\ndecision\tWITHIN BOUNDS: shortlist and catalogue frozen\n";
+    atomic_write(out + ".preflight.tsv", pre.str());
+    atomic_write(out + ".singles.tsv", stab.str());
+    atomic_write(out + ".scores.tsv", table.str());
+    atomic_write(out + ".provenance.tsv", prov.str());
+    std::cout << pre.str();
+    return 0;
+}
+
 int block_sequences(const Args& args) {
     const std::string out = args.required("out");
     const std::string reference = args.required("reference");
@@ -7709,7 +8134,7 @@ int library_estimate(const Args& args) {
 int main(int argc, char** argv) {
     try {
         if (argc < 2) {
-            std::cerr << "usage: genotype_probe simulate|loo-gfa|evaluate|compare|genotype|trace|anchors|subsample|preflight|respell|coverage-audit|form-census|mosaic-truth|orientations|panel-alleles|tied-consensus|score-set|block-sequences|prior-pool|two-block-catalogue|two-block-eval|mass-reconcile|spell|edit-distances|repair-search --key value ...\n";
+            std::cerr << "usage: genotype_probe simulate|loo-gfa|evaluate|compare|genotype|trace|anchors|subsample|preflight|respell|coverage-audit|form-census|mosaic-truth|orientations|panel-alleles|tied-consensus|score-set|block-sequences|prior-pool|two-block-catalogue|two-block-eval|two-block-lik|two-block-lik-gate|mass-reconcile|spell|edit-distances|repair-search --key value ...\n";
             return 2;
         }
         const std::string command = argv[1];
@@ -7738,6 +8163,8 @@ int main(int argc, char** argv) {
         if (command == "prior-pool") return prior_pool(args);
         if (command == "two-block-catalogue") return two_block_catalogue(args);
         if (command == "two-block-eval") return two_block_eval(args);
+        if (command == "two-block-lik") return two_block_lik(args);
+        if (command == "two-block-lik-gate") return two_block_lik_gate(args);
         if (command == "mass-reconcile") return mass_reconcile(args);
         if (command == "spell") return spell(args);
         if (command == "edit-distances") return edit_distances(args);
