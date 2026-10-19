@@ -51,9 +51,15 @@ int main() {
         require(r.blocks[0].label == "DATA_SUPPORTED" && r.blocks[0].certified, "gate 1: exposure-decided rival must leave block 0 DATA_SUPPORTED");
         require(std::fabs(r.blocks[0].delta_fragment + 5.0) < 1e-12 && std::fabs(r.blocks[0].delta_exposure - 10.0) < 1e-12,
                 "gate 1: call-minus-competitor fragment -5, exposure +10");
-        // (2) prior dependence stays visible
-        require(r.blocks[1].label == "PRIOR_DEPENDENT", "gate 2: a likelihood-winning rival selected against by the prior is PRIOR_DEPENDENT");
-        require(r.blocks[1].delta_prior > 0.0 && r.blocks[1].delta_likelihood < 0.0, "gate 2: the deltas show prior for, likelihood against");
+        // (2) prior dependence stays visible. Group 3 (a phase alternative carrying the call's genotype with higher L) is left
+        // out here: with it, block 1's genotype is data-supported through that alternative, as the frozen rule says (gate 3).
+        {
+            const std::vector<SupportGroup> g2{gs[0], gs[1], gs[2], gs[4]};
+            const auto x = panvar::block_data_support_v1(g2, 0, 5);
+            require(x.blocks[1].label == "PRIOR_DEPENDENT", "gate 2: a likelihood-winning rival selected against by the prior is PRIOR_DEPENDENT");
+            require(x.blocks[1].delta_prior > 0.0 && x.blocks[1].delta_likelihood < 0.0, "gate 2: the deltas show prior for, likelihood against");
+            require(r.blocks[1].label == "DATA_SUPPORTED", "gate 2/3: with the phase alternative present, block 1 is supported through it");
+        }
         // (3) same genotype, competing phase: support unaffected; the phase competitor is genotype-preserving
         require(r.blocks[2].label == "NO_EVALUATED_ALTERNATIVE" && r.blocks[3].label == "NO_EVALUATED_ALTERNATIVE",
                 "gate 3: a phase alternative never creates a disagreeing genotype");

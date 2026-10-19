@@ -301,12 +301,19 @@ int main() {
                 require(slurp(path("on") + suffix, false) == slurp(path("sup1") + suffix, false),
                         std::string("support annotation must leave ") + suffix + " unchanged");
             }
-            const auto legacy_cols = [&](const std::string& prefix) {   // the first 29 block columns are the pre-existing ones
+            std::size_t legacy_columns = 1;   // the pre-existing columns: as many as the legacy run's own header has
+            {
+                std::ifstream in(path("on") + ".block_genotypes.tsv");
+                std::string header;
+                std::getline(in, header);
+                for (const char c : header) legacy_columns += c == '\t' ? 1 : 0;
+            }
+            const auto legacy_cols = [&](const std::string& prefix) {
                 std::ifstream in(prefix + ".block_genotypes.tsv");
                 std::string out, line;
                 while (std::getline(in, line)) {
                     std::size_t at = 0;
-                    for (int k = 0; k < 29 && at != std::string::npos; ++k) at = line.find('\t', at + 1);
+                    for (std::size_t k = 0; k < legacy_columns && at != std::string::npos; ++k) at = line.find('\t', at + 1);
                     out += line.substr(0, at) + '\n';
                 }
                 return out;
