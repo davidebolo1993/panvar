@@ -291,6 +291,9 @@ if(PANVAR_BUILD_TESTING)
         target_link_libraries(genotype_joint_search_e2e_test PRIVATE panvarlib)
         target_compile_options(genotype_joint_search_e2e_test PRIVATE -Wall -Wextra -Wpedantic)
         add_test(NAME panvar_genotype_joint_search_e2e COMMAND genotype_joint_search_e2e_test)
+        # M6-A diagnostic (not a ctest): count-fit comparator core gates
+        add_executable(count_fit_gates tests/count_fit_gates.cpp)
+        target_compile_options(count_fit_gates PRIVATE -Wall -Wextra -Wpedantic)
         # M4-B: the shared copying-transition implementation (adapter geometry rule + builder) against the brute-force oracle
         add_executable(genotype_copying_transitions_test tests/genotype_copying_transitions.cpp src/cli_utils.cpp)
         target_link_libraries(genotype_copying_transitions_test PRIVATE panvarlib)

@@ -15,6 +15,7 @@
 #include "panvar/fragment_likelihood.hpp"
 #include "panvar/genotype_command.hpp"
 #include "panvar/copying_transitions.hpp"
+#include "count_fit.hpp"
 #include "panvar/genotype_dosage.hpp"
 #include "panvar/genotype_dosage_integrate.hpp"
 #include "panvar/genotype_dosage_repair.hpp"
@@ -7271,6 +7272,196 @@ int prior_geometry(const Args& args) {
     return tiles && agrees ? 0 : 3;
 }
 
+// count-fit (M6-A, DIAGNOSTIC; truth-free): the depth-normalised 31-mer count-fit comparator of tests/count_fit.hpp over
+// every ordered pair of the target block's active alleles, substituted into the run's reported winner (rank-1
+// representative) as a fixed two-homologue context. Dictionary = canonical 31-mers of every active template's complete
+// spelling. Depth = mean observed count / 2 over stable-copy k-mers (exactly one copy in every active template, no
+// occurrence overlapping the target block in any template). Preflight refuses an oversized catalogue (never truncated).
+// Not a likelihood; never combined with the fragment likelihood or the prior; no posterior or GQ.
+std::string join_alleles(const std::vector<std::size_t>& v) {
+    std::string out;
+    for (std::size_t i = 0; i < v.size(); ++i) out += (i ? "," : "") + std::to_string(v[i]);
+    return out;
+}
+int count_fit(const Args& args) {
+    using clock = std::chrono::steady_clock;
+    const auto t0 = clock::now();
+    const auto secs = [](clock::time_point a) { return std::chrono::duration<double>(clock::now() - a).count(); };
+    const std::string out = args.required("out");
+    const std::string run = args.required("run");
+    const std::string block_id = args.required("block");
+    const std::size_t max_candidates = std::stoul(args.get("max-candidates", "40000"));
+    const std::string curation = args.get("panel-curation", "");
+    const LoadedModel loaded = load_model(args.required("model-gfa"), args.required("reference"), out + ".model.sorted.gfa", 50,
+                                          curation.empty() ? std::vector<std::string>{} : read_panel_curation(curation));
+    std::filesystem::remove(out + ".model.sorted.gfa");
+    const panvar::PreparedGenotypeModel& model = *loaded.model;
+    const auto status = read_key_values(run + ".mosaic_status.tsv");
+    if (status.at("model_fingerprint") != loaded.fingerprint) throw std::runtime_error("the run was not scored on the rebuilt model");
+    const std::size_t blocks = model.blocks().size();
+    std::size_t tb = blocks;
+    for (std::size_t b = 0; b < blocks; ++b) if (model.blocks()[b].block_id == block_id) tb = b;
+    if (tb == blocks) throw std::runtime_error("no block " + block_id);
+    const auto& alleles = model.blocks()[tb].alleles;
+    const std::size_t n = alleles.size();
+    std::ostringstream s;
+    s << std::setprecision(12) << "key\tvalue\nmodel_fingerprint\t" << loaded.fingerprint << "\ntarget_block\t" << block_id << "\ntarget_alleles\t" << n
+      << "\ncandidates_ordered\t" << n * n << "\nmax_candidates\t" << max_candidates << "\nk\t31\nloss\tsum_k (observed_k/depth - predicted_k)^2 over D\n";
+    if (n * n > max_candidates) {
+        atomic_write(out + ".summary.tsv", s.str() + "refused\tthe catalogue exceeds max_candidates (never truncated)\n");
+        std::cout << "count-fit: REFUSED, " << n * n << " candidates > " << max_candidates << '\n';
+        return 3;
+    }
+    // ---- context: the run's reported winner (rank-1 representative)
+    std::vector<std::size_t> ctx[2];
+    std::string ctx_score = "NA";
+    for (const auto& row : read_table(run + ".equivalence_set.tsv")) {
+        if (row.at("rank") == "1" && row.at("representative") == "true") {
+            ctx[0] = parse_alleles(row.at("hap1_alleles"));
+            ctx[1] = parse_alleles(row.at("hap2_alleles"));
+            ctx_score = row.at("score");
+        }
+    }
+    if (ctx[0].size() != blocks || ctx[1].size() != blocks) throw std::runtime_error("no rank-1 representative in the run's equivalence set");
+    countfit::Context context;
+    for (int h = 0; h < 2; ++h) {
+        const panvar::HaplotypeSequence sp = panvar::spell_mosaic(model, panvar::MosaicPath{ctx[h]});
+        context.left[h] = sp.bases.substr(0, sp.block_intervals[tb].begin);
+        context.right[h] = sp.bases.substr(sp.block_intervals[tb].end);
+    }
+    // ---- dictionary from the active panel's complete spellings, with per-k-mer copy statistics across templates
+    auto mark = clock::now();
+    const auto& panel = model.panel();
+    countfit::Dictionary dict;
+    std::vector<std::uint32_t> present, minc, maxc;
+    std::vector<char> in_block;
+    for (std::size_t t = 0; t < panel.template_count(); ++t) {
+        const std::vector<std::size_t> row(panel.template_alleles[t].begin(), panel.template_alleles[t].end());
+        const panvar::HaplotypeSequence sp = panvar::spell_mosaic(model, panvar::MosaicPath{row});
+        const std::size_t lo = sp.block_intervals[tb].begin, hi = sp.block_intervals[tb].end;
+        std::unordered_map<std::uint32_t, std::uint32_t> local;
+        countfit::for_each_kmer(sp.bases, [&](std::uint64_t k, std::size_t pos) {
+            const std::uint32_t id = dict.add(k);
+            if (id >= present.size()) { present.push_back(0); minc.push_back(UINT32_MAX); maxc.push_back(0); in_block.push_back(0); }
+            ++local[id];
+            if (pos < hi && pos + countfit::K > lo) in_block[id] = 1;
+        });
+        for (const auto& [id, c] : local) { ++present[id]; minc[id] = std::min(minc[id], c); maxc[id] = std::max(maxc[id], c); }
+    }
+    const std::size_t D = dict.kmer.size();
+    std::vector<char> stable(D, 0);
+    std::size_t n_stable = 0;
+    for (std::size_t i = 0; i < D; ++i) {
+        if (present[i] == panel.template_count() && minc[i] == 1 && maxc[i] == 1 && !in_block[i]) { stable[i] = 1; ++n_stable; }
+    }
+    const double t_dict = secs(mark);
+    // ---- reads: both mates, every 31-mer window, canonical; non-ACGT windows skipped
+    mark = clock::now();
+    const std::vector<panvar::ReadPair> fragments = read_pairs(args.required("reads1"), args.required("reads2"));
+    std::vector<std::uint32_t> obs(D, 0);
+    std::uint64_t windows = 0, valid = 0, in_dict = 0;
+    for (const auto& f : fragments) {
+        for (const panvar::SequencingRead* r : {&f.first, &f.second}) {
+            if (r->bases.size() >= static_cast<std::size_t>(countfit::K)) windows += r->bases.size() - countfit::K + 1;
+            countfit::for_each_kmer(r->bases, [&](std::uint64_t k, std::size_t) {
+                ++valid;
+                const long i = dict.find(k);
+                if (i >= 0) { ++obs[i]; ++in_dict; }
+            });
+        }
+    }
+    const double t_reads = secs(mark);
+    // ---- depth from stable-copy k-mers (expected 2 copies in any diploid genotype the panel can spell)
+    std::vector<double> stable_obs;
+    double stable_sum = 0.0;
+    for (std::size_t i = 0; i < D; ++i) if (stable[i]) { stable_obs.push_back(obs[i]); stable_sum += obs[i]; }
+    s << "templates\t" << panel.template_count() << "\ndictionary_kmers\t" << D << "\nstable_copy_kmers\t" << n_stable << "\nread_pairs\t" << fragments.size()
+      << "\nread_windows\t" << windows << "\nread_windows_valid_acgt\t" << valid << "\nread_windows_skipped_non_acgt\t" << (windows - valid)
+      << "\nread_windows_in_dictionary\t" << in_dict << '\n';
+    if (n_stable < 1000) {
+        atomic_write(out + ".summary.tsv", s.str() + "refused\tfewer than 1,000 stable-copy k-mers: no stable depth scale\n");
+        std::cout << "count-fit: REFUSED, " << n_stable << " stable-copy k-mers\n";
+        return 3;
+    }
+    std::sort(stable_obs.begin(), stable_obs.end());
+    const double depth = stable_sum / (2.0 * static_cast<double>(n_stable));
+    const double median2 = stable_obs[stable_obs.size() / 2] / 2.0;
+    std::size_t zero_stable = 0;
+    for (double x : stable_obs) zero_stable += x == 0.0 ? 1 : 0;
+    s << "depth_haploid_kmer_mean\t" << depth << "\ndepth_haploid_kmer_median\t" << median2 << "\nstable_kmers_unobserved\t" << zero_stable << '\n';
+    // ---- candidates
+    mark = clock::now();
+    std::vector<double> y(D);
+    for (std::size_t i = 0; i < D; ++i) y[i] = obs[i] / depth;
+    const auto merged = [&](const std::string& a, const std::string& b) {
+        countfit::Sparse x = countfit::count_string(a, dict), z = countfit::count_string(b, dict);
+        std::map<std::uint32_t, std::uint32_t> m(x.v.begin(), x.v.end());
+        for (const auto& [i, c] : z.v) m[i] += c;
+        x.v.assign(m.begin(), m.end());
+        x.hash += z.hash;
+        x.outside += z.outside;
+        return x;
+    };
+    const countfit::Sparse base1 = merged(context.left[0], context.right[0]), base2 = merged(context.left[1], context.right[1]);
+    std::vector<countfit::Sparse> mid1, mid2;
+    std::size_t mid_entries = 0;
+    for (const auto& a : alleles) {
+        mid1.push_back(countfit::count_string(countfit::middle_window(context.left[0], a.sequence, context.right[0]), dict));
+        mid2.push_back(countfit::count_string(countfit::middle_window(context.left[1], a.sequence, context.right[1]), dict));
+        mid_entries += mid1.back().v.size() + mid2.back().v.size();
+    }
+    const auto cands = countfit::score_all(y, base1, base2, mid1, mid2);
+    const auto groups = countfit::group_profiles(cands);
+    const double t_cands = secs(mark);
+    const std::size_t ca = ctx[0][tb], cb = ctx[1][tb];
+    std::size_t caller_rank = 0, caller_group = 0;
+    std::vector<std::size_t> group_of(cands.size());
+    for (std::size_t g = 0; g < groups.size(); ++g) for (std::size_t i : groups[g]) group_of[i] = g;
+    for (std::size_t i = 0; i < cands.size(); ++i) if (cands[i].a == ca && cands[i].b == cb) caller_group = group_of[i];
+    for (std::size_t g = 0; g < groups.size(); ++g) if (cands[groups[g][0]].loss < cands[groups[caller_group][0]].loss - 1e-9) ++caller_rank;
+    const double best = cands[groups[0][0]].loss;
+    // residual split for the best group's first member and the caller's prediction: loss on the two middle windows vs elsewhere
+    const auto split = [&](std::size_t a, std::size_t b) {
+        std::vector<double> pred(D, 0.0);
+        for (const countfit::Sparse* v : {&base1, &base2, static_cast<const countfit::Sparse*>(&mid1[a]), static_cast<const countfit::Sparse*>(&mid2[b])}) for (const auto& [i, c] : v->v) pred[i] += c;
+        std::set<std::uint32_t> win;
+        for (const auto& [i, c] : mid1[a].v) win.insert(i);
+        for (const auto& [i, c] : mid2[b].v) win.insert(i);
+        double inside = 0.0, total = 0.0;
+        std::size_t big = 0;
+        for (std::size_t i = 0; i < D; ++i) {
+            const double e = (y[i] - pred[i]) * (y[i] - pred[i]);
+            total += e;
+            if (win.count(static_cast<std::uint32_t>(i))) { inside += e; big += std::fabs(y[i] - pred[i]) > 1.0 ? 1 : 0; }
+        }
+        return std::make_tuple(total, inside, big, win.size());
+    };
+    const auto [bt, bi, bb, bw] = split(cands[groups[0][0]].a, cands[groups[0][0]].b);
+    const auto [ct, ci, cbig, cw] = split(ca, cb);
+    s << "target_block_index\t" << tb << "\ncontext_hap1\t" << join_alleles(ctx[0]) << "\ncontext_hap2\t" << join_alleles(ctx[1]) << '\n';
+    s << "context_source\trank-1 representative of " << run << ".equivalence_set.tsv (score " << ctx_score << ")\ncaller_target_alleles\t" << ca << ',' << cb
+      << "\ncaller_group_rank\t" << caller_rank + 1 << "\ncaller_loss_minus_best\t" << cands[groups[caller_group][0]].loss - best << "\ngroups\t" << groups.size()
+      << "\nbest_group_size\t" << groups[0].size() << "\nbest_loss\t" << best << "\nbest_window_loss\t" << bi << "\nbest_window_kmers\t" << bw
+      << "\nbest_window_kmers_abs_residual_gt1\t" << bb << "\ncaller_window_loss\t" << ci << "\ncaller_window_kmers\t" << cw
+      << "\ncaller_window_kmers_abs_residual_gt1\t" << cbig << "\nmiddle_sparse_entries\t" << mid_entries
+      << "\nseconds_dictionary\t" << t_dict << "\nseconds_reads\t" << t_reads << "\nseconds_candidates\t" << t_cands << "\nseconds_total\t" << secs(t0)
+      << "\nphys_footprint_peak_bytes\t" << physical_footprint().peak << '\n';
+    std::ostringstream ct_out;
+    ct_out << std::setprecision(12) << "group_rank\tgroup_size\tallele_h1\tallele_h2\th1_bp\th2_bp\tloss\tloss_minus_best\tprofile_hash\tmiddle_kmers_outside_dictionary\tis_caller\n";
+    for (std::size_t g = 0; g < groups.size(); ++g) {
+        for (std::size_t i : groups[g]) {
+            const auto& c = cands[i];
+            ct_out << g + 1 << '\t' << groups[g].size() << '\t' << c.a << '\t' << c.b << '\t' << alleles[c.a].sequence.size() << '\t' << alleles[c.b].sequence.size()
+                   << '\t' << c.loss << '\t' << c.loss - best << '\t' << std::hex << c.profile << std::dec << '\t' << c.outside << '\t'
+                   << (c.a == ca && c.b == cb ? "true" : "false") << '\n';
+        }
+    }
+    atomic_write(out + ".candidates.tsv", ct_out.str());
+    atomic_write(out + ".summary.tsv", s.str());
+    std::cout << s.str();
+    return 0;
+}
+
 // support-audit (M3-E.1): the C++ block_data_support_v2 on a saved run's (rounded) score and candidate tables -- the same
 // inputs the independent Python audit reads. No model, no reads, no rescoring.
 int support_audit(const Args& args) {
@@ -8484,6 +8675,7 @@ int main(int argc, char** argv) {
         if (command == "joint-bounds") return joint_bounds(args);
         if (command == "support-audit") return support_audit(args);
         if (command == "prior-geometry") return prior_geometry(args);
+        if (command == "count-fit") return count_fit(args);
         if (command == "mass-reconcile") return mass_reconcile(args);
         if (command == "spell") return spell(args);
         if (command == "edit-distances") return edit_distances(args);

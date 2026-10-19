@@ -72,3 +72,13 @@ cache, `repair_max_neighbours`, cumulative caps, round bound 32. Every root repr
   winner is always single-block optimal.
 
 The structural/count-model comparison remains the next major scientific task.
+
+## Closure appended at M6-A (2026-10-19; Sol's review)
+
+Pooled-winner continuation stays **parked**. Recorded:
+1. The three reported winners have no improving move within the existing shortlist.
+2. The tested +0.613 move stays unreachable by the ordinary engine (allele pair rank 723), and would still be wrong
+   (M3-G).
+3. This does not show that every wider neighbourhood, or every other cell, behaves the same way.
+
+No further search or copying-rate experiments were run in M6-A.
