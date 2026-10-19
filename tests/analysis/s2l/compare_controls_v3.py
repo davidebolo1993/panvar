@@ -12,7 +12,7 @@ import subprocess
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-V3 = os.path.join(HERE, "s2l_compare.py")
+V3 = os.path.join(HERE, os.environ.get("S2L_COMPARATOR", "s2l_compare.py"))
 S2J = "/Users/davide.bolognini/panvar/tests/results/s2j_origin_admission_20261018/runs/caller.acot30.reuse"
 S2K = "/Users/davide.bolognini/panvar/tests/results/s2k_post_refinement_20261019/runs/caller.acot30.6gib"
 ARGS = ["--declared-settings", "footprint_limit_bytes", "--categories", "operational,profile,checkpoints,envelope"]

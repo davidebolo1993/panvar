@@ -50,7 +50,14 @@ MANIFEST_B += [("combined.acot_30", "caller", "acot_30:combined", 300),
                ("compare.acot_30.repeat", "pair", "combined.acot_30:combined.acot_30.repeat", 30),
                ("summary", "summary", "-", 30)]
 GIB6 = 6442450944
-MANIFESTS = {"B": MANIFEST_B}
+# Amendment 1 (declared before further execution): v3 classified union_fragment_block_footprint_max_bytes (blocked route
+# only) as a both-runs operational row, so compare.c4_5/cyp_5/acot_5 failed on it alone (recorded, unchanged). v3.1 adds
+# only that route-only classification. New units: v3.1 controls and v3.1 recompares of the saved 5x pairs; every pair unit
+# not yet run uses v3.1.
+MANIFEST_A1 = [("compare.v31_controls", "controls31", "-", 30)] + [
+    (f"recompare_v31.{t}", "pair31", f"control.{t}:combined.{t}", 30) for t in ("c4_5", "cyp_5", "acot_5")]
+V31_PAIRS = {"compare.c4_30", "compare.cyp_30", "compare.acot_30", "compare.acot_30.repeat"}
+MANIFESTS = {"B": MANIFEST_B, "A1": MANIFEST_A1}
 
 
 def ledger_rows():
@@ -141,7 +148,10 @@ def command(unit, kind, target, timeout, d):
         return [sys.executable, os.path.join(HERE, "compare_controls_v3.py"), d, f"{d}/scratch"], "-"
     if kind == "summary":
         return [sys.executable, os.path.join(HERE, "s2l_summary.py"), f"{OUT}/runs", f"{d}/summary.tsv"], "-"
-    if kind == "pair":
+    if kind == "controls31":
+        return ["env", "S2L_COMPARATOR=s2l_compare_v31.py", sys.executable, os.path.join(HERE, "compare_controls_v3.py"), d,
+                f"{d}/scratch"], "-"
+    if kind in ("pair", "pair31"):
         x, y = (f"{OUT}/runs/{u}" for u in target.split(":"))
         if not (os.path.exists(f"{x}/call.mosaic_status.tsv") and os.path.exists(f"{y}/call.mosaic_status.tsv")):
             return None, "NOT RUN (condition): an arm did not run"
@@ -152,7 +162,8 @@ def command(unit, kind, target, timeout, d):
                           "a refusal is a resource limitation, not an equivalence")
         cats = "operational,profile,checkpoints" if target.endswith(".repeat") else "operational,profile,route,admission,checkpoints"
         declared = "" if target.endswith(".repeat") else "union_fragment_blocks,repair_round1_origin_admission"
-        return [sys.executable, os.path.join(HERE, "s2l_compare.py"), x, y, f"{d}/compare.tsv",
+        script = "s2l_compare_v31.py" if kind == "pair31" or unit in V31_PAIRS else "s2l_compare.py"
+        return [sys.executable, os.path.join(HERE, script), x, y, f"{d}/compare.tsv",
                 "--declared-settings", declared, "--categories", cats], "-"
     cell_id, arm = target.split(":")
     return caller_command(cell_id, arm, timeout, d), f"{arm} arm"
