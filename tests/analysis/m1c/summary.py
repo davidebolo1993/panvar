@@ -27,11 +27,22 @@ def main(runs, out):
     dec = ["coverage\tpair\tfragment_delta\tfavouring_A\tfavouring_B\ttop10\ttop50\ttop200\ttop1000\tclasses\t"
            "placement_evidence_interpretable\n"]
     for cov in ("c4_10", "c4_30"):
-        score = f"{runs}/score.{cov}/score"
-        if not os.path.exists(score + ".scores_truth_free.tsv"):
+        # Amendment 2: c4_30 is scored in two parts that share `reported`, which must be bit-equal across them.
+        parts = [f"{runs}/score.{cov}/score"] if os.path.exists(f"{runs}/score.{cov}/score.scores_truth_free.tsv") else \
+            [f"{runs}/score.{cov}.part{i}/score" for i in (1, 2) if os.path.exists(f"{runs}/score.{cov}.part{i}/score.scores_truth_free.tsv")]
+        if not parts:
             lines.append(f"{cov}\tNOT RUN\n")
             continue
-        rows = list(csv.DictReader(open(score + ".scores_truth_free.tsv"), delimiter="\t"))
+        rows, seen = [], {}
+        for score in parts:
+            for r in csv.DictReader(open(score + ".scores_truth_free.tsv"), delimiter="\t"):
+                if r["label"] in seen:
+                    same = all(seen[r["label"]][k] == r[k] for k in ("fragment_term_hex", "exposure_term_hex", "prior"))
+                    print(f"{cov}: {r['label']} across parts bit-equal: {same}")
+                    assert same, "a shared candidate differs across parts"
+                    continue
+                seen[r["label"]] = r
+                rows.append(r)
         content = {}
         cp = f"{runs}/content.{cov}/{cov}.content.tsv"
         if os.path.exists(cp):
@@ -47,7 +58,7 @@ def main(runs, out):
                                     c31.get("vs_reported_pooled", "NA"), c151.get("vs_reported_pooled", "NA"),
                                     c31.get("vs_truth_pooled", "NA"), c31.get("vs_truth_per_hap", "NA"),
                                     c151.get("vs_truth_pooled", "NA")]) + "\n")
-        for path in sorted(glob.glob(score + ".decomp.*.summary.tsv")):
+        for path in sorted(p for score in parts for p in glob.glob(score + ".decomp.*.summary.tsv")):
             s = kv(path)
             classes = ";".join(f"{k[6:-6]}={float(v):.3f}" for k, v in s.items() if k.startswith("class_") and k.endswith("_delta")
                                and not k.endswith("median_delta") and not k.endswith("min_delta") and not k.endswith("max_delta"))

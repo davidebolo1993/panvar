@@ -39,7 +39,18 @@ MANIFEST_B = [("gate.mass_fixture.s1", "fixture", "20261019", 30), ("gate.mass_f
 # fixture's LibraryModel had no provenance string, which validate_library_model refuses (recorded, unchanged). The fixture
 # now declares one; nothing else changed. New units rerun the two fixtures; the rest of manifest B continues unchanged.
 MANIFEST_A1 = [("gate.mass_fixture.s1.a1", "fixture", "20261019", 30), ("gate.mass_fixture.s2.a1", "fixture", "7", 30)]
-MANIFESTS = {"B": MANIFEST_B, "A1": MANIFEST_A1}
+# Amendment 2 (declared before further execution): score.c4_30 would record every origin of 22 unique haplotypes at 30x;
+# M1-B's 16-haplotype 30x decomposition peaked at 4.0 GB, so this projects to about 5.5 GB, too close to the 6 GiB
+# envelope. score.c4_30 is WITHDRAWN before execution and replaced by two scorer runs over disjoint alternative subsets
+# that share `reported` (a candidate's score does not depend on the others scored beside it -- validated bit for bit by
+# the explicit gate); `reported` must be bit-equal across the two parts. Content and summary units are unchanged in
+# meaning; the summary reads both parts.
+PARTS = {"1": ["reported", "realloc_A_p1", "realloc_A_p2", "realloc_B_p1", "realloc_B_p2"],
+         "2": ["reported", "saved_2+2", "truth", "truthblock_in_reported_a", "truthblock_in_reported_b",
+               "reportedblock_in_truth_a", "reportedblock_in_truth_b"]}
+MANIFEST_A2 = [("score.c4_30.part1", "scorepart", "c4_30:1", 150), ("score.c4_30.part2", "scorepart", "c4_30:2", 200)]
+WITHDRAWN = {"score.c4_30": "WITHDRAWN by Amendment 2 before execution (memory envelope); replaced by score.c4_30.part1/part2"}
+MANIFESTS = {"B": MANIFEST_B, "A1": MANIFEST_A1, "A2": MANIFEST_A2}
 
 
 def ledger_rows():
@@ -147,6 +158,24 @@ def command(unit, kind, target, timeout, d):
         return [sys.executable, os.path.join(HERE, "construct.py"), "--spell", f"{OUT}/runs/spell.{target}/spell", "--out",
                 f"{d}/alternatives", "--expected-reported", reported_total(target), "--expected-comparator",
                 comparator_total(target)], "diagnostic construction (truth)"
+    if unit in WITHDRAWN:
+        return None, WITHDRAWN[unit]
+    if kind == "scorepart":
+        if exit_of("gate.explicit_compare") != "0":
+            return None, "NOT RUN (condition): the explicit-sequence gate did not pass"
+        case, part = target.split(":")
+        c = CASES[case]
+        keep = PARTS[part]
+        src = f"{OUT}/runs/construct.{case}/alternatives.explicit.tsv"
+        rows = [l for l in open(src) if not l.startswith("#") and l.strip() and l.split("\t")[0] in keep]
+        open(f"{d}/alternatives.part{part}.explicit.tsv", "w").write("".join(rows))
+        labels = [l.split("\t")[0] for l in rows]
+        pairs = [f"reported,{x}" for x in labels if x.startswith("realloc_")]
+        pairs += [f"reported,{x}" for x in ("truth", "saved_2+2", "truthblock_in_reported_a") if x in labels]
+        if "reportedblock_in_truth_a" in labels:
+            pairs.append("truth,reportedblock_in_truth_a")
+        return scorer(c, case, d, ["--explicit", f"{d}/alternatives.part{part}.explicit.tsv", "--decompose", ";".join(pairs),
+                                   "--decompose-block", c["target_block"]]), f"explicit allocation alternatives, part {part}"
     if kind == "score":
         if exit_of("gate.explicit_compare") != "0":
             return None, "NOT RUN (condition): the explicit-sequence gate did not pass"
