@@ -129,3 +129,16 @@ candidate.
 Neither a better loss nor a different search over the existing catalogue addresses the first. The second needs
 long-range adjacency evidence (M1-E). No k change, weighting, production patch or combination with the fragment model
 was made.
+
+## Closure appended at M6-C (2026-10-19; Sol's review)
+
+Retained findings, each qualified to the **tested** dictionary (active-panel canonical 31-mers), objective (squared
+depth-normalised count error) and catalogue (existing allele pairs at one block in a fixed context):
+1. **Count scoring gives useful dosage information** in the CYP2D6 NA19650 example.
+2. **C4's available sequence content biases both tested observation models,** count and fragment, toward the 3+1.
+3. **Matched allocations can be indistinguishable to counts:** content-matched 1+3 and 2+2 profiles are identical.
+4. **Paired-fragment adjacency can carry information absent from those counts** (M1-E: 7.6 at 10× once T1 is
+   corrected).
+
+This does **not** show that every possible loss or longer-range observation model must fail. The count comparator stays
+diagnostic only.

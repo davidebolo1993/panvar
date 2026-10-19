@@ -291,6 +291,10 @@ if(PANVAR_BUILD_TESTING)
         target_link_libraries(genotype_joint_search_e2e_test PRIVATE panvarlib)
         target_compile_options(genotype_joint_search_e2e_test PRIVATE -Wall -Wextra -Wpedantic)
         add_test(NAME panvar_genotype_joint_search_e2e COMMAND genotype_joint_search_e2e_test)
+        # M6-C diagnostic (not a ctest): nuisance-marginalised structural likelihood, synthetic feasibility only
+        add_executable(nuisance_structural tests/nuisance_structural.cpp)
+        target_link_libraries(nuisance_structural PRIVATE panvarlib)
+        target_compile_options(nuisance_structural PRIVATE -Wall -Wextra -Wpedantic)
         # M6-A diagnostic (not a ctest): count-fit comparator core gates
         add_executable(count_fit_gates tests/count_fit_gates.cpp)
         target_compile_options(count_fit_gates PRIVATE -Wall -Wextra -Wpedantic)
