@@ -99,3 +99,16 @@ indicates a likelihood inconsistency. One coverage pair does not establish calib
    distance-aware, and here it decides about −9 of the −10.2 at the ctx:0/sv:1 boundary. Whether redraw cost should
    depend on block span or flank context remains open (M3-A's distance-matched model was measured, not adopted). No
    grid or rule is proposed or implemented in this batch.
+
+## Closure appended at M4-A (2026-10-19; Sol's review; the record above is not rewritten)
+
+**The ctx:0 outcome stands:** no inconsistency demonstrated, retained as an unresolved low-depth error. Joint search
+stays parked and default-off.
+
+Recorded separately and not reopened in M4-A:
+1. **The final pooled winner may never have been refined.** A union candidate can be reported without any refinement
+   from it.
+2. **Conditional data support is not calibrated user confidence.** The support labels (v1x/v2x) are conditional on the
+   evaluated candidates.
+3. **The C4 sv:7 structural error is a different model/content problem.** The fragment term decides it on content the
+   leave-one-out panel cannot spell (M1-B/M1-C). It is unrelated to the copying prior or to this ctx:0 case.
