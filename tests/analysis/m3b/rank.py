@@ -21,7 +21,23 @@ def rows(p):
 
 sel, top, dec = [], [], []
 for cell in cells:
-    scores = rows(f"{runs}/score.{cell}/score.scores_truth_free.tsv")
+    # Amendment 1: a cell may be scored whole or in two parts; every part carries the incumbent, which must agree exactly
+    import os
+    whole = f"{runs}/score.{cell}/score.scores_truth_free.tsv"
+    files = [whole] if os.path.exists(whole) else [f"{runs}/score.{cell}.part{i}/score.scores_truth_free.tsv" for i in (1, 2)]
+    scores, seen = [], {}
+    for f in files:
+        for r in rows(f):
+            if r["label"] in seen:
+                assert r["label"] == "incumbent" and r["total"] == seen[r["label"]]["total"], f"{cell}: part disagreement on {r['label']}"
+                continue
+            seen[r["label"]] = r
+            scores.append(r)
+    with open(f"{os.path.dirname(prefix)}/merged.{cell}.tsv", "w") as out:
+        keys = list(scores[0].keys())
+        out.write("\t".join(keys) + "\n")
+        for r in scores:
+            out.write("\t".join(r[k] for k in keys) + "\n")
     prov = {r["label"]: r for r in rows(f"{runs}/cat.{cell}/cat.provenance.tsv")}
     pre = dict(r for r in (l.rstrip("\n").split("\t", 1) for l in open(f"{runs}/cat.{cell}/cat.preflight.tsv")) if len(r) == 2)
     for r in scores:

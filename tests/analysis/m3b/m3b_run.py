@@ -34,7 +34,13 @@ CELL = {
 CELLS = list(CELL)
 MANIFEST_B = ([(f"cat.{c}", "cat", c, 60) for c in CELLS] + [(f"score.{c}", "score", c, 180) for c in CELLS] +
               [("rank", "rank", "-", 30)] + [(f"eval.{c}", "eval", c, 60) for c in CELLS])
-MANIFESTS = {"B": MANIFEST_B}
+# Amendment 1: 2x scoring took 126 s for 1,849 candidates, so a 5x cell projects to ~300 s (> the 180-s unit cap). Each 5x
+# catalogue is split deterministically into two parts (labels in order, halves), each carrying the incumbent and its
+# expected total; the budget then admits one complete 5x control: the mosaic 5x twin. lzo_5x scoring is NOT run (gap).
+MANIFEST_A1 = [("split.mosaic_5x", "split", "mosaic_5x", 30), ("score.mosaic_5x.part1", "score_part", "mosaic_5x:1", 180),
+               ("score.mosaic_5x.part2", "score_part", "mosaic_5x:2", 180), ("rank.a1", "rank", "-", 30),
+               ("eval.a1.mosaic_2x", "eval", "mosaic_2x", 60), ("eval.a1.mosaic_5x", "eval", "mosaic_5x", 60)]
+MANIFESTS = {"B": MANIFEST_B, "A1": MANIFEST_A1}
 CARRIED = 0.0
 INPUTS = {r["cell"] + ":" + r["file"]: r["sha256"] for r in csv.DictReader(open(os.path.join(HERE, "INPUTS.tsv")), delimiter="\t")}
 
@@ -110,7 +116,27 @@ def common(c):
     return ["--model-gfa", c["gfa"], "--reference", REF, *([] if c["curation"] == "none" else ["--panel-curation", c["curation"]])]
 
 
+def score_files(cell):
+    whole = f"{OUT}/runs/score.{cell}/score.scores_truth_free.tsv"
+    parts = [f"{OUT}/runs/score.{cell}.part{i}/score.scores_truth_free.tsv" for i in (1, 2)]
+    if os.path.exists(whole):
+        return [whole]
+    return parts if all(os.path.exists(p) for p in parts) else []
+
+
 def command(unit, kind, target, timeout, d):
+    if kind == "split":
+        verify(target)
+        return [sys.executable, os.path.join(HERE, "split_catalogue.py"), f"{OUT}/runs/cat.{target}/cat.catalogue.tsv", f"{d}/part"], \
+            "deterministic two-part split (Amendment 1)"
+    if kind == "score_part":
+        cell, part = target.split(":")
+        verify(cell)
+        c = CELL[cell]
+        return ["nice", f"{BUILD}/genotype_probe", "score-set", "--out", f"{d}/score", "--donor", c["donor"], "--run", c["run"], *common(c),
+                "--candidates", f"{OUT}/runs/split.{cell}/part{part}.tsv", "--library", f"{c['reads']}/library.txt",
+                "--reads1", f"{c['reads']}/reads_1.fq", "--reads2", f"{c['reads']}/reads_2.fq", "--threads", "4"], \
+            f"unchanged reference scorer, catalogue part {part} of 2 (Amendment 1)"
     if kind in ("cat", "score", "eval"):
         verify(target)
         c = CELL[target]
@@ -126,21 +152,22 @@ def command(unit, kind, target, timeout, d):
                 "--candidates", cat, "--library", f"{c['reads']}/library.txt", "--reads1", f"{c['reads']}/reads_1.fq",
                 "--reads2", f"{c['reads']}/reads_2.fq", "--threads", "4"], "unchanged reference scorer (score-set) on the frozen catalogue"
     if kind == "rank":
-        done_cells = [c for c in CELLS if os.path.exists(f"{OUT}/runs/score.{c}/score.scores_truth_free.tsv")]
+        done_cells = [c for c in CELLS if score_files(c)]
         return [sys.executable, os.path.join(HERE, "rank.py"), f"{OUT}/runs", f"{d}/m3b", *done_cells], "truth-free selection (frozen before evaluation)"
     if kind == "eval":
-        assert os.path.exists(f"{OUT}/runs/rank/m3b.selection.sha256"), "evaluation needs the frozen selection"
-        sc = f"{OUT}/runs/score.{target}/score.scores_truth_free.tsv"
+        rank_dir = f"{OUT}/runs/rank.a1" if unit.startswith("eval.a1.") else f"{OUT}/runs/rank"
+        assert os.path.exists(f"{rank_dir}/m3b.selection.sha256"), "evaluation needs the frozen selection"
+        sc = f"{rank_dir}/merged.{target}.tsv"
         if not os.path.exists(sc):
             return None, "NOT RUN: not scored"
         labels = set(["incumbent"])
-        for r in csv.DictReader(open(f"{OUT}/runs/rank/m3b.selection.tsv"), delimiter="\t"):
+        for r in csv.DictReader(open(f"{rank_dir}/m3b.selection.tsv"), delimiter="\t"):
             if r["cell"] == target:
                 labels.add(r["winner"])
-        for r in csv.DictReader(open(f"{OUT}/runs/rank/m3b.decomposition.tsv"), delimiter="\t"):
+        for r in csv.DictReader(open(f"{rank_dir}/m3b.decomposition.tsv"), delimiter="\t"):
             if r["cell"] == target and r["label"] != "absent":
                 labels.add(r["label"])
-        for r in csv.DictReader(open(f"{OUT}/runs/rank/m3b.top.tsv"), delimiter="\t"):
+        for r in csv.DictReader(open(f"{rank_dir}/m3b.top.tsv"), delimiter="\t"):
             if r["cell"] == target:
                 labels.add(r["label"])
         return ["nice", f"{BUILD}/genotype_probe", "two-block-eval", "--out", f"{d}/eval", *common(c), "--scores", sc, *c["truth"],
