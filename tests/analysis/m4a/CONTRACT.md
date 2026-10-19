@@ -160,3 +160,14 @@ alleles.
   467:1099–1103.
 - Halldorsson BV, et al. (2019). Characterizing mutagenic effects of recombination through a sequence-level genetic map.
   *Science* 363:eaau1043. Crossovers and non-crossover gene conversion.
+
+## Qualification appended at M4-B (2026-10-19; Sol's review; the text above is not rewritten)
+
+**The uniqueness claim in section 1 is conditional.** "No other per-boundary rule composes" holds under three assumptions:
+1. **Homogeneous distance:** one hazard per bp everywhere.
+2. **A fixed redraw measure:** the same U at every boundary.
+3. **The continuous semigroup model:** T(d₁)T(d₂) = T(d₁+d₂) for all d.
+
+Under these, r(d) = 1 − e^{−d/λ} is forced (Cauchy's functional equation for the survival term). **A nonuniform additive
+hazard composes exactly too:** r_b = 1 − exp(−∫ κ(x) dx over the boundary's interval), for example from a map-like κ(x).
+It is a possible later extension, not excluded by the composition argument, and not adopted in M4-B.

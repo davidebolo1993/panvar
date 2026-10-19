@@ -136,8 +136,40 @@ struct LocusInputReport {
     std::string curation_digest;
 };
 
+// M4-B (EXPERIMENTAL, consumed only by copying_transition distance_ref_core_v1_experimental): the reference-coordinate
+// geometry of the block chain, computed by the adapter against the FRAME -- every allele a complete-frame template carries
+// after the divergence trim, curated templates included, before curation removes any allele from the callable model.
+// Positions are on the reference path's axis in canonical chain order (invariant segment 0, reference allele of block 0,
+// segment 1, ...). A block's core is its reference interval with the maximal prefix and suffix shared by every frame
+// allele removed; a block whose frame has one distinct sequence has an empty core (a NEUTRAL state). Never derived from
+// reads, truth, candidates or the callable (curated) allele set. Unavailable geometry is explicit, never substituted.
+struct LocusGeometry {
+    std::string status = "unavailable: not computed";   // "available", or "unavailable: <reason>"
+    std::string reference_path_name;
+    std::vector<std::string> block_ids;
+    std::vector<long long> ref_start, ref_end;        // the reference allele's interval, bp
+    std::vector<long long> core_start, core_end;      // the polymorphic core (core_start == core_end: empty)
+    std::vector<long long> position_x2;               // twice the copying state's position (core midpoint), exact
+    std::vector<std::size_t> frame_distinct_alleles;  // distinct frame sequences per block (1 = neutral state)
+    std::string frame_digest;                         // block ids + every frame allele sequence
+    std::string digest;                               // status, reference, intervals, frame digest
+    bool available() const noexcept { return status == "available"; }
+    // Distance between consecutive core midpoints (bp; exact halves). Throws when unavailable.
+    std::vector<double> distances() const;
+};
+
+// The geometry rule itself, separated from the graph walk so it can be gated on fixtures. `frame_alleles[b]` are block
+// b's frame sequences; `reference_alleles` (one per block) or nullptr with `unavailable_reason`.
+LocusGeometry compute_locus_geometry(const std::vector<std::string>& block_ids,
+                                     const std::vector<std::string>& invariant_segments,
+                                     const std::vector<std::vector<std::string>>& frame_alleles,
+                                     const std::vector<std::string>* reference_alleles,
+                                     const std::string& reference_path_name,
+                                     const std::string& unavailable_reason = "");
+
 struct LocusInputResult {
     StructuralLocusInput input;
+    LocusGeometry geometry;   // M4-B
     // The bytes each panel path spells in its own frame, for the round-trip verifier only. These are
     // deliberately kept outside the prepared model so no authoritative sequence can enter inference.
     std::vector<AuthoritativePanelSequence> authoritative;

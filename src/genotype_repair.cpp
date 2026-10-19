@@ -255,7 +255,12 @@ CoordinateRepairSearch::CoordinateRepairSearch(const PreparedGenotypeModel& mode
     const std::size_t blocks = model.blocks().size();
     if (blocks < 2) throw std::invalid_argument("the repair search needs at least two blocks");
     if (emissions.blocks.size() != blocks) throw std::invalid_argument("one proposal emission per block");
-    switches_.assign(blocks - 1, options.switch_probability);
+    if (!options.switch_vector.empty()) {   // M4-B: the run's shared transition vector
+        if (options.switch_vector.size() + 1 != blocks) throw std::invalid_argument("the repair's transition vector does not match the block count");
+        switches_ = options.switch_vector;
+    } else {
+        switches_.assign(blocks - 1, options.switch_probability);
+    }
     // The per-block local pairs, ranked once. Deterministic: emission descending, then indices.
     local_.resize(blocks);
     for (std::size_t b = 0; b < blocks; ++b) {

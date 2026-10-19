@@ -275,6 +275,12 @@ struct GenotypeCommandOptions {
     // appends separately versioned block-genotype support columns computed under the full data likelihood (fragment +
     // exposure, prior excluded; genotype_block_support.hpp). Every existing column, filter and decision is unchanged.
     std::string block_support_rule = "legacy";
+    // M4-B (EXPERIMENTAL, profile keys; default constant_v1): the copying prior's transition specification, built ONCE per
+    // run by build_copying_transitions and shared by every supported stage. distance_ref_core_v1_experimental needs the
+    // adapter's locus geometry (refused with a prepared locus, which carries none), a positive copying_length_bp, joint
+    // search off, and no switch_probability set by a profile or flag (the preset's value is not a conflicting setting).
+    std::string copying_transition = "constant_v1";
+    double copying_length_bp = 0.0;
     // I2-B (EXPERIMENTAL, profile keys only, never public settings): how the adaptive search's window enumeration builds
     // its placement rows. "reference" (the default) scans each enumerated window whole, unchanged. "fine_experimental"
     // builds the same rows from a round-local, per-worker fine store (PreparedScoringContext::

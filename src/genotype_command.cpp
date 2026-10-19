@@ -23,6 +23,7 @@
 #include "panvar/marker_model.hpp"
 #include "panvar/genotype_block_support.hpp"
 #include "panvar/genotype_joint_search.hpp"
+#include "panvar/copying_transitions.hpp"
 #include "panvar/mosaic_beam.hpp"
 #include "panvar/mosaic_spelling.hpp"
 #include "panvar/output.hpp"
@@ -170,6 +171,35 @@ std::optional<std::string> union_fragment_blocks_refusal(const GenotypeCommandOp
     return std::nullopt;
 }
 // M3-D: the joint-search experiment's contract (checked before an API run touches its prefix).
+// M4-B: the copying-transition specification's contract (checked before an API run touches its prefix). The distance mode
+// is refused, never silently replaced by constant transitions, wherever it cannot be honoured.
+std::optional<std::string> copying_transition_refusal(const GenotypeCommandOptions& o) {
+    const bool length_set = o.setting_sources.count("copying_length_bp") != 0;
+    if (o.copying_transition == "constant_v1") {
+        if (length_set) return std::string("copying_length_bp is a distance_ref_core_v1_experimental parameter; it is refused with constant_v1");
+        return std::nullopt;
+    }
+    const std::string p = "copying_transition distance_ref_core_v1_experimental ";
+    if (o.copying_transition != "distance_ref_core_v1_experimental") return "copying_transition '" + o.copying_transition + "' is not supported";
+    if (!length_set || !std::isfinite(o.copying_length_bp) || !(o.copying_length_bp > 0.0)) return p + "needs copying_length_bp > 0";
+    const auto sw = o.setting_sources.find("switch_probability");
+    if (sw != o.setting_sources.end() && sw->second.rfind("preset ", 0) != 0) {
+        return p + "conflicts with switch_probability set by " + sw->second + " (a scalar switch setting and a distance specification are exclusive)";
+    }
+    if (o.repair_joint_search != "off") return p + "is not supported with repair_joint_search (joint search stays off)";
+    if (!o.diagnostic_refinement_replay.empty()) return p + "is not supported with the refinement replay";
+    if (o.diagnostic_tie_branching) return p + "is not supported with diagnostic tie branching";
+    return std::nullopt;
+}
+CopyingTransitions g_transitions;   // M4-B: this run's one transition vector (set once the model exists)
+LocusGeometry g_geometry;           // M4-B: the adapter's geometry of this run's model (when built here)
+std::vector<double> run_switches(std::size_t blocks) {
+    if (g_transitions.r.size() + 1 != blocks) {
+        throw std::logic_error("the run's copying-transition vector does not match the block count (" + std::to_string(g_transitions.r.size()) +
+                               " boundaries for " + std::to_string(blocks) + " blocks)");
+    }
+    return g_transitions.r;
+}
 std::optional<std::string> joint_search_refusal(const GenotypeCommandOptions& o) {
     if (o.repair_joint_search == "off") return std::nullopt;
     const std::string p = "repair_joint_search experimental_v1 ";
@@ -221,6 +251,7 @@ RepairSetup make_repair_setup(const GenotypeCommandOptions& options, const Fragm
     }
     s.fused_seed = options.adaptive_fused_seed;
     s.switch_probability = options.switch_probability;
+    if (g_transitions.distance_mode()) s.switch_vector = g_transitions.r;   // M4-B (constant mode: the scalar, as before)
     s.declared_neighbour_cap = options.repair_max_neighbours;
     s.memory_log = true;
     if (options.diagnostic_refinement_memory) s.memory_live_path = options.out_prefix + ".refinement_memory_live.tsv";
@@ -249,6 +280,7 @@ std::string repair_setup_text(const RepairSetup& r, std::size_t fragments) {
       << s.fine_window_served_cap << ";fused_seed=" << s.fused_seed << ";switch=" << hex_double(s.switch_probability)
       << ";neighbour_cap=" << s.declared_neighbour_cap;
     if (s.round1_reuse_only_admission) t << ";round1_admission=reuse_only_experimental";   // S2-J (absent by default)
+    if (!s.switch_vector.empty()) t << ";transitions=" << g_transitions.vector_digest;   // M4-B (absent in constant mode)
     return t.str();
 }
 std::string emissions_digest(const PreparedProposalEmissions& emissions) {
@@ -1317,7 +1349,8 @@ void write_status(
                                 "dosage_census_backend", "adaptive_emission_handoff", "output_schema", "early_incumbent",
                                 "test_interrupt_point", "diagnostic_union_evidence_dump", "diagnostic_union_kernel_dump",
                                 "union_progressive_schedule", "union_fragment_blocks", "diagnostic_refinement_memory",
-                                "diagnostic_refinement_replay", "repair_round1_origin_admission", "repair_joint_search", "block_support_rule"}) {
+                                "diagnostic_refinement_replay", "repair_round1_origin_admission", "repair_joint_search", "block_support_rule",
+                                "copying_transition", "copying_length_bp"}) {
             const auto source = options.setting_sources.find(key);
             if (source == options.setting_sources.end()) continue;
             const std::string k = key;
@@ -1349,6 +1382,8 @@ void write_status(
                                       : k == "repair_round1_origin_admission" ? options.repair_round1_origin_admission
                                       : k == "repair_joint_search" ? options.repair_joint_search
                                       : k == "block_support_rule" ? options.block_support_rule
+                                      : k == "copying_transition" ? options.copying_transition
+                                      : k == "copying_length_bp" ? hex_double(options.copying_length_bp)
                                       : k == "gap_recursion_backend"
                                           ? std::string(gap_recursion_backend_name(options.gap_recursion_fixed_geometry))
                                                                          : std::to_string(options.adaptive_fine_max_served_placements);
@@ -1363,6 +1398,36 @@ void write_status(
     out << "syncmer_s\t" << options.syncmer_s << '\n';
     out << "min_variant_bp\t" << options.min_variant_bp << '\n';
     out << "switch_probability\t" << options.switch_probability << '\n';
+    if (options.setting_sources.count("copying_transition") != 0) {   // M4-B: recorded only when a profile set the key
+        const CopyingTransitions& tr = g_transitions;
+        out << "copying_transition\t" << options.copying_transition << "\ncopying_redraw_measure\tuniform_template_rows_v1\n";
+        if (options.copying_transition != "constant_v1") {
+            std::ostringstream v;
+            v << std::setprecision(17) << options.copying_length_bp;
+            out << "copying_length_bp\t" << v.str() << "\ncopying_length_bp_hex\t" << hex_double(options.copying_length_bp) << '\n';
+        }
+        out << "locus_geometry_status\t" << g_geometry.status << "\nlocus_geometry_reference\t"
+            << (g_geometry.reference_path_name.empty() ? "NA" : g_geometry.reference_path_name) << "\nlocus_geometry_digest\t"
+            << (g_geometry.digest.empty() ? "NA" : g_geometry.digest) << "\nlocus_geometry_frame_digest\t"
+            << (g_geometry.frame_digest.empty() ? "NA" : g_geometry.frame_digest) << '\n';
+        if (!tr.r.empty()) {
+            out << "transition_vector_sha256\t" << tr.vector_digest << "\ntransition_boundaries\t" << tr.r.size() << "\ntransition_r_min\t"
+                << *std::min_element(tr.r.begin(), tr.r.end()) << "\ntransition_r_max\t" << *std::max_element(tr.r.begin(), tr.r.end())
+                << "\ntransition_zero_distance_boundaries\t" << tr.zero_distance_boundaries
+                << "\ntransition_zero_distance_informative_boundaries\t" << tr.zero_distance_informative_boundaries << '\n';
+            if (tr.distance_mode()) {
+                out << "locus_geometry_distances_bp\t";
+                for (std::size_t b = 0; b < tr.distance_bp.size(); ++b) {   // exact halves of a bp
+                    std::ostringstream v;
+                    v << std::fixed << std::setprecision(1) << tr.distance_bp[b];
+                    out << (b ? "," : "") << v.str();
+                }
+                out << '\n';
+            }
+        } else {
+            out << "transition_vector_sha256\tNA\n";
+        }
+    }
     out << "max_mosaic_candidates\t" << options.max_mosaic_candidates << '\n';
     out << "mismatch_band\t" << options.mismatch_band << '\n';
     // Version one is serial by contract: the scorer is not threaded before the serial algorithm
@@ -2172,6 +2237,19 @@ void apply_genotype_setting(const std::string& context, const std::string& key, 
         }
         options.union_progressive_schedule = value;
     }
+    else if (key == "copying_transition") {   // M4-B (EXPERIMENTAL)
+        if (value != "constant_v1" && value != "distance_ref_core_v1_experimental") {
+            throw std::runtime_error(context + ": 'copying_transition' is constant_v1 or distance_ref_core_v1_experimental: " + value);
+        }
+        options.copying_transition = value;
+    }
+    else if (key == "copying_length_bp") {   // M4-B (EXPERIMENTAL)
+        std::size_t used = 0;
+        double v = 0.0;
+        try { v = std::stod(value, &used); } catch (const std::exception&) { used = 0; }
+        if (used != value.size() || !std::isfinite(v) || !(v > 0.0)) throw std::runtime_error(context + ": 'copying_length_bp' must be a finite number > 0: " + value);
+        options.copying_length_bp = v;
+    }
     else if (key == "block_support_rule") {   // M3-E (EXPERIMENTAL)
         if (value != "legacy" && value != "full_data_likelihood_v1_experimental" && value != "full_data_likelihood_v2_experimental") {
             throw std::runtime_error(context + ": 'block_support_rule' is legacy, full_data_likelihood_v1_experimental or "
@@ -2894,6 +2972,15 @@ GenotypeRunStatus run_genotype_body(const GenotypeCommandOptions& options, Genot
     if (const std::optional<std::string> refused = joint_search_refusal(options)) {   // M3-D: before the prefix
         throw std::invalid_argument(*refused);
     }
+    if (const std::optional<std::string> refused = copying_transition_refusal(options)) {   // M4-B: before the prefix
+        throw std::invalid_argument(*refused);
+    }
+    if (locus != nullptr && options.copying_transition != "constant_v1") {   // M4-B: before the prefix
+        throw std::invalid_argument("copying_transition " + options.copying_transition + " needs the adapter's locus geometry; a prepared "
+                                    "locus (built in-process or loaded from an index file) carries none -- run from the graph");
+    }
+    g_transitions = CopyingTransitions{};   // M4-B: never a previous run's vector
+    g_geometry = LocusGeometry{};
     {
         std::lock_guard<std::mutex> lock(g_checkpoint_mutex);   // S2-G: this run's checkpoints only
         g_checkpoints_on = options.union_fragment_blocks != "off";
@@ -3147,6 +3234,20 @@ GenotypeRunStatus run_genotype_body(const GenotypeCommandOptions& options, Genot
                      "the locus does not carry at least two blocks and two panel templates");
         return GenotypeRunStatus::ModelIncomplete;
     }
+    // M4-B: the run's ONE copying-transition vector, before any stage computes a prior.
+    if (locus == nullptr) g_geometry = local.built.geometry;
+    try {
+        CopyingTransitionSpec spec;
+        spec.mode = options.copying_transition;
+        spec.constant_r = options.switch_probability;
+        spec.copying_length_bp = options.copying_length_bp;
+        g_transitions = build_copying_transitions(model.blocks().size(), spec.mode == "constant_v1" ? nullptr : &g_geometry, spec);
+    } catch (const UnsupportedCopyingTransition& error) {
+        timings.total = seconds_since(started);
+        write_status(status_path, GenotypeRunStatus::ModelIncomplete, fingerprint, options, library, timings, &locus_report, nullptr,
+                     nullptr, nullptr, std::string("unsupported copying transition: ") + error.what());
+        return GenotypeRunStatus::ModelIncomplete;
+    }
 
     // ---- stage 2: markers ----------------------------------------------------------------------
     mark = Clock::now();
@@ -3367,7 +3468,7 @@ GenotypeRunStatus run_genotype_body(const GenotypeCommandOptions& options, Genot
         // Selection: the panel pair maximising the existing proposal marker emissions plus the exact path prior (the
         // ranking's own prior arithmetic), ties to panel order. Table lookups only: nothing is fragment-scored here.
         const Clock::time_point select_mark = Clock::now();
-        const std::vector<double> early_switch(model.blocks().size() - 1, options.switch_probability);
+        const std::vector<double> early_switch = run_switches(model.blocks().size());   // M4-B
         std::map<std::vector<std::size_t>, double> early_path_prior;
         const auto path_prior_of = [&](const MosaicPath& path) {
             const auto found = early_path_prior.find(path.alleles);
@@ -3497,8 +3598,7 @@ GenotypeRunStatus run_genotype_body(const GenotypeCommandOptions& options, Genot
     // ---- stage 3b: mosaic proposal --------------------------------------------------------------------------
     write_running_status("proposal");
     mark = Clock::now();
-    const std::vector<double> switch_probability(
-        model.blocks().size() - 1, options.switch_probability);
+    const std::vector<double> switch_probability = run_switches(model.blocks().size());   // M4-B: the run's one vector
     MosaicBeamResult beam;
     if (!panel_only) {
         MosaicBeamParameters beam_parameters;
@@ -3785,7 +3885,7 @@ GenotypeRunStatus run_genotype_body(const GenotypeCommandOptions& options, Genot
     // S2-C/S2-D: a truth-free proposal score per sequence pair (the S2-A selection formula: proposal marker emissions plus
     // the exact path prior, maximised over the pair's labellings) -- the progressive schedule's order and the kernel dump's
     const auto pair_proposal_scores = [&]() {
-        const std::vector<double> sw(model.blocks().size() - 1, options.switch_probability);
+        const std::vector<double> sw = run_switches(model.blocks().size());   // M4-B
         std::map<std::vector<std::size_t>, double> path_prior;
         const auto prior_of = [&](const MosaicPath& path) {
             const auto found = path_prior.find(path.alleles);
@@ -3990,7 +4090,7 @@ GenotypeRunStatus run_genotype_body(const GenotypeCommandOptions& options, Genot
                         g_progressive.prefix_pairs = prefix.size();
                         g_progressive.prefix_tied_groups = ranking.winner_set.size();
                         if (g_incumbent.enabled && !g_incumbent.failed) {
-                            const std::vector<double> sw(model.blocks().size() - 1, options.switch_probability);
+                            const std::vector<double> sw = run_switches(model.blocks().size());   // M4-B
                             const MosaicCandidate* representative = nullptr;
                             double representative_prior = -std::numeric_limits<double>::infinity();
                             std::size_t labellings = 0, prefix_labellings = 0;
@@ -5329,7 +5429,7 @@ GenotypeRunStatus run_genotype_body(const GenotypeCommandOptions& options, Genot
             std::set<DiplotypeIdentity> announced;          // every start a tie offered, as the worklist dedupes
             std::set<DiplotypeIdentity> pending;            // announced and not yet run: the frontier
             std::unique_ptr<CoordinateRepairSearch> live;   // the branch that ran last, alive for its own tie
-            const std::vector<double> seed_switches(block_count - 1, search_options.switch_probability);
+            const std::vector<double> seed_switches = run_switches(block_count);   // M4-B
             const auto pins_now = [&]() {
                 std::vector<std::size_t> pins(legacy_parent_pins.begin(), legacy_parent_pins.end());
                 for (const auto& seed : seed_pins) pins.push_back(seed.first);
@@ -6525,7 +6625,7 @@ GenotypeRunStatus run_genotype_body(const GenotypeCommandOptions& options, Genot
             PreparedScoringContext* guard_context = search ? search->context() : nullptr;
             const std::uint64_t guard_origins_before =
                 guard_context != nullptr ? guard_context->cumulative_counters().physical_origins : 0;
-            const std::vector<double> guard_switches(block_count - 1, options.switch_probability);
+            const std::vector<double> guard_switches = run_switches(block_count);   // M4-B
             for (std::size_t b = 0; b < block_count && options.representation_guard; ++b) {
                 BlockFilter& bf = block_filter[b];
                 const BlockProposalEmissions& emission = emissions.blocks[b];
@@ -6647,7 +6747,7 @@ GenotypeRunStatus run_genotype_body(const GenotypeCommandOptions& options, Genot
             const std::size_t created_before = shared->haplotypes_created();
             const std::uint64_t dps_before = read_emission_cache_counters().executed_dps;
             const std::size_t band = scoring_options.mismatch_band;
-            const std::vector<double> start_switches(block_count - 1, search_options.switch_probability);
+            const std::vector<double> start_switches = run_switches(block_count);   // M4-B
             const char* const view_name[] = {"central", "low", "high"};
             std::vector<LibraryAuditView> views(view_count);
             std::vector<std::string> fork_of(view_count, "none"), trunk_stop(view_count, report.stop_reason);
@@ -8367,7 +8467,7 @@ int execute_genotype_command(const GenotypeCommandOptions& requested, const Prep
                 scoring.max_mass_cells = options.max_mass_cells;
                 scoring.emission_cache_bytes = options.emission_cache_bytes;
                 scoring.gap_recursion_backend = gap_recursion_backend_of(options);   // I2-H: dosage too
-                const std::vector<double> switches(capture.model->blocks().size() - 1, options.switch_probability);
+                const std::vector<double> switches = run_switches(capture.model->blocks().size());   // M4-B
                 dosage::DosageShadowOptions shadow_options;
                 shadow_options.threads = options.threads;
                 shadow_options.allocation_test = options.dosage_allocation_test;
@@ -8410,6 +8510,7 @@ int execute_genotype_command(const GenotypeCommandOptions& requested, const Prep
             filters.repair_max_piece_hits = options.repair_max_piece_hits;
             filters.repair_max_latent_pairs = options.repair_max_latent_pairs;
             filters.switch_probability = options.switch_probability;
+            if (g_transitions.distance_mode()) filters.switch_vector = g_transitions.r;   // M4-B
             filters.representation_guard = options.representation_guard;
         }
         dosage::DosageIntegration integration =

@@ -14,6 +14,7 @@
 #include "panvar/bubbles.hpp"
 #include "panvar/fragment_likelihood.hpp"
 #include "panvar/genotype_command.hpp"
+#include "panvar/copying_transitions.hpp"
 #include "panvar/genotype_dosage.hpp"
 #include "panvar/genotype_dosage_integrate.hpp"
 #include "panvar/genotype_dosage_repair.hpp"
@@ -5484,7 +5485,35 @@ int score_set(const Args& args) {
         panvar::score_diplotypes(interned, scored_pairs, fragments, library, scoring);
     const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - mark).count();
 
-    const std::vector<double> switches(blocks - 1, switch_probability);
+    // M4-B: the run's copying-transition specification, through the caller's own builder (no private construction). A
+    // distance specification refuses an explicit --switch-probability, and the specification must agree with the run's
+    // recorded one (mode and, when recorded, the exact vector digest) -- never silently constant.
+    panvar::CopyingTransitionSpec transition_spec;
+    transition_spec.mode = args.get("copying-transition", "constant_v1");
+    transition_spec.constant_r = switch_probability;
+    transition_spec.copying_length_bp = std::stod(args.get("copying-length-bp", "0"));
+    if (transition_spec.mode != "constant_v1" && !args.get("switch-probability", "").empty()) {
+        throw std::runtime_error("score-set: --copying-transition " + transition_spec.mode + " conflicts with --switch-probability");
+    }
+    if (transition_spec.mode == "constant_v1" && !args.get("copying-length-bp", "").empty()) {
+        throw std::runtime_error("score-set: --copying-length-bp needs --copying-transition distance_ref_core_v1_experimental");
+    }
+    const panvar::CopyingTransitions transitions = panvar::build_copying_transitions(
+        blocks, transition_spec.mode == "constant_v1" ? nullptr : &loaded.built.geometry, transition_spec);
+    {
+        const auto mode = status.find("copying_transition");
+        const std::string run_mode = mode == status.end() ? std::string("constant_v1") : mode->second;
+        if (run_mode != transitions.mode) {
+            throw std::runtime_error("score-set: the run used copying_transition " + run_mode + ", this score-set " + transitions.mode);
+        }
+        const auto digest = status.find("transition_vector_sha256");
+        if (digest != status.end() && digest->second != transitions.vector_digest) {
+            throw std::runtime_error("score-set: transition vector digest " + transitions.vector_digest + " differs from the run's " + digest->second);
+        }
+        std::cout << "score-set " << donor << ": copying_transition " << transitions.mode << ", transition_vector_sha256 " << transitions.vector_digest
+                  << (digest != status.end() ? " (matches the run)" : " (the run recorded no digest)") << '\n';
+    }
+    const std::vector<double>& switches = transitions.r;
     std::vector<double> prior_of_pair(scored_pairs.size(), 0.0);
     for (std::size_t slot = 0; slot < scored_pairs.size(); ++slot) {
         prior_of_pair[slot] = panvar::log_unordered_sequence_pair_prior(
@@ -7204,6 +7233,37 @@ int prior_geometry(const Args& args) {
     }
     s << "total_d_panel_mean_m3a\t" << tot[0] << "\ntotal_d_ref_start\t" << tot[1] << "\ntotal_d_ref_block_mid\t" << tot[2] << "\ntotal_d_ref_core_mid\t"
       << tot[3] << "\ntotal_invariant_gap\t" << tot[4] << "\nboundaries_core_mid_nonpositive\t" << zero_core << "\nreference_chain_bp\t" << x << '\n';
+    // M4-B: the ADAPTER's geometry (against the frame, before curation) -- the one the caller consumes -- with its digests,
+    // zero-distance inventory and the hazard-matched control length at --constant-r (default 0.01).
+    const panvar::LocusGeometry& ag = loaded.built.geometry;
+    s << "adapter_geometry_status\t" << ag.status << "\nadapter_geometry_reference\t" << ag.reference_path_name << "\nadapter_geometry_digest\t"
+      << ag.digest << "\nadapter_frame_digest\t" << ag.frame_digest << '\n';
+    std::ostringstream at;
+    at << std::setprecision(12) << "boundary\tleft\tright\tleft_frame_alleles\tright_frame_alleles\td_adapter_core_mid\tzero_distance\tclass\n";
+    if (ag.available()) {
+        const std::vector<double> ad = ag.distances();
+        std::size_t zero = 0, zero_inf = 0;
+        double total = 0.0;
+        for (std::size_t b = 1; b < blocks; ++b) {
+            const bool z = ad[b - 1] == 0.0;
+            const bool inf = ag.frame_distinct_alleles[b - 1] > 1 && ag.frame_distinct_alleles[b] > 1;
+            zero += z ? 1 : 0;
+            zero_inf += (z && inf) ? 1 : 0;
+            total += ad[b - 1];
+            at << b << '\t' << ag.block_ids[b - 1] << '\t' << ag.block_ids[b] << '\t' << ag.frame_distinct_alleles[b - 1] << '\t'
+               << ag.frame_distinct_alleles[b] << '\t' << ad[b - 1] << '\t' << z << '\t' << (inf ? "informative-informative" : "involves_neutral") << '\n';
+        }
+        const double r = std::stod(args.get("constant-r", "0.01"));
+        const double hm = panvar::hazard_matched_copying_length(ag, r);
+        char hex[64];
+        std::snprintf(hex, sizeof hex, "%a", hm);
+        std::ostringstream hm_text;
+        hm_text << std::setprecision(17) << hm;
+        s << "adapter_total_distance_bp\t" << total << "\nadapter_zero_distance_boundaries\t" << zero
+          << "\nadapter_zero_distance_informative_boundaries\t" << zero_inf << "\nhazard_matched_constant_r\t" << r
+          << "\nhazard_matched_copying_length_bp\t" << hm_text.str() << "\nhazard_matched_copying_length_hex\t" << hex << '\n';
+    }
+    atomic_write(out + ".adapter_boundaries.tsv", at.str());
     atomic_write(out + ".blocks.tsv", bt.str());
     atomic_write(out + ".boundaries.tsv", dt.str());
     atomic_write(out + ".summary.tsv", s.str());

@@ -149,6 +149,7 @@ add_library(panvarlib
     src/mosaic_beam.cpp
     src/mosaic_beam_grouped.cpp
     src/genotype_locus.cpp
+    src/copying_transitions.cpp
     src/genotype_command.cpp
     src/prepared_locus_file.cpp
     src/genotype_repair.cpp
@@ -290,6 +291,15 @@ if(PANVAR_BUILD_TESTING)
         target_link_libraries(genotype_joint_search_e2e_test PRIVATE panvarlib)
         target_compile_options(genotype_joint_search_e2e_test PRIVATE -Wall -Wextra -Wpedantic)
         add_test(NAME panvar_genotype_joint_search_e2e COMMAND genotype_joint_search_e2e_test)
+        # M4-B: the shared copying-transition implementation (adapter geometry rule + builder) against the brute-force oracle
+        add_executable(genotype_copying_transitions_test tests/genotype_copying_transitions.cpp src/cli_utils.cpp)
+        target_link_libraries(genotype_copying_transitions_test PRIVATE panvarlib)
+        target_compile_options(genotype_copying_transitions_test PRIVATE -Wall -Wextra -Wpedantic)
+        add_test(NAME panvar_genotype_copying_transitions COMMAND genotype_copying_transitions_test)
+        add_executable(genotype_copying_transitions_e2e_test tests/genotype_copying_transitions_e2e.cpp src/cli_utils.cpp)
+        target_link_libraries(genotype_copying_transitions_e2e_test PRIVATE panvarlib)
+        target_compile_options(genotype_copying_transitions_e2e_test PRIVATE -Wall -Wextra -Wpedantic)
+        add_test(NAME panvar_genotype_copying_transitions_e2e COMMAND genotype_copying_transitions_e2e_test)
         # M3-A diagnostic (not a ctest): copying-prior representation tests reusing the mosaic-core oracles
         add_executable(m3a_prior_representation tests/m3a_prior_representation.cpp)
         target_link_libraries(m3a_prior_representation PRIVATE panvarlib)

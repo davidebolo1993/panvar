@@ -60,6 +60,7 @@ struct ReportedFilterInputs {
     FragmentScoringOptions scoring;
     std::uint64_t repair_max_physical_origins = 0, repair_max_state_classes = 0, repair_max_piece_hits = 0, repair_max_latent_pairs = 0;
     double switch_probability = 0.01;
+    std::vector<double> switch_vector;   // M4-B: when non-empty, the run's shared transition vector replaces the scalar
     bool representation_guard = true;
 };
 

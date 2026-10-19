@@ -253,7 +253,8 @@ std::vector<GuardRow> representation_guard_rows(const PreparedGenotypeModel& mod
                                                 const ReportedFilterInputs& in, const MosaicPath& first, const MosaicPath& second,
                                                 const DiplotypeScore& called, double called_prior) {
     const std::size_t blocks = model.blocks().size();
-    const std::vector<double> switches(blocks - 1, in.switch_probability);
+    const std::vector<double> switches = !in.switch_vector.empty() ? in.switch_vector : std::vector<double>(blocks - 1, in.switch_probability);
+    if (switches.size() + 1 != blocks) throw std::invalid_argument("the dosage transition vector does not match the block count");
     ScoringInputs si;
     si.model = &model; si.reads = in.reads; si.library = in.library; si.options = in.scoring;
     si.repair_max_physical_origins = in.repair_max_physical_origins; si.repair_max_state_classes = in.repair_max_state_classes;

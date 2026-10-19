@@ -83,6 +83,8 @@ struct RepairSearchOptions {
     // retain each census by a second full placement, as before).
     bool fused_seed = false;
     double switch_probability = 0.01;
+    // M4-B: when non-empty (one per boundary), the run's shared copying-transition vector replaces the scalar above.
+    std::vector<double> switch_vector;
     // 0: none. A round's neighbourhood above this is refused before any allocation.
     std::uint64_t declared_neighbour_cap = 0;
     // Per-round memory accounts at four fixed points (context modes only).

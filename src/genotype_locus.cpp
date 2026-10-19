@@ -335,6 +335,83 @@ TrimOutcome trim_variant_block_to_divergence(
 
 } // namespace
 
+LocusGeometry compute_locus_geometry(const std::vector<std::string>& block_ids,
+                                     const std::vector<std::string>& invariant_segments,
+                                     const std::vector<std::vector<std::string>>& frame_alleles,
+                                     const std::vector<std::string>* reference_alleles,
+                                     const std::string& reference_path_name,
+                                     const std::string& unavailable_reason) {
+    LocusGeometry g;
+    g.reference_path_name = reference_path_name;
+    g.block_ids = block_ids;
+    const std::size_t blocks = block_ids.size();
+    if (frame_alleles.size() != blocks || invariant_segments.size() != blocks + 1) {
+        throw std::invalid_argument("locus geometry: frame and chain sizes disagree");
+    }
+    Digest frame;
+    frame.add(blocks);
+    for (std::size_t b = 0; b < blocks; ++b) {
+        frame.add(block_ids[b]);
+        std::set<std::string> distinct(frame_alleles[b].begin(), frame_alleles[b].end());
+        frame.add(distinct.size());
+        for (const std::string& s : distinct) frame.add(s);
+        g.frame_distinct_alleles.push_back(distinct.size());
+    }
+    g.frame_digest = frame.hex();
+    if (reference_alleles == nullptr || reference_alleles->size() != blocks) {
+        g.status = "unavailable: " + (unavailable_reason.empty() ? std::string("no reference allele per block") : unavailable_reason);
+    } else {
+        long long x = static_cast<long long>(invariant_segments[0].size());
+        for (std::size_t b = 0; b < blocks; ++b) {
+            const std::string& rs = (*reference_alleles)[b];
+            const long long len = static_cast<long long>(rs.size());
+            std::size_t pre = rs.size(), suf = rs.size();
+            if (g.frame_distinct_alleles[b] > 1) {
+                for (const std::string& a : frame_alleles[b]) {
+                    std::size_t p = 0, q = 0;
+                    while (p < rs.size() && p < a.size() && rs[p] == a[p]) ++p;
+                    while (q < rs.size() && q < a.size() && rs[rs.size() - 1 - q] == a[a.size() - 1 - q]) ++q;
+                    pre = std::min(pre, p);
+                    suf = std::min(suf, q);
+                }
+            }
+            long long lo = x + static_cast<long long>(std::min<std::size_t>(pre, rs.size()));
+            long long hi = x + len - static_cast<long long>(std::min<std::size_t>(suf, rs.size()));
+            long long pos2 = lo + hi;   // twice the state's position, exact
+            if (lo > hi) lo = hi = std::min(lo, hi);   // overlapping shared affixes (indel in a repeat): an empty core
+            if (g.frame_distinct_alleles[b] <= 1) {   // neutral: an empty core at the block interval's midpoint
+                pos2 = 2 * x + len;
+                lo = hi = x;
+            }
+            g.ref_start.push_back(x);
+            g.ref_end.push_back(x + len);
+            g.core_start.push_back(lo);
+            g.core_end.push_back(hi);
+            g.position_x2.push_back(pos2);
+            x += len + static_cast<long long>(invariant_segments[b + 1].size());
+        }
+        g.status = "available";
+    }
+    Digest digest;
+    digest.add(g.status);
+    digest.add(g.reference_path_name);
+    digest.add(g.frame_digest);
+    for (std::size_t b = 0; b < g.ref_start.size(); ++b) {
+        for (const long long v : {g.ref_start[b], g.ref_end[b], g.core_start[b], g.core_end[b], g.position_x2[b]}) digest.add(static_cast<std::size_t>(v));
+    }
+    g.digest = digest.hex();
+    return g;
+}
+
+std::vector<double> LocusGeometry::distances() const {
+    if (!available()) throw std::invalid_argument("locus geometry is " + status);
+    std::vector<double> d;
+    for (std::size_t b = 1; b < position_x2.size(); ++b) {
+        d.push_back(0.5 * static_cast<double>(position_x2[b] - position_x2[b - 1]));
+    }
+    return d;
+}
+
 LocusInputResult build_locus_input(
     const Graph& graph,
     const std::vector<Bubble>& bubbles,
@@ -529,6 +606,31 @@ LocusInputResult build_locus_input(
         }
     }
     report.boundary_bases_moved_to_context = moved_bases;
+
+    // M4-B: the geometry, against the frame (every complete-frame template, curated ones included), before curation.
+    {
+        std::vector<std::vector<std::string>> frame(chain.size());
+        for (std::size_t bi = 0; bi < chain.size(); ++bi) frame[bi] = block_sequences[bi].sequences;
+        std::size_t ref = graph.paths.size();
+        for (std::size_t pi = 0; pi < graph.paths.size(); ++pi) {
+            if (graph.paths[pi].name == options.reference_path_name) ref = pi;
+        }
+        std::string reason;
+        if (options.reference_path_name.empty()) reason = "no reference path declared";
+        else if (ref == graph.paths.size()) reason = "the reference path is not a path of the graph";
+        else if (!orientations[ref].has_value()) reason = "the reference path has no consistent chain frame";
+        else if (*orientations[ref] != ChainOrientation::Forward) reason = "the reference path is antiparallel to the chain";
+        else if (!complete[ref]) reason = "the reference path's frame is partial: " + partial_reason_by_template[ref];
+        if (reason.empty()) {
+            std::vector<std::string> ref_alleles(chain.size());
+            for (std::size_t bi = 0; bi < chain.size(); ++bi) {
+                ref_alleles[bi] = block_sequences[bi].sequences.at(slot_by_source[bi].at(allele_source_by_template[ref][bi]));
+            }
+            result.geometry = compute_locus_geometry(block_ids, result.input.invariant_segments, frame, &ref_alleles, options.reference_path_name);
+        } else {
+            result.geometry = compute_locus_geometry(block_ids, result.input.invariant_segments, frame, nullptr, options.reference_path_name, reason);
+        }
+    }
 
     // The active panel. Curation removes named templates from the callable panel, not only from the panel-pair
     // search: a block's source allele stays callable only when a retained template with a complete frame carries it.
