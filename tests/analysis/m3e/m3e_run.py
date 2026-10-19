@@ -47,7 +47,10 @@ MANIFEST_A = [("audit.saved", "audit", "-", 60)]
 MANIFEST_G = [("gate.support", "gate_support", "-", 60)]
 MANIFEST_R = ([(f"run.{c}.{arm}", "run", f"{c}:{arm}", TIMEOUT[c] + (30 if arm == "on" else 0)) for c in ORDER for arm in ("off", "on")] +
               [("compare", "cmp", "-", 30)])
-MANIFESTS = {"A": MANIFEST_A, "G": MANIFEST_G, "R": MANIFEST_R}
+# gate.support (manifest G) failed on gate fixtures, recorded; the fixtures were corrected (commits 0a9044b..) and the final
+# gate units below run on committed code
+MANIFEST_G2 = [("gate.support.final", "gate_support", "-", 60), ("gate.e2e.final", "gate_e2e", "-", 60)]
+MANIFESTS = {"A": MANIFEST_A, "G": MANIFEST_G, "G2": MANIFEST_G2, "R": MANIFEST_R}
 CARRIED = 0.0
 INPUTS = {r["cell"] + ":" + r["file"]: r["sha256"] for r in csv.DictReader(open(os.path.join(HERE, "INPUTS.tsv")), delimiter="\t")}
 
@@ -134,6 +137,8 @@ def command(unit, kind, target, timeout, d):
     if kind == "audit":
         runs = [f"{c}.{arm}={M3D}/run.{c}.{arm}/call" for c in ORDER for arm in ("off", "on")]
         return [sys.executable, os.path.join(HERE, "audit_saved.py"), f"{d}/audit", *runs], "saved-evidence audit (independent Python, truth-free)"
+    if kind == "gate_e2e":
+        return [f"{BUILD}/genotype_joint_search_e2e_test"], "caller gates incl. the annotation-only and thread checks"
     if kind == "gate_support":
         return [f"{BUILD}/genotype_block_support_test"], "support-rule gates (shared function)"
     if kind == "run":
