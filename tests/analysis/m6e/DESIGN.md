@@ -103,3 +103,14 @@ to more haplotypes, then the type's majority length class, then the smallest SHA
   smallest decisive next test (or parking).
 
 Unresolved correspondence and resource limits are recorded, not expanded.
+
+## Amendment 1 (declared after `analyse` exited 1; 3.5 s spent)
+
+**What failed.** The input guard refused the script's final read-back of its own `m6e.summary.tsv`, which it does only to
+print it. Every output had already been written.
+
+**Fix.** Reads under the unit's own directory are now allowed. The allowlist for inputs is unchanged, and so is every
+measurement.
+
+**Units.** Manifest A1: `analyse.a1` (90 s). `analyse` stays recorded as failed. Its outputs were not inspected before this
+amendment.

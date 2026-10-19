@@ -39,7 +39,8 @@ def guarded(path, mode="r", *a, **k):
     if "w" in mode or "a" in mode:
         assert p.startswith(os.path.dirname(os.path.abspath(prefix))), f"write outside the unit directory: {p}"
     else:
-        assert p in ALLOW, f"not an allowlisted panel-only input: {p}"
+        # Amendment 1: the unit may read back its own outputs (the final summary print)
+        assert p in ALLOW or p.startswith(os.path.dirname(os.path.abspath(prefix))), f"not an allowlisted panel-only input: {p}"
     return _open(path, mode, *a, **k)
 
 

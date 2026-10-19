@@ -21,7 +21,10 @@ OUT = "/Users/davide.bolognini/panvar/tests/results/m6e_panel_variation_20261019
 M1D = "/Users/davide.bolognini/panvar/tests/results/m1d_unit_reachability_20261019/runs"
 BUDGET = 300
 MANIFEST_P = [("prepare", "prepare", "-", 30), ("align", "align", "-", 120), ("analyse", "analyse", "-", 90)]
-MANIFESTS = {"P": MANIFEST_P}
+# Amendment 1 (declared after `analyse` exited 1 at 3.5 s spent): the input guard refused the script's read-back of its own
+# summary for the final print (all outputs were already written); reads under the unit's own directory are allowed. analyse.a1.
+MANIFEST_A1 = [("analyse.a1", "analyse", "-", 90)]
+MANIFESTS = {"P": MANIFEST_P, "A1": MANIFEST_A1}
 INPUTS = [   # panel-only inputs (frozen digests); nothing else is read
     {"file": f"{M1D}/inventory.a1/inventory.tsv", "sha256": "e890464ef2a1d6b91cb15b2d53a1577ddcdc032ec85f698033a1cc57a99b1039"},
     {"file": f"{M1D}/inventory.a1/inventory.fa", "sha256": "8f425a37e811428616d1d40b707fe6813e0f710b79ef36cabcb44215deb470c4"},
