@@ -7095,6 +7095,122 @@ int joint_bounds(const Args& args) {
     return 0;
 }
 
+// prior-geometry (M4-A, DIAGNOSTIC; truth-free, read-free, candidate-free): per block, the reference path's interval along
+// the canonical chain (from the reference projected onto the model's own block frame), the polymorphic core of the
+// block's callable alleles (maximal common prefix/suffix removed), and per boundary every candidate distance the M4-A
+// contract compares: M3-A's panel-mean span (start of block b-1 to start of block b, averaged over templates), the
+// reference start-to-start distance, the reference block-midpoint distance, the reference core-midpoint distance and the
+// invariant gap. Gates: the reference projection must tile the chain (invariant segments + projected blocks spell the
+// reference path's bytes in chain order) and, when the reference is a panel template, agree with that template's alleles.
+// Nothing here is used by any caller.
+int prior_geometry(const Args& args) {
+    const std::string out = args.required("out");
+    const std::string reference = args.required("reference");
+    const std::string curation = args.get("panel-curation", "");
+    const LoadedModel loaded = load_model(args.required("model-gfa"), reference, out + ".model.sorted.gfa", 50,
+                                          curation.empty() ? std::vector<std::string>{} : read_panel_curation(curation));
+    std::filesystem::remove(out + ".model.sorted.gfa");
+    const panvar::PreparedGenotypeModel& model = *loaded.model;
+    const std::size_t blocks = model.blocks().size();
+    const auto& panel = model.panel();
+    const auto& inv = model.invariant_segments();
+    const auto projection = panvar::project_path_onto_locus(loaded.sorted.graph, loaded.bubbles, loaded.built.report, reference);
+    std::ostringstream s;
+    s << std::setprecision(12) << "key\tvalue\nmodel_fingerprint\t" << loaded.fingerprint << "\nblocks\t" << blocks << "\ntemplates\t"
+      << panel.template_count() << "\nchain_orientation\t" << (model.chain_orientation() == panvar::ChainOrientation::Forward ? "forward" : "reverse")
+      << "\nreference_projected\t" << (projection.has_value() ? "true" : "false") << '\n';
+    if (!projection.has_value()) {
+        atomic_write(out + ".summary.tsv", s.str());
+        std::cout << s.str() << "prior-geometry: REFUSED (the reference does not project onto the chain)\n";
+        return 4;
+    }
+    std::vector<std::size_t> ref_len(blocks, 0);
+    bool complete = true;
+    std::string spelled = inv[0];
+    for (std::size_t b = 0; b < blocks; ++b) {
+        if (!projection->blocks[b].has_value()) { complete = false; continue; }
+        ref_len[b] = projection->blocks[b]->size();
+        spelled += *projection->blocks[b] + inv[b + 1];
+    }
+    // the reference path's own bytes, for the tiling gate
+    std::string path_bytes;
+    for (const panvar::PathRecord& p : loaded.sorted.graph.paths) {
+        if (p.name == reference) path_bytes = panvar::spell_path_steps_sequence(loaded.sorted.graph, p.steps);
+    }
+    const auto rc = [](std::string x) {
+        std::reverse(x.begin(), x.end());
+        for (char& c : x) c = c == 'A' ? 'T' : c == 'C' ? 'G' : c == 'G' ? 'C' : c == 'T' ? 'A' : c;
+        return x;
+    };
+    const bool tiles = complete && (spelled == path_bytes || spelled == rc(path_bytes));
+    std::size_t ref_template = panel.template_count();
+    for (std::size_t t = 0; t < panel.template_count(); ++t) if (panel.template_names[t] == reference) ref_template = t;
+    bool agrees = true;
+    if (ref_template != panel.template_count()) {
+        for (std::size_t b = 0; b < blocks; ++b) {
+            if (!projection->blocks[b].has_value() || model.blocks()[b].alleles[panel.template_alleles[ref_template][b]].sequence != *projection->blocks[b]) agrees = false;
+        }
+    }
+    s << "reference_projection_complete\t" << complete << "\nreference_tiles_chain\t" << tiles << "\nreference_path_bp\t" << path_bytes.size()
+      << "\nreference_is_panel_template\t" << (ref_template != panel.template_count()) << "\nreference_template_alleles_agree\t" << agrees << '\n';
+    // per block
+    std::vector<double> start(blocks), end(blocks), core_lo(blocks), core_hi(blocks), pmean(blocks);
+    double x = static_cast<double>(inv[0].size());
+    std::ostringstream bt;
+    bt << std::setprecision(12) << "block\tkind\tcallable_alleles\tref_bp\tref_start\tref_end\tcommon_prefix\tcommon_suffix\tcore_start\tcore_end\tcore_bp\t"
+                                   "panel_mean_bp\tmin_allele_bp\tmax_allele_bp\tinvariant_after_bp\n";
+    for (std::size_t b = 0; b < blocks; ++b) {
+        const auto& al = model.blocks()[b].alleles;
+        std::size_t pre = std::numeric_limits<std::size_t>::max(), suf = std::numeric_limits<std::size_t>::max(), lo_bp = std::numeric_limits<std::size_t>::max(), hi_bp = 0;
+        for (const auto& a : al) {
+            lo_bp = std::min(lo_bp, a.sequence.size());
+            hi_bp = std::max(hi_bp, a.sequence.size());
+            const std::string& r0 = al[0].sequence;
+            std::size_t p = 0;
+            while (p < r0.size() && p < a.sequence.size() && r0[p] == a.sequence[p]) ++p;
+            std::size_t q = 0;
+            while (q < r0.size() && q < a.sequence.size() && r0[r0.size() - 1 - q] == a.sequence[a.sequence.size() - 1 - q]) ++q;
+            pre = std::min(pre, p);
+            suf = std::min(suf, q);
+        }
+        if (al.size() == 1) pre = suf = al[0].sequence.size();   // monomorphic: no polymorphic core
+        start[b] = x;
+        end[b] = x + static_cast<double>(ref_len[b]);
+        const double L = static_cast<double>(ref_len[b]);
+        double lo = start[b] + std::min<double>(static_cast<double>(pre), L), hi = end[b] - std::min<double>(static_cast<double>(suf), L);
+        if (lo > hi) lo = hi = 0.5 * (lo + hi);
+        core_lo[b] = lo;
+        core_hi[b] = hi;
+        double mean = 0.0;
+        for (std::size_t t = 0; t < panel.template_count(); ++t) mean += static_cast<double>(al[panel.template_alleles[t][b]].sequence.size());
+        pmean[b] = mean / static_cast<double>(panel.template_count());
+        bt << model.blocks()[b].block_id << '\t' << (model.blocks()[b].kind == panvar::GenotypeBlockKind::Variant ? "variant" : "context") << '\t'
+           << al.size() << '\t' << ref_len[b] << '\t' << start[b] << '\t' << end[b] << '\t' << pre << '\t' << suf << '\t' << lo << '\t' << hi << '\t'
+           << hi - lo << '\t' << pmean[b] << '\t' << lo_bp << '\t' << hi_bp << '\t' << inv[b + 1].size() << '\n';
+        x = end[b] + static_cast<double>(inv[b + 1].size());
+    }
+    std::ostringstream dt;
+    dt << std::setprecision(12) << "boundary\tleft\tright\td_panel_mean_m3a\td_ref_start\td_ref_block_mid\td_ref_core_mid\td_invariant_gap\n";
+    double tot[5] = {0, 0, 0, 0, 0};
+    std::size_t zero_core = 0;
+    for (std::size_t b = 1; b < blocks; ++b) {
+        const double d[5] = {pmean[b - 1] + static_cast<double>(inv[b].size()), start[b] - start[b - 1], 0.5 * (start[b] + end[b]) - 0.5 * (start[b - 1] + end[b - 1]),
+                             0.5 * (core_lo[b] + core_hi[b]) - 0.5 * (core_lo[b - 1] + core_hi[b - 1]), static_cast<double>(inv[b].size())};
+        for (int k = 0; k < 5; ++k) tot[k] += d[k];
+        zero_core += d[3] <= 0.0 ? 1 : 0;
+        dt << b << '\t' << model.blocks()[b - 1].block_id << '\t' << model.blocks()[b].block_id;
+        for (double v : d) dt << '\t' << v;
+        dt << '\n';
+    }
+    s << "total_d_panel_mean_m3a\t" << tot[0] << "\ntotal_d_ref_start\t" << tot[1] << "\ntotal_d_ref_block_mid\t" << tot[2] << "\ntotal_d_ref_core_mid\t"
+      << tot[3] << "\ntotal_invariant_gap\t" << tot[4] << "\nboundaries_core_mid_nonpositive\t" << zero_core << "\nreference_chain_bp\t" << x << '\n';
+    atomic_write(out + ".blocks.tsv", bt.str());
+    atomic_write(out + ".boundaries.tsv", dt.str());
+    atomic_write(out + ".summary.tsv", s.str());
+    std::cout << s.str();
+    return tiles && agrees ? 0 : 3;
+}
+
 // support-audit (M3-E.1): the C++ block_data_support_v2 on a saved run's (rounded) score and candidate tables -- the same
 // inputs the independent Python audit reads. No model, no reads, no rescoring.
 int support_audit(const Args& args) {
@@ -8307,6 +8423,7 @@ int main(int argc, char** argv) {
         if (command == "two-block-lik-gate") return two_block_lik_gate(args);
         if (command == "joint-bounds") return joint_bounds(args);
         if (command == "support-audit") return support_audit(args);
+        if (command == "prior-geometry") return prior_geometry(args);
         if (command == "mass-reconcile") return mass_reconcile(args);
         if (command == "spell") return spell(args);
         if (command == "edit-distances") return edit_distances(args);

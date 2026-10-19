@@ -294,6 +294,10 @@ if(PANVAR_BUILD_TESTING)
         add_executable(m3a_prior_representation tests/m3a_prior_representation.cpp)
         target_link_libraries(m3a_prior_representation PRIVATE panvarlib)
         target_compile_options(m3a_prior_representation PRIVATE -Wall -Wextra -Wpedantic)
+        # M4-A diagnostic (not a ctest): distance-aware copying-prior contract invariance gates (prototype in the test only)
+        add_executable(m4a_distance_prior tests/m4a_distance_prior.cpp)
+        target_link_libraries(m4a_distance_prior PRIVATE panvarlib)
+        target_compile_options(m4a_distance_prior PRIVATE -Wall -Wextra -Wpedantic)
 
         # bubbles.cpp draws its progress bar from cli_utils, which otherwise only the panvar
         # executable compiles; this test is the first to link the bubble caller on its own.
