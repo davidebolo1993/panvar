@@ -148,3 +148,17 @@ state's own boundary enters no prior.
 the test or the library.
 
 **Units.** Manifest A1, `gate.lib.a1` (60 s). `gate.lib` stays recorded as failed.
+
+## Amendment 2 (declared after `gate.e2e` and before any further unit; 8.7 s spent)
+
+**What failed.** `gate.e2e` exited 1 on one check, E6 "reverse-written graph: distances equal". Forward
+`365.5,510.0,510.0,510.0,365.0`; reverse `365.0,510.0,510.0,510.0,365.5`. All 23 other checks passed, including E6's
+independent-recomputation check.
+
+**Cause: an expectation defect.** Writing every path reverse-complemented, the reference included, reverses the
+canonical chain, which is defined by the reference's direction. The positions are therefore mirrored, as M4-A
+CONTRACT section 2 states. The observed distances are the exact mirror.
+
+**Fix.** E6 now checks that the reversed list equals the forward list (row prefix `E6 A2:`). The library is unchanged.
+
+**Units.** Manifest A2, `gate.e2e.a2` (240 s). `gate.e2e` stays recorded as failed.

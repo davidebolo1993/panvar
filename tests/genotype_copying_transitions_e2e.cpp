@@ -310,8 +310,14 @@ int main() {
         const Locus r = write_valley("valley_rev", true, false);
         const auto xr = distance(options(r, "dist_rev"), 500.0);
         check(panvar::run_genotype(xr) == panvar::GenotypeRunStatus::Complete, "E6 reverse-written graph completes");
-        check(status(xr.out_prefix)["locus_geometry_distances_bp"] == st["locus_geometry_distances_bp"],
-              "E6 reverse-written graph: distances equal (" + status(xr.out_prefix)["locus_geometry_distances_bp"] + " vs " + st["locus_geometry_distances_bp"] + ")");
+        {   // Amendment 2: a reverse-complemented reference reverses the canonical chain, so the distances are the MIRROR (the
+            // M4-B freeze expected equality, a test defect; M4-A CONTRACT section 2: reversal mirrors positions)
+            auto mirrored = parse_list(status(xr.out_prefix)["locus_geometry_distances_bp"]);
+            std::reverse(mirrored.begin(), mirrored.end());
+            check(mirrored == parse_list(st["locus_geometry_distances_bp"]),
+                  "E6 A2: reverse-written graph: distances mirror the forward ones (" + status(xr.out_prefix)["locus_geometry_distances_bp"] + " vs " +
+                      st["locus_geometry_distances_bp"] + ")");
+        }
         // E7: insertion and deletion blocks
         const Locus id = write_valley("indel", false, true);
         const auto xi = distance(options(id, "dist_indel"), 500.0);

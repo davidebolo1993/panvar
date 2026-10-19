@@ -77,7 +77,9 @@ MANIFEST_E = ([("identity.c4_three_switches_1_2.baseline", "run", "c4_three_swit
 MANIFEST_D = [(f"decomp.{c}", "decomp", c, 90) for c in CONTROLS + ERRORS]
 # Amendment 1: gate.lib failed one row on a test-assertion defect (G4 carved case); corrected assertion, re-run
 MANIFEST_A1 = [("gate.lib.a1", "exe", "genotype_copying_transitions_test", 60)]
-MANIFESTS = {"A1": MANIFEST_A1, "G": MANIFEST_G, "L": MANIFEST_L, "C": MANIFEST_C, "E": MANIFEST_E, "D": MANIFEST_D}
+# Amendment 2: gate.e2e failed E6 on an expectation defect (a reverse-complemented reference mirrors the distances)
+MANIFEST_A2 = [("gate.e2e.a2", "exe", "genotype_copying_transitions_e2e_test", 240)]
+MANIFESTS = {"A1": MANIFEST_A1, "A2": MANIFEST_A2, "G": MANIFEST_G, "L": MANIFEST_L, "C": MANIFEST_C, "E": MANIFEST_E, "D": MANIFEST_D}
 INPUTS = list(csv.DictReader(open(os.path.join(HERE, "INPUTS.tsv")), delimiter="\t"))
 LAMBDA = os.path.join(HERE, "LAMBDA.tsv")
 
