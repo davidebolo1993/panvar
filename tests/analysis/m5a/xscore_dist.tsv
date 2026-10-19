@@ -1,0 +1,3 @@
+# the same two, scored under the DISTANCE prior (frozen lambda); D_term's saved total is the expectation
+C_term	40,30,40,4,4,6,84,47,35,1,67	52,46,19,7,4,5,52,67,3,1,0	NA
+D_term	40,30,57,9,9,4,84,47,35,1,67	52,46,19,7,4,5,52,67,3,1,0	-31889.374595462843
