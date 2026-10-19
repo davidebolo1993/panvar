@@ -363,10 +363,31 @@ void g9_donor_removal() {
     const auto m = panvar::prepare_genotype_model(in);
     std::vector<std::vector<std::string>> frame;
     for (const auto& b : in.blocks) { std::vector<std::string> v; for (const auto& a : b.alleles) v.push_back(a.sequence); frame.push_back(v); }
-    auto loo = in;   // remove h2, the only carrier of the short b1 allele "G"
+    // Amendment 1: the removed donor must carry an allele that defines the core boundary, or the control has nothing to
+    // detect. h2 now carries b0 allele "e" = TTACGT, the only allele differing at b0's last base (it removes the shared
+    // suffix "GA"); h2 is then removed with its allele.
+    auto with_e = in;
+    with_e.blocks[0].alleles.push_back({"e", "TTACGT"});
+    with_e.templates[2].allele_source_ids[0] = "e";
+    const auto me = panvar::prepare_genotype_model(with_e);
+    std::vector<std::vector<std::string>> frame_e;
+    for (const auto& b : with_e.blocks) { std::vector<std::string> v; for (const auto& a : b.alleles) v.push_back(a.sequence); frame_e.push_back(v); }
+    auto loo = with_e;
     loo.templates.erase(loo.templates.begin() + 2);
-    loo.blocks[1].alleles.pop_back();
+    loo.blocks[0].alleles.pop_back();
+    loo.blocks[1].alleles.pop_back();   // h2 was also the only carrier of the short b1 allele "G"
     const auto ml = panvar::prepare_genotype_model(loo);
+    {
+        const auto gfe = reference_geometry(me, ref_ids(me, "ref"), &frame_e), glfe = reference_geometry(ml, ref_ids(ml, "ref"), &frame_e);
+        row("G9_donor_removal", "A1:frame_cores:max|d_loo - d|", std::max(std::fabs(glfe.distance[0] - gfe.distance[0]), std::fabs(glfe.distance[1] - gfe.distance[1])),
+            "0 (geometry fixed by the frame)", glfe.distance == gfe.distance);
+        const auto gce = reference_geometry(me, ref_ids(me, "ref")), glce = reference_geometry(ml, ref_ids(ml, "ref"));
+        row("G9_donor_removal", "A1:CONTROL_callable_cores:max|d_loo - d|", std::max(std::fabs(glce.distance[0] - gce.distance[0]), std::fabs(glce.distance[1] - gce.distance[1])),
+            "> 0 (callable-allele cores are panel-dependent)", glce.distance != gce.distance);
+        const auto pme = panel_mean(me), pmle = panel_mean(ml);
+        row("G9_donor_removal", "A1:CONTROL_panel_mean:max|d_loo - d|", std::max(std::fabs(pmle[0] - pme[0]), std::fabs(pmle[1] - pme[1])), "> 0 (M3-A span is panel-dependent)", pmle != pme);
+    }
+    return;
     const auto gf = reference_geometry(m, ref_ids(m, "ref"), &frame), glf = reference_geometry(ml, ref_ids(ml, "ref"), &frame);
     row("G9_donor_removal", "frame_cores:max|d_loo - d|", std::max(std::fabs(glf.distance[0] - gf.distance[0]), std::fabs(glf.distance[1] - gf.distance[1])), "0 (geometry fixed by the frame)", glf.distance == gf.distance);
     const auto gc = reference_geometry(m, ref_ids(m, "ref")), glc = reference_geometry(ml, ref_ids(ml, "ref"));

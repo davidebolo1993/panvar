@@ -58,3 +58,23 @@ uncurated model of the same graph. The gap between the two is what the G9 contro
 - **Declared timeouts:** gates 60 s each; geometry 60 s each; compare 30 s.
 - Builds are not executions and are not counted, as in earlier batches.
 - Inputs are hashed in INPUTS.tsv.
+
+## Amendment 1 (declared after `gates.m4a` and before any further unit; 0.4 s spent)
+
+**What failed.** `gates.m4a` exited 1 on one CONTROL row: `G9_donor_removal CONTROL_callable_cores` reported 0 where the
+control expects > 0. Every contract gate, G1–G10, passed.
+
+**Cause: a fixture defect.** The removed donor h2 carried only the short b1 allele `G`. That allele does not shorten b1's
+shared prefix or suffix (GGG/GTG/G share `G…G` either way), so removing it cannot move a core, and the control had
+nothing to detect.
+
+**Fix.** h2 now carries a b0 allele, `TTACGT`, which is the only allele differing at b0's last base. Removing it changes
+the shared suffix. Applied in a fixture of its own, so the base fixture used by G1–G8 and G10 is unchanged. The three G9
+rows are recomputed on it with the prefix `A1:`, and the original rows stay in the output.
+
+**Units.** New manifest A1, `gates.m4a.a1` (60 s). It runs before the rest of manifest A. `gates.m4a` stays recorded as
+failed.
+
+**Expectation for the original rows.** In the A1 run, the original G9 rows still appear, unchanged. Their CONTROL row
+still reads FAIL, because the original fixture cannot exercise it. It is kept, not edited. The A1 run therefore exits 1
+on that row only. A1 is judged on its `A1:` rows plus every other row.

@@ -35,7 +35,9 @@ GEOM = {"c4": (f"{GR}/c4.gfa", REF, None), "c4_loo_NA19650": (f"{GR}/NA19650.loo
 PAIRS = ["ts1_curated,ts1_uncurated", "cyp_curated,cyp_uncurated", "c4,c4_loo_NA19650", "cyp_curated,cyp_loo_NA19650"]
 MANIFEST_A = ([("gates.m4a", "gates", "m4a_distance_prior", 60), ("gates.m3a_regress", "gates", "m3a_prior_representation", 60)] +
               [(f"geometry.{k}", "geometry", k, 60) for k in GEOM] + [("geometry.compare", "compare", "-", 30)])
-MANIFESTS = {"A": MANIFEST_A}
+# Amendment 1: gates.m4a failed one CONTROL row (G9 fixture: the removed donor carried no core-defining allele); fixed fixture
+MANIFEST_A1 = [("gates.m4a.a1", "gates", "m4a_distance_prior", 60)]
+MANIFESTS = {"A": MANIFEST_A, "A1": MANIFEST_A1}
 INPUTS = list(csv.DictReader(open(os.path.join(HERE, "INPUTS.tsv")), delimiter="\t"))
 
 
