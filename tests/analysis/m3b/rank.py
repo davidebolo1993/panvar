@@ -67,7 +67,8 @@ for cell in cells:
         parts = rest.split("+")
         inter = []
         for part in parts:
-            blk, change = part.split(":")[0], part.split(":")[1]
+            # Amendment 2: block ids contain ':' (e.g. ctx:0), so split from the right: <block id>:<from>><to>:r<rank>
+            blk, change, _ = part.rsplit(":", 2)
             want = f"single:{h}:{blk}:{change}"
             lab = next((l for l, p in prov.items() if any(m.startswith(want + ":") for m in p["moves"].split("|"))), None)
             inter.append(lab)

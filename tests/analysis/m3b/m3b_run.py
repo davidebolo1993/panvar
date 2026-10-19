@@ -40,7 +40,9 @@ MANIFEST_B = ([(f"cat.{c}", "cat", c, 60) for c in CELLS] + [(f"score.{c}", "sco
 MANIFEST_A1 = [("split.mosaic_5x", "split", "mosaic_5x", 30), ("score.mosaic_5x.part1", "score_part", "mosaic_5x:1", 180),
                ("score.mosaic_5x.part2", "score_part", "mosaic_5x:2", 180), ("rank.a1", "rank", "-", 30),
                ("eval.a1.mosaic_2x", "eval", "mosaic_2x", 60), ("eval.a1.mosaic_5x", "eval", "mosaic_5x", 60)]
-MANIFESTS = {"B": MANIFEST_B, "A1": MANIFEST_A1}
+# Amendment 2: rank.py matched intermediates by splitting block ids at their first ':' (reporting bug; selection unaffected)
+MANIFEST_A2 = [("rank.a2", "rank", "-", 30), ("eval.a2.mosaic_2x", "eval", "mosaic_2x", 60), ("eval.a2.mosaic_5x", "eval", "mosaic_5x", 60)]
+MANIFESTS = {"B": MANIFEST_B, "A1": MANIFEST_A1, "A2": MANIFEST_A2}
 CARRIED = 0.0
 INPUTS = {r["cell"] + ":" + r["file"]: r["sha256"] for r in csv.DictReader(open(os.path.join(HERE, "INPUTS.tsv")), delimiter="\t")}
 
@@ -155,7 +157,7 @@ def command(unit, kind, target, timeout, d):
         done_cells = [c for c in CELLS if score_files(c)]
         return [sys.executable, os.path.join(HERE, "rank.py"), f"{OUT}/runs", f"{d}/m3b", *done_cells], "truth-free selection (frozen before evaluation)"
     if kind == "eval":
-        rank_dir = f"{OUT}/runs/rank.a1" if unit.startswith("eval.a1.") else f"{OUT}/runs/rank"
+        rank_dir = f"{OUT}/runs/rank.a2" if unit.startswith("eval.a2.") else f"{OUT}/runs/rank.a1" if unit.startswith("eval.a1.") else f"{OUT}/runs/rank"
         assert os.path.exists(f"{rank_dir}/m3b.selection.sha256"), "evaluation needs the frozen selection"
         sc = f"{rank_dir}/merged.{target}.tsv"
         if not os.path.exists(sc):
