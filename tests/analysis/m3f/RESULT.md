@@ -87,3 +87,28 @@ The pass's footprint grows with coverage and catalogue size. At 5× LZO it alrea
 - **Where the harm came from.** Memory, not selection.
 - **Next step, if any.** A bounded-memory design for the pass, so it refuses before it starts. Not a wider campaign,
   larger k, or tie-branched trunks; those would be algorithm changes outside this batch.
+
+## Qualifications appended at M3-G (2026-10-19; Sol's review; the record above is not rewritten)
+
+**Closure.** Joint search stays default-off and experimental. Its bounds, k, tie-branch handling and memory handling are
+unchanged, and NA19650 is not rerun with a larger memory limit.
+
+1. **Both homologues at one block is an ordinary move.** Ordinary single-block refinement already replaces an unordered
+   allele pair, so it can change both homologues at one block.
+   - The post-hoc note on `three_switches_1` 2× ("cross-homologue move, outside the same-homologue catalogue") is true
+     only of the joint catalogue. The ordinary route can reach that change.
+   - The frozen class OUTSIDE_TWO_BLOCK_NEIGHBOURHOOD was also measured from the wrong starting point: the call's
+     equivalence-set representative, which came from the union pool.
+   - Measured from the repair's own final incumbent, the truth differs at ctx:0 only, one ordinary single-block move
+     away. M3-G diagnoses why that move was not taken.
+2. **Unavailable sequence is not unavailable allocation.**
+   - **Exact sequence content:** unavailable (NA19650 LOO availability floor 113; truth not spellable).
+   - **Structural allocation:** available. M1-B evaluated about 5–6k panel-supported 2+2 candidates at sv:7, and the
+     fragment term preferred 3+1 by 271 at 10×. M1-C priced a content-identical 3+1 → 2+2 move at 5.5.
+   - The recommendation's line "a LOO allocation the panel cannot spell" is therefore wrong. The allocation is spellable
+     and scored, and it loses on content.
+3. **The 6 GiB envelope did not replace the 4 GiB guard.** The 6 GiB execution envelope was the batch's process limit.
+   The profile's 4 GiB footprint guard stayed in force, and the NA19650 10× refusal is that guard's.
+4. **Skipped controls validate nothing.** The two GE controls whose pass was skipped (`three_switches_1` 5×,
+   `dense_switching_1` 10×) are unchanged because the pass never ran. They are not evidence about the pass. Only LZO
+   HG00171 5× exercised it on a control.
