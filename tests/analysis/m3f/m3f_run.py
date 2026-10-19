@@ -61,7 +61,9 @@ MANIFEST_D = ([(f"lik.{c}", "lik", c, 120) for c in ("ds1_2", "ts1_2")] +
               [("structure.loo_na19650_10", "structure", "loo_na19650_10", 30), ("attribution", "attr", "-", 30)])
 # Amendment 1: accuracy re-run with the partial-table fix (the failed 'accuracy' unit stays recorded)
 MANIFEST_A1 = [("accuracy.a1", "acc", "all", 30)]
-MANIFESTS = {"C": MANIFEST_C, "E": MANIFEST_E, "A1": MANIFEST_A1, "D": MANIFEST_D}
+# Amendment 2: accuracy.a1 failed the same way (the refused run's evaluator also writes a summary); re-run as accuracy.a2
+MANIFEST_A2 = [("accuracy.a2", "acc", "all", 30)]
+MANIFESTS = {"C": MANIFEST_C, "E": MANIFEST_E, "A1": MANIFEST_A1, "A2": MANIFEST_A2, "D": MANIFEST_D}
 CARRIED = 0.0
 INPUTS = [r for r in csv.DictReader(open(os.path.join(HERE, "INPUTS.tsv")), delimiter="\t")]
 
@@ -210,7 +212,7 @@ def command(unit, kind, target, timeout, d):
         offe, one = (f"{OUT}/runs/eval.{target}.{arm}/eval.blocks.tsv" for arm in ("off", "on"))
         # Amendment 1: an arm whose evaluation failed (no summary) is replaced by the off table in the 'fresh' column, which
         # is then ignored; the attribution reads only the 'historical' (off) column in that case
-        if not os.path.exists(f"{OUT}/runs/eval.{target}.on/eval.summary.tsv"):
+        if eval_value(target, "on", "excess_over_floor_total") in (None, "NA"):   # Amendment 2: refused runs also write a summary
             one = offe
         if not os.path.exists(offe):
             return None, "NOT RUN (condition): the off arm was not evaluated"

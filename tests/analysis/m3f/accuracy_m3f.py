@@ -66,8 +66,13 @@ for cell in cells:
             rows.append((cell, arm, k, ev.get(k, "-")))
         rows.append((cell, arm, "caller_status", st.get("status", "-")))
         calls = {r["block_id"]: r for r in table(f"{runs}/run.{cell}.{arm}/call.block_genotypes.tsv")}
-        # Amendment 1: a failed evaluation (no summary) can leave a partial block table; it contributes no blocks
-        for b in (table(f"{runs}/eval.{cell}.{arm}/eval.blocks.tsv") if ev else []):
+        # Amendment 1: a failed evaluation (no summary) can leave a partial block table; it contributes no blocks.
+        # Amendment 2: the evaluator also writes a summary for a refused run (no excess), so the test is a numeric excess,
+        # and an incomplete row is skipped
+        evaluated = num(ev.get("excess_over_floor_total")) is not None
+        for b in (table(f"{runs}/eval.{cell}.{arm}/eval.blocks.tsv") if evaluated else []):
+            if b.get("block_id") is None or b.get("kind") is None or b.get("excess") is None:
+                continue
             c = calls.get(b["block_id"], {})
             exact = "exact" if b.get("excess") == "0" else "wrong"
             support[(cell, arm, c.get("genotype_support_v2x", "-"), c.get("quality_filter_v2x", "-"), b.get("kind", "-"), exact)] += 1

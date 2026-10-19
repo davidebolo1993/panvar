@@ -30,3 +30,18 @@
 
 **Unchanged:** the refusal is a result. The 4 GiB guard is not raised, and the LOO on arm stays REFUSAL_OR_NO_CALL in
 every denominator.
+
+## Amendment 2 (declared after `accuracy.a1` failed and before any further unit; 613.7 s spent)
+
+**Why A1 was not enough.** `accuracy.a1` failed in the same place. The evaluator also writes `eval.summary.tsv` for a
+refused run (status RESOURCE_REFUSAL, no excess) before it throws, so A1's "summary exists" test still let the partial
+block table through.
+
+**Changes** (scripts only):
+- `accuracy_m3f.py` reads a block table only when the summary has a numeric `excess_over_floor_total`, and skips any row
+  missing `block_id`, `kind` or `excess`.
+- The structure unit's on-arm test in `m3f_run.py` uses the same numeric-excess test.
+- New manifest A2 with one unit, `accuracy.a2` (30 s). `accuracy` and `accuracy.a1` stay recorded as failed.
+
+**Dry run.** Unlike A1, the fixed script was run once on the recorded outputs, written to the scratchpad and not counted
+as a unit, before `accuracy.a2`. It exits 0 and gives the same outcome table for every cell.
