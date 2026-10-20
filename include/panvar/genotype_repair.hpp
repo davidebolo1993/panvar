@@ -123,6 +123,8 @@ struct RepairSearchOptions {
 // M9-G: what the junction-aware proposals did in one search.
 struct JunctionProposalReport {
     std::size_t eligible_blocks = 0;
+    // M11-C (diagnostic output only): the per-block eligibility condition, filled only where it was evaluated (JP on)
+    std::vector<unsigned char> block_eligible;
     std::uint64_t invocations = 0, cache_hits = 0, cutoff_tie_crossings = 0;
     double seconds = 0.0;
 };

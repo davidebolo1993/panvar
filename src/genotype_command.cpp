@@ -302,6 +302,12 @@ std::optional<std::string> refinement_diagnostic_refusal(const GenotypeCommandOp
 // M9-G: the run's junction-proposal account, summed over its searches (eligibility is a property of the model: the maximum).
 void accumulate_junction(JunctionProposalReport& total, const JunctionProposalReport& one) {
     total.eligible_blocks = std::max(total.eligible_blocks, one.eligible_blocks);
+    if (!one.block_eligible.empty()) {   // M11-C: a block is reported eligible when any search evaluated it as eligible
+        if (total.block_eligible.empty()) total.block_eligible.assign(one.block_eligible.size(), 0);
+        for (std::size_t b = 0; b < one.block_eligible.size() && b < total.block_eligible.size(); ++b) {
+            total.block_eligible[b] = static_cast<unsigned char>(total.block_eligible[b] | one.block_eligible[b]);
+        }
+    }
     total.invocations += one.invocations;
     total.cache_hits += one.cache_hits;
     total.cutoff_tie_crossings += one.cutoff_tie_crossings;
@@ -483,6 +489,7 @@ void annotate_v2(SequenceReport& report, const PreparedGenotypeModel& model, con
 }
 SequenceLegacy g_sequence_legacy;
 bool g_sequence_published = false;   // S1-C: the report was published (or its failure recorded) for this run
+std::vector<unsigned char> g_junction_block_flags;   // M11-C: this run's per-block JP1.1 eligibility (empty: not evaluated)
 std::uint64_t g_union_end_footprint = 0;   // I2-K (measurement): physical footprint right after the union pass
 // I3-A: what the status says about a prepared locus this run used (reset at every run start).
 struct PreparedLocusUse {
@@ -1448,7 +1455,7 @@ void write_status(
                                 "union_progressive_schedule", "union_fragment_blocks", "diagnostic_refinement_memory",
                                 "diagnostic_refinement_replay", "repair_round1_origin_admission", "repair_joint_search", "block_support_rule",
                                 "repair_junction_proposals", "compound_annotation", "compound_interval_declarations",
-                                "copying_transition", "copying_length_bp"}) {
+                                "copying_transition", "copying_length_bp", "block_diagnostics"}) {
             const auto source = options.setting_sources.find(key);
             if (source == options.setting_sources.end()) continue;
             const std::string k = key;
@@ -1481,6 +1488,7 @@ void write_status(
                                       : k == "repair_joint_search" ? options.repair_joint_search
                                       : k == "repair_junction_proposals" ? options.repair_junction_proposals
                                       : k == "compound_annotation" ? options.compound_annotation
+                                      : k == "block_diagnostics" ? options.block_diagnostics
                                       : k == "compound_interval_declarations" ? options.compound_interval_declarations
                                       : k == "block_support_rule" ? options.block_support_rule
                                       : k == "copying_transition" ? options.copying_transition
@@ -2203,6 +2211,7 @@ void write_status(
         out << "seconds_detail_model_unattributed\t" << timings.model - model_named << '\n';
         out << "seconds_detail_markers_unattributed\t" << timings.markers - markers_named << '\n';
     }
+    if (repair != nullptr) g_junction_block_flags = repair->junction.block_eligible;   // M11-C: diagnostic output only
     if (repair != nullptr) write_repair_report(out, *repair);
     commit_status(path, out.str());
 }
@@ -2357,6 +2366,10 @@ void apply_genotype_setting(const std::string& context, const std::string& key, 
                                                "full_data_likelihood_v2_experimental: " + value);
         }
         options.block_support_rule = value;
+    }
+    else if (key == "block_diagnostics") {   // M11-C (diagnostic output, default off)
+        if (value != "off" && value != "diagnostic_v1") throw std::runtime_error(context + ": 'block_diagnostics' is off or diagnostic_v1: " + value);
+        options.block_diagnostics = value;
     }
     else if (key == "compound_annotation") {   // M9-J (opt-in annotation)
         if (value != "off" && value != "contract_v2") throw std::runtime_error(context + ": 'compound_annotation' is off or contract_v2: " + value);
@@ -2721,6 +2734,7 @@ void remove_run_outputs(const std::string& out_prefix) {
     for (const std::string& suffix : dosage::dosage_stage_outputs()) std::remove((out_prefix + suffix).c_str());
     for (const char* suffix : kPartialOutputs) std::remove((out_prefix + suffix).c_str());
     // S2-H: the refinement diagnostics are run-owned too (removed at the start only: they must survive a stop)
+    std::remove((out_prefix + ".block_diagnostics.tsv").c_str());   // M11-C: run-owned diagnostic, removed at the start
     for (const char* suffix : {".refinement_memory_live.tsv", ".refinement_seed_report.tsv", ".refinement_replay_inputs.tsv",
                                ".refinement_replay.tsv",
                                ".refinement_replay_rounds.tsv", ".refinement_replay_scored.tsv"}) {
@@ -3123,6 +3137,7 @@ GenotypeRunStatus run_genotype_body(const GenotypeCommandOptions& options, Genot
     if (options.output_schema == "sequence_first_v2") g_sequence_report.schema = "sequence_first_v2";   // S1-D
     g_sequence_legacy = SequenceLegacy{};
     g_sequence_published = false;
+    g_junction_block_flags.clear();   // M11-C: never a previous run's flags
     reset_prepared_library_terms_tally();         // I2-F: likewise
     g_union_end_footprint = 0;
     reset_emission_handoff_report();   // I2-K: nothing from an earlier run is reported or adopted
@@ -8588,6 +8603,7 @@ int execute_genotype_command(const GenotypeCommandOptions& requested, const Prep
     }
     dosage::DosageShadowSummary summary;
     std::string audit_status = "NOT_RUN", audit_note = "none";
+    std::vector<std::string> census_routes;   // M11-C: filled only by the census, only when block_diagnostics is on
     std::optional<double> declared_marker_background;
     std::optional<LibraryModel> library;
     std::vector<ReadPair> fragments;
@@ -8626,6 +8642,7 @@ int execute_genotype_command(const GenotypeCommandOptions& requested, const Prep
                 shadow_options.repair_max_piece_hits = options.repair_max_piece_hits;
                 shadow_options.repair_max_latent_pairs = options.repair_max_latent_pairs;
                 shadow_options.repair_origin_cache_bytes = 0;   // path on, nothing retained (measured: 2.77 vs 3.74 GiB)
+                if (options.block_diagnostics == "diagnostic_v1") shadow_options.census_routes_out = &census_routes;   // M11-C
                 summary = dosage::run_dosage_shadow(*capture.model, capture.node_sequences, fragments, *library, scoring, switches,
                                                     options.out_prefix, options.out_prefix, shadow_options);
                 audit_status = summary.audit_status;
@@ -8638,6 +8655,33 @@ int execute_genotype_command(const GenotypeCommandOptions& requested, const Prep
                          std::string("key\tvalue\ndosage_audit\tshadow\ndosage_audit_status\tFAILED\ndosage_audit_note\t") +
                              error.what() + "\n");
         }
+    }
+    if (options.block_diagnostics == "diagnostic_v1" && capture.model) {
+        // M11-C (DIAGNOSTIC; nothing reads it): per-block census route and JP1.1 emission-tie condition. A value is written
+        // only where it was computed; otherwise an explicit NOT_EVALUATED / UNAVAILABLE value with its reason.
+        std::string census_absent;
+        if (mode == "off") census_absent = "NOT_EVALUATED:dosage_audit_off";
+        else if (!called) census_absent = "NOT_EVALUATED:no_genotype_emitted";
+        else if (audit_status == "REFUSED_LIBRARY") census_absent = "NOT_EVALUATED:unsupported_library";
+        else if (audit_status == "NOT_RUN") census_absent = "NOT_EVALUATED:no_rank1_call";
+        else census_absent = "UNAVAILABLE:census_not_completed";
+        const std::string jp_absent = options.repair_junction_proposals == "off" ? "NOT_EVALUATED:junction_proposals_off"
+                                                                               : "NOT_EVALUATED:no_repair_search_report";
+        std::ostringstream t;
+        t << "# block diagnostics (M11-C, diagnostic_v1): census_route = the dosage census route of the block (model-derived; "
+             "reported when the census completed, also if a later audit stage failed); jp_emission_tie = the JP1.1 eligibility "
+             "condition (every proposal pair emission tied and more pairs than the local-pair limit) where a repair search "
+             "evaluated it. Diagnostic only: not confidence, not correctness, not read by the caller.\n"
+          << "# dosage_audit_status\t" << audit_status << "\n"
+          << "block_index\tblock_id\tcensus_route\tjp_emission_tie\n";
+        const auto& blocks = capture.model->blocks();
+        for (std::size_t b = 0; b < blocks.size(); ++b) {
+            const std::string route = census_routes.size() == blocks.size() ? census_routes[b] : census_absent;
+            const std::string tie = g_junction_block_flags.size() == blocks.size() ? (g_junction_block_flags[b] ? "TIED_ELIGIBLE" : "NOT_ELIGIBLE")
+                                                                                  : jp_absent;
+            t << b << '\t' << blocks[b].block_id << '\t' << route << '\t' << tie << '\n';
+        }
+        atomic_write(options.out_prefix + ".block_diagnostics.tsv", t.str());
     }
     // Repair mode's rewrite builds every file before writing the first, so a refusal here leaves the caller's outputs
     // as they are; the locus table is the primary locus-level output in every mode.

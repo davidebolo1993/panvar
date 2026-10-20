@@ -280,6 +280,10 @@ struct GenotypeCommandOptions {
     // M9-J (opt-in, profile keys compound_annotation off|contract_v2 and compound_interval_declarations <file>): writes
     // <prefix>.sequence_compound.tsv beside sequence_blocks (compound_annotation.hpp). Annotation only; sequence_first_v2.
     std::string compound_annotation = "off";
+    // M11-C (DIAGNOSTIC, default off): off | diagnostic_v1 -- <prefix>.block_diagnostics.tsv with each block's census route
+    // (kept when the census ran even if a later dosage-audit stage failed) and the JP1.1 emission-tie condition where it
+    // was evaluated. Output only: nothing reads it.
+    std::string block_diagnostics = "off";
     std::string compound_interval_declarations;
     // M3-E (EXPERIMENTAL, profile key block_support_rule legacy|full_data_likelihood_v1_experimental; default legacy):
     // appends separately versioned block-genotype support columns computed under the full data likelihood (fragment +

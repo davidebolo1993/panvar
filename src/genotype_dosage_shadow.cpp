@@ -163,6 +163,12 @@ DosageShadowSummary run_dosage_shadow(const PreparedGenotypeModel& model, const 
     const std::vector<CensusBlock> census = run_census(model, nodes, *span, settings, options.census_backend,
                                                        options.census_backend_declared ? &summary.census_work : nullptr);
     summary.seconds_census = seconds_since(t);
+    if (options.census_routes_out != nullptr) {   // M11-C: recorded before any later stage can fail
+        options.census_routes_out->assign(model.blocks().size(), "UNAVAILABLE:census_row_missing");
+        for (const CensusBlock& c : census) {
+            if (c.block < options.census_routes_out->size()) (*options.census_routes_out)[c.block] = census_route_name(c.route);
+        }
+    }
     t = std::chrono::steady_clock::now();
     std::vector<BlockFeatureModel> features(model.blocks().size());
     for (const CensusBlock& c : census) {

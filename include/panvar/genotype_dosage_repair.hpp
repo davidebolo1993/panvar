@@ -283,6 +283,9 @@ struct DosageShadowOptions {
     // stage timers and work counters.
     CensusBackend census_backend = CensusBackend::reference;
     bool census_backend_declared = false;
+    // M11-C (diagnostic output only): when set, receives each block's census route as soon as the census has run, so a
+    // later audit-stage failure does not discard it. Null (the default): nothing is recorded.
+    std::vector<std::string>* census_routes_out = nullptr;
 };
 
 // One COMPLETE_DIPLOTYPE_REPAIR, as repair mode needs it: the chosen block sequences in reported-homologue order

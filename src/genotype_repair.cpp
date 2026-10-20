@@ -290,6 +290,7 @@ CoordinateRepairSearch::CoordinateRepairSearch(const PreparedGenotypeModel& mode
                 ++junction_report_.eligible_blocks;
             }
         }
+        junction_report_.block_eligible.assign(junction_block_.begin(), junction_block_.end());   // M11-C: reported, never read by the search
     }
     neighbour_bound_ = repair_neighbour_bound(model, options.local_pairs);
     if (options_.mode != RepairScoringMode::OneShot && !options_.external_context) new_context();
