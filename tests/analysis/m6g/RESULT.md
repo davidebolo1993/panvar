@@ -131,3 +131,17 @@ pruning, or sampling). This is stated, not implemented.
   instances like these.
 
 **Not claimed.** Nothing here bears on C4 NA19650, genotyping accuracy, or the full C1 model on real sequences.
+
+## M6 closure (appended at M7-A, 2026-10-20; Sol's review; the record above is not rewritten)
+
+1. **C1 remains a supported sequence-prior research ingredient** (M6-F).
+2. **Parked:** C2 switching, κ, and full nuisance-marginalised read inference.
+3. **M6-G's recovery question is inconclusive,** not negative. The PANEL premise was unmet, so the fixtures could not test
+   recovery.
+4. **Content-driven structural misranking is already demonstrated** by the existing C4 NA19650 evidence (M1-B to M1-E,
+   M6-A/B).
+5. **The ~20.6-nat residual cost is not a universal cap on evidence.** It is the prior cost of two novel site-copies at
+   ε_res = 1e-4 in that fixture. Stronger data can overcome a prior penalty, so the sentence above calling it a cap on
+   what one extra copy could absorb applies only to that fixture's evidence.
+
+No further toy redesign or parameter sweep follows from M6.
