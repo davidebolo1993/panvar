@@ -107,3 +107,16 @@ That evaluation should be specified before any data is used and should include:
 - refusal and resource accounting.
 
 **Not started here.** No default change.
+
+## Corrections (appended by M9-H, 2026-10-20; the text and tables above are unchanged)
+
+1. **Tie classes.** The implementation compares each score with its **class head**: a new class starts when
+   head − score > 1e-9. Scores are **not** chained through adjacent scores, as the DESIGN and this RESULT stated. JP1.1 is
+   unchanged; this corrects only the description.
+2. **`same_sequence_pair`.** Recomputed with unordered haplotype-digest pairs, returning UNKNOWN for absent or incomplete
+   predictions (M9-H `runs/correction/`, fixtures 6/6: swapped, different, homozygous-vs-heterozygous, missing,
+   provisional, no prediction).
+   - **Re-applied to the five M9-G cells:** d1, d3 and d6 False; LZO d1 and d2 True. These are identical to the
+     historical values, so **no M9-G conclusion changes**.
+   - **Why it made no difference here:** the v2 representative's hap1 is the SHA-smaller haplotype, so the historical
+     ordered comparison happened to agree.
