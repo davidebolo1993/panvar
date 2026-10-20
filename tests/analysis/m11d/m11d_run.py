@@ -32,6 +32,9 @@ UNITS += [("outcomes.a1", 300), ("fit.a1", 120)]
 # amendment A2 (AMENDMENT_A2.md): outcomes.a1 failed in its final consistency check on the NO_PREDICTION rows; fit.a1 was NOT RUN
 UNITS += [("outcomes.a2", 300), ("fit.a2", 120)]
 PRE += 15.0   # disclosed A2 development: structural check of outcomes.a1's partial table (row classes, consistency columns)
+# amendment A3 (AMENDMENT_A3.md): a reporting-only unit; descriptive tables from outcomes.a2 / fit.a2, no predictor change
+UNITS += [("report", 120)]
+PRE += 120.0  # disclosed A3 development: reading runs.tsv and the fit.a2 printout, writing m11d_report.py
 
 
 def ledger():
@@ -78,6 +81,8 @@ def command(unit, d):
         return eval_cmd(m11d.cell(cid), d)
     if kind == "truth":
         return py + ["truth", cid, d]
+    if unit == "report":
+        return [sys.executable, os.path.join(HERE, "m11d_report.py"), d]
     if kind in ("inventory", "outcomes", "fit"):
         return py + [kind, d]
     return py + [unit, d]
@@ -101,6 +106,8 @@ def precondition(unit):
         return "the inventory failed"
     if unit == "fit.a2" and exit_of("outcomes.a2") != "0":
         return "the outcomes unit failed"
+    if unit == "report" and exit_of("fit.a2") != "0":
+        return "the fit unit failed"
     return None
 
 
