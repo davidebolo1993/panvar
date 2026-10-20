@@ -84,8 +84,12 @@ equivalences only within sv:5..ctx:6, so only pool candidates equal outside that
 **Not evaluated:** the visited, duplicate and prior-rejection stages. They apply only to generated neighbours, and none
 of these was generated.
 
-**How the called sv:5 pairs entered the search** (5/71, 45/107 and 0/21; ranks outside the list except 0/21): from the
-union and panel candidates, not from a repair move at sv:5. The repair could then change sv:5 only to (0, y ≤ 31).
+**How the called sv:5 pairs entered the search:**
+- **E1 (5/71) and E3 (45/107):** these pairs are outside the 32 list, so they cannot have come from a repair move at sv:5.
+  They come from the union or panel start.
+- **E6 (0/21):** this pair is inside the list (rank 22), and the tie that started branching was a swap at sv:5. The saved
+  records do not show its origin.
+- **In every case,** repair could change sv:5 only to (0, y ≤ 31).
 
 ## 5. M9-D semantics corrected (context-aware classification; fixture 6/6 PASS)
 
