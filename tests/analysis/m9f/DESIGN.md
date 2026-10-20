@@ -108,3 +108,15 @@ prior and the run's model, curation, reads and library.
 
 **Boundaries:** no prior change, joint search, wider shortlist, confidence remapping, filter, default promotion or caller
 integration. The persisted locus index is untouched. All JP1 state is in-process and sample-scoped.
+
+## Amendment 1 (analysis only; declared after `analyse`; proposals, freeze and scoring untouched)
+
+Two problems with the first `analyse`, which stays recorded:
+1. **Overlap.** It reported overlap 0 with the original index-ordered list for LOO d2, d4 and d5. No original ranking was
+   computed for those cells: M9-E ranked d1, d3 and d6, and this batch ranked the LZO models. Their overlap becomes NA.
+2. **Exact match alone.** It cannot say whether a replacement moves the call toward the truth. The analysis adds the
+   unordered sv:5 edit distance to the truth bytes for the incumbent and for the best replacement. The truth bytes are
+   the M9-D `interval.<cell>` `block-sequences` outputs, which cover LOO d1, d2, d3, d4 and d6. d5 and the LZO controls
+   have none.
+
+**Rerun:** `analyse.a1` (30 s).

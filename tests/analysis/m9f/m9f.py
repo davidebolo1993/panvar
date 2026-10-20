@@ -327,6 +327,41 @@ if mode == "analyse":
                        improvements_over_incumbent=sum(1 for k, r in sc.items() if k != "incumbent" and r["total"] != "NA" and float(r["total"]) > inc_total),
                        score_seconds=LED.get(f"score.{cell}", {}).get("wall_seconds", ""), score_peak_gib=LED.get(f"score.{cell}", {}).get("peak_rss_gib", ""))
         res.append(row)
+    # Amendment 1 (analysis only): unordered sv:5 edit distance to the truth bytes (M9-D interval units, LOO cells only) for
+    # the incumbent and the best replacement; overlap is NA where no original ranking was computed for the cell
+    def ed(a, b):
+        prev = list(range(len(b) + 1))
+        for i, ca in enumerate(a, 1):
+            cur = [i]
+            for j, cb in enumerate(b, 1):
+                cur.append(min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (ca != cb)))
+            prev = cur
+        return prev[-1]
+    for row in res:
+        cell = row["cell"]
+        if cell not in ("LOO.d1", "LOO.d3", "LOO.d6") and cell.startswith("LOO"):
+            row["overlap_with_index_list"] = "NA (original ranking not computed for this cell)"
+        tf = f"{D}/interval.{cell}/bs.sv:5.truth.fa"
+        if not os.path.exists(tf):
+            row["sv5_distance_incumbent"] = row["sv5_distance_best_change"] = "NA (no truth bytes)"
+            continue
+        recs, cur = {}, None
+        for line in open(tf):
+            if line.startswith(">"):
+                cur = line[1:].split()[0]
+                recs[cur] = ""
+            else:
+                recs[cur] += line.strip()
+        t1, t2 = recs["truth1"], recs["truth2"]
+        al = dump(MODEL(cell))[[r["block_id"] for r in T(f"{C}/call.{cell}/call.sequence_blocks.tsv")].index("sv:5")]
+        dist = lambda x, y: min(ed(al[x], t1) + ed(al[y], t2), ed(al[y], t1) + ed(al[x], t2))
+        ix, iy = (int(v) for v in row["incumbent_sv5"].split("/"))
+        row["sv5_distance_incumbent"] = dist(ix, iy)
+        if row.get("changed_sv5_to", "unchanged") != "unchanged":
+            bx, by = (int(v) for v in row["changed_sv5_to"].split("/"))
+            row["sv5_distance_best_change"] = dist(bx, by)
+        else:
+            row["sv5_distance_best_change"] = "unchanged"
     write(f"{out}/results.tsv", res)
     for r in res:
         print(r)

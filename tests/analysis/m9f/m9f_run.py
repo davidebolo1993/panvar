@@ -27,7 +27,8 @@ CELLS = ["LOO.d1", "LOO.d3", "LOO.d6", "LZO.d1", "LZO.d2", "LOO.d2", "LOO.d4", "
 MANIFEST_P = ([("gates", "gates", "-", 60), ("ranks.LZO.d1", "ranks", "LZO.d1", 60), ("ranks.LZO.d2", "ranks", "LZO.d2", 60)]
               + [(f"propose.{c}", "propose", c, 120) for c in CELLS] + [("freeze", "freeze", "-", 10)]
               + [(f"score.{c}", "score", c, 200) for c in CELLS] + [("analyse", "analyse", "-", 30)])
-MANIFESTS = {"P": MANIFEST_P}
+MANIFEST_A1 = [("analyse.a1", "analyse", "-", 30)]   # Amendment 1: sv:5 distances to truth bytes; overlap NA where not computed
+MANIFESTS = {"P": MANIFEST_P, "A1": MANIFEST_A1}
 
 
 def ledger_rows():
