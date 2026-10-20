@@ -23,7 +23,12 @@ BUDGET = 900
 PRE_FREEZE = 30.0   # disclosed: m10c_align_eval development builds (22.9 + 1.3 s) and configure, rounded up; no fixture or case was run
 TRUTHS = list(m10c.TRUTH)
 MANIFESTS = {"P": [("build", "build", "-", 300), ("gate.aligner", "gate", "-", 60), ("fixtures", "py", "fixtures", 120)] +
-             [(f"truth.{c}", "truth", c, 120) for c in TRUTHS] + [("cases", "py", "cases", 300)]}
+             [(f"truth.{c}", "truth", c, 120) for c in TRUTHS] + [("cases", "py", "cases", 300)],
+             # Amendment 1 (after `fixtures`: method A cannot locate events): method B on the fixtures (+F10c); cases only if
+             # method B meets every structural and concordance fixture (m10c.B_REQUIRED)
+             "A1": [("build.a1", "build", "-", 300), ("fixtures_b.a1", "py", "fixtures_b", 120)] +
+             [(f"truth.{c}.a1", "truth", c, 120) for c in TRUTHS] + [("cases.a1", "py", "cases", 300)]}
+AMENDMENT_DEV = 30.0   # disclosed: Amendment 1 development (three builds of the minimap2 mode incl. two failed links, 26 s), rounded up
 
 
 def ledger_rows():
@@ -32,7 +37,7 @@ def ledger_rows():
 
 
 def spent():
-    return PRE_FREEZE + sum(float(r["wall_seconds"]) for r in ledger_rows())
+    return PRE_FREEZE + AMENDMENT_DEV + sum(float(r["wall_seconds"]) for r in ledger_rows())
 
 
 def done():
@@ -62,8 +67,15 @@ def run_unit(unit):
         why = "the build failed"
     elif kind in ("truth", "py") and exit_of("gate.aligner") != "0":
         why = "the aligner gate failed"
-    elif target == "cases" and (exit_of("fixtures") != "0" or any(exit_of(f"truth.{c}") != "0" for c in TRUTHS)):
-        why = "the fixtures or a truth extraction failed"
+    elif unit == "cases":
+        why = "superseded by Amendment 1: method A cannot locate events (fixtures), so cases run only under method B (cases.a1)"
+    elif unit.startswith("truth.") and not unit.endswith(".a1"):
+        why = "superseded by Amendment 1 (truth extraction runs as .a1, only if method B is supported)"
+    elif unit.endswith(".a1") and (unit.startswith("truth.") or unit == "cases.a1") and \
+            open(f"{OUT}/runs/fixtures_b.a1/method_b_supported.txt").read().strip() != "True":
+        why = "method B does not meet every structural and concordance fixture: no saved case is inspected"
+    elif unit == "cases.a1" and any(exit_of(f"truth.{c}.a1") != "0" for c in TRUTHS):
+        why = "a truth extraction failed"
     elif spent() + timeout > BUDGET:
         why = f"{spent():.1f} + {timeout} > {BUDGET} s"
     if why:

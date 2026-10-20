@@ -167,6 +167,137 @@ def diploid_pairs(pid, p, t, sites=((), ())):
             (f"{pid}.12", p[0], t[1], sites[1]), (f"{pid}.21", p[1], t[0], sites[0])]
 
 
+# ------------------------------------------------------------------------------------------------ Amendment 1: method B
+# Method A's path cannot locate events (unit-cost gaps fragment: F03's 55-bp deletion has longest run 8). Method B uses the
+# existing panvar::minimap2_hits (asm20; affine gaps; all regions, unflagged) in both roles. Its frozen event rule, per role:
+#   no hit -> NO_ALIGNMENT (UNSUPPORTED); a reverse-strand hit spanning >= EVENT query bases -> INVERSION;
+#   chain = forward hits in decreasing matches, dropping any that overlaps a kept hit by >= EVENT query bases (those are
+#   ALTERNATIVE_PLACEMENT, a flag); in the chain ordered by query start: a target position decrease -> ORDER, a target
+#   overlap >= EVENT -> DUPLICATION, a query or target gap >= EVENT between neighbours -> GAP; any CIGAR I/D op >= EVENT in a
+#   chain hit -> INDEL; uncovered query or target prefix/suffix >= EVENT -> ENDPOINT_UNMATCHED (< EVENT: ENDPOINT_NOTE).
+# Per homologue: UNSUPPORTED (no alignment / endpoint) > AMBIGUOUS (the two roles disagree on whether an event exists) >
+# DISCORDANT (an event, or a located-site difference from method A's path) > CONCORDANT. The assignment is method A's.
+def align_b(pairs, d, tag):
+    man = f"{d}/{tag}.manifest.tsv"
+    subprocess.run([ALIGN, "--minimap2", man, f"{d}/{tag}.minimap2.tsv"], check=True)
+    out = collections.defaultdict(list)
+    for r in csv.DictReader(open(f"{d}/{tag}.minimap2.tsv"), delimiter="\t"):
+        out[(r["id"], r["role"])].append(r)
+    return out
+
+
+def events_b(hits, qlen, tlen):
+    if not hits or hits[0]["hit"] == "none":
+        return {"NO_ALIGNMENT"}, set(), 0
+    ev, flags = set(), set()
+    H = [dict(strand=h["strand"], qs=int(h["qs"]), qe=int(h["qe"]), ts=int(h["ts"]), te=int(h["te"]), m=int(h["matches"]), big=h["big_ops"]) for h in hits]
+    if any(h["strand"] == "-" and h["qe"] - h["qs"] >= EVENT for h in H):
+        ev.add("INVERSION")
+    chain = []
+    for h in sorted((h for h in H if h["strand"] == "+"), key=lambda h: -h["m"]):
+        if any(min(h["qe"], c["qe"]) - max(h["qs"], c["qs"]) >= EVENT for c in chain):
+            flags.add("ALTERNATIVE_PLACEMENT")
+            continue
+        chain.append(h)
+    if not chain:
+        return ev | {"NO_FORWARD_ALIGNMENT"}, flags, 0
+    chain.sort(key=lambda h: h["qs"])
+    for x, y in zip(chain, chain[1:]):
+        if y["ts"] < x["ts"]:
+            ev.add("ORDER")
+        if x["te"] - y["ts"] >= EVENT:
+            ev.add("DUPLICATION")
+        if y["qs"] - x["qe"] >= EVENT or y["ts"] - x["te"] >= EVENT:
+            ev.add("GAP")
+    if any(h["big"] != "-" for h in chain):
+        ev.add("INDEL")
+    ends = [chain[0]["qs"], qlen - chain[-1]["qe"], min(h["ts"] for h in chain), tlen - max(h["te"] for h in chain)]
+    if max(ends) >= EVENT:
+        ev.add("ENDPOINT_UNMATCHED")
+    elif max(ends) > 0:
+        flags.add("ENDPOINT_NOTE")
+    return ev, flags, max(ends)
+
+
+def diploid_b(rows_a, hits, pid, truth_ok=(True, True)):
+    if not all(truth_ok):
+        return dict(verdict="UNSUPPORTED", flags="TRUTH_UNAVAILABLE")
+    tot = {k: int(rows_a[(f"{pid}.{k}", "forward")]["edits"]) for k in ("11", "22", "12", "21")}
+    t1, t2 = tot["11"] + tot["22"], tot["12"] + tot["21"]
+    best, other = (("11", "22"), ("12", "21")) if t1 <= t2 else (("12", "21"), ("11", "22"))
+
+    def hom(k):
+        fw = rows_a[(f"{pid}.{k}", "forward")]
+        qlen, tlen = int(fw["len_a"]), int(fw["len_b"])
+        e1, f1, _ = events_b(hits.get((f"{pid}.{k}", "pred_on_truth"), []), qlen, tlen)
+        e2, f2, _ = events_b(hits.get((f"{pid}.{k}", "truth_on_pred"), []), tlen, qlen)
+        sites = [x for x in fw["site_results"].split(";") if x != "-" and x.split(":")[1] != x.split(":")[2]]
+        return dict(ev_pred_on_truth=sorted(e1), ev_truth_on_pred=sorted(e2), flags=sorted(f1 | f2), sites=sites,
+                    struct=(bool(e1 - {"ENDPOINT_UNMATCHED"}), bool(e2 - {"ENDPOINT_UNMATCHED"}), bool(sites)), net=qlen - tlen)
+    hb, ho = [hom(k) for k in best], [hom(k) for k in other]
+    flags = set(f for x in hb for f in x["flags"])
+    if t1 == t2:
+        flags.add("ASSIGNMENT_TIE")
+    allev = [set(x["ev_pred_on_truth"]) | set(x["ev_truth_on_pred"]) for x in hb]
+    if any({"NO_ALIGNMENT", "NO_FORWARD_ALIGNMENT"} & e for e in allev) and not any({"INVERSION"} & e for e in allev):
+        verdict = "UNSUPPORTED"
+    elif any("ENDPOINT_UNMATCHED" in e for e in allev):
+        verdict = "UNSUPPORTED"
+        flags.add("ENDPOINT_UNMATCHED")
+    elif t1 == t2 and sorted(x["struct"] for x in hb) != sorted(x["struct"] for x in ho):
+        verdict = "AMBIGUOUS"
+    elif any(x["struct"][0] != x["struct"][1] for x in hb):
+        verdict = "AMBIGUOUS"
+        flags.add("ROLES_DISAGREE")
+    elif any(x["struct"][0] or x["sites"] for x in hb):
+        verdict = "DISCORDANT"
+    else:
+        verdict = "CONCORDANT"
+    if any(x["sites"] for x in hb):
+        flags.add("CLASS_SITE_DISCORDANT")
+    if all(x["struct"][0] for x in hb) and hb[0]["net"] * hb[1]["net"] < 0 and abs(hb[0]["net"] + hb[1]["net"]) < EVENT:
+        flags.add("DOSAGE_BALANCED_ALLOCATION_DIFFERS")
+    return dict(verdict=verdict, flags=",".join(sorted(flags)) or "-", assignment="p1-t1,p2-t2" if best == ("11", "22") else "p1-t2,p2-t1",
+                total_edits_best=min(t1, t2), total_edits_other=max(t1, t2),
+                h1_events=";".join(sorted(allev[0])) or "-", h2_events=";".join(sorted(allev[1])) or "-",
+                h1_edits=tot[best[0]], h2_edits=tot[best[1]], h1_net=hb[0]["net"], h2_net=hb[1]["net"])
+
+
+B_REQUIRED = ("F01", "F02", "F03", "F03b", "F04", "F05", "F06", "F07", "F07b", "F08", "F08b", "F09", "F10b", "F10c", "F11", "F11b", "F14")
+
+
+def fixtures_b(out):
+    F = fixtures_def_a1()
+    pairs = []
+    for fid, _, p, t, sites, _ in F:
+        pairs += diploid_pairs(fid, p, t, sites or ((), ()))
+    rows = align(pairs, out, "fixtures")
+    hits = align_b(pairs, out, "fixtures")
+    res = []
+    for fid, desc, p, t, sites, req in F:
+        v = diploid_b(rows, hits, fid)
+        met = "n/a (definition required)" if req == "DEFINITION_REQUIRED" else ("yes" if v["verdict"] == req else "NO")
+        res.append(dict(fixture=fid, description=desc, required=req, verdict=v["verdict"], required_met=met, **{k: x for k, x in v.items() if k != "verdict"}))
+    write(out, "fixtures_b", res)
+    for r in res:
+        print(f"{r['fixture']}\t{r['required']}\t{r['verdict']}\t{r['required_met']}\t{r['flags']}\t{r['h1_events']}|{r['h2_events']}")
+    supported = all(r["required_met"] == "yes" for r in res if r["fixture"] in B_REQUIRED)
+    open(f"{out}/method_b_supported.txt", "w").write(f"{supported}\n")
+    print(f"method B meets every structural and concordance fixture ({','.join(B_REQUIRED)}): {supported}")
+    return 0
+
+
+def fixtures_def_a1():
+    F = fixtures_def()
+    L, Rf, U = rnd("L", 800), rnd("R", 800), rnd("U", 600)
+    copy = [mutate(U, [100 + 37 * k, 400 + 11 * k], f"copy{k}") for k in range(4)]
+    base = L + copy[0] + copy[1] + Rf
+    site = len(L) + 250
+    F.append(("F10c", "1-bp change at a class site declared for the locus (on both truth haplotypes)", (mutate(base, [site], "class"), base),
+              (base, base), ([site], [site]), "DISCORDANT"))
+    return F
+
+
 # ------------------------------------------------------------------------------------------------ frozen fixtures
 def fixtures_def():
     L, Rf, U = rnd("L", 800), rnd("R", 800), rnd("U", 600)
@@ -327,7 +458,7 @@ def cases(out):
     for cid, tcase, preds in CASES:
         dump = TRUTH[tcase][0]
         seq, ids = model_blocks(dump)
-        tdir = f"{OUT}/runs/truth.{tcase}"
+        tdir = f"{OUT}/runs/truth.{tcase}.a1"   # Amendment 1: truth extraction runs as .a1
         th = {"truth1": [], "truth2": []}
         avail = {"truth1": True, "truth2": True}
         for b, bid in enumerate(ids):
@@ -347,13 +478,17 @@ def cases(out):
                 pid = f"{cid}.{label}.{'int' if lo else 'full'}"
                 rows = align(diploid_pairs(pid, p, t), out, pid) if all(ok) else {}
                 v = diploid(rows, pid, ok)
+                vb = diploid_b(rows, align_b(None, out, pid), pid, ok) if all(ok) else dict(verdict="UNSUPPORTED", flags="TRUTH_UNAVAILABLE")
                 res.append(dict(case=cid, prediction=label, scope=scope, truth_available=f"{ok[0]}/{ok[1]}",
-                                pred_bp=f"{len(p[0])}/{len(p[1])}", truth_bp=f"{len(t[0])}/{len(t[1])}", **v))
+                                pred_bp=f"{len(p[0])}/{len(p[1])}", truth_bp=f"{len(t[0])}/{len(t[1])}",
+                                method_b_verdict=vb["verdict"], method_b_flags=vb["flags"], method_b_h1_events=vb.get("h1_events", "-"),
+                                method_b_h2_events=vb.get("h2_events", "-"), method_a_verdict=v["verdict"], method_a_flags=v["flags"],
+                                **{k: x for k, x in v.items() if k not in ("verdict", "flags")}))
         prov.append(dict(case=cid, **kv(f"{tdir}/provenance.tsv")))
     write(out, "cases", res)
     write(out, "provenance", prov)
     for r in res:
-        print(f"{r['case']}\t{r['prediction']}\t{r['scope'][:8]}\t{r['verdict']}\t{r['flags']}\t{r.get('total_edits_best', '-')}")
+        print(f"{r['case']}\t{r['prediction']}\t{r['scope'][:8]}\tB={r['method_b_verdict']}\t{r['method_b_flags']}\t{r['method_b_h1_events']}|{r['method_b_h2_events']}\tA={r['method_a_verdict']}\t{r.get('total_edits_best', '-')}")
     return 0
 
 
@@ -364,4 +499,4 @@ if __name__ == "__main__":
         sys.exit(truth(sys.argv[2], sys.argv[3]))
     out = sys.argv[2]
     os.makedirs(out, exist_ok=True)
-    sys.exit({"gate": lambda o: fixtures(o, gate=True), "fixtures": fixtures, "cases": cases}[mode](out))
+    sys.exit({"gate": lambda o: fixtures(o, gate=True), "fixtures": fixtures, "fixtures_b": fixtures_b, "cases": cases}[mode](out))

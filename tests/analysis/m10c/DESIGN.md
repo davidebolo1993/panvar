@@ -91,3 +91,40 @@ Provenance (truth GFA SHA-256, fingerprint match) and endpoint compatibility are
 
 **Units (manifest P):** `build`, `gate.aligner`, `fixtures`, `truth.<5>`, `cases`. Admission: spent + declared timeout ≤
 900 s.
+
+## Amendment 1 (after `fixtures`; no truth extraction or case has run)
+
+**What `fixtures` showed (recorded, unchanged).** Method A (unit-cost global alignment) gets the **edit distance** right,
+but **cannot locate events**. Unit-cost gaps fragment freely:
+- the F03 55 bp deletion has a longest indel run of 8;
+- the F04 600 bp copy insertion, 24;
+- inversions and order changes appear as scattered mismatches and indels.
+
+Neither E1 nor the benchmark's E2 detects them. Required distinctions missed: F03, F04, F06, F07, F07b, F11, F14 (all read
+as CONCORDANT) and F12b (a 20 bp endpoint offset, only noted).
+
+F10 came out AMBIGUOUS. The cause is my fixture: it declared the site on one of two identical truth haplotypes, so the
+assignment is arbitrary. The evaluator's ambiguity is the correct response. F10 stays recorded.
+
+**Method B (added, existing implementation).** `panvar::minimap2_hits` (asm20, affine gaps, all regions), in both roles,
+with the frozen event rule in `m10c.py` (`events_b`):
+- reverse-strand hit → INVERSION;
+- chain order → ORDER;
+- target overlap → DUPLICATION;
+- inter-hit gap → GAP;
+- CIGAR I/D ≥ 50 → INDEL;
+- uncovered ends → endpoint;
+- hits overlapping by ≥ 50 query bases → ALTERNATIVE_PLACEMENT (flag).
+
+The assignment and located-site bases still come from Method A. **Method A's results stay recorded as its failures.**
+
+**Fixture added:** F10c, the class site declared for the locus on both truth haplotypes (required DISCORDANT).
+
+**Condition for inspecting saved cases.** They run only if Method B meets **every** structural and concordance fixture:
+F01, F02, F03, F03b, F04, F05, F06, F07, F07b, F08, F08b, F09, F10b, F10c, F11, F11b, F14.
+- Excluded: F12/F12b and F13, because endpoint matching for real cases is **by construction** (the same chain boundaries
+  for truth and prediction), and F13 needs a definition.
+- If the condition fails, no case is inspected.
+
+**Runs (manifest A1):** `build.a1`, `fixtures_b.a1`, `truth.<5>.a1`, `cases.a1`. The P units `truth.*` and `cases` are
+superseded (recorded NOT RUN). Disclosed amendment development: 30 s.

@@ -11,7 +11,11 @@
 //   indel_runs_ge50: contiguous same-op indel runs of >= 50 bp as op:len@b_position (I = extra in A, D = missing from A)
 //   max_indel_run, terminal_left / terminal_right: the indel run touching each alignment end (op:len or 0)
 //   site_results: per located site pos:truth_base:aligned_A_base (or '-' for a deletion)
+// M10-C Amendment 1: `m10c_align_eval --minimap2 <manifest> <out>` runs the existing panvar::minimap2_hits (asm20, all
+// regions: primary, secondary and supplementary, unflagged) in both roles (A on B, and B on A) and writes every hit:
+//   strand, query start/end, target start/end, matches, block length, and CIGAR I/D ops >= 50 bp as op:len@target_pos
 #include "panvar/align.hpp"
+#include "panvar/minimap2_align.hpp"
 
 #include "edlib.h"
 
@@ -110,7 +114,40 @@ Walk walk(const std::string& a, const std::string& b, const std::vector<std::siz
 }
 }  // namespace
 
+int minimap2_mode(const std::string& manifest, const std::string& out_path) {
+    std::ifstream in(manifest);
+    std::ofstream out(out_path);
+    out << "id\trole\thit\tstrand\tqs\tqe\tts\tte\tmatches\tblock_len\tbig_ops\n";
+    for (std::string line; std::getline(in, line);) {
+        if (line.empty()) continue;
+        std::vector<std::string> f;
+        std::stringstream ss(line);
+        for (std::string x; std::getline(ss, x, '\t');) f.push_back(x);
+        const std::string a = slurp(f[1]), b = slurp(f[2]);
+        for (const bool swap : {false, true}) {
+            const std::string& q = swap ? b : a;
+            const std::string& t = swap ? a : b;
+            const auto hits = panvar::minimap2_hits("q", q, "t", t, "asm20", 64);
+            if (hits.empty()) out << f[0] << '\t' << (swap ? "truth_on_pred" : "pred_on_truth") << "\tnone\t-\t-\t-\t-\t-\t-\t-\t-\n";
+            for (std::size_t h = 0; h < hits.size(); ++h) {
+                const auto& x = hits[h];
+                std::string big;
+                std::size_t tp = x.target_start_bp;
+                for (const auto& [op, len] : x.cigar) {
+                    if ((op == 1 || op == 2) && len >= 50) big += (big.empty() ? "" : ";") + std::string(op == 1 ? "I" : "D") + ":" + std::to_string(len) + "@" + std::to_string(tp);
+                    if (op == 7 || op == 8 || op == 2) tp += static_cast<std::size_t>(len);
+                }
+                out << f[0] << '\t' << (swap ? "truth_on_pred" : "pred_on_truth") << '\t' << h << '\t' << (x.reverse ? '-' : '+') << '\t'
+                    << x.query_start_bp << '\t' << x.query_end_bp << '\t' << x.target_start_bp << '\t' << x.target_end_bp << '\t'
+                    << x.n_matches << '\t' << x.aln_block_len << '\t' << (big.empty() ? "-" : big) << '\n';
+            }
+        }
+    }
+    return 0;
+}
+
 int main(int argc, char** argv) {
+    if (argc == 4 && std::string(argv[1]) == "--minimap2") return minimap2_mode(argv[2], argv[3]);
     if (argc != 3) {
         std::cerr << "usage: m10c_align_eval <manifest.tsv> <out.tsv>\n";
         return 2;
