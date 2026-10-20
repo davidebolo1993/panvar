@@ -35,6 +35,9 @@ PRE += 15.0   # disclosed A2 development: structural check of outcomes.a1's part
 # amendment A3 (AMENDMENT_A3.md): a reporting-only unit; descriptive tables from outcomes.a2 / fit.a2, no predictor change
 UNITS += [("report", 120)]
 PRE += 120.0  # disclosed A3 development: reading runs.tsv and the fit.a2 printout, writing m11d_report.py
+# amendment A4 (AMENDMENT_A4.md): report failed on zero-length blocks' undefined normalized excess; re-run as report.a4
+UNITS += [("report.a4", 120)]
+PRE += 60.0   # disclosed A4 development: locating the 34 zero-length blocks; a 0.1 s scratchpad dry run of the fixed report
 
 
 def ledger():
@@ -81,7 +84,7 @@ def command(unit, d):
         return eval_cmd(m11d.cell(cid), d)
     if kind == "truth":
         return py + ["truth", cid, d]
-    if unit == "report":
+    if unit in ("report", "report.a4"):
         return [sys.executable, os.path.join(HERE, "m11d_report.py"), d]
     if kind in ("inventory", "outcomes", "fit"):
         return py + [kind, d]
@@ -106,7 +109,7 @@ def precondition(unit):
         return "the inventory failed"
     if unit == "fit.a2" and exit_of("outcomes.a2") != "0":
         return "the outcomes unit failed"
-    if unit == "report" and exit_of("fit.a2") != "0":
+    if unit in ("report", "report.a4") and exit_of("fit.a2") != "0":
         return "the fit unit failed"
     return None
 

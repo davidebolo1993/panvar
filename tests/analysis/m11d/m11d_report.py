@@ -48,7 +48,8 @@ def main(out):
         B = sel(blocks, L)
         P = [r for r in B if r["predicted"] == "True"]
         ex = [float(r["excess"]) for r in P]
-        nx = [float(r["normalized_excess"]) for r in P]
+        # amendment A4: a zero-length block (truth and called alleles all empty) has undefined normalized excess (0/0); counted apart
+        nx = [float(r["normalized_excess"]) for r in P if r["normalized_excess"] not in ("", "None")]
         qf = [float(r["QVfrac"]) for r in P if r["QVfrac"] not in ("", "None")]
         quint = collections.Counter(int(r["quintile"]) for r in P if r["quintile"] not in ("", "None"))
         art = [r for r in P if r["synonymous_artefact"] == "True"]
@@ -57,7 +58,7 @@ def main(out):
                        fit_rows=sum(1 for k in preds if (L == "ALL" or preds[k]["locus"] == L)),
                        excess_sum=f(sum(ex), 8), excess_mean=f(statistics.mean(ex)), excess_median=f(statistics.median(ex)),
                        excess_p90=f(q(ex, 0.9)), excess_max=f(max(ex), 8),
-                       norm_excess_mean=f(statistics.mean(nx)), norm_excess_median=f(statistics.median(nx)), norm_excess_max=f(max(nx)),
+                       zero_length_blocks=len(P) - len(nx), norm_excess_mean=f(statistics.mean(nx)), norm_excess_median=f(statistics.median(nx)), norm_excess_max=f(max(nx)),
                        floor_attained=f"{sum(r['floor_attained'] == 'True' for r in P)}/{len(P)}",
                        catastrophic_ge_1000=sum(r["catastrophic"] == "True" for r in P),
                        top_QVfrac_ge_0_8=f"{sum(r['top_category'] == 'True' for r in P)}/{len(P)}",
