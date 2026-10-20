@@ -123,3 +123,12 @@ representation ambiguity from a real sequence difference.
   edit distance), 30 s.
 
 **Unchanged:** the matched contrasts, gates and readings.
+
+## Amendment 2
+
+**Failure.** `intervals` exited 1. `block-sequences` names the truth records `truth1` and `truth2`, but the comparison
+expected `truth0` and `truth1`.
+
+**Fix.** The record index is corrected. Nothing else changes.
+
+**Rerun.** `intervals.a2` (30 s). The failed `intervals` unit stays recorded.

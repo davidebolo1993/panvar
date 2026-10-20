@@ -28,7 +28,8 @@ MANIFEST_P = ([("build", "build", "-", 120), ("models", "models", "-", 120), ("c
               + [(f"score.{c}", "score", c, 90) for c in CASES] + [("degeneracy", "degeneracy", "-", 120), ("analyse", "analyse", "-", 30)])
 MANIFEST_A1 = ([(f"interval.{c}", "interval", c, 60) for c in ("LOO.d1", "LOO.d2", "LOO.d3", "LOO.d4", "LOO.d6")]
                + [("intervals", "intervals", "-", 30)])   # Amendment 1: truth bytes over sv:5..ctx:6 (block-sequences) and comparison
-MANIFESTS = {"P": MANIFEST_P, "A1": MANIFEST_A1}
+MANIFEST_A2 = [("intervals.a2", "intervals", "-", 30)]   # Amendment 2: truth record names
+MANIFESTS = {"P": MANIFEST_P, "A1": MANIFEST_A1, "A2": MANIFEST_A2}
 
 
 def ledger_rows():

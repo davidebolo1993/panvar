@@ -212,7 +212,7 @@ if mode == "intervals":   # Amendment 1: interval-level sequence comparison over
                         recs[cur] = ""
                     else:
                         recs[cur] += line.strip()
-                seq += recs[f"truth{k}"]
+                seq += recs[f"truth{k + 1}"]   # Amendment 2: block-sequences names the records truth1, truth2
             truth.append(seq)
         def core(a, b):   # residual differing core after trimming the common prefix and suffix
             p = 0
@@ -225,7 +225,7 @@ if mode == "intervals":   # Amendment 1: interval-level sequence comparison over
         best = min(((0, 1), (1, 0)), key=lambda o: sum(sum(core(called[i], truth[o[i]])) for i in (0, 1)))
         for i in (0, 1):
             c, t = called[i], truth[best[i]]
-            rows.append(dict(case=case, cell=cell, interval="..".join(span), haplotype=f"called hap{i + 1} vs truth{best[i]}", identical=c == t,
+            rows.append(dict(case=case, cell=cell, interval="..".join(span), haplotype=f"called hap{i + 1} vs truth{best[i] + 1}", identical=c == t,
                              called_bp=len(c), truth_bp=len(t), residual_core_called_bp=core(c, t)[0], residual_core_truth_bp=core(c, t)[1]))
     write("intervals", rows)
     print(open(f"{out}/intervals.tsv").read())
