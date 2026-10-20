@@ -1,0 +1,31 @@
+# panvar genotype: development configuration genotype-dev-m10a-v1 (M10-A) -- layer 1b, the COMMON route and switches
+#
+# The named development configuration has three layers, composed per run by tests/analysis/m10a/compose_m10a.py:
+#   1a  profiles/genotype_dev_performance_v1.tsv (unchanged): exact performance backends, cache budgets, consumption caps
+#   1b  THIS FILE: the retained route, the JP1.1 experiment, the reporting contract and the additive annotation
+#   2   model-bound declarations: compound_interval_declarations_v1, one artifact per model fingerprint (never here)
+#   3   locus/input resource requirements: time and footprint guards, state-class and neighbour bounds (never here)
+# Common command flags (not profile keys): --preset short-read --dosage-mode audit --threads 4.
+#
+# NOT a default and NOT a production configuration. No scientific parameter is standardised here: the model settings are
+# the short-read preset's, unchanged, and the only switch that changes candidate generation is marked below.
+profile	genotype-dev-m10a-v1
+
+## retained route (S2-A, S2-G, S2-J; validated together as S2-L "combined") -------------------------------------------
+# Completion and resource policy. A completed run equals the ordinary route's (S2-G/S2-L); they change WHETHER and
+# HOW EARLY a run delivers a prediction under a guard, never what a completed run computes.
+early_incumbent	experimental_v1
+union_fragment_blocks	fine_core_4096_experimental
+repair_round1_origin_admission	reuse_only_experimental
+
+## experimental scientific switch (M9-G/M9-H): CHANGES CANDIDATE GENERATION ----------------------------------------------
+# JP1.1 reorders the repair shortlist at blocks where every pair emission ties (search heuristic only; the objective,
+# scores and priors are unchanged). Predictions may legitimately differ from the same configuration without it.
+repair_junction_proposals	experimental_v1
+
+## reporting contract and additive annotation (S1-D/S1-D.1, M9-J/M9-J.1) ------------------------------------------------
+output_schema	sequence_first_v2
+compound_annotation	contract_v2
+
+## stated explicitly, equal to the default -----------------------------------------------------------------------------
+repair_joint_search	off

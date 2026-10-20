@@ -153,3 +153,13 @@ Users read one prediction, one quality decision and one phase row. Everything el
 
 No model, prior, filter, FASTA-policy, search or default change. No calibration, clustering, long-read work or new
 families. The existing exact-sequence compound annotation stays as a stricter diagnostic.
+
+---
+**Superseded (appended by M10-A; the text above is unchanged as the historical record).** Version 2 is
+`tests/analysis/m10a/QUALITY_TARGET.md`. It corrects three defects of this version:
+1. pairwise "within tolerance" equality is not transitive. Version 2 defines equivalence as equality of a per-haplotype
+   projection, with a class-defining position set in place of a tolerance;
+2. representability is split into intact panel, allowed mosaic, unrepresentable, unclassifiable and undetermined, with the
+   search outcome reported separately. Correctness depends only on agreement with truth;
+3. the locus decision is about the joint event that every interval genotype is correct. It uses joint pool support as a
+   calibration input, never a product of marginals, and precommits to no single support threshold.
