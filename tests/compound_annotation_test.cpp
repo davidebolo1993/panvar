@@ -6,6 +6,7 @@
 #include "panvar/compound_annotation.hpp"
 
 #include <cmath>
+#include <cstdlib>
 #include <cstdio>
 #include <fstream>
 #include <iomanip>
@@ -104,7 +105,7 @@ int replay(const std::string& manifest, const std::string& out_path) {
         p.blocks = blocks;
         for (const auto& r : table(f[2] + ".mosaic_scores.tsv")) {
             group_index[r.at("sequence_candidate_id")] = p.mass.size();
-            p.mass.push_back(std::stod(r.at("candidate_set_probability")));
+            p.mass.push_back(std::strtod(r.at("candidate_set_probability").c_str(), nullptr));   // subnormals parse (stod throws)
         }
         p.labellings.resize(p.mass.size());
         p.decision.assign(p.mass.size(), false);

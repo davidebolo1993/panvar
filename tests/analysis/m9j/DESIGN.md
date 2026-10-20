@@ -138,3 +138,14 @@ library's declaration parser is unaffected: its lines never end in an empty fiel
 - `gate.replay.a1`, which replaces `gate.replay` in the smoke precondition.
 
 The failed unit stays recorded.
+
+## Amendment 2 (after `gate.replay.a1`; before any smoke run)
+
+**Failure.** `gate.replay.a1` exited 1: `std::stod` threw `out_of_range` on **subnormal** printed masses (for example about
+1e-310). It reports underflow as an error, whereas Python's `float()` parses them.
+
+**Scope.** A test-harness defect only. The caller never parses masses: it uses in-memory doubles.
+
+**Fix.** The harness parses masses with `std::strtod`, which returns the subnormal value. Nothing else changes.
+
+**Rerun:** `build.a2`, `gate.compound_unit.a2` and `gate.replay.a2`, which replace the A1 units in the smoke precondition.
