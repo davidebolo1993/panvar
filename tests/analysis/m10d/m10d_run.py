@@ -24,7 +24,8 @@ PRE_FREEZE = 10.0   # disclosed: the --distance mode build (2.0 s) and configure
 TRUTHS = list(m10d.m10c.TRUTH)
 MANIFESTS = {"P": [("build", "build", "-", 120), ("gate.contract", "py", "gate", 120)] +
              [(f"truth.{c}", "truth", c, 120) for c in TRUTHS] + [("cases", "py", "cases", 400)],
-             "A1": [("cases.a1", "py", "cases", 400)]}   # Amendment 1: provenance-column harness defect; same cases, same truth units
+             "A1": [("cases.a1", "py", "cases", 400)],   # Amendment 1: provenance-column harness defect; same cases, same truth units
+             "A2": [("cases.a2", "py", "cases", 400)]}   # Amendment 2: framed-prefix rows for interior-unsupported cases
 
 
 def ledger_rows():

@@ -223,7 +223,24 @@ def cases(out):
                         "the flank blocks carry each path's own assembly extent and are excluded identically)",
                         pred_bp=f"{len(p[0])}/{len(p[1])}", historical_block_metric=HISTORICAL.get((cid, label), "-"))
             if any(x is None for x in interior):
-                res.append(dict(base, status="UNSUPPORTED", reason="truth projection unavailable at a block", truth_bp="-"))
+                missing = [f"{k}:{ids[b]}" for k in ("truth1", "truth2") for b in range(1, n - 1) if th[k][b] is None]
+                res.append(dict(base, status="UNSUPPORTED", reason="truth projection unavailable at " + ",".join(missing), truth_bp="-"))
+                # Amendment 2: the largest framed prefix [1..k] with blocks 1..k+1 projected for both truth haplotypes (so the
+                # end boundary's moved bytes are framed); named explicitly, never presented as the interior
+                kmax = 0
+                for k in range(1, n - 2):
+                    if all(th[h][b] is not None for h in ("truth1", "truth2") for b in range(1, k + 2)):
+                        kmax = k
+                if kmax:
+                    tp = tuple("".join(th[h][1:kmax + 1]) for h in ("truth1", "truth2"))
+                    pp = tuple("".join(seq[(b, tup[hh][b])] for b in range(1, kmax + 1)) for hh in (0, 1))
+                    o = [orientation(pp[hh], tp[hh]) for hh in (0, 1)]
+                    rows = distances(diploid_pairs(f"{cid}.{label}.prefix", pp, tp), out, f"{cid}.{label}.prefix")
+                    v = contract(rows, f"{cid}.{label}.prefix")
+                    res.append(dict(base, scope=f"framed prefix (Amendment 2): blocks {ids[1]}..{ids[kmax]} -- NOT the chain interior; "
+                                    f"{ids[kmax + 1]} is the last framed neighbour", pred_bp=f"{len(pp[0])}/{len(pp[1])}",
+                                    truth_bp=f"{len(tp[0])}/{len(tp[1])}", **v,
+                                    orientation_check=";".join(f"h{hh + 1}:{o[hh][2]}({o[hh][0]}/{o[hh][1]})" for hh in (0, 1)), reason="-"))
                 continue
             o = [orientation(p[h], interior[h]) for h in (0, 1)]
             rows = distances(diploid_pairs(f"{cid}.{label}", p, interior), out, f"{cid}.{label}")

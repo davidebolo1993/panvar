@@ -102,3 +102,19 @@ provenance file written by the truth units has its own `case` key, and my harnes
 **Fix.** The column is renamed to `evaluated_case`. This is a harness defect: no metric, case, tie rule or scope changes.
 
 **Rerun:** `cases.a1`, on the same truth units. `cases` stays recorded.
+
+## Amendment 2 (after `cases.a1`; no metric or rule changed)
+
+**Observation.** All three CYP2D6 interior comparisons are UNSUPPORTED. `project_path_onto_locus` returns no frame for
+**sv:17 of truth haplotype 2** (`NA19650#2#haplotype2-0000078`): that path's walk is shorter than the bytes the divergence
+trim moves out of the block. The bytes are **not** reconstructed. The interior rows stay UNSUPPORTED, with the block named.
+
+sv:9 truth is available (39,609 + 27,459 bp), unlike M1-B's single-block run.
+
+**Addition.** For a case whose interior is unsupported, one further row reports the **largest framed prefix**: blocks
+1..k, where blocks 1..k+1 are projected for both truth haplotypes, so the moved bytes at the end boundary are framed.
+- The row is labelled as that region, **not** the chain interior, and the contract is otherwise unchanged.
+- For CYP2D6 it is sv:1..sv:15.
+- It is a narrower named scope, not an approximation of the interior.
+
+**Rerun:** `cases.a2`. `cases.a1` stays recorded.
