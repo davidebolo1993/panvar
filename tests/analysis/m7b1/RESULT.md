@@ -128,3 +128,17 @@ set made from real sequence. It provides neither genome-wide k-mer uniqueness no
 
 No favourable result arose, so nothing here motivates attribution of a benefit. Nothing here concerns truth-free
 candidate discovery or general genotyping.
+
+## Addendum at M7-C (2026-10-20; the record above and its sealed package are unchanged)
+
+M7-C's read-only audit (`tests/analysis/m7c/RESULT.md`) corrects four points:
+
+1. **The attempt files are intact.** `sol_ext..csv.br` holds 4 concatenated Brotli streams; they are not corrupt. The
+   direct gate (attempts 1–20 for every genotype) passes in all 11 runs.
+2. **The "56 % / 35 % extrapolated GC" figure counts sparse individual GC bins.** Locityper's actual blurred tails
+   (outside < 29 / > 67) cover 3.8 % (C4) and 2.1–2.2 % (CYP) of target windows.
+3. **`lik_sd` is the variance in natural-log units divided by ln 10,** not "log₁₀ of the variance". The derived noise
+   figures stand.
+4. **Score terms added.** The depth term carries the wrong copy-number preference in the C4 control and the CYP failure.
+
+The scoped conclusion is unchanged.
