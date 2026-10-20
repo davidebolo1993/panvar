@@ -115,3 +115,21 @@ table (`in_local_list`) in each reported winner's context. Questions:
 
 This would show whether the gap is in local pair ranking or in move generation, with no new search, tuning or caller
 change.
+
+## Correction (appended by M9-E, 2026-10-20; the text and tables above are unchanged)
+
+**What was wrong.** The automatic `reading` column of `analyse/contrasts.tsv` was not context-aware.
+
+**What replaces it.** M9-E reclassifies all 52 contrasts (`m9e_reachability_20261020/runs/analyse/m9d_reclassified.tsv`;
+fixture 6/6). An **inconsistency is claimed only for a scored-pool member that scores above the reported winner.** A
+context-B truth carrier beating its called-pair insertion is not, by itself, an inconsistency.
+
+| reading | count |
+|---|---|
+| INCONSISTENCY | **0** |
+| SEARCH_GAP | 5 (E1 A_truth_ba; E3 A_truth_ab and A_truth_ba; E6 A_truth_ab and A_truth_ba) |
+| no improvement over the winner | 25 |
+| consistent | 22 |
+
+**What M9-E found about the search gaps.** They are shortlist exclusions. sv:5's proposal emissions are identically 0.0
+across all 6,786 pairs, so the 32-pair list is allele-index order, and the improving pairs rank 753, 3,444 and 1,439.
