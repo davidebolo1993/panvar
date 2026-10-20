@@ -7838,6 +7838,304 @@ int block_sequences(const Args& args) {
 }
 
 // ------------------------------------------------------------------------------------------------
+// copying-heldout (M8-B, DIAGNOSTIC; panel sequences only, no reads): copying-prior calibration on family-held-out
+// panel haplotypes with a MASKED labelled-path score (log_haploid_mosaic_prior_masked), and a whole-sequence support
+// check (log_haploid_sequence_prior on family-excluded models of the same graph frame).
+//   --mode gates     fixtures: exhaustive tiny-history oracle, no-mask equality, all-masked = 0, transition composition
+//                    across masked blocks, donor permutation / duplicate weighting, AB|C whole-sequence negative control
+//   --mode fit       --split TSV (template, family, role train|eval): inner leave-one-family-out training profiles over the
+//                    frozen grids (constant r; distance lambda = lambda_HM x multiplier), selection, and outer evaluation of
+//                    eval families against the training bank only; --scramble-eval perturbs eval rows (isolation test)
+//   --mode support   per family (eval first, then training up to --support-seconds): whole-sequence prior of each held-out
+//                    haplotype under a model of the same graph with every eval template and the family's templates excluded
+// Masks are recomputed against each actual reference bank: block b is observed for query q iff some bank row carries q's
+// allele at b (labels of the full model's frame; the frame and the geometry are fixed and derived from the full panel).
+// ------------------------------------------------------------------------------------------------
+namespace heldout {
+const std::vector<double> kGridR = {0.0003, 0.001, 0.003, 0.01, 0.03, 0.1, 0.3};
+const std::vector<double> kGridMult = {1.0 / 30, 0.1, 1.0 / 3, 1.0, 3.0, 10.0, 30.0};
+constexpr double kLegacyR = 0.01;
+
+double brute_force(const panvar::PanelAlleleMatrix& p, const panvar::MosaicPath& m, const std::vector<bool>& obs, const std::vector<double>& r) {
+    const std::size_t n = p.template_count(), B = p.block_count();
+    std::size_t histories = 1;
+    for (std::size_t b = 0; b < B; ++b) histories *= n;
+    double total = 0;
+    for (std::size_t code = 0; code < histories; ++code) {
+        std::vector<std::size_t> h(B);
+        std::size_t x = code;
+        for (std::size_t b = 0; b < B; ++b) { h[b] = x % n; x /= n; }
+        double pr = 1.0 / static_cast<double>(n);
+        for (std::size_t b = 0; b < B && pr > 0; ++b) {
+            if (b > 0) pr *= (h[b] == h[b - 1] ? 1 - r[b - 1] : 0.0) + r[b - 1] / static_cast<double>(n);
+            if (obs[b] && p.template_alleles[h[b]][b] != m.alleles[b]) pr = 0;
+        }
+        total += pr;
+    }
+    return std::log(total);
+}
+
+panvar::PanelAlleleMatrix rows(const panvar::PanelAlleleMatrix& full, const std::vector<std::size_t>& ids) {
+    panvar::PanelAlleleMatrix out;
+    for (std::size_t i : ids) {
+        out.template_names.push_back(full.template_names[i]);
+        out.template_alleles.push_back(full.template_alleles[i]);
+    }
+    return out;
+}
+
+struct Scored {
+    double loglik = 0;
+    std::size_t masked = 0;
+};
+Scored score(const panvar::PanelAlleleMatrix& bank, const std::vector<std::size_t>& query, const std::vector<double>& r) {
+    const std::size_t B = query.size();
+    std::vector<bool> obs(B, false);
+    Scored s;
+    for (std::size_t b = 0; b < B; ++b) {
+        for (const auto& row : bank.template_alleles) if (row[b] == query[b]) { obs[b] = true; break; }
+        s.masked += obs[b] ? 0 : 1;
+    }
+    s.loglik = panvar::log_haploid_mosaic_prior_masked(bank, panvar::MosaicPath{query}, obs, r);
+    return s;
+}
+}  // namespace heldout
+
+int copying_heldout(const Args& args) {
+    using namespace heldout;
+    const std::string mode = args.required("mode");
+    const std::string out = args.required("out");
+    std::ostringstream report;
+    if (mode == "gates") {
+        std::mt19937_64 rng(20261020);
+        std::size_t failed = 0;
+        const auto row = [&](const std::string& gate, double value, double tol, bool larger_is_fail = true) {
+            const bool ok = larger_is_fail ? std::fabs(value) <= tol : std::fabs(value) > tol;
+            report << gate << '\t' << std::setprecision(6) << value << '\t' << (ok ? "PASS" : "FAIL") << '\n';
+            failed += ok ? 0 : 1;
+        };
+        double g1 = 0, g2 = 0, g3 = 0, g4 = 0, g5 = 0, g5b = 0;
+        for (int rep = 0; rep < 200; ++rep) {
+            const std::size_t n = 2 + rng() % 3, B = 2 + rng() % 4, A = 1 + rng() % 3;
+            panvar::PanelAlleleMatrix p;
+            for (std::size_t t = 0; t < n; ++t) {
+                p.template_names.push_back("t" + std::to_string(t));
+                std::vector<std::size_t> a(B);
+                for (auto& v : a) v = rng() % A;
+                p.template_alleles.push_back(a);
+            }
+            if (rep % 4 == 0) { p.template_names.push_back("dup"); p.template_alleles.push_back(p.template_alleles[0]); }   // duplicate rows
+            std::vector<std::size_t> q(B);
+            for (auto& v : q) v = rng() % A;
+            std::vector<bool> obs(B);
+            for (std::size_t b = 0; b < B; ++b) obs[b] = rng() % 3 != 0;
+            std::vector<double> r(B - 1);
+            for (auto& v : r) v = std::uniform_real_distribution<double>(0.001, 0.9)(rng);
+            const double fwd = panvar::log_haploid_mosaic_prior_masked(p, panvar::MosaicPath{q}, obs, r);
+            const double bf = brute_force(p, panvar::MosaicPath{q}, obs, r);
+            if (std::isfinite(fwd) || std::isfinite(bf)) g1 = std::max(g1, std::fabs(fwd - bf));
+            const std::vector<bool> all(B, true), none(B, false);
+            const double a1 = panvar::log_haploid_mosaic_prior_masked(p, panvar::MosaicPath{q}, all, r), a2 = panvar::log_haploid_mosaic_prior(p, panvar::MosaicPath{q}, r);
+            if (std::isfinite(a1) || std::isfinite(a2)) g2 = std::max(g2, std::fabs(a1 - a2));
+            g3 = std::max(g3, std::fabs(panvar::log_haploid_mosaic_prior_masked(p, panvar::MosaicPath{q}, none, r)));
+            // composition: masking interior block k equals removing it and composing its two boundaries
+            if (B >= 3) {
+                const std::size_t k = 1 + rng() % (B - 2);
+                std::vector<bool> om = obs;
+                om[k] = false;
+                panvar::PanelAlleleMatrix pr;
+                pr.template_names = p.template_names;
+                for (const auto& tr : p.template_alleles) { auto t2 = tr; t2.erase(t2.begin() + k); pr.template_alleles.push_back(t2); }
+                std::vector<std::size_t> q2 = q; q2.erase(q2.begin() + k);
+                std::vector<bool> o2 = om; o2.erase(o2.begin() + k);
+                std::vector<double> r2;
+                for (std::size_t b = 0; b + 1 < B; ++b) {
+                    if (b == k - 1) { r2.push_back(1 - (1 - r[k - 1]) * (1 - r[k])); ++b; }
+                    else r2.push_back(r[b]);
+                }
+                const double x1 = panvar::log_haploid_mosaic_prior_masked(p, panvar::MosaicPath{q}, om, r), x2 = panvar::log_haploid_mosaic_prior_masked(pr, panvar::MosaicPath{q2}, o2, r2);
+                if (std::isfinite(x1) || std::isfinite(x2)) g4 = std::max(g4, std::fabs(x1 - x2));
+            }
+            // donor permutation invariance; duplicating EVERY row leaves the score unchanged (uniform row weighting)
+            panvar::PanelAlleleMatrix perm = p, doubled = p;
+            std::shuffle(perm.template_alleles.begin(), perm.template_alleles.end(), rng);
+            for (const auto& tr : p.template_alleles) doubled.template_alleles.push_back(tr);
+            doubled.template_names.resize(doubled.template_alleles.size(), "d");
+            const double y1 = panvar::log_haploid_mosaic_prior_masked(perm, panvar::MosaicPath{q}, obs, r), y2 = panvar::log_haploid_mosaic_prior_masked(doubled, panvar::MosaicPath{q}, obs, r);
+            if (std::isfinite(y1) || std::isfinite(fwd)) g5 = std::max(g5, std::fabs(y1 - fwd));
+            if (std::isfinite(y2) || std::isfinite(fwd)) g5b = std::max(g5b, std::fabs(y2 - fwd));
+        }
+        row("G1_masked_forward_vs_exhaustive_history_oracle(200 fixtures, some with duplicate rows)", g1, 1e-10);
+        row("G2_no_masks_equals_log_haploid_mosaic_prior", g2, 1e-12);
+        row("G3_all_masked_equals_log_1", g3, 1e-12);
+        row("G4_masked_interior_block_equals_composed_transition", g4, 1e-10);
+        row("G5_donor_permutation_invariance", g5, 1e-10);
+        row("G5_duplicating_every_row_unchanged(declared uniform row weighting)", g5b, 1e-10);
+        // G6 whole-sequence negative control: query blocks AB|C, training blocks A|BC (same bytes GATCCATTG)
+        panvar::StructuralLocusInput in;
+        in.locus_id = "m8b-ab-c";
+        in.invariant_segments = {"", "", ""};
+        in.blocks = {{"b0", {{"A", "GAT"}, {"AB", "GATCCA"}}}, {"b1", {{"BC", "CCATTG"}, {"C", "TTG"}}}};
+        in.templates = {{"train", panvar::TemplateFrameStatus::Complete, {"A", "BC"}}};
+        std::string g6 = "PASS";
+        try {
+            const panvar::PreparedGenotypeModel m = panvar::prepare_genotype_model(in);
+            const double seq = panvar::log_haploid_sequence_prior(m, "GATCCATTG", {0.01});
+            // the query's labelled path (AB, C): both labels unsupported (no template carries them)
+            std::size_t ab = 0, c = 0;
+            for (std::size_t a = 0; a < m.blocks()[0].alleles.size(); ++a) if (m.allele(0, a).sequence == "GATCCA") ab = a;
+            for (std::size_t a = 0; a < m.blocks()[1].alleles.size(); ++a) if (m.allele(1, a).sequence == "TTG") c = a;
+            const double lab = panvar::log_haploid_mosaic_prior(m.panel(), panvar::MosaicPath{{ab, c}}, {0.01});
+            report << "G6_AB|C_whole_sequence_prior\t" << seq << '\t' << (std::isfinite(seq) ? "PASS" : "FAIL") << '\n';
+            report << "G6_AB|C_labelled_path_prior_(both_blocks_unsupported)\t" << lab << '\t' << (!std::isfinite(lab) ? "PASS" : "FAIL") << '\n';
+            failed += std::isfinite(seq) ? 0 : 1;
+            failed += !std::isfinite(lab) ? 0 : 1;
+        } catch (const std::exception& e) {
+            report << "G6_AB|C_fixture\tERROR " << e.what() << "\tFAIL\n";
+            ++failed;
+        }
+        report << "m8b_gates\t" << failed << '\t' << (failed ? "FAIL" : "PASS") << '\n';
+        atomic_write(out + ".gates.tsv", report.str());
+        std::cout << report.str();
+        return failed ? 1 : 0;
+    }
+
+    const std::string reference = args.required("reference");
+    std::vector<std::string> curated;
+    if (!args.get("panel-curation", "").empty()) curated = read_panel_curation(args.required("panel-curation"));
+    LoadedModel loaded = load_model(args.required("model-gfa"), reference, out + ".model.sorted.gfa", 50, curated);
+    const panvar::PreparedGenotypeModel& model = *loaded.model;
+    panvar::PanelAlleleMatrix panel = model.panel();
+    const std::size_t n = panel.template_count(), B = panel.block_count();
+    std::map<std::string, std::pair<std::string, std::string>> split;   // template -> (family, role)
+    {
+        std::ifstream f(args.required("split"));
+        for (std::string line; std::getline(f, line);) {
+            if (line.empty() || line[0] == '#') continue;
+            std::stringstream ss(line);
+            std::string t, fam, role;
+            std::getline(ss, t, '\t'); std::getline(ss, fam, '\t'); std::getline(ss, role, '\t');
+            split[t] = {fam, role};
+        }
+    }
+    std::map<std::string, std::vector<std::size_t>> fam_rows;
+    std::vector<std::size_t> train, eval_rows;
+    for (std::size_t i = 0; i < n; ++i) {
+        const auto it = split.find(panel.template_names[i]);
+        if (it == split.end()) throw std::runtime_error("template missing from the split: " + panel.template_names[i]);
+        fam_rows[it->second.first].push_back(i);
+        (it->second.second == "eval" ? eval_rows : train).push_back(i);
+    }
+    if (!args.get("scramble-eval", "").empty()) {   // isolation test: perturb every eval row's alleles
+        for (std::size_t i : eval_rows)
+            for (std::size_t b = 0; b < B; ++b)
+                panel.template_alleles[i][b] = (panel.template_alleles[i][b] + 1) % model.blocks()[b].alleles.size();
+    }
+    const panvar::LocusGeometry& geometry = loaded.built.geometry;
+    if (mode == "fit") {
+        const double lambda_hm = panvar::hazard_matched_copying_length(geometry, kLegacyR);
+        struct Point { std::string mode; double param; std::vector<double> r; };
+        std::vector<Point> grid;
+        for (double r : kGridR) {
+            panvar::CopyingTransitionSpec s;
+            s.constant_r = r;
+            grid.push_back({"constant", r, panvar::build_copying_transitions(B, &geometry, s).r});
+        }
+        for (double m : kGridMult) {
+            panvar::CopyingTransitionSpec s;
+            s.mode = "distance_ref_core_v1_experimental";
+            s.copying_length_bp = lambda_hm * m;
+            grid.push_back({"distance", lambda_hm * m, panvar::build_copying_transitions(B, &geometry, s).r});
+        }
+        std::set<std::string> train_fams, eval_fams;
+        for (std::size_t i : train) train_fams.insert(split[panel.template_names[i]].first);
+        for (std::size_t i : eval_rows) eval_fams.insert(split[panel.template_names[i]].first);
+        std::ostringstream prof, fam_prof, ev;
+        prof << std::setprecision(12) << "mode\tparam\ttraining_objective\ttraining_haplotypes\ttraining_masked_blocks\tminus_infinite\n";
+        fam_prof << std::setprecision(12) << "family\tmode\tparam\tcontribution\thaplotypes\tmasked_blocks\n";
+        for (const Point& g : grid) {
+            double total = 0;
+            std::size_t haps = 0, masked = 0, ninf = 0;
+            for (const std::string& f : train_fams) {
+                std::vector<std::size_t> bank_ids;
+                for (std::size_t i : train) if (split[panel.template_names[i]].first != f) bank_ids.push_back(i);
+                const panvar::PanelAlleleMatrix bank = rows(panel, bank_ids);
+                double fsum = 0;
+                std::size_t fm = 0, fh = 0;
+                for (std::size_t q : fam_rows[f]) {
+                    const Scored s = score(bank, panel.template_alleles[q], g.r);
+                    if (!std::isfinite(s.loglik)) { ++ninf; continue; }
+                    fsum += s.loglik; fm += s.masked; ++fh;
+                }
+                total += fsum; haps += fh; masked += fm;
+                fam_prof << f << '\t' << g.mode << '\t' << g.param << '\t' << fsum << '\t' << fh << '\t' << fm << '\n';
+            }
+            prof << g.mode << '\t' << g.param << '\t' << total << '\t' << haps << '\t' << masked << '\t' << ninf << '\n';
+        }
+        const panvar::PanelAlleleMatrix bank = rows(panel, train);
+        ev << std::setprecision(12) << "template\tfamily\tmode\tparam\tmasked_blocks\tobserved_blocks\tloglik\n";
+        for (std::size_t q : eval_rows)
+            for (const Point& g : grid) {
+                const Scored s = score(bank, panel.template_alleles[q], g.r);
+                ev << panel.template_names[q] << '\t' << split[panel.template_names[q]].first << '\t' << g.mode << '\t' << g.param << '\t' << s.masked << '\t'
+                   << B - s.masked << '\t' << s.loglik << '\n';
+            }
+        atomic_write(out + ".profile.tsv", prof.str());
+        atomic_write(out + ".family_profile.tsv", fam_prof.str());
+        atomic_write(out + ".eval.tsv", ev.str());
+        atomic_write(out + ".info.tsv", "key\tvalue\ntemplates\t" + std::to_string(n) + "\nblocks\t" + std::to_string(B) + "\ntraining_templates\t" + std::to_string(train.size()) +
+                                            "\neval_templates\t" + std::to_string(eval_rows.size()) + "\ntraining_families\t" + std::to_string(train_fams.size()) +
+                                            "\neval_families\t" + std::to_string(eval_fams.size()) + "\nlambda_hm_bp\t" + std::to_string(lambda_hm) +
+                                            "\ngeometry\t" + geometry.status + "\nscrambled_eval\t" + (args.get("scramble-eval", "").empty() ? "no" : "yes") + "\n");
+        std::cout << "copying-heldout fit: " << n << " templates, " << B << " blocks, " << train_fams.size() << " training / " << eval_fams.size() << " eval families\n";
+        return 0;
+    }
+    if (mode == "support") {
+        const double limit = std::stod(args.get("support-seconds", "40"));
+        const auto t0 = std::chrono::steady_clock::now();
+        std::vector<std::string> order;
+        for (std::size_t i : eval_rows) { const auto& f = split[panel.template_names[i]].first; if (std::find(order.begin(), order.end(), f) == order.end()) order.push_back(f); }
+        for (std::size_t i : train) { const auto& f = split[panel.template_names[i]].first; if (std::find(order.begin(), order.end(), f) == order.end()) order.push_back(f); }
+        std::ostringstream sup;
+        sup << std::setprecision(12) << "family\trole\ttemplate\tstatus\tbank_masked_blocks\twhole_sequence_log_prior\n";
+        for (const std::string& f : order) {
+            const bool tested = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count() < limit;
+            const std::string role = split[panel.template_names[fam_rows[f][0]]].second;
+            if (!tested) {
+                for (std::size_t q : fam_rows[f]) sup << f << '\t' << role << '\t' << panel.template_names[q] << "\tUNTESTED (time bound)\t\t\n";
+                continue;
+            }
+            std::vector<std::string> excluded = curated;
+            std::vector<std::size_t> bank_ids;
+            for (std::size_t i = 0; i < n; ++i) {
+                const auto& [fam, rl] = split[panel.template_names[i]];
+                if (rl == "eval" || fam == f) excluded.push_back(panel.template_names[i]);
+                else bank_ids.push_back(i);
+            }
+            panvar::LocusInputOptions opt;
+            opt.locus_id = loaded.sorted.resolved;
+            opt.reference_path_name = loaded.sorted.resolved;
+            opt.excluded_templates = excluded;
+            const panvar::LocusInputResult built = panvar::build_locus_input(loaded.sorted.graph, loaded.bubbles, opt);
+            const panvar::PreparedGenotypeModel mf = panvar::prepare_genotype_model(built.input);
+            const std::vector<double> r(mf.blocks().size() - 1, kLegacyR);
+            const panvar::PanelAlleleMatrix bank = rows(model.panel(), bank_ids);
+            for (std::size_t q : fam_rows[f]) {
+                const std::string seq = panvar::spell_panel_template(model, q).bases;
+                const double lp = panvar::log_haploid_sequence_prior(mf, seq, r);
+                const Scored s = score(bank, model.panel().template_alleles[q], r.size() + 1 == B ? r : std::vector<double>(B - 1, kLegacyR));
+                sup << f << '\t' << role << '\t' << panel.template_names[q] << '\t' << (std::isfinite(lp) ? "WHOLE_SEQUENCE_SUPPORTED" : "WHOLE_SEQUENCE_UNSUPPORTED")
+                    << '\t' << s.masked << '\t' << lp << '\n';
+            }
+        }
+        atomic_write(out + ".support.tsv", sup.str());
+        std::cout << "copying-heldout support: written\n";
+        return 0;
+    }
+    throw std::runtime_error("unknown --mode " + mode);
+}
+
+// ------------------------------------------------------------------------------------------------
 // edit-distances: global edit distance for declared sequence pairs (diagnostic evaluator)
 // ------------------------------------------------------------------------------------------------
 
@@ -8893,7 +9191,7 @@ int library_estimate(const Args& args) {
 int main(int argc, char** argv) {
     try {
         if (argc < 2) {
-            std::cerr << "usage: genotype_probe simulate|loo-gfa|evaluate|compare|genotype|trace|anchors|subsample|preflight|respell|coverage-audit|form-census|mosaic-truth|orientations|panel-alleles|tied-consensus|score-set|block-sequences|prior-pool|two-block-catalogue|two-block-eval|two-block-lik|two-block-lik-gate|joint-bounds|support-audit|mass-reconcile|spell|edit-distances|repair-search --key value ...\n";
+            std::cerr << "usage: genotype_probe simulate|loo-gfa|evaluate|compare|genotype|trace|anchors|subsample|preflight|respell|coverage-audit|form-census|mosaic-truth|orientations|panel-alleles|tied-consensus|score-set|block-sequences|prior-pool|two-block-catalogue|two-block-eval|two-block-lik|two-block-lik-gate|joint-bounds|support-audit|mass-reconcile|spell|edit-distances|copying-heldout|repair-search --key value ...\n";
             return 2;
         }
         const std::string command = argv[1];
@@ -8932,6 +9230,7 @@ int main(int argc, char** argv) {
         if (command == "mass-reconcile") return mass_reconcile(args);
         if (command == "spell") return spell(args);
         if (command == "edit-distances") return edit_distances(args);
+        if (command == "copying-heldout") return copying_heldout(args);
         if (command == "repair-search") return repair_search(args);
         if (command == "window-bench") return window_bench(args);
         if (command == "tie-branch") return tie_branch(args);

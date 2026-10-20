@@ -76,6 +76,39 @@ double log_haploid_mosaic_prior(
     return log_sum_exp(previous);
 }
 
+double log_haploid_mosaic_prior_masked(
+    const PanelAlleleMatrix& panel,
+    const MosaicPath& mosaic,
+    const std::vector<bool>& observed,
+    const std::vector<double>& switch_probability) {
+    validate_path_inputs(panel, mosaic, switch_probability);
+    if (observed.size() != panel.block_count()) throw std::invalid_argument("one observed flag is required per block");
+
+    const std::size_t templates = panel.template_count();
+    const double log_templates = std::log(static_cast<double>(templates));
+    std::vector<double> previous(templates, kNegInf);
+    std::vector<double> next(templates, kNegInf);
+
+    for (std::size_t h = 0; h < templates; ++h) {
+        if (!observed[0] || panel.template_alleles[h][0] == mosaic.alleles[0]) previous[h] = -log_templates;
+    }
+    for (std::size_t block = 1; block < panel.block_count(); ++block) {
+        const double r = switch_probability[block - 1];
+        const double total = log_sum_exp(previous);
+        const double log_stay = r < 1.0 ? std::log1p(-r) : kNegInf;
+        const double log_switch = r > 0.0 ? std::log(r) - log_templates : kNegInf;
+        std::fill(next.begin(), next.end(), kNegInf);
+        for (std::size_t h = 0; h < templates; ++h) {
+            if (observed[block] && panel.template_alleles[h][block] != mosaic.alleles[block]) continue;
+            const double stay = previous[h] == kNegInf || log_stay == kNegInf ? kNegInf : previous[h] + log_stay;
+            const double switched = total == kNegInf || log_switch == kNegInf ? kNegInf : total + log_switch;
+            next[h] = log_add_exp(stay, switched);
+        }
+        previous.swap(next);
+    }
+    return log_sum_exp(previous);
+}
+
 double log_unordered_diplotype_prior(
     const PanelAlleleMatrix& panel,
     const MosaicDiplotype& diplotype,

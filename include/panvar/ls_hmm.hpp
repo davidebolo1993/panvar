@@ -15,6 +15,17 @@ double log_haploid_mosaic_prior(
     const MosaicPath& mosaic,
     const std::vector<double>& switch_probability);
 
+// M8-B (diagnostic): the same labelled-path forward recursion with ALL-ONES emissions at blocks where
+// `observed[b]` is false (every template compatible); every boundary's transition, including those around
+// masked blocks, is applied unchanged. With every block observed it equals log_haploid_mosaic_prior; with
+// none observed it returns 0. This is a score of the observed blocks conditional on the declared mask, not
+// a predictive probability of a complete haplotype.
+double log_haploid_mosaic_prior_masked(
+    const PanelAlleleMatrix& panel,
+    const MosaicPath& mosaic,
+    const std::vector<bool>& observed,
+    const std::vector<double>& switch_probability);
+
 // Prior of an unordered diploid mosaic. The two homologues evolve independently; two distinct paths
 // therefore aggregate both orders and receive the exact log(2) multiplicity.
 //
