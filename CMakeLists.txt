@@ -386,6 +386,9 @@ if(PANVAR_BUILD_TESTING)
         add_executable(cyp2d6_block_alleles tests/analysis/cyp2d6_pilot/block_alleles_dump.cpp src/cli_utils.cpp)
         target_link_libraries(cyp2d6_block_alleles PRIVATE panvarlib)
         target_compile_options(cyp2d6_block_alleles PRIVATE -Wall -Wextra -Wpedantic)
+        add_executable(m10c_align_eval tests/analysis/m10c/align_eval.cpp src/cli_utils.cpp)   # M10-C diagnostic
+        target_link_libraries(m10c_align_eval PRIVATE panvarlib edlib)
+        target_compile_options(m10c_align_eval PRIVATE -Wall -Wextra -Wpedantic)
         add_executable(m10b_walk_dump tests/analysis/m10b/walk_dump.cpp src/cli_utils.cpp)   # M10-B diagnostic
         target_link_libraries(m10b_walk_dump PRIVATE panvarlib)
         target_compile_options(m10b_walk_dump PRIVATE -Wall -Wextra -Wpedantic)
