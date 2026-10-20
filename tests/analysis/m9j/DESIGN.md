@@ -149,3 +149,17 @@ The failed unit stays recorded.
 **Fix.** The harness parses masses with `std::strtod`, which returns the subnormal value. Nothing else changes.
 
 **Rerun:** `build.a2`, `gate.compound_unit.a2` and `gate.replay.a2`, which replace the A1 units in the smoke precondition.
+
+## Amendment 3 (after the ACOT smoke runs; before any CYP2D6 or C4 smoke run)
+
+**Completed:** the ACOT pair and the one-thread run (exit 0).
+
+**Failure.** For `smoke.cyp.off`, my command builder looked for `--out-prefix`, but M1-B's recorded command uses `--out`.
+It raised before launching any process. The empty directory `runs/smoke.cyp.off/` is kept, with no ledger row. The P units
+`smoke.cyp.*`, `smoke.c4.*` and `smoke_check` are superseded and never executed.
+
+**Fix.** The builder replaces whichever of `--out-prefix` and `--out` the source command uses. Nothing else changes.
+
+**Rerun:**
+- `smoke.cyp.off.a3`, `smoke.cyp.on.a3`, `smoke.c4.off.a3`, `smoke.c4.on.a3`;
+- `smoke_check.a3`, which reads the `.a3` directories for CYP2D6 and C4.

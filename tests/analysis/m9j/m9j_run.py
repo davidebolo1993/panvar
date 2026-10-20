@@ -35,7 +35,9 @@ MANIFEST_P = ([("build", "build", "-", 300), ("gate.compound_unit", "gate_compou
                ("smoke.c4.off", "smoke", "c4:off", 130), ("smoke.c4.on", "smoke", "c4:on", 130), ("smoke_check", "smoke_check", "-", 120)])
 MANIFEST_A1 = [("build.a1", "build", "-", 300), ("gate.compound_unit.a1", "gate_compound", "-", 30), ("gate.replay.a1", "replay", "-", 150)]   # Amendment 1
 MANIFEST_A2 = [("build.a2", "build", "-", 300), ("gate.compound_unit.a2", "gate_compound", "-", 30), ("gate.replay.a2", "replay", "-", 150)]   # Amendment 2
-MANIFESTS = {"P": MANIFEST_P, "A1": MANIFEST_A1, "A2": MANIFEST_A2}
+MANIFEST_A3 = [("smoke.cyp.off.a3", "smoke", "cyp:off", 310), ("smoke.cyp.on.a3", "smoke", "cyp:on", 310),
+               ("smoke.c4.off.a3", "smoke", "c4:off", 130), ("smoke.c4.on.a3", "smoke", "c4:on", 130), ("smoke_check.a3", "smoke_check", "-", 120)]   # Amendment 3
+MANIFESTS = {"P": MANIFEST_P, "A1": MANIFEST_A1, "A2": MANIFEST_A2, "A3": MANIFEST_A3}
 
 
 def ledger_rows():
@@ -91,7 +93,7 @@ def precondition(kind, target):
         return "the C4 model inventory failed"
     if kind == "smoke" and any(exit_of(g) != "0" for g in GATES):
         return "a gate failed: stop before caller smoke runs"
-    if kind == "smoke_check" and not any(m[0] in done() for m in MANIFEST_P if m[1] == "smoke"):
+    if kind == "smoke_check" and not any(m[0] in done() for rows in MANIFESTS.values() for m in rows if m[1] == "smoke"):
         return "no smoke run"
     return None
 
@@ -117,7 +119,8 @@ def command(kind, target, d):
         src, _ = SMOKE_SRC[name]
         first = open(f"{src}/run.log").readline().split()
         cmd = first[first.index("-l") + 1:]
-        cmd[cmd.index("--out-prefix") + 1] = f"{d}/call"
+        flag = "--out-prefix" if "--out-prefix" in cmd else "--out"   # Amendment 3: M1-B recorded --out
+        cmd[cmd.index(flag) + 1] = f"{d}/call"
         if arm == "on":
             cmd += ["--profile", f"{OUT}/runs/declare/{name}.compound_profile.tsv"]
         if len(parts) > 2 and parts[2] == "t1":

@@ -185,7 +185,8 @@ def compare_dirs(a, b, declared_extra):
 if mode == "smoke_check":
     rows, findings, consistency = [], [], []
     for name, sm in SMOKE.items():
-        off, on = f"{OUT}/smoke.{name}.off", f"{OUT}/smoke.{name}.on"
+        sfx = ".a3" if name in ("cyp", "c4") else ""   # Amendment 3: the CYP2D6 and C4 pairs ran as .a3 units
+        off, on = f"{OUT}/smoke.{name}.off{sfx}", f"{OUT}/smoke.{name}.on{sfx}"
         if not (os.path.exists(f"{off}/call.mosaic_status.tsv") and os.path.exists(f"{on}/call.mosaic_status.tsv")):
             rows.append(dict(case=name, file="(pair incomplete)", identical=False))
             continue
