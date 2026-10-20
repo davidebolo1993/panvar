@@ -187,3 +187,32 @@ with likelihood support shown as its basis label.
 - No MIXED or multi-label hypotheses occurred, so interval semantics are validated by fixtures only.
 - Masses are conditional on non-exhaustive, run-specific pools.
 - No calibration is claimed.
+
+## Qualification (appended by M9-B, 2026-10-20; the text above is unchanged)
+
+**1. A and C describe different propositions.** They are not two measurements of one certainty.
+- **A:** the reported exact unordered whole-haplotype sequence pair.
+- **C:** joint agreement of the reported unordered block-allele pairs across all reportable blocks.
+- **What replaces "understates SV certainty by about 4–5×":** the conditional masses themselves. In HG01975 LOO,
+  within each run's evaluated pool:
+
+| run | A | C |
+|---|---|---|
+| r0.01 | 0.2025 | 0.8378 |
+| r0.1 | 0.1551 | 0.8085 |
+
+  Neither value corrects the other.
+
+**2. C is joint, D is marginal.**
+- **C** is the mass of hypotheses agreeing at *every* reportable block simultaneously.
+- **D** is agreement at *one* block.
+- Joint agreement is not the product of block marginals. M9-B fixture J1 has two block marginals of 0.9 with joint
+  agreement 0.8; J2 has the same marginals with joint 0.9. Any value in the Fréchet interval [0.8, 0.9] is possible.
+
+**3. Neither C nor D is a calibrated probability of biological correctness.**
+- Both are conditional posterior masses within a non-exhaustive, run-specific candidate pool.
+- They are labels over block alleles, not structures.
+- Example (see M9-B §4): in HG01975 LOO, sv:5 has D = 1.0 while carrying a 10-bp exact-sequence error.
+
+**4. The recommendation is refined in M9-B.** The declared output unit is the reportable block, so the primary value is
+per-block D of exact block-allele agreement. C is a locus-level joint summary.
