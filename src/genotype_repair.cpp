@@ -276,6 +276,21 @@ CoordinateRepairSearch::CoordinateRepairSearch(const PreparedGenotypeModel& mode
         const std::size_t take = std::min(options.local_pairs, ranked.size());
         for (std::size_t r = 0; r < take; ++r) local_[b].push_back(ranked[r].second);
     }
+    // M9-G: junction-eligible blocks (every pair emission tied, more pairs than the limit), only when the experiment is on
+    junction_block_.assign(blocks, 0);
+    if (options.junction_reads) {
+        for (std::size_t b = 0; b < blocks; ++b) {
+            const BlockProposalEmissions& emission = emissions.blocks[b];
+            std::vector<double> all;
+            for (std::size_t x = 0; x < emission.allele_count; ++x) {
+                for (std::size_t y = x; y < emission.allele_count; ++y) all.push_back(emission.at(x, y));
+            }
+            if (junction_block_eligible(all, options.local_pairs)) {
+                junction_block_[b] = 1;
+                ++junction_report_.eligible_blocks;
+            }
+        }
+    }
     neighbour_bound_ = repair_neighbour_bound(model, options.local_pairs);
     if (options_.mode != RepairScoringMode::OneShot && !options_.external_context) new_context();
     memory_on_ = context_ != nullptr && options_.memory_log;
@@ -404,6 +419,34 @@ bool same_decision(const RoundVerdict& a, const RoundVerdict& b) {
     return a.complete == b.complete && a.unique_best == b.unique_best &&
            a.incumbent_in_top_set == b.incumbent_in_top_set && a.moved == b.moved && a.stop == b.stop &&
            a.winner == b.winner;
+}
+
+const std::vector<std::pair<std::size_t, std::size_t>>& CoordinateRepairSearch::local_for(
+    std::size_t b, const std::vector<std::size_t>& first, const std::vector<std::size_t>& second) {
+    if (b >= junction_block_.size() || junction_block_[b] == 0) return local_[b];
+    const JunctionProposalCache::Key key = JunctionProposalCache::key(b, first, second);
+    if (const JunctionProposal* hit = junction_cache_.find(key)) {
+        ++junction_report_.cache_hits;
+        return hit->pairs;
+    }
+    const auto mark = std::chrono::steady_clock::now();
+    const std::size_t blocks = model_.blocks().size();
+    std::vector<std::string> alleles;
+    alleles.reserve(model_.blocks()[b].alleles.size());
+    for (const auto& allele : model_.blocks()[b].alleles) alleles.push_back(allele.sequence);
+    JunctionContext context;
+    const std::vector<std::size_t>* haps[2] = {&first, &second};
+    for (int h = 0; h < 2; ++h) {
+        for (std::size_t i = 0; i < b; ++i) context.prefix[h] += model_.blocks()[i].alleles[(*haps[h])[i]].sequence;
+        for (std::size_t i = b + 1; i < blocks; ++i) context.suffix[h] += model_.blocks()[i].alleles[(*haps[h])[i]].sequence;
+        context.incumbent[h] = (*haps[h])[b];
+    }
+    JunctionProposal proposal = junction_local_pairs(alleles, context, *options_.junction_reads, options_.junction_rate,
+                                                     options_.junction_background, options_.local_pairs);
+    ++junction_report_.invocations;
+    junction_report_.cutoff_tie_crossings += proposal.cutoff_tie_crosses ? 1 : 0;
+    junction_report_.seconds += std::chrono::duration<double>(std::chrono::steady_clock::now() - mark).count();
+    return junction_cache_.insert(key, std::move(proposal)).pairs;
 }
 
 bool CoordinateRepairSearch::converged() const {
@@ -685,9 +728,10 @@ bool CoordinateRepairSearch::run(const RepairHooks& hooks) {
         const std::size_t cur_s2 = slot_with(cur_second_, Provenance{true, 1, 0, 0});
         seen_round.insert(key_of(cur_first_, cur_second_));
         for (std::size_t b = 0; b < blocks; ++b) {
-            for (std::size_t r = 0; r < local_[b].size(); ++r) {
-                const std::size_t x = local_[b][r].first;
-                const std::size_t y = local_[b][r].second;
+            const std::vector<std::pair<std::size_t, std::size_t>>& local = local_for(b, cur_first_, cur_second_);   // M9-G
+            for (std::size_t r = 0; r < local.size(); ++r) {
+                const std::size_t x = local[r].first;
+                const std::size_t y = local[r].second;
                 for (int assignment = 0; assignment < 2; ++assignment) {
                     if (assignment == 1 && x == y) continue;   // the swap is the same diplotype
                     std::vector<std::size_t> first = cur_first_;
@@ -1048,9 +1092,11 @@ bool CoordinateRepairSearch::run(const RepairHooks& hooks) {
         {
             std::set<DiplotypeIdentity> swapped;
             for (std::size_t b = 0; b < blocks; ++b) {
-                for (std::size_t r = 0; r < local_[b].size(); ++r) {
-                    const std::size_t x = local_[b][r].first;
-                    const std::size_t y = local_[b][r].second;
+                // M9-G: the same incumbent (unordered), so the same memoised list as the neighbourhood above
+                const std::vector<std::pair<std::size_t, std::size_t>>& local = local_for(b, cur_second_, cur_first_);
+                for (std::size_t r = 0; r < local.size(); ++r) {
+                    const std::size_t x = local[r].first;
+                    const std::size_t y = local[r].second;
                     for (int assignment = 0; assignment < 2; ++assignment) {
                         if (assignment == 1 && x == y) continue;
                         std::vector<std::size_t> first = cur_second_;   // homologues exchanged

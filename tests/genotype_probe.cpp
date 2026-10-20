@@ -23,6 +23,7 @@
 #include "panvar/genotype_locus.hpp"
 #include "panvar/genotype_model.hpp"
 #include "panvar/genotype_repair.hpp"
+#include "panvar/junction_proposals.hpp"
 #include "panvar/genotype_block_support.hpp"
 #include "panvar/genotype_joint_search.hpp"
 #include "panvar/gfa.hpp"
@@ -7758,6 +7759,71 @@ int support_audit(const Args& args) {
     return 0;
 }
 
+// M9-G: JP1.1 junction-aware proposals at one block, in a run's authoritative v2 representative context (diagnostic; the
+// caller's own helper). Writes every unordered pair (x <= y) with both assignment scores, its best score and tie class,
+// in JP1.1 order, so the port can be compared with the M9-F Python reference.
+int junction_proposals_probe(const Args& args) {
+    const std::string out = args.required("out");
+    const std::string reference = args.required("reference");
+    struct StagedGraphs {
+        std::string prefix;
+        ~StagedGraphs() {
+            std::error_code ignored;
+            std::filesystem::remove(prefix + ".model.sorted.gfa", ignored);
+        }
+    } staged_graphs{out};
+    const std::string curation = args.get("panel-curation", "");
+    const LoadedModel loaded = load_model(args.required("model-gfa"), reference, out + ".model.sorted.gfa", 50,
+                                          curation.empty() ? std::vector<std::string>{} : read_panel_curation(curation));
+    const panvar::PreparedGenotypeModel& model = *loaded.model;
+    const std::string run = args.required("run");
+    const auto status = read_key_values(run + ".mosaic_status.tsv");
+    if (status.at("model_fingerprint") != loaded.fingerprint) throw std::runtime_error("the run was not scored on the rebuilt model");
+    const auto locus = read_key_values(run + ".sequence_locus.tsv");
+    const std::vector<std::size_t> first = parse_alleles(locus.at("representative_labelling_hap1"));
+    const std::vector<std::size_t> second = parse_alleles(locus.at("representative_labelling_hap2"));
+    const std::string id = args.required("block");
+    std::size_t b = model.blocks().size();
+    for (std::size_t i = 0; i < model.blocks().size(); ++i) {
+        if (model.blocks()[i].block_id == id) b = i;
+    }
+    if (b == model.blocks().size()) throw std::runtime_error("no block " + id);
+    std::vector<std::string> alleles;
+    for (const auto& a : model.blocks()[b].alleles) alleles.push_back(a.sequence);
+    panvar::JunctionContext context;
+    const std::vector<std::size_t>* haps[2] = {&first, &second};
+    for (int h = 0; h < 2; ++h) {
+        for (std::size_t i = 0; i < b; ++i) context.prefix[h] += model.blocks()[i].alleles[(*haps[h])[i]].sequence;
+        for (std::size_t i = b + 1; i < model.blocks().size(); ++i) context.suffix[h] += model.blocks()[i].alleles[(*haps[h])[i]].sequence;
+        context.incumbent[h] = (*haps[h])[b];
+    }
+    const std::vector<panvar::ReadPair> fragments = read_pairs(args.required("reads1"), args.required("reads2"));
+    const auto mark = std::chrono::steady_clock::now();
+    const panvar::JunctionReadKmers table = panvar::JunctionReadKmers::from_fragments(fragments);
+    const double table_seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - mark).count();
+    const double rate = std::stod(status.at("marker_depth_rate_per_copy"));
+    const double background = std::stod(status.at("marker_background"));
+    panvar::JunctionProposal summary;
+    const auto mark2 = std::chrono::steady_clock::now();
+    const std::vector<panvar::JunctionPairScore> rows = panvar::junction_rank_all(alleles, context, table, rate, background, &summary);
+    const double rank_seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - mark2).count();
+    std::ostringstream t;
+    t << std::setprecision(17) << "rank\tx\ty\tscore_ab\tscore_ba\tbest\ttie_class\n";
+    for (std::size_t i = 0; i < rows.size(); ++i) {
+        t << (i + 1) << '\t' << rows[i].x << '\t' << rows[i].y << '\t' << rows[i].ab << '\t' << rows[i].ba << '\t' << rows[i].best << '\t'
+          << rows[i].tie_class << '\n';
+    }
+    atomic_write(out + ".junction_ranks.tsv", t.str());
+    std::ostringstream k;
+    k << std::setprecision(17) << "key\tvalue\nblock\t" << id << "\nalleles\t" << alleles.size() << "\npairs\t" << rows.size()
+      << "\ninventory\t" << summary.inventory << "\nobserved\t" << summary.observed << "\nelsewhere\t" << summary.elsewhere
+      << "\ndistinct_scores\t" << summary.distinct_scores << "\nread_kmers\t" << table.codes.size() << "\nread_table_bytes\t" << table.bytes()
+      << "\nread_table_seconds\t" << table_seconds << "\nrank_seconds\t" << rank_seconds << "\nrate\t" << rate << "\nbackground\t" << background << '\n';
+    atomic_write(out + ".junction_summary.tsv", k.str());
+    std::cout << "junction-proposals: " << rows.size() << " pairs, inventory " << summary.inventory << ", " << rank_seconds << " s\n";
+    return 0;
+}
+
 int block_sequences(const Args& args) {
     const std::string out = args.required("out");
     const std::string reference = args.required("reference");
@@ -9219,6 +9285,7 @@ int main(int argc, char** argv) {
         if (command == "repair-pilot") return repair_pilot(args);
         if (command == "score-set") return score_set(args);
         if (command == "block-sequences") return block_sequences(args);
+        if (command == "junction-proposals") return junction_proposals_probe(args);
         if (command == "prior-pool") return prior_pool(args);
         if (command == "two-block-catalogue") return two_block_catalogue(args);
         if (command == "two-block-eval") return two_block_eval(args);

@@ -271,6 +271,12 @@ struct GenotypeCommandOptions {
     // exhaustive search or an optimality certificate. Not supported with the library sensitivity audit, diagnostic tie
     // branching, the refinement replay or diagnostic_union_only (refused before any output).
     std::string repair_joint_search = "off";
+    // M9-G (EXPERIMENTAL, profile key repair_junction_proposals off|experimental_v1; default off): at repair blocks whose
+    // existing allele-pair proposal emissions are ALL tied (and that have more pairs than repair_local_pairs), the local-pair
+    // list is the junction-aware JP1.1 shortlist for the current incumbent (junction_proposals.hpp) instead of index order.
+    // Search proposal only: the objective, the shortlist size, both assignments and the incumbent are unchanged. Not
+    // supported with diagnostic tie branching or the refinement replay (refused before any output).
+    std::string repair_junction_proposals = "off";
     // M3-E (EXPERIMENTAL, profile key block_support_rule legacy|full_data_likelihood_v1_experimental; default legacy):
     // appends separately versioned block-genotype support columns computed under the full data likelihood (fragment +
     // exposure, prior excluded; genotype_block_support.hpp). Every existing column, filter and decision is unchanged.

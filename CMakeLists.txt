@@ -153,6 +153,7 @@ add_library(panvarlib
     src/genotype_command.cpp
     src/prepared_locus_file.cpp
     src/genotype_repair.cpp
+    src/junction_proposals.cpp
     src/genotype_joint_search.cpp
     src/genotype_block_support.cpp
     src/genotype_dosage.cpp
@@ -418,6 +419,11 @@ if(PANVAR_BUILD_TESTING)
         target_compile_options(genotype_batch_resource_test PRIVATE -Wall -Wextra -Wpedantic)
         add_test(NAME panvar_genotype_batch_resource COMMAND genotype_batch_resource_test)
         # S1-B: the sequence-first reporting layer on hand-built pooled decisions.
+        # M9-G: junction-aware proposals (JP1.1) against an independent whole-haplotype oracle
+        add_executable(junction_proposals_test tests/junction_proposals_test.cpp)
+        target_link_libraries(junction_proposals_test PRIVATE panvarlib)
+        target_compile_options(junction_proposals_test PRIVATE -Wall -Wextra -Wpedantic)
+        add_test(NAME panvar_junction_proposals COMMAND junction_proposals_test)
         add_executable(genotype_sequence_report_test tests/genotype_sequence_report.cpp src/cli_utils.cpp)
         target_link_libraries(genotype_sequence_report_test PRIVATE panvarlib)
         target_compile_options(genotype_sequence_report_test PRIVATE -Wall -Wextra -Wpedantic)

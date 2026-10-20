@@ -6,6 +6,7 @@
 
 #include "panvar/fragment_likelihood.hpp"
 #include "panvar/genotype_model.hpp"
+#include "panvar/junction_proposals.hpp"
 #include "panvar/marker_model.hpp"
 
 #include <cstddef>
@@ -110,6 +111,20 @@ struct RepairSearchOptions {
     // Which scored view the search decides by (library_sensitivity_audit_v1): 0, the run's library; k >= 1, the k-th
     // of FragmentScoringOptions::audit_libraries. Every view is scored in the same pass; only the decisions differ.
     std::size_t score_view = 0;
+    // M9-G (EXPERIMENTAL, default off): junction-aware local pairs (JP1.1, junction_proposals.hpp) at every block whose
+    // proposal emissions are ALL tied and that has more pairs than local_pairs. Null: off (the index-ordered list, as
+    // before). The read table is sample-scoped and shared read-only by the run's searches; the rate and background are the
+    // run's own marker depth fit.
+    std::shared_ptr<const JunctionReadKmers> junction_reads;
+    double junction_rate = 0.0;
+    double junction_background = 0.0;
+};
+
+// M9-G: what the junction-aware proposals did in one search.
+struct JunctionProposalReport {
+    std::size_t eligible_blocks = 0;
+    std::uint64_t invocations = 0, cache_hits = 0, cutoff_tie_crossings = 0;
+    double seconds = 0.0;
 };
 
 // A candidate's complete identity: its unordered pair of allele paths.
@@ -290,6 +305,11 @@ public:
     const RepairSearchOptions& options() const { return options_; }
     const FragmentScoringOptions& scoring() const { return scoring_; }
     const std::vector<std::vector<std::pair<std::size_t, std::size_t>>>& local_pairs() const { return local_; }
+    // M9-G: the local pairs a neighbourhood around (first, second) uses at block b -- the index-ordered list unless the
+    // block is junction-eligible, then the JP1.1 shortlist for exactly that incumbent (memoised on the complete key).
+    const std::vector<std::pair<std::size_t, std::size_t>>& local_for(std::size_t b, const std::vector<std::size_t>& first,
+                                                                      const std::vector<std::size_t>& second);
+    const JunctionProposalReport& junction_report() const { return junction_report_; }
 
     // The rounds table (truth-free), one row per round, with every column the gates compare.
     std::string render_rounds(const std::vector<RepairRound>& rounds) const;
@@ -309,6 +329,9 @@ private:
     RepairSearchOptions options_;
     std::vector<double> switches_;
     std::vector<std::vector<std::pair<std::size_t, std::size_t>>> local_;
+    std::vector<char> junction_block_;            // M9-G: blocks the junction-aware proposals replace
+    JunctionProposalCache junction_cache_{16};
+    JunctionProposalReport junction_report_;
     std::uint64_t neighbour_bound_ = 0;
     std::unique_ptr<PreparedScoringContext> context_;
     PreparedScoringContext* shared_ = nullptr;

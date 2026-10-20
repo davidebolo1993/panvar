@@ -200,6 +200,14 @@ std::vector<double> run_switches(std::size_t blocks) {
     }
     return g_transitions.r;
 }
+std::optional<std::string> junction_proposals_refusal(const GenotypeCommandOptions& o) {   // M9-G
+    if (o.repair_junction_proposals == "off") return std::nullopt;
+    const std::string p = "repair_junction_proposals experimental_v1 ";
+    if (o.repair_rounds == 0) return p + "needs the adaptive repair (repair rounds > 0)";
+    if (o.diagnostic_tie_branching) return p + "is not supported with diagnostic tie branching (it enumerates the index-ordered lists)";
+    if (!o.diagnostic_refinement_replay.empty()) return p + "is not supported with the refinement replay";
+    return std::nullopt;
+}
 std::optional<std::string> joint_search_refusal(const GenotypeCommandOptions& o) {
     if (o.repair_joint_search == "off") return std::nullopt;
     const std::string p = "repair_joint_search experimental_v1 ";
@@ -224,6 +232,14 @@ std::optional<std::string> refinement_diagnostic_refusal(const GenotypeCommandOp
     }
     if (!o.development_candidate_prefixes.empty()) return p + "is not supported with development candidate prefixes";
     return std::nullopt;
+}
+// M9-G: the run's junction-proposal account, summed over its searches (eligibility is a property of the model: the maximum).
+void accumulate_junction(JunctionProposalReport& total, const JunctionProposalReport& one) {
+    total.eligible_blocks = std::max(total.eligible_blocks, one.eligible_blocks);
+    total.invocations += one.invocations;
+    total.cache_hits += one.cache_hits;
+    total.cutoff_tie_crossings += one.cutoff_tie_crossings;
+    total.seconds += one.seconds;
 }
 // S2-H: the refinement's scoring options and search options, from the run's options and union scoring options -- ONE
 // construction for the production search and the diagnostic replay.
@@ -1006,6 +1022,10 @@ struct RepairReport {
     // M3-D (EXPERIMENTAL): the joint-block pass and its single continuation leg ("off" when the option is off).
     std::string joint_search_status = "off";
     JointSearchResult joint;
+    // M9-G (EXPERIMENTAL): junction-aware proposals, summed over every search of the run (trunk, legs, tie branches).
+    JunctionProposalReport junction;
+    std::size_t junction_read_kmers = 0, junction_read_bytes = 0;
+    double junction_rate = 0.0, junction_background = 0.0, junction_table_seconds = 0.0;
     bool joint_continued = false;
     std::size_t joint_leg_first_round = 0, joint_leg_rounds = 0, joint_leg_moves = 0;
     std::string joint_leg_stop = "none";
@@ -1137,6 +1157,17 @@ void write_repair_report(std::ostream& out, const RepairReport& r) {
             << "\nadaptive_fine_ledger_scope\tcontainers_only_not_process_memory\n";
     }
     out << "call_class\t" << r.call_class << "\nno_call_reason\t" << r.no_call_reason << '\n';
+    if (o.repair_junction_proposals != "off") {   // M9-G (EXPERIMENTAL): recorded only when the experiment is on
+        out << "repair_junction_proposals\t" << o.repair_junction_proposals
+            << "\njunction_proposal_rule\tJP1.1_all_canonical_31mers_incumbent_windows_poisson_content_tiebreak"
+            << "\njunction_proposal_scope\tsearch_heuristic_not_likelihood_not_confidence_not_final_score"
+            << "\njunction_eligible_blocks\t" << r.junction.eligible_blocks << "\njunction_invocations\t" << r.junction.invocations
+            << "\njunction_cache_hits\t" << r.junction.cache_hits << "\njunction_cutoff_tie_crossings\t" << r.junction.cutoff_tie_crossings
+            << "\njunction_seconds\t" << r.junction.seconds << "\njunction_read_kmers\t" << r.junction_read_kmers
+            << "\njunction_read_table_bytes\t" << r.junction_read_bytes << "\njunction_read_table_seconds\t" << r.junction_table_seconds
+            << "\njunction_rate_per_copy\t" << hex_double(r.junction_rate) << "\njunction_background\t" << hex_double(r.junction_background)
+            << "\njunction_rate_source\tthe_run_marker_depth_fit_unchanged;no_runtime_all_kmer_rate_check\n";
+    }
     if (o.repair_joint_search != "off") {   // M3-D (EXPERIMENTAL): recorded only when the experiment is on
         const JointSearchResult& j = r.joint;
         out << "repair_joint_search\t" << o.repair_joint_search << "\njoint_search_scope\tbounded_heuristic_neighbourhood_not_exhaustive"
@@ -1350,6 +1381,7 @@ void write_status(
                                 "test_interrupt_point", "diagnostic_union_evidence_dump", "diagnostic_union_kernel_dump",
                                 "union_progressive_schedule", "union_fragment_blocks", "diagnostic_refinement_memory",
                                 "diagnostic_refinement_replay", "repair_round1_origin_admission", "repair_joint_search", "block_support_rule",
+                                "repair_junction_proposals",
                                 "copying_transition", "copying_length_bp"}) {
             const auto source = options.setting_sources.find(key);
             if (source == options.setting_sources.end()) continue;
@@ -1381,6 +1413,7 @@ void write_status(
                                       : k == "diagnostic_refinement_replay" ? options.diagnostic_refinement_replay
                                       : k == "repair_round1_origin_admission" ? options.repair_round1_origin_admission
                                       : k == "repair_joint_search" ? options.repair_joint_search
+                                      : k == "repair_junction_proposals" ? options.repair_junction_proposals
                                       : k == "block_support_rule" ? options.block_support_rule
                                       : k == "copying_transition" ? options.copying_transition
                                       : k == "copying_length_bp" ? hex_double(options.copying_length_bp)
@@ -2257,6 +2290,12 @@ void apply_genotype_setting(const std::string& context, const std::string& key, 
         }
         options.block_support_rule = value;
     }
+    else if (key == "repair_junction_proposals") {   // M9-G (EXPERIMENTAL)
+        if (value != "off" && value != "experimental_v1") {
+            throw std::runtime_error(context + ": 'repair_junction_proposals' is off or experimental_v1: " + value);
+        }
+        options.repair_junction_proposals = value;
+    }
     else if (key == "repair_joint_search") {   // M3-D (EXPERIMENTAL)
         if (value != "off" && value != "experimental_v1") {
             throw std::runtime_error(context + ": 'repair_joint_search' is off or experimental_v1: " + value);
@@ -2970,6 +3009,9 @@ GenotypeRunStatus run_genotype_body(const GenotypeCommandOptions& options, Genot
         throw std::invalid_argument(*refused);
     }
     if (const std::optional<std::string> refused = joint_search_refusal(options)) {   // M3-D: before the prefix
+        throw std::invalid_argument(*refused);
+    }
+    if (const std::optional<std::string> refused = junction_proposals_refusal(options)) {   // M9-G: before the prefix
         throw std::invalid_argument(*refused);
     }
     if (const std::optional<std::string> refused = copying_transition_refusal(options)) {   // M4-B: before the prefix
@@ -4993,6 +5035,16 @@ GenotypeRunStatus run_genotype_body(const GenotypeCommandOptions& options, Genot
         FragmentScoringOptions& repair_scoring = repair_setup.scoring;
         if (options.adaptive_emission_handoff) repair_scoring.emission_handoff_in = &union_emissions;   // I2-K
         RepairSearchOptions& search_options = repair_setup.search;
+        if (options.repair_junction_proposals == "experimental_v1") {   // M9-G: one sample-scoped read table per run
+            const Clock::time_point table_mark = Clock::now();
+            auto table = std::make_shared<const JunctionReadKmers>(JunctionReadKmers::from_fragments(fragments));
+            report.junction_table_seconds = seconds_since(table_mark);
+            report.junction_read_kmers = table->codes.size();
+            report.junction_read_bytes = table->bytes();
+            search_options.junction_reads = std::move(table);
+            search_options.junction_rate = report.junction_rate = depth.rate_per_copy;
+            search_options.junction_background = report.junction_background = depth.background;
+        }
         if (options.diagnostic_refinement_memory) {   // S2-H: what a fresh-process replay of round 1 must match
             std::ostringstream t;
             t << "key\tvalue\nschema\tdiagnostic_refinement_replay_inputs_v1\nnote\tDIAGNOSTIC ONLY: replay inputs, not a result\n"
@@ -5126,6 +5178,7 @@ GenotypeRunStatus run_genotype_body(const GenotypeCommandOptions& options, Genot
                 }
             };
             reproduced = search->run(hooks);
+            accumulate_junction(report.junction, search->junction_report());   // M9-G
             search_end = Clock::now();
             search_returned = true;
             report.stages = search->stage_seconds();
@@ -5330,6 +5383,7 @@ GenotypeRunStatus run_genotype_body(const GenotypeCommandOptions& options, Genot
                         } catch (const ResourceExhausted& error) {
                             refusal = error.what();
                         }
+                        accumulate_junction(report.junction, leg.junction_report());   // M9-G
                         report.joint_continued = true;
                         report.joint_leg_physical_origins = shared->cumulative_counters().physical_origins - leg_before.physical_origins;
                         report.joint_leg_rounds = leg.rounds().size();
@@ -5667,6 +5721,7 @@ GenotypeRunStatus run_genotype_body(const GenotypeCommandOptions& options, Genot
                                          std::to_string(round.index) + " committed");
                 };
                 const bool branch_reproduced = live->run(hooks);
+                accumulate_junction(report.junction, live->junction_report());   // M9-G
                 if (hit) {
                     // Consumed: the seed leaves the cache, and each slot no other cached seed holds with it.
                     seed_cache_bytes -= seed_metadata.at(key);   // I4-C: its charged bookkeeping
@@ -6840,6 +6895,7 @@ GenotypeRunStatus run_genotype_body(const GenotypeCommandOptions& options, Genot
                 hooks.on_scored_views = [&](const std::vector<DiplotypeScore>& all) { items.back().views = all; };
                 Leg leg;
                 leg.reproduced = leg_search.run(hooks);
+                accumulate_junction(report.junction, leg_search.junction_report());   // M9-G
                 leg.converged = leg_search.converged();
                 leg.stop = leg_search.stop_reason();
                 leg.rounds = leg_search.rounds().size();
@@ -8267,6 +8323,7 @@ std::optional<int> parse_genotype_arguments(const std::vector<std::string>& args
     if (const std::optional<std::string> refused = union_fragment_blocks_refusal(options)) throw std::runtime_error(*refused);
     if (const std::optional<std::string> refused = refinement_diagnostic_refusal(options)) throw std::runtime_error(*refused);
     if (const std::optional<std::string> refused = joint_search_refusal(options)) throw std::runtime_error(*refused);
+    if (const std::optional<std::string> refused = junction_proposals_refusal(options)) throw std::runtime_error(*refused);   // M9-G
     if (profiled) {
         // Every setting a flag gave beside the profile, with the value it took.
         for (const std::string& flag : args) {
