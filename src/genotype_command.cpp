@@ -200,6 +200,72 @@ std::vector<double> run_switches(std::size_t blocks) {
     }
     return g_transitions.r;
 }
+std::optional<std::string> compound_annotation_refusal(const GenotypeCommandOptions& o) {   // M9-J
+    if (o.compound_annotation == "off") {
+        if (!o.compound_interval_declarations.empty()) return std::string("compound_interval_declarations needs compound_annotation contract_v2");
+        return std::nullopt;
+    }
+    if (o.output_schema != "sequence_first_v2") return std::string("compound_annotation contract_v2 needs output_schema sequence_first_v2");
+    return std::nullopt;
+}
+std::optional<CompoundDeclarations> g_compound_declarations;   // M9-J: this run's declarations (read before the prefix)
+void compound_prepare(SequenceReport& r, const GenotypeCommandOptions& o) {
+    if (o.compound_annotation != "contract_v2") return;
+    r.compound.enabled = true;
+    if (g_compound_declarations) {
+        r.compound.declaration_path = g_compound_declarations->path;
+        r.compound.declaration_sha256 = g_compound_declarations->sha256;
+    }
+}
+// M9-J: the completed pool -- every sequence group, every recorded labelling, every group's full-precision mass.
+void compound_pooled(SequenceReport& r, const PooledDecision& d, const PreparedGenotypeModel& model, const std::string& fingerprint,
+                     const GenotypeCommandOptions& o) {
+    if (o.compound_annotation != "contract_v2") return;
+    const auto mark = std::chrono::steady_clock::now();
+    compound_prepare(r, o);
+    std::vector<std::string> ids;
+    for (const auto& block : model.blocks()) ids.push_back(block.block_id);
+    std::vector<std::pair<std::size_t, std::size_t>> representation;
+    for (const RepresentationInterval& iv : r.intervals) representation.push_back({iv.first_block, iv.last_block});
+    const std::vector<CompoundSpan> spans =
+        resolve_compound_spans(g_compound_declarations ? &*g_compound_declarations : nullptr, fingerprint, ids, representation, &r.compound.declaration_status);
+    std::vector<double> mass(d.groups.size(), 0.0);
+    for (const CertifiedCandidate& c : d.ranking.candidates) mass[c.candidate_id] = c.candidate_set_probability;
+    const std::set<std::size_t> top(d.top_groups.begin(), d.top_groups.end());
+    std::vector<CompoundGroup> groups(d.groups.size());
+    for (std::size_t g = 0; g < d.groups.size(); ++g) {
+        groups[g].mass = mass[g];
+        groups[g].decision_set = top.count(g) != 0;
+        for (const std::size_t m : d.groups[g]) groups[g].members.push_back({&d.candidates[m].first, &d.candidates[m].second});
+    }
+    const CompoundAlleleBytes bytes = [&](std::size_t b, std::size_t a) -> const std::string& { return model.blocks()[b].alleles[a].sequence; };
+    r.compound.rows.clear();
+    for (const CompoundSpan& span : spans) {
+        CompoundAnnotationRow row = compound_assess(bytes, span.first, span.last, groups, r.representative_first, r.representative_second);
+        for (const std::string& s : span.sources) row.sources += (row.sources.empty() ? "" : ",") + s;
+        r.compound.rows.push_back(std::move(row));
+    }
+    r.compound.seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - mark).count();
+}
+// M9-J: a report without a completed pool (provisional): declared spans only, no bounds.
+void compound_unassessed(SequenceReport& r, const PreparedGenotypeModel& model, const std::string& fingerprint, const GenotypeCommandOptions& o,
+                         const std::string& status) {
+    if (o.compound_annotation != "contract_v2") return;
+    compound_prepare(r, o);
+    std::vector<std::string> ids;
+    for (const auto& block : model.blocks()) ids.push_back(block.block_id);
+    const std::vector<CompoundSpan> spans =
+        resolve_compound_spans(g_compound_declarations ? &*g_compound_declarations : nullptr, fingerprint, ids, {}, &r.compound.declaration_status);
+    r.compound.rows.clear();
+    for (const CompoundSpan& span : spans) {
+        CompoundAnnotationRow row;
+        row.first = span.first;
+        row.last = span.last;
+        row.status = status;
+        for (const std::string& s : span.sources) row.sources += (row.sources.empty() ? "" : ",") + s;
+        r.compound.rows.push_back(std::move(row));
+    }
+}
 std::optional<std::string> junction_proposals_refusal(const GenotypeCommandOptions& o) {   // M9-G
     if (o.repair_junction_proposals == "off") return std::nullopt;
     const std::string p = "repair_junction_proposals experimental_v1 ";
@@ -1381,7 +1447,7 @@ void write_status(
                                 "test_interrupt_point", "diagnostic_union_evidence_dump", "diagnostic_union_kernel_dump",
                                 "union_progressive_schedule", "union_fragment_blocks", "diagnostic_refinement_memory",
                                 "diagnostic_refinement_replay", "repair_round1_origin_admission", "repair_joint_search", "block_support_rule",
-                                "repair_junction_proposals",
+                                "repair_junction_proposals", "compound_annotation", "compound_interval_declarations",
                                 "copying_transition", "copying_length_bp"}) {
             const auto source = options.setting_sources.find(key);
             if (source == options.setting_sources.end()) continue;
@@ -1414,6 +1480,8 @@ void write_status(
                                       : k == "repair_round1_origin_admission" ? options.repair_round1_origin_admission
                                       : k == "repair_joint_search" ? options.repair_joint_search
                                       : k == "repair_junction_proposals" ? options.repair_junction_proposals
+                                      : k == "compound_annotation" ? options.compound_annotation
+                                      : k == "compound_interval_declarations" ? options.compound_interval_declarations
                                       : k == "block_support_rule" ? options.block_support_rule
                                       : k == "copying_transition" ? options.copying_transition
                                       : k == "copying_length_bp" ? hex_double(options.copying_length_bp)
@@ -2290,6 +2358,11 @@ void apply_genotype_setting(const std::string& context, const std::string& key, 
         }
         options.block_support_rule = value;
     }
+    else if (key == "compound_annotation") {   // M9-J (opt-in annotation)
+        if (value != "off" && value != "contract_v2") throw std::runtime_error(context + ": 'compound_annotation' is off or contract_v2: " + value);
+        options.compound_annotation = value;
+    }
+    else if (key == "compound_interval_declarations") options.compound_interval_declarations = value;   // M9-J
     else if (key == "repair_junction_proposals") {   // M9-G (EXPERIMENTAL)
         if (value != "off" && value != "experimental_v1") {
             throw std::runtime_error(context + ": 'repair_junction_proposals' is off or experimental_v1: " + value);
@@ -3014,6 +3087,17 @@ GenotypeRunStatus run_genotype_body(const GenotypeCommandOptions& options, Genot
     if (const std::optional<std::string> refused = junction_proposals_refusal(options)) {   // M9-G: before the prefix
         throw std::invalid_argument(*refused);
     }
+    if (const std::optional<std::string> refused = compound_annotation_refusal(options)) {   // M9-J: before the prefix
+        throw std::invalid_argument(*refused);
+    }
+    g_compound_declarations.reset();   // M9-J: never a previous run's declarations; a malformed file refuses before the prefix
+    if (options.compound_annotation == "contract_v2" && !options.compound_interval_declarations.empty()) {
+        try {
+            g_compound_declarations = read_compound_declarations(options.compound_interval_declarations);
+        } catch (const std::runtime_error& error) {
+            throw std::invalid_argument(error.what());
+        }
+    }
     if (const std::optional<std::string> refused = copying_transition_refusal(options)) {   // M4-B: before the prefix
         throw std::invalid_argument(*refused);
     }
@@ -3482,6 +3566,7 @@ GenotypeRunStatus run_genotype_body(const GenotypeCommandOptions& options, Genot
                 return false;
             }
         }
+        compound_unassessed(r, model, fingerprint, options, "NOT_ASSESSED_PROVISIONAL");   // M9-J (opt-in)
         if (!publish_sequence_report(r, legacy, options.out_prefix, "")) {
             g_incumbent.failed = true;
             g_incumbent.failure = "checkpoint_publication_failed: " + r.publication_error;
@@ -4801,6 +4886,7 @@ GenotypeRunStatus run_genotype_body(const GenotypeCommandOptions& options, Genot
             // last; a failure leaves no partial report and the status says so.
             flush_outputs();   // S2-K: claim, then the prepared outputs (S2-A: the watchdog can no longer overwrite the report)
             if (sequence_first(options) && !g_sequence_published) {   // S2-A: a failed checkpoint already published
+                compound_prepare(g_sequence_report, options);   // M9-J: enabled; rows only if a pool or a provisional set them
                 publish_sequence_report(g_sequence_report, g_sequence_legacy, options.out_prefix,
                                         "no completed ranking and no safely available evaluated candidate (" +
                                             g_sequence_legacy.run_status + ", " + g_sequence_legacy.no_call_reason + ")");
@@ -5243,6 +5329,7 @@ GenotypeRunStatus run_genotype_body(const GenotypeCommandOptions& options, Genot
                 search->incumbent_first(), search->incumbent_second(), search->incumbent_total(), stop, note, block_ids,
                 [&](const std::vector<std::size_t>& labels) { return spell_mosaic(model, MosaicPath{labels}).bases; });
             if (options.output_schema == "sequence_first_v2") annotate_v2(g_sequence_report, model, fingerprint);
+            compound_unassessed(g_sequence_report, model, fingerprint, options, "NOT_ASSESSED_PROVISIONAL");   // M9-J
         };
         if (!refusal.empty()) {
             report.no_call_reason = "cumulative_cap";
@@ -6642,6 +6729,7 @@ GenotypeRunStatus run_genotype_body(const GenotypeCommandOptions& options, Genot
                 return spell_mosaic(model, MosaicPath{labels}).bases;
             });
             if (options.output_schema == "sequence_first_v2") annotate_v2(g_sequence_report, model, fingerprint);
+            compound_pooled(g_sequence_report, decided, model, fingerprint, options);   // M9-J (opt-in)
         }
 
         if (decided.decision == TopSetDecision::DistinctTie) {
@@ -8324,6 +8412,7 @@ std::optional<int> parse_genotype_arguments(const std::vector<std::string>& args
     if (const std::optional<std::string> refused = refinement_diagnostic_refusal(options)) throw std::runtime_error(*refused);
     if (const std::optional<std::string> refused = joint_search_refusal(options)) throw std::runtime_error(*refused);
     if (const std::optional<std::string> refused = junction_proposals_refusal(options)) throw std::runtime_error(*refused);   // M9-G
+    if (const std::optional<std::string> refused = compound_annotation_refusal(options)) throw std::runtime_error(*refused);   // M9-J
     if (profiled) {
         // Every setting a flag gave beside the profile, with the value it took.
         for (const std::string& flag : args) {
@@ -8490,6 +8579,7 @@ int execute_genotype_command(const GenotypeCommandOptions& requested, const Prep
                       legacy.run_status + ")"
                 : "no completed ranking and no safely available evaluated candidate (" + legacy.run_status +
                       (legacy.no_call_reason != "NA" ? ", " + legacy.no_call_reason : "") + ")";
+        compound_prepare(g_sequence_report, options);   // M9-J: enabled; rows only if a pool or a provisional set them
         publish_sequence_report(g_sequence_report, legacy, options.out_prefix, reason);
         g_sequence_published = true;
     }

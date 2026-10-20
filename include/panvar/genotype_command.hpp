@@ -277,6 +277,10 @@ struct GenotypeCommandOptions {
     // Search proposal only: the objective, the shortlist size, both assignments and the incumbent are unchanged. Not
     // supported with diagnostic tie branching or the refinement replay (refused before any output).
     std::string repair_junction_proposals = "off";
+    // M9-J (opt-in, profile keys compound_annotation off|contract_v2 and compound_interval_declarations <file>): writes
+    // <prefix>.sequence_compound.tsv beside sequence_blocks (compound_annotation.hpp). Annotation only; sequence_first_v2.
+    std::string compound_annotation = "off";
+    std::string compound_interval_declarations;
     // M3-E (EXPERIMENTAL, profile key block_support_rule legacy|full_data_likelihood_v1_experimental; default legacy):
     // appends separately versioned block-genotype support columns computed under the full data likelihood (fragment +
     // exposure, prior excluded; genotype_block_support.hpp). Every existing column, filter and decision is unchanged.

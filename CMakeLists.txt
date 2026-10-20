@@ -154,6 +154,7 @@ add_library(panvarlib
     src/prepared_locus_file.cpp
     src/genotype_repair.cpp
     src/junction_proposals.cpp
+    src/compound_annotation.cpp
     src/genotype_joint_search.cpp
     src/genotype_block_support.cpp
     src/genotype_dosage.cpp
@@ -419,6 +420,11 @@ if(PANVAR_BUILD_TESTING)
         target_compile_options(genotype_batch_resource_test PRIVATE -Wall -Wextra -Wpedantic)
         add_test(NAME panvar_genotype_batch_resource COMMAND genotype_batch_resource_test)
         # S1-B: the sequence-first reporting layer on hand-built pooled decisions.
+        # M9-J: compound interval annotations (contract v2) and the saved-table replay harness
+        add_executable(compound_annotation_test tests/compound_annotation_test.cpp src/cli_utils.cpp)
+        target_link_libraries(compound_annotation_test PRIVATE panvarlib)
+        target_compile_options(compound_annotation_test PRIVATE -Wall -Wextra -Wpedantic)
+        add_test(NAME panvar_compound_annotation COMMAND compound_annotation_test)
         # M9-G: junction-aware proposals (JP1.1) against an independent whole-haplotype oracle
         add_executable(junction_proposals_test tests/junction_proposals_test.cpp)
         target_link_libraries(junction_proposals_test PRIVATE panvarlib)

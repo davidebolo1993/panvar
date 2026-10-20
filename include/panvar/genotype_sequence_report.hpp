@@ -11,6 +11,7 @@
 //                     high confidence or biological correctness;
 //   EXPLORED       -- block projections are those of the explored members only. Uniqueness and error-mass bounds are
 //                     conditional on them; an unexplored labelling of the same sequence may exist.
+#include "panvar/compound_annotation.hpp"
 #include "panvar/genotype_repair.hpp"
 
 #include <cstddef>
@@ -129,6 +130,7 @@ struct SequenceReport {
     std::vector<RepresentationInterval> intervals;
     std::vector<SequenceAlternative> alternatives;
     bool publication_failed = false;   // S1-C: writing the report failed; nothing partial is left
+    CompoundAnnotation compound;       // M9-J (opt-in): compound interval annotations; written only when enabled
     std::string publication_error;
     // S1-D (sequence_first_v2 only)
     HaplotypeOrigin origin[2];                  // hap1, hap2

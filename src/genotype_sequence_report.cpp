@@ -340,7 +340,8 @@ const std::vector<std::string>& sequence_report_outputs() {
         ".sequence_locus.tsv", ".sequence_blocks.tsv", ".sequence_haplotypes.fa", ".representation_intervals.tsv",
         ".sequence_alternatives.tsv", ".sequence_locus.tsv.writing", ".sequence_blocks.tsv.writing",
         ".sequence_haplotypes.fa.writing", ".representation_intervals.tsv.writing", ".sequence_alternatives.tsv.writing",
-        ".sequence_haplotypes.tsv", ".sequence_haplotypes.tsv.writing"};   // the last two: S1-D (sequence_first_v2)
+        ".sequence_haplotypes.tsv", ".sequence_haplotypes.tsv.writing",    // S1-D (sequence_first_v2)
+        ".sequence_compound.tsv", ".sequence_compound.tsv.writing"};       // M9-J (compound annotations, opt-in)
     return suffixes;
 }
 
@@ -399,6 +400,11 @@ std::string sequence_report_status_keys(const SequenceReport& report) {
     if (report.schema == "sequence_first_v2") {   // S1-D: intentional FASTA absence is never a publication failure
         const auto [emitted, reason] = sequence_fasta_decision(report);
         out << "sequence_fasta\t" << (emitted ? "emitted" : "not_emitted") << "\nsequence_fasta_reason\t" << reason << '\n';
+    }
+    if (report.compound.enabled) {   // M9-J: recorded only when the annotation is on
+        out << "compound_annotation\tcontract_v2\ncompound_declaration_status\t" << report.compound.declaration_status
+            << "\ncompound_declaration_sha256\t" << report.compound.declaration_sha256 << "\ncompound_intervals\t" << report.compound.rows.size()
+            << "\ncompound_seconds\t" << report.compound.seconds << '\n';
     }
     return out.str();
 }
@@ -632,6 +638,9 @@ void write_sequence_report(const SequenceReport& r, const SequenceLegacy& legacy
         atomic_write(prefix + ".sequence_haplotypes.fa", fasta);
     } else {
         std::remove((prefix + ".sequence_haplotypes.fa").c_str());
+    }
+    if (r.compound.enabled) {   // M9-J: before the locus commit record, like every content file
+        atomic_write(prefix + ".sequence_compound.tsv", render_compound_annotation(r.compound, r.block_ids));
     }
     atomic_write(prefix + ".sequence_locus.tsv", locus_text);   // only once every required report is complete
 }
