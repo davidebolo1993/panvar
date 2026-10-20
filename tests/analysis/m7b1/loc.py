@@ -7,6 +7,7 @@ set, then verify: options == priors, every genotype has a stage-2 (annealing) ro
 """
 import gzip
 import json
+import math
 import os
 import re
 import sys
@@ -66,10 +67,16 @@ for fn in sorted(os.listdir(gdir)):
                     for k in ("total_reads", "unmapped", "out_of_bounds"):
                         if k in hdr:
                             acct.setdefault((g, k), []).append(float(f[hdr.index(k)]))
-checks.append(dict(check="20 annealing attempts per genotype (sol_ext)", value=f"{sorted(set(attempts.values())) if attempts else 'no sol_ext file'}",
-                   ok=bool(attempts) and set(attempts.values()) == {20} and set(attempts) == want_gts))
+# Amendment 1: Locityper's multi-thread sol_ext file is corrupt (brotli: corrupt input), so attempts are verified from the logged
+# stage parameters plus a finite lik_sd for every genotype; sol_ext readability is reported, not gated.
+plain = re.sub(r"\x1b\[[0-9;]*m", "", open(log).read())
+stage2_a20 = bool(re.search(r"Stage\s+II\. Simulated annealing\s+\[a=20,", plain))
+sd_ok = all(o.get("lik_sd") is not None and math.isfinite(float(o["lik_sd"])) for o in opts)
+checks.append(dict(check="stage II annealing logged with a=20 and every genotype has a finite lik_sd",
+                   value=f"stage II a=20: {stage2_a20}; finite lik_sd {sum(1 for o in opts if o.get('lik_sd') is not None)}/{len(opts)}; "
+                         f"sol_ext decoded genotypes {len(attempts)} (file corrupt: {len(attempts) < len(want_gts)})", ok=stage2_a20 and sd_ok))
 text = open(log).read()
-reads = [l.strip() for l in text.splitlines() if re.search(r"(recruit|read pairs|reads|unmapped|Mapp|used)", l, re.I) and not l.startswith("$")][:20]
+reads = [re.sub(r"\x1b\[[0-9;]*m", "", l).strip() for l in text.splitlines() if re.search(r"(Recruited|Use \d+ read pairs|possible genotypes|Keep \d+/)", l)][:20]
 mean = lambda v: sum(v) / len(v) if v else ""
 rows = [dict(genotype=canon(o["genotype"]), lik_mean_log10=o["lik_mean"], lik_sd_log10=o.get("lik_sd"), prob=o.get("prob"), log10_prob=o.get("log10_prob"),
              scored_reads_mean=mean(acct.get((canon(o["genotype"]), "total_reads"), [])), unmapped_mean=mean(acct.get((canon(o["genotype"]), "unmapped"), [])),

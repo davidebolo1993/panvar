@@ -84,3 +84,18 @@ seeds (s1 = 20261020, s2 = 20261021, preproc 20261020).
 - Unstable rankings (a winning margin ≤ the seed difference of the top two genotypes) are INCONCLUSIVE.
 - A favourable result motivates attribution only. It is not evidence that local depth caused it, nor of improved
   genotyping.
+
+## Amendment 1 (declared after the two control units exited 1; 16.4 s spent)
+
+**What failed.** The 20-attempt check read Locityper's per-attempt `sol_ext..csv.br`. With 4 threads that file is
+**corrupt**: `brotli` reports corrupt input after 3 genotypes. Database membership, option set and stage-2 coverage all
+passed.
+
+**Fix (verification only).**
+- Attempts are verified from the logged stage parameters (`Stage II. Simulated annealing [a=20,…]`) together with a
+  finite `lik_sd` for every genotype.
+- `sol_ext` readability is reported, not gated.
+- Read-count log lines are parsed robustly.
+
+**Settings, seeds and pools are unchanged.** The two controls re-run as `.a1` in new directories; the other units keep
+their frozen order. The failed units stay recorded.

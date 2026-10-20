@@ -31,7 +31,13 @@ MANIFEST_P = ([("reuse", "reuse", "-", 60), ("background", "background", "-", 60
               + [("loc.c4_lzo_hg00171_5.D.s1r", "loc", "c4_lzo_hg00171_5:D:20261020", 60), ("loc.c4_loo_na19650_10.D.s2", "loc", "c4_loo_na19650_10:D:20261021", 60),
                  ("loc.cyp_loo_na19650_5.D.s2", "loc", "cyp_loo_na19650_5:D:20261021", 60)]
               + [("compare", "compare", "-", 30)])
-MANIFESTS = {"P": MANIFEST_P}
+# Amendment 1 (declared after loc.c4_lzo_hg00171_5.D.s1 and loc.cyp_lzo_hg02769_5.D.s1 exited 1 at 16.4 s): the 20-attempt check read
+# Locityper's sol_ext file, which is corrupt with 4 threads; attempts are now verified from the logged stage parameters (a=20) plus
+# finite lik_sd. Settings, seeds and pools unchanged. The two controls re-run as .a1; the remaining units follow in frozen order.
+MANIFEST_A1 = ([("loc.c4_lzo_hg00171_5.D.s1.a1", "loc", "c4_lzo_hg00171_5:D:20261020", 60), ("loc.cyp_lzo_hg02769_5.D.s1.a1", "loc", "cyp_lzo_hg02769_5:D:20261020", 60)]
+               + [m for m in MANIFEST_P if m[0].startswith("loc.") and m[0] not in ("loc.c4_lzo_hg00171_5.D.s1", "loc.cyp_lzo_hg02769_5.D.s1")]
+               + [("compare", "compare", "-", 30)])
+MANIFESTS = {"P": MANIFEST_P, "A1": MANIFEST_A1}
 INPUTS = [{"file": "/Users/davide.bolognini/panvar-worktrees/s1-d-panel-references/tests/analysis/m7a/CANDIDATES.tsv",
            "sha256": "a8cd9516798a4795" }]   # prefix-checked in verify(); full bindings are re-verified by pools/provenance via M7-A BINDINGS.tsv
 

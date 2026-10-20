@@ -24,6 +24,8 @@ rank_rows, summary, seeds, membership = [], [], [], []
 
 
 def loc_opts(unit):
+    if os.path.exists(f"{RUNS}/{unit}.a1/options.tsv"):   # Amendment 1 re-runs supersede the failed-check units
+        unit = f"{unit}.a1"
     p = f"{RUNS}/{unit}/options.tsv"
     return {r["genotype"]: r for r in table(p)} if os.path.exists(p) and os.path.exists(f"{RUNS}/{unit}/checks.tsv") and all(
         r["ok"] == "True" for r in table(f"{RUNS}/{unit}/checks.tsv")) else None
