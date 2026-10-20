@@ -66,3 +66,21 @@ runner has its own docstring.
 4. **The failure check:** which target each failure violates, and which targets remain unassessed.
 5. **One proposed user-facing contract,** plus the validation still needed and the smallest next experiment, with
    development samples and held-out samples kept apart.
+
+## Amendment 1 (declared before any further execution)
+
+**What failed.** `fixtures` exited 1 (J1 and J2 FAIL), and the runner's gate then refused `evidence`.
+- The failing gate raised after the unit directory was created, so `runs/evidence/` exists empty, with no ledger row.
+  It is kept, not deleted.
+
+**Cause: a fixture definition defect.** Label pairs are (hap1 over blocks, hap2 over blocks).
+- **J1:** the competitor meant to disagree at block 0 only, `((1, 9), (3, 4))`, has block-0 genotype (1, 3) and so
+  agrees there.
+- **J2:** the "both blocks" competitor, `((1, 9), (3, 5))`, likewise agrees at block 0.
+
+**Correction.** J1's competitor becomes `((9, 2), (3, 4))` (disagrees at block 0 only), and J2's becomes
+`((9, 9), (3, 5))` (disagrees at both). The expected values are unchanged: marginals 0.9 and 0.9, with joint 0.8 for J1
+and 0.9 for J2. The aggregation code (M9-A core) is not touched.
+
+**Rerun.** As `fixtures.a1` and `evidence.a1` (manifest A1, same timeouts); `evidence.a1` is gated on `fixtures.a1`.
+The failed `fixtures` unit stays recorded.
