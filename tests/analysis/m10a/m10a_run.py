@@ -67,12 +67,17 @@ MANIFEST_A2 = [("controls.a2", "py", "controls", 120), ("cmp.route.c4_5.a2", "cm
     [(f"{arm}.cyp_5.a2", "cli", f"{arm}:cyp_5", TIMEOUT[arm]["cyp_5"]) for arm in ("REF", "O", "D0", "D")] + \
     [(f"cmp.{mode}.cyp_5.a2", "cmp", f"{mode}:{CMP[mode][0]}.cyp_5:{CMP[mode][1]}.cyp_5", CMP_TIMEOUT) for mode in ("backend", "route", "jp")]
 SUPERSEDED = {"cmp.route.c4_5": "cmp.route.c4_5.a2", "cmp.jp.c4_5": "cmp.jp.c4_5.a2", "controls": "controls.a2",
-              "cmp.jp.acot_5": "cmp.jp.acot_5.a3", "controls.a2": "controls.a3"}
+              "cmp.jp.acot_5": "cmp.jp.acot_5.a3", "controls.a2": "controls.a3",
+              "cmp.prepared.c4_5": "cmp.prepared.c4_5.a4", "cmp.prepared.c4_30": "cmp.prepared.c4_30.a4", "controls.a3": "controls.a4"}
+# Amendment 4 (after cmp.prepared.c4_5/c4_30 failed only on the JP read-table timer): controls rerun, the two comparisons
+# re-evaluated on the same runs, and write.cyp (recorded NOT RUN by the stop) run as write.cyp.a4
+MANIFEST_A4 = [("controls.a4", "py", "controls", 120), ("cmp.prepared.c4_5.a4", "cmp", "prepared:D.c4_5:loaded.c4/c4_5", CMP_TIMEOUT),
+               ("cmp.prepared.c4_30.a4", "cmp", "prepared:D.c4_30:loaded.c4/c4_30", CMP_TIMEOUT), ("write.cyp.a4", "write", "cyp", 60)]
 # Amendment 3 (after cmp.jp.acot_5 failed only on the plan's own per-arm time guard): controls rerun, the comparison re-evaluated
 MANIFEST_A3 = [("controls.a3", "py", "controls", 120), ("cmp.jp.acot_5.a3", "cmp", "jp:D0.acot_5:D.acot_5", CMP_TIMEOUT)]
 ALIAS = {f"{arm}.cyp_5": f"{arm}.cyp_5.a2" for arm in ("REF", "O", "D0", "D")}   # run directories of the renamed units
-AMENDMENT_DEV = 15.0   # disclosed: Amendments 2-3 inspection and edits (seconds of compute, rounded up)
-MANIFESTS = {"P": manifest(), "A2": MANIFEST_A2, "A3": MANIFEST_A3}
+AMENDMENT_DEV = 20.0   # disclosed: Amendments 2-4 inspection and edits (seconds of compute, rounded up)
+MANIFESTS = {"P": manifest(), "A2": MANIFEST_A2, "A3": MANIFEST_A3, "A4": MANIFEST_A4}
 STOPPING = ("cmp.backend.", "cmp.route.", "cmp.jp.", "cmp.prepared.", "cmp.repeat.")   # Amendment 1: a failed JP invariant stops too
 CALLER = ("cli", "write", "loaded", "loaded1")
 
@@ -126,13 +131,13 @@ def run_status(d):
 def precondition(unit, kind, target):
     if kind != "build" and exit_of("build") != "0":
         return "the build failed"
-    gates = [m[0] for m in MANIFESTS["P"] if m[1] == "gate"] + ["controls.a3", "declare"]
+    gates = [m[0] for m in MANIFESTS["P"] if m[1] == "gate"] + ["controls.a4", "declare"]
     if kind in CALLER and any(exit_of(g) != "0" for g in gates):
         return "a gate, the comparator controls or the declarations failed: stop before any caller run"
     if kind in CALLER and any(r["unit"].startswith(STOPPING) and r["exit"] == "1" and
                               exit_of(SUPERSEDED.get(r["unit"], "")) != "0" for r in ledger_rows()):
         return "an equivalence comparison failed: stop (an amendment is required before any further caller run)"
-    if kind == "loaded" and exit_of(f"write.{target}") != "0":
+    if kind == "loaded" and "0" not in (exit_of(f"write.{target}"), exit_of(f"write.{target}.a4")):
         return "the index was not written"
     if kind == "loaded1":   # only if the two-sample process did not deliver a completed acot_30 sample (resource outcome)
         if exit_of("loaded.acot") is None:

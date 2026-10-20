@@ -83,7 +83,7 @@ def load_v32(extra):
             return got
         one = in_a != in_b
         # Amendment 2: the annotation's own timer is timing (inspected: 0.00014-0.00016 s)
-        if "operational" in cats and not one and k == "compound_seconds":
+        if "operational" in cats and not one and k in ("compound_seconds", "junction_seconds", "junction_read_table_seconds"):   # A2, A4
             return "operational"
         # Amendment 2: the status echo of the declared JP setting (its value is checked in the settings table)
         if "junction" in cats and one and k == "repair_junction_proposals":

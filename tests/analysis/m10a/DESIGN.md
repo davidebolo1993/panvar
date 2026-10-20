@@ -268,3 +268,20 @@ continues. Disclosed development time for Amendments 2–3: 15 s in all.
 *Record note.* Commit `50804fc` contains only the Amendment 3 text above. My edit script stopped on an assertion before
 writing any code, and the manifest step then failed, so no unit ran. The code follows in the next commit, unchanged from
 the text.
+
+## Amendment 4 (after `cmp.prepared.c4_5` and `cmp.prepared.c4_30` failed; no caller run since)
+
+**What failed.** Cold against loaded C4, at 5× and 30×, failed on one status key, `junction_read_table_seconds`: JP1.1's
+read-table build timer (inspected: 0.0211 against 0.0208 s at 5×). Every scientific file, setting, identity key and cap was
+equal. The other categories absorbed checkpoints, operational keys and the prepared rows.
+`junction_seconds`, JP1.1's other timer, is 0 on C4 but non-zero on eligible loci. It is declared **prospectively**.
+
+**Fix.** `junction_seconds` and `junction_read_table_seconds` are operational timing in every mode, when present in both
+runs. Nothing else changes.
+
+**Reruns:**
+- `controls.a4`;
+- `cmp.prepared.c4_5.a4` and `cmp.prepared.c4_30.a4`, on the same saved runs;
+- `write.cyp.a4`. The stop recorded `write.cyp` as NOT RUN, and `loaded.cyp` accepts either.
+
+Then manifest P continues. Disclosed development time for Amendments 2–4: 20 s in all.
