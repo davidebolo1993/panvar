@@ -212,3 +212,52 @@ held-out ACOT families.
 C4 and CYP2D6 need genuinely new samples or assemblies outside the inspected panels before either can be calibrated.
 
 **Stopping here** at the contract and mapping checkpoint.
+
+## Qualification (appended by M9-C, 2026-10-20; the text above is unchanged)
+
+M9-B traced the **legacy** output schema. Every run it used (M8-C/M8-D, M1-B) is legacy or was read through legacy
+tables. The current reporting contract, `output_schema sequence_first_v2`, changes several statements.
+
+1. **Legacy no-calls are not v2 non-predictions.**
+   - A legacy `distinct_tie` / `divergent_tie` stops with no legacy block tables (`genotype_command.cpp:6592-6599`). The
+     sequence report is still built from the same pooled decision before that stop.
+   - The v2 outputs are authoritative: `.sequence_locus.tsv` (`prediction`, `sequence_status`, representative SHA-256s,
+     representation intervals, `representative_probability`, `decision_set_probability`) and `.sequence_blocks.tsv` (one
+     row per block, with `block_status`).
+   - **How v2 reads a tie:**
+     - a label-only tie, where the sequence is identical, is `PREDICTION` / `RESOLVED`;
+     - blocks where every top-set labelling agrees are `IDENTIFIED`;
+     - blocks where they disagree are `REPRESENTATION_AMBIGUOUS` (one top group) or `GENOTYPE_UNRESOLVED` (several);
+     - sequence status is `RESOLVED` / `GENOTYPE_RESOLVED_SEQUENCE_SET` / `SEQUENCE_TIED`.
+     See `genotype_sequence_report.cpp:212-262` and fixture `test_coupled`.
+   - `NO_PREDICTION` is reserved for runs with no completed ranking. `PROVISIONAL` (exit 3) is a budget-stopped
+     incumbent with `PROVISIONAL_LABEL` blocks.
+   - M9-B's statement that "an ambiguous winner is a `distinct_tie` no-call with no block tables" holds for the legacy
+     schema only.
+2. **Projection-aware error masses already exist.**
+   - `.sequence_blocks.tsv` carries `error_mass_lower` (mass of groups whose every explored labelling disagrees at the
+     block) and `error_mass_upper` (mass of groups with any disagreeing labelling). Each group is counted once.
+     See `genotype_sequence_report.cpp:232-247` and fixture `test_bounds_count_groups_once`.
+   - They are conditional on the explored labellings (`projection_coverage EXPLORED`).
+   - The legacy GQ is kept beside them as `legacy_representative_GQ`, labelled
+     `legacy_diagnostic_one_labelling_per_group_not_projection_aware`.
+   - M9-B's requirement that the contract value "must be projection-aware" is **already met by these fields**. No new
+     implementation is proposed.
+3. **v2 FASTA policy (S1-D / S1-D.1).**
+   - **Two panel haplotypes:** no FASTA. Each haplotype gets an extraction reference in `.sequence_haplotypes.tsv`
+     (`gfa_path=…;interval=0-len;orientation=…`).
+   - **Either haplotype off-panel:** `.sequence_haplotypes.fa` with both haplotypes.
+   - The legacy `.mosaic_haplotypes.fa` is suppressed.
+   - M9-B §5's "two haplotype FASTAs when unique" is the legacy policy and is replaced by this one.
+4. **C4 allocation.** M9-B §4 said earlier work "showed that allocation is not identifiable from short reads in this case."
+   The evidence is narrower:
+   - **M1-C:** moving one reported unit (3+1 → 2+2) with pooled content identical up to k = 151 costs 5.5 (10×) and 2.0
+     (30×) nats. That is weak but **non-zero** discrimination among the alternatives examined, and it does not grow with
+     coverage.
+   - **M6-B:** content-matched pairs that are count-identical are separated by the fragment model's long-range adjacency
+     by 7.6.
+   - **The earlier sv7 self-review** constructed one start-swap pair with an identical per-fragment vector.
+   - **None of this is a general impossibility proof.**
+5. **Representation intervals are conservative enclosing intervals.** `representation_interval_scope` is
+   `conservative_enclosing_not_minimal`, one linear-scan range per group. They are not certified minimal compound
+   intervals. M9-B's "declared minimal compound interval" is a future requirement, not a property of the current outputs.
