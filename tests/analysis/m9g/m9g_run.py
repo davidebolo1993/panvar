@@ -34,7 +34,7 @@ MANIFEST_P = ([("build", "build", "-", 300), ("prepare", "prepare", "-", 10), ("
               + [(f"call.off.{c}", "call", f"off:{c}", WATCHDOG) for c in CELLS] + [("gate.offcheck", "offcheck", "-", 30)]
               + [(f"call.on.{c}", "call", f"on:{c}", WATCHDOG) for c in CELLS] + [("freeze", "freeze", "-", 10)]
               + [(f"eval.{a}.{c}", "eval", f"{a}:{c}", 50) for a in ("off", "on") for c in CELLS] + [("analyse", "analyse", "-", 30)])
-MANIFESTS = {"P": MANIFEST_P, "A1": MANIFEST_A1}
+MANIFESTS = {"P": MANIFEST_P}
 
 
 def ledger_rows():

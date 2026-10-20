@@ -138,3 +138,10 @@ run).
 
 **Admission:** spent + the unit's timeout + the declared timeouts of every pending freeze/eval/analyse unit (for builds,
 gates and calls) ≤ 2,400. Refused units are recorded NOT RUN.
+
+## Amendment 1 (before any unit ran)
+
+**Failure.** The runner failed at import: it kept the M9-F runner's `MANIFESTS` line, which references an undefined
+`MANIFEST_A1`. Nothing executed, and no ledger or manifest file was written.
+
+**Fix.** `MANIFESTS = {"P": MANIFEST_P}`. Nothing else changes.
