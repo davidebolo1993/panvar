@@ -56,3 +56,11 @@
 - **r = 0.1 better in LOO but worse in LZO:** reported as a **trade-off**, with no tuning.
 - **LZO inspection:** whether r = 0.1 introduces an off-panel or mosaic call with excess > 0. A different donor label alone
   is not an error.
+
+## Amendment 1 (declared after `prepare` exited 1; 3.4 s spent)
+
+**What failed.** `subsample` does not create its output directory: it reported success and wrote nothing. The simulator
+lineage re-check passed before that step.
+
+**Fix.** `prepare` creates the directory first. The unit re-runs as `prepare.a1`, and every later unit reads its outputs.
+Donor selection, seeds, panels and profiles are unchanged.

@@ -28,7 +28,7 @@ ACOT_REF = "GRCh38#0#chr14:73416151-73668669"
 T = lambda p: list(csv.DictReader((l for l in open(p) if not l.startswith("#")), delimiter="\t"))
 KV = lambda p: {l.split("\t")[0]: l.rstrip("\n").split("\t")[1] for l in open(p) if "\t" in l and not l.startswith("#")} if os.path.exists(p) else {}
 os.makedirs(out, exist_ok=True)
-prep = f"{runs}/prepare"
+prep = f"{runs}/prepare.a1"   # Amendment 1
 donors = [l.split("\t")[1] for l in open(f"{prep}/prepare.tsv") if l.startswith("donor_")]
 CELLS = [(dn, sch, r) for dn in donors for sch in ("LZO", "LOO") for r in ("r0.01", "r0.1")]
 cell_dir = lambda dn, sch, r: f"{runs}/call.{dn}.{sch}.{r}"

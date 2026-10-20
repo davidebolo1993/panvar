@@ -30,7 +30,10 @@ EVALS = [(i, sch, r) for sch in ("LOO", "LZO") for i in ("d1", "d2") for r in ("
 MANIFEST_P = ([("prepare", "prepare", "-", 90)] + [(f"call.{i}.{s}.{r}", "call", f"{i}:{s}:{r}", 120) for i, s, r in CALLS]
               + [("checks", "checks", "-", 30)] + [(f"eval.{i}.{s}.{r}", "eval", f"{i}:{s}:{r}", 150) for i, s, r in EVALS]
               + [("contrast", "contrast", "-", 120), ("summary", "summary", "-", 30)])
-MANIFESTS = {"P": MANIFEST_P}
+# Amendment 1 (declared after `prepare` exited 1 at 3.4 s): subsample does not create its output directory; prepare now creates
+# it. prepare.a1 replaces prepare (its directory is used by every later unit); the frozen order is otherwise unchanged.
+MANIFEST_A1 = [("prepare.a1", "prepare", "-", 90)] + [m for m in MANIFEST_P if m[0] != "prepare"]
+MANIFESTS = {"P": MANIFEST_P, "A1": MANIFEST_A1}
 INPUTS = []
 
 
@@ -79,7 +82,7 @@ def verify():
 
 
 def donor(i):
-    return [l.split("\t")[1] for l in open(f"{OUT}/runs/prepare/prepare.tsv") if l.startswith("donor_")][int(i[1]) - 1]
+    return [l.split("\t")[1] for l in open(f"{OUT}/runs/prepare.a1/prepare.tsv") if l.startswith("donor_")][int(i[1]) - 1]
 
 
 def unit_name(kind, target):   # concrete donor ids in run directories
@@ -89,11 +92,11 @@ def unit_name(kind, target):   # concrete donor ids in run directories
 
 def command(kind, target, d):
     ok = lambda u: next((r["exit"] for r in ledger_rows() if r["unit"] == u), None) == "0"
-    P = f"{OUT}/runs/prepare"
+    P = f"{OUT}/runs/prepare.a1"
     if kind == "prepare":
         return [sys.executable, os.path.join(HERE, "prepare.py"), d], "prepare (donors, panels, reads, profiles)"
     if kind == "call":
-        assert ok("prepare")
+        assert ok("prepare.a1")
         i, s, r = target.split(":")
         dn = donor(i)
         reads = f"{P}/reads/{dn}/cov5"

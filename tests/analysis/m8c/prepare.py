@@ -71,6 +71,7 @@ assert lineage_ok, "simulator lineage re-check failed"
 for f, dn, ts in chosen:
     s30, s5 = f"{d}/reads/{dn}/cov30", f"{d}/reads/{dn}/cov5"
     os.makedirs(s30)
+    os.makedirs(s5)   # Amendment 1: subsample does not create its output directory
     assert run([PROBE, "simulate", "--gfa", ACOT_GFA, "--reference", ACOT_REF, "--donor", dn, "--depth", "30", "--read-length", "100",
                 "--seed", "20260916", "--seed-salt", dn, "--out", s30]) == 0
     assert run([PROBE, "subsample", "--reads1", f"{s30}/reads_1.fq", "--reads2", f"{s30}/reads_2.fq", "--library", f"{s30}/library.txt",
