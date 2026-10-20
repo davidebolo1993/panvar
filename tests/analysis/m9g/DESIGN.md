@@ -145,3 +145,12 @@ gates and calls) ≤ 2,400. Refused units are recorded NOT RUN.
 `MANIFEST_A1`. Nothing executed, and no ledger or manifest file was written.
 
 **Fix.** `MANIFESTS = {"P": MANIFEST_P}`. Nothing else changes.
+
+## Amendment 2 (after `gate.refusal`; no caller run yet)
+
+**Failure.** `gate.refusal` exited 1. The CLI did refuse `--repair-rounds 0` with no output written, but through the
+existing rule "output_schema sequence_first_v2 needs the adaptive repair", which fires before the new
+`repair_junction_proposals` refusal. The gate was mis-designed.
+
+**Fix.** `gate.refusal.a2` runs the same test with the on-profile minus its `output_schema` line (legacy schema), so the new
+refusal is exercised. It replaces `gate.refusal` in the call precondition. The failed unit stays recorded.

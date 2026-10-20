@@ -95,6 +95,8 @@ if mode == "refusal":
     P = f"{C}/prepare"
     prof = f"{out}/profile.on.tsv"
     lines = open(f"{OUT}/prepare/profile.on.tsv").read()
+    if len(sys.argv) > 3 and sys.argv[3] == "legacy":   # Amendment 2: without v2, whose own repair-rounds refusal fires first
+        lines = "".join(l + "\n" for l in lines.splitlines() if not l.startswith("output_schema\t"))
     open(prof, "w").write(lines)
     reads = f"{P}/reads/NA19909/cov5"
     cmd = [f"{WT}/build/panvar", "genotype", "--profile", prof, "--threads", "4", "--gfa", f"{R}/genotype_perf_bounded_20261015/inputs/acot/acot.gfa",

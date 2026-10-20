@@ -34,7 +34,8 @@ MANIFEST_P = ([("build", "build", "-", 300), ("prepare", "prepare", "-", 10), ("
               + [(f"call.off.{c}", "call", f"off:{c}", WATCHDOG) for c in CELLS] + [("gate.offcheck", "offcheck", "-", 30)]
               + [(f"call.on.{c}", "call", f"on:{c}", WATCHDOG) for c in CELLS] + [("freeze", "freeze", "-", 10)]
               + [(f"eval.{a}.{c}", "eval", f"{a}:{c}", 50) for a in ("off", "on") for c in CELLS] + [("analyse", "analyse", "-", 30)])
-MANIFESTS = {"P": MANIFEST_P}
+MANIFEST_A2 = [("gate.refusal.a2", "refusal2", "-", 60)]   # Amendment 2: refusal tested without output_schema v2
+MANIFESTS = {"P": MANIFEST_P, "A2": MANIFEST_A2}
 
 
 def ledger_rows():
@@ -84,13 +85,13 @@ def donor(cell):
     return prep[f"donor_{cell.split('.d')[1]}"][0]
 
 
-GATES = ["gate.unit", "gate.sequence_report", "gate.e2e_sequence_first", "gate.refusal", "gate.parity"]
+GATES = ["gate.unit", "gate.sequence_report", "gate.e2e_sequence_first", "gate.refusal.a2", "gate.parity"]   # Amendment 2
 
 
 def precondition(kind, target):
     if kind in ("gate_unit", "gate_seq", "gate_e2e", "parity_run", "prepare") and exit_of("build") != "0":
         return "the build did not succeed"
-    if kind in ("refusal",) and exit_of("prepare") != "0":
+    if kind in ("refusal", "refusal2") and exit_of("prepare") != "0":
         return "prepare did not succeed"
     if kind == "call":
         if any(exit_of(g) != "0" for g in GATES):
@@ -116,6 +117,8 @@ def command(kind, target, d):
     if kind == "build":
         return ["cmake", "--build", BUILD, "--target", "panvar", "genotype_probe", "junction_proposals_test", "genotype_sequence_report_test",
                 "genotype_command_e2e_test", "-j", "8"], None, "build every touched target"
+    if kind == "refusal2":
+        return py("refusal", d, "legacy"), None, "refusal without output_schema v2"
     if kind in ("prepare", "refusal", "parity", "offcheck", "freeze", "analyse"):
         return py(kind, d), None, kind
     if kind == "gate_unit":
