@@ -99,3 +99,10 @@ and the queried family excluded. A finite value means the whole sequence is supp
   - meaningful: ≥ 1 nat per haplotype;
   - consistent: ≥ 75 % of families positive and largest positive share ≤ 0.5.
 - **Never used for fitting:** the CYP2D6 NA19650 failure and C4's missing-content problem.
+
+## Amendment 1 (declared after `gates` exited 1; 15.2 s spent)
+
+**What failed.** The G5 fixture named every doubled row "d", and panel validation refuses duplicate template names.
+
+**Fix.** The copies get unique names. No gate logic or tolerance changes. The unit re-runs as `gates.a1`; the inventory
+stands.

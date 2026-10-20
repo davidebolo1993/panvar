@@ -7959,8 +7959,10 @@ int copying_heldout(const Args& args) {
             // donor permutation invariance; duplicating EVERY row leaves the score unchanged (uniform row weighting)
             panvar::PanelAlleleMatrix perm = p, doubled = p;
             std::shuffle(perm.template_alleles.begin(), perm.template_alleles.end(), rng);
-            for (const auto& tr : p.template_alleles) doubled.template_alleles.push_back(tr);
-            doubled.template_names.resize(doubled.template_alleles.size(), "d");
+            for (std::size_t t = 0; t < p.template_alleles.size(); ++t) {   // Amendment 1: unique names for the copies
+                doubled.template_alleles.push_back(p.template_alleles[t]);
+                doubled.template_names.push_back(p.template_names[t] + "_copy");
+            }
             const double y1 = panvar::log_haploid_mosaic_prior_masked(perm, panvar::MosaicPath{q}, obs, r), y2 = panvar::log_haploid_mosaic_prior_masked(doubled, panvar::MosaicPath{q}, obs, r);
             if (std::isfinite(y1) || std::isfinite(fwd)) g5 = std::max(g5, std::fabs(y1 - fwd));
             if (std::isfinite(y2) || std::isfinite(fwd)) g5b = std::max(g5b, std::fabs(y2 - fwd));

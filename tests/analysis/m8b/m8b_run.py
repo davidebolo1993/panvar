@@ -29,7 +29,10 @@ LOCI = {"C4": (f"{R}/genotype_c4_production_11fe681/graphs/c4.gfa", "HG00096#1#h
 MANIFEST_P = ([("inventory", "inventory", "-", 30), ("gates", "gates", "-", 30)]
               + [(f"{k}.{L}", k, L, 60) for L in LOCI for k in ("fit", "fit_scrambled")]
               + [(f"support.{L}", "support", L, 45) for L in LOCI] + [("summary", "summary", "-", 30)])
-MANIFESTS = {"P": MANIFEST_P}
+# Amendment 1 (declared after `gates` exited 1 at 15.2 s): the G5 fixture gave the doubled rows one shared name, which panel
+# validation refuses; the copies now get unique names. gates.a1 replaces gates; the rest of the frozen order is unchanged.
+MANIFEST_A1 = [("gates.a1", "gates", "-", 30)] + [m for m in MANIFEST_P if m[0] not in ("inventory", "gates")]
+MANIFESTS = {"P": MANIFEST_P, "A1": MANIFEST_A1}
 INPUTS = []
 
 
@@ -85,7 +88,7 @@ def command(kind, target, d):
     if kind == "gates":
         return [probe, "copying-heldout", "--mode", "gates", "--out", f"{d}/h"], "gates"
     if kind in ("fit", "fit_scrambled", "support"):
-        assert ok("inventory") and ok("gates"), "fitting runs only after the inventory and the gates pass"
+        assert ok("inventory") and (ok("gates") or ok("gates.a1")), "fitting runs only after the inventory and the gates pass"
         gfa, ref, cur = LOCI[target]
         cmd = [probe, "copying-heldout", "--mode", "support" if kind == "support" else "fit", "--out", f"{d}/h", "--reference", ref, "--model-gfa", gfa,
                "--split", f"{OUT}/runs/inventory/split.{target}.tsv"]
