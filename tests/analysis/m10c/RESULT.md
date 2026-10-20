@@ -116,3 +116,12 @@ in the repository.
 - **(c)** build the comparator.
 
 No off-model parser was built. No merge, push, cleanup or promotion. Inputs, indexes, WIP and stash are preserved.
+
+## Closure (appended; the record above is unchanged)
+
+**M10-C is closed and its findings are preserved as recorded.**
+- **Not adopted:** the A+C evaluator. No other comparator is installed or built.
+- **Checkpoint:** M10-A remains the computational checkpoint.
+- **Paused** until Davide approves the target definition (§4): further structural-evaluator work and confidence
+  implementation.
+- **No further batch is scheduled.**
