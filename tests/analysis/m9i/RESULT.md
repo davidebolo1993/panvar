@@ -141,3 +141,37 @@ sequence edit distance, and it inherits the labelling overstatement shown above.
 - describe confidence and errors over compound intervals wherever the model has degeneracy.
 
 **Not done:** no implementation, threshold, filter or default change.
+
+## Corrections (appended by M9-I.1, 2026-10-20; the text and tables above are unchanged)
+
+The contract is replaced by **contract v2** (`tests/analysis/m9i1/`). Reapplying it to all 34 cases changes **no scientific
+conclusion**.
+
+1. **Missing projections.** M9-I counted a group with mass but no recorded labelling as definite error.
+   - **v2:** such mass enters both upper bounds and neither lower bound; it is counted, and the status is
+     ASSESSED_WITH_MISSING_PROJECTIONS.
+   - **Empty pool:** UNASSESSED.
+   - **Saved cases:** 0 missing groups.
+2. **Competitor status comes from projections, not mass.** The statuses are NO_EVALUATED_ALTERNATIVE,
+   EVALUATED_ALTERNATIVE, EVALUATED_ALTERNATIVE_ZERO_MASS and UNKNOWN.
+   - NO_EVALUATED_ALTERNATIVE describes the explored pool and is never evidence of correctness.
+   - **Saved cases:** all 34 have an evaluated alternative with positive mass.
+3. **Numerical accounting.**
+   - Masses are validated as finite and ≥ 0, normalised by their recorded total with stable summation, and the
+     discrepancy is reported. The saved discrepancies are |total − 1| ≤ 5.0e-10, so bounds change by ≤ 5.0e-10
+     relative.
+   - Error masses are still summed directly.
+   - **Scope:** these are approximate masses reconstructed from 12-digit printed values, not certified bounds on the
+     full-precision posterior. About 8–9 × 10⁴ groups per ACOT run and about 10⁴ per CYP run have printed mass exactly
+     0, which is double underflow.
+4. **The mixed-projection fixture is replaced by a physically realisable one** (M9-I.1 M7). Two labellings spell the same
+   whole haplotype, checked independently, with compensating boundaries that project differently onto a single-block
+   interval; the mass is kept as an interval. M9-I's G4 combined labellings that did not spell one sequence.
+5. **Interpretation:**
+   - **"Compound distance never exceeds block sums"** holds **in the observed cases only**. It is not a property: with
+     truth AC/GT and prediction AT/GC, both single-position unphased genotypes match (block distances 0), but the
+     compound pair differs.
+   - **Compound targets include within-interval phase.**
+   - **"Honest masses"** is withdrawn. It should read: "some inexact calls carry larger pool-conditional error masses
+     (0.20–0.50)". No calibration is implied.
+   - **Exact-sequence confidence remains distinct from structural confidence.**
