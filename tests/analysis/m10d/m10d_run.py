@@ -23,7 +23,8 @@ ENVELOPE = 6 << 30
 PRE_FREEZE = 10.0   # disclosed: the --distance mode build (2.0 s) and configure checks, rounded up; no fixture or case run
 TRUTHS = list(m10d.m10c.TRUTH)
 MANIFESTS = {"P": [("build", "build", "-", 120), ("gate.contract", "py", "gate", 120)] +
-             [(f"truth.{c}", "truth", c, 120) for c in TRUTHS] + [("cases", "py", "cases", 400)]}
+             [(f"truth.{c}", "truth", c, 120) for c in TRUTHS] + [("cases", "py", "cases", 400)],
+             "A1": [("cases.a1", "py", "cases", 400)]}   # Amendment 1: provenance-column harness defect; same cases, same truth units
 
 
 def ledger_rows():

@@ -215,7 +215,7 @@ def cases(out):
                 ok[k] &= k in recs
         n = len(ids)
         interior = tuple("".join(x for x in th[k][1:n - 1]) if all(x is not None for x in th[k][1:n - 1]) else None for k in ("truth1", "truth2"))
-        prov.append(dict(case=cid, **m10c.kv(f"{tdir}/provenance.tsv")))
+        prov.append(dict(evaluated_case=cid, **m10c.kv(f"{tdir}/provenance.tsv")))   # Amendment 1: the file has its own 'case' key
         for label, src in preds.items():
             tup = m10c.predictions(src)
             p = tuple("".join(seq[(b, tup[h][b])] for b in range(1, n - 1)) for h in (0, 1))

@@ -93,3 +93,12 @@ scope, and orientation.
   tree, polled every 0.2 s. A breach kills the tree and is recorded.
 - A failed gate stops before any case.
 - There is no approximate fallback. A unit that fails stays failed and visible.
+
+## Amendment 1 (after `cases` exited 1; the truth units had succeeded)
+
+**Failure.** `cases` raised `TypeError: dict() got multiple values for keyword argument 'case'` before writing any row. The
+provenance file written by the truth units has its own `case` key, and my harness also passed `case=`.
+
+**Fix.** The column is renamed to `evaluated_case`. This is a harness defect: no metric, case, tie rule or scope changes.
+
+**Rerun:** `cases.a1`, on the same truth units. `cases` stays recorded.
