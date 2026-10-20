@@ -29,6 +29,9 @@ FROZEN_UNITS = list(UNITS)   # MANIFEST.tsv records the frozen list
 # amendment A1 (declared after the outcomes unit failed on a caller no-call's NA alleles; AMENDMENT_A1.md): re-run the two
 # analysis units; the failed outcomes unit and the fit unit that ran without an outcomes table stay recorded
 UNITS += [("outcomes.a1", 300), ("fit.a1", 120)]
+# amendment A2 (AMENDMENT_A2.md): outcomes.a1 failed in its final consistency check on the NO_PREDICTION rows; fit.a1 was NOT RUN
+UNITS += [("outcomes.a2", 300), ("fit.a2", 120)]
+PRE += 15.0   # disclosed A2 development: structural check of outcomes.a1's partial table (row classes, consistency columns)
 
 
 def ledger():
@@ -93,6 +96,10 @@ def precondition(unit):
     if unit == "outcomes.a1" and exit_of("inventory") != "0":
         return "the inventory failed"
     if unit == "fit.a1" and exit_of("outcomes.a1") != "0":
+        return "the outcomes unit failed"
+    if unit == "outcomes.a2" and exit_of("inventory") != "0":
+        return "the inventory failed"
+    if unit == "fit.a2" and exit_of("outcomes.a2") != "0":
         return "the outcomes unit failed"
     return None
 

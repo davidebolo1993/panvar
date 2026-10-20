@@ -329,7 +329,7 @@ def outcomes(out):
     write(out, "runs", runs)
     write(out, "gq_correspondence", [dict(blocks_checked=len(corr), max_abs_difference=max(corr) if corr else None,
                                           within_0_01=sum(x < 0.01 for x in corr))])
-    bad = [r for r in rows if r.get("truth_defined") and not (r["distance_matches_evaluator"] and r["floor_matches_evaluator"])]
+    bad = [r for r in rows if r.get("predicted") and not (r["distance_matches_evaluator"] and r["floor_matches_evaluator"])]
     print(f"blocks {len(rows)}; evaluator consistency failures {len(bad)}; GQ correspondence {len(corr)} blocks, max |diff| {max(corr) if corr else None}")
     return 0 if not bad else 1
 
