@@ -82,16 +82,17 @@ if mode == "fixtures":
     G = lambda i, logp, m: dict(id=i, score=logp, fragment=logp, exposure=0.0, prior=0.0, bound=0.0, members=m)
     res = []
     ok = lambda name, cond, detail: res.append(dict(fixture=name, result="PASS" if cond else "FAIL", detail=detail))
+    # Amendment 1: J1's competitor 2 disagrees at block 0 only; J2's competitor disagrees at both blocks
     # J1: two blocks, marginals 0.9 each, joint 0.8 (the Frechet lower bound for these marginals); product would be 0.81
     win = ((1, 2), (3, 4))
     B = geno(win)
-    pool = build([G(0, math.log(0.8), [win]), G(1, math.log(0.1), [((1, 2), (3, 5))]), G(2, math.log(0.1), [((9, 2), (3, 4))])   # Amendment 1: disagrees at block 0 only])
+    pool = build([G(0, math.log(0.8), [win]), G(1, math.log(0.1), [((1, 2), (3, 5))]), G(2, math.log(0.1), [((9, 2), (3, 4))])])
     rows, blocks, _ = audit_pool(pool, B, [True, True])
     d1, d2, c = blocks[0]["mass_lower"], blocks[1]["mass_lower"], rows["C reportable-block genotype agreement"]["mass_lower"]
     ok("J1 marginals 0.9/0.9, joint 0.8", abs(d1 - 0.9) < 1e-12 and abs(d2 - 0.9) < 1e-12 and abs(c - 0.8) < 1e-12 and abs(c - d1 * d2) > 0.009,
        f"D1={d1:.6f} D2={d2:.6f} C={c:.6f} product={d1 * d2:.6f} Frechet=[{max(0, d1 + d2 - 1):.2f},{min(d1, d2):.2f}]")
     # J2: same marginals, perfectly dependent errors: joint 0.9 (the upper bound)
-    pool = build([G(0, math.log(0.9), [win]), G(1, math.log(0.1), [((9, 9), (3, 5))])   # Amendment 1: disagrees at both blocks])
+    pool = build([G(0, math.log(0.9), [win]), G(1, math.log(0.1), [((9, 9), (3, 5))])])
     rows, blocks, _ = audit_pool(pool, B, [True, True])
     d1, d2, c = blocks[0]["mass_lower"], blocks[1]["mass_lower"], rows["C reportable-block genotype agreement"]["mass_lower"]
     ok("J2 marginals 0.9/0.9, joint 0.9", abs(d1 - 0.9) < 1e-12 and abs(d2 - 0.9) < 1e-12 and abs(c - 0.9) < 1e-12,

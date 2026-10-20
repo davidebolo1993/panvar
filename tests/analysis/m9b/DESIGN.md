@@ -84,3 +84,14 @@ and 0.9 for J2. The aggregation code (M9-A core) is not touched.
 
 **Rerun.** As `fixtures.a1` and `evidence.a1` (manifest A1, same timeouts); `evidence.a1` is gated on `fixtures.a1`.
 The failed `fixtures` unit stays recorded.
+
+## Amendment 2 (declared before any further execution)
+
+**What failed.** `fixtures.a1` exited 1 with a SyntaxError.
+- **Cause:** Amendment 1's edit put inline `#` comments inside the `build([...])` expressions, so the comments swallowed
+  the closing brackets. The file was not compiled before the commit.
+- **Correction:** the comments move above the fixture, and the code is otherwise identical to Amendment 1. Both files now
+  compile.
+- **Rerun:** as `fixtures.a2` and `evidence.a2` (manifest A2, same timeouts), with `evidence.a2` gated on `fixtures.a2`.
+
+`fixtures` and `fixtures.a1` stay recorded as failures.

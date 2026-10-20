@@ -25,7 +25,8 @@ ACOT_GFA = f"{R}/genotype_perf_bounded_20261015/inputs/acot/acot.gfa"
 ACOT_REF = "GRCh38#0#chr14:73416151-73668669"
 MANIFEST_P = [("fixtures", "fixtures", "-", 10), ("evidence", "evidence", "-", 90)]
 MANIFEST_A1 = [("fixtures.a1", "fixtures", "-", 10), ("evidence.a1", "evidence", "-", 90)]   # Amendment 1: corrected J1/J2 labels
-MANIFESTS = {"P": MANIFEST_P, "A1": MANIFEST_A1}
+MANIFEST_A2 = [("fixtures.a2", "fixtures", "-", 10), ("evidence.a2", "evidence", "-", 90)]   # Amendment 2: syntax repair of A1
+MANIFESTS = {"P": MANIFEST_P, "A1": MANIFEST_A1, "A2": MANIFEST_A2}
 INPUTS = []
 
 
@@ -75,7 +76,7 @@ def verify():
 
 def command(kind, target, d):
     if kind == "evidence":
-        gate = "fixtures.a1" if d.endswith(".a1") else "fixtures"
+        gate = "fixtures" + d[d.rindex("evidence") + len("evidence"):]
         assert next((r["exit"] for r in ledger_rows() if r["unit"] == gate), None) == "0", "the fixtures must pass first"
     return [sys.executable, os.path.join(HERE, "m9b.py"), kind, d], kind
 
