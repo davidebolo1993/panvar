@@ -1,0 +1,65 @@
+# M8-A: donors previously inspected (named in a memory note or tests/analysis design/result as of M8-A, a campaign 11fe681 mosaic-plan donor, or a donor of an M6-F evaluation family). Frozen before any M8-A unit; expanded to pedigree families at use.
+donor	sources
+HG00096	memory:MEMORY.md; memory:panvar-genotype-docs-consolidation.md; memory:panvar-longread-orientation-assembly.md; memory:panvar-longread-phase0.md; memory:panvar-loo-reference-donor.md; memory:panvar-m1a-attribution.md; memory:panvar-m1e-residual-sensitivity.md; memory:panvar-m2a-residual-discovery.md; memory:panvar-s1d-panel-references.md; tests/analysis/m1a/DESIGN.md; tests/analysis/m1b/DESIGN.md; tests/analysis/m3b/DESIGN.md; tests/analysis/m3f/SELECTION.md; tests/analysis/m4a/INTEGRATION.md; tests/analysis/m6e/DESIGN.md; tests/analysis/m6e/RESULT.md; tests/analysis/m6f/DESIGN.md; tests/analysis/m6f/RESULT.md; tests/analysis/m7a/SPEC.md; tests/analysis/m7b/DESIGN.md; tests/analysis/m7b/RESULT.md; tests/analysis/s1d/README.md
+HG00097	memory:panvar-m1a-attribution.md; tests/analysis/m1a/DESIGN.md; tests/analysis/m4b/DESIGN.md; tests/analysis/m4b/RESULT.md
+HG00171	memory:panvar-longread-h3g-c1.md; memory:panvar-longread-route-a.md; memory:panvar-m3f-validation.md; memory:panvar-m4a-distance-prior.md; memory:panvar-m4b-distance-prior.md; memory:panvar-m5a-pooled-winner.md; memory:panvar-m6a-count-model.md; memory:panvar-m7a-real-failure-spec.md; memory:panvar-repair-start-rule-open.md; tests/analysis/m3f/RESULT.md; tests/analysis/m3f/SELECTION.md; tests/analysis/m4a/INTEGRATION.md; tests/analysis/m4b/DESIGN.md; tests/analysis/m4b/RESULT.md; tests/analysis/m5a/DESIGN.md; tests/analysis/m5a/RESULT.md; tests/analysis/m6a/DESIGN.md; tests/analysis/m6a/RESULT.md; tests/analysis/m6b/RESULT.md; tests/analysis/m6e/RESULT.md; tests/analysis/m7a/SPEC.md; tests/analysis/m7b/DESIGN.md; tests/analysis/m7b/RESULT.md; tests/analysis/m7b1/RESULT.md; tests/analysis/m7c/RESULT.md
+HG00232	memory:panvar-lpa-representation-drift.md
+HG00268	memory:panvar-longread-orientation-assembly.md; memory:panvar-longread-route-a.md; memory:panvar-m4a-distance-prior.md; tests/analysis/m4a/INTEGRATION.md
+HG00358	campaign 11fe681 mosaic plan dense_switching_1; memory:panvar-census-free-branch-seeds.md; memory:panvar-dosage-cpp-port.md; memory:panvar-genotype-docs-consolidation.md; memory:panvar-union-placement-reuse.md
+HG00512	memory:panvar-c4-outlier-audit.md; memory:panvar-longread-ogr2.md; memory:panvar-repair-start-rule-open.md; memory:panvar-sv7-observability.md; tests/analysis/m6f/DESIGN.md; tests/analysis/m6f/RESULT.md
+HG00513	tests/analysis/m6e/RESULT.md; tests/analysis/m6f/DESIGN.md; tests/analysis/m6f/RESULT.md
+HG00514	tests/analysis/m6e/RESULT.md; tests/analysis/m6f/DESIGN.md; tests/analysis/m6f/RESULT.md
+HG00731	campaign 11fe681 mosaic plan three_switches_1; tests/analysis/m3h/RESULT.md; tests/analysis/m6e/RESULT.md; tests/analysis/m6f/DESIGN.md; tests/analysis/m6f/RESULT.md
+HG00732	tests/analysis/m6e/RESULT.md; tests/analysis/m6f/DESIGN.md; tests/analysis/m6f/RESULT.md
+HG00733	tests/analysis/m6e/RESULT.md; tests/analysis/m6f/DESIGN.md; tests/analysis/m6f/RESULT.md
+HG00864	M6-F evaluation family HG00864 (panel sequences scored); memory:panvar-m6f-copying-predictive.md; tests/analysis/m6f/RESULT.md
+HG01114	memory:panvar-repair-start-rule-open.md
+HG01346	memory:panvar-cn-from-multiplicity.md
+HG01352	memory:panvar-census-free-branch-seeds.md; memory:panvar-union-placement-reuse.md
+HG01457	campaign 11fe681 mosaic plan both_homologues_1
+HG01505	campaign 11fe681 mosaic plan panel_control_2
+HG01573	memory:MEMORY.md; memory:panvar-c4-figure-freeze.md; memory:panvar-census-free-branch-seeds.md; memory:panvar-final-campaign-plan.md; memory:panvar-i4a-scaling.md; memory:panvar-i4c-seed-reuse.md; memory:panvar-longread-h3g-c1.md; memory:panvar-longread-h3g-c22.md; memory:panvar-longread-phase0.md; memory:panvar-repair-start-rule-open.md; memory:panvar-union-placement-reuse.md; tests/analysis/m6e/RESULT.md
+HG01596	memory:panvar-dosage-design-frozen.md; memory:panvar-sv7-allocation-unidentifiable.md
+HG01890	M6-F evaluation family BB05 (panel sequences scored)
+HG02011	tests/analysis/m3h/RESULT.md
+HG02059	campaign 11fe681 mosaic plan one_homologue_once_1
+HG02106	M6-F evaluation family PEL38 (panel sequences scored)
+HG02282	memory:panvar-repair-start-rule-open.md
+HG02492	memory:panvar-sv7-allocation-unidentifiable.md
+HG02554	memory:panvar-longread-ogr2.md
+HG02587	campaign 11fe681 mosaic plan dense_switching_2
+HG02666	M6-F evaluation family GB40 (panel sequences scored)
+HG02769	campaign 11fe681 mosaic plan three_switches_1; memory:panvar-cyp2d6-pilot.md; memory:panvar-longread-ogr2.md; memory:panvar-longread-phase0.md; memory:panvar-m1a-attribution.md; memory:panvar-m3h-evidence-decomposition.md; memory:panvar-m5a-pooled-winner.md; memory:panvar-m6a-count-model.md; memory:panvar-m7a-real-failure-spec.md; memory:panvar-repair-start-rule-open.md; tests/analysis/m1a/DESIGN.md; tests/analysis/m3h/RESULT.md; tests/analysis/m4b/DESIGN.md; tests/analysis/m4b/RESULT.md; tests/analysis/m5a/DESIGN.md; tests/analysis/m5a/RESULT.md; tests/analysis/m6a/DESIGN.md; tests/analysis/m6a/RESULT.md; tests/analysis/m6b/RESULT.md; tests/analysis/m7a/SPEC.md; tests/analysis/m7b/DESIGN.md; tests/analysis/m7b/RESULT.md; tests/analysis/m7b1/RESULT.md; tests/analysis/m7c/RESULT.md
+HG02818	M6-F evaluation family GB66 (panel sequences scored)
+HG02953	campaign 11fe681 mosaic plan both_homologues_2; memory:panvar-cyp2d6-pilot.md
+HG03009	campaign 11fe681 mosaic plan one_homologue_once_2
+HG03065	campaign 11fe681 mosaic plan dense_switching_2
+HG03248	campaign 11fe681 mosaic plan three_switches_2; memory:MEMORY.md; memory:panvar-longread-h3g-c1.md; memory:panvar-sv7-factorized-proposal.md; memory:panvar-sv7-observability.md; memory:panvar-sv7-reachability.md; tests/analysis/m6e/RESULT.md
+HG03371	M6-F evaluation family NG98 (panel sequences scored)
+HG03452	memory:panvar-longread-ar0-kfold.md
+HG03456	campaign 11fe681 mosaic plan both_homologues_2; memory:panvar-c4-figure-freeze.md; memory:panvar-dosage-cpp-port.md; memory:panvar-genotype-docs-consolidation.md; memory:panvar-release-engineering.md
+HG03683	campaign 11fe681 mosaic plan panel_control_1; memory:panvar-longread-h3g-c1.md
+HG03732	memory:panvar-longread-ar0-kfold.md
+HG03807	tests/analysis/m1b/DESIGN.md
+HG04217	memory:panvar-longread-ogr2.md; memory:panvar-sv7-allocation-unidentifiable.md
+NA12329	M6-F evaluation family 1328 (panel sequences scored)
+NA18534	campaign 11fe681 mosaic plan one_homologue_once_1; tests/analysis/m6e/RESULT.md
+NA18913	tests/analysis/m6f/DESIGN.md
+NA18939	campaign 11fe681 mosaic plan panel_control_2; memory:panvar-longread-ar0-kfold.md
+NA18989	campaign 11fe681 mosaic plan both_homologues_1; memory:panvar-longread-orientation-assembly.md; memory:panvar-mosaic-genotyper-rebuild.md; memory:panvar-repair-start-rule-open.md; tests/analysis/m4a/DESIGN.md; tests/analysis/m4a/RESULT.md
+NA19036	M6-F evaluation family NA19036 (panel sequences scored); memory:panvar-m6f-copying-predictive.md; tests/analysis/m6f/RESULT.md
+NA19129	campaign 11fe681 mosaic plan dense_switching_1
+NA19238	campaign 11fe681 mosaic plan three_switches_2; tests/analysis/m6e/RESULT.md; tests/analysis/m6f/DESIGN.md; tests/analysis/m6f/RESULT.md
+NA19239	tests/analysis/m6e/RESULT.md; tests/analysis/m6f/DESIGN.md; tests/analysis/m6f/RESULT.md
+NA19240	memory:panvar-cn-from-multiplicity.md; tests/analysis/m6e/RESULT.md; tests/analysis/m6f/DESIGN.md; tests/analysis/m6f/RESULT.md
+NA19317	campaign 11fe681 mosaic plan panel_control_1
+NA19331	memory:panvar-repair-start-rule-open.md
+NA19347	campaign 11fe681 mosaic plan one_homologue_once_2; memory:panvar-m1d-unit-reachability.md; tests/analysis/m6e/RESULT.md
+NA19384	memory:panvar-repair-start-rule-open.md; memory:panvar-sv7-allocation-unidentifiable.md
+NA19434	memory:panvar-longread-ogr2.md; memory:panvar-longread-orientation-assembly.md; memory:panvar-repair-start-rule-open.md; memory:panvar-sv7-allocation-unidentifiable.md; memory:panvar-union-placement-reuse.md; tests/analysis/m3h/RESULT.md
+NA19650	memory:MEMORY.md; memory:panvar-c4-figure-freeze.md; memory:panvar-c4-outlier-audit.md; memory:panvar-cyp2d6-pilot.md; memory:panvar-headline-filters.md; memory:panvar-i4a-scaling.md; memory:panvar-i4b-union-views.md; memory:panvar-i4c-seed-reuse.md; memory:panvar-longread-h3f-a.md; memory:panvar-longread-h3g-a.md; memory:panvar-longread-h3g-b.md; memory:panvar-longread-phase0.md; memory:panvar-m1a-attribution.md; memory:panvar-m1b-structural.md; memory:panvar-m1c-allocation.md; memory:panvar-m1e-residual-sensitivity.md; memory:panvar-m2a-residual-discovery.md; memory:panvar-m3f-validation.md; memory:panvar-m3g-proposal-trace.md; memory:panvar-m4a-distance-prior.md; memory:panvar-m6a-count-model.md; memory:panvar-m6b-count-attribution.md; memory:panvar-m6e-panel-variation.md; memory:panvar-m7a-real-failure-spec.md; memory:panvar-sv7-allocation-unidentifiable.md; memory:panvar-sv7-factorized-proposal.md; memory:panvar-sv7-observability.md; memory:panvar-sv7-reachability.md; tests/analysis/m1a/DESIGN.md; tests/analysis/m1b/DESIGN.md; tests/analysis/m1c/DESIGN.md; tests/analysis/m1d/DESIGN.md; tests/analysis/m3a/DESIGN.md; tests/analysis/m3d/DESIGN.md; tests/analysis/m3f/RESULT.md; tests/analysis/m3f/SELECTION.md; tests/analysis/m3g/RESULT.md; tests/analysis/m4a/CONTRACT.md; tests/analysis/m4a/DESIGN.md; tests/analysis/m4a/INTEGRATION.md; tests/analysis/m4a/RESULT.md; tests/analysis/m6a/DESIGN.md; tests/analysis/m6a/RESULT.md; tests/analysis/m6b/DESIGN.md; tests/analysis/m6b/RESULT.md; tests/analysis/m6e/DESIGN.md; tests/analysis/m6e/RESULT.md; tests/analysis/m6f/DESIGN.md; tests/analysis/m6f/RESULT.md; tests/analysis/m6g/RESULT.md; tests/analysis/m7a/SPEC.md; tests/analysis/m7b/DESIGN.md; tests/analysis/m7b/RESULT.md; tests/analysis/m7b1/DESIGN.md; tests/analysis/m7b1/RESULT.md; tests/analysis/m7c/RESULT.md
+NA19983	memory:panvar-cyp2d6-pilot.md
+NA20509	memory:panvar-production-caller-adaptive.md; memory:panvar-repair-memory-slot-reuse.md
+NA20847	memory:panvar-census-free-branch-seeds.md; memory:panvar-longread-orientation-assembly.md; memory:panvar-sv7-allocation-unidentifiable.md
+NA21487	tests/analysis/m6e/RESULT.md; tests/analysis/m6f/DESIGN.md
+NA24385	memory:panvar-c4-figure-freeze.md; memory:panvar-longread-ar0-kfold.md; memory:panvar-sv7-allocation-unidentifiable.md; tests/analysis/m6f/DESIGN.md
