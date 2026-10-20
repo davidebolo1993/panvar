@@ -33,7 +33,8 @@ MANIFEST_P = ([("build", "build", "-", 300), ("gate.compound_unit", "gate_compou
                ("smoke.acot.off", "smoke", "acot:off", 930), ("smoke.acot.on", "smoke", "acot:on", 930), ("smoke.acot.on.t1", "smoke", "acot:on:t1", 930),
                ("smoke.cyp.off", "smoke", "cyp:off", 310), ("smoke.cyp.on", "smoke", "cyp:on", 310),
                ("smoke.c4.off", "smoke", "c4:off", 130), ("smoke.c4.on", "smoke", "c4:on", 130), ("smoke_check", "smoke_check", "-", 120)])
-MANIFESTS = {"P": MANIFEST_P}
+MANIFEST_A1 = [("build.a1", "build", "-", 300), ("gate.compound_unit.a1", "gate_compound", "-", 30), ("gate.replay.a1", "replay", "-", 150)]   # Amendment 1
+MANIFESTS = {"P": MANIFEST_P, "A1": MANIFEST_A1}
 
 
 def ledger_rows():
@@ -78,11 +79,11 @@ def record(unit, rev, dirty, timeout, wall, rss, code, timed_out, note):
         f.write(f"{unit}\t{rev}\t{dirty}\t{timeout}\t{wall:.2f}\t{rss:.3f}\t{code}\t{int(bool(timed_out))}\t{note}\n")
 
 
-GATES = ["build", "gate.compound_unit", "gate.junction_unit", "gate.sequence_report", "gate.e2e_sequence_first", "declare", "gate.replay"]
+GATES = ["build.a1", "gate.compound_unit.a1", "gate.junction_unit", "gate.sequence_report", "gate.e2e_sequence_first", "declare", "gate.replay.a1"]   # Amendment 1
 
 
 def precondition(kind, target):
-    if kind not in ("build",) and exit_of("build") != "0":
+    if kind not in ("build",) and exit_of("build.a1" if "build.a1" in done() else "build") != "0":
         return "the build failed"
     if kind == "declare" and exit_of("c4model") != "0":
         return "the C4 model inventory failed"

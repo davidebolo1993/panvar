@@ -49,11 +49,15 @@ std::string spell(const std::vector<std::vector<std::string>>& blocks, const std
     return s;
 }
 
-std::vector<std::string> split(const std::string& s, char sep) {
+std::vector<std::string> split(const std::string& s, char sep) {   // keeps a trailing empty field (an empty allele's sequence)
     std::vector<std::string> out;
-    std::string item;
-    std::stringstream in(s);
-    while (std::getline(in, item, sep)) out.push_back(item);
+    std::size_t start = 0;
+    while (true) {
+        const std::size_t at = s.find(sep, start);
+        out.push_back(s.substr(start, at == std::string::npos ? std::string::npos : at - start));
+        if (at == std::string::npos) break;
+        start = at + 1;
+    }
     return out;
 }
 std::vector<std::size_t> labels(const std::string& s) {

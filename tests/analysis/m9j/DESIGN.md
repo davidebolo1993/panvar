@@ -121,3 +121,20 @@ No additional families and no wider campaign.
 **Total: 1,800 s,** including 75 s of disclosed pre-freeze development compiles and unit-test runs.
 
 **Admission:** spent + timeout + 120 s (the smoke check). Failed attempts are preserved; settings are never relaxed.
+
+## Amendment 1 (after `gate.replay`; before any smoke run)
+
+**Failure.** `gate.replay` exited 1: the replay harness threw `map::at` before writing any row.
+
+**Cause.** The harness's `split` (in `tests/compound_annotation_test.cpp`) dropped a trailing empty field. Dump rows of
+**empty alleles** (zero-length sequence) therefore lost their `sequence` column. This is a test-harness defect. The
+library's declaration parser is unaffected: its lines never end in an empty field.
+
+**Fix.** The harness `split` keeps trailing empty fields. Nothing else changes.
+
+**Rerun:**
+- `build.a1` (test binary only);
+- `gate.compound_unit.a1`;
+- `gate.replay.a1`, which replaces `gate.replay` in the smoke precondition.
+
+The failed unit stays recorded.
