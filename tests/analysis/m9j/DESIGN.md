@@ -163,3 +163,22 @@ It raised before launching any process. The empty directory `runs/smoke.cyp.off/
 **Rerun:**
 - `smoke.cyp.off.a3`, `smoke.cyp.on.a3`, `smoke.c4.off.a3`, `smoke.c4.on.a3`;
 - `smoke_check.a3`, which reads the `.a3` directories for CYP2D6 and C4.
+
+## Amendment 4 (after `smoke_check.a3`; no caller run follows)
+
+**What `smoke_check.a3` found.** Every scientific output is identical: 73 of 76 identity checks pass, and 29 of 31 thread
+checks pass, including both annotation files.
+
+**Why it failed.** Some differing `mosaic_status` keys fell outside the declared patterns. Their values were inspected:
+- **`emission_cache_dp_hits` / `emission_cache_dp_misses`:** cache-work split counters. Hits + misses = 2,054,744 in
+  both arms; only the split varies. This is the known run-to-run cache-work variation at 4 threads.
+- **`profile`, `profile_name`, `profile_sha256`:** the provenance of the added compound profile file. The design allowed
+  `profile` only in `settings.tsv`.
+- **The 1- against 4-thread comparison:** thread-count and work-partition keys (`threads_*`, `adaptive_fine_units_*`,
+  `adaptive_fine_worker_*`, `settings_overridden_after_profile`) and the settings `threads` value. These differ by
+  construction when the thread count differs.
+
+**Fix.** These keys are declared explicitly (`AMENDMENT4_KEYS`, and `THREAD_KEYS` for the thread run only). No scientific
+file, column or other key is excluded.
+
+**Rerun:** `smoke_check.a4`. `smoke_check.a3` stays recorded.

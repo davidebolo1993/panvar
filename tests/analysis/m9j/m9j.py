@@ -151,7 +151,13 @@ BRANCH_COLS = ["branch", "parent_tie", "start_hap1", "start_hap2", "start_total"
                "terminal_genotype", "terminal_total"]
 
 
-def compare_dirs(a, b, declared_extra):
+# Amendment 4 (declared after smoke_check.a3; values inspected): cache-work split counters (hits + misses invariant across arms)
+# and the provenance of the added compound profile; for the 1- vs 4-thread comparison only, thread-count and work-partition keys.
+AMENDMENT4_KEYS = {"emission_cache_dp_hits", "emission_cache_dp_misses", "profile", "profile_name", "profile_sha256"}
+THREAD_KEYS = re.compile(r"^threads|^adaptive_fine_units_|^adaptive_fine_worker_|^settings_overridden_after_profile$")
+
+
+def compare_dirs(a, b, declared_extra, thread_run=False):
     """Every file of a (off) against b (on), each arm's own prefix normalised. Returns rows."""
     rows = []
     fa = {f[len("call."):]: f for f in os.listdir(a) if f.startswith("call.")}
@@ -174,7 +180,8 @@ def compare_dirs(a, b, declared_extra):
             ka = {l.split("\t")[0]: l.split("\t")[1:] for l in ta.splitlines() if "\t" in l}
             kb = {l.split("\t")[0]: l.split("\t")[1:] for l in tb.splitlines() if "\t" in l}
             diff = [x for x in set(ka) | set(kb) if ka.get(x) != kb.get(x)]
-            undeclared = [x for x in diff if not (x.startswith("compound_") or VOLATILE_STATUS.search(x) or (k == "settings.tsv" and x == "profile"))]
+            undeclared = [x for x in diff if not (x.startswith("compound_") or VOLATILE_STATUS.search(x) or (k == "settings.tsv" and x == "profile")
+                                                  or x in AMENDMENT4_KEYS or (thread_run and THREAD_KEYS.search(x)))]
             rows.append(dict(file=k + " (keys)", identical=not undeclared, detail=("declared differences: " + ",".join(sorted(x for x in diff if x not in undeclared))[:300]
                                                                                  + (" | UNDECLARED: " + ",".join(sorted(undeclared)) if undeclared else ""))))
         else:
@@ -242,7 +249,7 @@ if mode == "smoke_check":
     if os.path.exists(f"{t1}/call.sequence_compound.tsv"):
         threads.append(dict(check="sequence_compound.tsv identical (1 vs 4 threads)",
                             identical=open(f"{t1}/call.sequence_compound.tsv").read() == open(f"{t4}/call.sequence_compound.tsv").read()))
-        for r in compare_dirs(t4, t1, set()):
+        for r in compare_dirs(t4, t1, set(), thread_run=True):
             threads.append(dict(check=f"{r['file']} (4 vs 1 threads)", identical=r["identical"], detail=r.get("detail", "")))
     write("identity", rows)
     write("findings", findings)

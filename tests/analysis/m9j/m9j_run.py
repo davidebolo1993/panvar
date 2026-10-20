@@ -37,7 +37,8 @@ MANIFEST_A1 = [("build.a1", "build", "-", 300), ("gate.compound_unit.a1", "gate_
 MANIFEST_A2 = [("build.a2", "build", "-", 300), ("gate.compound_unit.a2", "gate_compound", "-", 30), ("gate.replay.a2", "replay", "-", 150)]   # Amendment 2
 MANIFEST_A3 = [("smoke.cyp.off.a3", "smoke", "cyp:off", 310), ("smoke.cyp.on.a3", "smoke", "cyp:on", 310),
                ("smoke.c4.off.a3", "smoke", "c4:off", 130), ("smoke.c4.on.a3", "smoke", "c4:on", 130), ("smoke_check.a3", "smoke_check", "-", 120)]   # Amendment 3
-MANIFESTS = {"P": MANIFEST_P, "A1": MANIFEST_A1, "A2": MANIFEST_A2, "A3": MANIFEST_A3}
+MANIFEST_A4 = [("smoke_check.a4", "smoke_check", "-", 120)]   # Amendment 4: inspected non-scientific keys declared
+MANIFESTS = {"P": MANIFEST_P, "A1": MANIFEST_A1, "A2": MANIFEST_A2, "A3": MANIFEST_A3, "A4": MANIFEST_A4}
 
 
 def ledger_rows():
