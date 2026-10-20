@@ -141,3 +141,25 @@ are recorded. Nothing is pooled across configurations.
    permit read simulation; 5× first.
 7. **The quantity to calibrate.** Fix the input (`error_mass_upper`), and any stratification (block kind, genotype support)
    to declare **before** the development data is examined.
+
+---
+## Qualifications (appended after review; the audit above is unchanged)
+
+**1. The audit does not establish that every confident error comes from an absent candidate.** The documented attributions
+differ:
+
+| confident error (development) | documented cause | source |
+|---|---|---|
+| ACOT sv:5, M9-C d1 / d3 / d6 (E1, E3, E6) | **search omission**: a one-block replacement scores higher but was never evaluated (proposal emissions tied at sv:5) | M9-D, M9-E |
+| ACOT sv:5 d2 (E2), sv:9 d3 (E4) | **copying-prior effect**: the likelihood favours truth, and the LOO-context prior favours the call | M9-D |
+| ACOT sv:5 d4 (E5) | **weak likelihood preference** for the call (about 1 nat) | M9-D |
+| C4 NA19650 sv:7 (65 kb) | **mixed**: the truth is unspellable from the LOO panel (availability), **and** the saved 2+2 class is present but scores lower (likelihood/model; residual content, M6-B) | M1-B, M1-C, M6-B |
+| CYP2D6 NA19650 sv:9 at 5× (12 kb) | **likelihood/model limitation**: the true 2+3 class is in the pool (best rank 4) but loses by about 31 nats; a count model fixes this LOO dosage (M6-A) | M1-B, M6-A |
+| ACOT NA19909 sv:13 (27 kb, M9-C d1) | **unattributed** | — |
+| ACOT sv:9 ≈ 475 bp errors (M9-H L1, L4; M9-C d2) | **unattributed** (PRIOR_ONLY blocks; resembles E4, not shown) | — |
+| C4 campaign sv:7 catastrophic errors in 10 further donors (e.g. HG04217, NA20847) | **unattributed** (only NA19650 was studied) | — |
+
+**2. Scope of calibration.** A scalar calibration **can** correct average over-confidence for a class of predictions. It
+**cannot** distinguish good from bad predictions whose inputs are indistinguishable. This does **not** make calibration
+categorically impossible. Whether the documented failure classes have distinguishable truth-free inputs is an empirical
+question, addressed below.
