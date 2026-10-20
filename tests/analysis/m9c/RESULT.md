@@ -194,3 +194,25 @@ it is confidently wrong in every LOO cell.
 
 **Next (not run):** an isolated sv:5 comparison per affected cell, as the attribution step, before any calibration or
 contract claim covers that block.
+
+## Qualification (appended by M9-D, 2026-10-20; the text above is unchanged)
+
+1. **Excluding sv:5 after inspection does not establish calibration on the remaining blocks.** The block was singled out
+   after seeing the truth-based outcome. "28 exact of 29 in the lowest bin without sv:5" is a post-hoc, descriptive
+   observation on 6 families. It is not evidence that the error mass is calibrated elsewhere.
+2. **sv:5 allele lengths are not uniformly 20–30 bp.** From the archived evaluator (`eval.<cell>.blocks.tsv`, called and
+   truth bp):
+
+| cell | called (bp) | truth (bp) |
+|---|---|---|
+| LOO d1 | 30 / 27 | 28 / 29 |
+| LOO d2 | 27 / 27 | 27 / 27 |
+| LOO d3 | 18 / 33 | 23 / 37 |
+| LOO d4 | 23 / 27 | 29 / 27 |
+| LOO d5 | — (legacy no-call; truth unavailable) | 47 / 20 |
+| LOO d6 | 44 / 7 | 50 / 44 |
+| LZO d1 | 28 / 29 (exact) | 28 / 29 |
+| LZO d2 | 27 / 27 (exact) | 27 / 27 |
+
+   The range is **7–50 bp**. For comparison, the d3 sv:9 alleles are 434 / 434 bp called against 433 / 434 bp truth.
+3. **Status:** all cells selected for M9-D are now development evidence.
