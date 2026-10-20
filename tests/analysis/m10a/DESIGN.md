@@ -249,3 +249,18 @@ No scientific file, column, setting, identity key or cap is excused.
 directories. A superseded failure stops nothing once its replacement passes.
 
 Disclosed development time for this amendment: 10 s, counted in the budget.
+
+## Amendment 3 (after `cmp.jp.acot_5` failed; no caller run since)
+
+**What failed.** `cmp.jp.acot_5` failed J3 and J4 on exactly one key, `time_limit_seconds`, 130 against 160, in the
+settings table and its status echo.
+- **Cause: my plan.** The frozen plan gives D a larger timeout than D0 for ACOT 5× and for every 30× cell (150/180,
+  300/360). The time guard is the declared timeout minus 20 s.
+- **Not a run problem.** Both runs completed. JP1.1 was eligible (1 block). No other invariant was reached or violated.
+
+**Fix.** In `jp` mode only, `time_limit_seconds` is a **declared operational guard difference**: J3 and J4 skip it, and the
+underlying identity check declares it. Its two values are reported. It is accepted only on top of the outcome check, which
+requires both runs to be complete. Every other setting, identity key, cap and budget stays protected.
+
+**Reruns:** `controls.a3` (it must still pass 18/18) and `cmp.jp.acot_5.a3` on the same saved runs. Then manifest P
+continues. Disclosed development time for Amendments 2–3: 15 s in all.
