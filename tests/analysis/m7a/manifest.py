@@ -124,6 +124,13 @@ for cell, c in CELLS.items():
             s, r = best[k]
             add("D", f"saved_{k[0]}+{k[1]}", r["hap1_alleles"], r["hap2_alleles"], "caller best saved per unit class (M1-B rule steps 1-2, truth-free)",
                 s["score"], s["fragment_term"], s["exposure_term"], s["sequence_pair_prior"])
+    rep1, rep2 = eq[0]["hap1_alleles"].split(","), eq[0]["hap2_alleles"].split(",")
+
+    def substitution(h1, h2):   # differs from the reported call only at the target block (either homologue assignment)
+        a, b = h1.split(","), h2.split(",")
+        same = lambda x, y: all(x[i] == y[i] for i in range(len(x)) if i != t)
+        return (same(a, rep1) and same(b, rep2)) or (same(a, rep2) and same(b, rep1))
+
     fs = {r["label"]: r for r in T(f"{P}/m6a_count_model_20261019/runs/fragscore.{c['m6a']}/fs.scores_truth_free.tsv")}
     for r in csv.reader(open(f"{P}/m6a_count_model_20261019/runs/freeze/eval_candidates.{c['m6a']}.tsv"), delimiter="\t"):
         label, h1, h2 = r[0], r[1], r[2]
@@ -138,7 +145,10 @@ for cell, c in CELLS.items():
                              representation="panel_allele_paths", hap1_alleles=e["hap1_alleles"], hap2_alleles=e["hap2_alleles"], fasta="-", records="-",
                              target_alleles=f"{e['hap1_alleles'].split(',')[t]}|{e['hap2_alleles'].split(',')[t]}",
                              unit_copies=f"{u1}+{u2}", unit_total=(u1 + u2) if None not in (u1, u2) else "NA", unit_class="+".join(str(x) for x in sorted((u1, u2))) if None not in (u1, u2) else "NA",
-                             reachability="caller_scored" if key in scored_pairs else "catalogue_member_not_scored_by_caller",
+                             # Amendment 2: reachability split; also_truth_selected flags a D candidate that a truth-selected rule also reached
+                             caller_scored="yes" if key in scored_pairs else "no",
+                             target_substitution_of_reported="yes" if substitution(e["hap1_alleles"], e["hap2_alleles"]) else "no",
+                             also_truth_selected="yes" if e["tier"] == "D" and any(l.startswith("sub_truth") for l in e["labels"]) else "no",
                              copying_prior_defined="yes", saved_expected_total=e["expected_total"], saved_fragment_term=e["fragment_term"],
                              saved_exposure_term=e["exposure_term"], saved_prior=e["prior"]))
     # oracle constructions (explicit sequences; off-panel; no copying prior)
@@ -163,7 +173,8 @@ for cell, c in CELLS.items():
             rows.append(dict(cell=cell, locus=c["locus"], target_block=c["block"], tier="O", labels=f"{k}_{r['label']}",
                              sources=f"{k.upper()} truth-selected/patched construction" + (" (complete true diplotype; reference only)" if r["label"] == "truth" else ""),
                              representation="explicit_sequences", hap1_alleles="-", hap2_alleles="-", fasta=r["fasta"], records=f"{r['record1']}|{r['record2']}",
-                             target_alleles="-", unit_copies="see construction record", unit_total="NA", unit_class="NA", reachability="off_panel",
+                             target_alleles="-", unit_copies="see construction record", unit_total="NA", unit_class="NA", caller_scored="no",
+                             target_substitution_of_reported="no (explicit off-panel sequence)", also_truth_selected="yes",
                              copying_prior_defined="no (prior_support none)", saved_expected_total="NA", saved_fragment_term="NA", saved_exposure_term="NA",
                              saved_prior="NA", sequence_sha256_prefix=f"{h[0]}|{h[1]}"))
 
@@ -181,4 +192,4 @@ from collections import Counter
 print(Counter((r["cell"], r["tier"]) for r in rows))
 for r in rows:
     if r["tier"] != "O":
-        print(r["cell"], r["tier"], r["labels"][:60], r["unit_copies"], r["reachability"], r["saved_expected_total"][:14])
+        print(r["cell"], r["tier"], r["labels"][:40], r["unit_copies"], r["caller_scored"], r["target_substitution_of_reported"], r["also_truth_selected"], r["saved_expected_total"][:14])
