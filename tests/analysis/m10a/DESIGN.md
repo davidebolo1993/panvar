@@ -264,3 +264,7 @@ requires both runs to be complete. Every other setting, identity key, cap and bu
 
 **Reruns:** `controls.a3` (it must still pass 18/18) and `cmp.jp.acot_5.a3` on the same saved runs. Then manifest P
 continues. Disclosed development time for Amendments 2–3: 15 s in all.
+
+*Record note.* Commit `50804fc` contains only the Amendment 3 text above. My edit script stopped on an assertion before
+writing any code, and the manifest step then failed, so no unit ran. The code follows in the next commit, unchanged from
+the text.

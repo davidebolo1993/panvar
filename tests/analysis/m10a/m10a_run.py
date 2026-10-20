@@ -66,10 +66,13 @@ MANIFEST_A2 = [("controls.a2", "py", "controls", 120), ("cmp.route.c4_5.a2", "cm
                ("cmp.jp.c4_5.a2", "cmp", "jp:D0.c4_5:D.c4_5", CMP_TIMEOUT)] + \
     [(f"{arm}.cyp_5.a2", "cli", f"{arm}:cyp_5", TIMEOUT[arm]["cyp_5"]) for arm in ("REF", "O", "D0", "D")] + \
     [(f"cmp.{mode}.cyp_5.a2", "cmp", f"{mode}:{CMP[mode][0]}.cyp_5:{CMP[mode][1]}.cyp_5", CMP_TIMEOUT) for mode in ("backend", "route", "jp")]
-SUPERSEDED = {"cmp.route.c4_5": "cmp.route.c4_5.a2", "cmp.jp.c4_5": "cmp.jp.c4_5.a2", "controls": "controls.a2"}
+SUPERSEDED = {"cmp.route.c4_5": "cmp.route.c4_5.a2", "cmp.jp.c4_5": "cmp.jp.c4_5.a2", "controls": "controls.a2",
+              "cmp.jp.acot_5": "cmp.jp.acot_5.a3", "controls.a2": "controls.a3"}
+# Amendment 3 (after cmp.jp.acot_5 failed only on the plan's own per-arm time guard): controls rerun, the comparison re-evaluated
+MANIFEST_A3 = [("controls.a3", "py", "controls", 120), ("cmp.jp.acot_5.a3", "cmp", "jp:D0.acot_5:D.acot_5", CMP_TIMEOUT)]
 ALIAS = {f"{arm}.cyp_5": f"{arm}.cyp_5.a2" for arm in ("REF", "O", "D0", "D")}   # run directories of the renamed units
-AMENDMENT_DEV = 10.0   # disclosed: Amendment 2 inspection and edits (seconds of compute, rounded up)
-MANIFESTS = {"P": manifest(), "A2": MANIFEST_A2}
+AMENDMENT_DEV = 15.0   # disclosed: Amendments 2-3 inspection and edits (seconds of compute, rounded up)
+MANIFESTS = {"P": manifest(), "A2": MANIFEST_A2, "A3": MANIFEST_A3}
 STOPPING = ("cmp.backend.", "cmp.route.", "cmp.jp.", "cmp.prepared.", "cmp.repeat.")   # Amendment 1: a failed JP invariant stops too
 CALLER = ("cli", "write", "loaded", "loaded1")
 
@@ -123,7 +126,7 @@ def run_status(d):
 def precondition(unit, kind, target):
     if kind != "build" and exit_of("build") != "0":
         return "the build failed"
-    gates = [m[0] for m in MANIFESTS["P"] if m[1] == "gate"] + ["controls.a2", "declare"]
+    gates = [m[0] for m in MANIFESTS["P"] if m[1] == "gate"] + ["controls.a3", "declare"]
     if kind in CALLER and any(exit_of(g) != "0" for g in gates):
         return "a gate, the comparator controls or the declarations failed: stop before any caller run"
     if kind in CALLER and any(r["unit"].startswith(STOPPING) and r["exit"] == "1" and

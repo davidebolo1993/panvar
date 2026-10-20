@@ -64,6 +64,9 @@ IDENTITY_STATUS = re.compile(r"^(model_fingerprint|sha256_\w+|gfa|reference_path
                              r"boundary_bases_moved_to_context)$")
 CONFIG_STATUS = re.compile(r"^(max_\w+|\w+_limit_\w+|\w+_budget_(bytes|basis|scope)|\w+_budgeted_bytes|proposal_state_limit|"
                            r"representation_guard_bound_nats|union_cap_\w+|union_caps_scope|threads_requested)$")
+# Amendment 3: the plan declares different per-arm timeouts for D0 and D (ACOT 5x, every 30x cell); the wall-clock watchdog
+# never changes a completed result (compose_profile OPERATIONAL_OVERRIDES), and both sides must have completed (outcome check)
+JP_GUARDS = {"time_limit_seconds"}
 OBJECTIVE = ("score", "fragment_term", "exposure_term", "sequence_pair_prior", "numeric_error_bound", "fragments_with_mass",
              "fragments_total", "mismatch_band")
 
@@ -85,6 +88,8 @@ def load_v32(extra):
         # Amendment 2: the status echo of the declared JP setting (its value is checked in the settings table)
         if "junction" in cats and one and k == "repair_junction_proposals":
             return "junction"
+        if "junction" in cats and not one and k in JP_GUARDS:   # Amendment 3 (jp mode only)
+            return "guard"
         if "incumbent" in cats and ((one and INCUMBENT_ONE_SIDED.match(k)) or (not one and k in INCUMBENT_WORK)):
             return "incumbent"
         if "junction" in cats and one and JUNCTION_ONE_SIDED.match(k):
@@ -158,10 +163,10 @@ def jp_invariants(a, b):
         if os.path.exists(os.path.join(d, "call.sequence_locus.tsv")) and pred not in PREDICTIONS:
             bad.append(f"J2 sequence_locus prediction {pred!r} in {os.path.basename(d)}")
     for k in sorted(set(sa) | set(sb)):
-        if k != "repair_junction_proposals" and sa.get(k) != sb.get(k):
+        if k != "repair_junction_proposals" and k not in JP_GUARDS and sa.get(k) != sb.get(k):
             bad.append(f"J3 undeclared effective setting {k}: {sa.get(k)} vs {sb.get(k)}")
     for k in sorted(set(sta) | set(stb)):
-        if (IDENTITY_STATUS.match(k) or CONFIG_STATUS.match(k)) and sta.get(k) != stb.get(k):
+        if (IDENTITY_STATUS.match(k) or CONFIG_STATUS.match(k)) and k not in JP_GUARDS and sta.get(k) != stb.get(k):
             kind = "identity" if IDENTITY_STATUS.match(k) else "configured cap/budget"
             bad.append(f"J4 {kind} status key {k}: {sta.get(k)} vs {stb.get(k)}")
     return bad, eligible
@@ -202,9 +207,11 @@ def jp_objective(a, b):
 
 def jp(a, b, out):
     bad, eligible = jp_invariants(a, b)
-    rows = [("mode", "jp"), ("junction_eligible_blocks", eligible), ("invariants_J1_J4", "pass" if not bad else "FAIL")]
+    tl = (kv(os.path.join(a, "call.mosaic_status.tsv")).get("time_limit_seconds"), kv(os.path.join(b, "call.mosaic_status.tsv")).get("time_limit_seconds"))
+    rows = [("mode", "jp"), ("junction_eligible_blocks", eligible), ("time_limit_seconds_D0|D", f"{tl[0]}|{tl[1]}"),
+            ("invariants_J1_J4", "pass" if not bad else "FAIL")]
     if not bad and eligible == "0":
-        code = run_v32(a, b, out, "operational,profile,junction,checkpoints", "repair_junction_proposals")   # Amendment 2: checkpoints
+        code = run_v32(a, b, out, "operational,profile,junction,checkpoints", "repair_junction_proposals,time_limit_seconds")   # Amendment 2: checkpoints
         append(out, rows + [("identity_demanded", "yes (eligible 0)"), ("verdict", "PASS" if code == 0 else "FAIL")])
         print(open(out).read(), end="")
         return code
@@ -217,7 +224,7 @@ def jp(a, b, out):
         append(out, rows + [("problem", p) for p in bad] + [("verdict", "FAIL")])
         print(open(out).read(), end="")
         return 1
-    code = run_v32(a, b, out, "operational,profile,junction,checkpoints", "repair_junction_proposals")
+    code = run_v32(a, b, out, "operational,profile,junction,checkpoints", "repair_junction_proposals,time_limit_seconds")
     la, lb = kv(os.path.join(a, "call.sequence_locus.tsv")), kv(os.path.join(b, "call.sequence_locus.tsv"))
     rows += [("identity_demanded", "no (JP1.1 changes candidate generation; invariants J1-J5 passed)"),
              ("identity_observed", "yes" if code == 0 else "no")]
