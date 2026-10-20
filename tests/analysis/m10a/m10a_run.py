@@ -21,7 +21,7 @@ WT = os.path.abspath(os.path.join(HERE, "..", "..", ".."))
 BUILD = f"{WT}/build"
 OUT = m10a.OUT
 BUDGET = 2400
-PRE_FREEZE = 0.0
+PRE_FREEZE = 30.0   # disclosed: M10-A + Amendment 1 development runs (composer test, three control dry runs, JP pair audit), rounded up
 GIB6 = str(6 << 30)
 LOCI = {"c4": ("c4_5", "c4_30"), "cyp": ("cyp_5", "cyp_30"), "acot": ("acot_5", "acot_30")}
 TIMEOUT = {   # declared per arm and cell; the run's time limit is the timeout minus 20 s (an operational guard override)
@@ -30,6 +30,7 @@ TIMEOUT = {   # declared per arm and cell; the run's time limit is the timeout m
     "D0": {"c4_5": 90, "cyp_5": 90, "acot_5": 150, "c4_30": 150, "cyp_30": 150, "acot_30": 300},
     "D": {"c4_5": 90, "cyp_5": 90, "acot_5": 180, "c4_30": 180, "cyp_30": 180, "acot_30": 360},
 }
+CMP_TIMEOUT = 30   # Amendment 1: comparisons take seconds; their timeouts are reserved before any caller unit is admitted
 CMP = {"backend": ("REF", "O"), "route": ("O", "D0"), "jp": ("D0", "D"), "prepared": ("D", "P"), "repeat": ("D", "D.r")}
 
 
@@ -45,21 +46,22 @@ def manifest():
         for mode in ("backend", "route", "jp"):
             x, y = CMP[mode]
             if cell in TIMEOUT[x] and cell in TIMEOUT[y]:
-                m.append((f"cmp.{mode}.{cell}", "cmp", f"{mode}:{x}.{cell}:{y}.{cell}", 60))
+                m.append((f"cmp.{mode}.{cell}", "cmp", f"{mode}:{x}.{cell}:{y}.{cell}", CMP_TIMEOUT))
     for locus, (lo, hi) in LOCI.items():
         m.append((f"write.{locus}", "write", locus, 120 if locus == "acot" else 60))
         m.append((f"loaded.{locus}", "loaded", locus, TIMEOUT["D"][lo] + TIMEOUT["D"][hi]))
         for cell in (lo, hi):
-            m.append((f"cmp.prepared.{cell}", "cmp", f"prepared:D.{cell}:loaded.{locus}/{cell}", 60))
+            m.append((f"cmp.prepared.{cell}", "cmp", f"prepared:D.{cell}:loaded.{locus}/{cell}", CMP_TIMEOUT))
     m += [("loaded.acot.single30", "loaded1", "acot", TIMEOUT["D"]["acot_30"]),   # conditional (DESIGN.md 4.4)
-          ("cmp.prepared.acot_30.single", "cmp", "prepared:D.acot_30:loaded.acot.single30/acot_30", 60),
+          ("cmp.prepared.acot_30.single", "cmp", "prepared:D.acot_30:loaded.acot.single30/acot_30", CMP_TIMEOUT),
           ("D.r.acot_30", "cli", "D:acot_30", TIMEOUT["D"]["acot_30"]),
-          ("cmp.repeat.acot_30", "cmp", "repeat:D.acot_30:D.r.acot_30", 60), ("summary", "py", "summary", 60)]
+          ("cmp.repeat.acot_30", "cmp", "repeat:D.acot_30:D.r.acot_30", CMP_TIMEOUT), ("summary", "py", "summary", 60)]
     return m
 
 
 MANIFESTS = {"P": manifest()}
-STOPPING = ("cmp.backend.", "cmp.route.", "cmp.prepared.", "cmp.repeat.")
+STOPPING = ("cmp.backend.", "cmp.route.", "cmp.jp.", "cmp.prepared.", "cmp.repeat.")   # Amendment 1: a failed JP invariant stops too
+CALLER = ("cli", "write", "loaded", "loaded1")
 
 
 def ledger_rows():
@@ -112,9 +114,9 @@ def precondition(unit, kind, target):
     if kind != "build" and exit_of("build") != "0":
         return "the build failed"
     gates = [m[0] for m in MANIFESTS["P"] if m[1] == "gate"] + ["controls", "declare"]
-    if kind in ("cli", "write", "loaded", "loaded1") and any(exit_of(g) != "0" for g in gates):
+    if kind in CALLER and any(exit_of(g) != "0" for g in gates):
         return "a gate, the comparator controls or the declarations failed: stop before any caller run"
-    if kind in ("cli", "write", "loaded", "loaded1") and any(r["unit"].startswith(STOPPING) and r["exit"] == "1" for r in ledger_rows()):
+    if kind in CALLER and any(r["unit"].startswith(STOPPING) and r["exit"] == "1" for r in ledger_rows()):
         return "an equivalence comparison failed: stop (an amendment is required before any further caller run)"
     if kind == "loaded" and exit_of(f"write.{target}") != "0":
         return "the index was not written"
@@ -204,8 +206,11 @@ def run_unit(unit):
         print(f"{unit}: NOT RUN ({why})")
         return 0
     used = spent()
-    if used + timeout > BUDGET:
-        record(unit, rev, dirty, timeout, 0.0, 0.0, "not_run", 0, f"NOT RUN: {used:.1f} + {timeout} > {BUDGET} s")
+    # Amendment 1: before admitting caller work, reserve the declared timeouts of every comparison and the summary still to run
+    reserve = sum(m[3] for m in MANIFESTS[part] if m[0] not in done() and m[0] != unit and (m[1] == "cmp" or m[0] == "summary")) \
+        if kind in CALLER else 0
+    if used + timeout + reserve > BUDGET:
+        record(unit, rev, dirty, timeout, 0.0, 0.0, "not_run", 0, f"NOT RUN: {used:.1f} + {timeout} + reserve {reserve} > {BUDGET} s")
         print(f"{unit}: NOT RUN (budget)")
         return 0
     d = f"{OUT}/runs/{unit}"

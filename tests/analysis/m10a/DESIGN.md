@@ -143,3 +143,77 @@ stated gaps.
 - behaviour on other loci;
 - concurrent in-process use;
 - any default.
+
+## Amendment 1 (prospective preflight; declared before any campaign unit ran)
+
+**Defect (Sol's review).** Sol built two copies of S2-L `combined.c4_5`, with `junction_eligible_blocks 1` and
+`mismatch_band` 6 → 7. The underlying comparator rejected the settings difference, but `jp` overrode it with
+`JP_ATTRIBUTABLE`, exit 0. Reproducer: `/private/tmp/panvar-m10a-review.788IMa/`, copied into the `controls` unit.
+
+**Corrected `jp`** (`m10a_compare.py`). JP eligibility may change candidates, trajectory, predictions and their
+annotations. It never waives the invariants below, which are checked in order; any violation is FAIL:
+- **J1** `junction_eligible_blocks` is a nonnegative integer. The off arm has no JP rows or setting. The on arm runs
+  `experimental_v1`.
+- **J2** Required outputs are present, non-empty and have a TSV header in both arms: settings, status, scores, candidates,
+  rounds, the sequence locus, blocks, alternatives and haplotypes, plus `sequence_compound.tsv` when the annotation is on.
+  The prediction is one of PREDICTION, PROVISIONAL or NO_PREDICTION.
+- **J3** Effective settings have equal key sets and values, except `repair_junction_proposals`. This covers every
+  scientific setting and every configured cap in the settings table.
+- **J4** Protected status keys are equal:
+  - input, model and library identity: `model_fingerprint`, `sha256_*`, `gfa`, `reference_path`, locus geometry and
+    transition digests, `library_provenance`, `curation_digest`;
+  - configured caps and budgets: `max_*`, `*_limit_*`, `*_budget_*`, `*_budgeted_bytes`, `proposal_state_limit`,
+    `representation_guard_bound_nats`, `union_cap*`, `threads_requested`.
+- **Eligible 0:** full s2l v3.2 identity, as before.
+- **Eligible > 0 — J5:** every hypothesis scored in both arms has **exactly equal printed** objective components (`score`,
+  `fragment_term`, `exposure_term`, `sequence_pair_prior`, `numeric_error_bound`, `fragments_with_mass`,
+  `fragments_total`, `mismatch_band`), and its labelling's `exact_path_prior` is equal too.
+  - **Matching.** Hypotheses are matched by **labelling**, the unordered pair of allele tuples, never by candidate or group
+    id.
+  - **Excluded.** `candidate_set_probability` changes legitimately with pool membership.
+  - **Non-vacuous.** At least one common hypothesis is required.
+  - **Why exact equality.** It was audited on three real saved JP off/on pairs (M9-H L4, L2, Z1): 89,442, 93,513 and
+    84,458 common labellings, all components identical as printed; only `candidate_set_probability` differed.
+
+  Only after J1–J5 pass is the verdict `JP_ATTRIBUTABLE`.
+
+**Corrected and added controls** (18, unit `controls`). Each must give its expected exit **and** contain its intended
+reason. The `score` control now edits the column named `score`; it previously edited the last column,
+`carries_called_genotype`.
+- **Positive controls:**
+  - C1, C2, C7, C9 and C10 as before;
+  - **J1:** the real saved JP off/on pair M9-H L4 (JP1.1 changed the search; 89,442 common hypotheses) gives
+    JP_ATTRIBUTABLE;
+  - **J2:** an eligible-0 copy gives identity.
+- **Negative controls:**
+  - C3: the score column altered;
+  - C8: an undeclared setting;
+  - **N0:** Sol's reproducer. It fails on J3, and also on J1, because its B has no JP setting;
+  - **N1:** real pair with an unrelated scientific setting changed (J3);
+  - **N2:** an undeclared cap changed in settings (J3);
+  - **N3:** a configured cap changed in status only (J4);
+  - **N4:** input identity changed (J4);
+  - **N5:** a common hypothesis's `fragment_term` corrupted (J5);
+  - **N6:** a required output missing (J2);
+  - **N7:** eligible 0 with a changed score (identity);
+  - **N8:** eligibility `-1` (J1).
+- **Development dry run:** 18/18 in 5.5 s, each negative with exactly its intended problem.
+
+**Runner:**
+- A **failed `jp` comparison stops further caller runs**, like the other equivalence comparisons.
+- `JP_ATTRIBUTABLE` (exit 0) and resource `UNRESOLVED` (exit 2) never stop.
+- Comparison timeouts are 30 s.
+- **Before admitting any caller unit**, the declared timeouts of every comparison and the summary still to run are reserved:
+  spent + unit timeout + reserve ≤ 2,400 s.
+- Disclosed development time, 30 s, counts against the budget.
+
+**Summary.** Adds the driver phase tables (index write/verify, load, each sample, cleanup, and current and lifetime peak
+footprint), the batch verdicts and a copy of the ledger.
+
+**Reporting of index reuse** keeps three things separate:
+1. cold-vs-indexed scientific equivalence, per sample;
+2. whether the **sequential** 5×-then-30× process completed;
+3. the conditional fresh-process fallback (`loaded.acot.single30`). It can establish single-sample loaded-index equivalence,
+   but never that the sequential batch completed.
+
+Each locus's two workloads are two coverages of **one** donor. They are not validation across biological samples.

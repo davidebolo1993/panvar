@@ -96,48 +96,111 @@ def relocated(src, dst, edit=None):
 
 def add_status(rows):
     def f(d):
-        with open(os.path.join(d, "call.mosaic_status.tsv"), "a") as s:
-            s.write("".join(f"{k}\t{v}\n" for k, v in rows))
+        with open(os.path.join(d, "call.mosaic_status.tsv"), "a") as st:
+            st.write("".join(f"{k}\t{v}\n" for k, v in rows))
+    return f
+
+
+def set_kv(fname, key, value):   # replace one key's value in a key<TAB>value[<TAB>source] file (settings or status)
+    def f(d):
+        p = os.path.join(d, fname)
+        lines = open(p).read().split("\n")
+        hit = 0
+        for i, line in enumerate(lines):
+            x = line.split("\t")
+            if x[0] == key:
+                x[1] = value
+                lines[i] = "\t".join(x)
+                hit += 1
+        assert hit == 1, (fname, key, hit)
+        open(p, "w").write("\n".join(lines))
+    return f
+
+
+def set_column(fname, column, value, row_pred=lambda r: True):   # Amendment 1: alter a named column, never by position
+    def f(d):
+        p = os.path.join(d, fname)
+        lines = open(p).read().split("\n")
+        head = next(i for i, l in enumerate(lines) if l and not l.startswith("#"))
+        cols = lines[head].split("\t")
+        j = cols.index(column)
+        for i in range(head + 1, len(lines)):
+            x = lines[i].split("\t")
+            if len(x) == len(cols) and row_pred(dict(zip(cols, x))):
+                x[j] = value(x[j])
+                lines[i] = "\t".join(x)
+                open(p, "w").write("\n".join(lines))
+                return
+        raise AssertionError(f"no row of {fname} matched")
     return f
 
 
 def bump_score(d):
-    p = os.path.join(d, "call.mosaic_scores.tsv")
-    lines = open(p).read().split("\n")
-    f = lines[1].split("\t")
-    f[-1] = f[-1] + "1" if f[-1] else "1"
-    lines[1] = "\t".join(f)
-    open(p, "w").write("\n".join(lines))
+    set_column("call.mosaic_scores.tsv", "score", lambda v: repr(float(v) - 1.0))(d)
+
+
+def common_group(off, on):
+    """The sequence_candidate_id, in the JP-on run, of a labelling that both runs score (matched by labelling)."""
+    labs = {tuple(sorted((r["hap1_alleles"], r["hap2_alleles"]))) for r in T(f"{off}/call.mosaic_candidates.tsv")}
+    return next(r["sequence_candidate_id"] for r in T(f"{on}/call.mosaic_candidates.tsv")
+                if tuple(sorted((r["hap1_alleles"], r["hap2_alleles"]))) in labs)
 
 
 def controls(out):
-    # S2-L predates the annotation: a relocated copy with a header-only annotation file stands in for an annotated run
-    base = relocated(f"{S2L}/combined.c4_5", f"{out}/base",
-                     lambda d: open(os.path.join(d, "call.sequence_compound.tsv"), "w").write("interval\tstatus\n"))
-    jp_rows = [("junction_eligible_blocks", "0"), ("junction_invocations", "0")]
-    settings_jp = lambda d: open(os.path.join(d, "call.settings.tsv"), "a").write("repair_junction_proposals\texperimental_v1\tprofile x\n")
+    import tempfile
+    tmp = tempfile.mkdtemp(prefix="copies.", dir=out)   # relocated copies; removed at the end (only the verdicts are kept)
+    s2l_c4 = f"{S2L}/combined.c4_5"
     s2a = f"{R}/s2a_early_incumbent_20261018/runs"
     p1 = f"{R}/p1_consolidation_20261017/runs"
-    cases = [
-        ("C1 route: S2-L control vs combined (C4 5x)", "route", f"{S2L}/control.c4_5", f"{S2L}/combined.c4_5", 0),
-        ("C2 route: S2-A early incumbent off vs on (C4 5x)", "route", f"{s2a}/c4.off", f"{s2a}/c4.on", 0),
-        ("C3 route: one score altered", "route", f"{S2L}/combined.c4_5", relocated(f"{S2L}/combined.c4_5", f"{out}/c3", bump_score), 1),
-        ("C4 jp: eligible 0, otherwise identical", "jp", base, relocated(base, f"{out}/c4", lambda d: (add_status(jp_rows)(d), settings_jp(d))), 0),
-        ("C5 jp: eligible 0 and a score altered", "jp", base,
-         relocated(base, f"{out}/c5", lambda d: (add_status(jp_rows)(d), settings_jp(d), bump_score(d))), 1),
-        ("C6 jp: eligible 1 and a score altered (JP-attributable)", "jp", base,
-         relocated(base, f"{out}/c6", lambda d: (add_status([("junction_eligible_blocks", "1")])(d), settings_jp(d), bump_score(d))), 0),
-        ("C7 prepared: prepared rows added", "prepared", base,
-         relocated(base, f"{out}/c7", add_status([("prepared_locus", "1"), ("prepared_locus_origin", "loaded")])), 0),
-        ("C8 prepared: an undeclared setting changed", "prepared", base,
-         relocated(base, f"{out}/c8", lambda d: open(os.path.join(d, "call.settings.tsv"), "a").write("mismatch_band\t7\tprofile x\n")), 1),
-        ("C9 backend: P1 opt vs reference (C4 5x; P1 PASS)", "backend", f"{p1}/o.c4_5", f"{p1}/r.c4_5", 0),
-        ("C10 repeat: S2-L ACOT 30x combined vs its repeat", "repeat", f"{S2L}/combined.acot_30", f"{S2L}/combined.acot_30.repeat", 0),
+    m9h = f"{R}/m9h_jp11_validation_20261020/runs"
+    off, on = f"{m9h}/call.off.L4", f"{m9h}/call.on.L4"   # a real saved JP off/on pair (M9-H L4: JP1.1 changed the prediction)
+    sol = f"{out}/sol_reproducer"   # Sol's reproducer, kept with the unit
+    shutil.copytree("/private/tmp/panvar-m10a-review.788IMa", sol)
+    jp_on = lambda d: open(os.path.join(d, "call.settings.tsv"), "a").write("repair_junction_proposals\texperimental_v1\tprofile x\n")
+    eligible0 = lambda d: (add_status([("junction_eligible_blocks", "0"), ("junction_invocations", "0")])(d), jp_on(d))
+    gid = common_group(off, on)
+    n = iter(range(1000))
+    cp = lambda src, edit=None: relocated(src, f"{tmp}/{next(n)}", edit)  # noqa: E731
+    cases = [   # label, mode, A, B, expected exit, substring the comparison output must contain (its intended reason)
+        ("C1 route: S2-L control vs combined (C4 5x)", "route", f"{S2L}/control.c4_5", s2l_c4, 0, "verdict\tPASS"),
+        ("C2 route: S2-A early incumbent off vs on (C4 5x)", "route", f"{s2a}/c4.off", f"{s2a}/c4.on", 0, "verdict\tPASS"),
+        ("C3 route: the score column altered", "route", s2l_c4, cp(s2l_c4, bump_score), 1, "call.mosaic_scores.tsv differs"),
+        ("C7 prepared: prepared rows added", "prepared", s2l_c4,
+         cp(s2l_c4, add_status([("prepared_locus", "1"), ("prepared_locus_origin", "loaded")])), 0, "verdict\tPASS"),
+        ("C8 prepared: an undeclared setting changed", "prepared", s2l_c4, cp(s2l_c4, set_kv("call.settings.tsv", "mismatch_band", "7")), 1,
+         "effective settings differ outside the declared settings: mismatch_band"),
+        ("C9 backend: P1 opt vs reference (C4 5x; P1 PASS)", "backend", f"{p1}/o.c4_5", f"{p1}/r.c4_5", 0, "verdict\tPASS"),
+        ("C10 repeat: S2-L ACOT 30x combined vs its repeat", "repeat", f"{S2L}/combined.acot_30", f"{S2L}/combined.acot_30.repeat", 0, "verdict\tPASS"),
+        ("J1 jp: real saved JP off/on pair (M9-H L4)", "jp", off, on, 0, "verdict\tJP_ATTRIBUTABLE"),
+        ("J2 jp: eligible 0, otherwise identical", "jp", s2l_c4, cp(s2l_c4, eligible0), 0, "identity_demanded\tyes"),
+        ("N0 jp: Sol's reproducer (eligible 1, mismatch_band 6 -> 7)", "jp", f"{sol}/A", f"{sol}/B", 1,
+         "J3 undeclared effective setting mismatch_band"),
+        ("N1 jp: real pair, eligible, an unrelated scientific setting changed", "jp", off, cp(on, set_kv("call.settings.tsv", "mismatch_band", "7")), 1,
+         "J3 undeclared effective setting mismatch_band"),
+        ("N2 jp: real pair, eligible, an undeclared cap changed (settings)", "jp", off,
+         cp(on, set_kv("call.settings.tsv", "max_state_classes", "600000001")), 1, "J3 undeclared effective setting max_state_classes"),
+        ("N3 jp: real pair, eligible, a configured cap changed (status only)", "jp", off,
+         cp(on, set_kv("call.mosaic_status.tsv", "max_physical_origins", "1")), 1, "J4 configured cap/budget status key max_physical_origins"),
+        ("N4 jp: real pair, eligible, input identity changed", "jp", off,
+         cp(on, set_kv("call.mosaic_status.tsv", "sha256_reads1", "0" * 64)), 1, "J4 identity status key sha256_reads1"),
+        ("N5 jp: real pair, eligible, a common hypothesis's objective corrupted", "jp", off,
+         cp(on, set_column("call.mosaic_scores.tsv", "fragment_term", lambda v: repr(float(v) - 0.5),
+                           lambda r: r["sequence_candidate_id"] == gid)), 1, "J5 objective of labelling"),
+        ("N6 jp: real pair, eligible, a required output missing", "jp", off,
+         cp(on, lambda d: os.remove(os.path.join(d, "call.sequence_blocks.tsv"))), 1, "J2 missing or empty required output"),
+        ("N7 jp: eligible 0 with a changed score", "jp", s2l_c4, cp(s2l_c4, lambda d: (eligible0(d), bump_score(d))), 1,
+         "call.mosaic_scores.tsv differs"),
+        ("N8 jp: real pair, eligibility malformed (-1)", "jp", off, cp(on, set_kv("call.mosaic_status.tsv", "junction_eligible_blocks", "-1")), 1,
+         "J1 junction_eligible_blocks is not a nonnegative integer"),
     ]
     rows = []
-    for label, mode, a, b, want in cases:
-        got = compare(mode, a, b, f"{out}/{label.split()[0]}.tsv")
-        rows.append(dict(control=label, mode=mode, expected_exit=want, exit=got, ok=got == want))
+    for label, mode, a, b, want, reason in cases:
+        res = f"{out}/{label.split()[0]}.tsv"
+        got = compare(mode, a, b, res)
+        text = open(res).read() if os.path.exists(res) else ""
+        rows.append(dict(control=label, mode=mode, expected_exit=want, exit=got, intended_reason=reason.replace("\t", " "),
+                         reason_found=reason in text, ok=got == want and reason in text))
+    shutil.rmtree(tmp)
     write(out, "controls", rows)
     print(open(f"{out}/controls.tsv").read())
     return 0 if all(r["ok"] for r in rows) else 1
@@ -159,11 +222,31 @@ def summary(out):
                              prepared_locus=st.get("prepared_locus_origin", "cold"), model_fingerprint=st.get("model_fingerprint")))
         if u.startswith("cmp.") and os.path.exists(f"{d}/compare.tsv"):
             kv = KV(f"{d}/compare.tsv")
-            cmps.append(dict(comparison=u, verdict=kv.get("verdict"), science_identical=kv.get("science_identical", "-"),
-                             junction_eligible_blocks=kv.get("junction_eligible_blocks", "-")))
+            cmps.append(dict(comparison=u, verdict=kv.get("verdict"), science_identical=kv.get("science_identical", "-")[:200],
+                             junction_eligible_blocks=kv.get("junction_eligible_blocks", "-"), common_hypotheses=kv.get("common_hypotheses", "-"),
+                             identity_observed=kv.get("identity_observed", "-"), prediction=kv.get("prediction_D0|D", "-"),
+                             representative_hap1=kv.get("representative_hap1_sha256_D0|D", "-"),
+                             representative_hap2=kv.get("representative_hap2_sha256_D0|D", "-"),
+                             p1_row=kv.get("p1_compare_row", "-")[:200], problems=";".join(v for k, v in
+                                 [tuple(l.split("\t", 1)) for l in open(f"{d}/compare.tsv").read().splitlines() if "\t" in l] if k == "problem")[:300] or "-"))
+    # index construction / load cost and sequential memory (driver phase tables; Amendment 1 section 4)
+    index = []
+    for u in sorted(os.listdir(f"{OUT}/runs")):
+        ph = T(f"{OUT}/runs/{u}/driver.phases.tsv")
+        br = KV(f"{OUT}/runs/{u}/driver.batch_resource.tsv")
+        for r in ph:
+            index.append(dict(unit=u, phase=r["phase"], sample=os.path.basename(os.path.dirname(r["sample"])) if r["sample"] != "-" else "-",
+                              seconds=r["seconds"], exit=r["exit"], current_bytes=r["current_bytes"], lifetime_peak_bytes=r["lifetime_peak_bytes"],
+                              peak_increase_bytes=r["peak_increase_bytes"], live_allocation_bytes=r["live_allocation_bytes"],
+                              note=r["note"][:160], batch_verdict=br.get("batch_resource_verdict", "-"),
+                              samples_completed=f"{br.get('samples_completed', '-')}/{br.get('samples_requested', '-')}"))
+    ledger = T(f"{OUT}/ledger.tsv")
     write(out, "runs", runs)
     write(out, "comparisons", cmps)
-    print(open(f"{out}/runs.tsv").read() + "\n" + open(f"{out}/comparisons.tsv").read())
+    write(out, "index", index)
+    write(out, "ledger_copy", ledger)
+    for n in ("runs", "comparisons", "index"):
+        print(f"## {n}\n" + open(f"{out}/{n}.tsv").read())
     return 0
 
 

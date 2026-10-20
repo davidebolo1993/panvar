@@ -7,9 +7,21 @@ nothing scientific is relaxed. Modes and what they establish:
                             SCIENCE list predates                                     -> computational-backend equivalence
   route     O vs D0         s2l_compare_v3.2, categories operational,profile,route,admission,checkpoints + 'incumbent'
                             (declared settings: the three retained-route keys)      -> retained-route equivalence
-  jp        D0 vs D         s2l_compare_v3.2, categories operational,profile + 'junction' (declared setting
-                            repair_junction_proposals). IDENTITY IS DEMANDED ONLY IF D reports junction_eligible_blocks 0;
-                            otherwise the verdict is JP_ATTRIBUTABLE and the differences are reported, not failed
+  jp        D0 vs D         Amendment 1 (prospective; Sol's reproducer): invariants that JP eligibility NEVER waives, then
+                            identity or attribution. Always, in this order (any violation -> FAIL):
+                              J1 junction_eligible_blocks in D is a nonnegative integer; D0 has no junction_* rows and JP
+                                 off; D has JP experimental_v1
+                              J2 required outputs present and well-formed in both arms (REQUIRED, plus sequence_compound.tsv
+                                 when compound_annotation is contract_v2); sequence_locus prediction in PREDICTIONS
+                              J3 effective settings: equal key sets and values except repair_junction_proposals
+                              J4 protected status keys equal: input/model/library identity (IDENTITY_STATUS) and configured
+                                 caps and budgets (CONFIG_STATUS)
+                            eligible 0: full s2l_compare_v3.2 identity (categories operational,profile,junction)
+                            eligible > 0: J5 every hypothesis scored in both arms -- matched by its labelling (the unordered
+                                 pair of allele tuples), never by candidate or group id -- has EXACTLY equal printed objective
+                                 components (OBJECTIVE, and the labelling's exact_path_prior); at least one common
+                                 hypothesis. candidate_set_probability is excluded (it depends on pool membership).
+                                 Only then JP_ATTRIBUTABLE; v3.2 identity is run and reported (not failed)
   prepared  D vs P          s2l_compare_v3.2, categories operational,profile + 'prepared'; no declared setting
                                                                                     -> persisted-index route equivalence
   repeat    D vs D (again)  s2l_compare_v3.2, categories operational,profile,checkpoints  -> determinism
@@ -43,6 +55,17 @@ JUNCTION_ONE_SIDED = re.compile(r"^junction_\w+$")
 PREPARED_ONE_SIDED = re.compile(r"^(prepared_locus\w*|seconds_detail_model_\w+)$")
 SEQUENCE_FILES = re.compile(r"^call\.(sequence_\w+\.(tsv|fa)|representation_intervals\.tsv)$")
 SKIP_EXTRA = re.compile(r"^(args\.txt|driver\..*)$")
+# Amendment 1 (JP invariants)
+REQUIRED = ("settings.tsv", "mosaic_status.tsv", "mosaic_scores.tsv", "mosaic_candidates.tsv", "repair_rounds.tsv", "sequence_locus.tsv",
+            "sequence_blocks.tsv", "sequence_alternatives.tsv", "sequence_haplotypes.tsv")
+PREDICTIONS = {"PREDICTION", "PROVISIONAL", "NO_PREDICTION"}
+IDENTITY_STATUS = re.compile(r"^(model_fingerprint|sha256_\w+|gfa|reference_path|locus_geometry_\w+|transition_vector_sha256|"
+                             r"transition_boundaries|transition_zero_distance_\w+|library_provenance|curation_digest|"
+                             r"boundary_bases_moved_to_context)$")
+CONFIG_STATUS = re.compile(r"^(max_\w+|\w+_limit_\w+|\w+_budget_(bytes|basis|scope)|\w+_budgeted_bytes|proposal_state_limit|"
+                           r"representation_guard_bound_nats|union_cap_\w+|union_caps_scope|threads_requested)$")
+OBJECTIVE = ("score", "fragment_term", "exposure_term", "sequence_pair_prior", "numeric_error_bound", "fragments_with_mass",
+             "fragments_total", "mismatch_band")
 
 
 def load_v32(extra):
@@ -95,6 +118,111 @@ def append(out, rows):
             f.write(f"{k}\t{v}\n")
 
 
+def table(p):
+    import csv
+    return list(csv.DictReader((l for l in open(p) if not l.startswith("#")), delimiter="\t"))
+
+
+def settings(d):
+    return {k: v.split("\t")[0] for k, v in kv(os.path.join(d, "call.settings.tsv")).items() if k != "key"}
+
+
+def jp_invariants(a, b):
+    """J1-J4: (problems, eligible). Problems are 'J<n> reason' strings; an empty list means every invariant holds."""
+    bad = []
+    sta, stb = kv(os.path.join(a, "call.mosaic_status.tsv")), kv(os.path.join(b, "call.mosaic_status.tsv"))
+    sa, sb = settings(a), settings(b)
+    eligible = stb.get("junction_eligible_blocks", "missing")
+    if not re.fullmatch(r"[0-9]+", eligible):
+        bad.append(f"J1 junction_eligible_blocks is not a nonnegative integer: {eligible!r}")
+    if any(k.startswith("junction_") for k in sta) or sa.get("repair_junction_proposals", "off") != "off":
+        bad.append("J1 the JP-off arm carries JP rows or settings")
+    if sb.get("repair_junction_proposals") != "experimental_v1":
+        bad.append("J1 the JP-on arm does not run repair_junction_proposals experimental_v1")
+    for d, st in ((a, sa), (b, sb)):
+        need = list(REQUIRED) + (["sequence_compound.tsv"] if st.get("compound_annotation") == "contract_v2" else [])
+        for f in need:
+            p = os.path.join(d, "call." + f)
+            if not os.path.exists(p) or os.path.getsize(p) == 0:
+                bad.append(f"J2 missing or empty required output {os.path.basename(d)}/call.{f}")
+            elif f not in ("settings.tsv", "mosaic_status.tsv", "sequence_locus.tsv") and not any(
+                    "\t" in l and not l.startswith("#") for l in open(p, errors="replace").read().split("\n")[:50]):
+                bad.append(f"J2 malformed required output {os.path.basename(d)}/call.{f} (no TSV header)")
+        pred = kv(os.path.join(d, "call.sequence_locus.tsv")).get("prediction")
+        if os.path.exists(os.path.join(d, "call.sequence_locus.tsv")) and pred not in PREDICTIONS:
+            bad.append(f"J2 sequence_locus prediction {pred!r} in {os.path.basename(d)}")
+    for k in sorted(set(sa) | set(sb)):
+        if k != "repair_junction_proposals" and sa.get(k) != sb.get(k):
+            bad.append(f"J3 undeclared effective setting {k}: {sa.get(k)} vs {sb.get(k)}")
+    for k in sorted(set(sta) | set(stb)):
+        if (IDENTITY_STATUS.match(k) or CONFIG_STATUS.match(k)) and sta.get(k) != stb.get(k):
+            kind = "identity" if IDENTITY_STATUS.match(k) else "configured cap/budget"
+            bad.append(f"J4 {kind} status key {k}: {sta.get(k)} vs {stb.get(k)}")
+    return bad, eligible
+
+
+def jp_objective(a, b):
+    """J5: (problems, common hypotheses). Matched by labelling, never by id; exact printed equality."""
+    def load(d):
+        scores = {r["sequence_candidate_id"]: r for r in table(os.path.join(d, "call.mosaic_scores.tsv"))}
+        labs = {}
+        for r in table(os.path.join(d, "call.mosaic_candidates.tsv")):
+            labs.setdefault(tuple(sorted((r["hap1_alleles"], r["hap2_alleles"]))), []).append(r)
+        return scores, labs
+    (sa, la), (sb, lb) = load(a), load(b)
+    common = set(la) & set(lb)
+    bad = []
+    for k in sorted(common):
+        prior_a = {r["exact_path_prior"] for r in la[k]}
+        prior_b = {r["exact_path_prior"] for r in lb[k]}
+        if prior_a != prior_b:
+            bad.append(f"J5 exact_path_prior of labelling {k[0][:40]}|{k[1][:40]}: {sorted(prior_a)} vs {sorted(prior_b)}")
+        rows_a = [sa[r["sequence_candidate_id"]] for r in la[k] if r["sequence_candidate_id"] in sa]
+        rows_b = [sb[r["sequence_candidate_id"]] for r in lb[k] if r["sequence_candidate_id"] in sb]
+        if not rows_a or not rows_b:
+            bad.append(f"J5 labelling {k[0][:40]}|{k[1][:40]} has no score row in one arm")
+            continue
+        va = {tuple(r[c] for c in OBJECTIVE) for r in rows_a}
+        vb = {tuple(r[c] for c in OBJECTIVE) for r in rows_b}
+        if va != vb or len(va) != 1:
+            bad.append(f"J5 objective of labelling {k[0][:40]}|{k[1][:40]}: {sorted(va)[:1]} vs {sorted(vb)[:1]}")
+        if len(bad) > 20:
+            bad.append("J5 ... (truncated after 20)")
+            break
+    if not common:
+        bad.append("J5 no hypothesis is scored in both arms: the objective check would be vacuous")
+    return bad, len(common)
+
+
+def jp(a, b, out):
+    bad, eligible = jp_invariants(a, b)
+    rows = [("mode", "jp"), ("junction_eligible_blocks", eligible), ("invariants_J1_J4", "pass" if not bad else "FAIL")]
+    if not bad and eligible == "0":
+        code = run_v32(a, b, out, "operational,profile,junction", "repair_junction_proposals")
+        append(out, rows + [("identity_demanded", "yes (eligible 0)"), ("verdict", "PASS" if code == 0 else "FAIL")])
+        print(open(out).read(), end="")
+        return code
+    if not bad:
+        obj, common = jp_objective(a, b)
+        rows += [("common_hypotheses", common), ("objective_J5", "pass" if not obj else "FAIL")]
+        bad += obj
+    if bad:
+        open(out, "w").write("key\tvalue\n")
+        append(out, rows + [("problem", p) for p in bad] + [("verdict", "FAIL")])
+        print(open(out).read(), end="")
+        return 1
+    code = run_v32(a, b, out, "operational,profile,junction", "repair_junction_proposals")
+    la, lb = kv(os.path.join(a, "call.sequence_locus.tsv")), kv(os.path.join(b, "call.sequence_locus.tsv"))
+    rows += [("identity_demanded", "no (JP1.1 changes candidate generation; invariants J1-J5 passed)"),
+             ("identity_observed", "yes" if code == 0 else "no")]
+    for k in ("prediction", "sequence_status", "representative_hap1_sha256", "representative_hap2_sha256"):
+        rows.append((f"{k}_D0|D", f"{la.get(k, 'NA')}|{lb.get(k, 'NA')}"))
+    rows.append(("verdict", "JP_ATTRIBUTABLE"))
+    append(out, rows)
+    print(open(out).read(), end="")
+    return 0
+
+
 def main():
     mode, a, b, out = sys.argv[1], os.path.abspath(sys.argv[2]), os.path.abspath(sys.argv[3]), sys.argv[4]
     (oa, ca), (ob, cb) = outcome(a), outcome(b)
@@ -119,24 +247,7 @@ def main():
     elif mode == "repeat":
         code = run_v32(a, b, out, "operational,profile,checkpoints", "")
     elif mode == "jp":
-        eligible = kv(os.path.join(b, "call.mosaic_status.tsv")).get("junction_eligible_blocks", "missing")
-        code = run_v32(a, b, out, "operational,profile,junction", "repair_junction_proposals")
-        if eligible == "0":
-            append(out, [("junction_eligible_blocks", "0"), ("identity_demanded", "yes"), ("verdict", "PASS" if code == 0 else "FAIL")])
-            print(f"jp: eligible 0, identity demanded: {'PASS' if code == 0 else 'FAIL'}")
-            return code
-        la, lb = kv(os.path.join(a, "call.sequence_locus.tsv")), kv(os.path.join(b, "call.sequence_locus.tsv"))
-        rows = [("junction_eligible_blocks", eligible), ("identity_demanded", "no (JP1.1 changes candidate generation)"),
-                ("identity_observed", "yes" if code == 0 else "no")]
-        for k in ("prediction", "sequence_status", "representative_hap1_sha256", "representative_hap2_sha256"):
-            rows.append((f"{k}_D0|D", f"{la.get(k, 'NA')}|{lb.get(k, 'NA')}"))
-        contract = eligible != "missing" and all(os.path.exists(os.path.join(d, f"call.{f}")) for d in (a, b)
-                                                 for f in ("sequence_locus.tsv", "sequence_blocks.tsv", "sequence_compound.tsv"))
-        rows.append(("output_contract_valid", "yes" if contract else "NO"))
-        rows.append(("verdict", "JP_ATTRIBUTABLE" if contract else "FAIL"))
-        append(out, rows)
-        print("\n".join(f"{k}\t{v}" for k, v in rows))
-        return 0 if contract else 1
+        return jp(a, b, out)
     else:
         raise SystemExit(f"unknown mode {mode}")
     append(out, [("verdict", "PASS" if code == 0 else "FAIL")])
