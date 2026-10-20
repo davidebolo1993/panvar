@@ -105,22 +105,29 @@ def manifest(out):
             s = KV(sp)
             run = s.get("run", "")
             bp = sp.replace("summary.tsv", "blocks.tsv")
+            if s.get("run_no_call") == "true":   # Amendment 1: a no-call run stays visible (incomplete stratum), never "missing"
+                rows.append(dict(stratum=stratum, locus=locus or "-", summary=sp, run=run, status="NO_CALL",
+                                 reason=f"run emitted no block genotype ({s.get('status', '-')})", donor=s.get("donor", "-"),
+                                 scheme=s.get("scheme", "-"), model_fingerprint=s.get("model_fingerprint", "-"), run_status=s.get("status", "-")))
+                continue
             if not run or not os.path.exists(bp) or not os.path.exists(run + ".block_genotypes.tsv"):
-                rows.append(dict(stratum=stratum, summary=sp, status="EXCLUDED", reason="no run block table or evaluator block table"))
+                why = "no run prefix in the summary" if not run else "no evaluator block table" if not os.path.exists(bp) else "no run block table"
+                rows.append(dict(stratum=stratum, summary=sp, status="EXCLUDED", reason=why))
                 continue
             loc = locus or ("C4" if "/call.c4_" in run else "CYP2D6")
             st = KV(run + ".mosaic_status.tsv")
             rows.append(dict(stratum=stratum, locus=loc, summary=sp, blocks=bp, run=run, status="INCLUDED", reason="-",
                              donor=s.get("donor", "-"), scheme=s.get("scheme", "-"), model_fingerprint=s.get("model_fingerprint", "-"),
-                             profile_sha256=st.get("profile_sha256", "-"), run_status=s.get("status", "-"),
+                             profile_sha256=st.get("profile_sha256", "-"), reads1_sha256=st.get("sha256_reads1", "-"), run_status=s.get("status", "-"),
                              v2=os.path.exists(run + ".sequence_blocks.tsv"), case_label=case_label(stratum, s),
                              eval_blocks_sha256=sha(bp)))
-    # duplicates: identical evaluator block tables within one model/profile are one observation (M9-G off = M9-C)
+    # duplicates: the same evaluation of the same reads, model and profile (M9-G off = M9-C). Amendment 1: the reads' SHA-256
+    # is part of the key, so coverage replicates (different reads) with identical evaluator tables stay distinct runs
     seen = {}
     for r in rows:
         if r["status"] != "INCLUDED":
             continue
-        key = (r["model_fingerprint"], r["profile_sha256"], r["eval_blocks_sha256"])
+        key = (r["model_fingerprint"], r["profile_sha256"], r["reads1_sha256"], r["eval_blocks_sha256"])
         if key in seen:
             r["status"], r["reason"] = "DUPLICATE", f"identical evaluator block table, model and profile as {seen[key]}"
         else:
@@ -157,7 +164,8 @@ def gq_bin(g):
 
 
 def audit(out):
-    man = [r for r in T(f"{OUT}/runs/manifest/manifest.tsv") if r["status"] == "INCLUDED"]
+    allm = T(f"{OUT}/runs/manifest.a1/manifest.tsv")   # Amendment 1
+    man = [r for r in allm if r["status"] == "INCLUDED"]
     comp = {r["case"]: num(r["compound_distance_m9i"]) for r in T(M9I)}
     obs, runs = [], []
     for m in man:
@@ -200,6 +208,11 @@ def audit(out):
                          winner_candidate_set_probability=s.get("winner_candidate_set_probability", "NA"),
                          excess_over_floor_total=s.get("excess_over_floor_total", "NA"), undefined_truth_blocks=s.get("undefined_truth_blocks", "NA"),
                          case_label=m["case_label"], interval_artefact_bp=artefact_bp))
+    for m in allm:   # Amendment 1: no-call runs stay in the run-level denominators
+        if m["status"] == "NO_CALL":
+            runs.append(dict(stratum=m["stratum"], locus=m["locus"], donor=m["donor"], scheme=m["scheme"], run_status=m["run_status"],
+                             completion="NO_CALL", decision_set_probability="NA", winner_candidate_set_probability="NA",
+                             excess_over_floor_total="NA", undefined_truth_blocks="NA", case_label="-", interval_artefact_bp=None))
     write(out, "block_observations", obs)
     write(out, "locus_level", runs)
     summary, extremes = [], []

@@ -14,7 +14,7 @@ import m10d_run  # noqa: E402  (watchdog only)
 WT = os.path.abspath(os.path.join(HERE, "..", "..", ".."))
 OUT = "/Users/davide.bolognini/panvar/tests/results/m11a_confidence_design_20261020/m11b"
 BUDGET, PRE = 300, 15.0   # disclosed: M11-A inventory run and path inspection, rounded up
-UNITS = {"manifest": 60, "audit": 120}
+UNITS = {"manifest": 60, "manifest.a1": 60, "audit": 120}   # Amendment 1: manifest.a1 supersedes manifest
 
 
 def main(unit):
@@ -26,14 +26,14 @@ def main(unit):
     rev = subprocess.run(["git", "-C", WT, "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
     dirty = subprocess.run(["git", "-C", WT, "status", "--porcelain"], capture_output=True, text=True).stdout.strip()
     assert not dirty, "commit first"
-    if unit == "audit" and not any(r[0] == "manifest" and r[4] == "0" for r in rows):
+    if unit == "audit" and not any(r[0] == "manifest.a1" and r[4] == "0" for r in rows):
         sys.exit("manifest missing")
     if spent + UNITS[unit] > BUDGET:
         sys.exit(f"budget: {spent} + {UNITS[unit]} > {BUDGET}")
     d = f"{OUT}/runs/{unit}"
     os.makedirs(d)
     with open(f"{d}/run.log", "w") as log:
-        code, verdict, peak, wall = m10d_run.run_watched([sys.executable, os.path.join(HERE, "m11b.py"), unit, d], log, UNITS[unit])
+        code, verdict, peak, wall = m10d_run.run_watched([sys.executable, os.path.join(HERE, "m11b.py"), unit.split(".")[0], d], log, UNITS[unit])
     if not os.path.exists(led):
         open(led, "w").write("unit\trevision\tdeclared_timeout\twall_seconds\texit\twatchdog\tpeak_gib\n")
     open(led, "a").write(f"{unit}\t{rev}\t{UNITS[unit]}\t{wall:.2f}\t{code}\t{verdict}\t{peak / 2**30:.3f}\n")
