@@ -135,3 +135,33 @@ them for the comparison only.
 - **Not shown:** that r = 0.1's objective ranks genotypes better, or that the gain generalises. The evidence is one donor
   at one coverage on one locus.
 - **Status:** r = 0.1 stays a candidate parameter with one reachability-mediated LOO improvement. It is not promoted.
+
+## Qualification (appended by M9-A, 2026-10-20; the text above is unchanged)
+
+**The "separation gap 0.044 / 0.043 nats" quoted above is `numeric_separation_gap`.** It is the gap between the rank-1
+and rank-2 *sequence pairs*. In both runs the rank-2 pair carries the **same unphased genotype at every block** as the
+winner and differs only in phase:
+- the fragment and exposure terms are identical (likelihood gap 0);
+- the gap is entirely prior.
+
+So it measures phase/sequence-pair uncertainty, not genotype uncertainty.
+
+**Unphased-genotype uncertainty, reproduced from the archived outputs** (M9-A `runs/audit/m8d_qualification.tsv`):
+
+| run | locus genotype separation (`caller_genotype_separation_gap`) | evaluated mass carrying the reported unphased genotype |
+|---|---|---|
+| r = 0.01 | 0.70213715071 | 0.405311 |
+| r = 0.1 | 0.90184718165 | 0.313111 |
+
+These equal Sol's independent values: 0.7021371507 / 0.9018471817 and ≈ 0.405311 / 0.313111.
+
+"Near-tie winner (gap 0.04 nats)" in the Decision should therefore read: **near-tie in phase; the reported unphased
+genotype is separated by 0.70 / 0.90 nats, with conditional mass 0.41 / 0.31 within each run's evaluated pool.**
+
+**What still holds:**
+- **The search conclusion:** both objectives prefer the closer final candidate by about 2 nats, and r = 0.01 did not reach
+  it.
+
+**What is not established:**
+- that either winner is globally optimal;
+- that r = 0.1 is the better-calibrated prior.
