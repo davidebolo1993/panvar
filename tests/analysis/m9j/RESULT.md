@@ -104,3 +104,24 @@ output, and its cost is under 0.1 s.
 compound unit is the natural evaluation unit.
 
 **Status:** no default promotion.
+
+## Correction (appended by M9-J.1; the record above is unchanged)
+
+**Defect.** Sol's review found that target resolution was decided from the decision-set projections that were
+**available**. A decision-set group without recorded labellings was therefore ignored:
+- one known projection plus a missing decision-set group gave `RESOLVED` / `the_resolved_target`;
+- an entirely missing decision set gave `NO_DECISION_SET` with `the_resolved_target`.
+
+**Fix (M9-J.1, `e61c09c`).** Missing decision-set projections prevent `RESOLVED` and give a new status,
+`INCOMPLETE_DECISION_SET`. An absent decision set is `NO_DECISION_SET` with representative-only wording. Missing
+non-decision groups do not affect resolution. Two columns are added: `decision_set_groups` and
+`decision_set_missing_groups`.
+
+**Effect on this record: none.**
+- The 34-case replay is byte-identical in every saved column.
+- The saved ACOT and CYP2D6 caller annotations re-assess to the same `RESOLVED` result, with 2 decision-set groups and 0
+  missing.
+- The C4 control still has no rows.
+
+The statement "decision-set resolved / unresolved" in the gates table above did not cover incomplete decision sets. See
+`tests/analysis/m9j1/RESULT.md`.
