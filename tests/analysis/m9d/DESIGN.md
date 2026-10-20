@@ -103,3 +103,23 @@ attribution is made to sequencing error, placement or a prior defect without sup
 - **Order:** `build`, `models`, `construct`, then `score` for E1–E6, C1, C2 (90 s each), then `degeneracy`, then `analyse`.
 - **One process at a time, four threads,** existing resource settings unchanged.
 - **Refused units** are recorded NOT RUN.
+
+## Amendment 1 (declared after `analyse`, before any further execution)
+
+**Trigger.** The non-gating degeneracy inventory found **2,045 cross-block equivalences**, all within **sv:5..ctx:6**, in
+all three models. There are no within-block duplicates. So label identity at sv:5 does not determine the sequence over
+sv:5 + ctx:6.
+- In d1 and d2, ctx:6 already agrees with truth (evaluator distance 0).
+- In d3, d4 and d6 it does not (distances 4, 6 and 5).
+
+**Question.** Whether each reported haplotype's sv:5 + ctx:6 sequence equals or differs from the truth's. This separates
+representation ambiguity from a real sequence difference.
+
+**Added units, read-only and truth used diagnostically:**
+- `interval.<cell>` for LOO d1, d2, d3, d4 and d6: the existing `genotype_probe block-sequences --blocks sv:5,ctx:6,sv:9
+  --truth-gfa acot.gfa --donor <donor>` (truth projection bytes; LOO model and curation), 60 s each;
+- `intervals`: per haplotype, the reported sv:5 + ctx:6 bytes (sv:9 alone for E4) against the truth projection's, under
+  the better pairing. It reports identity and the residual differing core after trimming common prefix and suffix (not an
+  edit distance), 30 s.
+
+**Unchanged:** the matched contrasts, gates and readings.

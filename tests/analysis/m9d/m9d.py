@@ -188,6 +188,49 @@ if mode == "construct":
     print(f"gates: {len(gates) - len(bad)}/{len(gates)} pass")
     sys.exit(0 if not bad else 1)
 
+if mode == "intervals":   # Amendment 1: interval-level sequence comparison over the degenerate sv:5..ctx:6 (and sv:9 alone)
+    blocks = dump("LOO")
+    rows = []
+    for case, cell, block, kind, model in CASES:
+        if kind != "error":
+            continue
+        d = f"{C}/call.{cell}"
+        ids = [r["block_id"] for r in T(f"{d}/call.sequence_blocks.tsv")]
+        span = ["sv:5", "ctx:6"] if block == "sv:5" else [block]
+        lg = T(f"{d}/call.locus_genotype.tsv")[0]
+        h = (labs(lg["hap1_block_path"]), labs(lg["hap2_block_path"]))
+        called = ["".join(blocks[ids.index(x)][hh[ids.index(x)]] for x in span) for hh in h]
+        bs = f"{OUT}/interval.{cell}/bs"
+        truth = []
+        for k in (0, 1):
+            seq = ""
+            for x in span:
+                recs, cur = {}, None
+                for line in open(f"{bs}.{x}.truth.fa"):
+                    if line.startswith(">"):
+                        cur = line[1:].split()[0]
+                        recs[cur] = ""
+                    else:
+                        recs[cur] += line.strip()
+                seq += recs[f"truth{k}"]
+            truth.append(seq)
+        def core(a, b):   # residual differing core after trimming the common prefix and suffix
+            p = 0
+            while p < min(len(a), len(b)) and a[p] == b[p]:
+                p += 1
+            q = 0
+            while q < min(len(a), len(b)) - p and a[-1 - q] == b[-1 - q]:
+                q += 1
+            return len(a) - p - q, len(b) - p - q
+        best = min(((0, 1), (1, 0)), key=lambda o: sum(sum(core(called[i], truth[o[i]])) for i in (0, 1)))
+        for i in (0, 1):
+            c, t = called[i], truth[best[i]]
+            rows.append(dict(case=case, cell=cell, interval="..".join(span), haplotype=f"called hap{i + 1} vs truth{best[i]}", identical=c == t,
+                             called_bp=len(c), truth_bp=len(t), residual_core_called_bp=core(c, t)[0], residual_core_truth_bp=core(c, t)[1]))
+    write("intervals", rows)
+    print(open(f"{out}/intervals.tsv").read())
+    sys.exit(0)
+
 if mode == "analyse":
     rep, contrasts, frags = [], [], []
     mem = {r["label"]: r for r in T(f"{OUT}/construct/membership.tsv")}

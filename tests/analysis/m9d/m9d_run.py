@@ -26,7 +26,9 @@ CASES = {"E1": ("LOO.d1", "sv:5"), "E2": ("LOO.d2", "sv:5"), "E3": ("LOO.d3", "s
          "E6": ("LOO.d6", "sv:5"), "C1": ("LZO.d1", "sv:5"), "C2": ("LZO.d2", "sv:5")}
 MANIFEST_P = ([("build", "build", "-", 120), ("models", "models", "-", 120), ("construct", "construct", "-", 30)]
               + [(f"score.{c}", "score", c, 90) for c in CASES] + [("degeneracy", "degeneracy", "-", 120), ("analyse", "analyse", "-", 30)])
-MANIFESTS = {"P": MANIFEST_P}
+MANIFEST_A1 = ([(f"interval.{c}", "interval", c, 60) for c in ("LOO.d1", "LOO.d2", "LOO.d3", "LOO.d4", "LOO.d6")]
+               + [("intervals", "intervals", "-", 30)])   # Amendment 1: truth bytes over sv:5..ctx:6 (block-sequences) and comparison
+MANIFESTS = {"P": MANIFEST_P, "A1": MANIFEST_A1}
 
 
 def ledger_rows():
@@ -95,7 +97,12 @@ def command(kind, target, d):
     py = lambda mode: ([sys.executable, os.path.join(HERE, "m9d.py"), mode, d], None, mode)
     if kind == "build":
         return ["cmake", "--build", BUILD, "--target", "cyp2d6_block_alleles", "-j", "4"], None, "relink the model dump tool"
-    if kind in ("models", "construct", "degeneracy", "analyse"):
+    if kind == "interval":
+        dn = donor(target)
+        return ([f"{BUILD}/genotype_probe", "block-sequences", "--out", f"{d}/bs", "--reference", ACOT_REF, "--model-gfa", ACOT_GFA,
+                 "--panel-curation", f"{P}/curation.LOO.txt", "--blocks", "sv:5,ctx:6,sv:9", "--truth-gfa", ACOT_GFA, "--donor", dn], None,
+                f"block-sequences {target} ({dn})")
+    if kind in ("models", "construct", "degeneracy", "analyse", "intervals"):
         return py(kind)
     if kind == "score":
         cell, block = CASES[target]
