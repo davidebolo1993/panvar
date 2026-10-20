@@ -134,3 +134,11 @@ writes only to new directories under the M7-B results.
   INCONCLUSIVE.**
 - A favourable Locityper result motivates attribution only. It does not show that local depth alone caused it, nor
   improved general genotyping.
+
+## Amendment 1 (declared after `background` exited 1; 8.2 s spent)
+
+**What failed.** The fragment-intensity check compared `simulation.tsv`'s λ, which is printed to 6 significant digits, at
+a relative tolerance of 1e-6. Spelling, ploidy, template z-scores and simulation exits all passed.
+
+**Fix.** λ is compared at the printed precision (relative 1e-5). The unit is re-run as `background.a1`, into a new
+directory, with the same deterministic seeds. Downstream units read `background.a1`. Nothing else changes.

@@ -54,7 +54,7 @@ if mode == "background":
                     "--seed", c["seed"], "--seed-salt", f"m7b-bg-{cell}", "--out", o], log)
         kv = {l.split("\t")[0]: l.rstrip("\n").split("\t")[1] for l in open(f"{o}/simulation.tsv") if "\t" in l} if code == 0 else {}
         lam_expected = (c["depth"] / 2) / (2 * 100) / (1 - 0.001)
-        lam_ok = code == 0 and abs(float(kv["lambda"]) - lam_expected) <= 1e-6 * lam_expected
+        lam_ok = code == 0 and abs(float(kv["lambda"]) - lam_expected) <= 1e-5 * lam_expected   # Amendment 1: simulation.tsv prints 6 significant digits
         hap_ok = code == 0 and kv.get("haplotype_0_bp") == kv.get("haplotype_1_bp") == str(len(bg))
         z = [(float(kv[f"haplotype_{i}_templates"]) - float(kv[f"haplotype_{i}_expected_templates"])) / float(kv[f"haplotype_{i}_expected_templates"]) ** 0.5
              for i in (0, 1)] if code == 0 else [99]
@@ -71,7 +71,7 @@ if mode == "reference":
     log = f"{d}/commands.log"
     L = LOCI[locus]
     ref = spell_gfa_path(L["gfa"], L["ref_path"])
-    bg = fasta(f"{OUT}/runs/background/m7bg.fa")["m7bg"]
+    bg = fasta(f"{OUT}/runs/background.a1/m7bg.fa")["m7bg"]
     with open(f"{d}/ref.fa", "w") as f:
         f.write(f">m7bg\n{bg}\n>{L['contig']}\n{ref}\n")
     open(f"{d}/locus.tsv", "w").write(f"contig\t{L['contig']}\nlength\t{len(ref)}\nregion_length\t{region_length(L['ref_path'])}\nbackground_length\t{len(bg)}\n")
@@ -87,8 +87,8 @@ if mode == "preproc":
     log = f"{d}/commands.log"
     lineage_bin(c["lineage"])
     refdir = f"{OUT}/runs/reference.{c['locus']}"
-    bg = f"{OUT}/runs/background/bg_{cell}"
-    bglen = len(fasta(f"{OUT}/runs/background/m7bg.fa")["m7bg"])
+    bg = f"{OUT}/runs/background.a1/bg_{cell}"
+    bglen = len(fasta(f"{OUT}/runs/background.a1/m7bg.fa")["m7bg"])
     code = run([LOCITYPER, "preproc", "-i", f"{bg}/reads_1.fq", f"{bg}/reads_2.fq", "-r", f"{refdir}/ref.fa", "-j", f"{refdir}/ref.jf",
                 "-o", f"{d}/preproc", "-b", f"m7bg:1-{bglen}", "--seed", PREPROC_SEED, "-@", 4, "--debug",
                 "--strobealign", STROBEALIGN, "--samtools", SAMTOOLS, "--jellyfish", JELLYFISH], log)

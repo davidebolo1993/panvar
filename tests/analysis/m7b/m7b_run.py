@@ -33,7 +33,10 @@ MANIFEST_P = ([("provenance", "provenance", "-", 120), ("background", "backgroun
               + [("loc.c4_lzo_hg00171_5.D.s1r", "loc", "c4_lzo_hg00171_5:D:20261020", 60), ("loc.c4_loo_na19650_10.D.s2", "loc", "c4_loo_na19650_10:D:20261021", 60),
                  ("loc.cyp_loo_na19650_5.D.s2", "loc", "cyp_loo_na19650_5:D:20261021", 60)]
               + [("truthdist", "truthdist", "-", 90), ("compare", "compare", "-", 30)])
-MANIFESTS = {"P": MANIFEST_P}
+# Amendment 1 (declared after `background` exited 1 at 8.2 s): lambda compared at simulation.tsv's printed precision (6 significant
+# digits; relative 1e-5) instead of 1e-6. Every other check passed. background.a1 replaces background; downstream paths read background.a1.
+MANIFEST_A1 = [("background.a1", "background", "-", 60)] + [m for m in MANIFEST_P if m[0] not in ("provenance", "background")]
+MANIFESTS = {"P": MANIFEST_P, "A1": MANIFEST_A1}
 INPUTS = [{"file": "/Users/davide.bolognini/panvar-worktrees/s1-d-panel-references/tests/analysis/m7a/CANDIDATES.tsv",
            "sha256": "a8cd9516798a4795" }]   # prefix-checked in verify(); full bindings are re-verified by pools/provenance via M7-A BINDINGS.tsv
 
