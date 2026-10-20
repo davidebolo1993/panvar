@@ -35,7 +35,8 @@ MANIFEST_P = ([("build", "build", "-", 300), ("prepare", "prepare", "-", 10), ("
               + [(f"call.on.{c}", "call", f"on:{c}", WATCHDOG) for c in CELLS] + [("freeze", "freeze", "-", 10)]
               + [(f"eval.{a}.{c}", "eval", f"{a}:{c}", 50) for a in ("off", "on") for c in CELLS] + [("analyse", "analyse", "-", 30)])
 MANIFEST_A2 = [("gate.refusal.a2", "refusal2", "-", 60)]   # Amendment 2: refusal tested without output_schema v2
-MANIFESTS = {"P": MANIFEST_P, "A2": MANIFEST_A2}
+MANIFEST_A3 = [("gate.offcheck.a3", "offcheck", "-", 30)]   # Amendment 3: dosage_status timing rows excluded
+MANIFESTS = {"P": MANIFEST_P, "A2": MANIFEST_A2, "A3": MANIFEST_A3}
 
 
 def ledger_rows():
@@ -96,7 +97,7 @@ def precondition(kind, target):
     if kind == "call":
         if any(exit_of(g) != "0" for g in GATES):
             return "a gate failed: stop before real caller runs"
-        if target.startswith("on:") and exit_of("gate.offcheck") != "0":
+        if target.startswith("on:") and exit_of("gate.offcheck.a3") != "0":   # Amendment 3
             return "the off arm does not reproduce M9-C: stop before on runs"
     if kind == "offcheck" and any(f"call.off.{c}" not in done() for c in CELLS):
         return "not every off call has an outcome"

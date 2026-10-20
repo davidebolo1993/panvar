@@ -140,6 +140,9 @@ if mode == "offcheck":
                 continue
             # each arm's own output prefix (written into locus tables and file links) is normalised; nothing else
             norm = lambda p, pre: open(p).read().replace(pre, "<PREFIX>") if os.path.exists(p) else None
+            if f == "dosage_status.tsv":   # Amendment 3: its seconds_* rows are wall-clock timings, not science
+                norm = lambda p, pre: "".join(l + "\n" for l in open(p).read().replace(pre, "<PREFIX>").splitlines()
+                                              if not l.startswith("seconds_")) if os.path.exists(p) else None
             same = norm(pa, a) is not None and norm(pa, a) == norm(pb, b)
             rows.append(dict(cell=cell, file=f, identical=same))
         rows.append(dict(cell=cell, file="repair_rounds.tsv (scientific columns)", identical=projected(f"{a}.repair_rounds.tsv", ROUND_COLS) == projected(f"{b}.repair_rounds.tsv", ROUND_COLS)))

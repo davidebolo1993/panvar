@@ -154,3 +154,13 @@ existing rule "output_schema sequence_first_v2 needs the adaptive repair", which
 
 **Fix.** `gate.refusal.a2` runs the same test with the on-profile minus its `output_schema` line (legacy schema), so the new
 refusal is exercised. It replaces `gate.refusal` in the call precondition. The failed unit stays recorded.
+
+## Amendment 3 (after `gate.offcheck`; no on run yet)
+
+**Failure.** `gate.offcheck` exited 1. 80 of 84 checks were identical. The four failures are `dosage_status.tsv` in LOO d3,
+d6 and LZO d1, d2, and they differ only in its `seconds_dosage_*` rows, which are wall-clock timings.
+
+**Cause.** The design listed the whole file as scientific. That was my error.
+
+**Fix.** `gate.offcheck.a3` excludes `seconds_*` rows of `dosage_status.tsv`. Every other check is unchanged. It replaces
+`gate.offcheck` in the on-arm precondition. The failed unit stays recorded.
