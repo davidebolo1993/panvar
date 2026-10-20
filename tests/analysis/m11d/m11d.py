@@ -256,6 +256,10 @@ def outcomes(out):
             if e["truth1_bp"] == "NA" or e["truth2_bp"] == "NA" or not os.path.exists(f"{tdir}/bs.{bid}.truth.fa"):
                 meta.append((e, None))
                 continue
+            if "NA" in (e["called_allele1"], e["called_allele2"], e["excess"]):
+                # amendment A1: a block without a called genotype (a caller no-call) is NO_PREDICTION, never an outcome
+                meta.append((e, "NO_PREDICTION"))
+                continue
             al, tr = fasta(f"{tdir}/bs.{bid}.alleles.fa"), fasta(f"{tdir}/bs.{bid}.truth.fa")
             seqs = dict(p1=al[f"allele_{e['called_allele1']}"], p2=al[f"allele_{e['called_allele2']}"], b1=al[f"allele_{e['truth1_closest_allele']}"],
                         b2=al[f"allele_{e['truth2_closest_allele']}"], t1=tr["truth1"], t2=tr["truth2"])
@@ -273,7 +277,7 @@ def outcomes(out):
                 continue
             blk = order[order.index(iv[0]):order.index(iv[1]) + 1]
             parts = [m for e, m in meta if e["block_id"] in blk]
-            if len(parts) != len(blk) or any(m is None for m in parts):
+            if len(parts) != len(blk) or any(not isinstance(m, tuple) for m in parts):
                 continue
             cat = {k2: "".join(m[1][k2] for m in parts) for k2 in ("p1", "p2", "t1", "t2")}
             iv_pairs.append((k, blk, cat))
@@ -300,7 +304,10 @@ def outcomes(out):
                        read_support=bg.get(bid, {}).get("genotype_support", "NA"), census_route=dg.get(bid, {}).get("census_route", "NA"),
                        jp_emission_tie=dg.get(bid, {}).get("jp_emission_tie", "NA"), block_status=sb.get(bid, {}).get("block_status", "NA"))
             if m is None:
-                rows.append(dict(base, truth_defined=False, **inp))
+                rows.append(dict(base, truth_defined=False, predicted=False, **inp))
+                continue
+            if m == "NO_PREDICTION":
+                rows.append(dict(base, truth_defined=True, predicted=False, **inp))
                 continue
             pid, seqs = m
             g = {t: D[f"{pid}.{t}"] for t in ("p1t1", "p2t2", "p1t2", "p2t1", "b1t1", "b2t2")}
@@ -311,7 +318,7 @@ def outcomes(out):
             ex = float(e["excess"])
             den = max(len(seqs["t1"]) + len(seqs["t2"]), len(seqs["p1"]) + len(seqs["p2"]))
             qf = qvp / qvb if qvb else None
-            rows.append(dict(base, truth_defined=True, excess=ex, normalized_excess=ex / den if den else None, floor_attained=ex == 0,
+            rows.append(dict(base, truth_defined=True, predicted=True, excess=ex, normalized_excess=ex / den if den else None, floor_attained=ex == 0,
                              catastrophic=ex >= CATASTROPHIC_BP, QVfrac=qf, QVfrac_above_1=bool(qf is not None and qf > 1),
                              top_category=bool(qf is not None and qf >= TOP), quintile=None if qf is None else min(4, int(qf * 5)) if qf < 1 else 4,
                              distance_matches_evaluator=min(e1, e2) == float(e["unordered_distance"]),
@@ -329,10 +336,15 @@ def outcomes(out):
 
 # ------------------------------------------------------------------------------------------------ the frozen comparison
 def fit(out):
-    rows = T(f"{OUT}/runs/outcomes/blocks.tsv")
+    # amendment A1: read the outcomes unit with the same suffix (fit.a1 <- outcomes.a1); a missing table is a failure, not an empty fit
+    src = os.path.join(os.path.dirname(out), "outcomes" + os.path.basename(out)[len("fit"):], "blocks.tsv")
+    if not os.path.exists(src):
+        print(f"no outcomes table at {src}")
+        return 1
+    rows = T(src)
     usable = []
     for r in rows:
-        if r["truth_defined"] != "True" or r["assessable"] != "True" or r["gq"] in ("", "None"):
+        if r["truth_defined"] != "True" or r.get("predicted") != "True" or r["assessable"] != "True" or r["gq"] in ("", "None"):
             continue
         usable.append(dict(r, y=1.0 if r["top_category"] == "True" else 0.0, x=float(r["gq"]),
                            prior=1.0 if r["read_support"] == "PRIOR_ONLY" else 0.0))

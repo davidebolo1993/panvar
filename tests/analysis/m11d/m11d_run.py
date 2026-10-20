@@ -25,6 +25,10 @@ UNITS = [("build", 300), ("gate.selftest", 60)]
 for c in m11d.CELLS:
     UNITS += [(f"call.{c['id']}", m11d.WATCHDOG[c["locus"]]), (f"eval.{c['id']}", 120), (f"truth.{c['id']}", 60)]
 UNITS += [("inventory", 120), ("outcomes", 300), ("fit", 120)]
+FROZEN_UNITS = list(UNITS)   # MANIFEST.tsv records the frozen list
+# amendment A1 (declared after the outcomes unit failed on a caller no-call's NA alleles; AMENDMENT_A1.md): re-run the two
+# analysis units; the failed outcomes unit and the fit unit that ran without an outcomes table stay recorded
+UNITS += [("outcomes.a1", 300), ("fit.a1", 120)]
 
 
 def ledger():
@@ -71,6 +75,8 @@ def command(unit, d):
         return eval_cmd(m11d.cell(cid), d)
     if kind == "truth":
         return py + ["truth", cid, d]
+    if kind in ("inventory", "outcomes", "fit"):
+        return py + [kind, d]
     return py + [unit, d]
 
 
@@ -84,6 +90,10 @@ def precondition(unit):
         return "no call outputs to evaluate"
     if kind == "truth" and exit_of(f"eval.{cid}") != "0":
         return "no evaluation"
+    if unit == "outcomes.a1" and exit_of("inventory") != "0":
+        return "the inventory failed"
+    if unit == "fit.a1" and exit_of("outcomes.a1") != "0":
+        return "the outcomes unit failed"
     return None
 
 
@@ -117,7 +127,7 @@ def run_unit(unit):
 
 def manifest():
     os.makedirs(OUT, exist_ok=True)
-    lines = ["unit\tdeclared_timeout_seconds"] + [f"{u}\t{t}" for u, t in UNITS]
+    lines = ["unit\tdeclared_timeout_seconds"] + [f"{u}\t{t}" for u, t in FROZEN_UNITS]
     bins = [f"# executable\t{b}\t{m11d.sha(f'{WT}/build/{b}')}" for b in ("panvar", "genotype_probe", "m10c_align_eval", "cyp2d6_block_alleles")]
     cells = []
     for c in m11d.CELLS:
