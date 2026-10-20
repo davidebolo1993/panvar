@@ -28,7 +28,9 @@ MANIFESTS = {"P": [("build", "build", "-", 300), ("gate.aligner", "gate", "-", 6
              # method B meets every structural and concordance fixture (m10c.B_REQUIRED)
              "A1": [("build.a1", "build", "-", 300), ("fixtures_b.a1", "py", "fixtures_b", 120)] +
              [(f"truth.{c}.a1", "truth", c, 120) for c in TRUTHS] + [("cases.a1", "py", "cases", 300)]}
-AMENDMENT_DEV = 30.0   # disclosed: Amendment 1 development (three builds of the minimap2 mode incl. two failed links, 26 s), rounded up
+MANIFESTS["A2"] = [("build.a2", "build", "-", 300), ("fixtures_c.a2", "py", "fixtures_c", 120)] + \
+    [(f"truth.{c}.a2", "truth", c, 120) for c in TRUTHS] + [("cases.a2", "py", "cases", 300)]   # Amendment 2: method C
+AMENDMENT_DEV = 35.0   # disclosed: Amendments 1-2 development (minimap2-mode builds incl. two failed links 26 s; abPOA-mode build 1.2 s), rounded up
 
 
 def ledger_rows():
@@ -75,6 +77,11 @@ def run_unit(unit):
             open(f"{OUT}/runs/fixtures_b.a1/method_b_supported.txt").read().strip() != "True":
         why = "method B does not meet every structural and concordance fixture: no saved case is inspected"
     elif unit == "cases.a1" and any(exit_of(f"truth.{c}.a1") != "0" for c in TRUTHS):
+        why = "a truth extraction failed"
+    elif unit.endswith(".a2") and (unit.startswith("truth.") or unit == "cases.a2") and \
+            open(f"{OUT}/runs/fixtures_c.a2/method_c_supported.txt").read().strip() == "NONE":
+        why = "method C does not meet the structural and concordance fixtures (not even inversion-blind): no saved case is inspected"
+    elif unit == "cases.a2" and any(exit_of(f"truth.{c}.a2") != "0" for c in TRUTHS):
         why = "a truth extraction failed"
     elif spent() + timeout > BUDGET:
         why = f"{spent():.1f} + {timeout} > {BUDGET} s"

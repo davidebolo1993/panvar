@@ -298,6 +298,53 @@ def fixtures_def_a1():
     return F
 
 
+# ------------------------------------------------------------------------------------------------ Amendment 2: method C
+# Method B fails F04/F05/F06 (minimap2 aligns only part of a sequence with repeated units) and F07b. Method C uses the
+# existing panvar::poa_msa (abPOA, global, affine gaps) as a two-row alignment, forward and on plain-reversed sequences;
+# events are gap runs >= EVENT (contiguous by the affine model); the verdict rule is method A's with these runs; the
+# assignment remains method A's exact edit distance. Inversions are not representable in a single-strand global alignment.
+def align_c(d, tag):
+    subprocess.run([ALIGN, "--poa", f"{d}/{tag}.manifest.tsv", f"{d}/{tag}.poa.tsv"], check=True)
+    return {(r["id"], r["direction"]): r for r in csv.DictReader(open(f"{d}/{tag}.poa.tsv"), delimiter="\t")}
+
+
+def diploid_c(rows_a, rows_c, pid, truth_ok=(True, True)):
+    if not all(truth_ok):
+        return dict(verdict="UNSUPPORTED", flags="TRUTH_UNAVAILABLE")
+    conv = {}
+    for k, r in rows_c.items():
+        conv[k] = dict(r, indel_runs_ge50=r["gap_runs_ge50"], edits=rows_a[k]["edits"], aln_len=r["columns"],
+                       over_threshold_bp=str(sum(int(x.split(":")[1].split("@")[0]) for x in r["gap_runs_ge50"].split(";")) if r["gap_runs_ge50"] != "-" else 0),
+                       max_indel_run=r["max_gap_run"])
+    return diploid(conv, pid, truth_ok)
+
+
+C_REQUIRED = B_REQUIRED
+
+
+def fixtures_c(out):
+    F = fixtures_def_a1()
+    pairs = []
+    for fid, _, p, t, sites, _ in F:
+        pairs += diploid_pairs(fid, p, t, sites or ((), ()))
+    rows = align(pairs, out, "fixtures")
+    rc_ = align_c(out, "fixtures")
+    res = []
+    for fid, desc, p, t, sites, req in F:
+        v = diploid_c(rows, rc_, fid)
+        met = "n/a (definition required)" if req == "DEFINITION_REQUIRED" else ("yes" if v["verdict"] == req else "NO")
+        res.append(dict(fixture=fid, description=desc, required=req, verdict=v["verdict"], required_met=met, **{k: x for k, x in v.items() if k != "verdict"}))
+    write(out, "fixtures_c", res)
+    for r in res:
+        print(f"{r['fixture']}\t{r['required']}\t{r['verdict']}\t{r['required_met']}\t{r['flags']}\t{r.get('h1_e1_forward', '-')}|{r.get('h2_e1_forward', '-')}")
+    full = all(r["required_met"] == "yes" for r in res if r["fixture"] in C_REQUIRED)
+    narrow = all(r["required_met"] == "yes" for r in res if r["fixture"] in C_REQUIRED and r["fixture"] not in ("F07", "F07b"))
+    status = "FULL" if full else "INVERSION_BLIND" if narrow else "NONE"
+    open(f"{out}/method_c_supported.txt", "w").write(status + "\n")
+    print(f"method C support: {status}")
+    return 0
+
+
 # ------------------------------------------------------------------------------------------------ frozen fixtures
 def fixtures_def():
     L, Rf, U = rnd("L", 800), rnd("R", 800), rnd("U", 600)
@@ -458,7 +505,7 @@ def cases(out):
     for cid, tcase, preds in CASES:
         dump = TRUTH[tcase][0]
         seq, ids = model_blocks(dump)
-        tdir = f"{OUT}/runs/truth.{tcase}.a1"   # Amendment 1: truth extraction runs as .a1
+        tdir = f"{OUT}/runs/truth.{tcase}.a2"   # Amendment 2: truth extraction runs as .a2
         th = {"truth1": [], "truth2": []}
         avail = {"truth1": True, "truth2": True}
         for b, bid in enumerate(ids):
@@ -478,17 +525,18 @@ def cases(out):
                 pid = f"{cid}.{label}.{'int' if lo else 'full'}"
                 rows = align(diploid_pairs(pid, p, t), out, pid) if all(ok) else {}
                 v = diploid(rows, pid, ok)
-                vb = diploid_b(rows, align_b(None, out, pid), pid, ok) if all(ok) else dict(verdict="UNSUPPORTED", flags="TRUTH_UNAVAILABLE")
+                vb = diploid_c(rows, align_c(out, pid), pid, ok) if all(ok) else dict(verdict="UNSUPPORTED", flags="TRUTH_UNAVAILABLE")   # A2: method C
                 res.append(dict(case=cid, prediction=label, scope=scope, truth_available=f"{ok[0]}/{ok[1]}",
                                 pred_bp=f"{len(p[0])}/{len(p[1])}", truth_bp=f"{len(t[0])}/{len(t[1])}",
-                                method_b_verdict=vb["verdict"], method_b_flags=vb["flags"], method_b_h1_events=vb.get("h1_events", "-"),
-                                method_b_h2_events=vb.get("h2_events", "-"), method_a_verdict=v["verdict"], method_a_flags=v["flags"],
+                                method_c_verdict=vb["verdict"], method_c_flags=vb["flags"], method_c_h1_runs=vb.get("h1_e1_forward", "-"),
+                                method_c_h2_runs=vb.get("h2_e1_forward", "-"), method_c_h1_runs_reverse=vb.get("h1_e1_reverse", "-"),
+                                method_c_h2_runs_reverse=vb.get("h2_e1_reverse", "-"), method_a_verdict=v["verdict"], method_a_flags=v["flags"],
                                 **{k: x for k, x in v.items() if k not in ("verdict", "flags")}))
         prov.append(dict(case=cid, **kv(f"{tdir}/provenance.tsv")))
     write(out, "cases", res)
     write(out, "provenance", prov)
     for r in res:
-        print(f"{r['case']}\t{r['prediction']}\t{r['scope'][:8]}\tB={r['method_b_verdict']}\t{r['method_b_flags']}\t{r['method_b_h1_events']}|{r['method_b_h2_events']}\tA={r['method_a_verdict']}\t{r.get('total_edits_best', '-')}")
+        print(f"{r['case']}\t{r['prediction']}\t{r['scope'][:8]}\tC={r['method_c_verdict']}\t{r['method_c_flags']}\t{r['method_c_h1_runs']}|{r['method_c_h2_runs']}\tA={r['method_a_verdict']}\t{r.get('total_edits_best', '-')}")
     return 0
 
 
@@ -499,4 +547,4 @@ if __name__ == "__main__":
         sys.exit(truth(sys.argv[2], sys.argv[3]))
     out = sys.argv[2]
     os.makedirs(out, exist_ok=True)
-    sys.exit({"gate": lambda o: fixtures(o, gate=True), "fixtures": fixtures, "fixtures_b": fixtures_b, "cases": cases}[mode](out))
+    sys.exit({"gate": lambda o: fixtures(o, gate=True), "fixtures": fixtures, "fixtures_b": fixtures_b, "fixtures_c": fixtures_c, "cases": cases}[mode](out))

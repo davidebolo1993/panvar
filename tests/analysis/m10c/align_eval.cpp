@@ -14,8 +14,12 @@
 // M10-C Amendment 1: `m10c_align_eval --minimap2 <manifest> <out>` runs the existing panvar::minimap2_hits (asm20, all
 // regions: primary, secondary and supplementary, unflagged) in both roles (A on B, and B on A) and writes every hit:
 //   strand, query start/end, target start/end, matches, block length, and CIGAR I/D ops >= 50 bp as op:len@target_pos
+// M10-C Amendment 2: `m10c_align_eval --poa <manifest> <out>` aligns A and B with the existing panvar::poa_msa (abPOA,
+// global, affine gaps) as a two-row alignment, forward and on plain-reversed sequences, and writes the same measurements as
+// the default mode from the gapped rows (gap runs >= 50 bp, terminal gap runs, mismatches, located-site bases).
 #include "panvar/align.hpp"
 #include "panvar/minimap2_align.hpp"
+#include "panvar/poa.hpp"
 
 #include "edlib.h"
 
@@ -114,6 +118,93 @@ Walk walk(const std::string& a, const std::string& b, const std::vector<std::siz
 }
 }  // namespace
 
+int poa_mode(const std::string& manifest, const std::string& out_path) {
+    std::ifstream in(manifest);
+    std::ofstream out(out_path);
+    out << "id\tdirection\tlen_a\tlen_b\tcolumns\tmismatches\tins_bp\tdel_bp\tgap_runs_ge50\tmax_gap_run\tterminal_left\tterminal_right\tsite_results\n";
+    for (std::string line; std::getline(in, line);) {
+        if (line.empty()) continue;
+        std::vector<std::string> f;
+        std::stringstream ss(line);
+        for (std::string x; std::getline(ss, x, '\t');) f.push_back(x);
+        const std::string a = slurp(f[1]), b = slurp(f[2]);
+        std::vector<std::size_t> sites;
+        if (f.size() > 3 && f[3] != "-") {
+            std::stringstream sp(f[3]);
+            for (std::string x; std::getline(sp, x, ',');) sites.push_back(std::stoul(x));
+        }
+        for (const bool rev : {false, true}) {
+            std::string aa = a, bb = b;
+            if (rev) {
+                std::reverse(aa.begin(), aa.end());
+                std::reverse(bb.begin(), bb.end());
+            }
+            const std::vector<std::string> rows = panvar::poa_msa({aa, bb});
+            const std::string& ra = rows.at(0);
+            const std::string& rb = rows.at(1);
+            std::size_t mism = 0, ins = 0, del = 0, maxrun = 0, ib = 0, run = 0, run_b = 0;
+            char op = 0;
+            std::vector<std::string> runs;
+            std::vector<char> at_b(bb.size(), '?');
+            auto close = [&]() {
+                if (!op) return;
+                maxrun = std::max(maxrun, run);
+                if (run >= 50) {
+                    std::size_t pos = rev ? bb.size() - run_b - (op == 'D' ? run : 0) : run_b;
+                    runs.push_back(std::string(1, op) + ":" + std::to_string(run) + "@" + std::to_string(pos));
+                }
+                op = 0;
+                run = 0;
+            };
+            for (std::size_t c = 0; c < ra.size(); ++c) {
+                const bool ga = ra[c] == '-', gb = rb[c] == '-';
+                if (ga && gb) continue;
+                const char cur = gb ? 'I' : ga ? 'D' : 0;
+                if (cur != op) {
+                    close();
+                    if (cur) { op = cur; run_b = ib; }
+                }
+                if (cur) ++run;
+                if (!ga && !gb) {
+                    if (ra[c] != rb[c]) ++mism;
+                    at_b[ib++] = ra[c];
+                } else if (gb) {
+                    ++ins;
+                } else {
+                    ++del;
+                    at_b[ib++] = '-';
+                }
+            }
+            close();
+            auto terminal = [&](bool from_start) {
+                std::size_t n = 0;
+                char t = 0;
+                for (std::size_t k = 0; k < ra.size(); ++k) {
+                    const std::size_t c = from_start ? k : ra.size() - 1 - k;
+                    const bool ga = ra[c] == '-', gb = rb[c] == '-';
+                    if (ga && gb) continue;
+                    const char cur = gb ? 'I' : ga ? 'D' : 0;
+                    if (!cur || (t && cur != t)) break;
+                    t = cur;
+                    ++n;
+                }
+                return t ? std::string(1, t) + ":" + std::to_string(n) : std::string("0");
+            };
+            const std::string s1 = terminal(true), s2 = terminal(false);
+            std::string rs, sr;
+            for (const auto& x : runs) rs += (rs.empty() ? "" : ";") + x;
+            for (const std::size_t p : sites) {
+                const std::size_t q = rev ? bb.size() - 1 - p : p;
+                sr += (sr.empty() ? "" : ";") + std::to_string(p) + ":" + bb[q] + ":" + at_b[q];
+            }
+            out << f[0] << '\t' << (rev ? "reverse" : "forward") << '\t' << a.size() << '\t' << b.size() << '\t' << ra.size() << '\t' << mism << '\t'
+                << ins << '\t' << del << '\t' << (rs.empty() ? "-" : rs) << '\t' << maxrun << '\t' << (rev ? s2 : s1) << '\t' << (rev ? s1 : s2)
+                << '\t' << (sr.empty() ? "-" : sr) << '\n';
+        }
+    }
+    return 0;
+}
+
 int minimap2_mode(const std::string& manifest, const std::string& out_path) {
     std::ifstream in(manifest);
     std::ofstream out(out_path);
@@ -148,6 +239,7 @@ int minimap2_mode(const std::string& manifest, const std::string& out_path) {
 
 int main(int argc, char** argv) {
     if (argc == 4 && std::string(argv[1]) == "--minimap2") return minimap2_mode(argv[2], argv[3]);
+    if (argc == 4 && std::string(argv[1]) == "--poa") return poa_mode(argv[2], argv[3]);
     if (argc != 3) {
         std::cerr << "usage: m10c_align_eval <manifest.tsv> <out.tsv>\n";
         return 2;

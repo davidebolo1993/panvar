@@ -128,3 +128,32 @@ F01, F02, F03, F03b, F04, F05, F06, F07, F07b, F08, F08b, F09, F10b, F10c, F11, 
 
 **Runs (manifest A1):** `build.a1`, `fixtures_b.a1`, `truth.<5>.a1`, `cases.a1`. The P units `truth.*` and `cases` are
 superseded (recorded NOT RUN). Disclosed amendment development: 30 s.
+
+## Amendment 2 (after `fixtures_b.a1`; no case inspected)
+
+**What Method B showed (recorded).**
+- **Met:** F03, F03b, F07 (600 bp inversion as a reverse hit), F11, F11b, F14, F10c and the concordance fixtures.
+- **Failed:**
+  - F04 and F05 (copy number; 3+1 vs 2+2): minimap2 returned **one** hit over the first 2,000 bp and dropped the rest of a
+    sequence with repeated units. The verdict read that as an unmatched endpoint.
+  - F06 (order): only one 601 bp block was aligned.
+  - F07b: the 60 bp inversion was absorbed into the hit as mismatches.
+
+  So a minimap2 primary or secondary hit set does not establish copy number or allocation (as the brief warned). Under the
+  frozen condition, no case was inspected (`truth.*.a1` and `cases.a1` recorded NOT RUN).
+
+**Method C (added, existing implementation).** `panvar::poa_msa` (abPOA: global, affine gaps) as a two-row alignment,
+forward and on plain-reversed sequences.
+- **Events:** gap runs ≥ 50 bp.
+- **Verdict rule:** Method A's.
+- **Assignment:** Method A's exact edit distance.
+- **Known in advance:** a single-strand global alignment cannot represent an inversion.
+
+**Condition for inspecting saved cases (declared now, before running C).**
+- **FULL:** C meets every fixture in the Amendment 1 list.
+- **INVERSION_BLIND:** C fails only F07/F07b. Cases are then inspected under the explicitly **narrower, named
+  "inversion-blind"** evaluation, with inversions listed as unsupported.
+- **NONE:** otherwise; no case is inspected.
+
+**Runs (manifest A2):** `build.a2`, `fixtures_c.a2`, `truth.<5>.a2`, `cases.a2`. Disclosed development for Amendments 1–2:
+35 s.
