@@ -14,7 +14,19 @@ d = sys.argv[1]
 log = f"{d}/commands.log"
 P = f"{OUT}/runs/pools"
 mapping = table(f"{P}/mapping.tsv")
-excess = {(r["cell"], r["label"]): int(r["block_excess"]) for r in table(f"{R}/m6a_count_model_20261019/runs/summary.a1/m6a.tsv") if r.get("block_excess", "") not in ("", "NA")}
+# Amendment 2: m6a.tsv has two sections with different headers; read the one whose header carries block_excess
+excess, hdr = {}, None
+for line in open(f"{R}/m6a_count_model_20261019/runs/summary.a1/m6a.tsv"):
+    f = line.rstrip("\n").split("\t")
+    if "block_excess" in f:
+        hdr = f
+        continue
+    if hdr and len(f) == len(hdr) and f[0] != "cell":
+        r = dict(zip(hdr, f))
+        if r["block_excess"] not in ("", "NA"):
+            excess[(r["cell"], r["label"])] = int(r["block_excess"])
+    elif hdr and (len(f) != len(hdr)):
+        hdr = None
 out, ok_all = [], True
 for cell, c in CELLS.items():
     pairs = f"{d}/{cell}.pairs.tsv"

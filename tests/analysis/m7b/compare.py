@@ -19,7 +19,7 @@ RUNS = f"{OUT}/runs"
 TRUTH = {"c4_loo_na19650_10": "2+2", "cyp_loo_na19650_5": "2+3", "c4_lzo_hg00171_5": "2+2", "cyp_lzo_hg02769_5": "2+2"}
 LN10 = math.log(10)
 mapping = table(f"{RUNS}/pools/mapping.tsv")
-td = {(r["cell"], r["canonical_diplotype"]): r for r in table(f"{RUNS}/truthdist/truthdist.tsv")} if os.path.exists(f"{RUNS}/truthdist/truthdist.tsv") else {}
+td = {(r["cell"], r["canonical_diplotype"]): r for r in table(f"{RUNS}/truthdist.a2/truthdist.tsv")} if os.path.exists(f"{RUNS}/truthdist.a2/truthdist.tsv") else {}
 rank_rows, summary, seeds, membership = [], [], [], []
 
 

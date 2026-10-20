@@ -142,3 +142,24 @@ a relative tolerance of 1e-6. Spelling, ploidy, template z-scores and simulation
 
 **Fix.** λ is compared at the printed precision (relative 1e-5). The unit is re-run as `background.a1`, into a new
 directory, with the same deterministic seeds. Downstream units read `background.a1`. Nothing else changes.
+
+## Calibration stop (recorded after `preproc.c4_lzo_hg00171_5` exited 1; 9.6 s spent)
+
+**What failed.** Locityper `preproc` refused the frozen background with "Cannot count k-mers for sequence with Ns": the
+1,000-N spacer lies inside the declared background region. The design wrongly assumed that N windows would be excluded.
+
+**Decision, per the stop rule.** No change to the background construction (spacer removal, restricting `--bg-region` to
+one region, or any other) is made without review. **All Locityper preprocessing, `target` and `genotype` units are
+stopped and recorded NOT RUN.** The remaining three `preproc` units would fail identically and were not attempted.
+
+**What still runs.** Calibration-independent units on the frozen pools, which change no setting: `pools`, Panvar
+`score-set` (D for each cell; X for CYP LOO), `truthdist`, and a compare that reports Locityper as not available. The O
+`score-set` is not run: it serves only the D+O Locityper diagnostic.
+
+## Amendment 2 (declared after `truthdist` exited 1; 63.4 s spent)
+
+**What failed.** `m6a.tsv` has two sections with different headers. The block-excess section was not parsed, so no floor
+could be implied.
+
+**Fix.** The section whose header carries `block_excess` is read. The units are re-run as `truthdist.a2` and
+`compare.a2`.

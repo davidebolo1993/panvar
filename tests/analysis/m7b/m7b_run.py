@@ -36,7 +36,10 @@ MANIFEST_P = ([("provenance", "provenance", "-", 120), ("background", "backgroun
 # Amendment 1 (declared after `background` exited 1 at 8.2 s): lambda compared at simulation.tsv's printed precision (6 significant
 # digits; relative 1e-5) instead of 1e-6. Every other check passed. background.a1 replaces background; downstream paths read background.a1.
 MANIFEST_A1 = [("background.a1", "background", "-", 60)] + [m for m in MANIFEST_P if m[0] not in ("provenance", "background")]
-MANIFESTS = {"P": MANIFEST_P, "A1": MANIFEST_A1}
+# Amendment 2 (declared after `truthdist` exited 1 at 63.4 s): the M6-A summary's second section (block_excess) was not parsed;
+# truthdist.a2 and compare.a2 replace truthdist and compare.
+MANIFEST_A2 = [("truthdist.a2", "truthdist", "-", 90), ("compare.a2", "compare", "-", 30)]
+MANIFESTS = {"P": MANIFEST_P, "A1": MANIFEST_A1, "A2": MANIFEST_A2}
 INPUTS = [{"file": "/Users/davide.bolognini/panvar-worktrees/s1-d-panel-references/tests/analysis/m7a/CANDIDATES.tsv",
            "sha256": "a8cd9516798a4795" }]   # prefix-checked in verify(); full bindings are re-verified by pools/provenance via M7-A BINDINGS.tsv
 
