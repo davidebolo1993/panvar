@@ -131,3 +131,18 @@ The degeneracy inventory under version 2:
 
 **Not built:** the off-model parser. No merge, push, storage cleanup, prior change, calibration, clustering or long-read
 work.
+
+
+## Scope clarification (appended by M10-D, 2026-10-20; the record above is unchanged)
+
+**Davide clarified the intended notion of structural similarity.** It is **sequence similarity**, not equality of an
+explicit structural alphabet.
+- Small substitutions and indels contribute proportionately to the distance.
+- The evaluator is **not** required to identify or classify inversions, rearrangements, junctions or copy-number events.
+
+**What this closes:**
+- the structural-alphabet and event-comparator investigation (M10-B, B.1, C);
+- M10-C method A was unsuitable for event decomposition, but that does **not** disqualify its exact global edit distance,
+  which M10-D adopts as the evaluation metric.
+
+M10-A remains the computational checkpoint.

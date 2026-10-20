@@ -122,3 +122,18 @@ into model alleles, π gives a labelling-invariant structural projection. It cov
 - no calibration evidence;
 - no accuracy claim (development cases only);
 - no caller integration, new families, clustering, long-read work, merge, push or default change.
+
+
+## Scope clarification (appended by M10-D, 2026-10-20; the record above is unchanged)
+
+**Davide clarified the intended notion of structural similarity.** It is **sequence similarity**, not equality of an
+explicit structural alphabet.
+- Small substitutions and indels contribute proportionately to the distance.
+- The evaluator is **not** required to identify or classify inversions, rearrangements, junctions or copy-number events.
+
+**What this closes:**
+- the structural-alphabet and event-comparator investigation (M10-B, B.1, C);
+- M10-C method A was unsuitable for event decomposition, but that does **not** disqualify its exact global edit distance,
+  which M10-D adopts as the evaluation metric.
+
+M10-A remains the computational checkpoint.

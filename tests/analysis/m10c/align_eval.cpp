@@ -14,6 +14,8 @@
 // M10-C Amendment 1: `m10c_align_eval --minimap2 <manifest> <out>` runs the existing panvar::minimap2_hits (asm20, all
 // regions: primary, secondary and supplementary, unflagged) in both roles (A on B, and B on A) and writes every hit:
 //   strand, query start/end, target start/end, matches, block length, and CIGAR I/D ops >= 50 bp as op:len@target_pos
+// M10-D: `m10c_align_eval --distance <manifest> <out>` calls panvar::nw_edit_distance(A, B) once per pair (forward only) and
+// writes id, len_a, len_b, edits, aln_len -- the exact global edit distance and the benchmark's alignment-column count S.
 // M10-C Amendment 2: `m10c_align_eval --poa <manifest> <out>` aligns A and B with the existing panvar::poa_msa (abPOA,
 // global, affine gaps) as a two-row alignment, forward and on plain-reversed sequences, and writes the same measurements as
 // the default mode from the gapped rows (gap runs >= 50 bp, terminal gap runs, mismatches, located-site bases).
@@ -117,6 +119,23 @@ Walk walk(const std::string& a, const std::string& b, const std::vector<std::siz
     return w;
 }
 }  // namespace
+
+int distance_mode(const std::string& manifest, const std::string& out_path) {
+    std::ifstream in(manifest);
+    std::ofstream out(out_path);
+    out << "id\tlen_a\tlen_b\tedits\taln_len\n";
+    for (std::string line; std::getline(in, line);) {
+        if (line.empty()) continue;
+        std::vector<std::string> f;
+        std::stringstream ss(line);
+        for (std::string x; std::getline(ss, x, '\t');) f.push_back(x);
+        const std::string a = slurp(f[1]), b = slurp(f[2]);
+        const panvar::NwAlign nw = panvar::nw_edit_distance(a, b);
+        out << f[0] << '\t' << a.size() << '\t' << b.size() << '\t' << nw.edits << '\t' << nw.aln_len << '\n';
+        out.flush();
+    }
+    return 0;
+}
 
 int poa_mode(const std::string& manifest, const std::string& out_path) {
     std::ifstream in(manifest);
@@ -240,6 +259,7 @@ int minimap2_mode(const std::string& manifest, const std::string& out_path) {
 int main(int argc, char** argv) {
     if (argc == 4 && std::string(argv[1]) == "--minimap2") return minimap2_mode(argv[2], argv[3]);
     if (argc == 4 && std::string(argv[1]) == "--poa") return poa_mode(argv[2], argv[3]);
+    if (argc == 4 && std::string(argv[1]) == "--distance") return distance_mode(argv[2], argv[3]);
     if (argc != 3) {
         std::cerr << "usage: m10c_align_eval <manifest.tsv> <out.tsv>\n";
         return 2;
