@@ -25,7 +25,8 @@ WT = "/Users/davide.bolognini/panvar-worktrees/s1-d-panel-references"
 PROBE = f"{WT}/build/genotype_probe"
 ACOT_GFA = f"{R}/genotype_perf_bounded_20261015/inputs/acot/acot.gfa"
 ACOT_REF = "GRCh38#0#chr14:73416151-73668669"
-T = lambda p: list(csv.DictReader((l for l in open(p) if not l.startswith("#")), delimiter="\t"))
+# Amendment 2: a missing output (e.g. a timed-out call) is an absent result, never a crash; the cell stays in the denominator
+T = lambda p: list(csv.DictReader((l for l in open(p) if not l.startswith("#")), delimiter="\t")) if os.path.exists(p) else []
 KV = lambda p: {l.split("\t")[0]: l.rstrip("\n").split("\t")[1] for l in open(p) if "\t" in l and not l.startswith("#")} if os.path.exists(p) else {}
 os.makedirs(out, exist_ok=True)
 prep = f"{runs}/prepare.a1"   # Amendment 1

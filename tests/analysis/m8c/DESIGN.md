@@ -64,3 +64,10 @@ lineage re-check passed before that step.
 
 **Fix.** `prepare` creates the directory first. The unit re-runs as `prepare.a1`, and every later unit reads its outputs.
 Donor selection, seeds, panels and profiles are unchanged.
+
+## Amendment 2 (declared after `contrast` and `summary` exited 1; 827.1 s spent)
+
+**What failed.** The analysis read the outputs of the two timed-out HG01975 LOO calls, which do not exist.
+
+**Fix.** A missing output is treated as an absent result, so those cells stay in the denominator as resource failures. The
+units re-run as `contrast.a2` and `summary.a2`.

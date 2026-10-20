@@ -33,7 +33,10 @@ MANIFEST_P = ([("prepare", "prepare", "-", 90)] + [(f"call.{i}.{s}.{r}", "call",
 # Amendment 1 (declared after `prepare` exited 1 at 3.4 s): subsample does not create its output directory; prepare now creates
 # it. prepare.a1 replaces prepare (its directory is used by every later unit); the frozen order is otherwise unchanged.
 MANIFEST_A1 = [("prepare.a1", "prepare", "-", 90)] + [m for m in MANIFEST_P if m[0] != "prepare"]
-MANIFESTS = {"P": MANIFEST_P, "A1": MANIFEST_A1}
+# Amendment 2 (declared after `contrast` and `summary` exited 1 at 827.1 s): the analysis read the timed-out runs' missing outputs;
+# missing outputs are now absent results. contrast.a2 and summary.a2 replace them.
+MANIFEST_A2 = [("contrast.a2", "contrast", "-", 120), ("summary.a2", "summary", "-", 30)]
+MANIFESTS = {"P": MANIFEST_P, "A1": MANIFEST_A1, "A2": MANIFEST_A2}
 INPUTS = []
 
 
