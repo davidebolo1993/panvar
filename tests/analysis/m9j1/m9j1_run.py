@@ -22,7 +22,8 @@ PRE_FREEZE = 25.0   # disclosed: one development compile of compound_annotation_
 MANIFEST_P = [("build", "build", "-", 300), ("gate.compound_unit", "gate_compound", "-", 30), ("gate.junction_unit", "gate_junction", "-", 30),
               ("gate.sequence_report", "gate_seq", "-", 30), ("gate.e2e_sequence_first", "gate_e2e", "-", 240), ("sol_repro", "py", "-", 60),
               ("replay_compare", "py", "-", 150), ("saved_smoke", "py", "-", 60)]
-MANIFESTS = {"P": MANIFEST_P}
+MANIFEST_A1 = [("sol_repro.a1", "py", "-", 60)]   # Amendment 1: the reproducer linked like compound_annotation_test
+MANIFESTS = {"P": MANIFEST_P, "A1": MANIFEST_A1}
 
 
 def ledger_rows():
@@ -87,7 +88,7 @@ def command(kind, target, d):
     if kind == "gate_e2e":
         return [f"{BUILD}/genotype_command_e2e_test", d, WT], {"PANVAR_E2E_ONLY": "sequence_first"}, "caller-level sequence_first lifecycle"
     if kind == "py":
-        unit = os.path.basename(d)
+        unit = os.path.basename(d).split(".a")[0]
         return py(unit, d), None, unit
     raise ValueError(kind)
 

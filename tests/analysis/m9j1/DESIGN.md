@@ -64,3 +64,14 @@ Admission: spent + declared timeout of the next unit. Failed units stay recorded
 - `CHECKPOINT.md`: the development checkpoint (revision, effective experimental settings, declaration artifacts, required
   inputs and indexes, limitations). No merge, push or default promotion.
 - `QUALITY_TARGET.md`: the production quality target proposal, specification only; no threshold, no calibration.
+
+## Amendment 1 (after `saved_smoke`; all P units recorded)
+
+**Failure.** `sol_repro` exited 1 at **link time**, before the reproducer ran: my compile command linked `libpanvarlib.a`
+and `libedlib.a` only, while the library's archive members also need zlib, abpoa and minigraph (`_gzclose`, `_gzopen`, …).
+A harness defect; no library or caller change.
+
+**Fix.** Link with the `compound_annotation_test` target's own link line (`libabpoa.a`, `libminigraph.a`, `-lz`, plus
+`-lpthread`). The expected output and pass rule are unchanged.
+
+**Rerun:** `sol_repro.a1`. `sol_repro` stays recorded.

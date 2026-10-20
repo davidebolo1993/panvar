@@ -34,7 +34,8 @@ def write(name, rows):
 if mode == "sol_repro":
     shutil.copy(REPRO, f"{out}/repro.cpp")   # the reviewer's file, kept verbatim with the unit
     subprocess.run(["c++", "-std=c++17", "-O1", f"-I{WT}/include", f"{out}/repro.cpp", f"{WT}/src/cli_utils.cpp", f"{WT}/build/libpanvarlib.a",
-                    f"{WT}/build/libedlib.a", "-o", f"{out}/repro"], check=True)
+                    f"{WT}/build/libedlib.a", f"{WT}/external/abpoa/lib/libabpoa.a",   # Amendment 1: the test target's link line
+                    f"{WT}/external/minigraph/libminigraph.a", "-lz", "-lpthread", "-o", f"{out}/repro"], check=True)
     lines = subprocess.run([f"{out}/repro"], capture_output=True, text=True, check=True).stdout.splitlines()
     print("\n".join(lines))
     want = ["INCOMPLETE_DECISION_SET", "INCOMPLETE_DECISION_SET"]
