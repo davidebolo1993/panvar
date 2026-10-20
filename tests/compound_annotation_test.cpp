@@ -87,7 +87,7 @@ std::vector<std::map<std::string, std::string>> table(const std::string& path) {
 int replay(const std::string& manifest, const std::string& out_path) {
     std::ifstream in(manifest);
     std::ofstream out(out_path);
-    out << std::setprecision(17) << "case\tstatus\ttarget_resolution\tdecision_set_projections\tcompetitor\tsupport_lower\tsupport_upper\terror_lower\t"
+    out << std::setprecision(17) << "case\tstatus\ttarget_resolution\tdecision_set_groups\tdecision_set_missing_groups\tdecision_set_projections\tcompetitor\tsupport_lower\tsupport_upper\terror_lower\t"
                                     "error_upper\tgroups\tmissing_groups\tambiguous_groups\tzero_mass_groups\toriginal_total\tnormalisation_discrepancy\n";
     for (std::string line; std::getline(in, line);) {
         if (line.empty()) continue;
@@ -116,7 +116,8 @@ int replay(const std::string& manifest, const std::string& out_path) {
             if (group_index.count(g)) p.decision[group_index.at(g)] = true;
         }
         const CompoundAnnotationRow row = p.run(ids.at(f[5]), ids.at(f[6]), labels(f[3]), labels(f[4]));
-        out << f[0] << '\t' << row.status << '\t' << row.target_resolution << '\t' << row.decision_set_projections << '\t' << row.competitor << '\t'
+        out << f[0] << '\t' << row.status << '\t' << row.target_resolution << '\t' << row.decision_set_groups << '\t' << row.decision_set_missing_groups
+            << '\t' << row.decision_set_projections << '\t' << row.competitor << '\t'
             << row.support_lower << '\t' << row.support_upper << '\t' << row.error_lower << '\t' << row.error_upper << '\t' << row.groups << '\t'
             << row.missing_groups << '\t' << row.ambiguous_groups << '\t' << row.zero_mass_groups << '\t' << row.original_total << '\t'
             << row.normalisation_discrepancy << '\n';
@@ -200,6 +201,30 @@ int main(int argc, char** argv) {
               "decision-set members with different compound projections: unresolved, representative-only mass");
         Pool q{blocks, {{{x, x}}, {{y, y}}}, {0.5, 0.5}, {true, true}};
         check(q.run(1, 2, x, x).target_resolution == "RESOLVED", "decision-set members with synonymous labellings: resolved");
+    }
+    // M9-J.1 resolution fixtures (Sol's reproducer and its neighbours); bounds stay conservative, prediction untouched
+    {
+        const std::vector<std::vector<std::string>> one = {{"A"}};
+        const std::vector<std::size_t> p0 = {0};
+        Pool a{one, {{{p0, p0}}, {}}, {0.6, 0.4}, {true, true}};   // one known decision-set projection + one missing group
+        const auto r = a.run(0, 0, p0, p0);
+        check(r.target_resolution == "INCOMPLETE_DECISION_SET" && r.mass_reference.find("representative_projection_only") == 0 &&
+                  r.decision_set_missing_groups == 1 && std::fabs(r.support_upper - 1.0) < 1e-15 && std::fabs(r.support_lower - 0.6) < 1e-15,
+              "R1 known + missing decision-set group: INCOMPLETE, representative-only, bounds unchanged");
+        Pool b{one, {{}}, {0.4}, {true}};   // entirely missing decision set
+        const auto rb = b.run(0, 0, p0, p0);
+        check(rb.target_resolution == "INCOMPLETE_DECISION_SET" && rb.mass_reference != "the_resolved_target",
+              "R2 entirely missing decision set: INCOMPLETE, never the_resolved_target");
+        Pool c{one, {{{p0, p0}}}, {1.0}, {false}};   // no decision set flagged
+        const auto rc = c.run(0, 0, p0, p0);
+        check(rc.target_resolution == "NO_DECISION_SET" && rc.mass_reference != "the_resolved_target", "R3 absent decision set: NO_DECISION_SET, not resolved");
+        Pool d{blocks, {{{x, x}, {y, y}}, {}}, {0.7, 0.3}, {true, false}};   // missing NON-decision group only
+        const auto rd = d.run(1, 2, x, x);
+        check(rd.target_resolution == "RESOLVED" && rd.mass_reference == "the_resolved_target" && rd.missing_groups == 1 &&
+                  rd.status == "ASSESSED_WITH_MISSING_PROJECTIONS",
+              "R4 a missing non-decision group leaves the decision target RESOLVED (and the bounds conservative)");
+        Pool e{blocks, {{{x, x}}, {{z, z}}, {}}, {0.4, 0.4, 0.2}, {true, true, true}};   // differing AND missing
+        check(e.run(1, 2, x, x).target_resolution == "INCOMPLETE_DECISION_SET", "R5 differing projections plus a missing group: INCOMPLETE (unknown projection)");
     }
     // declarations: parse, fingerprint / block-id mismatch, non-consecutive, coalescing overlaps (adjacent stays apart)
     {

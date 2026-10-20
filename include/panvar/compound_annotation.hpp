@@ -20,9 +20,13 @@
 //   competitor (from projections, not mass): NO_EVALUATED_ALTERNATIVE | EVALUATED_ALTERNATIVE |
 //              EVALUATED_ALTERNATIVE_ZERO_MASS | UNKNOWN (missing groups, no recorded difference); never evidence of
 //              correctness
-//   target resolution: RESOLVED when every recorded labelling of every decision-set group projects to one target;
-//              otherwise UNRESOLVED_DECISION_SET, the decision-set projections are listed, and the bounds refer to the
-//              representative's projection only (mass_reference says so)
+//   target resolution (M9-J.1: decided independently of the mass bounds, over the decision-set groups only):
+//              NO_DECISION_SET          no group is flagged as a decision-set member
+//              INCOMPLETE_DECISION_SET  some decision-set group has no recorded labelling (its projection is unknown)
+//              UNRESOLVED_DECISION_SET  every decision-set group is projected and the projections differ
+//              RESOLVED                 every decision-set group is projected and all its labellings give one target
+//              only RESOLVED has mass_reference the_resolved_target; otherwise the bounds refer to the representative's
+//              projection only and mass_reference says why. Missing NON-decision groups never affect resolution.
 // Scope: explored candidates and recorded labellings only; pool-conditional and uncalibrated; nothing about unsearched
 // alternatives. Intervals are conservative declarations, not minimal or exhaustive.
 #include <cstddef>
@@ -70,6 +74,7 @@ struct CompoundAnnotationRow {
     std::size_t first = 0, last = 0;
     std::string blocks, sources, status = "UNASSESSED", target_resolution = "NA", mass_reference = "NA", competitor = "NA";
     std::size_t decision_set_projections = 0;
+    std::size_t decision_set_groups = 0, decision_set_missing_groups = 0;   // M9-J.1
     std::string decision_set_projection_digests = "NA";
     std::string target_a_sha256 = "NA", target_b_sha256 = "NA";
     std::size_t target_a_bp = 0, target_b_bp = 0;

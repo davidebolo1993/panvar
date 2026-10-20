@@ -170,6 +170,8 @@ CompoundAnnotationRow compound_assess(const CompoundAlleleBytes& bytes, std::siz
     std::set<std::pair<std::size_t, std::size_t>> ds;
     for (const CompoundGroup& g : groups) {
         if (!g.decision_set) continue;
+        ++row.decision_set_groups;
+        if (g.members.empty()) ++row.decision_set_missing_groups;   // M9-J.1: its projection is unknown
         for (const auto& [m1, m2] : g.members) ds.insert(pair_of(*m1, *m2));
     }
     row.decision_set_projections = ds.size();
@@ -184,9 +186,20 @@ CompoundAnnotationRow compound_assess(const CompoundAlleleBytes& bytes, std::siz
         row.decision_set_projection_digests.clear();
         for (const std::string& d : digests) row.decision_set_projection_digests += (row.decision_set_projection_digests.empty() ? "" : ";") + d;
     }
-    const bool resolved = ds.size() <= 1;
-    row.target_resolution = ds.empty() ? "NO_DECISION_SET" : resolved ? "RESOLVED" : "UNRESOLVED_DECISION_SET";
-    row.mass_reference = resolved ? "the_resolved_target" : "representative_projection_only_not_a_resolved_target";
+    // M9-J.1: resolution independent of the mass bounds; an incompletely projected decision set is never RESOLVED
+    if (row.decision_set_groups == 0) {
+        row.target_resolution = "NO_DECISION_SET";
+        row.mass_reference = "representative_projection_only_no_decision_set";
+    } else if (row.decision_set_missing_groups > 0) {
+        row.target_resolution = "INCOMPLETE_DECISION_SET";
+        row.mass_reference = "representative_projection_only_decision_set_incompletely_projected";
+    } else if (ds.size() == 1) {
+        row.target_resolution = "RESOLVED";
+        row.mass_reference = "the_resolved_target";
+    } else {
+        row.target_resolution = "UNRESOLVED_DECISION_SET";
+        row.mass_reference = "representative_projection_only_not_a_resolved_target";
+    }
     // masses
     Sum total;
     for (const CompoundGroup& g : groups) {
@@ -244,7 +257,8 @@ std::string render_compound_annotation(const CompoundAnnotation& a, const std::v
     std::ostringstream o;
     o << "# compound interval annotations (M9-I.1 contract v2); declarations " << a.declaration_path << " sha256=" << a.declaration_sha256
       << " status=" << a.declaration_status << "\n"
-      << "interval\tfirst_block\tlast_block\tblocks\tsources\ttarget_scope\tstatus\ttarget_resolution\tdecision_set_projections\t"
+      << "interval\tfirst_block\tlast_block\tblocks\tsources\ttarget_scope\tstatus\ttarget_resolution\tdecision_set_groups\t"
+         "decision_set_missing_groups\tdecision_set_projections\t"
          "decision_set_projection_digests\ttarget_hapA_sha256\ttarget_hapB_sha256\ttarget_hapA_bp\ttarget_hapB_bp\tmass_reference\tcompetitor\t"
          "support_lower\tsupport_upper\terror_lower\terror_upper\tgroups\tmissing_groups\tambiguous_groups\tzero_mass_groups\t"
          "original_total\tnormalisation_discrepancy\tlimitation\n";
@@ -257,7 +271,8 @@ std::string render_compound_annotation(const CompoundAnnotation& a, const std::v
         o << block_ids[r.first] << ".." << block_ids[r.last] << '\t' << block_ids[r.first] << '\t' << block_ids[r.last] << '\t' << blocks << '\t'
           << (sources.empty() ? "NA" : sources) << '\t'
           << "exact_unordered_pair_of_concatenated_interval_sequences;includes_within_interval_phase;not_structural_equivalence" << '\t'
-          << r.status << '\t' << r.target_resolution << '\t' << r.decision_set_projections << '\t' << r.decision_set_projection_digests << '\t'
+          << r.status << '\t' << r.target_resolution << '\t' << r.decision_set_groups << '\t' << r.decision_set_missing_groups << '\t'
+          << r.decision_set_projections << '\t' << r.decision_set_projection_digests << '\t'
           << r.target_a_sha256 << '\t' << r.target_b_sha256 << '\t' << r.target_a_bp << '\t' << r.target_b_bp << '\t' << r.mass_reference << '\t'
           << r.competitor << '\t' << num(r.support_lower) << '\t' << num(r.support_upper) << '\t' << num(r.error_lower) << '\t'
           << num(r.error_upper) << '\t' << r.groups << '\t' << r.missing_groups << '\t' << r.ambiguous_groups << '\t' << r.zero_mass_groups << '\t'
