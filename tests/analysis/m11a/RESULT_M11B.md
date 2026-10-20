@@ -163,3 +163,17 @@ differ:
 **cannot** distinguish good from bad predictions whose inputs are indistinguishable. This does **not** make calibration
 categorically impossible. Whether the documented failure classes have distinguishable truth-free inputs is an empirical
 question, addressed below.
+
+---
+## Correction to Q1's meaning (appended by M11-C; the associations above are unchanged)
+
+**What `PRIOR_ONLY` is not.** It does **not** mean "no fragment informs the block" (§2 and CALIBRATION_DESIGN Q1 said so).
+
+**What it is** (`block_genotype_read_supported`, `genotype_repair.cpp` / `genotype_command.cpp`). A block is `PRIOR_ONLY`
+when at least one **fragment contender** has a different unordered genotype at that block. A fragment contender is a ranked
+rival whose read-only fragment term is not certifiably below the winner's, within numeric bounds.
+
+**What follows:**
+- Both `READS` and `PRIOR_ONLY` are conditional on the explored, ranked pool and on representative labellings.
+- The lower floor attainment of PRIOR_ONLY blocks therefore means: where the reads did not separate the call from an
+  explored rival, the call was correct less often.

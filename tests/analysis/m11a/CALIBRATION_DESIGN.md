@@ -93,3 +93,11 @@ completed bounded search does not prove candidate adequacy.
 5. **Synonymous-artefact treatment.**
 6. **Validation acceptance:** ACOT 18, prior-score-exposed; C4 / CYP2D6 development-only. Read simulation for validation;
    5× first.
+
+---
+**Superseded in part (appended by M11-C).**
+- **Q1's definition:** see the correction in `RESULT_M11B.md`. PRIOR_ONLY means some fragment contender in the ranked pool
+  disagrees at the block.
+- **§2's stratified (Q1 × Q2 × Q3) scheme:** replaced by M11-C's two pre-declared candidates, C1 (`error_mass_upper`) and
+  C2 (+ Q1). Q2 and Q3 stay diagnostic only, as default-off outputs (`block_diagnostics`). See
+  `tests/analysis/m11c/RESULT.md` §4.
