@@ -68,7 +68,8 @@ for cell, c in CELLS.items():
             bind(cell, f"{k}_explicit", c[k] + "/candidates.explicit.tsv")
             bind(cell, f"{k}_fasta", c[k] + "/candidates.fa")
 
-    units = {r["name"]: int(r["unit_copies"]) for r in T(c["units"])}
+    # Amendment 1: M6-A units tables end with a '#' comment line (skipped)
+    units = {r["name"]: int(r["unit_copies"]) for r in T(c["units"]) if not r["name"].startswith("#")}
     t = c["t"]
     ucopy = lambda path: units.get(f"allele_{path.split(',')[t]}")
     cand = {r["candidate_id"]: r for r in T(c["run"] + ".mosaic_candidates.tsv")}
