@@ -104,7 +104,7 @@ if mode == "analyse":
         kinds = {b: (ev[b]["kind"] if b in ev else lg[b]["kind"] if b in lg else "unknown") for b in [r["block_id"] for r in sb]}
         # candidate genotypes at each block, for the high-confidence error inspection (evaluated label pairs and their groups)
         cand, scores = None, None
-        n_id = n_exact = n_err = n_hc_err = n_rep = 0
+        n_id = n_exact = n_err = n_hc_err = n_rep = n_unavail = n_unavail_hc = 0
         for r in sb:
             b = r["block_id"]
             kind = kinds.get(b, "unknown")
@@ -135,8 +135,11 @@ if mode == "analyse":
             blocks.append(row)
             if exact is True:
                 n_exact += 1
-            elif exact is False:
+            elif exact is False and stratum.startswith("floor-zero"):
                 n_err += 1
+            elif exact is False:   # Amendment 1: truth allele unavailable -- not a floor-zero error, counted apart
+                n_unavail += 1
+                n_unavail_hc += up < HIGH
             # legacy GQ comparison where the assumptions coincide: no mixed groups at this block (lower == upper) and a
             # single decision-set group (the legacy representative is then the v2 representative's group)
             g = r["legacy_representative_GQ"]
@@ -147,7 +150,7 @@ if mode == "analyse":
             elif g not in ("NA",):
                 gq.append(dict(cell=cell, block=b, error_mass_upper=up, error_from_legacy_GQ="not compared",
                                log10_ratio="assumptions differ (mixed groups or decision set > 1)"))
-            if up < HIGH and exact is False:
+            if up < HIGH and exact is False and stratum.startswith("floor-zero"):   # Amendment 1: floor-zero only, as frozen
                 n_hc_err += 1
                 if cand is None:
                     sc = {x["sequence_candidate_id"]: x for x in T(f"{d}/call.mosaic_scores.tsv")}
@@ -158,7 +161,7 @@ if mode == "analyse":
                 carriers = {gid for gid, h1, h2 in cand if sorted((int(h1[bi]), int(h2[bi]))) == t}
                 rep = scores.get(sl.get("representative_group", ""), max(scores.values(), key=lambda x: float(x["score"])))
                 lik = lambda x: float(x["fragment_term"]) + float(x["exposure_term"])
-                if r["representation_interval"] not in ("", "NA") or lo != up:
+                if r["representation_interval"] not in ("", "NA", "none") or lo != up:   # Amendment 1: 'none' = no interval
                     cat = "representation ambiguity"
                 elif not carriers:
                     cat = "correct block pair absent from evaluated candidates"
@@ -172,8 +175,9 @@ if mode == "analyse":
                                best_truth_pair_gap_prior=float(rep["sequence_pair_prior"]) - float(best["sequence_pair_prior"]) if best else "",
                                attribution="whole-hypothesis contrast only; not block-isolated (no block-local likelihood claim)"))
         fam.append(dict(cell=cell, family=FAMILY[dn], scheme=scheme, outcome=f.get("outcome", "NA"), sequence_status=f.get("sequence_status", "NA"),
-                        legacy_run_status=f.get("legacy_run_status", "NA"), reportable_blocks=n_rep, identified_reportable=n_id, exact=n_exact, errors=n_err,
-                        high_confidence_errors=n_hc_err, phase_support=f.get("legacy_phase_support", "NA"),
+                        legacy_run_status=f.get("legacy_run_status", "NA"), reportable_blocks=n_rep, identified_reportable=n_id, exact=n_exact, errors_floor_zero=n_err,
+                        high_confidence_errors_floor_zero=n_hc_err, not_exact_truth_unavailable=n_unavail,
+                        high_confidence_not_exact_truth_unavailable=n_unavail_hc, phase_support=f.get("legacy_phase_support", "NA"),
                         wall_seconds=f.get("wall_seconds", ""), peak_rss_gib=f.get("peak_rss_gib", "")))
     # reliability table: predeclared bins x stratum, LOO and LZO separately
     rel = []

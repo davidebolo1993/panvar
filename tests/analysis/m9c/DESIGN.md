@@ -162,3 +162,20 @@ The third category is never called a block-local likelihood defect, because ther
 - **phase**, reported from the legacy phase support per cell.
 
 **No calibration curve, fitting, GQ remapping, PASS rule, prior tuning, clustering or promotion.**
+
+## Amendment 1 (declared after `analyse`, before any further execution; calls, freeze and evaluations untouched)
+
+The first `analyse` (exit 0) has two defects in the high-confidence error inspection. It stays recorded.
+- **Interval value.** A block outside any interval has `representation_interval` `none`. The check treated only empty
+  and `NA` as "no interval", so every high-confidence error was classified "representation ambiguity". `none` now means
+  no interval.
+- **Stratum.** The inspection selected every not-exact block with `error_mass_upper` < 0.01, including blocks whose truth
+  allele is unavailable in the calling panel. Those are not errors that exact agreement could avoid. As frozen ("floor
+  zero, not exact"), the inspection is now restricted to floor-zero blocks.
+
+**Family table.** Its error columns are split into floor-zero errors and not-exact-with-truth-unavailable (each with a
+high-confidence count).
+
+**Unchanged:** the bins, strata, reliability table and accounting.
+
+**Rerun:** `analyse.a1` (manifest A1, timeout 60 s), into its own directory.

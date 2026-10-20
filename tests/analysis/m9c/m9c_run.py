@@ -28,7 +28,8 @@ MANIFEST_P = ([("build", "build", "-", 400), ("prepare", "prepare", "-", 120), (
                ("gate.e2e_sequence_first", "gate_e2e", "-", 240)]
               + [(f"call.{c}", "call", c, WATCHDOG) for c in CELLS] + [("freeze", "freeze", "-", 10)]
               + [(f"eval.{c}", "eval", c, 60) for c in CELLS] + [("analyse", "analyse", "-", 60)])
-MANIFESTS = {"P": MANIFEST_P}
+MANIFEST_A1 = [("analyse.a1", "analyse", "-", 60)]   # Amendment 1: analysis defects (interval "none"; floor-zero restriction)
+MANIFESTS = {"P": MANIFEST_P, "A1": MANIFEST_A1}
 
 
 def ledger_rows():
