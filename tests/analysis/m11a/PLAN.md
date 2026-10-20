@@ -162,3 +162,23 @@ M10-D scored **10 prediction rows over 5 cases**: **8 caller predictions** and *
 
 "Seven development cases" and "all seven development predictions" were inaccurate. The correction is appended to M10-D's
 RESULT.
+
+---
+## Correction (appended at M11-B, from Davide and Sol; the proposal above is preserved as the historical record)
+
+1. **The primary evaluation outcome is the established floor-adjusted, per-block sequence outcome:**
+   `excess = predicted-to-truth edit distance − best available-to-truth edit distance`. It is reported in bp and as its
+   existing diploid-length normalization (`scripts/genotype_report`), under the evaluator's denominator contract.
+   - The M10-D whole-region distance and QV is a **complementary diagnostic**, not the calibration outcome.
+   - No whole-locus floor, no QV cutoffs.
+   - §3's O1/O2 ordering and the QV-band decisions in §5 are **superseded**.
+2. **The first production target is confidence in each reported block genotype.**
+   - Its input is a **per-block** truth-free quantity: `error_mass_upper`, with `conditional_GQ` as the legacy equivalent.
+   - The locus-level `decision_set_probability` is kept separately, and is **not** broadcast onto blocks. §2's proposed
+     locus-level input is superseded for the block target.
+   - Completion and resource status gate assessability only. A completed bounded search does not prove that every better
+     candidate was explored.
+3. **Validation status of the 18 ACOT families:** unused for genotyping, but prior-score-exposed (M8-B). **Not** pristine
+   external validation.
+4. The development audit is `RESULT_M11B.md`. The revised pilot (M11-C) and its decisions are stated in terms of acceptable
+   excess and acceptable confident-error rate.
