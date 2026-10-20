@@ -2,6 +2,9 @@
 // node walks and the sorted graph's node sequences -- the model information a structural projection can reuse.
 //   additionally writes <out>.walks.tsv (block_index, allele_index, walk_index, walk as node+/- steps) and
 //   <out>.nodes.tsv (node, length, sequence) for every node any walk visits
+// M10-B.1 (additive): <out>.blocks.tsv (the locus report's per-block divergence trims, bypass and representation flags),
+//   <out>.sources.tsv (per allele: counts of walk / empty / bypass / other source records) and <out>.segments.tsv
+//   (invariant segment lengths), so the boundary transformation can be audited instead of assumed
 //
 // Builds the model exactly as genotype_probe's load_model does (reference sort with flipping, cactus snarls, bubbles,
 // locus input with the panel curation, prepare_genotype_model) and prints its fingerprint, so a caller can require it
@@ -96,6 +99,42 @@ int main(int argc, char** argv) {
                         for (std::string step; std::getline(ss, step, ',');) used.insert(step.substr(0, step.size() - 1));
                     }
                 }
+            }
+            std::ofstream sources(out + ".sources.tsv");
+            sources << "block_index\tallele_index\twalk_sources\tempty_sources\tbypass_sources\tother_sources\n";
+            for (std::size_t b = 0; b < model.blocks().size(); ++b) {
+                const panvar::PreparedGenotypeBlock& block = model.blocks()[b];
+                for (std::size_t a = 0; a < block.alleles.size(); ++a) {
+                    std::size_t w = 0, e = 0, y = 0, o = 0;
+                    for (const std::string& source : block.alleles[a].source_ids) {
+                        if (source.find("walk:") != std::string::npos) ++w;
+                        else if (source == "empty") ++e;
+                        else if (source == "bypass") ++y;
+                        else ++o;
+                    }
+                    sources << b << '\t' << a << '\t' << w << '\t' << e << '\t' << y << '\t' << o << '\n';
+                }
+            }
+            std::ofstream blocks(out + ".blocks.tsv");
+            blocks << "block_index\tmodel_block_id\treport_block_id\tkind\ttrimmed_prefix_bp\ttrimmed_suffix_bp\t"
+                      "representation_dependent\tbypass_templates\tsource_node\tsink_node\n";
+            const auto& report = built.report.blocks;
+            for (std::size_t b = 0; b < model.blocks().size(); ++b) {
+                blocks << b << '\t' << model.blocks()[b].block_id << '\t';
+                if (b < report.size()) {
+                    const panvar::LocusBlockReport& r = report[b];
+                    blocks << r.block_id << '\t' << (r.kind == panvar::GenotypeBlockKind::Variant ? "SV" : "context") << '\t'
+                           << r.trimmed_prefix_bp << '\t' << r.trimmed_suffix_bp << '\t' << (r.representation_dependent ? 1 : 0)
+                           << '\t' << r.bypass_templates << '\t' << (r.source_node.empty() ? "-" : r.source_node) << '\t'
+                           << (r.sink_node.empty() ? "-" : r.sink_node) << '\n';
+                } else {
+                    blocks << "MISSING\tNA\tNA\tNA\tNA\tNA\tNA\tNA\n";
+                }
+            }
+            std::ofstream segments(out + ".segments.tsv");
+            segments << "segment_index\tlength\n";
+            for (std::size_t i = 0; i < built.input.invariant_segments.size(); ++i) {
+                segments << i << '\t' << built.input.invariant_segments[i].size() << '\n';
             }
             std::ofstream nodes(out + ".nodes.tsv");
             nodes << "node\tlength\tsequence\n";
