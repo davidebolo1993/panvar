@@ -59,7 +59,17 @@ def manifest():
     return m
 
 
-MANIFESTS = {"P": manifest()}
+# Amendment 2 (after cmp.route.c4_5 and cmp.jp.c4_5 failed on non-scientific status keys; every scientific file identical):
+# comparator categories extended; controls rerun; the two C4 comparisons re-evaluated on the SAME saved runs; the CYP2D6 5x
+# units, recorded NOT RUN by the stop, run under .a2 names. Then manifest P continues with its remaining units.
+MANIFEST_A2 = [("controls.a2", "py", "controls", 120), ("cmp.route.c4_5.a2", "cmp", "route:O.c4_5:D0.c4_5", CMP_TIMEOUT),
+               ("cmp.jp.c4_5.a2", "cmp", "jp:D0.c4_5:D.c4_5", CMP_TIMEOUT)] + \
+    [(f"{arm}.cyp_5.a2", "cli", f"{arm}:cyp_5", TIMEOUT[arm]["cyp_5"]) for arm in ("REF", "O", "D0", "D")] + \
+    [(f"cmp.{mode}.cyp_5.a2", "cmp", f"{mode}:{CMP[mode][0]}.cyp_5:{CMP[mode][1]}.cyp_5", CMP_TIMEOUT) for mode in ("backend", "route", "jp")]
+SUPERSEDED = {"cmp.route.c4_5": "cmp.route.c4_5.a2", "cmp.jp.c4_5": "cmp.jp.c4_5.a2", "controls": "controls.a2"}
+ALIAS = {f"{arm}.cyp_5": f"{arm}.cyp_5.a2" for arm in ("REF", "O", "D0", "D")}   # run directories of the renamed units
+AMENDMENT_DEV = 10.0   # disclosed: Amendment 2 inspection and edits (seconds of compute, rounded up)
+MANIFESTS = {"P": manifest(), "A2": MANIFEST_A2}
 STOPPING = ("cmp.backend.", "cmp.route.", "cmp.jp.", "cmp.prepared.", "cmp.repeat.")   # Amendment 1: a failed JP invariant stops too
 CALLER = ("cli", "write", "loaded", "loaded1")
 
@@ -70,7 +80,7 @@ def ledger_rows():
 
 
 def spent():
-    return PRE_FREEZE + sum(float(r["wall_seconds"]) for r in ledger_rows())
+    return PRE_FREEZE + AMENDMENT_DEV + sum(float(r["wall_seconds"]) for r in ledger_rows())
 
 
 def done():
@@ -113,10 +123,11 @@ def run_status(d):
 def precondition(unit, kind, target):
     if kind != "build" and exit_of("build") != "0":
         return "the build failed"
-    gates = [m[0] for m in MANIFESTS["P"] if m[1] == "gate"] + ["controls", "declare"]
+    gates = [m[0] for m in MANIFESTS["P"] if m[1] == "gate"] + ["controls.a2", "declare"]
     if kind in CALLER and any(exit_of(g) != "0" for g in gates):
         return "a gate, the comparator controls or the declarations failed: stop before any caller run"
-    if kind in CALLER and any(r["unit"].startswith(STOPPING) and r["exit"] == "1" for r in ledger_rows()):
+    if kind in CALLER and any(r["unit"].startswith(STOPPING) and r["exit"] == "1" and
+                              exit_of(SUPERSEDED.get(r["unit"], "")) != "0" for r in ledger_rows()):
         return "an equivalence comparison failed: stop (an amendment is required before any further caller run)"
     if kind == "loaded" and exit_of(f"write.{target}") != "0":
         return "the index was not written"
@@ -128,9 +139,15 @@ def precondition(unit, kind, target):
     if kind == "cmp":
         mode, a, b = target.split(":")
         for side in (a, b):
+            side = rdir(side)
             if not os.path.exists(f"{OUT}/runs/{side}"):
                 return f"{side} has no run directory"
     return None
+
+
+def rdir(side):   # Amendment 2: a renamed unit's run directory ('D.cyp_5' -> 'D.cyp_5.a2'; 'loaded.cyp/cyp_5' unchanged)
+    head, _, tail = side.partition("/")
+    return ALIAS.get(head, head) + ("/" + tail if tail else "")
 
 
 def p1_compare_completed():
@@ -176,7 +193,7 @@ def command(unit, kind, target, d):
         return ["nice", f"{BUILD}/panvar", "genotype", *genotype_args(m10a.cells()[cell_id], prof, f"{d}/call")], None
     if kind == "cmp":
         mode, a, b = target.split(":")
-        return py(os.path.join(HERE, "m10a_compare.py"), mode, f"{OUT}/runs/{a}", f"{OUT}/runs/{b}", f"{d}/compare.tsv"), None
+        return py(os.path.join(HERE, "m10a_compare.py"), mode, f"{OUT}/runs/{rdir(a)}", f"{OUT}/runs/{rdir(b)}", f"{d}/compare.tsv"), None
     # persisted-index route (genotype_prepared_locus_driver): write-panel from the 5x args, then load and analyse in ONE process
     lo, hi = LOCI[target]
     samples = (lo,) if kind == "write" else (hi,) if kind == "loaded1" else (lo, hi)

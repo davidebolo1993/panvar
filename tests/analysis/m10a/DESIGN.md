@@ -217,3 +217,35 @@ footprint), the batch verdicts and a copy of the ledger.
    but never that the sequential batch completed.
 
 Each locus's two workloads are two coverages of **one** donor. They are not validation across biological samples.
+
+## Amendment 2 (after `cmp.route.c4_5` and `cmp.jp.c4_5` failed; no caller run since)
+
+**What failed.** Both C4 5× comparisons failed on **status keys only**. Every scientific file is byte-identical across REF,
+O, D0 and D: genotypes, scores, sequence locus and compound annotation have the same SHA-256 in all four arms.
+`cmp.backend.c4_5` passed. JP1.1 reported `junction_eligible_blocks 0` on C4. The keys outside the declared categories, with
+their inspected values:
+- `compound_seconds` (route and jp): the annotation's own timer, 0.000144 against 0.000155 s;
+- `footprint_checkpoint<N>_{phys_footprint_bytes, phys_footprint_peak_bytes, allocator_in_use_bytes, seconds}` (jp only):
+  14 checkpoints in both arms, with identical stage names; only the measured bytes and seconds differ. The `checkpoints`
+  category already covers these in `route` and `repeat`; I left it out of `jp`;
+- `repair_junction_proposals` in status, present in D only: the echo of the declared setting, whose value J3 checks in the
+  settings table.
+
+**Fix:**
+- `compound_seconds` is operational timing in every mode.
+- `checkpoints` is added to `jp`.
+- The one-sided status echo `repair_junction_proposals` joins the `junction` category.
+- **Prospectively**, `checkpoints` is also added to `prepared`, because cold and loaded runs measure footprints differently.
+
+No scientific file, column, setting, identity key or cap is excused.
+
+**Reruns (manifest A2):**
+- `controls.a2` replaces `controls` as the caller precondition;
+- `cmp.route.c4_5.a2` and `cmp.jp.c4_5.a2` are re-evaluated on the **same saved runs** (no caller rerun);
+- `REF/O/D0/D.cyp_5.a2` and their three comparisons. The stop recorded the original CYP2D6 5× units as NOT RUN; they keep
+  those ledger rows.
+
+**Then** manifest P continues with its remaining units. Comparisons that name a CYP2D6 5× arm resolve to the `.a2` run
+directories. A superseded failure stops nothing once its replacement passes.
+
+Disclosed development time for this amendment: 10 s, counted in the budget.

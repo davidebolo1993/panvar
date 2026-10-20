@@ -79,6 +79,12 @@ def load_v32(extra):
         if got:
             return got
         one = in_a != in_b
+        # Amendment 2: the annotation's own timer is timing (inspected: 0.00014-0.00016 s)
+        if "operational" in cats and not one and k == "compound_seconds":
+            return "operational"
+        # Amendment 2: the status echo of the declared JP setting (its value is checked in the settings table)
+        if "junction" in cats and one and k == "repair_junction_proposals":
+            return "junction"
         if "incumbent" in cats and ((one and INCUMBENT_ONE_SIDED.match(k)) or (not one and k in INCUMBENT_WORK)):
             return "incumbent"
         if "junction" in cats and one and JUNCTION_ONE_SIDED.match(k):
@@ -198,7 +204,7 @@ def jp(a, b, out):
     bad, eligible = jp_invariants(a, b)
     rows = [("mode", "jp"), ("junction_eligible_blocks", eligible), ("invariants_J1_J4", "pass" if not bad else "FAIL")]
     if not bad and eligible == "0":
-        code = run_v32(a, b, out, "operational,profile,junction", "repair_junction_proposals")
+        code = run_v32(a, b, out, "operational,profile,junction,checkpoints", "repair_junction_proposals")   # Amendment 2: checkpoints
         append(out, rows + [("identity_demanded", "yes (eligible 0)"), ("verdict", "PASS" if code == 0 else "FAIL")])
         print(open(out).read(), end="")
         return code
@@ -211,7 +217,7 @@ def jp(a, b, out):
         append(out, rows + [("problem", p) for p in bad] + [("verdict", "FAIL")])
         print(open(out).read(), end="")
         return 1
-    code = run_v32(a, b, out, "operational,profile,junction", "repair_junction_proposals")
+    code = run_v32(a, b, out, "operational,profile,junction,checkpoints", "repair_junction_proposals")
     la, lb = kv(os.path.join(a, "call.sequence_locus.tsv")), kv(os.path.join(b, "call.sequence_locus.tsv"))
     rows += [("identity_demanded", "no (JP1.1 changes candidate generation; invariants J1-J5 passed)"),
              ("identity_observed", "yes" if code == 0 else "no")]
@@ -243,7 +249,7 @@ def main():
     if mode == "route":
         code = run_v32(a, b, out, "operational,profile,route,admission,checkpoints,incumbent", ROUTE_KEYS)
     elif mode == "prepared":
-        code = run_v32(a, b, out, "operational,profile,prepared", "")
+        code = run_v32(a, b, out, "operational,profile,prepared,checkpoints", "")   # Amendment 2 (prospective): checkpoints
     elif mode == "repeat":
         code = run_v32(a, b, out, "operational,profile,checkpoints", "")
     elif mode == "jp":
