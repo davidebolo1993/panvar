@@ -96,3 +96,19 @@ the M10-B.1 dump's.
 **Not defined or changed:** no categorical "structurally correct" cutoff; no clusters; no posterior pooling; no change to
 GQ, confidence, filters, predictions, priors or caller code. No reads, families, parser, aligner, merge, push, cleanup or
 promotion. WIP, stash, indexes and earlier packages are preserved.
+
+## Wording correction (appended by M11-A; no rerun; the table above is unchanged)
+
+The title's "seven development cases evaluated" and the hand-off's "all seven development predictions" were inaccurate.
+
+M10-D scored **10 prediction rows over 5 cases**:
+- **8 caller predictions:** C4 NA19650 reported 3+1; C4 HG00096 call; CYP2D6 5× and 30×; ACOT L4 and L2, JP on and off.
+- **2 saved alternatives** from M1-B: C4 saved 2+2 and CYP2D6 saved 2+3. These are not caller predictions.
+
+**Scope:**
+- **Scored on the chain interior:** 7 rows (C4 ×3, ACOT ×4).
+- **Scored only on the named framed prefix sv:1..sv:15:** 3 rows (CYP2D6). Their chain-interior comparison is UNSUPPORTED
+  (truth haplotype 2, sv:17, not projectable).
+- **Flank-inclusive:** 7 rows, all UNSUPPORTED (unmatched endpoints).
+
+M10-D is accepted and closed as the sequence-similarity evaluation checkpoint.
