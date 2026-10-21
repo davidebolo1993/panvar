@@ -194,3 +194,13 @@ declared.
   frozen comparison. It was **not** selected here;
 - whether a continuous primary target (excess or normalized excess), and not the near-saturated top label (94% positive),
   should drive any later confidence work.
+
+## Addendum (M11-E, 2026-10-21): correction to the derived report
+
+`runs/report.a4/blocks_summary.tsv` column `artefact_bp` double-counts. It sums each interval's artefact bp over both flagged
+blocks of the interval (3,540 CYP2D6 / 32 ACOT / 3,572 all).
+- **Correct, once per interval:** **1,770 / 16 / 1,786** bp. §5 above already reports these values.
+- **The original report is preserved.** The corrected tables are in
+  `tests/results/m11e_catastrophic_attribution_20261021/runs/fixes/artefact_correction.tsv` and `artefact_intervals.tsv`.
+- **Eligibility annotations** for the M11-D blocks are in the same directory. These are all-empty blocks, and
+  representation-dependent blocks that are exact or unresolved at interval level; no label is changed.
