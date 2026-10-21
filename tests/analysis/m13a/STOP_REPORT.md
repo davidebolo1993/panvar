@@ -128,3 +128,20 @@ not a tuning step, and it should be made before any real contrast is opened.
 - one evaluation batch (6 contrasts at about 30–60 s each including base scans; under 600 s).
 
 **The question remains open.**
+
+## Closure (2026-10-21): qualifications appended; the historical record is unchanged
+
+**M13-A is closed as INCONCLUSIVE.** No real-case scoring and no accuracy claim.
+
+**Qualifications:**
+1. **Factorisation is verified only on the exhaustive fixtures** (engine = brute force). It is **not** established in
+   general by the joint-MAP interaction check, which tests one joint state.
+2. **Candidate-specific admission creates different truncated state spaces** for different candidates. Rankings of these
+   lower bounds do not certify rankings of the full marginals.
+3. **High admission counts in correct controls (99–217 sites) do not establish contamination or incorrect placement.**
+4. **A widened placement scan (band + 1)** would need a completeness argument covering combined substitutions, where
+   several sites change together.
+5. **Monte Carlo variance alone would not certify** that an approximate engine explored all important modes.
+
+**The proposed approximate engine is not implemented.** The diagnostic code (`tests/vt_marginal.hpp`,
+`tests/m13a_vt_gates.cpp`, `genotype_probe vt-score`) is preserved.
