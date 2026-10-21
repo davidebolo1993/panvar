@@ -59,3 +59,10 @@ results. The index saves locus preparation, not the sample's work.
 - the remaining limitations.
 
 The batch stops for review.
+
+## 4. Amendment A1 (declared after the run, before the rerun; the failed unit stays recorded)
+
+**The failure:** `ex.refusals_c4` failed 1 of 9 checks. Its curation manifest was written as `curation.txt` in the unit
+directory, inside the refusal prefix `curation`, so the "nothing written at the prefix" count included the manifest.
+**The refusal itself was correct:** exit 2, `panel curation` named, all four sentinels intact. The manifest is renamed
+`manifest_curation.txt`, and the unit is rerun once as `a1.ex.refusals_c4`. No other unit is affected.

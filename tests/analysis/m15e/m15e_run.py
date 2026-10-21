@@ -20,10 +20,13 @@ UNITS = [("build", 300), ("cli_contract", 60), ("e2e.prepared_locus", 150),
          ("ex.build_c4", 120), ("ex.build_cyp2d6", 120), ("ex.build_acot", 180),
          ("ex.index_c4", 240), ("ex.index_cyp2d6", 300), ("ex.index_acot", 400),
          ("ex.dosage_check_c4", 200), ("ex.two_samples_c4", 240), ("ex.refusals_c4", 180),
-         ("ctest.full", 1250)]
+         ("ctest.full", 1250),
+         # A1 (declared before the rerun): ex.refusals_c4's curation manifest was named inside the "curation" refusal prefix,
+         # so the nothing-written count included the manifest itself; renamed, the unit is rerun once (original kept)
+         ("a1.ex.refusals_c4", 180)]
 NEEDS = {"ex.index_c4": ["ex.build_c4"], "ex.index_cyp2d6": ["ex.build_cyp2d6"], "ex.index_acot": ["ex.build_acot"],
          "ex.dosage_check_c4": ["ex.build_c4"], "ex.two_samples_c4": ["ex.build_c4", "ex.index_c4"],
-         "ex.refusals_c4": ["ex.build_c4"]}
+         "ex.refusals_c4": ["ex.build_c4"], "a1.ex.refusals_c4": ["ex.build_c4"]}
 
 
 def command(unit, d):
@@ -35,7 +38,7 @@ def command(unit, d):
         return ["env", "PANVAR_E2E_ONLY=prepared_locus", f"{WT}/build/genotype_command_e2e_test", d]
     if unit == "ctest.full":
         return ["ctest", "--test-dir", f"{WT}/build", "-j", "1", "--timeout", "900", "--output-on-failure"]
-    return [sys.executable, os.path.join(HERE, "examples.py"), unit.split(".", 1)[1], d]
+    return [sys.executable, os.path.join(HERE, "examples.py"), unit.split("ex.", 1)[1], d]
 
 
 R = runner.Runner(OUT, BUDGET, PRE, UNITS, command, lambda u: [] if u == "build" else ["build"] + NEEDS.get(u, []),

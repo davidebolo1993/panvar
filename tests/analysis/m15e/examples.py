@@ -170,7 +170,7 @@ def ex_refusals_c4(d):
     idx = index_path("c4")
     graph_paths = [l.split("\t")[1] for l in open(E.CELLS["c4"]["graph"]) if l.startswith("P\t")]
     other_ref = next(p for p in graph_paths if p != E.CELLS["c4"]["ref"])
-    cur = f"{d}/curation.txt"
+    cur = f"{d}/manifest_curation.txt"   # A1: a name outside every refusal prefix (curation.txt was counted at prefix "curation")
     open(cur, "w").write(other_ref + "\n")
     data = open(idx, "rb").read()
     open(f"{d}/half_index.pvpl", "wb").write(data[: len(data) // 2])
