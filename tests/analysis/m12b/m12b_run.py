@@ -105,8 +105,25 @@ def command(unit, d):
     raise ValueError(unit)
 
 
+EVALUATE_RESERVE = 300   # amendment A2: evaluate's declared timeout, reserved before admitting any score unit
+
+
+class ReservingRunner(runner.Runner):
+    """Amendment A2 (AMENDMENT_A2.md): a score unit is admitted only if spent + its timeout + EVALUATE_RESERVE <= budget, so
+    the final evaluation can never be refused by scoring. Order, estimates and watchdogs are unchanged."""
+
+    def precondition(self, unit):
+        why = super().precondition(unit)
+        if why or not unit.startswith("score."):
+            return why
+        spent, timeout = self.spent(), dict(self.units)[unit]
+        if spent + timeout + EVALUATE_RESERVE > self.budget:
+            return f"budget: {spent:.1f} + {timeout} + evaluate reserve {EVALUATE_RESERVE} > {self.budget} s"
+        return None
+
+
 def make_runner():
-    return runner.Runner(OUT, BUDGET, PRE, units(), command, needs, revision=lambda: runner.git_revision(WT), require_clean=runner.git_clean(WT))
+    return ReservingRunner(OUT, BUDGET, PRE, units(), command, needs, revision=lambda: runner.git_revision(WT), require_clean=runner.git_clean(WT))
 
 
 def manifest():
