@@ -100,6 +100,8 @@ struct RunWatch {
     bool checkpoint_failed = false;
     std::string checkpoint_stage = "none";
     std::string checkpoint_locus;
+    // M15-D.1: a sequence_first_v2 run reports its termination in .sequence_locus.tsv even without the early incumbent
+    bool sequence_v2 = false;
 };
 // The one run in flight in this process, or null. Runs are sequential within a process.
 RunWatch* g_watch = nullptr;
@@ -501,7 +503,9 @@ struct PreparedLocusUse {
 };
 PreparedLocusUse g_prepared_use;
 
-std::string minimal_status(const RunWatch& watch, const std::string& state, const std::string& note) {
+// M15-D.1: `exit_code` is the process exit status of a terminal state (stop or failure), written beside the sequence
+// fields so the status, .sequence_locus.tsv and the process agree; -1 for the RUNNING record.
+std::string minimal_status(const RunWatch& watch, const std::string& state, const std::string& note, int exit_code = -1) {
     const FootprintSample footprint = physical_footprint();
     std::ostringstream text;
     text << std::setprecision(12) << "key\tvalue\nstatus\t" << state << "\nnote\t" << note
@@ -520,9 +524,12 @@ std::string minimal_status(const RunWatch& watch, const std::string& state, cons
          << '\n';
     for (const auto& hash : g_input_hashes) text << "sha256_" << hash.first << '\t' << hash.second << '\n';
     text << footprint_checkpoint_rows();   // S2-G (blocked route only)
+    if (exit_code >= 0) text << "exit_code\t" << exit_code << '\n';
     if (watch.early_incumbent) {   // S2-A
         text << "early_incumbent\texperimental_v1\ncheckpoint_committed\t" << (watch.checkpoint_committed ? "yes" : "no")
              << "\ncheckpoint_stage\t" << watch.checkpoint_stage << '\n';
+    }
+    if (watch.early_incumbent || watch.sequence_v2) {
         if (state == "FAILED") {   // an exception ended the run: an explicit failure, never a budget stop or fallback
             text << "sequence_prediction\tNO_PREDICTION\nsequence_completion\trun_failed\nsequence_exit_code\t2\n"
                     "checkpoint_retained\tno: a failed run keeps no checkpoint as a prediction\n";
@@ -532,7 +539,8 @@ std::string minimal_status(const RunWatch& watch, const std::string& state, cons
                  << (watch.checkpoint_failed ? "report_publication_failed"
                      : kept                  ? "budget_stop"
                                              : "budget_stop_before_first_evaluated_candidate")
-                 << "\nsequence_exit_code\t" << (watch.checkpoint_failed ? 2 : kept ? 3 : 1) << "\ncheckpoint_retained\t"
+                 << "\nsequence_exit_code\t" << (watch.checkpoint_failed ? 2 : kept ? 3 : exit_code >= 0 ? exit_code : 1)
+                 << "\ncheckpoint_retained\t"
                  << (kept ? "yes: <prefix>.sequence_* hold the last committed checkpoint (PROVISIONAL; search incomplete)"
                           : "no") << '\n';
         }
@@ -589,22 +597,24 @@ void stop_run(const std::string& state, const std::string& note, int code) {
                                                            "; the last committed checkpoint is kept (search incomplete)");
         text = with_key_value(text, "legacy_run_status", state);
         text = with_key_value(text, "checkpoint_search_status", "budget_stop:" + state);
-        atomic_write(g_watch->out_prefix + ".sequence_locus.tsv", text);
         code = 3;
+        text = with_key_value(text, "exit_code", "3");   // M15-D.1: the record states the process exit
+        atomic_write(g_watch->out_prefix + ".sequence_locus.tsv", text);
     } else if (!(g_watch->early_incumbent && g_watch->checkpoint_failed)) {
         // S1-C: the sequence-first reports are run-owned too; a stopped run never sits beside an earlier prediction
         for (const std::string& suffix : sequence_report_outputs()) std::filesystem::remove(g_watch->out_prefix + suffix, ignored);
-        if (g_watch->early_incumbent) {   // S2-A: the budget expired before any candidate was fully evaluated
+        if (g_watch->early_incumbent || g_watch->sequence_v2) {   // S2-A: the budget expired before any candidate was fully evaluated
+            // M15-D.1: exit_code is the process exit (124 time, 125 footprint), never a no-call's 1
             atomic_write(g_watch->out_prefix + ".sequence_locus.tsv",
                          "key\tvalue\nschema_version\tsequence_first_v2\nprediction\tNO_PREDICTION\nsequence_status\tNA\n"
                          "completion\tbudget_stop_before_first_evaluated_candidate\ncompletion_note\t" + state + ": " + note +
-                         "\nlegacy_run_status\t" + state + "\ncheckpoint_stage\tnone\nexit_code\t1\n");
+                         "\nlegacy_run_status\t" + state + "\ncheckpoint_stage\tnone\nexit_code\t" + std::to_string(code) + "\n");
         }
     } else {
         code = 2;   // S2-A: a checkpoint publication failed earlier; its failure record stays, never a fallback
     }
     std::filesystem::remove(g_watch->out_prefix + ".sorted.gfa", ignored);
-    atomic_write(g_watch->out_prefix + ".mosaic_status.tsv", minimal_status(*g_watch, state, note));
+    atomic_write(g_watch->out_prefix + ".mosaic_status.tsv", minimal_status(*g_watch, state, note, code));
     std::cerr << "[genotype] " << state << ": " << note << '\n';
     std::_Exit(code);
 }
@@ -2426,7 +2436,8 @@ void apply_genotype_setting(const std::string& context, const std::string& key, 
     else if (key == "test_interrupt_point") {   // S2-A TEST HOOK
         if (value != "none" && value != "before_first_evaluation" && value != "after_checkpoint" &&
             value != "union_scoring" && value != "adaptive_refinement" && value != "after_prefix_checkpoint" &&
-            value != "refinement_seed_census" && value != "post_refinement_guard" && value != "post_refinement_outputs") {
+            value != "refinement_seed_census" && value != "post_refinement_guard" && value != "post_refinement_outputs" &&
+            value != "footprint_before_first_evaluation") {
             throw std::runtime_error(context + ": 'test_interrupt_point' is none, before_first_evaluation, after_checkpoint, "
                                      "union_scoring or adaptive_refinement: " + value);
         }
@@ -3188,6 +3199,13 @@ GenotypeRunStatus run_genotype_body(const GenotypeCommandOptions& options, Genot
     const Clock::time_point started = Clock::now();
     StageTimings timings;
     const std::string status_path = options.out_prefix + ".mosaic_status.tsv";
+    // M15-D.1: a declared library (--library FILE) is read and validated in full BEFORE the prefix is touched, so a
+    // missing, unreadable or invalid file refuses the run with every file at the prefix left as it was. Errors found
+    // later (graph, reads, model, resources, writing) are not covered by this guarantee: by then the run owns the prefix.
+    if (!options.library_path.empty() && options.library_path != "auto") {
+        std::optional<double> preflight_background;
+        (void)read_library(options.library_path, preflight_background);
+    }
     // A run owns its output prefix. Outputs an earlier run left under the same prefix are removed before
     // anything else, so a run that stops early can never sit beside a previous ranking and look complete.
     remove_run_outputs(options.out_prefix);
@@ -3271,6 +3289,7 @@ GenotypeRunStatus run_genotype_body(const GenotypeCommandOptions& options, Genot
         watch->footprint_limit = options.footprint_limit_bytes;
         watch->time_limit = options.time_limit_seconds;
         watch->early_incumbent = g_incumbent.enabled;   // S2-A
+        watch->sequence_v2 = options.output_schema == "sequence_first_v2";   // M15-D.1
         g_watch = watch.get();
         write_running_status("model");
         if (options.footprint_limit_bytes != 0 || options.time_limit_seconds > 0.0) {
@@ -3310,7 +3329,7 @@ GenotypeRunStatus run_genotype_body(const GenotypeCommandOptions& options, Genot
                 // RUNNING behind, which a reader could take for a run still in progress.
                 if (!g_watch->finished && std::uncaught_exceptions() > 0) {
                     try {
-                        if (g_watch->early_incumbent && !g_watch->checkpoint_failed) {
+                        if ((g_watch->early_incumbent || g_watch->sequence_v2) && !g_watch->checkpoint_failed) {
                             // S2-A: a failure is never a fallback -- no committed checkpoint is left as a prediction
                             for (const std::string& suffix : sequence_report_outputs()) {
                                 std::remove((g_watch->out_prefix + suffix).c_str());
@@ -3324,7 +3343,7 @@ GenotypeRunStatus run_genotype_body(const GenotypeCommandOptions& options, Genot
                         }
                         atomic_write(g_watch->out_prefix + ".mosaic_status.tsv",
                                      minimal_status(*g_watch, "FAILED",
-                                                    "an exception ended the run before a final status"));
+                                                    "an exception ended the run before a final status", 2));
                     } catch (...) {
                     }
                 }
@@ -3685,6 +3704,9 @@ GenotypeRunStatus run_genotype_body(const GenotypeCommandOptions& options, Genot
         g_incumbent.seconds_selection = seconds_since(select_mark);
         if (options.test_interrupt_point == "before_first_evaluation") {
             stop_run("TIME_LIMIT", "test hook: before the first candidate evaluation completed", 124);
+        }
+        if (options.test_interrupt_point == "footprint_before_first_evaluation") {   // M15-D.1 TEST HOOK
+            stop_run("RESOURCE_REFUSAL", "test hook: footprint limit before the first candidate evaluation completed", 125);
         }
         // Full evaluation of that one pair under the unchanged scorer: every fragment, the admitted placements and
         // paired geometry, exposure (through the union pass's own route and caps), and the ranking's sequence prior.
@@ -8753,6 +8775,12 @@ int execute_genotype_command(const GenotypeCommandOptions& requested, const Prep
                          std::string("key\tvalue\ndosage_audit\tshadow\ndosage_audit_status\tFAILED\ndosage_audit_note\t") +
                              error.what() + "\n");
         }
+        // M15-D.1: a requested audit that did not complete is said on stderr (also under --quiet: it is a warning, not
+        // progress); the prediction is unchanged and DOSAGE_FILTER reports NOT_EVALUATED
+        if (audit_status != "COMPLETE" && audit_status != "NOT_RUN") {
+            std::cerr << "[genotype] WARNING: the requested dosage audit did not complete (" << audit_status << ": " << audit_note
+                      << "); the prediction is unchanged and DOSAGE_FILTER is NOT_EVALUATED\n";
+        }
     }
     if (options.block_diagnostics == "diagnostic_v1" && capture.model) {
         // M11-C (DIAGNOSTIC; nothing reads it): per-block census route and JP1.1 emission-tie condition. A value is written
@@ -8828,6 +8856,24 @@ int execute_genotype_command(const GenotypeCommandOptions& requested, const Prep
         if (v2_fasta_policy) {   // S1-D.1: the policy holds on failure too
             suppress_empty_dosage_fasta(options.out_prefix);
             suppress_legacy_fasta(options.out_prefix);
+        }
+        // M15-D.1: the process exits 2 (an output error), so the records that state an exit say 2 as well. The sequence
+        // report stays as published (its sequences are complete); the failure is named beside it.
+        if (sequence_first) {
+            const std::string why = std::string("FAILED: ") + error.what();
+            for (const std::string file : {options.out_prefix + ".sequence_locus.tsv", options.out_prefix + ".mosaic_status.tsv"}) {
+                try {
+                    std::ifstream in(file);
+                    if (!in) continue;
+                    std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+                    const bool locus = file.size() > 19 && file.compare(file.size() - 19, 19, ".sequence_locus.tsv") == 0;
+                    text = with_key_value(text, locus ? "exit_code" : "sequence_exit_code", "2");
+                    if (!locus) text = with_key_value(text, "exit_code", "2");
+                    text = with_key_value(text, "locus_output", why);
+                    atomic_write(file, text);
+                } catch (...) {
+                }
+            }
         }
         return 2;
     }

@@ -197,8 +197,20 @@ memory is not divided per thread.
 | **completed prediction** | 0 | `.sequence_locus.tsv` `prediction PREDICTION`, `completion completed_ranking` (even when uncertain); full block tables |
 | **PROVISIONAL** | 3 | the best **fully evaluated** candidate after a budget stop or declared cap (early-incumbent checkpoint). It is **not a completed search** and carries no decision set and no confidence |
 | **no prediction** | 1 | `prediction NO_PREDICTION` with `no_call_reason` (for example `distinct_tie`, `neighbourhood_bound`) |
-| time / footprint stop before any checkpoint | 124 / 125 | minimal status only (`NO_PREDICTION`, `TIME_LIMIT`) |
-| argument, input or output error | 2 | nothing at the prefix (refusals happen before any output) |
+| time / footprint stop before any checkpoint | 124 / 125 | minimal status (`TIME_LIMIT` / `RESOURCE_REFUSAL`) and a `NO_PREDICTION` `.sequence_locus.tsv` (`completion budget_stop_before_first_evaluated_candidate`) |
+| argument or declared-library error | 2 | **refused before the prefix is touched**: every file already there is left as it was |
+| input, model or output error found during the run | 2 | the run already owns the prefix: earlier run-owned outputs are gone and a `FAILED` status (or, after the sequence report was published, `locus_output FAILED: …`) says what happened |
+
+**Exit agreement:** the process exit, `.sequence_locus.tsv` `exit_code` and the status (`sequence_exit_code`, and
+`exit_code` for stops and failures) state the same value in every outcome above.
+
+**What is refused before the prefix is touched:**
+- contradictory or invalid arguments and profiles;
+- a declared `--library FILE` that is missing, unreadable or invalid (bad keys, values or format).
+
+**What is not:** errors that can only be found while running, such as unreadable reads, a graph or model refusal, a
+resource stop or a failed write. Those happen after the run has cleared its prefix. The guarantee is not "every error is
+transactional".
 
 The legacy schema uses 0 call / 1 no-call / 2 / 124 / 125.
 
@@ -224,7 +236,7 @@ PROVISIONAL or absent result as a completed one.
 | **representation (labelling) ambiguity** | per block `block_status`; `.representation_intervals.tsv` | `REPRESENTATION_AMBIGUOUS`: explored labellings **of the same sequence pair** differ at the block, so the **sequence may still be unique**. `GENOTYPE_UNRESOLVED`: the decision set disagrees on the block genotype. Computed over **explored** labellings only |
 | **phase** | `phase_support`, PHASE_FILTER | read-supported → PASS; prior-only → LOW_QUALITY `MODEL_ONLY_PHASE`; unresolved → NO_CALL; next to a homozygous block → NOT_APPLICABLE. A genotype-equivalent call has no phase and no FASTA |
 | **headline filters** | GENOTYPE_FILTER, DOSAGE_FILTER, PHASE_FILTER (per block and per locus, with `REASON@ids`) | **PASS means the computational and representation checks passed.** It is **not** calibrated reliability, and **no combination of PASS values establishes an exact or biologically correct genotype.** LOW_QUALITY reasons include a representation conflict, `LIBRARY_SENSITIVE` (`auto` only), unresolved dosage content and `MODEL_ONLY_PHASE`. NOT_EVALUATED means a check could not complete (dosage off, audit failed or underpowered, library audit incomplete). NO_CALL means a no-call |
-| **dosage audit** (only with `--dosage-check`) | `.dosage_status.tsv` (COMPLETE / FAILED / NOT_RUN, with note); block `dosage_status` | **disagreement:** CONTENT_REPAIRED, TRIGGERED_UNREPAIRED, SUSPECT. **Unavailable:** audit FAILED or NOT_RUN, or block UNDERPOWERED / NOT_EVALUATED. The audit **never** replaces haplotypes under v2. Its representatives appear only in dosage diagnostics (`REPRESENTATIVE_ONLY_NOT_RESOLVED`) |
+| **dosage audit** (only with `--dosage-check`) | `.dosage_status.tsv` (COMPLETE / FAILED / NOT_RUN, with note); block `dosage_status`. A requested audit that does not complete is also reported on stderr, even with `--quiet`, and DOSAGE_FILTER is NOT_EVALUATED (`audit_FAILED`), never consistent. Known case: the CYP2D6 development cell, where the audit's unit library refuses sv:9 (`alleles disagree on their flanks or anchor trims`) | **disagreement:** CONTENT_REPAIRED, TRIGGERED_UNREPAIRED, SUSPECT. **Unavailable:** audit FAILED or NOT_RUN, or block UNDERPOWERED / NOT_EVALUATED. The audit **never** replaces haplotypes under v2. Its representatives appear only in dosage diagnostics (`REPRESENTATIVE_ONLY_NOT_RESOLVED`) |
 | **conditional support** | `genotype_support` (READS / PRIOR_ONLY), `error_mass_lower/upper`, `legacy_representative_GQ`, `candidate_scope CONDITIONAL`, `structure_confidence NA` | conditional on the **explored** candidate pool. PRIOR_ONLY: the reads alone do not separate the call from an explored rival. **Uncalibrated:** in development, error mass did not predict block accuracy better than a constant baseline, and catastrophic blocks carried GQ up to 443 |
 
 **Descriptive warnings** (not rejection rules; see M15-B `CONTRACT.md`):

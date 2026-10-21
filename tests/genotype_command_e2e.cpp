@@ -4702,7 +4702,8 @@ void test_early_incumbent() {
         require(code == 124 && locus.at("prediction") == "NO_PREDICTION" &&
                     locus.at("completion") == "budget_stop_before_first_evaluated_candidate" &&
                     !exists(path("ei_before/call.sequence_haplotypes.tsv")) && st.at("status") == "TIME_LIMIT" &&
-                    st.at("sequence_exit_code") == "1" && st.at("checkpoint_committed") == "no",
+                    st.at("sequence_exit_code") == "124" && locus.at("exit_code") == "124" &&   // M15-D.1: the process exit
+                    st.at("checkpoint_committed") == "no",
                 "S2-A stop before the first evaluation: typed NO_PREDICTION, exit 124 (got " + std::to_string(code) + ")");
     }
     std::map<std::string, std::string> early_locus;
@@ -4873,6 +4874,193 @@ void test_early_incumbent_caps() {
     }
     std::cout << "  early incumbent caps: proposal, union, cumulative and neighbourhood stops keep the best evaluated "
                  "candidate as PROVISIONAL; a scoring inconsistency is an explicit no-prediction failure\n";
+}
+
+// ---- M15-D.1: a declared library is validated before the prefix is touched ------------------------------------------------
+// A missing, unreadable or invalid --library FILE refuses the run with every file at the prefix byte-identical and nothing
+// added -- through the CLI and the direct command API. (Errors found later, once the run owns the prefix, are not covered.)
+void test_declared_library_preflight() {
+    namespace fs = std::filesystem;
+    const std::string good = "insert_mean_bp 300\ninsert_sd_bp 30\nsupport_sigmas 4\nsubstitution_error 0.002\n"
+                             "outlier_weight 0.001\nfragment_start_intensity 0.085\nmarker_background 0.01\n";
+    struct Bad { std::string name, content, needle; bool create = true, unreadable = false; };
+    const std::vector<Bad> cases = {
+        {"missing", "", "cannot open library model file", false},
+        {"unreadable", good, "cannot open library model file", true, true},
+        {"repeated_key", good + "insert_sd_bp 30\n", "insert_sd_bp"},
+        {"unknown_key", good + "gap_open 4\n", "gap_open"},
+        {"missing_key", "insert_mean_bp 300\ninsert_sd_bp 30\n", "support_sigmas"},
+        {"negative_sd", "insert_mean_bp 300\ninsert_sd_bp -30\nsupport_sigmas 4\nsubstitution_error 0.002\n"
+                        "outlier_weight 0.001\nfragment_start_intensity 0.085\n", "insert standard deviation"},
+        {"non_finite", "insert_mean_bp nan\ninsert_sd_bp 30\nsupport_sigmas 4\nsubstitution_error 0.002\n"
+                       "outlier_weight 0.001\nfragment_start_intensity 0.085\n", "insert_mean_bp"},
+    };
+    const std::vector<std::string> sentinels = {".mosaic_status.tsv", ".sequence_locus.tsv", ".settings.tsv", ".genotypes.tsv",
+                                                ".sequence_haplotypes.fa", ".locus_genotype.tsv"};
+    for (const Bad& c : cases) {
+        for (const bool cli : {true, false}) {
+            const std::string rel = "lp_" + c.name + (cli ? "_cli" : "_api");
+            fs::remove_all(path(rel));
+            fs::create_directories(path(rel));
+            const std::string lib = path(rel + "/library.txt");
+            if (c.create) {
+                std::ofstream(lib) << c.content;
+                if (c.unreadable) fs::permissions(lib, fs::perms::none);
+            }
+            if (c.unreadable && std::ifstream(lib)) {   // e.g. run as root: the file is readable after all
+                std::cout << "  (unreadable-library case skipped: permissions do not apply to this user)\n";
+                fs::permissions(lib, fs::perms::owner_read | fs::perms::owner_write);
+                continue;
+            }
+            for (const std::string& suffix : sentinels) std::ofstream(path(rel + "/call" + suffix)) << "sentinel " << suffix << "\n";
+            std::string message;
+            int code = 0;
+            try {
+                if (cli) {
+                    code = panvar::run_genotype_command({"--graph", path("tiny_phaseable.gfa"), "--reference-path",
+                                                         "sampleA#1#chr1:0-100", "--reads1", path("phaseable_r1.fq"),
+                                                         "--reads2", path("phaseable_r2.fq"), "--library", lib, "--kmer-size", "21",
+                                                         "--syncmer-s", "11", "--threads", "1", "--quiet", "--out",
+                                                         path(rel + "/call")});
+                } else {
+                    panvar::GenotypeCommandOptions o =
+                        repair_options(rel + "/call", path("phaseable_r1.fq"), path("phaseable_r2.fq"), "tiny_phaseable.gfa");
+                    o.library_path = lib;
+                    code = panvar::execute_genotype_command(o, nullptr);
+                }
+            } catch (const std::exception& error) {
+                message = error.what();
+                code = 2;
+            }
+            if (c.unreadable) fs::permissions(lib, fs::perms::owner_read | fs::perms::owner_write);
+            require(code == 2 && message.find(c.needle) != std::string::npos,
+                    rel + ": refused (exit 2) naming '" + c.needle + "' (got exit " + std::to_string(code) + ": " + message + ")");
+            std::set<std::string> want = {"library.txt"};
+            for (const std::string& suffix : sentinels) {
+                want.insert("call" + suffix);
+                require(slurp(path(rel + "/call" + suffix)) == "sentinel " + suffix + "\n", rel + ": " + suffix + " left byte-identical");
+            }
+            if (!c.create) want.erase("library.txt");
+            const auto got = sf::files(path(rel));
+            require(std::set<std::string>(got.begin(), got.end()) == want, rel + ": nothing added or removed at the prefix");
+        }
+    }
+    std::cout << "  declared-library preflight: missing, unreadable and five invalid files refused before the prefix is touched "
+                 "(CLI and API; sentinels byte-identical)\n";
+}
+
+// ---- M15-D.1: termination statuses -- the process exit, .sequence_locus.tsv and the status agree, for every outcome ----
+void test_termination_consistency() {
+    namespace fs = std::filesystem;
+    const auto fresh = [&](const std::string& rel, bool early) {
+        fs::remove_all(path(rel));
+        fs::create_directories(path(rel));
+        panvar::GenotypeCommandOptions o =
+            repair_options(rel + "/call", path("phaseable_r1.fq"), path("phaseable_r2.fq"), "tiny_phaseable.gfa");
+        o.output_schema = "sequence_first_v2";
+        o.setting_sources["output_schema"] = "test";
+        if (early) {
+            o.early_incumbent = "experimental_v1";
+            o.setting_sources["early_incumbent"] = "test";
+        }
+        return o;
+    };
+    // every record that states an exit states the process's; `status_exit` is the status's own exit_code row, written for
+    // stops and failures (absent from an ordinary completed status, which reports sequence_exit_code only)
+    const auto agree = [&](const std::string& rel, int code, const std::string& prediction, const std::string& what,
+                           bool status_exit) {
+        const auto locus = sf::kv(path(rel + "/call.sequence_locus.tsv"));
+        const auto st = read_status(path(rel + "/call.mosaic_status.tsv"));
+        const std::string c = std::to_string(code);
+        require(locus.count("exit_code") && locus.at("exit_code") == c, what + ": .sequence_locus.tsv exit_code " +
+                                                                          (locus.count("exit_code") ? locus.at("exit_code") : "absent") + ", process " + c);
+        require(st.count("sequence_exit_code") && st.at("sequence_exit_code") == c,
+                what + ": status sequence_exit_code " + (st.count("sequence_exit_code") ? st.at("sequence_exit_code") : "absent") +
+                    ", process " + c);
+        if (status_exit) {
+            require(st.count("exit_code") && st.at("exit_code") == c,
+                    what + ": status exit_code " + (st.count("exit_code") ? st.at("exit_code") : "absent") + ", process " + c);
+        }
+        require(locus.at("prediction") == prediction && st.at("sequence_prediction") == prediction,
+                what + ": prediction " + locus.at("prediction") + " in the report, " + st.at("sequence_prediction") + " in the status");
+    };
+    // (1) time stop before any checkpoint: 124, no prediction
+    {
+        panvar::GenotypeCommandOptions o = fresh("tc_time", true);
+        o.test_interrupt_point = "before_first_evaluation";
+        const int code = s2a::execute_in_child(o);
+        require(code == 124, "time stop before a checkpoint: exit 124 (got " + std::to_string(code) + ")");
+        agree("tc_time", 124, "NO_PREDICTION", "time stop before a checkpoint", true);
+        require(read_status(path("tc_time/call.mosaic_status.tsv")).at("status") == "TIME_LIMIT" &&
+                    !exists(path("tc_time/call.sequence_haplotypes.tsv")),
+                "time stop before a checkpoint: TIME_LIMIT, no sequences");
+    }
+    // (2) footprint stop before any checkpoint: 125, no prediction (deterministic hook, not a memory race)
+    {
+        panvar::GenotypeCommandOptions o = fresh("tc_footprint", true);
+        o.test_interrupt_point = "footprint_before_first_evaluation";
+        const int code = s2a::execute_in_child(o);
+        require(code == 125, "footprint stop before a checkpoint: exit 125 (got " + std::to_string(code) + ")");
+        agree("tc_footprint", 125, "NO_PREDICTION", "footprint stop before a checkpoint", true);
+        const auto st = read_status(path("tc_footprint/call.mosaic_status.tsv"));
+        require(st.at("status") == "RESOURCE_REFUSAL" && st.at("no_call_reason") == "footprint_limit" &&
+                    !exists(path("tc_footprint/call.sequence_haplotypes.tsv")),
+                "footprint stop before a checkpoint: RESOURCE_REFUSAL (footprint_limit), no sequences");
+    }
+    // (3) a stop after a committed checkpoint: 3, PROVISIONAL
+    {
+        panvar::GenotypeCommandOptions o = fresh("tc_checkpoint", true);
+        o.test_interrupt_point = "after_checkpoint";
+        const int code = s2a::execute_in_child(o);
+        require(code == 3, "stop after a checkpoint: exit 3 (got " + std::to_string(code) + ")");
+        agree("tc_checkpoint", 3, "PROVISIONAL", "stop after a checkpoint", true);
+        require(exists(path("tc_checkpoint/call.sequence_haplotypes.tsv")), "stop after a checkpoint: the checkpoint's sequences kept");
+    }
+    // (4) an ordinary no-prediction outcome (a declared neighbourhood bound, no checkpoint to keep): 1
+    {
+        panvar::GenotypeCommandOptions o = fresh("tc_nocall", false);
+        o.repair_max_neighbours = 1;
+        const int code = panvar::execute_genotype_command(o, nullptr);
+        require(code == 1, "ordinary no prediction: exit 1 (got " + std::to_string(code) + ")");
+        agree("tc_nocall", 1, "NO_PREDICTION", "ordinary no prediction", false);
+    }
+    // (5) a completed prediction: 0 (the reference point of the contract)
+    {
+        const int code = panvar::execute_genotype_command(fresh("tc_predict", false), nullptr);
+        require(code == 0, "completed prediction: exit 0 (got " + std::to_string(code) + ")");
+        agree("tc_predict", 0, "PREDICTION", "completed prediction", false);
+    }
+    // (6) reporting failures: 2. A checkpoint that cannot be published (the existing S2-A publication contract) ...
+    {
+        panvar::GenotypeCommandOptions o = fresh("tc_publish", true);
+        fs::create_directories(path("tc_publish/call.sequence_alternatives.tsv.writing/blocker"));
+        const int code = panvar::execute_genotype_command(o, nullptr);
+        require(code == 2, "checkpoint publication failure: exit 2 (got " + std::to_string(code) + ")");
+        const auto st = read_status(path("tc_publish/call.mosaic_status.tsv"));
+        require(st.at("sequence_publication") == "FAILED" && st.at("sequence_exit_code") == "2" &&
+                    st.at("sequence_prediction") == "NO_PREDICTION",
+                "checkpoint publication failure: the status says FAILED, NO_PREDICTION and exit 2");
+        if (exists(path("tc_publish/call.sequence_locus.tsv"))) {
+            require(sf::kv(path("tc_publish/call.sequence_locus.tsv")).at("exit_code") == "2",
+                    "checkpoint publication failure: a sequence record, if any, says exit 2");
+        }
+        fs::remove_all(path("tc_publish/call.sequence_alternatives.tsv.writing"));
+    }
+    // ... and a locus table that cannot be written after the sequence report was published
+    {
+        panvar::GenotypeCommandOptions o = fresh("tc_locus", false);
+        fs::create_directories(path("tc_locus/call.locus_genotype.tsv.writing/blocker"));
+        const int code = panvar::execute_genotype_command(o, nullptr);
+        require(code == 2, "locus output failure: exit 2 (got " + std::to_string(code) + ")");
+        const auto locus = sf::kv(path("tc_locus/call.sequence_locus.tsv"));
+        const auto st = read_status(path("tc_locus/call.mosaic_status.tsv"));
+        require(locus.at("exit_code") == "2" && st.at("sequence_exit_code") == "2" && st.at("exit_code") == "2" &&
+                    locus.at("locus_output").rfind("FAILED: ", 0) == 0 && st.at("locus_output").rfind("FAILED: ", 0) == 0,
+                "locus output failure: the report and status say exit 2 and name the failure (report exit " + locus.at("exit_code") + ")");
+        fs::remove_all(path("tc_locus/call.locus_genotype.tsv.writing"));
+    }
+    std::cout << "  termination: 124 / 125 before a checkpoint, 3 PROVISIONAL, 1 no prediction, 0 prediction, 2 reporting "
+                 "failures -- process, .sequence_locus.tsv and status agree\n";
 }
 
 // ---- S2-D: opt-in progressive scheduling of the indexed union pass (union_progressive_schedule experimental_v1) --------
@@ -5773,6 +5961,8 @@ int main(int argc, char** argv) {
             test_sequence_first_v2_contract();
             test_early_incumbent();
             test_early_incumbent_caps();
+            test_termination_consistency();   // M15-D.1
+            test_declared_library_preflight();   // M15-D.1
             test_progressive_schedule();
             std::cout << "genotype command e2e (sequence_first only): PASS\n";
             return 0;
@@ -5824,6 +6014,8 @@ int main(int argc, char** argv) {
         test_sequence_first_v2_contract();
         test_early_incumbent();
         test_early_incumbent_caps();
+        test_termination_consistency();   // M15-D.1
+        test_declared_library_preflight();   // M15-D.1
         test_progressive_schedule();
         test_blocked_union_route();
         test_refinement_diagnostics();

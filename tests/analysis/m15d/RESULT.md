@@ -101,3 +101,21 @@ legacy`) are switched off and recorded `(inactive: <reason>)`. The same features
 - **Still open:** F1–F3 are reported, not fixed. The filter review and the advanced help are the next steps.
 
 **Stopped for review.**
+
+---
+
+## Qualification appended by M15-D.1 (2026-10-21)
+
+**F1 (CYP2D6 audit).**
+- **The original failed unit stays recorded as it ran:** `a2.ex.dosage_absent_cyp2d6`, 12 of 13 checks.
+- **The frozen M15-D expectation was incorrect for this known case.** It said that with `--dosage-check` "the audit
+  completes and the dosage filter is evaluated from it".
+- **What actually happens at the CYP2D6 development cell:**
+  - the audit's unit library refuses sv:9 ("alleles disagree on their flanks or anchor trims"), so the audit reports
+    FAILED, as it did in the archived M11-D run;
+  - the prediction is unchanged;
+  - DOSAGE_FILTER reads NOT_EVALUATED (`audit_FAILED`), never consistent.
+- **The unit-library model is not changed.** M15-D.1 verifies the honest reporting of this limitation and adds a stderr
+  warning when a requested audit does not complete.
+
+**F2 and F3** are corrected in M15-D.1: the declared library is preflighted, and the termination exit fields agree.

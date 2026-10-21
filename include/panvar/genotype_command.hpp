@@ -214,7 +214,8 @@ struct GenotypeCommandOptions {
     std::string early_incumbent = "off";
     // S2-A TEST HOOK (profile key test_interrupt_point): a deterministic time-limit stop at none |
     // before_first_evaluation | after_checkpoint | union_scoring | adaptive_refinement (after the first committed round) |
-    // after_prefix_checkpoint (S2-D: right after the progressive schedule's 32-pair checkpoint).
+    // after_prefix_checkpoint (S2-D: right after the progressive schedule's 32-pair checkpoint) |
+    // footprint_before_first_evaluation (M15-D.1: a footprint-limit stop, exit 125, where before_first_evaluation stops on time).
     std::string test_interrupt_point = "none";
     // S2-B TEST HOOK (API only): the early candidate's log-likelihood is moved one ulp before the union check, so the
     // check must fail the run explicitly (never a provisional fallback).

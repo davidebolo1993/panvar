@@ -94,8 +94,13 @@ What a run writes depends on its outcome:
 | strict call | 0 | yes | yes, phased | yes |
 | genotype-equivalent call | 0 | yes | yes, unordered | no |
 | no-call (model, library, search or tie) | 1 | yes | no | no |
-| time or footprint limit | 124 / 125 | minimal status only | no | no |
-| argument, input or output error | 2 | no locus summary | no | no |
+| time or footprint limit | 124 / 125 | minimal status (and, under `sequence_first_v2`, a `NO_PREDICTION` sequence record) | no | no |
+| argument or declared-library error | 2 | refused before the prefix is touched: existing files are left as they were | no | no |
+| input, model or output error during the run | 2 | a `FAILED` status; earlier run-owned outputs are already removed | no | no |
+
+The process exit, `.sequence_locus.tsv` `exit_code` and the status's `sequence_exit_code` (and `exit_code` for stops and
+failures) always agree. Only argument, profile and declared-library errors are refused before the prefix is touched;
+errors found while running are not.
 
 ### Reading the call
 
