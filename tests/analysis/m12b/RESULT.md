@@ -112,3 +112,20 @@ measurement.** Sequence content materially shapes it, even where it selects the 
 
 **What a resolution would need** (not run): the 6 C4 blocks lost to budget, including K1, scored under the same frozen rule
 with more time. That would test whether K1's correct state also yields a correct sequence.
+
+## Corrections (M12-C, 2026-10-21): interpretation only; results and decision unchanged
+
+1. **K5 (B06).** "No panel pair has the truth's state … an availability limit" means only that **no available pair matches
+   the truth's full pooled-feature vector**.
+   - **What it does not mean:** that the correct total copy number is unavailable.
+   - The selected pair 104/97 and the evaluator-best pair 95/10 have the **same** state, (4,2,2,2,2,0,0). Both differ from
+     the truth only in feature 3, which every panel allele carries at least once.
+   - Their feature-0 totals equal the truth's (4).
+2. **K5's worsening.** "Follows from forcing a state the panel cannot realise" is incorrect as an explanation.
+   - **The evaluator-best pair 95/10 was in the selected state and was scored.**
+   - The unchanged objective preferred 104/97 by 112.3 nats, and the count loss preferred it too.
+   - The worsening comes from the rule's **within-state** choice.
+3. **Safety.** "0 introduced large errors" is not evidence of safety. K5, an already-catastrophic prediction, got worse
+   (12,075 → 24,240). M12-C adds K1 (39,155 → 65,462).
+
+Details: `tests/analysis/m12c/RESULT.md`.
