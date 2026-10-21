@@ -17,11 +17,14 @@ OUT = f"{m11d.R}/m15f_filter_contract_20261021"
 # disclosed development: one scan of saved outputs for demonstration cases (15 s), a few file inspections, three dev
 # runs of the synthetic table (<1 s each); the two code inventories were read-only code reading (no execution)
 BUDGET, PRE = 600, 30.0
-UNITS = [("fidelity", 240), ("synthetic", 30), ("saved", 120)]
+UNITS = [("fidelity", 240), ("synthetic", 30), ("saved", 120),
+         # A1 (declared before the rerun): a no-call's model block ids come from the recorded id list (no file carries
+         # them); runs recorded before 02f846a are classified as an earlier rule, not as a port mismatch
+         ("a1.fidelity", 240)]
 
 
 def command(unit, d):
-    return [sys.executable, os.path.join(HERE, "contract.py"), unit, d]
+    return [sys.executable, os.path.join(HERE, "contract.py"), unit.split(".")[-1], d]
 
 
 R = runner.Runner(OUT, BUDGET, PRE, UNITS, command, lambda u: [], revision=lambda: runner.git_revision(WT),

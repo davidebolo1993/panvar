@@ -410,21 +410,32 @@ def saved_prefixes():
 
 def unit_fidelity(d):
     """The Python port reproduces every recorded headline value (locus filters, reasons, call summary)."""
-    ok = bad = skipped = 0
+    ok = bad = skipped = earlier = 0
     lines = ["prefix\tresult\tfirst_difference"]
     for p in saved_prefixes():
         L = facts(p)
         if not L["recorded"].get("genotype_filter"):
             skipped += 1
             continue
+        # A1: a no-call's units are the MODEL's blocks, which production passes in memory (apply_headline's block_ids) and
+        # no output file lists; they are taken from the recorded reasons' id list (an input fact, not an outcome)
+        if not L["blocks"] and L["recorded"].get("genotype_filter") == "NO_CALL":
+            rec_ids = L["recorded"].get("genotype_filter_reasons", "").split("@", 1)
+            if len(rec_ids) == 2 and rec_ids[1] != "locus":
+                L["block_ids"] = rec_ids[1].split(";")[0].split(",")
         c = current(L)
         diff = next((k for k in CURRENT_KEYS if c[k] != L["recorded"].get(k)), None)
+        # A1: runs recorded before 02f846a wrote COMPLETE_REPAIR_NOT_APPLIED without its :<reason> suffix (an earlier rule)
+        if diff and "/runs_a1e3ffd/" in p:
+            lines.append(f"{p.replace(R + '/', '')}\tearlier_rule_a1e3ffd\t{diff}")
+            earlier += 1
+            continue
         ok += diff is None
         bad += diff is not None
         lines.append(f"{p.replace(R + '/', '')}\t{'match' if diff is None else 'DIFF'}\t"
                      f"{'' if diff is None else diff + ': port=' + c[diff][:120] + ' recorded=' + str(L['recorded'].get(diff))[:120]}")
     open(f"{d}/fidelity.tsv", "w").write("\n".join(lines) + "\n")
-    print(f"fidelity: {ok} match, {bad} differ, {skipped} without a recorded headline (pre-headline runs)")
+    print(f"fidelity: {ok} match, {bad} differ, {earlier} recorded under an earlier rule (a1e3ffd), {skipped} without a recorded headline (pre-headline runs)")
     return 0 if bad == 0 else 1
 
 
