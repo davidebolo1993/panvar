@@ -28,6 +28,8 @@ sys.path.insert(0, os.path.join(HERE, "..", "m11e"))
 import m11e  # noqa: E402
 
 m11d = m11e.m11d
+import csv  # noqa: E402
+csv.field_size_limit(sys.maxsize)   # amendment A3: feature k-mer lists exceed csv's default 131,072-character field
 T, KV, write = m11d.T, m11d.KV, m11d.write
 fasta = functools.lru_cache(maxsize=None)(m11d.fasta)
 M11D = m11e.M11D

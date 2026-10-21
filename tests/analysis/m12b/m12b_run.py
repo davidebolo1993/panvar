@@ -31,7 +31,8 @@ def plan():
 
 
 def units():
-    return STATIC + [(r["unit"], int(r["timeout_s"])) for r in plan()] + [("evaluate", 300)]
+    # amendment A3: evaluate failed on csv's field-size limit (C4 feature k-mer lists); re-run as evaluate.a3
+    return STATIC + [(r["unit"], int(r["timeout_s"])) for r in plan()] + [("evaluate", 300), ("evaluate.a3", 300)]
 
 
 def needs(unit):
@@ -47,7 +48,7 @@ def needs(unit):
         return ["gate.selftest"]
     if unit.startswith("score."):
         return ["build", "gate.selftest", "gate.order", "gate.features.a1", "select"]
-    if unit == "evaluate":
+    if unit in ("evaluate", "evaluate.a3"):
         return ["select"]
     return []
 
@@ -76,6 +77,8 @@ def command(unit, d):
         return py + ["gate_order", d]
     if unit == "gate.features.a1":
         return py + ["gate_features", d]
+    if unit == "evaluate.a3":
+        return py + ["evaluate", d]
     pc = f"{OUT}/runs/preflight_candidates"
     if unit.startswith("preflight."):
         locus = unit.split(".", 1)[1]
