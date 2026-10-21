@@ -208,11 +208,13 @@ int main() {
         threw = false;
         try { genotype_preset_settings("c4"); } catch (const std::exception&) { threw = true; }
         require(threw, "an unknown preset (no locus presets) is refused");
+        // M15-D: the preset carries the release candidate's resource configuration (cache budgets, consumption
+        // capacities, the footprint guard, the state-class cap and the model neighbourhood bound), but never a time
+        // limit, a dosage stage, a candidate count, a reference or a locus-specific number.
         for (const auto& [k, v] : genotype_preset_settings("short-read")) {
-            const bool forbidden = k.find("max_") == 0 || k.find("cache") != std::string::npos || k.find("limit") != std::string::npos ||
-                                   k.find("consumed") != std::string::npos || k.find("repair_max_") == 0 || k == "max_mosaic_candidates" ||
-                                   k.find("dosage") != std::string::npos || k.find("reference") != std::string::npos || k == "repair_max_neighbours";
-            require(!forbidden || k == "proposal_state_limit", "the preset sets no resource, candidate-count, dosage or reference key (" + k + ")");
+            const bool forbidden = k == "time_limit_seconds" || k == "dosage_mode" || k == "dosage_audit" || k == "max_mosaic_candidates" ||
+                                   k.find("reference") != std::string::npos || (k == "repair_max_neighbours" && v != "model");
+            require(!forbidden, "the preset sets no time limit, dosage stage, candidate count, reference or locus-specific cap (" + k + ")");
         }
         require(std::isnan(genotype_preset_library("short-read").insert_mean_bp), "the preset declares no insert");
     }

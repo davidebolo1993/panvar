@@ -20,28 +20,38 @@ Algorithm and worked trace: [algorithms/genotype.md](../algorithms/genotype.md).
 - `--graph <graph.gfa>` (alias `--gfa`): the locus graph. Every path (`P` or `W` line) is a panel haplotype unless curated out, and must cross the whole locus; a path covering only part of it refuses the run.
 - `--reads1 <r1.fq>`, `--reads2 <r2.fq>`: paired FASTQ, optionally gzipped, mates in the same order.
 - `--out <prefix>` (alias `--out-prefix`; default `genotype`). Earlier `genotype` outputs under the prefix are removed first.
-- The coordinate reference: `--reference-path`, or the graph's `RS:Z` sample, which must name exactly one path.
+- The coordinate reference: `--reference-path`, or the graph's `RS:Z` sample, which must name exactly one path. Otherwise the run is refused and the candidate paths are listed.
 - The read library:
   - **Omitted or `--library auto`:** the insert distribution and fragment-start intensity are estimated from the reads. An invalid estimate refuses the run (`LIBRARY_REFUSED`); there is no fallback.
   - **`--library FILE`:** the exactly reproducible route. One `key value` per line: `insert_mean_bp`, `insert_sd_bp`, `support_sigmas`, `substitution_error`, `outlier_weight`, `fragment_start_intensity`, and optionally `marker_background`, each once. Blank lines and `#` comments are allowed. Unknown, repeated or missing keys, trailing content and non-finite values are refused, with the file, line and key named. The gap model is fixed and cannot be declared.
 
 ```bash
-panvar genotype --graph locus.gfa --reads1 R1.fq.gz --reads2 R2.fq.gz --out sample
+panvar genotype --graph locus.gfa --reads1 R1.fq.gz --reads2 R2.fq.gz --threads 4 --out sample
 ```
 
-This runs `--preset short-read`, the default preset. Settings are applied in a fixed order, whatever the order of the arguments: a flag over `--profile` over the preset over the built-in default. Every effective setting and its source go to `<prefix>.settings.tsv`.
+This runs `--preset short-read`, the default preset. No profile is needed. The preset carries:
+- the production algorithm and the short-read constants;
+- the accelerated exact computational backends, with their cache budgets and capacities;
+- junction proposals (`repair_junction_proposals experimental_v1`, a candidate-generation setting);
+- the early evaluated incumbent;
+- the `sequence_first_v2` report with the compound annotation;
+- a 6 GiB footprint guard;
+- the model's own repair-neighbourhood bound (`repair_max_neighbours model`).
+
+It sets no time limit and no dosage stage. The usage guide lists every value. Settings are applied in a fixed order, whatever the order of the arguments: a flag over `--profile` over the preset over the built-in default. Every effective setting and its source go to `<prefix>.settings.tsv`.
 
 ## Key options
 
 | flag | what it does | default |
 |------|--------------|---------|
-| `--library auto\|FILE` | estimate the library or declare it | `auto` |
-| `--dosage-mode off\|audit\|repair` | the [dosage stage](#dosage-modes) | `off`; `audit` under `sequence_first_v2`, where `repair` is refused |
+| `--library auto\|FILE` | estimate the library or declare it | `auto` (omitted = auto) |
+| `--dosage-check` | run the [dosage audit](#dosage-modes); never changes the prediction | not run (reported NOT_EVALUATED) |
+| `--dosage-mode off\|audit\|repair` | expert spelling of the dosage stage. `audit` = `--dosage-check`; `repair` needs `--output-schema legacy`; a contradiction with `--dosage-check` is refused | `off` |
 | `--panel-curation <file>` | remove named paths from the active panel ([below](#panel-curation)) | — |
 | `--threads <N>` | worker threads; results do not depend on them | `1` |
 | `--mosaic-candidates <K>` | off-panel mosaics evaluated beside the panel pairs; `0` evaluates panel pairs only | `128` |
 | `--bubbles <file>` | precomputed bubbles CSV instead of detected variant sites | detected |
-| `--profile <file>` | a `key<TAB>value` settings file (it must name itself; repeated `--profile` files apply in order). The tested complete configurations are `profiles/genotype_experimental_sr_v1_<locus>.tsv` (experimental) | — |
+| `--profile <file>` | an optional expert override: a `key<TAB>value` settings file (it must name itself; repeated `--profile` files apply in order). `profiles/genotype_experimental_sr_v1_<locus>.tsv` reproduce the evidence configurations | — |
 | `--adaptive-repair on\|off`, `--repair-rounds <N>` | the bounded coordinate refinement (local moves scored exactly within declared caps; not a global optimum) and its round cap; `off` or `0` rounds gives the unrepaired view, with tie branching off. Contradictory combinations are refused | `on`, `32` |
 | `-q, --quiet` | no progress messages | off |
 
@@ -151,9 +161,11 @@ What a run writes depends on its outcome:
 
 **Confidence.** `structure_confidence` is `NA` (`UNCALIBRATED`).
 
-### Sequence-first output v2 (experimental, opt-in)
+### Sequence-first output v2 (experimental; the short-read preset's report)
 
-**How to enable it.** Use `--output-schema sequence_first_v2`. It is a separate contract: `sequence_first_v1` and the default `legacy` are unchanged.
+**How it is selected.** The short-read preset sets `output_schema sequence_first_v2`, and `--output-schema` selects any schema
+explicitly. The unrepaired view (`--adaptive-repair off` or `--repair-rounds 0`) reports with `legacy`. `sequence_first_v1`
+and `legacy` are unchanged.
 
 **What it adds to v1:**
 - **Panel membership.** Each predicted haplotype, completed or provisional, is classified by exact sequence identity, in the locus frame, against the active (curated) panel.
@@ -172,9 +184,10 @@ What a run writes depends on its outcome:
   Every other legacy table and audit diagnostic is unchanged.
 
 **Dosage is diagnostic under v2:**
-- **default:** `--dosage-mode` defaults to `audit`;
-- **`off`:** allowed (also as `--dosage-audit off`), and recorded as not evaluated;
-- **`repair`:** refused before the output prefix is touched. Reproduce historical repair results with the legacy contract.
+- **default:** not run, and reported as not evaluated. v2 no longer implies the audit;
+- **`--dosage-check`** (or `--dosage-mode audit`): the audit, which never changes the prediction;
+- **`repair`:** refused before the output prefix is touched. Reproduce historical repair results with the legacy contract
+  (`--output-schema legacy --dosage-mode repair`).
 
 The command line, `execute_genotype_command` and the prepared-locus command route all resolve this through one function, `resolve_dosage_contract`. An API caller declares a mode with `dosage_mode_explicit` or a non-default `dosage_mode`. `dosage_mode_source` records the setting actually used. `run_genotype` and `run_genotype_prepared` call the caller alone, with no dosage stage, and record `dosage_mode not_run`.
 
@@ -182,9 +195,12 @@ The audit never changes the prediction or its sequences. It is not run when the 
 
 **Extraction:** `tests/analysis/s1d/extract_panel_haplotype.py --check <graph.gfa> <prefix>.sequence_haplotypes.tsv` extracts every listed panel path and checks its hash and length.
 
-### Early evaluated incumbent (experimental, opt-in)
+### Early evaluated incumbent (experimental; on under the short-read preset)
 
-**How to enable it.** Set the profile key `early_incumbent experimental_v1`. It requires `sequence_first_v2` and the adaptive repair, and is refused otherwise. Off (the default) changes nothing.
+**How it is selected.** The short-read preset sets `early_incumbent experimental_v1`, or the profile key sets it explicitly.
+- **Requirements:** it needs `sequence_first_v2` and the adaptive repair.
+- **When they are missing:** a preset-sourced setting is switched off and recorded inactive; an explicit setting is refused.
+- **When off:** it changes nothing.
 
 **What happens.**
 - **Selection.** After the markers, before the mosaic proposal and the union pass, one panel diplotype is selected. It is the argmax of the existing proposal marker emissions plus the exact path prior over the panel pairs, with ties going to panel order. This uses table lookups only and is not a winner claim.
@@ -211,12 +227,15 @@ The audit never changes the prediction or its sequences. It is not run when the 
 - Reported block alleles are active panel alleles. A sequence absent from the active panel cannot be reported as an authoritative panel allele; the caller may select a representable alternative or make a no-call.
 - GQ and the conditional posterior are conditional on the evaluated candidates and are not externally calibrated.
 - Conditional dosage content corrects copy numbers, not the exact diplotype. When several arrangements of repeated units fit equally, which homologue carries each unit stays unresolved, and the caller's alleles are reported.
-- Resource use grows with the active panel, the reads and the repair search. A repair neighbourhood larger than `--repair-max-neighbours` ends in a no-call (`neighbourhood_bound`).
+- Resource use grows with the active panel, the reads and the repair search. A numeric `--repair-max-neighbours` below a neighbourhood ends in a no-call (`neighbourhood_bound`). The preset's `model` bound records the model's own maximum and compares no external cap.
+- No time limit is set by default. The 6 GiB footprint guard is sampled, not an allocation ceiling.
 
 ## Example
 
 ```bash
-panvar genotype --graph locus.gfa --reads1 R1.fq.gz --reads2 R2.fq.gz --out sample --threads 8
+panvar genotype --graph locus.gfa --reads1 R1.fq.gz --reads2 R2.fq.gz --out sample --threads 4
 panvar genotype --graph locus.gfa --reads1 R1.fq.gz --reads2 R2.fq.gz --out sample \
-  --library library.txt --dosage-mode repair --threads 8
+  --library library.txt --dosage-check --threads 4
+panvar genotype --graph locus.gfa --reads1 R1.fq.gz --reads2 R2.fq.gz --out sample \
+  --library library.txt --output-schema legacy --dosage-mode repair --threads 4   # the legacy repair
 ```

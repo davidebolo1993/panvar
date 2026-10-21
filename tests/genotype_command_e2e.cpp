@@ -5025,8 +5025,12 @@ bool shared_volatile(const std::string& k) {
         "union_origin_cache_payload_bytes", "union_origin_cache_peak_bytes", "union_cached_origins_consumed",
         "union_cached_states_consumed", "physical_origins", "statistical_state_classes", "latent_alignment_pairs",
         "valid_fr_states", "piece_hits", "full_read_verifications", "dp_evaluations", "proposed_starts", "unique_starts",
-        "accepted_mate_placements", "reused_physical_origins", "reused_state_aggregates", "merged_state_classes"};
-    return std::regex_search(k, timing) || names.count(k) != 0;
+        "accepted_mate_placements", "reused_physical_origins", "reused_state_aggregates", "merged_state_classes",
+        // M15-D: served work of the exact prefilter cache the short-read preset enables
+        "union_cached_prefilters_consumed", "union_completed_blocks_cached_prefilters_consumed"};
+    // M15-D: the exact emission and prefilter caches' accounting (executed / served work), per-block executed DPs, timing
+    static const std::regex executed("^emission_cache_|^union_prefilter_cache_|^union_block[0-9]+_executed_dps$|_seconds$");
+    return std::regex_search(k, timing) || std::regex_search(k, executed) || names.count(k) != 0;
 }
 // the combined route's own resource rows, when both runs write them (memory and time of the same work)
 bool route_resource(const std::string& k) {
@@ -5083,7 +5087,10 @@ void require_same_science(const std::string& control, const std::string& integra
         }
         if (f == "call.settings.tsv") {
             auto x = sf::kv(a), y = sf::kv(b);
-            if (x.count("union_fragment_blocks") == 0) y.erase("union_fragment_blocks");
+            if (x.count("union_fragment_blocks") == 0 || x.at("union_fragment_blocks").rfind("off", 0) == 0) {   // M15-D: declared off
+                x.erase("union_fragment_blocks");
+                y.erase("union_fragment_blocks");
+            }
             if (threads_differ) { x.erase("threads"); y.erase("threads"); }
             if (profiles_differ) {   // two profile files by construction: compare values, not the source column
                 for (auto* m : {&x, &y}) for (auto& [k, v] : *m) v = v.substr(0, v.find('\t'));
@@ -5182,7 +5189,9 @@ void test_blocked_union_route() {
                                                      "union_origin_cache_bytes\t67108864\nmax_union_cached_placements_consumed\t2000000000\n"
                                                      "max_union_cached_origins_consumed\t2000000000\nmax_union_cached_states_consumed\t2000000000\n"
                                                      "max_union_cached_prefilters_consumed\t2000000000\nunion_fragment_blocks\tfine_core_4096_experimental\n";
-        std::ofstream(path("bu_cli_off_profile.tsv")) << "profile\ts2g-test-off\nunion_scoring_backend\tindexed_fine_experimental\n"
+        // M15-D: the short-read preset blocks the union by default; the control declares the unblocked route
+        std::ofstream(path("bu_cli_off_profile.tsv")) << "profile\ts2g-test-off\nunion_fragment_blocks\toff\n"
+                                                         "union_scoring_backend\tindexed_fine_experimental\n"
                                                          "indexed_union_store_bytes\t268435456\nindexed_union_evidence_layout\tfine_views_experimental\n"
                                                          "union_origin_cache_bytes\t67108864\nmax_union_cached_placements_consumed\t2000000000\n"
                                                          "max_union_cached_origins_consumed\t2000000000\nmax_union_cached_states_consumed\t2000000000\n"

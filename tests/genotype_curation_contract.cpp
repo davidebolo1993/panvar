@@ -108,6 +108,8 @@ int run(const std::string& tag, const std::string& reads, const std::string& mod
     std::vector<std::string> args = {"--graph", path(tag + ".gfa"), "--reference-path", "sampleA#1#chr1:0-100",
                                      "--reads1", path(reads + "_r1.fq"), "--reads2", path(reads + "_r2.fq"),
                                      "--library", path("library.txt"), "--dosage-mode", mode, "--threads", "2",
+                                     // M15-D: the legacy interface (its FASTA carries the sequences; dosage repair is legacy-only)
+                                     "--output-schema", "legacy",
                                      "--out", path(tag + "." + mode + (curation.empty() ? "" : "." + std::filesystem::path(curation).stem().string())),
                                      "--quiet"};
     if (!curation.empty()) {

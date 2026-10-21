@@ -1166,7 +1166,8 @@ void write_repair_report(std::ostream& out, const RepairReport& r) {
     out << "algorithm\tpanel_anchored_adaptive_completion\n";
     out << "repair_max_rounds\t" << o.repair_rounds << "\nrepair_local_pairs\t" << o.repair_local_pairs
         << "\nrepair_origin_cache_bytes\t" << o.repair_origin_cache_bytes << "\nrepair_origin_cache_policy\tplanned"
-        << "\nrepair_max_neighbours\t" << o.repair_max_neighbours << "\nrepair_neighbour_bound\t" << r.neighbour_bound
+        << "\nrepair_max_neighbours\t" << (o.repair_max_neighbours_model ? std::string("model") : std::to_string(o.repair_max_neighbours))
+        << "\nrepair_neighbour_bound\t" << r.neighbour_bound
         << "\nrepair_max_physical_origins\t" << o.repair_max_physical_origins << "\nrepair_max_state_classes\t"
         << o.repair_max_state_classes << "\nrepair_max_piece_hits\t" << o.repair_max_piece_hits
         << "\nrepair_max_latent_pairs\t" << o.repair_max_latent_pairs << '\n';
@@ -2484,7 +2485,15 @@ void apply_genotype_setting(const std::string& context, const std::string& key, 
     else if (key == "repair_rounds") options.repair_rounds = u();
     else if (key == "repair_local_pairs") options.repair_local_pairs = u();
     else if (key == "repair_origin_cache_bytes") options.repair_origin_cache_bytes = u();
-    else if (key == "repair_max_neighbours") options.repair_max_neighbours = u();
+    else if (key == "repair_max_neighbours") {
+        if (value == "model") {   // M15-D: the model's structural neighbourhood maximum
+            options.repair_max_neighbours_model = true;
+            options.repair_max_neighbours = 0;
+        } else {
+            options.repair_max_neighbours_model = false;
+            options.repair_max_neighbours = u();
+        }
+    }
     else if (key == "repair_max_physical_origins") options.repair_max_physical_origins = u();
     else if (key == "repair_max_state_classes") options.repair_max_state_classes = u();
     else if (key == "repair_max_piece_hits") options.repair_max_piece_hits = u();
@@ -2566,7 +2575,10 @@ std::string genotype_setting_value(const GenotypeCommandOptions& o, const std::s
     else if (key == "max_mosaic_candidates") out << o.max_mosaic_candidates;
     else if (key == "repair_rounds") out << o.repair_rounds;
     else if (key == "repair_local_pairs") out << o.repair_local_pairs;
-    else if (key == "repair_max_neighbours") out << o.repair_max_neighbours;
+    else if (key == "repair_max_neighbours") {
+        if (o.repair_max_neighbours_model) return std::string("model");
+        out << o.repair_max_neighbours;
+    }
     else if (key == "repair_tie_branching") return b(o.repair_tie_branching);
     else if (key == "repair_tie_max_branches") out << o.repair_tie_max_branches;
     else if (key == "representation_guard") return b(o.representation_guard);
@@ -2647,12 +2659,43 @@ void validate_genotype_settings(const GenotypeCommandOptions& o) {
 std::vector<std::pair<std::string, std::string>> genotype_preset_settings(const std::string& name) {
     if (name == "long-read") throw std::runtime_error("--preset long-read: long-read scoring is not implemented");
     if (name != "short-read") throw std::runtime_error("unknown --preset '" + name + "' (available: short-read)");
-    // The production algorithm (adaptive repair, exact tie branching, the representation guard) and the short-read
-    // technology constants. No resource cap, cache budget, time or footprint limit, candidate count or dosage setting:
-    // those stay at the built-in defaults unless a profile or a flag sets them (docs/modules/genotype.md, Required inputs).
+    // The production algorithm (adaptive repair, exact tie branching, the representation guard), the short-read
+    // technology constants and (M15-D) the retained release-candidate configuration, so an ordinary run needs no profile
+    // (docs/guides/genotype_short_read.md, defaults table). Grouped by role:
+    //   exact computational backends and routes (results gated identical on completed runs) with their cache budgets and
+    //   consumption capacities; one candidate-generation setting (repair_junction_proposals, JP1.1); the early evaluated
+    //   incumbent (a PROVISIONAL checkpoint on a budget stop; completed runs unchanged); the sequence-first v2 report with
+    //   the compound annotation; the total-footprint guard (6 GiB) and the state-class work cap used by the release
+    //   candidate; and a model-derived repair neighbourhood bound. No time limit, no dosage stage.
+    // Preset-sourced features whose requirements a flag or profile removes are switched off and recorded as inactive
+    // at argument resolution; the same features set explicitly keep their refusals.
     return {{"repair_rounds", "32"}, {"repair_tie_branching", "1"}, {"representation_guard", "1"},
             {"kmer_size", "31"}, {"syncmer_s", "15"}, {"min_variant_bp", "50"}, {"mismatch_band", "6"},
-            {"switch_probability", "0.01"}, {"proposal_state_limit", "256"}, {"phase_audit_candidates", "0"}};
+            {"switch_probability", "0.01"}, {"proposal_state_limit", "256"}, {"phase_audit_candidates", "0"},
+            // exact computational backends and routes
+            {"union_scoring_backend", "indexed_fine_experimental"}, {"adaptive_window_discovery", "fine_experimental"},
+            {"indexed_union_store_layout", "exact"}, {"indexed_union_evidence_layout", "fine_views_experimental"},
+            {"adaptive_fused_seed", "1"}, {"marker_proposal_reuse_table_bytes", "4194304"},
+            {"combination_prepared_library_terms", "1"}, {"gap_recursion_backend", "fixed_geometry_experimental"},
+            {"dosage_census_backend", "interned_experimental"}, {"union_fragment_blocks", "fine_core_4096_experimental"},
+            {"repair_round1_origin_admission", "reuse_only_experimental"},
+            // cache and store budgets (retained memory for reuse; they do not cap work)
+            {"indexed_union_store_bytes", "2147483648"}, {"adaptive_fine_store_bytes", "536870912"},
+            {"emission_cache_bytes", "536870912"}, {"repair_origin_cache_bytes", "805306368"},
+            {"union_placement_cache_bytes", "536870912"}, {"union_origin_cache_bytes", "1073741824"},
+            {"union_prefilter_cache_bytes", "134217728"}, {"start_sort_scratch_bytes", "335544320"},
+            // consumption capacities of the reuse routes, and the state-class work cap of the release candidate
+            {"adaptive_fine_max_served_placements", "2000000000"}, {"max_union_cached_placements_consumed", "2000000000"},
+            {"max_union_cached_origins_consumed", "2000000000"}, {"max_union_cached_states_consumed", "2000000000"},
+            {"max_union_cached_prefilters_consumed", "2000000000"}, {"max_state_classes", "600000000"},
+            // candidate generation (affects predictions): junction proposals
+            {"repair_junction_proposals", "experimental_v1"},
+            // budget-stop behaviour: the early evaluated incumbent
+            {"early_incumbent", "experimental_v1"},
+            // reporting
+            {"output_schema", "sequence_first_v2"}, {"compound_annotation", "contract_v2"}, {"timing_detail", "1"},
+            // resources: total-footprint guard; model-derived repair neighbourhood bound
+            {"footprint_limit_bytes", "6442450944"}, {"repair_max_neighbours", "model"}};
 }
 
 LibraryModel genotype_preset_library(const std::string& name) {
@@ -8247,6 +8290,7 @@ std::optional<int> parse_genotype_arguments(const std::vector<std::string>& args
             options.dosage_mode_source = "flag --dosage-audit";
         }
         else if (flag == "--library-diagnostic") options.library_diagnostic = true;
+        else if (flag == "--dosage-check") options.dosage_check_flag = true;   // M15-D: resolved after every flag
         else if (flag == "--dosage-mode") {
             options.dosage_mode = need(i);
             options.dosage_mode_explicit = true;
@@ -8259,20 +8303,24 @@ std::optional<int> parse_genotype_arguments(const std::vector<std::string>& args
         else if (flag == "-h" || flag == "--help") {
             out <<
                 "Usage:\n"
-                "  panvar genotype --graph <graph.gfa> --reads1 <r1.fq> --reads2 <r2.fq> --out <prefix> [options]\n\n"
+                "  panvar genotype --graph <locus.gfa> --reads1 <R1.fq[.gz]> --reads2 <R2.fq[.gz]> --threads 4 --out <prefix>\n\n"
                 "Genotypes one structural locus from paired short reads: a diplotype (two whole-locus haplotypes)\n"
-                "over the graph's panel, projected to one allele pair per block.\n\n"
+                "over the graph's panel, projected to one allele pair per block. EXPERIMENTAL. No profile is needed:\n"
+                "the short-read preset carries the accelerated configuration, the library is estimated from the reads,\n"
+                "the report is sequence-first v2 and the dosage audit runs only with --dosage-check.\n\n"
                 "Options:\n"
-                "  --preset short-read        the production algorithm and short-read constants; the default when\n"
-                "                             omitted (long-read: refused, not implemented)\n"
-                "  --library auto|FILE        omitted means auto: insert and fragment-start intensity estimated from the\n"
-                "                             reads, refused (LIBRARY_REFUSED) if invalid, never a fallback. FILE is the\n"
+                "  --preset short-read        the production algorithm, short-read constants and the accelerated\n"
+                "                             configuration; the default when omitted (long-read: refused, not implemented)\n"
+                "  --library auto|FILE        omitted means auto (identical): insert mean/sd and fragment-start intensity\n"
+                "                             estimated from the reads, refused (LIBRARY_REFUSED) if invalid, never a fallback;\n"
+                "                             support_sigmas, substitution_error and outlier_weight stay fixed. FILE is the\n"
                 "                             exact reproducibility route (no estimate, no audit): one `key value` per line,\n"
                 "                             exactly insert_mean_bp, insert_sd_bp, support_sigmas, substitution_error,\n"
                 "                             outlier_weight, fragment_start_intensity and optionally marker_background;\n"
                 "                             an unknown, repeated or missing key is refused. The gap model (gap_open,\n"
                 "                             gap_extend, maximum displacement) is fixed and cannot be declared.\n"
-                "  --reference-path NAME      the coordinate reference (default: the graph's RS:Z sample)\n"
+                "  --reference-path NAME      the coordinate reference (default: the single path of the graph's RS:Z\n"
+                "                             sample; refused with the candidates listed when absent or ambiguous)\n"
                 "  --panel-curation FILE      panel templates to exclude\n"
                 "  --bubbles FILE             precomputed bubbles CSV (default: detected from the graph)\n"
                 "  --threads N                workers\n"
@@ -8281,14 +8329,17 @@ std::optional<int> parse_genotype_arguments(const std::vector<std::string>& args
                 "                             within declared caps; not a global optimum. off gives the unrepaired\n"
                 "                             development view\n"
                 "  --repair-rounds N          the repair's round cap\n"
-                "  --dosage-mode off|audit|repair   the dosage stage. Default off; under --output-schema sequence_first_v2\n"
-                "                             the default is audit and repair is refused (exit 2). audit never changes the\n"
-                "                             prediction and is not necessarily cheaper than repair\n"
-                "  --output-schema legacy|sequence_first_v1|sequence_first_v2   the report contract (default legacy;\n"
-                "                             v1/v2 experimental). v2 writes sequence_haplotypes.tsv with panel-path\n"
-                "                             extraction references and writes sequence_haplotypes.fa only when a haplotype\n"
-                "                             is off-panel; its exit status is 0 PREDICTION, 3 PROVISIONAL, 1 NO_PREDICTION\n"
-                "  --profile FILE             a settings profile (key<TAB>value; it must name itself). Repeated --profile\n"
+                "  --dosage-check             run the dosage audit and write its diagnostics; it never changes the\n"
+                "                             prediction and adds run time (not necessarily cheaper than the call).\n"
+                "                             Without it dosage is not run (reported NOT_EVALUATED). Expert spelling:\n"
+                "                             --dosage-mode off|audit|repair (default off); repair needs --output-schema\n"
+                "                             legacy; a contradiction with --dosage-check is refused\n"
+                "  --output-schema sequence_first_v2|legacy|sequence_first_v1   the report contract (default\n"
+                "                             sequence_first_v2 under the short-read preset). v2 writes sequence_haplotypes.tsv\n"
+                "                             with panel-path extraction references and writes sequence_haplotypes.fa only when\n"
+                "                             a haplotype is off-panel; exit 0 PREDICTION, 3 PROVISIONAL, 1 NO_PREDICTION.\n"
+                "                             The unrepaired view (--adaptive-repair off) reports with the legacy schema\n"
+                "  --profile FILE             optional expert override (key<TAB>value; it must name itself). Repeated --profile\n"
                 "                             files apply in order, a later one overriding an earlier one; a key set twice\n"
                 "                             in one file is refused. A profile is not by itself a validated configuration\n"
                 "  -q, --quiet\n"
@@ -8297,8 +8348,8 @@ std::optional<int> parse_genotype_arguments(const std::vector<std::string>& args
                 "  GENOTYPE_FILTER, DOSAGE_FILTER, PHASE_FILTER: PASS, LOW_QUALITY, NOT_EVALUATED, NO_CALL or NOT_APPLICABLE,\n"
                 "  with reasons; CALL_SUMMARY=GENOTYPE_<s>;DOSAGE_<s>;PHASE_<s>. Per block in .block_genotypes.tsv and\n"
                 "  .genotypes.tsv (genotype_filter, dosage_filter); per locus in .locus_genotype.tsv (all three, reasons\n"
-                "  and per-status counts). A no-call is NO_CALL in all three, DOSAGE_FILTER included; a call under\n"
-                "  --dosage-mode off has DOSAGE_FILTER NOT_EVALUATED. PHASE_FILTER is PASS only for read-supported\n"
+                "  and per-status counts). A no-call is NO_CALL in all three, DOSAGE_FILTER included; a call without\n"
+                "  --dosage-check has DOSAGE_FILTER NOT_EVALUATED. PHASE_FILTER is PASS only for read-supported\n"
                 "  phase; a prior-selected phase is LOW_QUALITY (MODEL_ONLY_PHASE).\n"
                 "  PASS means the computational and representation checks passed. It is not calibrated reliability, and\n"
                 "  no combination of PASS values establishes an exact or biologically correct genotype.\n\n"
@@ -8311,10 +8362,11 @@ std::optional<int> parse_genotype_arguments(const std::vector<std::string>& args
                 ".mosaic_haplotypes.fa (a strict call's haplotypes; legacy schema only), .mosaic_status.tsv, .settings.tsv\n"
                 "(every effective setting and its source) and the search record; sequence-first schemas add the\n"
                 ".sequence_* reports (see docs/guides/genotype_short_read.md).\n\n"
-                "Exit status (legacy schema; sequence-first schemas use 0/3/1 as above): 0 a genotype was emitted;\n"
-                "1 no-call; 2 argument, input or output error; 124 time limit\n"
-                "(time_limit_seconds); 125 footprint limit (footprint_limit_bytes: a sampled guard -- the physical footprint is "
-                "polled every 100 ms while the run is unclaimed -- not an allocation-level ceiling; a short spike between "
+                "Exit status: sequence-first (default) 0 PREDICTION, 3 PROVISIONAL, 1 NO_PREDICTION; legacy schema\n"
+                "0 a genotype was emitted, 1 no-call; both: 2 argument, input or output error; 124 time limit\n"
+                "(time_limit_seconds; none under the preset); 125 footprint limit (footprint_limit_bytes, 6 GiB under the\n"
+                "preset: a sampled guard -- the physical footprint is polled every 100 ms while the run is unclaimed --\n"
+                "not an allocation-level ceiling; a short spike between "
                 "samples can exceed it).\n";
             return 0;
         }
@@ -8423,6 +8475,44 @@ std::optional<int> parse_genotype_arguments(const std::vector<std::string>& args
         apply_genotype_setting(source == options.setting_sources.end() ? std::string("default") : source->second,
                                "repair_tie_branching", "0", options);
     }
+    // M15-D: preset-sourced features whose requirements a flag or profile removed are switched off and recorded as
+    // inactive (with the reason) instead of refusing an ordinary run; the same features set explicitly keep their refusals.
+    {
+        const auto from_preset = [&](const char* key) {
+            const auto it = options.setting_sources.find(key);
+            return it != options.setting_sources.end() && it->second.rfind("preset ", 0) == 0;
+        };
+        const auto deactivate = [&](const char* key, const char* value, const std::string& why) {
+            const std::string source = options.setting_sources[key];
+            apply_genotype_setting(source + " (inactive: " + why + ")", key, value, options);
+        };
+        if (options.repair_rounds == 0 && from_preset("output_schema") && options.output_schema != "legacy") {
+            deactivate("output_schema", "legacy", "the unrepaired view has no pooled decision to report");
+        }
+        if (from_preset("early_incumbent") && options.early_incumbent != "off") {
+            if (const auto why = early_incumbent_refusal(options)) deactivate("early_incumbent", "off", *why);
+        }
+        if (from_preset("compound_annotation") && options.compound_annotation != "off") {
+            if (const auto why = compound_annotation_refusal(options)) deactivate("compound_annotation", "off", *why);
+        }
+        if (from_preset("repair_junction_proposals") && options.repair_junction_proposals != "off") {
+            if (const auto why = junction_proposals_refusal(options)) deactivate("repair_junction_proposals", "off", *why);
+        }
+        if (from_preset("union_fragment_blocks") && options.union_fragment_blocks != "off") {
+            if (const auto why = union_fragment_blocks_refusal(options)) deactivate("union_fragment_blocks", "off", *why);
+        }
+    }
+    // M15-D: --dosage-check runs the existing dosage audit (never changing the prediction). It is consistent with an
+    // explicit audit mode and contradicts any other explicit dosage setting; contradictions are refused before any output.
+    if (options.dosage_check_flag) {
+        if (options.dosage_mode_explicit && options.dosage_mode != "audit") {
+            throw std::runtime_error("--dosage-check contradicts " + options.dosage_mode_source + " (dosage mode " + options.dosage_mode +
+                                     "): --dosage-check runs the dosage audit, which never changes the prediction");
+        }
+        options.dosage_mode_source = options.dosage_mode_explicit ? options.dosage_mode_source + " and flag --dosage-check" : "flag --dosage-check";
+        options.dosage_mode = "audit";
+        options.dosage_mode_explicit = true;
+    }
     // S1-B: sequence_first_v1 reports the adaptive repair's pooled decision; every other route is refused explicitly.
     if (sequence_first(options)) {
         if (options.repair_rounds == 0) {
@@ -8524,27 +8614,17 @@ std::optional<std::string> resolve_dosage_contract(GenotypeCommandOptions& optio
     if (options.dosage_mode != "off" && options.dosage_mode != "audit" && options.dosage_mode != "repair") {
         return "dosage_mode takes off, audit or repair (got '" + options.dosage_mode + "')";
     }
-    const bool defaulted = options.dosage_mode_source == "contract_default_sequence_first_v2";   // resolved before
-    if (!options.dosage_mode_explicit && options.dosage_mode != "off" && !defaulted) {
+    if (!options.dosage_mode_explicit && options.dosage_mode != "off") {
         options.dosage_mode_explicit = true;   // an API caller set a non-default mode: declared
         if (options.dosage_mode_source == "default") options.dosage_mode_source = "caller_options";
     }
-    if (options.output_schema != "sequence_first_v2") {
-        if (defaulted && !options.dosage_mode_explicit) {   // a v2 default never carries over to another schema
-            options.dosage_mode = "off";
-            options.dosage_mode_source = "default";
-        }
-        return std::nullopt;
-    }
-    if (!options.dosage_mode_explicit) {
-        options.dosage_mode = "audit";
-        options.dosage_mode_source = "contract_default_sequence_first_v2";
-    } else if (options.dosage_mode == "repair") {
+    // M15-D: no schema implies a dosage stage. Without --dosage-check (or an explicit mode) dosage is off and reported as
+    // not evaluated; the audit runs only when requested and never changes the prediction.
+    if (options.output_schema != "sequence_first_v2") return std::nullopt;
+    if (options.dosage_mode == "repair") {
         return "--dosage-mode repair is not available under output_schema sequence_first_v2: dosage is diagnostic there "
-               "(audit, or off) and never changes the prediction; reproduce historical repair results with the legacy "
-               "contract (omit --output-schema, or --output-schema legacy)";
-    } else if (options.dosage_mode_source == "default") {
-        options.dosage_mode_source = "caller_options";   // declared off through dosage_mode_explicit
+               "(--dosage-check, or off) and never changes the prediction; reproduce historical repair results with the legacy "
+               "contract (--output-schema legacy --dosage-mode repair)";
     }
     return std::nullopt;
 }

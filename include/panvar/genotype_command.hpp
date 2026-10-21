@@ -111,6 +111,10 @@ struct GenotypeCommandOptions {
     std::size_t repair_origin_cache_bytes = 402653184;   // 384 MiB, planned retention
     // One round's neighbourhood above this is refused before any allocation.
     std::uint64_t repair_max_neighbours = 670;
+    // M15-D: 'model' -- the declared bound is the model's own structural neighbourhood maximum
+    // (repair_neighbour_bound: sum over blocks of 2 * min(repair_local_pairs, a(a+1)/2)); the short-read preset default.
+    bool repair_max_neighbours_model = false;
+    bool dosage_check_flag = false;   // M15-D: --dosage-check given
     // CUMULATIVE caps over the whole repair search, a different declared quantity from the per-pass
     // caps above, which bound the union's single scoring pass.
     std::uint64_t repair_max_physical_origins = 4900000000ULL;

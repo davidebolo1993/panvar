@@ -125,78 +125,126 @@ Outcome parse(const std::vector<std::string>& args, panvar::GenotypeCommandOptio
 }
 
 // S1-B: output_schema is validated, recorded with its source, and refused where it has no pooled decision to report.
+// M15-D: the short-read preset sets sequence_first_v2; an explicit schema overrides it.
 void test_output_schema() {
     panvar::GenotypeCommandOptions kept;
     require(parse({"--output-schema", "sequence_first_v1"}, &kept).error.empty() &&
                 kept.output_schema == "sequence_first_v1" &&
                 kept.setting_sources.at("output_schema") == "flag --output-schema",
             "--output-schema sequence_first_v1 is accepted and recorded with its source");
-    require(parse({}, &kept).error.empty() && kept.output_schema == "legacy" && kept.setting_sources.count("output_schema") == 0,
-            "unset, the schema is legacy and has no recorded source");
+    require(parse({}, &kept).error.empty() && kept.output_schema == "sequence_first_v2" &&
+                kept.setting_sources.at("output_schema") == "preset short-read (default)",
+            "unset, the schema is the preset's sequence_first_v2, recorded as such");
     require(parse({"--output-schema", "sequence_first"}).error.find("'output_schema' is legacy, sequence_first_v1 or sequence_first_v2") !=
                 std::string::npos,
             "an unknown schema is refused");
     for (const std::vector<std::string>& unsupported :
          {std::vector<std::string>{"--output-schema", "sequence_first_v1", "--adaptive-repair", "off"},
-          std::vector<std::string>{"--repair-rounds", "0", "--output-schema", "sequence_first_v1"}}) {
-        require(parse(unsupported).error.find("sequence_first_v1 needs the adaptive repair") != std::string::npos,
-                "sequence_first_v1 without the adaptive repair is refused explicitly, never a silent legacy fallback");
+          std::vector<std::string>{"--repair-rounds", "0", "--output-schema", "sequence_first_v1"},
+          std::vector<std::string>{"--output-schema", "sequence_first_v2", "--adaptive-repair", "off"}}) {
+        require(parse(unsupported).error.find("needs the adaptive repair") != std::string::npos,
+                "an explicit sequence-first schema without the adaptive repair is refused, never a silent legacy fallback");
     }
     require(parse({"--output-schema", "legacy", "--adaptive-repair", "off"}).error.empty(),
             "an explicit legacy schema is accepted on every route");
-    std::cout << "  output_schema: validated, recorded with its source, refused without the adaptive repair\n";
+    std::cout << "  output_schema: preset v2 by default, validated, recorded with its source, explicit refusals kept\n";
 }
 
-// S1-D: sequence_first_v2 makes dosage diagnostic -- audit by default, off allowed, repair refused (only there).
-void test_v2_dosage_contract() {
+// M15-D: the accelerated configuration is the preset's, recorded per key; preset features whose requirements a flag
+// removed are switched off and recorded inactive; the neighbourhood bound is the model's own.
+void test_preset_configuration() {
     panvar::GenotypeCommandOptions kept;
-    require(parse({"--output-schema", "sequence_first_v2"}, &kept).error.empty() && kept.dosage_mode == "audit" &&
-                !kept.dosage_mode_explicit,
-            "v2 without --dosage-mode defaults to audit");
-    require(parse({"--output-schema", "sequence_first_v2", "--dosage-mode", "off"}, &kept).error.empty() &&
-                kept.dosage_mode == "off" && kept.dosage_mode_explicit,
-            "v2 with an explicit off keeps off (recorded as not evaluated)");
-    require(parse({"--dosage-mode", "repair", "--output-schema", "sequence_first_v2"}).error.find(
-                "--dosage-mode repair is not available under output_schema sequence_first_v2") != std::string::npos,
-            "v2 refuses an explicit repair, whatever the argument order");
-    require(parse({"--dosage-mode", "repair"}, &kept).error.empty() && kept.dosage_mode == "repair",
-            "legacy (default) still accepts repair");
+    require(parse({}, &kept).error.empty(), "the bare preset parses");
+    for (const char* key : {"union_scoring_backend", "adaptive_window_discovery", "indexed_union_store_layout",
+                            "indexed_union_evidence_layout", "adaptive_fused_seed", "combination_prepared_library_terms",
+                            "gap_recursion_backend", "dosage_census_backend", "union_fragment_blocks",
+                            "repair_round1_origin_admission", "repair_junction_proposals", "early_incumbent", "compound_annotation",
+                            "output_schema", "emission_cache_bytes", "indexed_union_store_bytes", "footprint_limit_bytes",
+                            "max_state_classes", "repair_max_neighbours"}) {
+        require(kept.setting_sources.count(key) && kept.setting_sources.at(key) == "preset short-read (default)",
+                std::string("preset key recorded from the preset: ") + key);
+    }
+    require(kept.union_scoring_backend == "indexed_fine_experimental" && kept.adaptive_window_discovery == "fine_experimental" &&
+                kept.indexed_union_evidence_layout == "fine_views_experimental" && kept.gap_recursion_fixed_geometry &&
+                kept.dosage_census_interned && kept.union_fragment_blocks == "fine_core_4096_experimental" &&
+                kept.repair_round1_origin_admission == "reuse_only_experimental" && kept.repair_junction_proposals == "experimental_v1" &&
+                kept.early_incumbent == "experimental_v1" && kept.compound_annotation == "contract_v2" &&
+                kept.footprint_limit_bytes == 6442450944ULL && kept.max_state_classes == 600000000ULL,
+            "the preset's accelerated values are the release candidate's");
+    require(kept.repair_max_neighbours_model && kept.repair_max_neighbours == 0, "model: no external neighbourhood cap is compared");
+    require(kept.time_limit_seconds == 0 && kept.setting_sources.count("time_limit_seconds") == 0, "the preset sets no time limit");
+    require(kept.dosage_mode == "off" && kept.dosage_mode_source == "default", "the preset runs no dosage stage");
+    require(parse({"--repair-max-neighbours", "958"}, &kept).error.empty() && !kept.repair_max_neighbours_model &&
+                kept.repair_max_neighbours == 958,
+            "a numeric neighbourhood cap still overrides the model bound");
+    write(path("cap.tsv"), "profile\tcap\nrepair_max_neighbours\t1004\n");
+    require(parse({"--profile", path("cap.tsv")}, &kept).error.empty() && kept.repair_max_neighbours == 1004 &&
+                kept.setting_sources.at("repair_max_neighbours").rfind("profile ", 0) == 0,
+            "a profile's numeric cap overrides the preset");
+    for (const std::vector<std::string>& unrepaired :
+         {std::vector<std::string>{"--adaptive-repair", "off"}, std::vector<std::string>{"--repair-rounds", "0"}}) {
+        require(parse(unrepaired, &kept).error.empty() && kept.output_schema == "legacy" && kept.early_incumbent == "off" &&
+                    kept.compound_annotation == "off" && kept.repair_junction_proposals == "off",
+                "the unrepaired view switches the preset's repair-only features off instead of refusing");
+        for (const char* key : {"output_schema", "early_incumbent", "compound_annotation", "repair_junction_proposals"}) {
+            require(kept.setting_sources.at(key).find("(inactive: ") != std::string::npos,
+                    std::string("the switched-off preset key is recorded inactive with its reason: ") + key);
+        }
+    }
+    require(parse({"--output-schema", "legacy"}, &kept).error.empty() && kept.early_incumbent == "off" &&
+                kept.compound_annotation == "off" && kept.setting_sources.at("early_incumbent").find("(inactive: ") != std::string::npos,
+            "an explicit legacy schema switches the preset's v2-only features off");
+    write(path("explicit_early.tsv"), "profile\texplicit-early\noutput_schema\tlegacy\nearly_incumbent\texperimental_v1\n");
+    require(parse({"--profile", path("explicit_early.tsv")}).error.find("early_incumbent") != std::string::npos,
+            "the same feature set explicitly keeps its refusal");
+    std::cout << "  preset: accelerated keys recorded from the preset, model neighbourhood bound, no time limit or dosage; "
+                 "inactive preset features recorded, explicit ones refused\n";
+}
+
+// M15-D: dosage runs only when requested (--dosage-check, or an explicit expert mode); no schema implies it; v2 refuses repair.
+void test_dosage_check_contract() {
+    panvar::GenotypeCommandOptions kept;
+    require(parse({}, &kept).error.empty() && kept.dosage_mode == "off" && !kept.dosage_mode_explicit &&
+                kept.dosage_mode_source == "default",
+            "no flag: dosage off (not evaluated), source default");
+    require(parse({"--output-schema", "sequence_first_v2"}, &kept).error.empty() && kept.dosage_mode == "off",
+            "an explicit v2 no longer implies the audit");
+    require(parse({"--dosage-check"}, &kept).error.empty() && kept.dosage_mode == "audit" && kept.dosage_mode_explicit &&
+                kept.dosage_mode_source == "flag --dosage-check",
+            "--dosage-check runs the audit, source flag --dosage-check");
+    require(parse({"--dosage-check", "--dosage-mode", "audit"}, &kept).error.empty() && kept.dosage_mode == "audit" &&
+                kept.dosage_mode_source == "flag --dosage-mode and flag --dosage-check",
+            "--dosage-check with an explicit audit is consistent");
+    require(parse({"--dosage-mode", "audit"}, &kept).error.empty() && kept.dosage_mode == "audit",
+            "the expert spelling --dosage-mode audit still runs the audit");
+    for (const std::vector<std::string>& contradiction :
+         {std::vector<std::string>{"--dosage-check", "--dosage-mode", "off"}, std::vector<std::string>{"--dosage-mode", "off", "--dosage-check"},
+          std::vector<std::string>{"--dosage-check", "--dosage-audit", "off"},
+          std::vector<std::string>{"--dosage-check", "--output-schema", "legacy", "--dosage-mode", "repair"}}) {
+        require(parse(contradiction).error.find("--dosage-check contradicts") != std::string::npos,
+                "a contradiction with --dosage-check is refused, in either order");
+    }
+    write(path("dosage_off.tsv"), "profile\tdosage-off\ndosage_mode\toff\n");
+    require(!parse({"--profile", path("dosage_off.tsv"), "--dosage-check"}).error.empty(),
+            "dosage is not a profile key: a profile cannot set or silently disable it");
+    require(parse({"--dosage-mode", "repair"}).error.find("--dosage-mode repair is not available under output_schema sequence_first_v2") !=
+                std::string::npos,
+            "repair under the default v2 report is refused");
+    require(parse({"--output-schema", "legacy", "--dosage-mode", "repair"}, &kept).error.empty() && kept.dosage_mode == "repair",
+            "the legacy repair stays reachable through the explicit legacy interface");
     require(parse({"--output-schema", "sequence_first_v1", "--dosage-mode", "repair"}, &kept).error.empty() &&
                 kept.dosage_mode == "repair",
             "sequence_first_v1 still accepts repair (its meaning is unchanged)");
-    require(parse({"--output-schema", "sequence_first_v1"}, &kept).error.empty() && kept.dosage_mode == "off",
-            "sequence_first_v1 keeps the built-in dosage default");
-    // S1-D.1: provenance names the setting actually used, and --dosage-audit is a declaration too
-    require(parse({"--output-schema", "sequence_first_v2"}, &kept).error.empty() &&
-                kept.dosage_mode_source == "contract_default_sequence_first_v2",
-            "v2 default: source contract_default_sequence_first_v2");
-    require(parse({"--output-schema", "sequence_first_v2", "--dosage-mode", "off"}, &kept).error.empty() &&
-                kept.dosage_mode_source == "flag --dosage-mode",
-            "v2 --dosage-mode off: source names the flag");
-    require(parse({"--output-schema", "sequence_first_v2", "--dosage-audit", "off"}, &kept).error.empty() &&
-                kept.dosage_mode == "off" && kept.dosage_mode_source == "flag --dosage-audit",
-            "v2 --dosage-audit off is a declared off (no longer overridden to audit)");
     require(parse({"--dosage-audit", "shadow"}, &kept).error.empty() && kept.dosage_mode == "audit",
-            "legacy --dosage-audit shadow is still audit");
-    require(parse({}, &kept).error.empty() && kept.dosage_mode == "off" && kept.dosage_mode_source == "default",
-            "legacy default: off, source default");
+            "--dosage-audit shadow is still audit");
     // S1-D.1: the shared resolver, as the direct command API and the prepared route apply it
     {
-        panvar::GenotypeCommandOptions o;   // dosage fields as constructed (Sol's reproducer)
+        panvar::GenotypeCommandOptions o;   // dosage fields as constructed
         o.output_schema = "sequence_first_v2";
-        require(!panvar::resolve_dosage_contract(o) && o.dosage_mode == "audit" &&
-                    o.dosage_mode_source == "contract_default_sequence_first_v2",
-                "API: v2 with untouched dosage fields resolves to audit");
-        require(!panvar::resolve_dosage_contract(o) && o.dosage_mode == "audit" &&
-                    o.dosage_mode_source == "contract_default_sequence_first_v2" && !o.dosage_mode_explicit,
-                "API: resolution is idempotent");
-    }
-    {
-        panvar::GenotypeCommandOptions o;
-        o.output_schema = "sequence_first_v2";
-        o.dosage_mode_explicit = true;
-        require(!panvar::resolve_dosage_contract(o) && o.dosage_mode == "off" && o.dosage_mode_source == "caller_options",
-                "API: v2 declared off stays off");
+        require(!panvar::resolve_dosage_contract(o) && o.dosage_mode == "off" && o.dosage_mode_source == "default" &&
+                    !o.dosage_mode_explicit,
+                "API: v2 with untouched dosage fields stays off (M15-D: no implied audit)");
+        require(!panvar::resolve_dosage_contract(o) && o.dosage_mode == "off", "API: resolution is idempotent");
     }
     for (const bool flagged : {true, false}) {
         panvar::GenotypeCommandOptions o;
@@ -227,8 +275,8 @@ void test_v2_dosage_contract() {
         o.dosage_mode = "bogus";
         require(panvar::resolve_dosage_contract(o).has_value(), "API: an unknown dosage mode is refused");
     }
-    std::cout << "  sequence_first_v2 dosage contract: audit by default, explicit off kept, repair refused only under v2; "
-                 "one resolver for CLI and API (provenance, idempotence, declared by value)\n";
+    std::cout << "  dosage: off unless --dosage-check (or an expert mode), contradictions refused in either order, repair "
+                 "only under the legacy interface; one resolver for CLI and API\n";
 }
 
 void test_repair_option_order() {
@@ -329,10 +377,13 @@ void test_help_text() {
     require(a.find("--repair-origin-cache-bytes") == std::string::npos && h.find("--repair-origin-cache-bytes") == std::string::npos,
             "the diagnostic cache flags stay out of the help");
     // M15-C: the user-facing corrections stay corrected
-    for (const char* needle : {"sequence_first_v2", "the default is audit and repair is refused", "not calibrated reliability",
+    for (const char* needle : {"sequence_first_v2", "not calibrated reliability",
                                "no combination of PASS values establishes an exact", "not a global optimum",
-                               "only when a haplotype\n                             is off-panel", "3 PROVISIONAL",
-                               "A profile is not by itself a validated configuration"}) {
+                               "writes sequence_haplotypes.fa only when\n                             a haplotype is off-panel",
+                               "3 PROVISIONAL", "A profile is not by itself a validated configuration",
+                               // M15-D: the basic command
+                               "--dosage-check", "Without it dosage is not run", "omitted means auto (identical)",
+                               "never a fallback", "optional expert override", "No profile is needed"}) {
         require(h.find(needle) != std::string::npos, std::string("--help must say: ") + needle);
     }
     require(h.find("exact genotype =") == std::string::npos && h.find("the exact coordinate repair") == std::string::npos &&
@@ -405,7 +456,8 @@ int main(int argc, char** argv) {
         test_cache_flag_provenance();
         test_help_text();
         test_output_schema();
-        test_v2_dosage_contract();
+        test_preset_configuration();
+        test_dosage_check_contract();
         test_pre_block_no_call();
     } catch (const std::exception& error) {
         std::cerr << "FAIL: " << error.what() << '\n';
