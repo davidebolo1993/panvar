@@ -1,5 +1,7 @@
 # Module `genotype`
 
+> **Experimental short-read release candidate:** the authoritative usage guide (inputs, every flag and profile key, resources, outputs, filters, evidence and tested commands) is [docs/guides/genotype_short_read.md](../guides/genotype_short_read.md).
+
 CLI: `panvar genotype`
 
 ## What it does
@@ -34,13 +36,13 @@ This runs `--preset short-read`, the default preset. Settings are applied in a f
 | flag | what it does | default |
 |------|--------------|---------|
 | `--library auto\|FILE` | estimate the library or declare it | `auto` |
-| `--dosage-mode off\|audit\|repair` | the [dosage stage](#dosage-modes) | `off` |
+| `--dosage-mode off\|audit\|repair` | the [dosage stage](#dosage-modes) | `off`; `audit` under `sequence_first_v2`, where `repair` is refused |
 | `--panel-curation <file>` | remove named paths from the active panel ([below](#panel-curation)) | — |
 | `--threads <N>` | worker threads; results do not depend on them | `1` |
 | `--mosaic-candidates <K>` | off-panel mosaics evaluated beside the panel pairs; `0` evaluates panel pairs only | `128` |
 | `--bubbles <file>` | precomputed bubbles CSV instead of detected variant sites | detected |
-| `--profile <file>` | a validated `key<TAB>value` settings file | — |
-| `--adaptive-repair on\|off`, `--repair-rounds <N>` | the repair search and its round cap; `off` or `0` rounds gives the unrepaired view, with tie branching off. Contradictory combinations are refused | `on`, `32` |
+| `--profile <file>` | a `key<TAB>value` settings file (it must name itself; repeated `--profile` files apply in order). The tested complete configurations are `profiles/genotype_experimental_sr_v1_<locus>.tsv` (experimental) | — |
+| `--adaptive-repair on\|off`, `--repair-rounds <N>` | the bounded coordinate refinement (local moves scored exactly within declared caps; not a global optimum) and its round cap; `off` or `0` rounds gives the unrepaired view, with tie branching off. Contradictory combinations are refused | `on`, `32` |
 | `-q, --quiet` | no progress messages | off |
 
 `panvar genotype --help-advanced` lists the scientific flags (marker k-mer and syncmer sizes, variant-site span, switch probability, proposal width, mismatch band, repair-neighbourhood bounds, tie branching, representation check), resource keys and their defaults.
@@ -102,10 +104,10 @@ What a run writes depends on its outcome:
 | PHASE_FILTER | adjacent pair of heterozygous blocks | read-supported phase | LOW_QUALITY `MODEL_ONLY_PHASE` for prior-only phase; NO_CALL for unresolved phase; NOT_APPLICABLE next to a homozygous block |
 
 - **A no-call** is NO_CALL in all three filters. A run that stopped before its blocks existed reports one `locus` unit per filter.
-- **Usage policies, not filters:**
-  - an exact genotype needs GENOTYPE PASS and DOSAGE PASS or NOT_APPLICABLE, and therefore a dosage stage;
-  - dosage content needs DOSAGE PASS;
-  - a phased genotype also needs PHASE PASS.
+- **What PASS means:** the computational and representation checks passed. **PASS is not calibrated reliability,** and no
+  combination of PASS values establishes an exact or biologically correct genotype. In the reserved ACOT evaluation (M15-B),
+  two ~478 bp sv:9 length errors were GENOTYPE_FILTER PASS
+  ([guide §7](../guides/genotype_short_read.md#7-decision-guide-filters-ambiguity-audit-and-support)).
 - **Component fields:** `filter`, `genotype_support`, `quality_filter`, the library-sensitivity fields and `dosage_stage_filter` remain in the tables. `quality_filter` also requires read support, which GENOTYPE_FILTER does not.
 
 `scripts/plot_genotype_results.py` summarises many runs as tables, figures and a short report. It is truth-free unless truth tables are given; see its `--help`. `scripts/plot_genotype_block_error.py` draws ordered-block raincloud figures of excess and normalised excess from a block-evaluation table; see its `--help`. `scripts/plot_genotype_block_gq.py` draws the same blocks as points coloured by conditional GQ; see its `--help`.
