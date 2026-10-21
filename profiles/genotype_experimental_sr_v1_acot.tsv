@@ -1,0 +1,52 @@
+# panvar genotype -- EXPERIMENTAL short-read profile genotype-experimental-sr-v1, ACOT (M15-C)
+# The COMPLETE effective profile of the tested configuration (M10-A arm D, 'genotype-dev-m10a-v1'): the ACOT analysis base
+# (resource guards; repair_max_neighbours 1004 (locus-specific)), the performance overlay (profiles/genotype_dev_performance_v1.tsv) and the M10-A overlay
+# (profiles/genotype_dev_m10a_v1.tsv), with no compound interval declarations. Use it alone with --profile.
+# Evidence: development runs (M11-D) and, for ACOT only, the 18 reserved families (M15-B), all at 5x simulated reads with a
+# declared --library FILE. Not a default, not a calibrated-confidence configuration. See docs/guides/genotype_short_read.md.
+# Resource-only keys (time_limit_seconds, footprint_limit_bytes, *_cache_bytes, *_store_bytes, scratch) may be edited in a
+# copy without changing predictions while no limit binds; every other key affects the computation route or the reports.
+profile	genotype-experimental-sr-v1-acot
+## analysis base profile (scientific/model settings and its own guards)
+time_limit_seconds	900
+footprint_limit_bytes	6442450944
+max_state_classes	600000000
+repair_max_neighbours	1004
+## overlay: performance backend choices
+union_scoring_backend	indexed_fine_experimental
+adaptive_window_discovery	fine_experimental
+indexed_union_store_layout	exact
+indexed_union_evidence_layout	fine_views_experimental
+adaptive_fused_seed	1
+marker_proposal_reuse_table_bytes	4194304
+combination_prepared_library_terms	1
+gap_recursion_backend	fixed_geometry_experimental
+dosage_census_backend	interned_experimental
+## overlay: cache and workspace budgets
+indexed_union_store_bytes	2147483648
+adaptive_fine_store_bytes	536870912
+emission_cache_bytes	536870912
+repair_origin_cache_bytes	805306368
+union_placement_cache_bytes	536870912
+union_origin_cache_bytes	1073741824
+union_prefilter_cache_bytes	134217728
+start_sort_scratch_bytes	335544320
+## overlay: resource capacities and guards
+adaptive_fine_max_served_placements	2000000000
+max_union_cached_placements_consumed	2000000000
+max_union_cached_origins_consumed	2000000000
+max_union_cached_states_consumed	2000000000
+max_union_cached_prefilters_consumed	2000000000
+## overlay: reporting
+timing_detail	1
+## m10a: retained route
+early_incumbent	experimental_v1
+union_fragment_blocks	fine_core_4096_experimental
+repair_round1_origin_admission	reuse_only_experimental
+## m10a: experimental scientific switch
+repair_junction_proposals	experimental_v1
+## m10a: reporting contract and additive annotation
+output_schema	sequence_first_v2
+compound_annotation	contract_v2
+## m10a: stated explicitly, equal to the default
+repair_joint_search	off

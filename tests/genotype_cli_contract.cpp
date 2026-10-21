@@ -328,6 +328,16 @@ void test_help_text() {
     }
     require(a.find("--repair-origin-cache-bytes") == std::string::npos && h.find("--repair-origin-cache-bytes") == std::string::npos,
             "the diagnostic cache flags stay out of the help");
+    // M15-C: the user-facing corrections stay corrected
+    for (const char* needle : {"sequence_first_v2", "the default is audit and repair is refused", "not calibrated reliability",
+                               "no combination of PASS values establishes an exact", "not a global optimum",
+                               "only when a haplotype\n                             is off-panel", "3 PROVISIONAL",
+                               "A profile is not by itself a validated configuration"}) {
+        require(h.find(needle) != std::string::npos, std::string("--help must say: ") + needle);
+    }
+    require(h.find("exact genotype =") == std::string::npos && h.find("the exact coordinate repair") == std::string::npos &&
+            h.find("a validated settings profile") == std::string::npos, "--help must not imply exact/validated results");
+    require(a.find("legacy|sequence_first_v1|sequence_first_v2") != std::string::npos, "--help-advanced must list sequence_first_v2");
     std::cout << "  help: exit statuses, library contract, audit cost, headline scope and corrected flag meanings\n";
 }
 
