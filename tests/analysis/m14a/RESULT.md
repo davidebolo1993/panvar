@@ -127,3 +127,27 @@ work is not where end-to-end time goes. Removing haplotypes also removes the cop
 relies on.
 
 These are inspected development findings on 15 cells. They are not validation and they are not a confidence claim.
+
+## Closure (2026-10-21): NOT USEFUL accepted for the tested route; qualifications appended
+
+**Accepted:** NOT USEFUL for the tested **whole-haplotype representative route with Mash similarity.** It does not enter
+the release, and no further clustering, profiling campaign or ACOT-only tuning follows.
+
+**Qualifications:**
+1. **No conclusion is drawn about structure-aware clustering methods in general.** The broader idea stays a future research
+   option.
+2. **Three changes were not isolated:** removing templates changed allele availability, copying-prior composition and
+   search behaviour together. The experiment establishes harmful outcomes, but not which change caused each error.
+3. **Damaged-control counts refer to near-floor blocks, not independent samples.** Block and cell/donor counts:
+
+   | setting | transition | blocks | cells | donors | cells by locus |
+   |---|---|---|---|---|---|
+   | r2 | control damaged | 17 | 11 | 10 | ACOT 3, C4 3, CYP2D6 5 |
+   | r4 | control damaged | 28 | 11 | 10 | ACOT 2, C4 4, CYP2D6 5 |
+   | r2 | catastrophe introduced | 1 | 1 | 1 | |
+   | r4 | catastrophe introduced | 4 | 4 | 4 | |
+   | r2 / r4 | catastrophe worsened | 3 / 3 | 3 / 3 | 3 / 3 | |
+
+   NA19705 contributes a C4 and a CYP2D6 cell, so there are 10 distinct donors in 11 cells.
+4. **Small Mash distances do not certify similar repeat counts or arrangements,** so tight clusters were not necessarily
+   safe structural substitutes.
