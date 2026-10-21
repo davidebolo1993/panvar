@@ -20,6 +20,9 @@ STATIC = [("build", 300), ("gate.selftest", 60), ("preflight_candidates", 60),
           ("preflight.CYP2D6", 180), ("preflight.C4", 180), ("preflight.ACOT", 300), ("gate.order_reversed", 180), ("gate.order", 60)]
 STATIC += [(f"count.{b['bid']}", 300 if b["locus"] == "ACOT" else 120) for b in BLOCKS]
 STATIC += [("gate.features", 120), ("select", 120)]
+# amendment A1 (AMENDMENT_A1.md): gate.features was dispatched as mode "gate.features" (the mode is "gate_features") and failed
+# before running; re-run as gate.features.a1, which the score units now need. The failed unit stays recorded.
+STATIC.insert(STATIC.index(("select", 120)), ("gate.features.a1", 120))
 
 
 def plan():
@@ -40,10 +43,10 @@ def needs(unit):
         return ["preflight.CYP2D6", "gate.order_reversed"]
     if unit.startswith("count."):
         return ["build"]
-    if unit in ("gate.features", "select"):
+    if unit in ("gate.features", "gate.features.a1", "select"):
         return ["gate.selftest"]
     if unit.startswith("score."):
-        return ["build", "gate.selftest", "gate.order", "gate.features", "select"]
+        return ["build", "gate.selftest", "gate.order", "gate.features.a1", "select"]
     if unit == "evaluate":
         return ["select"]
     return []
@@ -71,6 +74,8 @@ def command(unit, d):
         return py + [unit, d]
     if unit == "gate.order":
         return py + ["gate_order", d]
+    if unit == "gate.features.a1":
+        return py + ["gate_features", d]
     pc = f"{OUT}/runs/preflight_candidates"
     if unit.startswith("preflight."):
         locus = unit.split(".", 1)[1]
