@@ -291,6 +291,37 @@ for h in cleanA cleanB flank; do
 done
 ok "the flanking bases survive as fragments, byte for byte"
 
+# ---------------------------------------------------------------- approximate mode: shared fragments
+# Fragments are interned by site, role, the step they follow and their bases, never minted per path.
+# Minted per occurrence, two haplotypes that walk exactly the same route got a private copy of every
+# flank fragment each -- at a real locus, 351 separate ATATAT nodes before one array -- so identical
+# haplotypes left panphorte walking different routes and refine read the site as a skeleton mismatch.
+{ printf 'H\tVN:Z:1.0\n'
+  printf "S\t1\t%s\nS\t2\t%s\nS\t3\tTTT%sGGG\nS\t4\t%s\n" "$BB1" "$UNIT" "$UNIT" "$BB2"
+  printf 'L\t1\t+\t2\t+\t0M\nL\t2\t+\t2\t+\t0M\nL\t2\t+\t4\t+\t0M\n'
+  printf 'L\t1\t+\t3\t+\t0M\nL\t3\t+\t4\t+\t0M\n'
+  printf 'P\tcleanA\t1+,2+,2+,4+\t*\nP\tcleanB\t1+,2+,2+,4+\t*\n'
+  printf 'P\tflankA\t1+,3+,4+\t*\nP\tflankB\t1+,3+,4+\t*\n'; } > "$OUT/share.gfa"
+"$BIN" bubble -i "$OUT/share.gfa" -r cleanA -o "$OUT/shareb" --min-variant-bp 0 -q >/dev/null 2>&1
+"$BIN" panphorte -i "$OUT/shareb.sorted.gfa" -c "$OUT/shareb.bubbles.csv" -o "$OUT/sharep" \
+       --min-similarity 0.90 --min-array-prevalence 0.5 -q >/dev/null 2>&1
+[ "$(rep "$OUT/sharep.panphorte.report.tsv" normalized)" = "yes" ] \
+  && ok "the shared-fragment fixture folds" \
+  || bad "the shared-fragment fixture did not fold, so the assertions below test nothing"
+[ -n "$(pline "$OUT/sharep.normalized.gfa" flankA)" ] \
+  && [ "$(pline "$OUT/sharep.normalized.gfa" flankA)" = "$(pline "$OUT/sharep.normalized.gfa" flankB)" ] \
+  && ok "two identical haplotypes still walk one route after folding" \
+  || bad "identical haplotypes walk different routes: $(pline "$OUT/sharep.normalized.gfa" flankA) vs $(pline "$OUT/sharep.normalized.gfa" flankB)"
+share_frag=$(awk '$1 == "S" && ($3 == "TTT" || $3 == "GGG")' "$OUT/sharep.normalized.gfa" | wc -l | tr -d ' ')
+[ "$share_frag" = "2" ] \
+  && ok "each flank fragment is one node shared by both carriers" \
+  || bad "$share_frag TTT/GGG fragment nodes, expected 2 (one per flank)"
+for h in cleanA cleanB flankA flankB; do
+  [ "$(spell "$OUT/shareb.sorted.gfa" $h)" = "$(spell "$OUT/sharep.normalized.gfa" $h)" ] \
+    || bad "$h lost or gained bases when its fragments were shared"
+done
+ok "sharing fragments keeps every haplotype's bases"
+
 # ---------------------------------------------------------------- no carrier is ever called CN 0
 # The condition the whole boundary policy exists to prevent: a half-REP, half-literal site makes `call`
 # read CN 0 for a haplotype that carries a copy, because copy number is counted from REP occurrences.

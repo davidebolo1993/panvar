@@ -880,6 +880,13 @@ void panphorte_normalize(const PanphorteOptions& options, PanphorteSummary* summ
     // multiplicity, and identical repeat units at different loci are the normal case, not a corner
     // one.
     std::unordered_map<std::string, std::string> rep_by_unit; // "<bubble>\t<canonical unit>" -> node
+    // Fragment nodes (the literal bases around and between approximate copies) are interned like REP
+    // nodes, never minted per occurrence. Minting one per path gave every haplotype its own node for the
+    // same bases -- 351 separate ATATAT nodes before one array -- and made identical haplotypes walk
+    // different routes. The key is SITE- and CONTEXT-local: bubble, role (lead / between copies /
+    // tail), the oriented step it follows, and the sequence in path orientation; so two paths that
+    // read the same bases at the same place share the node, and identical walks stay identical.
+    std::unordered_map<std::string, std::string> fragment_by_key;
     std::unordered_set<std::string> removal_candidates;
     // Oriented links a path traversed across a span this run replaced, and the site that replaced it. A
     // replaced node that survives because some other site still uses it would otherwise keep its old
@@ -1253,18 +1260,27 @@ void panphorte_normalize(const PanphorteOptions& options, PanphorteSummary* summ
                         // in the replaced range that is not inside a copy, verbatim, as
                         // per-occurrence nodes: nothing outside an accepted copy is lost, and copies
                         // that share a node are all folded rather than the second one declined.
+                        const auto fragment_node = [&](char role, const std::string& bases) {
+                            const PathStep& prev = pa.replacement.empty() ? graph.paths[pi].steps[pa.start - 1]
+                                                                          : pa.replacement.back();
+                            const std::string key = std::to_string(bubble.id) + '\t' + role + '\t' + prev.node_id +
+                                                    (prev.reverse ? "-" : "+") + '\t' + bases;
+                            const auto fit = fragment_by_key.find(key);
+                            if (fit != fragment_by_key.end()) return fit->second;
+                            const std::string id = add_new_node(model, bases);
+                            fragment_by_key.emplace(key, id);
+                            ++summary.nodes_added;
+                            ++summary.fragment_nodes_added;
+                            return id;
+                        };
                         for (std::size_t ci = 0; ci < m.n_copies(); ++ci) {
                             if (!m.frag[ci].empty()) {
-                                pa.replacement.push_back(PathStep{add_new_node(model, m.frag[ci]), false});
-                                ++summary.nodes_added;
-                                ++summary.fragment_nodes_added;
+                                pa.replacement.push_back(PathStep{fragment_node(ci == 0 ? 'L' : 'G', m.frag[ci]), false});
                             }
                             pa.replacement.push_back(PathStep{rep_id, m.rev[ci]});
                         }
                         if (!m.frag.back().empty()) {
-                            pa.replacement.push_back(PathStep{add_new_node(model, m.frag.back()), false});
-                            ++summary.nodes_added;
-                            ++summary.fragment_nodes_added;
+                            pa.replacement.push_back(PathStep{fragment_node('T', m.frag.back()), false});
                         }
                         // The steps this block replaces are gone from the path. Marking them (and the
                         // arcs across them) makes them candidates for removal; whether they actually
