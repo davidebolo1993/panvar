@@ -7274,6 +7274,53 @@ int prior_geometry(const Args& args) {
     return tiles && agrees ? 0 : 3;
 }
 
+// panel-sketch (M14-A, DIAGNOSTIC; panel sequences only): every ACTIVE panel template spelled through the model (its own
+// allele path) and a deterministic bottom-s MinHash sketch of its canonical k-mers (splitmix64 of the 2-bit code), for
+// representative selection by Mash distance. Writes <out>.sketch.tsv: template, length, allele path, sketch.
+int panel_sketch(const Args& args) {
+    const std::string out = args.required("out");
+    const std::string curation = args.get("panel-curation", "");
+    const LoadedModel loaded = load_model(args.required("model-gfa"), args.required("reference"), out + ".model.sorted.gfa", 50,
+                                          curation.empty() ? std::vector<std::string>{} : read_panel_curation(curation));
+    std::filesystem::remove(out + ".model.sorted.gfa");
+    const panvar::PreparedGenotypeModel& model = *loaded.model;
+    const std::size_t k = std::stoul(args.get("k", "21")), s = std::stoul(args.get("s", "2000"));
+    const auto mix = [](std::uint64_t x) {
+        x += 0x9e3779b97f4a7c15ULL;
+        x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ULL;
+        x = (x ^ (x >> 27)) * 0x94d049bb133111ebULL;
+        return x ^ (x >> 31);
+    };
+    std::ostringstream o;
+    o << "template\tlength\tallele_path\tsketch\n";
+    const auto& panel = model.panel();
+    for (std::size_t row = 0; row < panel.template_count(); ++row) {
+        const std::vector<std::size_t>& path = panel.template_alleles[row];
+        const std::string seq = panvar::spell_mosaic(model, panvar::MosaicPath{path}).bases;
+        std::set<std::uint64_t> keep;
+        const std::uint64_t mask = (k >= 32) ? ~0ULL : ((1ULL << (2 * k)) - 1ULL);
+        std::uint64_t fwd = 0, rev = 0;
+        std::size_t filled = 0;
+        for (char ch : seq) {
+            const int b = ch == 'A' ? 0 : ch == 'C' ? 1 : ch == 'G' ? 2 : ch == 'T' ? 3 : -1;
+            if (b < 0) { fwd = rev = 0; filled = 0; continue; }
+            fwd = ((fwd << 2) | static_cast<std::uint64_t>(b)) & mask;
+            rev = (rev >> 2) | (static_cast<std::uint64_t>(3 - b) << (2 * (k - 1)));
+            if (++filled < k) continue;
+            const std::uint64_t h = mix(std::min(fwd, rev));
+            if (keep.size() < s) keep.insert(h);
+            else if (h < *keep.rbegin() && !keep.count(h)) { keep.erase(std::prev(keep.end())); keep.insert(h); }
+        }
+        std::string p, sk;
+        for (std::size_t a : path) p += (p.empty() ? "" : ",") + std::to_string(a);
+        for (std::uint64_t h : keep) sk += (sk.empty() ? "" : ",") + std::to_string(h);
+        o << panel.template_names[row] << '\t' << seq.size() << '\t' << p << '\t' << sk << '\n';
+    }
+    atomic_write(out + ".sketch.tsv", o.str());
+    std::cout << "panel-sketch: " << panel.template_count() << " active templates, k=" << k << ", s=" << s << ", model " << loaded.fingerprint << '\n';
+    return 0;
+}
+
 // vt-score (M13-A, DIAGNOSTIC; truth-free): the variation-tolerant truncated marginal of tests/vt_marginal.hpp for frozen
 // candidates in a run's fixed context. --candidates FILE: label \t hap1 alleles \t hap2 alleles [\t expected ordinary total].
 // Reports, per candidate, the ordinary fixed-content score (fragment + exposure + the run's copying prior; an expected total
@@ -9428,6 +9475,7 @@ int main(int argc, char** argv) {
         if (command == "repair-pilot") return repair_pilot(args);
         if (command == "score-set") return score_set(args);
         if (command == "vt-score") return vt_score(args);
+        if (command == "panel-sketch") return panel_sketch(args);
         if (command == "block-sequences") return block_sequences(args);
         if (command == "junction-proposals") return junction_proposals_probe(args);
         if (command == "prior-pool") return prior_pool(args);
