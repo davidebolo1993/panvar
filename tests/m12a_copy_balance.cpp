@@ -96,7 +96,10 @@ Frag make_fragment(const std::string& h, std::size_t s, bool first_forward, std:
     f.first_forward = first_forward;
     f.pair = first_forward ? panvar::ReadPair{rd("f/1", left), rd("f/2", right)} : panvar::ReadPair{rd("f/1", right), rd("f/2", left)};
     const std::size_t array_begin = FLANK, array_end = FLANK + copies * U, e = s + INSERT;
-    if (s < array_begin || e > array_end) f.cls = "boundary";
+    // M12-A amendment A1: a template wholly inside one flank is "flank" (present on every H_k, including k = 0); one that
+    // crosses a flank|array boundary is "boundary" (needs at least one unit)
+    if (e <= array_begin || s >= array_end) f.cls = "flank";
+    else if (s < array_begin || e > array_end) f.cls = "boundary";
     else if ((s - array_begin) / U != (e - 1 - array_begin) / U) f.cls = "junction";
     else f.cls = "interior";
     return f;
@@ -118,6 +121,7 @@ std::size_t brute_origins(const std::string& h, const panvar::ReadPair& p, const
 std::size_t analytic_origins(const std::string& cls, std::size_t k) {
     if (cls == "interior") return k;
     if (cls == "junction") return k >= 2 ? k - 1 : 0;
+    if (cls == "flank") return 1;
     return k >= 1 ? 1 : 0;   // boundary: the template carries flank sequence, so one place at most (fragments < U)
 }
 
@@ -182,7 +186,7 @@ int main() {
         }
     }
     std::cout << "G1 origins: " << g1 << " (fragment, haplotype) comparisons; classes interior=" << by_class["interior"]
-              << " junction=" << by_class["junction"] << " boundary=" << by_class["boundary"] << '\n';
+              << " junction=" << by_class["junction"] << " boundary=" << by_class["boundary"] << " flank=" << by_class["flank"] << '\n';
 
     // ---- G2 / G3: scorer vs oracle vs independent; copy-number balance under a noise-free tiling --------------------
     // The observed data: one template per start on EACH of the two truth copies (homozygous H_3), i.e. exactly the

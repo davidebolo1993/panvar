@@ -197,7 +197,8 @@ def block_counts(summary, side):
 def analyse(out):
     contract_rows = {r["case"]: r for r in T(f"{OUT}/runs/contract/contract.tsv")}
     rows = []
-    fixtures_ok = os.path.exists(f"{OUT}/runs/gate.fixtures/run.log") and "ALL GATES PASS" in open(f"{OUT}/runs/gate.fixtures/run.log").read()
+    fx = f"{OUT}/runs/gate.fixtures.a1/run.log"   # amendment A1: the corrected fixture run
+    fixtures_ok = os.path.exists(fx) and "ALL GATES PASS" in open(fx).read()
     for c in CASES:
         cid, cell = c["case"], c["cell"]
         ss = f"{OUT}/runs/lik.{cid}/ss"

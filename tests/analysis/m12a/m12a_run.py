@@ -20,15 +20,21 @@ UNITS = [("build", 300), ("gate.fixtures", 120), ("contract", 120), ("prepare", 
 UNITS += [(f"lik.{c['case']}", LOCUS_TIMEOUT[m11d.cell(c["cell"])["locus"]]) for c in m12a.CASES]
 UNITS += [(f"count.{c['case']}", 240 if m11d.cell(c["cell"])["locus"] == "ACOT" else 180) for c in m12a.CASES if c["count"] == "run"]
 UNITS += [("analyse", 120)]
+# amendment A1 (AMENDMENT_A1.md): the fixture's analytic origin class omitted flank-only templates; gate.fixtures failed on
+# that fixture-code defect alone (oracle = brute force everywhere). Re-run as gate.fixtures.a1 before the case units.
+UNITS.insert(2, ("build.a1", 300))
+UNITS.insert(3, ("gate.fixtures.a1", 120))
 
 
 def needs(unit):
     if unit == "gate.fixtures":
         return ["build"]
+    if unit == "gate.fixtures.a1":
+        return ["build.a1"]
     if unit in ("contract", "prepare"):
         return []
     if unit.startswith(("lik.", "count.")):
-        return ["build", "prepare"]
+        return ["build.a1", "prepare"]
     if unit == "analyse":
         return ["contract", "prepare"]
     return []
@@ -64,9 +70,9 @@ def count_cmd(c, d):
 
 def command(unit, d):
     py = [sys.executable, os.path.join(HERE, "m12a.py")]
-    if unit == "build":
+    if unit in ("build", "build.a1"):
         return ["cmake", "--build", f"{WT}/build", "--target", "genotype_probe", "m12a_copy_balance", "-j", "8"]
-    if unit == "gate.fixtures":
+    if unit in ("gate.fixtures", "gate.fixtures.a1"):
         return [f"{WT}/build/m12a_copy_balance"]
     if unit.startswith("lik."):
         return lik_cmd(m12a.case(unit.split(".", 1)[1]), d)
