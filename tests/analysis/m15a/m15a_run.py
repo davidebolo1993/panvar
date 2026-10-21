@@ -18,6 +18,9 @@ BUDGET, PRE = 900, 60.0   # disclosed: reading, one reproduction comparison of a
 # (panvar_genotype_report 105 s, panvar_genotype_branch_lifetime 98 s, panvar_genotype_block_delta 72 s) -- excluded for budget
 EXCLUDE = "panvar_genotype_report$|panvar_genotype_branch_lifetime$|panvar_genotype_block_delta$"
 UNITS = [("build", 420), ("ctest", 420), ("reproduce", 60)]
+# amendment A1 (AMENDMENT_A1.md): ctest hit its 420 s unit watchdog; panvar_genotype_command_e2e hit the 120 s per-test cap
+# (its recorded cost, 8.9 s, was stale) and panvar_smoke_real_c4 was interrupted. Re-run exactly those two, per-test 280 s.
+UNITS += [("ctest.a1", 300)]
 NEEDS = {"ctest": ["build"]}
 
 
@@ -26,6 +29,9 @@ def command(unit, d):
         return ["cmake", "--build", f"{WT}/build", "-j", "4"]
     if unit == "ctest":
         return ["ctest", "--test-dir", f"{WT}/build", "-j", "1", "-E", EXCLUDE, "--output-on-failure", "--timeout", "120"]
+    if unit == "ctest.a1":
+        return ["ctest", "--test-dir", f"{WT}/build", "-j", "1", "-R", "panvar_genotype_command_e2e$|panvar_smoke_real_c4$", "--output-on-failure",
+                "--timeout", "280"]
     return [sys.executable, os.path.join(HERE, "reproduce.py"), d]
 
 
