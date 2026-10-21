@@ -125,3 +125,25 @@ truth-allocated or floor content over both scores' current choice.
 
 **Consistent with earlier findings** that C4 sv:7 allocation is weakly identifiable from reads (M1-C, M6-B, sv7
 allocation).
+
+## Closure (2026-10-21)
+
+**M12-C is closed, and the hard dosage-first rule is parked.**
+
+**Kept as diagnostics only:**
+- the count-state outputs: pooled-feature copy states (`count-attrib --features 1`), count-state selection and the
+  coverage ledger.
+
+**Not done:**
+- the selector is not integrated;
+- the scoring campaign is not extended;
+- no further dosage weight is tuned.
+
+**Not claimed:** these results do not establish short-read unidentifiability of allocation or content. They show only
+that, on these cases, the unchanged objective and the count loss preferred the wrong within-state candidates.
+
+**Unchanged:**
+- the caller checkpoint (M10-A + M11-C);
+- the 18 ACOT validation families.
+
+No further batch is open.
