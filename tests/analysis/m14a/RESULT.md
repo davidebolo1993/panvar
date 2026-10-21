@@ -151,3 +151,10 @@ the release, and no further clustering, profiling campaign or ACOT-only tuning f
    NA19705 contributes a C4 and a CYP2D6 cell, so there are 10 distinct donors in 11 cells.
 4. **Small Mash distances do not certify similar repeat counts or arrangements,** so tight clusters were not necessarily
    safe structural substitutes.
+
+## Record correction (M15-A, 2026-10-21)
+
+**`MANIFEST.tsv` records the `panvar` hash taken before M14-A's `build` unit** (`c03cbba4…`). That unit re-linked `panvar`
+from unchanged sources, and the calls ran on `47042a5c…`.
+- **Sources:** `src/` and `include/` are identical to `ed10d53`.
+- **Behaviour:** M14-A's full-panel runs reproduce M11-D's archived calls on 15 of 15 cells (M15-A `runs/reproduce`).
