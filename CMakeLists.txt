@@ -405,6 +405,9 @@ if(PANVAR_BUILD_TESTING)
         add_test(NAME panvar_genotype_review_regressions
                  COMMAND genotype_review_regressions ${CMAKE_CURRENT_SOURCE_DIR}/tests/genotype_review_regressions.expected)
 
+        add_executable(m12a_copy_balance tests/m12a_copy_balance.cpp)   # M12-A diagnostic fixtures (not a ctest)
+        target_link_libraries(m12a_copy_balance PRIVATE panvarlib)
+        target_compile_options(m12a_copy_balance PRIVATE -Wall -Wextra -Wpedantic)
         add_executable(genotype_fragment_oracle_test tests/genotype_fragment_oracle.cpp)
         target_link_libraries(genotype_fragment_oracle_test PRIVATE panvarlib)
         target_compile_options(genotype_fragment_oracle_test PRIVATE -Wall -Wextra -Wpedantic)

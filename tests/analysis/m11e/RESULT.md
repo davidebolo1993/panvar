@@ -160,3 +160,11 @@ content is blocked by the panel prior.
 - `runs/score.*/`: score-set tables, local ranks, decompositions.
 - `runs/trace/attribution.tsv`.
 - `MANIFEST.tsv`, `ledger.tsv`.
+
+## Closure (2026-10-21): local scope
+
+**M11-E is closed with its local scope explicit:**
+- **What was shown:** the tested best-available replacements lose in each winner's own context.
+- **What it does not exclude:** better multi-block alternatives, or other correct-copy-number alternatives.
+- **K2 and K3:** they show that the **tested** alleles are inconsistent with the reads. They do not show the exhaustive
+  absence of every read-consistent, correct-copy-number panel allele.

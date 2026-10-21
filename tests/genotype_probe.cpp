@@ -7679,7 +7679,9 @@ int count_attrib(const Args& args) {
             }
         }
     }
-    // ---- the unchanged active catalogue against every profile (exact groups)
+    // ---- the unchanged active catalogue against every profile (exact groups). M12-A: --skip-catalogue 1 scores only the
+    // frozen candidates (the catalogue table then records that it was skipped); nothing above changes.
+    const bool skip_catalogue = args.get("skip-catalogue", "0") == "1";
     const auto merged = [&](const std::string& a, const std::string& b) {
         countfit::Sparse x = countfit::count_string(a, dict), z = countfit::count_string(b, dict);
         countfit::Sparse s = countfit::sum_sparse(x, z);
@@ -7688,13 +7690,14 @@ int count_attrib(const Args& args) {
     };
     const countfit::Sparse base1 = merged(context.left[0], context.right[0]), base2 = merged(context.left[1], context.right[1]);
     std::vector<countfit::Sparse> mid1, mid2;
-    for (const auto& a : alleles) {
+    if (!skip_catalogue) for (const auto& a : alleles) {
         mid1.push_back(countfit::count_string(countfit::middle_window(context.left[0], a.sequence, context.right[0]), dict));
         mid2.push_back(countfit::count_string(countfit::middle_window(context.left[1], a.sequence, context.right[1]), dict));
     }
     std::ostringstream cat_out;
     cat_out << std::setprecision(12) << "profile\tgroup_rank\tgroup_size\tallele_h1\tallele_h2\tloss\tloss_minus_best\tis_caller\n";
-    for (const auto& pr : profiles) {
+    if (skip_catalogue) cat_out << "# skipped (--skip-catalogue 1): only the frozen candidates were scored\n";
+    if (!skip_catalogue) for (const auto& pr : profiles) {
         const auto cs2 = countfit::score_all(pr.second, base1, base2, mid1, mid2);
         const auto groups = countfit::group_profiles(cs2, mid1, mid2);
         const double best = cs2[groups[0][0]].loss;
