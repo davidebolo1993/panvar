@@ -202,6 +202,24 @@ void test_preset_configuration() {
 }
 
 // M15-D: dosage runs only when requested (--dosage-check, or an explicit expert mode); no schema implies it; v2 refuses repair.
+// M15-E: build and load cannot be combined; a build refuses sample-only arguments
+void test_panel_index_flags() {
+    require(parse({"--build-panel-index", "x.pvpl", "--panel-index", "x.pvpl"}).error.find("cannot be combined") != std::string::npos,
+            "--build-panel-index with --panel-index is refused");
+    for (const char* sample_arg : {"--reads1", "--reads2", "--library", "--out", "--out-prefix", "-o", "--dosage-mode", "--dosage-audit"}) {
+        const std::string value = std::string(sample_arg) == "--dosage-mode" ? "audit" : std::string(sample_arg) == "--dosage-audit" ? "shadow" : "v";
+        require(parse({"--build-panel-index", "x.pvpl", sample_arg, value}).error.find("is a sample argument") != std::string::npos,
+                std::string("--build-panel-index refuses ") + sample_arg);
+    }
+    require(parse({"--build-panel-index", "x.pvpl", "--dosage-check"}).error.find("is a sample argument") != std::string::npos,
+            "--build-panel-index refuses --dosage-check");
+    panvar::GenotypeCommandOptions kept;
+    require(parse({"--panel-index", "x.pvpl", "--reads1", "a", "--reads2", "b", "--threads", "3", "--dosage-check"}, &kept).error.empty() &&
+                kept.panel_index_path == "x.pvpl",
+            "--panel-index accepts every sample argument");
+    std::cout << "  panel-index flags: build + load refused; a build refuses sample arguments; a load accepts them\n";
+}
+
 void test_dosage_check_contract() {
     panvar::GenotypeCommandOptions kept;
     require(parse({}, &kept).error.empty() && kept.dosage_mode == "off" && !kept.dosage_mode_explicit &&
@@ -383,7 +401,10 @@ void test_help_text() {
                                "3 PROVISIONAL", "A profile is not by itself a validated configuration",
                                // M15-D: the basic command
                                "--dosage-check", "Without it dosage is not run", "omitted means auto (identical)",
-                               "never a fallback", "optional expert override", "No profile is needed"}) {
+                               "never a fallback", "optional expert override", "No profile is needed",
+                               // M15-E: the panel-index flags
+                               "--build-panel-index FILE", "--panel-index FILE", "saves locus preparation, not the rest",
+                               "never overwritten", "still read and hashed", "never rebuilt"}) {
         require(h.find(needle) != std::string::npos, std::string("--help must say: ") + needle);
     }
     require(h.find("exact genotype =") == std::string::npos && h.find("the exact coordinate repair") == std::string::npos &&
@@ -458,6 +479,7 @@ int main(int argc, char** argv) {
         test_output_schema();
         test_preset_configuration();
         test_dosage_check_contract();
+        test_panel_index_flags();
         test_pre_block_no_call();
     } catch (const std::exception& error) {
         std::cerr << "FAIL: " << error.what() << '\n';

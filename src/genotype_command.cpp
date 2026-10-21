@@ -2167,6 +2167,12 @@ void write_status(
         out << "prepared_locus_origin\t" << g_prepared_use.origin << '\n';
         if (!g_prepared_use.file_checksum.empty()) out << "prepared_locus_file_sha256\t" << g_prepared_use.file_checksum << '\n';
         out << "prepared_locus_panel_source\t" << g_prepared_use.panel_source << '\n';   // I3-D
+        if (!options.panel_index_path.empty()) {   // M15-E: the public --panel-index route (runtime facts)
+            out << "panel_index\t" << options.panel_index_path << "\npanel_index_file_bytes\t" << options.panel_index_file_bytes
+                << "\npanel_index_load_seconds\t" << options.panel_index_load_seconds << "\npanel_index_panel_rebuild_reason\t"
+                << (options.panel_index_panel_rebuild_reason.empty() ? std::string("none") : options.panel_index_panel_rebuild_reason)
+                << '\n';
+        }
     }
     if (options.setting_sources.count("adaptive_emission_handoff") != 0) {
         // I2-K (EXPERIMENTAL): what the union-to-adaptive emission handoff did (inherited entries are not stage work)
@@ -8313,6 +8319,8 @@ std::optional<int> parse_genotype_arguments(const std::vector<std::string>& args
         }
         else if (flag == "--library-diagnostic") options.library_diagnostic = true;
         else if (flag == "--dosage-check") options.dosage_check_flag = true;   // M15-D: resolved after every flag
+        else if (flag == "--build-panel-index") options.build_panel_index_path = need(i);   // M15-E
+        else if (flag == "--panel-index") options.panel_index_path = need(i);               // M15-E
         else if (flag == "--dosage-mode") {
             options.dosage_mode = need(i);
             options.dosage_mode_explicit = true;
@@ -8325,7 +8333,9 @@ std::optional<int> parse_genotype_arguments(const std::vector<std::string>& args
         else if (flag == "-h" || flag == "--help") {
             out <<
                 "Usage:\n"
-                "  panvar genotype --graph <locus.gfa> --reads1 <R1.fq[.gz]> --reads2 <R2.fq[.gz]> --threads 4 --out <prefix>\n\n"
+                "  panvar genotype --graph <locus.gfa> --reads1 <R1.fq[.gz]> --reads2 <R2.fq[.gz]> --threads 4 --out <prefix>\n"
+                "  panvar genotype --graph <locus.gfa> --build-panel-index <locus.pvpl>        (once per locus)\n"
+                "  panvar genotype --graph <locus.gfa> --panel-index <locus.pvpl> --reads1 ... --reads2 ... --out <prefix>\n\n"
                 "Genotypes one structural locus from paired short reads: a diplotype (two whole-locus haplotypes)\n"
                 "over the graph's panel, projected to one allele pair per block. EXPERIMENTAL. No profile is needed:\n"
                 "the short-read preset carries the accelerated configuration, the library is estimated from the reads,\n"
@@ -8364,6 +8374,15 @@ std::optional<int> parse_genotype_arguments(const std::vector<std::string>& args
                 "  --profile FILE             optional expert override (key<TAB>value; it must name itself). Repeated --profile\n"
                 "                             files apply in order, a later one overriding an earlier one; a key set twice\n"
                 "                             in one file is refused. A profile is not by itself a validated configuration\n"
+                "  --build-panel-index FILE   build the sample-independent panel index for this graph, reference, curation,\n"
+                "                             bubbles and marker settings (structural model + marker panel), then stop: no\n"
+                "                             reads, library or output prefix; an existing FILE is never overwritten\n"
+                "  --panel-index FILE         genotype against a built index: it saves locus preparation, not the rest of the\n"
+                "                             run. Its integrity, versions and identity are verified first (the --graph and\n"
+                "                             other inputs are still read and hashed); a missing, corrupt or incompatible\n"
+                "                             index is refused (exit 2) before the output prefix is touched, never rebuilt.\n"
+                "                             Rebuild it when the graph, reference, curation, bubbles, --min-variant-bp,\n"
+                "                             --kmer-size or --syncmer-s change (reads, library, threads and --dosage-check do not)\n"
                 "  -q, --quiet\n"
                 "  --help-advanced            advanced scientific flags, profile keys and precedence\n\n"
                 "Headline filters, three independent verdicts (every detailed field is also reported):\n"
@@ -8576,6 +8595,22 @@ std::optional<int> parse_genotype_arguments(const std::vector<std::string>& args
             }
             if (const AdvancedFlag* a = advanced_setting(flag)) {
                 options.overridden_settings.push_back(std::string(a->key) + "=" + genotype_setting_value(options, a->key));
+            }
+        }
+    }
+    // M15-E: the panel-index modes. Building runs no sample, so a sample-only argument is refused rather than ignored;
+    // building and loading in one invocation is refused (build once, then genotype each sample with --panel-index).
+    if (!options.build_panel_index_path.empty()) {
+        if (!options.panel_index_path.empty()) {
+            throw std::runtime_error("--build-panel-index and --panel-index cannot be combined: build the index once, then "
+                                     "genotype each sample with --panel-index");
+        }
+        static const std::set<std::string> sample_only = {"--reads1", "--reads2", "--library", "--out", "--out-prefix", "-o",
+                                                          "--dosage-check", "--dosage-mode", "--dosage-audit"};
+        for (const std::string& a : args) {
+            if (sample_only.count(a) != 0) {
+                throw std::runtime_error("--build-panel-index builds the sample-independent index only and runs no sample: " + a +
+                                         " is a sample argument (give it when genotyping with --panel-index)");
             }
         }
     }
@@ -8881,9 +8916,87 @@ int execute_genotype_command(const GenotypeCommandOptions& requested, const Prep
     return called ? 0 : 1;
 }
 
+namespace {
+// M15-E: --build-panel-index. The sample-independent preparation (structural model and marker panel) through the existing
+// I3-C/I3-D writer: canonical bytes, atomic publication that never overwrites. No sample runs, no genotype prefix is
+// cleared and no sample report is written; the only temporary (the staged sorted graph) sits next to the index and is
+// removed. The build record goes to stdout.
+int build_panel_index(const GenotypeCommandOptions& requested) {
+    const std::string& path = requested.build_panel_index_path;
+    try {
+        std::error_code ec;
+        if (std::filesystem::exists(path, ec)) {   // before any work; publish_prepared_locus refuses it too
+            throw PreparedLocusFormatError(PreparedLocusFormatError::Kind::exists, path + " exists; an index is never overwritten");
+        }
+        GenotypeCommandOptions options = requested;
+        options.out_prefix = path;   // the staged sorted graph: <index>.prepared_locus.sorted.gfa, removed after the build
+        const Clock::time_point start = Clock::now();
+        const PreparedLocusPreparation prepared = prepare_genotype_locus_record(options, /*persist_panel=*/true);
+        const double prepare_seconds = seconds_since(start);
+        const Clock::time_point write_start = Clock::now();
+        const std::string bytes = encode_prepared_locus(prepared.record);
+        publish_prepared_locus(bytes, path);
+        const double write_seconds = seconds_since(write_start);
+        const PreparedLocusKey& key = prepared.record.key;
+        std::cout << std::setprecision(6) << "key\tvalue\npanel_index\t" << path << "\nschema_version\t" << kPreparedLocusSchemaVersion
+                  << "\npreparation_algorithm_version\t" << kPreparationAlgorithmVersion << "\npanel_extension_version\t"
+                  << kPanelExtensionVersion << "\nmarker_panel_algorithm_version\t" << kMarkerPanelAlgorithmVersion
+                  << "\nidentity_gfa_sha256\t" << key.gfa_sha256 << "\nidentity_reference_path\t" << key.reference_path
+                  << "\nresolved_reference\t" << prepared.record.resolved_reference << "\nidentity_bubbles\t" << key.bubbles
+                  << "\nidentity_min_variant_bp\t" << key.min_variant_bp << "\nidentity_curation\t" << key.curation
+                  << "\nidentity_kmer_size\t" << key.kmer_size << "\nidentity_syncmer_s\t" << key.syncmer_s
+                  << "\nmodel_fingerprint\t" << prepared.record.model_fingerprint << "\nfile_bytes\t" << bytes.size()
+                  << "\nfile_sha256\t" << sha256_bytes(bytes) << "\nprepare_seconds\t" << prepare_seconds << "\nwrite_seconds\t"
+                  << write_seconds << "\ncontents\tsample-independent preparation only: structural model and marker panel\n";
+        return 0;
+    } catch (const PreparedLocusFormatError& error) {
+        std::cerr << "[genotype] --build-panel-index " << path << " refused (" << prepared_locus_error_name(error.kind())
+                  << "): " << error.what() << '\n';
+        return 2;
+    }
+}
+
+// M15-E: --panel-index. The index is loaded and verified in full (integrity, bounded decoding, schema and preparation
+// versions, reconstruction digests) before anything else; the sample's own inputs are then checked against its identity
+// (graph content, reference, bubbles, curation, min_variant_bp, k, s) by the prepared route, before the output prefix is
+// touched. Any failure is a named refusal (exit 2); there is never a fallback to an in-memory preparation.
+int run_with_panel_index(GenotypeCommandOptions& options) {
+    const std::string& path = options.panel_index_path;
+    std::shared_ptr<const PreparedLocus> locus;
+    try {
+        PreparedLocusLoadReport report;
+        const Clock::time_point start = Clock::now();
+        locus = load_prepared_locus(path, PreparedLocusLoadLimits{}, &report);
+        options.panel_index_load_seconds = seconds_since(start);
+        options.panel_index_file_bytes = report.file_bytes;
+        options.panel_index_panel_source = report.panel_source;
+        options.panel_index_panel_rebuild_reason = report.panel_rebuild_reason;
+    } catch (const PreparedLocusFormatError& error) {
+        std::cerr << "[genotype] --panel-index " << path << " refused (" << prepared_locus_error_name(error.kind())
+                  << "): " << error.what() << "; nothing at the output prefix was touched\n";
+        return 2;
+    }
+    if (locus->panel_source() != "loaded") {   // never described as a fully loaded panel
+        std::cerr << "[genotype] --panel-index " << path << ": the marker panel was REBUILT from the stored model ("
+                  << (options.panel_index_panel_rebuild_reason.empty() ? std::string("no panel section")
+                                                                       : options.panel_index_panel_rebuild_reason)
+                  << "); the structural model was loaded\n";
+    }
+    try {
+        return execute_genotype_command(options, locus.get());
+    } catch (const PreparedLocusMismatch& error) {
+        std::cerr << "[genotype] --panel-index " << path << " is incompatible with this sample's inputs: " << error.what()
+                  << "; nothing at the output prefix was touched (build an index for these inputs with --build-panel-index)\n";
+        return 2;
+    }
+}
+}  // namespace
+
 int run_genotype_command(const std::vector<std::string>& args) {
     GenotypeCommandOptions options;
     if (const std::optional<int> done = resolve_genotype_command(args, options)) return *done;
+    if (!options.build_panel_index_path.empty()) return build_panel_index(options);   // M15-E
+    if (!options.panel_index_path.empty()) return run_with_panel_index(options);      // M15-E
     return execute_genotype_command(options, nullptr);
 }
 

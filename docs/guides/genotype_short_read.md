@@ -269,11 +269,73 @@ PROVISIONAL or absent result as a completed one.
 - `phase_audit_candidates`.
 
 **No CLI exists for these:**
-- **The persisted prepared-locus index** (`.panel.pvpl`) and sequential multi-sample reuse: library/API-level, exercised only
-  by development drivers (for example `genotype_prepared_locus_driver`). The tested configuration does not use an index.
+- **In-process multi-sample reuse** (one process analysing several samples against one prepared locus): library/API-level,
+  exercised only by development drivers (for example `genotype_prepared_locus_driver`). The persisted index has a public
+  CLI (§8a).
 - **Batch / multi-sample runs:** one locus and one sample per invocation.
 
 **Long reads:** not implemented (`--preset long-read` is refused).
+
+## 8a. Build once, genotype many: the panel index
+
+The panel index is the persisted, **sample-independent** preparation of one locus: the structural model and the marker
+panel (format: the I3-C/I3-D prepared-locus file). Building it once saves that preparation in every later run.
+- **What it does not save:** reading and scoring the sample. Library estimation, markers, depth, candidates, placements,
+  refinement and the dosage audit all still run per sample.
+- **How much time it saves depends on the locus.** Measured times are in `tests/analysis/m15e/RESULT.md`. There is no
+  universal speedup.
+
+**Build** (no reads and no library):
+
+```
+panvar genotype --graph locus.gfa --reference-path NAME [--panel-curation FILE] [--bubbles FILE] \
+  --build-panel-index locus.pvpl
+```
+
+- **Outputs:** the index, published atomically, and a build record on stdout. The record gives the schema, preparation,
+  panel-extension and marker-panel versions; the identity (graph SHA-256, reference, bubbles, `min_variant_bp`, curation,
+  k, s); the model fingerprint; the file size and SHA-256; and the preparation and write times.
+- **An existing file is never overwritten** (refused, exit 2).
+- **Refused in build mode:** sample arguments (`--reads1/2`, `--library`, `--out`, `--dosage-check`, `--dosage-mode`) and
+  `--panel-index`.
+- **Nothing else is written:** no output prefix is cleared, no sample report is created and no cache is left. The one
+  temporary, a sorted graph next to the index, is removed.
+
+**Genotype each sample:**
+
+```
+panvar genotype --graph locus.gfa --reference-path NAME [--panel-curation FILE] [--bubbles FILE] \
+  --panel-index locus.pvpl --reads1 S1.R1.fq.gz --reads2 S1.R2.fq.gz --threads 4 --out S1
+panvar genotype --graph locus.gfa --reference-path NAME [--panel-curation FILE] [--bubbles FILE] \
+  --panel-index locus.pvpl --reads1 S2.R1.fq.gz --reads2 S2.R2.fq.gz --threads 4 --out S2
+```
+
+**What is verified before the output prefix is touched:**
+- **The file:** integrity (header SHA-256), bounded decoding, schema and preparation versions, and reconstruction digests.
+- **This sample's inputs against the index's identity:** graph content, reference, bubbles, curation, `--min-variant-bp`,
+  `--kmer-size` and `--syncmer-s`.
+- **Inputs are still read:** `--graph` and the other inputs are read and hashed for this check, and the extraction
+  references point into the graph.
+
+**Refusals:** a missing, truncated, corrupt or incompatible index is refused with a named reason (exit 2, for example
+`io`, `truncated`, `checksum_mismatch`, `incompatible_preparation`, or the differing identity field). It is never replaced
+by an in-memory preparation.
+
+**What stays the same:**
+- **Rebuilding is never automatic,** and a different git revision does not by itself make an index incompatible.
+- **Output:** the status records `prepared_locus_origin loaded`, `prepared_locus_panel_source` and `panel_index*`. A panel
+  that had to be rebuilt from the stored model (an index without a panel section, or with one this binary does not
+  support) is reported on stderr and in the status, never as a loaded panel.
+
+**Rebuild the index when** any of these change: the graph, the reference path, the panel curation, the bubbles (or
+`--min-variant-bp` when bubbles are computed), `--kmer-size`, `--syncmer-s`, or a new panvar version that raises the
+schema or preparation version (the load says so).
+
+**These do not invalidate an index:** reads, library (`auto` or `FILE`), threads, `--dosage-check`, output schema,
+resource limits and every other sample or search option.
+
+**Never stored in an index:** library estimates, read counts or depth, candidate pools, placements, refinement state and
+dosage results.
 
 ## 9. Tested commands (M15-D `runs/ex.*`; development controls only)
 

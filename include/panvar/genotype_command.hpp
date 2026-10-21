@@ -115,6 +115,14 @@ struct GenotypeCommandOptions {
     // (repair_neighbour_bound: sum over blocks of 2 * min(repair_local_pairs, a(a+1)/2)); the short-read preset default.
     bool repair_max_neighbours_model = false;
     bool dosage_check_flag = false;   // M15-D: --dosage-check given
+    // M15-E: the persisted panel index (the I3-C/I3-D prepared-locus file). --build-panel-index writes one and runs no
+    // sample; --panel-index genotypes against one after its integrity, versions and identity are verified.
+    std::string build_panel_index_path;
+    std::string panel_index_path;
+    // M15-E, runtime only (set by the --panel-index route; reported in the status): what the load did
+    double panel_index_load_seconds = -1.0;
+    std::uint64_t panel_index_file_bytes = 0;
+    std::string panel_index_panel_source, panel_index_panel_rebuild_reason;
     // CUMULATIVE caps over the whole repair search, a different declared quantity from the per-pass
     // caps above, which bound the union's single scoring pass.
     std::uint64_t repair_max_physical_origins = 4900000000ULL;

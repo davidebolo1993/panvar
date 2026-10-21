@@ -2914,7 +2914,9 @@ bool indexed_allowed_key(const std::string& key) {
         // I2-K: the emission-handoff provenance and work block
         "^adaptive_emission_handoff|"
         // I3-A: the prepared-locus provenance
-        "^prepared_locus)");
+        "^prepared_locus|"
+        // M15-E: the public --panel-index route's runtime facts
+        "^panel_index)");
     return std::regex_search(key, diagnostic);
 }
 
@@ -2931,7 +2933,10 @@ void require_same_science(const std::string& a, const std::string& b, const std:
                 }
                 return text;
             };
-            require(placeheld(slurp(path(a + suffix)), path(a)) == placeheld(slurp(path(b + suffix)), path(b)),
+            // M15-E: and the bare prefix name (the locus table links its sibling files by name)
+            const auto base = [](const std::string& rel) { return std::filesystem::path(rel).filename().string(); };
+            require(placeheld(placeheld(slurp(path(a + suffix)), path(a)), base(a)) ==
+                        placeheld(placeheld(slurp(path(b + suffix)), path(b)), base(b)),
                     label + ": " + suffix + " differs");
         }
     }
@@ -2953,6 +2958,168 @@ void require_same_science(const std::string& a, const std::string& b, const std:
         }
         require(vx == vy, label + ": status key '" + key + "' differs: " + x->second + " vs " + y->second);
     }
+}
+
+// ---- M15-E: the public panel-index flags (--build-panel-index, --panel-index) through the CLI ------------------------------
+void test_panel_index_cli() {
+    namespace fs = std::filesystem;
+    const std::string d = "pi";
+    fs::remove_all(path(d));
+    fs::create_directories(path(d));
+    const std::string index = path(d + "/locus.pvpl");
+    const std::vector<std::string> locus_args = {"--graph", path("prep_locus.gfa"), "--reference-path", "sampleA#1#chr1:0-100",
+                                                 "--kmer-size", "21", "--syncmer-s", "11"};
+    const auto sample = [&](char which, const std::string& prefix, const std::vector<std::string>& extra) {
+        std::vector<std::string> a = locus_args;
+        for (const std::string& x : {std::string("--reads1"), path(std::string("prep_") + which + "_r1.fq"), std::string("--reads2"),
+                                     path(std::string("prep_") + which + "_r2.fq"), std::string("--max-mosaic-candidates"),
+                                     std::string("8"), std::string("--threads"), std::string("1"), std::string("--quiet"),
+                                     std::string("--out"), path(d + "/" + prefix)}) {
+            a.push_back(x);
+        }
+        a.insert(a.end(), extra.begin(), extra.end());
+        return a;
+    };
+    const auto run = [&](const std::vector<std::string>& a, std::string* message = nullptr) {
+        try {
+            return panvar::run_genotype_command(a);
+        } catch (const std::exception& error) {
+            if (message) *message = error.what();
+            return 2;
+        }
+    };
+    const auto file_sha = [&](const std::string& f) { return panvar::sha256_bytes(slurp(f)); };
+    const auto files = [](const std::string& dir) {
+        std::set<std::string> out;
+        for (const auto& e : fs::directory_iterator(dir)) out.insert(e.path().filename().string());
+        return out;
+    };
+    // (1) build without reads or a library: the index alone, no sample report, no genotype prefix, no temporary left
+    std::vector<std::string> build = locus_args;
+    build.push_back("--build-panel-index");
+    build.push_back(index);
+    require(run(build) == 0 && exists(index), "panel index: built without reads or a library");
+    require(files(path(d)) == std::set<std::string>{"locus.pvpl"}, "panel index: the build writes the index and nothing else");
+    require(!exists(path("genotype.mosaic_status.tsv")), "panel index: the default genotype prefix is never touched by a build");
+    const std::string index_sha = file_sha(index);
+    // (2) an existing destination is refused and left byte-identical
+    require(run(build) == 2 && file_sha(index) == index_sha, "panel index: an existing destination is refused, unchanged");
+    // (3) refused combinations, before any work
+    {
+        std::string message;
+        std::vector<std::string> both = build;
+        both.push_back("--panel-index");
+        both.push_back(index);
+        require(run(both, &message) == 2 && message.find("cannot be combined") != std::string::npos, "panel index: build + load refused");
+        for (const std::vector<std::string>& extra :
+             {std::vector<std::string>{"--reads1", path("prep_A_r1.fq")}, std::vector<std::string>{"--library", path("lib.txt")},
+              std::vector<std::string>{"--out", path(d + "/x")}, std::vector<std::string>{"--dosage-check"}}) {
+            std::vector<std::string> a = build;
+            a.insert(a.end(), extra.begin(), extra.end());
+            message.clear();
+            require(run(a, &message) == 2 && message.find("is a sample argument") != std::string::npos,
+                    "panel index: build with " + extra.front() + " refused");
+        }
+        require(file_sha(index) == index_sha && files(path(d)) == std::set<std::string>{"locus.pvpl"},
+                "panel index: the refusals touched nothing");
+    }
+    // (4)-(7) cold vs indexed: declared library, automatic library, --dosage-check, a second sample, two thread counts
+    const std::string lib = path("lib.txt");
+    const auto compare = [&](const std::string& cold, const std::string& indexed, const std::string& what) {
+        require_same_science(d + "/" + cold, d + "/" + indexed, what);
+        for (const char* suffix : {".sequence_locus.tsv", ".sequence_haplotypes.tsv", ".sequence_blocks.tsv", ".sequence_haplotypes.fa"}) {
+            const std::string a = path(d + "/" + cold + suffix), b = path(d + "/" + indexed + suffix);
+            require(exists(a) == exists(b), what + ": " + suffix + " present in one run only");
+            if (!exists(a)) continue;
+            std::string x = slurp(a), y = slurp(b);
+            for (auto [text, name] : {std::pair<std::string*, std::string>{&x, cold}, {&y, indexed}}) {   // record names
+                for (std::size_t at = text->find(name + "_seq"); at != std::string::npos; at = text->find(name + "_seq", at + 1)) {
+                    text->replace(at, name.size(), "<RUN>");
+                }
+            }
+            require(x == y, what + ": " + suffix + " identical");
+        }
+        const auto st = read_status(path(d + "/" + indexed + ".mosaic_status.tsv"));
+        require(st.at("prepared_locus_origin") == "loaded" && st.at("prepared_locus_panel_source") == "loaded" &&
+                    st.at("panel_index") == index && st.at("panel_index_panel_rebuild_reason") == "none",
+                what + ": the status records a fully loaded index (model and panel)");
+        require(read_status(path(d + "/" + cold + ".mosaic_status.tsv")).count("prepared_locus") == 0, what + ": the cold run prepared in memory");
+    };
+    const std::vector<std::string> use = {"--panel-index", index};
+    const auto both_runs = [&](char which, const std::string& tag, std::vector<std::string> extra) {
+        const int a = run(sample(which, "cold_" + tag, extra));
+        extra.insert(extra.end(), use.begin(), use.end());
+        const int b = run(sample(which, "idx_" + tag, extra));
+        require(a == b && (a == 0 || a == 1 || a == 3), tag + ": cold and indexed exits agree (" + std::to_string(a) + ", " + std::to_string(b) + ")");
+        compare("cold_" + tag, "idx_" + tag, "panel index " + tag);
+    };
+    both_runs('A', "A_declared", {"--library", lib});
+    both_runs('A', "A_auto", {});
+    both_runs('A', "A_check", {"--library", lib, "--dosage-check"});
+    {
+        auto x = read_status(path(d + "/cold_A_check.dosage_status.tsv")), y = read_status(path(d + "/idx_A_check.dosage_status.tsv"));
+        for (auto* m : {&x, &y}) for (auto it = m->begin(); it != m->end();) it = it->first.rfind("seconds_", 0) == 0 ? m->erase(it) : std::next(it);
+        require(!x.empty() && x == y, "panel index A_check: the dosage audit is identical (timing aside)");
+    }
+    both_runs('B', "B_declared", {"--library", lib});   // a second sample from the same index
+    {
+        std::vector<std::string> t2 = sample('A', "idx_A_t2", {"--library", lib, "--panel-index", index});
+        for (std::size_t k = 0; k + 1 < t2.size(); ++k) if (t2[k] == "--threads") t2[k + 1] = "2";
+        require(run(t2) == run(sample('A', "cold_A_t1", {"--library", lib})), "panel index: 2 threads, same exit");
+        // the science files (the status records the worker counts, which differ by declaration)
+        for (const char* suffix : {".genotypes.tsv", ".block_genotypes.tsv", ".mosaic_scores.tsv", ".equivalence_set.tsv",
+                                   ".sequence_haplotypes.tsv", ".sequence_blocks.tsv"}) {
+            const std::string a = path(d + "/cold_A_t1" + suffix), b = path(d + "/idx_A_t2" + suffix);
+            std::string x = exists(a) ? slurp(a) : "", y = exists(b) ? slurp(b) : "";
+            for (auto [text, name] : {std::pair<std::string*, std::string>{&x, "cold_A_t1"}, {&y, "idx_A_t2"}}) {
+                for (std::size_t at = text->find(name); at != std::string::npos; at = text->find(name, at + 1)) text->replace(at, name.size(), "<RUN>");
+            }
+            require(exists(a) == exists(b) && x == y, std::string("panel index: threads do not invalidate the index: ") + suffix + " identical");
+        }
+    }
+    require(file_sha(index) == index_sha, "panel index: the index is byte-unchanged after every use (no sample state written)");
+    // (8)-(9) refusals before the prefix is touched: incompatible inputs and settings; missing, truncated, corrupted files
+    const auto refused = [&](const std::string& tag, std::vector<std::string> a) {
+        const std::string prefix = path(d + "/" + tag);
+        for (const char* suffix : {".mosaic_status.tsv", ".sequence_locus.tsv", ".settings.tsv"}) std::ofstream(prefix + suffix) << "sentinel\n";
+        require(run(a) == 2, "panel index refused: " + tag + " exits 2");
+        for (const char* suffix : {".mosaic_status.tsv", ".sequence_locus.tsv", ".settings.tsv"}) {
+            require(slurp(prefix + suffix) == "sentinel\n", "panel index refused: " + tag + " left " + suffix + " untouched");
+        }
+        std::size_t owned = 0;
+        for (const std::string& f : files(path(d))) owned += f.rfind(tag + ".", 0) == 0;
+        require(owned == 3, "panel index refused: " + tag + " wrote nothing at its prefix");
+    };
+    std::ofstream(path(d + "/curation.txt")) << "sampleD#1#chr1:0-100\n";
+    refused("mm_curation", sample('A', "mm_curation", {"--library", lib, "--panel-index", index, "--panel-curation", path(d + "/curation.txt")}));
+    {
+        std::vector<std::string> a = sample('A', "mm_kmer", {"--library", lib, "--panel-index", index});
+        for (std::size_t k = 0; k + 1 < a.size(); ++k) if (a[k] == "--kmer-size") a[k + 1] = "19";
+        refused("mm_kmer", a);
+    }
+    refused("mm_min_variant", sample('A', "mm_min_variant", {"--library", lib, "--panel-index", index, "--min-variant-bp", "40"}));
+    {
+        std::vector<std::string> a = sample('A', "mm_reference", {"--library", lib, "--panel-index", index});
+        for (std::size_t k = 0; k + 1 < a.size(); ++k) if (a[k] == "--reference-path") a[k + 1] = "sampleB#1#chr1:0-100";
+        refused("mm_reference", a);
+    }
+    {
+        std::vector<std::string> a = sample('A', "mm_graph", {"--library", lib, "--panel-index", index});
+        for (std::size_t k = 0; k + 1 < a.size(); ++k) if (a[k] == "--graph") a[k + 1] = path("prep_other.gfa");
+        refused("mm_graph", a);
+    }
+    refused("missing", sample('A', "missing", {"--library", lib, "--panel-index", path(d + "/no_such.pvpl")}));
+    const std::string bytes = slurp(index);
+    std::ofstream(path(d + "/half_index.pvpl"), std::ios::binary) << bytes.substr(0, bytes.size() / 2);
+    refused("truncated", sample('A', "truncated", {"--library", lib, "--panel-index", path(d + "/half_index.pvpl")}));
+    std::string flipped = bytes;
+    flipped[flipped.size() - 17] = static_cast<char>(flipped[flipped.size() - 17] ^ 0x5a);
+    std::ofstream(path(d + "/flipped_index.pvpl"), std::ios::binary) << flipped;
+    refused("corrupted", sample('A', "corrupted", {"--library", lib, "--panel-index", path(d + "/flipped_index.pvpl")}));
+    require(file_sha(index) == index_sha, "panel index: still byte-unchanged after the refusals");
+    std::cout << "  panel-index CLI: built without reads, existing destination and sample arguments refused; cold == indexed "
+                 "(declared, auto, --dosage-check, second sample, threads); curation/k/min-variant/reference/graph mismatches "
+                 "and missing/truncated/corrupted indexes refused before the prefix is touched; the index never changes\n";
 }
 
 void test_indexed_union_backend() {
@@ -5909,6 +6076,7 @@ int main(int argc, char** argv) {
             test_prepared_locus();
             test_prepared_locus_cleanup();
             test_prepared_locus_index();
+            test_panel_index_cli();   // M15-E
             std::cout << "genotype command e2e (prepared_locus only): PASS\n";
             return 0;
         } catch (const std::exception& error) {
@@ -6008,6 +6176,7 @@ int main(int argc, char** argv) {
         test_prepared_locus();
         test_prepared_locus_cleanup();
         test_prepared_locus_index();
+        test_panel_index_cli();   // M15-E
         test_sequence_first_schema();
         test_sequence_first_lifecycle();
         test_sequence_first_v2();

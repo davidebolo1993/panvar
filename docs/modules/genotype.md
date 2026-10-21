@@ -57,6 +57,21 @@ It sets no time limit and no dosage stage. The usage guide lists every value. Se
 
 `panvar genotype --help-advanced` lists the scientific flags (marker k-mer and syncmer sizes, variant-site span, switch probability, proposal width, mismatch band, repair-neighbourhood bounds, tie branching, representation check), resource keys and their defaults.
 
+### Panel index (build once, genotype many)
+
+`--build-panel-index FILE` writes the locus's sample-independent preparation (structural model and marker panel) and
+stops. It needs no reads or library, writes no sample output and never overwrites an existing file.
+
+`--panel-index FILE` genotypes against it:
+- the index's integrity, versions and identity are verified, and the sample's graph, reference, curation, bubbles and
+  marker settings are checked against it, before the output prefix is touched;
+- a missing, corrupt or incompatible index is a named refusal (exit 2), never an in-memory fallback;
+- `--graph` is still read and hashed.
+
+The index saves locus preparation only: everything that reads the sample still runs. Rebuild it when the graph,
+reference, curation, bubbles, `--min-variant-bp`, `--kmer-size` or `--syncmer-s` change. Details:
+[the usage guide, §8a](../guides/genotype_short_read.md).
+
 ### Panel curation
 
 `--panel-curation` names paths to remove from the active panel, one per line. An allele carried only by removed paths is not callable, and no stage proposes, repairs or reports it. A sequence-identical allele on a retained path stays, with only retained provenance. The removed paths still define the graph's blocks. A panel that cannot spell the locus without them refuses the run (`MODEL_INCOMPLETE`).
