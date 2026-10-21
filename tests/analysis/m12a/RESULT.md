@@ -202,3 +202,14 @@ the reads can be built from panel material, and score them with the unchanged ob
 
 **Separate, lower-priority item:** the C4 anchor marker-rate deficit (0.79–1.02). It affects proposals and the dosage
 audit, not the score.
+
+## Closure (2026-10-21): K1 qualification
+
+**M12-A is closed.** The scored rates and exposure are consistent, and truth-content substitution reverses the preferences
+in K1, K4 and K5.
+
+**K1's frozen label (`INCONSISTENT_RATE_OR_CONVENTION`) stands as recorded, with one qualification:**
+- the C4 marker-rate discrepancy (anchor-based `marker_depth_rate_per_copy`, 0.938) does **not** establish an
+  inconsistency in the objective's fragment-start rate;
+- the objective uses the declared λ, which equals the simulated λ × the subsample fraction exactly;
+- the locus fragment count fits it (z = −0.70).

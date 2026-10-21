@@ -7497,6 +7497,25 @@ int count_attrib(const Args& args) {
     for (std::size_t b = 0; b < blocks; ++b) if (model.blocks()[b].block_id == block_id) tb = b;
     if (tb == blocks) throw std::runtime_error("no block " + block_id);
     const auto& alleles = model.blocks()[tb].alleles;
+    // M12-B: --features 1 writes the target block's pooled copy-count features exactly as the dosage audit computes them
+    // (panvar::dosage::pooled_features, default DosageSettings, graph only; no reads): copies per allele and the feature
+    // k-mers (2-bit canonical codes). Nothing else in this command changes.
+    if (args.get("features", "0") == "1") {
+        const panvar::dosage::BlockFeatureModel fm = panvar::dosage::pooled_features(model.blocks()[tb], panvar::dosage::DosageSettings{});
+        std::ostringstream ft, fk;
+        ft << "block_id\tfeature\tkmers\tcopies_by_allele\n";
+        fk << "block_id\tfeature\tkmer_codes\n";
+        for (std::size_t f = 0; f < fm.features.size(); ++f) {
+            std::string copies, codes;
+            for (std::uint16_t v : fm.features[f].copies) copies += (copies.empty() ? "" : ",") + std::to_string(v);
+            for (panvar::dosage::Kmer k : fm.features[f].kmers) codes += (codes.empty() ? "" : ",") + std::to_string(k);
+            ft << block_id << '\t' << f << '\t' << fm.features[f].kmers.size() << '\t' << copies << '\n';
+            fk << block_id << '\t' << f << '\t' << codes << '\n';
+        }
+        atomic_write(out + ".features.tsv", ft.str());
+        atomic_write(out + ".feature_kmers.tsv", fk.str());
+        std::cout << "count-attrib: " << fm.features.size() << " pooled features at " << block_id << '\n';
+    }
     std::vector<std::size_t> ctx[2];
     for (const auto& row : read_table(run + ".equivalence_set.tsv")) {
         if (row.at("rank") == "1" && row.at("representative") == "true") { ctx[0] = parse_alleles(row.at("hap1_alleles")); ctx[1] = parse_alleles(row.at("hap2_alleles")); }
