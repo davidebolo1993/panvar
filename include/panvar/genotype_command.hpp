@@ -201,7 +201,7 @@ struct GenotypeCommandOptions {
     // defaults dosage to audit when it was not, and refuses repair (resolve_dosage_contract).
     bool dosage_mode_explicit = false;
     // S1-D.1: where the dosage mode in effect came from, set by resolve_dosage_contract (and by the dosage flags):
-    // "default", "flag --dosage-mode", "flag --dosage-audit", "caller_options" or "contract_default_sequence_first_v2".
+    // "default", "flag --dosage-mode", "flag --dosage-audit", "flag --dosage-check" or "caller_options" (M15-D: no schema implies a mode).
     std::string dosage_mode_source = "default";
     // S2-A (EXPERIMENTAL, opt-in; profile key early_incumbent off|experimental_v1; sequence_first_v2 with the adaptive
     // repair only): before the mosaic proposal and the union pass, one deterministic panel diplotype -- the argmax of
@@ -574,9 +574,10 @@ int execute_genotype_command(const GenotypeCommandOptions& options, const Prepar
 
 // S1-D.1: the dosage contract of one command execution, shared by argument resolution and execute_genotype_command (so
 // the CLI, the direct command API and the prepared-locus command route agree). A mode is declared when
-// dosage_mode_explicit is set or dosage_mode differs from the default "off". Under sequence_first_v2: undeclared ->
-// audit (source contract_default_sequence_first_v2); declared off or audit -> kept; declared repair -> refused, with the
-// message returned (nothing is changed or written). Other schemas keep the declared or default mode. Idempotent.
+// dosage_mode_explicit is set or dosage_mode differs from the default "off". M15-D: no schema implies a mode, so an
+// undeclared mode stays off (not evaluated). Under sequence_first_v2 a declared repair is refused, with the message
+// returned (nothing is changed or written); off and audit are kept. Other schemas keep the declared or default mode.
+// Idempotent.
 std::optional<std::string> resolve_dosage_contract(GenotypeCommandOptions& options);
 
 } // namespace panvar

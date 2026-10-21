@@ -120,3 +120,35 @@ candidate count and diagnostics.
 - the remaining limitations.
 
 The batch stops for review. The next steps are a filter review, then the advanced help.
+
+## 5. Amendments (declared after the first run, before any rerun; the failed units stay recorded)
+
+**A1. `command_e2e` and the resolver.** `ctest.full` failed only in `panvar_genotype_command_e2e`. That test stops at its
+first failure, so the rest of it had not run.
+- **The stale expectation:** it still expected "v2 implies audit" from the direct API and the prepared route. It now
+  expects:
+  - v2 with untouched dosage fields: dosage off, source `default`, no audit artefact;
+  - a declared audit: runs (`caller_options`);
+  - the prepared route: identical to the direct API.
+- **A regression found by the corrected test, and fixed:** the M15-D resolver edit had dropped S1-D.1's provenance for an
+  API caller who declares off (`dosage_mode_explicit` with mode off). It read `default`; it now reads `caller_options`
+  again, under v2 as before.
+  - The CLI path is unaffected: its explicit modes carry flag sources. So the example units already passed stand.
+- The header comments are updated.
+- **Rerun as `a1.ctest`:** `command_e2e` plus the CLI-contract, sequence-report and library-estimate tests. The rest of the
+  full suite passed in `ctest.full`.
+
+**A2. Four example checks were wrong** (the checks were wrong, not the outputs):
+- `.sequence_haplotypes.fa` record names are derived from the output prefix (`<prefix>_seq_hapN`). The FASTA is now
+  compared with that part removed.
+- The library tables differ between runs in timing rows. They are now compared without them.
+- `library_invocation` (`explicit_auto` vs `omitted_means_auto`) is a deliberate provenance row. It is now asserted
+  rather than counted as a difference.
+- A time stop before the first checkpoint writes only the minimal status (documented), so it has no `.settings.tsv`. The
+  check now asserts that the status names the override profile and its 8 s limit, and records the sequence report's
+  `exit_code` beside the process exit.
+- **Rerun** as `a2.ex.*`: `auto_equivalence_c4`, `declared_c4`, `declared_cyp2d6`, the two `dosage_absent` units that
+  needed them, and `resource_stop`.
+
+**Budget:** 360 s of amendment development disclosed (`PRE` 660 s). The units run within the remaining budget; one that
+cannot be admitted is recorded NOT RUN.

@@ -53,6 +53,27 @@ def sha(p):
     return hashlib.sha256(open(p, "rb").read()).hexdigest() if os.path.exists(p) else None
 
 
+def fasta_key(p):
+    """A2: a FASTA's content with the record names' prefix-derived part removed (records are named <prefix>_seq_hapN)."""
+    if not os.path.exists(p):
+        return None
+    lines = []
+    for line in open(p):
+        if line.startswith(">"):
+            name, _, rest = line[1:].partition(" ")
+            line = ">" + name[name.find("_seq_"):] + " " + rest
+        lines.append(line)
+    return hashlib.sha256("".join(lines).encode()).hexdigest()
+
+
+def untimed(p):
+    """A2: a key/value or table file without its timing rows (keys starting seconds_ or containing _seconds)."""
+    if not os.path.exists(p):
+        return None
+    keep = [l for l in open(p) if not (l.split("\t", 1)[0].startswith("seconds") or "_seconds" in l.split("\t", 1)[0])]
+    return hashlib.sha256("".join(keep).encode()).hexdigest()
+
+
 def cmd(cell, out, library=None, extra=(), reference=True, reads=None):
     c = CELLS[cell]
     rd = reads or c["reads"]
@@ -196,14 +217,19 @@ def ex_auto_equivalence_c4(d):
     p = run(cmd("c4", out, library="auto"))
     check(prediction_key(out) == prediction_key(ref), "omitted vs --library auto: identical prediction")
     for suffix in (".library_estimate.tsv", ".library_sensitivity.tsv", ".library_sensitivity_blocks.tsv", ".sequence_haplotypes.tsv",
-                   ".sequence_blocks.tsv", ".block_genotypes.tsv", ".genotypes.tsv", ".equivalence_set.tsv", ".sequence_haplotypes.fa"):
-        check(sha(out + suffix) == sha(ref + suffix), f"omitted vs --library auto: {suffix} identical ({'present' if sha(ref + suffix) else 'absent in both' if not sha(out + suffix) else 'absent in one'})")
+                   ".sequence_blocks.tsv", ".block_genotypes.tsv", ".genotypes.tsv", ".equivalence_set.tsv"):
+        check(untimed(out + suffix) == untimed(ref + suffix), f"omitted vs --library auto: {suffix} identical apart from timing rows "
+              f"({'present' if sha(ref + suffix) else 'absent in both' if not sha(out + suffix) else 'absent in one'})")
+    check(fasta_key(out + ".sequence_haplotypes.fa") == fasta_key(ref + ".sequence_haplotypes.fa"),
+          "omitted vs --library auto: .sequence_haplotypes.fa identical apart from the prefix-derived record names")
     a, b = settings(out), settings(ref)
     check({k: v[0] for k, v in a.items()} == {k: v[0] for k, v in b.items()}, "omitted vs --library auto: every effective setting equal")
     x, y = KV(out + ".mosaic_status.tsv"), KV(ref + ".mosaic_status.tsv")
     lib = {k for k in set(x) | set(y) if "library" in k and x.get(k) != y.get(k)}
     print("library status rows that differ:", {k: (x.get(k), y.get(k)) for k in sorted(lib)})
-    check(all("seconds" in k for k in lib), "omitted vs --library auto: library status rows equal (timing aside)")
+    check(all("seconds" in k for k in lib - {"library_invocation"}) and x.get("library_invocation") == "explicit_auto"
+          and y.get("library_invocation") == "omitted_means_auto",
+          "omitted vs --library auto: library status rows equal apart from timing and the invocation provenance row")
     print(f"exit {p.returncode}")
     return 0
 
@@ -215,8 +241,10 @@ def declared(cell, d):
     check(p.returncode == 0, f"{cell}: exit 0")
     a = CELLS[cell]["archived"]
     check(prediction_key(out) == prediction_key(a), f"{cell}: prediction identical to the archived M11-D accelerated run")
-    for suffix in (".sequence_haplotypes.tsv", ".equivalence_set.tsv", ".sequence_haplotypes.fa"):
+    for suffix in (".sequence_haplotypes.tsv", ".equivalence_set.tsv"):
         check(sha(out + suffix) == sha(a + suffix), f"{cell}: {suffix} identical to the archived run")
+    check(fasta_key(out + ".sequence_haplotypes.fa") == fasta_key(a + ".sequence_haplotypes.fa"),
+          f"{cell}: .sequence_haplotypes.fa identical to the archived run apart from the prefix-derived record names")
     new, old = settings(out), settings(a)
     diff = sorted(k for k in set(new) | set(old) if new.get(k, (None,))[0] != old.get(k, (None,))[0])
     check(set(diff) <= DECLARED_DIFF, f"{cell}: settings differ from the archived run only in {sorted(DECLARED_DIFF)} (got {diff})")
@@ -253,7 +281,8 @@ def ex_declared_acot(d):
 
 def dosage_absent(cell, d):
     """The same declared-library run without --dosage-check: the prediction is unchanged; dosage diagnostics and status differ."""
-    ref = os.path.join(os.path.dirname(d), f"ex.declared_{cell}", cell)
+    pre = os.path.basename(d).split("ex.")[0]   # amendment units ("a2.ex.*") read their own declared run
+    ref = os.path.join(os.path.dirname(d), f"{pre}ex.declared_{cell}", cell)
     out = f"{d}/{cell}"
     p = run(cmd(cell, out, library="declared"))
     check(p.returncode == 0, f"{cell}: exit 0")
@@ -379,8 +408,13 @@ def ex_resource_stop(d):
     check((p.returncode == 3 and sl.get("prediction") == "PROVISIONAL") or (p.returncode == 124 and sl.get("prediction") != "PREDICTION"),
           "binding time limit: never reported as a completed prediction")
     s = settings(out)
-    check(s.get("time_limit_seconds", ("", ""))[1].startswith("profile") and s.get("union_scoring_backend", ("", ""))[1].startswith("preset"),
-          "binding time limit: the override is recorded from the profile, everything else from the preset")
+    if os.path.exists(out + ".settings.tsv"):
+        check(s.get("time_limit_seconds", ("", ""))[1].startswith("profile") and s.get("union_scoring_backend", ("", ""))[1].startswith("preset"),
+              "binding time limit: the override is recorded from the profile, everything else from the preset")
+    else:   # A2: a stop before any checkpoint writes the minimal status only (documented); it names the profile and the limit
+        check(st.get("profile") == prof and st.get("time_limit_seconds") == "8" and st.get("status") == "TIME_LIMIT",
+              "binding time limit: the minimal status names the override profile and its 8 s limit")
+    print(f"recorded: sequence_locus exit_code {sl.get('exit_code')} vs process exit {p.returncode}")
     return 0
 
 

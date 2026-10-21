@@ -4410,6 +4410,17 @@ void test_sequence_first_v2_contract() {
         require(row.at("dosage_mode") == "audit" && row.at("dosage_audit_status") == "COMPLETE",
                 what + ": the locus table records the audit actually run");
     };
+    // M15-D: sequence_first_v2 no longer implies the audit; untouched dosage fields mean no dosage stage
+    const auto audit_not_run = [&](const std::string& rel, const std::string& what) {
+        const auto locus = sf::kv(path(rel + "/call.sequence_locus.tsv"));
+        require(locus.at("dosage_mode") == "off" && locus.at("dosage_mode_source") == "default",
+                what + ": recorded dosage_mode off, source default (got " + locus.at("dosage_mode") + ", " +
+                    locus.at("dosage_mode_source") + ")");
+        require(!exists(path(rel + "/call.dosage_status.tsv")) && !exists(path(rel + "/call.dosage_blocks.tsv")),
+                what + ": no audit artefact");
+        require(s1d1::locus_row(path(rel + "/call.locus_genotype.tsv")).at("dosage_mode") == "off",
+                what + ": the locus table records dosage off");
+    };
     const auto v2_inventory = [&](const std::string& rel, const std::string& what) {
         const auto locus = sf::kv(path(rel + "/call.sequence_locus.tsv"));
         const bool off_panel = locus.at("fasta_emitted") == "yes";
@@ -4432,7 +4443,15 @@ void test_sequence_first_v2_contract() {
     const panvar::GenotypeCommandOptions api = fresh("sf21_api", "sequence_first_v2");
     require(api.dosage_mode == "off" && !api.dosage_mode_explicit, "the reproducer's options: dosage fields as constructed");
     require(panvar::execute_genotype_command(api, nullptr) == 0, "v2 API default: predicts");
-    audit_ran("sf21_api", "contract_default_sequence_first_v2", "v2 API default");
+    audit_not_run("sf21_api", "v2 API default");
+    // the audit when requested: declared audit by value
+    {
+        panvar::GenotypeCommandOptions audit = fresh("sf21_audit", "sequence_first_v2");
+        audit.dosage_mode = "audit";
+        require(panvar::execute_genotype_command(audit, nullptr) == 0, "v2 API audit: predicts");
+        audit_ran("sf21_audit", "caller_options", "v2 API declared audit");
+        v2_inventory("sf21_audit", "v2 API audit");
+    }
     v2_inventory("sf21_api", "v2 API default");
     // (2) declared off
     {
@@ -4468,10 +4487,10 @@ void test_sequence_first_v2_contract() {
         const panvar::GenotypeCommandOptions route = fresh("sf21_prepared", "sequence_first_v2");
         const std::shared_ptr<const panvar::PreparedLocus> prepared = panvar::prepare_genotype_locus(route);
         require(panvar::execute_genotype_command(route, prepared.get()) == 0, "v2 prepared default: predicts");
-        audit_ran("sf21_prepared", "contract_default_sequence_first_v2", "v2 prepared default");
+        audit_not_run("sf21_prepared", "v2 prepared default");
         v2_inventory("sf21_prepared", "v2 prepared default");
         for (const char* f : {"call.sequence_haplotypes.tsv", "call.sequence_locus.tsv", "call.sequence_blocks.tsv",
-                              "call.dosage_blocks.tsv", "call.locus_genotype.tsv"}) {
+                              "call.locus_genotype.tsv"}) {
             require(sf::normalised(path("sf21_api/") + f, path("sf21_api")) == sf::normalised(path("sf21_prepared/") + f, path("sf21_prepared")),
                     std::string("v2 prepared default: ") + f + " identical to the direct API route");
         }

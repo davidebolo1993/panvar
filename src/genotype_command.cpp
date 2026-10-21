@@ -8626,6 +8626,9 @@ std::optional<std::string> resolve_dosage_contract(GenotypeCommandOptions& optio
                "(--dosage-check, or off) and never changes the prediction; reproduce historical repair results with the legacy "
                "contract (--output-schema legacy --dosage-mode repair)";
     }
+    if (options.dosage_mode_explicit && options.dosage_mode_source == "default") {
+        options.dosage_mode_source = "caller_options";   // S1-D.1: declared off through dosage_mode_explicit
+    }
     return std::nullopt;
 }
 
