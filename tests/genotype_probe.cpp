@@ -16,6 +16,7 @@
 #include "panvar/genotype_command.hpp"
 #include "panvar/copying_transitions.hpp"
 #include "count_fit.hpp"
+#include "vt_marginal.hpp"
 #include "panvar/genotype_dosage.hpp"
 #include "panvar/genotype_dosage_integrate.hpp"
 #include "panvar/genotype_dosage_repair.hpp"
@@ -7273,6 +7274,126 @@ int prior_geometry(const Args& args) {
     return tiles && agrees ? 0 : 3;
 }
 
+// vt-score (M13-A, DIAGNOSTIC; truth-free): the variation-tolerant truncated marginal of tests/vt_marginal.hpp for frozen
+// candidates in a run's fixed context. --candidates FILE: label \t hap1 alleles \t hap2 alleles [\t expected ordinary total].
+// Reports, per candidate, the ordinary fixed-content score (fragment + exposure + the run's copying prior; an expected total
+// must reproduce), the fixed-content score under the C1 prior (m_panel) and the truncated marginal (m_res) with its
+// decomposition, site/group counts and the joint-MAP interaction error. --dry 1: admission and grouping only.
+int vt_score(const Args& args) {
+    using clock = std::chrono::steady_clock;
+    const auto t0 = clock::now();
+    const std::string out = args.required("out");
+    const std::string reference = args.required("reference");
+    const std::string run = args.required("run");
+    const std::string block_id = args.required("block");
+    const std::string curation = args.get("panel-curation", "");
+    const LoadedModel loaded = load_model(args.required("model-gfa"), reference, out + ".model.sorted.gfa", 50,
+                                          curation.empty() ? std::vector<std::string>{} : read_panel_curation(curation));
+    std::filesystem::remove(out + ".model.sorted.gfa");
+    const panvar::PreparedGenotypeModel& model = *loaded.model;
+    const auto status = read_key_values(run + ".mosaic_status.tsv");
+    if (status.at("model_fingerprint") != loaded.fingerprint) throw std::runtime_error("the run was not scored on the rebuilt model");
+    const std::size_t blocks = model.blocks().size();
+    std::size_t tb = blocks;
+    for (std::size_t b = 0; b < blocks; ++b) if (model.blocks()[b].block_id == block_id) tb = b;
+    if (tb == blocks) throw std::runtime_error("no block " + block_id);
+    // C1 components: panel block alleles weighted by active-panel template counts (uniform template weights)
+    const auto& alleles = model.blocks()[tb].alleles;
+    std::vector<double> count(alleles.size(), 0.0);
+    for (std::size_t row = 0; row < model.panel().template_count(); ++row) count[model.panel().template_alleles[row][tb]] += 1.0;
+    const double templates = static_cast<double>(model.panel().template_count());
+    struct Declared { std::string label; std::vector<std::size_t> h[2]; bool has_expected = false; double expected = 0; };
+    std::vector<Declared> declared;
+    {
+        std::ifstream in(args.required("candidates"));
+        for (std::string line; std::getline(in, line);) {
+            if (line.empty() || line[0] == '#') continue;
+            std::vector<std::string> f;
+            std::stringstream ss(line);
+            for (std::string x; std::getline(ss, x, '\t');) f.push_back(x);
+            Declared d;
+            d.label = f.at(0);
+            d.h[0] = parse_alleles(f.at(1));
+            d.h[1] = parse_alleles(f.at(2));
+            if (f.size() > 3 && f[3] != "NA" && !f[3].empty()) { d.has_expected = true; d.expected = std::stod(f[3]); }
+            declared.push_back(d);
+        }
+    }
+    std::vector<vt::Candidate> cands;
+    std::vector<std::array<std::string, 2>> spelled;
+    for (const Declared& d : declared) {
+        vt::Candidate c;
+        c.label = d.label;
+        for (int h = 0; h < 2; ++h) {
+            const panvar::HaplotypeSequence sp = panvar::spell_mosaic(model, panvar::MosaicPath{d.h[h]});
+            c.hap[h] = sp.bases;
+            c.block[h] = sp.block_intervals[tb];
+            const std::size_t len = c.block[h].size();
+            for (std::size_t a = 0; a < alleles.size(); ++a) {
+                if (count[a] > 0 && alleles[a].sequence.size() == len) c.comps[h].push_back(vt::Component{alleles[a].sequence, std::log(count[a] / templates)});
+            }
+        }
+        cands.push_back(c);
+    }
+    const panvar::LibraryModel library = read_library_file(args.required("library"));
+    const std::vector<panvar::ReadPair> fragments = read_pairs(args.required("reads1"), args.required("reads2"));
+    panvar::FragmentScoringOptions scoring;
+    scoring.threads = std::stoul(args.get("threads", "4"));
+    scoring.mismatch_band = std::stoul(status.at("mismatch_band"));
+    scoring.minimum_piece_bp = 12;
+    scoring.max_piece_hits = std::stoull(status.at("max_piece_hits"));
+    scoring.max_proposed_starts_per_haplotype = std::stoull(status.at("max_proposed_starts_per_haplotype"));
+    scoring.max_physical_origins = std::stoull(status.at("max_physical_origins"));
+    scoring.max_state_classes = std::stoull(status.at("max_state_classes"));
+    scoring.max_mass_cells = std::stoull(status.at("max_mass_cells"));
+    scoring.emission_cache_bytes = static_cast<std::size_t>(std::stoull(status.at("emission_cache_bytes")));
+    // the ordinary fixed-content score: the run's copying prior (constant_v1 at the run's switch probability)
+    panvar::CopyingTransitionSpec spec;
+    spec.mode = "constant_v1";
+    spec.constant_r = std::stod(args.get("switch-probability", "0.01"));
+    const panvar::CopyingTransitions transitions = panvar::build_copying_transitions(blocks, nullptr, spec);
+    vt::Settings settings;
+    settings.dry = args.get("dry", "0") == "1";
+    settings.max_variant_haplotypes = std::stoul(args.get("max-variant-haplotypes", std::to_string(settings.max_variant_haplotypes)));
+    const auto t_scan = clock::now();
+    const vt::BaseScan scan = vt::base_scan(cands, fragments, library, scoring);
+    const double seconds_scan = std::chrono::duration<double>(clock::now() - t_scan).count();
+    const auto t_eval = clock::now();
+    const std::vector<vt::Result> res = vt::evaluate(cands, fragments, library, scoring, settings, scan);
+    const double seconds_eval = std::chrono::duration<double>(clock::now() - t_eval).count();
+    std::ostringstream o, st;
+    o << std::setprecision(17)
+      << "label\tstatus\thap1_alleles\thap2_alleles\tblock1_bp\tblock2_bp\tcomponents1\tcomponents2\tordinary_total\tcopying_prior\texpected_total\treproduced\t"
+         "base_fragment\tbase_exposure\tbase_loglik\tlog_prior_panel\tlog_m_panel\tlog_m_res\teq_fit_gain\tkl\texpected_alt\tsites\tgroups\tmax_group\t"
+         "variant_haplotypes\tmap_alt\tinteraction_error\n";
+    std::size_t refused = 0;
+    for (std::size_t i = 0; i < res.size(); ++i) {
+        const vt::Result& r = res[i];
+        const double prior = panvar::log_unordered_sequence_pair_prior(model, cands[i].hap[0], cands[i].hap[1], transitions.r);
+        const double ordinary = settings.dry ? std::nan("") : r.base_loglik + prior;
+        const bool rep = !declared[i].has_expected || settings.dry || std::fabs(ordinary - declared[i].expected) <= 1e-6;
+        refused += rep ? 0 : 1;
+        const auto join = [](const std::vector<std::size_t>& v) { std::string t; for (auto x : v) t += (t.empty() ? "" : ",") + std::to_string(x); return t; };
+        o << r.label << '\t' << r.status << '\t' << join(declared[i].h[0]) << '\t' << join(declared[i].h[1]) << '\t' << cands[i].block[0].size() << '\t'
+          << cands[i].block[1].size() << '\t' << cands[i].comps[0].size() << '\t' << cands[i].comps[1].size() << '\t' << ordinary << '\t' << prior << '\t'
+          << (declared[i].has_expected ? std::to_string(declared[i].expected) : std::string("NA")) << '\t' << (rep ? "true" : "false") << '\t'
+          << r.base_fragment << '\t' << r.base_exposure << '\t' << r.base_loglik << '\t' << r.log_prior_panel << '\t' << r.log_m_panel << '\t' << r.log_m_res
+          << '\t' << r.eq_fit_gain << '\t' << r.kl << '\t' << r.expected_alt << '\t' << r.sites << '\t' << r.groups << '\t' << r.max_group << '\t'
+          << r.variant_haplotypes << '\t' << r.map_alt << '\t' << r.interaction_error << '\n';
+        for (const vt::Site& t : r.site_list)
+            st << r.label << '\t' << t.hom << '\t' << t.pos << '\t' << (t.pos - cands[i].block[t.hom].begin) << '\t' << t.ref << '\t' << t.alt << '\t' << t.support << '\n';
+    }
+    atomic_write(out + ".vt.tsv", o.str());
+    atomic_write(out + ".sites.tsv", "label\thomologue\tpos\tblock_offset\tref\talt\tsupport\n" + st.str());
+    std::cout << o.str() << "vt-score: fragments " << fragments.size() << ", base scan " << seconds_scan << " s, evaluation " << seconds_eval
+              << " s, total " << std::chrono::duration<double>(clock::now() - t0).count() << " s, peak footprint " << physical_footprint().peak << '\n';
+    if (refused) {
+        std::cout << "vt-score: REFUSED, " << refused << " declared ordinary totals did not reproduce\n";
+        return 4;
+    }
+    return 0;
+}
+
 // count-fit (M6-A, DIAGNOSTIC; truth-free): the depth-normalised 31-mer count-fit comparator of tests/count_fit.hpp over
 // every ordered pair of the target block's active alleles, substituted into the run's reported winner (rank-1
 // representative) as a fixed two-homologue context. Dictionary = canonical 31-mers of every active template's complete
@@ -9306,6 +9427,7 @@ int main(int argc, char** argv) {
         if (command == "tied-consensus") return tied_consensus(args);
         if (command == "repair-pilot") return repair_pilot(args);
         if (command == "score-set") return score_set(args);
+        if (command == "vt-score") return vt_score(args);
         if (command == "block-sequences") return block_sequences(args);
         if (command == "junction-proposals") return junction_proposals_probe(args);
         if (command == "prior-pool") return prior_pool(args);
