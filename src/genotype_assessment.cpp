@@ -1,4 +1,5 @@
 #include "panvar/genotype_assessment.hpp"
+#include "panvar/genotype_output_layout.hpp"
 
 #include "panvar/genotype_repair.hpp"   // atomic_write
 
@@ -111,7 +112,7 @@ std::set<std::string> id_set(const Row& st, const std::string& key) {
 }
 
 Facts read_facts(const std::string& prefix) {
-    const Row st = read_kv(prefix + ".mosaic_status.tsv"), sl = read_kv(prefix + ".sequence_locus.tsv");
+    const Row st = read_kv(prefix + ".mosaic_status.tsv"), sl = read_kv(genotype_output_path(prefix, ".sequence_locus.tsv"));
     Facts f;
     const std::string run_status = get(st, "status", "NA");
     f.call_class = or_(get(st, "call_class"), run_status == "COMPLETE" ? "strict_call"
@@ -134,7 +135,7 @@ Facts read_facts(const std::string& prefix) {
     f.completion = get(sl, "completion", "NA");
     f.sequence_status = get(sl, "sequence_status", "NA");
     f.phase_support = get(st, "phase_support", get(sl, "legacy_phase_support", "NA"));
-    f.v2_blocks = read_rows(prefix + ".sequence_blocks.tsv");
+    f.v2_blocks = read_rows(genotype_output_path(prefix, ".sequence_blocks.tsv"));
     for (const Row& r : read_rows(prefix + ".block_genotypes.tsv")) f.legacy.emplace(get(r, "block_id"), r);
     for (const Row& r : read_rows(prefix + ".dosage_blocks.tsv")) f.dosage.emplace(get(r, "block_id"), r);
     return f;
@@ -451,7 +452,7 @@ std::string render(const View& view) {
 void write_view(const std::string& prefix, const View& view) {
     // the locus rows: earlier assessment rows dropped, the current ones appended (idempotent)
     {
-        const std::string path = prefix + ".sequence_locus.tsv";
+        const std::string path = genotype_output_path(prefix, ".sequence_locus.tsv");
         std::ifstream in(path);
         if (in) {
             std::string text;
@@ -467,7 +468,7 @@ void write_view(const std::string& prefix, const View& view) {
     }
     std::map<std::string, std::vector<std::string>> by_id;
     for (const auto& [id, cols] : view.blocks) by_id[id] = cols;
-    rewrite_columns(prefix + ".sequence_blocks.tsv", block_columns(), by_id, "block_id");
+    rewrite_columns(genotype_output_path(prefix, ".sequence_blocks.tsv"), block_columns(), by_id, "block_id");
     rewrite_columns(prefix + ".block_genotypes.tsv", block_columns(), by_id, "block_id");
     rewrite_columns(prefix + ".genotypes.tsv", block_columns(), by_id, "block_id");
     // the locus mirror: one header and one row

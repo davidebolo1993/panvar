@@ -92,6 +92,14 @@ Each locus value carries coverage counts. A missing check is never a failure, an
 
 ## Breaking and default behaviour changes
 
+**Output paths (M15-L, breaking).**
+- **Beside `--out P`:** only `P.sequence_locus.tsv`, `P.sequence_blocks.tsv`, `P.sequence_haplotypes.tsv`, and
+  `P.sequence_haplotypes.fa` when written.
+- **Moved:** every other report moves to `P.diagnostics/` under its usual name. That includes the status, settings, the
+  locus and block tables, candidates and scores, the library and dosage files, and the repair logs.
+- **Unchanged:** contents, apart from the locus table's link to the primary FASTA (`../<name>.sequence_haplotypes.fa`).
+- **Scripts** that read a diagnostic at `P.<suffix>` must read `P.diagnostics/<name>.<suffix>`.
+
 Relative to the previously published `genotype-mosaic` (`cee58de`). Relative to `main` (`1d87162` plus the panphorte fix),
 the whole mosaic-caller line below is new:
 

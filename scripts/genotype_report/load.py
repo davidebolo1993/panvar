@@ -51,8 +51,17 @@ def _settings_digest(prefix, status):
     return "profile:" + status.get("profile_sha256", "NA")[:16] + "|preset:" + status.get("preset", "none")
 
 
+def primary_prefix(prefix):
+    """M15-L: a run's diagnostics live in <P>.diagnostics/<name>.*; the run is identified by its primary prefix P. A flat
+    prefix (runs before M15-L, or the internal API) is its own primary prefix."""
+    d, name = os.path.split(prefix)
+    if os.path.basename(d) == name + ".diagnostics":
+        return os.path.join(os.path.dirname(d), name)
+    return prefix
+
+
 def _read_prefix(root, prefix, sources):
-    run_id = os.path.relpath(prefix, root).replace(os.sep, "/")
+    run_id = os.path.relpath(primary_prefix(prefix), root).replace(os.sep, "/")
     L = read_tsv(prefix + ".locus_genotype.tsv", "locus table")
     if len(L) != 1:
         raise Refusal(f"{prefix}.locus_genotype.tsv: expected one row, found {len(L)}")
@@ -119,7 +128,8 @@ def _read_prefix(root, prefix, sources):
 
 def load_directory(root):
     """Every <prefix>.locus_genotype.tsv under root (recursively; <prefix>.original.* dosage-repair originals are not
-    runs). run_id is the prefix path relative to root."""
+    runs). run_id is the run's primary prefix path relative to root (M15-L: the locus table is in <P>.diagnostics/, and the
+    run is P)."""
     root = os.path.abspath(root)
     prefixes = []
     for d, _, files in os.walk(root):

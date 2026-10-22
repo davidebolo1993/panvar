@@ -1,4 +1,5 @@
 #include "panvar/genotype_command.hpp"
+#include "panvar/genotype_output_layout.hpp"
 #include "panvar/genotype_assessment.hpp"
 #include "panvar/genotype_sequence_report.hpp"
 #include "panvar/prepared_locus.hpp"
@@ -589,7 +590,7 @@ void stop_run(const std::string& state, const std::string& note, int code) {
     if (g_watch->finished) return;
     g_watch->finished = true;
     std::error_code ignored;
-    for (const char* suffix : kFinalOutputs) std::filesystem::remove(g_watch->out_prefix + suffix, ignored);
+    for (const char* suffix : kFinalOutputs) std::filesystem::remove(genotype_output_path(g_watch->out_prefix, suffix), ignored);
     if (g_watch->early_incumbent && g_watch->checkpoint_committed && !g_watch->checkpoint_failed) {
         // S2-A: the last committed checkpoint is kept as the PROVISIONAL prediction. Only its pre-rendered locus
         // record is rewritten with the stop -- no scoring and no reconstruction here (this may be a memory stop).
@@ -601,13 +602,13 @@ void stop_run(const std::string& state, const std::string& note, int code) {
         text = with_key_value(text, "checkpoint_search_status", "budget_stop:" + state);
         code = 3;
         text = with_key_value(text, "exit_code", "3");   // M15-D.1: the record states the process exit
-        atomic_write(g_watch->out_prefix + ".sequence_locus.tsv", text);
+        atomic_write(genotype_output_path(g_watch->out_prefix, ".sequence_locus.tsv"), text);
     } else if (!(g_watch->early_incumbent && g_watch->checkpoint_failed)) {
         // S1-C: the sequence-first reports are run-owned too; a stopped run never sits beside an earlier prediction
-        for (const std::string& suffix : sequence_report_outputs()) std::filesystem::remove(g_watch->out_prefix + suffix, ignored);
+        for (const std::string& suffix : sequence_report_outputs()) std::filesystem::remove(genotype_output_path(g_watch->out_prefix, suffix), ignored);
         if (g_watch->early_incumbent || g_watch->sequence_v2) {   // S2-A: the budget expired before any candidate was fully evaluated
             // M15-D.1: exit_code is the process exit (124 time, 125 footprint), never a no-call's 1
-            atomic_write(g_watch->out_prefix + ".sequence_locus.tsv",
+            atomic_write(genotype_output_path(g_watch->out_prefix, ".sequence_locus.tsv"),
                          "key\tvalue\nschema_version\tsequence_first_v2\nprediction\tNO_PREDICTION\nsequence_status\tNA\n"
                          "completion\tbudget_stop_before_first_evaluated_candidate\ncompletion_note\t" + state + ": " + note +
                          "\nlegacy_run_status\t" + state + "\ncheckpoint_stage\tnone\nexit_code\t" + std::to_string(code) + "\n");
@@ -2819,18 +2820,36 @@ std::vector<BlockGenotypeConfidence> block_genotype_confidence(
 namespace {
 
 void remove_run_outputs(const std::string& out_prefix) {
-    for (const char* suffix : kFinalOutputs) std::remove((out_prefix + suffix).c_str());
-    for (const std::string& suffix : sequence_report_outputs()) std::remove((out_prefix + suffix).c_str());   // S1-C
-    for (const std::string& suffix : dosage::dosage_stage_outputs()) std::remove((out_prefix + suffix).c_str());
-    for (const char* suffix : kPartialOutputs) std::remove((out_prefix + suffix).c_str());
+    // M15-L: under the command's layout the run works in <P>.diagnostics/; the directory is created here, the first time the
+    // run touches its prefix (every preflight refusal has already happened), one level only, so a prefix whose directory does
+    // not exist still fails as before. Each run-owned report is removed at its path in the layout, and -- the same names only
+    // -- at the old flat location <P><suffix>, so an earlier run's flat reports never sit beside this run's.
+    const bool layout = genotype_layout_active(out_prefix);
+    if (layout) {
+        const std::filesystem::path dir = std::filesystem::path(out_prefix).parent_path();
+        std::error_code ec;
+        if (!std::filesystem::is_directory(dir, ec) && !std::filesystem::create_directory(dir, ec)) {
+            throw std::runtime_error("cannot create the diagnostics directory " + dir.string() +
+                                     (ec ? " (" + ec.message() + ")" : std::string()));
+        }
+    }
+    const std::string primary = genotype_primary_prefix(out_prefix);
+    const auto drop = [&](const std::string& suffix) {
+        std::remove(genotype_output_path(out_prefix, suffix).c_str());
+        if (layout && !genotype_primary_suffix(suffix)) std::remove((primary + suffix).c_str());   // an earlier flat run's
+    };
+    for (const char* suffix : kFinalOutputs) drop(suffix);
+    for (const std::string& suffix : sequence_report_outputs()) drop(suffix);   // S1-C
+    for (const std::string& suffix : dosage::dosage_stage_outputs()) drop(suffix);
+    for (const char* suffix : kPartialOutputs) drop(suffix);
     // S2-H: the refinement diagnostics are run-owned too (removed at the start only: they must survive a stop)
-    std::remove((out_prefix + ".block_diagnostics.tsv").c_str());   // M11-C: run-owned diagnostic, removed at the start
+    drop(".block_diagnostics.tsv");   // M11-C: run-owned diagnostic, removed at the start
     for (const char* suffix : {".refinement_memory_live.tsv", ".refinement_seed_report.tsv", ".refinement_replay_inputs.tsv",
                                ".refinement_replay.tsv",
                                ".refinement_replay_rounds.tsv", ".refinement_replay_scored.tsv"}) {
-        std::remove((out_prefix + suffix).c_str());
+        drop(suffix);
     }
-    std::remove((out_prefix + ".mosaic_status.tsv").c_str());
+    drop(".mosaic_status.tsv");
 }
 
 // The proposal a standalone run with target k returns. Neither the beam's pruning nor its ordering reads
@@ -3380,9 +3399,9 @@ GenotypeRunStatus run_genotype_body(const GenotypeCommandOptions& options, Genot
                         if ((g_watch->early_incumbent || g_watch->sequence_v2) && !g_watch->checkpoint_failed) {
                             // S2-A: a failure is never a fallback -- no committed checkpoint is left as a prediction
                             for (const std::string& suffix : sequence_report_outputs()) {
-                                std::remove((g_watch->out_prefix + suffix).c_str());
+                                std::remove(genotype_output_path(g_watch->out_prefix, suffix).c_str());
                             }
-                            atomic_write(g_watch->out_prefix + ".sequence_locus.tsv",
+                            atomic_write(genotype_output_path(g_watch->out_prefix, ".sequence_locus.tsv"),
                                          "key\tvalue\nschema_version\tsequence_first_v2\nprediction\tNO_PREDICTION\n"
                                          "sequence_status\tNA\ncompletion\trun_failed\ncompletion_note\tan exception ended the "
                                          "run before a final status\nlegacy_run_status\tFAILED\ncheckpoint_stage\tnone\n"
@@ -3704,7 +3723,7 @@ GenotypeRunStatus run_genotype_body(const GenotypeCommandOptions& options, Genot
             }
             return false;
         }
-        std::ifstream committed(options.out_prefix + ".sequence_locus.tsv");
+        std::ifstream committed(genotype_output_path(options.out_prefix, ".sequence_locus.tsv"));
         std::stringstream text;
         text << committed.rdbuf();
         if (g_watch != nullptr) {
@@ -8741,6 +8760,9 @@ std::optional<int> parse_genotype_arguments(const std::vector<std::string>& args
                 "Sequences: .sequence_haplotypes.tsv always gives each haplotype's SHA-256 and origin; when both haplotypes\n"
                 "are on the panel, no FASTA is needed (extraction references point into the graph); when either is\n"
                 "off-panel, .sequence_haplotypes.fa holds both.\n\n"
+                "Files: only the primary reports are written beside the prefix (.sequence_locus.tsv, .sequence_blocks.tsv,\n"
+                ".sequence_haplotypes.tsv and the conditional .sequence_haplotypes.fa); every other report (status,\n"
+                "settings, locus and block tables, candidates, scores, library and dosage files) is in <prefix>.diagnostics/.\n\n"
                 "Primary assessment (assessment_v1), in .sequence_locus.tsv and .sequence_blocks.tsv (mirrored in the locus\n"
                 "and block tables). Every check concerns the published prediction:\n"
                 "  sequence_resolution  RESOLVED, GENOTYPE_RESOLVED_SEQUENCE_SET, SEQUENCE_TIED (sequence ambiguity)\n"
@@ -8893,6 +8915,7 @@ std::optional<int> parse_genotype_arguments(const std::vector<std::string>& args
         }
     }
     validate_genotype_settings(options);   // every source applied: cross-field rules, before any work
+    options.diagnostics_directory = true;   // M15-L: the command's output layout (primary reports beside the prefix)
     return std::nullopt;
 }
 
@@ -8999,6 +9022,14 @@ int execute_genotype_command(const GenotypeCommandOptions& requested, const Prep
     // S1-D.1: the dosage contract is resolved here as at argument resolution, so a direct API caller and the
     // prepared-locus route get the CLI's defaults; a refused repair returns before the run touches its prefix.
     GenotypeCommandOptions options = requested;
+    // M15-L: the command's layout. The run works under <P>.diagnostics/<name>; only the primary sequence reports are written
+    // beside P (genotype_output_layout.hpp). Registered for this run and forgotten when it ends, whatever the exit path.
+    std::optional<GenotypeOutputLayoutScope> layout;
+    if (options.diagnostics_directory && !options.out_prefix.empty()) {
+        const std::string primary = options.out_prefix;
+        options.out_prefix = genotype_diagnostics_prefix(primary);
+        layout.emplace(options.out_prefix, primary);
+    }
     if (const std::optional<std::string> refused = resolve_dosage_contract(options)) {
         std::cerr << "[genotype] " << *refused << '\n';
         return 2;
@@ -9194,7 +9225,7 @@ int execute_genotype_command(const GenotypeCommandOptions& requested, const Prep
         }
         if (sequence_first) {
             const std::string why = std::string("FAILED: ") + error.what();
-            for (const std::string file : {options.out_prefix + ".sequence_locus.tsv", options.out_prefix + ".mosaic_status.tsv"}) {
+            for (const std::string file : {genotype_output_path(options.out_prefix, ".sequence_locus.tsv"), options.out_prefix + ".mosaic_status.tsv"}) {
                 try {
                     std::ifstream in(file);
                     if (!in) continue;

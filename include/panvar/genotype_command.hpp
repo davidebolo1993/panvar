@@ -407,6 +407,9 @@ struct GenotypeCommandOptions {
     std::string dosage_mode = "off";
     // SHADOW ONLY: the allocation observability test inside the shadow audit (off until its cost is reviewed).
     bool dosage_allocation_test = false;
+    // M15-L: the command's output layout: only the primary sequence reports beside out_prefix, every other report in
+    // <out_prefix>.diagnostics/ (genotype_output_layout.hpp). Set by the command line; the internal API is flat unless set.
+    bool diagnostics_directory = false;
     // I2-J (EXPERIMENTAL, profile key only): `dosage_census_backend reference|interned_experimental`, the dosage block
     // census's implementation (dosage::CensusBackend). Exact; setting the key records it with the census timers.
     bool dosage_census_interned = false;

@@ -3,6 +3,7 @@
 // presenting a partial ranking, and the model fingerprint identifies the model rather than the run.
 
 #include "panvar/genotype_command.hpp"
+#include "panvar/genotype_output_layout.hpp"
 #include "panvar/prepared_locus.hpp"
 #include "panvar/prepared_locus_file.hpp"
 #include "panvar/integrated_snarls.hpp"
@@ -51,6 +52,17 @@ void require(bool condition, const std::string& message) {
 std::string dir;
 
 std::string path(const std::string& name) { return dir + "/" + name; }
+
+// M15-L: where a run's report lives. The four primary reports are beside the prefix; every other report is under
+// <prefix>.diagnostics/<name> when the run used the command's layout (the directory exists), and beside the prefix for a run
+// through the internal API (the flat layout).
+std::string out_rel(const std::string& rel, const std::string& suffix) {
+    if (panvar::genotype_primary_suffix(suffix)) return rel + suffix;
+    const std::string diag = rel + ".diagnostics";
+    if (std::filesystem::is_directory(path(diag))) return diag + "/" + std::filesystem::path(rel).filename().string() + suffix;
+    return rel + suffix;
+}
+
 
 // Every block table this test's runs wrote -- on every call path -- carries quality_filter and quality_reason equal to
 // block_quality(filter, genotype_support) of the same row: the two columns depend on nothing else, so no truth
@@ -476,8 +488,8 @@ panvar::GenotypeCommandOptions tiny_options(const std::string& prefix, const std
 }
 
 bool no_ranking_or_call(const std::string& prefix) {
-    return !exists(path(prefix + ".mosaic_scores.tsv")) && !exists(path(prefix + ".genotypes.tsv")) &&
-           !exists(path(prefix + ".block_genotypes.tsv")) && !exists(path(prefix + ".mosaic_haplotypes.fa"));
+    return !exists(path(out_rel(prefix, ".mosaic_scores.tsv"))) && !exists(path(out_rel(prefix, ".genotypes.tsv"))) &&
+           !exists(path(out_rel(prefix, ".block_genotypes.tsv"))) && !exists(path(out_rel(prefix, ".mosaic_haplotypes.fa")));
 }
 
 // Every stage that can stop early ends with a named status, no ranking and no call.
@@ -873,7 +885,7 @@ void test_off_panel_phase_is_not_claimed_from_reads() {
 // a panel-only run's status said PANEL_ONLY while every block row said CONDITIONAL, taken from an empty
 // beam. That changes no genotype and corrupts anything that summarises the rows.
 void require_scope_agrees(const std::string& prefix, const std::string& expected) {
-    const auto status = read_status(path(prefix + ".mosaic_status.tsv"));
+    const auto status = read_status(path(out_rel(prefix, ".mosaic_status.tsv")));
     require(status.count("candidate_scope") == 1 && status.at("candidate_scope") == expected,
             prefix + " must report candidate_scope " + expected + ", got " +
                 (status.count("candidate_scope") ? status.at("candidate_scope") : std::string("(absent)")));
@@ -881,7 +893,7 @@ void require_scope_agrees(const std::string& prefix, const std::string& expected
     std::size_t scope_column = 0;
     {
         // By name: the filter columns follow candidate_scope, so it is no longer the last column.
-        std::ifstream header_file(path(prefix + ".block_genotypes.tsv"));
+        std::ifstream header_file(path(out_rel(prefix, ".block_genotypes.tsv")));
         std::string header;
         std::getline(header_file, header);
         std::stringstream fields(header);
@@ -895,7 +907,7 @@ void require_scope_agrees(const std::string& prefix, const std::string& expected
         }
         require(found, prefix + ".block_genotypes.tsv has no candidate_scope column");
     }
-    for (const auto& row : read_rows(path(prefix + ".block_genotypes.tsv"))) {
+    for (const auto& row : read_rows(path(out_rel(prefix, ".block_genotypes.tsv")))) {
         if (row.empty() || row.front() == "block_id") continue;   // header, if read_rows returns one
         require(row.size() > scope_column && row[scope_column] == expected,
                 prefix + " block row " + row.front() + " reports scope " + row[scope_column] +
@@ -1001,18 +1013,18 @@ void test_proposal_status_rules() {
 void check_block_posteriors(const std::string& prefix) {
     std::vector<std::vector<std::size_t>> hap1;
     std::vector<std::vector<std::size_t>> hap2;
-    for (const auto& row : read_rows(path(prefix + ".mosaic_candidates.tsv"))) {
+    for (const auto& row : read_rows(path(out_rel(prefix, ".mosaic_candidates.tsv")))) {
         hap1.push_back(parse_path(row[2]));
         hap2.push_back(parse_path(row[3]));
     }
     std::vector<std::pair<std::size_t, double>> representatives;   // (candidate index, set probability)
     std::size_t winner = hap1.size();
-    for (const auto& row : read_rows(path(prefix + ".mosaic_scores.tsv"))) {
+    for (const auto& row : read_rows(path(out_rel(prefix, ".mosaic_scores.tsv")))) {
         representatives.emplace_back(std::stoul(row[1]), std::stod(row[10]));
         if (row[13] == "true") winner = std::stoul(row[1]);
     }
     require(winner < hap1.size(), "the scores must name a winner in the manifest");
-    const auto rows = read_rows(path(prefix + ".block_genotypes.tsv"));
+    const auto rows = read_rows(path(out_rel(prefix, ".block_genotypes.tsv")));
     for (std::size_t b = 0; b < rows.size(); ++b) {
         const auto called = std::minmax(hap1[winner][b], hap2[winner][b]);
         double same = 0.0;
@@ -2515,9 +2527,9 @@ bool no_final_outputs(const std::string& prefix) {
 }
 
 void require_truth_genotype(const panvar::GenotypeCommandOptions& options, const std::string& prefix) {
-    const auto reported = read_status(path(prefix + ".mosaic_status.tsv"));
+    const auto reported = read_status(path(out_rel(prefix, ".mosaic_status.tsv")));
     const TruthFrame frame = rebuild_truth_frame(options, reported.at("model_fingerprint"), kTruth1Nodes, kTruth2Nodes);
-    const auto rows = read_rows(path(prefix + ".block_genotypes.tsv"));
+    const auto rows = read_rows(path(out_rel(prefix, ".block_genotypes.tsv")));
     require(rows.size() == frame.model->blocks().size(), "the block table must carry every block");
     for (std::size_t b = 0; b < rows.size(); ++b) {
         const auto& alleles = frame.model->blocks()[b].alleles;
@@ -2551,13 +2563,13 @@ std::vector<std::string> guard_prefilter(const std::string& prefix) {
             out.push_back(line);
         }
     }
-    std::ifstream fasta(path(prefix + ".mosaic_haplotypes.fa"));
+    std::ifstream fasta(path(out_rel(prefix, ".mosaic_haplotypes.fa")));
     for (std::string line; std::getline(fasta, line);) {
         if (!line.empty() && line[0] != '>') out.push_back(line);
     }
     // The status apart from timing, process gauges, the guard's own keys and the cumulative repair work,
     // which legitimately includes the guard's scoring when it is on.
-    for (const auto& [key, value] : read_status(path(prefix + ".mosaic_status.tsv"))) {
+    for (const auto& [key, value] : read_status(path(out_rel(prefix, ".mosaic_status.tsv")))) {
         static const std::vector<std::string> skip = {"seconds_", "resources_", "threads_", "representation_",
                                                       "locus_filter", "lowqual_blocks", "not_evaluated_blocks",
                                                       "quality_",
@@ -2575,7 +2587,7 @@ std::vector<std::string> guard_prefilter(const std::string& prefix) {
 
 std::vector<std::string> guard_filters(const std::string& prefix) {
     std::vector<std::string> out;
-    for (const auto& row : read_rows(path(prefix + ".block_genotypes.tsv"))) {
+    for (const auto& row : read_rows(path(out_rel(prefix, ".block_genotypes.tsv")))) {
         std::string line = row[0];
         for (std::size_t c = row.size() - 10; c < row.size(); ++c) line += '\t' + row[c];
         out.push_back(line);
@@ -2598,7 +2610,7 @@ void test_representation_guard_outside_pool() {
         }
         return o;
     };
-    const auto status_of = [&](const std::string& name) { return read_status(path(name + ".mosaic_status.tsv")); };
+    const auto status_of = [&](const std::string& name) { return read_status(path(out_rel(name, ".mosaic_status.tsv"))); };
     require(panvar::run_genotype(options_for("guard_off", false, false, 2)) == panvar::GenotypeRunStatus::Complete,
             "fixture: the guard-off run calls");
     require(panvar::run_genotype(options_for("guard_pool", true, false, 2)) == panvar::GenotypeRunStatus::Complete &&
@@ -2716,10 +2728,10 @@ void test_adaptive_completion() {
         run.threads = threads;
         require(panvar::run_genotype(run) == panvar::GenotypeRunStatus::Complete, "the K = 16 completion must call");
         require_truth_genotype(run, name);
-        const std::string rounds = rounds_science(path(name + ".repair_rounds.tsv"));
-        const std::string tables = slurp(path(name + ".genotypes.tsv")) + slurp(path(name + ".block_genotypes.tsv")) +
-                                   slurp(path(name + ".mosaic_scores.tsv")) + slurp(path(name + ".equivalence_set.tsv")) +
-                                   slurp(path(name + ".mosaic_candidates.tsv"));
+        const std::string rounds = rounds_science(path(out_rel(name, ".repair_rounds.tsv")));
+        const std::string tables = slurp(path(out_rel(name, ".genotypes.tsv"))) + slurp(path(out_rel(name, ".block_genotypes.tsv"))) +
+                                   slurp(path(out_rel(name, ".mosaic_scores.tsv"))) + slurp(path(out_rel(name, ".equivalence_set.tsv"))) +
+                                   slurp(path(out_rel(name, ".mosaic_candidates.tsv")));
         if (reference_rounds.empty()) {
             reference_rounds = rounds;
             reference_tables = tables;
@@ -2924,8 +2936,8 @@ void require_same_science(const std::string& a, const std::string& b, const std:
     for (const char* suffix : {".genotypes.tsv", ".block_genotypes.tsv", ".mosaic_candidates.tsv", ".mosaic_scores.tsv",
                                ".mosaic_haplotypes.fa", ".equivalence_set.tsv", ".locus_genotype.tsv",
                                ".library_sensitivity.tsv"}) {
-        require(exists(path(a + suffix)) == exists(path(b + suffix)), label + ": " + suffix + " present in one run only");
-        if (exists(path(a + suffix))) {
+        require(exists(path(out_rel(a, suffix))) == exists(path(out_rel(b, suffix))), label + ": " + suffix + " present in one run only");
+        if (exists(path(out_rel(a, suffix)))) {
             // the run's own prefix (FASTA record names, haplotype ids) differs by name only
             const auto placeheld = [](std::string text, const std::string& prefix) {
                 for (std::size_t at = text.find(prefix); at != std::string::npos; at = text.find(prefix, at + 5)) {
@@ -2935,12 +2947,12 @@ void require_same_science(const std::string& a, const std::string& b, const std:
             };
             // M15-E: and the bare prefix name (the locus table links its sibling files by name)
             const auto base = [](const std::string& rel) { return std::filesystem::path(rel).filename().string(); };
-            require(placeheld(placeheld(slurp(path(a + suffix)), path(a)), base(a)) ==
-                        placeheld(placeheld(slurp(path(b + suffix)), path(b)), base(b)),
+            require(placeheld(placeheld(slurp(path(out_rel(a, suffix))), path(a)), base(a)) ==
+                        placeheld(placeheld(slurp(path(out_rel(b, suffix))), path(b)), base(b)),
                     label + ": " + suffix + " differs");
         }
     }
-    const auto sa = read_status(path(a + ".mosaic_status.tsv")), sb = read_status(path(b + ".mosaic_status.tsv"));
+    const auto sa = read_status(path(out_rel(a, ".mosaic_status.tsv"))), sb = read_status(path(out_rel(b, ".mosaic_status.tsv")));
     std::set<std::string> keys;
     for (const auto& kv : sa) keys.insert(kv.first);
     for (const auto& kv : sb) keys.insert(kv.first);
@@ -3039,11 +3051,11 @@ void test_panel_index_cli() {
             }
             require(x == y, what + ": " + suffix + " identical");
         }
-        const auto st = read_status(path(d + "/" + indexed + ".mosaic_status.tsv"));
+        const auto st = read_status(path(out_rel(d + "/" + indexed, ".mosaic_status.tsv")));
         require(st.at("prepared_locus_origin") == "loaded" && st.at("prepared_locus_panel_source") == "loaded" &&
                     st.at("panel_index") == index && st.at("panel_index_panel_rebuild_reason") == "none",
                 what + ": the status records a fully loaded index (model and panel)");
-        require(read_status(path(d + "/" + cold + ".mosaic_status.tsv")).count("prepared_locus") == 0, what + ": the cold run prepared in memory");
+        require(read_status(path(out_rel(d + "/" + cold, ".mosaic_status.tsv"))).count("prepared_locus") == 0, what + ": the cold run prepared in memory");
     };
     const std::vector<std::string> use = {"--panel-index", index};
     const auto both_runs = [&](char which, const std::string& tag, std::vector<std::string> extra) {
@@ -3057,7 +3069,7 @@ void test_panel_index_cli() {
     both_runs('A', "A_auto", {});
     both_runs('A', "A_check", {"--library", lib, "--dosage-check"});
     {
-        auto x = read_status(path(d + "/cold_A_check.dosage_status.tsv")), y = read_status(path(d + "/idx_A_check.dosage_status.tsv"));
+        auto x = read_status(path(out_rel(d + "/cold_A_check", ".dosage_status.tsv"))), y = read_status(path(out_rel(d + "/idx_A_check", ".dosage_status.tsv")));
         for (auto* m : {&x, &y}) for (auto it = m->begin(); it != m->end();) it = it->first.rfind("seconds_", 0) == 0 ? m->erase(it) : std::next(it);
         require(!x.empty() && x == y, "panel index A_check: the dosage audit is identical (timing aside)");
     }
@@ -3158,12 +3170,12 @@ void test_indexed_union_backend() {
         require(panvar::run_genotype(indexed(o)) == panvar::GenotypeRunStatus::Complete, "the indexed backend must call");
         require_same_science("ix_ref_t" + std::to_string(threads), name,
                              "indexed backend, " + std::to_string(threads) + " thread(s)");
-        const auto st = read_status(path(name + ".mosaic_status.tsv"));
+        const auto st = read_status(path(out_rel(name, ".mosaic_status.tsv")));
         require(st.at("union_scoring_backend") == "indexed_fine_experimental" &&
                     st.at("union_scoring_backend_stages") == "initial_union_pass" && st.at("indexed_union_refusal") == "none" &&
                     std::stoull(st.at("indexed_union_store_charged_bytes")) > 0,
                 "the indexed run must record its backend, the stage it served and its store");
-        const std::string settings = slurp(path(name + ".settings.tsv"));
+        const std::string settings = slurp(path(out_rel(name, ".settings.tsv")));
         require(settings.find("union_scoring_backend\tindexed_fine_experimental\tprofile test") != std::string::npos &&
                     settings.find("indexed_union_store_bytes\t268435456\tprofile test") != std::string::npos,
                 "the experimental keys must be recorded with their source");
@@ -3296,9 +3308,9 @@ void test_adaptive_fine_windows() {
                     panvar::run_genotype(arm(f, true, threads)) == panvar::GenotypeRunStatus::Complete,
                 "fixture: both adaptive arms must call");
         require_same_science(c, f, "fine adaptive windows, " + std::to_string(threads) + " threads");
-        require(science(path(c + ".repair_rounds.tsv")) == science(path(f + ".repair_rounds.tsv")),
+        require(science(path(out_rel(c, ".repair_rounds.tsv"))) == science(path(out_rel(f, ".repair_rounds.tsv"))),
                 "the complete adaptive trajectory must be the control's");
-        const auto sc = read_status(path(c + ".mosaic_status.tsv")), sf = read_status(path(f + ".mosaic_status.tsv"));
+        const auto sc = read_status(path(out_rel(c, ".mosaic_status.tsv"))), sf = read_status(path(out_rel(f, ".mosaic_status.tsv")));
         require(sf.at("pool_score_mismatches") == "0" && sc.at("adaptive_window_discovery") == "reference" &&
                     sf.at("adaptive_window_discovery") == "fine_experimental" && sc.at("adaptive_fine_units_served") == "0" &&
                     std::stoull(sf.at("adaptive_fine_units_discovered")) > 0 &&
@@ -3435,9 +3447,9 @@ void test_fused_anchor_seeding() {
                     panvar::run_genotype(arm(f, true, threads)) == panvar::GenotypeRunStatus::Complete,
                 "fixture: both seeding arms must call");
         require_same_science(c, f, "fused seeding, " + std::to_string(threads) + " threads");
-        require(science(path(c + ".repair_rounds.tsv")) == science(path(f + ".repair_rounds.tsv")),
+        require(science(path(out_rel(c, ".repair_rounds.tsv"))) == science(path(out_rel(f, ".repair_rounds.tsv"))),
                 "the complete adaptive trajectory must be the control's");
-        const auto sc = read_status(path(c + ".mosaic_status.tsv")), sf = read_status(path(f + ".mosaic_status.tsv"));
+        const auto sc = read_status(path(out_rel(c, ".mosaic_status.tsv"))), sf = read_status(path(out_rel(f, ".mosaic_status.tsv")));
         const std::uint64_t pc = std::stoull(sc.at("adaptive_full_placements")), pf = std::stoull(sf.at("adaptive_full_placements"));
         const std::uint64_t seeded = sc.at("repair_anchor_hap1") == sc.at("repair_anchor_hap2") ? 1 : 2;
         require(sf.at("adaptive_fused_seed") == "1" && sc.at("adaptive_fused_seed") == "0" && pc == pf + seeded &&
@@ -3511,9 +3523,9 @@ void test_prepared_combination_terms() {
                     panvar::run_genotype(arm(p, true)) == panvar::GenotypeRunStatus::Complete,
                 "fixture: both combination arms must call");
         require_same_science(c, p, "prepared combination terms, " + std::to_string(threads) + " threads");
-        require(science(path(c + ".repair_rounds.tsv")) == science(path(p + ".repair_rounds.tsv")),
+        require(science(path(out_rel(c, ".repair_rounds.tsv"))) == science(path(out_rel(p, ".repair_rounds.tsv"))),
                 "the adaptive trajectory must be the scalar path's");
-        const auto sc = read_status(path(c + ".mosaic_status.tsv")), sp = read_status(path(p + ".mosaic_status.tsv"));
+        const auto sc = read_status(path(out_rel(c, ".mosaic_status.tsv"))), sp = read_status(path(out_rel(p, ".mosaic_status.tsv")));
         require(sc.at("combination_prepared_calls") == "0" && std::stoull(sp.at("combination_prepared_calls")) >= 2 &&
                     std::stoll(sp.at("combination_net_validations_avoided")) > 0 &&
                     std::stoll(sp.at("combination_net_logs_avoided")) > 0 &&
@@ -3556,9 +3568,9 @@ void test_gap_recursion_backend() {
                     panvar::run_genotype(arm(e, true)) == panvar::GenotypeRunStatus::Complete,
                 "fixture: both recursion arms must call");
         require_same_science(c, e, "gap recursion backend, " + std::to_string(threads) + " threads");
-        require(science(path(c + ".repair_rounds.tsv")) == science(path(e + ".repair_rounds.tsv")),
+        require(science(path(out_rel(c, ".repair_rounds.tsv"))) == science(path(out_rel(e, ".repair_rounds.tsv"))),
                 "the adaptive trajectory must be the reference recursion's");
-        const auto sc = read_status(path(c + ".mosaic_status.tsv")), se = read_status(path(e + ".mosaic_status.tsv"));
+        const auto sc = read_status(path(out_rel(c, ".mosaic_status.tsv"))), se = read_status(path(out_rel(e, ".mosaic_status.tsv")));
         require(sc.at("gap_recursion_backend") == "scaled_reference" &&
                     se.at("gap_recursion_backend") == "fixed_geometry_experimental" &&
                     se.at("gap_recursion_backend_scope") == "union_adaptive_dosage",
@@ -3614,9 +3626,9 @@ void test_emission_handoff() {
                     panvar::run_genotype(arm(e, true)) == panvar::GenotypeRunStatus::Complete,
                 "fixture: both handoff arms must call");
         require_same_science(c, e, "emission handoff, " + std::to_string(threads) + " threads");
-        require(science(path(c + ".repair_rounds.tsv")) == science(path(e + ".repair_rounds.tsv")),
+        require(science(path(out_rel(c, ".repair_rounds.tsv"))) == science(path(out_rel(e, ".repair_rounds.tsv"))),
                 "the adaptive trajectory must be the cold search's");
-        const auto sc = read_status(path(c + ".mosaic_status.tsv")), se = read_status(path(e + ".mosaic_status.tsv"));
+        const auto sc = read_status(path(out_rel(c, ".mosaic_status.tsv"))), se = read_status(path(out_rel(e, ".mosaic_status.tsv")));
         require(sc.at("adaptive_emission_handoff") == "0" && sc.at("adaptive_emission_handoff_detached") == "0" &&
                     sc.at("adaptive_emission_handoff_inherited_hits") == "0",
                 "the off arm detaches and inherits nothing");
@@ -3704,13 +3716,13 @@ void test_prepared_locus() {
         const panvar::GenotypeRunStatus status = panvar::run_genotype_prepared(sample(name, c.which, c.threads, c.library), *prepared);
         require(status == cold_status[tag], name + ": the run status must be the cold run's");
         require_same_science("prep_cold_" + tag, name, "prepared locus, " + name);
-        require(exists(path("prep_cold_" + tag + ".repair_rounds.tsv")) == exists(path(name + ".repair_rounds.tsv")),
+        require(exists(path("prep_cold_" + tag + ".repair_rounds.tsv")) == exists(path(out_rel(name, ".repair_rounds.tsv"))),
                 name + ": the adaptive trajectory must exist in both or neither");
         if (exists(path("prep_cold_" + tag + ".repair_rounds.tsv"))) {
-            require(trajectory(path("prep_cold_" + tag + ".repair_rounds.tsv")) == trajectory(path(name + ".repair_rounds.tsv")),
+            require(trajectory(path("prep_cold_" + tag + ".repair_rounds.tsv")) == trajectory(path(out_rel(name, ".repair_rounds.tsv"))),
                     name + ": the adaptive trajectory must be the cold run's (scientific columns)");
         }
-        const auto st = read_status(path(name + ".mosaic_status.tsv"));
+        const auto st = read_status(path(out_rel(name, ".mosaic_status.tsv")));
         require(st.at("prepared_locus") == "1" && st.at("prepared_locus_id") == std::to_string(prepared->id()),
                 name + ": the status must record the prepared locus it used");
         require(prepared->digest() == digest, name + ": the prepared locus must be unchanged by an analysis");
@@ -3798,7 +3810,7 @@ void test_prepared_locus() {
             const int a = panvar::run_genotype_command(args(cold, which));
             const int b = panvar::run_genotype_command_prepared(args(warm, which), *command_locus);
             require(a == b, std::string("command exit codes must agree for sample ") + which);
-            const auto sa = read_status(path(cold + ".mosaic_status.tsv")), sb = read_status(path(warm + ".mosaic_status.tsv"));
+            const auto sa = read_status(path(out_rel(cold, ".mosaic_status.tsv"))), sb = read_status(path(out_rel(warm, ".mosaic_status.tsv")));
             std::set<std::string> keys;
             for (const auto& kv : sa) keys.insert(kv.first);
             for (const auto& kv : sb) keys.insert(kv.first);
@@ -3812,9 +3824,9 @@ void test_prepared_locus() {
                                        ".mosaic_haplotypes.fa", ".equivalence_set.tsv", ".library_sensitivity.tsv",
                                        ".dosage_status.tsv", ".dosage_blocks.tsv", ".dosage_census.tsv", ".dosage_features.tsv",
                                        ".dosage_repairs.tsv", ".locus_genotype.tsv"}) {
-                require(exists(path(cold + suffix)) == exists(path(warm + suffix)), std::string("command path: ") + suffix + " presence");
-                if (!exists(path(cold + suffix))) continue;
-                std::string x = slurp(path(cold + suffix)), y = slurp(path(warm + suffix));
+                require(exists(path(out_rel(cold, suffix))) == exists(path(out_rel(warm, suffix))), std::string("command path: ") + suffix + " presence");
+                if (!exists(path(out_rel(cold, suffix)))) continue;
+                std::string x = slurp(path(out_rel(cold, suffix))), y = slurp(path(out_rel(warm, suffix)));
                 if (std::string(suffix) == ".dosage_status.tsv") {   // its timing rows differ by run
                     const auto strip = [](const std::string& t) {
                         std::string out;
@@ -3876,9 +3888,9 @@ void test_prepared_locus_cleanup() {
     };
     const auto same_as_cold = [&](const std::string& cold, const std::string& run) {
         require_same_science(cold, run, "cleanup, " + run);
-        require(exists(path(cold + ".repair_rounds.tsv")) == exists(path(run + ".repair_rounds.tsv")) &&
-                    (!exists(path(cold + ".repair_rounds.tsv")) ||
-                     trajectory(path(cold + ".repair_rounds.tsv")) == trajectory(path(run + ".repair_rounds.tsv"))),
+        require(exists(path(out_rel(cold, ".repair_rounds.tsv"))) == exists(path(out_rel(run, ".repair_rounds.tsv"))) &&
+                    (!exists(path(out_rel(cold, ".repair_rounds.tsv"))) ||
+                     trajectory(path(out_rel(cold, ".repair_rounds.tsv"))) == trajectory(path(out_rel(run, ".repair_rounds.tsv")))),
                 run + ": the adaptive trajectory must be the cold run's");
     };
     const auto release = [&](const std::string& after) {
@@ -3980,11 +3992,11 @@ void test_prepared_locus_index() {
         const std::string name = "index_run" + std::to_string(runs++) + "_" + r.tag;
         (void)panvar::run_genotype_prepared(sample(name, r.which, r.threads, r.library), *loaded);
         require_same_science("prep_cold_" + r.tag, name, "loaded index, " + name);
-        require(exists(path("prep_cold_" + r.tag + ".repair_rounds.tsv")) == exists(path(name + ".repair_rounds.tsv")) &&
-                    (!exists(path(name + ".repair_rounds.tsv")) ||
-                     trajectory(path("prep_cold_" + r.tag + ".repair_rounds.tsv")) == trajectory(path(name + ".repair_rounds.tsv"))),
+        require(exists(path("prep_cold_" + r.tag + ".repair_rounds.tsv")) == exists(path(out_rel(name, ".repair_rounds.tsv"))) &&
+                    (!exists(path(out_rel(name, ".repair_rounds.tsv"))) ||
+                     trajectory(path("prep_cold_" + r.tag + ".repair_rounds.tsv")) == trajectory(path(out_rel(name, ".repair_rounds.tsv")))),
                 name + ": the adaptive trajectory must be the cold run's");
-        const auto st = read_status(path(name + ".mosaic_status.tsv"));
+        const auto st = read_status(path(out_rel(name, ".mosaic_status.tsv")));
         require(st.at("prepared_locus") == "1" && st.at("prepared_locus_origin") == "loaded" &&
                     st.at("prepared_locus_file_sha256") == report.file_checksum &&
                     st.at("prepared_locus_id") == std::to_string(loaded->id()),
@@ -4024,11 +4036,11 @@ void test_prepared_locus_index() {
         const std::string name = "index_panel_run" + std::to_string(panel_runs++) + "_" + r.tag;
         (void)panvar::run_genotype_prepared(sample(name, r.which, r.threads, r.library), *panel_loaded);
         require_same_science("prep_cold_" + r.tag, name, "panel-loaded index, " + name);
-        require(exists(path("prep_cold_" + r.tag + ".repair_rounds.tsv")) == exists(path(name + ".repair_rounds.tsv")) &&
-                    (!exists(path(name + ".repair_rounds.tsv")) ||
-                     trajectory(path("prep_cold_" + r.tag + ".repair_rounds.tsv")) == trajectory(path(name + ".repair_rounds.tsv"))),
+        require(exists(path("prep_cold_" + r.tag + ".repair_rounds.tsv")) == exists(path(out_rel(name, ".repair_rounds.tsv"))) &&
+                    (!exists(path(out_rel(name, ".repair_rounds.tsv"))) ||
+                     trajectory(path("prep_cold_" + r.tag + ".repair_rounds.tsv")) == trajectory(path(out_rel(name, ".repair_rounds.tsv")))),
                 name + ": the adaptive trajectory must be the cold run's");
-        const auto st = read_status(path(name + ".mosaic_status.tsv"));
+        const auto st = read_status(path(out_rel(name, ".mosaic_status.tsv")));
         require(st.at("prepared_locus_origin") == "loaded" && st.at("prepared_locus_panel_source") == "loaded" &&
                     st.at("prepared_locus_file_sha256") == panel_report.file_checksum,
                 name + ": the status records the panel-loaded index");
@@ -4270,8 +4282,8 @@ void test_sequence_first_lifecycle() {
         fs::remove_all(path(rel));
         fs::create_directories(path(rel));
         require(panvar::execute_genotype_command(options(true), nullptr) == 0, "lifecycle: the first run predicts");
-        require(sf::kv(path(prefix + ".sequence_locus.tsv")).at("prediction") == "PREDICTION" &&
-                    exists(path(prefix + ".sequence_haplotypes.fa")),
+        require(sf::kv(path(out_rel(prefix, ".sequence_locus.tsv"))).at("prediction") == "PREDICTION" &&
+                    exists(path(out_rel(prefix, ".sequence_haplotypes.fa"))),
                 "lifecycle: a published PREDICTION with its FASTA");
     };
     // prediction -> legacy
@@ -4287,11 +4299,11 @@ void test_sequence_first_lifecycle() {
         o.max_mosaic_candidates = 0;
         o.repair_rounds = 1;
         require(panvar::execute_genotype_command(o, nullptr) == 3, "prediction -> provisional: exit 3");
-        const auto locus = sf::kv(path(prefix + ".sequence_locus.tsv"));
+        const auto locus = sf::kv(path(out_rel(prefix, ".sequence_locus.tsv")));
         require(locus.at("prediction") == "PROVISIONAL" &&
-                    slurp(path(prefix + ".sequence_haplotypes.fa")).find("prediction=PROVISIONAL") != std::string::npos &&
-                    slurp(path(prefix + ".sequence_blocks.tsv")).find("IDENTIFIED") == std::string::npos &&
-                    read_rows(path(prefix + ".representation_intervals.tsv")).empty(),
+                    slurp(path(out_rel(prefix, ".sequence_haplotypes.fa"))).find("prediction=PROVISIONAL") != std::string::npos &&
+                    slurp(path(out_rel(prefix, ".sequence_blocks.tsv"))).find("IDENTIFIED") == std::string::npos &&
+                    read_rows(path(out_rel(prefix, ".representation_intervals.tsv"))).empty(),
                 "prediction -> provisional: only the provisional report, nothing from the earlier prediction");
     }
     // prediction -> normal no-prediction outcome (a declared neighbourhood bound refuses before any search)
@@ -4300,9 +4312,9 @@ void test_sequence_first_lifecycle() {
         panvar::GenotypeCommandOptions o = options(true);
         o.repair_max_neighbours = 1;
         require(panvar::execute_genotype_command(o, nullptr) == 1, "prediction -> no prediction: exit 1");
-        require(sf::kv(path(prefix + ".sequence_locus.tsv")).at("prediction") == "NO_PREDICTION" &&
-                    !exists(path(prefix + ".sequence_haplotypes.fa")) &&
-                    read_rows(path(prefix + ".sequence_blocks.tsv")).empty(),
+        require(sf::kv(path(out_rel(prefix, ".sequence_locus.tsv"))).at("prediction") == "NO_PREDICTION" &&
+                    !exists(path(out_rel(prefix, ".sequence_haplotypes.fa"))) &&
+                    read_rows(path(out_rel(prefix, ".sequence_blocks.tsv"))).empty(),
                 "prediction -> no prediction: a NO_PREDICTION record, no FASTA, no earlier block rows");
     }
     // prediction -> watchdog stop
@@ -4324,7 +4336,7 @@ void test_sequence_first_lifecycle() {
         int wait_status = 0;
         waitpid(child, &wait_status, 0);
         require(WIFEXITED(wait_status) && WEXITSTATUS(wait_status) == 124, "prediction -> watchdog: exit 124");
-        require(read_status(path(prefix + ".mosaic_status.tsv")).at("status") == "TIME_LIMIT",
+        require(read_status(path(out_rel(prefix, ".mosaic_status.tsv"))).at("status") == "TIME_LIMIT",
                 "prediction -> watchdog: TIME_LIMIT status");
         for (const std::string& f : owned) {
             require(!exists(path(prefix + f)), "prediction -> watchdog: no earlier report beside TIME_LIMIT (" + f + ")");
@@ -4355,7 +4367,7 @@ void test_sequence_first_lifecycle() {
         fs::create_directories(path(prefix + ".sequence_alternatives.tsv.writing/blocker"));
         const int code = panvar::execute_genotype_command(options(true), nullptr);
         require(code == 2, "publication failure: exit 2 (got " + std::to_string(code) + ")");
-        const auto status = read_status(path(prefix + ".mosaic_status.tsv"));
+        const auto status = read_status(path(out_rel(prefix, ".mosaic_status.tsv")));
         require(status.at("sequence_prediction") == "NO_PREDICTION" && status.at("sequence_publication") == "FAILED" &&
                     status.at("sequence_exit_code") == "2",
                 "publication failure: the status claims no prediction and names the failure");
@@ -4363,11 +4375,11 @@ void test_sequence_first_lifecycle() {
                               ".sequence_alternatives.tsv"}) {
             require(!exists(path(prefix + f)), std::string("publication failure: no partial ") + f);
         }
-        if (exists(path(prefix + ".sequence_locus.tsv"))) {
-            require(sf::kv(path(prefix + ".sequence_locus.tsv")).at("prediction") == "NO_PREDICTION",
+        if (exists(path(out_rel(prefix, ".sequence_locus.tsv")))) {
+            require(sf::kv(path(out_rel(prefix, ".sequence_locus.tsv"))).at("prediction") == "NO_PREDICTION",
                     "publication failure: no locus record claims a prediction");
         }
-        fs::remove_all(path(prefix + ".sequence_alternatives.tsv.writing"));   // the test's own blocker
+        fs::remove_all(path(out_rel(prefix, ".sequence_alternatives.tsv.writing")));   // the test's own blocker
     }
     std::cout << "  sequence-first lifecycle: prediction -> legacy / provisional / no prediction / watchdog leave no "
                  "earlier report; a prepared refusal changes nothing; a failed publication leaves no prediction claim\n";
@@ -5462,11 +5474,25 @@ std::vector<std::string> unexpected_status_differences(const std::string& a, con
 }
 // every output file identical (paths normalised) except the status (explicit allowances above), the settings record
 // (exactly the route's own row), repair_memory (a timing log) and the dosage status's timing rows
+// M15-L: a run directory's files, the diagnostics directory's included ("call.diagnostics/<file>")
+std::set<std::string> run_files(const std::string& d) {
+    std::set<std::string> out;
+    for (const auto& e : std::filesystem::directory_iterator(d)) {
+        const std::string name = e.path().filename().string();
+        if (e.is_directory()) {
+            for (const auto& x : std::filesystem::directory_iterator(e.path())) out.insert(name + "/" + x.path().filename().string());
+        } else {
+            out.insert(name);
+        }
+    }
+    return out;
+}
 void require_same_science(const std::string& control, const std::string& integrated, const std::string& what,
                           bool threads_differ = false, bool profiles_differ = false) {
-    require(sf::files(path(control)) == sf::files(path(integrated)), what + ": the same output files");
-    for (const std::string& f : sf::files(path(control))) {
-        const std::string a = path(control + "/" + f), b = path(integrated + "/" + f);
+    require(run_files(path(control)) == run_files(path(integrated)), what + ": the same output files");
+    for (const std::string& rel : run_files(path(control))) {
+        const std::string a = path(control + "/" + rel), b = path(integrated + "/" + rel);
+        const std::string f = std::filesystem::path(rel).filename().string();
         if (f == "call.repair_memory.tsv") continue;
         if (f == "call.mosaic_status.tsv") {
             std::string listing;
@@ -5499,7 +5525,7 @@ void require_same_science(const std::string& control, const std::string& integra
             require(x == y, what + ": dosage status identical (timing rows aside)");
             continue;
         }
-        require(sf::normalised(a, path(control)) == sf::normalised(b, path(integrated)), what + ": " + f + " identical");
+        require(sf::normalised(a, path(control)) == sf::normalised(b, path(integrated)), what + ": " + rel + " identical");
     }
 }
 }  // namespace s2g
@@ -5603,9 +5629,9 @@ void test_blocked_union_route() {
         const int a = panvar::run_genotype_command(cli("bu_cli_off_profile.tsv", "bu_cli_off/call"));
         const int b = panvar::run_genotype_command(cli("bu_cli_profile.tsv", "bu_cli/call"));
         require(a == b && a == 0, "S2-G CLI: both routes complete with the same exit code");
-        require(sf::kv(path("bu_cli/call.settings.tsv")).at("union_fragment_blocks").rfind("fine_core_4096_experimental", 0) == 0,
+        require(sf::kv(path(out_rel("bu_cli/call", ".settings.tsv"))).at("union_fragment_blocks").rfind("fine_core_4096_experimental", 0) == 0,
                 "S2-G CLI: the profile's route is recorded in the settings");
-        require(read_status(path("bu_cli/call.mosaic_status.tsv")).at("union_fragment_block_pairs") == "4096",
+        require(read_status(path(out_rel("bu_cli/call", ".mosaic_status.tsv"))).at("union_fragment_block_pairs") == "4096",
                 "S2-G CLI: the declared 4,096-pair blocks");
         s2g::require_same_science("bu_cli_off", "bu_cli", "S2-G CLI ordinary vs combined", false, true);
         // prepared locus: cold and warm runs of the combined route, and the ordinary warm run
@@ -6172,10 +6198,10 @@ void test_unrefined_v2() {
                         sf::normalised(path(V + table), path("uv2_" + c.name + "_v2")),
                     c.name + ": " + table + " identical between the legacy and v2 contracts (candidates, scores, ranking)");
         }
-        require(!fs::exists(path(L + ".sequence_locus.tsv")), c.name + ": the internal legacy contract writes no sequence report");
-        const auto st = sf::kv(path(V + ".mosaic_status.tsv"));
-        const auto sl = sf::kv(path(V + ".sequence_locus.tsv"));
-        const auto legacy_status = sf::kv(path(L + ".mosaic_status.tsv"));
+        require(!fs::exists(path(out_rel(L, ".sequence_locus.tsv"))), c.name + ": the internal legacy contract writes no sequence report");
+        const auto st = sf::kv(path(out_rel(V, ".mosaic_status.tsv")));
+        const auto sl = sf::kv(path(out_rel(V, ".sequence_locus.tsv")));
+        const auto legacy_status = sf::kv(path(out_rel(L, ".mosaic_status.tsv")));
         const std::string pred = sl.count("prediction") ? sl.at("prediction") : "absent";
         const std::string seq = sl.count("sequence_status") ? sl.at("sequence_status") : "absent";
         const std::string phase = sl.count("legacy_phase_support") ? sl.at("legacy_phase_support") : "absent";
@@ -6183,7 +6209,7 @@ void test_unrefined_v2() {
                   << ", phase " << legacy_status.at("phase_support") << ") -> v2 " << pred << " " << seq << " (exit "
                   << exits["v2"] << ", phase " << phase << ", status phase " << st.at("phase_support") << ")\n";
         if (record_only) {
-            std::istringstream blocks(slurp(path(V + ".sequence_blocks.tsv")));
+            std::istringstream blocks(slurp(path(out_rel(V, ".sequence_blocks.tsv"))));
             std::string line;
             std::getline(blocks, line);
             while (std::getline(blocks, line)) std::cout << "      " << line.substr(0, 60) << "\n";
@@ -6196,7 +6222,7 @@ void test_unrefined_v2() {
                     st.at("phase_support") + ")");
         require(exits["v2"] == (pred == "PREDICTION" ? 0 : pred == "PROVISIONAL" ? 3 : 1), c.name + ": the v2 exit status");
         {
-            std::istringstream blocks(slurp(path(V + ".sequence_blocks.tsv")));
+            std::istringstream blocks(slurp(path(out_rel(V, ".sequence_blocks.tsv"))));
             std::string line, statuses;
             std::getline(blocks, line);
             while (std::getline(blocks, line)) {
@@ -6213,7 +6239,7 @@ void test_unrefined_v2() {
             }
         }
         if (pred == "PREDICTION") {
-            std::istringstream scores(slurp(path(V + ".mosaic_scores.tsv")));
+            std::istringstream scores(slurp(path(out_rel(V, ".mosaic_scores.tsv"))));
             std::string header, first;
             std::getline(scores, header);
             std::getline(scores, first);

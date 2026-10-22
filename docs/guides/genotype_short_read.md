@@ -305,12 +305,30 @@ these, for example `profile my-limits` + `time_limit_seconds 900`.
 
 ## 6. Outputs: what you get
 
+**Where the files are (M15-L; a breaking change of output paths).** A run with `--out P`, where `P = <dir>/<name>`, writes:
+
+| location | files |
+|---|---|
+| beside the prefix | `P.sequence_locus.tsv` (the outcome and the primary assessment), `P.sequence_blocks.tsv`, `P.sequence_haplotypes.tsv`, and `P.sequence_haplotypes.fa` when the v2 FASTA rule writes one |
+| `P.diagnostics/` | every other report, under its usual name `<name>.<suffix>`: the status (`.mosaic_status.tsv`), `.settings.tsv`, the locus and block tables, candidates, scores, the equivalence set, alternatives, representation intervals, the compound annotation, the library estimate and sensitivity, the dosage audit files and the repair logs |
+
+**How the run treats the two locations:**
+- **The contents are unchanged.** Links between diagnostics are relative to their table. The locus table links the primary
+  FASTA as `../<name>.sequence_haplotypes.fa`.
+- **The outcome record is always beside the prefix.** `P.sequence_locus.tsv` is written there whenever a run produces it:
+  predictions, provisional checkpoints, no-predictions, watchdog stops and reporting failures.
+- **When the directory is created:** when a run first touches its prefix, after every preflight refusal. A refused run
+  creates nothing.
+- **Earlier flat runs:** before writing, the run removes its own report names both at their new locations and at the old
+  flat locations `P.<suffix>`, so an earlier run's flat reports never sit beside the new layout. Nothing else is removed.
+- **Diagnostics are never deleted automatically.**
+
 | outcome | exit (v2) | what exists |
 |---|---|---|
 | **completed prediction** | 0 | `.sequence_locus.tsv` `prediction PREDICTION`, `completion completed_ranking` (even when uncertain); full block tables |
 | **PROVISIONAL** | 3 | the best **fully evaluated** candidate after a budget stop or declared cap (early-incumbent checkpoint). It is **not a completed search** and carries no decision set and no confidence |
 | **no prediction** | 1 | `prediction NO_PREDICTION` with `no_call_reason` (for example `neighbourhood_bound` with no checkpoint to keep). A legacy `distinct_tie` is **not** a no-prediction when the tie is only over labellings of one sequence pair: that is a PREDICTION (exit 0) with `legacy_no_call_reason distinct_tie` |
-| time / footprint stop before any checkpoint | 124 / 125 | minimal status (`TIME_LIMIT` / `RESOURCE_REFUSAL`) and a `NO_PREDICTION` `.sequence_locus.tsv` (`completion budget_stop_before_first_evaluated_candidate`) |
+| time / footprint stop before any checkpoint | 124 / 125 | minimal status (`TIME_LIMIT` / `RESOURCE_REFUSAL`, in `P.diagnostics/`) and a `NO_PREDICTION` `P.sequence_locus.tsv` (`completion budget_stop_before_first_evaluated_candidate`) |
 | argument or declared-library error | 2 | **refused before the prefix is touched**: every file already there is left as it was |
 | input, model or output error found during the run | 2 | the run already owns the prefix: earlier run-owned outputs are gone and a `FAILED` status (or, after the sequence report was published, `locus_output FAILED: …`) says what happened |
 

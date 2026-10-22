@@ -96,6 +96,15 @@ A dosage-sensitive block ends in one of four states:
 
 ## Outputs
 
+**Layout (M15-L, a breaking change of output paths).**
+- **Beside the prefix:** only the primary sequence reports. These are `<prefix>.sequence_locus.tsv`,
+  `<prefix>.sequence_blocks.tsv` and `<prefix>.sequence_haplotypes.tsv`, plus `<prefix>.sequence_haplotypes.fa` when the v2
+  FASTA rule writes it.
+- **In `<prefix>.diagnostics/`:** every other report, under its usual name `<name>.<suffix>`. The tables below list them
+  by suffix.
+- **The outcome record** (`.sequence_locus.tsv`) is written beside the prefix whenever it is produced.
+- **The internal API** (`GenotypeCommandOptions` without `diagnostics_directory`) keeps the flat layout.
+
 | file | contents |
 |------|----------|
 | `<prefix>.locus_genotype.tsv` | the locus summary, one row: run status, call class, no-call reason, the haplotypes and unordered genotype when called, score and separation, dosage summary, the three headline filters with reasons and per-status counts |

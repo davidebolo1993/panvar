@@ -125,6 +125,7 @@ add_custom_target(panvar_source_provenance
     VERBATIM)
 
 add_library(panvarlib
+    src/genotype_output_layout.cpp
     src/gfa.cpp
     src/gfa_io.cpp
     src/align.cpp

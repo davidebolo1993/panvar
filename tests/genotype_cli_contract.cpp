@@ -448,7 +448,8 @@ void test_help_text() {
                                "assessed once\n                       per locus", "coverage and not_assessed list",
                                "a missing check is not a failure", "not calibrated reliability", "no quality threshold",
                                "superseded\ncompatibility diagnostics", "0 PREDICTION, 3 PROVISIONAL, 1 NO_PREDICTION",
-                               "2 argument, input or output error", "124 time\nlimit", "125 footprint limit", "sampled"}) {
+                               "2 argument, input or output error", "124 time\nlimit", "125 footprint limit", "sampled",
+                               "every other report (status,\nsettings, locus and block tables", "is in <prefix>.diagnostics/"}) {
         require(h.find(needle) != std::string::npos, std::string("--help must say: ") + needle);
     }
     // the headline-filter explanation is gone from the basic help (only named as superseded diagnostics)
@@ -554,7 +555,11 @@ void test_pre_block_no_call() {
                                                           path("pre_library.txt"), "--panel-curation", path("pre_curation.tsv"),
                                                           "--out", path("pre"), "--quiet"});
     require(exit_status == 1, "a pre-block failure must exit 1 (no-call), got " + std::to_string(exit_status));
-    const auto row = locus_row(path("pre.locus_genotype.tsv"));
+    // M15-L: the command's layout -- the locus table is a diagnostic, in pre.diagnostics/, never beside the prefix
+    require(std::filesystem::is_directory(path("pre.diagnostics")) && !std::filesystem::exists(path("pre.locus_genotype.tsv")) &&
+                !std::filesystem::exists(path("pre.mosaic_status.tsv")),
+            "the run's diagnostics are in pre.diagnostics/, not beside the prefix");
+    const auto row = locus_row(path("pre.diagnostics/pre.locus_genotype.tsv"));
     require(row.at("run_status") == "MODEL_INCOMPLETE", "the fixture must fail before the blocks: " + row.at("run_status"));
     require(row.at("call_summary") == "GENOTYPE_NO_CALL;DOSAGE_NO_CALL;PHASE_NO_CALL",
             "a pre-block no-call must read NO_CALL in all three: " + row.at("call_summary"));

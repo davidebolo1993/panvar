@@ -1,3 +1,4 @@
+#include "panvar/genotype_output_layout.hpp"
 #include "panvar/genotype_dosage_integrate.hpp"
 
 #include "panvar/genotype_command.hpp"
@@ -899,7 +900,12 @@ void write_locus_genotype(const PreparedGenotypeModel* model, const std::string&
     v["block_table"] = link(".block_genotypes.tsv");
     v["genotypes_table"] = link(".genotypes.tsv");
     if (d.fasta_policy == "sequence_first_v2") {   // S1-D.1: the sequence report's FASTA is the only prediction FASTA
-        v["main_fasta"] = link(".sequence_haplotypes.fa");
+        // M15-L: the primary FASTA lives beside the prefix; the link is relative to this table (in <P>.diagnostics/ under
+        // the command's layout)
+        const std::string fasta = genotype_output_path(out_prefix, ".sequence_haplotypes.fa");
+        v["main_fasta"] = !exists(fasta) ? std::string("NA")
+                          : genotype_layout_active(out_prefix) ? "../" + base + ".sequence_haplotypes.fa"
+                                                               : base + ".sequence_haplotypes.fa";
         v["original_fasta"] = "NA";
     } else {
         v["main_fasta"] = strict ? link(".mosaic_haplotypes.fa") : "NA";

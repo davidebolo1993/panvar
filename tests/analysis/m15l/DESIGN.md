@@ -6,7 +6,14 @@
 - **Not changed:** no file content (apart from file references, §3), inference, assessment or filter rule.
 - **Not done:** no automatic deletion of diagnostics, no change to archived outputs, no merge, push or release.
 
-**Budget:** 2,400 s for the recorded units.
+**Budget:** 2,400 s, raised to 3,600 s before the harness freeze. The disclosed development, about 1,500 s, was larger
+than usual: rebuilding the 6,000-line e2e test several times; one lost background attempt; e2e reruns that turned out to
+have used a stale test binary, because a helper was defined after its first use and the build failed silently in a
+pipeline; and trial runs. With each example run on two binaries and the full suite, 2,400 s could not admit the suite.
+
+**Also updated (an internal reader):** `scripts/genotype_report/load.py` (the report tool behind
+`plot_genotype_results.py`). It still finds runs by their locus table, now in `P.diagnostics/`, and identifies each run by
+its primary prefix `P` (run_id unchanged).
 
 ## 1. The layout
 

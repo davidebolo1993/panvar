@@ -129,6 +129,7 @@ int run(const std::string& tag, const std::string& reads, const std::string& mod
     o.dosage_mode = mode;
     o.dosage_mode_explicit = true;
     o.dosage_mode_source = "test (internal API)";
+    o.diagnostics_directory = false;   // M15-L: the internal API's flat layout (this test reads the legacy reports by name)
     return panvar::execute_genotype_command(o, nullptr);
 }
 

@@ -1,4 +1,5 @@
 #include "panvar/genotype_sequence_report.hpp"
+#include "panvar/genotype_output_layout.hpp"
 
 #include "panvar/fragment_likelihood.hpp"
 
@@ -533,7 +534,7 @@ void write_sequence_report(const SequenceReport& r, const SequenceLegacy& legacy
                    << '\n';
         }
     }
-    atomic_write(prefix + ".sequence_blocks.tsv", blocks.str());
+    atomic_write(genotype_output_path(prefix, ".sequence_blocks.tsv"), blocks.str());
 
     std::ostringstream iv;
     // hapA/hapB: A is the group's sequence with the smaller SHA-256 (for the representative group: FASTA hap1, labelling
@@ -549,7 +550,7 @@ void write_sequence_report(const SequenceReport& r, const SequenceLegacy& legacy
            << r.block_ids[i.last_block] << '\t' << ids << "\tconservative_enclosing_not_minimal\t" << i.tuples.size()
            << '\t' << tuples << '\t' << i.hap_a_sha256 << '\t' << i.hap_b_sha256 << '\n';
     }
-    atomic_write(prefix + ".representation_intervals.tsv", iv.str());
+    atomic_write(genotype_output_path(prefix, ".representation_intervals.tsv"), iv.str());
 
     std::ostringstream alt;
     alt << "rank\tgroup\tin_decision_set\trepresentative\tscore\tfragment_term\texposure_term\tsequence_pair_prior\t"
@@ -566,7 +567,7 @@ void write_sequence_report(const SequenceReport& r, const SequenceLegacy& legacy
             << digest_hex(a.first) << '\t' << a.first.length << '\t' << digest_hex(a.second) << '\t' << a.second.length
             << '\t' << a.blocks_with_other_genotypes.size() << '\t' << (ids.empty() ? "none" : ids) << '\n';
     }
-    atomic_write(prefix + ".sequence_alternatives.tsv", alt.str());
+    atomic_write(genotype_output_path(prefix, ".sequence_alternatives.tsv"), alt.str());
 
     if (r.schema == "sequence_first_v2") {
         // S1-D: one row per predicted haplotype -- identity, origin, extraction reference, block-path provenance
@@ -597,7 +598,7 @@ void write_sequence_report(const SequenceReport& r, const SequenceLegacy& legacy
                     << (r.prediction == "PROVISIONAL" ? "yes" : "no") << '\n';
             }
         }
-        atomic_write(prefix + ".sequence_haplotypes.tsv", hap.str());
+        atomic_write(genotype_output_path(prefix, ".sequence_haplotypes.tsv"), hap.str());
     }
     std::string fasta;
     if (fasta_decision.first && r.schema == "sequence_first_v2") {
@@ -617,9 +618,9 @@ void write_sequence_report(const SequenceReport& r, const SequenceLegacy& legacy
             fasta += fasta_record(base + "_seq_hap" + std::to_string(h + 1), "sha256=" + *sha[h] + " bp=" +
                                   std::to_string(bases[h]->size()) + " " + origin + " " + header.str(), *bases[h]);
         }
-        atomic_write(prefix + ".sequence_haplotypes.fa", fasta);
+        atomic_write(genotype_output_path(prefix, ".sequence_haplotypes.fa"), fasta);
     } else if (r.schema == "sequence_first_v2") {
-        std::remove((prefix + ".sequence_haplotypes.fa").c_str());   // intentional absence (fasta_reason), not a failure
+        std::remove(genotype_output_path(prefix, ".sequence_haplotypes.fa").c_str());   // intentional absence (fasta_reason), not a failure
     } else if (predicted) {
         const std::string base = basename_of(prefix);
         std::ostringstream header;
@@ -635,14 +636,14 @@ void write_sequence_report(const SequenceReport& r, const SequenceLegacy& legacy
                 fasta_record(base + "_seq_hap2", "sha256=" + r.hap2_sha256 + " bp=" +
                                                      std::to_string(r.hap2_bases.size()) + " " + header.str(),
                              r.hap2_bases);
-        atomic_write(prefix + ".sequence_haplotypes.fa", fasta);
+        atomic_write(genotype_output_path(prefix, ".sequence_haplotypes.fa"), fasta);
     } else {
-        std::remove((prefix + ".sequence_haplotypes.fa").c_str());
+        std::remove(genotype_output_path(prefix, ".sequence_haplotypes.fa").c_str());
     }
     if (r.compound.enabled) {   // M9-J: before the locus commit record, like every content file
-        atomic_write(prefix + ".sequence_compound.tsv", render_compound_annotation(r.compound, r.block_ids));
+        atomic_write(genotype_output_path(prefix, ".sequence_compound.tsv"), render_compound_annotation(r.compound, r.block_ids));
     }
-    atomic_write(prefix + ".sequence_locus.tsv", locus_text);   // only once every required report is complete
+    atomic_write(genotype_output_path(prefix, ".sequence_locus.tsv"), locus_text);   // only once every required report is complete
 }
 
 bool publish_sequence_report(SequenceReport& r, const SequenceLegacy& legacy, const std::string& prefix,
@@ -652,7 +653,7 @@ bool publish_sequence_report(SequenceReport& r, const SequenceLegacy& legacy, co
         return true;
     } catch (const std::exception& error) {
         // Never leave a partial report: remove every owned file of this run, then record the failure (best effort).
-        for (const std::string& suffix : sequence_report_outputs()) std::remove((prefix + suffix).c_str());
+        for (const std::string& suffix : sequence_report_outputs()) std::remove(genotype_output_path(prefix, suffix).c_str());
         SequenceReport failed;
         failed.schema = r.schema;
         failed.publication_failed = true;
@@ -661,14 +662,14 @@ bool publish_sequence_report(SequenceReport& r, const SequenceLegacy& legacy, co
         failed.legacy_phase_support = r.legacy_phase_support;
         r = failed;
         try {
-            atomic_write(prefix + ".sequence_locus.tsv",
+            atomic_write(genotype_output_path(prefix, ".sequence_locus.tsv"),
                          "key\tvalue\nschema_version\t" + failed.schema + "\nprediction\tNO_PREDICTION\nsequence_status\tNA\n"
                          "completion\treport_publication_failed\ncompletion_note\t" + std::string(error.what()) +
                          "\nlegacy_run_status\t" + legacy.run_status + "\nlegacy_call_class\t" + legacy.call_class +
                          "\nlegacy_no_call_reason\t" + legacy.no_call_reason + "\nexit_code\t2\n");
         } catch (const std::exception&) {
-            std::remove((prefix + ".sequence_locus.tsv").c_str());
-            std::remove((prefix + ".sequence_locus.tsv.writing").c_str());
+            std::remove(genotype_output_path(prefix, ".sequence_locus.tsv").c_str());
+            std::remove(genotype_output_path(prefix, ".sequence_locus.tsv.writing").c_str());
         }
         return false;
     }
