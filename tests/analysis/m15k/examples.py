@@ -198,17 +198,28 @@ def payload_equal_but_provenance(new, old, new_commit, old_commit):
     ia, ib = a.find(new_commit.encode()), b.find(old_commit.encode())
     if ia < 0 or ib < 0 or ia != ib:
         return False, f"commit offsets {ia}, {ib}"
-    before_ok = all(a[i] == b[i] for i in range(ia) if not 24 <= i < 56)
     def tree(x, at):
         n = int.from_bytes(x[at:at + 8], "little")
         return x[at + 8:at + 8 + n].decode(errors="replace"), at + 8 + n
     tree_a, end_a = tree(a, ia + len(new_commit))
     tree_b, end_b = tree(b, ib + len(old_commit))
-    return before_ok and a[end_a:] == b[end_b:], (f"source_tree {tree_b!r} -> {tree_a!r}; {len(b)} -> {len(a)} bytes; "
-                                                  f"before the commit identical: {before_ok}")
+    # A2: before the commit, the bytes may differ only in the header digest [24, 56) and in 8-byte length fields that grow by
+    # exactly the tree string's change in length (the payload length and the provenance section's length).
+    delta = len(tree_a) - len(tree_b)
+    diff = [i for i in range(ia) if a[i] != b[i] and not 24 <= i < 56]
+    fields = {p for i in diff for p in range(max(0, i - 7), i + 1)
+              if int.from_bytes(a[p:p + 8], "little") - int.from_bytes(b[p:p + 8], "little") == delta}
+    covered = all(any(p <= i < p + 8 for p in fields) for i in diff)
+    return covered and a[end_a:] == b[end_b:], (f"source_tree {tree_b!r} -> {tree_a!r}; {len(b)} -> {len(a)} bytes; "
+                                                f"{len(diff)} differing header bytes outside the digest, all in length fields "
+                                                f"grown by {delta}: {covered}; after the provenance identical: {a[end_a:] == b[end_b:]}")
 
 
 def ex_index_c4(d):
+    # A2: rebuild first, so the binary is built from the current HEAD (an amendment commit changes only harness files, and the
+    # recorded commit is, correctly, the one actually built)
+    b = subprocess.run(["cmake", "--build", f"{WT}/build", "-j", "4", "--target", "panvar"], capture_output=True, text=True)
+    check(b.returncode == 0, "rebuilt from the current HEAD (no reconfigure)")
     idx_dir = f"{d}/index"
     os.makedirs(idx_dir, exist_ok=True)
     idx = f"{idx_dir}/c4.pvpl"

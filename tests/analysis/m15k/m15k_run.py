@@ -27,7 +27,13 @@ UNITS = [("build", 300), ("contract", 240), ("ex.refined_c4", 150), ("ex.refined
          # own length-prefixed field. The indexed run's status also differs from M15-J's in exactly two rows by design (the
          # index file's SHA-256 and its path); those are allowed and every other row is still compared. 44 of 46 checks had
          # passed (provenance = HEAD, cold = indexed). The unit is rerun; the failure stays recorded.
-         ("a1.ex.index_c4", 200)]
+         ("a1.ex.index_c4", 200),
+         # A2 (declared before the rerun): (1) the binary had last been built at the provenance-rebuild commit, so the index
+         # recorded that commit -- correctly, the source actually built -- while the check compared with the later HEAD; the
+         # unit now rebuilds first. (2) The provenance section grew by 4 bytes ("1" -> "clean"), so the payload length and the
+         # section's length field differ before the commit; those 8-byte fields are allowed when they grow by exactly the tree
+         # string's change. 43 of 45 checks had passed, the indexed run against M15-J's included. Rerun; failures recorded.
+         ("a2.ex.index_c4", 200)]
 
 
 def command(unit, d):
