@@ -23,7 +23,10 @@ UNITS = [("build", 300), ("spec_equivalence", 60), ("ex.replay_saved", 400), ("e
          # A1 (declared before the rerun): the completed-run comparison normalised the prefix name as a bare substring, and
          # the C4 prefix `c4` is a hexadecimal substring of hashes; names are now replaced only as names and the locus
          # table's prefix column is a name. The three completed-run units are rerun (the originals stay recorded).
-         ("a1.ex.complete_c4", 150), ("a1.ex.complete_cyp2d6", 200), ("a1.ex.complete_acot", 300)]
+         ("a1.ex.complete_c4", 150), ("a1.ex.complete_cyp2d6", 200), ("a1.ex.complete_acot", 300),
+         # A2 (declared before the rerun): the A1 units never ran -- the runner passed "ex.complete_*" as the example name
+         # (split at the first dot); the dispatch is fixed and the three units rerun (the A1 failures stay recorded)
+         ("a2.ex.complete_c4", 150), ("a2.ex.complete_cyp2d6", 200), ("a2.ex.complete_acot", 300)]
 
 
 def command(unit, d):
@@ -33,7 +36,7 @@ def command(unit, d):
         return ["ctest", "--test-dir", f"{WT}/build", "-R", "panvar_genotype_assessment$", "--output-on-failure", "-V"]
     if unit == "ctest.full":
         return ["ctest", "--test-dir", f"{WT}/build", "-j", "1", "--timeout", "900", "--output-on-failure"]
-    return [sys.executable, os.path.join(HERE, "examples.py"), unit.split(".", 1)[1], d]
+    return [sys.executable, os.path.join(HERE, "examples.py"), unit.split("ex.", 1)[1], d]   # A2: amendment prefixes
 
 
 R = runner.Runner(OUT, BUDGET, PRE, UNITS, command, lambda u: [] if u == "build" else ["build"],

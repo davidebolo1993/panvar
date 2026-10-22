@@ -60,3 +60,10 @@ asymmetrically.
 **The fix:** names are now replaced only as names: the full path, `<base>_seq` and `<base>.`. The locus table's `prefix`
 column is compared as a name. All three completed-run units are rerun as `a1.ex.complete_*`, because the over-broad
 normalisation could in principle have masked a difference.
+
+## 4. Amendment A2 (declared before the rerun)
+
+**The failure:** the three `a1.ex.complete_*` units never ran their comparison. The runner split the unit name at its
+first dot and passed `ex.complete_*` as the example name (`KeyError`, 0.2 s each).
+
+**The fix:** the dispatch is corrected and the units are rerun as `a2.ex.complete_*`. The A1 failures stay recorded.
