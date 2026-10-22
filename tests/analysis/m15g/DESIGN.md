@@ -67,3 +67,9 @@ normalisation could in principle have masked a difference.
 first dot and passed `ex.complete_*` as the example name (`KeyError`, 0.2 s each).
 
 **The fix:** the dispatch is corrected and the units are rerun as `a2.ex.complete_*`. The A1 failures stay recorded.
+
+## 5. Amendment A3 (declared before the rerun)
+
+**The failure:** A1 missed one call. The locus-table comparison still passed the bare basename as the prefix, so
+`a2.ex.complete_c4` failed that one check (24 of 25). That call now passes the full prefix, and the three units are rerun
+as `a3.ex.complete_*`.

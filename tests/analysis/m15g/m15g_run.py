@@ -26,7 +26,10 @@ UNITS = [("build", 300), ("spec_equivalence", 60), ("ex.replay_saved", 400), ("e
          ("a1.ex.complete_c4", 150), ("a1.ex.complete_cyp2d6", 200), ("a1.ex.complete_acot", 300),
          # A2 (declared before the rerun): the A1 units never ran -- the runner passed "ex.complete_*" as the example name
          # (split at the first dot); the dispatch is fixed and the three units rerun (the A1 failures stay recorded)
-         ("a2.ex.complete_c4", 150), ("a2.ex.complete_cyp2d6", 200), ("a2.ex.complete_acot", 300)]
+         ("a2.ex.complete_c4", 150), ("a2.ex.complete_cyp2d6", 200), ("a2.ex.complete_acot", 300),
+         # A3 (declared before the rerun): A1 left one call (the locus-table comparison) passing the bare basename, so it
+         # still normalised `c4` as a substring of hashes; that call is fixed and the three units rerun once more
+         ("a3.ex.complete_c4", 150), ("a3.ex.complete_cyp2d6", 200), ("a3.ex.complete_acot", 300)]
 
 
 def command(unit, d):

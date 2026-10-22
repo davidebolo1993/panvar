@@ -131,7 +131,7 @@ def complete(cell, d):
         check(a is not None and a == b, f"{cell}: {suffix} pre-existing columns unchanged (old headline columns included)")
     a = without(out + ".locus_genotype.tsv", S.LOCUS_KEYS + ["headline_filters_status", "prefix"])   # A1: prefix is the run's name
     b = without(old + ".locus_genotype.tsv", ["prefix"])
-    check(named(a, os.path.basename(out)) == named(b, os.path.basename(old)), f"{cell}: locus table pre-existing columns unchanged")
+    check(named(a, out) == named(b, old), f"{cell}: locus table pre-existing columns unchanged")   # A3: names as names
     check(E.T(out + ".locus_genotype.tsv")[0].get("headline_filters_status") == "superseded_by_assessment_v1",
           f"{cell}: the old headline fields are labelled superseded")
     so, sn = E.KV(old + ".mosaic_status.tsv"), E.KV(out + ".mosaic_status.tsv")
