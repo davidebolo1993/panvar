@@ -47,3 +47,10 @@ support, prior-dependent, locus-level phase, coverage).
 | `ex.help_text` | both help texts captured (the deliverable) |
 | `ex.preserved_c4` | the no-profile C4 command: every output identical to M15-G's run of the same command, apart from the run's name and timing and resource rows. This covers settings, sequences, scores, assessment and the old headline columns |
 | `ctest.full` | the full enabled suite on the final binary |
+
+## Amendment A1 (declared before the rerun; the failed unit stays recorded)
+
+**The failure:** `ex.preserved_c4` compared nothing. It sliced the output suffix one character too far (`c4block_genotypes.tsv`)
+and stopped on a FileNotFoundError.
+
+**The fix:** the slice is corrected and the unit is rerun as `a1.ex.preserved_c4`.

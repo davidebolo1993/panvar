@@ -33,8 +33,8 @@ def ex_preserved_c4(d):
     out = f"{d}/c4"
     p = subprocess.run(E.cmd("c4", out), capture_output=True, text=True)
     check(p.returncode == 0, "c4: exit 0")
-    new = sorted(f[3:] for f in os.listdir(d) if f.startswith("c4."))
-    old = sorted(f[3:] for f in os.listdir(os.path.dirname(M15G)) if f.startswith("c4."))
+    new = sorted(f[2:] for f in os.listdir(d) if f.startswith("c4."))   # A1: the suffix keeps its leading dot
+    old = sorted(f[2:] for f in os.listdir(os.path.dirname(M15G)) if f.startswith("c4."))
     check(new == old, f"c4: the same output files ({len(new)})")
     volatile = ("seconds", "_bytes", "rss_", "footprint", "elapsed", "threads_peak", "_peak")
     for suffix in new:

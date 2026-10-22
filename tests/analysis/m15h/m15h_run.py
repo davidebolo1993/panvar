@@ -16,7 +16,10 @@ OUT = f"{m11d.R}/m15h_help_20261022"
 # disclosed development (before the freeze): rebuilds of panvar and the contract test, five contract-test runs (<1 s each),
 # help previews and the inventory generation
 BUDGET, PRE = 1800, 90.0
-UNITS = [("build", 300), ("cli_contract", 60), ("ex.help_text", 30), ("ex.preserved_c4", 150), ("ctest.full", 1250)]
+UNITS = [("build", 300), ("cli_contract", 60), ("ex.help_text", 30), ("ex.preserved_c4", 150), ("ctest.full", 1250),
+         # A1 (declared before the rerun): the preservation unit sliced the output suffix one character too far and compared
+         # nothing (FileNotFoundError); the slice is fixed and the unit rerun (the failure stays recorded)
+         ("a1.ex.preserved_c4", 150)]
 
 
 def command(unit, d):
