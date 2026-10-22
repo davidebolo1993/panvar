@@ -189,20 +189,23 @@ def build_record(text):
     return dict(l.split("\t", 1) for l in text.strip().splitlines()[1:] if "\t" in l)
 
 
-def payload_equal_but_provenance(new, old, new_commit, new_tree, old_commit, old_tree):
-    """The index equals `old` apart from the header digest [24, 56) and the two provenance strings (whose lengths may differ):
-    every byte before the commit (outside the digest) and every byte after the tree string identical."""
+def payload_equal_but_provenance(new, old, new_commit, old_commit):
+    """The index equals `old` apart from the header digest [24, 56) and the two provenance strings: every byte before the
+    commit (outside the digest) identical, and every byte after the tree string identical. A1: the tree string is read from
+    its own length-prefixed field (u64 little-endian, the file's string encoding) instead of being assumed; M15-J's build was
+    configured with a dirty tree, so it stores "1"."""
     a, b = open(new, "rb").read(), open(old, "rb").read()
     ia, ib = a.find(new_commit.encode()), b.find(old_commit.encode())
     if ia < 0 or ib < 0 or ia != ib:
         return False, f"commit offsets {ia}, {ib}"
     before_ok = all(a[i] == b[i] for i in range(ia) if not 24 <= i < 56)
-    ta = a.find(new_tree.encode(), ia + len(new_commit))
-    tb = b.find(old_tree.encode(), ib + len(old_commit))
-    if ta < 0 or tb < 0 or ta - ia > 64 or tb - ib > 64:
-        return False, "tree strings not found next to the commit"
-    tail_a, tail_b = a[ta + len(new_tree):], b[tb + len(old_tree):]
-    return before_ok and tail_a == tail_b, f"{len(a)} vs {len(b)} bytes; length prefixes between the strings may differ"
+    def tree(x, at):
+        n = int.from_bytes(x[at:at + 8], "little")
+        return x[at + 8:at + 8 + n].decode(errors="replace"), at + 8 + n
+    tree_a, end_a = tree(a, ia + len(new_commit))
+    tree_b, end_b = tree(b, ib + len(old_commit))
+    return before_ok and a[end_a:] == b[end_b:], (f"source_tree {tree_b!r} -> {tree_a!r}; {len(b)} -> {len(a)} bytes; "
+                                                  f"before the commit identical: {before_ok}")
 
 
 def ex_index_c4(d):
@@ -218,8 +221,8 @@ def ex_index_c4(d):
           f"c4: producer provenance is the source built: {rec.get('producer_source_commit')} {rec.get('producer_source_tree')} "
           f"(HEAD {head})")
     old = f"{M15J}/a1.ex.index_c4/index/c4.pvpl"
-    ok, how = payload_equal_but_provenance(idx, old, rec.get("producer_source_commit", ""), rec.get("producer_source_tree", ""),
-                                           "e1b900df838221bdde8edf85412310bd0fe4ae76", "0")
+    ok, how = payload_equal_but_provenance(idx, old, rec.get("producer_source_commit", ""),
+                                           "e1b900df838221bdde8edf85412310bd0fe4ae76")
     check(ok, f"c4: the index equals M15-J's apart from the provenance strings and the header digest ({how})")
     for k in ("schema_version", "preparation_algorithm_version", "panel_extension_version", "marker_panel_algorithm_version",
               "identity_gfa_sha256", "model_fingerprint"):
@@ -231,8 +234,30 @@ def ex_index_c4(d):
     M15E_X.CHECKS = CHECKS
     M15E_X.check = check
     M15E_X.compare("c4", cold, ind, "c4 cold vs indexed (M15-K)")
-    M15J_X.same_outputs(ind, f"{M15J}/a1.ex.index_c4/c4.index", "c4 indexed vs M15-J indexed")
+    indexed_equals_m15j(ind, f"{M15J}/a1.ex.index_c4/c4.index")
     return 0
+
+
+def indexed_equals_m15j(ind, old):
+    """A1: the indexed run equals M15-J's (the M15-H rule) apart from two status rows that differ by design: the index file's
+    SHA-256 (its provenance strings changed) and the index's own path (another unit directory)."""
+    status = ".mosaic_status.tsv"
+    keep = lambda p: {k: v for k, v in E.KV(p + status).items()
+                      if not any(x in k for x in VOLATILE) and k not in ("prepared_locus_file_sha256", "panel_index")}
+    a, b = keep(ind), keep(old)
+    norm = lambda d, p: {k: v.replace(p, "<RUN>") for k, v in d.items()}
+    check(norm(a, ind) == norm(b, old), "c4 indexed vs M15-J indexed: .mosaic_status.tsv identical apart from timing, resource "
+          "rows, the index file's SHA-256 and its path")
+    nb, ob = os.path.basename(ind), os.path.basename(old)
+    for f in sorted(f[len(nb):] for f in os.listdir(os.path.dirname(ind)) if f.startswith(nb + ".")):
+        if f in (status,) + LOGS:
+            continue
+        x = open(ind + f, errors="replace").read().replace(ind, "<RUN>").replace(nb + "_seq", "<RUN>_seq")
+        y = open(old + f, errors="replace").read().replace(old, "<RUN>").replace(ob + "_seq", "<RUN>_seq")
+        if f in (".library_estimate.tsv", ".library_sensitivity.tsv", ".dosage_status.tsv"):
+            x = "\n".join(l for l in x.splitlines() if not any(v in l.split("\t")[0] for v in VOLATILE))
+            y = "\n".join(l for l in y.splitlines() if not any(v in l.split("\t")[0] for v in VOLATILE))
+        check(x == y, f"c4 indexed vs M15-J indexed: {f} identical")
 
 
 def ex_provenance_rebuild(d):

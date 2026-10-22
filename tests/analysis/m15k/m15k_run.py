@@ -21,7 +21,13 @@ OUT = f"{m11d.R}/m15k_unrefined_v2_20261022"
 BUDGET, PRE = 2400, 300.0
 UNITS = [("build", 300), ("contract", 240), ("ex.refined_c4", 150), ("ex.refined_cyp2d6", 200), ("ex.refined_acot", 300),
          ("ex.unrefined_c4", 200), ("ex.unrefined_cyp2d6", 250), ("ex.unrefined_acot", 300), ("ex.index_c4", 200),
-         ("ex.provenance_rebuild", 200), ("ctest.full", 1300)]
+         ("ex.provenance_rebuild", 200), ("ctest.full", 1300),
+         # A1 (declared before the rerun): ex.index_c4 assumed M15-J's stored tree string was "0"; its build directory was
+         # configured with a dirty tree, so it is "1", and the payload check could not find it. The tree is now read from its
+         # own length-prefixed field. The indexed run's status also differs from M15-J's in exactly two rows by design (the
+         # index file's SHA-256 and its path); those are allowed and every other row is still compared. 44 of 46 checks had
+         # passed (provenance = HEAD, cold = indexed). The unit is rerun; the failure stays recorded.
+         ("a1.ex.index_c4", 200)]
 
 
 def command(unit, d):
