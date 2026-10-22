@@ -71,8 +71,21 @@ its source is written to `<prefix>.settings.tsv`.
 
 **The reporting contract is fixed:** ordinary genotyping reports `sequence_first_v2`, recorded as `output_schema` in
 `.settings.tsv` with its source. No flag or profile selects another contract (`--output-schema` was removed in M15-J; a
-profile may only restate `output_schema sequence_first_v2`, as the evidence profiles do). The one exception is the unrepaired development view (below), which still
-reports `legacy`; whether it should report v2 is an open decision.
+profile may only restate `output_schema sequence_first_v2`, as the evidence profiles do). This holds for unrefined runs
+too (M15-K, below).
+
+**Unrefined runs** (`--adaptive-repair off` or `--repair-rounds 0`) report the same v2 contract. The report comes from the
+**already-scored union pool**: the union candidates, their scores and the union ranking, unchanged and written as before,
+with the same pooled decision the refined route uses. Nothing more is scored or refined.
+- **Tie and phase outcomes follow the v2 rules, not the historical unrefined rules:**
+  - two phasings of one genotype, formerly a block consensus with exit 1, are now a prediction (`GENOTYPE_RESOLVED_SEQUENCE_SET`, exit 0);
+  - a tie that disagrees at a block is `SEQUENCE_TIED` with that block `GENOTYPE_UNRESOLVED`;
+  - one sequence spelled by several labellings is `RESOLVED` with its blocks `LABELS_AMBIGUOUS`;
+  - phase is the pooled decision's.
+- **The representation guard does not run on this route,** so `genotype_check` is `NOT_ASSESSED` there.
+- **The legacy tables** (including the historical block-consensus tables) are still written beside the report.
+- **The historical K-prefix phase audit** (`phase_audit_candidates`) is internal to the legacy contract. A profile may only
+  restate 0.
 
 **`--preset short-read`** is always applied, whether or not it is given. It names no locus and reads no repository file.
 It sets:
@@ -94,7 +107,6 @@ and the preset, and the test suite checks it.
 **When a flag removes a preset feature's requirement,** the preset-sourced feature is switched off instead of refusing the
 run. This happens with `--adaptive-repair off` or `--repair-rounds 0` (the unrepaired development view).
 - `.settings.tsv` records it as `preset … (inactive: <reason>)`.
-- Under the unrepaired view, `output_schema` becomes legacy.
 - The same features set explicitly by a flag or profile keep their refusals.
 
 **`--profile FILE`: optional overrides, never required.** An ordinary run needs no profile: the preset is the complete
@@ -234,7 +246,7 @@ from the parser and the preset):
 | reporting | `block_diagnostics` | — | block_diagnostics | off \| diagnostic_v1 | off | - | reporting | expert profile only |
 | reporting | `emission_lookup_timing` | — | emission_lookup_timing | 0 \| 1 | 0 | - | reporting | expert profile only |
 | legacy | `--max-candidates` | — | — | - | refused | - | - | legacy |
-| legacy | `phase_audit_candidates` | — | phase_audit_candidates | N >= 0 | 0 | candidates | reporting | expert profile only |
+| legacy | `phase_audit_candidates` | — | phase_audit_candidates | 0 | 0 | candidates | reporting | internal |
 | legacy | `--output-schema` | — | — | - | refused | - | - | removed |
 | legacy | `--dosage-mode, --dosage-audit` | — | — | - | refused | - | - | removed |
 | legacy | `--phase-audit-candidates` | — | — | - | refused | - | - | removed |
@@ -282,7 +294,7 @@ these, for example `profile my-limits` + `time_limit_seconds 900`.
 ## 5. Reporting and diagnostics
 
 - **The report contract:** fixed, `sequence_first_v2`, recorded as `output_schema` (§2). The primary view is
-  `assessment_v1` (§7.0). The unrepaired development view still reports with `legacy`.
+  `assessment_v1` (§7.0). Unrefined runs report it too (§2).
 - **The dosage check:** `--dosage-check`, an optional audit of the reported alleles. It reports findings or why it was
   unavailable, and it **never replaces the prediction**. Without it, `dosage_check` is `NOT_REQUESTED`. It is the only
   public dosage control: `--dosage-mode` and `--dosage-audit` were removed, and no profile key enables a dosage repair.
@@ -395,10 +407,11 @@ PROVISIONAL or absent result as a completed one.
 
 **Diagnostic and test settings** (refused or unsupported for production use):
 - `diagnostic_*` keys and `test_*` hooks;
-- the profile key `phase_audit_candidates` (the unrepaired development view only).
+- the historical K-prefix phase audit, `phase_audit_candidates` (internal to the legacy contract; a profile may only
+  restate 0).
 
 **Removed from the command line in M15-J** (each refused by name, with what replaces it; nothing is silently ignored):
-`--output-schema`, `--dosage-mode`, `--dosage-audit`, `--phase-audit-candidates` (the profile key remains),
+`--output-schema`, `--dosage-mode`, `--dosage-audit`, `--phase-audit-candidates` (internal since M15-K),
 `--repair-origin-cache-bytes` and `--repair-tie-seed-cache-bytes` (the profile keys remain), `--dosage-allocation-test` and
 `--library-diagnostic`. `--max-candidates` stays refused. The behaviour behind them (the legacy and `sequence_first_v1`
 contracts, the dosage repair, the dosage allocation test, the library diagnostic) remains reachable only through the
@@ -431,6 +444,13 @@ panvar genotype --graph locus.gfa --reference-path NAME [--panel-curation FILE] 
 - **Outputs:** the index, published atomically, and a build record on stdout. The record gives the schema, preparation,
   panel-extension and marker-panel versions; the identity (graph SHA-256, reference, bubbles, `min_variant_bp`, curation,
   k, s); the model fingerprint; the file size and SHA-256; and the preparation and write times.
+- **Producer provenance** is separate from that identity: `producer_source_commit`, `producer_source_tree` and
+  `producer_build_type`, also stored in the index.
+  - **What it records (M15-K):** the source revision actually built, captured at build time, so a commit after the last CMake
+    configure is still recorded correctly. `producer_source_commit` is a git commit or `unavailable`; `producer_source_tree`
+    is `clean`, `dirty` (tracked files differed from that commit) or `unknown`.
+  - **It is reported, never compared:** whether an index loads depends only on its versions and identity.
+  - **Earlier indexes** (before M15-K) store the commit at which the build was configured, with `0`/`1` for the tree state.
 - **An existing file is never overwritten** (refused, exit 2).
 - **Refused in build mode:** sample arguments (`--reads1/2`, `--library`, `--out`, `--dosage-check`) and `--panel-index`.
 - **Nothing else is written:** no output prefix is cleared, no sample report is created and no cache is left. The one
@@ -502,7 +522,7 @@ The prediction is identical to the archived M11-D accelerated run at all three c
 |---|---|---|
 | omitted vs explicit auto | `--library auto` | identical prediction, library estimate and settings |
 | dosage absent vs `--dosage-check` | the declared-library command without `--dosage-check` | identical prediction; DOSAGE_FILTER NOT_EVALUATED (`dosage_mode_off`) without it; the audit adds only `.dosage*` diagnostics |
-| unrepaired view | `--adaptive-repair off` | runs under the legacy schema; the preset's repair-only features are recorded inactive |
+| unrepaired view | `--adaptive-repair off` | M15-D record: ran under the legacy schema then. Since M15-K it reports v2 from the scored union pool (§2); the preset's repair-only features are recorded inactive |
 | automatic library refusal | 300 read pairs | `LIBRARY_REFUSED`, exit 1, no prediction, no FASTA |
 | binding time limit | a one-key expert profile with `time_limit_seconds 8` (ACOT) | exit 3 PROVISIONAL or 124; never a completed prediction |
 | `--dosage-check` with `--dosage-mode off` / `--dosage-audit off` / the legacy repair | | refused, exit 2, the prefix untouched |

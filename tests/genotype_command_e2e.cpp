@@ -6083,6 +6083,153 @@ void test_post_refinement_guard() {
                  "and a memory stop before publication leave no final output and keep the checkpoint PROVISIONAL\n";
 }
 
+// M15-K fixtures. A tie that disagrees at a block: three templates differ only at one bubble whose three alleles have equal
+// length, and the reads come from the far flanks only, so nothing separates the three heterozygous pairs. Returns the two
+// flank sequences the reads are drawn from.
+std::pair<std::string, std::string> write_split_tie_locus(const std::string& file) {
+    std::mt19937_64 rng(11);
+    const std::string left = random_bases(rng, 900), right = random_bases(rng, 900);
+    const std::string a = random_bases(rng, 120), b = random_bases(rng, 120), c = random_bases(rng, 120);
+    std::ofstream out(path(file));
+    out << "H\tVN:Z:1.0\nS\t1\t" << left << "\nS\t2\t" << a << "\nS\t3\t" << b << "\nS\t4\t" << c << "\nS\t5\t" << right << '\n';
+    for (const char* edge : {"1\t+\t2\t+", "1\t+\t3\t+", "1\t+\t4\t+", "2\t+\t5\t+", "3\t+\t5\t+", "4\t+\t5\t+"}) {
+        out << "L\t" << edge << "\t0M\n";
+    }
+    out << "P\tsampleA#1#chr1:0-100\t1+,2+,5+\t*\nP\tsampleB#1#chr1:0-100\t1+,3+,5+\t*\nP\tsampleC#1#chr1:0-100\t1+,4+,5+\t*\n";
+    return {left, right};
+}
+// One sequence spelled by several labellings: a 60 bp unit U, two bubbles each holding U or nothing, around a shared copy of
+// U. "U in the first bubble" and "U in the second" spell the same sequence with different labels at both blocks. Returns the
+// two-copy haplotype the reads are drawn from.
+std::string write_label_locus(const std::string& file) {
+    std::mt19937_64 rng(12);
+    const std::string left = random_bases(rng, 800), right = random_bases(rng, 800), u = random_bases(rng, 60);
+    std::ofstream out(path(file));
+    out << "H\tVN:Z:1.0\nS\t1\t" << left << "\nS\t2\t" << u << "\nS\t3\t" << u << "\nS\t4\t" << u << "\nS\t5\t" << right << '\n';
+    for (const char* edge : {"1\t+\t2\t+", "1\t+\t3\t+", "2\t+\t3\t+", "3\t+\t4\t+", "3\t+\t5\t+", "4\t+\t5\t+"}) {
+        out << "L\t" << edge << "\t0M\n";
+    }
+    out << "P\tsampleA#1#chr1:0-100\t1+,2+,3+,5+\t*\nP\tsampleB#1#chr1:0-100\t1+,3+,4+,5+\t*\n"
+           "P\tsampleC#1#chr1:0-100\t1+,2+,3+,4+,5+\t*\nP\tsampleD#1#chr1:0-100\t1+,3+,5+\t*\n";
+    return left + u + u + right;
+}
+
+// ---- M15-K: unrefined runs report the v2 contract (tests/analysis/m15k/DESIGN.md section 1) ---------------------------
+// Five unrefined fixtures (0 repair rounds) -- unique; a genotype-equivalent tie (the legacy block consensus); a tie that
+// disagrees at a block; one sequence spelled by several labellings; a prior-only phase -- each run with the internal legacy contract and with sequence_first_v2. The candidates,
+// their objective components and the union ranking (.mosaic_candidates.tsv, .mosaic_scores.tsv) must be identical; the v2
+// report must come from the pooled decision over those scores (its representative score is the best union score, its
+// phase is the status's phase), with the v2 exit status; the legacy arm writes no sequence report.
+void test_unrefined_v2() {
+    namespace fs = std::filesystem;
+    struct Case {
+        std::string name, gfa, r1, r2;
+        std::function<void(panvar::GenotypeCommandOptions&)> configure;
+        std::string legacy_status, prediction, sequence_status, phase;
+    };
+    const std::vector<Case> cases = {
+        {"unique", "tiny_phaseable.gfa", path("phaseable_r1.fq"), path("phaseable_r2.fq"), [](auto&) {}, "COMPLETE",
+         "PREDICTION", "RESOLVED", "READS_WITHIN_CANDIDATES"},
+        // two phasings of one genotype: the legacy block consensus (exit 1) is a v2 prediction of a sequence set
+        {"genotype_tie", "tiny.gfa", path("unphaseable_r1.fq"), path("unphaseable_r2.fq"),
+         [](auto& o) { o.proposal_state_limit = 1048576; o.max_mosaic_candidates = 64; }, "BLOCK_CONSENSUS", "PREDICTION",
+         "GENOTYPE_RESOLVED_SEQUENCE_SET", "UNRESOLVED"},
+        // three heterozygous pairs that disagree at the block: SEQUENCE_TIED, the block GENOTYPE_UNRESOLVED
+        {"split_tie", "uv2_split_tie.gfa", path("uv2_split_r1.fq"), path("uv2_split_r2.fq"),
+         [](auto& o) { o.proposal_state_limit = 1048576; o.max_mosaic_candidates = 64; }, "BLOCK_CONSENSUS", "PREDICTION",
+         "SEQUENCE_TIED", "UNRESOLVED"},
+        // one sequence pair spelled by several labellings: RESOLVED, its blocks REPRESENTATION_AMBIGUOUS
+        {"labels", "uv2_labels.gfa", path("uv2_labels_r1.fq"), path("uv2_labels_r2.fq"),
+         [](auto& o) { o.proposal_state_limit = 1048576; o.max_mosaic_candidates = 64; }, "COMPLETE", "PREDICTION",
+         "RESOLVED", "UNRESOLVED"},
+        // the phase is decided by the prior among fragment contenders: PRIOR_ONLY under both contracts
+        {"prior_only", "tiny_duplicate.gfa", path("duplicate_r1.fq"), path("duplicate_r2.fq"),
+         [](auto& o) { o.proposal_state_limit = 1048576; }, "COMPLETE", "PREDICTION", "RESOLVED", "PRIOR_ONLY"},
+    };
+    {
+        const auto flanks = write_split_tie_locus("uv2_split_tie.gfa");
+        simulate(flanks.first, flanks.second, path("uv2_split_r1.fq"), path("uv2_split_r2.fq"), 77);
+        const std::string two = write_label_locus("uv2_labels.gfa");
+        simulate(two, two, path("uv2_labels_r1.fq"), path("uv2_labels_r2.fq"), 78);
+    }
+    const bool record_only = std::getenv("PANVAR_E2E_RECORD") != nullptr;
+    for (const Case& c : cases) {
+        std::map<std::string, int> exits;
+        for (const std::string arm : {"legacy", "v2"}) {
+            const std::string rel = "uv2_" + c.name + "_" + arm;
+            fs::remove_all(path(rel));
+            fs::create_directories(path(rel));
+            panvar::GenotypeCommandOptions o = tiny_options(rel + "/call", c.r1, c.r2, c.gfa);
+            c.configure(o);
+            require(o.repair_rounds == 0, "fixture: the unrefined route (0 repair rounds)");
+            o.output_schema = arm == "v2" ? "sequence_first_v2" : "legacy";
+            o.setting_sources["output_schema"] = "test";
+            exits[arm] = panvar::execute_genotype_command(o, nullptr);
+        }
+        const std::string L = "uv2_" + c.name + "_legacy/call", V = "uv2_" + c.name + "_v2/call";
+        for (const char* table : {".mosaic_candidates.tsv", ".mosaic_scores.tsv"}) {
+            require(sf::normalised(path(L + table), path("uv2_" + c.name + "_legacy")) ==
+                        sf::normalised(path(V + table), path("uv2_" + c.name + "_v2")),
+                    c.name + ": " + table + " identical between the legacy and v2 contracts (candidates, scores, ranking)");
+        }
+        require(!fs::exists(path(L + ".sequence_locus.tsv")), c.name + ": the internal legacy contract writes no sequence report");
+        const auto st = sf::kv(path(V + ".mosaic_status.tsv"));
+        const auto sl = sf::kv(path(V + ".sequence_locus.tsv"));
+        const auto legacy_status = sf::kv(path(L + ".mosaic_status.tsv"));
+        const std::string pred = sl.count("prediction") ? sl.at("prediction") : "absent";
+        const std::string seq = sl.count("sequence_status") ? sl.at("sequence_status") : "absent";
+        const std::string phase = sl.count("legacy_phase_support") ? sl.at("legacy_phase_support") : "absent";
+        std::cout << "  unrefined v2 " << c.name << ": legacy " << legacy_status.at("status") << " (exit " << exits["legacy"]
+                  << ", phase " << legacy_status.at("phase_support") << ") -> v2 " << pred << " " << seq << " (exit "
+                  << exits["v2"] << ", phase " << phase << ", status phase " << st.at("phase_support") << ")\n";
+        if (record_only) {
+            std::istringstream blocks(slurp(path(V + ".sequence_blocks.tsv")));
+            std::string line;
+            std::getline(blocks, line);
+            while (std::getline(blocks, line)) std::cout << "      " << line.substr(0, 60) << "\n";
+            continue;
+        }
+        require(legacy_status.at("status") == c.legacy_status, c.name + ": legacy status " + legacy_status.at("status"));
+        require(pred == c.prediction && seq == c.sequence_status, c.name + ": v2 " + pred + " " + seq);
+        require(phase == c.phase && st.at("phase_support") == phase,
+                c.name + ": phase follows the pooled decision, in the report and the status (" + phase + ", " +
+                    st.at("phase_support") + ")");
+        require(exits["v2"] == (pred == "PREDICTION" ? 0 : pred == "PROVISIONAL" ? 3 : 1), c.name + ": the v2 exit status");
+        {
+            std::istringstream blocks(slurp(path(V + ".sequence_blocks.tsv")));
+            std::string line, statuses;
+            std::getline(blocks, line);
+            while (std::getline(blocks, line)) {
+                const std::size_t a = line.find('\t'), b = line.find('\t', a + 1);
+                statuses += line.substr(a + 1, b - a - 1) + ",";
+            }
+            if (c.name == "split_tie") {
+                require(statuses.find("GENOTYPE_UNRESOLVED") != std::string::npos, "split_tie: the disagreeing block is "
+                        "GENOTYPE_UNRESOLVED (" + statuses + ")");
+            }
+            if (c.name == "labels") {
+                require(statuses.find("REPRESENTATION_AMBIGUOUS") != std::string::npos, "labels: the relabelled blocks are "
+                        "REPRESENTATION_AMBIGUOUS (" + statuses + ")");
+            }
+        }
+        if (pred == "PREDICTION") {
+            std::istringstream scores(slurp(path(V + ".mosaic_scores.tsv")));
+            std::string header, first;
+            std::getline(scores, header);
+            std::getline(scores, first);
+            double best = std::stod(first.substr(first.find('\t', first.find('\t', first.find('\t') + 1) + 1) + 1));
+            for (std::string row; std::getline(scores, row);) {
+                const std::size_t a = row.find('\t'), b = row.find('\t', a + 1), d = row.find('\t', b + 1);
+                best = std::max(best, std::stod(row.substr(d + 1)));
+            }
+            require(std::abs(std::stod(sl.at("representative_score")) - best) <= 1e-6 * std::max(1.0, std::abs(best)),
+                    c.name + ": the representative's score is the best union score (" + sl.at("representative_score") + ")");
+        }
+    }
+    std::cout << "  unrefined v2: candidates and scores identical across contracts; the v2 report follows the pooled "
+                 "decision (unique, genotype tie, split tie, label-equivalent, prior-only phase)\n";
+}
+
 int main(int argc, char** argv) {
     if (argc < 2) {
         std::cerr << "usage: genotype_command_e2e_test <scratch dir> [source dir]\n";
@@ -6121,6 +6268,33 @@ int main(int argc, char** argv) {
             return 0;
         } catch (const std::exception& error) {
             std::cerr << "genotype command e2e (blocked_union only): FAIL: " << error.what() << '\n';
+            return 1;
+        }
+    }
+    // M15-K: a focused run of the unrefined-v2 gate (its fixtures written here exactly as the full run writes them)
+    if (const char* only = std::getenv("PANVAR_E2E_ONLY"); only != nullptr && std::string(only) == "unrefined_v2") {
+        try {
+            std::filesystem::create_directories(dir);
+            write_library(path("lib.txt"));
+            {
+                const TinyLocus locus = write_tiny_locus("tiny_phaseable.gfa", 80, 70);
+                const auto truths = spell_truths(locus);
+                simulate(truths.first, truths.second, path("phaseable_r1.fq"), path("phaseable_r2.fq"), 123);
+            }
+            {
+                const TinyLocus locus = write_tiny_locus();
+                const auto truths = spell_truths(locus);
+                simulate(truths.first, truths.second, path("unphaseable_r1.fq"), path("unphaseable_r2.fq"), 123);
+            }
+            {
+                const TinyLocus locus = write_tiny_locus("tiny_duplicate.gfa", 350, 340, true);
+                simulate(locus.haplotypes[0], locus.haplotypes[1], path("duplicate_r1.fq"), path("duplicate_r2.fq"), 321);
+            }
+            test_unrefined_v2();
+            std::cout << "genotype command e2e (unrefined_v2 only): PASS\n";
+            return 0;
+        } catch (const std::exception& error) {
+            std::cerr << "genotype command e2e (unrefined_v2 only): FAIL: " << error.what() << '\n';
             return 1;
         }
     }
@@ -6202,6 +6376,7 @@ int main(int argc, char** argv) {
         test_sequence_first_lifecycle();
         test_sequence_first_v2();
         test_sequence_first_v2_contract();
+        test_unrefined_v2();   // M15-K
         test_early_incumbent();
         test_early_incumbent_caps();
         test_termination_consistency();   // M15-D.1

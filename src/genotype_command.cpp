@@ -492,6 +492,7 @@ void annotate_v2(SequenceReport& report, const PreparedGenotypeModel& model, con
 }
 SequenceLegacy g_sequence_legacy;
 bool g_sequence_published = false;   // S1-C: the report was published (or its failure recorded) for this run
+bool g_unrefined_v2 = false;   // M15-K: this run's v2 report came from the unrefined route's union pool
 std::vector<unsigned char> g_junction_block_flags;   // M11-C: this run's per-block JP1.1 eligibility (empty: not evaluated)
 std::uint64_t g_union_end_footprint = 0;   // I2-K (measurement): physical footprint right after the union pass
 // I3-A: what the status says about a prepared locus this run used (reset at every run start).
@@ -2762,6 +2763,12 @@ void apply_genotype_profile(const std::string& path, GenotypeCommandOptions& opt
             throw std::runtime_error("profile " + path + ": 'output_schema' cannot select a reporting contract: genotyping "
                                      "reports sequence_first_v2 (a profile may only restate that value)");
         }
+        // M15-K: the K-prefix phase audit is internal (legacy contract only); a profile may only restate 0, as the historical
+        // C4 profiles do.
+        if (key == "phase_audit_candidates" && value != "0") {
+            throw std::runtime_error("profile " + path + ": 'phase_audit_candidates' is internal: a profile may only restate 0 "
+                                     "(unrefined runs take phase from the v2 pooled decision)");
+        }
         if (key == "dosage_mode" || key == "dosage_audit" || key == "dosage_check") {
             throw std::runtime_error("profile " + path + ": '" + key + "' is not a profile setting: dosage is an audit only, "
                                      "requested with --dosage-check, and never replaces the prediction");
@@ -3220,6 +3227,7 @@ GenotypeRunStatus run_genotype_body(const GenotypeCommandOptions& options, Genot
     if (options.output_schema == "sequence_first_v2") g_sequence_report.schema = "sequence_first_v2";   // S1-D
     g_sequence_legacy = SequenceLegacy{};
     g_sequence_published = false;
+    g_unrefined_v2 = false;
     g_junction_block_flags.clear();   // M11-C: never a previous run's flags
     reset_prepared_library_terms_tally();         // I2-F: likewise
     g_union_end_footprint = 0;
@@ -3274,6 +3282,17 @@ GenotypeRunStatus run_genotype_body(const GenotypeCommandOptions& options, Genot
             throw std::runtime_error("the repair search runs with phase audit 0; the pooled rerank replaces it");
         }
         if (options.repair_local_pairs < 1) throw std::runtime_error("repair_local_pairs must be at least 1");
+    }
+    // M15-K: the unrefined route reports v2 from the union pool's decision, phase included. The K-prefix phase audit and
+    // development prefix ladders belong to the internal legacy contract and are refused beside v2 rather than mixed in.
+    if (options.repair_rounds == 0 && options.output_schema == "sequence_first_v2") {
+        if (options.phase_audit_candidates != 0) {
+            throw std::runtime_error("phase_audit_candidates needs the internal legacy contract: under sequence_first_v2 the "
+                                     "unrefined route takes phase from the pooled decision");
+        }
+        if (!options.development_candidate_prefixes.empty()) {
+            throw std::runtime_error("development candidate prefixes need the internal legacy contract (not sequence_first_v2)");
+        }
     }
 
     // Provenance by content, recorded in every status this run writes. An input that cannot be read is
@@ -7884,6 +7903,52 @@ GenotypeRunStatus run_genotype_body(const GenotypeCommandOptions& options, Genot
                                                           same_blocks, summary.phase_audit_phase_support);
         }
 
+        // ---- M15-K: the unrefined route reports the v2 contract (tests/analysis/m15k/DESIGN.md section 1). The report is
+        // built from the ALREADY-SCORED union pool -- the candidates of the ranking used above, converted exactly as the
+        // refined route seeds its pool -- by the same pooled decision. Nothing is scored, searched or refined here; the
+        // candidates, their scores and the union ranking written below are unchanged. Ties and phase follow the v2 rules:
+        // the status's phase support (read by the assessment) is the pooled decision's, set before any table is written.
+        if (options.output_schema == "sequence_first_v2") {
+            std::vector<SequenceDigest> digest(interned.sequences.size());
+            for (std::size_t h = 0; h < interned.sequences.size(); ++h) digest[h] = sequence_digest(interned.sequences[h]);
+            std::vector<PoolCandidate> pooled;
+            pooled.reserve(candidates.size());
+            std::set<DiplotypeIdentity> seen;
+            for (std::size_t i = 0; i < candidates.size(); ++i) {
+                const MosaicCandidate& c = candidates[i];
+                if (!seen.insert(diplotype_identity(c.diplotype.first.alleles, c.diplotype.second.alleles)).second) continue;
+                const std::size_t x = interned.index_of[slot_of_path.at(c.diplotype.first.alleles)];
+                const std::size_t y = interned.index_of[slot_of_path.at(c.diplotype.second.alleles)];
+                const auto key = sequence_pair(c);
+                PoolCandidate pc;
+                pc.first = c.diplotype.first.alleles;
+                pc.second = c.diplotype.second.alleles;
+                pc.first_sequence = digest[x];
+                pc.second_sequence = digest[y];
+                pc.score = scored.scores[scored_index.at(key)];
+                pc.sequence_prior = haploid_sequence_prior[key.first] + haploid_sequence_prior[key.second] +
+                                    (key.first != key.second ? std::log(2.0) : 0.0);
+                pc.path_prior = path_prior[i];
+                pooled.push_back(std::move(pc));
+            }
+            const PooledDecision decided = decide_pooled_genotype(std::move(pooled), model.blocks().size(), fragments.size(),
+                                                                  scoring_options.mismatch_band);
+            g_unrefined_v2 = true;
+            if (decided.score_mismatches == 0) {
+                std::vector<std::string> block_ids;
+                for (const auto& block : model.blocks()) block_ids.push_back(block.block_id);
+                g_sequence_report = build_sequence_report(decided, block_ids, [&](const std::vector<std::size_t>& labels) {
+                    return spell_mosaic(model, MosaicPath{labels}).bases;
+                });
+                annotate_v2(g_sequence_report, model, fingerprint);
+                compound_pooled(g_sequence_report, decided, model, fingerprint, options);
+                summary.phase_support = decided.phase_support;
+                summary.phase_support_within_candidates = decided.phase_support;
+            } else {
+                g_sequence_legacy.no_call_reason = "sequence_score_mismatch";   // NO_PREDICTION, said rather than hidden
+            }
+        }
+
         // ---- outputs --------------------------------------------------------------------------------
         {
             std::ofstream out = open_output(options.out_prefix + ".mosaic_candidates.tsv");
@@ -8328,7 +8393,7 @@ const OptionEntry kOptionEntries[] = {
      "the INITIAL off-panel mosaics added to every panel diplotype in the union ranking; it does not cap the mosaics the refinement generates later", ""},
     {"search", "--proposal-state-limit N", "", "proposal_state_limit", "N >= 1", "beam states", "inference", "supported", "the mosaic proposal beam width", ""},
     {"search", "--adaptive-repair on|off", "", "", "on | off", "-", "inference", "supported",
-     "BOUNDED coordinate refinement: local moves scored exactly within declared caps; not a globally exhaustive search. off is the unrepaired development view (legacy report)", "on"},
+     "BOUNDED coordinate refinement: local moves scored exactly within declared caps; not a globally exhaustive search. off is the unrefined development view: the already-scored union pool, reported with the v2 contract (its tie and phase outcomes follow the v2 rules, not the historical unrefined rules; no representation guard)", "on"},
     {"search", "--repair-rounds N", "", "repair_rounds", "N >= 0", "rounds", "inference+completion", "supported",
      "the refinement's round cap; 0 is the unrepaired view; resolved with --adaptive-repair and --repair-tie-branching, an explicit contradiction refused", ""},
     {"search", "--repair-local-pairs N", "", "repair_local_pairs", "N >= 1", "allele pairs per block", "inference", "supported", "allele pairs per block in one refinement neighbourhood", ""},
@@ -8383,7 +8448,7 @@ const OptionEntry kOptionEntries[] = {
     {"resources", "adaptive_emission_handoff", "", "adaptive_emission_handoff", "0 | 1", "-", "computation", "expert profile only", "union-to-adaptive emission handoff (not in the tested configuration)", ""},
     // 5. reporting and diagnostics
     {"reporting", "reporting contract (output_schema)", "", "output_schema", "sequence_first_v2", "-", "reporting", "fixed",
-     "the reporting contract, recorded as output_schema in .settings.tsv; not a flag; a profile may only restate sequence_first_v2 (the evidence profiles do). The unrepaired development view (--adaptive-repair off) still reports legacy, recorded with source '(inactive: ...)'", ""},
+     "the reporting contract, recorded as output_schema in .settings.tsv, for refined and unrefined runs alike; not a flag; a profile may only restate sequence_first_v2 (the evidence profiles do)", ""},
     {"reporting", "--representation-guard on|off", "", "representation_guard", "on | off", "-", "reporting", "supported", "the representation-conflict check (feeds genotype_check CONFLICT)", ""},
     {"reporting", "compound_annotation", "", "compound_annotation", "off | contract_v2", "-", "reporting", "expert profile only", "the compound annotation (.sequence_compound.tsv); needs sequence_first_v2", ""},
     {"reporting", "compound_interval_declarations", "", "compound_interval_declarations", "a file", "-", "reporting", "expert profile only", "model-bound compound interval declarations (not in the tested configuration)", ""},
@@ -8394,11 +8459,11 @@ const OptionEntry kOptionEntries[] = {
     {"reporting", "emission_lookup_timing", "", "emission_lookup_timing", "0 | 1", "-", "reporting", "expert profile only", "measurement only (not for production calls)", ""},
     // 6. legacy and development compatibility
     {"legacy", "--max-candidates", "", "", "-", "-", "-", "legacy", "removed: refused with a pointer to --mosaic-candidates (every panel diplotype is always a candidate)", "refused"},
-    {"legacy", "phase_audit_candidates", "", "phase_audit_candidates", "N >= 0", "candidates", "reporting", "expert profile only",
-     "the phase audit set of the unrepaired development view; refused under adaptive repair", ""},
-    {"legacy", "--output-schema", "", "", "-", "-", "-", "removed", "removed: genotyping reports the sequence-first v2 contract, recorded as output_schema in .settings.tsv (the unrepaired development view, --adaptive-repair off, still reports legacy, recorded the same way); historical contracts are not selectable", "refused"},
+    {"legacy", "phase_audit_candidates", "", "phase_audit_candidates", "0", "candidates", "reporting", "internal",
+     "the historical K-prefix phase audit of the unrefined view: internal to the legacy contract; a profile may only restate 0. Unrefined runs take phase from the v2 pooled decision", ""},
+    {"legacy", "--output-schema", "", "", "-", "-", "-", "removed", "removed: genotyping reports the sequence-first v2 contract, recorded as output_schema in .settings.tsv (unrefined runs too); historical contracts are not selectable", "refused"},
     {"legacy", "--dosage-mode, --dosage-audit", "", "", "-", "-", "-", "removed", "removed: dosage is an audit only (--dosage-check) and never replaces the prediction", "refused"},
-    {"legacy", "--phase-audit-candidates", "", "", "-", "-", "-", "removed", "removed from the command line: the profile key phase_audit_candidates remains for the unrepaired development view", "refused"},
+    {"legacy", "--phase-audit-candidates", "", "", "-", "-", "-", "removed", "removed: the K-prefix phase audit is internal (a profile may only restate phase_audit_candidates 0)", "refused"},
     {"legacy", "--repair-origin-cache-bytes, --repair-tie-seed-cache-bytes", "", "", "-", "-", "-", "removed", "removed from the command line: the profile keys repair_origin_cache_bytes and repair_tie_seed_cache_bytes remain", "refused"},
     {"legacy", "--dosage-allocation-test, --library-diagnostic", "", "", "-", "-", "-", "removed", "removed: development diagnostics, not available from the command line", "refused"},
     {"legacy", "diagnostic_* and test_* profile keys", "", "", "-", "-", "-", "development",
@@ -8539,8 +8604,8 @@ const std::map<std::string, std::string>& removed_genotype_options() {
                           "--dosage-check to audit the reported alleles"},
         {"--dosage-audit", "--dosage-audit was removed: dosage is an audit only and never replaces the prediction; use "
                            "--dosage-check to audit the reported alleles"},
-        {"--phase-audit-candidates", "--phase-audit-candidates was removed from the command line: set the profile key "
-                                     "phase_audit_candidates (unrepaired development view only)"},
+        {"--phase-audit-candidates", "--phase-audit-candidates was removed: the K-prefix phase audit is internal; unrefined "
+                                     "runs take phase from the v2 pooled decision"},
         {"--repair-origin-cache-bytes", "--repair-origin-cache-bytes was removed from the command line: set the profile key "
                                         "repair_origin_cache_bytes"},
         {"--repair-tie-seed-cache-bytes", "--repair-tie-seed-cache-bytes was removed from the command line: set the profile "
@@ -8692,9 +8757,8 @@ std::optional<int> parse_genotype_arguments(const std::vector<std::string>& args
                 "older headline fields (genotype_filter, dosage_filter, phase_filter, call_summary) are kept as superseded\n"
                 "compatibility diagnostics.\n\n"
                 "Exit status: 0 PREDICTION, 3 PROVISIONAL, 1 NO_PREDICTION; 2 argument, input or output error; 124 time\n"
-                "limit, 125 footprint limit (the 6 GiB footprint guard is sampled, not an allocation ceiling). The\n"
-                "unrepaired development view (see --help-advanced) still reports the legacy contract: 0 a genotype was\n"
-                "emitted, 1 no-call. Full guide: docs/guides/genotype_short_read.md.\n";
+                "limit, 125 footprint limit (the 6 GiB footprint guard is sampled, not an allocation ceiling). Full guide:\n"
+                "docs/guides/genotype_short_read.md.\n";
             return 0;
         }
         else if (flag == "--help-advanced") {
@@ -8751,9 +8815,6 @@ std::optional<int> parse_genotype_arguments(const std::vector<std::string>& args
             const std::string source = options.setting_sources[key];
             apply_genotype_setting(source + " (inactive: " + why + ")", key, value, options);
         };
-        if (options.repair_rounds == 0 && from_preset("output_schema") && options.output_schema != "legacy") {
-            deactivate("output_schema", "legacy", "the unrepaired view has no pooled decision to report");
-        }
         if (from_preset("early_incumbent") && options.early_incumbent != "off") {
             if (const auto why = early_incumbent_refusal(options)) deactivate("early_incumbent", "off", *why);
         }
@@ -8780,7 +8841,8 @@ std::optional<int> parse_genotype_arguments(const std::vector<std::string>& args
     }
     // S1-B: sequence_first_v1 reports the adaptive repair's pooled decision; every other route is refused explicitly.
     if (sequence_first(options)) {
-        if (options.repair_rounds == 0) {
+        // M15-K: sequence_first_v2 reports the unrefined route from its union pool; v1 (internal) still needs the repair.
+        if (options.repair_rounds == 0 && options.output_schema != "sequence_first_v2") {
             throw std::runtime_error("output_schema " + options.output_schema + " needs the adaptive repair (repair rounds > 0); the "
                                      "unrepaired view has no pooled decision to report");
         }
@@ -8956,6 +9018,17 @@ int execute_genotype_command(const GenotypeCommandOptions& requested, const Prep
         // publishes here; a watchdog stop never reaches here (no prediction, and its owned reports were removed).
         SequenceLegacy legacy = g_sequence_legacy;
         if (legacy.run_status == "NA") legacy.run_status = genotype_run_status_name(status);
+        if (g_unrefined_v2 && legacy.call_class == "NA") {
+            // M15-K: the unrefined route's legacy classification, from its own status, as the refined route records its own
+            legacy.call_class = status == GenotypeRunStatus::Complete                        ? "strict_call"
+                                : status == GenotypeRunStatus::ConditionalGenotypeEquivalent ? "genotype_equivalent_call"
+                                                                                             : "no_call";
+            if (legacy.no_call_reason == "NA") {
+                std::string reason = genotype_run_status_name(status);
+                for (char& ch : reason) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+                legacy.no_call_reason = called ? "none" : reason;
+            }
+        }
         legacy.dosage_mode = options.dosage_mode;
         legacy.dosage_mode_source = dosage_mode_source(options);
         // A legacy call without a sequence report would be a route this schema does not cover: said, never hidden.
@@ -9172,7 +9245,12 @@ int build_panel_index(const GenotypeCommandOptions& requested) {
                   << "\nidentity_kmer_size\t" << key.kmer_size << "\nidentity_syncmer_s\t" << key.syncmer_s
                   << "\nmodel_fingerprint\t" << prepared.record.model_fingerprint << "\nfile_bytes\t" << bytes.size()
                   << "\nfile_sha256\t" << sha256_bytes(bytes) << "\nprepare_seconds\t" << prepare_seconds << "\nwrite_seconds\t"
-                  << write_seconds << "\ncontents\tsample-independent preparation only: structural model and marker panel\n";
+                  << write_seconds
+                  // M15-K: producer provenance (who wrote the index; reported, never compared on load), apart from the
+                  // compatibility identity above
+                  << "\nproducer_source_commit\t" << prepared.record.provenance.source_commit << "\nproducer_source_tree\t"
+                  << prepared.record.provenance.source_tree << "\nproducer_build_type\t" << prepared.record.provenance.build_type
+                  << "\ncontents\tsample-independent preparation only: structural model and marker panel\n";
         return 0;
     } catch (const PreparedLocusFormatError& error) {
         std::cerr << "[genotype] --build-panel-index " << path << " refused (" << prepared_locus_error_name(error.kind())

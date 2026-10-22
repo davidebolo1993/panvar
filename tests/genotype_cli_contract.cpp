@@ -128,7 +128,7 @@ Outcome parse(const std::vector<std::string>& args, panvar::GenotypeCommandOptio
 }
 
 // M15-J: one public reporting contract. The preset's sequence_first_v2 is recorded with its source; no flag or profile
-// selects another; the unrepaired development view keeps its legacy report, recorded inactive (a reported dependency,
+// selects another; M15-K: the unrefined view reports v2 too (from its already-scored union pool) (formerly a reported dependency,
 // unchanged in M15-J). The internal API keeps every contract for regression tests.
 void test_output_schema() {
     panvar::GenotypeCommandOptions kept;
@@ -156,13 +156,11 @@ void test_output_schema() {
     }
     for (const std::vector<std::string>& unrepaired :
          {std::vector<std::string>{"--adaptive-repair", "off"}, std::vector<std::string>{"--repair-rounds", "0"}}) {
-        require(parse(unrepaired, &kept).error.empty() && kept.output_schema == "legacy" &&
-                    kept.setting_sources.at("output_schema").find("(inactive: the unrepaired view has no pooled decision") !=
-                        std::string::npos,
-                "the unrepaired view keeps its legacy report, recorded inactive with the reason (dependency, unchanged)");
+        require(parse(unrepaired, &kept).error.empty() && kept.output_schema == "sequence_first_v2" &&
+                    kept.setting_sources.at("output_schema") == "preset short-read (default)",
+                "M15-K: the unrefined view reports the v2 contract too, recorded from the preset (no inactive marker)");
     }
-    std::cout << "  reporting contract: preset v2, recorded; no flag or profile selects another; the unrepaired view's "
-                 "legacy report recorded inactive\n";
+    std::cout << "  reporting contract: preset v2 for refined and unrefined runs, recorded; no flag or profile selects another\n";
 }
 
 // M15-D: the accelerated configuration is the preset's, recorded per key; preset features whose requirements a flag
@@ -198,10 +196,13 @@ void test_preset_configuration() {
             "a profile's numeric cap overrides the preset");
     for (const std::vector<std::string>& unrepaired :
          {std::vector<std::string>{"--adaptive-repair", "off"}, std::vector<std::string>{"--repair-rounds", "0"}}) {
-        require(parse(unrepaired, &kept).error.empty() && kept.output_schema == "legacy" && kept.early_incumbent == "off" &&
-                    kept.compound_annotation == "off" && kept.repair_junction_proposals == "off",
-                "the unrepaired view switches the preset's repair-only features off instead of refusing");
-        for (const char* key : {"output_schema", "early_incumbent", "compound_annotation", "repair_junction_proposals"}) {
+        require(parse(unrepaired, &kept).error.empty() && kept.output_schema == "sequence_first_v2" && kept.early_incumbent == "off" &&
+                    kept.compound_annotation == "contract_v2" && kept.repair_junction_proposals == "off",
+                "the unrepaired view switches the preset's repair-only features off instead of refusing; v2 and its compound "
+                "annotation stay on (M15-K)");
+        require(kept.setting_sources.at("compound_annotation") == "preset short-read (default)",
+                "the compound annotation is not marked inactive in the unrefined view");
+        for (const char* key : {"early_incumbent", "repair_junction_proposals"}) {
             require(kept.setting_sources.at(key).find("(inactive: ") != std::string::npos,
                     std::string("the switched-off preset key is recorded inactive with its reason: ") + key);
         }
@@ -359,7 +360,7 @@ void test_removed_options() {
         {{"--output-schema", "legacy"}, "--output-schema was removed"},
         {{"--dosage-mode", "audit"}, "--dosage-mode was removed"},
         {{"--dosage-audit", "shadow"}, "--dosage-audit was removed"},
-        {{"--phase-audit-candidates", "8"}, "set the profile key phase_audit_candidates"},
+        {{"--phase-audit-candidates", "8"}, "--phase-audit-candidates was removed: the K-prefix phase audit is internal"},
         {{"--repair-origin-cache-bytes", "123"}, "set the profile key repair_origin_cache_bytes"},
         {{"--repair-tie-seed-cache-bytes", "456"}, "set the profile key repair_tie_seed_cache_bytes"},
         {{"--dosage-allocation-test"}, "--dosage-allocation-test was removed"},
@@ -384,9 +385,19 @@ void test_removed_options() {
     write(path("bad_cache.tsv"), "profile\tbad\nrepair_origin_cache_bytes\t12x\n");
     require(!parse({"--profile", path("bad_cache.tsv")}).error.empty(), "a malformed byte count must be refused");
     write(path("phase_profile.tsv"), "profile\tphase\nphase_audit_candidates\t8\n");
+    require(parse({"--profile", path("phase_profile.tsv"), "--adaptive-repair", "off"}).error.find(
+                "'phase_audit_candidates' is internal: a profile may only restate 0") != std::string::npos,
+            "M15-K: a positive phase audit is refused in a profile (internal to the legacy contract)");
+    write(path("phase_profile.tsv"), "profile\tphase\nphase_audit_candidates\t0\n");
     require(parse({"--profile", path("phase_profile.tsv"), "--adaptive-repair", "off"}, &options).error.empty() &&
-                options.phase_audit_candidates == 8,
-            "phase_audit_candidates remains a profile key (unrepaired development view)");
+                options.phase_audit_candidates == 0,
+            "a profile may restate phase_audit_candidates 0 (the historical C4 profiles do)");
+    for (const char* historical : {"genotype_c4.tsv", "genotype_c4_v6_campaign_local.tsv"}) {
+        if (source_dir_for_profiles.empty()) break;
+        require(parse({"--profile", source_dir_for_profiles + "/profiles/" + historical}).error.find("phase_audit_candidates") ==
+                    std::string::npos,
+                std::string("a historical profile restating phase_audit_candidates 0 is not refused for it: ") + historical);
+    }
     write(path("plain_profile.tsv"), "profile\tplain\n");
     require(parse({"--profile", path("plain_profile.tsv"), "--profile", path("plain_profile.tsv")}).error.find(
                 "--profile was given 2 times") != std::string::npos,
@@ -404,7 +415,7 @@ void test_removed_options() {
                 options.syncmer_s == 11 && options.setting_sources.at("kmer_size") == "flag --kmer-size",
             "precedence: a flag overrides the profile, which overrides the preset, whatever the order");
     std::cout << "  removed options: " << removed.size() << " refused by name (before --help); cache budgets and "
-                 "phase_audit_candidates remain profile keys; one profile per run\n";
+                 "phase_audit_candidates is internal (restating 0 only); one profile per run\n";
 }
 
 void test_help_text() {
@@ -436,9 +447,8 @@ void test_help_text() {
                                "conditional on the explored candidates", "prior-dependent does not mean the prior alone chose the call",
                                "assessed once\n                       per locus", "coverage and not_assessed list",
                                "a missing check is not a failure", "not calibrated reliability", "no quality threshold",
-                               "superseded\ncompatibility diagnostics", "0 PREDICTION, 3 PROVISIONAL, 1 NO_PREDICTION", "0 a genotype was\nemitted",
-                               "1 no-call", "2 argument, input or output error", "124 time\nlimit", "125 footprint limit", "sampled",
-                               "unrepaired development view (see --help-advanced) still reports the legacy contract"}) {
+                               "superseded\ncompatibility diagnostics", "0 PREDICTION, 3 PROVISIONAL, 1 NO_PREDICTION",
+                               "2 argument, input or output error", "124 time\nlimit", "125 footprint limit", "sampled"}) {
         require(h.find(needle) != std::string::npos, std::string("--help must say: ") + needle);
     }
     // the headline-filter explanation is gone from the basic help (only named as superseded diagnostics)
@@ -463,7 +473,8 @@ void test_help_text() {
                                "default: model (the model-derived bound) (built-in 670)", "expert profile only",
                                "changes: completion", "changes: computation", "changes: inference", "changes: reporting",
                                "per-mate edit budget", "substitutions + gap bases", "cannot be supplied", "some path spans at least N bp",
-                               "SAMPLED every 100 ms", "refused under adaptive repair",
+                               "SAMPLED every 100 ms", "internal to the legacy contract; a profile may only restate 0",
+                               "reported with the v2 contract (its tie and phase outcomes follow the v2 rules",
                                "Profiles (--profile FILE): optional overrides, never required", "a repeated --profile is refused",
                                "literal key<TAB>value", "'profile<TAB>NAME' is required", "profile<TAB>my_overrides",
                                "footprint_limit_bytes<TAB>4294967296", "A flag given beside the profile overrides it",

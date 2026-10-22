@@ -259,7 +259,7 @@ void test_versions_and_provenance(const Fixture& f) {
     // a different (compatible) build: accepted; its provenance is reported and preserved by a rewrite
     panvar::PreparedLocusRecord other = f.prepared.record;
     other.provenance.compiler = "some other compiler 0.0";
-    other.provenance.configure_commit = "0000000000000000000000000000000000000000";
+    other.provenance.source_commit = "0000000000000000000000000000000000000000";
     const std::string other_bytes = panvar::encode_prepared_locus(other);
     const auto loaded = load_bytes(other_bytes, "prov.pvpl");
     require(loaded->stored_provenance().find("some other compiler 0.0") != std::string::npos, "the stored provenance is reported");

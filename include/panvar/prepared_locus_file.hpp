@@ -38,10 +38,14 @@ inline constexpr std::uint32_t kPreparationAlgorithmVersion = 1;
 inline constexpr std::uint32_t kPanelExtensionVersion = 1;
 inline constexpr std::uint32_t kMarkerPanelAlgorithmVersion = 1;
 
+// Producer provenance (M15-K): who wrote an index -- the writer, the source revision actually built (source_commit: a git
+// commit or "unavailable"), whether its tracked files matched that commit (source_tree: clean | dirty | unknown), the
+// compiler and the build type. Reported, never compared when an index is loaded: compatibility is the identity and the
+// versions, checked separately.
 struct PreparedLocusProvenance {
-    std::string writer, configure_commit, configure_dirty, compiler, build_type;
+    std::string writer, source_commit, source_tree, compiler, build_type;
     bool operator==(const PreparedLocusProvenance& o) const {
-        return writer == o.writer && configure_commit == o.configure_commit && configure_dirty == o.configure_dirty &&
+        return writer == o.writer && source_commit == o.source_commit && source_tree == o.source_tree &&
                compiler == o.compiler && build_type == o.build_type;
     }
 };

@@ -113,22 +113,16 @@ if(NOT EXISTS ${EIGEN_DIR}/Eigen/Dense)
         "Run: git submodule update --init --recursive")
 endif()
 
-# I3-C: the persistent prepared-locus index records the git state when CMake configured the build (provenance only,
-# labelled configure-time because it can be stale relative to the sources compiled; never used for compatibility).
-execute_process(COMMAND git rev-parse HEAD WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
-                OUTPUT_VARIABLE PANVAR_CONFIGURE_COMMIT OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
-execute_process(COMMAND git status --porcelain --untracked-files=no WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
-                OUTPUT_VARIABLE PANVAR_CONFIGURE_STATUS OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
-if(NOT PANVAR_CONFIGURE_COMMIT)
-    set(PANVAR_CONFIGURE_COMMIT "unknown")
-endif()
-if(PANVAR_CONFIGURE_STATUS)
-    set(PANVAR_CONFIGURE_DIRTY "1")
-else()
-    set(PANVAR_CONFIGURE_DIRTY "0")
-endif()
-set_source_files_properties(src/prepared_locus_file.cpp PROPERTIES COMPILE_DEFINITIONS
-    "PANVAR_CONFIGURE_COMMIT=\"${PANVAR_CONFIGURE_COMMIT}\";PANVAR_CONFIGURE_DIRTY=\"${PANVAR_CONFIGURE_DIRTY}\"")
+# M15-K: the persistent prepared-locus index records the source revision ACTUALLY BUILT (provenance only, never used for
+# compatibility). It is captured on every build, not at configure time: the target below rewrites the generated header only
+# when the commit or the tree state changed, so a new commit recompiles one file and needs no reconfigure.
+set(PANVAR_SOURCE_PROVENANCE_HEADER ${CMAKE_CURRENT_BINARY_DIR}/generated/panvar_source_provenance.h)
+add_custom_target(panvar_source_provenance
+    COMMAND ${CMAKE_COMMAND} -DSOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR} -DOUTPUT=${PANVAR_SOURCE_PROVENANCE_HEADER}
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/source_provenance.cmake
+    BYPRODUCTS ${PANVAR_SOURCE_PROVENANCE_HEADER}
+    COMMENT "Recording the source revision built"
+    VERBATIM)
 
 add_library(panvarlib
     src/gfa.cpp
@@ -182,6 +176,8 @@ add_library(panvarlib
     src/rebuild.cpp
     src/output.cpp
 )
+add_dependencies(panvarlib panvar_source_provenance)
+target_include_directories(panvarlib PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/generated)
 
 target_include_directories(panvarlib
     PUBLIC
@@ -509,6 +505,11 @@ if(PANVAR_BUILD_TESTING)
         add_executable(genotype_cli_contract_test tests/genotype_cli_contract.cpp src/cli_utils.cpp)
         target_link_libraries(genotype_cli_contract_test PRIVATE panvarlib)
         target_compile_options(genotype_cli_contract_test PRIVATE -Wall -Wextra -Wpedantic)
+        # M15-K: the build-time source provenance recorded in the panel index (a temporary git repository)
+        add_test(NAME panvar_source_provenance
+                 COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/source_provenance_test.sh ${CMAKE_COMMAND}
+                         ${CMAKE_CURRENT_SOURCE_DIR}/cmake/source_provenance.cmake ${CMAKE_CURRENT_BINARY_DIR}/source_provenance)
+        set_tests_properties(panvar_source_provenance PROPERTIES TIMEOUT 60)
         add_test(NAME panvar_genotype_cli_contract
                  COMMAND genotype_cli_contract_test ${CMAKE_CURRENT_BINARY_DIR}/genotype_cli_contract ${CMAKE_CURRENT_SOURCE_DIR})
         # --panel-curation removes templates from the callable panel: an allele only curated templates carry is reachable

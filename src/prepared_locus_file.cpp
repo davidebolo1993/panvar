@@ -22,11 +22,16 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-#ifndef PANVAR_CONFIGURE_COMMIT
-#define PANVAR_CONFIGURE_COMMIT "unknown"
+// M15-K: the source revision actually built, generated at build time (cmake/source_provenance.cmake). A target compiled
+// without the generated header says so instead of guessing.
+#if __has_include("panvar_source_provenance.h")
+#include "panvar_source_provenance.h"
 #endif
-#ifndef PANVAR_CONFIGURE_DIRTY
-#define PANVAR_CONFIGURE_DIRTY "unknown"
+#ifndef PANVAR_SOURCE_COMMIT
+#define PANVAR_SOURCE_COMMIT "unavailable"
+#endif
+#ifndef PANVAR_SOURCE_TREE
+#define PANVAR_SOURCE_TREE "unknown"
 #endif
 
 namespace panvar {
@@ -64,8 +69,8 @@ const char* prepared_locus_error_name(PreparedLocusFormatError::Kind kind) {
 PreparedLocusProvenance current_prepared_locus_provenance() {
     PreparedLocusProvenance p;
     p.writer = "panvar";
-    p.configure_commit = PANVAR_CONFIGURE_COMMIT;
-    p.configure_dirty = PANVAR_CONFIGURE_DIRTY;
+    p.source_commit = PANVAR_SOURCE_COMMIT;
+    p.source_tree = PANVAR_SOURCE_TREE;
 #ifdef __VERSION__
     p.compiler = __VERSION__;
 #else
@@ -109,7 +114,7 @@ std::atomic<std::uint64_t>& precount_counter() {
 }
 
 std::string describe_provenance(const PreparedLocusProvenance& p) {
-    return "writer=" + p.writer + ";configure_commit=" + p.configure_commit + ";configure_dirty=" + p.configure_dirty +
+    return "writer=" + p.writer + ";source_commit=" + p.source_commit + ";source_tree=" + p.source_tree +
            ";compiler=" + p.compiler + ";build_type=" + p.build_type;
 }
 
@@ -299,8 +304,8 @@ std::string section_body(std::uint32_t id, const PreparedLocusRecord& r) {
             break;
         case kProvenance:
             w.str(r.provenance.writer);
-            w.str(r.provenance.configure_commit);
-            w.str(r.provenance.configure_dirty);
+            w.str(r.provenance.source_commit);
+            w.str(r.provenance.source_tree);
             w.str(r.provenance.compiler);
             w.str(r.provenance.build_type);
             break;
@@ -1006,8 +1011,9 @@ PreparedLocusRecord decode_with(const std::string& file, const PreparedLocusLoad
                 case kProvenance:
                     acc.set_tally(&tallies.other);
                     c.str(r.provenance.writer, "writer");
-                    c.str(r.provenance.configure_commit, "configure_commit");
-                    c.str(r.provenance.configure_dirty, "configure_dirty");
+                    // M15-K: the same two fields as before; indexes written earlier hold a configure-time commit and 0/1
+                    c.str(r.provenance.source_commit, "source_commit");
+                    c.str(r.provenance.source_tree, "source_tree");
                     c.str(r.provenance.compiler, "compiler");
                     c.str(r.provenance.build_type, "build_type");
                     break;

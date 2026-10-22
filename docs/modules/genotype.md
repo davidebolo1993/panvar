@@ -51,7 +51,7 @@ It sets no time limit and no dosage stage. The usage guide lists every value. Se
 | `--mosaic-candidates <K>` | the **initial** off-panel mosaics evaluated beside the panel pairs (the refinement may add more); `0` evaluates panel pairs only | `128` |
 | `--bubbles <file>` | precomputed bubbles CSV instead of detected variant sites | detected |
 | `--profile <file>` | optional expert overrides, never required: one `key<TAB>value` file with a `profile<TAB>name` row; given once (a repeated `--profile` is refused); a profile cannot select a reporting contract (`output_schema` may only restate `sequence_first_v2`) or set the dosage stage. `profiles/genotype_experimental_sr_v1_<locus>.tsv` reproduce the evidence configurations | — |
-| `--adaptive-repair on\|off`, `--repair-rounds <N>` | the bounded coordinate refinement (local moves scored exactly within declared caps; not a global optimum) and its round cap; `off` or `0` rounds gives the unrepaired view, with tie branching off. Contradictory combinations are refused | `on`, `32` |
+| `--adaptive-repair on\|off`, `--repair-rounds <N>` | the bounded coordinate refinement (local moves scored exactly within declared caps; not a global optimum) and its round cap; `off` or `0` rounds gives the unrefined view, with tie branching off: the already-scored union pool, reported with the v2 contract (its tie and phase outcomes follow the v2 rules; no representation guard). Contradictory combinations are refused | `on`, `32` |
 | `--build-panel-index <file>` / `--panel-index <file>` | build the sample-independent panel index once / genotype against it ([below](#panel-index-build-once-genotype-many)) | — |
 | `-q, --quiet` | no progress messages (warnings are still printed) | off |
 
@@ -199,9 +199,18 @@ guide §7.0.
 ### Sequence-first output v2 (experimental; the short-read preset's report)
 
 **How it is selected.** The short-read preset sets `output_schema sequence_first_v2`, recorded in `.settings.tsv`; it is the
-command's only reporting contract (M15-J: `--output-schema` removed; a profile may only restate `sequence_first_v2`). The unrepaired
-development view (`--adaptive-repair off` or `--repair-rounds 0`) still reports with `legacy`, recorded as the preset's
-value made inactive. `sequence_first_v1` and `legacy` remain internal, unchanged.
+command's only reporting contract (M15-J: `--output-schema` removed; a profile may only restate `sequence_first_v2`).
+
+**Unrefined runs** (`--adaptive-repair off` or `--repair-rounds 0`; M15-K) report v2 too. The pool is the union candidates
+of the ranking already computed, with their scores, sequence digests and priors. The same `decide_pooled_genotype` decides
+over it: nothing is scored, searched or refined beyond the union pass.
+- **Outcomes follow v2, not the historical unrefined rules.** A genotype-equivalent tie is a prediction (formerly a block
+  consensus, exit 1); a tie that disagrees at a block is `SEQUENCE_TIED`; phase is the pooled decision's.
+- **No representation guard runs** on this route, so `genotype_check` is `NOT_ASSESSED`.
+- **The legacy tables are written as before.**
+- **Internal, legacy contract only:** the historical K-prefix phase audit and development prefix ladders.
+
+`sequence_first_v1` and `legacy` remain internal, unchanged.
 
 **What it adds to v1:**
 - **Panel membership.** Each predicted haplotype, completed or provisional, is classified by exact sequence identity, in the locus frame, against the active (curated) panel.
