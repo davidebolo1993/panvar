@@ -708,6 +708,109 @@ std::string pick_reference_unit(
     return best;
 }
 
+// The phase of an approximate unit. A seed is cut wherever its probe landed, so it is a ROTATION of the copies: in the
+// middle of an array any rotation folds the same copies, but at the edges it does not. With the unit rotated d bases into
+// a copy, k copies become a d-base head fragment, k-1 REP steps and a tail fragment -- one copy per haplotype lost from
+// the copy number, and a single-copy haplotype gets no REP at all (chr17:4.93 Mb, a 39 bp unit rotated by 15).
+//
+// The rotation is PROPOSED from the data rather than searched: on the commonest distinct interiors, the bases just before
+// the first detected copy are matched against the unit's tail, and those just after the last copy against its head (a
+// cumulative Hamming scan, linear in the unit length); the matched length says how far the unit is out of phase. The proposal is then TESTED on the same interiors and kept
+// only if it detects strictly more copies; otherwise the seeded unit stands, so a site that already folds well is never
+// changed. The cost is bounded by 2 x kPhaseSample detections on single interiors per bubble, whatever the unit length
+// or panel size.
+struct UnitPhase {
+    std::string unit;
+    std::size_t shift = 0;          // bases the seeded unit was rotated left by (0: unchanged)
+    std::size_t copies_seeded = 0;  // copies detected on the sample (weighted by haplotypes) with the seeded unit
+    std::size_t copies_phased = 0;  // ... with the proposed rotation (= copies_seeded when nothing was proposed)
+};
+UnitPhase phase_unit_at_array_edge(const Graph& graph, const std::vector<BubblePathIndex>& path_indexes,
+                                   const Bubble& bubble, const std::string& unit, const PanphorteOptions& options) {
+    constexpr std::size_t kPhaseSample = 8;     // distinct interiors that propose and test the rotation
+    constexpr std::size_t kMinPartial = 16;     // a partial copy shorter than this is not evidence of phase
+    UnitPhase out;
+    out.unit = unit;
+    const std::size_t L = unit.size();
+    if (L < 2 * kMinPartial) return out;
+    std::map<std::string, std::size_t> interiors;   // spelled interior -> haplotypes
+    for (std::size_t pi = 0; pi < graph.paths.size(); ++pi) {
+        BubblePathInterval used{};
+        if (!bubble_steps(graph.paths[pi], path_indexes[pi], bubble, &used).has_value()) continue;
+        if (used.inside_count == 0) continue;
+        const std::size_t left = used.left + 1;
+        if (used.right <= left) continue;
+        const std::vector<PathStep> nat(graph.paths[pi].steps.begin() + static_cast<std::ptrdiff_t>(left),
+                                        graph.paths[pi].steps.begin() + static_cast<std::ptrdiff_t>(used.right));
+        ++interiors[spell_path_steps_sequence(graph, nat)];
+    }
+    // The commonest interiors, deterministic: more haplotypes first, then the map's own order.
+    std::vector<std::pair<const std::string*, std::size_t>> sample;
+    for (const auto& [s, n] : interiors) sample.emplace_back(&s, n);
+    std::stable_sort(sample.begin(), sample.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
+    if (sample.size() > kPhaseSample) sample.resize(kPhaseSample);
+
+    std::vector<std::vector<ApproxCopy>> seeded(sample.size());
+    run_parallel(sample.size(), options.threads, [&](std::size_t i) {
+        seeded[i] = detect_copies_native(*sample[i].first, unit, options.min_similarity);
+    });
+    std::map<std::size_t, std::size_t> votes;   // proposed left rotation -> haplotypes
+    for (std::size_t i = 0; i < sample.size(); ++i) {
+        out.copies_seeded += seeded[i].size() * sample[i].second;
+        if (seeded[i].empty() || seeded[i].front().rev) continue;
+        const std::string& s = *sample[i].first;
+        const std::size_t c0 = seeded[i].front().bp_lo;
+        std::size_t mism = 0, matched = 0;
+        for (std::size_t j = 1; j <= std::min(c0, L - 1); ++j) {
+            const bool same = s[c0 - j] == unit[L - j];
+            if (!same) ++mism;
+            // The partial copy must BEGIN on a matching base: extending it over a mismatch would pull a flanking base into
+            // the first copy, where approximate folding would overwrite it with the unit's base.
+            if (same && j >= kMinPartial &&
+                static_cast<double>(j - mism) / static_cast<double>(j) >= options.min_similarity) {
+                matched = j;
+            }
+        }
+        if (matched > 0) votes[L - matched] += sample[i].second;
+        // The other edge: the bases after the last copy against the unit's HEAD. A copy split by the rotation is a head
+        // partial plus a tail partial, so whichever is long enough proposes the same rotation; the partial must END on a
+        // matching base, for the same reason as above.
+        const ApproxCopy& last = seeded[i].back();
+        if (last.rev) continue;
+        const std::size_t e = last.bp_hi;
+        mism = 0;
+        matched = 0;
+        for (std::size_t j = 1; e + j <= s.size() && j <= L - 1; ++j) {
+            const bool same = s[e + j - 1] == unit[j - 1];
+            if (!same) ++mism;
+            if (same && j >= kMinPartial &&
+                static_cast<double>(j - mism) / static_cast<double>(j) >= options.min_similarity) {
+                matched = j;
+            }
+        }
+        if (matched > 0) votes[matched] += sample[i].second;
+    }
+    out.copies_phased = out.copies_seeded;
+    std::size_t shift = 0, best_votes = 0;
+    for (const auto& [d, n] : votes) {
+        if (n > best_votes) { best_votes = n; shift = d; }
+    }
+    if (shift == 0) return out;
+    const std::string rotated = unit.substr(shift) + unit.substr(0, shift);
+    std::vector<std::size_t> phased(sample.size(), 0);
+    run_parallel(sample.size(), options.threads, [&](std::size_t i) {
+        phased[i] = detect_copies_native(*sample[i].first, rotated, options.min_similarity).size();
+    });
+    std::size_t total = 0;
+    for (std::size_t i = 0; i < sample.size(); ++i) total += phased[i] * sample[i].second;
+    if (total > out.copies_seeded) {
+        out.unit = rotated;
+        out.shift = shift;
+        out.copies_phased = total;
+    }
+    return out;
+}
+
 } // namespace
 
 void panphorte_normalize(const PanphorteOptions& options, PanphorteSummary* summary_out) {
@@ -973,8 +1076,13 @@ void panphorte_normalize(const PanphorteOptions& options, PanphorteSummary* summ
             // Single-block: seed one representative unit, find its near-identical copies per path (any
             // orientation, banded alignment), collapse to one REP node looped per copy. Lossy --
             // within-copy detail is dropped; inter-copy sequence is kept as literal steps.
-            const std::string ref_unit =
-                pick_reference_unit(graph, node_tok, path_indexes, bubble, options);
+            const UnitPhase phase = phase_unit_at_array_edge(
+                graph, path_indexes, bubble, pick_reference_unit(graph, node_tok, path_indexes, bubble, options), options);
+            const std::string& ref_unit = phase.unit;
+            if (!options.quiet && phase.shift != 0) {
+                std::cerr << "[bubble " << bubble.id << "] unit re-phased at the array edge: rotated " << phase.shift
+                          << " bp; sample copies " << phase.copies_seeded << " -> " << phase.copies_phased << "\n";
+            }
             if (!options.quiet && ref_unit.size() >= options.min_unit_bp) {
                 // One concise line per SEEDED bubble (works in non-interactive logs too): what was
                 // seeded and how much alignment work it implies, printed BEFORE the expensive

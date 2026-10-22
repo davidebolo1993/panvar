@@ -12,6 +12,10 @@ Within a bubble, each haplotype's interior is taken as a sequence of node steps.
 
 Where no step period exists, because the graph's node boundaries were set by alignment rather than by the repeat, the unit is seeded from the spelled bases instead. Both routes end with the same thing: a unit sequence and the positions of its copies.
 
+**Phase at the array edge (approximate mode).** A tandem repeat has no natural start, and a base-level seed starts wherever its probe landed, so the unit can be a rotation of the copies. In the middle of an array any rotation folds the same copies; at the edges it does not. With the unit rotated d bases into a copy, k copies become a d-base fragment, k − 1 unit copies and a tail fragment: every haplotype loses one copy, and a one-copy haplotype folds none.
+- **Proposing a rotation.** On the commonest distinct interiors (at most 8), the bases just before the first detected copy are matched against the unit's end, and those just after the last copy against its start. The match must cover at least 16 bases at `--min-similarity` and begin (or end) on a matching base. Its length says how far the unit is out of phase. This is a linear scan, never a search over every rotation, so a multi-kb unit costs no more than a short one.
+- **Testing it.** The proposed rotation is kept only if it detects strictly more copies on the same interiors; otherwise the seeded unit stands, and a site that already folds well is unchanged. A re-phased site is logged (`unit re-phased at the array edge`).
+
 ### 2. Extend the array and accept it
 
 From the seed, copies are extended in both directions at the detected period. Bases lying between successive copies are interruptions: they are kept but not counted as copies, and are tolerated while they stay within `--max-interruption-frac` of the span covered so far. Past that fraction the array ends and a new one may begin.

@@ -847,6 +847,43 @@ rf5_rc=$?
   && ok "--refine without --reference-path is refused before anything is written" \
   || bad "--refine without --reference-path exited $rf5_rc or wrote: $(ls "$OUT" | grep '^rf5\.' | tr '\n' ' ')"
 
+# ---------------------------------------------------------------- approximate unit phased at the array edge
+# A tandem repeat has no natural start, and a base-level seed is cut wherever its probe lands: here 15 bases into a copy
+# (the chr17:4.93 Mb 39 bp repeat). Folded in that phase, k copies became a head fragment, k-1 REP steps and a tail
+# fragment, so every haplotype lost one copy and a one-copy haplotype got no REP at all. The unit is now rotated to the
+# array's edge when that folds more copies. Each interior is ONE node ('A' + k copies), so no node-step period exists and
+# the base-level seed is what decides the phase.
+PU="GAGCCCACCTCAGAGCCCGCCCCCAGCCCGACCACCCCG"
+{ printf 'H\tVN:Z:1.0\n'
+  printf "S\t1\t%s\nS\t2\tA%s\nS\t3\tA%s%s\nS\t4\tA%s%s%s\nS\t5\t%s\n" "$BB1" "$PU" "$PU" "$PU" "$PU" "$PU" "$PU" "$BB2"
+  for e in "1 2" "1 3" "1 4" "2 5" "3 5" "4 5"; do printf "L\t%s\t+\t%s\t+\t0M\n" "${e% *}" "${e#* }"; done
+  printf 'P\tk2a\t1+,3+,5+\t*\nP\tk2b\t1+,3+,5+\t*\nP\tk3a\t1+,4+,5+\t*\nP\tk3b\t1+,4+,5+\t*\n'
+  printf 'P\tk1a\t1+,2+,5+\t*\nP\tk1b\t1+,2+,5+\t*\n'; } > "$OUT/phase.gfa"
+"$BIN" bubble -i "$OUT/phase.gfa" -r k2a -o "$OUT/phaseb" --min-variant-bp 0 -q >/dev/null 2>&1
+"$BIN" panphorte -i "$OUT/phaseb.sorted.gfa" -c "$OUT/phaseb.bubbles.csv" -o "$OUT/phasep" --min-similarity 0.90 \
+       --min-unit-bp 20 --min-array-prevalence 0.5 > "$OUT/phasep.log" 2>&1
+phase_rep=$(awk '$1=="L" && $2==$4 {print $2}' "$OUT/phasep.normalized.gfa" | head -1)
+if [ -z "$phase_rep" ]; then
+  bad "the phase fixture folded nothing ($(tail -1 "$OUT/phasep.log"))"
+else
+  [ "$(awk -v r="$phase_rep" '$1=="S" && $2==r {print $3}' "$OUT/phasep.normalized.gfa")" = "$PU" ] \
+    && ok "the folded unit is in the copies' own phase (rotated at the array edge)" \
+    || bad "the folded unit is a rotation of the copies: $(awk -v r="$phase_rep" '$1=="S" && $2==r {print $3}' "$OUT/phasep.normalized.gfa")"
+  phase_ok=1
+  for h in k1a:1 k1b:1 k2a:2 k2b:2 k3a:3 k3b:3; do
+    n=$(pline "$OUT/phasep.normalized.gfa" "${h%%:*}" | tr ',' '\n' | grep -c "^${phase_rep}[+-]$")
+    [ "$n" = "${h##*:}" ] || { phase_ok=0; bad "${h%%:*} walks the REP node $n times, expected ${h##*:}"; }
+  done
+  [ "$phase_ok" = 1 ] && ok "every copy folds: one, two and three copies walk the REP node 1, 2 and 3 times"
+  phase_seq=1
+  for h in k1a k2a k3a; do
+    [ "$(spell "$OUT/phaseb.sorted.gfa" $h)" = "$(spell "$OUT/phasep.normalized.gfa" $h)" ] || phase_seq=0
+  done
+  [ "$phase_seq" = 1 ] && ok "and exact copies keep every haplotype's sequence" || bad "re-phasing changed a haplotype's sequence"
+  grep -q "unit re-phased at the array edge" "$OUT/phasep.log" \
+    && ok "the re-phasing is logged" || bad "the re-phasing was not logged"
+fi
+
 # ---------------------------------------------------------------- family commit is a transaction
 # Panphorte writes a six-file family (normalized GFA, report, provenance, copies, bubbles, Bandage).
 # The shared StagedOutputs commit is what makes that atomic; the only injected-rollback fixture ran
