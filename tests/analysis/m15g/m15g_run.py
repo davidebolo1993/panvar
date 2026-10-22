@@ -19,7 +19,11 @@ OUT = f"{m11d.R}/m15g_assessment_20261022"
 BUDGET, PRE = 2400, 240.0
 UNITS = [("build", 300), ("spec_equivalence", 60), ("ex.replay_saved", 400), ("ex.complete_c4", 150), ("ex.complete_cyp2d6", 200),
          ("ex.complete_acot", 300), ("ex.dosage_cyp2d6", 200), ("ex.legacy_tie", 60), ("ex.provisional", 120), ("ex.absent", 120),
-         ("ex.reporting_failure", 150), ("ctest.full", 1250)]
+         ("ex.reporting_failure", 150), ("ctest.full", 1250),
+         # A1 (declared before the rerun): the completed-run comparison normalised the prefix name as a bare substring, and
+         # the C4 prefix `c4` is a hexadecimal substring of hashes; names are now replaced only as names and the locus
+         # table's prefix column is a name. The three completed-run units are rerun (the originals stay recorded).
+         ("a1.ex.complete_c4", 150), ("a1.ex.complete_cyp2d6", 200), ("a1.ex.complete_acot", 300)]
 
 
 def command(unit, d):

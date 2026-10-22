@@ -45,3 +45,18 @@
 | `ctest.full` | the full enabled suite on the final revision passes; disabled tests reported separately |
 
 **Failure handling:** a failure is recorded and never retuned. An amendment is declared before any rerun.
+
+## 3. Amendment A1 (declared after the run, before the rerun; the failed unit stays recorded)
+
+**The failure:** `ex.complete_c4` failed 3 of 25 checks. The comparison normalised the run's prefix name as a bare
+substring, and the C4 prefix `c4` is also a hexadecimal substring of SHA-256 values, so hashes were rewritten
+asymmetrically.
+
+**The outputs themselves were identical,** checked outside the harness:
+- `.sequence_haplotypes.tsv` is byte-identical;
+- the sequence record has no differing row;
+- the locus table differs only in its `prefix` column (the run's name).
+
+**The fix:** names are now replaced only as names: the full path, `<base>_seq` and `<base>.`. The locus table's `prefix`
+column is compared as a name. All three completed-run units are rerun as `a1.ex.complete_*`, because the over-broad
+normalisation could in principle have masked a difference.

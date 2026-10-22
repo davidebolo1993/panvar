@@ -74,10 +74,11 @@ def without(path, drop_cols):
     return "\n".join("\t".join(r.split("\t")[i] if i < len(r.split("\t")) else "" for i in keep) for r in lines)
 
 
-def named(text, *names):
-    for n in names:
-        text = text.replace(n, "<RUN>")
-    return text
+def named(text, prefix, base=None):
+    """A1: the run's own name normalised only where it occurs AS a name -- the full path, `<base>_seq` (FASTA records) and
+    `<base>.` (sibling files) -- never as a bare substring (the C4 prefix `c4` is also a hexadecimal substring of hashes)."""
+    base = base or os.path.basename(prefix)
+    return text.replace(prefix, "<RUN>").replace(base + "_seq", "<RUN>_seq").replace(base + ".", "<RUN>.")
 
 
 # ---------------------------------------------------------------- units ------------------------------------------------
@@ -128,8 +129,8 @@ def complete(cell, d):
     for suffix in (".sequence_blocks.tsv", ".block_genotypes.tsv", ".genotypes.tsv"):
         a, b = without(out + suffix, S.BLOCK_COLUMNS), without(old + suffix, S.BLOCK_COLUMNS)
         check(a is not None and a == b, f"{cell}: {suffix} pre-existing columns unchanged (old headline columns included)")
-    a = without(out + ".locus_genotype.tsv", S.LOCUS_KEYS + ["headline_filters_status"])
-    b = without(old + ".locus_genotype.tsv", [])
+    a = without(out + ".locus_genotype.tsv", S.LOCUS_KEYS + ["headline_filters_status", "prefix"])   # A1: prefix is the run's name
+    b = without(old + ".locus_genotype.tsv", ["prefix"])
     check(named(a, os.path.basename(out)) == named(b, os.path.basename(old)), f"{cell}: locus table pre-existing columns unchanged")
     check(E.T(out + ".locus_genotype.tsv")[0].get("headline_filters_status") == "superseded_by_assessment_v1",
           f"{cell}: the old headline fields are labelled superseded")
