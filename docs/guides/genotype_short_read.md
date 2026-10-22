@@ -196,7 +196,7 @@ memory is not divided per thread.
 |---|---|---|
 | **completed prediction** | 0 | `.sequence_locus.tsv` `prediction PREDICTION`, `completion completed_ranking` (even when uncertain); full block tables |
 | **PROVISIONAL** | 3 | the best **fully evaluated** candidate after a budget stop or declared cap (early-incumbent checkpoint). It is **not a completed search** and carries no decision set and no confidence |
-| **no prediction** | 1 | `prediction NO_PREDICTION` with `no_call_reason` (for example `distinct_tie`, `neighbourhood_bound`) |
+| **no prediction** | 1 | `prediction NO_PREDICTION` with `no_call_reason` (for example `neighbourhood_bound` with no checkpoint to keep). A legacy `distinct_tie` is **not** a no-prediction when the tie is only over labellings of one sequence pair: that is a PREDICTION (exit 0) with `legacy_no_call_reason distinct_tie` |
 | time / footprint stop before any checkpoint | 124 / 125 | minimal status (`TIME_LIMIT` / `RESOURCE_REFUSAL`) and a `NO_PREDICTION` `.sequence_locus.tsv` (`completion budget_stop_before_first_evaluated_candidate`) |
 | argument or declared-library error | 2 | **refused before the prefix is touched**: every file already there is left as it was |
 | input, model or output error found during the run | 2 | the run already owns the prefix: earlier run-owned outputs are gone and a `FAILED` status (or, after the sequence report was published, `locus_output FAILED: …`) says what happened |
@@ -224,6 +224,37 @@ The legacy schema uses 0 call / 1 no-call / 2 / 124 / 125.
   (`OFF_PANEL_PAIR`). The legacy `.mosaic_haplotypes.fa` is suppressed under v2.
 
 ## 7. Decision guide: filters, ambiguity, audit and support
+
+### 7.0 The primary view: `assessment_v1`
+
+Read this first. `.sequence_locus.tsv` (mirrored in `.locus_genotype.tsv`) and `.sequence_blocks.tsv` (mirrored in the
+block tables) carry it. Every assessment concerns the **published prediction**, and a legacy block fact is used only where
+it verifiably describes the same alleles. The full contract is `tests/analysis/m15g/CONTRACT.md`.
+
+| field | values |
+|---|---|
+| `prediction` | PREDICTION · PROVISIONAL · NO_PREDICTION (never overridden by the legacy call class) |
+| `sequence_resolution` | RESOLVED · GENOTYPE_RESOLVED_SEQUENCE_SET · SEQUENCE_TIED · NOT_DETERMINED · NA |
+| `genotype_check` (+ coverage) | NONE_DETECTED · CONFLICT (representation conflict, library sensitivity) · NOT_ASSESSED |
+| `dosage_check` (+ coverage) | AGREES · SUSPECT · DISAGREES · UNAVAILABLE · NOT_REQUESTED · NOT_APPLICABLE: always about the reported alleles. Corrections are listed separately in `dosage_alternatives` (diagnostic) |
+| `read_support` (+ coverage) | READS · PRIOR_DEPENDENT · NOT_ASSESSED (unknown support is never READS) |
+| `phase` | READ_SUPPORTED · PRIOR_ONLY · UNRESOLVED · NOT_ASSESSED · NOT_APPLICABLE. **Locus-level** (phase support is decided once per locus) and applicable when two or more blocks are heterozygous, adjacent or not |
+| `findings` / `not_assessed` | every concrete finding and every check that could not run, each with its block ids; both always written |
+| `assessment_summary` | the scan line, with `[assessed/applicable]` wherever coverage is partial |
+
+**How to read it:**
+- **Missing evidence is not a failure,** and it never hides a finding.
+- **There is no overall PASS** and nothing calibrated.
+
+**Example, C4 with `--dosage-check`:** `PREDICTION;SEQUENCE_RESOLVED;GENOTYPE_NONE_DETECTED;DOSAGE_AGREES[1/2];SUPPORT_PRIOR_DEPENDENT;PHASE_PRIOR_ONLY`.
+- `findings`: `PRIOR_DEPENDENT@sv:1,ctx:2,ctx:4,sv:5,sv:7;PHASE_PRIOR_ONLY@locus`.
+- `not_assessed`: `DOSAGE:UNDERPOWERED@sv:1`.
+
+**The headline filters below** (GENOTYPE_FILTER, DOSAGE_FILTER, PHASE_FILTER, `call_summary`) are kept unchanged for this
+experimental release and labelled `headline_filters_status superseded_by_assessment_v1`. Known misreadings:
+- they mark a v2 prediction NO_CALL when the legacy decision tied;
+- NOT_EVALUATED outranks LOW_QUALITY;
+- DOSAGE_FILTER PASS can describe an unapplied correction.
 
 **First:** is it a completed prediction (exit 0, `PREDICTION`, `completed_ranking`)? If not, report its status. Never treat a
 PROVISIONAL or absent result as a completed one.

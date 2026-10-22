@@ -111,7 +111,7 @@ It stops when nothing improves, or at `--repair-rounds`. A neighbourhood larger 
 | several groups, the same unordered genotype at every block | genotype-equivalent call |
 | groups that disagree at a block | no-call (`distinct_tie`) |
 
-**Support and quality.** A rival whose fragment term is not certifiably below the winner's is a fragment contender. `phase_support` is read-supported with no contender, and `PRIOR_ONLY` otherwise. A block's `genotype_support` is `PRIOR_ONLY` when a contender differs there. The block's conditional posterior and GQ are:
+**Support and quality.** A rival whose fragment term is not certifiably below the winner's is a fragment contender. `phase_support` is computed once per locus: `UNRESOLVED` when the decision is not unique, read-supported with no contender, and `PRIOR_ONLY` otherwise. A block's `genotype_support` is `PRIOR_ONLY` when a contender differs there. The block's conditional posterior and GQ are:
 
 ```text
 log_err_b = logsumexp{ s_c : genotype_c(b) ≠ called(b) } − logsumexp{ all evaluated s_c }

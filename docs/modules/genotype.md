@@ -119,6 +119,17 @@ errors found while running are not.
 
 ### Reading the call
 
+**The primary view is `assessment_v1`** (sequence-first v2). It is written as rows in `.sequence_locus.tsv` and columns in
+`.sequence_blocks.tsv`, mirrored in the locus and block tables:
+- `prediction`, `sequence_resolution`;
+- `genotype_check`, `dosage_check` (about the reported alleles; corrections are in `dosage_alternatives`), `read_support`
+  and locus-level `phase`, each with coverage;
+- `findings` and `not_assessed`.
+
+It uses a legacy block fact only where that fact verifiably describes the published alleles. The headline filters below
+are kept unchanged but superseded (`headline_filters_status`). Contract: `tests/analysis/m15g/CONTRACT.md`; usage: the
+guide §7.0.
+
 - **Strict call** (`COMPLETE`): one best pair of haplotypes. A *genotype-equivalent call* (`CONDITIONAL_GENOTYPE_EQUIVALENT`) has several best pairs that agree on every block's unordered genotype but not on phase, so it reports no FASTA and no phase.
 - **No-call:** the reason is in `no_call_reason`, for example `distinct_tie`, `tie_branching_incomplete` or `neighbourhood_bound`.
 - **Panel alleles:** every reported block allele is an active panel allele, and `allele*_sources` names its panel sources. A whole haplotype may still be off-panel as a mosaic.
