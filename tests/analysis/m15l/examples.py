@@ -18,7 +18,8 @@ M15K_INDEX = f"{R}/m15k_unrefined_v2_20261022/runs/a2.ex.index_c4/index/c4.pvpl"
 PRIMARY = {".sequence_locus.tsv", ".sequence_blocks.tsv", ".sequence_haplotypes.tsv", ".sequence_haplotypes.fa"}
 VOLATILE = ("seconds", "_bytes", "rss_", "footprint", "elapsed", "threads_peak", "_peak", "emission_cache_",
             "union_prefilter_cache_", "_executed_dps", "cached_prefilters_consumed")
-KEYED = (".mosaic_status.tsv", ".dosage_status.tsv", ".library_estimate.tsv", ".library_sensitivity.tsv")
+# A1: the primary record too -- a provisional record carries the checkpoint's timing rows (checkpoint_seconds_*)
+KEYED = (".mosaic_status.tsv", ".dosage_status.tsv", ".library_estimate.tsv", ".library_sensitivity.tsv", ".sequence_locus.tsv")
 LOGS = (".repair_memory.tsv", ".repair_rounds.tsv")
 CHECKS = []
 
@@ -148,7 +149,8 @@ def ex_failed(d):
     check(rc == 2 and sl.get("exit_code") == "2" and sl.get("locus_output", "").startswith("FAILED: "),
           "reporting failure: exit 2, recorded in the primary record beside the prefix")
     so = E.KV(old + ".sequence_locus.tsv")
-    strip = lambda m: {k: v.replace(old, "<RUN>").replace(new, "<RUN>").replace(f"{new}.diagnostics/c4", "<RUN>")
+    # A1: the longer diagnostics path is replaced before the primary prefix it begins with
+    strip = lambda m: {k: v.replace(old, "<RUN>").replace(f"{new}.diagnostics/c4", "<RUN>").replace(new, "<RUN>")
                        for k, v in m.items() if "seconds" not in k}
     check(strip(sl) == strip(so), "reporting failure: the primary record equals M15-K's (its paths aside)")
     # (3) a refused run (a declared library that does not exist): exit 2, nothing created

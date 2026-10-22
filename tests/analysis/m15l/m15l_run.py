@@ -20,7 +20,14 @@ OUT = f"{m11d.R}/m15l_diagnostics_dir_20261022"
 BUDGET, PRE = 3600, 1500.0
 UNITS = [("build", 300), ("tests", 120), ("ex.layout_c4", 200), ("ex.layout_cyp2d6", 250), ("ex.layout_acot", 350),
          ("ex.dosage_check_cyp2d6", 250), ("ex.indexed_c4", 200), ("ex.provisional", 150), ("ex.failed", 300),
-         ("ex.stale_flat", 150), ("ctest.full", 1300)]
+         ("ex.stale_flat", 150), ("ctest.full", 1300),
+         # A1 (declared before the reruns): ex.provisional compared the primary record byte for byte, but a provisional
+         # record carries the checkpoint's timing rows (checkpoint_seconds_*), which differ by run; the record now gets the
+         # timing-row allowance every keyed file has. ex.failed's record comparison replaced the primary prefix before the
+         # longer diagnostics path it begins with, so the failure message naming the diagnostics locus table differed; the
+         # longer path is now replaced first. Every layout and outcome check had passed (12/13, 11/12). Both are rerun; the
+         # failures stay recorded.
+         ("a1.ex.provisional", 150), ("a1.ex.failed", 300)]
 
 
 def command(unit, d):
