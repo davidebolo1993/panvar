@@ -1,8 +1,10 @@
 # M15-I result: release documentation and a non-mutating integration plan; ready for authorization
 
 **Logistics:**
-- **Branch:** `m15-i-release`. Candidate head `5eaca6a`: `cd51d37` (the M15-H functional freeze) plus documentation only.
-  There is no code, test or CMake difference.
+- **Branch:** `m15-i-release`. The candidate is its head: `cd51d37` (the M15-H functional freeze) plus the documentation
+  commits `5eaca6a` (notes, plan, checklist) and this result.
+- **Verifiable:** `git diff --stat cd51d37 m15-i-release -- src include CMakeLists.txt tests/*.cpp tests/*.sh tests/*.py`
+  is empty.
 - **Not done:** no merge, cherry-pick, worktree switch, tag, push, publication or cleanup. WIP (`311a41ad…`), stash
   `dbb170c5` and the sealed results are preserved.
 
@@ -33,7 +35,7 @@
    - legacy-tie assessments, API expansion, aliases and removals deferred;
    - known limitations retained explicitly.
 4. **Integration plan** (`INTEGRATION_PLAN.md`):
-   - **Candidate** `5eaca6a` into **target** `main` (= `origin/main` `e91b73c`): 571 ahead, 1 behind, merge base `1d87162`.
+   - **Candidate** `m15-i-release` (dry-merged at `5eaca6a`) into **target** `main` (= `origin/main` `e91b73c`): 571 ahead, 1 behind, merge base `1d87162`.
    - **A dry `git merge-tree` is clean.** The merged tree keeps `main`'s panphorte fix (blob `ca07e8c`), its fixture, and
      both test registrations. Retention is through a `--no-ff` merge commit.
    - **Expected textual conflicts:** none. The candidate line never touched the fix's three files.
