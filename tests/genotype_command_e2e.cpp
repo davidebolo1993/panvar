@@ -5598,7 +5598,7 @@ void test_blocked_union_route() {
                                             "--reads1", path("phaseable_r1.fq"), "--reads2", path("phaseable_r2.fq"),
                                             "--library", path("lib.txt"), "--kmer-size", "21", "--syncmer-s", "11",
                                             "--max-mosaic-candidates", "16", "--threads", "2", "--profile", path(profile),
-                                            "--output-schema", "sequence_first_v2", "--quiet", "--out", path(prefix)};
+                                            "--quiet", "--out", path(prefix)};   // M15-J: v2 is the fixed contract
         };
         const int a = panvar::run_genotype_command(cli("bu_cli_off_profile.tsv", "bu_cli_off/call"));
         const int b = panvar::run_genotype_command(cli("bu_cli_profile.tsv", "bu_cli/call"));

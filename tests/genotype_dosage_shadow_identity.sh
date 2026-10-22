@@ -3,6 +3,8 @@
 # dosage flag absent and with --dosage-audit shadow. Every pre-existing output must equal the frozen 11fe681 campaign
 # output byte for byte, except the status file's wall-time, memory and binary-provenance lines; shadow may add only
 # <prefix>.dosage_*.tsv. Usage: genotype_dosage_shadow_identity.sh <panvar binary> <campaign root> <cell> <scratch dir>
+# M15-J: --dosage-audit was removed from the command line (refused, exit 2). This historical gate (not registered in ctest)
+# reproduces only with a binary built before M15-J (for example the M15-I release candidate, panvar SHA-256 3f7e03a4...).
 set -uo pipefail
 PANVAR=$1; C=$2; CELL=$3; OUT=$4
 mkdir -p "$OUT"

@@ -129,7 +129,7 @@ These annotations never change the caller's decision.
 
 ### 9. Audit and repair dosage
 
-With `--dosage-mode audit` or `repair`, a called locus is tested for copy-number contradictions.
+With `--dosage-check` (internal mode `audit`), or the internal-only `repair` mode, a called locus is tested for copy-number contradictions.
 
 **Census.** With molecule span `S = ⌈μ + 4σ⌉`, a block is dosage-sensitive when two of its active alleles differ in length by at least `S` while the shorter adds at most 50 bp of nodes absent from the longer.
 

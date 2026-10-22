@@ -37,6 +37,11 @@ configuration.
 **An opt-in dosage check:** `--dosage-check` runs the copy-number audit of the reported alleles.
 - It never changes the prediction, and it adds run time.
 - Without it, the dosage check is reported as NOT_REQUESTED.
+- It is the only public dosage control: no flag or profile key repairs dosage.
+
+**One public reporting contract:** ordinary genotyping reports `sequence_first_v2`, recorded as `output_schema` in
+`.settings.tsv`. No flag or profile selects another contract. The unrepaired development view (`--adaptive-repair off`)
+still reports `legacy`; whether it should report v2 is an open decision.
 
 **A public panel index:**
 - `--build-panel-index FILE` builds the sample-independent preparation (structural model and marker panel) once per
@@ -69,6 +74,8 @@ Each locus value carries coverage counts. A missing check is never a failure, an
 
 **Help and inventory:**
 - `--help` covers everyday use.
+- `--profile` is documented as optional overrides: the literal `key<TAB>value` format, the required `profile<TAB>name`
+  row, a minimal working example and the precedence (default < preset < profile < flag). One profile per run.
 - `--help-advanced` lists every option by purpose, with values, effective defaults, units and what each can change.
 - The guide's option inventory is generated from the parser and checked by the test suite.
 
@@ -91,20 +98,24 @@ the whole mosaic-caller line below is new:
 | configuration | reference routes unless a profile was given | the accelerated preset (**JP1.1 can change predictions**; the early incumbent can turn a budget stop into PROVISIONAL) |
 | refinement-neighbourhood bound | 670 (CYP2D6 and ACOT needed profiles) | `model` (the model's own maximum); a numeric cap is still accepted |
 | footprint guard | none | 6 GiB, sampled (exit 125, or 3 PROVISIONAL) |
-| dosage | off unless `--dosage-mode audit\|repair` | **off unless `--dosage-check`** (`--dosage-mode` remains; `repair` needs `--output-schema legacy`) |
+| dosage | off unless `--dosage-mode audit\|repair` | **off unless `--dosage-check`**, an audit only; `--dosage-mode` and `--dosage-audit` removed (refused) |
+| reporting contract | `--output-schema legacy\|sequence_first_v1\|sequence_first_v2` | fixed `sequence_first_v2` (`--output-schema` removed, refused; a profile may only restate v2); the unrepaired view still reports legacy |
+| removed spellings | accepted | refused by name: `--phase-audit-candidates`, `--repair-origin-cache-bytes`, `--repair-tie-seed-cache-bytes` (their profile keys remain), `--dosage-allocation-test`, `--library-diagnostic` |
+| `--profile` given twice | applied in order, the status naming only the last file | refused |
 | primary interpretation | the headline filters | `assessment_v1` (the headline fields are kept, unchanged, as **superseded** diagnostics) |
 | panphorte with `--min-similarity` < 1 | one fragment node per haplotype | shared fragment nodes: **graphs and node IDs differ** from earlier outputs for approximately folded sites |
 
 **Legacy compatibility retained:**
-- `--output-schema legacy` (and `sequence_first_v1`);
-- `--dosage-mode repair` under the legacy schema;
-- `--dosage-audit off|shadow`;
-- `--adaptive-repair off` (the unrepaired development view);
-- every expert profile key, and the locus profiles of the evidence;
-- the `headline_filters_v2` columns, unchanged.
+- `--adaptive-repair off` (the unrepaired development view, which still reports legacy);
+- every expert profile key except `output_schema` (which may only restate `sequence_first_v2`), and the locus profiles of
+  the evidence, unchanged;
+- the `headline_filters_v2` columns and every output file, unchanged;
+- the legacy and `sequence_first_v1` contracts and the dosage repair, through the internal API only (regression tests).
 
-**No flag was removed or renamed.** `--max-candidates` remains refused with a pointer to `--mosaic-candidates`, as
-before.
+**Removed or refused flags (M15-J):** `--output-schema`, `--dosage-mode`, `--dosage-audit`, `--phase-audit-candidates`,
+`--repair-origin-cache-bytes`, `--repair-tie-seed-cache-bytes`, `--dosage-allocation-test` and `--library-diagnostic` are
+refused by name with what replaces them (exit 2, before the output prefix is touched). `--max-candidates` remains
+refused with a pointer to `--mosaic-candidates`. No flag was renamed.
 
 ## Evidence
 

@@ -69,6 +69,11 @@ three development cells; that is a descriptive record, not an accuracy result.
 **Precedence:** explicit flag > profile > preset > built-in default, whatever the argument order. Every effective setting and
 its source is written to `<prefix>.settings.tsv`.
 
+**The reporting contract is fixed:** ordinary genotyping reports `sequence_first_v2`, recorded as `output_schema` in
+`.settings.tsv` with its source. No flag or profile selects another contract (`--output-schema` was removed in M15-J; a
+profile may only restate `output_schema sequence_first_v2`, as the evidence profiles do). The one exception is the unrepaired development view (below), which still
+reports `legacy`; whether it should report v2 is an open decision.
+
 **`--preset short-read`** is always applied, whether or not it is given. It names no locus and reads no repository file.
 It sets:
 - the production algorithm and the short-read constants (marker k-mer and syncmer sizes, site span, copying prior,
@@ -87,17 +92,34 @@ and the preset, and the test suite checks it.
 **Not set by the preset:** the dosage stage (`--dosage-check`), the reference, the panel curation and diagnostics.
 
 **When a flag removes a preset feature's requirement,** the preset-sourced feature is switched off instead of refusing the
-run. This happens with `--adaptive-repair off`, `--repair-rounds 0` or `--output-schema legacy`.
+run. This happens with `--adaptive-repair off` or `--repair-rounds 0` (the unrepaired development view).
 - `.settings.tsv` records it as `preset … (inactive: <reason>)`.
 - Under the unrepaired view, `output_schema` becomes legacy.
 - The same features set explicitly by a flag or profile keep their refusals.
 
-**`--profile FILE`:** `key<TAB>value` lines.
-- The file must name itself (`profile <name>`).
-- A key set twice in one file is refused.
-- **Repeated `--profile` files apply in order, a later file silently overriding an earlier one.**
-  - **Limitation:** the settings source then names the profile that set each key, but there is no merged-profile digest.
-  - Prefer one complete profile.
+**`--profile FILE`: optional overrides, never required.** An ordinary run needs no profile: the preset is the complete
+configuration. A profile changes only the keys it names.
+- **Format:** one literal `key<TAB>value` per line (a TAB, not spaces). Blank lines and lines starting with `#` are ignored.
+- **The `profile<TAB>NAME` row is required.** It names the file in the records (`profile_name` in the status, beside the
+  file's path and SHA-256).
+- **Refused, before anything is written:** a key set twice; an unknown key; a malformed value; an `output_schema` other
+  than `sequence_first_v2` (the contract is fixed; restating it is accepted); `dosage_mode` (dosage is only an audit,
+  requested with `--dosage-check`).
+- **One profile per run:** a repeated `--profile` is refused (M15-J). Before, files applied in order and the status named
+  only the last; merge the settings into one file instead.
+- **Precedence:** a flag beside the profile overrides it, whatever the order; `.settings.tsv` records the flag as that
+  key's source.
+
+Minimal working profile (columns separated by one TAB):
+
+```
+profile	my_overrides
+footprint_limit_bytes	4294967296
+```
+
+```
+panvar genotype --graph locus.gfa --reads1 S.R1.fq.gz --reads2 S.R2.fq.gz --threads 4 --out S --profile my_overrides.tsv
+```
 
 **A resource-adjusted run:** a one-key expert profile (for example `profile my-limits` + `time_limit_seconds 900`) on top of
 the preset. Alternatively, copy a complete profile and change only resource keys (§4).
@@ -181,8 +203,8 @@ from the parser and the preset):
 | resources | `max_union_cached_prefilters_consumed` | — | max_union_cached_prefilters_consumed | N >= 0 | 2000000000 (built-in 0) | prefilters | completion | expert profile only |
 | resources | `adaptive_fine_max_served_placements` | — | adaptive_fine_max_served_placements | N >= 0 | 2000000000 (built-in 0) | placements | completion | expert profile only |
 | resources | `emission_cache_bytes` | — | emission_cache_bytes | N >= 0 | 512 MiB (built-in 0) | bytes | computation | expert profile only |
-| resources | `repair_origin_cache_bytes` | --repair-origin-cache-bytes | repair_origin_cache_bytes | N >= 0 | 768 MiB (built-in 384 MiB) | bytes | computation | expert profile only |
-| resources | `repair_tie_seed_cache_bytes` | --repair-tie-seed-cache-bytes | repair_tie_seed_cache_bytes | N >= 0 | 0 | bytes | computation | expert profile only |
+| resources | `repair_origin_cache_bytes` | — | repair_origin_cache_bytes | N >= 0 | 768 MiB (built-in 384 MiB) | bytes | computation | expert profile only |
+| resources | `repair_tie_seed_cache_bytes` | — | repair_tie_seed_cache_bytes | N >= 0 | 0 | bytes | computation | expert profile only |
 | resources | `union_placement_cache_bytes` | — | union_placement_cache_bytes | N >= 0 | 512 MiB (built-in 0) | bytes | computation | expert profile only |
 | resources | `union_origin_cache_bytes` | — | union_origin_cache_bytes | N >= 0 | 1 GiB (built-in 0) | bytes | computation | expert profile only |
 | resources | `union_prefilter_cache_bytes` | — | union_prefilter_cache_bytes | N >= 0 | 128 MiB (built-in 0) | bytes | computation | expert profile only |
@@ -202,8 +224,7 @@ from the parser and the preset):
 | resources | `repair_round1_origin_admission` | — | repair_round1_origin_admission | existing \| reuse_only_experimental | reuse_only_experimental (built-in existing) | - | computation | expert profile only |
 | resources | `union_progressive_schedule` | — | union_progressive_schedule | off \| experimental_v1 | off | - | computation | expert profile only |
 | resources | `adaptive_emission_handoff` | — | adaptive_emission_handoff | 0 \| 1 | 0 | - | computation | expert profile only |
-| reporting | `--dosage-mode off\|audit\|repair` | — | — | off \| audit \| repair | off | - | reporting | supported |
-| reporting | `--output-schema sequence_first_v2\|legacy\|sequence_first_v1` | — | output_schema | sequence_first_v2 \| legacy \| sequence_first_v1 | sequence_first_v2 (built-in legacy) | - | reporting+completion | supported |
+| reporting | `reporting contract (output_schema)` | — | output_schema | sequence_first_v2 | sequence_first_v2 (built-in legacy) | - | reporting | fixed |
 | reporting | `--representation-guard on\|off` | — | representation_guard | on \| off | on (built-in off) | - | reporting | supported |
 | reporting | `compound_annotation` | — | compound_annotation | off \| contract_v2 | contract_v2 (built-in off) | - | reporting | expert profile only |
 | reporting | `compound_interval_declarations` | — | compound_interval_declarations | a file | — | - | reporting | expert profile only |
@@ -213,10 +234,12 @@ from the parser and the preset):
 | reporting | `block_diagnostics` | — | block_diagnostics | off \| diagnostic_v1 | off | - | reporting | expert profile only |
 | reporting | `emission_lookup_timing` | — | emission_lookup_timing | 0 \| 1 | 0 | - | reporting | expert profile only |
 | legacy | `--max-candidates` | — | — | - | refused | - | - | legacy |
-| legacy | `--dosage-audit off\|shadow` | — | — | off \| shadow | off | - | reporting | legacy |
-| legacy | `--phase-audit-candidates N` | — | phase_audit_candidates | N >= 0 | 0 | candidates | reporting | development |
-| legacy | `--dosage-allocation-test` | — | — | flag | off | - | reporting | development |
-| legacy | `--library-diagnostic` | — | — | flag | off | - | reporting | development |
+| legacy | `phase_audit_candidates` | — | phase_audit_candidates | N >= 0 | 0 | candidates | reporting | expert profile only |
+| legacy | `--output-schema` | — | — | - | refused | - | - | removed |
+| legacy | `--dosage-mode, --dosage-audit` | — | — | - | refused | - | - | removed |
+| legacy | `--phase-audit-candidates` | — | — | - | refused | - | - | removed |
+| legacy | `--repair-origin-cache-bytes, --repair-tie-seed-cache-bytes` | — | — | - | refused | - | - | removed |
+| legacy | `--dosage-allocation-test, --library-diagnostic` | — | — | - | refused | - | - | removed |
 | legacy | `diagnostic_* and test_* profile keys` | — | — | - | off | - | - | development |
 <!-- option-inventory:end -->
 
@@ -258,12 +281,11 @@ these, for example `profile my-limits` + `time_limit_seconds 900`.
 
 ## 5. Reporting and diagnostics
 
-- **The report contract:** `--output-schema` (default `sequence_first_v2`). The primary view is `assessment_v1` (§7.0). The
-  unrepaired view reports with `legacy`.
-- **The dosage check:** `--dosage-check` (an optional audit of the reported alleles; it never changes the prediction).
-  - The expert spelling is `--dosage-mode off|audit|repair`.
-  - `repair` (may replace a block) needs `--output-schema legacy` and is refused under v2.
-  - A contradiction with `--dosage-check` is refused.
+- **The report contract:** fixed, `sequence_first_v2`, recorded as `output_schema` (§2). The primary view is
+  `assessment_v1` (§7.0). The unrepaired development view still reports with `legacy`.
+- **The dosage check:** `--dosage-check`, an optional audit of the reported alleles. It reports findings or why it was
+  unavailable, and it **never replaces the prediction**. Without it, `dosage_check` is `NOT_REQUESTED`. It is the only
+  public dosage control: `--dosage-mode` and `--dosage-audit` were removed, and no profile key enables a dosage repair.
 - **Profile-only report keys** (`compound_annotation`, `compound_interval_declarations`, `block_support_rule`,
   `library_sensitivity_audit`, `timing_detail`, `block_diagnostics`, `emission_lookup_timing`) are in the inventory.
 - **The older headline fields** (`genotype_filter`, `dosage_filter`, `phase_filter`, `call_summary`) are **superseded
@@ -373,10 +395,14 @@ PROVISIONAL or absent result as a completed one.
 
 **Diagnostic and test settings** (refused or unsupported for production use):
 - `diagnostic_*` keys and `test_*` hooks;
-- `--dosage-allocation-test`, `--library-diagnostic`, `--dosage-audit off|shadow` (an older spelling of `--dosage-mode
-  off|audit`);
-- the cache flags `--repair-origin-cache-bytes` and `--repair-tie-seed-cache-bytes`;
-- `phase_audit_candidates`.
+- the profile key `phase_audit_candidates` (the unrepaired development view only).
+
+**Removed from the command line in M15-J** (each refused by name, with what replaces it; nothing is silently ignored):
+`--output-schema`, `--dosage-mode`, `--dosage-audit`, `--phase-audit-candidates` (the profile key remains),
+`--repair-origin-cache-bytes` and `--repair-tie-seed-cache-bytes` (the profile keys remain), `--dosage-allocation-test` and
+`--library-diagnostic`. `--max-candidates` stays refused. The behaviour behind them (the legacy and `sequence_first_v1`
+contracts, the dosage repair, the dosage allocation test, the library diagnostic) remains reachable only through the
+internal API, for regression tests.
 
 **No CLI exists for these:**
 - **In-process multi-sample reuse** (one process analysing several samples against one prepared locus): library/API-level,
@@ -406,8 +432,7 @@ panvar genotype --graph locus.gfa --reference-path NAME [--panel-curation FILE] 
   panel-extension and marker-panel versions; the identity (graph SHA-256, reference, bubbles, `min_variant_bp`, curation,
   k, s); the model fingerprint; the file size and SHA-256; and the preparation and write times.
 - **An existing file is never overwritten** (refused, exit 2).
-- **Refused in build mode:** sample arguments (`--reads1/2`, `--library`, `--out`, `--dosage-check`, `--dosage-mode`) and
-  `--panel-index`.
+- **Refused in build mode:** sample arguments (`--reads1/2`, `--library`, `--out`, `--dosage-check`) and `--panel-index`.
 - **Nothing else is written:** no output prefix is cleared, no sample report is created and no cache is left. The one
   temporary, a sorted graph next to the index, is removed.
 
@@ -491,12 +516,14 @@ keys and the removed `--max-candidates`) are unchanged.
 
 ## 10. Recommended future removals and aliases (not implemented; each needs separate approval)
 
+**Done in M15-J:** `--output-schema`, `--dosage-mode`, `--dosage-audit`, `--phase-audit-candidates`, the cache flag
+spellings, `--dosage-allocation-test` and `--library-diagnostic` are refused by name; repeated `--profile` is refused.
+
 **Remove** (after the experimental release):
-- the superseded headline columns, or move them behind a flag;
-- `--dosage-audit` (an older spelling of `--dosage-mode`);
+- the superseded headline columns, or move them behind a flag (after the assessment no longer reads the legacy block
+  table: M15-J `DESIGN.md` §3);
 - the refused `--max-candidates` message;
-- the `legacy_i2a` store layout;
-- the `--repair-origin-cache-bytes` / `--repair-tie-seed-cache-bytes` diagnostic flag spellings (the profile keys remain).
+- the `legacy_i2a` store layout.
 
 **Consider aliases or flags:**
 - `--time-limit SECONDS` and `--memory-limit BYTES` for the two run guards, which are now profile-only;

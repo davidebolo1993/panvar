@@ -21,6 +21,7 @@
 namespace {
 
 std::string dir;
+std::string source_dir_for_profiles;   // M15-J: the evidence profiles are read from the source tree when it is given
 std::string path(const std::string& name) { return dir + "/" + name; }
 void require(bool ok, const std::string& what) { if (!ok) throw std::runtime_error(what); }
 
@@ -126,30 +127,42 @@ Outcome parse(const std::vector<std::string>& args, panvar::GenotypeCommandOptio
     return out;
 }
 
-// S1-B: output_schema is validated, recorded with its source, and refused where it has no pooled decision to report.
-// M15-D: the short-read preset sets sequence_first_v2; an explicit schema overrides it.
+// M15-J: one public reporting contract. The preset's sequence_first_v2 is recorded with its source; no flag or profile
+// selects another; the unrepaired development view keeps its legacy report, recorded inactive (a reported dependency,
+// unchanged in M15-J). The internal API keeps every contract for regression tests.
 void test_output_schema() {
     panvar::GenotypeCommandOptions kept;
-    require(parse({"--output-schema", "sequence_first_v1"}, &kept).error.empty() &&
-                kept.output_schema == "sequence_first_v1" &&
-                kept.setting_sources.at("output_schema") == "flag --output-schema",
-            "--output-schema sequence_first_v1 is accepted and recorded with its source");
     require(parse({}, &kept).error.empty() && kept.output_schema == "sequence_first_v2" &&
                 kept.setting_sources.at("output_schema") == "preset short-read (default)",
-            "unset, the schema is the preset's sequence_first_v2, recorded as such");
-    require(parse({"--output-schema", "sequence_first"}).error.find("'output_schema' is legacy, sequence_first_v1 or sequence_first_v2") !=
-                std::string::npos,
-            "an unknown schema is refused");
-    for (const std::vector<std::string>& unsupported :
-         {std::vector<std::string>{"--output-schema", "sequence_first_v1", "--adaptive-repair", "off"},
-          std::vector<std::string>{"--repair-rounds", "0", "--output-schema", "sequence_first_v1"},
-          std::vector<std::string>{"--output-schema", "sequence_first_v2", "--adaptive-repair", "off"}}) {
-        require(parse(unsupported).error.find("needs the adaptive repair") != std::string::npos,
-                "an explicit sequence-first schema without the adaptive repair is refused, never a silent legacy fallback");
+            "unset, the contract is the preset's sequence_first_v2, recorded as such");
+    for (const char* value : {"legacy", "sequence_first_v1", "sequence_first_v2"}) {
+        require(parse({"--output-schema", value}).error.find("--output-schema was removed") != std::string::npos,
+                std::string("--output-schema ") + value + " is refused by name");
     }
-    require(parse({"--output-schema", "legacy", "--adaptive-repair", "off"}).error.empty(),
-            "an explicit legacy schema is accepted on every route");
-    std::cout << "  output_schema: preset v2 by default, validated, recorded with its source, explicit refusals kept\n";
+    for (const char* value : {"legacy", "sequence_first_v1", "sequence_first"}) {
+        write(path("schema_profile.tsv"), std::string("profile\tschema\noutput_schema\t") + value + "\n");
+        require(parse({"--profile", path("schema_profile.tsv")}).error.find("'output_schema' cannot select a reporting contract") !=
+                    std::string::npos,
+                std::string("a profile cannot select another reporting contract (") + value + ")");
+    }
+    write(path("schema_profile.tsv"), "profile\tschema\noutput_schema\tsequence_first_v2\n");
+    require(parse({"--profile", path("schema_profile.tsv")}, &kept).error.empty() && kept.output_schema == "sequence_first_v2",
+            "a profile may restate the fixed contract (the evidence profiles do)");
+    for (const char* locus : {"c4", "cyp2d6", "acot"}) {
+        const std::string evidence = source_dir_for_profiles + "/profiles/genotype_experimental_sr_v1_" + locus + ".tsv";
+        if (source_dir_for_profiles.empty()) break;
+        require(parse({"--profile", evidence}, &kept).error.empty() && kept.output_schema == "sequence_first_v2",
+                std::string("the evidence profile still parses: ") + locus);
+    }
+    for (const std::vector<std::string>& unrepaired :
+         {std::vector<std::string>{"--adaptive-repair", "off"}, std::vector<std::string>{"--repair-rounds", "0"}}) {
+        require(parse(unrepaired, &kept).error.empty() && kept.output_schema == "legacy" &&
+                    kept.setting_sources.at("output_schema").find("(inactive: the unrepaired view has no pooled decision") !=
+                        std::string::npos,
+                "the unrepaired view keeps its legacy report, recorded inactive with the reason (dependency, unchanged)");
+    }
+    std::cout << "  reporting contract: preset v2, recorded; no flag or profile selects another; the unrepaired view's "
+                 "legacy report recorded inactive\n";
 }
 
 // M15-D: the accelerated configuration is the preset's, recorded per key; preset features whose requirements a flag
@@ -193,11 +206,9 @@ void test_preset_configuration() {
                     std::string("the switched-off preset key is recorded inactive with its reason: ") + key);
         }
     }
-    require(parse({"--output-schema", "legacy"}, &kept).error.empty() && kept.early_incumbent == "off" &&
-                kept.compound_annotation == "off" && kept.setting_sources.at("early_incumbent").find("(inactive: ") != std::string::npos,
-            "an explicit legacy schema switches the preset's v2-only features off");
-    write(path("explicit_early.tsv"), "profile\texplicit-early\noutput_schema\tlegacy\nearly_incumbent\texperimental_v1\n");
-    require(parse({"--profile", path("explicit_early.tsv")}).error.find("early_incumbent") != std::string::npos,
+    write(path("explicit_early.tsv"), "profile\texplicit-early\nearly_incumbent\texperimental_v1\n");
+    require(parse({"--profile", path("explicit_early.tsv"), "--adaptive-repair", "off"}).error.find("early_incumbent") !=
+                std::string::npos,
             "the same feature set explicitly keeps its refusal");
     std::cout << "  preset: accelerated keys recorded from the preset, model neighbourhood bound, no time limit or dosage; "
                  "inactive preset features recorded, explicit ones refused\n";
@@ -208,9 +219,8 @@ void test_preset_configuration() {
 void test_panel_index_flags() {
     require(parse({"--build-panel-index", "x.pvpl", "--panel-index", "x.pvpl"}).error.find("cannot be combined") != std::string::npos,
             "--build-panel-index with --panel-index is refused");
-    for (const char* sample_arg : {"--reads1", "--reads2", "--library", "--out", "--out-prefix", "-o", "--dosage-mode", "--dosage-audit"}) {
-        const std::string value = std::string(sample_arg) == "--dosage-mode" ? "audit" : std::string(sample_arg) == "--dosage-audit" ? "shadow" : "v";
-        require(parse({"--build-panel-index", "x.pvpl", sample_arg, value}).error.find("is a sample argument") != std::string::npos,
+    for (const char* sample_arg : {"--reads1", "--reads2", "--library", "--out", "--out-prefix", "-o"}) {
+        require(parse({"--build-panel-index", "x.pvpl", sample_arg, "v"}).error.find("is a sample argument") != std::string::npos,
                 std::string("--build-panel-index refuses ") + sample_arg);
     }
     require(parse({"--build-panel-index", "x.pvpl", "--dosage-check"}).error.find("is a sample argument") != std::string::npos,
@@ -227,36 +237,23 @@ void test_dosage_check_contract() {
     require(parse({}, &kept).error.empty() && kept.dosage_mode == "off" && !kept.dosage_mode_explicit &&
                 kept.dosage_mode_source == "default",
             "no flag: dosage off (not evaluated), source default");
-    require(parse({"--output-schema", "sequence_first_v2"}, &kept).error.empty() && kept.dosage_mode == "off",
-            "an explicit v2 no longer implies the audit");
     require(parse({"--dosage-check"}, &kept).error.empty() && kept.dosage_mode == "audit" && kept.dosage_mode_explicit &&
                 kept.dosage_mode_source == "flag --dosage-check",
             "--dosage-check runs the audit, source flag --dosage-check");
-    require(parse({"--dosage-check", "--dosage-mode", "audit"}, &kept).error.empty() && kept.dosage_mode == "audit" &&
-                kept.dosage_mode_source == "flag --dosage-mode and flag --dosage-check",
-            "--dosage-check with an explicit audit is consistent");
-    require(parse({"--dosage-mode", "audit"}, &kept).error.empty() && kept.dosage_mode == "audit",
-            "the expert spelling --dosage-mode audit still runs the audit");
-    for (const std::vector<std::string>& contradiction :
-         {std::vector<std::string>{"--dosage-check", "--dosage-mode", "off"}, std::vector<std::string>{"--dosage-mode", "off", "--dosage-check"},
-          std::vector<std::string>{"--dosage-check", "--dosage-audit", "off"},
-          std::vector<std::string>{"--dosage-check", "--output-schema", "legacy", "--dosage-mode", "repair"}}) {
-        require(parse(contradiction).error.find("--dosage-check contradicts") != std::string::npos,
-                "a contradiction with --dosage-check is refused, in either order");
+    for (const std::vector<std::string>& removed :
+         {std::vector<std::string>{"--dosage-mode", "audit"}, std::vector<std::string>{"--dosage-mode", "repair"},
+          std::vector<std::string>{"--dosage-mode", "off"}, std::vector<std::string>{"--dosage-audit", "shadow"},
+          std::vector<std::string>{"--dosage-check", "--dosage-mode", "repair"}}) {
+        const std::string error = parse(removed).error;
+        require(error.find("was removed: dosage is an audit only") != std::string::npos && error.find("--dosage-check") != std::string::npos,
+                "a removed dosage spelling is refused with a pointer to --dosage-check: " + removed[0] + " " + removed[1]);
     }
-    write(path("dosage_off.tsv"), "profile\tdosage-off\ndosage_mode\toff\n");
-    require(!parse({"--profile", path("dosage_off.tsv"), "--dosage-check"}).error.empty(),
-            "dosage is not a profile key: a profile cannot set or silently disable it");
-    require(parse({"--dosage-mode", "repair"}).error.find("--dosage-mode repair is not available under output_schema sequence_first_v2") !=
-                std::string::npos,
-            "repair under the default v2 report is refused");
-    require(parse({"--output-schema", "legacy", "--dosage-mode", "repair"}, &kept).error.empty() && kept.dosage_mode == "repair",
-            "the legacy repair stays reachable through the explicit legacy interface");
-    require(parse({"--output-schema", "sequence_first_v1", "--dosage-mode", "repair"}, &kept).error.empty() &&
-                kept.dosage_mode == "repair",
-            "sequence_first_v1 still accepts repair (its meaning is unchanged)");
-    require(parse({"--dosage-audit", "shadow"}, &kept).error.empty() && kept.dosage_mode == "audit",
-            "--dosage-audit shadow is still audit");
+    for (const char* key : {"dosage_mode", "dosage_audit", "dosage_check"}) {
+        write(path("dosage_profile.tsv"), std::string("profile\tdosage\n") + key + "\trepair\n");
+        require(parse({"--profile", path("dosage_profile.tsv"), "--dosage-check"}).error.find("is not a profile setting") !=
+                    std::string::npos,
+                std::string("a profile cannot set the dosage stage: ") + key);
+    }
     // S1-D.1: the shared resolver, as the direct command API and the prepared route apply it
     {
         panvar::GenotypeCommandOptions o;   // dosage fields as constructed
@@ -272,7 +269,7 @@ void test_dosage_check_contract() {
         o.dosage_mode = "repair";
         o.dosage_mode_explicit = flagged;
         const std::optional<std::string> refused = panvar::resolve_dosage_contract(o);
-        require(refused && refused->find("legacy contract") != std::string::npos,
+        require(refused && refused->find("internal API with the legacy contract") != std::string::npos,
                 std::string("API: v2 repair is refused (") + (flagged ? "declared" : "set by value") + ")");
     }
     {
@@ -295,8 +292,8 @@ void test_dosage_check_contract() {
         o.dosage_mode = "bogus";
         require(panvar::resolve_dosage_contract(o).has_value(), "API: an unknown dosage mode is refused");
     }
-    std::cout << "  dosage: off unless --dosage-check (or an expert mode), contradictions refused in either order, repair "
-                 "only under the legacy interface; one resolver for CLI and API\n";
+    std::cout << "  dosage: off unless --dosage-check; the expert spellings and profile keys refused; repair only through "
+                 "the internal API's legacy contract; one resolver for CLI and API\n";
 }
 
 void test_repair_option_order() {
@@ -355,26 +352,59 @@ void test_repair_option_order() {
     std::cout << "  repair options: " << cases.size() << " combinations, both orders identical; contradictions refused\n";
 }
 
-void test_cache_flag_provenance() {
+// M15-J: removed spellings are refused by name with what replaces them; the cache budgets stay profile keys with their
+// provenance; one profile per run.
+void test_removed_options() {
+    const std::vector<std::pair<std::vector<std::string>, std::string>> removed = {
+        {{"--output-schema", "legacy"}, "--output-schema was removed"},
+        {{"--dosage-mode", "audit"}, "--dosage-mode was removed"},
+        {{"--dosage-audit", "shadow"}, "--dosage-audit was removed"},
+        {{"--phase-audit-candidates", "8"}, "set the profile key phase_audit_candidates"},
+        {{"--repair-origin-cache-bytes", "123"}, "set the profile key repair_origin_cache_bytes"},
+        {{"--repair-tie-seed-cache-bytes", "456"}, "set the profile key repair_tie_seed_cache_bytes"},
+        {{"--dosage-allocation-test"}, "--dosage-allocation-test was removed"},
+        {{"--library-diagnostic"}, "--library-diagnostic was removed"},
+        {{"--max-candidates", "4"}, "--max-candidates is now --max-mosaic-candidates"},
+    };
+    for (const auto& [args, needle] : removed) {
+        std::vector<std::string> with = {"--graph", "g.gfa", "--threads", "2"};
+        with.insert(with.end(), args.begin(), args.end());
+        require(parse(with).error.find(needle) != std::string::npos, "refused by name: " + args[0] + " (" + parse(with).error + ")");
+        std::vector<std::string> first = args;
+        first.insert(first.end(), {"--help"});
+        require(parse(first).error.find(needle) != std::string::npos, "refused before --help is honoured: " + args[0]);
+    }
     panvar::GenotypeCommandOptions options;
-    require(parse({"--repair-origin-cache-bytes", "123", "--repair-tie-seed-cache-bytes", "456"}, &options).error.empty(),
-            "the diagnostic cache flags must parse");
-    require(options.repair_origin_cache_bytes == 123 && options.repair_tie_seed_cache_bytes == 456, "the values must be applied");
-    require(options.setting_sources.at("repair_origin_cache_bytes") == "flag --repair-origin-cache-bytes" &&
-                options.setting_sources.at("repair_tie_seed_cache_bytes") == "flag --repair-tie-seed-cache-bytes",
-            "without a profile, .settings.tsv must name the flags as the source");
-    require(panvar::genotype_setting_value(options, "repair_origin_cache_bytes") == "123" &&
-                panvar::genotype_setting_value(options, "repair_tie_seed_cache_bytes") == "456",
-            "the recorded effective values must be the flags' values");
+    write(path("cache_profile.tsv"), "profile\tcache\nrepair_origin_cache_bytes\t123\nrepair_tie_seed_cache_bytes\t456\n");
+    require(parse({"--profile", path("cache_profile.tsv")}, &options).error.empty() && options.repair_origin_cache_bytes == 123 &&
+                options.repair_tie_seed_cache_bytes == 456 &&
+                options.setting_sources.at("repair_origin_cache_bytes").rfind("profile ", 0) == 0 &&
+                options.setting_sources.at("repair_tie_seed_cache_bytes").rfind("profile ", 0) == 0,
+            "the cache budgets remain profile keys, recorded with the profile as source");
+    write(path("bad_cache.tsv"), "profile\tbad\nrepair_origin_cache_bytes\t12x\n");
+    require(!parse({"--profile", path("bad_cache.tsv")}).error.empty(), "a malformed byte count must be refused");
+    write(path("phase_profile.tsv"), "profile\tphase\nphase_audit_candidates\t8\n");
+    require(parse({"--profile", path("phase_profile.tsv"), "--adaptive-repair", "off"}, &options).error.empty() &&
+                options.phase_audit_candidates == 8,
+            "phase_audit_candidates remains a profile key (unrepaired development view)");
     write(path("plain_profile.tsv"), "profile\tplain\n");
-    require(parse({"--profile", path("plain_profile.tsv"), "--repair-origin-cache-bytes", "789"}, &options).error.empty(),
-            "the flag beside a profile must parse");
-    bool listed = false;
-    for (const std::string& o : options.overridden_settings) listed |= o == "repair_origin_cache_bytes=789";
-    require(listed && options.setting_sources.at("repair_origin_cache_bytes") == "flag --repair-origin-cache-bytes",
-            "beside a profile the flag must be recorded as an override");
-    require(!parse({"--repair-origin-cache-bytes", "12x"}).error.empty(), "a malformed byte count must be refused");
-    std::cout << "  cache flags: effective values and 'flag --...' sources recorded, with and without a profile\n";
+    require(parse({"--profile", path("plain_profile.tsv"), "--profile", path("plain_profile.tsv")}).error.find(
+                "--profile was given 2 times") != std::string::npos,
+            "a repeated --profile is refused");
+    write(path("twice.tsv"), "profile\ttwice\nkmer_size\t31\nkmer_size\t29\n");
+    require(parse({"--profile", path("twice.tsv")}).error.find("is set twice") != std::string::npos, "a key set twice is refused");
+    write(path("nameless.tsv"), "kmer_size\t31\n");
+    require(parse({"--profile", path("nameless.tsv")}).error.find("does not name itself") != std::string::npos,
+            "a profile without its profile<TAB>name row is refused");
+    write(path("unknown.tsv"), "profile\tunknown\nno_such_key\t1\n");
+    require(parse({"--profile", path("unknown.tsv")}).error.find("unknown setting 'no_such_key'") != std::string::npos,
+            "an unknown profile key is refused");
+    write(path("override.tsv"), "profile\toverride\nkmer_size\t29\nsyncmer_s\t11\n");
+    require(parse({"--kmer-size", "27", "--profile", path("override.tsv")}, &options).error.empty() && options.kmer_size == 27 &&
+                options.syncmer_s == 11 && options.setting_sources.at("kmer_size") == "flag --kmer-size",
+            "precedence: a flag overrides the profile, which overrides the preset, whatever the order");
+    std::cout << "  removed options: " << removed.size() << " refused by name (before --help); cache budgets and "
+                 "phase_audit_candidates remain profile keys; one profile per run\n";
 }
 
 void test_help_text() {
@@ -406,8 +436,9 @@ void test_help_text() {
                                "conditional on the explored candidates", "prior-dependent does not mean the prior alone chose the call",
                                "assessed once\n                       per locus", "coverage and not_assessed list",
                                "a missing check is not a failure", "not calibrated reliability", "no quality threshold",
-                               "superseded\ncompatibility diagnostics", "0 PREDICTION, 3 PROVISIONAL, 1 NO_PREDICTION", "0 a\ngenotype was emitted",
-                               "1 no-call", "2 argument, input or output error", "124 time limit", "125 footprint\nlimit", "sampled"}) {
+                               "superseded\ncompatibility diagnostics", "0 PREDICTION, 3 PROVISIONAL, 1 NO_PREDICTION", "0 a genotype was\nemitted",
+                               "1 no-call", "2 argument, input or output error", "124 time\nlimit", "125 footprint limit", "sampled",
+                               "unrepaired development view (see --help-advanced) still reports the legacy contract"}) {
         require(h.find(needle) != std::string::npos, std::string("--help must say: ") + needle);
     }
     // the headline-filter explanation is gone from the basic help (only named as superseded diagnostics)
@@ -432,11 +463,16 @@ void test_help_text() {
                                "default: model (the model-derived bound) (built-in 670)", "expert profile only",
                                "changes: completion", "changes: computation", "changes: inference", "changes: reporting",
                                "per-mate edit budget", "substitutions + gap bases", "cannot be supplied", "some path spans at least N bp",
-                               "SAMPLED every 100 ms", "older spelling of --dosage-mode", "refused under adaptive repair",
-                               "sequence_first_v2 | legacy | sequence_first_v1"}) {
+                               "SAMPLED every 100 ms", "refused under adaptive repair",
+                               "Profiles (--profile FILE): optional overrides, never required", "a repeated --profile is refused",
+                               "literal key<TAB>value", "'profile<TAB>NAME' is required", "profile<TAB>my_overrides",
+                               "footprint_limit_bytes<TAB>4294967296", "A flag given beside the profile overrides it",
+                               "A profile cannot select a reporting contract", "--output-schema", "removed: genotyping reports the sequence-first v2 contract",
+                               "--dosage-mode, --dosage-audit", "removed: dosage is an audit only",
+                               "--repair-origin-cache-bytes, --repair-tie-seed-cache-bytes", "default: refused"}) {
         require(a.find(needle) != std::string::npos, std::string("--help-advanced must say: ") + needle);
     }
-    require(a.find("--repair-origin-cache-bytes") != std::string::npos, "the diagnostic cache flag spellings are documented as aliases of their keys");
+    require(a.find("(alias --repair-origin-cache-bytes)") == std::string::npos, "the removed cache flag spellings are not documented as aliases");
     require(a.find("calibrated reliab") != std::string::npos && a.find("reliable call") == std::string::npos, "no reliability claim");
     // every public setting and every accepted user key appears in the inventory (nothing left as an unexplained key)
     std::set<std::string> keys;
@@ -538,8 +574,9 @@ int main(int argc, char** argv) {
     try {
         test_library_file();
         test_repair_option_order();
-        test_cache_flag_provenance();
+        test_removed_options();
         test_help_text();
+        if (argc >= 3) source_dir_for_profiles = argv[2];
         if (argc >= 3) test_guide_inventory(argv[2]);
         test_output_schema();
         test_preset_configuration();

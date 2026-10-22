@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
 """--dosage-mode integration gate (docs/modules/genotype.md, Dosage modes), on one C4 campaign cell re-run
-end to end with `panvar genotype`:
+end to end with `panvar genotype`.
+
+M15-J: --dosage-mode and --output-schema were removed from the command line (refused, exit 2). This historical gate (not
+registered in ctest) reproduces only with a binary built before M15-J (for example the M15-I release candidate, panvar
+SHA-256 3f7e03a4...); the dosage modes remain reachable through the internal API (GenotypeCommandOptions).
+
 
   identity   the flag absent and `--dosage-mode off` equal the sealed 11fe681 outputs (normalised as the shadow gate
              normalises them) and add exactly the ordinary outputs written since that campaign: <prefix>.locus_genotype.tsv,

@@ -2756,6 +2756,16 @@ void apply_genotype_profile(const std::string& path, GenotypeCommandOptions& opt
         const std::string key = line.substr(0, tab);
         const std::string value = line.substr(tab + 1);
         if (!seen.insert(key).second) throw std::runtime_error("profile " + path + ": '" + key + "' is set twice");
+        // M15-J: no profile reaches an older reporting contract or the dosage stage. output_schema may only restate the
+        // fixed contract (the evidence profiles record it, and their bytes are cited by the sealed packages).
+        if (key == "output_schema" && value != "sequence_first_v2") {
+            throw std::runtime_error("profile " + path + ": 'output_schema' cannot select a reporting contract: genotyping "
+                                     "reports sequence_first_v2 (a profile may only restate that value)");
+        }
+        if (key == "dosage_mode" || key == "dosage_audit" || key == "dosage_check") {
+            throw std::runtime_error("profile " + path + ": '" + key + "' is not a profile setting: dosage is an audit only, "
+                                     "requested with --dosage-check, and never replaces the prediction");
+        }
         if (key == "profile") options.profile_name = value;
         else apply_genotype_setting("profile " + path, key, value, options);
     }
@@ -8233,8 +8243,6 @@ const AdvancedFlag kAdvancedFlags[] = {
     {"--proposal-state-limit", "proposal_state_limit", false, "mosaic proposal beam width"},
     {"--mismatch-band", "mismatch_band", false,
      "per-mate edit budget of the banded gapped placement model (substitutions + gap bases)"},
-    {"--phase-audit-candidates", "phase_audit_candidates", false,
-     "candidates in the phase audit set (0: none); at least --mosaic-candidates", true},
     {"--repair-local-pairs", "repair_local_pairs", false, "allele pairs per block in a repair neighbourhood"},
     {"--repair-max-neighbours", "repair_max_neighbours", false, "declared bound on one repair neighbourhood (0: none)"},
     {"--repair-tie-branching", "repair_tie_branching", true, "exact branch-and-pool at improving-move ties"},
@@ -8284,7 +8292,7 @@ const OptionEntry kOptionEntries[] = {
     {"everyday", "--threads N", "", "threads", "N >= 1", "worker threads", "computation", "everyday",
      "worker threads; results do not depend on them; memory is not divided per thread", ""},
     {"everyday", "--dosage-check", "", "", "flag", "-", "reporting", "everyday",
-     "the optional copy-number audit of the reported alleles; never changes the prediction; adds run time; refused beside a contradicting --dosage-mode", "off (dosage_check NOT_REQUESTED)"},
+     "the optional copy-number audit of the reported alleles; never changes the prediction; adds run time; the only public dosage control (dosage is never repaired)", "off (dosage_check NOT_REQUESTED)"},
     {"everyday", "--build-panel-index FILE", "", "", "a new file path", "-", "computation", "everyday",
      "build the sample-independent panel index (structural model + marker panel) and stop; no reads, library or output prefix; never overwrites; refused beside --panel-index or a sample argument", "none"},
     {"everyday", "--panel-index FILE", "", "", "an index path", "-", "computation", "everyday",
@@ -8303,7 +8311,7 @@ const OptionEntry kOptionEntries[] = {
     {"input", "--preset short-read", "", "", "short-read", "-", "inference+computation", "supported",
      "the production algorithm, short-read constants and the accelerated configuration; always applied (long-read is refused, not implemented)", "short-read"},
     {"input", "--profile FILE", "", "", "key<TAB>value file naming itself", "-", "any", "supported",
-     "optional expert override; repeated files apply in order; a key set twice in one file is refused; not by itself a validated configuration", "none"},
+     "optional expert overrides, never required: one file of literal key<TAB>value lines with a profile<TAB>name row; precedence default < preset < profile < flag; given once (a repeated --profile is refused); a key set twice is refused; output_schema may only restate sequence_first_v2 and dosage_mode is not a profile setting; not by itself a validated configuration", "none"},
     // 2. copying prior and marker/placement model
     {"model", "--switch-probability P", "", "switch_probability", "0 < P <= 0.5", "per block boundary", "inference", "supported",
      "the DONOR-REDRAW probability of the Li-Stephens copying prior: how often a haplotype is allowed to change panel donor at a block boundary; a prior regularisation, NOT a biological recombination probability", ""},
@@ -8352,8 +8360,8 @@ const OptionEntry kOptionEntries[] = {
     {"resources", "max_union_cached_prefilters_consumed", "", "max_union_cached_prefilters_consumed", "N >= 0", "prefilters", "completion", "expert profile only", "served-work capacity of the prefilter reuse route", ""},
     {"resources", "adaptive_fine_max_served_placements", "", "adaptive_fine_max_served_placements", "N >= 0", "placements", "completion", "expert profile only", "served-work capacity of the fine adaptive discovery store", ""},
     {"resources", "emission_cache_bytes", "", "emission_cache_bytes", "N >= 0", "bytes", "computation", "expert profile only", "retained emission cache (reuse only; not a work cap)", ""},
-    {"resources", "repair_origin_cache_bytes", "--repair-origin-cache-bytes", "repair_origin_cache_bytes", "N >= 0", "bytes", "computation", "expert profile only", "retained refinement origin cache", ""},
-    {"resources", "repair_tie_seed_cache_bytes", "--repair-tie-seed-cache-bytes", "repair_tie_seed_cache_bytes", "N >= 0", "bytes", "computation", "expert profile only", "retained tie-branch seed cache", ""},
+    {"resources", "repair_origin_cache_bytes", "", "repair_origin_cache_bytes", "N >= 0", "bytes", "computation", "expert profile only", "retained refinement origin cache", ""},
+    {"resources", "repair_tie_seed_cache_bytes", "", "repair_tie_seed_cache_bytes", "N >= 0", "bytes", "computation", "expert profile only", "retained tie-branch seed cache", ""},
     {"resources", "union_placement_cache_bytes", "", "union_placement_cache_bytes", "N >= 0", "bytes", "computation", "expert profile only", "retained union placement cache", ""},
     {"resources", "union_origin_cache_bytes", "", "union_origin_cache_bytes", "N >= 0", "bytes", "computation", "expert profile only", "retained union origin cache", ""},
     {"resources", "union_prefilter_cache_bytes", "", "union_prefilter_cache_bytes", "N >= 0", "bytes", "computation", "expert profile only", "retained union prefilter cache", ""},
@@ -8374,10 +8382,8 @@ const OptionEntry kOptionEntries[] = {
     {"resources", "union_progressive_schedule", "", "union_progressive_schedule", "off | experimental_v1", "-", "computation", "expert profile only", "progressive union schedule (not in the tested configuration)", ""},
     {"resources", "adaptive_emission_handoff", "", "adaptive_emission_handoff", "0 | 1", "-", "computation", "expert profile only", "union-to-adaptive emission handoff (not in the tested configuration)", ""},
     // 5. reporting and diagnostics
-    {"reporting", "--dosage-mode off|audit|repair", "", "", "off | audit | repair", "-", "reporting", "supported",
-     "expert spelling of the dosage stage: audit = --dosage-check; repair (may replace a block) needs --output-schema legacy and is refused under sequence_first_v2", "off"},
-    {"reporting", "--output-schema sequence_first_v2|legacy|sequence_first_v1", "", "output_schema", "sequence_first_v2 | legacy | sequence_first_v1", "-", "reporting+completion", "supported",
-     "the report contract and its exit statuses; v2 carries the primary assessment_v1 view; the unrepaired view reports with legacy", ""},
+    {"reporting", "reporting contract (output_schema)", "", "output_schema", "sequence_first_v2", "-", "reporting", "fixed",
+     "the reporting contract, recorded as output_schema in .settings.tsv; not a flag; a profile may only restate sequence_first_v2 (the evidence profiles do). The unrepaired development view (--adaptive-repair off) still reports legacy, recorded with source '(inactive: ...)'", ""},
     {"reporting", "--representation-guard on|off", "", "representation_guard", "on | off", "-", "reporting", "supported", "the representation-conflict check (feeds genotype_check CONFLICT)", ""},
     {"reporting", "compound_annotation", "", "compound_annotation", "off | contract_v2", "-", "reporting", "expert profile only", "the compound annotation (.sequence_compound.tsv); needs sequence_first_v2", ""},
     {"reporting", "compound_interval_declarations", "", "compound_interval_declarations", "a file", "-", "reporting", "expert profile only", "model-bound compound interval declarations (not in the tested configuration)", ""},
@@ -8388,11 +8394,13 @@ const OptionEntry kOptionEntries[] = {
     {"reporting", "emission_lookup_timing", "", "emission_lookup_timing", "0 | 1", "-", "reporting", "expert profile only", "measurement only (not for production calls)", ""},
     // 6. legacy and development compatibility
     {"legacy", "--max-candidates", "", "", "-", "-", "-", "legacy", "removed: refused with a pointer to --mosaic-candidates (every panel diplotype is always a candidate)", "refused"},
-    {"legacy", "--dosage-audit off|shadow", "", "", "off | shadow", "-", "reporting", "legacy", "older spelling of --dosage-mode off|audit", "off"},
-    {"legacy", "--phase-audit-candidates N", "", "phase_audit_candidates", "N >= 0", "candidates", "reporting", "development",
-     "the phase audit set of the unrepaired view; refused under adaptive repair", ""},
-    {"legacy", "--dosage-allocation-test", "", "", "flag", "-", "reporting", "development", "allocation test diagnostic of the dosage stage", "off"},
-    {"legacy", "--library-diagnostic", "", "", "flag", "-", "reporting", "development", "writes the library estimate beside a declared library", "off"},
+    {"legacy", "phase_audit_candidates", "", "phase_audit_candidates", "N >= 0", "candidates", "reporting", "expert profile only",
+     "the phase audit set of the unrepaired development view; refused under adaptive repair", ""},
+    {"legacy", "--output-schema", "", "", "-", "-", "-", "removed", "removed: genotyping reports the sequence-first v2 contract, recorded as output_schema in .settings.tsv (the unrepaired development view, --adaptive-repair off, still reports legacy, recorded the same way); historical contracts are not selectable", "refused"},
+    {"legacy", "--dosage-mode, --dosage-audit", "", "", "-", "-", "-", "removed", "removed: dosage is an audit only (--dosage-check) and never replaces the prediction", "refused"},
+    {"legacy", "--phase-audit-candidates", "", "", "-", "-", "-", "removed", "removed from the command line: the profile key phase_audit_candidates remains for the unrepaired development view", "refused"},
+    {"legacy", "--repair-origin-cache-bytes, --repair-tie-seed-cache-bytes", "", "", "-", "-", "-", "removed", "removed from the command line: the profile keys repair_origin_cache_bytes and repair_tie_seed_cache_bytes remain", "refused"},
+    {"legacy", "--dosage-allocation-test, --library-diagnostic", "", "", "-", "-", "-", "removed", "removed: development diagnostics, not available from the command line", "refused"},
     {"legacy", "diagnostic_* and test_* profile keys", "", "", "-", "-", "-", "development",
      "test hooks (diagnostic_union_evidence_dump, diagnostic_union_kernel_dump, diagnostic_refinement_memory, diagnostic_refinement_replay, test_interrupt_point, test_library_sensitivity_fail_view); not user settings", "off"},
 };
@@ -8473,9 +8481,16 @@ std::string genotype_advanced_help() {
            "every effective setting and its source is written to <prefix>.settings.tsv. 'changes' says what an option\n"
            "can alter: inference (the prediction may change), computation (time or memory only; results gated\n"
            "identical), reporting (outputs or annotations only), completion (whether or how a run completes: caps,\n"
-           "guards, budget stops). 'expert profile only' controls have no flag: set them as key<TAB>value in a\n"
-           "--profile file. Defaults are the effective short-read values (the built-in value is shown where it\n"
-           "differs).\n";
+           "guards, budget stops). 'expert profile only' controls have no flag: set them in a --profile file.\n"
+           "Defaults are the effective short-read values (the built-in value is shown where it differs).\n\n"
+           "Profiles (--profile FILE): optional overrides, never required; an ordinary run needs none. One file per\n"
+           "run (a repeated --profile is refused). Each line is a literal key<TAB>value; blank lines and lines\n"
+           "starting with # are ignored; one row 'profile<TAB>NAME' is required and names the file in the records;\n"
+           "a key set twice is refused; an unknown key is refused. A profile cannot select a reporting contract\n"
+           "(output_schema may only restate sequence_first_v2) and cannot set the dosage stage (dosage_mode). A flag\n"
+           "given beside the profile overrides it. Minimal working profile (TAB-separated):\n"
+           "    profile<TAB>my_overrides\n"
+           "    footprint_limit_bytes<TAB>4294967296\n";
     for (const auto& [group, title] : kOptionGroups) {
         if (group == "everyday") continue;
         out << "\n" << title << "\n";
@@ -8512,6 +8527,35 @@ std::string genotype_advanced_help() {
     return out.str();
 }
 
+namespace {
+// M15-J: options removed from the public interface. Each is refused by name, with what replaces it, before anything is read
+// or written; none is silently ignored. The behaviour behind them stays reachable through the internal API
+// (GenotypeCommandOptions) where regression tests and diagnostics need it.
+const std::map<std::string, std::string>& removed_genotype_options() {
+    static const std::map<std::string, std::string> removed = {
+        {"--output-schema", "--output-schema was removed: genotyping reports the sequence-first v2 contract, recorded as "
+                            "output_schema in .settings.tsv; historical reporting contracts are not selectable"},
+        {"--dosage-mode", "--dosage-mode was removed: dosage is an audit only and never replaces the prediction; use "
+                          "--dosage-check to audit the reported alleles"},
+        {"--dosage-audit", "--dosage-audit was removed: dosage is an audit only and never replaces the prediction; use "
+                           "--dosage-check to audit the reported alleles"},
+        {"--phase-audit-candidates", "--phase-audit-candidates was removed from the command line: set the profile key "
+                                     "phase_audit_candidates (unrepaired development view only)"},
+        {"--repair-origin-cache-bytes", "--repair-origin-cache-bytes was removed from the command line: set the profile key "
+                                        "repair_origin_cache_bytes"},
+        {"--repair-tie-seed-cache-bytes", "--repair-tie-seed-cache-bytes was removed from the command line: set the profile "
+                                          "key repair_tie_seed_cache_bytes"},
+        {"--dosage-allocation-test", "--dosage-allocation-test was removed: a development diagnostic of the dosage stage, "
+                                     "not available from the command line"},
+        {"--library-diagnostic", "--library-diagnostic was removed: a development diagnostic, not available from the "
+                                 "command line"},
+        {"--max-candidates", "--max-candidates is now --max-mosaic-candidates: every panel diplotype is always a candidate, "
+                             "and K counts only the off-panel mosaics added to it"},
+    };
+    return removed;
+}
+}  // namespace
+
 std::optional<int> parse_genotype_arguments(const std::vector<std::string>& args, GenotypeCommandOptions& options,
                                             std::ostream& out) {
     const auto need = [&](std::size_t& i) {
@@ -8524,6 +8568,22 @@ std::optional<int> parse_genotype_arguments(const std::vector<std::string>& args
     // needs an explicit --adaptive-repair off. The preset is applied once, the last --preset given or the default.
     options.preset_name = "short-read";
     options.preset_explicit = false;
+    // Removed options are refused first, whatever else the command says (M15-J). Every argument is checked, so a value
+    // spelled exactly like a removed option is refused too; no path or name needs that spelling.
+    for (const std::string& a : args) {
+        const auto it = removed_genotype_options().find(a);
+        if (it != removed_genotype_options().end()) throw std::runtime_error(it->second);
+    }
+    // One profile per run: its file is what the status names (profile, profile_name, profile_sha256), so a second file
+    // would apply settings the record does not identify.
+    {
+        std::size_t profiles = 0;
+        for (const std::string& a : args) profiles += a == "--profile" ? 1 : 0;
+        if (profiles > 1) {
+            throw std::runtime_error("--profile was given " + std::to_string(profiles) + " times: give one profile file "
+                                     "(merge the settings into one file; a key set twice is refused)");
+        }
+    }
     for (std::size_t i = 0; i < args.size(); ++i) {
         if (args[i] != "--preset") continue;
         options.preset_name = need(i);
@@ -8556,7 +8616,6 @@ std::optional<int> parse_genotype_arguments(const std::vector<std::string>& args
         else if (flag == "--max-mosaic-candidates" || flag == "--mosaic-candidates") {
             apply_genotype_setting("flag " + flag, "max_mosaic_candidates", need(i), options);
         }
-        else if (flag == "--output-schema") apply_genotype_setting("flag --output-schema", "output_schema", need(i), options);
         else if (flag == "--repair-rounds") repair_rounds_flag = need(i);   // resolved with --adaptive-repair below
         else if (flag == "--adaptive-repair") {
             adaptive_repair_flag = need(i);
@@ -8575,39 +8634,9 @@ std::optional<int> parse_genotype_arguments(const std::vector<std::string>& args
             apply_genotype_setting("flag " + flag, a.key, v, options);
             if (std::string(a.key) == "repair_tie_branching") tie_branching_flag = v;
         }
-        // Diagnostic cache budgets (not in the help): validated and recorded as flags, so .settings.tsv and the status
-        // name their effective value and source like every other setting.
-        else if (flag == "--repair-origin-cache-bytes") {
-            apply_genotype_setting("flag --repair-origin-cache-bytes", "repair_origin_cache_bytes", need(i), options);
-        }
-        else if (flag == "--repair-tie-seed-cache-bytes") {
-            apply_genotype_setting("flag --repair-tie-seed-cache-bytes", "repair_tie_seed_cache_bytes", need(i), options);
-        }
-        else if (flag == "--max-candidates") {
-            throw std::runtime_error("--max-candidates is now --max-mosaic-candidates: every panel diplotype is "
-                                     "always a candidate, and K counts only the off-panel mosaics added to it");
-        }
-        else if (flag == "--dosage-allocation-test") options.dosage_allocation_test = true;
-        else if (flag == "--dosage-audit") {
-            // the shadow-port spelling of --dosage-mode off|audit
-            const std::string v = need(i);
-            if (v != "off" && v != "shadow") throw std::runtime_error("--dosage-audit takes off or shadow");
-            options.dosage_mode = v == "shadow" ? "audit" : "off";
-            options.dosage_mode_explicit = true;   // S1-D.1: a declared mode (sequence_first_v2 keeps it)
-            options.dosage_mode_source = "flag --dosage-audit";
-        }
-        else if (flag == "--library-diagnostic") options.library_diagnostic = true;
         else if (flag == "--dosage-check") options.dosage_check_flag = true;   // M15-D: resolved after every flag
         else if (flag == "--build-panel-index") options.build_panel_index_path = need(i);   // M15-E
         else if (flag == "--panel-index") options.panel_index_path = need(i);               // M15-E
-        else if (flag == "--dosage-mode") {
-            options.dosage_mode = need(i);
-            options.dosage_mode_explicit = true;
-            options.dosage_mode_source = "flag --dosage-mode";
-            if (options.dosage_mode != "off" && options.dosage_mode != "audit" && options.dosage_mode != "repair") {
-                throw std::runtime_error("--dosage-mode takes off, audit or repair");
-            }
-        }
         else if (flag == "-q" || flag == "--quiet") options.quiet = true;
         else if (flag == "-h" || flag == "--help") {
             out <<
@@ -8662,10 +8691,10 @@ std::optional<int> parse_genotype_arguments(const std::vector<std::string>& args
                 "hides a finding. These assessments are not calibrated reliability, and there is no quality threshold. The\n"
                 "older headline fields (genotype_filter, dosage_filter, phase_filter, call_summary) are kept as superseded\n"
                 "compatibility diagnostics.\n\n"
-                "Exit status: sequence-first (default) 0 PREDICTION, 3 PROVISIONAL, 1 NO_PREDICTION; legacy schema 0 a\n"
-                "genotype was emitted, 1 no-call; both: 2 argument, input or output error; 124 time limit, 125 footprint\n"
-                "limit (the 6 GiB footprint guard is sampled, not an allocation ceiling). Full guide:\n"
-                "docs/guides/genotype_short_read.md.\n";
+                "Exit status: 0 PREDICTION, 3 PROVISIONAL, 1 NO_PREDICTION; 2 argument, input or output error; 124 time\n"
+                "limit, 125 footprint limit (the 6 GiB footprint guard is sampled, not an allocation ceiling). The\n"
+                "unrepaired development view (see --help-advanced) still reports the legacy contract: 0 a genotype was\n"
+                "emitted, 1 no-call. Full guide: docs/guides/genotype_short_read.md.\n";
             return 0;
         }
         else if (flag == "--help-advanced") {
@@ -8780,14 +8809,6 @@ std::optional<int> parse_genotype_arguments(const std::vector<std::string>& args
                 options.overridden_settings.push_back("max_mosaic_candidates=" +
                                                       std::to_string(options.max_mosaic_candidates));
             }
-            if (flag == "--repair-origin-cache-bytes") {
-                options.overridden_settings.push_back("repair_origin_cache_bytes=" +
-                                                      std::to_string(options.repair_origin_cache_bytes));
-            }
-            if (flag == "--repair-tie-seed-cache-bytes") {
-                options.overridden_settings.push_back("repair_tie_seed_cache_bytes=" +
-                                                      std::to_string(options.repair_tie_seed_cache_bytes));
-            }
             if (const AdvancedFlag* a = advanced_setting(flag)) {
                 options.overridden_settings.push_back(std::string(a->key) + "=" + genotype_setting_value(options, a->key));
             }
@@ -8801,7 +8822,7 @@ std::optional<int> parse_genotype_arguments(const std::vector<std::string>& args
                                      "genotype each sample with --panel-index");
         }
         static const std::set<std::string> sample_only = {"--reads1", "--reads2", "--library", "--out", "--out-prefix", "-o",
-                                                          "--dosage-check", "--dosage-mode", "--dosage-audit"};
+                                                          "--dosage-check"};
         for (const std::string& a : args) {
             if (sample_only.count(a) != 0) {
                 throw std::runtime_error("--build-panel-index builds the sample-independent index only and runs no sample: " + a +
@@ -8874,9 +8895,9 @@ std::optional<std::string> resolve_dosage_contract(GenotypeCommandOptions& optio
     // not evaluated; the audit runs only when requested and never changes the prediction.
     if (options.output_schema != "sequence_first_v2") return std::nullopt;
     if (options.dosage_mode == "repair") {
-        return "--dosage-mode repair is not available under output_schema sequence_first_v2: dosage is diagnostic there "
-               "(--dosage-check, or off) and never changes the prediction; reproduce historical repair results with the legacy "
-               "contract (--output-schema legacy --dosage-mode repair)";
+        return "dosage_mode repair is not available under output_schema sequence_first_v2: dosage is diagnostic there "
+               "(--dosage-check, or off) and never changes the prediction; historical repair results are reproduced only "
+               "through the internal API with the legacy contract";
     }
     if (options.dosage_mode_explicit && options.dosage_mode_source == "default") {
         options.dosage_mode_source = "caller_options";   // S1-D.1: declared off through dosage_mode_explicit

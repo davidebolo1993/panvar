@@ -107,16 +107,29 @@ const std::string kLibrary = "insert_mean_bp 300\ninsert_sd_bp 30\nsupport_sigma
 int run(const std::string& tag, const std::string& reads, const std::string& mode, const std::string& curation) {
     std::vector<std::string> args = {"--graph", path(tag + ".gfa"), "--reference-path", "sampleA#1#chr1:0-100",
                                      "--reads1", path(reads + "_r1.fq"), "--reads2", path(reads + "_r2.fq"),
-                                     "--library", path("library.txt"), "--dosage-mode", mode, "--threads", "2",
-                                     // M15-D: the legacy interface (its FASTA carries the sequences; dosage repair is legacy-only)
-                                     "--output-schema", "legacy",
+                                     "--library", path("library.txt"), "--threads", "2",
                                      "--out", path(tag + "." + mode + (curation.empty() ? "" : "." + std::filesystem::path(curation).stem().string())),
                                      "--quiet"};
     if (!curation.empty()) {
         args.push_back("--panel-curation");
         args.push_back(path(curation));
     }
-    return panvar::run_genotype_command(args);
+    // M15-J: the legacy contract (its FASTA carries the sequences) and the dosage modes, repair included, are internal: set
+    // through the API, as the removed --output-schema legacy / --dosage-mode flags did, with the preset's v2-only features
+    // (early incumbent, compound annotation) off.
+    panvar::GenotypeCommandOptions o;
+    std::ostringstream sink;
+    panvar::parse_genotype_arguments(args, o, sink);
+    o.output_schema = "legacy";
+    o.setting_sources["output_schema"] = "test (internal API)";
+    o.early_incumbent = "off";
+    o.setting_sources["early_incumbent"] = "test (internal API)";
+    o.compound_annotation = "off";
+    o.setting_sources["compound_annotation"] = "test (internal API)";
+    o.dosage_mode = mode;
+    o.dosage_mode_explicit = true;
+    o.dosage_mode_source = "test (internal API)";
+    return panvar::execute_genotype_command(o, nullptr);
 }
 
 std::map<std::string, std::string> status_of(const std::string& prefix) {

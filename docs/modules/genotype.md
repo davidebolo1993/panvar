@@ -46,12 +46,11 @@ It sets no time limit and no dosage stage. The usage guide lists every value. Se
 |------|--------------|---------|
 | `--library auto\|FILE` | estimate the library or declare it | `auto` (omitted = auto) |
 | `--dosage-check` | run the [dosage audit](#dosage-modes) of the reported alleles; never changes the prediction | not run (`dosage_check NOT_REQUESTED`) |
-| `--dosage-mode off\|audit\|repair` | expert spelling of the dosage stage. `audit` = `--dosage-check`; `repair` needs `--output-schema legacy`; a contradiction with `--dosage-check` is refused | `off` |
 | `--panel-curation <file>` | remove named paths from the active panel ([below](#panel-curation)) | — |
 | `--threads <N>` | worker threads; results do not depend on them | `1` |
 | `--mosaic-candidates <K>` | the **initial** off-panel mosaics evaluated beside the panel pairs (the refinement may add more); `0` evaluates panel pairs only | `128` |
 | `--bubbles <file>` | precomputed bubbles CSV instead of detected variant sites | detected |
-| `--profile <file>` | an optional expert override: a `key<TAB>value` settings file (it must name itself; repeated `--profile` files apply in order). `profiles/genotype_experimental_sr_v1_<locus>.tsv` reproduce the evidence configurations | — |
+| `--profile <file>` | optional expert overrides, never required: one `key<TAB>value` file with a `profile<TAB>name` row; given once (a repeated `--profile` is refused); a profile cannot select a reporting contract (`output_schema` may only restate `sequence_first_v2`) or set the dosage stage. `profiles/genotype_experimental_sr_v1_<locus>.tsv` reproduce the evidence configurations | — |
 | `--adaptive-repair on\|off`, `--repair-rounds <N>` | the bounded coordinate refinement (local moves scored exactly within declared caps; not a global optimum) and its round cap; `off` or `0` rounds gives the unrepaired view, with tie branching off. Contradictory combinations are refused | `on`, `32` |
 | `--build-panel-index <file>` / `--panel-index <file>` | build the sample-independent panel index once / genotype against it ([below](#panel-index-build-once-genotype-many)) | — |
 | `-q, --quiet` | no progress messages (warnings are still printed) | off |
@@ -79,11 +78,15 @@ reference, curation, bubbles, `--min-variant-bp`, `--kmer-size` or `--syncmer-s`
 
 ### Dosage modes
 
+The command has one dosage control, `--dosage-check`, which runs the audit. The modes below are the internal ones
+(`dosage_mode` in `GenotypeCommandOptions`); `repair` is reachable only through the internal API, under the legacy
+contract, for regression tests.
+
 | mode | what it does |
 |------|--------------|
-| `off` | no dosage stage |
-| `audit` | the dosage census, tests and repair search; writes `<prefix>.dosage_*` and never changes the reported genotype. It is not necessarily cheaper than `repair` |
-| `repair` | as `audit`, and applies each eligible complete diplotype repair; the caller's outputs are kept as `<prefix>.original.*` |
+| `off` | no dosage stage (the command's default; `dosage_check NOT_REQUESTED`) |
+| `audit` | `--dosage-check`: the dosage census, tests and repair search; writes `<prefix>.dosage_*` and never changes the reported genotype. It is not necessarily cheaper than `repair` |
+| `repair` | internal only: as `audit`, and applies each eligible complete diplotype repair; the caller's outputs are kept as `<prefix>.original.*` |
 
 A dosage-sensitive block ends in one of four states:
 - **Complete diplotype repair** (`COMPLETE_DIPLOTYPE_REPAIR`): the repaired content is complete and the diplotype is uniquely resolved within the declared model and search: the enumeration is complete and, for repeated units, the top allocation-equivalence set contains one unordered diplotype. "Complete" describes that scope, not biological truth. In repair mode it replaces the caller's block only when the run is a strict call, it is the only one at the locus, the reported haplotypes reproduce, and both repaired alleles belong to the active panel; otherwise the reason it was not applied is recorded.
@@ -156,7 +159,7 @@ guide §7.0.
 
 ### Sequence-first output (experimental, opt-in)
 
-**How to enable it.** Use `--output-schema sequence_first_v1` (profile key `output_schema`; built-in `legacy`, short-read preset `sequence_first_v2`).
+**How to enable it.** Through the internal API only (`output_schema sequence_first_v1` in `GenotypeCommandOptions`): since M15-J no flag or profile selects a reporting contract. The command reports v2 (below).
 
 **What it adds.** It reports the caller's existing decision by sequence pair instead of by block label. It changes no score, search, legacy output, dosage or phase decision. It needs the adaptive repair; other routes are refused.
 
@@ -182,7 +185,7 @@ guide §7.0.
 
 **When nothing is reported.** Watchdog stops, refusals and invalid input give no prediction. The five reports belong to the run: a later run at the same prefix, or a watchdog stop, removes them.
 
-**Dosage.** The report and its FASTA describe the caller's decision *before* the dosage stage (`dosage_scope`, `post_dosage_sequence`, `dosage_mode`). When `--dosage-mode repair` changes the legacy reported genotype, this FASTA is not the post-dosage sequence.
+**Dosage.** The report and its FASTA describe the caller's decision *before* the dosage stage (`dosage_scope`, `post_dosage_sequence`, `dosage_mode`). When a dosage repair (internal API, legacy contract only) changes the legacy reported genotype, this FASTA is not the post-dosage sequence.
 
 **Exit status under this schema:**
 - 0: a prediction, even when uncertain;
@@ -195,9 +198,10 @@ guide §7.0.
 
 ### Sequence-first output v2 (experimental; the short-read preset's report)
 
-**How it is selected.** The short-read preset sets `output_schema sequence_first_v2`, and `--output-schema` selects any schema
-explicitly. The unrepaired view (`--adaptive-repair off` or `--repair-rounds 0`) reports with `legacy`. `sequence_first_v1`
-and `legacy` are unchanged.
+**How it is selected.** The short-read preset sets `output_schema sequence_first_v2`, recorded in `.settings.tsv`; it is the
+command's only reporting contract (M15-J: `--output-schema` removed; a profile may only restate `sequence_first_v2`). The unrepaired
+development view (`--adaptive-repair off` or `--repair-rounds 0`) still reports with `legacy`, recorded as the preset's
+value made inactive. `sequence_first_v1` and `legacy` remain internal, unchanged.
 
 **What it adds to v1:**
 - **Panel membership.** Each predicted haplotype, completed or provisional, is classified by exact sequence identity, in the locus frame, against the active (curated) panel.
@@ -217,9 +221,10 @@ and `legacy` are unchanged.
 
 **Dosage is diagnostic under v2:**
 - **default:** not run, and reported as not evaluated. v2 no longer implies the audit;
-- **`--dosage-check`** (or `--dosage-mode audit`): the audit, which never changes the prediction;
-- **`repair`:** refused before the output prefix is touched. Reproduce historical repair results with the legacy contract
-  (`--output-schema legacy --dosage-mode repair`).
+- **`--dosage-check`:** the audit, which never changes the prediction (the only public dosage control; `--dosage-mode`
+  and `--dosage-audit` were removed in M15-J);
+- **`repair`:** not reachable from the command line or a profile. Through the internal API it is refused under v2;
+  historical repair results are reproduced only through the internal API with the legacy contract.
 
 The command line, `execute_genotype_command` and the prepared-locus command route all resolve this through one function, `resolve_dosage_contract`. An API caller declares a mode with `dosage_mode_explicit` or a non-default `dosage_mode`. `dosage_mode_source` records the setting actually used. `run_genotype` and `run_genotype_prepared` call the caller alone, with no dosage stage, and record `dosage_mode not_run`.
 
@@ -268,6 +273,4 @@ The audit never changes the prediction or its sequences. It is not run when the 
 panvar genotype --graph locus.gfa --reads1 R1.fq.gz --reads2 R2.fq.gz --out sample --threads 4
 panvar genotype --graph locus.gfa --reads1 R1.fq.gz --reads2 R2.fq.gz --out sample \
   --library library.txt --dosage-check --threads 4
-panvar genotype --graph locus.gfa --reads1 R1.fq.gz --reads2 R2.fq.gz --out sample \
-  --library library.txt --output-schema legacy --dosage-mode repair --threads 4   # the legacy repair
 ```
