@@ -19,7 +19,10 @@ BUDGET, PRE = 1800, 90.0
 UNITS = [("build", 300), ("cli_contract", 60), ("ex.help_text", 30), ("ex.preserved_c4", 150), ("ctest.full", 1250),
          # A1 (declared before the rerun): the preservation unit sliced the output suffix one character too far and compared
          # nothing (FileNotFoundError); the slice is fixed and the unit rerun (the failure stays recorded)
-         ("a1.ex.preserved_c4", 150)]
+         ("a1.ex.preserved_c4", 150),
+         # A2 (declared before the rerun): the status comparison lacked the exact caches' scheduling-dependent served-work
+         # counters (the allowance the e2e S2-G test already declares); every science check had passed
+         ("a2.ex.preserved_c4", 150)]
 
 
 def command(unit, d):

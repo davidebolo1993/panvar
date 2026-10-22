@@ -54,3 +54,14 @@ support, prior-dependent, locus-level phase, coverage).
 and stopped on a FileNotFoundError.
 
 **The fix:** the slice is corrected and the unit is rerun as `a1.ex.preserved_c4`.
+
+## Amendment A2 (declared before the rerun)
+
+**The failure:** `a1.ex.preserved_c4` passed 19 of 20 checks. Every science file was identical: settings, sequences,
+scores, candidates and the assessment.
+
+**The cause:** the status differed only in the exact caches' served-work counters (`emission_cache_*`,
+`union_prefilter_cache_*`, `union_block*_executed_dps`, `union_cached_prefilters_consumed`). These depend on scheduling at
+4 threads, and the e2e S2-G test already treats them as volatile.
+
+**The fix:** they are added to this check's volatile set, and the unit is rerun as `a2.ex.preserved_c4`.

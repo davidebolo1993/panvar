@@ -36,7 +36,9 @@ def ex_preserved_c4(d):
     new = sorted(f[2:] for f in os.listdir(d) if f.startswith("c4."))   # A1: the suffix keeps its leading dot
     old = sorted(f[2:] for f in os.listdir(os.path.dirname(M15G)) if f.startswith("c4."))
     check(new == old, f"c4: the same output files ({len(new)})")
-    volatile = ("seconds", "_bytes", "rss_", "footprint", "elapsed", "threads_peak", "_peak")
+    volatile = ("seconds", "_bytes", "rss_", "footprint", "elapsed", "threads_peak", "_peak",
+                # A2: the exact caches' served-work counters, scheduling-dependent at 4 threads (the e2e S2-G allowance)
+                "emission_cache_", "union_prefilter_cache_", "_executed_dps", "cached_prefilters_consumed")
     for suffix in new:
         a, b = open(out + suffix).read(), open(M15G + suffix).read()
         a = a.replace(out, "<RUN>").replace("c4_seq", "<RUN>_seq")
