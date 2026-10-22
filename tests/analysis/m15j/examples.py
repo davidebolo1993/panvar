@@ -167,6 +167,37 @@ def ex_refusals(d):
     return 0
 
 
+def index_equal_but_provenance(new, old):
+    """A1: the index equals M15-E's apart from the builder's recorded source revision (40 hex characters in the header) and the
+    32-byte header digest that covers it. Every other byte, the payload included, must be identical."""
+    a, b = open(new, "rb").read(), open(old, "rb").read()
+    check(len(a) == len(b), f"c4: the index has M15-E's size ({len(a)} bytes)")
+    diff = [i for i in range(min(len(a), len(b))) if a[i] != b[i]]
+    hexd = set(b"0123456789abcdef")
+    def run_of_hex(x, i):
+        lo = i
+        while lo > 0 and x[lo - 1] in hexd:
+            lo -= 1
+        hi = i
+        while hi < len(x) and x[hi] in hexd:
+            hi += 1
+        return lo, hi
+    rev = set()
+    for i in diff:
+        if 24 <= i < 56:
+            continue
+        lo, hi = run_of_hex(a, i)
+        if (lo, hi) == run_of_hex(b, i) and hi - lo == 40:
+            rev.add((lo, hi))
+    allowed = lambda i: 24 <= i < 56 or any(lo <= i < hi for lo, hi in rev)
+    check(diff and all(allowed(i) for i in diff) and len(rev) == 1,
+          f"c4: the index equals M15-E's apart from the builder revision field {sorted(rev)} and the header digest "
+          f"[24, 56) ({len(diff)} bytes differ)")
+    if rev:
+        lo, hi = next(iter(rev))
+        print(f"builder revision recorded: M15-J {a[lo:hi].decode()} vs M15-E {b[lo:hi].decode()}")
+
+
 def ex_index_c4(d):
     """The M15-E index build and load on C4 with the M15-J binary: the index bytes equal M15-E's index; the indexed run equals
     the cold run (the M15-E checks) and both equal M15-E's runs of the same commands."""
@@ -176,7 +207,7 @@ def ex_index_c4(d):
     p = run(M15E_X.locus_cmd("c4", ["--build-panel-index", idx]))
     check(p.returncode == 0 and os.path.exists(idx), "c4: index built")
     old_idx = f"{M15E}/ex.build_c4/index/c4.pvpl"
-    check(M15E_X.sha(idx) == M15E_X.sha(old_idx), f"c4: the index is byte-identical to M15-E's ({M15E_X.sha(idx)[:16]})")
+    index_equal_but_provenance(idx, old_idx)
     cold, ind = f"{d}/c4.cold", f"{d}/c4.index"
     p1 = run(E.cmd("c4", cold))
     p2 = run(E.cmd("c4", ind, extra=["--panel-index", idx]))

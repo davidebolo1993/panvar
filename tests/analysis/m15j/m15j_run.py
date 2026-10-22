@@ -19,7 +19,12 @@ OUT = f"{m11d.R}/m15j_interface_20261022"
 BUDGET, PRE = 2400, 240.0
 UNITS = [("build", 300), ("cli_contract", 60), ("ex.ordinary_c4", 150), ("ex.ordinary_cyp2d6", 200), ("ex.ordinary_acot", 300),
          ("ex.dosage_check_cyp2d6", 250), ("ex.dosage_check_c4", 150), ("ex.refusals", 120), ("ex.index_c4", 200),
-         ("ex.unrefined", 300), ("ctest.full", 1250)]
+         ("ex.unrefined", 300), ("ctest.full", 1250),
+         # A1 (declared before the rerun): ex.index_c4 required the index to be byte-identical to M15-E's, but the header records
+         # the builder's source revision (40 hex characters) and a 32-byte header digest covering it, so 71 bytes differ by
+         # design. 37 of 38 checks had passed (cold = indexed, both equal to M15-E). The check now allows exactly those two
+         # fields and requires every other byte to be identical; the unit is rerun (the failure stays recorded)
+         ("a1.ex.index_c4", 200)]
 
 
 def command(unit, d):
