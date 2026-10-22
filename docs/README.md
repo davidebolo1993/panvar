@@ -4,7 +4,7 @@ Documentation for the `panvar` CLI.
 
 | folder / file | what's in it |
 |---------------|--------------|
-| **[modules/](modules/)** | one short usage page per module: what it does, inputs, key options, outputs, limitations. |
+| **[modules/](modules/)** | module manuals: purpose, inputs, options, outputs and limitations; genotype includes its complete option inventory and assessment reference. |
 | **[algorithms/](algorithms/)** | how each module works and how its options change the result. |
 | **[walkthrough.md](walkthrough.md)** | the whole pipeline on one real locus, step by step with commands and plots. |
 | **[gwas.md](gwas.md)** | the association worked example on that locus: phenotype, multiple-testing correction, structure control. |
@@ -22,6 +22,6 @@ Documentation for the `panvar` CLI.
 6. [modules/describe.md](modules/describe.md) — per-bubble variant, k-mer and node/edge features.
 7. [modules/associate.md](modules/associate.md) — association testing on the `describe` features.
 
-- [modules/genotype.md](modules/genotype.md) — diplotype genotyping of a structural locus from paired short reads, with optional dosage audit and repair; also covers the `scripts/plot_genotype_results.py` report.
+- [modules/genotype.md](modules/genotype.md) — diplotype genotyping of a structural locus from paired short reads, automatic library estimation, optional audit-only dosage checking, reusable panel indexes and a documented primary assessment. Start here for short-read genotyping.
 - [modules/inspect.md](modules/inspect.md) — clustering, path FASTA, and node/edge matrices for a called bubble.
 - [modules/benchmark.md](modules/benchmark.md) — truth-event discovery, carrier assignment, and sequence reconstruction from caller output.

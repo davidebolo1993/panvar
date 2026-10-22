@@ -10,6 +10,8 @@ with `-DPANVAR_SLOW_TESTS=ON`.
 The `genotype_{smoke,cli,index,assessment,dosage,resources,exactness}.sh` scripts
 run named CTest groups: e.g. `bash tests/genotype_cli.sh build`.
 They fail if the group is missing. All groups also run in the ordinary full suite.
+The CLI group also checks public documentation links and the genotype manual;
+its generated option table is checked against the parser/preset by the C++ CLI contract.
 `helpers/` holds C++ assertions and independent Python oracles; `fixtures/`
 contains immutable profile parsing examples, not profiles users need to run.
 

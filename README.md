@@ -13,7 +13,26 @@ cmake --build build -j
 
 #### Requirements
 
-A C++17 compiler, CMake ≥ 3.16, `make`, and zlib. Five libraries ship as git submodules (hence the `git submodule update --init --recursive` step — nothing extra to install): `minimap2`, statically linked for INS-subtype realignment; `Eigen`, the header-only linear-algebra library used for linear mixed models; `edlib`, the bit-parallel edit-distance library behind the banded fit alignment; `abPOA` (with its nested `SIMDe`), the partial-order aligner behind `refine`; and `minigraph`, the progressive graph generator behind `rebuild`. A fast smoke test runs with `ctest --test-dir build --output-on-failure`.
+A C++17 compiler, CMake ≥ 3.16, `make`, and zlib. Five libraries ship as git submodules (hence the `git submodule update --init --recursive` step — nothing extra to install): `minimap2`, statically linked for INS-subtype realignment; `Eigen`, the header-only linear-algebra library used for linear mixed models; `edlib`, the bit-parallel edit-distance library behind the banded fit alignment; `abPOA` (with its nested `SIMDe`), the partial-order aligner behind `refine`; and `minigraph`, the progressive graph generator behind `rebuild`. Run the enabled regression suite with `ctest --test-dir build --output-on-failure` (several minutes, not just a smoke test). Genotype assessment fixtures require Python 3; plotting tests additionally require NumPy, pandas and matplotlib. See [tests/README.md](tests/README.md) for focused test groups.
+
+## Short-read genotyping (experimental)
+
+Genotype one diploid sample at one locus, using a graph panel and paired reads:
+
+```bash
+mkdir -p results
+./build/panvar genotype --graph locus.gfa --reference-path REF \
+  --reads1 sample.R1.fq.gz --reads2 sample.R2.fq.gz --threads 4 --out results/sample
+```
+
+Replace REF with the coordinate-reference path. The command estimates the library automatically and needs no
+profile. Add `--dosage-check` for a diagnostic copy-number audit; it never changes the prediction. The optional
+`--build-panel-index` / `--panel-index` flags reuse locus preparation across samples.
+
+Read the [genotype manual](docs/modules/genotype.md) for inputs, all flags, output layout, assessment meanings
+and evidence limits. Primary reports sit beside the output prefix; supporting reports are in its `.diagnostics/`
+directory. A completed prediction is not calibrated reliability. Evidence is limited to simulated short reads,
+with reserved evaluation at ACOT and development-only C4/CYP2D6 results. Long reads are not implemented.
 
 ## Docker
 

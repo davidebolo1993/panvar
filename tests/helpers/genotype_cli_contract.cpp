@@ -452,6 +452,13 @@ void test_help_text() {
                                "every other report (status,\nsettings, locus and block tables", "is in <prefix>.diagnostics/"}) {
         require(h.find(needle) != std::string::npos, std::string("--help must say: ") + needle);
     }
+    require(h.find("docs/modules/genotype.md") != std::string::npos &&
+                a.find("docs/modules/genotype.md") != std::string::npos,
+            "basic and advanced help point to the module manual");
+    require(h.find("docs/guides/") == std::string::npos && a.find("docs/guides/") == std::string::npos,
+            "help must not point to the retired guide directory");
+    require(a.find("<prefix>.diagnostics/<name>.settings.tsv") != std::string::npos,
+            "advanced help uses the current diagnostic settings path");
     // the headline-filter explanation is gone from the basic help (only named as superseded diagnostics)
     for (const char* gone : {"Headline filters, three independent verdicts", "PASS means the computational", "MODEL_ONLY_PHASE",
                              "--mosaic-candidates", "--adaptive-repair", "--profile FILE", "exact genotype =", "a validated settings profile"}) {
@@ -507,18 +514,18 @@ void test_help_text() {
                  "defaults, units, effects and terms; inventory covers every public and profile key\n";
 }
 
-// M15-H: the guide's option inventory is exactly the generated one (defaults tied to the parser and the preset)
-void test_guide_inventory(const std::string& source_dir) {
-    std::ifstream in(source_dir + "/docs/guides/genotype_short_read.md");
-    require(static_cast<bool>(in), "the guide is readable");
+// M15-H: the manual's option inventory is exactly the generated one (defaults tied to the parser and the preset)
+void test_manual_inventory(const std::string& source_dir) {
+    std::ifstream in(source_dir + "/docs/modules/genotype.md");
+    require(static_cast<bool>(in), "the module manual is readable");
     const std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
     const std::string begin = "<!-- option-inventory:begin -->\n", end = "<!-- option-inventory:end -->";
     const std::size_t b = text.find(begin), e = text.find(end);
-    require(b != std::string::npos && e != std::string::npos && e > b, "the guide carries the option-inventory block");
+    require(b != std::string::npos && e != std::string::npos && e > b, "the module manual carries the option-inventory block");
     const std::string block = text.substr(b + begin.size(), e - b - begin.size());
     require(block == panvar::genotype_option_inventory_markdown(),
-            "the guide's option inventory equals the generated inventory (regenerate it with genotype_cli_contract_test --print-inventory)");
-    std::cout << "  guide: the option inventory equals the generated one\n";
+            "the manual's option inventory equals the generated inventory (regenerate it with genotype_cli_contract_test --print-inventory)");
+    std::cout << "  manual: the option inventory equals the generated one\n";
 }
 
 std::map<std::string, std::string> locus_row(const std::string& file) {
@@ -577,7 +584,7 @@ void test_pre_block_no_call() {
 } // namespace
 
 int main(int argc, char** argv) {
-    if (argc == 2 && std::string(argv[1]) == "--print-inventory") {   // M15-H: the guide's block, regenerated
+    if (argc == 2 && std::string(argv[1]) == "--print-inventory") {   // M15-H: the manual's block, regenerated
         std::cout << panvar::genotype_option_inventory_markdown();
         return 0;
     }
@@ -593,7 +600,7 @@ int main(int argc, char** argv) {
         test_removed_options();
         test_help_text();
         if (argc >= 3) source_dir_for_profiles = argv[2];
-        if (argc >= 3) test_guide_inventory(argv[2]);
+        if (argc >= 3) test_manual_inventory(argv[2]);
         test_output_schema();
         test_preset_configuration();
         test_dosage_check_contract();

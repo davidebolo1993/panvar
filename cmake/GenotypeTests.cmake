@@ -23,6 +23,7 @@ foreach(required IN ITEMS
     "tests/real_data/c4.gfa.gz"
     "tests/helpers/assessment/assessment_spec.py"
     "tests/helpers/assessment/compare.py"
+    "tests/helpers/documentation_test.py"
     "tests/helpers/compound_annotation_test.cpp"
     "tests/helpers/genotype_assessment_main.cpp"
     "tests/helpers/genotype_batch_resource.cpp"
@@ -268,6 +269,8 @@ add_test(NAME panvar_genotype_report
          COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/tests/helpers/report_test.py ${CMAKE_CURRENT_SOURCE_DIR}/scripts)
 add_test(NAME panvar_genotype_source_tree_clean
          COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/helpers/source_tree_clean.sh)
+add_test(NAME panvar_genotype_documentation
+         COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/tests/helpers/documentation_test.py ${CMAKE_CURRENT_SOURCE_DIR})
 
 set_tests_properties(
     panvar_genotype_mosaic_core
@@ -278,6 +281,7 @@ set_tests_properties(
 
 set_tests_properties(
     panvar_genotype_cli_contract
+    panvar_genotype_documentation
     panvar_genotype_curation_contract
     panvar_genotype_source_tree_clean
     PROPERTIES LABELS "genotype;cli")

@@ -2693,7 +2693,7 @@ std::vector<std::pair<std::string, std::string>> genotype_preset_settings(const 
     if (name != "short-read") throw std::runtime_error("unknown --preset '" + name + "' (available: short-read)");
     // The production algorithm (adaptive repair, exact tie branching, the representation guard), the short-read
     // technology constants and (M15-D) the retained release-candidate configuration, so an ordinary run needs no profile
-    // (docs/guides/genotype_short_read.md, defaults table). Grouped by role:
+    // (docs/modules/genotype.md, defaults table). Grouped by role:
     //   exact computational backends and routes (results gated identical on completed runs) with their cache budgets and
     //   consumption capacities; one candidate-generation setting (repair_junction_proposals, JP1.1); the early evaluated
     //   incumbent (a PROVISIONAL checkpoint on a budget stop; completed runs unchanged); the sequence-first v2 report with
@@ -8562,7 +8562,7 @@ std::string genotype_advanced_help() {
     std::ostringstream out;
     out << "panvar genotype: every option, by purpose\n\n"
            "Precedence: explicit flag > profile (--profile) > preset > built-in default, whatever the argument order;\n"
-           "every effective setting and its source is written to <prefix>.settings.tsv. 'changes' says what an option\n"
+           "every effective setting and its source is written to <prefix>.diagnostics/<name>.settings.tsv. 'changes' says what an option\n"
            "can alter: inference (the prediction may change), computation (time or memory only; results gated\n"
            "identical), reporting (outputs or annotations only), completion (whether or how a run completes: caps,\n"
            "guards, budget stops). 'expert profile only' controls have no flag: set them in a --profile file.\n"
@@ -8607,7 +8607,7 @@ std::string genotype_advanced_help() {
         << wrap("Locus summaries must be read with their coverage counts and not_assessed list: a positive value covers "
                 "only the assessed blocks ([assessed/applicable] marks partial coverage).", 2, 112)
         << wrap("Nothing here is calibrated reliability; there is no quality threshold.", 2, 112);
-    out << "\nFull inventory with defaults: docs/guides/genotype_short_read.md (option inventory).\n";
+    out << "\nFull inventory with defaults: docs/modules/genotype.md (option inventory).\n";
     return out.str();
 }
 
@@ -8780,7 +8780,7 @@ std::optional<int> parse_genotype_arguments(const std::vector<std::string>& args
                 "compatibility diagnostics.\n\n"
                 "Exit status: 0 PREDICTION, 3 PROVISIONAL, 1 NO_PREDICTION; 2 argument, input or output error; 124 time\n"
                 "limit, 125 footprint limit (the 6 GiB footprint guard is sampled, not an allocation ceiling). Full guide:\n"
-                "docs/guides/genotype_short_read.md.\n";
+                "docs/modules/genotype.md.\n";
             return 0;
         }
         else if (flag == "--help-advanced") {
