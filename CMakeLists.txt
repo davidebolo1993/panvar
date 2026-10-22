@@ -510,7 +510,7 @@ if(PANVAR_BUILD_TESTING)
         target_link_libraries(genotype_cli_contract_test PRIVATE panvarlib)
         target_compile_options(genotype_cli_contract_test PRIVATE -Wall -Wextra -Wpedantic)
         add_test(NAME panvar_genotype_cli_contract
-                 COMMAND genotype_cli_contract_test ${CMAKE_CURRENT_BINARY_DIR}/genotype_cli_contract)
+                 COMMAND genotype_cli_contract_test ${CMAKE_CURRENT_BINARY_DIR}/genotype_cli_contract ${CMAKE_CURRENT_SOURCE_DIR})
         # --panel-curation removes templates from the callable panel: an allele only curated templates carry is reachable
         # by no stage, a shared allele keeps only retained provenance, and an insufficient active panel refuses.
         add_executable(genotype_curation_contract_test tests/genotype_curation_contract.cpp src/cli_utils.cpp)

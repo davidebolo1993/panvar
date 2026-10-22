@@ -45,17 +45,18 @@ It sets no time limit and no dosage stage. The usage guide lists every value. Se
 | flag | what it does | default |
 |------|--------------|---------|
 | `--library auto\|FILE` | estimate the library or declare it | `auto` (omitted = auto) |
-| `--dosage-check` | run the [dosage audit](#dosage-modes); never changes the prediction | not run (reported NOT_EVALUATED) |
+| `--dosage-check` | run the [dosage audit](#dosage-modes) of the reported alleles; never changes the prediction | not run (`dosage_check NOT_REQUESTED`) |
 | `--dosage-mode off\|audit\|repair` | expert spelling of the dosage stage. `audit` = `--dosage-check`; `repair` needs `--output-schema legacy`; a contradiction with `--dosage-check` is refused | `off` |
 | `--panel-curation <file>` | remove named paths from the active panel ([below](#panel-curation)) | — |
 | `--threads <N>` | worker threads; results do not depend on them | `1` |
-| `--mosaic-candidates <K>` | off-panel mosaics evaluated beside the panel pairs; `0` evaluates panel pairs only | `128` |
+| `--mosaic-candidates <K>` | the **initial** off-panel mosaics evaluated beside the panel pairs (the refinement may add more); `0` evaluates panel pairs only | `128` |
 | `--bubbles <file>` | precomputed bubbles CSV instead of detected variant sites | detected |
 | `--profile <file>` | an optional expert override: a `key<TAB>value` settings file (it must name itself; repeated `--profile` files apply in order). `profiles/genotype_experimental_sr_v1_<locus>.tsv` reproduce the evidence configurations | — |
 | `--adaptive-repair on\|off`, `--repair-rounds <N>` | the bounded coordinate refinement (local moves scored exactly within declared caps; not a global optimum) and its round cap; `off` or `0` rounds gives the unrepaired view, with tie branching off. Contradictory combinations are refused | `on`, `32` |
-| `-q, --quiet` | no progress messages | off |
+| `--build-panel-index <file>` / `--panel-index <file>` | build the sample-independent panel index once / genotype against it ([below](#panel-index-build-once-genotype-many)) | — |
+| `-q, --quiet` | no progress messages (warnings are still printed) | off |
 
-`panvar genotype --help-advanced` lists the scientific flags (marker k-mer and syncmer sizes, variant-site span, switch probability, proposal width, mismatch band, repair-neighbourhood bounds, tie branching, representation check), resource keys and their defaults.
+`panvar genotype --help-advanced` lists every option, grouped by purpose, with its accepted values, effective short-read default, units and what it can change (inference, computation, reporting or completion). The guide's option inventory is the same table, generated from the parser and checked by the test suite.
 
 ### Panel index (build once, genotype many)
 
@@ -155,7 +156,7 @@ guide §7.0.
 
 ### Sequence-first output (experimental, opt-in)
 
-**How to enable it.** Use `--output-schema sequence_first_v1` (profile key `output_schema`; default `legacy`).
+**How to enable it.** Use `--output-schema sequence_first_v1` (profile key `output_schema`; built-in `legacy`, short-read preset `sequence_first_v2`).
 
 **What it adds.** It reports the caller's existing decision by sequence pair instead of by block label. It changes no score, search, legacy output, dosage or phase decision. It needs the adaptive repair; other routes are refused.
 

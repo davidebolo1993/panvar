@@ -14,6 +14,8 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <iterator>
+#include <set>
 #include <vector>
 
 namespace {
@@ -380,37 +382,95 @@ void test_help_text() {
     std::ostringstream help, advanced;
     require(panvar::parse_genotype_arguments({"--help"}, options, help) == 0, "--help exits 0");
     require(panvar::parse_genotype_arguments({"--help-advanced"}, options, advanced) == 0, "--help-advanced exits 0");
-    const std::string h = help.str(), a = advanced.str();
-    for (const char* needle : {"0 a genotype was emitted", "1 no-call", "2 argument, input or output error", "124 time limit",
-                               "125 footprint limit", "LIBRARY_SENSITIVITY_NOT_EVALUATED", ".block_genotypes.tsv and\n  .genotypes.tsv",
-                               "A no-call is NO_CALL in all three", "not necessarily cheaper", "gap_open", "an unknown, repeated or missing key"}) {
+    const std::string h = help.str(), a_raw = advanced.str();
+    // the advanced help is wrapped by its generator: phrases are matched with whitespace runs collapsed
+    std::string a;
+    for (char c : a_raw) {
+        const bool ws = c == ' ' || c == '\n';
+        if (ws && !a.empty() && a.back() == ' ') continue;
+        a += ws ? ' ' : c;
+    }
+    // M15-H: the basic help leads with the ordinary command and the everyday options, in order
+    std::size_t at = 0;
+    for (const char* needle : {"--threads 4 --out <prefix>", "--build-panel-index <locus.pvpl>", "Everyday options:", "--graph FILE",
+                               "--reads1 FILE --reads2 FILE", "--out PREFIX", "--reference-path NAME", "--threads N", "--dosage-check",
+                               "--build-panel-index FILE", "--panel-index FILE", "-q, --quiet", "--help-advanced", "Outcomes:",
+                               "Primary assessment (assessment_v1)", "Exit status:"}) {
+        const std::size_t found = h.find(needle, at);
+        require(found != std::string::npos, std::string("--help must say, in order: ") + needle);
+        at = found;
+    }
+    for (const char* needle : {"No profile is needed", "estimated from the reads", "never a fallback", "It never changes the\n",
+                               "not necessarily cheaper", "still required and still read and hashed", "never rebuilt",
+                               "no FASTA is needed", "PROVISIONAL (the best fully evaluated candidate", "NO_PREDICTION (exit 1)",
+                               "conditional on the explored candidates", "prior-dependent does not mean the prior alone chose the call",
+                               "assessed once\n                       per locus", "coverage and not_assessed list",
+                               "a missing check is not a failure", "not calibrated reliability", "no quality threshold",
+                               "superseded\ncompatibility diagnostics", "0 PREDICTION, 3 PROVISIONAL, 1 NO_PREDICTION", "0 a\ngenotype was emitted",
+                               "1 no-call", "2 argument, input or output error", "124 time limit", "125 footprint\nlimit", "sampled"}) {
         require(h.find(needle) != std::string::npos, std::string("--help must say: ") + needle);
     }
-    require(h.find("FILE declares\n") == std::string::npos && h.find("declares every value") == std::string::npos,
-            "--help must not claim the file declares every value");
-    for (const char* needle : {"some path spans at least N bp inside it", "per-mate edit budget", "substitutions + gap bases",
-                               "cannot be supplied in the file", "explicit contradiction", "tie branching on with no rounds"}) {
+    // the headline-filter explanation is gone from the basic help (only named as superseded diagnostics)
+    for (const char* gone : {"Headline filters, three independent verdicts", "PASS means the computational", "MODEL_ONLY_PHASE",
+                             "--mosaic-candidates", "--adaptive-repair", "--profile FILE", "exact genotype =", "a validated settings profile"}) {
+        require(h.find(gone) == std::string::npos, std::string("--help must no longer carry: ") + gone);
+    }
+    // advanced help: the six purpose groups, in order, then the terms
+    at = 0;
+    for (const char* needle : {"1. Input and panel overrides", "2. Copying prior and marker / placement model",
+                               "3. Candidate generation and bounded refinement", "4. Resource limits, work caps, cache budgets and exact backends",
+                               "5. Reporting and diagnostics", "6. Legacy and development compatibility", "Terms (read before interpreting results)"}) {
+        const std::size_t found = a.find(needle, at);
+        require(found != std::string::npos, std::string("--help-advanced must have, in order: ") + needle);
+        at = found;
+    }
+    for (const char* needle : {"not a biological recombination probability", "INITIAL off-panel mosaics",
+                               "not a globally exhaustive search", "it is not a filter on final calls",
+                               "the substitution, outlier and gap parameters stay fixed", "Support is conditional on the explored candidates",
+                               "does not establish that the prior alone caused the selection", "not independently at each boundary",
+                               "coverage counts and not_assessed list", "no quality threshold",
+                               "default: model (the model-derived bound) (built-in 670)", "expert profile only",
+                               "changes: completion", "changes: computation", "changes: inference", "changes: reporting",
+                               "per-mate edit budget", "substitutions + gap bases", "cannot be supplied", "some path spans at least N bp",
+                               "SAMPLED every 100 ms", "older spelling of --dosage-mode", "refused under adaptive repair",
+                               "sequence_first_v2 | legacy | sequence_first_v1"}) {
         require(a.find(needle) != std::string::npos, std::string("--help-advanced must say: ") + needle);
     }
-    require(a.find("--repair-origin-cache-bytes") == std::string::npos && h.find("--repair-origin-cache-bytes") == std::string::npos,
-            "the diagnostic cache flags stay out of the help");
-    // M15-C: the user-facing corrections stay corrected
-    for (const char* needle : {"sequence_first_v2", "not calibrated reliability",
-                               "no combination of PASS values establishes an exact", "not a global optimum",
-                               "writes sequence_haplotypes.fa only when\n                             a haplotype is off-panel",
-                               "3 PROVISIONAL", "A profile is not by itself a validated configuration",
-                               // M15-D: the basic command
-                               "--dosage-check", "Without it dosage is not run", "omitted means auto (identical)",
-                               "never a fallback", "optional expert override", "No profile is needed",
-                               // M15-E: the panel-index flags
-                               "--build-panel-index FILE", "--panel-index FILE", "saves locus preparation, not the rest",
-                               "never overwritten", "still read and hashed", "never rebuilt"}) {
-        require(h.find(needle) != std::string::npos, std::string("--help must say: ") + needle);
+    require(a.find("--repair-origin-cache-bytes") != std::string::npos, "the diagnostic cache flag spellings are documented as aliases of their keys");
+    require(a.find("calibrated reliab") != std::string::npos && a.find("reliable call") == std::string::npos, "no reliability claim");
+    // every public setting and every accepted user key appears in the inventory (nothing left as an unexplained key)
+    std::set<std::string> keys;
+    for (const auto& r : panvar::genotype_option_inventory()) keys.insert(r.key);
+    for (const std::string& k : panvar::genotype_public_settings()) require(keys.count(k) != 0, "inventory lists public setting " + k);
+    for (const char* k : {"union_scoring_backend", "union_fragment_blocks", "early_incumbent", "repair_junction_proposals", "output_schema",
+                          "compound_annotation", "block_diagnostics", "copying_transition", "block_support_rule", "timing_detail",
+                          "indexed_union_store_bytes", "adaptive_fine_store_bytes", "marker_proposal_reuse_table_bytes"}) {
+        require(keys.count(k) != 0, std::string("inventory lists profile key ") + k);
     }
-    require(h.find("exact genotype =") == std::string::npos && h.find("the exact coordinate repair") == std::string::npos &&
-            h.find("a validated settings profile") == std::string::npos, "--help must not imply exact/validated results");
-    require(a.find("legacy|sequence_first_v1|sequence_first_v2") != std::string::npos, "--help-advanced must list sequence_first_v2");
-    std::cout << "  help: exit statuses, library contract, audit cost, headline scope and corrected flag meanings\n";
+    // effective defaults come from the preset and the built-in options
+    std::map<std::string, std::string> d;
+    for (const auto& r : panvar::genotype_option_inventory()) if (!r.key.empty()) d[r.key] = r.effective_default;
+    require(d.at("repair_max_neighbours").rfind("model", 0) == 0 && d.at("footprint_limit_bytes") == "6 GiB (built-in 0)" &&
+                d.at("time_limit_seconds") == "0" && d.at("output_schema") == "sequence_first_v2 (built-in legacy)" &&
+                d.at("max_mosaic_candidates") == "128" && d.at("switch_probability") == "0.01" && d.at("min_variant_bp") == "50" &&
+                d.at("kmer_size") == "31" && d.at("syncmer_s") == "15" && d.at("threads") == "1",
+            "inventory defaults equal the parser and preset");
+    std::cout << "  help: basic help leads with the everyday command and assessment_v1; advanced help by purpose with values, "
+                 "defaults, units, effects and terms; inventory covers every public and profile key\n";
+}
+
+// M15-H: the guide's option inventory is exactly the generated one (defaults tied to the parser and the preset)
+void test_guide_inventory(const std::string& source_dir) {
+    std::ifstream in(source_dir + "/docs/guides/genotype_short_read.md");
+    require(static_cast<bool>(in), "the guide is readable");
+    const std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    const std::string begin = "<!-- option-inventory:begin -->\n", end = "<!-- option-inventory:end -->";
+    const std::size_t b = text.find(begin), e = text.find(end);
+    require(b != std::string::npos && e != std::string::npos && e > b, "the guide carries the option-inventory block");
+    const std::string block = text.substr(b + begin.size(), e - b - begin.size());
+    require(block == panvar::genotype_option_inventory_markdown(),
+            "the guide's option inventory equals the generated inventory (regenerate it with genotype_cli_contract_test --print-inventory)");
+    std::cout << "  guide: the option inventory equals the generated one\n";
 }
 
 std::map<std::string, std::string> locus_row(const std::string& file) {
@@ -465,8 +525,12 @@ void test_pre_block_no_call() {
 } // namespace
 
 int main(int argc, char** argv) {
+    if (argc == 2 && std::string(argv[1]) == "--print-inventory") {   // M15-H: the guide's block, regenerated
+        std::cout << panvar::genotype_option_inventory_markdown();
+        return 0;
+    }
     if (argc < 2) {
-        std::cerr << "usage: genotype_cli_contract_test <scratch dir>\n";
+        std::cerr << "usage: genotype_cli_contract_test <scratch dir> [source dir] | --print-inventory\n";
         return 2;
     }
     dir = argv[1];
@@ -476,6 +540,7 @@ int main(int argc, char** argv) {
         test_repair_option_order();
         test_cache_flag_provenance();
         test_help_text();
+        if (argc >= 3) test_guide_inventory(argv[2]);
         test_output_schema();
         test_preset_configuration();
         test_dosage_check_contract();

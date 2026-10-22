@@ -71,20 +71,18 @@ its source is written to `<prefix>.settings.tsv`.
 
 **`--preset short-read`** is always applied, whether or not it is given. It names no locus and reads no repository file.
 It sets:
-- **the algorithm and constants:**
-  - `kmer_size` 31, `syncmer_s` 15, `min_variant_bp` 50, `switch_probability` 0.01;
-  - `proposal_state_limit` 256, `mismatch_band` 6, `phase_audit_candidates` 0;
-  - `repair_rounds` 32, `repair_tie_branching` on, `representation_guard` on.
-- **exact computational backends and routes** (§3, the performance table), plus `union_fragment_blocks` and
-  `repair_round1_origin_admission`.
-- **cache budgets and consumption capacities** (§4), and `max_state_classes` 6e8.
-- **candidate generation:** `repair_junction_proposals experimental_v1` (JP1.1). It can change predictions (§3).
-- **budget-stop behaviour:** `early_incumbent experimental_v1`.
-- **reporting:** `output_schema sequence_first_v2`, `compound_annotation contract_v2`, `timing_detail` 1.
-- **resources:**
-  - `footprint_limit_bytes` 6 GiB;
-  - `repair_max_neighbours model`;
-  - **no time limit.**
+- the production algorithm and the short-read constants (marker k-mer and syncmer sizes, site span, copying prior,
+  proposal width, placement band, refinement rounds, tie branching, representation guard);
+- the exact computational backends and routes, their cache budgets and consumption capacities, and the state-class work cap;
+- candidate generation: junction proposals (`repair_junction_proposals experimental_v1`, JP1.1), which can change
+  predictions;
+- budget-stop behaviour: `early_incumbent experimental_v1`;
+- reporting: `output_schema sequence_first_v2`, `compound_annotation contract_v2`, `timing_detail`;
+- resources: the 6 GiB footprint guard and the model-derived neighbourhood bound (`repair_max_neighbours model`); **no
+  time limit**.
+
+**Every value, and its built-in counterpart, is in the option inventory (§3).** That table is generated from the parser
+and the preset, and the test suite checks it.
 
 **Not set by the preset:** the dosage stage (`--dosage-check`), the reference, the panel curation and diagnostics.
 
@@ -104,91 +102,172 @@ run. This happens with `--adaptive-repair off`, `--repair-rounds 0` or `--output
 **A resource-adjusted run:** a one-key expert profile (for example `profile my-limits` + `time_limit_seconds 900`) on top of
 the preset. Alternatively, copy a complete profile and change only resource keys (§4).
 
-## 3. Scientific and search controls
+## 3. Options by purpose: the inventory
 
-The **Affects predictions?** column means:
-- **yes:** changing the value can change the reported haplotypes;
-- **route:** a computation path gated identical on completed runs;
-- **report:** outputs or annotations only.
+`panvar genotype --help` lists the everyday options. `--help-advanced` lists every option, grouped by purpose:
+1. input and panel overrides;
+2. the copying prior and the marker / placement model;
+3. candidate generation and bounded refinement;
+4. resource limits, work caps, cache budgets and exact backends;
+5. reporting and diagnostics;
+6. legacy and development compatibility.
 
-**Core settings** (flag = profile key; same parser):
+**Columns** (each entry gives its accepted values, effective short-read default, units, what it can change, and its
+status):
+- **changes:**
+  - **inference:** the prediction may change;
+  - **computation:** time or memory only; results gated identical on completed runs;
+  - **reporting:** outputs or annotations only;
+  - **completion:** whether or how a run completes (caps, guards, budget stops).
+- **status:**
+  - **everyday:** in `--help`;
+  - **supported:** an advanced flag;
+  - **expert profile only:** no flag; `key<TAB>value` in a `--profile` file;
+  - **legacy** or **development:** kept working, not for ordinary use.
+- **Aliases** are listed once, beside the preferred spelling.
 
-| flag / key | values | default (built-in → preset → tested profile) | affects predictions? | notes and refusals |
-|---|---|---|---|---|
-| `--kmer-size` / `kmer_size` | 1..31 | 31 → 31 | yes (markers) | |
-| `--syncmer-s` / `syncmer_s` | 1..k | 15 → 15 | yes | |
-| `--min-variant-bp` / `min_variant_bp` | ≥ 1 | 50 → 50 | yes (block decomposition) | |
-| `--switch-probability` / `switch_probability` | (0, 0.5] | 0.01 → 0.01 | yes (copying prior) | |
-| `--proposal-state-limit` / `proposal_state_limit` | ≥ 1 | 256 → 256 | yes (proposal beam) | |
-| `--mismatch-band` / `mismatch_band` | ≥ 0 | 6 → 6 | yes (placement model) | |
-| `--mosaic-candidates` / `max_mosaic_candidates` | ≥ 0 | 128 | yes | `--max-candidates` is removed and refused |
-| `--adaptive-repair` | on, off | on | yes | **bounded coordinate refinement:** local moves scored exactly within declared caps, **not a global optimum**. `off` is the unrepaired development view |
-| `--repair-rounds` / `repair_rounds` | ≥ 0 | 0 → 32 | yes | resolved with `--adaptive-repair` / tie branching. A contradiction (off with N > 0, on with 0, tie branching with 0 rounds) is refused |
-| `--repair-local-pairs` / `repair_local_pairs` | ≥ 1 | 32 | yes | |
-| `--repair-max-neighbours` / `repair_max_neighbours` | `model`, or ≥ 0 (0: none) | 670 → **`model`** (tested profiles: C4 670, CYP2D6 958, ACOT 1004) | yes, when numeric (a neighbourhood above it no-calls `neighbourhood_bound`) | **`model`:** the declared bound is the model's own structural maximum, `Σ_blocks 2·min(repair_local_pairs, a(a+1)/2)` (C4 670, CYP2D6 958, ACOT 998). It is recorded as `repair_neighbour_bound`. The locus-specific caps existed only to admit each locus, and each equalled or exceeded this maximum |
-| `--repair-tie-branching` / `repair_tie_branching` | on, off | off → on | yes | |
-| `--repair-tie-max-branches` / `repair_tie_max_branches` | ≥ 1 | 16 | yes (beyond it: no-call) | |
-| `--representation-guard` / `representation_guard` | on, off | off → on | report (GENOTYPE_FILTER) | |
-| `--phase-audit-candidates` | ≥ 0 | 0 | development only | refused under adaptive repair |
+**The inventory** (generated by `genotype_cli_contract_test --print-inventory`; the test suite fails if this table differs
+from the parser and the preset):
 
-**Experimental profile keys** (profile only; "preset" = the short-read preset's value):
+<!-- option-inventory:begin -->
+| group | option | aliases | profile key | values | effective default (short-read) | units | changes | status |
+|---|---|---|---|---|---|---|---|---|
+| everyday | `--graph FILE` | --gfa, -i | — | a GFA path | required | - | input | everyday |
+| everyday | `--reads1 FILE / --reads2 FILE` | — | — | FASTQ paths (.gz accepted) | required | - | input | everyday |
+| everyday | `--out PREFIX` | --out-prefix, -o | — | a path prefix | genotype | - | reporting | everyday |
+| everyday | `--reference-path NAME` | -r | — | a path name | the single path of the graph's RS:Z sample (refused, candidates listed, when absent or ambiguous) | - | inference | everyday |
+| everyday | `--threads N` | — | threads | N >= 1 | 1 | worker threads | computation | everyday |
+| everyday | `--dosage-check` | — | — | flag | off (dosage_check NOT_REQUESTED) | - | reporting | everyday |
+| everyday | `--build-panel-index FILE` | — | — | a new file path | none | - | computation | everyday |
+| everyday | `--panel-index FILE` | — | — | an index path | none (prepared in memory) | - | computation | everyday |
+| everyday | `-q, --quiet` | — | — | flag | off | - | reporting | everyday |
+| everyday | `-h, --help / --help-advanced` | — | — | flag | - | - | reporting | everyday |
+| input | `--library auto\|FILE` | — | — | auto, or a library file | auto | - | inference | supported |
+| input | `--panel-curation FILE` | — | — | a file of path names | none | - | inference | supported |
+| input | `--bubbles FILE` | — | — | a bubbles CSV | computed from the graph | - | inference | supported |
+| input | `--min-variant-bp N` | — | min_variant_bp | N >= 1 | 50 | bp | inference | supported |
+| input | `--preset short-read` | — | — | short-read | short-read | - | inference+computation | supported |
+| input | `--profile FILE` | — | — | key<TAB>value file naming itself | none | - | any | supported |
+| model | `--switch-probability P` | — | switch_probability | 0 < P <= 0.5 | 0.01 | per block boundary | inference | supported |
+| model | `--kmer-size K` | — | kmer_size | 1 <= K <= 31 | 31 | bp | inference | supported |
+| model | `--syncmer-s S` | — | syncmer_s | 1 <= S <= K | 15 | bp | inference | supported |
+| model | `--mismatch-band N` | — | mismatch_band | N >= 0 | 6 | edits per mate | inference | supported |
+| model | `copying_transition` | — | copying_transition | constant_v1 \| distance_ref_core_v1_experimental | constant_v1 | - | inference | expert profile only |
+| model | `copying_length_bp` | — | copying_length_bp | > 0 (hex double) | 0x0p+0 | bp | inference | expert profile only |
+| search | `--mosaic-candidates K` | --max-mosaic-candidates | max_mosaic_candidates | K >= 0 | 128 | mosaics | inference+computation | supported |
+| search | `--proposal-state-limit N` | — | proposal_state_limit | N >= 1 | 256 | beam states | inference | supported |
+| search | `--adaptive-repair on\|off` | — | — | on \| off | on | - | inference | supported |
+| search | `--repair-rounds N` | — | repair_rounds | N >= 0 | 32 (built-in 0) | rounds | inference+completion | supported |
+| search | `--repair-local-pairs N` | — | repair_local_pairs | N >= 1 | 32 | allele pairs per block | inference | supported |
+| search | `--repair-max-neighbours model\|N` | — | repair_max_neighbours | model, or N >= 0 (0: none) | model (the model-derived bound) (built-in 670) | candidates per round | completion | supported |
+| search | `--repair-tie-branching on\|off` | — | repair_tie_branching | on \| off | on (built-in off) | - | inference | supported |
+| search | `--repair-tie-max-branches N` | — | repair_tie_max_branches | N >= 1 | 16 | branches | completion | supported |
+| search | `repair_junction_proposals` | — | repair_junction_proposals | off \| experimental_v1 | experimental_v1 (built-in off) | - | inference | expert profile only |
+| search | `early_incumbent` | — | early_incumbent | off \| experimental_v1 | experimental_v1 (built-in off) | - | completion | expert profile only |
+| search | `repair_joint_search` | — | repair_joint_search | off \| experimental_v1 | off | - | inference | expert profile only |
+| resources | `footprint_limit_bytes` | — | footprint_limit_bytes | N >= 0 (0: none) | 6 GiB (built-in 0) | bytes | completion | expert profile only |
+| resources | `time_limit_seconds` | — | time_limit_seconds | S >= 0 (0: none) | 0 | seconds | completion | expert profile only |
+| resources | `max_physical_origins` | — | max_physical_origins | N >= 0 | 500000000 | origins | completion | expert profile only |
+| resources | `max_state_classes` | — | max_state_classes | N >= 0 | 600000000 (built-in 200000000) | state classes | completion | expert profile only |
+| resources | `max_piece_hits` | — | max_piece_hits | N >= 0 | 2000000000 | piece hits | completion | expert profile only |
+| resources | `max_mass_cells` | — | max_mass_cells | N >= 0 | 200000000 | cells | completion | expert profile only |
+| resources | `repair_max_physical_origins` | — | repair_max_physical_origins | N >= 0 | 4900000000 | origins | completion | expert profile only |
+| resources | `repair_max_state_classes` | — | repair_max_state_classes | N >= 0 | 4200000000 | state classes | completion | expert profile only |
+| resources | `repair_max_piece_hits` | — | repair_max_piece_hits | N >= 0 | 14000000000 | piece hits | completion | expert profile only |
+| resources | `repair_max_latent_pairs` | — | repair_max_latent_pairs | N >= 0 | 14000000000 | pairs | completion | expert profile only |
+| resources | `max_union_cached_placements_consumed` | — | max_union_cached_placements_consumed | N >= 0 | 2000000000 (built-in 0) | placements | completion | expert profile only |
+| resources | `max_union_cached_origins_consumed` | — | max_union_cached_origins_consumed | N >= 0 | 2000000000 (built-in 0) | origins | completion | expert profile only |
+| resources | `max_union_cached_states_consumed` | — | max_union_cached_states_consumed | N >= 0 | 2000000000 (built-in 0) | states | completion | expert profile only |
+| resources | `max_union_cached_prefilters_consumed` | — | max_union_cached_prefilters_consumed | N >= 0 | 2000000000 (built-in 0) | prefilters | completion | expert profile only |
+| resources | `adaptive_fine_max_served_placements` | — | adaptive_fine_max_served_placements | N >= 0 | 2000000000 (built-in 0) | placements | completion | expert profile only |
+| resources | `emission_cache_bytes` | — | emission_cache_bytes | N >= 0 | 512 MiB (built-in 0) | bytes | computation | expert profile only |
+| resources | `repair_origin_cache_bytes` | --repair-origin-cache-bytes | repair_origin_cache_bytes | N >= 0 | 768 MiB (built-in 384 MiB) | bytes | computation | expert profile only |
+| resources | `repair_tie_seed_cache_bytes` | --repair-tie-seed-cache-bytes | repair_tie_seed_cache_bytes | N >= 0 | 0 | bytes | computation | expert profile only |
+| resources | `union_placement_cache_bytes` | — | union_placement_cache_bytes | N >= 0 | 512 MiB (built-in 0) | bytes | computation | expert profile only |
+| resources | `union_origin_cache_bytes` | — | union_origin_cache_bytes | N >= 0 | 1 GiB (built-in 0) | bytes | computation | expert profile only |
+| resources | `union_prefilter_cache_bytes` | — | union_prefilter_cache_bytes | N >= 0 | 128 MiB (built-in 0) | bytes | computation | expert profile only |
+| resources | `start_sort_scratch_bytes` | — | start_sort_scratch_bytes | N >= 0 | 320 MiB (built-in 0) | bytes | computation | expert profile only |
+| resources | `indexed_union_store_bytes` | — | indexed_union_store_bytes | N >= 0 | 2 GiB (built-in 0) | bytes | computation+completion | expert profile only |
+| resources | `adaptive_fine_store_bytes` | — | adaptive_fine_store_bytes | N >= 0 | 512 MiB (built-in 0) | bytes | computation+completion | expert profile only |
+| resources | `marker_proposal_reuse_table_bytes` | — | marker_proposal_reuse_table_bytes | N >= 0 | 4 MiB (built-in 0) | bytes | computation | expert profile only |
+| resources | `union_scoring_backend` | — | union_scoring_backend | reference \| indexed_fine_experimental | indexed_fine_experimental (built-in reference) | - | computation | expert profile only |
+| resources | `adaptive_window_discovery` | — | adaptive_window_discovery | reference \| fine_experimental | fine_experimental (built-in reference) | - | computation | expert profile only |
+| resources | `indexed_union_store_layout` | — | indexed_union_store_layout | exact \| legacy_i2a | exact | - | computation | expert profile only |
+| resources | `indexed_union_evidence_layout` | — | indexed_union_evidence_layout | reconstructed \| fine_views_experimental | fine_views_experimental (built-in reconstructed) | - | computation | expert profile only |
+| resources | `adaptive_fused_seed` | — | adaptive_fused_seed | 0 \| 1 | 1 (built-in 0) | - | computation | expert profile only |
+| resources | `combination_prepared_library_terms` | — | combination_prepared_library_terms | 0 \| 1 | 1 (built-in 0) | - | computation | expert profile only |
+| resources | `gap_recursion_backend` | — | gap_recursion_backend | scaled_reference \| fixed_geometry_experimental | fixed_geometry_experimental (built-in scaled_reference) | - | computation | expert profile only |
+| resources | `dosage_census_backend` | — | dosage_census_backend | reference \| interned_experimental | interned_experimental (built-in reference) | - | computation | expert profile only |
+| resources | `union_fragment_blocks` | — | union_fragment_blocks | off \| fine_core_4096_experimental | fine_core_4096_experimental (built-in off) | - | computation | expert profile only |
+| resources | `repair_round1_origin_admission` | — | repair_round1_origin_admission | existing \| reuse_only_experimental | reuse_only_experimental (built-in existing) | - | computation | expert profile only |
+| resources | `union_progressive_schedule` | — | union_progressive_schedule | off \| experimental_v1 | off | - | computation | expert profile only |
+| resources | `adaptive_emission_handoff` | — | adaptive_emission_handoff | 0 \| 1 | 0 | - | computation | expert profile only |
+| reporting | `--dosage-mode off\|audit\|repair` | — | — | off \| audit \| repair | off | - | reporting | supported |
+| reporting | `--output-schema sequence_first_v2\|legacy\|sequence_first_v1` | — | output_schema | sequence_first_v2 \| legacy \| sequence_first_v1 | sequence_first_v2 (built-in legacy) | - | reporting+completion | supported |
+| reporting | `--representation-guard on\|off` | — | representation_guard | on \| off | on (built-in off) | - | reporting | supported |
+| reporting | `compound_annotation` | — | compound_annotation | off \| contract_v2 | contract_v2 (built-in off) | - | reporting | expert profile only |
+| reporting | `compound_interval_declarations` | — | compound_interval_declarations | a file | — | - | reporting | expert profile only |
+| reporting | `block_support_rule` | — | block_support_rule | legacy \| full_data_likelihood_v1_experimental \| full_data_likelihood_v2_experimental | legacy | - | reporting | expert profile only |
+| reporting | `library_sensitivity_audit` | — | library_sensitivity_audit | 0 \| 1 | 1 | - | reporting+computation | expert profile only |
+| reporting | `timing_detail` | — | timing_detail | 0 \| 1 | 1 (built-in 0) | - | reporting | expert profile only |
+| reporting | `block_diagnostics` | — | block_diagnostics | off \| diagnostic_v1 | off | - | reporting | expert profile only |
+| reporting | `emission_lookup_timing` | — | emission_lookup_timing | 0 \| 1 | 0 | - | reporting | expert profile only |
+| legacy | `--max-candidates` | — | — | - | refused | - | - | legacy |
+| legacy | `--dosage-audit off\|shadow` | — | — | off \| shadow | off | - | reporting | legacy |
+| legacy | `--phase-audit-candidates N` | — | phase_audit_candidates | N >= 0 | 0 | candidates | reporting | development |
+| legacy | `--dosage-allocation-test` | — | — | flag | off | - | reporting | development |
+| legacy | `--library-diagnostic` | — | — | flag | off | - | reporting | development |
+| legacy | `diagnostic_* and test_* profile keys` | — | — | - | off | - | - | development |
+<!-- option-inventory:end -->
 
-| key | values (tested value in **bold**) | default | affects predictions? |
-|---|---|---|---|
-| `early_incumbent` | off, **experimental_v1** | off → preset experimental_v1 | completed runs identical; on a budget stop it keeps a PROVISIONAL checkpoint. Needs `sequence_first_v2` and adaptive repair, otherwise refused |
-| `union_fragment_blocks` | off, **fine_core_4096_experimental** | off → preset fine_core_4096 | route |
-| `repair_round1_origin_admission` | existing, **reuse_only_experimental** | existing → preset reuse_only | route |
-| `repair_junction_proposals` | off, **experimental_v1** | off → preset experimental_v1 | **yes:** adds junction proposals (it changed one candidate pool and one block's conditional GQ in M10-A) |
-| `repair_joint_search` | **off**, experimental_v1 | off | yes (not in the tested configuration) |
-| `copying_transition` / `copying_length_bp` | **constant_v1**, distance_ref_core_v1_experimental / > 0 | constant_v1 | yes (not in the tested configuration) |
-| `block_support_rule` | **legacy**, full_data_likelihood_v1/v2_experimental | legacy | report (support semantics) |
-| `union_progressive_schedule`, `adaptive_emission_handoff` | off / 0 (tested) | off / 0 | route (not in the tested configuration) |
-
-**Performance backends** (route; identical results gated in the I/S batches and in M10-A; all set by the preset):
-
-| key | tested and preset value |
-|---|---|
-| `union_scoring_backend` | indexed_fine_experimental |
-| `adaptive_window_discovery` | fine_experimental |
-| `indexed_union_store_layout` | exact |
-| `indexed_union_evidence_layout` | fine_views_experimental |
-| `adaptive_fused_seed` | 1 |
-| `combination_prepared_library_terms` | 1 |
-| `gap_recursion_backend` | fixed_geometry_experimental |
-| `dosage_census_backend` | interned_experimental |
-| `marker_proposal_reuse_table_bytes` | 4194304 |
+**Terms.** Read these before interpreting results:
+- **Donor redraw:** `--switch-probability` is the copying prior's per-boundary donor-redraw probability, a regularisation of
+  the panel model. It is **not a biological recombination probability**.
+- **Mosaic candidates:** `--mosaic-candidates` sets the **initial** off-panel mosaics. The refinement may generate and score
+  further mosaics beyond that number.
+- **Bounded refinement:** local moves scored exactly within declared caps. It is **not a globally exhaustive search**, and a
+  completed ranking is conditional on what was explored.
+- **`min_variant_bp`** constructs the variant sites (blocks). It is **not a filter on final calls**.
+- **Library estimation** learns the insert distribution and the fragment-start intensity only. The substitution, outlier
+  and gap parameters stay fixed.
+- **Support is conditional on the explored candidates:** READS means no explored rival projecting to a different genotype
+  was within bounds of the winner's fragment term.
+- **Prior-dependent** (`read_support PRIOR_DEPENDENT`): the reads alone did not separate the call from an explored rival.
+  This **does not establish that the prior alone caused the selection**.
+- **Phase** is assessed once per locus (the decision's phase support), **not independently at each boundary**.
+- **Locus summaries** must be read with their coverage counts and `not_assessed` list. A positive value covers only the
+  assessed blocks, and `[assessed/applicable]` marks partial coverage.
+- **Nothing here is calibrated reliability,** and there is no quality threshold.
 
 ## 4. Resource limits, caches and work caps
 
-These are **four different things.** None of them changes a completed prediction while it does not bind.
+These are four different things. None of them changes a completed prediction while it does not bind. The values are in
+the inventory (§3, group 4).
 
 | kind | keys | behaviour when it binds |
 |---|---|---|
-| **total footprint guard** | `footprint_limit_bytes` (built-in 0: none; preset and tested 6 GiB) | a **sampled** guard: the physical footprint is polled every 100 ms, so it is not an allocation ceiling, and a short spike can exceed it. Exit 125, or a PROVISIONAL checkpoint with exit 3 under `early_incumbent` |
-| **time guard** | `time_limit_seconds` (0: none, also under the preset; tested profiles 900; set it with a one-key profile) | exit 124 before any checkpoint (NO_PREDICTION, as in the tested 8 s example), or 3 PROVISIONAL after one |
-| **cache and store budgets** (the preset sets the tested values) | `emission_cache_bytes`, `repair_origin_cache_bytes`, `union_placement_cache_bytes`, `union_origin_cache_bytes`, `union_prefilter_cache_bytes`, `indexed_union_store_bytes`, `adaptive_fine_store_bytes`, `start_sort_scratch_bytes`, `repair_tie_seed_cache_bytes`, `marker_proposal_reuse_table_bytes` | they bound **retained** memory for reuse. Work beyond a budget is recomputed, or a store that cannot hold the required data ends the run with a recorded resource refusal (`.mosaic_status.tsv` names it). They do not cap work |
-| **executed-work caps** | `max_physical_origins` (5e8), `max_state_classes` (2e8; preset and tested 6e8), `max_piece_hits`, `max_mass_cells`, `repair_max_physical_origins`, `repair_max_state_classes`, `repair_max_piece_hits`, `repair_max_latent_pairs`, `max_union_cached_*_consumed`, `adaptive_fine_max_served_placements` | a typed refusal, no-call or PROVISIONAL with the cap named. They do not degrade silently |
+| **total-footprint guard** | `footprint_limit_bytes` | **sampled** every 100 ms, so it is not an allocation ceiling and a short spike can exceed it. Exit 125, or 3 PROVISIONAL with an early-incumbent checkpoint |
+| **time guard** | `time_limit_seconds` (none under the preset) | exit 124 before any checkpoint (NO_PREDICTION), or 3 PROVISIONAL after one |
+| **cache and store budgets** | `*_cache_bytes`, `*_store_bytes`, `start_sort_scratch_bytes`, `marker_proposal_reuse_table_bytes` | they bound **retained** memory for reuse. Work beyond a budget is recomputed. A store that cannot hold the required data (`indexed_union_store_bytes`, `adaptive_fine_store_bytes`) ends the run with a recorded resource refusal. They do not cap work |
+| **executed-work caps** | `max_physical_origins`, `max_state_classes`, `max_piece_hits`, `max_mass_cells`, `repair_max_*`, `max_union_cached_*_consumed`, `adaptive_fine_max_served_placements` | a typed refusal, no-call or PROVISIONAL with the cap named. They do not degrade silently |
 
-**More RAM alone does not raise any work cap,** and it does not guarantee completion. Large loci at high coverage reach work
-caps such as the 500 M physical-origin cap independently of memory.
+**More RAM alone does not raise any work cap,** and it does not guarantee completion. A one-key expert profile sets any of
+these, for example `profile my-limits` + `time_limit_seconds 900`.
 
-**Not implemented:** memory-per-thread budgeting and disk spilling. `--threads N` (default 1; tested 4) sets workers;
-memory is not divided per thread.
+**Not implemented:** memory-per-thread budgeting and disk spilling.
 
 ## 5. Reporting and diagnostics
 
-| key / flag | values | default | role |
-|---|---|---|---|
-| `--output-schema` / `output_schema` | legacy, sequence_first_v1, **sequence_first_v2** | legacy → preset v2 (legacy under the unrepaired view) | the report contract and the exit statuses (§6). It no longer implies a dosage stage |
-| `--dosage-check` | flag | not given | runs the existing dosage audit and writes its diagnostics (`dosage_mode_source flag --dosage-check`). **It never changes the prediction** and adds run time. Without it, dosage is not run: DOSAGE_FILTER is NOT_EVALUATED (`DOSAGE_NOT_EVALUATED:dosage_mode_off`) |
-| `--dosage-mode` (expert spelling) | off, audit, repair | off | `audit` = `--dosage-check`. A contradiction with `--dosage-check` (`off`, `repair`, or `--dosage-audit off`) is refused, exit 2. `repair` is refused under v2; the legacy repair, which may replace a block (`<prefix>.original.*` kept), needs `--output-schema legacy --dosage-mode repair`. Dosage is not a profile key |
-| `compound_annotation` | off, **contract_v2** | off | report (`.sequence_compound.tsv`) |
-| `compound_interval_declarations` | file | none | report; model-bound declarations, **not used in the tested configuration** |
-| `block_diagnostics` | **off**, diagnostic_v1 | off | report (`.block_diagnostics.tsv`: census route, JP tie); identical science verified |
-| `timing_detail` | 0, **1** | 0 | report (stage timers) |
-| `library_sensitivity_audit` | 0, 1 | 1 | under `--library auto`, the 0.9×/1.1× audit behind `LIBRARY_SENSITIVE` |
-| `emission_lookup_timing` | 0, 1 | 0 | measurement only |
-| `-q`, `--quiet` | | | |
+- **The report contract:** `--output-schema` (default `sequence_first_v2`). The primary view is `assessment_v1` (§7.0). The
+  unrepaired view reports with `legacy`.
+- **The dosage check:** `--dosage-check` (an optional audit of the reported alleles; it never changes the prediction).
+  - The expert spelling is `--dosage-mode off|audit|repair`.
+  - `repair` (may replace a block) needs `--output-schema legacy` and is refused under v2.
+  - A contradiction with `--dosage-check` is refused.
+- **Profile-only report keys** (`compound_annotation`, `compound_interval_declarations`, `block_support_rule`,
+  `library_sensitivity_audit`, `timing_detail`, `block_diagnostics`, `emission_lookup_timing`) are in the inventory.
+- **The older headline fields** (`genotype_filter`, `dosage_filter`, `phase_filter`, `call_summary`) are **superseded
+  compatibility diagnostics** for this experimental release (§7).
 
 ## 6. Outputs: what you get
 
@@ -409,3 +488,20 @@ The prediction is identical to the archived M11-D accelerated run at all three c
 
 The M15-C profile-based commands (§0 profiles, resource-adjusted copies, refusals for duplicate, unknown or unnamed profile
 keys and the removed `--max-candidates`) are unchanged.
+
+## 10. Recommended future removals and aliases (not implemented; each needs separate approval)
+
+**Remove** (after the experimental release):
+- the superseded headline columns, or move them behind a flag;
+- `--dosage-audit` (an older spelling of `--dosage-mode`);
+- the refused `--max-candidates` message;
+- the `legacy_i2a` store layout;
+- the `--repair-origin-cache-bytes` / `--repair-tie-seed-cache-bytes` diagnostic flag spellings (the profile keys remain).
+
+**Consider aliases or flags:**
+- `--time-limit SECONDS` and `--memory-limit BYTES` for the two run guards, which are now profile-only;
+- `--curation` as a short alias of `--panel-curation`.
+
+**Keep as is:** `--mosaic-candidates` (preferred) with `--max-mosaic-candidates` as its alias; the `-i` / `-o` / `-r` short
+aliases.
+

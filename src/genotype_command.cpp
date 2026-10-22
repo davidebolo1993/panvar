@@ -1378,6 +1378,48 @@ void write_repair_report(std::ostream& out, const RepairReport& r) {
     out << std::setprecision(6);
 }
 
+// The effective value of an experimental profile key (the settings table's own mapping; M15-H: also the built-in
+// defaults the advanced help prints, so the two can never disagree).
+std::string experimental_setting_value(const GenotypeCommandOptions& options, const std::string& k) {
+    return k == "union_scoring_backend"       ? options.union_scoring_backend
+                                      : k == "indexed_union_store_bytes" ? std::to_string(options.indexed_union_store_bytes)
+                                      : k == "adaptive_window_discovery" ? options.adaptive_window_discovery
+                                      : k == "adaptive_fine_store_bytes" ? std::to_string(options.adaptive_fine_store_bytes)
+                                      : k == "indexed_union_store_layout" ? options.indexed_union_store_layout
+                                      : k == "indexed_union_evidence_layout" ? options.indexed_union_evidence_layout
+                                      : k == "timing_detail"              ? std::string(options.timing_detail ? "1" : "0")
+                                      : k == "adaptive_fused_seed"        ? std::string(options.adaptive_fused_seed ? "1" : "0")
+                                      : k == "marker_proposal_reuse_table_bytes"
+                                          ? std::to_string(options.marker_proposal_reuse_table_bytes)
+                                      : k == "combination_prepared_library_terms"
+                                          ? std::string(options.combination_prepared_library_terms ? "1" : "0")
+                                      : k == "dosage_census_backend"
+                                          ? std::string(options.dosage_census_interned ? "interned_experimental" : "reference")
+                                      : k == "adaptive_emission_handoff"
+                                          ? std::string(options.adaptive_emission_handoff ? "1" : "0")
+                                      : k == "output_schema" ? options.output_schema
+                                      : k == "early_incumbent" ? options.early_incumbent
+                                      : k == "test_interrupt_point" ? options.test_interrupt_point
+                                      : k == "diagnostic_union_evidence_dump" ? std::string(options.diagnostic_union_evidence_dump ? "1" : "0")
+                                      : k == "diagnostic_union_kernel_dump" ? std::string(options.diagnostic_union_kernel_dump ? "1" : "0")
+                                      : k == "union_progressive_schedule" ? options.union_progressive_schedule
+                                      : k == "union_fragment_blocks" ? options.union_fragment_blocks
+                                      : k == "diagnostic_refinement_memory" ? std::string(options.diagnostic_refinement_memory ? "1" : "0")
+                                      : k == "diagnostic_refinement_replay" ? options.diagnostic_refinement_replay
+                                      : k == "repair_round1_origin_admission" ? options.repair_round1_origin_admission
+                                      : k == "repair_joint_search" ? options.repair_joint_search
+                                      : k == "repair_junction_proposals" ? options.repair_junction_proposals
+                                      : k == "compound_annotation" ? options.compound_annotation
+                                      : k == "block_diagnostics" ? options.block_diagnostics
+                                      : k == "compound_interval_declarations" ? options.compound_interval_declarations
+                                      : k == "block_support_rule" ? options.block_support_rule
+                                      : k == "copying_transition" ? options.copying_transition
+                                      : k == "copying_length_bp" ? hex_double(options.copying_length_bp)
+                                      : k == "gap_recursion_backend"
+                                          ? std::string(gap_recursion_backend_name(options.gap_recursion_fixed_geometry))
+                                                                         : std::to_string(options.adaptive_fine_max_served_placements);
+}
+
 void write_status(
     const std::string& path,
     GenotypeRunStatus status,
@@ -1477,43 +1519,7 @@ void write_status(
             const auto source = options.setting_sources.find(key);
             if (source == options.setting_sources.end()) continue;
             const std::string k = key;
-            const std::string value = k == "union_scoring_backend"       ? options.union_scoring_backend
-                                      : k == "indexed_union_store_bytes" ? std::to_string(options.indexed_union_store_bytes)
-                                      : k == "adaptive_window_discovery" ? options.adaptive_window_discovery
-                                      : k == "adaptive_fine_store_bytes" ? std::to_string(options.adaptive_fine_store_bytes)
-                                      : k == "indexed_union_store_layout" ? options.indexed_union_store_layout
-                                      : k == "indexed_union_evidence_layout" ? options.indexed_union_evidence_layout
-                                      : k == "timing_detail"              ? std::string(options.timing_detail ? "1" : "0")
-                                      : k == "adaptive_fused_seed"        ? std::string(options.adaptive_fused_seed ? "1" : "0")
-                                      : k == "marker_proposal_reuse_table_bytes"
-                                          ? std::to_string(options.marker_proposal_reuse_table_bytes)
-                                      : k == "combination_prepared_library_terms"
-                                          ? std::string(options.combination_prepared_library_terms ? "1" : "0")
-                                      : k == "dosage_census_backend"
-                                          ? std::string(options.dosage_census_interned ? "interned_experimental" : "reference")
-                                      : k == "adaptive_emission_handoff"
-                                          ? std::string(options.adaptive_emission_handoff ? "1" : "0")
-                                      : k == "output_schema" ? options.output_schema
-                                      : k == "early_incumbent" ? options.early_incumbent
-                                      : k == "test_interrupt_point" ? options.test_interrupt_point
-                                      : k == "diagnostic_union_evidence_dump" ? std::string(options.diagnostic_union_evidence_dump ? "1" : "0")
-                                      : k == "diagnostic_union_kernel_dump" ? std::string(options.diagnostic_union_kernel_dump ? "1" : "0")
-                                      : k == "union_progressive_schedule" ? options.union_progressive_schedule
-                                      : k == "union_fragment_blocks" ? options.union_fragment_blocks
-                                      : k == "diagnostic_refinement_memory" ? std::string(options.diagnostic_refinement_memory ? "1" : "0")
-                                      : k == "diagnostic_refinement_replay" ? options.diagnostic_refinement_replay
-                                      : k == "repair_round1_origin_admission" ? options.repair_round1_origin_admission
-                                      : k == "repair_joint_search" ? options.repair_joint_search
-                                      : k == "repair_junction_proposals" ? options.repair_junction_proposals
-                                      : k == "compound_annotation" ? options.compound_annotation
-                                      : k == "block_diagnostics" ? options.block_diagnostics
-                                      : k == "compound_interval_declarations" ? options.compound_interval_declarations
-                                      : k == "block_support_rule" ? options.block_support_rule
-                                      : k == "copying_transition" ? options.copying_transition
-                                      : k == "copying_length_bp" ? hex_double(options.copying_length_bp)
-                                      : k == "gap_recursion_backend"
-                                          ? std::string(gap_recursion_backend_name(options.gap_recursion_fixed_geometry))
-                                                                         : std::to_string(options.adaptive_fine_max_served_placements);
+            const std::string value = experimental_setting_value(options, k);
             table += k + "\t" + value + "\t" + source->second + "\n";
         }
         atomic_write(options.out_prefix + ".settings.tsv", table);
@@ -8241,6 +8247,271 @@ const AdvancedFlag* advanced_setting(const std::string& flag) {
 }
 } // namespace
 
+// ---- M15-H: the public option inventory (one table; the advanced help, the guide's inventory and the tests derive from it)
+namespace {
+struct OptionEntry {
+    const char* group;    // everyday | input | model | search | resources | reporting | legacy
+    const char* option;   // the flag, or the profile key for profile-only controls
+    const char* aliases;  // "" when none
+    const char* key;      // the profile / settings key ("" when the option is not a setting)
+    const char* values;
+    const char* units;
+    const char* effect;   // inference | computation | reporting | completion | input (combinations with +)
+    const char* status;   // everyday | supported | expert profile only | legacy | development
+    const char* text;
+    const char* fixed_default;   // "" = computed from the preset and the built-in options
+};
+// Groups, in help order.
+const std::vector<std::pair<std::string, std::string>> kOptionGroups = {
+    {"everyday", "Everyday options"},
+    {"input", "1. Input and panel overrides"},
+    {"model", "2. Copying prior and marker / placement model"},
+    {"search", "3. Candidate generation and bounded refinement"},
+    {"resources", "4. Resource limits, work caps, cache budgets and exact backends"},
+    {"reporting", "5. Reporting and diagnostics"},
+    {"legacy", "6. Legacy and development compatibility"},
+};
+const OptionEntry kOptionEntries[] = {
+    // everyday
+    {"everyday", "--graph FILE", "--gfa, -i", "", "a GFA path", "-", "input", "everyday",
+     "the locus graph; every P/W path is a panel haplotype unless curated out, and must cross the whole locus", "required"},
+    {"everyday", "--reads1 FILE / --reads2 FILE", "", "", "FASTQ paths (.gz accepted)", "-", "input", "everyday",
+     "paired reads, mates in the same order", "required"},
+    {"everyday", "--out PREFIX", "--out-prefix, -o", "", "a path prefix", "-", "reporting", "everyday",
+     "every report is written at the prefix; a run first removes the run-owned reports already there", "genotype"},
+    {"everyday", "--reference-path NAME", "-r", "", "a path name", "-", "inference", "everyday",
+     "the coordinate reference and orientation frame", "the single path of the graph's RS:Z sample (refused, candidates listed, when absent or ambiguous)"},
+    {"everyday", "--threads N", "", "threads", "N >= 1", "worker threads", "computation", "everyday",
+     "worker threads; results do not depend on them; memory is not divided per thread", ""},
+    {"everyday", "--dosage-check", "", "", "flag", "-", "reporting", "everyday",
+     "the optional copy-number audit of the reported alleles; never changes the prediction; adds run time; refused beside a contradicting --dosage-mode", "off (dosage_check NOT_REQUESTED)"},
+    {"everyday", "--build-panel-index FILE", "", "", "a new file path", "-", "computation", "everyday",
+     "build the sample-independent panel index (structural model + marker panel) and stop; no reads, library or output prefix; never overwrites; refused beside --panel-index or a sample argument", "none"},
+    {"everyday", "--panel-index FILE", "", "", "an index path", "-", "computation", "everyday",
+     "genotype against a built index (saves locus preparation only); --graph is still required and read; integrity, versions and identity are verified before the output prefix is touched; never rebuilt silently", "none (prepared in memory)"},
+    {"everyday", "-q, --quiet", "", "", "flag", "-", "reporting", "everyday", "no progress messages (warnings are still printed)", "off"},
+    {"everyday", "-h, --help / --help-advanced", "", "", "flag", "-", "reporting", "everyday", "this help / every option by purpose", "-"},
+    // 1. input and panel overrides
+    {"input", "--library auto|FILE", "", "", "auto, or a library file", "-", "inference", "supported",
+     "auto (also when omitted) estimates only the insert mean/sd (>= 500 decisive anchored pairs) and the fragment-start intensity (marker depth fit), and refuses (LIBRARY_REFUSED, never a fallback); support_sigmas 4, substitution_error 0.002, outlier_weight 0.001 and the gap model stay fixed. FILE declares exactly insert_mean_bp, insert_sd_bp, support_sigmas, substitution_error, outlier_weight, fragment_start_intensity (and optionally marker_background), each once; gap_open, gap_extend and the maximum displacement cannot be supplied", "auto"},
+    {"input", "--panel-curation FILE", "", "", "a file of path names", "-", "inference", "supported",
+     "paths removed from the active panel (they still define the blocks); part of a panel index's identity", "none"},
+    {"input", "--bubbles FILE", "", "", "a bubbles CSV", "-", "inference", "supported",
+     "precomputed variant sites instead of the graph's own decomposition; part of a panel index's identity", "computed from the graph"},
+    {"input", "--min-variant-bp N", "", "min_variant_bp", "N >= 1", "bp", "inference", "supported",
+     "SITE CONSTRUCTION, not call filtering: a candidate variant site is kept when some path spans at least N bp inside it; part of a panel index's identity", ""},
+    {"input", "--preset short-read", "", "", "short-read", "-", "inference+computation", "supported",
+     "the production algorithm, short-read constants and the accelerated configuration; always applied (long-read is refused, not implemented)", "short-read"},
+    {"input", "--profile FILE", "", "", "key<TAB>value file naming itself", "-", "any", "supported",
+     "optional expert override; repeated files apply in order; a key set twice in one file is refused; not by itself a validated configuration", "none"},
+    // 2. copying prior and marker/placement model
+    {"model", "--switch-probability P", "", "switch_probability", "0 < P <= 0.5", "per block boundary", "inference", "supported",
+     "the DONOR-REDRAW probability of the Li-Stephens copying prior: how often a haplotype is allowed to change panel donor at a block boundary; a prior regularisation, NOT a biological recombination probability", ""},
+    {"model", "--kmer-size K", "", "kmer_size", "1 <= K <= 31", "bp", "inference", "supported", "marker k-mer length; part of a panel index's identity", ""},
+    {"model", "--syncmer-s S", "", "syncmer_s", "1 <= S <= K", "bp", "inference", "supported", "marker syncmer s; part of a panel index's identity", ""},
+    {"model", "--mismatch-band N", "", "mismatch_band", "N >= 0", "edits per mate", "inference", "supported",
+     "per-mate edit budget of the banded gapped placement model (substitutions + gap bases)", ""},
+    {"model", "copying_transition", "", "copying_transition", "constant_v1 | distance_ref_core_v1_experimental", "-", "inference", "expert profile only",
+     "the transition law of the copying prior (distance-scaled is experimental, not in the tested configuration)", ""},
+    {"model", "copying_length_bp", "", "copying_length_bp", "> 0 (hex double)", "bp", "inference", "expert profile only",
+     "the length scale of the distance-scaled transition (used only by distance_ref_core_v1_experimental)", ""},
+    // 3. candidate generation and bounded refinement
+    {"search", "--mosaic-candidates K", "--max-mosaic-candidates", "max_mosaic_candidates", "K >= 0", "mosaics", "inference+computation", "supported",
+     "the INITIAL off-panel mosaics added to every panel diplotype in the union ranking; it does not cap the mosaics the refinement generates later", ""},
+    {"search", "--proposal-state-limit N", "", "proposal_state_limit", "N >= 1", "beam states", "inference", "supported", "the mosaic proposal beam width", ""},
+    {"search", "--adaptive-repair on|off", "", "", "on | off", "-", "inference", "supported",
+     "BOUNDED coordinate refinement: local moves scored exactly within declared caps; not a globally exhaustive search. off is the unrepaired development view (legacy report)", "on"},
+    {"search", "--repair-rounds N", "", "repair_rounds", "N >= 0", "rounds", "inference+completion", "supported",
+     "the refinement's round cap; 0 is the unrepaired view; resolved with --adaptive-repair and --repair-tie-branching, an explicit contradiction refused", ""},
+    {"search", "--repair-local-pairs N", "", "repair_local_pairs", "N >= 1", "allele pairs per block", "inference", "supported", "allele pairs per block in one refinement neighbourhood", ""},
+    {"search", "--repair-max-neighbours model|N", "", "repair_max_neighbours", "model, or N >= 0 (0: none)", "candidates per round", "completion", "supported",
+     "model: the bound is the model's own structural maximum, sum over blocks of 2 * min(repair_local_pairs, a(a+1)/2), recorded as repair_neighbour_bound; N: a declared cap, a larger neighbourhood stops (neighbourhood_bound: PROVISIONAL with a checkpoint, else no prediction)", ""},
+    {"search", "--repair-tie-branching on|off", "", "repair_tie_branching", "on | off", "-", "inference", "supported", "exact branch-and-pool at improving-move ties", ""},
+    {"search", "--repair-tie-max-branches N", "", "repair_tie_max_branches", "N >= 1", "branches", "completion", "supported", "the tie-branching cap; beyond it the run does not complete (tie_branching_incomplete)", ""},
+    {"search", "repair_junction_proposals", "", "repair_junction_proposals", "off | experimental_v1", "-", "inference", "expert profile only",
+     "junction proposals during refinement (JP1.1, candidate generation): can change predictions; needs repair rounds > 0", ""},
+    {"search", "early_incumbent", "", "early_incumbent", "off | experimental_v1", "-", "completion", "expert profile only",
+     "keep the best fully evaluated candidate as a PROVISIONAL checkpoint on a budget stop; completed runs unchanged; needs sequence_first_v2 and adaptive repair", ""},
+    {"search", "repair_joint_search", "", "repair_joint_search", "off | experimental_v1", "-", "inference", "expert profile only", "experimental joint two-block moves (not in the tested configuration)", ""},
+    // 4. resources
+    {"resources", "footprint_limit_bytes", "", "footprint_limit_bytes", "N >= 0 (0: none)", "bytes", "completion", "expert profile only",
+     "total-footprint guard, SAMPLED every 100 ms (not an allocation ceiling); a stop exits 125, or 3 PROVISIONAL with a checkpoint", ""},
+    {"resources", "time_limit_seconds", "", "time_limit_seconds", "S >= 0 (0: none)", "seconds", "completion", "expert profile only",
+     "wall-clock guard; a stop exits 124, or 3 PROVISIONAL with a checkpoint", ""},
+    {"resources", "max_physical_origins", "", "max_physical_origins", "N >= 0", "origins", "completion", "expert profile only", "union-pass work cap (typed refusal when reached)", ""},
+    {"resources", "max_state_classes", "", "max_state_classes", "N >= 0", "state classes", "completion", "expert profile only", "union-pass work cap", ""},
+    {"resources", "max_piece_hits", "", "max_piece_hits", "N >= 0", "piece hits", "completion", "expert profile only", "union-pass work cap", ""},
+    {"resources", "max_mass_cells", "", "max_mass_cells", "N >= 0", "cells", "completion", "expert profile only", "union-pass work cap", ""},
+    {"resources", "repair_max_physical_origins", "", "repair_max_physical_origins", "N >= 0", "origins", "completion", "expert profile only", "cumulative refinement work cap (cumulative_cap)", ""},
+    {"resources", "repair_max_state_classes", "", "repair_max_state_classes", "N >= 0", "state classes", "completion", "expert profile only", "cumulative refinement work cap", ""},
+    {"resources", "repair_max_piece_hits", "", "repair_max_piece_hits", "N >= 0", "piece hits", "completion", "expert profile only", "cumulative refinement work cap", ""},
+    {"resources", "repair_max_latent_pairs", "", "repair_max_latent_pairs", "N >= 0", "pairs", "completion", "expert profile only", "cumulative refinement work cap", ""},
+    {"resources", "max_union_cached_placements_consumed", "", "max_union_cached_placements_consumed", "N >= 0", "placements", "completion", "expert profile only", "served-work capacity of the placement reuse route", ""},
+    {"resources", "max_union_cached_origins_consumed", "", "max_union_cached_origins_consumed", "N >= 0", "origins", "completion", "expert profile only", "served-work capacity of the origin reuse route", ""},
+    {"resources", "max_union_cached_states_consumed", "", "max_union_cached_states_consumed", "N >= 0", "states", "completion", "expert profile only", "served-work capacity of the state reuse route", ""},
+    {"resources", "max_union_cached_prefilters_consumed", "", "max_union_cached_prefilters_consumed", "N >= 0", "prefilters", "completion", "expert profile only", "served-work capacity of the prefilter reuse route", ""},
+    {"resources", "adaptive_fine_max_served_placements", "", "adaptive_fine_max_served_placements", "N >= 0", "placements", "completion", "expert profile only", "served-work capacity of the fine adaptive discovery store", ""},
+    {"resources", "emission_cache_bytes", "", "emission_cache_bytes", "N >= 0", "bytes", "computation", "expert profile only", "retained emission cache (reuse only; not a work cap)", ""},
+    {"resources", "repair_origin_cache_bytes", "--repair-origin-cache-bytes", "repair_origin_cache_bytes", "N >= 0", "bytes", "computation", "expert profile only", "retained refinement origin cache", ""},
+    {"resources", "repair_tie_seed_cache_bytes", "--repair-tie-seed-cache-bytes", "repair_tie_seed_cache_bytes", "N >= 0", "bytes", "computation", "expert profile only", "retained tie-branch seed cache", ""},
+    {"resources", "union_placement_cache_bytes", "", "union_placement_cache_bytes", "N >= 0", "bytes", "computation", "expert profile only", "retained union placement cache", ""},
+    {"resources", "union_origin_cache_bytes", "", "union_origin_cache_bytes", "N >= 0", "bytes", "computation", "expert profile only", "retained union origin cache", ""},
+    {"resources", "union_prefilter_cache_bytes", "", "union_prefilter_cache_bytes", "N >= 0", "bytes", "computation", "expert profile only", "retained union prefilter cache", ""},
+    {"resources", "start_sort_scratch_bytes", "", "start_sort_scratch_bytes", "N >= 0", "bytes", "computation", "expert profile only", "start-sort scratch budget", ""},
+    {"resources", "indexed_union_store_bytes", "", "indexed_union_store_bytes", "N >= 0", "bytes", "computation+completion", "expert profile only", "indexed union store; a store too small for the required data ends the run with a recorded resource refusal", ""},
+    {"resources", "adaptive_fine_store_bytes", "", "adaptive_fine_store_bytes", "N >= 0", "bytes", "computation+completion", "expert profile only", "fine adaptive discovery store (refusal when too small)", ""},
+    {"resources", "marker_proposal_reuse_table_bytes", "", "marker_proposal_reuse_table_bytes", "N >= 0", "bytes", "computation", "expert profile only", "marker-proposal reuse table", ""},
+    {"resources", "union_scoring_backend", "", "union_scoring_backend", "reference | indexed_fine_experimental", "-", "computation", "expert profile only", "exact union scoring backend (results gated identical on completed runs)", ""},
+    {"resources", "adaptive_window_discovery", "", "adaptive_window_discovery", "reference | fine_experimental", "-", "computation", "expert profile only", "exact adaptive window discovery", ""},
+    {"resources", "indexed_union_store_layout", "", "indexed_union_store_layout", "exact | legacy_i2a", "-", "computation", "expert profile only", "indexed store layout", ""},
+    {"resources", "indexed_union_evidence_layout", "", "indexed_union_evidence_layout", "reconstructed | fine_views_experimental", "-", "computation", "expert profile only", "indexed evidence layout", ""},
+    {"resources", "adaptive_fused_seed", "", "adaptive_fused_seed", "0 | 1", "-", "computation", "expert profile only", "fused anchor seeding", ""},
+    {"resources", "combination_prepared_library_terms", "", "combination_prepared_library_terms", "0 | 1", "-", "computation", "expert profile only", "library terms prepared once per combination", ""},
+    {"resources", "gap_recursion_backend", "", "gap_recursion_backend", "scaled_reference | fixed_geometry_experimental", "-", "computation", "expert profile only", "gapped placement recursion", ""},
+    {"resources", "dosage_census_backend", "", "dosage_census_backend", "reference | interned_experimental", "-", "computation", "expert profile only", "dosage census backend", ""},
+    {"resources", "union_fragment_blocks", "", "union_fragment_blocks", "off | fine_core_4096_experimental", "-", "computation", "expert profile only", "blocked union route (needs the indexed backend, exact layout, fine views, origin cache and positive consumption caps)", ""},
+    {"resources", "repair_round1_origin_admission", "", "repair_round1_origin_admission", "existing | reuse_only_experimental", "-", "computation", "expert profile only", "first-round origin admission", ""},
+    {"resources", "union_progressive_schedule", "", "union_progressive_schedule", "off | experimental_v1", "-", "computation", "expert profile only", "progressive union schedule (not in the tested configuration)", ""},
+    {"resources", "adaptive_emission_handoff", "", "adaptive_emission_handoff", "0 | 1", "-", "computation", "expert profile only", "union-to-adaptive emission handoff (not in the tested configuration)", ""},
+    // 5. reporting and diagnostics
+    {"reporting", "--dosage-mode off|audit|repair", "", "", "off | audit | repair", "-", "reporting", "supported",
+     "expert spelling of the dosage stage: audit = --dosage-check; repair (may replace a block) needs --output-schema legacy and is refused under sequence_first_v2", "off"},
+    {"reporting", "--output-schema sequence_first_v2|legacy|sequence_first_v1", "", "output_schema", "sequence_first_v2 | legacy | sequence_first_v1", "-", "reporting+completion", "supported",
+     "the report contract and its exit statuses; v2 carries the primary assessment_v1 view; the unrepaired view reports with legacy", ""},
+    {"reporting", "--representation-guard on|off", "", "representation_guard", "on | off", "-", "reporting", "supported", "the representation-conflict check (feeds genotype_check CONFLICT)", ""},
+    {"reporting", "compound_annotation", "", "compound_annotation", "off | contract_v2", "-", "reporting", "expert profile only", "the compound annotation (.sequence_compound.tsv); needs sequence_first_v2", ""},
+    {"reporting", "compound_interval_declarations", "", "compound_interval_declarations", "a file", "-", "reporting", "expert profile only", "model-bound compound interval declarations (not in the tested configuration)", ""},
+    {"reporting", "block_support_rule", "", "block_support_rule", "legacy | full_data_likelihood_v1_experimental | full_data_likelihood_v2_experimental", "-", "reporting", "expert profile only", "support semantics of the legacy block fields", ""},
+    {"reporting", "library_sensitivity_audit", "", "library_sensitivity_audit", "0 | 1", "-", "reporting+computation", "expert profile only", "under --library auto, the 0.9x / 1.1x intensity audit behind LIBRARY_SENSITIVE", ""},
+    {"reporting", "timing_detail", "", "timing_detail", "0 | 1", "-", "reporting", "expert profile only", "stage timers in the status", ""},
+    {"reporting", "block_diagnostics", "", "block_diagnostics", "off | diagnostic_v1", "-", "reporting", "expert profile only", "per-block census route and JP tie diagnostics", ""},
+    {"reporting", "emission_lookup_timing", "", "emission_lookup_timing", "0 | 1", "-", "reporting", "expert profile only", "measurement only (not for production calls)", ""},
+    // 6. legacy and development compatibility
+    {"legacy", "--max-candidates", "", "", "-", "-", "-", "legacy", "removed: refused with a pointer to --mosaic-candidates (every panel diplotype is always a candidate)", "refused"},
+    {"legacy", "--dosage-audit off|shadow", "", "", "off | shadow", "-", "reporting", "legacy", "older spelling of --dosage-mode off|audit", "off"},
+    {"legacy", "--phase-audit-candidates N", "", "phase_audit_candidates", "N >= 0", "candidates", "reporting", "development",
+     "the phase audit set of the unrepaired view; refused under adaptive repair", ""},
+    {"legacy", "--dosage-allocation-test", "", "", "flag", "-", "reporting", "development", "allocation test diagnostic of the dosage stage", "off"},
+    {"legacy", "--library-diagnostic", "", "", "flag", "-", "reporting", "development", "writes the library estimate beside a declared library", "off"},
+    {"legacy", "diagnostic_* and test_* profile keys", "", "", "-", "-", "-", "development",
+     "test hooks (diagnostic_union_evidence_dump, diagnostic_union_kernel_dump, diagnostic_refinement_memory, diagnostic_refinement_replay, test_interrupt_point, test_library_sensitivity_fail_view); not user settings", "off"},
+};
+
+std::string human_bytes(const std::string& raw) {
+    if (raw.empty() || raw.find_first_not_of("0123456789") != std::string::npos) return raw;
+    const unsigned long long n = std::stoull(raw);
+    const unsigned long long gib = 1ull << 30, mib = 1ull << 20;
+    if (n == 0) return "0";
+    if (n % gib == 0) return std::to_string(n / gib) + " GiB";
+    if (n % mib == 0) return std::to_string(n / mib) + " MiB";
+    return raw;
+}
+std::string setting_display(const OptionEntry& e, const std::string& raw) {
+    const std::string values = e.values;
+    std::string v = raw;
+    if (values == "on | off") v = raw == "1" ? "on" : raw == "0" ? "off" : raw;
+    if (std::string(e.units) == "bytes") v = human_bytes(raw);
+    return v;
+}
+std::string effective_default(const OptionEntry& e) {
+    if (*e.fixed_default) return e.fixed_default;
+    static const GenotypeCommandOptions built_in;
+    const std::string key = e.key;
+    const auto& pub = genotype_public_settings();
+    const bool is_public = std::find(pub.begin(), pub.end(), key) != pub.end();
+    const std::string b = setting_display(e, is_public ? genotype_setting_value(built_in, key) : experimental_setting_value(built_in, key));
+    static const auto preset = genotype_preset_settings("short-read");
+    const auto p = std::find_if(preset.begin(), preset.end(), [&](const auto& kv) { return kv.first == key; });
+    if (p == preset.end()) return b;
+    std::string shown = setting_display(e, p->second);
+    if (key == "repair_max_neighbours" && p->second == "model") shown = "model (the model-derived bound)";
+    return shown == b ? shown : shown + " (built-in " + b + ")";
+}
+std::string wrap(const std::string& text, std::size_t indent, std::size_t width) {
+    std::string out, line;
+    std::istringstream in(text);
+    for (std::string word; in >> word;) {
+        if (!line.empty() && indent + line.size() + 1 + word.size() > width) {
+            out += std::string(indent, ' ') + line + "\n";
+            line.clear();
+        }
+        line += (line.empty() ? "" : " ") + word;
+    }
+    if (!line.empty()) out += std::string(indent, ' ') + line + "\n";
+    return out;
+}
+}  // namespace
+
+std::vector<GenotypeOptionRow> genotype_option_inventory() {
+    std::vector<GenotypeOptionRow> rows;
+    for (const OptionEntry& e : kOptionEntries) {
+        rows.push_back({e.group, e.option, e.aliases, e.key, e.values, effective_default(e), e.units, e.effect, e.status, e.text});
+    }
+    return rows;
+}
+
+std::string genotype_option_inventory_markdown() {
+    std::ostringstream out;
+    out << "| group | option | aliases | profile key | values | effective default (short-read) | units | changes | status |\n"
+        << "|---|---|---|---|---|---|---|---|---|\n";
+    const auto cell = [](std::string s) {
+        std::string o;
+        for (char c : s) o += c == '|' ? std::string("\\|") : std::string(1, c);
+        return o.empty() ? std::string("—") : o;
+    };
+    for (const GenotypeOptionRow& r : genotype_option_inventory()) {
+        out << "| " << r.group << " | `" << cell(r.option) << "` | " << cell(r.aliases) << " | " << cell(r.key) << " | " << cell(r.values)
+            << " | " << cell(r.effective_default) << " | " << cell(r.units) << " | " << cell(r.effect) << " | " << r.status << " |\n";
+    }
+    return out.str();
+}
+
+std::string genotype_advanced_help() {
+    std::ostringstream out;
+    out << "panvar genotype: every option, by purpose\n\n"
+           "Precedence: explicit flag > profile (--profile) > preset > built-in default, whatever the argument order;\n"
+           "every effective setting and its source is written to <prefix>.settings.tsv. 'changes' says what an option\n"
+           "can alter: inference (the prediction may change), computation (time or memory only; results gated\n"
+           "identical), reporting (outputs or annotations only), completion (whether or how a run completes: caps,\n"
+           "guards, budget stops). 'expert profile only' controls have no flag: set them as key<TAB>value in a\n"
+           "--profile file. Defaults are the effective short-read values (the built-in value is shown where it\n"
+           "differs).\n";
+    for (const auto& [group, title] : kOptionGroups) {
+        if (group == "everyday") continue;
+        out << "\n" << title << "\n";
+        for (const OptionEntry& e : kOptionEntries) {
+            if (group != e.group) continue;
+            out << "  " << e.option << (*e.aliases ? std::string("   (alias ") + e.aliases + ")" : std::string()) << "\n";
+            out << wrap(e.text, 6, 112);
+            std::string facts = std::string("values: ") + e.values + "; default: " + effective_default(e);
+            if (std::string(e.units) != "-") facts += std::string("; units: ") + e.units;
+            facts += std::string("; changes: ") + e.effect + "; " + e.status;
+            if (*e.key && std::string(e.option).rfind("--", 0) == 0) facts += std::string("; profile key ") + e.key;
+            out << wrap(facts, 6, 112);
+        }
+    }
+    out << "\nTerms (read before interpreting results)\n"
+        << wrap("Donor redraw: --switch-probability is the copying prior's per-boundary donor-redraw probability, a "
+                "regularisation of the panel model, not a biological recombination probability.", 2, 112)
+        << wrap("Mosaic candidates: --mosaic-candidates sets the INITIAL off-panel mosaics; the bounded refinement may "
+                "generate and score further mosaics beyond that number.", 2, 112)
+        << wrap("Refinement is bounded: local moves are scored exactly within declared caps; it is not a globally "
+                "exhaustive search, and a completed ranking is conditional on what was explored.", 2, 112)
+        << wrap("min_variant_bp constructs the variant sites (blocks); it is not a filter on final calls.", 2, 112)
+        << wrap("Library estimation learns the insert distribution and the fragment-start intensity only; the "
+                "substitution, outlier and gap parameters stay fixed.", 2, 112)
+        << wrap("Support is conditional on the explored candidates: READS means no explored rival projecting to a "
+                "different genotype was within bounds of the winner's fragment term.", 2, 112)
+        << wrap("Prior-dependent (read_support PRIOR_DEPENDENT): the reads alone did not separate the call from an "
+                "explored rival. It does not establish that the prior alone caused the selection.", 2, 112)
+        << wrap("Phase is assessed once per locus (the decision's phase support), not independently at each boundary.", 2, 112)
+        << wrap("Locus summaries must be read with their coverage counts and not_assessed list: a positive value covers "
+                "only the assessed blocks ([assessed/applicable] marks partial coverage).", 2, 112)
+        << wrap("Nothing here is calibrated reliability; there is no quality threshold.", 2, 112);
+    out << "\nFull inventory with defaults: docs/guides/genotype_short_read.md (option inventory).\n";
+    return out.str();
+}
+
 std::optional<int> parse_genotype_arguments(const std::vector<std::string>& args, GenotypeCommandOptions& options,
                                             std::ostream& out) {
     const auto need = [&](std::size_t& i) {
@@ -8344,145 +8615,61 @@ std::optional<int> parse_genotype_arguments(const std::vector<std::string>& args
                 "  panvar genotype --graph <locus.gfa> --reads1 <R1.fq[.gz]> --reads2 <R2.fq[.gz]> --threads 4 --out <prefix>\n"
                 "  panvar genotype --graph <locus.gfa> --build-panel-index <locus.pvpl>        (once per locus)\n"
                 "  panvar genotype --graph <locus.gfa> --panel-index <locus.pvpl> --reads1 ... --reads2 ... --out <prefix>\n\n"
-                "Genotypes one structural locus from paired short reads: a diplotype (two whole-locus haplotypes)\n"
-                "over the graph's panel, projected to one allele pair per block. EXPERIMENTAL. No profile is needed:\n"
-                "the short-read preset carries the accelerated configuration, the library is estimated from the reads,\n"
-                "the report is sequence-first v2 and the dosage audit runs only with --dosage-check.\n\n"
-                "Options:\n"
-                "  --preset short-read        the production algorithm, short-read constants and the accelerated\n"
-                "                             configuration; the default when omitted (long-read: refused, not implemented)\n"
-                "  --library auto|FILE        omitted means auto (identical): insert mean/sd and fragment-start intensity\n"
-                "                             estimated from the reads, refused (LIBRARY_REFUSED) if invalid, never a fallback;\n"
-                "                             support_sigmas, substitution_error and outlier_weight stay fixed. FILE is the\n"
-                "                             exact reproducibility route (no estimate, no audit): one `key value` per line,\n"
-                "                             exactly insert_mean_bp, insert_sd_bp, support_sigmas, substitution_error,\n"
-                "                             outlier_weight, fragment_start_intensity and optionally marker_background;\n"
-                "                             an unknown, repeated or missing key is refused. The gap model (gap_open,\n"
-                "                             gap_extend, maximum displacement) is fixed and cannot be declared.\n"
-                "  --reference-path NAME      the coordinate reference (default: the single path of the graph's RS:Z\n"
-                "                             sample; refused with the candidates listed when absent or ambiguous)\n"
-                "  --panel-curation FILE      panel templates to exclude\n"
-                "  --bubbles FILE             precomputed bubbles CSV (default: detected from the graph)\n"
-                "  --threads N                workers\n"
-                "  --mosaic-candidates K      off-panel mosaics scored beside every panel diplotype\n"
-                "  --adaptive-repair on|off   bounded coordinate refinement (default on): local moves scored exactly,\n"
-                "                             within declared caps; not a global optimum. off gives the unrepaired\n"
-                "                             development view\n"
-                "  --repair-rounds N          the repair's round cap\n"
-                "  --dosage-check             run the dosage audit and write its diagnostics; it never changes the\n"
-                "                             prediction and adds run time (not necessarily cheaper than the call).\n"
-                "                             Without it dosage is not run (reported NOT_EVALUATED). Expert spelling:\n"
-                "                             --dosage-mode off|audit|repair (default off); repair needs --output-schema\n"
-                "                             legacy; a contradiction with --dosage-check is refused\n"
-                "  --output-schema sequence_first_v2|legacy|sequence_first_v1   the report contract (default\n"
-                "                             sequence_first_v2 under the short-read preset). v2 writes sequence_haplotypes.tsv\n"
-                "                             with panel-path extraction references and writes sequence_haplotypes.fa only when\n"
-                "                             a haplotype is off-panel; exit 0 PREDICTION, 3 PROVISIONAL, 1 NO_PREDICTION.\n"
-                "                             The unrepaired view (--adaptive-repair off) reports with the legacy schema\n"
-                "  --profile FILE             optional expert override (key<TAB>value; it must name itself). Repeated --profile\n"
-                "                             files apply in order, a later one overriding an earlier one; a key set twice\n"
-                "                             in one file is refused. A profile is not by itself a validated configuration\n"
-                "  --build-panel-index FILE   build the sample-independent panel index for this graph, reference, curation,\n"
-                "                             bubbles and marker settings (structural model + marker panel), then stop: no\n"
-                "                             reads, library or output prefix; an existing FILE is never overwritten\n"
-                "  --panel-index FILE         genotype against a built index: it saves locus preparation, not the rest of the\n"
-                "                             run. Its integrity, versions and identity are verified first (the --graph and\n"
-                "                             other inputs are still read and hashed); a missing, corrupt or incompatible\n"
-                "                             index is refused (exit 2) before the output prefix is touched, never rebuilt.\n"
-                "                             Rebuild it when the graph, reference, curation, bubbles, --min-variant-bp,\n"
-                "                             --kmer-size or --syncmer-s change (reads, library, threads and --dosage-check do not)\n"
-                "  -q, --quiet\n"
-                "  --help-advanced            advanced scientific flags, profile keys and precedence\n\n"
-                "Headline filters, three independent verdicts (every detailed field is also reported):\n"
-                "  GENOTYPE_FILTER, DOSAGE_FILTER, PHASE_FILTER: PASS, LOW_QUALITY, NOT_EVALUATED, NO_CALL or NOT_APPLICABLE,\n"
-                "  with reasons; CALL_SUMMARY=GENOTYPE_<s>;DOSAGE_<s>;PHASE_<s>. Per block in .block_genotypes.tsv and\n"
-                "  .genotypes.tsv (genotype_filter, dosage_filter); per locus in .locus_genotype.tsv (all three, reasons\n"
-                "  and per-status counts). A no-call is NO_CALL in all three, DOSAGE_FILTER included; a call without\n"
-                "  --dosage-check has DOSAGE_FILTER NOT_EVALUATED. PHASE_FILTER is PASS only for read-supported\n"
-                "  phase; a prior-selected phase is LOW_QUALITY (MODEL_ONLY_PHASE).\n"
-                "  PASS means the computational and representation checks passed. It is not calibrated reliability, and\n"
-                "  no combination of PASS values establishes an exact or biologically correct genotype.\n\n"
-                "Under --library auto the call is also followed at 0.9x and 1.1x the estimated intensity; a block whose\n"
-                "unordered genotype differs there (likelihood rank or search path) is LOW_QUALITY (LIBRARY_SENSITIVE). An\n"
-                "audit that cannot complete makes GENOTYPE_FILTER NOT_EVALUATED (LIBRARY_SENSITIVITY_NOT_EVALUATED) at\n"
-                "every block, and the locus filter NOT_EVALUATED_LIBRARY_SENSITIVITY; after a dosage repair, a block the\n"
-                "audit no longer covers is NOT_EVALUATED the same way. The call itself never changes.\n\n"
-                "Outputs: .locus_genotype.tsv (the locus-level call), .block_genotypes.tsv and .genotypes.tsv (per block),\n"
-                ".mosaic_haplotypes.fa (a strict call's haplotypes; legacy schema only), .mosaic_status.tsv, .settings.tsv\n"
-                "(every effective setting and its source) and the search record; sequence-first schemas add the\n"
-                ".sequence_* reports (see docs/guides/genotype_short_read.md).\n\n"
-                "Exit status: sequence-first (default) 0 PREDICTION, 3 PROVISIONAL, 1 NO_PREDICTION; legacy schema\n"
-                "0 a genotype was emitted, 1 no-call; both: 2 argument, input or output error; 124 time limit\n"
-                "(time_limit_seconds; none under the preset); 125 footprint limit (footprint_limit_bytes, 6 GiB under the\n"
-                "preset: a sampled guard -- the physical footprint is polled every 100 ms while the run is unclaimed --\n"
-                "not an allocation-level ceiling; a short spike between "
-                "samples can exceed it).\n";
+                "Genotypes one structural locus from paired short reads: a diplotype (two whole-locus haplotypes) over the\n"
+                "graph's panel, projected to one allele pair per block. EXPERIMENTAL. No profile is needed: the short-read\n"
+                "preset is applied, and the library is estimated from the reads (insert size and fragment-start intensity\n"
+                "only; the error parameters stay fixed; an invalid estimate refuses the run, never a fallback).\n\n"
+                "Everyday options:\n"
+                "  --graph FILE               the locus graph (alias -i)\n"
+                "  --reads1 FILE --reads2 FILE  paired FASTQ (.gz accepted), mates in the same order\n"
+                "  --out PREFIX               output prefix (default genotype; alias -o)\n"
+                "  --reference-path NAME      coordinate reference (default: the single path of the graph's RS:Z sample;\n"
+                "                             refused with the candidates listed when absent or ambiguous)\n"
+                "  --threads N                worker threads (default 1); results do not depend on them\n"
+                "  --dosage-check             optional copy-number audit of the reported alleles. It never changes the\n"
+                "                             prediction and adds run time (not necessarily cheaper than the call); without\n"
+                "                             it dosage_check is NOT_REQUESTED\n"
+                "  --build-panel-index FILE   build the sample-independent panel index for this graph, reference,\n"
+                "                             curation, bubbles and marker settings, then stop; never overwritten\n"
+                "  --panel-index FILE         genotype against a built index: it saves locus preparation, not the rest of\n"
+                "                             the run. --graph is still required and still read and hashed; the index's\n"
+                "                             integrity, versions and identity are verified before the output prefix is\n"
+                "                             touched, and a missing, corrupt or incompatible index is refused (exit 2),\n"
+                "                             never rebuilt. Rebuild it when the graph, reference, curation, bubbles,\n"
+                "                             --min-variant-bp, --kmer-size or --syncmer-s change\n"
+                "  -q, --quiet                no progress messages (warnings are still printed)\n"
+                "  -h, --help                 this help\n"
+                "  --help-advanced            every option by purpose: library file, curation and bubbles; the copying\n"
+                "                             prior and marker model; candidates and bounded refinement; resource limits,\n"
+                "                             caches and backends; reporting; legacy and development controls\n\n"
+                "Outcomes: PREDICTION (a completed ranking; exit 0), PROVISIONAL (the best fully evaluated candidate after\n"
+                "a budget stop or declared cap: the search is incomplete; exit 3), NO_PREDICTION (exit 1).\n"
+                "Sequences: .sequence_haplotypes.tsv always gives each haplotype's SHA-256 and origin; when both haplotypes\n"
+                "are on the panel, no FASTA is needed (extraction references point into the graph); when either is\n"
+                "off-panel, .sequence_haplotypes.fa holds both.\n\n"
+                "Primary assessment (assessment_v1), in .sequence_locus.tsv and .sequence_blocks.tsv (mirrored in the locus\n"
+                "and block tables). Every check concerns the published prediction:\n"
+                "  sequence_resolution  RESOLVED, GENOTYPE_RESOLVED_SEQUENCE_SET, SEQUENCE_TIED (sequence ambiguity)\n"
+                "  genotype_check       NONE_DETECTED, CONFLICT or NOT_ASSESSED (+ coverage)\n"
+                "  dosage_check         AGREES, SUSPECT, DISAGREES, UNAVAILABLE, NOT_REQUESTED or NOT_APPLICABLE; corrections\n"
+                "                       are listed apart, as diagnostics (dosage_alternatives)\n"
+                "  read_support         READS, PRIOR_DEPENDENT or NOT_ASSESSED: conditional on the explored candidates;\n"
+                "                       prior-dependent does not mean the prior alone chose the call\n"
+                "  phase                READ_SUPPORTED, PRIOR_ONLY, UNRESOLVED, NOT_ASSESSED or NOT_APPLICABLE, assessed once\n"
+                "                       per locus (not independently at each boundary)\n"
+                "  findings, not_assessed  every concrete finding and every check that could not run, with block ids\n"
+                "Read a locus summary with its coverage and not_assessed list: a missing check is not a failure and never\n"
+                "hides a finding. These assessments are not calibrated reliability, and there is no quality threshold. The\n"
+                "older headline fields (genotype_filter, dosage_filter, phase_filter, call_summary) are kept as superseded\n"
+                "compatibility diagnostics.\n\n"
+                "Exit status: sequence-first (default) 0 PREDICTION, 3 PROVISIONAL, 1 NO_PREDICTION; legacy schema 0 a\n"
+                "genotype was emitted, 1 no-call; both: 2 argument, input or output error; 124 time limit, 125 footprint\n"
+                "limit (the 6 GiB footprint guard is sampled, not an allocation ceiling). Full guide:\n"
+                "docs/guides/genotype_short_read.md.\n";
             return 0;
         }
         else if (flag == "--help-advanced") {
-            GenotypeCommandOptions defaults;
-            out <<
-                "panvar genotype: advanced settings\n\n"
-                "Precedence: explicit flag > profile (--profile) > preset > built-in default, whatever the argument\n"
-                "order. The preset is --preset short-read whether or not it is given. Every effective setting and its\n"
-                "source is written to <prefix>.settings.tsv.\n\n"
-                "Scientific flags (each is exactly its profile key: same parser, same validation):\n";
-            const auto preset = genotype_preset_settings("short-read");
-            const auto show = [&](const AdvancedFlag& f) {
-                std::string head = std::string("  ") + f.flag + (f.on_off ? " on|off" : " N");
-                head.resize(std::max<std::size_t>(head.size() + 1, 34), ' ');
-                const auto word = [&](const std::string& v) { return f.on_off ? std::string(v == "1" ? "on" : "off") : v; };
-                const std::string built_in = word(genotype_setting_value(defaults, f.key));
-                const auto in_preset = std::find_if(preset.begin(), preset.end(), [&](const auto& kv) { return kv.first == f.key; });
-                out << head << f.help << "\n" << std::string(34, ' ') << "profile key " << f.key << "; "
-                          << (in_preset == preset.end() ? "built-in default " + built_in
-                                                        : "short-read preset " + word(in_preset->second) + " (built-in " + built_in + ")")
-                          << "\n";
-            };
-            for (const AdvancedFlag& f : kAdvancedFlags) if (!f.development_only) show(f);
-            out << "\nDevelopment-only scientific control: refused under adaptive repair (the production default, whose\n"
-                         "pooled rerank replaces the audit); it needs --adaptive-repair off:\n";
-            for (const AdvancedFlag& f : kAdvancedFlags) if (f.development_only) show(f);
-            const auto list = [](const std::vector<std::string>& keys) {
-                std::string out = "  ";
-                std::size_t width = 2;
-                for (const std::string& key : keys) {
-                    if (width > 2 && width + key.size() + 2 > 104) { out += "\n  "; width = 2; }
-                    out += (width > 2 ? "  " : "") + key;
-                    width += key.size() + 2;
-                }
-                return out + "\n";
-            };
-            std::vector<std::string> resource, measurement;
-            bool after_flags = false;
-            for (const std::string& key : genotype_public_settings()) {
-                if (key == "max_piece_hits") after_flags = true;
-                if (!after_flags) continue;
-                (key == "emission_lookup_timing" || key == "library_sensitivity_audit" ? measurement : resource).push_back(key);
-            }
-            out << "\nResource caps, caches and limits: profile keys only (key<TAB>value in a --profile file):\n"
-                      << list(resource) << "Measurement keys (profile only; not for production calls):\n" << list(measurement);
-            out <<
-                "\nLibrary parameters belong to --library FILE, one `key value` per line: exactly insert_mean_bp,\n"
-                "insert_sd_bp, support_sigmas, substitution_error, outlier_weight, fragment_start_intensity and\n"
-                "optionally marker_background, each once; '#' starts a comment. gap_open, gap_extend and the maximum\n"
-                "displacement are fixed by the short-read model and cannot be supplied in the file.\n\n"
-                "Development view: --adaptive-repair off gives the unrepaired proposal call (no repair rounds, no tie\n"
-                "branching); --repair-rounds 0 is the same view, with tie branching off. --adaptive-repair, --repair-rounds\n"
-                "and --repair-tie-branching are resolved together whatever their order; an explicit contradiction (off\n"
-                "with N > 0 rounds, on with 0 rounds, tie branching on with no rounds) is refused. Diagnostic and test\n"
-                "hooks are not user settings and are not listed.\n\n"
-                "Reporting (EXPERIMENTAL, opt-in): --output-schema legacy|sequence_first_v1|sequence_first_v2 (profile key\n"
-                "output_schema; default legacy). sequence_first_v2 adds panel membership, extraction references and the\n"
-                "conditional FASTA rule to v1, defaults --dosage-mode to audit and refuses repair. sequence_first_v1 adds <prefix>.sequence_locus.tsv, .sequence_blocks.tsv,\n"
-                ".sequence_haplotypes.fa, .representation_intervals.tsv and .sequence_alternatives.tsv, and changes the\n"
-                "exit status to 0 PREDICTION (a completed ranking, even if uncertain), 3 PROVISIONAL (a declared-cap stop\n"
-                "with an exactly scored incumbent), 1 NO_PREDICTION; legacy outputs are unchanged. It needs the adaptive\n"
-                "repair. structure_confidence is NA (UNCALIBRATED); projection_coverage is EXPLORED.\n\n"
-                "Further experimental profile keys (backends, caches, early_incumbent, union_fragment_blocks,\n"
-                "repair_round1_origin_admission, repair_junction_proposals, compound_annotation, block_diagnostics, ...)\n"
-                "are documented with their values, defaults and refusals in docs/guides/genotype_short_read.md; the\n"
-                "tested complete configuration is profiles/genotype_experimental_sr_v1_<locus>.tsv (EXPERIMENTAL).\n";
+            out << genotype_advanced_help();
             return 0;
                 } else {
             throw std::runtime_error("unknown genotype option: " + flag);

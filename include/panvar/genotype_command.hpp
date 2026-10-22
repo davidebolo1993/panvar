@@ -559,6 +559,14 @@ void validate_genotype_settings(const GenotypeCommandOptions& options);
 // is not a preset value (NaN): it comes from --library auto or --library FILE. "long-read" is reserved and refused as
 // not implemented; any other name is refused.
 std::vector<std::pair<std::string, std::string>> genotype_preset_settings(const std::string& name);
+// M15-H: the public option inventory (every option: group, aliases, profile key, values, effective short-read default
+// computed from the preset and the built-in options, units, what it changes, status), and the texts derived from it.
+struct GenotypeOptionRow {
+    std::string group, option, aliases, key, values, effective_default, units, effect, status, text;
+};
+std::vector<GenotypeOptionRow> genotype_option_inventory();
+std::string genotype_option_inventory_markdown();
+std::string genotype_advanced_help();
 LibraryModel genotype_preset_library(const std::string& name);
 
 // A declared library file (--library FILE): one `key value` per line; blank lines and lines whose first non-space
