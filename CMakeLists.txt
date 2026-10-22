@@ -163,6 +163,7 @@ add_library(panvarlib
     src/genotype_dosage_integrate.cpp
     src/library_estimate.cpp
     src/genotype_headline.cpp
+    src/genotype_assessment.cpp
     src/genotype_dosage_provenance.cpp
     src/fragment_likelihood.cpp
     src/genotype_sequence_report.cpp
@@ -498,6 +499,13 @@ if(PANVAR_BUILD_TESTING)
         add_test(NAME panvar_genotype_headline COMMAND genotype_headline_test)
         # The command's release contract: the declared-library file, order-independent repair options, the diagnostic
         # cache flags' provenance, the help text, and a pre-block no-call's headline.
+        # M15-G: the assessment_v1 view agrees byte for byte with its executable specification (fixtures G1-G6, S01-S20)
+        add_executable(genotype_assessment_test tests/genotype_assessment_main.cpp src/cli_utils.cpp)
+        target_link_libraries(genotype_assessment_test PRIVATE panvarlib)
+        target_compile_options(genotype_assessment_test PRIVATE -Wall -Wextra -Wpedantic)
+        add_test(NAME panvar_genotype_assessment
+                 COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/tests/analysis/m15g/compare.py
+                         $<TARGET_FILE:genotype_assessment_test> ${CMAKE_CURRENT_BINARY_DIR}/genotype_assessment)
         add_executable(genotype_cli_contract_test tests/genotype_cli_contract.cpp src/cli_utils.cpp)
         target_link_libraries(genotype_cli_contract_test PRIVATE panvarlib)
         target_compile_options(genotype_cli_contract_test PRIVATE -Wall -Wextra -Wpedantic)

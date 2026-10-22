@@ -4442,11 +4442,23 @@ void test_sequence_first_v2() {
     // (2) audit vs off: nothing but the recorded dosage mode changes
     const panvar::GenotypeCommandOptions off = options("sf2_off", "off");
     require(panvar::execute_genotype_command(off, nullptr) == 0, "v2 off: predicts");
-    for (const char* f : {"call.sequence_haplotypes.tsv", "call.sequence_blocks.tsv", "call.representation_intervals.tsv",
+    for (const char* f : {"call.sequence_haplotypes.tsv", "call.representation_intervals.tsv",
                           "call.sequence_alternatives.tsv", "call.mosaic_scores.tsv", "call.mosaic_candidates.tsv",
                           "call.equivalence_set.tsv"}) {
         require(sf::normalised(path("sf2_audit/") + f, path("sf2_audit")) == sf::normalised(path("sf2_off/") + f, path("sf2_off")),
                 std::string("audit vs off: ") + f + " identical");
+    }
+    {   // M15-G: the sequence blocks' science columns are identical; only the assessment's dosage columns record the difference
+        const auto ra = rows(path("sf2_audit/call.sequence_blocks.tsv")), ro = rows(path("sf2_off/call.sequence_blocks.tsv"));
+        require(ra.size() == ro.size() && !ra.empty(), "audit vs off: the same sequence block rows");
+        static const std::set<std::string> dosage_cols = {"dosage_check", "dosage_check_reason", "dosage_alternative"};
+        for (std::size_t i = 0; i < ra.size(); ++i) {
+            for (const auto& [k, v] : ra[i]) {
+                if (dosage_cols.count(k) == 0) require(ro[i].at(k) == v, "audit vs off: sequence_blocks " + k + " identical");
+            }
+            require(ro[i].at("dosage_check") == "NOT_REQUESTED" && ra[i].at("dosage_check") != "NOT_REQUESTED",
+                    "audit vs off: the assessment records the dosage check as requested or not");
+        }
     }
     {   // the legacy block table: every column identical except the dosage filter pair, which records the mode (off:
         // DOSAGE_NOT_EVALUATED:dosage_mode_off; audit: its finding) -- a diagnostic annotation, never a genotype change
@@ -4467,6 +4479,8 @@ void test_sequence_first_v2() {
             for (std::size_t c = 0; c < a.front().size(); ++c) {
                 const std::string& col = a.front()[c];
                 if (col == "dosage_filter" || col == "dosage_filter_reasons") continue;
+                // M15-G: the assessment mirror's dosage columns record the requested check, as dosage_filter does
+                if (col == "dosage_check" || col == "dosage_check_reason" || col == "dosage_alternative") continue;
                 require(a[r][c] == o[r][c], "audit vs off: block column " + col + " unchanged by the audit");
             }
             require(o[r][std::find(o.front().begin(), o.front().end(), "dosage_filter_reasons") - o.front().begin()] ==
@@ -4478,6 +4492,13 @@ void test_sequence_first_v2() {
     require(la.at("dosage_mode") == "audit" && lo.at("dosage_mode") == "off", "audit vs off: recorded modes");
     la.erase("dosage_mode");
     lo.erase("dosage_mode");
+    // M15-G: the assessment rows that state the dosage check (and the lists and summary that carry it) differ by design;
+    // the genotype, support, phase and resolution rows must not
+    require(lo.at("dosage_check") == "NOT_REQUESTED" && la.at("dosage_check") != "NOT_REQUESTED", "audit vs off: the dosage check recorded");
+    for (const char* k : {"dosage_check", "dosage_check_coverage", "dosage_alternatives", "findings", "not_assessed", "assessment_summary"}) {
+        la.erase(k);
+        lo.erase(k);
+    }
     require(la == lo, "audit vs off: the locus record is otherwise identical (prediction, hashes, origins)");
     require(exists(path("sf2_audit/call.dosage_status.tsv")) &&
                 read_status(path("sf2_audit/call.dosage_status.tsv")).at("dosage_audit") == "shadow",

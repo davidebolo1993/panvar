@@ -1,4 +1,5 @@
 #include "panvar/genotype_command.hpp"
+#include "panvar/genotype_assessment.hpp"
 #include "panvar/genotype_sequence_report.hpp"
 #include "panvar/prepared_locus.hpp"
 #include "panvar/prepared_locus_file.hpp"
@@ -615,6 +616,12 @@ void stop_run(const std::string& state, const std::string& note, int code) {
     }
     std::filesystem::remove(g_watch->out_prefix + ".sorted.gfa", ignored);
     atomic_write(g_watch->out_prefix + ".mosaic_status.tsv", minimal_status(*g_watch, state, note, code));
+    if (g_watch->sequence_v2) {   // M15-G: the stop record carries the primary view too (provisional or no prediction)
+        try {
+            assessment::write_assessment(g_watch->out_prefix);
+        } catch (...) {
+        }
+    }
     std::cerr << "[genotype] " << state << ": " << note << '\n';
     std::_Exit(code);
 }
@@ -3350,6 +3357,7 @@ GenotypeRunStatus run_genotype_body(const GenotypeCommandOptions& options, Genot
                         atomic_write(g_watch->out_prefix + ".mosaic_status.tsv",
                                      minimal_status(*g_watch, "FAILED",
                                                     "an exception ended the run before a final status", 2));
+                        if (g_watch->sequence_v2) assessment::write_assessment(g_watch->out_prefix);   // M15-G
                     } catch (...) {
                     }
                 }
@@ -8875,6 +8883,9 @@ int execute_genotype_command(const GenotypeCommandOptions& requested, const Prep
         }
         dosage::write_locus_genotype(model, options.out_prefix, integration);
         if (v2_fasta_policy) suppress_legacy_fasta(options.out_prefix);
+        // M15-G: the primary assessment (assessment_v1) of the published v2 prediction, from this run's own outputs, once
+        // every input it reads is final; a failure here is a reporting failure (exit 2, named below)
+        if (v2_fasta_policy) assessment::write_assessment(options.out_prefix);
         if (options.library_diagnostic && model && options.library_path != "auto") {   // auto writes its own table
             std::optional<double> ignored;
             const LibraryModel declared = read_library(options.library_path, ignored);
@@ -8894,6 +8905,12 @@ int execute_genotype_command(const GenotypeCommandOptions& requested, const Prep
         }
         // M15-D.1: the process exits 2 (an output error), so the records that state an exit say 2 as well. The sequence
         // report stays as published (its sequences are complete); the failure is named beside it.
+        if (v2_fasta_policy) {   // M15-G: the primary view of the published prediction, best effort, from what was written
+            try {
+                assessment::write_assessment(options.out_prefix);
+            } catch (...) {
+            }
+        }
         if (sequence_first) {
             const std::string why = std::string("FAILED: ") + error.what();
             for (const std::string file : {options.out_prefix + ".sequence_locus.tsv", options.out_prefix + ".mosaic_status.tsv"}) {
