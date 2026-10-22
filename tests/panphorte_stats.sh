@@ -709,6 +709,144 @@ mix_copies=$(awk -F'\t' '$1=="mixed"{print $4}' "$OUT/mixp.panphorte.copies.tsv"
   && ok "and the 3 bp flanking each in-node copy survive" \
   || bad "mixed lost bases when its two unequal copies were folded"
 
+# ---------------------------------------------------------------- --refine: flanks realigned around the array
+# After folding, the bases around the array keep the input graph's representation: the same flank can
+# be spelled through different node chains by different haplotypes. --refine realigns the flanks before
+# and after each carrier's array block (one alignment per side), keeps the block and every non-carrier
+# as folded, and accepts the rebuild only when it has fewer nodes and steps.
+#
+# Carriers A, A2, C and the reverse-crossing R spell the left flank ACGTAC as 5+6; B spells it 8+9.
+# The right flank GGTT is 7 for A, A2, B and 10+11 for C and R. D crosses without copies.
+rf_mk() {   # <name> <path lines "NAME STEPS"...>: the shared refine fixture graph
+  local n=$1; shift; local paths=("$@")
+  { printf 'H\tVN:Z:1.0\n'
+    printf "S\t1\t%s\nS\t2\t%s\nS\t4\t%s\n" "$BB1" "$UNIT" "$BB2"
+    printf "S\t5\tACG\nS\t6\tTAC\nS\t7\tGGTT\nS\t8\tAC\nS\t9\tGTAC\nS\t10\tGG\nS\t11\tTT\nS\t12\tTTTT\nS\t13\tCA\n"
+    local e
+    for e in "1 5" "5 6" "6 2" "2 2" "2 7" "7 4" "1 8" "8 9" "9 2" "2 10" "10 11" "11 4" "1 12" "12 4" \
+             "2 13" "13 2" "5 2"; do
+      printf "L\t%s\t+\t%s\t+\t0M\n" "${e% *}" "${e#* }"
+    done
+    for e in "${paths[@]}"; do printf 'P\t%s\t%s\t*\n' "${e%% *}" "${e#* }"; done; } > "$OUT/$n.gfa"
+  "$BIN" bubble -i "$OUT/$n.gfa" -r A -o "$OUT/${n}b" --min-variant-bp 0 -q >/dev/null 2>&1
+}
+rf_run() {  # <name> <out> [panphorte args...]
+  local n=$1 o=$2; shift 2
+  "$BIN" panphorte -i "$OUT/${n}b.sorted.gfa" -c "$OUT/${n}b.bubbles.csv" -r A --resnarl-min-variant-bp 0 \
+         -o "$OUT/$o" -q "$@" >/dev/null 2>&1
+}
+rcol() { awk -F'\t' -v w="$2" 'NR==1{for(i=1;i<=NF;i++)c[$i]=i;next} NR==2{print $(c[w])}' "$1"; }
+# REP occurrences per path: steps on nodes that carry a self-link
+repcounts() { awk '$1=="L" && $2==$4 {self[$2]=1}
+                   $1=="P" {n=split($3,a,","); c=0; for(i=1;i<=n;i++) if (substr(a[i],1,length(a[i])-1) in self) c++
+                            print $2, c}' "$1" "$1" | sort; }
+# interior node ids of a path, without the two anchors
+inner() { pline "$1" "$2" | tr ',' '\n' | sed '1d;$d'; }
+SPLIT=("A 1+,5+,6+,2+,2+,7+,4+" "A2 1+,5+,6+,2+,2+,7+,4+" "B 1+,8+,9+,2+,2+,2+,7+,4+"
+       "C 1+,5+,6+,2+,2+,10+,11+,4+" "R 4-,11-,10-,2-,2-,6-,5-,1-" "D 1+,12+,4+")
+
+rf_mk rf1 "${SPLIT[@]}"
+rf_run rf1 rf1n
+rf_run rf1 rf1r --refine
+[ ! -e "$OUT/rf1n.panphorte.refine.tsv" ] \
+  && ok "without --refine no refine table is written" \
+  || bad "a run without --refine wrote the refine table"
+[ "$(rcol "$OUT/rf1r.panphorte.refine.tsv" refine_status)" = "refined" ] \
+  && ok "--refine rebuilds the flanks of a folded site whose flanks are split differently" \
+  || bad "--refine status '$(rcol "$OUT/rf1r.panphorte.refine.tsv" refine_status)', expected refined"
+rf_counts="$(rcol "$OUT/rf1r.panphorte.refine.tsv" nodes_before)>$(rcol "$OUT/rf1r.panphorte.refine.tsv" nodes_after) $(rcol "$OUT/rf1r.panphorte.refine.tsv" steps_before)>$(rcol "$OUT/rf1r.panphorte.refine.tsv" steps_after)"
+[ "$rf_counts" = "8>3 18>11" ] \
+  && ok "flank nodes 8 -> 3 and steps 18 -> 11 (one node per flank, the non-carrier untouched)" \
+  || bad "flank nodes/steps before>after '$rf_counts', expected '8>3 18>11'"
+rf_ok=1
+for h in A A2 B C R D; do
+  [ "$(spell "$OUT/rf1n.normalized.sorted.gfa" $h)" = "$(spell "$OUT/rf1r.normalized.sorted.gfa" $h)" ] || rf_ok=0
+done
+[ "$rf_ok" = 1 ] && ok "every haplotype spells exactly what it spelled after folding" \
+                 || bad "--refine changed a haplotype's sequence"
+[ "$(repcounts "$OUT/rf1n.normalized.sorted.gfa")" = "$(repcounts "$OUT/rf1r.normalized.sorted.gfa")" ] \
+  && ok "every haplotype walks the REP node the same number of times" \
+  || bad "--refine changed a REP copy count"
+# B spelled the left flank through other nodes than A; after --refine both walk one node for it.
+rf_l_a=$(inner "$OUT/rf1r.normalized.sorted.gfa" A | head -1)
+rf_l_b=$(inner "$OUT/rf1r.normalized.sorted.gfa" B | head -1)
+rf_r_a=$(inner "$OUT/rf1r.normalized.sorted.gfa" A | tail -1)
+rf_r_c=$(inner "$OUT/rf1r.normalized.sorted.gfa" C | tail -1)
+[ "$rf_l_a" = "$rf_l_b" ] && [ "$rf_r_a" = "$rf_r_c" ] \
+  && ok "carriers that spelled a flank through different chains now share its node" \
+  || bad "flanks still scattered: left A=$rf_l_a B=$rf_l_b, right A=$rf_r_a C=$rf_r_c"
+# R crosses the site in reverse: its route must be C's route reversed, not a reverse-complemented copy.
+rf_c=$(pline "$OUT/rf1r.normalized.sorted.gfa" C)
+rf_r=$(pline "$OUT/rf1r.normalized.sorted.gfa" R | tr ',' '\n' | tail -r 2>/dev/null || pline "$OUT/rf1r.normalized.sorted.gfa" R | tr ',' '\n' | tac)
+rf_r=$(echo "$rf_r" | sed 's/+$/#/;s/-$/+/;s/#$/-/' | paste -sd, -)
+[ "$rf_c" = "$rf_r" ] \
+  && ok "a carrier crossing in reverse walks the same route as its forward twin" \
+  || bad "reverse carrier route '$rf_r' differs from C '$rf_c'"
+# The fixture's CA node is used only by the interruption fixture below, so it is an orphan in this graph
+# with or without --refine; what --refine must not do is add one.
+rf_topo() { awk '$1 == "S" {seg[$2] = 1}
+     $1 == "L" {link[$2 "" $3 ">" $4 "" $5] = 1}
+     $1 == "P" {n = split($3, st, ","); for (i = 1; i <= n; i++) {
+                  node = substr(st[i], 1, length(st[i]) - 1); o = substr(st[i], length(st[i]))
+                  used[node] = 1
+                  if (!(node in seg)) absent++
+                  if (i > 1) {
+                    fo = (po == "+") ? "-" : "+"; ro = (o == "+") ? "-" : "+"
+                    if (!((pn "" po ">" node "" o) in link) && !((node "" ro ">" pn "" fo) in link)) dangling++
+                  }
+                  pn = node; po = o }}
+     END {for (s in seg) if (!(s in used)) orphan++
+          printf "%d %d %d\n", absent + 0, dangling + 0, orphan + 0}' "$1"; }
+rf_topo_r=$(rf_topo "$OUT/rf1r.normalized.sorted.gfa")
+rf_orph_n=$(rf_topo "$OUT/rf1n.normalized.sorted.gfa" | cut -d' ' -f3)
+[ "$rf_topo_r" = "0 0 $rf_orph_n" ] \
+  && ok "the refined graph has no absent node or dangling adjacency, and no new orphan segment" \
+  || bad "refined graph topology (absent dangling orphan): $rf_topo_r; unrefined orphans: $rf_orph_n"
+
+# A folded array may hold fragments between its copies, repeated: REP CA REP CA REP. They belong to the
+# array, which --refine keeps verbatim; only an unfolded repeat in a FLANK is a duplication to refuse.
+rf_mk rf3 "${SPLIT[@]}" "I 1+,8+,9+,2+,13+,2+,13+,2+,10+,11+,4+"
+rf_run rf3 rf3n --min-similarity 0.90
+rf_run rf3 rf3r --min-similarity 0.90 --refine
+[ "$(rcol "$OUT/rf3r.panphorte.refine.tsv" refine_status)" = "refined" ] \
+  && ok "a fragment repeated between folded copies does not block --refine" \
+  || bad "status '$(rcol "$OUT/rf3r.panphorte.refine.tsv" refine_status)' with a repeated between-copy fragment"
+[ "$(spell "$OUT/rf3n.normalized.sorted.gfa" I)" = "$(spell "$OUT/rf3r.normalized.sorted.gfa" I)" ] \
+  && [ "$(repcounts "$OUT/rf3n.normalized.sorted.gfa")" = "$(repcounts "$OUT/rf3r.normalized.sorted.gfa")" ] \
+  && ok "and the array block, fragments included, is kept as folded" \
+  || bad "the array block with its between-copy fragments changed"
+
+# Exact folding leaves I's interrupted copies unfolded: node 2 walked three times outside any REP. That
+# is the duplication --refine must not linearize, so the site is left exactly as folded.
+rf_run rf3 rf2n
+rf_run rf3 rf2r --refine
+[ "$(rcol "$OUT/rf2r.panphorte.refine.tsv" refine_status)" = "skipped:unfolded_dup" ] \
+  && ok "a site with an unfolded duplication in a flank is skipped" \
+  || bad "status '$(rcol "$OUT/rf2r.panphorte.refine.tsv" refine_status)', expected skipped:unfolded_dup"
+rf_same=1
+for f in normalized.sorted.gfa bubbles.csv bandage_nodes.csv panphorte.report.tsv panphorte.rep_provenance.tsv; do
+  cmp -s "$OUT/rf2n.$f" "$OUT/rf2r.$f" || rf_same=0
+done
+[ "$rf_same" = 1 ] && ok "and every output is byte-identical to the run without --refine" \
+                   || bad "a skipped site still changed the output"
+
+# Flanks already shared: realignment cannot make the site simpler, so it is kept as folded.
+rf_mk rf4 "A 1+,5+,2+,2+,7+,4+" "B 1+,5+,2+,2+,2+,7+,4+" "D 1+,12+,4+"
+rf_run rf4 rf4n
+rf_run rf4 rf4r --refine
+[ "$(rcol "$OUT/rf4r.panphorte.refine.tsv" refine_status)" = "kept_original:not_simpler" ] \
+  && cmp -s "$OUT/rf4n.normalized.sorted.gfa" "$OUT/rf4r.normalized.sorted.gfa" \
+  && ok "a rebuild that is not simpler is not kept, and the graph is unchanged" \
+  || bad "status '$(rcol "$OUT/rf4r.panphorte.refine.tsv" refine_status)' or the graph changed for a site already minimal"
+
+# Sites are aligned in reference orientation and the reference must cross each one.
+"$BIN" panphorte -i "$OUT/rf1b.sorted.gfa" -c "$OUT/rf1b.bubbles.csv" -o "$OUT/rf5" --refine -q \
+       >/dev/null 2>&1
+rf5_rc=$?
+[ "$rf5_rc" -ne 0 ] && [ -z "$(ls "$OUT" | grep '^rf5\.')" ] \
+  && ok "--refine without --reference-path is refused before anything is written" \
+  || bad "--refine without --reference-path exited $rf5_rc or wrote: $(ls "$OUT" | grep '^rf5\.' | tr '\n' ' ')"
+
 # ---------------------------------------------------------------- family commit is a transaction
 # Panphorte writes a six-file family (normalized GFA, report, provenance, copies, bubbles, Bandage).
 # The shared StagedOutputs commit is what makes that atomic; the only injected-rollback fixture ran

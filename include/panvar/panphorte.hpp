@@ -42,6 +42,15 @@ struct PanphorteOptions {
     // afterwards it could fail with the normalized family already on disk.
     std::string gtf_path;
     bool quiet = false;
+    // --refine: after folding, realign the flanks around the folded array at every folded site (one
+    // alignment before the array, one after, over the haplotypes that walk the REP node), keeping the
+    // result only where it is simpler. The array itself and haplotypes without a REP are untouched.
+    // Off: output unchanged. Needs --reference-path. Limits as refine's --max-poa-bp / --max-walks /
+    // --max-poa-work, applied per flank alignment.
+    bool refine = false;
+    std::size_t refine_max_poa_bp = 5000;
+    std::size_t refine_max_walks = 500;
+    std::size_t refine_max_poa_work = 0;
 };
 
 struct PanphorteSummary {
@@ -65,6 +74,12 @@ struct PanphorteSummary {
     bool sorted = false;
     std::size_t resnarled_bubbles = 0;
     bool genes_written = false;
+    // --refine: folded sites rebuilt, kept as folded because the rebuild was not simpler, and skipped.
+    std::size_t refine_refined = 0;
+    std::size_t refine_kept = 0;
+    std::size_t refine_skipped = 0;
+    std::size_t refine_nodes_added = 0;
+    std::size_t refine_nodes_removed = 0;
 };
 
 void panphorte_normalize(const PanphorteOptions& options, PanphorteSummary* summary_out = nullptr);

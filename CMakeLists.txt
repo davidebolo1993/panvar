@@ -134,6 +134,7 @@ add_library(panvarlib
     src/variant_call.cpp
     src/describe.cpp
     src/panphorte.cpp
+    src/panphorte_refine.cpp
     src/poa.cpp
     src/refine.cpp
     src/rebuild.cpp

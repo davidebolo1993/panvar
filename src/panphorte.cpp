@@ -1,4 +1,5 @@
 #include "panvar/panphorte.hpp"
+#include "panvar/panphorte_refine.hpp"
 
 #include "panvar/align.hpp"
 #include "panvar/bubble_path.hpp"
@@ -720,6 +721,10 @@ void panphorte_normalize(const PanphorteOptions& options, PanphorteSummary* summ
     // copies / GFA writers below don't fail when the prefix points at a missing dir.
     cli::ensure_parent_dir_for_file(options.out_prefix);
 
+    if (options.refine && options.reference_path.empty())
+        throw std::runtime_error("panphorte: --refine needs --reference-path (sites are aligned in reference "
+                                 "orientation and the reference must cross each one)");
+
     ParseGfaOptions parse_opts;
     parse_opts.include_paths = true;
     parse_opts.include_sequences = true;
@@ -747,6 +752,7 @@ void panphorte_normalize(const PanphorteOptions& options, PanphorteSummary* summ
             options.out_prefix + ".bandage_nodes.csv",
             options.out_prefix + ".bandage_genes.csv",
             options.out_prefix + ".panphorte.rep_provenance.tsv",
+            options.out_prefix + ".panphorte.refine.tsv",
         };
         // The GTF is an input like any other. Checked only against the gene CSV, it could name the
         // report or the provenance table and be overwritten by the commit, after it had been read.
@@ -894,6 +900,14 @@ void panphorte_normalize(const PanphorteOptions& options, PanphorteSummary* summ
     // graph. The bubble id is carried so a link that cannot be resolved can name where it came from.
     std::unordered_map<std::string, std::size_t> obsolete_edge_keys;
     std::vector<std::vector<PathArray>> per_path_arrays(graph.paths.size());
+    // Every bubble the loop visited, in order, and whether it was folded: the candidate sites of --refine.
+    struct SeenSite {
+        std::size_t bubble_id;
+        std::string source;
+        std::string sink;
+        bool folded;
+    };
+    std::vector<SeenSite> seen_sites;
 
     // Every consecutive pair the ORIGINAL path walks across [lo, hi), plus the arcs into and out of the
     // span: those are the ones the replacement is meant to supersede.
@@ -1325,6 +1339,7 @@ void panphorte_normalize(const PanphorteOptions& options, PanphorteSummary* summ
 
             const bool norm_ok = paths_norm > 0;
             if (norm_ok) ++summary.bubbles_normalized;
+            seen_sites.push_back({bubble.id, bubble.source, bubble.sink, norm_ok});
             report << bubble.id << '\t' << (norm_ok ? "yes" : "no") << '\t'
                    << unit_bp_report << '\t' << paths_norm << '\t'
                    << min_copies_seen << '\t' << max_copies_seen << '\t'
@@ -1468,6 +1483,7 @@ void panphorte_normalize(const PanphorteOptions& options, PanphorteSummary* summ
                              : carriers_by_motif.empty() ? "no_tandem_detected"
                              : confirmed_motifs.empty() ? "below_prevalence"
                                                         : "no_copies_rewritten";
+        seen_sites.push_back({bubble.id, bubble.source, bubble.sink, normalized});
         report << bubble.id << '\t' << (normalized ? "yes" : "no") << '\t'
                << unit_bp_report << '\t' << paths_norm << '\t'
                << min_copies_seen << '\t' << max_copies_seen << '\t'
@@ -1692,6 +1708,71 @@ void panphorte_normalize(const PanphorteOptions& options, PanphorteSummary* summ
                 "link of the replaced span is also used somewhere else, and separating the two would "
                 "need the reused context cloned before the rewrite, which is not implemented");
         }
+    }
+
+    // --refine: realign the residue around each folded site (see panphorte_refine.hpp). Runs on the
+    // graph exactly as folded and checked above, before the sort and the re-snarl.
+    if (options.refine) {
+        const std::string resolved = resolve_reference_path_name(graph, options.reference_path, "panphorte");
+        std::unordered_map<std::size_t, std::unordered_set<std::string>> spliced;
+        for (const auto& arrays : per_path_arrays)
+            for (const PathArray& a : arrays)
+                for (const PathStep& st : a.replacement) spliced[a.bubble_id].insert(st.node_id);
+        std::unordered_map<std::size_t, const Bubble*> by_id;
+        for (const Bubble& b : bubbles) by_id[b.id] = &b;
+        std::vector<PanphorteRefineSite> sites;
+        for (const SeenSite& s : seen_sites) {
+            if (!s.folded) continue;
+            PanphorteRefineSite site;
+            site.bubble_id = s.bubble_id;
+            site.source = s.source;
+            site.sink = s.sink;
+            for (const std::string& n : by_id.at(s.bubble_id)->inside)
+                if (model.has_node(n)) site.interior.insert(n);
+            for (const std::string& n : spliced[s.bubble_id])
+                if (model.has_node(n)) site.interior.insert(n);
+            site.interior.erase(s.source);
+            site.interior.erase(s.sink);
+            sites.push_back(std::move(site));
+        }
+        PanphorteRefineLimits lim;
+        lim.max_poa_bp = options.refine_max_poa_bp;
+        lim.max_walks = options.refine_max_walks;
+        lim.max_poa_work = options.refine_max_poa_work;
+        const PanphorteRefineResult rr = panphorte_refine_sites(model, sites, resolved, lim);
+        summary.refine_refined = rr.refined;
+        summary.refine_kept = rr.kept;
+        summary.refine_skipped = rr.skipped;
+        summary.refine_nodes_added = rr.nodes_added;
+        summary.refine_nodes_removed = rr.nodes_removed;
+        summary.edges_added += rr.edges_added;
+        summary.edges_removed += rr.edges_removed;
+
+        std::ofstream rt(staged.stage(options.out_prefix + ".panphorte.refine.tsv"));
+        if (!rt) throw std::runtime_error("panphorte: cannot write the refine table");
+        // Ids are the FOLDED graph's (input numbering), as in the copies table: the sort renumbers nodes.
+        rt << "input_bubble_id\tinput_source\tinput_sink\trefine_status\tdetail\tpaths\tcarriers\t"
+              "distinct_flanks_before\tdistinct_flanks_after\tnodes_before\tnodes_after\tsteps_before\t"
+              "steps_after\tsingle_path_nodes_before\tsingle_path_nodes_after\n";
+        std::unordered_map<std::size_t, const PanphorteRefineRow*> row_of;
+        for (const PanphorteRefineRow& r : rr.rows) row_of[r.bubble_id] = &r;
+        for (const SeenSite& s : seen_sites) {
+            rt << s.bubble_id << '\t' << s.source << '\t' << s.sink << '\t';
+            const auto it = row_of.find(s.bubble_id);
+            if (it == row_of.end()) {
+                rt << "not_folded\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-\n";
+                continue;
+            }
+            const PanphorteRefineRow& r = *it->second;
+            const auto num = [&](std::size_t v) { return r.measured ? std::to_string(v) : std::string("-"); };
+            rt << r.status << '\t' << (r.detail.empty() ? "-" : r.detail) << '\t' << r.paths << '\t'
+               << r.carriers << '\t' << r.distinct_pre << '\t' << r.distinct_post << '\t'
+               << num(r.nodes_before) << '\t' << num(r.nodes_after) << '\t' << num(r.steps_before) << '\t'
+               << num(r.steps_after) << '\t' << num(r.single_path_nodes_before) << '\t'
+               << num(r.single_path_nodes_after) << '\n';
+        }
+        rt.close();
+        if (!rt) throw std::runtime_error("panphorte: failed to write the refine table");
     }
 
     // old REP id -> the id it is delivered under. Empty means the ids did not move.

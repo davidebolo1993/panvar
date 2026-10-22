@@ -39,6 +39,10 @@ The CSV must describe the graph handed in, and the sites it selects must be pair
 | `--allow-partial-boundary` | override the safety refusal if a copy cannot be bounded by a step range; normally unnecessary because fragment nodes preserve partial-node flanks | off |
 | `--no-flip` | with `--reference-path`, skip reorienting to the reference strand | off |
 | `--threads <N>` | workers for approximate detection (`0` = auto) | `0` |
+| `--refine` | after folding, realign the flanks around each folded array (see below); needs `--reference-path` | off |
+| `--refine-max-poa-bp <N>` | longest flank `--refine` aligns | `5000` |
+| `--refine-max-walks <N>` | most distinct flanks per side `--refine` aligns | `500` |
+| `--refine-max-poa-work <N>` | longest × total flank bp per site (`0` = no limit) | `0` |
 | `--gtf <path>` | after re-sorting, project genes onto reference nodes; separate from `bubble --gtf` because collapsing renumbers nodes | — |
 | `-q, --quiet` | disable progress logs | off |
 
@@ -53,6 +57,7 @@ The CSV must describe the graph handed in, and the sites it selects must be pair
 | `<prefix>.panphorte.copies.tsv` | one row per haplotype and array, in approximate mode |
 | `<prefix>.panphorte.rep_provenance.tsv` | one row per repeat-unit node created |
 | `<prefix>.bandage_nodes.csv` | Bandage node colors |
+| `<prefix>.panphorte.refine.tsv` | one row per input site, with `--refine` |
 
 `panphorte.report.tsv` columns:
 
@@ -74,6 +79,28 @@ The CSV must describe the graph handed in, and the sites it selects must be pair
 
 `panphorte.copies.tsv` gives, per haplotype and array, its `copies`, `unit_bp`, `mean_identity`, the `orientations` of its copies, the `region_bp` they span and the input site they came from. `panphorte.rep_provenance.tsv` maps each created repeat-unit node to the site and `canonical_motif` it stands for, and gives the `copy_quantum` each traversal represents.
 
+`panphorte.refine.tsv` columns (node ids are the folded graph's, before the sort renumbers them):
+
+| column | meaning |
+|--------|---------|
+| `input_bubble_id`, `input_source`, `input_sink` | the site, as in the input CSV |
+| `refine_status` | `refined`; `kept_original:not_simpler`; `not_folded`; or `skipped:<reason>` with `unfolded_dup`, `partial_paths`, `ambiguous_anchor_traversal`, `reference_not_traversing`, `not_a_clean_chain`, `no_carrier`, `segment_too_long`, `poa_work`, `too_diverse` or `poa_not_lossless` |
+| `detail` | the node, path or sizes behind a skip |
+| `paths`, `carriers` | haplotypes crossing the site, and those walking its repeat-unit node |
+| `distinct_flanks_before`, `distinct_flanks_after` | distinct flank sequences aligned on each side |
+| `nodes_*`, `steps_*`, `single_path_nodes_*` | before and after: nodes, steps (summed over haplotypes) and nodes used by one haplotype only, outside the array blocks |
+
+### `--refine`
+
+Folding leaves the bases around an array as the input graph spelled them, so one flank can be walked through different node chains by different haplotypes. `--refine` rebuilds them per folded site:
+
+- each carrier's **array block** (its first to last repeat-unit step, with whatever lies between copies) is kept verbatim, so copy counts never change;
+- the flanks before the block are aligned together (abPOA), and so are the flanks after it; they are never aligned across the block;
+- haplotypes that walk no repeat-unit node at the site are left as folded;
+- the rebuild is kept only if it has no more nodes and no more steps than before, and fewer of one; otherwise the site stays as folded (`kept_original:not_simpler`).
+
+A site is skipped, untouched, when a flank walks a node twice (an unfolded duplication that realigning would flatten), when a path touches it without crossing it once from anchor to anchor, or when a path's traversal is ambiguous. Before anything is written, every haplotype must spell what it spelled after folding, walk the same repeat-unit nodes the same number of times, step only across existing links, and no rewritten haplotype's folded route may remain walkable; identical carriers must walk identical routes. Without `--refine` the output is unchanged.
+
 ## Limitations
 
 - Below `--min-similarity 1.0` the collapse is lossy: divergent copies are folded onto one consensus unit, so a haplotype no longer spells its own sequence at that site.
@@ -81,6 +108,7 @@ The CSV must describe the graph handed in, and the sites it selects must be pair
 - Exact folding seeds from runs of repeated node steps, so two byte-identical copies split at different node boundaries can be missed even though folding them would be lossless.
 - Approximate detection looks for copies sharing an exact short seed, so a copy above `--min-similarity` whose substitutions are spread evenly can go undetected.
 - Where one site carries two phase-rotated units, each becomes its own repeat-unit node. A consumer counting those nodes sees two independent duplications rather than one site's copy number unless it groups them on `canonical_motif` using the provenance table.
+- `--refine` does not realign haplotypes that carry no folded copy. Where those haplotypes still carry the array as literal sequence (copies too divergent to fold), aligning them with the carriers' flanks fragments the site instead of simplifying it, so they keep their folded representation.
 - `--allow-partial-boundary` is a safeguard override for an unobserved edge case, not a normal operating mode; using it can create a mixed folded/literal representation that downstream CN cannot interpret safely.
 
 ## Example

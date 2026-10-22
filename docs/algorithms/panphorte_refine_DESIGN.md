@@ -1,8 +1,9 @@
-# Design: `panphorte --refine`, realigning the residue around folded arrays (proposal; not implemented)
+# Design: `panphorte --refine`, realigning the residue around folded arrays
 
 **Branch:** `panphorte-refine-design`, from `main` `e91b73c`.
 
-**Status:** design for review. No code is changed.
+**Status:** implemented with the changes in §6, which take precedence over §2–§5 where they differ. The user
+documentation is `docs/modules/panphorte.md` and `docs/algorithms/panphorte.md` §5.
 
 ## 1. Problem
 
@@ -174,3 +175,52 @@ within the existing limits.
 - **The genotype candidate** (M15-I) never touches `src/panphorte.cpp`, `src/refine.cpp` or `tests/panphorte_stats.sh`,
   so the planned merge stays independent.
 - **The shared module:** a new file. The genotype code does not use refine.
+
+## 6. As implemented (2026-10-22)
+
+### 6.1 Changes from the proposal
+
+| proposal | implemented | why |
+|---|---|---|
+| one joint alignment of every crossing haplotype, non-carriers included, with forced node boundaries at each REP cut (§2.2) | **per side**: one alignment of the carriers' flanks before the array, one of those after it; non-carriers are left as folded | measured at chr3 bubble 5 (§6.2): the joint alignment was rejected by the simpler rule (12,090 → 50,452 steps) |
+| REP runs as cut points, one residual segment per gap between runs | the **array block**: a carrier's first to last REP step, verbatim, fragments between copies included | at lower `--min-similarity`, folded arrays carry interned fragments between copies (`REP GT REP GT REP`), which the per-run duplication guard read as an unfolded duplication |
+| the duplication guard over the whole interior | over the **flanks** only | the same reason; nothing inside the block is realigned, so nothing in it can be linearized |
+| a shared module extracted from `refine` | a separate file, `src/panphorte_refine.cpp`, with its own copies of the interior, compaction and splice helpers | the standalone `refine` is untouched, so it is byte-identical by construction |
+| new columns in `panphorte.report.tsv` | a separate `<prefix>.panphorte.refine.tsv` | the report is written inside the folding loop; a separate file keeps the output without `--refine` byte-identical |
+| — | `--refine` needs `--reference-path` | sites are aligned in reference orientation and the reference must cross each one |
+| — | the old route check is per rewritten carrier; links walked only by old routes are dropped | non-carriers keep old flank nodes, so the old route could otherwise stay walkable through them |
+
+### 6.2 Evidence (chr3:46654531–46940288, the colleague's pipeline, `--min-similarity 0.97`)
+
+**Why non-carriers are left as folded.** The 114 haplotypes without a folded copy still carry their array as literal sequence:
+- 6–10 copies at 87.5–96.4% identity to the folded unit, so none folds at 0.97;
+- their interiors are 470–824 bp, against 218–296 bp of carrier flanks.
+
+POA of tandem repeats of varying length gives no consistent alignment, as the measurements before → after realignment show:
+
+| what is realigned | nodes | steps |
+|---|---|---|
+| non-carriers alone | 115 → 126 | 6,863 → 8,715 |
+| carriers, flanks glued into one sequence | 52 → 39 | 5,227 → 6,948 |
+| carriers, per side | 52 → 30 | 5,227 → 4,275 |
+| everyone jointly (§2.2) | 155 → 572 | 12,090 → 50,452 |
+
+**Result at bubble 5:**
+- `refined`: 153 → 140 nodes and 12,054 → 11,115 steps outside the blocks;
+- 1 bp nodes in the site: 69 → 53;
+- the 30 bp half copy in HG00126#1, HG00128#2 and HG00140#1 is now one shared 5-node chain, where it was three different chains;
+- spelled sequence and REP copies identical on 466 of 466 paths;
+- 45 distinct walks for 45 distinct sequences;
+- the run is deterministic, and the standalone `refine` downstream makes the same decisions as before.
+
+**Lower thresholds do not help.**
+- At 0.95 folding is refused (a rewritten route would still be walkable).
+- At 0.93 / 0.90 / 0.87, 462 of 466 haplotypes fold, but 3 / 3 / 7 distinct haplotype sequences are erased. The newly folded arrays start at a different offset (left flank 63 vs 78 bp) and keep 0–3 divergent copies in their right flank (114–295 bp). `--refine` then rejects the site as not simpler.
+- The copies are a mix of variants: 52–58 bp, differing by AT-run indels; five units cover 89% at 0.97. Folding them would need several REP nodes per site, which is not designed here.
+
+**Other loci.** Without `--refine`, the output is byte-identical to `main` (`e91b73c`) at chr3 and at chr17, ACOT, ANKRD36C, C4, CYP2D6, GSTM1 and LPA (similarity 1.0 and 0.97). With `--refine`:
+- nothing folds at chr17, ACOT, C4, CYP2D6 or GSTM1;
+- ANKRD36C bubble 6 and LPA bubble 7 (0.97) are skipped as `unfolded_dup`;
+- MYOM2 was not run (its graph is to be rebuilt).
+
+All locus results above were re-measured with the final code.

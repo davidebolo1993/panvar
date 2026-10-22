@@ -50,6 +50,17 @@ void print_panphorte_help() {
         << "      --gtf <path>                 Reference-coordinate GTF; after re-sorting, project genes\n"
         << "                                   onto the normalized graph's nodes and write\n"
         << "                                   <prefix>.bandage_genes.csv (needs a PanSN --reference-path)\n"
+        << "      --refine                     After folding, realign the flanks around each folded\n"
+        << "                                   array: one alignment for the flanks before it and one for\n"
+        << "                                   those after, over the haplotypes that walk the REP node.\n"
+        << "                                   The array and haplotypes without copies are untouched;\n"
+        << "                                   kept only where it gives fewer nodes and steps. Sites with\n"
+        << "                                   a node walked twice in a flank, partial paths or an\n"
+        << "                                   ambiguous traversal are left as folded. Needs\n"
+        << "                                   --reference-path; writes <prefix>.panphorte.refine.tsv\n"
+        << "      --refine-max-poa-bp <N>      Longest flank aligned (default: 5000)\n"
+        << "      --refine-max-walks <N>       Most distinct flanks per side (default: 500)\n"
+        << "      --refine-max-poa-work <N>    Longest x total flank bp per site (0 = none; default: 0)\n"
         << "  -q, --quiet                      Disable progress logs\n"
         << "  -h, --help                       Show this help\n";
 }
@@ -147,6 +158,22 @@ int run_panphorte_command(const std::vector<std::string>& args) {
             gtf_path = require_value(arg);
             continue;
         }
+        if (arg == "--refine") {
+            options.refine = true;
+            continue;
+        }
+        if (arg == "--refine-max-poa-bp") {
+            options.refine_max_poa_bp = cli::parse_size_arg(arg, require_value(arg));
+            continue;
+        }
+        if (arg == "--refine-max-walks") {
+            options.refine_max_walks = cli::parse_size_arg(arg, require_value(arg));
+            continue;
+        }
+        if (arg == "--refine-max-poa-work") {
+            options.refine_max_poa_work = cli::parse_size_arg(arg, require_value(arg));
+            continue;
+        }
         if (arg == "-q" || arg == "--quiet") {
             options.quiet = true;
             continue;
@@ -172,6 +199,9 @@ int run_panphorte_command(const std::vector<std::string>& args) {
     }
     if (options.bubbles_csv_in.empty()) {
         throw std::runtime_error("panphorte requires --bubble-prefix-in <prefix> or --bubbles-csv <path>");
+    }
+    if (options.refine && options.reference_path.empty()) {
+        throw std::runtime_error("--refine needs -r/--reference-path");
     }
     if (options.min_copies < 2) {
         throw std::runtime_error("--min-copies must be >= 2");
@@ -205,6 +235,14 @@ int run_panphorte_command(const std::vector<std::string>& args) {
              std::to_string(summary.edges_added) + " −" + std::to_string(summary.edges_removed) +
              " edges)");
 
+    if (options.refine) {
+        log.info("refine: " + std::to_string(summary.refine_refined) + " folded site(s) realigned, " +
+                 std::to_string(summary.refine_kept) + " kept as folded (not simpler), " +
+                 std::to_string(summary.refine_skipped) + " skipped (+" +
+                 std::to_string(summary.refine_nodes_added) + " −" +
+                 std::to_string(summary.refine_nodes_removed) + " nodes)");
+    }
+
     std::vector<std::string> outputs;
     if (summary.sorted) {
         log.info("sorted along the reference; re-snarled " +
@@ -224,6 +262,9 @@ int run_panphorte_command(const std::vector<std::string>& args) {
     outputs.push_back(options.out_prefix + ".panphorte.rep_provenance.tsv");
     if (options.min_similarity < 1.0) {
         outputs.push_back(options.out_prefix + ".panphorte.copies.tsv");
+    }
+    if (options.refine) {
+        outputs.push_back(options.out_prefix + ".panphorte.refine.tsv");
     }
 
     log.wrote(outputs);

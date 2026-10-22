@@ -30,7 +30,25 @@ Copy boundaries are base coordinates and rarely land on a node edge. Rounding to
 
 At `--min-similarity 1.0` only byte-identical copies fold, and the graph still spells every haplotype exactly. Below that, copies are found by alignment and folded onto one representative, which discards the differences between them.
 
-### 5. Re-snarl and emit
+### 5. Optionally, realign the flanks (`--refine`)
+
+After folding, the flanks around an array keep the input graph's nodes, so the same flank bases can be spelled by different node chains in different haplotypes. With `--refine`, each folded site is rebuilt around its arrays:
+
+1. Each crossing haplotype's interior is split at its array block, from its first to its last repeat-unit step. The block is kept verbatim, including any fragments between copies; only the flank before it and the flank after it are rebuilt. Haplotypes that walk no repeat-unit node keep their walk.
+2. The distinct flanks on each side are aligned with abPOA, separately for the two sides. A run of alignment columns traversed by exactly the same flanks becomes one node, as in `refine`.
+3. Each carrier's walk becomes its rebuilt flank before, its block, and its rebuilt flank after.
+4. The rebuild is kept only if it is simpler. Simpler means no more nodes and no more steps than the folded site, outside the blocks, and fewer of at least one.
+
+Sites are left as folded when a flank walks a node twice. That is an unfolded copy, and realigning would linearize it. They are also left as folded when a path touches the site without one anchor-to-anchor traversal, or when a traversal is ambiguous. The acceptance checks run before anything is written:
+- every haplotype spells what it spelled after folding;
+- its repeat-unit steps are unchanged in node, orientation and number;
+- every step pair has a link;
+- carriers with identical flanks and blocks walk identical routes;
+- no folded route that was rewritten is still walkable.
+
+Flanks are aligned per side, never across the block. Removing the array and joining the two flanks creates a sequence no haplotype carries, and its repeat-like edges align ambiguously. Haplotypes without a folded copy are not aligned with the carriers. Where they still carry the array as literal sequence, a tandem repeat of varying length has no unique alignment, and aligning it fragments the flanks instead of simplifying them.
+
+### 6. Re-snarl and emit
 
 With `--reference-path`, the normalized graph is sorted along the reference and decomposed again, so the output is ready for `call` without an external tool. That re-snarl applies its own `--resnarl-min-variant-bp`, a separate decision from the one that produced the input sites. Bubble ids are reassigned by it.
 
