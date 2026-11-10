@@ -230,6 +230,21 @@ install(TARGETS panvar RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 if(PANVAR_BUILD_TESTING)
     include(CTest)
     if(BUILD_TESTING)
+        # Unit tests of the shared k-mer primitives: brute force on random sequences, and the existing
+        # collector on the real loci's spelled paths.
+        add_executable(panvar_kmer_test tests/unit/kmer_test.cpp)
+        target_link_libraries(panvar_kmer_test PRIVATE panvarlib minimap2 Threads::Threads ZLIB::ZLIB)
+        target_compile_options(panvar_kmer_test PRIVATE -Wall -Wextra -Wpedantic)
+        add_test(
+            NAME panvar_unit_kmer
+            COMMAND panvar_kmer_test
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/real_data/paralogs/c4.gfa.gz
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/real_data/paralogs/gstm.gfa.gz
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/real_data/paralogs/cyp2d.gfa.gz
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/real_data/paralogs/acot.gfa.gz
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/real_data/tandem_repeat/lpa.gfa.gz
+        )
+        set_tests_properties(panvar_unit_kmer PROPERTIES TIMEOUT 300)
         # Fast, dependency-free smoke on a tiny hand-built graph that exercises every
         # call event type + confounders with exact-record assertions (no vg needed).
         set(PANVAR_SYN_SMOKE ${CMAKE_CURRENT_SOURCE_DIR}/tests/suites/synthetic_smoke.sh)
