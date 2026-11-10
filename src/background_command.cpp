@@ -30,14 +30,20 @@ void print_background_help() {
         << "  panvar background -o <store.bgk> --genome NAME=FASTA [--genome ...] [options]   build\n"
         << "  panvar background -o <store.bgk> --add --genome NAME=FASTA [...]                add a segment\n"
         << "  panvar background -o <store.bgk> --merge                                        merge segments\n"
-        << "  panvar background -o <store.bgk> --dump <out.tsv>                               every k-mer\n\n"
+        << "  panvar background -o <store.bgk> --compact                                      to SSHash\n"
+        << "  panvar background -o <store.bgk> --dump <out.tsv>                               every k-mer\n"
+        << "  panvar background -o <store.bgk> --verify <background>                          compare counts\n\n"
         << "Options:\n"
         << "  -o, --out <dir>         The store (a folder of segments)\n"
         << "      --genome NAME=PATH  A genome, FASTA plain or gzip/bgzip; repeatable\n"
         << "      --genomes <tsv>     Genomes as name and path per line\n"
         << "      --add               Add the genomes to an existing store as a new segment\n"
         << "      --merge             Merge the store's segments into one\n"
+        << "      --compact           Write a merged store as an SSHash dictionary, <store>.sshash\n"
+        << "      --minimizer <N>     SSHash minimizer length for --compact (default: from the k-mer count)\n"
         << "      --dump <path>       Write every k-mer and its count (segments summed) as TSV\n"
+        << "      --verify <path>     Check that a background (store or .sshash) gives every k-mer of this\n"
+        << "                          store the same count, and 0 to random absent ones\n"
         << "      --partitions <N>    Partitions of a new store, a power of two (default 4096)\n"
         << "      --memory <size>     Memory for counting, across threads, e.g. 2G, 512M (default 2G)\n"
         << "      --tmp-dir <dir>     Where the temporary spill files go (default: inside the store)\n"
@@ -145,7 +151,9 @@ int run_background_command(const std::vector<std::string>& args) {
     std::string out, dump, tmp_dir;
     std::vector<bg::Genome> genomes;
     std::size_t threads = 0, memory = std::size_t{2} << 30, partitions = 4096;
-    bool quiet = false, add = false, merge = false, partitions_given = false;
+    bool quiet = false, add = false, merge = false, compact = false, partitions_given = false;
+    std::string verify;
+    std::size_t minimizer = 0;
     for (std::size_t i = 0; i < args.size(); ++i) {
         const std::string& a = args[i];
         auto value = [&]() -> const std::string& {
@@ -174,6 +182,9 @@ int run_background_command(const std::vector<std::string>& args) {
             }
         } else if (a == "--add") add = true;
         else if (a == "--merge") merge = true;
+        else if (a == "--compact") compact = true;
+        else if (a == "--minimizer") minimizer = cli::parse_size_arg(a, value());
+        else if (a == "--verify") verify = value();
         else if (a == "--dump") dump = value();
         else if (a == "--partitions") { partitions = cli::parse_size_arg(a, value()); partitions_given = true; }
         else if (a == "--memory") memory = parse_memory(value());
@@ -183,14 +194,15 @@ int run_background_command(const std::vector<std::string>& args) {
         else throw std::runtime_error("Unknown option: " + a);
     }
     if (out.empty()) throw std::runtime_error("background requires -o/--out <store.bgk>");
-    if (static_cast<int>(add) + static_cast<int>(merge) + static_cast<int>(!dump.empty()) > 1)
-        throw std::runtime_error("background: --add, --merge and --dump are separate runs");
+    if (static_cast<int>(add) + static_cast<int>(merge) + static_cast<int>(compact) + static_cast<int>(!dump.empty()) +
+        static_cast<int>(!verify.empty()) > 1)
+        throw std::runtime_error("background: --add, --merge, --compact, --dump and --verify are separate runs");
     if (threads == 0) threads = std::max(1u, std::thread::hardware_concurrency());
     const bool exists = fs::exists(fs::path(out) / "manifest.json");
     cli::RunLog log("background", quiet);
 
-    if (!dump.empty() || merge) {
-        if (!genomes.empty()) throw std::runtime_error("background: --dump and --merge take no --genome");
+    if (!dump.empty() || merge || compact || !verify.empty()) {
+        if (!genomes.empty()) throw std::runtime_error("background: --merge, --compact, --dump and --verify take no --genome");
         if (!exists) throw std::runtime_error(out + " is not a background store (no manifest.json)");
     }
     if (!dump.empty()) {
@@ -208,6 +220,62 @@ int run_background_command(const std::vector<std::string>& args) {
         log.wrote({dump});
         log.done();
         return 0;
+    }
+
+    if (compact) {
+        bg::CompactOptions co;
+        co.store_dir = out;
+        std::string base = out;
+        while (base.size() > 1 && base.back() == '/') base.pop_back();
+        co.out_path = base + ".sshash";
+        co.tmp_dir = tmp_dir.empty() ? (fs::path(out) / "compact.tmp").string() : tmp_dir;
+        co.threads = threads;
+        co.minimizer = minimizer;
+        co.ram_gb = std::max<std::size_t>(1, memory >> 30);
+        co.log = [&](const std::string& m) { log.info(m); };
+        bg::CompactStats st;
+        try {
+            st = bg::compact_store(co);
+        } catch (...) {
+            std::error_code ec;
+            if (tmp_dir.empty()) fs::remove_all(co.tmp_dir, ec);
+            throw;
+        }
+        std::error_code ec;
+        if (tmp_dir.empty()) fs::remove_all(co.tmp_dir, ec);
+        fs::copy_file(fs::path(out) / "manifest.json", co.out_path + ".manifest.json", fs::copy_options::overwrite_existing);
+        log.info("compacted: " + std::to_string(st.kmers) + " k-mers in " + std::to_string(st.strings) + " strings, " +
+                 human_bytes(st.bytes) + " (" + std::to_string(static_cast<double>(st.bytes) * 8 / static_cast<double>(std::max<std::uint64_t>(1, st.kmers))).substr(0, 5) +
+                 " bits per k-mer)");
+        log.wrote({co.out_path, co.out_path + ".manifest.json"});
+        log.done();
+        return 0;
+    }
+
+    if (!verify.empty()) {
+        const bg::Store store(out);
+        const auto other = bg::Background::open(verify);
+        log.info("verifying " + verify + " (" + other->kind() + ") against " + out);
+        std::uint64_t checked = 0, wrong = 0;
+        for (std::uint32_t p = 0; p < store.partitions(); ++p)
+            store.for_each(p, [&](std::uint64_t code, std::uint64_t count) {
+                ++checked;
+                if (other->count(code) != count && wrong++ < 5)
+                    log.info("differs: " + kmer::decode(code, bg::kK) + " " + std::to_string(count) + " vs " +
+                             std::to_string(other->count(code)));
+            });
+        std::uint64_t x = 0x243f6a8885a308d3ULL, absent = 0, absent_wrong = 0;
+        for (int t = 0; t < 1000000; ++t) {
+            x = kmer::mix64(x + static_cast<std::uint64_t>(t));
+            const std::uint64_t c = kmer::canonical(x & kmer::mask_of(bg::kK), bg::kK);
+            if (store.count(c) != 0) continue;
+            ++absent;
+            if (other->count(c) != 0) ++absent_wrong;
+        }
+        log.info("checked " + std::to_string(checked) + " k-mers: " + std::to_string(wrong) + " differ; " +
+                 std::to_string(absent) + " random absent k-mers: " + std::to_string(absent_wrong) + " found");
+        log.done();
+        return wrong == 0 && absent_wrong == 0 ? 0 : 1;
     }
 
     if (merge) {

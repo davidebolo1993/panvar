@@ -128,6 +128,9 @@ public:
     std::uint64_t count(std::uint64_t canonical_kmer) const;
     // Every (k-mer, count) of one partition, in code order.
     void for_each(std::uint32_t partition, const std::function<void(std::uint64_t, std::uint64_t)>& f) const;
+    // Distinct k-mers in a partition; a k-mer's index within its partition (-1 when absent) and its count.
+    std::uint64_t partition_size(std::uint32_t partition) const;
+    std::int64_t find(std::uint64_t canonical_kmer, std::uint32_t partition, std::uint64_t* count) const;
 
 private:
     struct Part {
@@ -166,5 +169,38 @@ private:
 
 // The segment folders of a store (seg-<n>), in order.
 std::vector<std::string> segment_dirs_of(const std::string& store_dir);
+
+struct CompactOptions {
+    std::string store_dir;            // a store of one segment (merge first)
+    std::string out_path;             // the SSHash dictionary, <store>.sshash by convention
+    std::string tmp_dir;              // the string set and SSHash's temporary files
+    std::size_t threads = 2;
+    std::size_t minimizer = 0;        // SSHash's minimizer length; 0 picks one from the k-mer count
+    std::size_t ram_gb = 4;           // SSHash's construction memory limit
+    std::function<void(const std::string&)> log;
+};
+
+struct CompactStats {
+    std::uint64_t kmers = 0;          // distinct k-mers written
+    std::uint64_t strings = 0;        // simplitigs
+    std::uint64_t string_bases = 0;   // their total length
+    std::uint64_t bytes = 0;          // the dictionary's size
+    std::size_t minimizer = 0;
+};
+
+// Rewrites a merged store as a string set (each k-mer once, with its count) and builds an SSHash weighted
+// dictionary from it.
+CompactStats compact_store(const CompactOptions& options);
+
+// Counts of canonical 31-mers from either form of a background: a store folder or a compacted dictionary.
+class Background {
+public:
+    virtual ~Background() = default;
+    virtual std::uint64_t count(std::uint64_t canonical_kmer) const = 0;
+    virtual std::uint64_t distinct() const = 0;
+    virtual std::string kind() const = 0;
+    // A store folder, or a .sshash file written by compact_store.
+    static std::unique_ptr<Background> open(const std::string& path);
+};
 
 } // namespace panvar::bg

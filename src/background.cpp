@@ -461,6 +461,15 @@ std::uint64_t Segment::count_at(const Part& pt, std::uint64_t index) const {
     throw std::runtime_error("background: a count marked as overflow is missing from the overflow list");
 }
 
+std::uint64_t Segment::partition_size(std::uint32_t partition) const { return part(partition).codes.size(); }
+
+std::int64_t Segment::find(std::uint64_t canonical_kmer, std::uint32_t partition, std::uint64_t* count) const {
+    const Part pt = part(partition);
+    const std::int64_t i = pt.codes.find(canonical_kmer);
+    if (i >= 0 && count != nullptr) *count = count_at(pt, static_cast<std::uint64_t>(i));
+    return i;
+}
+
 std::uint64_t Segment::count(std::uint64_t canonical_kmer) const {
     const Part pt = part(partition_of(canonical_kmer, partitions_));
     const std::int64_t i = pt.codes.find(canonical_kmer);

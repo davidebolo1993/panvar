@@ -55,6 +55,37 @@ add_library(edlib STATIC ${EDLIB_DIR}/src/edlib.cpp)
 target_include_directories(edlib PUBLIC $<BUILD_INTERFACE:${EDLIB_DIR}/include>)
 set_target_properties(edlib PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
+# SSHash (submodule + nested PTHash, MIT) -- the compressed k-mer dictionary `background --compact` writes.
+# Compiled here as a plain static library from its sources, with panvar's flags rather than its own (which add
+# -Werror, and -mavx2 -mbmi2 on x86-64): its x86 fast paths are guarded by __AVX2__, so the default build runs
+# on any x86-64; -DPANVAR_SSHASH_AVX2=ON turns them on for machines that have AVX2.
+set(SSHASH_DIR ${CMAKE_CURRENT_SOURCE_DIR}/external/sshash)
+if(NOT EXISTS ${SSHASH_DIR}/include/dictionary.hpp OR NOT EXISTS ${SSHASH_DIR}/external/pthash/include/pthash.hpp)
+    message(FATAL_ERROR
+        "Missing SSHash sources in external/sshash (or its nested PTHash). "
+        "Run: git submodule update --init --recursive")
+endif()
+option(PANVAR_SSHASH_AVX2 "Build SSHash with AVX2 and BMI2 (x86-64 machines that have them)" OFF)
+add_library(sshash STATIC
+    ${SSHASH_DIR}/external/gz/zip_stream.cpp
+    ${SSHASH_DIR}/external/cityhash/cityhash.cpp
+)   # its templated sources (src/*.cpp) are included by src/background_sshash.cpp, as SSHash's own tools do
+target_include_directories(sshash SYSTEM PUBLIC
+    ${SSHASH_DIR}/include
+    ${SSHASH_DIR}
+    ${SSHASH_DIR}/external/pthash/include
+    ${SSHASH_DIR}/external/pthash/external/bits/include
+    ${SSHASH_DIR}/external/pthash/external/fastmod
+    ${SSHASH_DIR}/external/pthash/external/bits/external/essentials/include
+    ${SSHASH_DIR}/external/pthash/external/xxHash
+    ${SSHASH_DIR}/external/pthash/external/mm_file/include
+)
+target_compile_options(sshash PRIVATE -O3 -w)
+if(PANVAR_SSHASH_AVX2 AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64)$")
+    target_compile_options(sshash PUBLIC -mavx2 -mbmi2)
+endif()
+target_link_libraries(sshash PUBLIC ZLIB::ZLIB Threads::Threads)
+
 # abPOA (submodule + nested SIMDe, MIT) -- partial-order alignment behind `refine`'s residual MSA.
 # Built as a static library via its own Makefile (like minimap2); its Makefile auto-detects arm64
 # (uname -m) and selects the apple-m1/SIMDe SIMD path.
@@ -162,6 +193,7 @@ add_library(panvarlib
     src/rebuild.cpp
     src/output.cpp
     src/background.cpp
+    src/background_sshash.cpp
 )
 
 target_include_directories(panvarlib
@@ -186,7 +218,7 @@ target_compile_options(panvarlib
 # PRIVATE: edlib is an implementation detail of align.cpp, not part of panvarlib's
 # public interface. For a static lib CMake still propagates the symbols to the final
 # executable link, while keeping edlib out of the installed export set.
-target_link_libraries(panvarlib PRIVATE edlib abpoa minigraph ZLIB::ZLIB)
+target_link_libraries(panvarlib PRIVATE edlib abpoa minigraph sshash ZLIB::ZLIB)
 
 add_executable(panvar
     src/main.cpp

@@ -159,6 +159,29 @@ int main(int argc, char** argv) {
         for (const auto& [c, n] : truth) merge_ok = merge_ok && merged.count(c) == n;
         check(sum_ok, "two segments of one genome: counts summed over them equal the whole genome's");
         check(merge_ok, "their merge is one segment with the same counts");
+
+        // Compacted to SSHash: the same counts through the shared interface, 0 for absent k-mers.
+        const std::filesystem::path one = dir / "one";
+        std::filesystem::remove_all(one);
+        std::filesystem::create_directories(one);
+        std::filesystem::rename(mo.out_segment_dir, one / "seg-0");
+        bg::CompactOptions co;
+        co.store_dir = one.string();
+        co.out_path = (dir / "one.sshash").string();
+        co.tmp_dir = (dir / "compact.tmp").string();
+        co.threads = 2;
+        const bg::CompactStats cs = bg::compact_store(co);
+        const auto compacted = bg::Background::open(co.out_path);
+        const auto as_store = bg::Background::open(one.string());
+        bool compact_ok = cs.kmers == truth.size() && compacted->distinct() == truth.size();
+        for (const auto& [c, n] : truth) compact_ok = compact_ok && compacted->count(c) == n && as_store->count(c) == n;
+        bool compact_absent = true;
+        for (int t = 0; t < 20000; ++t) {
+            const std::uint64_t c = kmer::canonical(rng() & kmer::mask_of(bg::kK), bg::kK);
+            if (!truth.count(c)) compact_absent = compact_absent && compacted->count(c) == 0;
+        }
+        check(compact_ok, "compacted to SSHash (" + std::to_string(cs.strings) + " strings): every count unchanged");
+        check(compact_absent, "compacted: absent k-mers give 0");
     }
 
     std::printf("\nbackground_test: %s\n", failures ? (std::to_string(failures) + " check(s) failed").c_str() : "all checks passed");
