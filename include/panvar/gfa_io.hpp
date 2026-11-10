@@ -9,6 +9,7 @@
 #include "panvar/gfa.hpp"
 
 #include <cstddef>
+#include <cstdint>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -24,8 +25,8 @@ struct GfaEdge {
 };
 
 // The one canonical name for a path, matching what parse_gfa() records in Graph::paths: a W line is
-// sample#hap#seqid:start-end, a P line is its name. Modules kept private copies of this rule and one of
-// them dropped the :start-end suffix, so a W-line graph resolved a reference that then matched no path.
+// sample#hap#seqid:start-end, a P line is its name. Every module names paths through it, so a reference
+// resolved on a W-line graph matches its path.
 std::string gfa_path_name(const struct GfaPath& p);
 
 struct GfaPath {
@@ -48,6 +49,10 @@ struct GfaModel {
     std::unordered_map<std::string, std::string> seq;  // id -> sequence ("" means '*')
     std::vector<GfaEdge> edges;
     std::vector<GfaPath> paths;
+    // add_new_node's running maximum numeric id over node_order[0, max_id_scanned): only ids appended
+    // since are scanned on the next call, instead of every node per new node.
+    std::size_t max_id_scanned = 0;
+    std::uint64_t max_id_seen = 0;
 
     bool has_node(const std::string& id) const { return seq.find(id) != seq.end(); }
 };

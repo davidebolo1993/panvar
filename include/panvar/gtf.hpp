@@ -24,14 +24,18 @@ struct GeneFeature {
     // copy-number resolver sketches discriminative k-mers from the CDS (paralogs differ in coding
     // sequence), so a paralog cluster is separable from the GTF alone.
     std::vector<std::pair<std::size_t, std::size_t>> cds;
+    // The coding exons of one transcript, sorted: the one tagged Ensembl_canonical, else the one with the
+    // most coding bases (the merged ones where the GTF names no transcripts). Exons of a paralog are matched one to one, which a union across transcripts
+    // (alternative ends, readthroughs into a neighbour) does not allow.
+    std::vector<std::pair<std::size_t, std::size_t>> canonical_cds;
 };
 
 // True iff `name` looks like PanSN `sample#hap#contig:start-end`: at least two '#'
 // separators and a parseable ":start-end" interval. Annotation is gated on this.
 bool is_pansn(const std::string& name);
 
-// Resolve a reference path in `graph` by exact name, else unique case-insensitive
-// substring. Returns nullptr when not found or ambiguous (callers decide how to react).
+// Resolve a reference path in `graph` by match_reference_name (ref_path.hpp). Returns nullptr when not
+// found or ambiguous (callers decide how to react).
 const PathRecord* resolve_reference_path(const Graph& graph, const std::string& query);
 
 // Parse gene features from a (optionally gzipped) Ensembl/GENCODE GTF, keeping only
@@ -39,10 +43,12 @@ const PathRecord* resolve_reference_path(const Graph& graph, const std::string& 
 // case-insensitive, so "chr6" matches "6") whose interval overlaps [lo_1based, hi_1based].
 // If no row ever matches `ref_chrom`, a warning is logged and an empty vector returned --
 // never a hard error.
+// `module` names the module in warnings.
 std::vector<GeneFeature> parse_gtf(const std::string& gtf_path,
                                    const std::string& ref_chrom,
                                    std::size_t lo_1based,
-                                   std::size_t hi_1based);
+                                   std::size_t hi_1based,
+                                   const std::string& module = "panvar");
 
 // Project genes onto the reference walk's nodes: each reference node spans
 // [start + prefix[k], start + prefix[k+1]) in reference bp; map node_id -> the indices
@@ -64,8 +70,8 @@ void write_bandage_gene_colors_csv(const std::string& output_path,
                                    const std::unordered_map<std::string, std::vector<int>>& node_genes,
                                    const std::vector<GeneFeature>& genes);
 
-// Per-gene copy number of a folded paralog cluster is resolved by private-k-mer dosage / per-site consensus
-// in gene_cn_kmer.hpp (no per-haplotype realignment); the old span-realignment resolver was removed.
+// Per-gene copy number of a folded paralog cluster is resolved by private-k-mer dosage and per-site consensus
+// in gene_cn_kmer.hpp, without realigning each haplotype.
 
 // One-shot annotation for bubble/panphorte: resolve the reference path in `graph` by
 // `ref_query`, gate on PanSN (warn+return false otherwise), parse genes over the reference
@@ -75,6 +81,7 @@ bool emit_gene_annotation(const Graph& graph,
                           const std::string& ref_query,
                           const std::string& gtf_path,
                           const std::string& bandage_csv_out,
-                          const std::string& node_genes_out = "");
+                          const std::string& node_genes_out = "",
+                          const std::string& module = "panvar");
 
 } // namespace panvar

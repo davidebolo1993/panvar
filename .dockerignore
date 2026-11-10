@@ -1,4 +1,12 @@
-build/
-tests/results/
+# Host build trees and objects: copied in, make would take them as up to date and link host binaries.
+build*/
+external/**/*.o
+external/**/*.a
+external/minigraph/minigraph
+external/minimap2/minimap2
+external/abpoa/lib/
+external/abpoa/bin/
+# Test data and outputs: not needed to build the image (tests are off).
+tests/
 .git/
-.DS_Store
+**/.DS_Store

@@ -9,7 +9,9 @@
 #include <cstdint>
 #include <fstream>
 #include <iostream>
+#include <map>
 #include <stdexcept>
+#include <unordered_set>
 
 namespace panvar {
 namespace {
@@ -77,26 +79,21 @@ bool is_pansn(const std::string& name) {
     const std::size_t first = name.find('#');
     if (first == std::string::npos) return false;
     if (name.find('#', first + 1) == std::string::npos) return false;
-    return parse_reference_path_label(name).has_interval;
+    return parse_reference_path_label(name, 0, true).has_interval;   // one_based: also a W start without an end
 }
 
 const PathRecord* resolve_reference_path(const Graph& graph, const std::string& query) {
-    for (const PathRecord& p : graph.paths) {
-        if (p.name == query) return &p;
-    }
-    const std::string needle = to_lower(query);
-    const PathRecord* hit = nullptr;
-    int n = 0;
-    for (const PathRecord& p : graph.paths) {
-        if (to_lower(p.name).find(needle) != std::string::npos) { hit = &p; ++n; }
-    }
-    return n == 1 ? hit : nullptr;
+    std::vector<std::string> names;
+    for (const PathRecord& p : graph.paths) names.push_back(p.name);
+    const std::vector<std::size_t> hits = match_reference_name(names, query);
+    return hits.size() == 1 ? &graph.paths[hits[0]] : nullptr;
 }
 
 std::vector<GeneFeature> parse_gtf(const std::string& gtf_path,
                                    const std::string& ref_chrom,
                                    std::size_t lo_1based,
-                                   std::size_t hi_1based) {
+                                   std::size_t hi_1based,
+                                   const std::string& module) {
     GzLineReader reader(gtf_path);
     if (!reader.ok()) {
         throw std::runtime_error("Failed to open GTF: " + gtf_path);
@@ -105,7 +102,10 @@ std::vector<GeneFeature> parse_gtf(const std::string& gtf_path,
     std::vector<GeneFeature> genes;
     std::unordered_map<std::string, std::size_t> gene_by_id;                 // gene_id -> index in genes
     std::unordered_map<std::string, std::vector<std::pair<std::size_t, std::size_t>>> cds_by_id;
-    bool chrom_seen = false;
+    // gene_id -> transcript_id -> its coding exons; and the transcripts tagged canonical
+    std::unordered_map<std::string, std::map<std::string, std::vector<std::pair<std::size_t, std::size_t>>>> tx_cds;
+    std::unordered_set<std::string> canonical_tx;
+    bool chrom_seen = false, chrom_rows = false;   // a gene row, any gene or CDS row, on the chromosome
     std::string line;
     while (reader.getline(line)) {
         if (line.empty() || line[0] == '#') continue;
@@ -114,6 +114,7 @@ std::vector<GeneFeature> parse_gtf(const std::string& gtf_path,
         const bool is_gene = (f[2] == "gene"), is_cds = (f[2] == "CDS");
         if (!is_gene && !is_cds) continue;
         if (norm_chrom(f[0]) != want) continue;
+        chrom_rows = true;
         std::size_t start = 0, end = 0;
         try {
             start = static_cast<std::size_t>(std::stoull(f[3]));
@@ -123,11 +124,18 @@ std::vector<GeneFeature> parse_gtf(const std::string& gtf_path,
             // Collect coding-exon intervals keyed by gene_id; attached to their gene after the pass.
             const std::string gid = gtf_attr(f[8], "gene_id");
             if (!gid.empty()) cds_by_id[gid].emplace_back(start, end);
+            const std::string tid = gtf_attr(f[8], "transcript_id");
+            if (!gid.empty() && !tid.empty()) {
+                tx_cds[gid][tid].emplace_back(start, end);
+                if (f[8].find("\"Ensembl_canonical\"") != std::string::npos) canonical_tx.insert(tid);
+            }
             continue;
         }
         chrom_seen = true;
         if (end < lo_1based || start > hi_1based) continue; // no overlap with the region
-        const std::string biotype = gtf_attr(f[8], "gene_biotype");
+        // Ensembl writes gene_biotype, GENCODE gene_type; reading only the first left GENCODE lncRNAs in.
+        std::string biotype = gtf_attr(f[8], "gene_biotype");
+        if (biotype.empty()) biotype = gtf_attr(f[8], "gene_type");
         if (biotype == "lncRNA") continue;  // long ncRNAs span whole loci and blur paralog annotation
         GeneFeature g;
         g.chrom = f[0];
@@ -155,9 +163,34 @@ std::vector<GeneFeature> parse_gtf(const std::string& gtf_path,
         }
         genes[git->second].cds = std::move(merged);
     }
+    for (auto& [gid, txs] : tx_cds) {
+        const auto git = gene_by_id.find(gid);
+        if (git == gene_by_id.end()) continue;
+        const std::vector<std::pair<std::size_t, std::size_t>>* best = nullptr;
+        std::size_t best_bp = 0;
+        bool best_canon = false;
+        for (const auto& [tid, iv] : txs) {   // ordered by transcript id, so ties are stable
+            std::size_t bp = 0;
+            for (const auto& [a, b] : iv) bp += b - a + 1;
+            const bool canon = canonical_tx.count(tid) != 0;
+            if (best == nullptr || (canon && !best_canon) || (canon == best_canon && bp > best_bp)) {
+                best = &iv; best_bp = bp; best_canon = canon;
+            }
+        }
+        if (best != nullptr) {
+            genes[git->second].canonical_cds = *best;
+            std::sort(genes[git->second].canonical_cds.begin(), genes[git->second].canonical_cds.end());
+        }
+    }
+    for (GeneFeature& g : genes)   // a GTF without transcript ids: its merged coding exons
+        if (g.canonical_cds.empty()) g.canonical_cds = g.cds;
     if (!chrom_seen) {
-        std::cerr << "warning: gtf chrom '" << ref_chrom << "' not found in " << gtf_path
-                  << "; continuing without gene annotation\n";
+        if (chrom_rows)
+            std::cerr << cli::log_prefix(module) << "warning: gtf " << gtf_path << " has no 'gene' rows on '" << ref_chrom
+                      << "' (genes are read from them); continuing without gene annotation\n";
+        else
+            std::cerr << cli::log_prefix(module) << "warning: gtf chrom '" << ref_chrom << "' not found in " << gtf_path
+                      << "; continuing without gene annotation\n";
     }
     return genes;
 }
@@ -214,6 +247,7 @@ void write_node_genes_tsv(const std::string& output_path,
         }
         out << '\n';
     }
+    cli::close_output(out, output_path);
 }
 
 void write_bandage_gene_colors_csv(const std::string& output_path,
@@ -232,6 +266,7 @@ void write_bandage_gene_colors_csv(const std::string& output_path,
         }
         out << id << ',' << gene_color(genes[gi.front()].gene_name) << ',' << label << '\n';
     }
+    cli::close_output(out, output_path);
 }
 
 
@@ -239,23 +274,25 @@ bool emit_gene_annotation(const Graph& graph,
                           const std::string& ref_query,
                           const std::string& gtf_path,
                           const std::string& bandage_csv_out,
-                          const std::string& node_genes_out) {
+                          const std::string& node_genes_out,
+                          const std::string& module) {
     const PathRecord* ref_path = resolve_reference_path(graph, ref_query);
     if (ref_path == nullptr) {
-        std::cerr << "warning: --gtf given but reference path '" << ref_query
+        std::cerr << cli::log_prefix(module) << "warning: --gtf given but reference path '" << ref_query
                   << "' not found/ambiguous; skipping gene annotation\n";
         return false;
     }
     if (!is_pansn(ref_path->name)) {
-        std::cerr << "warning: --gtf given but reference path '" << ref_path->name
+        std::cerr << cli::log_prefix(module) << "warning: --gtf given but reference path '" << ref_path->name
                   << "' is not PanSN (sample#hap#contig:start-end); skipping gene annotation\n";
         return false;
     }
-    const ParsedReferencePath meta = parse_reference_path_label(ref_path->name);
     const std::vector<std::size_t> pref = path_prefix_bp(*ref_path, graph.nodes);
+    const ParsedReferencePath meta =
+        parse_reference_path_label(ref_path->name, pref.empty() ? 0 : pref.back(), ref_path->type == 'W');
     const std::size_t lo = meta.region_start_1based;
     const std::size_t hi = lo + (pref.empty() ? 0 : pref.back()) - 1;
-    const std::vector<GeneFeature> genes = parse_gtf(gtf_path, meta.chrom, lo, hi);
+    const std::vector<GeneFeature> genes = parse_gtf(gtf_path, meta.chrom, lo, hi, module);
     const auto node_genes = project_genes_to_nodes(graph, *ref_path, meta, genes);
     write_bandage_gene_colors_csv(bandage_csv_out, node_genes, genes);
     if (!node_genes_out.empty()) write_node_genes_tsv(node_genes_out, node_genes, genes);

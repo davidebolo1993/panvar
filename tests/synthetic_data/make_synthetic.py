@@ -10,8 +10,8 @@ bubbles look, and which the caller's interval finder requires):
   INV      : reference has INV1 forward; s_inv traverses it reverse.
   SELFDUP  : R has a self-loop; reference R x1, s_selfdup R x3 (self-loop DUP).
   PEAKDUP  : folded G via G-C-G cycle (no self-loop). reference G x2 (baseline),
-             s_peakdup1/2 G x3 (peak-multiplicity DUP, +1), s_null G x1 (a deletion,
-             must NOT fire as a DUP).
+             s_peakdup1/2 G x3 (+1), s_null G x1 (-1); with --cn all three are carriers
+             of one module CNV, the loss included.
   CONFOUND : B folded x2 in ALL paths (invariant cluster background) + node D whose
              deletion (s_confdel) makes the bubble exist. B must NOT yield a DUP.
 """
@@ -92,19 +92,6 @@ with open("tests/synthetic_data/syn.gfa", "w") as f:
         walk = ",".join(f"{nid}{'-' if rev else '+'}" for nid, rev in p)
         f.write(f"P\t{name}\t{walk}\t*\n")
 
-# expected-truth file for the smoke assertions
-with open("tests/synthetic_data/expected.tsv", "w") as f:
-    f.write("svtype\tcarriers\tnote\n")
-    f.write("DEL\ts_del\tdeletion of DEL1 (60bp)\n")
-    f.write("INS\ts_ins\tnovel insertion INS1 (70bp)\n")
-    f.write("INV\ts_inv\tinversion of INV1 (80bp)\n")
-    f.write("DUP\ts_selfdup\tR x3 vs ref x1 (self-loop), REF_CN=1\n")
-    f.write("DUP\ts_peakdup1,s_peakdup2\tG x3 vs ref x2 (peak multiplicity, +1), REF_CN=2\n")
-    f.write("DEL\ts_null\tG x1 vs ref x2 = deletion, must NOT be a DUP\n")
-    f.write("DEL\ts_confdel\tdeletion of D; B folded x2 invariant must NOT yield a DUP\n")
-    # syn_w.gfa (W-lines)
-    f.write("INV\ts_winv\t[W-line] inversion of IV (80bp)\n")
-    f.write("DUP\ts_wmixdup\t[W-line] U x3 mixed orientation (+,-,+) vs ref x2, REF_CN=2; one DUP, not an INV\n")
 print("wrote tests/synthetic_data/syn.gfa")
 print(f"nodes={len(order)} edges={len(edges)} paths={len(paths)}")
 

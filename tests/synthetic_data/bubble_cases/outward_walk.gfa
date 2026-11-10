@@ -1,0 +1,9 @@
+H	VN:Z:1.0
+S	1	AAAA
+S	2	CCCC
+S	3	GGGG
+L	1	+	2	+	0M
+L	2	+	3	+	0M
+L	3	+	1	+	0M
+P	ref	1+,2+,3+	*
+P	outside	3+,1+	*

@@ -13,3 +13,4 @@ _mg_verbose
 _gfa_read
 _gfa_destroy
 _gfa_init
+_gfa_print

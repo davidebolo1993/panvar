@@ -2,6 +2,7 @@
 
 #include "panvar/graph_utils.hpp"
 
+#include <algorithm>
 #include <unordered_map>
 #include <utility>
 
@@ -11,10 +12,14 @@ BubbleAlleleSet enumerate_bubble_alleles(
     const Graph& graph,
     const std::vector<BubblePathIndex>& path_indexes,
     const Bubble& bubble,
-    const std::string& reference_path_name) {
+    const std::string& reference_path_name,
+    const std::unordered_set<std::string>* gap_nodes) {
 
     BubbleAlleleSet out;
     out.bubble_id = bubble.id;
+    // Where the table's boundary orientations describe the walks, a path touching the site only from
+    // outside (`3+ 1+` beside a `1+..3+` site) is not a deletion, as bubble scores it.
+    const bool inward = bubble_orientation_holds(graph.paths, path_indexes, bubble);
 
     std::size_t ref_idx = graph.paths.size();
     for (std::size_t pi = 0; pi < graph.paths.size(); ++pi) {
@@ -23,7 +28,7 @@ BubbleAlleleSet enumerate_bubble_alleles(
     if (ref_idx < graph.paths.size()) {
         std::vector<std::size_t> ref_idxs;
         auto ref_opt = bubble_steps(graph.paths[ref_idx], path_indexes[ref_idx], bubble,
-                                    nullptr, &ref_idxs);
+                                    nullptr, &ref_idxs, inward);
         if (ref_opt.has_value() && !ref_opt->empty()) {
             out.reference_steps = std::move(*ref_opt);
             out.reference_step_indices = std::move(ref_idxs);
@@ -34,9 +39,17 @@ BubbleAlleleSet enumerate_bubble_alleles(
 
     std::unordered_map<std::string, std::size_t> sig_to_allele;
     for (std::size_t pi = 0; pi < graph.paths.size(); ++pi) {
-        const auto steps_opt = bubble_steps(graph.paths[pi], path_indexes[pi], bubble);
+        const auto steps_opt = bubble_steps(graph.paths[pi], path_indexes[pi], bubble, nullptr, nullptr, inward);
         if (!steps_opt.has_value() || steps_opt->empty()) continue;
         const std::vector<PathStep>& steps = *steps_opt;
+        // Only the interior is the allele: the boundaries are shared by every path crossing the site,
+        // so a gap there says nothing about which allele a haplotype carries.
+        if (gap_nodes != nullptr && pi != ref_idx && !gap_nodes->empty() && steps.size() > 2 &&
+            std::any_of(steps.begin() + 1, steps.end() - 1,
+                        [&](const PathStep& s) { return gap_nodes->count(s.node_id) != 0; })) {
+            ++out.gap_paths;
+            continue;
+        }
         out.traversing.insert(graph.paths[pi].name);
         std::string sig = build_walk_signature(steps);
         auto it = sig_to_allele.find(sig);

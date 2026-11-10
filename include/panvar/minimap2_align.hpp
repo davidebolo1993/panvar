@@ -19,8 +19,8 @@ struct Minimap2Hit {
     std::size_t n_matches = 0;     // mlen: matching bases in the alignment
     std::size_t aln_block_len = 0; // blen: alignment block length (match+mismatch+indel)
     // Gap-compressed identity (each indel run counts as ONE event, not by length), like minimap2's
-    // `de`. Robust when a long query maps a copy missing a large insertion (e.g. C4 short form lacks
-    // a large internal indel): the structural indel does not deflate identity. 0 when no cigar available.
+    // `de`. Robust when a long query maps a copy missing a large insertion: the structural indel does
+    // not deflate identity. 0 when no cigar available.
     double gc_identity = 0.0;
 
     // Extended (EQX) CIGAR of the alignment as (op, length) pairs, op in {7='=', 8='X', 1='I', 2='D'},
@@ -56,5 +56,21 @@ std::vector<Minimap2Hit> minimap2_hits(
     const std::string& target_seq,
     const std::string& preset = "asm20",
     std::size_t best_n = 64);
+
+// minimap2_hits with its settings spelled out. `self` maps a sequence against itself as minimap2 -DP
+// does (query and target given the same name): the diagonal is skipped and every chain kept, for finding
+// the copies a sequence holds of itself.
+struct Minimap2Params {
+    std::string preset = "asm20";
+    std::size_t best_n = 64;
+    float pri_ratio = 0.5f;   // secondaries kept down to this fraction of the primary's score
+    bool self = false;
+};
+std::vector<Minimap2Hit> minimap2_hits(
+    const std::string& query_name,
+    const std::string& query_seq,
+    const std::string& target_name,
+    const std::string& target_seq,
+    const Minimap2Params& params);
 
 } // namespace panvar

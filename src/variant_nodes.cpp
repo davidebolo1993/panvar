@@ -9,10 +9,8 @@
 namespace panvar {
 
 // `bubble_members` is every node each bubble owns (interior plus both boundaries). A call's nodes are
-// the whole basis on which a truth event is attributed to it, so a node that is not in the graph, or
-// belongs to a different site, silently turns a called event into a missed one -- the input error and
-// the caller failure produce the identical output. Nothing here is skipped or repaired: an input that
-// cannot be trusted is refused.
+// the whole basis on which a truth event is attributed to it, so a node that belongs to a different
+// site silently turns a called event into a missed one. An input that cannot be trusted is refused.
 VariantNodes load_variant_nodes(
         const std::string& path,
         const std::unordered_map<std::size_t, std::unordered_set<std::string>>& bubble_members,
@@ -33,6 +31,7 @@ VariantNodes load_variant_nodes(
     static const char* kHead[] = {"variant_id", "bubble_id", "svtype", "node_ids"};
     while (std::getline(in, line)) {
         ++lineno;
+        if (!line.empty() && line.back() == '\r') line.pop_back();   // a CRLF file, as the other readers allow
         if (line.empty()) continue;
         const std::vector<std::string> f = split_tab(line);
         if (ncol == 0) {

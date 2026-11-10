@@ -13,7 +13,7 @@
 namespace panvar {
 
 struct GraphSortOptions {
-    std::string reference_path; // path name or unique case-insensitive substring (required)
+    std::string reference_path; // reference path, as -r resolves it (required)
     bool flip = true;           // reorient nodes the reference traverses in reverse
     bool renumber = true;       // assign 1..N ids in sorted order
 };
@@ -23,6 +23,7 @@ struct GraphSortResult {
     std::string resolved_reference; // the path name actually used
     std::size_t flipped_nodes = 0;
     std::size_t reference_steps = 0;
+    std::size_t cycle_blocks = 0;   // strongly connected groups of 2+ nodes, each placed as one block
 };
 
 // Flip + reference-guided sort + (optional) renumber, in place on `model`.

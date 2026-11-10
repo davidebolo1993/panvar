@@ -2,14 +2,13 @@
 
 // Reader for `call`'s <prefix>.variant_nodes.tsv, shared by every consumer.
 //
-// The file is one row per emitted RECORD holding the union of nodes over every merged event and every
+// The file is one row per emitted record holding the union of nodes over every merged event and every
 // carrier. It has no haplotype column: two carriers of one merged record traverse different node sets,
 // so which haplotype carries what is only knowable from the VCF.
 //
 // It is read strictly, because a call's node set is the whole basis on which anything downstream is
-// attributed to that call. A stale node, a dropped row or a mis-parsed bubble id would not fail --
-// it produces exactly the output a genuine caller miss produces, and the two are indistinguishable
-// afterwards. So nothing here is skipped or repaired.
+// attributed to that call: a stale node, a dropped row or a mis-parsed bubble id would not fail but
+// produce the output of a genuine caller miss. So nothing here is skipped or repaired.
 
 #include <cstddef>
 #include <map>
@@ -22,7 +21,7 @@
 namespace panvar {
 
 // One emitted call. Kept whole: folding a bubble's calls into a single node set cannot distinguish
-// "this event matched THAT record" from "this event touches something some record also touches".
+// "this event matched that record" from "this event touches something some record also touches".
 struct CalledRecord {
     std::string variant_id;
     std::string svtype;

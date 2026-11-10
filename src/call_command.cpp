@@ -2,8 +2,12 @@
 
 #include "panvar/cli_utils.hpp"
 #include "panvar/gfa.hpp"
+#include "panvar/graph_utils.hpp"
 #include "panvar/variant_call.hpp"
 
+#include <algorithm>
+#include <cctype>
+#include <filesystem>
 #include <iostream>
 #include <stdexcept>
 #include <string>
@@ -15,72 +19,53 @@ namespace {
 void print_call_help() {
     std::cout
         << "Usage:\n"
-        << "  panvar call -i <graph.gfa> (-b <prefix> | -c <bubbles.csv>) -r <name> -o <prefix> [options]\n\n"
-        << "Graph-native structural variant caller. Compares each haplotype's bubble walk to a\n"
-        << "reference walk, merges fragmented same-type events within a bubble and equivalent\n"
-        << "events across haplotypes, and writes a multi-sample VCF per bubble plus a region VCF.\n"
-        << "Input is expected to be a panphorte-normalized GFA (a tandem DUP is a REP node looped).\n\n"
+        << "  panvar call -i <graph.gfa> (-b <prefix> | -c <bubbles.csv>) -r <name> -o <prefix> [options]\n"
+        << "\n"
+        << "Call structural variants: each haplotype's walk through a site is compared with the\n"
+        << "reference's, pieces of one event are joined, and the same event in different haplotypes\n"
+        << "becomes one VCF record. Folded repeats are called as copy numbers.\n"
+        << "\n"
         << "Options:\n"
-        << "  -i, --gfa <path>                 panphorte-normalized/sorted GFA, i.e.\n"
-        << "                                   <panphorte_prefix>.normalized.sorted.gfa (required)\n"
-        << "  -b, --bubble-prefix-in <prefix>  panphorte output prefix (auto-uses <prefix>.bubbles.csv)\n"
-        << "  -c, --bubbles-csv-in <path>      panphorte bubbles CSV (required if no prefix)\n"
-        << "  -r, --reference-path <name>      Reference path name used as the diff baseline (required)\n"
-        << "  -o, --out-prefix <prefix>        Output prefix for VCFs (required)\n"
-        << "      --min-sv-bp <N>              Minimum size of a reported (merged) event (default: 50)\n"
-        << "      --merge-distance-bp <N>      Coalesce nearby same-type events within a bubble (default: 100)\n"
-        << "      --merge-jaccard <X>          Cross-haplotype node-set Jaccard to merge events (default: 0.80)\n"
-        << "      --merge-seq-identity <X>     Cross-haplotype event-sequence identity to merge (default: 0.80)\n"
-        << "      --merge-size-ratio <X>       Length-ratio floor for the sequence merge; lower to merge\n"
-        << "                                   same-locus events of different sizes, e.g. STR alleles\n"
-        << "                                   (default: 0 = use --merge-seq-identity)\n"
-        << "      --min-haplotypes <N>         Drop records carried by fewer than N haplotypes (default: 1)\n"
-        << "      --min-alt-af <X>             Drop records whose ALT carrier frequency (carriers over\n"
-        << "                                   traversing haplotypes) is below X. Not a minor-allele\n"
-        << "                                   frequency: a DUP's reference-like state is not an allele\n"
-        << "                                   here (default: 0=off; --min-maf is an accepted alias)\n"
-        << "      --allele-vcf                 Also write <prefix>.alleles.vcf: one record per bubble carrying\n"
-        << "                                   EVERY distinct allele as explicit sequence, each haplotype's GT\n"
-        << "                                   indexing its own. Lossless companion to the merged region VCF,\n"
-        << "                                   which describes one walk with several interpreted records\n"
-        << "      --allele-vcf-max-bp <N>      Skip a bubble in the allele VCF if any allele exceeds N bp\n"
-        << "                                   (0 = no limit, the default)\n"
-        << "      --multiallelic-loci          Collapse a bounded locus into ONE multiallelic record (REF+ALT1,ALT2..)\n"
-        << "      --multiallelic-max-bp <N>    Skip multiallelic collapse above this allele size (default: 5000)\n"
-        << "      --rescue-min-bp <N>          Floor for sub-threshold events kept for rescue (default: min-sv-bp/2)\n"
-        << "      --classify-ins               Refine INS subtype NOVEL/DUP with minimap2\n"
-        << "      --minimap-preset <name>      minimap2 preset for INS refinement: asm5|asm10|asm20 (default: asm20)\n"
-        << "      --minimap-best-n <N>         minimap2 best_n chains (default: 8)\n"
-        << "      --ins-dup-min-identity <X>   Identity for an INS to be subtyped DUP (default: 0.90)\n"
-        << "      --tangle-min-hubs <N>        Suppress DUP/CN calling in a low-complexity tangle: a bubble\n"
-        << "                                   with >= N high-degree hub interior nodes (default: 10, 0=off)\n"
-        << "      --tangle-hub-degree <N>      Distinct-neighbour degree for an interior node to count as a\n"
-        << "                                   tangle hub (default: 20)\n"
-        << "      --cn-unit-spacing            Take the MODULE_BP copy-number step from the panel's own\n"
-        << "                                   cluster spacing rather than ref_bp/ref_fold. This makes\n"
-        << "                                   the calibration panel-dependent and is therefore opt-in\n"
-        << "      --max-cn-model-residual <F>  Refuse a MODULE_BP copy-number call when more than this\n"
-        << "                                   FRACTION of traversers round ambiguously\n"
-        << "                                   (CN_ROUND_AMBIGUOUS_FRAC, 0..1); the bubble then\n"
-        << "                                   gets no CN call at all, not a fallback one. 0 = off\n"
-        << "      --max-dup-region-frac <F>    Suppress a peak DUP spanning more than this fraction of the\n"
-        << "                                   reference (a tangle artifact, not a real dup; default: 0.8, 0=off)\n"
-        << "      --cn                         Enable inferred MODULE_BP and PEAK copy-number routes. REP\n"
-        << "                                   self-loop traversal counting is automatic when that topology\n"
-        << "                                   exists. Routes resolve as REP > MODULE_BP > PEAK and emit the\n"
-        << "                                   total copy number of the represented module. With --gtf, a\n"
-        << "                                   separate table estimates per-gene CN where paralogs are\n"
-        << "                                   separable. Sequence-resolved\n"
-        << "                                   DEL/INS/INV are kept alongside the CN call.\n"
-        << "      --gtf <path>                 Reference-coordinate GTF: annotate variants with the genes\n"
-        << "                                   they touch (INFO GENES), write <prefix>.node_genes.tsv and a\n"
-        << "                                   per-gene DUP copy-number table; needs a PanSN reference path\n"
-        << "      --bubble-id <N>              Restrict to one bubble ID (repeatable)\n"
-        << "      --no-per-bubble-vcf          Only write the concatenated region VCF\n"
-        << "      --no-variant-nodes           Skip the variant_nodes.tsv sidecar\n"
-        << "      --threads <N>                Worker threads for the per-bubble loop (0 = auto)\n"
-        << "  -q, --quiet                      Disable progress logs\n"
-        << "  -h, --help                       Show this help\n";
+        << "  -i, --gfa <path>                  Sorted GFA from bubble, panphorte or refine (required)\n"
+        << "  -b, --bubble-prefix <prefix>      Sites from <prefix>.bubbles.csv (required unless -c)\n"
+        << "  -c, --bubbles-csv <path>          Site table, by path\n"
+        << "      --panphorte-prefix <prefix>   Unit-graph table <prefix>.panphorte.unit_graph.tsv, to count\n"
+        << "                                    folded repeats' copies (default: the site table's prefix)\n"
+        << "  -r, --reference-path <name>       Reference path, exact name or unique substring (required)\n"
+        << "  -o, --out-prefix <prefix>         Output prefix (required)\n"
+        << "      --gtf <path>                  Genes each variant touches, and copy number per gene (needs a\n"
+        << "                                    PanSN reference name)\n"
+        << "      --cn                          Also count the copies of a duplicated stretch the graph did not\n"
+        << "                                    fold (CN_METHOD=MODULE)\n"
+        << "      --bubble-id <N>               Only this site; repeatable (default: all)\n"
+        << "      --min-sv-bp <N>               Smallest event reported (default 50)\n"
+        << "      --rescue-min-bp <N>           Smallest piece kept for joining into a larger event (default:\n"
+        << "                                    half --min-sv-bp)\n"
+        << "      --no-align-alleles            Compare with the reference node by node, not by base alignment\n"
+        << "      --merge-distance-bp <N>       Merge events of different haplotypes within N bp plus the\n"
+        << "                                    smaller event's size (default 100)\n"
+        << "      --merge-jaccard <X>           Shared nodes needed to merge events (default 0.80)\n"
+        << "      --merge-seq-identity <X>      Sequence identity needed to merge events (default 0.80)\n"
+        << "      --merge-size-ratio <X>        Smaller/larger size needed to merge events (default 0 = as\n"
+        << "                                    --merge-seq-identity)\n"
+        << "      --min-haplotypes <N>          Drop records carried by fewer than N haplotypes (default 1)\n"
+        << "      --min-alt-af <X>              Drop records whose AF (AC/AN, the haplotypes or with --diploid\n"
+        << "                                    the haplotype slots that have an allele there) is below X\n"
+        << "                                    (default 0)\n"
+        << "      --classify-ins                Tell new insertions from duplications with minimap2\n"
+        << "      --minimap-preset <name>       asm5, asm10 or asm20, for --classify-ins (default asm20)\n"
+        << "      --minimap-best-n <N>          Chains minimap2 keeps, for --classify-ins (default 8)\n"
+        << "      --ins-dup-min-identity <X>    Identity for an insertion to count as a duplication\n"
+        << "                                    (default 0.90)\n"
+        << "      --diploid                     One VCF column per sample (paths SAMPLE#HAP#...), not per path\n"
+        << "      --no-per-bubble-vcf           Only the region VCF, not one per site\n"
+        << "      --max-seq-bp <N>              Leave INSSEQ, DELSEQ and INVSEQ out above N bases, so VCF tools\n"
+        << "                                    read the lines (default 20000; 0 = no limit)\n"
+        << "      --no-variant-nodes            Do not write <prefix>.variant_nodes.tsv (the nodes describe\n"
+        << "                                    reads) nor <prefix>.carrier_events.tsv\n"
+        << "  -t, --threads <N>                 Worker threads (default 0 = all cores)\n"
+        << "  -q, --quiet                       No progress logs\n"
+        << "  -h, --help                        Show this help\n";
 }
 
 } // namespace
@@ -93,11 +78,13 @@ int run_call_command(const std::vector<std::string>& args) {
 
     std::string gfa_path;
     std::string bubble_prefix_in;
+    std::string panphorte_prefix;
+    bool panphorte_prefix_given = false;
     std::string out_prefix;
     VariantCallOptions options;
 
     for (std::size_t i = 0; i < args.size(); ++i) {
-        const std::string& arg = args[i];
+        const std::string arg = cli::renamed_input_flag(args[i], "call");
         auto require_value = [&](const std::string& flag) -> const std::string& {
             if (i + 1 >= args.size()) {
                 throw std::runtime_error("Missing value after " + flag);
@@ -113,12 +100,17 @@ int run_call_command(const std::vector<std::string>& args) {
             gfa_path = require_value(arg);
             continue;
         }
-        if (arg == "-b" || arg == "--bubble-prefix-in") {
+        if (arg == "-b" || arg == "--bubble-prefix") {
             bubble_prefix_in = require_value(arg);
             continue;
         }
-        if (arg == "-c" || arg == "--bubbles-csv-in") {
+        if (arg == "-c" || arg == "--bubbles-csv") {
             options.bubbles_csv_in = require_value(arg);
+            continue;
+        }
+        if (arg == "--panphorte-prefix") {
+            panphorte_prefix = require_value(arg);
+            panphorte_prefix_given = true;
             continue;
         }
         if (arg == "-r" || arg == "--reference-path") {
@@ -131,6 +123,10 @@ int run_call_command(const std::vector<std::string>& args) {
         }
         if (arg == "--min-sv-bp") {
             options.min_sv_bp = cli::parse_size_arg(arg, require_value(arg));
+            continue;
+        }
+        if (arg == "--max-seq-bp") {
+            options.max_seq_bp = cli::parse_size_arg(arg, require_value(arg));
             continue;
         }
         if (arg == "--merge-distance-bp") {
@@ -153,24 +149,16 @@ int run_call_command(const std::vector<std::string>& args) {
             options.min_haplotypes = cli::parse_size_arg(arg, require_value(arg));
             continue;
         }
-        if (arg == "--min-alt-af" || arg == "--min-maf") {   // --min-maf is the historical spelling
+        if (arg == "--min-alt-af") {
             options.min_maf = cli::parse_unit_fraction_arg(arg, require_value(arg));
             continue;
         }
-        if (arg == "--allele-vcf") {
-            options.allele_vcf = true;
+        if (arg == "--no-align-alleles") {
+            options.align_alleles = false;
             continue;
         }
-        if (arg == "--allele-vcf-max-bp") {
-            options.allele_vcf_max_bp = cli::parse_size_arg(arg, require_value(arg));
-            continue;
-        }
-        if (arg == "--multiallelic-loci") {
-            options.multiallelic_loci = true;
-            continue;
-        }
-        if (arg == "--multiallelic-max-bp") {
-            options.multiallelic_max_bp = cli::parse_size_arg(arg, require_value(arg));
+        if (arg == "--diploid") {
+            options.diploid = true;
             continue;
         }
         if (arg == "--rescue-min-bp") {
@@ -181,30 +169,8 @@ int run_call_command(const std::vector<std::string>& args) {
             options.classify_ins = true;
             continue;
         }
-        if (arg == "--cn") {                 // copy-number calling: all routes, resolved by topology
+        if (arg == "--cn") {                 // copy-number calling: the module route
             options.cn = true;
-            continue;
-        }
-        if (arg == "--tangle-hub-degree") {
-            options.tangle_hub_degree = cli::parse_size_arg(arg, require_value(arg));
-            continue;
-        }
-        if (arg == "--tangle-min-hubs") {    // 0 disables the low-complexity tangle guard
-            options.tangle_min_hubs = cli::parse_size_arg(arg, require_value(arg));
-            continue;
-        }
-        if (arg == "--max-dup-region-frac") {  // suppress a peak DUP spanning > this fraction of the reference
-            // A fraction of the reference, so 0..1. Raw std::stod accepted 2, and "nan" -- which then
-            // compared false against everything and silently disabled the guard.
-            options.max_dup_region_frac = cli::parse_unit_fraction_arg(arg, require_value(arg));
-            continue;
-        }
-        if (arg == "--cn-unit-spacing") {   // take the MODULE_BP copy step from the panel, not ref_bp/ref_fold
-            options.cn_unit_spacing = true;
-            continue;
-        }
-        if (arg == "--max-cn-model-residual") {
-            options.max_cn_model_residual = cli::parse_unit_fraction_arg(arg, require_value(arg));
             continue;
         }
         if (arg == "--gtf") {
@@ -248,7 +214,7 @@ int run_call_command(const std::vector<std::string>& args) {
             options.write_variant_nodes = false;
             continue;
         }
-        if (arg == "--threads") {
+        if (arg == "-t" || arg == "--threads") {
             options.threads = cli::parse_size_arg(arg, require_value(arg));
             continue;
         }
@@ -269,12 +235,12 @@ int run_call_command(const std::vector<std::string>& args) {
             options.bubbles_csv_in = derived;
         } else if (options.bubbles_csv_in != derived) {
             throw std::runtime_error(
-                "Conflicting bubble inputs: --bubble-prefix-in resolves to '" +
-                derived + "' but --bubbles-csv-in is '" + options.bubbles_csv_in + "'");
+                "Conflicting bubble inputs: --bubble-prefix resolves to '" +
+                derived + "' but --bubbles-csv is '" + options.bubbles_csv_in + "'");
         }
     }
     if (options.bubbles_csv_in.empty()) {
-        throw std::runtime_error("call requires --bubble-prefix-in <prefix> or --bubbles-csv-in <path>");
+        throw std::runtime_error("call requires --bubble-prefix <prefix> or --bubbles-csv <path>");
     }
     if (options.reference_path.empty()) {
         throw std::runtime_error("--reference-path is required for module 'call'");
@@ -283,64 +249,140 @@ int run_call_command(const std::vector<std::string>& args) {
         throw std::runtime_error("call requires -o/--out-prefix <prefix>");
     }
     options.out_prefix = out_prefix;
-
-    ParseGfaOptions parse_options;
-    parse_options.include_paths = true;
-    parse_options.include_sequences = true;
-    const Graph graph = parse_gfa(gfa_path, parse_options);
-    if (graph.paths.empty()) {
-        throw std::runtime_error("Input GFA has no P/W paths; variant calling requires paths");
+    // panphorte's unit graphs travel with the site table (refine forwards them under its own prefix). Named
+    // explicitly, the table must exist; found by default, it is used when it is there.
+    {
+        const std::string tail = ".bubbles.csv";
+        const std::string& csv = options.bubbles_csv_in;
+        if (!panphorte_prefix_given)
+            panphorte_prefix = !bubble_prefix_in.empty() ? bubble_prefix_in
+                             : csv.size() > tail.size() && csv.compare(csv.size() - tail.size(), tail.size(), tail) == 0
+                                 ? csv.substr(0, csv.size() - tail.size()) : std::string();
+        const std::string ug = panphorte_prefix.empty() ? std::string() : panphorte_prefix + ".panphorte.unit_graph.tsv";
+        std::error_code ec;
+        if (!ug.empty() && std::filesystem::is_regular_file(ug, ec)) options.unit_graph_tsv = ug;
+        else if (panphorte_prefix_given)
+            throw std::runtime_error("call: --panphorte-prefix " + panphorte_prefix + ": no " + ug);
     }
 
     cli::RunLog log("call", options.quiet);
-    log.info("input " + gfa_path + " (" + std::to_string(graph.nodes.size()) + " nodes, " +
-             std::to_string(graph.paths.size()) + " paths); reference " + options.reference_path);
+    log.info("reading: " + gfa_path);
+    ParseGfaOptions parse_options;
+    parse_options.include_paths = true;
+    parse_options.include_sequences = true;
+    Graph graph = parse_gfa(gfa_path, parse_options);
+    require_graph_paths(graph.nodes.size(), graph.paths.size(), "call");
+    // Uppercase, and any letter other than ACGT as N, so a soft-masked or IUPAC graph still writes valid
+    // REF/ALT, does not split one allele into case variants, and merges sequences regardless of case.
+    for (auto& [id, node] : graph.nodes) {
+        (void)id;
+        for (char& c : node.sequence) {
+            const char u = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+            c = (u == 'A' || u == 'C' || u == 'G' || u == 'T') ? u : 'N';
+        }
+    }
+
+    log.info("input: haplotypes: " + std::to_string(graph.paths.size()) + "; nodes: " +
+             std::to_string(graph.nodes.size()));
+    // The path the query resolves to (exact, else a unique substring), as the VCF's ##reference names it.
+    log.info("reference: " + resolve_reference_path_name(graph, options.reference_path, "call"));
+    log.info(options.unit_graph_tsv.empty() ? std::string("folded repeats: no unit-graph table")
+                                            : "folded repeats: " + options.unit_graph_tsv);
 
     VariantCallSummary summary;
     call_variants(graph, options, &summary);
 
-    log.info("called " + std::to_string(summary.records_written) + " records across " +
-             std::to_string(summary.bubbles_with_calls) + "/" + std::to_string(summary.bubbles_seen) +
-             " bubbles (DEL " + std::to_string(summary.del) + ", INS " + std::to_string(summary.ins) +
-             ", INV " + std::to_string(summary.inv) + ", DUP " + std::to_string(summary.dup) +
-             ", MULTI " + std::to_string(summary.multi) + ")");
-    if (summary.oversized_dups > 0) {
-        log.info("suppressed " + std::to_string(summary.oversized_dups) +
-                 " copy-number DUP call(s) as low-complexity-tangle or oversized (> max-dup-region-frac)" +
-                 (summary.tangle_bubbles > 0
-                      ? "; " + std::to_string(summary.tangle_bubbles) + " bubble(s) flagged tangle"
-                      : ""));
-    }
-    // Both of these are guaranteed losses, and a quiet run previously left no record of either: the
-    // counters reached the summary struct and nothing printed them, so a missing CN call or an
-    // unaligned divergent block had no durable reason anywhere in the output.
+    log.info("sites: " + std::to_string(summary.bubbles_seen) + "; with records: " +
+             std::to_string(summary.bubbles_with_calls));
+    log.info("records: " + std::to_string(summary.records_written) + "; DEL: " + std::to_string(summary.del) +
+             "; INS: " + std::to_string(summary.ins) + "; INV: " + std::to_string(summary.inv) + "; CNV: " +
+             std::to_string(summary.dup) + "; SUB: " + std::to_string(summary.sub));
+    // A module copy number not called because the graph is tangled there is a loss, and the remedy is
+    // upstream: said even with -q.
+    auto id_list = [](std::vector<std::size_t> ids) {
+        std::sort(ids.begin(), ids.end());
+        ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
+        std::string out;
+        for (std::size_t k = 0; k < ids.size(); ++k) out += (k ? "," : "") + std::to_string(ids[k]);
+        return out;
+    };
+    if (!summary.tangle_ids.empty())
+        std::cerr << cli::log_prefix("call") << "warning: no module copy number at site(s) " << id_list(summary.tangle_ids)
+                  << ": ten or more nodes there have fifty neighbours or more on one end, a tangle whose node counts are "
+                     "no copy number; `panvar rebuild` may untangle the graph\n";
+    if (!summary.oversized_ids.empty())
+        std::cerr << cli::log_prefix("call") << "warning: no module copy number at site(s) " << id_list(summary.oversized_ids)
+                  << ": the module would span more than 80% of the reference, scattered revisits rather than "
+                     "copies; `panvar rebuild` may untangle the graph\n";
+    // Genotypes set missing (GT .) for a reason the run cannot avoid, each logged with its count so the
+    // loss has a stated reason.
     if (summary.skipped_large_segments > 0) {
-        log.info("skipped " + std::to_string(summary.skipped_large_segments) +
-                 " divergent block(s) too large to align; each is a false negative, not a quiet pass");
+        std::string ids;
+        for (std::size_t k = 0; k < summary.unaligned_bubbles.size(); ++k)
+            ids += (k ? "," : "") + std::to_string(summary.unaligned_bubbles[k]);
+        log.info("blocks too large to align: " + std::to_string(summary.skipped_large_segments) +
+                 (ids.empty() ? std::string() : " (sites " + ids + ")") + "; GT . there: " +
+                 std::to_string(summary.unaligned_missing));
     }
-    if (summary.declined_cn_model > 0) {
-        log.info("declined " + std::to_string(summary.declined_cn_model) +
-                 " module copy-number call(s) over --max-cn-model-residual, leaving " +
-                 std::to_string(summary.declined_cn_model_bubbles) +
-                 " bubble(s) with no CN record (sequence-resolved events are unaffected)");
+    if (summary.covered_missing > 0)
+        log.info("GT . within a larger deletion of the haplotype's own: " + std::to_string(summary.covered_missing));
+    if (summary.ref_gap_bubbles > 0) {
+        std::string ids;
+        for (std::size_t k = 0; k < summary.ref_gap_ids.size(); ++k)
+            ids += (k ? "," : "") + std::to_string(summary.ref_gap_ids[k]);
+        log.info("sites skipped, assembly gap in the reference: " + std::to_string(summary.ref_gap_bubbles) +
+                 " (" + ids + ")");
+    }
+    if (summary.gap_missing > 0) {
+        log.info("GT . across an assembly gap: " + std::to_string(summary.gap_missing));
+    }
+    // Detection only: walks and copy numbers on these bubbles are measured as anywhere else, and every
+    // record there carries INFO/MULTI_CROSSING.
+    if (summary.multi_crossing_bubbles > 0) {
+        log.info("paths crossing a site more than once: " + std::to_string(summary.multi_crossing_paths) +
+                 "; sites: " + std::to_string(summary.multi_crossing_bubbles) + " (records flagged MULTI_CROSSING)");
+    }
+    if (summary.diploid_records_dropped > 0)
+        log.info("--diploid: records with no sample carrier, not written: " +
+                 std::to_string(summary.diploid_records_dropped));
+    if (summary.multi_crossing_unscored_paths > 0) {
+        std::string ids;
+        for (std::size_t k = 0; k < summary.multi_crossing_unscored_ids.size() && k < 10; ++k)
+            ids += (k ? "," : "") + std::to_string(summary.multi_crossing_unscored_ids[k]);
+        if (summary.multi_crossing_unscored_ids.size() > 10) ids += ",...";
+        std::cerr << cli::log_prefix("call") << "warning: " << summary.multi_crossing_unscored_paths << " path(s) at "
+                  << summary.multi_crossing_unscored_bubbles << " bubble(s) (" << ids
+                  << ") cross a second time with an allele --min-sv-bp or more longer or shorter than every "
+                     "reference crossing, outside the walk that is scored: an SV-sized change no record "
+                     "describes (MULTI_CROSSING_UNSCORED)\n";
     }
 
+    // Every output shares the prefix's directory. The per-site VCFs, one per site with records, are named
+    // once as a pattern with their count, so the line stays short and the file count is the real one.
+    const std::filesystem::path out_dir = std::filesystem::path(options.out_prefix).parent_path();
+    const std::string base = std::filesystem::path(options.out_prefix).filename().string();
     std::vector<std::string> outputs;
-    outputs.push_back(options.out_prefix + ".region.vcf");
-    if (options.allele_vcf) {
-        outputs.push_back(options.out_prefix + ".alleles.vcf");
-    }
-    if (options.write_per_bubble_vcf) {
-        outputs.push_back(options.out_prefix + ".bubble_<id>.vcf");
+    outputs.push_back(base + ".region.vcf");
+    std::size_t n_files = 1;
+    if (summary.per_bubble_vcfs > 0) {
+        outputs.push_back(base + ".bubble_<id>.vcf (" + std::to_string(summary.per_bubble_vcfs) +
+                          (summary.per_bubble_vcfs == 1 ? " file)" : " files)"));
+        n_files += summary.per_bubble_vcfs;
     }
     if (options.write_variant_nodes) {
-        outputs.push_back(options.out_prefix + ".variant_nodes.tsv");
+        outputs.push_back(base + ".variant_nodes.tsv");
+        outputs.push_back(base + ".carrier_events.tsv");
+        n_files += 2;
     }
-    if (!options.gtf_path.empty()) {
-        outputs.push_back(options.out_prefix + ".node_genes.tsv");
-        outputs.push_back(options.out_prefix + ".dup_gene_cn.tsv");
+    if (summary.gene_tables_written) {
+        outputs.push_back(base + ".node_genes.tsv");
+        outputs.push_back(base + ".dup_gene_cn.tsv");
+        n_files += 2;
     }
-    log.wrote(outputs);
+    std::string listed;
+    for (std::size_t k = 0; k < outputs.size(); ++k) listed += (k ? ", " : "") + outputs[k];
+    log.info("wrote " + std::to_string(n_files) + (n_files == 1 ? " file" : " files") +
+             (out_dir.empty() ? std::string() : " in " + out_dir.string() + "/") + ": " + listed);
     log.done();
     return 0;
 }

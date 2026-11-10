@@ -10,3 +10,4 @@ mg_verbose
 gfa_read
 gfa_destroy
 gfa_init
+gfa_print

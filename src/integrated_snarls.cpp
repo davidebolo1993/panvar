@@ -1,7 +1,8 @@
 #include "panvar/integrated_snarls.hpp"
 
-// Port of vg's integrated_snarl_finder (MIT) - just the traverse_decomposition path, on an in-process
-// HandleShim. Cactus / 3-edge-connected decomposition unchanged, so snarls match `vg snarls`.
+// Port of vg's integrated_snarl_finder (MIT): only the traverse_decomposition path, on an in-process
+// HandleShim. The cactus / 3-edge-connected decomposition is unchanged; the rooting is not (a cycle no path
+// walks around does not root it, see traverse_decomposition), so snarls match `vg snarls` except there.
 // Method: Paten et al. 2018, Superbubbles, Ultrabubbles and Cacti (https://doi.org/10.1089/cmb.2017.0251).
 // Upstream: https://github.com/vgteam/vg/blob/master/src/integrated_snarl_finder.cpp
 
@@ -22,8 +23,8 @@
 namespace panvar {
 namespace {
 
-// A handle is a union-find index: node_rank * 2 + reverse_bit. This makes uf_rank(handle)
-// == handle, exactly matching vg's RankedHandleGraph indexing convention.
+// A handle is a union-find index, node_rank * 2 + reverse_bit, so uf_rank(handle) == handle as in vg's
+// RankedHandleGraph indexing.
 using handle_t = std::uint64_t;
 using edge_t = std::pair<handle_t, handle_t>;
 
@@ -42,6 +43,7 @@ struct HandleShim {
     std::size_t get_node_count() const { return in->node_ids.size(); }
     std::size_t get_length(handle_t h) const { return in->node_len[h >> 1]; }
     const std::string& get_id(handle_t h) const { return in->node_ids[h >> 1]; }
+    bool walked_twice(handle_t h) const { return !in->walked_twice.empty() && in->walked_twice[h >> 1] != 0; }
     // 1-based rank in union-find space, matching vg (uf_rank subtracts 1).
     std::size_t handle_to_rank(handle_t h) const { return static_cast<std::size_t>(h) + 1; }
     handle_t rank_to_handle(std::size_t rank) const { return static_cast<handle_t>(rank - 1); }
@@ -490,12 +492,16 @@ void traverse_computed_decomposition(
     std::vector<std::pair<std::size_t, handle_t>>& longest_cycles,
     std::unordered_map<handle_t, handle_t>& next_along_cycle,
     const std::function<void(handle_t)>& begin_chain, const std::function<void(handle_t)>& end_chain,
-    const std::function<void(handle_t)>& begin_snarl, const std::function<void(handle_t)>& end_snarl) {
+    const std::function<void(handle_t)>& begin_snarl, const std::function<void(handle_t)>& end_snarl,
+    const std::function<void(bool)>& begin_root) {
 
     HandleGraphNodeSet visited(graph);
     std::size_t to_decompose = graph->get_node_count();
 
     while (visited.size() < to_decompose) {
+        // panvar: say whether this root is a cycle (else a path), before anything under it is emitted.
+        begin_root(!(longest_cycles.empty() ||
+                     (!longest_paths.empty() && longest_cycles.back().first <= longest_paths.back().first)));
         struct SnarlChainFrame {
             bool is_snarl = true;
             bool saw_children = false;
@@ -683,7 +689,8 @@ void traverse_computed_decomposition(
 void traverse_decomposition(const HandleShim* graph, const std::function<void(handle_t)>& begin_chain,
                             const std::function<void(handle_t)>& end_chain,
                             const std::function<void(handle_t)>& begin_snarl,
-                            const std::function<void(handle_t)>& end_snarl) {
+                            const std::function<void(handle_t)>& end_snarl,
+                            const std::function<void(bool)>& begin_root) {
     MergedAdjacencyGraph cactus(graph);
 
     std::vector<std::pair<handle_t, handle_t>> merge_list;
@@ -711,6 +718,24 @@ void traverse_decomposition(const HandleShim* graph, const std::function<void(ha
     auto& longest_cycles = cycles.first;
     auto& next_along_cycle = cycles.second;
 
+    // panvar: vg roots a component on the longer of its longest cycle and its longest path between two tips.
+    // Only the one longest cycle of each component is a candidate. If no path walks around it -- each path
+    // takes one side, as with a site's two alleles -- it counts as 1 bp, so a variable region longer than the
+    // locus's flanks does not become the root and lose its own site; the component is then rooted on its
+    // path, as a shorter cycle is never considered. If paths walk around it (a repeat walked twice, an
+    // inversion walked both ways) it keeps its length.
+    for (auto& cycle : longest_cycles) {
+        bool walked = false;
+        handle_t h = cycle.second;
+        do {
+            if (graph->walked_twice(h)) { walked = true; break; }
+            const auto it = next_along_cycle.find(h);
+            if (it == next_along_cycle.end()) break;
+            h = it->second;
+        } while (h != cycle.second);
+        if (!walked) cycle.first = 1;
+    }
+
     for (auto& kv : next_along_cycle) forest.merge(kv.first, kv.second);
 
     auto forest_paths = forest.longest_paths_in_forest(longest_cycles);
@@ -722,33 +747,95 @@ void traverse_decomposition(const HandleShim* graph, const std::function<void(ha
 
     traverse_computed_decomposition(graph, cactus, forest, longest_paths, towards_deepest_leaf,
                                     longest_cycles, next_along_cycle, begin_chain, end_chain,
-                                    begin_snarl, end_snarl);
+                                    begin_snarl, end_snarl, begin_root);
 }
 
 } // namespace
 
 std::vector<std::pair<std::string, std::string>> find_top_level_snarls_cactus(
-    const SnarlGraphInput& in) {
+    const SnarlGraphInput& in, std::vector<SnarlInward>* inward) {
     std::vector<std::pair<std::string, std::string>> out;
+    if (inward != nullptr) inward->clear();
     if (in.node_ids.empty()) return out;
 
     HandleShim shim(&in);
 
-    // Collect the outermost snarls: a snarl with no enclosing snarl is top-level.
-    int open_snarls = 0;
-    std::string pending_start;
-    auto begin_chain = [&](handle_t) {};
-    auto end_chain = [&](handle_t) {};
+    // A snarl as the decomposition reports it: the start handle reads into it, the end handle reads out of
+    // it, so the interior hangs off the start's end side when the start is forward, and off the end's end
+    // side when the end is reversed. Every snarl is kept with its nesting, so a wrapper can be replaced by
+    // what is inside it, however deep the real sites sit.
+    struct Found {
+        handle_t start = 0, end = 0;
+        bool cycle_root = false;
+        std::unordered_set<std::size_t> interior;   // node ranks inside (boundaries removed below)
+        std::vector<std::size_t> children;          // snarls one level down
+    };
+    std::vector<Found> all;
+    std::vector<std::size_t> roots;   // top-level snarls
+    std::vector<std::size_t> open;    // snarls currently open, outermost first
+    bool cycle_root = false;
+    auto note = [&](handle_t h) {
+        for (const std::size_t i : open) all[i].interior.insert(h >> 1);
+    };
+    auto begin_root = [&](bool is_cycle) { cycle_root = is_cycle; };
+    auto begin_chain = [&](handle_t h) { note(h); };
+    auto end_chain = [&](handle_t h) { note(h); };
     auto begin_snarl = [&](handle_t h) {
-        if (open_snarls == 0) pending_start = shim.get_id(h);
-        ++open_snarls;
+        note(h);
+        const std::size_t i = all.size();
+        all.emplace_back();
+        all.back().start = h;
+        all.back().cycle_root = cycle_root;
+        (open.empty() ? roots : all[open.back()].children).push_back(i);
+        open.push_back(i);
     };
     auto end_snarl = [&](handle_t h) {
-        --open_snarls;
-        if (open_snarls == 0) out.emplace_back(pending_start, shim.get_id(h));
+        const std::size_t i = open.back();
+        open.pop_back();
+        all[i].end = h;
+        note(h);
     };
 
-    traverse_decomposition(&shim, begin_chain, end_chain, begin_snarl, end_snarl);
+    traverse_decomposition(&shim, begin_chain, end_chain, begin_snarl, end_snarl, begin_root);
+
+    auto emit = [&](const Found& f) {
+        out.emplace_back(shim.get_id(f.start), shim.get_id(f.end));
+        if (inward != nullptr)
+            inward->push_back(SnarlInward{!shim.get_is_reverse(f.start), shim.get_is_reverse(f.end)});
+    };
+    // In a cycle-rooted component, a snarl holding an end of most paths may wrap the locus ends rather than
+    // describe a site: paths start or stop inside it, none crosses it, and bubble would reject it with every
+    // site nested in it. So its children are passed on too, descending while that holds. The snarl itself
+    // is still passed on: most haplotypes can end inside a real site, and bubble drops a site no path
+    // crosses and, of two overlapping sites, keeps the smaller. One end of a path is enough, as a path can
+    // enter a wrapper through the reverse visit of a shared node and end in it. "Most paths" counts only
+    // the snarl's own component, so paths of an unrelated component cannot outvote the locus's own.
+    std::vector<std::size_t> comp_of(in.node_ids.size());
+    for (std::size_t i = 0; i < comp_of.size(); ++i) comp_of[i] = i;
+    std::function<std::size_t(std::size_t)> root_of = [&](std::size_t x) {
+        while (comp_of[x] != x) { comp_of[x] = comp_of[comp_of[x]]; x = comp_of[x]; }
+        return x;
+    };
+    for (const auto& e : in.edges) comp_of[root_of(e.from_rank)] = root_of(e.to_rank);
+    auto wraps_ends = [&](Found& f) {
+        f.interior.erase(f.start >> 1);
+        f.interior.erase(f.end >> 1);
+        if (!f.cycle_root || in.path_ends.empty()) return false;
+        const std::size_t comp = root_of(f.start >> 1);
+        std::size_t holding = 0, paths = 0;
+        for (const auto& [first, last] : in.path_ends) {
+            if (root_of(first) != comp && root_of(last) != comp) continue;
+            ++paths;
+            holding += f.interior.count(first) != 0 || f.interior.count(last) != 0;
+        }
+        return holding * 2 > paths;
+    };
+    std::function<void(std::size_t)> visit = [&](std::size_t i) {
+        emit(all[i]);
+        if (!wraps_ends(all[i])) return;
+        for (const std::size_t c : all[i].children) visit(c);
+    };
+    for (const std::size_t r : roots) visit(r);
     return out;
 }
 
@@ -768,6 +855,36 @@ SnarlGraphInput snarl_input_from_model(const GfaModel& model) {
         const auto ti = rank_of.find(e.to);
         if (fi == rank_of.end() || ti == rank_of.end()) continue;
         sgi.edges.push_back({fi->second, e.from_orient == '-', ti->second, e.to_orient == '-'});
+    }
+    sgi.walked_twice.assign(model.node_order.size(), 0);
+    std::vector<char> forward(model.node_order.size(), 0), backward(model.node_order.size(), 0);
+    for (const GfaPath& p : model.paths) {
+        // A haplotype stored on the other strand runs from late ranks to early ones (ranks follow the reference
+        // after the sort). Its strand comes from where its ends lie, not from how they are walked: an inverted
+        // end node or an inversion near an end would mislead. Ends of one rank fall back to their orientation.
+        bool flipped = false;
+        if (!p.steps.empty()) {
+            const auto fi = rank_of.find(p.steps.front().node_id), li = rank_of.find(p.steps.back().node_id);
+            if (fi != rank_of.end() && li != rank_of.end() && fi->second != li->second)
+                flipped = li->second < fi->second;
+            else
+                flipped = p.steps.front().reverse && p.steps.back().reverse;
+        }
+        std::unordered_map<std::size_t, std::size_t> seen;
+        for (const auto& st : p.steps) {
+            const auto r = rank_of.find(st.node_id);
+            if (r == rank_of.end()) continue;
+            if (++seen[r->second] == 2) sgi.walked_twice[r->second] = 1;
+            (st.reverse != flipped ? backward : forward)[r->second] = 1;
+        }
+    }
+    for (std::size_t i = 0; i < forward.size(); ++i)
+        if (forward[i] && backward[i]) sgi.walked_twice[i] = 1;
+    for (const GfaPath& p : model.paths) {
+        if (p.steps.empty()) continue;
+        const auto fi = rank_of.find(p.steps.front().node_id);
+        const auto li = rank_of.find(p.steps.back().node_id);
+        if (fi != rank_of.end() && li != rank_of.end()) sgi.path_ends.emplace_back(fi->second, li->second);
     }
     return sgi;
 }

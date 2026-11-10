@@ -11,9 +11,9 @@
 
 namespace panvar {
 
-// One distinct allele of a bubble: the walk itself plus the haplotypes that carry it.
-// Alleles are grouped by canonical-walk signature, so two haplotypes share an allele only when
-// they traverse the same nodes in the same orientations.
+// One distinct allele of a bubble: the walk plus the haplotypes that carry it. Alleles are grouped by
+// canonical-walk signature, so two haplotypes share one only when they traverse the same nodes in the same
+// orientations.
 struct BubbleAllele {
     std::size_t id = 0;                     // index within the set, in first-encounter order
     std::string signature;                  // grouping key ("12+,13-,14+")
@@ -25,23 +25,26 @@ struct BubbleAlleleSet {
     std::size_t bubble_id = 0;
     std::vector<BubbleAllele> alleles;
     std::unordered_set<std::string> traversing;   // path names that cross the bubble at all
+    // Paths left out because their walk across the bubble steps on an assembly-gap node: their
+    // allele is unknown, not an allele of N bases, so they are missing (GT '.') like a non-traverser.
+    std::size_t gap_paths = 0;
     std::vector<PathStep> reference_steps;        // empty when the reference does not cross
-    // For each entry of reference_steps, the index it came from in the reference path's own step
-    // vector. Coordinates must be taken from THESE, not from a node->position map: such a map records
-    // a node's first occurrence, which is the wrong occurrence wherever the reference revisits it.
+    // For each entry of reference_steps, its index in the reference path's own steps. Coordinates come
+    // from these, not a node->position map, which holds a node's first occurrence only.
     std::vector<std::size_t> reference_step_indices;
     std::string reference_signature;
     bool has_reference = false;
 };
 
-// Enumerate the distinct alleles of `bubble` across every path in `graph`. `path_indexes` is
-// parallel to `graph.paths`. Uses `bubble_steps`, so pure-deletion alleles (no interior node) are
-// represented rather than dropped. Allele order is the order haplotypes are first seen, which keeps
-// it stable for a given graph.
+// The distinct alleles of `bubble` across every path in `graph` (`path_indexes` parallel to `graph.paths`).
+// Uses `bubble_steps`, so pure-deletion alleles are represented. Alleles are in the order haplotypes are
+// first seen, stable for a given graph. A non-reference path whose interior steps on a node of `gap_nodes`
+// (when given) is not traversing; see gap_paths. The boundaries do not count: every path shares them.
 BubbleAlleleSet enumerate_bubble_alleles(
     const Graph& graph,
     const std::vector<BubblePathIndex>& path_indexes,
     const Bubble& bubble,
-    const std::string& reference_path_name);
+    const std::string& reference_path_name,
+    const std::unordered_set<std::string>* gap_nodes = nullptr);
 
 } // namespace panvar

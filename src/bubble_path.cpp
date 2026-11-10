@@ -56,15 +56,11 @@ void evaluate_direction(
     const std::vector<std::size_t>& inside_positions,
     std::optional<BubblePathInterval>& best) {
 
-    // The rule is "the interval with the most interior steps wins, shortest span then leftmost to break
-    // a tie". Enumerating start/end pairs to find that is quadratic, and any bound that makes it
-    // affordable silently clips the answer wherever a boundary recurs often -- a tandem array, a
-    // duplication, any path revisiting a boundary enough times.
-    //
-    // No enumeration is needed. The interior count is monotone under containment, so the WIDEST interval
-    // attains the maximum and every interval attaining it contains all of those interior steps. The
-    // shortest such interval is the tightest window around them: the last start before the first
-    // interior step, the first end after the last. Exact, in two binary searches.
+    // The interval with the most interior steps wins, shortest span then leftmost breaking a tie. No
+    // enumeration of start/end pairs is needed (quadratic, and any bound clips the answer where a boundary
+    // recurs): the interior count is monotone under containment, so the widest interval attains the
+    // maximum, and the shortest interval attaining it is the tightest window around those interior steps,
+    // the last start before the first interior step and the first end after the last. Two binary searches.
     if (start_positions.empty() || end_positions.empty()) {
         return;
     }
@@ -108,6 +104,13 @@ BubblePathIndex build_bubble_path_index(const PathRecord& path) {
     return out;
 }
 
+BubblePathIndex build_bubble_path_index(const PathRecord& path, const std::unordered_set<std::string>& keep) {
+    BubblePathIndex out;
+    for (std::size_t i = 0; i < path.steps.size(); ++i)
+        if (keep.count(path.steps[i].node_id)) out.positions[path.steps[i].node_id].push_back(i);
+    return out;
+}
+
 std::optional<BubblePathInterval> find_best_bubble_path_interval(
     const BubblePathIndex& index,
     const Bubble& bubble) {
@@ -139,10 +142,9 @@ std::vector<PathStep> canonical_bubble_path_steps(
         return {};
     }
 
-    // The index each returned step came from in `path.steps`, carried alongside rather than derived by
-    // the caller: the reverse branch below may flip the walk a second time, so `left + j` and
-    // `right - j` are both wrong in one of the four combinations. A caller that needs to know WHICH
-    // occurrence of a repeated node it is looking at cannot reconstruct this safely from outside.
+    // The index each returned step came from in `path.steps`, carried alongside, so a caller knows which
+    // occurrence of a repeated node it is looking at. A reversed interval has its source at `right` and
+    // its sink at `left`, so reading it backwards gives source to sink.
     std::vector<PathStep> out;
     std::vector<std::size_t> idx;
     out.reserve(interval.right - interval.left + 1);
@@ -161,24 +163,43 @@ std::vector<PathStep> canonical_bubble_path_steps(
         out.push_back(PathStep{step.node_id, !step.reverse});
         idx.push_back(i - 1);
     }
-    if (!out.empty() && (out.front().node_id != bubble.source || out.back().node_id != bubble.sink)) {
-        std::reverse(out.begin(), out.end());
-        std::reverse(idx.begin(), idx.end());
-        for (auto& step : out) {
-            step.reverse = !step.reverse;
-        }
-    }
     if (out_step_indices != nullptr) *out_step_indices = std::move(idx);
     return out;
 }
 
-// Steps of `path` across `bubble` (canonical source->sink). Falls back to an empty interior
-// ([source, sink]) for paths that cross with no inside node (a pure deletion / short side of an
-// insertion), which the inside-node-only interval finder would otherwise drop.
+// Steps of `path` across `bubble` (canonical source->sink), with an empty-interior fallback; see the
+// header.
 std::optional<std::vector<PathStep>> bubble_steps(
     const PathRecord& path, const BubblePathIndex& index, const Bubble& bubble,
-    BubblePathInterval* used_interval, std::vector<std::size_t>* used_step_indices) {
-    const auto iv = find_best_bubble_path_interval(index, bubble);
+    BubblePathInterval* used_interval, std::vector<std::size_t>* used_step_indices, bool inward_only) {
+    // With `inward_only`, a window must leave its first boundary and reach its last through the inward sides:
+    // a walk into the site that turns back and reaches the far boundary from outside does not cross it.
+    const auto inward = [&](const BubblePathInterval& w) {
+        if (!inward_only || bubble.source == bubble.sink) return true;
+        if (w.left >= path.steps.size() || w.right >= path.steps.size()) return false;
+        const bool rl = path.steps[w.left].reverse, rr = path.steps[w.right].reverse;
+        return w.source_to_sink ? rl == bubble.source_reverse && rr == bubble.sink_reverse
+                                : rl != bubble.sink_reverse && rr != bubble.source_reverse;
+    };
+    auto iv = find_best_bubble_path_interval(index, bubble);
+    if (iv.has_value() && !inward(*iv)) {
+        // The widest window runs past a turn at an end; keep the crossings inside it instead. Per direction,
+        // one window from the first crossing with an interior to the last, and the better of the two.
+        iv.reset();
+        const auto inside_positions = collect_inside_positions(index, bubble);
+        const auto crossings = bubble_crossings(path, index, bubble, false);
+        for (const bool fwd : {true, false}) {
+            std::optional<BubblePathInterval> w;
+            for (const BubblePathInterval& c : crossings) {
+                if (c.source_to_sink != fwd || c.right <= c.left + 1) continue;
+                if (!w) w = c;
+                w->right = c.right;
+            }
+            if (!w) continue;
+            w->inside_count = count_inside_between(inside_positions, w->left, w->right);
+            if (w->inside_count > 0 && (!iv || better_interval(*w, *iv))) iv = w;
+        }
+    }
     if (iv.has_value()) {
         std::vector<PathStep> s = canonical_bubble_path_steps(path, bubble, *iv, used_step_indices);
         if (!s.empty()) {
@@ -189,125 +210,91 @@ std::optional<std::vector<PathStep>> bubble_steps(
     const auto si = index.positions.find(bubble.source);
     const auto ki = index.positions.find(bubble.sink);
     if (si == index.positions.end() || ki == index.positions.end()) return std::nullopt;
-    const auto record = [&](std::size_t l, std::size_t r, bool s2s) {
-        if (used_step_indices != nullptr) *used_step_indices = s2s ? std::vector<std::size_t>{l, r}
-                                                                   : std::vector<std::size_t>{r, l};
-        if (used_interval == nullptr) return;
-        used_interval->left = l;
-        used_interval->right = r;
-        used_interval->inside_count = 0;
-        used_interval->source_to_sink = s2s;
-    };
+    // A crossing with nothing between the boundaries is an adjacent pair: source then sink, or sink
+    // then source (flipped). With `inward_only` it must be read through both inward sides as well (see
+    // the header). A path crossing this way more than once gets one window over all its crossings, as
+    // with an interior: `1 3 1 3` is two copies of the deletion, not the deletion.
+    constexpr std::size_t kNone = static_cast<std::size_t>(-1);
+    std::size_t f_first = kNone, f_last = kNone, r_first = kNone, r_last = kNone;
     const std::unordered_set<std::size_t> sink_pos(ki->second.begin(), ki->second.end());
     for (const std::size_t p : si->second) {                 // forward: source then sink
-        if (sink_pos.count(p + 1)) {
-            record(p, p + 1, true);
-            return std::vector<PathStep>{ path.steps[p], path.steps[p + 1] };
-        }
+        if (!sink_pos.count(p + 1)) continue;
+        if (inward_only && (path.steps[p].reverse != bubble.source_reverse ||
+                            path.steps[p + 1].reverse != bubble.sink_reverse)) continue;
+        if (f_first == kNone) f_first = p;
+        f_last = p;
     }
     const std::unordered_set<std::size_t> src_pos(si->second.begin(), si->second.end());
     for (const std::size_t p : ki->second) {                 // reverse: sink then source -> flip
-        if (src_pos.count(p + 1)) {
-            record(p, p + 1, false);
-            return std::vector<PathStep>{
-                PathStep{ path.steps[p + 1].node_id, !path.steps[p + 1].reverse },
-                PathStep{ path.steps[p].node_id, !path.steps[p].reverse } };
-        }
+        if (!src_pos.count(p + 1)) continue;
+        if (inward_only && (path.steps[p].reverse == bubble.sink_reverse ||
+                            path.steps[p + 1].reverse == bubble.source_reverse)) continue;
+        if (r_first == kNone) r_first = p;
+        r_last = p;
     }
-    return std::nullopt;
+    BubblePathInterval ev;
+    if (f_first != kNone) {
+        ev.left = f_first;
+        ev.right = f_last + 1;
+        ev.source_to_sink = true;
+    } else if (r_first != kNone) {
+        ev.left = r_first;
+        ev.right = r_last + 1;
+        ev.source_to_sink = false;
+    } else {
+        return std::nullopt;
+    }
+    ev.inside_count = 0;
+    std::vector<PathStep> s = canonical_bubble_path_steps(path, bubble, ev, used_step_indices);
+    if (s.empty()) return std::nullopt;
+    if (used_interval != nullptr) *used_interval = ev;
+    return s;
 }
 
-std::optional<std::vector<PathStep>> interval_steps(
-    const PathRecord& path,
-    const BubblePathIndex& index,
-    const std::string& from_node,
-    const std::string& to_node) {
-
-    const auto fi = index.positions.find(from_node);
-    const auto ti = index.positions.find(to_node);
-    if (fi == index.positions.end() || ti == index.positions.end()) return std::nullopt;
-
-    // Shortest interval spanning the two boundaries, in either direction.
-    bool found = false;
-    bool forward = true;
-    std::size_t best_left = 0;
-    std::size_t best_right = 0;
-    auto consider = [&](std::size_t l, std::size_t r, bool fwd) {
-        if (r <= l) return;
-        if (!found || (r - l) < (best_right - best_left)) {
-            found = true;
-            forward = fwd;
-            best_left = l;
-            best_right = r;
-        }
-    };
-    for (const std::size_t a : fi->second) {
-        for (const std::size_t b : ti->second) {
-            if (b > a) consider(a, b, true);
-        }
-    }
-    if (!found) {
-        for (const std::size_t b : ti->second) {
-            for (const std::size_t a : fi->second) {
-                if (a > b) consider(b, a, false);
-            }
+// Every crossing, in path order; see the header for the rule. Callers that edit or spell each crossing need
+// them apart: one window over two crossings would also take in the stretch between them.
+std::vector<BubblePathInterval> bubble_crossings(const PathRecord& path, const BubblePathIndex& index,
+                                                 const Bubble& bubble, bool fallback) {
+    std::vector<BubblePathInterval> out;
+    const auto si = index.positions.find(bubble.source);
+    const auto ki = index.positions.find(bubble.sink);
+    // A table without orientations gives none to test: its default would pick crossings at random.
+    const bool oriented = bubble.orientation_known || !fallback;
+    if (oriented && bubble.source != bubble.sink && si != index.positions.end() && ki != index.positions.end()) {
+        std::vector<std::pair<std::size_t, bool>> hits;   // (step, is_source), in path order
+        hits.reserve(si->second.size() + ki->second.size());
+        for (const std::size_t p : si->second) hits.emplace_back(p, true);
+        for (const std::size_t p : ki->second) hits.emplace_back(p, false);
+        std::sort(hits.begin(), hits.end());
+        for (std::size_t k = 0; k + 1 < hits.size(); ++k) {
+            const auto [pa, a_src] = hits[k];
+            const auto [pb, b_src] = hits[k + 1];
+            if (a_src == b_src) continue;
+            const bool ra = path.steps[pa].reverse, rb = path.steps[pb].reverse;
+            const bool fwd = a_src && ra == bubble.source_reverse && rb == bubble.sink_reverse;
+            const bool bwd = !a_src && ra != bubble.sink_reverse && rb != bubble.source_reverse;
+            if (!fwd && !bwd) continue;
+            BubblePathInterval iv;
+            iv.left = pa;
+            iv.right = pb;
+            iv.inside_count = pb - pa - 1;
+            iv.source_to_sink = fwd;
+            out.push_back(iv);
         }
     }
-    if (!found) return std::nullopt;
-
-    std::vector<PathStep> out;
-    out.reserve(best_right - best_left + 1);
-    if (forward) {
-        for (std::size_t i = best_left; i <= best_right; ++i) out.push_back(path.steps[i]);
-    } else {
-        for (std::size_t i = best_right + 1; i > best_left; --i) {
-            const PathStep& s = path.steps[i - 1];
-            out.push_back(PathStep{s.node_id, !s.reverse});
-        }
+    if (out.empty() && fallback) {
+        BubblePathInterval used{};
+        if (bubble_steps(path, index, bubble, &used).has_value()) out.push_back(used);
     }
     return out;
 }
 
-std::optional<std::vector<PathStep>> interval_interior_steps(
-    const PathRecord& path,
-    const BubblePathIndex& index,
-    const std::string& from_node,
-    const std::string& to_node) {
-
-    auto full = interval_steps(path, index, from_node, to_node);
-    if (!full.has_value() || full->size() <= 2) return std::nullopt;
-    return std::vector<PathStep>(full->begin() + 1, full->end() - 1);
-}
-
-std::optional<std::vector<PathStep>> flank_steps(
-    const PathRecord& path,
-    const BubblePathIndex& index,
-    const std::string& boundary_node,
-    bool leading) {
-
-    const auto it = index.positions.find(boundary_node);
-    if (it == index.positions.end() || it->second.empty()) return std::nullopt;
-
-    // A path may run through the graph in either direction; the boundary node's own orientation says
-    // which. When it is reversed, the reference-upstream flank sits AFTER the boundary in path order.
-    const std::size_t pos = leading ? it->second.front() : it->second.back();
-    const bool rev = path.steps[pos].reverse;
-    const bool take_prefix = leading != rev;
-
-    std::vector<PathStep> out;
-    if (take_prefix) {
-        if (pos == 0) return std::nullopt;
-        out.assign(path.steps.begin(), path.steps.begin() + static_cast<long>(pos));
-    } else {
-        if (pos + 1 >= path.steps.size()) return std::nullopt;
-        out.assign(path.steps.begin() + static_cast<long>(pos) + 1, path.steps.end());
-    }
-    if (out.empty()) return std::nullopt;
-    if (rev) {
-        std::reverse(out.begin(), out.end());
-        for (PathStep& st : out) st.reverse = !st.reverse;
-    }
-    return out;
+bool bubble_orientation_holds(const std::vector<PathRecord>& paths, const std::vector<BubblePathIndex>& indexes,
+                              const Bubble& bubble) {
+    if (!bubble.orientation_known) return false;
+    for (std::size_t pi = 0; pi < paths.size(); ++pi)
+        if (!bubble_crossings(paths[pi], indexes[pi], bubble, false).empty()) return true;
+    return false;
 }
 
 } // namespace panvar

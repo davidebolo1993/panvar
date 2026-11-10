@@ -3,28 +3,22 @@ name: ci
 on:
   push:
   pull_request:
-  # The slow rebuild suite costs about eight minutes and drives minigraph, so it runs on a schedule
-  # and on demand rather than on every push.
+  # The slow suites and the Docker image take minutes: weekly and on demand.
   schedule:
     - cron: "0 5 * * 1"
   workflow_dispatch:
 
 jobs:
-  # The release contract: a clean tree, the default suite, and an INSTALLED binary that
-  # runs outside the build directory. Linux matters beyond "another compiler" -- minigraph's symbols
-  # are localized against minimap2 through a separate ELF path (cmake/minigraph_exports_elf.txt), so
-  # the Mach-O result says nothing about it.
+  # Build, the default suites, and the installed binary run from elsewhere. Linux and
+  # macOS link minigraph against minimap2 differently (cmake/minigraph_exports_*.txt), so both run.
   build-and-test:
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
-
     runs-on: ${{ matrix.os }}
-
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
           submodules: recursive
 
@@ -36,8 +30,7 @@ jobs:
 
       - name: Install build dependencies (macOS)
         if: runner.os == 'macOS'
-        run: |
-          brew install cmake zlib || true
+        run: brew install cmake zlib || true
 
       - name: Configure
         run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$PWD/_install"
@@ -48,29 +41,26 @@ jobs:
       - name: Test
         run: ctest --test-dir build --output-on-failure
 
-      - name: No tracked script may hardcode a developer's interpreter path
+      - name: No script hardcodes a developer's interpreter path
         shell: bash
         run: |
-          # A registered test that shells out to /home/<someone>/miniconda3/bin/python passes on one
-          # machine and fails everywhere else, for a reason unrelated to what it tests.
-          if git ls-files 'tests/*.sh' 'scripts/*' | xargs grep -nE '(~|\$HOME|/home/[a-z]+|/Users/[a-z.]+)/[a-zA-Z0-9_.-]*(conda|env)[a-zA-Z0-9_.-]*/bin/' 2>/dev/null; then
+          if git ls-files 'tests/*.sh' 'scripts/*' 'dev/*' | xargs grep -nE '(~|\$HOME|/home/[a-z]+|/Users/[a-z.]+)/[a-zA-Z0-9_.-]*(conda|env)[a-zA-Z0-9_.-]*/bin/' 2>/dev/null; then
             echo "hardcoded interpreter path above; use PATH or an overridable variable" >&2
             exit 1
           fi
-          echo "no hardcoded interpreter paths"
 
       - name: Install, then run the installed binary from elsewhere
         shell: bash
         run: |
           cmake --install build
-          echo "installed files:"; find _install -type f | sort
+          find _install -type f | sort
           cd /
           "$GITHUB_WORKSPACE/_install/bin/panvar" --help > /dev/null
           "$GITHUB_WORKSPACE/_install/bin/panvar" bubble --help > /dev/null
 
-  # The rebuild suite is the only test that drives minigraph end to end, and the only one that would
-  # catch an ELF symbol-localization regression at runtime rather than at link time.
-  slow-rebuild:
+  # The slow suites: rebuild drives minigraph end to end, the only runtime check of its symbol
+  # localization on Linux.
+  slow:
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     strategy:
       fail-fast: false
@@ -88,3 +78,25 @@ jobs:
       - run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DPANVAR_SLOW_TESTS=ON
       - run: cmake --build build -j
       - run: ctest --test-dir build --output-on-failure
+
+  # The image builds, and the binary and every bundled tool start in it.
+  docker:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - run: docker build -t panvar:ci .
+      - name: Tools in the image
+        run: |
+          docker run --rm panvar:ci bubble --help > /dev/null
+          docker run --rm -i --entrypoint /usr/local/bin/_entrypoint.sh panvar:ci bash -s <<'EOF'
+          set -e
+          for t in vg odgi bcftools bgzip tabix minimap2 k8 paftools.js samtools svim-asm truvari gemma column python3 Rscript; do
+            command -v "$t" > /dev/null || { echo "missing: $t"; exit 1; }
+          done
+          python3 -c 'import numpy'
+          Rscript -e 'for (p in c("ggplot2", "ggrepel", "data.table", "shiny", "plotly", "SKAT", "SPAtest", "susieR")) library(p, character.only = TRUE)'
+          echo "all tools present"
+          EOF

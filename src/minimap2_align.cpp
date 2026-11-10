@@ -120,6 +120,7 @@ Minimap2Hit minimap2_best_hit(
         &map_opt,
         query_name.c_str());
     if (regs == nullptr || n_regs <= 0) {
+        std::free(regs);   // mm_map can return a live buffer with no hits; free(nullptr) is a no-op
         mm_tbuf_destroy(tbuf);
         mm_idx_destroy(idx);
         return out;
@@ -168,6 +169,22 @@ std::vector<Minimap2Hit> minimap2_hits(
     const std::string& target_seq,
     const std::string& preset,
     std::size_t best_n) {
+    Minimap2Params params;
+    params.preset = preset;
+    params.best_n = best_n;
+    // Keep moderately low-scoring secondaries, so a partial or truncated paralog copy still surfaces as
+    // its own hit -- without admitting so many weak hits that they steal loci in the competition and
+    // blur the separation between neighbouring paralogs.
+    params.pri_ratio = 0.5f;
+    return minimap2_hits(query_name, query_seq, target_name, target_seq, params);
+}
+
+std::vector<Minimap2Hit> minimap2_hits(
+    const std::string& query_name,
+    const std::string& query_seq,
+    const std::string& target_name,
+    const std::string& target_seq,
+    const Minimap2Params& params) {
 
     std::vector<Minimap2Hit> hits;
     if (query_seq.empty() || target_seq.empty()) return hits;
@@ -179,22 +196,22 @@ std::vector<Minimap2Hit> minimap2_hits(
     mm_idxopt_t idx_opt;
     mm_mapopt_t map_opt;
     if (mm_set_opt(nullptr, &idx_opt, &map_opt) < 0) return hits;
-    const std::string chosen = preset.empty() ? std::string("asm20") : preset;
+    const std::string chosen = params.preset.empty() ? std::string("asm20") : params.preset;
     if (mm_set_opt(chosen.c_str(), &idx_opt, &map_opt) < 0) return hits;
     map_opt.flag |= (MM_F_CIGAR | MM_F_EQX);
     map_opt.flag &= ~MM_F_OUT_SAM;
-    // Keep secondary alignments (one per paralog copy in the target) and raise the cap.
+    if (params.self) map_opt.flag |= (MM_F_NO_DIAG | MM_F_ALL_CHAINS);
+    // Keep secondary alignments (one per copy in the target) and raise the cap.
     const int want = static_cast<int>(std::min<std::size_t>(
         static_cast<std::size_t>(std::numeric_limits<int>::max()),
-        std::max<std::size_t>(static_cast<std::size_t>(1), best_n)));
+        std::max<std::size_t>(static_cast<std::size_t>(1), params.best_n)));
     map_opt.best_n = std::max(map_opt.best_n, want);
-    // Keep moderately low-scoring secondaries, so a partial or truncated paralog copy still surfaces as
-    // its own hit -- without admitting so many weak hits that they steal loci in the competition and
-    // blur the separation between neighbouring paralogs.
-    map_opt.pri_ratio = 0.5f;
+    map_opt.pri_ratio = params.pri_ratio;
 
+    // In self mode both carry one name: minimap2 recognises the diagonal by it.
+    const std::string& tname = params.self ? query_name : target_name;
     const char* seq_ptrs[1] = {target_seq.c_str()};
-    const char* name_ptrs[1] = {target_name.c_str()};
+    const char* name_ptrs[1] = {tname.c_str()};
     mm_idx_t* idx = mm_idx_str(idx_opt.w, idx_opt.k,
                                (idx_opt.flag & MM_I_HPC) != 0 ? 1 : 0,
                                idx_opt.bucket_bits, 1, seq_ptrs, name_ptrs);

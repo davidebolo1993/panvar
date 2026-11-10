@@ -80,6 +80,18 @@ std::vector<std::string> poa_msa(const std::vector<std::string>& seqs) {
             }
         }
     }
+    // abPOA only places the gaps: it reads anything but ACGT as N and writes upper case. Each row gets its own
+    // bytes back over its non-gap columns, so soft-masked and IUPAC bases come through unchanged.
+    for (int i = 0; i < m; ++i) {
+        const std::string& s = seqs[nonempty[i]];
+        std::string& r = rows[nonempty[i]];
+        std::size_t k = 0;
+        for (char& c : r) {
+            if (c == '-') continue;
+            if (k == s.size()) break;
+            c = s[k++];
+        }
+    }
 
     for (int i = 0; i < m; ++i) std::free(bseqs[i]);
     std::free(bseqs);

@@ -16,9 +16,9 @@
 
 int main(int argc, char** argv) {
     try {
-        if (argc <= 1) {
+        if (argc <= 1) {   // as each command does when run bare
             panvar::cli::print_general_help();
-            return 1;
+            return 0;
         }
 
         const std::string subcommand = argv[1];
@@ -29,8 +29,12 @@ int main(int argc, char** argv) {
             args.emplace_back(argv[i]);
         }
 
-        if (subcommand == "-h" || subcommand == "--help") {
+        if (subcommand == "-h" || subcommand == "--help" || subcommand == "help") {
             panvar::cli::print_general_help();
+            return 0;
+        }
+        if (subcommand == "-V" || subcommand == "--version" || subcommand == "version") {
+            std::cout << "panvar " << PANVAR_VERSION << '\n';
             return 0;
         }
 
@@ -62,7 +66,7 @@ int main(int argc, char** argv) {
             return panvar::run_associate_command(args);
         }
 
-        throw std::runtime_error("Unknown subcommand: " + subcommand);
+        throw std::runtime_error("unknown command: " + subcommand + " (run 'panvar --help' for the list)");
     } catch (const std::exception& e) {
         std::cerr << "Error: " << e.what() << '\n';
         return 2;

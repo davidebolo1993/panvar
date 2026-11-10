@@ -1,8 +1,10 @@
 #include "panvar/graph_utils.hpp"
+#include "panvar/ref_path.hpp"
 
 #include <cctype>
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <stdexcept>
 
@@ -20,15 +22,6 @@ std::uint64_t hash_step_token(const PathStep& step) {
     return h;
 }
 
-std::vector<std::uint64_t> build_walk_tokens(const std::vector<PathStep>& steps) {
-    std::vector<std::uint64_t> tokens;
-    tokens.reserve(steps.size());
-    for (const auto& step : steps) {
-        tokens.push_back(hash_step_token(step));
-    }
-    return tokens;
-}
-
 std::string build_walk_signature(const std::vector<PathStep>& steps) {
     std::string sig;
     sig.reserve(steps.size() * 8);
@@ -40,15 +33,6 @@ std::string build_walk_signature(const std::vector<PathStep>& steps) {
         sig.push_back(steps[i].reverse ? '-' : '+');
     }
     return sig;
-}
-
-std::unordered_map<std::string, const PathRecord*> path_records_by_name(const Graph& graph) {
-    std::unordered_map<std::string, const PathRecord*> out;
-    out.reserve(graph.paths.size() * 2);
-    for (const auto& path : graph.paths) {
-        out[path.name] = &path;
-    }
-    return out;
 }
 
 std::vector<std::size_t> path_prefix_bp(
@@ -64,31 +48,28 @@ std::vector<std::size_t> path_prefix_bp(
     return pref;
 }
 
+// Every IUPAC code has a complement (R<->Y, K<->M, B<->V, D<->H; S, W and N are their own), and case is
+// kept, so a reverse-oriented segment spells what the path holds, ambiguity codes and soft-masking
+// included. A character that is not a base (e.g. '-') becomes N.
 std::string reverse_complement(const std::string& sequence) {
+    static const auto table = [] {
+        std::array<char, 256> t{};
+        t.fill('N');
+        const char* from = "ACGTRYKMBVDHSWN";
+        const char* to   = "TGCAYRMKVBHDSWN";
+        for (int i = 0; from[i] != '\0'; ++i) {
+            t[static_cast<unsigned char>(from[i])] = to[i];
+            t[static_cast<unsigned char>(std::tolower(static_cast<unsigned char>(from[i])))] =
+                static_cast<char>(std::tolower(static_cast<unsigned char>(to[i])));
+        }
+        t[static_cast<unsigned char>('U')] = 'A';
+        t[static_cast<unsigned char>('u')] = 'a';
+        return t;
+    }();
     std::string rc;
     rc.reserve(sequence.size());
     for (auto it = sequence.rbegin(); it != sequence.rend(); ++it) {
-        switch (*it) {
-            case 'A':
-            case 'a':
-                rc.push_back('T');
-                break;
-            case 'C':
-            case 'c':
-                rc.push_back('G');
-                break;
-            case 'G':
-            case 'g':
-                rc.push_back('C');
-                break;
-            case 'T':
-            case 't':
-                rc.push_back('A');
-                break;
-            default:
-                rc.push_back('N');
-                break;
-        }
+        rc.push_back(table[static_cast<unsigned char>(*it)]);
     }
     return rc;
 }
@@ -138,21 +119,16 @@ std::unordered_set<std::string> self_loop_nodes(const Graph& graph) {
 std::string resolve_reference_path_name(const Graph& graph, const std::string& query,
                                         const std::string& module) {
     if (query.empty()) return query;
-    for (const PathRecord& p : graph.paths) {
-        if (p.name == query) return p.name;
-    }
-    const auto lower = [](std::string t) {
-        std::transform(t.begin(), t.end(), t.begin(),
-                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-        return t;
-    };
-    const std::string q = lower(query);
+    std::vector<std::string> names;
+    for (const PathRecord& p : graph.paths) names.push_back(p.name);
     std::vector<std::string> hits;
-    for (const PathRecord& p : graph.paths) {
-        if (lower(p.name).find(q) != std::string::npos) hits.push_back(p.name);
-    }
+    for (const std::size_t i : match_reference_name(names, query)) hits.push_back(names[i]);
     if (hits.size() == 1) return hits[0];
     if (hits.empty()) {
+        // A W line named by its own (0-based) coordinates, which panvar names from start + 1.
+        const std::string w = w_literal_as_path_name(query);
+        for (const PathRecord& p : graph.paths)
+            if (!w.empty() && p.type == 'W' && p.name == w) return p.name;
         throw std::runtime_error(module + ": reference path not found: " + query);
     }
     std::string msg = module + ": reference path ambiguous: " + query + " matches:";
@@ -160,9 +136,16 @@ std::string resolve_reference_path_name(const Graph& graph, const std::string& q
     throw std::runtime_error(msg);
 }
 
+void require_graph_paths(std::size_t segments, std::size_t paths, const std::string& module) {
+    if (paths > 0) return;
+    if (segments == 0)
+        throw std::runtime_error(module + ": input GFA has no segments and no paths (an empty file, or not GFA)");
+    throw std::runtime_error(module + ": input GFA has no P/W paths; panvar reads the haplotypes' walks");
+}
+
 void validate_graph_paths(const Graph& graph, const std::string& module,
                           bool require_sequences, bool require_zero_overlaps) {
-    if (graph.paths.empty()) throw std::runtime_error(module + ": input GFA has no P/W paths");
+    require_graph_paths(graph.nodes.size(), graph.paths.size(), module);
     std::unordered_set<std::string> seen;
     for (const PathRecord& p : graph.paths) {
         if (p.name.empty()) throw std::runtime_error(module + ": input GFA has a path with no name");

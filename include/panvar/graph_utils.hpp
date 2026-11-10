@@ -13,8 +13,7 @@
 
 namespace panvar {
 
-// Union-find with path compression + union by rank. Shared by the walk clustering in
-// `inspect` and the connected-component event merging in `call`.
+// Union-find with path compression + union by rank, for the connected-component event merging in `call`.
 struct DisjointSet {
     explicit DisjointSet(std::size_t n) : parent(n), rank(n, 0) {
         std::iota(parent.begin(), parent.end(), std::size_t{0});
@@ -44,7 +43,6 @@ struct DisjointSet {
     std::vector<unsigned char> rank;
 };
 
-std::unordered_map<std::string, const PathRecord*> path_records_by_name(const Graph& graph);
 std::vector<std::size_t> path_prefix_bp(
     const PathRecord& path,
     const std::unordered_map<std::string, Node>& nodes);
@@ -54,25 +52,28 @@ std::string spell_path_steps_sequence(
     const std::vector<PathStep>& steps,
     bool* complete = nullptr);
 
-// Walk identity helpers shared across modules: a stable per-step hash token, the
-// token vector for a walk, and a human-readable "id+/id-" signature string.
+// Walk identity helpers shared across modules: a stable per-step hash token and a human-readable
+// "id+/id-" signature string.
 std::uint64_t hash_step_token(const PathStep& step);
-std::vector<std::uint64_t> build_walk_tokens(const std::vector<PathStep>& steps);
 std::string build_walk_signature(const std::vector<PathStep>& steps);
 
-// Nodes carrying a self-loop edge (a panphorte REP, or any tandem-unit node): these are
-// copy-number loci even when a haplotype traverses them only once. Re-derive this from the graph
-// rather than trusting `Bubble::cyclic`, which `bubbles.csv` does not round-trip.
+// Nodes carrying a self-loop edge (a panphorte unit, or any tandem-unit node): these are
+// copy-number loci even when a haplotype traverses them only once. Read from the graph's edges, since
+// `bubbles.csv` does not record it.
 std::unordered_set<std::string> self_loop_nodes(const Graph& graph);
 
-// Resolve a reference path QUERY to an exact path name: exact match, else a unique case-insensitive
-// substring match. Ambiguity and absence are errors, never resolved by file order.
+// Resolve a reference path QUERY to an exact path name by match_reference_name (ref_path.hpp), or a W line
+// named by its own coordinates. Ambiguity and absence are errors, never resolved by file order.
 //
 // Every consumer compares path names exactly, so a module that accepts a loose query and then passes
 // the QUERY on has silently resolved nothing: boundaries come back unoriented, reference allele support
 // reads 0, and nothing says so. Resolve once, at the edge, and pass the resolved name inward.
 std::string resolve_reference_path_name(const Graph& graph, const std::string& query,
                                         const std::string& module);
+
+// Refuses a graph with no P/W paths, as every module reads the haplotypes' walks; a file with no segments
+// either is named as empty.
+void require_graph_paths(std::size_t segments, std::size_t paths, const std::string& module);
 
 // One authoritative check that a graph is safe to reason about, shared by every module that reads
 // paths. Each condition, left unchecked, gives a silently WRONG answer rather than a failure: a step

@@ -1,6 +1,8 @@
 #include "panvar/graph_sort.hpp"
 
+#include "panvar/gfa.hpp"
 #include "panvar/graph_utils.hpp" // reverse_complement
+#include "panvar/ref_path.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -9,6 +11,7 @@
 #include <functional>
 #include <limits>
 #include <queue>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -20,30 +23,26 @@ namespace panvar {
 
 std::string gfa_path_name(const GfaPath& p) {
     if (p.type == 'W') {
-        return p.sample + "#" + p.hap + "#" + p.seqid + ":" + p.start + "-" + p.end;
+        return w_path_name(p.sample, p.hap, p.seqid, p.start, p.end);
     }
     return p.name;
 }
 
 namespace {
 
-std::string to_lower(std::string s) {
-    for (char& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-    return s;
-}
-
-// Resolve the reference path: exact name first, else a unique case-insensitive substring.
+// Resolve the reference path as every module does (match_reference_name).
 std::size_t resolve_reference(const GfaModel& model, const std::string& query) {
-    for (std::size_t i = 0; i < model.paths.size(); ++i) {
-        if (gfa_path_name(model.paths[i]) == query) return i;
-    }
-    const std::string q = to_lower(query);
-    std::vector<std::size_t> hits;
-    for (std::size_t i = 0; i < model.paths.size(); ++i) {
-        if (to_lower(gfa_path_name(model.paths[i])).find(q) != std::string::npos) hits.push_back(i);
-    }
+    std::vector<std::string> names;
+    for (const GfaPath& p : model.paths) names.push_back(gfa_path_name(p));
+    const std::vector<std::size_t> hits = match_reference_name(names, query);
     if (hits.size() == 1) return hits[0];
-    if (hits.empty()) throw std::runtime_error("Reference path not found: " + query);
+    if (hits.empty()) {
+        // A W line named by its own (0-based) coordinates, which panvar names from start + 1.
+        const std::string w = w_literal_as_path_name(query);
+        for (std::size_t i = 0; !w.empty() && i < model.paths.size(); ++i)
+            if (model.paths[i].type == 'W' && gfa_path_name(model.paths[i]) == w) return i;
+        throw std::runtime_error("Reference path not found: " + query);
+    }
     std::string msg = "Reference path ambiguous: " + query + " matches:";
     for (std::size_t i : hits) msg += "\n  " + gfa_path_name(model.paths[i]);
     throw std::runtime_error(msg);
@@ -140,18 +139,43 @@ GraphSortResult sort_graph_reference(GfaModel& model, const GraphSortOptions& op
         for (const std::string& id : model.node_order) bucket.emplace(id, INF);
     }
 
-    // Directed arcs from all path walks (consecutive steps), for Kahn's topological order.
-    std::unordered_map<std::string, std::unordered_set<std::string>> succ;
-    std::unordered_map<std::string, std::size_t> indeg;
-    indeg.reserve(model.node_order.size() * 2);
-    for (const std::string& id : model.node_order) indeg[id] = 0;
-    for (const GfaPath& p : model.paths) {
-        for (std::size_t i = 1; i < p.steps.size(); ++i) {
-            const std::string& a = p.steps[i - 1].node_id;
-            const std::string& b = p.steps[i].node_id;
-            if (a == b) continue; // ignore self-arcs (tandem repeats)
-            if (!model.has_node(a) || !model.has_node(b)) continue;
-            if (succ[a].insert(b).second) indeg[b] += 1;
+    // Directed arcs from all path walks, in WALK direction. A step pair `a+ b+` says a precedes b, and
+    // `b- a-` says the same thing walked backwards; reading the second as "b before a" would turn every
+    // node a reverse-stored haplotype covers into a 2-cycle against the reference. A pair that switches
+    // orientation takes its direction from whichever node is on the reference: after the flip above a
+    // reference node reads forward along the reference, so its step orientation says which way the path
+    // is moving there. That gives an arc to an off-reference allele node stored opposite to its flanks
+    // (in `5- 1+ 2-`, 1 lies between 2 and 5), so it is numbered inside its own site.
+    // Two reference nodes in opposite orientations are a genuine inversion and state no order.
+    const std::size_t n = model.node_order.size();
+    std::unordered_map<std::string, std::size_t> idx;
+    idx.reserve(n * 2);
+    for (std::size_t i = 0; i < n; ++i) idx.emplace(model.node_order[i], i);
+    std::vector<std::vector<std::size_t>> succ(n);
+    {
+        std::unordered_set<std::uint64_t> seen_arc;
+        for (const GfaPath& p : model.paths) {
+            for (std::size_t i = 1; i < p.steps.size(); ++i) {
+                const PathStep& s0 = p.steps[i - 1];
+                const PathStep& s1 = p.steps[i];
+                if (s0.node_id == s1.node_id) continue;          // self-arc (tandem repeat)
+                const auto ia = idx.find(s0.node_id), ib = idx.find(s1.node_id);
+                if (ia == idx.end() || ib == idx.end()) continue;
+                // Orientation relative to the reference's reading of the node. After the flip the
+                // reference reads every one of its nodes forward; with --no-flip it still reads some
+                // reversed, which are numbered along the reference only when read this way.
+                const bool rev0 = s0.reverse != (!options.flip && ref_reverse.count(s0.node_id) && ref_reverse.at(s0.node_id));
+                const bool rev1 = s1.reverse != (!options.flip && ref_reverse.count(s1.node_id) && ref_reverse.at(s1.node_id));
+                bool backwards = rev0;                           // walking against the reference
+                if (rev0 != rev1) {
+                    const bool r0 = ref_rank.count(s0.node_id) != 0, r1 = ref_rank.count(s1.node_id) != 0;
+                    if (r0 == r1) continue;                      // inversion (or no anchor): no order
+                    backwards = r0 ? rev0 : rev1;
+                }
+                const std::size_t from = backwards ? ib->second : ia->second;
+                const std::size_t to = backwards ? ia->second : ib->second;
+                if (seen_arc.insert((static_cast<std::uint64_t>(from) << 32) | to).second) succ[from].push_back(to);
+            }
         }
     }
 
@@ -164,50 +188,92 @@ GraphSortResult sort_graph_reference(GfaModel& model, const GraphSortOptions& op
             if (num != o.num) return num > o.num;
             return id > o.id;
         }
+        bool operator<(const Key& o) const { return o > *this; }
     };
-    auto make_key = [&](const std::string& id) { return Key{bucket[id], id_num(id), id}; };
-    std::priority_queue<Key, std::vector<Key>, std::greater<Key>> ready;
-    for (const std::string& id : model.node_order) {
-        if (indeg[id] == 0) ready.push(make_key(id));
-    }
+    std::vector<Key> key(n);
+    for (std::size_t i = 0; i < n; ++i) key[i] = Key{bucket[model.node_order[i]], id_num(model.node_order[i]), model.node_order[i]};
 
-    std::vector<std::string> order;
-    order.reserve(model.node_order.size());
-    std::unordered_set<std::string> emitted;
-    emitted.reserve(model.node_order.size() * 2);
-    auto emit = [&](const std::string& u) {
-        order.push_back(u);
-        emitted.insert(u);
-        const auto si = succ.find(u);
-        if (si == succ.end()) return;
-        for (const std::string& v : si->second) {
-            if (indeg[v] > 0 && --indeg[v] == 0) ready.push(make_key(v));
-        }
-    };
-    while (order.size() < model.node_order.size()) {
-        if (!ready.empty()) {
-            const Key k = ready.top();
-            ready.pop();
-            if (emitted.count(k.id)) continue;
-            emit(k.id);
-        } else {
-            // cycle: break by emitting the remaining node with the smallest key.
-            std::string best;
-            Key bk{INF, std::numeric_limits<std::uint64_t>::max(), ""};
-            bool found = false;
-            for (const std::string& id : model.node_order) {
-                if (emitted.count(id)) continue;
-                const Key k = make_key(id);
-                if (!found || bk > k) {
-                    bk = k;
-                    best = id;
-                    found = true;
+    // Nodes on a cycle (a tandem repeat, a reference that revisits a region) cannot be ordered among
+    // themselves by the walks, so each strongly connected component is placed as one block: blocks in
+    // topological order, the smallest key first among those ready, and the nodes inside a block by key.
+    // Breaking a cycle only when nothing else is ready would hold a stalled node back until every node
+    // downstream of it is numbered, placing a repeat block after the unique flank that follows it.
+    std::vector<std::size_t> comp(n, SIZE_MAX);
+    std::size_t n_comp = 0;
+    {   // Tarjan, iterative
+        std::vector<std::size_t> index_of(n, SIZE_MAX), low(n, 0), stack;
+        std::vector<char> on_stack(n, 0);
+        std::size_t counter = 0;
+        struct Frame { std::size_t v, next; };
+        for (std::size_t root = 0; root < n; ++root) {
+            if (index_of[root] != SIZE_MAX) continue;
+            std::vector<Frame> call{{root, 0}};
+            index_of[root] = low[root] = counter++;
+            stack.push_back(root);
+            on_stack[root] = 1;
+            while (!call.empty()) {
+                Frame& f = call.back();
+                if (f.next < succ[f.v].size()) {
+                    const std::size_t w = succ[f.v][f.next++];
+                    if (index_of[w] == SIZE_MAX) {
+                        index_of[w] = low[w] = counter++;
+                        stack.push_back(w);
+                        on_stack[w] = 1;
+                        call.push_back({w, 0});
+                    } else if (on_stack[w]) {
+                        low[f.v] = std::min(low[f.v], index_of[w]);
+                    }
+                    continue;
                 }
+                const std::size_t v = f.v;
+                if (low[v] == index_of[v]) {
+                    std::size_t w;
+                    do {
+                        w = stack.back();
+                        stack.pop_back();
+                        on_stack[w] = 0;
+                        comp[w] = n_comp;
+                    } while (w != v);
+                    ++n_comp;
+                }
+                call.pop_back();
+                if (!call.empty()) low[call.back().v] = std::min(low[call.back().v], low[v]);
             }
-            if (!found) break;
-            emit(best);
         }
     }
+    std::vector<std::vector<std::size_t>> members(n_comp);
+    for (std::size_t i = 0; i < n; ++i) members[comp[i]].push_back(i);
+    std::vector<Key> comp_key(n_comp);
+    for (std::size_t c = 0; c < n_comp; ++c) {
+        std::sort(members[c].begin(), members[c].end(), [&](std::size_t a, std::size_t b) { return key[a] < key[b]; });
+        comp_key[c] = key[members[c].front()];
+    }
+    std::vector<std::vector<std::size_t>> comp_succ(n_comp);
+    std::vector<std::size_t> comp_indeg(n_comp, 0);
+    {
+        std::unordered_set<std::uint64_t> seen;
+        for (std::size_t v = 0; v < n; ++v)
+            for (const std::size_t w : succ[v]) {
+                const std::size_t a = comp[v], b = comp[w];
+                if (a == b || !seen.insert((static_cast<std::uint64_t>(a) << 32) | b).second) continue;
+                comp_succ[a].push_back(b);
+                ++comp_indeg[b];
+            }
+    }
+    using CompItem = std::pair<Key, std::size_t>;
+    auto later = [](const CompItem& x, const CompItem& y) { return x.first > y.first; };
+    std::priority_queue<CompItem, std::vector<CompItem>, decltype(later)> ready(later);
+    for (std::size_t c = 0; c < n_comp; ++c) if (comp_indeg[c] == 0) ready.push({comp_key[c], c});
+    std::vector<std::string> order;
+    order.reserve(n);
+    while (!ready.empty()) {
+        const std::size_t c = ready.top().second;
+        ready.pop();
+        for (const std::size_t v : members[c]) order.push_back(model.node_order[v]);
+        for (const std::size_t d : comp_succ[c]) if (--comp_indeg[d] == 0) ready.push({comp_key[d], d});
+    }
+    result.cycle_blocks = 0;
+    for (std::size_t c = 0; c < n_comp; ++c) result.cycle_blocks += members[c].size() > 1;
 
     // ---- 3. renumber 1..N in sorted order ---------------------------------------------
     if (options.renumber) {

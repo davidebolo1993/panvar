@@ -2,25 +2,21 @@
 
 Documentation for the `panvar` CLI.
 
-| folder / file | what's in it |
-|---------------|--------------|
-| **[modules/](modules/)** | one short usage page per module: what it does, inputs, key options, outputs, limitations. |
-| **[algorithms/](algorithms/)** | how each module works and how its options change the result. |
-| **[walkthrough.md](walkthrough.md)** | the whole pipeline on one real locus, step by step with commands and plots. |
-| **[gwas.md](gwas.md)** | the association worked example on that locus: phenotype, multiple-testing correction, structure control. |
-| **[references.md](references.md)** | tools and papers behind each module. |
-
 ## Pipeline
 
-`[rebuild] → bubble → panphorte → [refine] → call → describe → associate`, plus the `inspect` and `benchmark` utilities.
+`[rebuild] → bubble → panphorte → refine → call → describe → associate`, plus the `inspect` and `benchmark` utilities.
 
-1. [modules/rebuild.md](modules/rebuild.md) — (opt-in) re-induce a locus graph too fragmented to decompose, before bubble finding.
-2. [modules/bubble.md](modules/bubble.md) — bubble-site extraction from a GFA.
-3. [modules/panphorte.md](modules/panphorte.md) — normalize tandem-repeat bubbles into a copy-number-explicit GFA.
-4. [modules/refine.md](modules/refine.md) — (opt-in) POA-realign bubble interiors to remove graph-builder alignment artifacts.
-5. [modules/call.md](modules/call.md) — graph-native SV calling (DEL/INS/INV/DUP), with an interpreted region VCF and an optional explicit-allele VCF.
-6. [modules/describe.md](modules/describe.md) — per-bubble variant, k-mer and node/edge features.
-7. [modules/associate.md](modules/associate.md) — association testing on the `describe` features.
+### Main modules
 
-- [modules/inspect.md](modules/inspect.md) — clustering, path FASTA, and node/edge matrices for a called bubble.
-- [modules/benchmark.md](modules/benchmark.md) — truth-event discovery, carrier assignment, and sequence reconstruction from caller output.
+1. [rebuild.md](rebuild.md) — re-induce a locus graph too fragmented to decompose
+2. [bubble.md](bubble.md) — bubble-site extraction from a GFA
+3. [panphorte.md](panphorte.md) — normalize tandem-repeat bubbles
+4. [refine.md](refine.md) — POA-realign bubble interiors
+5. [call.md](call.md) — graph-native SV calling (DEL/INS/INV/SUB, CNV)
+6. [describe.md](describe.md) — per-bubble variant, k-mer and node/edge features.
+7. [associate.md](associate.md) — association testing on the `describe` features
+
+### Utilities
+
+- [inspect.md](inspect.md) — clustering, path FASTA, and node/edge matrices for a called bubble.
+- [benchmark.md](benchmark.md) — haplotypes' large variation call's output accounts for

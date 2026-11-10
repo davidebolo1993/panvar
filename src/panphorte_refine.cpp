@@ -99,11 +99,10 @@ std::optional<Interior> interior_between(const Steps& steps, const std::string& 
     return out;
 }
 
-// A path's interior split around its ARRAY BLOCK: every step from the first REP step to the last -- the
-// folded copies and whatever folding left between them. The block is kept verbatim and never realigned:
-// a fragment repeated between copies (REP GT REP GT REP) belongs to the folded array, not to an unfolded
-// duplication. What is realigned are the flanks before and after it. A path with no REP step is a
-// non-carrier and is left as folded.
+// A path's interior split around its array block: every step from the first unit step to the last -- the
+// folded copies and whatever folding left between them. The block is kept verbatim, since a fragment repeated
+// between copies belongs to the folded array, not to an unfolded duplication; only the flanks before and
+// after it are realigned. A path with no unit step is a non-carrier and is left as folded.
 struct Shape {
     bool carrier = false;
     std::size_t block_lo = 0, block_hi = 0;   // [lo, hi) in the interior
@@ -230,7 +229,7 @@ std::string steps_key(const Steps& steps) {
     return k;
 }
 
-// Non-REP nodes and steps outside the array blocks, over every traversing path. `routes` replaces a
+// Non-unit nodes and steps outside the array blocks, over every traversing path. `routes` replaces a
 // carrier's flank steps by its rebuilt flank route when given.
 struct Measure { std::size_t nodes = 0, steps = 0, single = 0; };
 Measure measure(const std::unordered_map<std::size_t, Interior>& per_path,
@@ -261,7 +260,7 @@ Measure measure(const std::unordered_map<std::size_t, Interior>& per_path,
 
 std::optional<SiteEdit> process_site(const PanphorteRefineSite& site, const GfaModel& model,
                                      const std::vector<std::size_t>& path_order, std::size_t ref_idx,
-                                     const std::unordered_set<std::string>& self_loop,
+                                     const std::unordered_set<std::string>& rep_nodes,
                                      const PanphorteRefineLimits& lim, PanphorteRefineRow& row) {
     const auto skip = [&](const std::string& reason, const std::string& detail) {
         row.status = "skipped:" + reason;
@@ -274,18 +273,30 @@ std::optional<SiteEdit> process_site(const PanphorteRefineSite& site, const GfaM
 
     std::unordered_set<std::string> reps;
     for (const auto& n : site.interior)
-        if (self_loop.count(n) != 0) reps.insert(n);
+        if (rep_nodes.count(n) != 0) reps.insert(n);
 
     std::unordered_map<std::size_t, Interior> per_path;
     std::unordered_map<std::size_t, Shape> shapes;
     std::size_t partial = 0;
+    // A skip found mid-scan is applied after the scan, so a skipped row still reports how many haplotypes
+    // cross the site and how many carry the unit node.
+    std::optional<std::pair<std::string, std::string>> deferred;
+    std::size_t traversing = 0, carrying = 0;
+    const auto skip_counted = [&](const std::string& reason, const std::string& detail) {
+        row.paths = traversing;
+        row.carriers = carrying;
+        return skip(reason, detail);
+    };
     for (const std::size_t idx : path_order) {
         const Steps& steps = model.paths[idx].steps;
         bool ambiguous = false;
         auto got = interior_between(steps, site.source, site.sink, site.interior, &ambiguous);
-        if (ambiguous)
-            return skip("ambiguous_anchor_traversal",
-                        "path " + gfa_path_name(model.paths[idx]) + " has two equally good traversals");
+        if (ambiguous) {
+            if (!deferred)
+                deferred.emplace("ambiguous_anchor_traversal",
+                                 "path " + gfa_path_name(model.paths[idx]) + " has two equally good traversals");
+            continue;
+        }
         // Interior nodes the chosen traversal does not cover: a partial or second traversal, which keeps
         // its old nodes and so keeps the old route walkable beside the rebuilt one.
         std::size_t outside = 0;
@@ -296,23 +307,42 @@ std::optional<SiteEdit> process_site(const PanphorteRefineSite& site, const GfaM
         }
         if (outside > 0) { ++partial; continue; }
         if (!got) continue;
+        // A window holding the site's own anchors spans two crossings and the backbone between them;
+        // realigned as one flank, that backbone would be rebuilt as site sequence.
+        if (std::any_of(got->steps.begin(), got->steps.end(), [&](const PathStep& st) {
+                return st.node_id == site.source || st.node_id == site.sink;
+            })) {
+            if (!deferred)
+                deferred.emplace("multiple_crossings",
+                                 "path " + gfa_path_name(model.paths[idx]) + " crosses the site more than once");
+            continue;
+        }
+        ++traversing;
         Shape shape = shape_of(got->steps, reps);
+        if (shape.carrier) ++carrying;
         // The duplication guard, on the flanks only: the array block is kept verbatim, so nothing inside
         // it is linearized. A flank node walked twice is an unfolded copy that realignment would flatten.
         std::unordered_map<std::string, int> c;
         for (std::size_t k = 0; k < got->steps.size(); ++k)
             if (k < shape.block_lo || k >= shape.block_hi) ++c[got->steps[k].node_id];
+        bool dup = false;
         for (const auto& kv : c)
-            if (kv.second >= 2)
-                return skip("unfolded_dup", "node " + kv.first + " x" + std::to_string(kv.second) + " on " +
-                                                gfa_path_name(model.paths[idx]));
+            if (kv.second >= 2) {
+                if (!deferred)
+                    deferred.emplace("unfolded_dup", "node " + kv.first + " x" + std::to_string(kv.second) + " on " +
+                                                         gfa_path_name(model.paths[idx]));
+                dup = true;
+                break;
+            }
+        if (dup) continue;
         shapes[idx] = std::move(shape);
         per_path[idx] = std::move(*got);
     }
+    if (deferred) return skip_counted(deferred->first, deferred->second);
     if (partial > 0)
-        return skip("partial_paths", std::to_string(partial) +
-                                         " path(s) touch the interior outside one anchor-to-anchor traversal");
-    if (per_path.count(ref_idx) == 0) return skip("reference_not_traversing", "");
+        return skip_counted("partial_paths", std::to_string(partial) +
+                                                 " path(s) touch the interior outside one anchor-to-anchor traversal");
+    if (per_path.count(ref_idx) == 0) return skip_counted("reference_not_traversing", "");
     row.paths = per_path.size();
 
     // Distinct flank sequences, reference first, one alignment for the flanks before the block and one
@@ -331,7 +361,7 @@ std::optional<SiteEdit> process_site(const PanphorteRefineSite& site, const GfaM
     }
     row.distinct_pre = flank_seqs[0].size();
     row.distinct_post = flank_seqs[1].size();
-    if (row.carriers == 0) return skip("no_carrier", "no traversing path walks a REP node");
+    if (row.carriers == 0) return skip("no_carrier", "no traversing path walks a unit node");
 
     const Measure before = measure(per_path, shapes, nullptr);
     row.nodes_before = before.nodes;
@@ -433,11 +463,9 @@ bool same_steps(const Steps& x, const Steps& y) {
 
 PanphorteRefineResult panphorte_refine_sites(GfaModel& model, const std::vector<PanphorteRefineSite>& sites,
                                              const std::string& resolved_reference,
-                                             const PanphorteRefineLimits& limits) {
+                                             const PanphorteRefineLimits& limits,
+                                             const std::unordered_set<std::string>& rep_nodes) {
     PanphorteRefineResult result;
-    std::unordered_set<std::string> self_loop;
-    for (const auto& e : model.edges)
-        if (e.from == e.to) self_loop.insert(e.from);
 
     std::size_t ref_idx = model.paths.size();
     for (std::size_t i = 0; i < model.paths.size(); ++i)
@@ -451,7 +479,7 @@ PanphorteRefineResult panphorte_refine_sites(GfaModel& model, const std::vector<
     std::vector<RepSignature> reps_before;
     for (const GfaPath& p : model.paths) {
         spelled_before.push_back(spell(model, p.steps));
-        reps_before.push_back(rep_signature(p.steps, self_loop));
+        reps_before.push_back(rep_signature(p.steps, rep_nodes));
     }
 
     std::vector<SiteEdit> edits;
@@ -460,7 +488,7 @@ PanphorteRefineResult panphorte_refine_sites(GfaModel& model, const std::vector<
         row.bubble_id = site.bubble_id;
         row.source = site.source;
         row.sink = site.sink;
-        auto edit = process_site(site, model, path_order, ref_idx, self_loop, limits, row);
+        auto edit = process_site(site, model, path_order, ref_idx, rep_nodes, limits, row);
         if (edit) {
             edit->row_index = result.rows.size();
             edits.push_back(std::move(*edit));
@@ -563,7 +591,7 @@ PanphorteRefineResult panphorte_refine_sites(GfaModel& model, const std::vector<
         }
     model.edges = std::move(kept);
 
-    // ACCEPTANCE: nothing is written unless all of these hold.
+    // Acceptance: nothing is written unless all of these hold.
     // 1. Every path spells exactly what it spelled after folding.
     std::vector<std::string> broken;
     for (std::size_t i = 0; i < model.paths.size(); ++i)
@@ -572,10 +600,10 @@ PanphorteRefineResult panphorte_refine_sites(GfaModel& model, const std::vector<
     if (!broken.empty())
         throw std::runtime_error("panphorte --refine: the rewrite changed the sequence of " +
                                  cli::join_with_comma(broken) + " relative to the folded graph");
-    // 2. Every path walks the same REP nodes, in the same orientation, the same number of times.
+    // 2. Every path walks the same unit nodes, in the same orientation, the same number of times.
     for (std::size_t i = 0; i < model.paths.size(); ++i)
-        if (rep_signature(model.paths[i].steps, self_loop) != reps_before[i])
-            throw std::runtime_error("panphorte --refine: the REP copies of " + gfa_path_name(model.paths[i]) +
+        if (rep_signature(model.paths[i].steps, rep_nodes) != reps_before[i])
+            throw std::runtime_error("panphorte --refine: the unit copies of " + gfa_path_name(model.paths[i]) +
                                      " changed (node, orientation or count)");
     // 3. Every consecutive step pair has a link.
     for (const GfaPath& p : model.paths)

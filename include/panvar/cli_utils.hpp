@@ -2,6 +2,8 @@
 
 #include <chrono>
 #include <cstddef>
+#include <fstream>
+#include <set>
 #include <string>
 #include <utility>
 #include <vector>
@@ -65,12 +67,19 @@ private:
     std::chrono::steady_clock::time_point start_;
 };
 
+// "[module HH:MM:SS] ", the prefix RunLog puts on its lines, for code that logs outside a RunLog.
+std::string log_prefix(const std::string& module);
+
 std::string trim_ascii(const std::string& text);
 std::size_t parse_size_arg(const std::string& name, const std::string& value);
 double parse_similarity_arg(const std::string& name, const std::string& value);
 double parse_unit_fraction_arg(const std::string& name, const std::string& value);
 std::string join_with_comma(const std::vector<std::string>& values);
 void ensure_parent_dir_for_file(const std::string& path_text);
+// Flush and close `out`, throwing if any write to it failed. An ofstream left to its destructor closes
+// silently, so a write lost to a full disk would leave a truncated file that StagedOutputs then installs
+// as part of a successful run. `what` names the file in the error.
+void close_output(std::ofstream& out, const std::string& what);
 
 // A unique sibling of `final_path`: outputs are written here and renamed into place, so an
 // interrupted or failed run never leaves a half-written file where a complete one is expected.
@@ -79,15 +88,30 @@ std::string staging_path(const std::string& final_path, const std::string& modul
 // Rename a staged file into place, falling back to copy-then-remove across filesystems.
 void commit_staged(const std::string& staged, const std::string& final_path);
 
-// Every output of one command, staged together and committed only once the command has succeeded.
-// Anything still staged when the set is destroyed is removed, so a throw leaves no partial output.
+// An input the command reads more than once must be a regular file it can reopen: a pipe or a process
+// substitution gives its content to the first read only, and a /dev/fd path (such as /dev/stdin) shares
+// the descriptor's offset, so the later passes would see an empty input. Throws, naming the flag and
+// the reason. A missing file is left to the reader to report.
+void require_regular_input(const std::string& module, const std::string& flag, const std::string& path);
+
+// An input flag under its earlier name (--bubble-prefix-in, --bubbles-csv-in, --panphorte-prefix-in,
+// --snarls-in) as its current one, with a warning the first time; any other argument as it is.
+std::string renamed_input_flag(const std::string& arg, const std::string& module);
+
 // Refuse, before anything is opened, two outputs that name one file or any output that names an
 // input. Empty entries are ignored, so a caller can pass optional destinations unconditionally.
-// Comparison is by weakly_canonical path, so a symlink or a second mount point is caught too.
+// Comparison is by weakly_canonical path (case-folded on macOS), so a symlink or a `..` spelling is
+// caught; a hard link is not, which is harmless because outputs are installed by rename.
 void reject_output_collisions(const std::string& module,
                               const std::vector<std::string>& outputs,
                               const std::vector<std::string>& inputs);
 
+// Every output of one command, staged together and committed only once the command has succeeded.
+// Anything still staged when the set is destroyed is removed, so a throw leaves no partial output, and
+// so are the directories stage() created for it if they are left empty. While a set is alive, each
+// output directory holds an extra empty file named like a staging sibling, with this process's id
+// (<output>.<module>-hold.<pid>-tmp.*), so a concurrent run that fails cannot remove a directory this run
+// still needs. A later run removes the holds of runs that were killed before removing their own.
 class StagedOutputs {
 public:
     explicit StagedOutputs(std::string module);
@@ -95,7 +119,7 @@ public:
     StagedOutputs(const StagedOutputs&) = delete;
     StagedOutputs& operator=(const StagedOutputs&) = delete;
 
-    // Register a destination and return the path to write to instead.
+    // Register a destination and return the path to write to instead. Creates its parent directory.
     std::string stage(const std::string& final_path);
     // Move every staged file to its destination, in registration order, as ONE transaction: a
     // failure part-way through removes what this run installed and restores whatever it displaced,
@@ -105,6 +129,9 @@ public:
 private:
     std::string module_;
     std::vector<std::pair<std::string, std::string>> pending_;   // (staged, final)
+    std::vector<std::string> made_dirs_;   // directories stage() created, deepest first per stage
+    std::vector<std::pair<std::string, int>> holds_;   // per output directory: empty file, its locked descriptor
+    std::set<std::string> held_dirs_;
 };
 
 } // namespace panvar::cli

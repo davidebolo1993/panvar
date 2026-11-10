@@ -1,53 +1,21 @@
-build/
-# Any CMake build tree at the root, not only the one called "build". A review build named
-# build_genotype_review was swept into a commit by `git add -A` -- 448 generated files, 75 MB --
-# and one directory name was all that stood between the rule and the repository.
+# Build trees at the root, whatever their name
 /build*/
-.DS_Store
-
 *.o
 *.obj
 *.a
 *.so
 *.dylib
 __pycache__/
+.DS_Store
 *.claude/*
 *.claude
 
+# Outputs of scripts/*_examples.sh and the dev/ checks: regenerate them (tests/README.md)
+tests/examples/
+# The full Ensembl GTF is too large to commit; tests/real_data holds the genes of its loci
+tests/real_data/Homo_sapiens.GRCh38.116.gtf.gz
 
-#tests/real_data/gencode*
-#tests/real_data/lpa*
-#tests/real_data/gstm1*
-#tests/real_data/cypd26*
-tests/results
-
-!tests/results/.gitkeep
-
-
-# Local regenerated results (scripts/regen_results.sh)
-results/
-tests/real_data/*.gtf.gz
-chiara_test/*
-
-
-# Local-only working material. None of this belongs in the published repository:
-#   experiments/  proof-of-concepts and the research record for the module that is not released
-#   results/      regenerated output tables (scripts/regen_results.sh), ignored above
-#   docs/reports/ dated review write-ups, kept for the authors rather than for users
-#   docs/review_followups.md  the release ledger -- internal working state, not documentation
-# An earlier rule tracked experiments/*.md, on the argument that the pre-registrations and negative
-# results are the scientific record and should outlive any working tree. They are, and they still do:
-# the record stays in git history and in the local tree. But a published repository is the wrong place
-# to ship it -- a clone of a released tool should get the tool, not the internal argument about a
-# module it cannot even build. Ignore the directory outright, with no exception to re-add it.
-experiments/
+# Dated review write-ups, kept for the authors, not for users
 docs/reports/
-docs/review_followups.md
-reports/
-
-# External comparison checkout used while designing the replacement genotyper; it is not a Panvar
-# dependency and must never be swept into a commit.
-external/locityper/
-
-
-build_genotype_review/
+# Our own check of the docs against the binary
+dev/check_docs.py

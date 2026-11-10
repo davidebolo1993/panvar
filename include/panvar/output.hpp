@@ -15,7 +15,9 @@ void write_bubbles_csv(
     const std::string& output_path,
     const std::vector<Bubble>& bubbles);
 
-std::vector<Bubble> read_bubbles_csv(const std::string& input_path);
+// Inversion sites (Bubble::inversion_parent) enclose other sites; they are read only when asked for, so
+// a consumer that needs disjoint sites -- folding, refining -- sees the ordinary ones alone.
+std::vector<Bubble> read_bubbles_csv(const std::string& input_path, bool with_inversion_sites = false);
 
 void write_bandage_node_colors_csv(
     const std::string& output_path,

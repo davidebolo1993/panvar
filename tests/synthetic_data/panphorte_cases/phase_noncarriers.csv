@@ -1,0 +1,2 @@
+bubble_id,source,source_orient,sink,sink_orient,inside_node_count,total_node_count,path_support,distinct_alleles,ref_allele_support,alt_allele_support_max,alt_allele_support_min,min_inside_bp,max_inside_bp,inside_nodes
+1,1,+,2,+,20,22,20,1,1,1,1,0,0,"10;11;12;13;14;15;16;17;18;19;20;21;22;23;24;25;26;27;28;29"

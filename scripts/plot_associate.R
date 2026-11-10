@@ -1,176 +1,328 @@
 #!/usr/bin/env Rscript
-
-# Deterministic figures: geom_jitter and ggrepel both draw from R's RNG, so two runs on the SAME table
-# produced byte-different PNGs and any staleness check comparing docs/img against results/ reported
-# every figure as changed. Seeded here rather than in a wrapper, so the property holds however the
-# script is invoked.
-set.seed(1)
-
-# Manhattan + QQ for `panvar associate` output. See docs/gwas.md; run with --help for usage.
-suppressWarnings(suppressMessages(library(ggplot2)))
+# associate runs along the reference: -log10 p, and -log10 p given the signals. See --help for usage.
+suppressWarnings(suppressMessages({ library(ggplot2); library(ggrepel) }))
 
 args <- commandArgs(trailingOnly = TRUE)
 usage <- function(status = 0) {
   cat(paste(c(
-    "plot_associate.R - Manhattan (before/after correction) + QQ for `panvar associate` output.",
+    "plot_associate.R - associate runs along the reference",
     "",
-    "Usage:",
-    "  Rscript plot_associate.R --assoc <assoc.tsv> --out <prefix> [options]",
+    "Usage: Rscript plot_associate.R [options] [<label>=]<associate prefix> ...",
     "",
-    "Required:",
-    "  --assoc <path>     panvar associate .assoc.tsv",
-    "  --out <prefix>     output prefix; writes <prefix>.manhattan.{png,pdf} and <prefix>.qq.{png,pdf}",
+    "Top: -log10 p over each row's reference span, with the run's thresholds (selection in dark red).",
+    "Bottom (variant unit): -log10 p given the signals. Several runs: a block each, on its own y scale.",
     "",
-    "Optional:",
-    "  --summary <path>   .summary.tsv (adds correction thresholds to the Manhattan)",
-    "  --title <s>        plot title (default 'panvar associate')",
-    "  --width / --height figure size in inches (default 10 x 7)",
-    "  --dpi <n>          PNG resolution (default 150)",
+    "Options:",
+    "  --top <N>          rows named per panel and run (default 5; 1 with several runs)",
+    "  --layers <a,b>     only these sources (default all)",
+    "  --out <path>       .png or .pdf (default <prefix>.region.png; associate.region.png for several)",
+    "  --dpi <N>          resolution (default 150)",
+    "  --width, --height  size in inches (default from the runs and rows)",
     "  -h, --help         show this help"), collapse = "\n"), "\n")
   quit(status = status)
 }
 if (length(args) == 0 || any(args %in% c("-h", "--help"))) usage(0)
+valued <- c("--out", "--layers", "--dpi", "--width", "--height", "--top")
 get <- function(flag, default = NULL) {
-  i <- match(flag, args); if (is.na(i) || i == length(args)) return(default); args[i + 1]
+  i <- match(flag, args)
+  if (is.na(i)) return(default)
+  if (i == length(args)) stop("missing value after ", flag)
+  args[i + 1]
 }
-assoc <- get("--assoc"); out <- get("--out"); summary_path <- get("--summary"); title <- get("--title", "panvar associate")
-man_w <- as.numeric(get("--width", "10")); man_h <- as.numeric(get("--height", "7")); dpi <- as.numeric(get("--dpi", "150"))
-if (is.null(assoc) || is.null(out)) usage(1)
+taken <- unlist(lapply(valued, function(f) { i <- match(f, args); if (is.na(i)) integer(0) else c(i, i + 1) }))
+runs <- if (length(taken)) args[-taken] else args
+if (any(startsWith(runs, "--"))) stop("unknown option: ", runs[startsWith(runs, "--")][1])
+if (length(runs) == 0) usage(1)
+top_n_given <- get("--top")
+dpi <- as.numeric(get("--dpi", "150"))
+keep_layers <- if (is.null(get("--layers"))) NULL else strsplit(get("--layers"), ",")[[1]]
 
-d <- read.delim(assoc, sep = "\t", header = TRUE, check.names = FALSE)
-d <- d[is.finite(d$p), ]
-if (nrow(d) == 0) stop("no finite p-values in ", assoc)
-n_tests <- nrow(d)
-
-# prefer the summary's feature count (authoritative) for the Bonferroni denominator
-if (!is.null(summary_path) && file.exists(summary_path)) {
-  s <- read.delim(summary_path, sep = "\t", header = TRUE, check.names = FALSE)
-  v <- s$value[s$key == "features_tested"]; if (length(v) == 1) n_tests <- as.numeric(v)
-}
-bonf <- 0.05 / n_tests
-fdr_p <- suppressWarnings(max(d$p[is.finite(d$q_bh) & d$q_bh < 0.05]))
-if (!is.finite(fdr_p)) fdr_p <- NA_real_
-
-# x = node id for graph features; for k-mers (many per node) a per-node-ordered index, one column each
-first_int <- function(x) suppressWarnings(as.numeric(sub("^[^0-9]*([0-9]+).*$", "\\1", x)))
-node1 <- first_int(d$nodes)
-layer <- if ("layer" %in% names(d)) d$layer else rep(".", nrow(d))
-is_kmer <- sum(layer == "kmer") > sum(layer == "graph")
-if (is_kmer) {
-  ord <- order(ifelse(is.finite(node1), node1, max(node1[is.finite(node1)], 0) + 1), d$p)
-  d$x <- NA_real_; d$x[ord] <- seq_len(nrow(d))   # per-k-mer index, ordered by node id then p
-  xlab <- "k-mer index (ordered by node id)"
-} else {
-  d$x <- node1
-  if (any(is.finite(d$x))) {
-    rng <- range(d$x[is.finite(d$x)]); d$x[!is.finite(d$x)] <- rng[1] - 0.05 * max(1, diff(rng))
-  } else d$x <- seq_len(nrow(d))
-  xlab <- "graph order (node id)"
-}
-d$logp <- -log10(pmax(d$p, 1e-300))
-d$logq <- -log10(pmax(ifelse(is.finite(d$q_bh), d$q_bh, 1), 1e-300))
-d$sig <- ifelse(d$p < bonf, "Bonferroni",
-                ifelse(is.finite(d$q_bh) & d$q_bh < 0.05, "FDR<0.05", "ns"))
-d$sig <- factor(d$sig, levels = c("ns", "FDR<0.05", "Bonferroni"))
-
-# panels: raw -log10 p (nominal + Bonferroni lines), BH -log10 q (q=0.05 line), and -- when the
-# conditional/COJO columns are present -- -log10(p_conditional). colour is the verdict, so noise peaks in
-# the top panel collapse in the lower ones; what remains tall in the third panel is what survives
-# conditioning on the selected signals, whether or not it is itself one of them.
-has_cond <- "p_conditional" %in% names(d) && any(is.finite(d$p_conditional))
-role <- if ("cond_role" %in% names(d)) as.character(d$cond_role) else rep(".", nrow(d))
-levels_sig <- c("ns", "FDR<0.05", "Bonferroni", "conditioning signal")
-d$sig <- factor(as.character(d$sig), levels = levels_sig)
-lv <- c("before correction: raw -log10(p)", "after correction: BH -log10(q)")
-if (has_cond) lv <- c(lv, "after conditioning: -log10(p_conditional)")
-long <- rbind(
-  data.frame(x = d$x, y = d$logp, sig = d$sig, panel = lv[1]),
-  data.frame(x = d$x, y = d$logq, sig = d$sig, panel = lv[2]))
-if (has_cond) {
-  anchor <- role %in% c("signal", "lead")                       # the conditioning signal(s)
-  # Every point is drawn at its OWN p_conditional, anchors included. Drawing anchors at their raw p
-  # instead made the panel contradict its axis: a lead going p=3e-191 -> p_conditional=2e-38 was drawn
-  # at 191, so a signal that mostly dissolves under conditioning looked untouched. Anchors stay
-  # identifiable by colour, which is what the colour is for.
-  # A sole COJO signal has nothing to condition on, so associate leaves p_conditional NA. Conditioning
-  # on the empty set IS the marginal model, so that anchor is drawn at its own p -- dropping it would
-  # empty the panel of the very signal it is about. Anchors that DO have a conditional estimate (two or
-  # more signals) are drawn at it, which is the case that was being misreported.
-  pc <- ifelse(is.finite(d$p_conditional), d$p_conditional, ifelse(anchor, d$p, NA_real_))
-  yc <- -log10(pmax(pc, 1e-300))
-  sc <- ifelse(anchor, "conditioning signal",
-        ifelse(is.finite(d$p_conditional) & d$p_conditional < bonf, "Bonferroni", "ns"))
-  keep <- is.finite(pc)                       # collinear features have no conditional estimate to show
-  long <- rbind(long, data.frame(x = d$x[keep], y = yc[keep],
-    sig = factor(sc[keep], levels = levels_sig), panel = lv[3]))
-}
-long$panel <- factor(long$panel, levels = lv)
-thr <- data.frame(
-  panel = factor(c(lv[1], lv[1], lv[2]), levels = lv),
-  yint  = c(-log10(0.05), -log10(bonf), -log10(0.05)),
-  col   = c("grey50", "#d95f02", "#2c7fb8"),
-  lty   = c("dotted", "dashed", "dashed"))
-if (has_cond) thr <- rbind(thr, data.frame(panel = factor(lv[3], levels = lv),
-  yint = -log10(bonf), col = "#d95f02", lty = "dashed"))
-
-# one label per gene at its top feature; in the corrected panels for genes surviving correction, and in the
-# conditioning panel for the conditioning signal(s). needs the `gene` column from `associate --node-genes`.
-lab <- NULL
-if ("gene" %in% names(d)) {
-  has_gene <- !is.na(d$gene) & d$gene != "."
-  g <- d[has_gene & (d$p < bonf | (is.finite(d$q_bh) & d$q_bh < 0.05)), ]
-  if (nrow(g) > 0) {
-    g <- g[order(g$p), ]; g <- g[!duplicated(g$gene), ]   # best feature per gene
-    lab <- rbind(
-      data.frame(x = g$x, y = -log10(pmax(g$p, 1e-300)), gene = g$gene, panel = lv[1]),
-      data.frame(x = g$x, y = -log10(pmax(ifelse(is.finite(g$q_bh), g$q_bh, 1), 1e-300)),
-                 gene = g$gene, panel = lv[2]))
+read <- function(p) read.delim(p, colClasses = "character", check.names = FALSE, na.strings = c("NA", "."))
+# Break marks: a white cut across the panel at the gap, and a stroke over each cut end of the frame.
+GeomBreakMarks <- ggproto("GeomBreakMarks", Geom, required_aes = "y", default_aes = aes(colour = "grey20"),
+  draw_key = draw_key_blank,
+  draw_panel = function(data, panel_params, coord) {
+    d <- coord$transform(transform(data, x = 0), panel_params)
+    lo <- min(d$y); hi <- max(d$y)
+    cut <- grid::rectGrob(x = grid::unit(0, "npc") - grid::unit(4, "pt"), y = grid::unit(lo, "npc"),
+                          width = grid::unit(1, "npc") + grid::unit(8, "pt"), height = grid::unit(hi - lo, "npc"),
+                          just = c("left", "bottom"), gp = grid::gpar(fill = "white", col = NA))
+    side <- rep(c(0, 1), each = 2); yy <- rep(c(lo, hi), 2)
+    strokes <- grid::segmentsGrob(x0 = grid::unit(side, "npc") - grid::unit(5, "pt"), x1 = grid::unit(side, "npc") + grid::unit(5, "pt"),
+                                  y0 = grid::unit(yy, "npc") - grid::unit(3, "pt"), y1 = grid::unit(yy, "npc") + grid::unit(3, "pt"),
+                                  gp = grid::gpar(col = d$colour[1], lwd = 1.4))
+    grid::gTree(children = grid::gList(cut, strokes))
+  })
+geom_break_marks <- function(mapping = NULL, data = NULL, ...)
+  layer(geom = GeomBreakMarks, mapping = mapping, data = data, stat = "identity", position = "identity",
+        show.legend = FALSE, inherit.aes = FALSE, params = list(...))
+source_order <- c("variant", "snv", "svim", "kmer", "graph")
+threshold_keys <- c(Bonferroni = "bonferroni_threshold", permutation = "permutation_threshold")
+rows <- list(); lines <- list(); labels <- character(0); prefixes <- character(0); info <- list()
+for (r in runs) {
+  label <- NA
+  if (grepl("^[^/=]+=", r)) { label <- sub("=.*", "", r); r <- sub("^[^=]*=", "", r) }
+  if (is.na(label)) label <- basename(r)
+  label <- toupper(label)
+  if (label %in% labels) stop("two runs labelled ", label, ": give each a <label>=")
+  labels <- c(labels, label); prefixes <- c(prefixes, r)
+  a <- read(paste0(r, ".assoc.tsv")); s <- read(paste0(r, ".summary.tsv"))
+  key <- function(k) { v <- s$value[s$key == k]; if (length(v) == 0 || is.na(v[1])) NA_character_ else v[1] }
+  for (c in c("chrom", "pos", "end"))
+    if (!c %in% names(a)) stop(r, ".assoc.tsv has no ", c, " column: re-run associate on describe -r sidecars")
+  if (!is.null(keep_layers)) a <- a[a$layer %in% keep_layers, ]
+  for (c in c("pos", "end", "p", "p_conditional", "stat", "n")) a[[c]] <- as.numeric(a[[c]])
+  placed <- !is.na(a$pos) & !is.na(a$end) & !is.na(a$p)
+  if (sum(!placed) > 0) message(label, ": ", sum(!placed), " row(s) with no place on the reference or no p left out")
+  a <- a[placed, ]
+  if (nrow(a) == 0) stop(label, ": no row has a place on the reference")
+  chrom <- unique(a$chrom)
+  if (length(chrom) > 1) stop(label, ": rows lie on several chromosomes (", paste(chrom, collapse = ", "), "); a run is drawn along one")
+  # At the 1e-300 floor a t test's p is rebuilt from its statistic (df from the row's samples, or every sample for
+  # lmm), so such rows keep their order; a score test's tail cannot be rebuilt and stays at the floor.
+  ncov <- suppressWarnings(as.numeric(key("covariates"))); if (is.na(ncov)) ncov <- 0
+  n_all <- suppressWarnings(as.numeric(key("samples_used")))
+  a$y <- -log10(pmax(a$p, 1e-300))
+  deep <- a$p <= 1e-300 & is.finite(a$stat) & a$p_method %in% c("t", "lmm")
+  if (any(deep)) {
+    df <- ifelse(a$p_method[deep] == "lmm" & !is.na(n_all), n_all, a$n[deep]) - ncov - 2
+    a$y[deep] <- -(log(2) + pt(-abs(a$stat[deep]), df = pmax(1, df), log.p = TRUE)) / log(10)
   }
-  if (has_cond) {                                          # label the conditioning signal(s) in panel 3
-    gc <- d[has_gene & role %in% c("signal", "lead"), ]
-    if (nrow(gc) > 0) {
-      gc <- gc[order(gc$p), ]; gc <- gc[!duplicated(gc$gene), ]
-      lab <- rbind(lab, data.frame(x = gc$x, y = -log10(pmax(gc$p, 1e-300)),
-                                   gene = gc$gene, panel = lv[3]))
+  a$yc <- -log10(pmax(a$p_conditional, 1e-300))
+  a$run <- label
+  a$x0 <- a$pos / 1e6; a$x1 <- a$end / 1e6
+  rows[[label]] <- a
+  # The run's thresholds; the one the selection used is marked.
+  l <- data.frame(name = character(0), p = numeric(0))
+  for (nm in names(threshold_keys)) {
+    v <- suppressWarnings(as.numeric(key(threshold_keys[[nm]])))
+    if (!is.na(v) && v > 0) l[nrow(l) + 1, ] <- list(nm, v)
+  }
+  entry <- suppressWarnings(as.numeric(key("cojo_entry_threshold")))
+  l$selection <- !is.na(entry) & abs(l$p - entry) <= 1e-9 * entry
+  if (!is.na(entry) && !any(l$selection)) l[nrow(l) + 1, ] <- list("selection", entry, TRUE)
+  l$run <- rep(label, nrow(l))
+  lines[[label]] <- l
+  info[[label]] <- list(chrom = chrom, model = key("model"), unit = key("unit"), n = nrow(a),
+                        variant = identical(key("unit"), "variant") && any(!is.na(a$yc)))
+}
+a <- do.call(rbind, rows)
+lt <- do.call(rbind, lines)
+a$run <- factor(a$run, labels)
+layers <- c(intersect(source_order, unique(a$layer)), sort(setdiff(unique(a$layer), source_order)))
+palette <- setNames(c("#b45f06", "#2e75b6", "#6aa84f", "#8e7cc3", "#999999", "#cc4125", "#45818e")[seq_along(layers)], layers)
+a$layer <- factor(a$layer, layers)
+a$signal <- a$cond_role %in% c("signal", "lead")
+a$in_cs <- !is.na(a$cs)
+
+panels <- c(top = "-log10 p", bottom = "-log10 p given the signals")
+two_rows <- any(vapply(info, function(i) i$variant, logical(1)))
+long <- transform(a, panel = "top", yy = y)
+if (two_rows) {
+  # variant-unit runs only: a feature run's p given its lead is another test
+  variant_runs <- labels[vapply(info, function(i) i$variant, logical(1))]
+  b <- a[!a$signal & !is.na(a$yc) & a$run %in% variant_runs, ]
+  if (nrow(b)) long <- rbind(long, transform(b, panel = "bottom", yy = yc))
+}
+long$panel <- factor(long$panel, names(panels))
+long$wide <- long$x1 > long$x0
+# Several runs: one row, a block [k - 1, k] of the x axis per run, as chromosomes in a genome-wide plot.
+many <- length(labels) > 1
+top_n <- as.integer(if (is.null(top_n_given)) (if (many) 1 else 5) else top_n_given)
+if (many) {
+  block <- function(x, r) {
+    k <- match(as.character(r), labels)
+    lo <- tapply(c(a$x0, a$x1), rep(as.character(a$run), 2), min)[as.character(r)]
+    hi <- tapply(c(a$x0, a$x1), rep(as.character(a$run), 2), max)[as.character(r)]
+    (k - 1) + 0.04 + 0.92 * ifelse(hi > lo, (x - lo) / (hi - lo), 0.5)
+  }
+  long$x0 <- block(long$x0, long$run); long$x1 <- block(long$x1, long$run)
+}
+long$xm <- (long$x0 + long$x1) / 2
+# Several runs: each block maps its -log10 p to [0, 1] on its own scale, linear up to 0.95; when a few rows stand
+# above three times its 99.5th percentile, the bulk and the lines take 0.62, a break 0.62-0.68, those few the rest.
+if (many) {
+  scale_of <- list()
+  for (r in labels) for (pn in levels(long$panel)) {
+    sel <- long$run == r & long$panel == pn
+    if (!any(sel)) next
+    v <- long$yy[sel]
+    th <- -log10(lt$p[lt$run == r & (pn == "top" | lt$selection)])
+    cut <- 3 * max(as.numeric(quantile(v, 0.995)), 1)
+    hi <- v[v > cut]
+    if (pn == "top" && length(hi) && any(v <= cut)) {
+      b1 <- max(c(v[v <= cut], th)) * 1.15; b2 <- min(hi) * 0.95; tp <- max(hi) * 1.04
+      f <- local({ b1 <- b1; b2 <- b2; tp <- tp
+        function(y) ifelse(y <= b1, 0.62 * y / b1,
+                           ifelse(y >= b2, 0.68 + 0.27 * (y - b2) / (tp - b2), 0.62 + 0.06 * (y - b1) / (b2 - b1))) })
+      lo_t <- pretty(c(0, b1), n = 4); hi_t <- pretty(c(b2, tp), n = 2)
+      ticks <- c(lo_t[lo_t <= b1 & 0.62 * lo_t / b1 <= 0.57], hi_t[hi_t >= b2 & hi_t <= tp])   # none just under the break
+      gap <- TRUE
+    } else {
+      tp <- max(c(v, th)) * 1.08
+      f <- local({ tp <- tp; function(y) 0.95 * y / tp })
+      ticks <- pretty(c(0, tp), n = 4); ticks <- ticks[ticks <= tp]
+      gap <- FALSE
     }
+    scale_of[[paste(r, pn)]] <- list(f = f, ticks = ticks, gap = gap)
   }
-  if (!is.null(lab)) lab$panel <- factor(lab$panel, levels = lv)
+  for (k in names(scale_of)) {
+    sel <- paste(long$run, long$panel) == k
+    long$yy[sel] <- scale_of[[k]]$f(long$yy[sel])
+  }
+  block_ticks <- do.call(rbind, lapply(names(scale_of), function(k) {
+    r <- sub(" (top|bottom)$", "", k); pn <- sub(".* ", "", k)
+    data.frame(k = match(r, labels), panel = factor(pn, names(panels)), value = scale_of[[k]]$ticks,
+               d = scale_of[[k]]$f(scale_of[[k]]$ticks))
+  }))
+  block_gaps <- do.call(rbind, lapply(names(scale_of)[vapply(scale_of, function(s) s$gap, logical(1))], function(k) {
+    r <- sub(" (top|bottom)$", "", k)
+    data.frame(k = match(r, labels), panel = factor("top", names(panels)), lo = 0.62, hi = 0.68)
+  }))
 }
 
-cols <- c("ns" = "grey70", "FDR<0.05" = "#2c7fb8", "Bonferroni" = "#d95f02", "conditioning signal" = "#e7298a")
-p_man <- ggplot(long, aes(x, y, colour = sig)) +
-  geom_hline(data = thr, aes(yintercept = yint), colour = thr$col, linetype = thr$lty) +
-  geom_point(size = 1.3, alpha = 0.8) +
-  facet_wrap(~panel, ncol = 1, scales = "free_y") +
-  scale_colour_manual(values = cols, name = NULL, drop = FALSE) +
-  labs(title = title,
-       subtitle = sprintf("n=%d tests; Bonferroni 0.05/n = %.2g (dashed orange); nominal/FDR 0.05 (dotted grey / dashed blue)", n_tests, bonf),
-       x = xlab, y = NULL) +
-  theme_bw(base_size = 12) + theme(legend.position = "top")
-if (!is.null(lab)) {
-  if (requireNamespace("ggrepel", quietly = TRUE)) {
-    p_man <- p_man + ggrepel::geom_text_repel(data = lab, aes(x, y, label = gene),
-      inherit.aes = FALSE, size = 3, min.segment.length = 0, max.overlaps = 20,
-      box.padding = 0.4, colour = "black")
-  } else {
-    p_man <- p_man + geom_text(data = lab, aes(x, y, label = gene), inherit.aes = FALSE,
-      size = 3, vjust = -0.6, colour = "black")
-  }
-}
-plot_h <- if (has_cond) man_h * 1.4 else man_h   # extra room for the third (conditional) panel
-ggsave(paste0(out, ".manhattan.png"), p_man, width = man_w, height = plot_h, dpi = dpi)
-ggsave(paste0(out, ".manhattan.pdf"), p_man, width = man_w, height = plot_h)
+# Named rows: the strongest per run and panel; the top panel's first with its genes (bold for one run).
+named <- do.call(rbind, lapply(split(long, list(long$run, long$panel), drop = TRUE), function(d) {
+  d <- d[order(-d$yy), ][seq_len(min(top_n, nrow(d))), ]
+  d$first <- !many & d$panel == "top" & seq_len(nrow(d)) == 1
+  lead <- d$panel == "top" & seq_len(nrow(d)) == 1
+  d$text <- ifelse(lead & !is.na(d$gene), paste0(d$feature_id, "\n", d$gene), d$feature_id)
+  d
+}))
 
-# QQ with genomic-inflation lambda
-po <- sort(pmax(d$p, 1e-300)); m <- length(po)
-qq <- data.frame(exp = -log10(ppoints(m)), obs = -log10(po))
-lambda <- median(qchisq(1 - po, df = 1)) / qchisq(0.5, df = 1)
-p_qq <- ggplot(qq, aes(exp, obs)) +
-  geom_abline(slope = 1, intercept = 0, colour = "grey60") +
-  geom_point(size = 1.2, alpha = 0.8, colour = "#2c7fb8") +
-  labs(title = paste0(title, " - QQ"), subtitle = sprintf("genomic inflation lambda = %.3f", lambda),
-       x = expression(expected~-log[10](p)), y = expression(observed~-log[10](p))) +
-  theme_bw(base_size = 12)
-ggsave(paste0(out, ".qq.png"), p_qq, width = 5, height = 5, dpi = dpi)
-ggsave(paste0(out, ".qq.pdf"), p_qq, width = 5, height = 5)
-cat("Wrote:", paste0(out, ".manhattan.png"), "and", paste0(out, ".qq.png"), "\n")
+# Threshold lines in the top row, the selection's also in the bottom row; their values go in the run's title.
+lt$run <- factor(lt$run, labels)
+lt$y <- -log10(lt$p)
+lt$colour <- ifelse(lt$selection, "#a61c00", "grey35")
+strip_text <- vapply(labels, function(r) {
+  d <- lt[lt$run == r, ]
+  d <- d[order(d$name), ]
+  values <- paste0(d$name, " ", formatC(d$p, format = "e", digits = 1), ifelse(d$selection, " (selection)", ""),
+                   collapse = " · ")
+  paste0(r, " · ", info[[r]]$chrom, " (Mb)", if (nrow(d)) paste0("\n", values) else "")
+}, "")
+lines_long <- rbind(transform(lt, panel = "top"), if (two_rows) transform(lt[lt$selection, ], panel = "bottom"))
+lines_long$panel <- factor(lines_long$panel, names(panels))
+if (many) {
+  # on the run's own scale; no line where the run has no rows
+  has_scale <- paste(lines_long$run, lines_long$panel) %in% names(scale_of)
+  lines_long <- lines_long[has_scale, ]
+  for (i in seq_len(nrow(lines_long)))
+    lines_long$y[i] <- scale_of[[paste(lines_long$run[i], lines_long$panel[i])]]$f(lines_long$y[i])
+} else if (two_rows) {
+  lines_long <- lines_long[lines_long$panel == "top" | lines_long$run %in% unique(long$run[long$panel == "bottom"]), ]
+}
+# Several runs: lines span their run's block, named with its selection threshold.
+k_of <- match(as.character(lines_long$run), labels)
+lines_long$x <- k_of - 1 + 0.01; lines_long$xend <- k_of - 0.01
+block_text <- vapply(labels, function(r) {
+  d <- lt[lt$run == r & lt$selection, ]
+  paste0(r, " \u00b7 ", info[[r]]$chrom, if (nrow(d)) paste0("\nselection ", formatC(d$p[1], format = "e", digits = 1)) else "")
+}, "")
+shade <- if (many) expand.grid(k = seq(2, length(labels), by = 2), panel = factor(levels(long$panel)[levels(long$panel) %in% long$panel], names(panels))) else NULL
+# One run: a broken axis when a few rows stand above three times the 99.5th percentile; linear below the break
+# for the bulk and the lines, a short linear part above it for those few, each with its own ticks.
+ytop <- long$yy[long$panel == "top"]
+q <- as.numeric(quantile(ytop, 0.995))
+high <- ytop[ytop > 3 * max(q, 1)]
+broken <- !many && length(high) > 0 && any(ytop <= 3 * max(q, 1))
+if (broken) {
+  low_max <- max(c(ytop[ytop <= 3 * max(q, 1)], lt$y))
+  b1 <- low_max * 1.15                       # top of the lower part
+  b2 <- min(high) * 0.95                     # bottom of the upper part
+  top_y <- max(high) * 1.04
+  gap <- 0.08 * b1                           # the break, in lower-part units
+  up <- 0.45 * b1 / (top_y - b2)             # the upper part takes about a third of the height
+  fwd <- function(y) ifelse(y <= b1, y, ifelse(y >= b2, b1 + gap + (y - b2) * up, b1 + (y - b1) / (b2 - b1) * gap))
+  inv <- function(t) ifelse(t <= b1, t, ifelse(t >= b1 + gap, b2 + (t - b1 - gap) / up, b1 + (t - b1) / gap * (b2 - b1)))
+  ticks <- function(lim) {
+    if (lim[2] <= b1) return(pretty(lim, n = 5))   # the bottom row
+    lo <- pretty(c(0, b1), n = 5); lo <- lo[lo <= b1]
+    hi <- pretty(c(b2, top_y), n = 3); hi <- hi[hi >= b2 & hi <= top_y]
+    v <- c(lo, hi); v[v >= lim[1] & v <= lim[2]]
+  }
+  y_scale <- scale_y_continuous(trans = scales::trans_new("broken", fwd, inv), breaks = ticks,
+                                expand = expansion(mult = c(0.02, 0.06)))
+  marks <- data.frame(run = factor(labels, labels), panel = factor("top", names(panels)), y = c(b1, b2))
+} else if (many) {
+  y_scale <- scale_y_continuous(limits = c(-0.01, 1.02), breaks = NULL, expand = expansion(add = 0))
+} else {
+  y_scale <- scale_y_continuous(expand = expansion(mult = c(0.02, 0.15)))
+}
+
+fig <- ggplot(long) +
+  # every other block shaded
+  { if (many && nrow(shade)) geom_rect(data = shade, aes(xmin = k - 1, xmax = k, ymin = -Inf, ymax = Inf), inherit.aes = FALSE,
+                                       fill = "grey95", colour = NA) } +
+  # the break over the frame, under the rows
+  { if (broken) geom_break_marks(data = marks, aes(y = y)) } +
+  # several runs: each block's gridlines, ticks and break
+  { if (many) geom_segment(data = block_ticks, aes(x = k - 1, xend = k, y = d, yend = d), inherit.aes = FALSE,
+                           colour = "grey90", linewidth = 0.3) } +
+  { if (many) geom_text(data = block_ticks, aes(x = k - 1 + 0.008, y = d, label = value), inherit.aes = FALSE,
+                        hjust = 0, vjust = -0.3, size = 2.3, colour = "grey45") } +
+  # an outer block's gap reaches past the panel edge, cutting the frame
+  { if (many && !is.null(block_gaps)) geom_rect(data = block_gaps, aes(xmin = ifelse(k == 1, -0.008, k - 1),
+                                                                       xmax = ifelse(k == length(labels), k + 0.008, k),
+                                                                       ymin = lo, ymax = hi),
+                                                inherit.aes = FALSE, fill = "white", colour = NA) } +
+  { if (many && !is.null(block_gaps)) geom_segment(data = rbind(transform(block_gaps, x = k - 1, yb = lo), transform(block_gaps, x = k - 1, yb = hi),
+                                                                transform(block_gaps, x = k, yb = lo), transform(block_gaps, x = k, yb = hi)),
+                                                   aes(x = x - 0.012, xend = x + 0.012, y = yb - 0.012, yend = yb + 0.012),
+                                                   inherit.aes = FALSE, colour = "grey20", linewidth = 0.6) } +
+  { if (many) geom_segment(data = lines_long, aes(x = x, xend = xend, y = y, yend = y, linetype = name, colour = I(colour)),
+                           linewidth = 0.5)
+    else geom_hline(data = lines_long, aes(yintercept = y, linetype = name, colour = I(colour)), linewidth = 0.5) } +
+  geom_segment(data = long[long$wide, ], aes(x = x0, xend = x1, y = yy, yend = yy, colour = layer), linewidth = 1.1) +
+  geom_point(data = long[!long$wide, ], aes(x = x0, y = yy, colour = layer), size = 1.1, alpha = 0.7) +
+  geom_point(data = long[long$in_cs & long$panel == "top", ], aes(x = xm, y = yy), shape = 21, size = 3,
+             colour = "grey15", fill = NA, stroke = 0.6) +
+  geom_label_repel(data = named, aes(x = xm, y = yy, label = text, fontface = ifelse(first, "bold", "plain")),
+                   size = 2.4, colour = "grey10", fill = "white", label.size = 0.2, box.padding = 0.4,
+                   min.segment.length = 0, segment.colour = "grey40", segment.size = 0.3,
+                   arrow = arrow(length = unit(0.012, "npc"), type = "closed"), max.overlaps = Inf, seed = 1) +
+  scale_colour_manual(values = palette, name = NULL, breaks = layers) +
+  scale_linetype_manual(values = c(Bonferroni = "dotted", permutation = "dashed", selection = "solid"), name = NULL,
+                        guide = guide_legend(override.aes = list(colour = "grey35"))) +
+  { if (many) facet_grid(panel ~ ., switch = "y", labeller = labeller(panel = panels))
+    else facet_grid(panel ~ run, scales = "free", switch = "y", labeller = labeller(panel = panels, run = setNames(strip_text, labels))) } +
+  { if (many) scale_x_continuous(breaks = seq_along(labels) - 0.5, labels = block_text, expand = expansion(add = 0)) } +
+  labs(x = NULL, y = NULL,
+       title = if (length(labels) == 1) paste0(labels, " · ", info[[1]]$model, " · ", info[[1]]$unit, " unit · ",
+                                              info[[1]]$n, " rows") else NULL) +
+  theme_bw(base_size = 10) +
+  theme(legend.position = "top", panel.grid.minor = element_blank(), strip.placement = "outside",
+        strip.background = element_blank(), strip.text = element_text(size = 9), plot.title = element_text(size = 10))
+fig <- fig + y_scale
+# The panel is exactly [0, number of runs], so the outer break strokes sit on the frame.
+if (many) fig <- fig + theme(panel.grid.major.x = element_blank(), axis.ticks.x = element_blank()) +
+  coord_cartesian(xlim = c(0, length(labels)), ylim = c(-0.01, 1.02), expand = FALSE, clip = "off")
+# Several runs: the frame is a layer over the shading, its side edges cut at an outer block's break.
+if (many) {
+  K <- length(labels); y0 <- -0.01; y1 <- 1.02
+  gap_at <- function(k) !is.null(block_gaps) && k %in% block_gaps$k
+  frame <- do.call(rbind, lapply(levels(droplevels(long$panel)), function(pn) {
+    edge <- function(x, k) if (pn == "top" && gap_at(k)) data.frame(x = x, y = c(y0, 0.68), yend = c(0.62, y1)) else
+      data.frame(x = x, y = y0, yend = y1)
+    rbind(data.frame(x = c(0, 0), xend = c(K, K), y = c(y0, y1), yend = c(y0, y1)),
+          transform(edge(0, 1), xend = x), transform(edge(K, K), xend = x))[, c("x", "xend", "y", "yend")] |>
+      transform(panel = factor(pn, names(panels)))
+  }))
+  fig$layers <- append(fig$layers, list(geom_segment(data = frame, aes(x = x, xend = xend, y = y, yend = yend),
+                                                     inherit.aes = FALSE, colour = "grey20", linewidth = 0.6)),
+                       after = if (nrow(shade)) 1 else 0)
+  fig <- fig + theme(panel.border = element_blank(), panel.background = element_rect(fill = "white", colour = NA),
+                     legend.key = element_rect(fill = "white", colour = NA))
+}
+if (broken)
+  fig <- fig + coord_cartesian(clip = "off") +
+    # the frame as the panel background, so the break's white cut interrupts it
+    theme(panel.border = element_blank(), panel.background = element_rect(fill = "white", colour = "grey20", linewidth = 0.6),
+          legend.key = element_rect(fill = "white", colour = NA))
+out <- get("--out", if (length(prefixes) > 1) file.path(dirname(prefixes[1]), "associate.region.png") else
+  paste0(prefixes[1], ".region.png"))
+if (!grepl("\\.(png|pdf)$", out)) stop("--out must end in .png or .pdf")
+width <- as.numeric(get("--width", as.character(if (many) max(10, 3 + 2.5 * length(labels)) else 10)))
+height <- as.numeric(get("--height", if (two_rows) "7.5" else "5"))
+ggsave(out, fig, width = width, height = height, dpi = dpi)
+cat("wrote", out, "\n")

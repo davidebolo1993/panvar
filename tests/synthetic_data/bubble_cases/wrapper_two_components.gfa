@@ -1,0 +1,73 @@
+H	VN:Z:1.0
+S	1	AAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+S	2	CCCCCCCCCCCCCCCCCCCC
+S	4	GGGGGGGGGGGGGGGGGGGGGGGGGGGGGG
+S	7	TTTTTTTTTTTTTTTTTTTTTTTTTTTTTT
+S	6	A
+S	m2	CCCCCC
+S	m3	GGGG
+S	m5	TT
+S	m6	A
+S	m7	CCCCCCCC
+S	m8	GGGGGGGG
+L	1	+	2	+	0M
+L	2	+	4	+	0M
+L	4	+	m2	+	0M
+L	m2	+	m3	+	0M
+L	m3	+	m5	+	0M
+L	m2	+	m5	+	0M
+L	m5	+	m6	+	0M
+L	m5	+	m7	+	0M
+L	m6	+	m8	+	0M
+L	m7	+	m8	+	0M
+L	m8	+	7	+	0M
+L	4	+	6	+	0M
+L	6	+	7	+	0M
+L	7	+	1	+	0M
+P	REF	1+,2+,4+,m2+,m3+,m5+,m6+,m8+,7+	*
+P	hdel	1+,2+,4+,m2+,m5+,m6+,m8+,7+	*
+P	hexp	1+,2+,4+,m2+,m3+,m5+,m7+,m8+,7+	*
+P	hexp2	1+,2+,4+,m2+,m5+,m7+,m8+,7+	*
+P	hbyp	1+,2+,4+,6+,7+	*
+P	hdup	1+,2+,4+,m2+,m3+,m5+,m6+,m8+,7+,1+,2+,4+,6+,7+	*
+P	t0	1+,2+,4+,m2+,m3+,m5+	*
+P	t1	1+,2+,4+,m2+,m3+,m5+,m6+,m8+	*
+P	t2	1+,2+,4+,m2+,m5+,m6+	*
+P	t3	1+,2+,4+,m2+,m3+,m5+,m7+	*
+P	t4	1+,2+,4+,m2+,m3+,m5+	*
+P	t5	1+,2+,4+,m2+,m3+,m5+,m6+,m8+	*
+P	t6	1+,2+,4+,m2+,m5+,m6+	*
+P	t7	1+,2+,4+,m2+,m3+,m5+,m7+	*
+S	x	A
+S	y	C
+L	x	+	y	+	0M
+P	u01	x+,y+	*
+P	u02	x+,y+	*
+P	u03	x+,y+	*
+P	u04	x+,y+	*
+P	u05	x+,y+	*
+P	u06	x+,y+	*
+P	u07	x+,y+	*
+P	u08	x+,y+	*
+P	u09	x+,y+	*
+P	u10	x+,y+	*
+P	u11	x+,y+	*
+P	u12	x+,y+	*
+P	u13	x+,y+	*
+P	u14	x+,y+	*
+P	u15	x+,y+	*
+P	u16	x+,y+	*
+P	u17	x+,y+	*
+P	u18	x+,y+	*
+P	u19	x+,y+	*
+P	u20	x+,y+	*
+P	u21	x+,y+	*
+P	u22	x+,y+	*
+P	u23	x+,y+	*
+P	u24	x+,y+	*
+P	u25	x+,y+	*
+P	u26	x+,y+	*
+P	u27	x+,y+	*
+P	u28	x+,y+	*
+P	u29	x+,y+	*
+P	u30	x+,y+	*

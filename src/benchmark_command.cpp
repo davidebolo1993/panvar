@@ -9,26 +9,25 @@
 #include "panvar/output.hpp"
 #include "panvar/parallel.hpp"
 #include "panvar/ref_path.hpp"
-#include "panvar/variant_nodes.hpp"
 
 #include <algorithm>
 #include <array>
 #include <cctype>
-#include <cmath>
+#include <numeric>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
-#include <fstream>
 #include <functional>
+#include <fstream>
 #include <iostream>
 #include <map>
-#include <optional>
 #include <set>
 #include <stdexcept>
 #include <string>
 #include <system_error>
+#include <tuple>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -39,571 +38,607 @@ namespace {
 void print_benchmark_help() {
     std::cout
         << "Usage:\n"
-        << "  panvar benchmark -i <graph.gfa> (-b <prefix> | -c <bubbles.csv>) \\\n"
-        << "                   --variant-nodes <call.variant_nodes.tsv> -r <name> -o <prefix> [options]\n\n"
-        << "Round-trip scores of the caller's own output, over the same bubbles, the same truth and the\n"
-        << "same QV scale, differing only in what the reconstruction is allowed to use.\n\n"
-        << "  graph     Reference walk with the haplotype's OWN steps substituted at every block that\n"
-        << "            shares a node with ANY call at that bubble. Deliberately optimistic: sharing a\n"
-        << "            node with some call is not the same as matching one, so a called block can\n"
-        << "            authorise copying a neighbouring uncalled allele. Read it as a discovery upper\n"
-        << "            bound -- can the graph hold this haplotype, and did the caller flag the\n"
-        << "            divergent blocks -- never as a genotyping score. No genotype is read.\n"
-        << "  carrier    `called` plus the requirement that THIS haplotype's GT names the record. It\n"
-        << "             implants the same true blocks, so `called` minus `carrier` is entirely loss to\n"
-        << "             wrong carrier assignment, and `carrier` minus `region_vcf` is what the VCF's\n"
-        << "             encoding of those same calls costs. Needs --vcf.\n"
-        << "  called     The same substitution restricted to blocks a SPECIFIC record is attributed to\n"
-        << "             AND that reach --min-sv-bp; nothing else of the haplotype's walk is copied. It\n"
-        << "             still substitutes the haplotype's TRUE block, not the record's REF/ALT effect,\n"
-        << "             so it is the ceiling those records would reach if each reproduced its block\n"
-        << "             exactly -- not what they do reproduce. That is `region_vcf`.\n"
-        << "  region_vcf (--vcf) Reference sequence with only the edits this haplotype's GT names,\n"
-        << "             applied from the VCF alone. A missed carrier keeps reference and a spurious one\n"
-        << "             edits sequence that was already correct, so both error directions cost bases.\n"
-        << "             This is what a consumer reconstructing a sample from the VCF actually gets.\n"
-        << "             It measures the FIDELITY OF THE COMPACT REPRESENTATION, not read-level\n"
-        << "             genotyping: no reads are involved at any level here. Pass call's --allele-vcf\n"
-        << "             instead to score the lossless per-bubble alleles.\n\n"
-        << "All are aligned to the haplotype's true walk (edlib NW) and scored\n"
-        << "QV = -10*log10(max(0.5, delta)/S), combined per haplotype length-weighted (sum delta / sum S)\n"
-        << "and binned into the cosigt bands (<17, 17-23, 23-33, >33). The do-nothing baseline (plain\n"
-        << "reference) is scored alongside and is the denominator of gap_closed.\n\n"
-        << "Separately, a TRUTH EVENT LEDGER classifies what was there to be found, before any call is\n"
-        << "consulted: each maximal divergent block between the reference walk and the haplotype's walk\n"
-        << "is one event, sized in bp, and classified called / missed / below_threshold. Event size is\n"
-        << "a property of the two walks, so it does not move with the alignment.\n\n"
+        << "  panvar benchmark -i <graph.gfa> (-b <prefix> | -c <bubbles.csv>) -r <name> --calls <prefix>\n"
+        << "                   -o <prefix> [options]\n\n"
+        << "Check how much of every haplotype's large variation call's output accounts for. Each haplotype\n"
+        << "is rebuilt from the reference twice, with call's own events for it and with the VCF records it\n"
+        << "carries, and each rebuild is aligned to the haplotype's own sequence: what the first leaves was\n"
+        << "missed by call, what only the second leaves was lost in the VCF.\n\n"
         << "Options:\n"
-        << "  -i, --gfa <path>                 Passed graph the calls were made on (required)\n"
-        << "  -b, --bubble-prefix-in <prefix>  panphorte output prefix (auto-uses <prefix>.bubbles.csv)\n"
-        << "  -c, --bubbles-csv-in <path>      panphorte bubbles CSV (required if no prefix)\n"
-        << "      --variant-nodes <path>       call's <prefix>.variant_nodes.tsv (required)\n"
-        << "      --vcf <path>                 call's <prefix>.region.vcf (or --allele-vcf). Adds the\n"
-        << "                                   reconstruction above; without it only the graph and\n"
-        << "                                   called reconstructions are scored\n"
-        << "  -r, --reference-path <name>      Reference path name/substring, the diff baseline (required)\n"
-        << "  -o, --out-prefix <prefix>        Output prefix for the QV tables (required)\n"
-        << "      --called-bubbles-only        Score only bubbles carrying >=1 call. Ascertainment-biased\n"
-        << "                                   by construction -- a bubble with real variation and no call\n"
-        << "                                   is exactly the miss the ledger exists to count, and this\n"
-        << "                                   drops it. Default scores every reference-traversed bubble.\n"
-        << "      --dup-model <cn|cnbp>        How a copy-number record is reconstructed: lay down CN\n"
-        << "                                   copies of RU_LEN in place of REF_CN (cn), or apply\n"
-        << "                                   the per-sample CNBP bp delta (cnbp, default). Both tile an\n"
-        << "                                   inferred reference span, so DUP reconstruction is a\n"
-        << "                                   heuristic on length, not the inserted sequence.\n"
-        << "      --min-sv-bp <N>              Event-size threshold for the truth ledger; set it to the\n"
-        << "                                   value `call` ran with (default 50)\n"
-        << "      --no-truth-events            Do not write the per-event ledger table\n"
-        << "      --threads <N>                Worker threads over haplotypes (0 = auto)\n"
-        << "  -q, --quiet                      Disable progress logs\n"
-        << "  -h, --help                       Show this help\n";
-}
-
-// cosigt/locityper QV bands.
-const char* qv_band(double qv) {
-    if (qv < 17.0) return "<17";
-    if (qv < 23.0) return "17-23";
-    if (qv < 33.0) return "23-33";
-    return ">33";
-}
-
-// QV = -10*log10(max(0.5, delta)/S). delta<=0.5 (a perfect/near-perfect match) is floored so the score
-// stays finite and grows with region length, matching cosigt's convention.
-double qv_from(std::size_t delta, std::size_t aln_len) {
-    if (aln_len == 0) return 60.0;  // nothing to align; treat as perfect
-    const double num = std::max(0.5, static_cast<double>(delta));
-    return -10.0 * std::log10(num / static_cast<double>(aln_len));
-}
-
-// Ceiling QV for a perfect (delta<=0.5) reconstruction of total aligned length S: QV_max = 10*log10(2S).
-// A short region can never reach the high cosigt bands, so we also report qv / qv_max -- length-fair,
-// 1.0 for a perfect reconstruction of any size -- and bin that ratio into quintiles.
-double qv_max_from(std::size_t aln_len) {
-    if (aln_len == 0) return 60.0;
-    return 10.0 * std::log10(2.0 * static_cast<double>(aln_len));
-}
-
-const char* qv_ratio_quintile(double ratio) {
-    if (ratio < 0.2) return "0.0-0.2";
-    if (ratio < 0.4) return "0.2-0.4";
-    if (ratio < 0.6) return "0.4-0.6";
-    if (ratio < 0.8) return "0.6-0.8";
-    return "0.8-1.0";
+        << "  -i, --gfa <path>                  Graph the calls were made on (required)\n"
+        << "  -b, --bubble-prefix <prefix>      Sites from <prefix>.bubbles.csv (required unless -c)\n"
+        << "  -c, --bubbles-csv <path>          Site table, by path\n"
+        << "  -r, --reference-path <name>       Reference path, as given to call (required)\n"
+        << "      --calls <prefix>              call's output: <prefix>.region.vcf and\n"
+        << "                                    <prefix>.carrier_events.tsv, without --diploid\n"
+        << "                                    (required)\n"
+        << "  -o, --out-prefix <prefix>         Output prefix (required)\n"
+        << "      --min-sv-bp <N>               Smallest large event (default 50); below call's own,\n"
+        << "                                    what lies under call's threshold is listed too\n"
+        << "      --merge-gap <N>               Differences N or fewer aligned bases apart are one event\n"
+        << "                                    (default 10)\n"
+        << "  -t, --threads <N>                 Worker threads (default 0 = all cores)\n"
+        << "  -q, --quiet                       No progress logs\n"
+        << "  -h, --help                        Show this help\n";
 }
 
 std::vector<std::string> split_on(const std::string& s, char sep) {
-    std::vector<std::string> f;
-    std::string cur;
-    for (char c : s) { if (c == sep) { f.push_back(cur); cur.clear(); } else cur += c; }
-    f.push_back(cur);
-    return f;
-}
-
-// One VCF record, reduced to what a reconstruction needs. Genotypes are haploid because each VCF
-// sample column IS one haplotype path -- the join to the graph is by name, with no phasing to infer.
-struct VcfRecord {
-    std::string id;
-    std::size_t bubble_id = 0;
-    bool has_bubble_id = false;
-    bool allele_style = false;    // one row per BUBBLE spelling every allele, not one row per call
-    std::size_t pos = 0;               // 1-based, genomic
-    std::size_t end = 0;
-    long long svlen = 0;
-    std::string svtype;
-    std::string insseq;
-    std::string ref_allele;                 // REF column, when the record carries explicit sequence
-    std::vector<std::string> alts;          // ALT alleles, explicit sequence only (empty if symbolic)
-    std::size_t ref_cn = 0;            // copy-number records: copies the reference carries
-    std::size_t ru_len = 0;            // copy-number records: length of one repeat unit
-    // Wide enough for a bubble with hundreds of distinct alleles: the allele VCF indexes every one of
-    // them, so an 8-bit slot silently wraps past 127 and drops the edit.
-    std::vector<std::int32_t> gt;      // per sample: -1 missing, 0 reference, >=1 alt
-    std::vector<long long> cn;         // per sample: copies this haplotype carries (-1 absent)
-    std::vector<long long> cnbp;       // per sample: bp this haplotype gains/loses
-};
-
-struct VcfData {
-    std::vector<std::string> samples;
-    std::vector<VcfRecord> records;
-};
-
-VcfData load_vcf(const std::string& path) {
-    std::ifstream in(path);
-    if (!in) throw std::runtime_error("Failed to open VCF: " + path);
-    VcfData vd;
-    std::string line;
-    bool saw_header = false;
-    std::size_t lineno = 0;
-    std::unordered_set<std::string> seen_ids;
-    while (std::getline(in, line)) {
-        if (line.empty()) continue;
-        if (line.rfind("##", 0) == 0) continue;
-        if (line[0] == '#') {
-            const std::vector<std::string> h = split_on(line, '\t');
-            for (std::size_t i = 9; i < h.size(); ++i) vd.samples.push_back(h[i]);
-            // A repeated sample column makes "which haplotype is this" depend on column order, and the
-            // join below would silently keep only one of them.
-            std::unordered_set<std::string> seen;
-            for (const std::string& s : vd.samples)
-                if (!seen.insert(s).second)
-                    throw std::runtime_error("VCF has a duplicate sample column '" + s +
-                                             "', so which haplotype a genotype belongs to is undefined: " + path);
-            saw_header = true;
-            continue;
-        }
-        ++lineno;
-        const std::vector<std::string> f = split_on(line, '\t');
-        if (!saw_header)
-            throw std::runtime_error(path + ": a data line appears before the #CHROM header");
-        // A short or long line means the columns are not where they are read from, so every genotype
-        // after it belongs to the wrong haplotype.
-        if (f.size() != 9 + vd.samples.size())
-            throw std::runtime_error(path + ":" + std::to_string(lineno) + ": has " +
-                                     std::to_string(f.size()) + " fields, the #CHROM header declares " +
-                                     std::to_string(9 + vd.samples.size()) + " (9 fixed + " +
-                                     std::to_string(vd.samples.size()) + " samples)");
-        VcfRecord r;
-        r.id = f[2];
-        if (r.id.size() > 8 && r.id.compare(r.id.size() - 8, 8, "_ALLELES") == 0)
-            r.allele_style = true;
-        if (r.id != "." && !seen_ids.insert(r.id).second)
-            throw std::runtime_error(path + ":" + std::to_string(lineno) + ": duplicate record ID '" +
-                                     r.id + "'");
-        r.pos = static_cast<std::size_t>(std::stoull(f[1]));
-        // A record whose ALT is literal sequence is applied as a plain REF -> ALT substitution, which
-        // is what the allele VCF emits: one record per bubble, every distinct allele spelled out.
-        if (!f[4].empty() && f[4] != "." && f[4].find('<') == std::string::npos) {
-            r.ref_allele = f[3];
-            r.alts = split_on(f[4], ',');
-        }
-        for (const std::string& kv : split_on(f[7], ';')) {
-            const std::size_t eq = kv.find('=');
-            if (eq == std::string::npos) continue;
-            const std::string k = kv.substr(0, eq), v = kv.substr(eq + 1);
-            if (k == "BUBBLE_ID") { r.bubble_id = static_cast<std::size_t>(std::stoull(v)); r.has_bubble_id = true; }
-            else if (k == "END") r.end = static_cast<std::size_t>(std::stoull(v));
-            else if (k == "SVLEN") r.svlen = std::stoll(v);
-            else if (k == "SVTYPE") r.svtype = v;
-            else if (k == "INSSEQ") r.insseq = v;
-            else if (k == "REF_CN") r.ref_cn = static_cast<std::size_t>(std::stoull(v));
-            // RU_LEN only appears on CN_METHOD=REP now; a MODULE_BP record reports the same
-            // quantity as CN_UNIT_BP, renamed because it is the SHARED per-copy content rather
-            // than a literal repeat unit. --dup-model cn wants whichever the record carries.
-            else if (k == "RU_LEN" || k == "CN_UNIT_BP")
-                r.ru_len = static_cast<std::size_t>(std::stoull(v));
-            else if (k == "NALLELES") r.allele_style = true;
-        }
-        // Without BUBBLE_ID a record cannot be placed, and every such record would silently pile up
-        // against bubble 0.
-        if (!r.has_bubble_id)
-            throw std::runtime_error(path + ":" + std::to_string(lineno) + ": record '" + r.id +
-                                     "' carries no BUBBLE_ID, so it cannot be attached to a site");
-        const std::vector<std::string> fmt = split_on(f[8], ':');
-        std::size_t gt_i = fmt.size(), cnbp_i = fmt.size(), cn_i = fmt.size();
-        for (std::size_t i = 0; i < fmt.size(); ++i) {
-            if (fmt[i] == "GT") gt_i = i;
-            else if (fmt[i] == "CNBP") cnbp_i = i;
-            else if (fmt[i] == "CN") cn_i = i;
-        }
-        r.gt.assign(vd.samples.size(), -1);
-        r.cn.assign(vd.samples.size(), -1);
-        r.cnbp.assign(vd.samples.size(), 0);
-        for (std::size_t s = 0; s < vd.samples.size(); ++s) {
-            const std::vector<std::string> v = split_on(f[s + 9], ':');
-            if (gt_i < v.size() && !v[gt_i].empty() && v[gt_i] != ".") {
-                // Every sample column IS one haplotype, so a genotype is one allele index. A diploid
-                // field would be read by stoi as its first allele -- "0/1" as 0 -- so a heterozygous
-                // carrier would silently score as reference.
-                const std::string& g = v[gt_i];
-                if (g.find('/') != std::string::npos || g.find('|') != std::string::npos)
-                    throw std::runtime_error(path + ":" + std::to_string(lineno) + ": sample '" +
-                                             vd.samples[s] + "' has the diploid genotype '" + g +
-                                             "'. benchmark joins one VCF column to one haplotype path, "
-                                             "so genotypes must be haploid allele indices");
-                std::size_t used = 0;
-                int gi = 0;
-                try { gi = std::stoi(g, &used); } catch (const std::exception&) { used = 0; }
-                if (used != g.size() || gi < 0)
-                    throw std::runtime_error(path + ":" + std::to_string(lineno) + ": sample '" +
-                                             vd.samples[s] + "' has the genotype '" + g +
-                                             "', which is not an allele index");
-                r.gt[s] = static_cast<std::int32_t>(gi);
-            }
-            if (cnbp_i < v.size() && !v[cnbp_i].empty() && v[cnbp_i] != ".")
-                r.cnbp[s] = std::stoll(v[cnbp_i]);
-            if (cn_i < v.size() && !v[cn_i].empty() && v[cn_i] != ".")
-                r.cn[s] = std::stoll(v[cn_i]);
-        }
-        vd.records.push_back(std::move(r));
-    }
-    if (!saw_header) throw std::runtime_error("VCF has no #CHROM header line: " + path);
-    return vd;
-}
-
-// How many records of each kind could actually be laid down, so a genotype QV is never read without
-// knowing what it was computed from.
-struct GtStats {
-    std::size_t applied = 0;
-    std::size_t unplaceable = 0;   // POS outside the bubble's reference span (a merged or shifted bubble)
-    std::size_t clamped = 0;       // edit ran past the span end and was truncated
-    std::size_t unhandled = 0;     // svtype with no reconstruction rule
-    std::size_t ref_mismatch = 0;  // record REF did not match the reference at POS (placement is wrong)
-    std::size_t heuristic = 0;     // laid down by tiling an inferred span (DUP): length, not sequence
-};
-
-// Apply the edits `hap` is genotyped as carrying to the bubble's reference sequence. Nothing from the
-// haplotype's own walk enters here -- that is the whole point of the second metric. Edits are laid down
-// right to left so earlier ones do not shift the coordinates of later ones.
-std::string apply_genotype(const std::string& ref_bubble,
-                           std::size_t bubble_start_0,          // 0-based bp offset of ref_bubble in the reference path
-                           std::size_t region_start_1based,
-                           const std::vector<const VcfRecord*>& recs,
-                           std::size_t hap,
-                           bool cn_model,
-                           GtStats& stats) {
-    std::vector<const VcfRecord*> carried;
-    for (const VcfRecord* r : recs)
-        if (hap < r->gt.size() && r->gt[hap] >= 1) carried.push_back(r);
-    std::sort(carried.begin(), carried.end(),
-              [](const VcfRecord* a, const VcfRecord* b) { return a->pos > b->pos; });
-
-    std::string out = ref_bubble;
-    for (const VcfRecord* r : carried) {
-        // POS is the anchor base; the event occupies POS+1 onwards. Everything is expressed relative to
-        // the bubble's own reference sequence so the two metrics share a denominator.
-        if (r->pos < region_start_1based) { ++stats.unplaceable; continue; }
-        const std::size_t g = r->pos - region_start_1based;   // 0-based in the reference path
-        if (g < bubble_start_0 || g >= bubble_start_0 + out.size()) { ++stats.unplaceable; continue; }
-        const std::size_t at = g - bubble_start_0 + 1;        // first edited base, 0-based in `out`
-        if (at > out.size()) { ++stats.unplaceable; continue; }
-
-        if (!r->alts.empty()) {
-            // Explicit-sequence allele: replace the record's REF span with the allele the GT names.
-            // `at` is one past the anchor, and REF starts AT the anchor, so back up one base.
-            const std::size_t start = at - 1;
-            const std::int32_t gi = r->gt[hap];
-            if (gi < 1 || static_cast<std::size_t>(gi) > r->alts.size()) { ++stats.unhandled; continue; }
-            std::size_t n = r->ref_allele.size();
-            if (start + n > out.size()) { n = out.size() - start; ++stats.clamped; }
-            // The record's REF must be the reference sequence at POS. If it is not, the record is
-            // being laid down in the wrong place and every score downstream is fiction.
-            if (out.compare(start, n, r->ref_allele, 0, n) != 0) ++stats.ref_mismatch;
-            out.erase(start, n);
-            out.insert(start, r->alts[static_cast<std::size_t>(gi) - 1]);
-            ++stats.applied;
-        } else if (r->svtype == "DEL") {
-            std::size_t n = static_cast<std::size_t>(r->svlen < 0 ? -r->svlen : r->svlen);
-            if (at + n > out.size()) { n = out.size() - at; ++stats.clamped; }
-            out.erase(at, n);
-            ++stats.applied;
-        } else if (r->svtype == "INS") {
-            if (r->insseq.empty()) { ++stats.unhandled; continue; }
-            out.insert(at, r->insseq);
-            ++stats.applied;
-        } else if (r->svtype == "INV") {
-            // Symbolic inversion: the span POS+1..END comes back reverse-complemented. Unlike DUP this
-            // is exact -- an inversion carries no new sequence, so the reference supplies all of it.
-            std::size_t n = r->end > r->pos ? r->end - r->pos
-                                            : static_cast<std::size_t>(r->svlen < 0 ? -r->svlen : r->svlen);
-            if (n == 0) { ++stats.unhandled; continue; }
-            if (at + n > out.size()) { n = out.size() - at; ++stats.clamped; }
-            if (n == 0) { ++stats.unhandled; continue; }
-            const std::string seg = out.substr(at, n);
-            out.replace(at, n, reverse_complement(seg));
-            ++stats.applied;
-        } else if (r->svtype == "DUP") {
-            // A copy-number record. The reference carries REF_CN copies of a RU_LEN unit here and this
-            // haplotype carries CN of them, so lay down CN copies in place of REF_CN -- the array's
-            // LENGTH is what this record is about, and it is what drives the score. Both branches tile
-            // an inferred reference span, so what is reconstructed is the right LENGTH of approximately
-            // right sequence: counted as `heuristic`, never as exact.
-            const std::size_t avail = out.size() - at;
-            const long long cn = hap < r->cn.size() ? r->cn[hap] : -1;
-            if (cn_model && cn >= 0 && r->ru_len > 0 && r->ref_cn > 0) {
-                const std::size_t unit_len = std::min(r->ru_len, avail);
-                if (unit_len == 0) { ++stats.unhandled; continue; }
-                const std::string unit = out.substr(at, unit_len);
-                std::size_t drop = r->ref_cn * r->ru_len;
-                if (drop > avail) { drop = avail; ++stats.clamped; }
-                out.erase(at, drop);
-                const std::size_t want = static_cast<std::size_t>(cn) * r->ru_len;
-                std::string add;
-                add.reserve(want);
-                while (add.size() < want) add += unit.substr(0, std::min(unit.size(), want - add.size()));
-                out.insert(at, add);
-                ++stats.applied;
-                ++stats.heuristic;
-                continue;
-            }
-            // No CN or no unit length: fall back to the record's own bp delta over the annotated span.
-            const long long d = hap < r->cnbp.size() ? r->cnbp[hap] : 0;
-            if (d == 0) { ++stats.unhandled; continue; }
-            const std::size_t unit = std::min(r->end > r->pos ? r->end - r->pos : 0, avail);
-            if (unit == 0) { ++stats.unhandled; continue; }
-            if (d < 0) {
-                std::size_t n = static_cast<std::size_t>(-d);
-                if (n > avail) { n = avail; ++stats.clamped; }
-                out.erase(at, n);
-            } else {
-                std::string add;
-                add.reserve(static_cast<std::size_t>(d));
-                while (add.size() < static_cast<std::size_t>(d))
-                    add += out.substr(at, std::min(unit, static_cast<std::size_t>(d) - add.size()));
-                out.insert(at, add);
-            }
-            ++stats.applied;
-            ++stats.heuristic;
-        } else {
-            ++stats.unhandled;
-        }
-    }
+    std::vector<std::string> out;
+    std::size_t start = 0;
+    for (std::size_t i = 0; i <= s.size(); ++i)
+        if (i == s.size() || s[i] == sep) { out.push_back(s.substr(start, i - start)); start = i + 1; }
     return out;
 }
 
-// ---- One decomposition of the two walks, shared by the ledger and by both reconstructions ----
-//
-// LCS anchors on step tokens: the maximal runs of steps between consecutive shared anchors are the
-// places the two walks disagree. Coordinate-free, so bubble orientation is irrelevant.
-std::vector<std::pair<std::size_t, std::size_t>> walk_anchors(const std::vector<PathStep>& ref_steps,
-                                                              const std::vector<PathStep>& hap_steps,
-                                                              bool& coarse) {
-    coarse = false;
-    const std::vector<std::uint64_t> rt = build_walk_tokens(ref_steps);
-    const std::vector<std::uint64_t> ht = build_walk_tokens(hap_steps);
-    const std::size_t n = rt.size(), m = ht.size();
-    std::vector<std::pair<std::size_t, std::size_t>> anchors;
-    // Guard the O(nm) table on pathological walks (a huge DUP). Falling back means the whole bubble
-    // becomes ONE block, which is a coarser decomposition, not a wrong one -- but it has to be counted,
-    // because a single block cannot separate a called event from an uncalled one beside it.
-    if (n == 0 || m == 0 || static_cast<std::uint64_t>(n) * m > 8000000ULL) {
-        if (n != 0 && m != 0) coarse = true;
-        return anchors;
-    }
-    std::vector<std::vector<std::uint32_t>> dp(n + 1, std::vector<std::uint32_t>(m + 1, 0));
-    for (std::size_t i = 0; i < n; ++i)
-        for (std::size_t j = 0; j < m; ++j)
-            dp[i + 1][j + 1] = (rt[i] == ht[j]) ? dp[i][j] + 1 : std::max(dp[i][j + 1], dp[i + 1][j]);
-    std::size_t i = n, j = m;
-    while (i > 0 && j > 0) {
-        if (rt[i - 1] == ht[j - 1]) { anchors.emplace_back(i - 1, j - 1); --i; --j; }
-        else if (dp[i - 1][j] >= dp[i][j - 1]) --i;
-        else --j;
-    }
-    std::reverse(anchors.begin(), anchors.end());
-    return anchors;
+std::size_t parse_count(const std::string& t, const std::string& what) {
+    char* end = nullptr;
+    const unsigned long long v = std::strtoull(t.c_str(), &end, 10);
+    if (t.empty() || end == t.c_str() || *end != '\0' || t[0] == '-')
+        throw std::runtime_error(what + ": '" + t + "' is not a count");
+    return static_cast<std::size_t>(v);
 }
 
-// One maximal divergent block: the reference takes ref_steps[ri0,ri1) where the haplotype takes
-// hap_steps[hi0,hi1). This is the unit `call` works in -- a difference between two walks -- so it is
-// the unit a truth ledger has to be built on. Its SIZE is a property of the two walks and of nothing
-// else: it does not move with the alignment, the threshold or the calls.
-struct TruthBlock {
-    std::size_t ri0 = 0, ri1 = 0, hi0 = 0, hi1 = 0;
-    std::size_t ref_bp = 0, hap_bp = 0;
-    std::size_t size_bp = 0;   // max(ref_bp, hap_bp): call gates a linked DEL/INS pair on the larger arm
-    int rec = -1;              // PRIMARY attribution: lowest variant id overlapping the block, so the
-                               // ledger stays a partition (one event, one svtype). -1 when none.
-    std::vector<int> recs_all; // EVERY overlapping record. A bubble can carry many records over one
-                               // divergent region and different carriers take different ones, so asking
-                               // whether a haplotype carries "the" record would really be asking whether
-                               // it carries whichever one the primary attribution happened to pick.
-};
-
-std::vector<TruthBlock> divergent_blocks(const Graph& graph,
-                                         const std::vector<PathStep>& ref_steps,
-                                         const std::vector<PathStep>& hap_steps,
-                                         const std::vector<std::pair<std::size_t, std::size_t>>& anchors,
-                                         const std::vector<CalledRecord>& recs) {
-    auto node_bp = [&](const std::vector<PathStep>& steps, std::size_t lo, std::size_t hi) {
-        std::size_t bp = 0;
-        for (std::size_t k = lo; k < hi; ++k) {
-            const auto it = graph.nodes.find(steps[k].node_id);
-            if (it != graph.nodes.end()) bp += it->second.sequence.size();
-        }
-        return bp;
-    };
-    std::vector<TruthBlock> out;
-    auto add = [&](std::size_t ri0, std::size_t ri1, std::size_t hi0, std::size_t hi1) {
-        if (ri1 == ri0 && hi1 == hi0) return;
-        TruthBlock b;
-        b.ri0 = ri0; b.ri1 = ri1; b.hi0 = hi0; b.hi1 = hi1;
-        b.ref_bp = node_bp(ref_steps, ri0, ri1);
-        b.hap_bp = node_bp(hap_steps, hi0, hi1);
-        b.size_bp = std::max(b.ref_bp, b.hap_bp);
-        // Attribute to every record whose nodes this block actually contains; the first (records are
-        // sorted by variant id) is the primary one. A block that merely sits in the same bubble as a
-        // record is not attributed to it.
-        for (std::size_t ri = 0; ri < recs.size(); ++ri) {
-            bool hit = false;
-            for (std::size_t k = ri0; k < ri1 && !hit; ++k)
-                if (recs[ri].nodes.count(ref_steps[k].node_id)) hit = true;
-            for (std::size_t k = hi0; k < hi1 && !hit; ++k)
-                if (recs[ri].nodes.count(hap_steps[k].node_id)) hit = true;
-            if (!hit) continue;
-            if (b.rec < 0) b.rec = static_cast<int>(ri);
-            b.recs_all.push_back(static_cast<int>(ri));
-        }
-        out.push_back(b);
-    };
-    std::size_t pi = 0, pj = 0;
-    for (const auto& a : anchors) {
-        add(pi, a.first, pj, a.second);
-        pi = a.first + 1;
-        pj = a.second + 1;
-    }
-    add(pi, ref_steps.size(), pj, hap_steps.size());
-    return out;
-}
-
-// Walk the reference, substituting the haplotype's own steps at every block `take` accepts. `applied`
-// reports whether anything was substituted.
-std::vector<PathStep> reconstruct(const std::vector<PathStep>& ref_steps,
-                                  const std::vector<PathStep>& hap_steps,
-                                  const std::vector<std::pair<std::size_t, std::size_t>>& anchors,
-                                  const std::vector<TruthBlock>& blocks,
-                                  const std::function<bool(const TruthBlock&)>& take,
-                                  bool& applied) {
-    applied = false;
-    std::unordered_map<std::size_t, const TruthBlock*> by_ri0;
-    for (const TruthBlock& b : blocks) by_ri0[b.ri0 * 1000003ULL + b.hi0] = &b;
-    std::vector<PathStep> out;
-    std::size_t pi = 0, pj = 0;
-    auto emit_block = [&](std::size_t ri1, std::size_t hi1) {
-        const auto it = by_ri0.find(pi * 1000003ULL + pj);
-        const bool substitute = it != by_ri0.end() && take(*it->second);
-        if (substitute) {
-            for (std::size_t k = pj; k < hi1; ++k) out.push_back(hap_steps[k]);
-            if (ri1 != pi || hi1 != pj) applied = true;
-        } else {
-            for (std::size_t k = pi; k < ri1; ++k) out.push_back(ref_steps[k]);
-        }
-    };
-    for (const auto& a : anchors) {
-        emit_block(a.first, a.second);
-        out.push_back(ref_steps[a.first]);  // shared anchor step
-        pi = a.first + 1;
-        pj = a.second + 1;
-    }
-    emit_block(ref_steps.size(), hap_steps.size());
-    return out;
-}
-
-// The truth ledger for one (haplotype, bubble): what was there to be found, and what became of it.
-struct Ledger {
-    std::size_t events = 0;
-    std::size_t called = 0, missed = 0, below = 0;
-    std::size_t called_bp = 0, missed_bp = 0, below_bp = 0;
-};
-
-struct BubbleObs {
-    std::size_t bubble_id = 0;
-    bool carrier = false;
-    std::size_t delta = 0;
-    std::size_t aln_len = 0;
-    std::size_t run_lt_bp = 0;   // residual in alignment runs < min-sv-bp
-    std::size_t run_ge_bp = 0;   // residual in alignment runs >= min-sv-bp
-    Ledger led;
-    // The called-only reconstruction: the reference with exactly the retained calls implanted.
-    std::size_t called_delta = 0;
-    std::size_t called_aln_len = 0;
-    // The same, but only where THIS haplotype's GT names the record as one it carries. The bridge
-    // between discovery and representation: `called` minus this is carrier-assignment loss, this minus
-    // `genotype` is what the VCF's encoding of those same calls costs.
-    bool carrier_scored = false;
-    std::size_t carrier_delta = 0;
-    std::size_t carrier_aln_len = 0;
-    // Every block at or above the threshold restored, regardless of any call. What remains is purely
-    // variation the caller was never asked to emit, so it is the floor the other levels are measured
-    // from -- without it, sub-threshold sequence is charged to the caller as a discovery failure.
-    std::size_t scope_delta = 0;
-    // Genotype-aware reconstruction over the same bubble against the same truth, plus the do-nothing
-    // baseline (plain reference) it has to beat. A VCF that closes none of the gap between the baseline
-    // and the graph bound is worth nothing here, and one that scores WORSE than the baseline is applying
-    // edits in the wrong place -- which is the invariant that makes this number readable.
-    bool gt_scored = false;
-    std::size_t gt_delta = 0;
-    std::size_t gt_aln_len = 0;
-    std::size_t ref_delta = 0;
-    std::size_t ref_aln_len = 0;
-    bool gt_called_carrier = false;   // the VCF genotypes this haplotype as carrying an alt here
-    bool gt_true_carrier = false;     // its walk really does diverge, by at least min-sv-bp
-};
-
-struct EventRow {
-    std::string sample;
-    std::size_t bubble_id = 0;
-    std::size_t ref_bp = 0, hap_bp = 0, size_bp = 0;
-    const char* klass = "";
+// One row of call's carrier_events.tsv: the event the listed carriers were called for, as the reference
+// interval [ref_start, ref_end] (1-based; ref_end = ref_start - 1 for an insertion before ref_start)
+// and the forward-strand bases that replace it.
+struct CarrierEvent {
     std::string variant_id;
+    std::size_t bubble_id = 0;
+    std::string kind;
+    std::size_t ref_start = 0, ref_end = 0;
+    std::string cn;
+    std::string walk_cn;
+    long long event_bp = 0;        // the event as call measured it: net change, an inversion's length
+    std::string alt;
+    std::vector<std::string> haplotypes;
+    std::size_t order = 0;         // --vcf: the record's place in the file
+    bool insertion() const { return ref_end + 1 == ref_start; }
+    std::size_t ref_len() const { return insertion() ? 0 : ref_end - ref_start + 1; }
+};
+
+std::vector<CarrierEvent> load_carrier_events(const std::string& path) {
+    std::ifstream in(path);
+    if (!in) throw std::runtime_error("cannot open " + path + " (written by call; rerun call to produce it)");
+    std::string line;
+    if (!std::getline(in, line) ||
+        line != "variant_id\tbubble_id\tkind\tref_start\tref_end\tcn\twalk_cn\tevent_bp\talt_bp\talt\thaplotypes")
+        throw std::runtime_error(path + ": not a carrier_events.tsv header");
+    std::vector<CarrierEvent> out;
+    std::size_t lineno = 1;
+    while (std::getline(in, line)) {
+        ++lineno;
+        if (line.empty()) continue;
+        const std::vector<std::string> f = split_on(line, '\t');
+        const std::string where = path + " line " + std::to_string(lineno);
+        if (f.size() != 11) throw std::runtime_error(where + ": expected 11 columns");
+        CarrierEvent e;
+        e.variant_id = f[0];
+        e.bubble_id = parse_count(f[1], where);
+        e.kind = f[2];
+        e.ref_start = parse_count(f[3], where);
+        e.ref_end = parse_count(f[4], where);
+        e.cn = f[5];
+        e.walk_cn = f[6];
+        if (f[7] != ".") {
+            char* end = nullptr;
+            e.event_bp = std::strtoll(f[7].c_str(), &end, 10);
+            if (end == f[7].c_str() || *end != '\0') throw std::runtime_error(where + ": event_bp is not a number");
+        }
+        e.alt = f[9] == "." ? std::string() : f[9];
+        if (parse_count(f[8], where) != e.alt.size()) throw std::runtime_error(where + ": alt_bp does not match alt");
+        if (e.kind != "unresolved" && (e.ref_start == 0 || e.ref_end + 1 < e.ref_start))
+            throw std::runtime_error(where + ": not a reference interval");
+        e.haplotypes = split_on(f[10], ',');
+        out.push_back(std::move(e));
+    }
+    return out;
+}
+
+// What the region VCF says about each record: its size and, per carrier, its copy number.
+struct VcfRecordInfo {
+    std::string id;
+    std::size_t pos = 0, end = 0;                         // POS and INFO/END (END = POS without one)
     std::string svtype;
+    bool has_svlen = false;
+    long long svlen = 0;
+    long long ref_cn = -1;
+    long long unit_bp = 0;                                // RU_LEN or CN_UNIT_BP: one copy
+    long long cn_ref_bp = 0;                              // CN_MODULE_REF_BP: the reference's copies, from POS+1
+    std::string ref, info;
+    std::vector<std::string> alts;
+    std::unordered_set<std::string> carriers;             // GT names an ALT
+    std::unordered_map<std::string, int> sample_allele;   // GT's allele index; -1 for '.'
+    std::unordered_map<std::string, long long> sample_cn;
+    std::unordered_map<std::string, long long> sample_cnbp;   // FORMAT:CNBP, the carrier's own change in bp
+};
+
+// Whether a record's change lies inside genomic [lo, hi]: an insertion goes in before POS+1, so it is inside
+// only when POS+1 is past lo and no further than hi; any other change runs from POS+1 to END.
+bool change_inside(const VcfRecordInfo& o, std::size_t lo, std::size_t hi) {
+    const std::size_t a = o.pos + 1, b = std::max(o.end, o.pos);
+    if (b < a) return a > lo && a <= hi;
+    return a <= hi && b >= lo;
+}
+
+// A record's length change as far as it falls inside [lo, hi]: a deletion reaching past an edge counts
+// only its bases inside; anything else counts whole.
+long long change_within(const VcfRecordInfo& o, long long change, std::size_t lo, std::size_t hi) {
+    const std::size_t a = o.pos + 1, b = std::max(o.end, o.pos);
+    if (change >= 0 || b < a || (a >= lo && b <= hi) || b < lo || a > hi) return change;
+    const std::size_t in = std::min(b, hi) + 1 - std::max(a, lo);
+    return std::max(change, -static_cast<long long>(in));
+}
+
+std::string info_field(const std::string& info, const std::string& key) {
+    for (const std::string& kv : split_on(info, ';')) {
+        const std::size_t eq = kv.find('=');
+        if (eq != std::string::npos && kv.compare(0, eq, key) == 0) return kv.substr(eq + 1);
+    }
+    return std::string();
+}
+
+bool has_flag(const std::string& info, const std::string& key) {
+    for (const std::string& kv : split_on(info, ';')) if (kv == key) return true;
+    return false;
+}
+
+std::vector<VcfRecordInfo> load_region_vcf(const std::string& path, std::vector<std::string>& samples) {
+    std::ifstream in(path);
+    if (!in) throw std::runtime_error("cannot open " + path);
+    std::vector<VcfRecordInfo> out;
+    std::string line;
+    bool header = false;
+    while (std::getline(in, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        // A --diploid VCF has a column per sample, not per path, even where its GTs show one haplotype.
+        if (line.rfind("##panvar_columns=diploid", 0) == 0)
+            throw std::runtime_error(path + " was written by call --diploid (one column per sample); benchmark scores "
+                                     "haplotypes (one column per path): rerun call without --diploid");
+        if (line.empty() || line.rfind("##", 0) == 0) continue;
+        const std::vector<std::string> f = split_on(line, '\t');
+        if (line.rfind("#CHROM", 0) == 0) { samples.assign(f.begin() + std::min<std::size_t>(9, f.size()), f.end()); header = true; continue; }
+        if (!header) throw std::runtime_error(path + ": a record before the #CHROM line; not a VCF call wrote");
+        if (f.size() < 9 + samples.size()) throw std::runtime_error(path + ": a record has fewer columns than samples");
+        VcfRecordInfo r;
+        r.id = f[2];
+        r.pos = std::stoull(f[1]);
+        const std::string en = info_field(f[7], "END");
+        r.end = en.empty() ? r.pos + (f[3].size() > 0 ? f[3].size() - 1 : 0) : std::stoull(en);
+        r.svtype = info_field(f[7], "SVTYPE");
+        r.ref = f[3];
+        r.alts = split_on(f[4], ',');
+        r.info = f[7];
+        const std::string sl = info_field(f[7], "SVLEN");
+        if (!sl.empty() && sl.find(',') == std::string::npos) { r.has_svlen = true; r.svlen = std::stoll(sl); }
+        const std::string rc = info_field(f[7], "REF_CN");
+        if (!rc.empty()) r.ref_cn = std::stoll(rc);
+        std::string unit = info_field(f[7], "RU_LEN");
+        if (unit.empty()) unit = info_field(f[7], "CN_UNIT_BP");
+        if (!unit.empty()) r.unit_bp = std::stoll(unit);
+        const std::string crb = info_field(f[7], "CN_MODULE_REF_BP");
+        if (!crb.empty()) r.cn_ref_bp = std::stoll(crb);
+        const std::vector<std::string> fmt = split_on(f[8], ':');
+        const auto gt_i = std::find(fmt.begin(), fmt.end(), "GT") - fmt.begin();
+        const auto cn_i = std::find(fmt.begin(), fmt.end(), "CN") - fmt.begin();
+        const auto cnbp_i = std::find(fmt.begin(), fmt.end(), "CNBP") - fmt.begin();
+        for (std::size_t s = 0; s < samples.size(); ++s) {
+            const std::vector<std::string> v = split_on(f[9 + s], ':');
+            if (static_cast<std::size_t>(gt_i) < v.size()) {
+                const std::string& gt = v[static_cast<std::size_t>(gt_i)];
+                if (gt.find_first_of("/|") != std::string::npos)
+                    throw std::runtime_error(path + ": record " + r.id + " has a diploid GT ('" + gt +
+                                             "'); benchmark scores haplotypes (one column per path)");
+                if (gt != "." && gt != "0") r.carriers.insert(samples[s]);
+                r.sample_allele[samples[s]] = gt == "." ? -1 : static_cast<int>(parse_count(gt, path + " GT"));
+            }
+            if (static_cast<std::size_t>(cn_i) < v.size() && v[static_cast<std::size_t>(cn_i)] != ".")
+                r.sample_cn[samples[s]] = std::stoll(v[static_cast<std::size_t>(cn_i)]);
+            if (static_cast<std::size_t>(cnbp_i) < v.size() && v[static_cast<std::size_t>(cnbp_i)] != ".")
+                r.sample_cnbp[samples[s]] = std::stoll(v[static_cast<std::size_t>(cnbp_i)]);
+        }
+        out.push_back(std::move(r));
+    }
+    return out;
+}
+
+// A difference between two sequences, from their alignment. Gaps (I/D columns) no more than `merge_gap`
+// aligned columns apart are one event, with the mismatches within `merge_gap` of either end; a run of
+// mismatches with no gap is an event where it is dense, one column in five or more over `min_event`
+// columns or more (an inversion or an equal-length replacement can align with few gaps). An event is
+// sized as call sizes a replaced run, by the larger of the bases each side holds over it: its gaps and
+// mismatches, and the chance matches between them.
+struct Diff {
+    std::size_t t0 = 0, t1 = 0;     // target interval [t0, t1)
+    std::size_t q0 = 0, q1 = 0;     // query interval [q0, q1)
+    std::size_t del_bp = 0, ins_bp = 0;
+    bool has_del = false, has_ins = false;
+    std::size_t size() const { return std::max(del_bp, ins_bp); }
+    const char* type() const { return !has_ins && has_del ? "DEL" : !has_del && has_ins ? "INS" : "SUB"; }
+};
+
+// Matches inside an event in runs shorter than this are chance matches; a longer run is shared sequence,
+// as a repeat lining up between scattered changes.
+constexpr std::size_t kChanceRun = 5;
+// A dense window is searched over at most this many mismatches from its start.
+constexpr std::size_t kMaxWindowMismatches = 2000;
+
+struct DiffSet {
+    std::vector<Diff> events;       // every event, any size
+    std::size_t mismatches = 0;     // mismatches outside every event (SNVs)
+};
+
+DiffSet diff_of(const std::string& ops, std::size_t merge_gap, std::size_t min_event) {
+    DiffSet out;
+    const std::size_t n = ops.size();
+    const auto gap = [&](std::size_t c) { return ops[c] == 'I' || ops[c] == 'D'; };
+    std::vector<std::pair<std::size_t, std::size_t>> spans;   // events as column intervals [c0, c1]
+    std::vector<char> dense;                                   // per span: a dense mismatch window
+    std::vector<std::pair<std::size_t, std::size_t>> cores;    // per span: its first and last gap (or the span)
+    std::vector<char> in_event(n, 0);
+    // Gap clusters, widened by the mismatches within merge_gap of either end.
+    for (std::size_t c = 0; c < n;) {
+        if (!gap(c)) { ++c; continue; }
+        std::size_t c0 = c, c1 = c;
+        for (std::size_t k = c + 1; k < n && k <= c1 + merge_gap + 1; ++k) if (gap(k)) c1 = k;
+        const std::size_t g0 = c0, g1 = c1;
+        for (std::size_t k = g0; k-- > 0 && g0 - k <= merge_gap && !gap(k);) if (ops[k] == 'X') c0 = k;
+        for (std::size_t k = g1 + 1; k < n && k - g1 <= merge_gap && !gap(k); ++k) if (ops[k] == 'X') c1 = k;
+        spans.emplace_back(c0, c1);
+        dense.push_back(0);
+        cores.emplace_back(g0, g1);
+        for (std::size_t k = c0; k <= c1; ++k) in_event[k] = 1;
+        c = c1 + 1;
+    }
+    // Mismatch runs outside the gap clusters: each within merge_gap of the next. A dense window of one is an
+    // event; a window is grown from each mismatch as far as it stays dense, so sparse mismatches beside a
+    // dense stretch do not dilute it.
+    std::vector<std::size_t> lone;
+    for (std::size_t c = 0; c < n; ++c) if (ops[c] == 'X' && !in_event[c]) lone.push_back(c);
+    for (std::size_t a = 0; a < lone.size();) {
+        std::size_t b = a;
+        while (b + 1 < lone.size() && lone[b + 1] - lone[b] <= merge_gap + 1) ++b;
+        for (std::size_t i = a; i <= b;) {
+            // The furthest mismatch keeping the window dense, within a bounded number of mismatches.
+            std::size_t best = i;
+            const std::size_t last = std::min(b, i + kMaxWindowMismatches);
+            for (std::size_t j = last; j > i; --j)
+                if (5 * (j - i + 1) >= lone[j] - lone[i] + 1) { best = j; break; }
+            const std::size_t span = lone[best] - lone[i] + 1;
+            if (best > i && span >= min_event) {
+                spans.emplace_back(lone[i], lone[best]);
+                dense.push_back(1);
+                cores.emplace_back(lone[i], lone[best]);
+                i = best + 1;
+            }
+            else ++i;
+        }
+        a = b + 1;
+    }
+    // Spans within merge_gap of each other: a dense window joins the spans beside it; two gap clusters are
+    // one event only when the stretch between their gaps, any dense window there included, is one mismatch
+    // in five or more (an inverted or replaced stretch). Gap clusters with mostly matches between their
+    // gaps stay apart, however short a dense window between them.
+    std::vector<std::size_t> order(spans.size());
+    std::iota(order.begin(), order.end(), std::size_t{0});
+    std::sort(order.begin(), order.end(), [&](std::size_t x, std::size_t y) { return spans[x] < spans[y]; });
+    std::vector<std::pair<std::size_t, std::size_t>> merged;
+    constexpr std::size_t kNoGap = static_cast<std::size_t>(-1);
+    std::size_t gap_core = kNoGap;   // the last gap in the event being built, kNoGap while it has none
+    for (const std::size_t i : order) {
+        const auto& sp = spans[i];
+        bool join = !merged.empty() && sp.first <= merged.back().second + merge_gap + 1;
+        if (join && !dense[i] && gap_core != kNoGap) {
+            std::size_t x = 0;
+            const std::size_t from = gap_core + 1, to = cores[i].first;   // columns strictly between the gaps
+            for (std::size_t k = from; k < to; ++k) x += ops[k] == 'X';
+            join = to <= from || 5 * x >= to - from;
+        }
+        if (join) merged.back().second = std::max(merged.back().second, sp.second);
+        else { merged.push_back(sp); gap_core = kNoGap; }
+        if (!dense[i]) gap_core = gap_core == kNoGap ? cores[i].second : std::max(gap_core, cores[i].second);
+    }
+    // Mismatches outside every event are SNVs.
+    {
+        std::size_t e = 0;
+        for (std::size_t c = 0; c < n; ++c) {
+            while (e < merged.size() && merged[e].second < c) ++e;
+            if (ops[c] == 'X' && !(e < merged.size() && merged[e].first <= c)) ++out.mismatches;
+        }
+    }
+    // Target and query positions per column, then each event's extent on both sides.
+    std::size_t t = 0, q = 0, m = 0;
+    for (std::size_t c = 0; c < n; ++c) {
+        while (m < merged.size() && merged[m].first == c) {
+            Diff d;
+            d.t0 = t;
+            d.q0 = q;
+            std::size_t tt = t, qq = q, run = 0, chance = 0, nd = 0, ni = 0, nx = 0;
+            for (std::size_t k = merged[m].first; k <= merged[m].second; ++k) {
+                const char o = ops[k];
+                if (o != 'I') ++tt;
+                if (o != 'D') ++qq;
+                if (o == 'M') { ++run; continue; }
+                if (run < kChanceRun) chance += run;
+                run = 0;
+                if (o == 'X') ++nx;
+                if (o == 'D') ++nd;
+                if (o == 'I') ++ni;
+            }
+            d.has_del = nd > 0;
+            d.has_ins = ni > 0;
+            // A deletion or insertion alone: its gap bases (the aligner scatters chance matches through
+            // it too). A replacement or inversion -- mismatches or gaps on both sides, in 40% of its
+            // columns or more -- the bases each side holds, chance matches included. Scattered changes
+            // in a repeat, with fewer edits between longer matches, count as their edits.
+            const std::size_t cols = merged[m].second - merged[m].first + 1;
+            const bool replaced = 4 * (std::min(nd, ni) + nx) >= std::max(nd, ni) && 5 * (nd + ni + nx) >= 2 * cols;
+            d.del_bp = nd + nx + (replaced ? chance : 0);
+            d.ins_bp = ni + nx + (replaced ? chance : 0);
+            d.t1 = tt;
+            d.q1 = qq;
+            out.events.push_back(d);
+            ++m;
+        }
+        if (ops[c] != 'I') ++t;
+        if (ops[c] != 'D') ++q;
+    }
+    return out;
+}
+
+// Where on the target an insertion or deletion alone can lie with the same result: inside a repeat its
+// bases can be written at any copy, and an aligner picks one end. [s0, s1) spans every placement; false
+// for any other event, which keeps its own place.
+bool slide_of(const std::string& target, const std::string& query, const Diff& d, std::size_t& s0, std::size_t& s1) {
+    if (d.has_del == d.has_ins || d.t1 > target.size() || d.q1 > query.size()) return false;
+    // The bases the two sides share at either end are not part of it (an aligner can thread matches
+    // through a gap); what remains must be bases on one side only.
+    std::size_t t0 = d.t0, t1 = d.t1, q0 = d.q0, q1 = d.q1;
+    while (t0 < t1 && q0 < q1 && target[t0] == query[q0]) { ++t0; ++q0; }
+    while (t0 < t1 && q0 < q1 && target[t1 - 1] == query[q1 - 1]) { --t1; --q1; }
+    if ((t0 < t1) == (q0 < q1)) return false;
+    if (t0 < t1) {   // target[a, b) removed
+        const std::size_t a = t0, b = t1, len = b - a;
+        std::size_t lo = a, hi = b;
+        while (lo > 0 && target[lo - 1] == target[lo - 1 + len]) --lo;
+        while (hi < target.size() && target[hi] == target[hi - len]) ++hi;
+        s0 = lo; s1 = hi;
+        return true;
+    }
+    // query[q0, q1) put in before target[t0]: moved right by k, it starts at ins[k % len]; moved left, it
+    // ends at ins[len - 1 - k % len]
+    const std::string ins = query.substr(q0, q1 - q0);
+    const std::size_t len = ins.size();
+    std::size_t lo = t0, hi = t0;
+    while (hi < target.size() && target[hi] == ins[(hi - t0) % len]) ++hi;
+    while (lo > 0 && target[lo - 1] == ins[len - 1 - (t0 - lo) % len]) --lo;
+    s0 = lo; s1 = hi;
+    return true;
+}
+
+// Global alignment of `target` and `query` cut at blocks both hold exactly: (target pos, query pos,
+// length), increasing in both. Each stretch between blocks is aligned on its own and the blocks are
+// matches, so a large copy-number difference costs only its own stretch, not the whole region.
+std::string aligned_ops(const std::string& target, const std::string& query,
+                        const std::vector<std::array<std::size_t, 3>>& blocks) {
+    std::string ops, part;
+    std::size_t t = 0, q = 0;
+    for (const auto& [bt, bq, len] : blocks) {
+        if (bt < t || bq < q || bt + len > target.size() || bq + len > query.size()) continue;
+        if (target.compare(bt, len, query, bq, len) != 0) continue;
+        nw_edit_ops(target.substr(t, bt - t), query.substr(q, bq - q), part);
+        ops += part;
+        ops.append(len, 'M');
+        t = bt + len;
+        q = bq + len;
+    }
+    nw_edit_ops(target.substr(t), query.substr(q), part);
+    ops += part;
+    return ops;
+}
+
+// Exact blocks to cut an alignment at: runs of 500 bases or more whose 31-mers occur once in `target` and
+// once in `query`, on one diagonal, chained co-linearly to hold the most bases. Sequence anchors, not
+// graph nodes, so a copy call placed at another offset in a repeat than the walk does is not forced
+// there; a k-mer inside a repeated copy is not unique, so the aligner stays free to place copies.
+// `conflict` is set when a run left out of the chain crosses it: the sequences hold a block in another
+// order (a moved or swapped segment), and the chain may then not lie on the best alignment.
+std::vector<std::array<std::size_t, 3>> kmer_blocks(const std::string& target, const std::string& query,
+                                                    bool& conflict) {
+    conflict = false;
+    constexpr std::size_t k = 31;
+    const auto code = [](char c) -> int {
+        switch (c) { case 'A': case 'a': return 0; case 'C': case 'c': return 1; case 'G': case 'g': return 2;
+                     case 'T': case 't': return 3; default: return -1; }
+    };
+    const auto scan = [&](const std::string& s, const auto& fn) {
+        std::uint64_t v = 0;
+        std::size_t run = 0;
+        const std::uint64_t mask = (std::uint64_t{1} << (2 * k)) - 1;
+        for (std::size_t i = 0; i < s.size(); ++i) {
+            const int c = code(s[i]);
+            if (c < 0) { run = 0; v = 0; continue; }
+            v = ((v << 2) | static_cast<std::uint64_t>(c)) & mask;
+            if (++run >= k) fn(v, i + 1 - k);
+        }
+    };
+    std::unordered_map<std::uint64_t, std::size_t> tpos;   // k-mer -> position, SIZE_MAX when repeated
+    tpos.reserve(target.size());
+    scan(target, [&](std::uint64_t v, std::size_t p) {
+        auto [it, fresh] = tpos.try_emplace(v, p);
+        if (!fresh) it->second = SIZE_MAX;
+    });
+    std::unordered_map<std::uint64_t, std::size_t> qcount;
+    qcount.reserve(query.size());
+    scan(query, [&](std::uint64_t v, std::size_t) { ++qcount[v]; });
+    std::vector<std::pair<std::size_t, std::size_t>> hits;   // (query pos, target pos), query order
+    scan(query, [&](std::uint64_t v, std::size_t p) {
+        const auto it = tpos.find(v);
+        if (it != tpos.end() && it->second != SIZE_MAX && qcount[v] == 1) hits.emplace_back(p, it->second);
+    });
+    // Only long runs anchor: in unique sequence they run for as long as the sequence is unique, while
+    // inside a repeat a copy-specific difference makes a run of a few dozen bases.
+    constexpr std::size_t kMinRun = 500;
+    std::vector<std::array<std::size_t, 3>> runs;   // (target, query, length), query order
+    for (const auto& [q, t] : hits) {
+        if (!runs.empty()) {
+            auto& r = runs.back();
+            if (q == r[1] + r[2] - k + 1 && t == r[0] + r[2] - k + 1) { ++r[2]; continue; }
+        }
+        runs.push_back({t, q, k});
+    }
+    // Shorter unique runs still show order: a segment that moved can hold no run of kMinRun (a few
+    // differences in it break its runs up) and still cross the chain. Runs of kMinCross or more are kept to
+    // look for that.
+    constexpr std::size_t kMinCross = 200;
+    std::vector<std::array<std::size_t, 3>> short_runs;
+    for (const auto& r : runs) if (r[2] >= kMinCross && r[2] < kMinRun) short_runs.push_back(r);
+    runs.erase(std::remove_if(runs.begin(), runs.end(), [](const auto& r) { return r[2] < kMinRun; }), runs.end());
+    // The chain of non-overlapping runs, increasing in both, holding the most bases.
+    const std::size_t nr = runs.size();
+    std::vector<std::size_t> best(nr, 0), prev(nr, SIZE_MAX);
+    for (std::size_t a = 0; a < nr; ++a) {
+        best[a] = runs[a][2];
+        for (std::size_t b = 0; b < a; ++b)
+            if (runs[b][0] + runs[b][2] <= runs[a][0] && runs[b][1] + runs[b][2] <= runs[a][1] &&
+                best[b] + runs[a][2] > best[a]) { best[a] = best[b] + runs[a][2]; prev[a] = b; }
+    }
+    std::vector<std::array<std::size_t, 3>> blocks;
+    if (nr == 0) return blocks;
+    std::size_t top = 0;
+    for (std::size_t a = 1; a < nr; ++a) if (best[a] > best[top]) top = a;
+    std::vector<char> chained(nr, 0);
+    for (std::size_t a = top; a != SIZE_MAX; a = prev[a]) { blocks.push_back(runs[a]); chained[a] = 1; }
+    std::reverse(blocks.begin(), blocks.end());
+    // A run left out crosses the chain when its middle lies before a chained run on one sequence and
+    // after it on the other; two runs beside a small indel only overlap by a few bases.
+    const auto crosses = [&](const std::array<std::size_t, 3>& r) {
+        const std::size_t mt = r[0] + r[2] / 2, mq = r[1] + r[2] / 2;
+        for (const auto& b : blocks)
+            if ((mt < b[0] && mq >= b[1] + b[2]) || (mt >= b[0] + b[2] && mq < b[1])) return true;
+        return false;
+    };
+    for (std::size_t a = 0; a < nr && !conflict; ++a) if (!chained[a] && crosses(runs[a])) conflict = true;
+    for (std::size_t a = 0; a < short_runs.size() && !conflict; ++a) if (crosses(short_runs[a])) conflict = true;
+    return blocks;
+}
+
+// The alignment of `target` and `query`, as edit operations. Cut at exact blocks when they are all in
+// order; when one is out of order, the cut alignment is only an upper bound, and the exact one is found
+// within it.
+std::string align_ops(const std::string& target, const std::string& query) {
+    bool conflict = false;
+    const std::vector<std::array<std::size_t, 3>> blocks = kmer_blocks(target, query, conflict);
+    std::string ops = aligned_ops(target, query, blocks);
+    if (!conflict) return ops;
+    const std::size_t bound = static_cast<std::size_t>(std::count_if(ops.begin(), ops.end(), [](char o) { return o != 'M'; }));
+    if (bound == 0) return ops;
+    std::string exact;
+    if (nw_edit_ops_bounded(target, query, bound - 1, exact) != SIZE_MAX) return exact;
+    return ops;
+}
+
+// Where a stretch of the reference repeats itself with a period near `unit`: the offset d at which the
+// most 31-mers recur -- within a tenth of `unit` if any recur there, else from unit/2 to 3 unit/2 -- and
+// the first position x0 of a k-mer recurring at d. Copies that share segments at more than one offset
+// (one copy carrying an insertion the other lacks) give several; `unit`, call's own measure of a copy,
+// picks between them. A copy is then [x0, x0 + d): deleting it or adding it there is what a recombination
+// between two copies does. `forms` gets every offset with a quarter of the strongest one's support, with
+// its x0 and support: the reference's copies when they come in several lengths. False when nothing recurs
+// (a reference with one copy).
+struct CopyForm { std::size_t start = 0, length = 0, support = 0; };
+bool period_of(const std::string& seq, std::size_t unit, std::size_t& d, std::size_t& x0,
+               std::vector<CopyForm>& forms) {
+    constexpr std::size_t k = 31, kMaxOcc = 64;
+    if (seq.size() < 2 * k || unit < 2) return false;
+    const std::size_t dlo = unit / 2, dhi = unit + unit / 2;
+    std::unordered_map<std::uint64_t, std::vector<std::uint32_t>> at;
+    std::uint64_t v = 0;
+    std::size_t run = 0;
+    const std::uint64_t mask = (std::uint64_t{1} << (2 * k)) - 1;
+    for (std::size_t i = 0; i < seq.size(); ++i) {
+        int c = -1;
+        switch (seq[i]) { case 'A': case 'a': c = 0; break; case 'C': case 'c': c = 1; break;
+                          case 'G': case 'g': c = 2; break; case 'T': case 't': c = 3; break; default: break; }
+        if (c < 0) { run = 0; v = 0; continue; }
+        v = ((v << 2) | static_cast<std::uint64_t>(c)) & mask;
+        if (++run >= k) at[v].push_back(static_cast<std::uint32_t>(i + 1 - k));
+    }
+    std::unordered_map<std::size_t, std::size_t> votes;
+    std::unordered_map<std::size_t, std::size_t> first;
+    for (const auto& [kmer, pos] : at) {
+        if (pos.size() < 2 || pos.size() > kMaxOcc) continue;
+        for (std::size_t a = 0; a < pos.size(); ++a)
+            for (std::size_t b = a + 1; b < pos.size(); ++b) {
+                const std::size_t dd = pos[b] - pos[a];
+                if (dd < dlo || dd > dhi) continue;
+                ++votes[dd];
+                const auto [it, fresh] = first.try_emplace(dd, pos[a]);
+                if (!fresh) it->second = std::min<std::size_t>(it->second, pos[a]);
+            }
+    }
+    // An offset near `unit` is taken only with a quarter of the strongest offset's support: a few
+    // k-mers recurring there by chance must not stand for the copies.
+    std::size_t strongest = 0;
+    for (const auto& [dd, n] : votes) strongest = std::max(strongest, n);
+    std::size_t best = 0;
+    for (const bool near : {true, false}) {
+        for (const auto& [dd, n] : votes) {
+            if (near && 10 * (dd > unit ? dd - unit : unit - dd) > unit) continue;
+            if (n > best || (n == best && dd < d)) { best = n; d = dd; }
+        }
+        if (near && 4 * best < strongest) best = 0;
+        if (best > 0) break;
+    }
+    if (best == 0) return false;
+    x0 = first.at(d);
+    forms.clear();
+    for (const auto& [dd, n] : votes) if (4 * n >= strongest) forms.push_back({first.at(dd), dd, n});
+    std::sort(forms.begin(), forms.end(), [](const CopyForm& a, const CopyForm& b) { return a.length < b.length; });
+    return true;
+}
+
+// A piece of a reconstruction: target positions [r0, r1) copy the reference from g0 (genomic), or are
+// an applied event replacing [g0, g1] (genomic, g1 = g0 - 1 for an insertion).
+struct Piece {
+    std::size_t r0 = 0, r1 = 0;
+    std::size_t g0 = 0, g1 = 0;
+    int event = -1;                 // index into the haplotype's applied events, -1 for reference
+};
+
+struct LargeRow {
+    std::string haplotype;
+    std::size_t g0 = 0, g1 = 0;     // genomic interval the difference sits at
+    // where it may sit: [g0, g1], or the whole of an applied event it lies in, whose bases are the
+    // carrier's own and map to the reference only in proportion
+    std::size_t m0 = 0, m1 = 0;
+    std::size_t w0 = 0, w1 = 0;     // [g0, g1] widened over every place an indel alone can slide to
+    std::string type;
+    std::size_t size = 0, del_bp = 0, ins_bp = 0;
+    std::string cause;
+    std::string bubbles = ".";
+    std::string records = ".";
 };
 
 struct HapResult {
-    std::string sample;
-    bool scored = false;
-    bool joined = false;
-    std::size_t sum_delta = 0;
-    std::size_t sum_aln = 0;
-    std::size_t sum_run_lt = 0;
-    std::size_t sum_run_ge = 0;
-    std::size_t called_sum_delta = 0;
-    std::size_t called_sum_aln = 0;
-    bool carrier_scored = false;
-    std::size_t carrier_sum_delta = 0;
-    std::size_t carrier_sum_aln = 0;
-    std::size_t gt_absent_records = 0;   // a called record with no VCF row to read a GT from
-    Ledger led;
-    bool gt_scored = false;
-    std::size_t gt_sum_delta = 0;
-    std::size_t gt_sum_aln = 0;
-    std::size_t ref_sum_delta = 0;
-    std::size_t ref_sum_aln = 0;
-    std::size_t coarse_blocks = 0;     // bubbles whose walks were too big to decompose
-    std::size_t skipped_bubbles = 0;   // bubbles this haplotype does not traverse
-    GtStats gt_stats;
-    std::vector<BubbleObs> obs;
-    std::vector<EventRow> events;
+    std::string name;
+    std::string status = "scored";
+    std::size_t g_start = 0, g_end = 0;
+    std::size_t applied = 0, conflicts = 0, outside_extent = 0, unresolved = 0, absorbed = 0;
+    std::size_t present_n = 0, present_bp = 0, present_small_bp = 0, present_snv = 0;
+    std::size_t left_n = 0, left_bp = 0, left_small_bp = 0, left_snv = 0;
+    std::map<std::string, std::size_t> left_by_cause;
+    struct Span { std::string id; std::size_t lo = 0, hi = 0; };
+    std::vector<Span> applied_spans;        // where each applied event sits (genomic)
+    std::set<std::string> outside_ids;      // records whose event lies past the scored stretch
+    std::vector<LargeRow> rows;
+    // the large differences between the plain reference and the haplotype: what there was to find
+    struct Present { std::size_t g0 = 0, g1 = 0, size = 0, del_bp = 0, ins_bp = 0; const char* type = "DEL"; std::string bubbles = "."; };
+    std::vector<Present> present_rows;
+};
+
+struct CheckRow {
+    std::string variant_id, haplotype, kind, reported, own;
+    long long difference = 0;
 };
 
 } // namespace
@@ -611,940 +646,1262 @@ struct HapResult {
 int run_benchmark_command(const std::vector<std::string>& args) {
     if (args.empty()) { print_benchmark_help(); return 0; }
 
-    std::string gfa_path, bubble_prefix_in, bubbles_csv_in, variant_nodes_in, vcf_in, reference_path, out_prefix;
-    std::size_t threads = 0;
-    std::size_t min_sv_bp = 50;   // event-size threshold for the truth ledger (match the call run)
+    std::string gfa_path, bubble_prefix_in, bubbles_csv_in, calls_prefix, reference_path, out_prefix;
+    std::size_t threads = 0, min_sv_bp = 50, merge_gap = 10;
     bool quiet = false;
-    // Every reference-traversed bubble is scored. Restricting to called bubbles cannot measure a miss:
-    // the bubble a caller said nothing about is precisely the one a miss lives in.
-    bool called_only = false;
-    bool write_events = true;
-    // How a copy-number record is laid down. `cnbp` -- the per-sample bp delta -- is the default: it is
-    // the measured quantity, where CN x RU_LEN understates the true bp change at a cyclic array.
-    bool dup_cn_model = false;
-
     for (std::size_t i = 0; i < args.size(); ++i) {
-        const std::string& arg = args[i];
+        const std::string arg = cli::renamed_input_flag(args[i], "benchmark");
         auto require_value = [&](const std::string& flag) -> const std::string& {
             if (i + 1 >= args.size()) throw std::runtime_error("Missing value after " + flag);
             return args[++i];
         };
         if (arg == "-h" || arg == "--help") { print_benchmark_help(); return 0; }
         else if (arg == "-i" || arg == "--gfa") gfa_path = require_value(arg);
-        else if (arg == "-b" || arg == "--bubble-prefix-in") bubble_prefix_in = require_value(arg);
-        else if (arg == "-c" || arg == "--bubbles-csv-in") bubbles_csv_in = require_value(arg);
-        else if (arg == "--variant-nodes") variant_nodes_in = require_value(arg);
-        else if (arg == "--vcf") vcf_in = require_value(arg);
-        else if (arg == "--dup-model") {
-            const std::string v = require_value(arg);
-            if (v == "cn") dup_cn_model = true;
-            else if (v == "cnbp") dup_cn_model = false;
-            else throw std::runtime_error("--dup-model must be cn or cnbp");
-        }
+        else if (arg == "-b" || arg == "--bubble-prefix") bubble_prefix_in = require_value(arg);
+        else if (arg == "-c" || arg == "--bubbles-csv") bubbles_csv_in = require_value(arg);
+        else if (arg == "--calls") calls_prefix = require_value(arg);
         else if (arg == "-r" || arg == "--reference-path") reference_path = require_value(arg);
         else if (arg == "-o" || arg == "--out-prefix") out_prefix = require_value(arg);
-        else if (arg == "--called-bubbles-only") called_only = true;
-        // Retained: scoring every bubble is now the default, so this asks for what it already gets.
-        else if (arg == "--all-bubbles") called_only = false;
-        else if (arg == "--no-truth-events") write_events = false;
         else if (arg == "--min-sv-bp") min_sv_bp = cli::parse_size_arg(arg, require_value(arg));
-        else if (arg == "--threads") threads = cli::parse_size_arg(arg, require_value(arg));
+        else if (arg == "--merge-gap") merge_gap = cli::parse_size_arg(arg, require_value(arg));
+        else if (arg == "-t" || arg == "--threads") threads = cli::parse_size_arg(arg, require_value(arg));
         else if (arg == "-q" || arg == "--quiet") quiet = true;
         else throw std::runtime_error("Unknown option for benchmark: " + arg);
     }
-
     if (gfa_path.empty()) throw std::runtime_error("Missing required input: --gfa <path>");
     if (!bubble_prefix_in.empty()) {
         const std::string derived = bubble_prefix_in + ".bubbles.csv";
         if (bubbles_csv_in.empty()) bubbles_csv_in = derived;
         else if (bubbles_csv_in != derived)
-            throw std::runtime_error("Conflicting bubble inputs: --bubble-prefix-in resolves to '" +
-                                     derived + "' but --bubbles-csv-in is '" + bubbles_csv_in + "'");
+            throw std::runtime_error("Conflicting bubble inputs: --bubble-prefix resolves to '" + derived +
+                                     "' but --bubbles-csv is '" + bubbles_csv_in + "'");
     }
-    if (bubbles_csv_in.empty())
-        throw std::runtime_error("benchmark requires --bubble-prefix-in <prefix> or --bubbles-csv-in <path>");
-    if (variant_nodes_in.empty()) throw std::runtime_error("benchmark requires --variant-nodes <path>");
-    if (reference_path.empty()) throw std::runtime_error("--reference-path is required for module 'benchmark'");
+    if (bubbles_csv_in.empty()) throw std::runtime_error("benchmark requires --bubble-prefix <prefix> or --bubbles-csv <path>");
+    if (calls_prefix.empty()) throw std::runtime_error("benchmark requires --calls <call_prefix>");
+    if (reference_path.empty()) throw std::runtime_error("benchmark requires --reference-path <name>");
     if (out_prefix.empty()) throw std::runtime_error("benchmark requires -o/--out-prefix <prefix>");
     if (min_sv_bp == 0) throw std::runtime_error("--min-sv-bp must be at least 1");
-
-    // Every destination is resolved and checked against every input BEFORE anything is opened, then
-    // written to a staged sibling and renamed in only once the run has succeeded.
-    std::vector<std::string> finals = {out_prefix + ".qv.tsv",
-                                       out_prefix + ".qv_by_haplotype.tsv",
-                                       out_prefix + ".qv_summary.tsv"};
-    if (write_events) finals.push_back(out_prefix + ".truth_events.tsv");
-    {
-        const std::vector<std::string> inputs = {gfa_path, bubbles_csv_in, variant_nodes_in, vcf_in};
-        std::unordered_set<std::string> seen_out;
-        for (const std::string& f : finals) {
-            if (!seen_out.insert(f).second)
-                throw std::runtime_error("benchmark: two outputs would be written to the same file: " + f);
-            for (const std::string& in : inputs) {
-                if (in.empty()) continue;
-                std::error_code ec;
-                if (f == in || std::filesystem::equivalent(f, in, ec))
-                    throw std::runtime_error("benchmark: output '" + f + "' is also an input; refusing to "
-                                             "overwrite what the run reads");
-            }
+    // Two stages from one call run: each carrier's own events (what call found), then the VCF's records
+    // (what the file keeps). Both are scored and written together.
+    struct ModeSpec {
+        bool vcf = false;
+        std::string vcf_in, ce_in;
+    };
+    const std::string vcf_in_path = calls_prefix + ".region.vcf", ce_in_path = calls_prefix + ".carrier_events.tsv";
+    const std::vector<ModeSpec> specs = {{false, vcf_in_path, ce_in_path}, {true, vcf_in_path, std::string()}};
+    const std::vector<std::string> finals = {out_prefix + ".summary.tsv", out_prefix + ".haplotypes.tsv",
+                                             out_prefix + ".events.tsv", out_prefix + ".carrier_checks.tsv",
+                                             out_prefix + ".present.tsv"};
+    for (const std::string& f : finals)
+        for (const std::string& in : {gfa_path, bubbles_csv_in, vcf_in_path, ce_in_path}) {
+            std::error_code ec;
+            if (f == in || std::filesystem::equivalent(f, in, ec))
+                throw std::runtime_error("benchmark: output '" + f + "' is also an input; refusing to "
+                                         "overwrite what the run reads");
         }
-    }
 
     ParseGfaOptions parse_options;
     parse_options.include_paths = true;
     parse_options.include_sequences = true;
     const Graph graph = parse_gfa(gfa_path, parse_options);
-    if (graph.paths.empty())
-        throw std::runtime_error("Input GFA has no P/W paths; benchmarking requires paths");
-    // benchmark spells every walk by concatenating whole segments and measures bp from them, so a step
-    // naming a missing node, a step pair with no link, a duplicate path name and a non-zero overlap all
-    // corrupt the numbers rather than failing.
     validate_graph_paths(graph, "benchmark", true, true);
     const std::string ref_name = resolve_reference_path_name(graph, reference_path, "benchmark");
-
-    cli::RunLog log("benchmark", quiet);
-    log.info("input " + gfa_path + " (" + std::to_string(graph.nodes.size()) + " nodes, " +
-             std::to_string(graph.paths.size()) + " paths); reference " + ref_name);
-
-    const std::vector<Bubble> all_bubbles_csv = read_bubbles_csv(bubbles_csv_in);
-    {
-        std::unordered_set<std::size_t> seen;
-        for (const Bubble& b : all_bubbles_csv) {
-            auto need = [&](const std::string& n) {
-                if (!graph.nodes.count(n))
-                    throw std::runtime_error("bubble " + std::to_string(b.id) + " names node '" + n +
-                                             "', which is not in " + gfa_path +
-                                             " -- the CSV and the graph do not describe the same data");
-            };
-            need(b.source);
-            need(b.sink);
-            for (const std::string& n : b.inside) need(n);
-            if (!seen.insert(b.id).second)
-                throw std::runtime_error("bubbles CSV has a duplicate bubble id " + std::to_string(b.id) +
-                                         ": which site a call or a score refers to would be undefined");
-        }
-    }
-    const std::unordered_map<std::size_t, std::unordered_set<std::string>> bubble_members =
-        bubble_member_nodes(all_bubbles_csv);
-    const VariantNodes cv = load_variant_nodes(variant_nodes_in, bubble_members, "benchmark");
     const PathRecord* ref_path = nullptr;
     for (const PathRecord& p : graph.paths) if (p.name == ref_name) ref_path = &p;
 
-    std::vector<Bubble> bubbles;
-    for (const Bubble& b : all_bubbles_csv) if (!called_only || cv.bubble_ids.count(b.id)) bubbles.push_back(b);
+    cli::RunLog log("benchmark", quiet);
+    log.info("reading: " + gfa_path);
+    log.info("input: haplotypes: " + std::to_string(graph.paths.size()) + "; nodes: " +
+             std::to_string(graph.nodes.size()));
+    log.info("reference: " + ref_name);
+    log.info("calls: " + calls_prefix);
 
-    // Reference walk per scored bubble (the reconstruction backbone). A bubble the reference doesn't
-    // traverse has no baseline, so it is dropped from scoring -- counted, never silent.
-    const BubblePathIndex ref_index = build_bubble_path_index(*ref_path);
-    std::unordered_map<std::size_t, std::vector<PathStep>> ref_steps;
-    for (const Bubble& b : bubbles) {
-        const auto s = bubble_steps(*ref_path, ref_index, b);
-        if (s) ref_steps[b.id] = *s;
-    }
-    const std::size_t no_ref_bubbles = bubbles.size() - ref_steps.size();
-    log.info("scoring " + std::to_string(ref_steps.size()) + " of " + std::to_string(bubbles.size()) +
-             (called_only ? " called bubbles" : " bubbles") + " across " +
-             std::to_string(graph.paths.size()) + " haplotypes (" + std::to_string(no_ref_bubbles) +
-             " not traversed by the reference), event threshold " + std::to_string(min_sv_bp) + " bp");
-
-    // Genotype-aware scoring, when a VCF is supplied. VCF POS lives in the reference path's own forward
-    // coordinates, so each bubble's reference span is taken as a substring there and the reconstruction
-    // is flipped back for bubbles the reference crosses sink->source.
-    const bool do_gt = !vcf_in.empty();
-    // Without a VCF only the two truth-assisted levels can be scored, and every column from
-    // carrier_sum_delta onward is written as `.`. That is a silently PARTIAL result: a reader sees a
-    // populated table and no indication that half the analysis did not run, and the plotting script
-    // then fails on the empty columns. Say so once, prominently.
-    if (!do_gt) {
-        log.info("no --vcf: scoring the `graph` and `called` levels ONLY. The `carrier` and "
-                 "`region_vcf` levels, the loss partition (loss_bp) and variation_recovered are NOT "
-                 "computed, and their columns are written as `.`");
-        log.info("  pass call's <prefix>.region.vcf for the interpreted reconstruction, or its "
-                 "<prefix>.alleles.vcf (call --allele-vcf) for the lossless one");
-    }
-    VcfData vcf;
-    std::unordered_map<std::size_t, std::vector<const VcfRecord*>> recs_by_bubble;
-    std::vector<int> hap_vcf(graph.paths.size(), -1);
-    std::unordered_map<std::size_t, std::pair<std::size_t, std::size_t>> ref_span;  // bubble -> [bp start, bp len)
-    std::unordered_map<std::size_t, bool> ref_flip;
-    std::string ref_seq;
-    std::size_t region_start = 1;
-    std::size_t joined = 0, unjoined_samples = 0;
-    if (do_gt) {
-        vcf = load_vcf(vcf_in);
-        for (const VcfRecord& r : vcf.records) recs_by_bubble[r.bubble_id].push_back(&r);
-        std::unordered_map<std::string, std::size_t> sample_of;
-        for (std::size_t i = 0; i < vcf.samples.size(); ++i) sample_of[vcf.samples[i]] = i;
-        std::unordered_set<std::size_t> used;
-        for (std::size_t i = 0; i < graph.paths.size(); ++i) {
-            const auto it = sample_of.find(graph.paths[i].name);
-            if (it != sample_of.end()) { hap_vcf[i] = static_cast<int>(it->second); used.insert(it->second); ++joined; }
-        }
-        unjoined_samples = vcf.samples.size() - used.size();
-        if (joined == 0)
-            throw std::runtime_error("No VCF sample column matches a graph path name, so no haplotype "
-                                     "can be region-VCF scored: " + vcf_in);
-        region_start = parse_reference_path_label(ref_path->name).region_start_1based;
-
-        std::vector<std::size_t> prefix(ref_path->steps.size() + 1, 0);
-        for (std::size_t i = 0; i < ref_path->steps.size(); ++i) {
-            const auto nit = graph.nodes.find(ref_path->steps[i].node_id);
-            prefix[i + 1] = prefix[i] + (nit != graph.nodes.end() ? nit->second.sequence.size() : 0);
-        }
-        ref_seq = spell_path_steps_sequence(graph, ref_path->steps);
+    // ---- the reference, and each bubble's span on it ----
+    const std::string ref_seq = spell_path_steps_sequence(graph, ref_path->steps);
+    // The name's interval convention follows from the path's length (see parse_reference_path_label).
+    const ParsedReferencePath ref_meta = parse_reference_path_label(ref_name, ref_seq.size(), ref_path->type == 'W');
+    if (ref_meta.length_mismatch)
+        std::cerr << cli::log_prefix("benchmark") << "warning: the interval in reference path name '" << ref_name
+                  << "' does not match the path's " << ref_seq.size() << " bp; reading its start as "
+                  << (ref_meta.half_open ? "0-based (half-open)" : "the W line's start, plus one") << "\n";
+    if (!ref_meta.has_interval)
+        std::cerr << cli::log_prefix("benchmark") << "warning: reference path name '" << ref_name << "' has no :start-end interval; "
+                  << "positions are counted from the path's first base (1)\n";
+    const std::size_t region_start = ref_meta.region_start_1based;
+    std::vector<std::size_t> ref_prefix(ref_path->steps.size() + 1, 0);
+    for (std::size_t k = 0; k < ref_path->steps.size(); ++k)
+        ref_prefix[k + 1] = ref_prefix[k] + graph.nodes.at(ref_path->steps[k].node_id).sequence.size();
+    const std::vector<Bubble> bubbles = read_bubbles_csv(bubbles_csv_in, /*with_inversion_sites=*/true);
+    // The sites CSV and the GFA are separate inputs: a table from another graph would leave every
+    // difference outside the sites, so one naming nodes this graph lacks, or one id twice, is refused.
+    {
+        std::unordered_set<std::size_t> seen_ids;
+        std::vector<std::string> missing;
         for (const Bubble& b : bubbles) {
-            if (!ref_steps.count(b.id)) continue;
-            std::size_t lo = 0, hi = 0;
-            bool flip = false, ok = false;
-            const auto iv = find_best_bubble_path_interval(ref_index, b);
-            if (iv.has_value()) {
-                lo = std::min(iv->left, iv->right);
-                hi = std::max(iv->left, iv->right);
-                flip = !iv->source_to_sink;
-                ok = true;
-            } else {
-                // The same fallback bubble_steps uses: an adjacent source/sink pair with no interior.
-                const auto si = ref_index.positions.find(b.source);
-                const auto ki = ref_index.positions.find(b.sink);
-                if (si != ref_index.positions.end() && ki != ref_index.positions.end()) {
-                    const std::unordered_set<std::size_t> sink_pos(ki->second.begin(), ki->second.end());
-                    for (const std::size_t p : si->second)
-                        if (sink_pos.count(p + 1)) { lo = p; hi = p + 1; ok = true; break; }
-                    if (!ok) {
-                        const std::unordered_set<std::size_t> src_pos(si->second.begin(), si->second.end());
-                        for (const std::size_t p : ki->second)
-                            if (src_pos.count(p + 1)) { lo = p; hi = p + 1; flip = true; ok = true; break; }
-                    }
-                }
-            }
-            if (!ok || hi + 1 >= prefix.size()) continue;
-            ref_span[b.id] = { prefix[lo], prefix[hi + 1] - prefix[lo] };
-            ref_flip[b.id] = flip;
+            if (!seen_ids.insert(b.id).second)
+                throw std::runtime_error("benchmark: duplicate bubble id in " + bubbles_csv_in + ": " + std::to_string(b.id));
+            const auto check = [&](const std::string& n) {
+                if (graph.nodes.find(n) == graph.nodes.end() && missing.size() < 8)
+                    missing.push_back("bubble " + std::to_string(b.id) + " node " + n);
+            };
+            check(b.source);
+            check(b.sink);
+            for (const std::string& n : b.inside) check(n);
         }
-        log.info("region-VCF scoring from " + vcf_in + ": " + std::to_string(vcf.records.size()) +
-                 " records, " + std::to_string(joined) + "/" + std::to_string(graph.paths.size()) +
-                 " haplotypes joined to VCF samples, " + std::to_string(ref_span.size()) +
-                 "/" + std::to_string(bubbles.size()) + " bubbles placed on the reference");
-        // A partial join is a selected subset, and a QV computed over a subset is not the QV of the run.
-        if (joined != graph.paths.size() || unjoined_samples)
-            log.info("warning: the region-VCF score covers " + std::to_string(joined) + " of " +
-                     std::to_string(graph.paths.size()) + " graph haplotypes; " +
-                     std::to_string(graph.paths.size() - joined) + " path(s) have no VCF column and " +
-                     std::to_string(unjoined_samples) + " VCF sample(s) have no path. It is a SUBSET score");
+        if (!missing.empty())
+            throw std::runtime_error("benchmark: the bubbles CSV describes nodes the GFA does not contain (" +
+                                     cli::join_with_comma(missing) + "); the CSV and the graph are not the same graph");
     }
-
-    // variant_nodes.tsv carries no haplotype column -- one row per RECORD, holding the union of nodes
-    // over every merged event and every carrier -- so which haplotype carries a record is only knowable
-    // from the VCF. That join is by record id, and it only exists for the REGION VCF: `call --allele-vcf`
-    // writes one row per BUBBLE (`bubbleN_ALLELES`) spelling every allele, which shares no id with a
-    // per-call row. Assuming the join silently produced carrier_walk 0% and a 1.4 Mb "missed carrier"
-    // loss on C4 while the genotype level correctly read 0 bp residual, so the mode is now decided
-    // explicitly and refuses anything in between.
-    std::unordered_map<std::string, const VcfRecord*> vcf_by_id;
-    bool allele_mode = false;
-    if (do_gt) {
-        for (const VcfRecord& r : vcf.records)
-            if (r.id != ".") vcf_by_id.emplace(r.id, &r);
-        std::size_t joined_recs = 0, total_recs = 0;
-        for (const auto& [bid, recs] : cv.records)
-            for (const CalledRecord& rec : recs) {
-                ++total_recs;
-                const auto vit = vcf_by_id.find(rec.variant_id);
-                if (vit == vcf_by_id.end()) continue;
-                // A matching id must also agree on the site, or the two files describe different runs.
-                if (vit->second->has_bubble_id && vit->second->bubble_id != bid)
-                    throw std::runtime_error("record '" + rec.variant_id + "' is at bubble " +
-                                             std::to_string(bid) + " in " + variant_nodes_in + " but at bubble " +
-                                             std::to_string(vit->second->bubble_id) + " in " + vcf_in);
-                ++joined_recs;
-            }
-        std::size_t allele_rows = 0;
-        for (const VcfRecord& r : vcf.records) if (r.allele_style) ++allele_rows;
-        if (total_recs != 0 && joined_recs == 0 && allele_rows == vcf.records.size() && !vcf.records.empty()) {
-            allele_mode = true;
-            // "One record per bubble" is the allele VCF's whole contract: the reconstruction takes the
-            // haplotype's GT as an index into that bubble's allele list, so a second record at the same
-            // bubble would silently make which allele a GT names depend on file order.
-            std::unordered_set<std::size_t> seen_bubbles;
-            for (const VcfRecord& r : vcf.records)
-                if (!seen_bubbles.insert(r.bubble_id).second)
-                    throw std::runtime_error(vcf_in + ": two allele records at bubble " +
-                                             std::to_string(r.bubble_id) + " ('" + r.id +
-                                             "'); an allele VCF carries exactly one record per bubble");
-        } else if (joined_recs != total_recs) {
-            throw std::runtime_error(
-                vcf_in + ": " + std::to_string(joined_recs) + " of " + std::to_string(total_recs) +
-                " records in " + variant_nodes_in + " have a VCF row with the same ID. A region VCF must "
-                "match all of them and an allele VCF none; a partial match means the two files are from "
-                "different runs");
-        }
-        // The join must be exact in BOTH directions. Checking only that every call has a VCF row lets a
-        // stale or superset VCF through, and its extra records are applied as edits by the genotype
-        // level while contributing to no truth attribution -- a silent superset of the run being scored.
-        if (!allele_mode) {
-            std::unordered_set<std::string> called_ids;
-            for (const auto& [bid, recs] : cv.records)
-                for (const CalledRecord& rec : recs) called_ids.insert(rec.variant_id);
-            std::size_t extra = 0;
-            std::string first_extra;
-            for (const VcfRecord& r : vcf.records)
-                if (r.id != "." && !called_ids.count(r.id)) {
-                    if (!extra) first_extra = r.id;
-                    ++extra;
-                }
-            if (extra)
-                throw std::runtime_error(vcf_in + " has " + std::to_string(extra) + " record(s) with no row "
-                                         "in " + variant_nodes_in + " (first: '" + first_extra +
-                                         "'). The two must describe the same call set exactly, or the "
-                                         "region_vcf level applies edits nothing else accounts for");
+    std::vector<std::pair<std::size_t, std::pair<std::size_t, std::size_t>>> bubble_span;   // id -> genomic [lo, hi]
+    {
+        const BubblePathIndex ridx = build_bubble_path_index(*ref_path);
+        for (const Bubble& b : bubbles) {
+            std::vector<std::size_t> used;
+            if (!bubble_steps(*ref_path, ridx, b, nullptr, &used) || used.empty()) continue;
+            // The interior, from the last base of the near boundary to the first of the far one: the
+            // boundary nodes are shared sequence.
+            const auto [lo, hi] = std::minmax_element(used.begin(), used.end());
+            bubble_span.push_back({b.id, {region_start + ref_prefix[*lo + 1] - 1, region_start + ref_prefix[*hi]}});
         }
     }
 
-    std::vector<HapResult> results(graph.paths.size());
-    static const std::vector<CalledRecord> kNoCalled;
+    // ---- each haplotype, once for every mode: its strand, the stretch it shares with the reference, and
+    // the alignment of the plain reference over it ----
+    std::unordered_map<std::string, std::size_t> ref_count;
+    for (const PathStep& s : ref_path->steps) ++ref_count[s.node_id];
+    std::unordered_map<std::string, std::size_t> ref_pos_of;   // unique reference node -> step index
+    for (std::size_t k = 0; k < ref_path->steps.size(); ++k)
+        if (ref_count[ref_path->steps[k].node_id] == 1) ref_pos_of[ref_path->steps[k].node_id] = k;
+    struct Prep {
+        std::string status = "not_prepared";   // "scored" once its alignment is done
+        std::size_t g_start = 0, g_end = 0, o0 = 0, o1 = 0;
+        std::string truth;
+        DiffSet base;
+    };
+    std::vector<Prep> preps(graph.paths.size());
+    // Only the paths the VCF has a column for are scored.
+    std::unordered_set<std::string> in_vcf_header;
+    {
+        std::ifstream vh(vcf_in_path);
+        if (!vh) throw std::runtime_error("cannot open " + vcf_in_path);
+        for (std::string l; std::getline(vh, l);) {
+            if (!l.empty() && l.back() == '\r') l.pop_back();
+            if (l.rfind("#CHROM", 0) == 0) {
+                const std::vector<std::string> f = split_on(l, '\t');
+                in_vcf_header.insert(f.begin() + std::min<std::size_t>(9, f.size()), f.end());
+                break;
+            }
+        }
+    }
+    {
+        std::size_t to_align = 0;
+        for (const PathRecord& p : graph.paths) to_align += &p != ref_path && in_vcf_header.count(p.name);
+        log.info("aligning to the reference: " + std::to_string(to_align) + " haplotypes");
+    }
     run_parallel(graph.paths.size(), threads, [&](std::size_t pi) {
         const PathRecord& path = graph.paths[pi];
-        HapResult& hr = results[pi];
-        hr.sample = path.name;
-        hr.joined = do_gt && hap_vcf[pi] >= 0;
-        if (&path == ref_path) return;
-        const BubblePathIndex idx = build_bubble_path_index(path);
-        for (const Bubble& b : bubbles) {
-            const auto rit = ref_steps.find(b.id);
-            if (rit == ref_steps.end()) continue;                // reference doesn't traverse -> no baseline
-            const auto steps = bubble_steps(path, idx, b);
-            if (!steps) { ++hr.skipped_bubbles; continue; }      // haplotype doesn't traverse
-            const std::string truth = spell_path_steps_sequence(graph, *steps);
-            const auto crit = cv.records.find(b.id);
-            const std::vector<CalledRecord>& recs = crit != cv.records.end() ? crit->second : kNoCalled;
+        if (&path == ref_path || !in_vcf_header.count(path.name)) return;
+        Prep& pr = preps[pi];
+        // Orientation and extent from the nodes the haplotype and the reference each hold once: the
+        // haplotype is turned to the reference's strand, and both are cut to the longest co-linear
+        // chain of such nodes, so a partial assembly is not charged for the sequence it does not have.
+        std::unordered_map<std::string, std::size_t> hcount;
+        for (const PathStep& s : path.steps) ++hcount[s.node_id];
+        std::size_t same = 0, opposite = 0;
+        int first_same = -1, last_same = -1;   // the orientation of the haplotype's first and last anchors
+        for (const PathStep& s : path.steps) {
+            const auto it = ref_pos_of.find(s.node_id);
+            if (it == ref_pos_of.end() || hcount[s.node_id] != 1) continue;
+            const bool sm = s.reverse == ref_path->steps[it->second].reverse;
+            (sm ? same : opposite) += 1;
+            if (first_same < 0) first_same = sm;
+            last_same = sm;
+        }
+        if (same + opposite == 0) { pr.status = "no_shared_anchor"; return; }
+        std::vector<PathStep> hsteps = path.steps;
+        // The haplotype's direction comes from its two ends when they agree, else from most of its anchors:
+        // an inversion longer than both flanks together would outvote them.
+        const bool flip = first_same == last_same ? first_same == 0 : opposite > same;
+        if (flip) {
+            std::reverse(hsteps.begin(), hsteps.end());
+            for (PathStep& s : hsteps) s.reverse = !s.reverse;
+        }
+        std::vector<std::pair<std::size_t, std::size_t>> anchors;   // (hap step, ref step)
+        for (std::size_t k = 0; k < hsteps.size(); ++k) {
+            const auto it = ref_pos_of.find(hsteps[k].node_id);
+            if (it != ref_pos_of.end() && hcount[hsteps[k].node_id] == 1 &&
+                hsteps[k].reverse == ref_path->steps[it->second].reverse)
+                anchors.emplace_back(k, it->second);
+        }
+        // longest chain increasing in both (patience sort on the reference index)
+        std::vector<std::size_t> tails, tail_idx, prev(anchors.size(), SIZE_MAX);
+        for (std::size_t a = 0; a < anchors.size(); ++a) {
+            const auto pos = std::lower_bound(tails.begin(), tails.end(), anchors[a].second) - tails.begin();
+            if (static_cast<std::size_t>(pos) == tails.size()) { tails.push_back(anchors[a].second); tail_idx.push_back(a); }
+            else { tails[static_cast<std::size_t>(pos)] = anchors[a].second; tail_idx[static_cast<std::size_t>(pos)] = a; }
+            if (pos > 0) prev[a] = tail_idx[static_cast<std::size_t>(pos) - 1];
+        }
+        if (tail_idx.empty()) { pr.status = "no_shared_anchor"; return; }
+        std::size_t last = tail_idx.back(), first = last;
+        while (prev[first] != SIZE_MAX) first = prev[first];
+        std::size_t h0 = anchors[first].first, h1 = anchors[last].first;
+        std::size_t r0 = anchors[first].second, r1 = anchors[last].second;
+        // A haplotype whose walk starts (ends) on the reference's own first (last) node, the same way, is
+        // complete at that end: scored to the region's edge, so a deletion right after it counts.
+        const auto same_step = [](const PathStep& a, const PathStep& b) {
+            return a.node_id == b.node_id && a.reverse == b.reverse;
+        };
+        if (same_step(hsteps.front(), ref_path->steps.front())) { h0 = 0; r0 = 0; }
+        if (same_step(hsteps.back(), ref_path->steps.back())) { h1 = hsteps.size() - 1; r1 = ref_path->steps.size() - 1; }
+        pr.truth = spell_path_steps_sequence(
+            graph, std::vector<PathStep>(hsteps.begin() + static_cast<std::ptrdiff_t>(h0),
+                                         hsteps.begin() + static_cast<std::ptrdiff_t>(h1) + 1));
+        pr.o0 = ref_prefix[r0];
+        pr.o1 = ref_prefix[r1 + 1];   // reference offsets [o0, o1)
+        pr.g_start = region_start + pr.o0;
+        pr.g_end = region_start + pr.o1 - 1;
+        pr.base = diff_of(align_ops(ref_seq.substr(pr.o0, pr.o1 - pr.o0), pr.truth), merge_gap, min_sv_bp);
+        pr.status = "scored";
+    });
 
-            // ONE decomposition, three consumers: the ledger, the optimistic graph reconstruction and
-            // the strict called-only one. They cannot disagree about what a block is.
-            bool coarse = false;
-            const auto anchors = walk_anchors(rit->second, *steps, coarse);
-            if (coarse) ++hr.coarse_blocks;
-            const std::vector<TruthBlock> blocks =
-                divergent_blocks(graph, rit->second, *steps, anchors, recs);
-
-            BubbleObs o;
-            o.bubble_id = b.id;
-            for (const TruthBlock& blk : blocks) {
-                if (blk.size_bp == 0) continue;                  // identical content, nothing to find
-                ++o.led.events;
-                const char* klass;
-                if (blk.size_bp < min_sv_bp) { ++o.led.below; o.led.below_bp += blk.size_bp; klass = "below_threshold"; }
-                // `called` = a specific record shares at least one node with this block. That is
-                // attribution, not coverage: it does not establish that the record spans the block or
-                // represents it correctly.
-                else if (blk.rec >= 0)       { ++o.led.called; o.led.called_bp += blk.size_bp; klass = "called"; }
-                else                          { ++o.led.missed; o.led.missed_bp += blk.size_bp; klass = "missed"; }
-                if (write_events) {
-                    EventRow er;
-                    er.sample = path.name;
-                    er.bubble_id = b.id;
-                    er.ref_bp = blk.ref_bp;
-                    er.hap_bp = blk.hap_bp;
-                    er.size_bp = blk.size_bp;
-                    er.klass = klass;
-                    er.variant_id = blk.rec >= 0 ? recs[static_cast<std::size_t>(blk.rec)].variant_id : ".";
-                    er.svtype = blk.rec >= 0 ? recs[static_cast<std::size_t>(blk.rec)].svtype : ".";
-                    hr.events.push_back(std::move(er));
+    // What one stage leaves, per haplotype, and its counts.
+    struct Stage {
+        std::vector<HapResult> results;
+        std::vector<CheckRow> checks;
+        std::size_t checked = 0, unchecked = 0, cn_checked = 0, cn_unchecked = 0, unresolved_rows = 0;
+        std::size_t not_reconstructable = 0, missing_gt = 0, not_in_vcf = 0;
+        std::vector<VcfRecordInfo> vcf;
+    };
+    Stage stages[2];
+    const auto score_mode = [&](const ModeSpec& spec, Stage& out) {
+    const bool vcf_mode = spec.vcf;
+    const std::string& vcf_in = spec.vcf_in;
+    const std::string& ce_in = spec.ce_in;
+    // ---- call's output: the VCF and each carrier's own event ----
+    std::vector<std::string> vcf_samples;
+    const std::vector<VcfRecordInfo> vcf = load_region_vcf(vcf_in, vcf_samples);
+    std::unordered_map<std::string, const VcfRecordInfo*> vcf_by_id;
+    // Records are matched to carrier events and to what is left by their ID.
+    for (const VcfRecordInfo& r : vcf)
+        if (r.id.empty() || r.id == "." || !vcf_by_id.emplace(r.id, &r).second)
+            throw std::runtime_error(vcf_in + ": record at POS " + std::to_string(r.pos) + " has " +
+                                     (r.id.empty() || r.id == "." ? std::string("no ID") : "the repeated ID '" + r.id + "'") +
+                                     "; benchmark names each record by a unique ID");
+    // --vcf: each record's written allele, for every haplotype whose GT names it. A copy-number record has
+    // no sequence: a gain is (CN - REF_CN) tandem copies of one reference copy, a loss deletes that many.
+    // One reference copy, genomic (start, length): one period where the reference's copies repeat, else
+    // the copies' last RU_LEN / CN_UNIT_BP bases; with one reference copy, its span or those bases. The copies run for CN_MODULE_REF_BP from POS+1 (a UNIT
+    // record's END is its first copy's). Real copies differ in length and content, so this approximates.
+    // A carrier of a MODULE record with FORMAT:CNBP gets the form of the reference's copies that fits its own
+    // change per copy: paralogous copies come in several lengths, and one length cannot stand for all its
+    // carriers. CNBP is the net change over the copies, so the carrier's other records there come off it
+    // first. A UNIT record's copies are one period.
+    // period: the copy is a period at which the reference's copies repeat, so a whole copy away is another
+    struct CopyForms { std::pair<std::size_t, std::size_t> fallback; std::vector<CopyForm> forms; bool period = false; };
+    std::map<std::string, CopyForms> copy_cache;
+    const auto copy_of = [&](const VcfRecordInfo& r, const std::string& h) -> std::pair<std::size_t, std::size_t> {
+        auto it = copy_cache.find(r.id);
+        if (it == copy_cache.end()) {
+            CopyForms cf;
+            const std::size_t span = r.cn_ref_bp > 0 ? static_cast<std::size_t>(r.cn_ref_bp) : std::max(r.end, r.pos) - r.pos;
+            const std::size_t aend = r.pos + span, unit = static_cast<std::size_t>(std::max(0LL, r.unit_bp));
+            cf.fallback = {0, unit};   // start 0: its length known, no reference copy to spell
+            if (r.ref_cn == 1 && r.cn_ref_bp > 0 && r.pos >= region_start && aend < region_start + ref_seq.size()) {
+                cf.fallback = {r.pos + 1, span};   // the reference holds one copy: the span is it
+                // unless the copies are a shorter stretch inside it: the carrier's change then tells
+                if (unit > 0 && unit < span) cf.forms = {{r.pos + 1, span, 1}, {aend - unit + 1, unit, 1}};
+            } else if (unit > 0 && unit <= span && r.pos >= region_start && aend < region_start + ref_seq.size()) {
+                cf.fallback = {aend - unit + 1, unit};
+                // The period is looked for near the span over the reference's copies: CN_UNIT_BP is only
+                // what the copies share, short of a copy where they differ.
+                const std::size_t hint = r.ref_cn >= 2 && r.cn_ref_bp > 0 ? span / static_cast<std::size_t>(r.ref_cn) : unit;
+                std::size_t pd = 0, px = 0;
+                std::vector<CopyForm> forms;
+                if (r.ref_cn >= 2 && period_of(ref_seq.substr(r.pos + 1 - region_start, span), hint, pd, px, forms)) {
+                    cf.fallback = {r.pos + 1 + px, pd};
+                    cf.period = true;
+                    for (CopyForm& f : forms) { f.start += r.pos + 1; cf.forms.push_back(f); }
                 }
             }
-
-            // Optimistic: substitute wherever the block shares a node with ANY call at this bubble.
-            const auto nit = cv.nodes.find(b.id);
-            static const std::unordered_set<std::string> kEmptyNodes;
-            const std::unordered_set<std::string>& union_nodes =
-                nit != cv.nodes.end() ? nit->second : kEmptyNodes;
-            bool applied = false;
-            const std::vector<PathStep> recon_steps =
-                reconstruct(rit->second, *steps, anchors, blocks,
-                            [&](const TruthBlock& blk) {
-                                for (std::size_t k = blk.ri0; k < blk.ri1; ++k)
-                                    if (union_nodes.count(rit->second[k].node_id)) return true;
-                                for (std::size_t k = blk.hi0; k < blk.hi1; ++k)
-                                    if (union_nodes.count((*steps)[k].node_id)) return true;
-                                return false;
-                            }, applied);
-            const std::string recon = spell_path_steps_sequence(graph, recon_steps);
-            const NwAlign nw = nw_edit_distance(recon, truth, min_sv_bp);
-
-            // Strict: substitute only blocks that map to a specific emitted call AND reach the threshold.
-            bool c_applied = false;
-            const std::vector<PathStep> called_steps =
-                reconstruct(rit->second, *steps, anchors, blocks,
-                            [&](const TruthBlock& blk) { return blk.rec >= 0 && blk.size_bp >= min_sv_bp; },
-                            c_applied);
-            const NwAlign cnw = nw_edit_distance(spell_path_steps_sequence(graph, called_steps), truth);
-
-            bool s_applied = false;
-            const std::vector<PathStep> scope_steps =
-                reconstruct(rit->second, *steps, anchors, blocks,
-                            [&](const TruthBlock& blk) { return blk.size_bp >= min_sv_bp; }, s_applied);
-            o.scope_delta =
-                nw_edit_distance(spell_path_steps_sequence(graph, scope_steps), truth).edits;
-
-            // carrier_walk: the same substitution, additionally requiring that THIS haplotype's GT
-            // names the record. It uses the haplotype's true graph steps, exactly as `called` does, so
-            // the only difference between them is whether the carrier was correctly identified. Needs
-            // a VCF and a joined column; without one there is no GT to read and the level is absent
-            // rather than assumed.
-            const int hv_i = (do_gt && !allele_mode) ? hap_vcf[pi] : -1;
-            if (hv_i >= 0) {
-                const std::size_t hv = static_cast<std::size_t>(hv_i);
-                bool w_applied = false;
-                const std::vector<PathStep> carrier_steps =
-                    reconstruct(rit->second, *steps, anchors, blocks,
-                                [&](const TruthBlock& blk) {
-                                    if (blk.rec < 0 || blk.size_bp < min_sv_bp) return false;
-                                    for (const int ri : blk.recs_all) {
-                                        const auto vit = vcf_by_id.find(
-                                            recs[static_cast<std::size_t>(ri)].variant_id);
-                                        if (vit == vcf_by_id.end()) { ++hr.gt_absent_records; continue; }
-                                        if (hv < vit->second->gt.size() && vit->second->gt[hv] >= 1)
-                                            return true;
+            it = copy_cache.emplace(r.id, std::move(cf)).first;
+        }
+        const CopyForms& cf = it->second;
+        const auto cn = r.sample_cn.find(h);
+        const auto bp = r.sample_cnbp.find(h);
+        if (cf.forms.empty() || cn == r.sample_cn.end() || bp == r.sample_cnbp.end() || cn->second == r.ref_cn ||
+            info_field(r.info, "CN_METHOD") != "MODULE")
+            return cf.fallback;
+        long long own = bp->second;
+        const std::size_t span_end = r.pos + (r.cn_ref_bp > 0 ? static_cast<std::size_t>(r.cn_ref_bp) : r.end - r.pos);
+        for (const VcfRecordInfo& o : vcf) {
+            if (&o == &r || !change_inside(o, r.pos + 1, span_end)) continue;   // changing the copies
+            const auto a = o.sample_allele.find(h);
+            if (a == o.sample_allele.end() || a->second <= 0 || static_cast<std::size_t>(a->second) > o.alts.size()) continue;
+            const std::string& alt = o.alts[static_cast<std::size_t>(a->second) - 1];
+            if (alt.empty() || alt[0] != '<')
+                own -= change_within(o, static_cast<long long>(alt.size()) - static_cast<long long>(o.ref.size()), r.pos + 1, span_end);
+            else if (alt.rfind("<CNV", 0) != 0 && alt != "<INV>" && o.has_svlen) own -= change_within(o, o.svlen, r.pos + 1, span_end);   // an INV's SVLEN changes no length
+        }
+        const long long per = std::llabs(own) / std::llabs(cn->second - r.ref_cn);
+        // Lengths within 2% (100 bp at least) of the carrier's are one form, many offsets of one copy: the
+        // best supported of them, so a shifted copy is not taken for a closer length; of equal support, the nearer.
+        const auto gap = [&](const CopyForm& f) { return std::llabs(static_cast<long long>(f.length) - per); };
+        const long long tol = std::max(100LL, per / 50);
+        const CopyForm* best = nullptr;
+        for (const CopyForm& f : cf.forms)
+            if (gap(f) <= tol && (best == nullptr || f.support > best->support || (f.support == best->support && gap(f) < gap(*best)))) best = &f;
+        if (best == nullptr)
+            best = &*std::min_element(cf.forms.begin(), cf.forms.end(),
+                                      [&](const CopyForm& x, const CopyForm& y) { return gap(x) < gap(y); });
+        return {best->start, best->length};
+    };
+    std::size_t vcf_not_reconstructable = 0, vcf_missing_gt = 0;
+    std::vector<CarrierEvent> cevents;
+    if (vcf_mode) {
+        const std::size_t ref_lo = region_start, ref_hi = region_start + ref_seq.size() - 1;   // genomic
+        auto ref_at = [&](std::size_t g0, std::size_t g1) {   // genomic [g0, g1], g1 >= g0 - 1
+            return g1 + 1 <= g0 ? std::string() : ref_seq.substr(g0 - region_start, g1 - g0 + 1);
+        };
+        std::map<std::tuple<std::string, std::size_t, std::size_t, std::string>, std::size_t> row_of;
+        auto add = [&](const VcfRecordInfo& r, const char* kind, std::size_t g0, std::size_t g1,
+                       const std::string& alt, const std::string& cn, const std::string& h) {
+            const auto key = std::make_tuple(r.id + '\t' + kind + '\t' + cn, g0, g1, alt);
+            auto it = row_of.find(key);
+            if (it == row_of.end()) {
+                CarrierEvent e;
+                e.order = static_cast<std::size_t>(&r - vcf.data());
+                e.variant_id = r.id; e.kind = kind; e.ref_start = g0; e.ref_end = g1; e.cn = cn;
+                e.walk_cn = "."; e.alt = alt;
+                e.event_bp = static_cast<long long>(alt.size()) - static_cast<long long>(g1 + 1 - g0);
+                it = row_of.emplace(key, cevents.size()).first;
+                cevents.push_back(std::move(e));
+            }
+            cevents[it->second].haplotypes.push_back(h);
+        };
+        for (const VcfRecordInfo& r : vcf) {
+            bool reconstructable = true;
+            for (const auto& [h, a] : r.sample_allele) {
+                if (a < 0) { ++vcf_missing_gt; continue; }
+                if (a == 0) continue;
+                if (static_cast<std::size_t>(a) > r.alts.size())
+                    throw std::runtime_error(vcf_in + ": record " + r.id + " GT names an allele it does not have");
+                const std::string& alt = r.alts[static_cast<std::size_t>(a) - 1];
+                const bool subst = has_flag(r.info, "SUBSTITUTION");
+                const std::size_t end = std::max(r.end, r.pos);
+                if (r.pos < ref_lo || end > ref_hi) { reconstructable = false; add(r, "unresolved", 0, 0, std::string(), ".", h); continue; }
+                if (alt.empty() || alt[0] != '<') {
+                    // sequence-resolved: REF at POS replaced by ALT, their shared first bases trimmed
+                    const auto upper = [](std::string x) {
+                        for (char& ch : x) ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
+                        return x;
+                    };
+                    if (upper(ref_at(r.pos, r.pos + r.ref.size() - 1)) != upper(r.ref))
+                        throw std::runtime_error(vcf_in + ": record " + r.id + " REF does not match the reference at POS "
+                                                 + std::to_string(r.pos));
+                    std::size_t c = 0;
+                    while (c < r.ref.size() && c < alt.size() &&
+                           std::toupper(static_cast<unsigned char>(r.ref[c])) == std::toupper(static_cast<unsigned char>(alt[c]))) ++c;
+                    add(r, "seq", r.pos + c, r.pos + r.ref.size() - 1, alt.substr(c), ".", h);
+                } else if (alt == "<DEL>" || alt == "<INS>") {
+                    const std::string ins = info_field(r.info, "INSSEQ");
+                    // An insertion, or a replacement, spells its new sequence from INSSEQ.
+                    if ((alt == "<INS>" || subst) && ins.empty()) { reconstructable = false; add(r, "unresolved", 0, 0, std::string(), ".", h); continue; }
+                    if (alt == "<INS>" && !subst) add(r, "ins", r.pos + 1, r.pos, ins, ".", h);
+                    else add(r, alt == "<DEL>" && !subst ? "del" : "sub", r.pos + 1, end, subst ? ins : std::string(), ".", h);
+                } else if (alt == "<INV>") {
+                    add(r, "inv", r.pos + 1, end, reverse_complement(ref_at(r.pos + 1, end)), ".", h);
+                } else if (alt.rfind("<CNV", 0) == 0) {
+                    const auto cit = r.sample_cn.find(h);
+                    const auto [c0, clen] = copy_of(r, h);
+                    const std::size_t aend = r.pos + (r.cn_ref_bp > 0 ? static_cast<std::size_t>(r.cn_ref_bp) : end - r.pos);
+                    if (cit == r.sample_cn.end() || r.ref_cn <= 0 || c0 == 0 || clen == 0) {
+                        reconstructable = false; add(r, "unresolved", 0, 0, std::string(), ".", h); continue;
+                    }
+                    const long long d = cit->second - r.ref_cn;
+                    const std::string cn = std::to_string(cit->second);
+                    if (d == 0) continue;
+                    // Copies gained or lost go where the reference's copies repeat: at c0, or a whole copy
+                    // either side of it, the first of these clear of the carrier's other records there (a
+                    // copy lost over a deletion the carrier also has would undo that record).
+                    const std::size_t want = d > 0 ? 0 : static_cast<std::size_t>(-d) * clen;
+                    struct Change { std::size_t lo, hi; bool ins; };
+                    std::vector<Change> others;   // genomic [lo, hi] the carrier changes; an insertion goes in before lo
+                    for (const VcfRecordInfo& o : vcf) {
+                        if (&o == &r || !change_inside(o, r.pos + 1, aend)) continue;
+                        const auto oa = o.sample_allele.find(h);
+                        if (oa != o.sample_allele.end() && oa->second > 0)
+                            others.push_back({o.pos + 1, std::max(o.end, o.pos + 1), o.end <= o.pos});
+                    }
+                    const auto clear = [&](std::size_t s) {
+                        const std::size_t e = want ? s + want - 1 : s;
+                        for (const Change& o : others)
+                            if (want ? (o.ins ? s < o.lo && o.lo <= e : o.lo <= e && s <= o.hi) : (o.lo < s && s <= o.hi)) return false;
+                        return true;
+                    };
+                    // A window must lie inside the copies; of those, the nearest clear one, else the nearest
+                    // that fits.
+                    const auto fits = [&](std::size_t s) { return s >= r.pos + 1 && s + (want ? want - 1 : 0) <= aend; };
+                    // with one reference copy there is no other copy to step to
+                    const std::size_t steps = r.ref_cn == 1 ? 0 : (aend + 1 - std::min(aend + 1, r.pos + 1)) / clen + 1;
+                    std::size_t at = c0;
+                    bool found = false;
+                    for (int pass = 0; pass < 2 && !found; ++pass)
+                        for (std::size_t step = 0; step <= steps && !found; ++step)
+                            for (const int sign : {1, -1}) {
+                                if (step == 0 && sign < 0) continue;
+                                if (sign < 0 && c0 < step * clen) continue;
+                                const std::size_t s0c = sign > 0 ? c0 + step * clen : c0 - step * clen;
+                                if (fits(s0c) && (pass == 1 || clear(s0c))) { at = s0c; found = true; break; }
+                            }
+                    // copies lost that fit at no copy's start (as many as the reference holds): the copies' end
+                    if (!found && want) at = aend + 1 >= r.pos + 1 + want ? aend + 1 - want : r.pos + 1;
+                    if (d > 0) {
+                        // the copy beside the insertion point, so the gain is a tandem copy wherever it goes
+                        const std::size_t s0 = at + clen - 1 <= aend ? at : at - clen;
+                        const std::string copy = ref_at(s0, s0 + clen - 1);
+                        // A gained copy can be a shorter form than the reference's. FORMAT:CNBP says how much
+                        // shorter (its change, less the carrier's other records there, less the copies pasted);
+                        // where a deletion record inside the copies accounts for that, k copies short by it,
+                        // those copies are pasted without it. Without such a record the VCF holds the length
+                        // only, and what is left counts as copy_count.
+                        std::string short_copy;
+                        long long short_k = 0;
+                        const auto bpit = r.sample_cnbp.find(h);
+                        if (bpit != r.sample_cnbp.end() && info_field(r.info, "CN_METHOD") == "MODULE") {
+                            long long own = bpit->second;
+                            // deletions inside the copies (a replacement too, by its net loss): the reference they
+                            // replace, genomic [lo, lo + span), and what they put there
+                            struct Shorter { std::size_t lo = 0, span = 0; std::string with; long long net = 0; };
+                            std::vector<Shorter> dels;
+                            for (const VcfRecordInfo& o : vcf) {
+                                if (&o == &r || !change_inside(o, r.pos + 1, aend)) continue;
+                                const bool symbolic = !o.alts.empty() && !o.alts[0].empty() && o.alts[0][0] == '<';
+                                if (o.svtype == "DEL" && !o.alts.empty()) {
+                                    Shorter sh;
+                                    if (symbolic) {
+                                        sh.lo = o.pos + 1; sh.span = std::max(o.end, o.pos) - o.pos;
+                                        if (has_flag(o.info, "SUBSTITUTION")) sh.with = info_field(o.info, "INSSEQ");
+                                    } else if (o.ref.size() > o.alts[0].size()) {
+                                        sh.lo = o.pos + 1; sh.span = o.ref.size() - 1; sh.with = o.alts[0].substr(1);
                                     }
-                                    return false;
-                                }, w_applied);
-                const NwAlign wnw =
-                    nw_edit_distance(spell_path_steps_sequence(graph, carrier_steps), truth);
-                hr.carrier_scored = true;
-                hr.carrier_sum_delta += wnw.edits;
-                hr.carrier_sum_aln += wnw.aln_len;
-                o.carrier_scored = true;
-                o.carrier_delta = wnw.edits;
-                o.carrier_aln_len = wnw.aln_len;
+                                    sh.net = static_cast<long long>(sh.span) - static_cast<long long>(sh.with.size());
+                                    if (sh.net >= static_cast<long long>(min_sv_bp) && sh.span < clen && sh.lo >= r.pos + 1 && sh.lo + sh.span - 1 <= aend &&
+                                        !(has_flag(o.info, "SUBSTITUTION") && sh.with.empty()))
+                                        dels.push_back(sh);
+                                }
+                                const auto oa = o.sample_allele.find(h);   // the carrier's own other records come off CNBP
+                                if (oa == o.sample_allele.end() || oa->second <= 0 || static_cast<std::size_t>(oa->second) > o.alts.size()) continue;
+                                const std::string& alt = o.alts[static_cast<std::size_t>(oa->second) - 1];
+                                if (alt.empty() || alt[0] != '<')
+                                    own -= change_within(o, static_cast<long long>(alt.size()) - static_cast<long long>(o.ref.size()), r.pos + 1, aend);
+                                else if (alt.rfind("<CNV", 0) != 0 && alt != "<INV>" && o.has_svlen) own -= change_within(o, o.svlen, r.pos + 1, aend);
+                            }
+                            const long long resid = own - d * static_cast<long long>(clen);
+                            // Where a deletion sits in the pasted copy: a whole number of copies away when the copy
+                            // is a period of the reference's copies, else inside the copy itself; npos if neither.
+                            const bool periodic = copy_cache.at(r.id).period;
+                            const auto offset = [&](const Shorter& del) -> std::size_t {
+                                const std::size_t off = periodic ? (del.lo + clen * (s0 / clen + 2) - s0) % clen
+                                                                 : (del.lo >= s0 ? del.lo - s0 : std::string::npos);
+                                return off != std::string::npos && off + del.span <= clen ? off : std::string::npos;
+                            };
+                            // Only a shortfall beyond the form's own tolerance (lengths within 2%, 100 bp at least,
+                            // are one form); only a deletion that brings the pasted copies nearer CNBP, within
+                            // min_sv plus 1% of a copy per copy; and only when every such deletion is one stretch of the
+                            // copy, within min_sv in place and length (two stretches: the VCF does not say which, and
+                            // none is applied; a smaller shift leaves less than min_sv).
+                            const long long form_tol = std::max(static_cast<long long>(min_sv_bp),
+                                                                d * std::max(100LL, static_cast<long long>(clen) / 50));
+                            long long best_diff = -1;
+                            // every deletion that would explain it, to tell whether they are one stretch
+                            std::vector<std::pair<std::size_t, std::size_t>> fits_off_span;
+                            const auto apart = [&](std::size_t a, std::size_t b, bool circular) {
+                                std::size_t g = a > b ? a - b : b - a;
+                                if (circular) g = std::min(g, clen - g);
+                                return g >= min_sv_bp;
+                            };
+                            if (resid < -form_tol)
+                                for (const Shorter& del : dels) {
+                                    const std::size_t off = offset(del);
+                                    if (off == std::string::npos) continue;
+                                    const std::string made = copy.substr(0, off) + del.with + copy.substr(off + del.span);
+                                    for (long long k = 1; k <= d; ++k) {
+                                        const long long diff = std::llabs(resid + k * del.net);
+                                        const long long tol = static_cast<long long>(min_sv_bp) + k * static_cast<long long>(clen) / 100;
+                                        if (diff > tol || diff >= std::llabs(resid)) continue;
+                                        fits_off_span.push_back({off, del.span});
+                                        if (best_diff < 0 || diff < best_diff) { best_diff = diff; short_copy = made; short_k = k; }
+                                    }
+                                }
+                            bool ambiguous = false;
+                            for (std::size_t i = 0; i < fits_off_span.size() && !ambiguous; ++i)
+                                for (std::size_t j = i + 1; j < fits_off_span.size() && !ambiguous; ++j)
+                                    ambiguous = apart(fits_off_span[i].first, fits_off_span[j].first, periodic) ||
+                                                apart(fits_off_span[i].second, fits_off_span[j].second, false);
+                            if (ambiguous || best_diff < 0) { short_k = 0; short_copy.clear(); }
+                        }
+                        std::string ins;
+                        for (long long k = 0; k < d; ++k) ins += k < short_k ? short_copy : copy;
+                        add(r, "cnv", at, at - 1, ins, cn, h);
+                    } else {
+                        const std::size_t del = std::min<std::size_t>(want, aend + 1 - at);
+                        add(r, "cnv", at, at + del - 1, std::string(), cn, h);
+                    }
+                } else { reconstructable = false; add(r, "unresolved", 0, 0, std::string(), ".", h); }
             }
+            if (!reconstructable) ++vcf_not_reconstructable;
+        }
+    } else cevents = load_carrier_events(ce_in);
+    // The two files must describe one run: every carrier of every record has exactly one event.
+    if (!vcf_mode) {
+        std::unordered_map<std::string, std::unordered_set<std::string>> ce_carriers;
+        for (const CarrierEvent& e : cevents) {
+            if (!vcf_by_id.count(e.variant_id))
+                throw std::runtime_error(ce_in + " names record '" + e.variant_id + "', which " + vcf_in +
+                                         " does not have: the two files are from different runs");
+            for (const std::string& h : e.haplotypes) ce_carriers[e.variant_id].insert(h);   // can be several events
+        }
+        for (const VcfRecordInfo& r : vcf) {
+            const auto it = ce_carriers.find(r.id);
+            const std::size_t n = it == ce_carriers.end() ? 0 : it->second.size();
+            bool same = n == r.carriers.size();
+            for (const std::string& h : r.carriers) if (same && !it->second.count(h)) same = false;
+            if (!same)
+                throw std::runtime_error("record '" + r.id + "' has " + std::to_string(r.carriers.size()) +
+                                         " carrier(s) in " + vcf_in + " and " + std::to_string(n) + " in " + ce_in +
+                                         ": the two files are from different runs");
+        }
+    }
+    // Each record's reference span, for attributing what is left: its POS..END, widened to wherever any
+    // carrier's own event sits.
+    std::map<std::string, std::pair<std::size_t, std::size_t>> record_span, event_span;
+    for (const VcfRecordInfo& r : vcf) record_span[r.id] = {r.pos, std::max(r.pos, r.end)};
+    std::unordered_map<std::string, std::vector<const CarrierEvent*>> events_of;   // haplotype -> events
+    std::size_t unresolved_rows = 0;
+    for (const CarrierEvent& e : cevents) {
+        if (e.kind == "unresolved") { unresolved_rows += e.haplotypes.size(); continue; }
+        std::size_t lo = e.insertion() ? e.ref_start - 1 : e.ref_start;
+        std::size_t hi = e.insertion() ? e.ref_start : e.ref_end;
+        // A --vcf copy gain or loss sits at one copy, but stands for the record's whole run of copies.
+        if (e.kind == "cnv") {
+            const VcfRecordInfo& r = *vcf_by_id.at(e.variant_id);
+            lo = std::min(lo, r.pos + 1);
+            hi = std::max(hi, r.pos + (r.cn_ref_bp > 0 ? static_cast<std::size_t>(r.cn_ref_bp) : std::max(r.end, r.pos) - r.pos));
+        }
+        auto& sp = record_span[e.variant_id];
+        sp.first = std::min(sp.first, lo);
+        sp.second = std::max(sp.second, hi);
+        const auto [es, fresh] = event_span.try_emplace(e.variant_id, lo, hi);
+        if (!fresh) { es->second.first = std::min(es->second.first, lo); es->second.second = std::max(es->second.second, hi); }
+        for (const std::string& h : e.haplotypes) events_of[h].push_back(&e);
+    }
+    std::unordered_map<std::string, std::unordered_set<std::string>> unresolved_of;
+    for (const CarrierEvent& e : cevents)
+        if (e.kind == "unresolved") for (const std::string& h : e.haplotypes) unresolved_of[h].insert(e.variant_id);
 
-            hr.scored = true;
-            hr.sum_delta += nw.edits;
-            hr.sum_aln += nw.aln_len;
-            hr.sum_run_lt += nw.sub_threshold_bp;
-            hr.sum_run_ge += nw.over_threshold_bp;
-            hr.called_sum_delta += cnw.edits;
-            hr.called_sum_aln += cnw.aln_len;
-            hr.led.events += o.led.events;
-            hr.led.called += o.led.called;   hr.led.called_bp += o.led.called_bp;
-            hr.led.missed += o.led.missed;   hr.led.missed_bp += o.led.missed_bp;
-            hr.led.below  += o.led.below;    hr.led.below_bp  += o.led.below_bp;
-
-            o.carrier = applied;
-            o.delta = nw.edits;
-            o.aln_len = nw.aln_len;
-            o.run_lt_bp = nw.sub_threshold_bp;
-            o.run_ge_bp = nw.over_threshold_bp;
-            o.called_delta = cnw.edits;
-            o.called_aln_len = cnw.aln_len;
-            // Truth for the carrier call comes from the WALKS, not from an alignment: this haplotype
-            // carries something callable here iff one of its divergent blocks reaches the threshold.
-            o.gt_true_carrier = o.led.called > 0 || o.led.missed > 0;
-
-            const auto span = do_gt && hap_vcf[pi] >= 0 ? ref_span.find(b.id) : ref_span.end();
-            if (span != ref_span.end()) {
-                const std::size_t hv = static_cast<std::size_t>(hap_vcf[pi]);
-                static const std::vector<const VcfRecord*> kNoRecs;
-                const auto brit = recs_by_bubble.find(b.id);
-                const std::vector<const VcfRecord*>& brecs =
-                    brit != recs_by_bubble.end() ? brit->second : kNoRecs;
-                const std::string ref_bubble = ref_seq.substr(span->second.first, span->second.second);
-                std::string gt_recon = apply_genotype(ref_bubble, span->second.first, region_start,
-                                                      brecs, hv, dup_cn_model, hr.gt_stats);
-                std::string ref_recon = ref_bubble;
-                if (ref_flip.at(b.id)) {
-                    gt_recon = reverse_complement(gt_recon);
-                    ref_recon = reverse_complement(ref_recon);
+    // A carrier's copy-number event is its own stretch between the steps its walk and the reference share
+    // on either side of the copies, so its other events inside that stretch -- an insertion between or
+    // beside its copies, a deletion of a copy's part -- are already in it. An insertion is inside when it
+    // goes in anywhere from before the stretch's first base to before the base after its last.
+    const auto inside_at = [](const CarrierEvent& c, const CarrierEvent& e) {
+        if (&c == &e || e.kind == "cn") return false;
+        if (c.insertion()) return e.insertion() && e.ref_start == c.ref_start;
+        if (e.insertion()) return c.ref_start <= e.ref_start && e.ref_start <= c.ref_end + 1;
+        return c.ref_start <= e.ref_start && e.ref_end <= c.ref_end;
+    };
+    // An insertion that repeats the sequence beside it can go in anywhere over its record's CIPOS. When that
+    // range crosses a stretch's edge, its listed place does not say which side it is on: it is inside when
+    // counting it brings the stretch's expected length (as the carrier check computes it) nearer its own.
+    const auto place_range = [&](const CarrierEvent& e) {
+        std::size_t lo = e.ref_start, hi = e.ref_start;
+        const VcfRecordInfo& r = *vcf_by_id.at(e.variant_id);
+        const std::vector<std::string> ci = split_on(info_field(r.info, "CIPOS"), ',');
+        if (ci.size() == 2) {
+            char* e0 = nullptr; char* e1 = nullptr;
+            const long long a = std::strtoll(ci[0].c_str(), &e0, 10), b = std::strtoll(ci[1].c_str(), &e1, 10);
+            const long long p = static_cast<long long>(r.pos) + 1;
+            if (*e0 == '\0' && *e1 == '\0' && p + a > 0 && a <= b) {
+                lo = std::min(lo, static_cast<std::size_t>(p + a));
+                hi = std::max(hi, static_cast<std::size_t>(p + b));
+            }
+        }
+        return std::make_pair(lo, hi);
+    };
+    std::map<std::pair<const CarrierEvent*, std::string>, std::unordered_set<const CarrierEvent*>> inside_of;
+    for (const auto& [h, evs] : events_of) {
+        for (const CarrierEvent* c : evs) {
+            if (c->kind != "cn") continue;
+            auto& in = inside_of[{c, h}];
+            std::vector<const CarrierEvent*> edge;
+            for (const CarrierEvent* e : evs) {
+                if (e != c && e->kind != "cn" && e->insertion() && !c->insertion()) {
+                    const auto [lo, hi] = place_range(*e);
+                    if (lo <= c->ref_end + 1 && hi >= c->ref_start && (lo < c->ref_start || hi > c->ref_end + 1)) {
+                        edge.push_back(e);
+                        continue;
+                    }
                 }
-                const NwAlign gnw = nw_edit_distance(gt_recon, truth);
-                const NwAlign rnw = nw_edit_distance(ref_recon, truth);
-                hr.gt_scored = true;
-                hr.gt_sum_delta += gnw.edits;
-                hr.gt_sum_aln += gnw.aln_len;
-                hr.ref_sum_delta += rnw.edits;
-                hr.ref_sum_aln += rnw.aln_len;
-                o.gt_scored = true;
-                o.gt_delta = gnw.edits;
-                o.gt_aln_len = gnw.aln_len;
-                o.ref_delta = rnw.edits;
-                o.ref_aln_len = rnw.aln_len;
-                for (const VcfRecord* r : brecs)
-                    if (hv < r->gt.size() && r->gt[hv] >= 1) { o.gt_called_carrier = true; break; }
+                if (inside_at(*c, *e)) in.insert(e);
             }
-            hr.obs.push_back(std::move(o));
+            if (edge.empty()) continue;
+            const VcfRecordInfo& r = *vcf_by_id.at(c->variant_id);
+            const auto cit = r.sample_cn.find(h);
+            const long long copy_bp = static_cast<long long>(copy_of(r, h).second);
+            if (cit == r.sample_cn.end() || r.ref_cn < 0 || copy_bp <= 0) {
+                for (const CarrierEvent* e : edge) if (inside_at(*c, *e)) in.insert(e);
+                continue;
+            }
+            long long expect = static_cast<long long>(c->ref_len()) + (cit->second - r.ref_cn) * copy_bp;
+            for (const CarrierEvent* e : in) expect += static_cast<long long>(e->alt.size()) - static_cast<long long>(e->ref_len());
+            const long long got = static_cast<long long>(c->alt.size());
+            for (const CarrierEvent* e : edge) {
+                const long long with = expect + static_cast<long long>(e->alt.size());
+                if (std::llabs(got - with) < std::llabs(got - expect)) { in.insert(e); expect = with; }
+            }
+        }
+    }
+    // Inversions whose alt is the plain reference interval turned round.
+    std::unordered_set<const CarrierEvent*> plain_inv;
+    for (const CarrierEvent& e : cevents)
+        if (e.kind == "inv" && !e.insertion() && e.ref_start >= region_start && e.ref_end < region_start + ref_seq.size() &&
+            e.alt == reverse_complement(ref_seq.substr(e.ref_start - region_start, e.ref_len())))
+            plain_inv.insert(&e);
+    const auto inside_cn = [&](const CarrierEvent& c, const CarrierEvent& e, const std::string& h) {
+        const auto it = inside_of.find({&c, h});
+        return it != inside_of.end() && it->second.count(&e) > 0;
+    };
+
+    // ---- the carrier check: each carrier's own event against what the VCF reports for it ----
+    std::vector<CheckRow> checks;
+    std::size_t checked = 0, unchecked = 0, cn_stretch_checked = 0, cn_stretch_unchecked = 0;
+    // A carrier can hold several events under one record (two pieces call filed together): their net change
+    // together is what the record's SVLEN stands for, so they are checked once, summed.
+    std::map<std::pair<std::string, std::string>, std::pair<long long, std::size_t>> seq_net;   // (record, carrier)
+    if (!vcf_mode)
+        for (const CarrierEvent& e : cevents)
+            if (e.kind != "unresolved" && e.kind != "cn" && e.kind != "inv")
+                for (const std::string& h : e.haplotypes) {
+                    auto& v = seq_net[{e.variant_id, h}];
+                    v.first += e.event_bp; ++v.second;
+                }
+    std::set<std::pair<std::string, std::string>> seq_done;
+    for (const CarrierEvent& e : cevents) {
+        if (vcf_mode) break;   // the events ARE the VCF's
+        if (e.kind == "unresolved") continue;
+        const VcfRecordInfo& r = *vcf_by_id.at(e.variant_id);
+        const long long own_net = e.event_bp;
+        for (const std::string& h : e.haplotypes) {
+            long long reported = 0, own = own_net, limit = static_cast<long long>(min_sv_bp);
+            std::string rep_s, own_s;
+            if (e.kind == "cn") {
+                // The CN reported against the copies the carrier's own walk holds.
+                const auto cit = r.sample_cn.find(h);
+                if (cit == r.sample_cn.end() || e.walk_cn == ".") { ++unchecked; continue; }
+                reported = cit->second;
+                own = static_cast<long long>(parse_count(e.walk_cn, ce_in));
+                limit = 1;
+                rep_s = "CN=" + std::to_string(cit->second);
+                own_s = std::to_string(own) + " copies in its walk";
+            } else if (e.kind == "inv" || r.svtype == "INV") {
+                if (!r.has_svlen) { ++unchecked; continue; }
+                reported = r.svlen < 0 ? -r.svlen : r.svlen;
+                own = e.event_bp;
+                rep_s = "SVLEN=" + std::to_string(r.svlen);
+                own_s = std::to_string(own) + " bp inverted";
+            } else {
+                if (!seq_done.insert({e.variant_id, h}).second) continue;   // checked with its first event
+                if (!r.has_svlen) { ++unchecked; continue; }
+                const auto& net = seq_net.at({e.variant_id, h});
+                own = net.first;
+                reported = r.svlen;
+                rep_s = "SVLEN=" + std::to_string(r.svlen);
+                own_s = std::to_string(own) + " bp" + (net.second > 1 ? " over " + std::to_string(net.second) + " events" : "");
+            }
+            ++checked;
+            const long long diff = own - reported;
+            if ((diff < 0 ? -diff : diff) >= limit) checks.push_back({e.variant_id, h, e.kind, rep_s, own_s, diff});
+            if (e.kind != "cn") continue;
+            // And the stretch's length against the CN: the reference's stretch, (CN - REF_CN) copies, and
+            // the carrier's own events inside it. Sequence the stretch holds beyond that is in no record.
+            const auto cit = r.sample_cn.find(h);
+            const auto eit = events_of.find(h);
+            const long long copy_bp = static_cast<long long>(copy_of(r, h).second);
+            if (cit == r.sample_cn.end() || r.ref_cn < 0 || copy_bp <= 0) { ++cn_stretch_unchecked; continue; }
+            ++cn_stretch_checked;
+            long long expect = static_cast<long long>(e.ref_len()) + (cit->second - r.ref_cn) * copy_bp, inner = 0;
+            if (eit != events_of.end())
+                for (const CarrierEvent* o : eit->second)
+                    if (inside_cn(e, *o, h)) inner += static_cast<long long>(o->alt.size()) - static_cast<long long>(o->ref_len());
+            expect += inner;
+            const long long got = static_cast<long long>(e.alt.size());
+            // Copies of one record differ by small indels that add up over many copies: each copy changed
+            // may differ by 1% of a copy, on top of --min-sv-bp.
+            const long long dcn = cit->second > r.ref_cn ? cit->second - r.ref_cn : r.ref_cn - cit->second;
+            const long long off = got - expect < 0 ? expect - got : got - expect;
+            if (100 * off >= 100 * static_cast<long long>(min_sv_bp) + dcn * copy_bp)
+                checks.push_back({e.variant_id, h, "cn_stretch",
+                                  std::to_string(e.ref_len()) + " bp + (" + std::to_string(cit->second) + "-" +
+                                      std::to_string(r.ref_cn) + ") x " + std::to_string(copy_bp) + " bp copies + " +
+                                      std::to_string(inner) + " bp of its events = " + std::to_string(expect) + " bp",
+                                  std::to_string(got) + " bp stretch", got - expect});
+        }
+    }
+
+    // ---- each haplotype: apply its events, align, and read what is left ----
+    std::vector<const PathRecord*> haps;
+    std::size_t not_in_vcf = 0;
+    {
+        std::unordered_set<std::string> in_vcf(vcf_samples.begin(), vcf_samples.end());
+        for (const PathRecord& p : graph.paths) {
+            if (&p == ref_path) continue;
+            if (!in_vcf.count(p.name)) { ++not_in_vcf; continue; }
+            haps.push_back(&p);
+        }
+    }
+
+    if (!vcf_mode) {
+        std::size_t unanchored = 0;   // a haplotype sharing no anchor with the reference is not scored
+        for (const PathRecord* p : haps)
+            unanchored += preps[static_cast<std::size_t>(p - graph.paths.data())].status != "scored";
+        if (unanchored > 0)
+            std::cerr << cli::log_prefix("benchmark") << "warning: " << unanchored
+                      << " haplotype(s) share no anchor node with the reference and are not scored\n";
+        log.info("haplotypes scored: " + std::to_string(haps.size() - unanchored) + "; large events: " +
+                 std::to_string(min_sv_bp) + " bp or more");
+        log.info("call's events: records: " + std::to_string(vcf.size()) + "; carrier events: " +
+                 std::to_string(cevents.size()));
+    } else {
+        log.info("VCF: records: " + std::to_string(vcf.size()) + "; events rebuilt from them: " +
+                 std::to_string(cevents.size()));
+    }
+
+    std::unordered_map<std::string, const HapResult*> call_stage;   // the VCF stage reads the call stage's
+    if (vcf_mode) for (const HapResult& r : stages[0].results) call_stage[r.name] = &r;
+    std::vector<HapResult> results(haps.size());
+    run_parallel(haps.size(), threads, [&](std::size_t hi) {
+        const PathRecord& path = *haps[hi];
+        HapResult& hr = results[hi];
+        hr.name = path.name;
+        const std::set<std::string>* call_outside = nullptr;
+        if (const auto it = call_stage.find(path.name); it != call_stage.end()) call_outside = &it->second->outside_ids;
+        const Prep& pr = preps[static_cast<std::size_t>(&path - graph.paths.data())];
+        if (pr.status != "scored") { hr.status = pr.status; return; }
+        hr.g_start = pr.g_start;
+        hr.g_end = pr.g_end;
+        const std::size_t o0 = pr.o0, o1 = pr.o1;
+        const std::string& truth = pr.truth;
+
+        // The events, in reference order; an event outside the extent, or overlapping one already
+        // applied, is left out and counted.
+        std::vector<const CarrierEvent*> evs;
+        if (const auto it = events_of.find(path.name); it != events_of.end()) evs = it->second;
+        if (const auto it = unresolved_of.find(path.name); it != unresolved_of.end()) hr.unresolved = it->second.size();
+        // Events outside the scored stretch leave first, so they neither absorb nor outweigh the events
+        // inside it. The VCF stage leaves out what the call stage left out for this haplotype, so an edge
+        // event is in or out the same way in both.
+        {
+            std::vector<const CarrierEvent*> in;
+            for (const CarrierEvent* e : evs) {
+                const std::size_t lo = e->ref_start, hi_end = e->ref_end + 1;
+                const bool outside = e->insertion() ? (lo <= hr.g_start || lo > hr.g_end) : (lo < hr.g_start || hi_end > hr.g_end + 1);
+                const bool out_in_call = vcf_mode && call_outside != nullptr && call_outside->count(e->variant_id);
+                if (outside || out_in_call) { ++hr.outside_extent; hr.outside_ids.insert(e->variant_id); continue; }
+                in.push_back(e);
+            }
+            evs.swap(in);
+        }
+        const auto by_order = [vcf_mode](const CarrierEvent* a, const CarrierEvent* b) {
+            if (a->ref_start != b->ref_start) return a->ref_start < b->ref_start;
+            if (a->insertion() != b->insertion()) return a->insertion();   // goes in before ref_start
+            if (a->ref_end != b->ref_end) return a->ref_end > b->ref_end;  // the enclosing one first
+            if (vcf_mode) return a->order < b->order;   // two records at one point: the VCF's order
+            return a->alt.size() > b->alt.size();   // one interval: the replacement holding more of the haplotype
+        };
+        std::sort(evs.begin(), evs.end(), by_order);
+        // Its events inside its own copy-number stretch are part of that stretch (see inside_cn).
+        {
+            std::vector<const CarrierEvent*> cns;
+            for (const CarrierEvent* e : evs) if (e->kind == "cn") cns.push_back(e);
+            if (!cns.empty()) {
+                const auto n0 = evs.size();
+                evs.erase(std::remove_if(evs.begin(), evs.end(), [&](const CarrierEvent* e) {
+                    for (const CarrierEvent* c : cns) if (inside_cn(*c, *e, path.name)) return true;
+                    return false;
+                }), evs.end());
+                hr.absorbed = n0 - evs.size();
+            }
+        }
+        // Other overlapping events of one haplotype: the one with the longer reference interval is kept,
+        // and of two over one interval the first in the order above. Two insertions at one point, or two
+        // crossing intervals, are conflicts too; each left out is counted. An event inside an inversion
+        // that turns the plain reference is not a conflict: the sites inside an inversion keep their own
+        // events, so they are applied to the reference stretch first, and the inversion turns the result.
+        std::unordered_map<const CarrierEvent*, std::vector<const CarrierEvent*>> nested;
+        // k starts no later than e. An insertion goes in before its ref_start, so it is inside an interval
+        // [S, E] only when S < ref_start <= E, and two insertions clash at one point (in --vcf mode two
+        // records inserting at one point are both applied, in the file's order).
+        const auto overlaps = [&](const CarrierEvent* k, const CarrierEvent* e) {
+            if (e->insertion() && k->insertion()) return !vcf_mode && e->ref_start == k->ref_start;
+            if (e->insertion()) return k->ref_start < e->ref_start && e->ref_start <= k->ref_end;
+            if (k->insertion()) return false;
+            return e->ref_start <= k->ref_end;
+        };
+        // Longest first, each event is kept unless it overlaps one already kept, so of two overlapping events
+        // the longer is kept whatever lies around them. `nest` sets events inside a kept plain inversion
+        // aside in `nested` instead of weighing them against it.
+        std::unordered_map<const CarrierEvent*, std::size_t> rank;   // place in the order above
+        for (std::size_t i = 0; i < evs.size(); ++i) rank[evs[i]] = i;
+        const auto before = [&](const CarrierEvent* a, const CarrierEvent* b) { return rank.at(a) < rank.at(b); };
+        const auto keep_apart = [&](std::vector<const CarrierEvent*> list, bool nest) {
+            std::sort(list.begin(), list.end(), [&](const CarrierEvent* a, const CarrierEvent* b) {
+                return a->ref_len() != b->ref_len() ? a->ref_len() > b->ref_len() : before(a, b);
+            });
+            std::vector<const CarrierEvent*> kept;   // apart, in the order above
+            for (const CarrierEvent* e : list) {
+                const auto at = std::upper_bound(kept.begin(), kept.end(), e, before);
+                // Kept events are apart, so only the one before e and those starting within e can overlap it.
+                const CarrierEvent* hit = nullptr;
+                if (at != kept.begin() && overlaps(*(at - 1), e)) hit = *(at - 1);
+                for (auto it = at; !hit && it != kept.end() && (*it)->ref_start <= std::max(e->ref_start, e->ref_end); ++it)
+                    if (overlaps(e, *it)) hit = *it;
+                if (!hit) kept.insert(at, e);
+                else if (nest && plain_inv.count(hit) && before(hit, e) && e->kind != "inv" &&
+                         (e->insertion() || e->ref_end <= hit->ref_end))
+                    nested[hit].push_back(e);
+                else ++hr.conflicts;
+            }
+            return kept;
+        };
+        evs = keep_apart(evs, true);
+        // inside an inversion, the same rule among its own events
+        for (auto& [inv, inner] : nested) inner = keep_apart(inner, false);
+        std::string recon;
+        recon.reserve(o1 - o0);
+        std::vector<Piece> pieces;
+        std::vector<const CarrierEvent*> applied;
+        std::size_t cursor = hr.g_start;          // next genomic base to copy
+        bool last_was_insertion_here = false;
+        std::size_t last_insertion_at = 0;
+        auto copy_ref = [&](std::size_t g_to) {   // copy [cursor, g_to)
+            if (g_to <= cursor) return;
+            Piece p; p.r0 = recon.size(); p.g0 = cursor; p.g1 = g_to - 1;
+            recon.append(ref_seq, cursor - region_start, g_to - cursor);
+            p.r1 = recon.size();
+            pieces.push_back(p);
+            cursor = g_to;
+        };
+        for (const CarrierEvent* e : evs) {
+            const std::size_t lo = e->ref_start, hi_end = e->ref_end + 1;   // genomic [lo, hi_end)
+            if (lo < cursor || (!vcf_mode && e->insertion() && last_was_insertion_here && last_insertion_at == lo)) { ++hr.conflicts; continue; }   // a guard: the events kept above are apart
+            copy_ref(lo);
+            Piece p; p.r0 = recon.size(); p.g0 = lo; p.g1 = e->ref_end; p.event = static_cast<int>(applied.size());
+            applied.push_back(e);
+            if (const auto it = nested.find(e); it != nested.end()) {
+                std::string inner;
+                std::size_t c = lo;
+                bool ins_here = false;
+                for (const CarrierEvent* n : it->second) {
+                    if (n->ref_start < c || (!vcf_mode && n->insertion() && ins_here && n->ref_start == c)) { ++hr.conflicts; continue; }
+                    inner.append(ref_seq, c - region_start, n->ref_start - c);
+                    inner += n->alt;
+                    c = n->ref_end + 1;
+                    ins_here = n->insertion();
+                    applied.push_back(n);
+                }
+                inner.append(ref_seq, c - region_start, hi_end - c);
+                recon += reverse_complement(inner);
+            } else recon += e->alt;
+            p.r1 = recon.size();
+            pieces.push_back(p);
+            cursor = hi_end;
+            last_was_insertion_here = e->insertion();
+            last_insertion_at = lo;
+        }
+        copy_ref(hr.g_end + 1);
+        hr.applied = applied.size();
+        for (const CarrierEvent* e : applied) {
+            hr.applied_spans.push_back({e->variant_id, e->insertion() ? e->ref_start - 1 : e->ref_start,
+                                        e->insertion() ? e->ref_start : e->ref_end});
+        }
+
+        // reconstruction position -> (genomic position, applied event or -1)
+        auto locate = [&](std::size_t r) -> std::pair<std::size_t, int> {
+            auto it = std::upper_bound(pieces.begin(), pieces.end(), r,
+                                       [](std::size_t v, const Piece& p) { return v < p.r0; });
+            if (it == pieces.begin()) return {hr.g_start, -1};
+            --it;
+            if (it->event >= 0) {   // the carrier's own bases: placed in proportion over the reference it replaces
+                if (it->g1 < it->g0 || it->r1 <= it->r0) return {it->g0, it->event};
+                const std::size_t off = std::min((r - it->r0) * (it->g1 - it->g0 + 1) / (it->r1 - it->r0), it->g1 - it->g0);
+                // an inversion's bases run backwards over the reference
+                const bool turned = applied[static_cast<std::size_t>(it->event)]->kind == "inv";
+                return {turned ? it->g1 - off : it->g0 + off, it->event};
+            }
+            const std::size_t g = it->g0 + std::min(r - it->r0, it->r1 > it->r0 ? it->r1 - it->r0 : 0);
+            return {g, -1};
+        };
+
+        const DiffSet& base = pr.base;
+        hr.present_snv = base.mismatches;
+        const std::size_t stretch = pr.o1 - pr.o0;
+        const std::string ref_stretch = ref_seq.substr(pr.o0, stretch);
+        for (const Diff& d : base.events) {
+            if (d.size() < min_sv_bp) { hr.present_small_bp += d.size(); continue; }
+            ++hr.present_n; hr.present_bp += d.size();
+            // Placed as the leftovers are: from the base before the event to the base after it.
+            HapResult::Present p;
+            p.g0 = pr.g_start + (d.t0 > 0 ? d.t0 - 1 : 0);
+            p.g1 = pr.g_start + std::min(d.t1, stretch ? stretch - 1 : 0);
+            p.size = d.size(); p.del_bp = d.del_bp; p.ins_bp = d.ins_bp; p.type = d.type();
+            // the sites it lies in, by the leftovers' rule, anywhere it can slide to
+            std::size_t w0 = p.g0, w1 = p.g1, s0 = 0, s1 = 0;
+            if (slide_of(ref_stretch, pr.truth, d, s0, s1)) {
+                w0 = std::min(w0, pr.g_start + (s0 > 0 ? s0 - 1 : 0));
+                w1 = std::max(w1, pr.g_start + std::min(s1, stretch ? stretch - 1 : 0));
+            }
+            const std::size_t lo = w0 > merge_gap ? w0 - merge_gap : 0, hi = w1 + merge_gap;
+            for (const auto& [bid, sp] : bubble_span)
+                if (sp.first <= hi && lo <= sp.second) p.bubbles = (p.bubbles == "." ? "" : p.bubbles + ";") + std::to_string(bid);
+            hr.present_rows.push_back(std::move(p));
+        }
+        // With nothing applied the reconstruction is the reference, already aligned.
+        const DiffSet left = applied.empty() ? base : diff_of(align_ops(recon, truth), merge_gap, min_sv_bp);
+        hr.left_snv = left.mismatches;
+        std::unordered_set<std::string> carried;   // every record the haplotype carries, applied or not
+        if (const auto it = events_of.find(path.name); it != events_of.end())
+            for (const CarrierEvent* e : it->second) carried.insert(e->variant_id);
+        for (const Diff& d : left.events) {
+            if (d.size() < min_sv_bp) { hr.left_small_bp += d.size(); continue; }
+            ++hr.left_n;
+            hr.left_bp += d.size();
+            LargeRow row;
+            row.haplotype = path.name;
+            row.type = d.type();
+            row.size = d.size(); row.del_bp = d.del_bp; row.ins_bp = d.ins_bp;
+            // where it sits, and whether it touches an event applied to this haplotype
+            int touched = -1;
+            std::size_t g_lo = SIZE_MAX, g_hi = 0, m_lo = SIZE_MAX, m_hi = 0;
+            const std::size_t r_hi = d.t1 > d.t0 ? d.t1 - 1 : d.t0;
+            // its first and last bases, and the bases before and after it (an insertion has only these)
+            for (std::size_t r : {d.t0, r_hi, d.t0 > 0 ? d.t0 - 1 : d.t0, std::min(d.t1, recon.size() ? recon.size() - 1 : 0)}) {
+                const auto [g, ev] = locate(r);
+                const bool own = d.t1 > d.t0 && (r == d.t0 || r == r_hi);   // its own bases, not its flanks
+                if (ev >= 0 && touched < 0 && (own || (d.t1 == d.t0 && r == d.t0))) touched = ev;
+                g_lo = std::min(g_lo, g); g_hi = std::max(g_hi, g);
+                if (ev >= 0 && own) {
+                    const CarrierEvent& ae = *applied[static_cast<std::size_t>(ev)];
+                    m_lo = std::min(m_lo, ae.ref_start); m_hi = std::max(m_hi, std::max(ae.ref_end, ae.ref_start));
+                }
+            }
+            // An insertion has no bases of its own: it lies in an applied event when both its flanks do.
+            if (d.t1 == d.t0 && d.t0 > 0) {
+                const int ea = locate(d.t0 - 1).second, eb = locate(std::min(d.t0, recon.size() ? recon.size() - 1 : 0)).second;
+                if (ea >= 0 && ea == eb) {
+                    const CarrierEvent& ae = *applied[static_cast<std::size_t>(ea)];
+                    m_lo = std::min(m_lo, ae.ref_start); m_hi = std::max(m_hi, std::max(ae.ref_end, ae.ref_start));
+                }
+            }
+            for (auto it = std::upper_bound(pieces.begin(), pieces.end(), d.t0,
+                                            [](std::size_t v, const Piece& p) { return v < p.r0; });
+                 touched < 0 && it != pieces.end() && it->r0 < d.t1; ++it)
+                if (it->event >= 0) touched = it->event;
+            row.g0 = g_lo; row.g1 = g_hi;
+            row.m0 = std::min(m_lo, g_lo); row.m1 = std::max(m_hi, g_hi);
+            // Sites and records are looked for anywhere it can slide to.
+            std::size_t w_lo = g_lo, w_hi = g_hi;
+            if (std::size_t s0 = 0, s1 = 0; slide_of(recon, truth, d, s0, s1)) {
+                const std::size_t last = recon.size() ? recon.size() - 1 : 0;
+                const std::size_t r_lo = s0 > 0 ? s0 - 1 : 0, r_hi = std::min(s1, last);
+                const auto take = [&](std::size_t r) {
+                    const std::size_t g = locate(r).first;
+                    w_lo = std::min(w_lo, g); w_hi = std::max(w_hi, g);
+                };
+                take(r_lo);
+                take(r_hi);
+                // and the ends of every piece inside, as an applied inversion maps backwards
+                for (auto it = std::upper_bound(pieces.begin(), pieces.end(), r_lo,
+                                                [](std::size_t v, const Piece& p) { return v < p.r0; });
+                     it != pieces.end() && it->r0 <= r_hi; ++it) {
+                    take(it->r0);
+                    if (it->r1 > it->r0) take(std::min(it->r1 - 1, r_hi));
+                }
+                if (auto it = std::upper_bound(pieces.begin(), pieces.end(), r_lo,
+                                               [](std::size_t v, const Piece& p) { return v < p.r0; });
+                    it != pieces.begin() && (--it)->r1 > it->r0)
+                    take(std::min(it->r1 - 1, r_hi));
+            }
+            row.w0 = w_lo; row.w1 = w_hi;
+            row.m0 = std::min(row.m0, w_lo); row.m1 = std::max(row.m1, w_hi);
+            const std::size_t slo = w_lo > merge_gap ? w_lo - merge_gap : 0, shi = w_hi + merge_gap;
+            const auto near = [&](const std::map<std::string, std::pair<std::size_t, std::size_t>>& spans) {
+                std::vector<std::string> v;
+                for (const auto& [id, sp] : spans) if (sp.first <= shi && slo <= sp.second) v.push_back(id);
+                return v;
+            };
+            std::vector<std::string> recs, bids;
+            for (const auto& [bid, sp] : bubble_span)
+                if (sp.first <= shi && slo <= sp.second) bids.push_back(std::to_string(bid));
+            if (touched >= 0) {
+                const CarrierEvent& te = *applied[static_cast<std::size_t>(touched)];
+                row.cause = "incomplete";
+                recs = {te.variant_id};
+            } else {
+                // Where the records' events sit first, then their POS..END (a copy-number record's span is its
+                // whole module). A record this haplotype carries there: its event is not all of what the
+                // haplotype has (incomplete), or it could not be written (unresolved). Otherwise a record it
+                // does not carry: a miss.
+                const std::unordered_set<std::string>* unres = nullptr;
+                if (const auto it = unresolved_of.find(path.name); it != unresolved_of.end()) unres = &it->second;
+                // A record of its own that could not be written, there, comes first: nothing of it was applied.
+                std::vector<std::string> mine, gone, others;
+                if (unres != nullptr)
+                    for (const std::string& id : near(record_span)) if (unres->count(id)) gone.push_back(id);
+                for (const auto* spans : {&event_span, &record_span}) {
+                    if (!gone.empty()) break;
+                    for (const std::string& id : near(*spans)) (carried.count(id) ? mine : others).push_back(id);
+                    if (!mine.empty() || !others.empty()) break;
+                }
+                if (!gone.empty()) { row.cause = "unresolved"; recs = gone; }
+                else if (!mine.empty()) { row.cause = "incomplete"; recs = mine; }
+                else if (!others.empty()) { row.cause = "not_carrier"; recs = others; }
+                else { row.cause = !bids.empty() ? "no_record" : "outside_bubbles"; recs.clear(); }
+            }
+            auto join = [](const std::vector<std::string>& v) {
+                if (v.empty()) return std::string(".");
+                std::string s;
+                for (std::size_t k = 0; k < v.size(); ++k) { if (k) s += ';'; s += v[k]; }
+                return s;
+            };
+            row.records = join(recs);
+            row.bubbles = join(bids);
+            ++hr.left_by_cause[row.cause];
+            hr.rows.push_back(std::move(row));
         }
     });
 
-    cli::StagedOutputs staged("benchmark");
-    std::vector<std::string> staged_paths;
-    for (const std::string& f : finals) staged_paths.push_back(staged.stage(f));
-    auto staged_for = [&](const std::string& f) {
-        for (std::size_t i = 0; i < finals.size(); ++i) if (finals[i] == f) return staged_paths[i];
-        throw std::runtime_error("benchmark: unstaged output " + f);
+    out.results = std::move(results);
+    out.checks = std::move(checks);
+    out.checked = checked; out.unchecked = unchecked;
+    out.cn_checked = cn_stretch_checked; out.cn_unchecked = cn_stretch_unchecked;
+    out.unresolved_rows = unresolved_rows;
+    out.not_reconstructable = vcf_not_reconstructable; out.missing_gt = vcf_missing_gt;
+    out.not_in_vcf = not_in_vcf;
+    out.vcf = vcf;
     };
-
-    std::map<std::string, std::size_t> band_count;
-    std::map<std::string, std::size_t> quintile_count;
-    std::map<std::string, std::size_t> gt_band_count;
-    std::map<std::string, std::size_t> gt_quintile_count;
-    std::map<std::string, std::size_t> called_quintile_count;
-    std::size_t scored_haps = 0, gt_scored_haps = 0;
-    double gt_closed_sum = 0.0;
-    std::size_t gt_closed_n = 0, gt_closed_na = 0;
-    std::size_t gt_worse_than_ref = 0;
-    std::size_t gt_tot_ref_delta = 0, gt_tot_gt_delta = 0, gt_tot_graph_delta = 0;
-    std::size_t tot_run_lt = 0, tot_run_ge = 0;
-    std::size_t tot_called_delta = 0;
-    std::size_t tot_carrier_delta = 0, tot_carrier_aln = 0, carrier_scored_haps = 0;
-    std::size_t tot_gt_absent = 0;
-    std::map<std::string, std::size_t> carrier_quintile_count;
-    std::size_t tot_coarse = 0, tot_skipped = 0;
-    Ledger tot_led;
-    GtStats tot_gt;
-    {
-        std::ofstream by_hap(staged_for(out_prefix + ".qv_by_haplotype.tsv"));
-        if (!by_hap) throw std::runtime_error("Failed to write " + out_prefix + ".qv_by_haplotype.tsv");
-        by_hap << "sample\tn_bubbles\tsum_delta\tsum_aln_len\tqv\tband\tqv_max\tqv_ratio\tquintile\tidentity"
-                  "\tresid_run_lt_bp\tresid_run_ge_bp"
-                  "\ttruth_events\ttruth_called\ttruth_missed\ttruth_below"
-                  "\ttruth_called_bp\ttruth_missed_bp\ttruth_below_bp"
-                  "\tcalled_sum_delta\tcalled_qv\tcalled_quintile"
-                  "\tcarrier_sum_delta\tcarrier_qv"
-                  "\tgt_sum_delta\tgt_sum_aln_len\tgt_qv\tgt_band\tgt_quintile\tgt_identity"
-                  "\tref_sum_delta\tref_qv\tgap_closed\n";
-        for (const HapResult& hr : results) {
-            if (!hr.scored) continue;
-            const double qv = qv_from(hr.sum_delta, hr.sum_aln);
-            const double qmax = qv_max_from(hr.sum_aln);
-            const double ratio = std::min(1.0, std::max(0.0, qmax > 0.0 ? qv / qmax : 1.0));
-            // Linear reconstruction identity: 1 - error rate. Unlike QV it does not overweight a few
-            // uncalled SNPs over a long region (a handful of edits in tens of kb stays ~1.0).
-            const double identity = hr.sum_aln ? std::max(0.0, 1.0 - static_cast<double>(hr.sum_delta) / static_cast<double>(hr.sum_aln)) : 1.0;
-            const std::string band = qv_band(qv);
-            const std::string quintile = qv_ratio_quintile(ratio);
-            const double cqv = qv_from(hr.called_sum_delta, hr.called_sum_aln);
-            const double cmax = qv_max_from(hr.called_sum_aln);
-            const std::string cquint = qv_ratio_quintile(std::min(1.0, std::max(0.0, cmax > 0.0 ? cqv / cmax : 1.0)));
-            by_hap << hr.sample << '\t' << hr.obs.size() << '\t' << hr.sum_delta << '\t'
-                   << hr.sum_aln << '\t' << qv << '\t' << band << '\t' << qmax << '\t'
-                   << ratio << '\t' << quintile << '\t' << identity << '\t'
-                   << hr.sum_run_lt << '\t' << hr.sum_run_ge << '\t'
-                   << hr.led.events << '\t' << hr.led.called << '\t' << hr.led.missed << '\t'
-                   << hr.led.below << '\t' << hr.led.called_bp << '\t' << hr.led.missed_bp << '\t'
-                   << hr.led.below_bp << '\t'
-                   << hr.called_sum_delta << '\t' << cqv << '\t' << cquint << '\t';
-            if (hr.carrier_scored) {
-                const double wqv = qv_from(hr.carrier_sum_delta, hr.carrier_sum_aln);
-                const double wmax = qv_max_from(hr.carrier_sum_aln);
-                by_hap << hr.carrier_sum_delta << '\t' << wqv;
-                ++carrier_quintile_count[qv_ratio_quintile(
-                    std::min(1.0, std::max(0.0, wmax > 0.0 ? wqv / wmax : 1.0)))];
-                tot_carrier_delta += hr.carrier_sum_delta;
-                tot_carrier_aln += hr.carrier_sum_aln;
-                ++carrier_scored_haps;
-                tot_gt_absent += hr.gt_absent_records;
-            } else {
-                by_hap << ".\t.";
+    // ---- outputs: what call missed, then what the VCF lost on top ----
+    // A large difference left by the VCF's records that overlaps one left by call's own events (on the
+    // reference, within --merge-gap) is the same miss. The rest is what the step from call's findings to
+    // the file lost: copies the record counts but cannot spell (copy_count), sequence it does not hold
+    // (no_sequence), inexact inversion ends (imprecise), or a carrier's own allele the record's
+    // representative does not match (representative).
+    const auto write_outputs = [&]() {
+        cli::StagedOutputs staged("benchmark");
+        const Stage& sc = stages[0];
+        const Stage& sv = stages[1];
+        std::unordered_map<std::string, const HapResult*> vres;
+        for (const HapResult& r : sv.results) vres[r.name] = &r;
+        std::unordered_map<std::string, const VcfRecordInfo*> rec;
+        for (const VcfRecordInfo& r : sv.vcf) rec[r.id] = &r;
+        // Why the VCF rebuild leaves `e` where call's own events do not; `records` may be filled in.
+        const auto lost_reason = [&](const LargeRow& e, const HapResult& c, std::string& records) -> std::string {
+            if (e.cause == "unresolved") return "no_sequence";
+            const std::vector<std::string> ids = e.records == "." ? std::vector<std::string>() : split_on(e.records, ';');
+            for (const std::string& id : ids)
+                if (const auto it = rec.find(id); it != rec.end() && (it->second->svtype == "CNV" || it->second->svtype == "DUP"))
+                    return "copy_count";
+            for (const std::string& id : ids)
+                if (const auto it = rec.find(id); it != rec.end() && has_flag(it->second->info, "IMPRECISE")) return "imprecise";
+            if (e.cause == "incomplete") return "representative";
+            // A record whose own event for this haplotype sits there, written elsewhere by the VCF.
+            for (const HapResult::Span& sp : c.applied_spans)
+                if (e.w0 <= sp.hi + merge_gap && sp.lo <= e.w1 + merge_gap) { records = sp.id; return "representative"; }
+            return "other";
+        };
+        std::map<std::string, std::size_t> missed_by_cause = {{"incomplete", 0}, {"unresolved", 0}, {"not_carrier", 0},
+                                                              {"no_record", 0}, {"outside_bubbles", 0}};
+        std::map<std::string, std::size_t> lost_by_reason = {{"copy_count", 0}, {"no_sequence", 0}, {"imprecise", 0},
+                                                             {"representative", 0}, {"other", 0}};
+        std::map<std::string, std::size_t> skipped;
+        std::size_t scored = 0, present_n = 0, present_bp = 0, missed_n = 0, missed_bp = 0, lost_n = 0, lost_bp = 0;
+        std::size_t vcf_left_n = 0, vcf_left_bp = 0, clean_call = 0, clean_vcf = 0, present_small = 0, small_call = 0, small_vcf = 0;
+        std::size_t present_snv = 0, snv_call = 0, snv_vcf = 0, applied_call = 0, applied_vcf = 0, conflicts = 0;
+        std::size_t outside = 0, absorbed = 0, conflicts_vcf = 0;
+        std::set<std::pair<std::string, std::string>> mismatching;
+        for (const CheckRow& c : sc.checks) mismatching.emplace(c.variant_id, c.haplotype);
+        std::ofstream ho(staged.stage(finals[1]));
+        std::ofstream eo(staged.stage(finals[2]));
+        if (!ho || !eo) throw std::runtime_error("cannot write benchmark outputs at " + out_prefix);
+        ho << "haplotype\tstatus\tref_start\tref_end\tlarge_present\tlarge_present_bp\tmissed_by_call\tmissed_by_call_bp"
+              "\tlost_in_vcf\tlost_in_vcf_bp\tsmall_present_bp\tsmall_left_call_bp\tsmall_left_vcf_bp\tsnv_present"
+              "\tsnv_left_call\tsnv_left_vcf\n";
+        eo << "haplotype\tstage\tref_start\tref_end\ttype\tsize_bp\tdel_bp\tins_bp\treason\tbubbles\trecords\n";
+        const auto row_out = [&](const LargeRow& e, const char* stage, const std::string& reason) {
+            eo << e.haplotype << '\t' << stage << '\t' << e.g0 << '\t' << e.g1 << '\t' << e.type << '\t' << e.size
+               << '\t' << e.del_bp << '\t' << e.ins_bp << '\t' << reason << '\t' << e.bubbles << '\t' << e.records << '\n';
+        };
+        for (const HapResult& c : sc.results) {
+            const auto vit = vres.find(c.name);
+            if (c.status != "scored" || vit == vres.end()) {
+                ++skipped[c.status];
+                ho << c.name << '\t' << c.status;
+                for (int k = 0; k < 14; ++k) ho << "\t.";
+                ho << '\n';
+                continue;
             }
-            if (hr.gt_scored) {
-                const double gqv = qv_from(hr.gt_sum_delta, hr.gt_sum_aln);
-                const double gmax = qv_max_from(hr.gt_sum_aln);
-                const double gratio = std::min(1.0, std::max(0.0, gmax > 0.0 ? gqv / gmax : 1.0));
-                const double gident = hr.gt_sum_aln ? std::max(0.0, 1.0 - static_cast<double>(hr.gt_sum_delta) / static_cast<double>(hr.gt_sum_aln)) : 1.0;
-                const std::string gband = qv_band(gqv);
-                const std::string gquint = qv_ratio_quintile(gratio);
-                // How much of the distance between doing nothing and the graph bound the VCF closes.
-                // 1 = everything the graph could offer, 0 = no better than plain reference, < 0 = the
-                // genotypes put edits where they do not belong. When the baseline already equals the
-                // graph bound there is no distance to close and the ratio is UNDEFINED -- reporting it
-                // as 1.0 called a total miss a perfect score, since baseline == genotype == graph then
-                // reads "closed everything".
-                const double denom = static_cast<double>(hr.ref_sum_delta) - static_cast<double>(hr.sum_delta);
-                const bool has_gap = std::fabs(denom) > 1e-9;
-                const double closed = has_gap
-                    ? (static_cast<double>(hr.ref_sum_delta) - static_cast<double>(hr.gt_sum_delta)) / denom
-                    : 0.0;
-                by_hap << '\t' << hr.gt_sum_delta << '\t' << hr.gt_sum_aln << '\t' << gqv << '\t'
-                       << gband << '\t' << gquint << '\t' << gident << '\t'
-                       << hr.ref_sum_delta << '\t' << qv_from(hr.ref_sum_delta, hr.ref_sum_aln) << '\t';
-                if (has_gap) by_hap << closed; else by_hap << "NA";
-                if (has_gap) { gt_closed_sum += closed; ++gt_closed_n; } else ++gt_closed_na;
-                if (hr.gt_sum_delta > hr.ref_sum_delta) ++gt_worse_than_ref;
-                gt_tot_ref_delta += hr.ref_sum_delta;
-                gt_tot_gt_delta += hr.gt_sum_delta;
-                gt_tot_graph_delta += hr.sum_delta;
-                ++gt_band_count[gband];
-                ++gt_quintile_count[gquint];
-                ++gt_scored_haps;
-                tot_gt.applied += hr.gt_stats.applied;
-                tot_gt.unplaceable += hr.gt_stats.unplaceable;
-                tot_gt.clamped += hr.gt_stats.clamped;
-                tot_gt.unhandled += hr.gt_stats.unhandled;
-                tot_gt.ref_mismatch += hr.gt_stats.ref_mismatch;
-                tot_gt.heuristic += hr.gt_stats.heuristic;
-            } else {
-                by_hap << "\t.\t.\t.\t.\t.\t.\t.\t.\t.";
+            const HapResult& v = *vit->second;
+            ++scored;
+            std::size_t h_lost = 0, h_lost_bp = 0;
+            for (const LargeRow& e : c.rows) {
+                ++missed_by_cause[e.cause];
+                row_out(e, "missed_by_call", e.cause);
             }
-            by_hap << '\n';
-            ++band_count[band];
-            ++quintile_count[quintile];
-            ++called_quintile_count[cquint];
-            ++scored_haps;
-            tot_run_lt += hr.sum_run_lt;
-            tot_run_ge += hr.sum_run_ge;
-            tot_called_delta += hr.called_sum_delta;
-            tot_coarse += hr.coarse_blocks;
-            tot_skipped += hr.skipped_bubbles;
-            tot_led.events += hr.led.events;
-            tot_led.called += hr.led.called;   tot_led.called_bp += hr.led.called_bp;
-            tot_led.missed += hr.led.missed;   tot_led.missed_bp += hr.led.missed_bp;
-            tot_led.below  += hr.led.below;    tot_led.below_bp  += hr.led.below_bp;
-        }
-    }
-
-    if (write_events) {
-        std::ofstream ev(staged_for(out_prefix + ".truth_events.tsv"));
-        if (!ev) throw std::runtime_error("Failed to write " + out_prefix + ".truth_events.tsv");
-        ev << "sample\tbubble_id\tref_bp\thap_bp\tsize_bp\tclass\tvariant_id\tsvtype\n";
-        for (const HapResult& hr : results)
-            for (const EventRow& e : hr.events)
-                ev << e.sample << '\t' << e.bubble_id << '\t' << e.ref_bp << '\t' << e.hap_bp << '\t'
-                   << e.size_bp << '\t' << e.klass << '\t' << e.variant_id << '\t' << e.svtype << '\n';
-    }
-
-    std::map<std::string, std::map<std::string, std::size_t>> class_bands;
-    // Carrier confusion at the (haplotype, bubble) level: the genotype call (does the VCF say this
-    // haplotype carries an alt here) against the truth (does its walk diverge by at least the
-    // threshold). Reported for ALL only -- a bubble judgement has no single svtype, and fanning it out
-    // over every svtype the bubble contains reported one observation as several.
-    std::array<std::size_t, 4> carrier{{0, 0, 0, 0}};   // {TP, FP, FN, TN}
-    // THE COMMON SET. Every comparative number is accumulated only over (haplotype, bubble)
-    // observations that ALL levels could score -- i.e. those the genotype level reached. `called` and
-    // `graph` cover every graph haplotype, `carrier` only those joined to a VCF column, `genotype`
-    // only those whose bubble could also be placed on the reference. Totalling them over their own
-    // populations and then subtracting compares different denominators: with one haplotype left out
-    // of the VCF the fixture reported carrier_walk 100% ABOVE called 83.3%, and a carrier-assignment
-    // loss of MINUS 20 bp.
-    std::size_t cs_obs = 0, cs_base = 0, cs_graph = 0, cs_called = 0, cs_carrier = 0,
-                cs_scope = 0, cs_gt = 0;
-    // SIGNED. The genotype level applies every record the haplotype carries, while carrier_walk only
-    // substitutes blocks that are eligible AND attributed, so a record can improve a region
-    // carrier_walk left alone and the step comes out negative there. Clamping those to zero silently
-    // broke the partition on four of six loci; a negative term is a real finding (the VCF beat the
-    // walk-based ceiling locally) and is shown rather than hidden.
-    long long cs_repr = 0, cs_fp = 0;
-    // The event ledger by svtype IS a partition: each event maps to at most one record.
-    std::map<std::string, std::array<std::size_t, 3>> ledger_by_type;  // svtype -> {called, missed, below}
-    {
-        std::ofstream qv_out(staged_for(out_prefix + ".qv.tsv"));
-        if (!qv_out) throw std::runtime_error("Failed to write " + out_prefix + ".qv.tsv");
-        qv_out << "sample\tbubble_id\tsvtypes\tis_carrier\tdelta\taln_len\tqv\tresid_run_lt_bp\tresid_run_ge_bp"
-                  "\ttruth_events\ttruth_called\ttruth_missed\ttruth_below\ttruth_missed_bp"
-                  "\tcalled_delta\tcalled_qv\tcarrier_delta\tcarrier_qv"
-                  "\tgt_delta\tgt_aln_len\tgt_qv\tref_delta\tgt_called_carrier\tgt_true_carrier\n";
-        for (const HapResult& hr : results) {
-            if (!hr.scored) continue;
-            for (const BubbleObs& o : hr.obs) {
-                std::string svt;
-                const auto sit = cv.svtypes.find(o.bubble_id);
-                if (sit != cv.svtypes.end())
-                    for (const std::string& s : sit->second) { if (!svt.empty()) svt += ','; svt += s; }
-                const double qv = qv_from(o.delta, o.aln_len);
-                const std::string band = qv_band(qv);
-                qv_out << hr.sample << '\t' << o.bubble_id << '\t' << (svt.empty() ? "." : svt) << '\t'
-                       << (o.carrier ? 1 : 0) << '\t' << o.delta << '\t' << o.aln_len << '\t' << qv << '\t'
-                       << o.run_lt_bp << '\t' << o.run_ge_bp << '\t'
-                       << o.led.events << '\t' << o.led.called << '\t' << o.led.missed << '\t'
-                       << o.led.below << '\t' << o.led.missed_bp << '\t'
-                       << o.called_delta << '\t' << qv_from(o.called_delta, o.called_aln_len);
-                if (o.carrier_scored)
-                    qv_out << '\t' << o.carrier_delta << '\t'
-                           << qv_from(o.carrier_delta, o.carrier_aln_len);
-                else
-                    qv_out << "\t.\t.";
-                if (o.gt_scored) {
-                    qv_out << '\t' << o.gt_delta << '\t' << o.gt_aln_len << '\t'
-                           << qv_from(o.gt_delta, o.gt_aln_len) << '\t' << o.ref_delta << '\t'
-                           << (o.gt_called_carrier ? 1 : 0) << '\t' << (o.gt_true_carrier ? 1 : 0);
-                    ++carrier[o.gt_called_carrier ? (o.gt_true_carrier ? 0 : 1)
-                                                  : (o.gt_true_carrier ? 2 : 3)];
-                    ++cs_obs;
-                    cs_base += o.ref_delta;
-                    cs_graph += o.delta;
-                    cs_called += o.called_delta;
-                    cs_carrier += o.carrier_scored ? o.carrier_delta : o.called_delta;
-                    cs_scope += o.scope_delta;
-                    cs_gt += o.gt_delta;
-                    // The step from carrier to genotype is not one thing. Where this haplotype has an
-                    // eligible truth block, it is the encoding of a correctly assigned record. Where it
-                    // has none and the VCF still edits it, the damage is the false-positive assignment
-                    // itself -- carrier_walk has no true block to substitute, so it leaves the
-                    // reference alone while the genotype level applies the erroneous edit.
-                    const long long step = static_cast<long long>(o.gt_delta) -
-                                           static_cast<long long>(o.carrier_scored ? o.carrier_delta
-                                                                                   : o.called_delta);
-                    if (o.gt_called_carrier && !o.gt_true_carrier) cs_fp += step;
-                    else cs_repr += step;
-                } else {
-                    qv_out << "\t.\t.\t.\t.\t.\t" << (o.gt_true_carrier ? 1 : 0);
+            // A VCF-stage leftover lying on one of call's leftovers (within --merge-gap; a leftover inside
+            // an applied event may lie anywhere over it) is that miss again, up to the miss's size: only what
+            // goes beyond it, by --min-sv-bp or more, was lost in the VCF. Each of call's leftovers is
+            // drawn on once in all, so a miss is never counted twice.
+            // Each of the VCF rebuild's own leftovers is also written whole (left_by_vcf): a miss again, with
+            // the cause of the miss it draws most on, when what goes beyond is under --min-sv-bp; else with
+            // its reason as lost in the VCF.
+            std::vector<std::size_t> held(c.rows.size(), 0);
+            std::vector<std::pair<LargeRow, std::string>> by_vcf;
+            for (const LargeRow& e0 : v.rows) {
+                LargeRow e = e0;
+                std::size_t most = 0, most_k = 0;
+                for (std::size_t k = 0; k < c.rows.size() && e.size > 0; ++k) {
+                    const LargeRow& m = c.rows[k];
+                    if (!(e.m0 <= m.m1 + merge_gap && m.m0 <= e.m1 + merge_gap) || held[k] >= m.size) continue;
+                    // the same direction: a loss is not a gain call missed (a replacement is either)
+                    if (e.type != m.type && e.type != "SUB" && m.type != "SUB") continue;
+                    const std::size_t take = std::min(e.size, m.size - held[k]);
+                    held[k] += take;
+                    e.size -= take;
+                    if (take > most) { most = take; most_k = k; }
                 }
-                qv_out << '\n';
-                if (sit != cv.svtypes.end())
-                    for (const std::string& s : sit->second) ++class_bands[s][band];
-            }
-            for (const EventRow& e : hr.events) {
-                auto& c = ledger_by_type[e.svtype];
-                if (std::string(e.klass) == "called") ++c[0];
-                else if (std::string(e.klass) == "missed") ++c[1];
-                else ++c[2];
-            }
-        }
-    }
-
-    static const char* kBands[] = {"<17", "17-23", "23-33", ">33"};
-    static const char* kQuintiles[] = {"0.0-0.2", "0.2-0.4", "0.4-0.6", "0.6-0.8", "0.8-1.0"};
-    {
-        std::ofstream sum(staged_for(out_prefix + ".qv_summary.tsv"));
-        if (!sum) throw std::runtime_error("Failed to write " + out_prefix + ".qv_summary.tsv");
-        sum << "scope\tkey\tband\tn\tpct\n";
-        // Length-fair headline: % of haplotypes per qv/qv_max quintile (Q5 = 0.8-1.0 is best).
-        for (const char* q : kQuintiles) {
-            const std::size_t n = quintile_count.count(q) ? quintile_count[q] : 0;
-            const double pct = scored_haps ? 100.0 * static_cast<double>(n) / static_cast<double>(scored_haps) : 0.0;
-            sum << "quintile\tALL\t" << q << '\t' << n << '\t' << pct << '\n';
-        }
-        for (const char* band : kBands) {
-            const std::size_t n = band_count.count(band) ? band_count[band] : 0;
-            const double pct = scored_haps ? 100.0 * static_cast<double>(n) / static_cast<double>(scored_haps) : 0.0;
-            sum << "haplotype\tALL\t" << band << '\t' << n << '\t' << pct << '\n';
-        }
-        for (const char* q : kQuintiles) {
-            const std::size_t n = called_quintile_count.count(q) ? called_quintile_count[q] : 0;
-            const double pct = scored_haps ? 100.0 * static_cast<double>(n) / static_cast<double>(scored_haps) : 0.0;
-            sum << "called_quintile\tALL\t" << q << '\t' << n << '\t' << pct << '\n';
-        }
-        // The truth ledger. Every divergent block between the reference walk and a haplotype's walk is
-        // one event, sized from the walks; `called` means it contains a node of a specific emitted
-        // record, which is weaker than "that record reproduces it" and is labelled accordingly.
-        {
-            const std::size_t tot = tot_led.events ? tot_led.events : 1;
-            sum << "truth_event\tALL\tevents\t" << tot_led.events << "\t100\n";
-            sum << "truth_event\tALL\tcalled\t" << tot_led.called << '\t'
-                << 100.0 * static_cast<double>(tot_led.called) / static_cast<double>(tot) << '\n';
-            sum << "truth_event\tALL\tmissed\t" << tot_led.missed << '\t'
-                << 100.0 * static_cast<double>(tot_led.missed) / static_cast<double>(tot) << '\n';
-            sum << "truth_event\tALL\tbelow_threshold\t" << tot_led.below << '\t'
-                << 100.0 * static_cast<double>(tot_led.below) / static_cast<double>(tot) << '\n';
-            sum << "truth_bp\tALL\tcalled_bp\t" << tot_led.called_bp << "\t0\n";
-            sum << "truth_bp\tALL\tmissed_bp\t" << tot_led.missed_bp << "\t0\n";
-            sum << "truth_bp\tALL\tbelow_threshold_bp\t" << tot_led.below_bp << "\t0\n";
-            for (const auto& [svt, c] : ledger_by_type) {
-                sum << "truth_event\t" << svt << "\tcalled\t" << c[0] << "\t0\n";
-                sum << "truth_event\t" << svt << "\tmissed\t" << c[1] << "\t0\n";
-                sum << "truth_event\t" << svt << "\tbelow_threshold\t" << c[2] << "\t0\n";
-            }
-        }
-        // Residual by contiguous ALIGNMENT RUN length. This is a property of the edit path edlib
-        // returns, not of any event: a clean 60 bp deletion of non-repetitive sequence comes back as a
-        // dozen short runs, because co-optimal paths distribute the gap across chance matches. Kept as
-        // a description of the residual's shape; the called/missed question is the ledger's.
-        {
-            const std::size_t tot = tot_run_lt + tot_run_ge;
-            const double lt_pct = tot ? 100.0 * static_cast<double>(tot_run_lt) / static_cast<double>(tot) : 0.0;
-            const double ge_pct = tot ? 100.0 * static_cast<double>(tot_run_ge) / static_cast<double>(tot) : 0.0;
-            sum << "residual_run\t<" << min_sv_bp << "bp\tshort_runs\t" << tot_run_lt << '\t' << lt_pct << '\n';
-            sum << "residual_run\t>=" << min_sv_bp << "bp\tlong_runs\t" << tot_run_ge << '\t' << ge_pct << '\n';
-        }
-        // What was left out of the denominators, so no rate is read as if it covered everything.
-        sum << "excluded\tALL\tbubbles_no_reference_walk\t" << no_ref_bubbles << "\t0\n";
-        sum << "excluded\tALL\thaplotype_bubbles_not_traversed\t" << tot_skipped << "\t0\n";
-        sum << "excluded\tALL\tbubbles_decomposed_coarsely\t" << tot_coarse << "\t0\n";
-        sum << "excluded\tALL\thaplotypes_without_vcf_column\t"
-            << (do_gt ? graph.paths.size() - joined : 0) << "\t0\n";
-        sum << "excluded\tALL\tvcf_samples_without_path\t" << unjoined_samples << "\t0\n";
-        sum << "called_recon\tALL\tdelta\t" << tot_called_delta << "\t0\n";
-        if (carrier_scored_haps) {
-            for (const char* q : kQuintiles) {
-                const std::size_t n = carrier_quintile_count.count(q) ? carrier_quintile_count[q] : 0;
-                const double pct = 100.0 * static_cast<double>(n) / static_cast<double>(carrier_scored_haps);
-                sum << "carrier_quintile\tALL\t" << q << '\t' << n << '\t' << pct << '\n';
-            }
-            sum << "carrier_recon\tALL\tdelta\t" << tot_carrier_delta << "\t0\n";
-            // The denominator that turns the delta above into an identity. It was being accumulated
-            // and never reported, so the summary carried a numerator a reader could not normalize
-            // without going back to the per-haplotype table -- and the compiler flagged it as an
-            // unused variable, which is what the accumulation had in fact become.
-            sum << "carrier_recon\tALL\taln_len\t" << tot_carrier_aln << "\t0\n";
-            sum << "carrier_recon\tALL\thaplotypes\t" << carrier_scored_haps << "\t0\n";
-            sum << "carrier_recon\tALL\tcalled_records_absent_from_vcf\t" << tot_gt_absent << "\t0\n";
-        }
-        // Genotype-aware reconstruction, reported on the same scale so the two are read side by side.
-        if (gt_scored_haps) {
-            for (const char* q : kQuintiles) {
-                const std::size_t n = gt_quintile_count.count(q) ? gt_quintile_count[q] : 0;
-                const double pct = 100.0 * static_cast<double>(n) / static_cast<double>(gt_scored_haps);
-                sum << "gt_quintile\tALL\t" << q << '\t' << n << '\t' << pct << '\n';
-            }
-            for (const char* band : kBands) {
-                const std::size_t n = gt_band_count.count(band) ? gt_band_count[band] : 0;
-                const double pct = 100.0 * static_cast<double>(n) / static_cast<double>(gt_scored_haps);
-                sum << "gt_haplotype\tALL\t" << band << '\t' << n << '\t' << pct << '\n';
-            }
-            {
-                const std::size_t tp = carrier[0], fp = carrier[1], fn = carrier[2], tn = carrier[3];
-                const double prec = (tp + fp) ? 100.0 * static_cast<double>(tp) / static_cast<double>(tp + fp) : 0.0;
-                const double rec = (tp + fn) ? 100.0 * static_cast<double>(tp) / static_cast<double>(tp + fn) : 0.0;
-                sum << "gt_carrier\tALL\tTP\t" << tp << '\t' << prec << '\n';
-                sum << "gt_carrier\tALL\tFP\t" << fp << '\t' << prec << '\n';
-                sum << "gt_carrier\tALL\tFN\t" << fn << '\t' << rec << '\n';
-                sum << "gt_carrier\tALL\tTN\t" << tn << '\t' << rec << '\n';
-            }
-            {
-                const double denom = static_cast<double>(gt_tot_ref_delta) - static_cast<double>(gt_tot_graph_delta);
-                const bool has_gap = std::fabs(denom) > 1e-9;
-                const double closed = has_gap
-                    ? (static_cast<double>(gt_tot_ref_delta) - static_cast<double>(gt_tot_gt_delta)) / denom : 0.0;
-                sum << "gt_gap\tALL\tbaseline_delta\t" << gt_tot_ref_delta << "\t0\n";
-                sum << "gt_gap\tALL\tregion_vcf_delta\t" << gt_tot_gt_delta << "\t0\n";
-                sum << "gt_gap\tALL\tgraph_delta\t" << gt_tot_graph_delta << "\t0\n";
-                sum << "gt_gap\tALL\tgap_closed_pooled\t0\t";
-                if (has_gap) sum << 100.0 * closed << '\n'; else sum << "NA\n";
-                sum << "gt_gap\tALL\tgap_closed_mean\t" << gt_closed_n << '\t';
-                if (gt_closed_n) sum << 100.0 * gt_closed_sum / static_cast<double>(gt_closed_n) << '\n';
-                else sum << "NA\n";
-                sum << "gt_gap\tALL\tgap_closed_undefined\t" << gt_closed_na << "\t0\n";
-                sum << "gt_gap\tALL\tworse_than_baseline\t" << gt_worse_than_ref << '\t'
-                    << (gt_scored_haps ? 100.0 * static_cast<double>(gt_worse_than_ref) /
-                                             static_cast<double>(gt_scored_haps) : 0.0) << '\n';
-                // `variation_recovered` asks the same question against the other denominator: of the
-                // distance between the plain reference and the truth, what fraction does each level
-                // remove. gap_closed measures against the ACHIEVABLE bound (the graph), this against
-                // all of it, so the pair says which of representation or graph is the limit.
-                //
-                // Every figure below is over the COMMON SET (see cs_* above), so the levels are ratios
-                // of the same observations. The all-panel totals stay available as `called_recon` and
-                // `gt_gap`, but they do not enter these.
-                const double base = static_cast<double>(cs_base);
-                auto vr = [&](const char* name, std::size_t d) {
-                    sum << "variation_recovered\tALL\t" << name << "\t0\t";
-                    if (cs_obs && base > 0.0) sum << 100.0 * (base - static_cast<double>(d)) / base << '\n';
-                    else sum << "NA\n";
-                };
-                vr("graph", cs_graph);
-                vr("called", cs_called);
-                if (carrier_scored_haps) vr("carrier_walk", cs_carrier);
-                else sum << "variation_recovered\tALL\tcarrier_walk\t0\tNA\n";
-                vr("region_vcf", cs_gt);
-                vr("in_scope_floor", cs_scope);
-                sum << "common_set\tALL\tobservations\t" << cs_obs << "\t0\n";
-                sum << "common_set\tALL\tbaseline_delta\t" << cs_base << "\t0\n";
-                sum << "common_set\tALL\tregion_vcf_delta\t" << cs_gt << "\t0\n";
-                // An exact partition of the genotype residual over the common set. The five terms sum
-                // to cs_gt by construction, each being one consecutive step of
-                //   truth -> in-scope floor -> called -> carrier -> genotype.
-                sum << "vcf_mode\tALL\t" << (allele_mode ? "allele" : "region") << "\t0\t0\n";
-                // The partition's middle terms are per-call attributions. An allele VCF has no per-call
-                // rows, so they are absent rather than zero -- reporting them anyway turned a perfect
-                // 0 bp reconstruction into a 1.4 Mb missed-carrier loss and a negative representation.
-                if (cs_obs && allele_mode) {
-                    sum << "loss_bp\tALL\tnot_applicable\t0\t0\n";
-                    sum << "loss_bp\tALL\tout_of_scope\t" << cs_scope << "\t0\n";
-                    sum << "loss_bp\tALL\tserialization_residual\t" << cs_gt << "\t0\n";
-                } else if (cs_obs) {
-                    const long long oos  = static_cast<long long>(cs_scope);
-                    const long long disc = static_cast<long long>(cs_called) - static_cast<long long>(cs_scope);
-                    const long long miss = static_cast<long long>(cs_carrier) - static_cast<long long>(cs_called);
-                    sum << "loss_bp\tALL\tout_of_scope\t" << oos << "\t0\n";
-                    sum << "loss_bp\tALL\tdiscovery_or_attribution\t" << disc << "\t0\n";
-                    sum << "loss_bp\tALL\tcarrier_missed\t" << miss << "\t0\n";
-                    sum << "loss_bp\tALL\trepresentation\t" << cs_repr << "\t0\n";
-                    sum << "loss_bp\tALL\tfalse_positive_damage\t" << cs_fp << "\t0\n";
-                    const long long tot = oos + disc + miss + cs_repr + cs_fp;
-                    sum << "loss_bp\tALL\tsum_check\t" << tot << '\t'
-                        << (tot == static_cast<long long>(cs_gt) ? "exact" : "MISMATCH") << '\n';
+                if (e.size < min_sv_bp) {
+                    LargeRow again = e0;
+                    again.records = c.rows[most_k].records;
+                    by_vcf.push_back({again, c.rows[most_k].cause});
+                    continue;
                 }
+                if (e.size < e0.size) {   // the part beyond call's miss, sized as such
+                    e.del_bp = std::min(e.del_bp, e.size); e.ins_bp = std::min(e.ins_bp, e.size);
+                }
+                std::string records = e.records;
+                const std::string why = lost_reason(e, c, records);
+                ++lost_by_reason[why];
+                ++h_lost; h_lost_bp += e.size;
+                LargeRow shown = e;
+                shown.records = records;
+                row_out(shown, "lost_in_vcf", why);
+                LargeRow whole = e0;
+                whole.records = records;
+                by_vcf.push_back({whole, why});
             }
-            // What the genotype QV was actually computed from, so it is never read without that context.
-            sum << "gt_records\tALL\tapplied\t" << tot_gt.applied << "\t0\n";
-            sum << "gt_records\tALL\tunplaceable\t" << tot_gt.unplaceable << "\t0\n";
-            sum << "gt_records\tALL\tclamped\t" << tot_gt.clamped << "\t0\n";
-            sum << "gt_records\tALL\tunhandled\t" << tot_gt.unhandled << "\t0\n";
-            sum << "gt_records\tALL\tref_mismatch\t" << tot_gt.ref_mismatch << "\t0\n";
-            sum << "gt_records\tALL\theuristic\t" << tot_gt.heuristic << "\t0\n";
+            for (const auto& [row, why] : by_vcf) row_out(row, "left_by_vcf", why);
+            present_n += c.present_n; present_bp += c.present_bp;
+            missed_n += c.left_n; missed_bp += c.left_bp;
+            lost_n += h_lost; lost_bp += h_lost_bp;
+            vcf_left_n += v.left_n; vcf_left_bp += v.left_bp;
+            clean_call += c.left_n == 0; clean_vcf += v.left_n == 0;
+            present_small += c.present_small_bp; small_call += c.left_small_bp; small_vcf += v.left_small_bp;
+            present_snv += c.present_snv; snv_call += c.left_snv; snv_vcf += v.left_snv;
+            applied_call += c.applied; applied_vcf += v.applied;
+            conflicts += c.conflicts; conflicts_vcf += v.conflicts; outside += c.outside_extent;
+            absorbed += c.absorbed;
+            ho << c.name << '\t' << c.status << '\t' << c.g_start << '\t' << c.g_end << '\t' << c.present_n << '\t'
+               << c.present_bp << '\t' << c.left_n << '\t' << c.left_bp << '\t' << h_lost << '\t' << h_lost_bp << '\t'
+               << c.present_small_bp << '\t' << c.left_small_bp << '\t' << v.left_small_bp << '\t' << c.present_snv
+               << '\t' << c.left_snv << '\t' << v.left_snv << '\n';
         }
-        for (const auto& [svclass, bands] : class_bands) {
-            std::size_t total = 0;
-            for (const auto& [b, n] : bands) total += n;
-            for (const char* band : kBands) {
-                const auto bit = bands.find(band);
-                const std::size_t n = bit != bands.end() ? bit->second : 0;
-                const double pct = total ? 100.0 * static_cast<double>(n) / static_cast<double>(total) : 0.0;
-                sum << "svclass\t" << svclass << '\t' << band << '\t' << n << '\t' << pct << '\n';
+        ho.close(); eo.close();
+        if (!ho || !eo) throw std::runtime_error("failed writing benchmark outputs at " + out_prefix);
+        {
+            // What there was to find, per scored haplotype: the truth set a comparison with other callers uses.
+            std::ofstream po(staged.stage(finals[4]));
+            if (!po) throw std::runtime_error("cannot write " + finals[4]);
+            po << "haplotype\tref_start\tref_end\ttype\tsize_bp\tdel_bp\tins_bp\tbubbles\n";
+            for (const HapResult& c : sc.results) {
+                if (c.status != "scored" || !vres.count(c.name)) continue;
+                for (const HapResult::Present& p : c.present_rows)
+                    po << c.name << '\t' << p.g0 << '\t' << p.g1 << '\t' << p.type << '\t' << p.size << '\t'
+                       << p.del_bp << '\t' << p.ins_bp << '\t' << p.bubbles << '\n';
             }
+            po.close();
+            if (!po) throw std::runtime_error("failed writing " + finals[4]);
         }
-    }
-    staged.commit();
-
-    auto quintile_recap = [&](const std::map<std::string, std::size_t>& counts, std::size_t denom) {
-        std::string s;
-        for (const char* q : kQuintiles) {
-            const auto it = counts.find(q);
-            const std::size_t n = it != counts.end() ? it->second : 0;
-            const double pct = denom ? 100.0 * static_cast<double>(n) / static_cast<double>(denom) : 0.0;
-            char buf[64];
-            std::snprintf(buf, sizeof(buf), " %s=%.1f%%", q, pct);
-            s += buf;
+        {
+            std::ofstream co(staged.stage(finals[3]));
+            if (!co) throw std::runtime_error("cannot write " + finals[3]);
+            co << "variant_id\thaplotype\tkind\treported\town_event\tdifference_bp\n";
+            for (const CheckRow& c : sc.checks)
+                co << c.variant_id << '\t' << c.haplotype << '\t' << c.kind << '\t' << c.reported << '\t' << c.own
+                   << '\t' << c.difference << '\n';
+            co.close();
+            if (!co) throw std::runtime_error("failed writing " + finals[3]);
         }
-        return s;
+        // 1 - left / present; negative when more is left than was there
+        const auto recovered = [&](std::size_t left) {
+            if (present_bp == 0) return std::string("NA");
+            char b[32];
+            std::snprintf(b, sizeof(b), "%.4f", 1.0 - static_cast<double>(left) / static_cast<double>(present_bp));
+            return std::string(b);
+        };
+        std::ofstream so(staged.stage(finals[0]));
+        if (!so) throw std::runtime_error("cannot write " + finals[0]);
+        so << "key\tvalue\n"
+           << "min_sv_bp\t" << min_sv_bp << '\n'
+           << "merge_gap\t" << merge_gap << '\n'
+           << "haplotypes_scored\t" << scored << '\n';
+        for (const auto& [why, n] : skipped) so << "haplotypes_skipped_" << why << '\t' << n << '\n';
+        so << "large_events_present\t" << present_n << '\n'
+           << "large_bp_present\t" << present_bp << '\n'
+           << "missed_by_call_events\t" << missed_n << '\n'
+           << "missed_by_call_bp\t" << missed_bp << '\n';
+        for (const auto& [c, n] : missed_by_cause) so << "missed_" << c << '\t' << n << '\n';
+        so << "lost_in_vcf_events\t" << lost_n << '\n'
+           << "lost_in_vcf_bp\t" << lost_bp << '\n';
+        for (const auto& [c, n] : lost_by_reason) so << "lost_" << c << '\t' << n << '\n';
+        so << "left_by_vcf_events\t" << vcf_left_n << '\n'
+           << "left_by_vcf_bp\t" << vcf_left_bp << '\n';
+        so << "recovered_by_call_fraction\t" << recovered(missed_bp) << '\n'
+           << "recovered_by_vcf_fraction\t" << recovered(vcf_left_bp) << '\n'
+           << "haplotypes_clean_call\t" << clean_call << '\n'
+           << "haplotypes_clean_vcf\t" << clean_vcf << '\n'
+           << "small_bp_present\t" << present_small << '\n'
+           << "small_bp_left_call\t" << small_call << '\n'
+           << "small_bp_left_vcf\t" << small_vcf << '\n'
+           << "snv_present\t" << present_snv << '\n'
+           << "snv_left_call\t" << snv_call << '\n'
+           << "snv_left_vcf\t" << snv_vcf << '\n'
+           << "carriers_checked\t" << sc.checked << '\n'
+           << "carrier_mismatches\t" << mismatching.size() << '\n';
+        so.close();
+        if (!so) throw std::runtime_error("failed writing " + finals[0]);
+        log.info("present: " + std::to_string(present_bp) + " bp of large events");
+        log.info("missed by call: " + std::to_string(missed_bp) + " bp");
+        log.info("lost in the VCF: " + std::to_string(lost_bp) + " bp more");
+        log.info("carriers disagreeing with their record: " + std::to_string(mismatching.size()));
+        // How each rebuild was made: counts to read when a result looks wrong, warned about where they can
+        // mean a loss.
+        log.info("events applied: call: " + std::to_string(applied_call) + "; VCF: " + std::to_string(applied_vcf) +
+                 "; left out for overlapping another: call: " + std::to_string(conflicts) + "; VCF: " +
+                 std::to_string(conflicts_vcf));
+        log.info("events not applied: inside a carrier's own copy stretch: " + std::to_string(absorbed) +
+                 "; past the scored stretch: " + std::to_string(outside));
+        log.info("VCF genotypes . (no allele there): " + std::to_string(sv.missing_gt));
+        const auto warn = [&](std::size_t n, const std::string& what) {
+            if (n > 0) std::cerr << cli::log_prefix("benchmark") << "warning: " << n << ' ' << what << '\n';
+        };
+        warn(sc.unresolved_rows, "carrier event(s) call could not place on the reference");
+        warn(sv.not_reconstructable, "VCF record(s) that could not be spelled for some carrier");
+        warn(lost_by_reason["no_sequence"], "event(s) lost in the VCF for a sequence call left out (call --max-seq-bp 0 "
+             "writes them all)");
+        warn(sc.not_in_vcf, "haplotype(s) with no VCF column");
+        warn(sc.unchecked + sc.cn_unchecked, "carrier check(s) skipped: the record has no single SVLEN, or no CN or copy length to compare");
+        staged.commit();
     };
-    log.info("graph (optimistic upper bound) " + std::to_string(scored_haps) + " haplotypes, qv/qv_max quintiles:" +
-             quintile_recap(quintile_count, scored_haps));
-    log.info("called (retained calls only) " + std::to_string(scored_haps) + " haplotypes, qv/qv_max quintiles:" +
-             quintile_recap(called_quintile_count, scored_haps));
-    if (carrier_scored_haps)
-        log.info("carrier_walk (retained calls this haplotype is genotyped as carrying) " +
-                 std::to_string(carrier_scored_haps) + " haplotypes, qv/qv_max quintiles:" +
-                 quintile_recap(carrier_quintile_count, carrier_scored_haps));
-    {
-        char lb[256];
-        std::snprintf(lb, sizeof(lb),
-                      "truth events at >=%zu bp: %zu called, %zu MISSED (%zu bp); %zu below threshold",
-                      min_sv_bp, tot_led.called, tot_led.missed, tot_led.missed_bp, tot_led.below);
-        log.info(lb);
-    }
-    if (tot_coarse)
-        log.info("note: " + std::to_string(tot_coarse) + " haplotype-bubble pair(s) were too large to "
-                 "decompose and were treated as a single event");
-    if (gt_scored_haps) {
-        log.info("region_vcf (from the VCF alone) " + std::to_string(gt_scored_haps) + " haplotypes, qv/qv_max quintiles:" +
-                 quintile_recap(gt_quintile_count, gt_scored_haps));
-        {
-            const double denom = static_cast<double>(gt_tot_ref_delta) - static_cast<double>(gt_tot_graph_delta);
-            const bool has_gap = std::fabs(denom) > 1e-9;
-            const double closed = has_gap
-                ? (static_cast<double>(gt_tot_ref_delta) - static_cast<double>(gt_tot_gt_delta)) / denom : 0.0;
-            char gb[288];
-            if (has_gap)
-                std::snprintf(gb, sizeof(gb),
-                              "residual bases: baseline(no edits)=%zu region_vcf=%zu graph=%zu -> gap closed %.1f%%"
-                              " (%zu haplotypes worse than baseline)",
-                              gt_tot_ref_delta, gt_tot_gt_delta, gt_tot_graph_delta, 100.0 * closed, gt_worse_than_ref);
-            else
-                std::snprintf(gb, sizeof(gb),
-                              "residual bases: baseline(no edits)=%zu region_vcf=%zu graph=%zu -> gap closed UNDEFINED"
-                              " (the graph bound equals the baseline, so there is no gap to close)",
-                              gt_tot_ref_delta, gt_tot_gt_delta, gt_tot_graph_delta);
-            log.info(gb);
-        }
-        const double prec = (carrier[0] + carrier[1]) ? 100.0 * static_cast<double>(carrier[0]) / static_cast<double>(carrier[0] + carrier[1]) : 0.0;
-        const double rec = (carrier[0] + carrier[2]) ? 100.0 * static_cast<double>(carrier[0]) / static_cast<double>(carrier[0] + carrier[2]) : 0.0;
-        char buf[192];
-        std::snprintf(buf, sizeof(buf),
-                      "carrier calls: TP=%zu FP=%zu FN=%zu TN=%zu (precision %.1f%%, recall %.1f%%)",
-                      carrier[0], carrier[1], carrier[2], carrier[3], prec, rec);
-        log.info(buf);
-    } else if (do_gt) {
-        log.info("region-VCF scoring produced no scored haplotype (no bubble placed on the reference)");
-    }
+    for (std::size_t m = 0; m < 2; ++m) score_mode(specs[m], stages[m]);
+    write_outputs();
     log.wrote(finals);
     log.done();
     return 0;

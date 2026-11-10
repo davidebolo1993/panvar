@@ -1,0 +1,9 @@
+N F0 5000 11
+N INS 300 12
+N F1 10000 1
+N U 6000 2
+N F2 10000 5
+N F2b @F2:3:9
+P ref F0+,F1+,U+,U+,U+,F2+
+P h1 F0+,INS+,F1+,U+,U+,U+,F2b+
+P h2 F0+,F1+,U+,U+,U+,F2+

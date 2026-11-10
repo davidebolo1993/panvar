@@ -1,0 +1,3 @@
+input_bubble_id	unit_bp	canonical_motif	copy_quantum	unit	anchor_pos	anchor_nodes	n_nodes	nodes
+1	4	CCCC	1	CCCC	1	2	1	2
+999	4	CCCC	1	CCCC	1	2	1	2

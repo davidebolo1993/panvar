@@ -1,6 +1,8 @@
 #include "panvar/rebuild_command.hpp"
 
 #include <iostream>
+#include <limits>
+#include <utility>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -17,54 +19,39 @@ void print_rebuild_help() {
     std::cout
         << "Usage:\n"
         << "  panvar rebuild -i <graph.gfa> -o <out.gfa> [options]\n\n"
-        << "Re-induce a pathological (fragmented low-complexity) locus graph BEFORE bubble decomposition.\n"
-        << "A cheap degree gate decides whether the graph is pathological (a cluster of hubs with a high\n"
-        << "single-END degree, from seqwish over-merging); if so, the locus is rebuilt by progressive graph\n"
-        << "generation using minigraph's engine, with haplotypes added most-complete-first by CANONICAL\n"
-        << "k-mer richness (so the order does not depend on which strand the graph is stored on), ties\n"
-        << "broken by path name. The emitted GFA carries per-haplotype P lines and preserves link\n"
-        << "orientation, so inversion bubbles survive.\n"
-        << "\n"
-        << "The result is ACCEPTED only if every haplotype comes back: each path recovered as a walk whose\n"
-        << "consecutive steps are joined by links that exist, with matched cover and recovered-walk\n"
-        << "identity above --min-matched-cover / --min-recovered-identity. minigraph augments variation\n"
-        << "above --min-var, so sub-threshold differences are collapsed by construction and a walk is\n"
-        << "never byte-identical -- the contract is fidelity within those bounds, not losslessness.\n"
-        << "Otherwise the rebuilt graph is discarded and the ORIGINAL written unchanged. Acceptance proves\n"
-        << "fidelity, NOT that the graph got less tangled; the run reports hubs and max handle degree\n"
-        << "before and after so that can be judged separately.\n"
-        << "Healthy graphs pass through unchanged, so validated loci are never touched.\n\n"
+        << "Re-induce a fragmented locus graph before bubble decomposition.\n\n"
         << "Options:\n"
-        << "  -i, --gfa <path>            Input GFA (required)\n"
-        << "  -o, --out <path>            Output GFA (required)\n"
-        << "      --kmer <N>              k for the k-mer richness metric: haplotypes are ordered by\n"
-        << "                              distinct k-mers, ties broken by total k-mers (default 21)\n"
-        << "      --min-var <N>           Minimum variant length augmented into the graph, i.e.\n"
-        << "                              minigraph -L (default 50). Lower values keep more of the\n"
-        << "                              small variation, at the cost of a denser graph\n"
-        << "      --min-align-len <N>     Minimum alignment length that may contribute events. 0 = auto:\n"
-        << "                              scaled from the MEDIAN haplotype length and capped at half the\n"
-        << "                              shortest, so no haplotype is gated out by a bar it could never\n"
-        << "                              clear. A larger value is honoured but warned about.\n"
-        << "      --tmp-dir <path>        Parent dir for the per-haplotype FASTA scratch (default: beside\n"
-        << "                              --out); a dedicated subfolder under it is created and removed\n"
-        << "      --hub-degree <N>        Node degree that counts as a hub (default 50)\n"
-        << "      --min-hubs <N>          >= this many hubs => pathological (default 10)\n"
-        << "  -t, --threads <N>           Worker threads (0 = auto)\n"
-        << "  ---- acceptance contract (the rebuild is discarded and the ORIGINAL written if unmet) ----\n"
-        << "      --min-recovered-identity <X>  Per-path identity of the walk re-spelled from the REBUILT\n"
-        << "                              graph against the original haplotype (default 0.98)\n"
-        << "      --min-matched-cover <X> Per-path matching bases / haplotype length (default 0.95).\n"
-        << "                              Distinct from the chain's outer envelope, which hides internal gaps\n"
-        << "  -r, --reference-path <name>  This path must be recovered within the same bounds. Exact match\n"
-        << "                              wins, else a unique substring; an ambiguous name is refused.\n"
-        << "                              Seeding stays richness-driven -- this is about RECOVERY\n"
-        << "      --allow-loss            Accept a rebuild that fails the contract, recording what it violated\n"
-        << "      --audit <path>          Per-path audit TSV (default <out>.rebuild_audit.tsv): coverage,\n"
-        << "                              identity and a status per path, plus the global verdict\n"
-        << "      --force                 Rebuild even if the gate says healthy (testing/small inputs)\n"
-        << "  -q, --quiet                 Disable progress logs\n"
-        << "  -h, --help                  Show this help\n";
+        << "  -i, --gfa <path>               Input GFA, a regular file (required)\n"
+        << "  -o, --out <path>               Output GFA, ending in .gfa or .gfa.gz (gzipped) (required). Also\n"
+        << "                                 writes <prefix>.rebuild.report.tsv when a rebuilt graph is evaluated\n"
+        << "  -r, --reference-path <name>    Reference path: it seeds the graph and must come back exactly\n"
+        << "                                 (ignoring case), or the rebuild is refused. Exact name or\n"
+        << "                                 unique substring\n"
+        << "      --mode <folded|minigraph>  folded: each copy-number module becomes one unit subgraph its\n"
+        << "                                 copies walk (default); minigraph: the graph minigraph builds\n"
+        << "      --fold-identity <X>        Identity of a repeat that makes a module, 0.80 to 1 (default 0.95)\n"
+        << "      --fold-min-copy-bp <N>     Shortest copy that makes a module, 1000 or more (default 3000;\n"
+        << "                                 shorter tandem units are left to panphorte)\n"
+        << "      --min-var <N>              Shortest variant added to the graph (minigraph -L; default 50)\n"
+        << "      --min-align-len <N>        Shortest alignment that may add variation (minigraph -l).\n"
+        << "                                 0 = auto (default): minigraph's 100 kb, or half the median\n"
+        << "                                 haplotype if shorter (at least 1 kb); at most half the shortest\n"
+        << "      --base-align               Base-level alignment in generation (minigraph -c; up to 2x slower)\n"
+        << "      --clip-to-reference        With -r: drop haplotype sequence running past the reference's ends\n"
+        << "      --kmer <N>                 k-mer size for ordering haplotypes by k-mer richness, 11 to 255\n"
+        << "                                 (default 21)\n"
+        << "      --hub-degree <N>           Node degree that counts as a hub (default 50)\n"
+        << "      --min-hubs <N>             Hubs that make a graph fragmented (default 10)\n"
+        << "      --force                    Rebuild even a graph that is not fragmented\n"
+        << "      --tmp-dir <path>           Parent directory for scratch files (default: beside --out)\n"
+        << "  -t, --threads <N>              Worker threads (default 0 = all cores)\n"
+        << "  -q, --quiet                    Disable progress logs\n"
+        << "  -h, --help                     Show this help\n\n"
+        << "Acceptance (when unmet, the input graph is written unchanged):\n"
+        << "      --min-recovered-identity <X>  Identity of each rebuilt walk to its haplotype (default 0.98)\n"
+        << "      --min-matched-cover <X>    Share of each haplotype's bases aligned and matching (default 0.95)\n"
+        << "      --allow-loss               Accept a rebuild that fails these, recording why; never one whose\n"
+        << "                                 reference does not come back exactly\n";
 }
 
 } // namespace
@@ -87,85 +74,121 @@ int run_rebuild_command(const std::vector<std::string>& args) {
         else if (arg == "-o" || arg == "--out") opt.out_path = require_value(arg);
         else if (arg == "--kmer") opt.kmer = cli::parse_size_arg(arg, require_value(arg));
         else if (arg == "--min-var") opt.min_var = cli::parse_size_arg(arg, require_value(arg));
+        else if (arg == "--fold-identity") {
+            opt.fold_identity = cli::parse_unit_fraction_arg(arg, require_value(arg));
+            if (opt.fold_identity < 0.80) throw std::runtime_error("--fold-identity must be 0.80 or more");
+        }
+        else if (arg == "--fold-min-copy-bp") {
+            opt.fold_min_copy_bp = cli::parse_size_arg(arg, require_value(arg));
+            if (opt.fold_min_copy_bp < 1000) throw std::runtime_error("--fold-min-copy-bp must be 1000 or more");
+        }
         else if (arg == "--min-align-len") {
             const std::string& v = require_value(arg);
             opt.min_align_len = (v == "auto") ? 0 : cli::parse_size_arg(arg, v);
         }
         else if (arg == "--tmp-dir") opt.tmp_dir = require_value(arg);
-        else if (arg == "--hub-degree") opt.hub_degree = cli::parse_size_arg(arg, require_value(arg));
-        else if (arg == "--min-hubs") opt.min_hubs = cli::parse_size_arg(arg, require_value(arg));
+        else if (arg == "--hub-degree" || arg == "--min-hubs") {
+            // 0 makes every graph pathological, which forces a rebuild without --force's warning
+            // that variation under --min-var is collapsed.
+            const std::size_t v = cli::parse_size_arg(arg, require_value(arg));
+            if (v == 0) throw std::runtime_error(arg + " must be 1 or more");
+            (arg == "--hub-degree" ? opt.hub_degree : opt.min_hubs) = v;
+        }
         else if (arg == "-t" || arg == "--threads") opt.threads = cli::parse_size_arg(arg, require_value(arg));
         else if (arg == "--force") opt.force = true;
+        else if (arg == "--base-align") opt.base_align = true;
+        else if (arg == "--clip-to-reference") opt.clip_to_reference = true;
         else if (arg == "--min-recovered-identity")
             opt.min_recovered_identity = cli::parse_unit_fraction_arg(arg, require_value(arg));
         else if (arg == "--min-matched-cover")
             opt.min_matched_cover = cli::parse_unit_fraction_arg(arg, require_value(arg));
-        else if (arg == "-r" || arg == "--reference-path") opt.reference_path = require_value(arg);
+        else if (arg == "-r" || arg == "--reference-path") {
+            opt.reference_path = require_value(arg);
+            if (opt.reference_path.empty()) throw std::runtime_error(arg + " is empty: name the reference path");
+        }
         else if (arg == "--allow-loss") opt.allow_loss = true;
-        else if (arg == "--audit") opt.audit_path = require_value(arg);
+        else if (arg == "--mode") {
+            const std::string m = require_value(arg);
+            if (m == "folded") opt.fold_modules = true;
+            else if (m == "minigraph") opt.fold_modules = false;
+            else throw std::runtime_error("--mode is '" + m + "', expected folded or minigraph");
+        }
+        else if (arg == "--audit")
+            throw std::runtime_error("--audit was removed: the report is always written beside the output, "
+                                     "as <prefix>.rebuild.report.tsv");
         else if (arg == "-q" || arg == "--quiet") opt.quiet = true;
         else throw std::runtime_error("Unknown option: " + arg);
     }
 
     if (opt.gfa_path.empty()) throw std::runtime_error("Missing required input: --gfa <path>");
     if (opt.out_path.empty()) throw std::runtime_error("Missing required input: --out <path>");
-    // Writing to the input path truncated it on open, so the graph was destroyed before it could be
-    // read -- a healthy pass-through turned a 2 kB file into 0 bytes. Compare the resolved paths, and
-    // also `equivalent` so a symlink or a second mount point to the same file is caught.
-    {
+    if (opt.min_var < 1) throw std::runtime_error("--min-var must be at least 1");
+    // under 3 kb a tandem repeat is panphorte's to fold
+    if (opt.fold_min_copy_bp < 3000)
+        std::cerr << cli::log_prefix("rebuild") << "warning: --fold-min-copy-bp " << opt.fold_min_copy_bp
+                  << ": modules of copies under 3 kb are usually tandem repeats left to panphorte\n";
+    if (opt.clip_to_reference && opt.reference_path.empty())
+        throw std::runtime_error("--clip-to-reference needs -r: the reference's ends define what is clipped");
+    // Below 11 the k-mer space (4^k) is smaller than a locus, so distinct counts saturate and stop ranking
+    // anything; 255 is only a sanity limit.
+    if (opt.kmer < 11 || opt.kmer > 255)
+        throw std::runtime_error("--kmer must be between 11 and 255 (got " + std::to_string(opt.kmer) + ")");
+    // These reach minigraph and the thread pool as int: values that would not fit are refused.
+    const std::pair<const char*, std::size_t> as_int[] = {
+        {"--min-var", opt.min_var}, {"--min-align-len", opt.min_align_len}, {"--threads", opt.threads}};
+    for (const auto& [flag, v] : as_int)
+        if (v > static_cast<std::size_t>(std::numeric_limits<int>::max()))
+            throw std::runtime_error(std::string(flag) + " is too large: " + std::to_string(v));
+    // Writing to the input path would truncate it on open, before it is read. Compare the resolved paths, and
+    // `equivalent` so a symlink or a second mount point to the same file is caught; the report gets the same
+    // check.
+    auto same_file = [](const std::string& a, const std::string& b) {
         std::error_code ec;
-        const std::filesystem::path in_p = std::filesystem::weakly_canonical(opt.gfa_path, ec);
-        const std::filesystem::path out_p = std::filesystem::weakly_canonical(opt.out_path, ec);
-        bool same = (!ec && !in_p.empty() && in_p == out_p);
-        if (!same && std::filesystem::exists(opt.out_path)) {
+        const std::filesystem::path pa = std::filesystem::weakly_canonical(a, ec);
+        const std::filesystem::path pb = std::filesystem::weakly_canonical(b, ec);
+        bool same = (!ec && !pa.empty() && pa == pb);
+        if (!same && std::filesystem::exists(b)) {
             std::error_code eq;
-            same = std::filesystem::equivalent(opt.gfa_path, opt.out_path, eq) && !eq;
+            same = std::filesystem::equivalent(a, b, eq) && !eq;
         }
-        if (same)
-            throw std::runtime_error("rebuild: --out is the same file as --gfa (" + opt.out_path +
-                                     "); refusing to overwrite the input");
+        return same;
+    };
+    // The input is read twice -- parsed, and copied as it stands on a pass-through -- so it must be a regular
+    // file, not a pipe.
+    cli::require_regular_input("rebuild", "--gfa", opt.gfa_path);
+    // The report is named from the output's prefix, so the output must say it is a GFA.
+    {
+        const auto ends = [&](const std::string& e) {
+            return opt.out_path.size() > e.size() && opt.out_path.compare(opt.out_path.size() - e.size(), e.size(), e) == 0;
+        };
+        if (!ends(".gfa") && !ends(".gfa.gz"))
+            throw std::runtime_error("rebuild: --out must end in .gfa or .gfa.gz (got '" + opt.out_path + "')");
     }
+    if (same_file(opt.gfa_path, opt.out_path))
+        throw std::runtime_error("rebuild: --out is the same file as --gfa (" + opt.out_path +
+                                 "); refusing to overwrite the input");
+    if (same_file(opt.gfa_path, rebuild_report_path(opt.out_path)))
+        throw std::runtime_error("rebuild: the report path " + rebuild_report_path(opt.out_path) +
+                                 " is the input graph; refusing to overwrite it");
+    // Directories made for the output are removed again if the run fails, when nothing else is in them.
+    std::vector<std::filesystem::path> made;
+    for (std::filesystem::path d = std::filesystem::path(opt.out_path).parent_path();
+         !d.empty() && !std::filesystem::exists(d); d = d.parent_path())
+        made.push_back(d);
     cli::ensure_parent_dir_for_file(opt.out_path);
 
     cli::RunLog log("rebuild", opt.quiet);
-    const RebuildSummary s = rebuild_graph(opt);
-    // Report what was actually WRITTEN. Saying "rebuilt: 4740 -> 31 nodes" after the contract rejected
-    // the rebuild and the original was passed through describes a file that does not exist.
-    if (!s.ran) {
-        log.info("passed through: " + std::to_string(s.raw_nodes) + " nodes (graph is not pathological)");
-    } else if (s.accepted || opt.allow_loss) {
-        log.info(std::string(s.accepted ? "rebuilt" : "rebuilt (contract not met, accepted with "
-                                                     "--allow-loss)") + ": " +
-                 std::to_string(s.raw_nodes) + " -> " + std::to_string(s.out_nodes) +
-                 " nodes; seed=" + (s.seed.empty() ? "-" : s.seed) + "; " +
-                 std::to_string(s.paths_recovered) + "/" + std::to_string(s.haplotypes) +
-                 " paths recovered");
-        // Acceptance proves FIDELITY -- that every haplotype came back within the bounds. It does not
-        // prove the graph got less tangled, which is the reason for rebuilding in the first place, so
-        // report the before/after on the same per-handle measure and let the reader judge.
-        // At least one metric must strictly improve and none may worsen. `<=` alone called an entirely
-        // unchanged graph "untangled", which is the one thing the word must not mean.
-        const bool no_worse = s.out_hubs <= s.raw_hubs && s.out_maxdeg <= s.raw_maxdeg &&
-                              s.out_selfloops <= s.raw_selfloops;
-        const bool strictly_better = s.out_hubs < s.raw_hubs || s.out_maxdeg < s.raw_maxdeg ||
-                                     s.out_selfloops < s.raw_selfloops;
-        const bool better = no_worse && strictly_better;
-        log.info(std::string("structure: hubs ") + std::to_string(s.raw_hubs) + " -> " +
-                 std::to_string(s.out_hubs) + ", max handle degree " + std::to_string(s.raw_maxdeg) +
-                 " -> " + std::to_string(s.out_maxdeg) + ", self-loops " +
-                 std::to_string(s.raw_selfloops) + " -> " + std::to_string(s.out_selfloops) +
-                 (better ? " (untangled)"
-                         : (no_worse ? " (unchanged -- the rebuild preserved the haplotypes but did not "
-                                       "simplify the graph)"
-                                     : " (NOT untangled -- some structure measure got worse)")));
-    } else {
-        log.info("rejected: the rebuild would have been " + std::to_string(s.raw_nodes) + " -> " +
-                 std::to_string(s.out_nodes) + " nodes, but " + s.reject_reason +
-                 "; the original graph was written unchanged");
+    RebuildSummary s;
+    try {
+        s = rebuild_graph(opt);
+    } catch (...) {
+        std::error_code ec;
+        for (const std::filesystem::path& d : made) std::filesystem::remove(d, ec);   // only if empty
+        throw;
     }
+    // The run logs its verdict and both graphs' shapes; here only what was written.
     std::vector<std::string> written{opt.out_path};
-    if (s.audit_written)
-        written.push_back(opt.audit_path.empty() ? opt.out_path + ".rebuild_audit.tsv" : opt.audit_path);
+    if (s.report_written) written.push_back(rebuild_report_path(opt.out_path));
     log.wrote(written);
     log.done();
     return 0;

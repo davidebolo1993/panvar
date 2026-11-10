@@ -8,9 +8,8 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 option(PANVAR_BUILD_TESTING "Build tests" ON)
 
-# The rebuild suite is the only test that drives minigraph and costs about 5.5 minutes of a 6 minute
-# run, so it is registered but disabled by default. It worked as an undeclared cache variable, which
-# meant it did not appear in ccmake/cmake-gui and a fresh build tree had to be reconfigured to find it.
+# The slow real-data suites (rebuild drives minigraph and takes minutes) are registered but disabled
+# unless this is on.
 option(PANVAR_SLOW_TESTS "Enable the slow test label (the ~6 minute rebuild suite)" OFF)
 
 find_package(Threads REQUIRED)
@@ -23,7 +22,12 @@ if(NOT EXISTS ${MINIMAP2_DIR}/minimap.h OR NOT EXISTS ${MINIMAP2_DIR}/Makefile)
         "Missing minimap2 sources in external/minimap2. "
         "Run: git submodule update --init --recursive")
 endif()
-find_program(MINIMAP2_MAKE NAMES make gmake REQUIRED)
+# find_program(... REQUIRED) needs CMake 3.18, so a missing make is reported by hand.
+find_program(VENDORED_MAKE NAMES make gmake)
+if(NOT VENDORED_MAKE)
+    message(FATAL_ERROR "make (or gmake) is needed to build the vendored minimap2, abPOA and minigraph")
+endif()
+set(MINIMAP2_MAKE ${VENDORED_MAKE})
 set(MINIMAP2_MAKE_ARGS)
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(arm64|aarch64|ARM64)$")
     list(APPEND MINIMAP2_MAKE_ARGS arm_neon=1 aarch64=1)
@@ -61,7 +65,7 @@ if(NOT EXISTS ${ABPOA_DIR}/include/abpoa.h OR NOT EXISTS ${ABPOA_DIR}/include/si
         "Missing abPOA sources in external/abpoa (or its nested SIMDe). "
         "Run: git submodule update --init --recursive")
 endif()
-find_program(ABPOA_MAKE NAMES make gmake REQUIRED)
+set(ABPOA_MAKE ${VENDORED_MAKE})
 add_custom_target(abpoa_build
     COMMAND ${ABPOA_MAKE} -C ${ABPOA_DIR} lib/libabpoa.a
     BYPRODUCTS ${ABPOA_LIB}
@@ -87,19 +91,26 @@ if(NOT EXISTS ${MINIGRAPH_DIR}/minigraph.h OR NOT EXISTS ${MINIGRAPH_DIR}/Makefi
         "Missing minigraph sources in external/minigraph. "
         "Run: git submodule update --init --recursive")
 endif()
-find_program(MINIGRAPH_MAKE NAMES make gmake REQUIRED)
+set(MINIGRAPH_MAKE ${VENDORED_MAKE})
+# minigraph's Makefile adds -msse4, which GCC rejects off x86; minigraph uses no SSE intrinsics, so
+# elsewhere its flags are passed without it.
+set(MINIGRAPH_MAKE_ARGS)
+if(NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64|i[3-6]86|x86)$")
+    list(APPEND MINIGRAPH_MAKE_ARGS "CFLAGS=-g -Wall -Wc++-compat -std=c99 -O3")
+endif()
 if(APPLE)
     set(MINIGRAPH_EXPORTS ${CMAKE_CURRENT_SOURCE_DIR}/cmake/minigraph_exports_macho.txt)
 else()
     set(MINIGRAPH_EXPORTS ${CMAKE_CURRENT_SOURCE_DIR}/cmake/minigraph_exports_elf.txt)
 endif()
 add_custom_target(minigraph_build
-    COMMAND ${MINIGRAPH_MAKE} -C ${MINIGRAPH_DIR} minigraph
+    COMMAND ${MINIGRAPH_MAKE} -C ${MINIGRAPH_DIR} minigraph ${MINIGRAPH_MAKE_ARGS}
     COMMAND ${CMAKE_COMMAND} -E rm -f ${MINIGRAPH_LIB} ${MINIGRAPH_MERGED}
     COMMAND /usr/bin/env bash ${CMAKE_CURRENT_SOURCE_DIR}/cmake/build_minigraph_lib.sh
             ${MINIGRAPH_DIR} ${MINIGRAPH_EXPORTS}
     BYPRODUCTS ${MINIGRAPH_LIB} ${MINIGRAPH_MERGED}
     COMMENT "Building minigraph static library (symbols localized against minimap2)"
+    VERBATIM
 )
 add_library(minigraph STATIC IMPORTED GLOBAL)
 set_target_properties(minigraph PROPERTIES IMPORTED_LOCATION ${MINIGRAPH_LIB})
@@ -132,6 +143,9 @@ add_library(panvarlib
     src/gene_cn_kmer.cpp
     src/minimap2_align.cpp
     src/variant_call.cpp
+    src/cosigt.cpp
+    src/path_inversion.cpp
+    src/module_fold.cpp
     src/describe.cpp
     src/panphorte.cpp
     src/panphorte_refine.cpp
@@ -179,6 +193,7 @@ add_executable(panvar
     src/associate_command.cpp
 )
 target_include_directories(panvar PRIVATE ${EIGEN_DIR})
+target_compile_definitions(panvar PRIVATE PANVAR_VERSION="${PROJECT_VERSION}")
 target_link_libraries(panvar PRIVATE panvarlib minimap2 Threads::Threads ZLIB::ZLIB)
 if(NOT WIN32)
     target_link_libraries(panvar PRIVATE m)
@@ -199,19 +214,9 @@ target_compile_options(panvar
 
 include(GNUInstallDirs)
 
-# panvar ships as a COMMAND-LINE TOOL. Only the executable is installed.
-#
-# The previous rules exported panvarlib, its headers and a panvarTargets.cmake, which looked like a
-# supported C++ package and was not one: the exported target referred to `abpoa` and `minigraph`,
-# which are IMPORTED targets that were never exported, and to `ZLIB::ZLIB` with no package config to
-# rediscover it, so `find_package(panvar)` could not configure in a consumer project. The default
-# The earlier rules also installed internal headers whose implementations were not part of the
-# installed binary.
-#
-# Advertising a package contract nobody can satisfy is worse than not advertising one. If a C++ API is
-# wanted later it needs a panvarConfig.cmake, dependency discovery and export for every vendored
-# dependency, a deliberate public-header set rather than all of include/, and an external consumer
-# that compiles and links against the installed tree in CI -- none of which is release work.
+# panvar ships as a command-line tool, so only the executable is installed. panvarlib is not exported:
+# it links IMPORTED vendored targets (abpoa, minigraph) that have no package config, so a consumer's
+# find_package(panvar) could not resolve them.
 install(TARGETS panvar RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 
 if(PANVAR_BUILD_TESTING)
@@ -219,7 +224,7 @@ if(PANVAR_BUILD_TESTING)
     if(BUILD_TESTING)
         # Fast, dependency-free smoke on a tiny hand-built graph that exercises every
         # call event type + confounders with exact-record assertions (no vg needed).
-        set(PANVAR_SYN_SMOKE ${CMAKE_CURRENT_SOURCE_DIR}/tests/synthetic_smoke.sh)
+        set(PANVAR_SYN_SMOKE ${CMAKE_CURRENT_SOURCE_DIR}/tests/suites/synthetic_smoke.sh)
         if(EXISTS ${PANVAR_SYN_SMOKE})
             add_test(
                 NAME panvar_smoke_synthetic
@@ -227,10 +232,21 @@ if(PANVAR_BUILD_TESTING)
             )
         endif()
 
-        # Deterministic statistical assertions for `associate`: linear p against R's lm() (the normal
-        # tail would be 83 orders of magnitude out at 9 df), the logistic separation contract, case/
-        # control carrier counts, and GRM rejection. No RNG, no R at run time, ~1s.
-        set(PANVAR_ASSOC_STATS ${CMAKE_CURRENT_SOURCE_DIR}/tests/associate_stats.sh)
+        # bubble -> panphorte -> call on a generated locus with four planted SVs: sites, positions,
+        # carriers and copy numbers against the planted truth. Seconds.
+        set(PANVAR_SYN_BENCH ${CMAKE_CURRENT_SOURCE_DIR}/tests/suites/synthetic_bench.sh)
+        if(EXISTS ${PANVAR_SYN_BENCH})
+            add_test(
+                NAME panvar_synthetic_bench
+                COMMAND /usr/bin/env bash ${PANVAR_SYN_BENCH} $<TARGET_FILE:panvar> ${CMAKE_CURRENT_BINARY_DIR}/synthetic_bench
+            )
+            set_tests_properties(panvar_synthetic_bench PROPERTIES TIMEOUT 120)
+        endif()
+
+        # Deterministic statistical assertions for `associate`: linear p against R's lm() (a t tail,
+        # not a normal one, at small df), the logistic separation contract, case/control carrier
+        # counts, and GRM rejection. No RNG, no R at run time, about a second.
+        set(PANVAR_ASSOC_STATS ${CMAKE_CURRENT_SOURCE_DIR}/tests/suites/associate_stats.sh)
         if(EXISTS ${PANVAR_ASSOC_STATS})
             add_test(
                 NAME panvar_associate_stats
@@ -239,11 +255,9 @@ if(PANVAR_BUILD_TESTING)
             set_tests_properties(panvar_associate_stats PROPERTIES TIMEOUT 120)
         endif()
 
-        # bubble contract on hand-checkable graphs. CTest exercised the default internal cactus finder
-        # nowhere: synthetic_smoke.sh supplies checked-in external snarls, and real_smoke.sh makes its
-        # bubble assertions conditional on finding a first bubble -- and a header-only CSV is non-empty,
-        # so a total discovery regression would escape.
-        set(PANVAR_BUBBLE_STATS ${CMAKE_CURRENT_SOURCE_DIR}/tests/bubble_stats.sh)
+        # bubble contract on hand-checkable graphs, run through the default internal snarl finder and
+        # through --snarls.
+        set(PANVAR_BUBBLE_STATS ${CMAKE_CURRENT_SOURCE_DIR}/tests/suites/bubble_stats.sh)
         if(EXISTS ${PANVAR_BUBBLE_STATS})
             add_test(
                 NAME panvar_bubble_stats
@@ -252,11 +266,9 @@ if(PANVAR_BUILD_TESTING)
             set_tests_properties(panvar_bubble_stats PROPERTIES TIMEOUT 180)
         endif()
 
-        # inspect contract. real_smoke.sh only checks that inspect's files exist and that the gzip is
-        # readable, which passes whether or not the contents are right -- it would not have caught a
-        # whole allele missing from the FASTA, a duplicate path name, or a bubbles CSV from a different
-        # graph running to completion.
-        set(PANVAR_INSPECT_STATS ${CMAKE_CURRENT_SOURCE_DIR}/tests/inspect_stats.sh)
+        # inspect contract: the contents of its outputs (FASTA alleles, path names, input checks), which
+        # the smoke tests only check exist.
+        set(PANVAR_INSPECT_STATS ${CMAKE_CURRENT_SOURCE_DIR}/tests/suites/inspect_stats.sh)
         if(EXISTS ${PANVAR_INSPECT_STATS})
             add_test(
                 NAME panvar_inspect_stats
@@ -265,12 +277,10 @@ if(PANVAR_BUILD_TESTING)
             set_tests_properties(panvar_inspect_stats PROPERTIES TIMEOUT 180)
         endif()
 
-        # Opt-in regressions against the committed real loci. Several contracts are only reachable
-        # on real data: ANKRD36C is the only locus that ever produced overlapping sites, LPA KIV-2 is
-        # the folding case with 466 haplotypes, whether the POA guards SKIP anything is a property of
-        # real sequence, and an accepted rebuilt GFA has to be re-readable by the next module. About
-        # 2.5 minutes, so it carries the slow label with the rebuild suite.
-        set(PANVAR_REAL_REGRESSIONS ${CMAKE_CURRENT_SOURCE_DIR}/tests/real_regressions.sh)
+        # Opt-in regressions against the committed real loci, for contracts only real data reaches
+        # (overlapping sites, folding at hundreds of haplotypes, the POA guards, re-reading a rebuilt
+        # GFA). A few minutes, so it carries the slow label.
+        set(PANVAR_REAL_REGRESSIONS ${CMAKE_CURRENT_SOURCE_DIR}/tests/suites/real_regressions.sh)
         if(EXISTS ${PANVAR_REAL_REGRESSIONS})
             add_test(
                 NAME panvar_real_regressions
@@ -282,7 +292,7 @@ if(PANVAR_BUILD_TESTING)
             endif()
         endif()
 
-        set(PANVAR_CALL_STATS ${CMAKE_CURRENT_SOURCE_DIR}/tests/call_stats.sh)
+        set(PANVAR_CALL_STATS ${CMAKE_CURRENT_SOURCE_DIR}/tests/suites/call_stats.sh)
         if(EXISTS ${PANVAR_CALL_STATS})
             add_test(
                 NAME panvar_call_stats
@@ -291,11 +301,41 @@ if(PANVAR_BUILD_TESTING)
             set_tests_properties(panvar_call_stats PROPERTIES TIMEOUT 180)
         endif()
 
-        # benchmark contract. real_smoke.sh checks that benchmark runs; it asserts nothing about what
-        # the numbers mean. Both headline claims were wrong -- the residual split classified by
-        # alignment-run length rather than event size, so a clean 60 bp deletion read as
-        # sub-threshold, and gap_closed reported 100% for a bubble that was missed entirely.
-        set(PANVAR_BENCHMARK_STATS ${CMAKE_CURRENT_SOURCE_DIR}/tests/benchmark_stats.sh)
+        # call invariants that the real loci never exercise: a bubble row against the reference
+        # direction, P-line order, node renumbering, single-linkage chaining, EVENTID on a merged
+        # substitution, a short self-loop REP. Synthetic and fast. Cases whose fix is a later plan item
+        # print xfail/XPASS and do not fail the test.
+        set(PANVAR_CALL_INVARIANTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/suites/call_invariants.sh)
+        if(EXISTS ${PANVAR_CALL_INVARIANTS})
+            add_test(
+                NAME panvar_call_invariants
+                COMMAND /usr/bin/env bash ${PANVAR_CALL_INVARIANTS} $<TARGET_FILE:panvar> ${CMAKE_CURRENT_BINARY_DIR}/call_invariants
+            )
+            set_tests_properties(panvar_call_invariants PROPERTIES TIMEOUT 180)
+        endif()
+
+        # ORIGINAL vs CURRENT call on the six real loci, field by field plus BIMBAM, with every
+        # difference listed in tests/suites/call_regress.expected.tsv. Needs a pinned original build, e.g.
+        # `cmake -DPANVAR_ORIG_BIN=/path/to/original/panvar -DPANVAR_SLOW_TESTS=ON`. Three input
+        # sets (base, refined, altref) built from scratch take about two minutes, so it is gated like
+        # panvar_real_regressions.
+        set(PANVAR_ORIG_BIN "" CACHE FILEPATH
+            "Pinned ORIGINAL panvar binary for panvar_call_regress (the test is disabled while unset)")
+        set(PANVAR_CALL_REGRESS ${CMAKE_CURRENT_SOURCE_DIR}/tests/suites/call_regress.sh)
+        if(EXISTS ${PANVAR_CALL_REGRESS})
+            add_test(
+                NAME panvar_call_regress
+                COMMAND /usr/bin/env bash ${PANVAR_CALL_REGRESS} "${PANVAR_ORIG_BIN}" $<TARGET_FILE:panvar> ${CMAKE_CURRENT_BINARY_DIR}/call_regress
+            )
+            set_tests_properties(panvar_call_regress PROPERTIES TIMEOUT 900 LABELS "real;slow")
+            if(NOT PANVAR_SLOW_TESTS OR NOT PANVAR_ORIG_BIN)
+                set_tests_properties(panvar_call_regress PROPERTIES DISABLED TRUE)
+            endif()
+        endif()
+
+        # benchmark contract: what the reported numbers mean on hand-checkable cases, which the smoke
+        # test does not assert.
+        set(PANVAR_BENCHMARK_STATS ${CMAKE_CURRENT_SOURCE_DIR}/tests/suites/benchmark_stats.sh)
         if(EXISTS ${PANVAR_BENCHMARK_STATS})
             add_test(
                 NAME panvar_benchmark_stats
@@ -304,10 +344,8 @@ if(PANVAR_BUILD_TESTING)
             set_tests_properties(panvar_benchmark_stats PROPERTIES TIMEOUT 180)
         endif()
 
-        # describe contract. The C4 smoke test checks that describe produces output and asserts nothing
-        # about the dosages -- so a bug that made a plain deletion emit ZERO features passed it, with
-        # every file still present.
-        set(PANVAR_DESCRIBE_STATS ${CMAKE_CURRENT_SOURCE_DIR}/tests/describe_stats.sh)
+        # describe contract: the feature dosages, which the smoke test does not assert.
+        set(PANVAR_DESCRIBE_STATS ${CMAKE_CURRENT_SOURCE_DIR}/tests/suites/describe_stats.sh)
         if(EXISTS ${PANVAR_DESCRIBE_STATS})
             add_test(
                 NAME panvar_describe_stats
@@ -316,9 +354,8 @@ if(PANVAR_BUILD_TESTING)
             set_tests_properties(panvar_describe_stats PROPERTIES TIMEOUT 300)
         endif()
 
-        # panphorte contract. The registered C4 smoke test passes with five normalized=no rows, so it
-        # never exercises folding at all.
-        set(PANVAR_PANPHORTE_STATS ${CMAKE_CURRENT_SOURCE_DIR}/tests/panphorte_stats.sh)
+        # panphorte contract: folding itself, which the smoke test's graph does not exercise.
+        set(PANVAR_PANPHORTE_STATS ${CMAKE_CURRENT_SOURCE_DIR}/tests/suites/panphorte_stats.sh)
         if(EXISTS ${PANVAR_PANPHORTE_STATS})
             add_test(
                 NAME panvar_panphorte_stats
@@ -327,9 +364,8 @@ if(PANVAR_BUILD_TESTING)
             set_tests_properties(panvar_panphorte_stats PROPERTIES TIMEOUT 300)
         endif()
 
-        # refine contract. real_smoke.sh only checks that refine's files exist and that `call` runs
-        # afterwards, which passes whether or not the rewrite was correct.
-        set(PANVAR_REFINE_STATS ${CMAKE_CURRENT_SOURCE_DIR}/tests/refine_stats.sh)
+        # refine contract: whether the rewrite is correct, which the smoke test does not assert.
+        set(PANVAR_REFINE_STATS ${CMAKE_CURRENT_SOURCE_DIR}/tests/suites/refine_stats.sh)
         if(EXISTS ${PANVAR_REFINE_STATS})
             add_test(
                 NAME panvar_refine_stats
@@ -338,21 +374,29 @@ if(PANVAR_BUILD_TESTING)
             set_tests_properties(panvar_refine_stats PROPERTIES TIMEOUT 300)
         endif()
 
+        # rebuild's module fold on a synthetic copy-number module: every path exact, one pass per copy.
+        # Seconds, so on by default (the real-data rebuild suite below is the slow one).
+        set(PANVAR_MODULE_FOLD_STATS ${CMAKE_CURRENT_SOURCE_DIR}/tests/suites/module_fold_stats.sh)
+        if(EXISTS ${PANVAR_MODULE_FOLD_STATS})
+            add_test(
+                NAME panvar_module_fold_stats
+                COMMAND /usr/bin/env bash ${PANVAR_MODULE_FOLD_STATS} $<TARGET_FILE:panvar> ${CMAKE_CURRENT_BINARY_DIR}/module_fold_stats
+            )
+            set_tests_properties(panvar_module_fold_stats PROPERTIES TIMEOUT 300)
+        endif()
+
         # rebuild contract: the input is never destroyed, a healthy graph survives, a malformed one is
-        # refused rather than silently repaired, and nothing is left behind. CTest previously exercised
-        # no rebuild at all.
-        set(PANVAR_REBUILD_STATS ${CMAKE_CURRENT_SOURCE_DIR}/tests/rebuild_stats.sh)
+        # refused rather than silently repaired, and nothing is left behind.
+        set(PANVAR_REBUILD_STATS ${CMAKE_CURRENT_SOURCE_DIR}/tests/suites/rebuild_stats.sh)
         if(EXISTS ${PANVAR_REBUILD_STATS})
             add_test(
                 NAME panvar_rebuild_stats
-                COMMAND /usr/bin/env bash ${PANVAR_REBUILD_STATS} $<TARGET_FILE:panvar> ${CMAKE_CURRENT_BINARY_DIR}/rebuild_stats ${CMAKE_CURRENT_SOURCE_DIR}/tests/real_data/c4.gfa.gz
+                COMMAND /usr/bin/env bash ${PANVAR_REBUILD_STATS} $<TARGET_FILE:panvar> ${CMAKE_CURRENT_BINARY_DIR}/rebuild_stats ${CMAKE_CURRENT_SOURCE_DIR}/tests/real_data/paralogs/c4.gfa.gz
             )
-            # Real-data integration: several forced rebuilds of C4 (reproducibility across threads,
-            # k either side of 31, the reference-ambiguity and verdict cases). Minutes, not seconds.
-            # PAUSED by default: the only test that drives minigraph, and it costs ~5.5 minutes of a
-            # ~6 minute suite. Re-enable with `cmake -DPANVAR_SLOW_TESTS=ON` (then `ctest -L slow`),
-            # and run it before anything that touches rebuild. Turn it back on by default once the
-            # module review pass is finished.
+            # Several forced rebuilds of a real locus (reproducibility across threads, k either side
+            # of 31, the reference-ambiguity and verdict cases). It drives minigraph and takes minutes,
+            # so it is off by default: enable with `cmake -DPANVAR_SLOW_TESTS=ON`, then `ctest -L slow`.
+            # Run it before anything that touches rebuild.
             set_tests_properties(panvar_rebuild_stats PROPERTIES TIMEOUT 900 LABELS "real;slow")
             if(NOT PANVAR_SLOW_TESTS)
                 set_tests_properties(panvar_rebuild_stats PROPERTIES DISABLED TRUE)
@@ -360,12 +404,11 @@ if(PANVAR_BUILD_TESTING)
         endif()
 
         # Real-data integration smoke: the whole bubble -> inspect -> describe -> panphorte
-        # -> call pipeline on a committed locus, asserting each stage's outputs. Registered on
-        # C4 (the smallest graph, ~3s, no external tools) so the pipeline is exercised end-to-end
-        # by ctest. Labelled "real" so it can be excluded with `ctest -LE real` if desired; the
-        # larger loci (gstm1/lpa) stay manual: bash tests/real_smoke.sh ./build/panvar <gfa> <out>.
-        set(PANVAR_REAL_SMOKE ${CMAKE_CURRENT_SOURCE_DIR}/tests/real_smoke.sh)
-        set(PANVAR_REAL_SMOKE_GFA ${CMAKE_CURRENT_SOURCE_DIR}/tests/real_data/c4.gfa.gz)
+        # -> call pipeline on the smallest committed locus (seconds, no external tools), asserting each
+        # stage's outputs. Labelled "real" so `ctest -LE real` can skip it; other graphs run by hand:
+        # bash tests/suites/real_smoke.sh ./build/panvar <gfa> <out>.
+        set(PANVAR_REAL_SMOKE ${CMAKE_CURRENT_SOURCE_DIR}/tests/suites/real_smoke.sh)
+        set(PANVAR_REAL_SMOKE_GFA ${CMAKE_CURRENT_SOURCE_DIR}/tests/real_data/paralogs/c4.gfa.gz)
         if(EXISTS ${PANVAR_REAL_SMOKE} AND EXISTS ${PANVAR_REAL_SMOKE_GFA})
             add_test(
                 NAME panvar_smoke_real_c4
