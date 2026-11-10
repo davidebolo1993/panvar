@@ -3,7 +3,7 @@ name: ci
 on:
   push:
   pull_request:
-  # The slow suites and the Docker image take minutes: weekly and on demand.
+  # The slow suites take minutes: weekly and on demand.
   schedule:
     - cron: "0 5 * * 1"
   workflow_dispatch:
@@ -78,25 +78,3 @@ jobs:
       - run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DPANVAR_SLOW_TESTS=ON
       - run: cmake --build build -j
       - run: ctest --test-dir build --output-on-failure
-
-  # The image builds, and the binary and every bundled tool start in it.
-  docker:
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          submodules: recursive
-      - run: docker build -t panvar:ci .
-      - name: Tools in the image
-        run: |
-          docker run --rm panvar:ci bubble --help > /dev/null
-          docker run --rm -i --entrypoint /usr/local/bin/_entrypoint.sh panvar:ci bash -s <<'EOF'
-          set -e
-          for t in vg odgi bcftools bgzip tabix minimap2 k8 paftools.js samtools svim-asm truvari gemma column python3 Rscript; do
-            command -v "$t" > /dev/null || { echo "missing: $t"; exit 1; }
-          done
-          python3 -c 'import numpy'
-          Rscript -e 'for (p in c("ggplot2", "ggrepel", "data.table", "shiny", "plotly", "SKAT", "SPAtest", "susieR")) library(p, character.only = TRUE)'
-          echo "all tools present"
-          EOF

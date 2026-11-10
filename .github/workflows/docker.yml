@@ -1,0 +1,47 @@
+name: docker
+
+# The image builds, and the binary and every bundled tool start in it: on pushes and pull requests that
+# change what the image is built from, weekly (the conda packages move), and on demand.
+on:
+  push:
+    paths:
+      - Dockerfile
+      - .dockerignore
+      - CMakeLists.txt
+      - cmake/**
+      - external/**
+      - .gitmodules
+      - .github/workflows/docker.yml
+  pull_request:
+    paths:
+      - Dockerfile
+      - .dockerignore
+      - CMakeLists.txt
+      - cmake/**
+      - external/**
+      - .gitmodules
+      - .github/workflows/docker.yml
+  schedule:
+    - cron: "0 5 * * 1"
+  workflow_dispatch:
+
+jobs:
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - run: docker build -t panvar:ci .
+      - name: Tools in the image
+        run: |
+          docker run --rm panvar:ci bubble --help > /dev/null
+          docker run --rm -i --entrypoint /usr/local/bin/_entrypoint.sh panvar:ci bash -s <<'EOF'
+          set -e
+          for t in vg odgi bcftools bgzip tabix minimap2 k8 paftools.js samtools svim-asm truvari gemma column python3 Rscript; do
+            command -v "$t" > /dev/null || { echo "missing: $t"; exit 1; }
+          done
+          python3 -c 'import numpy'
+          Rscript -e 'for (p in c("ggplot2", "ggrepel", "data.table", "shiny", "plotly", "SKAT", "SPAtest", "susieR")) library(p, character.only = TRUE)'
+          echo "all tools present"
+          EOF
