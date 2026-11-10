@@ -34,7 +34,8 @@ OUT="$OUT/run.$$.$(date +%s)"
 rm -rf "$OUT"; mkdir -p "$OUT"
 fails=0
 ok()  { printf "  ok   %s\n" "$1"; }
-bad() { printf "  FAIL %s\n" "$1"; fails=$((fails + 1)); }
+failed=()
+bad() { printf "  FAIL %s\n" "$1"; fails=$((fails + 1)); failed+=("${1:0:300}"); }
 
 # Deterministic sequence, distinct per node ($2 seeds it): identical flanks would give the snarl finder a
 # different graph than intended, and a repeated motif is a tandem repeat, which bubble extends sites to
@@ -3625,4 +3626,5 @@ check "one file written: the log says 'file'" "$(grep -o 'wrote 1 file[s]* in' "
 
 printf "\n"
 if [ "$fails" -eq 0 ]; then printf "call_stats: all assertions passed\n"; exit 0; fi
-printf "call_stats: %d assertion(s) failed\n" "$fails"; exit 1
+# repeated last, shortened: a long output can be cut in the middle by ctest
+printf "call_stats: %d assertion(s) failed:\n" "$fails"; printf "  FAIL %s\n" "${failed[@]}"; exit 1
