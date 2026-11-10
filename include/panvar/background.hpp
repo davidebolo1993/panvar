@@ -345,6 +345,10 @@ public:
     static std::unique_ptr<Background> open(const std::string& path);
 };
 
+// The process's peak memory so far, for logs: allocated memory (footprint) where the system reports it,
+// and resident memory (which also counts pages of mapped files).
+std::string memory_report();
+
 // Default worker threads: Slurm's allocation, else the CPU affinity mask, else the hardware count.
 std::size_t default_threads();
 

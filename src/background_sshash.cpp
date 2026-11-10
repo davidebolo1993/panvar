@@ -436,8 +436,9 @@ CompactStats compact_store(const CompactOptions& o) {
     const Manifest m = read_manifest(o.store_dir);
     if (m.segments.size() != 1)
         throw std::runtime_error("background: compacting needs a store of exactly one segment (run --merge first)");
-    const Segment seg((fs::path(o.store_dir) / m.segments[0].dir).string());
-    const std::uint64_t n = seg.distinct();
+    // the store is read while the strings are written, then released: the SSHash build does not need it
+    auto seg = std::make_unique<Segment>((fs::path(o.store_dir) / m.segments[0].dir).string());
+    const std::uint64_t n = seg->distinct();
     CompactStats st;
     const std::string tmp_out = o.out_path + ".tmp";
     DictHeader h;
@@ -465,8 +466,8 @@ CompactStats compact_store(const CompactOptions& o) {
     log("compact: writing the string set of " + std::to_string(n) + " k-mers (" + (o.local_strings ? "partition-local paths, glued" : "greedy over the store") + ")");
     {
         SpssWriter w(spss);
-        if (o.local_strings) local_strings(seg, o.threads, w, log);
-        else greedy_strings(seg, o.threads, w);
+        if (o.local_strings) local_strings(*seg, o.threads, w, log);
+        else greedy_strings(*seg, o.threads, w);
         w.close();
         st.strings = w.strings_;
         st.string_bases = w.bases_;
@@ -489,6 +490,8 @@ CompactStats compact_store(const CompactOptions& o) {
     cfg.num_threads = std::max<std::size_t>(1, o.threads);
     cfg.ram_limit_in_GiB = std::max<std::size_t>(1, o.ram_gb);
     cfg.tmp_dirname = o.tmp_dir;
+    seg.reset();
+    log("compact: strings written; " + memory_report());
     log("compact: building the SSHash dictionary (minimizer length " + std::to_string(st.minimizer) + ")");
     const auto t1 = std::chrono::steady_clock::now();
     {
@@ -529,6 +532,7 @@ CompactStats compact_store(const CompactOptions& o) {
     }
     fs::rename(tmp_out, o.out_path);
     st.sshash_seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - t1).count();
+    log("compact: dictionary built; " + memory_report());
     st.bytes = fs::file_size(o.out_path);
     return st;
 }

@@ -31,6 +31,9 @@
 #ifdef __linux__
 #include <sched.h>
 #endif
+#ifdef __APPLE__
+#include <libproc.h>
+#endif
 
 namespace panvar::bg {
 
@@ -153,6 +156,30 @@ void radix_sort(std::uint64_t* a, std::size_t n) {
         }
     };
     Rec::sort(a, n, 56);
+}
+
+std::string memory_report() {
+    auto gb = [](std::uint64_t b) { char buf[32]; std::snprintf(buf, sizeof buf, "%.2f GB", static_cast<double>(b) / (1ULL << 30)); return std::string(buf); };
+    std::string out;
+#ifdef __APPLE__
+    rusage_info_v4 ri{};
+    if (proc_pid_rusage(getpid(), RUSAGE_INFO_V4, reinterpret_cast<rusage_info_t*>(&ri)) == 0)
+        out = "peak allocated " + gb(ri.ri_lifetime_max_phys_footprint) + ", ";
+#endif
+#ifdef __linux__
+    // the anonymous resident memory now (Linux keeps no peak of it), beside the resident peak below
+    std::ifstream st("/proc/self/status");
+    for (std::string line; std::getline(st, line);)
+        if (line.rfind("RssAnon:", 0) == 0) out = "allocated now " + gb(std::strtoull(line.c_str() + 8, nullptr, 10) * 1024) + ", ";
+#endif
+    struct rusage ru {};
+    getrusage(RUSAGE_SELF, &ru);
+#ifdef __APPLE__
+    const std::uint64_t peak = static_cast<std::uint64_t>(ru.ru_maxrss);
+#else
+    const std::uint64_t peak = static_cast<std::uint64_t>(ru.ru_maxrss) * 1024;
+#endif
+    return out + "peak resident " + gb(peak);
 }
 
 std::size_t default_threads() {
