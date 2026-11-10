@@ -193,6 +193,8 @@ add_library(panvarlib
     src/rebuild.cpp
     src/output.cpp
     src/background.cpp
+    src/background_store.cpp
+    src/background_graph.cpp
     src/background_sshash.cpp
     src/anchors.cpp
 )
@@ -286,6 +288,14 @@ if(PANVAR_BUILD_TESTING)
         add_test(NAME panvar_unit_background
                  COMMAND panvar_background_test ${CMAKE_CURRENT_BINARY_DIR}/unit_background)
         set_tests_properties(panvar_unit_background PROPERTIES TIMEOUT 300)
+        # background end to end: kills at every commit step, concurrent adds, segments attached, range
+        # merges, compaction, anchoring after the fact, a full disk; dumps against an independent count.
+        set(PANVAR_BG_CLI ${CMAKE_CURRENT_SOURCE_DIR}/tests/suites/background_cli.sh)
+        if(EXISTS ${PANVAR_BG_CLI})
+            add_test(NAME panvar_background_cli
+                     COMMAND /usr/bin/env bash ${PANVAR_BG_CLI} $<TARGET_FILE:panvar> ${CMAKE_CURRENT_SOURCE_DIR}/tests/tools ${CMAKE_CURRENT_BINARY_DIR}/background_cli)
+            set_tests_properties(panvar_background_cli PROPERTIES TIMEOUT 600)
+        endif()
         # Fast, dependency-free smoke on a tiny hand-built graph that exercises every
         # call event type + confounders with exact-record assertions (no vg needed).
         set(PANVAR_SYN_SMOKE ${CMAKE_CURRENT_SOURCE_DIR}/tests/suites/synthetic_smoke.sh)

@@ -22,6 +22,7 @@ inline std::size_t ceil_log2(std::uint64_t x) { return x <= 1 ? 0 : 64 - static_
 // Builds the serialized words for `values` (strictly increasing, each < 2^universe_bits).
 // Layout: [n, low_bits, max_high, high_words, sample_count, low_words] then high, samples, low.
 inline std::vector<std::uint64_t> build(const std::vector<std::uint64_t>& values, std::size_t universe_bits) {
+    if (universe_bits == 0 || universe_bits > 63) throw std::runtime_error("elias-fano: the universe must be 1 to 63 bits");
     const std::uint64_t n = values.size();
     const std::size_t lb = n == 0 ? 0 : (universe_bits > ceil_log2(n) ? universe_bits - ceil_log2(n) : 0);
     const std::uint64_t max_high = n == 0 ? 0 : values.back() >> lb;
@@ -32,6 +33,7 @@ inline std::vector<std::uint64_t> build(const std::vector<std::uint64_t>& values
     const std::uint64_t lmask = lb == 0 ? 0 : (lb == 64 ? ~0ULL : (1ULL << lb) - 1);
     for (std::uint64_t i = 0; i < n; ++i) {
         if (i > 0 && values[i] <= values[i - 1]) throw std::runtime_error("elias-fano: values not strictly increasing");
+        if ((values[i] >> universe_bits) != 0) throw std::runtime_error("elias-fano: a value outside the universe");
         const std::uint64_t h = values[i] >> lb, p = h + i;
         high[p / 64] |= 1ULL << (p % 64);
         if (lb > 0) {
@@ -122,6 +124,24 @@ public:
         }
         return -1;
     }
+
+    // Sequential reading of the values in order, without select.
+    class Cursor {
+    public:
+        explicit Cursor(const View& v) : v_(&v), word_(v.n_ > 0 ? v.high_[0] : 0) {}
+        bool next(std::uint64_t& value) {
+            if (i_ >= v_->n_) return false;
+            while (word_ == 0) word_ = v_->high_[++wi_];
+            const std::uint64_t p = wi_ * 64 + ctz64(word_);
+            word_ &= word_ - 1;
+            value = ((p - i_) << v_->lb_) | v_->low(i_);
+            ++i_;
+            return true;
+        }
+    private:
+        const View* v_;
+        std::uint64_t i_ = 0, wi_ = 0, word_ = 0;
+    };
 
 private:
     // Position of zero number j (0-based) in the high bit vector.
