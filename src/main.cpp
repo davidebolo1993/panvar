@@ -5,6 +5,7 @@
 #include <stdexcept>
 
 #include "panvar/associate_command.hpp"
+#include "panvar/background_command.hpp"
 #include "panvar/benchmark_command.hpp"
 #include "panvar/bubble_command.hpp"
 #include "panvar/call_command.hpp"
@@ -65,6 +66,9 @@ int main(int argc, char** argv) {
         }
         if (subcommand == "associate") {
             return panvar::run_associate_command(args);
+        }
+        if (subcommand == "background") {
+            return panvar::run_background_command(args);
         }
 
         throw std::runtime_error("unknown command: " + subcommand + " (run 'panvar --help' for the list)");

@@ -161,6 +161,7 @@ add_library(panvarlib
     src/refine.cpp
     src/rebuild.cpp
     src/output.cpp
+    src/background.cpp
 )
 
 target_include_directories(panvarlib
@@ -199,6 +200,7 @@ add_executable(panvar
     src/refine_command.cpp
     src/rebuild_command.cpp
     src/associate_command.cpp
+    src/background_command.cpp
 )
 target_include_directories(panvar PRIVATE ${EIGEN_DIR})
 target_compile_definitions(panvar PRIVATE PANVAR_VERSION="${PROJECT_VERSION}")
@@ -245,6 +247,12 @@ if(PANVAR_BUILD_TESTING)
                 ${CMAKE_CURRENT_SOURCE_DIR}/tests/real_data/tandem_repeat/lpa.gfa.gz
         )
         set_tests_properties(panvar_unit_kmer PROPERTIES TIMEOUT 300)
+        add_executable(panvar_background_test tests/unit/background_test.cpp)
+        target_link_libraries(panvar_background_test PRIVATE panvarlib minimap2 Threads::Threads ZLIB::ZLIB)
+        target_compile_options(panvar_background_test PRIVATE -Wall -Wextra -Wpedantic)
+        add_test(NAME panvar_unit_background
+                 COMMAND panvar_background_test ${CMAKE_CURRENT_BINARY_DIR}/unit_background)
+        set_tests_properties(panvar_unit_background PROPERTIES TIMEOUT 300)
         # Fast, dependency-free smoke on a tiny hand-built graph that exercises every
         # call event type + confounders with exact-record assertions (no vg needed).
         set(PANVAR_SYN_SMOKE ${CMAKE_CURRENT_SOURCE_DIR}/tests/suites/synthetic_smoke.sh)
