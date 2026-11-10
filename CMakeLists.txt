@@ -194,6 +194,7 @@ add_library(panvarlib
     src/output.cpp
     src/background.cpp
     src/background_sshash.cpp
+    src/anchors.cpp
 )
 
 target_include_directories(panvarlib

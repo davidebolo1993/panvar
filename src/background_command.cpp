@@ -1,5 +1,6 @@
 #include "panvar/background_command.hpp"
 
+#include "panvar/anchors.hpp"
 #include "panvar/background.hpp"
 #include "panvar/cli_utils.hpp"
 
@@ -32,7 +33,8 @@ void print_background_help() {
         << "  panvar background -o <store.bgk> --merge                                        merge segments\n"
         << "  panvar background -o <store.bgk> --compact                                      to SSHash\n"
         << "  panvar background -o <store.bgk> --dump <out.tsv>                               every k-mer\n"
-        << "  panvar background -o <store.bgk> --verify <background>                          compare counts\n\n"
+        << "  panvar background -o <store.bgk> --verify <background>                          compare counts\n"
+        << "  panvar background -o <store.bgk> --locate CONTIG:START-END                      find a locus\n\n"
         << "Options:\n"
         << "  -o, --out <dir>         The store (a folder of segments)\n"
         << "      --genome NAME=PATH  A genome, FASTA plain or gzip/bgzip; repeatable\n"
@@ -44,6 +46,10 @@ void print_background_help() {
         << "      --dump <path>       Write every k-mer and its count (segments summed) as TSV\n"
         << "      --verify <path>     Check that a background (store or .sshash) gives every k-mer of this\n"
         << "                          store the same count, and 0 to random absent ones\n"
+        << "      --coordinate-reference NAME\n"
+        << "                          The genome whose coordinates locus graphs carry: its unique anchors are\n"
+        << "                          mapped in every genome, so a locus can be found in each\n"
+        << "      --locate <region>   Where each genome holds a region of the coordinate reference\n"
         << "      --partitions <N>    Partitions of a new store, a power of two (default 4096)\n"
         << "      --memory <size>     Memory for counting, across threads, e.g. 2G, 512M (default 2G)\n"
         << "      --tmp-dir <dir>     Where the temporary spill files go (default: inside the store)\n"
@@ -152,7 +158,7 @@ int run_background_command(const std::vector<std::string>& args) {
     std::vector<bg::Genome> genomes;
     std::size_t threads = 0, memory = std::size_t{2} << 30, partitions = 4096;
     bool quiet = false, add = false, merge = false, compact = false, partitions_given = false;
-    std::string verify;
+    std::string verify, coordinate_reference, locate_region;
     std::size_t minimizer = 0;
     for (std::size_t i = 0; i < args.size(); ++i) {
         const std::string& a = args[i];
@@ -185,6 +191,8 @@ int run_background_command(const std::vector<std::string>& args) {
         else if (a == "--compact") compact = true;
         else if (a == "--minimizer") minimizer = cli::parse_size_arg(a, value());
         else if (a == "--verify") verify = value();
+        else if (a == "--coordinate-reference") coordinate_reference = value();
+        else if (a == "--locate") locate_region = value();
         else if (a == "--dump") dump = value();
         else if (a == "--partitions") { partitions = cli::parse_size_arg(a, value()); partitions_given = true; }
         else if (a == "--memory") memory = parse_memory(value());
@@ -195,13 +203,13 @@ int run_background_command(const std::vector<std::string>& args) {
     }
     if (out.empty()) throw std::runtime_error("background requires -o/--out <store.bgk>");
     if (static_cast<int>(add) + static_cast<int>(merge) + static_cast<int>(compact) + static_cast<int>(!dump.empty()) +
-        static_cast<int>(!verify.empty()) > 1)
+        static_cast<int>(!verify.empty()) + static_cast<int>(!locate_region.empty()) > 1)
         throw std::runtime_error("background: --add, --merge, --compact, --dump and --verify are separate runs");
     if (threads == 0) threads = std::max(1u, std::thread::hardware_concurrency());
     const bool exists = fs::exists(fs::path(out) / "manifest.json");
     cli::RunLog log("background", quiet);
 
-    if (!dump.empty() || merge || compact || !verify.empty()) {
+    if (!dump.empty() || merge || compact || !verify.empty() || !locate_region.empty()) {
         if (!genomes.empty()) throw std::runtime_error("background: --merge, --compact, --dump and --verify take no --genome");
         if (!exists) throw std::runtime_error(out + " is not a background store (no manifest.json)");
     }
@@ -218,6 +226,39 @@ int run_background_command(const std::vector<std::string>& args) {
         if (std::fclose(f) != 0) throw std::runtime_error("cannot write " + dump);
         log.info("dumped " + std::to_string(n) + " k-mers from " + std::to_string(store.segments()) + " segment(s)");
         log.wrote({dump});
+        log.done();
+        return 0;
+    }
+
+    if (!locate_region.empty()) {
+        const auto colon = locate_region.rfind(':'), dash = locate_region.rfind('-');
+        if (colon == std::string::npos || dash == std::string::npos || dash < colon)
+            throw std::runtime_error("--locate takes CONTIG:START-END, got " + locate_region);
+        const std::string contig = locate_region.substr(0, colon);
+        const std::uint64_t start = cli::parse_size_arg("--locate", locate_region.substr(colon + 1, dash - colon - 1));
+        const std::uint64_t end = cli::parse_size_arg("--locate", locate_region.substr(dash + 1));
+        const fs::path adir = fs::path(out) / "anchors";
+        std::vector<std::string> refs;
+        std::error_code ec;
+        for (const auto& e : fs::directory_iterator(adir, ec)) if (e.is_directory()) refs.push_back(e.path().filename().string());
+        if (!coordinate_reference.empty()) refs = {coordinate_reference};
+        if (refs.size() != 1) throw std::runtime_error("--locate: give --coordinate-reference (the store has " + std::to_string(refs.size()) + " anchor sets)");
+        const fs::path rdir = adir / refs[0];
+        const anchors::ReferenceAnchors ref = anchors::load_reference((rdir / "reference.anc").string());
+        std::cout << "genome\tcopy\tcontig\tstart\tend\tstrand\tanchors_inside\tanchors_flank\n";
+        std::vector<std::string> maps;
+        for (const auto& e : fs::directory_iterator(rdir, ec))
+            if (e.path().extension() == ".map") maps.push_back(e.path().string());
+        std::sort(maps.begin(), maps.end());
+        for (const auto& mp : maps) {
+            const anchors::GenomeMap map = anchors::load_map(mp);
+            const auto spans = anchors::locate(ref, map, contig, start, end);
+            const std::string g = fs::path(mp).stem().string();
+            if (spans.empty()) std::cout << g << "\t0\t.\t.\t.\t.\t0\t0\n";
+            for (std::size_t i = 0; i < spans.size(); ++i)
+                std::cout << g << '\t' << i + 1 << '\t' << spans[i].contig << '\t' << spans[i].start << '\t' << spans[i].end << '\t'
+                          << (spans[i].forward ? '+' : '-') << '\t' << spans[i].anchors_inside << '\t' << spans[i].anchors_flank << '\n';
+        }
         log.done();
         return 0;
     }
@@ -349,6 +390,29 @@ int run_background_command(const std::vector<std::string>& args) {
         throw;
     }
     write_segment_info(o.segment_dir, SegmentInfo{genomes, st.distinct, st.kmers});
+
+    // Anchors: a new coordinate reference's set, then every new genome mapped against every set the store has.
+    const fs::path adir = fs::path(out) / "anchors";
+    if (!coordinate_reference.empty()) {
+        const auto it = std::find_if(genomes.begin(), genomes.end(), [&](const bg::Genome& g) { return g.name == coordinate_reference; });
+        if (it == genomes.end()) throw std::runtime_error("--coordinate-reference " + coordinate_reference + " is not among the genomes given");
+        fs::create_directories(adir / coordinate_reference);
+        const anchors::ReferenceAnchors ref = anchors::build_reference(it->path, threads, [&](const std::string& m) { log.info(m); });
+        anchors::save(ref, (adir / coordinate_reference / "reference.anc").string());
+    }
+    std::error_code aec;
+    for (const auto& e : fs::directory_iterator(adir, aec)) {
+        if (!e.is_directory() || !fs::exists(e.path() / "reference.anc")) continue;
+        const anchors::ReferenceAnchors ref = anchors::load_reference((e.path() / "reference.anc").string());
+        for (const auto& g : genomes) {
+            const anchors::GenomeMap map = anchors::map_genome(ref, g.path, threads);
+            anchors::save(map, (e.path() / (g.name + ".map")).string());
+            std::uint64_t found = 0;
+            for (const auto n : map.occurrences) found += n > 0;
+            log.info("anchors of " + e.path().filename().string() + " in " + g.name + ": " + std::to_string(found) + " of " +
+                     std::to_string(ref.code.size()) + " found");
+        }
+    }
     write_manifest(out, o.partitions);
     log.info(fs::path(o.segment_dir).filename().string() + ": " + std::to_string(st.distinct) + " distinct 31-mers of " +
              std::to_string(st.kmers) + " occurrences, " + human_bytes(st.bytes) + "; spill " + human_bytes(st.spill_bytes) +

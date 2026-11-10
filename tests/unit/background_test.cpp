@@ -2,6 +2,7 @@
 // built from a synthetic genome, looked up k-mer by k-mer against a brute-force count.
 //   background_test <scratch dir>
 
+#include "panvar/anchors.hpp"
 #include "panvar/background.hpp"
 #include "panvar/elias_fano.hpp"
 #include "panvar/kmer.hpp"
@@ -182,6 +183,46 @@ int main(int argc, char** argv) {
         }
         check(compact_ok, "compacted to SSHash (" + std::to_string(cs.strings) + " strings): every count unchanged");
         check(compact_absent, "compacted: absent k-mers give 0");
+    }
+
+    // Anchors: a locus found in another genome where it is moved, duplicated in reverse, and split by a contig break.
+    {
+        auto rc = [](const std::string& x) {
+            std::string r(x.rbegin(), x.rend());
+            for (auto& c : r) c = c == 'A' ? 'T' : c == 'C' ? 'G' : c == 'G' ? 'C' : 'A';
+            return r;
+        };
+        const std::string ref = random_sequence(rng, 2000000);
+        const std::size_t ls = 900000, le = 1000000;            // the locus on the reference
+        const std::string locus = ref.substr(ls, le - ls);
+        // genome B: 50 kb inserted before the locus (so it moves), the locus plus 30 kb around it again in
+        // reverse on a second contig, and on a third contig the locus split in two at its middle
+        const std::string b1 = ref.substr(0, 300000) + random_sequence(rng, 50000) + ref.substr(300000);
+        const std::string b2 = random_sequence(rng, 200000) + rc(ref.substr(ls - 30000, (le - ls) + 60000)) + random_sequence(rng, 200000);
+        const std::string b3a = random_sequence(rng, 100000) + ref.substr(ls - 20000, 70000);
+        const std::string b3b = ref.substr(ls + 50000, 70000) + random_sequence(rng, 100000);
+        const std::string rfa = (dir / "ref.fa").string(), bfa = (dir / "b.fa").string();
+        { std::ofstream f(rfa); f << ">chrR\n" << ref << '\n'; }
+        { std::ofstream f(bfa); f << ">b1\n" << b1 << "\n>b2\n" << b2 << "\n>b3a\n" << b3a << "\n>b3b\n" << b3b << '\n'; }
+        const anchors::ReferenceAnchors ra = anchors::build_reference(rfa, 2);
+        const anchors::GenomeMap self = anchors::map_genome(ra, rfa, 2), mb = anchors::map_genome(ra, bfa, 2);
+        const auto sspan = anchors::locate(ra, self, "chrR", ls, le);
+        const auto bspan = anchors::locate(ra, mb, "chrR", ls, le);
+        auto has = [&](const std::string& contig, bool fwd, std::uint64_t s0, std::uint64_t e0) {
+            for (const auto& sp : bspan)
+                // each end within 5 kb of the copy's, either side (a copy at a contig end stops at its last anchor)
+                if (sp.contig == contig && sp.forward == fwd && (sp.start > s0 ? sp.start - s0 : s0 - sp.start) < 5000 &&
+                    (sp.end > e0 ? sp.end - e0 : e0 - sp.end) < 5000) return true;
+            return false;
+        };
+        const std::uint64_t b2_locus = 200000 + 30000;           // the reversed locus in b2
+        check(ra.code.size() > 1500 && ra.code.size() < 2500, "anchors: about one per kilobase (" + std::to_string(ra.code.size()) + " on 2 Mb)");
+        check(sspan.size() == 1 && sspan[0].start <= ls && sspan[0].end >= le && ls - sspan[0].start < 5000 && sspan[0].end - le < 5000,
+              "the reference locates its own interval, ending at the nearest flank anchors");
+        check(has("b1", true, ls + 50000, le + 50000), "a moved copy is found where it moved");
+        check(has("b2", false, b2_locus, b2_locus + (le - ls)), "a reversed copy elsewhere is found, on the other strand");
+        check(has("b3a", true, 100000 + 20000, 100000 + 70000) && has("b3b", true, 0, 50000),
+              "a copy split by a contig break is found as two partial copies (" + std::to_string(bspan.size()) + " copies in all)");
     }
 
     std::printf("\nbackground_test: %s\n", failures ? (std::to_string(failures) + " check(s) failed").c_str() : "all checks passed");
