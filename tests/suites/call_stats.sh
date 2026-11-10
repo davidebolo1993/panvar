@@ -863,7 +863,9 @@ b=$(rinfo "$OUT/repB.region.vcf" SVLEN):$(rinfo "$OUT/repB.region.vcf" SVLEN_RAN
 # ---------------------------------------------------------------- module losses are carriers
 # A module the reference holds once: h0 loses it (CN 0, a carrier, as on UNIT), h2 and h3 gain copies.
 # Sequences are random so that distinct nodes do not look alike to the sequence-identity merge.
-rseq() { awk -v n="$1" -v s="$2" 'BEGIN{srand(s); for(i=0;i<n;i++) printf "%s", substr("ACGT", int(rand()*4)+1, 1)}'; }
+# a seeded random sequence, the same on every platform (awk's rand differs between awk implementations)
+RSEQ_PY="$(cd "$(dirname "$0")/.." && pwd)/tools/rseq.py"
+rseq() { "${PYTHON:-python3}" -I "$RSEQ_PY" "$1" "$2"; }
 cn_call() {   # cn_call <gfa> <prefix>
   "$BIN" bubble -i "$1" -r ref --min-variant-bp 0 -o "$2.b" --merge-nearby-bp 0 --quiet >/dev/null 2>&1
   "$BIN" call -i "$2.b.sorted.gfa" --bubble-prefix "$2.b" -r ref -o "$2" --cn --quiet >/dev/null 2>&1
