@@ -129,6 +129,36 @@ int main(int argc, char** argv) {
                          std::to_string(big) + " counted 255 or more)");
         check(absent_ok, "random k-mers: present ones counted, absent ones 0");
         check(dump_ok && dumped == truth.size(), "iterating the partitions gives every k-mer once, in its own partition");
+
+        // The same genome as two segments (split with a k-1 overlap): summed, and merged, equal to the whole.
+        const std::filesystem::path store = dir / "store";
+        std::filesystem::remove_all(store);
+        const std::size_t cut = 200000;
+        const std::string parts[2] = {genome.substr(0, cut), genome.substr(cut - (bg::kK - 1))};
+        for (int i = 0; i < 2; ++i) {
+            const std::string pfa = (dir / ("part" + std::to_string(i) + ".fa")).string();
+            std::ofstream f(pfa);
+            f << ">p\n" << parts[i] << '\n';
+            if (i == 1) f << ">c2\n" << genome.substr(1000, 40000) << '\n';
+            f.close();
+            bg::BuildOptions po = o;
+            po.genomes = {{"p" + std::to_string(i), pfa}};
+            po.segment_dir = (store / ("seg-" + std::to_string(i))).string();
+            bg::build_segment(po);
+        }
+        const bg::Store two(store.string());
+        bool sum_ok = two.segments() == 2;
+        for (const auto& [c, n] : truth) sum_ok = sum_ok && two.count(c) == n;
+        bg::MergeOptions mo;
+        mo.segment_dirs = two.segment_dirs();
+        mo.out_segment_dir = (dir / "merged").string();
+        mo.threads = 3;
+        const bg::SegmentStats ms = bg::merge_segments(mo);
+        const bg::Segment merged(mo.out_segment_dir);
+        bool merge_ok = ms.distinct == truth.size();
+        for (const auto& [c, n] : truth) merge_ok = merge_ok && merged.count(c) == n;
+        check(sum_ok, "two segments of one genome: counts summed over them equal the whole genome's");
+        check(merge_ok, "their merge is one segment with the same counts");
     }
 
     std::printf("\nbackground_test: %s\n", failures ? (std::to_string(failures) + " check(s) failed").c_str() : "all checks passed");

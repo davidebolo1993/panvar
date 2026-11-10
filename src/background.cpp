@@ -10,6 +10,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <memory>
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -145,6 +146,97 @@ std::vector<std::uint64_t> encode_partition(const std::vector<std::uint64_t>& co
     return out;
 }
 
+// Sorted codes with repeats -> distinct codes and their counts.
+void collapse(const std::vector<std::uint64_t>& sorted, std::vector<std::uint64_t>& codes, std::vector<std::uint64_t>& counts) {
+    codes.clear();
+    counts.clear();
+    for (std::size_t i = 0; i < sorted.size();) {
+        std::size_t e = i + 1;
+        while (e < sorted.size() && sorted[e] == sorted[i]) ++e;
+        codes.push_back(sorted[i]);
+        counts.push_back(e - i);
+        i = e;
+    }
+}
+
+// Writes a segment's parts.bin: a header with every partition's offset, then the partitions' encodings in
+// whatever order threads finish them.
+class PartsWriter {
+public:
+    PartsWriter(const std::string& segment_dir, std::uint32_t partitions)
+        : path_((fs::path(segment_dir) / "parts.bin").string()), header_(kHeaderWords + partitions, 0), partitions_(partitions) {
+        fs::create_directories(segment_dir);
+        out_ = std::fopen(path_.c_str(), "wb");
+        if (out_ == nullptr) throw std::runtime_error("background: cannot write " + path_);
+        header_[0] = kMagic; header_[1] = kVersion; header_[2] = kK; header_[3] = kM; header_[4] = partitions;
+        if (std::fwrite(header_.data(), 8, header_.size(), out_) != header_.size())
+            throw std::runtime_error("background: cannot write " + path_);
+        words_ = header_.size();
+        written_.assign(partitions, 0);
+    }
+    ~PartsWriter() { if (out_ != nullptr) std::fclose(out_); }
+    PartsWriter(const PartsWriter&) = delete;
+    PartsWriter& operator=(const PartsWriter&) = delete;
+
+    void put(std::uint32_t p, const std::vector<std::uint64_t>& codes, const std::vector<std::uint64_t>& counts) {
+        const std::vector<std::uint64_t> blob = encode_partition(codes, counts);
+        std::lock_guard<std::mutex> lk(m_);
+        if (written_[p]) throw std::runtime_error("background: partition written twice");
+        written_[p] = 1;
+        header_[kHeaderWords + p] = words_;
+        if (std::fwrite(blob.data(), 8, blob.size(), out_) != blob.size())
+            throw std::runtime_error("background: cannot write " + path_);
+        words_ += blob.size();
+        distinct_ += codes.size();
+    }
+    // Writes the header; returns the file's size in bytes.
+    std::uint64_t finish() {
+        for (std::uint32_t p = 0; p < partitions_; ++p)
+            if (!written_[p]) throw std::runtime_error("background: partition " + std::to_string(p) + " was not written");
+        header_[5] = distinct_;
+        if (std::fseek(out_, 0, SEEK_SET) != 0 || std::fwrite(header_.data(), 8, header_.size(), out_) != header_.size() ||
+            std::fclose(out_) != 0) {
+            out_ = nullptr;
+            throw std::runtime_error("background: cannot write " + path_);
+        }
+        out_ = nullptr;
+        return words_ * 8;
+    }
+    std::uint64_t distinct() const { return distinct_; }
+
+private:
+    std::string path_;
+    std::vector<std::uint64_t> header_;
+    std::uint32_t partitions_;
+    std::FILE* out_ = nullptr;
+    std::uint64_t words_ = 0, distinct_ = 0;
+    std::vector<char> written_;
+    std::mutex m_;
+};
+
+// Runs f(i) for i in [0, n) on `threads` threads; the first exception is rethrown after all stop.
+template <class F>
+void parallel_for(std::size_t n, std::size_t threads, F&& f) {
+    std::atomic<std::size_t> next{0};
+    std::exception_ptr failure;
+    std::mutex fm;
+    std::vector<std::thread> pool;
+    for (std::size_t t = 0; t < std::max<std::size_t>(1, threads); ++t)
+        pool.emplace_back([&] {
+            try {
+                for (std::size_t i; (i = next++) < n;) {
+                    { std::lock_guard<std::mutex> lk(fm); if (failure) return; }
+                    f(i);
+                }
+            } catch (...) {
+                std::lock_guard<std::mutex> lk(fm);
+                if (!failure) failure = std::current_exception();
+            }
+        });
+    for (auto& t : pool) t.join();
+    if (failure) std::rethrow_exception(failure);
+}
+
 }  // namespace
 
 SegmentStats build_segment(const BuildOptions& o) {
@@ -166,7 +258,7 @@ SegmentStats build_segment(const BuildOptions& o) {
     if (o.spill_files != 0 && (o.spill_files & (o.spill_files - 1)) != 0)
         throw std::runtime_error("background: the spill file count must be a power of two");
     const std::uint32_t files = static_cast<std::uint32_t>(std::min<std::uint64_t>(
-        o.partitions, o.spill_files != 0 ? o.spill_files : next_pow2((bases * 12 + per_thread - 1) / per_thread)));
+        o.partitions, o.spill_files != 0 ? o.spill_files : next_pow2((bases * 16 + per_thread - 1) / per_thread)));
     const std::uint32_t file_shift = log2_exact(files);
     raise_open_file_limit(files);
 
@@ -272,91 +364,51 @@ SegmentStats build_segment(const BuildOptions& o) {
     for (const auto& s : spill) { std::error_code ec; st.spill_bytes += fs::file_size(s.path, ec); }
     log("spilled " + std::to_string(st.kmers) + " k-mer occurrences in " + std::to_string(st.spill_bytes) + " bytes");
 
-    // Phase 2: workers take spill files one at a time, unpack, sort and count each partition in it, and
+    // Phase 2: threads take spill files one at a time, unpack, sort and count each partition in it, and
     // append its encoding to parts.bin.
-    fs::create_directories(o.segment_dir);
-    const std::string parts_path = (fs::path(o.segment_dir) / "parts.bin").string();
-    std::FILE* out = std::fopen(parts_path.c_str(), "wb");
-    if (out == nullptr) throw std::runtime_error("background: cannot write " + parts_path);
-    std::vector<std::uint64_t> header(kHeaderWords + o.partitions, 0);
-    header[0] = kMagic; header[1] = kVersion; header[2] = kK; header[3] = kM; header[4] = o.partitions;
-    std::fwrite(header.data(), 8, header.size(), out);
-    std::uint64_t out_words = header.size();
-    std::vector<std::uint64_t> offsets(o.partitions, 0);
-    std::mutex out_m;
-    std::atomic<std::uint32_t> next_file{0};
-    std::atomic<std::uint64_t> distinct{0};
-    {
-        std::vector<std::thread> workers;
-        for (std::size_t t = 0; t < threads; ++t) {
-            workers.emplace_back([&] {
-                try {
-                    const std::uint32_t per_file = o.partitions / files;
-                    std::vector<std::vector<std::uint64_t>> codes(per_file);
-                    std::string data, bases_s;
-                    for (std::uint32_t b; (b = next_file++) < files;) {
-                        {
-                            std::ifstream in(spill[b].path, std::ios::binary);
-                            data.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
-                        }
-                        std::error_code ec;
-                        fs::remove(spill[b].path, ec);
-                        for (auto& v : codes) v.clear();
-                        for (std::size_t at = 0; at + 6 <= data.size();) {
-                            std::uint16_t p16; std::uint32_t len;
-                            std::memcpy(&p16, data.data() + at, 2);
-                            std::memcpy(&len, data.data() + at + 2, 4);
-                            at += 6;
-                            bases_s.resize(len);
-                            for (std::uint32_t i = 0; i < len; ++i)
-                                bases_s[i] = "ACGT"[(static_cast<unsigned char>(data[at + i / 4]) >> (2 * (i % 4))) & 3];
-                            at += (len + 3) / 4;
-                            auto& v = codes[p16 >> file_shift];
-                            kmer::for_each_canonical_kmer(bases_s.data(), len, kK,
-                                                          [&](std::uint64_t c, std::size_t, bool) { v.push_back(c); });
-                        }
-                        data.clear();
-                        data.shrink_to_fit();
-                        for (std::uint32_t j = 0; j < per_file; ++j) {
-                            auto& v = codes[j];
-                            std::sort(v.begin(), v.end());
-                            std::vector<std::uint64_t> uniq, counts;
-                            for (std::size_t i = 0; i < v.size();) {
-                                std::size_t e = i + 1;
-                                while (e < v.size() && v[e] == v[i]) ++e;
-                                uniq.push_back(v[i]);
-                                counts.push_back(e - i);
-                                i = e;
-                            }
-                            const std::vector<std::uint64_t> blob = encode_partition(uniq, counts);
-                            distinct += uniq.size();
-                            const std::uint32_t p = (j << file_shift) | b;
-                            std::lock_guard<std::mutex> lk(out_m);
-                            offsets[p] = out_words;
-                            if (std::fwrite(blob.data(), 8, blob.size(), out) != blob.size())
-                                throw std::runtime_error("background: cannot write " + parts_path);
-                            out_words += blob.size();
-                            std::vector<std::uint64_t>().swap(v);
-                        }
-                    }
-                } catch (...) {
-                    std::lock_guard<std::mutex> lk(failure_m);
-                    if (!failure) failure = std::current_exception();
-                }
-            });
-        }
-        for (auto& w : workers) w.join();
+    PartsWriter writer(o.segment_dir, o.partitions);
+    try {
+        parallel_for(files, threads, [&](std::size_t b) {
+            const std::uint32_t per_file = o.partitions / files;
+            std::vector<std::vector<std::uint64_t>> codes(per_file);
+            std::string data, bases_s;
+            {
+                std::ifstream in(spill[b].path, std::ios::binary);
+                data.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+            }
+            std::error_code ec;
+            fs::remove(spill[b].path, ec);
+            for (std::size_t at = 0; at + 6 <= data.size();) {
+                std::uint16_t p16; std::uint32_t len;
+                std::memcpy(&p16, data.data() + at, 2);
+                std::memcpy(&len, data.data() + at + 2, 4);
+                at += 6;
+                bases_s.resize(len);
+                for (std::uint32_t i = 0; i < len; ++i)
+                    bases_s[i] = "ACGT"[(static_cast<unsigned char>(data[at + i / 4]) >> (2 * (i % 4))) & 3];
+                at += (len + 3) / 4;
+                auto& v = codes[p16 >> file_shift];
+                kmer::for_each_canonical_kmer(bases_s.data(), len, kK, [&](std::uint64_t c, std::size_t, bool) { v.push_back(c); });
+            }
+            std::string().swap(data);
+            std::vector<std::uint64_t> uniq, counts;
+            for (std::uint32_t j = 0; j < per_file; ++j) {
+                auto& v = codes[j];
+                std::sort(v.begin(), v.end());
+                collapse(v, uniq, counts);
+                std::vector<std::uint64_t>().swap(v);
+                writer.put((j << file_shift) | static_cast<std::uint32_t>(b), uniq, counts);
+            }
+        });
+    } catch (...) {
+        std::error_code ec;
+        fs::remove_all(spill_dir, ec);
+        throw;
     }
     std::error_code ec;
     fs::remove_all(spill_dir, ec);
-    if (failure) { std::fclose(out); std::rethrow_exception(failure); }
-    header[5] = distinct;
-    std::copy(offsets.begin(), offsets.end(), header.begin() + kHeaderWords);
-    if (std::fseek(out, 0, SEEK_SET) != 0 || std::fwrite(header.data(), 8, header.size(), out) != header.size() ||
-        std::fclose(out) != 0)
-        throw std::runtime_error("background: cannot write " + parts_path);
-    st.distinct = distinct;
-    st.bytes = out_words * 8;
+    st.bytes = writer.finish();
+    st.distinct = writer.distinct();
     return st;
 }
 
@@ -418,6 +470,88 @@ std::uint64_t Segment::count(std::uint64_t canonical_kmer) const {
 void Segment::for_each(std::uint32_t partition, const std::function<void(std::uint64_t, std::uint64_t)>& f) const {
     const Part pt = part(partition);
     pt.codes.for_each_value([&](std::uint64_t i, std::uint64_t code) { f(code, count_at(pt, i)); });
+}
+
+namespace {
+
+// One partition of several segments as distinct codes with summed counts, in code order.
+void merged_partition(const std::vector<const Segment*>& segs, std::uint32_t p,
+                      std::vector<std::uint64_t>& codes, std::vector<std::uint64_t>& counts) {
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> all;
+    for (const Segment* s : segs) s->for_each(p, [&](std::uint64_t c, std::uint64_t n) { all.emplace_back(c, n); });
+    if (segs.size() > 1) std::sort(all.begin(), all.end());
+    codes.clear();
+    counts.clear();
+    for (const auto& [c, n] : all) {
+        if (!codes.empty() && codes.back() == c) counts.back() += n;
+        else { codes.push_back(c); counts.push_back(n); }
+    }
+}
+
+}  // namespace
+
+SegmentStats merge_segments(const MergeOptions& o) {
+    if (o.segment_dirs.empty()) throw std::runtime_error("background: nothing to merge");
+    std::vector<std::unique_ptr<Segment>> segs;
+    std::vector<const Segment*> raw;
+    for (const auto& d : o.segment_dirs) {
+        segs.push_back(std::make_unique<Segment>(d));
+        raw.push_back(segs.back().get());
+        if (segs.back()->partitions() != segs.front()->partitions())
+            throw std::runtime_error("background: segments with different partition counts cannot be merged");
+    }
+    const std::uint32_t partitions = segs.front()->partitions();
+    PartsWriter writer(o.out_segment_dir, partitions);
+    parallel_for(partitions, o.threads, [&](std::size_t p) {
+        std::vector<std::uint64_t> codes, counts;
+        merged_partition(raw, static_cast<std::uint32_t>(p), codes, counts);
+        writer.put(static_cast<std::uint32_t>(p), codes, counts);
+    });
+    SegmentStats st;
+    st.bytes = writer.finish();
+    st.distinct = writer.distinct();
+    return st;
+}
+
+std::vector<std::string> segment_dirs_of(const std::string& store_dir) {
+    std::vector<std::pair<long, std::string>> found;
+    std::error_code ec;
+    for (const auto& e : fs::directory_iterator(store_dir, ec)) {
+        const std::string name = e.path().filename().string();
+        if (!e.is_directory() || name.rfind("seg-", 0) != 0) continue;
+        const std::string num = name.substr(4);
+        if (num.empty() || num.find_first_not_of("0123456789") != std::string::npos) continue;
+        if (!fs::exists(e.path() / "parts.bin")) continue;
+        found.emplace_back(std::stol(num), e.path().string());
+    }
+    std::sort(found.begin(), found.end());
+    std::vector<std::string> out;
+    for (auto& f : found) out.push_back(std::move(f.second));
+    return out;
+}
+
+Store::Store(const std::string& store_dir) : dirs_(segment_dirs_of(store_dir)) {
+    if (dirs_.empty()) throw std::runtime_error("background: " + store_dir + " holds no segment");
+    for (const auto& d : dirs_) {
+        segs_.push_back(std::make_unique<Segment>(d));
+        if (segs_.back()->partitions() != segs_.front()->partitions())
+            throw std::runtime_error("background: " + store_dir + " mixes segments with different partition counts");
+    }
+    partitions_ = segs_.front()->partitions();
+}
+
+std::uint64_t Store::count(std::uint64_t canonical_kmer) const {
+    std::uint64_t n = 0;
+    for (const auto& s : segs_) n += s->count(canonical_kmer);
+    return n;
+}
+
+void Store::for_each(std::uint32_t partition, const std::function<void(std::uint64_t, std::uint64_t)>& f) const {
+    std::vector<const Segment*> raw;
+    for (const auto& s : segs_) raw.push_back(s.get());
+    std::vector<std::uint64_t> codes, counts;
+    merged_partition(raw, partition, codes, counts);
+    for (std::size_t i = 0; i < codes.size(); ++i) f(codes[i], counts[i]);
 }
 
 }  // namespace panvar::bg

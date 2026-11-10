@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <deque>
 #include <functional>
+#include <memory>
 #include <string>
 #include <utility>
 #include <vector>
@@ -104,6 +105,15 @@ struct SegmentStats {
 
 SegmentStats build_segment(const BuildOptions& options);
 
+struct MergeOptions {
+    std::vector<std::string> segment_dirs;   // all with the same partition count
+    std::string out_segment_dir;
+    std::size_t threads = 2;
+};
+
+// Merges segments into one, partition by partition on threads: each k-mer once, its counts summed.
+SegmentStats merge_segments(const MergeOptions& options);
+
 // A segment, read in place.
 class Segment {
 public:
@@ -136,5 +146,25 @@ private:
     std::uint32_t partitions_ = 0;
     std::uint64_t distinct_ = 0;
 };
+
+// A store: every segment of it, read in place; a k-mer's count is the sum over the segments.
+class Store {
+public:
+    explicit Store(const std::string& store_dir);
+    std::uint32_t partitions() const { return partitions_; }
+    std::size_t segments() const { return segs_.size(); }
+    const std::vector<std::string>& segment_dirs() const { return dirs_; }
+    std::uint64_t count(std::uint64_t canonical_kmer) const;
+    // Every (k-mer, summed count) of one partition, in code order.
+    void for_each(std::uint32_t partition, const std::function<void(std::uint64_t, std::uint64_t)>& f) const;
+
+private:
+    std::vector<std::string> dirs_;
+    std::vector<std::unique_ptr<Segment>> segs_;
+    std::uint32_t partitions_ = 0;
+};
+
+// The segment folders of a store (seg-<n>), in order.
+std::vector<std::string> segment_dirs_of(const std::string& store_dir);
 
 } // namespace panvar::bg
