@@ -197,6 +197,8 @@ add_library(panvarlib
     src/background_graph.cpp
     src/background_sshash.cpp
     src/anchors.cpp
+    src/fasta_index.cpp
+    src/locus_index.cpp
 )
 
 target_include_directories(panvarlib
@@ -236,6 +238,7 @@ add_executable(panvar
     src/rebuild_command.cpp
     src/associate_command.cpp
     src/background_command.cpp
+    src/recruit_command.cpp
 )
 target_include_directories(panvar PRIVATE ${EIGEN_DIR})
 target_compile_definitions(panvar PRIVATE PANVAR_VERSION="${PROJECT_VERSION}")
@@ -295,6 +298,14 @@ if(PANVAR_BUILD_TESTING)
             add_test(NAME panvar_background_cli
                      COMMAND /usr/bin/env bash ${PANVAR_BG_CLI} $<TARGET_FILE:panvar> ${CMAKE_CURRENT_SOURCE_DIR}/tests/tools ${CMAKE_CURRENT_BINARY_DIR}/background_cli)
             set_tests_properties(panvar_background_cli PROPERTIES TIMEOUT 600)
+        endif()
+        # recruit --index-only on a synthetic locus with a paralog: outside counts against brute force,
+        # classes, decoys, screen, reuse and rebuilds.
+        set(PANVAR_RECRUIT_INDEX ${CMAKE_CURRENT_SOURCE_DIR}/tests/suites/recruit_index.sh)
+        if(EXISTS ${PANVAR_RECRUIT_INDEX})
+            add_test(NAME panvar_recruit_index
+                     COMMAND /usr/bin/env bash ${PANVAR_RECRUIT_INDEX} $<TARGET_FILE:panvar> ${CMAKE_CURRENT_SOURCE_DIR}/tests/tools ${CMAKE_CURRENT_BINARY_DIR}/recruit_index)
+            set_tests_properties(panvar_recruit_index PROPERTIES TIMEOUT 300)
         endif()
         # Fast, dependency-free smoke on a tiny hand-built graph that exercises every
         # call event type + confounders with exact-record assertions (no vg needed).

@@ -16,6 +16,7 @@
 #include <memory>
 #include <mutex>
 #include <queue>
+#include <set>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -940,6 +941,7 @@ SegmentStats build_segment(const BuildOptions& o) {
                 } else {
                     GzLineReader in(g.path);
                     if (!in.ok()) throw std::runtime_error("background: cannot read " + g.path);
+                    std::set<std::string> seen_contigs;
                     std::string line, chunk;
                     std::uint32_t contig = 0;
                     std::uint64_t chunk_offset = 0, contig_pos = 0;
@@ -969,6 +971,8 @@ SegmentStats build_segment(const BuildOptions& o) {
                             if (have) { ship(false); contig_lengths[gi].push_back(contig_pos); }
                             const auto sp = line.find_first_of(" \t");
                             contig_names[gi].push_back(line.substr(1, sp == std::string::npos ? std::string::npos : sp - 1));
+                            if (!seen_contigs.insert(contig_names[gi].back()).second)
+                                throw std::runtime_error("background: " + g.path + " names contig " + contig_names[gi].back() + " twice");
                             contig = static_cast<std::uint32_t>(contig_names[gi].size() - 1);
                             contig_pos = 0;
                             chunk.clear();

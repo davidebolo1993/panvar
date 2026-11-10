@@ -33,10 +33,11 @@ truth t_12 data/ref.fa data/g1.fa data/g2.fa
 truth t_123 data/ref.fa data/g1.fa data/g2.fa data/g3.fa
 truth t_all data/ref.fa data/g1.fa data/g2.fa data/g3.fa data/g4.fa
 # more genomes, each a sequence no other file has
-cat data/g4.fa data/g1.fa > data/g4b.fa
-cat data/g1.fa data/g3.fa > data/g6.fa
-cat data/g2.fa data/g3.fa > data/g7.fa
-cat data/g2.fa data/g4.fa > data/g5.fa
+two() { { sed "s/^>/>a_/" "$1"; sed "s/^>/>b_/" "$2"; } > "$3"; }   # two genomes as one, contig names kept apart
+two data/g4.fa data/g1.fa data/g4b.fa
+two data/g1.fa data/g3.fa data/g6.fa
+two data/g2.fa data/g3.fa data/g7.fa
+two data/g2.fa data/g4.fa data/g5.fa
 cp data/g2.fa data/g2copy.fa
 
 echo "== failed and interrupted runs leave the store as it was"
@@ -175,6 +176,9 @@ echo "== inputs and limits"
 check "a genome name with a slash is refused" '[[ $rc -ne 0 ]]'
 "${BG[@]}" -o bad2 --genome r=data/reads.fq 2> err.txt; rc=$?
 check "FASTQ is refused as a genome" '[[ $rc -ne 0 ]] && grep -q FASTQ err.txt'
+cat data/g1.fa data/g4.fa > data/twice.fa
+"${BG[@]}" -o bad3 --genome t=data/twice.fa 2> err.txt; rc=$?
+check "a genome naming a contig twice is refused" '[[ $rc -ne 0 ]] && grep -q "twice" err.txt'
 printf ">e\nNNNN\n" > data/empty.fa
 "${BG[@]}" -o e --genome e=data/empty.fa && "${BG[@]}" -o e --compact && "${BG[@]}" -o e --verify e.sshash; rc=$?
 check "a store without k-mers builds, compacts and verifies" '[[ $rc -eq 0 ]]'
