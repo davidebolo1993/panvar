@@ -20,7 +20,7 @@ namespace panvar::anchors {
 constexpr std::size_t kK = 31;
 constexpr std::size_t kS = 11;
 constexpr std::uint32_t kSampleOneIn = 100;   // of closed syncmers (about one per 10.5 bases): one per ~1 kb
-constexpr std::size_t kMaxOccurrences = 4;    // places kept per anchor and genome; more marks it repeated there
+constexpr std::size_t kMaxOccurrences = 4;    // places kept per anchor, genome and contig; more marks it repeated there
 
 // Whether a canonical k-mer is sampled as an anchor candidate (before the uniqueness test).
 bool sampled(std::uint64_t canonical_kmer);
@@ -76,7 +76,8 @@ std::vector<Hit> map_fasta(const AnchorLookup& lookup, const std::string& fasta,
                            std::vector<std::string>& contigs, std::vector<std::uint64_t>& lengths);
 
 // Writes a segment's anchor file for one reference: per anchor, its places sorted by genome, contig and
-// position; an anchor seen more than kMaxOccurrences times in a genome keeps one entry marked repeated.
+// position; an anchor seen more than kMaxOccurrences times on one contig of a genome keeps one entry
+// marked repeated there (a graph genome's haplotypes are its contigs).
 void write_segment_anchors(const std::string& path, const ReferenceAnchors& ref,
                            const std::vector<std::string>& genome_names,
                            const std::vector<std::vector<std::string>>& contig_names,
@@ -125,6 +126,8 @@ struct Span {
     std::size_t anchors_inside = 0;      // chained anchors from inside the interval
     std::size_t anchors_flank = 0;       // chained anchors from the flanks
     std::size_t chains = 1;              // chains joined into this span because they overlapped
+    std::uint64_t inner_start = 0, inner_end = 0;   // the stretch between the outermost inside anchors (the span
+                                                    // itself when the interval has none)
 };
 
 struct LocateOptions {

@@ -14,10 +14,12 @@
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <map>
 #include <random>
 #include <set>
 #include <string>
+#include <tuple>
 #include <vector>
 
 using namespace panvar;
@@ -119,7 +121,6 @@ int main(int argc, char** argv) {
     // Counts: random, skewed and constant lists decode exactly, by index and by cursor.
     {
         bool ok = true;
-        std::uint64_t words_core = 0;
         for (int t = 0; t < 60; ++t) {
             const std::size_t n = t == 0 ? 0 : 1 + rng() % 5000;
             std::vector<std::uint64_t> c(n);
@@ -133,7 +134,6 @@ int main(int argc, char** argv) {
             ok = ok && v.words() == w.size();
             bg::counts::View::Cursor cur(v);
             for (std::size_t i = 0; i < n; ++i) ok = ok && v.get(i) == c[i] && cur.next() == c[i];
-            if (t % 4 == 2) words_core += w.size();
         }
         check(ok, "count encoding: exact by index and in sequence (small, skewed, constant and huge counts)");
         std::vector<std::uint64_t> c(10000, 466);
@@ -243,6 +243,38 @@ int main(int argc, char** argv) {
         }
     }
 
+    // A genome longer than the reading chunk (1 Mb at a small memory bound), as one line and as 60 columns:
+    // the same counts, every k-mer once, and the same anchors.
+    {
+        const std::string big = random_sequence(rng, 3200000);
+        const std::string fa60 = (dir / "big60.fa").string(), fa1 = (dir / "big1.fa").string();
+        write_fasta(fa60, {{"b", big}});
+        { std::ofstream f(fa1); f << ">b\n" << big << '\n'; }
+        const anchors::ReferenceAnchors ra = anchors::build_reference("b", fa60, 2);
+        std::vector<std::vector<std::tuple<std::uint32_t, std::uint32_t, bool>>> places(2);
+        std::vector<Counts> counts(2);
+        std::vector<std::uint64_t> kmers(2);
+        for (int v = 0; v < 2; ++v) {
+            bg::BuildOptions bo = o;
+            bo.genomes = {{"b", v == 0 ? fa60 : fa1, 0, ""}};
+            bo.segment_dir = (dir / ("big-seg" + std::to_string(v))).string();
+            bo.memory_bytes = std::size_t{16} << 20;
+            bo.anchor_sets = {{"b", &ra}};
+            kmers[v] = bg::build_segment(bo).kmers;
+            counts[v] = dump(bg::Segment(bo.segment_dir));
+            const anchors::SegmentAnchors sa((fs::path(bo.segment_dir) / "anchors-b.bin").string());
+            std::vector<anchors::Place> ps;
+            for (std::size_t a = 0; a < sa.anchors(); ++a) {
+                sa.places(a, ps);
+                for (const auto& p : ps) places[v].emplace_back(static_cast<std::uint32_t>(a), p.pos, p.repeated);
+            }
+        }
+        bool at_ref = places[0].size() == ra.code.size();
+        for (std::size_t i = 0; i < places[0].size() && at_ref; ++i) at_ref = std::get<1>(places[0][i]) == ra.at[std::get<0>(places[0][i])].pos;
+        check(kmers[0] == big.size() - 30 && kmers[1] == kmers[0] && counts[0] == counts[1] && places[0] == places[1] && at_ref,
+              "a 3.2 Mb genome read in 1 Mb chunks, one line or 60 columns: every k-mer once, every anchor where the reference has it");
+    }
+
     // The same genome twice: folding stores identical super-k-mers once; counts double.
     {
         const std::string fa2 = (dir / "g2.fa").string();
@@ -311,22 +343,35 @@ int main(int argc, char** argv) {
         const bg::Segment m(merged.string());
         check(info.distinct == truth.size() && dump(m) == truth, "their merge, in three partition ranges, has the same counts");
 
-        // An interrupted parts file (magic not yet written) is refused, not read.
-        const fs::path broken = dir / "broken";
-        fs::create_directories(broken);
-        fs::copy_file(merged / "parts-0.bin", broken / "parts-0.bin");
-        fs::copy_file(merged / "parts-1.bin", broken / "parts-1.bin");
-        fs::copy_file(merged / "parts-2.bin", broken / "parts-2.bin");
-        bg::write_segment_info(broken.string(), info);
-        {
-            std::fstream f(broken / "parts-1.bin", std::ios::in | std::ios::out | std::ios::binary);
+        // Damaged files are refused, each on its own: no magic (an interrupted write), truncated, a corrupt
+        // partition header.
+        auto damaged = [&](const std::string& name, const std::function<void(const fs::path&)>& harm) {
+            const fs::path b = dir / name;
+            fs::remove_all(b);
+            fs::create_directories(b);
+            for (const char* f : {"parts-0.bin", "parts-1.bin", "parts-2.bin"}) fs::copy_file(merged / f, b / f);
+            bg::write_segment_info(b.string(), info);
+            harm(b / "parts-1.bin");
+            try { bg::Segment x(b.string()); } catch (const std::exception&) { return true; }
+            return false;
+        };
+        const bool no_magic = damaged("broken1", [](const fs::path& f) {
+            std::fstream io(f, std::ios::in | std::ios::out | std::ios::binary);
             const std::uint64_t zero = 0;
-            f.write(reinterpret_cast<const char*>(&zero), 8);
-        }
-        fs::resize_file(broken / "parts-2.bin", fs::file_size(broken / "parts-2.bin") - 16);
-        bool refused = false;
-        try { bg::Segment b(broken.string()); } catch (const std::exception&) { refused = true; }
-        check(refused, "a parts file without its magic, or truncated, is refused");
+            io.write(reinterpret_cast<const char*>(&zero), 8);
+        });
+        const bool truncated = damaged("broken2", [](const fs::path& f) { fs::resize_file(f, fs::file_size(f) - 16); });
+        const bool bad_header = damaged("broken3", [](const fs::path& f) {
+            // the first partition's Elias-Fano high-word count, made inconsistent
+            std::fstream io(f, std::ios::in | std::ios::out | std::ios::binary);
+            std::uint64_t first_off = 0;
+            io.seekg(9 * 8);
+            io.read(reinterpret_cast<char*>(&first_off), 8);
+            io.seekp(static_cast<std::streamoff>((first_off + 3) * 8));
+            const std::uint64_t bogus = 1ULL << 40;
+            io.write(reinterpret_cast<const char*>(&bogus), 8);
+        });
+        check(no_magic && truncated && bad_header, "a parts file without its magic, truncated, or with a corrupt partition header is refused");
 
         // Compaction, both string builders: the same counts, 0 for absent k-mers, tied to the store.
         const fs::path one = dir / "one";
@@ -350,13 +395,18 @@ int main(int argc, char** argv) {
             check(ok, std::string("compacted (") + (local ? "partition-local" : "greedy") + " strings: " + std::to_string(cs.strings) +
                       " strings, " + std::to_string(cs.string_bases) + " bases): every count unchanged, absent k-mers 0");
         }
-        {   // a changed store makes its dictionary stale
+        {   // a store whose genomes changed makes its dictionary stale; a new generation alone (a reference
+            // added, a merge) does not
             bg::Manifest mm = bg::read_manifest(one.string());
             ++mm.generation;
             bg::write_manifest(one.string(), mm);
+            bool kept = true;
+            try { bg::Background::open((dir / "one.sshash").string()); } catch (const std::exception&) { kept = false; }
+            mm.segments[0].genomes.push_back({"another", "/elsewhere.fa", 1, "0000000000000000"});
+            bg::write_manifest(one.string(), mm);
             bool stale = false;
             try { bg::Background::open((dir / "one.sshash").string()); } catch (const std::exception&) { stale = true; }
-            check(stale, "a dictionary whose store changed since is refused as stale");
+            check(kept && stale, "a dictionary is refused as stale when its store's genomes changed, not when only its generation did");
         }
         {   // an empty store compacts to an empty dictionary
             const std::string efa = (dir / "empty.fa").string();
@@ -444,6 +494,17 @@ int main(int argc, char** argv) {
         std::sort(b.begin(), b.end());
         check(!a.empty() && a == b && contigs == bg::graph::graph_contigs(gfa),
               "anchors placed through the graph equal those found in the spelled haplotypes (" + std::to_string(a.size()) + ")");
+        // through the counting pass, the anchor file and locate: every haplotype holds its copy
+        bg::BuildOptions ga = o;
+        ga.genomes = {{"graph", gfa, 0, ""}};
+        ga.segment_dir = (dir / "graph-anchored").string();
+        ga.anchor_sets = {{"ref", &ra}};
+        bg::build_segment(ga);
+        const anchors::SegmentAnchors gsa((dir / "graph-anchored" / "anchors-ref.bin").string());
+        const auto gspans = anchors::locate(ra, {&gsa}, "ref", 10000, 30000);
+        std::set<std::string> found;
+        for (const auto& sp : gspans) found.insert(sp.contig);
+        check(found.size() == 6, "located through a graph's anchors: a copy in each of its 6 haplotypes (" + std::to_string(found.size()) + ")");
     }
 
     // Locating: moved, reversed, split, tandem-duplicated and displaced copies; short intervals.

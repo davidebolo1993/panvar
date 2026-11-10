@@ -85,7 +85,7 @@ std::vector<std::uint64_t> encode(const std::vector<std::uint64_t>& c) {
     return out;
 }
 
-View::View(const std::uint64_t* w, std::uint64_t n) : n_(n) {
+View::View(const std::uint64_t* w, std::uint64_t n) {
     width_ = static_cast<std::uint32_t>(w[0] & 0xff);
     n_exc_ = w[0] >> 8;
     if (n > 0 && (width_ == 0 || width_ > 64)) throw std::runtime_error("background: corrupt count block");
@@ -333,7 +333,14 @@ private:
 // size; when full, written out and emptied.
 class DedupTable {
 public:
-    explicit DedupTable(std::size_t budget) : budget_(budget) { slots_.assign(1024, 0); }
+    // The records take three quarters of the budget, reserved once (pages are touched only as they fill), the
+    // slots the rest; nothing grows past that, so the table holds its share exactly.
+    explicit DedupTable(std::size_t budget) : budget_(budget) {
+        slots_.assign(1024, 0);
+        arena_.reserve(budget * 3 / 4);
+        max_slots_ = 1024;
+        while (max_slots_ * 2 * 8 <= budget / 4) max_slots_ *= 2;
+    }
     // `rec` is one spill record (as put_varint/pack_bases write it); appends to `out` when the table flushes.
     void add(std::uint64_t j, std::uint64_t len, std::uint64_t mult, const unsigned char* packed, std::string& out) {
         const std::size_t pbytes = (len + 3) / 4;
@@ -344,7 +351,12 @@ public:
             const std::uint64_t slot = slots_[s];
             if (slot == 0) {
                 const std::uint64_t off = arena_.size();
-                if (off >= (1ULL << 40)) { flush(out); add(j, len, mult, packed, out); return; }
+                if (off >= (1ULL << 40) || off + 12 + pbytes > arena_.capacity()) {
+                    if (off == 0) { emit(out, j, len, mult, packed); return; }   // larger than the whole table
+                    flush(out);
+                    add(j, len, mult, packed, out);
+                    return;
+                }
                 const std::uint32_t m32 = static_cast<std::uint32_t>(std::min<std::uint64_t>(mult, 0xFFFFFFFFULL));
                 arena_.append(reinterpret_cast<const char*>(&m32), 4);
                 const std::uint32_t j32 = static_cast<std::uint32_t>(j), l32 = static_cast<std::uint32_t>(len);
@@ -354,7 +366,6 @@ public:
                 slots_[s] = (fp << 40) | off;
                 if (mult > 0xFFFFFFFFULL) big_.emplace_back(off, mult);
                 if (++used_ * 10 > slots_.size() * 7) grow(out);
-                if (arena_.size() + slots_.size() * 8 > budget_) flush(out);
                 return;
             }
             if ((slot >> 40) != fp) continue;
@@ -398,7 +409,7 @@ private:
         out.append(reinterpret_cast<const char*>(packed), (len + 3) / 4);
     }
     void grow(std::string& out) {
-        if ((slots_.size() * 2) * 8 + arena_.size() > budget_) { flush(out); return; }
+        if (slots_.size() >= max_slots_) { flush(out); return; }
         std::vector<std::uint64_t> old;
         old.swap(slots_);
         slots_.assign(old.size() * 2, 0);
@@ -419,7 +430,7 @@ private:
     std::string arena_;
     std::vector<std::uint64_t> slots_;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> big_;
-    std::size_t used_ = 0;
+    std::size_t used_ = 0, max_slots_ = 1024;
     std::uint64_t hits_ = 0;
 };
 
@@ -536,29 +547,70 @@ public:
 
     void add(std::uint32_t j, std::uint64_t code, std::uint64_t mult) {
         Acc& a = acc_[j];
-        if (mult == 1) { a.raw.push_back(code); used_ += 8; }
-        else { a.wt.emplace_back(code, mult); used_ += 16; }
+        // memory is counted by capacity: a vector that grows briefly holds its old and new buffers
+        if (mult == 1) {
+            const std::size_t before = a.raw.capacity();
+            a.raw.push_back(code);
+            if (a.raw.capacity() != before) used_ += (a.raw.capacity() + before) * 8;
+        } else {
+            const std::size_t before = a.wt.capacity();
+            a.wt.emplace_back(code, mult);
+            if (a.wt.capacity() != before) used_ += (a.wt.capacity() + before) * 16;
+        }
         if (used_ > budget_) compact(true);
     }
     // The partition's distinct codes and counts; call once per partition after all adds.
     void finish(std::uint32_t j, std::vector<std::uint64_t>& codes, std::vector<std::uint64_t>& cnt) {
-        if (!finished_) { compact(false); finished_ = true; if (runs_.fp != nullptr && std::fflush(runs_.fp) != 0) fail(); }
+        if (!finished_) { compact(true); finished_ = true; if (runs_.fp != nullptr && std::fflush(runs_.fp) != 0) fail(); }
         Acc& a = acc_[j];
         if (a.disk.empty()) { codes.swap(a.rc); cnt.swap(a.rn); a = Acc(); return; }
-        std::vector<std::vector<std::uint64_t>> dc, dn;
-        for (const auto& [off, n] : a.disk) {
-            dc.emplace_back(n);
-            dn.emplace_back(n);
-            if (std::fseek(runs_.fp, static_cast<long>(off), SEEK_SET) != 0 || std::fread(dc.back().data(), 8, n, runs_.fp) != n ||
-                std::fread(dn.back().data(), 8, n, runs_.fp) != n)
+        // the runs on disk are read in small chunks while they are merged, so a partition's runs need not fit
+        struct Cursor {
+            std::uint64_t off = 0, n = 0, at = 0, buf_at = 0;
+            std::vector<std::uint64_t> c, k;
+        };
+        std::vector<Cursor> cur(a.disk.size());
+        constexpr std::uint64_t kChunk = 1 << 15;
+        auto refill = [&](Cursor& r) {
+            const std::uint64_t take = std::min<std::uint64_t>(kChunk, r.n - r.at);
+            r.c.resize(take);
+            r.k.resize(take);
+            if (std::fseek(runs_.fp, static_cast<long>(r.off + r.at * 8), SEEK_SET) != 0 || std::fread(r.c.data(), 8, take, runs_.fp) != take ||
+                std::fseek(runs_.fp, static_cast<long>(r.off + (r.n + r.at) * 8), SEEK_SET) != 0 || std::fread(r.k.data(), 8, take, runs_.fp) != take)
                 throw std::runtime_error("background: cannot read " + run_path_);
+            r.buf_at = r.at;
+        };
+        using E = std::pair<std::uint64_t, std::size_t>;
+        std::priority_queue<E, std::vector<E>, std::greater<E>> heap;
+        for (std::size_t r = 0; r < cur.size(); ++r) {
+            cur[r].off = a.disk[r].first;
+            cur[r].n = a.disk[r].second;
+            refill(cur[r]);
+            heap.emplace(cur[r].c[0], r);
         }
-        std::vector<std::pair<const std::uint64_t*, const std::uint64_t*>> runs;
-        std::vector<std::size_t> lens;
-        for (std::size_t r = 0; r < dc.size(); ++r) { runs.emplace_back(dc[r].data(), dn[r].data()); lens.push_back(dc[r].size()); }
-        runs.emplace_back(a.rc.data(), a.rn.data());
-        lens.push_back(a.rc.size());
-        merge_runs(runs, lens, codes, cnt);
+        const std::size_t mem = cur.size();   // the run still in memory takes the last slot
+        std::size_t mi = 0;
+        if (!a.rc.empty()) heap.emplace(a.rc[0], mem);
+        codes.clear();
+        cnt.clear();
+        while (!heap.empty()) {
+            const auto [code, r] = heap.top();
+            heap.pop();
+            std::uint64_t c;
+            if (r == mem) {
+                c = a.rn[mi++];
+                if (mi < a.rc.size()) heap.emplace(a.rc[mi], mem);
+            } else {
+                Cursor& x = cur[r];
+                c = x.k[x.at - x.buf_at];
+                if (++x.at < x.n) {
+                    if (x.at - x.buf_at >= x.c.size()) refill(x);
+                    heap.emplace(x.c[x.at - x.buf_at], r);
+                }
+            }
+            if (!codes.empty() && codes.back() == code) cnt.back() += c;
+            else { codes.push_back(code); cnt.push_back(c); }
+        }
         a = Acc();
     }
     std::uint64_t run_bytes() const { return run_bytes_; }
@@ -572,51 +624,65 @@ private:
     };
     [[noreturn]] void fail() { throw std::runtime_error("background: cannot write " + run_path_); }
 
+    // Every partition's new occurrences sorted, collapsed and merged into its run; when what is held (runs
+    // so far plus occurrences not yet collapsed) passes the budget, a run goes to the run file at once.
     void compact(bool may_spill) {
-        std::size_t run_total = 0;
+        std::size_t raw_left = 0, held = 0;
+        for (const Acc& a : acc_) {
+            raw_left += a.raw.capacity() * 8 + a.wt.capacity() * 16;
+            held += (a.rc.capacity() + a.rn.capacity()) * 8;
+        }
         std::vector<std::uint64_t> c1, n1, c2, n2;
         for (Acc& a : acc_) {
-            if (a.raw.empty() && a.wt.empty()) { run_total += a.rc.size() * 16; continue; }
-            radix_sort(a.raw.data(), a.raw.size());
-            c1.clear(); n1.clear();
-            for (std::size_t i = 0; i < a.raw.size();) {
-                std::size_t e = i + 1;
-                while (e < a.raw.size() && a.raw[e] == a.raw[i]) ++e;
-                c1.push_back(a.raw[i]); n1.push_back(e - i);
-                i = e;
+            if (!a.raw.empty() || !a.wt.empty()) {
+                raw_left -= a.raw.capacity() * 8 + a.wt.capacity() * 16;
+                held -= (a.rc.capacity() + a.rn.capacity()) * 8;
+                radix_sort(a.raw.data(), a.raw.size());
+                c1.clear(); n1.clear();
+                for (std::size_t i = 0; i < a.raw.size();) {
+                    std::size_t e = i + 1;
+                    while (e < a.raw.size() && a.raw[e] == a.raw[i]) ++e;
+                    c1.push_back(a.raw[i]); n1.push_back(e - i);
+                    i = e;
+                }
+                std::vector<std::uint64_t>().swap(a.raw);
+                std::sort(a.wt.begin(), a.wt.end());
+                c2.clear(); n2.clear();
+                for (const auto& [c, n] : a.wt) {
+                    if (!c2.empty() && c2.back() == c) n2.back() += n;
+                    else { c2.push_back(c); n2.push_back(n); }
+                }
+                std::vector<std::pair<std::uint64_t, std::uint64_t>>().swap(a.wt);
+                std::vector<std::uint64_t> rc, rn;
+                rc.reserve(c1.size() + c2.size() + a.rc.size());
+                rn.reserve(rc.capacity());
+                merge_runs({{c1.data(), n1.data()}, {c2.data(), n2.data()}, {a.rc.data(), a.rn.data()}}, {c1.size(), c2.size(), a.rc.size()}, rc, rn);
+                rc.shrink_to_fit(); rn.shrink_to_fit();
+                a.rc.swap(rc); a.rn.swap(rn);
+                held += (a.rc.capacity() + a.rn.capacity()) * 8;
             }
-            std::vector<std::uint64_t>().swap(a.raw);
-            std::sort(a.wt.begin(), a.wt.end());
-            c2.clear(); n2.clear();
-            for (const auto& [c, n] : a.wt) {
-                if (!c2.empty() && c2.back() == c) n2.back() += n;
-                else { c2.push_back(c); n2.push_back(n); }
+            if (may_spill && !a.rc.empty() && held + raw_left > budget_ / 2) {
+                held -= (a.rc.capacity() + a.rn.capacity()) * 8;
+                spill(a);
             }
-            std::vector<std::pair<std::uint64_t, std::uint64_t>>().swap(a.wt);
-            std::vector<std::uint64_t> rc, rn;
-            merge_runs({{c1.data(), n1.data()}, {c2.data(), n2.data()}, {a.rc.data(), a.rn.data()}}, {c1.size(), c2.size(), a.rc.size()}, rc, rn);
-            rc.shrink_to_fit(); rn.shrink_to_fit();
-            a.rc.swap(rc); a.rn.swap(rn);
-            run_total += a.rc.size() * 16;
         }
-        used_ = run_total;
-        if (!may_spill || run_total <= budget_ / 2) return;
+        c1 = {}; n1 = {}; c2 = {}; n2 = {};
+        used_ = held;
+    }
+
+    void spill(Acc& a) {
         if (runs_.fp == nullptr) {
             runs_.fp = std::fopen(run_path_.c_str(), "w+b");
             if (runs_.fp == nullptr) fail();
         }
-        for (Acc& a : acc_) {
-            if (a.rc.empty()) continue;
-            if (std::fseek(runs_.fp, 0, SEEK_END) != 0) fail();
-            const long off = std::ftell(runs_.fp);
-            if (std::fwrite(a.rc.data(), 8, a.rc.size(), runs_.fp) != a.rc.size() || std::fwrite(a.rn.data(), 8, a.rn.size(), runs_.fp) != a.rn.size())
-                fail();
-            a.disk.emplace_back(static_cast<std::uint64_t>(off), a.rc.size());
-            run_bytes_ += a.rc.size() * 16;
-            std::vector<std::uint64_t>().swap(a.rc);
-            std::vector<std::uint64_t>().swap(a.rn);
-        }
-        used_ = 0;
+        if (std::fseek(runs_.fp, 0, SEEK_END) != 0) fail();
+        const long off = std::ftell(runs_.fp);
+        if (std::fwrite(a.rc.data(), 8, a.rc.size(), runs_.fp) != a.rc.size() || std::fwrite(a.rn.data(), 8, a.rn.size(), runs_.fp) != a.rn.size())
+            fail();
+        a.disk.emplace_back(static_cast<std::uint64_t>(off), a.rc.size());
+        run_bytes_ += a.rc.size() * 16;
+        std::vector<std::uint64_t>().swap(a.rc);
+        std::vector<std::uint64_t>().swap(a.rn);
     }
 
     std::vector<Acc> acc_;
@@ -674,17 +740,13 @@ SegmentInfo read_segment_info(const std::string& dir) {
 
 void write_segment_info(const std::string& dir, const SegmentInfo& info) {
     const std::string path = (fs::path(dir) / "segment.tsv").string(), tmp = path + ".tmp";
-    {
-        std::ofstream f(tmp);
-        f << "format\tpanvar-background-segment\t" << kVersion << "\npartitions\t" << info.partitions << '\n';
-        for (const auto& p : info.parts) f << "parts\t" << p.file << '\t' << p.first << '\t' << p.end << '\n';
-        for (const auto& g : info.genomes) f << "genome\t" << g.name << '\t' << g.path << '\t' << g.bytes << '\t' << g.checksum << '\n';
-        f << "distinct\t" << info.distinct << "\noccurrences\t" << info.occurrences << '\n';
-        for (const auto& [name, fp] : info.anchor_sets) f << "anchors\t" << name << '\t' << hex64(fp) << '\n';
-        f.flush();
-        if (!f) throw std::runtime_error("background: cannot write " + tmp);
-    }
-    fsync_path(tmp);
+    std::ostringstream f;
+    f << "format\tpanvar-background-segment\t" << kVersion << "\npartitions\t" << info.partitions << '\n';
+    for (const auto& p : info.parts) f << "parts\t" << p.file << '\t' << p.first << '\t' << p.end << '\n';
+    for (const auto& g : info.genomes) f << "genome\t" << g.name << '\t' << g.path << '\t' << g.bytes << '\t' << g.checksum << '\n';
+    f << "distinct\t" << info.distinct << "\noccurrences\t" << info.occurrences << '\n';
+    for (const auto& [name, fp] : info.anchor_sets) f << "anchors\t" << name << '\t' << hex64(fp) << '\n';
+    write_file_durably(tmp, f.str());
     fs::rename(tmp, path);
 }
 
@@ -697,7 +759,10 @@ SegmentStats build_segment(const BuildOptions& o) {
         throw std::runtime_error("background: the partition count must be a power of two, at most 65536");
     if (o.genomes.empty()) throw std::runtime_error("background: no genome given");
     if (o.genomes.size() > 65535) throw std::runtime_error("background: at most 65535 genomes in one segment");
-    if (fs::exists(o.segment_dir)) throw std::runtime_error("background: " + o.segment_dir + " already exists");
+    if (fs::exists(o.segment_dir)) {   // only a folder its caller created and claimed (holding job.lock) may exist
+        for (const auto& e : fs::directory_iterator(o.segment_dir))
+            if (e.path().filename() != "job.lock") throw std::runtime_error("background: " + o.segment_dir + " is not empty");
+    }
     const std::size_t threads = std::max<std::size_t>(1, o.threads);
     auto log = [&](const std::string& m) { if (o.log) o.log(m); };
 
@@ -711,12 +776,29 @@ SegmentStats build_segment(const BuildOptions& o) {
     // Spill files: as many as it takes for one to be counted in a thread's share of the memory (8 bytes per
     // occurrence and room to sort; a file that still does not fit is counted in sorted runs on disk).
     const std::uint64_t per_thread = std::max<std::uint64_t>(std::uint64_t{64} << 20, o.memory_bytes / threads);
+    // What the bound must also hold: the reader's chunks in flight, and the anchors found (20 bytes each; about
+    // one per reference anchor and genome).
+    const std::size_t chunk_bases = std::clamp<std::size_t>(o.memory_bytes / (16 * threads), std::size_t{1} << 20, kChunkBases);
+    std::uint64_t anchor_bytes = 0;
+    for (const AnchorSet& s : o.anchor_sets) anchor_bytes += s.ref->code.size() * 20ULL * o.genomes.size();
+    const std::uint64_t fixed = chunk_bases * (3 * threads + 2) + anchor_bytes;
+    const std::uint64_t left = o.memory_bytes > fixed ? o.memory_bytes - fixed : 0;
+    // a partition is held whole while it is encoded (about 40 bytes per distinct k-mer)
+    if (bases / o.partitions * 40 > o.memory_bytes / threads)
+        log("warning: with " + std::to_string(o.partitions) + " partitions, one may need about " +
+            std::to_string(bases / o.partitions * 40 >> 20) + " MB to encode, more than a thread's share of --memory; use more partitions");
+    if (left < o.memory_bytes / 4)
+        log("warning: --memory " + std::to_string(o.memory_bytes >> 20) + " MB leaves little for counting after the anchors (" +
+            std::to_string(anchor_bytes >> 20) + " MB) and reading buffers");
     // a thread's share, less room for the copies made while runs are collapsed and merged
-    const std::uint64_t count_budget = std::max<std::uint64_t>(std::uint64_t{1} << 20, o.memory_bytes / threads * 5 / 8);
+    const std::uint64_t count_budget = std::max<std::uint64_t>(std::uint64_t{1} << 20, std::max<std::uint64_t>(left, o.memory_bytes / 4) / threads * 5 / 8);
     if (o.spill_files != 0 && (o.spill_files & (o.spill_files - 1)) != 0)
         throw std::runtime_error("background: the spill file count must be a power of two");
-    const std::uint32_t files = static_cast<std::uint32_t>(std::min<std::uint64_t>(
-        o.partitions, o.spill_files != 0 ? o.spill_files : std::max<std::uint64_t>(1, next_pow2((bases * 12 + per_thread - 1) / per_thread))));
+    std::uint64_t want_files = o.spill_files != 0 ? o.spill_files : std::max<std::uint64_t>(1, next_pow2((bases * 12 + per_thread - 1) / per_thread));
+    // every thread keeps a buffer of at least 4 KB per file: an eighth of the bound caps the file count
+    if (o.spill_files == 0)
+        while (want_files > 1 && threads * want_files * 4096 > o.memory_bytes / 8) want_files /= 2;
+    const std::uint32_t files = static_cast<std::uint32_t>(std::min<std::uint64_t>(o.partitions, want_files));
     const std::uint32_t file_shift = log2_exact(files);
     const std::uint32_t per_file = o.partitions / files;
     raise_open_file_limit(files);
@@ -740,7 +822,7 @@ SegmentStats build_segment(const BuildOptions& o) {
     };
     std::vector<SpillFile> spill(files);
     // Memory in the spill phase: per-thread buffers up to an eighth of the budget, dedup tables up to three eighths.
-    const std::size_t flush_at = std::clamp<std::size_t>(o.memory_bytes / 8 / (threads * files), std::size_t{16} << 10, std::size_t{4} << 20);
+    const std::size_t flush_at = std::clamp<std::size_t>(o.memory_bytes / 8 / (threads * files), std::size_t{4} << 10, std::size_t{4} << 20);
     const std::size_t table_budget = o.memory_bytes * 3 / 8 / files;
     for (std::uint32_t b = 0; b < files; ++b) {
         spill[b].path = (spill_dir / ("s" + std::to_string(b) + ".spill")).string();
@@ -769,9 +851,11 @@ SegmentStats build_segment(const BuildOptions& o) {
     std::exception_ptr failure;
     std::mutex failure_m;
     ItemQueue queue(threads * 2);
+    std::atomic<bool> aborted_run{false};
     auto record_failure = [&] {
         std::lock_guard<std::mutex> lk(failure_m);
         if (!failure) failure = std::current_exception();
+        aborted_run = true;
         queue.abort();
     };
     {
@@ -842,14 +926,16 @@ SegmentStats build_segment(const BuildOptions& o) {
                             it.anchors = false;
                             return queue.push(std::move(it));
                         });
+                    if (aborted_run) break;
                     checksum = gc.checksum;
                     genome_bases = gc.bases;
                     contig_names[gi] = gc.contigs;
                     contig_lengths[gi] = gc.contig_lengths;
-                    for (std::size_t s = 0; s < lookups.size(); ++s) {
+                    for (std::size_t s = 0; s < lookups.size() && !aborted_run; ++s) {
                         std::vector<anchors::Hit> gh = graph::graph_anchors(g.path, *lookups[s], static_cast<std::uint32_t>(gi), threads);
                         auto& dst = hits[s][threads];
-                        dst.insert(dst.end(), gh.begin(), gh.end());
+                        if (dst.empty()) dst = std::move(gh);
+                        else dst.insert(dst.end(), gh.begin(), gh.end());
                     }
                 } else {
                     GzLineReader in(g.path);
@@ -858,7 +944,7 @@ SegmentStats build_segment(const BuildOptions& o) {
                     std::uint32_t contig = 0;
                     std::uint64_t chunk_offset = 0, contig_pos = 0;
                     bool have = false, aborted = false;
-                    chunk.reserve(kChunkBases + kK);
+                    chunk.reserve(chunk_bases + kK);
                     auto ship = [&](bool keep_tail) {
                         if (chunk.size() >= kK) {
                             std::string tail = keep_tail ? chunk.substr(chunk.size() - (kK - 1)) : std::string();
@@ -870,7 +956,7 @@ SegmentStats build_segment(const BuildOptions& o) {
                             if (!queue.push(std::move(it))) aborted = true;
                             chunk = std::move(tail);
                             chunk_offset = contig_pos - chunk.size();
-                            chunk.reserve(kChunkBases + kK);
+                            chunk.reserve(chunk_bases + kK);
                         } else if (!keep_tail) {
                             chunk.clear();
                             chunk_offset = contig_pos;
@@ -892,14 +978,14 @@ SegmentStats build_segment(const BuildOptions& o) {
                         }
                         if (!have) throw std::runtime_error("background: " + g.path + ": sequence before the first '>' line");
                         for (std::size_t at = 0; at < line.size();) {   // long lines in pieces, so chunks stay bounded
-                            const std::size_t take = std::min(line.size() - at, kChunkBases - chunk.size());
+                            const std::size_t take = std::min(line.size() - at, chunk_bases - chunk.size());
                             for (std::size_t i = at; i < at + take; ++i) genome_bases += kmer::base_code(line[i]) >= 0;
                             chunk.append(line, at, take);
                             contig_pos += take;
                             at += take;
                             if (contig_pos >= (1ULL << 32) && !lookups.empty())
                                 throw std::runtime_error("background: " + g.path + ": a contig of 4 Gb or more; anchors keep 32-bit positions");
-                            if (chunk.size() >= kChunkBases) ship(true);
+                            if (chunk.size() >= chunk_bases) ship(true);
                         }
                     }
                     if (have) { ship(false); contig_lengths[gi].push_back(contig_pos); }
@@ -1063,11 +1149,19 @@ Segment::Segment(const std::string& segment_dir) : dir_(segment_dir), info_(read
         for (std::uint32_t p = pf.first; p < pf.end; ++p) {
             if (seen[p]++) throw bad("repeats partition " + std::to_string(p));
             const std::uint64_t off = table[2 * (p - pf.first)], size = table[2 * (p - pf.first) + 1];
-            if (off < data_start || size < 7 || off + size > total) throw bad("has a partition outside the file");
-            const ef::View codes(w + off);
-            if (codes.words() + 1 > size) throw bad("has a corrupt partition");
+            if (off < data_start || size < 7 || size > total || off > total - size) throw bad("has a partition outside the file");
+            // the Elias-Fano header's fields must agree with each other and fit the partition's words
+            const std::uint64_t* h = w + off;
+            const std::uint64_t n = h[0], lb = h[1], max_high = h[2], hw = h[3], sc = h[4], lw = h[5];
+            if (lb > 62 || n > size * 64 || max_high > (std::uint64_t{1} << 62) || hw != (n + max_high + 1 + 63) / 64 ||
+                lw != (n * lb + 63) / 64 || sc == 0 || sc > hw * 64 / ef::kSelectSample + 1 || 6 + hw + sc + lw + 1 > size)
+                throw bad("has a corrupt partition");
+            const ef::View codes(h);
+            const std::uint64_t ch = w[off + codes.words()];
+            const std::uint64_t width = ch & 0xff, n_exc = ch >> 8;
+            if ((n > 0 && (width == 0 || width > 64)) || n_exc > n || 1 + (n * width + 63) / 64 + 2 * n_exc + codes.words() != size)
+                throw bad("has a corrupt partition");
             const counts::View cnt(w + off + codes.words(), codes.size());
-            if (codes.words() + cnt.words() != size) throw bad("has a corrupt partition");
             where_[p] = {w + off, size};
         }
     }

@@ -293,13 +293,14 @@ void write_segment_anchors(const std::string& path, const ReferenceAnchors& ref,
         first[a] = places.size() / kPlaceBytes;
         while (h < hits.size() && hits[h].anchor == a) {
             std::size_t e = h;
-            while (e < hits.size() && hits[e].anchor == a && hits[e].genome == hits[h].genome) ++e;
+            // capped per genome and contig: a graph genome's haplotypes are its contigs, each its own copy
+            while (e < hits.size() && hits[e].anchor == a && hits[e].genome == hits[h].genome && hits[e].contig == hits[h].contig) ++e;
             const bool repeated = e - h > kMaxOccurrences;
             for (std::size_t i = h; i < (repeated ? h + 1 : e); ++i) {
                 unsigned char rec[kPlaceBytes];
                 const std::uint16_t g = static_cast<std::uint16_t>(hits[i].genome);
                 const std::uint16_t flags = static_cast<std::uint16_t>((hits[i].forward ? kForward : 0) | (repeated ? kRepeated : 0));
-                const std::uint32_t c = repeated ? 0 : hits[i].contig, p = repeated ? 0 : hits[i].pos;
+                const std::uint32_t c = hits[i].contig, p = repeated ? 0 : hits[i].pos;
                 std::memcpy(rec, &g, 2); std::memcpy(rec + 2, &flags, 2); std::memcpy(rec + 4, &c, 4); std::memcpy(rec + 8, &p, 4);
                 places.append(reinterpret_cast<const char*>(rec), kPlaceBytes);
             }
@@ -374,7 +375,7 @@ void SegmentAnchors::places(std::size_t a, std::vector<Place>& out) const {
         p.repeated = (flags & kRepeated) != 0;
         p.contig = get32(rec + 4);
         p.pos = get32(rec + 8);
-        if (p.genome >= genomes_.size() || (!p.repeated && p.contig >= contigs_[p.genome].size()))
+        if (p.genome >= genomes_.size() || p.contig >= contigs_[p.genome].size())
             throw std::runtime_error("anchors: a place outside its genome's contigs");
         out.push_back(p);
     }
@@ -410,7 +411,7 @@ void merge_segment_anchors(const std::vector<std::string>& inputs, const Referen
             for (const Place& p : ps) {
                 if (p.repeated) {   // keep the marker: more than kMaxOccurrences + 1 identical entries
                     for (std::size_t r = 0; r <= kMaxOccurrences; ++r)
-                        hits.push_back({static_cast<std::uint32_t>(a), genome_base[s] + p.genome, 0, static_cast<std::uint32_t>(r), p.forward});
+                        hits.push_back({static_cast<std::uint32_t>(a), genome_base[s] + p.genome, p.contig, static_cast<std::uint32_t>(r), p.forward});
                 } else {
                     hits.push_back({static_cast<std::uint32_t>(a), genome_base[s] + p.genome, p.contig, p.pos, p.forward});
                 }
@@ -463,7 +464,9 @@ std::vector<Span> locate(const ReferenceAnchors& ref, const std::vector<const Se
         }
         for (std::size_t g = 0; g < groups.size(); ++g) {
             std::vector<Span> spans;
-            for (auto& [key, pts] : groups[g]) {
+            for (auto& group : groups[g]) {
+                const auto& key = group.first;
+                auto& pts = group.second;
                 const bool same = key.second;
                 std::sort(pts.begin(), pts.end(), [](const Point& a, const Point& b) { return a.ref_pos != b.ref_pos ? a.ref_pos < b.ref_pos : a.pos < b.pos; });
                 const std::size_t n = pts.size();
@@ -504,7 +507,7 @@ std::vector<Span> locate(const ReferenceAnchors& ref, const std::vector<const Se
                     }
                     if (inside < required || (required == 0 && (before == SIZE_MAX || after == SIZE_MAX))) continue;
                     // the copy on the genome, in reference terms: left = reference start side
-                    std::uint64_t lo, hi;
+                    std::uint64_t lo, hi, ilo, ihi;
                     auto gpos = [&](std::size_t j) { return pts[j].pos; };
                     auto extend = [&](std::size_t inner, std::size_t flank_j, std::uint64_t ref_boundary, bool left) {
                         // genome position bounding the copy on the reference's `left` side
@@ -526,9 +529,13 @@ std::vector<Span> locate(const ReferenceAnchors& ref, const std::vector<const Se
                         const std::uint64_t b = extend(last_in, after, end, false);
                         lo = std::min({a, b, gpos(first_in), gpos(last_in)});
                         hi = std::max({a, b, gpos(first_in), gpos(last_in)});
+                        ilo = std::min(gpos(first_in), gpos(last_in));
+                        ihi = std::max(gpos(first_in), gpos(last_in));
                     } else {   // an interval without inside anchors: between the nearest flanks
                         lo = std::min(gpos(before), gpos(after));
                         hi = std::max(gpos(before), gpos(after));
+                        ilo = lo;
+                        ihi = hi;
                     }
                     Span sp;
                     sp.genome = sa.genomes()[g];
@@ -538,6 +545,8 @@ std::vector<Span> locate(const ReferenceAnchors& ref, const std::vector<const Se
                     sp.forward = same;
                     sp.anchors_inside = inside;
                     sp.anchors_flank = flanks;
+                    sp.inner_start = ilo;
+                    sp.inner_end = std::min(ihi + kK, sp.end);
                     spans.push_back(sp);
                 }
             }
@@ -549,6 +558,8 @@ std::vector<Span> locate(const ReferenceAnchors& ref, const std::vector<const Se
                     Span& j = joined.back();
                     if (sp.anchors_inside > j.anchors_inside) j.forward = sp.forward;
                     j.end = std::max(j.end, sp.end);
+                    j.inner_start = std::min(j.inner_start, sp.inner_start);
+                    j.inner_end = std::max(j.inner_end, sp.inner_end);
                     j.anchors_inside += sp.anchors_inside;
                     j.anchors_flank += sp.anchors_flank;
                     j.chains += sp.chains;

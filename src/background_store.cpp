@@ -111,32 +111,49 @@ Manifest read_manifest(const std::string& store_dir) {
 
 void write_manifest(const std::string& store_dir, const Manifest& m) {
     const std::string path = (fs::path(store_dir) / "manifest.json").string(), tmp = path + ".tmp";
-    {
-        std::ofstream o(tmp);
-        o << "{\n  \"format\": \"panvar-background\",\n  \"version\": 2,\n  \"store_id\": " << json::quote(m.store_id)
-          << ",\n  \"generation\": " << m.generation << ",\n  \"k\": " << kK << ",\n  \"minimizer\": " << kM
-          << ",\n  \"partitions\": " << m.partitions << ",\n  \"next_segment\": " << m.next_segment << ",\n  \"coordinate_references\": [";
-        for (std::size_t i = 0; i < m.references.size(); ++i)
-            o << (i ? ", " : "") << "{\"name\": " << json::quote(m.references[i].first) << ", \"fingerprint\": \"" << hex64(m.references[i].second) << "\"}";
-        o << "],\n  \"segments\": [";
-        for (std::size_t s = 0; s < m.segments.size(); ++s) {
-            const auto& ms = m.segments[s];
-            o << (s ? "," : "") << "\n    {\"dir\": " << json::quote(ms.dir) << ", \"distinct\": " << ms.distinct
-              << ", \"occurrences\": " << ms.occurrences << ", \"genomes\": [";
-            for (std::size_t g = 0; g < ms.genomes.size(); ++g) {
-                const auto& ge = ms.genomes[g];
-                o << (g ? "," : "") << "\n      {\"name\": " << json::quote(ge.name) << ", \"path\": " << json::quote(ge.path)
-                  << ", \"bytes\": " << ge.bytes << ", \"checksum\": " << json::quote(ge.checksum) << "}";
-            }
-            o << "]}";
+    std::ostringstream o;
+    o << "{\n  \"format\": \"panvar-background\",\n  \"version\": 2,\n  \"store_id\": " << json::quote(m.store_id)
+      << ",\n  \"generation\": " << m.generation << ",\n  \"k\": " << kK << ",\n  \"minimizer\": " << kM
+      << ",\n  \"partitions\": " << m.partitions << ",\n  \"next_segment\": " << m.next_segment << ",\n  \"coordinate_references\": [";
+    for (std::size_t i = 0; i < m.references.size(); ++i)
+        o << (i ? ", " : "") << "{\"name\": " << json::quote(m.references[i].first) << ", \"fingerprint\": \"" << hex64(m.references[i].second) << "\"}";
+    o << "],\n  \"segments\": [";
+    for (std::size_t s = 0; s < m.segments.size(); ++s) {
+        const auto& ms = m.segments[s];
+        o << (s ? "," : "") << "\n    {\"dir\": " << json::quote(ms.dir) << ", \"distinct\": " << ms.distinct
+          << ", \"occurrences\": " << ms.occurrences << ", \"genomes\": [";
+        for (std::size_t g = 0; g < ms.genomes.size(); ++g) {
+            const auto& ge = ms.genomes[g];
+            o << (g ? "," : "") << "\n      {\"name\": " << json::quote(ge.name) << ", \"path\": " << json::quote(ge.path)
+              << ", \"bytes\": " << ge.bytes << ", \"checksum\": " << json::quote(ge.checksum) << "}";
         }
-        o << "\n  ]\n}\n";
-        o.flush();
-        if (!o) throw std::runtime_error("background: cannot write " + tmp);
+        o << "]}";
     }
-    fsync_path(tmp);
+    o << "\n  ]\n}\n";
+    write_file_durably(tmp, o.str());
     fs::rename(tmp, path);
     fsync_path(store_dir);
+}
+
+void write_file_durably(const std::string& path, const std::string& content) {
+    std::FILE* f = std::fopen(path.c_str(), "wb");
+    if (f == nullptr) throw std::runtime_error("background: cannot write " + path + ": " + std::strerror(errno));
+    const bool ok = std::fwrite(content.data(), 1, content.size(), f) == content.size() && std::fflush(f) == 0 && ::fsync(fileno(f)) == 0;
+    const int e = errno;
+    if (std::fclose(f) != 0 || !ok) {
+        std::error_code ec;
+        fs::remove(path, ec);
+        throw std::runtime_error("background: cannot write " + path + ": " + std::strerror(ok ? errno : e));
+    }
+}
+
+std::uint64_t content_id(const Manifest& m) {
+    std::vector<std::string> g;
+    for (const auto& s : m.segments) for (const auto& ge : s.genomes) g.push_back(ge.name + "\t" + ge.checksum);
+    std::sort(g.begin(), g.end());
+    std::uint64_t h = 0x84222325cbf29ce4ULL ^ m.partitions;
+    for (const auto& x : g) for (const char c : x) h = kmer::mix64(h ^ static_cast<unsigned char>(c));
+    return h;
 }
 
 Store::Store(const std::string& store_dir) : manifest_(read_manifest(store_dir)) {

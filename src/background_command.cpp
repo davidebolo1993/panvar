@@ -55,8 +55,8 @@ void print_background_help() {
         << "      --merge             Merge the store's segments into one\n"
         << "      --range I/N         Merge only the I-th of N partition ranges (0-based); the last to finish commits\n"
         << "      --compact           Write a merged store as an SSHash dictionary, <store>.sshash\n"
-        << "      --local-strings     --compact building strings within partitions, then gluing them: no random\n"
-        << "                          access to the store (for stores larger than memory; slower otherwise)\n"
+        << "      --local-strings     --compact building strings within partitions, then gluing them: never reads\n"
+        << "                          across partitions, but holds every path in memory; slower\n"
         << "      --minimizer <N>     SSHash minimizer length for --compact (default: from the k-mer count)\n"
         << "      --dump <path>       Write every k-mer and its count (segments summed) as TSV\n"
         << "      --verify <path>     Check that a background (store or .sshash) holds exactly this store's\n"
@@ -95,12 +95,21 @@ void check_name(const std::string& what, const std::string& n) {
         throw std::runtime_error(what + " '" + n + "': use letters, digits, '.', '_' and '-' (not starting with '.'), at most 100");
 }
 
-// Test hook: PANVAR_TEST_FAIL_AT=<point> ends the process abruptly there, as a kill would.
+// Test hooks: PANVAR_TEST_FAIL_AT=<point> ends the process abruptly there, as a kill would;
+// PANVAR_TEST_WAIT_AT=<point>:<file> waits there (up to two minutes) until <file> exists, so a test can
+// slot another job in at that moment.
 void fail_point(const char* point) {
     const char* at = std::getenv("PANVAR_TEST_FAIL_AT");
     if (at != nullptr && std::string(at) == point) {
         std::fflush(nullptr);
         std::_Exit(137);
+    }
+    const char* wait = std::getenv("PANVAR_TEST_WAIT_AT");
+    if (wait != nullptr) {
+        const std::string w(wait);
+        const auto colon = w.find(':');
+        if (colon != std::string::npos && w.substr(0, colon) == point)
+            for (int i = 0; i < 1200 && !fs::exists(w.substr(colon + 1)); ++i) std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
 }
 
@@ -189,6 +198,46 @@ void add_anchor_record(const fs::path& seg_dir, const std::string& ref, std::uin
                            info.anchor_sets.end());
     info.anchor_sets.emplace_back(ref, fp);
     bg::write_segment_info(seg_dir.string(), info);
+}
+
+// A copy of a segment folder at dst: files hard-linked where the filesystem allows, else copied.
+void link_or_copy_dir(const fs::path& src, const fs::path& dst) {
+    fs::create_directories(dst);
+    for (const auto& e : fs::directory_iterator(src)) {
+        if (!e.is_regular_file() || e.path().filename() == "job.lock") continue;
+        std::error_code ec;
+        fs::create_hard_link(e.path(), dst / e.path().filename(), ec);
+        if (ec) fs::copy_file(e.path(), dst / e.path().filename(), fs::copy_options::overwrite_existing);
+    }
+}
+
+// Maps genomes of committed segments on a reference into anchor files under `dir` (one per segment, named
+// after it), skipping segments already mapped there.
+void map_segments(const std::string& out, const std::vector<bg::ManifestSegment>& segs, const anchors::ReferenceAnchors& ref,
+                  const fs::path& dir, const std::string& suffix, std::size_t threads, cli::RunLog& log) {
+    for (const auto& s : segs) {
+        const fs::path f = dir / (s.dir + suffix);
+        if (fs::exists(f)) continue;
+        map_segment(bg::read_segment_info((fs::path(out) / s.dir).string()), ref, f.string(), threads, log);
+    }
+}
+
+// Genome identity: a name, or a sequence, already in the store.
+void check_new_genomes(const bg::Manifest& m, const std::vector<bg::Genome>& genomes) {
+    std::map<std::string, std::string> by_checksum;
+    std::set<std::string> names;
+    for (const auto& s : m.segments)
+        for (const auto& g : s.genomes) { names.insert(g.name); if (!g.checksum.empty()) by_checksum[g.checksum] = g.name; }
+    for (const auto& g : genomes) {
+        if (names.count(g.name)) throw std::runtime_error("background: genome " + g.name + " is already in the store");
+        if (!g.checksum.empty()) {
+            const auto it = by_checksum.find(g.checksum);
+            if (it != by_checksum.end())
+                throw std::runtime_error("background: genome " + g.name + " has the same sequence as " + it->second + ", already counted");
+            by_checksum[g.checksum] = g.name;
+        }
+        names.insert(g.name);
+    }
 }
 
 struct Staging {
@@ -363,6 +412,17 @@ int run_background_command(const std::vector<std::string>& args) {
                     log.info("differs: " + kmer::decode(codes[i], bg::kK) + " " + std::to_string(counts[i]) + " vs " + std::to_string(got[i]));
             }
         }
+        // random k-mers absent from this store must be absent there too
+        std::uint64_t x = 0x243f6a8885a308d3ULL, absent = 0, absent_wrong = 0;
+        std::vector<std::uint64_t> probe;
+        for (int t = 0; t < 1000000; ++t) {
+            x = kmer::mix64(x + static_cast<std::uint64_t>(t));
+            probe.push_back(kmer::canonical(x & kmer::mask_of(bg::kK), bg::kK));
+        }
+        const auto here = store.count_batch(probe), there = other->count_batch(probe);
+        for (std::size_t i = 0; i < probe.size(); ++i) if (here[i] == 0) { ++absent; absent_wrong += there[i] != 0; }
+        log.info(std::to_string(absent) + " random absent k-mers: " + std::to_string(absent_wrong) + " found there");
+        wrong += absent_wrong;
         const std::uint64_t other_distinct = other->distinct();
         log.info("checked " + std::to_string(checked) + " k-mers: " + std::to_string(wrong) + " differ; " + verify + " holds " +
                  std::to_string(other_distinct) + " distinct k-mers, this store " + std::to_string(checked));
@@ -386,6 +446,8 @@ int run_background_command(const std::vector<std::string>& args) {
         co.log = [&](const std::string& m) { log.info(m); };
         bg::CompactStats st;
         {
+            const bg::JobLock one_at_a_time((fs::path(out) / ".compact").string());   // throws when another --compact runs
+            fail_point("compact-locked");
             Staging tmp{co.tmp_dir, std::make_unique<bg::JobLock>(co.tmp_dir)};
             st = bg::compact_store(co);
         }
@@ -409,7 +471,17 @@ int run_background_command(const std::vector<std::string>& args) {
             const std::string name = e.path().filename().string();
             if (e.is_directory() && name.rfind("seg-", 0) == 0 && !listed.count(name)) remove(e.path());
             else if (e.is_directory() && (name.rfind("panvar-background-", 0) == 0 || name.rfind("panvar-compact-", 0) == 0) && !bg::job_alive(e.path().string())) remove(e.path());
-            else if (e.is_directory() && name.rfind(".merge-", 0) == 0 && name.rfind(".merge-" + std::to_string(m.generation) + "-", 0) != 0) remove(e.path());
+            else if (e.is_directory() && name.rfind(".merge-", 0) == 0) {
+                // a merge stays while every segment it plans is listed, or while one of its range jobs runs
+                bool live = false, plan_ok = true;
+                std::ifstream plan(e.path() / "plan.txt");
+                std::string d;
+                std::size_t planned = 0;
+                while (std::getline(plan, d)) if (!d.empty()) { ++planned; plan_ok = plan_ok && listed.count(d); }
+                std::error_code ec2;
+                for (const auto& r : fs::directory_iterator(e.path(), ec2)) live = live || (r.is_directory() && bg::job_alive(r.path().string()));
+                if (!live && (planned == 0 || !plan_ok)) remove(e.path());
+            }
             else if (!e.is_directory() && name.size() > 4 && name.compare(name.size() - 4, 4, ".tmp") == 0) remove(e.path());
         }
         for (const auto& e : fs::directory_iterator(fs::path(out) / ".staging", ec))
@@ -433,7 +505,32 @@ int run_background_command(const std::vector<std::string>& args) {
             ranges = static_cast<std::uint32_t>(n);
             all_ranges = false;
         }
-        const fs::path mdir = fs::path(out) / (".merge-" + std::to_string(m.generation) + "-" + std::to_string(ranges));
+        // A merge of N ranges already under way, whose planned segments are all still listed, is joined: its
+        // plan stands even if segments were added since. Otherwise a new merge plans the segments listed now.
+        fs::path mdir;
+        {
+            std::map<std::string, bg::ManifestSegment> listed;
+            for (const auto& s : m.segments) listed[s.dir] = s;
+            std::error_code ec;
+            for (const auto& e : fs::directory_iterator(out, ec)) {
+                const std::string name = e.path().filename().string();
+                const std::string suffix = "-" + std::to_string(ranges);
+                if (!e.is_directory() || name.rfind(".merge-", 0) != 0 || name.size() <= suffix.size() ||
+                    name.compare(name.size() - suffix.size(), suffix.size(), suffix) != 0)
+                    continue;
+                std::ifstream in(e.path() / "plan.txt");
+                std::vector<bg::ManifestSegment> planned;
+                bool ok = static_cast<bool>(in);
+                for (std::string d; ok && std::getline(in, d);) {
+                    if (d.empty()) continue;
+                    const auto it = listed.find(d);
+                    if (it == listed.end()) ok = false;
+                    else planned.push_back(it->second);
+                }
+                if (ok && planned.size() > 1) { mdir = e.path(); m.segments = planned; break; }
+            }
+        }
+        if (mdir.empty()) mdir = fs::path(out) / (".merge-" + std::to_string(m.generation) + "-" + std::to_string(ranges));
         fs::create_directories(mdir);
         std::vector<std::string> seg_dirs;
         std::string plan;
@@ -506,69 +603,87 @@ int run_background_command(const std::vector<std::string>& args) {
         {
             const bg::StoreLock lock(out);
             bg::Manifest now = bg::read_manifest(out);
-            if (now.generation != m.generation) {
-                if (!fs::exists(mdir)) { log.info("merge: another job committed it"); log.done(); return 0; }
-                throw std::runtime_error("background: the store changed during the merge; run --merge again (and --clean)");
-            }
+            if (!fs::exists(mdir)) { log.info("merge: another job committed it"); log.done(); return 0; }
+            // the merge replaces the segments it planned; segments committed since stay as they are
+            std::set<std::string> planned, listed;
+            for (const auto& s : m.segments) planned.insert(s.dir);
+            for (const auto& s : now.segments) listed.insert(s.dir);
+            for (const auto& d : planned)
+                if (!listed.count(d)) throw std::runtime_error("background: " + d + " left the store during the merge; run --merge again (and --clean)");
+            if (now.references != m.references) throw std::runtime_error("background: the coordinate references changed during the merge; run --merge again");
             std::error_code ec;
             for (std::uint32_t i = 0; i < ranges; ++i) fs::remove_all(mdir / ("range-" + std::to_string(i)), ec);
             fs::remove(mdir / "plan.txt", ec);
             const std::string dir = take_segment_name(out, now);
             fs::rename(mdir, fs::path(out) / dir);
             fs::remove_all(fs::path(out) / dir / "commit", ec);
-            for (const auto& s : now.segments) old.push_back(s.dir);
             bg::ManifestSegment ms;
             ms.dir = dir;
             ms.distinct = info.distinct;
             ms.occurrences = info.occurrences;
             ms.genomes = info.genomes;
-            now.segments = {ms};
+            std::vector<bg::ManifestSegment> kept = {ms};
+            for (const auto& s : now.segments) {
+                if (planned.count(s.dir)) old.push_back(s.dir);
+                else kept.push_back(s);
+            }
+            now.segments = kept;
             ++now.generation;
             fail_point("merge-before-manifest");
             bg::write_manifest(out, now);
             log.info("merged into " + dir + ": " + std::to_string(info.distinct) + " distinct 31-mers");
         }
         fail_point("merge-after-commit");
-        for (const auto& d : old) { std::error_code ec; fs::remove_all(fs::path(out) / d, ec); }
+        // the merged-away segments stay on disk: jobs still reading them would fail; --clean removes them
+        log.info("the " + std::to_string(old.size()) + " merged-away segments stay until --clean (run it when no job reads the store)");
         log.wrote({(fs::path(out) / "manifest.json").string()});
         log.done();
         return 0;
     }
 
     if (!attach.empty()) {
+        // everything is checked first, then each segment is linked (or copied) into the store, the manifest
+        // committed, and only then are the sources removed: a failure or a kill leaves them where they were
+        std::vector<bg::SegmentInfo> infos;
+        for (const auto& a : attach) {
+            infos.push_back(bg::read_segment_info(a));
+            const bg::Segment check(a);   // complete and readable
+        }
         const bg::StoreLock lock(out);
         bg::Manifest m = bg::read_manifest(out);
-        std::set<std::string> names;
-        for (const auto& s : m.segments) for (const auto& g : s.genomes) names.insert(g.name);
-        for (const auto& a : attach) {
-            const bg::SegmentInfo info = bg::read_segment_info(a);
-            if (info.partitions != m.partitions) throw std::runtime_error("background: " + a + " has " + std::to_string(info.partitions) + " partitions, the store " + std::to_string(m.partitions));
-            for (const auto& [name, fp] : m.references) {
+        std::vector<bg::Genome> incoming;
+        for (std::size_t i = 0; i < attach.size(); ++i) {
+            const auto& info = infos[i];
+            if (bg::job_alive(attach[i])) throw std::runtime_error("background: " + attach[i] + " is still being built");
+            if (info.partitions != m.partitions) throw std::runtime_error("background: " + attach[i] + " has " + std::to_string(info.partitions) + " partitions, the store " + std::to_string(m.partitions));
+            for (const auto& ref_entry : m.references) {
+                const std::string& name = ref_entry.first;
+                const std::uint64_t fp = ref_entry.second;
                 const auto it = std::find_if(info.anchor_sets.begin(), info.anchor_sets.end(), [&](const auto& x) { return x.first == name; });
                 if (it == info.anchor_sets.end() || it->second != fp)
-                    throw std::runtime_error("background: " + a + " lacks the anchors of " + name + " (build it with --segment-only against this store)");
+                    throw std::runtime_error("background: " + attach[i] + " lacks the anchors of " + name + " (build it with --segment-only against this store)");
+                anchors::SegmentAnchors((fs::path(attach[i]) / ("anchors-" + name + ".bin")).string());
             }
-            for (const auto& g : info.genomes) if (!names.insert(g.name).second) throw std::runtime_error("background: genome " + g.name + " is already in the store");
-            {
-                const bg::Segment check(a);   // complete and readable
-                for (const auto& [name, fp] : m.references) anchors::SegmentAnchors((fs::path(a) / ("anchors-" + name + ".bin")).string());
-            }
-            const std::string dir = take_segment_name(out, m);
-            const fs::path dst = fs::path(out) / dir;
-            std::error_code ec;
-            fs::rename(a, dst, ec);
-            if (ec) {   // another filesystem: copy, then remove the source
-                const fs::path tmp = fs::path(out) / ".staging" / ("attach-" + random_id());
-                fs::create_directories(tmp.parent_path());
-                fs::copy(a, tmp, fs::copy_options::recursive);
-                fs::rename(tmp, dst);
-                fs::remove_all(a, ec);
-            }
-            m.segments.push_back({dir, info.distinct, info.occurrences, info.genomes});
-            log.info("attached " + a + " as " + dir);
+            incoming.insert(incoming.end(), info.genomes.begin(), info.genomes.end());
         }
-        ++m.generation;
-        bg::write_manifest(out, m);
+        check_new_genomes(m, incoming);
+        std::vector<std::string> made;
+        try {
+            for (std::size_t i = 0; i < attach.size(); ++i) {
+                const std::string dir = take_segment_name(out, m);
+                link_or_copy_dir(attach[i], fs::path(out) / dir);
+                made.push_back(dir);
+                m.segments.push_back({dir, infos[i].distinct, infos[i].occurrences, infos[i].genomes});
+                log.info("attaching " + attach[i] + " as " + dir);
+            }
+            ++m.generation;
+            fail_point("attach-before-manifest");
+            bg::write_manifest(out, m);
+        } catch (...) {
+            for (const auto& d : made) { std::error_code ec; fs::remove_all(fs::path(out) / d, ec); }
+            throw;
+        }
+        for (const auto& a : attach) { std::error_code ec; fs::remove_all(a, ec); }
         log.wrote({(fs::path(out) / "manifest.json").string()});
         log.done();
         return 0;
@@ -586,12 +701,21 @@ int run_background_command(const std::vector<std::string>& args) {
         st.lock = std::make_unique<bg::JobLock>(st.dir.string());
         const anchors::ReferenceAnchors ref = anchors::build_reference(coordinate_reference, rg->path, threads, [&](const std::string& s) { log.info(s); });
         anchors::save(ref, (st.dir / "reference.anc").string());
-        for (const auto& s : m.segments)
-            map_segment(bg::read_segment_info((fs::path(out) / s.dir).string()), ref, (st.dir / (s.dir + ".bin")).string(), threads, log);
-        fail_point("reference-before-commit");
-        const bg::StoreLock lock(out);
-        bg::Manifest now = bg::read_manifest(out);
-        if (now.generation != m.generation) throw std::runtime_error("background: the store changed meanwhile; run again");
+        // segments committed while mapping are mapped in turn before the commit
+        std::unique_ptr<bg::StoreLock> lock;
+        bg::Manifest now = m;
+        for (int round = 0;; ++round) {
+            map_segments(out, now.segments, ref, st.dir, ".bin", threads, log);
+            fail_point("reference-before-commit");
+            lock = std::make_unique<bg::StoreLock>(out);
+            now = bg::read_manifest(out);
+            for (const auto& r : now.references) if (r.first == coordinate_reference) throw std::runtime_error("background: another job added " + coordinate_reference);
+            bool all = true;
+            for (const auto& s : now.segments) all = all && fs::exists(st.dir / (s.dir + ".bin"));
+            if (all) break;
+            if (round == 20) throw std::runtime_error("background: the store keeps changing; run again later");
+            lock.reset();
+        }
         for (const auto& s : now.segments) {
             const fs::path sd = fs::path(out) / s.dir;
             fs::rename(st.dir / (s.dir + ".bin"), sd / ("anchors-" + coordinate_reference + ".bin"));
@@ -625,7 +749,22 @@ int run_background_command(const std::vector<std::string>& args) {
     bg::Manifest m = bg::read_manifest(out);
     if (exists && !add && segment_only.empty() && !m.segments.empty()) throw std::runtime_error(out + " already holds a store: --add adds a segment to it");
     if (partitions_given && partitions != m.partitions) throw std::runtime_error("background: the store has " + std::to_string(m.partitions) + " partitions");
-    for (const auto& s : m.segments) for (const auto& g : s.genomes) if (given.count(g.name)) throw std::runtime_error("background: genome " + g.name + " is already in the store");
+    check_new_genomes(m, genomes);   // names now; sequences once counted
+    for (const auto& s : m.segments)
+        for (const auto& g : s.genomes)
+            for (const auto& n : genomes)
+                if (fs::path(g.path) == fs::path(n.path)) throw std::runtime_error("background: " + n.path + " is already counted as " + g.name);
+    // --segment-only claims its folder: it must not exist; a job lock inside keeps a second job out
+    std::unique_ptr<bg::JobLock> claim;
+    bool claimed = false;
+    if (!segment_only.empty()) {
+        std::error_code ec;
+        if (!fs::create_directory(fs::absolute(segment_only), ec) || ec)
+            throw std::runtime_error("background: --segment-only " + segment_only + " exists already (or cannot be made); give a new folder");
+        claimed = true;
+        try { claim = std::make_unique<bg::JobLock>(fs::absolute(segment_only).string()); }
+        catch (...) { fs::remove(fs::absolute(segment_only), ec); throw; }
+    }
 
     // anchors: the store's references, plus a new one among these genomes
     auto refs = load_references(out, m);
@@ -664,13 +803,15 @@ int run_background_command(const std::vector<std::string>& args) {
         stats = bg::build_segment(o);
     } catch (...) {
         std::error_code ec;
-        if (!segment_only.empty()) fs::remove_all(o.segment_dir, ec);
+        if (claimed) { claim.reset(); fs::remove_all(o.segment_dir, ec); }   // only the folder this job made
         throw;
     }
     const std::string summary = std::to_string(stats.distinct) + " distinct 31-mers of " + std::to_string(stats.kmers) + " occurrences, " +
         human_bytes(stats.bytes) + "; spill " + human_bytes(stats.spill_bytes) + " in " + std::to_string(stats.spill_files) + " files" +
         (stats.run_bytes > 0 ? ", runs " + human_bytes(stats.run_bytes) : "");
     if (!segment_only.empty()) {
+        fail_point("segment-built");
+        { std::error_code ec; claim.reset(); fs::remove(fs::path(o.segment_dir) / "job.lock", ec); }
         log.info("segment " + o.segment_dir + ": " + summary + " (commit it with --attach)");
         log.wrote({o.segment_dir});
         log.done();
@@ -678,11 +819,37 @@ int run_background_command(const std::vector<std::string>& args) {
     }
     fail_point("count-before-commit");
     {
-        const bg::StoreLock lock(out);
-        bg::Manifest now = bg::read_manifest(out);
-        if (now.references != m.references) throw std::runtime_error("background: the store's coordinate references changed meanwhile; run again");
-        if (new_ref && now.generation != m.generation) throw std::runtime_error("background: the store changed while a coordinate reference was added; run again");
-        for (const auto& s : now.segments) for (const auto& g : s.genomes) if (given.count(g.name)) throw std::runtime_error("background: genome " + g.name + " was added meanwhile");
+        // References added to the store meanwhile are mapped in this segment; with a new reference, segments
+        // committed meanwhile are mapped on it. Then the commit is tried again.
+        std::unique_ptr<bg::StoreLock> lock;
+        bg::Manifest now;
+        bg::SegmentInfo mine = bg::read_segment_info(o.segment_dir);
+        for (int round = 0;; ++round) {
+            lock = std::make_unique<bg::StoreLock>(out);
+            now = bg::read_manifest(out);
+            check_new_genomes(now, mine.genomes);
+            std::vector<std::pair<std::string, std::uint64_t>> missing;
+            for (const auto& r : now.references) {
+                const bool have = std::any_of(mine.anchor_sets.begin(), mine.anchor_sets.end(), [&](const auto& x) { return x == r; });
+                if (!have) missing.push_back(r);
+            }
+            if (new_ref)
+                for (const auto& r : now.references) if (r.first == coordinate_reference) throw std::runtime_error("background: another job added " + coordinate_reference);
+            bool unmapped = false;
+            if (new_ref) for (const auto& s : now.segments) unmapped = unmapped || !fs::exists(st.dir / (s.dir + ".anchors"));
+            if (missing.empty() && !unmapped) break;
+            if (round == 20) throw std::runtime_error("background: the store keeps changing; run again later");
+            lock.reset();
+            for (const auto& [name, fp] : missing) {
+                const anchors::ReferenceAnchors r = anchors::load_reference(ref_path(out, name).string());
+                if (r.fingerprint() != fp) throw std::runtime_error("background: the anchor set of " + name + " does not match the manifest");
+                map_segment(mine, r, (fs::path(o.segment_dir) / ("anchors-" + name + ".bin")).string(), threads, log);
+                mine.anchor_sets.emplace_back(name, fp);
+                bg::write_segment_info(o.segment_dir, mine);
+                log.info("mapped this segment on " + name + ", added to the store meanwhile");
+            }
+            if (new_ref) map_segments(out, now.segments, *new_ref, st.dir, ".anchors", threads, log);
+        }
         if (new_ref) {
             for (const auto& s : now.segments) {
                 const fs::path sd = fs::path(out) / s.dir;
@@ -695,8 +862,7 @@ int run_background_command(const std::vector<std::string>& args) {
         }
         const std::string dir = take_segment_name(out, now);
         fs::rename(o.segment_dir, fs::path(out) / dir);
-        const bg::SegmentInfo info = bg::read_segment_info((fs::path(out) / dir).string());
-        now.segments.push_back({dir, info.distinct, info.occurrences, info.genomes});
+        now.segments.push_back({dir, mine.distinct, mine.occurrences, mine.genomes});
         ++now.generation;
         fail_point("commit-before-manifest");
         bg::write_manifest(out, now);

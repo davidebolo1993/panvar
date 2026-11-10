@@ -9,6 +9,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -33,6 +34,18 @@ std::vector<anchors::Hit> graph_anchors(const std::string& gfa, const anchors::A
 
 // The haplotype contig names and lengths, in the order counting and anchoring index them.
 std::vector<std::string> graph_contigs(const std::string& gfa, std::vector<std::uint64_t>* lengths = nullptr);
+
+// A graph's haplotypes, held to read stretches of them by contig coordinates.
+class Haplotypes {
+public:
+    explicit Haplotypes(const std::string& gfa);
+    ~Haplotypes();
+    // The bases of [start, end) of a haplotype contig (W-line coordinates include the walk's start offset).
+    std::string fetch(const std::string& contig, std::uint64_t start, std::uint64_t end) const;
+private:
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
+};
 
 // The haplotypes spelled as FASTA (for checks).
 void spell_graph(const std::string& gfa, const std::string& fasta_out);

@@ -32,6 +32,12 @@ truth t_ref_g1 data/ref.fa data/g1.fa
 truth t_12 data/ref.fa data/g1.fa data/g2.fa
 truth t_123 data/ref.fa data/g1.fa data/g2.fa data/g3.fa
 truth t_all data/ref.fa data/g1.fa data/g2.fa data/g3.fa data/g4.fa
+# more genomes, each a sequence no other file has
+cat data/g4.fa data/g1.fa > data/g4b.fa
+cat data/g1.fa data/g3.fa > data/g6.fa
+cat data/g2.fa data/g3.fa > data/g7.fa
+cat data/g2.fa data/g4.fa > data/g5.fa
+cp data/g2.fa data/g2copy.fa
 
 echo "== failed and interrupted runs leave the store as it was"
 "${BG[@]}" -o s --genome ref=data/ref.fa --genome g1=data/g1.fa --coordinate-reference reff 2> err.txt; rc=$?
@@ -55,7 +61,6 @@ check "a genome name already in the store is refused" '[[ $rc -ne 0 ]] && grep -
 
 echo "== two jobs adding at once both commit"
 cp -r s s_conc
-cp data/g4.fa data/g4b.fa
 "${BG[@]}" -o s_conc --add --genome g4=data/g4.fa & p1=$!
 "${BG[@]}" -o s_conc --add --genome g4b=data/g4b.fa & p2=$!
 wait $p1; r1=$?; wait $p2; r2=$?
@@ -68,17 +73,46 @@ check "a segment built for the store is not part of it yet" 'same s t_123 && [[ 
 "${BG[@]}" -o s --attach seg_g4
 check "attached, its genome counts" 'same s t_all && [[ ! -d seg_g4 ]]'
 
+echo "== segment folders and failed attaches leave everything where it was"
+cp -r s s_att
+mkdir -p precious && echo keep > precious/results.txt
+"${BG[@]}" -o s_att --segment-only precious --genome g6=data/g6.fa 2> err.txt; rc=$?
+check "--segment-only refuses a folder that exists, and leaves it alone" '[[ $rc -ne 0 && -f precious/results.txt ]]'
+PANVAR_TEST_WAIT_AT=segment-built:$OUT/go1 "${BG[@]}" -o s_att --segment-only seg_x --genome g6=data/g6.fa & p1=$!
+for _ in $(seq 1 200); do [[ -d seg_x ]] && break; sleep 0.1; done
+"${BG[@]}" -o s_att --segment-only seg_x --genome g7=data/g7.fa 2> err.txt; rc=$?
+touch go1; wait $p1; r1=$?
+check "a second job given the same --segment-only folder is refused; the first completes" '[[ $rc -ne 0 && $r1 -eq 0 ]] && grep -q "g6" seg_x/segment.tsv && ! grep -q "g7" seg_x/segment.tsv'
+"${BG[@]}" -o s_att --segment-only seg_y --genome g2copy=data/g2copy.fa
+"${BG[@]}" -o s_att --attach seg_x seg_y 2> err.txt; rc=$?
+check "attaching a segment whose genome is already counted fails; the other source stays" '[[ $rc -ne 0 && -f seg_x/segment.tsv && -f seg_y/segment.tsv ]] && grep -q "same sequence" err.txt && same s_att t_all'
+PANVAR_TEST_FAIL_AT=attach-before-manifest "${BG[@]}" -o s_att --attach seg_x; rc=$?
+check "an attach killed before its commit: store unchanged, source still there" '[[ $rc -eq 137 && -f seg_x/segment.tsv ]] && same s_att t_all'
+"${BG[@]}" -o s_att --clean && "${BG[@]}" -o s_att --attach seg_x
+truth t_all6 data/ref.fa data/g1.fa data/g2.fa data/g3.fa data/g4.fa data/g6.fa
+check "attached after --clean, its genome counts once" 'same s_att t_all6 && [[ $(on_disk s_att) == $(listed s_att) && ! -d seg_x ]]'
+
 echo "== merging in ranges"
 PANVAR_TEST_FAIL_AT=merge-range "${BG[@]}" -o s --merge --range 0/3; rc=$?
 check "a range job killed after writing its part: store unchanged" '[[ $rc -eq 137 ]] && same s t_all && [[ $(listed s) == 4 ]]'
 "${BG[@]}" -o s --merge --range 1/3 && "${BG[@]}" -o s --merge --range 0/3
 check "two of three ranges done: not committed yet" 'same s t_all && [[ $(listed s) == 4 ]]'
 "${BG[@]}" -o s --merge --range 2/3
-check "the last range commits one segment with the same counts" 'same s t_all && [[ $(listed s) == 1 && $(on_disk s) == 1 ]]'
+check "the last range commits one segment with the same counts" 'same s t_all && [[ $(listed s) == 1 ]]'
+check "the merged-away segments stay for jobs still reading them" '[[ $(on_disk s) == 5 ]]'
+"${BG[@]}" -o s --clean
+check "--clean removes them" '[[ $(on_disk s) == 1 ]] && same s t_all'
+cp -r s_att s_mb
+PANVAR_TEST_FAIL_AT=merge-before-manifest "${BG[@]}" -o s_mb --merge; rc=$?
+check "a merge killed just before its commit: store unchanged" '[[ $rc -eq 137 ]] && same s_mb t_all6 && [[ $(listed s_mb) == 5 ]]'
+"${BG[@]}" -o s_mb --merge --range 0/2 && "${BG[@]}" -o s_mb --add --genome g7=data/g7.fa && "${BG[@]}" -o s_mb --merge --range 1/2
+truth t_all67 data/ref.fa data/g1.fa data/g2.fa data/g3.fa data/g4.fa data/g6.fa data/g7.fa
+check "an --add between range jobs: the merge commits the segments it planned, the new one stays" 'same s_mb t_all67 && [[ $(listed s_mb) == 2 ]]'
 cp -r s s_m2
 "${BG[@]}" -o s_m2 --add --genome g4b=data/g4b.fa
 PANVAR_TEST_FAIL_AT=merge-after-commit "${BG[@]}" -o s_m2 --merge; rc=$?
-check "killed after the merge commit, before the old segments go: counts right" '[[ $rc -eq 137 ]] && same s_m2 t_conc && [[ $(listed s_m2) == 1 && $(on_disk s_m2) == 3 ]]'
+truth t_m2 data/ref.fa data/g1.fa data/g2.fa data/g3.fa data/g4.fa data/g4b.fa
+check "killed after the merge commit: counts right" '[[ $rc -eq 137 ]] && same s_m2 t_m2 && [[ $(listed s_m2) == 1 && $(on_disk s_m2) == 3 ]]'
 "${BG[@]}" -o s_m2 --clean
 check "--clean removes the merged-away segments" '[[ $(on_disk s_m2) == 1 ]]'
 
@@ -91,10 +125,17 @@ check "--verify fails against a store with more k-mers" '[[ $rc -ne 0 ]]'
 "${BG[@]}" -o s --compact --local-strings
 "${BG[@]}" -o s --verify s.sshash; rc=$?
 check "the partition-local string builder gives the same background" '[[ $rc -eq 0 ]]'
+PANVAR_TEST_WAIT_AT=compact-locked:$OUT/go3 "${BG[@]}" -o s --compact & p3=$!
+for _ in $(seq 1 200); do [[ -d s/.compact ]] && break; sleep 0.1; done
+"${BG[@]}" -o s --compact 2> err.txt; rc=$?
+touch go3; wait $p3; r3=$?
+check "a second --compact while one runs is refused; the first completes" '[[ $rc -ne 0 && $r3 -eq 0 ]] && grep -q "in use" err.txt'
 "${BG[@]}" -o s_m2 --compact && cp -r s_m2 s_m3 && cp s_m2.sshash s_m3.sshash
-"${BG[@]}" -o s_m3 --add --genome g5=data/g2.fa
+"${BG[@]}" -o s_m3 --add --genome g5=data/g5.fa
 "${BG[@]}" -o s_m3 --verify s_m3.sshash 2> err.txt; rc=$?
 check "a dictionary compacted before an --add is refused as stale" '[[ $rc -ne 0 ]] && grep -q stale err.txt'
+"${BG[@]}" -o s_m3 --add --genome g5again=data/g5.fa 2> err.txt; rc=$?
+check "a genome under a new name but already counted is refused" '[[ $rc -ne 0 ]] && grep -qE "already counted|same sequence" err.txt'
 
 echo "== locating, and anchoring an existing store on a new reference"
 "${BG[@]}" -o s --locate chr1:120000-160000 > loc.tsv
@@ -109,7 +150,7 @@ no_overlap() {  # <file> <genome>
 }
 check "g1: the locus 20 kb further on" 'has_copy loc.tsv g1 chr1 + 134000 140000 180000 186000'
 check "g2: a reversed copy on a, and the reference copy on b" 'has_copy loc.tsv g2 a - 62000 65500 104500 108000 && has_copy loc.tsv g2 b + 114000 120000 160000 166000'
-check "g3: the tandem copies do not overlap" 'no_overlap loc.tsv g3'
+check "g3: two tandem copies, not overlapping" 'no_overlap loc.tsv g3 && [[ $(awk -F"\t" '"'"'$1=="g3" && $2>0'"'"' loc.tsv | wc -l | tr -d " ") == 2 ]]'
 "${BG[@]}" -o s --locate chr1:160000-120000 > /dev/null 2>&1; rc=$?
 check "a reversed interval is refused" '[[ $rc -ne 0 ]]'
 "${BG[@]}" -o s --locate chr1:290000-400000 > /dev/null 2>&1; rc=$?
@@ -119,6 +160,15 @@ check "an interval past the contig is refused" '[[ $rc -ne 0 ]]'
 "${BG[@]}" -o r --coordinate-reference ref
 "${BG[@]}" -o r --locate chr1:120000-160000 > loc2.tsv
 check "a reference added later anchors every committed genome" '[[ $(awk -F"\t" '"'"'NR>1 && $2>0 {print $1}'"'"' loc2.tsv | sort -u | wc -l | tr -d " ") == 3 ]]'
+"${BG[@]}" -o r2 --genome ref=data/ref.fa --genome g1=data/g1.fa
+PANVAR_TEST_WAIT_AT=count-before-commit:$OUT/go2 "${BG[@]}" -o r2 --add --genome g2=data/g2.fa & p2=$!
+sleep 1
+PANVAR_TEST_FAIL_AT=reference-before-commit "${BG[@]}" -o r2 --coordinate-reference ref; rc=$?
+check "adding a reference killed before its commit: no reference" '[[ $rc -eq 137 ]] && ! grep -q fingerprint r2/manifest.json'
+"${BG[@]}" -o r2 --coordinate-reference ref
+touch go2; wait $p2; r2rc=$?
+"${BG[@]}" -o r2 --locate chr1:120000-160000 > loc3.tsv
+check "an --add counting while a reference was added maps itself on it and commits" '[[ $r2rc -eq 0 && $(awk -F"\t" '"'"'NR>1 && $2>0 {print $1}'"'"' loc3.tsv | sort -u | wc -l | tr -d " ") == 3 ]]'
 
 echo "== inputs and limits"
 "${BG[@]}" -o bad1 --genome a/b=data/g1.fa > /dev/null 2>&1; rc=$?

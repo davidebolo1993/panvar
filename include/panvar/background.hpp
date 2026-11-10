@@ -110,7 +110,7 @@ private:
     const std::uint64_t* packed_ = nullptr;
     const std::uint64_t* exc_index_ = nullptr;
     const std::uint64_t* exc_count_ = nullptr;
-    std::uint64_t n_ = 0, n_exc_ = 0, words_ = 0, escape_ = 0;
+    std::uint64_t n_exc_ = 0, words_ = 0, escape_ = 0;
     std::uint32_t width_ = 0;
 };
 }  // namespace counts
@@ -249,6 +249,11 @@ bool store_exists(const std::string& store_dir);
 Manifest read_manifest(const std::string& store_dir);
 // Replaces manifest.json atomically (temporary file, fsync, rename, fsync of the folder).
 void write_manifest(const std::string& store_dir, const Manifest& m);
+// Writes a file and syncs it, checking every step (close included); removes it on failure.
+void write_file_durably(const std::string& path, const std::string& content);
+// What the store counts: a hash of its genomes' names and sequence checksums (not of how they are split
+// into segments, nor of its anchors), so a merge or a new coordinate reference keeps it.
+std::uint64_t content_id(const Manifest& m);
 
 // An exclusive lock on a store's .lock file, held until destroyed; waits for other holders.
 class StoreLock {
@@ -305,8 +310,8 @@ struct CompactOptions {
     std::size_t threads = 2;
     std::size_t minimizer = 0;        // SSHash's minimizer length; 0 picks one from the k-mer count
     std::size_t ram_gb = 4;           // SSHash's construction memory limit
-    bool local_strings = false;       // build strings within partitions and glue them (no random access to the
-                                      // store; slower while the store fits in memory)
+    bool local_strings = false;       // build strings within partitions and glue them: never reads across
+                                      // partitions, but holds every path in memory; slower
     bool quiet = false;               // SSHash's own messages go to stderr unless quiet
     std::function<void(const std::string&)> log;
 };
@@ -321,7 +326,7 @@ struct CompactStats {
 };
 
 // Rewrites a merged store as a string set (each k-mer once, with its count) and builds an SSHash weighted
-// dictionary from it, written with a header that ties it to the store's id and generation.
+// dictionary from it, written with a header that ties it to the store's id and content.
 CompactStats compact_store(const CompactOptions& options);
 
 // Counts of canonical 31-mers from either form of a background: a store folder or a compacted dictionary.
@@ -334,9 +339,9 @@ public:
     virtual std::uint64_t distinct() const = 0;
     virtual std::string kind() const = 0;
     virtual std::string store_id() const = 0;
-    virtual std::uint64_t generation() const = 0;
+    virtual std::uint64_t content() const = 0;   // the store's content_id when it was read or compacted
     // A store folder, or a compacted dictionary written by compact_store. A dictionary next to its store
-    // (<store>.sshash beside <store>) must match the store's id and generation.
+    // (<store>.sshash beside <store>) must match the store's id and content.
     static std::unique_ptr<Background> open(const std::string& path);
 };
 

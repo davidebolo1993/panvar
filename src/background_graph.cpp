@@ -4,6 +4,7 @@
 #include "panvar/gz_reader.hpp"
 #include "panvar/kmer.hpp"
 
+#include <algorithm>
 #include <cstring>
 #include <fstream>
 #include <stdexcept>
@@ -62,6 +63,12 @@ Graph load_nodes(const std::string& gfa) {
     g.start.push_back(0);
     while (in.getline(line)) {
         g.checksum = hash_line(line, g.checksum);
+        if (line.size() > 2 && line[0] == 'L' && line[1] == '\t') {   // haplotypes are spelled by concatenation
+            const auto f = split(line, '\t');
+            if (f.size() > 5 && f[5] != "*" && f[5] != "0M" && !f[5].empty())
+                throw std::runtime_error("background: " + gfa + ": a link with overlap " + f[5] + "; only 0M or * links are supported");
+            continue;
+        }
         if (line.size() < 2 || line[0] != 'S' || line[1] != '\t') continue;
         const auto t1 = line.find('\t', 2);
         const std::string name = line.substr(2, t1 == std::string::npos ? std::string::npos : t1 - 2);
@@ -103,6 +110,9 @@ void for_each_walk(const std::string& gfa, const Graph& g, F&& f) {
         if (line[0] == 'P') {
             if (t.size() < 3) throw std::runtime_error("background: " + gfa + ": a short P line");
             w.contig = t[1];
+            if (t.size() > 3 && t[3] != "*" && !t[3].empty())
+                for (const auto& ov : split(t[3], ','))
+                    if (ov != "0M" && ov != "*") throw std::runtime_error("background: " + gfa + ": path " + t[1] + " has overlap " + ov + "; only 0M is supported");
             for (const auto& s : split(t[2], ',')) {
                 if (s.size() < 2 || (s.back() != '+' && s.back() != '-')) throw std::runtime_error("background: " + gfa + ": bad P step " + s);
                 w.steps.emplace_back(node(s.substr(0, s.size() - 1)), s.back() == '-');
@@ -273,6 +283,44 @@ std::vector<std::string> graph_contigs(const std::string& gfa, std::vector<std::
         }
     });
     return out;
+}
+
+struct Haplotypes::Impl {
+    Graph g;
+    std::vector<Walk> walks;
+    std::vector<std::vector<std::uint64_t>> starts;   // per walk, the contig coordinate of each step
+};
+
+Haplotypes::Haplotypes(const std::string& gfa) : impl_(std::make_unique<Impl>()) {
+    impl_->g = load_nodes(gfa);
+    for_each_walk(gfa, impl_->g, [&](const Walk& w) {
+        impl_->walks.push_back(w);
+        std::vector<std::uint64_t> st;
+        std::uint64_t pos = w.offset;
+        for (const auto& s : w.steps) { st.push_back(pos); pos += impl_->g.len(s.first); }
+        st.push_back(pos);
+        impl_->starts.push_back(std::move(st));
+    });
+}
+
+Haplotypes::~Haplotypes() = default;
+
+std::string Haplotypes::fetch(const std::string& contig, std::uint64_t start, std::uint64_t end) const {
+    for (std::size_t wi = 0; wi < impl_->walks.size(); ++wi) {
+        const Walk& w = impl_->walks[wi];
+        const auto& st = impl_->starts[wi];
+        if (w.contig != contig || start >= st.back() || end <= st.front()) continue;
+        std::string out;
+        std::size_t i = static_cast<std::size_t>(std::upper_bound(st.begin(), st.end(), std::max(start, st.front())) - st.begin()) - 1;
+        for (; i + 1 < st.size() && st[i] < end; ++i) {
+            const auto [v, rev] = w.steps[i];
+            const std::uint64_t from = start > st[i] ? start - st[i] : 0;
+            const std::uint64_t to = std::min<std::uint64_t>(impl_->g.len(v), end - st[i]);
+            impl_->g.append(out, v, rev, from, to);
+        }
+        return out;
+    }
+    throw std::runtime_error("background: no haplotype " + contig + " covering " + std::to_string(start) + "-" + std::to_string(end));
 }
 
 void spell_graph(const std::string& gfa, const std::string& fasta_out) {

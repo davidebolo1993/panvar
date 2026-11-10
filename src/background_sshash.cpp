@@ -35,7 +35,7 @@ namespace {
 
 namespace fs = std::filesystem;
 
-constexpr std::uint64_t kDictMagic = 0x3148535347425650ULL;   // "PVBGSSH1"
+constexpr std::uint64_t kDictMagic = 0x3248535347425650ULL;   // "PVBGSSH2"
 
 template <class F>
 void parallel_partitions(std::uint32_t n, std::size_t threads, F&& f) {
@@ -58,10 +58,10 @@ void parallel_partitions(std::uint32_t n, std::size_t threads, F&& f) {
     if (failure) std::rethrow_exception(failure);
 }
 
-// panvar's header in front of the SSHash payload: magic, version, store id, generation, k-mers, payload start.
+// panvar's header in front of the SSHash payload: magic, version, store id, store content, k-mers, payload start.
 struct DictHeader {
     std::string store_id;
-    std::uint64_t generation = 0, kmers = 0, payload = 0;
+    std::uint64_t content = 0, kmers = 0, payload = 0;
 };
 
 DictHeader read_header(std::istream& in, const std::string& path) {
@@ -78,7 +78,7 @@ DictHeader read_header(std::istream& in, const std::string& path) {
     h.store_id.resize(idlen);
     in.read(&h.store_id[0], static_cast<std::streamsize>(idlen));
     in.seekg(static_cast<std::streamoff>((32 + idlen + 7) / 8 * 8));
-    h.generation = u64();
+    h.content = u64();
     h.kmers = u64();
     h.payload = u64();
     return h;
@@ -91,7 +91,7 @@ void write_header(std::ostream& out, const DictHeader& h, std::uint64_t magic) {
     u64(h.store_id.size());
     out.write(h.store_id.data(), static_cast<std::streamsize>(h.store_id.size()));
     for (std::size_t pad = (32 + h.store_id.size() + 7) / 8 * 8 - (24 + h.store_id.size()); pad > 0; --pad) out.put('\0');
-    u64(h.generation);
+    u64(h.content);
     u64(h.kmers);
     u64(h.payload);
 }
@@ -111,7 +111,7 @@ public:
     }
     std::string kind() const override { return "store, " + std::to_string(store_.segments()) + " segment(s)"; }
     std::string store_id() const override { return store_.manifest().store_id; }
-    std::uint64_t generation() const override { return store_.manifest().generation; }
+    std::uint64_t content() const override { return content_id(store_.manifest()); }
 
 private:
     Store store_;
@@ -150,7 +150,7 @@ public:
     std::uint64_t distinct() const override { return header_.kmers; }
     std::string kind() const override { return "compacted (SSHash)"; }
     std::string store_id() const override { return header_.store_id; }
-    std::uint64_t generation() const override { return header_.generation; }
+    std::uint64_t content() const override { return header_.content; }
 
 private:
     std::shared_ptr<Mapping> map_;
@@ -424,8 +424,8 @@ std::unique_ptr<Background> Background::open(const std::string& path) {
             const Manifest m = read_manifest(base);
             if (m.store_id != dict->store_id())
                 throw std::runtime_error("background: " + path + " was compacted from another store than " + base);
-            if (m.generation != dict->generation())
-                throw std::runtime_error("background: " + path + " is stale: " + base + " changed since it was compacted (compact again)");
+            if (content_id(m) != dict->content())
+                throw std::runtime_error("background: " + path + " is stale: the genomes of " + base + " changed since it was compacted (compact again)");
         }
     }
     return dict;
@@ -442,7 +442,7 @@ CompactStats compact_store(const CompactOptions& o) {
     const std::string tmp_out = o.out_path + ".tmp";
     DictHeader h;
     h.store_id = m.store_id;
-    h.generation = m.generation;
+    h.content = content_id(m);
     h.kmers = n;
     h.payload = header_size(h.store_id);
 
