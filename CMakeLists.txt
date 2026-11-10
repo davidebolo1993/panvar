@@ -66,8 +66,16 @@ if(NOT EXISTS ${ABPOA_DIR}/include/abpoa.h OR NOT EXISTS ${ABPOA_DIR}/include/si
         "Run: git submodule update --init --recursive")
 endif()
 set(ABPOA_MAKE ${VENDORED_MAKE})
+set(ABPOA_MAKE_ARGS)
+# On x86-64 abPOA compiles its aligner once per SIMD level and names each copy from the compiler's CPU
+# macros. A compiler whose default target already has AVX2 names the SSE2 and SSE4.1 copies as AVX2, and
+# the dispatcher's SSE symbols go missing at link time: build from the plain x86-64 baseline instead.
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64)$")
+    list(APPEND ABPOA_MAKE_ARGS
+        "CFLAGS=-O3 -Wall -Wno-unused-function -Wno-misleading-indentation -DUSE_SIMDE -DSIMDE_ENABLE_NATIVE_ALIASES -march=x86-64")
+endif()
 add_custom_target(abpoa_build
-    COMMAND ${ABPOA_MAKE} -C ${ABPOA_DIR} lib/libabpoa.a
+    COMMAND ${ABPOA_MAKE} -C ${ABPOA_DIR} lib/libabpoa.a ${ABPOA_MAKE_ARGS}
     BYPRODUCTS ${ABPOA_LIB}
     COMMENT "Building abPOA static library"
 )
