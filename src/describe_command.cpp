@@ -13,6 +13,8 @@
 #include <string>
 #include <utility>
 #include <vector>
+#include <cstdlib>
+#include <iterator>
 
 namespace panvar {
 namespace {

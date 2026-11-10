@@ -4,6 +4,7 @@
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <cstdint>
 
 #include "edlib.h"
 

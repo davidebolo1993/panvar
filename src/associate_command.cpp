@@ -27,6 +27,8 @@
 #include <vector>
 
 #include <Eigen/Dense>
+#include <cstdint>
+#include <cctype>
 
 #include "panvar/gz_reader.hpp"
 

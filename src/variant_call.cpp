@@ -43,6 +43,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+#include <cstdio>
 
 namespace panvar {
 namespace {

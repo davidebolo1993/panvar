@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <unordered_set>
+#include <iterator>
 
 namespace panvar {
 namespace {

@@ -2,6 +2,7 @@
 #include <iostream>
 #include <string>
 #include <vector>
+#include <stdexcept>
 
 #include "panvar/associate_command.hpp"
 #include "panvar/benchmark_command.hpp"

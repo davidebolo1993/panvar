@@ -4,6 +4,7 @@
 #include <map>
 #include <tuple>
 #include <unordered_map>
+#include <cstdint>
 
 namespace panvar {
 

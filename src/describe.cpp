@@ -34,6 +34,8 @@
 #include <utility>
 #include <vector>
 #include <zlib.h>
+#include <cstdio>
+#include <string_view>
 
 namespace panvar {
 namespace {

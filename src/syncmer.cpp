@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <limits>
+#include <cstdint>
 
 namespace panvar {
 
