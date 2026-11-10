@@ -1554,7 +1554,7 @@ GB=$(rseq 160 74)
 printf '%s\n1,S,+,K,+,4,6,4,4,1,1,1,0,160,"A;B;b;N"\n' "$MOD_HDR" > "$OUT/gap.bubbles.csv"
 gap_log=$("$BIN" call -i "$OUT/gap.gfa" -c "$OUT/gap.bubbles.csv" -r ref -o "$OUT/gap" 2>&1 >/dev/null)
 gt_of() { awk -F'\t' -v s="$2" -v t="$3" '/^#CHROM/{for(i=10;i<=NF;i++) if($i ~ s) c=i}
-            !/^#/ && $8 ~ ("SVTYPE="t";") {split($c,g,":"); print g[1]; exit}' "$1"; }
+            c && !/^#/ && $8 ~ ("SVTYPE="t";") {split($c,g,":"); print g[1]; exit}' "$1"; }   # no column: nothing
 VCF="$OUT/gap.region.vcf"
 check "a haplotype crossing an assembly gap: GT on the substitution, typed INS by its net change" \
   "$(gt_of "$VCF" hgap INS):$(info INS SVLEN):$(grep -v '^#' "$VCF" | grep -c SUBSTITUTION)" ".:60:1"

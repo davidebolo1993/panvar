@@ -39,7 +39,11 @@ jobs:
         run: cmake --build build -j
 
       - name: Test
-        run: ctest --test-dir build --output-on-failure
+        shell: bash
+        run: |
+          # On failure, repeat the failed checks at the end: a suite's output is long.
+          ctest --test-dir build --output-on-failure || {
+            echo "---- failed checks ----"; grep -h "^  FAIL " build/Testing/Temporary/LastTest.log; exit 1; }
 
       - name: No script hardcodes a developer's interpreter path
         shell: bash
