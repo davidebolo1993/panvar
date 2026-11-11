@@ -1119,7 +1119,10 @@ SegmentStats build_segment(const BuildOptions& o) {
     info.distinct = st.distinct;
     info.occurrences = st.kmers;
     for (std::size_t s = 0; s < o.anchor_sets.size(); ++s) {
-        std::vector<anchors::Hit> all;
+        std::vector<anchors::Hit> all;   // sized once: the per-thread lists are freed as they are copied
+        std::size_t total = 0;
+        for (const auto& v : hits[s]) total += v.size();
+        all.reserve(total);
         for (auto& v : hits[s]) { all.insert(all.end(), v.begin(), v.end()); std::vector<anchors::Hit>().swap(v); }
         std::vector<std::string> names;
         for (const auto& g : genomes) names.push_back(g.name);

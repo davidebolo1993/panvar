@@ -588,10 +588,12 @@ int main(int argc, char** argv) {
                            << "W\ts\t1\tchrX\t0\t20\t>a>b\nW\ts\t1\tchrX\t20\t30\t>c\n"
                            << "W\ts\t2\tchrY\t0\t10\t>a\nW\ts\t2\tchrY\t15\t25\t<b\n";
         const bg::graph::Haplotypes h(gfa);
-        const bool across = h.fetch("s#1#chrX", 5, 25) == "CGTACGGGGGCCCCCTTTTT" && h.fetch("s#1#chrX", 22, 30) == "TTTAAAAA";
+        const auto p1 = h.fetch("s#1#chrX", 5, 25), p2 = h.fetch("s#1#chrX", 22, 30);
+        const bool across = p1.size() == 2 && p1[0].start == 5 && p1[0].seq == "CGTACGGGGGCCCCC" && p1[1].start == 20 &&
+                            p1[1].seq == "TTTTT" && p2.size() == 1 && p2[0].start == 22 && p2[0].seq == "TTTAAAAA";
         bool gap = false;
         try { h.fetch("s#2#chrY", 5, 20); } catch (const std::exception&) { gap = true; }
-        check(across && gap, "graph intervals are cut across consecutive walks of a contig; a gap between walks is refused");
+        check(across && gap, "graph intervals across consecutive walks come back one piece per walk; a gap between walks is refused");
     }
 
     std::printf("\nbackground_test: %s\n", failures ? (std::to_string(failures) + " check(s) failed").c_str() : "all checks passed");

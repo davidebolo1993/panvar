@@ -57,6 +57,16 @@ python3 "$TOOLS/locus_reads.py" data/ref.fa chr1 115000 165000 30 span 6 reads_s
 check "reads holding the whole locus between two flanks are certain, partial ($(reason span.tsv partial) of 30)" '[[ $(reason span.tsv partial) == 30 ]]'
 check "reads past the end are certain, partial ($(reason long.tsv partial) of 300), segments within the read" '[[ $(reason long.tsv partial) -ge 270 ]] && awk -F"\t" '"'"'NR>1 && $4=="partial" {split($6, g, "-"); if (g[2] - g[1] >= 2000 || g[1] != 0 && g[2] != 2000) bad = 1} END {exit bad}'"'"' long.tsv'
 
+# a graph genome counts one haplotype per sample#haplotype of its paths
+"$BIN" background -t 2 --partitions 64 --memory 64M -q --tmp-dir "$OUT/tmp" -o s_graph --genome ref=data/ref.fa --genome lg=data/locus.gfa --coordinate-reference ref
+"$BIN" recruit -t 2 -q --background s_graph -r ref --index-only --save-index idx_graph --locus data/locus.gfa 2> graph.txt; rc=$?
+check "a graph genome's PanSN paths count as haplotypes (1 FASTA + 3 paths)" '[[ $rc -eq 0 ]] && grep -q "haplotypes.4 in the background" idx_graph/locus.index.tsv'
+cp data/ga.fa data/ga_moved.fa
+"$BIN" background -t 2 --partitions 64 --memory 64M -q --tmp-dir "$OUT/tmp" -o s_moved --genome ref=data/ref.fa --genome ga=data/ga_moved.fa --coordinate-reference ref
+printf '>chr1\nACGT\n' >> data/ga_moved.fa
+"$BIN" recruit -t 2 -q --background s_moved -r ref --index-only --save-index idx_moved --locus data/locus.gfa 2> moved.txt; rc=$?
+check "a genome file changed since it was counted is refused" '[[ $rc -ne 0 ]] && grep -q "was replaced" moved.txt'
+
 # the decoy scan split across threads gives the same index
 "$BIN" recruit -t 4 -q --background s -r ref --index-only --save-index idx4 --locus data/locus.gfa
 "$BIN" recruit --dump-index idx4/locus.plx=dump4t.tsv

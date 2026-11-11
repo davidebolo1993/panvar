@@ -306,15 +306,16 @@ Haplotypes::Haplotypes(const std::string& gfa) : impl_(std::make_unique<Impl>())
 Haplotypes::~Haplotypes() = default;
 
 // A contig of a haplotype may be several walks (W lines with consecutive ranges): the interval is cut from
-// each walk it overlaps, in order; a part no walk covers is an error, not a shorter sequence.
-std::string Haplotypes::fetch(const std::string& contig, std::uint64_t start, std::uint64_t end) const {
+// each walk it overlaps, in order, one piece per walk, since counting never joined walks (no k-mer spans
+// two); a part no walk covers is an error, not a shorter sequence.
+std::vector<Haplotypes::Piece> Haplotypes::fetch(const std::string& contig, std::uint64_t start, std::uint64_t end) const {
     std::vector<std::size_t> hit;
     for (std::size_t wi = 0; wi < impl_->walks.size(); ++wi) {
         const auto& st = impl_->starts[wi];
         if (impl_->walks[wi].contig == contig && start < st.back() && end > st.front()) hit.push_back(wi);
     }
     std::sort(hit.begin(), hit.end(), [&](std::size_t x, std::size_t y) { return impl_->starts[x].front() < impl_->starts[y].front(); });
-    std::string out;
+    std::vector<Piece> out;
     std::uint64_t at = start;
     for (const std::size_t wi : hit) {
         const Walk& w = impl_->walks[wi];
@@ -322,13 +323,16 @@ std::string Haplotypes::fetch(const std::string& contig, std::uint64_t start, st
         if (st.back() <= at) continue;
         if (st.front() > at) break;   // a gap before this walk
         const std::uint64_t stop = std::min<std::uint64_t>(end, st.back());
+        Piece piece;
+        piece.start = at;
         std::size_t i = static_cast<std::size_t>(std::upper_bound(st.begin(), st.end(), at) - st.begin()) - 1;
         for (; i + 1 < st.size() && st[i] < stop; ++i) {
             const auto [v, rev] = w.steps[i];
             const std::uint64_t from = at > st[i] ? at - st[i] : 0;
             const std::uint64_t to = std::min<std::uint64_t>(impl_->g.len(v), stop - st[i]);
-            impl_->g.append(out, v, rev, from, to);
+            impl_->g.append(piece.seq, v, rev, from, to);
         }
+        out.push_back(std::move(piece));
         at = stop;
         if (at >= end) return out;
     }

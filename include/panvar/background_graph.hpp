@@ -40,8 +40,13 @@ class Haplotypes {
 public:
     explicit Haplotypes(const std::string& gfa);
     ~Haplotypes();
-    // The bases of [start, end) of a haplotype contig (W-line coordinates include the walk's start offset).
-    std::string fetch(const std::string& contig, std::uint64_t start, std::uint64_t end) const;
+    // The bases of [start, end) of a haplotype contig (W-line coordinates include the walk's start offset),
+    // one piece per walk the interval crosses: counting never joined walks, so no k-mer spans two pieces.
+    struct Piece {
+        std::uint64_t start = 0;
+        std::string seq;
+    };
+    std::vector<Piece> fetch(const std::string& contig, std::uint64_t start, std::uint64_t end) const;
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;

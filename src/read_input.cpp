@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdlib>
 #include <deque>
 #include <exception>
 #include <filesystem>
@@ -277,6 +278,7 @@ public:
 
 private:
     static constexpr std::int64_t kNear = 100000;   // a mate this far ahead is waited for
+    static constexpr std::size_t kHoldMax = 2000000;  // reads waiting for mates in an unsorted file before going lean
     struct Held {
         std::string seq;
         bool read1 = true;
@@ -333,7 +335,19 @@ private:
         h.mtid = b->core.mtid;
         h.mpos = b->core.mpos;
         if (!coordinate_) {
+            if (lean_) {   // holding too much already: only a read that hits a screen is kept, its mate fetched later
+                if (o_.screened(h.seq)) {
+                    h.candidate = true;
+                    h.mtid = -1;
+                    h.mpos = -1;
+                    held_.emplace(std::move(name), std::move(h));
+                } else {
+                    ++lean_dropped_;
+                }
+                return;
+            }
             held_.emplace(std::move(name), std::move(h));
+            if (held_.size() > hold_max_) go_lean();
             return;
         }
         const std::int32_t tid = b->core.tid;
@@ -386,8 +400,29 @@ private:
 
     // The end: every read still waiting either never met its mate (unsorted input: scored alone) or, in
     // coordinate-sorted input, has its mate fetched.
+    // An unsorted file whose mates are far apart (all read 1 before all read 2, say) would hold most of the
+    // sample: past kHoldMax waiting reads, only those hitting a screen are kept (as candidates, their mates
+    // fetched by a second pass) and new reads are kept only if they hit. A pair is still scored when
+    // either mate hits.
+    void go_lean() {
+        lean_ = true;
+        if (o_.log) o_.log(path_ + ": over " + std::to_string(hold_max_) + " reads wait for their mates (the file is not name-grouped): "
+                           "keeping only reads that hit a screen, their mates fetched by a second pass");
+        for (auto it = held_.begin(); it != held_.end();) {
+            if (o_.screened(it->second.seq)) {
+                it->second.candidate = true;
+                it->second.mtid = -1;
+                it->second.mpos = -1;
+                ++it;
+            } else {
+                ++lean_dropped_;
+                it = held_.erase(it);
+            }
+        }
+    }
+
     void finish() {
-        if (!coordinate_) {
+        if (!coordinate_ && !lean_) {
             for (auto& [name, h] : held_) {
                 ++st_.unmatched;
                 emit(name, std::move(h.seq), std::string(), false);
@@ -419,8 +454,9 @@ private:
         for (std::size_t i = 0; i < wanted_.size(); ++i)
             if (!paired[i]) rest.push_back(std::move(wanted_[i]));
         wanted_.swap(rest);
-        if (wanted_.empty()) return;
-        fetch();
+        if (!wanted_.empty()) fetch();
+        st_.unscreened += lean_dropped_ / 2;   // reads set aside whose mates were set aside too: unscreened pairs
+        st_.dropped += lean_dropped_ % 2;
     }
 
     bool mate_of(const bam1_t* b, const Wanted& w) const {
@@ -449,9 +485,9 @@ private:
         }
         std::unordered_map<std::string, std::size_t> rest;   // a second pass for mates no index found
         for (std::size_t i = 0; i < wanted_.size(); ++i)
-            if (!found[i] && (idx == nullptr || wanted_[i].mtid < 0 || wanted_[i].mpos < 0)) rest.emplace(wanted_[i].name, i);
+            if (!found[i]) rest.emplace(wanted_[i].name, i);   // no index, no mate place, or stale mate fields
         if (!rest.empty()) {
-            if (o_.log) o_.log(path_ + ": a second pass for " + std::to_string(rest.size()) + " mates" + (idx == nullptr ? " (no index)" : ""));
+            if (o_.log) o_.log(path_ + ": a second pass for " + std::to_string(rest.size()) + " mates" + (idx == nullptr ? " (no index)" : " (not where the index put them)"));
             HtsFile pass(path_, o_, &pool_);
             while (!rest.empty() && pass.read()) {
                 const auto it = rest.find(bam_get_qname(pass.rec));
@@ -472,6 +508,7 @@ private:
 
     void deliver(const Wanted& w, const bam1_t* mate) {
         ++st_.fetched;
+        if (lean_ && lean_dropped_ > 0) --lean_dropped_;   // the mate fetched was one set aside
         Held h;
         h.seq = w.seq;
         h.read1 = w.read1;
@@ -500,7 +537,9 @@ private:
     htsThreadPool pool_{nullptr, 0};
     std::unique_ptr<HtsFile> file_;
     std::string sample_;
-    bool coordinate_ = false, eof_ = false;
+    bool coordinate_ = false, eof_ = false, lean_ = false;
+    std::uint64_t lean_dropped_ = 0;
+    std::size_t hold_max_ = std::getenv("PANVAR_TEST_HOLD_MAX") ? std::strtoull(std::getenv("PANVAR_TEST_HOLD_MAX"), nullptr, 10) : kHoldMax;
     std::int32_t last_tid_ = -2;     // the contig of the last record (sweeps)
     std::int32_t order_tid_ = -1;    // the last placed record's position (the order check)
     std::int64_t order_pos_ = -1;

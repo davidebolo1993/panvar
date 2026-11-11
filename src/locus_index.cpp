@@ -303,6 +303,18 @@ std::string expected_key(const BuildOptions& o, const std::string& gfa) {
     return k.key();
 }
 
+// A genome the index reads again (to cut its spans, to scan for decoys) must be the file the background
+// counted: a different one would subtract or place k-mers the counts never held. Its size is checked (its
+// sequence checksum would mean reading every genome whole).
+void check_unchanged(const bg::Genome& g) {
+    std::error_code ec;
+    const std::uint64_t now = fs::file_size(g.path, ec);
+    if (ec) throw std::runtime_error("recruit: genome " + g.name + ": cannot read " + g.path + " (the background counted it there)");
+    if (g.bytes != 0 && now != g.bytes)
+        throw std::runtime_error("recruit: genome " + g.name + ": " + g.path + " is " + std::to_string(now) + " bytes, " +
+                                 std::to_string(g.bytes) + " when the background counted it: the file was replaced");
+}
+
 // Calls f(i) for i in [0, n) on up to `threads` threads, each i on one thread; the first exception thrown
 // is rethrown once all have stopped.
 void parallel_for(std::size_t n, std::size_t threads, const std::function<void(std::size_t)>& f) {
@@ -347,10 +359,14 @@ std::vector<LocusIndex> build(const BuildOptions& o) {
     std::map<std::string, bg::Genome> genomes;
     for (const auto& s : m.segments) for (const auto& g : s.genomes) genomes[g.name] = g;
     // background haplotypes: a FASTA genome is one, a graph one per sample#haplotype of its P and W lines
+    // (PanSN path names: sample#haplotype#contig, or sample#contig for a haploid sample); a graph whose
+    // P lines are not PanSN names cannot say how many haplotypes it holds and counts as one
     std::uint64_t haplotypes = 0;
     for (const auto& [gname, ge] : genomes) {
+        if (!fs::is_regular_file(ge.path)) throw std::runtime_error("recruit: genome " + gname + ": no file at " + ge.path);
         if (!is_gfa_file(ge.path)) { ++haplotypes; continue; }
         std::set<std::string> haps;
+        bool plain = false;
         GzLineReader in(ge.path);
         if (!in.ok()) throw std::runtime_error("recruit: cannot read " + ge.path);
         for (std::string line; in.getline(line);) {
@@ -358,13 +374,18 @@ std::vector<LocusIndex> build(const BuildOptions& o) {
             const std::size_t a = line.find('\t', 2);
             if (line[0] == 'W') {
                 const std::size_t b = line.find('\t', a + 1);
-                haps.insert(line.substr(2, b == std::string::npos ? std::string::npos : b - 2));   // sample<TAB>haplotype
+                if (a == std::string::npos || b == std::string::npos) continue;
+                haps.insert(line.substr(2, a - 2) + "#" + line.substr(a + 1, b - a - 1));   // sample#haplotype
             } else {
                 const std::string name = line.substr(2, a == std::string::npos ? std::string::npos : a - 2);
-                const std::size_t h1 = name.find('#'), h2 = h1 == std::string::npos ? h1 : name.find('#', h1 + 1);
-                haps.insert(h2 == std::string::npos ? name : name.substr(0, h2));
+                const std::size_t h1 = name.find('#');
+                if (h1 == std::string::npos) { plain = true; continue; }
+                const std::size_t h2 = name.find('#', h1 + 1);
+                haps.insert(h2 == std::string::npos ? name.substr(0, h1) + "#0" : name.substr(0, h2));
             }
         }
+        if (plain && haps.empty()) log("note: " + ge.path + ": its paths are not PanSN names (sample#haplotype#contig): counted as one haplotype");
+        else if (plain) log("note: " + ge.path + ": some paths are not PanSN names: only the PanSN ones are counted as haplotypes");
         haplotypes += std::max<std::size_t>(1, haps.size());
     }
     haplotypes = std::max<std::uint64_t>(1, haplotypes);
@@ -445,26 +466,29 @@ std::vector<LocusIndex> build(const BuildOptions& o) {
             }
         }
         if (iv.empty()) continue;
-        std::vector<std::string> seqs;
+        check_unchanged(ge);
+        std::vector<std::vector<bg::graph::Haplotypes::Piece>> pieces(iv.size());   // a FASTA span is one piece
         if (is_gfa_file(ge.path)) {
             const bg::graph::Haplotypes h(ge.path);
-            for (const auto& i : iv) seqs.push_back(h.fetch(i.contig, i.start, i.end));
+            for (std::size_t k = 0; k < iv.size(); ++k) pieces[k] = h.fetch(iv[k].contig, iv[k].start, iv[k].end);
         } else {
             if (!fasta::IndexedFasta::indexed(ge.path)) log("note: " + ge.path + " has no .fai (and .gzi): read in full to cut its spans");
-            seqs = fasta::fetch_intervals(ge.path, iv);
+            std::vector<std::string> seqs = fasta::fetch_intervals(ge.path, iv);
+            for (std::size_t k = 0; k < iv.size(); ++k) pieces[k].push_back({iv[k].start, std::move(seqs[k])});
         }
         for (std::size_t k = 0; k < iv.size(); ++k) {
             LocusWork& w = work[owner[k].first];
             const anchors::Span& sp = w.spans[gname][owner[k].second];
             std::uint64_t found = 0;
-            kmer::for_each_canonical_kmer(seqs[k].data(), seqs[k].size(), kK, [&](std::uint64_t c, std::size_t at, bool) {
-                const std::int64_t i = w.idx.find(c);
-                if (i < 0) return;
-                ++w.sub[i];
-                ++found;
-                const std::uint64_t pos = iv[k].start + at;
-                if (pos >= sp.inner_start && pos + kK <= sp.inner_end) ++w.sub_trim[i];
-            });
+            for (const auto& piece : pieces[k])
+                kmer::for_each_canonical_kmer(piece.seq.data(), piece.seq.size(), kK, [&](std::uint64_t c, std::size_t at, bool) {
+                    const std::int64_t i = w.idx.find(c);
+                    if (i < 0) return;
+                    ++w.sub[i];
+                    ++found;
+                    const std::uint64_t pos = piece.start + at;
+                    if (pos >= sp.inner_start && pos + kK <= sp.inner_end) ++w.sub_trim[i];
+                });
             w.idx.spans.push_back({gname, sp.contig, sp.start, sp.end, sp.forward, found});
         }
     }
@@ -488,7 +512,8 @@ std::vector<LocusIndex> build(const BuildOptions& o) {
             x.cls[i] = c;
         }
         if (x.negative > 0)
-            log("warning: " + x.name + ": " + std::to_string(x.negative) + " k-mers occur more often in the located copies than in the background (a FASTA other than the one counted?)");
+            throw std::runtime_error("recruit: " + x.name + ": " + std::to_string(x.negative) +
+                                     " k-mers occur more often in the located copies than the background counted: a genome file differs from the one counted");
     }
 
     // decoys: the homologous windows of the decoy genomes around their S k-mers, outside the locus
@@ -516,6 +541,7 @@ std::vector<LocusIndex> build(const BuildOptions& o) {
     for (const auto& dname : decoys) {
         const bg::Genome& ge = genomes.at(dname);
         if (is_gfa_file(ge.path)) throw std::runtime_error("recruit: decoy genome " + dname + " is a graph; decoys must be FASTA");
+        check_unchanged(ge);
         GzLineReader in(ge.path);
         if (!in.ok()) throw std::runtime_error("recruit: cannot read " + ge.path);
         std::string line, name, seq;

@@ -25,8 +25,8 @@ def name_of(header):
 
 def locityper_names(path):
     names = set()
-    if not os.path.exists(path):
-        return names
+    if not os.path.exists(path):   # Locityper writes a file even when it recruits nothing
+        sys.exit(f"locityper_score: {path} is missing: that run did not complete")
     opener = gzip.open if path.endswith(".gz") else open
     with opener(path, "rt") as f:
         for i, line in enumerate(f):

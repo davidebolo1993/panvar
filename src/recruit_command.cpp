@@ -211,6 +211,13 @@ int run_recruit_command(const std::vector<std::string>& args) {
         (is_plx(l) ? given_indexes : graphs).push_back(l);
     }
     o.loci = graphs;
+    for (const auto& plx : given_indexes) {   // a given index is checked now, not first when reads arrive
+        try {
+            (void)recruit::load(plx);
+        } catch (const std::exception& e) {
+            throw std::runtime_error(std::string(e.what()) + " (rebuild it from its graph)");
+        }
+    }
     if (!graphs.empty() && o.background.empty()) throw std::runtime_error("recruit requires --background <store.bgk> to index a graph");
     if (!graphs.empty() && o.reference_query.empty()) throw std::runtime_error("recruit requires -r <reference path> to index a graph");
     if (!index_only && (samples.empty() || ro.out.empty()))

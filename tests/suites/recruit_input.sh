@@ -60,6 +60,11 @@ awk -F'\t' 'BEGIN {OFS = "\t"} !/^@/ && int($2 / 128) % 2 == 1 && int($2 / 512) 
 "$BIN" recruit --locus "$IDX" -i orphans.sam -o orphans.tsv -t 2 2> orphans.log; rc=$?
 check "reads whose mate was filtered are scored alone ($(grep -o '[0-9]* reads without their mate' orphans.log))" '[[ $rc -eq 0 ]] && grep -q "reads without their mate" orphans.log'
 
+# an unsorted file with every read 1 before every read 2: past the hold limit, only reads hitting a screen wait
+{ grep '^@' name.sam | sed 's/SO:queryname/SO:unsorted/'; grep -v '^@' name.sam | awk -F'\t' 'int($2 / 64) % 2 == 1'; grep -v '^@' name.sam | awk -F'\t' 'int($2 / 64) % 2 == 0'; } > split.sam
+PANVAR_TEST_HOLD_MAX=100 "$BIN" recruit --locus "$IDX" -i split.sam -o split.tsv -t 2 2> split.log; sorted split.tsv
+check "an unsorted file of all read 1 then all read 2 gives the same table with a small hold limit" 'cmp -s split.tsv.sorted fq.tsv.sorted && grep -q "keeping only reads that hit" split.log'
+
 sed 's/SO:queryname/SO:coordinate/' name.sam > liar.sam
 "$BIN" recruit --locus "$IDX" -i liar.sam -o x.tsv -q 2> err3.txt; rc=$?
 check "a file claiming coordinate order without it stops the run" '[[ $rc -ne 0 ]] && grep -q "not sorted by coordinate" err3.txt'
@@ -68,6 +73,10 @@ if command -v samtools > /dev/null; then
   samtools view -b -o coord.bam coord.sam && samtools index coord.bam
   "$BIN" recruit --locus "$IDX" -i coord.bam -o bam.tsv -t 4 2> bam.log; sorted bam.tsv
   check "a coordinate-sorted BAM with index gives the same table, mates fetched through the index" 'cmp -s bam.tsv.sorted fq.tsv.sorted && grep -q "mates fetched" bam.log && ! grep -q "second pass" bam.log'
+  # mate fields pointing to the wrong place: the index misses, the second pass finds the mates
+  awk -F'\t' 'BEGIN {OFS = "\t"} !/^@/ && $8 > 150000 {$8 += 7} {print}' coord.sam | samtools view -b -o stale.bam - && samtools index stale.bam
+  "$BIN" recruit --locus "$IDX" -i stale.bam -o stale.tsv -t 4 2> stale.log; sorted stale.tsv
+  check "stale mate positions: the mates are found by a second pass, same table" 'cmp -s stale.tsv.sorted fq.tsv.sorted && grep -q "not where the index put them" stale.log'
   for c in chrA chrB; do printf '>%s\n' $c; head -c 20000000 /dev/zero | tr '\0' 'A' | fold -w 60; echo; done > zero.fa
   samtools faidx zero.fa && samtools view -C -T zero.fa -o coord.cram coord.bam 2> /dev/null && samtools index coord.cram
   "$BIN" recruit --locus "$IDX" -i coord.cram --cram-reference zero.fa -o cram.tsv -t 4 -q; sorted cram.tsv

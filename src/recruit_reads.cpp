@@ -406,6 +406,7 @@ ReadStats recruit_reads(const ReadOptions& o) {
                 else ++st.unrecruited;
             }
         }
+        if (std::ferror(out) || std::fflush(out) != 0) throw std::runtime_error("recruit: cannot write " + o.out);
         batch.swap(next);
     }
     close_source();
