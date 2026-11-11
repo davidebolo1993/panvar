@@ -4,6 +4,7 @@
 #include "panvar/background.hpp"
 #include "panvar/background_graph.hpp"
 #include "panvar/fasta_index.hpp"
+#include "panvar/flat_map.hpp"
 #include "panvar/gfa.hpp"
 #include "panvar/graph_utils.hpp"
 #include "panvar/gz_reader.hpp"
@@ -11,14 +12,19 @@
 #include "panvar/ref_path.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <cstring>
+#include <exception>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <memory>
+#include <mutex>
 #include <set>
 #include <sstream>
 #include <stdexcept>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -297,8 +303,38 @@ std::string expected_key(const BuildOptions& o, const std::string& gfa) {
     return k.key();
 }
 
+// Calls f(i) for i in [0, n) on up to `threads` threads, each i on one thread; the first exception thrown
+// is rethrown once all have stopped.
+void parallel_for(std::size_t n, std::size_t threads, const std::function<void(std::size_t)>& f) {
+    std::atomic<std::size_t> next{0};
+    std::exception_ptr failed;
+    std::mutex m;
+    auto run = [&] {
+        for (std::size_t i; (i = next++) < n;) {
+            try {
+                f(i);
+            } catch (...) {
+                std::lock_guard<std::mutex> lock(m);
+                if (!failed) failed = std::current_exception();
+                next = n;
+            }
+        }
+    };
+    std::vector<std::thread> pool;
+    for (std::size_t t = 1; t < std::min(threads, n); ++t) pool.emplace_back(run);
+    run();
+    for (auto& t : pool) t.join();
+    if (failed) std::rethrow_exception(failed);
+}
+
 std::vector<LocusIndex> build(const BuildOptions& o) {
-    auto log = [&](const std::string& s) { if (o.log) o.log(s); };
+    std::mutex log_mutex;
+    auto log = [&](const std::string& s) {
+        if (!o.log) return;
+        std::lock_guard<std::mutex> lock(log_mutex);
+        o.log(s);
+    };
+    const std::size_t threads = std::max<std::size_t>(1, o.threads);
     const bg::Manifest m = bg::read_manifest(o.background);
     std::string cref = o.coordinate_reference;
     if (cref.empty()) {
@@ -326,15 +362,15 @@ std::vector<LocusIndex> build(const BuildOptions& o) {
 
     // 1-3: each locus's k-mers, their background counts, their copies in every genome
     std::vector<LocusWork> work(o.loci.size());
-    std::vector<std::unique_ptr<Graph>> graphs;
-    for (std::size_t li = 0; li < o.loci.size(); ++li) {
+    std::vector<std::unique_ptr<Graph>> graphs(o.loci.size());
+    parallel_for(o.loci.size(), threads, [&](std::size_t li) {
         LocusWork& w = work[li];
         LocusIndex& x = w.idx;
         x.graph_path = fs::absolute(o.loci[li]).string();
         x.name = locus_name_of(o.loci[li]);
         x.graph_checksum = file_checksum(o.loci[li]);
-        graphs.push_back(std::make_unique<Graph>(parse_gfa(o.loci[li])));
-        const Graph& g = *graphs.back();
+        graphs[li] = std::make_unique<Graph>(parse_gfa(o.loci[li]));
+        const Graph& g = *graphs[li];
         std::vector<std::string> names;
         for (const auto& p : g.paths) names.push_back(p.name);
         const auto hit = match_reference_name(names, o.reference_query);
@@ -371,7 +407,7 @@ std::vector<LocusIndex> build(const BuildOptions& o) {
         w.spans[cref] = {self};
         log(x.name + ": " + std::to_string(x.codes.size()) + " k-mers from " + std::to_string(x.paths) + " paths; " + x.contig + ":" +
             std::to_string(x.start) + "-" + std::to_string(x.end) + " located in " + std::to_string(w.spans.size()) + " genomes");
-    }
+    });
 
     // subtraction: read every span from its genome (one file at a time, every locus at once)
     for (const auto& [gname, ge] : genomes) {
@@ -432,10 +468,26 @@ std::vector<LocusIndex> build(const BuildOptions& o) {
     }
 
     // decoys: the homologous windows of the decoy genomes around their S k-mers, outside the locus
-    std::unordered_map<std::uint64_t, std::vector<std::uint32_t>> shared;   // S k-mer -> loci
-    for (std::size_t li = 0; li < work.size(); ++li)
-        for (std::size_t i = 0; i < work[li].idx.codes.size(); ++i)
-            if (work[li].idx.cls[i] == kShared) shared[work[li].idx.codes[i]].push_back(static_cast<std::uint32_t>(li));
+    // S k-mer -> an entry of `owners`, the loci holding it
+    std::vector<std::vector<std::uint32_t>> owners;
+    FlatMap<std::uint32_t> shared;
+    {
+        std::size_t n = 0;
+        for (const auto& w : work) n += static_cast<std::size_t>(std::count(w.idx.cls.begin(), w.idx.cls.end(), kShared));
+        shared.reserve(n);
+        for (std::size_t li = 0; li < work.size(); ++li)
+            for (std::size_t i = 0; i < work[li].idx.codes.size(); ++i) {
+                if (work[li].idx.cls[i] != kShared) continue;
+                bool existing = false;
+                std::uint32_t& id = shared.slot(work[li].idx.codes[i], existing);
+                if (!existing) {
+                    id = static_cast<std::uint32_t>(owners.size());
+                    owners.emplace_back();
+                }
+                owners[id].push_back(static_cast<std::uint32_t>(li));
+            }
+    }
+    const std::size_t scan_threads = threads;
     std::vector<std::unordered_set<std::uint64_t>> candidates(work.size());
     for (const auto& dname : decoys) {
         const bg::Genome& ge = genomes.at(dname);
@@ -445,18 +497,37 @@ std::vector<LocusIndex> build(const BuildOptions& o) {
         std::string line, name, seq;
         auto scan = [&] {
             if (seq.empty()) return;
+            // hits of S k-mers outside each locus's own copy, in position order: the contig's k-mer starts
+            // are split into ranges scanned in parallel and joined in order
             std::vector<std::vector<std::uint64_t>> hits(work.size());
-            kmer::for_each_canonical_kmer(seq.data(), seq.size(), kK, [&](std::uint64_t c, std::size_t at, bool) {
-                const auto it = shared.find(c);
-                if (it == shared.end()) return;
-                for (const std::uint32_t li : it->second) {
-                    bool own = false;   // inside this locus's own copy in this genome
-                    const auto sp = work[li].spans.find(dname);
-                    if (sp != work[li].spans.end())
-                        for (const auto& s : sp->second) own = own || (s.contig == name && at + kK > s.start && at < s.end);
-                    if (!own) hits[li].push_back(at);
-                }
-            });
+            const std::size_t starts = seq.size() >= kK ? seq.size() - kK + 1 : 0;
+            const std::size_t parts = std::min<std::size_t>(scan_threads, std::max<std::size_t>(1, starts / 1000000));
+            std::vector<std::vector<std::vector<std::uint64_t>>> part_hits(parts, std::vector<std::vector<std::uint64_t>>(work.size()));
+            auto scan_part = [&](std::size_t p) {
+                const std::size_t a = starts * p / parts, b = starts * (p + 1) / parts;
+                if (b <= a) return;
+                kmer::for_each_canonical_kmer(seq.data() + a, b - a + kK - 1, kK, [&](std::uint64_t c, std::size_t off, bool) {
+                    const std::uint32_t* id = shared.find(c);
+                    if (id == nullptr) return;
+                    const std::size_t at = a + off;
+                    for (const std::uint32_t li : owners[*id]) {
+                        bool own = false;   // inside this locus's own copy in this genome
+                        const auto sp = work[li].spans.find(dname);
+                        if (sp != work[li].spans.end())
+                            for (const auto& s : sp->second) own = own || (s.contig == name && at + kK > s.start && at < s.end);
+                        if (!own) part_hits[p][li].push_back(at);
+                    }
+                });
+            };
+            if (starts > 0) {
+                std::vector<std::thread> pool;
+                for (std::size_t p = 1; p < parts; ++p) pool.emplace_back(scan_part, p);
+                scan_part(0);
+                for (auto& t : pool) t.join();
+                for (std::size_t li = 0; li < work.size(); ++li)
+                    for (std::size_t p = 0; p < parts; ++p)
+                        hits[li].insert(hits[li].end(), part_hits[p][li].begin(), part_hits[p][li].end());
+            }
             for (std::size_t li = 0; li < work.size(); ++li) {
                 if (hits[li].empty()) continue;
                 // clusters of hits no more than a pad apart; a cluster with enough hits is a homologous stretch,
@@ -514,7 +585,7 @@ std::vector<LocusIndex> build(const BuildOptions& o) {
         scan();
         log("decoys: scanned " + dname);
     }
-    for (std::size_t li = 0; li < work.size(); ++li) {
+    parallel_for(work.size(), threads, [&](std::size_t li) {
         LocusIndex& x = work[li].idx;
         std::vector<std::uint64_t> cand(candidates[li].begin(), candidates[li].end());
         std::sort(cand.begin(), cand.end());
@@ -530,7 +601,7 @@ std::vector<LocusIndex> build(const BuildOptions& o) {
         log(x.name + ": P " + std::to_string(np) + ", S " + std::to_string(ns) + ", R " + std::to_string(nr) + "; decoys " +
             std::to_string(x.decoy.size()) + " from " + std::to_string(x.decoy_windows) + " windows (" + std::to_string(x.decoy_bases) +
             " bp), screen " + std::to_string(x.screen.size()));
-    }
+    });
     std::vector<LocusIndex> out;
     for (auto& w : work) out.push_back(std::move(w.idx));
     return out;

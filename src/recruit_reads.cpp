@@ -1,5 +1,6 @@
 #include "panvar/recruit_reads.hpp"
 
+#include "panvar/flat_map.hpp"
 #include "panvar/gz_reader.hpp"
 #include "panvar/kmer.hpp"
 
@@ -22,44 +23,6 @@ constexpr std::uint8_t kLabelP = 0, kLabelS = 1, kLabelR = 2, kLabelD = 3, kLabe
 struct Fragment {
     std::string name, seq1, seq2;
     bool paired = false;
-};
-
-// An open-addressing table from k-mer codes (below 2^62, so the all-ones key marks an empty slot) to
-// values, sized at least twice the keys it is given; lookups probe linearly.
-template <typename V>
-class FlatMap {
-public:
-    void reserve(std::size_t n) {
-        std::size_t cap = 16;
-        while (cap < 2 * n) cap <<= 1;
-        keys_.assign(cap, kEmpty);
-        vals_.assign(cap, V{});
-        mask_ = cap - 1;
-    }
-    // The slot of `key`, claimed if absent; existing tells which.
-    V& slot(std::uint64_t key, bool& existing) {
-        std::size_t i = hash(key) & mask_;
-        while (keys_[i] != kEmpty && keys_[i] != key) i = (i + 1) & mask_;
-        existing = keys_[i] == key;
-        keys_[i] = key;
-        return vals_[i];
-    }
-    const V* find(std::uint64_t key) const {
-        for (std::size_t i = hash(key) & mask_;; i = (i + 1) & mask_) {
-            if (keys_[i] == key) return &vals_[i];
-            if (keys_[i] == kEmpty) return nullptr;
-        }
-    }
-
-private:
-    static constexpr std::uint64_t kEmpty = ~0ULL;
-    static std::size_t hash(std::uint64_t x) {
-        x ^= x >> 33; x *= 0xff51afd7ed558ccdULL; x ^= x >> 33; x *= 0xc4ceb9fe1a85ec53ULL; x ^= x >> 33;
-        return static_cast<std::size_t>(x);
-    }
-    std::vector<std::uint64_t> keys_;
-    std::vector<V> vals_;
-    std::size_t mask_ = 0;
 };
 
 // One locus, as reads see it: each k-mer's label (P/S/R, D for decoys), with a bit for multi-copy P.
@@ -367,21 +330,37 @@ ReadStats recruit_reads(const ReadOptions& o) {
     ReadStats st;
     const std::size_t threads = std::max<std::size_t>(1, o.threads);
     constexpr std::size_t kBatch = 20000;
-    // The next batch is read while the workers score the current one.
+    // The next batch is read while the workers score the current one; with mates, the two files are read
+    // on two threads.
+    std::vector<std::string> names2(kBatch);
     auto read_batch = [&](std::vector<Fragment>& batch) {
         batch.resize(kBatch);
-        std::size_t n = 0;
-        std::string n2;
-        while (n < kBatch && read_fastq(in1, batch[n].name, batch[n].seq1)) {
-            Fragment& f = batch[n];
-            f.paired = in2 != nullptr;
-            if (in2) {
-                if (!read_fastq(*in2, n2, f.seq2)) throw std::runtime_error("recruit: " + o.reads2 + " has fewer reads than " + o.reads1);
-                if (n2 != f.name) throw std::runtime_error("recruit: mates out of step: " + f.name + " and " + n2);
-            }
-            ++n;
+        std::size_t n1 = 0, n2 = 0;
+        std::exception_ptr failed1, failed2;
+        std::thread mates;
+        if (in2)
+            mates = std::thread([&] {
+                try {
+                    while (n2 < kBatch && read_fastq(*in2, names2[n2], batch[n2].seq2)) ++n2;
+                } catch (...) {
+                    failed2 = std::current_exception();
+                }
+            });
+        try {
+            while (n1 < kBatch && read_fastq(in1, batch[n1].name, batch[n1].seq1)) batch[n1++].paired = in2 != nullptr;
+        } catch (...) {
+            failed1 = std::current_exception();
         }
-        batch.resize(n);
+        if (mates.joinable()) mates.join();
+        if (failed1) std::rethrow_exception(failed1);
+        if (failed2) std::rethrow_exception(failed2);
+        if (in2) {
+            if (n2 < n1) throw std::runtime_error("recruit: " + o.reads2 + " has fewer reads than " + o.reads1);
+            if (n2 > n1) throw std::runtime_error("recruit: " + o.reads2 + " has more reads than " + o.reads1);
+            for (std::size_t i = 0; i < n1; ++i)
+                if (names2[i] != batch[i].name) throw std::runtime_error("recruit: mates out of step: " + batch[i].name + " and " + names2[i]);
+        }
+        batch.resize(n1);
     };
     std::vector<Fragment> batch, next;
     std::vector<std::vector<Row>> rows;
