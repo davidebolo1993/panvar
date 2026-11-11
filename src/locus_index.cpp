@@ -501,7 +501,7 @@ std::vector<LocusIndex> build(const BuildOptions& o) {
             // are split into ranges scanned in parallel and joined in order
             std::vector<std::vector<std::uint64_t>> hits(work.size());
             const std::size_t starts = seq.size() >= kK ? seq.size() - kK + 1 : 0;
-            const std::size_t parts = std::min<std::size_t>(scan_threads, std::max<std::size_t>(1, starts / 1000000));
+            const std::size_t parts = std::min<std::size_t>(scan_threads, std::max<std::size_t>(1, starts / 65536));
             std::vector<std::vector<std::vector<std::uint64_t>>> part_hits(parts, std::vector<std::vector<std::uint64_t>>(work.size()));
             auto scan_part = [&](std::size_t p) {
                 const std::size_t a = starts * p / parts, b = starts * (p + 1) / parts;

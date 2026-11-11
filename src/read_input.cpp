@@ -137,14 +137,21 @@ struct HtsFile {
             sam_close(fp);
             throw std::runtime_error("recruit: " + p + " is not SAM, BAM or CRAM");
         }
+        auto fail = [&](const std::string& why) {
+            if (hdr) sam_hdr_destroy(hdr);
+            sam_close(fp);
+            throw std::runtime_error("recruit: " + p + ": " + why);
+        };
+        // a BGZF or CRAM file whose writer stopped between blocks lacks the end marker: truncated
+        if (hts_check_EOF(fp) == 0) fail("truncated (no end-of-file marker)");
         if (pool != nullptr && pool->pool != nullptr) hts_set_thread_pool(fp, pool);
         if (f->format == cram) {
             if (!o.cram_reference.empty() && hts_set_fai_filename(fp, o.cram_reference.c_str()) != 0)
-                throw std::runtime_error("recruit: " + p + ": cannot use the CRAM reference " + o.cram_reference);
+                fail("cannot use the CRAM reference " + o.cram_reference);
             hts_set_opt(fp, CRAM_OPT_REQUIRED_FIELDS, SAM_QNAME | SAM_FLAG | SAM_RNAME | SAM_POS | SAM_RNEXT | SAM_PNEXT | SAM_SEQ);
         }
         hdr = sam_hdr_read(fp);
-        if (hdr == nullptr) throw std::runtime_error("recruit: " + p + ": cannot read the header");
+        if (hdr == nullptr) fail("cannot read the header");
         rec = bam_init1();
     }
     ~HtsFile() {
@@ -162,11 +169,31 @@ struct HtsFile {
         if (r == -1) return false;
         throw std::runtime_error("recruit: " + path + ": cannot read a record (truncated or damaged, or a CRAM whose reference cannot be found; see --cram-reference)");
     }
+    // Sorted by coordinate: the header says so, or it says nothing and the file has an index.
     bool coordinate_sorted() const {
         kstring_t ks = KS_INITIALIZE;
-        const bool yes = sam_hdr_find_tag_hd(hdr, "SO", &ks) == 0 && ks.s != nullptr && std::string(ks.s) == "coordinate";
+        const bool tagged = sam_hdr_find_tag_hd(hdr, "SO", &ks) == 0 && ks.s != nullptr;
+        const std::string so = tagged ? ks.s : "";
         ks_free(&ks);
-        return yes;
+        if (so == "coordinate") return true;
+        if (tagged && so != "unknown") return false;
+        hts_idx_t* idx = sam_index_load(fp, path.c_str());
+        if (idx == nullptr) return false;
+        hts_idx_destroy(idx);
+        return true;
+    }
+    std::string sample() const {
+        std::string sample;
+        const int n = sam_hdr_count_lines(hdr, "RG");
+        for (int i = 0; i < n; ++i) {
+            kstring_t ks = KS_INITIALIZE;
+            if (sam_hdr_find_tag_pos(hdr, "RG", i, "SM", &ks) == 0 && ks.s != nullptr) {
+                if (sample.empty()) sample = ks.s;
+                else if (sample != ks.s) sample = "several";
+            }
+            ks_free(&ks);
+        }
+        return sample;
     }
 };
 
@@ -208,9 +235,17 @@ public:
             pool_.pool = hts_tpool_init(static_cast<int>(o.threads));
             if (pool_.pool == nullptr) throw std::runtime_error("recruit: cannot start htslib threads");
         }
-        file_ = std::make_unique<HtsFile>(path, o, &pool_);
-        coordinate_ = file_->coordinate_sorted();
-        if (coordinate_ && !o.screened) throw std::runtime_error("recruit: coordinate-sorted input needs the loci's screen");
+        try {
+            file_ = std::make_unique<HtsFile>(path, o, &pool_);
+            coordinate_ = file_->coordinate_sorted();
+            sample_ = file_->sample();
+            if (coordinate_ && !o.screened) throw std::runtime_error("recruit: coordinate-sorted input needs the loci's screen");
+        } catch (...) {
+            file_.reset();
+            if (pool_.pool) hts_tpool_destroy(pool_.pool);
+            pool_.pool = nullptr;
+            throw;
+        }
     }
     ~Alignments() override {
         file_.reset();
@@ -237,7 +272,7 @@ public:
     std::string describe() const override {
         const htsFormat* f = hts_get_format(file_->fp);
         const char* kind = f->format == cram ? "CRAM" : f->format == bam ? "BAM" : "SAM";
-        return path_ + " (" + kind + (coordinate_ ? ", coordinate-sorted" : "") + ")";
+        return path_ + " (" + kind + (coordinate_ ? ", coordinate-sorted" : "") + (sample_.empty() ? "" : ", sample " + sample_) + ")";
     }
 
 private:
@@ -271,15 +306,26 @@ private:
             return;
         }
         const bool read1 = !(flag & BAM_FREAD2);
-        if (coordinate_ && b->core.tid != last_tid_) {
-            sweep(b->core.tid);
-            last_tid_ = b->core.tid;
+        if (coordinate_) {
+            check_order(b);
+            if (b->core.tid != last_tid_) {
+                sweep(b->core.tid, -1);
+                last_tid_ = b->core.tid;
+            } else if (st_.records % 65536 == 0) {
+                sweep(b->core.tid, b->core.pos);
+            }
         }
         const auto it = held_.find(name);
         if (it != held_.end()) {
-            pair_up(std::move(name), std::move(it->second), sequence_of(b), read1);
+            if (it->second.read1 != read1) {
+                pair_up(std::move(name), std::move(it->second), sequence_of(b), read1);
+                held_.erase(it);
+                return;
+            }
+            // a second read 1 (or read 2) of this name: not its mate; the held one goes on alone
+            ++st_.unmatched;
+            emit(it->first, std::move(it->second.seq), std::string(), false);
             held_.erase(it);
-            return;
         }
         Held h;
         h.seq = sequence_of(b);
@@ -292,7 +338,8 @@ private:
         }
         const std::int32_t tid = b->core.tid;
         const std::int64_t pos = b->core.pos;
-        const bool mate_unplaced = h.mtid < 0 || tid < 0;
+        // a mate without a known place (unplaced, or RNEXT/PNEXT unavailable) is waited for like a near one
+        const bool mate_unplaced = h.mtid < 0 || h.mpos < 0 || tid < 0;
         const bool behind = !mate_unplaced && (h.mtid < tid || (h.mtid == tid && h.mpos < pos));
         if (behind) {   // its mate passed and was not kept: it did not hit; this one decides the pair
             if (o_.screened(h.seq)) wanted_.push_back({std::move(name), std::move(h.seq), read1, h.mtid, h.mpos});
@@ -308,11 +355,26 @@ private:
         }
     }
 
-    // A new contig: reads waiting for a mate on a passed contig lost it (filtered out): kept if they hit.
-    void sweep(std::int32_t tid) {
+    // Pairing relies on the order the header claims: a record before the last one stops the run.
+    void check_order(const bam1_t* b) {
+        const std::int32_t tid = b->core.tid;
+        const std::int64_t pos = b->core.pos;
+        if (tid < 0) { unplaced_seen_ = true; return; }
+        if (unplaced_seen_ || tid < order_tid_ || (tid == order_tid_ && pos < order_pos_))
+            throw std::runtime_error("recruit: " + path_ + " is not sorted by coordinate (" + bam_get_qname(b) +
+                                     " comes after a later position), though it is read as sorted");
+        order_tid_ = tid;
+        order_pos_ = pos;
+    }
+
+    // Reads waiting for a mate whose place has passed lost it (filtered out): kept if they hit. Called at a
+    // new contig (pos -1: any mate on another contig has passed) and now and then within one.
+    void sweep(std::int32_t tid, std::int64_t pos) {
         for (auto it = held_.begin(); it != held_.end();) {
             Held& h = it->second;
-            if (!h.candidate && h.mtid >= 0 && h.mtid != tid) {
+            const bool known = h.mtid >= 0 && h.mpos >= 0;
+            const bool passed = pos < 0 ? h.mtid != tid : (h.mtid < tid || (h.mtid == tid && h.mpos < pos));
+            if (!h.candidate && known && passed) {
                 if (o_.screened(h.seq)) wanted_.push_back({it->first, std::move(h.seq), h.read1, h.mtid, h.mpos});
                 else ++st_.dropped;
                 it = held_.erase(it);
@@ -328,8 +390,7 @@ private:
         if (!coordinate_) {
             for (auto& [name, h] : held_) {
                 ++st_.unmatched;
-                if (h.read1) emit(name, std::move(h.seq), std::string(), true);
-                else emit(name, std::string(), std::move(h.seq), true);
+                emit(name, std::move(h.seq), std::string(), false);
             }
             held_.clear();
             return;
@@ -339,6 +400,25 @@ private:
             else ++st_.dropped;
         }
         held_.clear();
+        // both mates waiting (stale mate fields): they are each other's mate
+        std::unordered_map<std::string, std::size_t> first;
+        std::vector<Wanted> rest;
+        std::vector<char> paired(wanted_.size(), 0);
+        for (std::size_t i = 0; i < wanted_.size(); ++i) {
+            const auto [it, fresh] = first.emplace(wanted_[i].name, i);
+            if (fresh) continue;
+            Wanted& a = wanted_[it->second];
+            Wanted& b = wanted_[i];
+            if (paired[it->second] || a.read1 == b.read1) continue;
+            Held h;
+            h.seq = std::move(a.seq);
+            h.read1 = a.read1;
+            pair_up(b.name, std::move(h), std::move(b.seq), b.read1);
+            paired[it->second] = paired[i] = 1;
+        }
+        for (std::size_t i = 0; i < wanted_.size(); ++i)
+            if (!paired[i]) rest.push_back(std::move(wanted_[i]));
+        wanted_.swap(rest);
         if (wanted_.empty()) return;
         fetch();
     }
@@ -356,7 +436,7 @@ private:
         if (idx != nullptr) {
             for (std::size_t i = 0; i < wanted_.size(); ++i) {
                 const Wanted& w = wanted_[i];
-                if (w.mtid < 0) continue;
+                if (w.mtid < 0 || w.mpos < 0) continue;
                 hts_itr_t* itr = sam_itr_queryi(idx, w.mtid, w.mpos, w.mpos + 1);
                 if (itr == nullptr) continue;
                 int r;
@@ -369,7 +449,7 @@ private:
         }
         std::unordered_map<std::string, std::size_t> rest;   // a second pass for mates no index found
         for (std::size_t i = 0; i < wanted_.size(); ++i)
-            if (!found[i] && (idx == nullptr || wanted_[i].mtid < 0)) rest.emplace(wanted_[i].name, i);
+            if (!found[i] && (idx == nullptr || wanted_[i].mtid < 0 || wanted_[i].mpos < 0)) rest.emplace(wanted_[i].name, i);
         if (!rest.empty()) {
             if (o_.log) o_.log(path_ + ": a second pass for " + std::to_string(rest.size()) + " mates" + (idx == nullptr ? " (no index)" : ""));
             HtsFile pass(path_, o_, &pool_);
@@ -385,8 +465,7 @@ private:
             if (found[i]) continue;
             Wanted& w = wanted_[i];
             ++st_.unmatched;
-            if (w.read1) emit(std::move(w.name), std::move(w.seq), std::string(), true);
-            else emit(std::move(w.name), std::string(), std::move(w.seq), true);
+            emit(std::move(w.name), std::move(w.seq), std::string(), false);
         }
         wanted_.clear();
     }
@@ -420,8 +499,12 @@ private:
     std::string path_;
     htsThreadPool pool_{nullptr, 0};
     std::unique_ptr<HtsFile> file_;
+    std::string sample_;
     bool coordinate_ = false, eof_ = false;
-    std::int32_t last_tid_ = -2;
+    std::int32_t last_tid_ = -2;     // the contig of the last record (sweeps)
+    std::int32_t order_tid_ = -1;    // the last placed record's position (the order check)
+    std::int64_t order_pos_ = -1;
+    bool unplaced_seen_ = false;
     std::unordered_map<std::string, Held> held_;
     std::vector<Wanted> wanted_;
     std::deque<Fragment> ready_;
@@ -449,34 +532,14 @@ std::unique_ptr<FragmentSource> open_input(const std::string& path, const InputO
     return std::make_unique<FastqSingle>(path, options.interleaved);
 }
 
-std::string sample_of(const std::string& path) {
-    samFile* fp = sam_open(path.c_str(), "r");
-    if (fp == nullptr) return "";
-    sam_hdr_t* hdr = sam_hdr_read(fp);
-    std::string sample;
-    bool agree = true;
-    if (hdr != nullptr) {
-        const int n = sam_hdr_count_lines(hdr, "RG");
-        for (int i = 0; i < n && agree; ++i) {
-            kstring_t ks = KS_INITIALIZE;
-            if (sam_hdr_find_tag_pos(hdr, "RG", i, "SM", &ks) == 0 && ks.s != nullptr) {
-                if (sample.empty()) sample = ks.s;
-                else if (sample != ks.s) agree = false;
-            }
-            ks_free(&ks);
-        }
-        sam_hdr_destroy(hdr);
-    }
-    sam_close(fp);
-    return agree ? sample : "";
-}
-
 InputStats count_records(const std::string& path, const InputOptions& options) {
     if (!is_alignment_file(path)) {
         FastqSingle f(path, false);
         std::vector<Fragment> batch;
         while (f.next(batch, 100000) > 0) {}
-        return f.stats();
+        InputStats st = f.stats();
+        if (options.interleaved) st.pairs = st.records, st.fragments = 0;
+        return st;
     }
     htsThreadPool pool{nullptr, 0};
     if (options.threads > 1) pool.pool = hts_tpool_init(static_cast<int>(options.threads));
@@ -492,14 +555,12 @@ InputStats count_records(const std::string& path, const InputOptions& options) {
             else {
                 if (flag & BAM_FDUP) ++st.duplicates;
                 if (flag & BAM_FUNMAP) ++st.unmapped;
-                if (flag & BAM_FPAIRED) ++st.pairs;   // mates, here: each pair counts twice
-                else ++st.fragments;
+                if (flag & BAM_FPAIRED) ++st.pairs;   // here: paired reads
+                else ++st.fragments;                  // here: single reads
             }
         }
     }
     if (pool.pool) hts_tpool_destroy(pool.pool);
-    st.pairs /= 2;
-    st.fragments += st.pairs;
     return st;
 }
 

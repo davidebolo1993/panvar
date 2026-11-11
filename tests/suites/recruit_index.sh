@@ -57,6 +57,14 @@ python3 "$TOOLS/locus_reads.py" data/ref.fa chr1 115000 165000 30 span 6 reads_s
 check "reads holding the whole locus between two flanks are certain, partial ($(reason span.tsv partial) of 30)" '[[ $(reason span.tsv partial) == 30 ]]'
 check "reads past the end are certain, partial ($(reason long.tsv partial) of 300), segments within the read" '[[ $(reason long.tsv partial) -ge 270 ]] && awk -F"\t" '"'"'NR>1 && $4=="partial" {split($6, g, "-"); if (g[2] - g[1] >= 2000 || g[1] != 0 && g[2] != 2000) bad = 1} END {exit bad}'"'"' long.tsv'
 
+# the decoy scan split across threads gives the same index
+"$BIN" recruit -t 4 -q --background s -r ref --index-only --save-index idx4 --locus data/locus.gfa
+"$BIN" recruit --dump-index idx4/locus.plx=dump4t.tsv
+check "an index built on 4 threads equals the 1-thread one" 'cmp -s dump.tsv dump4t.tsv'
+mkdir -p twin/a twin/b && cp data/locus.gfa twin/a/locus.gfa && cp data/locus.gfa twin/b/locus.gfa
+"$BIN" recruit -t 2 -q --background s -r ref --index-only --save-index idx_twin --locus twin/a/locus.gfa --locus twin/b/locus.gfa 2> twin.txt; rc=$?
+check "two graphs of one name are refused" '[[ $rc -ne 0 ]] && grep -q "rename one graph" twin.txt'
+
 "${RC[@]}" --locus data/locus.gfa 2> log2.txt
 check "a current index is reused" 'grep -q "is current, reused" log2.txt'
 "${RC[@]}" --locus data/locus.gfa --informative-max 2 2> log3.txt

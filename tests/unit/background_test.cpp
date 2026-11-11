@@ -581,6 +581,19 @@ int main(int argc, char** argv) {
         check(ms.genomes().size() == 8 && mspans.size() == 2 * spans.size(), "merged anchor files keep every genome's places");
     }
 
+    // a haplotype contig held as several walks: an interval across them is cut from each, a gap refused
+    {
+        const std::string gfa = (dir / "split_walks.gfa").string();
+        std::ofstream(gfa) << "H\tVN:Z:1.1\nS\ta\tACGTACGTAC\nS\tb\tGGGGGCCCCC\nS\tc\tTTTTTAAAAA\n"
+                           << "W\ts\t1\tchrX\t0\t20\t>a>b\nW\ts\t1\tchrX\t20\t30\t>c\n"
+                           << "W\ts\t2\tchrY\t0\t10\t>a\nW\ts\t2\tchrY\t15\t25\t<b\n";
+        const bg::graph::Haplotypes h(gfa);
+        const bool across = h.fetch("s#1#chrX", 5, 25) == "CGTACGGGGGCCCCCTTTTT" && h.fetch("s#1#chrX", 22, 30) == "TTTAAAAA";
+        bool gap = false;
+        try { h.fetch("s#2#chrY", 5, 20); } catch (const std::exception&) { gap = true; }
+        check(across && gap, "graph intervals are cut across consecutive walks of a contig; a gap between walks is refused");
+    }
+
     std::printf("\nbackground_test: %s\n", failures ? (std::to_string(failures) + " check(s) failed").c_str() : "all checks passed");
     return failures ? 1 : 0;
 }

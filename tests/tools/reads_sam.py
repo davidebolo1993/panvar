@@ -2,7 +2,8 @@
 """SAM files holding the pairs of a FASTQ pair, for checking that recruit reads the same fragments from
 both: one name-sorted, one coordinate-sorted. Positions are made up (the reads are not aligned), placed to
 exercise the pairing: most mates 250 bp apart, some far apart on the same contig, some on another contig,
-some with an unmapped mate placed beside it, some pairs unmapped at the end; reverse-strand records hold
+some with an unmapped mate placed beside it, some without mate positions (PNEXT 0), some pairs unmapped at
+the end; reverse-strand records hold
 the reverse complement; some records are duplicates (kept); extra secondary, supplementary and QC-failed
 records (skipped) are added.
 
@@ -58,10 +59,15 @@ def main():
         elif kind < 0.90:      # another contig
             c2 = contigs[1] if c1 == contigs[0] else contigs[0]
             p2 = rng.randrange(1, c2[1] - 1000)
-        elif kind < 0.95:      # mate 2 unmapped, placed with mate 1
+        elif kind < 0.94:      # mate 2 unmapped, placed with mate 1
             c2, p2 = c1, p1
             f2 = (f2 | 4) & ~16 & ~32
             f1 |= 8
+        elif kind < 0.97:      # mates near each other, but their records give no mate position (PNEXT 0)
+            c2, p2 = c1, p1 + 250
+            recs.append(record(n1, f1, c1[0], p1, 60, "=", 0, s1))
+            recs.append(record(n2, f2, c2[0], p2, 60, "=", 0, s2))
+            continue
         else:                  # both unmapped: the end of the file
             f1, f2 = 1 | 4 | 8 | 64, 1 | 4 | 8 | 128
             recs.append(record(n1, f1, "*", 0, 0, "*", 0, s1))

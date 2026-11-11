@@ -6,7 +6,8 @@
 // Records: secondary, supplementary and QC-failed alignments are skipped; unmapped records and
 // duplicates are kept; a reverse-strand record is turned back to the orientation it was sequenced in.
 // Mates: in a file not sorted by coordinate a read waits for its mate (mates are adjacent in name-grouped
-// files). In a coordinate-sorted file a read waits when its mate lies ahead within 100 kb; one whose mate
+// files). A file is read as sorted by coordinate when its header says so, or says nothing and it has an
+// index; positions going backwards then stop the run. In a coordinate-sorted file a read waits when its mate lies ahead within 100 kb; one whose mate
 // lies further (or on another contig) is kept only when it hits a locus screen, and a read whose mate
 // passed unkept is screened and, if it hits, its mate is fetched at the end, by an indexed query when the
 // file has an index, else by a second pass. Either way a pair reaches the scorer when either mate hits a
@@ -39,7 +40,7 @@ struct InputStats {
     std::uint64_t duplicates = 0, unmapped = 0;                   // kept
     std::uint64_t fragments = 0, pairs = 0;
     std::uint64_t fetched = 0;          // mates fetched at the end (coordinate-sorted input)
-    std::uint64_t unmatched = 0;        // paired reads whose mate was never found (scored alone)
+    std::uint64_t unmatched = 0;        // paired reads whose mate was never found (scored alone, as single reads)
     std::uint64_t dropped = 0;          // reads set aside unscreened whose mate never came (coordinate-sorted)
     std::uint64_t unscreened = 0;       // pairs passed over because neither mate hit a screen (coordinate-sorted)
 };
@@ -59,9 +60,8 @@ std::unique_ptr<FragmentSource> open_fastq_pair(const std::string& reads1, const
 std::unique_ptr<FragmentSource> open_input(const std::string& path, const InputOptions& options);
 // Whether htslib reads the file as SAM, BAM or CRAM.
 bool is_alignment_file(const std::string& path);
-// The sample an alignment file holds: its read groups' SM when they agree, else "".
-std::string sample_of(const std::string& path);
-// Every record of an alignment file counted by kind (for --dry-run); FASTQ files count records only.
+// Every record of a file counted by kind (for --dry-run): `pairs` then counts paired reads and `fragments`
+// single reads, as kept by the record policy; FASTQ files are single reads unless interleaved.
 InputStats count_records(const std::string& path, const InputOptions& options);
 
 }  // namespace panvar::recruit

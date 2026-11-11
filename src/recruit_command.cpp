@@ -70,7 +70,7 @@ void print_recruit_help() {
         << "                           elsewhere can carry a few private k-mers by sequencing error\n"
         << "      --error-rate <e>     The reads' error rate per base: more mismatch runs than errors and new\n"
         << "                           alleles explain make a read divergent (default 0.002)\n"
-        << "  -t, --threads <N>        Worker threads (reading runs beside them)\n"
+        << "  -t, --threads <N>        Scoring threads; a reader and N/4 decompression threads run beside them\n"
         << "  -q, --quiet              No progress logs\n"
         << "  -h, --help               Show this help\n";
 }
@@ -187,7 +187,8 @@ int run_recruit_command(const std::vector<std::string>& args) {
         recruit::InputOptions io;
         io.cram_reference = ro.cram_reference;
         io.threads = threads == 0 ? bg::default_threads() : threads;
-        std::cout << "sample\tfile\trecords\tsecondary\tsupplementary\tqc_fail\tduplicates\tunmapped\tfragments\tpairs\tseconds\n";
+        io.interleaved = ro.interleaved;
+        std::cout << "sample\tfile\trecords\tsecondary\tsupplementary\tqc_fail\tduplicates\tunmapped\tsingle_reads\tpaired_reads\tseconds\n";
         for (const auto& [name, files] : samples)
             for (const auto& [a, b] : files)
                 for (const std::string* f : {&a, &b}) {
@@ -232,6 +233,14 @@ int run_recruit_command(const std::vector<std::string>& args) {
         fs::create_directories(dir.empty() ? fs::path(".") : dir);
         return (dir / (n + ext)).string();
     };
+    {   // each locus writes <name>.plx: two graphs with one name would overwrite each other
+        std::map<std::string, std::string> taken;
+        for (const auto& l : o.loci) {
+            const std::string plx = fs::absolute(index_path(l, ".plx")).lexically_normal().string();
+            const auto [it, fresh] = taken.emplace(plx, l);
+            if (!fresh) throw std::runtime_error("recruit: " + it->second + " and " + l + " would both be indexed as " + plx + "; rename one graph");
+        }
+    }
     recruit::BuildOptions todo = o;
     todo.loci.clear();
     std::vector<std::string> wrote;

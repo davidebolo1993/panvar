@@ -98,19 +98,35 @@ std::pair<std::size_t, std::size_t> locus_segment(const std::vector<Kmer>& v, do
 // homologous flank), else they count with the segment's. Codes counted are added to `mine`.
 void count_segment(const std::vector<Kmer>& v, std::pair<std::size_t, std::size_t> seg, bool boundary, Evidence& ev,
                    const std::vector<std::uint64_t>* seen, std::vector<std::uint64_t>* mine) {
-    std::size_t last_p = 0, last_d = 0, last_out = 0;
-    bool have_p = false, have_d = false, have_out = false, in_n = false;
     auto counted_before = [&](std::uint64_t c) { return seen != nullptr && std::binary_search(seen->begin(), seen->end(), c); };
+    // A site is a group of k-mers starting within k bases of the group's first; a group with a k-mer the
+    // other mate counted is that mate's site, whichever end of it this mate reaches first.
+    struct Sites {
+        bool open = false, seen = false;
+        std::size_t first = 0;
+        std::uint32_t* counter = nullptr;
+        void add(std::size_t start, bool already, std::uint32_t* to) {
+            if (!open || start >= first + kK) {
+                close();
+                open = true;
+                seen = false;
+                first = start;
+                counter = to;
+            }
+            seen = seen || already;
+        }
+        void close() {
+            if (open && !seen) ++*counter;
+            open = false;
+        }
+    } p, d, out;
+    bool in_n = false;
     for (std::size_t i = 0; i < v.size(); ++i) {
         const Kmer& k = v[i];
         const bool inside = i >= seg.first && i <= seg.second;
         if (!inside) {
             if (k.lab == kLabelD) {
-                if (!counted_before(k.code) && (!have_out || k.start >= last_out + kK)) {
-                    ++(boundary ? ev.decoy_out : ev.sites_d);
-                    last_out = k.start;
-                    have_out = true;
-                }
+                out.add(k.start, counted_before(k.code), boundary ? &ev.decoy_out : &ev.sites_d);
                 if (mine) mine->push_back(k.code);
             }
             continue;
@@ -118,16 +134,19 @@ void count_segment(const std::vector<Kmer>& v, std::pair<std::size_t, std::size_
         ++ev.seg_kmers;
         if (in_n && (k.lab != kLabelN || k.start != v[i - 1].start + 1)) in_n = false;
         if (k.lab == kLabelP) {
-            if (!counted_before(k.code) && (!have_p || k.start >= last_p + kK)) { ++ev.sites_p; last_p = k.start; have_p = true; }
+            p.add(k.start, counted_before(k.code), &ev.sites_p);
             if (mine) mine->push_back(k.code);
         } else if (k.lab == kLabelD) {
-            if (!counted_before(k.code) && (!have_d || k.start >= last_d + kK)) { ++ev.sites_d; last_d = k.start; have_d = true; }
+            d.add(k.start, counted_before(k.code), &ev.sites_d);
             if (mine) mine->push_back(k.code);
         } else if (k.lab == kLabelN && !in_n) {
             ++ev.runs_n;
             in_n = true;
         }
     }
+    p.close();
+    d.close();
+    out.close();
 }
 
 // The most mismatch runs a locus read of this many callable k-mers should show: an upper Poisson bound on
@@ -268,6 +287,9 @@ ReadStats recruit_reads(const ReadOptions& o) {
         const LocusIndex x = load(o.indexes[li]);
         LocusTable& t = loci[li];
         t.name = x.name;
+        for (std::size_t lj = 0; lj < li; ++lj)
+            if (loci[lj].name == x.name)
+                throw std::runtime_error("recruit: two loci are named " + x.name + " (" + o.indexes[lj] + ", " + o.indexes[li] + "); rename one graph");
         t.label.reserve(x.codes.size() + x.decoy.size());
         bool existing = false;
         for (std::size_t i = 0; i < x.codes.size(); ++i)
@@ -300,7 +322,7 @@ ReadStats recruit_reads(const ReadOptions& o) {
     InputOptions io;
     io.cram_reference = o.cram_reference;
     io.interleaved = o.interleaved;
-    io.threads = std::max<std::size_t>(1, o.threads);
+    io.threads = std::max<std::size_t>(1, o.threads / 4);   // decompression: a quarter of the scorers keeps up
     io.screened = screened;
     io.log = o.log;
     std::size_t next_input = 0;

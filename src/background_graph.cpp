@@ -305,22 +305,35 @@ Haplotypes::Haplotypes(const std::string& gfa) : impl_(std::make_unique<Impl>())
 
 Haplotypes::~Haplotypes() = default;
 
+// A contig of a haplotype may be several walks (W lines with consecutive ranges): the interval is cut from
+// each walk it overlaps, in order; a part no walk covers is an error, not a shorter sequence.
 std::string Haplotypes::fetch(const std::string& contig, std::uint64_t start, std::uint64_t end) const {
+    std::vector<std::size_t> hit;
     for (std::size_t wi = 0; wi < impl_->walks.size(); ++wi) {
+        const auto& st = impl_->starts[wi];
+        if (impl_->walks[wi].contig == contig && start < st.back() && end > st.front()) hit.push_back(wi);
+    }
+    std::sort(hit.begin(), hit.end(), [&](std::size_t x, std::size_t y) { return impl_->starts[x].front() < impl_->starts[y].front(); });
+    std::string out;
+    std::uint64_t at = start;
+    for (const std::size_t wi : hit) {
         const Walk& w = impl_->walks[wi];
         const auto& st = impl_->starts[wi];
-        if (w.contig != contig || start >= st.back() || end <= st.front()) continue;
-        std::string out;
-        std::size_t i = static_cast<std::size_t>(std::upper_bound(st.begin(), st.end(), std::max(start, st.front())) - st.begin()) - 1;
-        for (; i + 1 < st.size() && st[i] < end; ++i) {
+        if (st.back() <= at) continue;
+        if (st.front() > at) break;   // a gap before this walk
+        const std::uint64_t stop = std::min<std::uint64_t>(end, st.back());
+        std::size_t i = static_cast<std::size_t>(std::upper_bound(st.begin(), st.end(), at) - st.begin()) - 1;
+        for (; i + 1 < st.size() && st[i] < stop; ++i) {
             const auto [v, rev] = w.steps[i];
-            const std::uint64_t from = start > st[i] ? start - st[i] : 0;
-            const std::uint64_t to = std::min<std::uint64_t>(impl_->g.len(v), end - st[i]);
+            const std::uint64_t from = at > st[i] ? at - st[i] : 0;
+            const std::uint64_t to = std::min<std::uint64_t>(impl_->g.len(v), stop - st[i]);
             impl_->g.append(out, v, rev, from, to);
         }
-        return out;
+        at = stop;
+        if (at >= end) return out;
     }
-    throw std::runtime_error("background: no haplotype " + contig + " covering " + std::to_string(start) + "-" + std::to_string(end));
+    throw std::runtime_error("background: no haplotype " + contig + " covering " + std::to_string(at) + "-" + std::to_string(end) +
+                             (at > start ? " (of " + std::to_string(start) + "-" + std::to_string(end) + ")" : std::string()));
 }
 
 void spell_graph(const std::string& gfa, const std::string& fasta_out) {

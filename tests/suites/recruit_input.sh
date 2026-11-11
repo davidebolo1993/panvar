@@ -49,8 +49,41 @@ check "the coordinate-sorted SAM counts every fragment" 'grep -q "4500 fragments
 check "QC-failed reads never reach the table" '! grep -q qcfail coord.1.tsv'
 check "8 threads write the same rows in the same order as 1" 'cmp -s coord.1.tsv coord.8.tsv && cmp -s name.1.tsv name.8.tsv'
 
+# mates that overlap wholly (150 bp fragments): the pair holds exactly the sites of one mate
+python3 "$TOOLS/locus_reads.py" data/ref.fa chr1 120000 160000 1000 ovl 9 ovl 150
+"$BIN" recruit --locus "$IDX" -1 ovl_1.fq -2 ovl_2.fq -o ovl_pair.tsv -q
+"$BIN" recruit --locus "$IDX" -i ovl_1.fq -o ovl_one.tsv -q
+check "wholly overlapping mates count each site once" 'diff <(cut -f1,8 ovl_pair.tsv | sort) <(cut -f1,8 ovl_one.tsv | sort) > /dev/null'
+
+# mates lost to the QC filter: their partners are scored alone and reported
+awk -F'\t' 'BEGIN {OFS = "\t"} !/^@/ && int($2 / 128) % 2 == 1 && int($2 / 512) % 2 == 0 && ++n % 25 == 0 {$2 += 512} {print}' coord.sam > orphans.sam
+"$BIN" recruit --locus "$IDX" -i orphans.sam -o orphans.tsv -t 2 2> orphans.log; rc=$?
+check "reads whose mate was filtered are scored alone ($(grep -o '[0-9]* reads without their mate' orphans.log))" '[[ $rc -eq 0 ]] && grep -q "reads without their mate" orphans.log'
+
+sed 's/SO:queryname/SO:coordinate/' name.sam > liar.sam
+"$BIN" recruit --locus "$IDX" -i liar.sam -o x.tsv -q 2> err3.txt; rc=$?
+check "a file claiming coordinate order without it stops the run" '[[ $rc -ne 0 ]] && grep -q "not sorted by coordinate" err3.txt'
+
+if command -v samtools > /dev/null; then
+  samtools view -b -o coord.bam coord.sam && samtools index coord.bam
+  "$BIN" recruit --locus "$IDX" -i coord.bam -o bam.tsv -t 4 2> bam.log; sorted bam.tsv
+  check "a coordinate-sorted BAM with index gives the same table, mates fetched through the index" 'cmp -s bam.tsv.sorted fq.tsv.sorted && grep -q "mates fetched" bam.log && ! grep -q "second pass" bam.log'
+  for c in chrA chrB; do printf '>%s\n' $c; head -c 20000000 /dev/zero | tr '\0' 'A' | fold -w 60; echo; done > zero.fa
+  samtools faidx zero.fa && samtools view -C -T zero.fa -o coord.cram coord.bam 2> /dev/null && samtools index coord.cram
+  "$BIN" recruit --locus "$IDX" -i coord.cram --cram-reference zero.fa -o cram.tsv -t 4 -q; sorted cram.tsv
+  check "a CRAM gives the same table" 'cmp -s cram.tsv.sorted fq.tsv.sorted'
+  python3 -c "import sys; d=open('coord.bam','rb').read(); import struct; o=0; ends=[]
+while o < len(d):
+    bsize=struct.unpack('<H', d[o+16:o+18])[0]+1; o+=bsize; ends.append(o)
+open('cut.bam','wb').write(d[:ends[len(ends)//2]])"
+  "$BIN" recruit --locus "$IDX" -i cut.bam -o x.tsv -q 2> err4.txt; rc=$?
+  check "a BAM cut at a block boundary is refused as truncated" '[[ $rc -ne 0 ]] && grep -q "truncated" err4.txt'
+else
+  echo "  skip BAM, CRAM and truncation checks (samtools not installed)"
+fi
+
 "$BIN" recruit -i name.sam -1 r_1.fq -2 r_2.fq --dry-run > dry.tsv
-check "--dry-run counts records by kind" 'awk -F"\t" '"'"'$2=="name.sam" && $3 > 9000 && $4 > 0 && $5 > 0 && $6 == 50 && $10 == 4500'"'"' dry.tsv | grep -q . && awk -F"\t" '"'"'$2=="r_1.fq" && $3 == 4500'"'"' dry.tsv | grep -q .'
+check "--dry-run counts records by kind" 'awk -F"\t" '"'"'$2=="name.sam" && $3 > 9000 && $4 > 0 && $5 > 0 && $6 == 50 && $10 == 9000'"'"' dry.tsv | grep -q . && awk -F"\t" '"'"'$2=="r_1.fq" && $3 == 4500'"'"' dry.tsv | grep -q .'
 
 printf 's1\tr_1.fq\tr_2.fq\ns2\tname.sam\ns2\tinter.fq\n' > sheet.tsv
 "$BIN" recruit --locus "$IDX" --samples sheet.tsv -o per_sample -q
