@@ -14,6 +14,8 @@ The output is a table with one row per fragment and locus, the recruited reads a
 
 ## How it works
 
+Indexing and scoring are panvar's own; SAM, BAM and CRAM are read with [htslib](https://github.com/samtools/htslib), and the background is queried through `background`'s store or its [SSHash](https://github.com/jermp/sshash) dictionary.
+
 The index, built once per locus graph and kept beside it (`<locus>.plx`, with a report `<locus>.index.tsv`):
 
 1. Every canonical 31-mer of the graph's haplotypes is collected, with the nodes it starts on and its largest copy number within one haplotype. A k-mer once in every haplotype is a backbone k-mer: its depth in a sample is the depth of one copy.
