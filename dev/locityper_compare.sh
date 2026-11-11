@@ -11,8 +11,8 @@
 # LOCITYPER=<locityper executable>; panvar from build/.
 set -euo pipefail
 
-OUT="$1"; JF="$2"; TARGETS="$3"; SIM="${4:-$HOME/panvar-data/sim}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+OUT="$1"; JF="$2"; TARGETS="$3"; SIM="${4:-$ROOT/tests/examples/recruit_sim}"
 P="$ROOT/build/panvar"
 LT="${LOCITYPER:-locityper}"
 mkdir -p "$OUT"

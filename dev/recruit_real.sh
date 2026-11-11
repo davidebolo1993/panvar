@@ -7,9 +7,9 @@
 set -euo pipefail
 
 BAM="$1"; SAMPLE="$2"; OUT="$3"
-SIM="${4:-$HOME/panvar-data/sim}"
-BG="${5:-$HOME/panvar-data/poc/poc.bgk}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+SIM="${4:-$ROOT/tests/examples/recruit_sim}"
+BG="${5:-$SIM/bg.bgk}"
 P="$ROOT/build/panvar"
 RD="$ROOT/tests/real_data"
 mkdir -p "$OUT"

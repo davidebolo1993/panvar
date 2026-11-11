@@ -12,7 +12,7 @@ set -euo pipefail
 
 abs() { echo "$(cd "$(dirname "$1")" && pwd)/$(basename "$1")"; }
 mkdir -p "$1"
-OUT="$(cd "$1" && pwd)"; TARGETS="$(abs "$2")"; SIM="$(abs "${3:-$HOME/panvar-data/sim}")"; LT_RUN="${4:+$(abs "$4")}"
+OUT="$(cd "$1" && pwd)"; TARGETS="$(abs "$2")"; SIM="$(abs "${3:-$(cd "$(dirname "$0")/.." && pwd)/tests/examples/recruit_sim}")"; LT_RUN="${4:+$(abs "$4")}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BBDUK="${BBDUK:-bbduk.sh}"; MB="${MIRABAIT:-mirabait}"
 cd "$OUT"

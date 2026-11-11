@@ -12,9 +12,8 @@
 #   recruit_benchmark.sh [sim dir]
 set -euo pipefail
 
-SIM="${1:-$HOME/panvar-data/sim}"
-[[ -z "$SIM" ]] && SIM="$HOME/panvar-data/sim"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+SIM="${1:-$ROOT/tests/examples/recruit_sim}"
 P="$ROOT/build/panvar"
 OUT="$SIM/benchmark"
 mkdir -p "$OUT"

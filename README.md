@@ -1,6 +1,6 @@
 # panvar
 
-`panvar` is a modular C++17 toolkit for pangenome-graph SV calling and association testing. It runs an end-to-end pipeline — snarl finding, tandem-repeat normalization, graph-native structural-variant calling, feature description, and association testing: `bubble → panphorte → call → describe → associate`, with an opt-in `rebuild` step (re-induce a locus graph too fragmented to decompose) before `bubble`, an opt-in `refine` step (POA-realign bubble interiors to remove graph-builder alignment artifacts) between `panphorte` and `call`, the `inspect` utility available at any step, and `benchmark` for assessing the quality of the calls.
+`panvar` is a modular C++17 toolkit for pangenome-graph SV calling and association testing. It runs an end-to-end pipeline — snarl finding, tandem-repeat normalization, graph-native structural-variant calling, feature description, and association testing: `bubble → panphorte → call → describe → associate`, with an opt-in `rebuild` step (re-induce a locus graph too fragmented to decompose) before `bubble`, an opt-in `refine` step (POA-realign bubble interiors to remove graph-builder alignment artifacts) between `panphorte` and `call`, the `inspect` utility available at any step, and `benchmark` for assessing the quality of the calls. A second pipeline, `background → recruit`, sorts a sample's sequencing reads to locus graphs without aligning them: the genome's k-mers are counted once, each locus is indexed against them, and each read is called certain, ambiguous or unrecruited for the loci it touches.
 
 ## Install
 
@@ -30,6 +30,7 @@ docker run --rm -v "$PWD":/work --entrypoint /usr/local/bin/_entrypoint.sh panva
 
 - [docs/README.md](docs/README.md) — documentation index
 - Modules: [rebuild](docs/rebuild.md) · [bubble](docs/bubble.md) · [panphorte](docs/panphorte.md) · [refine](docs/refine.md) · [call](docs/call.md) · [describe](docs/describe.md) · [associate](docs/associate.md) · [inspect](docs/inspect.md) · [benchmark](docs/benchmark.md)
+- Read recruitment: [background](docs/background.md) · [recruit](docs/recruit.md)
 
 ## License
 

@@ -13,7 +13,7 @@
 set -euo pipefail
 
 abs() { echo "$(cd "$(dirname "$1")" && pwd)/$(basename "$1")"; }
-OUT="$1"; SIM="$(abs "${2:-$HOME/panvar-data/sim}")"; BG="$(abs "${3:-$SIM/bg_g38.bgk}")"; NULL="${4:-HG00097}"
+OUT="$1"; SIM="$(abs "${2:-$(cd "$(dirname "$0")/.." && pwd)/tests/examples/recruit_sim}")"; BG="$(abs "${3:-$SIM/bg_g38.bgk}")"; NULL="${4:-HG00097}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 P="$ROOT/build/panvar"
 RD="$ROOT/tests/real_data"

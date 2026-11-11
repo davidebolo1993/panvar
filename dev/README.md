@@ -100,3 +100,44 @@ With `--calibrate`, `calibrate.sh` then runs null simulations for what no tool c
 | `--group`, 2% cases: burden / SKAT / SKAT-O | 4.7% / 9.5% / 7.8% below 0.05; 0.8% / 4.1% / 3.4% below 0.01 | 5%, 1% |
 | `delta_r2` interval, 300 noise records against one | 0 of 100 exclude 0 | at most 5% |
 
+## Read recruitment against simulations
+
+`dev/recruit_simulate.sh` makes the read sets of the recruitment benchmark in `tests/examples/recruit_sim`, from the paralog and tandem-repeat graphs of `tests/real_data`. Per locus, a sample and its relatives are held out of the graph (`dev/recruit_sources.py held-out`), and the locus is indexed without them against two backgrounds: GRCh38 and CHM13 (the main arm), and GRCh38 alone (so CHM13 is a genome the index never saw). Reads come from the held-out sample's two haplotypes (the positives), from GRCh38 2 Mb around the locus, from the decoy windows, from 15 kb across each locus edge, and from 1x of GRCh38 and of CHM13 with the loci masked; each set in its own file, so the file is the truth. Short pairs come from wgsim and ART's HiSeq 2500 profile, long reads from pbsim3's ONT model and `dev/simulate_hifi.py`; ART pairs and ONT reads carry their true span in their names (`dev/sim_truth.py`). With `WG=1` it adds a whole-GRCh38 arm and whole-CHM13 negatives.
+
+`dev/recruit_benchmark.sh` recruits every set in every arm and `dev/recruit_score.py` scores them: certain and recruited share of the locus fragments, fragments from elsewhere taken, and boundary reads by whether they lie inside, across or outside the edge, with seconds per set. `dev/recruit_calibrate.py` pools the negatives into the false-certain rate per technology at each private-site cut, with its 95% bound. `dev/private_elsewhere.cpp` finds a locus's private k-mers on chromosomes a background lacks, and `dev/relabel_index.cpp` relabels them shared, to emulate a whole-genome background from a partial one.
+
+```bash
+bash dev/recruit_simulate.sh "" "" GRCh38.fa.gz CHM13.fa.gz        # wgsim, art_illumina and pbsim3 on PATH (PBSIM_MODEL)
+bash dev/recruit_benchmark.sh
+python3 dev/recruit_calibrate.py tests/examples/recruit_sim/benchmark
+```
+
+`dev/recruit_seeds.sh` recruits every set with each screen (`recruit --screen`: closed syncmers, minimizers at the same density, every k-mer) and tables certain and recruited fragments and seconds per screen. `dev/recruit_baselines.sh` takes the same sets with BBDuk and mirabait (every 31-mer of the locus haplotypes as bait), and `dev/locityper_compare.sh` with Locityper's recruitment on the same background (its jellyfish counts of GRCh38); both table each tool beside recruit's certain and recruited fragments.
+
+```bash
+bash dev/recruit_seeds.sh tests/examples/recruit_seeds
+bash dev/locityper_compare.sh tests/examples/recruit_locityper grch38.jf targets/      # locityper and jellyfish on PATH
+bash dev/recruit_baselines.sh tests/examples/recruit_baselines targets/ "" tests/examples/recruit_locityper   # bbduk.sh (and mirabait)
+```
+
+The targets folder holds each locus's haplotypes as `<locus>.fa`.
+
+## Recruitment on real reads
+
+`dev/recruit_assembly_truth.sh` scores a real sample against its own assembly: it recruits the sample's reads (CRAM, BAM or FASTQ), finds each locus on the sample's two haplotypes by aligning the locus's GRCh38 interval to them, aligns every read to each haplotype on its own (aligned to both at once, a read the two share has MAPQ 0), and `dev/recruit_assembly_score.py` classes each fragment by where its mates align: in the locus (MAPQ 20 or more, or below), elsewhere, or unaligned, against recruit's fate. The indexes must be built from graphs without the sample and its relatives (`dev/recruit_sources.py held-out`). `dev/recruit_real.sh` is the lighter check: a sample's GRCh38 alignments around each locus and in its decoy windows, recruited and compared with where the aligner put them (`dev/recruit_real_score.py`). `dev/recruit_formats.sh` aligns a FASTQ pair and writes it in every layout (BAM sorted by coordinate with and without index, by name, CRAM, unaligned BAM): each must give the FASTQ's table.
+
+```bash
+THREADS=16 CRAM_REFERENCE=GRCh38_full_analysis_set_plus_decoy_hla.fa bash dev/recruit_assembly_truth.sh truth \
+  sample.final.cram sample.paternal.fa.gz sample.maternal.fa.gz GRCh38_full_analysis_set_plus_decoy_hla.fa index/*.plx
+bash dev/recruit_formats.sh reads_1.fq.gz reads_2.fq.gz GRCh38.fa.gz formats index/*.plx       # minimap2 and samtools on PATH
+```
+
+## Copy number from certain reads
+
+`dev/recruit_gene_cn.py` reads each gene's copy number in a sample from its certain reads alone (`recruit --reads-out --certain-only`): the k-mers whose count in the graph's annotated haplotypes equals each haplotype's copies of the gene (in at least 90% of them) read one copy each, so their median depth over that of the backbone k-mers (once in every haplotype), times two, is the diploid copy number. The truth is the sample's own rows in the gene tables of `tests/real_data` (or the repeat's copy counts). `dev/recruit_hard_cases.sh` runs it on the simulated samples and on a sample without a gene that most haplotypes carry, held out of its graph, which must read 0.
+
+```bash
+bash dev/recruit_hard_cases.sh tests/examples/recruit_cn
+python3 dev/recruit_gene_cn.py --gfa held_out.gfa --sample <name> --genes tests/real_data/paralogs/<locus>.bed --reads certain_reads/*.fq.gz
+```
+

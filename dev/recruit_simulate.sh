@@ -23,27 +23,37 @@
 # ART pairs and ONT reads carry their source span in their names (dev/sim_truth.py), wgsim and HiFi reads
 # their own way; long reads that are mostly N (masked sequence) are dropped. Sets already made are kept
 # (boundary sets made before spans were in the names must be removed to be remade).
-#   recruit_simulate.sh [out_dir] [background store] [GRCh38 fasta] [CHM13 fasta] [pbsim3 dir]
+#   recruit_simulate.sh [out dir] [background store] <GRCh38 fasta> <CHM13 fasta> [pbsim3 dir]
+# The out dir defaults to tests/examples/recruit_sim, the store to <out dir>/bg.bgk (counted from the two
+# genomes when missing). pbsim3: a source tree (src/pbsim, data/), else PBSIM_DIR, else pbsim on PATH with
+# PBSIM_MODEL the ERRHMM-ONT-HQ model file.
 #   WG=1 WG_T2T=<whole CHM13 fasta> [WG_REF=<whole GRCh38 fasta>] recruit_simulate.sh ...
 set -euo pipefail
 
-OUT="${1:-$HOME/panvar-data/sim}"
-BG="${2:-$HOME/panvar-data/poc/poc.bgk}"
-REF="${3:-$HOME/panvar-data/poc/grch38_poc.fa.gz}"
-T2T="${4:-$HOME/panvar-data/poc/chm13_poc.fa.gz}"
-PB="${5:-$HOME/tools/pbsim3}"
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+abs() { echo "$(cd "$(dirname "$1")" && pwd)/$(basename "$1")"; }
+OUT="${1:-$ROOT/tests/examples/recruit_sim}"
+BG="${2:-}"
+REF="${3:-}"; T2T="${4:-}"
+[[ -n "$REF" && -n "$T2T" ]] || { echo "recruit_simulate.sh: give the GRCh38 and CHM13 FASTAs (third and fourth arguments)" >&2; exit 1; }
+REF="$(abs "$REF")"; T2T="$(abs "$T2T")"
+PB="${5:-${PBSIM_DIR:-}}"
+PBSIM="${PB:+$PB/src/pbsim}"; PBSIM="${PBSIM:-pbsim}"
+PBSIM_MODEL="${PBSIM_MODEL:-${PB:+$PB/data/ERRHMM-ONT-HQ.model}}"
 ART="${ART:-art_illumina}"
 WG="${WG:-0}"
 WG_REF="${WG_REF:-}"
 WG_T2T="${WG_T2T:-}"
-[[ -z "$OUT" ]] && OUT="$HOME/panvar-data/sim"
-ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+mkdir -p "$OUT"
+OUT="$(cd "$OUT" && pwd)"
+BG="${BG:+$(abs "$BG")}"; BG="${BG:-$OUT/bg.bgk}"
 P="$ROOT/build/panvar"
 SRC="python3 $ROOT/dev/recruit_sources.py"
 TRUTH="python3 $ROOT/dev/sim_truth.py"
 RD="$ROOT/tests/real_data"
-mkdir -p "$OUT"
 cd "$OUT"
+# the GRCh38 + CHM13 background of the main arm
+[[ -f "$BG/manifest.json" ]] || "$P" background -o "$BG" --genome grch38="$REF" --genome chm13="$T2T" --coordinate-reference grch38 -t 2 --memory 4G -q
 
 # locus, graph, held-out sample, everyone held out (the sample and its relatives in the graph)
 LOCI=("c4 $RD/paralogs/c4.gfa.gz HG00733 HG00733,HG00731,HG00732"
@@ -78,7 +88,8 @@ long() {   # long <ont|hifi> <fasta> <depth> <prefix> <seed>
     python3 "$ROOT/dev/simulate_hifi.py" "$2" "$3" "$4.fq.gz" --seed "$5" --prefix "$(basename "$4")_"
     return
   fi
-  local model=(--method errhmm --errhmm "$PB/data/ERRHMM-ONT-HQ.model" --accuracy-mean 0.98 --length-mean 15000 --length-sd 10000)
+  [[ -n "$PBSIM_MODEL" ]] || { echo "recruit_simulate.sh: set PBSIM_MODEL to pbsim3's ERRHMM-ONT-HQ.model (or give its source tree)" >&2; exit 1; }
+  local model=(--method errhmm --errhmm "$PBSIM_MODEL" --accuracy-mean 0.98 --length-mean 15000 --length-sd 10000)
   # pbsim3 stops with SIGPIPE on its second sequence here, so each sequence is simulated on its own
   local parts="$4.parts" i=0 f name
   mkdir -p "$parts"
@@ -88,7 +99,7 @@ long() {   # long <ont|hifi> <fasta> <depth> <prefix> <seed>
   for f in "$parts"/*.fa; do
     i=$((i + 1))
     name=$(head -1 "$f" | cut -c2- | cut -d' ' -f1)
-    "$PB/src/pbsim" --strategy wgs --genome "$f" --depth "$3" --seed $(( $5 * 1000 + i )) --prefix "$parts/out$i" \
+    "$PBSIM" --strategy wgs --genome "$f" --depth "$3" --seed $(( $5 * 1000 + i )) --prefix "$parts/out$i" \
       --id-prefix "$(basename "$4")_$i." "${model[@]}" >> "$4.log" 2>&1
     if [[ -s "$parts/out${i}_0001.fq.gz" ]]; then $TRUTH maf "$parts/out${i}_0001.fq.gz" "$parts/out${i}_0001.maf.gz" "$name" >> "$4.fq"; fi
     rm -f "$parts/out${i}"_* "$f"

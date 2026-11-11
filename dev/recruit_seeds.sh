@@ -7,7 +7,7 @@
 set -euo pipefail
 
 mkdir -p "$1"
-OUT="$(cd "$1" && pwd)"; SIM="$(cd "${2:-$HOME/panvar-data/sim}" && pwd)"
+OUT="$(cd "$1" && pwd)"; SIM="$(cd "${2:-$(cd "$(dirname "$0")/.." && pwd)/tests/examples/recruit_sim}" && pwd)"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 P="$ROOT/build/panvar"
 cd "$OUT"
