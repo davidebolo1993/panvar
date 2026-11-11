@@ -2,7 +2,8 @@
 
 // The locus index: every canonical 31-mer of a locus graph's haplotypes, labelled against the background.
 //   P (private)  outside the locus, the background holds it nowhere
-//   S (shared)   1 to --informative-max times elsewhere
+//   S (shared)   1 to --informative-max times elsewhere per background haplotype (a FASTA genome is one,
+//                a graph genome one per sample#haplotype of its paths), on average
 //   R (repeat)   more often than that
 // "Outside" is the background count minus the locus's own copies in every background genome, found
 // through the anchors and read from each genome's FASTA (the coordinate reference: its exact interval).
@@ -49,6 +50,7 @@ struct LocusIndex {
     std::string background, store_id, background_kind, coordinate_reference;
     std::uint64_t content = 0;              // the background's content_id (its genomes)
     std::uint32_t informative_max = 8;
+    std::uint64_t haplotypes = 1;           // background haplotypes: S is up to informative_max times this
     std::uint64_t pad = 1500;
     double dust = 2.5;
     std::uint32_t decoy_min_hits = 20;

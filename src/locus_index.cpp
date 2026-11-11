@@ -36,7 +36,7 @@ namespace fs = std::filesystem;
 
 constexpr std::size_t kK = 31, kS = 11;
 constexpr std::uint64_t kMagic = 0x3130305850585650ULL;   // "PVPXP001"
-constexpr std::uint64_t kVersion = 3;   // 2: decoy windows stop at the locus; 3: clusters split at it
+constexpr std::uint64_t kVersion = 4;   // 2: decoy windows stop at the locus; 3: clusters split at it; 4: S per haplotype
 const std::size_t kLengths[] = {100, 150, 250, 1000, 10000};
 constexpr std::size_t kWindowStep = 25;
 
@@ -346,6 +346,28 @@ std::vector<LocusIndex> build(const BuildOptions& o) {
         throw std::runtime_error("recruit: " + cref + " is not a coordinate reference of the background");
     std::map<std::string, bg::Genome> genomes;
     for (const auto& s : m.segments) for (const auto& g : s.genomes) genomes[g.name] = g;
+    // background haplotypes: a FASTA genome is one, a graph one per sample#haplotype of its P and W lines
+    std::uint64_t haplotypes = 0;
+    for (const auto& [gname, ge] : genomes) {
+        if (!is_gfa_file(ge.path)) { ++haplotypes; continue; }
+        std::set<std::string> haps;
+        GzLineReader in(ge.path);
+        if (!in.ok()) throw std::runtime_error("recruit: cannot read " + ge.path);
+        for (std::string line; in.getline(line);) {
+            if (line.size() < 2 || line[1] != '\t' || (line[0] != 'P' && line[0] != 'W')) continue;
+            const std::size_t a = line.find('\t', 2);
+            if (line[0] == 'W') {
+                const std::size_t b = line.find('\t', a + 1);
+                haps.insert(line.substr(2, b == std::string::npos ? std::string::npos : b - 2));   // sample<TAB>haplotype
+            } else {
+                const std::string name = line.substr(2, a == std::string::npos ? std::string::npos : a - 2);
+                const std::size_t h1 = name.find('#'), h2 = h1 == std::string::npos ? h1 : name.find('#', h1 + 1);
+                haps.insert(h2 == std::string::npos ? name : name.substr(0, h2));
+            }
+        }
+        haplotypes += std::max<std::size_t>(1, haps.size());
+    }
+    haplotypes = std::max<std::uint64_t>(1, haplotypes);
     const std::vector<std::string> decoys = o.decoy_genomes.empty() ? std::vector<std::string>{cref} : o.decoy_genomes;
     for (const auto& d : decoys)
         if (!genomes.count(d)) throw std::runtime_error("recruit: decoy genome " + d + " is not in the background");
@@ -390,6 +412,7 @@ std::vector<LocusIndex> build(const BuildOptions& o) {
         x.background_kind = kind;
         x.coordinate_reference = cref;
         x.informative_max = o.informative_max;
+        x.haplotypes = haplotypes;
         x.pad = o.pad;
         x.dust = o.dust;
         x.decoy_min_hits = o.decoy_min_hits;
@@ -452,7 +475,8 @@ std::vector<LocusIndex> build(const BuildOptions& o) {
         const std::size_t n = x.codes.size();
         x.cls.resize(n);
         x.outside.resize(n);
-        auto class_of = [&](std::uint64_t out) { return out == 0 ? kPrivate : out <= x.informative_max ? kShared : kRepeat; };
+        const std::uint64_t shared_max = static_cast<std::uint64_t>(x.informative_max) * x.haplotypes;
+        auto class_of = [&](std::uint64_t out) { return out == 0 ? kPrivate : out <= shared_max ? kShared : kRepeat; };
         for (std::size_t i = 0; i < n; ++i) {
             if (w.sub[i] > w.counts[i]) { ++x.negative; w.sub[i] = w.counts[i]; }
             const std::uint64_t out = w.counts[i] - w.sub[i];
@@ -591,7 +615,7 @@ std::vector<LocusIndex> build(const BuildOptions& o) {
         std::sort(cand.begin(), cand.end());
         const auto cc = counts->count_batch(cand);
         for (std::size_t i = 0; i < cand.size(); ++i)
-            if (cc[i] <= x.informative_max) x.decoy.push_back(cand[i]);
+            if (cc[i] <= static_cast<std::uint64_t>(x.informative_max) * x.haplotypes) x.decoy.push_back(cand[i]);
         // screen: closed syncmers among P and S
         for (std::size_t i = 0; i < x.codes.size(); ++i)
             if (x.cls[i] != kRepeat && kmer::is_closed_syncmer(x.codes[i], kK, kS)) x.screen.push_back(x.codes[i]);
@@ -634,7 +658,7 @@ void save(const LocusIndex& x, const std::string& path) {
         for (const auto& s : x.spans) { o.str(s.genome); o.str(s.contig); o.u64(s.start); o.u64(s.end); o.u64(s.forward); o.u64(s.subtracted); }
         o.vec(x.ceilings);
         o.u64(x.dust_demoted); o.u64(x.span_demoted); o.u64(x.negative);
-        o.u64(x.decoy_min_hits); o.u64(x.decoy_windows); o.u64(x.decoy_bases);
+        o.u64(x.decoy_min_hits); o.u64(x.decoy_windows); o.u64(x.decoy_bases); o.u64(x.haplotypes);
         o.u64(x.decoy_window_list.size());
         for (const auto& w : x.decoy_window_list) { o.str(w.genome); o.str(w.contig); o.u64(w.start); o.u64(w.end); o.u64(w.hits); }
         o.f.seekp(0);
@@ -673,7 +697,7 @@ LocusIndex load(const std::string& path) {
     for (auto& s : x.spans) { s.genome = i.str(); s.contig = i.str(); s.start = i.u64(); s.end = i.u64(); s.forward = i.u64() != 0; s.subtracted = i.u64(); }
     x.ceilings = i.vec<Ceiling>();
     x.dust_demoted = i.u64(); x.span_demoted = i.u64(); x.negative = i.u64();
-    x.decoy_min_hits = static_cast<std::uint32_t>(i.u64()); x.decoy_windows = i.u64(); x.decoy_bases = i.u64();
+    x.decoy_min_hits = static_cast<std::uint32_t>(i.u64()); x.decoy_windows = i.u64(); x.decoy_bases = i.u64(); x.haplotypes = i.u64();
     x.decoy_window_list.resize(i.u64());
     for (auto& w : x.decoy_window_list) { w.genome = i.str(); w.contig = i.str(); w.start = i.u64(); w.end = i.u64(); w.hits = i.u64(); }
     const std::size_t n = x.codes.size();
@@ -696,6 +720,7 @@ void write_report(const LocusIndex& x, const std::string& path) {
     r << "locus\tname\t" << x.name << "\nlocus\tgraph\t" << x.graph_path << "\nlocus\treference_path\t" << x.reference_path
       << "\nlocus\tinterval\t" << x.contig << ':' << x.start << '-' << x.end << "\nlocus\tpaths\t" << x.paths
       << "\nlocus\tbackground\t" << x.background << " (" << x.background_kind << ", content " << std::hex << x.content << std::dec << ")"
+      << "\nlocus\thaplotypes\t" << x.haplotypes << " in the background (shared: up to " << x.informative_max * x.haplotypes << " copies outside)"
       << "\nlocus\tkmers\t" << x.codes.size() << "\nlocus\tprivate\t" << np << " (" << pct(np) << "%)"
       << "\nlocus\tshared\t" << ns << " (" << pct(ns) << "%)" << "\nlocus\trepeat\t" << nr << " (" << pct(nr) << "%)"
       << "\nlocus\tbackbone\t" << bb << "\nlocus\tmulti_copy\t" << multi << "\nlocus\tnode_sets\t" << (x.nodeset_first.empty() ? 0 : x.nodeset_first.size() - 1)

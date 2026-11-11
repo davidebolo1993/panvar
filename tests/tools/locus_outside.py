@@ -11,6 +11,7 @@ import sys
 
 report, dump, cmax = sys.argv[1], sys.argv[2], int(sys.argv[3])
 genomes = sys.argv[4:]
+cmax *= len(genomes)   # the cut is per background haplotype; each FASTA here is one
 comp = str.maketrans("ACGT", "TGCA")
 
 
