@@ -44,7 +44,18 @@ fate() { awk -F'\t' -v p="$1" -v f="$2" 'NR>1 && index($1, p)==1 && $3==f' recru
 check "reads from the locus are certain ($(fate loc certain) of 2000)" '[[ $rc -eq 0 && $(fate loc certain) -ge 1900 ]]'
 check "reads from the paralog are never certain, and mostly unrecruited as homolog ($(fate par unrecruited) of 2000)" '[[ $(fate par certain) == 0 && $(fate par unrecruited) -ge 1000 ]]'
 check "reads from elsewhere are not even screened" '[[ $(awk -F"\t" '"'"'NR>1 && index($1, "far")==1'"'"' recruited.tsv | wc -l | tr -d " ") == 0 ]]'
-
+# across the locus's end (its last few hundred bases are shared: the copies' ends are uncertain): pairs of
+# 1400 bp fragments with one mate well inside and the other past the end; single 2 kb reads past the end
+python3 "$TOOLS/locus_reads.py" data/ref.fa chr1 158700 160400 300 edge 4 reads_edge 1400
+"$BIN" recruit --locus idx/locus.plx -1 reads_edge_1.fq -2 reads_edge_2.fq -o edge.tsv -t 2 -q
+python3 "$TOOLS/locus_reads.py" data/ref.fa chr1 158600 161000 300 long 5 reads_long 2000 2000
+"$BIN" recruit --locus idx/locus.plx -1 reads_long_1.fq -o long.tsv -t 2 -q
+reason() { awk -F'\t' -v r="$2" 'NR>1 && $3=="certain" && $4==r' "$1" | wc -l | tr -d ' '; }
+check "pairs with a mate past the end are certain, rescued ($(reason edge.tsv rescued) of 300)" '[[ $(reason edge.tsv rescued) -ge 270 ]]'
+python3 "$TOOLS/locus_reads.py" data/ref.fa chr1 115000 165000 30 span 6 reads_span 48000 48000
+"$BIN" recruit --locus idx/locus.plx -1 reads_span_1.fq -o span.tsv -t 2 -q
+check "reads holding the whole locus between two flanks are certain, partial ($(reason span.tsv partial) of 30)" '[[ $(reason span.tsv partial) == 30 ]]'
+check "reads past the end are certain, partial ($(reason long.tsv partial) of 300), segments within the read" '[[ $(reason long.tsv partial) -ge 270 ]] && awk -F"\t" '"'"'NR>1 && $4=="partial" {split($6, g, "-"); if (g[2] - g[1] >= 2000 || g[1] != 0 && g[2] != 2000) bad = 1} END {exit bad}'"'"' long.tsv'
 
 "${RC[@]}" --locus data/locus.gfa 2> log2.txt
 check "a current index is reused" 'grep -q "is current, reused" log2.txt'

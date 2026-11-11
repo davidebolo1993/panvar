@@ -2,8 +2,8 @@
 
 // Recruiting reads to locus indexes without aligning: each read (or pair) is screened by its closed
 // syncmers against the loaded loci; for every locus it hits, each of its k-mers is labelled P, S, R (the
-// locus table), D (the decoys) or N (neither), the labels are compressed into runs, and the evidence
-// decides the fragment's fate: certain, ambiguous (with a reason) or unrecruited.
+// locus table), D (the decoys) or N (neither), each read's locus segment is found from the labels, and the
+// evidence in the segments decides the fragment's fate: certain, ambiguous (with a reason) or unrecruited.
 
 #include "panvar/locus_index.hpp"
 
@@ -17,12 +17,16 @@ namespace panvar::recruit {
 enum class Method { Runs, Kmers, Fraction };
 
 struct Evidence {
-    // Independent sites: private (or decoy) k-mers counted only when they start at least k bases after
-    // the last one counted, so all k-mers a single differing base touches count once; a k-mer already
-    // counted in the other mate is not counted again.
+    // Within each read's locus segment (the stretch of its k-mers that reads as locus sequence):
+    // independent sites, private (or decoy) k-mers counted only when they start at least k bases after the
+    // last one counted, so all k-mers a single differing base touches count once; a k-mer already counted
+    // in the other mate is not counted again.
     std::uint32_t sites_p = 0;
     std::uint32_t sites_d = 0;
+    std::uint32_t decoy_out = 0;   // decoy sites outside the segments
     std::uint32_t runs_n = 0;      // runs of k-mers in neither table (a sequencing error or a new allele each)
+    std::uint32_t seg_kmers = 0;   // callable k-mers in the segments
+    // Whole reads:
     std::uint32_t n_p = 0, n_s = 0, n_r = 0, n_d = 0, n_n = 0;   // k-mers per label
     std::uint32_t kmers = 0;       // k-mers read (windows without N bases)
     std::uint32_t windows = 0;     // k-mer windows the read has, callable or not

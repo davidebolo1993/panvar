@@ -7,7 +7,6 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
-#include <deque>
 #include <string>
 #include <utility>
 #include <vector>
@@ -17,15 +16,16 @@ namespace panvar::kmer {
 constexpr std::size_t kMaxK = 31;
 
 // A/C/G/T in either case -> 0..3; anything else -> -1, which breaks the window.
-inline int base_code(char c) {
-    switch (c) {
-        case 'A': case 'a': return 0;
-        case 'C': case 'c': return 1;
-        case 'G': case 'g': return 2;
-        case 'T': case 't': return 3;
-        default: return -1;
-    }
-}
+inline constexpr std::array<std::int8_t, 256> kBaseCode = [] {
+    std::array<std::int8_t, 256> t{};
+    for (auto& x : t) x = -1;
+    t['A'] = t['a'] = 0;
+    t['C'] = t['c'] = 1;
+    t['G'] = t['g'] = 2;
+    t['T'] = t['t'] = 3;
+    return t;
+}();
+inline int base_code(char c) { return kBaseCode[static_cast<unsigned char>(c)]; }
 
 inline std::uint64_t mask_of(std::size_t k) { return k >= 32 ? ~0ULL : (1ULL << (2 * k)) - 1ULL; }
 
@@ -93,8 +93,8 @@ inline bool is_closed_syncmer(std::uint64_t code, std::size_t k, std::size_t s) 
 }
 
 // Calls f(code, start, forward) for every k-mer of seq[0, n) that is a closed syncmer (as
-// is_closed_syncmer), in order, in linear time: the s-mer hashes of the current window are kept in a
-// monotone queue.
+// is_closed_syncmer), in order, in linear expected time: the s-mer hashes of the current window sit in a
+// ring with their minimum, which is rescanned only when it leaves the window.
 template <class F>
 void for_each_closed_syncmer(const char* seq, std::size_t n, std::size_t k, std::size_t s, F&& f) {
     if (k == 0 || k > kMaxK || s == 0 || s > k || n < k) return;
@@ -102,29 +102,32 @@ void for_each_closed_syncmer(const char* seq, std::size_t n, std::size_t k, std:
     const std::size_t krc = 2 * (k - 1), src = 2 * (s - 1), w = k - s + 1;
     std::uint64_t kf = 0, kr = 0, sf = 0, sr = 0;
     std::size_t filled = 0;
-    std::vector<std::uint64_t> ring(w);            // s-mer hashes by start position modulo w
-    std::deque<std::pair<std::uint64_t, std::size_t>> mins;   // (hash, s-mer start), hashes increasing
+    std::array<std::uint64_t, kMaxK> ring{};       // s-mer hashes; slot `head` holds the newest
+    std::size_t head = w - 1;
+    std::uint64_t best = ~0ULL;                      // the window's least hash and the latest s-mer holding it
+    std::size_t best_at = 0;
     for (std::size_t i = 0; i < n; ++i) {
         const int b = base_code(seq[i]);
-        if (b < 0) { kf = kr = sf = sr = 0; filled = 0; mins.clear(); continue; }
+        if (b < 0) { kf = kr = sf = sr = 0; filled = 0; best = ~0ULL; continue; }
         const auto ub = static_cast<std::uint64_t>(b), cb = static_cast<std::uint64_t>(3 - b);
         kf = ((kf << 2) | ub) & kmask; kr = (kr >> 2) | (cb << krc);
         sf = ((sf << 2) | ub) & smask; sr = (sr >> 2) | (cb << src);
         ++filled;
-        if (filled >= s) {
-            const std::size_t sstart = i + 1 - s;
-            const std::uint64_t h = mix64(sf <= sr ? sf : sr);
-            ring[sstart % w] = h;
-            while (!mins.empty() && mins.back().first > h) mins.pop_back();
-            mins.emplace_back(h, sstart);
+        if (filled < s) continue;
+        const std::size_t sstart = i + 1 - s;
+        const std::uint64_t h = mix64(sf <= sr ? sf : sr);
+        head = head + 1 == w ? 0 : head + 1;
+        ring[head] = h;
+        if (h <= best) { best = h; best_at = sstart; }
+        if (filled < k) continue;
+        const std::size_t kstart = i + 1 - k;
+        const std::size_t first = head + 1 == w ? 0 : head + 1;   // the slot of the window's first s-mer
+        if (best_at < kstart) {   // the minimum left the window: rescan its w s-mers
+            best = ~0ULL;
+            for (std::size_t j = 0, slot = first; j < w; ++j, slot = slot + 1 == w ? 0 : slot + 1)
+                if (ring[slot] <= best) { best = ring[slot]; best_at = kstart + j; }
         }
-        if (filled >= k) {
-            const std::size_t kstart = i + 1 - k;
-            while (mins.front().second < kstart) mins.pop_front();
-            const std::uint64_t best = mins.front().first;
-            if (ring[kstart % w] == best || ring[(kstart + w - 1) % w] == best)
-                f(kf <= kr ? kf : kr, kstart, kf <= kr);
-        }
+        if (ring[first] == best || h == best) f(kf <= kr ? kf : kr, kstart, kf <= kr);
     }
 }
 

@@ -39,7 +39,10 @@ void print_recruit_help() {
         << "      --decoy-min-hits <N> Shared k-mer hits, each within a pad of the next, that make a homologous window (default 20)\n"
         << "  -1, --reads <fq>         Reads (FASTQ, plain or gzip)\n"
         << "  -2, --mates <fq>         Their mates, in the same order\n"
-        << "  -o, --out <tsv>          One row per screened fragment and locus: fate, reason and evidence\n"
+        << "  -o, --out <tsv>          One row per screened fragment and locus: fate (certain, ambiguous,\n"
+        << "                           unrecruited), reason, each mate's locus segment (read bases) and the\n"
+        << "                           evidence. A certain fragment is partial when a read runs out of the\n"
+        << "                           locus, rescued when one mate alone decides the pair\n"
         << "      --method <m>         runs (default: >= --min-sites independent private sites, decoy sites at\n"
         << "                           most --decoy-share of them, at least --min-density of them),\n"
         << "                           kmers (>= 3 private k-mers, no decoy k-mer), fraction (>= --min-fraction\n"
@@ -51,7 +54,7 @@ void print_recruit_help() {
         << "                           elsewhere can carry a few private k-mers by sequencing error\n"
         << "      --error-rate <e>     The reads' error rate per base: more mismatch runs than errors and new\n"
         << "                           alleles explain make a read divergent (default 0.002)\n"
-        << "  -t, --threads <N>        Worker threads\n"
+        << "  -t, --threads <N>        Worker threads (reading runs beside them)\n"
         << "  -q, --quiet              No progress logs\n"
         << "  -h, --help               Show this help\n";
 }

@@ -24,7 +24,7 @@ def main():
     a = ap.parse_args()
     rng = random.Random(a.seed)
     seqs, name, parts = [], None, []
-    for line in open(a.fasta):
+    for line in (gzip.open(a.fasta, "rt") if a.fasta.endswith(".gz") else open(a.fasta)):
         line = line.strip()
         if line.startswith(">"):
             if name is not None:
@@ -62,7 +62,7 @@ def main():
                 else:
                     read.append(c)
             r = "".join(read)
-            out.write(f"@{a.prefix}{i}_{name}_{start}_{strand}\n{r}\n+\n{'I' * len(r)}\n")
+            out.write(f"@{a.prefix}{i}_{name}_{start}_{start + length}_{strand}\n{r}\n+\n{'I' * len(r)}\n")
 
 
 if __name__ == "__main__":

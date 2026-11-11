@@ -1,38 +1,35 @@
 #!/usr/bin/env python3
-"""Scores recruitment tables against the truth of simulated read sets, for several decision rules applied
-to the same evidence (each table row keeps it), so one pass over the reads serves every rule.
+"""Scores recruitment tables against the truth of simulated read sets.
 
-    recruit_score.py --out <summary.tsv> <arm> <locus> <tech> <source> <fragments> <table> [...]
-Each set is six arguments: the arm (main: GRCh38 + CHM13 background; g38: GRCh38 only), the locus, the
-technology (short, ont, hifi), the source (locus, locus1 = one mate only, near, decoy, boundary,
-genome, new), the fragments simulated, and recruit's table.
+    recruit_score.py --sim <sim dir> --out <summary.tsv> <arm> <locus> <tech> <source> <reads> <table> [...]
+Each set is six arguments: the arm (main: GRCh38 + CHM13 background; g38: GRCh38 only; wg: the whole
+GRCh38), the locus, the technology (short, illumina, ont, hifi), the source (locus, locus1 = one mate only,
+near, decoy, boundary, genome, new, wgnew), the reads (the first mates' FASTQ, which is counted and, for
+boundary sets, holds each fragment's span) and recruit's table.
 
-Rules (a read is never certain when uncallable or divergent, as recruit decides):
-    runs1, runs2, runs3  >= 1, 2, 3 independent private sites, no decoy site
-    share5, share10      >= 2 private sites, decoy sites at most 5% / 10% of them
-    dense5               share5, and at least 0.05 private sites per 31 callable bases (recruit's default)
-    kmers                >= 3 private k-mers, no decoy k-mer
-    fraction             >= half of the k-mers in the locus, one private
-Divergence uses each technology's error rate (short 0.002, ont 0.03, hifi 0.001).
-
-Columns: certain, ambiguous and unrecruited counts; recall (locus sources); recall on the hard subset
-(reads whose k-mers are mostly shared or repeat); false certain per million fragments and per million
-screened fragments, with a 95% upper bound on the former; for the 1x genome sets, the false-certain reads
-expected in 30x of the simulated chromosomes.
+Columns: fragments, screened; certain (of which partial and rescued), ambiguous and unrecruited;
+recall and recruited (certain or ambiguous) for the locus sources; false certain per million fragments
+with its 95% upper bound for the negative sources, and for the genome sets the false-certain fragments
+expected in 30x. Boundary sets are split by the true span: fragments wholly inside the locus, straddling
+an edge, and wholly outside (where certain is false); for long reads straddling, the median difference
+between the locus segment recruit reports and the part truly inside.
 """
 import argparse
-import csv
+import gzip
 import math
+import re
 import sys
 
-RULES = ["runs1", "runs2", "runs3", "share5", "share10", "dense5", "kmers", "fraction"]
-ERROR = {"short": 0.002, "ont": 0.03, "hifi": 0.001}
+DEPTH = {"genome": 1.0, "new": 1.0, "wgnew": None}
+WGNEW_DEPTH = {"short": 0.5, "illumina": 0.5, "ont": 0.2, "hifi": 0.2}
+NEGATIVE = {"near", "decoy", "genome", "new", "wgnew"}
 
 
 def poisson_upper(k, conf=0.95):
     """Exact upper confidence bound on a Poisson mean after observing k events."""
     lo, hi = float(k), float(k) + 10 + 10 * math.sqrt(k + 1)
     target = 1 - conf
+
     def cdf(lam):
         term = s = math.exp(-lam)
         for i in range(1, k + 1):
@@ -48,76 +45,127 @@ def poisson_upper(k, conf=0.95):
     return hi
 
 
-def flags(r, e):
-    k, w, runs = int(r["kmers"]), int(r["windows"]), int(r["runs_n"])
-    uncallable = w > 0 and k * 2 < w
-    lam = (e + 0.001) * k
-    divergent = runs > lam + 3.1 * math.sqrt(lam) + 2
-    return uncallable or divergent
+def fragment_name(h):
+    n = h[1:].split()[0]
+    return n[:-2] if len(n) > 2 and n[-2] == "/" and n[-1] in "12" else n
 
 
-def certain(rule, r, e):
-    if flags(r, e):
-        return False
-    sp, sd, n_p, n_d = int(r["sites_p"]), int(r["sites_d"]), int(r["n_p"]), int(r["n_d"])
-    if rule.startswith("runs"):
-        return sd == 0 and sp >= int(rule[4:])
-    if rule.startswith("share"):
-        return sp >= 2 and sd <= int(rule[5:]) / 100 * sp
-    if rule == "dense5":   # recruit's default: share5, and private sites at least 0.05 per 31 callable bases
-        return sp >= 2 and sd <= 0.05 * sp and sp >= 0.05 * int(r["kmers"]) / 31
-    if rule == "kmers":
-        return n_d == 0 and n_p >= 3
-    k = int(r["kmers"])
-    return k > 0 and n_p >= 1 and (n_p + int(r["n_s"]) + int(r["n_r"])) / k >= 0.5
+def read_fastq(path):
+    """(name, length) of every record."""
+    with gzip.open(path, "rt") as f:
+        while True:
+            h = f.readline()
+            if not h:
+                return
+            s = f.readline()
+            f.readline()
+            f.readline()
+            yield fragment_name(h), len(s.rstrip("\n"))
 
 
-def unrecruited(r):
-    sp, sd, n_s = int(r["sites_p"]), int(r["sites_d"]), int(r["n_s"])
-    return (sp == 0 and sd >= 2) or (sp == 0 and sd < 2 and n_s == 0)
+SPAN = {   # the fragment's span in its boundary source sequence, 0-based end-exclusive
+    "short": re.compile(r"boundary\|(\w+?)_(\d+)_(\d+)_(\d+)_(\d+)_\d+:"),       # wgsim: 1-based outer ends
+    "illumina": re.compile(r"boundary\|(\w+?)_(\d+)_(\d+)_(\d+)_(\d+)_[+-]$"),
+    "ont": re.compile(r"boundary\|(\w+?)_(\d+)_(\d+)_(\d+)_(\d+)_[+-]$"),
+    "hifi": re.compile(r"boundary\|(\w+?)_(\d+)_(\d+)_(\d+)_(\d+)_[+-]$"),
+}
 
 
-def hard(r):
-    k = int(r["kmers"])
-    return k > 0 and (int(r["n_s"]) + int(r["n_r"])) / k > 0.5
+def truth_span(tech, name, length):
+    m = SPAN[tech].search(name)
+    if not m:
+        sys.exit(f"recruit_score: no span in {name}")
+    s0 = int(m.group(2))
+    a, b = int(m.group(4)), int(m.group(5))
+    if tech == "short":
+        a -= 1
+    return s0 + a, s0 + b
+
+
+def locus_interval(sim, locus):
+    with open(f"{sim}/{locus}/{locus}.index.tsv") as f:
+        for line in f:
+            x = line.rstrip("\n").split("\t")
+            if x[0] == "locus" and x[1] == "interval":
+                chrom, rest = x[2].rsplit(":", 1)
+                a, b = rest.split("-")
+                return int(a), int(b)
+    sys.exit(f"recruit_score: no interval for {locus}")
+
+
+def segment_length(seg):
+    if seg == ".":
+        return 0
+    a, b = seg.split("-")
+    return int(b) - int(a)
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--sim", required=True)
     ap.add_argument("--out", required=True)
     ap.add_argument("sets", nargs="+")
     a = ap.parse_args()
     if len(a.sets) % 6:
-        sys.exit("sets come in sixes: arm locus tech source fragments table")
+        sys.exit("sets come in sixes: arm locus tech source reads table")
+    counted = {}
     out = []
     for i in range(0, len(a.sets), 6):
-        arm, locus, tech, source, total, table = a.sets[i:i + 6]
-        total = int(total)
-        e = ERROR[tech]
-        rows = []
+        arm, locus, tech, source, reads, table = a.sets[i:i + 6]
+        if reads not in counted:
+            counted[reads] = list(read_fastq(reads)) if source == "boundary" else sum(1 for _ in read_fastq(reads))
+        total = len(counted[reads]) if source == "boundary" else counted[reads]
+        rows = {}
         with open(table) as f:
-            for r in csv.DictReader(f, delimiter="\t"):
+            head = f.readline().rstrip("\n").split("\t")
+            for line in f:
+                r = dict(zip(head, line.rstrip("\n").split("\t")))
                 if r["locus"] == locus:
-                    rows.append(r)
-        screened = len({r["fragment"] for r in rows})
-        n_hard = sum(hard(r) for r in rows)
-        positive = source in ("locus", "locus1")
-        for rule in RULES:
-            c = sum(certain(rule, r, e) for r in rows)
-            u = sum(1 for r in rows if not certain(rule, r, e) and unrecruited(r))
-            amb = len(rows) - c - u
-            ch = sum(1 for r in rows if hard(r) and certain(rule, r, e))
-            row = {"arm": arm, "locus": locus, "tech": tech, "source": source, "rule": rule, "fragments": total,
-                   "screened": screened, "certain": c, "ambiguous": amb, "unrecruited": u,
-                   "recall": f"{c / total:.4f}" if positive else "",
-                   "recruited": f"{(c + amb) / total:.4f}" if positive else "",
-                   "hard_reads": n_hard if positive else "",
-                   "hard_recall": f"{ch / n_hard:.4f}" if positive and n_hard else "",
-                   "false_certain_per_million": "" if positive or source == "boundary" else f"{1e6 * c / total:.2f}",
-                   "upper95_per_million": "" if positive or source == "boundary" else f"{1e6 * poisson_upper(c) / total:.2f}",
-                   "per_million_screened": "" if positive or source == "boundary" or screened == 0 else f"{1e6 * c / screened:.1f}",
-                   "per_30x": f"{30 * c}" if source in ("genome", "new") else ""}
-            out.append(row)
+                    rows[r["fragment"]] = r
+        fate = [r["fate"] for r in rows.values()]
+        c = fate.count("certain")
+        amb = fate.count("ambiguous")
+        row = {"arm": arm, "locus": locus, "tech": tech, "source": source, "fragments": total, "screened": len(rows),
+               "certain": c, "partial": sum(1 for r in rows.values() if r["fate"] == "certain" and r["reason"] == "partial"),
+               "rescued": sum(1 for r in rows.values() if r["fate"] == "certain" and r["reason"] == "rescued"),
+               "ambiguous": amb, "unrecruited": fate.count("unrecruited"), "recall": "", "recruited": "",
+               "false_certain_per_million": "", "upper95_per_million": "", "per_30x": "",
+               "in": "", "in_certain": "", "straddle": "", "straddle_certain": "", "straddle_recruited": "",
+               "out": "", "out_certain": "", "segment_error_median": ""}
+        if source in ("locus", "locus1"):
+            row["recall"] = f"{c / total:.4f}"
+            row["recruited"] = f"{(c + amb) / total:.4f}"
+        if source in NEGATIVE:
+            row["false_certain_per_million"] = f"{1e6 * c / total:.2f}"
+            row["upper95_per_million"] = f"{1e6 * poisson_upper(c) / total:.2f}"
+            depth = DEPTH.get(source, 0) or (WGNEW_DEPTH[tech] if source == "wgnew" else 0)
+            if depth:
+                row["per_30x"] = f"{30 / depth * c:.0f}"
+        if source == "boundary":
+            ls, le = locus_interval(a.sim, locus)
+            n = {"in": 0, "straddle": 0, "out": 0}
+            cert = {"in": 0, "straddle": 0, "out": 0}
+            recr = 0
+            errors = []
+            for name, length in counted[reads]:
+                x, y = truth_span(tech, name, length)
+                inside = max(0, min(y, le) - max(x, ls))
+                kind = "in" if inside >= y - x else "out" if inside == 0 else "straddle"
+                n[kind] += 1
+                r = rows.get(name)
+                if r is None:
+                    continue
+                if r["fate"] == "certain":
+                    cert[kind] += 1
+                    if kind == "straddle" and tech in ("ont", "hifi"):
+                        errors.append(abs(segment_length(r["seg1"]) - inside))
+                if kind == "straddle" and r["fate"] in ("certain", "ambiguous"):
+                    recr += 1
+            errors.sort()
+            row.update({"in": n["in"], "in_certain": cert["in"], "straddle": n["straddle"], "straddle_certain": cert["straddle"],
+                        "straddle_recruited": recr, "out": n["out"], "out_certain": cert["out"],
+                        "segment_error_median": errors[len(errors) // 2] if errors else ""})
+        out.append(row)
     cols = list(out[0].keys())
     with open(a.out, "w") as f:
         f.write("\t".join(cols) + "\n")
