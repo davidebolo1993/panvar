@@ -1,9 +1,10 @@
 #include "panvar/recruit_reads.hpp"
 
 #include "panvar/flat_map.hpp"
-#include "panvar/read_input.hpp"
-#include "panvar/recruit_scoring.hpp"
 #include "panvar/kmer.hpp"
+#include "panvar/read_input.hpp"
+#include "panvar/recruit_calibration.hpp"
+#include "panvar/recruit_scoring.hpp"
 
 #include <zlib.h>
 
@@ -109,10 +110,12 @@ ReadStats recruit_reads(const ReadOptions& options) {
     auto log = [&](const std::string& s) { if (o.log) o.log(s); };
     if (o.indexes.empty()) throw std::runtime_error("recruit: no locus index");
     std::vector<LocusTable> loci(o.indexes.size());
+    std::vector<std::vector<Calibration>> calibration(o.indexes.size());
     std::vector<std::pair<std::uint64_t, std::uint32_t>> screen_items;
     for (std::size_t li = 0; li < o.indexes.size(); ++li) {
         const LocusIndex x = load(o.indexes[li]);
         loci[li] = table_of(x);
+        calibration[li] = x.calibration;
         for (std::size_t lj = 0; lj < li; ++lj)
             if (loci[lj].name == x.name)
                 throw std::runtime_error("recruit: two loci are named " + x.name + " (" + o.indexes[lj] + ", " + o.indexes[li] + "); rename one graph");
@@ -202,6 +205,37 @@ ReadStats recruit_reads(const ReadOptions& options) {
         char b[64];
         std::snprintf(b, sizeof b, "%.4f", o.error_rate);
         log(std::string("error rate ") + b + " (" + st.error_source + ")");
+    }
+    // each locus's private-site cut: calibrated for the run's read class (from the first reads), or the given one
+    std::vector<std::string> cut_note(loci.size());
+    {
+        std::uint64_t bases = 0, reads = 0;
+        for (const Fragment& f : batch) {
+            bases += f.seq1.size() + f.seq2.size();
+            reads += !f.seq1.empty() + !f.seq2.empty();
+        }
+        const double mean = reads ? static_cast<double>(bases) / static_cast<double>(reads) : 0;
+        for (std::size_t li = 0; li < loci.size(); ++li) {
+            char b[256];
+            if (!o.calibrated_cut || o.method != Method::Runs) {
+                std::snprintf(b, sizeof b, "%u\tgiven", o.min_sites);
+            } else {
+                const Cut c = calibrated_cut(calibration[li], mean, o.error_rate, o.false_certain_rate);
+                if (c.min_sites == 0) {
+                    std::snprintf(b, sizeof b, "%u\tthe index carries no calibration", o.min_sites);
+                } else {
+                    loci[li].min_sites = c.min_sites;
+                    const std::uint64_t scr = c.by->flank_screened + c.by->decoy_screened;
+                    const std::uint64_t fc = c.by->flank_certain[c.min_sites] + c.by->decoy_certain[c.min_sites];
+                    std::snprintf(b, sizeof b, "%u\tcalibrated (%s reads%s): held-out recall %.4f; false certain %llu of %llu screened off-target, 95%% bound %.3g",
+                                  c.min_sites, c.by->read_class.c_str(), c.met ? "" : "; no cut reaches the rate, the largest is used",
+                                  c.by->locus ? static_cast<double>(c.by->locus_certain[c.min_sites]) / static_cast<double>(c.by->locus) : 0.0,
+                                  static_cast<unsigned long long>(fc), static_cast<unsigned long long>(scr), upper_bound(fc, scr));
+                }
+            }
+            cut_note[li] = b;
+            log(loci[li].name + ": private-site cut " + std::string(b).replace(std::string(b).find('\t'), 1, ", "));
+        }
     }
 
     std::FILE* out = std::fopen(o.out.c_str(), "w");
@@ -320,6 +354,7 @@ ReadStats recruit_reads(const ReadOptions& options) {
             std::fprintf(sm, "locus\t%s\tbackbone_depth\t%.2f k-mer depth, %.2f base depth over %llu backbone k-mers\n", loci[li].name.c_str(), kdepth, bdepth,
                          static_cast<unsigned long long>(loci[li].backbone));
             std::fprintf(sm, "locus\t%s\tcertain_in_other_loci\t%llu\n", loci[li].name.c_str(), static_cast<unsigned long long>(multi_certain[li]));
+            std::fprintf(sm, "locus\t%s\tsite_cut\t%s\n", loci[li].name.c_str(), cut_note[li].c_str());
         }
         if (std::fclose(sm) != 0) throw std::runtime_error("recruit: cannot write " + o.summary);
     }

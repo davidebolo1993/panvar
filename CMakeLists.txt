@@ -265,6 +265,7 @@ add_library(panvarlib
     src/locus_index.cpp
     src/recruit_reads.cpp
     src/read_input.cpp
+    src/recruit_calibration.cpp
     src/recruit_scoring.cpp
 )
 

@@ -47,6 +47,8 @@ void print_recruit_help() {
         << "      --dust <score>       Private k-mers this low-complexity become shared (default 2.5)\n"
         << "      --decoy-genomes A,B  Genomes whose homologous windows are decoys (default: the coordinate reference)\n"
         << "      --decoy-min-hits <N> Shared k-mer hits, each within a pad of the next, that make a homologous window (default 20)\n"
+        << "      --no-calibration     Build indexes without calibration (reads simulated from held-out samples,\n"
+        << "                           decoy windows and the reference's 5 Mb flanks, scored at each site cut)\n"
         << "  -1, --reads <fq>         Reads (FASTQ, plain or gzip); repeatable\n"
         << "  -2, --mates <fq>         Their mates, in the same order (one per -1)\n"
         << "  -i, --input <file>       One file of reads: FASTQ (single-end, or --interleaved), SAM, BAM or CRAM;\n"
@@ -64,7 +66,10 @@ void print_recruit_help() {
         << "                           most --decoy-share of them, at least --min-density of them),\n"
         << "                           kmers (>= 3 private k-mers, no decoy k-mer), fraction (>= --min-fraction\n"
         << "                           of k-mers in the locus, one private)\n"
-        << "      --min-sites <N>      Private sites for certain with --method runs (default 2)\n"
+        << "      --false-certain-rate <r>  Per locus, the lowest private-site cut (at least 2) whose simulated\n"
+        << "                           off-target reads of the run's read class are certain at most at this\n"
+        << "                           rate (default 1e-6; an index without calibration uses 2)\n"
+        << "      --min-sites <N>      One private-site cut for every locus instead (--method runs)\n"
         << "      --min-fraction <f>   For --method fraction (default 0.5)\n"
         << "      --decoy-share <f>    Decoy sites tolerated as a share of the private sites (default 0.05)\n"
         << "      --min-density <f>    Private sites needed per 31 callable bases (default 0.05): a long read\n"
@@ -102,7 +107,7 @@ int run_recruit_command(const std::vector<std::string>& args) {
     std::string save_dir, sheet, summary;
     double error_rate = -1, preset_rate = -1;
     std::vector<std::string> reads1, reads2, singles;
-    bool index_only = false, quiet = false, dry_run = false;
+    bool index_only = false, quiet = false, dry_run = false, rate_given = false;
     std::size_t threads = 0;
     for (std::size_t i = 0; i < args.size(); ++i) {
         const std::string& a = args[i];
@@ -120,6 +125,8 @@ int run_recruit_command(const std::vector<std::string>& args) {
         else if (a == "--informative-max") o.informative_max = static_cast<std::uint32_t>(cli::parse_size_arg(a, value()));
         else if (a == "--pad") o.pad = cli::parse_size_arg(a, value());
         else if (a == "--dust") o.dust = parse_number(a, value());
+        else if (a == "--no-calibration") o.calibrate = false;
+        else if (a == "--false-certain-rate") { ro.false_certain_rate = parse_number(a, value()); rate_given = true; }
         else if (a == "--decoy-min-hits") o.decoy_min_hits = static_cast<std::uint32_t>(cli::parse_size_arg(a, value()));
         else if (a == "--decoy-genomes") {
             std::stringstream ss(value());
@@ -156,7 +163,7 @@ int run_recruit_command(const std::vector<std::string>& args) {
             else if (m == "kmers") ro.method = recruit::Method::Kmers;
             else if (m == "fraction") ro.method = recruit::Method::Fraction;
             else throw std::runtime_error("--method is runs, kmers or fraction");
-        } else if (a == "--min-sites") ro.min_sites = static_cast<std::uint32_t>(cli::parse_size_arg(a, value()));
+        } else if (a == "--min-sites") { ro.min_sites = static_cast<std::uint32_t>(cli::parse_size_arg(a, value())); ro.calibrated_cut = false; }
         else if (a == "--min-fraction") ro.min_fraction = parse_number(a, value());
         else if (a == "--decoy-share") ro.decoy_share = parse_number(a, value());
         else if (a == "--min-density") ro.min_density = parse_number(a, value());
@@ -243,6 +250,8 @@ int run_recruit_command(const std::vector<std::string>& args) {
     if (!index_only && (samples.empty() || ro.out.empty()))
         throw std::runtime_error("recruit requires reads (-1/-2, -i or --samples) and -o (or --index-only)");
     if (ro.min_sites == 0) throw std::runtime_error("--min-sites must be at least 1");
+    if (rate_given && !ro.calibrated_cut) throw std::runtime_error("give --false-certain-rate or --min-sites, not both");
+    if (!(ro.false_certain_rate >= 0 && ro.false_certain_rate < 1)) throw std::runtime_error("--false-certain-rate must be in [0, 1)");
     if (ro.decoy_share < 0 || ro.decoy_share > 1) throw std::runtime_error("--decoy-share must be between 0 and 1");
     if (ro.min_density < 0 || ro.min_density > 1) throw std::runtime_error("--min-density must be between 0 and 1");
     if (error_rate >= 0.5) throw std::runtime_error("--error-rate must be between 0 and 0.5");

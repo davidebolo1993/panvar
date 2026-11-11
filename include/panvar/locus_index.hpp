@@ -13,6 +13,7 @@
 // Evidence is counted in independent sites: a run of r consecutive private k-mers holds ceil(r / k) of
 // them, since one differing base changes at most k consecutive k-mers.
 
+#include <array>
 #include <cstdint>
 #include <functional>
 #include <map>
@@ -43,6 +44,21 @@ struct Ceiling {
     double single2_min = 0, single2_median = 0;      // with >= 2 independent private single-copy sites
 };
 
+// Calibration of one read class: reads simulated from the locus haplotypes of held-out samples (their
+// own k-mers removed from the index), from the decoy windows and from the coordinate reference's flanks,
+// scored as recruit scores them; the counts certain at each private-site cut m (index m, 1 to kMaxCut).
+constexpr std::uint32_t kMaxCut = 8;
+struct Calibration {
+    std::string read_class;                   // short, hifi, ont
+    double error_rate = 0;
+    std::uint64_t read_length = 0, insert = 0;   // insert 0: single reads
+    std::uint64_t held_out = 0;               // samples held out
+    std::uint64_t locus = 0;                  // their fragments
+    std::uint64_t flank = 0, decoy = 0;       // off-target fragments simulated
+    std::uint64_t flank_screened = 0, decoy_screened = 0;
+    std::array<std::uint64_t, kMaxCut + 1> locus_certain{}, flank_certain{}, decoy_certain{};
+};
+
 struct LocusIndex {
     // manifest
     std::string name, graph_path, graph_checksum, reference_path, contig;
@@ -55,6 +71,7 @@ struct LocusIndex {
     double dust = 2.5;
     std::uint32_t decoy_min_hits = 20;
     std::vector<std::string> decoy_genomes;
+    bool calibrated = false;
     std::size_t paths = 0;
     std::uint64_t decoy_windows = 0, decoy_bases = 0;
     // k-mers, sorted by code, with parallel fields
@@ -73,6 +90,7 @@ struct LocusIndex {
     std::vector<GenomeSpan> spans;
     std::vector<DecoyWindow> decoy_window_list;
     std::vector<Ceiling> ceilings;
+    std::vector<Calibration> calibration;        // empty when not calibrated
     std::uint64_t dust_demoted = 0, span_demoted = 0, negative = 0;
 
     std::int64_t find(std::uint64_t canonical) const;
@@ -89,6 +107,7 @@ struct BuildOptions {
     double dust = 2.5;
     std::uint32_t decoy_min_hits = 20;           // shared k-mer hits that make a cluster a homologous window
     std::vector<std::string> decoy_genomes;      // default: the coordinate reference
+    bool calibrate = true;
     std::size_t threads = 2;
     std::function<void(const std::string&)> log;
 };

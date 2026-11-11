@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # panvar recruit --index-only on a synthetic locus whose reference carries a diverged paralog: outside
 # counts against brute force over the genomes, classes from them, decoys from the paralog, the screen,
-# reuse of a current index and rebuilding when the graph, background or settings change.
+# calibration and the cut it gives recruit, reuse of a current index and rebuilding when the graph,
+# background or settings change.
 #   recruit_index.sh <panvar_bin> <tests/tools dir> <out_dir>
 set -uo pipefail
 
@@ -71,12 +72,28 @@ check "a genome file changed since it was counted is refused" '[[ $rc -ne 0 ]] &
 "$BIN" recruit -t 4 -q --background s -r ref --index-only --save-index idx4 --locus data/locus.gfa
 "$BIN" recruit --dump-index idx4/locus.plx=dump4t.tsv
 check "an index built on 4 threads equals the 1-thread one" 'cmp -s dump.tsv dump4t.tsv'
+cal() { awk -F'\t' '$1=="calibration" && $2!="class"' "$1"; }
+check "calibration: three read classes at cuts 1 to 8" '[[ $(cal idx/locus.index.tsv | wc -l | tr -d " ") == 24 && $(cal idx/locus.index.tsv | cut -f2 | sort -u | tr "\n" " ") == "hifi ont short " ]]'
+check "calibration: certain counts within their totals, falling as the cut rises" 'cal idx/locus.index.tsv | awk -F"\t" '"'"'{if ($8 > $7 || $11 > $10 || $13 > $12) bad = 1; if ($6 > 1 && ($8 > l8 || $11 > l11 || $13 > l13)) bad = 1; l8 = $8; l11 = $11; l13 = $13} END {exit bad}'"'"''
+held=$(cal idx/locus.index.tsv | awk -F'\t' '$2=="short" && $6==2 {print $8 " of " $7}')
+check "calibration: the paralog gives off-target reads, the held-out sample locus reads ($held certain at 2 sites)" 'cal idx/locus.index.tsv | awk -F"\t" '"'"'$2=="short" && $6==2 && $12 > 1000 && $7 > 500 && $8 / $7 > 0.9 {ok = 1} END {exit !ok}'"'"''
+check "calibration on 4 threads equals the 1-thread one" '[[ "$(cal idx/locus.index.tsv)" == "$(cal idx4/locus.index.tsv)" ]]'
+check "recruit takes each locus's calibrated cut and reports it" 'grep -q "^locus.locus.site_cut.2.calibrated (short reads)" recruited.summary.tsv'
+"$BIN" recruit --locus idx/locus.plx -1 reads_1.fq -2 reads_2.fq -o fixed.tsv -t 2 -q --min-sites 3
+check "--min-sites gives every locus that cut" 'grep -q "^locus.locus.site_cut.3.given" fixed.summary.tsv'
+"$BIN" recruit --locus idx/locus.plx -1 reads_1.fq -2 reads_2.fq -o both.tsv -q --min-sites 3 --false-certain-rate 1e-3 2> both.txt; rc=$?
+check "--min-sites and --false-certain-rate together are refused" '[[ $rc -ne 0 ]] && grep -q "not both" both.txt'
+"$BIN" recruit -t 2 -q --background s -r ref --index-only --save-index idx_nocal --locus data/locus.gfa --no-calibration
+"$BIN" recruit --locus idx_nocal/locus.plx -1 reads_1.fq -2 reads_2.fq -o nocal.tsv -t 2 -q
+check "an index without calibration: no calibration rows, the cut 2, the same table" '[[ -z "$(cal idx_nocal/locus.index.tsv)" ]] && grep -q "site_cut.2.the index carries no calibration" nocal.summary.tsv && cmp -s recruited.tsv nocal.tsv'
 mkdir -p twin/a twin/b && cp data/locus.gfa twin/a/locus.gfa && cp data/locus.gfa twin/b/locus.gfa
 "$BIN" recruit -t 2 -q --background s -r ref --index-only --save-index idx_twin --locus twin/a/locus.gfa --locus twin/b/locus.gfa 2> twin.txt; rc=$?
 check "two graphs of one name are refused" '[[ $rc -ne 0 ]] && grep -q "rename one graph" twin.txt'
 
 "${RC[@]}" --locus data/locus.gfa 2> log2.txt
 check "a current index is reused" 'grep -q "is current, reused" log2.txt'
+"${RC[@]}" --locus data/locus.gfa --no-calibration 2> log2b.txt
+check "an index asked without calibration is rebuilt" 'grep -q "rebuilding" log2b.txt'
 "${RC[@]}" --locus data/locus.gfa --informative-max 2 2> log3.txt
 check "another setting rebuilds it" 'grep -q "rebuilding" log3.txt && [[ $(field idx/locus.index.tsv repeat | cut -d" " -f1) -ge 0 ]]'
 { sed "s/>chr1/>x1/" data/ga.fa; sed "s/>chr1/>x2/" data/gb.fa; } > data/gc.fa

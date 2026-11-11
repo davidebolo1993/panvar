@@ -9,6 +9,7 @@
 #include "panvar/graph_utils.hpp"
 #include "panvar/gz_reader.hpp"
 #include "panvar/kmer.hpp"
+#include "panvar/recruit_calibration.hpp"
 #include "panvar/ref_path.hpp"
 
 #include <algorithm>
@@ -36,7 +37,7 @@ namespace fs = std::filesystem;
 
 constexpr std::size_t kK = 31, kS = 11;
 constexpr std::uint64_t kMagic = 0x3130305850585650ULL;   // "PVPXP001"
-constexpr std::uint64_t kVersion = 4;   // 2: decoy windows stop at the locus; 3: clusters split at it; 4: S per haplotype
+constexpr std::uint64_t kVersion = 5;   // 2: decoy windows stop at the locus; 3: clusters split at it; 4: S per haplotype; 5: calibration
 const std::size_t kLengths[] = {100, 150, 250, 1000, 10000};
 constexpr std::size_t kWindowStep = 25;
 
@@ -279,7 +280,7 @@ std::string LocusIndex::key() const {
     std::string d;
     for (const auto& g : decoy_genomes) d += g + ",";
     return "v" + std::to_string(kVersion) + "|" + graph_checksum + "|" + reference_path + "|" + store_id + "|" + std::to_string(content) + "|" +
-           coordinate_reference + "|" + std::to_string(informative_max) + "|" + std::to_string(pad) + "|" + std::to_string(dust) + "|" + std::to_string(decoy_min_hits) + "|" + d;
+           coordinate_reference + "|" + std::to_string(informative_max) + "|" + std::to_string(pad) + "|" + std::to_string(dust) + "|" + std::to_string(decoy_min_hits) + "|" + d + (calibrated ? "|c1" : "|c0");
 }
 
 std::string expected_key(const BuildOptions& o, const std::string& gfa) {
@@ -300,6 +301,7 @@ std::string expected_key(const BuildOptions& o, const std::string& gfa) {
     k.dust = o.dust;
     k.decoy_min_hits = o.decoy_min_hits;
     k.decoy_genomes = o.decoy_genomes.empty() ? std::vector<std::string>{k.coordinate_reference} : o.decoy_genomes;
+    k.calibrated = o.calibrate;
     return k.key();
 }
 
@@ -438,6 +440,7 @@ std::vector<LocusIndex> build(const BuildOptions& o) {
         x.dust = o.dust;
         x.decoy_min_hits = o.decoy_min_hits;
         x.decoy_genomes = decoys;
+        x.calibrated = o.calibrate;
         std::vector<std::uint32_t> present;
         collect_kmers(g, x, present);
         x.backbone.resize(x.codes.size());
@@ -652,6 +655,68 @@ std::vector<LocusIndex> build(const BuildOptions& o) {
             std::to_string(x.decoy.size()) + " from " + std::to_string(x.decoy_windows) + " windows (" + std::to_string(x.decoy_bases) +
             " bp), screen " + std::to_string(x.screen.size()));
     });
+    if (o.calibrate) {
+        // off-target sequence: the coordinate reference beside each locus, and the decoy windows with context
+        // (cut where the locus's own copy begins, as the windows are)
+        std::vector<std::vector<OffTarget>> off(work.size());
+        std::map<std::string, std::vector<fasta::Interval>> want;
+        std::map<std::string, std::vector<std::pair<std::size_t, std::size_t>>> slot;   // genome -> (locus, entry)
+        auto add = [&](std::size_t li, const std::string& genome, const std::string& contig, std::uint64_t s, std::uint64_t e, bool decoy,
+                       std::uint64_t core_s, std::uint64_t core_e) {
+            if (e <= s) return;
+            OffTarget t;
+            t.decoy = decoy;
+            t.core_start = core_s - s;
+            t.core_end = core_e - s;
+            off[li].push_back(std::move(t));
+            want[genome].push_back({contig, s, e});
+            slot[genome].emplace_back(li, off[li].size() - 1);
+        };
+        for (std::size_t li = 0; li < work.size(); ++li) {
+            const LocusIndex& x = work[li].idx;
+            if (!is_gfa_file(genomes.at(cref).path)) {
+                const std::uint64_t a = x.start > kCalibrationFlank ? x.start - kCalibrationFlank : 0;
+                add(li, cref, x.contig, a, x.start, false, a, x.start);
+                add(li, cref, x.contig, x.end, x.end + kCalibrationFlank, false, x.end, x.end + kCalibrationFlank);
+            }
+            for (const DecoyWindow& w : x.decoy_window_list) {
+                std::uint64_t s = w.start > kCalibrationContext ? w.start - kCalibrationContext : 0, e = w.end + kCalibrationContext;
+                const auto own = work[li].spans.find(w.genome);
+                if (own != work[li].spans.end())
+                    for (const auto& sp : own->second) {
+                        if (sp.contig != w.contig || sp.end <= s || sp.start >= e) continue;
+                        if (sp.end <= w.start) s = std::max<std::uint64_t>(s, sp.end);
+                        else if (sp.start >= w.end) e = std::min<std::uint64_t>(e, sp.start);
+                    }
+                add(li, w.genome, w.contig, s, e, true, w.start, w.end);
+            }
+        }
+        for (const auto& [gname, iv] : want) {
+            check_unchanged(genomes.at(gname));
+            std::vector<std::string> seqs = fasta::fetch_intervals(genomes.at(gname).path, iv);
+            for (std::size_t k = 0; k < iv.size(); ++k) {
+                OffTarget& t = off[slot[gname][k].first][slot[gname][k].second];
+                t.seq = std::move(seqs[k]);
+                if (!t.decoy) t.core_end = t.seq.size();   // a flank clamped at its contig's end
+                t.core_end = std::min<std::uint64_t>(t.core_end, t.seq.size());
+                t.core_start = std::min(t.core_start, t.core_end);
+            }
+        }
+        for (std::size_t li = 0; li < work.size(); ++li) {
+            LocusIndex& x = work[li].idx;
+            calibrate(x, *graphs[li], off[li], threads);
+            for (const Calibration& c : x.calibration) {
+                const std::uint64_t scr = c.flank_screened + c.decoy_screened;
+                char b[256];
+                std::snprintf(b, sizeof b, "%s: calibration %s: certain recall %.4f at 2 sites (%llu held-out fragments, %llu samples); false certain %llu at 1 site, %llu at 2, of %llu screened off-target",
+                              x.name.c_str(), c.read_class.c_str(), c.locus ? static_cast<double>(c.locus_certain[2]) / static_cast<double>(c.locus) : 0.0,
+                              static_cast<unsigned long long>(c.locus), static_cast<unsigned long long>(c.held_out),
+                              static_cast<unsigned long long>(c.flank_certain[1] + c.decoy_certain[1]),
+                              static_cast<unsigned long long>(c.flank_certain[2] + c.decoy_certain[2]), static_cast<unsigned long long>(scr));
+                log(b);
+            }
+        }
+    }
     std::vector<LocusIndex> out;
     for (auto& w : work) out.push_back(std::move(w.idx));
     return out;
@@ -687,6 +752,16 @@ void save(const LocusIndex& x, const std::string& path) {
         o.u64(x.decoy_min_hits); o.u64(x.decoy_windows); o.u64(x.decoy_bases); o.u64(x.haplotypes);
         o.u64(x.decoy_window_list.size());
         for (const auto& w : x.decoy_window_list) { o.str(w.genome); o.str(w.contig); o.u64(w.start); o.u64(w.end); o.u64(w.hits); }
+        o.u64(x.calibrated);
+        o.u64(x.calibration.size());
+        for (const auto& c : x.calibration) {
+            o.str(c.read_class);
+            std::uint64_t ebits;
+            std::memcpy(&ebits, &c.error_rate, 8);
+            for (const std::uint64_t v : {ebits, c.read_length, c.insert, c.held_out, c.locus, c.flank, c.decoy, c.flank_screened, c.decoy_screened}) o.u64(v);
+            for (const auto* a : {&c.locus_certain, &c.flank_certain, &c.decoy_certain})
+                for (const std::uint64_t v : *a) o.u64(v);
+        }
         o.f.seekp(0);
         o.u64(kMagic);
         o.f.flush();
@@ -726,6 +801,16 @@ LocusIndex load(const std::string& path) {
     x.decoy_min_hits = static_cast<std::uint32_t>(i.u64()); x.decoy_windows = i.u64(); x.decoy_bases = i.u64(); x.haplotypes = i.u64();
     x.decoy_window_list.resize(i.u64());
     for (auto& w : x.decoy_window_list) { w.genome = i.str(); w.contig = i.str(); w.start = i.u64(); w.end = i.u64(); w.hits = i.u64(); }
+    x.calibrated = i.u64() != 0;
+    x.calibration.resize(i.u64());
+    for (auto& c : x.calibration) {
+        c.read_class = i.str();
+        const std::uint64_t ebits = i.u64();
+        std::memcpy(&c.error_rate, &ebits, 8);
+        for (std::uint64_t* v : {&c.read_length, &c.insert, &c.held_out, &c.locus, &c.flank, &c.decoy, &c.flank_screened, &c.decoy_screened}) *v = i.u64();
+        for (auto* a : {&c.locus_certain, &c.flank_certain, &c.decoy_certain})
+            for (std::uint64_t& v : *a) v = i.u64();
+    }
     const std::size_t n = x.codes.size();
     if (x.cls.size() != n || x.outside.size() != n || x.mult.size() != n || x.backbone.size() != n || x.nodeset.size() != n ||
         key != x.key())
@@ -763,6 +848,20 @@ void write_report(const LocusIndex& x, const std::string& path) {
     for (const auto& c : x.ceilings)
         r << "ceiling\t" << c.length << '\t' << c.p3_min << '\t' << c.p3_median << '\t' << c.sites2_min << '\t' << c.sites2_median << '\t'
           << c.single2_min << '\t' << c.single2_median << '\n';
+    // per read class and private-site cut: held-out locus fragments certain (recall), off-target ones certain
+    // (false certain) of those screened, and that share's 95% upper bound
+    r << "calibration\tclass\terror_rate\tread_length\tinsert\tcut\tlocus\tlocus_certain\trecall\tflank_screened\tflank_certain\tdecoy_screened\tdecoy_certain\tfalse_certain_bound\n";
+    for (const auto& c : x.calibration)
+        for (std::uint32_t m = 1; m <= kMaxCut; ++m) {
+            const std::uint64_t fc = c.flank_certain[m] + c.decoy_certain[m];
+            char b[64];
+            std::snprintf(b, sizeof b, "%.4f\t%.3g", c.locus ? static_cast<double>(c.locus_certain[m]) / static_cast<double>(c.locus) : 0.0,
+                          upper_bound(fc, c.flank_screened + c.decoy_screened));
+            const std::string rb(b);
+            r << "calibration\t" << c.read_class << '\t' << c.error_rate << '\t' << c.read_length << '\t' << c.insert << '\t' << m << '\t' << c.locus << '\t'
+              << c.locus_certain[m] << '\t' << rb.substr(0, rb.find('\t')) << '\t' << c.flank_screened << '\t' << c.flank_certain[m] << '\t'
+              << c.decoy_screened << '\t' << c.decoy_certain[m] << '\t' << rb.substr(rb.find('\t') + 1) << '\n';
+        }
     if (!r) throw std::runtime_error("recruit: cannot write " + path);
 }
 

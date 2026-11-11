@@ -52,7 +52,9 @@ Costs costs_for(double error_rate);
 // A locus index as reads see it.
 LocusTable table_of(const LocusIndex& x);
 
-// One fragment against one locus.
-Row score_fragment(const Fragment& fr, const LocusTable& t, std::uint32_t li, const ReadOptions& o, double gap_cost, double flank_share);
+// One fragment against one locus. With `certain_through`, also the largest private-site cut (up to
+// kMaxCut) at which the fragment is certain, 0 if none: certain at a cut means certain at every lower one.
+Row score_fragment(const Fragment& fr, const LocusTable& t, std::uint32_t li, const ReadOptions& o, double gap_cost, double flank_share,
+                   std::uint32_t* certain_through = nullptr);
 
 }  // namespace panvar::recruit::scoring

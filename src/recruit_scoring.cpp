@@ -12,9 +12,6 @@ namespace panvar::recruit::scoring {
 
 namespace {
 
-
-
-
 struct Kmer {
     std::uint64_t code;
     std::uint32_t start;
@@ -194,7 +191,7 @@ void decide(Row& r, const Evidence& one, const Evidence* two, const char* status
 }  // namespace
 
 Row score_fragment(const Fragment& fr, const LocusTable& t, std::uint32_t li, const ReadOptions& o, double gap_cost,
-                   double flank_share) {
+                   double flank_share, std::uint32_t* certain_through) {
     Row r;
     r.fragment = fr.name;
     r.locus = li;
@@ -264,6 +261,14 @@ Row score_fragment(const Fragment& fr, const LocusTable& t, std::uint32_t li, co
     auto idx = [](const char* s) { return s[0] == 'i' ? 0 : s[0] == 'p' ? 1 : 2; };
     r.mates = pair ? kMates[idx(status[0])][idx(status[1])] : status[0];
     if (!pair) r.seg[1] = ".";
+    if (certain_through != nullptr) {
+        *certain_through = 0;
+        for (std::uint32_t m = kMaxCut; m >= 1 && *certain_through == 0; --m) {
+            Row x = r;
+            decide(x, ev[0], pair ? &ev[1] : nullptr, status, o, m);
+            if (x.fate[0] == 'c') *certain_through = m;
+        }
+    }
     decide(r, ev[0], pair ? &ev[1] : nullptr, status, o, t.min_sites ? t.min_sites : o.min_sites);
     return r;
 }
