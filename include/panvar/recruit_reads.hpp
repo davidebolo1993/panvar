@@ -37,7 +37,10 @@ struct Evidence {
 
 struct ReadOptions {
     std::vector<std::string> indexes;    // .plx files
-    std::string reads1, reads2;          // FASTQ (plain or gzip); reads2 for pairs
+    // one sample's reads, read in this order: a FASTQ pair (both), or one file (FASTQ, SAM, BAM, CRAM)
+    std::vector<std::pair<std::string, std::string>> inputs;
+    std::string cram_reference;          // FASTA for CRAM
+    bool interleaved = false;            // single FASTQ files hold mates as consecutive records
     std::string out;                     // per-fragment table (TSV)
     Method method = Method::Runs;
     std::uint32_t min_sites = 2;         // private sites for certain

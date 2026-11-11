@@ -1,7 +1,7 @@
 #include "panvar/recruit_reads.hpp"
 
 #include "panvar/flat_map.hpp"
-#include "panvar/gz_reader.hpp"
+#include "panvar/read_input.hpp"
 #include "panvar/kmer.hpp"
 
 #include <algorithm>
@@ -19,11 +19,6 @@ namespace {
 
 constexpr std::size_t kK = 31, kS = 11;
 constexpr std::uint8_t kLabelP = 0, kLabelS = 1, kLabelR = 2, kLabelD = 3, kLabelN = 4, kMultiBit = 8;
-
-struct Fragment {
-    std::string name, seq1, seq2;
-    bool paired = false;
-};
 
 // One locus, as reads see it: each k-mer's label (P/S/R, D for decoys), with a bit for multi-copy P.
 struct LocusTable {
@@ -255,24 +250,6 @@ Row score_fragment(const Fragment& fr, const LocusTable& t, std::uint32_t li, co
     return r;
 }
 
-bool read_fastq(GzLineReader& in, std::string& name, std::string& seq) {
-    std::string h, plus, qual;
-    while (in.getline(h)) {
-        if (h.empty()) continue;
-        if (h[0] != '@') throw std::runtime_error("recruit: not FASTQ (a record starts with '" + h.substr(0, 1) + "')");
-        if (!in.getline(seq) || !in.getline(plus) || !in.getline(qual)) throw std::runtime_error("recruit: a truncated FASTQ record");
-        if (!seq.empty() && seq.back() == '\r') seq.pop_back();
-        if (!qual.empty() && qual.back() == '\r') qual.pop_back();
-        if (plus.empty() || plus[0] != '+' || qual.size() != seq.size())
-            throw std::runtime_error("recruit: a malformed FASTQ record at " + h.substr(0, 60) + " (multi-line FASTQ is not read)");
-        const auto sp = h.find_first_of(" \t");
-        name = h.substr(1, sp == std::string::npos ? std::string::npos : sp - 1);
-        if (name.size() > 2 && name[name.size() - 2] == '/' && (name.back() == '1' || name.back() == '2')) name.resize(name.size() - 2);
-        return true;
-    }
-    return false;
-}
-
 }  // namespace
 
 void Evidence::add(const Evidence& o) {
@@ -311,13 +288,36 @@ ReadStats recruit_reads(const ReadOptions& o) {
     }
     screen_items = {};
 
-    GzLineReader in1(o.reads1);
-    if (!in1.ok()) throw std::runtime_error("recruit: cannot read " + o.reads1);
-    std::unique_ptr<GzLineReader> in2;
-    if (!o.reads2.empty()) {
-        in2 = std::make_unique<GzLineReader>(o.reads2);
-        if (!in2->ok()) throw std::runtime_error("recruit: cannot read " + o.reads2);
-    }
+    // whether a read hits some locus's screen (the input layer asks, for coordinate-sorted files)
+    auto screened = [&](const std::string& seq) {
+        bool hit = false;
+        kmer::for_each_closed_syncmer(seq.data(), seq.size(), kK, kS, [&](std::uint64_t c, std::size_t, bool) {
+            if (!hit && screen.find(c) != nullptr) hit = true;
+        });
+        return hit;
+    };
+    if (o.inputs.empty()) throw std::runtime_error("recruit: no reads given");
+    InputOptions io;
+    io.cram_reference = o.cram_reference;
+    io.interleaved = o.interleaved;
+    io.threads = std::max<std::size_t>(1, o.threads);
+    io.screened = screened;
+    io.log = o.log;
+    std::size_t next_input = 0;
+    std::unique_ptr<FragmentSource> source;
+    ReadStats st;
+    auto close_source = [&] {
+        if (!source) return;
+        const InputStats& s = source->stats();
+        st.fragments += s.unscreened + s.dropped;   // passed over before scoring, unscreened
+        log(source->describe() + ": " + std::to_string(s.records) + " records, " + std::to_string(s.fragments + s.unscreened + s.dropped) +
+            " fragments (" + std::to_string(s.pairs + s.unscreened) + " pairs)" +
+            (s.secondary + s.supplementary + s.qc_fail > 0 ? "; skipped " + std::to_string(s.secondary) + " secondary, " +
+                 std::to_string(s.supplementary) + " supplementary, " + std::to_string(s.qc_fail) + " QC-failed" : std::string()) +
+            (s.fetched > 0 ? "; " + std::to_string(s.fetched) + " mates fetched" : std::string()) +
+            (s.unmatched > 0 ? "; " + std::to_string(s.unmatched) + " reads without their mate" : std::string()));
+        source.reset();
+    };
     std::FILE* out = std::fopen(o.out.c_str(), "w");
     if (out == nullptr) throw std::runtime_error("recruit: cannot write " + o.out);
     std::fprintf(out, "fragment\tlocus\tfate\treason\tmates\tseg1\tseg2\tsites_p\tsites_d\tdecoy_out\truns_n\tseg_kmers\tn_p\tn_s\tn_r\tn_d\tn_n\tkmers\twindows\tbases\tmulti_p\n");
@@ -327,40 +327,24 @@ ReadStats recruit_reads(const ReadOptions& o) {
     const double gap_cost = q >= 1.0 ? 1e9 : 0.5 * q / (1.0 - q);
     const double flank_share = 0.25 * q;   // locus k-mers beyond a segment's end below this: a flank
 
-    ReadStats st;
     const std::size_t threads = std::max<std::size_t>(1, o.threads);
     constexpr std::size_t kBatch = 20000;
-    // The next batch is read while the workers score the current one; with mates, the two files are read
-    // on two threads.
-    std::vector<std::string> names2(kBatch);
-    auto read_batch = [&](std::vector<Fragment>& batch) {
-        batch.resize(kBatch);
-        std::size_t n1 = 0, n2 = 0;
-        std::exception_ptr failed1, failed2;
-        std::thread mates;
-        if (in2)
-            mates = std::thread([&] {
-                try {
-                    while (n2 < kBatch && read_fastq(*in2, names2[n2], batch[n2].seq2)) ++n2;
-                } catch (...) {
-                    failed2 = std::current_exception();
-                }
-            });
-        try {
-            while (n1 < kBatch && read_fastq(in1, batch[n1].name, batch[n1].seq1)) batch[n1++].paired = in2 != nullptr;
-        } catch (...) {
-            failed1 = std::current_exception();
+    // The next batch is read while the workers score the current one.
+    auto read_batch = [&](std::vector<Fragment>& batch) {   // the inputs one after another
+        batch.clear();
+        std::vector<Fragment> part;
+        while (batch.size() < kBatch) {
+            if (!source) {
+                if (next_input == o.inputs.size()) break;
+                const auto& [a, b] = o.inputs[next_input++];
+                source = b.empty() ? open_input(a, io) : open_fastq_pair(a, b);
+            }
+            if (source->next(part, kBatch - batch.size()) == 0) {
+                close_source();
+                continue;
+            }
+            for (auto& f : part) batch.push_back(std::move(f));
         }
-        if (mates.joinable()) mates.join();
-        if (failed1) std::rethrow_exception(failed1);
-        if (failed2) std::rethrow_exception(failed2);
-        if (in2) {
-            if (n2 < n1) throw std::runtime_error("recruit: " + o.reads2 + " has fewer reads than " + o.reads1);
-            if (n2 > n1) throw std::runtime_error("recruit: " + o.reads2 + " has more reads than " + o.reads1);
-            for (std::size_t i = 0; i < n1; ++i)
-                if (names2[i] != batch[i].name) throw std::runtime_error("recruit: mates out of step: " + batch[i].name + " and " + names2[i]);
-        }
-        batch.resize(n1);
     };
     std::vector<Fragment> batch, next;
     std::vector<std::vector<Row>> rows;
@@ -402,10 +386,7 @@ ReadStats recruit_reads(const ReadOptions& o) {
         }
         batch.swap(next);
     }
-    if (in2) {
-        std::string n2, s2;
-        if (read_fastq(*in2, n2, s2)) throw std::runtime_error("recruit: " + o.reads2 + " has more reads than " + o.reads1);
-    }
+    close_source();
     if (std::fclose(out) != 0) throw std::runtime_error("recruit: cannot write " + o.out);
     return st;
 }

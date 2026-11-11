@@ -86,6 +86,70 @@ if(PANVAR_SSHASH_AVX2 AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64)$
 endif()
 target_link_libraries(sshash PUBLIC ZLIB::ZLIB Threads::Threads)
 
+# htslib (submodule + nested htscodecs, MIT/BSD) -- SAM, BAM and CRAM input for `recruit`. Compiled here from
+# its sources as a static library, with a generated config.h instead of its configure step: no network
+# access (libcurl off), bzip2 and lzma CRAM codecs and libdeflate when the system has them. Its codec SIMD
+# variants are compiled where the compiler enables them by default (NEON on 64-bit ARM); elsewhere CRAM uses
+# the portable codecs.
+set(HTSLIB_DIR ${CMAKE_CURRENT_SOURCE_DIR}/external/htslib)
+if(NOT EXISTS ${HTSLIB_DIR}/hts.c OR NOT EXISTS ${HTSLIB_DIR}/htscodecs/htscodecs/htscodecs.c)
+    message(FATAL_ERROR
+        "Missing htslib sources in external/htslib (or its nested htscodecs). "
+        "Run: git submodule update --init --recursive")
+endif()
+find_package(BZip2 QUIET)
+find_package(LibLZMA QUIET)
+find_library(LIBDEFLATE_LIBRARY NAMES deflate)
+find_path(LIBDEFLATE_INCLUDE_DIR libdeflate.h)
+set(HTSLIB_GEN ${CMAKE_CURRENT_BINARY_DIR}/htslib_generated)
+set(HTSLIB_CONFIG "/* config.h for the vendored htslib, written by panvar's CMake */\n#ifndef _XOPEN_SOURCE\n#define _XOPEN_SOURCE 600\n#endif\n#define HAVE_DRAND48 1\n")
+if(BZIP2_FOUND)
+    string(APPEND HTSLIB_CONFIG "#define HAVE_LIBBZ2 1\n")
+endif()
+if(LIBLZMA_FOUND)
+    string(APPEND HTSLIB_CONFIG "#define HAVE_LIBLZMA 1\n#define HAVE_LZMA_H 1\n")
+endif()
+if(LIBDEFLATE_LIBRARY AND LIBDEFLATE_INCLUDE_DIR)
+    string(APPEND HTSLIB_CONFIG "#define HAVE_LIBDEFLATE 1\n")
+endif()
+file(WRITE ${HTSLIB_GEN}/config.h.new "${HTSLIB_CONFIG}")
+file(WRITE ${HTSLIB_GEN}/version.h.new "#define HTS_VERSION_TEXT \"1.23\"\n#define HTSCODECS_VERSION_TEXT \"1.6.5\"\n")
+file(WRITE ${HTSLIB_GEN}/config_vars.h.new
+    "#define HTS_CC \"${CMAKE_C_COMPILER}\"\n#define HTS_CPPFLAGS \"\"\n#define HTS_CFLAGS \"\"\n#define HTS_LDFLAGS \"\"\n#define HTS_LIBS \"\"\n")
+foreach(h config.h version.h config_vars.h)   # rewritten only when changed, so htslib is not rebuilt each time
+    configure_file(${HTSLIB_GEN}/${h}.new ${HTSLIB_GEN}/${h} COPYONLY)
+endforeach()
+set(HTSLIB_SOURCES)
+foreach(f kfunc kstring bcf_sr_sort bgzf errmod faidx header hfile hts hts_expr hts_os md5 multipart probaln realn
+          regidx region sam sam_mods simd synced_bcf_reader vcf_sweep tbx textutils thread_pool vcf vcfutils
+          cram/cram_codecs cram/cram_decode cram/cram_encode cram/cram_external cram/cram_index cram/cram_io
+          cram/cram_stats cram/mFILE cram/open_trace_file cram/pooled_alloc cram/string_alloc
+          htscodecs/htscodecs/arith_dynamic htscodecs/htscodecs/fqzcomp_qual htscodecs/htscodecs/htscodecs
+          htscodecs/htscodecs/pack htscodecs/htscodecs/rANS_static4x16pr htscodecs/htscodecs/rANS_static32x16pr
+          htscodecs/htscodecs/rANS_static32x16pr_neon htscodecs/htscodecs/rANS_static htscodecs/htscodecs/rle
+          htscodecs/htscodecs/tokenise_name3 htscodecs/htscodecs/utils)
+    list(APPEND HTSLIB_SOURCES ${HTSLIB_DIR}/${f}.c)
+endforeach()
+add_library(hts STATIC ${HTSLIB_SOURCES})
+target_include_directories(hts PRIVATE ${HTSLIB_GEN} ${HTSLIB_DIR}/htscodecs)
+target_include_directories(hts SYSTEM PUBLIC ${HTSLIB_DIR})
+target_compile_options(hts PRIVATE -O2 -w)
+set_target_properties(hts PROPERTIES POSITION_INDEPENDENT_CODE ON C_STANDARD 99)
+target_link_libraries(hts PUBLIC ZLIB::ZLIB Threads::Threads)
+if(NOT APPLE)
+    target_link_libraries(hts PUBLIC m)
+endif()
+if(BZIP2_FOUND)
+    target_link_libraries(hts PUBLIC BZip2::BZip2)
+endif()
+if(LIBLZMA_FOUND)
+    target_link_libraries(hts PUBLIC LibLZMA::LibLZMA)
+endif()
+if(LIBDEFLATE_LIBRARY AND LIBDEFLATE_INCLUDE_DIR)
+    target_include_directories(hts PRIVATE ${LIBDEFLATE_INCLUDE_DIR})
+    target_link_libraries(hts PUBLIC ${LIBDEFLATE_LIBRARY})
+endif()
+
 # abPOA (submodule + nested SIMDe, MIT) -- partial-order alignment behind `refine`'s residual MSA.
 # Built as a static library via its own Makefile (like minimap2); its Makefile auto-detects arm64
 # (uname -m) and selects the apple-m1/SIMDe SIMD path.
@@ -200,6 +264,7 @@ add_library(panvarlib
     src/fasta_index.cpp
     src/locus_index.cpp
     src/recruit_reads.cpp
+    src/read_input.cpp
 )
 
 target_include_directories(panvarlib
@@ -224,7 +289,7 @@ target_compile_options(panvarlib
 # PRIVATE: edlib is an implementation detail of align.cpp, not part of panvarlib's
 # public interface. For a static lib CMake still propagates the symbols to the final
 # executable link, while keeping edlib out of the installed export set.
-target_link_libraries(panvarlib PRIVATE edlib abpoa minigraph sshash ZLIB::ZLIB)
+target_link_libraries(panvarlib PRIVATE edlib abpoa minigraph sshash hts ZLIB::ZLIB)
 
 add_executable(panvar
     src/main.cpp
@@ -307,6 +372,9 @@ if(PANVAR_BUILD_TESTING)
             add_test(NAME panvar_recruit_index
                      COMMAND /usr/bin/env bash ${PANVAR_RECRUIT_INDEX} $<TARGET_FILE:panvar> ${CMAKE_CURRENT_SOURCE_DIR}/tests/tools ${CMAKE_CURRENT_BINARY_DIR}/recruit_index)
             set_tests_properties(panvar_recruit_index PROPERTIES TIMEOUT 300)
+            add_test(NAME panvar_recruit_input
+                     COMMAND /usr/bin/env bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/suites/recruit_input.sh $<TARGET_FILE:panvar> ${CMAKE_CURRENT_SOURCE_DIR}/tests/tools ${CMAKE_CURRENT_BINARY_DIR}/recruit_input)
+            set_tests_properties(panvar_recruit_input PROPERTIES TIMEOUT 300)
         endif()
         # Fast, dependency-free smoke on a tiny hand-built graph that exercises every
         # call event type + confounders with exact-record assertions (no vg needed).
