@@ -20,7 +20,7 @@ The index, built once per locus graph and kept beside it (`<locus>.plx`, with a 
 2. The locus is located in every background genome: the reference path's interval (`-r`; its name carries `contig:start-end`) is found through the background's anchors, and the k-mers of each copy found are counted and subtracted from the background's counts.
 3. Each k-mer is labelled by what is left (its count outside the locus): private (none), shared (up to `--informative-max` per background haplotype, on average) or repeat (more). Private k-mers of low complexity, or that become shared when the located copies are trimmed at their uncertain ends, are labelled shared.
 4. Decoys: in the decoy genomes (`--decoy-genomes`), clusters of shared k-mer hits outside the locus's own copy (20 hits, each within 1,500 bp of the next) are homologous windows; their k-mers that are not in the locus and are shared in the background become decoy k-mers, the alleles of the homologs.
-5. The screen is the closed syncmers (11-mer minimum at either end) among the private and shared k-mers, about one in ten.
+5. The screen is the closed syncmers ([Edgar 2021](https://doi.org/10.7717/peerj.10805); 11-mer minimum at either end) among the private and shared k-mers, about one in ten.
 6. Calibration: reads are simulated for three classes (2×150 pairs at 0.2% error, HiFi-like reads at 0.1%, ONT-like reads at 3%) from the haplotypes of up to eight samples held out one at a time (the k-mers only that sample carries read as new while its reads are scored), from the decoy windows, and from 5 Mb of the coordinate reference on each side of the locus. They are screened and scored as below, and the index keeps, per class, how many are certain at each cut from one to eight private sites.
 
 Reads, per sample:
@@ -60,6 +60,7 @@ Reads, per sample:
 | `--reads-out <dir>` | the recruited reads as gzip FASTQ, per locus and fate | off |
 | `--certain-only` | with `--reads-out`, certain reads only | off |
 | `--summary <path>` | the run's summary | beside the table |
+| `--dump-index <plx>=<tsv>` | write every k-mer of an index as text (columns below), and stop | |
 | `-t, --threads <N>` | scoring threads; a reader and a quarter as many decompression threads run beside them | Slurm's allocation, else all cores |
 | `-q, --quiet` | no progress logs | off |
 
@@ -74,6 +75,8 @@ A sample sheet holds tab-separated lines of sample, file and optionally a mate f
 | `<locus>.plx` | the index |
 | `<locus>.index.tsv` | the index's report: the locus (k-mers by label, backbone, decoys, screen), each copy found per genome with the k-mers subtracted, the decoy windows, ceilings (the share of read-length windows of each haplotype with 2 private sites) and the calibration (per read class and cut: held-out fragments certain, off-target certain of those screened, and the 95% bound) |
 | `<reads-out>/<locus>.<fate>_1.fq.gz`, `_2.fq.gz` | with `--reads-out`: recruited pairs, as sequenced, with qualities (`<locus>.<fate>.fq.gz` for single reads) |
+
+An index dumped with `--dump-index` has one row per k-mer of the locus: `kmer` (its canonical sequence), `class` (`P`, `S` or `R`), `outside` (its background count outside the locus), `multiplicity` (its largest copy number within one haplotype), `backbone` (1 if once in every haplotype), `screen` (1 if a screen syncmer) and `nodes` (the graph nodes it starts on). Decoy k-mers are not locus k-mers and are not listed.
 
 Table columns:
 

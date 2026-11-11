@@ -63,6 +63,9 @@ void print_recruit_help() {
         << "      --reads-out <dir>           The recruited reads as gzip FASTQ, per locus and fate\n"
         << "      --certain-only              With --reads-out: certain reads only\n"
         << "      --summary <tsv>             The run's summary (default: beside -o, .summary.tsv)\n\n"
+        << "Inspecting:\n"
+        << "      --dump-index <plx>=<tsv>    Write every k-mer of an index with its label, count outside the locus,\n"
+        << "                                  copies within a haplotype, backbone and screen flags and graph nodes\n\n"
         << "  -t, --threads <N>               Scoring threads (default: Slurm's allocation or the CPUs available)\n"
         << "  -q, --quiet                     No progress logs\n"
         << "  -h, --help                      Show this help\n";
