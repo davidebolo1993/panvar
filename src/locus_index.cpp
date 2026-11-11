@@ -37,7 +37,7 @@ namespace fs = std::filesystem;
 
 constexpr std::size_t kK = 31, kS = 11;
 constexpr std::uint64_t kMagic = 0x3130305850585650ULL;   // "PVPXP001"
-constexpr std::uint64_t kVersion = 5;   // 2: decoy windows stop at the locus; 3: clusters split at it; 4: S per haplotype; 5: calibration
+constexpr std::uint64_t kVersion = 6;   // 2: decoy windows stop at the locus; 3: clusters split at it; 4: S per haplotype; 5: calibration; 6: its decoy pairs cross window edges
 const std::size_t kLengths[] = {100, 150, 250, 1000, 10000};
 constexpr std::size_t kWindowStep = 25;
 
@@ -705,6 +705,9 @@ std::vector<LocusIndex> build(const BuildOptions& o) {
         for (std::size_t li = 0; li < work.size(); ++li) {
             LocusIndex& x = work[li].idx;
             calibrate(x, *graphs[li], off[li], threads);
+            if (std::none_of(graphs[li]->paths.begin(), graphs[li]->paths.end(), [](const PathRecord& p) { return p.name.find('#') != std::string::npos; }))
+                log("note: " + x.name + ": no path name is PanSN (sample#haplotype#contig): calibration holds out one path at a time, "
+                    "so a sample's other haplotype stays in and held-out recall is optimistic");
             for (const Calibration& c : x.calibration) {
                 const std::uint64_t scr = c.flank_screened + c.decoy_screened;
                 char b[256];

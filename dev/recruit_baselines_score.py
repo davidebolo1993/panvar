@@ -6,6 +6,10 @@ boundary: fragments straddling an edge, and wholly outside, taken. On the genome
 mirabait bait the five loci at once, so their count there is of fragments taken to any of them.
 
     recruit_baselines_score.py <baselines dir> <sim dir> [locityper_compare dir]
+
+panvar's tables: with a Locityper run, its own (GRCh38-only background) beside the benchmark's g38 locus
+tables; without one, the benchmark's: g38 for the locus and genome sets, main (GRCh38 and CHM13) for the
+near, decoy and boundary sets, the only arm it writes them for. A missing table stops the scoring.
 """
 import glob
 import gzip
@@ -49,11 +53,16 @@ def main():
                     sets.append(fastq_names(glob.glob(f"{out}/mirabait.{label}*.f*q*")))
                 if lt:
                     sets.append(locityper_names(f"{lt}/lt.{locus}.{tech}.{src}.fq"))
-                table = (f"{sim}/benchmark/g38.{locus}.{tech}.locus.tsv" if src == "locus" or not lt
-                         else f"{lt}/pv.all.{tech}.new.tsv" if src == "new" else f"{lt}/pv.{locus}.{tech}.{src}.tsv")
-                if src != "locus" and not lt:
-                    table = f"{sim}/benchmark/g38.{locus}.{tech}.{src}.tsv"
-                sets.extend(panvar_sets(table, locus) if os.path.exists(table) else (set(), set()))
+                b = f"{sim}/benchmark"
+                if src == "locus":
+                    table = f"{b}/g38.{locus}.{tech}.locus.tsv"
+                elif src == "new":
+                    table = f"{lt}/pv.all.{tech}.new.tsv" if lt else f"{b}/g38.new.{tech}.tsv"
+                else:
+                    table = f"{lt}/pv.{locus}.{tech}.{src}.tsv" if lt else f"{b}/main.{locus}.{tech}.{src}.tsv"
+                if not os.path.exists(table):
+                    sys.exit(f"recruit_baselines_score: {table} is missing")
+                sets.extend(panvar_sets(table, locus))
                 if src == "boundary":
                     ls, le = locus_interval(sim, locus)
                     kinds = {}

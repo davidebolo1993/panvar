@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <cmath>
 #include <cstring>
 #include <map>
@@ -54,11 +55,13 @@ struct Rng {
     }
 };
 
+// Errors at rate e (bases upper-cased: a substitution must change the base whatever its case).
 std::string with_errors(const std::string& s, double e, double indel_share, Rng& rng) {
     static const char kBases[] = "ACGT";
     std::string out;
     out.reserve(s.size() + s.size() / 50 + 4);
-    for (const char c : s) {
+    for (const char lc : s) {
+        const char c = static_cast<char>(std::toupper(static_cast<unsigned char>(lc)));
         if (rng.unit() >= e) { out += c; continue; }
         const double k = rng.unit();
         if (k < indel_share / 2) continue;                                       // deletion
@@ -131,6 +134,13 @@ void run(const std::vector<Job>& jobs, std::uint64_t seed, const Class& c, const
     }
 }
 
+// FNV-1a: the same seed on every platform (std::hash differs between standard libraries).
+std::uint64_t fnv1a(const std::string& s) {
+    std::uint64_t h = 0xCBF29CE484222325ULL;
+    for (const char c : s) h = (h ^ static_cast<unsigned char>(c)) * 0x100000001B3ULL;
+    return h;
+}
+
 std::string sample_of(const std::string& path) {
     const std::size_t h = path.find('#');
     return h == std::string::npos ? path : path.substr(0, h);
@@ -171,7 +181,7 @@ void calibrate(LocusIndex& x, const Graph& g, const std::vector<OffTarget>& off,
         cal.read_length = c.length;
         cal.insert = c.insert;
         cal.held_out = held.size();
-        Rng rng{0x5EEDULL ^ std::hash<std::string>{}(x.name + c.name)};
+        Rng rng{0x5EEDULL ^ fnv1a(x.name + c.name)};
         Tally tally[3];
         // held-out samples: their own k-mers read as new (N), one sample at a time
         for (const std::string& s : held) {
@@ -201,7 +211,8 @@ void calibrate(LocusIndex& x, const Graph& g, const std::vector<OffTarget>& off,
             run(jobs, rng.next(), c, t, x.screen, threads, tally);
             for (const auto& [p, v] : saved) *p = v;
         }
-        // off target: the flanks tiled, the decoy windows tiled with reads overlapping them
+        // off target: the flanks tiled, the decoy windows tiled with reads overlapping them (fragments overlapping
+        // a window share its sites, so false certain fragments cluster by site: the bound treats them as independent)
         std::uint64_t flank_bases = 0, decoy_bases = 0;
         for (const OffTarget& r : off) (r.decoy ? decoy_bases : flank_bases) += r.decoy ? r.core_end - r.core_start + (c.insert ? 0 : c.length) : r.seq.size();
         const std::uint64_t want = c.insert ? kOffShort : kOffLong;
@@ -211,11 +222,16 @@ void calibrate(LocusIndex& x, const Graph& g, const std::vector<OffTarget>& off,
         for (const OffTarget& r : off) {
             const std::uint64_t n = r.seq.size();
             if (c.insert) {
-                const std::uint64_t lo = r.decoy ? r.core_start : 0, hi = r.decoy ? std::min(r.core_end, n) : n;
-                for (std::uint64_t a = lo; a + c.insert <= hi; a += r.decoy ? stride_decoy : stride_flank) {
+                // decoy windows: fragments with at least a read length inside the window, in its context too
+                const std::uint64_t max_l = c.insert + 3 * c.insert_sd;
+                const std::uint64_t lo = r.decoy && r.core_start + c.length > max_l ? r.core_start + c.length - max_l : 0;
+                const std::uint64_t hi = r.decoy ? (r.core_end > c.length ? r.core_end - c.length : 0) : n;
+                for (std::uint64_t a = lo; a < hi; a += r.decoy ? stride_decoy : stride_flank) {
                     const std::uint64_t L = static_cast<std::uint64_t>(std::clamp(static_cast<double>(c.insert) + c.insert_sd * rng.normal(),
-                                                                                  static_cast<double>(c.length), static_cast<double>(c.insert + 3 * c.insert_sd)));
-                    if (a + L <= hi) jobs.push_back({&r.seq, a, L, static_cast<std::uint8_t>(r.decoy ? 2 : 1)});
+                                                                                  static_cast<double>(c.length), static_cast<double>(max_l)));
+                    if (a + L > n) continue;
+                    if (r.decoy && std::min(a + L, r.core_end) < std::max(a, r.core_start) + c.length) continue;
+                    jobs.push_back({&r.seq, a, L, static_cast<std::uint8_t>(r.decoy ? 2 : 1)});
                 }
             } else if (n <= c.length) {
                 if (n >= 2 * kK) jobs.push_back({&r.seq, 0, n, static_cast<std::uint8_t>(r.decoy ? 2 : 1)});
@@ -242,8 +258,26 @@ void calibrate(LocusIndex& x, const Graph& g, const std::vector<OffTarget>& off,
 
 double upper_bound(std::uint64_t events, std::uint64_t n) {
     if (n == 0) return 1.0;
-    const double a = static_cast<double>(events) + 1.0;   // Wilson-Hilferty, chi-square with 2(events + 1) degrees
-    const double u = a * std::pow(1.0 - 1.0 / (9.0 * a) + 1.645 / (3.0 * std::sqrt(a)), 3.0);
+    // the mean at which `events` or fewer happen with probability 0.05 (exact Poisson, by bisection; above a
+    // few hundred events, Wilson-Hilferty's chi-square approximation)
+    const double k = static_cast<double>(events);
+    double u;
+    if (events > 300) {
+        const double a = k + 1.0;
+        u = a * std::pow(1.0 - 1.0 / (9.0 * a) + 1.645 / (3.0 * std::sqrt(a)), 3.0);
+    } else {
+        auto cdf = [&](double lambda) {   // P(X <= events)
+            double term = std::exp(-lambda), sum = term;
+            for (std::uint64_t i = 1; i <= events; ++i) { term *= lambda / static_cast<double>(i); sum += term; }
+            return sum;
+        };
+        double lo = k, hi = k + 10.0 + 10.0 * std::sqrt(k + 1.0);
+        for (int it = 0; it < 100; ++it) {
+            const double mid = 0.5 * (lo + hi);
+            (cdf(mid) > 0.05 ? lo : hi) = mid;
+        }
+        u = hi;
+    }
     return std::min(1.0, u / static_cast<double>(n));
 }
 
@@ -252,11 +286,21 @@ Cut calibrated_cut(const std::vector<Calibration>& cs, double mean_read_length, 
     for (const Calibration& c : cs) {
         if (c.read_class != want) continue;
         const std::uint64_t screened = c.flank_screened + c.decoy_screened;
+        Cut cut;
+        cut.by = &c;
+        if (screened == 0) return cut;   // nothing measured: no calibrated cut
+        cut.min_sites = kMaxCut;
+        cut.met = false;
         for (std::uint32_t m = 2; m <= kMaxCut; ++m) {
             const std::uint64_t fc = c.flank_certain[m] + c.decoy_certain[m];
-            if (static_cast<double>(fc) <= rate * static_cast<double>(screened)) return {m, &c, true};
+            if (static_cast<double>(fc) <= rate * static_cast<double>(screened)) {
+                cut.min_sites = m;
+                cut.met = true;
+                break;
+            }
         }
-        return {kMaxCut, &c, false};
+        cut.shown = upper_bound(c.flank_certain[cut.min_sites] + c.decoy_certain[cut.min_sites], screened) <= rate;
+        return cut;
     }
     return {};
 }

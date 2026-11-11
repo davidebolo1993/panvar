@@ -15,6 +15,7 @@ truth: the sample's copies in the same table (its haplotypes need not be in the 
 import argparse
 import collections
 import gzip
+import re
 import statistics
 import sys
 
@@ -41,22 +42,22 @@ def opener(path):
 
 
 def read_gfa(path):
+    """Each path's sequence by name: P lines by their name, W lines as sample#haplotype#contig:start-end."""
     seqs, paths = {}, {}
     with opener(path) as f:
         for line in f:
-            if line[0] == "S":
-                x = line.rstrip("\n").split("\t")
+            x = line.rstrip("\n").split("\t")
+            if x[0] == "S":
                 seqs[x[1]] = x[2]
-            elif line[0] == "P":
-                x = line.rstrip("\n").split("\t")
-                paths[x[1]] = x[2]
+            elif x[0] == "P":
+                paths[x[1]] = [(st[:-1], st[-1] == "-") for st in x[2].split(",")]
+            elif x[0] == "W":
+                walk = re.findall(r"([<>])([^<>]+)", x[6])
+                name = f"{x[1]}#{x[2]}#{x[3]}" + (f":{x[4]}-{x[5]}" if x[4] != "*" else "")
+                paths[name] = [(node, d == "<") for d, node in walk]
     out = {}
     for name, steps in paths.items():
-        parts = []
-        for st in steps.split(","):
-            s = seqs[st[:-1]]
-            parts.append(s if st[-1] == "+" else s.translate(COMP)[::-1])
-        out[name] = "".join(parts)
+        out[name] = "".join(seqs[n].translate(COMP)[::-1] if rev else seqs[n] for n, rev in steps)
     return out
 
 

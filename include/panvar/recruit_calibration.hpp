@@ -28,13 +28,16 @@ constexpr std::uint64_t kCalibrationFlank = 5000000;
 void calibrate(LocusIndex& x, const Graph& g, const std::vector<OffTarget>& off, std::size_t threads);
 
 struct Cut {
-    std::uint32_t min_sites = 0;          // 0: the index carries no calibration
+    std::uint32_t min_sites = 0;          // 0: no calibrated cut (no calibration of this class, or no screened negative)
     const Calibration* by = nullptr;      // the read class it came from
     bool met = true;                      // false: no cut reaches the rate (the largest is used)
+    bool shown = false;                   // the false-certain share's 95% bound is within the rate: the
+                                          // simulation was large enough to show it, not only to see none
 };
 
 // The read class nearest a run (short below 1 kb mean read length; long: hifi at an error rate up to 1%,
-// else ont) and its lowest cut, never below 2, whose off-target false-certain share is at most `rate`.
+// else ont) and its lowest cut, never below 2, whose observed off-target false-certain share is at most
+// `rate`. With fewer screened negatives than 1 / rate this is the lowest cut with none observed.
 Cut calibrated_cut(const std::vector<Calibration>& c, double mean_read_length, double error_rate, double rate);
 
 // The share's one-sided 95% upper bound with `events` of `n` (Poisson).

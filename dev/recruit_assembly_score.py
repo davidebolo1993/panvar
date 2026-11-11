@@ -4,13 +4,14 @@
     recruit_assembly_score.py intervals <loci.fa> <loci.paf>      each locus on each haplotype (BED)
     recruit_assembly_score.py score <loci.bed> <aligned.tsv> <recruit.tsv>
 
-intervals: per locus and haplotype (contigs prefixed h1_, h2_), the contig holding most of the locus's
-aligned bases and the span of the alignments on it near the best one; a locus covered under half is
-flagged (a deletion, or the assembly broken there).
+intervals: per locus and haplotype (contigs prefixed h1_, h2_), from primary alignments only (a
+secondary one may be a nearby paralog): the contig holding most of the locus's aligned bases, the span of
+the alignments on it near the best one, and the share of the locus they cover (query bases counted once);
+a locus covered under half is flagged (a deletion, or the assembly broken there).
 
-score: aligned.tsv holds primary alignments (name, mate, contig, start, end, MAPQ). Per locus, each
+score: aligned.tsv holds primary and supplementary alignments (name, mate, contig, start, end, MAPQ). Per locus, each
 fragment aligned into it, or screened by recruit, is classed by its mates:
-    locus_q        a mate overlaps the locus on either haplotype at MAPQ >= 20
+    locus_q        a mate (or part of one) overlaps the locus on either haplotype at MAPQ >= 20
     locus_low      a mate overlaps it, all such mates below MAPQ 20 (repeats the aligner cannot place)
     elsewhere_q    no mate there, every aligned mate MAPQ >= 20 (expect never certain)
     elsewhere_low  no mate there, an aligned mate below MAPQ 20
@@ -38,9 +39,11 @@ def intervals(fa, paf):
     alns = collections.defaultdict(list)
     with open(paf) as f:
         for line in f:
-            x = line.split("\t")
+            x = line.rstrip("\n").split("\t")
+            if "tp:A:S" in x[12:]:
+                continue
             q, t, ts, te, matches = x[0], x[5], int(x[7]), int(x[8]), int(x[9])
-            alns[(q, t[:3])].append((t, ts, te, matches))
+            alns[(q, t[:3])].append((t, ts, te, matches, int(x[2]), int(x[3])))
     for q in qlen:
         for hap in ("h1_", "h2_"):
             a = alns.get((q, hap), [])
@@ -48,13 +51,18 @@ def intervals(fa, paf):
                 print(f"# {q} {hap[:2]}: not found", file=sys.stderr)
                 continue
             by = collections.Counter()
-            for t, _, _, m in a:
+            for t, _, _, m, _, _ in a:
                 by[t] += m
             contig = by.most_common(1)[0][0]
             best = max((x for x in a if x[0] == contig), key=lambda x: x[3])
             near = [x for x in a if x[0] == contig and x[1] < best[2] + qlen[q] and x[2] > best[1] - qlen[q]]
             s, e = min(x[1] for x in near), max(x[2] for x in near)
-            cover = sum(x[3] for x in near) / qlen[q]
+            covered, end = 0, 0   # query bases in the union of the alignments' query ranges
+            for qs, qe in sorted((x[4], x[5]) for x in near):
+                if qe > end:
+                    covered += qe - max(qs, end)
+                    end = qe
+            cover = covered / qlen[q]
             flag = "" if cover >= 0.5 else "\tlow_cover"
             print(f"{contig}\t{s}\t{e}\t{q}\t{cover:.3f}{flag}")
 

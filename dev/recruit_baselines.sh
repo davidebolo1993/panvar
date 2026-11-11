@@ -11,27 +11,31 @@
 set -euo pipefail
 
 abs() { echo "$(cd "$(dirname "$1")" && pwd)/$(basename "$1")"; }
-OUT="$1"; TARGETS="$(abs "$2")"; SIM="$(abs "${3:-$HOME/panvar-data/sim}")"; LT_RUN="${4:-}"
+mkdir -p "$1"
+OUT="$(cd "$1" && pwd)"; TARGETS="$(abs "$2")"; SIM="$(abs "${3:-$HOME/panvar-data/sim}")"; LT_RUN="${4:+$(abs "$4")}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BBDUK="${BBDUK:-bbduk.sh}"; MB="${MIRABAIT:-mirabait}"
-mkdir -p "$OUT"
 cd "$OUT"
 LOCI=(c4 cyp2d gstm acot lpa)
 paired() { [[ $1 == short || $1 == illumina ]]; }
 [[ -s times.tsv ]] || echo -e "tool\tset\ttech\tseconds\tmax_rss_kb" > times.tsv
-if /usr/bin/time -v true 2> /dev/null; then TIME=(/usr/bin/time -v); else TIME=(/usr/bin/time -l); fi
+if /usr/bin/time -v true 2> /dev/null; then TIME=(/usr/bin/time -v); elif /usr/bin/time -l true 2> /dev/null; then TIME=(/usr/bin/time -l); else TIME=(); fi   # GNU, BSD, or none (no memory)
 timed() {   # timed <tool> <set> <tech> <command...>
   local tool=$1 set=$2 tech=$3 t0 t1 rss; shift 3
   t0=$(python3 -c 'import time; print(time.time())')
-  "${TIME[@]}" "$@" > /dev/null 2> time.tmp || { cat time.tmp >&2; exit 1; }
+  ${TIME[@]+"${TIME[@]}"} "$@" > /dev/null 2> time.tmp || { cat time.tmp >&2; exit 1; }
   t1=$(python3 -c 'import time; print(time.time())')
   rss=$(awk '/Maximum resident set size/ {print $NF} /maximum resident set size/ {print int($1 / 1024)}' time.tmp)
   echo -e "$tool\t$set\t$tech\t$(python3 -c "print(round($t1 - $t0, 2))")\t$rss" >> times.tsv
 }
-done_or_run() { local marker=$1; shift; [[ -f $marker ]] && return 0; "$@" && touch "$marker"; }
+done_or_run() { local marker=$1; shift; [[ -f $marker ]] && return 0; "$@"; touch "$marker"; }   # a plain command: set -e holds
 have_mirabait=0; command -v "$MB" > /dev/null && have_mirabait=1
 
-all_targets() { [[ -s all.targets.fa ]] || cat $(for L in "${LOCI[@]}"; do echo "$TARGETS/$L.fa"; done) > all.targets.fa; }
+all_targets() {
+  [[ -s all.targets.fa ]] && return 0
+  local files=(); for L in "${LOCI[@]}"; do files+=("$TARGETS/$L.fa"); done
+  cat "${files[@]}" > all.targets.tmp && mv all.targets.tmp all.targets.fa
+}
 run_set() {   # run_set <locus, or all> <tech> <reads prefix> <label>
   local L=$1 tech=$2 pre=$3 label=$4 in=() mbin=()
   if paired "$tech"; then
@@ -59,5 +63,6 @@ for tech in short illumina ont hifi; do
   run_set all "$tech" "$SIM/new/${tech}_new" "all.$tech.new"
 done
 rm -f time.tmp
-python3 "$ROOT/dev/recruit_baselines_score.py" "$OUT" "$SIM" ${LT_RUN:+"$LT_RUN"} > results.tsv
+python3 "$ROOT/dev/recruit_baselines_score.py" "$OUT" "$SIM" ${LT_RUN:+"$LT_RUN"} > results.tmp
+mv results.tmp results.tsv
 column -t results.tsv

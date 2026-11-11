@@ -81,11 +81,14 @@ check "calibration on 4 threads equals the 1-thread one" '[[ "$(cal idx/locus.in
 check "recruit takes each locus's calibrated cut and reports it" 'grep -q "^locus.locus.site_cut.2.calibrated (short reads)" recruited.summary.tsv'
 "$BIN" recruit --locus idx/locus.plx -1 reads_1.fq -2 reads_2.fq -o fixed.tsv -t 2 -q --min-sites 3
 check "--min-sites gives every locus that cut" 'grep -q "^locus.locus.site_cut.3.given" fixed.summary.tsv'
+"$BIN" recruit --locus idx/locus.plx -1 reads_1.fq -2 reads_2.fq -o rules.tsv -t 2 -q --decoy-share 0.2
+check "other scoring rules than the calibration's keep the default cut" 'grep -q "site_cut.2 (the calibration scored with the default" rules.summary.tsv'
+check "summary rows keep four fields" '[[ $(awk -F"\t" '"'"'NF != 4'"'"' recruited.summary.tsv | wc -l | tr -d " ") == 0 ]]'
 "$BIN" recruit --locus idx/locus.plx -1 reads_1.fq -2 reads_2.fq -o both.tsv -q --min-sites 3 --false-certain-rate 1e-3 2> both.txt; rc=$?
 check "--min-sites and --false-certain-rate together are refused" '[[ $rc -ne 0 ]] && grep -q "not both" both.txt'
 "$BIN" recruit -t 2 -q --background s -r ref --index-only --save-index idx_nocal --locus data/locus.gfa --no-calibration
 "$BIN" recruit --locus idx_nocal/locus.plx -1 reads_1.fq -2 reads_2.fq -o nocal.tsv -t 2 -q
-check "an index without calibration: no calibration rows, the cut 2, the same table" '[[ -z "$(cal idx_nocal/locus.index.tsv)" ]] && grep -q "site_cut.2.the index carries no calibration" nocal.summary.tsv && cmp -s recruited.tsv nocal.tsv'
+check "an index without calibration: no calibration rows, the cut 2, the same table" '[[ -z "$(cal idx_nocal/locus.index.tsv)" ]] && grep -q "site_cut.2 (the index carries no calibration)" nocal.summary.tsv && cmp -s recruited.tsv nocal.tsv'
 mkdir -p twin/a twin/b && cp data/locus.gfa twin/a/locus.gfa && cp data/locus.gfa twin/b/locus.gfa
 "$BIN" recruit -t 2 -q --background s -r ref --index-only --save-index idx_twin --locus twin/a/locus.gfa --locus twin/b/locus.gfa 2> twin.txt; rc=$?
 check "two graphs of one name are refused" '[[ $rc -ne 0 ]] && grep -q "rename one graph" twin.txt'

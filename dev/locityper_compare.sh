@@ -35,7 +35,8 @@ timed() {   # timed <tool> <set> <tech> <command...>: seconds and peak memory (K
 done_or_run() {   # done_or_run <marker> <command...>: skips a step already completed, marks it when it succeeds
   local marker=$1; shift
   [[ -f $marker ]] && return 0
-  "$@" && touch "$marker"
+  "$@"
+  touch "$marker"
 }
 reads_of() {   # reads_of <tech> <prefix>: the read arguments, for locityper and for panvar
   if paired "$1"; then LT_IN=(-i "$2_1.fq.gz" "$2_2.fq.gz"); PV_IN=(-1 "$2_1.fq.gz" -2 "$2_2.fq.gz")

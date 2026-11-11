@@ -206,35 +206,54 @@ ReadStats recruit_reads(const ReadOptions& options) {
         std::snprintf(b, sizeof b, "%.4f", o.error_rate);
         log(std::string("error rate ") + b + " (" + st.error_source + ")");
     }
-    // each locus's private-site cut: calibrated for the run's read class (from the first reads), or the given one
+    // each locus's private-site cut: calibrated for the run's read class (from the first reads), or the given
+    // one when the run scores by other rules than the calibration did
     std::vector<std::string> cut_note(loci.size());
     {
         std::uint64_t bases = 0, reads = 0;
+        bool pairs = false;
         for (const Fragment& f : batch) {
             bases += f.seq1.size() + f.seq2.size();
             reads += !f.seq1.empty() + !f.seq2.empty();
+            pairs = pairs || (f.paired && !f.seq1.empty() && !f.seq2.empty());
         }
         const double mean = reads ? static_cast<double>(bases) / static_cast<double>(reads) : 0;
+        const ReadOptions defaults;
+        const bool same_rules = o.method == Method::Runs && o.decoy_share == defaults.decoy_share && o.min_density == defaults.min_density;
         for (std::size_t li = 0; li < loci.size(); ++li) {
-            char b[256];
-            if (!o.calibrated_cut || o.method != Method::Runs) {
-                std::snprintf(b, sizeof b, "%u\tgiven", o.min_sites);
+            std::string note;
+            if (!o.calibrated_cut) {
+                note = std::to_string(o.min_sites) + " given";
+            } else if (!same_rules) {
+                note = std::to_string(o.min_sites) + " (the calibration scored with the default method, decoy share and density; these differ)";
             } else {
                 const Cut c = calibrated_cut(calibration[li], mean, o.error_rate, o.false_certain_rate);
-                if (c.min_sites == 0) {
-                    std::snprintf(b, sizeof b, "%u\tthe index carries no calibration", o.min_sites);
+                if (c.by == nullptr) {
+                    note = std::to_string(o.min_sites) + " (the index carries no calibration)";
+                } else if (c.min_sites == 0) {
+                    note = std::to_string(o.min_sites) + " (the calibration screened no off-target read)";
                 } else {
                     loci[li].min_sites = c.min_sites;
                     const std::uint64_t scr = c.by->flank_screened + c.by->decoy_screened;
                     const std::uint64_t fc = c.by->flank_certain[c.min_sites] + c.by->decoy_certain[c.min_sites];
-                    std::snprintf(b, sizeof b, "%u\tcalibrated (%s reads%s): held-out recall %.4f; false certain %llu of %llu screened off-target, 95%% bound %.3g",
-                                  c.min_sites, c.by->read_class.c_str(), c.met ? "" : "; no cut reaches the rate, the largest is used",
+                    char b[512];
+                    std::snprintf(b, sizeof b, "%u calibrated (%s reads): held-out recall %.4f; false certain %llu of %llu screened off-target, 95%% bound %.3g, %s",
+                                  c.min_sites, c.by->read_class.c_str(),
                                   c.by->locus ? static_cast<double>(c.by->locus_certain[c.min_sites]) / static_cast<double>(c.by->locus) : 0.0,
-                                  static_cast<unsigned long long>(fc), static_cast<unsigned long long>(scr), upper_bound(fc, scr));
+                                  static_cast<unsigned long long>(fc), static_cast<unsigned long long>(scr), upper_bound(fc, scr),
+                                  !c.met ? "no cut reaches the rate: the largest is used"
+                                  : c.shown ? "within the rate" : "too few to show the rate (none beyond it seen)");
+                    note = b;
+                    if (o.error_rate > 2 * c.by->error_rate) {
+                        std::snprintf(b, sizeof b, "; the run's error rate %.4f is above the calibration's %.4f: its off-target reads may be certain more often",
+                                      o.error_rate, c.by->error_rate);
+                        note += b;
+                    }
+                    if (c.by->insert > 0 && !pairs) note += "; calibrated on pairs, the run reads single reads";
                 }
             }
-            cut_note[li] = b;
-            log(loci[li].name + ": private-site cut " + std::string(b).replace(std::string(b).find('\t'), 1, ", "));
+            cut_note[li] = note;
+            log(loci[li].name + ": private-site cut " + note);
         }
     }
 

@@ -17,40 +17,46 @@ OUT="$1"; SIM="$(abs "${2:-$HOME/panvar-data/sim}")"; BG="$(abs "${3:-$SIM/bg_g3
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 P="$ROOT/build/panvar"
 RD="$ROOT/tests/real_data"
-CN="python3 $ROOT/dev/recruit_gene_cn.py"
+CN=(python3 "$ROOT/dev/recruit_gene_cn.py")
 mkdir -p "$OUT"
 cd "$OUT"
+# a step's outputs are trusted only once its marker is written, after it succeeded
+done_or_run() { local marker=$1; shift; [[ -f $marker ]] && return 0; "$@"; touch "$marker"; }
+src() { python3 "$ROOT/dev/recruit_sources.py" "$1" --gfa "$2" --sample "$3" --out "$4.tmp"; mv "$4.tmp" "$4"; }
 
 # GSTM1-null sample: held out, its index, its reads
 mkdir -p gstm1_null
-[[ -s gstm1_null/gstm.gfa ]] || python3 "$ROOT/dev/recruit_sources.py" held-out --gfa "$RD/paralogs/gstm.gfa.gz" --sample "$NULL" --out gstm1_null/gstm.gfa
-[[ -s gstm1_null/locus.fa ]] || python3 "$ROOT/dev/recruit_sources.py" locus --gfa "$RD/paralogs/gstm.gfa.gz" --sample "$NULL" --out gstm1_null/locus.fa
+[[ -s gstm1_null/gstm.gfa ]] || src held-out "$RD/paralogs/gstm.gfa.gz" "$NULL" gstm1_null/gstm.gfa
+[[ -s gstm1_null/locus.fa ]] || src locus "$RD/paralogs/gstm.gfa.gz" "$NULL" gstm1_null/locus.fa
 [[ -f gstm1_null/gstm.plx ]] || "$P" recruit --locus gstm1_null/gstm.gfa --background "$BG" -r grch38 --index-only --save-index gstm1_null -t 2 -q
-if [[ ! -s gstm1_null/reads_2.fq.gz ]]; then
+simulate() {
+  local len
   len=$(awk '!/^>/ {n += length($0)} END {print n}' gstm1_null/locus.fa)
   wgsim -N $((len * 15 / 300)) -1 150 -2 150 -d 400 -s 50 -e 0.002 -r 0 -R 0 -X 0 -S 11 gstm1_null/locus.fa gstm1_null/reads_1.fq gstm1_null/reads_2.fq > /dev/null
   gzip -f gstm1_null/reads_1.fq gstm1_null/reads_2.fq
-fi
+}
+done_or_run gstm1_null/reads.done simulate
 
 recruit() {   # recruit <name> <plx> <reads_1> <reads_2>: certain reads in <name>.reads/
-  [[ -s $1.tsv ]] && return 0
+  rm -rf "$1.reads"
   "$P" recruit --locus "$2" -1 "$3" -2 "$4" --error-rate 0.002 -o "$1.tsv" --reads-out "$1.reads" --certain-only -t 2 -q
 }
-recruit gstm1_null gstm1_null/gstm.plx gstm1_null/reads_1.fq.gz gstm1_null/reads_2.fq.gz
+done_or_run gstm1_null.done recruit gstm1_null gstm1_null/gstm.plx gstm1_null/reads_1.fq.gz gstm1_null/reads_2.fq.gz
 for entry in "c4 HG00733 paralogs/c4.bed" "cyp2d HG00733 paralogs/cyp2d.bed" "gstm HG002 paralogs/gstm.bed" "acot HG002 paralogs/acot.bed" "lpa HG002 -"; do
   read -r L _ _ <<< "$entry"
-  recruit "$L" "$SIM/$L/g38/$L.plx" "$SIM/$L/short_locus_1.fq.gz" "$SIM/$L/short_locus_2.fq.gz"
+  done_or_run "$L.done" recruit "$L" "$SIM/$L/g38/$L.plx" "$SIM/$L/short_locus_1.fq.gz" "$SIM/$L/short_locus_2.fq.gz"
 done
 
 {
   echo -e "case\tsample\tunit\tkmers\tmedian_depth\tcopy_number\tcalled\ttruth\tmatch"
-  $CN --gfa gstm1_null/gstm.gfa --sample "$NULL" --genes "$RD/paralogs/gstm.bed" --reads gstm1_null.reads/*.fq.gz | tail -n +2 | sed 's/^/gstm1_null\t/'
+  "${CN[@]}" --gfa gstm1_null/gstm.gfa --sample "$NULL" --genes "$RD/paralogs/gstm.bed" --reads gstm1_null.reads/*.fq.gz | tail -n +2 | sed 's/^/gstm1_null\t/'
   for entry in "c4 HG00733 paralogs/c4.bed" "cyp2d HG00733 paralogs/cyp2d.bed" "gstm HG002 paralogs/gstm.bed" "acot HG002 paralogs/acot.bed"; do
     read -r L S B <<< "$entry"
-    $CN --gfa "$SIM/$L/$L.gfa" --sample "$S" --genes "$RD/$B" --reads "$L".reads/*.fq.gz | tail -n +2 | sed "s/^/$L\t/"
+    "${CN[@]}" --gfa "$SIM/$L/$L.gfa" --sample "$S" --genes "$RD/$B" --reads "$L".reads/*.fq.gz | tail -n +2 | sed "s/^/$L\t/"
   done
-  $CN --gfa "$SIM/lpa/lpa.gfa" --sample HG002 --repeats "$RD/tandem_repeat/lpa.repeats.tsv" --reads lpa.reads/*.fq.gz | tail -n +2 | sed 's/^/lpa\t/'
-} > cn.tsv 2> cn.log
+  "${CN[@]}" --gfa "$SIM/lpa/lpa.gfa" --sample HG002 --repeats "$RD/tandem_repeat/lpa.repeats.tsv" --reads lpa.reads/*.fq.gz | tail -n +2 | sed 's/^/lpa\t/'
+} > cn.tmp 2> cn.log
+mv cn.tmp cn.tsv
 column -t cn.tsv
 # fates of the CYP2D sample's fragments, by reason (the hybrid shows as conflict, if anywhere)
 echo; echo "cyp2d fragments by fate and reason:"
