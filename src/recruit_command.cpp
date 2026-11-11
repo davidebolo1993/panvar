@@ -4,6 +4,7 @@
 #include "panvar/cli_utils.hpp"
 #include "panvar/kmer.hpp"
 #include "panvar/locus_index.hpp"
+#include "panvar/recruit_reads.hpp"
 
 #include <algorithm>
 #include <filesystem>
@@ -22,7 +23,8 @@ void print_recruit_help() {
     std::cout
         << "panvar recruit - recruit a sample's reads to locus graphs without aligning\n\n"
         << "Usage:\n"
-        << "  panvar recruit --locus <graph.gfa> [--locus ...] --background <store.bgk> -r <reference path> --index-only\n\n"
+        << "  panvar recruit --locus <graph.gfa> [--locus ...] --background <store.bgk> -r <reference path> --index-only\n"
+        << "  panvar recruit --locus <graph.gfa | index.plx> [...] [--background ... -r ...] -1 <reads.fq> [-2 <mates.fq>] -o <out.tsv>\n\n"
         << "Options:\n"
         << "      --locus <gfa>        A locus graph; repeatable\n"
         << "      --background <dir>   The background store (its .sshash beside it is used when current)\n"
@@ -35,9 +37,31 @@ void print_recruit_help() {
         << "      --dust <score>       Private k-mers this low-complexity become shared (default 2.5)\n"
         << "      --decoy-genomes A,B  Genomes whose homologous windows are decoys (default: the coordinate reference)\n"
         << "      --decoy-min-hits <N> Shared k-mer hits, each within a pad of the next, that make a homologous window (default 20)\n"
+        << "  -1, --reads <fq>         Reads (FASTQ, plain or gzip)\n"
+        << "  -2, --mates <fq>         Their mates, in the same order\n"
+        << "  -o, --out <tsv>          One row per screened fragment and locus: fate, reason and evidence\n"
+        << "      --method <m>         runs (default: >= --min-sites independent private sites, decoy sites at\n"
+        << "                           most --decoy-share of them, at least --min-density of them),\n"
+        << "                           kmers (>= 3 private k-mers, no decoy k-mer), fraction (>= --min-fraction\n"
+        << "                           of k-mers in the locus, one private)\n"
+        << "      --min-sites <N>      Private sites for certain with --method runs (default 2)\n"
+        << "      --min-fraction <f>   For --method fraction (default 0.5)\n"
+        << "      --decoy-share <f>    Decoy sites tolerated as a share of the private sites (default 0.05)\n"
+        << "      --min-density <f>    Private sites needed per 31 callable bases (default 0.05): a long read\n"
+        << "                           elsewhere can carry a few private k-mers by sequencing error\n"
+        << "      --error-rate <e>     The reads' error rate per base: more mismatch runs than errors and new\n"
+        << "                           alleles explain make a read divergent (default 0.002)\n"
         << "  -t, --threads <N>        Worker threads\n"
         << "  -q, --quiet              No progress logs\n"
         << "  -h, --help               Show this help\n";
+}
+
+double parse_number(const std::string& name, const std::string& v) {
+    std::size_t used = 0;
+    double x = 0;
+    try { x = std::stod(v, &used); } catch (const std::exception&) { used = 0; }
+    if (used == 0 || used != v.size()) throw std::runtime_error(name + " takes a number, got '" + v + "'");
+    return x;
 }
 
 }  // namespace
@@ -45,6 +69,7 @@ void print_recruit_help() {
 int run_recruit_command(const std::vector<std::string>& args) {
     if (args.empty()) { print_recruit_help(); return 0; }
     recruit::BuildOptions o;
+    recruit::ReadOptions ro;
     std::string save_dir;
     bool index_only = false, quiet = false;
     std::size_t threads = 0;
@@ -63,7 +88,7 @@ int run_recruit_command(const std::vector<std::string>& args) {
         else if (a == "--save-index") save_dir = value();
         else if (a == "--informative-max") o.informative_max = static_cast<std::uint32_t>(cli::parse_size_arg(a, value()));
         else if (a == "--pad") o.pad = cli::parse_size_arg(a, value());
-        else if (a == "--dust") o.dust = std::stod(value());
+        else if (a == "--dust") o.dust = parse_number(a, value());
         else if (a == "--decoy-min-hits") o.decoy_min_hits = static_cast<std::uint32_t>(cli::parse_size_arg(a, value()));
         else if (a == "--decoy-genomes") {
             std::stringstream ss(value());
@@ -86,15 +111,40 @@ int run_recruit_command(const std::vector<std::string>& args) {
             for (const std::uint64_t d : x.decoy) out << kmer::decode(d, 31) << "\tD\t.\t.\t.\t0\t.\n";
             if (!out) throw std::runtime_error("recruit: cannot write " + v.substr(eq + 1));
             return 0;
-        } else if (a == "-t" || a == "--threads") threads = cli::parse_size_arg(a, value());
+        } else if (a == "-1" || a == "--reads") ro.reads1 = value();
+        else if (a == "-2" || a == "--mates") ro.reads2 = value();
+        else if (a == "-o" || a == "--out") ro.out = value();
+        else if (a == "--method") {
+            const std::string m = value();
+            if (m == "runs") ro.method = recruit::Method::Runs;
+            else if (m == "kmers") ro.method = recruit::Method::Kmers;
+            else if (m == "fraction") ro.method = recruit::Method::Fraction;
+            else throw std::runtime_error("--method is runs, kmers or fraction");
+        } else if (a == "--min-sites") ro.min_sites = static_cast<std::uint32_t>(cli::parse_size_arg(a, value()));
+        else if (a == "--min-fraction") ro.min_fraction = parse_number(a, value());
+        else if (a == "--decoy-share") ro.decoy_share = parse_number(a, value());
+        else if (a == "--min-density") ro.min_density = parse_number(a, value());
+        else if (a == "--error-rate") ro.error_rate = parse_number(a, value());
+        else if (a == "-t" || a == "--threads") threads = cli::parse_size_arg(a, value());
         else if (a == "-q" || a == "--quiet") quiet = true;
         else throw std::runtime_error("Unknown option: " + a);
     }
-    if (o.loci.empty()) throw std::runtime_error("recruit requires --locus <graph.gfa>");
-    if (o.background.empty()) throw std::runtime_error("recruit requires --background <store.bgk>");
-    if (o.reference_query.empty()) throw std::runtime_error("recruit requires -r <reference path>");
-    if (!index_only) throw std::runtime_error("recruit: reading reads is not available yet; run with --index-only");
-    for (const auto& l : o.loci) if (!fs::is_regular_file(l)) throw std::runtime_error("recruit: no graph at " + l);
+    if (o.loci.empty()) throw std::runtime_error("recruit requires --locus <graph.gfa | index.plx>");
+    auto is_plx = [](const std::string& p) { return p.size() > 4 && p.compare(p.size() - 4, 4, ".plx") == 0; };
+    std::vector<std::string> given_indexes, graphs;
+    for (const auto& l : o.loci) {
+        if (!fs::is_regular_file(l)) throw std::runtime_error("recruit: no file at " + l);
+        (is_plx(l) ? given_indexes : graphs).push_back(l);
+    }
+    o.loci = graphs;
+    if (!graphs.empty() && o.background.empty()) throw std::runtime_error("recruit requires --background <store.bgk> to index a graph");
+    if (!graphs.empty() && o.reference_query.empty()) throw std::runtime_error("recruit requires -r <reference path> to index a graph");
+    if (!index_only && (ro.reads1.empty() || ro.out.empty())) throw std::runtime_error("recruit requires -1 <reads> and -o <out.tsv> (or --index-only)");
+    if (ro.min_sites == 0) throw std::runtime_error("--min-sites must be at least 1");
+    if (ro.decoy_share < 0 || ro.decoy_share > 1) throw std::runtime_error("--decoy-share must be between 0 and 1");
+    if (ro.min_density < 0 || ro.min_density > 1) throw std::runtime_error("--min-density must be between 0 and 1");
+    if (!(ro.error_rate >= 0 && ro.error_rate < 0.5)) throw std::runtime_error("--error-rate must be between 0 and 0.5");
+    if (!(ro.min_fraction > 0 && ro.min_fraction <= 1)) throw std::runtime_error("--min-fraction must be in (0, 1]");
     cli::RunLog log("recruit", quiet);
     o.threads = threads == 0 ? bg::default_threads() : threads;
     o.log = [&](const std::string& s) { log.info(s); };
@@ -134,6 +184,16 @@ int run_recruit_command(const std::vector<std::string>& args) {
             wrote.push_back(plx);
             wrote.push_back(tsv);
         }
+    }
+    if (!index_only) {
+        ro.indexes = given_indexes;
+        for (const auto& l : o.loci) ro.indexes.push_back(index_path(l, ".plx"));
+        ro.threads = o.threads;
+        ro.log = o.log;
+        const recruit::ReadStats st = recruit::recruit_reads(ro);
+        log.info(std::to_string(st.fragments) + " fragments, " + std::to_string(st.screened) + " screened; per locus: " +
+                 std::to_string(st.certain) + " certain, " + std::to_string(st.ambiguous) + " ambiguous, " + std::to_string(st.unrecruited) + " unrecruited");
+        wrote.push_back(ro.out);
     }
     log.wrote(wrote);
     log.done();

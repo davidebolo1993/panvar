@@ -199,6 +199,7 @@ add_library(panvarlib
     src/anchors.cpp
     src/fasta_index.cpp
     src/locus_index.cpp
+    src/recruit_reads.cpp
 )
 
 target_include_directories(panvarlib

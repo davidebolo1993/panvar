@@ -33,6 +33,19 @@ check "the paralog makes shared k-mers and decoys" '[[ $(field idx/locus.index.t
 check "the screen holds only private and shared k-mers, about one in ten" 'awk -F"\t" '"'"'NR>1 && $2!="D" {n++; s+=$6} END {exit !(s > n/20 && s < n/5)}'"'"' dump.tsv'
 check "ceilings per read length" 'awk -F"\t" '"'"'$1=="ceiling" && $2==150 && $4>0.9 && $4<=1'"'"' idx/locus.index.tsv | grep -q .'
 
+# reads: from the locus, from its paralog, from elsewhere in the reference
+python3 "$TOOLS/locus_reads.py" data/ref.fa chr1 120000 160000 2000 loc 1 reads_locus
+python3 "$TOOLS/locus_reads.py" data/ref.fa chr1 231000 259000 2000 par 2 reads_paralog
+python3 "$TOOLS/locus_reads.py" data/ref.fa chr1 0 100000 2000 far 3 reads_far
+cat reads_locus_1.fq reads_paralog_1.fq reads_far_1.fq > reads_1.fq
+cat reads_locus_2.fq reads_paralog_2.fq reads_far_2.fq > reads_2.fq
+"$BIN" recruit --locus idx/locus.plx -1 reads_1.fq -2 reads_2.fq -o recruited.tsv -t 2 -q; rc=$?
+fate() { awk -F'\t' -v p="$1" -v f="$2" 'NR>1 && index($1, p)==1 && $3==f' recruited.tsv | wc -l | tr -d ' '; }
+check "reads from the locus are certain ($(fate loc certain) of 2000)" '[[ $rc -eq 0 && $(fate loc certain) -ge 1900 ]]'
+check "reads from the paralog are never certain, and mostly unrecruited as homolog ($(fate par unrecruited) of 2000)" '[[ $(fate par certain) == 0 && $(fate par unrecruited) -ge 1000 ]]'
+check "reads from elsewhere are not even screened" '[[ $(awk -F"\t" '"'"'NR>1 && index($1, "far")==1'"'"' recruited.tsv | wc -l | tr -d " ") == 0 ]]'
+
+
 "${RC[@]}" --locus data/locus.gfa 2> log2.txt
 check "a current index is reused" 'grep -q "is current, reused" log2.txt'
 "${RC[@]}" --locus data/locus.gfa --informative-max 2 2> log3.txt

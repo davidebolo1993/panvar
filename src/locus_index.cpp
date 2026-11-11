@@ -30,7 +30,7 @@ namespace fs = std::filesystem;
 
 constexpr std::size_t kK = 31, kS = 11;
 constexpr std::uint64_t kMagic = 0x3130305850585650ULL;   // "PVPXP001"
-constexpr std::uint64_t kVersion = 1;
+constexpr std::uint64_t kVersion = 3;   // 2: decoy windows stop at the locus; 3: clusters split at it
 const std::size_t kLengths[] = {100, 150, 250, 1000, 10000};
 constexpr std::size_t kWindowStep = 25;
 
@@ -465,7 +465,16 @@ std::vector<LocusIndex> build(const BuildOptions& o) {
                 std::uint64_t first = 0, last = 0, count = 0;
                 auto flush = [&] {
                     if (count < work[li].idx.decoy_min_hits) return;
-                    const std::uint64_t ws = first > pad ? first - pad : 0, we = std::min<std::uint64_t>(seq.size(), last + kK + pad);
+                    std::uint64_t ws = first > pad ? first - pad : 0, we = std::min<std::uint64_t>(seq.size(), last + kK + pad);
+                    // the padding stops at the locus's own copy in this genome: that sequence is the locus
+                    const auto own = work[li].spans.find(dname);
+                    if (own != work[li].spans.end())
+                        for (const auto& sp : own->second) {
+                            if (sp.contig != name || sp.end <= ws || sp.start >= we) continue;
+                            if (last + kK <= sp.start) we = std::min<std::uint64_t>(we, sp.start);
+                            else if (first >= sp.end) ws = std::max<std::uint64_t>(ws, sp.end);
+                        }
+                    if (we <= ws) return;
                     ++work[li].idx.decoy_windows;
                     work[li].idx.decoy_bases += we - ws;
                     work[li].idx.decoy_window_list.push_back({dname, name, ws, we, count});
@@ -473,8 +482,17 @@ std::vector<LocusIndex> build(const BuildOptions& o) {
                         if (work[li].idx.find(c) < 0) candidates[li].insert(c);
                     });
                 };
+                // the locus's own copies in this genome split clusters: hits on its two sides are two clusters
+                std::vector<std::pair<std::uint64_t, std::uint64_t>> own_here;
+                const auto own_it = work[li].spans.find(dname);
+                if (own_it != work[li].spans.end())
+                    for (const auto& sp : own_it->second) if (sp.contig == name) own_here.emplace_back(sp.start, sp.end);
+                auto across_own = [&](std::uint64_t a, std::uint64_t b) {   // a < b
+                    for (const auto& [os, oe] : own_here) if (a < os && b >= oe) return true;
+                    return false;
+                };
                 for (const std::uint64_t at : hits[li]) {
-                    if (count > 0 && at <= last + pad) { last = at; ++count; continue; }
+                    if (count > 0 && at <= last + pad && !across_own(last, at)) { last = at; ++count; continue; }
                     flush();
                     first = last = at;
                     count = 1;
