@@ -46,8 +46,12 @@ struct ReadOptions {
     std::uint32_t min_sites = 2;         // private sites for certain
     double decoy_share = 0.05;           // decoy sites tolerated, as a share of the private sites (runs method)
     double min_density = 0.05;           // private sites per 31 callable bases: chance hits in a long read are sparse
-    double error_rate = 0.002;           // per base: the expected mismatch runs, beside one new allele per kb
+    double error_rate = -1;              // per base: the expected mismatch runs, beside one new allele per kb;
+                                         // below 0: estimated from the base qualities of the first reads
     double min_fraction = 0.5;           // the fraction method's cut
+    std::string reads_out;               // a folder for the recruited reads as FASTQ (none if empty)
+    bool reads_ambiguous = true;         // write ambiguous reads too (else certain only)
+    std::string summary;                 // the run's summary table (none if empty)
     std::size_t threads = 2;
     std::function<void(const std::string&)> log;
 };
@@ -55,6 +59,8 @@ struct ReadOptions {
 struct ReadStats {
     std::uint64_t fragments = 0, screened = 0;
     std::uint64_t certain = 0, ambiguous = 0, unrecruited = 0;
+    double error_rate = 0;               // the rate scored with
+    std::string error_source;            // given, or estimated from base qualities, or a default
 };
 
 ReadStats recruit_reads(const ReadOptions& options);

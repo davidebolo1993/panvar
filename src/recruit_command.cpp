@@ -70,7 +70,16 @@ void print_recruit_help() {
         << "      --min-density <f>    Private sites needed per 31 callable bases (default 0.05): a long read\n"
         << "                           elsewhere can carry a few private k-mers by sequencing error\n"
         << "      --error-rate <e>     The reads' error rate per base: more mismatch runs than errors and new\n"
-        << "                           alleles explain make a read divergent (default 0.002)\n"
+        << "                           alleles explain make a read divergent (default: estimated from the base\n"
+        << "                           qualities of the first reads; logged and in the summary)\n"
+        << "      --preset <p>         The error rate of a technology: illumina 0.002, hifi 0.001, ont 0.03,\n"
+        << "                           clr 0.1 (--error-rate wins)\n"
+        << "      --reads-out <dir>    Write the recruited reads as gzip FASTQ, per locus and fate\n"
+        << "                           (<locus>.certain_1/_2.fq.gz for pairs, <locus>.certain.fq.gz for single\n"
+        << "                           reads; likewise ambiguous), as sequenced, with their qualities\n"
+        << "      --certain-only       With --reads-out: certain reads only\n"
+        << "      --summary <tsv>      The run's summary (default: beside -o, .summary.tsv): input records by\n"
+        << "                           kind, fragments by locus, fate and reason, error rate, backbone depth\n"
         << "  -t, --threads <N>        Scoring threads; a reader and N/4 decompression threads run beside them\n"
         << "  -q, --quiet              No progress logs\n"
         << "  -h, --help               Show this help\n";
@@ -90,7 +99,8 @@ int run_recruit_command(const std::vector<std::string>& args) {
     if (args.empty()) { print_recruit_help(); return 0; }
     recruit::BuildOptions o;
     recruit::ReadOptions ro;
-    std::string save_dir, sheet;
+    std::string save_dir, sheet, summary;
+    double error_rate = -1, preset_rate = -1;
     std::vector<std::string> reads1, reads2, singles;
     bool index_only = false, quiet = false, dry_run = false;
     std::size_t threads = 0;
@@ -150,7 +160,17 @@ int run_recruit_command(const std::vector<std::string>& args) {
         else if (a == "--min-fraction") ro.min_fraction = parse_number(a, value());
         else if (a == "--decoy-share") ro.decoy_share = parse_number(a, value());
         else if (a == "--min-density") ro.min_density = parse_number(a, value());
-        else if (a == "--error-rate") ro.error_rate = parse_number(a, value());
+        else if (a == "--error-rate") error_rate = parse_number(a, value());
+        else if (a == "--preset") {
+            const std::string p = value();
+            if (p == "illumina") preset_rate = 0.002;
+            else if (p == "hifi") preset_rate = 0.001;
+            else if (p == "ont") preset_rate = 0.03;
+            else if (p == "clr") preset_rate = 0.1;
+            else throw std::runtime_error("--preset is illumina, hifi, ont or clr");
+        } else if (a == "--reads-out") ro.reads_out = value();
+        else if (a == "--certain-only") ro.reads_ambiguous = false;
+        else if (a == "--summary") summary = value();
         else if (a == "-t" || a == "--threads") threads = cli::parse_size_arg(a, value());
         else if (a == "-q" || a == "--quiet") quiet = true;
         else throw std::runtime_error("Unknown option: " + a);
@@ -225,7 +245,8 @@ int run_recruit_command(const std::vector<std::string>& args) {
     if (ro.min_sites == 0) throw std::runtime_error("--min-sites must be at least 1");
     if (ro.decoy_share < 0 || ro.decoy_share > 1) throw std::runtime_error("--decoy-share must be between 0 and 1");
     if (ro.min_density < 0 || ro.min_density > 1) throw std::runtime_error("--min-density must be between 0 and 1");
-    if (!(ro.error_rate >= 0 && ro.error_rate < 0.5)) throw std::runtime_error("--error-rate must be between 0 and 0.5");
+    if (error_rate >= 0.5) throw std::runtime_error("--error-rate must be between 0 and 0.5");
+    ro.error_rate = error_rate >= 0 ? error_rate : preset_rate;   // below 0: estimated from base qualities
     if (!(ro.min_fraction > 0 && ro.min_fraction <= 1)) throw std::runtime_error("--min-fraction must be in (0, 1]");
     cli::RunLog log("recruit", quiet);
     o.threads = threads == 0 ? bg::default_threads() : threads;
@@ -282,15 +303,23 @@ int run_recruit_command(const std::vector<std::string>& args) {
         ro.log = o.log;
         const std::string out = ro.out;
         if (!sheet.empty()) fs::create_directories(out);
+        const std::string reads_out = ro.reads_out;
+        auto beside = [](const std::string& table) {   // x.tsv -> x.summary.tsv
+            const std::string stem = table.size() > 4 && table.compare(table.size() - 4, 4, ".tsv") == 0 ? table.substr(0, table.size() - 4) : table;
+            return stem + ".summary.tsv";
+        };
         for (const auto& [name, files] : samples) {
             ro.inputs = files;
             ro.out = sheet.empty() ? out : (fs::path(out) / (name + ".tsv")).string();
+            ro.summary = !summary.empty() && sheet.empty() ? summary : beside(ro.out);
+            if (!reads_out.empty()) ro.reads_out = sheet.empty() ? reads_out : (fs::path(reads_out) / name).string();
             if (!name.empty()) log.info(name + ": " + std::to_string(files.size()) + " input(s)");
             const recruit::ReadStats st = recruit::recruit_reads(ro);
             log.info((name.empty() ? std::string() : name + ": ") + std::to_string(st.fragments) + " fragments, " + std::to_string(st.screened) +
                      " screened; per locus: " + std::to_string(st.certain) + " certain, " + std::to_string(st.ambiguous) + " ambiguous, " +
                      std::to_string(st.unrecruited) + " unrecruited");
             wrote.push_back(ro.out);
+            wrote.push_back(ro.summary);
         }
     }
     log.wrote(wrote);

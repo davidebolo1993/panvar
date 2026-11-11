@@ -20,8 +20,8 @@ namespace panvar::recruit {
 
 namespace {
 
-bool read_fastq(GzLineReader& in, std::string& name, std::string& seq) {
-    std::string h, plus, qual;
+bool read_fastq(GzLineReader& in, std::string& name, std::string& seq, std::string& qual) {
+    std::string h, plus;
     while (in.getline(h)) {
         if (h.empty()) continue;
         if (h[0] != '@') throw std::runtime_error("recruit: not FASTQ (a record starts with '" + h.substr(0, 1) + "')");
@@ -54,13 +54,13 @@ public:
         std::exception_ptr failed1, failed2;
         std::thread mates([&] {
             try {
-                while (n2 < n && read_fastq(*in2_, names2_[n2], out[n2].seq2)) ++n2;
+                while (n2 < n && read_fastq(*in2_, names2_[n2], out[n2].seq2, out[n2].qual2)) ++n2;
             } catch (...) {
                 failed2 = std::current_exception();
             }
         });
         try {
-            while (n1 < n && read_fastq(*in1_, out[n1].name, out[n1].seq1)) out[n1++].paired = true;
+            while (n1 < n && read_fastq(*in1_, out[n1].name, out[n1].seq1, out[n1].qual1)) out[n1++].paired = true;
         } catch (...) {
             failed1 = std::current_exception();
         }
@@ -70,8 +70,8 @@ public:
         if (n2 < n1) throw std::runtime_error("recruit: " + r2_ + " has fewer reads than " + r1_);
         if (n2 > n1) throw std::runtime_error("recruit: " + r2_ + " has more reads than " + r1_);
         if (n1 < n) {   // the first file ended: so must the second
-            std::string name, seq;
-            if (read_fastq(*in2_, name, seq)) throw std::runtime_error("recruit: " + r2_ + " has more reads than " + r1_);
+            std::string name, seq, qual;
+            if (read_fastq(*in2_, name, seq, qual)) throw std::runtime_error("recruit: " + r2_ + " has more reads than " + r1_);
         }
         for (std::size_t i = 0; i < n1; ++i)
             if (names2_[i] != out[i].name) throw std::runtime_error("recruit: mates out of step: " + out[i].name + " and " + names2_[i]);
@@ -98,12 +98,13 @@ public:
         out.resize(n);
         std::size_t k = 0;
         std::string name2;
-        while (k < n && read_fastq(*in_, out[k].name, out[k].seq1)) {
+        while (k < n && read_fastq(*in_, out[k].name, out[k].seq1, out[k].qual1)) {
             ++st_.records;
             out[k].paired = interleaved_;
             out[k].seq2.clear();
+            out[k].qual2.clear();
             if (interleaved_) {
-                if (!read_fastq(*in_, name2, out[k].seq2)) throw std::runtime_error("recruit: " + path_ + ": an odd number of interleaved records");
+                if (!read_fastq(*in_, name2, out[k].seq2, out[k].qual2)) throw std::runtime_error("recruit: " + path_ + ": an odd number of interleaved records");
                 if (name2 != out[k].name) throw std::runtime_error("recruit: " + path_ + ": interleaved mates out of step: " + out[k].name + " and " + name2);
                 ++st_.records;
                 ++st_.pairs;
@@ -149,7 +150,8 @@ struct HtsFile {
         if (f->format == cram) {
             if (!o.cram_reference.empty() && hts_set_fai_filename(fp, o.cram_reference.c_str()) != 0)
                 fail("cannot use the CRAM reference " + o.cram_reference);
-            hts_set_opt(fp, CRAM_OPT_REQUIRED_FIELDS, SAM_QNAME | SAM_FLAG | SAM_RNAME | SAM_POS | SAM_RNEXT | SAM_PNEXT | SAM_SEQ);
+            hts_set_opt(fp, CRAM_OPT_REQUIRED_FIELDS,
+                        SAM_QNAME | SAM_FLAG | SAM_RNAME | SAM_POS | SAM_RNEXT | SAM_PNEXT | SAM_SEQ | (o.qualities ? SAM_QUAL : 0));
         }
         hdr = sam_hdr_read(fp);
         if (hdr == nullptr) fail("cannot read the header");
@@ -211,8 +213,9 @@ const std::array<char, 256> kComplement = [] {
     return t;
 }();
 
-// The read as sequenced: a reverse-strand record's sequence reverse-complemented back.
-std::string sequence_of(const bam1_t* b) {
+// The read as sequenced: a reverse-strand record's sequence reverse-complemented back, its qualities
+// reversed (none when the record has none).
+std::string sequence_of(const bam1_t* b, std::string* qual = nullptr) {
     const std::size_t n = static_cast<std::size_t>(b->core.l_qseq);
     std::string s(n, 'N');
     const std::uint8_t* q = bam_get_seq(b);
@@ -222,9 +225,19 @@ std::string sequence_of(const bam1_t* b) {
         s[i + 1] = p[1];
     }
     if (n % 2) s[n - 1] = kPairs[q[n / 2]][0];
-    if (b->core.flag & BAM_FREVERSE) {
+    const bool reverse = b->core.flag & BAM_FREVERSE;
+    if (reverse) {
         std::reverse(s.begin(), s.end());
         for (char& c : s) c = kComplement[static_cast<unsigned char>(c)];
+    }
+    if (qual != nullptr) {
+        const std::uint8_t* bq = bam_get_qual(b);
+        qual->clear();
+        if (n > 0 && bq[0] != 0xff) {
+            qual->resize(n);
+            for (std::size_t i = 0; i < n; ++i) (*qual)[i] = static_cast<char>(std::min<int>(bq[i], 93) + 33);
+            if (reverse) std::reverse(qual->begin(), qual->end());
+        }
     }
     return s;
 }
@@ -279,15 +292,23 @@ public:
 private:
     static constexpr std::int64_t kNear = 100000;   // a mate this far ahead is waited for
     static constexpr std::size_t kHoldMax = 2000000;  // reads waiting for mates in an unsorted file before going lean
+    struct Read {
+        std::string seq, qual;
+    };
+    Read read_of(const bam1_t* b) const {
+        Read r;
+        r.seq = sequence_of(b, o_.qualities ? &r.qual : nullptr);
+        return r;
+    }
     struct Held {
-        std::string seq;
+        std::string seq, qual;
         bool read1 = true;
         bool candidate = false;   // kept because it hits a screen (else waiting for a near mate, unscreened)
         std::int32_t mtid = -1;
         std::int64_t mpos = -1;
     };
     struct Wanted {   // a kept read whose mate must be fetched
-        std::string name, seq;
+        std::string name, seq, qual;
         bool read1 = true;
         std::int32_t mtid = -1;
         std::int64_t mpos = -1;
@@ -304,7 +325,7 @@ private:
         if (flag & BAM_FUNMAP) ++st_.unmapped;
         std::string name = bam_get_qname(b);
         if (!(flag & BAM_FPAIRED)) {
-            emit(std::move(name), sequence_of(b), std::string(), false);
+            emit(std::move(name), read_of(b), Read{}, false);
             return;
         }
         const bool read1 = !(flag & BAM_FREAD2);
@@ -320,17 +341,17 @@ private:
         const auto it = held_.find(name);
         if (it != held_.end()) {
             if (it->second.read1 != read1) {
-                pair_up(std::move(name), std::move(it->second), sequence_of(b), read1);
+                pair_up(std::move(name), std::move(it->second), read_of(b), read1);
                 held_.erase(it);
                 return;
             }
             // a second read 1 (or read 2) of this name: not its mate; the held one goes on alone
             ++st_.unmatched;
-            emit(it->first, std::move(it->second.seq), std::string(), false);
+            emit(it->first, Read{std::move(it->second.seq), std::move(it->second.qual)}, Read{}, false);
             held_.erase(it);
         }
         Held h;
-        h.seq = sequence_of(b);
+        h.seq = sequence_of(b, o_.qualities ? &h.qual : nullptr);
         h.read1 = read1;
         h.mtid = b->core.mtid;
         h.mpos = b->core.mpos;
@@ -356,7 +377,7 @@ private:
         const bool mate_unplaced = h.mtid < 0 || h.mpos < 0 || tid < 0;
         const bool behind = !mate_unplaced && (h.mtid < tid || (h.mtid == tid && h.mpos < pos));
         if (behind) {   // its mate passed and was not kept: it did not hit; this one decides the pair
-            if (o_.screened(h.seq)) wanted_.push_back({std::move(name), std::move(h.seq), read1, h.mtid, h.mpos});
+            if (o_.screened(h.seq)) wanted_.push_back({std::move(name), std::move(h.seq), std::move(h.qual), read1, h.mtid, h.mpos});
             else ++st_.unscreened;
             return;
         }
@@ -389,7 +410,7 @@ private:
             const bool known = h.mtid >= 0 && h.mpos >= 0;
             const bool passed = pos < 0 ? h.mtid != tid : (h.mtid < tid || (h.mtid == tid && h.mpos < pos));
             if (!h.candidate && known && passed) {
-                if (o_.screened(h.seq)) wanted_.push_back({it->first, std::move(h.seq), h.read1, h.mtid, h.mpos});
+                if (o_.screened(h.seq)) wanted_.push_back({it->first, std::move(h.seq), std::move(h.qual), h.read1, h.mtid, h.mpos});
                 else ++st_.dropped;
                 it = held_.erase(it);
             } else {
@@ -425,13 +446,13 @@ private:
         if (!coordinate_ && !lean_) {
             for (auto& [name, h] : held_) {
                 ++st_.unmatched;
-                emit(name, std::move(h.seq), std::string(), false);
+                emit(name, Read{std::move(h.seq), std::move(h.qual)}, Read{}, false);
             }
             held_.clear();
             return;
         }
         for (auto& [name, h] : held_) {
-            if (h.candidate || o_.screened(h.seq)) wanted_.push_back({name, std::move(h.seq), h.read1, h.mtid, h.mpos});
+            if (h.candidate || o_.screened(h.seq)) wanted_.push_back({name, std::move(h.seq), std::move(h.qual), h.read1, h.mtid, h.mpos});
             else ++st_.dropped;
         }
         held_.clear();
@@ -447,8 +468,9 @@ private:
             if (paired[it->second] || a.read1 == b.read1) continue;
             Held h;
             h.seq = std::move(a.seq);
+            h.qual = std::move(a.qual);
             h.read1 = a.read1;
-            pair_up(b.name, std::move(h), std::move(b.seq), b.read1);
+            pair_up(b.name, std::move(h), Read{std::move(b.seq), std::move(b.qual)}, b.read1);
             paired[it->second] = paired[i] = 1;
         }
         for (std::size_t i = 0; i < wanted_.size(); ++i)
@@ -501,7 +523,7 @@ private:
             if (found[i]) continue;
             Wanted& w = wanted_[i];
             ++st_.unmatched;
-            emit(std::move(w.name), std::move(w.seq), std::string(), false);
+            emit(std::move(w.name), Read{std::move(w.seq), std::move(w.qual)}, Read{}, false);
         }
         wanted_.clear();
     }
@@ -511,21 +533,25 @@ private:
         if (lean_ && lean_dropped_ > 0) --lean_dropped_;   // the mate fetched was one set aside
         Held h;
         h.seq = w.seq;
+        h.qual = w.qual;
         h.read1 = w.read1;
-        pair_up(w.name, std::move(h), sequence_of(mate), !w.read1);
+        pair_up(w.name, std::move(h), read_of(mate), !w.read1);
     }
 
-    void pair_up(std::string name, Held first, std::string seq, bool read1) {
+    void pair_up(std::string name, Held first, Read second, bool read1) {
         // mate 1 first: by flags, else in arrival order
-        if (first.read1 || !read1) emit(std::move(name), std::move(first.seq), std::move(seq), true);
-        else emit(std::move(name), std::move(seq), std::move(first.seq), true);
+        Read held{std::move(first.seq), std::move(first.qual)};
+        if (first.read1 || !read1) emit(std::move(name), std::move(held), std::move(second), true);
+        else emit(std::move(name), std::move(second), std::move(held), true);
     }
 
-    void emit(std::string name, std::string s1, std::string s2, bool paired) {
+    void emit(std::string name, Read r1, Read r2, bool paired) {
         Fragment f;
         f.name = std::move(name);
-        f.seq1 = std::move(s1);
-        f.seq2 = std::move(s2);
+        f.seq1 = std::move(r1.seq);
+        f.qual1 = std::move(r1.qual);
+        f.seq2 = std::move(r2.seq);
+        f.qual2 = std::move(r2.qual);
         f.paired = paired;
         ++st_.fragments;
         if (paired) ++st_.pairs;

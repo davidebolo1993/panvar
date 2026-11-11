@@ -23,12 +23,14 @@ namespace panvar::recruit {
 
 struct Fragment {
     std::string name, seq1, seq2;
+    std::string qual1, qual2;   // Phred+33, as sequenced; empty when the input has none
     bool paired = false;
 };
 
 struct InputOptions {
     std::string cram_reference;                               // FASTA (with .fai) for CRAM, if not resolvable otherwise
     bool interleaved = false;                                 // a single FASTQ holds mates as consecutive records
+    bool qualities = true;                                    // keep base qualities (CRAM decodes them only if so)
     std::size_t threads = 2;                                  // htslib decompression threads
     std::function<bool(const std::string&)> screened;         // a read hits some locus screen (coordinate-sorted input)
     std::function<void(const std::string&)> log;

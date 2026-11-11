@@ -91,6 +91,19 @@ else
   echo "  skip BAM, CRAM and truncation checks (samtools not installed)"
 fi
 
+# recruited reads as FASTQ, the summary, a preset
+"$BIN" recruit --locus "$IDX" -1 r_1.fq -2 r_2.fq -o out.tsv --reads-out reads_out --preset illumina -q
+check "certain pairs are written as FASTQ, mates in step" '[[ $(gzip -dc reads_out/locus.certain_1.fq.gz | awk "NR % 4 == 1" | wc -l) -eq $(awk -F"\t" '"'"'$3=="certain"'"'"' out.tsv | wc -l) && $(gzip -dc reads_out/locus.certain_2.fq.gz | wc -l) -eq $(gzip -dc reads_out/locus.certain_1.fq.gz | wc -l) ]]'
+check "the summary gives the error rate and the backbone depth" 'grep -q "^run.error_rate.0.00200.given" out.summary.tsv && grep -q "backbone_depth" out.summary.tsv'
+"$BIN" recruit --locus "$IDX" -1 r_1.fq -2 r_2.fq -o est.tsv 2> est.log
+check "without a rate, it is estimated from the base qualities" 'grep -q "error rate 0.0010 (estimated from" est.log'
+
+# more loci than 64: seventy copies of the locus, each read scored for every one
+mkdir -p many && for i in $(seq -w 1 70); do cp data/locus.gfa many/l$i.gfa; done
+"$BIN" recruit -t 4 -q --background s -r ref --index-only --save-index many_idx $(for i in $(seq -w 1 70); do printf -- "--locus many/l%s.gfa " $i; done)
+"$BIN" recruit -t 4 -q $(for f in many_idx/*.plx; do printf -- "--locus %s " $f; done) -1 a_1.fq -2 a_2.fq -o many.tsv
+check "seventy loci in one run: a certain pair is certain in all seventy, the others listed" 'awk -F"\t" '"'"'NR > 1 && $3 == "certain" && $24 == 70 {n++} NR > 1 && $3 == "certain" && split($23, o, ",") != 69 {bad++} END {exit !(n > 0 && bad == 0)}'"'"' many.tsv'
+
 "$BIN" recruit -i name.sam -1 r_1.fq -2 r_2.fq --dry-run > dry.tsv
 check "--dry-run counts records by kind" 'awk -F"\t" '"'"'$2=="name.sam" && $3 > 9000 && $4 > 0 && $5 > 0 && $6 == 50 && $10 == 9000'"'"' dry.tsv | grep -q . && awk -F"\t" '"'"'$2=="r_1.fq" && $3 == 4500'"'"' dry.tsv | grep -q .'
 
