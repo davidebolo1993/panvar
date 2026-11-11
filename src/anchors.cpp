@@ -182,7 +182,7 @@ ReferenceAnchors build_reference(const std::string& genome, const std::string& f
         ref.code.push_back(h.code);
         ref.at.push_back({h.contig, h.pos, h.forward});
     }
-    if (log) log("anchors: " + std::to_string(ref.code.size()) + " unique of " + std::to_string(hits.size()) + " sampled syncmers");
+    if (log) log("anchors: unique: " + std::to_string(ref.code.size()) + "; sampled syncmers: " + std::to_string(hits.size()));
     return ref;
 }
 

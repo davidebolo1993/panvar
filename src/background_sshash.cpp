@@ -328,7 +328,7 @@ void local_strings(const Segment& seg, std::size_t threads, SpssWriter& out, con
     std::vector<Frag> all;
     for (auto& v : frags) { all.insert(all.end(), v.begin(), v.end()); std::vector<Frag>().swap(v); }
     const std::uint64_t nf = all.size();
-    if (log) log("compact: " + std::to_string(nf) + " partition-local paths; gluing their ends");
+    if (log) log("compact: partition-local paths: " + std::to_string(nf) + "; gluing their ends");
     // end e = frag << 1 | side (0 left, 1 right); its outward code reads away from the path
     auto out_code = [&](std::uint64_t e) {
         const Frag& f = all[e >> 1];
@@ -455,7 +455,7 @@ CompactStats compact_store(const CompactOptions& o) {
         out.close();
         fs::rename(tmp_out, o.out_path);
         st.bytes = fs::file_size(o.out_path);
-        log("compact: the store holds no k-mer; wrote an empty background");
+        log("compact: the store holds no k-mer: an empty background written");
         return st;
     }
 
@@ -463,7 +463,7 @@ CompactStats compact_store(const CompactOptions& o) {
     const std::string spss = (fs::path(o.tmp_dir) / "compact.spss.fa.gz").string();
     struct Cleanup { std::string a, b; ~Cleanup() { std::error_code ec; fs::remove(a, ec); fs::remove(b, ec); } } cleanup{spss, tmp_out};
     const auto t0 = std::chrono::steady_clock::now();
-    log("compact: writing the string set of " + std::to_string(n) + " k-mers (" + (o.local_strings ? "partition-local paths, glued" : "greedy over the store") + ")");
+    log("compact: string set: k-mers: " + std::to_string(n) + "; strings: " + (o.local_strings ? "partition-local paths, glued" : "greedy over the store"));
     {
         SpssWriter w(spss);
         if (o.local_strings) local_strings(*seg, o.threads, w, log);
@@ -476,9 +476,13 @@ CompactStats compact_store(const CompactOptions& o) {
     if (st.kmers != n)
         throw std::runtime_error("background: the string set holds " + std::to_string(st.kmers) + " k-mers, the store " + std::to_string(n));
     st.strings_seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-    log("compact: " + std::to_string(st.strings) + " strings, " + std::to_string(st.string_bases) + " bases (" +
-        std::to_string(static_cast<double>(st.string_bases) / static_cast<double>(n)) + " bases per k-mer) in " +
-        std::to_string(st.strings_seconds) + " s");
+    {
+        char b[160];
+        std::snprintf(b, sizeof b, "compact: strings: %llu; bases: %llu; bases per k-mer: %.2f; seconds: %.1f",
+                      static_cast<unsigned long long>(st.strings), static_cast<unsigned long long>(st.string_bases),
+                      static_cast<double>(st.string_bases) / static_cast<double>(n), st.strings_seconds);
+        log(b);
+    }
 
     st.minimizer = o.minimizer != 0 ? o.minimizer
         : std::clamp<std::size_t>(static_cast<std::size_t>(std::ceil(std::log(static_cast<double>(std::max<std::uint64_t>(n, 2))) / std::log(4.0))) + 4, 13, 21);
@@ -492,7 +496,7 @@ CompactStats compact_store(const CompactOptions& o) {
     cfg.tmp_dirname = o.tmp_dir;
     seg.reset();
     log("compact: strings written; " + memory_report());
-    log("compact: building the SSHash dictionary (minimizer length " + std::to_string(st.minimizer) + ")");
+    log("compact: building the SSHash dictionary; minimizer length: " + std::to_string(st.minimizer));
     const auto t1 = std::chrono::steady_clock::now();
     {
         sshash::dictionary_type dict;

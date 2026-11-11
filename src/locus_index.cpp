@@ -386,8 +386,8 @@ std::vector<LocusIndex> build(const BuildOptions& o) {
                 haps.insert(h2 == std::string::npos ? name.substr(0, h1) + "#0" : name.substr(0, h2));
             }
         }
-        if (plain && haps.empty()) log("note: " + ge.path + ": its paths are not PanSN names (sample#haplotype#contig): counted as one haplotype");
-        else if (plain) log("note: " + ge.path + ": some paths are not PanSN names: only the PanSN ones are counted as haplotypes");
+        if (plain && haps.empty()) log("note: genome: " + ge.path + "; its paths are not PanSN names (sample#haplotype#contig): counted as one haplotype");
+        else if (plain) log("note: genome: " + ge.path + "; some paths are not PanSN names: only the PanSN ones are counted as haplotypes");
         haplotypes += std::max<std::size_t>(1, haps.size());
     }
     haplotypes = std::max<std::uint64_t>(1, haplotypes);
@@ -396,7 +396,7 @@ std::vector<LocusIndex> build(const BuildOptions& o) {
         if (!genomes.count(d)) throw std::runtime_error("recruit: decoy genome " + d + " is not in the background");
     std::string kind;
     const auto counts = open_counts(o.background, kind, o.log);
-    log("background: " + counts->kind() + ", coordinate reference " + cref);
+    log("background: " + counts->kind() + "; coordinate reference: " + cref + "; haplotypes: " + std::to_string(haplotypes));
     const anchors::ReferenceAnchors ref = anchors::load_reference((fs::path(o.background) / "anchors" / cref / "reference.anc").string());
     std::vector<std::unique_ptr<anchors::SegmentAnchors>> seg_anchors;
     std::vector<const anchors::SegmentAnchors*> sa;
@@ -452,8 +452,8 @@ std::vector<LocusIndex> build(const BuildOptions& o) {
         anchors::Span self;   // the coordinate reference: its exact interval
         self.genome = cref; self.contig = x.contig; self.start = x.start; self.end = x.end; self.inner_start = x.start; self.inner_end = x.end;
         w.spans[cref] = {self};
-        log(x.name + ": " + std::to_string(x.codes.size()) + " k-mers from " + std::to_string(x.paths) + " paths; " + x.contig + ":" +
-            std::to_string(x.start) + "-" + std::to_string(x.end) + " located in " + std::to_string(w.spans.size()) + " genomes");
+        log("locus: " + x.name + "; k-mers: " + std::to_string(x.codes.size()) + "; paths: " + std::to_string(x.paths) + "; interval: " + x.contig + ":" +
+            std::to_string(x.start) + "-" + std::to_string(x.end) + "; located in genomes: " + std::to_string(w.spans.size()));
     });
 
     // subtraction: read every span from its genome (one file at a time, every locus at once)
@@ -475,7 +475,7 @@ std::vector<LocusIndex> build(const BuildOptions& o) {
             const bg::graph::Haplotypes h(ge.path);
             for (std::size_t k = 0; k < iv.size(); ++k) pieces[k] = h.fetch(iv[k].contig, iv[k].start, iv[k].end);
         } else {
-            if (!fasta::IndexedFasta::indexed(ge.path)) log("note: " + ge.path + " has no .fai (and .gzi): read in full to cut its spans");
+            if (!fasta::IndexedFasta::indexed(ge.path)) log("note: genome: " + ge.path + "; no .fai (and .gzi): read in full to cut its spans");
             std::vector<std::string> seqs = fasta::fetch_intervals(ge.path, iv);
             for (std::size_t k = 0; k < iv.size(); ++k) pieces[k].push_back({iv[k].start, std::move(seqs[k])});
         }
@@ -636,7 +636,7 @@ std::vector<LocusIndex> build(const BuildOptions& o) {
             seq += line;
         }
         scan();
-        log("decoys: scanned " + dname);
+        log("decoys: genome scanned: " + dname);
     }
     parallel_for(work.size(), threads, [&](std::size_t li) {
         LocusIndex& x = work[li].idx;
@@ -651,9 +651,9 @@ std::vector<LocusIndex> build(const BuildOptions& o) {
         compute_ceilings(*graphs[li], x);
         std::size_t np = 0, ns = 0, nr = 0;
         for (const auto c : x.cls) (c == kPrivate ? np : c == kShared ? ns : nr)++;
-        log(x.name + ": P " + std::to_string(np) + ", S " + std::to_string(ns) + ", R " + std::to_string(nr) + "; decoys " +
-            std::to_string(x.decoy.size()) + " from " + std::to_string(x.decoy_windows) + " windows (" + std::to_string(x.decoy_bases) +
-            " bp), screen " + std::to_string(x.screen.size()));
+        log("locus: " + x.name + "; private: " + std::to_string(np) + "; shared: " + std::to_string(ns) + "; repeat: " + std::to_string(nr) +
+            "; decoys: " + std::to_string(x.decoy.size()) + " from " + std::to_string(x.decoy_windows) + " windows (" + std::to_string(x.decoy_bases) +
+            " bp); screen: " + std::to_string(x.screen.size()));
     });
     if (o.calibrate) {
         // off-target sequence: the coordinate reference beside each locus, and the decoy windows with context
@@ -706,12 +706,12 @@ std::vector<LocusIndex> build(const BuildOptions& o) {
             LocusIndex& x = work[li].idx;
             calibrate(x, *graphs[li], off[li], threads);
             if (std::none_of(graphs[li]->paths.begin(), graphs[li]->paths.end(), [](const PathRecord& p) { return p.name.find('#') != std::string::npos; }))
-                log("note: " + x.name + ": no path name is PanSN (sample#haplotype#contig): calibration holds out one path at a time, "
+                log("note: locus: " + x.name + "; no path name is PanSN (sample#haplotype#contig): calibration holds out one path at a time, "
                     "so a sample's other haplotype stays in and held-out recall is optimistic");
             for (const Calibration& c : x.calibration) {
                 const std::uint64_t scr = c.flank_screened + c.decoy_screened;
-                char b[256];
-                std::snprintf(b, sizeof b, "%s: calibration %s: certain recall %.4f at 2 sites (%llu held-out fragments, %llu samples); false certain %llu at 1 site, %llu at 2, of %llu screened off-target",
+                char b[512];
+                std::snprintf(b, sizeof b, "locus: %s; calibration: %s reads; held-out recall at 2 sites: %.4f (%llu fragments, %llu samples); off-target certain at 1 site: %llu, at 2: %llu; screened off-target: %llu",
                               x.name.c_str(), c.read_class.c_str(), c.locus ? static_cast<double>(c.locus_certain[2]) / static_cast<double>(c.locus) : 0.0,
                               static_cast<unsigned long long>(c.locus), static_cast<unsigned long long>(c.held_out),
                               static_cast<unsigned long long>(c.flank_certain[1] + c.decoy_certain[1]),

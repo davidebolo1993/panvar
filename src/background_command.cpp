@@ -34,46 +34,39 @@ namespace fs = std::filesystem;
 
 void print_background_help() {
     std::cout
-        << "panvar background - count every 31-mer of a set of genomes, for read recruitment\n\n"
         << "Usage:\n"
-        << "  panvar background -o <store.bgk> --genome NAME=PATH [...] [--coordinate-reference NAME]   build\n"
-        << "  panvar background -o <store.bgk> --add --genome NAME=PATH [...]           add a segment\n"
-        << "  panvar background -o <store.bgk> --segment-only <dir> --genome NAME=PATH  build a segment to attach later\n"
-        << "  panvar background -o <store.bgk> --attach <dir> [<dir> ...]               commit built segments\n"
-        << "  panvar background -o <store.bgk> --merge [--range I/N]                    merge segments\n"
-        << "  panvar background -o <store.bgk> --compact                                to SSHash\n"
-        << "  panvar background -o <store.bgk> --coordinate-reference NAME              anchor every genome on NAME\n"
-        << "  panvar background -o <store.bgk> --locate CONTIG:START-END                find a locus\n"
-        << "  panvar background -o <store.bgk> --dump <out.tsv> | --verify <bg> | --clean\n\n"
-        << "Options:\n"
-        << "  -o, --out <dir>         The store (a folder; manifest.json lists its segments)\n"
-        << "      --genome NAME=PATH  A genome: FASTA (plain or gzip) or GFA (its P/W haplotypes); repeatable\n"
-        << "      --genomes <tsv>     Genomes as name and path per line\n"
-        << "      --add               Add the genomes to an existing store as a new segment\n"
-        << "      --segment-only <dir> Count the genomes into <dir> for the store, without committing\n"
-        << "      --attach <dir>...   Commit segments built with --segment-only\n"
-        << "      --merge             Merge the store's segments into one\n"
-        << "      --range I/N         Merge only the I-th of N partition ranges (0-based); the last to finish commits\n"
-        << "      --compact           Write a merged store as an SSHash dictionary, <store>.sshash\n"
-        << "      --local-strings     --compact building strings within partitions, then gluing them: never reads\n"
-        << "                          across partitions, but holds every path in memory; slower\n"
-        << "      --minimizer <N>     SSHash minimizer length for --compact (default: from the k-mer count)\n"
-        << "      --dump <path>       Write every k-mer and its count (segments summed) as TSV\n"
-        << "      --verify <path>     Check that a background (store or .sshash) holds exactly this store's\n"
-        << "                          k-mers with the same counts\n"
-        << "      --clean             Remove what no committed segment or live job uses\n"
-        << "      --coordinate-reference NAME\n"
-        << "                          The genome whose coordinates locus graphs carry: its unique anchors are\n"
-        << "                          placed in every genome, so a locus can be found in each\n"
-        << "      --locate <region>   Where each genome holds a region of the coordinate reference\n"
-        << "      --spell-graph GFA=FASTA  Write a graph's haplotypes as FASTA (a check of graph counting)\n"
-        << "      --partitions <N>    Partitions of a new store, a power of two (default 4096)\n"
-        << "      --memory <size>     Memory bound for counting, e.g. 2G, 512M (default 2G)\n"
-        << "      --no-dedup          Do not fold identical super-k-mers while spilling\n"
-        << "      --tmp-dir <dir>     Temporary files (default: $TMPDIR, else inside the store)\n"
-        << "  -t, --threads <N>       Worker threads (default: Slurm's allocation or the CPUs available)\n"
-        << "  -q, --quiet             No progress logs\n"
-        << "  -h, --help              Show this help\n";
+        << "  panvar background -o <store.bgk> --genome NAME=PATH [...] --coordinate-reference NAME\n"
+        << "  panvar background -o <store.bgk> --add --genome NAME=PATH [...]\n"
+        << "  panvar background -o <store.bgk> --segment-only <dir> --genome NAME=PATH [...]   (then --attach <dir>)\n"
+        << "  panvar background -o <store.bgk> --merge [--range I/N] | --compact | --clean\n\n"
+        << "Count every 31-mer of a set of genomes once, for recruiting reads to loci: the store holds each k-mer's\n"
+        << "count, and anchors that find any locus of the coordinate reference in every genome. Genomes can be\n"
+        << "added later as segments, each counted in its own job; queries sum the segments. Merge them when there\n"
+        << "are many, and compact the store into an SSHash dictionary once it is final.\n\n"
+        << "Building:\n"
+        << "  -o, --out <dir>                 The store (a folder; manifest.json lists its segments)\n"
+        << "      --genome NAME=PATH          A genome: FASTA (plain, gzip or bgzip) or a GFA of haplotypes; repeatable\n"
+        << "      --genomes <tsv>             Genomes as lines of name and path\n"
+        << "      --coordinate-reference NAME The genome whose coordinates the locus graphs carry: its anchors are\n"
+        << "                                  placed in every genome (on an existing store: adds them)\n"
+        << "      --add                       Count the genomes into a new segment of an existing store\n"
+        << "      --segment-only <dir>        Count the genomes into <dir> without committing (a parallel job)\n"
+        << "      --attach <dir>...           Commit segments built with --segment-only\n"
+        << "      --partitions <N>            Partitions of a new store, a power of two (default 4096)\n"
+        << "      --memory <size>             Memory bound for counting, e.g. 2G, 512M (default 2G)\n"
+        << "      --tmp-dir <dir>             Temporary files (default: $TMPDIR, else inside the store)\n\n"
+        << "Finishing:\n"
+        << "      --merge                     Merge the store's segments into one\n"
+        << "      --range I/N                 With --merge: only the I-th of N partition ranges (0-based), one job each\n"
+        << "      --compact                   Write the merged store as an SSHash dictionary, <store>.sshash\n"
+        << "      --clean                     Remove what no committed segment or running job uses\n\n"
+        << "Inspecting:\n"
+        << "      --locate <region>           Where each genome holds a region of the coordinate reference\n"
+        << "      --dump <path>               Every k-mer and its count (segments summed), as TSV\n"
+        << "      --verify <path>             Check that another background (store or .sshash) holds the same counts\n\n"
+        << "  -t, --threads <N>               Worker threads (default: Slurm's allocation or the CPUs available)\n"
+        << "  -q, --quiet                     No progress logs\n"
+        << "  -h, --help                      Show this help\n";
 }
 
 std::size_t parse_memory(const std::string& v) {
@@ -180,7 +173,7 @@ void map_segment(const bg::SegmentInfo& info, const anchors::ReferenceAnchors& r
             auto h = anchors::map_fasta(lookup, ge.path, static_cast<std::uint32_t>(g), threads, contigs[g], lengths[g]);
             hits.insert(hits.end(), h.begin(), h.end());
         }
-        log.info("anchors of " + ref.genome + " in " + ge.name + " mapped");
+        log.info("anchors: " + ref.genome + "; mapped in: " + ge.name);
     }
     anchors::write_segment_anchors(out_path, ref, names, contigs, lengths, hits);
 }
@@ -348,7 +341,7 @@ int run_background_command(const std::vector<std::string>& args) {
                 ++n;
             });
         if (std::fclose(f) != 0 || !ok) throw std::runtime_error("cannot write " + dump);
-        log.info("dumped " + std::to_string(n) + " k-mers from " + std::to_string(store.segments()) + " segment(s)");
+        log.info("dumped: k-mers: " + std::to_string(n) + "; segments: " + std::to_string(store.segments()));
         log.wrote({dump});
         log.done();
         return 0;
@@ -391,7 +384,7 @@ int run_background_command(const std::vector<std::string>& args) {
                 }
                 if (copy == 0) std::cout << g.name << "\t0\t.\t.\t.\t.\t0\t0\t0\n";
             }
-        log.info("read " + std::to_string(bytes) + " bytes of anchor places");
+        log.info("anchor places: bytes read: " + std::to_string(bytes));
         log.done();
         return 0;
     }
@@ -399,7 +392,7 @@ int run_background_command(const std::vector<std::string>& args) {
     if (!verify.empty()) {
         const bg::Store store(out);
         const auto other = bg::Background::open(verify);
-        log.info("verifying " + verify + " (" + other->kind() + ") against " + out);
+        log.info("verify: " + verify + " (" + other->kind() + "); against: " + out);
         std::uint64_t checked = 0, wrong = 0;
         std::vector<std::uint64_t> codes, counts;
         for (std::uint32_t p = 0; p < store.partitions(); ++p) {
@@ -409,7 +402,7 @@ int run_background_command(const std::vector<std::string>& args) {
             for (std::size_t i = 0; i < codes.size(); ++i) {
                 ++checked;
                 if (got[i] != counts[i] && wrong++ < 5)
-                    log.info("differs: " + kmer::decode(codes[i], bg::kK) + " " + std::to_string(counts[i]) + " vs " + std::to_string(got[i]));
+                    log.info("differs: " + kmer::decode(codes[i], bg::kK) + "; here: " + std::to_string(counts[i]) + "; there: " + std::to_string(got[i]));
             }
         }
         // random k-mers absent from this store must be absent there too
@@ -421,11 +414,11 @@ int run_background_command(const std::vector<std::string>& args) {
         }
         const auto here = store.count_batch(probe), there = other->count_batch(probe);
         for (std::size_t i = 0; i < probe.size(); ++i) if (here[i] == 0) { ++absent; absent_wrong += there[i] != 0; }
-        log.info(std::to_string(absent) + " random absent k-mers: " + std::to_string(absent_wrong) + " found there");
+        log.info("random absent k-mers: " + std::to_string(absent) + "; found there: " + std::to_string(absent_wrong));
         wrong += absent_wrong;
         const std::uint64_t other_distinct = other->distinct();
-        log.info("checked " + std::to_string(checked) + " k-mers: " + std::to_string(wrong) + " differ; " + verify + " holds " +
-                 std::to_string(other_distinct) + " distinct k-mers, this store " + std::to_string(checked));
+        log.info("checked: k-mers: " + std::to_string(checked) + "; differ: " + std::to_string(wrong) + "; distinct there: " +
+                 std::to_string(other_distinct) + "; distinct here: " + std::to_string(checked));
         log.done();
         return wrong == 0 && other_distinct == checked ? 0 : 1;
     }
@@ -451,9 +444,13 @@ int run_background_command(const std::vector<std::string>& args) {
             Staging tmp{co.tmp_dir, std::make_unique<bg::JobLock>(co.tmp_dir)};
             st = bg::compact_store(co);
         }
-        log.info("compacted: " + std::to_string(st.kmers) + " k-mers in " + std::to_string(st.strings) + " strings, " +
-                 human_bytes(st.bytes) + " (" + std::to_string(static_cast<double>(st.bytes) * 8 / static_cast<double>(std::max<std::uint64_t>(1, st.kmers))).substr(0, 5) +
-                 " bits per k-mer); strings " + std::to_string(st.strings_seconds).substr(0, 6) + " s, SSHash " + std::to_string(st.sshash_seconds).substr(0, 6) + " s");
+        {
+            char b[256];
+            std::snprintf(b, sizeof b, "compacted: k-mers: %llu; strings: %llu; size: %s; bits per k-mer: %.2f; seconds: strings %.1f, SSHash %.1f",
+                          static_cast<unsigned long long>(st.kmers), static_cast<unsigned long long>(st.strings), human_bytes(st.bytes).c_str(),
+                          static_cast<double>(st.bytes) * 8 / static_cast<double>(std::max<std::uint64_t>(1, st.kmers)), st.strings_seconds, st.sshash_seconds);
+            log.info(b);
+        }
         log.wrote({co.out_path});
         log.done();
         return 0;
@@ -465,7 +462,7 @@ int run_background_command(const std::vector<std::string>& args) {
         std::set<std::string> listed;
         for (const auto& s : m.segments) listed.insert(s.dir);
         std::uint64_t removed = 0;
-        auto remove = [&](const fs::path& p) { std::error_code ec; removed += fs::remove_all(p, ec) > 0; log.info("removed " + p.filename().string()); };
+        auto remove = [&](const fs::path& p) { std::error_code ec; removed += fs::remove_all(p, ec) > 0; log.info("removed: " + p.filename().string()); };
         std::error_code ec;
         for (const auto& e : fs::directory_iterator(out, ec)) {
             const std::string name = e.path().filename().string();
@@ -486,14 +483,14 @@ int run_background_command(const std::vector<std::string>& args) {
         }
         for (const auto& e : fs::directory_iterator(fs::path(out) / ".staging", ec))
             if (!bg::job_alive(e.path().string())) remove(e.path());
-        log.info("clean: removed " + std::to_string(removed) + " item(s)");
+        log.info("clean: items removed: " + std::to_string(removed));
         log.done();
         return 0;
     }
 
     if (merge) {
         bg::Manifest m = bg::read_manifest(out);
-        if (m.segments.size() <= 1) { log.info("one segment or none: nothing to merge"); log.done(); return 0; }
+        if (m.segments.size() <= 1) { log.info("merge: one segment or none, nothing to merge"); log.done(); return 0; }
         std::uint32_t ranges = 1, mine = 0;
         bool all_ranges = true;
         if (!range.empty()) {
@@ -552,7 +549,7 @@ int run_background_command(const std::vector<std::string>& args) {
         for (std::uint32_t i = 0; i < ranges; ++i) {
             if (!all_ranges && i != mine) continue;
             const fs::path pf = mdir / part_name(i);
-            if (fs::exists(pf)) { log.info("range " + std::to_string(i) + " already merged"); continue; }
+            if (fs::exists(pf)) { log.info("merge: range: " + std::to_string(i) + "; already merged"); continue; }
             const bg::JobLock rl((mdir / ("range-" + std::to_string(i))).string());
             bg::MergeRangeOptions mo;
             mo.segment_dirs = seg_dirs;
@@ -560,13 +557,14 @@ int run_background_command(const std::vector<std::string>& args) {
             mo.first = static_cast<std::uint32_t>(static_cast<std::uint64_t>(m.partitions) * i / ranges);
             mo.end = static_cast<std::uint32_t>(static_cast<std::uint64_t>(m.partitions) * (i + 1) / ranges);
             mo.threads = threads;
-            log.info("merging partitions " + std::to_string(mo.first) + "-" + std::to_string(mo.end) + " of " + std::to_string(m.segments.size()) + " segments");
+            log.info("merge: partitions: " + std::to_string(mo.first) + "-" + std::to_string(mo.end) + "; segments: " + std::to_string(m.segments.size()));
+            mo.progress = !quiet;
             bg::merge_range(mo);
             fail_point("merge-range");
         }
         for (std::uint32_t i = 0; i < ranges; ++i)
             if (!fs::exists(mdir / part_name(i))) {
-                log.info("merge: range " + std::to_string(mine) + " of " + std::to_string(ranges) + " done; the last range to finish commits");
+                log.info("merge: range: " + std::to_string(mine) + " of " + std::to_string(ranges) + "; done (the last range to finish commits)");
                 log.done();
                 return 0;
             }
@@ -631,11 +629,11 @@ int run_background_command(const std::vector<std::string>& args) {
             ++now.generation;
             fail_point("merge-before-manifest");
             bg::write_manifest(out, now);
-            log.info("merged into " + dir + ": " + std::to_string(info.distinct) + " distinct 31-mers");
+            log.info("merged: segment: " + dir + "; distinct 31-mers: " + std::to_string(info.distinct));
         }
         fail_point("merge-after-commit");
         // the merged-away segments stay on disk: jobs still reading them would fail; --clean removes them
-        log.info("the " + std::to_string(old.size()) + " merged-away segments stay until --clean (run it when no job reads the store)");
+        log.info("merge: merged-away segments: " + std::to_string(old.size()) + "; kept until --clean (run it when no job reads the store)");
         log.wrote({(fs::path(out) / "manifest.json").string()});
         log.done();
         return 0;
@@ -674,7 +672,7 @@ int run_background_command(const std::vector<std::string>& args) {
                 link_or_copy_dir(attach[i], fs::path(out) / dir);
                 made.push_back(dir);
                 m.segments.push_back({dir, infos[i].distinct, infos[i].occurrences, infos[i].genomes});
-                log.info("attaching " + attach[i] + " as " + dir);
+                log.info("attach: " + attach[i] + "; as: " + dir);
             }
             ++m.generation;
             fail_point("attach-before-manifest");
@@ -726,7 +724,7 @@ int run_background_command(const std::vector<std::string>& args) {
         now.references.emplace_back(coordinate_reference, ref.fingerprint());
         ++now.generation;
         bg::write_manifest(out, now);
-        log.info("coordinate reference " + coordinate_reference + ": " + std::to_string(ref.code.size()) + " anchors, mapped in every genome");
+        log.info("coordinate reference: " + coordinate_reference + "; anchors: " + std::to_string(ref.code.size()) + "; mapped in every genome");
         log.done();
         return 0;
     }
@@ -798,6 +796,7 @@ int run_background_command(const std::vector<std::string>& args) {
     o.dedup = dedup;
     o.anchor_sets = sets;
     o.log = [&](const std::string& s) { log.info(s); };
+    o.progress = !quiet;
     bg::SegmentStats stats;
     try {
         stats = bg::build_segment(o);
@@ -806,13 +805,13 @@ int run_background_command(const std::vector<std::string>& args) {
         if (claimed) { claim.reset(); fs::remove_all(o.segment_dir, ec); }   // only the folder this job made
         throw;
     }
-    const std::string summary = std::to_string(stats.distinct) + " distinct 31-mers of " + std::to_string(stats.kmers) + " occurrences, " +
-        human_bytes(stats.bytes) + "; spill " + human_bytes(stats.spill_bytes) + " in " + std::to_string(stats.spill_files) + " files" +
-        (stats.run_bytes > 0 ? ", runs " + human_bytes(stats.run_bytes) : "");
+    const std::string summary = "distinct 31-mers: " + std::to_string(stats.distinct) + "; occurrences: " + std::to_string(stats.kmers) + "; size: " +
+        human_bytes(stats.bytes) + "; spill: " + human_bytes(stats.spill_bytes) + " in " + std::to_string(stats.spill_files) + " files" +
+        (stats.run_bytes > 0 ? "; sorted runs: " + human_bytes(stats.run_bytes) : "");
     if (!segment_only.empty()) {
         fail_point("segment-built");
         { std::error_code ec; claim.reset(); fs::remove(fs::path(o.segment_dir) / "job.lock", ec); }
-        log.info("segment " + o.segment_dir + ": " + summary + " (commit it with --attach)");
+        log.info("segment: " + o.segment_dir + "; " + summary + " (commit it with --attach)");
         log.wrote({o.segment_dir});
         log.done();
         return 0;
@@ -846,7 +845,7 @@ int run_background_command(const std::vector<std::string>& args) {
                 map_segment(mine, r, (fs::path(o.segment_dir) / ("anchors-" + name + ".bin")).string(), threads, log);
                 mine.anchor_sets.emplace_back(name, fp);
                 bg::write_segment_info(o.segment_dir, mine);
-                log.info("mapped this segment on " + name + ", added to the store meanwhile");
+                log.info("anchors: " + name + " (added to the store meanwhile); mapped in this segment");
             }
             if (new_ref) map_segments(out, now.segments, *new_ref, st.dir, ".anchors", threads, log);
         }
@@ -866,7 +865,7 @@ int run_background_command(const std::vector<std::string>& args) {
         ++now.generation;
         fail_point("commit-before-manifest");
         bg::write_manifest(out, now);
-        log.info(dir + ": " + summary);
+        log.info("segment: " + dir + "; " + summary);
     }
     log.wrote({(fs::path(out) / "manifest.json").string()});
     log.done();

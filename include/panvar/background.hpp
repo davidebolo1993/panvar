@@ -156,6 +156,7 @@ struct BuildOptions {
     bool dedup = true;                // store identical super-k-mers once, with their multiplicity
     std::vector<AnchorSet> anchor_sets;   // mapped in every genome during the same pass
     std::function<void(const std::string&)> log;       // progress lines
+    bool progress = false;            // a progress bar while partitions are counted (on a terminal)
 };
 
 struct SegmentStats {
@@ -179,6 +180,7 @@ struct MergeRangeOptions {
     std::string out_path;
     std::uint32_t first = 0, end = 0;
     std::size_t threads = 2;
+    bool progress = false;            // a progress bar over the partitions (on a terminal)
 };
 SegmentStats merge_range(const MergeRangeOptions& options);
 

@@ -24,70 +24,48 @@ namespace fs = std::filesystem;
 
 void print_recruit_help() {
     std::cout
-        << "panvar recruit - recruit a sample's reads to locus graphs without aligning\n\n"
         << "Usage:\n"
-        << "  panvar recruit --locus <graph.gfa> [--locus ...] --background <store.bgk> -r <reference path> --index-only\n"
-        << "  panvar recruit --locus <graph.gfa | index.plx> [...] [--background ... -r ...] <reads> -o <out.tsv>\n"
-        << "  panvar recruit --locus ... --samples <sheet.tsv> -o <out dir>\n"
-        << "  panvar recruit <reads> --dry-run\n\n"
-        << "Reads: -1/-2 FASTQ pairs, -i any one file (FASTQ, SAM, BAM, CRAM), each repeatable; one sample's files\n"
-        << "are read in turn. Secondary, supplementary and QC-failed records are skipped, unmapped and duplicate\n"
-        << "ones kept; mates are paired in any sort order (coordinate-sorted: mates far apart are fetched at the\n"
-        << "end, through the index when there is one).\n\n"
-        << "Options:\n"
-        << "      --locus <gfa>        A locus graph; repeatable\n"
-        << "      --background <dir>   The background store (its .sshash beside it is used when current)\n"
-        << "  -r, --reference <name>   The graph path carrying the coordinates (e.g. grch38)\n"
-        << "      --coordinate-reference NAME  The background's coordinate reference (default: its only one)\n"
-        << "      --index-only         Build or check the locus indexes, read nothing\n"
-        << "      --save-index <dir>   Where indexes are kept and reused (default: beside each graph)\n"
-        << "      --informative-max <N>  A k-mer seen up to N times per background haplotype outside the locus is\n"
-        << "                           shared, more is repeat (default 8)\n"
-        << "      --pad <bp>           Decoy windows around homologous hits (default 1500)\n"
-        << "      --dust <score>       Private k-mers this low-complexity become shared (default 2.5)\n"
-        << "      --decoy-genomes A,B  Genomes whose homologous windows are decoys (default: the coordinate reference)\n"
-        << "      --decoy-min-hits <N> Shared k-mer hits, each within a pad of the next, that make a homologous window (default 20)\n"
-        << "      --no-calibration     Build indexes without calibration (reads simulated from held-out samples,\n"
-        << "                           decoy windows and the reference's 5 Mb flanks, scored at each site cut)\n"
-        << "  -1, --reads <fq>         Reads (FASTQ, plain or gzip); repeatable\n"
-        << "  -2, --mates <fq>         Their mates, in the same order (one per -1)\n"
-        << "  -i, --input <file>       One file of reads: FASTQ (single-end, or --interleaved), SAM, BAM or CRAM;\n"
-        << "                           repeatable\n"
-        << "      --interleaved        Single FASTQ files hold mates as consecutive records\n"
-        << "      --cram-reference <fa>  The FASTA (with .fai) CRAM files were compressed against\n"
-        << "      --samples <tsv>      Several samples: lines of sample, file[, mate file] (a sample may take\n"
-        << "                           several lines); -o is then a directory with <sample>.tsv per sample\n"
-        << "      --dry-run            Count each input's records by kind and the time to read them; nothing else\n"
-        << "  -o, --out <tsv>          One row per screened fragment and locus: fate (certain, ambiguous,\n"
-        << "                           unrecruited), reason, each mate's locus segment (read bases) and the\n"
-        << "                           evidence. A certain fragment is partial when a read runs out of the\n"
-        << "                           locus, rescued when one mate alone decides the pair\n"
-        << "      --method <m>         runs (default: >= --min-sites independent private sites, decoy sites at\n"
-        << "                           most --decoy-share of them, at least --min-density of them),\n"
-        << "                           kmers (>= 3 private k-mers, no decoy k-mer), fraction (>= --min-fraction\n"
-        << "                           of k-mers in the locus, one private)\n"
-        << "      --false-certain-rate <r>  Per locus, the lowest private-site cut (at least 2) whose simulated\n"
-        << "                           off-target reads of the run's read class are certain at most at this\n"
-        << "                           rate (default 1e-6; an index without calibration uses 2)\n"
-        << "      --min-sites <N>      One private-site cut for every locus instead (--method runs)\n"
-        << "      --min-fraction <f>   For --method fraction (default 0.5)\n"
-        << "      --decoy-share <f>    Decoy sites tolerated as a share of the private sites (default 0.05)\n"
-        << "      --min-density <f>    Private sites needed per 31 callable bases (default 0.05): a long read\n"
-        << "                           elsewhere can carry a few private k-mers by sequencing error\n"
-        << "      --error-rate <e>     The reads' error rate per base: more mismatch runs than errors and new\n"
-        << "                           alleles explain make a read divergent (default: estimated from the base\n"
-        << "                           qualities of the first reads; logged and in the summary)\n"
-        << "      --preset <p>         The error rate of a technology: illumina 0.002, hifi 0.001, ont 0.03,\n"
-        << "                           clr 0.1 (--error-rate wins)\n"
-        << "      --reads-out <dir>    Write the recruited reads as gzip FASTQ, per locus and fate\n"
-        << "                           (<locus>.certain_1/_2.fq.gz for pairs, <locus>.certain.fq.gz for single\n"
-        << "                           reads; likewise ambiguous), as sequenced, with their qualities\n"
-        << "      --certain-only       With --reads-out: certain reads only\n"
-        << "      --summary <tsv>      The run's summary (default: beside -o, .summary.tsv): input records by\n"
-        << "                           kind, fragments by locus, fate and reason, error rate, backbone depth\n"
-        << "  -t, --threads <N>        Scoring threads; a reader and N/4 decompression threads run beside them\n"
-        << "  -q, --quiet              No progress logs\n"
-        << "  -h, --help               Show this help\n";
+        << "  panvar recruit --locus <graph.gfa> [...] --background <store.bgk> -r <name> --index-only\n"
+        << "  panvar recruit --locus <graph.gfa | index.plx> [...] <reads> -o <out.tsv> [options]\n"
+        << "  panvar recruit --locus <...> [...] --samples <sheet.tsv> -o <out dir> [options]\n\n"
+        << "Recruit a sample's reads to locus graphs without aligning. Each graph is indexed once against the\n"
+        << "background (every k-mer of its haplotypes labelled private, shared or repeat, decoys from homologous\n"
+        << "windows, a calibrated cut) and the index kept for reuse; every read is then screened against all loci\n"
+        << "and called certain, ambiguous or unrecruited for each locus it hits.\n\n"
+        << "Locus indexes:\n"
+        << "      --locus <path>              A locus graph (GFA) or its index (.plx); repeatable\n"
+        << "      --background <dir>          The background store (required to index a graph)\n"
+        << "  -r, --reference <name>          The graph path carrying the coordinates (required to index a graph)\n"
+        << "      --coordinate-reference <name>  The background's coordinate reference (default: its only one)\n"
+        << "      --save-index <dir>          Where indexes are kept and reused (default: beside each graph)\n"
+        << "      --index-only                Build or check the indexes; read nothing\n"
+        << "      --informative-max <N>       A k-mer up to N times per background haplotype outside the locus is\n"
+        << "                                  shared, more is repeat (default 8)\n"
+        << "      --decoy-genomes <A,B>       Genomes whose homologous windows give decoys (default: the coordinate\n"
+        << "                                  reference)\n"
+        << "      --no-calibration            Build indexes without calibration\n\n"
+        << "Reads (one sample's files are read in turn):\n"
+        << "  -1, --reads <fq>                FASTQ (plain or gzip); repeatable\n"
+        << "  -2, --mates <fq>                Its mates, one per -1\n"
+        << "  -i, --input <file>              FASTQ (single reads), SAM, BAM or CRAM; repeatable\n"
+        << "      --interleaved               -i FASTQ files hold mates as consecutive records\n"
+        << "      --cram-reference <fa>       The FASTA (with .fai) CRAM files were compressed against\n"
+        << "      --samples <tsv>             Several samples: lines of sample, file[, mate file]; -o is then a folder\n"
+        << "      --dry-run                   Count each input's records and the time to read them; nothing else\n\n"
+        << "Calls:\n"
+        << "  -o, --out <tsv>                 One row per screened fragment and locus: fate, reason, each mate's\n"
+        << "                                  locus segment, the evidence and the graph nodes\n"
+        << "      --false-certain-rate <r>    Per locus, the lowest calibrated private-site cut (at least 2) whose\n"
+        << "                                  off-target reads are certain at most at this rate (default 1e-6)\n"
+        << "      --min-sites <N>             One private-site cut for every locus instead\n"
+        << "      --error-rate <e>            The reads' error rate per base (default: from base qualities)\n"
+        << "      --preset <p>                The error rate of illumina (0.002), hifi (0.001), ont (0.03) or clr (0.1)\n"
+        << "      --reads-out <dir>           The recruited reads as gzip FASTQ, per locus and fate\n"
+        << "      --certain-only              With --reads-out: certain reads only\n"
+        << "      --summary <tsv>             The run's summary (default: beside -o, .summary.tsv)\n\n"
+        << "  -t, --threads <N>               Scoring threads (default: Slurm's allocation or the CPUs available)\n"
+        << "  -q, --quiet                     No progress logs\n"
+        << "  -h, --help                      Show this help\n";
 }
 
 double parse_number(const std::string& name, const std::string& v) {
@@ -123,11 +101,8 @@ int run_recruit_command(const std::vector<std::string>& args) {
         else if (a == "--index-only") index_only = true;
         else if (a == "--save-index") save_dir = value();
         else if (a == "--informative-max") o.informative_max = static_cast<std::uint32_t>(cli::parse_size_arg(a, value()));
-        else if (a == "--pad") o.pad = cli::parse_size_arg(a, value());
-        else if (a == "--dust") o.dust = parse_number(a, value());
         else if (a == "--no-calibration") o.calibrate = false;
         else if (a == "--false-certain-rate") { ro.false_certain_rate = parse_number(a, value()); rate_given = true; }
-        else if (a == "--decoy-min-hits") o.decoy_min_hits = static_cast<std::uint32_t>(cli::parse_size_arg(a, value()));
         else if (a == "--decoy-genomes") {
             std::stringstream ss(value());
             for (std::string d; std::getline(ss, d, ',');) if (!d.empty()) o.decoy_genomes.push_back(d);
@@ -157,16 +132,13 @@ int run_recruit_command(const std::vector<std::string>& args) {
         else if (a == "--samples") sheet = value();
         else if (a == "--dry-run") dry_run = true;
         else if (a == "-o" || a == "--out") ro.out = value();
-        else if (a == "--method") {
+        else if (a == "--screen") {   // the seed comparison (dev/recruit_seeds.sh)
             const std::string m = value();
-            if (m == "runs") ro.method = recruit::Method::Runs;
-            else if (m == "kmers") ro.method = recruit::Method::Kmers;
-            else if (m == "fraction") ro.method = recruit::Method::Fraction;
-            else throw std::runtime_error("--method is runs, kmers or fraction");
+            if (m == "syncmer") ro.screen = recruit::Screen::Syncmer;
+            else if (m == "minimizer") ro.screen = recruit::Screen::Minimizer;
+            else if (m == "all") ro.screen = recruit::Screen::All;
+            else throw std::runtime_error("--screen is syncmer, minimizer or all");
         } else if (a == "--min-sites") { ro.min_sites = static_cast<std::uint32_t>(cli::parse_size_arg(a, value())); ro.calibrated_cut = false; }
-        else if (a == "--min-fraction") ro.min_fraction = parse_number(a, value());
-        else if (a == "--decoy-share") ro.decoy_share = parse_number(a, value());
-        else if (a == "--min-density") ro.min_density = parse_number(a, value());
         else if (a == "--error-rate") error_rate = parse_number(a, value());
         else if (a == "--preset") {
             const std::string p = value();
@@ -252,11 +224,8 @@ int run_recruit_command(const std::vector<std::string>& args) {
     if (ro.min_sites == 0) throw std::runtime_error("--min-sites must be at least 1");
     if (rate_given && !ro.calibrated_cut) throw std::runtime_error("give --false-certain-rate or --min-sites, not both");
     if (!(ro.false_certain_rate >= 0 && ro.false_certain_rate < 1)) throw std::runtime_error("--false-certain-rate must be in [0, 1)");
-    if (ro.decoy_share < 0 || ro.decoy_share > 1) throw std::runtime_error("--decoy-share must be between 0 and 1");
-    if (ro.min_density < 0 || ro.min_density > 1) throw std::runtime_error("--min-density must be between 0 and 1");
     if (error_rate >= 0.5) throw std::runtime_error("--error-rate must be between 0 and 0.5");
     ro.error_rate = error_rate >= 0 ? error_rate : preset_rate;   // below 0: estimated from base qualities
-    if (!(ro.min_fraction > 0 && ro.min_fraction <= 1)) throw std::runtime_error("--min-fraction must be in (0, 1]");
     cli::RunLog log("recruit", quiet);
     o.threads = threads == 0 ? bg::default_threads() : threads;
     o.log = [&](const std::string& s) { log.info(s); };
@@ -287,10 +256,10 @@ int run_recruit_command(const std::vector<std::string>& args) {
         if (fs::exists(plx)) {
             try {
                 const recruit::LocusIndex old = recruit::load(plx);
-                if (old.key() == recruit::expected_key(o, l)) { log.info(l + ": index " + plx + " is current, reused"); continue; }
-                log.info(l + ": index " + plx + " was built from another graph, background or settings; rebuilding");
+                if (old.key() == recruit::expected_key(o, l)) { log.info("index: " + plx + "; current, reused"); continue; }
+                log.info("index: " + plx + "; built from another graph, background or settings: rebuilding");
             } catch (const std::exception& e) {
-                log.info(l + ": " + e.what() + "; rebuilding");
+                log.info("index: " + plx + "; " + e.what() + ": rebuilding");
             }
         }
         todo.loci.push_back(l);
@@ -322,11 +291,11 @@ int run_recruit_command(const std::vector<std::string>& args) {
             ro.out = sheet.empty() ? out : (fs::path(out) / (name + ".tsv")).string();
             ro.summary = !summary.empty() && sheet.empty() ? summary : beside(ro.out);
             if (!reads_out.empty()) ro.reads_out = sheet.empty() ? reads_out : (fs::path(reads_out) / name).string();
-            if (!name.empty()) log.info(name + ": " + std::to_string(files.size()) + " input(s)");
+            if (!name.empty()) log.info("sample: " + name + "; inputs: " + std::to_string(files.size()));
             const recruit::ReadStats st = recruit::recruit_reads(ro);
-            log.info((name.empty() ? std::string() : name + ": ") + std::to_string(st.fragments) + " fragments, " + std::to_string(st.screened) +
-                     " screened; per locus: " + std::to_string(st.certain) + " certain, " + std::to_string(st.ambiguous) + " ambiguous, " +
-                     std::to_string(st.unrecruited) + " unrecruited");
+            log.info((name.empty() ? std::string() : "sample: " + name + "; ") + "fragments: " + std::to_string(st.fragments) + "; screened: " +
+                     std::to_string(st.screened) + "; certain: " + std::to_string(st.certain) + "; ambiguous: " + std::to_string(st.ambiguous) +
+                     "; unrecruited: " + std::to_string(st.unrecruited) + " (per locus)");
             wrote.push_back(ro.out);
             wrote.push_back(ro.summary);
         }

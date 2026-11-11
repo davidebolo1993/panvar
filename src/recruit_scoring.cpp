@@ -140,15 +140,8 @@ bool divergent(const Evidence& v, const ReadOptions& o) { return static_cast<dou
 
 bool is_certain(const Evidence& v, const ReadOptions& o, std::uint32_t min_sites) {
     if (v.seg_kmers == 0 || uncallable(v) || divergent(v, o)) return false;
-    switch (o.method) {
-        case Method::Runs:
-            return v.sites_p >= min_sites && v.sites_d <= o.decoy_share * v.sites_p &&
-                   v.sites_p >= o.min_density * static_cast<double>(v.seg_kmers) / static_cast<double>(kK);
-        case Method::Kmers: return v.n_d == 0 && v.n_p >= std::max<std::uint32_t>(3, min_sites);
-        case Method::Fraction:
-            return v.kmers > 0 && v.n_p >= 1 && static_cast<double>(v.n_p + v.n_s + v.n_r) / v.kmers >= o.min_fraction;
-    }
-    return false;
+    return v.sites_p >= min_sites && v.sites_d <= o.decoy_share * v.sites_p &&
+           v.sites_p >= o.min_density * static_cast<double>(v.seg_kmers) / static_cast<double>(kK);
 }
 
 // A fragment's fate. The pair's pooled evidence decides; failing that, one mate certain on its own makes

@@ -14,7 +14,10 @@
 
 namespace panvar::recruit {
 
-enum class Method { Runs, Kmers, Fraction };
+// Which read k-mers are looked up to decide whether a read is scored: closed syncmers among the loci's
+// private and shared k-mers (default); the read's minimizers (one per window of 20 k-mers, the same
+// density) among all of them; or every k-mer (no screen). For the seed comparison.
+enum class Screen { Syncmer, Minimizer, All };
 
 struct Evidence {
     // Within each read's locus segment (the stretch of its k-mers that reads as locus sequence):
@@ -42,15 +45,14 @@ struct ReadOptions {
     std::string cram_reference;          // FASTA for CRAM
     bool interleaved = false;            // single FASTQ files hold mates as consecutive records
     std::string out;                     // per-fragment table (TSV)
-    Method method = Method::Runs;
+    Screen screen = Screen::Syncmer;
     std::uint32_t min_sites = 2;         // private sites for certain (each locus's calibrated cut instead, if so)
     bool calibrated_cut = true;          // per locus, the lowest cut meeting the false-certain rate
     double false_certain_rate = 1e-6;    // per screened off-target fragment of the run's read class
-    double decoy_share = 0.05;           // decoy sites tolerated, as a share of the private sites (runs method)
+    double decoy_share = 0.05;           // decoy sites tolerated, as a share of the private sites
     double min_density = 0.05;           // private sites per 31 callable bases: chance hits in a long read are sparse
     double error_rate = -1;              // per base: the expected mismatch runs, beside one new allele per kb;
                                          // below 0: estimated from the base qualities of the first reads
-    double min_fraction = 0.5;           // the fraction method's cut
     std::string reads_out;               // a folder for the recruited reads as FASTQ (none if empty)
     bool reads_ambiguous = true;         // write ambiguous reads too (else certain only)
     std::string summary;                 // the run's summary table (none if empty)

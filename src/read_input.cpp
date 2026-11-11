@@ -427,8 +427,8 @@ private:
     // either mate hits.
     void go_lean() {
         lean_ = true;
-        if (o_.log) o_.log(path_ + ": over " + std::to_string(hold_max_) + " reads wait for their mates (the file is not name-grouped): "
-                           "keeping only reads that hit a screen, their mates fetched by a second pass");
+        if (o_.log) o_.log("input: " + path_ + "; reads waiting for their mates: over " + std::to_string(hold_max_) +
+                           " (the file is not name-grouped): keeping only reads that hit a screen, their mates fetched by a second pass");
         for (auto it = held_.begin(); it != held_.end();) {
             if (o_.screened(it->second.seq)) {
                 it->second.candidate = true;
@@ -509,7 +509,7 @@ private:
         for (std::size_t i = 0; i < wanted_.size(); ++i)
             if (!found[i]) rest.emplace(wanted_[i].name, i);   // no index, no mate place, or stale mate fields
         if (!rest.empty()) {
-            if (o_.log) o_.log(path_ + ": a second pass for " + std::to_string(rest.size()) + " mates" + (idx == nullptr ? " (no index)" : " (not where the index put them)"));
+            if (o_.log) o_.log("input: " + path_ + "; second pass for mates: " + std::to_string(rest.size()) + (idx == nullptr ? " (no index)" : " (not where the index put them)"));
             HtsFile pass(path_, o_, &pool_);
             while (!rest.empty() && pass.read()) {
                 const auto it = rest.find(bam_get_qname(pass.rec));

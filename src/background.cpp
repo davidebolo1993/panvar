@@ -1,6 +1,7 @@
 #include "panvar/background.hpp"
 
 #include "panvar/anchors.hpp"
+#include "panvar/cli_utils.hpp"
 #include "panvar/background_graph.hpp"
 #include "panvar/gz_reader.hpp"
 
@@ -813,11 +814,11 @@ SegmentStats build_segment(const BuildOptions& o) {
     const std::uint64_t left = o.memory_bytes > fixed ? o.memory_bytes - fixed : 0;
     // a partition is held whole while it is encoded (about 40 bytes per distinct k-mer)
     if (bases / o.partitions * 40 > o.memory_bytes / threads)
-        log("warning: with " + std::to_string(o.partitions) + " partitions, one may need about " +
-            std::to_string(bases / o.partitions * 40 >> 20) + " MB to encode, more than a thread's share of --memory; use more partitions");
+        log("warning: partitions: " + std::to_string(o.partitions) + "; encoding one may need " + std::to_string(bases / o.partitions * 40 >> 20) +
+            " MB, more than a thread's share of --memory: use more partitions");
     if (left < o.memory_bytes / 4)
-        log("warning: --memory " + std::to_string(o.memory_bytes >> 20) + " MB leaves little for counting after the anchors (" +
-            std::to_string(anchor_bytes >> 20) + " MB) and reading buffers");
+        log("warning: --memory: " + std::to_string(o.memory_bytes >> 20) + " MB; anchors: " + std::to_string(anchor_bytes >> 20) +
+            " MB; little is left for counting after them and the reading buffers");
     // a thread's share, less room for the copies made while runs are collapsed and merged
     const std::uint64_t count_budget = std::max<std::uint64_t>(std::uint64_t{1} << 20, std::max<std::uint64_t>(left, o.memory_bytes / 4) / threads * 5 / 8);
     if (o.spill_files != 0 && (o.spill_files & (o.spill_files - 1)) != 0)
@@ -858,8 +859,8 @@ SegmentStats build_segment(const BuildOptions& o) {
         if (spill[b].f.fp == nullptr) throw std::runtime_error("background: cannot write " + spill[b].path);
         if (o.dedup && table_budget >= (std::size_t{1} << 20)) spill[b].dedup = std::make_unique<DedupTable>(table_budget);
     }
-    log("spill: " + std::to_string(files) + " files in " + spill_dir.string() + " (estimated " + std::to_string(bases) +
-        " bases" + (spill[0].dedup ? ", identical super-k-mers stored once" : "") + ")");
+    log("spill: files: " + std::to_string(files) + "; folder: " + spill_dir.string() + "; estimated bases: " + std::to_string(bases) +
+        (spill[0].dedup ? "; identical super-k-mers: stored once" : ""));
 
     // Anchor lookups, one per coordinate reference.
     std::vector<std::unique_ptr<anchors::AnchorLookup>> lookups;
@@ -1024,7 +1025,7 @@ SegmentStats build_segment(const BuildOptions& o) {
                 }
                 g.checksum = hex64(checksum);
                 acgt += genome_bases;
-                log("read " + g.name + ": " + std::to_string(genome_bases) + " ACGT bases" + (genome_bases == 0 ? " (no sequence)" : ""));
+                log("read: " + g.name + "; ACGT bases: " + std::to_string(genome_bases) + (genome_bases == 0 ? " (no sequence)" : ""));
             }
         } catch (...) {
             record_failure();
@@ -1055,14 +1056,16 @@ SegmentStats build_segment(const BuildOptions& o) {
     st.bases = acgt;
     st.kmers = occurrences;
     for (const auto& s : spill) { std::error_code ec; st.spill_bytes += fs::file_size(s.path, ec); }
-    log("spilled " + std::to_string(st.kmers) + " k-mer occurrences in " + std::to_string(st.spill_bytes) + " bytes" +
-        (dedup_hits > 0 ? " (" + std::to_string(dedup_hits) + " repeated super-k-mers folded)" : ""));
+    log("spilled: k-mer occurrences: " + std::to_string(st.kmers) + "; bytes: " + std::to_string(st.spill_bytes) +
+        (dedup_hits > 0 ? "; repeated super-k-mers folded: " + std::to_string(dedup_hits) : ""));
 
     // Phase 2: threads take spill files one at a time, count their partitions within the memory budget and
     // append the encodings to parts-0.bin.
     fs::create_directories(o.segment_dir);
     PartsWriter writer((fs::path(o.segment_dir) / "parts-0.bin").string(), o.partitions, 0, o.partitions);
     std::atomic<std::uint64_t> run_bytes{0};
+    std::mutex bar_m;
+    cli::ProgressBar bar(o.progress ? cli::log_prefix("background") + "counting partitions" : std::string(), files);
     parallel_for(files, threads, [&](std::size_t b) {
         PartitionCounter counter(per_file, static_cast<std::size_t>(count_budget), spill[b].path + ".runs");
         {
@@ -1106,11 +1109,14 @@ SegmentStats build_segment(const BuildOptions& o) {
             writer.put((j << file_shift) | static_cast<std::uint32_t>(b), codes, cnt);
         }
         run_bytes += counter.run_bytes();
+        std::lock_guard<std::mutex> lk(bar_m);
+        bar.tick();
     });
+    bar.done();
     st.run_bytes = run_bytes;
     st.bytes = writer.finish();
     st.distinct = writer.distinct();
-    if (st.run_bytes > 0) log("counting wrote " + std::to_string(st.run_bytes) + " bytes of sorted runs (partitions above the memory share)");
+    if (st.run_bytes > 0) log("sorted runs: bytes: " + std::to_string(st.run_bytes) + " (partitions above the memory share)");
 
     SegmentInfo info;
     info.partitions = o.partitions;
@@ -1270,11 +1276,16 @@ SegmentStats merge_range(const MergeRangeOptions& o) {
     const std::uint32_t partitions = segs.front()->partitions();
     if (o.first >= o.end || o.end > partitions) throw std::runtime_error("background: bad merge range");
     PartsWriter writer(o.out_path, partitions, o.first, o.end);
+    std::mutex bar_m;
+    cli::ProgressBar bar(o.progress ? cli::log_prefix("background") + "merging partitions" : std::string(), o.end - o.first);
     parallel_for(o.end - o.first, o.threads, [&](std::size_t i) {
         std::vector<std::uint64_t> codes, cnt;
         merge_partition(raw, o.first + static_cast<std::uint32_t>(i), [&](std::uint64_t c, std::uint64_t n) { codes.push_back(c); cnt.push_back(n); });
         writer.put(o.first + static_cast<std::uint32_t>(i), codes, cnt);
+        std::lock_guard<std::mutex> lk(bar_m);
+        bar.tick();
     });
+    bar.done();
     SegmentStats st;
     st.bytes = writer.finish();
     st.distinct = writer.distinct();

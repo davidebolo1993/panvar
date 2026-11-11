@@ -44,8 +44,8 @@ for t in 1 8; do
   check "a name-sorted SAM gives the same table, $t thread(s)" 'cmp -s name.$t.tsv.sorted fq.tsv.sorted'
   check "a coordinate-sorted SAM gives the same table, $t thread(s)" 'cmp -s coord.$t.tsv.sorted fq.tsv.sorted'
 done
-check "far mates are fetched by a second pass ($(grep -o '[0-9]* mates fetched' coord.1.log))" 'grep -q "second pass" coord.1.log && grep -q "mates fetched" coord.1.log'
-check "the coordinate-sorted SAM counts every fragment" 'grep -q "4500 fragments (4500 pairs)" coord.1.log'
+check "far mates are fetched by a second pass ($(grep -o 'mates fetched: [0-9]*' coord.1.log))" 'grep -q "second pass" coord.1.log && grep -q "mates fetched" coord.1.log'
+check "the coordinate-sorted SAM counts every fragment" 'grep -q "fragments: 4500; pairs: 4500" coord.1.log'
 check "QC-failed reads never reach the table" '! grep -q qcfail coord.1.tsv'
 check "8 threads write the same rows in the same order as 1" 'cmp -s coord.1.tsv coord.8.tsv && cmp -s name.1.tsv name.8.tsv'
 
@@ -96,7 +96,7 @@ fi
 check "certain pairs are written as FASTQ, mates in step" '[[ $(gzip -dc reads_out/locus.certain_1.fq.gz | awk "NR % 4 == 1" | wc -l) -eq $(awk -F"\t" '"'"'$3=="certain"'"'"' out.tsv | wc -l) && $(gzip -dc reads_out/locus.certain_2.fq.gz | wc -l) -eq $(gzip -dc reads_out/locus.certain_1.fq.gz | wc -l) ]]'
 check "the summary gives the error rate and the backbone depth" 'grep -q "^run.error_rate.0.00200.given" out.summary.tsv && grep -q "backbone_depth" out.summary.tsv'
 "$BIN" recruit --locus "$IDX" -1 r_1.fq -2 r_2.fq -o est.tsv 2> est.log
-check "without a rate, it is estimated from the base qualities" 'grep -q "error rate 0.0010 (estimated from" est.log'
+check "without a rate, it is estimated from the base qualities" 'grep -q "error rate: 0.0010 (estimated from" est.log'
 
 # more loci than 64: seventy copies of the locus, each read scored for every one
 mkdir -p many && for i in $(seq -w 1 70); do cp data/locus.gfa many/l$i.gfa; done

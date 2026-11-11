@@ -103,6 +103,37 @@ double estimated_error(const std::vector<Fragment>& batch, std::string& source) 
     return long_reads ? 0.03 : 0.002;
 }
 
+// The read's seeds for the screen: closed syncmers, minimizers (the smallest hash of each window of kWindow
+// consecutive k-mers, each reported once), or every canonical k-mer.
+constexpr std::size_t kWindow = 20;
+template <class F>
+void for_each_seed(Screen mode, const std::string& s, F&& f) {
+    if (mode == Screen::Syncmer) {
+        kmer::for_each_closed_syncmer(s.data(), s.size(), kK, kS, [&](std::uint64_t c, std::size_t, bool) { f(c); });
+        return;
+    }
+    if (mode == Screen::All) {
+        kmer::for_each_canonical_kmer(s.data(), s.size(), kK, [&](std::uint64_t c, std::size_t, bool) { f(c); });
+        return;
+    }
+    struct Seed { std::uint64_t hash, code; std::size_t at; };
+    std::vector<Seed> w;   // the window's candidates, increasing hash (a monotone queue)
+    std::size_t last = ~std::size_t{0}, prev = ~std::size_t{0}, emitted = ~std::size_t{0};
+    kmer::for_each_canonical_kmer(s.data(), s.size(), kK, [&](std::uint64_t c, std::size_t at, bool) {
+        if (prev != ~std::size_t{0} && at != prev + 1) w.clear();   // an N broke the run of k-mers
+        if (w.empty()) last = at;
+        prev = at;
+        const std::uint64_t h = kmer::mix64(c);
+        while (!w.empty() && w.back().hash >= h) w.pop_back();
+        w.push_back({h, c, at});
+        while (w.front().at + kWindow <= at) w.erase(w.begin());
+        if (at + 1 >= last + kWindow && w.front().at != emitted) {   // a full window: its minimizer
+            emitted = w.front().at;
+            f(w.front().code);
+        }
+    });
+}
+
 }  // namespace
 
 ReadStats recruit_reads(const ReadOptions& options) {
@@ -119,9 +150,14 @@ ReadStats recruit_reads(const ReadOptions& options) {
         for (std::size_t lj = 0; lj < li; ++lj)
             if (loci[lj].name == x.name)
                 throw std::runtime_error("recruit: two loci are named " + x.name + " (" + o.indexes[lj] + ", " + o.indexes[li] + "); rename one graph");
-        for (const std::uint64_t s : x.screen) screen_items.emplace_back(s, static_cast<std::uint32_t>(li));
-        log(x.name + ": " + std::to_string(x.codes.size()) + " k-mers, " + std::to_string(x.decoy.size()) + " decoys, " +
-            std::to_string(x.screen.size()) + " screen syncmers");
+        if (o.screen == Screen::Syncmer) {
+            for (const std::uint64_t s : x.screen) screen_items.emplace_back(s, static_cast<std::uint32_t>(li));
+        } else {
+            for (std::size_t i = 0; i < x.codes.size(); ++i)
+                if (x.cls[i] != kRepeat) screen_items.emplace_back(x.codes[i], static_cast<std::uint32_t>(li));
+        }
+        log("locus: " + x.name + "; k-mers: " + std::to_string(x.codes.size()) + "; decoys: " + std::to_string(x.decoy.size()) +
+            "; screen syncmers: " + std::to_string(x.screen.size()));
     }
     // the screen: syncmer -> an entry of `screen_loci`, the loci it belongs to (any number of loci)
     std::sort(screen_items.begin(), screen_items.end());
@@ -145,7 +181,7 @@ ReadStats recruit_reads(const ReadOptions& options) {
     // whether a read hits some locus's screen (the input layer asks, for coordinate-sorted files)
     auto screened = [&](const std::string& seq) {
         bool hit = false;
-        kmer::for_each_closed_syncmer(seq.data(), seq.size(), kK, kS, [&](std::uint64_t c, std::size_t, bool) {
+        for_each_seed(o.screen, seq, [&](std::uint64_t c) {
             if (!hit && screen.find(c) != nullptr) hit = true;
         });
         return hit;
@@ -167,12 +203,12 @@ ReadStats recruit_reads(const ReadOptions& options) {
         const InputStats& s = source->stats();
         st.fragments += s.unscreened + s.dropped;   // passed over before scoring, unscreened
         input_stats.emplace_back(source->describe(), s);
-        log(source->describe() + ": " + std::to_string(s.records) + " records, " + std::to_string(s.fragments + s.unscreened + s.dropped) +
-            " fragments (" + std::to_string(s.pairs + s.unscreened) + " pairs)" +
-            (s.secondary + s.supplementary + s.qc_fail > 0 ? "; skipped " + std::to_string(s.secondary) + " secondary, " +
-                 std::to_string(s.supplementary) + " supplementary, " + std::to_string(s.qc_fail) + " QC-failed" : std::string()) +
-            (s.fetched > 0 ? "; " + std::to_string(s.fetched) + " mates fetched" : std::string()) +
-            (s.unmatched > 0 ? "; " + std::to_string(s.unmatched) + " reads without their mate" : std::string()));
+        log("input: " + source->describe() + "; records: " + std::to_string(s.records) + "; fragments: " +
+            std::to_string(s.fragments + s.unscreened + s.dropped) + "; pairs: " + std::to_string(s.pairs + s.unscreened) +
+            (s.secondary + s.supplementary + s.qc_fail > 0 ? "; skipped: secondary " + std::to_string(s.secondary) + ", supplementary " +
+                 std::to_string(s.supplementary) + ", QC-failed " + std::to_string(s.qc_fail) : std::string()) +
+            (s.fetched > 0 ? "; mates fetched: " + std::to_string(s.fetched) : std::string()) +
+            (s.unmatched > 0 ? "; reads without their mate: " + std::to_string(s.unmatched) : std::string()));
         source.reset();
     };
     constexpr std::size_t kBatch = 20000;
@@ -204,7 +240,7 @@ ReadStats recruit_reads(const ReadOptions& options) {
     {
         char b[64];
         std::snprintf(b, sizeof b, "%.4f", o.error_rate);
-        log(std::string("error rate ") + b + " (" + st.error_source + ")");
+        log(std::string("error rate: ") + b + " (" + st.error_source + ")");
     }
     // each locus's private-site cut: calibrated for the run's read class (from the first reads), or the given
     // one when the run scores by other rules than the calibration did
@@ -218,14 +254,10 @@ ReadStats recruit_reads(const ReadOptions& options) {
             pairs = pairs || (f.paired && !f.seq1.empty() && !f.seq2.empty());
         }
         const double mean = reads ? static_cast<double>(bases) / static_cast<double>(reads) : 0;
-        const ReadOptions defaults;
-        const bool same_rules = o.method == Method::Runs && o.decoy_share == defaults.decoy_share && o.min_density == defaults.min_density;
         for (std::size_t li = 0; li < loci.size(); ++li) {
             std::string note;
             if (!o.calibrated_cut) {
                 note = std::to_string(o.min_sites) + " given";
-            } else if (!same_rules) {
-                note = std::to_string(o.min_sites) + " (the calibration scored with the default method, decoy share and density; these differ)";
             } else {
                 const Cut c = calibrated_cut(calibration[li], mean, o.error_rate, o.false_certain_rate);
                 if (c.by == nullptr) {
@@ -253,7 +285,7 @@ ReadStats recruit_reads(const ReadOptions& options) {
                 }
             }
             cut_note[li] = note;
-            log(loci[li].name + ": private-site cut " + note);
+            log("locus: " + loci[li].name + "; site cut: " + note);
         }
     }
 
@@ -271,6 +303,8 @@ ReadStats recruit_reads(const ReadOptions& options) {
     std::uint64_t read_bases = 0, reads_seen = 0;
     const std::size_t threads = std::max<std::size_t>(1, o.threads);
     std::vector<std::vector<Row>> rows;
+    constexpr std::uint64_t kReportEvery = 10000000;
+    std::uint64_t next_report = kReportEvery;
     while (!batch.empty()) {
         rows.assign(batch.size(), {});
         std::atomic<std::size_t> cursor{0};
@@ -282,7 +316,7 @@ ReadStats recruit_reads(const ReadOptions& options) {
                     const Fragment& fr = batch[i];
                     hit.clear();
                     for (const std::string* s : {&fr.seq1, &fr.seq2})
-                        kmer::for_each_closed_syncmer(s->data(), s->size(), kK, kS, [&](std::uint64_t c, std::size_t, bool) {
+                        for_each_seed(o.screen, *s, [&](std::uint64_t c) {
                             if (const std::uint32_t* id = screen.find(c)) hit.insert(hit.end(), screen_loci[*id].begin(), screen_loci[*id].end());
                         });
                     std::sort(hit.begin(), hit.end());
@@ -338,6 +372,11 @@ ReadStats recruit_reads(const ReadOptions& options) {
             }
         }
         if (std::ferror(out) || std::fflush(out) != 0) throw std::runtime_error("recruit: cannot write " + o.out);
+        if (st.fragments >= next_report) {   // a line every 10 million fragments: a stream has no total for a bar
+            log("progress: fragments: " + std::to_string(st.fragments) + "; screened: " + std::to_string(st.screened) + "; certain: " +
+                std::to_string(st.certain));
+            while (next_report <= st.fragments) next_report += kReportEvery;
+        }
         batch.swap(next);
     }
     close_source();
