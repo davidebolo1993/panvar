@@ -115,8 +115,8 @@ void fail_point(const char* point) {
 
 std::string human_bytes(std::uint64_t b) {
     char buf[32];
-    if (b >= (1ULL << 30)) std::snprintf(buf, sizeof buf, "%.2f GB", static_cast<double>(b) / (1ULL << 30));
-    else std::snprintf(buf, sizeof buf, "%.1f MB", static_cast<double>(b) / (1ULL << 20));
+    if (b >= (1ULL << 30)) std::snprintf(buf, sizeof buf, "%.2f GiB", static_cast<double>(b) / (1ULL << 30));
+    else std::snprintf(buf, sizeof buf, "%.1f MiB", static_cast<double>(b) / (1ULL << 20));
     return buf;
 }
 

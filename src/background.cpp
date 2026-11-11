@@ -159,7 +159,7 @@ void radix_sort(std::uint64_t* a, std::size_t n) {
 }
 
 std::string memory_report() {
-    auto gb = [](std::uint64_t b) { char buf[32]; std::snprintf(buf, sizeof buf, "%.2f GB", static_cast<double>(b) / (1ULL << 30)); return std::string(buf); };
+    auto gb = [](std::uint64_t b) { char buf[32]; std::snprintf(buf, sizeof buf, "%.2f GiB", static_cast<double>(b) / (1ULL << 30)); return std::string(buf); };
     std::string out;
 #ifdef __APPLE__
     rusage_info_v4 ri{};
