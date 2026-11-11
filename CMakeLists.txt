@@ -228,6 +228,7 @@ if(NOT EXISTS ${EIGEN_DIR}/Eigen/Dense)
 endif()
 
 add_library(panvarlib
+    src/cli_utils.cpp
     src/gfa.cpp
     src/gfa_io.cpp
     src/align.cpp
@@ -295,7 +296,6 @@ target_link_libraries(panvarlib PRIVATE edlib abpoa minigraph sshash hts ZLIB::Z
 
 add_executable(panvar
     src/main.cpp
-    src/cli_utils.cpp
     src/bubble_command.cpp
     src/inspect.cpp
     src/call_command.cpp
