@@ -294,6 +294,7 @@ struct Event {
     bool seq_event = false;
     std::size_t seq_before = 0;
     std::string seq_ins;              // seq_event: the inserted sequence in genomic orientation
+    bool node_found = false;          // seq_event: a node replacement that is a plain insertion or deletion
     // A node event that is one exact change -- one stretch of reference deleted or replaced, or one
     // insertion point -- written the way an aligned event is (base before it, bases deleted, sequence
     // inserted in genomic orientation), so the two can be compared as the haplotypes they make.
@@ -3264,6 +3265,44 @@ void call_variants(
             }
             return true;
         };
+        // A node replacement whose two sides share bases at either end (different nodes spelling the same
+        // bases) and that is then a plain insertion or deletion is made one, placed as an aligned change is
+        // (left-aligned along the reference), so it merges with the same change typed as one and is
+        // classified as one. Its size and nodes are unchanged. Not at a collapsed module, whose copy-change
+        // accounting reads the node comparison's events as they are.
+        auto plain_indel = [&](Event& e) {
+            const std::size_t base = ref_meta.region_start_1based;
+            if (e.splice_before < base || e.splice_before + 1 - base + e.splice_del > ref_genome.size()) return;
+            std::string d = ref_genome.substr(e.splice_before + 1 - base, e.splice_del);
+            std::string a = e.splice_ins;
+            std::size_t pre = 0;
+            while (pre < d.size() && pre < a.size() && d[pre] == a[pre]) ++pre;
+            std::size_t suf = 0;
+            while (suf < d.size() - pre && suf < a.size() - pre && d[d.size() - 1 - suf] == a[a.size() - 1 - suf]) ++suf;
+            const std::size_t dl = d.size() - pre - suf, il = a.size() - pre - suf;
+            if ((dl != 0) == (il != 0)) return;   // still a replacement, or no change at all
+            d = d.substr(pre, dl);
+            a = a.substr(pre, il);
+            const std::size_t gx = e.splice_before + 1 + pre;
+            std::size_t x = gx;
+            std::string u = dl == 0 ? a : d;
+            while (x > base + 1 && ref_genome[x - 1 - base] == u.back() &&
+                   (dl == 0 || ref_genome[x - 1 - base] == ref_genome[x - 1 - base + dl])) {
+                u = u.back() + u.substr(0, u.size() - 1);
+                --x;
+            }
+            e.seq_event = true;
+            e.node_found = true;
+            e.ref_tok_first = e.ref_tok_last = SIZE_MAX;   // placed by its bases, as an aligned change is
+            e.seq_before = gx - 1;
+            e.ref_pos = x;
+            e.type = dl == 0 ? EvType::Ins : EvType::Del;
+            e.seq = dl == 0 ? (ref_rev ? reverse_complement(a) : a) : (ref_rev ? reverse_complement(d) : d);
+            e.alt_seq.clear();
+            e.del_bp = dl; e.ins_bp = il;
+            e.size_bp = std::max(dl, il);
+            e.seq_ins = a;
+        };
         // The module record, when this site has one: a replacement of a whole copy is split below.
         const MergedRecord* module_rec = nullptr;
         for (const MergedRecord& mr : merged) if (!mr.anchor_nodes.empty()) module_rec = &mr;
@@ -3354,6 +3393,7 @@ void call_variants(
                     if (e.type == EvType::Sub) e.splice_ins = ref_rev ? reverse_complement(e.alt_seq) : e.alt_seq;
                     for (char& c : e.splice_ins) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
                     e.splice_ok = !ref_genome.empty();
+                    if (e.type == EvType::Sub && e.splice_ok && !e.across_copies && !e.split_piece && !module_record) plain_indel(e);
                 } else if (e.type == EvType::Ins && e.ref_tok_anchor != SIZE_MAX) {
                     const auto sp = tok_span(e.ref_tok_anchor, e.ref_tok_anchor);
                     if (sp.first <= ref_meta.region_start_1based) continue;
@@ -4407,9 +4447,12 @@ void call_variants(
             bool node_minimal = false;
             if (!e.seq_event && e.type == EvType::Sub && e.splice_ok && !imprecise && !e.seq.empty() &&
                 !e.alt_seq.empty()) {
-                const std::string d = ref_rev ? reverse_complement(e.seq) : e.seq;
+                std::string d = ref_rev ? reverse_complement(e.seq) : e.seq;
+                for (char& c : d) c = upper_base(c)[0];
                 const std::string& a = e.splice_ins;
-                node_minimal = upper_base(d.front()) == upper_base(a.front()) || upper_base(d.back()) == upper_base(a.back());
+                // identical sides are no change; the node comparison drops them, and this keeps the guard here
+                node_minimal = d != a && (upper_base(d.front()) == upper_base(a.front()) ||
+                                          upper_base(d.back()) == upper_base(a.back()));
             }
             const std::size_t before = e.seq_event ? e.seq_before : e.splice_before;
             bool rp = false, rp_sub = false;
@@ -4908,10 +4951,11 @@ void call_variants(
                 // comparison left out lies between them on both walks, so each side keeps its own copies --
                 // spanning it on the reference alone would write a substitution beside an array as the array's loss.
                 const auto event_body = [&](const Event& ev, std::size_t ai) -> std::string {
-                    if (ev.seq_event)
-                        return body("seq", ev.seq_before + 1, ev.seq_before + ev.del_bp, ".", ev.seq_ins);
                     const char* kind = ev.type == EvType::Ins ? "ins" : ev.type == EvType::Del ? "del"
                                      : ev.type == EvType::Sub ? "sub" : ev.type == EvType::Inv ? "inv" : nullptr;
+                    if (ev.seq_event)   // a node replacement made a plain insertion or deletion keeps its node kind
+                        return body(ev.node_found && kind != nullptr ? kind : "seq", ev.seq_before + 1,
+                                    ev.seq_before + ev.del_bp, ".", ev.seq_ins);
                     if (kind == nullptr || ai >= alleles.size()) return unresolved;
                     if (ev.split_piece) {
                         const std::string ev_bp = std::to_string(ev.type == EvType::Ins ? static_cast<long long>(ev.size_bp)

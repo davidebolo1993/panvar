@@ -901,6 +901,12 @@ modlow=$(awk -F'\t' '/^#CHROM/{for(i=10;i<=NF;i++) if($i=="htest#1#chr1") c=i}
 [ "$modlow" = "SVTYPE=CNV:0:1 SVTYPE=DEL:1:. " ] \
   && ok "MODULE: a copy change under --min-sv-bp is no carrier and keeps its own 100 bp deletion" \
   || bad "MODULE non-carrier: records 'SVTYPE:GT:CN' for htest are '$modlow', expected 'SVTYPE=CNV:0:1 SVTYPE=DEL:1:. '"
+# The carrier hfull's own deletion of one copy is its copy change: it stays off the deletion record.
+modfull=$(awk -F'\t' '/^#CHROM/{for(i=10;i<=NF;i++) if($i=="hfull#1#chr1") c=i}
+  !/^#/ && $8 ~ /SVTYPE=DEL;/ {split($c,g,":"); n=split($8,f,";"); for(i=1;i<=n;i++) if(f[i] ~ /^(AC|NMERGED)=/) printf "%s ", f[i]; printf "hfull:%s", g[1]}' "$V")
+[ "$modfull" = "NMERGED=1 AC=1 hfull:0" ] \
+  && ok "MODULE carrier: its copy loss is not also a deletion record" \
+  || bad "MODULE carrier: the deletion record reads '$modfull', expected 'NMERGED=1 AC=1 hfull:0'"
 # The reference runs a 20 bp module (ma, mb: 10 bp each) three times -- one copy below --min-sv-bp, so
 # no module record: its copy changes are sequence. hgain's three extra copies are a 60 bp insertion,
 # hloss's lost ones a 60 bp deletion, and hnet's, replaced by a 20 bp node x of its own, a substitution
@@ -3652,6 +3658,28 @@ check "node replacement sharing a base with the reference: a plain deletion (POS
   "$(awk -F'\t' '!/^#/{n=split($8,f,";"); e=""; l=""; for(i=1;i<=n;i++){split(f[i],kv,"=");
        if(kv[1]=="END") e=kv[2]; if(kv[1]=="SVLEN") l=kv[2]}
        print $2, e, l, ($8 ~ /SUBSTITUTION/ ? "SUBSTITUTION" : "plain")}' "$OUT/ntrim/v.region.vcf")" "300 400 -100 plain"
+# rinfo_of <vcf> <key>: the first record's INFO value for key
+rinfo_of() { awk -F'\t' -v k="$2" '!/^#/{n=split($8,f,";"); for(i=1;i<=n;i++){split(f[i],kv,"="); if(kv[1]==k){print kv[2]; exit}}}' "$1"; }
+D=$(awk -F'\t' '$1=="S" && $2=="D"{print $3}' "$OUT/ntrim/g.gfa")
+check "the deletion slides one base left (a's G, then D less its last base) and 4 bp in all (HOMLEN CIPOS CIEND DELSEQ)" \
+  "$(rinfo_of "$OUT/ntrim/v.region.vcf" HOMLEN) $(rinfo_of "$OUT/ntrim/v.region.vcf" CIPOS) $(rinfo_of "$OUT/ntrim/v.region.vcf" CIEND) $(rinfo_of "$OUT/ntrim/v.region.vcf" DELSEQ)" \
+  "4 0,4 0,4 G${D%?}"
+# h2 deletes D through the reference's own a; h1's replacement is the same deletion, so one record holds both.
+sed 's/^P h2#1#chr1 .*/P h2#1#chr1 L+,a+,R+/' "$OUT/ntrim.spec" > "$OUT/ndup.spec"
+python3 -I "$TOOLS/spec_gfa.py" "$OUT/ndup.spec" "$OUT/ndup"
+"$BIN" call -i "$OUT/ndup/g.gfa" -c "$OUT/ndup/g.bubbles.csv" -r 'ref#0#chr1:0-701' -o "$OUT/ndup/v" \
+  --no-align-alleles --no-per-bubble-vcf -q >/dev/null 2>&1
+check "a node replacement that is a plain deletion merges with the same deletion (records, h1 h2 GT)" \
+  "$(grep -vc '^#' "$OUT/ndup/v.region.vcf") $(awk -F'\t' '/^#CHROM/{for(i=10;i<=NF;i++) c[$i]=i} !/^#/{split($c["h1#1#chr1"],a,":"); split($c["h2#1#chr1"],b,":"); print a[1] b[1]; exit}' "$OUT/ndup/v.region.vcf")" "1 11"
+# h1 walks b, a's G and 97 bp more, for a: a plain 97 bp insertion, classified as one (INS_SUBTYPE).
+printf 'N L 300 91\nN a =G\nN I 90 95\nN R 300 93\nP ref#0#chr1:0-601 L+,a+,R+\nP h2#1#chr1 L+,a+,I+,R+\n' > "$OUT/ncls.spec"
+printf 'N b =G%s\nP h1#1#chr1 L+,b+,R+\nB L R a;b;I\n' "$(blk 97 96)" >> "$OUT/ncls.spec"
+python3 -I "$TOOLS/spec_gfa.py" "$OUT/ncls.spec" "$OUT/ncls"
+"$BIN" call -i "$OUT/ncls/g.gfa" -c "$OUT/ncls/g.bubbles.csv" -r 'ref#0#chr1:0-601' -o "$OUT/ncls/v" \
+  --no-align-alleles --classify-ins --no-per-bubble-vcf -q >/dev/null 2>&1
+check "--classify-ins: both insertions, the node replacement's too, are classified (SVLEN:INS_SUBTYPE)" \
+  "$(awk -F'\t' '!/^#/{n=split($8,f,";"); l=""; t="-"; for(i=1;i<=n;i++){split(f[i],kv,"="); if(kv[1]=="SVLEN") l=kv[2]; if(kv[1]=="INS_SUBTYPE") t=kv[2]} printf "%s:%s ", l, t}' "$OUT/ncls/v.region.vcf")" \
+  "90:NOVEL 97:NOVEL "
 
 # Aligned alleles: the band is set from the node comparison's drift, which can understate the change where the
 # walks are matched at short nodes out of place. The best placement is a 123 bp deletion and an 86 bp insertion
