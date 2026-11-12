@@ -887,6 +887,20 @@ h0gtcn=$(awk -F'\t' '/^#CHROM/{for(i=10;i<=NF;i++) if($i=="h0#1#chr1") c=i}
   !/^#/ && /CN_METHOD=MODULE;/{split($9,k,":"); split($c,v,":"); for(j in k) f[k[j]]=v[j]; print f["GT"]":"f["CN"]}' "$V")
 [ "$h0gtcn" = "1:0" ] && ok "MODULE: the total loss is a carrier (GT 1) with CN 0" \
                       || bad "MODULE: the total loss reads GT:CN $h0gtcn, expected 1:0"
+# The reference runs a module of two anchor nodes (a3 20 bp, a2 40 bp) twice. htest deletes a2 of the second
+# copy and the 60 bp node x after it: one copy fewer at the anchor (CN 1), but its module changes by 40 bp, under
+# --min-sv-bp, so it is no carrier of the module record. Its 100 bp deletion is then reported as a deletion.
+{ printf 'N L 2000 81\nN A3 20 82\nN A2 40 83\nN S 40 84\nN X 60 85\nN R 2000 86\n'
+  printf 'P ref#0#chr1:0-4220 L+,A3+,A2+,S+,A3+,A2+,X+,R+\nP hfull#1#chr1 L+,A3+,A2+,X+,R+\n'
+  printf 'P hgain#1#chr1 L+,A3+,A2+,S+,A3+,A2+,S+,A3+,A2+,X+,R+\nP htest#1#chr1 L+,A3+,A2+,S+,A3+,R+\n'
+  for i in 1 2 3 4 5 6 7 8 9 10; do printf 'P hr%s#1#chr1 L+,A3+,A2+,S+,A3+,A2+,X+,R+\n' "$i"; done; } > "$OUT/modlow.spec"
+python3 -I "$(cd "$(dirname "$0")/.." && pwd)/tools/spec_gfa.py" "$OUT/modlow.spec" "$OUT/modlow"
+cn_call "$OUT/modlow/g.gfa" "$OUT/modlow"; V="$OUT/modlow.region.vcf"
+modlow=$(awk -F'\t' '/^#CHROM/{for(i=10;i<=NF;i++) if($i=="htest#1#chr1") c=i}
+  !/^#/ {split($c,g,":"); split($8,f,";"); printf "%s:%s:%s ", f[2], g[1], g[2]}' "$V")
+[ "$modlow" = "SVTYPE=CNV:0:1 SVTYPE=DEL:1:. " ] \
+  && ok "MODULE: a copy change under --min-sv-bp is no carrier and keeps its own 100 bp deletion" \
+  || bad "MODULE non-carrier: records 'SVTYPE:GT:CN' for htest are '$modlow', expected 'SVTYPE=CNV:0:1 SVTYPE=DEL:1:. '"
 # The reference runs a 20 bp module (ma, mb: 10 bp each) three times -- one copy below --min-sv-bp, so
 # no module record: its copy changes are sequence. hgain's three extra copies are a 60 bp insertion,
 # hloss's lost ones a 60 bp deletion, and hnet's, replaced by a 20 bp node x of its own, a substitution

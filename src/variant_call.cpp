@@ -3810,8 +3810,14 @@ void call_variants(
                 };
                 std::vector<std::unordered_set<std::string>> drop(merged.size());
                 std::vector<std::unordered_set<std::string>> not_cn(merged.size());   // module carriers given up
+                // The record's carriers. Only their copy changes are reported by it: a haplotype left out of them
+                // (its module changes by under --min-sv-bp) keeps the events that hold its change.
+                std::unordered_map<const MergedRecord*, std::unordered_set<std::string>> cn_carriers;
+                for (const std::size_t di : mds)
+                    cn_carriers[&merged[di]].insert(merged[di].carriers.begin(), merged[di].carriers.end());
                 // A carrier's copy change on a module record: delta (copies) and cb (the module's own bp change).
                 const auto copy_change = [&](const MergedRecord& d, const std::string& m, long long& delta, long long& cb) {
+                    if (!cn_carriers[&d].count(m)) return false;
                     const auto cit = d.sample_cn.find(m);
                     if (cit == d.sample_cn.end()) return false;
                     delta = static_cast<long long>(cit->second) - static_cast<long long>(d.seed.ref_cn);
