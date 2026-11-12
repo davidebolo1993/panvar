@@ -112,3 +112,22 @@ with open(os.path.join(out, "split_o", "locus.gfa"), "w") as f:
     f.write(f"S\t1\t{ref2[ls2:le2]}\nS\t2\t{hap_o}\n")
     f.write(f"P\tref#1#chr1:{ls2}-{le2}\t1+\t*\n")
     f.write(f"P\tgo#1#chr1:{ls2}-{ls2 + len(hap_o)}\t2+\t*\n")
+
+# split_e/: the locus of split/, and arrays that run into a contig end through a stub with errors (no window
+# fits there, and its k-mers fall short of the density a window needs; the graph holds the array without the
+# errors): in ge, a contig holding more of the array of a whole copy; in gt, a copy reaching its contig's end
+os.makedirs(os.path.join(out, "split_e"), exist_ok=True)
+arr_e, arr_g = array(6), array(7)
+stub_e = mutate(arr_e[4 * 5500:4 * 5500 + 1700], 0.006)
+stub_g = mutate(arr_g[5 * 5500:5 * 5500 + 2000], 0.01)
+hap_e = left + arr_e + right
+hap_g = left + arr_g + right
+write("split_e/ref", [("chr1", ref2)])
+write("split_e/ge", [("chr1", ref2[:ls2] + hap_e + ref2[le2:]), ("o", arr_e[:4 * 5500] + stub_e)])
+write("split_e/gt", [("chr1", ref2[:ls2] + left + arr_g[:5 * 5500] + stub_g)])
+with open(os.path.join(out, "split_e", "locus.gfa"), "w") as f:
+    f.write("H\tVN:Z:1.0\n")
+    f.write(f"S\t1\t{ref2[ls2:le2]}\nS\t2\t{hap_e}\nS\t3\t{hap_g}\n")
+    f.write(f"P\tref#1#chr1:{ls2}-{le2}\t1+\t*\n")
+    f.write(f"P\tge#1#chr1:{ls2}-{ls2 + len(hap_e)}\t2+\t*\n")
+    f.write(f"P\tgt#1#chr1:{ls2}-{ls2 + len(hap_g)}\t3+\t*\n")

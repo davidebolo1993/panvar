@@ -84,6 +84,11 @@ check "an array past a copy's estimated end is found on its contig ($(pieces idx
 "$BIN" recruit --dump-index idx_orphan/locus.plx=dump_orphan.tsv
 check "an array contig next to a whole copy is found ($(pieces idx_orphan/locus.index.tsv))" '[[ $rc -eq 0 && "$(pieces idx_orphan/locus.index.tsv)" == "go:orphan:0-22000 " ]] && grep -q "every genome scanned for pieces" orphan.txt && python3 "$TOOLS/locus_outside.py" idx_orphan/locus.index.tsv dump_orphan.tsv 8 data/split_o/ref.fa data/split_o/go.fa > brute_orphan.txt && awk -F"\t" '"'"'NR>1 && $2!="D" && $4>=3 {n++; p+=($2=="P")} END {exit !(n>5000 && p==n)}'"'"' dump_orphan.tsv'
 check "a locus without an array is not looked for in every genome" '! grep -q "every genome scanned" log1.txt'
+# arrays running into contig ends through stubs with errors: a piece and a copy's uncertain end reach the end
+"$BIN" background -t 2 --partitions 64 --memory 64M -q --tmp-dir "$OUT/tmp" -o s_ends --genome ref=data/split_e/ref.fa --genome ge=data/split_e/ge.fa --genome gt=data/split_e/gt.fa --coordinate-reference ref
+"$BIN" recruit -t 2 -q --background s_ends -r ref --index-only --save-index idx_ends --locus data/split_e/locus.gfa; rc=$?
+"$BIN" recruit --dump-index idx_ends/locus.plx=dump_ends.tsv
+check "array stubs at contig ends count as the locus ($(pieces idx_ends/locus.index.tsv))" '[[ $rc -eq 0 && "$(pieces idx_ends/locus.index.tsv)" == "ge:o:0-23700 " && $(field idx_ends/locus.index.tsv span_demoted) == 0 ]] && python3 "$TOOLS/locus_outside.py" idx_ends/locus.index.tsv dump_ends.tsv 8 data/split_e/ref.fa data/split_e/ge.fa data/split_e/gt.fa > brute_ends.txt && awk -F"\t" '"'"'NR>1 && $2!="D" {n++; p+=($2=="P")} END {exit !(n>50000 && p==n)}'"'"' dump_ends.tsv'
 "$BIN" recruit -t 4 -q --background s_split -r ref --index-only --save-index idx_split4 --locus data/split/locus.gfa
 "$BIN" recruit --dump-index idx_split4/locus.plx=dump_split4.tsv
 check "the piece scan on 4 threads gives the same index" 'cmp -s dump_split.tsv dump_split4.tsv'

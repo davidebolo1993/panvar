@@ -38,7 +38,7 @@ namespace fs = std::filesystem;
 
 constexpr std::size_t kK = 31, kS = 11;
 constexpr std::uint64_t kMagic = 0x3130305850585650ULL;   // "PVPXP001"
-constexpr std::uint64_t kVersion = 9;   // 2: decoy windows stop at the locus; 3: clusters split at it; 4: S per haplotype; 5: calibration; 6: its decoy pairs cross window edges; 7: locus pieces off the located copies; 8: and past estimated ends; 9: and everywhere for a locus with array pieces outside
+constexpr std::uint64_t kVersion = 10;   // 2: decoy windows stop at the locus; 3: clusters split at it; 4: S per haplotype; 5: calibration; 6: its decoy pairs cross window edges; 7: locus pieces off the located copies; 8: and past estimated ends; 9: and everywhere for a locus with array pieces outside; 10: stretches reach contig ends
 const std::size_t kLengths[] = {100, 150, 250, 1000, 10000};
 constexpr std::size_t kWindowStep = 25;
 // A stretch of a genome is a piece of the locus when, over every window of this many bases in it, this
@@ -618,6 +618,22 @@ std::vector<LocusIndex> build(const BuildOptions& o) {
                     const std::uint64_t ws = hits[i], we = hits[j - 1] + kK;
                     if (!dense.empty() && ws <= dense.back().second) dense.back().second = std::max(dense.back().second, we);
                     else dense.emplace_back(ws, we);
+                }
+                // a stretch less than a window from a contig end reaches that end when at least half of the k-mer
+                // starts in between are the locus's: no window fits there, and assemblies hold more errors near
+                // their contig ends
+                if (!dense.empty()) {
+                    auto& first = dense.front();
+                    if (first.first > 0 && first.first < kPieceWindow) {
+                        const std::size_t n = static_cast<std::size_t>(std::lower_bound(hits.begin(), hits.end(), first.first) - hits.begin());
+                        if (2 * n >= first.first) first.first = 0;
+                    }
+                    auto& last = dense.back();
+                    if (last.second < seq.size() && seq.size() - last.second < kPieceWindow) {
+                        const std::uint64_t from = last.second - kK + 1;   // the first start past the stretch's last k-mer
+                        const std::size_t n = static_cast<std::size_t>(hits.end() - std::upper_bound(hits.begin(), hits.end(), last.second - kK));
+                        if (2 * n >= starts - from) last.second = seq.size();
+                    }
                 }
                 const LocusWork& w = work[li];
                 std::vector<const anchors::Span*> own;   // the located copies on this contig
