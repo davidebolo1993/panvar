@@ -304,6 +304,8 @@ check "with no reference copy, the copies go where the walk has them, either sid
       "$(sv uzero_B missed_by_call_events):$(lg uzero_B "$UNRESOLVED")" "0:0"
 check "the VCF cannot spell copies with REF_CN 0: counted, and what they leave is lost (no_sequence)" \
       "$(lg uzero_B "$UNSPELLED"):$(lost_rows uzero | tr ';' '\n' | awk '$1=="h2"{print $4}')" "1:no_sequence"
+check "the warning names the cause: no reference copy to paste, not a sequence call left out (lines)" \
+      "$(grep -c 'no reference copy to paste' "$OUT/uzero_B.log"):$(grep -c 'max-seq-bp' "$OUT/uzero_B.log")" "1:0"
 # A twin of the loop (V: U's sequence, same neighbours, no loop) and a unit graph whose copy is
 # (a1|a2) b: a carrier's copies are counted as the record counts them, not on the key node alone.
 cat > "$OUT/twin.spec" <<'EOF'
@@ -570,6 +572,8 @@ cp "$OUT/sub_c.carrier_events.tsv" "$OUT/subn_c.carrier_events.tsv"
 bm -i "$OUT/sub/g.gfa" -c "$OUT/sub/g.bubbles.csv" -r 'ref#0#chr1:0-660' --calls "$OUT/subn_c" -o "$OUT/subn_B" -q >/dev/null 2>&1
 check "a replacement with no INSSEQ is not rebuilt from the VCF, and what it leaves is lost (no_sequence)" \
       "$([ "$(lg subn_B "$UNSPELLED")" -ge 1 ] && echo counted):$(lost_rows subn | cut -d' ' -f4 | sort -u | paste -sd, -)" "counted:no_sequence"
+check "the warning names the cause: a sequence call left out above --max-seq-bp (lines)" \
+      "$(grep -c 'call left out above its --max-seq-bp' "$OUT/subn_B.log"):$(grep -c 'no reference copy' "$OUT/subn_B.log")" "1:0"
 check "every haplotype is clean once its replacement is applied" "$(sv sub_B haplotypes_clean_call):$(sv sub_B haplotypes_clean_vcf):$(sv sub_B haplotypes_scored)" "10:10:10"
 # Two similar segments in the other order: 31 differences each, not a 600 bp deletion and insertion.
 cat > "$OUT/swap.spec" <<'EOF'

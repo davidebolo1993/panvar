@@ -871,6 +871,9 @@ int run_benchmark_command(const std::vector<std::string>& args) {
         std::size_t checked = 0, unchecked = 0, cn_checked = 0, cn_unchecked = 0, unresolved_rows = 0;
         std::size_t not_reconstructable = 0, missing_gt = 0, not_in_vcf = 0;
         std::vector<VcfRecordInfo> vcf;
+        // A record that could not be spelled for some carrier, and why: "sequence" (left out above call's
+        // --max-seq-bp), "no_copy" (a copy-number record with no reference copy to paste), "other".
+        std::unordered_map<std::string, std::string> unspelled;
     };
     Stage stages[2];
     const auto score_mode = [&](const ModeSpec& spec, Stage& out) {
@@ -956,6 +959,7 @@ int run_benchmark_command(const std::vector<std::string>& args) {
         return {best->start, best->length};
     };
     std::size_t vcf_not_reconstructable = 0, vcf_missing_gt = 0;
+    std::unordered_map<std::string, std::string> unspelled;
     std::vector<CarrierEvent> cevents;
     if (vcf_mode) {
         const std::size_t ref_lo = region_start, ref_hi = region_start + ref_seq.size() - 1;   // genomic
@@ -988,7 +992,7 @@ int run_benchmark_command(const std::vector<std::string>& args) {
                 const std::string& alt = r.alts[static_cast<std::size_t>(a) - 1];
                 const bool subst = has_flag(r.info, "SUBSTITUTION");
                 const std::size_t end = std::max(r.end, r.pos);
-                if (r.pos < ref_lo || end > ref_hi) { reconstructable = false; add(r, "unresolved", 0, 0, std::string(), ".", h); continue; }
+                if (r.pos < ref_lo || end > ref_hi) { unspelled.emplace(r.id, "other"); reconstructable = false; add(r, "unresolved", 0, 0, std::string(), ".", h); continue; }
                 if (alt.empty() || alt[0] != '<') {
                     // sequence-resolved: REF at POS replaced by ALT, their shared first bases trimmed
                     const auto upper = [](std::string x) {
@@ -1005,7 +1009,7 @@ int run_benchmark_command(const std::vector<std::string>& args) {
                 } else if (alt == "<DEL>" || alt == "<INS>") {
                     const std::string ins = info_field(r.info, "INSSEQ");
                     // An insertion, or a replacement, spells its new sequence from INSSEQ.
-                    if ((alt == "<INS>" || subst) && ins.empty()) { reconstructable = false; add(r, "unresolved", 0, 0, std::string(), ".", h); continue; }
+                    if ((alt == "<INS>" || subst) && ins.empty()) { unspelled.emplace(r.id, "sequence"); reconstructable = false; add(r, "unresolved", 0, 0, std::string(), ".", h); continue; }
                     if (alt == "<INS>" && !subst) add(r, "ins", r.pos + 1, r.pos, ins, ".", h);
                     else add(r, alt == "<DEL>" && !subst ? "del" : "sub", r.pos + 1, end, subst ? ins : std::string(), ".", h);
                 } else if (alt == "<INV>") {
@@ -1015,6 +1019,7 @@ int run_benchmark_command(const std::vector<std::string>& args) {
                     const auto [c0, clen] = copy_of(r, h);
                     const std::size_t aend = r.pos + (r.cn_ref_bp > 0 ? static_cast<std::size_t>(r.cn_ref_bp) : end - r.pos);
                     if (cit == r.sample_cn.end() || r.ref_cn <= 0 || c0 == 0 || clen == 0) {
+                        unspelled.emplace(r.id, cit == r.sample_cn.end() ? "other" : "no_copy");
                         reconstructable = false; add(r, "unresolved", 0, 0, std::string(), ".", h); continue;
                     }
                     const long long d = cit->second - r.ref_cn;
@@ -1147,7 +1152,7 @@ int run_benchmark_command(const std::vector<std::string>& args) {
                         const std::size_t del = std::min<std::size_t>(want, aend + 1 - at);
                         add(r, "cnv", at, at + del - 1, std::string(), cn, h);
                     }
-                } else { reconstructable = false; add(r, "unresolved", 0, 0, std::string(), ".", h); }
+                } else { unspelled.emplace(r.id, "other"); reconstructable = false; add(r, "unresolved", 0, 0, std::string(), ".", h); }
             }
             if (!reconstructable) ++vcf_not_reconstructable;
         }
@@ -1685,6 +1690,7 @@ int run_benchmark_command(const std::vector<std::string>& args) {
     out.cn_checked = cn_stretch_checked; out.cn_unchecked = cn_stretch_unchecked;
     out.unresolved_rows = unresolved_rows;
     out.not_reconstructable = vcf_not_reconstructable; out.missing_gt = vcf_missing_gt;
+    out.unspelled = std::move(unspelled);
     out.not_in_vcf = not_in_vcf;
     out.vcf = vcf;
     };
@@ -1719,6 +1725,7 @@ int run_benchmark_command(const std::vector<std::string>& args) {
         };
         std::map<std::string, std::size_t> missed_by_cause = {{"incomplete", 0}, {"unresolved", 0}, {"not_carrier", 0},
                                                               {"no_record", 0}, {"outside_bubbles", 0}};
+        std::map<std::string, std::size_t> unspelled_lost;   // no_sequence losses, by why the record is unspelled
         std::map<std::string, std::size_t> lost_by_reason = {{"copy_count", 0}, {"no_sequence", 0}, {"imprecise", 0},
                                                              {"representative", 0}, {"other", 0}};
         std::map<std::string, std::size_t> skipped;
@@ -1789,6 +1796,11 @@ int run_benchmark_command(const std::vector<std::string>& args) {
                 std::string records = e.records;
                 const std::string why = lost_reason(e, c, records);
                 ++lost_by_reason[why];
+                if (why == "no_sequence") {   // by why its record could not be spelled
+                    const auto ids = split_on(records, ';');
+                    const auto it = ids.empty() ? sv.unspelled.end() : sv.unspelled.find(ids.front());
+                    ++unspelled_lost[it == sv.unspelled.end() ? "other" : it->second];
+                }
                 ++h_lost; h_lost_bp += e.size;
                 LargeRow shown = e;
                 shown.records = records;
@@ -1894,8 +1906,10 @@ int run_benchmark_command(const std::vector<std::string>& args) {
         };
         warn(sc.unresolved_rows, "carrier event(s) call could not place on the reference");
         warn(sv.not_reconstructable, "VCF record(s) that could not be spelled for some carrier");
-        warn(lost_by_reason["no_sequence"], "event(s) lost in the VCF for a sequence call left out (call --max-seq-bp 0 "
-             "writes them all)");
+        warn(unspelled_lost["sequence"], "event(s) lost in the VCF at a record whose sequence call left out above its "
+             "--max-seq-bp (call --max-seq-bp 0 writes them all)");
+        warn(unspelled_lost["no_copy"], "event(s) lost in the VCF at a copy-number record with no reference copy to paste");
+        warn(unspelled_lost["other"], "event(s) lost in the VCF at a record that could not be spelled");
         warn(sc.not_in_vcf, "haplotype(s) with no VCF column");
         warn(sc.unchecked + sc.cn_unchecked, "carrier check(s) skipped: the record has no single SVLEN, or no CN or copy length to compare");
         staged.commit();
