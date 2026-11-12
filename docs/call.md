@@ -95,7 +95,7 @@ VCF 4.2. `POS` is the base before the event, `END` its last reference base. `GT`
 | `NMERGED`, `SVLEN_RANGE`, `MERGE_*` | how many carriers were merged and how much they differ |
 | `GENES` | with `--gtf`: genes over the record; inside a copy of a `MODULE` site holding several genes, the paralogs its carriers hold |
 
-`FORMAT`: `GT`, `CN` (`.` except on a `CNV`); on a `CNV` also `CNBP` and `CNRESID`, and on a `UNIT` record `CNINV`: copies in the opposite orientation to the reference's copy (with no reference copy, to the orientation most haplotypes' copies take). A gain with more such copies than the reference has is flagged `INVDUP`; with no reference copy, only a haplotype holding a copy and its reverse complement is. The full list is in the VCF header.
+`FORMAT`: `GT`, `CN` (`.` except on a `CNV`; on a `MODULE` record a haplotype that is no carrier reads `REF_CN`, as its change is in its own records and a dosage read off `CN` would count it twice); on a `CNV` also `CNBP` and `CNRESID`, and on a `UNIT` record `CNINV`: copies in the opposite orientation to the reference's copy (with no reference copy, to the orientation most haplotypes' copies take). A gain with more such copies than the reference has is flagged `INVDUP`; with no reference copy, only a haplotype holding a copy and its reverse complement is. The full list is in the VCF header.
 
 `carrier_events.tsv`, one row per record and event; carriers holding the same event share a row:
 

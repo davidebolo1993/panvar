@@ -1927,7 +1927,7 @@ void call_variants(
         out << (options.diploid
                     ? "##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Per-haplotype genotype of the sample's paths, numbered PanSN haplotypes in order joined by '|'; if the sample also has haplotypes with no number (e.g. HPRC 'U'), each of those is a slot too and every slot is joined by '/' (unphased): 1=carrier, 0=reference-like, .=no allele there (as per path), or two contigs of the haplotype cross the site with different values\">\n"
                     : "##FORMAT=<ID=GT,Number=1,Type=String,Description=\"1=carrier, 0=reference-like, .=no allele there: the haplotype does not cross the site, crosses an assembly gap there, could not be aligned there, or its own larger deletion removes the record's bases\">\n");
-        out << "##FORMAT=<ID=CN,Number=1,Type=Integer,Description=\"Copy number on a CNV record: copies of the repeat unit (CN_METHOD=UNIT) or of the module (MODULE); . on other records\">\n";
+        out << "##FORMAT=<ID=CN,Number=1,Type=Integer,Description=\"Copy number on a CNV record: copies of the repeat unit (CN_METHOD=UNIT) or of the module (MODULE), where a MODULE record's non-carrier (GT 0) reads REF_CN, its change being in its own records; . on other records\">\n";
         out << "##FORMAT=<ID=CNBP,Number=1,Type=Integer,Description=\"Actual linear bp gained(+)/lost(-) by this haplotype vs the reference, from the spelled walk (node length x traversal multiplicity minus the reference's): over the bubble interior on CN_METHOD=UNIT; on MODULE, from the haplotype's first to its last module node, everything walked between. Recovers the linear SV size that a one-copy unit does not convey; CNV records only.\">\n";
         out << "##FORMAT=<ID=CNRESID,Number=1,Type=Integer,Description=\"CNBP - (CN-REF_CN) copies of RU_LEN (UNIT) or CN_UNIT_BP (MODULE): the bp this haplotype gained or lost that whole copies do NOT explain. 0 means the whole size difference is copy number; otherwise a partial copy or other sequence changed in the same site, and on MODULE also copies of another size than the reference's\">\n";
         out << "##FORMAT=<ID=CNINV,Number=1,Type=Integer,Description=\"CN_METHOD=UNIT only: how many of this haplotype's CN copies run opposite to the reference's copy of the unit (with no reference copy, to the orientation most haplotypes' copies take; when both are equally common, the haplotype's copies in its own less common orientation). 0 means every copy is in the reference orientation; a gain with CNINV above the reference's is an inverted duplication (INFO/INVDUP), and with no reference copy a haplotype holding copies in both orientations\">\n";
@@ -4879,7 +4879,11 @@ void call_variants(
                             ", which traverses the site (" + cn_method_name(e.cn_method) +
                             " route); a traversing haplotype must always have a measured CN");
                     }
-                    row << cit->second;
+                    // A module record's non-carrier (its module changes by under --min-sv-bp, or a larger event of
+                    // its own holds its copy change) reads the reference's count: its change is in its own events,
+                    // and a dosage read off CN would count it twice. CNBP stays as measured.
+                    const std::size_t cn_out = is_module_cn(e.cn_method) && !carrier ? e.ref_cn : cit->second;
+                    row << cn_out;
                     const long long this_cnbp = sample_cnbp(s);
                     row << ':' << this_cnbp;
                     // CNRESID: the change in bases that whole copies do not explain, (CN-REF_CN) copies
@@ -4887,7 +4891,7 @@ void call_variants(
                     // also holds the size difference of copies of another type than the reference's.
                     if ((e.cn_method == CnMethod::Unit || e.cn_method == CnMethod::Module) && e.ru_len > 0) {
                         const long long predicted =
-                            (static_cast<long long>(cit->second) - static_cast<long long>(e.ref_cn)) *
+                            (static_cast<long long>(cn_out) - static_cast<long long>(e.ref_cn)) *
                             static_cast<long long>(e.ru_len);
                         row << ':' << (this_cnbp - predicted);
                     }
