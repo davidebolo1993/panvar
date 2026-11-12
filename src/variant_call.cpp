@@ -3809,10 +3809,11 @@ void call_variants(
         //   - Up to |copy change| units, each the one fitting a whole number of the copies still
         //     unexplained best, between half of its share and all of the change (+25%).
         //   - A carrier whose copy change lies inside a larger anchor-holding event of its own is that
-        //     event's carrier: it leaves the DUP (GT 0, CN kept), and a DUP left with no carrier goes.
+        //     event's carrier: it leaves the DUP (GT 0, CN written as REF_CN, as that event holds its change),
+        //     and a DUP left with no carrier goes.
         //   - Only against DUPs that survive the tangle/oversize gate, so a suppressed DUP does not take
         //     its events with it.
-        // CN and CNBP are untouched.
+        // The measured CN and CNBP are untouched; a non-carrier's FORMAT/CN is set where the record is written.
         if (options.cn) {
             std::unordered_map<std::string, std::size_t> s2a;
             for (std::size_t ai = 0; ai < alleles.size(); ++ai)
@@ -4006,8 +4007,8 @@ void call_variants(
                         if (any) break;
                     }
                 }
-                // module carriers whose copy change another event of theirs describes: GT 0, CN kept; a record left
-                // with no carrier goes
+                // module carriers whose copy change another event of theirs describes: GT 0 (CN written as REF_CN);
+                // a record left with no carrier goes
                 for (const std::size_t di : mds) {
                     if (not_cn[di].empty()) continue;
                     std::vector<std::string> nc;
@@ -4175,6 +4176,36 @@ void call_variants(
             }
 
         if (merged.empty()) return;   // the dropped modules' genes are queued above
+
+        // A module record's non-carriers whose change a kept record of their own holds: their event there
+        // (their own, else the record's) is on the module's anchor or copy nodes. They read REF_CN, so a
+        // dosage read off CN does not count the change twice; a non-carrier whose change no record holds keeps
+        // the copies its walk holds.
+        std::unordered_map<const MergedRecord*, std::unordered_set<std::string>> cn_held;
+        for (const MergedRecord& d : merged) {
+            if (!is_module_cn(d.seed.cn_method) || d.seed.type != EvType::Dup) continue;
+            const std::unordered_set<std::string> car(d.carriers.begin(), d.carriers.end());
+            const auto on_module = [&](const std::vector<std::string>& nodes) {
+                for (const std::string& n : nodes)
+                    if (d.anchor_nodes.count(n) || d.module_nodes.count(n)) return true;
+                return false;
+            };
+            for (const MergedRecord& r : merged) {
+                if (&r == &d || r.seed.type == EvType::Dup) continue;
+                for (const std::string& m : r.carriers) {
+                    if (car.count(m) || cn_held[&d].count(m)) continue;
+                    bool held = false;
+                    const auto ait = sample_to_allele.find(m);
+                    const auto me = ait == sample_to_allele.end() ? r.member_event.end() : r.member_event.find(ait->second);
+                    if (me != r.member_event.end()) {
+                        for (const Event& ev : me->second) held = held || on_module(ev.nodes);
+                    } else {
+                        held = on_module(r.seed.nodes);
+                    }
+                    if (held) cn_held[&d].insert(m);
+                }
+            }
+        }
 
         for (const MergedRecord& mr : merged) {
             const Event& e = mr.seed;
@@ -4879,10 +4910,11 @@ void call_variants(
                             ", which traverses the site (" + cn_method_name(e.cn_method) +
                             " route); a traversing haplotype must always have a measured CN");
                     }
-                    // A module record's non-carrier (its module changes by under --min-sv-bp, or a larger event of
-                    // its own holds its copy change) reads the reference's count: its change is in its own events,
-                    // and a dosage read off CN would count it twice. CNBP stays as measured.
-                    const std::size_t cn_out = is_module_cn(e.cn_method) && !carrier ? e.ref_cn : cit->second;
+                    // A module record's non-carrier whose change a kept record of its own holds (cn_held) reads
+                    // the reference's count, so a dosage read off CN does not count it twice. CNBP stays as measured.
+                    const auto held = cn_held.find(&mr);
+                    const std::size_t cn_out = is_module_cn(e.cn_method) && !carrier && held != cn_held.end() &&
+                                               held->second.count(s) ? e.ref_cn : cit->second;
                     row << cn_out;
                     const long long this_cnbp = sample_cnbp(s);
                     row << ':' << this_cnbp;

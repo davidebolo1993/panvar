@@ -902,6 +902,31 @@ modlow=$(awk -F'\t' '/^#CHROM/{for(i=10;i<=NF;i++) if($i=="htest#1#chr1") c=i}
 [ "$modlow" = "SVTYPE=CNV:0:2 SVTYPE=DEL:1:. " ] \
   && ok "MODULE: a copy change under --min-sv-bp is no carrier, reads REF_CN and keeps its own 100 bp deletion" \
   || bad "MODULE non-carrier: records 'SVTYPE:GT:CN' for htest are '$modlow', expected 'SVTYPE=CNV:0:2 SVTYPE=DEL:1:. '"
+# gt_cn <vcf> <sample> <svtype>: that sample's GT:CN on the first record of the type
+gt_cn() { awk -F'\t' -v s="$2" -v t="$3" '/^#CHROM/{for(i=10;i<=NF;i++) if($i==s) c=i}
+  !/^#/ && $8 ~ ("SVTYPE="t";") {split($c,g,":"); print g[1]":"g[2]; exit}' "$1"; }
+# htest's second a2 is replaced by q, a copy of a2 with 2 bases changed: one copy fewer at the anchor (CN 1) and
+# a module change under --min-sv-bp, but no record of its own holds that change, so CN stays as measured.
+sed -e 's/^P htest#1#chr1 .*/P htest#1#chr1 L+,A3+,A2+,S+,A3+,Q+,X+,R+/' -e 's/^N A2 40 83$/N A2 40 83\nN Q @A2:2:7/' \
+  "$OUT/modlow.spec" > "$OUT/modpara.spec"
+python3 -I "$(cd "$(dirname "$0")/.." && pwd)/tools/spec_gfa.py" "$OUT/modpara.spec" "$OUT/modpara"
+cn_call "$OUT/modpara/g.gfa" "$OUT/modpara"
+check "MODULE non-carrier whose change no record holds keeps its measured CN (GT:CN, records)" \
+  "$(gt_cn "$OUT/modpara.region.vcf" 'htest#1#chr1' CNV) $(grep -vc '^#' "$OUT/modpara.region.vcf")" "0:1 1"
+# hbig deletes the second copy and x after it, 120 bp: a carrier of one copy fewer whose loss lies inside a larger
+# deletion of its own is that deletion's carrier; the module record reads REF_CN for it.
+sed 's/^P htest#1#chr1 .*/P hbig#1#chr1 L+,A3+,A2+,S+,R+/' "$OUT/modlow.spec" > "$OUT/modbig.spec"
+python3 -I "$(cd "$(dirname "$0")/.." && pwd)/tools/spec_gfa.py" "$OUT/modbig.spec" "$OUT/modbig"
+cn_call "$OUT/modbig/g.gfa" "$OUT/modbig"
+check "MODULE carrier given up to a larger deletion of its own reads REF_CN (CNV GT:CN, DEL GT)" \
+  "$(gt_cn "$OUT/modbig.region.vcf" 'hbig#1#chr1' CNV) $(gt_cn "$OUT/modbig.region.vcf" 'hbig#1#chr1' DEL | cut -d: -f1)" "0:2 1"
+# --diploid: sample s1 holds a carrier (one copy lost) and a non-carrier whose own deletion holds its change.
+sed -e 's/^P hfull#1#chr1 /P s1#1#chr1 /' -e 's/^P htest#1#chr1 /P s1#2#chr1 /' "$OUT/modlow.spec" > "$OUT/moddip.spec"
+python3 -I "$(cd "$(dirname "$0")/.." && pwd)/tools/spec_gfa.py" "$OUT/moddip.spec" "$OUT/moddip"
+"$BIN" bubble -i "$OUT/moddip/g.gfa" -r ref --min-variant-bp 0 -o "$OUT/moddip.b" --merge-nearby-bp 0 --quiet >/dev/null 2>&1
+"$BIN" call -i "$OUT/moddip.b.sorted.gfa" --bubble-prefix "$OUT/moddip.b" -r ref -o "$OUT/moddip" --cn --diploid --quiet >/dev/null 2>&1
+check "--diploid: one carrier and one non-carrier holding its change (s1 GT:CN:CNBP:CNRESID:HCN)" \
+  "$(awk -F'\t' '/^#CHROM/{for(i=10;i<=NF;i++) if($i=="s1") c=i} !/^#/ && /SVTYPE=CNV;/{print $c; exit}' "$OUT/moddip.region.vcf")" "1|0:3:-140:-60:1|2"
 # The carrier hfull's own deletion of one copy is its copy change: it stays off the deletion record.
 modfull=$(awk -F'\t' '/^#CHROM/{for(i=10;i<=NF;i++) if($i=="hfull#1#chr1") c=i}
   !/^#/ && $8 ~ /SVTYPE=DEL;/ {split($c,g,":"); n=split($8,f,";"); for(i=1;i<=n;i++) if(f[i] ~ /^(AC|NMERGED)=/) printf "%s ", f[i]; printf "hfull:%s", g[1]}' "$V")

@@ -95,7 +95,7 @@ VCF 4.2. `POS` is the base before the event, `END` its last reference base. `GT`
 | `NMERGED`, `SVLEN_RANGE`, `MERGE_*` | how many carriers were merged and how much they differ |
 | `GENES` | with `--gtf`: genes over the record; inside a copy of a `MODULE` site holding several genes, the paralogs its carriers hold |
 
-`FORMAT`: `GT`, `CN` (`.` except on a `CNV`; on a `MODULE` record a haplotype that is no carrier reads `REF_CN`, as its change is in its own records and a dosage read off `CN` would count it twice); on a `CNV` also `CNBP` and `CNRESID`, and on a `UNIT` record `CNINV`: copies in the opposite orientation to the reference's copy (with no reference copy, to the orientation most haplotypes' copies take). A gain with more such copies than the reference has is flagged `INVDUP`; with no reference copy, only a haplotype holding a copy and its reverse complement is. The full list is in the VCF header.
+`FORMAT`: `GT`, `CN` (`.` except on a `CNV`; on a `MODULE` record a haplotype that is no carrier, but whose change a record of its own holds, reads `REF_CN`, as a dosage read off `CN` would otherwise count it twice); on a `CNV` also `CNBP` and `CNRESID`, and on a `UNIT` record `CNINV`: copies in the opposite orientation to the reference's copy (with no reference copy, to the orientation most haplotypes' copies take). A gain with more such copies than the reference has is flagged `INVDUP`; with no reference copy, only a haplotype holding a copy and its reverse complement is. The full list is in the VCF header.
 
 `carrier_events.tsv`, one row per record and event; carriers holding the same event share a row:
 
@@ -115,7 +115,7 @@ VCF 4.2. `POS` is the base before the event, `END` its last reference base. `GT`
 |--------|---------|
 | `bubble_id`, `variant_id` | the site and its `CNV` record (`.` for a module with no record) |
 | `sample`, `genes`, `gene_id` | the haplotype, the gene's name and its id |
-| `cn` | the gene's copy number on this haplotype |
+| `cn` | the gene's copy number on this haplotype, from the copies it holds (as is the module's total): for a haplotype that is no carrier of the site's record it can differ from the VCF's `CN`, which is then `REF_CN` |
 | `reliable` | 1 when backed by the haplotype's k-mers, or for a site's only gene; 0 when it is counted past the module's total or cannot be told apart from its paralogs, and `cn` is then the module's total |
 | `dosage`, `hits`, `priv_kmers` | `hits` / `priv_kmers`: the gene's private 31-mers found in the haplotype, over how many it has |
 | `copies` | copies found by aligning the whole gene, where they could raise `cn` |
