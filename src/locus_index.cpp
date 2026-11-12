@@ -503,22 +503,41 @@ std::vector<LocusIndex> build(const BuildOptions& o) {
     }
 
     // pieces: a genome whose copy of a locus is broken (a copy reaching a contig end, more than one copy, or
-    // none) may hold more of it out of the anchors' reach, such as a tandem array cut by a contig break. It is
-    // scanned for stretches dense in the locus's k-mers: their k-mers off the located copies are subtracted,
-    // and those in a copy's uncertain ends are the locus, so no longer uncertain.
+    // none) may hold more of it out of the anchors' reach, such as a tandem array cut by a contig break; a copy
+    // with an end estimated from the reference (no flank anchor where expected, as past an array longer than
+    // the reference's) may go on past that end on its contig. The genome, or that contig, is scanned for
+    // stretches dense in the locus's k-mers: their k-mers off the located copies are subtracted, and those in
+    // a copy's uncertain ends are the locus, so no longer uncertain.
     {
-        std::map<std::string, std::vector<std::size_t>> scan_loci;   // genome -> the loci broken in it
-        for (const auto& [gname, ge] : genomes) {
+        struct Need {
+            std::vector<std::size_t> whole;                               // loci looked for in every contig
+            std::map<std::string, std::vector<std::size_t>> contigs;     // contig -> loci looked for in it
+            std::map<std::string, std::uint64_t> lengths;
+        };
+        std::map<std::string, Need> scan_loci;
+        for (const auto& g : genomes) {
+            const std::string& gname = g.first;
             if (gname == cref) continue;
             for (std::size_t li = 0; li < work.size(); ++li) {
                 const auto it = work[li].spans.find(gname);
                 if (it == work[li].spans.end() || it->second.size() > 1 ||
-                    std::any_of(it->second.begin(), it->second.end(), [](const anchors::Span& sp) { return sp.open; }))
-                    scan_loci[gname].push_back(li);
+                    std::any_of(it->second.begin(), it->second.end(), [](const anchors::Span& sp) { return sp.open; })) {
+                    scan_loci[gname].whole.push_back(li);
+                    continue;
+                }
+                for (const auto& sp : it->second)
+                    if (sp.estimated) {
+                        Need& nd = scan_loci[gname];
+                        nd.contigs[sp.contig].push_back(li);
+                        nd.lengths[sp.contig] = sp.contig_length;
+                    }
             }
         }
         std::vector<char> wanted(work.size(), 0);
-        for (const auto& [gname, ls] : scan_loci) for (const std::size_t li : ls) wanted[li] = 1;
+        for (const auto& e : scan_loci) {
+            for (const std::size_t li : e.second.whole) wanted[li] = 1;
+            for (const auto& c : e.second.contigs) for (const std::size_t li : c.second) wanted[li] = 1;
+        }
         FlatMap<std::uint32_t> lk;                       // locus k-mer -> an entry of lk_owners, the loci holding it
         std::vector<std::vector<std::uint32_t>> lk_owners;
         {
@@ -538,111 +557,128 @@ std::vector<LocusIndex> build(const BuildOptions& o) {
         const std::size_t need = static_cast<std::size_t>(std::ceil(kPieceDensity * static_cast<double>(kPieceWindow)));
         std::vector<std::set<std::string>> piece_genomes(work.size());
         std::vector<std::size_t> scanned_for(work.size(), 0);
+        auto scan = [&](const std::string& gname, const std::string& name, const std::string& seq, const std::vector<char>& here) {
+            if (seq.size() < kPieceWindow + kK - 1) return;
+            // each locus's k-mer starts on the contig, in order: ranges scanned in parallel, joined in order
+            const std::size_t starts = seq.size() - kK + 1;
+            const std::size_t parts = std::min<std::size_t>(threads, std::max<std::size_t>(1, starts / 65536));
+            std::vector<std::vector<std::vector<std::uint64_t>>> part_hits(parts, std::vector<std::vector<std::uint64_t>>(work.size()));
+            auto scan_part = [&](std::size_t p) {
+                const std::size_t a = starts * p / parts, b = starts * (p + 1) / parts;
+                if (b <= a) return;
+                kmer::for_each_canonical_kmer(seq.data() + a, b - a + kK - 1, kK, [&](std::uint64_t c, std::size_t off, bool) {
+                    const std::uint32_t* id = lk.find(c);
+                    if (id == nullptr) return;
+                    for (const std::uint32_t li : lk_owners[*id]) if (here[li]) part_hits[p][li].push_back(a + off);
+                });
+            };
+            std::vector<std::thread> pool;
+            for (std::size_t p = 1; p < parts; ++p) pool.emplace_back(scan_part, p);
+            scan_part(0);
+            for (auto& t : pool) t.join();
+            for (std::size_t li = 0; li < work.size(); ++li) {
+                if (!here[li]) continue;
+                std::vector<std::uint64_t> hits;
+                for (std::size_t p = 0; p < parts; ++p) hits.insert(hits.end(), part_hits[p][li].begin(), part_hits[p][li].end());
+                if (hits.size() < need) continue;
+                // dense stretches: the union of the windows of kPieceWindow k-mer starts holding enough of them
+                std::vector<std::pair<std::uint64_t, std::uint64_t>> dense;
+                for (std::size_t i = 0, j = 0; i < hits.size(); ++i) {
+                    if (j < i) j = i;
+                    while (j < hits.size() && hits[j] < hits[i] + kPieceWindow) ++j;
+                    if (j - i < need) continue;
+                    const std::uint64_t ws = hits[i], we = hits[j - 1] + kK;
+                    if (!dense.empty() && ws <= dense.back().second) dense.back().second = std::max(dense.back().second, we);
+                    else dense.emplace_back(ws, we);
+                }
+                LocusWork& w = work[li];
+                std::vector<const anchors::Span*> own;   // the located copies on this contig
+                const auto it = w.spans.find(gname);
+                if (it != w.spans.end()) for (const auto& sp : it->second) if (sp.contig == name) own.push_back(&sp);
+                for (const auto& stretch : dense) {
+                    const std::uint64_t a = stretch.first, b = stretch.second;
+                    // the stretch off the copies, as pieces overlapping a neighbouring copy by k - 1 bases: a k-mer
+                    // lies wholly in exactly one copy or piece
+                    std::vector<std::pair<std::uint64_t, std::uint64_t>> off{{a, b}};
+                    for (const anchors::Span* sp : own) {
+                        std::vector<std::pair<std::uint64_t, std::uint64_t>> next;
+                        for (const auto& x : off) {
+                            if (sp->end <= x.first || sp->start >= x.second) { next.push_back(x); continue; }
+                            if (x.first < sp->start) next.emplace_back(x.first, std::min(x.second, sp->start + kK - 1));
+                            if (sp->end < x.second) next.emplace_back(std::max(x.first, sp->end - (kK - 1)), x.second);
+                        }
+                        off = std::move(next);
+                    }
+                    std::vector<std::uint64_t> found(off.size(), 0);
+                    kmer::for_each_canonical_kmer(seq.data() + a, b - a, kK, [&](std::uint64_t c, std::size_t at, bool) {
+                        const std::int64_t i = w.idx.find(c);
+                        if (i < 0) return;
+                        const std::uint64_t pos = a + at;
+                        for (const anchors::Span* sp : own)
+                            if (pos >= sp->start && pos + kK <= sp->end) {   // counted with its copy
+                                if (pos < sp->inner_start || pos + kK > sp->inner_end) ++w.sub_trim[i];
+                                return;
+                            }
+                        ++w.sub[i];
+                        ++w.sub_trim[i];
+                        for (std::size_t k = 0; k < off.size(); ++k)
+                            if (pos >= off[k].first && pos + kK <= off[k].second) { ++found[k]; break; }
+                    });
+                    for (std::size_t k = 0; k < off.size(); ++k) {
+                        if (found[k] == 0) continue;
+                        w.idx.spans.push_back({gname, name, off[k].first, off[k].second, true, found[k], true});
+                        piece_genomes[li].insert(gname);
+                    }
+                }
+            }
+        };
         for (const auto& entry : scan_loci) {
             const std::string& gname = entry.first;
-            const std::vector<std::size_t>& loci_here = entry.second;
+            const Need& nd = entry.second;
             const bg::Genome& ge = genomes.at(gname);
-            if (is_gfa_file(ge.path)) { log("note: genome: " + gname + "; a graph: not scanned for pieces of a broken locus copy"); continue; }
+            if (is_gfa_file(ge.path)) { log("note: genome: " + gname + "; a graph: not scanned for pieces of a locus"); continue; }
             check_unchanged(ge);
-            std::vector<char> here(work.size(), 0);
-            for (const std::size_t li : loci_here) { here[li] = 1; ++scanned_for[li]; }
-            GzLineReader in(ge.path);
-            if (!in.ok()) throw std::runtime_error("recruit: cannot read " + ge.path);
-            std::string line, name, seq;
-            auto scan = [&] {
-                if (seq.size() < kPieceWindow + kK - 1) return;
-                // each locus's k-mer starts on the contig, in order: ranges scanned in parallel, joined in order
-                const std::size_t starts = seq.size() - kK + 1;
-                const std::size_t parts = std::min<std::size_t>(threads, std::max<std::size_t>(1, starts / 65536));
-                std::vector<std::vector<std::vector<std::uint64_t>>> part_hits(parts, std::vector<std::vector<std::uint64_t>>(work.size()));
-                auto scan_part = [&](std::size_t p) {
-                    const std::size_t a = starts * p / parts, b = starts * (p + 1) / parts;
-                    if (b <= a) return;
-                    kmer::for_each_canonical_kmer(seq.data() + a, b - a + kK - 1, kK, [&](std::uint64_t c, std::size_t off, bool) {
-                        const std::uint32_t* id = lk.find(c);
-                        if (id == nullptr) return;
-                        for (const std::uint32_t li : lk_owners[*id]) if (here[li]) part_hits[p][li].push_back(a + off);
-                    });
-                };
-                std::vector<std::thread> pool;
-                for (std::size_t p = 1; p < parts; ++p) pool.emplace_back(scan_part, p);
-                scan_part(0);
-                for (auto& t : pool) t.join();
-                for (std::size_t li = 0; li < work.size(); ++li) {
-                    if (!here[li]) continue;
-                    std::vector<std::uint64_t> hits;
-                    for (std::size_t p = 0; p < parts; ++p) hits.insert(hits.end(), part_hits[p][li].begin(), part_hits[p][li].end());
-                    if (hits.size() < need) continue;
-                    // dense stretches: the union of the windows of kPieceWindow k-mer starts holding enough of them
-                    std::vector<std::pair<std::uint64_t, std::uint64_t>> dense;
-                    for (std::size_t i = 0, j = 0; i < hits.size(); ++i) {
-                        if (j < i) j = i;
-                        while (j < hits.size() && hits[j] < hits[i] + kPieceWindow) ++j;
-                        if (j - i < need) continue;
-                        const std::uint64_t ws = hits[i], we = hits[j - 1] + kK;
-                        if (!dense.empty() && ws <= dense.back().second) dense.back().second = std::max(dense.back().second, we);
-                        else dense.emplace_back(ws, we);
-                    }
-                    LocusWork& w = work[li];
-                    std::vector<const anchors::Span*> own;   // the located copies on this contig
-                    const auto it = w.spans.find(gname);
-                    if (it != w.spans.end()) for (const auto& sp : it->second) if (sp.contig == name) own.push_back(&sp);
-                    for (const auto& stretch : dense) {
-                        const std::uint64_t a = stretch.first, b = stretch.second;
-                        // the stretch off the copies, as pieces overlapping a neighbouring copy by k - 1 bases: a k-mer
-                        // lies wholly in exactly one copy or piece
-                        std::vector<std::pair<std::uint64_t, std::uint64_t>> off{{a, b}};
-                        for (const anchors::Span* sp : own) {
-                            std::vector<std::pair<std::uint64_t, std::uint64_t>> next;
-                            for (const auto& x : off) {
-                                if (sp->end <= x.first || sp->start >= x.second) { next.push_back(x); continue; }
-                                if (x.first < sp->start) next.emplace_back(x.first, std::min(x.second, sp->start + kK - 1));
-                                if (sp->end < x.second) next.emplace_back(std::max(x.first, sp->end - (kK - 1)), x.second);
-                            }
-                            off = std::move(next);
-                        }
-                        std::vector<std::uint64_t> found(off.size(), 0);
-                        kmer::for_each_canonical_kmer(seq.data() + a, b - a, kK, [&](std::uint64_t c, std::size_t at, bool) {
-                            const std::int64_t i = w.idx.find(c);
-                            if (i < 0) return;
-                            const std::uint64_t pos = a + at;
-                            for (const anchors::Span* sp : own)
-                                if (pos >= sp->start && pos + kK <= sp->end) {   // counted with its copy
-                                    if (pos < sp->inner_start || pos + kK > sp->inner_end) ++w.sub_trim[i];
-                                    return;
-                                }
-                            ++w.sub[i];
-                            ++w.sub_trim[i];
-                            for (std::size_t k = 0; k < off.size(); ++k)
-                                if (pos >= off[k].first && pos + kK <= off[k].second) { ++found[k]; break; }
-                        });
-                        for (std::size_t k = 0; k < off.size(); ++k) {
-                            if (found[k] == 0) continue;
-                            w.idx.spans.push_back({gname, name, off[k].first, off[k].second, true, found[k], true});
-                            piece_genomes[li].insert(gname);
-                        }
-                    }
-                }
+            std::vector<char> counted(work.size(), 0);
+            for (const std::size_t li : nd.whole) counted[li] = 1;
+            for (const auto& c : nd.contigs) for (const std::size_t li : c.second) counted[li] = 1;
+            for (std::size_t li = 0; li < work.size(); ++li) scanned_for[li] += counted[li];
+            auto here_for = [&](const std::string& contig) {
+                std::vector<char> h(work.size(), 0);
+                for (const std::size_t li : nd.whole) h[li] = 1;
+                const auto it = nd.contigs.find(contig);
+                if (it != nd.contigs.end()) for (const std::size_t li : it->second) h[li] = 1;
+                return h;
             };
-            while (in.getline(line)) {
-                if (line.empty()) continue;
-                if (line[0] == '>') {
-                    scan();
-                    const auto sp = line.find_first_of(" \t");
-                    name = line.substr(1, sp == std::string::npos ? std::string::npos : sp - 1);
-                    seq.clear();
-                    continue;
+            if (!nd.whole.empty()) {
+                GzLineReader in(ge.path);
+                if (!in.ok()) throw std::runtime_error("recruit: cannot read " + ge.path);
+                std::string line, name, seq;
+                while (in.getline(line)) {
+                    if (line.empty()) continue;
+                    if (line[0] == '>') {
+                        if (!name.empty()) scan(gname, name, seq, here_for(name));
+                        const auto sp = line.find_first_of(" \t");
+                        name = line.substr(1, sp == std::string::npos ? std::string::npos : sp - 1);
+                        seq.clear();
+                        continue;
+                    }
+                    seq += line;
                 }
-                seq += line;
+                if (!name.empty()) scan(gname, name, seq, here_for(name));
+                log("pieces: genome scanned: " + gname);
+            } else {
+                std::vector<fasta::Interval> iv;
+                for (const auto& c : nd.contigs) iv.push_back({c.first, 0, nd.lengths.at(c.first)});
+                const std::vector<std::string> seqs = fasta::fetch_intervals(ge.path, iv);
+                for (std::size_t k = 0; k < iv.size(); ++k) scan(gname, iv[k].contig, seqs[k], here_for(iv[k].contig));
+                log("pieces: contigs scanned: " + gname + " (" + std::to_string(iv.size()) + ")");
             }
-            scan();
-            log("pieces: genome scanned: " + gname);
         }
         for (std::size_t li = 0; li < work.size(); ++li) {
             if (scanned_for[li] == 0) continue;
             std::uint64_t n = 0, bp = 0;
             for (const auto& sp : work[li].idx.spans) if (sp.piece) { ++n; bp += sp.end - sp.start; }
-            log("locus: " + work[li].idx.name + "; genomes with a broken copy: " + std::to_string(scanned_for[li]) + "; pieces: " + std::to_string(n) +
+            log("locus: " + work[li].idx.name + "; genomes scanned for pieces: " + std::to_string(scanned_for[li]) + "; pieces: " + std::to_string(n) +
                 " (" + std::to_string(bp) + " bp) in " + std::to_string(piece_genomes[li].size()) + " genomes");
         }
     }

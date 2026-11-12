@@ -82,3 +82,19 @@ with open(os.path.join(split, "locus.gfa"), "w") as f:
     f.write(f"S\t1\t{ref2[ls2:le2]}\nS\t2\t{hap_s}\n")
     f.write(f"P\tref#1#chr1:{ls2}-{le2}\t1+\t*\n")
     f.write(f"P\tgs#1#chr1:{ls2}-{ls2 + len(hap_s)}\t2+\t*\n")
+
+# split_t/: a locus ending in its array, and a genome with a much longer array on one contig: no inside
+# anchor follows the array and the flank sits too far past it, so the copy's end is estimated and stops
+# inside the array; the rest of the array, on the same contig, must be found as a piece
+left_t = seq(20000)
+ref_t = seq(120000) + left_t + array(4) + seq(120000)
+le_t = 120000 + len(left_t) + 4 * 5500
+hap_t = left_t + array(16)
+os.makedirs(os.path.join(out, "split_t"), exist_ok=True)
+write("split_t/ref", [("chr1", ref_t)])
+write("split_t/gl", [("chr1", ref_t[:120000] + hap_t + ref_t[le_t:])])
+with open(os.path.join(out, "split_t", "locus.gfa"), "w") as f:
+    f.write("H\tVN:Z:1.0\n")
+    f.write(f"S\t1\t{ref_t[120000:le_t]}\nS\t2\t{hap_t}\n")
+    f.write(f"P\tref#1#chr1:120000-{le_t}\t1+\t*\n")
+    f.write(f"P\tgl#1#chr1:120000-{120000 + len(hap_t)}\t2+\t*\n")

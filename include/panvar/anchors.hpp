@@ -129,6 +129,9 @@ struct Span {
     std::uint64_t inner_start = 0, inner_end = 0;   // the stretch between the outermost inside anchors (the span
                                                     // itself when the interval has none)
     bool open = false;                   // reaches a contig end: the copy may go on elsewhere in the genome
+    bool estimated = false;              // an end placed by the reference's distance, no flank anchor where expected:
+                                         // the copy may go on past it on its contig
+    std::uint64_t contig_length = 0;
 };
 
 struct LocateOptions {

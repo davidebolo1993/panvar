@@ -550,6 +550,7 @@ std::vector<Span> locate(const ReferenceAnchors& ref, const std::vector<const Se
                     // the copy on the genome, in reference terms: left = reference start side
                     std::uint64_t lo, hi, ilo, ihi;
                     auto gpos = [&](std::size_t j) { return pts[j].pos; };
+                    bool estimated = false;
                     auto extend = [&](std::size_t inner, std::size_t flank_j, std::uint64_t ref_boundary, bool left) {
                         // genome position bounding the copy on the reference's `left` side
                         const std::uint64_t ref_gap = left ? pts[inner].ref_pos - pts[flank_j == SIZE_MAX ? inner : flank_j].ref_pos
@@ -559,6 +560,7 @@ std::vector<Span> locate(const ReferenceAnchors& ref, const std::vector<const Se
                             if (g_gap <= ref_gap + ref_gap / 2 + kExtendSlack) return gpos(flank_j);
                         }
                         // no trustworthy flank: extend by the reference's distance to the interval boundary
+                        estimated = true;
                         const std::uint64_t d = left ? (pts[inner].ref_pos > ref_boundary ? pts[inner].ref_pos - ref_boundary : 0)
                                                      : (ref_boundary > pts[inner].ref_pos + kK ? ref_boundary - pts[inner].ref_pos - kK : 0);
                         const bool towards_lower = left == same;   // on the genome, the reference's left is lower when same strand
@@ -588,7 +590,9 @@ std::vector<Span> locate(const ReferenceAnchors& ref, const std::vector<const Se
                     sp.anchors_flank = flanks;
                     sp.inner_start = ilo;
                     sp.inner_end = std::min(ihi + kK, sp.end);
-                    sp.open = lo == 0 || sp.end >= sa.contig_length(g, key.first);
+                    sp.contig_length = sa.contig_length(g, key.first);
+                    sp.open = lo == 0 || sp.end >= sp.contig_length;
+                    sp.estimated = estimated;
                     spans.push_back(sp);
                 }
             }
@@ -603,6 +607,7 @@ std::vector<Span> locate(const ReferenceAnchors& ref, const std::vector<const Se
                     j.inner_start = std::min(j.inner_start, sp.inner_start);
                     j.inner_end = std::max(j.inner_end, sp.inner_end);
                     j.open = j.open || sp.open;
+                    j.estimated = j.estimated || sp.estimated;
                     j.anchors_inside += sp.anchors_inside;
                     j.anchors_flank += sp.anchors_flank;
                     j.chains += sp.chains;

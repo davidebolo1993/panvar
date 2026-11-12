@@ -72,6 +72,11 @@ check "the array's k-mers stay private, none demoted at the copies' ends" '[[ $(
 "$BIN" recruit -t 2 -q --background s_split_p -r ref --index-only --save-index idx_split_p --locus data/split/locus.gfa; rc=$?
 "$BIN" recruit --dump-index idx_split_p/locus.plx=dump_split_p.tsv
 check "a paralogous array is not a piece; its k-mers count outside" '[[ $rc -eq 0 && "$(pieces idx_split_p/locus.index.tsv)" == "gs:x:0-17700 " ]] && python3 "$TOOLS/locus_outside.py" idx_split_p/locus.index.tsv dump_split_p.tsv 8 data/split/ref.fa data/split/gs.fa data/split/gp.fa > brute_split_p.txt && awk -F"\t" '"'"'NR>1 && $2=="S" && $4>=3 {n++} END {exit !(n>5000)}'"'"' dump_split_p.tsv'
+# a much longer array on one contig: the copy's end is estimated and stops inside it; the contig is scanned
+"$BIN" background -t 2 --partitions 64 --memory 64M -q --tmp-dir "$OUT/tmp" -o s_tail --genome ref=data/split_t/ref.fa --genome gl=data/split_t/gl.fa --coordinate-reference ref
+"$BIN" recruit -t 2 -q --background s_tail -r ref --index-only --save-index idx_tail --locus data/split_t/locus.gfa; rc=$?
+"$BIN" recruit --dump-index idx_tail/locus.plx=dump_tail.tsv
+check "an array past a copy's estimated end is found on its contig ($(pieces idx_tail/locus.index.tsv))" '[[ $rc -eq 0 && "$(pieces idx_tail/locus.index.tsv)" == "gl:chr1:161970-228000 " ]] && python3 "$TOOLS/locus_outside.py" idx_tail/locus.index.tsv dump_tail.tsv 8 data/split_t/ref.fa data/split_t/gl.fa > brute_tail.txt && awk -F"\t" '"'"'NR>1 && $2!="D" && $4>=3 {n++; p+=($2=="P")} END {exit !(n>5000 && p==n)}'"'"' dump_tail.tsv'
 "$BIN" recruit -t 4 -q --background s_split -r ref --index-only --save-index idx_split4 --locus data/split/locus.gfa
 "$BIN" recruit --dump-index idx_split4/locus.plx=dump_split4.tsv
 check "the piece scan on 4 threads gives the same index" 'cmp -s dump_split.tsv dump_split4.tsv'
