@@ -27,7 +27,7 @@ The index, built once per locus graph and kept beside it (`<locus>.plx`, with a 
 
 Reads, per sample:
 
-7. Every read's closed syncmers are looked up in the screens of all loci; a fragment (a pair, or a single read) is scored for each locus whose screen it hits. In a coordinate-sorted file, a read waits for a mate within 100 kb; a read whose mate lies farther is kept only if it hits a screen, and its mate is fetched at the end, through the index or by a second pass.
+7. Every read's closed syncmers are looked up in the screens of all loci; a fragment (a pair, or a single read) is scored for each locus whose screen it hits. In a coordinate-sorted file, a read waits for a mate within 100 kb; a read whose mate lies farther is kept only if it hits a screen, and its mate is fetched at the end, through the index or by a second pass. Mates are fetched in their order on the genome, nearby ones by one query: a CRAM decodes against the reference, and fetching in any other order reloads a reference contig at almost every mate.
 8. Each k-mer of a read is labelled private, shared, repeat, decoy, or neither (a sequencing error or a new allele).
 9. The read's locus segment is its highest-scoring stretch: locus k-mers count +1, decoy k-mers −2, and a run of k-mers in neither table is free for its first 31 k-mers (one differing base makes that many) and costs after them. When the read leaves the locus at its ends (beyond the segment, few locus k-mers), the segment alone is judged; otherwise the whole read is.
 10. Evidence is counted in independent sites: a private (or decoy) k-mer counts only when it starts 31 or more bases after the last one counted, so all k-mers one differing base touches count once. A pair's mates are pooled without counting a site twice.

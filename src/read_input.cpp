@@ -14,6 +14,7 @@
 #include <filesystem>
 #include <stdexcept>
 #include <thread>
+#include <tuple>
 #include <unordered_map>
 
 namespace panvar::recruit {
@@ -291,6 +292,7 @@ public:
 
 private:
     static constexpr std::int64_t kNear = 100000;   // a mate this far ahead is waited for
+    static constexpr std::int64_t kFetchGap = 200000;   // mates this close are fetched by one query
     static constexpr std::size_t kHoldMax = 2000000;  // reads waiting for mates in an unsorted file before going lean
     struct Read {
         std::string seq, qual;
@@ -381,7 +383,7 @@ private:
             else ++st_.unscreened;
             return;
         }
-        const bool near = mate_unplaced || (h.mtid == tid && h.mpos - pos <= kNear);
+        const bool near = mate_unplaced || (h.mtid == tid && h.mpos - pos <= near_);
         if (near) {
             held_.emplace(std::move(name), std::move(h));
         } else if (o_.screened(h.seq)) {
@@ -492,18 +494,47 @@ private:
         HtsFile again(path_, o_, &pool_);
         hts_idx_t* idx = sam_index_load(again.fp, path_.c_str());
         if (idx != nullptr) {
-            for (std::size_t i = 0; i < wanted_.size(); ++i) {
-                const Wanted& w = wanted_[i];
-                if (w.mtid < 0 || w.mpos < 0) continue;
-                hts_itr_t* itr = sam_itr_queryi(idx, w.mtid, w.mpos, w.mpos + 1);
-                if (itr == nullptr) continue;
-                int r;
-                while ((r = sam_itr_next(again.fp, itr, again.rec)) >= 0)
-                    if (again.rec->core.pos == w.mpos && mate_of(again.rec, w)) { found[i] = 1; deliver(w, again.rec); break; }
-                hts_itr_destroy(itr);
-                if (r < -1) { hts_idx_destroy(idx); throw std::runtime_error("recruit: " + path_ + ": cannot read a record while fetching mates"); }
+            // in the mates' order on the genome, nearby mates read by one query: each reference contig is loaded
+            // and each block decoded once (in the order the reads came, a CRAM reloads a contig at almost every mate)
+            std::vector<std::size_t> order;
+            for (std::size_t i = 0; i < wanted_.size(); ++i)
+                if (wanted_[i].mtid >= 0 && wanted_[i].mpos >= 0) order.push_back(i);
+            std::sort(order.begin(), order.end(), [&](std::size_t a, std::size_t b) {
+                return std::tie(wanted_[a].mtid, wanted_[a].mpos, a) < std::tie(wanted_[b].mtid, wanted_[b].mpos, b);
+            });
+            if (o_.log && !order.empty()) o_.log("input: " + path_ + "; mates to fetch through the index: " + std::to_string(order.size()));
+            std::vector<Read> mates(wanted_.size());
+            std::unordered_map<std::string, std::vector<std::size_t>> group;   // a query's wanted reads, by name
+            for (std::size_t a = 0; a < order.size();) {
+                std::size_t b = a + 1;
+                while (b < order.size() && wanted_[order[b]].mtid == wanted_[order[a]].mtid &&
+                       wanted_[order[b]].mpos - wanted_[order[b - 1]].mpos <= kFetchGap)
+                    ++b;
+                group.clear();
+                for (std::size_t k = a; k < b; ++k) group[wanted_[order[k]].name].push_back(order[k]);
+                std::size_t left = b - a;
+                hts_itr_t* itr = sam_itr_queryi(idx, wanted_[order[a]].mtid, wanted_[order[a]].mpos, wanted_[order[b - 1]].mpos + 1);
+                if (itr != nullptr) {
+                    int r = 0;
+                    while (left > 0 && (r = sam_itr_next(again.fp, itr, again.rec)) >= 0) {
+                        const auto it = group.find(bam_get_qname(again.rec));
+                        if (it == group.end()) continue;
+                        for (const std::size_t i : it->second)
+                            if (!found[i] && again.rec->core.pos == wanted_[i].mpos && mate_of(again.rec, wanted_[i])) {
+                                found[i] = 1;
+                                mates[i] = read_of(again.rec);
+                                --left;
+                                break;
+                            }
+                    }
+                    hts_itr_destroy(itr);
+                    if (left > 0 && r < -1) { hts_idx_destroy(idx); throw std::runtime_error("recruit: " + path_ + ": cannot read a record while fetching mates"); }
+                }
+                a = b;
             }
             hts_idx_destroy(idx);
+            for (std::size_t i = 0; i < wanted_.size(); ++i)   // in the order the reads came, as before
+                if (found[i]) deliver(wanted_[i], std::move(mates[i]));
         }
         std::unordered_map<std::string, std::size_t> rest;   // a second pass for mates no index found
         for (std::size_t i = 0; i < wanted_.size(); ++i)
@@ -515,7 +546,7 @@ private:
                 const auto it = rest.find(bam_get_qname(pass.rec));
                 if (it == rest.end() || !mate_of(pass.rec, wanted_[it->second])) continue;
                 found[it->second] = 1;
-                deliver(wanted_[it->second], pass.rec);
+                deliver(wanted_[it->second], read_of(pass.rec));
                 rest.erase(it);
             }
         }
@@ -528,14 +559,14 @@ private:
         wanted_.clear();
     }
 
-    void deliver(const Wanted& w, const bam1_t* mate) {
+    void deliver(const Wanted& w, Read mate) {
         ++st_.fetched;
         if (lean_ && lean_dropped_ > 0) --lean_dropped_;   // the mate fetched was one set aside
         Held h;
         h.seq = w.seq;
         h.qual = w.qual;
         h.read1 = w.read1;
-        pair_up(w.name, std::move(h), read_of(mate), !w.read1);
+        pair_up(w.name, std::move(h), std::move(mate), !w.read1);
     }
 
     void pair_up(std::string name, Held first, Read second, bool read1) {
@@ -566,6 +597,7 @@ private:
     bool coordinate_ = false, eof_ = false, lean_ = false;
     std::uint64_t lean_dropped_ = 0;
     std::size_t hold_max_ = std::getenv("PANVAR_TEST_HOLD_MAX") ? std::strtoull(std::getenv("PANVAR_TEST_HOLD_MAX"), nullptr, 10) : kHoldMax;
+    std::int64_t near_ = std::getenv("PANVAR_TEST_NEAR") ? std::strtoll(std::getenv("PANVAR_TEST_NEAR"), nullptr, 10) : kNear;
     std::int32_t last_tid_ = -2;     // the contig of the last record (sweeps)
     std::int32_t order_tid_ = -1;    // the last placed record's position (the order check)
     std::int64_t order_pos_ = -1;

@@ -77,6 +77,9 @@ if command -v samtools > /dev/null; then
   awk -F'\t' 'BEGIN {OFS = "\t"} !/^@/ && $8 > 150000 {$8 += 7} {print}' coord.sam | samtools view -b -o stale.bam - && samtools index stale.bam
   "$BIN" recruit --locus "$IDX" -i stale.bam -o stale.tsv -t 4 2> stale.log; sorted stale.tsv
   check "stale mate positions: the mates are found by a second pass, same table" 'cmp -s stale.tsv.sorted fq.tsv.sorted && grep -q "not where the index put them" stale.log'
+  # no mate waited for: every pair whose first read misses the screens has its mate fetched, nearby mates by one query
+  PANVAR_TEST_NEAR=0 "$BIN" recruit --locus "$IDX" -i coord.bam -o fetch.tsv -t 4 2> fetch.log; sorted fetch.tsv
+  check "mates fetched through the index by contig and position, several per query: same table ($(grep -o 'mates fetched: [0-9]*' fetch.log))" 'cmp -s fetch.tsv.sorted fq.tsv.sorted && ! grep -q "second pass" fetch.log && [[ $(grep -o "mates fetched: [0-9]*" fetch.log | grep -o "[0-9]*$") -ge 10 ]]'
   for c in chrA chrB; do printf '>%s\n' $c; head -c 20000000 /dev/zero | tr '\0' 'A' | fold -w 60; echo; done > zero.fa
   samtools faidx zero.fa && samtools view -C -T zero.fa -o coord.cram coord.bam 2> /dev/null && samtools index coord.cram
   "$BIN" recruit --locus "$IDX" -i coord.cram --cram-reference zero.fa -o cram.tsv -t 4 -q; sorted cram.tsv
