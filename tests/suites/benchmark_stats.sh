@@ -309,6 +309,32 @@ for n in uflank uedge2; do
   check "$n: an aligned insertion beside the copies is applied once (left:stretch bp of h1)" \
         "$(sv ${n}_B missed_by_call_events):$(awk -F'\t' '$3=="cn" && $11 ~ /h1#/{print $9}' "$OUT/${n}_c.carrier_events.tsv")" "0:52"
 done
+# A 120 bp spacer Z between the copies on one walk only: h1 holds its one copy before Z (sp2) or Z between its
+# copies (sp3), or no copy (sp4). The aligned walks, copies left out, hold Z alike, so no event of h1's has it:
+# its copy stretch must, running between the steps the two walks share, or Z is lost or applied twice.
+cat > "$OUT/sp2.spec" <<'EOF'
+N L 300 101
+N A 100 102
+N U 52 103
+N Z 120 107
+N R 300 105
+P ref#0#chr1:0-976 L+,A+,U+,U+,Z+,U+,R+
+P h1#1#chr1 L+,A+,U+,Z+,R+
+P h2#1#chr1 L+,A+,U+,U+,Z+,U+,R+
+P h3#1#chr1 L+,A+,U+,U+,U+,Z+,U+,R+
+B L R A;U;Z
+EOF
+spec sp2
+sed -e 's/^P ref#0#chr1:0-976 .*/P ref#0#chr1:0-976 L+,A+,Z+,U+,U+,U+,R+/' -e 's/^P h1#1#chr1 .*/P h1#1#chr1 L+,A+,U+,Z+,U+,R+/' \
+    -e 's/^P h2#1#chr1 .*/P h2#1#chr1 L+,A+,Z+,U+,U+,U+,R+/' -e 's/^P h3#1#chr1 .*/P h3#1#chr1 L+,A+,Z+,U+,U+,U+,U+,R+/' \
+    "$OUT/sp2.spec" > "$OUT/sp3.spec"
+spec sp3
+sed 's/^P h1#1#chr1 .*/P h1#1#chr1 L+,A+,Z+,R+/' "$OUT/sp2.spec" > "$OUT/sp4.spec"
+spec sp4
+for n in sp2:172 sp3:224 sp4:120; do
+  check "${n%%:*}: a spacer between copies on one walk is kept once (left:stretch bp of h1)" \
+        "$(sv ${n%%:*}_B missed_by_call_events):$(awk -F'\t' '$3=="cn" && $11 ~ /h1#/{print $9}' "$OUT/${n%%:*}_c.carrier_events.tsv")" "0:${n#*:}"
+done
 # No reference copy: X after the copies (hX), or before them (hY, whose copies call could not place).
 cat > "$OUT/uzero.spec" <<'EOF'
 N S 300 1

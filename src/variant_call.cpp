@@ -5061,8 +5061,17 @@ void call_variants(
                     }
                     // An allele whose events come from aligning its bases has every change beside its copies as
                     // an event of its own, placed by that alignment: its stretch is its copies alone, the first
-                    // copy to the last on each walk, so those bases are not applied twice.
-                    if (allele_seq[ai] && in_ref) {
+                    // copy to the last on each walk, so those bases are not applied twice. The copies left both
+                    // walks before they were aligned, so sequence between copies is in no event: that holds only
+                    // where the two runs hold the same steps between their copies; otherwise the stretch runs
+                    // between the shared steps, as below.
+                    const auto between = [&](const std::vector<PathStep>& w, bool in, std::size_t a, std::size_t b) {
+                        std::vector<std::pair<std::string, bool>> out;
+                        for (std::size_t k = a; in && k <= b; ++k)
+                            if (!cn_nodes.count(w[k].node_id)) out.emplace_back(w[k].node_id, w[k].reverse);
+                        return out;
+                    };
+                    if (allele_seq[ai] && in_ref && between(ref_steps, in_ref, ra, rb) == between(hw, in_hap, ha, hb)) {
                         const auto sp = tok_span(ra, rb);
                         if (sp.first == 0) return unresolved;
                         const std::string alt = !in_hap ? std::string() : fwd(spell_path_steps_sequence(
