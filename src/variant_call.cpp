@@ -3051,6 +3051,7 @@ void call_variants(
         // INS/DEL/INV records (GT . where they carry nothing). One slot per allele, so the parallel
         // writers never share one.
         std::vector<char> allele_unaligned(alleles.size(), 0);
+        std::vector<char> allele_seq(alleles.size(), 0);   // its events come from aligning its bases
         // Blocks too large to align that no base-level comparison of the allele then covered.
         std::vector<std::size_t> allele_skipped_blocks(alleles.size(), 0);
         // Alleles compared by sequence. Each haplotype's interior is aligned to the reference's at base
@@ -3296,6 +3297,7 @@ void call_variants(
                 if (seq_ok && !inv && seq_events(ai, Htok, events, skipped > 0, sev)) {
                     events = std::move(sev);
                     allele_unaligned[ai] = 0;
+                    allele_seq[ai] = 1;
                     allele_skipped_blocks[ai] = 0;
                 }
             }
@@ -5009,8 +5011,19 @@ void call_variants(
                         }
                         wcn = std::to_string(walk_cn);
                     }
-                    // The stretch between the steps the carrier's walk and the reference were matched at on
-                    // either side of the copies, as a node event is written: the carrier's own sequence beside
+                    // An allele whose events come from aligning its bases has every change beside its copies as
+                    // an event of its own, placed by that alignment: its stretch is its copies alone, the first
+                    // copy to the last on each walk, so those bases are not applied twice.
+                    if (allele_seq[ai] && in_ref) {
+                        const auto sp = tok_span(ra, rb);
+                        if (sp.first == 0) return unresolved;
+                        const std::string alt = !in_hap ? std::string() : fwd(spell_path_steps_sequence(
+                            graph, std::vector<PathStep>(hw.begin() + static_cast<std::ptrdiff_t>(ha),
+                                                         hw.begin() + static_cast<std::ptrdiff_t>(hb) + 1)));
+                        return body("cn", sp.first, sp.second, cn, alt, wcn);
+                    }
+                    // Otherwise the stretch between the steps the carrier's walk and the reference were matched at
+                    // on either side of the copies, as a node event is written: the carrier's own sequence beside
                     // or between its copies (an insertion, a deletion of flank) is in it, so whatever order the
                     // walk has them in is what benchmark applies. Its own events inside the stretch are part of
                     // it; benchmark checks the stretch's length against the CN plus those events.

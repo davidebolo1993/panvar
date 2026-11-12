@@ -269,14 +269,12 @@ check "an insertion between a carrier's copies is part of its copy stretch, not 
       "$(sv ubetween_B missed_by_call_events):$(lg ubetween_B "$INSIDE_CN"):$(sv ubetween_B carrier_mismatches)" "0:1:0"
 # An insertion that repeats its neighbours can go in anywhere over its CIPOS, and its listed place can fall
 # on the wrong side of a stretch's edge; the stretch's length says which side it is on. ubedge: hX's
-# stretch holds X, listed past the stretch. uedge: X goes in before the copies (the stretch is the copies
-# alone), listed at the stretch's first base.
+# stretch holds X, listed past the stretch. uedge: X goes in before the copies (an aligned allele's stretch
+# is its copies alone), listed at the stretch's first base.
 sed 's/^P hX.*/P hX#1#chr1 S+,X+,U+,U+,U+,T+/' "$OUT/ubetween.spec" > "$OUT/uedge.spec"
 spec uedge
 awk -F'\t' 'BEGIN{OFS="\t"} $1=="bubble1_INS_X"{$4=422; $5=421} 1' "$OUT/ubetween_c.carrier_events.tsv" > "$OUT/ubedge_c.carrier_events.tsv"
 sed 's/SVTYPE=INS;SVLEN=80;/SVTYPE=INS;SVLEN=80;CIPOS=0,121;/' "$OUT/ubetween_c.region.vcf" > "$OUT/ubedge_c.region.vcf"
-awk -F'\t' 'BEGIN{OFS="\t"} $1=="bubble1_CNV_U" && $11=="hX#1#chr1"{$10=substr($10,81); $9=length($10); $8=$9-120} 1' \
-    "$OUT/uedge_c.carrier_events.tsv" > "$OUT/x.tsv" && mv "$OUT/x.tsv" "$OUT/uedge_c.carrier_events.tsv"
 sed 's/SVTYPE=INS;SVLEN=80;/SVTYPE=INS;SVLEN=80;CIPOS=-5,0;/' "$OUT/uedge_c.region.vcf" > "$OUT/x.vcf" && mv "$OUT/x.vcf" "$OUT/uedge_c.region.vcf"
 for n in ubetween:ubedge uedge:uedge; do
   bm -i "$OUT/${n%%:*}/g.gfa" -c "$OUT/${n%%:*}/g.bubbles.csv" -r 'ref#0#chr1:0-720' --calls "$OUT/${n#*:}_c" \
@@ -286,6 +284,31 @@ check "an ambiguous insertion listed past a stretch that holds it is inside (lef
       "$(sv ubedge_B missed_by_call_events):$(lg ubedge_B "$INSIDE_CN"):$(sv ubedge_B carrier_mismatches)" "0:1:0"
 check "an ambiguous insertion listed at a stretch that lacks it is applied (left:inside:mismatches)" \
       "$(sv uedge_B missed_by_call_events):$(lg uedge_B "$INSIDE_CN"):$(sv uedge_B carrier_mismatches)" "0:0:0"
+# A unit U, three copies on the reference. h1 deletes the last 3 bp of A (node P), keeps the 8 bp node B and
+# inserts a 180 bp X before its one copy. Aligned, the deletion and X are one replacement starting in A,
+# before the copies; its copy stretch is its copies alone, so X is applied once (uflank). In uedge2, h1 keeps
+# A whole: X goes in at the stretch's first base, and the stretch's length says it is beside the copies.
+cat > "$OUT/uflank.spec" <<'EOF'
+N L 300 101
+N A =CGCCTGTACTTCCAACTCCTTTACAGTCTTTCCGCACGTCTGGTTCTCCCGATATCGATGTCCGTCCCTCCTCAACTGCAACATGGGTTCTCGCATCTCC
+N P =CGCCTGTACTTCCAACTCCTTTACAGTCTTTCCGCACGTCTGGTTCTCCCGATATCGATGTCCGTCCCTCCTCAACTGCAACATGGGTTCTCGCATC
+N B 8 106
+N U 52 103
+N X 180 104
+N R 300 105
+P ref#0#chr1:0-864 L+,A+,B+,U+,U+,U+,R+
+P h1#1#chr1 L+,P+,B+,X+,U+,R+
+P h2#1#chr1 L+,A+,B+,U+,U+,U+,R+
+P h3#1#chr1 L+,A+,B+,U+,U+,U+,U+,R+
+B L R A;P;B;U;X
+EOF
+spec uflank
+sed 's/^P h1#1#chr1 L+,P+,/P h1#1#chr1 L+,A+,/' "$OUT/uflank.spec" > "$OUT/uedge2.spec"
+spec uedge2
+for n in uflank uedge2; do
+  check "$n: an aligned insertion beside the copies is applied once (left:stretch bp of h1)" \
+        "$(sv ${n}_B missed_by_call_events):$(awk -F'\t' '$3=="cn" && $11 ~ /h1#/{print $9}' "$OUT/${n}_c.carrier_events.tsv")" "0:52"
+done
 # No reference copy: X after the copies (hX), or before them (hY, whose copies call could not place).
 cat > "$OUT/uzero.spec" <<'EOF'
 N S 300 1

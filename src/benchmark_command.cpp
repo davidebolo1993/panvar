@@ -1204,10 +1204,11 @@ int run_benchmark_command(const std::vector<std::string>& args) {
     for (const CarrierEvent& e : cevents)
         if (e.kind == "unresolved") for (const std::string& h : e.haplotypes) unresolved_of[h].insert(e.variant_id);
 
-    // A carrier's copy-number event is its own stretch between the steps its walk and the reference share
-    // on either side of the copies, so its other events inside that stretch -- an insertion between or
-    // beside its copies, a deletion of a copy's part -- are already in it. An insertion is inside when it
-    // goes in anywhere from before the stretch's first base to before the base after its last.
+    // A carrier's copy-number event is its own stretch: its copies, and for an allele call compared node by
+    // node the sequence beside them up to the steps its walk and the reference share, so its other events
+    // inside that stretch -- an insertion between or beside its copies, a deletion of a copy's part -- are
+    // already in it. An insertion is inside when it goes in after the stretch's first base and before the
+    // base after its last; one at either edge may be beside the copies or in the stretch.
     const auto inside_at = [](const CarrierEvent& c, const CarrierEvent& e) {
         if (&c == &e || e.kind == "cn") return false;
         if (c.insertion()) return e.insertion() && e.ref_start == c.ref_start;
@@ -1215,7 +1216,7 @@ int run_benchmark_command(const std::vector<std::string>& args) {
         return c.ref_start <= e.ref_start && e.ref_end <= c.ref_end;
     };
     // An insertion that repeats the sequence beside it can go in anywhere over its record's CIPOS. When that
-    // range crosses a stretch's edge, its listed place does not say which side it is on: it is inside when
+    // range reaches a stretch's edge, its listed place does not say which side it is on: it is inside when
     // counting it brings the stretch's expected length (as the carrier check computes it) nearer its own.
     const auto place_range = [&](const CarrierEvent& e) {
         std::size_t lo = e.ref_start, hi = e.ref_start;
@@ -1241,7 +1242,7 @@ int run_benchmark_command(const std::vector<std::string>& args) {
             for (const CarrierEvent* e : evs) {
                 if (e != c && e->kind != "cn" && e->insertion() && !c->insertion()) {
                     const auto [lo, hi] = place_range(*e);
-                    if (lo <= c->ref_end + 1 && hi >= c->ref_start && (lo < c->ref_start || hi > c->ref_end + 1)) {
+                    if (lo <= c->ref_end + 1 && hi >= c->ref_start && (lo <= c->ref_start || hi >= c->ref_end + 1)) {
                         edge.push_back(e);
                         continue;
                     }
