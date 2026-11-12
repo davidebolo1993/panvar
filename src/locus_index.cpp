@@ -38,7 +38,7 @@ namespace fs = std::filesystem;
 
 constexpr std::size_t kK = 31, kS = 11;
 constexpr std::uint64_t kMagic = 0x3130305850585650ULL;   // "PVPXP001"
-constexpr std::uint64_t kVersion = 8;   // 2: decoy windows stop at the locus; 3: clusters split at it; 4: S per haplotype; 5: calibration; 6: its decoy pairs cross window edges; 7: locus pieces off the located copies; 8: and past estimated ends
+constexpr std::uint64_t kVersion = 9;   // 2: decoy windows stop at the locus; 3: clusters split at it; 4: S per haplotype; 5: calibration; 6: its decoy pairs cross window edges; 7: locus pieces off the located copies; 8: and past estimated ends; 9: and everywhere for a locus with array pieces outside
 const std::size_t kLengths[] = {100, 150, 250, 1000, 10000};
 constexpr std::size_t kWindowStep = 25;
 // A stretch of a genome is a piece of the locus when, over every window of this many bases in it, this
@@ -46,6 +46,13 @@ constexpr std::size_t kWindowStep = 25;
 // about 97%, a paralog at 99% identity about 70%.
 constexpr std::uint64_t kPieceWindow = 5000;
 constexpr double kPieceDensity = 0.95;
+// A locus is looked for in every genome when this share of its k-mers are tandem (this many copies or more
+// within a haplotype) and left with a few copies outside the located ones (at most this many times their own
+// copy number): the mark of array pieces next to copies that look whole. A locus without an array has a few
+// hundredths of a percent.
+constexpr std::uint16_t kTandemCopies = 3;
+constexpr std::uint64_t kTandemOutside = 10;
+constexpr double kTandemShare = 0.005;
 
 std::string hex64(std::uint64_t v) {
     char b[17];
@@ -505,36 +512,53 @@ std::vector<LocusIndex> build(const BuildOptions& o) {
     // pieces: a genome whose copy of a locus is broken (a copy reaching a contig end, more than one copy, or
     // none) may hold more of it out of the anchors' reach, such as a tandem array cut by a contig break; a copy
     // with an end estimated from the reference (no flank anchor where expected, as past an array longer than
-    // the reference's) may go on past that end on its contig. The genome, or that contig, is scanned for
-    // stretches dense in the locus's k-mers: their k-mers off the located copies are subtracted, and those in
-    // a copy's uncertain ends are the locus, so no longer uncertain.
+    // the reference's) may go on past that end on its contig. A locus whose tandem k-mers are often left with a
+    // few copies outside the located ones has such pieces next to copies that look whole (an array contig of
+    // its own): every genome is scanned for it. A scanned genome, or contig, is searched for stretches dense in
+    // the locus's k-mers: their k-mers off the located copies are subtracted, and those in a copy's uncertain
+    // ends are the locus, so no longer uncertain.
     {
+        std::vector<char> everywhere(work.size(), 0);
+        for (std::size_t li = 0; li < work.size(); ++li) {
+            const LocusWork& w = work[li];
+            std::size_t tandem_out = 0;
+            for (std::size_t i = 0; i < w.idx.codes.size(); ++i) {
+                if (w.idx.mult[i] < kTandemCopies) continue;
+                const std::uint64_t out = w.counts[i] - std::min(w.sub[i], w.counts[i]);
+                if (out >= 1 && out <= kTandemOutside * w.idx.mult[i]) ++tandem_out;
+            }
+            if (static_cast<double>(tandem_out) >= kTandemShare * static_cast<double>(w.idx.codes.size())) {
+                everywhere[li] = 1;
+                log("locus: " + w.idx.name + "; tandem k-mers with a few copies outside: " + std::to_string(tandem_out) + "; every genome scanned for pieces");
+            }
+        }
         struct Need {
             std::vector<std::size_t> whole;                               // loci looked for in every contig
             std::map<std::string, std::vector<std::size_t>> contigs;     // contig -> loci looked for in it
             std::map<std::string, std::uint64_t> lengths;
         };
-        std::map<std::string, Need> scan_loci;
+        std::vector<std::pair<std::string, Need>> scan_list;
         for (const auto& g : genomes) {
             const std::string& gname = g.first;
             if (gname == cref) continue;
+            Need nd;
             for (std::size_t li = 0; li < work.size(); ++li) {
                 const auto it = work[li].spans.find(gname);
-                if (it == work[li].spans.end() || it->second.size() > 1 ||
+                if (everywhere[li] || it == work[li].spans.end() || it->second.size() > 1 ||
                     std::any_of(it->second.begin(), it->second.end(), [](const anchors::Span& sp) { return sp.open; })) {
-                    scan_loci[gname].whole.push_back(li);
+                    nd.whole.push_back(li);
                     continue;
                 }
                 for (const auto& sp : it->second)
                     if (sp.estimated) {
-                        Need& nd = scan_loci[gname];
                         nd.contigs[sp.contig].push_back(li);
                         nd.lengths[sp.contig] = sp.contig_length;
                     }
             }
+            if (!nd.whole.empty() || !nd.contigs.empty()) scan_list.emplace_back(gname, std::move(nd));
         }
         std::vector<char> wanted(work.size(), 0);
-        for (const auto& e : scan_loci) {
+        for (const auto& e : scan_list) {
             for (const std::size_t li : e.second.whole) wanted[li] = 1;
             for (const auto& c : e.second.contigs) for (const std::size_t li : c.second) wanted[li] = 1;
         }
@@ -555,13 +579,17 @@ std::vector<LocusIndex> build(const BuildOptions& o) {
             }
         }
         const std::size_t need = static_cast<std::size_t>(std::ceil(kPieceDensity * static_cast<double>(kPieceWindow)));
-        std::vector<std::set<std::string>> piece_genomes(work.size());
-        std::vector<std::size_t> scanned_for(work.size(), 0);
-        auto scan = [&](const std::string& gname, const std::string& name, const std::string& seq, const std::vector<char>& here) {
+        // what a genome's scan finds, applied in genome order once all are scanned (genomes run in parallel)
+        struct Found {
+            std::vector<std::pair<std::uint32_t, std::uint32_t>> off, ends;   // (locus, k-mer): off the copies / in an uncertain end
+            std::vector<std::pair<std::size_t, GenomeSpan>> pieces;
+        };
+        auto scan = [&](const std::string& gname, const std::string& name, const std::string& seq, const std::vector<char>& here,
+                        std::size_t inner, Found& f) {
             if (seq.size() < kPieceWindow + kK - 1) return;
             // each locus's k-mer starts on the contig, in order: ranges scanned in parallel, joined in order
             const std::size_t starts = seq.size() - kK + 1;
-            const std::size_t parts = std::min<std::size_t>(threads, std::max<std::size_t>(1, starts / 65536));
+            const std::size_t parts = std::min<std::size_t>(inner, std::max<std::size_t>(1, starts / 65536));
             std::vector<std::vector<std::vector<std::uint64_t>>> part_hits(parts, std::vector<std::vector<std::uint64_t>>(work.size()));
             auto scan_part = [&](std::size_t p) {
                 const std::size_t a = starts * p / parts, b = starts * (p + 1) / parts;
@@ -591,7 +619,7 @@ std::vector<LocusIndex> build(const BuildOptions& o) {
                     if (!dense.empty() && ws <= dense.back().second) dense.back().second = std::max(dense.back().second, we);
                     else dense.emplace_back(ws, we);
                 }
-                LocusWork& w = work[li];
+                const LocusWork& w = work[li];
                 std::vector<const anchors::Span*> own;   // the located copies on this contig
                 const auto it = w.spans.find(gname);
                 if (it != w.spans.end()) for (const auto& sp : it->second) if (sp.contig == name) own.push_back(&sp);
@@ -614,34 +642,36 @@ std::vector<LocusIndex> build(const BuildOptions& o) {
                         const std::int64_t i = w.idx.find(c);
                         if (i < 0) return;
                         const std::uint64_t pos = a + at;
+                        const auto key = std::make_pair(static_cast<std::uint32_t>(li), static_cast<std::uint32_t>(i));
                         for (const anchors::Span* sp : own)
                             if (pos >= sp->start && pos + kK <= sp->end) {   // counted with its copy
-                                if (pos < sp->inner_start || pos + kK > sp->inner_end) ++w.sub_trim[i];
+                                if (pos < sp->inner_start || pos + kK > sp->inner_end) f.ends.push_back(key);
                                 return;
                             }
-                        ++w.sub[i];
-                        ++w.sub_trim[i];
+                        f.off.push_back(key);
                         for (std::size_t k = 0; k < off.size(); ++k)
                             if (pos >= off[k].first && pos + kK <= off[k].second) { ++found[k]; break; }
                     });
-                    for (std::size_t k = 0; k < off.size(); ++k) {
-                        if (found[k] == 0) continue;
-                        w.idx.spans.push_back({gname, name, off[k].first, off[k].second, true, found[k], true});
-                        piece_genomes[li].insert(gname);
-                    }
+                    for (std::size_t k = 0; k < off.size(); ++k)
+                        if (found[k] > 0) f.pieces.emplace_back(li, GenomeSpan{gname, name, off[k].first, off[k].second, true, found[k], true});
                 }
             }
         };
-        for (const auto& entry : scan_loci) {
-            const std::string& gname = entry.first;
-            const Need& nd = entry.second;
+        // genomes in parallel, each read by one thread; a lone genome splits its contigs among the threads
+        std::vector<Found> found(scan_list.size());
+        const std::size_t outer = std::max<std::size_t>(1, std::min(threads, scan_list.size()));
+        const std::size_t inner = std::max<std::size_t>(1, threads / outer);
+        std::mutex log_mutex;
+        for (const auto& e : scan_list) check_unchanged(genomes.at(e.first));
+        parallel_for(scan_list.size(), outer, [&](std::size_t gi) {
+            const std::string& gname = scan_list[gi].first;
+            const Need& nd = scan_list[gi].second;
             const bg::Genome& ge = genomes.at(gname);
-            if (is_gfa_file(ge.path)) { log("note: genome: " + gname + "; a graph: not scanned for pieces of a locus"); continue; }
-            check_unchanged(ge);
-            std::vector<char> counted(work.size(), 0);
-            for (const std::size_t li : nd.whole) counted[li] = 1;
-            for (const auto& c : nd.contigs) for (const std::size_t li : c.second) counted[li] = 1;
-            for (std::size_t li = 0; li < work.size(); ++li) scanned_for[li] += counted[li];
+            if (is_gfa_file(ge.path)) {
+                std::lock_guard<std::mutex> lock(log_mutex);
+                log("note: genome: " + gname + "; a graph: not scanned for pieces of a locus");
+                return;
+            }
             auto here_for = [&](const std::string& contig) {
                 std::vector<char> h(work.size(), 0);
                 for (const std::size_t li : nd.whole) h[li] = 1;
@@ -656,7 +686,7 @@ std::vector<LocusIndex> build(const BuildOptions& o) {
                 while (in.getline(line)) {
                     if (line.empty()) continue;
                     if (line[0] == '>') {
-                        if (!name.empty()) scan(gname, name, seq, here_for(name));
+                        if (!name.empty()) scan(gname, name, seq, here_for(name), inner, found[gi]);
                         const auto sp = line.find_first_of(" \t");
                         name = line.substr(1, sp == std::string::npos ? std::string::npos : sp - 1);
                         seq.clear();
@@ -664,14 +694,30 @@ std::vector<LocusIndex> build(const BuildOptions& o) {
                     }
                     seq += line;
                 }
-                if (!name.empty()) scan(gname, name, seq, here_for(name));
-                log("pieces: genome scanned: " + gname);
+                if (!name.empty()) scan(gname, name, seq, here_for(name), inner, found[gi]);
             } else {
                 std::vector<fasta::Interval> iv;
                 for (const auto& c : nd.contigs) iv.push_back({c.first, 0, nd.lengths.at(c.first)});
                 const std::vector<std::string> seqs = fasta::fetch_intervals(ge.path, iv);
-                for (std::size_t k = 0; k < iv.size(); ++k) scan(gname, iv[k].contig, seqs[k], here_for(iv[k].contig));
-                log("pieces: contigs scanned: " + gname + " (" + std::to_string(iv.size()) + ")");
+                for (std::size_t k = 0; k < iv.size(); ++k) scan(gname, iv[k].contig, seqs[k], here_for(iv[k].contig), inner, found[gi]);
+            }
+            std::lock_guard<std::mutex> lock(log_mutex);
+            log(nd.whole.empty() ? "pieces: contigs scanned: " + gname + " (" + std::to_string(nd.contigs.size()) + ")"
+                                 : "pieces: genome scanned: " + gname);
+        });
+        std::vector<std::size_t> scanned_for(work.size(), 0);
+        std::vector<std::set<std::string>> piece_genomes(work.size());
+        for (std::size_t gi = 0; gi < scan_list.size(); ++gi) {
+            const Need& nd = scan_list[gi].second;
+            std::vector<char> counted(work.size(), 0);
+            for (const std::size_t li : nd.whole) counted[li] = 1;
+            for (const auto& c : nd.contigs) for (const std::size_t li : c.second) counted[li] = 1;
+            for (std::size_t li = 0; li < work.size(); ++li) scanned_for[li] += counted[li];
+            for (const auto& [li, i] : found[gi].off) { ++work[li].sub[i]; ++work[li].sub_trim[i]; }
+            for (const auto& [li, i] : found[gi].ends) ++work[li].sub_trim[i];
+            for (auto& [li, sp] : found[gi].pieces) {
+                piece_genomes[li].insert(sp.genome);
+                work[li].idx.spans.push_back(std::move(sp));
             }
         }
         for (std::size_t li = 0; li < work.size(); ++li) {

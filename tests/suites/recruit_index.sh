@@ -77,9 +77,21 @@ check "a paralogous array is not a piece; its k-mers count outside" '[[ $rc -eq 
 "$BIN" recruit -t 2 -q --background s_tail -r ref --index-only --save-index idx_tail --locus data/split_t/locus.gfa; rc=$?
 "$BIN" recruit --dump-index idx_tail/locus.plx=dump_tail.tsv
 check "an array past a copy's estimated end is found on its contig ($(pieces idx_tail/locus.index.tsv))" '[[ $rc -eq 0 && "$(pieces idx_tail/locus.index.tsv)" == "gl:chr1:161970-228000 " ]] && python3 "$TOOLS/locus_outside.py" idx_tail/locus.index.tsv dump_tail.tsv 8 data/split_t/ref.fa data/split_t/gl.fa > brute_tail.txt && awk -F"\t" '"'"'NR>1 && $2!="D" && $4>=3 {n++; p+=($2=="P")} END {exit !(n>5000 && p==n)}'"'"' dump_tail.tsv'
+# a whole copy, and more of its array on a contig of its own: the tandem k-mers left with a few copies
+# outside send the index looking in every genome; a locus without an array never does
+"$BIN" background -t 2 --partitions 64 --memory 64M -q --tmp-dir "$OUT/tmp" -o s_orphan --genome ref=data/split_o/ref.fa --genome go=data/split_o/go.fa --coordinate-reference ref
+"$BIN" recruit -t 2 --background s_orphan -r ref --index-only --save-index idx_orphan --locus data/split_o/locus.gfa 2> orphan.txt; rc=$?
+"$BIN" recruit --dump-index idx_orphan/locus.plx=dump_orphan.tsv
+check "an array contig next to a whole copy is found ($(pieces idx_orphan/locus.index.tsv))" '[[ $rc -eq 0 && "$(pieces idx_orphan/locus.index.tsv)" == "go:orphan:0-22000 " ]] && grep -q "every genome scanned for pieces" orphan.txt && python3 "$TOOLS/locus_outside.py" idx_orphan/locus.index.tsv dump_orphan.tsv 8 data/split_o/ref.fa data/split_o/go.fa > brute_orphan.txt && awk -F"\t" '"'"'NR>1 && $2!="D" && $4>=3 {n++; p+=($2=="P")} END {exit !(n>5000 && p==n)}'"'"' dump_orphan.tsv'
+check "a locus without an array is not looked for in every genome" '! grep -q "every genome scanned" log1.txt'
 "$BIN" recruit -t 4 -q --background s_split -r ref --index-only --save-index idx_split4 --locus data/split/locus.gfa
 "$BIN" recruit --dump-index idx_split4/locus.plx=dump_split4.tsv
 check "the piece scan on 4 threads gives the same index" 'cmp -s dump_split.tsv dump_split4.tsv'
+"$BIN" recruit -t 1 -q --background s_split_p -r ref --index-only --save-index idx_split_p1 --locus data/split/locus.gfa
+"$BIN" recruit -t 4 -q --background s_split_p -r ref --index-only --save-index idx_split_p4 --locus data/split/locus.gfa
+"$BIN" recruit --dump-index idx_split_p1/locus.plx=dump_split_p1.tsv
+"$BIN" recruit --dump-index idx_split_p4/locus.plx=dump_split_p4.tsv
+check "genomes scanned in parallel give the index of one at a time" 'cmp -s dump_split_p1.tsv dump_split_p4.tsv && cmp -s <(grep "^piece" idx_split_p1/locus.index.tsv) <(grep "^piece" idx_split_p4/locus.index.tsv)'
 
 # a graph genome counts one haplotype per sample#haplotype of its paths
 "$BIN" background -t 2 --partitions 64 --memory 64M -q --tmp-dir "$OUT/tmp" -o s_graph --genome ref=data/ref.fa --genome lg=data/locus.gfa --coordinate-reference ref

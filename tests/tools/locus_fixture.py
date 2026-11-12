@@ -98,3 +98,17 @@ with open(os.path.join(out, "split_t", "locus.gfa"), "w") as f:
     f.write(f"S\t1\t{ref_t[120000:le_t]}\nS\t2\t{hap_t}\n")
     f.write(f"P\tref#1#chr1:120000-{le_t}\t1+\t*\n")
     f.write(f"P\tgl#1#chr1:120000-{120000 + len(hap_t)}\t2+\t*\n")
+
+# split_o/: the locus of split/, and a genome whose copy is whole but which holds more of its array (units its
+# haplotype has) on a contig of its own (no copy is broken, no end estimated): the locus's tandem k-mers left with a few copies outside
+# send the index looking in every genome
+os.makedirs(os.path.join(out, "split_o"), exist_ok=True)
+arr_o = array(6)
+hap_o = left + arr_o + right
+write("split_o/ref", [("chr1", ref2)])
+write("split_o/go", [("chr1", ref2[:ls2] + hap_o + ref2[le2:]), ("orphan", arr_o[:4 * 5500])])
+with open(os.path.join(out, "split_o", "locus.gfa"), "w") as f:
+    f.write("H\tVN:Z:1.0\n")
+    f.write(f"S\t1\t{ref2[ls2:le2]}\nS\t2\t{hap_o}\n")
+    f.write(f"P\tref#1#chr1:{ls2}-{le2}\t1+\t*\n")
+    f.write(f"P\tgo#1#chr1:{ls2}-{ls2 + len(hap_o)}\t2+\t*\n")
