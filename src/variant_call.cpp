@@ -3291,7 +3291,10 @@ void call_variants(
                 std::size_t k = e.r_lo, j = e.r_lo;
                 while (k > 0 && Rdiff[k - 1].src_idx + 1 == Rdiff[k].src_idx) --k;
                 while (j + 1 < Rdiff.size() && Rdiff[j + 1].src_idx == Rdiff[j].src_idx + 1) ++j;
-                if (k > 0) floor = tok_span(Rdiff[k].src_idx, Rdiff[j].src_idx).first;   // none left of the walk's start
+                // only where the walks' reference leaves off on the genomic left: before the stretch in walk order
+                // on a forward reference, after it on one walked backwards
+                const bool gap_left = ref_rev ? j + 1 < Rdiff.size() : k > 0;
+                if (gap_left) floor = tok_span(Rdiff[k].src_idx, Rdiff[j].src_idx).first;
             }
             std::size_t x = gx;
             std::string u = dl == 0 ? a : d;

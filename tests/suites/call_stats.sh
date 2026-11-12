@@ -3720,6 +3720,17 @@ python3 -I "$TOOLS/spec_gfa.py" "$OUT/nfloor.spec" "$OUT/nfloor"
   --no-align-alleles --no-per-bubble-vcf -q >/dev/null 2>&1
 check "a node replacement's deletion beside counted copies merges with the same deletion (DEL records, AC)" \
   "$(grep -v '^#' "$OUT/nfloor/v.region.vcf" | grep -c 'SVTYPE=DEL;') $(awk -F'\t' '!/^#/ && /SVTYPE=DEL;/{n=split($8,f,";"); for(i=1;i<=n;i++) if(f[i] ~ /^AC=/) print f[i]}' "$OUT/nfloor/v.region.vcf")" "1 AC=2"
+# The same with the walks stored on the other strand (the reference walked backwards): the copies' side is then
+# the walks' later side, and the slide stops there all the same.
+{ printf 'N L 300 101\nN A 100 102\nN U =%s\nN D =%s\nN E =%s\nN F =%s\nN R 300 105\n' "$U52" "$U52" "$(blk 30 108)" "$(blk 30 108)"
+  M="U-,U-,U-,U-,U-,U-"
+  printf 'P ref#0#chr1:0-1094 R-,%s,D-,E-,A-,L-\nP h1#1#chr1 R-,%s,F-,A-,L-\nP h2#1#chr1 R-,%s,E-,A-,L-\n' "$M" "$M" "$M"
+  printf 'P h3#1#chr1 R-,U-,U-,%s,D-,E-,A-,L-\nB L R A;U;D;E;F\n' "$M"; } > "$OUT/nfloorr.spec"
+python3 -I "$TOOLS/spec_gfa.py" "$OUT/nfloorr.spec" "$OUT/nfloorr"
+"$BIN" call -i "$OUT/nfloorr/g.gfa" -c "$OUT/nfloorr/g.bubbles.csv" -r 'ref#0#chr1:0-1094' -o "$OUT/nfloorr/v" \
+  --no-align-alleles --no-per-bubble-vcf -q >/dev/null 2>&1
+check "the same, the reference walked backwards (DEL records, AC)" \
+  "$(grep -v '^#' "$OUT/nfloorr/v.region.vcf" | grep -c 'SVTYPE=DEL;') $(awk -F'\t' '!/^#/ && /SVTYPE=DEL;/{n=split($8,f,";"); for(i=1;i<=n;i++) if(f[i] ~ /^AC=/) print f[i]}' "$OUT/nfloorr/v.region.vcf")" "1 AC=2"
 
 # Aligned alleles: the band is set from the node comparison's drift, which can understate the change where the
 # walks are matched at short nodes out of place. The best placement is a 123 bp deletion and an 86 bp insertion
