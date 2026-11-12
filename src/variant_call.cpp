@@ -3085,6 +3085,10 @@ void call_variants(
         // writers never share one.
         std::vector<char> allele_unaligned(alleles.size(), 0);
         std::vector<char> allele_seq(alleles.size(), 0);   // its events come from aligning its bases
+        // Such an allele's alignment: every change it found, small ones too, in offsets of the two compared
+        // sequences (the reference's and the haplotype's interiors with the counted copies left out, genomic
+        // orientation), so a copy stretch can be cut where the alignment cuts the bases beside the copies.
+        std::vector<std::vector<AlignedChange>> allele_align(alleles.size());
         // Blocks too large to align that no base-level comparison of the allele then covered.
         std::vector<std::size_t> allele_skipped_blocks(alleles.size(), 0);
         // Alleles compared by sequence. Each haplotype's interior is aligned to the reference's at base
@@ -3177,7 +3181,7 @@ void call_variants(
             while (p < rs.size() && p < hs.size() && rs[p] == hs[p]) ++p;
             while (sfx < rs.size() - p && sfx < hs.size() - p && rs[rs.size() - 1 - sfx] == hs[hs.size() - 1 - sfx]) ++sfx;
             const std::size_t n = rs.size() - p - sfx, m = hs.size() - p - sfx;
-            if (n == 0 && m == 0) return true;
+            if (n == 0 && m == 0) { allele_align[ai].clear(); return true; }
             // A substitution says nothing about where the walk drifts inside the run it replaces: one
             // node can hold an insertion and a deletion far apart. So it may reach as far as its larger side.
             long long drift = 0, reach = 0;
@@ -3295,6 +3299,8 @@ void call_variants(
                 e.anchor_node = bubble.source;
                 out.push_back(std::move(e));
             }
+            allele_align[ai].clear();
+            for (const AlignedChange& c : changes) allele_align[ai].push_back({at + c.t0, at + c.t1, at + c.q0, at + c.q1});
             return true;
         };
         // A node replacement whose two sides share bases at either end (different nodes spelling the same
@@ -4258,6 +4264,100 @@ void call_variants(
                 }
             }
         }
+        // The copy stretch of an aligned allele (see cn_body): its first and last reference base and the bases
+        // that replace them; false where the alignment is not at hand.
+        struct Stretch { std::size_t g_first = 0, g_last = 0; std::string alt; };
+        const auto aligned_stretch = [&](std::size_t ai, const std::unordered_set<std::string>& copy_nodes,
+                                         Stretch& out) -> bool {
+            if (!seq_ok || seq_pieces.empty() || ref_steps.size() < 3) return false;
+            const std::size_t base = ref_meta.region_start_1based;
+            const std::vector<AlignedChange>& ch = allele_align[ai];
+            // Reference: genomic position of each compared base, and the junctions where this record's copies sit.
+            const std::string& rs = seq_ref;
+            const auto rgen = [&](std::size_t i) {   // genomic position of compared reference base i
+                std::size_t pc = 0;
+                while (pc + 1 < seq_pieces.size() && seq_pieces[pc + 1].off <= i) ++pc;
+                return seq_pieces[pc].g0 + (i - seq_pieces[pc].off);
+            };
+            std::vector<std::size_t> rj;   // offsets in rs where a copy of this record lies
+            {
+                std::vector<std::size_t> order;
+                for (std::size_t k = 1; k + 1 < ref_steps.size(); ++k) order.push_back(k);
+                if (ref_rev) std::reverse(order.begin(), order.end());
+                std::size_t off = 0;
+                for (const std::size_t k : order) {
+                    if (rdiff_pos.count(k)) off += node_len(graph, ref_steps[k].node_id);
+                    else if (copy_nodes.count(ref_steps[k].node_id) && (rj.empty() || rj.back() != off)) rj.push_back(off);
+                }
+                if (off != rs.size()) return false;
+            }
+            if (rj.empty()) return false;
+            // Haplotype: its interior with every step (hf) and with the counted copies left out (hs), genomic
+            // orientation; for each compared base its place in hf; and the junctions where its copies sit.
+            const std::vector<PathStep>& w = alleles[ai].steps;
+            const std::vector<Tok> Ht = collapse_walk(w, walk_drop, walk_unit_of);
+            std::unordered_set<std::size_t> kept;
+            for (const Tok& t : Ht) kept.insert(t.src_idx);
+            std::vector<std::size_t> order;
+            for (std::size_t k = 1; k + 1 < w.size(); ++k) order.push_back(k);
+            if (ref_rev) std::reverse(order.begin(), order.end());
+            std::string hf;
+            std::vector<std::size_t> hpos;   // compared hap base -> offset in hf
+            std::vector<std::size_t> hj;     // offsets in hs where a copy of this record lies
+            for (const std::size_t k : order) {
+                std::string sq = spell_path_steps_sequence(graph, std::vector<PathStep>{w[k]});
+                for (char& c : sq) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+                if (ref_rev) sq = reverse_complement(sq);
+                if (kept.count(k)) for (std::size_t q = 0; q < sq.size(); ++q) hpos.push_back(hf.size() + q);
+                else if (copy_nodes.count(w[k].node_id) && (hj.empty() || hj.back() != hpos.size())) hj.push_back(hpos.size());
+                hf += sq;
+            }
+            long long net = 0;
+            for (const AlignedChange& c : ch)
+                net += static_cast<long long>(c.q1 - c.q0) - static_cast<long long>(c.t1 - c.t0);
+            if (static_cast<long long>(rs.size()) + net != static_cast<long long>(hpos.size())) return false;
+            // The alignment as boundary pairs: between changes the two sides run base for base.
+            // f(r, after): the hap boundary at reference boundary r, past an insertion there when `after`.
+            const auto f = [&](std::size_t r, bool after) -> std::size_t {
+                long long d = 0;
+                for (const AlignedChange& c : ch) {
+                    if (c.t1 < r || (c.t1 == r && (c.t0 < r || after)))
+                        d += static_cast<long long>(c.q1 - c.q0) - static_cast<long long>(c.t1 - c.t0);
+                    else if (c.t0 < r && r < c.t1) return SIZE_MAX;   // inside a change: no single place
+                }
+                return static_cast<std::size_t>(static_cast<long long>(r) + d);
+            };
+            // finv(h, lo): the reference boundary at hap boundary h; inside a change, its near edge on that side
+            const auto finv = [&](std::size_t h, bool lo) -> std::size_t {
+                long long d = 0;
+                for (const AlignedChange& c : ch) {
+                    const long long dc = static_cast<long long>(c.q1 - c.q0) - static_cast<long long>(c.t1 - c.t0);
+                    if (h >= c.q1 && !(h == c.q1 && c.q0 == c.q1)) { d += dc; continue; }
+                    if (h > c.q0) return lo ? c.t0 : c.t1;
+                    break;
+                }
+                return static_cast<std::size_t>(static_cast<long long>(h) - d);
+            };
+            std::size_t rlo = rj.front(), rhi = rj.back();
+            if (!hj.empty()) { rlo = std::min(rlo, finv(hj.front(), true)); rhi = std::max(rhi, finv(hj.back(), false)); }
+            // never inside a change: widen to its edges
+            for (const AlignedChange& c : ch) {
+                if (c.t0 < rlo && rlo < c.t1) rlo = c.t0;
+                if (c.t0 < rhi && rhi < c.t1) rhi = c.t1;
+            }
+            std::size_t hlo = f(rlo, true), hhi = f(rhi, false);
+            if (hlo == SIZE_MAX || hhi == SIZE_MAX) return false;
+            if (!hj.empty()) { hlo = std::min(hlo, hj.front()); hhi = std::max(hhi, hj.back()); }
+            if (hhi < hlo) return false;
+            // reference interval: the bases between compared base rlo-1 and compared base rhi (copies included)
+            const std::size_t g_first = rlo == 0 ? tok_span(1, ref_steps.size() - 2).first : rgen(rlo - 1) + 1;
+            const std::size_t g_last = rhi >= rs.size() ? tok_span(1, ref_steps.size() - 2).second : rgen(rhi) - 1;
+            const std::size_t f_first = hlo == 0 ? 0 : hpos[hlo - 1] + 1;
+            const std::size_t f_last = hhi >= hpos.size() ? hf.size() : hpos[hhi];
+            if (g_first <= base || g_last + 1 < g_first || f_last < f_first) return false;
+            out = {g_first, g_last, hf.substr(f_first, f_last - f_first)};
+            return true;
+        };
         std::unordered_map<const MergedRecord*, std::string> id_of;   // this site's record ids, as written
         std::vector<std::pair<std::size_t, std::vector<std::vector<const MergedRecord*>>>> held_rows;
 
@@ -5164,25 +5264,15 @@ void call_variants(
                         }
                         wcn = std::to_string(walk_cn);
                     }
-                    // An allele whose events come from aligning its bases has every change beside its copies as
-                    // an event of its own, placed by that alignment: its stretch is its copies alone, the first
-                    // copy to the last on each walk, so those bases are not applied twice. The copies left both
-                    // walks before they were aligned, so sequence between copies is in no event: that holds only
-                    // where the two runs hold the same steps between their copies; otherwise the stretch runs
-                    // between the shared steps, as below.
-                    const auto between = [&](const std::vector<PathStep>& w, bool in, std::size_t a, std::size_t b) {
-                        std::vector<std::pair<std::string, bool>> out;
-                        for (std::size_t k = a; in && k <= b; ++k)
-                            if (!cn_nodes.count(w[k].node_id)) out.emplace_back(w[k].node_id, w[k].reverse);
-                        return out;
-                    };
-                    if (allele_seq[ai] && in_ref && between(ref_steps, in_ref, ra, rb) == between(hw, in_hap, ha, hb)) {
-                        const auto sp = tok_span(ra, rb);
-                        if (sp.first == 0) return unresolved;
-                        const std::string alt = !in_hap ? std::string() : fwd(spell_path_steps_sequence(
-                            graph, std::vector<PathStep>(hw.begin() + static_cast<std::ptrdiff_t>(ha),
-                                                         hw.begin() + static_cast<std::ptrdiff_t>(hb) + 1)));
-                        return body("cn", sp.first, sp.second, cn, alt, wcn);
+                    // An allele whose events come from aligning its bases (its copies left out of both walks) has
+                    // every change beside its copies as an event of its own. Its stretch is cut where that
+                    // alignment cuts the two walks: from the first copy on either walk to the last, each place on
+                    // one walk taken to the other by the alignment, and a change of the alignment never cut in two.
+                    // So no base of the haplotype is both in the stretch and in an event of its own outside it,
+                    // and a base between copies on one walk is in the stretch on the other too.
+                    if (allele_seq[ai] && in_ref) {
+                        Stretch st;
+                        if (aligned_stretch(ai, cn_nodes, st)) return body("cn", st.g_first, st.g_last, cn, st.alt, wcn);
                     }
                     // Otherwise the stretch between the steps the carrier's walk and the reference were matched at
                     // on either side of the copies, as a node event is written: the carrier's own sequence beside

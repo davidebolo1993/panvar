@@ -331,7 +331,29 @@ sed -e 's/^P ref#0#chr1:0-976 .*/P ref#0#chr1:0-976 L+,A+,Z+,U+,U+,U+,R+/' -e 's
 spec sp3
 sed 's/^P h1#1#chr1 .*/P h1#1#chr1 L+,A+,Z+,R+/' "$OUT/sp2.spec" > "$OUT/sp4.spec"
 spec sp4
-for n in sp2:172 sp3:224 sp4:120; do
+# dd: h1 deletes A's last 3 bp, keeps B, inserts X before its first copy (an aligned event, reported), and holds
+# Y, Z with one base changed, between its two copies: Y pairs with the reference's Z by place, so the stretch
+# stays its copies and Y, and X is applied once. ddsame: the same with Z itself.
+cat > "$OUT/dd.spec" <<'EOF'
+N L 300 101
+N A =CGCCTGTACTTCCAACTCCTTTACAGTCTTTCCGCACGTCTGGTTCTCCCGATATCGATGTCCGTCCCTCCTCAACTGCAACATGGGTTCTCGCATCTCC
+N P =CGCCTGTACTTCCAACTCCTTTACAGTCTTTCCGCACGTCTGGTTCTCCCGATATCGATGTCCGTCCCTCCTCAACTGCAACATGGGTTCTCGCATC
+N B 8 106
+N U 52 103
+N Z 120 107
+N Y @Z:1:5
+N X 180 104
+N R 300 105
+P ref#0#chr1:0-1036 L+,A+,B+,U+,Z+,U+,U+,R+
+P h1#1#chr1 L+,P+,B+,X+,U+,Y+,U+,R+
+P h2#1#chr1 L+,A+,B+,U+,Z+,U+,U+,R+
+P h3#1#chr1 L+,A+,B+,U+,Z+,U+,U+,U+,R+
+B L R A;P;B;U;X;Z;Y
+EOF
+spec dd
+sed 's/^P h1#1#chr1 .*/P h1#1#chr1 L+,P+,B+,X+,U+,Z+,U+,R+/' "$OUT/dd.spec" > "$OUT/ddsame.spec"
+spec ddsame
+for n in sp2:172 sp3:224 sp4:120 dd:224 ddsame:224; do
   check "${n%%:*}: a spacer between copies on one walk is kept once (left:stretch bp of h1)" \
         "$(sv ${n%%:*}_B missed_by_call_events):$(awk -F'\t' '$3=="cn" && $11 ~ /h1#/{print $9}' "$OUT/${n%%:*}_c.carrier_events.tsv")" "0:${n#*:}"
 done
