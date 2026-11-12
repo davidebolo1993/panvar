@@ -4267,6 +4267,7 @@ void call_variants(
         // The copy stretch of an aligned allele (see cn_body): its first and last reference base and the bases
         // that replace them; false where the alignment is not at hand.
         struct Stretch { std::size_t g_first = 0, g_last = 0; std::string alt; };
+        std::unordered_map<const void*, std::vector<std::size_t>> ref_junctions;   // per record's copy-node set
         const auto aligned_stretch = [&](std::size_t ai, const std::unordered_set<std::string>& copy_nodes,
                                          Stretch& out) -> bool {
             if (!seq_ok || seq_pieces.empty() || ref_steps.size() < 3) return false;
@@ -4279,8 +4280,8 @@ void call_variants(
                 while (pc + 1 < seq_pieces.size() && seq_pieces[pc + 1].off <= i) ++pc;
                 return seq_pieces[pc].g0 + (i - seq_pieces[pc].off);
             };
-            std::vector<std::size_t> rj;   // offsets in rs where a copy of this record lies
-            {
+            std::vector<std::size_t>& rj = ref_junctions[&copy_nodes];   // offsets in rs where a copy of this record lies
+            if (rj.empty()) {
                 std::vector<std::size_t> order;
                 for (std::size_t k = 1; k + 1 < ref_steps.size(); ++k) order.push_back(k);
                 if (ref_rev) std::reverse(order.begin(), order.end());
@@ -4289,28 +4290,35 @@ void call_variants(
                     if (rdiff_pos.count(k)) off += node_len(graph, ref_steps[k].node_id);
                     else if (copy_nodes.count(ref_steps[k].node_id) && (rj.empty() || rj.back() != off)) rj.push_back(off);
                 }
-                if (off != rs.size()) return false;
+                if (off != rs.size()) { rj.clear(); return false; }
             }
             if (rj.empty()) return false;
             // Haplotype: its interior with every step (hf) and with the counted copies left out (hs), genomic
             // orientation; for each compared base its place in hf; and the junctions where its copies sit.
             const std::vector<PathStep>& w = alleles[ai].steps;
-            const std::vector<Tok> Ht = collapse_walk(w, walk_drop, walk_unit_of);
-            std::unordered_set<std::size_t> kept;
-            for (const Tok& t : Ht) kept.insert(t.src_idx);
+            // a step is compared unless its unit's copies left the walks (as collapse_walk decides)
+            const auto kept = [&](std::size_t k) {
+                const auto u = walk_unit_of.find(w[k].node_id);
+                return !walk_drop.count(u == walk_unit_of.end() ? w[k].node_id : u->second);
+            };
             std::vector<std::size_t> order;
             for (std::size_t k = 1; k + 1 < w.size(); ++k) order.push_back(k);
             if (ref_rev) std::reverse(order.begin(), order.end());
             std::string hf;
             std::vector<std::size_t> hpos;   // compared hap base -> offset in hf
             std::vector<std::size_t> hj;     // offsets in hs where a copy of this record lies
+            hf.reserve(rs.size() * 2);
             for (const std::size_t k : order) {
-                std::string sq = spell_path_steps_sequence(graph, std::vector<PathStep>{w[k]});
-                for (char& c : sq) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
-                if (ref_rev) sq = reverse_complement(sq);
-                if (kept.count(k)) for (std::size_t q = 0; q < sq.size(); ++q) hpos.push_back(hf.size() + q);
+                const auto nit = graph.nodes.find(w[k].node_id);
+                if (nit == graph.nodes.end()) return false;
+                const std::string& nseq = nit->second.sequence;
+                const std::size_t at = hf.size();
+                // the step in genomic orientation: walked backwards on one strand of the two
+                if (w[k].reverse != ref_rev) hf += reverse_complement(nseq);
+                else hf += nseq;
+                for (std::size_t q = at; q < hf.size(); ++q) hf[q] = static_cast<char>(std::toupper(static_cast<unsigned char>(hf[q])));
+                if (kept(k)) for (std::size_t q = at; q < hf.size(); ++q) hpos.push_back(q);
                 else if (copy_nodes.count(w[k].node_id) && (hj.empty() || hj.back() != hpos.size())) hj.push_back(hpos.size());
-                hf += sq;
             }
             long long net = 0;
             for (const AlignedChange& c : ch)
@@ -5229,6 +5237,8 @@ void call_variants(
                         if (cn_nodes.count(w[k].node_id)) { if (a == SIZE_MAX) a = k; b = k; }
                     return a != SIZE_MAX;
                 };
+                std::unordered_map<std::size_t, std::pair<bool, Stretch>> stretch_of;   // per allele, found once
+                ref_junctions.clear();   // keyed by this record's copy-node set, which lives in this iteration
                 const auto cn_body = [&](std::size_t ai, const std::string& cn) -> std::string {
                     if (cn_nodes.empty() || ai >= alleles.size()) return unresolved;
                     const std::vector<PathStep>& hw = alleles[ai].steps;
@@ -5271,8 +5281,14 @@ void call_variants(
                     // So no base of the haplotype is both in the stretch and in an event of its own outside it,
                     // and a base between copies on one walk is in the stretch on the other too.
                     if (allele_seq[ai] && in_ref) {
-                        Stretch st;
-                        if (aligned_stretch(ai, cn_nodes, st)) return body("cn", st.g_first, st.g_last, cn, st.alt, wcn);
+                        auto it = stretch_of.find(ai);
+                        if (it == stretch_of.end()) {
+                            Stretch st;
+                            const bool ok = aligned_stretch(ai, cn_nodes, st);
+                            it = stretch_of.emplace(ai, std::make_pair(ok, std::move(st))).first;
+                        }
+                        if (it->second.first)
+                            return body("cn", it->second.second.g_first, it->second.second.g_last, cn, it->second.second.alt, wcn);
                     }
                     // Otherwise the stretch between the steps the carrier's walk and the reference were matched at
                     // on either side of the copies, as a node event is written: the carrier's own sequence beside
