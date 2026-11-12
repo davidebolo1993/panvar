@@ -927,6 +927,26 @@ python3 -I "$(cd "$(dirname "$0")/.." && pwd)/tools/spec_gfa.py" "$OUT/moddip.sp
 "$BIN" call -i "$OUT/moddip.b.sorted.gfa" --bubble-prefix "$OUT/moddip.b" -r ref -o "$OUT/moddip" --cn --diploid --quiet >/dev/null 2>&1
 check "--diploid: one carrier and one non-carrier holding its change (s1 GT:CN:CNBP:CNRESID:HCN)" \
   "$(awk -F'\t' '/^#CHROM/{for(i=10;i<=NF;i++) if($i=="s1") c=i} !/^#/ && /SVTYPE=CNV;/{print $c; exit}' "$OUT/moddip.region.vcf")" "1|0:3:-140:-60:1|2"
+"$BIN" call -i "$OUT/moddip.b.sorted.gfa" --bubble-prefix "$OUT/moddip.b" -r ref -o "$OUT/moddip_af" --cn --diploid \
+  --min-alt-af 0.1 --quiet >/dev/null 2>&1
+check "--diploid, the holding deletion filtered out: the non-carrier's measured CN (s1 GT:CN:...:HCN)" \
+  "$(awk -F'\t' '/^#CHROM/{for(i=10;i<=NF;i++) if($i=="s1") c=i} !/^#/ && /SVTYPE=CNV;/{print $c; exit}' "$OUT/moddip_af.region.vcf")" "1|0:2:-140:20:1|1"
+# htest's deletion holds its change only while it is written: --min-alt-af 0.1 leaves it out (AF 1/14), and the
+# module record then reads its measured CN; so does --diploid, where the sample's own column then reads 1|1.
+"$BIN" call -i "$OUT/modlow.b.sorted.gfa" --bubble-prefix "$OUT/modlow.b" -r ref -o "$OUT/modlow_af" --cn --min-alt-af 0.1 \
+  --quiet >/dev/null 2>&1
+check "MODULE non-carrier whose holding record is filtered out keeps its measured CN (records, GT:CN)" \
+  "$(grep -vc '^#' "$OUT/modlow_af.region.vcf") $(gt_cn "$OUT/modlow_af.region.vcf" 'htest#1#chr1' CNV)" "1 0:1"
+# htest walks T for the reference's S, an extra S after x, and q, a copy of a2 with 2 bases changed, for a2. Its
+# deletion of S and insertion of S are on module nodes but not on the anchor: no record holds its copy change.
+{ printf 'N L 2000 81\nN A3 20 82\nN A2 40 83\nN Q @A2:2:7\nN S 80 84\nN T 20 89\nN X 60 85\nN R 2000 86\n'
+  printf 'P ref#0#chr1:0-4300 L+,A3+,A2+,S+,A3+,A2+,X+,R+\nP hfull#1#chr1 L+,A3+,A2+,X+,R+\n'
+  printf 'P hgain#1#chr1 L+,A3+,A2+,S+,A3+,A2+,S+,A3+,A2+,X+,R+\nP htest#1#chr1 L+,A3+,A2+,T+,A3+,Q+,X+,S+,R+\n'
+  for i in 1 2 3 4 5 6 7 8 9 10; do printf 'P hr%s#1#chr1 L+,A3+,A2+,S+,A3+,A2+,X+,R+\n' "$i"; done; } > "$OUT/modoff.spec"
+python3 -I "$(cd "$(dirname "$0")/.." && pwd)/tools/spec_gfa.py" "$OUT/modoff.spec" "$OUT/modoff"
+cn_call "$OUT/modoff/g.gfa" "$OUT/modoff"
+check "MODULE non-carrier whose records are off the anchor keeps its measured CN (GT:CN)" \
+  "$(gt_cn "$OUT/modoff.region.vcf" 'htest#1#chr1' CNV)" "0:1"
 # The carrier hfull's own deletion of one copy is its copy change: it stays off the deletion record.
 modfull=$(awk -F'\t' '/^#CHROM/{for(i=10;i<=NF;i++) if($i=="hfull#1#chr1") c=i}
   !/^#/ && $8 ~ /SVTYPE=DEL;/ {split($c,g,":"); n=split($8,f,";"); for(i=1;i<=n;i++) if(f[i] ~ /^(AC|NMERGED)=/) printf "%s ", f[i]; printf "hfull:%s", g[1]}' "$V")

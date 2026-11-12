@@ -1951,8 +1951,40 @@ void call_variants(
         std::string line;                       // full VCF row (with trailing newline)
         std::size_t unaligned_missing = 0;      // its haplotypes GT '.' as unaligned, and as within a larger
         std::size_t covered_missing = 0;        // deletion of their own (the run's counts lose a dropped record's)
+        // A module record's sample written as REF_CN because records of its own (holders) hold its change: the
+        // field it takes instead, with its measured CN, when none of those records is written.
+        struct CnHeld { std::size_t col = 0; std::string measured; std::vector<std::string> holders; };
+        std::vector<CnHeld> cn_held;
     };
     std::vector<OutRecord> out_records;
+    // A record's module samples written as REF_CN whose holders are all left out (`gone`) take their measured CN.
+    const auto apply_measured_cn = [](OutRecord& rec, const std::function<bool(const std::string&)>& gone) {
+        if (rec.cn_held.empty()) return;
+        std::vector<std::string> cols;
+        std::size_t a = 0;
+        std::string line = rec.line;
+        const bool nl = !line.empty() && line.back() == '\n';
+        if (nl) line.pop_back();
+        while (true) {
+            const std::size_t b = line.find('\t', a);
+            cols.push_back(line.substr(a, b == std::string::npos ? std::string::npos : b - a));
+            if (b == std::string::npos) break;
+            a = b + 1;
+        }
+        bool changed = false;
+        for (OutRecord::CnHeld& h : rec.cn_held) {
+            bool kept = false;
+            for (const std::string& id : h.holders) kept = kept || !gone(id);
+            if (kept || h.col >= cols.size() || h.measured.empty()) continue;
+            cols[h.col] = h.measured;
+            h.measured.clear();
+            changed = true;
+        }
+        if (!changed) return;
+        std::string out;
+        for (std::size_t k = 0; k < cols.size(); ++k) { if (k) out += '\t'; out += cols[k]; }
+        rec.line = out + (nl ? "\n" : "");
+    };
     std::vector<std::string> variant_nodes_rows;     // <prefix>.variant_nodes.tsv (describe handoff)
     std::vector<std::string> carrier_events_rows;    // <prefix>.carrier_events.tsv (benchmark handoff)
     std::vector<std::string> dup_gene_cn_rows;       // <prefix>.dup_gene_cn.tsv body (per-gene DUP CN)
@@ -4189,35 +4221,45 @@ void call_variants(
 
         if (merged.empty()) return;   // the dropped modules' genes are queued above
 
-        // A module record's non-carriers whose change a kept record of their own holds: their event there
-        // (their own, else the record's) is on the module's anchor or copy nodes. They read REF_CN, so a
-        // dosage read off CN does not count the change twice; a non-carrier whose change no record holds keeps
-        // the copies its walk holds.
-        std::unordered_map<const MergedRecord*, std::unordered_set<std::string>> cn_held;
+        // A module record's non-carriers whose change records of their own hold: their event in such a record
+        // (their own, else the record's) is on the module's anchor and changes its length the way their copy
+        // number does -- the test the copy accounting above applies to a carrier's events. They read REF_CN, so
+        // a dosage read off CN does not count the change twice; a non-carrier whose change no record holds keeps
+        // the copies its walk holds. Which of those records is written is known only once the write-time
+        // filters ran, so the holders are kept with the line (OutRecord::cn_held).
+        std::unordered_map<const MergedRecord*, std::unordered_map<std::string, std::vector<const MergedRecord*>>> cn_held;
         for (const MergedRecord& d : merged) {
-            if (!is_module_cn(d.seed.cn_method) || d.seed.type != EvType::Dup) continue;
+            if (!is_module_cn(d.seed.cn_method) || d.seed.type != EvType::Dup || d.anchor_nodes.empty()) continue;
             const std::unordered_set<std::string> car(d.carriers.begin(), d.carriers.end());
-            const auto on_module = [&](const std::vector<std::string>& nodes) {
-                for (const std::string& n : nodes)
-                    if (d.anchor_nodes.count(n) || d.module_nodes.count(n)) return true;
-                return false;
+            const auto net_of = [](const Event& ev) -> long long {
+                if (ev.type == EvType::Ins) return static_cast<long long>(ev.size_bp);
+                if (ev.type == EvType::Del) return -static_cast<long long>(ev.size_bp);
+                return static_cast<long long>(ev.ins_bp) - static_cast<long long>(ev.del_bp);
             };
             for (const MergedRecord& r : merged) {
                 if (&r == &d || r.seed.type == EvType::Dup) continue;
                 for (const std::string& m : r.carriers) {
-                    if (car.count(m) || cn_held[&d].count(m)) continue;
-                    bool held = false;
+                    const auto cit = d.sample_cn.find(m);
+                    if (car.count(m) || cit == d.sample_cn.end()) continue;
+                    const long long delta = static_cast<long long>(cit->second) - static_cast<long long>(d.seed.ref_cn);
+                    if (delta == 0) continue;
                     const auto ait = sample_to_allele.find(m);
                     const auto me = ait == sample_to_allele.end() ? r.member_event.end() : r.member_event.find(ait->second);
-                    if (me != r.member_event.end()) {
-                        for (const Event& ev : me->second) held = held || on_module(ev.nodes);
-                    } else {
-                        held = on_module(r.seed.nodes);
+                    std::vector<const Event*> evs;
+                    if (me != r.member_event.end()) for (const Event& ev : me->second) evs.push_back(&ev);
+                    else evs.push_back(&r.seed);
+                    long long net = 0;
+                    bool anchor = false;
+                    for (const Event* ev : evs) {
+                        net += net_of(*ev);
+                        for (const std::string& n : ev->nodes) anchor = anchor || d.anchor_nodes.count(n);
                     }
-                    if (held) cn_held[&d].insert(m);
+                    if (anchor && net * delta > 0) cn_held[&d][m].push_back(&r);
                 }
             }
         }
+        std::unordered_map<const MergedRecord*, std::string> id_of;   // this site's record ids, as written
+        std::vector<std::pair<std::size_t, std::vector<std::vector<const MergedRecord*>>>> held_rows;
 
         for (const MergedRecord& mr : merged) {
             const Event& e = mr.seed;
@@ -4902,6 +4944,8 @@ void call_variants(
                                       ? "\tGT:CN:CNBP:CNRESID"
                                       : "\tGT:CN:CNBP")
                            : "\tGT:CN");
+            std::vector<OutRecord::CnHeld> held_fix;
+            std::vector<std::vector<const MergedRecord*>> held_ptrs;
             for (const std::string& s : sample_names) {
                 row << '\t';
                 if (!traverses.count(s)) {
@@ -4925,8 +4969,22 @@ void call_variants(
                     // A module record's non-carrier whose change a kept record of its own holds (cn_held) reads
                     // the reference's count, so a dosage read off CN does not count it twice. CNBP stays as measured.
                     const auto held = cn_held.find(&mr);
-                    const std::size_t cn_out = is_module_cn(e.cn_method) && !carrier && held != cn_held.end() &&
-                                               held->second.count(s) ? e.ref_cn : cit->second;
+                    const auto hs_it = held == cn_held.end() ? decltype(held->second.end())() : held->second.find(s);
+                    const bool held_here = is_module_cn(e.cn_method) && !carrier && held != cn_held.end() &&
+                                           hs_it != held->second.end();
+                    const std::size_t cn_out = held_here ? e.ref_cn : cit->second;
+                    if (held_here) {
+                        std::ostringstream m;
+                        m << "0:" << cit->second << ':' << sample_cnbp(s);
+                        if (e.ru_len > 0)
+                            m << ':' << (sample_cnbp(s) - (static_cast<long long>(cit->second) - static_cast<long long>(e.ref_cn)) *
+                                                          static_cast<long long>(e.ru_len));
+                        OutRecord::CnHeld h;
+                        h.col = 9 + static_cast<std::size_t>(&s - sample_names.data());
+                        h.measured = m.str();
+                        held_fix.push_back(std::move(h));
+                        held_ptrs.push_back(hs_it->second);
+                    }
                     row << cn_out;
                     const long long this_cnbp = sample_cnbp(s);
                     row << ':' << this_cnbp;
@@ -4958,6 +5016,9 @@ void call_variants(
             rec.line = row.str();
             rec.unaligned_missing = n_unaligned;
             rec.covered_missing = n_unknown - n_unaligned;
+            rec.cn_held = std::move(held_fix);
+            if (!held_ptrs.empty()) held_rows.emplace_back(out_records.size(), std::move(held_ptrs));
+            id_of[&mr] = id;
             out_records.push_back(std::move(rec));
 
             if (options.write_variant_nodes) {
@@ -5204,6 +5265,15 @@ void call_variants(
             else if (e.type == EvType::Inv) ++summary.inv;
             else ++summary.dup;
         }
+        // The holders' ids, now that every record of the site is written; a sample none of whose holders was
+        // written takes its measured CN at once.
+        for (auto& [k, ptrs] : held_rows) {
+            OutRecord& rec = out_records[k];
+            for (std::size_t f = 0; f < ptrs.size(); ++f)
+                for (const MergedRecord* r : ptrs[f])
+                    if (const auto it = id_of.find(r); it != id_of.end()) rec.cn_held[f].holders.push_back(it->second);
+            apply_measured_cn(rec, [](const std::string&) { return false; });
+        }
     };
     // Ticked as bubbles are processed, not in the merge below, so the bar follows the run.
     for (std::size_t bubble_idx = 0; bubble_idx < bubbles.size(); ++bubble_idx) {
@@ -5407,6 +5477,8 @@ void call_variants(
             return true;
         }), out_records.end());
         summary.diploid_records_dropped = no_column;
+        // a module sample read as REF_CN because a dropped record held its change takes its measured CN
+        for (OutRecord& r : out_records) apply_measured_cn(r, [&](const std::string& id) { return dropped.count(id) != 0; });
         // a dropped copy-number record's genes keep their per-gene rows, under no record
         for (DupGeneTarget& t : dup_targets) if (dropped.count(t.variant_id)) t.variant_id = ".";
         if (!dropped.empty()) {
