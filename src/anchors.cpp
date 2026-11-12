@@ -588,6 +588,7 @@ std::vector<Span> locate(const ReferenceAnchors& ref, const std::vector<const Se
                     sp.anchors_flank = flanks;
                     sp.inner_start = ilo;
                     sp.inner_end = std::min(ihi + kK, sp.end);
+                    sp.open = lo == 0 || sp.end >= sa.contig_length(g, key.first);
                     spans.push_back(sp);
                 }
             }
@@ -601,6 +602,7 @@ std::vector<Span> locate(const ReferenceAnchors& ref, const std::vector<const Se
                     j.end = std::max(j.end, sp.end);
                     j.inner_start = std::min(j.inner_start, sp.inner_start);
                     j.inner_end = std::max(j.inner_end, sp.inner_end);
+                    j.open = j.open || sp.open;
                     j.anchors_inside += sp.anchors_inside;
                     j.anchors_flank += sp.anchors_flank;
                     j.chains += sp.chains;

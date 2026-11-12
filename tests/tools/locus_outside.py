@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Checks a locus index dump against brute force: each k-mer's outside count must equal its count over
-the genomes minus its count inside the spans the index subtracted (its report's span rows); classes must
-follow from it; decoys must be absent from the locus and present in the genomes.
+the genomes minus its count inside the spans and pieces the index subtracted (its report's span and piece
+rows); classes must follow from it; decoys must be absent from the locus and present in the genomes.
 
     locus_outside.py <index.tsv report> <dump.tsv> <informative max> <genome.fa>...
 Prints problems; exits 1 when any.
@@ -41,7 +41,7 @@ def fasta(path):
 spans = collections.defaultdict(list)   # genome -> (contig, start, end)
 for line in open(report):
     f = line.rstrip("\n").split("\t")
-    if f[0] == "span" and f[1] != "genome":
+    if f[0] in ("span", "piece") and f[1] != "genome":
         spans[f[1]].append((f[2], int(f[3]), int(f[4])))
 total, own = collections.Counter(), collections.Counter()
 for g in genomes:

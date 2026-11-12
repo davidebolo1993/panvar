@@ -58,6 +58,24 @@ python3 "$TOOLS/locus_reads.py" data/ref.fa chr1 115000 165000 30 span 6 reads_s
 check "reads holding the whole locus between two flanks are certain, partial ($(reason span.tsv partial) of 30)" '[[ $(reason span.tsv partial) == 30 ]]'
 check "reads past the end are certain, partial ($(reason long.tsv partial) of 300), segments within the read" '[[ $(reason long.tsv partial) -ge 270 ]] && awk -F"\t" '"'"'NR>1 && $4=="partial" {split($6, g, "-"); if (g[2] - g[1] >= 2000 || g[1] != 0 && g[2] != 2000) bad = 1} END {exit bad}'"'"' long.tsv'
 
+# a locus copy broken inside a tandem array: the array's middle sits on a contig of its own, out of the
+# anchors' reach; it is found as a piece and subtracted, and the copies' uncertain ends that are array count
+# as the locus. A paralogous array in another genome is not a piece.
+"$BIN" background -t 2 --partitions 64 --memory 64M -q --tmp-dir "$OUT/tmp" -o s_split --genome ref=data/split/ref.fa --genome gs=data/split/gs.fa --coordinate-reference ref
+"$BIN" recruit -t 2 -q --background s_split -r ref --index-only --save-index idx_split --locus data/split/locus.gfa; rc=$?
+"$BIN" recruit --dump-index idx_split/locus.plx=dump_split.tsv
+pieces() { awk -F'\t' '$1=="piece" && $2!="genome" {print $2 ":" $3 ":" $4 "-" $5}' "$1" | tr '\n' ' '; }
+check "a broken copy's orphan piece is found ($(pieces idx_split/locus.index.tsv))" '[[ $rc -eq 0 && "$(pieces idx_split/locus.index.tsv)" == "gs:x:0-17700 " ]]'
+check "outside counts equal brute force with the piece subtracted" 'python3 "$TOOLS/locus_outside.py" idx_split/locus.index.tsv dump_split.tsv 8 data/split/ref.fa data/split/gs.fa > brute_split.txt'
+check "the array's k-mers stay private, none demoted at the copies' ends" '[[ $(field idx_split/locus.index.tsv span_demoted) == 0 ]] && awk -F"\t" '"'"'NR>1 && $2!="D" && $4>=3 {n++; p+=($2=="P")} END {exit !(n>5000 && p==n)}'"'"' dump_split.tsv'
+"$BIN" background -t 2 --partitions 64 --memory 64M -q --tmp-dir "$OUT/tmp" -o s_split_p --genome ref=data/split/ref.fa --genome gs=data/split/gs.fa --genome gp=data/split/gp.fa --coordinate-reference ref
+"$BIN" recruit -t 2 -q --background s_split_p -r ref --index-only --save-index idx_split_p --locus data/split/locus.gfa; rc=$?
+"$BIN" recruit --dump-index idx_split_p/locus.plx=dump_split_p.tsv
+check "a paralogous array is not a piece; its k-mers count outside" '[[ $rc -eq 0 && "$(pieces idx_split_p/locus.index.tsv)" == "gs:x:0-17700 " ]] && python3 "$TOOLS/locus_outside.py" idx_split_p/locus.index.tsv dump_split_p.tsv 8 data/split/ref.fa data/split/gs.fa data/split/gp.fa > brute_split_p.txt && awk -F"\t" '"'"'NR>1 && $2=="S" && $4>=3 {n++} END {exit !(n>5000)}'"'"' dump_split_p.tsv'
+"$BIN" recruit -t 4 -q --background s_split -r ref --index-only --save-index idx_split4 --locus data/split/locus.gfa
+"$BIN" recruit --dump-index idx_split4/locus.plx=dump_split4.tsv
+check "the piece scan on 4 threads gives the same index" 'cmp -s dump_split.tsv dump_split4.tsv'
+
 # a graph genome counts one haplotype per sample#haplotype of its paths
 "$BIN" background -t 2 --partitions 64 --memory 64M -q --tmp-dir "$OUT/tmp" -o s_graph --genome ref=data/ref.fa --genome lg=data/locus.gfa --coordinate-reference ref
 "$BIN" recruit -t 2 -q --background s_graph -r ref --index-only --save-index idx_graph --locus data/locus.gfa 2> graph.txt; rc=$?

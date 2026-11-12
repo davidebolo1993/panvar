@@ -128,6 +128,7 @@ struct Span {
     std::size_t chains = 1;              // chains joined into this span because they overlapped
     std::uint64_t inner_start = 0, inner_end = 0;   // the stretch between the outermost inside anchors (the span
                                                     // itself when the interval has none)
+    bool open = false;                   // reaches a contig end: the copy may go on elsewhere in the genome
 };
 
 struct LocateOptions {

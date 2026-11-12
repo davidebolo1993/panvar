@@ -29,6 +29,7 @@ struct GenomeSpan {
     std::uint64_t start = 0, end = 0;
     bool forward = true;
     std::uint64_t subtracted = 0;      // locus k-mer occurrences found in it
+    bool piece = false;                // a piece of the locus off the located copies (no anchors placed it)
 };
 
 struct DecoyWindow {

@@ -19,8 +19,8 @@ Indexing and scoring are panvar's own; SAM, BAM and CRAM are read with [htslib](
 The index, built once per locus graph and kept beside it (`<locus>.plx`, with a report `<locus>.index.tsv`):
 
 1. Every canonical 31-mer of the graph's haplotypes is collected, with the nodes it starts on and its largest copy number within one haplotype. A k-mer once in every haplotype is a backbone k-mer: its depth in a sample is the depth of one copy.
-2. The locus is located in every background genome: the reference path's interval (`-r`; its name carries `contig:start-end`) is found through the background's anchors, and the k-mers of each copy found are counted and subtracted from the background's counts.
-3. Each k-mer is labelled by what is left (its count outside the locus): private (none), shared (up to `--informative-max` per background haplotype, on average) or repeat (more). Private k-mers of low complexity, or that become shared when the located copies are trimmed at their uncertain ends, are labelled shared.
+2. The locus is located in every background genome: the reference path's interval (`-r`; its name carries `contig:start-end`) is found through the background's anchors, and the k-mers of each copy found are counted and subtracted from the background's counts. A genome whose copy is broken (a copy reaching a contig end, several copies, or none) is also scanned for stretches made almost entirely of the locus's k-mers (95% of every 5,000 bases): pieces of the locus the anchors cannot place, such as a tandem array cut by a contig break, are subtracted too. A paralog 1% diverged keeps about 70% of the locus's k-mers, so it is not taken for a piece.
+3. Each k-mer is labelled by what is left (its count outside the locus): private (none), shared (up to `--informative-max` per background haplotype, on average) or repeat (more). Private k-mers of low complexity, or that become shared when the located copies are trimmed at their uncertain ends (unless those ends lie in such a stretch), are labelled shared.
 4. Decoys: in the decoy genomes (`--decoy-genomes`), clusters of shared k-mer hits outside the locus's own copy (20 hits, each within 1,500 bp of the next) are homologous windows; their k-mers that are not in the locus and are shared in the background become decoy k-mers, the alleles of the homologs.
 5. The screen is the closed syncmers ([Edgar 2021](https://doi.org/10.7717/peerj.10805); 11-mer minimum at either end) among the private and shared k-mers, about one in ten.
 6. Calibration: reads are simulated for three classes (2×150 pairs at 0.2% error, HiFi-like reads at 0.1%, ONT-like reads at 3%) from the haplotypes of up to eight samples held out one at a time (the k-mers only that sample carries read as new while its reads are scored), from the decoy windows, and from 5 Mb of the coordinate reference on each side of the locus. They are screened and scored as below, and the index keeps, per class, how many are certain at each cut from one to eight private sites.
@@ -75,10 +75,10 @@ A sample sheet holds tab-separated lines of sample, file and optionally a mate f
 | `<out>` | one row per screened fragment and locus (columns below) |
 | `<out stem>.summary.tsv` | the run: error rate and its source, fragments, screened, mean read length; each input's records by kind; per locus, fragments by fate and reason, the backbone depth, the fragments certain for another locus too, and the private-site cut with the calibration behind it |
 | `<locus>.plx` | the index |
-| `<locus>.index.tsv` | the index's report: the locus (k-mers by label, backbone, decoys, screen), each copy found per genome with the k-mers subtracted, the decoy windows, ceilings (the share of read-length windows of each haplotype with 2 private sites) and the calibration (per read class and cut: held-out fragments certain, off-target certain of those screened, and the 95% bound) |
+| `<locus>.index.tsv` | the index's report: the locus (k-mers by label, backbone, pieces, decoys, screen), each copy found per genome with the k-mers subtracted, the pieces found off them, the decoy windows, ceilings (the share of read-length windows of each haplotype with 2 private sites) and the calibration (per read class and cut: held-out fragments certain, off-target certain of those screened, and the 95% bound) |
 | `<reads-out>/<locus>.<fate>_1.fq.gz`, `_2.fq.gz` | with `--reads-out`: recruited pairs, as sequenced, with qualities (`<locus>.<fate>.fq.gz` for single reads) |
 
-An index dumped with `--dump-index` has one row per k-mer of the locus: `kmer` (its canonical sequence), `class` (`P`, `S` or `R`), `outside` (its background count outside the locus), `multiplicity` (its largest copy number within one haplotype), `backbone` (1 if once in every haplotype), `screen` (1 if a screen syncmer) and `nodes` (the graph nodes it starts on). Decoy k-mers are not locus k-mers and are not listed.
+An index dumped with `--dump-index` has one row per k-mer of the locus: `kmer` (its canonical sequence), `class` (`P`, `S` or `R`), `outside` (its background count outside the locus), `multiplicity` (its largest copy number within one haplotype), `backbone` (1 if once in every haplotype), `screen` (1 if a screen syncmer) and `nodes` (the graph nodes it starts on). Decoy k-mers follow as class `D`, with `.` in the fields only locus k-mers have.
 
 Table columns:
 
@@ -108,7 +108,9 @@ Table columns:
 - A homologous copy carrying the locus's alleles at two distinguishing bases within one read (gene conversion, a paralogous variant at both) reads as certain; a larger background, where more of those alleles are shared, reduces it.
 - Short pairs across a locus edge are less often certain than inside it: the located copies' ends are uncertain, so the k-mers near them are labelled shared.
 - Long spliced transcripts cross many junctions and read as divergent.
-- A locus missing from a background genome cannot be subtracted there; its k-mers keep that genome's counts.
+- A locus missing from a background genome cannot be subtracted there; its k-mers keep that genome's counts, unless the scan for pieces finds it.
+- Genomes given to the background as graphs are not scanned for pieces.
+- A homologous copy elsewhere that carries three or more of the reference's unique anchors in order is located as a copy of the locus and subtracted.
 
 ## Example
 
