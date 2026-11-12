@@ -129,16 +129,37 @@ bool aligned_changes(const std::string& ref, const std::string& hap, int w, std:
     std::int8_t mat[25];
     for (int i = 0; i < 5; ++i)
         for (int j = 0; j < 5; ++j) mat[i * 5 + j] = static_cast<std::int8_t>((i == 4 || j == 4) ? -1 : i == j ? 2 : -4);
-    ksw_extz_t ez;
-    std::memset(&ez, 0, sizeof(ez));
-    ksw_extd2_sse(nullptr, static_cast<int>(q.size()), q.data(), static_cast<int>(t.size()), t.data(), 5, mat,
-                  4, 2, 24, 1, w, -1, 0, 0, &ez);
-    if (ez.n_cigar <= 0 || ez.cigar == nullptr) { std::free(ez.cigar); return false; }
     std::vector<std::pair<int, int>> cigar;
-    cigar.reserve(static_cast<std::size_t>(ez.n_cigar));
-    for (int k = 0; k < ez.n_cigar; ++k)
-        cigar.emplace_back(static_cast<int>(ez.cigar[k] & 0xf), static_cast<int>(ez.cigar[k] >> 4));
-    std::free(ez.cigar);
+    auto align = [&](int band, int& score) {
+        ksw_extz_t ez;
+        std::memset(&ez, 0, sizeof(ez));
+        ksw_extd2_sse(nullptr, static_cast<int>(q.size()), q.data(), static_cast<int>(t.size()), t.data(), 5, mat,
+                      4, 2, 24, 1, band, -1, 0, 0, &ez);
+        if (ez.n_cigar <= 0 || ez.cigar == nullptr) { std::free(ez.cigar); return false; }
+        cigar.clear();
+        for (int k = 0; k < ez.n_cigar; ++k)
+            cigar.emplace_back(static_cast<int>(ez.cigar[k] & 0xf), static_cast<int>(ez.cigar[k] >> 4));
+        std::free(ez.cigar);
+        score = ez.score;
+        return true;
+    };
+    int score = 0;
+    if (!align(w, score)) return false;
+    // The band can hold a worse placement than one outside it. An alignment reaching D diagonals from the main
+    // one has at least 2D - |n - m| gap bases, each costing 1 or more and taking a column of 2 from the matches,
+    // so it scores at most n + m - 2(2D - |n - m|). Where that bound for D = w + 1 is above the banded score,
+    // the alignment is redone with the band beyond which the bound falls under it, and kept if it scores more.
+    if (w >= 0) {
+        const long long n = static_cast<long long>(ref.size()), m = static_cast<long long>(hap.size());
+        const long long d = n > m ? n - m : m - n;
+        const long long need = std::min(std::max(n, m), (n + m + 2 * d - static_cast<long long>(score) + 3) / 4 - 1);
+        const std::size_t cells = static_cast<std::size_t>(std::max(n, m)) * static_cast<std::size_t>(2 * need + 1);
+        if (need > w && cells <= kSeqAlignCellCap) {
+            const std::vector<std::pair<int, int>> banded = cigar;
+            int wide = 0;
+            if (!align(static_cast<int>(need), wide) || wide <= score) cigar = banded;
+        }
+    }
     return changes_from_cigar(cigar, ref, hap, out);
 }
 

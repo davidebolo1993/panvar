@@ -3640,6 +3640,16 @@ check "a gap split across two partly-N nodes: records, h1 h2 h3 GT, SVLEN, AN, g
   --no-per-bubble-vcf --no-variant-nodes > "$OUT/pgap/one.log" 2>&1
 check "one file written: the log says 'file'" "$(grep -o 'wrote 1 file[s]* in' "$OUT/pgap/one.log")" "wrote 1 file in"
 
+# Aligned alleles: the band is set from the node comparison's drift, which can understate the change where the
+# walks are matched at short nodes out of place. The best placement is a 123 bp deletion and an 86 bp insertion
+# (net -37); a band of the node drift alone holds only a worse one, a 71 -> 78 bp replacement.
+python3 -I "$TOOLS/spec_gfa.py" "$(cd "$(dirname "$0")/.." && pwd)/synthetic_data/call_cases/narrow_band.spec" "$OUT/nband"
+"$BIN" call -i "$OUT/nband/g.gfa" -c "$OUT/nband/g.bubbles.csv" -r 'ref#0#chr1:0-1186' -o "$OUT/nband/v" \
+  --no-per-bubble-vcf -q >/dev/null 2>&1
+check "aligned alleles: the placement a wider band finds (records SVTYPE:SVLEN)" \
+  "$(awk -F'\t' '!/^#/{n=split($8,f,";"); for(i=1;i<=n;i++) if(f[i] ~ /^SVTYPE=|^SVLEN=/) s=s f[i] " "; } END{print s}' "$OUT/nband/v.region.vcf")" \
+  "SVTYPE=DEL SVLEN=-123 SVTYPE=INS SVLEN=86 "
+
 printf "\n"
 if [ "$fails" -eq 0 ]; then printf "call_stats: all assertions passed\n"; exit 0; fi
 # repeated last, shortened: a long output can be cut in the middle by ctest
