@@ -4356,6 +4356,19 @@ void call_variants(
             std::size_t hlo = f(rlo, true), hhi = f(rhi, false);
             if (hlo == SIZE_MAX || hhi == SIZE_MAX) return false;
             if (!hj.empty()) { hlo = std::min(hlo, hj.front()); hhi = std::max(hhi, hj.back()); }
+            // An insertion at the stretch's first place goes in before it, and one at its last place after it
+            // (or, where the reference's copies sit there, among them): outside the stretch only where that is
+            // also its side of the haplotype's copies; otherwise its bases are in the stretch, in their place.
+            for (const AlignedChange& c : ch) {
+                if (c.t0 != c.t1 || (c.t0 != rlo && c.t0 != rhi)) continue;
+                bool inside = false;
+                if (c.t0 == rlo && !hj.empty() && c.q1 > hj.front()) inside = true;
+                if (c.t0 == rhi && c.t0 != rlo) {
+                    const bool among = std::find(rj.begin(), rj.end(), rhi) != rj.end();
+                    if (among || (!hj.empty() && c.q0 < hj.back())) inside = true;
+                }
+                if (inside) { hlo = std::min(hlo, c.q0); hhi = std::max(hhi, c.q1); }
+            }
             if (hhi < hlo) return false;
             // reference interval: the bases between compared base rlo-1 and compared base rhi (copies included)
             const std::size_t g_first = rlo == 0 ? tok_span(1, ref_steps.size() - 2).first : rgen(rlo - 1) + 1;

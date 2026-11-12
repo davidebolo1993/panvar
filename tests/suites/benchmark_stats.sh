@@ -357,6 +357,21 @@ for n in sp2:172 sp3:224 sp4:120 dd:224 ddsame:224; do
   check "${n%%:*}: a spacer between copies on one walk is kept once (left:stretch bp of h1)" \
         "$(sv ${n%%:*}_B missed_by_call_events):$(awk -F'\t' '$3=="cn" && $11 ~ /h1#/{print $9}' "$OUT/${n%%:*}_c.carrier_events.tsv")" "0:${n#*:}"
 done
+# An 80 bp X beside hX's copies, after them (eafter, three copies; eone, one) or before them (ebefore), and the
+# same stored on the other strand (rebefore, reafter). Aligned, X goes in at the copies' start on the reference;
+# its bases must stay on their side of hX's copies, so the stretch holds them where they follow the copies.
+for n in eafter:S+,U+,U+,U+,X+,T+ eone:S+,U+,X+,T+ ebefore:S+,X+,U+,U+,U+,T+; do
+  sed "s/^P hX#1#chr1 .*/P hX#1#chr1 ${n#*:}/" "$OUT/ubetween.spec" > "$OUT/${n%%:*}.spec"
+  spec "${n%%:*}"
+done
+for n in rebefore:T-,U-,U-,U-,X-,S- reafter:T-,X-,U-,U-,U-,S-; do
+  sed -e "s/^P hX#1#chr1 .*/P hX#1#chr1 ${n#*:}/" -e 's/^P ref#0#chr1:0-720 .*/P ref#0#chr1:0-720 T-,U-,U-,S-/' \
+      -e 's/^P h1#1#chr1 .*/P h1#1#chr1 T-,U-,U-,S-/' -e 's/^P h4#1#chr1 .*/P h4#1#chr1 T-,U-,U-,U-,U-,S-/' \
+      "$OUT/ubetween.spec" > "$OUT/${n%%:*}.spec"
+  spec "${n%%:*}"
+done
+check "an insertion beside the copies keeps its side of them (left: eafter eone ebefore rebefore reafter)" \
+      "$(sv eafter_B missed_by_call_events) $(sv eone_B missed_by_call_events) $(sv ebefore_B missed_by_call_events) $(sv rebefore_B missed_by_call_events) $(sv reafter_B missed_by_call_events)" "0 0 0 0 0"
 # No reference copy: X after the copies (hX), or before them (hY, whose copies call could not place).
 cat > "$OUT/uzero.spec" <<'EOF'
 N S 300 1
