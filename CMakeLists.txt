@@ -293,6 +293,11 @@ target_compile_options(panvarlib
 # public interface. For a static lib CMake still propagates the symbols to the final
 # executable link, while keeping edlib out of the installed export set.
 target_link_libraries(panvarlib PRIVATE edlib abpoa minigraph sshash hts ZLIB::ZLIB)
+# GCC 8 and older keep std::filesystem in a separate library; PUBLIC so every target linking
+# panvarlib (the tool and the unit tests) gets it after the library on the link line.
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND CMAKE_CXX_COMPILER_VERSION VERSION_LESS 9)
+    target_link_libraries(panvarlib PUBLIC stdc++fs)
+endif()
 
 add_executable(panvar
     src/main.cpp
@@ -313,12 +318,6 @@ target_compile_definitions(panvar PRIVATE PANVAR_VERSION="${PROJECT_VERSION}")
 target_link_libraries(panvar PRIVATE panvarlib minimap2 Threads::Threads ZLIB::ZLIB)
 if(NOT WIN32)
     target_link_libraries(panvar PRIVATE m)
-endif()
-# GCC 8 and older keep std::filesystem symbols in a separate library.
-if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
-    if(CMAKE_CXX_COMPILER_VERSION VERSION_LESS 9)
-        target_link_libraries(panvar PRIVATE stdc++fs)
-    endif()
 endif()
 
 target_compile_options(panvar
