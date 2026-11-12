@@ -3707,6 +3707,20 @@ check "--classify-ins: both insertions, the node replacement's too, are classifi
   "$(awk -F'\t' '!/^#/{n=split($8,f,";"); l=""; t="-"; for(i=1;i<=n;i++){split(f[i],kv,"="); if(kv[1]=="SVLEN") l=kv[2]; if(kv[1]=="INS_SUBTYPE") t=kv[2]} printf "%s:%s ", l, t}' "$OUT/ncls/v.region.vcf")" \
   "90:NOVEL 97:NOVEL "
 
+# A 52 bp unit U, six copies on the reference, then D, a node spelling U, and E. h2 skips D; h1 skips it too but
+# walks F, a node spelling E, in place of E. h1's replacement is the deletion of D, which slides along the copies,
+# but no further than where the copies left the walks: it is h2's deletion, one record.
+U52=$(blk 52 103)
+{ printf 'N L 300 101\nN A 100 102\nN U =%s\nN D =%s\nN E =%s\nN F =%s\nN R 300 105\n' "$U52" "$U52" "$(blk 30 108)" "$(blk 30 108)"
+  M="U+,U+,U+,U+,U+,U+"
+  printf 'P ref#0#chr1:0-1094 L+,A+,%s,D+,E+,R+\nP h1#1#chr1 L+,A+,%s,F+,R+\nP h2#1#chr1 L+,A+,%s,E+,R+\n' "$M" "$M" "$M"
+  printf 'P h3#1#chr1 L+,A+,%s,U+,U+,D+,E+,R+\nB L R A;U;D;E;F\n' "$M"; } > "$OUT/nfloor.spec"
+python3 -I "$TOOLS/spec_gfa.py" "$OUT/nfloor.spec" "$OUT/nfloor"
+"$BIN" call -i "$OUT/nfloor/g.gfa" -c "$OUT/nfloor/g.bubbles.csv" -r 'ref#0#chr1:0-1094' -o "$OUT/nfloor/v" \
+  --no-align-alleles --no-per-bubble-vcf -q >/dev/null 2>&1
+check "a node replacement's deletion beside counted copies merges with the same deletion (DEL records, AC)" \
+  "$(grep -v '^#' "$OUT/nfloor/v.region.vcf" | grep -c 'SVTYPE=DEL;') $(awk -F'\t' '!/^#/ && /SVTYPE=DEL;/{n=split($8,f,";"); for(i=1;i<=n;i++) if(f[i] ~ /^AC=/) print f[i]}' "$OUT/nfloor/v.region.vcf")" "1 AC=2"
+
 # Aligned alleles: the band is set from the node comparison's drift, which can understate the change where the
 # walks are matched at short nodes out of place. The best placement is a 123 bp deletion and an 86 bp insertion
 # (net -37); a band of the node drift alone holds only a worse one, a 71 -> 78 bp replacement.

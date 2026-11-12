@@ -3284,9 +3284,18 @@ void call_variants(
             d = d.substr(pre, dl);
             a = a.substr(pre, il);
             const std::size_t gx = e.splice_before + 1 + pre;
+            // Not past the start of the stretch of reference the walks still hold, into copies they no longer
+            // do, as an aligned change is bounded.
+            std::size_t floor = 0;
+            if (e.r_lo != SIZE_MAX && e.r_lo < Rdiff.size()) {
+                std::size_t k = e.r_lo, j = e.r_lo;
+                while (k > 0 && Rdiff[k - 1].src_idx + 1 == Rdiff[k].src_idx) --k;
+                while (j + 1 < Rdiff.size() && Rdiff[j + 1].src_idx == Rdiff[j].src_idx + 1) ++j;
+                if (k > 0) floor = tok_span(Rdiff[k].src_idx, Rdiff[j].src_idx).first;   // none left of the walk's start
+            }
             std::size_t x = gx;
             std::string u = dl == 0 ? a : d;
-            while (x > base + 1 && ref_genome[x - 1 - base] == u.back() &&
+            while (x > base + 1 && x > floor && ref_genome[x - 1 - base] == u.back() &&
                    (dl == 0 || ref_genome[x - 1 - base] == ref_genome[x - 1 - base + dl])) {
                 u = u.back() + u.substr(0, u.size() - 1);
                 --x;
