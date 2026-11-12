@@ -3640,6 +3640,19 @@ check "a gap split across two partly-N nodes: records, h1 h2 h3 GT, SVLEN, AN, g
   --no-per-bubble-vcf --no-variant-nodes > "$OUT/pgap/one.log" 2>&1
 check "one file written: the log says 'file'" "$(grep -o 'wrote 1 file[s]* in' "$OUT/pgap/one.log")" "wrote 1 file in"
 
+# Node comparison: h1 walks node b in place of the reference's a, both the single base G, and skips the 100 bp
+# node D after a. The two sides of the replacement share that G, so it is written as its minimal change: a plain
+# 100 bp deletion, left-aligned (D ends in G, so POS 300 and END 400), with no SUBSTITUTION flag.
+printf 'N L 300 91\nN a =G\nN b =G\nN D 100 92\nN R 300 93\nP ref#0#chr1:0-701 L+,a+,D+,R+\nP h1#1#chr1 L+,b+,R+\nP h2#1#chr1 L+,a+,D+,R+\nB L R a;b;D\n' \
+  > "$OUT/ntrim.spec"
+python3 -I "$TOOLS/spec_gfa.py" "$OUT/ntrim.spec" "$OUT/ntrim"
+"$BIN" call -i "$OUT/ntrim/g.gfa" -c "$OUT/ntrim/g.bubbles.csv" -r 'ref#0#chr1:0-701' -o "$OUT/ntrim/v" \
+  --no-align-alleles --no-per-bubble-vcf -q >/dev/null 2>&1
+check "node replacement sharing a base with the reference: a plain deletion (POS END SVLEN flag)" \
+  "$(awk -F'\t' '!/^#/{n=split($8,f,";"); e=""; l=""; for(i=1;i<=n;i++){split(f[i],kv,"=");
+       if(kv[1]=="END") e=kv[2]; if(kv[1]=="SVLEN") l=kv[2]}
+       print $2, e, l, ($8 ~ /SUBSTITUTION/ ? "SUBSTITUTION" : "plain")}' "$OUT/ntrim/v.region.vcf")" "300 400 -100 plain"
+
 # Aligned alleles: the band is set from the node comparison's drift, which can understate the change where the
 # walks are matched at short nodes out of place. The best placement is a 123 bp deletion and an 86 bp insertion
 # (net -37); a band of the node drift alone holds only a worse one, a 71 -> 78 bp replacement.

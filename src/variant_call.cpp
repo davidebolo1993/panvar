@@ -4399,11 +4399,21 @@ void call_variants(
             // before it, as its minimal change: the sequence the two sides share at either end is trimmed,
             // as VCF normalisation does. What is left is an INS, a DEL, or -- both sides still holding
             // sequence -- a DEL/INS of the net change flagged SUBSTITUTION, or a SUB spelling both when the
-            // net change is under --min-sv-bp.
+            // net change is under --min-sv-bp. A replacement from the node comparison that is one exact change
+            // is written the same way when its two sides share bases at either end, as different nodes spelling
+            // the same bases do: a deletion with one base of the haplotype's own is then a plain deletion.
+            bool node_minimal = false;
+            if (!e.seq_event && e.type == EvType::Sub && e.splice_ok && !imprecise && !e.seq.empty() &&
+                !e.alt_seq.empty()) {
+                const std::string d = ref_rev ? reverse_complement(e.seq) : e.seq;
+                const std::string& a = e.splice_ins;
+                node_minimal = upper_base(d.front()) == upper_base(a.front()) || upper_base(d.back()) == upper_base(a.back());
+            }
+            const std::size_t before = e.seq_event ? e.seq_before : e.splice_before;
             bool rp = false, rp_sub = false;
             std::string rp_del, rp_ins;   // reference orientation
-            if (e.seq_event && !ref_base_at(e.seq_before).empty()) {
-                pos = e.seq_before;
+            if ((e.seq_event || node_minimal) && !ref_base_at(before).empty()) {
+                pos = before;
                 const std::string& del_w = e.type == EvType::Ins ? std::string() : e.seq;
                 const std::string& ins_w = e.type == EvType::Ins ? e.seq : e.type == EvType::Sub ? e.alt_seq : std::string();
                 std::string d = ref_rev ? reverse_complement(del_w) : del_w;
