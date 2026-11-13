@@ -77,13 +77,32 @@ if command -v samtools > /dev/null; then
   awk -F'\t' 'BEGIN {OFS = "\t"} !/^@/ && $8 > 150000 {$8 += 7} {print}' coord.sam | samtools view -b -o stale.bam - && samtools index stale.bam
   "$BIN" recruit --locus "$IDX" -i stale.bam -o stale.tsv -t 4 2> stale.log; sorted stale.tsv
   check "stale mate positions: the mates are found by a second pass, same table" 'cmp -s stale.tsv.sorted fq.tsv.sorted && grep -q "not where the index put them" stale.log'
-  # no mate waited for: every pair whose first read misses the screens has its mate fetched, nearby mates by one query
+  # no mate waited for: every pair whose first read misses the screens has its mate fetched
   PANVAR_TEST_NEAR=0 "$BIN" recruit --locus "$IDX" -i coord.bam -o fetch.tsv -t 4 2> fetch.log; sorted fetch.tsv
-  check "mates fetched through the index by contig and position, several per query: same table ($(grep -o 'mates fetched: [0-9]*' fetch.log))" 'cmp -s fetch.tsv.sorted fq.tsv.sorted && ! grep -q "second pass" fetch.log && [[ $(grep -o "mates fetched: [0-9]*" fetch.log | grep -o "[0-9]*$") -ge 10 ]]'
+  check "mates fetched through the index by contig and position: same table ($(grep -o 'mates fetched: [0-9]*' fetch.log))" 'cmp -s fetch.tsv.sorted fq.tsv.sorted && ! grep -q "second pass" fetch.log && [[ $(grep -o "mates fetched: [0-9]*" fetch.log | grep -o "[0-9]*$") -ge 10 ]]'
   for c in chrA chrB; do printf '>%s\n' $c; head -c 20000000 /dev/zero | tr '\0' 'A' | fold -w 60; echo; done > zero.fa
   samtools faidx zero.fa && samtools view -C -T zero.fa -o coord.cram coord.bam 2> /dev/null && samtools index coord.cram
   "$BIN" recruit --locus "$IDX" -i coord.cram --cram-reference zero.fa -o cram.tsv -t 4 -q; sorted cram.tsv
   check "a CRAM gives the same table" 'cmp -s cram.tsv.sorted fq.tsv.sorted'
+  # the rows' order: fetched mates come in the order their reads came, whatever the queries (a BAM queries
+  # each mate position alone, a CRAM nearby mates together); those a second pass finds follow, in file order
+  nfetch() { grep -o "mates fetched: [0-9]*" "$1" | grep -o "[0-9]*$"; }
+  nsecond() { grep -o "second pass for mates: [0-9]*" "$1" | grep -o "[0-9]*$" || echo 0; }
+  PANVAR_TEST_NEAR=0 "$BIN" recruit --locus "$IDX" -i coord.cram --cram-reference zero.fa -o fetch_cram.tsv -t 4 2> fetch_cram.log
+  check "a CRAM writes the BAM's rows in the BAM's order, mates waited for or all fetched" 'cmp -s cram.tsv bam.tsv && cmp -s fetch_cram.tsv fetch.tsv'
+  check "fetched mates come in the order their reads came" 'python3 "$TOOLS/fetch_order.py" fetch.tsv coord.sam $(nfetch fetch.log) 0 && python3 "$TOOLS/fetch_order.py" fetch_cram.tsv coord.sam $(nfetch fetch_cram.log) 0'
+  # mates found through the index mixed with mates whose fields point elsewhere, found by a second pass
+  awk -F'\t' 'BEGIN {OFS = "\t"} !/^@/ && $8 > 0 && NR % 2 == 0 {$8 += 7} {print}' coord.sam > mixed.sam
+  samtools view -b -o mixed.bam mixed.sam 2> /dev/null && samtools index mixed.bam
+  samtools view -C -T zero.fa -o mixed.cram mixed.bam 2> /dev/null && samtools index mixed.cram
+  for t in 1 4; do
+    for f in bam cram; do
+      PANVAR_TEST_NEAR=0 "$BIN" recruit --locus "$IDX" -i mixed.$f --cram-reference zero.fa -o mixed.$f.$t.tsv -t $t 2> mixed.$f.$t.log
+    done
+  done
+  sorted mixed.bam.1.tsv
+  n2=$(nsecond mixed.bam.1.log); n1=$(( $(nfetch mixed.bam.1.log) - n2 ))
+  check "mates through the index ($n1) and by a second pass ($n2): the same table, its rows in order, alike from BAM and CRAM at 1 and 4 threads" '[[ $n1 -gt 0 && $n2 -gt 0 ]] && cmp -s mixed.bam.1.tsv.sorted fq.tsv.sorted && python3 "$TOOLS/fetch_order.py" mixed.bam.1.tsv mixed.sam $n1 $n2 && cmp -s mixed.bam.1.tsv mixed.cram.1.tsv && cmp -s mixed.bam.1.tsv mixed.bam.4.tsv && cmp -s mixed.bam.1.tsv mixed.cram.4.tsv'
   python3 -c "import sys; d=open('coord.bam','rb').read(); import struct; o=0; ends=[]
 while o < len(d):
     bsize=struct.unpack('<H', d[o+16:o+18])[0]+1; o+=bsize; ends.append(o)
