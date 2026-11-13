@@ -516,6 +516,10 @@ BUBBLE=1 spec sepb --cn
 cn_exact() { echo "$(awk -F'\t' '$1=="cn_exact_checked"{print $2}' "$OUT/$1_B.summary.tsv"):$(tail -n +2 "$OUT/$1_B.carrier_checks.tsv" | awk -F'\t' '$3=="cn_exact"' | wc -l | tr -d ' ')"; }
 check "copies: the VCF rebuilds every haplotype (large_left_vcf_bp; cn_exact checked:differing)" \
   "$(sv sepb_B large_left_vcf_bp) $(cn_exact sepb)" "0 6:0"
+cp "$OUT/sepb.spec" "$OUT/sepbs.spec"
+BUBBLE=1 spec sepbs --cn --max-seq-bp 100
+check "copies, --max-seq-bp under a copy: gained copies named by the reference stretches they repeat still rebuild (large_left_vcf_bp; cn_exact)" \
+  "$(sv sepbs_B large_left_vcf_bp) $(cn_exact sepbs)" "0 6:0"
 awk '$1=="P"{n=split($3,s,","); o=""; for(i=n;i>=1;i--){x=s[i]; c=substr(x,length(x)); x=substr(x,1,length(x)-1) (c=="+"?"-":"+")
             o=o (o==""?"":",") x}; print $1, $2, o; next} {print}' "$OUT/sepb.spec" > "$OUT/sepbr.spec"
 BUBBLE=1 spec sepbr --cn

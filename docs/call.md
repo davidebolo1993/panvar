@@ -74,7 +74,7 @@ panphorte's unit-graph table is read from the site table's prefix (or `--panphor
 | `--classify-ins` | tell new insertions (`NOVEL`) from duplications (`DUP`) with minimap2 (`--minimap-preset`, `--minimap-best-n`, `--ins-dup-min-identity`), for every `INS` record by the bases it inserts | off |
 | `--diploid` | one column per sample, with phased `GT` (`/` for a sample with unnumbered haplotypes); `CN` is the sample's total | off |
 | `--no-per-bubble-vcf`, `--no-variant-nodes` | skip the per-site VCFs, or the node and carrier tables | off |
-| `--max-seq-bp <N>` | leave `INSSEQ`, `DELSEQ`, `INVSEQ` and each `CN_FORMS` sequence out above N bases, so VCF tools read the lines; `0` writes them all | `20000` |
+| `--max-seq-bp <N>` | leave `INSSEQ`, `DELSEQ`, `INVSEQ` and each `CN_FORMS` sequence (its literal bases) out above N bases, so VCF tools read the lines; `0` writes them all | `20000` |
 | `-t, --threads <N>` | worker threads (`0` = all cores) | `0` |
 | `-q, --quiet` | no progress logs | off |
 
@@ -98,7 +98,7 @@ VCF 4.2. `POS` is the base before the event, `END` its last reference base. `FIL
 | `AN`, `AC`, `AF` | haplotypes with an allele at the site (not `.`), carriers, ratio. The reference path is left out, and a haplotype in several contigs counts once, a carrier where one of its contigs carries the record, as with `--diploid` |
 | `BUBBLE_ID`, `EVENT_NODES` | the site and the event's nodes; a `PATH_INVERSION`, typed from the walks, has no nodes |
 | `CN_METHOD`, `REF_CN`, `RU_LEN` | how copies were counted, the reference's count, a unit copy's length; a `CNV`'s `POS`+1..`END` covers the reference's copies |
-| `CN_FORMS` | on a `MODULE` record, the copies its carriers gained or lost, each an edit of the reference: `START-END:SEQ`, reference bases `START`..`END` replaced by `SEQ` in reference orientation (`END` = `START`-1 for an insertion, `SEQ` empty for a deletion, `*` above `--max-seq-bp`). Distinct copies are listed once, in reference order |
+| `CN_FORMS` | on a `MODULE` record, the copies its carriers gained or lost, each an edit of the reference: `START-END:SEQ`, reference bases `START`..`END` replaced by `SEQ` in reference orientation (`END` = `START`-1 for an insertion, `SEQ` empty for a deletion). `SEQ` names the reference stretches it repeats where that is shorter, `=A-B` (bases `A`..`B`) or `~A-B` (their reverse complement), joined with literal bases by `+`: a gained copy repeats the reference's copies, so its form stays short however long the copy. It is `*` where its literal bases exceed `--max-seq-bp`. Distinct copies are listed once, in reference order |
 | `SVLEN_RANGE`, `MERGE_MIN_SIM`, `MERGE_TEST` | how much the merged events differ: their sizes, and the weakest similarity of a member to the representative in the test that admits it (under the test's threshold: the member joined through others) |
 | `GENES` | with `--gtf`: genes over the record; inside a copy of a `MODULE` site holding several genes, the paralogs its carriers hold |
 

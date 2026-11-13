@@ -1072,7 +1072,11 @@ void join_small_pieces(const Graph& graph, const std::vector<Tok>& R, const std:
 }
 
 // One haplotype's copies at a collapsed module, told apart from its other events (see call.md, step 7).
-struct CopyForm { std::size_t start = 0, end = 0; std::string seq; };   // reference [start, end] -> seq
+// A copy as an edit of the reference: [start, end] replaced by seq (reference orientation). `code` spells seq
+// by the reference stretches it repeats (=A-B forward, ~A-B reverse-complemented) and literal bases between,
+// joined by '+'; empty where that is no shorter. A gained copy repeats the reference's copies, so the code stays
+// short however long the copy.
+struct CopyForm { std::size_t start = 0, end = 0; std::string seq, code; std::size_t literal_bp = 0; };
 struct CopySplit {
     enum Mode { None, Copies, OwnEvent } mode = None;
     std::vector<Event> rest;        // Copies: its events with the copies taken out, in walk order
@@ -2296,7 +2300,7 @@ void call_variants(
         out << "##INFO=<ID=RU_LEN,Number=1,Type=Integer,Description=\"Repeat-unit length in bp, one represented copy. Emitted only for CN_METHOD=UNIT; (CN-REF_CN)*RU_LEN is the repeat-copy component of the haplotype size, while FORMAT/CNBP is the full module-walk change and CNRESID is their difference\">\n";
         out << "##INFO=<ID=CN_UNIT_BP,Number=1,Type=Integer,Description=\"CN_METHOD=MODULE only: one copy of the module, the reference's bp over its nodes divided by REF_CN; with REF_CN=0, the median over the haplotypes holding copies of their bp per copy. Copies of different types differ, so a carrier's own change is FORMAT:CNBP\">\n";
         out << "##INFO=<ID=CN_METHOD,Number=1,Type=String,Description=\"How CN was measured: UNIT (copies of a panphorte unit graph, counted exactly where they pass its anchor; a one-node unit graph's are its traversals) or MODULE (--cn: passes through the anchor of a collapsed module, the module nodes the most paths revisit)\">\n";
-        out << "##INFO=<ID=CN_FORMS,Number=.,Type=String,Description=\"CN_METHOD=MODULE: the copies carriers gained or lost, each an edit of the reference, START-END:SEQ (reference bases START..END, 1-based, replaced by SEQ in reference orientation; END=START-1 for an insertion, SEQ empty for a deletion, * where SEQ is over --max-seq-bp). FORMAT/CNFORM names each carrier's; with its other records they rebuild its walk\">\n";
+        out << "##INFO=<ID=CN_FORMS,Number=.,Type=String,Description=\"CN_METHOD=MODULE: the copies carriers gained or lost, each an edit of the reference, START-END:SEQ (reference bases START..END, 1-based, replaced by SEQ in reference orientation; END=START-1 for an insertion, SEQ empty for a deletion, * where its literal bases are over --max-seq-bp). SEQ may name the reference stretches it repeats, =A-B (bases A..B) or ~A-B (their reverse complement), joined with literal bases by +. FORMAT/CNFORM names each carrier's; with its other records they rebuild its walk\">\n";
         out << "##INFO=<ID=CN_MODULE_REF_BP,Number=1,Type=Integer,Description=\"Reference bp across the bubble interior, each visit counted, over which CN_METHOD=UNIT measures CNBP. On a MODULE record END-POS equals it, unless CN_SPAN_AMBIGUOUS (the span then also encloses the boundary visits between the outermost ones); on a UNIT record END covers the reference's copies, which can lie inside the interior\">\n";
         out << "##INFO=<ID=CN_ANCHOR_BP,Number=1,Type=Integer,Description=\"CN_METHOD=MODULE: bp of the module's anchor, the nodes CN counts passes through\">\n";
         out << "##INFO=<ID=CN_MODULE_NODES_BP,Number=1,Type=Integer,Description=\"CN_METHOD=MODULE: bp of the module's nodes, those some path visits more than once, one visit each\">\n";
@@ -3794,6 +3798,8 @@ void call_variants(
             module_rec == nullptr ? std::unordered_set<std::string>()
                                   : std::unordered_set<std::string>(module_rec->carriers.begin(), module_rec->carriers.end());
         std::vector<CopySplit> copy_split(alleles.size());
+        std::unordered_map<std::string, std::size_t> ref_tok_of_node;   // a node the reference walks: one place it does
+        for (std::size_t k = 0; k < Rdiff.size(); ++k) ref_tok_of_node.emplace(Rdiff[k].node_id, k);
         run_parallel(alleles.size(), options.threads, [&](std::size_t ai) {
             if (build_walk_signature(alleles[ai].steps) == ref_sig) return;
             std::vector<Event> events;
@@ -3841,7 +3847,51 @@ void call_variants(
                                 const std::size_t before = ref_rev ? sp.first - 1 : sp.second;   // the base it follows
                                 f.start = before + 1; f.end = before;
                             }
+                            // The inserted bases as the reference stretches they repeat: each token of a node the
+                            // reference walks, at the place it walks it, in walk order; kept where it spells the same
+                            // bases and is shorter.
+                            struct Seg { std::size_t a = 0, b = 0; bool rc = false; std::string lit; };
+                            std::vector<Seg> segs;
+                            for (const Tok* t : ht) {
+                                const auto it = ref_tok_of_node.find(t->node_id);
+                                if (it == ref_tok_of_node.end()) { segs.push_back({0, 0, false, spell_toks(graph, {t})}); continue; }
+                                const Tok& r = Rdiff[it->second];
+                                const auto sp = tok_span(r.src_idx, r.src_idx);
+                                if (sp.first == 0) { segs.push_back({0, 0, false, spell_toks(graph, {t})}); continue; }
+                                segs.push_back({sp.first, sp.second, (t->reverse != r.reverse) != ref_rev, std::string()});
+                            }
+                            if (ref_rev) {   // the copy in reference orientation: the walk's pieces backwards, each turned
+                                std::reverse(segs.begin(), segs.end());
+                                for (Seg& g : segs) { if (g.a == 0) g.lit = reverse_complement(g.lit); else g.rc = !g.rc; }
+                            }
+                            std::vector<Seg> merged_segs;
+                            for (Seg& g : segs) {
+                                if (!merged_segs.empty() && g.a != 0 && merged_segs.back().a != 0 && merged_segs.back().rc == g.rc &&
+                                    (g.rc ? g.b + 1 == merged_segs.back().a : merged_segs.back().b + 1 == g.a)) {
+                                    if (g.rc) merged_segs.back().a = g.a; else merged_segs.back().b = g.b;
+                                } else if (!merged_segs.empty() && g.a == 0 && merged_segs.back().a == 0) merged_segs.back().lit += g.lit;
+                                else merged_segs.push_back(std::move(g));
+                            }
+                            std::string code, made;
+                            std::size_t lit_bp = 0;
+                            const std::size_t base = ref_meta.region_start_1based;
+                            for (const Seg& g : merged_segs) {
+                                if (!code.empty()) code += '+';
+                                if (g.a == 0) {
+                                    std::string l = g.lit;
+                                    for (char& ch : l) ch = upper_base(ch)[0];
+                                    code += l; made += l; lit_bp += l.size();
+                                    continue;
+                                }
+                                code += (g.rc ? '~' : '=') + std::to_string(g.a) + '-' + std::to_string(g.b);
+                                if (g.a < base || g.b + 1 - base > ref_genome.size()) { made.clear(); break; }
+                                std::string x = ref_genome.substr(g.a - base, g.b + 1 - g.a);
+                                for (char& ch : x) ch = upper_base(ch)[0];
+                                made += g.rc ? reverse_complement(x) : x;
+                            }
                             f.seq = std::move(seq);
+                            if (made == f.seq && code.size() < f.seq.size()) { f.code = std::move(code); f.literal_bp = lit_bp; }
+                            else f.literal_bp = f.seq.size();
                             return true;
                         };
                         copy_split[ai] = split_copies(graph, Rdiff, Htok, events, module_rec->module_nodes, module_rec->anchor_nodes,
@@ -5267,7 +5317,8 @@ void call_variants(
                 info << ";CN_FORMS=";
                 for (std::size_t k = 0; k < mr.forms.size(); ++k) {
                     const CopyForm& f = mr.forms[k];
-                    info << (k ? "," : "") << f.start << '-' << f.end << ':' << (seq_fits(f.seq.size()) ? f.seq : std::string("*"));
+                    info << (k ? "," : "") << f.start << '-' << f.end << ':'
+                         << (!seq_fits(f.literal_bp) ? std::string("*") : f.code.empty() ? f.seq : f.code);
                 }
             }
             auto sample_cnbp = [&](const std::string& s) -> long long {

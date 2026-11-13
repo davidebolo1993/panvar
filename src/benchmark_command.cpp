@@ -909,7 +909,24 @@ int run_benchmark_command(const std::vector<std::string>& args) {
     const std::string& ce_in = spec.ce_in;
     // ---- call's output: the VCF and each carrier's own event ----
     std::vector<std::string> vcf_samples;
-    const std::vector<VcfRecordInfo> vcf = load_region_vcf(vcf_in, vcf_samples);
+    std::vector<VcfRecordInfo> vcf = load_region_vcf(vcf_in, vcf_samples);
+    // A form spelled by the reference stretches it repeats (=A-B, ~A-B reverse-complemented, joined with literal
+    // bases by +) is spelled out; one naming bases outside the region cannot be.
+    for (VcfRecordInfo& r : vcf)
+        for (VcfRecordInfo::Form& fm : r.cn_forms) {
+            if (!fm.spelled || fm.seq.find_first_of("=~+") == std::string::npos) continue;
+            std::string made;
+            for (const std::string& g : split_on(fm.seq, '+')) {
+                if (g.empty() || (g[0] != '=' && g[0] != '~')) { made += g; continue; }
+                const std::size_t dash = g.find('-');
+                const std::size_t a = dash == std::string::npos ? 0 : parse_count(g.substr(1, dash - 1), vcf_in + " CN_FORMS");
+                const std::size_t b = dash == std::string::npos ? 0 : parse_count(g.substr(dash + 1), vcf_in + " CN_FORMS");
+                if (a < region_start || b < a || b + 1 - region_start > ref_seq.size()) { fm.spelled = false; break; }
+                const std::string x = ref_seq.substr(a - region_start, b + 1 - a);
+                made += g[0] == '~' ? reverse_complement(x) : x;
+            }
+            fm.seq = fm.spelled ? made : std::string();
+        }
     std::unordered_map<std::string, const VcfRecordInfo*> vcf_by_id;
     // Records are matched to carrier events and to what is left by their ID.
     for (const VcfRecordInfo& r : vcf)

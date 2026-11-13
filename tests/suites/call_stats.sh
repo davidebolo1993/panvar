@@ -1060,6 +1060,13 @@ python3 -I "$(cd "$(dirname "$0")/.." && pwd)/tools/spec_gfa.py" "$OUT/sepsm.spe
 cn_call "$OUT/sepsm/g.gfa" "$OUT/sepsm"
 check "copies: two pieces under --min-sv-bp 8 bp apart inside a copy are one record (hsm)" \
   "$(hrec "$OUT/sepsm.region.vcf" 'hsm#1#chr1')" "0:2 DEL:-50"
+# A gained copy repeats the reference's copies, so its form names those stretches instead of spelling them, and
+# --max-seq-bp under the copy leaves it spelled: hgain's copy forward, hinv's turned round.
+"$BIN" call -i "$OUT/sep.b.sorted.gfa" --bubble-prefix "$OUT/sep.b" -r ref -o "$OUT/sep_short" --cn --max-seq-bp 100 --quiet >/dev/null 2>&1
+check "copies: forms of gained copies name the reference stretches they repeat (hgain, hinv CN_FORMS entries)" \
+  "$(awk -F'\t' '/^#CHROM/{for(i=10;i<=NF;i++) c[$i]=i} !/^#/ && /SVTYPE=CNV;/{n=split($9,k,":"); match($8,/CN_FORMS=[^;]*/); split(substr($8,RSTART+9,RLENGTH-9),fs,",")
+       for (h in c) if (h=="hgain#1#chr1" || h=="hinv#1#chr1") { split($c[h],v,":"); for(j=1;j<=n;j++) if(k[j]=="CNFORM") r[h]=fs[v[j]] }
+       print r["hgain#1#chr1"], r["hinv#1#chr1"]}' "$OUT/sep_short.region.vcf")" "2001-2000:=2001-2200 2361-2360:~2001-2200"
 # --diploid: hhalf and heq as one sample; each haplotype's copies are listed, joined as GT is.
 sed -e 's/^P hhalf#1#chr1 /P s9#1#chr1 /' -e 's/^P heq#1#chr1 /P s9#2#chr1 /' "$OUT/sep.spec" > "$OUT/sepdip.spec"
 python3 -I "$(cd "$(dirname "$0")/.." && pwd)/tools/spec_gfa.py" "$OUT/sepdip.spec" "$OUT/sepdip"
