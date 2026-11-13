@@ -1146,15 +1146,6 @@ struct MergedRecord {
     std::unordered_set<std::string> anchor_nodes, module_nodes;
     std::size_t min_size_bp = 0;                            // smallest merged member size (SVLEN_RANGE)
     std::size_t max_size_bp = 0;                            // largest merged member size
-    double merge_max_jaccard = -1.0;                        // strongest node-set Jaccard that merged a member (-1 = none)
-    double merge_max_seqid = -1.0;                          // strongest sequence identity that merged a member (-1 = none)
-    // Weakest pairwise node Jaccard inside the merged component (-1 = single member). Single-linkage
-    // can chain A-B-C where A and C would never merge directly, and the strongest-edge fields above
-    // cannot show that; this can. `exact` is false when the component was too large to compare all
-    // pairs and the figure is an upper bound taken against the representative.
-    double merge_diameter = -1.0;
-    bool merge_diameter_exact = true;
-    double merge_direct_frac = -1.0;   // share of member pairs that match directly (-1: unmerged)
     std::unordered_map<std::size_t, std::size_t> member_size;   // member allele -> its own event's size
     std::unordered_map<std::size_t, long long> member_net;      // Sub: member allele -> its own net bp change
     // Member allele -> the events of its own that joined this record: what each carrier was called for,
@@ -1959,11 +1950,8 @@ void call_variants(
         out << "##INFO=<ID=MULTI_CROSSING_UNSCORED,Number=1,Type=Integer,Description=\"Of the MULTI_CROSSING paths, those with a traversal the scored walk does not hold whose allele length differs from every reference traversal of this bubble by --min-sv-bp or more: an SV-sized difference no record here describes. Absent when none\">\n";
         if (!genes.empty())
             out << "##INFO=<ID=GENES,Number=.,Type=String,Description=\"Gene(s) overlapping the variant (from --gtf); for an event inside a gene of a copy-number site's copies, that gene's paralogs its carriers hold\">\n";
-        out << "##INFO=<ID=MERGE_DIAMETER,Number=1,Type=Float,Description=\"Weakest pairwise node Jaccard between any two events merged into this record. Node-comparison events merge by transitive single-linkage, so a record can span members that would never have merged directly (A-B-C with A and C dissimilar); MERGE_JACCARD reports the strongest edge and cannot show that, this reports the worst. Events from aligned alleles merge around a representative, each member matching it. Near 0 means the record's members share almost no nodes and the chain reached a long way. Absent on unmerged records\">\n";
-        out << "##INFO=<ID=MERGE_DIAMETER_EXACT,Number=0,Type=Flag,Description=\"MERGE_DIAMETER, MERGE_JACCARD, MERGE_SEQID and MERGE_DIRECT_FRAC compared every pair of merged members. Absent means the component exceeded the all-pairs bound (128 members) and each was measured against the representative only\">\n";
-        out << "##INFO=<ID=MERGE_JACCARD,Number=1,Type=Float,Description=\"Strongest node-set Jaccard over the pairs of merged members that match directly (every pair of the component, not only the pairs the merge sweep tested), and over force-called members against the representative\">\n";
-        out << "##INFO=<ID=MERGE_SEQID,Number=1,Type=Float,Description=\"Strongest sequence identity over the same directly matching pairs, counted only where the Jaccard gate did not decide the pair\">\n";
-        out << "##INFO=<ID=MERGE_DIRECT_FRAC,Number=1,Type=Float,Description=\"Share of member pairs of the merged component that match each other directly (same test as the merge). For node-comparison events (transitive single-linkage) below 1 means some members joined only through a chain; for events from aligned alleles (merged around a representative) it means members matched only through the representative. Force-called members are not counted. Absent on unmerged records\">\n";
+        out << "##INFO=<ID=MERGE_MIN_SIM,Number=1,Type=Float,Description=\"How alike the events merged into this record are: the weakest similarity of a member event to the representative, in the test that admits it (MERGE_TEST). Under that test's threshold (--merge-seq-identity, --merge-jaccard), the member joined only through other members. Absent where every member holds the representative's event\">\n";
+        out << "##INFO=<ID=MERGE_TEST,Number=1,Type=String,Description=\"The test MERGE_MIN_SIM is measured in: spliced (sequence identity of the haplotypes the two events make, for events found by aligning alleles or each one exact change), jaccard (the events' node sets, length-weighted) or seq (their sequences)\">\n";
         out << "##INFO=<ID=AN,Number=1,Type=Integer,Description=\"Allele number: haplotypes with an allele at the site (GT not .). The reference path is left out, and a haplotype assembled in several contigs (PanSN sample#haplotype) counts once where those with an allele agree on it, not at all where they differ\">\n";
         out << "##INFO=<ID=AC,Number=A,Type=Integer,Description=\"Allele count: haplotypes of AN that carry the allele\">\n";
         out << "##INFO=<ID=AF,Number=A,Type=Float,Description=\"Allele frequency = AC/AN; --min-alt-af is tested on it\">\n";
@@ -2449,10 +2437,13 @@ void call_variants(
         // changes less than --min-sv-bp apart, and then the haplotypes they make where both are exact
         // changes, else node-set Jaccard or sequence identity. out_jac/out_seq receive the evidence
         // (seq computed only when the Jaccard gate did not already decide it).
+        // out_test: the test that decided, "spliced" (the haplotypes the two make), "jaccard" (their nodes) or
+        // "seq" (their sequences); empty where none was reached.
         auto events_match = [&](const Event& a, const Event& b,
-                                double* out_jac = nullptr, double* out_seq = nullptr) {
+                                double* out_jac = nullptr, double* out_seq = nullptr, const char** out_test = nullptr) {
             if (out_jac) *out_jac = -1.0;
             if (out_seq) *out_seq = -1.0;
+            if (out_test) *out_test = "";
             // Net length change: a deletion's is minus its size, an insertion's its size.
             auto net_of = [](const Event& e) -> long long {
                 if (e.type == EvType::Ins) return static_cast<long long>(e.size_bp);
@@ -2501,6 +2492,7 @@ void call_variants(
                 const double sid = spliced_identity(a, b);
                 if (out_jac) *out_jac = -1.0;
                 if (out_seq) *out_seq = sid;
+                if (out_test) *out_test = "spliced";
                 const long long na = static_cast<long long>(a.ins_bp) - static_cast<long long>(a.del_bp);
                 const long long nb = static_cast<long long>(b.ins_bp) - static_cast<long long>(b.del_bp);
                 const long long dn = na > nb ? na - nb : nb - na;
@@ -2521,11 +2513,13 @@ void call_variants(
                 if (a.type != EvType::Inv && splice_of(a, A) && splice_of(b, B)) {
                     const double sid = spliced_identity(a, b);
                     if (out_seq) *out_seq = sid;
+                    if (out_test) *out_test = "spliced";
                     return sid >= options.merge_seq_identity;
                 }
             }
             const double jac = weighted_jaccard(graph, a.nodes, b.nodes);
             if (out_jac) *out_jac = jac;
+            if (out_test) *out_test = "jaccard";
             if (jac >= options.merge_jaccard) return true;
             const double len_ratio =
                 options.merge_size_ratio > 0.0 ? options.merge_size_ratio : options.merge_seq_identity;
@@ -2535,6 +2529,7 @@ void call_variants(
                 ? seq_identity(a.seq + "|" + a.alt_seq, b.seq + "|" + b.alt_seq, options.merge_seq_identity, len_ratio)
                 : seq_identity(a.seq, b.seq, options.merge_seq_identity, len_ratio);
             if (out_seq) *out_seq = sid;
+            if (out_test) *out_test = "seq";
             return sid >= options.merge_seq_identity;
         };
 
@@ -3581,20 +3576,6 @@ void call_variants(
                     const Event& e = allele_events[ai][k];
                     if (e.size_bp >= rescue_floor) cands.push_back({ai, &e, ev_class[ai][k]});
                 }
-            // Per-class results, so a pair of contents is aligned once however many members carry them.
-            // Keyed on the unordered pair: weighted_jaccard is symmetric, and canon_match below fixes
-            // the orientation of events_match from the contents alone.
-            auto pair_key = [](std::size_t a, std::size_t b) {
-                if (a > b) std::swap(a, b);
-                return (static_cast<std::uint64_t>(a) << 32) | static_cast<std::uint64_t>(b);
-            };
-            std::unordered_map<std::uint64_t, double> jac_cache;
-            auto class_jaccard = [&](std::size_t a, std::size_t b) {
-                const auto [it, fresh] = jac_cache.try_emplace(pair_key(a, b), 0.0);
-                if (fresh) it->second = weighted_jaccard(graph, class_rep[a]->nodes, class_rep[b]->nodes);
-                return it->second;
-            };
-
             DisjointSet dsu(cands.size());
             // Position-sorted windowed sweep keeps edge-building near-linear: events_match can only
             // fire within |dpos| <= merge_distance_bp + size_i, so we stop once past that bound.
@@ -3759,74 +3740,8 @@ void call_variants(
                     if (better) bx = x;
                 }
                 const std::size_t best = comp[bx];
-                // Single-linkage merges A with C whenever some B links to both, so the record can span
-                // members that would never have merged directly. MERGE_JACCARD reports the strongest
-                // edge, which says nothing about that. The diameter -- the weakest pairwise similarity
-                // in the component -- is what shows how far the chain reached. Bounded, because this is
-                // quadratic and a component can hold hundreds of members.
-                double diameter = -1.0;
-                bool diameter_exact = true;
-                if (comp.size() >= 2) {
-                    constexpr std::size_t kDiameterMaxMembers = 128;
-                    if (comp.size() <= kDiameterMaxMembers) {
-                        diameter = 1.0;
-                        for (std::size_t x = 0; x < comp.size(); ++x)
-                            for (std::size_t y = x + 1; y < comp.size(); ++y)
-                                diameter = std::min(diameter,
-                                                    class_jaccard(cands[comp[x]].cls, cands[comp[y]].cls));
-                    } else {
-                        // Against the representative only: an upper bound on the true diameter, and
-                        // labelled as such rather than passed off as the real thing.
-                        diameter = 1.0;
-                        diameter_exact = false;
-                        for (std::size_t k : comp)
-                            if (k != best)
-                                diameter = std::min(diameter, class_jaccard(cands[best].cls, cands[k].cls));
-                    }
-                }
-                // Merge evidence from every member pair (the match graph restricted to the component), so
-                // it does not depend on which edges the sweep tested -- the sweep skips pairs already
-                // joined, and which those are follows path order. MERGE_DIRECT_FRAC is the share of pairs
-                // that match directly: below 1, some members joined only through a chain. Same bound as
-                // the diameter; above it, star to the representative. Each pair is tested in a fixed
-                // orientation (by sequence, then size): the banded alignment of two equal-length
-                // sequences is not symmetric.
-                double comp_jac = -1.0, comp_seq = -1.0, direct_frac = -1.0;
-                if (comp.size() >= 2) {
-                    auto canon_match = [&](const Event& x, const Event& y, double* j, double* s) {
-                        const bool swap = y.seq < x.seq || (y.seq == x.seq && y.size_bp < x.size_bp);
-                        return swap ? events_match(y, x, j, s) : events_match(x, y, j, s);
-                    };
-                    struct PairMatch { bool ok; double j, s; };
-                    std::unordered_map<std::uint64_t, PairMatch> match_cache;
-                    std::size_t pairs = 0, direct = 0;
-                    auto take = [&](std::size_t x, std::size_t y) {
-                        ++pairs;
-                        const auto [it, fresh] =
-                            match_cache.try_emplace(pair_key(cands[x].cls, cands[y].cls), PairMatch{false, -1.0, -1.0});
-                        if (fresh) {
-                            PairMatch& pm = it->second;
-                            pm.ok = canon_match(*cands[x].e, *cands[y].e, &pm.j, &pm.s);
-                        }
-                        const double j = it->second.j, s = it->second.s;
-                        if (!it->second.ok) return;
-                        ++direct;
-                        comp_jac = std::max(comp_jac, j);
-                        comp_seq = std::max(comp_seq, s);
-                    };
-                    if (diameter_exact) {
-                        for (std::size_t x = 0; x < comp.size(); ++x)
-                            for (std::size_t y = x + 1; y < comp.size(); ++y) take(comp[x], comp[y]);
-                    } else {
-                        for (std::size_t k : comp) if (k != best) take(best, k);
-                    }
-                    direct_frac = static_cast<double>(direct) / static_cast<double>(pairs);
-                }
                 MergedRecord mr;
                 mr.seed = *cands[best].e;                 // most-carried member represents the record
-                mr.merge_direct_frac = direct_frac;
-                mr.merge_diameter = diameter;
-                mr.merge_diameter_exact = diameter_exact;
                 mr.min_size_bp = mr.seed.size_bp;
                 mr.max_size_bp = mr.seed.size_bp;
                 for (std::size_t k : comp) {
@@ -3843,8 +3758,6 @@ void call_variants(
                         for (const std::string& m : alleles[cands[k].ai].members)
                             mr.carriers.push_back(m);
                 }
-                mr.merge_max_jaccard = comp_jac;
-                mr.merge_max_seqid = comp_seq;
                 merged.push_back(std::move(mr));
             }
             // ID suffixes (_2, _3) follow emission order, so put the new records in content order first.
@@ -3868,7 +3781,7 @@ void call_variants(
             MergedRecord& mr = merged[ri];
             if (mr.seed.type == EvType::Dup) return;
             // The seed against each content class once (see ev_class).
-            struct SeedMatch { signed char ok = -1; double jac = -1.0, sid = -1.0; };
+            struct SeedMatch { signed char ok = -1; };
             std::vector<SeedMatch> seen(class_rep.size());
             for (std::size_t ai = 0; ai < alleles.size(); ++ai) {
                 if (mr.member_alleles.count(ai)) continue;
@@ -3878,8 +3791,7 @@ void call_variants(
                     // that do not match each other can both match it.
                     if (mr.seed.seq_event && e.seq_event && e.size_bp >= rescue_floor) continue;
                     SeedMatch& sm = seen[ev_class[ai][k]];
-                    if (sm.ok < 0) sm.ok = events_match(mr.seed, e, &sm.jac, &sm.sid) ? 1 : 0;
-                    const double jac = sm.jac, sid = sm.sid;
+                    if (sm.ok < 0) sm.ok = events_match(mr.seed, e) ? 1 : 0;
                     if (sm.ok == 1) {
                         mr.member_alleles.insert(ai);
                         mr.member_event[ai].push_back(e);
@@ -3888,8 +3800,6 @@ void call_variants(
                             mr.member_net[ai] = static_cast<long long>(e.ins_bp) - static_cast<long long>(e.del_bp);
                         mr.min_size_bp = std::min(mr.min_size_bp, e.size_bp);
                         mr.max_size_bp = std::max(mr.max_size_bp, e.size_bp);
-                        mr.merge_max_jaccard = std::max(mr.merge_max_jaccard, jac);
-                        mr.merge_max_seqid = std::max(mr.merge_max_seqid, sid);
                         mr.member_nodes.insert(e.nodes.begin(), e.nodes.end());
                         for (const std::string& m : alleles[ai].members) mr.carriers.push_back(m);
                         break;
@@ -4149,10 +4059,6 @@ void call_variants(
                         // record: kept on a removed member's size, a record whose remaining members are all
                         // under --min-sv-bp would be written.
                         if (!first) r.filter_bp = r.max_size_bp;
-                        if (ma.size() < 2) {
-                            r.merge_diameter = -1.0; r.merge_direct_frac = -1.0;
-                            r.merge_max_jaccard = -1.0; r.merge_max_seqid = -1.0;
-                        }
                         // The representative must be an event some remaining carrier holds; when its own
                         // carriers were all removed, choose again among the remaining members' own events
                         // (the one each contributed: same type, its member size), by the merge's rule --
@@ -4863,25 +4769,34 @@ void call_variants(
             } else if (e.type != EvType::Dup && mr.min_size_bp != mr.max_size_bp) {
                 info << ";SVLEN_RANGE=" << mr.min_size_bp << "," << mr.max_size_bp;
             }
-            if (mr.merge_diameter >= 0.0) {
-                std::ostringstream d; d.setf(std::ios::fixed); d.precision(4);
-                d << mr.merge_diameter;
-                info << ";MERGE_DIAMETER=" << d.str();
-                if (mr.merge_diameter_exact) info << ";MERGE_DIAMETER_EXACT";
-            }
-            if (e.type != EvType::Dup && mr.merge_direct_frac >= 0.0) {
-                std::ostringstream d; d.setf(std::ios::fixed); d.precision(4);
-                d << mr.merge_direct_frac;
-                info << ";MERGE_DIRECT_FRAC=" << d.str();
-            }
-            // Cross-haplotype merge evidence (only set when ≥2 events were actually merged).
-            if (e.type != EvType::Dup && mr.merge_max_jaccard >= 0.0) {
-                char buf[32]; std::snprintf(buf, sizeof(buf), "%.4g", mr.merge_max_jaccard);
-                info << ";MERGE_JACCARD=" << buf;
-            }
-            if (e.type != EvType::Dup && mr.merge_max_seqid >= 0.0) {
-                char buf[32]; std::snprintf(buf, sizeof(buf), "%.4g", mr.merge_max_seqid);
-                info << ";MERGE_SEQID=" << buf;
+            // How alike the merged events are: each remaining member event against the representative, in the test
+            // that admits it (events_match), and the weakest of them. A member that joined only through others
+            // (node events merge by single linkage) can fall under the test's threshold, which shows how far the
+            // chain reached. Each content once.
+            if (e.type != EvType::Dup && e.type != EvType::Inv && mr.member_alleles.size() > 0) {
+                double min_sim = 2.0;
+                const char* min_test = "";
+                std::set<std::tuple<int, std::size_t, std::size_t, std::string, std::string, std::vector<std::string>>> seen;
+                for (const std::size_t ai : mr.member_alleles) {
+                    const auto me = mr.member_event.find(ai);
+                    if (me == mr.member_event.end()) continue;
+                    for (const Event& m : me->second) {
+                        if (m.type == e.type && m.ref_pos == e.ref_pos && m.size_bp == e.size_bp && m.seq == e.seq &&
+                            m.alt_seq == e.alt_seq && m.nodes == e.nodes) continue;
+                        if (!seen.emplace(static_cast<int>(m.type), m.ref_pos, m.size_bp, m.seq, m.alt_seq, m.nodes).second) continue;
+                        double jac = -1.0, sid = -1.0;
+                        const char* test = "";
+                        events_match(e, m, &jac, &sid, &test);
+                        const std::string t = test;
+                        const double v = t == "jaccard" ? jac : sid;
+                        if (t.empty() || v < 0.0) continue;
+                        if (v < min_sim) { min_sim = v; min_test = test; }
+                    }
+                }
+                if (min_sim <= 1.0) {
+                    char buf[32]; std::snprintf(buf, sizeof(buf), "%.4g", min_sim);
+                    info << ";MERGE_MIN_SIM=" << buf << ";MERGE_TEST=" << min_test;
+                }
             }
             // An unaligned haplotype that carries nothing here is unknown, not reference (see
             // allele_unaligned): it leaves AN and is written GT '.'. A carrier keeps its 1.

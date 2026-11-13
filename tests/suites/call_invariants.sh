@@ -147,8 +147,8 @@ done
 
 # ---------------------------------------------------------------- 4. single-linkage chaining
 # Three 100 bp insertions on distinct nodes: A and C each differ from B in 15 bases at opposite ends,
-# so A~B and B~C pass --merge-seq-identity 0.80 and A~C (0.70) does not. One record, and
-# MERGE_DIAMETER must be there to show how far the chain reaches. The control drops B. Single linkage
+# so A~B and B~C pass --merge-seq-identity 0.80 and A~C (0.70) does not. One record, and its MERGE_MIN_SIM,
+# under the threshold, shows how far the chain reaches. The control drops B. Single linkage
 # is the node comparison's merge (--no-align-alleles); events found by aligning alleles merge around a
 # representative instead, and each must match it.
 echo "-- 4. chaining A~B~C"
@@ -158,9 +158,10 @@ call_ "$D/g_ac.gfa" "$D/g_ac.bubbles.csv" "$R" "$D/ch_ac" --no-align-alleles
 eq "control: A and C alone stay separate INS records" "$(IC count "$D/ch_ac.region.vcf" SVTYPE=INS)" "2"
 eq "with B they chain into one INS record" "$(IC count "$D/ch.region.vcf" SVTYPE=INS)" "1"
 eq "and is carried by all three" "$(IC get "$D/ch.region.vcf" SVTYPE=INS AC)" "3"
-md=$(IC get "$D/ch.region.vcf" SVTYPE=INS MERGE_DIAMETER)
-[ -n "$md" ] && [ "$md" != "<absent>" ] && ok "MERGE_DIAMETER is reported ($md)" \
-                                        || bad "the chained record has no MERGE_DIAMETER"
+md=$(IC get "$D/ch.region.vcf" SVTYPE=INS MERGE_MIN_SIM); mt=$(IC get "$D/ch.region.vcf" SVTYPE=INS MERGE_TEST)
+[ -n "$md" ] && [ "$md" != "<absent>" ] && awk -v m="$md" 'BEGIN{exit !(m < 0.80)}' && [ "$mt" = seq ] \
+  && ok "MERGE_MIN_SIM is under --merge-seq-identity ($md, $mt): a member joined through another" \
+  || bad "the chained record's MERGE_MIN_SIM/MERGE_TEST read '$md'/'$mt', expected under 0.80 and seq"
 
 # ---------------------------------------------------------------- 5. substitution
 # hapSUB replaces node 2 (60 bp) by node 6 (58 bp), hapDEL deletes node 2. The substitution is one
