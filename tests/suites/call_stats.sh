@@ -99,6 +99,8 @@ check "INS REF is the last base of n6" "$(field INS 4)" "${N6: -1}"
 
 check "every record is FILTER PASS, which the header defines" \
   "$(awk -F'\t' '!/^#/{print $7}' "$VCF" | sort -u | paste -sd, -):$(grep -c '^##FILTER=<ID=PASS,' "$VCF")" "PASS:1"
+check "the IMPRECISE header gives its three causes (cluster, N run, PATH_INVERSION)" \
+  "$(grep '^##INFO=<ID=IMPRECISE,' "$VCF" | grep -c 'CLUSTER.*an N in the reference.*PATH_INVERSION')" "1"
 # The header states the --max-seq-bp the sequences were written with: 60 leaves out the 70 bp DELSEQ.
 "$BIN" call -i "$OUT/cb.sorted.gfa" -c "$OUT/cb.bubbles.csv" -r "$REF_NAME" -o "$OUT/cmax" --max-seq-bp 60 -q >/dev/null 2>&1
 check "--max-seq-bp 60: the header's limit and the DEL's DELSEQ" \

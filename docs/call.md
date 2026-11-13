@@ -88,9 +88,9 @@ VCF 4.2. `POS` is the base before the event, `END` its last reference base. `FIL
 |-------|---------|
 | `SVTYPE`, `SVLEN`, `END` | type, length change (an inversion: its length), last base |
 | `INSSEQ`, `DELSEQ`, `INVSEQ`, `SUBSTITUTION` | the event's sequence, left out above `--max-seq-bp` (20,000) so VCF tools can read the lines; a replacement's two sides |
-| `IMPRECISE`, `CIPOS`, `CIEND`, `HOMLEN` | uncertain or sliding breakpoints |
+| `IMPRECISE`, `CIPOS`, `CIEND`, `HOMLEN` | uncertain or sliding breakpoints: `IMPRECISE` marks a cluster of pieces (`END`-`POS` wider than \|`SVLEN`\|), a breakpoint at an N run of the reference, or a `PATH_INVERSION` whose breakpoints lie in repeats |
 | `AN`, `AC`, `AF` | haplotypes with an allele at the site (not `.`), carriers, ratio |
-| `BUBBLE_ID`, `START_NODE`, `END_NODE`, `EVENT_NODES` | the site and the event's nodes |
+| `BUBBLE_ID`, `START_NODE`, `END_NODE`, `EVENT_NODES` | the site and the event's nodes; a `PATH_INVERSION`, typed from the walks, has no nodes |
 | `CN_METHOD`, `REF_CN`, `RU_LEN` | how copies were counted, the reference's count, a unit copy's length |
 | `NMERGED`, `SVLEN_RANGE`, `MERGE_*` | how many carriers were merged and how much they differ |
 | `GENES` | with `--gtf`: genes over the record; inside a copy of a `MODULE` site holding several genes, the paralogs its carriers hold |
