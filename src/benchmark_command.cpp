@@ -150,6 +150,12 @@ struct VcfRecordInfo {
     std::unordered_map<std::string, int> sample_allele;   // GT's allele index; -1 for '.'
     std::unordered_map<std::string, long long> sample_cn;
     std::unordered_map<std::string, long long> sample_cnbp;   // FORMAT:CNBP, the carrier's own change in bp
+    // MODULE: the copies carriers gained or lost (INFO/CN_FORMS), reference [start, end] replaced by seq
+    // (end = start - 1 for an insertion; spelled false where call left the sequence out), and each carrier's
+    // (FORMAT/CNFORM, 0-based)
+    struct Form { std::size_t start = 0, end = 0; std::string seq; bool spelled = true; };
+    std::vector<Form> cn_forms;
+    std::unordered_map<std::string, std::vector<std::size_t>> sample_cnform;
 };
 
 // Whether a record's change lies inside genomic [lo, hi]: an insertion goes in before POS+1, so it is inside
@@ -216,10 +222,25 @@ std::vector<VcfRecordInfo> load_region_vcf(const std::string& path, std::vector<
         if (unit.empty()) unit = info_field(f[7], "CN_UNIT_BP");
         if (!unit.empty()) r.unit_bp = std::stoll(unit);
         if (r.svtype == "CNV" && r.end > r.pos) r.cn_ref_bp = static_cast<long long>(r.end - r.pos);
+        const std::string forms = info_field(f[7], "CN_FORMS");
+        if (!forms.empty())
+            for (const std::string& x : split_on(forms, ',')) {
+                const std::size_t colon = x.find(':'), dash = x.find('-');
+                if (colon == std::string::npos || dash == std::string::npos || dash > colon)
+                    throw std::runtime_error(path + ": record " + r.id + " has a CN_FORMS entry that is not START-END:SEQ ('" + x + "')");
+                VcfRecordInfo::Form fm;
+                fm.start = parse_count(x.substr(0, dash), path + " CN_FORMS");
+                fm.end = parse_count(x.substr(dash + 1, colon - dash - 1), path + " CN_FORMS");
+                fm.seq = x.substr(colon + 1);
+                if (fm.seq == "*") { fm.seq.clear(); fm.spelled = false; }
+                if (fm.end + 1 < fm.start) throw std::runtime_error(path + ": record " + r.id + " has a CN_FORMS entry ending before it starts");
+                r.cn_forms.push_back(std::move(fm));
+            }
         const std::vector<std::string> fmt = split_on(f[8], ':');
         const auto gt_i = std::find(fmt.begin(), fmt.end(), "GT") - fmt.begin();
         const auto cn_i = std::find(fmt.begin(), fmt.end(), "CN") - fmt.begin();
         const auto cnbp_i = std::find(fmt.begin(), fmt.end(), "CNBP") - fmt.begin();
+        const auto cnform_i = std::find(fmt.begin(), fmt.end(), "CNFORM") - fmt.begin();
         for (std::size_t s = 0; s < samples.size(); ++s) {
             const std::vector<std::string> v = split_on(f[9 + s], ':');
             if (static_cast<std::size_t>(gt_i) < v.size()) {
@@ -234,6 +255,13 @@ std::vector<VcfRecordInfo> load_region_vcf(const std::string& path, std::vector<
                 r.sample_cn[samples[s]] = std::stoll(v[static_cast<std::size_t>(cn_i)]);
             if (static_cast<std::size_t>(cnbp_i) < v.size() && v[static_cast<std::size_t>(cnbp_i)] != ".")
                 r.sample_cnbp[samples[s]] = std::stoll(v[static_cast<std::size_t>(cnbp_i)]);
+            if (static_cast<std::size_t>(cnform_i) < v.size() && v[static_cast<std::size_t>(cnform_i)] != ".")
+                for (const std::string& k : split_on(v[static_cast<std::size_t>(cnform_i)], ',')) {
+                    const std::size_t i = parse_count(k, path + " CNFORM");
+                    if (i == 0 || i > r.cn_forms.size())
+                        throw std::runtime_error(path + ": record " + r.id + " names CN_FORMS entry " + k + ", which it does not have");
+                    r.sample_cnform[samples[s]].push_back(i - 1);
+                }
         }
         out.push_back(std::move(r));
     }
@@ -867,7 +895,7 @@ int run_benchmark_command(const std::vector<std::string>& args) {
     struct Stage {
         std::vector<HapResult> results;
         std::vector<CheckRow> checks;
-        std::size_t checked = 0, unchecked = 0, cn_checked = 0, cn_unchecked = 0, unresolved_rows = 0;
+        std::size_t checked = 0, unchecked = 0, cn_checked = 0, cn_unchecked = 0, cn_exact_checked = 0, unresolved_rows = 0;
         std::size_t not_reconstructable = 0, missing_gt = 0, not_in_vcf = 0;
         std::vector<VcfRecordInfo> vcf;
         // A record that could not be spelled for some carrier, and why: "sequence" (left out above call's
@@ -1013,6 +1041,21 @@ int run_benchmark_command(const std::vector<std::string>& args) {
                     else add(r, alt == "<DEL>" && !subst ? "del" : "sub", r.pos + 1, end, subst ? ins : std::string(), ".", h);
                 } else if (alt == "<INV>") {
                     add(r, "inv", r.pos + 1, end, reverse_complement(ref_at(r.pos + 1, end)), ".", h);
+                } else if (alt.rfind("<CNV", 0) == 0 && !r.cn_forms.empty()) {
+                    // The record names the carrier's copies: each pasted as written. A carrier with none named
+                    // holds its copies in no change of its walk.
+                    const auto cit = r.sample_cn.find(h);
+                    const std::string cn = cit == r.sample_cn.end() ? std::string(".") : std::to_string(cit->second);
+                    const auto fit = r.sample_cnform.find(h);
+                    if (fit == r.sample_cnform.end()) continue;
+                    for (const std::size_t k : fit->second) {
+                        const VcfRecordInfo::Form& fm = r.cn_forms[k];
+                        if (!fm.spelled || fm.start < ref_lo || fm.end > ref_hi) {
+                            unspelled.emplace(r.id, fm.spelled ? "other" : "sequence");
+                            reconstructable = false; add(r, "unresolved", 0, 0, std::string(), ".", h); continue;
+                        }
+                        add(r, "cnv", fm.start, fm.end, fm.seq, cn, h);
+                    }
                 } else if (alt.rfind("<CNV", 0) == 0) {
                     const auto cit = r.sample_cn.find(h);
                     const auto [c0, clen] = copy_of(r, h);
@@ -1278,7 +1321,7 @@ int run_benchmark_command(const std::vector<std::string>& args) {
 
     // ---- the carrier check: each carrier's own event against what the VCF reports for it ----
     std::vector<CheckRow> checks;
-    std::size_t checked = 0, unchecked = 0, cn_stretch_checked = 0, cn_stretch_unchecked = 0;
+    std::size_t checked = 0, unchecked = 0, cn_stretch_checked = 0, cn_stretch_unchecked = 0, cn_exact_checked = 0;
     // A carrier can hold several events under one record (two pieces call filed together): their net change
     // together is what the record's SVLEN stands for, so they are checked once, summed.
     std::map<std::pair<std::string, std::string>, std::pair<long long, std::size_t>> seq_net;   // (record, carrier)
@@ -1326,10 +1369,74 @@ int run_benchmark_command(const std::vector<std::string>& args) {
             const long long diff = own - reported;
             if ((diff < 0 ? -diff : diff) >= limit) checks.push_back({e.variant_id, h, e.kind, rep_s, own_s, diff});
             if (e.kind != "cn") continue;
+            const auto eit = events_of.find(h);
+            // A record naming each carrier's copies (CN_FORMS): the reference's stretch with the carrier's copies
+            // and its own events inside the stretch applied must make the stretch its walk holds, but for changes
+            // under --min-sv-bp, which call does not report: flagged when they overlap, or when aligned the two
+            // differ by --min-sv-bp or more somewhere.
+            if (!r.cn_forms.empty()) {
+                const auto fit = r.sample_cnform.find(h);
+                if (fit == r.sample_cnform.end() || e.ref_start < region_start || e.ref_end >= region_start + ref_seq.size()) continue;
+                ++cn_exact_checked;
+                struct Edit { std::size_t g0, g1; const std::string* alt; };   // [g0, g1] replaced; g1 = g0 - 1 inserts
+                std::vector<Edit> edits;
+                bool spelled = true;
+                for (const std::size_t k : fit->second) {
+                    const VcfRecordInfo::Form& fm = r.cn_forms[k];
+                    spelled = spelled && fm.spelled;
+                    edits.push_back({fm.start, fm.end, &fm.seq});
+                }
+                if (eit != events_of.end())
+                    for (const CarrierEvent* o : eit->second)
+                        if (inside_cn(e, *o, h)) edits.push_back({o->ref_start, o->ref_end, &o->alt});
+                std::stable_sort(edits.begin(), edits.end(), [](const Edit& a, const Edit& b) {
+                    if (a.g0 != b.g0) return a.g0 < b.g0;
+                    return a.g1 < b.g1;   // an insertion before a change starting at its base
+                });
+                const auto upper = [](std::string x) {
+                    for (char& c : x) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+                    return x;
+                };
+                // Two insertions at one point go in either order (the VCF does not say which comes first): the
+                // stretch is made both ways, and the one nearer the walk's counts.
+                std::string made;
+                bool clash = false, large = false;
+                for (int pass = 0; pass < 2; ++pass) {
+                    if (pass == 1) {
+                        bool shared = false;
+                        for (std::size_t i = 0; i + 1 < edits.size(); ++i)
+                            if (edits[i].g0 == edits[i + 1].g0 && edits[i].g1 + 1 == edits[i].g0 && edits[i + 1].g1 + 1 == edits[i + 1].g0) {
+                                std::swap(edits[i], edits[i + 1]); shared = true; ++i;
+                            }
+                        if (!shared) break;
+                    }
+                    made.clear();
+                    std::size_t at = e.ref_start;
+                    clash = false;
+                    for (const Edit& x : edits) {
+                        if (x.g0 < at || x.g0 < e.ref_start || x.g1 > e.ref_end) { clash = true; break; }
+                        made += ref_seq.substr(at - region_start, x.g0 - at);
+                        made += *x.alt;
+                        at = x.g1 + 1;
+                    }
+                    if (!clash) made += ref_seq.substr(at - region_start, e.ref_end + 1 - at);
+                    large = false;
+                    if (!clash && upper(made) != upper(e.alt))
+                        for (const Diff& d : diff_of(align_ops(upper(made), upper(e.alt)), merge_gap, min_sv_bp).events)
+                            large = large || d.size() >= min_sv_bp;
+                    if (!clash && !large) break;
+                }
+                const long long gap = static_cast<long long>(e.alt.size()) - static_cast<long long>(made.size());
+                if (spelled && (clash || large))
+                    checks.push_back({e.variant_id, h, "cn_exact",
+                                      clash ? std::string("copies and events that overlap") :
+                                              std::to_string(made.size()) + " bp from its copies and events",
+                                      std::to_string(e.alt.size()) + " bp stretch", gap});
+                continue;
+            }
             // And the stretch's length against the CN: the reference's stretch, (CN - REF_CN) copies, and
             // the carrier's own events inside it. Sequence the stretch holds beyond that is in no record.
             const auto cit = r.sample_cn.find(h);
-            const auto eit = events_of.find(h);
             const long long copy_bp = static_cast<long long>(copy_of(r, h).second);
             if (cit == r.sample_cn.end() || r.ref_cn < 0 || copy_bp <= 0) { ++cn_stretch_unchecked; continue; }
             ++cn_stretch_checked;
@@ -1686,7 +1793,7 @@ int run_benchmark_command(const std::vector<std::string>& args) {
     out.results = std::move(results);
     out.checks = std::move(checks);
     out.checked = checked; out.unchecked = unchecked;
-    out.cn_checked = cn_stretch_checked; out.cn_unchecked = cn_stretch_unchecked;
+    out.cn_checked = cn_stretch_checked; out.cn_unchecked = cn_stretch_unchecked; out.cn_exact_checked = cn_exact_checked;
     out.unresolved_rows = unresolved_rows;
     out.not_reconstructable = vcf_not_reconstructable; out.missing_gt = vcf_missing_gt;
     out.unspelled = std::move(unspelled);
@@ -1873,7 +1980,8 @@ int run_benchmark_command(const std::vector<std::string>& args) {
            << "snv_left_call\t" << snv_call << '\n'
            << "snv_left_vcf\t" << snv_vcf << '\n'
            << "carriers_checked\t" << sc.checked << '\n'
-           << "carrier_mismatches\t" << mismatching.size() << '\n';
+           << "carrier_mismatches\t" << mismatching.size() << '\n'
+           << "cn_exact_checked\t" << sc.cn_exact_checked << '\n';
         so.close();
         if (!so) throw std::runtime_error("failed writing " + finals[0]);
         log.info("present: " + std::to_string(present_bp) + " bp of large events");
