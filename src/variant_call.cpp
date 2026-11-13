@@ -751,6 +751,95 @@ void join_split_replacements(const Graph& graph, const std::vector<Tok>& R, cons
     events = std::move(out);
 }
 
+// A walk's copy span at a collapsed module: its first and last token on one of the module's nodes, or false.
+bool copy_span(const std::vector<Tok>& W, const std::unordered_set<std::string>& module_nodes, std::size_t& a,
+               std::size_t& b) {
+    a = SIZE_MAX; b = 0;
+    for (std::size_t k = 0; k < W.size(); ++k)
+        if (module_nodes.count(W[k].node_id)) { if (a == SIZE_MAX) a = k; b = k; }
+    return a != SIZE_MAX;
+}
+
+// Whether tokens [lo, hi) of a walk lie inside its copy span [a, b]; an empty range sits before token lo, so
+// it is inside when it falls between two tokens of the span.
+bool in_copy_span(std::size_t lo, std::size_t hi, std::size_t a, std::size_t b) {
+    if (lo == SIZE_MAX || a == SIZE_MAX) return false;
+    if (lo == hi) return a < lo && lo <= b;
+    return a <= lo && hi - 1 <= b;
+}
+
+// One deletion or one insertion the node comparison cut in pieces inside a collapsed module's copies, where the
+// walks meet at short nodes by chance: two or more consecutive deletions (or insertions), separated only by
+// stretches both walks share that are shorter than `join_bp` and lie in one place on each walk, all inside the
+// copies on both walks, are one replacement of the reference from the first piece to the last by the
+// haplotype's bases there (the shared stretches included, so it spells the haplotype exactly), sized by its
+// net change, when that reaches `min_bp`. Replacements are not joined: their two sides say nothing about which
+// way the change goes.
+void join_copy_pieces(const Graph& graph, const std::vector<Tok>& R, const std::vector<Tok>& H,
+                      const std::unordered_set<std::string>& module_nodes, std::vector<Event>& events,
+                      std::size_t join_bp, std::size_t min_bp) {
+    if (join_bp == 0 || events.size() < 2) return;
+    std::size_t ra = 0, rb = 0, ha = 0, hb = 0;
+    if (!copy_span(R, module_nodes, ra, rb) || !copy_span(H, module_nodes, ha, hb)) return;
+    const auto joinable = [&](const Event& e) {
+        return !e.seq_event && !e.across_copies && !e.split_piece && e.r_lo != SIZE_MAX && e.h_lo != SIZE_MAX &&
+               (e.type == EvType::Del || e.type == EvType::Ins) && in_copy_span(e.r_lo, e.r_hi, ra, rb) &&
+               in_copy_span(e.h_lo, e.h_hi, ha, hb);
+    };
+    // the stretch between two pieces: the same tokens on both walks, shorter than join_bp
+    const auto short_match = [&](const Event& a, const Event& b) {
+        if (b.r_lo < a.r_hi || b.h_lo < a.h_hi || b.r_lo - a.r_hi != b.h_lo - a.h_hi) return false;
+        std::size_t bp = 0;
+        for (std::size_t k = 0; k < b.r_lo - a.r_hi; ++k) {
+            if (R[a.r_hi + k].token != H[a.h_hi + k].token) return false;
+            bp += node_len(graph, R[a.r_hi + k].node_id);
+        }
+        return bp < join_bp;
+    };
+    // consecutive steps of the walk the tokens were collapsed from: one place, not across dropped copies
+    const auto one_place = [](const std::vector<Tok>& W, std::size_t lo, std::size_t hi) {
+        for (std::size_t k = lo; k + 1 < hi; ++k)
+            if (W[k + 1].src_idx != W[k].src_idx + 1) return false;
+        return true;
+    };
+    std::vector<Event> out;
+    std::size_t i = 0;
+    while (i < events.size()) {
+        std::size_t m = i;
+        if (joinable(events[i]))
+            for (std::size_t j = i + 1; j < events.size(); ++j) {
+                if (!joinable(events[j]) || events[j].type != events[i].type || !short_match(events[j - 1], events[j]) ||
+                    !one_place(R, events[i].r_lo, events[j].r_hi) || !one_place(H, events[i].h_lo, events[j].h_hi))
+                    break;
+                m = j;
+            }
+        std::size_t net = 0;
+        for (std::size_t k = i; k <= m; ++k) net += events[k].size_bp;
+        if (m == i || net < min_bp) { out.push_back(std::move(events[i])); ++i; continue; }
+        std::vector<const Tok*> rt, ht;
+        for (std::size_t k = events[i].r_lo; k < events[m].r_hi; ++k) rt.push_back(&R[k]);
+        for (std::size_t k = events[i].h_lo; k < events[m].h_hi; ++k) ht.push_back(&H[k]);
+        Event e;
+        e.type = EvType::Sub;
+        for (const Tok* t : rt) e.nodes.push_back(t->node_id);
+        for (const Tok* t : ht) e.nodes.push_back(t->node_id);
+        e.start_node = rt.front()->node_id;
+        e.end_node = rt.back()->node_id;
+        e.seq = spell_toks(graph, rt);
+        e.alt_seq = spell_toks(graph, ht);
+        e.del_bp = toks_bp(graph, rt);
+        e.ins_bp = toks_bp(graph, ht);
+        e.size_bp = e.del_bp > e.ins_bp ? e.del_bp - e.ins_bp : e.ins_bp - e.del_bp;
+        e.anchor_node = rt.front()->node_id;
+        e.ref_tok_first = rt.front()->src_idx;
+        e.ref_tok_last = rt.back()->src_idx;
+        e.r_lo = events[i].r_lo; e.r_hi = events[m].r_hi; e.h_lo = events[i].h_lo; e.h_hi = events[m].h_hi;
+        out.push_back(std::move(e));
+        i = m + 1;
+    }
+    events = std::move(out);
+}
+
 // Whether `piece` is a version of part of `copy`: all of it aligns inside `copy` at 80% identity or more. Two
 // versions of one segment can share few k-mers yet align well.
 bool version_of(const std::string& piece, const std::string& copy) {
@@ -3449,6 +3538,7 @@ void call_variants(
                         split_copy_replacements(graph, Rdiff, Htok, module_rec->anchor_nodes,
                                                 static_cast<long long>(cit->second) - static_cast<long long>(module_rec->seed.ref_cn),
                                                 module_rec->seed.ru_len, options.min_sv_bp, events);
+                    join_copy_pieces(graph, Rdiff, Htok, module_rec->module_nodes, events, options.merge_distance_bp, options.min_sv_bp);
                 }
                 // An inversion is a node-level finding (the walk turns round); such an allele keeps it.
                 bool inv = false;
