@@ -739,6 +739,10 @@ else
     [ "$dimp" = "yes" ] \
       && ok "and it is flagged IMPRECISE, so END-POS == |SVLEN| still holds everywhere else" \
       || bad "a DEL cluster whose span exceeds |SVLEN| was not flagged IMPRECISE"
+    # the 120 bases it removes lie somewhere in the span: each breakpoint up to the slack inward
+    dci=$(awk -F'\t' '$0!~/^#/ && $8~/SVLEN=-120/{n=split($8,a,";"); for(i=1;i<=n;i++){split(a[i],kv,"=");
+            if(kv[1]=="CIPOS") p=kv[2]; if(kv[1]=="CIEND") e=kv[2]} print p" "e; exit}' "$CVCF")
+    check "its CIPOS/CIEND give the slack, END-POS less |SVLEN|" "$dci" "0,$((dspan - dsv)) -$((dspan - dsv)),0"
   fi
 fi
 
@@ -1644,11 +1648,12 @@ check "a haplotype crossing an assembly gap: GT on the substitution, typed INS b
   "$(gt_of "$VCF" hgap INS):$(info INS SVLEN):$(grep -v '^#' "$VCF" | grep -c SUBSTITUTION)" ".:60:1"
 check "the gap haplotype is out of AN; the case variant joins its allele (INS AN:AC)" \
   "$(info INS AN):$(info INS AC)" "3:2"
-# Aligned, the replacement is trimmed of the bases A and B share at either end, so INSSEQ is part of B.
-ins=$(info INS INSSEQ)
+# Aligned, the replacement is trimmed of the bases A and B share at either end, so ALT, after its base at
+# POS, is part of B.
+ins=$(field INS 5 | cut -c2-)
 ins_ok=no
 [ -n "$ins" ] && [ "$ins" = "$(printf '%s' "$ins" | tr a-z A-Z)" ] && [[ "$GB" == *"$ins"* ]] && ins_ok=yes
-check "INSSEQ is upper case, and B's" "$ins_ok" "yes"
+check "the inserted bases (ALT) are upper case, and B's" "$ins_ok" "yes"
 grep -v '^#' "$VCF" | grep -q 'NNNNNNNNNN' && bad "a record spells the assembly gap's N bases" \
   || ok "no record spells the gap's N bases"
 printf '%s\n' "$gap_log" | grep -q 'GT . across an assembly gap: 1' \
@@ -1824,7 +1829,8 @@ VCF="$OUT/cc.region.vcf"
 
 # ---------------------------------------------------------------- substitutions
 # Reference F S A K G with A 200 bp. hb replaces A by B (40 bp): a net loss of 160 bp, written as a DEL
-# of -160 that replaces POS+1..END (200 bp, DELSEQ) by INSSEQ and is flagged SUBSTITUTION. hc replaces
+# of -160 that replaces POS+1..END (200 bp) by B and is flagged SUBSTITUTION, its two sides spelled in REF
+# and ALT. hc replaces
 # A by C (210 bp): a net +10, under --min-sv-bp, so a SUB spelling both sequences. ht walks A2, a
 # second node with A's sequence: no change, so no record.
 SA=$(rseq 200 121); SB=$(rseq 40 122); SC=$(rseq 210 123)
@@ -1837,9 +1843,9 @@ SA=$(rseq 200 121); SB=$(rseq 40 122); SC=$(rseq 210 123)
 printf '%s\n1,S,+,K,+,4,6,4,4,1,1,1,0,210,"A;A2;B;C"\n' "$MOD_HDR" > "$OUT/sub.bubbles.csv"
 "$BIN" call -i "$OUT/sub.gfa" -c "$OUT/sub.bubbles.csv" -r ref -o "$OUT/sub" -q >/dev/null 2>&1
 VCF="$OUT/sub.region.vcf"
-check "a replacement losing 160 bp: one DEL (SVLEN:END-POS:INSSEQ is B:flag)" \
-  "$(info DEL SVLEN):$(( $(info DEL END) - $(field DEL 2) )):$([ "$(info DEL INSSEQ)" = "$SB" ] && echo B):$(grep -v '^#' "$VCF" | awk -F'\t' '$8~/SVTYPE=DEL;/' | grep -c ';SUBSTITUTION')" \
-  "-160:200:B:1"
+check "a replacement losing 160 bp: one DEL spelled in REF/ALT (SVLEN:END-POS:REF is A:ALT is B:flag)" \
+  "$(info DEL SVLEN):$(( $(info DEL END) - $(field DEL 2) )):$([ "$(field DEL 4)" = "$(field DEL 4 | cut -c1)$SA" ] && echo A):$([ "$(field DEL 5)" = "$(field DEL 4 | cut -c1)$SB" ] && echo B):$(grep -v '^#' "$VCF" | awk -F'\t' '$8~/SVTYPE=DEL;/' | grep -c ';SUBSTITUTION')" \
+  "-160:200:A:B:1"
 # REF and ALT are A and C less the bases they share at either end, after the base before.
 trim_pair() { "${PYTHON:-python3}" -c 'import sys
 a, b = sys.argv[1:3]; p = 0
@@ -2226,6 +2232,8 @@ printf 'bubble_id,source,source_orient,sink,sink_orient,inside_node_count,total_
 "$BIN" call -i "$OUT/nadj.gfa" -c "$OUT/nadj.csv" -r 'ref#0#chr1:1-560' -o "$OUT/nadj" --no-per-bubble-vcf -q >/dev/null 2>&1
 check "events against an N run in the reference are IMPRECISE (DEL | INS)" \
   "$(grep -v '^#' "$OUT/nadj.region.vcf" | awk -F'\t' '/SVTYPE=DEL/{print ($8 ~ /IMPRECISE/) ? "imprecise" : "precise"}')|$(grep -v '^#' "$OUT/nadj.region.vcf" | awk -F'\t' '/SVTYPE=INS/{print ($8 ~ /IMPRECISE/) ? "imprecise" : "precise"}')" "imprecise|imprecise"
+check "and their start can lie anywhere in the 200 N run (DEL CIPOS CIEND | INS CIPOS)" \
+  "$(grep -v '^#' "$OUT/nadj.region.vcf" | awk -F'\t' '/SVTYPE=DEL/{n=split($8,a,";"); for(i=1;i<=n;i++){split(a[i],kv,"="); if(kv[1]=="CIPOS") p=kv[2]; if(kv[1]=="CIEND") e=kv[2]} print p" "e}')|$(grep -v '^#' "$OUT/nadj.region.vcf" | awk -F'\t' '/SVTYPE=INS/{n=split($8,a,";"); for(i=1;i<=n;i++){split(a[i],kv,"="); if(kv[1]=="CIPOS") p=kv[2]} print p}')" "-200,0 0,0|-200,0"
 
 # ---------------------------------------------------------------- merging next to copy-number records
 # Fixtures from a line spec (tests/tools/spec_gfa.py). th prints one item per record, in POS order:

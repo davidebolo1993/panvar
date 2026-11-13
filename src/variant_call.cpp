@@ -1897,10 +1897,10 @@ void call_variants(
         out << "##INFO=<ID=REF_CN_SOURCE,Number=1,Type=String,Description=\"How REF_CN was counted: UNIT_ANCHOR (the unit graph's copies at its anchor) or ANCHOR_PASSES (MODULE: the reference's passes through the module's anchor, counted as every haplotype's are)\">\n";
         out << "##INFO=<ID=CN_ANCHOR_BP,Number=1,Type=Integer,Description=\"CN_METHOD=MODULE: bp of the module's anchor, the nodes CN counts passes through\">\n";
         out << "##INFO=<ID=CN_MODULE_NODES_BP,Number=1,Type=Integer,Description=\"CN_METHOD=MODULE: bp of the module's nodes, those some path visits more than once, one visit each\">\n";
-        out << "##INFO=<ID=SUBSTITUTION,Number=0,Type=Flag,Description=\"The DEL or INS replaces the reference bases POS+1..END (DELSEQ) with INSSEQ, typed by its net change, which SVLEN gives. A replacement whose net change is under --min-sv-bp is a SVTYPE=SUB record with the two sequences as REF and ALT\">\n";
+        out << "##INFO=<ID=SUBSTITUTION,Number=0,Type=Flag,Description=\"The DEL or INS replaces the reference bases POS+1..END with other bases, typed by its net change, which SVLEN gives. Where both sides fit --max-seq-bp and the breakpoints are exact, REF and ALT spell it after the base at POS, as on a SUB; otherwise ALT is symbolic, with DELSEQ and INSSEQ where they fit. A replacement whose net change is under --min-sv-bp is a SVTYPE=SUB record\">\n";
         out << "##INFO=<ID=HOMLEN,Number=1,Type=Integer,Description=\"Exact INS/DEL (not a substitution, not IMPRECISE): how many bases the event can slide right along the reference and stay the same haplotype. POS is left-aligned, so the equivalent placements are POS..POS+HOMLEN\">\n";
-        out << "##INFO=<ID=CIPOS,Number=2,Type=Integer,Description=\"Interval around POS holding the equivalent placements of a left-aligned INS/DEL: 0,HOMLEN. On a PATH_INVERSION record: where the left breakpoint can lie, 0 to the length of the sequence between the left flank and the inverted run (typically an inverted repeat)\">\n";
-        out << "##INFO=<ID=CIEND,Number=2,Type=Integer,Description=\"Interval around END holding the equivalent placements of a left-aligned DEL: 0,HOMLEN. On a PATH_INVERSION record: where the right breakpoint can lie, minus the length of the sequence between the inverted run and the right flank, to 0\">\n";
+        out << "##INFO=<ID=CIPOS,Number=2,Type=Integer,Description=\"Interval around POS where the event can start. A left-aligned exact INS/DEL: 0,HOMLEN, its equivalent placements. An IMPRECISE record: from the start of an N run the base at POS lies in, to how far the removed bases can lie after POS in a cluster (END-POS less |SVLEN|). A PATH_INVERSION: 0 to the length of the sequence between the left flank and the inverted run (typically an inverted repeat)\">\n";
+        out << "##INFO=<ID=CIEND,Number=2,Type=Integer,Description=\"Interval around END where the event can end. A left-aligned exact DEL: 0,HOMLEN. An IMPRECISE record: from how far the removed bases can lie before END in a cluster, to the end of an N run after END. A PATH_INVERSION: minus the length of the sequence between the inverted run and the right flank, to 0\">\n";
         out << "##INFO=<ID=PATH_INVERSION,Number=0,Type=Flag,Description=\"An inversion at an inversion site (bubble kind 'inversion'), typed from the haplotypes' walks: a run of reference nodes a haplotype walks reversed, between two runs it walks forward. Such a site is made where no snarl holds the inversion -- its breakpoints lie in inverted repeats the graph collapses, so every path crosses the repeat nodes in both orientations -- and encloses the sites inside it. POS is the last forward base before the inverted run, END the last base before the forward run after it; CIPOS/CIEND give the breakpoint ranges and IMPRECISE is set when they are not zero. Typed from the walks rather than from one site's nodes, it has no EVENT_NODES, START_NODE or END_NODE\">\n";
         out << "##INFO=<ID=IMPRECISE,Number=0,Type=Flag,Description=\"The breakpoints are not exact, for one of three reasons. The record describes an event CLUSTER rather than one exact event: coalescing joined several pieces that keep reference sequence between them, or the deletion spans loop copies a CNV record counts (their bases are left out of SVLEN), so POS+1..END is wider than the |SVLEN| bases removed. A breakpoint abuts an N in the reference (the base before POS+1 or after END), which places the event only to within the N run. Or a PATH_INVERSION whose breakpoints lie in repeats, with CIPOS/CIEND not zero. On a PRECISE DEL or INV, END-POS equals |SVLEN|\">\n";
         out << "##INFO=<ID=CN_SPAN_AMBIGUOUS,Number=1,Type=Integer,Description=\"Path measurements taken over a module span whose source or sink boundary occurs MORE THAN ONCE in that path. The span is then first-source..last-sink, which is a choice: it can enclose two separate visits and the content between them rather than one module. Every quantity measured over the span -- CN, CNBP, CN_MODULE_REF_BP -- inherits that choice on those paths. Absent when every boundary is visited once\">\n";
@@ -4559,6 +4559,7 @@ void call_variants(
             // span, while SVLEN stays the net deleted bases. END-POS == |SVLEN| therefore holds for
             // every precise record and the flag announces the records where it cannot.
             bool imprecise = false;
+            long long cluster_slack = 0;   // a cluster's span beyond the bases it removes
             if (del_inv_end > 0 && (e.type == EvType::Del || e.type == EvType::Inv)) {
                 // Bases from POS+1 to END; with no preceding base, POS is itself the first affected one.
                 const long long span_bp =
@@ -4567,6 +4568,7 @@ void call_variants(
                 if (span_bp > mag) {
                     end = static_cast<std::size_t>(del_inv_end);
                     imprecise = true;
+                    cluster_slack = span_bp - mag;
                 }
             }
             // A COLLAPSED_MODULE record describes the whole site, and its "unit" is only the shared part
@@ -4754,6 +4756,14 @@ void call_variants(
             const int seen_n = ++id_counts[base_id];
             const std::string id = seen_n == 1 ? base_id : base_id + "_" + std::to_string(seen_n);
 
+            // A replacement of --min-sv-bp or more net change (SUBSTITUTION) is spelled in REF and ALT as a SUB is,
+            // when both sides fit --max-seq-bp: a VCF tool then reads the bases it replaces and what replaces
+            // them. Above that, or IMPRECISE, it stays symbolic with DELSEQ and INSSEQ where they fit.
+            const auto fits = [&options](std::size_t n) { return options.max_seq_bp == 0 || n <= options.max_seq_bp; };
+            const bool explicit_sub = !imprecise &&
+                (rp ? (!rp_sub && !rp_del.empty() && !rp_ins.empty() && fits(rp_del.size()) && fits(rp_ins.size()))
+                    : (e.type == EvType::Sub && sub_sized && !e.seq.empty() && !e.alt_seq.empty() &&
+                       fits(e.seq.size()) && fits(e.alt_seq.size())));
             std::ostringstream info;
             info << "END=" << end << ";SVTYPE=" << svt;
             if (rp ? (!rp_del.empty() && !rp_ins.empty() && !rp_sub) : sub_sized) info << ";SUBSTITUTION";
@@ -4924,7 +4934,20 @@ void call_variants(
             // the base: the event may begin anywhere in the run, so the record is IMPRECISE.
             if (!imprecise && e.type != EvType::Dup && (ref_base == "N" || ref_base_at(end + 1) == "N"))
                 imprecise = true;
-            if (imprecise) info << ";IMPRECISE";
+            if (imprecise) {
+                info << ";IMPRECISE";
+                // How far each breakpoint can lie from where it is written. A cluster's |SVLEN| removed bases lie
+                // somewhere in POS+1..END: its start up to the slack later, its end up to the slack earlier. A
+                // breakpoint at an N run can lie anywhere in the run.
+                if (homlen == 0) {
+                    long long n_before = 0, n_after = 0;
+                    for (std::size_t q = pos; q > 0 && ref_base_at(q) == "N"; --q) ++n_before;
+                    for (std::size_t q = end + 1; ref_base_at(q) == "N"; ++q) ++n_after;
+                    const bool has_end = e.type == EvType::Del || e.type == EvType::Inv || e.type == EvType::Sub;
+                    if (!has_end) info << ";CIPOS=" << -n_before << "," << n_after;
+                    else info << ";CIPOS=" << -n_before << "," << cluster_slack << ";CIEND=" << -cluster_slack << "," << n_after;
+                }
+            }
             if (e.module_span_ambiguous > 0)
                 info << ";CN_SPAN_AMBIGUOUS=" << e.module_span_ambiguous;
             if (multi_crossing_paths > 0) info << ";MULTI_CROSSING=" << multi_crossing_paths;
@@ -4981,7 +5004,7 @@ void call_variants(
                 }
             }
             if (invdup) info << ";INVDUP";
-            if (rp_sub) {
+            if (rp_sub || explicit_sub) {
                 // REF/ALT spell it
             } else if (rp) {
                 if (!rp_del.empty() && seq_fits(rp_del.size())) info << ";DELSEQ=" << rp_del;
@@ -5000,7 +5023,7 @@ void call_variants(
             }
             // A substitution's INSSEQ is what reconstructs the haplotype, so it has its own size check
             // rather than the replaced sequence's.
-            if (!rp && e.type == EvType::Sub && sub_sized && !e.alt_seq.empty() && seq_fits(e.alt_seq.size()))
+            if (!rp && !explicit_sub && e.type == EvType::Sub && sub_sized && !e.alt_seq.empty() && seq_fits(e.alt_seq.size()))
                 info << ";INSSEQ=" << (ref_rev ? reverse_complement(e.alt_seq) : e.alt_seq);
 
             // FORMAT:CNBP (DUP only): the linear bp a haplotype gains/loses through the module -- spelled
@@ -5038,10 +5061,10 @@ void call_variants(
             // after the shared base at POS (none when the event starts the region).
             std::string ref_col = ref_base, alt_col = std::string("<") + svt + ">";
             if (is_dup && e.cn_method == CnMethod::Unit) alt_col = "<CNV:TR>";   // VCF 4.4 tandem-repeat CNV
-            if (rp_sub) {
+            if (rp_sub || (explicit_sub && rp)) {
                 ref_col = ref_base + rp_del;
                 alt_col = ref_base + rp_ins;
-            } else if (e.type == EvType::Sub && !sub_sized && !rp) {
+            } else if (e.type == EvType::Sub && (!sub_sized || explicit_sub) && !rp) {
                 const std::string pad = no_pre_base ? std::string() : ref_base;
                 ref_col = pad + (ref_rev ? reverse_complement(e.seq) : e.seq);
                 alt_col = pad + (ref_rev ? reverse_complement(e.alt_seq) : e.alt_seq);

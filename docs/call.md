@@ -87,8 +87,8 @@ VCF 4.2. `POS` is the base before the event, `END` its last reference base. `FIL
 | field | meaning |
 |-------|---------|
 | `SVTYPE`, `SVLEN`, `END` | type, length change (an inversion: its length), last base |
-| `INSSEQ`, `DELSEQ`, `INVSEQ`, `SUBSTITUTION` | the event's sequence, left out above `--max-seq-bp` (20,000) so VCF tools can read the lines; a replacement's two sides |
-| `IMPRECISE`, `CIPOS`, `CIEND`, `HOMLEN` | uncertain or sliding breakpoints: `IMPRECISE` marks a cluster of pieces (`END`-`POS` wider than \|`SVLEN`\|), a breakpoint at an N run of the reference, or a `PATH_INVERSION` whose breakpoints lie in repeats |
+| `INSSEQ`, `DELSEQ`, `INVSEQ`, `SUBSTITUTION` | the event's sequence, left out above `--max-seq-bp` (20,000) so VCF tools can read the lines. A replacement (`SUB`, or a `DEL`/`INS` flagged `SUBSTITUTION`) is spelled in `REF` and `ALT` where both sides fit and its breakpoints are exact |
+| `IMPRECISE`, `CIPOS`, `CIEND`, `HOMLEN` | uncertain or sliding breakpoints: `IMPRECISE` marks a cluster of pieces (`END`-`POS` wider than \|`SVLEN`\|), a breakpoint at an N run of the reference, or a `PATH_INVERSION` whose breakpoints lie in repeats; its `CIPOS`/`CIEND` give how far each breakpoint can lie |
 | `AN`, `AC`, `AF` | haplotypes with an allele at the site (not `.`), carriers, ratio |
 | `BUBBLE_ID`, `START_NODE`, `END_NODE`, `EVENT_NODES` | the site and the event's nodes; a `PATH_INVERSION`, typed from the walks, has no nodes |
 | `CN_METHOD`, `REF_CN`, `RU_LEN` | how copies were counted, the reference's count, a unit copy's length; a `CNV`'s `POS`+1..`END` covers the reference's copies |
