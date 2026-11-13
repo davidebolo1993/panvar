@@ -25,7 +25,8 @@ Every difference must be covered by a row. An uncovered one is a FAIL (exit 1). 
 listed under PENDING USER APPROVAL and does not fail. Header-line (##) changes and ID renames are
 listed and counted but never fail on their own: a renamed record whose content also changed has a
 CHANGED item that does. Rows that matched nothing are listed as a warning (they are stale, or the
-run was a subset).
+run was a subset), except an approved ADDED or CHANGED copy-number row that an exercised run did not
+produce: that copy-number record or value is lost, and it fails.
 
 --emit-expected prints the expected-diff file back with every exercised row's pin list set to what
 this run observed, and appends a 'pending' row (note TODO) for each uncovered difference. A row
@@ -87,6 +88,14 @@ def matches(row, it):
         pats = [p.strip() for p in row['fields'].split(',')]
         return all(any(fnmatch.fnmatchcase(f, p) for p in pats) for f in it['fields'].split(','))
     return True
+
+
+CN_FIELD_RE = re.compile(r'(^|[.,])(H?CN|REF_CN|CNBP|CNRESID|CN_[A-Z_]+|MODBP)(,|$)')
+
+
+def is_cn_row(row):
+    """A row about a copy-number record, or about copy-number values of any record."""
+    return bool(re.search(r'_(CNV|DUP)_', row['id'])) or bool(CN_FIELD_RE.search(row['fields']))
 
 
 def brief(fil, line):
@@ -275,8 +284,18 @@ def main():
         for r in stale:
             print(f'  row {r["n"]} [{r["status"]}] {r["locus"]}/{r["inputs"]}/{r["config"]} {r["file"]} '
                   f'{r["kind"]} {r["id"]}: {r["note"]}')
+    # An approved copy-number record that this run no longer produces is a lost record, not a stale
+    # row: it fails, so a vanished CN call is never passed by its approved removal alone.
+    runs = [k.split('/') for k in per_run]
+    lost_cn = [r for r in stale if r['status'] == 'approved' and r['kind'] in ('ADDED', 'CHANGED') and is_cn_row(r)
+               and any(gm(loc, r['locus']) and gm(inp, r['inputs']) and gm(cfg, r['config'])
+                       for inp, loc, cfg in runs)]
+    if lost_cn:
+        print(f'\n== APPROVED COPY-NUMBER ROWS NO RUN PRODUCES: FAIL ({len(lost_cn)}) ==')
+        for r in lost_cn:
+            print(f'  row {r["n"]} {r["locus"]}/{r["inputs"]}/{r["config"]} {r["kind"]} {r["id"]}: {r["note"][:80]}')
 
-    if unexpected:
+    if unexpected or lost_cn:
         unexpected.sort(key=lambda it: (not it['crit'], it['value_of'] is None))
         nval = sum(1 for it in unexpected if it['value_of'])
         print(f'\n== UNEXPECTED DIFFERENCES: FAIL ({len(unexpected)}, CN-critical first; {nval} of them a '
@@ -287,7 +306,8 @@ def main():
             if r:
                 print(f'      VALUE DIFFERS from row {r["n"]} [{r["status"]}] ({r["note"][:80]}): '
                       f'pin {it["pin"]}, row accepts {",".join(r["pins"])}')
-        print(f'\ncall_regress: FAIL, {len(unexpected)} unexpected difference(s); '
+        print(f'\ncall_regress: FAIL, {len(unexpected)} unexpected difference(s), {len(lost_cn)} approved CN row(s) '
+              f'no run produces; '
               f'{sum(map(len, pending.values()))} pending, {sum(map(len, approved.values()))} approved, '
               f'{sum(map(len, renames.values()))} rename(s)')
         return 1
