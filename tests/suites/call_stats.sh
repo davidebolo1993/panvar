@@ -97,6 +97,11 @@ check "DEL REF is the last base of n1" "$(field DEL 4)" "${N1: -1}"
 check "INV REF is the last base of n4" "$(field INV 4)" "${N4: -1}"
 check "INS REF is the last base of n6" "$(field INS 4)" "${N6: -1}"
 
+# The header states the --max-seq-bp the sequences were written with: 60 leaves out the 70 bp DELSEQ.
+"$BIN" call -i "$OUT/cb.sorted.gfa" -c "$OUT/cb.bubbles.csv" -r "$REF_NAME" -o "$OUT/cmax" --max-seq-bp 60 -q >/dev/null 2>&1
+check "--max-seq-bp 60: the header's limit and the DEL's DELSEQ" \
+  "$(grep -c '^##INFO=<ID=DELSEQ.*left out above 60 bp' "$OUT/cmax.region.vcf"):$(awk -F'\t' '!/^#/ && /SVTYPE=DEL;/ && /DELSEQ=/' "$OUT/cmax.region.vcf" | wc -l | tr -d ' ')" "1:0"
+
 # The interval in the reference's name: pggb, odgi and impg write a 0-based start with a half-open end
 # (end - start = the path's length), panvar's own W-line names are 1-based inclusive (end - start + 1).
 # The path's length tells them apart; one matching neither is read as half-open, with a warning. Read

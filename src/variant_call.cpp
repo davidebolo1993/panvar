@@ -1868,6 +1868,9 @@ void call_variants(
     cli::ensure_parent_dir_for_file(options.out_prefix + ".region.vcf");
 
     auto write_vcf_header = [&](std::ostream& out) {
+        // the --max-seq-bp this run wrote the sequences with
+        const std::string seq_limit = options.max_seq_bp == 0 ? std::string()
+                                    : "; left out above " + std::to_string(options.max_seq_bp) + " bp (--max-seq-bp)";
         out << "##fileformat=VCFv4.2\n";
         out << "##source=panvar call\n";
         out << "##reference=" << ref_name << "\n";
@@ -1916,9 +1919,9 @@ void call_variants(
         out << "##INFO=<ID=AN,Number=1,Type=Integer,Description=\"Allele number = haplotypes crossing the site that have an allele there (GT not .)\">\n";
         out << "##INFO=<ID=AC,Number=A,Type=Integer,Description=\"Allele count = carrier haplotypes\">\n";
         out << "##INFO=<ID=AF,Number=A,Type=Float,Description=\"Allele frequency = AC/AN; --min-alt-af is tested on it\">\n";
-        out << "##INFO=<ID=INSSEQ,Number=1,Type=String,Description=\"Inserted sequence of the representative member (see SVLEN); left out above 20000 bp\">\n";
-        out << "##INFO=<ID=DELSEQ,Number=1,Type=String,Description=\"Deleted reference sequence of the representative member (see SVLEN); left out above 20000 bp\">\n";
-        out << "##INFO=<ID=INVSEQ,Number=1,Type=String,Description=\"Inverted reference sequence of the representative member (see SVLEN); left out above 20000 bp\">\n";
+        out << "##INFO=<ID=INSSEQ,Number=1,Type=String,Description=\"Inserted sequence of the representative member (see SVLEN)" << seq_limit << "\">\n";
+        out << "##INFO=<ID=DELSEQ,Number=1,Type=String,Description=\"Deleted reference sequence of the representative member (see SVLEN)" << seq_limit << "\">\n";
+        out << "##INFO=<ID=INVSEQ,Number=1,Type=String,Description=\"Inverted reference sequence of the representative member (see SVLEN)" << seq_limit << "\">\n";
         out << "##ALT=<ID=DEL,Description=\"Deletion\">\n";
         out << "##ALT=<ID=INS,Description=\"Insertion\">\n";
         out << "##ALT=<ID=INV,Description=\"Inversion\">\n";
