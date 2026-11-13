@@ -256,7 +256,7 @@ std::vector<VcfRecordInfo> load_region_vcf(const std::string& path, std::vector<
             if (static_cast<std::size_t>(cnbp_i) < v.size() && v[static_cast<std::size_t>(cnbp_i)] != ".")
                 r.sample_cnbp[samples[s]] = std::stoll(v[static_cast<std::size_t>(cnbp_i)]);
             if (static_cast<std::size_t>(cnform_i) < v.size() && v[static_cast<std::size_t>(cnform_i)] != ".")
-                for (const std::string& k : split_on(v[static_cast<std::size_t>(cnform_i)], ',')) {
+                for (const std::string& k : split_on(v[static_cast<std::size_t>(cnform_i)], '+')) {
                     const std::size_t i = parse_count(k, path + " CNFORM");
                     if (i == 0 || i > r.cn_forms.size())
                         throw std::runtime_error(path + ": record " + r.id + " names CN_FORMS entry " + k + ", which it does not have");
@@ -910,14 +910,14 @@ int run_benchmark_command(const std::vector<std::string>& args) {
     // ---- call's output: the VCF and each carrier's own event ----
     std::vector<std::string> vcf_samples;
     std::vector<VcfRecordInfo> vcf = load_region_vcf(vcf_in, vcf_samples);
-    // A form spelled by the reference stretches it repeats (=A-B, ~A-B reverse-complemented, joined with literal
+    // A form spelled by the reference stretches it repeats (@A-B, ~A-B reverse-complemented, joined with literal
     // bases by +) is spelled out; one naming bases outside the region cannot be.
     for (VcfRecordInfo& r : vcf)
         for (VcfRecordInfo::Form& fm : r.cn_forms) {
-            if (!fm.spelled || fm.seq.find_first_of("=~+") == std::string::npos) continue;
+            if (!fm.spelled || fm.seq.find_first_of("@~+") == std::string::npos) continue;
             std::string made;
             for (const std::string& g : split_on(fm.seq, '+')) {
-                if (g.empty() || (g[0] != '=' && g[0] != '~')) { made += g; continue; }
+                if (g.empty() || (g[0] != '@' && g[0] != '~')) { made += g; continue; }
                 const std::size_t dash = g.find('-');
                 const std::size_t a = dash == std::string::npos ? 0 : parse_count(g.substr(1, dash - 1), vcf_in + " CN_FORMS");
                 const std::size_t b = dash == std::string::npos ? 0 : parse_count(g.substr(dash + 1), vcf_in + " CN_FORMS");

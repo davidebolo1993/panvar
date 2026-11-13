@@ -1076,7 +1076,7 @@ void join_small_pieces(const Graph& graph, const std::vector<Tok>& R, const std:
 
 // One haplotype's copies at a collapsed module, told apart from its other events (see call.md, step 7).
 // A copy as an edit of the reference: [start, end] replaced by seq (reference orientation). `code` spells seq
-// by the reference stretches it repeats (=A-B forward, ~A-B reverse-complemented) and literal bases between,
+// by the reference stretches it repeats (@A-B forward, ~A-B reverse-complemented) and literal bases between,
 // joined by '+'; empty where that is no shorter. A gained copy repeats the reference's copies, so the code stays
 // short however long the copy.
 struct CopyForm { std::size_t start = 0, end = 0; std::string seq, code; std::size_t literal_bp = 0; };
@@ -2309,7 +2309,7 @@ void call_variants(
         out << "##INFO=<ID=RU_LEN,Number=1,Type=Integer,Description=\"Repeat-unit length in bp, one represented copy. Emitted only for CN_METHOD=UNIT; (CN-REF_CN)*RU_LEN is the repeat-copy component of the haplotype size, while FORMAT/CNBP is the full module-walk change and CNRESID is their difference\">\n";
         out << "##INFO=<ID=CN_UNIT_BP,Number=1,Type=Integer,Description=\"CN_METHOD=MODULE only: one copy of the module, the reference's bp over its nodes divided by REF_CN; with REF_CN=0, the median over the haplotypes holding copies of their bp per copy. Copies of different types differ, so a carrier's own change is FORMAT:CNBP\">\n";
         out << "##INFO=<ID=CN_METHOD,Number=1,Type=String,Description=\"How CN was measured: UNIT (copies of a panphorte unit graph, counted exactly where they pass its anchor; a one-node unit graph's are its traversals) or MODULE (--cn: passes through the anchor of a collapsed module, the module nodes the most paths revisit)\">\n";
-        out << "##INFO=<ID=CN_FORMS,Number=.,Type=String,Description=\"CN_METHOD=MODULE: the copies carriers gained or lost, each an edit of the reference, START-END:SEQ (reference bases START..END, 1-based, replaced by SEQ in reference orientation; END=START-1 for an insertion, SEQ empty for a deletion, * where its literal bases are over --max-seq-bp). SEQ may name the reference stretches it repeats, =A-B (bases A..B) or ~A-B (their reverse complement), joined with literal bases by +. FORMAT/CNFORM names each carrier's; with its other records they rebuild its walk\">\n";
+        out << "##INFO=<ID=CN_FORMS,Number=.,Type=String,Description=\"CN_METHOD=MODULE: the copies carriers gained or lost, each an edit of the reference, START-END:SEQ (reference bases START..END, 1-based, replaced by SEQ in reference orientation; END=START-1 for an insertion, SEQ empty for a deletion, * where its literal bases are over --max-seq-bp). SEQ may name the reference stretches it repeats, @A-B (bases A..B) or ~A-B (their reverse complement), joined with literal bases by +. FORMAT/CNFORM names each carrier's; with its other records they rebuild its walk\">\n";
         out << "##INFO=<ID=CN_MODULE_REF_BP,Number=1,Type=Integer,Description=\"Reference bp across the bubble interior, each visit counted, over which CN_METHOD=UNIT measures CNBP. On a MODULE record END-POS equals it, unless CN_SPAN_AMBIGUOUS (the span then also encloses the boundary visits between the outermost ones); on a UNIT record END covers the reference's copies, which can lie inside the interior\">\n";
         out << "##INFO=<ID=CN_ANCHOR_BP,Number=1,Type=Integer,Description=\"CN_METHOD=MODULE: bp of the module's anchor, the nodes CN counts passes through\">\n";
         out << "##INFO=<ID=CN_MODULE_NODES_BP,Number=1,Type=Integer,Description=\"CN_METHOD=MODULE: bp of the module's nodes, those some path visits more than once, one visit each\">\n";
@@ -2344,7 +2344,7 @@ void call_variants(
         out << "##FORMAT=<ID=CN,Number=1,Type=Integer,Description=\"Copy number on a CNV record: copies of the repeat unit (CN_METHOD=UNIT) or of the module (MODULE). A MODULE non-carrier (GT 0) whose change a written record of its own holds reads REF_CN, so a dosage read off CN does not count it twice; any other haplotype reads its measured copies. . on other records\">\n";
         out << "##FORMAT=<ID=CNBP,Number=1,Type=Integer,Description=\"Actual linear bp gained(+)/lost(-) by this haplotype vs the reference, from the spelled walk (node length x traversal multiplicity minus the reference's): over the bubble interior on CN_METHOD=UNIT; on MODULE, from the haplotype's first to its last module node, everything walked between. Recovers the linear SV size that a one-copy unit does not convey; CNV records only.\">\n";
         out << "##FORMAT=<ID=CNRESID,Number=1,Type=Integer,Description=\"CNBP - (CN-REF_CN) copies of RU_LEN (UNIT) or CN_UNIT_BP (MODULE), with the measured CN (a MODULE non-carrier written as REF_CN keeps its own copies here): the bp this haplotype gained or lost that whole copies do NOT explain. 0 means the whole size difference is copy number; otherwise a partial copy or other sequence changed in the same site, and on MODULE also copies of another size than the reference's\">\n";
-        out << "##FORMAT=<ID=CNFORM,Number=1,Type=String,Description=\"CN_METHOD=MODULE: the copies this haplotype gained or lost, as 1-based indices into INFO/CN_FORMS, comma-joined; . for a non-carrier, or a carrier whose copies are in no change of its walk\">\n";
+        out << "##FORMAT=<ID=CNFORM,Number=1,Type=String,Description=\"CN_METHOD=MODULE: the copies this haplotype gained or lost, as 1-based indices into INFO/CN_FORMS joined by +; . for a non-carrier, or a carrier whose copies are in no change of its walk. With --diploid, the sample's haplotypes are joined as GT is\">\n";
         out << "##FORMAT=<ID=MODBP,Number=1,Type=Integer,Description=\"CN_METHOD=MODULE: this haplotype's bp change over the module's own nodes against the reference's, each visit counted; GT 1 needs it to reach --min-sv-bp (see ALT CNV). CNBP measures over the copies with everything walked between them\">\n";
         out << "##FORMAT=<ID=CNINV,Number=1,Type=Integer,Description=\"CN_METHOD=UNIT only: how many of this haplotype's CN copies run opposite to the reference's copy of the unit (with no reference copy, to the orientation most haplotypes' copies take; when both are equally common, the haplotype's copies in its own less common orientation). 0 means every copy is in the reference orientation; a gain with CNINV above the reference's is an inverted duplication (INFO/INVDUP), and with no reference copy a haplotype holding copies in both orientations\">\n";
         if (options.diploid) {
@@ -3929,7 +3929,7 @@ void call_variants(
                                     code += l; made += l; lit_bp += l.size();
                                     continue;
                                 }
-                                code += (g.rc ? '~' : '=') + std::to_string(g.a) + '-' + std::to_string(g.b);
+                                code += (g.rc ? '~' : '@') + std::to_string(g.a) + '-' + std::to_string(g.b);
                                 if (g.a < base || g.b + 1 - base > ref_genome.size()) { made.clear(); break; }
                                 std::string x = ref_genome.substr(g.a - base, g.b + 1 - g.a);
                                 for (char& ch : x) ch = upper_base(ch)[0];
@@ -5469,7 +5469,7 @@ void call_variants(
                         const auto ait = sample_to_allele.find(s);
                         const auto fit = !carrier || ait == sample_to_allele.end() ? mr.allele_forms.end() : mr.allele_forms.find(ait->second);
                         if (fit != mr.allele_forms.end())
-                            for (std::size_t k = 0; k < fit->second.size(); ++k) fs += (k ? "," : "") + std::to_string(fit->second[k] + 1);
+                            for (std::size_t k = 0; k < fit->second.size(); ++k) fs += (k ? "+" : "") + std::to_string(fit->second[k] + 1);
                         row << ':' << (fs.empty() ? std::string(".") : fs);
                     }
                     if (e.cn_method == CnMethod::Unit && e.ru_len > 0) {

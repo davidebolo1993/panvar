@@ -678,7 +678,7 @@ pk_cn() { awk -F'\t' -v s="$1" '/^#CHROM/{for(i=10;i<=NF;i++) if($i ~ s) c=i}
 # The third u lies between the duplicating haplotype's copies: it goes with them, in the module record's forms.
 check "the third u is in the duplicating haplotype's copies, no insertion of its own (INS records, pkdup's CNFORM)" \
   "$(grep -v '^#' "$PKV" | grep -c 'SVTYPE=INS;') $(awk -F'\t' '/^#CHROM/{for(i=10;i<=NF;i++) if($i ~ /^pkdup#/) c=i}
-     !/^#/ && /SVTYPE=CNV;/{n=split($9,k,":"); split($c,v,":"); for(j=1;j<=n;j++) if(k[j]=="CNFORM") print v[j]}' "$PKV")" "0 1,2"
+     !/^#/ && /SVTYPE=CNV;/{n=split($9,k,":"); split($c,v,":"); for(j=1;j<=n;j++) if(k[j]=="CNFORM") print v[j]}' "$PKV")" "0 1+2"
 
 # ---------------------------------------------------------------------------------------------
 # Within-haplotype coalescing must also judge nearness at the OCCURRENCE, not at a node's first
@@ -1066,7 +1066,7 @@ check "copies: two pieces under --min-sv-bp 8 bp apart inside a copy are one rec
 check "copies: forms of gained copies name the reference stretches they repeat (hgain, hinv CN_FORMS entries)" \
   "$(awk -F'\t' '/^#CHROM/{for(i=10;i<=NF;i++) c[$i]=i} !/^#/ && /SVTYPE=CNV;/{n=split($9,k,":"); match($8,/CN_FORMS=[^;]*/); split(substr($8,RSTART+9,RLENGTH-9),fs,",")
        for (h in c) if (h=="hgain#1#chr1" || h=="hinv#1#chr1") { split($c[h],v,":"); for(j=1;j<=n;j++) if(k[j]=="CNFORM") r[h]=fs[v[j]] }
-       print r["hgain#1#chr1"], r["hinv#1#chr1"]}' "$OUT/sep_short.region.vcf")" "2001-2000:=2001-2200 2361-2360:~2001-2200"
+       print r["hgain#1#chr1"], r["hinv#1#chr1"]}' "$OUT/sep_short.region.vcf")" "2001-2000:@2001-2200 2361-2360:~2001-2200"
 # hz walks Z (50 bp, no module node) for the first copy's A3 (60 bp): Z takes A3's place in its copies, so CNBP
 # is its walk's change across them, -10, not -60 from its first module node on.
 sed 's/^P hyy#1#chr1 .*/P hz#1#chr1 L+,Z+,A2+,S+,A3+,A2+,X1+,X2+,X3+,R+/' "$OUT/sep.spec" | sed 's/^N Y 70 89$/N Y 70 89\nN Z 50 90/' > "$OUT/sepz.spec"
@@ -1099,6 +1099,9 @@ python3 -I "$(cd "$(dirname "$0")/.." && pwd)/tools/spec_gfa.py" "$OUT/sepoff.sp
 "$BIN" call -i "$OUT/sepoff/g.gfa" -c "$OUT/sepoff/g.bubbles.csv" -r ref -o "$OUT/sepoff" --cn --quiet >/dev/null 2>&1
 check "copies, no reference copy: a replacement elsewhere in the site leaves a gain a carrier (hsub records)" \
   "$(hrec "$OUT/sepoff.region.vcf" 'hsub#1#chr1')" "1:1 INS:1000"
+# The record's INFO and FORMAT keep to what VCF allows: no '=' inside an INFO value, and CNFORM one value.
+check "copies: no '=' inside an INFO value, CNFORM declared one value (INFO fields with two '=', CNFORM Number)" \
+  "$(grep -v '^#' "$OUT/sep_short.region.vcf" | awk -F'\t' '{n=split($8,f,";"); for(i=1;i<=n;i++) if (gsub(/=/,"=",f[i]) > 1) b++} END{print b+0}') $(grep -o '##FORMAT=<ID=CNFORM,Number=[^,]*' "$OUT/sep_short.region.vcf" | sed 's/.*Number=//')" "0 1"
 # --diploid: hhalf and heq as one sample; each haplotype's copies are listed, joined as GT is.
 sed -e 's/^P hhalf#1#chr1 /P s9#1#chr1 /' -e 's/^P heq#1#chr1 /P s9#2#chr1 /' "$OUT/sep.spec" > "$OUT/sepdip.spec"
 python3 -I "$(cd "$(dirname "$0")/.." && pwd)/tools/spec_gfa.py" "$OUT/sepdip.spec" "$OUT/sepdip"
