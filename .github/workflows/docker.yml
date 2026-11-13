@@ -27,18 +27,21 @@ on:
 
 jobs:
   docker:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           submodules: recursive
       - run: docker build -t panvar:ci .
       - name: Tools in the image
         run: |
           docker run --rm panvar:ci bubble --help > /dev/null
+          docker run --rm panvar:ci background --help > /dev/null
+          docker run --rm panvar:ci recruit --help > /dev/null
           docker run --rm -i --entrypoint /usr/local/bin/_entrypoint.sh panvar:ci bash -s <<'EOF'
           set -e
-          for t in vg odgi bcftools bgzip tabix minimap2 k8 paftools.js samtools svim-asm truvari gemma column python3 Rscript; do
+          for t in vg odgi bcftools bgzip tabix minimap2 k8 paftools.js samtools svim-asm truvari gemma column python3 Rscript \
+                   wgsim art_illumina pbsim bbduk.sh locityper jellyfish; do
             command -v "$t" > /dev/null || { echo "missing: $t"; exit 1; }
           done
           python3 -c 'import numpy'

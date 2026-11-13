@@ -55,6 +55,101 @@ add_library(edlib STATIC ${EDLIB_DIR}/src/edlib.cpp)
 target_include_directories(edlib PUBLIC $<BUILD_INTERFACE:${EDLIB_DIR}/include>)
 set_target_properties(edlib PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
+# SSHash (submodule + nested PTHash, MIT) -- the compressed k-mer dictionary `background --compact` writes.
+# Compiled here as a plain static library from its sources, with panvar's flags rather than its own (which add
+# -Werror, and -mavx2 -mbmi2 on x86-64): its x86 fast paths are guarded by __AVX2__, so the default build runs
+# on any x86-64; -DPANVAR_SSHASH_AVX2=ON turns them on for machines that have AVX2.
+set(SSHASH_DIR ${CMAKE_CURRENT_SOURCE_DIR}/external/sshash)
+if(NOT EXISTS ${SSHASH_DIR}/include/dictionary.hpp OR NOT EXISTS ${SSHASH_DIR}/external/pthash/include/pthash.hpp)
+    message(FATAL_ERROR
+        "Missing SSHash sources in external/sshash (or its nested PTHash). "
+        "Run: git submodule update --init --recursive")
+endif()
+option(PANVAR_SSHASH_AVX2 "Build SSHash with AVX2 and BMI2 (x86-64 machines that have them)" OFF)
+add_library(sshash STATIC
+    ${SSHASH_DIR}/external/gz/zip_stream.cpp
+    ${SSHASH_DIR}/external/cityhash/cityhash.cpp
+)   # its templated sources (src/*.cpp) are included by src/background_sshash.cpp, as SSHash's own tools do
+target_include_directories(sshash SYSTEM PUBLIC
+    ${SSHASH_DIR}/include
+    ${SSHASH_DIR}
+    ${SSHASH_DIR}/external/pthash/include
+    ${SSHASH_DIR}/external/pthash/external/bits/include
+    ${SSHASH_DIR}/external/pthash/external/fastmod
+    ${SSHASH_DIR}/external/pthash/external/bits/external/essentials/include
+    ${SSHASH_DIR}/external/pthash/external/xxHash
+    ${SSHASH_DIR}/external/pthash/external/mm_file/include
+)
+target_compile_options(sshash PRIVATE -O3 -w)
+if(PANVAR_SSHASH_AVX2 AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64)$")
+    target_compile_options(sshash PUBLIC -mavx2 -mbmi2)
+endif()
+target_link_libraries(sshash PUBLIC ZLIB::ZLIB Threads::Threads)
+
+# htslib (submodule + nested htscodecs, MIT/BSD) -- SAM, BAM and CRAM input for `recruit`. Compiled here from
+# its sources as a static library, with a generated config.h instead of its configure step: no network
+# access (libcurl off), bzip2 and lzma CRAM codecs and libdeflate when the system has them. Its codec SIMD
+# variants are compiled where the compiler enables them by default (NEON on 64-bit ARM); elsewhere CRAM uses
+# the portable codecs.
+set(HTSLIB_DIR ${CMAKE_CURRENT_SOURCE_DIR}/external/htslib)
+if(NOT EXISTS ${HTSLIB_DIR}/hts.c OR NOT EXISTS ${HTSLIB_DIR}/htscodecs/htscodecs/htscodecs.c)
+    message(FATAL_ERROR
+        "Missing htslib sources in external/htslib (or its nested htscodecs). "
+        "Run: git submodule update --init --recursive")
+endif()
+find_package(BZip2 QUIET)
+find_package(LibLZMA QUIET)
+find_library(LIBDEFLATE_LIBRARY NAMES deflate)
+find_path(LIBDEFLATE_INCLUDE_DIR libdeflate.h)
+set(HTSLIB_GEN ${CMAKE_CURRENT_BINARY_DIR}/htslib_generated)
+set(HTSLIB_CONFIG "/* config.h for the vendored htslib, written by panvar's CMake */\n#ifndef _XOPEN_SOURCE\n#define _XOPEN_SOURCE 600\n#endif\n#define HAVE_DRAND48 1\n")
+if(BZIP2_FOUND)
+    string(APPEND HTSLIB_CONFIG "#define HAVE_LIBBZ2 1\n")
+endif()
+if(LIBLZMA_FOUND)
+    string(APPEND HTSLIB_CONFIG "#define HAVE_LIBLZMA 1\n#define HAVE_LZMA_H 1\n")
+endif()
+if(LIBDEFLATE_LIBRARY AND LIBDEFLATE_INCLUDE_DIR)
+    string(APPEND HTSLIB_CONFIG "#define HAVE_LIBDEFLATE 1\n")
+endif()
+file(WRITE ${HTSLIB_GEN}/config.h.new "${HTSLIB_CONFIG}")
+file(WRITE ${HTSLIB_GEN}/version.h.new "#define HTS_VERSION_TEXT \"1.23\"\n#define HTSCODECS_VERSION_TEXT \"1.6.5\"\n")
+file(WRITE ${HTSLIB_GEN}/config_vars.h.new
+    "#define HTS_CC \"${CMAKE_C_COMPILER}\"\n#define HTS_CPPFLAGS \"\"\n#define HTS_CFLAGS \"\"\n#define HTS_LDFLAGS \"\"\n#define HTS_LIBS \"\"\n")
+foreach(h config.h version.h config_vars.h)   # rewritten only when changed, so htslib is not rebuilt each time
+    configure_file(${HTSLIB_GEN}/${h}.new ${HTSLIB_GEN}/${h} COPYONLY)
+endforeach()
+set(HTSLIB_SOURCES)
+foreach(f kfunc kstring bcf_sr_sort bgzf errmod faidx header hfile hts hts_expr hts_os md5 multipart probaln realn
+          regidx region sam sam_mods simd synced_bcf_reader vcf_sweep tbx textutils thread_pool vcf vcfutils
+          cram/cram_codecs cram/cram_decode cram/cram_encode cram/cram_external cram/cram_index cram/cram_io
+          cram/cram_stats cram/mFILE cram/open_trace_file cram/pooled_alloc cram/string_alloc
+          htscodecs/htscodecs/arith_dynamic htscodecs/htscodecs/fqzcomp_qual htscodecs/htscodecs/htscodecs
+          htscodecs/htscodecs/pack htscodecs/htscodecs/rANS_static4x16pr htscodecs/htscodecs/rANS_static32x16pr
+          htscodecs/htscodecs/rANS_static32x16pr_neon htscodecs/htscodecs/rANS_static htscodecs/htscodecs/rle
+          htscodecs/htscodecs/tokenise_name3 htscodecs/htscodecs/utils)
+    list(APPEND HTSLIB_SOURCES ${HTSLIB_DIR}/${f}.c)
+endforeach()
+add_library(hts STATIC ${HTSLIB_SOURCES})
+target_include_directories(hts PRIVATE ${HTSLIB_GEN} ${HTSLIB_DIR}/htscodecs)
+target_include_directories(hts SYSTEM PUBLIC ${HTSLIB_DIR})
+target_compile_options(hts PRIVATE -O2 -w)
+set_target_properties(hts PROPERTIES POSITION_INDEPENDENT_CODE ON C_STANDARD 99)
+target_link_libraries(hts PUBLIC ZLIB::ZLIB Threads::Threads)
+if(NOT APPLE)
+    target_link_libraries(hts PUBLIC m)
+endif()
+if(BZIP2_FOUND)
+    target_link_libraries(hts PUBLIC BZip2::BZip2)
+endif()
+if(LIBLZMA_FOUND)
+    target_link_libraries(hts PUBLIC LibLZMA::LibLZMA)
+endif()
+if(LIBDEFLATE_LIBRARY AND LIBDEFLATE_INCLUDE_DIR)
+    target_include_directories(hts PRIVATE ${LIBDEFLATE_INCLUDE_DIR})
+    target_link_libraries(hts PUBLIC ${LIBDEFLATE_LIBRARY})
+endif()
+
 # abPOA (submodule + nested SIMDe, MIT) -- partial-order alignment behind `refine`'s residual MSA.
 # Built as a static library via its own Makefile (like minimap2); its Makefile auto-detects arm64
 # (uname -m) and selects the apple-m1/SIMDe SIMD path.
@@ -133,6 +228,7 @@ if(NOT EXISTS ${EIGEN_DIR}/Eigen/Dense)
 endif()
 
 add_library(panvarlib
+    src/cli_utils.cpp
     src/gfa.cpp
     src/gfa_io.cpp
     src/align.cpp
@@ -161,6 +257,17 @@ add_library(panvarlib
     src/refine.cpp
     src/rebuild.cpp
     src/output.cpp
+    src/background.cpp
+    src/background_store.cpp
+    src/background_graph.cpp
+    src/background_sshash.cpp
+    src/anchors.cpp
+    src/fasta_index.cpp
+    src/locus_index.cpp
+    src/recruit_reads.cpp
+    src/read_input.cpp
+    src/recruit_calibration.cpp
+    src/recruit_scoring.cpp
 )
 
 target_include_directories(panvarlib
@@ -185,11 +292,15 @@ target_compile_options(panvarlib
 # PRIVATE: edlib is an implementation detail of align.cpp, not part of panvarlib's
 # public interface. For a static lib CMake still propagates the symbols to the final
 # executable link, while keeping edlib out of the installed export set.
-target_link_libraries(panvarlib PRIVATE edlib abpoa minigraph ZLIB::ZLIB)
+target_link_libraries(panvarlib PRIVATE edlib abpoa minigraph sshash hts ZLIB::ZLIB)
+# GCC 8 and older keep std::filesystem in a separate library; PUBLIC so every target linking
+# panvarlib (the tool and the unit tests) gets it after the library on the link line.
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND CMAKE_CXX_COMPILER_VERSION VERSION_LESS 9)
+    target_link_libraries(panvarlib PUBLIC stdc++fs)
+endif()
 
 add_executable(panvar
     src/main.cpp
-    src/cli_utils.cpp
     src/bubble_command.cpp
     src/inspect.cpp
     src/call_command.cpp
@@ -199,18 +310,14 @@ add_executable(panvar
     src/refine_command.cpp
     src/rebuild_command.cpp
     src/associate_command.cpp
+    src/background_command.cpp
+    src/recruit_command.cpp
 )
 target_include_directories(panvar PRIVATE ${EIGEN_DIR})
 target_compile_definitions(panvar PRIVATE PANVAR_VERSION="${PROJECT_VERSION}")
 target_link_libraries(panvar PRIVATE panvarlib minimap2 Threads::Threads ZLIB::ZLIB)
 if(NOT WIN32)
     target_link_libraries(panvar PRIVATE m)
-endif()
-# GCC 8 and older keep std::filesystem symbols in a separate library.
-if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
-    if(CMAKE_CXX_COMPILER_VERSION VERSION_LESS 9)
-        target_link_libraries(panvar PRIVATE stdc++fs)
-    endif()
 endif()
 
 target_compile_options(panvar
@@ -230,6 +337,46 @@ install(TARGETS panvar RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 if(PANVAR_BUILD_TESTING)
     include(CTest)
     if(BUILD_TESTING)
+        # Unit tests of the shared k-mer primitives: brute force on random sequences, and the existing
+        # collector on the real loci's spelled paths.
+        add_executable(panvar_kmer_test tests/unit/kmer_test.cpp)
+        target_link_libraries(panvar_kmer_test PRIVATE panvarlib minimap2 Threads::Threads ZLIB::ZLIB)
+        target_compile_options(panvar_kmer_test PRIVATE -Wall -Wextra -Wpedantic)
+        add_test(
+            NAME panvar_unit_kmer
+            COMMAND panvar_kmer_test
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/real_data/paralogs/c4.gfa.gz
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/real_data/paralogs/gstm.gfa.gz
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/real_data/paralogs/cyp2d.gfa.gz
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/real_data/paralogs/acot.gfa.gz
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/real_data/tandem_repeat/lpa.gfa.gz
+        )
+        set_tests_properties(panvar_unit_kmer PROPERTIES TIMEOUT 300)
+        add_executable(panvar_background_test tests/unit/background_test.cpp)
+        target_link_libraries(panvar_background_test PRIVATE panvarlib minimap2 Threads::Threads ZLIB::ZLIB)
+        target_compile_options(panvar_background_test PRIVATE -Wall -Wextra -Wpedantic)
+        add_test(NAME panvar_unit_background
+                 COMMAND panvar_background_test ${CMAKE_CURRENT_BINARY_DIR}/unit_background)
+        set_tests_properties(panvar_unit_background PROPERTIES TIMEOUT 300)
+        # background end to end: kills at every commit step, concurrent adds, segments attached, range
+        # merges, compaction, anchoring after the fact, a full disk; dumps against an independent count.
+        set(PANVAR_BG_CLI ${CMAKE_CURRENT_SOURCE_DIR}/tests/suites/background_cli.sh)
+        if(EXISTS ${PANVAR_BG_CLI})
+            add_test(NAME panvar_background_cli
+                     COMMAND /usr/bin/env bash ${PANVAR_BG_CLI} $<TARGET_FILE:panvar> ${CMAKE_CURRENT_SOURCE_DIR}/tests/tools ${CMAKE_CURRENT_BINARY_DIR}/background_cli)
+            set_tests_properties(panvar_background_cli PROPERTIES TIMEOUT 600)
+        endif()
+        # recruit --index-only on a synthetic locus with a paralog: outside counts against brute force,
+        # classes, decoys, screen, reuse and rebuilds.
+        set(PANVAR_RECRUIT_INDEX ${CMAKE_CURRENT_SOURCE_DIR}/tests/suites/recruit_index.sh)
+        if(EXISTS ${PANVAR_RECRUIT_INDEX})
+            add_test(NAME panvar_recruit_index
+                     COMMAND /usr/bin/env bash ${PANVAR_RECRUIT_INDEX} $<TARGET_FILE:panvar> ${CMAKE_CURRENT_SOURCE_DIR}/tests/tools ${CMAKE_CURRENT_BINARY_DIR}/recruit_index)
+            set_tests_properties(panvar_recruit_index PROPERTIES TIMEOUT 300)
+            add_test(NAME panvar_recruit_input
+                     COMMAND /usr/bin/env bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/suites/recruit_input.sh $<TARGET_FILE:panvar> ${CMAKE_CURRENT_SOURCE_DIR}/tests/tools ${CMAKE_CURRENT_BINARY_DIR}/recruit_input)
+            set_tests_properties(panvar_recruit_input PROPERTIES TIMEOUT 300)
+        endif()
         # Fast, dependency-free smoke on a tiny hand-built graph that exercises every
         # call event type + confounders with exact-record assertions (no vg needed).
         set(PANVAR_SYN_SMOKE ${CMAKE_CURRENT_SOURCE_DIR}/tests/suites/synthetic_smoke.sh)

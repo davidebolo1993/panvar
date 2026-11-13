@@ -31,4 +31,11 @@ bash scripts/benchmark_thresholds.sh   # after benchmark_examples.sh
 bash dev/call_truth.sh                 # copy number against the truth sets, after call_examples.sh
 ```
 
-They need `python3` and `Rscript` (ggplot2, ggrepel, data.table). The `dev/` checks that call svim-asm, truvari or GEMMA are described in `dev/README.md`.
+The read-recruitment examples run on a synthetic genome set, in seconds, the second after the first:
+
+```bash
+bash scripts/background_examples.sh
+bash scripts/recruit_examples.sh
+```
+
+They need `python3` and `Rscript` (ggplot2, ggrepel, data.table). The `dev/` checks that call svim-asm, truvari or GEMMA, and the read-recruitment benchmarks, are described in `dev/README.md`.

@@ -1,0 +1,72 @@
+#pragma once
+
+// Recruiting reads to locus indexes without aligning: each read (or pair) is screened by its closed
+// syncmers against the loaded loci; for every locus it hits, each of its k-mers is labelled P, S, R (the
+// locus table), D (the decoys) or N (neither), each read's locus segment is found from the labels, and the
+// evidence in the segments decides the fragment's fate: certain, ambiguous (with a reason) or unrecruited.
+
+#include "panvar/locus_index.hpp"
+
+#include <cstdint>
+#include <functional>
+#include <string>
+#include <vector>
+
+namespace panvar::recruit {
+
+// Which read k-mers are looked up to decide whether a read is scored: closed syncmers among the loci's
+// private and shared k-mers (default); the read's minimizers (one per window of 20 k-mers, the same
+// density) among all of them; or every k-mer (no screen). For the seed comparison.
+enum class Screen { Syncmer, Minimizer, All };
+
+struct Evidence {
+    // Within each read's locus segment (the stretch of its k-mers that reads as locus sequence):
+    // independent sites, private (or decoy) k-mers counted only when they start at least k bases after the
+    // last one counted, so all k-mers a single differing base touches count once; a k-mer already counted
+    // in the other mate is not counted again.
+    std::uint32_t sites_p = 0;
+    std::uint32_t sites_d = 0;
+    std::uint32_t decoy_out = 0;   // decoy sites outside the segments
+    std::uint32_t runs_n = 0;      // runs of k-mers in neither table (a sequencing error or a new allele each)
+    std::uint32_t seg_kmers = 0;   // callable k-mers in the segments
+    // Whole reads:
+    std::uint32_t n_p = 0, n_s = 0, n_r = 0, n_d = 0, n_n = 0;   // k-mers per label
+    std::uint32_t kmers = 0;       // k-mers read (windows without N bases)
+    std::uint32_t windows = 0;     // k-mer windows the read has, callable or not
+    std::uint32_t bases = 0;
+    std::uint32_t multi = 0;       // P k-mers that are multi-copy within a haplotype
+    void add(const Evidence& o);
+};
+
+struct ReadOptions {
+    std::vector<std::string> indexes;    // .plx files
+    // one sample's reads, read in this order: a FASTQ pair (both), or one file (FASTQ, SAM, BAM, CRAM)
+    std::vector<std::pair<std::string, std::string>> inputs;
+    std::string cram_reference;          // FASTA for CRAM
+    bool interleaved = false;            // single FASTQ files hold mates as consecutive records
+    std::string out;                     // per-fragment table (TSV)
+    Screen screen = Screen::Syncmer;
+    std::uint32_t min_sites = 2;         // private sites for certain (each locus's calibrated cut instead, if so)
+    bool calibrated_cut = true;          // per locus, the lowest cut meeting the false-certain rate
+    double false_certain_rate = 1e-6;    // per screened off-target fragment of the run's read class
+    double decoy_share = 0.05;           // decoy sites tolerated, as a share of the private sites
+    double min_density = 0.05;           // private sites per 31 callable bases: chance hits in a long read are sparse
+    double error_rate = -1;              // per base: the expected mismatch runs, beside one new allele per kb;
+                                         // below 0: estimated from the base qualities of the first reads
+    std::string reads_out;               // a folder for the recruited reads as FASTQ (none if empty)
+    bool reads_ambiguous = true;         // write ambiguous reads too (else certain only)
+    std::string summary;                 // the run's summary table (none if empty)
+    std::size_t threads = 2;
+    std::function<void(const std::string&)> log;
+};
+
+struct ReadStats {
+    std::uint64_t fragments = 0, screened = 0;
+    std::uint64_t certain = 0, ambiguous = 0, unrecruited = 0;
+    double error_rate = 0;               // the rate scored with
+    std::string error_source;            // given, or estimated from base qualities, or a default
+};
+
+ReadStats recruit_reads(const ReadOptions& options);
+
+}  // namespace panvar::recruit
