@@ -1430,19 +1430,22 @@ void call_variants(
         std::vector<long long> per_allele;   // count per ALT index (1-based; index 0 unused)
         for (const OutColumn& col : out_columns) {
             // Each slot's values: those of the path of the haplotype that crosses the site. Where two contigs of
-            // one haplotype both cross it (overlapping contigs), they are the haplotype there when they agree;
-            // when they differ, which one it is is unknown: '.'.
+            // one haplotype both cross it (overlapping contigs), they are the haplotype there when they agree.
+            // When they differ, a contig carrying the record makes the haplotype a carrier, with that contig's
+            // values, as the per-path AC counts it; otherwise which one it is is unknown: '.'.
             std::vector<std::vector<std::string>> sv(col.slots.size(), std::vector<std::string>(keys.size(), "."));
             for (std::size_t s = 0; s < col.slots.size(); ++s) {
-                std::size_t known = 0, which = 0;
+                std::size_t known = 0, which = 0, carrying = SIZE_MAX;
                 bool agree = true;
                 for (const std::size_t i : col.slots[s]) {
                     const bool k_any = gt_k < keys.size() ? v[i][gt_k] != "." : v[i][0] != ".";
                     if (!k_any) continue;
                     if (known > 0 && v[i] != v[which]) agree = false;
+                    if (carrying == SIZE_MAX && gt_k < keys.size() && v[i][gt_k] != "0") carrying = i;
                     ++known; which = i;
                 }
                 if (known >= 1 && agree) sv[s] = v[which];
+                else if (carrying != SIZE_MAX) sv[s] = v[carrying];
                 if (gt_k < keys.size() && sv[s][gt_k] != ".") {
                     ++an;
                     if (sv[s][gt_k] != "0") ++ac;
@@ -1515,9 +1518,9 @@ void call_variants(
         return out;
     };
     // Per-path columns: AN/AC/AF over haplotypes, as --diploid counts slots. The reference path leaves AN, and a
-    // haplotype assembled in several contigs (PanSN sample#haplotype, numbered) counts once where its contigs
-    // that have an allele agree on it, not at all where they differ. A path with no numbered haplotype is one
-    // of its own.
+    // haplotype assembled in several contigs (PanSN sample#haplotype, numbered) counts once: a carrier where one
+    // of its contigs carries the record, so AC is the haplotypes with a carrying column. A path with no
+    // numbered haplotype is one of its own.
     std::vector<std::size_t> path_slot(sample_names.size(), SIZE_MAX);
     {
         std::map<std::string, std::size_t> slot_of;
@@ -1545,18 +1548,17 @@ void call_variants(
             }
         }
         if (f.size() < 10 || f.size() - 9 != sample_names.size()) return line;
-        std::unordered_map<std::size_t, std::string> slot_gt;   // slot -> its agreed GT ("?" where they differ)
+        std::unordered_map<std::size_t, std::string> slot_gt;   // slot -> its GT: a carrying contig's, else 0
         for (std::size_t i = 0; i < sample_names.size(); ++i) {
             if (path_slot[i] == SIZE_MAX) continue;
             const std::string& c = f[9 + i];
             const std::string gt = c.substr(0, c.find(':'));
             if (gt == ".") continue;
             auto [it, fresh] = slot_gt.emplace(path_slot[i], gt);
-            if (!fresh && it->second != gt) it->second = "?";
+            if (!fresh && it->second == "0") it->second = gt;   // a carrying contig makes the haplotype a carrier
         }
         long long an = 0, ac = 0;
         for (const auto& [k, g] : slot_gt) {
-            if (g == "?") continue;
             ++an;
             if (g != "0") ++ac;
         }
@@ -1954,7 +1956,7 @@ void call_variants(
             out << "##INFO=<ID=GENES,Number=.,Type=String,Description=\"Gene(s) overlapping the variant (from --gtf); for an event inside a gene of a copy-number site's copies, that gene's paralogs its carriers hold\">\n";
         out << "##INFO=<ID=MERGE_MIN_SIM,Number=1,Type=Float,Description=\"How alike the events merged into this record are: the weakest similarity of a member event to the representative, in the test that admits it (MERGE_TEST). Under that test's threshold (--merge-seq-identity, --merge-jaccard), the member joined only through other members. Absent where every member holds the representative's event\">\n";
         out << "##INFO=<ID=MERGE_TEST,Number=1,Type=String,Description=\"The test MERGE_MIN_SIM is measured in: spliced (sequence identity of the haplotypes the two events make, for events found by aligning alleles or each one exact change), jaccard (the events' node sets, length-weighted) or seq (their sequences)\">\n";
-        out << "##INFO=<ID=AN,Number=1,Type=Integer,Description=\"Allele number: haplotypes with an allele at the site (GT not .). The reference path is left out, and a haplotype assembled in several contigs (PanSN sample#haplotype) counts once where those with an allele agree on it, not at all where they differ\">\n";
+        out << "##INFO=<ID=AN,Number=1,Type=Integer,Description=\"Allele number: haplotypes with an allele at the site (GT not .). The reference path is left out, and a haplotype assembled in several contigs (PanSN sample#haplotype) counts once: a carrier where one of its contigs carries the allele\">\n";
         out << "##INFO=<ID=AC,Number=A,Type=Integer,Description=\"Allele count: haplotypes of AN that carry the allele\">\n";
         out << "##INFO=<ID=AF,Number=A,Type=Float,Description=\"Allele frequency = AC/AN; --min-alt-af is tested on it\">\n";
         out << "##INFO=<ID=INSSEQ,Number=1,Type=String,Description=\"Inserted sequence of the representative member (see SVLEN)" << seq_limit << "\">\n";
@@ -2706,8 +2708,8 @@ void call_variants(
         // haplotype whose CN differs from REF_CN: on UNIT that includes changes too small to make a carrier.
         // --min-alt-af is tested on the AF a record is written with. A copy-number record has no '.'
         // haplotype, so per path its AN is known here, counted as the writer counts it (per_path_counts): the
-        // haplotypes crossing the site, the reference path left out and a haplotype's contigs once where
-        // they agree on carrying it. Other records lose '.' haplotypes from AN when written, and are tested then.
+        // haplotypes crossing the site, the reference path left out and a haplotype's contigs once, a carrier
+        // where one of them carries it. Other records lose '.' haplotypes from AN when written, and are tested then.
         // With --diploid a slot whose contigs both cross the site is '.' where their values differ, and some
         // of those values (CNBP) are only measured when the record is written. Contigs that differ in GT, CN
         // or CNINV leave the slot out here; a slot of agreeing non-carrier contigs is left out too, so the AF
@@ -2718,16 +2720,14 @@ void call_variants(
             if (options.min_maf > 0.0 && mr.seed.type == EvType::Dup) {
                 std::size_t an = 0, ac = 0;
                 if (!options.diploid) {
-                    std::unordered_map<std::size_t, int> slot_gt;   // 1 carrier, 0 not, -1 contigs that differ
+                    std::unordered_map<std::size_t, int> slot_gt;   // 1 where a contig carries it, else 0
                     for (const std::string& t : traverses) {
                         const auto pit = name_to_pi.find(t);
                         if (pit == name_to_pi.end() || path_slot[pit->second] == SIZE_MAX) continue;
-                        const int g = uniq.count(t) != 0 ? 1 : 0;
-                        const auto [it, fresh] = slot_gt.emplace(path_slot[pit->second], g);
-                        if (!fresh && it->second != g) it->second = -1;
+                        int& g = slot_gt[path_slot[pit->second]];
+                        if (uniq.count(t) != 0) g = 1;
                     }
                     for (const auto& [slot, g] : slot_gt) {
-                        if (g < 0) continue;
                         ++an;
                         if (g == 1) ++ac;
                     }
@@ -2742,12 +2742,14 @@ void call_variants(
                     an = ac = 0;
                     for (const auto& [slot, paths] : slot_paths) {
                         const std::string& p0 = paths.front();
-                        const bool carrier = uniq.count(p0) != 0;
+                        bool carrier = false;
+                        for (const std::string& p : paths) carrier = carrier || uniq.count(p) != 0;
                         bool agree = true;
                         for (const std::string& p : paths)
                             agree = agree && (uniq.count(p) != 0) == carrier && value(mr.sample_cn, p) == value(mr.sample_cn, p0) &&
                                     value(mr.sample_cninv, p) == value(mr.sample_cninv, p0);
-                        if (!agree || (paths.size() > 1 && !carrier)) continue;
+                        // a carrying contig makes the slot a carrier; non-carrier contigs count only where alone
+                        if (!carrier && (!agree || paths.size() > 1)) continue;
                         ++an;
                         if (carrier) ++ac;
                     }

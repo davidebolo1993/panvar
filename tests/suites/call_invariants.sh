@@ -198,6 +198,13 @@ for mode in default cn; do
   eq "$mode: SVLEN is the 81 bp gain" "$(IC get "$V" SVTYPE=CNV SVLEN)" "81"
 done
 
+# ---------------------------------------------------------------- 7. AC
+# In every VCF this run wrote: AC is the number of haplotypes (per sample: columns) with a carrying column, and no
+# record is written with AC=0.
+echo "-- 7. AC counts the haplotypes that carry"
+check "AC = haplotypes with a carrying column, never 0 (every region VCF of this run)" \
+  python3 -I "$TOOLS/accheck.py" $(find "$OUT" -name '*.region.vcf' | sort)
+
 echo
 printf "call_invariants: %d passed, %d FAILED, %d xfail, %d XPASS\n" "$passes" "$fails" "$xfails" "$xpasses"
 [ "$fails" -eq 0 ]

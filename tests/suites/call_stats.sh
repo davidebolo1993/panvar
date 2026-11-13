@@ -1996,7 +1996,7 @@ write('onesided', [A[:100], C[:100]], {'h1#1#c': [A[:100], L2, C[:100]], 'h2#1#c
 D1, D2 = rnd(27700, 18), rnd(4500, 19)
 write('bigdel', [A, D1, D2, B], {'h1#1#c': [A, D2, B], 'h2#1#c': [A, B], 'h3#1#c': [A, B]}, 20)
 # --diploid: S1 has numbered haplotypes 1 and 2; S2 two unassigned contigs (#U#), one deleting B;
-# S3 has haplotype 1 in two contigs that both cross the site
+# S3 has haplotype 1 in two contigs that both cross the site, one of them deleting B
 write('dip', [A, B, C], {'S1#1#a': [A, B, C], 'S1#2#b': [A, B, C], 'S2#U#c': [A, C], 'S2#U#d': [A, B, C],
                         'S3#1#e': [A, C], 'S3#1#f': [A, B, C], 'S3#2#g': [A, C]}, 21)
 # the same 20 kb insertion in four haplotypes, each with 30 base changes of its own: two of them differ
@@ -2046,9 +2046,9 @@ check "deletions of 27.7 and 32.2 kb stay two records (SVLEN/AC)" \
 "$BIN" call -i "$OUT/dip.gfa" -c "$OUT/dip.bubbles.csv" -r ref -o "$OUT/dip" --diploid -q >/dev/null 2>&1
 VCF="$OUT/dip.region.vcf"
 dipgt() { awk -F'\t' -v s="$1" '/^#CHROM/{for(i=10;i<=NF;i++) if($i==s) c=i} !/^#/{split($c,g,":"); print g[1]; exit}' "$OUT/dip.region.vcf"; }
-check "--diploid: unassigned contigs are two unphased haplotypes; two contigs crossing make a slot unknown (S1:S2:S3)" \
-  "$(dipgt S1):$(dipgt S2):$(dipgt S3)" "0|0:1/0:.|1"
-check "--diploid: AN and AC count the alleles written" "$(info DEL AN):$(info DEL AC)" "5:2"
+check "--diploid: unassigned contigs are two unphased haplotypes; of two contigs crossing, the carrying one makes the slot a carrier (S1:S2:S3)" \
+  "$(dipgt S1):$(dipgt S2):$(dipgt S3)" "0|0:1/0:1|1"
+check "--diploid: AN and AC count the alleles written" "$(info DEL AN):$(info DEL AC)" "6:3"
 "$BIN" call -i "$OUT/hugedel.gfa" -c "$OUT/hugedel.bubbles.csv" -r ref -o "$OUT/hugedel" -q >/dev/null 2>&1
 check "a 250 kb deletion whose end moves by 10 bp is one record, with an identical one on other nodes (records:AC)" \
   "$(grep -vc '^#' "$OUT/hugedel.region.vcf"):$(grep -v '^#' "$OUT/hugedel.region.vcf" | grep -o ';AC=[0-9]*' | cut -c5-)" "1:3"
@@ -2212,8 +2212,8 @@ check "two tandem duplications are two INS records whatever the P-line order (ID
   "$(pk_lab "$OUT/pk_ab.region.vcf")|$(pk_lab "$OUT/pk_ba.region.vcf")" "bubble1_INS_X,bubble1_INS_Y|bubble1_INS_X,bubble1_INS_Y"
 
 # --diploid with a haplotype in two contigs that both cross the site. Agreeing (both delete d), they are the
-# haplotype there: S1 carries the DEL (AC 1); read as unknown, the record was written with AC=0. Disagreeing,
-# the slot is unknown, and a record no sample carries is not written.
+# haplotype there: S1 carries the DEL (AC 1); read as unknown, the record was written with AC=0. Disagreeing
+# (one deletes d), the contig carrying it makes S1 a carrier, as AC counts it per path.
 dip_gfa() {  # dip_gfa <out> <S1 contig 2's walk>
   { printf 'H\tVN:Z:1.0\nS\ta\t%s\nS\td\t%s\nS\tb\t%s\n' "$(blk 200 61)" "$(blk 120 62)" "$(blk 200 63)"
     printf 'L\ta\t+\td\t+\t0M\nL\td\t+\tb\t+\t0M\nL\ta\t+\tb\t+\t0M\n'
@@ -2223,15 +2223,15 @@ dip_gfa "$OUT/dip_agree.gfa" "a+,b+"; dip_gfa "$OUT/dip_differ.gfa" "a+,d+,b+"
 printf 'bubble_id,source,source_orient,sink,sink_orient,inside_node_count,total_node_count,path_support,distinct_alleles,ref_allele_support,alt_allele_support_max,alt_allele_support_min,min_inside_bp,max_inside_bp,inside_nodes\n1,a,+,b,+,1,3,5,2,3,2,2,0,120,"d"\n' > "$OUT/dip.csv"
 for o in agree differ; do "$BIN" call -i "$OUT/dip_$o.gfa" -c "$OUT/dip.csv" -r 'ref#0#chr1:1-520' -o "$OUT/dip_$o" --diploid \
   --no-per-bubble-vcf -q >/dev/null 2>&1; done
-check "--diploid: agreeing contigs carry the record, disagreeing ones leave no AC=0 record (AC agree | records differ)" \
-  "$(grep -v '^#' "$OUT/dip_agree.region.vcf" | grep -o ';AC=[0-9]*' | head -1)|$(grep -vc '^#' "$OUT/dip_differ.region.vcf")" ";AC=1|0"
-# Per path the same counting: AN and AC over haplotypes, the reference path left out. Agreeing, S1#1's two
-# contigs are one carrier (AN 3: S1#1, S2#1, S2#2); disagreeing, S1#1 is in neither, though both columns read.
+check "--diploid: agreeing contigs carry the record, and so does a carrying contig beside one that is not (AC agree | AC, S1 GT differ)" \
+  "$(grep -v '^#' "$OUT/dip_agree.region.vcf" | grep -o ';AC=[0-9]*' | head -1)|$(grep -v '^#' "$OUT/dip_differ.region.vcf" | grep -o ';AC=[0-9]*' | head -1) $(awk -F'\t' '/^#CHROM/{for(i=10;i<=NF;i++) if($i=="S1") c=i} !/^#/{split($c,g,":"); print g[1]; exit}' "$OUT/dip_differ.region.vcf")" ";AC=1|;AC=1 1"
+# Per path the same counting: AN and AC over haplotypes, the reference path left out. S1#1's two contigs are
+# one haplotype (AN 3: S1#1, S2#1, S2#2), a carrier whether both or one of them carry the record.
 for o in agree differ; do "$BIN" call -i "$OUT/dip_$o.gfa" -c "$OUT/dip.csv" -r 'ref#0#chr1:1-520' -o "$OUT/pp_$o" \
   --no-per-bubble-vcf -q >/dev/null 2>&1; done
 check "per path: a haplotype in two contigs counts once, the reference not at all (AN;AC agree | differ)" \
   "$(grep -v '^#' "$OUT/pp_agree.region.vcf" | grep -o 'AN=[0-9]*;AC=[0-9]*' | head -1)|$(grep -v '^#' "$OUT/pp_differ.region.vcf" | grep -o 'AN=[0-9]*;AC=[0-9]*' | head -1)" \
-  "AN=3;AC=1|AN=2;AC=0"
+  "AN=3;AC=1|AN=3;AC=1"
 
 # Events right after an N run in the reference: the source node ends in 200 N, A (120 bp) is deleted by h2/h3 and
 # I (80 bp) inserted before A by h4/h5. Each breakpoint is known only to within the run, and both records were
@@ -3807,6 +3807,25 @@ awk -F'\t' -v OFS='\t' -v d="$D10" '$1=="S" && $2=="D3"{$3=d} {print}' "$OUT/wre
 check "the representative is the event most carriers hold as written (SVLEN:SVLEN_RANGE:AC)" \
   "$(awk -F'\t' '!/^#/{n=split($8,f,";"); for(i=1;i<=n;i++){split(f[i],kv,"="); v[kv[1]]=kv[2]} print v["SVLEN"]":"v["SVLEN_RANGE"]":"v["AC"]}' "$OUT/wrep/v.region.vcf")" \
   "-130:-130,-120:7"
+# A haplotype in two contigs at a module site: s1#1#c1 deletes the second A2 and X, s1#1#c2 replaces that A2 by
+# Q, a 2-base variant. Only c1 carries the deletion; per path the haplotype counts as a carrier (no AC=0 record),
+# and with --diploid sample s1 carries it with c1's values.
+{ printf 'N L 2000 81\nN A3 20 82\nN A2 40 83\nN Q @A2:2:7\nN S 40 84\nN X 60 85\nN R 2000 86\n'
+  printf 'P ref#0#chr1:0-4220 L+,A3+,A2+,S+,A3+,A2+,X+,R+\nP hfull#1#chr1 L+,A3+,A2+,X+,R+\n'
+  printf 'P hgain#1#chr1 L+,A3+,A2+,S+,A3+,A2+,S+,A3+,A2+,X+,R+\nP s1#1#c1 L+,A3+,A2+,S+,A3+,R+\nP s1#1#c2 L+,A3+,A2+,S+,A3+,Q+,X+,R+\n'
+  for i in 1 2 3 4 5 6 7 8 9 10; do printf 'P hr%s#1#chr1 L+,A3+,A2+,S+,A3+,A2+,X+,R+\n' "$i"; done
+  printf 'B L R A3;A2;S;X;Q\n'; } > "$OUT/acsplit.spec"
+python3 -I "$TOOLS/spec_gfa.py" "$OUT/acsplit.spec" "$OUT/acsplit"
+for m in path diploid; do x=""; [ "$m" = diploid ] && x="--diploid"
+  # shellcheck disable=SC2086
+  "$BIN" call -i "$OUT/acsplit/g.gfa" -c "$OUT/acsplit/g.bubbles.csv" -r 'ref#0#chr1:0-4220' -o "$OUT/acsplit_$m" --cn $x \
+    --no-per-bubble-vcf -q >/dev/null 2>&1; done
+check "a haplotype one of whose contigs carries a record is its carrier (DEL_A2 AN;AC per path | per sample, s1 GT)" \
+  "$(grep -v '^#' "$OUT/acsplit_path.region.vcf" | awk -F'\t' '$3=="bubble1_DEL_A2"' | grep -o 'AN=[0-9]*;AC=[0-9]*')|$(awk -F'\t' '/^#CHROM/{for(i=10;i<=NF;i++) if($i=="s1") c=i} !/^#/ && $3=="bubble1_DEL_A2"{match($8,/AN=[0-9]*;AC=[0-9]*/); split($c,g,":"); print substr($8,RSTART,RLENGTH), g[1]}' "$OUT/acsplit_diploid.region.vcf")" \
+  "AN=13;AC=1|AN=13;AC=1 1"
+check "no record is written with AC=0 (per path, per sample)" \
+  "$(cat "$OUT/acsplit_path.region.vcf" "$OUT/acsplit_diploid.region.vcf" | grep -v '^#' | grep -c ';AC=0;')" "0"
+
 # --min-alt-af on a copy-number record, tested before the record is written, counts as the writer does: the
 # reference path is out of AN. hgain gains a copy and hr does not: AF 1/2, so 0.5 keeps the CNV.
 printf 'N L 2000 81\nN A3 20 82\nN A2 40 83\nN S 40 84\nN X 60 85\nN R 2000 86\nP ref#0#chr1:0-4220 L+,A3+,A2+,S+,A3+,A2+,X+,R+\nP hgain#1#chr1 L+,A3+,A2+,S+,A3+,A2+,S+,A3+,A2+,X+,R+\nP hr#1#chr1 L+,A3+,A2+,S+,A3+,A2+,X+,R+\n' > "$OUT/cnaf.spec"
