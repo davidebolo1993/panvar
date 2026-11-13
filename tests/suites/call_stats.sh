@@ -3791,6 +3791,22 @@ check "--classify-ins: an INS flagged SUBSTITUTION is classified from its insert
   "$(awk -F'\t' '!/^#/{n=split($8,f,";"); t="-"; for(i=1;i<=n;i++){split(f[i],kv,"="); if(kv[1]=="INS_SUBTYPE") t=kv[2]}
        printf "%s:%s:%s ", ($8 ~ /SVTYPE=INS;/ ? "INS" : "other"), ($8 ~ /SUBSTITUTION/ ? "SUBSTITUTION" : "plain"), t}' "$OUT/nsub/v.region.vcf")" \
   "INS:SUBSTITUTION:DUP "
+# The reference runs X1 D X2 with X1 and X2 the same 30 bases. Node by node, h1a/h1b delete D X2 and h2a/h2b
+# delete X1 D: two placements of one deletion, written the same once left-aligned (130 bp after F). h3a..h3c
+# delete D less its first 10 bases and X2 (120 bp). The representative is the event most carriers hold as
+# written, four, not the three that are one placement alone.
+{ printf 'N F 300 111\nN X1 =%s\nN D 100 113\nN X2 =%s\nN D3 @D:0:1\nN R 300 115\n' "$(blk 30 112)" "$(blk 30 112)"
+  printf 'P ref#0#chr1:0-760 F+,X1+,D+,X2+,R+\nP hr#1#c F+,X1+,D+,X2+,R+\n'
+  printf 'P h1a#1#c F+,X1+,R+\nP h1b#1#c F+,X1+,R+\nP h2a#1#c F+,X2+,R+\nP h2b#1#c F+,X2+,R+\n'
+  printf 'P h3a#1#c F+,X1+,D3+,R+\nP h3b#1#c F+,X1+,D3+,R+\nP h3c#1#c F+,X1+,D3+,R+\nB F R X1;D;X2;D3\n'; } > "$OUT/wrep.spec"
+python3 -I "$TOOLS/spec_gfa.py" "$OUT/wrep.spec" "$OUT/wrep"
+D10=$(awk -F'\t' '$1=="S" && $2=="D"{print substr($3, 1, 10)}' "$OUT/wrep/g.gfa")
+awk -F'\t' -v OFS='\t' -v d="$D10" '$1=="S" && $2=="D3"{$3=d} {print}' "$OUT/wrep/g.gfa" > "$OUT/wrep/g10.gfa"
+"$BIN" call -i "$OUT/wrep/g10.gfa" -c "$OUT/wrep/g.bubbles.csv" -r 'ref#0#chr1:0-760' -o "$OUT/wrep/v" \
+  --no-align-alleles --no-per-bubble-vcf -q >/dev/null 2>&1
+check "the representative is the event most carriers hold as written (SVLEN:SVLEN_RANGE:AC)" \
+  "$(awk -F'\t' '!/^#/{n=split($8,f,";"); for(i=1;i<=n;i++){split(f[i],kv,"="); v[kv[1]]=kv[2]} print v["SVLEN"]":"v["SVLEN_RANGE"]":"v["AC"]}' "$OUT/wrep/v.region.vcf")" \
+  "-130:-130,-120:7"
 
 # A 52 bp unit U, six copies on the reference, then D, a node spelling U, and E. h2 skips D; h1 skips it too but
 # walks F, a node spelling E, in place of E. h1's replacement is the deletion of D, which slides along the copies,

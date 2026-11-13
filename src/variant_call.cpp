@@ -3678,28 +3678,28 @@ void call_variants(
             // then by content: a record then reports what most of its carriers carry rather than one
             // outlier's size or sequence, and does not move when the GFA's paths are reordered.
             const std::size_t first_new_record = merged.size();
-            // An event as the record would write it. One found by aligning the alleles, or a node replacement
-            // that is one exact change sharing a base with the reference's side, is written as its minimal change:
-            // the bases its two sides share at either end trimmed, and an insertion or deletion left-aligned. Two
-            // members that differ only in how the walks placed them then write the same, and count as one.
-            // Any other event by its type, anchor and sequences.
+            // An event as the record would write it: its minimal change, the bases its two sides share at either
+            // end trimmed and an insertion or deletion left-aligned. Two members that differ only in how the walks
+            // placed them then write the same, and count as one. An event not placed on the reference by its bases
+            // goes by its type, anchor and sequences.
             using WrittenKey = std::tuple<int, std::size_t, std::string, std::string>;
             const auto written_key = [&](const Event& e) -> WrittenKey {
-                const bool node_min = !e.seq_event && e.type == EvType::Sub && e.splice_ok && !e.seq.empty() &&
-                    !e.alt_seq.empty() && [&] {
-                        std::string d = ref_rev ? reverse_complement(e.seq) : e.seq;
-                        for (char& c : d) c = upper_base(c)[0];
-                        const std::string& a = e.splice_ins;
-                        return d != a && !a.empty() && (upper_base(d.front()) == upper_base(a.front()) ||
-                                                        upper_base(d.back()) == upper_base(a.back()));
-                    }();
-                const std::size_t before = e.seq_event ? e.seq_before : e.splice_before;
-                if (!(e.seq_event || node_min) || ref_base_at(before).empty())
+                const std::size_t base = ref_meta.region_start_1based;
+                std::size_t pos = 0;
+                std::string d, a;
+                if (e.seq_event && !ref_base_at(e.seq_before).empty()) {
+                    pos = e.seq_before;
+                    d = e.type == EvType::Ins ? std::string() : e.seq;
+                    a = e.type == EvType::Ins ? e.seq : e.type == EvType::Sub ? e.alt_seq : std::string();
+                    if (ref_rev) { d = reverse_complement(d); a = reverse_complement(a); }
+                } else if (!e.seq_event && e.splice_ok && (e.type == EvType::Del || e.type == EvType::Ins || e.type == EvType::Sub) &&
+                           e.splice_before >= base && e.splice_before + 1 - base + e.splice_del <= ref_genome.size()) {
+                    pos = e.splice_before;
+                    d = ref_genome.substr(e.splice_before + 1 - base, e.splice_del);
+                    a = e.splice_ins;
+                } else {
                     return {static_cast<int>(e.type), e.ref_pos, e.seq, e.alt_seq};
-                std::size_t pos = before;
-                std::string d = e.type == EvType::Ins ? std::string() : e.seq;
-                std::string a = e.type == EvType::Ins ? e.seq : e.type == EvType::Sub ? e.alt_seq : std::string();
-                if (ref_rev) { d = reverse_complement(d); a = reverse_complement(a); }
+                }
                 for (char& c : d) c = upper_base(c)[0];
                 for (char& c : a) c = upper_base(c)[0];
                 std::size_t pre = 0;
