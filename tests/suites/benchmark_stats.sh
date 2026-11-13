@@ -525,6 +525,15 @@ awk '$1=="P"{n=split($3,s,","); o=""; for(i=n;i>=1;i--){x=s[i]; c=substr(x,lengt
 BUBBLE=1 spec sepbr --cn
 check "copies, the reference walked backwards: the VCF rebuilds every haplotype (large_left_vcf_bp; cn_exact)" \
   "$(sv sepbr_B large_left_vcf_bp) $(cn_exact sepbr)" "0 6:0"
+# A copy lost between two deletions of the same haplotype: the deletions stay apart, so the copy's own form
+# is not deleted twice.
+{ printf 'N L 2000 81\nN A 50 82\nN K1 25 83\nN X 25 84\nN K2 25 85\nN K3 25 86\nN Y 25 87\nN K4 25 88\nN R 2000 89\n'
+  printf 'P ref#0#chr1:0-4250 L+,A+,K1+,X+,K2+,A+,K3+,Y+,K4+,A+,R+\nP hc#1#chr1 L+,A+,K1+,K2+,K3+,K4+,A+,R+\n'
+  printf 'P hg#1#chr1 L+,A+,K1+,X+,K2+,A+,K3+,Y+,K4+,A+,K1+,X+,K2+,A+,R+\n'
+  for i in 1 2 3 4 5 6; do printf 'P hr%s#1#chr1 L+,A+,K1+,X+,K2+,A+,K3+,Y+,K4+,A+,R+\n' "$i"; done; } > "$OUT/sepbbar.spec"
+BUBBLE=1 spec sepbbar --cn
+check "copies: deletions either side of a lost copy rebuild apart from it (large_left_vcf_bp; cn_exact)" \
+  "$(sv sepbbar_B large_left_vcf_bp) $(cn_exact sepbbar)" "0 2:0"
 # No reference copy: the gained copies are the record's own sequence.
 { printf 'N L 2000 91\nN A 150 92\nN B 150 93\nN C 30 94\nN R 2000 95\nP ref#0#chr1:0-4030 L+,C+,R+\n'
   for i in 1 2 3 4; do printf 'P hone%s#1#chr1 L+,A+,B+,C+,R+\n' "$i"; done

@@ -1080,6 +1080,15 @@ sed 's/^P hyy#1#chr1 .*/P hzg#1#chr1 L+,Z+,A2+,S+,A3+,A2+,S+,A3+,A2+,X1+,X2+,X3+
 python3 -I "$(cd "$(dirname "$0")/.." && pwd)/tools/spec_gfa.py" "$OUT/sepzg.spec" "$OUT/sepzg"
 cn_call "$OUT/sepzg/g.gfa" "$OUT/sepzg"
 check "copies: sequence in place of the first copy's module nodes is in the copies (hzg records)" "$(hrec "$OUT/sepzg.region.vcf" 'hzg#1#chr1')" "1:3"
+# hc loses the middle of three copies of A (50 bp) and, either side of it, X and Y (25 bp each): its copy goes to
+# the module record, and X and Y, the copy between them, are not one 50 bp deletion across it.
+{ printf 'N L 2000 81\nN A 50 82\nN K1 25 83\nN X 25 84\nN K2 25 85\nN K3 25 86\nN Y 25 87\nN K4 25 88\nN R 2000 89\n'
+  printf 'P ref#0#chr1:0-4250 L+,A+,K1+,X+,K2+,A+,K3+,Y+,K4+,A+,R+\nP hc#1#chr1 L+,A+,K1+,K2+,K3+,K4+,A+,R+\n'
+  printf 'P hg#1#chr1 L+,A+,K1+,X+,K2+,A+,K3+,Y+,K4+,A+,K1+,X+,K2+,A+,R+\n'
+  for i in 1 2 3 4 5 6; do printf 'P hr%s#1#chr1 L+,A+,K1+,X+,K2+,A+,K3+,Y+,K4+,A+,R+\n' "$i"; done; } > "$OUT/sepbar.spec"
+python3 -I "$(cd "$(dirname "$0")/.." && pwd)/tools/spec_gfa.py" "$OUT/sepbar.spec" "$OUT/sepbar"
+cn_call "$OUT/sepbar/g.gfa" "$OUT/sepbar"
+check "copies: deletions either side of a lost copy are not joined across it (hc records)" "$(hrec "$OUT/sepbar.region.vcf" 'hc#1#chr1')" "1:2"
 # --diploid: hhalf and heq as one sample; each haplotype's copies are listed, joined as GT is.
 sed -e 's/^P hhalf#1#chr1 /P s9#1#chr1 /' -e 's/^P heq#1#chr1 /P s9#2#chr1 /' "$OUT/sep.spec" > "$OUT/sepdip.spec"
 python3 -I "$(cd "$(dirname "$0")/.." && pwd)/tools/spec_gfa.py" "$OUT/sepdip.spec" "$OUT/sepdip"

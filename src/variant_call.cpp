@@ -305,6 +305,9 @@ struct Event {
     // A deletion or insertion split out of a replacement at a collapsed module (split_copy_replacements): its
     // place on the reference is its own tokens, not the stretch between the matches around the replacement.
     bool split_piece = false;
+    // At a collapsed module: how many of the haplotype's copies (split_copies) lie before this event on its walks.
+    // Events with copies between them are not coalesced: the copies are reported apart, by the module record.
+    std::size_t copies_before = 0;
     // A node event's place in the two compared walks, half-open token ranges (SIZE_MAX = unknown). An empty
     // side sits at the token after the last match before the event.
     std::size_t r_lo = SIZE_MAX, r_hi = SIZE_MAX, h_lo = SIZE_MAX, h_hi = SIZE_MAX;
@@ -1229,10 +1232,11 @@ CopySplit split_copies(const Graph& graph, const std::vector<Tok>& R, const std:
         if (big == nullptr) break;
         big->role = 0; copy_net -= net_of(big->e);
     }
+    std::size_t copies = 0;
     for (Part& pt : parts) {
         CopyForm f;
-        if (pt.role != 0 && place(pt.e, f)) { out.forms.push_back(std::move(f)); out.passes += pt.passes; }
-        else out.rest.push_back(std::move(pt.e));
+        if (pt.role != 0 && place(pt.e, f)) { out.forms.push_back(std::move(f)); out.passes += pt.passes; ++copies; }
+        else { pt.e.copies_before = copies; out.rest.push_back(std::move(pt.e)); }
     }
     return out;
 }
@@ -1411,7 +1415,7 @@ void coalesce_events(
             out.back().ref_tok_anchor == SIZE_MAX || e.ref_tok_anchor == SIZE_MAX ||
             out.back().ref_tok_anchor == e.ref_tok_anchor;
         if (e.type != EvType::Dup && e.type != EvType::Sub && !out.empty() && out.back().type == e.type && ins_anchor_ok &&
-            !e.across_copies && !out.back().across_copies &&
+            !e.across_copies && !out.back().across_copies && e.copies_before == out.back().copies_before &&
             (ref_gap_ok(prev_lo, prev_hi, lo, hi) || (e.type == EvType::Ins && gap_ok(prev_hhi, hlo)))) {
             Event& prev = out.back();
             for (const std::string& nd : e.nodes) prev.nodes.push_back(nd);
