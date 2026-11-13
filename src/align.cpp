@@ -177,6 +177,22 @@ std::size_t nw_distance(const std::string& a, const std::string& b, std::size_t 
     }
     const std::size_t len_gap = a.size() > b.size() ? a.size() - b.size() : b.size() - a.size();
     if (bounded && len_gap > max_k) return max_k + 1;
+    // The work grows with the band, and a distance found within a band is exact, so a bounded distance is
+    // sought in bands doubling from the least it can be up to the bound: two close sequences then cost a
+    // band near their distance rather than the bound.
+    if (bounded) {
+        for (std::size_t k = std::max<std::size_t>(64, 2 * len_gap);; k *= 2) {
+            const std::size_t kk = std::min(k, max_k);
+            const EdlibAlignConfig cfg = edlibNewAlignConfig(static_cast<int>(kk), EDLIB_MODE_NW, EDLIB_TASK_DISTANCE,
+                                                             kCaseless, kCaselessN);
+            EdlibAlignResult res = edlibAlign(a.data(), static_cast<int>(a.size()), b.data(), static_cast<int>(b.size()), cfg);
+            const bool found = res.status == EDLIB_STATUS_OK && res.editDistance >= 0;
+            const std::size_t d = found ? static_cast<std::size_t>(res.editDistance) : max_k + 1;
+            edlibFreeAlignResult(res);
+            if (found || kk >= max_k) return d;
+            k = kk;
+        }
+    }
     const EdlibAlignConfig cfg = edlibNewAlignConfig(bounded ? static_cast<int>(max_k) : -1, EDLIB_MODE_NW,
                                                      EDLIB_TASK_DISTANCE, kCaseless, kCaselessN);
     EdlibAlignResult res = edlibAlign(a.data(), static_cast<int>(a.size()),
