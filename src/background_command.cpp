@@ -35,14 +35,11 @@ namespace fs = std::filesystem;
 void print_background_help() {
     std::cout
         << "Usage:\n"
-        << "  panvar background -o <store.bgk> --genome NAME=PATH [...] --coordinate-reference NAME\n"
-        << "  panvar background -o <store.bgk> --add --genome NAME=PATH [...]\n"
+        << "  panvar background -o <store.bgk> [--add] --genome NAME=PATH [...] [--coordinate-reference NAME]\n"
         << "  panvar background -o <store.bgk> --segment-only <dir> --genome NAME=PATH [...]   (then --attach <dir>)\n"
         << "  panvar background -o <store.bgk> --merge [--range I/N] | --compact | --clean\n\n"
-        << "Count every 31-mer of a set of genomes once, for recruiting reads to loci: the store holds each k-mer's\n"
-        << "count, and anchors that find any locus of the coordinate reference in every genome. Genomes can be\n"
-        << "added later as segments, each counted in its own job; queries sum the segments. Merge them when there\n"
-        << "are many, and compact the store into an SSHash dictionary once it is final.\n\n"
+        << "Count every 31-mer of a set of genomes once, with anchors that find any interval of the coordinate\n"
+        << "reference in every genome, for recruit.\n\n"
         << "Building:\n"
         << "  -o, --out <dir>                 The store (a folder; manifest.json lists its segments)\n"
         << "      --genome NAME=PATH          A genome: FASTA (plain, gzip or bgzip) or a GFA of haplotypes; repeatable\n"
