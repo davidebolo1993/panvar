@@ -116,7 +116,8 @@ struct LocusWork {
     LocusIndex idx;
     std::vector<std::uint64_t> counts;                 // background counts per k-mer
     std::vector<std::uint64_t> sub, sub_trim;          // own occurrences in the extended / trimmed spans
-    std::map<std::string, std::vector<anchors::Span>> spans;   // per genome
+    std::map<std::string, std::vector<anchors::Span>> spans;   // per genome: the located copies, then the pieces
+                                                               // found off them (the locus, both, from there on)
 };
 
 // Every k-mer of every path: nodes it starts on, largest copy number within a path, paths holding it.
@@ -733,6 +734,14 @@ std::vector<LocusIndex> build(const BuildOptions& o) {
             for (const auto& [li, i] : found[gi].ends) ++work[li].sub_trim[i];
             for (auto& [li, sp] : found[gi].pieces) {
                 piece_genomes[li].insert(sp.genome);
+                // a piece is the locus wherever a copy is: no decoy window or off-target read is taken from it
+                anchors::Span as;
+                as.genome = sp.genome;
+                as.contig = sp.contig;
+                as.start = as.inner_start = sp.start;
+                as.end = as.inner_end = sp.end;
+                as.forward = sp.forward;
+                work[li].spans[sp.genome].push_back(std::move(as));
                 work[li].idx.spans.push_back(std::move(sp));
             }
         }

@@ -72,6 +72,11 @@ check "the array's k-mers stay private, none demoted at the copies' ends" '[[ $(
 "$BIN" recruit -t 2 -q --background s_split_p -r ref --index-only --save-index idx_split_p --locus data/split/locus.gfa; rc=$?
 "$BIN" recruit --dump-index idx_split_p/locus.plx=dump_split_p.tsv
 check "a paralogous array is not a piece; its k-mers count outside" '[[ $rc -eq 0 && "$(pieces idx_split_p/locus.index.tsv)" == "gs:x:0-17700 " ]] && python3 "$TOOLS/locus_outside.py" idx_split_p/locus.index.tsv dump_split_p.tsv 8 data/split/ref.fa data/split/gs.fa data/split/gp.fa > brute_split_p.txt && awk -F"\t" '"'"'NR>1 && $2=="S" && $4>=3 {n++} END {exit !(n>5000)}'"'"' dump_split_p.tsv'
+# a genome holding a piece named as a decoy genome: the piece is the locus there, as its copies are, so it
+# gives no decoy window and calibration reads none of it as off-target
+"$BIN" recruit -t 2 -q --background s_split_p -r ref --index-only --save-index idx_split_d --locus data/split/locus.gfa --decoy-genomes ref,gs,gp; rc=$?
+offcut2() { awk -F'\t' '$1=="calibration" && $2=="short" && $6==2 {print $13 " of " $12}' "$1"; }
+check "a piece is no decoy window, nor off-target in calibration (short off-target certain at 2 sites: $(offcut2 idx_split_d/locus.index.tsv))" '[[ $rc -eq 0 && "$(pieces idx_split_d/locus.index.tsv)" == "gs:x:0-17700 " ]] && ! awk -F"\t" '"'"'$1=="decoy_window" && $2=="gs" && $3=="x"'"'"' idx_split_d/locus.index.tsv | grep -q . && [[ "$(offcut2 idx_split_d/locus.index.tsv)" == 0\ of* ]]'
 # a much longer array on one contig: the copy's end is estimated and stops inside it; the contig is scanned
 "$BIN" background -t 2 --partitions 64 --memory 64M -q --tmp-dir "$OUT/tmp" -o s_tail --genome ref=data/split_t/ref.fa --genome gl=data/split_t/gl.fa --coordinate-reference ref
 "$BIN" recruit -t 2 -q --background s_tail -r ref --index-only --save-index idx_tail --locus data/split_t/locus.gfa; rc=$?
