@@ -1893,7 +1893,7 @@ void call_variants(
         out << "##INFO=<ID=CN_SCOPE,Number=1,Type=String,Description=\"What one copy is a copy of: REPEAT_UNIT (one traversal of a represented repeat unit; full per-haplotype module size is FORMAT/CNBP) or COLLAPSED_MODULE (a module that may hold several distinct paralogs; RU_LEN is not emitted, shared per-copy content is CN_UNIT_BP, and per-haplotype size is FORMAT/CNBP)\">\n";
         out << "##INFO=<ID=CN_SHARED_BP,Number=1,Type=Integer,Description=\"CN_METHOD=MODULE: the reference's bp over the module's nodes, each visit counted\">\n";
         out << "##INFO=<ID=CN_REF_FOLD,Number=1,Type=Integer,Description=\"CN_METHOD=MODULE: the reference's copies of the module (REF_CN); CN_UNIT_BP is CN_SHARED_BP/CN_REF_FOLD\">\n";
-        out << "##INFO=<ID=CN_MODULE_REF_BP,Number=1,Type=Integer,Description=\"Reference bp across the whole bubble interior, the record's span. CN_SHARED_BP is the part on the module's nodes, the copies the record counts\">\n";
+        out << "##INFO=<ID=CN_MODULE_REF_BP,Number=1,Type=Integer,Description=\"Reference bp across the bubble interior, each visit counted, over which CN_METHOD=UNIT measures CNBP. On a MODULE record END-POS equals it, unless CN_SPAN_AMBIGUOUS (the span then also encloses the boundary visits between the outermost ones); on a UNIT record END covers the reference's copies, which can lie inside the interior\">\n";
         out << "##INFO=<ID=REF_CN_SOURCE,Number=1,Type=String,Description=\"How REF_CN was counted: UNIT_ANCHOR (the unit graph's copies at its anchor) or ANCHOR_PASSES (MODULE: the reference's passes through the module's anchor, counted as every haplotype's are)\">\n";
         out << "##INFO=<ID=CN_ANCHOR_BP,Number=1,Type=Integer,Description=\"CN_METHOD=MODULE: bp of the module's anchor, the nodes CN counts passes through\">\n";
         out << "##INFO=<ID=CN_MODULE_NODES_BP,Number=1,Type=Integer,Description=\"CN_METHOD=MODULE: bp of the module's nodes, those some path visits more than once, one visit each\">\n";
@@ -4388,6 +4388,7 @@ void call_variants(
             long long del_inv_end = -1;
             long long ins_pos = -1;
             long long rep_pos = -1;          // UNIT DUP: the base before the array, when resolved
+            long long rep_last = -1;         // UNIT DUP: the array's last base on the reference
             std::size_t anchor_start = 0;    // genomic start of `anchor`'s occurrence, when known
             bool rep_no_ref_copy = false;    // UNIT DUP whose reference holds no copy: spans no reference
             if (e.type == EvType::Del || e.type == EvType::Inv || e.type == EvType::Sub) {
@@ -4450,6 +4451,7 @@ void call_variants(
                         const auto sp = tok_span(j, j);
                         if (sp.first > 0 && (up < 0 || static_cast<long long>(sp.first) < up))
                             up = static_cast<long long>(sp.first);
+                        if (sp.first > 0) rep_last = std::max(rep_last, static_cast<long long>(sp.second));
                     }
                     if (up < 0 && ref_count.count(e.nodes.front())) up = rpos(e.nodes.front());
                     if (up >= 0) {
@@ -4546,9 +4548,10 @@ void call_variants(
                     e.ru_len > 0 ? e.ru_len : node_len(graph, e.nodes.empty() ? std::string() : e.nodes.front());
                 svlen = (static_cast<long long>(e.alt_cn) - static_cast<long long>(e.ref_cn)) *
                         static_cast<long long>(unit);
-                // END is the last base of the first reference copy, taken as one unit long. With no reference
-                // copy the record spans no reference sequence, so END = POS, as for an INS.
-                end = rep_no_ref_copy ? pos : pos + unit;
+                // END is the last base of the reference's last copy, so the record covers the whole array (one
+                // unit long where the copies were not found on the walk). With no reference copy the record spans
+                // no reference sequence, so END = POS, as for an INS.
+                end = rep_no_ref_copy ? pos : rep_last > static_cast<long long>(pos) ? static_cast<std::size_t>(rep_last) : pos + unit;
             }
             // A coalesced record can describe a deletion in several pieces with reference retained
             // between them. That is not one exact deletion: the affected interval is wider than the

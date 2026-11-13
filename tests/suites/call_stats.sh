@@ -1075,9 +1075,9 @@ rep_place_gfa() {   # rep_place_gfa <out.gfa> <ref copies> <hap>:<copies> ...
 rep_pos_end() { grep -v '^#' "$1" | awk -F'\t' '/CN_METHOD=UNIT/{match($8,/END=[0-9]+/); print $2":"substr($8,RSTART+4,RLENGTH-4); exit}'; }
 rep_place_gfa "$OUT/rpl.gfa" 4 h2:2 h7:7
 rep_call "$OUT/rpl.gfa" "$OUT/rpl"
-[ "$(rep_pos_end "$OUT/rpl.region.vcf")" = "1200:1260" ] \
-  && ok "a UNIT DUP is placed on its array (POS 1200, END 1260), not on the bubble's source" \
-  || bad "UNIT DUP placed at POS:END $(rep_pos_end "$OUT/rpl.region.vcf"), expected 1200:1260"
+[ "$(rep_pos_end "$OUT/rpl.region.vcf")" = "1200:1440" ] \
+  && ok "a UNIT DUP covers its array (POS 1200, END 1440: four 60 bp copies), not the bubble's source" \
+  || bad "UNIT DUP placed at POS:END $(rep_pos_end "$OUT/rpl.region.vcf"), expected 1200:1440"
 rep_place_gfa "$OUT/rpl0.gfa" 0 h3:3 h5:5
 rep_call "$OUT/rpl0.gfa" "$OUT/rpl0"
 [ "$(rep_pos_end "$OUT/rpl0.region.vcf")" = "1200:1200" ] \
@@ -1337,7 +1337,7 @@ rep_gfa rep0_skip 'F+,S+,A+,D+,A+,K+,G+' 'F+,S+,D+,A+,R+,R+,K+,G+' 'F+,S+,D+,A+,
 rep_gfa rep0_rskip 'G-,K-,A-,D-,A-,S-,F-' 'G-,K-,R-,R-,A-,D-,S-,F-' 'G-,K-,R-,R-,R-,A-,D-,S-,F-' \
   'G-,K-,A-,D-,A-,S-,F-'
 rep_gfa rep0_loop 'F+,S+,A+,K+,G+' 'F+,S+,A+,A+,R+,R+,K+,G+' 'F+,S+,A+,A+,R+,R+,R+,K+,G+' 'F+,S+,A+,K+,G+'
-for c in "rep_up 780:840:2" "rep0_src 660:660:0" "rep0_rev 770:770:0" "rep0_skip 830:830:0" \
+for c in "rep_up 780:900:2" "rep0_src 660:660:0" "rep0_rev 770:770:0" "rep0_skip 830:830:0" \
          "rep0_rskip 540:540:0" "rep0_loop 640:640:0"; do
   set -- $c; V="$OUT/$1.region.vcf"
   check "UNIT DUP from the reference walk ($1): POS:END:REF_CN" \
@@ -1526,8 +1526,8 @@ twin_gfa tw_loops 30 '' 'F+,S+,T+,A+,T+,K+,G+' 'F+,S+,L+,A+,L+,L+,L+,K+,G+' 'F+,
 V="$OUT/tw30.region.vcf"
 check "twin UNIT: L and T counted as one unit (REF_CN:AC:UNIT_TWIN_NODES)" \
       "$(rk_get "$V" bubble1_CNV_L 8 REF_CN):$(rk_get "$V" bubble1_CNV_L 8 AC):$(rk_get "$V" bubble1_CNV_L 8 UNIT_TWIN_NODES)" "2:1:T"
-check "twin UNIT: placed on the reference's first copy, via the twin (POS:END)" \
-      "$(rk_get "$V" bubble1_CNV_L 2):$(rk_get "$V" bubble1_CNV_L 8 END)" "540:570"
+check "twin UNIT: covers the reference's copies, the first via the twin, and A between them (POS:END)" \
+      "$(rk_get "$V" bubble1_CNV_L 2):$(rk_get "$V" bubble1_CNV_L 8 END)" "540:700"
 check "twin UNIT: a moved element is not a twin (REF_CN, twin field, DEL_T kept)" \
       "$(rk_get "$OUT/tw_move.region.vcf" bubble1_CNV_L 8 REF_CN):$(grep -c UNIT_TWIN_NODES= "$OUT/tw_move.region.vcf" | tr -d ' '):$(grep -c 'bubble1_DEL_T' "$OUT/tw_move.region.vcf" | tr -d ' ')" "0:0:1"
 check "twin UNIT: under --cn, the module counts the twin too and writes no record" \
@@ -2124,10 +2124,10 @@ ug_cn() { awk -F'\t' '/^#CHROM/{for(i=10;i<=NF;i++) s[i]=$i; next} !/^#/ && $8 ~
             for(i=10;i<=NF;i++){ split($i,v,":"); printf "%s %s ", s[i], v[c] } }' "$1"; }
 check "unit graph: copies counted at the anchor as one UNIT unit (ref 2, h1 2, h2 3, h0 0), no copy INS/DEL" \
   "$(ug_cn "$OUT/ug_c.region.vcf")|$(grep -v '^#' "$OUT/ug_c.region.vcf" | grep -cE 'SVTYPE=(INS|DEL)')" "ref 2 h1 2 h2 3 h0 0 |0"
-# The record spans the reference's first copy, one unit long from its first unit graph node; it was cut to the
-# segment the unit is keyed by (on LPA, 29 bp of a 5547 bp copy).
-check "unit graph: the record spans one copy (END-POS = RU_LEN = 64)" \
-  "$(grep -v '^#' "$OUT/ug_c.region.vcf" | awk -F'\t' '/CN_METHOD=UNIT/{match($8,/(^|;)END=[0-9]+/); e=$8; e=substr(e,RSTART,RLENGTH); sub(/.*END=/,"",e); match($8,/RU_LEN=[0-9]+/); print e-$2":"substr($8,RSTART+7,RLENGTH-7)}')" "64:64"
+# The record spans the reference's two copies from the first unit graph node, not the segment the unit is keyed
+# by (on LPA, 29 bp of a 5547 bp copy).
+check "unit graph: the record spans the reference's copies (END-POS = REF_CN x RU_LEN = 128)" \
+  "$(grep -v '^#' "$OUT/ug_c.region.vcf" | awk -F'\t' '/CN_METHOD=UNIT/{match($8,/(^|;)END=[0-9]+/); e=$8; e=substr(e,RSTART,RLENGTH); sub(/.*END=/,"",e); match($8,/RU_LEN=[0-9]+/); print e-$2":"substr($8,RSTART+7,RLENGTH-7)}')" "128:64"
 
 # Counted copies leave the walks before they are compared, so what lay on either side of them comes together.
 # Reference F S U J U J U T K G: three copies of the 300 bp unit U with a 1 bp junction J between them, then

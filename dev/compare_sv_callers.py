@@ -186,7 +186,7 @@ def call_merged(prefix, min_sv):
             bi = fmt.index("CNBP") if "CNBP" in fmt else -1
             ref_cn = int(inf["REF_CN"]) if inf.get("REF_CN", "").lstrip("-").isdigit() else None
             unit = next((int(inf[k]) for k in ("CN_UNIT_BP", "RU_LEN") if inf.get(k, "").isdigit()), 0)
-            span = int(inf["CN_MODULE_REF_BP"]) if inf.get("CN_MODULE_REF_BP", "").isdigit() else end - pos
+            span = end - pos   # a CNV covers the reference's copies, POS+1..END
             for hap, cell in zip(samples, f[9:]):
                 v = cell.split(":")
                 if t == "CNV":   # the copies changed, anywhere over the reference's copies

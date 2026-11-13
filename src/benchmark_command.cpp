@@ -143,7 +143,7 @@ struct VcfRecordInfo {
     long long svlen = 0;
     long long ref_cn = -1;
     long long unit_bp = 0;                                // RU_LEN or CN_UNIT_BP: one copy
-    long long cn_ref_bp = 0;                              // CN_MODULE_REF_BP: the reference's copies, from POS+1
+    long long cn_ref_bp = 0;                              // a CNV's span, POS+1..END: the reference's copies
     std::string ref, info;
     std::vector<std::string> alts;
     std::unordered_set<std::string> carriers;             // GT names an ALT
@@ -215,8 +215,7 @@ std::vector<VcfRecordInfo> load_region_vcf(const std::string& path, std::vector<
         std::string unit = info_field(f[7], "RU_LEN");
         if (unit.empty()) unit = info_field(f[7], "CN_UNIT_BP");
         if (!unit.empty()) r.unit_bp = std::stoll(unit);
-        const std::string crb = info_field(f[7], "CN_MODULE_REF_BP");
-        if (!crb.empty()) r.cn_ref_bp = std::stoll(crb);
+        if (r.svtype == "CNV" && r.end > r.pos) r.cn_ref_bp = static_cast<long long>(r.end - r.pos);
         const std::vector<std::string> fmt = split_on(f[8], ':');
         const auto gt_i = std::find(fmt.begin(), fmt.end(), "GT") - fmt.begin();
         const auto cn_i = std::find(fmt.begin(), fmt.end(), "CN") - fmt.begin();
@@ -893,8 +892,8 @@ int run_benchmark_command(const std::vector<std::string>& args) {
     // --vcf: each record's written allele, for every haplotype whose GT names it. A copy-number record has
     // no sequence: a gain is (CN - REF_CN) tandem copies of one reference copy, a loss deletes that many.
     // One reference copy, genomic (start, length): one period where the reference's copies repeat, else
-    // the copies' last RU_LEN / CN_UNIT_BP bases; with one reference copy, its span or those bases. The copies run for CN_MODULE_REF_BP from POS+1 (a UNIT
-    // record's END is its first copy's). Real copies differ in length and content, so this approximates.
+    // the copies' last RU_LEN / CN_UNIT_BP bases; with one reference copy, its span or those bases. The
+    // copies run from POS+1 to END. Real copies differ in length and content, so this approximates.
     // A carrier of a MODULE record with FORMAT:CNBP gets the form of the reference's copies that fits its own
     // change per copy: paralogous copies come in several lengths, and one length cannot stand for all its
     // carriers. CNBP is the net change over the copies, so the carrier's other records there come off it
