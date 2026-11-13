@@ -39,7 +39,7 @@ struct VariantCallOptions {
     // panphorte's <prefix>.panphorte.unit_graph.tsv, when present: each folded repeat's unit graph is one
     // copy-number unit, counted at its anchor nodes (one pass per copy), as a unit node is counted.
     std::string unit_graph_tsv;
-    std::size_t max_seq_bp = 20000;      // INSSEQ, DELSEQ and INVSEQ left out above this many bases (0: none)
+    std::size_t max_seq_bp = 20000;      // INSSEQ, DELSEQ, INVSEQ and CN_FORMS sequences left out above this many bases (0: none)
     std::vector<std::size_t> bubble_ids; // if non-empty, restrict to these bubbles
     bool write_per_bubble_vcf = true;    // also keep each <prefix>.bubble_<id>.vcf
     bool write_variant_nodes = true;     // write <prefix>.variant_nodes.tsv (per-variant node set)
