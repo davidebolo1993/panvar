@@ -3650,13 +3650,16 @@ void call_variants(
             // collapse does: contents in order of how many haplotypes carry them, each joining the first
             // representative it matches, or becoming one. Single linkage would chain the length alleles of
             // a repeat, each close to the next, into one record whose members share nothing with its
-            // representative. Node events keep single linkage.
+            // representative. Node events keep single linkage, except at a collapsed module: there every
+            // copy shares the same nodes, so single linkage chains different copies' events, a haplotype's
+            // own among them, into one record. There a record also holds one event per haplotype, as the
+            // VCF holds one allele per haplotype per record.
             {
                 std::vector<std::vector<std::size_t>> split;
                 for (std::vector<std::size_t>& comp : comps) {
                     bool aligned = false;
                     for (const std::size_t k : comp) aligned = aligned || cands[k].e->seq_event;
-                    if (!aligned || comp.size() < 2) { split.push_back(std::move(comp)); continue; }
+                    if (comp.size() < 2 || (!aligned && !module_record)) { split.push_back(std::move(comp)); continue; }
                     std::map<std::size_t, std::vector<std::size_t>> by_cls;
                     for (const std::size_t k : comp) by_cls[cands[k].cls].push_back(k);
                     struct ClsInfo { std::size_t cls, haps; };
@@ -3672,12 +3675,38 @@ void call_variants(
                         const Event& a = *class_rep[x.cls];
                         const Event& b = *class_rep[y.cls];
                         if (a.size_bp != b.size_bp) return a.size_bp > b.size_bp;
+                        if (module_record)   // the same content on other copies' nodes: their order fixed too
+                            return std::tie(a.ref_pos, a.seq, a.alt_seq, a.nodes) < std::tie(b.ref_pos, b.seq, b.alt_seq, b.nodes);
                         return std::tie(a.ref_pos, a.seq, a.alt_seq) < std::tie(b.ref_pos, b.seq, b.alt_seq);
                     });
                     std::vector<std::size_t> seeds;          // class of each group's representative
                     std::vector<std::vector<std::size_t>> groups;
+                    std::vector<std::unordered_set<std::size_t>> group_alleles;   // module site: the alleles in each
                     for (const ClsInfo& ci : order) {
                         const Event& ev = *class_rep[ci.cls];
+                        if (module_record) {
+                            // Each candidate on its own: one whose allele a group holds already goes on to the next
+                            // representative it matches, or becomes one.
+                            std::vector<signed char> ok(seeds.size(), -1);   // the class against each seed, once
+                            for (const std::size_t k : by_cls.at(ci.cls)) {
+                                std::size_t g = groups.size();
+                                for (std::size_t x = 0; x < seeds.size() && g == groups.size(); ++x) {
+                                    if (group_alleles[x].count(cands[k].ai)) continue;
+                                    if (ok[x] < 0) {
+                                        const Event& sd = *class_rep[seeds[x]];
+                                        const bool sw = ev.seq < sd.seq || (ev.seq == sd.seq && ev.size_bp < sd.size_bp);
+                                        ok[x] = (sw ? events_match(ev, sd, nullptr, nullptr) : events_match(sd, ev, nullptr, nullptr)) ? 1 : 0;
+                                    }
+                                    if (ok[x] == 1) g = x;
+                                }
+                                if (g == groups.size()) {
+                                    seeds.push_back(ci.cls); groups.emplace_back(); group_alleles.emplace_back(); ok.push_back(1);
+                                }
+                                groups[g].push_back(k);
+                                group_alleles[g].insert(cands[k].ai);
+                            }
+                            continue;
+                        }
                         std::size_t g = groups.size();
                         for (std::size_t x = 0; x < seeds.size() && g == groups.size(); ++x) {
                             const Event& sd = *class_rep[seeds[x]];
@@ -3839,6 +3868,46 @@ void call_variants(
         // supports the record's fixed representative, even below the size threshold. Monotone, so one
         // pass suffices. Not a node-set containment test: on folded loci the inserted nodes are shared
         // across nearly all walks, so it would force-call everyone.
+        // At a collapsed module an event goes to one record only: one of --rescue-min-bp or more is a
+        // candidate and found its record in the merge, and a smaller one goes to the first record (in
+        // record order) it matches. Representatives that do not match each other can both match it, and
+        // filed twice it would be counted twice.
+        const auto add_member = [&](MergedRecord& mr, std::size_t ai, const Event& e) {
+            mr.member_alleles.insert(ai);
+            mr.member_event[ai].push_back(e);
+            mr.member_size[ai] = e.size_bp;
+            if (e.type == EvType::Sub)
+                mr.member_net[ai] = static_cast<long long>(e.ins_bp) - static_cast<long long>(e.del_bp);
+            mr.min_size_bp = std::min(mr.min_size_bp, e.size_bp);
+            mr.max_size_bp = std::max(mr.max_size_bp, e.size_bp);
+            mr.member_nodes.insert(e.nodes.begin(), e.nodes.end());
+            for (const std::string& m : alleles[ai].members) mr.carriers.push_back(m);
+        };
+        if (module_record) {
+            std::vector<std::vector<std::pair<std::size_t, std::vector<std::size_t>>>> hits(merged.size());
+            run_parallel(merged.size(), options.threads, [&](std::size_t ri) {
+                const MergedRecord& mr = merged[ri];
+                if (mr.seed.type == EvType::Dup) return;
+                std::vector<signed char> seen(class_rep.size(), -1);
+                for (std::size_t ai = 0; ai < alleles.size(); ++ai) {
+                    if (mr.member_alleles.count(ai)) continue;
+                    std::vector<std::size_t> ks;
+                    for (std::size_t k = 0; k < allele_events[ai].size(); ++k) {
+                        const Event& e = allele_events[ai][k];
+                        if (e.size_bp >= rescue_floor) continue;
+                        signed char& ok = seen[ev_class[ai][k]];
+                        if (ok < 0) ok = events_match(mr.seed, e) ? 1 : 0;
+                        if (ok == 1) ks.push_back(k);
+                    }
+                    if (!ks.empty()) hits[ri].emplace_back(ai, std::move(ks));
+                }
+            });
+            std::set<std::pair<std::size_t, std::size_t>> claimed;
+            for (std::size_t ri = 0; ri < merged.size(); ++ri)
+                for (const auto& [ai, ks] : hits[ri])
+                    for (const std::size_t k : ks)
+                        if (claimed.insert({ai, k}).second) { add_member(merged[ri], ai, allele_events[ai][k]); break; }
+        } else
         run_parallel(merged.size(), options.threads, [&](std::size_t ri) {
             MergedRecord& mr = merged[ri];
             if (mr.seed.type == EvType::Dup) return;
@@ -3854,18 +3923,7 @@ void call_variants(
                     if (mr.seed.seq_event && e.seq_event && e.size_bp >= rescue_floor) continue;
                     SeedMatch& sm = seen[ev_class[ai][k]];
                     if (sm.ok < 0) sm.ok = events_match(mr.seed, e) ? 1 : 0;
-                    if (sm.ok == 1) {
-                        mr.member_alleles.insert(ai);
-                        mr.member_event[ai].push_back(e);
-                        mr.member_size[ai] = e.size_bp;
-                        if (e.type == EvType::Sub)
-                            mr.member_net[ai] = static_cast<long long>(e.ins_bp) - static_cast<long long>(e.del_bp);
-                        mr.min_size_bp = std::min(mr.min_size_bp, e.size_bp);
-                        mr.max_size_bp = std::max(mr.max_size_bp, e.size_bp);
-                        mr.member_nodes.insert(e.nodes.begin(), e.nodes.end());
-                        for (const std::string& m : alleles[ai].members) mr.carriers.push_back(m);
-                        break;
-                    }
+                    if (sm.ok == 1) { add_member(mr, ai, e); break; }
                 }
             }
         });
