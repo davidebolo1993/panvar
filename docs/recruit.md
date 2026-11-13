@@ -110,7 +110,7 @@ Table columns:
 - Long spliced transcripts cross many junctions and read as divergent.
 - A locus missing from a background genome cannot be subtracted there; its k-mers keep that genome's counts, unless the scan for pieces finds it.
 - Genomes given to the background as graphs are not scanned for pieces.
-- A homologous copy elsewhere that carries three or more of the reference's unique anchors in order is located as a copy of the locus and subtracted.
+- A homologous copy elsewhere close enough to carry three or more of the reference's unique anchors in order is located as a copy of the locus and subtracted, even one the coordinate reference lacks. Past that, the scan for pieces subtracts only stretches tied to the locus (on a located copy's contig, or reaching a contig end): density alone cannot tell a close paralog from a piece, so one with other sequence on both sides, on a contig without a copy, stays outside and its k-mers shared.
 
 ## Example
 
