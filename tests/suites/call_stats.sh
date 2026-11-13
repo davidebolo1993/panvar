@@ -1074,6 +1074,12 @@ python3 -I "$(cd "$(dirname "$0")/.." && pwd)/tools/spec_gfa.py" "$OUT/sepz.spec
 cn_call "$OUT/sepz/g.gfa" "$OUT/sepz"
 check "copies: CNBP counts sequence that takes the place of the first copy's module nodes (hz GT:CN:CNBP)" \
   "$(awk -F'\t' '/^#CHROM/{for(i=10;i<=NF;i++) if($i=="hz#1#chr1") c=i} !/^#/ && /SVTYPE=CNV;/{split($c,v,":"); print v[1]":"v[2]":"v[3]}' "$OUT/sepz.region.vcf")" "0:2:-10"
+# hzg gains a copy and walks Z for its first copy's A3 too: Z is in its copies for telling copies from other
+# events as well, so the swap of A3 for Z is one change inside them, not a 50 bp insertion of Z beside them.
+sed 's/^P hyy#1#chr1 .*/P hzg#1#chr1 L+,Z+,A2+,S+,A3+,A2+,S+,A3+,A2+,X1+,X2+,X3+,R+/' "$OUT/sep.spec" | sed 's/^N Y 70 89$/N Y 70 89\nN Z 50 90/' > "$OUT/sepzg.spec"
+python3 -I "$(cd "$(dirname "$0")/.." && pwd)/tools/spec_gfa.py" "$OUT/sepzg.spec" "$OUT/sepzg"
+cn_call "$OUT/sepzg/g.gfa" "$OUT/sepzg"
+check "copies: sequence in place of the first copy's module nodes is in the copies (hzg records)" "$(hrec "$OUT/sepzg.region.vcf" 'hzg#1#chr1')" "1:3"
 # --diploid: hhalf and heq as one sample; each haplotype's copies are listed, joined as GT is.
 sed -e 's/^P hhalf#1#chr1 /P s9#1#chr1 /' -e 's/^P heq#1#chr1 /P s9#2#chr1 /' "$OUT/sep.spec" > "$OUT/sepdip.spec"
 python3 -I "$(cd "$(dirname "$0")/.." && pwd)/tools/spec_gfa.py" "$OUT/sepdip.spec" "$OUT/sepdip"

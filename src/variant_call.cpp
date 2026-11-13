@@ -1102,13 +1102,18 @@ struct CopySplit {
 //   - The copies are bounded by twice the larger of |module_bp| and |delta| copies: past it, versions go back
 //     to the events, largest first.
 // `place` writes a part as an edit of the reference, false where it cannot (the part then stays an event).
+// `h_first`, `h_last`: the walk's copy span widened over sequence in place of the reference's end module nodes.
 CopySplit split_copies(const Graph& graph, const std::vector<Tok>& R, const std::vector<Tok>& H,
                        const std::vector<Event>& events, const std::unordered_set<std::string>& module_nodes,
                        const std::unordered_set<std::string>& anchor_nodes, long long delta, long long module_bp,
-                       std::size_t unit, const std::function<bool(const Event&, CopyForm&)>& place) {
+                       std::size_t unit, const std::function<bool(const Event&, CopyForm&)>& place,
+                       std::size_t h_first = SIZE_MAX, std::size_t h_last = SIZE_MAX) {
     CopySplit out;
     std::size_t ra = 0, rb = 0, ha = 0, hb = 0;
     const bool rspan = copy_span(R, module_nodes, ra, rb), hspan = copy_span(H, module_nodes, ha, hb);
+    // sequence in place of the copies' end module nodes is in the copies, as CNBP counts it
+    if (hspan && h_first != SIZE_MAX && h_first < ha) ha = h_first;
+    if (hspan && h_last != SIZE_MAX && h_last > hb && h_last < H.size()) hb = h_last;
     const auto clampi = [](std::size_t x, std::size_t lo, std::size_t hi) { return std::min(std::max(x, lo), hi); };
     const auto net_of = [](const Event& e) -> long long {
         if (e.type == EvType::Ins) return static_cast<long long>(e.size_bp);
@@ -3821,6 +3826,7 @@ void call_variants(
                 // reference's copies, holds other sequence in place of the reference's leading (trailing) module nodes:
                 // that sequence is in its copies. An insertion before copies that start as the reference's is beside
                 // them, and a deletion of module nodes with nothing in their place changes nothing here.
+                std::size_t h_first = SIZE_MAX, h_last = SIZE_MAX;   // the copy span widened so (split_copies)
                 if (module_rec != nullptr && !hm.empty()) {
                     std::size_t ra = 0, rb = 0, ha = 0, hb = 0;
                     if (copy_span(Rdiff, module_rec->module_nodes, ra, rb) && copy_span(Htok, module_rec->module_nodes, ha, hb)) {
@@ -3840,12 +3846,12 @@ void call_variants(
                         if (Htok[ha].token != Rdiff[ra].token) {
                             std::size_t j0 = SIZE_MAX;
                             for (std::size_t j = 0; j < ha; ++j) if (hr[j] != SIZE_MAX && hr[j] < ra) j0 = j;
-                            if (j0 != SIZE_MAX && hr[j0] + 1 == ra) fix += bp_of(Htok, j0 + 1, ha);
+                            if (j0 != SIZE_MAX && hr[j0] + 1 == ra && j0 + 1 < ha) { fix += bp_of(Htok, j0 + 1, ha); h_first = j0 + 1; }
                         }
                         if (Htok[hb].token != Rdiff[rb].token) {
                             std::size_t j1 = SIZE_MAX;
                             for (std::size_t j = hb + 1; j < Htok.size() && j1 == SIZE_MAX; ++j) if (hr[j] != SIZE_MAX && hr[j] > rb) j1 = j;
-                            if (j1 != SIZE_MAX && hr[j1] == rb + 1) fix += bp_of(Htok, hb + 1, j1);
+                            if (j1 != SIZE_MAX && hr[j1] == rb + 1 && hb + 1 < j1) { fix += bp_of(Htok, hb + 1, j1); h_last = j1 - 1; }
                         }
                         cnbp_fix[ai] = fix;
                     }
@@ -3932,7 +3938,7 @@ void call_variants(
                         };
                         copy_split[ai] = split_copies(graph, Rdiff, Htok, events, module_rec->module_nodes, module_rec->anchor_nodes,
                                                       static_cast<long long>(cit->second) - static_cast<long long>(module_rec->seed.ref_cn),
-                                                      bit->second, module_rec->seed.ru_len, place);
+                                                      bit->second, module_rec->seed.ru_len, place, h_first, h_last);
                     }
                     // Pieces of one change are joined once the copies are decided, on the parts left, so joining
                     // never changes which parts are copies.
