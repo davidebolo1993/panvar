@@ -56,6 +56,10 @@ struct VariantCallSummary {
     // Divergent blocks the node-token DP abandoned (over its cell cap) and no base-level alignment of the
     // allele then covered: changes there are not called, so the count is reported.
     std::size_t skipped_large_segments = 0;
+    // Module copy changes (--cn), per haplotype: carriers of a module record, haplotypes whose copy change is a
+    // larger event of their own, carriers none of whose changes holds a whole anchor pass (no form), and
+    // carriers whose forms gain or lose other anchor passes than their copy number says.
+    std::size_t copy_carriers = 0, copy_own_event = 0, copy_no_form = 0, copy_pass_off = 0;
     std::size_t del = 0;
     std::size_t ins = 0;
     std::size_t inv = 0;

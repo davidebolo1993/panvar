@@ -19,12 +19,6 @@ fails=0
 ok()  { printf "  ok   %s\n" "$1"; }
 bad() { printf "  FAIL %s\n" "$1"; fails=$((fails + 1)); }
 check() { [ "$2" = "$3" ] && ok "$1 = $3" || bad "$1: expected $3, got ${2:-<missing>}"; }
-# pending <label> <got> <want>: an expected result not yet produced. Prints 'xfail' while it differs and 'XPASS'
-# once it holds, and neither fails the run; an XPASS is made a check.
-xfails=0; xpasses=0
-pending() {
-  if [ "$2" = "$3" ]; then printf "  XPASS %s = %s: holds now; make it a check\n" "$1" "$3"; xpasses=$((xpasses + 1))
-  else printf "  xfail %s: expected %s, got %s\n" "$1" "$3" "${2:-<missing>}"; xfails=$((xfails + 1)); fi; }
 # bm <benchmark args>: benchmark with its log kept at <-o prefix>.log (-q dropped), for the counts it logs.
 bm() {
   local a=() o="" prev=""
@@ -257,6 +251,11 @@ spec() {
 }
 sv() { awk -F'\t' -v k="$2" '$1==k{print $2}' "$OUT/$1.summary.tsv"; }
 
+# noforms: a VCF without the copies its module records name (CN_FORMS, CNFORM), as an older call wrote it, so
+# benchmark finds each carrier's copy among the reference's
+noforms() { awk -F'\t' -v OFS='\t' '/^#/ || $9 !~ /:CNFORM$/ {print; next}
+  { sub(/;CN_FORMS=[^;]*/, "", $8); n = split($9, k, ":"); sub(/:CNFORM$/, "", $9)
+    for (i = 10; i <= NF; i++) if (split($i, v, ":") == n) sub(/:[^:]*$/, "", $i); print }'; }
 # vleft <name>: large events left by the VCF's records
 vleft() { sv "$1_B" large_left_vcf; }
 # A 60 bp repeat unit U, two copies on the reference; hX holds an 80 bp X between its first and second
@@ -433,8 +432,7 @@ check "a twin's copy and a unit graph's other anchor count as copies (checked:mi
       "$(sv twin_B carriers_checked):$(sv twin_B carrier_mismatches) $(sv ug_B carriers_checked):$(sv ug_B carrier_mismatches)" "3:0 3:0"
 check "the VCF: tandem copies of the reference's copy rebuild a repeat array exactly" "$(vleft twin) $(vleft ug)" "0 0"
 # --cn MODULE: A B (600 bp), one reference copy; h2, hX and hZ hold two. hX also holds an 80 bp X before
-# its copies, and call reports X nowhere (the copy-change step took its 680 bp insertion for the copy);
-# hZ's X after its copies has its own record.
+# its copies, hZ after them: each X is a record of its own, apart from the copies the module record names.
 cat > "$OUT/modins.spec" <<'EOF'
 N S 2000 1
 N A 300 2
@@ -449,13 +447,12 @@ P hZ#1#chr1 S+,A+,B+,A+,B+,X+,T+
 B S T A;B;X
 EOF
 spec modins --cn
-check "MODULE carriers are checked: their copies by the anchor rule (checked:unchecked)" \
-      "$(sv modins_B carriers_checked):$(lg modins_B "$UNCHECKED")" "4:0"
-check "and the 80 bp no record reports is flagged in hX's copy stretch, and nothing is left for hZ" \
-      "$(tail -n +2 "$OUT/modins_B.carrier_checks.tsv" | cut -f2,3,6 | paste -sd';' -) $(sv modins_B large_left_call)" \
-      "$(printf 'hX#1#chr1\tcn_stretch\t80') 0"
-check "the VCF: the copy gain and hZ's insertion at one point are both applied; hX's 80 bp is lost (copy_count)" \
-      "$(lost_rows modins)" "hX INS 80 copy_count"
+check "MODULE carriers are checked: their copies by the anchor rule, and the two X records (checked:unchecked)" \
+      "$(sv modins_B carriers_checked):$(lg modins_B "$UNCHECKED")" "5:0"
+check "no check flags a carrier, its copies and its X making its stretch (rows; cn_exact checked; large_left_call)" \
+      "$(tail -n +2 "$OUT/modins_B.carrier_checks.tsv" | wc -l | tr -d ' ') $(sv modins_B cn_exact_checked) $(sv modins_B large_left_call)" "0 3 0"
+check "the VCF: hX's copy and its insertion at one point are both applied, and nothing is lost" \
+      "$(lost_rows modins)" ""
 # Two variants of call's output, kept in tests/synthetic_data/benchmark_cases:
 # - modins_short_unit: CN_UNIT_BP is 300, half a copy; with one reference copy, the copy is the record's
 #   span, so the copies still rebuild and only hX's 80 bp is lost.
@@ -517,12 +514,12 @@ check "a gained copy of a shorter form, which a deletion record accounts for, is
 BUBBLE=1 spec sepb --cn
 # cn_exact <name>: carriers checked by cn_exact, and those that differ
 cn_exact() { echo "$(awk -F'\t' '$1=="cn_exact_checked"{print $2}' "$OUT/$1_B.summary.tsv"):$(tail -n +2 "$OUT/$1_B.carrier_checks.tsv" | awk -F'\t' '$3=="cn_exact"' | wc -l | tr -d ' ')"; }
-pending "copies: the VCF rebuilds every haplotype (large_left_vcf_bp; cn_exact checked:differing)" \
+check "copies: the VCF rebuilds every haplotype (large_left_vcf_bp; cn_exact checked:differing)" \
   "$(sv sepb_B large_left_vcf_bp) $(cn_exact sepb)" "0 6:0"
 awk '$1=="P"{n=split($3,s,","); o=""; for(i=n;i>=1;i--){x=s[i]; c=substr(x,length(x)); x=substr(x,1,length(x)-1) (c=="+"?"-":"+")
             o=o (o==""?"":",") x}; print $1, $2, o; next} {print}' "$OUT/sepb.spec" > "$OUT/sepbr.spec"
 BUBBLE=1 spec sepbr --cn
-pending "copies, the reference walked backwards: the VCF rebuilds every haplotype (large_left_vcf_bp; cn_exact)" \
+check "copies, the reference walked backwards: the VCF rebuilds every haplotype (large_left_vcf_bp; cn_exact)" \
   "$(sv sepbr_B large_left_vcf_bp) $(cn_exact sepbr)" "0 6:0"
 # No reference copy: the gained copies are the record's own sequence.
 { printf 'N L 2000 91\nN A 150 92\nN B 150 93\nN C 30 94\nN R 2000 95\nP ref#0#chr1:0-4030 L+,C+,R+\n'
@@ -530,7 +527,7 @@ pending "copies, the reference walked backwards: the VCF rebuilds every haplotyp
   for i in 1 2; do printf 'P htwo%s#1#chr1 L+,A+,B+,A+,B+,C+,R+\n' "$i"; done
   for i in 1 2 3 4 5 6; do printf 'P hr%s#1#chr1 L+,C+,R+\n' "$i"; done; } > "$OUT/sepb0.spec"
 BUBBLE=1 spec sepb0 --cn
-pending "copies, no reference copy: the VCF rebuilds the gains (large_left_vcf_bp, no_sequence; cn_exact)" \
+check "copies, no reference copy: the VCF rebuilds the gains (large_left_vcf_bp, no_sequence; cn_exact)" \
   "$(sv sepb0_B large_left_vcf_bp) $(sv sepb0_B large_left_vcf_no_sequence) $(cn_exact sepb0)" "0 0 6:0"
 
 sed 's/^P hX#1#chr1 .*/P hX#1#chr1 S+,A+,B+,A+,X+,B+,T+/' "$OUT/modins.spec" > "$OUT/modmid.spec"
@@ -547,7 +544,7 @@ awk -F'\t' -v OFS='\t' '!/^#/ && $3 ~ /_DEL_H$/ {
     for (k = 10; k <= n; k++) g = g "\t0"
     print $1, $2 - 80, "decoy1", $4, "<DEL>", ".", ".", "END=" $2 + 80 ";SVTYPE=DEL;SVLEN=-160", "GT" g
     print $1, $2 - 40, "decoy2", $4, "<DEL>", ".", ".", "END=" $2 + 140 ";SVTYPE=DEL;SVLEN=-180", "GT" g
-  } {print}' "$OUT/shortcopy_c.region.vcf" > "$OUT/decoys_c.region.vcf"
+  } {print}' "$OUT/shortcopy_c.region.vcf" | noforms > "$OUT/decoys_c.region.vcf"
 cp "$OUT/shortcopy_c.carrier_events.tsv" "$OUT/decoys_c.carrier_events.tsv"
 bm -i "$OUT/shortcopy/g.gfa" -c "$OUT/shortcopy/g.bubbles.csv" -r "ref#0#chr1:0-5600" --calls "$OUT/decoys_c" \
   -o "$OUT/decoys_B" -q >/dev/null 2>&1
@@ -895,6 +892,5 @@ check "a site table naming nodes the graph lacks, or an id twice, is refused" "$
        >/dev/null 2> "$OUT/dip.err"
 check "a --diploid VCF is refused as one (rc:says so)" "$?:$(grep -c 'without --diploid' "$OUT/dip.err")" "2:1"
 
-[ $((xfails + xpasses)) -gt 0 ] && printf "%d expected failure(s), %d now holding\n" "$xfails" "$xpasses"
 printf "%d assertion(s) failed\n" "$fails"
 [ "$fails" -eq 0 ]

@@ -326,6 +326,11 @@ int run_call_command(const std::vector<std::string>& args) {
     }
     if (summary.covered_missing > 0)
         log.info("GT . within a larger deletion of the haplotype's own: " + std::to_string(summary.covered_missing));
+    if (summary.copy_carriers + summary.copy_own_event > 0)
+        log.info("module copy changes: carriers " + std::to_string(summary.copy_carriers) + ", a larger event of their own " +
+                 std::to_string(summary.copy_own_event) + "; carriers with no change holding a whole copy " +
+                 std::to_string(summary.copy_no_form) + ", whose copies' anchor passes differ from CN " +
+                 std::to_string(summary.copy_pass_off));
     if (summary.ref_gap_bubbles > 0) {
         std::string ids;
         for (std::size_t k = 0; k < summary.ref_gap_ids.size(); ++k)

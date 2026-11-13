@@ -78,12 +78,6 @@ info()  { awk -F'\t' -v t="$1" -v k="$2" '$0!~/^#/ && $8~("SVTYPE="t";"){
 
 check() { # check <label> <got> <want>
   [ "$2" = "$3" ] && ok "$1 = $3" || bad "$1: expected $3, got ${2:-<missing>}"; }
-# pending <label> <got> <want>: an expected result not yet produced. Prints 'xfail' while it differs and 'XPASS'
-# once it holds, and neither fails the run; an XPASS is made a check.
-xfails=0; xpasses=0
-pending() {
-  if [ "$2" = "$3" ]; then printf "  XPASS %s = %s: holds now; make it a check\n" "$1" "$3"; xpasses=$((xpasses + 1))
-  else printf "  xfail %s: expected %s, got %s\n" "$1" "$3" "${2:-<missing>}"; xfails=$((xfails + 1)); fi; }
 
 # The event coordinates, each derivable from the node lengths at the top of this file.
 check "DEL POS (base before the deleted span)"  "$(field DEL 2)"      "100"
@@ -681,8 +675,10 @@ pk_cn() { awk -F'\t' -v s="$1" '/^#CHROM/{for(i=10;i<=NF;i++) if($i ~ s) c=i}
 [ "$(pk_cn pkflat)" = "1" ] \
   && ok "MODULE reports 1 copy for the haplotype that does not duplicate" \
   || bad "MODULE CN for the non-duplicating haplotype: expected 1, got '$(pk_cn pkflat)'"
-check "the third u is a 60 bp insertion beside the module record" \
-  "$(grep -v '^#' "$PKV" | grep -o 'SVTYPE=INS;SVLEN=[0-9]*' | paste -sd, -)" "SVTYPE=INS;SVLEN=60"
+# The third u lies between the duplicating haplotype's copies: it goes with them, in the module record's forms.
+check "the third u is in the duplicating haplotype's copies, no insertion of its own (INS records, pkdup's CNFORM)" \
+  "$(grep -v '^#' "$PKV" | grep -c 'SVTYPE=INS;') $(awk -F'\t' '/^#CHROM/{for(i=10;i<=NF;i++) if($i ~ /^pkdup#/) c=i}
+     !/^#/ && /SVTYPE=CNV;/{n=split($9,k,":"); split($c,v,":"); for(j=1;j<=n;j++) if(k[j]=="CNFORM") print v[j]}' "$PKV")" "0 1,2"
 
 # ---------------------------------------------------------------------------------------------
 # Within-haplotype coalescing must also judge nearness at the OCCURRENCE, not at a node's first
@@ -942,25 +938,25 @@ python3 -I "$(cd "$(dirname "$0")/.." && pwd)/tools/spec_gfa.py" "$OUT/modpara.s
 cn_call "$OUT/modpara/g.gfa" "$OUT/modpara"
 check "MODULE non-carrier whose change no record holds keeps its measured CN (GT:CN, records)" \
   "$(gt_cn "$OUT/modpara.region.vcf" 'htest#1#chr1' CNV) $(grep -vc '^#' "$OUT/modpara.region.vcf")" "0:1 1"
-# hbig deletes the second copy and x after it, 120 bp: a carrier of one copy fewer whose loss lies inside a larger
-# deletion of its own is that deletion's carrier; the module record reads REF_CN for it.
+# hbig deletes the second copy and x after it, 120 bp: as much unique sequence as copy, so still a carrier of one
+# copy fewer, and x (60 bp) a deletion of its own.
 sed 's/^P htest#1#chr1 .*/P hbig#1#chr1 L+,A3+,A2+,S+,R+/' "$OUT/modlow.spec" > "$OUT/modbig.spec"
 python3 -I "$(cd "$(dirname "$0")/.." && pwd)/tools/spec_gfa.py" "$OUT/modbig.spec" "$OUT/modbig"
 cn_call "$OUT/modbig/g.gfa" "$OUT/modbig"
-check "MODULE carrier given up to a larger deletion of its own reads REF_CN (CNV GT:CN, DEL GT)" \
-  "$(gt_cn "$OUT/modbig.region.vcf" 'hbig#1#chr1' CNV) $(gt_cn "$OUT/modbig.region.vcf" 'hbig#1#chr1' DEL | cut -d: -f1)" "0:2 1"
+check "MODULE carrier whose deletion holds as much unique sequence as copy: a carrier and the unique part (CNV GT:CN, DEL GT:SVLEN)" \
+  "$(gt_cn "$OUT/modbig.region.vcf" 'hbig#1#chr1' CNV) $(gt_cn "$OUT/modbig.region.vcf" 'hbig#1#chr1' DEL | cut -d: -f1):$(awk -F'\t' '!/^#/ && /SVTYPE=DEL;/{match($8,/SVLEN=-?[0-9]+/); print substr($8,RSTART+6,RLENGTH-6)}' "$OUT/modbig.region.vcf")" "1:1 1:-60"
 # --diploid: sample s1 holds a carrier (one copy lost) and a non-carrier whose own deletion holds its change. The
 # non-carrier's CN reads REF_CN, but its CNRESID comes from its measured copies, as when no record holds it.
 sed -e 's/^P hfull#1#chr1 /P s1#1#chr1 /' -e 's/^P htest#1#chr1 /P s1#2#chr1 /' "$OUT/modlow.spec" > "$OUT/moddip.spec"
 python3 -I "$(cd "$(dirname "$0")/.." && pwd)/tools/spec_gfa.py" "$OUT/moddip.spec" "$OUT/moddip"
 "$BIN" bubble -i "$OUT/moddip/g.gfa" -r ref --min-variant-bp 0 -o "$OUT/moddip.b" --merge-nearby-bp 0 --quiet >/dev/null 2>&1
 "$BIN" call -i "$OUT/moddip.b.sorted.gfa" --bubble-prefix "$OUT/moddip.b" -r ref -o "$OUT/moddip" --cn --diploid --quiet >/dev/null 2>&1
-check "--diploid: one carrier and one non-carrier holding its change (s1 GT:CN:CNBP:CNRESID:MODBP:HCN)" \
-  "$(awk -F'\t' '/^#CHROM/{for(i=10;i<=NF;i++) if($i=="s1") c=i} !/^#/ && /SVTYPE=CNV;/{print $c; exit}' "$OUT/moddip.region.vcf")" "1|0:3:-140:20:-140:1|2"
+check "--diploid: one carrier and one non-carrier holding its change (s1 GT:CN:CNBP:CNRESID:MODBP:CNFORM:HCN)" \
+  "$(awk -F'\t' '/^#CHROM/{for(i=10;i<=NF;i++) if($i=="s1") c=i} !/^#/ && /SVTYPE=CNV;/{print $c; exit}' "$OUT/moddip.region.vcf")" "1|0:3:-140:20:-140:2|.:1|2"
 "$BIN" call -i "$OUT/moddip.b.sorted.gfa" --bubble-prefix "$OUT/moddip.b" -r ref -o "$OUT/moddip_af" --cn --diploid \
   --min-alt-af 0.1 --quiet >/dev/null 2>&1
 check "--diploid, the holding deletion filtered out: the non-carrier's measured CN (s1 GT:CN:...:HCN)" \
-  "$(awk -F'\t' '/^#CHROM/{for(i=10;i<=NF;i++) if($i=="s1") c=i} !/^#/ && /SVTYPE=CNV;/{print $c; exit}' "$OUT/moddip_af.region.vcf")" "1|0:2:-140:20:-140:1|1"
+  "$(awk -F'\t' '/^#CHROM/{for(i=10;i<=NF;i++) if($i=="s1") c=i} !/^#/ && /SVTYPE=CNV;/{print $c; exit}' "$OUT/moddip_af.region.vcf")" "1|0:2:-140:20:-140:2|.:1|1"
 # htest's deletion holds its change only while it is written: --min-alt-af 0.1 leaves it out (AF 1/14), and the
 # module record then reads its measured CN; so does --diploid, where the sample's own column then reads 1|1.
 "$BIN" call -i "$OUT/modlow.b.sorted.gfa" --bubble-prefix "$OUT/modlow.b" -r ref -o "$OUT/modlow_af" --cn --min-alt-af 0.1 \
@@ -1033,9 +1029,9 @@ hrec() { awk -F'\t' -v s="$2" '/^#CHROM/{for(i=10;i<=NF;i++) if($i==s) c=i}
   END{print cnv o}' "$1"; }
 V="$OUT/sep.region.vcf"
 check "copies: a gain and a loss are the module record alone (hgain, hloss)" "$(hrec "$V" 'hgain#1#chr1')|$(hrec "$V" 'hloss#1#chr1')" "1:3|1:1"
-pending "copies: a loss with half a copy of unique sequence is a carrier and a deletion of that sequence (hhalf)" \
+check "copies: a loss with half a copy of unique sequence is a carrier and a deletion of that sequence (hhalf)" \
   "$(hrec "$V" 'hhalf#1#chr1')" "1:1 DEL:-80"
-pending "copies: a loss with as much unique sequence as copy is still a carrier (heq)" "$(hrec "$V" 'heq#1#chr1')" "1:1 DEL:-160"
+check "copies: a loss with as much unique sequence as copy is still a carrier (heq)" "$(hrec "$V" 'heq#1#chr1')" "1:1 DEL:-160"
 check "copies: a loss inside more unique sequence than copy is that deletion's carrier (hmore)" \
   "$(hrec "$V" 'hmore#1#chr1')" "0:2 DEL:-560"
 check "copies: a gain beside a deletion of the other direction is a carrier and that deletion (hdir)" \
@@ -1043,15 +1039,15 @@ check "copies: a gain beside a deletion of the other direction is a carrier and 
 check "copies: an inverted gained copy is the module record alone (hinv)" "$(hrec "$V" 'hinv#1#chr1')" "1:3"
 check "copies: one insertion in each copy is two records, one event each (hyy; its carrier events)" \
   "$(hrec "$V" 'hyy#1#chr1') $(awk -F'\t' '$NF ~ /hyy/ && $3 != "cn"' "$OUT/sep.carrier_events.tsv" | cut -f1 | sort | uniq -c | awk '{printf "%s", $1}')" "0:2 INS:70 INS:70 11"
-pending "copies: the module record names each carrier's copies (CN_FORMS, hhalf's CNFORM)" \
+check "copies: the module record names each carrier's copies; hhalf's is the second copy's deletion (its CN_FORMS entry)" \
   "$(awk -F'\t' '/^#CHROM/{for(i=10;i<=NF;i++) if($i=="hhalf#1#chr1") c=i} !/^#/ && /SVTYPE=CNV;/{n=split($9,k,":"); split($c,v,":")
-       for(j=1;j<=n;j++) if(k[j]=="CNFORM") f=v[j]; print (($8 ~ /CN_FORMS=/) ? "forms" : "none"), f}' "$V")" "forms 1"
+       for(j=1;j<=n;j++) if(k[j]=="CNFORM") f=v[j]; match($8,/CN_FORMS=[^;]*/); split(substr($8,RSTART+9,RLENGTH-9),fs,","); print fs[f]}' "$V")" "2201-2360:"
 # The same graph, the reference walked backwards: the records hold the same changes.
 awk '$1=="P"{n=split($3,s,","); o=""; for(i=n;i>=1;i--){x=s[i]; c=substr(x,length(x)); x=substr(x,1,length(x)-1) (c=="+"?"-":"+")
             o=o (o==""?"":",") x}; print $1, $2, o; next} {print}' "$OUT/sep.spec" > "$OUT/seprev.spec"
 python3 -I "$(cd "$(dirname "$0")/.." && pwd)/tools/spec_gfa.py" "$OUT/seprev.spec" "$OUT/seprev"
 cn_call "$OUT/seprev/g.gfa" "$OUT/seprev"
-pending "copies, the reference walked backwards: hhalf, heq, hmore, hdir as forward" \
+check "copies, the reference walked backwards: hhalf, heq, hmore, hdir as forward" \
   "$(for h in hhalf heq hmore hdir; do hrec "$OUT/seprev.region.vcf" "$h#1#chr1"; done | paste -sd'|' -)" \
   "1:1 DEL:-80|1:1 DEL:-160|0:2 DEL:-560|1:3 DEL:-400"
 # --diploid: hhalf and heq as one sample; each haplotype's copies are listed, joined as GT is.
@@ -1059,9 +1055,9 @@ sed -e 's/^P hhalf#1#chr1 /P s9#1#chr1 /' -e 's/^P heq#1#chr1 /P s9#2#chr1 /' "$
 python3 -I "$(cd "$(dirname "$0")/.." && pwd)/tools/spec_gfa.py" "$OUT/sepdip.spec" "$OUT/sepdip"
 "$BIN" bubble -i "$OUT/sepdip/g.gfa" -r ref --min-variant-bp 0 -o "$OUT/sepdip.b" --merge-nearby-bp 0 --quiet >/dev/null 2>&1
 "$BIN" call -i "$OUT/sepdip.b.sorted.gfa" --bubble-prefix "$OUT/sepdip.b" -r ref -o "$OUT/sepdip" --cn --diploid --quiet >/dev/null 2>&1
-pending "copies, --diploid: a sample's CNFORM joins its haplotypes' as GT does (s9 GT:CNFORM)" \
+check "copies, --diploid: a sample's CNFORM joins its haplotypes' as GT does (s9 GT:CNFORM)" \
   "$(awk -F'\t' '/^#CHROM/{for(i=10;i<=NF;i++) if($i=="s9") c=i} !/^#/ && /SVTYPE=CNV;/{n=split($9,k,":"); split($c,v,":")
-       for(j=1;j<=n;j++) { if(k[j]=="GT") g=v[j]; if(k[j]=="CNFORM") f=v[j] }; print g":"f}' "$OUT/sepdip.region.vcf")" "1|1:1|2"
+       for(j=1;j<=n;j++) { if(k[j]=="GT") g=v[j]; if(k[j]=="CNFORM") f=v[j] }; print g":"f}' "$OUT/sepdip.region.vcf")" "1|1:3|3"
 # No reference copy: two copies of A B (300 bp) gained by some haplotypes, one by others; the module record
 # carries their sequence.
 { printf 'N L 2000 91\nN A 150 92\nN B 150 93\nN C 30 94\nN R 2000 95\nP ref#0#chr1:0-4030 L+,C+,R+\n'
@@ -1070,10 +1066,10 @@ pending "copies, --diploid: a sample's CNFORM joins its haplotypes' as GT does (
   for i in 1 2 3 4 5 6; do printf 'P hr%s#1#chr1 L+,C+,R+\n' "$i"; done; } > "$OUT/sep0.spec"
 python3 -I "$(cd "$(dirname "$0")/.." && pwd)/tools/spec_gfa.py" "$OUT/sep0.spec" "$OUT/sep0"
 cn_call "$OUT/sep0/g.gfa" "$OUT/sep0"
-pending "copies, no reference copy: the gained copies are spelled (CN_FORMS without '*')" \
+check "copies, no reference copy: the gained copies are spelled (CN_FORMS without '*')" \
   "$(awk -F'\t' '!/^#/ && /SVTYPE=CNV;/{print (($8 ~ /CN_FORMS=[^;]*[ACGT]/ && $8 !~ /CN_FORMS=[^;]*\*/) ? "spelled" : "not")}' "$OUT/sep0.region.vcf")" "spelled"
 "$BIN" call -i "$OUT/sep0.b.sorted.gfa" --bubble-prefix "$OUT/sep0.b" -r ref -o "$OUT/sep0_short" --cn --max-seq-bp 100 --quiet >/dev/null 2>&1
-pending "copies, --max-seq-bp under a copy: the form is written without its sequence ('*')" \
+check "copies, --max-seq-bp under a copy: the form is written without its sequence ('*')" \
   "$(awk -F'\t' '!/^#/ && /SVTYPE=CNV;/{print (($8 !~ /CN_FORMS=/) ? "none" : ($8 ~ /CN_FORMS=[^;]*\*/) ? "unspelled" : "spelled")}' "$OUT/sep0_short.region.vcf")" "unspelled"
 
 # ---------------------------------------------------------------- inverted duplications
@@ -1649,8 +1645,8 @@ check "--cn module: no INS/DEL restates its copies; one copy's +60 bp of L is an
       "$(grep -v '^#' "$V" | grep -c 'CN_METHOD=MODULE;' | tr -d ' '):$(grep -v '^#' "$V" | grep -v '_CNV_' | grep -o 'SVTYPE=[A-Z]*;SVLEN=-\?[0-9]*' | paste -sd, -)" \
       "1:SVTYPE=INS;SVLEN=60"
 # h1 runs both module copies through L, the twin of the reference's T: its copies are whole copies.
-check "--cn module: a copy routed through the twin is a whole copy (h1 GT:CN:CNBP:CNRESID:MODBP)" \
-      "$(awk -F'\t' '/^#CHROM/{for(i=10;i<=NF;i++) if($i=="h1#1#chr1") c=i} !/^#/ && /CN_METHOD=MODULE;/{print $c}' "$V")" "0:2:0:0:0"
+check "--cn module: a copy routed through the twin is a whole copy (h1 GT:CN:CNBP:CNRESID:MODBP:CNFORM)" \
+      "$(awk -F'\t' '/^#CHROM/{for(i=10;i<=NF;i++) if($i=="h1#1#chr1") c=i} !/^#/ && /CN_METHOD=MODULE;/{print $c}' "$V")" "0:2:0:0:0:."
 check "a path routed through the twin of a kept loop is no variant" \
       "$(grep -vc '^#' "$OUT/w1_route.region.vcf" | tr -d ' ')" "0"
 
@@ -3950,7 +3946,6 @@ check "aligned alleles: the placement a wider band finds (records SVTYPE:SVLEN)"
   "SVTYPE=DEL SVLEN=-123 SVTYPE=INS SVLEN=86 "
 
 printf "\n"
-[ $((xfails + xpasses)) -gt 0 ] && printf "call_stats: %d expected failure(s), %d now holding\n" "$xfails" "$xpasses"
 if [ "$fails" -eq 0 ]; then printf "call_stats: all assertions passed\n"; exit 0; fi
 # repeated last, shortened: a long output can be cut in the middle by ctest
 printf "call_stats: %d assertion(s) failed:\n" "$fails"; printf "  FAIL %s\n" "${failed[@]}"; exit 1

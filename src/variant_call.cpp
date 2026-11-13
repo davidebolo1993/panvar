@@ -966,6 +966,207 @@ void split_copy_replacements(const Graph& graph, const std::vector<Tok>& R, cons
     events = std::move(out);
 }
 
+// A change of a walk, tokens [rl, rh) of R replaced by [hl, hh) of H, as an event: a deletion, an insertion or
+// a replacement, with the fields the node comparison gives its own.
+Event token_event(const Graph& graph, const std::vector<Tok>& R, const std::vector<Tok>& H, std::size_t rl,
+                  std::size_t rh, std::size_t hl, std::size_t hh) {
+    std::vector<const Tok*> rt, ht;
+    for (std::size_t k = rl; k < rh; ++k) rt.push_back(&R[k]);
+    for (std::size_t k = hl; k < hh; ++k) ht.push_back(&H[k]);
+    Event e;
+    if (!rt.empty() && !ht.empty()) {
+        e.type = EvType::Sub;
+        e.seq = spell_toks(graph, rt);
+        e.alt_seq = spell_toks(graph, ht);
+        e.del_bp = toks_bp(graph, rt);
+        e.ins_bp = toks_bp(graph, ht);
+        e.size_bp = substitution_change_bp(e.seq, e.alt_seq);
+    } else if (!rt.empty()) {
+        e.type = EvType::Del;
+        e.seq = spell_toks(graph, rt);
+        e.size_bp = toks_bp(graph, rt);
+    } else {
+        e.type = EvType::Ins;
+        e.seq = spell_toks(graph, ht);
+        e.size_bp = toks_bp(graph, ht);
+    }
+    for (const Tok* t : rt) e.nodes.push_back(t->node_id);
+    for (const Tok* t : ht) e.nodes.push_back(t->node_id);
+    if (!rt.empty()) {
+        e.start_node = rt.front()->node_id;
+        e.end_node = rt.back()->node_id;
+        e.anchor_node = rt.front()->node_id;
+        e.ref_tok_first = rt.front()->src_idx;
+        e.ref_tok_last = rt.back()->src_idx;
+    } else {
+        e.start_node = ht.front()->node_id;
+        e.end_node = ht.back()->node_id;
+        if (rl > 0) { e.anchor_node = R[rl - 1].node_id; e.ref_tok_anchor = R[rl - 1].src_idx; }
+        e.anchor_after = true;
+    }
+    e.r_lo = rl; e.r_hi = rh; e.h_lo = hl; e.h_hi = hh;
+    e.split_piece = true;   // placed by its own tokens: a piece cut from a change, no match beside it
+    return e;
+}
+
+// One haplotype's copies at a collapsed module, told apart from its other events (see call.md, step 7).
+struct CopyForm { std::size_t start = 0, end = 0; std::string seq; };   // reference [start, end] -> seq
+struct CopySplit {
+    enum Mode { None, Copies, OwnEvent } mode = None;
+    std::vector<Event> rest;        // Copies: its events with the copies taken out, in walk order
+    std::vector<CopyForm> forms;    // Copies: the copies, as edits of the reference
+    long long passes = 0;           // Copies: anchor passes the forms gain (lose: negative)
+};
+
+// The copies a haplotype gained or lost, from its own events (`events`, the node comparison of its walk H with
+// the reference's R). `delta` is its copies less the reference's, `module_bp` its change over the module's
+// nodes, `unit` one copy (CN_UNIT_BP).
+//   - The copy span of a walk runs from its first to its last token on a module node. An event touching it is
+//     part of the copy change; S is their net change.
+//   - The haplotype is no carrier, the copy change being an event of its own, when the change beside the copies
+//     goes their way and is more than the copies: (S - module_bp) has delta's sign and exceeds both
+//     |module_bp| and |delta| copies. A deletion that takes a copy with it is a deletion.
+//   - Otherwise each touching event is cut at the copy span's ends (node boundaries); the parts outside are
+//     events of their own. A replacement whose two sides are versions of each other is not cut: a copy
+//     replaced by a diverged version of it is one change. A part inside is a copy when it holds anchor passes
+//     (what CN counts), either way. A part with none is a copy only by its bases: a gain's insertion that is a
+//     version of the reference's copies, its first to last anchor pass (a copy's part on nodes the reference
+//     does not walk), or, beside a loss, an insertion that is a version of what the loss took, about the excess
+//     it took beyond the copies. A deletion with no anchor pass is a change inside a remaining copy.
+//   - The copies are bounded by twice the larger of |module_bp| and |delta| copies: past it, versions go back
+//     to the events, largest first.
+// `place` writes a part as an edit of the reference, false where it cannot (the part then stays an event).
+CopySplit split_copies(const Graph& graph, const std::vector<Tok>& R, const std::vector<Tok>& H,
+                       const std::vector<Event>& events, const std::unordered_set<std::string>& module_nodes,
+                       const std::unordered_set<std::string>& anchor_nodes, long long delta, long long module_bp,
+                       std::size_t unit, const std::function<bool(const Event&, CopyForm&)>& place) {
+    CopySplit out;
+    std::size_t ra = 0, rb = 0, ha = 0, hb = 0;
+    const bool rspan = copy_span(R, module_nodes, ra, rb), hspan = copy_span(H, module_nodes, ha, hb);
+    const auto clampi = [](std::size_t x, std::size_t lo, std::size_t hi) { return std::min(std::max(x, lo), hi); };
+    const auto net_of = [](const Event& e) -> long long {
+        if (e.type == EvType::Ins) return static_cast<long long>(e.size_bp);
+        if (e.type == EvType::Del) return -static_cast<long long>(e.size_bp);
+        if (e.type == EvType::Sub) return static_cast<long long>(e.ins_bp) - static_cast<long long>(e.del_bp);
+        return 0;
+    };
+    // Each event's cut points on both walks: before [lo, c1), inside [c1, c2), after [c2, hi). A walk with no
+    // module node is not cut.
+    struct Cut { std::size_t r1, r2, h1, h2; bool touches; };
+    std::vector<Cut> cuts(events.size());
+    long long S = 0;
+    for (std::size_t i = 0; i < events.size(); ++i) {
+        const Event& e = events[i];
+        Cut& c = cuts[i];
+        c.touches = false;
+        if (e.seq_event || e.type == EvType::Inv || e.type == EvType::Dup || e.r_lo == SIZE_MAX || e.h_lo == SIZE_MAX) continue;
+        c.r1 = rspan ? clampi(ra, e.r_lo, e.r_hi) : e.r_lo;
+        c.r2 = rspan ? clampi(rb + 1, e.r_lo, e.r_hi) : e.r_hi;
+        c.h1 = hspan ? clampi(ha, e.h_lo, e.h_hi) : e.h_lo;
+        c.h2 = hspan ? clampi(hb + 1, e.h_lo, e.h_hi) : e.h_hi;
+        // inside on a side: its tokens there, or an empty side that sits between two tokens of the span
+        const bool r_in = c.r1 < c.r2 || (e.r_lo == e.r_hi && (!rspan || in_copy_span(e.r_lo, e.r_hi, ra, rb)));
+        const bool h_in = c.h1 < c.h2 || (e.h_lo == e.h_hi && (!hspan || in_copy_span(e.h_lo, e.h_hi, ha, hb)));
+        c.touches = (c.r1 < c.r2 || c.h1 < c.h2) || (r_in && h_in);
+        if (c.touches) S += net_of(e);
+    }
+    const long long off = S - module_bp;
+    const long long ad = delta < 0 ? -delta : delta;
+    const long long scale = std::max(module_bp < 0 ? -module_bp : module_bp, ad * static_cast<long long>(unit));
+    if (off * delta > 0 && (off < 0 ? -off : off) > scale) { out.mode = CopySplit::OwnEvent; return out; }
+    out.mode = CopySplit::Copies;
+    // the anchor passes a part gains: the length-weighted median over the anchor's nodes of its visits there
+    const auto passes_of = [&](const Event& p) -> long long {
+        std::unordered_map<std::string, long long> d;
+        for (std::size_t k = p.r_lo; k < p.r_hi; ++k) if (anchor_nodes.count(R[k].node_id)) --d[R[k].node_id];
+        for (std::size_t k = p.h_lo; k < p.h_hi; ++k) if (anchor_nodes.count(H[k].node_id)) ++d[H[k].node_id];
+        std::vector<std::pair<long long, std::size_t>> cw;
+        std::size_t total = 0;
+        for (const std::string& n : anchor_nodes) {
+            const auto it = d.find(n);
+            const std::size_t len = node_len(graph, n);
+            cw.emplace_back(it == d.end() ? 0 : it->second, len);
+            total += len;
+        }
+        if (total == 0) return 0;
+        std::sort(cw.begin(), cw.end());
+        std::size_t acc = 0;
+        for (const auto& [v, w] : cw) { acc += w; if (2 * acc >= total) return v; }
+        return cw.back().first;
+    };
+    struct Part { Event e; bool inside = false; long long passes = 0; int role = 0; };   // role: 1 copy, 2 version
+    std::vector<Part> parts;
+    for (std::size_t i = 0; i < events.size(); ++i) {
+        const Event& e = events[i];
+        const Cut& c = cuts[i];
+        if (!c.touches) { parts.push_back({e, false, 0, 0}); continue; }
+        const std::size_t rs[4] = {e.r_lo, c.r1, c.r2, e.r_hi}, hs[4] = {e.h_lo, c.h1, c.h2, e.h_hi};
+        // A replacement of a copy by a version of it is one change, not a copy and an insertion: not cut.
+        const bool versions = e.type == EvType::Sub &&
+                              (e.seq.size() <= e.alt_seq.size() ? version_of(e.seq, e.alt_seq) : version_of(e.alt_seq, e.seq));
+        if (versions || (c.r1 == e.r_lo && c.r2 == e.r_hi && c.h1 == e.h_lo && c.h2 == e.h_hi)) {
+            Part pt{e, true, 0, 0};
+            pt.passes = passes_of(e);
+            parts.push_back(std::move(pt));
+            continue;
+        }
+        for (int k = 0; k < 3; ++k) {
+            if (rs[k] == rs[k + 1] && hs[k] == hs[k + 1]) continue;
+            Part pt{token_event(graph, R, H, rs[k], rs[k + 1], hs[k], hs[k + 1]), k == 1, 0, 0};
+            if (pt.inside) pt.passes = passes_of(pt.e);
+            parts.push_back(std::move(pt));
+        }
+    }
+    long long copy_net = 0;
+    for (Part& pt : parts)
+        if (pt.inside && pt.passes != 0) { pt.role = 1; copy_net += net_of(pt.e); }
+    if (delta > 0) {
+        // a gain's part on nodes the reference does not walk: a version of the reference's copies (from its
+        // first to its last pass through the anchor), or with no reference copy of the gained ones
+        std::string copies;
+        std::size_t aa = SIZE_MAX, ab = 0;
+        for (std::size_t k = 0; k < R.size(); ++k) if (anchor_nodes.count(R[k].node_id)) { if (aa == SIZE_MAX) aa = k; ab = k; }
+        if (aa != SIZE_MAX) { std::vector<const Tok*> t; for (std::size_t k = aa; k <= ab; ++k) t.push_back(&R[k]); copies = spell_toks(graph, t); }
+        else for (const Part& pt : parts) if (pt.role == 1) copies += pt.e.type == EvType::Sub ? pt.e.alt_seq : pt.e.seq;
+        for (Part& pt : parts) {
+            if (!pt.inside || pt.role != 0 || net_of(pt.e) <= 0 || copies.empty()) continue;
+            const std::string& ins = pt.e.type == EvType::Sub ? pt.e.alt_seq : pt.e.seq;
+            if (version_of(ins, copies)) { pt.role = 2; copy_net += net_of(pt.e); }
+        }
+    } else if (copy_net < 0) {
+        // beside a loss, an insertion putting back another version of what the loss took beyond its copies
+        std::string lost;
+        for (const Part& pt : parts) if (pt.role == 1 && pt.e.type != EvType::Ins) lost += pt.e.seq;
+        double excess = static_cast<double>(-copy_net) - static_cast<double>(ad) * static_cast<double>(unit);
+        std::vector<Part*> cand;
+        for (Part& pt : parts)
+            if (pt.inside && pt.role == 0 && net_of(pt.e) > 0 && pt.e.type != EvType::Del) cand.push_back(&pt);
+        std::stable_sort(cand.begin(), cand.end(), [&](const Part* a, const Part* b) { return net_of(a->e) > net_of(b->e); });
+        for (Part* pt : cand) {
+            const double b = static_cast<double>(net_of(pt->e));
+            if (excess <= 0 || b < 0.5 * excess || b > 1.25 * excess) continue;
+            if (!version_of(pt->e.type == EvType::Sub ? pt->e.alt_seq : pt->e.seq, lost)) continue;
+            pt->role = 2; copy_net += net_of(pt->e); excess -= b;
+        }
+    }
+    // the copies bounded by the walk's own module change: versions go back first, the largest first
+    const long long bound = 2 * scale;
+    while ((copy_net < 0 ? -copy_net : copy_net) > bound) {
+        Part* big = nullptr;
+        for (Part& pt : parts)
+            if (pt.role == 2 && (big == nullptr || std::llabs(net_of(pt.e)) > std::llabs(net_of(big->e)))) big = &pt;
+        if (big == nullptr) break;
+        big->role = 0; copy_net -= net_of(big->e);
+    }
+    for (Part& pt : parts) {
+        CopyForm f;
+        if (pt.role != 0 && place(pt.e, f)) { out.forms.push_back(std::move(f)); out.passes += pt.passes; }
+        else out.rest.push_back(std::move(pt.e));
+    }
+    return out;
+}
+
+
 // DEL/INS/INV of haplotype vs reference. Split both walks at shared anchors (tokens unique in both,
 // chained in monotonic order) so the quadratic DP runs only between anchors - bounds cost on huge
 // bubbles and gives identical breakpoints across haplotypes so the same event merges. CN is separate.
@@ -1212,6 +1413,10 @@ double seq_identity(const std::string& a, const std::string& b, double min_id, d
 
 // A merged event across haplotypes: a representative event + its carriers.
 struct MergedRecord {
+    // MODULE: each carrier allele's copies, as edits of the reference (split_copies), and the record's
+    // distinct forms in the order written (CN_FORMS).
+    std::unordered_map<std::size_t, std::vector<std::size_t>> allele_forms;
+    std::vector<CopyForm> forms;
     Event seed;                                             // representative (most-carried member)
     // The largest member event's size, which the --min-sv-bp filter judges a record by, so the choice of
     // representative does not change which records exist.
@@ -1551,7 +1756,7 @@ void call_variants(
                 if (k) out += ':';
                 const std::string& key = keys[k];
                 if (col.slots.size() == 1) { out += sv[0][k]; continue; }
-                if (key == "GT") {
+                if (key == "GT" || key == "CNFORM") {   // per haplotype, joined as GT is
                     for (std::size_t s = 0; s < sv.size(); ++s) { if (s) out += col.phased ? '|' : '/'; out += sv[s][k]; }
                     continue;
                 }
@@ -2029,6 +2234,7 @@ void call_variants(
         out << "##INFO=<ID=RU_LEN,Number=1,Type=Integer,Description=\"Repeat-unit length in bp, one represented copy. Emitted only for CN_METHOD=UNIT; (CN-REF_CN)*RU_LEN is the repeat-copy component of the haplotype size, while FORMAT/CNBP is the full module-walk change and CNRESID is their difference\">\n";
         out << "##INFO=<ID=CN_UNIT_BP,Number=1,Type=Integer,Description=\"CN_METHOD=MODULE only: one copy of the module, the reference's bp over its nodes divided by REF_CN; with REF_CN=0, the median over the haplotypes holding copies of their bp per copy. Copies of different types differ, so a carrier's own change is FORMAT:CNBP\">\n";
         out << "##INFO=<ID=CN_METHOD,Number=1,Type=String,Description=\"How CN was measured: UNIT (copies of a panphorte unit graph, counted exactly where they pass its anchor; a one-node unit graph's are its traversals) or MODULE (--cn: passes through the anchor of a collapsed module, the module nodes the most paths revisit)\">\n";
+        out << "##INFO=<ID=CN_FORMS,Number=.,Type=String,Description=\"CN_METHOD=MODULE: the copies carriers gained or lost, each an edit of the reference, START-END:SEQ (reference bases START..END, 1-based, replaced by SEQ in reference orientation; END=START-1 for an insertion, SEQ empty for a deletion, * where SEQ is over --max-seq-bp). FORMAT/CNFORM names each carrier's; with its other records they rebuild its walk\">\n";
         out << "##INFO=<ID=CN_MODULE_REF_BP,Number=1,Type=Integer,Description=\"Reference bp across the bubble interior, each visit counted, over which CN_METHOD=UNIT measures CNBP. On a MODULE record END-POS equals it, unless CN_SPAN_AMBIGUOUS (the span then also encloses the boundary visits between the outermost ones); on a UNIT record END covers the reference's copies, which can lie inside the interior\">\n";
         out << "##INFO=<ID=CN_ANCHOR_BP,Number=1,Type=Integer,Description=\"CN_METHOD=MODULE: bp of the module's anchor, the nodes CN counts passes through\">\n";
         out << "##INFO=<ID=CN_MODULE_NODES_BP,Number=1,Type=Integer,Description=\"CN_METHOD=MODULE: bp of the module's nodes, those some path visits more than once, one visit each\">\n";
@@ -2055,7 +2261,7 @@ void call_variants(
         out << "##ALT=<ID=DEL,Description=\"Deletion\">\n";
         out << "##ALT=<ID=INS,Description=\"Insertion\">\n";
         out << "##ALT=<ID=INV,Description=\"Inversion\">\n";
-        out << "##ALT=<ID=CNV,Description=\"Copy-number variable region (CN_METHOD=MODULE): FORMAT/CN gives each haplotype's copy number. GT is 1 where CN differs from REF_CN and the module's own nodes change by --min-sv-bp or more (FORMAT/MODBP), a gain or a loss, unless that change lies inside a larger event of the haplotype's own, whose record then holds it\">\n";
+        out << "##ALT=<ID=CNV,Description=\"Copy-number variable region (CN_METHOD=MODULE): FORMAT/CN gives each haplotype's copy number. GT is 1 where CN differs from REF_CN and the module's own nodes change by --min-sv-bp or more (FORMAT/MODBP), a gain or a loss, unless the haplotype's change beside its copies goes their way and is more than the copies (a deletion that takes a copy with it), whose record then holds it. A carrier's copies are in CN_FORMS and FORMAT/CNFORM; its other changes are in records of their own\">\n";
         out << "##ALT=<ID=CNV:TR,Description=\"Tandem-repeat copy-number variation: copies of a repeat unit (RU_LEN), counted exactly per haplotype in FORMAT/CN (CN_METHOD=UNIT)\">\n";
         out << (options.diploid
                     ? "##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Per-haplotype genotype of the sample's paths, numbered PanSN haplotypes in order joined by '|'; if the sample also has haplotypes with no number (e.g. HPRC 'U'), each of those is a slot too and every slot is joined by '/' (unphased): 1=carrier, 0=reference-like, .=no allele there (as per path), or two contigs of the haplotype cross the site with different values\">\n"
@@ -2063,6 +2269,7 @@ void call_variants(
         out << "##FORMAT=<ID=CN,Number=1,Type=Integer,Description=\"Copy number on a CNV record: copies of the repeat unit (CN_METHOD=UNIT) or of the module (MODULE). A MODULE non-carrier (GT 0) whose change a written record of its own holds reads REF_CN, so a dosage read off CN does not count it twice; any other haplotype reads its measured copies. . on other records\">\n";
         out << "##FORMAT=<ID=CNBP,Number=1,Type=Integer,Description=\"Actual linear bp gained(+)/lost(-) by this haplotype vs the reference, from the spelled walk (node length x traversal multiplicity minus the reference's): over the bubble interior on CN_METHOD=UNIT; on MODULE, from the haplotype's first to its last module node, everything walked between. Recovers the linear SV size that a one-copy unit does not convey; CNV records only.\">\n";
         out << "##FORMAT=<ID=CNRESID,Number=1,Type=Integer,Description=\"CNBP - (CN-REF_CN) copies of RU_LEN (UNIT) or CN_UNIT_BP (MODULE), with the measured CN (a MODULE non-carrier written as REF_CN keeps its own copies here): the bp this haplotype gained or lost that whole copies do NOT explain. 0 means the whole size difference is copy number; otherwise a partial copy or other sequence changed in the same site, and on MODULE also copies of another size than the reference's\">\n";
+        out << "##FORMAT=<ID=CNFORM,Number=1,Type=String,Description=\"CN_METHOD=MODULE: the copies this haplotype gained or lost, as 1-based indices into INFO/CN_FORMS, comma-joined; . for a non-carrier, or a carrier whose copies are in no change of its walk\">\n";
         out << "##FORMAT=<ID=MODBP,Number=1,Type=Integer,Description=\"CN_METHOD=MODULE: this haplotype's bp change over the module's own nodes against the reference's, each visit counted; GT 1 needs it to reach --min-sv-bp (see ALT CNV). CNBP measures over the copies with everything walked between them\">\n";
         out << "##FORMAT=<ID=CNINV,Number=1,Type=Integer,Description=\"CN_METHOD=UNIT only: how many of this haplotype's CN copies run opposite to the reference's copy of the unit (with no reference copy, to the orientation most haplotypes' copies take; when both are equally common, the haplotype's copies in its own less common orientation). 0 means every copy is in the reference orientation; a gain with CNINV above the reference's is an inverted duplication (INFO/INVDUP), and with no reference copy a haplotype holding copies in both orientations\">\n";
         if (options.diploid) {
@@ -2807,7 +3014,9 @@ void call_variants(
         // of those values (CNBP) are only measured when the record is written. Contigs that differ in GT, CN
         // or CNINV leave the slot out here; a slot of agreeing non-carrier contigs is left out too, so the AF
         // tested is never below the written one, which the final pass then tests exactly.
-        auto support_ok = [&](const MergedRecord& mr) {
+        // lowest: AN over every slot a contig of which crosses the site, so the AF tested is never above the
+        // written one (a carrier's copies are taken from its events only for a record that cannot then drop).
+        auto support_ok = [&](const MergedRecord& mr, bool lowest = false) {
             const std::unordered_set<std::string> uniq(mr.carriers.begin(), mr.carriers.end());
             if (uniq.size() < options.min_haplotypes) return false;
             if (options.min_maf > 0.0 && mr.seed.type == EvType::Dup) {
@@ -2842,7 +3051,7 @@ void call_variants(
                             agree = agree && (uniq.count(p) != 0) == carrier && value(mr.sample_cn, p) == value(mr.sample_cn, p0) &&
                                     value(mr.sample_cninv, p) == value(mr.sample_cninv, p0);
                         // a carrying contig makes the slot a carrier; non-carrier contigs count only where alone
-                        if (!carrier && (!agree || paths.size() > 1)) continue;
+                        if (!carrier && !lowest && (!agree || paths.size() > 1)) continue;
                         ++an;
                         if (carrier) ++ac;
                     }
@@ -3513,9 +3722,16 @@ void call_variants(
             e.size_bp = std::max(dl, il);
             e.seq_ins = a;
         };
-        // The module record, when this site has one: a replacement of a whole copy is split below.
+        // The module record, when this site has one: a replacement of a whole copy is split below, and each
+        // carrier's copies are told apart from its other events (split_copies).
         const MergedRecord* module_rec = nullptr;
-        for (const MergedRecord& mr : merged) if (!mr.anchor_nodes.empty()) module_rec = &mr;
+        std::size_t module_idx = SIZE_MAX;
+        for (std::size_t ri = 0; ri < merged.size(); ++ri)
+            if (!merged[ri].anchor_nodes.empty()) { module_rec = &merged[ri]; module_idx = ri; }
+        const std::unordered_set<std::string> module_gated =
+            module_rec == nullptr ? std::unordered_set<std::string>()
+                                  : std::unordered_set<std::string>(module_rec->carriers.begin(), module_rec->carriers.end());
+        std::vector<CopySplit> copy_split(alleles.size());
         run_parallel(alleles.size(), options.threads, [&](std::size_t ai) {
             if (build_walk_signature(alleles[ai].steps) == ref_sig) return;
             std::vector<Event> events;
@@ -3539,6 +3755,38 @@ void call_variants(
                                                 static_cast<long long>(cit->second) - static_cast<long long>(module_rec->seed.ref_cn),
                                                 module_rec->seed.ru_len, options.min_sv_bp, events);
                     join_copy_pieces(graph, Rdiff, Htok, module_rec->module_nodes, events, options.merge_distance_bp, options.min_sv_bp);
+                    // A carrier by the gate (CN differs, its module changes by --min-sv-bp): its copies, as edits
+                    // of the reference, and its other events.
+                    const std::string& m0 = alleles[ai].members.front();
+                    const auto bit = module_rec->sample_bp.find(m0);
+                    if (cit != module_rec->sample_cn.end() && module_gated.count(m0) && bit != module_rec->sample_bp.end()) {
+                        const auto place = [&](const Event& pc, CopyForm& f) -> bool {
+                            if (pc.r_lo == SIZE_MAX || pc.h_lo == SIZE_MAX) return false;
+                            std::vector<const Tok*> ht;
+                            for (std::size_t k = pc.h_lo; k < pc.h_hi; ++k) ht.push_back(&Htok[k]);
+                            std::string seq = ht.empty() ? std::string() : spell_toks(graph, ht);
+                            if (ref_rev) seq = reverse_complement(seq);
+                            for (char& ch : seq) ch = upper_base(ch)[0];
+                            if (pc.r_lo < pc.r_hi) {
+                                const auto sp = tok_span(Rdiff[pc.r_lo].src_idx, Rdiff[pc.r_hi - 1].src_idx);
+                                std::size_t bp = 0;
+                                for (std::size_t k = pc.r_lo; k < pc.r_hi; ++k) bp += node_len(graph, Rdiff[k].node_id);
+                                if (sp.first == 0 || sp.second + 1 - sp.first != bp) return false;   // not one stretch
+                                f.start = sp.first; f.end = sp.second;
+                            } else {
+                                if (pc.r_lo == 0) return false;
+                                const auto sp = tok_span(Rdiff[pc.r_lo - 1].src_idx, Rdiff[pc.r_lo - 1].src_idx);
+                                if (sp.first == 0) return false;
+                                const std::size_t before = ref_rev ? sp.first - 1 : sp.second;   // the base it follows
+                                f.start = before + 1; f.end = before;
+                            }
+                            f.seq = std::move(seq);
+                            return true;
+                        };
+                        copy_split[ai] = split_copies(graph, Rdiff, Htok, events, module_rec->module_nodes, module_rec->anchor_nodes,
+                                                      static_cast<long long>(cit->second) - static_cast<long long>(module_rec->seed.ref_cn),
+                                                      bit->second, module_rec->seed.ru_len, place);
+                    }
                 }
                 // An inversion is a node-level finding (the walk turns round); such an allele keeps it.
                 bool inv = false;
@@ -3551,23 +3799,6 @@ void call_variants(
                     allele_skipped_blocks[ai] = 0;
                 }
             }
-            // An insertion next to a counted loop array anchors on the reference step before the
-            // array in walk order. In a forward bubble that is the array's genomic start, the
-            // left-aligned place for content inside a tandem array and where the UNIT record sits; in
-            // a reverse bubble it is the array's end, so the same insertion would move by the array's
-            // length with the bubble's orientation. Anchor it on the far side of the array instead,
-            // which is its genomic start there too.
-            if (ref_rev) {
-                for (Event& e : events) {
-                    if (e.type != EvType::Ins || e.ref_tok_anchor == SIZE_MAX) continue;
-                    const auto it = rdiff_pos.find(e.ref_tok_anchor);
-                    if (it == rdiff_pos.end() || it->second + 1 >= Rdiff.size()) continue;
-                    const std::size_t next = Rdiff[it->second + 1].src_idx;
-                    if (next <= e.ref_tok_anchor + 1) continue;   // nothing dropped in between
-                    e.ref_tok_anchor = next - 1;
-                    e.anchor_node = ref_steps[next - 1].node_id;
-                }
-            }
             // Per-haplotype node -> first bp offset along this allele's walk, so coalescing
             // can also measure same-type-event gaps in the sample's own sequence space.
             std::unordered_map<std::string, std::size_t> hap_node_pos;
@@ -3578,42 +3809,65 @@ void call_variants(
                     off += node_len(graph, s.node_id);
                 }
             }
-            // The token->genomic resolver, so nearness is judged at the occurrence the events sit at.
-            // Aligned events need none: the alignment already made each indel one gap.
-            if (events.empty() || !events.front().seq_event) coalesce_events(graph, events, ref_node_pos, hap_node_pos, options.merge_distance_bp,
-                            [&](std::size_t t0, std::size_t t1, long long& lo, long long& hi) {
-                                const auto sp = tok_span(t0, t1);
-                                if (sp.first == 0) return false;
-                                lo = static_cast<long long>(sp.first);
-                                hi = static_cast<long long>(sp.second) + 1;   // half-open
-                                return true;
-                            });
-            for (Event& e : events) {
-                if (e.seq_event) continue;   // already placed, left-aligned
-                const long long p = ev_ref_pos(e);
-                e.ref_pos = p < 0 ? 0 : static_cast<std::size_t>(p);
-                // One exact change: a deletion or substitution whose reference tokens are exactly the
-                // bases it removes (not pieces with reference kept between), or an insertion at one point.
-                if (e.type == EvType::Del || e.type == EvType::Sub) {
-                    if (e.ref_tok_first == SIZE_MAX || e.ref_tok_last == SIZE_MAX) continue;
-                    const auto sp = tok_span(e.ref_tok_first, e.ref_tok_last);
-                    const std::size_t del = e.type == EvType::Sub ? e.del_bp : e.size_bp;
-                    if (sp.first <= ref_meta.region_start_1based || sp.second + 1 - sp.first != del) continue;
-                    e.splice_before = sp.first - 1;
-                    e.splice_del = del;
-                    if (e.type == EvType::Sub) e.splice_ins = ref_rev ? reverse_complement(e.alt_seq) : e.alt_seq;
-                    for (char& c : e.splice_ins) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
-                    e.splice_ok = !ref_genome.empty();
-                    if (e.type == EvType::Sub && e.splice_ok && !e.across_copies && !e.split_piece && !module_record) plain_indel(e);
-                } else if (e.type == EvType::Ins && e.ref_tok_anchor != SIZE_MAX) {
-                    const auto sp = tok_span(e.ref_tok_anchor, e.ref_tok_anchor);
-                    if (sp.first <= ref_meta.region_start_1based) continue;
-                    e.splice_before = ref_rev ? sp.first - 1 : sp.second;
-                    e.splice_ins = ref_rev ? reverse_complement(e.seq) : e.seq;
-                    for (char& c : e.splice_ins) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
-                    e.splice_ok = !ref_genome.empty();
+            // The events as written: placed on the reference and coalesced. A carrier's events with its copies
+            // taken out go the same way.
+            const auto finish = [&](std::vector<Event>& events) {
+                // An insertion next to a counted loop array anchors on the reference step before the
+                // array in walk order. In a forward bubble that is the array's genomic start, the
+                // left-aligned place for content inside a tandem array and where the UNIT record sits; in
+                // a reverse bubble it is the array's end, so the same insertion would move by the array's
+                // length with the bubble's orientation. Anchor it on the far side of the array instead,
+                // which is its genomic start there too.
+                if (ref_rev) {
+                    for (Event& e : events) {
+                        if (e.type != EvType::Ins || e.ref_tok_anchor == SIZE_MAX) continue;
+                        const auto it = rdiff_pos.find(e.ref_tok_anchor);
+                        if (it == rdiff_pos.end() || it->second + 1 >= Rdiff.size()) continue;
+                        const std::size_t next = Rdiff[it->second + 1].src_idx;
+                        if (next <= e.ref_tok_anchor + 1) continue;   // nothing dropped in between
+                        e.ref_tok_anchor = next - 1;
+                        e.anchor_node = ref_steps[next - 1].node_id;
+                    }
                 }
-            }
+                // The token->genomic resolver, so nearness is judged at the occurrence the events sit at.
+                // Aligned events need none: the alignment already made each indel one gap.
+                if (events.empty() || !events.front().seq_event) coalesce_events(graph, events, ref_node_pos, hap_node_pos, options.merge_distance_bp,
+                                [&](std::size_t t0, std::size_t t1, long long& lo, long long& hi) {
+                                    const auto sp = tok_span(t0, t1);
+                                    if (sp.first == 0) return false;
+                                    lo = static_cast<long long>(sp.first);
+                                    hi = static_cast<long long>(sp.second) + 1;   // half-open
+                                    return true;
+                                });
+                for (Event& e : events) {
+                    if (e.seq_event) continue;   // already placed, left-aligned
+                    const long long p = ev_ref_pos(e);
+                    e.ref_pos = p < 0 ? 0 : static_cast<std::size_t>(p);
+                    // One exact change: a deletion or substitution whose reference tokens are exactly the
+                    // bases it removes (not pieces with reference kept between), or an insertion at one point.
+                    if (e.type == EvType::Del || e.type == EvType::Sub) {
+                        if (e.ref_tok_first == SIZE_MAX || e.ref_tok_last == SIZE_MAX) continue;
+                        const auto sp = tok_span(e.ref_tok_first, e.ref_tok_last);
+                        const std::size_t del = e.type == EvType::Sub ? e.del_bp : e.size_bp;
+                        if (sp.first <= ref_meta.region_start_1based || sp.second + 1 - sp.first != del) continue;
+                        e.splice_before = sp.first - 1;
+                        e.splice_del = del;
+                        if (e.type == EvType::Sub) e.splice_ins = ref_rev ? reverse_complement(e.alt_seq) : e.alt_seq;
+                        for (char& c : e.splice_ins) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+                        e.splice_ok = !ref_genome.empty();
+                        if (e.type == EvType::Sub && e.splice_ok && !e.across_copies && !e.split_piece && !module_record) plain_indel(e);
+                    } else if (e.type == EvType::Ins && e.ref_tok_anchor != SIZE_MAX) {
+                        const auto sp = tok_span(e.ref_tok_anchor, e.ref_tok_anchor);
+                        if (sp.first <= ref_meta.region_start_1based) continue;
+                        e.splice_before = ref_rev ? sp.first - 1 : sp.second;
+                        e.splice_ins = ref_rev ? reverse_complement(e.seq) : e.seq;
+                        for (char& c : e.splice_ins) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+                        e.splice_ok = !ref_genome.empty();
+                    }
+                }
+            };
+            finish(events);
+            if (copy_split[ai].mode == CopySplit::Copies) finish(copy_split[ai].rest);
             allele_events[ai] = std::move(events);
         });
         std::unordered_set<std::string> unaligned_haps;
@@ -3622,6 +3876,64 @@ void call_variants(
             summary.skipped_large_segments += allele_skipped_blocks[ai];
         }
         if (!unaligned_haps.empty()) summary.unaligned_bubbles.push_back(bubble.id);
+        // A module record's carriers are the haplotypes whose copy change is copies; one whose change is a larger
+        // event of its own leaves it (GT 0, its CN set where the record is written). The carriers' copies go to
+        // the record, as its forms, and their other events on to the merge -- only when the record holds with
+        // its carriers left: tested on the lowest AF it can be written with, so the filters run at writing
+        // cannot drop it and the copies with it. Otherwise no carrier's copies are taken from its events.
+        if (module_rec != nullptr) {
+            MergedRecord& d = merged[module_idx];
+            std::unordered_map<std::string, std::size_t> allele_of;
+            for (std::size_t ai = 0; ai < alleles.size(); ++ai)
+                for (const std::string& m : alleles[ai].members) allele_of.emplace(m, ai);
+            MergedRecord probe;
+            probe.seed.type = EvType::Dup;
+            probe.sample_cn = d.sample_cn;
+            for (const std::string& c : d.carriers) {
+                const auto it = allele_of.find(c);
+                if (it != allele_of.end() && copy_split[it->second].mode == CopySplit::OwnEvent) { ++summary.copy_own_event; continue; }
+                probe.carriers.push_back(c);
+            }
+            if (!probe.carriers.empty() && support_ok(probe, true)) {
+                d.carriers = probe.carriers;
+                std::map<std::tuple<std::size_t, std::size_t, std::string>, std::size_t> form_idx;
+                for (std::size_t ai = 0; ai < alleles.size(); ++ai) {
+                    CopySplit& cs = copy_split[ai];
+                    if (cs.mode != CopySplit::Copies) continue;
+                    summary.copy_carriers += alleles[ai].members.size();
+                    if (cs.forms.empty()) summary.copy_no_form += alleles[ai].members.size();
+                    const auto cit = d.sample_cn.find(alleles[ai].members.front());
+                    const long long delta = cit == d.sample_cn.end() ? 0 :
+                        static_cast<long long>(cit->second) - static_cast<long long>(d.seed.ref_cn);
+                    if (!cs.forms.empty() && cs.passes != delta) summary.copy_pass_off += alleles[ai].members.size();
+                    std::vector<std::size_t>& fi = d.allele_forms[ai];
+                    for (CopyForm& f : cs.forms) {
+                        const auto [it, fresh] = form_idx.try_emplace({f.start, f.end, f.seq}, d.forms.size());
+                        if (fresh) d.forms.push_back(std::move(f));
+                        fi.push_back(it->second);
+                    }
+                    allele_events[ai] = std::move(cs.rest);
+                }
+                // forms in reference order, so CN_FORMS does not depend on the order alleles came in
+                std::vector<std::size_t> order(d.forms.size()), rank(d.forms.size());
+                for (std::size_t k = 0; k < order.size(); ++k) order[k] = k;
+                std::sort(order.begin(), order.end(), [&](std::size_t x, std::size_t y) {
+                    return std::tie(d.forms[x].start, d.forms[x].end, d.forms[x].seq) <
+                           std::tie(d.forms[y].start, d.forms[y].end, d.forms[y].seq); });
+                std::vector<CopyForm> sorted;
+                for (std::size_t k = 0; k < order.size(); ++k) { rank[order[k]] = k; sorted.push_back(std::move(d.forms[order[k]])); }
+                d.forms = std::move(sorted);
+                for (auto& [ai, fi] : d.allele_forms) {
+                    for (std::size_t& k : fi) k = rank[k];
+                    std::sort(fi.begin(), fi.end());
+                }
+            } else {
+                // no carrier's copies leave its events: the record is not written
+                dropped_modules.push_back(std::move(d));
+                merged.erase(merged.begin() + static_cast<std::ptrdiff_t>(module_idx));
+                module_rec = nullptr;
+            }
+        }
         // The reference bases each allele deletes, [first, last] genomic, from its exact deletions and
         // substitutions: a haplotype whose own larger deletion takes in a record's bases has no allele at that
         // record, and is written GT '.' there rather than 0 (see covered_here). Not at a collapsed module,
@@ -4017,316 +4329,6 @@ void call_variants(
                 }
             }
         });
-
-        // ---- Count a copy change once. A copy gained or lost is seen twice: the module DUP counts
-        // it, and the walk diff can also type the extra or missing copy as an INS or DEL, which describe
-        // then turns into a second association row. The decision is made per carrier, not per record: a
-        // haplotype leaves an INS/DEL only when its own copy change, in the event's direction, accounts
-        // for the event's size against its own net change (CNBP). The record goes only when no carrier is
-        // left. A record-level rule would both let multi-copy restatements through and drop whole records
-        // whose carriers are not copy changes at all.
-        //   - A substitution's two arms are one unit, their sizes netted.
-        //   - Only an event holding a copy of the module's anchor restates a copy; the carrier's other
-        //     events on the module's nodes are part of its change and come off it, so a copy deletion
-        //     explains the loss while a smaller deletion inside a remaining copy stays.
-        //   - Up to |copy change| units, each the one fitting a whole number of the copies still
-        //     unexplained best, between half of its share and all of the change (+25%).
-        //   - A carrier whose copy change lies inside a larger anchor-holding event of its own is that
-        //     event's carrier: it leaves the DUP (GT 0, CN written as REF_CN, as that event holds its change),
-        //     and a DUP left with no carrier goes.
-        //   - Only against DUPs that survive the tangle/oversize gate, so a suppressed DUP does not take
-        //     its events with it.
-        // The measured CN and CNBP are untouched; a non-carrier's FORMAT/CN is set where the record is written.
-        if (options.cn) {
-            std::unordered_map<std::string, std::size_t> s2a;
-            for (std::size_t ai = 0; ai < alleles.size(); ++ai)
-                for (const std::string& m : alleles[ai].members) s2a[m] = ai;
-            auto own_size = [&](const MergedRecord& r, const std::string& m) -> std::size_t {
-                const auto it = s2a.find(m);
-                if (it == s2a.end()) return r.seed.size_bp;
-                const auto ms = r.member_size.find(it->second);
-                return ms == r.member_size.end() ? r.seed.size_bp : ms->second;
-            };
-            // module DUPs (only records that pass the tangle/oversize/support gates exist)
-            std::vector<std::size_t> mds;
-            for (std::size_t ri = 0; ri < merged.size(); ++ri)
-                if (merged[ri].seed.type == EvType::Dup && is_module_cn(merged[ri].seed.cn_method)) mds.push_back(ri);
-            if (!mds.empty()) {
-                // per carrier: its events as units, a substitution by its net change, with the nodes of the
-                // carrier's own event (its member event, else the record's)
-                struct U {
-                    long long signed_bp = 0;
-                    std::vector<std::size_t> recs;
-                    std::unordered_set<std::string> nodes;
-                    std::string del_seq, ins_seq;   // the bases its events remove and add (walk orientation)
-                };
-                std::unordered_map<std::string, std::map<std::string, U>> per;
-                for (std::size_t ri = 0; ri < merged.size(); ++ri) {
-                    const MergedRecord& r = merged[ri];
-                    if (r.seed.type != EvType::Ins && r.seed.type != EvType::Del && r.seed.type != EvType::Sub) continue;
-                    const long long sg = r.seed.type == EvType::Ins ? 1 : -1;
-                    std::unordered_set<std::string> seen;
-                    for (const std::string& m : r.carriers) {
-                        if (!seen.insert(m).second) continue;
-                        U& u = per[m]["#" + std::to_string(ri)];
-                        // A substitution member by its own net change. Beside a module record events are node
-                        // events, which merge only with their own type, so every member of a substitution
-                        // record is a substitution and has its net change.
-                        const auto it = s2a.find(m);
-                        const auto mn = it == s2a.end() ? r.member_net.end() : r.member_net.find(it->second);
-                        if (mn != r.member_net.end()) u.signed_bp += mn->second;
-                        else u.signed_bp += sg * static_cast<long long>(own_size(r, m));
-                        const auto me = it == s2a.end() ? r.member_event.end() : r.member_event.find(it->second);
-                        const auto add_seqs = [&u](const Event& e) {
-                            if (e.type == EvType::Ins) u.ins_seq += e.seq;
-                            else if (e.type == EvType::Del) u.del_seq += e.seq;
-                            else if (e.type == EvType::Sub) { u.del_seq += e.seq; u.ins_seq += e.alt_seq; }
-                        };
-                        if (me != r.member_event.end())
-                            for (const Event& e : me->second) { u.nodes.insert(e.nodes.begin(), e.nodes.end()); add_seqs(e); }
-                        else {
-                            u.nodes.insert(r.seed.nodes.begin(), r.seed.nodes.end());
-                            add_seqs(r.seed);
-                        }
-                        u.recs.push_back(ri);
-                    }
-                }
-                auto touches = [](const U& u, const std::unordered_set<std::string>& set) {
-                    for (const std::string& n : u.nodes) if (set.count(n)) return true;
-                    return false;
-                };
-                std::vector<std::unordered_set<std::string>> drop(merged.size());
-                std::vector<std::unordered_set<std::string>> not_cn(merged.size());   // module carriers given up
-                // The record's carriers. Only their copy changes are reported by it: a haplotype left out of them
-                // (its module changes by under --min-sv-bp) keeps the events that hold its change.
-                std::unordered_map<const MergedRecord*, std::unordered_set<std::string>> cn_carriers;
-                for (const std::size_t di : mds)
-                    cn_carriers[&merged[di]].insert(merged[di].carriers.begin(), merged[di].carriers.end());
-                // A carrier's copy change on a module record: delta (copies) and cb (the module's own bp change).
-                const auto copy_change = [&](const MergedRecord& d, const std::string& m, long long& delta, long long& cb) {
-                    if (!cn_carriers[&d].count(m)) return false;
-                    const auto cit = d.sample_cn.find(m);
-                    if (cit == d.sample_cn.end()) return false;
-                    delta = static_cast<long long>(cit->second) - static_cast<long long>(d.seed.ref_cn);
-                    if (delta == 0) return false;
-                    const auto bit = d.sample_bp.find(m);
-                    cb = bit == d.sample_bp.end() ? 0 : bit->second;
-                    return true;
-                };
-                // First, the carriers each module record gives up, so a record that then falls under the carrier
-                // filters explains nothing: its copy changes are reported by the events it would have taken.
-                for (auto& [m, units] : per) {
-                    for (const std::size_t di : mds) {
-                        const MergedRecord& d = merged[di];
-                        long long delta = 0, cb = 0;
-                        if (!copy_change(d, m, delta, cb)) continue;
-                        // An event restates the copy change only if it holds a copy of what CN counts, the anchor:
-                        // a duplication of other content beside the module is its own event. The carrier's other
-                        // changes on the module's nodes are part of the module's change and come off it (a
-                        // deletion inside a remaining copy); changes elsewhere in the site are not part of it.
-                        // A carrier whose copy change lies inside a larger change of its own (an anchor-holding
-                        // event over 1.25x the module's whole change) is that event's carrier, not a copy-number one,
-                        // such as a large deletion that takes a short module copy with it.
-                        // An event is judged against the larger of the module change it would explain and the copies
-                        // changed times one copy (CN_UNIT_BP): another event of the carrier only partly on the
-                        // module's nodes comes off the change whole, which can leave it short of the copy.
-                        const double copy_bp = static_cast<double>(std::llabs(delta)) * static_cast<double>(d.seed.ru_len);
-                        bool inside_larger = false;
-                        for (const auto& [k, u] : units) {
-                            if (u.signed_bp * delta <= 0 || !touches(u, d.anchor_nodes)) continue;
-                            long long others = 0;
-                            for (const auto& [k2, u2] : units)
-                                if (k2 != k && touches(u2, d.module_nodes)) others += u2.signed_bp;
-                            const long long T = cb - others;   // the copy change this event would have to explain
-                            const double scale = std::max(T * delta > 0 ? static_cast<double>(std::llabs(T)) : 0.0, copy_bp);
-                            if (static_cast<double>(std::llabs(u.signed_bp)) > 1.25 * scale) inside_larger = true;
-                        }
-                        if (inside_larger) not_cn[di].insert(m);
-                    }
-                }
-                std::vector<char> survives(merged.size(), 1);
-                for (const std::size_t di : mds) {
-                    if (not_cn[di].empty()) continue;
-                    MergedRecord probe;
-                    probe.seed.type = EvType::Dup;
-                    for (const std::string& c : merged[di].carriers) if (!not_cn[di].count(c)) probe.carriers.push_back(c);
-                    survives[di] = !probe.carriers.empty() && support_ok(probe);
-                }
-                for (auto& [m, units] : per) {
-                    for (const std::size_t di : mds) {
-                        const MergedRecord& d = merged[di];
-                        if (!survives[di] || not_cn[di].count(m)) continue;
-                        long long delta = 0, cb = 0;
-                        if (!copy_change(d, m, delta, cb)) continue;
-                        const double copy_bp = static_cast<double>(std::llabs(delta)) * static_cast<double>(d.seed.ru_len);
-                        // Up to |delta| units; each the anchor-holding event in the copy change's direction nearest a
-                        // whole number of copies, between 1/r of the change still unexplained and all of it (+25%;
-                        // r = copies left).
-                        std::set<std::string> dropped;
-                        long long dropped_sum = 0;
-                        bool any = false;
-                        const long long ad = std::llabs(delta);
-                        for (long long i = 0; i < ad; ++i) {
-                            const std::string* best = nullptr; double best_err = 0.0;
-                            for (const auto& [k, u] : units) {
-                                if (dropped.count(k) || u.signed_bp * delta <= 0 || !touches(u, d.anchor_nodes)) continue;
-                                long long others = 0;
-                                for (const auto& [k2, u2] : units)
-                                    if (k2 != k && !dropped.count(k2) && touches(u2, d.module_nodes)) others += u2.signed_bp;
-                                const long long T = cb - dropped_sum - others;
-                                if (T * delta <= 0) continue;
-                                const double aT = static_cast<double>(std::llabs(T));
-                                const double rr = static_cast<double>(ad - i);
-                                const double ub = static_cast<double>(std::llabs(u.signed_bp));
-                                if (ub < 0.5 * aT / rr || ub > 1.25 * std::max(aT, copy_bp * rr / static_cast<double>(ad))) continue;
-                                // in copies of the module: the change still unexplained can be skewed by another event
-                                // only partly on the module's nodes (taken off it whole)
-                                const double c = ub / std::max(1.0, static_cast<double>(d.seed.ru_len));
-                                const double err = std::fabs(c - std::max(1.0, std::round(c)));
-                                if (best == nullptr || err < best_err) { best = &k; best_err = err; }
-                            }
-                            if (best == nullptr) break;
-                            dropped.insert(*best);
-                            dropped_sum += units[*best].signed_bp;
-                            for (std::size_t ri : units[*best].recs) drop[ri].insert(m);
-                            any = true;
-                        }
-                        // Beside a copy loss, a deletion that took more than the copies lost can be followed by an
-                        // insertion putting that much back as another version of it (a remaining copy carrying another
-                        // version of a segment the lost one held): such an insertion is part of the copy change. Each
-                        // one is between half and all (+25%) of the excess still unexplained, largest first.
-                        if (any && delta < 0) {
-                            std::string lost;
-                            for (const std::string& k : dropped) lost += units[k].del_seq;
-                            double excess = static_cast<double>(-dropped_sum) - copy_bp;
-                            std::vector<std::pair<long long, const std::string*>> cand;
-                            for (const auto& [k, u] : units)
-                                if (!dropped.count(k) && u.signed_bp > 0 && !u.ins_seq.empty()) cand.emplace_back(u.signed_bp, &k);
-                            std::sort(cand.begin(), cand.end(), [](const auto& a, const auto& b) {
-                                return a.first != b.first ? a.first > b.first : *a.second < *b.second; });
-                            for (const auto& [bp, k] : cand) {
-                                const double b = static_cast<double>(bp);
-                                if (excess <= 0 || b < 0.5 * excess || b > 1.25 * excess) continue;
-                                if (!version_of(units[*k].ins_seq, lost)) continue;
-                                for (std::size_t ri : units[*k].recs) drop[ri].insert(m);
-                                excess -= b;
-                            }
-                        }
-                        // Without panphorte's unit-graph table, a folded repeat's copy change can be spelled as a
-                        // larger change one way and whole copies the other (+6 copies inserted, -2 deleted for +4), or
-                        // only as whole copies against it where the rest was too large to align. An event holding the
-                        // anchor that is whole copies (within 0.15 of one) is part of the copy change, so it goes
-                        // too. A run with the table never gets here, and a partial-copy event stays.
-                        if (options.unit_graph_tsv.empty() && d.seed.ru_len > 0) {
-                            const double unit = static_cast<double>(d.seed.ru_len);
-                            for (const auto& [k, u] : units) {
-                                if (dropped.count(k) || !touches(u, d.anchor_nodes)) continue;
-                                const double x = static_cast<double>(u.signed_bp) / unit;
-                                if (std::llround(x) == 0 || std::fabs(x - std::round(x)) > 0.15) continue;
-                                for (std::size_t ri : u.recs) drop[ri].insert(m);
-                                any = true;
-                            }
-                        }
-                        if (any) break;
-                    }
-                }
-                // module carriers whose copy change another event of theirs describes: GT 0 (CN written as REF_CN);
-                // a record left with no carrier goes
-                for (const std::size_t di : mds) {
-                    if (not_cn[di].empty()) continue;
-                    std::vector<std::string> nc;
-                    for (const std::string& m : merged[di].carriers) if (!not_cn[di].count(m)) nc.push_back(m);
-                    merged[di].carriers = std::move(nc);
-                    if (merged[di].carriers.empty()) drop[di].insert("\x01");   // the whole record
-                }
-                std::vector<MergedRecord> kept;
-                for (std::size_t ri = 0; ri < merged.size(); ++ri) {
-                    MergedRecord& r = merged[ri];
-                    if (!drop[ri].empty()) {
-                        std::vector<std::string> nc;
-                        for (const std::string& m : r.carriers) if (!drop[ri].count(m)) nc.push_back(m);
-                        if (nc.empty()) {
-                            if (!r.anchor_nodes.empty()) dropped_modules.push_back(std::move(r));
-                            continue;
-                        }
-                        std::unordered_set<std::string> keepm(nc.begin(), nc.end());
-                        std::unordered_set<std::size_t> ma;
-                        for (std::size_t ai : r.member_alleles) {
-                            bool keep_ai = false;
-                            for (const std::string& m : alleles[ai].members) if (keepm.count(m)) keep_ai = true;
-                            if (keep_ai) ma.insert(ai);
-                        }
-                        // aggregates over the members that remain
-                        r.min_size_bp = r.max_size_bp = 0;
-                        bool first = true;
-                        for (std::size_t ai : ma) {
-                            const auto ms = r.member_size.find(ai);
-                            const std::size_t sz = ms == r.member_size.end() ? r.seed.size_bp : ms->second;
-                            if (first) { r.min_size_bp = r.max_size_bp = sz; first = false; }
-                            else { r.min_size_bp = std::min(r.min_size_bp, sz); r.max_size_bp = std::max(r.max_size_bp, sz); }
-                        }
-                        // The size filter follows the largest member that remains, whoever represents the
-                        // record: kept on a removed member's size, a record whose remaining members are all
-                        // under --min-sv-bp would be written.
-                        if (!first) r.filter_bp = r.max_size_bp;
-                        // The representative must be an event some remaining carrier holds; when its own
-                        // carriers were all removed, choose again among the remaining members' own events
-                        // (the one each contributed: same type, its member size), by the merge's rule --
-                        // carried by the most remaining haplotypes, then largest, then content. The size
-                        // filter follows the largest of them, as it follows the largest member above.
-                        {
-                            bool rep_held = false;
-                            std::vector<std::pair<const Event*, std::size_t>> own;   // event, its allele
-                            for (std::size_t ai : ma) {
-                                const auto ms = r.member_size.find(ai);
-                                for (const Event& e : allele_events[ai]) {
-                                    const bool mixed = e.seq_event && r.seed.seq_event && e.type != EvType::Inv &&
-                                                       (e.type == EvType::Sub || r.seed.type == EvType::Sub);
-                                    if (e.type != r.seed.type && !mixed) continue;
-                                    if (e.size_bp == r.seed.size_bp && e.seq == r.seed.seq && e.alt_seq == r.seed.alt_seq && e.ref_pos == r.seed.ref_pos) rep_held = true;
-                                    if (ms != r.member_size.end() && e.size_bp == ms->second) { own.emplace_back(&e, ai); break; }
-                                }
-                            }
-                            if (!rep_held && !own.empty()) {
-                                auto haps = [&](const Event* e) {
-                                    std::size_t n = 0;
-                                    for (const auto& [o, ai] : own)
-                                        if (o->ref_pos == e->ref_pos && o->size_bp == e->size_bp && o->seq == e->seq && o->alt_seq == e->alt_seq) n += alleles[ai].members.size();
-                                    return n;
-                                };
-                                const auto first_carrier = [&](std::size_t ai) {
-                                    return *std::min_element(alleles[ai].members.begin(), alleles[ai].members.end());
-                                };
-                                const Event* bestp = own.front().first;
-                                std::size_t best_ai = own.front().second;
-                                r.filter_bp = 0;
-                                for (const auto& [e, ai] : own) {
-                                    r.filter_bp = std::max(r.filter_bp, e->size_bp);
-                                    bool better;
-                                    const bool se = e->size_bp >= options.min_sv_bp, sb = bestp->size_bp >= options.min_sv_bp;
-                                    if (se != sb) better = se;
-                                    else if (haps(e) != haps(bestp)) better = haps(e) > haps(bestp);
-                                    else if (e->seq_event != bestp->seq_event) better = e->seq_event;
-                                    else if (e->size_bp != bestp->size_bp) better = e->size_bp > bestp->size_bp;
-                                    else if (e->ref_pos != bestp->ref_pos) better = e->ref_pos < bestp->ref_pos;
-                                    else if (e->seq != bestp->seq) better = e->seq < bestp->seq;
-                                    else if (e->alt_seq != bestp->alt_seq) better = e->alt_seq < bestp->alt_seq;
-                                    // the same content on different nodes: as in the merge, by first carrier
-                                    else if (ai != best_ai) better = first_carrier(ai) < first_carrier(best_ai);
-                                    else better = e->nodes < bestp->nodes;
-                                    if (better) { bestp = e; best_ai = ai; }
-                                }
-                                r.seed = *bestp;
-                            }
-                        }
-                        r.member_alleles = std::move(ma);
-                        r.carriers = std::move(nc);
-                    }
-                    kept.push_back(std::move(r));
-                }
-                merged = std::move(kept);
-            }
-        }
 
         // ---- Keep records reaching min_sv_bp (by their largest member) and --min-haplotypes.
         {
@@ -5193,6 +5195,14 @@ void call_variants(
             // paralog-private content that travels with each copy but that the reference does not revisit,
             // which one copy's shared part (CN_UNIT_BP) leaves out.
             if (is_dup && cnbp_ref_bp > 0) info << ";CN_MODULE_REF_BP=" << cnbp_ref_bp;
+            const bool with_forms = is_dup && is_module_cn(e.cn_method) && !mr.forms.empty();
+            if (with_forms) {
+                info << ";CN_FORMS=";
+                for (std::size_t k = 0; k < mr.forms.size(); ++k) {
+                    const CopyForm& f = mr.forms[k];
+                    info << (k ? "," : "") << f.start << '-' << f.end << ':' << (seq_fits(f.seq.size()) ? f.seq : std::string("*"));
+                }
+            }
             auto sample_cnbp = [&](const std::string& s) -> long long {
                 if (!mr.sample_copies_bp.empty()) {
                     const auto it = mr.sample_copies_bp.find(s);
@@ -5224,7 +5234,8 @@ void call_variants(
                                   : e.cn_method == CnMethod::Module && e.ru_len > 0
                                       ? "\tGT:CN:CNBP:CNRESID:MODBP"
                                       : is_module_cn(e.cn_method) ? "\tGT:CN:CNBP:MODBP" : "\tGT:CN:CNBP")
-                           : "\tGT:CN");
+                           : "\tGT:CN")
+                << (with_forms ? ":CNFORM" : "");
             std::vector<OutRecord::CnHeld> held_fix;
             std::vector<std::vector<const MergedRecord*>> held_ptrs;
             for (const std::string& s : sample_names) {
@@ -5264,6 +5275,7 @@ void call_variants(
                             m << ':' << (sample_cnbp(s) - (static_cast<long long>(cit->second) - static_cast<long long>(e.ref_cn)) *
                                                           static_cast<long long>(e.ru_len));
                         m << ':' << modbp;
+                        if (with_forms) m << ":.";
                         OutRecord::CnHeld h;
                         h.col = 9 + static_cast<std::size_t>(&s - sample_names.data());
                         h.measured = m.str();
@@ -5284,6 +5296,14 @@ void call_variants(
                         row << ':' << (this_cnbp - predicted);
                     }
                     if (is_module_cn(e.cn_method)) row << ':' << modbp;
+                    if (with_forms) {
+                        std::string fs;
+                        const auto ait = sample_to_allele.find(s);
+                        const auto fit = !carrier || ait == sample_to_allele.end() ? mr.allele_forms.end() : mr.allele_forms.find(ait->second);
+                        if (fit != mr.allele_forms.end())
+                            for (std::size_t k = 0; k < fit->second.size(); ++k) fs += (k ? "," : "") + std::to_string(fit->second[k] + 1);
+                        row << ':' << (fs.empty() ? std::string(".") : fs);
+                    }
                     if (e.cn_method == CnMethod::Unit && e.ru_len > 0) {
                         const auto iit = mr.sample_cninv.find(s);
                         row << ':' << (iit == mr.sample_cninv.end() ? std::string(".")
@@ -5354,15 +5374,18 @@ void call_variants(
                                     ev.seq_before + ev.del_bp, ".", ev.seq_ins);
                     if (kind == nullptr || ai >= alleles.size()) return unresolved;
                     if (ev.split_piece) {
-                        const std::string ev_bp = std::to_string(ev.type == EvType::Ins ? static_cast<long long>(ev.size_bp)
-                                                                                      : -static_cast<long long>(ev.size_bp));
+                        const std::string ev_bp = std::to_string(
+                            ev.type == EvType::Ins ? static_cast<long long>(ev.size_bp)
+                            : ev.type == EvType::Sub ? static_cast<long long>(ev.ins_bp) - static_cast<long long>(ev.del_bp)
+                                                     : -static_cast<long long>(ev.size_bp));
                         std::size_t rs = 0, re = 0;
                         if (ev.type == EvType::Ins) {
                             if (ev.ref_tok_anchor == SIZE_MAX || !insertion_at(ev.ref_tok_anchor, rs, re)) return unresolved;
                             return body(kind, rs, re, ".", fwd(ev.seq), ".", ev_bp);
                         }
                         const auto sp = tok_span(std::min(ev.ref_tok_first, ev.ref_tok_last), std::max(ev.ref_tok_first, ev.ref_tok_last));
-                        return sp.first == 0 ? unresolved : body(kind, sp.first, sp.second, ".", "", ".", ev_bp);
+                        return sp.first == 0 ? unresolved
+                                             : body(kind, sp.first, sp.second, ".", ev.type == EvType::Sub ? fwd(ev.alt_seq) : "", ".", ev_bp);
                     }
                     std::size_t lo_ref, hi_ref;   // the event's reference steps; an insertion has none
                     if (ev.type == EvType::Ins) {
@@ -5581,6 +5604,10 @@ void call_variants(
         summary.tangle_ids.insert(summary.tangle_ids.end(), bo.sum.tangle_ids.begin(), bo.sum.tangle_ids.end());
         summary.oversized_ids.insert(summary.oversized_ids.end(), bo.sum.oversized_ids.begin(), bo.sum.oversized_ids.end());
         summary.skipped_large_segments += bo.sum.skipped_large_segments;
+        summary.copy_carriers += bo.sum.copy_carriers;
+        summary.copy_own_event += bo.sum.copy_own_event;
+        summary.copy_no_form += bo.sum.copy_no_form;
+        summary.copy_pass_off += bo.sum.copy_pass_off;
         // Every per-bubble counter has to be carried over here, or the run summary never reports it.
         summary.multi_crossing_bubbles += bo.sum.multi_crossing_bubbles;
         summary.multi_crossing_paths += bo.sum.multi_crossing_paths;
