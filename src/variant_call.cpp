@@ -1138,10 +1138,10 @@ CopySplit split_copies(const Graph& graph, const std::vector<Tok>& R, const std:
         c.r2 = rspan ? clampi(rb + 1, e.r_lo, e.r_hi) : e.r_hi;
         c.h1 = hspan ? clampi(ha, e.h_lo, e.h_hi) : e.h_lo;
         c.h2 = hspan ? clampi(hb + 1, e.h_lo, e.h_hi) : e.h_hi;
-        // inside on a side: its tokens there, or an empty side that sits between two tokens of the span
-        const bool r_in = c.r1 < c.r2 || (e.r_lo == e.r_hi && (!rspan || in_copy_span(e.r_lo, e.r_hi, ra, rb)));
-        const bool h_in = c.h1 < c.h2 || (e.h_lo == e.h_hi && (!hspan || in_copy_span(e.h_lo, e.h_hi, ha, hb)));
-        c.touches = (c.r1 < c.r2 || c.h1 < c.h2) || (r_in && h_in);
+        // It touches the copies by its tokens inside a walk's copy span. A walk with no module node has no copy
+        // span and is not cut: the event's tokens there go with whatever it touches on the other walk, and do
+        // not make it touch, so a change elsewhere in the site stays out of the copies.
+        c.touches = (rspan && c.r1 < c.r2) || (hspan && c.h1 < c.h2);
         if (c.touches) S += net_of(e);
     }
     const long long off = S - module_bp;

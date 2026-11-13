@@ -1089,6 +1089,16 @@ check "copies: sequence in place of the first copy's module nodes is in the copi
 python3 -I "$(cd "$(dirname "$0")/.." && pwd)/tools/spec_gfa.py" "$OUT/sepbar.spec" "$OUT/sepbar"
 cn_call "$OUT/sepbar/g.gfa" "$OUT/sepbar"
 check "copies: deletions either side of a lost copy are not joined across it (hc records)" "$(hrec "$OUT/sepbar.region.vcf" 'hc#1#chr1')" "1:2"
+# No reference copy: hsub gains a copy of A B (300 bp) and, past C, replaces M (1000 bp) by N (2000 bp). The
+# replacement is apart from the copies and does not make the gain an event of its own.
+{ printf 'N L 2000 91\nN A 150 92\nN B 150 93\nN C 30 94\nN M 1000 96\nN N 2000 97\nN R 2000 95\nP ref#0#chr1:0-5030 L+,C+,M+,R+\n'
+  for i in 1 2 3 4; do printf 'P hone%s#1#chr1 L+,A+,B+,C+,M+,R+\n' "$i"; done
+  printf 'P htwo#1#chr1 L+,A+,B+,A+,B+,C+,M+,R+\nP hsub#1#chr1 L+,A+,B+,C+,N+,R+\nB L R A;B;C;M;N\n'
+  for i in 1 2 3 4 5 6; do printf 'P hr%s#1#chr1 L+,C+,M+,R+\n' "$i"; done; } > "$OUT/sepoff.spec"
+python3 -I "$(cd "$(dirname "$0")/.." && pwd)/tools/spec_gfa.py" "$OUT/sepoff.spec" "$OUT/sepoff"
+"$BIN" call -i "$OUT/sepoff/g.gfa" -c "$OUT/sepoff/g.bubbles.csv" -r ref -o "$OUT/sepoff" --cn --quiet >/dev/null 2>&1
+check "copies, no reference copy: a replacement elsewhere in the site leaves a gain a carrier (hsub records)" \
+  "$(hrec "$OUT/sepoff.region.vcf" 'hsub#1#chr1')" "1:1 INS:1000"
 # --diploid: hhalf and heq as one sample; each haplotype's copies are listed, joined as GT is.
 sed -e 's/^P hhalf#1#chr1 /P s9#1#chr1 /' -e 's/^P heq#1#chr1 /P s9#2#chr1 /' "$OUT/sep.spec" > "$OUT/sepdip.spec"
 python3 -I "$(cd "$(dirname "$0")/.." && pwd)/tools/spec_gfa.py" "$OUT/sepdip.spec" "$OUT/sepdip"
