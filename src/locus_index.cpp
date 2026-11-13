@@ -42,8 +42,9 @@ constexpr std::uint64_t kVersion = 10;   // 2: decoy windows stop at the locus; 
 const std::size_t kLengths[] = {100, 150, 250, 1000, 10000};
 constexpr std::size_t kWindowStep = 25;
 // A stretch of a genome is a piece of the locus when, over every window of this many bases in it, this
-// share of the k-mer starts are locus k-mers: a held-out haplotype's new alleles (about one per kb) leave
-// about 97%, a paralog at 99% identity about 70%.
+// share of the k-mer starts are locus k-mers (a held-out haplotype's new alleles, about one per kb, leave
+// about 97%) and it is tied to the locus (see the piece scan): a close paralog, or one whose differences
+// cluster, can be as dense.
 constexpr std::uint64_t kPieceWindow = 5000;
 constexpr double kPieceDensity = 0.95;
 // A locus is looked for in every genome when this share of its k-mers are tandem (this many copies or more
@@ -516,8 +517,9 @@ std::vector<LocusIndex> build(const BuildOptions& o) {
     // the reference's) may go on past that end on its contig. A locus whose tandem k-mers are often left with a
     // few copies outside the located ones has such pieces next to copies that look whole (an array contig of
     // its own): every genome is scanned for it. A scanned genome, or contig, is searched for stretches dense in
-    // the locus's k-mers: their k-mers off the located copies are subtracted, and those in a copy's uncertain
-    // ends are the locus, so no longer uncertain.
+    // the locus's k-mers and tied to it (on a located copy's contig, or reaching a contig end): their k-mers off
+    // the located copies are subtracted, and those in a copy's uncertain ends are the locus, so no longer
+    // uncertain.
     {
         std::vector<char> everywhere(work.size(), 0);
         for (std::size_t li = 0; li < work.size(); ++li) {
@@ -642,6 +644,11 @@ std::vector<LocusIndex> build(const BuildOptions& o) {
                 if (it != w.spans.end()) for (const auto& sp : it->second) if (sp.contig == name) own.push_back(&sp);
                 for (const auto& stretch : dense) {
                     const std::uint64_t a = stretch.first, b = stretch.second;
+                    // only a stretch tied to the locus is a piece: on a contig of a located copy, or reaching a
+                    // contig end (an array broken across contigs, a stub, a contig of its own). One with other
+                    // sequence on both sides, on a contig without a copy, may be a paralog the coordinate
+                    // reference lacks: it stays outside (shared, never falsely private).
+                    if (own.empty() && a > 0 && b < seq.size()) continue;
                     // the stretch off the copies, as pieces overlapping a neighbouring copy by k - 1 bases: a k-mer
                     // lies wholly in exactly one copy or piece
                     std::vector<std::pair<std::uint64_t, std::uint64_t>> off{{a, b}};

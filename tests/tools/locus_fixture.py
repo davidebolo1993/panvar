@@ -131,3 +131,22 @@ with open(os.path.join(out, "split_e", "locus.gfa"), "w") as f:
     f.write(f"P\tref#1#chr1:{ls2}-{le2}\t1+\t*\n")
     f.write(f"P\tge#1#chr1:{ls2}-{ls2 + len(hap_e)}\t2+\t*\n")
     f.write(f"P\tgt#1#chr1:{ls2}-{ls2 + len(hap_g)}\t3+\t*\n")
+
+# split_c/: the locus of split/, and a genome with no copy of it: a paralog of the array (a haplotype's units
+# the coordinate reference lacks, with 50 adjacent differences per 5 kb, dense enough for a window) between
+# other sequence on a contig of its own, which must stay outside; and a contig of the array alone, which is
+# a piece
+
+
+def clustered(s, block=5000, run=50):
+    b = list(s)
+    for x in range(0, len(b) - block + 1, block):
+        at = x + rng.randrange(block - run)
+        for i in range(at, at + run):
+            b[i] = rng.choice([c for c in "ACGT" if c != b[i]])
+    return "".join(b)
+
+
+os.makedirs(os.path.join(out, "split_c"), exist_ok=True)
+write("split_c/gc", [("chr1", seq(60000)), ("p", seq(3000) + clustered(long_array[5500:4 * 5500]) + seq(3000)),
+                     ("o", long_array[4 * 5500:7 * 5500])])
