@@ -292,7 +292,7 @@ public:
 
 private:
     static constexpr std::int64_t kNear = 100000;   // a mate this far ahead is waited for
-    static constexpr std::int64_t kFetchGap = 200000;   // mates this close are fetched by one query
+    static constexpr std::int64_t kFetchGap = 200000;   // CRAM mates this close are fetched by one query
     static constexpr std::size_t kHoldMax = 2000000;  // reads waiting for mates in an unsorted file before going lean
     struct Read {
         std::string seq, qual;
@@ -494,8 +494,10 @@ private:
         HtsFile again(path_, o_, &pool_);
         hts_idx_t* idx = sam_index_load(again.fp, path_.c_str());
         if (idx != nullptr) {
-            // in the mates' order on the genome, nearby mates read by one query: each reference contig is loaded
-            // and each block decoded once (in the order the reads came, a CRAM reloads a contig at almost every mate)
+            // in the mates' order on the genome. A CRAM reads nearby mates by one query, so each reference contig
+            // is loaded once (in the order the reads came, it reloads a contig at almost every mate); a BAM queries
+            // each mate position alone, as a query decodes every record between its ends.
+            const std::int64_t gap = hts_get_format(again.fp)->format == cram ? kFetchGap : 0;
             std::vector<std::size_t> order;
             for (std::size_t i = 0; i < wanted_.size(); ++i)
                 if (wanted_[i].mtid >= 0 && wanted_[i].mpos >= 0) order.push_back(i);
@@ -508,7 +510,7 @@ private:
             for (std::size_t a = 0; a < order.size();) {
                 std::size_t b = a + 1;
                 while (b < order.size() && wanted_[order[b]].mtid == wanted_[order[a]].mtid &&
-                       wanted_[order[b]].mpos - wanted_[order[b - 1]].mpos <= kFetchGap)
+                       wanted_[order[b]].mpos - wanted_[order[b - 1]].mpos <= gap)
                     ++b;
                 group.clear();
                 for (std::size_t k = a; k < b; ++k) group[wanted_[order[k]].name].push_back(order[k]);
