@@ -148,9 +148,11 @@ bench() { bm -i "$OUT/$1_b.sorted.gfa" -c "$OUT/$1_b.bubbles.csv" -r "$R" --call
                  -o "$OUT/$1_B" -q >/dev/null 2>&1; }
 val() { awk -F'\t' -v k="$2" '$1==k{print $2}' "$OUT/$1_B.summary.tsv"; }
 # present:left:left_bp for a label
-pl() { echo "$(val "$1" large_events_present):$(val "$1" missed_by_call_events):$(val "$1" missed_by_call_bp)"; }
-left_rows() { tail -n +2 "$OUT/$1_B.events.tsv" | awk -F'\t' '$2=="missed_by_call"{print $5" "$6" "$9" "$11}' | paste -sd';' -; }
-lost_rows() { tail -n +2 "$OUT/$1_B.events.tsv" | awk -F'\t' '$2=="lost_in_vcf"{print substr($1,1,2)" "$5" "$6" "$9}' | paste -sd';' -; }
+pl() { echo "$(val "$1" large_present):$(val "$1" large_left_call):$(val "$1" large_left_call_bp)"; }
+# call's leftovers: type size reason bubbles records
+left_rows() { tail -n +2 "$OUT/$1_B.events.tsv" | awk -F'\t' '$2=="call"{print $5" "$6" "$9" "$10" "$11}' | paste -sd';' -; }
+# the VCF's leftovers with a VCF reason (lost in the VCF): haplotype type size reason
+lost_rows() { tail -n +2 "$OUT/$1_B.events.tsv" | awk -F'\t' '$2=="vcf" && $9 ~ /^(no_sequence|copy_count|representative|other)$/{print substr($1,1,2)" "$5" "$6" "$9}' | paste -sd';' -; }
 
 # ---- what call accounts for leaves nothing --------------------------------------------------------
 # snpswap: a 60 bp deletion (hapdel), a 1 bp SNP in a 60 bp node (hapsnp), and another node spelling the
@@ -174,7 +176,7 @@ pipeline shift shift
 check "shift: a different cut of the same sequence is no difference" "$(pl shift)" "2:0:0"
 # rep: a 60 bp tandem unit at 2 copies on the reference, 4 on two haplotypes and 1 on another
 pipeline rep rep
-check "rep: copy-number changes recovered (+120, +120, -60)" "$(pl rep):$(val rep large_bp_present)" "3:0:0:300"
+check "rep: copy-number changes recovered (+120, +120, -60)" "$(pl rep):$(val rep large_present_bp)" "3:0:0:300"
 check "rep: each carrier's CN matches the copies its walk holds" "$(val rep carriers_checked):$(val rep carrier_mismatches)" "3:0"
 # partial: a haplotype starting one flank late is cut to what it covers, not charged for the rest
 pipeline partial partial
@@ -184,9 +186,9 @@ check "partial: and nothing is left" "$(pl partial)" "2:0:0"
 
 # ---- what call does not account for, by cause --------------------------------------------------------
 pipeline strand norec -- --min-sv-bp 65
-check "a 60 bp deletion call did not report (call at 65 bp) is no_record" "$(left_rows norec)" "DEL 60 no_record ."
+check "a 60 bp deletion call did not report (call at 65 bp) is not_reported, in its site" "$(left_rows norec)" "DEL 60 not_reported 1 ."
 pipeline strand outside --min-variant-bp 65
-check "one in no bubble at all is outside_bubbles" "$(left_rows outside)" "DEL 60 outside_bubbles ."
+check "one in no bubble at all is not_reported, in no site" "$(left_rows outside)" "DEL 60 not_reported . ."
 
 # A missed carrier: hapdel's genotype for the deletion is 0, in the VCF and the carrier events alike.
 pipeline strand missed
@@ -195,10 +197,10 @@ awk -F'\t' -v OFS='\t' -v id="$del_id" '/^#CHROM/{for(i=10;i<=NF;i++) if($i=="ha
   "$OUT/missed_c.region.vcf" > "$OUT/x.vcf" && mv "$OUT/x.vcf" "$OUT/missed_c.region.vcf"
 awk -F'\t' -v id="$del_id" '$1!=id' "$OUT/missed_c.carrier_events.tsv" > "$OUT/x.tsv" && mv "$OUT/x.tsv" "$OUT/missed_c.carrier_events.tsv"
 bench missed
-check "a carrier call missed is not_carrier, naming the record" "$(left_rows missed)" "DEL 60 not_carrier $del_id"
-vcf_rows() { tail -n +2 "$OUT/$1_B.events.tsv" | awk -F'\t' '$2=="left_by_vcf"{print $5" "$6" "$9}' | paste -sd';' -; }
-check "the VCF's rebuild leaves that miss again, whole, with its cause (left_by_vcf)" \
-      "$(vcf_rows missed):$(val missed left_by_vcf_events)" "DEL 60 not_carrier:1"
+check "a carrier call missed is not_carrier, naming the record" "$(left_rows missed | cut -d' ' -f1-3,5)" "DEL 60 not_carrier $del_id"
+vcf_rows() { tail -n +2 "$OUT/$1_B.events.tsv" | awk -F'\t' '$2=="vcf"{print $5" "$6" "$9}' | paste -sd';' -; }
+check "the VCF's rebuild leaves that miss again, whole, with its cause, not as its own (vcf:vcf_only)" \
+      "$(vcf_rows missed):$(val missed large_left_vcf):$(val missed large_left_vcf_only)" "DEL 60 not_carrier:1:0"
 
 # An event call got wrong: hapins's own insertion cut from 70 bp to 10. What is left is inside the event
 # applied to it (incomplete), and its own event no longer matches the record's SVLEN.
@@ -209,8 +211,8 @@ bench cut
 check "an event shorter than the haplotype's leaves the rest as incomplete" "$(left_rows cut | cut -d' ' -f1-3)" "INS 60 incomplete"
 check "and its carrier is flagged against the record's SVLEN (own 10 bp, SVLEN 70)" \
       "$(tail -n +2 "$OUT/cut_B.carrier_checks.tsv" | cut -f2,6)" "$(printf 'hapins#1#c\t-60')"
-check "the VCF's record spells the whole insertion: its rebuild leaves nothing (missed:left_by_vcf_events)" \
-      "$(val cut missed_by_call_events):$(val cut left_by_vcf_events):$(vcf_rows cut)" "1:0:"
+check "the VCF's record spells the whole insertion: its rebuild leaves nothing (call:vcf)" \
+      "$(val cut large_left_call):$(val cut large_left_vcf):$(vcf_rows cut)" "1:0:"
 
 # A wrong copy number: hap4 reported at CN 3 while its walk holds 4 copies.
 pipeline rep wrongcn
@@ -229,8 +231,8 @@ pipeline motif motif
 for f in "$OUT"/motif_b.* "$OUT"/motif_c.*; do cp "$f" "${f/motif_/motifs_}"; done
 sed -i.bak 's/RU_LEN=600/RU_LEN=480/' "$OUT/motifs_c.region.vcf" && rm -f "$OUT/motifs_c.region.vcf.bak"
 bench motifs
-check "a unit shorter than the copies still rebuilds them from the period (events lost by the VCF)" \
-      "$(val motif lost_in_vcf_events):$(val motifs lost_in_vcf_events)" "0:0"
+check "a unit shorter than the copies still rebuilds them from the period (left by the VCF only)" \
+      "$(val motif large_left_vcf_only):$(val motifs large_left_vcf_only)" "0:0"
 
 # ---- copy-number stretches, and the VCF mode (spec fixtures: tests/tools/spec_gfa.py) --------------------
 SPEC_GFA="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/tools/spec_gfa.py"
@@ -249,8 +251,8 @@ spec() {
 }
 sv() { awk -F'\t' -v k="$2" '$1==k{print $2}' "$OUT/$1.summary.tsv"; }
 
-# vleft <name>: large events left by the VCF's records, missed by call or lost in the VCF
-vleft() { echo $(( $(sv "$1_B" missed_by_call_events) + $(sv "$1_B" lost_in_vcf_events) )); }
+# vleft <name>: large events left by the VCF's records
+vleft() { sv "$1_B" large_left_vcf; }
 # A 60 bp repeat unit U, two copies on the reference; hX holds an 80 bp X between its first and second
 # copy. Its copy stretch holds X, and call's insertion of X is inside it: applied twice, it left 80 bp.
 cat > "$OUT/ubetween.spec" <<'EOF'
@@ -266,7 +268,7 @@ B S T U;X
 EOF
 spec ubetween
 check "an insertion between a carrier's copies is part of its copy stretch, not applied twice (left:inside:mismatches)" \
-      "$(sv ubetween_B missed_by_call_events):$(lg ubetween_B "$INSIDE_CN"):$(sv ubetween_B carrier_mismatches)" "0:1:0"
+      "$(sv ubetween_B large_left_call):$(lg ubetween_B "$INSIDE_CN"):$(sv ubetween_B carrier_mismatches)" "0:1:0"
 # An insertion that repeats its neighbours can go in anywhere over its CIPOS, and its listed place can fall
 # on the wrong side of a stretch's edge; the stretch's length says which side it is on. ubedge: hX's
 # stretch holds X, listed past the stretch. uedge: X goes in before the copies (an aligned allele's stretch
@@ -281,9 +283,9 @@ for n in ubetween:ubedge uedge:uedge; do
          -o "$OUT/${n#*:}_B" -q >/dev/null 2>&1
 done
 check "an ambiguous insertion listed past a stretch that holds it is inside (left:inside:mismatches)" \
-      "$(sv ubedge_B missed_by_call_events):$(lg ubedge_B "$INSIDE_CN"):$(sv ubedge_B carrier_mismatches)" "0:1:0"
+      "$(sv ubedge_B large_left_call):$(lg ubedge_B "$INSIDE_CN"):$(sv ubedge_B carrier_mismatches)" "0:1:0"
 check "an ambiguous insertion listed at a stretch that lacks it is applied (left:inside:mismatches)" \
-      "$(sv uedge_B missed_by_call_events):$(lg uedge_B "$INSIDE_CN"):$(sv uedge_B carrier_mismatches)" "0:0:0"
+      "$(sv uedge_B large_left_call):$(lg uedge_B "$INSIDE_CN"):$(sv uedge_B carrier_mismatches)" "0:0:0"
 # A unit U, three copies on the reference. h1 deletes the last 3 bp of A (node P), keeps the 8 bp node B and
 # inserts a 180 bp X before its one copy. Aligned, the deletion and X are one replacement starting in A,
 # before the copies; its copy stretch is its copies alone, so X is applied once (uflank). In uedge2, h1 keeps
@@ -307,7 +309,7 @@ sed 's/^P h1#1#chr1 L+,P+,/P h1#1#chr1 L+,A+,/' "$OUT/uflank.spec" > "$OUT/uedge
 spec uedge2
 for n in uflank uedge2; do
   check "$n: an aligned insertion beside the copies is applied once (left:stretch bp of h1)" \
-        "$(sv ${n}_B missed_by_call_events):$(awk -F'\t' '$3=="cn" && $11 ~ /h1#/{print $9}' "$OUT/${n}_c.carrier_events.tsv")" "0:52"
+        "$(sv ${n}_B large_left_call):$(awk -F'\t' '$3=="cn" && $11 ~ /h1#/{print $9}' "$OUT/${n}_c.carrier_events.tsv")" "0:52"
 done
 # A 120 bp spacer Z between the copies on one walk only: h1 holds its one copy before Z (sp2) or Z between its
 # copies (sp3), or no copy (sp4). The aligned walks, copies left out, hold Z alike, so no event of h1's has it:
@@ -355,7 +357,7 @@ sed 's/^P h1#1#chr1 .*/P h1#1#chr1 L+,P+,B+,X+,U+,Z+,U+,R+/' "$OUT/dd.spec" > "$
 spec ddsame
 for n in sp2:172 sp3:224 sp4:120 dd:224 ddsame:224; do
   check "${n%%:*}: a spacer between copies on one walk is kept once (left:stretch bp of h1)" \
-        "$(sv ${n%%:*}_B missed_by_call_events):$(awk -F'\t' '$3=="cn" && $11 ~ /h1#/{print $9}' "$OUT/${n%%:*}_c.carrier_events.tsv")" "0:${n#*:}"
+        "$(sv ${n%%:*}_B large_left_call):$(awk -F'\t' '$3=="cn" && $11 ~ /h1#/{print $9}' "$OUT/${n%%:*}_c.carrier_events.tsv")" "0:${n#*:}"
 done
 # An 80 bp X beside hX's copies, after them (eafter, three copies; eone, one) or before them (ebefore), and the
 # same stored on the other strand (rebefore, reafter). Aligned, X goes in at the copies' start on the reference;
@@ -371,7 +373,7 @@ for n in rebefore:T-,U-,U-,U-,X-,S- reafter:T-,X-,U-,U-,U-,S-; do
   spec "${n%%:*}"
 done
 check "an insertion beside the copies keeps its side of them (left: eafter eone ebefore rebefore reafter)" \
-      "$(sv eafter_B missed_by_call_events) $(sv eone_B missed_by_call_events) $(sv ebefore_B missed_by_call_events) $(sv rebefore_B missed_by_call_events) $(sv reafter_B missed_by_call_events)" "0 0 0 0 0"
+      "$(sv eafter_B large_left_call) $(sv eone_B large_left_call) $(sv ebefore_B large_left_call) $(sv rebefore_B large_left_call) $(sv reafter_B large_left_call)" "0 0 0 0 0"
 # No reference copy: X after the copies (hX), or before them (hY, whose copies call could not place).
 cat > "$OUT/uzero.spec" <<'EOF'
 N S 300 1
@@ -387,7 +389,7 @@ B S T U;X
 EOF
 spec uzero
 check "with no reference copy, the copies go where the walk has them, either side of an insertion (left:unresolved)" \
-      "$(sv uzero_B missed_by_call_events):$(lg uzero_B "$UNRESOLVED")" "0:0"
+      "$(sv uzero_B large_left_call):$(lg uzero_B "$UNRESOLVED")" "0:0"
 check "the VCF cannot spell copies with REF_CN 0: counted, and what they leave is lost (no_sequence)" \
       "$(lg uzero_B "$UNSPELLED"):$(lost_rows uzero | tr ';' '\n' | awk '$1=="h2"{print $4}')" "1:no_sequence"
 check "the warning names the cause: no reference copy to paste, not a sequence call left out (lines)" \
@@ -444,7 +446,7 @@ spec modins --cn
 check "MODULE carriers are checked: their copies by the anchor rule (checked:unchecked)" \
       "$(sv modins_B carriers_checked):$(lg modins_B "$UNCHECKED")" "4:0"
 check "and the 80 bp no record reports is flagged in hX's copy stretch, and nothing is left for hZ" \
-      "$(tail -n +2 "$OUT/modins_B.carrier_checks.tsv" | cut -f2,3,6 | paste -sd';' -) $(sv modins_B missed_by_call_events)" \
+      "$(tail -n +2 "$OUT/modins_B.carrier_checks.tsv" | cut -f2,3,6 | paste -sd';' -) $(sv modins_B large_left_call)" \
       "$(printf 'hX#1#chr1\tcn_stretch\t80') 0"
 check "the VCF: the copy gain and hZ's insertion at one point are both applied; hX's 80 bp is lost (copy_count)" \
       "$(lost_rows modins)" "hX INS 80 copy_count"
@@ -457,8 +459,8 @@ check "the VCF: the copy gain and hZ's insertion at one point are both applied; 
 CASES="$(cd "$(dirname "$0")/.." && pwd)/synthetic_data/benchmark_cases"
 bm -i "$OUT/modins/g.gfa" -c "$OUT/modins/g.bubbles.csv" -r ref --calls "$CASES/modins_short_unit" \
   -o "$OUT/modins_short_unit_B" -q >/dev/null 2>&1
-check "one reference copy: the copy is the record's span, not CN_UNIT_BP (lost_in_vcf_bp, carrier_mismatches)" \
-      "$(sv modins_short_unit_B lost_in_vcf_bp) $(sv modins_short_unit_B carrier_mismatches)" "80 1"
+check "one reference copy: the copy is the record's span, not CN_UNIT_BP (large_left_vcf_only_bp, carrier_mismatches)" \
+      "$(sv modins_short_unit_B large_left_vcf_only_bp) $(sv modins_short_unit_B carrier_mismatches)" "80 1"
 # With a unit only 50 bp short of the span, both are within the forms' tolerance of a carrier whose CNBP says
 # 550 bp: the nearer, the unit, is pasted, and the 50 bp the haplotype really holds beyond it are lost.
 sed -e 's/CN_UNIT_BP=300/CN_UNIT_BP=550/' -e 's/1:2:600:0\t1:2:600:0\t1:2:600:0$/1:2:550:0\t1:2:600:0\t1:2:600:0/' \
@@ -466,8 +468,8 @@ sed -e 's/CN_UNIT_BP=300/CN_UNIT_BP=550/' -e 's/1:2:600:0\t1:2:600:0\t1:2:600:0$
 cp "$CASES/modins_short_unit.carrier_events.tsv" "$OUT/modins_near_unit.carrier_events.tsv"
 bm -i "$OUT/modins/g.gfa" -c "$OUT/modins/g.bubbles.csv" -r ref --calls "$OUT/modins_near_unit" \
   -o "$OUT/modins_near_unit_B" -q >/dev/null 2>&1
-check "one reference copy, unit near the span: the form nearer the carrier's CNBP (lost_in_vcf_bp)" \
-      "$(sv modins_near_unit_B lost_in_vcf_bp)" "130"
+check "one reference copy, unit near the span: the form nearer the carrier's CNBP (large_left_vcf_only_bp)" \
+      "$(sv modins_near_unit_B large_left_vcf_only_bp)" "130"
 # A VCF with Windows line endings scores the same; an insertion runs from the base before it to the base after.
 cp "$OUT/modins_c.carrier_events.tsv" "$OUT/modins_crlf.carrier_events.tsv"
 sed 's/$/\r/' "$OUT/modins_c.region.vcf" > "$OUT/modins_crlf.region.vcf"
@@ -494,17 +496,17 @@ P hG#1#chr1 S+,A+,H+,B+,A+,H+,B+,A+,H+,B+,T+
 B S T A;H;B
 EOF
 spec shortcopy --cn
-check "a gained copy of a shorter form, which a deletion record accounts for, is rebuilt (lost_in_vcf_bp)" \
-      "$(sv shortcopy_B lost_in_vcf_bp)" "0"
+check "a gained copy of a shorter form, which a deletion record accounts for, is rebuilt (large_left_vcf_only_bp)" \
+      "$(sv shortcopy_B large_left_vcf_only_bp)" "0"
 sed 's/^P hX#1#chr1 .*/P hX#1#chr1 S+,A+,B+,A+,X+,B+,T+/' "$OUT/modins.spec" > "$OUT/modmid.spec"
 spec modmid --cn
 bm -i "$OUT/modmid/g.gfa" -c "$OUT/modmid/g.bubbles.csv" -r ref --calls "$CASES/modmid_missed_in_stretch" \
   -o "$OUT/modmid_missed_B" -q >/dev/null 2>&1
-check "a miss inside a copy stretch is counted once (missed_by_call_bp:lost_in_vcf_bp)" \
-      "$(sv modmid_missed_B missed_by_call_bp):$(sv modmid_missed_B lost_in_vcf_bp)" "80:0"
+check "a miss inside a copy stretch is counted once (large_left_call_bp:large_left_vcf_only_bp)" \
+      "$(sv modmid_missed_B large_left_call_bp):$(sv modmid_missed_B large_left_vcf_only_bp)" "80:0"
 # Two decoy deletion records nobody carries, 40 and 80 bp before H and 20 and 40 bp shorter: each explains
 # hS's short copy almost as well, and the first and the last lie 80 bp apart, so the VCF does not say which
-# stretch is missing and none is applied, whatever the records' order (lost_in_vcf_bp: H's 200 bp).
+# stretch is missing and none is applied, whatever the records' order (large_left_vcf_only_bp: H's 200 bp).
 awk -F'\t' -v OFS='\t' '!/^#/ && $3 ~ /_DEL_H$/ {
     n=split($0, f, "\t")
     for (k = 10; k <= n; k++) g = g "\t0"
@@ -514,8 +516,8 @@ awk -F'\t' -v OFS='\t' '!/^#/ && $3 ~ /_DEL_H$/ {
 cp "$OUT/shortcopy_c.carrier_events.tsv" "$OUT/decoys_c.carrier_events.tsv"
 bm -i "$OUT/shortcopy/g.gfa" -c "$OUT/shortcopy/g.bubbles.csv" -r "ref#0#chr1:0-5600" --calls "$OUT/decoys_c" \
   -o "$OUT/decoys_B" -q >/dev/null 2>&1
-check "deletions that would explain a short copy, a chain of small shifts reaching min_sv apart: none applied (lost_in_vcf_bp)" \
-      "$(sv decoys_B lost_in_vcf_bp)" "200"
+check "deletions that would explain a short copy, a chain of small shifts reaching min_sv apart: none applied (large_left_vcf_only_bp)" \
+      "$(sv decoys_B large_left_vcf_only_bp)" "200"
 # An inversion is mismatches only: one call misses is a large event left, not 200 bp of SNVs.
 cat > "$OUT/inv.spec" <<'EOF'
 N S 300 1
@@ -530,11 +532,11 @@ B S T A;C
 EOF
 spec inv
 check "an inversion counts as a large event present, and call's INV leaves nothing" \
-      "$(sv inv_B large_events_present):$(sv inv_B missed_by_call_events)" "2:0"
+      "$(sv inv_B large_present):$(sv inv_B large_left_call)" "2:0"
 grep -v 'INV_' "$OUT/inv_c.region.vcf" > "$OUT/invm_c.region.vcf"
 awk -F'\t' '$1 !~ /INV_/' "$OUT/inv_c.carrier_events.tsv" > "$OUT/invm_c.carrier_events.tsv"
 bm -i "$OUT/inv/g.gfa" -c "$OUT/inv/g.bubbles.csv" -r 'ref#0#chr1:0-900' --calls "$OUT/invm_c" -o "$OUT/invm_B" -q >/dev/null 2>&1
-check "an inversion call missed is a large event left" "$(sv invm_B missed_by_call_events)" "1"
+check "an inversion call missed is a large event left" "$(sv invm_B large_left_call)" "1"
 bm -i "$OUT/inv/g.gfa" -c "$OUT/inv/g.bubbles.csv" -r 'ref#0#chr1:0-900' --calls "$OUT/inv_c" \
        --vcf "$OUT/inv_c.region.vcf" -o "$OUT/x" -q >/dev/null 2>&1
 check "--vcf is not an option: both stages come from --calls" "$?" "2"
@@ -556,11 +558,11 @@ EOF
 BUBBLE=1 spec binv
 # (an inversion aligns as dense mismatches and comes out as several large events, so counts are > 0, not 1)
 check "an inversion longer than its flanks is scored: present, and left by nothing once call types its site" \
-      "$([ "$(sv binv_B large_events_present)" -gt 0 ] && echo present):$(sv binv_B missed_by_call_events) $(awk -F'\t' '$1 ~ /^hI/{print $3"-"$4}' "$OUT/binv_B.haplotypes.tsv")" "present:0 1-13600"
+      "$([ "$(sv binv_B large_present)" -gt 0 ] && echo present):$(sv binv_B large_left_call) $(awk -F'\t' '$1 ~ /^hI/{print $3"-"$4}' "$OUT/binv_B.haplotypes.tsv")" "present:0 1-13600"
 grep -v 'INV' "$OUT/binv_c.region.vcf" > "$OUT/binvm_c.region.vcf"
 awk -F'\t' 'NR == 1 || $3 != "inv"' "$OUT/binv_c.carrier_events.tsv" > "$OUT/binvm_c.carrier_events.tsv"
 bm -i "$OUT/binv/g.gfa" -c "$OUT/binv/g.bubbles.csv" -r 'ref#0#chr1:0-13600' --calls "$OUT/binvm_c" -o "$OUT/binvm_B" -q >/dev/null 2>&1
-check "and left over when no record has it" "$([ "$(sv binvm_B missed_by_call_events)" -gt 0 ] && echo left)" "left"
+check "and left over when no record has it" "$([ "$(sv binvm_B large_left_call)" -gt 0 ] && echo left)" "left"
 # The same inversion with a 200 bp D in its middle, which hID deletes and inverts (and hD only deletes):
 # the deletion is applied inside the inversion, not left out as a conflict with it.
 cat > "$OUT/binvd.spec" <<'EOF'
@@ -580,7 +582,7 @@ P hD#1#chr1 S+,I+,M1+,M2+,M4+,M3+,I-,T+
 EOF
 BUBBLE=1 spec binvd
 check "an event inside an inversion is applied inside it, in both stages (left:lost:conflicts:clean)" \
-      "$(sv binvd_B missed_by_call_events):$(sv binvd_B lost_in_vcf_events):$(lg binvd_B "$CONFLICTS_CALL"):$(sv binvd_B haplotypes_clean_vcf)" "0:0:0:4"
+      "$(sv binvd_B large_left_call):$(sv binvd_B large_left_vcf_only):$(lg binvd_B "$CONFLICTS_CALL"):$(sv binvd_B haplotypes_clean_vcf)" "0:0:0:4"
 
 # ---- sizes, alignment and attribution -------------------------------------------------------------------
 # An inversion is sized by its length: seven of 60 to 300 bp, one per haplotype. The bases at its ends that
@@ -620,7 +622,7 @@ B F200 F300 A300
 EOF
 spec invs
 check "seven inversions are seven large events, present, and none left once called" \
-      "$(sv invs_B large_events_present):$([ "$(sv invs_B large_bp_present)" -ge 900 ] && echo sized):$(sv invs_B missed_by_call_events)" "7:sized:0"
+      "$(sv invs_B large_present):$([ "$(sv invs_B large_present_bp)" -ge 900 ] && echo sized):$(sv invs_B large_left_call)" "7:sized:0"
 # A 60 bp replacement by 45 other bases is a large event, sized 60, in each of ten haplotypes.
 cat > "$OUT/sub.spec" <<'EOF'
 N S 300 1
@@ -650,7 +652,7 @@ P h10#1#chr1 S+,B10+,T+
 B S T A;B1;B2;B3;B4;B5;B6;B7;B8;B9;B10;
 EOF
 spec sub
-check "ten 60-for-45 bp replacements are large" "$(sv sub_B large_events_present):$([ "$(sv sub_B large_bp_present)" -ge 580 ] && echo sized)" "10:sized"
+check "ten 60-for-45 bp replacements are large" "$(sv sub_B large_present):$([ "$(sv sub_B large_present_bp)" -ge 580 ] && echo sized)" "10:sized"
 # A replacement whose new sequence the VCF does not hold cannot be rebuilt from it.
 awk -F'\t' -v OFS='\t' '$3 == "bubble1_SUB_A" { $4 = substr($4, 1, 1); $5 = "<DEL>"; $8 = $8 ";SUBSTITUTION" } 1' \
     "$OUT/sub_c.region.vcf" > "$OUT/subn_c.region.vcf"
@@ -676,7 +678,7 @@ B S T A;B;X;Y
 EOF
 spec swap
 check "swapped similar segments are small differences, not a large deletion and insertion" \
-      "$(sv swap_B large_events_present):$([ "$(sv swap_B snv_present)" -ge 50 ] && echo snvs)" "0:snvs"
+      "$(sv swap_B large_present):$([ "$(sv swap_B snv_present)" -ge 50 ] && echo snvs)" "0:snvs"
 # A 1 kb segment moved past a 5 kb one: the exact blocks are out of order, the cut alignment would
 # make it a 5 kb deletion and insertion, and the exact one is 1 kb deleted and 1 kb inserted.
 cat > "$OUT/tp2.spec" <<'EOF'
@@ -691,7 +693,7 @@ P h1#1#chr1 S+,A+,X+,B+,C+,T+
 P hm#1#chr1 S+,A+,B+,X+,C+,T+
 EOF
 spec tp2
-check "a moved segment is its own size deleted and inserted, not its neighbour's" "$(sv tp2_B large_bp_present)" "2000"
+check "a moved segment is its own size deleted and inserted, not its neighbour's" "$(sv tp2_B large_present_bp)" "2000"
 # Lower-case sequence: call writes REF upper-case; --vcf compares it ignoring case.
 cat > "$OUT/lc.spec" <<'EOF'
 N S =GGATCACAGTCTACACTGCTCACTCCAACCCCGGCCCCTGAGTCCGAGGAGAGGGTGCTTCAGAGTATGTATACCACTGGGTAGGATACGGCGGAGGGCACGTCAATACGGTTCAATGCCCTACTGCATGCTCTTGTGGTTCATCTGCATGGAGAGGGTGGGCATGGGTGGGGGTGCTGGCCCGTGATCTGGACCTCCCATCCACAGCTCATTGTACCGAGTGTAGAGAGGGGCTTGTCCTTCCAGATAGCGTTTCTGTTTCGGTGTAGGTGCTAATCGACTATGCTACTGCGGTTAACG
@@ -704,7 +706,7 @@ P h2#1#chr1 S+,B+,T+
 B S T A;B
 EOF
 spec lc
-check "the VCF stage runs on a soft-masked graph" "$(sv lc_B haplotypes_scored):$(sv lc_B lost_in_vcf_events)" "2:0"
+check "the VCF stage runs on a soft-masked graph" "$(sv lc_B haplotypes_scored):$(sv lc_B large_left_vcf_only)" "2:0"
 # An insertion just past a haplotype's shared stretch is outside it, not applied.
 cat > "$OUT/edge.spec" <<'EOF'
 N S 300 1
@@ -721,7 +723,7 @@ P hQ#1#chr1 X+,T+,U+
 B A T X
 EOF
 spec edge
-check "and the VCF stage leaves it out too: nothing lost" "$(sv edge_B lost_in_vcf_events)" "0"
+check "and the VCF stage leaves it out too: nothing lost" "$(sv edge_B large_left_vcf_only)" "0"
 check "an insertion past the stretch a haplotype shares is outside it, and leaves nothing" \
       "$([ "$(lg edge_B "$OUTSIDE")" -ge 1 ] && echo outside):$(awk -F'\t' '$1 ~ /^hT/{print $7}' "$OUT/edge_B.haplotypes.tsv")" "outside:0"
 # A haplotype that shares no node with the reference is not scored, and the log's count says so.
@@ -742,9 +744,9 @@ spec noanc
 check "the log counts only the haplotypes scored, and warns of the one skipped (log:summary:skipped)" \
       "$(sed -n 's/.*haplotypes scored: \([0-9]*\);.*/\1/p' "$OUT/noanc_L.log"):$(sv noanc_L haplotypes_scored):$(grep -c 'warning: 1 haplotype(s) share no anchor' "$OUT/noanc_L.log")" \
       "2:2:1"
-# A miss inside an inversion site is in that site (no_record), not outside every site.
-check "a miss inside an inversion site is no_record there" \
-      "$(tail -n +2 "$OUT/binvm_B.events.tsv" | awk -F'\t' '$2=="missed_by_call"{print $9}' | sort -u | paste -sd, -)" "no_record"
+# A miss inside an inversion site is in that site, not outside every site.
+check "a miss inside an inversion site is not_reported there" \
+      "$(tail -n +2 "$OUT/binvm_B.events.tsv" | awk -F'\t' '$2=="call"{print $9, ($10 == "." ? "nowhere" : "in a site")}' | sort -u | paste -sd, -)" "not_reported in a site"
 # Three overlapping events of one haplotype, under its record: A over P..R (its own sequence there), C the
 # deletion of Q inside A, B over R..W (no change) and longer than A. B replaces A; C does not overlap B, so
 # it is applied, and nothing is left.
@@ -767,7 +769,7 @@ nseq() { awk -v n="$2" '$1=="S" && $2==n{print $3}' "$OUT/$1/g.gfa"; }
 } >> "$OUT/three_c.carrier_events.tsv"
 bm -i "$OUT/three/g.gfa" -c "$OUT/three/g.bubbles.csv" -r 'ref#0#chr1:0-1060' --calls "$OUT/three_c" -o "$OUT/three_B" -q >/dev/null 2>&1
 check "an event left out for one later replaced is applied when it overlaps no kept one (left:applied:conflicts)" \
-      "$(sv three_B missed_by_call_events):$(lg three_B "$APPLIED_CALL"):$(lg three_B "$CONFLICTS_CALL")" "0:2:1"
+      "$(sv three_B large_left_call):$(lg three_B "$APPLIED_CALL"):$(lg three_B "$CONFLICTS_CALL")" "0:2:1"
 # Longest first, whatever lies around: with D over W..T (no change, longer than B) and an empty insertion
 # inside A too, D and A are kept and C, the insertion and B are left out, in either order of the rows.
 rseq() { awk '$1=="S"{printf "%s", $3}' "$OUT/three/g.gfa" | cut -c"$1"-"$2"; }   # S P Q R W T in order
@@ -776,7 +778,7 @@ row() { printf 'bubble1_DEL_Q\t1\t%s\t%s\t%s\t.\t.\t%s\t%s\t%s\thD#1#chr1\n' "$@
 bench3() { cp "$OUT/three_c.region.vcf" "$OUT/$1_c.region.vcf"
            bm -i "$OUT/three/g.gfa" -c "$OUT/three/g.bubbles.csv" -r 'ref#0#chr1:0-1060' --calls "$OUT/$1_c" \
                   -o "$OUT/$1_B" -q >/dev/null 2>&1; }
-lac() { echo "$(sv "$1_B" missed_by_call_events):$(lg "$1_B" "$APPLIED_CALL"):$(lg "$1_B" "$CONFLICTS_CALL")"; }
+lac() { echo "$(sv "$1_B" large_left_call):$(lg "$1_B" "$APPLIED_CALL"):$(lg "$1_B" "$CONFLICTS_CALL")"; }
 { cat "$OUT/three_c.carrier_events.tsv"; row seq 450 449 0 0 .; row seq 561 1000 0 440 "$(rseq 561 1000)"; } \
   > "$OUT/four_c.carrier_events.tsv"
 awk 'NR==1{print; next} {a[NR]=$0} END{for (i=NR; i>1; i--) print a[i]}' "$OUT/four_c.carrier_events.tsv" \
@@ -804,7 +806,7 @@ check "ties: the first of two crossing intervals, the longer of two replacements
       "$(lac tie)/$(lac tieg)" "0:1:2/1:1:1"
 # Why the VCF loses what call found, from one 200 bp deletion of Q (before a 300 bp tandem repeat R) with
 # its record edited: deleting only Q's last 20 bp leaves the record's own allele short (representative),
-# the same as IMPRECISE (imprecise), and deleting 60 bp of R too leaves a gap the alignment places at R's
+# the same as IMPRECISE (other), and deleting 60 bp of R too leaves a gap the alignment places at R's
 # far end; it can slide back along R to the record, so it is that record's allele (representative).
 cat > "$OUT/lostr.spec" <<EOF
 N S 300 1
@@ -827,7 +829,7 @@ for e in rep:'$2=580' imp:'$2=580; $8=$8";IMPRECISE"' oth:'sub(/END=[0-9]+/, "EN
 done
 check "lost in the VCF: a carried record's other allele, an IMPRECISE one, a gap sliding back to the record (reasons)" \
       "$(lost_rows rep | cut -d' ' -f4):$(lost_rows imp | cut -d' ' -f4):$(lost_rows oth | cut -d' ' -f4)" \
-      "representative:imprecise:representative"
+      "representative:other:representative"
 # Records are named by unique IDs.
 awk -F'\t' -v OFS='\t' '!/^#/ { $3 = "." } 1' "$OUT/strand_c.region.vcf" > "$OUT/dot_c.region.vcf"
 cp "$OUT/strand_c.carrier_events.tsv" "$OUT/dot_c.carrier_events.tsv"

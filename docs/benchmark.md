@@ -9,7 +9,7 @@ Checks how much of each haplotype's variation `call`'s output accounts for, usin
 1. The variation `call` reported for a haplotype is put into the reference, and the result is aligned to the haplotype. Where `call` reported the variation, the two match; where it did not, the difference is reported.
 2. To say how much that is, the plain reference, a rebuild with nothing put in, is aligned the same way: its differences are all there was to find. The share recovered is 1 − the bases left / the bases present.
 
-Each haplotype is rebuilt twice: from `call`'s own events for it (`carrier_events.tsv`), where what is left was missed by `call`; and from the VCF records it carries, where what is left on top was lost in writing the VCF. Differences of `--min-sv-bp` or more are listed; smaller ones (SNVs, small indels) are only totalled.
+Each haplotype is rebuilt twice: from `call`'s own events for it (`carrier_events.tsv`, stage `call`), where what is left was missed by `call`; and from the VCF records it carries (stage `vcf`), where what is left is one of those misses again or was lost in writing the VCF. Differences of `--min-sv-bp` or more are listed; smaller ones (SNVs, small indels) are only totalled.
 
 ## How it works
 
@@ -25,27 +25,24 @@ Alignments use [edlib](https://github.com/Martinsos/edlib).
 5. Gaps `--merge-gap` columns apart or fewer form one difference. A stretch dense in mismatches (one column in five, over `--min-sv-bp` columns) is one too, since an inversion or an equal-length replacement aligns almost without gaps. A difference is sized as `call` sizes it, by the larger side.
 6. Each difference left is looked up against the haplotype's own events, the records (its own and the others'), and the sites, to say why it is left. An insertion or deletion inside a repeat can be written at any copy, and the alignment picks one end, so it is looked up anywhere it can slide to.
 
-   Left by `call`'s own events: the first cause that applies.
+   Left by `call`'s own events (`call`): the first cause that applies.
 
    | cause | the difference |
    |-------|----------------|
-   | `incomplete` | `call` reported it, but its event did not rebuild all of it |
-   | `unresolved` | it lies at a record of this haplotype whose event could not be placed on the reference |
+   | `incomplete` | it lies at a record of this haplotype whose event did not rebuild all of it, or could not be placed on the reference |
    | `not_carrier` | a record is there, but this haplotype is not among its carriers |
-   | `no_record` | it lies in a site, but `call` reported nothing there |
-   | `outside_bubbles` | it lies outside every site, where `call` never looked |
+   | `not_reported` | `call` reported nothing there; `bubbles` says whether it lies in a site or outside every site, where `call` never looked |
 
-   Left by the VCF: a difference at one of `call`'s misses, in the same direction, is that miss again. What goes beyond it by `--min-sv-bp` or more was lost in the VCF: the first reason that applies.
+   Left by the VCF (`vcf`), each difference whole: one at `call`'s misses, in the same direction, is those misses again, with the cause of the one it overlaps most. One that goes beyond them by `--min-sv-bp` or more was lost in writing the VCF: the first reason that applies.
 
    | reason | the difference |
    |--------|----------------|
    | `no_sequence` | the record has no sequence to put in |
    | `copy_count` | the copies pasted for a copy-number record differ from the carrier's own |
-   | `imprecise` | the record's breakpoints are approximate (`IMPRECISE`) |
    | `representative` | the record holds another carrier's version of the event |
-   | `other` | none of these, as when the alignment places the difference further along a repeat |
+   | `other` | none of these, as when the record's breakpoints are approximate (`IMPRECISE`, tried before `representative`) or the alignment places the difference further along a repeat |
 
-   The VCF rebuild's differences are also listed whole (`left_by_vcf`).
+   The `vcf` rows with a VCF reason are what only the VCF leaves.
 7. Each carrier's own change is also compared with the record it is filed under. The first rebuild uses each carrier's own event, so a carrier filed under a record of the wrong size, or given the wrong copy number, still rebuilds perfectly there; the VCF rebuild shows the loss, but not which carrier and record it comes from. The check names them: the carrier's own events against the record's `SVLEN` (`--min-sv-bp` or more apart is a mismatch), and at a copy-number record its `CN` against the copies its walk holds, and its copy stretch's length against what `CN` implies (`cn_stretch`).
 
 ## Required inputs
@@ -83,12 +80,12 @@ How each rebuild was made (events applied, those left out for overlapping anothe
 |-----|---------|
 | `min_sv_bp`, `merge_gap` | the run's settings |
 | `haplotypes_scored`, `haplotypes_skipped_<reason>` | haplotypes scored, and those skipped, by reason |
-| `large_events_present`, `large_bp_present` | large differences there were to find: count and bases |
-| `missed_by_call_events`, `missed_by_call_bp` | large differences `call`'s own events leave |
-| `missed_<cause>` | the same, by cause (step 6) |
-| `lost_in_vcf_events`, `lost_in_vcf_bp` | large differences only the VCF leaves |
-| `lost_<reason>` | the same, by reason (step 6) |
-| `left_by_vcf_events`, `left_by_vcf_bp` | everything the VCF rebuild leaves, each difference whole; not quite the sum of the two above, as a miss the records rebuild is not left again |
+| `large_present`, `large_present_bp` | large differences there were to find: count and bases |
+| `large_left_call`, `large_left_call_bp` | large differences `call`'s own events leave |
+| `large_left_call_<cause>` | the same, by cause (step 6) |
+| `large_left_vcf`, `large_left_vcf_bp` | large differences the VCF's records leave, `call`'s misses again included |
+| `large_left_vcf_only`, `large_left_vcf_only_bp` | those with a VCF reason: what only the VCF leaves |
+| `large_left_vcf_<reason>` | the same, by reason (step 6) |
 | `recovered_by_call_fraction`, `recovered_by_vcf_fraction` | share of the bases present each rebuild accounts for: 1 − left / present; negative when the rebuild is further from the haplotype than the reference |
 | `haplotypes_clean_call`, `haplotypes_clean_vcf` | haplotypes with nothing large left |
 | `small_bp_present`, `small_bp_left_call`, `small_bp_left_vcf` | bases in smaller indels: present, and left by each rebuild |
@@ -102,9 +99,10 @@ How each rebuild was made (events applied, those left out for overlapping anothe
 | `haplotype`, `status` | the haplotype, and `scored` or why not |
 | `ref_start`, `ref_end` | the reference stretch scored (step 1) |
 | `large_present`, `large_present_bp` | large differences there were to find |
-| `missed_by_call`, `missed_by_call_bp` | those `call`'s own events leave |
-| `lost_in_vcf`, `lost_in_vcf_bp` | those only the VCF leaves |
-| `small_present_bp`, `small_left_call_bp`, `small_left_vcf_bp` | bases in smaller indels: present, and left by each rebuild |
+| `large_left_call`, `large_left_call_bp` | those `call`'s own events leave |
+| `large_left_vcf`, `large_left_vcf_bp` | those the VCF's records leave |
+| `large_left_vcf_only`, `large_left_vcf_only_bp` | those only the VCF leaves |
+| `small_bp_present`, `small_bp_left_call`, `small_bp_left_vcf` | bases in smaller indels: present, and left by each rebuild |
 | `snv_present`, `snv_left_call`, `snv_left_vcf` | SNVs: present, and left by each rebuild |
 
 `events.tsv`, one row per large difference left, and `present.tsv`, one row per large difference there was to find:
@@ -112,10 +110,10 @@ How each rebuild was made (events applied, those left out for overlapping anothe
 | column | meaning |
 |--------|---------|
 | `haplotype` | the haplotype |
-| `stage` | `events.tsv` only: `missed_by_call`, `lost_in_vcf`, or `left_by_vcf` (everything the VCF rebuild leaves, whole) |
+| `stage` | `events.tsv` only: the rebuild that leaves it, `call` or `vcf` |
 | `ref_start`, `ref_end` | where it lies on the reference, from the base before it to the base after |
 | `type`, `size_bp`, `del_bp`, `ins_bp` | `DEL`, `INS` or `SUB`; its size, as `call` sizes it, and the bases removed and added |
-| `reason` | `events.tsv` only: the cause or reason it is left (step 6) |
+| `reason` | `events.tsv` only: why it is left, a cause of `call`'s miss or, at `vcf`, a VCF reason (step 6) |
 | `bubbles` | the sites it lies in, or can slide to inside a repeat; `.` for none |
 | `records` | `events.tsv` only: the records it lies at, `.` for none |
 
@@ -132,8 +130,8 @@ How each rebuild was made (events applied, those left out for overlapping anothe
 
 `scripts/plot_benchmark.R` plots one benchmark run or several, each with the `--min-sv-bp` `call` ran with.
 
-- A bar is a share: of the differences present (haplotype against reference), those still left (rebuild against haplotype), stacked by cause.
-- Each run has two groups: `call`'s own events (`missed_by_call`), then the VCF (`left_by_vcf`). Above each bar, what is left of what was present. Benchmarked below `call`'s threshold, each group has two bars, all the differences and those of `call`'s threshold or more, named under them; they differ by what `call` was not asked for.
+- A bar is a share: of the differences present (haplotype against reference), those still left (rebuild against haplotype), stacked by reason.
+- Each run has two groups: `call`'s own events (`call`), then the VCF (`vcf`). Above each bar, what is left of what was present. Benchmarked below `call`'s threshold, each group has two bars, all the differences and those of `call`'s threshold or more, named under them; they differ by what `call` was not asked for.
 - Four panels: share of the differences and of their bases, over the whole haplotype and inside the sites only (`bubbles`). Options keep one row or column of panels and wrap many runs over several rows; the numbers go to a table beside the figure.
 - Over 100%, the rebuild differs from the haplotype more than the reference does, as where pasted reference copies differ from the carrier's own.
 - Above 10 runs (`--max-grouped`), `plot_benchmark.R` draws one panel with one bar per run, for one measure (differences, or bases with `--only-bases`), one scope (the whole haplotype, or the sites with `--only-sites`), one rebuild (`--stage call` or `vcf`, default `vcf`) and one size class (`--size all` or `above`, default `above`), 25 runs to a row (`--per-row`).

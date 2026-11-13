@@ -42,8 +42,8 @@ void print_benchmark_help() {
         << "                   -o <prefix> [options]\n\n"
         << "Check how much of every haplotype's large variation call's output accounts for. Each haplotype\n"
         << "is rebuilt from the reference twice, with call's own events for it and with the VCF records it\n"
-        << "carries, and each rebuild is aligned to the haplotype's own sequence: what the first leaves was\n"
-        << "missed by call, what only the second leaves was lost in the VCF.\n\n"
+        << "carries, and each rebuild is aligned to the haplotype's own sequence: what each leaves is listed\n"
+        << "with why, a VCF leftover as one of call's misses again or as lost in writing the VCF.\n\n"
         << "Options:\n"
         << "  -i, --gfa <path>                  Graph the calls were made on (required)\n"
         << "  -b, --bubble-prefix <prefix>      Sites from <prefix>.bubbles.csv (required unless -c)\n"
@@ -613,7 +613,8 @@ struct LargeRow {
     std::size_t w0 = 0, w1 = 0;     // [g0, g1] widened over every place an indel alone can slide to
     std::string type;
     std::size_t size = 0, del_bp = 0, ins_bp = 0;
-    std::string cause;
+    std::string cause;              // incomplete, not_carrier or not_reported
+    bool unwritten = false;         // at a record of its own whose event could not be placed or spelled
     std::string bubbles = ".";
     std::string records = ".";
 };
@@ -625,7 +626,6 @@ struct HapResult {
     std::size_t applied = 0, conflicts = 0, outside_extent = 0, unresolved = 0, absorbed = 0;
     std::size_t present_n = 0, present_bp = 0, present_small_bp = 0, present_snv = 0;
     std::size_t left_n = 0, left_bp = 0, left_small_bp = 0, left_snv = 0;
-    std::map<std::string, std::size_t> left_by_cause;
     struct Span { std::string id; std::size_t lo = 0, hi = 0; };
     std::vector<Span> applied_spans;        // where each applied event sits (genomic)
     std::set<std::string> outside_ids;      // records whose event lies past the scored stretch
@@ -1653,8 +1653,8 @@ int run_benchmark_command(const std::vector<std::string>& args) {
             } else {
                 // Where the records' events sit first, then their POS..END (a copy-number record's span is its
                 // whole module). A record this haplotype carries there: its event is not all of what the
-                // haplotype has (incomplete), or it could not be written (unresolved). Otherwise a record it
-                // does not carry: a miss.
+                // haplotype has, or it could not be written: both incomplete. Otherwise a record it does not
+                // carry, or none at all: a miss.
                 const std::unordered_set<std::string>* unres = nullptr;
                 if (const auto it = unresolved_of.find(path.name); it != unresolved_of.end()) unres = &it->second;
                 // A record of its own that could not be written, there, comes first: nothing of it was applied.
@@ -1666,10 +1666,10 @@ int run_benchmark_command(const std::vector<std::string>& args) {
                     for (const std::string& id : near(*spans)) (carried.count(id) ? mine : others).push_back(id);
                     if (!mine.empty() || !others.empty()) break;
                 }
-                if (!gone.empty()) { row.cause = "unresolved"; recs = gone; }
+                if (!gone.empty()) { row.cause = "incomplete"; row.unwritten = true; recs = gone; }
                 else if (!mine.empty()) { row.cause = "incomplete"; recs = mine; }
                 else if (!others.empty()) { row.cause = "not_carrier"; recs = others; }
-                else { row.cause = !bids.empty() ? "no_record" : "outside_bubbles"; recs.clear(); }
+                else { row.cause = "not_reported"; recs.clear(); }
             }
             auto join = [](const std::vector<std::string>& v) {
                 if (v.empty()) return std::string(".");
@@ -1679,7 +1679,6 @@ int run_benchmark_command(const std::vector<std::string>& args) {
             };
             row.records = join(recs);
             row.bubbles = join(bids);
-            ++hr.left_by_cause[row.cause];
             hr.rows.push_back(std::move(row));
         }
     });
@@ -1694,12 +1693,12 @@ int run_benchmark_command(const std::vector<std::string>& args) {
     out.not_in_vcf = not_in_vcf;
     out.vcf = vcf;
     };
-    // ---- outputs: what call missed, then what the VCF lost on top ----
+    // ---- outputs: what call's events leave, then what the VCF's records leave ----
     // A large difference left by the VCF's records that overlaps one left by call's own events (on the
-    // reference, within --merge-gap) is the same miss. The rest is what the step from call's findings to
-    // the file lost: copies the record counts but cannot spell (copy_count), sequence it does not hold
-    // (no_sequence), inexact inversion ends (imprecise), or a carrier's own allele the record's
-    // representative does not match (representative).
+    // reference, within --merge-gap) is the same miss, with its cause. The rest is what the step from
+    // call's findings to the file lost, with a VCF reason: sequence the record does not hold
+    // (no_sequence), copies it counts but cannot spell (copy_count), a carrier's own allele its
+    // representative does not match (representative), or anything else (other).
     const auto write_outputs = [&]() {
         cli::StagedOutputs staged("benchmark");
         const Stage& sc = stages[0];
@@ -1710,27 +1709,29 @@ int run_benchmark_command(const std::vector<std::string>& args) {
         for (const VcfRecordInfo& r : sv.vcf) rec[r.id] = &r;
         // Why the VCF rebuild leaves `e` where call's own events do not; `records` may be filled in.
         const auto lost_reason = [&](const LargeRow& e, const HapResult& c, std::string& records) -> std::string {
-            if (e.cause == "unresolved") return "no_sequence";
+            if (e.unwritten) return "no_sequence";
             const std::vector<std::string> ids = e.records == "." ? std::vector<std::string>() : split_on(e.records, ';');
             for (const std::string& id : ids)
                 if (const auto it = rec.find(id); it != rec.end() && (it->second->svtype == "CNV" || it->second->svtype == "DUP"))
                     return "copy_count";
+            // approximate breakpoints: not the representative's fault
             for (const std::string& id : ids)
-                if (const auto it = rec.find(id); it != rec.end() && has_flag(it->second->info, "IMPRECISE")) return "imprecise";
+                if (const auto it = rec.find(id); it != rec.end() && has_flag(it->second->info, "IMPRECISE")) return "other";
             if (e.cause == "incomplete") return "representative";
             // A record whose own event for this haplotype sits there, written elsewhere by the VCF.
             for (const HapResult::Span& sp : c.applied_spans)
                 if (e.w0 <= sp.hi + merge_gap && sp.lo <= e.w1 + merge_gap) { records = sp.id; return "representative"; }
             return "other";
         };
-        std::map<std::string, std::size_t> missed_by_cause = {{"incomplete", 0}, {"unresolved", 0}, {"not_carrier", 0},
-                                                              {"no_record", 0}, {"outside_bubbles", 0}};
-        std::map<std::string, std::size_t> unspelled_lost;   // no_sequence losses, by why the record is unspelled
-        std::map<std::string, std::size_t> lost_by_reason = {{"copy_count", 0}, {"no_sequence", 0}, {"imprecise", 0},
-                                                             {"representative", 0}, {"other", 0}};
+        const std::vector<std::string> causes = {"incomplete", "not_carrier", "not_reported"};
+        const std::vector<std::string> vcf_reasons = {"no_sequence", "copy_count", "representative", "other"};
+        std::map<std::string, std::size_t> call_by_cause, vcf_by_reason;
+        for (const std::string& c : causes) call_by_cause[c] = 0;
+        for (const std::string& r : vcf_reasons) vcf_by_reason[r] = 0;
+        std::map<std::string, std::size_t> unspelled_lost;   // no_sequence rows, by why the record is unspelled
         std::map<std::string, std::size_t> skipped;
-        std::size_t scored = 0, present_n = 0, present_bp = 0, missed_n = 0, missed_bp = 0, lost_n = 0, lost_bp = 0;
-        std::size_t vcf_left_n = 0, vcf_left_bp = 0, clean_call = 0, clean_vcf = 0, present_small = 0, small_call = 0, small_vcf = 0;
+        std::size_t scored = 0, present_n = 0, present_bp = 0, call_n = 0, call_bp = 0, vcf_only_n = 0, vcf_only_bp = 0;
+        std::size_t vcf_n = 0, vcf_bp = 0, clean_call = 0, clean_vcf = 0, present_small = 0, small_call = 0, small_vcf = 0;
         std::size_t present_snv = 0, snv_call = 0, snv_vcf = 0, applied_call = 0, applied_vcf = 0, conflicts = 0;
         std::size_t outside = 0, absorbed = 0, conflicts_vcf = 0;
         std::set<std::pair<std::string, std::string>> mismatching;
@@ -1738,9 +1739,9 @@ int run_benchmark_command(const std::vector<std::string>& args) {
         std::ofstream ho(staged.stage(finals[1]));
         std::ofstream eo(staged.stage(finals[2]));
         if (!ho || !eo) throw std::runtime_error("cannot write benchmark outputs at " + out_prefix);
-        ho << "haplotype\tstatus\tref_start\tref_end\tlarge_present\tlarge_present_bp\tmissed_by_call\tmissed_by_call_bp"
-              "\tlost_in_vcf\tlost_in_vcf_bp\tsmall_present_bp\tsmall_left_call_bp\tsmall_left_vcf_bp\tsnv_present"
-              "\tsnv_left_call\tsnv_left_vcf\n";
+        ho << "haplotype\tstatus\tref_start\tref_end\tlarge_present\tlarge_present_bp\tlarge_left_call\tlarge_left_call_bp"
+              "\tlarge_left_vcf\tlarge_left_vcf_bp\tlarge_left_vcf_only\tlarge_left_vcf_only_bp\tsmall_bp_present"
+              "\tsmall_bp_left_call\tsmall_bp_left_vcf\tsnv_present\tsnv_left_call\tsnv_left_vcf\n";
         eo << "haplotype\tstage\tref_start\tref_end\ttype\tsize_bp\tdel_bp\tins_bp\treason\tbubbles\trecords\n";
         const auto row_out = [&](const LargeRow& e, const char* stage, const std::string& reason) {
             eo << e.haplotype << '\t' << stage << '\t' << e.g0 << '\t' << e.g1 << '\t' << e.type << '\t' << e.size
@@ -1751,69 +1752,55 @@ int run_benchmark_command(const std::vector<std::string>& args) {
             if (c.status != "scored" || vit == vres.end()) {
                 ++skipped[c.status];
                 ho << c.name << '\t' << c.status;
-                for (int k = 0; k < 14; ++k) ho << "\t.";
+                for (int k = 0; k < 16; ++k) ho << "\t.";
                 ho << '\n';
                 continue;
             }
             const HapResult& v = *vit->second;
             ++scored;
-            std::size_t h_lost = 0, h_lost_bp = 0;
+            std::size_t h_only = 0, h_only_bp = 0;
             for (const LargeRow& e : c.rows) {
-                ++missed_by_cause[e.cause];
-                row_out(e, "missed_by_call", e.cause);
+                ++call_by_cause[e.cause];
+                row_out(e, "call", e.cause);
             }
-            // A VCF-stage leftover lying on one of call's leftovers (within --merge-gap; a leftover inside
-            // an applied event may lie anywhere over it) is that miss again, up to the miss's size: only what
-            // goes beyond it, by --min-sv-bp or more, was lost in the VCF. Each of call's leftovers is
+            // Each of the VCF rebuild's leftovers is listed whole. One lying on call's leftovers (within
+            // --merge-gap; a leftover inside an applied event may lie anywhere over it) is those misses again,
+            // up to their size, and takes the cause of the miss it draws most on, unless what goes beyond them
+            // reaches --min-sv-bp: then it was lost in the VCF, with a VCF reason. Each of call's leftovers is
             // drawn on once in all, so a miss is never counted twice.
-            // Each of the VCF rebuild's own leftovers is also written whole (left_by_vcf): a miss again, with
-            // the cause of the miss it draws most on, when what goes beyond is under --min-sv-bp; else with
-            // its reason as lost in the VCF.
             std::vector<std::size_t> held(c.rows.size(), 0);
-            std::vector<std::pair<LargeRow, std::string>> by_vcf;
             for (const LargeRow& e0 : v.rows) {
-                LargeRow e = e0;
-                std::size_t most = 0, most_k = 0;
-                for (std::size_t k = 0; k < c.rows.size() && e.size > 0; ++k) {
+                std::size_t beyond = e0.size, most = 0, most_k = 0;
+                for (std::size_t k = 0; k < c.rows.size() && beyond > 0; ++k) {
                     const LargeRow& m = c.rows[k];
-                    if (!(e.m0 <= m.m1 + merge_gap && m.m0 <= e.m1 + merge_gap) || held[k] >= m.size) continue;
+                    if (!(e0.m0 <= m.m1 + merge_gap && m.m0 <= e0.m1 + merge_gap) || held[k] >= m.size) continue;
                     // the same direction: a loss is not a gain call missed (a replacement is either)
-                    if (e.type != m.type && e.type != "SUB" && m.type != "SUB") continue;
-                    const std::size_t take = std::min(e.size, m.size - held[k]);
+                    if (e0.type != m.type && e0.type != "SUB" && m.type != "SUB") continue;
+                    const std::size_t take = std::min(beyond, m.size - held[k]);
                     held[k] += take;
-                    e.size -= take;
+                    beyond -= take;
                     if (take > most) { most = take; most_k = k; }
                 }
-                if (e.size < min_sv_bp) {
-                    LargeRow again = e0;
-                    again.records = c.rows[most_k].records;
-                    by_vcf.push_back({again, c.rows[most_k].cause});
+                LargeRow row = e0;
+                if (beyond < min_sv_bp) {
+                    row.records = c.rows[most_k].records;
+                    row_out(row, "vcf", c.rows[most_k].cause);
                     continue;
                 }
-                if (e.size < e0.size) {   // the part beyond call's miss, sized as such
-                    e.del_bp = std::min(e.del_bp, e.size); e.ins_bp = std::min(e.ins_bp, e.size);
-                }
-                std::string records = e.records;
-                const std::string why = lost_reason(e, c, records);
-                ++lost_by_reason[why];
+                const std::string why = lost_reason(e0, c, row.records);
+                ++vcf_by_reason[why];
                 if (why == "no_sequence") {   // by why its record could not be spelled
-                    const auto ids = split_on(records, ';');
+                    const auto ids = split_on(row.records, ';');
                     const auto it = ids.empty() ? sv.unspelled.end() : sv.unspelled.find(ids.front());
                     ++unspelled_lost[it == sv.unspelled.end() ? "other" : it->second];
                 }
-                ++h_lost; h_lost_bp += e.size;
-                LargeRow shown = e;
-                shown.records = records;
-                row_out(shown, "lost_in_vcf", why);
-                LargeRow whole = e0;
-                whole.records = records;
-                by_vcf.push_back({whole, why});
+                ++h_only; h_only_bp += e0.size;
+                row_out(row, "vcf", why);
             }
-            for (const auto& [row, why] : by_vcf) row_out(row, "left_by_vcf", why);
             present_n += c.present_n; present_bp += c.present_bp;
-            missed_n += c.left_n; missed_bp += c.left_bp;
-            lost_n += h_lost; lost_bp += h_lost_bp;
-            vcf_left_n += v.left_n; vcf_left_bp += v.left_bp;
+            call_n += c.left_n; call_bp += c.left_bp;
+            vcf_n += v.left_n; vcf_bp += v.left_bp;
+            vcf_only_n += h_only; vcf_only_bp += h_only_bp;
             clean_call += c.left_n == 0; clean_vcf += v.left_n == 0;
             present_small += c.present_small_bp; small_call += c.left_small_bp; small_vcf += v.left_small_bp;
             present_snv += c.present_snv; snv_call += c.left_snv; snv_vcf += v.left_snv;
@@ -1821,9 +1808,9 @@ int run_benchmark_command(const std::vector<std::string>& args) {
             conflicts += c.conflicts; conflicts_vcf += v.conflicts; outside += c.outside_extent;
             absorbed += c.absorbed;
             ho << c.name << '\t' << c.status << '\t' << c.g_start << '\t' << c.g_end << '\t' << c.present_n << '\t'
-               << c.present_bp << '\t' << c.left_n << '\t' << c.left_bp << '\t' << h_lost << '\t' << h_lost_bp << '\t'
-               << c.present_small_bp << '\t' << c.left_small_bp << '\t' << v.left_small_bp << '\t' << c.present_snv
-               << '\t' << c.left_snv << '\t' << v.left_snv << '\n';
+               << c.present_bp << '\t' << c.left_n << '\t' << c.left_bp << '\t' << v.left_n << '\t' << v.left_bp << '\t'
+               << h_only << '\t' << h_only_bp << '\t' << c.present_small_bp << '\t' << c.left_small_bp << '\t'
+               << v.left_small_bp << '\t' << c.present_snv << '\t' << c.left_snv << '\t' << v.left_snv << '\n';
         }
         ho.close(); eo.close();
         if (!ho || !eo) throw std::runtime_error("failed writing benchmark outputs at " + out_prefix);
@@ -1865,18 +1852,18 @@ int run_benchmark_command(const std::vector<std::string>& args) {
            << "merge_gap\t" << merge_gap << '\n'
            << "haplotypes_scored\t" << scored << '\n';
         for (const auto& [why, n] : skipped) so << "haplotypes_skipped_" << why << '\t' << n << '\n';
-        so << "large_events_present\t" << present_n << '\n'
-           << "large_bp_present\t" << present_bp << '\n'
-           << "missed_by_call_events\t" << missed_n << '\n'
-           << "missed_by_call_bp\t" << missed_bp << '\n';
-        for (const auto& [c, n] : missed_by_cause) so << "missed_" << c << '\t' << n << '\n';
-        so << "lost_in_vcf_events\t" << lost_n << '\n'
-           << "lost_in_vcf_bp\t" << lost_bp << '\n';
-        for (const auto& [c, n] : lost_by_reason) so << "lost_" << c << '\t' << n << '\n';
-        so << "left_by_vcf_events\t" << vcf_left_n << '\n'
-           << "left_by_vcf_bp\t" << vcf_left_bp << '\n';
-        so << "recovered_by_call_fraction\t" << recovered(missed_bp) << '\n'
-           << "recovered_by_vcf_fraction\t" << recovered(vcf_left_bp) << '\n'
+        so << "large_present\t" << present_n << '\n'
+           << "large_present_bp\t" << present_bp << '\n'
+           << "large_left_call\t" << call_n << '\n'
+           << "large_left_call_bp\t" << call_bp << '\n';
+        for (const std::string& c : causes) so << "large_left_call_" << c << '\t' << call_by_cause[c] << '\n';
+        so << "large_left_vcf\t" << vcf_n << '\n'
+           << "large_left_vcf_bp\t" << vcf_bp << '\n'
+           << "large_left_vcf_only\t" << vcf_only_n << '\n'
+           << "large_left_vcf_only_bp\t" << vcf_only_bp << '\n';
+        for (const std::string& r : vcf_reasons) so << "large_left_vcf_" << r << '\t' << vcf_by_reason[r] << '\n';
+        so << "recovered_by_call_fraction\t" << recovered(call_bp) << '\n'
+           << "recovered_by_vcf_fraction\t" << recovered(vcf_bp) << '\n'
            << "haplotypes_clean_call\t" << clean_call << '\n'
            << "haplotypes_clean_vcf\t" << clean_vcf << '\n'
            << "small_bp_present\t" << present_small << '\n'
@@ -1890,8 +1877,8 @@ int run_benchmark_command(const std::vector<std::string>& args) {
         so.close();
         if (!so) throw std::runtime_error("failed writing " + finals[0]);
         log.info("present: " + std::to_string(present_bp) + " bp of large events");
-        log.info("missed by call: " + std::to_string(missed_bp) + " bp");
-        log.info("lost in the VCF: " + std::to_string(lost_bp) + " bp more");
+        log.info("left by call: " + std::to_string(call_bp) + " bp");
+        log.info("left by the VCF: " + std::to_string(vcf_bp) + " bp; by the VCF only: " + std::to_string(vcf_only_bp) + " bp");
         log.info("carriers disagreeing with their record: " + std::to_string(mismatching.size()));
         // How each rebuild was made: counts to read when a result looks wrong, warned about where they can
         // mean a loss.
@@ -1906,10 +1893,10 @@ int run_benchmark_command(const std::vector<std::string>& args) {
         };
         warn(sc.unresolved_rows, "carrier event(s) call could not place on the reference");
         warn(sv.not_reconstructable, "VCF record(s) that could not be spelled for some carrier");
-        warn(unspelled_lost["sequence"], "event(s) lost in the VCF at a record whose sequence call left out above its "
+        warn(unspelled_lost["sequence"], "event(s) left by the VCF only, at a record whose sequence call left out above its "
              "--max-seq-bp (call --max-seq-bp 0 writes them all)");
-        warn(unspelled_lost["no_copy"], "event(s) lost in the VCF at a copy-number record with no reference copy to paste");
-        warn(unspelled_lost["other"], "event(s) lost in the VCF at a record that could not be spelled");
+        warn(unspelled_lost["no_copy"], "event(s) left by the VCF only, at a copy-number record with no reference copy to paste");
+        warn(unspelled_lost["other"], "event(s) left by the VCF only, at a record that could not be spelled");
         warn(sc.not_in_vcf, "haplotype(s) with no VCF column");
         warn(sc.unchecked + sc.cn_unchecked, "carrier check(s) skipped: the record has no single SVLEN, or no CN or copy length to compare");
         staged.commit();

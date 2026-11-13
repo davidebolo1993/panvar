@@ -1,5 +1,5 @@
 #!/usr/bin/env Rscript
-# What call's output leaves of the haplotypes' variation, by cause, for one benchmark run or several.
+# What call's output leaves of the haplotypes' variation, by reason, for one benchmark run or several.
 # See --help for usage.
 suppressWarnings(suppressMessages(library(ggplot2)))
 
@@ -10,7 +10,7 @@ usage <- function(status = 0) {
     "",
     "Usage: Rscript plot_benchmark.R [options] [<label>=]<prefix>[:<call min bp>] ...",
     "",
-    "Bars: share of the differences present still left, by cause, for call's events and the VCF; all",
+    "Bars: share of the differences present still left, by reason, for call's events and the VCF; all",
     "differences and those at call's threshold or more. Above --max-grouped runs, one bar per run.",
     "",
     "Options:",
@@ -55,11 +55,13 @@ if ("--only-sites" %in% args) scopes <- scopes["sites"]
 if ("--only-events" %in% args && "--only-bases" %in% args) stop("--only-events and --only-bases exclude each other")
 if ("--only-haplotype" %in% args && "--only-sites" %in% args) stop("--only-haplotype and --only-sites exclude each other")
 
-causes <- c("incomplete", "unresolved", "not_carrier", "no_record", "outside_bubbles")
-reasons <- c("copy_count", "no_sequence", "imprecise", "representative", "other")
-part_levels <- c(paste("missed:", causes), paste("lost in VCF:", reasons))
-palette <- setNames(c("#1f4e79", "#2e75b6", "#6fa8dc", "#9fc5e8", "#cfe2f3",
-                      "#b45f06", "#e69138", "#f6b26b", "#cc4125", "#f9cb9c"), part_levels)
+# a leftover's reason: a cause of call's miss (in either group, a VCF leftover being that miss again), or a
+# VCF reason (lost in writing the VCF)
+causes <- c("incomplete", "not_carrier", "not_reported")
+reasons <- c("no_sequence", "copy_count", "representative", "other")
+part_levels <- c(paste("call:", causes), paste("VCF:", reasons))
+palette <- setNames(c("#1f4e79", "#2e75b6", "#9fc5e8",
+                      "#b45f06", "#e69138", "#cc4125", "#f9cb9c"), part_levels)
 read <- function(p) read.delim(p, colClasses = "character", check.names = FALSE)
 
 # One row per run, scope, size class, stage and part: what is left and what was present.
@@ -75,19 +77,19 @@ for (r in runs) {
   labels <- c(labels, label); prefixes <- c(prefixes, r)
   s <- read(paste0(r, ".summary.tsv"))
   floor_bp <- as.numeric(s[[2]][s[[1]] == "min_sv_bp"])
-  if (!"left_by_vcf_events" %in% s[[1]]) stop(r, ".summary.tsv is from an older benchmark: re-run benchmark")
+  if (!"large_left_vcf" %in% s[[1]]) stop(r, ".summary.tsv is from an older benchmark: re-run benchmark")
   if (floor_bp >= t_call) message(label, ": benchmarked at ", floor_bp, " bp, not below call's ", t_call,
                                    " bp: both sizes show the same differences")
   present <- read(paste0(r, ".present.tsv"))
   if (!"bubbles" %in% names(present)) stop(r, ".present.tsv has no bubbles column: re-run benchmark")
   events <- read(paste0(r, ".events.tsv"))
-  part <- ifelse(events$reason %in% causes, paste("missed:", events$reason), paste("lost in VCF:", events$reason))
+  part <- ifelse(events$reason %in% causes, paste("call:", events$reason), paste("VCF:", events$reason))
   for (sc in names(scopes)) for (sz in c("all", "above")) {
     keep_p <- (sc == "haplotype" | present$bubbles != ".") & (sz == "all" | as.numeric(present$size_bp) >= t_call)
     keep_e <- (sc == "haplotype" | events$bubbles != ".") & (sz == "all" | as.numeric(events$size_bp) >= t_call)
     n_p <- sum(keep_p); bp_p <- sum(as.numeric(present$size_bp[keep_p]))
     for (st in c("call", "VCF")) {
-      k <- keep_e & events$stage == (if (st == "call") "missed_by_call" else "left_by_vcf")
+      k <- keep_e & events$stage == tolower(st)
       if (!any(k)) {
         rows[[length(rows) + 1]] <- data.frame(run = label, call_min_bp = t_call, benchmark_min_bp = floor_bp,
           scope = sc, size = sz, stage = st, part = NA, left = 0, left_bp = 0, present = n_p, present_bp = bp_p)
@@ -102,7 +104,7 @@ for (r in runs) {
 }
 d <- do.call(rbind, rows)
 unknown <- setdiff(na.omit(d$part), part_levels)
-if (length(unknown)) stop("unknown cause in events.tsv: ", unknown[1])
+if (length(unknown)) stop("unknown reason in events.tsv: ", unknown[1])
 
 out <- get("--out", if (length(prefixes) > 1) file.path(dirname(dirname(prefixes[1])), "benchmark.png")
                     else paste0(prefixes[1], ".png"))

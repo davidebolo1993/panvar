@@ -129,7 +129,7 @@ test -f "$BENCH_PREFIX.events.tsv"
 test -f "$BENCH_PREFIX.carrier_checks.tsv"
 # at least one haplotype scored, and the large events present counted
 awk -F '\t' '$1=="haplotypes_scored" { f=1; n=$2 } END { exit(f && n >= 1 ? 0 : 1) }' "$BENCH_PREFIX.summary.tsv"
-awk -F '\t' '$1=="large_events_present" { f=1 } END { exit(f ? 0 : 1) }' "$BENCH_PREFIX.summary.tsv"
+awk -F '\t' '$1=="large_present" { f=1 } END { exit(f ? 0 : 1) }' "$BENCH_PREFIX.summary.tsv"
 
 # The region VCF must be coordinate-sorted (POS non-decreasing) and have unique IDs.
 awk -F '\t' '!/^#/ { if ($2 < prev) { print "VCF not sorted at " $2 " < " prev > "/dev/stderr"; exit 1 } prev=$2 }' \
