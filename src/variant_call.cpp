@@ -1921,6 +1921,7 @@ void call_variants(
         out << "##INFO=<ID=INSSEQ,Number=1,Type=String,Description=\"Inserted sequence of the representative member (see SVLEN)" << seq_limit << "\">\n";
         out << "##INFO=<ID=DELSEQ,Number=1,Type=String,Description=\"Deleted reference sequence of the representative member (see SVLEN)" << seq_limit << "\">\n";
         out << "##INFO=<ID=INVSEQ,Number=1,Type=String,Description=\"Inverted reference sequence of the representative member (see SVLEN)" << seq_limit << "\">\n";
+        out << "##FILTER=<ID=PASS,Description=\"All filters passed: every record written passed --min-sv-bp, --min-haplotypes and --min-alt-af\">\n";
         out << "##ALT=<ID=DEL,Description=\"Deletion\">\n";
         out << "##ALT=<ID=INS,Description=\"Insertion\">\n";
         out << "##ALT=<ID=INV,Description=\"Inversion\">\n";
@@ -5045,7 +5046,7 @@ void call_variants(
             }
             std::ostringstream row;
             row << ref_meta.chrom << '\t' << pos << '\t' << id << '\t' << ref_col
-                << '\t' << alt_col << "\t.\t.\t" << info.str()
+                << '\t' << alt_col << "\t.\tPASS\t" << info.str()
                 << (is_dup ? (e.cn_method == CnMethod::Unit && e.ru_len > 0
                                   ? "\tGT:CN:CNBP:CNRESID:CNINV"
                                   : e.cn_method == CnMethod::Module && e.ru_len > 0
@@ -5535,7 +5536,7 @@ void call_variants(
             const std::string ref_base = off < ref_genome.size() ? std::string(1, ref_genome[off]) : std::string("N");
             OutRecord rec;
             rec.pos = pos; rec.end = end; rec.bubble_id = parent->id; rec.id = id;
-            rec.line = ref_meta.chrom + '\t' + std::to_string(pos) + '\t' + id + '\t' + ref_base + "\t<INV>\t.\t.\t" +
+            rec.line = ref_meta.chrom + '\t' + std::to_string(pos) + '\t' + id + '\t' + ref_base + "\t<INV>\t.\tPASS\t" +
                        info.str() + "\tGT:CN" + gts + '\n';
             out_records.push_back(std::move(rec));
             if (options.write_variant_nodes) {

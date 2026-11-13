@@ -97,6 +97,8 @@ check "DEL REF is the last base of n1" "$(field DEL 4)" "${N1: -1}"
 check "INV REF is the last base of n4" "$(field INV 4)" "${N4: -1}"
 check "INS REF is the last base of n6" "$(field INS 4)" "${N6: -1}"
 
+check "every record is FILTER PASS, which the header defines" \
+  "$(awk -F'\t' '!/^#/{print $7}' "$VCF" | sort -u | paste -sd, -):$(grep -c '^##FILTER=<ID=PASS,' "$VCF")" "PASS:1"
 # The header states the --max-seq-bp the sequences were written with: 60 leaves out the 70 bp DELSEQ.
 "$BIN" call -i "$OUT/cb.sorted.gfa" -c "$OUT/cb.bubbles.csv" -r "$REF_NAME" -o "$OUT/cmax" --max-seq-bp 60 -q >/dev/null 2>&1
 check "--max-seq-bp 60: the header's limit and the DEL's DELSEQ" \
