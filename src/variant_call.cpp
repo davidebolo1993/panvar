@@ -2493,14 +2493,18 @@ void call_variants(
             // events. Base changes between them are left to the identity, as one large insertion carries
             // ordinary divergence.
             if (a.seq_event && b.seq_event) {
-                const double sid = spliced_identity(a, b);
-                if (out_jac) *out_jac = -1.0;
-                if (out_seq) *out_seq = sid;
-                if (out_test) *out_test = "spliced";
                 const long long na = static_cast<long long>(a.ins_bp) - static_cast<long long>(a.del_bp);
                 const long long nb = static_cast<long long>(b.ins_bp) - static_cast<long long>(b.del_bp);
                 const long long dn = na > nb ? na - nb : nb - na;
-                return sid >= options.merge_seq_identity && dn < static_cast<long long>(options.min_sv_bp);
+                const bool len_ok = dn < static_cast<long long>(options.min_sv_bp);
+                if (out_jac) *out_jac = -1.0;
+                if (out_test) *out_test = "spliced";
+                // The length gate is the cheap test: where it fails and the identity is not asked for, it is
+                // not measured.
+                if (!len_ok && out_seq == nullptr) return false;
+                const double sid = spliced_identity(a, b);
+                if (out_seq) *out_seq = sid;
+                return sid >= options.merge_seq_identity && len_ok;
             }
             // The node rules keep the aligned rules' length gate: a record's carriers never differ in
             // length by a structural variant, however many nodes they share (a deletion shares most of
