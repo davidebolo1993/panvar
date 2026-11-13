@@ -3807,6 +3807,14 @@ awk -F'\t' -v OFS='\t' -v d="$D10" '$1=="S" && $2=="D3"{$3=d} {print}' "$OUT/wre
 check "the representative is the event most carriers hold as written (SVLEN:SVLEN_RANGE:AC)" \
   "$(awk -F'\t' '!/^#/{n=split($8,f,";"); for(i=1;i<=n;i++){split(f[i],kv,"="); v[kv[1]]=kv[2]} print v["SVLEN"]":"v["SVLEN_RANGE"]":"v["AC"]}' "$OUT/wrep/v.region.vcf")" \
   "-130:-130,-120:7"
+# --min-alt-af on a copy-number record, tested before the record is written, counts as the writer does: the
+# reference path is out of AN. hgain gains a copy and hr does not: AF 1/2, so 0.5 keeps the CNV.
+printf 'N L 2000 81\nN A3 20 82\nN A2 40 83\nN S 40 84\nN X 60 85\nN R 2000 86\nP ref#0#chr1:0-4220 L+,A3+,A2+,S+,A3+,A2+,X+,R+\nP hgain#1#chr1 L+,A3+,A2+,S+,A3+,A2+,S+,A3+,A2+,X+,R+\nP hr#1#chr1 L+,A3+,A2+,S+,A3+,A2+,X+,R+\n' > "$OUT/cnaf.spec"
+python3 -I "$TOOLS/spec_gfa.py" "$OUT/cnaf.spec" "$OUT/cnaf"
+"$BIN" bubble -i "$OUT/cnaf/g.gfa" -r ref --min-variant-bp 0 -o "$OUT/cnaf.b" --merge-nearby-bp 0 -q >/dev/null 2>&1
+"$BIN" call -i "$OUT/cnaf.b.sorted.gfa" --bubble-prefix "$OUT/cnaf.b" -r ref -o "$OUT/cnaf" --cn --min-alt-af 0.5 -q >/dev/null 2>&1
+check "--min-alt-af 0.5 keeps a CNV written with AF 1/2 (records: SVTYPE AF)" \
+  "$(grep -v '^#' "$OUT/cnaf.region.vcf" | awk -F'\t' '{n=split($8,f,";"); for(i=1;i<=n;i++){split(f[i],kv,"="); v[kv[1]]=kv[2]} printf "%s %s ", v["SVTYPE"], v["AF"]}')" "CNV 0.5 "
 
 # A 52 bp unit U, six copies on the reference, then D, a node spelling U, and E. h2 skips D; h1 skips it too but
 # walks F, a node spelling E, in place of E. h1's replacement is the deletion of D, which slides along the copies,

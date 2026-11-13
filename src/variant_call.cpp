@@ -2705,8 +2705,9 @@ void call_variants(
         // --min-haplotypes / --min-alt-af over a record's carriers, the haplotypes its AC counts, not every
         // haplotype whose CN differs from REF_CN: on UNIT that includes changes too small to make a carrier.
         // --min-alt-af is tested on the AF a record is written with. A copy-number record has no '.'
-        // haplotype, so per path its AN is known here: every haplotype crossing the site. Other records lose
-        // '.' haplotypes from AN when written, and are tested then.
+        // haplotype, so per path its AN is known here, counted as the writer counts it (per_path_counts): the
+        // haplotypes crossing the site, the reference path left out and a haplotype's contigs once where
+        // they agree on carrying it. Other records lose '.' haplotypes from AN when written, and are tested then.
         // With --diploid a slot whose contigs both cross the site is '.' where their values differ, and some
         // of those values (CNBP) are only measured when the record is written. Contigs that differ in GT, CN
         // or CNINV leave the slot out here; a slot of agreeing non-carrier contigs is left out too, so the AF
@@ -2715,8 +2716,22 @@ void call_variants(
             const std::unordered_set<std::string> uniq(mr.carriers.begin(), mr.carriers.end());
             if (uniq.size() < options.min_haplotypes) return false;
             if (options.min_maf > 0.0 && mr.seed.type == EvType::Dup) {
-                std::size_t an = traverses.size(), ac = uniq.size();
-                if (options.diploid) {
+                std::size_t an = 0, ac = 0;
+                if (!options.diploid) {
+                    std::unordered_map<std::size_t, int> slot_gt;   // 1 carrier, 0 not, -1 contigs that differ
+                    for (const std::string& t : traverses) {
+                        const auto pit = name_to_pi.find(t);
+                        if (pit == name_to_pi.end() || path_slot[pit->second] == SIZE_MAX) continue;
+                        const int g = uniq.count(t) != 0 ? 1 : 0;
+                        const auto [it, fresh] = slot_gt.emplace(path_slot[pit->second], g);
+                        if (!fresh && it->second != g) it->second = -1;
+                    }
+                    for (const auto& [slot, g] : slot_gt) {
+                        if (g < 0) continue;
+                        ++an;
+                        if (g == 1) ++ac;
+                    }
+                } else {
                     std::map<std::size_t, std::vector<std::string>> slot_paths;
                     for (const std::string& t : traverses)
                         if (const auto it = slot_of_path.find(t); it != slot_of_path.end()) slot_paths[it->second].push_back(t);
