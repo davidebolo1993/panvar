@@ -911,6 +911,11 @@ modlow=$(awk -F'\t' '/^#CHROM/{for(i=10;i<=NF;i++) if($i=="htest#1#chr1") c=i}
 [ "$modlow" = "SVTYPE=CNV:0:2 SVTYPE=DEL:1:. " ] \
   && ok "MODULE: a copy change under --min-sv-bp is no carrier, reads REF_CN and keeps its own 100 bp deletion" \
   || bad "MODULE non-carrier: records 'SVTYPE:GT:CN' for htest are '$modlow', expected 'SVTYPE=CNV:0:2 SVTYPE=DEL:1:. '"
+# MODBP, the module's own change, is what GT is decided on: htest's -40 bp is under --min-sv-bp, hfull's -100 is not.
+check "MODULE: MODBP decides GT (htest, hfull GT:CN:MODBP)" \
+  "$(awk -F'\t' '/^#CHROM/{for(i=10;i<=NF;i++) c[$i]=i} !/^#/ && /SVTYPE=CNV;/{n=split($9,k,":"); for(j=1;j<=n;j++) x[k[j]]=j
+       for (h in c) if (h == "htest#1#chr1" || h == "hfull#1#chr1") { split($c[h],v,":"); r[h]=v[x["GT"]]":"v[x["CN"]]":"v[x["MODBP"]] }
+       print r["htest#1#chr1"], r["hfull#1#chr1"]}' "$V")" "0:2:-40 1:1:-100"
 # gt_cn <vcf> <sample> <svtype>: that sample's GT:CN on the first record of the type
 gt_cn() { awk -F'\t' -v s="$2" -v t="$3" '/^#CHROM/{for(i=10;i<=NF;i++) if($i==s) c=i}
   !/^#/ && $8 ~ ("SVTYPE="t";") {split($c,g,":"); print g[1]":"g[2]; exit}' "$1"; }
@@ -935,12 +940,12 @@ sed -e 's/^P hfull#1#chr1 /P s1#1#chr1 /' -e 's/^P htest#1#chr1 /P s1#2#chr1 /' 
 python3 -I "$(cd "$(dirname "$0")/.." && pwd)/tools/spec_gfa.py" "$OUT/moddip.spec" "$OUT/moddip"
 "$BIN" bubble -i "$OUT/moddip/g.gfa" -r ref --min-variant-bp 0 -o "$OUT/moddip.b" --merge-nearby-bp 0 --quiet >/dev/null 2>&1
 "$BIN" call -i "$OUT/moddip.b.sorted.gfa" --bubble-prefix "$OUT/moddip.b" -r ref -o "$OUT/moddip" --cn --diploid --quiet >/dev/null 2>&1
-check "--diploid: one carrier and one non-carrier holding its change (s1 GT:CN:CNBP:CNRESID:HCN)" \
-  "$(awk -F'\t' '/^#CHROM/{for(i=10;i<=NF;i++) if($i=="s1") c=i} !/^#/ && /SVTYPE=CNV;/{print $c; exit}' "$OUT/moddip.region.vcf")" "1|0:3:-140:20:1|2"
+check "--diploid: one carrier and one non-carrier holding its change (s1 GT:CN:CNBP:CNRESID:MODBP:HCN)" \
+  "$(awk -F'\t' '/^#CHROM/{for(i=10;i<=NF;i++) if($i=="s1") c=i} !/^#/ && /SVTYPE=CNV;/{print $c; exit}' "$OUT/moddip.region.vcf")" "1|0:3:-140:20:-140:1|2"
 "$BIN" call -i "$OUT/moddip.b.sorted.gfa" --bubble-prefix "$OUT/moddip.b" -r ref -o "$OUT/moddip_af" --cn --diploid \
   --min-alt-af 0.1 --quiet >/dev/null 2>&1
 check "--diploid, the holding deletion filtered out: the non-carrier's measured CN (s1 GT:CN:...:HCN)" \
-  "$(awk -F'\t' '/^#CHROM/{for(i=10;i<=NF;i++) if($i=="s1") c=i} !/^#/ && /SVTYPE=CNV;/{print $c; exit}' "$OUT/moddip_af.region.vcf")" "1|0:2:-140:20:1|1"
+  "$(awk -F'\t' '/^#CHROM/{for(i=10;i<=NF;i++) if($i=="s1") c=i} !/^#/ && /SVTYPE=CNV;/{print $c; exit}' "$OUT/moddip_af.region.vcf")" "1|0:2:-140:20:-140:1|1"
 # htest's deletion holds its change only while it is written: --min-alt-af 0.1 leaves it out (AF 1/14), and the
 # module record then reads its measured CN; so does --diploid, where the sample's own column then reads 1|1.
 "$BIN" call -i "$OUT/modlow.b.sorted.gfa" --bubble-prefix "$OUT/modlow.b" -r ref -o "$OUT/modlow_af" --cn --min-alt-af 0.1 \
@@ -1556,8 +1561,8 @@ check "--cn module: no INS/DEL restates its copies; one copy's +60 bp of L is an
       "$(grep -v '^#' "$V" | grep -c 'CN_METHOD=MODULE;' | tr -d ' '):$(grep -v '^#' "$V" | grep -v '_CNV_' | grep -o 'SVTYPE=[A-Z]*;SVLEN=-\?[0-9]*' | paste -sd, -)" \
       "1:SVTYPE=INS;SVLEN=60"
 # h1 runs both module copies through L, the twin of the reference's T: its copies are whole copies.
-check "--cn module: a copy routed through the twin is a whole copy (h1 GT:CN:CNBP:CNRESID)" \
-      "$(awk -F'\t' '/^#CHROM/{for(i=10;i<=NF;i++) if($i=="h1#1#chr1") c=i} !/^#/ && /CN_METHOD=MODULE;/{print $c}' "$V")" "0:2:0:0"
+check "--cn module: a copy routed through the twin is a whole copy (h1 GT:CN:CNBP:CNRESID:MODBP)" \
+      "$(awk -F'\t' '/^#CHROM/{for(i=10;i<=NF;i++) if($i=="h1#1#chr1") c=i} !/^#/ && /CN_METHOD=MODULE;/{print $c}' "$V")" "0:2:0:0:0"
 check "a path routed through the twin of a kept loop is no variant" \
       "$(grep -vc '^#' "$OUT/w1_route.region.vcf" | tr -d ' ')" "0"
 

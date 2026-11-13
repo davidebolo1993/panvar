@@ -1925,14 +1925,15 @@ void call_variants(
         out << "##ALT=<ID=DEL,Description=\"Deletion\">\n";
         out << "##ALT=<ID=INS,Description=\"Insertion\">\n";
         out << "##ALT=<ID=INV,Description=\"Inversion\">\n";
-        out << "##ALT=<ID=CNV,Description=\"Copy-number variable region: FORMAT/CN gives each haplotype's copy number and GT 1 marks a callable change from REF_CN, a gain or a loss (CN_METHOD=MODULE)\">\n";
+        out << "##ALT=<ID=CNV,Description=\"Copy-number variable region (CN_METHOD=MODULE): FORMAT/CN gives each haplotype's copy number. GT is 1 where CN differs from REF_CN and the module's own nodes change by --min-sv-bp or more (FORMAT/MODBP), a gain or a loss, unless that change lies inside a larger event of the haplotype's own, whose record then holds it\">\n";
         out << "##ALT=<ID=CNV:TR,Description=\"Tandem-repeat copy-number variation: copies of a repeat unit (RU_LEN), counted exactly per haplotype in FORMAT/CN (CN_METHOD=UNIT)\">\n";
         out << (options.diploid
                     ? "##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Per-haplotype genotype of the sample's paths, numbered PanSN haplotypes in order joined by '|'; if the sample also has haplotypes with no number (e.g. HPRC 'U'), each of those is a slot too and every slot is joined by '/' (unphased): 1=carrier, 0=reference-like, .=no allele there (as per path), or two contigs of the haplotype cross the site with different values\">\n"
                     : "##FORMAT=<ID=GT,Number=1,Type=String,Description=\"1=carrier, 0=reference-like, .=no allele there: the haplotype does not cross the site, crosses an assembly gap there, could not be aligned there, or its own larger deletion removes the record's bases\">\n");
-        out << "##FORMAT=<ID=CN,Number=1,Type=Integer,Description=\"Copy number on a CNV record: copies of the repeat unit (CN_METHOD=UNIT) or of the module (MODULE), where a MODULE record's non-carrier (GT 0) reads REF_CN, its change being in its own records; . on other records\">\n";
+        out << "##FORMAT=<ID=CN,Number=1,Type=Integer,Description=\"Copy number on a CNV record: copies of the repeat unit (CN_METHOD=UNIT) or of the module (MODULE). A MODULE non-carrier (GT 0) whose change a written record of its own holds reads REF_CN, so a dosage read off CN does not count it twice; any other haplotype reads its measured copies. . on other records\">\n";
         out << "##FORMAT=<ID=CNBP,Number=1,Type=Integer,Description=\"Actual linear bp gained(+)/lost(-) by this haplotype vs the reference, from the spelled walk (node length x traversal multiplicity minus the reference's): over the bubble interior on CN_METHOD=UNIT; on MODULE, from the haplotype's first to its last module node, everything walked between. Recovers the linear SV size that a one-copy unit does not convey; CNV records only.\">\n";
         out << "##FORMAT=<ID=CNRESID,Number=1,Type=Integer,Description=\"CNBP - (CN-REF_CN) copies of RU_LEN (UNIT) or CN_UNIT_BP (MODULE), with the measured CN (a MODULE non-carrier written as REF_CN keeps its own copies here): the bp this haplotype gained or lost that whole copies do NOT explain. 0 means the whole size difference is copy number; otherwise a partial copy or other sequence changed in the same site, and on MODULE also copies of another size than the reference's\">\n";
+        out << "##FORMAT=<ID=MODBP,Number=1,Type=Integer,Description=\"CN_METHOD=MODULE: this haplotype's bp change over the module's own nodes against the reference's, each visit counted; GT 1 needs it to reach --min-sv-bp (see ALT CNV). CNBP measures over the copies with everything walked between them\">\n";
         out << "##FORMAT=<ID=CNINV,Number=1,Type=Integer,Description=\"CN_METHOD=UNIT only: how many of this haplotype's CN copies run opposite to the reference's copy of the unit (with no reference copy, to the orientation most haplotypes' copies take; when both are equally common, the haplotype's copies in its own less common orientation). 0 means every copy is in the reference orientation; a gain with CNINV above the reference's is an inverted duplication (INFO/INVDUP), and with no reference copy a haplotype holding copies in both orientations\">\n";
         if (options.diploid) {
             out << "##FORMAT=<ID=HCN,Number=1,Type=String,Description=\"--diploid: the copy number of each of the sample's haplotypes, in GT order, joined like GT ('|', or '/' when the sample's GT is unphased); CN is their sum, and CNBP, CNRESID and CNINV are sums too\">\n";
@@ -5050,8 +5051,8 @@ void call_variants(
                 << (is_dup ? (e.cn_method == CnMethod::Unit && e.ru_len > 0
                                   ? "\tGT:CN:CNBP:CNRESID:CNINV"
                                   : e.cn_method == CnMethod::Module && e.ru_len > 0
-                                      ? "\tGT:CN:CNBP:CNRESID"
-                                      : "\tGT:CN:CNBP")
+                                      ? "\tGT:CN:CNBP:CNRESID:MODBP"
+                                      : is_module_cn(e.cn_method) ? "\tGT:CN:CNBP:MODBP" : "\tGT:CN:CNBP")
                            : "\tGT:CN");
             std::vector<OutRecord::CnHeld> held_fix;
             std::vector<std::vector<const MergedRecord*>> held_ptrs;
@@ -5082,12 +5083,16 @@ void call_variants(
                     const bool held_here = is_module_cn(e.cn_method) && !carrier && held != cn_held.end() &&
                                            hs_it != held->second.end();
                     const std::size_t cn_out = held_here ? e.ref_cn : cit->second;
+                    // MODBP: the module's own change, what decides GT at a MODULE record
+                    const auto mbit = mr.sample_bp.find(s);
+                    const std::string modbp = mbit == mr.sample_bp.end() ? std::string(".") : std::to_string(mbit->second);
                     if (held_here) {
                         std::ostringstream m;
                         m << "0:" << cit->second << ':' << sample_cnbp(s);
                         if (e.ru_len > 0)
                             m << ':' << (sample_cnbp(s) - (static_cast<long long>(cit->second) - static_cast<long long>(e.ref_cn)) *
                                                           static_cast<long long>(e.ru_len));
+                        m << ':' << modbp;
                         OutRecord::CnHeld h;
                         h.col = 9 + static_cast<std::size_t>(&s - sample_names.data());
                         h.measured = m.str();
@@ -5107,6 +5112,7 @@ void call_variants(
                             static_cast<long long>(e.ru_len);
                         row << ':' << (this_cnbp - predicted);
                     }
+                    if (is_module_cn(e.cn_method)) row << ':' << modbp;
                     if (e.cn_method == CnMethod::Unit && e.ru_len > 0) {
                         const auto iit = mr.sample_cninv.find(s);
                         row << ':' << (iit == mr.sample_cninv.end() ? std::string(".")
