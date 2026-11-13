@@ -64,7 +64,7 @@ void print_recruit_help() {
         << "Inspecting:\n"
         << "      --dump-index <plx>=<tsv>    Write every k-mer of an index with its label, count outside the locus,\n"
         << "                                  copies within a haplotype, backbone and screen flags and graph nodes\n\n"
-        << "  -t, --threads <N>               Scoring threads (default: Slurm's allocation or the CPUs available)\n"
+        << "  -t, --threads <N>               Scoring threads (default: the CPUs available)\n"
         << "  -q, --quiet                     No progress logs\n"
         << "  -h, --help                      Show this help\n";
 }

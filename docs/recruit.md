@@ -63,7 +63,7 @@ Reads, per sample:
 | `--certain-only` | with `--reads-out`, certain reads only | off |
 | `--summary <path>` | the run's summary | beside the table |
 | `--dump-index <plx>=<tsv>` | write every k-mer of an index as text (columns below), and stop | |
-| `-t, --threads <N>` | scoring threads; a reader and a quarter as many decompression threads run beside them | Slurm's allocation, else all cores |
+| `-t, --threads <N>` | scoring threads; a reader and a quarter as many decompression threads run beside them | the CPUs available |
 | `-q, --quiet` | no progress logs | off |
 
 A sample sheet holds tab-separated lines of sample, file and optionally a mate file (paths relative to the sheet); a sample may take several lines, read in turn. With a sheet, `-o` is a folder holding `<sample>.tsv` per sample.

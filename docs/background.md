@@ -19,7 +19,7 @@ Counts every 31-mer of a set of genomes once, so that `recruit` can tell, for ea
 5. Anchors: closed syncmers ([Edgar 2021](https://doi.org/10.7717/peerj.10805)) that occur once in the coordinate reference are sampled about every kilobase. While a genome is counted, where it holds each anchor is recorded. A reference interval is found in a genome by chaining the anchors it holds inside and around the interval.
 6. A run writes a segment: a complete store of its genomes, in its own folder. `--add` counts more genomes into a new segment of the store; `--segment-only` counts them into a folder in a separate job, and `--attach` commits such folders. A store changes only when its manifest is rewritten, so a reader never sees half a segment, and a lock keeps two jobs from committing at once.
 7. `--merge` streams the segments' sorted partitions into one segment, summing the counts. `--range I/N` splits the partitions among N jobs; the last to finish commits. Merged-away segments stay on disk until `--clean`, since running jobs may still read them.
-8. `--compact` spells the merged store's k-mers as a set of strings, each k-mer once, in strings where consecutive k-mers overlap by 30 bases (extended greedily over the store), so a string of n k-mers holds n + 30 bases, 2 bits each, instead of 31n. SSHash ([Pibiri 2022](https://doi.org/10.1093/bioinformatics/btac245)) then indexes the strings by their minimizers: a minimal perfect hash of the minimizers points to the strings (or string pieces) holding each, and a k-mer is found by hashing its minimizer and checking those few positions; its count is a weight stored along the strings. The dictionary is written beside the store as `<store>.sshash`, about 9 bits per k-mer against about 45 in the store.
+8. `--compact` spells the merged store's k-mers as a set of strings, each k-mer once, in strings where consecutive k-mers overlap by 30 bases (extended greedily over the store), so a string of n k-mers holds n + 30 bases, 2 bits each, instead of 31n. SSHash ([Pibiri 2022](https://doi.org/10.1093/bioinformatics/btac245)) then indexes the strings by their minimizers: a minimal perfect hash of the minimizers points to the strings (or string pieces) holding each, and a k-mer is found by hashing its minimizer and checking those few positions; its count is a weight stored along the strings. The dictionary is written beside the store as `<store>.sshash`.
 
 ## Required inputs
 
@@ -47,7 +47,7 @@ Counts every 31-mer of a set of genomes once, so that `recruit` can tell, for ea
 | `--partitions <N>` | partitions of a new store, a power of two | `4096` |
 | `--memory <size>` | memory bound for counting, such as `16G` | `2G` |
 | `--tmp-dir <dir>` | spill files | `$TMPDIR`, else inside the store |
-| `-t, --threads <N>` | worker threads | Slurm's allocation, else all cores |
+| `-t, --threads <N>` | worker threads | the CPUs available |
 | `-q, --quiet` | no progress logs | off |
 
 ## Outputs
@@ -67,7 +67,7 @@ Counts every 31-mer of a set of genomes once, so that `recruit` can tell, for ea
 
 - k is 31 and the minimizer 11; both are fixed in the store format.
 - A compacted dictionary cannot grow: add genomes to the store and compact again.
-- Counting needs temporary disk of about a byte per genome base for the spill files, and several times that for sorted runs when `--memory` is small (whole GRCh38 with 32 GB: 3 GB of spill, 18 GB of runs); put `--tmp-dir` on a local disk.
+- Counting needs temporary disk of about a byte per genome base for the spill files, and several times that for sorted runs when `--memory` is small; put `--tmp-dir` on a local disk.
 - Anchors find a locus in a genome only where the genome holds enough of the interval's anchors in order; a copy broken across contigs, or inverted, is found in pieces.
 - A graph genome without PanSN path names counts as one haplotype, which lowers the shared cut of `recruit` for it.
 

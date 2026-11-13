@@ -61,7 +61,7 @@ void print_background_help() {
         << "      --locate <region>           Where each genome holds a region of the coordinate reference\n"
         << "      --dump <path>               Every k-mer and its count (segments summed), as TSV\n"
         << "      --verify <path>             Check that another background (store or .sshash) holds the same counts\n\n"
-        << "  -t, --threads <N>               Worker threads (default: Slurm's allocation or the CPUs available)\n"
+        << "  -t, --threads <N>               Worker threads (default: the CPUs available)\n"
         << "  -q, --quiet                     No progress logs\n"
         << "  -h, --help                      Show this help\n";
 }
