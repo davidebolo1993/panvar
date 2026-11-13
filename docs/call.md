@@ -89,7 +89,7 @@ VCF 4.2. `POS` is the base before the event, `END` its last reference base. `FIL
 | `SVTYPE`, `SVLEN`, `END` | type, length change (an inversion: its length), last base |
 | `INSSEQ`, `DELSEQ`, `INVSEQ`, `SUBSTITUTION` | the event's sequence, left out above `--max-seq-bp` (20,000) so VCF tools can read the lines. A replacement (`SUB`, or a `DEL`/`INS` flagged `SUBSTITUTION`) is spelled in `REF` and `ALT` where both sides fit and its breakpoints are exact |
 | `IMPRECISE`, `CIPOS`, `CIEND`, `HOMLEN` | uncertain or sliding breakpoints: `IMPRECISE` marks a cluster of pieces (`END`-`POS` wider than \|`SVLEN`\|), a breakpoint at an N run of the reference, or a `PATH_INVERSION` whose breakpoints lie in repeats; its `CIPOS`/`CIEND` give how far each breakpoint can lie |
-| `AN`, `AC`, `AF` | haplotypes with an allele at the site (not `.`), carriers, ratio |
+| `AN`, `AC`, `AF` | haplotypes with an allele at the site (not `.`), carriers, ratio. The reference path is left out, and a haplotype in several contigs counts once (not at all where its contigs disagree), as with `--diploid` |
 | `BUBBLE_ID`, `START_NODE`, `END_NODE`, `EVENT_NODES` | the site and the event's nodes; a `PATH_INVERSION`, typed from the walks, has no nodes |
 | `CN_METHOD`, `REF_CN`, `RU_LEN` | how copies were counted, the reference's count, a unit copy's length; a `CNV`'s `POS`+1..`END` covers the reference's copies |
 | `NMERGED`, `SVLEN_RANGE`, `MERGE_*` | how many carriers were merged and how much they differ |

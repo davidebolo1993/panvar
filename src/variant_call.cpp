@@ -1532,7 +1532,75 @@ void call_variants(
         out += '\n';
         return out;
     };
-    auto emit = [&](std::ostream& o, const std::string& line) { o << (options.diploid ? to_diploid(line) : line); };
+    // Per-path columns: AN/AC/AF over haplotypes, as --diploid counts slots. The reference path leaves AN, and a
+    // haplotype assembled in several contigs (PanSN sample#haplotype, numbered) counts once where its contigs
+    // that have an allele agree on it, not at all where they differ. A path with no numbered haplotype is one
+    // of its own.
+    std::vector<std::size_t> path_slot(sample_names.size(), SIZE_MAX);
+    {
+        std::map<std::string, std::size_t> slot_of;
+        for (std::size_t i = 0; i < sample_names.size(); ++i) {
+            if (i == ref_column) continue;
+            const std::string& n = sample_names[i];
+            const std::size_t a = n.find('#');
+            const std::size_t b = a == std::string::npos ? std::string::npos : n.find('#', a + 1);
+            const std::string h = a == std::string::npos ? std::string() : n.substr(a + 1, b == std::string::npos ? std::string::npos : b - a - 1);
+            const bool numbered = !h.empty() && h.size() < 18 && h.find_first_not_of("0123456789") == std::string::npos;
+            const std::string key = numbered ? n.substr(0, b) : "\x01" + n;
+            path_slot[i] = slot_of.emplace(key, slot_of.size()).first->second;
+        }
+    }
+    auto per_path_counts = [&](const std::string& line) -> std::string {
+        std::vector<std::string> f;
+        {
+            std::size_t a = 0;
+            const std::size_t n = line.size() - (line.empty() || line.back() != '\n' ? 0 : 1);
+            while (a <= n) {
+                const std::size_t b = line.find('\t', a);
+                const std::size_t e = (b == std::string::npos || b > n) ? n : b;
+                f.push_back(line.substr(a, e - a));
+                a = e + 1;
+            }
+        }
+        if (f.size() < 10 || f.size() - 9 != sample_names.size()) return line;
+        std::unordered_map<std::size_t, std::string> slot_gt;   // slot -> its agreed GT ("?" where they differ)
+        for (std::size_t i = 0; i < sample_names.size(); ++i) {
+            if (path_slot[i] == SIZE_MAX) continue;
+            const std::string& c = f[9 + i];
+            const std::string gt = c.substr(0, c.find(':'));
+            if (gt == ".") continue;
+            auto [it, fresh] = slot_gt.emplace(path_slot[i], gt);
+            if (!fresh && it->second != gt) it->second = "?";
+        }
+        long long an = 0, ac = 0;
+        for (const auto& [k, g] : slot_gt) {
+            if (g == "?") continue;
+            ++an;
+            if (g != "0") ++ac;
+        }
+        std::string info, sep;
+        std::size_t a = 0;
+        const std::string& in = f[7];
+        while (a <= in.size()) {
+            const std::size_t b = std::min(in.find(';', a), in.size());
+            std::string kv = in.substr(a, b - a);
+            if (kv.rfind("AN=", 0) == 0) kv = "AN=" + std::to_string(an);
+            else if (kv.rfind("AC=", 0) == 0) kv = "AC=" + std::to_string(ac);
+            else if (kv.rfind("AF=", 0) == 0) {
+                char buf[32]; std::snprintf(buf, sizeof(buf), "%.4g", an > 0 ? static_cast<double>(ac) / an : 0.0);
+                kv = std::string("AF=") + buf;
+            }
+            info += sep + kv; sep = ";";
+            a = b + 1;
+        }
+        f[7] = info;
+        std::string out;
+        for (std::size_t k = 0; k < f.size(); ++k) { if (k) out += '\t'; out += f[k]; }
+        return out + '\n';
+    };
+    // A record line as it is written: per sample with --diploid, else per path with AN over haplotypes.
+    auto written = [&](const std::string& line) { return options.diploid ? to_diploid(line) : per_path_counts(line); };
+    auto emit = [&](std::ostream& o, const std::string& line) { o << written(line); };
     // --min-alt-af against the AF a record line is written with, AC/AN (after to_diploid with --diploid).
     const auto af_below = [&](const std::string& line) {
         std::size_t from = 0;   // INFO is the eighth column
@@ -1915,8 +1983,8 @@ void call_variants(
         out << "##INFO=<ID=MERGE_SEQID,Number=1,Type=Float,Description=\"Strongest sequence identity over the same directly matching pairs, counted only where the Jaccard gate did not decide the pair\">\n";
         out << "##INFO=<ID=MERGE_DIRECT_FRAC,Number=1,Type=Float,Description=\"Share of member pairs of the merged component that match each other directly (same test as the merge). For node-comparison events (transitive single-linkage) below 1 means some members joined only through a chain; for events from aligned alleles (merged around a representative) it means members matched only through the representative. Force-called members are not counted. Absent on unmerged records\">\n";
         out << "##INFO=<ID=MERGE_SIZE_RATIO,Number=1,Type=Float,Description=\"The smaller over the larger size in SVLEN_RANGE; absent where the range crosses zero\">\n";
-        out << "##INFO=<ID=AN,Number=1,Type=Integer,Description=\"Allele number = haplotypes crossing the site that have an allele there (GT not .)\">\n";
-        out << "##INFO=<ID=AC,Number=A,Type=Integer,Description=\"Allele count = carrier haplotypes\">\n";
+        out << "##INFO=<ID=AN,Number=1,Type=Integer,Description=\"Allele number: haplotypes with an allele at the site (GT not .). The reference path is left out, and a haplotype assembled in several contigs (PanSN sample#haplotype) counts once where those with an allele agree on it, not at all where they differ\">\n";
+        out << "##INFO=<ID=AC,Number=A,Type=Integer,Description=\"Allele count: haplotypes of AN that carry the allele\">\n";
         out << "##INFO=<ID=AF,Number=A,Type=Float,Description=\"Allele frequency = AC/AN; --min-alt-af is tested on it\">\n";
         out << "##INFO=<ID=INSSEQ,Number=1,Type=String,Description=\"Inserted sequence of the representative member (see SVLEN)" << seq_limit << "\">\n";
         out << "##INFO=<ID=DELSEQ,Number=1,Type=String,Description=\"Deleted reference sequence of the representative member (see SVLEN)" << seq_limit << "\">\n";
@@ -5511,7 +5579,7 @@ void call_variants(
         for (const OutRecord& r : out_records) {
             if (r.line.find("\tSVTYPE=INV;") == std::string::npos && r.line.find(";SVTYPE=INV;") == std::string::npos)
                 continue;
-            if (options.min_maf > 0.0 && af_below(options.diploid ? to_diploid(r.line) : r.line)) continue;   // not written
+            if (options.min_maf > 0.0 && af_below(written(r.line))) continue;   // not written
             site_inv.emplace_back(r.pos, r.end);
         }
         std::size_t written = 0, no_site = 0;
@@ -5608,7 +5676,7 @@ void call_variants(
         std::unordered_set<std::string> dropped;
         std::size_t no_column = 0;
         out_records.erase(std::remove_if(out_records.begin(), out_records.end(), [&](const OutRecord& r) {
-            const std::string w = options.diploid ? to_diploid(r.line) : r.line;
+            const std::string w = written(r.line);
             if (w.empty()) ++no_column;
             else if (options.min_maf <= 0.0 || !af_below(w)) return false;
             dropped.insert(r.id);

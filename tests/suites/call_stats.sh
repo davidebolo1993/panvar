@@ -1647,7 +1647,7 @@ VCF="$OUT/gap.region.vcf"
 check "a haplotype crossing an assembly gap: GT on the substitution, typed INS by its net change" \
   "$(gt_of "$VCF" hgap INS):$(info INS SVLEN):$(grep -v '^#' "$VCF" | grep -c SUBSTITUTION)" ".:60:1"
 check "the gap haplotype is out of AN; the case variant joins its allele (INS AN:AC)" \
-  "$(info INS AN):$(info INS AC)" "3:2"
+  "$(info INS AN):$(info INS AC)" "2:2"
 # Aligned, the replacement is trimmed of the bases A and B share at either end, so ALT, after its base at
 # POS, is part of B.
 ins=$(field INS 5 | cut -c2-)
@@ -1767,12 +1767,12 @@ big_gfa "$OUT/big4.gfa" 2001
 "$BIN" call -i "$OUT/big4.gfa" -c "$OUT/big4.bubbles.csv" -r ref -o "$OUT/big4" -q >/dev/null 2>&1
 VCF="$OUT/big4.region.vcf"
 check "a 2001 x 2001-node stretch is compared: hbig carries its SUB, not the DEL (GT SUB:GT DEL:AN:AC)" \
-  "$(gt_of "$VCF" hbig SUB):$(gt_of "$VCF" hbig DEL):$(info DEL AN):$(info DEL AC)" "1:0:4:2"
+  "$(gt_of "$VCF" hbig SUB):$(gt_of "$VCF" hbig DEL):$(info DEL AN):$(info DEL AC)" "1:0:3:2"
 big_gfa "$OUT/big.gfa" 8001
 big_log=$("$BIN" call -i "$OUT/big.gfa" -c "$OUT/big.bubbles.csv" -r ref -o "$OUT/big" 2>&1 >/dev/null)
 VCF="$OUT/big.region.vcf"
 check "a haplotype with an unaligned stretch is unknown on the bubble's DEL (GT:AN:AC)" \
-  "$(gt_of "$VCF" hbig DEL):$(info DEL AN):$(info DEL AC)" ".:3:2"
+  "$(gt_of "$VCF" hbig DEL):$(info DEL AN):$(info DEL AC)" ".:2:2"
 printf '%s\n' "$big_log" | grep -q 'blocks too large to align: [0-9]* (sites 1); GT . there: 1' \
   && ok "the run summary names the bubble with the unaligned stretch" \
   || bad "the run summary does not name the unaligned bubble: $(printf '%s' "$big_log" | grep -i align)"
@@ -2109,7 +2109,7 @@ printf '%s\n1,S,+,K,+,1,3,4,2,2,2,2,0,120,"A"\n' "$MOD_HDR" > "$OUT/bgap.bubbles
 bgap_log=$("$BIN" call -i "$OUT/bgap.gfa" -c "$OUT/bgap.bubbles.csv" -r ref -o "$OUT/bgap" 2>&1 >/dev/null)
 VCF="$OUT/bgap.region.vcf"
 check "an assembly gap in a site's source and sink leaves its deletion called (SVLEN:AN:AC:set missing)" \
-  "$(info DEL SVLEN):$(info DEL AN):$(info DEL AC):$(printf '%s\n' "$bgap_log" | grep -c 'GT . across an assembly gap')" "-120:4:2:0"
+  "$(info DEL SVLEN):$(info DEL AN):$(info DEL AC):$(printf '%s\n' "$bgap_log" | grep -c 'GT . across an assembly gap')" "-120:3:2:0"
 
 # ---- a folded repeat as a unit graph (panphorte's default approximate fold) ----------------------
 # Copies of a 64 bp unit, two with a SNV of their own: the unit graph keeps every copy's sequence, so no node
@@ -2219,6 +2219,13 @@ for o in agree differ; do "$BIN" call -i "$OUT/dip_$o.gfa" -c "$OUT/dip.csv" -r 
   --no-per-bubble-vcf -q >/dev/null 2>&1; done
 check "--diploid: agreeing contigs carry the record, disagreeing ones leave no AC=0 record (AC agree | records differ)" \
   "$(grep -v '^#' "$OUT/dip_agree.region.vcf" | grep -o ';AC=[0-9]*' | head -1)|$(grep -vc '^#' "$OUT/dip_differ.region.vcf")" ";AC=1|0"
+# Per path the same counting: AN and AC over haplotypes, the reference path left out. Agreeing, S1#1's two
+# contigs are one carrier (AN 3: S1#1, S2#1, S2#2); disagreeing, S1#1 is in neither, though both columns read.
+for o in agree differ; do "$BIN" call -i "$OUT/dip_$o.gfa" -c "$OUT/dip.csv" -r 'ref#0#chr1:1-520' -o "$OUT/pp_$o" \
+  --no-per-bubble-vcf -q >/dev/null 2>&1; done
+check "per path: a haplotype in two contigs counts once, the reference not at all (AN;AC agree | differ)" \
+  "$(grep -v '^#' "$OUT/pp_agree.region.vcf" | grep -o 'AN=[0-9]*;AC=[0-9]*' | head -1)|$(grep -v '^#' "$OUT/pp_differ.region.vcf" | grep -o 'AN=[0-9]*;AC=[0-9]*' | head -1)" \
+  "AN=3;AC=1|AN=2;AC=0"
 
 # Events right after an N run in the reference: the source node ends in 200 N, A (120 bp) is deleted by h2/h3 and
 # I (80 bp) inserted before A by h4/h5. Each breakpoint is known only to within the run, and both records were
@@ -3367,8 +3374,8 @@ check "two replacements merged: records, SVLEN_RANGE and MERGE_SIZE_RATIO by net
 
 # ---------------------------------------------------------------------------------------------
 # --min-alt-af is tested on the AF the record is written with. Per path: hBig deletes a, b and c, so it
-# has no allele at hSmall's deletion of b (GT .), whose AF is 1/3; hBig's own is 1/4. Per sample
-# (--diploid): the reference path is no column, so S1's deletion is 1 of 4 haplotypes.
+# has no allele at hSmall's deletion of b (GT .), whose AF is 1/2; hBig's own is 1/3 (the reference path is
+# out of AN). Per sample (--diploid): S1's deletion is 1 of 4 haplotypes.
 # ---------------------------------------------------------------------------------------------
 d="$OUT/maf"; mkdir -p "$d"
 { printf 'H\tVN:Z:1.0\nS\tf1\t%s\nS\ta\t%s\nS\tb\t%s\nS\tc\t%s\nS\tf2\t%s\n' \
@@ -3382,16 +3389,16 @@ svlens() { awk -F'\t' '!/^#/ { k = split($8, a, ";"); for (i = 1; i <= k; i++) i
 # and file are checked: an empty result alone would also pass for a run that failed. The log counts only
 # the '.' genotypes of records written.
 maf_runs=""
-for af in 0 0.3 0.34; do
+for af in 0 0.4 0.51; do
   "$BIN" call -i "$d/g.gfa" -c "$d/g.csv" -r 'ref#0#chr1:1-500' -o "$d/af$af" --min-alt-af "$af" > "$d/af$af.log" 2>&1
   maf_runs="$maf_runs$? $([ -f "$d/af$af.region.vcf" ] && echo vcf || echo none) "
 done
-check "--min-alt-af 0 / 0.3 / 0.34: exit status and VCF" "$maf_runs" "0 vcf 0 vcf 0 vcf "
-check "--min-alt-af 0 / 0.3 / 0.34 keep the records written with AF at or above it" \
-  "$(svlens "$d/af0.region.vcf")| $(svlens "$d/af0.3.region.vcf")| $(svlens "$d/af0.34.region.vcf")" \
-  "SVLEN=-300 AF=0.25 SVLEN=-100 AF=0.3333 | SVLEN=-100 AF=0.3333 | "
-check "--min-alt-af: the log's 'GT . within a larger deletion' counts written records only (0 / 0.3 / 0.34)" \
-  "$(for af in 0 0.3 0.34; do printf '%s ' "$(grep -c 'GT . within a larger deletion' "$d/af$af.log")"; done)" "1 1 0 "
+check "--min-alt-af 0 / 0.4 / 0.51: exit status and VCF" "$maf_runs" "0 vcf 0 vcf 0 vcf "
+check "--min-alt-af 0 / 0.4 / 0.51 keep the records written with AF at or above it" \
+  "$(svlens "$d/af0.region.vcf")| $(svlens "$d/af0.4.region.vcf")| $(svlens "$d/af0.51.region.vcf")" \
+  "SVLEN=-300 AF=0.3333 SVLEN=-100 AF=0.5 | SVLEN=-100 AF=0.5 | "
+check "--min-alt-af: the log's 'GT . within a larger deletion' counts written records only (0 / 0.4 / 0.51)" \
+  "$(for af in 0 0.4 0.51; do printf '%s ' "$(grep -c 'GT . within a larger deletion' "$d/af$af.log")"; done)" "1 1 0 "
 dd="$OUT/maf_diploid"; mkdir -p "$dd"
 { grep -v '^P' "$d/g.gfa"
   printf 'P\tref#0#chr1:1-500\tf1+,a+,b+,c+,f2+\t*\nP\tS1#1#c\tf1+,b+,c+,f2+\t*\nP\tS1#2#c\tf1+,a+,b+,c+,f2+\t*\n'
@@ -3406,7 +3413,7 @@ check "--diploid --min-alt-af 0.25 / 0.26: exit status and VCF" "$dip_runs" "0 v
 check "--diploid --min-alt-af 0.25 / 0.26 against the written AF of 1 in 4" \
   "$(svlens "$dd/af0.25.region.vcf")| $(svlens "$dd/af0.26.region.vcf")" "SVLEN=-100 AF=0.25 | "
 check "a record --min-alt-af drops is in neither the per-site VCF nor the node table (records in each)" \
-  "$(grep -vc '^#' "$d"/af0.3.bubble_1.vcf) $(tail -n +2 "$d/af0.3.variant_nodes.tsv" | wc -l | tr -d ' ')" "1 1"
+  "$(grep -vc '^#' "$d"/af0.4.bubble_1.vcf) $(tail -n +2 "$d/af0.4.variant_nodes.tsv" | wc -l | tr -d ' ')" "1 1"
 
 # ---------------------------------------------------------------------------------------------
 # Site ids start at 1: 0 is what "no site" is written as, so a table holding one is refused.
@@ -3644,8 +3651,8 @@ check "80 sites with records under an open-file limit of 40: exit status, per-si
   "0 80 wrote 83 files 83"
 "$BIN" call -i "$OUT/cb.sorted.gfa" -c "$OUT/cb.bubbles.csv" -r "$REF_NAME" -o "$OUT/short_t" -t 1 -q >/dev/null 2>&1
 check "-t is --threads (exit status, records)" "$? $(grep -vc '^#' "$OUT/short_t.region.vcf" 2>/dev/null)" "0 3"
-check "the log names no per-site VCF where none was written (records dropped: --min-alt-af 0.34)" \
-  "$(grep -c 'bubble_<id>' "$OUT/maf/af0.34.log") $(grep -o 'wrote [0-9]* files' "$OUT/maf/af0.34.log")" "0 wrote 3 files"
+check "the log names no per-site VCF where none was written (records dropped: --min-alt-af 0.51)" \
+  "$(grep -c 'bubble_<id>' "$OUT/maf/af0.51.log") $(grep -o 'wrote [0-9]* files' "$OUT/maf/af0.51.log")" "0 wrote 3 files"
 
 # ---------------------------------------------------------------------------------------------
 # A unit-graph table from another run, whose node ids all exist here, is refused: its one-node unit does
@@ -3714,9 +3721,9 @@ gsplit() { # gsplit <name> <ref steps> <hA> <hB> <hC> [hD]: hA..hD's GT on the D
   VCF="$OUT/$1/v.region.vcf"
   printf '%s %s %s' "${out:--}" "$(info DEL AN)" "$(grep -c 'assembly gap' "$OUT/$1/log")"; }
 check "a 9 N reference beside an 18 N haplotype on shared nodes: hA..hC GT, AN, gap lines" \
-  "$(gsplit gs3 S+,N1+,D+,K+ S+,N1+,N2+,D+,K+ S+,N1+,K+ S+,N1+,D+,K+)" ".10 3 1"
+  "$(gsplit gs3 S+,N1+,D+,K+ S+,N1+,N2+,D+,K+ S+,N1+,K+ S+,N1+,D+,K+)" ".10 2 1"
 check "a 9 N haplotype on a node of an 18 N one: hA..hD GT, AN, gap lines" \
-  "$(gsplit gs2 S+,D+,K+ S+,N1+,N2+,K+ S+,K+ S+,N1+,D+,K+ S+,D+,K+)" ".100 4 1"
+  "$(gsplit gs2 S+,D+,K+ S+,N1+,N2+,K+ S+,K+ S+,N1+,D+,K+ S+,D+,K+)" ".100 3 1"
 # A gap split across two partly-N nodes (X ends in 5 N, Y starts with 5): h1, and h2 stored on the other
 # strand, cross it and are '.'; h3's 5 N on X alone are no gap, and its 65 bp insertion is called.
 { printf 'N S 100 341\nN K 100 342\nN X =%sNNNNN\nN Y =NNNNN%s\n' "$(blk 60 351)" "$(blk 60 352)"
@@ -3728,7 +3735,7 @@ python3 -I "$TOOLS/spec_gfa.py" "$OUT/pgap.spec" "$OUT/pgap"
 VCF="$OUT/pgap/v.region.vcf"
 check "a gap split across two partly-N nodes: records, h1 h2 h3 GT, SVLEN, AN, gap line" \
   "$(grep -vc '^#' "$VCF") $(gt_of "$VCF" h1 INS)$(gt_of "$VCF" h2 INS)$(gt_of "$VCF" h3 INS) $(info INS SVLEN) $(info INS AN) $(grep -o 'GT . across an assembly gap: [0-9]*' "$OUT/pgap/log")" \
-  "1 ..1 65 2 GT . across an assembly gap: 2"
+  "1 ..1 65 1 GT . across an assembly gap: 2"
 "$BIN" call -i "$OUT/pgap/g.gfa" -c "$OUT/pgap/g.bubbles.csv" -r 'ref#0#chr1:1-200' -o "$OUT/pgap/one" \
   --no-per-bubble-vcf --no-variant-nodes > "$OUT/pgap/one.log" 2>&1
 check "one file written: the log says 'file'" "$(grep -o 'wrote 1 file[s]* in' "$OUT/pgap/one.log")" "wrote 1 file in"
