@@ -1876,7 +1876,7 @@ void call_variants(
         out << "##INFO=<ID=SVTYPE,Number=1,Type=String,Description=\"Structural variant type\">\n";
         out << "##INFO=<ID=SVLEN,Number=A,Type=Integer,Description=\"ALT-REF length difference for DEL/INS (negative for a deletion). A DEL/INS/INV record merged across haplotypes reports POS, END, SVLEN and its sequence from one representative member: the exact event carried by the most haplotypes (ties: the larger). Members' sizes are in SVLEN_RANGE; the record is kept by --min-sv-bp on its largest member, so a representative can be smaller than that."
             << " For INV, the length of the inverted segment, which changes no length; for CNV see CN_SCOPE. Absent on CN_SCOPE=COLLAPSED_MODULE records, and on a CN_METHOD=UNIT record whose carriers both gain and lose copies: no single record-level size exists there -- read SVLEN_RANGE, or FORMAT:CN and CNBP for the per-sample size. A UNIT record whose carriers all change in one direction gives its largest change\">\n";
-        out << "##INFO=<ID=SVLEN_RANGE,Number=2,Type=Integer,Description=\"Min,max length change among merged members, signed as SVLEN (when they differ); a substitution merged with deletions or insertions counts by its net change. On a CN_METHOD=UNIT CNV: the smallest and largest carrier change, (CN-REF_CN)*RU_LEN in bp\">\n";
+        out << "##INFO=<ID=SVLEN_RANGE,Number=2,Type=Integer,Description=\"Min,max length change among the events merged into this record (every event each member brought), signed as SVLEN, when they differ; a substitution counts by its net change. On an INV, the inverted lengths. On a CN_METHOD=UNIT CNV: the smallest and largest carrier change, (CN-REF_CN)*RU_LEN in bp\">\n";
         out << "##INFO=<ID=BUBBLE_ID,Number=1,Type=Integer,Description=\"panvar bubble identifier\">\n";
         out << "##INFO=<ID=START_NODE,Number=1,Type=String,Description=\"First graph node of the event (of the representative member on a merged record; see SVLEN)\">\n";
         out << "##INFO=<ID=END_NODE,Number=1,Type=String,Description=\"Last graph node of the event\">\n";
@@ -1912,7 +1912,7 @@ void call_variants(
         out << "##INFO=<ID=MERGE_JACCARD,Number=1,Type=Float,Description=\"Strongest node-set Jaccard over the pairs of merged members that match directly (every pair of the component, not only the pairs the merge sweep tested), and over force-called members against the representative\">\n";
         out << "##INFO=<ID=MERGE_SEQID,Number=1,Type=Float,Description=\"Strongest sequence identity over the same directly matching pairs, counted only where the Jaccard gate did not decide the pair\">\n";
         out << "##INFO=<ID=MERGE_DIRECT_FRAC,Number=1,Type=Float,Description=\"Share of member pairs of the merged component that match each other directly (same test as the merge). For node-comparison events (transitive single-linkage) below 1 means some members joined only through a chain; for events from aligned alleles (merged around a representative) it means members matched only through the representative. Force-called members are not counted. Absent on unmerged records\">\n";
-        out << "##INFO=<ID=MERGE_SIZE_RATIO,Number=1,Type=Float,Description=\"Smallest/largest member size among merged members; a substitution merged with deletions or insertions counts by its net change, and min,max are then also in SVLEN_RANGE, as on a DEL or INS record. On a SVTYPE=SUB record a member's size is the larger side of the run it replaces, while SVLEN_RANGE gives the members' net changes\">\n";
+        out << "##INFO=<ID=MERGE_SIZE_RATIO,Number=1,Type=Float,Description=\"The smaller over the larger size in SVLEN_RANGE; absent where the range crosses zero\">\n";
         out << "##INFO=<ID=AN,Number=1,Type=Integer,Description=\"Allele number = haplotypes crossing the site that have an allele there (GT not .)\">\n";
         out << "##INFO=<ID=AC,Number=A,Type=Integer,Description=\"Allele count = carrier haplotypes\">\n";
         out << "##INFO=<ID=AF,Number=A,Type=Float,Description=\"Allele frequency = AC/AN; --min-alt-af is tested on it\">\n";
@@ -4794,58 +4794,40 @@ void call_variants(
                 if (e.type == EvType::Del || (rp && rp_ins.empty() && !rp_del.empty())) info << ";CIEND=0," << homlen;
             }
             if (rep_sized && rep_min != rep_max) info << ";SVLEN_RANGE=" << rep_min << "," << rep_max;
-            // A record merging substitutions with deletions or insertions: every member by its own net
-            // change, the quantity SVLEN gives, as a substitution's size is its larger side.
-            bool sub_mixed = false;
-            long long mix_lo = 0, mix_hi = 0;
+            // Members' sizes by their net change, the quantity SVLEN gives: every event each remaining member
+            // brought into the record (an allele can bring two), so the representative's is among them. A
+            // substitution's size is its larger side, which would not compare with SVLEN.
             if (e.type == EvType::Del || e.type == EvType::Ins || e.type == EvType::Sub) {
-                bool has_sub = false, has_other = false, any = false;
+                bool any = false;
+                long long lo = 0, hi = 0;
                 for (const std::size_t ai : mr.member_alleles) {
                     const auto me = mr.member_event.find(ai);
-                    if (me == mr.member_event.end() || me->second.empty()) continue;
-                    long long own = 0;
+                    if (me == mr.member_event.end()) continue;
                     for (const Event& m : me->second) {
-                        has_sub = has_sub || m.type == EvType::Sub;
-                        has_other = has_other || m.type != EvType::Sub;
                         const long long n = m.type == EvType::Ins ? static_cast<long long>(m.size_bp)
                                           : m.type == EvType::Del ? -static_cast<long long>(m.size_bp)
                                           : static_cast<long long>(m.ins_bp) - static_cast<long long>(m.del_bp);
-                        if (std::llabs(n) > std::llabs(own)) own = n;
+                        if (!any) { lo = hi = n; any = true; }
+                        else { lo = std::min(lo, n); hi = std::max(hi, n); }
                     }
-                    if (!any) { mix_lo = mix_hi = own; any = true; }
-                    else { mix_lo = std::min(mix_lo, own); mix_hi = std::max(mix_hi, own); }
                 }
-                sub_mixed = has_sub && has_other && any;
-            }
-            if (sub_mixed) {
-                if (mix_lo != mix_hi) {
-                    info << ";SVLEN_RANGE=" << mix_lo << "," << mix_hi;
-                    const long long lo = std::min(std::llabs(mix_lo), std::llabs(mix_hi));
-                    const long long hi = std::max(std::llabs(mix_lo), std::llabs(mix_hi));
-                    if (hi > 0) {
+                if (any && lo != hi) {
+                    info << ";SVLEN_RANGE=" << lo << "," << hi;
+                    const long long a = std::min(std::llabs(lo), std::llabs(hi));
+                    const long long b = std::max(std::llabs(lo), std::llabs(hi));
+                    if (b > 0 && (lo > 0) == (hi > 0)) {
                         char buf[32];
-                        std::snprintf(buf, sizeof(buf), "%.4g", static_cast<double>(lo) / static_cast<double>(hi));
+                        std::snprintf(buf, sizeof(buf), "%.4g", static_cast<double>(a) / static_cast<double>(b));
                         info << ";MERGE_SIZE_RATIO=" << buf;
                     }
                 }
-            } else if (e.type == EvType::Sub && !mr.member_net.empty()) {
-                // a substitution's members by their net change, the quantity its SVLEN gives
-                bool any = false; long long a = 0, b = 0;
-                for (const auto& [ai, n] : mr.member_net) {
-                    if (!mr.member_alleles.count(ai)) continue;   // a member the copy-change step removed
-                    if (!any) { a = b = n; any = true; } else { a = std::min(a, n); b = std::max(b, n); }
-                }
-                if (any && a != b) info << ";SVLEN_RANGE=" << a << "," << b;
-            }
-            if (!sub_mixed && e.type != EvType::Dup && mr.min_size_bp != mr.max_size_bp) {
-                const long long sign = svlen < 0 ? -1 : 1;
-                const long long a = sign * static_cast<long long>(mr.min_size_bp);
-                const long long b = sign * static_cast<long long>(mr.max_size_bp);
-                if (e.type != EvType::Sub) info << ";SVLEN_RANGE=" << std::min(a, b) << "," << std::max(a, b);
-                if (mr.max_size_bp > 0) {
+            } else if (e.type != EvType::Dup && mr.min_size_bp != mr.max_size_bp) {
+                const long long a = static_cast<long long>(mr.min_size_bp);
+                const long long b = static_cast<long long>(mr.max_size_bp);
+                info << ";SVLEN_RANGE=" << a << "," << b;
+                if (b > 0) {
                     char buf[32];
-                    std::snprintf(buf, sizeof(buf), "%.4g",
-                                  static_cast<double>(mr.min_size_bp) / static_cast<double>(mr.max_size_bp));
+                    std::snprintf(buf, sizeof(buf), "%.4g", static_cast<double>(a) / static_cast<double>(b));
                     info << ";MERGE_SIZE_RATIO=" << buf;
                 }
             }

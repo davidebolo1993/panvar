@@ -3325,6 +3325,24 @@ for mix in "hD1 hD2 hS1" "hS1 hS2 hD1"; do
 done
 
 # ---------------------------------------------------------------------------------------------
+# Two replacements of node b (100 bp) merged into one record: hS1 puts 170 bases there, hS2 the same and
+# 10 more (net +70 and +80). Members' sizes are their net changes, in SVLEN_RANGE and in the ratio
+# alike; a replacement's larger side (170, 180) is no size SVLEN gives.
+# ---------------------------------------------------------------------------------------------
+d="$OUT/subsub"; mkdir -p "$d"
+S170=$(blk 170 97 | tr AC GT); S180="$S170$(blk 10 101 | tr AC GT)"
+{ printf 'H\tVN:Z:1.0\nS\tf1\t%s\nS\tb\t%s\nS\ts1\t%s\nS\ts2\t%s\nS\tf2\t%s\n' "$(blk 100 53)" "$B100" "$S170" "$S180" "$(blk 100 59)"
+  printf 'L\tf1\t+\tb\t+\t0M\nL\tb\t+\tf2\t+\t0M\nL\tf1\t+\ts1\t+\t0M\nL\ts1\t+\tf2\t+\t0M\nL\tf1\t+\ts2\t+\t0M\nL\ts2\t+\tf2\t+\t0M\n'
+  printf 'P\tref#0#chr1:1-300\tf1+,b+,f2+\t*\nP\thR#1#c\tf1+,b+,f2+\t*\n'
+  printf 'P\thS1#1#c\tf1+,s1+,f2+\t*\nP\thS2#1#c\tf1+,s2+,f2+\t*\n'; } > "$d/g.gfa"
+printf 'bubble_id,source,source_orient,sink,sink_orient,path_support,min_inside_bp,max_inside_bp,inside_nodes\n1,f1,+,f2,+,4,100,180,b;s1;s2\n' > "$d/g.csv"
+"$BIN" call -i "$d/g.gfa" -c "$d/g.csv" -r 'ref#0#chr1:1-300' -o "$d/v" -q >/dev/null 2>&1
+check "two replacements merged: records, SVLEN_RANGE and MERGE_SIZE_RATIO by net change" \
+  "$(awk -F'\t' '!/^#/ { n++; r = "-"; m = "-"; k = split($8, a, ";")
+       for (i = 1; i <= k; i++) { if (a[i] ~ /^SVLEN_RANGE=/) r = substr(a[i], 13); if (a[i] ~ /^MERGE_SIZE_RATIO=/) m = substr(a[i], 18) } }
+       END { printf "%d %s %s", n, r, m }' "$d/v.region.vcf")" "1 70,80 0.875"
+
+# ---------------------------------------------------------------------------------------------
 # --min-alt-af is tested on the AF the record is written with. Per path: hBig deletes a, b and c, so it
 # has no allele at hSmall's deletion of b (GT .), whose AF is 1/3; hBig's own is 1/4. Per sample
 # (--diploid): the reference path is no column, so S1's deletion is 1 of 4 haplotypes.
