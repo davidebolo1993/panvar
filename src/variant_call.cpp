@@ -3674,10 +3674,52 @@ void call_variants(
                 }
                 comps = std::move(split);
             }
-            // The representative is the exact member event the most haplotypes carry, then the larger,
+            // The representative is the member event the most haplotypes carry as written, then the larger,
             // then by content: a record then reports what most of its carriers carry rather than one
             // outlier's size or sequence, and does not move when the GFA's paths are reordered.
             const std::size_t first_new_record = merged.size();
+            // An event as the record would write it. One found by aligning the alleles, or a node replacement
+            // that is one exact change sharing a base with the reference's side, is written as its minimal change:
+            // the bases its two sides share at either end trimmed, and an insertion or deletion left-aligned. Two
+            // members that differ only in how the walks placed them then write the same, and count as one.
+            // Any other event by its type, anchor and sequences.
+            using WrittenKey = std::tuple<int, std::size_t, std::string, std::string>;
+            const auto written_key = [&](const Event& e) -> WrittenKey {
+                const bool node_min = !e.seq_event && e.type == EvType::Sub && e.splice_ok && !e.seq.empty() &&
+                    !e.alt_seq.empty() && [&] {
+                        std::string d = ref_rev ? reverse_complement(e.seq) : e.seq;
+                        for (char& c : d) c = upper_base(c)[0];
+                        const std::string& a = e.splice_ins;
+                        return d != a && !a.empty() && (upper_base(d.front()) == upper_base(a.front()) ||
+                                                        upper_base(d.back()) == upper_base(a.back()));
+                    }();
+                const std::size_t before = e.seq_event ? e.seq_before : e.splice_before;
+                if (!(e.seq_event || node_min) || ref_base_at(before).empty())
+                    return {static_cast<int>(e.type), e.ref_pos, e.seq, e.alt_seq};
+                std::size_t pos = before;
+                std::string d = e.type == EvType::Ins ? std::string() : e.seq;
+                std::string a = e.type == EvType::Ins ? e.seq : e.type == EvType::Sub ? e.alt_seq : std::string();
+                if (ref_rev) { d = reverse_complement(d); a = reverse_complement(a); }
+                for (char& c : d) c = upper_base(c)[0];
+                for (char& c : a) c = upper_base(c)[0];
+                std::size_t pre = 0;
+                while (pre < d.size() && pre < a.size() && d[pre] == a[pre]) ++pre;
+                std::size_t suf = 0;
+                while (suf < d.size() - pre && suf < a.size() - pre && d[d.size() - 1 - suf] == a[a.size() - 1 - suf]) ++suf;
+                d = d.substr(pre, d.size() - pre - suf);
+                a = a.substr(pre, a.size() - pre - suf);
+                pos += pre;
+                if (d.empty() != a.empty()) {
+                    std::string& x = d.empty() ? a : d;
+                    for (;;) {
+                        const std::string b = ref_base_at(pos);
+                        if (b.empty() || x.empty() || b[0] != x.back() || ref_base_at(pos - 1).empty()) break;
+                        x = x.back() + x.substr(0, x.size() - 1);
+                        --pos;
+                    }
+                }
+                return {-1, pos, d, a};
+            };
             // true: a ranks before b. The same content on different nodes (a graph that kept two copies of one
             // sequence apart) goes to the member whose first carrier comes first by name, which renumbering the
             // graph does not change; node ids decide only between two events of one allele.
@@ -3695,14 +3737,11 @@ void call_variants(
                 // haplotypes carrying each member's exact event, over the component's members
                 std::vector<std::size_t> exact_haps(comp.size(), 0);
                 {
-                    // An "exact" member event: same type, anchor, size and sequence (nodes may differ).
-                    // Grouped by that key rather than compared pairwise: each group's haplotypes are
-                    // summed once over its distinct alleles.
-                    std::map<std::tuple<int, std::size_t, std::size_t, std::string, std::string>,
-                             std::unordered_set<std::size_t>> by_event;
-                    auto ekey = [](const Event& e) {
-                        return std::make_tuple(static_cast<int>(e.type), e.ref_pos, e.size_bp, e.seq, e.alt_seq);
-                    };
+                    // An "exact" member event: the same as written (written_key; nodes may differ). Grouped by
+                    // that key rather than compared pairwise: each group's haplotypes are summed once over its
+                    // distinct alleles.
+                    std::map<WrittenKey, std::unordered_set<std::size_t>> by_event;
+                    const auto& ekey = written_key;
                     for (const std::size_t k : comp) by_event[ekey(*cands[k].e)].insert(cands[k].ai);
                     auto haps = [&](const std::unordered_set<std::size_t>& ais) {
                         std::size_t n = 0;
