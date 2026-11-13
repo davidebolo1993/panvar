@@ -1050,6 +1050,16 @@ cn_call "$OUT/seprev/g.gfa" "$OUT/seprev"
 check "copies, the reference walked backwards: hhalf, heq, hmore, hdir as forward" \
   "$(for h in hhalf heq hmore hdir; do hrec "$OUT/seprev.region.vcf" "$h#1#chr1"; done | paste -sd'|' -)" \
   "1:1 DEL:-80|1:1 DEL:-160|0:2 DEL:-560|1:3 DEL:-400"
+# Two pieces of one change inside a copy, each under --min-sv-bp: hsm deletes P1 (30 bp) and, 8 bp on, replaces
+# P2 (30 bp) by Q2 (10 bp). Joined they are one 50 bp change, a record; apart each would be dropped.
+{ printf 'N L 2000 81\nN P1 30 90\nN K 8 91\nN P2 30 92\nN Q2 10 93\nN A 100 83\nN S 40 84\nN X 200 87\nN R 2000 88\n'
+  printf 'P ref#0#chr1:0-4600 L+,P1+,K+,P2+,A+,S+,P1+,K+,P2+,A+,X+,R+\nP hsm#1#chr1 L+,P1+,K+,P2+,A+,S+,K+,Q2+,A+,X+,R+\n'
+  printf 'P hgain#1#chr1 L+,P1+,K+,P2+,A+,S+,P1+,K+,P2+,A+,S+,P1+,K+,P2+,A+,X+,R+\n'
+  for i in 1 2 3 4 5 6; do printf 'P hr%s#1#chr1 L+,P1+,K+,P2+,A+,S+,P1+,K+,P2+,A+,X+,R+\n' "$i"; done; } > "$OUT/sepsm.spec"
+python3 -I "$(cd "$(dirname "$0")/.." && pwd)/tools/spec_gfa.py" "$OUT/sepsm.spec" "$OUT/sepsm"
+cn_call "$OUT/sepsm/g.gfa" "$OUT/sepsm"
+check "copies: two pieces under --min-sv-bp 8 bp apart inside a copy are one record (hsm)" \
+  "$(hrec "$OUT/sepsm.region.vcf" 'hsm#1#chr1')" "0:2 DEL:-50"
 # --diploid: hhalf and heq as one sample; each haplotype's copies are listed, joined as GT is.
 sed -e 's/^P hhalf#1#chr1 /P s9#1#chr1 /' -e 's/^P heq#1#chr1 /P s9#2#chr1 /' "$OUT/sep.spec" > "$OUT/sepdip.spec"
 python3 -I "$(cd "$(dirname "$0")/.." && pwd)/tools/spec_gfa.py" "$OUT/sepdip.spec" "$OUT/sepdip"

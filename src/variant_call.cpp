@@ -751,6 +751,10 @@ void join_split_replacements(const Graph& graph, const std::vector<Tok>& R, cons
     events = std::move(out);
 }
 
+// Two pieces of one change at a collapsed module at most this far apart are joined when each alone is under
+// --min-sv-bp (join_small_pieces): the distance at which benchmark reads two differences as one.
+constexpr std::size_t kSmallPieceGapBp = 10;
+
 // A walk's copy span at a collapsed module: its first and last token on one of the module's nodes, or false.
 bool copy_span(const std::vector<Tok>& W, const std::unordered_set<std::string>& module_nodes, std::size_t& a,
                std::size_t& b) {
@@ -1008,6 +1012,63 @@ Event token_event(const Graph& graph, const std::vector<Tok>& R, const std::vect
     e.r_lo = rl; e.r_hi = rh; e.h_lo = hl; e.h_hi = hh;
     e.split_piece = true;   // placed by its own tokens: a piece cut from a change, no match beside it
     return e;
+}
+
+// Pieces of one change the node comparison cut apart at a collapsed module, each under `min_bp` and so dropped
+// on its own: consecutive pieces of any kind, separated only by stretches both walks share that are `gap_bp`
+// or shorter and lie in one place on each walk, with one of them touching the copies, are one replacement from
+// the first piece to the last (the shared stretches included, so it spells the haplotype exactly), when it
+// reaches `min_bp`.
+void join_small_pieces(const Graph& graph, const std::vector<Tok>& R, const std::vector<Tok>& H,
+                       const std::unordered_set<std::string>& module_nodes, std::vector<Event>& events,
+                       std::size_t gap_bp, std::size_t min_bp) {
+    if (events.size() < 2) return;
+    std::size_t ra = 0, rb = 0, ha = 0, hb = 0;
+    const bool rspan = copy_span(R, module_nodes, ra, rb), hspan = copy_span(H, module_nodes, ha, hb);
+    const auto small = [&](const Event& e) {
+        return !e.seq_event && e.r_lo != SIZE_MAX && e.h_lo != SIZE_MAX && e.size_bp < min_bp &&
+               (e.type == EvType::Del || e.type == EvType::Ins || e.type == EvType::Sub);
+    };
+    const auto touches = [&](const Event& e) {
+        const bool r = rspan && (e.r_lo < e.r_hi ? e.r_lo <= rb && e.r_hi > ra : in_copy_span(e.r_lo, e.r_hi, ra, rb));
+        const bool h = hspan && (e.h_lo < e.h_hi ? e.h_lo <= hb && e.h_hi > ha : in_copy_span(e.h_lo, e.h_hi, ha, hb));
+        return r || h;
+    };
+    const auto near = [&](const Event& a, const Event& b) {
+        if (b.r_lo < a.r_hi || b.h_lo < a.h_hi || b.r_lo - a.r_hi != b.h_lo - a.h_hi) return false;
+        std::size_t bp = 0;
+        for (std::size_t k = 0; k < b.r_lo - a.r_hi; ++k) {
+            if (R[a.r_hi + k].token != H[a.h_hi + k].token) return false;
+            bp += node_len(graph, R[a.r_hi + k].node_id);
+        }
+        return bp <= gap_bp;
+    };
+    const auto one_place = [](const std::vector<Tok>& W, std::size_t lo, std::size_t hi) {
+        for (std::size_t k = lo; k + 1 < hi; ++k)
+            if (W[k + 1].src_idx != W[k].src_idx + 1) return false;
+        return true;
+    };
+    std::vector<Event> out;
+    std::size_t i = 0;
+    while (i < events.size()) {
+        std::size_t m = i;
+        bool touch = small(events[i]) && touches(events[i]);
+        if (small(events[i]))
+            for (std::size_t j = i + 1; j < events.size(); ++j) {
+                if (!small(events[j]) || !near(events[j - 1], events[j]) || !one_place(R, events[i].r_lo, events[j].r_hi) ||
+                    !one_place(H, events[i].h_lo, events[j].h_hi))
+                    break;
+                m = j;
+                touch = touch || touches(events[j]);
+            }
+        if (m > i && touch && events[i].r_lo < events[m].r_hi && events[i].h_lo < events[m].h_hi) {
+            Event e = token_event(graph, R, H, events[i].r_lo, events[m].r_hi, events[i].h_lo, events[m].h_hi);
+            if (e.size_bp >= min_bp) { out.push_back(std::move(e)); i = m + 1; continue; }
+        }
+        out.push_back(std::move(events[i]));
+        ++i;
+    }
+    events = std::move(out);
 }
 
 // One haplotype's copies at a collapsed module, told apart from its other events (see call.md, step 7).
@@ -3789,8 +3850,10 @@ void call_variants(
                     }
                     // Pieces of one change are joined once the copies are decided, on the parts left, so joining
                     // never changes which parts are copies.
-                    for (std::vector<Event>* evs : {&events, &copy_split[ai].rest})
+                    for (std::vector<Event>* evs : {&events, &copy_split[ai].rest}) {
                         join_copy_pieces(graph, Rdiff, Htok, module_rec->module_nodes, *evs, options.merge_distance_bp, options.min_sv_bp);
+                        join_small_pieces(graph, Rdiff, Htok, module_rec->module_nodes, *evs, kSmallPieceGapBp, options.min_sv_bp);
+                    }
                 }
                 // An inversion is a node-level finding (the walk turns round); such an allele keeps it.
                 bool inv = false;
