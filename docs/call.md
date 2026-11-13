@@ -65,7 +65,7 @@ panphorte's unit-graph table is read from the site table's prefix (or `--panphor
 | `--no-align-alleles` | compare node by node only | off |
 | `--merge-distance-bp <N>`, `--merge-jaccard <X>`, `--merge-seq-identity <X>`, `--merge-size-ratio <X>` | when two events are the same; a size ratio of `0` uses `--merge-seq-identity` | `100`, `0.80`, `0.80`, `0` |
 | `--min-haplotypes <N>`, `--min-alt-af <X>` | fewest carriers, as a count and as the record's `AF` (`AC/AN`; with `--diploid`, over haplotype slots) | `1`, `0` |
-| `--classify-ins` | tell new insertions (`NOVEL`) from duplications (`DUP`) with minimap2 (`--minimap-preset`, `--minimap-best-n`, `--ins-dup-min-identity`) | off |
+| `--classify-ins` | tell new insertions (`NOVEL`) from duplications (`DUP`) with minimap2 (`--minimap-preset`, `--minimap-best-n`, `--ins-dup-min-identity`), for every `INS` record by the bases it inserts | off |
 | `--diploid` | one column per sample, with phased `GT` (`/` for a sample with unnumbered haplotypes); `CN` is the sample's total | off |
 | `--no-per-bubble-vcf`, `--no-variant-nodes` | skip the per-site VCFs, or the node and carrier tables | off |
 | `--max-seq-bp <N>` | leave `INSSEQ`, `DELSEQ` and `INVSEQ` out above N bases, so VCF tools read the lines; `0` writes them all | `20000` |

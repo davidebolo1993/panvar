@@ -280,8 +280,7 @@ struct Event {
     std::string seq;                  // event sequence (DELSEQ/INSSEQ/INVSEQ)
     std::size_t ref_cn = 0;           // DUP only
     std::size_t alt_cn = 0;           // DUP only
-    std::string ins_subtype;          // INS only: "", "NOVEL", "DUP"
-    bool inverted_dup = false;        // UNIT DUP or INS_SUBTYPE=DUP: the extra copy is reverse-complemented
+    bool inverted_dup = false;        // UNIT DUP: some extra copy is reverse-complemented
     // Sub only: reference sequence replaced by other sequence in one gap between anchors. `seq` is the
     // replaced reference, `alt_seq` what replaces it; size_bp is the larger of the two, the size the
     // --min-sv-bp filter judges a substitution by.
@@ -1884,8 +1883,8 @@ void call_variants(
         out << "##INFO=<ID=START_NODE,Number=1,Type=String,Description=\"First graph node of the event (of the representative member on a merged record; see SVLEN)\">\n";
         out << "##INFO=<ID=END_NODE,Number=1,Type=String,Description=\"Last graph node of the event\">\n";
         out << "##INFO=<ID=EVENT_NODES,Number=.,Type=String,Description=\"Variant node set\">\n";
-        out << "##INFO=<ID=INS_SUBTYPE,Number=1,Type=String,Description=\"INS subtype: NOVEL or DUP (minimap2 refined)\">\n";
-        out << "##INFO=<ID=INVDUP,Number=0,Type=Flag,Description=\"Inverted duplication: the extra copy is the reverse complement of the sequence it copies. On a CN_METHOD=UNIT CNV, some carrier gains copies walked opposite to the reference's (see FORMAT/CNINV), or, with no reference copy, holds a copy and its reverse complement; on an INS with INS_SUBTYPE=DUP, the inserted sequence aligns to the reference window on the reverse strand\">\n";
+        out << "##INFO=<ID=INS_SUBTYPE,Number=1,Type=String,Description=\"--classify-ins, on every INS record (a replacement flagged SUBSTITUTION too), from the bases it inserts (INSSEQ, also where too long to write): DUP where minimap2 aligns half of them or more to the reference across the site at --ins-dup-min-identity, NOVEL otherwise\">\n";
+        out << "##INFO=<ID=INVDUP,Number=0,Type=Flag,Description=\"Inverted duplication: the extra copy is the reverse complement of the sequence it copies. On a CN_METHOD=UNIT CNV, some carrier gains copies walked opposite to the reference's (see FORMAT/CNINV), or, with no reference copy, holds a copy and its reverse complement; on an INS with INS_SUBTYPE=DUP, the inserted sequence aligns to the reference across the site on the reverse strand\">\n";
         out << "##INFO=<ID=REF_CN,Number=1,Type=Integer,Description=\"Reference copy number (CNV): copies of the repeat unit (CN_METHOD=UNIT) or of the module (MODULE)\">\n";
         out << "##INFO=<ID=UNIT_TWIN_NODES,Number=.,Type=String,Description=\"CN_METHOD=UNIT only: nodes refine's twin merge would fold into the loop node: the same sequence and the same oriented neighbours, a looped one only if its loop is walked. Their traversals are counted as copies of the unit in CN, REF_CN and CNINV\">\n";
         out << "##INFO=<ID=RU_LEN,Number=1,Type=Integer,Description=\"Repeat-unit length in bp, one represented copy. Emitted only for CN_METHOD=UNIT; (CN-REF_CN)*RU_LEN is the repeat-copy component of the haplotype size, while FORMAT/CNBP is the full module-walk change and CNRESID is their difference\">\n";
@@ -4162,25 +4161,6 @@ void call_variants(
             }
         }
 
-        // ---- INS subtype refinement on the representative only (bounded minimap2 calls), one call at a time.
-        if (options.classify_ins) {
-            static std::mutex minimap_mtx;
-            std::lock_guard<std::mutex> minimap_lock(minimap_mtx);
-            std::string ref_window;
-            for (MergedRecord& mr : merged) {
-                if (mr.seed.type != EvType::Ins || mr.seed.seq.empty()) continue;
-                if (ref_window.empty()) ref_window = spell_path_steps_sequence(graph, ref_steps);
-                const Minimap2Hit hit = minimap2_best_hit(
-                    "ins", mr.seed.seq, "refwin", ref_window, options.minimap_preset, options.minimap_best_n);
-                const bool dup = hit.ok && hit.identity() >= options.ins_dup_min_identity &&
-                                 hit.query_end_bp - hit.query_start_bp >= mr.seed.seq.size() / 2;
-                mr.seed.ins_subtype = dup ? "DUP" : "NOVEL";
-                // Both sequences are spelled along the same source->sink walk, so a reverse-strand hit
-                // means the inserted copy is the reverse complement of the reference sequence it copies.
-                mr.seed.inverted_dup = dup && hit.reverse;
-            }
-        }
-
         // ---- Keep records reaching min_sv_bp (by their largest member) and --min-haplotypes.
         {
             std::vector<MergedRecord> kept;
@@ -4385,6 +4365,7 @@ void call_variants(
         std::unordered_map<const MergedRecord*, std::string> id_of;   // this site's record ids, as written
         std::vector<std::pair<std::size_t, std::vector<std::vector<const MergedRecord*>>>> held_rows;
 
+        std::string ins_ref_window;   // the reference across the site, spelled once for --classify-ins
         for (const MergedRecord& mr : merged) {
             const Event& e = mr.seed;
             // POS / REF base from the reference node map. Anchor orientation-independently: a
@@ -4972,8 +4953,29 @@ void call_variants(
                     for (std::size_t k = 0; k < gnames.size(); ++k) { if (k) info << ','; info << vcf_escape(gnames[k]); }
                 }
             }
-            if (e.type == EvType::Ins && !e.ins_subtype.empty()) info << ";INS_SUBTYPE=" << e.ins_subtype;
-            if (e.inverted_dup) info << ";INVDUP";
+            // --classify-ins: every INS record by the bases it writes (INSSEQ, also above --max-seq-bp), a
+            // replacement's inserted side included, against the reference across the site (bounded minimap2
+            // calls, one at a time). Both are spelled along the site's walk, so a reverse-strand hit means the
+            // inserted copy is the reverse complement of the sequence it copies.
+            bool invdup = e.inverted_dup;
+            if (options.classify_ins && std::string(svt) == "INS") {
+                std::string w = rp ? rp_ins
+                              : e.type == EvType::Ins ? (!aligned_seq.empty() ? aligned_seq : ref_rev ? reverse_complement(e.seq) : e.seq)
+                              : e.type == EvType::Sub ? (ref_rev ? reverse_complement(e.alt_seq) : e.alt_seq) : std::string();
+                if (ref_rev) w = reverse_complement(w);
+                if (!w.empty()) {
+                    static std::mutex minimap_mtx;
+                    std::lock_guard<std::mutex> minimap_lock(minimap_mtx);
+                    if (ins_ref_window.empty()) ins_ref_window = spell_path_steps_sequence(graph, ref_steps);
+                    const Minimap2Hit hit = minimap2_best_hit("ins", w, "refwin", ins_ref_window, options.minimap_preset,
+                                                              options.minimap_best_n);
+                    const bool dup = hit.ok && hit.identity() >= options.ins_dup_min_identity &&
+                                     hit.query_end_bp - hit.query_start_bp >= w.size() / 2;
+                    info << ";INS_SUBTYPE=" << (dup ? "DUP" : "NOVEL");
+                    invdup = invdup || (dup && hit.reverse);
+                }
+            }
+            if (invdup) info << ";INVDUP";
             if (rp_sub) {
                 // REF/ALT spell it
             } else if (rp) {

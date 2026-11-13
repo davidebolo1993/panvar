@@ -3750,6 +3750,17 @@ python3 -I "$TOOLS/spec_gfa.py" "$OUT/ncls.spec" "$OUT/ncls"
 check "--classify-ins: both insertions, the node replacement's too, are classified (SVLEN:INS_SUBTYPE)" \
   "$(awk -F'\t' '!/^#/{n=split($8,f,";"); l=""; t="-"; for(i=1;i<=n;i++){split(f[i],kv,"="); if(kv[1]=="SVLEN") l=kv[2]; if(kv[1]=="INS_SUBTYPE") t=kv[2]} printf "%s:%s ", l, t}' "$OUT/ncls/v.region.vcf")" \
   "90:NOVEL 97:NOVEL "
+# h1 walks x, a copy of R, in place of the reference's 20 bp node a: a replacement of net +280, written as an INS
+# flagged SUBSTITUTION. Its inserted bases are classified too, and are a duplication of R.
+printf 'N L 300 91\nN a 20 97\nN R 300 93\nN x @R:0:1\nP ref#0#chr1:0-621 L+,a+,R+\nP h1#1#chr1 L+,x+,R+\nP h2#1#chr1 L+,a+,R+\nB L R a;x\n' \
+  > "$OUT/nsub.spec"
+python3 -I "$TOOLS/spec_gfa.py" "$OUT/nsub.spec" "$OUT/nsub"
+"$BIN" call -i "$OUT/nsub/g.gfa" -c "$OUT/nsub/g.bubbles.csv" -r 'ref#0#chr1:0-621' -o "$OUT/nsub/v" \
+  --classify-ins --no-per-bubble-vcf -q >/dev/null 2>&1
+check "--classify-ins: an INS flagged SUBSTITUTION is classified from its inserted bases (SVTYPE:flag:INS_SUBTYPE)" \
+  "$(awk -F'\t' '!/^#/{n=split($8,f,";"); t="-"; for(i=1;i<=n;i++){split(f[i],kv,"="); if(kv[1]=="INS_SUBTYPE") t=kv[2]}
+       printf "%s:%s:%s ", ($8 ~ /SVTYPE=INS;/ ? "INS" : "other"), ($8 ~ /SUBSTITUTION/ ? "SUBSTITUTION" : "plain"), t}' "$OUT/nsub/v.region.vcf")" \
+  "INS:SUBSTITUTION:DUP "
 
 # A 52 bp unit U, six copies on the reference, then D, a node spelling U, and E. h2 skips D; h1 skips it too but
 # walks F, a node spelling E, in place of E. h1's replacement is the deletion of D, which slides along the copies,
