@@ -1311,12 +1311,23 @@ int run_benchmark_command(const std::vector<std::string>& args) {
             if (edge.empty()) continue;
             const VcfRecordInfo& r = *vcf_by_id.at(c->variant_id);
             const auto cit = r.sample_cn.find(h);
-            const long long copy_bp = static_cast<long long>(copy_of(r, h).second);
-            if (cit == r.sample_cn.end() || r.ref_cn < 0 || copy_bp <= 0) {
+            // the copies' change in length: the carrier's named copies where the record names them, else CN's
+            long long copies = 0;
+            bool named = !r.cn_forms.empty();
+            if (named)
+                if (const auto fit = r.sample_cnform.find(h); fit != r.sample_cnform.end())
+                    for (const std::size_t k : fit->second) {
+                        const VcfRecordInfo::Form& fm = r.cn_forms[k];
+                        named = named && fm.spelled;
+                        copies += static_cast<long long>(fm.seq.size()) - static_cast<long long>(fm.end + 1 - fm.start);
+                    }
+            const long long copy_bp = named ? 1 : static_cast<long long>(copy_of(r, h).second);
+            if (!named && (cit == r.sample_cn.end() || r.ref_cn < 0 || copy_bp <= 0)) {
                 for (const CarrierEvent* e : edge) if (inside_at(*c, *e)) in.insert(e);
                 continue;
             }
-            long long expect = static_cast<long long>(c->ref_len()) + (cit->second - r.ref_cn) * copy_bp;
+            if (!named) copies = (cit->second - r.ref_cn) * copy_bp;
+            long long expect = static_cast<long long>(c->ref_len()) + copies;
             for (const CarrierEvent* e : in) expect += static_cast<long long>(e->alt.size()) - static_cast<long long>(e->ref_len());
             const long long got = static_cast<long long>(c->alt.size());
             for (const CarrierEvent* e : edge) {
