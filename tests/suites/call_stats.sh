@@ -1830,6 +1830,7 @@ sed -e 's/^P\thd1#1#chr1/P\ts1#1#chr1/' -e 's/^P\thd4#1#chr1/P\ts1#2#chr1/' -e '
 VCF="$OUT/dip.region.vcf"
 check "--diploid: columns, phased GTs and AN" \
   "$(awk -F'\t' '/^#CHROM/{print $10","$11} !/^#/{split($10,a,":"); split($11,b,":"); print a[1]"/"b[1]; exit}' "$VCF" | paste -sd: -):$(info DEL AN)" "s1,s2:1|1/0|1:4"
+check "--diploid: HCN only on a copy-number record (DEL FORMAT)" "$(field DEL 9)" "GT:CN"
 VCF="$OUT/cc.region.vcf"
 
 # ---------------------------------------------------------------- substitutions

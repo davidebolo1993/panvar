@@ -1421,6 +1421,8 @@ void call_variants(
         std::string info = f[7];
         std::size_t cn_k = keys.size();
         for (std::size_t k = 0; k < keys.size(); ++k) if (keys[k] == "CN") cn_k = k;
+        // HCN, each haplotype's copies, on a CNV record only: elsewhere CN is '.'
+        const bool hcn = cn_k < keys.size() && std::find(keys.begin(), keys.end(), "CNBP") != keys.end();
         std::size_t gt_k = keys.size();
         for (std::size_t k = 0; k < keys.size(); ++k) if (keys[k] == "GT") gt_k = k;
         std::string cols;
@@ -1468,7 +1470,7 @@ void call_variants(
                 for (const auto& x : sv) t += std::stoll(x[k]);
                 out += std::to_string(t);
             }
-            if (cn_k < keys.size()) {
+            if (hcn) {
                 out += ':';
                 for (std::size_t s = 0; s < sv.size(); ++s) { if (s) out += col.phased ? '|' : '/'; out += sv[s][cn_k]; }
             }
@@ -1507,7 +1509,7 @@ void call_variants(
         std::string out;
         for (std::size_t k = 0; k < 7; ++k) { out += f[k]; out += '\t'; }
         out += info; out += '\t'; out += f[8];
-        if (cn_k < keys.size()) out += ":HCN";
+        if (hcn) out += ":HCN";
         out += cols;
         out += '\n';
         return out;
@@ -1973,7 +1975,7 @@ void call_variants(
         out << "##FORMAT=<ID=MODBP,Number=1,Type=Integer,Description=\"CN_METHOD=MODULE: this haplotype's bp change over the module's own nodes against the reference's, each visit counted; GT 1 needs it to reach --min-sv-bp (see ALT CNV). CNBP measures over the copies with everything walked between them\">\n";
         out << "##FORMAT=<ID=CNINV,Number=1,Type=Integer,Description=\"CN_METHOD=UNIT only: how many of this haplotype's CN copies run opposite to the reference's copy of the unit (with no reference copy, to the orientation most haplotypes' copies take; when both are equally common, the haplotype's copies in its own less common orientation). 0 means every copy is in the reference orientation; a gain with CNINV above the reference's is an inverted duplication (INFO/INVDUP), and with no reference copy a haplotype holding copies in both orientations\">\n";
         if (options.diploid) {
-            out << "##FORMAT=<ID=HCN,Number=1,Type=String,Description=\"--diploid: the copy number of each of the sample's haplotypes, in GT order, joined like GT ('|', or '/' when the sample's GT is unphased); CN is their sum, and CNBP, CNRESID and CNINV are sums too\">\n";
+            out << "##FORMAT=<ID=HCN,Number=1,Type=String,Description=\"--diploid, on a CNV record: the copy number of each of the sample's haplotypes, in GT order, joined like GT ('|', or '/' when the sample's GT is unphased); CN is their sum, and CNBP, CNRESID, MODBP and CNINV are sums too\">\n";
             out << "##panvar_columns=diploid: one column per PanSN sample, its haplotype paths joined into a phased GT ('/' when a sample has unnumbered haplotypes); the reference path is not a column and leaves AN\n";
         }
         out << "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT";
