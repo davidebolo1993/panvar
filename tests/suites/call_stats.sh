@@ -101,6 +101,11 @@ check "every record is FILTER PASS, which the header defines" \
   "$(awk -F'\t' '!/^#/{print $7}' "$VCF" | sort -u | paste -sd, -):$(grep -c '^##FILTER=<ID=PASS,' "$VCF")" "PASS:1"
 check "the IMPRECISE header gives its three causes (cluster, N run, PATH_INVERSION)" \
   "$(grep '^##INFO=<ID=IMPRECISE,' "$VCF" | grep -c 'CLUSTER.*an N in the reference.*PATH_INVERSION')" "1"
+# Fields that repeat others are not written: START_NODE and END_NODE (EVENT_NODES), NMERGED (AC), CN_SCOPE and
+# REF_CN_SOURCE (CN_METHOD), CN_REF_FOLD (REF_CN), CN_SHARED_BP (CN_UNIT_BP x REF_CN), MERGE_SIZE_RATIO
+# (SVLEN_RANGE).
+check "no redundant fields in the header" \
+  "$(grep -cE '^##INFO=<ID=(START_NODE|END_NODE|NMERGED|CN_SCOPE|REF_CN_SOURCE|CN_REF_FOLD|CN_SHARED_BP|MERGE_SIZE_RATIO),' "$VCF")" "0"
 # The header states the --max-seq-bp the sequences were written with: 60 leaves out the 70 bp DELSEQ.
 "$BIN" call -i "$OUT/cb.sorted.gfa" -c "$OUT/cb.bubbles.csv" -r "$REF_NAME" -o "$OUT/cmax" --max-seq-bp 60 -q >/dev/null 2>&1
 check "--max-seq-bp 60: the header's limit and the DEL's DELSEQ" \
@@ -968,10 +973,10 @@ check "MODULE non-carrier whose records are off the anchor keeps its measured CN
   "$(gt_cn "$OUT/modoff.region.vcf" 'htest#1#chr1' CNV)" "0:1"
 # The carrier hfull's own deletion of one copy is its copy change: it stays off the deletion record.
 modfull=$(awk -F'\t' '/^#CHROM/{for(i=10;i<=NF;i++) if($i=="hfull#1#chr1") c=i}
-  !/^#/ && $8 ~ /SVTYPE=DEL;/ {split($c,g,":"); n=split($8,f,";"); for(i=1;i<=n;i++) if(f[i] ~ /^(AC|NMERGED)=/) printf "%s ", f[i]; printf "hfull:%s", g[1]}' "$V")
-[ "$modfull" = "NMERGED=1 AC=1 hfull:0" ] \
+  !/^#/ && $8 ~ /SVTYPE=DEL;/ {split($c,g,":"); n=split($8,f,";"); for(i=1;i<=n;i++) if(f[i] ~ /^AC=/) printf "%s ", f[i]; printf "hfull:%s", g[1]}' "$V")
+[ "$modfull" = "AC=1 hfull:0" ] \
   && ok "MODULE carrier: its copy loss is not also a deletion record" \
-  || bad "MODULE carrier: the deletion record reads '$modfull', expected 'NMERGED=1 AC=1 hfull:0'"
+  || bad "MODULE carrier: the deletion record reads '$modfull', expected 'AC=1 hfull:0'"
 # The reference runs a 20 bp module (ma, mb: 10 bp each) three times -- one copy below --min-sv-bp, so
 # no module record: its copy changes are sequence. hgain's three extra copies are a 60 bp insertion,
 # hloss's lost ones a 60 bp deletion, and hnet's, replaced by a 20 bp node x of its own, a substitution
@@ -1483,9 +1488,9 @@ printf '%s\n1,f0,+,f1,+,4,6,4,4,1,1,1,0,9000,"P;Q;k;R"\n' "$MOD_HDR" > "$OUT/msc
 V="$OUT/mscale.region.vcf"
 ms_fmt() { awk -F'\t' -v s="$1" -v key="$2" '/^#CHROM/{for(i=10;i<=NF;i++) if($i==s) c=i}
   !/^#/ && /CN_METHOD=MODULE;/{n=split($9,k,":"); split($c,v,":"); for(j=1;j<=n;j++) if(k[j]==key) print v[j]}' "$V"; }
-check "module scale: REF_CN from passes through the anchor (REF_CN:source)" \
-      "$(rk_get "$V" "$(grep -v '^#' "$V" | awk -F'\t' '/CN_METHOD=MODULE;/{print $3; exit}')" 8 REF_CN):$(grep -o 'REF_CN_SOURCE=[A-Z_]*' "$V" | head -1 | cut -d= -f2)" \
-      "2:ANCHOR_PASSES"
+check "module scale: REF_CN from passes through the anchor (REF_CN:CN_METHOD)" \
+      "$(rk_get "$V" "$(grep -v '^#' "$V" | awk -F'\t' '/CN_METHOD=MODULE;/{print $3; exit}')" 8 REF_CN):$(grep -v '^#' "$V" | grep -o 'CN_METHOD=[A-Z]*' | head -1 | cut -d= -f2)" \
+      "2:MODULE"
 check "module scale: CN of the gain, the loss and the partial loss" \
       "$(ms_fmt 'hgain#1#chr1' CN):$(ms_fmt 'hloss#1#chr1' CN):$(ms_fmt 'hpart#1#chr1' CN)" "3:1:1"
 check "partial copy: the 600 bp DEL no copy change explains stays" \
@@ -3348,16 +3353,16 @@ for mix in "hD1 hD2 hS1" "hS1 hS2 hD1"; do
     done; } > "$d/g.gfa"
   printf 'bubble_id,source,source_orient,sink,sink_orient,path_support,min_inside_bp,max_inside_bp,inside_nodes\n1,f1,+,f2,+,5,0,100,b;s\n' > "$d/g.csv"
   "$BIN" call -i "$d/g.gfa" -c "$d/g.csv" -r 'ref#0#chr1:1-300' -o "$d/v" -q >/dev/null 2>&1
-  check "deletion and substitution merged ($mix): records, SVLEN_RANGE, MERGE_SIZE_RATIO" \
+  check "deletion and substitution merged ($mix): records, SVLEN_RANGE" \
     "$(awk -F'\t' '!/^#/ { n++; r = "-"; m = "-"; k = split($8, a, ";")
-         for (i = 1; i <= k; i++) { if (a[i] ~ /^SVLEN_RANGE=/) r = substr(a[i], 13); if (a[i] ~ /^MERGE_SIZE_RATIO=/) m = substr(a[i], 18) } }
-         END { printf "%d %s %s", n, r, m }' "$d/v.region.vcf")" "1 -100,-85 0.85"
+         for (i = 1; i <= k; i++) if (a[i] ~ /^SVLEN_RANGE=/) r = substr(a[i], 13) }
+         END { printf "%d %s", n, r }' "$d/v.region.vcf")" "1 -100,-85"
 done
 
 # ---------------------------------------------------------------------------------------------
 # Two replacements of node b (100 bp) merged into one record: hS1 puts 170 bases there, hS2 the same and
-# 10 more (net +70 and +80). Members' sizes are their net changes, in SVLEN_RANGE and in the ratio
-# alike; a replacement's larger side (170, 180) is no size SVLEN gives.
+# 10 more (net +70 and +80). Members' sizes in SVLEN_RANGE are their net changes; a replacement's larger
+# side (170, 180) is no size SVLEN gives.
 # ---------------------------------------------------------------------------------------------
 d="$OUT/subsub"; mkdir -p "$d"
 S170=$(blk 170 97 | tr AC GT); S180="$S170$(blk 10 101 | tr AC GT)"
@@ -3367,10 +3372,10 @@ S170=$(blk 170 97 | tr AC GT); S180="$S170$(blk 10 101 | tr AC GT)"
   printf 'P\thS1#1#c\tf1+,s1+,f2+\t*\nP\thS2#1#c\tf1+,s2+,f2+\t*\n'; } > "$d/g.gfa"
 printf 'bubble_id,source,source_orient,sink,sink_orient,path_support,min_inside_bp,max_inside_bp,inside_nodes\n1,f1,+,f2,+,4,100,180,b;s1;s2\n' > "$d/g.csv"
 "$BIN" call -i "$d/g.gfa" -c "$d/g.csv" -r 'ref#0#chr1:1-300' -o "$d/v" -q >/dev/null 2>&1
-check "two replacements merged: records, SVLEN_RANGE and MERGE_SIZE_RATIO by net change" \
-  "$(awk -F'\t' '!/^#/ { n++; r = "-"; m = "-"; k = split($8, a, ";")
-       for (i = 1; i <= k; i++) { if (a[i] ~ /^SVLEN_RANGE=/) r = substr(a[i], 13); if (a[i] ~ /^MERGE_SIZE_RATIO=/) m = substr(a[i], 18) } }
-       END { printf "%d %s %s", n, r, m }' "$d/v.region.vcf")" "1 70,80 0.875"
+check "two replacements merged: records, SVLEN_RANGE by net change" \
+  "$(awk -F'\t' '!/^#/ { n++; r = "-"; k = split($8, a, ";")
+       for (i = 1; i <= k; i++) if (a[i] ~ /^SVLEN_RANGE=/) r = substr(a[i], 13) }
+       END { printf "%d %s", n, r }' "$d/v.region.vcf")" "1 70,80"
 
 # ---------------------------------------------------------------------------------------------
 # --min-alt-af is tested on the AF the record is written with. Per path: hBig deletes a, b and c, so it

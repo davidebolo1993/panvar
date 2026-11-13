@@ -157,7 +157,6 @@ call_ "$D/g.gfa" "$D/g.bubbles.csv" "$R" "$D/ch" --no-align-alleles
 call_ "$D/g_ac.gfa" "$D/g_ac.bubbles.csv" "$R" "$D/ch_ac" --no-align-alleles
 eq "control: A and C alone stay separate INS records" "$(IC count "$D/ch_ac.region.vcf" SVTYPE=INS)" "2"
 eq "with B they chain into one INS record" "$(IC count "$D/ch.region.vcf" SVTYPE=INS)" "1"
-eq "that record merges all three" "$(IC get "$D/ch.region.vcf" SVTYPE=INS NMERGED)" "3"
 eq "and is carried by all three" "$(IC get "$D/ch.region.vcf" SVTYPE=INS AC)" "3"
 md=$(IC get "$D/ch.region.vcf" SVTYPE=INS MERGE_DIAMETER)
 [ -n "$md" ] && [ "$md" != "<absent>" ] && ok "MERGE_DIAMETER is reported ($md)" \

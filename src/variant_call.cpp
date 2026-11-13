@@ -260,17 +260,6 @@ const char* cn_method_name(CnMethod m) {
 // A module DUP rather than a UNIT DUP: it counts copies of a collapsed module, not of a literal repeat unit.
 bool is_module_cn(CnMethod m) { return m == CnMethod::Module; }
 
-// What the copy is a copy of. REPEAT_UNIT means CN counts a literal repeat unit; COLLAPSED_MODULE
-// means it counts copies of a module that may contain several distinct paralogs, so per-copy content
-// is not one uniform sequence and (CN - REF_CN) x RU_LEN is not the haplotype's event size.
-const char* cn_scope_name(CnMethod m) {
-    switch (m) {
-        case CnMethod::Unit: return "REPEAT_UNIT";
-        case CnMethod::Module: return "COLLAPSED_MODULE";
-        default: return "";
-    }
-}
-
 // A typed event derived from one haplotype walk vs the reference walk.
 struct Event {
     EvType type = EvType::Del;
@@ -1942,14 +1931,12 @@ void call_variants(
         out << "##source=panvar call\n";
         out << "##reference=" << ref_name << "\n";
         out << "##contig=<ID=" << ref_meta.chrom << ">\n";
-        out << "##INFO=<ID=END,Number=1,Type=Integer,Description=\"Last reference base the variant spans, inclusive. POS is the base BEFORE the event (symbolic convention), so the event occupies POS+1..END and END-POS is its reference span: |SVLEN| for DEL/INV, 0 for INS (which spans no reference), the replaced bases for a SUBSTITUTION (whose SVLEN is the net change), and the module's own reference span for a CN_SCOPE=COLLAPSED_MODULE CNV -- there it equals INFO/CN_MODULE_REF_BP, the bubble interior (FORMAT:CNBP is measured over each haplotype's copies within it)\">\n";
+        out << "##INFO=<ID=END,Number=1,Type=Integer,Description=\"Last reference base the variant spans, inclusive. POS is the base BEFORE the event (symbolic convention), so the event occupies POS+1..END and END-POS is its reference span: |SVLEN| for DEL/INV, 0 for INS (which spans no reference), the replaced bases for a SUBSTITUTION (whose SVLEN is the net change), and for a CNV the reference's copies: on CN_METHOD=MODULE the module's own reference span, the bubble interior (FORMAT:CNBP is measured over each haplotype's copies within it), on UNIT the reference's array\">\n";
         out << "##INFO=<ID=SVTYPE,Number=1,Type=String,Description=\"Structural variant type\">\n";
         out << "##INFO=<ID=SVLEN,Number=A,Type=Integer,Description=\"ALT-REF length difference for DEL/INS (negative for a deletion). A DEL/INS/INV record merged across haplotypes reports POS, END, SVLEN and its sequence from one representative member: the exact event carried by the most haplotypes (ties: the larger). Members' sizes are in SVLEN_RANGE; the record is kept by --min-sv-bp on its largest member, so a representative can be smaller than that."
-            << " For INV, the length of the inverted segment, which changes no length; for CNV see CN_SCOPE. Absent on CN_SCOPE=COLLAPSED_MODULE records, and on a CN_METHOD=UNIT record whose carriers both gain and lose copies: no single record-level size exists there -- read SVLEN_RANGE, or FORMAT:CN and CNBP for the per-sample size. A UNIT record whose carriers all change in one direction gives its largest change\">\n";
+            << " For INV, the length of the inverted segment, which changes no length. On a CN_METHOD=MODULE CNV, one copy of the module, whose copies can hold several paralogs (each haplotype's own size is FORMAT/CNBP); absent on a CN_METHOD=UNIT record whose carriers both gain and lose copies: no single record-level size exists there -- read SVLEN_RANGE, or FORMAT:CN and CNBP for the per-sample size. A UNIT record whose carriers all change in one direction gives its largest change\">\n";
         out << "##INFO=<ID=SVLEN_RANGE,Number=2,Type=Integer,Description=\"Min,max length change among the events merged into this record (every event each member brought), signed as SVLEN, when they differ; a substitution counts by its net change. On an INV, the inverted lengths. On a CN_METHOD=UNIT CNV: the smallest and largest carrier change, (CN-REF_CN)*RU_LEN in bp\">\n";
         out << "##INFO=<ID=BUBBLE_ID,Number=1,Type=Integer,Description=\"panvar bubble identifier\">\n";
-        out << "##INFO=<ID=START_NODE,Number=1,Type=String,Description=\"First graph node of the event (of the representative member on a merged record; see SVLEN)\">\n";
-        out << "##INFO=<ID=END_NODE,Number=1,Type=String,Description=\"Last graph node of the event\">\n";
         out << "##INFO=<ID=EVENT_NODES,Number=.,Type=String,Description=\"Variant node set; absent on PATH_INVERSION records\">\n";
         out << "##INFO=<ID=INS_SUBTYPE,Number=1,Type=String,Description=\"--classify-ins, on every INS record (a replacement flagged SUBSTITUTION too), from the bases it inserts (INSSEQ, also where too long to write): DUP where minimap2 aligns half of them or more to the reference across the site at --ins-dup-min-identity, NOVEL otherwise\">\n";
         out << "##INFO=<ID=INVDUP,Number=0,Type=Flag,Description=\"Inverted duplication: the extra copy is the reverse complement of the sequence it copies. On a CN_METHOD=UNIT CNV, some carrier gains copies walked opposite to the reference's (see FORMAT/CNINV), or, with no reference copy, holds a copy and its reverse complement; on an INS with INS_SUBTYPE=DUP, the inserted sequence aligns to the reference across the site on the reverse strand\">\n";
@@ -1958,11 +1945,7 @@ void call_variants(
         out << "##INFO=<ID=RU_LEN,Number=1,Type=Integer,Description=\"Repeat-unit length in bp, one represented copy. Emitted only for CN_METHOD=UNIT; (CN-REF_CN)*RU_LEN is the repeat-copy component of the haplotype size, while FORMAT/CNBP is the full module-walk change and CNRESID is their difference\">\n";
         out << "##INFO=<ID=CN_UNIT_BP,Number=1,Type=Integer,Description=\"CN_METHOD=MODULE only: one copy of the module, the reference's bp over its nodes divided by REF_CN; with REF_CN=0, the median over the haplotypes holding copies of their bp per copy. Copies of different types differ, so a carrier's own change is FORMAT:CNBP\">\n";
         out << "##INFO=<ID=CN_METHOD,Number=1,Type=String,Description=\"How CN was measured: UNIT (copies of a panphorte unit graph, counted exactly where they pass its anchor; a one-node unit graph's are its traversals) or MODULE (--cn: passes through the anchor of a collapsed module, the module nodes the most paths revisit)\">\n";
-        out << "##INFO=<ID=CN_SCOPE,Number=1,Type=String,Description=\"What one copy is a copy of: REPEAT_UNIT (one traversal of a represented repeat unit; full per-haplotype module size is FORMAT/CNBP) or COLLAPSED_MODULE (a module that may hold several distinct paralogs; RU_LEN is not emitted, shared per-copy content is CN_UNIT_BP, and per-haplotype size is FORMAT/CNBP)\">\n";
-        out << "##INFO=<ID=CN_SHARED_BP,Number=1,Type=Integer,Description=\"CN_METHOD=MODULE: the reference's bp over the module's nodes, each visit counted\">\n";
-        out << "##INFO=<ID=CN_REF_FOLD,Number=1,Type=Integer,Description=\"CN_METHOD=MODULE: the reference's copies of the module (REF_CN); CN_UNIT_BP is CN_SHARED_BP/CN_REF_FOLD\">\n";
         out << "##INFO=<ID=CN_MODULE_REF_BP,Number=1,Type=Integer,Description=\"Reference bp across the bubble interior, each visit counted, over which CN_METHOD=UNIT measures CNBP. On a MODULE record END-POS equals it, unless CN_SPAN_AMBIGUOUS (the span then also encloses the boundary visits between the outermost ones); on a UNIT record END covers the reference's copies, which can lie inside the interior\">\n";
-        out << "##INFO=<ID=REF_CN_SOURCE,Number=1,Type=String,Description=\"How REF_CN was counted: UNIT_ANCHOR (the unit graph's copies at its anchor) or ANCHOR_PASSES (MODULE: the reference's passes through the module's anchor, counted as every haplotype's are)\">\n";
         out << "##INFO=<ID=CN_ANCHOR_BP,Number=1,Type=Integer,Description=\"CN_METHOD=MODULE: bp of the module's anchor, the nodes CN counts passes through\">\n";
         out << "##INFO=<ID=CN_MODULE_NODES_BP,Number=1,Type=Integer,Description=\"CN_METHOD=MODULE: bp of the module's nodes, those some path visits more than once, one visit each\">\n";
         out << "##INFO=<ID=SUBSTITUTION,Number=0,Type=Flag,Description=\"The DEL or INS replaces the reference bases POS+1..END with other bases, typed by its net change, which SVLEN gives. Where both sides fit --max-seq-bp and the breakpoints are exact, REF and ALT spell it after the base at POS, as on a SUB; otherwise ALT is symbolic, with DELSEQ and INSSEQ where they fit. A replacement whose net change is under --min-sv-bp is a SVTYPE=SUB record\">\n";
@@ -1976,13 +1959,11 @@ void call_variants(
         out << "##INFO=<ID=MULTI_CROSSING_UNSCORED,Number=1,Type=Integer,Description=\"Of the MULTI_CROSSING paths, those with a traversal the scored walk does not hold whose allele length differs from every reference traversal of this bubble by --min-sv-bp or more: an SV-sized difference no record here describes. Absent when none\">\n";
         if (!genes.empty())
             out << "##INFO=<ID=GENES,Number=.,Type=String,Description=\"Gene(s) overlapping the variant (from --gtf); for an event inside a gene of a copy-number site's copies, that gene's paralogs its carriers hold\">\n";
-        out << "##INFO=<ID=NMERGED,Number=1,Type=Integer,Description=\"Haplotype carriers merged into this record\">\n";
         out << "##INFO=<ID=MERGE_DIAMETER,Number=1,Type=Float,Description=\"Weakest pairwise node Jaccard between any two events merged into this record. Node-comparison events merge by transitive single-linkage, so a record can span members that would never have merged directly (A-B-C with A and C dissimilar); MERGE_JACCARD reports the strongest edge and cannot show that, this reports the worst. Events from aligned alleles merge around a representative, each member matching it. Near 0 means the record's members share almost no nodes and the chain reached a long way. Absent on unmerged records\">\n";
         out << "##INFO=<ID=MERGE_DIAMETER_EXACT,Number=0,Type=Flag,Description=\"MERGE_DIAMETER, MERGE_JACCARD, MERGE_SEQID and MERGE_DIRECT_FRAC compared every pair of merged members. Absent means the component exceeded the all-pairs bound (128 members) and each was measured against the representative only\">\n";
         out << "##INFO=<ID=MERGE_JACCARD,Number=1,Type=Float,Description=\"Strongest node-set Jaccard over the pairs of merged members that match directly (every pair of the component, not only the pairs the merge sweep tested), and over force-called members against the representative\">\n";
         out << "##INFO=<ID=MERGE_SEQID,Number=1,Type=Float,Description=\"Strongest sequence identity over the same directly matching pairs, counted only where the Jaccard gate did not decide the pair\">\n";
         out << "##INFO=<ID=MERGE_DIRECT_FRAC,Number=1,Type=Float,Description=\"Share of member pairs of the merged component that match each other directly (same test as the merge). For node-comparison events (transitive single-linkage) below 1 means some members joined only through a chain; for events from aligned alleles (merged around a representative) it means members matched only through the representative. Force-called members are not counted. Absent on unmerged records\">\n";
-        out << "##INFO=<ID=MERGE_SIZE_RATIO,Number=1,Type=Float,Description=\"The smaller over the larger size in SVLEN_RANGE; absent where the range crosses zero\">\n";
         out << "##INFO=<ID=AN,Number=1,Type=Integer,Description=\"Allele number: haplotypes with an allele at the site (GT not .). The reference path is left out, and a haplotype assembled in several contigs (PanSN sample#haplotype) counts once where those with an allele agree on it, not at all where they differ\">\n";
         out << "##INFO=<ID=AC,Number=A,Type=Integer,Description=\"Allele count: haplotypes of AN that carry the allele\">\n";
         out << "##INFO=<ID=AF,Number=A,Type=Float,Description=\"Allele frequency = AC/AN; --min-alt-af is tested on it\">\n";
@@ -4878,25 +4859,9 @@ void call_variants(
                         else { lo = std::min(lo, n); hi = std::max(hi, n); }
                     }
                 }
-                if (any && lo != hi) {
-                    info << ";SVLEN_RANGE=" << lo << "," << hi;
-                    const long long a = std::min(std::llabs(lo), std::llabs(hi));
-                    const long long b = std::max(std::llabs(lo), std::llabs(hi));
-                    if (b > 0 && (lo > 0) == (hi > 0)) {
-                        char buf[32];
-                        std::snprintf(buf, sizeof(buf), "%.4g", static_cast<double>(a) / static_cast<double>(b));
-                        info << ";MERGE_SIZE_RATIO=" << buf;
-                    }
-                }
+                if (any && lo != hi) info << ";SVLEN_RANGE=" << lo << "," << hi;
             } else if (e.type != EvType::Dup && mr.min_size_bp != mr.max_size_bp) {
-                const long long a = static_cast<long long>(mr.min_size_bp);
-                const long long b = static_cast<long long>(mr.max_size_bp);
-                info << ";SVLEN_RANGE=" << a << "," << b;
-                if (b > 0) {
-                    char buf[32];
-                    std::snprintf(buf, sizeof(buf), "%.4g", static_cast<double>(a) / static_cast<double>(b));
-                    info << ";MERGE_SIZE_RATIO=" << buf;
-                }
+                info << ";SVLEN_RANGE=" << mr.min_size_bp << "," << mr.max_size_bp;
             }
             if (mr.merge_diameter >= 0.0) {
                 std::ostringstream d; d.setf(std::ios::fixed); d.precision(4);
@@ -4962,10 +4927,7 @@ void call_variants(
             const std::size_t an = traverses.size() - n_unknown;
             const std::size_t ac = carrier_set.size();
             const double af = an > 0 ? static_cast<double>(ac) / static_cast<double>(an) : 0.0;
-            info << ";BUBBLE_ID=" << bubble.id
-                 << ";START_NODE=" << start_node << ";END_NODE=" << end_node
-                 << ";NMERGED=" << carrier_set.size()
-                 << ";AN=" << an << ";AC=" << ac;
+            info << ";BUBBLE_ID=" << bubble.id << ";AN=" << an << ";AC=" << ac;
             { char buf[32]; std::snprintf(buf, sizeof(buf), "%.4g", af); info << ";AF=" << buf; }
             info << ";EVENT_NODES=";
             for (std::size_t k = 0; k < ev_nodes.size(); ++k) { if (k) info << ','; info << ev_nodes[k]; }
@@ -4981,20 +4943,11 @@ void call_variants(
                 }
                 else if (e.cn_method == CnMethod::Module) info << ";CN_UNIT_BP=" << e.ru_len;
             }
-            // Which measurement produced CN, and what a copy is a copy of. Without these a consumer
-            // cannot tell an exact repeat-unit traversal count from a paralog module's dosage, and
-            // reads RU_LEN as a per-copy size in both cases -- which it only is for the first.
+            // Which measurement produced CN: an exact repeat-unit traversal count (UNIT, counted at the unit
+            // graph's anchor) or a module's dosage (MODULE, passes through its anchor), whose copies can hold
+            // several paralogs, so one copy's length is no carrier's size.
             if (e.type == EvType::Dup && e.cn_method != CnMethod::None) {
-                info << ";CN_METHOD=" << cn_method_name(e.cn_method)
-                     << ";CN_SCOPE=" << cn_scope_name(e.cn_method);
-            }
-            if (e.shared_fold_bp > 0) info << ";CN_SHARED_BP=" << e.shared_fold_bp;
-            if (e.ref_fold > 0) info << ";CN_REF_FOLD=" << e.ref_fold;
-            // REF_CN is not measured the same way on every route, and absolute CN is only as good as
-            // its anchor. Say which one produced it rather than leaving a bare integer.
-            if (e.type == EvType::Dup && e.cn_method != CnMethod::None) {
-                info << ";REF_CN_SOURCE="
-                     << (e.cn_method == CnMethod::Unit ? "UNIT_ANCHOR" : "ANCHOR_PASSES");
+                info << ";CN_METHOD=" << cn_method_name(e.cn_method);
                 if (e.cn_method == CnMethod::Module)
                     info << ";CN_ANCHOR_BP=" << e.anchor_bp << ";CN_MODULE_NODES_BP=" << e.module_nodes_bp;
             }
@@ -5111,10 +5064,9 @@ void call_variants(
                 return bp;
             };
             const long long cnbp_ref_bp = (is_dup && ref_idx < graph.paths.size()) ? cnbp_walk_bp(ref_idx) : 0;
-            // The reference's total bp across this bubble, beside CN_SHARED_BP (its folded subset). At a
-            // collapsed paralog module the two differ by the paralog-private content that travels with
-            // each copy but that the reference does not revisit -- which is exactly why RU_LEN, derived
-            // from the shared part, understates what a carrier gains or loses.
+            // The reference's total bp across this bubble. At a collapsed paralog module it holds the
+            // paralog-private content that travels with each copy but that the reference does not revisit,
+            // which one copy's shared part (CN_UNIT_BP) leaves out.
             if (is_dup && cnbp_ref_bp > 0) info << ";CN_MODULE_REF_BP=" << cnbp_ref_bp;
             auto sample_cnbp = [&](const std::string& s) -> long long {
                 if (!mr.sample_copies_bp.empty()) {
@@ -5624,7 +5576,7 @@ void call_variants(
             std::ostringstream info;
             info << "END=" << end << ";SVTYPE=INV;SVLEN=" << (end - pos) << ";PATH_INVERSION;BUBBLE_ID=" << parent->id;
             if (cipos > 0 || ciend > 0) info << ";IMPRECISE;CIPOS=0," << cipos << ";CIEND=-" << ciend << ",0";
-            info << ";NMERGED=" << ac << ";AN=" << an << ";AC=" << ac << ";AF=" << afb;
+            info << ";AN=" << an << ";AC=" << ac << ";AF=" << afb;
             if (!genes.empty()) {
                 const std::vector<std::string> gnames = genes_in_interval(pos + 1, end);
                 if (!gnames.empty()) {
