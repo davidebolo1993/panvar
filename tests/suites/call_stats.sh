@@ -1067,6 +1067,13 @@ check "copies: forms of gained copies name the reference stretches they repeat (
   "$(awk -F'\t' '/^#CHROM/{for(i=10;i<=NF;i++) c[$i]=i} !/^#/ && /SVTYPE=CNV;/{n=split($9,k,":"); match($8,/CN_FORMS=[^;]*/); split(substr($8,RSTART+9,RLENGTH-9),fs,",")
        for (h in c) if (h=="hgain#1#chr1" || h=="hinv#1#chr1") { split($c[h],v,":"); for(j=1;j<=n;j++) if(k[j]=="CNFORM") r[h]=fs[v[j]] }
        print r["hgain#1#chr1"], r["hinv#1#chr1"]}' "$OUT/sep_short.region.vcf")" "2001-2000:=2001-2200 2361-2360:~2001-2200"
+# hz walks Z (50 bp, no module node) for the first copy's A3 (60 bp): Z takes A3's place in its copies, so CNBP
+# is its walk's change across them, -10, not -60 from its first module node on.
+sed 's/^P hyy#1#chr1 .*/P hz#1#chr1 L+,Z+,A2+,S+,A3+,A2+,X1+,X2+,X3+,R+/' "$OUT/sep.spec" | sed 's/^N Y 70 89$/N Y 70 89\nN Z 50 90/' > "$OUT/sepz.spec"
+python3 -I "$(cd "$(dirname "$0")/.." && pwd)/tools/spec_gfa.py" "$OUT/sepz.spec" "$OUT/sepz"
+cn_call "$OUT/sepz/g.gfa" "$OUT/sepz"
+check "copies: CNBP counts sequence that takes the place of the first copy's module nodes (hz GT:CN:CNBP)" \
+  "$(awk -F'\t' '/^#CHROM/{for(i=10;i<=NF;i++) if($i=="hz#1#chr1") c=i} !/^#/ && /SVTYPE=CNV;/{split($c,v,":"); print v[1]":"v[2]":"v[3]}' "$OUT/sepz.region.vcf")" "0:2:-10"
 # --diploid: hhalf and heq as one sample; each haplotype's copies are listed, joined as GT is.
 sed -e 's/^P hhalf#1#chr1 /P s9#1#chr1 /' -e 's/^P heq#1#chr1 /P s9#2#chr1 /' "$OUT/sep.spec" > "$OUT/sepdip.spec"
 python3 -I "$(cd "$(dirname "$0")/.." && pwd)/tools/spec_gfa.py" "$OUT/sepdip.spec" "$OUT/sepdip"

@@ -3798,6 +3798,8 @@ void call_variants(
             module_rec == nullptr ? std::unordered_set<std::string>()
                                   : std::unordered_set<std::string>(module_rec->carriers.begin(), module_rec->carriers.end());
         std::vector<CopySplit> copy_split(alleles.size());
+        std::vector<long long> cnbp_fix(alleles.size(), 0);   // CNBP's change where a walk replaced the copies' end nodes
+        const std::unordered_set<std::string> interior(bubble.inside.begin(), bubble.inside.end());
         std::unordered_map<std::string, std::size_t> ref_tok_of_node;   // a node the reference walks: one place it does
         for (std::size_t k = 0; k < Rdiff.size(); ++k) ref_tok_of_node.emplace(Rdiff[k].node_id, k);
         run_parallel(alleles.size(), options.threads, [&](std::size_t ai) {
@@ -3810,10 +3812,44 @@ void call_variants(
                 // Only whole copies leave the walks, for a UNIT record (every node of the unit graph or loop),
                 // so a gap is split where they left it, beside a module record too: the module takes nothing
                 // out of the walks, but a UNIT array beside it still leaves junction pieces.
-                events = diff_walks(graph, Rdiff, Htok, bubble.source, options.write_variant_nodes ? &hm : nullptr, &skipped,
+                events = diff_walks(graph, Rdiff, Htok, bubble.source, options.write_variant_nodes || module_rec != nullptr ? &hm : nullptr, &skipped,
                                     true, options.min_sv_bp, rescue_floor);
                 for (std::size_t j = 0; j < hm.size(); ++j)
                     if (hm[j] != SIZE_MAX) allele_matched[ai].emplace_back(Htok[j].src_idx, hm[j]);
+                // CNBP runs from each walk's first module node to its last. A walk whose copies start (end) at another
+                // module node than the reference's, after (before) the step both walks share right before (after) the
+                // reference's copies, holds other sequence in place of the reference's leading (trailing) module nodes:
+                // that sequence is in its copies. An insertion before copies that start as the reference's is beside
+                // them, and a deletion of module nodes with nothing in their place changes nothing here.
+                if (module_rec != nullptr && !hm.empty()) {
+                    std::size_t ra = 0, rb = 0, ha = 0, hb = 0;
+                    if (copy_span(Rdiff, module_rec->module_nodes, ra, rb) && copy_span(Htok, module_rec->module_nodes, ha, hb)) {
+                        std::vector<std::size_t> hr(Htok.size(), SIZE_MAX);   // the reference token each is matched to
+                        for (std::size_t j = 0; j < hm.size() && j < Htok.size(); ++j) {
+                            if (hm[j] == SIZE_MAX) continue;
+                            const auto it = rdiff_pos.find(hm[j]);
+                            if (it != rdiff_pos.end()) hr[j] = it->second;
+                        }
+                        const auto bp_of = [&](const std::vector<Tok>& W, std::size_t lo, std::size_t hi) {   // [lo, hi)
+                            long long b = 0;
+                            for (std::size_t k = lo; k < hi; ++k)
+                                if (interior.count(W[k].node_id)) b += static_cast<long long>(node_len(graph, W[k].node_id));
+                            return b;
+                        };
+                        long long fix = 0;
+                        if (Htok[ha].token != Rdiff[ra].token) {
+                            std::size_t j0 = SIZE_MAX;
+                            for (std::size_t j = 0; j < ha; ++j) if (hr[j] != SIZE_MAX && hr[j] < ra) j0 = j;
+                            if (j0 != SIZE_MAX && hr[j0] + 1 == ra) fix += bp_of(Htok, j0 + 1, ha);
+                        }
+                        if (Htok[hb].token != Rdiff[rb].token) {
+                            std::size_t j1 = SIZE_MAX;
+                            for (std::size_t j = hb + 1; j < Htok.size() && j1 == SIZE_MAX; ++j) if (hr[j] != SIZE_MAX && hr[j] > rb) j1 = j;
+                            if (j1 != SIZE_MAX && hr[j1] == rb + 1) fix += bp_of(Htok, hb + 1, j1);
+                        }
+                        cnbp_fix[ai] = fix;
+                    }
+                }
                 if (skipped > 0) allele_unaligned[ai] = 1;
                 allele_skipped_blocks[ai] = skipped;
                 if (module_rec != nullptr && !alleles[ai].members.empty()) {
@@ -4000,6 +4036,10 @@ void call_variants(
         // cannot drop it and the copies with it. Otherwise no carrier's copies are taken from its events.
         if (module_rec != nullptr) {
             MergedRecord& d = merged[module_idx];
+            for (std::size_t ai = 0; ai < alleles.size(); ++ai)
+                if (cnbp_fix[ai] != 0)
+                    for (const std::string& m : alleles[ai].members)
+                        if (const auto it = d.sample_copies_bp.find(m); it != d.sample_copies_bp.end()) it->second += cnbp_fix[ai];
             std::unordered_map<std::string, std::size_t> allele_of;
             for (std::size_t ai = 0; ai < alleles.size(); ++ai)
                 for (const std::string& m : alleles[ai].members) allele_of.emplace(m, ai);
