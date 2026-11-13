@@ -920,13 +920,14 @@ python3 -I "$(cd "$(dirname "$0")/.." && pwd)/tools/spec_gfa.py" "$OUT/modbig.sp
 cn_call "$OUT/modbig/g.gfa" "$OUT/modbig"
 check "MODULE carrier given up to a larger deletion of its own reads REF_CN (CNV GT:CN, DEL GT)" \
   "$(gt_cn "$OUT/modbig.region.vcf" 'hbig#1#chr1' CNV) $(gt_cn "$OUT/modbig.region.vcf" 'hbig#1#chr1' DEL | cut -d: -f1)" "0:2 1"
-# --diploid: sample s1 holds a carrier (one copy lost) and a non-carrier whose own deletion holds its change.
+# --diploid: sample s1 holds a carrier (one copy lost) and a non-carrier whose own deletion holds its change. The
+# non-carrier's CN reads REF_CN, but its CNRESID comes from its measured copies, as when no record holds it.
 sed -e 's/^P hfull#1#chr1 /P s1#1#chr1 /' -e 's/^P htest#1#chr1 /P s1#2#chr1 /' "$OUT/modlow.spec" > "$OUT/moddip.spec"
 python3 -I "$(cd "$(dirname "$0")/.." && pwd)/tools/spec_gfa.py" "$OUT/moddip.spec" "$OUT/moddip"
 "$BIN" bubble -i "$OUT/moddip/g.gfa" -r ref --min-variant-bp 0 -o "$OUT/moddip.b" --merge-nearby-bp 0 --quiet >/dev/null 2>&1
 "$BIN" call -i "$OUT/moddip.b.sorted.gfa" --bubble-prefix "$OUT/moddip.b" -r ref -o "$OUT/moddip" --cn --diploid --quiet >/dev/null 2>&1
 check "--diploid: one carrier and one non-carrier holding its change (s1 GT:CN:CNBP:CNRESID:HCN)" \
-  "$(awk -F'\t' '/^#CHROM/{for(i=10;i<=NF;i++) if($i=="s1") c=i} !/^#/ && /SVTYPE=CNV;/{print $c; exit}' "$OUT/moddip.region.vcf")" "1|0:3:-140:-60:1|2"
+  "$(awk -F'\t' '/^#CHROM/{for(i=10;i<=NF;i++) if($i=="s1") c=i} !/^#/ && /SVTYPE=CNV;/{print $c; exit}' "$OUT/moddip.region.vcf")" "1|0:3:-140:20:1|2"
 "$BIN" call -i "$OUT/moddip.b.sorted.gfa" --bubble-prefix "$OUT/moddip.b" -r ref -o "$OUT/moddip_af" --cn --diploid \
   --min-alt-af 0.1 --quiet >/dev/null 2>&1
 check "--diploid, the holding deletion filtered out: the non-carrier's measured CN (s1 GT:CN:...:HCN)" \
