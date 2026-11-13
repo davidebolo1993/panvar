@@ -185,6 +185,21 @@ Rscript scripts/plot_associate.R [<label>=]<associate prefix> [...]
 
 ## Example
 
+```bash
+# call's records, per sample, against a phenotype with covariates
+panvar associate --genotypes locus_describe/sample/variant/bimbam_variant.bimbam.gz \
+  --samples locus_describe/sample/variant/samples.txt.gz --phenotype pheno.tsv -o assoc
+# records and k-mers tested as one, with 1,000 permutations
+panvar associate --genotypes locus_describe/sample/variant/bimbam_variant.bimbam.gz \
+  --samples locus_describe/sample/variant/samples.txt.gz \
+  --genotypes locus_describe/sample/kmers/bimbam_kmers.bimbam.gz \
+  --samples locus_describe/sample/kmers/samples.txt.gz --phenotype pheno.tsv --permutations 1000 -o assoc
+# a linear mixed model on a kinship matrix
+panvar associate --genotypes locus_describe/sample/variant/bimbam_variant.bimbam.gz \
+  --samples locus_describe/sample/variant/samples.txt.gz --phenotype pheno.tsv --model lmm \
+  --kinship kinship.txt -o assoc
+```
+
 `scripts/associate_examples.sh` tests `call`'s records beside SNVs and SVs called from the same haplotypes, on simulated cohorts of 1,000 samples at two loci, in `tests/examples/associate`. The inputs are in `tests/synthetic_data/associate`; how they are made is in [dev/README.md](../dev/README.md). Per locus, `associate` tests the three matrices together, with 1,000 permutations, four times:
 
 - with sex and the PCs, each source's rare records also tested together (`--group layer`);

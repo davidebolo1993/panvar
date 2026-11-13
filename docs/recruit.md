@@ -114,4 +114,13 @@ Table columns:
 
 ## Example
 
+```bash
+# the indexes, once per locus graph, kept beside each graph
+panvar recruit --locus locus_a.gfa --locus locus_b.gfa --background bg.bgk -r GRCh38 --index-only
+# one sample
+panvar recruit --locus locus_a.plx --locus locus_b.plx -1 sample_1.fq.gz -2 sample_2.fq.gz -o sample.tsv
+# a sample sheet, one table per sample in out/
+panvar recruit --locus locus_a.plx --locus locus_b.plx --samples samples.tsv -o out
+```
+
 `scripts/recruit_examples.sh` indexes the synthetic locus of `scripts/background_examples.sh` against its store and recruits pairs drawn from the locus, from its diverged paralog elsewhere in the reference, and from unrelated sequence, in `tests/examples/recruit`: the locus pairs are certain, the paralog's are not.

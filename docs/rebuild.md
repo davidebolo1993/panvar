@@ -108,6 +108,11 @@ The panels:
 
 ## Example
 
-`rebuild` runs before `bubble`, on graphs the gate flags.
+```bash
+# before bubble: a tangled graph rebuilt, seeded by the reference path; any other copied through
+panvar rebuild -i locus.gfa.gz -r GRCh38 -o locus.rebuilt.gfa
+# rebuilt even when the gate passes it
+panvar rebuild -i locus.gfa.gz -r GRCh38 -o locus.rebuilt.gfa --force
+```
 
 `scripts/rebuild_examples.sh` rebuilds a tangled locus and four paralog loci from `tests/real_data` twice, seeded by the reference (`-r`) and without it, compares both rebuilt graphs with the input and plots the comparison, all in `tests/examples/rebuild`. The paralogs are rebuilt with `--force`, since their graphs pass the gate.

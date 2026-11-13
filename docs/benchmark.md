@@ -157,4 +157,11 @@ Each script lists its options under `--help`.
 
 ## Example
 
+```bash
+# what call's output leaves of each haplotype (call run without --diploid)
+panvar benchmark -i locus_r.normalized.sorted.gfa -b locus_r -r GRCh38 --calls locus_call -o locus_bench
+# differences under call's 50 bp listed too
+panvar benchmark -i locus_r.normalized.sorted.gfa -b locus_r -r GRCh38 --calls locus_call -o locus_bench_10 --min-sv-bp 10
+```
+
 `scripts/benchmark_examples.sh` benchmarks `call`'s output on every graph of `tests/examples/call` and plots what it leaves, per graph, in `tests/examples/benchmark/benchmark.png`; benchmarked at 10 bp, so the differences under `call`'s 50 bp count too.

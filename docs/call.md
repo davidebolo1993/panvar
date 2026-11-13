@@ -142,4 +142,15 @@ VN_RDS=<call prefix>.viewer.rds Rscript scripts/variant_node_heatmap_app.R
 
 ## Example
 
+```bash
+# one VCF column per haplotype
+panvar call -i locus_r.normalized.sorted.gfa -b locus_r -r GRCh38 -o locus_call
+# also the copies of duplicated stretches the graph did not fold
+panvar call -i locus_r.normalized.sorted.gfa -b locus_r -r GRCh38 -o locus_call_cn --cn
+# the genes each record touches, and copy number per gene
+panvar call -i locus_r.normalized.sorted.gfa -b locus_r -r GRCh38 -o locus_call_genes --gtf genes.gtf.gz
+# one VCF column per sample
+panvar call -i locus_r.normalized.sorted.gfa -b locus_r -r GRCh38 -o locus_call_diploid --diploid
+```
+
 `scripts/call_examples.sh` calls every graph in `tests/examples/refine` (with a GTF, also per gene) and builds a viewer bundle for each, in `tests/examples/call`.

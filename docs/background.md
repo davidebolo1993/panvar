@@ -73,4 +73,18 @@ Counts every 31-mer of a set of genomes once, so that `recruit` can tell, for ea
 
 ## Example
 
+```bash
+# the reference alone, with its anchors
+panvar background -o bg.bgk --genome grch38=GRCh38.fa.gz --coordinate-reference grch38
+# a genome added later
+panvar background -o bg.bgk --add --genome hg1=hg1.fa.gz
+# genomes counted in separate jobs, then attached
+panvar background -o bg.bgk --segment-only seg_2 --genome hg2=hg2.fa.gz
+panvar background -o bg.bgk --segment-only seg_3 --genome hg3=hg3.fa.gz
+panvar background -o bg.bgk --attach seg_2 seg_3
+# the segments merged into one, then compacted
+panvar background -o bg.bgk --merge
+panvar background -o bg.bgk --compact
+```
+
 `scripts/background_examples.sh` counts a synthetic genome set two ways, all at once and grown step by step (a genome added, another counted in its own job and attached, merged, compacted), checks that both hold the same counts, and locates the locus in every genome, in `tests/examples/background`.

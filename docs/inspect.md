@@ -76,4 +76,12 @@ Rscript scripts/plot_inspect.R --table <prefix>/bubble_<N>/ --features edges
 
 ## Example
 
+```bash
+# every site: each haplotype's allele, and its node and link counts
+panvar inspect -i locus_r.normalized.sorted.gfa -b locus_r -o locus_inspect
+# one site, crossings clustered, and the allele table by sample
+panvar inspect -i locus_r.normalized.sorted.gfa -b locus_r -o locus_inspect --bubble-id 3 --cluster \
+  --samples samples.tsv -r GRCh38
+```
+
 `scripts/inspect_examples.sh` inspects the copy-number site of four loci from `tests/examples/bubble`, with clusters, allele tables and heatmaps, one folder per locus in `tests/examples/inspect`.

@@ -85,4 +85,11 @@ The sorted graph opens in [BandageNG](https://github.com/asl/BandageNG); File â€
 
 ## Example
 
+```bash
+# the sites, along the reference path
+panvar bubble -i locus.gfa.gz -r GRCh38 -o locus
+# and the genes on the reference's nodes, for Bandage
+panvar bubble -i locus.gfa.gz -r GRCh38 -o locus --gtf genes.gtf.gz
+```
+
 `scripts/bubble_examples.sh` finds the sites of the paralog and tandem-repeat loci in `tests/real_data` and of a rebuilt tangled locus, one folder per graph in `tests/examples/bubble`.

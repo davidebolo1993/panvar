@@ -114,4 +114,11 @@ Rscript scripts/plot_compare_graphs.R --prefix <compare prefix>
 
 ## Example
 
+```bash
+# tandem repeats folded where copies are identical, the sites found again for call
+panvar panphorte -i locus.sorted.gfa -b locus -r GRCh38 -o locus_p
+# copies 95% identical folded too
+panvar panphorte -i locus.sorted.gfa -b locus -r GRCh38 -o locus_p --min-similarity 0.95
+```
+
 `scripts/panphorte_examples.sh` folds the graphs in `tests/examples/bubble` (the tandem-repeat locus also with `--lossy-units`), inspects its repeat site before and after each fold, and compares the graphs, in `tests/examples/panphorte`.

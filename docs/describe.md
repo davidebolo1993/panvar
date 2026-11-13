@@ -127,4 +127,15 @@ Node and edge ids share one namespace, so a node id containing `>` is refused.
 
 ## Example
 
+```bash
+# k-mers, nodes and edges of every site, and one dosage per call record, per haplotype
+panvar describe -i locus_r.normalized.sorted.gfa -b locus_r -r GRCh38 --variant-vcf locus_call.region.vcf \
+  -o locus_describe
+# also per sample, summed over each sample's haplotypes
+panvar describe -i locus_r.normalized.sorted.gfa -b locus_r -r GRCh38 --variant-vcf locus_call.region.vcf \
+  -o locus_describe --samples samples.tsv
+# call's records only
+panvar describe --only-variant --variant-vcf locus_call.region.vcf -o locus_records
+```
+
 `scripts/describe_examples.sh` describes every graph `scripts/call_examples.sh` called, with its VCF, its `variant_nodes.tsv` and a samples table made from the path names, one folder per graph in `tests/examples/describe`.

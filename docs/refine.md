@@ -98,4 +98,11 @@ The refined graph opens in [BandageNG](https://github.com/asl/BandageNG) coloure
 
 ## Example
 
+```bash
+# every site realigned
+panvar refine -i locus_p.normalized.sorted.gfa -b locus_p -r GRCh38 -o locus_r
+# only some sites
+panvar refine -i locus_p.normalized.sorted.gfa -b locus_p -r GRCh38 -o locus_r --bubble-id 2,3
+```
+
 `scripts/refine_examples.sh` refines every graph in `tests/examples/panphorte` and compares each with its input, in `tests/examples/refine`.
