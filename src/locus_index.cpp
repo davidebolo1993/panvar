@@ -589,7 +589,8 @@ std::vector<LocusIndex> build(const BuildOptions& o) {
         };
         auto scan = [&](const std::string& gname, const std::string& name, const std::string& seq, const std::vector<char>& here,
                         std::size_t inner, Found& f) {
-            if (seq.size() < kPieceWindow + kK - 1) return;
+            if (seq.size() < kK) return;
+            const bool whole_only = seq.size() < kPieceWindow + kK - 1;   // no window fits
             // each locus's k-mer starts on the contig, in order: ranges scanned in parallel, joined in order
             const std::size_t starts = seq.size() - kK + 1;
             const std::size_t parts = std::min<std::size_t>(inner, std::max<std::size_t>(1, starts / 65536));
@@ -611,31 +612,38 @@ std::vector<LocusIndex> build(const BuildOptions& o) {
                 if (!here[li]) continue;
                 std::vector<std::uint64_t> hits;
                 for (std::size_t p = 0; p < parts; ++p) hits.insert(hits.end(), part_hits[p][li].begin(), part_hits[p][li].end());
-                if (hits.size() < need) continue;
-                // dense stretches: the union of the windows of kPieceWindow k-mer starts holding enough of them
                 std::vector<std::pair<std::uint64_t, std::uint64_t>> dense;
-                for (std::size_t i = 0, j = 0; i < hits.size(); ++i) {
-                    if (j < i) j = i;
-                    while (j < hits.size() && hits[j] < hits[i] + kPieceWindow) ++j;
-                    if (j - i < need) continue;
-                    const std::uint64_t ws = hits[i], we = hits[j - 1] + kK;
-                    if (!dense.empty() && ws <= dense.back().second) dense.back().second = std::max(dense.back().second, we);
-                    else dense.emplace_back(ws, we);
-                }
-                // a stretch less than a window from a contig end reaches that end when at least half of the k-mer
-                // starts in between are the locus's: no window fits there, and assemblies hold more errors near
-                // their contig ends
-                if (!dense.empty()) {
-                    auto& first = dense.front();
-                    if (first.first > 0 && first.first < kPieceWindow) {
-                        const std::size_t n = static_cast<std::size_t>(std::lower_bound(hits.begin(), hits.end(), first.first) - hits.begin());
-                        if (2 * n >= first.first) first.first = 0;
+                if (whole_only) {
+                    // a contig shorter than a window is a piece whole when at least half of its k-mer starts are the
+                    // locus's, the rule for a stretch's last bases before a contig end
+                    if (hits.empty() || 2 * hits.size() < starts) continue;
+                    dense.emplace_back(0, seq.size());
+                } else {
+                    if (hits.size() < need) continue;
+                    // dense stretches: the union of the windows of kPieceWindow k-mer starts holding enough of them
+                    for (std::size_t i = 0, j = 0; i < hits.size(); ++i) {
+                        if (j < i) j = i;
+                        while (j < hits.size() && hits[j] < hits[i] + kPieceWindow) ++j;
+                        if (j - i < need) continue;
+                        const std::uint64_t ws = hits[i], we = hits[j - 1] + kK;
+                        if (!dense.empty() && ws <= dense.back().second) dense.back().second = std::max(dense.back().second, we);
+                        else dense.emplace_back(ws, we);
                     }
-                    auto& last = dense.back();
-                    if (last.second < seq.size() && seq.size() - last.second < kPieceWindow) {
-                        const std::uint64_t from = last.second - kK + 1;   // the first start past the stretch's last k-mer
-                        const std::size_t n = static_cast<std::size_t>(hits.end() - std::upper_bound(hits.begin(), hits.end(), last.second - kK));
-                        if (2 * n >= starts - from) last.second = seq.size();
+                    // a stretch less than a window from a contig end reaches that end when at least half of the k-mer
+                    // starts in between are the locus's: no window fits there, and assemblies hold more errors near
+                    // their contig ends
+                    if (!dense.empty()) {
+                        auto& first = dense.front();
+                        if (first.first > 0 && first.first < kPieceWindow) {
+                            const std::size_t n = static_cast<std::size_t>(std::lower_bound(hits.begin(), hits.end(), first.first) - hits.begin());
+                            if (2 * n >= first.first) first.first = 0;
+                        }
+                        auto& last = dense.back();
+                        if (last.second < seq.size() && seq.size() - last.second < kPieceWindow) {
+                            const std::uint64_t from = last.second - kK + 1;   // the first start past the stretch's last k-mer
+                            const std::size_t n = static_cast<std::size_t>(hits.end() - std::upper_bound(hits.begin(), hits.end(), last.second - kK));
+                            if (2 * n >= starts - from) last.second = seq.size();
+                        }
                     }
                 }
                 const LocusWork& w = work[li];

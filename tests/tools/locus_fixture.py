@@ -150,3 +150,8 @@ def clustered(s, block=5000, run=50):
 os.makedirs(os.path.join(out, "split_c"), exist_ok=True)
 write("split_c/gc", [("chr1", seq(60000)), ("p", seq(3000) + clustered(long_array[5500:4 * 5500]) + seq(3000)),
                      ("o", long_array[4 * 5500:7 * 5500])])
+
+# split_h/: the locus of split/, and a genome with no copy of it but a contig shorter than a piece window
+# holding nothing but its array (a piece), and a short contig of other sequence
+os.makedirs(os.path.join(out, "split_h"), exist_ok=True)
+write("split_h/gh", [("chr1", seq(30000)), ("s", long_array[2000:6500]), ("n", seq(3000))])
