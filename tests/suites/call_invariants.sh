@@ -205,6 +205,25 @@ echo "-- 7. AC counts the haplotypes that carry"
 check "AC = haplotypes with a carrying column, never 0 (every region VCF of this run)" \
   python3 -I "$TOOLS/accheck.py" $(find "$OUT" -name '*.region.vcf' | sort)
 
+# ---------------------------------------------------------------- 8. --min-alt-af
+# Every record written under --min-alt-af reaches it, per path and per sample. The fixtures above, called again
+# at a threshold that drops some of their records.
+echo "-- 8. --min-alt-af holds on every record written"
+af_vcfs=()
+for fx in tie chain sub loop; do
+  D="$OUT/$fx"; G="$D/g.gfa"; C="$D/g.bubbles.csv"; R='ref#0#chr1:1-170'
+  [ "$fx" = chain ] && R='ref#0#chr1:1-100'
+  [ "$fx" = sub ] && { G="$D/sub_delfirst.gfa"; R='ref#0#chr1:1-140'; }
+  [ "$fx" = loop ] && R='ref#0#chr1:1-129'
+  for m in path diploid; do x=""; [ "$m" = diploid ] && x="--diploid"
+    # shellcheck disable=SC2086
+    call_ "$G" "$C" "$R" "$D/af_$m" --cn --min-alt-af 0.3 $x
+    [ -f "$D/af_$m.region.vcf" ] && af_vcfs+=("$D/af_$m.region.vcf")
+  done
+done
+check "--min-alt-af 0.3: every written record's AF reaches it, and AC counts its carriers (per path, per sample)" \
+  python3 -I "$TOOLS/accheck.py" --min-af 0.3 "${af_vcfs[@]}"
+
 echo
 printf "call_invariants: %d passed, %d FAILED, %d xfail, %d XPASS\n" "$passes" "$fails" "$xfails" "$xpasses"
 [ "$fails" -eq 0 ]

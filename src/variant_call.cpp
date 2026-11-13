@@ -5600,18 +5600,27 @@ void call_variants(
     if (options.diploid || options.min_maf > 0.0) {
         std::unordered_set<std::string> dropped;
         std::size_t no_column = 0;
-        out_records.erase(std::remove_if(out_records.begin(), out_records.end(), [&](const OutRecord& r) {
-            const std::string w = written(r.line);
-            if (w.empty()) ++no_column;
-            else if (options.min_maf <= 0.0 || !af_below(w)) return false;
-            dropped.insert(r.id);
-            summary.unaligned_missing -= r.unaligned_missing;
-            summary.covered_missing -= r.covered_missing;
-            return true;
-        }), out_records.end());
+        // A module sample read as REF_CN because a dropped record held its change takes its measured CN. That
+        // changes the line it is written with, and with --diploid can make a slot's contigs agree, which adds
+        // to AN: the records are tested again until none is dropped (each restoration happens once).
+        for (bool again = true; again;) {
+            out_records.erase(std::remove_if(out_records.begin(), out_records.end(), [&](const OutRecord& r) {
+                const std::string w = written(r.line);
+                if (w.empty()) ++no_column;
+                else if (options.min_maf <= 0.0 || !af_below(w)) return false;
+                dropped.insert(r.id);
+                summary.unaligned_missing -= r.unaligned_missing;
+                summary.covered_missing -= r.covered_missing;
+                return true;
+            }), out_records.end());
+            again = false;
+            for (OutRecord& r : out_records) {
+                const std::string before = r.line;
+                apply_measured_cn(r, [&](const std::string& id) { return dropped.count(id) != 0; });
+                if (r.line != before) again = true;
+            }
+        }
         summary.diploid_records_dropped = no_column;
-        // a module sample read as REF_CN because a dropped record held its change takes its measured CN
-        for (OutRecord& r : out_records) apply_measured_cn(r, [&](const std::string& id) { return dropped.count(id) != 0; });
         // a dropped copy-number record's genes keep their per-gene rows, under no record
         for (DupGeneTarget& t : dup_targets) if (dropped.count(t.variant_id)) t.variant_id = ".";
         if (!dropped.empty()) {
