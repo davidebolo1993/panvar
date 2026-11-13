@@ -12,8 +12,6 @@ Counts every 31-mer of a set of genomes once, so that `recruit` can tell, for ea
 
 ## How it works
 
-Counting, anchors and merging are panvar's own; the compacted dictionary is [SSHash](https://github.com/jermp/sshash)'s.
-
 1. A k-mer and its reverse complement count as one (the canonical k-mer). A base other than A, C, G or T ends the k-mers on either side of it.
 2. Consecutive k-mers that share a minimizer (the smallest canonical 11-mer by hash) form a super-k-mer, as in KMC 2 ([Deorowicz et al. 2015](https://doi.org/10.1093/bioinformatics/btv022)), and the minimizer picks one of `--partitions` partitions, so both strands of a k-mer reach the same partition. Readers cut the genomes into chunks; workers write each super-k-mer, 2 bits a base, to the spill file of its partition group under `--tmp-dir`. Identical super-k-mers are stored once, with their multiplicity.
 3. Each spill file is counted on its own thread within its share of `--memory`; a partition too large for it is counted in sorted runs on disk and merged. A counted partition is written as its sorted k-mers and their counts. The k-mers are Elias-Fano coded ([Vigna 2013](https://doi.org/10.1145/2433396.2433409)): each 62-bit k-mer is split into high bits, stored as gaps in unary in a bit vector, and low bits, stored at a fixed width, which takes about 2 + log2(universe / n) bits per k-mer and still allows a binary search without decoding. The counts are bit-packed: each takes the same number of bits, the width that fits most of them (often 1 or 2), and the few larger ones are listed apart.
@@ -75,18 +73,4 @@ Counting, anchors and merging are panvar's own; the compacted dictionary is [SSH
 
 ## Example
 
-```bash
-# the reference alone, with its anchors
-panvar background -o bg.bgk --genome grch38=GRCh38.fa.gz --coordinate-reference grch38 -t 16 --memory 32G
-# more assemblies later, each pair of haplotypes in its own job, then committed together
-panvar background -o bg.bgk --segment-only seg_1 --genome hg1=hap1.fa.gz --genome hg2=hap2.fa.gz -t 16 --memory 32G
-panvar background -o bg.bgk --attach seg_1 seg_2 seg_3
-# one segment, then the dictionary
-panvar background -o bg.bgk --merge -t 16
-panvar background -o bg.bgk --compact -t 16
-panvar background -o bg.bgk --locate chr1:1000000-1200000
-```
-
 `scripts/background_examples.sh` counts a synthetic genome set two ways, all at once and grown step by step (a genome added, another counted in its own job and attached, merged, compacted), checks that both hold the same counts, and locates the locus in every genome, in `tests/examples/background`.
-
-Whole GRCh38 counts in under two minutes on 16 threads into a 14 GB store; its dictionary is about 2.6 GB.

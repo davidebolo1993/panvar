@@ -114,16 +114,4 @@ Table columns:
 
 ## Example
 
-```bash
-# the indexes, once per locus graph (kept beside each graph)
-panvar recruit --locus locus_a.gfa --locus locus_b.gfa --background bg.bgk -r grch38 --index-only -t 16
-# a sample's reads, against both loci
-panvar recruit --locus locus_a.plx --locus locus_b.plx -i sample.cram --cram-reference GRCh38.fa \
-  -o sample.tsv --reads-out sample_reads -t 16
-# several samples from a sheet
-panvar recruit --locus locus_a.plx --locus locus_b.plx --samples samples.tsv -o out -t 16
-```
-
 `scripts/recruit_examples.sh` indexes the synthetic locus of `scripts/background_examples.sh` against its store and recruits pairs drawn from the locus, from its diverged paralog elsewhere in the reference, and from unrelated sequence, in `tests/examples/recruit`: the locus pairs are certain, the paralog's are not.
-
-A 30× short-read genome takes a few minutes on 8 threads against several loci; nearly every read is rejected by the screen. The simulation benchmark, the real-read checks and the comparisons are in `dev/` ([dev/README.md](../dev/README.md)).
