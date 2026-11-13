@@ -19,6 +19,12 @@ fails=0
 ok()  { printf "  ok   %s\n" "$1"; }
 bad() { printf "  FAIL %s\n" "$1"; fails=$((fails + 1)); }
 check() { [ "$2" = "$3" ] && ok "$1 = $3" || bad "$1: expected $3, got ${2:-<missing>}"; }
+# pending <label> <got> <want>: an expected result not yet produced. Prints 'xfail' while it differs and 'XPASS'
+# once it holds, and neither fails the run; an XPASS is made a check.
+xfails=0; xpasses=0
+pending() {
+  if [ "$2" = "$3" ]; then printf "  XPASS %s = %s: holds now; make it a check\n" "$1" "$3"; xpasses=$((xpasses + 1))
+  else printf "  xfail %s: expected %s, got %s\n" "$1" "$3" "${2:-<missing>}"; xfails=$((xfails + 1)); fi; }
 # bm <benchmark args>: benchmark with its log kept at <-o prefix>.log (-q dropped), for the counts it logs.
 bm() {
   local a=() o="" prev=""
@@ -498,6 +504,35 @@ EOF
 spec shortcopy --cn
 check "a gained copy of a shorter form, which a deletion record accounts for, is rebuilt (large_left_vcf_only_bp)" \
       "$(sv shortcopy_B large_left_vcf_only_bp)" "0"
+# Copies and the other events of each haplotype: the module record names the copies each carrier gained or lost
+# (CN_FORMS, CNFORM), and its other records the rest, so the VCF rebuilds every haplotype. The reference runs
+# A3 A2 twice, S between the copies and X1 X2 X3 after them (see call_stats.sh, the same haplotypes).
+{ printf 'N L 2000 81\nN A3 60 82\nN A2 100 83\nN S 40 84\nN X1 80 85\nN X2 80 86\nN X3 240 87\nN Y 70 89\nN R 2000 88\n'
+  printf 'P ref#0#chr1:0-4680 L+,A3+,A2+,S+,A3+,A2+,X1+,X2+,X3+,R+\n'
+  printf 'P hgain#1#chr1 L+,A3+,A2+,S+,A3+,A2+,S+,A3+,A2+,X1+,X2+,X3+,R+\nP hloss#1#chr1 L+,A3+,A2+,X1+,X2+,X3+,R+\n'
+  printf 'P hhalf#1#chr1 L+,A3+,A2+,S+,X2+,X3+,R+\nP heq#1#chr1 L+,A3+,A2+,S+,X3+,R+\nP hmore#1#chr1 L+,A3+,A2+,S+,R+\n'
+  printf 'P hdir#1#chr1 L+,A3+,A2+,S+,A3+,A2+,S+,A3+,A2+,R+\nP hinv#1#chr1 L+,A3+,A2+,S+,A3+,A2+,S-,A2-,A3-,X1+,X2+,X3+,R+\n'
+  printf 'P hyy#1#chr1 L+,A3+,Y+,A2+,S+,A3+,Y+,A2+,X1+,X2+,X3+,R+\n'
+  for i in 1 2 3 4 5 6 7 8; do printf 'P hr%s#1#chr1 L+,A3+,A2+,S+,A3+,A2+,X1+,X2+,X3+,R+\n' "$i"; done; } > "$OUT/sepb.spec"
+BUBBLE=1 spec sepb --cn
+# cn_exact <name>: carriers checked by cn_exact, and those that differ
+cn_exact() { echo "$(awk -F'\t' '$1=="cn_exact_checked"{print $2}' "$OUT/$1_B.summary.tsv"):$(tail -n +2 "$OUT/$1_B.carrier_checks.tsv" | awk -F'\t' '$3=="cn_exact"' | wc -l | tr -d ' ')"; }
+pending "copies: the VCF rebuilds every haplotype (large_left_vcf_bp; cn_exact checked:differing)" \
+  "$(sv sepb_B large_left_vcf_bp) $(cn_exact sepb)" "0 6:0"
+awk '$1=="P"{n=split($3,s,","); o=""; for(i=n;i>=1;i--){x=s[i]; c=substr(x,length(x)); x=substr(x,1,length(x)-1) (c=="+"?"-":"+")
+            o=o (o==""?"":",") x}; print $1, $2, o; next} {print}' "$OUT/sepb.spec" > "$OUT/sepbr.spec"
+BUBBLE=1 spec sepbr --cn
+pending "copies, the reference walked backwards: the VCF rebuilds every haplotype (large_left_vcf_bp; cn_exact)" \
+  "$(sv sepbr_B large_left_vcf_bp) $(cn_exact sepbr)" "0 6:0"
+# No reference copy: the gained copies are the record's own sequence.
+{ printf 'N L 2000 91\nN A 150 92\nN B 150 93\nN C 30 94\nN R 2000 95\nP ref#0#chr1:0-4030 L+,C+,R+\n'
+  for i in 1 2 3 4; do printf 'P hone%s#1#chr1 L+,A+,B+,C+,R+\n' "$i"; done
+  for i in 1 2; do printf 'P htwo%s#1#chr1 L+,A+,B+,A+,B+,C+,R+\n' "$i"; done
+  for i in 1 2 3 4 5 6; do printf 'P hr%s#1#chr1 L+,C+,R+\n' "$i"; done; } > "$OUT/sepb0.spec"
+BUBBLE=1 spec sepb0 --cn
+pending "copies, no reference copy: the VCF rebuilds the gains (large_left_vcf_bp, no_sequence; cn_exact)" \
+  "$(sv sepb0_B large_left_vcf_bp) $(sv sepb0_B large_left_vcf_no_sequence) $(cn_exact sepb0)" "0 0 6:0"
+
 sed 's/^P hX#1#chr1 .*/P hX#1#chr1 S+,A+,B+,A+,X+,B+,T+/' "$OUT/modins.spec" > "$OUT/modmid.spec"
 spec modmid --cn
 bm -i "$OUT/modmid/g.gfa" -c "$OUT/modmid/g.bubbles.csv" -r ref --calls "$CASES/modmid_missed_in_stretch" \
@@ -860,5 +895,6 @@ check "a site table naming nodes the graph lacks, or an id twice, is refused" "$
        >/dev/null 2> "$OUT/dip.err"
 check "a --diploid VCF is refused as one (rc:says so)" "$?:$(grep -c 'without --diploid' "$OUT/dip.err")" "2:1"
 
+[ $((xfails + xpasses)) -gt 0 ] && printf "%d expected failure(s), %d now holding\n" "$xfails" "$xpasses"
 printf "%d assertion(s) failed\n" "$fails"
 [ "$fails" -eq 0 ]
