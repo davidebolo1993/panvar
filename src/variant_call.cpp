@@ -834,6 +834,7 @@ void join_copy_pieces(const Graph& graph, const std::vector<Tok>& R, const std::
         e.ref_tok_first = rt.front()->src_idx;
         e.ref_tok_last = rt.back()->src_idx;
         e.r_lo = events[i].r_lo; e.r_hi = events[m].r_hi; e.h_lo = events[i].h_lo; e.h_hi = events[m].h_hi;
+        e.split_piece = true;   // placed by its own tokens: a copy taken out beside it leaves no match between
         out.push_back(std::move(e));
         i = m + 1;
     }
@@ -3754,7 +3755,6 @@ void call_variants(
                         split_copy_replacements(graph, Rdiff, Htok, module_rec->anchor_nodes,
                                                 static_cast<long long>(cit->second) - static_cast<long long>(module_rec->seed.ref_cn),
                                                 module_rec->seed.ru_len, options.min_sv_bp, events);
-                    join_copy_pieces(graph, Rdiff, Htok, module_rec->module_nodes, events, options.merge_distance_bp, options.min_sv_bp);
                     // A carrier by the gate (CN differs, its module changes by --min-sv-bp): its copies, as edits
                     // of the reference, and its other events.
                     const std::string& m0 = alleles[ai].members.front();
@@ -3787,6 +3787,10 @@ void call_variants(
                                                       static_cast<long long>(cit->second) - static_cast<long long>(module_rec->seed.ref_cn),
                                                       bit->second, module_rec->seed.ru_len, place);
                     }
+                    // Pieces of one change are joined once the copies are decided, on the parts left, so joining
+                    // never changes which parts are copies.
+                    for (std::vector<Event>* evs : {&events, &copy_split[ai].rest})
+                        join_copy_pieces(graph, Rdiff, Htok, module_rec->module_nodes, *evs, options.merge_distance_bp, options.min_sv_bp);
                 }
                 // An inversion is a node-level finding (the walk turns round); such an allele keeps it.
                 bool inv = false;
