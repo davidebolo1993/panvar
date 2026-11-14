@@ -259,6 +259,7 @@ std::vector<AnnotatedTranscript> load_hap_annotations(const Graph& graph, const 
             if (at.t.gene_id.empty()) at.t.gene_id = first_of(ta, {"gene_id"});
             if (at.t.gene_name.empty()) at.t.gene_name = at.t.gene_id.empty() ? at.t.transcript_id : at.t.gene_id;
             if (at.t.gene_id.empty()) at.t.gene_id = at.t.gene_name;
+            at.gene_key = sg.empty() ? at.t.gene_name : at.t.gene_id;
             at.t.biotype = first_of(ta, {"transcript_biotype", "transcript_type", "biotype"});
             if (at.t.biotype.empty()) at.t.biotype = tx->type;
             at.gene_record = gtf ? first_of(ta, {"gene_id"}) : gene ? tx->parents[0] : tid;
@@ -272,14 +273,16 @@ std::vector<AnnotatedTranscript> load_hap_annotations(const Graph& graph, const 
         if (orphan)
             std::cerr << cli::log_prefix(module) << "warning: " << hap << ": " << orphan
                       << " exon row(s) whose transcript record is missing in " << f[1] << "; skipped\n";
-        // Copies: each gene's records on a path, ranked by their first exon along the path.
+        // Copies: each gene's records on a path, ranked by their first exon along the path. A gene is its source
+        // gene where the annotation gives one (records of one source gene under different names are copies
+        // of it), else its name (Liftoff's extra copies have ids of their own).
         std::map<std::pair<std::size_t, std::string>, std::map<std::string, std::size_t>> records;
         for (const AnnotatedTranscript& at : mine) {
-            std::size_t& first = records[{at.path, at.t.gene_name}].emplace(at.gene_record, SIZE_MAX).first->second;
+            std::size_t& first = records[{at.path, at.gene_key}].emplace(at.gene_record, SIZE_MAX).first->second;
             first = std::min(first, at.t.exons.front().first);
         }
         for (AnnotatedTranscript& at : mine) {
-            const auto& recs = records[{at.path, at.t.gene_name}];
+            const auto& recs = records[{at.path, at.gene_key}];
             std::vector<std::pair<std::size_t, std::string>> order;
             for (const auto& [rec, first] : recs) order.emplace_back(first, rec);
             std::sort(order.begin(), order.end());
