@@ -141,3 +141,22 @@ bash dev/recruit_hard_cases.sh tests/examples/recruit_cn
 python3 dev/recruit_gene_cn.py --gfa held_out.gfa --sample <name> --genes tests/real_data/paralogs/<locus>.bed --reads certain_reads/*.fq.gz
 ```
 
+## Transcripts against outside truth
+
+Three checks of `panvar transcripts`, run on its outputs for a graph of `tests/real_data` (`scripts/transcripts_examples.sh` writes them in `tests/examples/transcripts`). They share `dev/transcripts_common.py` and the edit-distance helper `dev/edit_distance.cpp` (edlib, built into `build/edit_distance` on first use).
+
+- Copies: `dev/transcripts_copies.py` compares each gene's copies per haplotype with pangene's gene counts (`<locus>.bed`), and lists the haplotypes that differ as truth>ours.
+- Sequences: `dev/transcripts_minimap2.py` splice-aligns each reference transcript to each haplotype's spelled path (`minimap2 -x splice:hq`), takes the sequence the alignment gives on the haplotype, and compares it with the HST of that copy. A difference is classed by its cause: a boundary panvar moved, minimap2 clipping an end exon, an exon taken from another copy, another junction or exon count where the HST is no further from the reference, a shift inside a repeat, and otherwise `projection_worse`, the case to inspect.
+- HPRC annotations: `dev/transcripts_hprc.py` compares copies and transcripts with HPRC's own CAT and Liftoff annotations of the same assemblies (release 2), on haplotypes drawn by their copies of one gene. It needs HPRC's annotation index files (`cat.csv`, `liftoff.csv`) and network access; only the stretch of each annotation over the haplotype's path is kept.
+
+```bash
+bash scripts/transcripts_examples.sh
+python3 dev/transcripts_copies.py tests/examples/transcripts/c4/c4.hst.tsv tests/real_data/paralogs/c4.bed STK19=WHR1
+python3 dev/transcripts_minimap2.py tests/real_data/paralogs/c4.gfa.gz 'grch38#1#chr6:31891045-32123783' \
+  tests/real_data/Homo_sapiens.GRCh38.116.loci.gtf.gz tests/examples/transcripts/c4/c4 external/minimap2/minimap2 mm2_c4   # make -C external/minimap2 builds it
+# HPRC: draw haplotypes, fetch their annotations, compare
+python3 dev/transcripts_hprc.py select hprc gstm tests/examples/transcripts/gstm/gstm.hst.tsv cat.csv liftoff.csv GSTM1 0=8,1=9,2=2 GSTM2
+python3 dev/transcripts_hprc.py fetch hprc
+python3 dev/transcripts_hprc.py compare hprc gstm tests/examples/transcripts/gstm/gstm.hst.tsv tests/real_data/paralogs/gstm.gfa.gz \
+  tests/real_data/Homo_sapiens.GRCh38.116.loci.gtf.gz
+```
