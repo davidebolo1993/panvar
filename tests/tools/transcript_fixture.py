@@ -43,6 +43,12 @@ CASES = {
         genes={"GE": ("+", {"TE1": [(1000, 1050), (1100, 1150)]}), "GF": ("-", {"TF1": [(1700, 1750), (1800, 1850)]})},
         haps={"h1": [("snp", 2500)]},
         reversed={"h2": "h1"}),
+    # a short gene duplicated between long flanks
+    "flank": dict(
+        L=20200,
+        genes={"GG": ("+", {"TG1": [(10020, 10080)]})},
+        haps={"h1": [("dup", (10000, 10100))]},
+        reversed={"h2": "h1"}),
 }
 
 

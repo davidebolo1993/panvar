@@ -613,17 +613,18 @@ TranscriptsResult project_transcripts(const Graph& graph, const TranscriptsOptio
             const Gene& g = genes[gi];
             for (const bool rev : {false, true}) {
                 const Walk& W = rev ? Hr : H;
-                // Chains are completed only when they hold a tenth of the best one's anchored bases: the
-                // others are stray matches of single nodes, not passes.
+                // Chains are completed only when their anchored bases inside the marker's span are a tenth
+                // of the best chain's or more: the others are stray matches of single nodes, not passes.
+                // Bases outside the span are left out, as long flanks would hide a short gene's other copies.
                 const std::vector<std::vector<Anchor>> chains = chain_anchors(R, g, W, occ, rev, H.size());
                 std::vector<std::size_t> bp(chains.size(), 0);
                 std::size_t best = 0;
                 for (std::size_t k = 0; k < chains.size(); ++k) {
-                    for (const Anchor& a : chains[k]) bp[k] += a.w;
+                    for (const Anchor& a : chains[k]) bp[k] += overlap(a.x, a.x + a.w, g.m_lo, g.m_hi);
                     best = std::max(best, bp[k]);
                 }
                 for (std::size_t k = 0; k < chains.size(); ++k) {
-                    if (10 * bp[k] < best) continue;
+                    if (10 * bp[k] < best || (bp[k] == 0 && best > 0)) continue;
                     Pass p = make_pass(R, g, marker_cuts[gi], W, chains[k], t, gi, rev);
                     best_share[gi] = std::max(best_share[gi], p.share);
                     if (p.share >= opt.min_exon_share) passes.push_back(std::move(p));
