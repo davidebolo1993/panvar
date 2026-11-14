@@ -32,7 +32,8 @@ const char* hst_status_name(HstStatus s) {
 
 namespace {
 
-// Chaining: how far back a link may reach, in anchors and in bases, and what an indel costs per base.
+// Chaining: how far back a link may reach, in anchors and in bases (or twice the gene's stretch, for a
+// haplotype carrying many more units of a repeat inside the gene), and what an indel costs per base.
 constexpr std::size_t kChainLookback = 200;
 constexpr std::size_t kChainMaxGap = 100000;
 constexpr double kChainIndelCost = 0.05;
@@ -125,6 +126,7 @@ struct Pass {
     std::size_t h_lo = 0, h_hi = 0;   // bases of the walk as written
     std::vector<std::size_t> walk_steps;   // the matched steps of the walk as written, ascending
     std::size_t marker_matched = 0;
+    std::size_t matched = 0;          // reference bases of the gene's stretch matched, introns included
     double share = 0.0;
     bool at_walk_start = false, at_walk_end = false;   // the walk (oriented) starts or ends inside it
 };
@@ -201,15 +203,16 @@ std::vector<std::vector<Anchor>> chain_anchors(const Walk& R, const Gene& g, con
     const std::size_t n = an.size();
     std::vector<double> f(n);
     std::vector<long> prev(n, -1);
+    const std::size_t max_gap = std::max(kChainMaxGap, 2 * (R.pref[g.ge] - R.pref[g.gs]));
     for (std::size_t a = 0; a < n; ++a) {
         f[a] = static_cast<double>(an[a].w);
         const std::size_t stop = a > kChainLookback ? a - kChainLookback : 0;
         for (std::size_t b = a; b-- > stop;) {
             if (an[b].i >= an[a].i) continue;
             const std::size_t dy = an[a].y - (an[b].y + an[b].w);
-            if (dy > kChainMaxGap) break;
+            if (dy > max_gap) break;
             const std::size_t dx = an[a].x - (an[b].x + an[b].w);
-            if (dx > kChainMaxGap) continue;
+            if (dx > max_gap) continue;
             const double dd = std::fabs(static_cast<double>(dx) - static_cast<double>(dy));
             const double s = f[b] + static_cast<double>(an[a].w) - kChainIndelCost * dd - (dd > 0 ? std::log2(dd) : 0.0);
             if (s > f[a]) { f[a] = s; prev[a] = static_cast<long>(b); }
@@ -263,6 +266,7 @@ Pass make_pass(const Walk& R, const Gene& g, const Cuts& marker, const Walk& W, 
         any = true;
         const std::size_t i = g.gs + k;
         p.marker_matched += marker_overlap(marker, R.pref[i], R.pref[i + 1]);
+        p.matched += R.pref[i + 1] - R.pref[i];
     }
     std::sort(p.walk_steps.begin(), p.walk_steps.end());
     p.share = g.marker_bp ? static_cast<double>(p.marker_matched) / static_cast<double>(g.marker_bp) : 0.0;
@@ -352,21 +356,130 @@ void add_detail(std::string& d, const std::string& note) {
 
 std::string signed_text(long v) { return (v > 0 ? "+" : "") + std::to_string(v); }
 
+// Exons of a transcript that repeat with a tandem unit: exons starting at the same node and offset of the
+// reference walk, as a unit the reference walks several times holds the same exon in each pass. The stretch
+// from the first to the last such exon is projected by finding each kind of exon wherever the haplotype's
+// walk holds it, so the transcript follows the haplotype's own number of units.
+struct Tandem {
+    bool any = false;
+    std::size_t lo = 0, hi = 0;   // genomic exon indices of the stretch, inclusive
+    struct Kind {
+        int start_node = 0, end_node = 0;
+        char start_rev = 0, end_rev = 0;
+        std::size_t start_off = 0, end_off = 0;   // offsets of the exon's first and last base in their nodes
+        std::size_t ref_exon = 0, len = 0, count = 0;
+    };
+    std::vector<Kind> kinds;
+};
+
+std::size_t step_at(const Walk& w, std::size_t c) {
+    return static_cast<std::size_t>(std::upper_bound(w.pref.begin(), w.pref.end(), c) - w.pref.begin()) - 1;
+}
+
+Tandem find_tandem(const Walk& R, const Cuts& cuts) {
+    Tandem t;
+    std::vector<Tandem::Kind> kind(cuts.size());
+    std::map<std::tuple<int, char, std::size_t>, std::size_t> starts;
+    for (std::size_t k = 0; k < cuts.size(); ++k) {
+        const std::size_t i = step_at(R, cuts[k].first), j = step_at(R, cuts[k].second - 1);
+        kind[k] = {R.node[i], R.node[j], R.rev[i], R.rev[j], cuts[k].first - R.pref[i], cuts[k].second - 1 - R.pref[j],
+                   k, cuts[k].second - cuts[k].first, 1};
+        ++starts[{R.node[i], R.rev[i], kind[k].start_off}];
+    }
+    for (std::size_t k = 0; k < cuts.size(); ++k) {
+        if (starts[{kind[k].start_node, kind[k].start_rev, kind[k].start_off}] < 2) continue;
+        if (!t.any) t.lo = k;
+        t.hi = k;
+        t.any = true;
+    }
+    for (std::size_t k = t.lo; t.any && k <= t.hi; ++k) {
+        const Tandem::Kind& x = kind[k];
+        bool seen = false;
+        for (Tandem::Kind& y : t.kinds)
+            if (std::tie(y.start_node, y.start_rev, y.start_off, y.end_node, y.end_rev, y.end_off) ==
+                std::tie(x.start_node, x.start_rev, x.start_off, x.end_node, x.end_rev, x.end_off)) {
+                ++y.count;
+                seen = true;
+            }
+        if (!seen) t.kinds.push_back(x);
+    }
+    return t;
+}
+
+struct Piece {
+    std::size_t a = 0, b = 0;   // on the oriented walk
+    std::size_t ref = 0;        // the reference exon it stands for
+};
+
+// The exons of a tandem stretch on walk W between bases lo and hi: each kind wherever W holds its first and
+// last nodes at about its length apart. Where a unit misses one of the two nodes (a variant at the exon's
+// first or last base), the exon is placed from the other at the reference's length, and counted in
+// `inferred`. Overlapping finds keep exact ones first, then the kind the reference holds more often.
+std::vector<Piece> tandem_exons(const Walk& W, const Tandem& tm, std::size_t lo, std::size_t hi, std::size_t* inferred) {
+    struct Find { Piece p; bool exact; std::size_t count, off; };
+    std::vector<Find> found;
+    const std::size_t j0 = lo < W.len() ? step_at(W, lo) : W.size();
+    const auto at = [&](std::size_t j, int node, char rev) { return W.node[j] == node && W.rev[j] == rev; };
+    for (const Tandem::Kind& k : tm.kinds) {
+        const std::size_t slack = std::max<std::size_t>(30, k.len / 5);
+        std::vector<char> end_used(W.size(), 0);
+        for (std::size_t j = j0; j < W.size() && W.pref[j] < hi; ++j) {
+            if (!at(j, k.start_node, k.start_rev)) continue;
+            const std::size_t a = W.pref[j] + k.start_off;
+            if (a < lo) continue;
+            bool exact = false;
+            for (std::size_t e = j; e < W.size() && W.pref[e] <= a + k.len + slack; ++e) {
+                if (!at(e, k.end_node, k.end_rev)) continue;
+                const std::size_t b = W.pref[e] + k.end_off + 1;
+                if (b <= a || b > hi) continue;
+                if (b - a + slack >= k.len && b - a <= k.len + slack) {
+                    found.push_back({{a, b, k.ref_exon}, true, k.count, b - a > k.len ? b - a - k.len : k.len - (b - a)});
+                    end_used[e] = 1;
+                    exact = true;
+                }
+                break;
+            }
+            if (!exact && a + k.len <= hi) found.push_back({{a, a + k.len, k.ref_exon}, false, k.count, 0});
+        }
+        for (std::size_t e = j0; e < W.size() && W.pref[e] < hi; ++e) {
+            if (end_used[e] || !at(e, k.end_node, k.end_rev)) continue;
+            const std::size_t b = W.pref[e] + k.end_off + 1;
+            if (b <= hi && b >= lo + k.len) found.push_back({{b - k.len, b, k.ref_exon}, false, k.count, 0});
+        }
+    }
+    std::sort(found.begin(), found.end(), [](const Find& x, const Find& y) {
+        return std::tie(y.exact, y.count, x.off, x.p.a) < std::tie(x.exact, x.count, y.off, y.p.a);
+    });
+    std::vector<Piece> kept;
+    for (const Find& f : found) {
+        bool clash = false;
+        for (const Piece& q : kept) clash |= f.p.a < q.b && q.a < f.p.b;
+        if (clash) continue;
+        kept.push_back(f.p);
+        *inferred += !f.exact;
+    }
+    std::sort(kept.begin(), kept.end(), [](const Piece& x, const Piece& y) { return x.a < y.a; });
+    return kept;
+}
+
 // One transcript through one pass.
 HstRecord project_one(const Walk& R, const std::string& rseq, const Gene& g, const Pass& p, const Walk& W,
                       const std::string& wseq, const TranscriptFeature& tx, const Cuts& cuts,
-                      const TranscriptsResult::EdgeClip& clip) {
+                      const TranscriptsResult::EdgeClip& clip, const Tandem& tm) {
     HstRecord r;
     r.reverse = p.reverse;
     const std::size_t n = cuts.size();
     const bool minus = tx.strand == '-';
-    // Exons and introns are numbered in transcript order over the whole annotated transcript, 1-based.
+    // Exons and introns are numbered in transcript order over the whole annotated transcript, 1-based; a
+    // transcript whose tandem exons follow the haplotype is numbered over its own exons.
     const auto exon_no = [&](std::size_t k) { return minus ? clip.exons - clip.first_exon - k : clip.first_exon + k + 1; };
     if (clip.bp_5p) add_detail(r.detail, "clipped:5':" + std::to_string(clip.bp_5p));
     if (clip.bp_3p) add_detail(r.detail, "clipped:3':" + std::to_string(clip.bp_3p));
+    const auto in_tandem = [&](std::size_t k) { return tm.any && k >= tm.lo && k <= tm.hi; };
     std::vector<std::pair<std::size_t, std::size_t>> hx(n);
     bool missing = false;
     for (std::size_t k = 0; k < n; ++k) {
+        if (in_tandem(k)) continue;
         const auto [cs, ce] = cuts[k];
         const std::string e = "e" + std::to_string(exon_no(k));
         const bool before = cs < R.pref[g.gs + p.first], after = ce > R.pref[g.gs + p.last + 1];
@@ -385,10 +498,32 @@ HstRecord project_one(const Walk& R, const std::string& rseq, const Gene& g, con
         if (a.shift != 0) { ++r.moved; add_detail(r.detail, e + (minus ? ".end:" : ".start:") + signed_text(a.shift)); }
         if (b.shift != 0) { ++r.moved; add_detail(r.detail, e + (minus ? ".start:" : ".end:") + signed_text(b.shift)); }
     }
-    for (std::size_t k = 1; k < n && !missing; ++k)
-        if (hx[k].first < hx[k - 1].second) {
+    std::vector<Piece> pieces;
+    for (std::size_t k = 0; k < n && !missing; ++k) {
+        if (!in_tandem(k)) {
+            pieces.push_back({hx[k].first, hx[k].second, k});
+        } else if (k == tm.lo) {
+            // Between the exons around the stretch, or the pass's ends where the stretch ends the transcript.
+            const std::size_t lo = tm.lo > 0 ? hx[tm.lo - 1].second : W.pref[static_cast<std::size_t>(p.match[p.first])];
+            const std::size_t hi = tm.hi + 1 < n ? hx[tm.hi + 1].first : W.pref[static_cast<std::size_t>(p.match[p.last]) + 1];
+            std::size_t inferred = 0;
+            const std::vector<Piece> found = tandem_exons(W, tm, lo, hi, &inferred);
+            if (found.empty()) {
+                missing = true;
+                add_detail(r.detail, "tandem:missing");
+            }
+            if (found.size() != tm.hi - tm.lo + 1)
+                add_detail(r.detail, "tandem:" + std::to_string(tm.hi - tm.lo + 1) + ">" + std::to_string(found.size()));
+            if (inferred) add_detail(r.detail, "tandem_inferred:" + std::to_string(inferred));
+            pieces.insert(pieces.end(), found.begin(), found.end());
+        }
+    }
+    const std::size_t m = pieces.size();
+    const auto piece_no = [&](std::size_t q) { return tm.any ? (minus ? m - q : q + 1) : exon_no(pieces[q].ref); };
+    for (std::size_t q = 1; q < m && !missing; ++q)
+        if (pieces[q].a < pieces[q - 1].b) {
             missing = true;
-            add_detail(r.detail, "e" + std::to_string(exon_no(k)) + ":overlaps_neighbour");
+            add_detail(r.detail, "e" + std::to_string(piece_no(q)) + ":overlaps_neighbour");
         }
     if (missing) {
         r.status = HstStatus::MissingExon;
@@ -398,11 +533,15 @@ HstRecord project_one(const Walk& R, const std::string& rseq, const Gene& g, con
     // Splice-site dinucleotides at each intron, compared with the reference's. An intron the haplotype
     // shortens below its two splice sites is lost: its exons are joined.
     bool lost = false;
-    for (std::size_t k = 0; k + 1 < n; ++k) {
-        const std::size_t intron = minus ? clip.exons - 1 - clip.first_exon - k : clip.first_exon + k + 1;
-        const std::size_t rl = cuts[k].second, rr = cuts[k + 1].first;
-        const std::size_t hl = hx[k].second, hr = hx[k + 1].first;
-        if (rr < rl + 4) continue;
+    for (std::size_t q = 0; q + 1 < m; ++q) {
+        const std::size_t intron = tm.any ? (minus ? m - 1 - q : q + 1)
+                                 : minus ? clip.exons - 1 - clip.first_exon - pieces[q].ref : clip.first_exon + pieces[q].ref + 1;
+        const std::size_t rl = cuts[pieces[q].ref].second, rr = cuts[pieces[q + 1].ref].first;
+        const std::size_t hl = pieces[q].b, hr = pieces[q + 1].a;
+        // The reference's own introns after the left exon and before the right one.
+        if (pieces[q].ref + 1 >= n || cuts[pieces[q].ref + 1].first < rl + 4 || pieces[q + 1].ref == 0 ||
+            rr < cuts[pieces[q + 1].ref - 1].second + 4)
+            continue;
         if (hr < hl + 4) {
             lost = true;
             add_detail(r.detail, "i" + std::to_string(intron) + ":intron_lost");
@@ -418,15 +557,15 @@ HstRecord project_one(const Walk& R, const std::string& rseq, const Gene& g, con
         if (ref_left != hap_left) note(minus ? "acceptor" : "donor", ref_left, hap_left);
         if (ref_right != hap_right) note(minus ? "donor" : "acceptor", ref_right, hap_right);
     }
-    for (const auto& [a, b] : hx) r.sequence += wseq.substr(a, b - a);
+    for (const Piece& x : pieces) r.sequence += wseq.substr(x.a, x.b - x.a);
     if (minus) r.sequence = reverse_complement(r.sequence);
-    r.exons = n;
-    for (std::size_t q = 0; q < n; ++q) {
-        const auto [a, b] = hx[minus ? n - 1 - q : q];
-        r.exon_starts.push_back(p.reverse ? W.len() - b : a);
-        r.exon_lengths.push_back(b - a);
+    r.exons = m;
+    for (std::size_t q = 0; q < m; ++q) {
+        const Piece& x = pieces[minus ? m - 1 - q : q];
+        r.exon_starts.push_back(p.reverse ? W.len() - x.b : x.a);
+        r.exon_lengths.push_back(x.b - x.a);
     }
-    const std::size_t lo = hx.front().first, hi = hx.back().second;
+    const std::size_t lo = pieces.front().a, hi = pieces.back().b;
     r.path_start = p.reverse ? W.len() - hi : lo;
     r.path_end = p.reverse ? W.len() - lo : hi;
     r.status = lost ? HstStatus::IntronLost : clip.bp_5p + clip.bp_3p ? HstStatus::ClippedAtEdge
@@ -485,6 +624,7 @@ std::vector<std::size_t> accept_passes(const std::vector<Pass>& passes, const st
         const Pass& y = passes[b];
         if (x.share != y.share) return x.share > y.share;
         if (x.marker_matched != y.marker_matched) return x.marker_matched > y.marker_matched;
+        if (x.matched != y.matched) return x.matched > y.matched;   // the whole stretch decides a tie
         return std::tie(x.gene, x.h_lo) < std::tie(y.gene, y.h_lo);
     });
     const auto greedy = [&](const std::vector<char>& dropped, bool note) {
@@ -635,14 +775,29 @@ TranscriptsResult project_transcripts(const Graph& graph, const TranscriptsOptio
         for (const auto& [a, b] : cuts[k]) s += rseq.substr(a, b - a);
         res.reference_sequences.push_back(res.transcripts[k].strand == '-' ? reverse_complement(s) : s);
     }
+    std::vector<Tandem> tandem;
+    for (const Cuts& c : cuts) tandem.push_back(find_tandem(R, c));
     // A gene's copies are told apart by its marker's coding exons where it has them: paralogs are compared
-    // on what they encode, as untranslated ends differ more freely.
+    // on what they encode, as untranslated ends differ more freely. A tandem stretch of the marker is left
+    // out, as haplotypes carry its unit a different number of times.
     std::vector<Cuts> marker_cuts;
     for (Gene& g : genes) {
         const TranscriptFeature& m = res.transcripts[g.marker];
-        if (m.cds.empty()) { marker_cuts.push_back(cuts[g.marker]); continue; }
-        Cuts c;
-        for (const auto& [s, e] : m.cds) c.emplace_back(s - base, e - base + 1);
+        Cuts c = cuts[g.marker];
+        if (!m.cds.empty()) {
+            c.clear();
+            for (const auto& [s, e] : m.cds) c.emplace_back(s - base, e - base + 1);
+        }
+        const Tandem& tm = tandem[g.marker];
+        if (tm.any) {
+            const std::size_t t0 = cuts[g.marker][tm.lo].first, t1 = cuts[g.marker][tm.hi].second;
+            Cuts kept;
+            for (const auto& [a, b] : c) {
+                if (a < t0) kept.emplace_back(a, std::min(b, t0));
+                if (b > t1) kept.emplace_back(std::max(a, t1), b);
+            }
+            if (!kept.empty()) c = std::move(kept);
+        }
         g.marker_bp = 0;
         for (const auto& [a, b] : c) g.marker_bp += b - a;
         marker_cuts.push_back(std::move(c));
@@ -713,7 +868,7 @@ TranscriptsResult project_transcripts(const Graph& graph, const TranscriptsOptio
                 for (std::size_t c = 0; c < gp.size(); ++c) {
                     const Pass& p = *gp[c];
                     HstRecord r = project_one(R, rseq, genes[gi], p, p.reverse ? Hr : H, p.reverse ? hrseq : hseq,
-                                              res.transcripts[k], cuts[k], res.clips[k]);
+                                              res.transcripts[k], cuts[k], res.clips[k], tandem[k]);
                     r.transcript = k;
                     r.haplotype = h;
                     r.copy = static_cast<int>(c + 1);

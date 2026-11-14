@@ -64,6 +64,8 @@ CASES = {
                "GH": ("-", {"TH1": [(-300, -100), (200, 400)]}), "GL": ("+", {"TL1": [(-500, -400), (5400, 5500)]})},
         haps={"h1": [("snp", 4550)]},
         reversed={"h2": "h1"}),
+    # exons inside a repeat unit the reference walks three times and haplotypes 1, 3 or 5 times
+    "tandem": dict(units={"ref": 3, "h1": 1, "h2": 5, "h3": 3}, reversed={"h4": "h2"}),
 }
 
 
@@ -218,8 +220,47 @@ def name(h, L):
     return f"ref#0#chr1:{OFFSET}-{OFFSET + L}" if h == "ref" else f"{h}#1#ctg{h[1:]}:0-{L}"
 
 
+def write_tandem(case, d):
+    """Flank A (2 kb), a 1 kb unit walked n times over the same three nodes, flank B (2 kb). Gene GT has an
+    exon in A, one in each unit and one in B, so each haplotype's transcript has n unit exons."""
+    rnd = random.Random(11)
+    seq = lambda n: "".join(rnd.choice("ACGT") for _ in range(n))
+    A, U, B = list(seq(2000)), list(seq(1000)), list(seq(2000))
+    A[1600:1602], U[298:300], U[400:402], B[498:500] = "GT", "AG", "GT", "AG"
+    A, U, B = "".join(A), "".join(U), "".join(B)
+    nodes = {"1": A, "2": U[:300], "3": U[300:400], "4": U[400:], "5": B}
+    walk = lambda n: ["1"] + ["2", "3", "4"] * n + ["5"]
+    walks = {h: [(x, "+") for x in walk(n)] for h, n in case["units"].items()}
+    for h, src in case["reversed"].items():
+        walks[h] = [(x, "-") for x in reversed(walk(case["units"][src]))]
+    k = case["units"]["ref"]
+    L = 2000 + 1000 * k + 2000
+    exons = [(1500, 1600)] + [(2000 + 1000 * u + 300, 2000 + 1000 * u + 400) for u in range(k)] + [(2000 + 1000 * k + 500, 2000 + 1000 * k + 600)]
+    with open(f"{d}/locus.gfa", "w") as out:
+        out.write("H\tVN:Z:1.0\n")
+        for n, s in nodes.items():
+            out.write(f"S\t{n}\t{s}\n")
+        for e in ("1\t+\t2\t+", "2\t+\t3\t+", "3\t+\t4\t+", "4\t+\t2\t+", "4\t+\t5\t+"):
+            out.write(f"L\t{e}\t0M\n")
+        for h, steps in walks.items():
+            out.write(f"P\t{name(h, L)}\t{','.join(n + o for n, o in steps)}\t*\n")
+    attr = 'gene_id "GT"; gene_name "GT"; gene_biotype "protein_coding"; transcript_id "TT1"; transcript_name "TT1"; tag "Ensembl_canonical";'
+    with open(f"{d}/genes.gtf", "w") as out:
+        out.write(f"chr1\ttest\ttranscript\t{exons[0][0] + OFFSET + 1}\t{exons[-1][1] + OFFSET}\t.\t+\t.\t{attr}\n")
+        for a, b in exons:
+            out.write(f"chr1\ttest\texon\t{a + OFFSET + 1}\t{b + OFFSET}\t.\t+\t.\t{attr}\n")
+    with open(f"{d}/expected.tsv", "w") as out:
+        out.write("transcript_id\tgene_name\thaplotype\tcopy\tstatus\tdetail\tsequence\n")
+        for h in walks:
+            n = case["units"][case["reversed"].get(h, h)]
+            note = f"tandem:{k}>{n}" if n != k else "."
+            out.write(f"TT1\tGT\t{name(h, L)}\t1\tok\t{note}\t{A[1500:1600] + U[300:400] * n + B[500:600]}\n")
+
+
 def write(case_name, d):
     case = CASES[case_name]
+    if case_name == "tandem":
+        return write_tandem(case, d)
     ref, nodes, walks, seqs, maps = build(case)
     edges = set()
     for steps in walks.values():

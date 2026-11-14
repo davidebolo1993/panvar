@@ -7,6 +7,7 @@ CLI: `panvar transcripts`
 Projects a reference annotation onto every haplotype walk of a locus graph. Each transcript becomes one haplotype-specific transcript (HST) per haplotype and copy of its gene, spliced from that haplotype's own sequence.
 
 - A haplotype without a copy of a gene gets no transcript of it; one with two copies gets two, numbered along the walk.
+- Exons inside a repeat unit of the gene follow the haplotype's own number of units.
 - A transcript whose exon the haplotype lacks is reported and not written, so other transcripts of the gene still are.
 - An exon boundary that falls inside a variant is moved to the nearest base the haplotype shares with the reference, and flagged.
 - Each HST carries its source, `projected`, so transcripts from other annotations can join them later.
@@ -25,7 +26,9 @@ Projects a reference annotation onto every haplotype walk of a locus graph. Each
 
 6. Within each copy, an exon boundary is carried to the walk through the node holding it, at the same offset. When the walk does not pass that node (the boundary lies inside a variant), the boundary moves to the nearest position the walk shares with the reference, and a tie keeps the variant inside the exon. An exon sharing no base with the walk is missing.
 
-7. The exons are cut from the walk with the haplotype's alleles and joined in transcript order; a minus-strand transcript is reverse-complemented. The two splice-site bases at each end of every intron are compared with the reference's; an intron the haplotype shortens below those four bases is lost, and its exons are joined.
+7. Exons that repeat with a tandem unit inside the gene start at the same node and offset in each unit the reference walks, so a transcript's exons starting where another one starts mark its tandem stretch. That stretch follows the haplotype's own number of units: each kind of exon in it is placed wherever the walk holds its first and last nodes at about its length apart, between the exons around the stretch. A unit missing one of the two nodes (a variant at the exon's first or last base) gets the exon placed from the other at the reference's length. The marker's tandem stretch does not count towards its share, as haplotypes carry the unit a different number of times.
+
+8. The exons are cut from the walk with the haplotype's alleles and joined in transcript order; a minus-strand transcript is reverse-complemented. The two splice-site bases at each end of every intron are compared with the reference's; an intron the haplotype shortens below those four bases is lost, and its exons are joined.
 
 ## Required inputs
 
@@ -67,7 +70,7 @@ Projects a reference annotation onto every haplotype walk of a locus graph. Each
 | `moved_boundaries` | exon boundaries moved off a variant |
 | `changed_splice_sites` | intron ends whose two splice-site bases differ from the reference's |
 | `exon_starts`, `exon_lengths` | each exon's first base on the walk (as `path_start`) and length, in transcript order |
-| `detail` | notes, `;`-joined: `e3.start:-3` (exon 3's 5' boundary moved, the exon 3 reference bases shorter), `e2:missing`, `e1:walk_end` (the walk ends before it), `i1.donor:GT>AT` (a changed splice site, transcript strand), `i2:intron_lost`, `clipped:3':200` (annotated exonic bases past the path at the transcript's 3' end), `rival:<gene>:<share>><share>` (the paralog this copy was taken from, and both shares), and for no copy `best_share:<F>` and `taken_by:<gene>` or `inside:<gene>` |
+| `detail` | notes, `;`-joined: `e3.start:-3` (exon 3's 5' boundary moved, the exon 3 reference bases shorter), `e2:missing`, `e1:walk_end` (the walk ends before it), `i1.donor:GT>AT` (a changed splice site, transcript strand), `i2:intron_lost`, `clipped:3':200` (annotated exonic bases past the path at the transcript's 3' end), `tandem:14>46` (the exons of the tandem stretch on the reference and on the haplotype; the transcript's exons and introns are then numbered over its own), `tandem_inferred:1` (tandem exons placed from one end), `rival:<gene>:<share>><share>` (the paralog this copy was taken from, and both shares), and for no copy `best_share:<F>` and `taken_by:<gene>` or `inside:<gene>` |
 
 Statuses, most severe first:
 
@@ -84,7 +87,7 @@ Statuses, most severe first:
 ## Limitations
 
 - A copy is found through the nodes it shares with the reference copy. A copy the graph keeps on nodes of its own, neither folded onto the reference nor aligned to it, is not found.
-- Copies of a repeat inside a gene (tandem exons) are not expanded: the HST keeps the reference's exons.
+- Tandem exons are found by their first and last nodes, so a unit whose exon differs from every reference unit at both ends is not found; `tandem:14>46` gives the count against the reference's.
 - A copy mixing the differences of two near-identical paralogs goes to the one it shares more coding bases with; `rival` in `detail` gives the margin.
 - Only the reference annotation is projected, so isoforms and genes the reference lacks are not found. A changed splice site is reported, not judged: its transcript is still written.
 
