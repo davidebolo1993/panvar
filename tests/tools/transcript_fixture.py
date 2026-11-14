@@ -107,6 +107,9 @@ CASES = {
         genes={"GQ": ("+", {"TQ1": [(1000, 1300), (2000, 2300), (3000, 3300)]})},
         haps={"h1": [("sub", (1000, 1300)), ("sub", (2000, 2300)), ("sub", (3000, 3300))]},
         reversed={"h2": "h1"}),
+    # a short gene on the nodes of a stretch inside a longer gene, and a haplotype without the short gene
+    # whose copy of the longer one carries an allele there (write_nested)
+    "nested": dict(),
     # the main case with haplotypes' own annotations (write_annotated)
     "annotated": dict(),
 }
@@ -478,10 +481,56 @@ def write_annotated(d):
             out.write(f"{t}\t{g}\t{name(h, L)}\t{c}\t{st}\t{det}\t{sq}\tannotated\t{rec}\n")
 
 
+def write_nested(d):
+    """Gene GL: exons L1 and L2 around an intron U (three nodes). Gene GS, further on: one exon, the same three
+    nodes walked again. A haplotype without GS, whose copy of GL has an allele of U's middle node, 96%
+    identical: the chain of GS's nodes there lies inside GL's copy, which matches the stretch as well, so the
+    haplotype has no copy of GS. The same haplotype reversed."""
+    rnd = random.Random(13)
+    seq = lambda n: "".join(rnd.choice("ACGT") for _ in range(n))
+    size = dict(A=1000, L1=400, Ua=40, Ub=220, Uc=40, L2=400, C=1500, D=1000, T=500)
+    nodes = {n: seq(k) for n, k in size.items()}
+    nodes["Ubx"] = "".join(alt(c) if i % 25 == 0 else c for i, c in enumerate(nodes["Ub"]))
+    ids = {n: str(k + 1) for k, n in enumerate(nodes)}
+    walk = {"ref": ["A", "L1", "Ua", "Ub", "Uc", "L2", "C", "Ua", "Ub", "Uc", "D", "T"],
+            "h1": ["A", "L1", "Ua", "Ubx", "Uc", "L2", "T"]}
+    steps = {h: [(ids[n], "+") for n in w] for h, w in walk.items()}
+    steps["h2"] = [(n, "-") for n, _ in reversed(steps["h1"])]
+    L = sum(size[n] for n in walk["ref"])
+    at, pos = {}, 0
+    for k, n in enumerate(walk["ref"]):
+        at[k] = pos
+        pos += size[n]
+    exons = {"GL": [(at[1], at[1] + 400), (at[5], at[5] + 400)], "GS": [(at[7], at[7] + 300)]}
+    with open(f"{d}/locus.gfa", "w") as out:
+        out.write("H\tVN:Z:1.0\n")
+        for n, s in nodes.items():
+            out.write(f"S\t{ids[n]}\t{s}\n")
+        for x, ox, y, oy in sorted({(x, ox, y, oy) for w in steps.values() for (x, ox), (y, oy) in zip(w, w[1:])}):
+            out.write(f"L\t{x}\t{ox}\t{y}\t{oy}\t0M\n")
+        for h, w in steps.items():
+            out.write(f"P\t{name(h, L)}\t{','.join(n + o for n, o in w)}\t*\n")
+    with open(f"{d}/genes.gtf", "w") as out:
+        for g, ex in exons.items():
+            attr = (f'gene_id "{g}"; gene_name "{g}"; gene_biotype "protein_coding"; transcript_id "T{g}"; '
+                    f'transcript_name "T{g}"; tag "Ensembl_canonical";')
+            out.write(f"chr1\ttest\ttranscript\t{ex[0][0] + OFFSET + 1}\t{ex[-1][1] + OFFSET}\t.\t+\t.\t{attr}\n")
+            for a, b in ex:
+                out.write(f"chr1\ttest\texon\t{a + OFFSET + 1}\t{b + OFFSET}\t.\t+\t.\t{attr}\n")
+    gl, gs = nodes["L1"] + nodes["L2"], nodes["Ua"] + nodes["Ub"] + nodes["Uc"]
+    with open(f"{d}/expected.tsv", "w") as out:
+        out.write("transcript_id\tgene_name\thaplotype\tcopy\tstatus\tdetail\tsequence\n")
+        out.write(f"TGL\tGL\t{name('ref', L)}\t1\tok\t.\t{gl}\nTGS\tGS\t{name('ref', L)}\t1\tok\t.\t{gs}\n")
+        for h in ("h1", "h2"):
+            out.write(f"TGL\tGL\t{name(h, L)}\t1\tok\t.\t{gl}\nTGS\tGS\t{name(h, L)}\t0\tno_copy\t.\t.\n")
+
+
 def write(case_name, d):
     case = CASES[case_name]
     if case_name.startswith("tandem"):
         return write_tandem(case, d)
+    if case_name == "nested":
+        return write_nested(d)
     if case_name == "annotated":
         return write_annotated(d)
     ref, nodes, walks, seqs, maps = build(case)

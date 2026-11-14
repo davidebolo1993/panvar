@@ -32,7 +32,7 @@ Projects a reference annotation onto every haplotype walk of a locus graph. Each
    - Which bases count as aligned: those where the alignment holds, that is where the 15 bases on each side match to 0.7 (deletions of 20 bases or more aside), and not in a run of under 12 aligned bases between two gaps. Unit-cost alignment otherwise sets a stretch the walk lacks against whatever follows it, and may cut one indel in two around a base that happens to match.
    - The measure: among the marker's exonic bases, those aligned are the coverage, and those equal among them the identity. Alleles of one gene, hyperpolymorphic ones too, stay within a few percent of each other over their exons, and paralogs mostly do not, so the identity must reach `--min-identity`. Coverage of `--min-exon-share` or more is then a copy, its transcripts noted `placed_by_sequence`; coverage from 0.2 up to the share a partial copy (`partial_copy`), reported and not written; less, or a lower identity, no copy.
    - Boundaries: an exon boundary at an aligned base keeps its place; one at a base the walk lacks moves to the nearer end of that deletion, flagged as in step 7.
-   - Competition: placements are accepted best first, whole copies before partial ones, and one over the stretch of an accepted copy of a gene apart on the reference is that gene's.
+   - Competition: placements are accepted best first, whole copies before partial ones. One over the stretch of an accepted copy of a gene apart on the reference is that gene's; so is one whose chain lies inside a longer accepted pass of such a gene that matches the stretch at least as well (step 5).
 
    Genes with a tandem stretch are placed by nodes only, as their units are.
 

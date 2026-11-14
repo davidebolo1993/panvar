@@ -1339,7 +1339,8 @@ TranscriptsResult project_transcripts(const Graph& graph, const TranscriptsOptio
         // A gene with no pass to the share, and not lost to another gene, is looked for by sequence where its
         // best chain lies. Placements are accepted best first (whole copies before partial ones, then by the
         // bases they match); one taking the stretch of an accepted pass or placement of a gene apart on the
-        // reference is that gene's. Genes with a tandem stretch are placed by nodes only.
+        // reference, or nested in such a pass, is that gene's. Genes with a tandem stretch are placed by nodes
+        // only.
         std::vector<SeqCopy> placed(genes.size());
         {
             std::vector<SeqCopy> found(genes.size());
@@ -1361,8 +1362,11 @@ TranscriptsResult project_transcripts(const Graph& graph, const TranscriptsOptio
                     const std::size_t ov = overlap(sc.h_lo, sc.h_hi, lo, hi);
                     return static_cast<double>(ov) > kParalogOverlap * static_cast<double>(std::max(sc.h_hi - sc.h_lo, hi - lo));
                 };
+                // taken by an accepted pass over the same stretch, or inside one that matches the stretch as well
+                // as the chain the placement comes from: part of that gene's copy, as for a pass
                 bool taken = false;
-                for (const std::size_t a : kept) taken = taken || takes(passes[a].gene, passes[a].h_lo, passes[a].h_hi);
+                for (const std::size_t a : kept)
+                    taken = taken || takes(passes[a].gene, passes[a].h_lo, passes[a].h_hi) || nested_in(weak[gi], passes[a], genes, H);
                 for (std::size_t other = 0; other < genes.size(); ++other)
                     taken = taken || (placed[other].ok && takes(other, placed[other].h_lo, placed[other].h_hi));
                 if (!taken) placed[gi] = sc;
