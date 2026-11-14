@@ -15,7 +15,8 @@ Each difference is classed:
   junction_choice       a junction placed elsewhere, and the HST is no further from the reference
   repeat_shift          the bases between the two boundary choices repeat beside them (a tenth may differ)
   projection_worse      none of these: the HST is further from the reference than the alignment
-Transcripts reaching past the path, and HSTs of a tandem stretch, are not compared.
+Transcripts reaching past the path, HSTs of a tandem stretch, and transcripts only a haplotype's own
+annotation gives are not compared.
 """
 import collections
 import gzip
@@ -67,7 +68,8 @@ with open(f"{prefix}.hst.tsv") as fh:
     hdr = fh.readline().rstrip("\n").split("\t")
     for line in fh:
         r = dict(zip(hdr, line.rstrip("\n").split("\t")))
-        if r["exon_starts"] != "." and r["transcript_id"] in reftx and "tandem:" not in r["detail"]:
+        if (r["exon_starts"] != "." and r["transcript_id"] in reftx and "tandem:" not in r["detail"]
+                and r.get("source", "projected") != "annotated"):
             rows.append(r)
 
 

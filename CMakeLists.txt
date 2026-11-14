@@ -245,6 +245,7 @@ add_library(panvarlib
     src/ref_path.cpp
     src/gtf.cpp
     src/transcripts.cpp
+    src/hap_annotations.cpp
     src/gene_cn_kmer.cpp
     src/minimap2_align.cpp
     src/variant_call.cpp

@@ -66,6 +66,8 @@ CASES = {
         reversed={"h2": "h1"}),
     # exons inside a repeat unit the reference walks three times and haplotypes 1, 3 or 5 times
     "tandem": dict(units={"ref": 3, "h1": 1, "h2": 5, "h3": 3}, reversed={"h4": "h2"}),
+    # the main case with haplotypes' own annotations (write_annotated)
+    "annotated": dict(),
 }
 
 
@@ -257,10 +259,75 @@ def write_tandem(case, d):
             out.write(f"TT1\tGT\t{name(h, L)}\t1\tok\t{note}\t{A[1500:1600] + U[300:400] * n + B[500:600]}\n")
 
 
+def write_annotated(d):
+    """The main case, with annotations of h1 (GFF3: the reference transcript TA1, a novel isoform, and a
+    second copy of GB the projection does not see), h2 (GFF3: a transcript past the path's end), h3 (GFF3 on
+    an aliased contig name) and h5 (GTF: both copies of GC, as two gene records)."""
+    write("main", d)
+    case = CASES["main"]
+    L = case["L"]
+    ref, nodes, walks, seqs, maps = build(case)
+    m1 = maps["h1"][0]
+    pos = lambda m, p: m[p] + 1   # 1-based on the haplotype's contig (its path starts at 0)
+    gff = lambda ctg, kind, a, b, strand, attrs: f"{ctg}\tCAT\t{kind}\t{a}\t{b}\t.\t{strand}\t.\t{attrs}\n"
+    rows = []   # expected annotated-only rows: transcript, gene, haplotype, copy, status, detail, sequence
+    h1 = [gff("ctg1", "gene", pos(m1, 1000), pos(m1, 3299), "+", "ID=g1;gene_name=GA"),
+          gff("ctg1", "transcript", pos(m1, 1000), pos(m1, 3299), "+", "ID=TA1;Parent=g1;transcript_id=TA1")]
+    h1 += [gff("ctg1", "exon", pos(m1, a), pos(m1, b - 1), "+", "Parent=TA1") for a, b in case["genes"]["GA"][1]["TA1"]]
+    novel = [(1000, 1300), (3000, 3150)]   # a novel isoform: exon 3 ends early
+    h1 += [gff("ctg1", "transcript", pos(m1, 1000), pos(m1, 3149), "+", "ID=nov1;Parent=g1;transcript_class=putative_novel_isoform")]
+    h1 += [gff("ctg1", "exon", pos(m1, a), pos(m1, b - 1), "+", "Parent=nov1") for a, b in novel]
+    rows.append(("nov1", "GA", "h1", 1, "ok", "transcript_class:putative_novel_isoform", "".join(seqs["h1"][m1[a]:m1[b - 1] + 1] for a, b in novel)))
+    gb2 = [(6500, 6600), (6800, 6900)]       # a second GB copy, minus strand, where the projection sees none
+    h1 += [gff("ctg1", "gene", pos(m1, 5000), pos(m1, 5799), "-", "ID=g2;gene_name=GB"),
+           gff("ctg1", "transcript", pos(m1, 5000), pos(m1, 5799), "-", "ID=TB1;Parent=g2;transcript_id=TB1")]
+    h1 += [gff("ctg1", "exon", pos(m1, a), pos(m1, b - 1), "-", "Parent=TB1") for a, b in case["genes"]["GB"][1]["TB1"]]
+    h1 += [gff("ctg1", "gene", pos(m1, 6500), pos(m1, 6899), "-", "ID=g3;gene_name=GB"),
+           gff("ctg1", "transcript", pos(m1, 6500), pos(m1, 6899), "-", "ID=TB1x;Parent=g3;transcript_id=TB1")]
+    h1 += [gff("ctg1", "exon", pos(m1, a), pos(m1, b - 1), "-", "Parent=TB1x") for a, b in gb2]
+    rows.append(("TB1", "GB", "h1", 2, "ok", ".", rc("".join(seqs["h1"][m1[a]:m1[b - 1] + 1] for a, b in gb2))))
+    m2 = maps["h2"][0]
+    edge = [(m2[11500], m2[11700 - 1] + 1), (len(seqs["h2"]) + 100, len(seqs["h2"]) + 200)]   # path coordinates
+    h2 = [gff("ctg2", "transcript", edge[0][0] + 1, edge[1][1], "+", "ID=edge1;gene_name=GZ;transcript_id=edge1")]
+    h2 += [gff("ctg2", "exon", a + 1, b, "+", "Parent=edge1") for a, b in edge]
+    rows.append(("edge1", "GZ", "h2", 1, "clipped_at_edge", "clipped:3':100", seqs["h2"][edge[0][0]:edge[0][1]]))
+    m3 = maps["h3"][0]
+    alias_ex = [(4000, 4200)]
+    h3 = [gff("CTG3ALT", "transcript", pos(m3, 4000), pos(m3, 4199), "+", "ID=al1;gene_name=GY;transcript_id=al1")]
+    h3 += [gff("CTG3ALT", "exon", pos(m3, a), pos(m3, b - 1), "+", "Parent=al1") for a, b in alias_ex]
+    rows.append(("al1", "GY", "h3", 1, "ok", ".", seqs["h3"][m3[4000]:m3[4199] + 1]))
+    h5 = []
+    for k, m in enumerate(maps["h5"], 1):   # GTF: both GC copies, as projected
+        attr = f'gene_id "gc{k}"; gene_name "GC"; transcript_id "TC1";'
+        h5 += [f'ctg5\tCAT\texon\t{pos(m, a)}\t{pos(m, b - 1)}\t.\t+\t.\t{attr}\n' for a, b in case["genes"]["GC"][1]["TC1"]]
+    for h, lines, ext in (("h1", h1, "gff3"), ("h2", h2, "gff3"), ("h3", h3, "gff3"), ("h5", h5, "gtf")):
+        with open(f"{d}/{h}.{ext}", "w") as out:
+            out.write("##gff-version 3\n" if ext == "gff3" else "")
+            out.writelines(lines)
+    with open(f"{d}/hap_annotations.tsv", "w") as out:
+        out.write("haplotype\tpath\n")
+        for h, ext in (("h1", "gff3"), ("h2", "gff3"), ("h3", "gff3"), ("h5", "gtf")):
+            out.write(f"{h}#1\t{d}/{h}.{ext}\n")
+    with open(f"{d}/alias.tsv", "w") as out:
+        out.write("# names of one contig per row\nctg3\tCTG3ALT\n")
+    # TA1 on h1 and both TC1 copies on h5 are the projected records, of both sources
+    lines = open(f"{d}/expected.tsv").read().splitlines()
+    with open(f"{d}/expected.tsv", "w") as out:
+        out.write(lines[0] + "\tsource\n")
+        for line in lines[1:]:
+            f = line.split("\t")
+            both = (f[0], f[2].split("#")[0]) in (("TA1", "h1"), ("TC1", "h5"), ("TB1", "h1"))
+            out.write(line + ("\tprojected+annotated" if both else "\tprojected") + "\n")
+        for t, g, h, c, st, det, sq in rows:
+            out.write(f"{t}\t{g}\t{name(h, L)}\t{c}\t{st}\t{det}\t{sq}\tannotated\n")
+
+
 def write(case_name, d):
     case = CASES[case_name]
     if case_name == "tandem":
         return write_tandem(case, d)
+    if case_name == "annotated":
+        return write_annotated(d)
     ref, nodes, walks, seqs, maps = build(case)
     edges = set()
     for steps in walks.values():
@@ -300,8 +367,8 @@ def check(d, prefix):
     with open(f"{d}/expected.tsv") as fh:
         fh.readline()
         for line in fh:
-            t, g, h, c, st, det, s = line.rstrip("\n").split("\t")
-            exp[(t, h, c)] = (st, det, s)
+            t, g, h, c, st, det, s, *src = line.rstrip("\n").split("\t")
+            exp[(t, h, c, src[0] if src else "projected")] = (st, det, s)
     got, fa = {}, {}
     with open(f"{prefix}.hst.fa") as fh:
         for line in fh:
@@ -316,10 +383,11 @@ def check(d, prefix):
         hdr = fh.readline().rstrip("\n").split("\t")
         for line in fh:
             r = dict(zip(hdr, line.rstrip("\n").split("\t")))
-            k = (r["transcript_id"], r["haplotype"], r["copy"])
+            k = (r["transcript_id"], r["haplotype"], r["copy"], r["source"])
             if k in got:
                 sys.exit(f"duplicate row: {k}")
             key = f"{r['transcript_id']}|{r['gene_name']}|{r['haplotype']}|{r['copy']}"
+            key += "|annotated" if r["source"] == "annotated" else ""
             got[k] = (r, fa.get(key) or ".")
     bad = 0
     for k in sorted(set(exp) | set(got)):

@@ -7,6 +7,7 @@
 
 #include "panvar/gfa.hpp"
 #include "panvar/gtf.hpp"
+#include "panvar/hap_annotations.hpp"
 
 namespace panvar {
 
@@ -25,7 +26,9 @@ namespace panvar {
 struct TranscriptsOptions {
     std::string gfa_path;
     std::string reference_path;
-    std::string gtf_path;
+    std::string gtf_path;           // reference annotation to project; empty: annotated transcripts only
+    std::string hap_annotations;    // table of haplotype-specific annotations (hap_annotations.hpp)
+    std::string contig_alias;
     std::string out_prefix;
     double min_exon_share = 0.8;
     std::size_t threads = 0;
@@ -37,9 +40,15 @@ enum class HstStatus { Ok, SpliceSiteChanged, BoundaryMoved, ClippedAtEdge, Intr
 constexpr int kHstStatuses = 7;
 const char* hst_status_name(HstStatus s);
 
+// Where an HST comes from: projected from the reference annotation, cut from the haplotype's own annotation,
+// or both with the same sequence.
+enum HstSource { kProjected = 1, kAnnotated = 2 };
+
 // One transcript on one haplotype copy.
 struct HstRecord {
-    std::size_t transcript = 0;     // index into the projected transcripts
+    int source = kProjected;        // HstSource bits
+    std::size_t transcript = 0;     // index into the projected transcripts, or (annotated only) the annotated ones
+    int annotated_copies = -1;      // the gene's copies in the haplotype's annotation, where it has one
     std::size_t haplotype = 0;      // index into Graph::paths
     int copy = 0;                   // 1-based along the walk; 0 for no copy
     int copies = 0;                 // passes of the gene on this walk
@@ -70,10 +79,14 @@ struct TranscriptsResult {
     std::vector<TranscriptFeature> outside;        // transcripts with no exon on the reference path
     std::vector<std::string> reference_sequences;  // per transcript, spliced from the reference
     std::vector<std::string> haplotypes;           // path names, Graph::paths order
+    std::vector<AnnotatedTranscript> annotated;    // the haplotypes' own transcripts
+    std::vector<char> has_annotation;              // per path: its haplotype has an annotation
 };
 
-// Projects every transcript of the GTF with an exon on the reference path onto every path of `graph`. Records
-// reach `sink` haplotype by haplotype, in path order and gene, transcript, copy order within one.
+// Projects every transcript of the GTF with an exon on the reference path onto every path of `graph`, and
+// adds the transcripts of each haplotype's own annotation, cut from its walk; an annotated transcript with
+// the projected one's id, copy and sequence is one record of both sources. Records reach `sink` haplotype
+// by haplotype, in path order: projected ones in gene, transcript, copy order, then the annotated ones left.
 class HstSink {
 public:
     virtual ~HstSink() = default;

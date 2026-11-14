@@ -9,6 +9,7 @@
 #include <fstream>
 #include <iostream>
 #include <map>
+#include <unordered_map>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -19,14 +20,19 @@ namespace {
 void print_transcripts_help() {
     std::cout
         << "Usage:\n"
-        << "  panvar transcripts -i <graph.gfa> -r <name> --gtf <genes.gtf> -o <prefix> [options]\n\n"
+        << "  panvar transcripts -i <graph.gfa> -r <name> --gtf <genes.gtf> -o <prefix> [options]\n"
+        << "  panvar transcripts -i <graph.gfa> --hap-annotations <table.tsv> -o <prefix> [options]\n\n"
         << "Project a reference annotation onto every haplotype walk: one haplotype-specific transcript\n"
         << "per transcript, haplotype and copy of its gene.\n\n"
         << "Options:\n"
         << "  -i, --gfa <path>                  Locus GFA with haplotype paths (P or W lines) (required)\n"
         << "  -r, --reference-path <name>       Reference path, exact name or unique substring; its name\n"
-        << "                                    carries contig:start-end (required)\n"
-        << "      --gtf <path>                  GTF in reference coordinates, plain or gzipped (required)\n"
+        << "                                    carries contig:start-end (required with --gtf)\n"
+        << "      --gtf <path>                  GTF in reference coordinates, plain or gzipped, to project\n"
+        << "      --hap-annotations <tsv>       Haplotypes' own annotations: haplotype (sample#hap) and the\n"
+        << "                                    path of its GFF3 or GTF, in the assembly's coordinates\n"
+        << "      --contig-alias <tsv>          Contig names, one contig per row, matching the annotations'\n"
+        << "                                    contigs to the paths' (default: exact, or without sample#hap#)\n"
         << "  -o, --out-prefix <prefix>         Output prefix (required)\n"
         << "      --min-exon-share <F>          Share of the gene's marker exons a pass must walk to be a\n"
         << "                                    copy (default 0.8)\n"
@@ -55,32 +61,61 @@ public:
     }
 
     void add(const TranscriptsResult& res, const std::vector<HstRecord>& recs) override {
-        std::map<std::string, int> copies;   // per gene on this haplotype
+        if (!indexed_) {   // projected transcripts by id, and gene ids by name, for the annotated ones
+            for (std::size_t k = 0; k < res.transcripts.size(); ++k) {
+                ref_of_.emplace(res.transcripts[k].transcript_id, k);
+                gene_of_.emplace(res.transcripts[k].gene_name, res.transcripts[k].gene_id);
+            }
+            indexed_ = true;
+        }
+        std::map<std::string, std::pair<int, int>> copies;   // per gene on this haplotype: projected, annotated
         for (const HstRecord& r : recs) {
-            const TranscriptFeature& t = res.transcripts[r.transcript];
+            const bool annotated_only = r.source == kAnnotated;
+            const TranscriptFeature& t = annotated_only ? res.annotated[r.transcript].t : res.transcripts[r.transcript];
+            const auto ri = annotated_only ? ref_of_.find(t.transcript_id) : ref_of_.end();
+            const long ref = !annotated_only ? static_cast<long>(r.transcript) : ri == ref_of_.end() ? -1 : static_cast<long>(ri->second);
+            const auto gi = annotated_only ? gene_of_.find(t.gene_name) : gene_of_.end();
+            const std::string& gid = gi != gene_of_.end() ? gi->second : t.gene_id;
             const std::string& hap = res.haplotypes[r.haplotype];
             const bool has = !r.sequence.empty();
-            const bool same = has && r.sequence == res.reference_sequences[r.transcript];
-            tsv_ << t.transcript_id << '\t' << t.transcript_name << '\t' << t.gene_id << '\t' << t.gene_name << '\t'
+            const bool same = has && ref >= 0 && r.sequence == res.reference_sequences[static_cast<std::size_t>(ref)];
+            const char* source = r.source == kProjected ? "projected" : annotated_only ? "annotated" : "projected+annotated";
+            tsv_ << t.transcript_id << '\t' << t.transcript_name << '\t' << gid << '\t' << t.gene_name << '\t'
                  << (t.biotype.empty() ? "." : t.biotype) << '\t' << t.strand << '\t' << hap << '\t' << r.copy << '\t'
-                 << r.copies << "\tprojected\t" << hst_status_name(r.status) << '\t' << orientation(r) << '\t';
+                 << r.copies << '\t' << source << '\t' << hst_status_name(r.status) << '\t'
+                 << (annotated_only ? "." : orientation(r)) << '\t';
             if (has) tsv_ << r.path_start << '\t' << r.path_end << '\t' << r.sequence.size() << '\t' << r.exons;
             else tsv_ << ".\t.\t.\t.";
-            tsv_ << '\t' << res.reference_sequences[r.transcript].size() << '\t' << t.exons.size() << '\t'
-                 << (has ? (same ? "yes" : "no") : ".") << '\t' << r.moved << '\t' << r.splice_changed << '\t'
-                 << join(r.exon_starts) << '\t' << join(r.exon_lengths) << '\t' << (r.detail.empty() ? "." : r.detail)
+            if (ref >= 0)
+                tsv_ << '\t' << res.reference_sequences[static_cast<std::size_t>(ref)].size() << '\t'
+                     << res.transcripts[static_cast<std::size_t>(ref)].exons.size();
+            else
+                tsv_ << "\t.\t.";
+            tsv_ << '\t' << (has && ref >= 0 ? (same ? "yes" : "no") : ".") << '\t' << r.moved << '\t' << r.splice_changed
+                 << '\t' << join(r.exon_starts) << '\t' << join(r.exon_lengths) << '\t' << (r.detail.empty() ? "." : r.detail)
                  << '\n';
             if (has)
                 fa_ << '>' << t.transcript_id << '|' << t.gene_name << '|' << hap << '|' << r.copy
-                    << " source=projected status=" << hst_status_name(r.status) << '\n' << r.sequence << '\n';
-            Tally& g = genes_[t.gene_id];
+                    << (annotated_only ? "|annotated" : "") << " source=" << source << " status=" << hst_status_name(r.status)
+                    << '\n' << r.sequence << '\n';
+            Tally& g = genes_[gid];
             g.name = t.gene_name;
             ++g.status[static_cast<int>(r.status)];
             g.hst += has;
             g.same += same;
-            copies[t.gene_id] = r.copies;
+            g.annotated += has && (r.source & kAnnotated);
+            auto& c = copies.emplace(gid, std::make_pair(0, 0)).first->second;
+            if (r.source & kProjected) c.first = r.copies;
+            if (r.annotated_copies >= 0) c.second = r.annotated_copies;
         }
-        for (const auto& [gid, c] : copies) ++genes_[gid].by_copies[c];
+        for (const auto& [gid, c] : copies) {
+            ++genes_[gid].by_copies[c.first];
+            if (res.has_annotation[recs.front().haplotype] && c.first != c.second) {
+                const std::string& hap = res.haplotypes[recs.front().haplotype];
+                genes_[gid].differ.push_back(hap.substr(0, hap.find('#', hap.find('#') + 1)) + ":" +
+                                             std::to_string(c.first) + "/" + std::to_string(c.second));
+            }
+        }
     }
 
     void finish(const TranscriptsResult& res, const std::string& summary_path) {
@@ -99,11 +134,13 @@ public:
         for (const TranscriptFeature& t : res.transcripts)
             if (order.empty() || order.back() != t.gene_id) order.push_back(t.gene_id);
         for (const auto& [gid, v] : out) if (!tx.count(gid)) order.push_back(gid);
+        for (const auto& [gid, g] : genes_)   // genes only the haplotypes' annotations have
+            if (!tx.count(gid) && !out.count(gid)) { order.push_back(gid); tx[gid].first = g.name; }
         std::ofstream s(summary_path);
         if (!s) throw std::runtime_error("transcripts: cannot write " + summary_path);
-        s << "gene_id\tgene_name\ttranscripts\tclipped\toutside\thaplotypes_by_copies\thsts\tsame_as_ref";
+        s << "gene_id\tgene_name\ttranscripts\tclipped\toutside\thaplotypes_by_copies\thsts\tsame_as_ref\tannotated";
         for (int k = 0; k < kHstStatuses; ++k) s << '\t' << hst_status_name(static_cast<HstStatus>(k));
-        s << '\n';
+        s << "\tcopies_differ\n";
         for (const std::string& gid : order) {
             const Tally& g = genes_[gid];
             const std::string name = tx.count(gid) ? tx[gid].first : out[gid].first;
@@ -111,9 +148,11 @@ public:
               << (out.count(gid) ? out[gid].second : 0) << '\t';
             std::string bc;
             for (const auto& [c, n] : g.by_copies) bc += (bc.empty() ? "" : ",") + std::to_string(c) + ":" + std::to_string(n);
-            s << (bc.empty() ? "." : bc) << '\t' << g.hst << '\t' << g.same;
+            s << (bc.empty() ? "." : bc) << '\t' << g.hst << '\t' << g.same << '\t' << g.annotated;
             for (int k = 0; k < kHstStatuses; ++k) s << '\t' << g.status[k];
-            s << '\n';
+            std::string d;
+            for (const std::string& x : g.differ) d += (d.empty() ? "" : ",") + x;
+            s << '\t' << (d.empty() ? "." : d) << '\n';
             hsts_ += g.hst;
         }
         cli::close_output(s, summary_path);
@@ -125,12 +164,16 @@ private:
     struct Tally {
         std::string name;
         std::size_t status[kHstStatuses] = {};
-        std::size_t hst = 0, same = 0;
-        std::map<int, std::size_t> by_copies;   // copies -> haplotypes
+        std::size_t hst = 0, same = 0, annotated = 0;
+        std::map<int, std::size_t> by_copies;   // projected copies -> haplotypes
+        std::vector<std::string> differ;        // sample#hap:projected/annotated copies, where they differ
     };
     std::ofstream fa_, tsv_;
     std::string fa_path_, tsv_path_;
     std::map<std::string, Tally> genes_;
+    bool indexed_ = false;
+    std::unordered_map<std::string, std::size_t> ref_of_;
+    std::unordered_map<std::string, std::string> gene_of_;
     std::size_t hsts_ = 0;
 };
 
@@ -152,6 +195,8 @@ int run_transcripts_command(const std::vector<std::string>& args) {
         else if (arg == "-i" || arg == "--gfa") opt.gfa_path = require_value(arg);
         else if (arg == "-r" || arg == "--reference-path") opt.reference_path = require_value(arg);
         else if (arg == "--gtf") opt.gtf_path = require_value(arg);
+        else if (arg == "--hap-annotations") opt.hap_annotations = require_value(arg);
+        else if (arg == "--contig-alias") opt.contig_alias = require_value(arg);
         else if (arg == "-o" || arg == "--out-prefix") opt.out_prefix = require_value(arg);
         else if (arg == "--min-exon-share") opt.min_exon_share = cli::parse_unit_fraction_arg(arg, require_value(arg));
         else if (arg == "-t" || arg == "--threads") opt.threads = cli::parse_size_arg(arg, require_value(arg));
@@ -159,12 +204,15 @@ int run_transcripts_command(const std::vector<std::string>& args) {
         else throw std::runtime_error("Unknown option: " + arg);
     }
     if (opt.gfa_path.empty()) throw std::runtime_error("Missing required input: --gfa <path>");
-    if (opt.reference_path.empty()) throw std::runtime_error("Missing required input: --reference-path <name>");
-    if (opt.gtf_path.empty()) throw std::runtime_error("Missing required input: --gtf <path>");
+    if (opt.gtf_path.empty() && opt.hap_annotations.empty())
+        throw std::runtime_error("Missing required input: --gtf <path> or --hap-annotations <tsv>");
+    if (!opt.gtf_path.empty() && opt.reference_path.empty())
+        throw std::runtime_error("Missing required input: --reference-path <name> (with --gtf)");
     if (opt.out_prefix.empty()) throw std::runtime_error("Missing required input: --out-prefix <prefix>");
     const std::string fa = opt.out_prefix + ".hst.fa", tsv = opt.out_prefix + ".hst.tsv",
                       summary = opt.out_prefix + ".hst.summary.tsv";
-    cli::reject_output_collisions("transcripts", {fa, tsv, summary}, {opt.gfa_path, opt.gtf_path});
+    cli::reject_output_collisions("transcripts", {fa, tsv, summary},
+                                  {opt.gfa_path, opt.gtf_path, opt.hap_annotations, opt.contig_alias});
 
     cli::RunLog log("transcripts", opt.quiet);
     log.info("reading: " + opt.gfa_path);
@@ -181,7 +229,9 @@ int run_transcripts_command(const std::vector<std::string>& args) {
     FileSink sink(staged.stage(fa), staged.stage(tsv));
     const TranscriptsResult res = project_transcripts(graph, opt, sink);
     sink.finish(res, staged.stage(summary));
-    log.info("reference: " + res.reference);
+    if (!res.reference.empty()) log.info("reference: " + res.reference);
+    if (!opt.hap_annotations.empty())
+        log.info("haplotypes' own transcripts on their paths: " + std::to_string(res.annotated.size()));
     std::size_t genes = 0;
     for (std::size_t k = 0; k < res.transcripts.size(); ++k)
         genes += k == 0 || res.transcripts[k].gene_id != res.transcripts[k - 1].gene_id;

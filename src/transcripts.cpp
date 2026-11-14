@@ -8,6 +8,8 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <fstream>
+#include <set>
 #include <iostream>
 #include <numeric>
 #include <stdexcept>
@@ -350,6 +352,7 @@ bool exon_shared(const Walk& R, const Gene& g, const Pass& p, std::size_t cs, st
 }
 
 void add_detail(std::string& d, const std::string& note) {
+    if (note.empty()) return;
     if (!d.empty()) d += ';';
     d += note;
 }
@@ -659,7 +662,8 @@ std::vector<std::size_t> accept_passes(const std::vector<Pass>& passes, const st
 
 TranscriptsResult project_transcripts(const Graph& graph, const TranscriptsOptions& opt, HstSink& sink) {
     TranscriptsResult res;
-    res.reference = resolve_reference_path_name(graph, opt.reference_path, "transcripts");
+    const bool project = !opt.gtf_path.empty();
+    if (project) res.reference = resolve_reference_path_name(graph, opt.reference_path, "transcripts");
     const PathRecord* ref_path = nullptr;
     for (const PathRecord& p : graph.paths) {
         res.haplotypes.push_back(p.name);
@@ -676,16 +680,23 @@ TranscriptsResult project_transcripts(const Graph& graph, const TranscriptsOptio
             t.seq.push_back(graph.nodes.at(id).sequence);
         }
     }
-    const Walk R = to_walk(*ref_path, t);
-    const std::string rseq = spell(R, t);
-    const ParsedReferencePath meta = parse_reference_path_label(ref_path->name, R.len(), ref_path->type == 'W');
-    if (!meta.has_interval)
-        throw std::runtime_error("transcripts: reference path '" + ref_path->name +
-                                 "' carries no contig:start-end, so GTF coordinates cannot be placed on it");
-    const std::size_t base = meta.region_start_1based;
-    const std::size_t last = base + R.len() - 1;
-    std::vector<TranscriptFeature> partial;
-    std::vector<TranscriptFeature> txs = parse_gtf_transcripts(opt.gtf_path, meta.chrom, base, last, &partial, "transcripts");
+    // Without a reference annotation nothing is projected: no genes, and the walk loop below adds the
+    // annotated transcripts only.
+    Walk R;
+    std::string rseq;
+    std::size_t base = 0, last = 0;
+    std::vector<TranscriptFeature> partial, txs;
+    if (project) {
+        R = to_walk(*ref_path, t);
+        rseq = spell(R, t);
+        const ParsedReferencePath meta = parse_reference_path_label(ref_path->name, R.len(), ref_path->type == 'W');
+        if (!meta.has_interval)
+            throw std::runtime_error("transcripts: reference path '" + ref_path->name +
+                                     "' carries no contig:start-end, so GTF coordinates cannot be placed on it");
+        base = meta.region_start_1based;
+        last = base + R.len() - 1;
+        txs = parse_gtf_transcripts(opt.gtf_path, meta.chrom, base, last, &partial, "transcripts");
+    }
     std::vector<TranscriptsResult::EdgeClip> tx_clip;
     for (const TranscriptFeature& t : txs) tx_clip.push_back({t.exons.size(), 0, 0, 0});
     // A transcript reaching past the path keeps its exons on the path, cut at the path's ends.
@@ -882,13 +893,86 @@ TranscriptsResult project_transcripts(const Graph& graph, const TranscriptsOptio
         return out;
     };
 
+    res.has_annotation.assign(graph.paths.size(), 0);
+    std::vector<std::vector<std::size_t>> annotated_on(graph.paths.size());
+    if (!opt.hap_annotations.empty()) {
+        res.annotated = load_hap_annotations(graph, opt.hap_annotations, opt.contig_alias, "transcripts");
+        std::set<std::string> haps;
+        std::ifstream table(opt.hap_annotations);
+        for (std::string line; std::getline(table, line);) haps.insert(line.substr(0, line.find('\t')));
+        for (std::size_t p = 0; p < graph.paths.size(); ++p) {
+            const std::string& n = graph.paths[p].name;
+            const std::size_t a = n.find('#'), b = a == std::string::npos ? a : n.find('#', a + 1);
+            res.has_annotation[p] = b != std::string::npos && haps.count(n.substr(0, b)) != 0;
+        }
+        for (std::size_t k = 0; k < res.annotated.size(); ++k) annotated_on[res.annotated[k].path].push_back(k);
+    }
+    // The haplotype's own transcripts, cut from its walk; one with a projected record's id, copy and sequence
+    // is that record, of both sources.
+    const auto add_annotated = [&](std::size_t h, std::vector<HstRecord>& recs) {
+        if (annotated_on[h].empty()) return;
+        const std::string hseq = spell(to_walk(graph.paths[h], t), t);
+        std::map<std::tuple<std::string, int>, std::size_t> projected;
+        for (std::size_t k = 0; k < recs.size(); ++k)
+            if (!recs[k].sequence.empty()) projected[{res.transcripts[recs[k].transcript].transcript_id, recs[k].copy}] = k;
+        std::map<std::string, int> annotated_copies;   // per gene name
+        for (const std::size_t a : annotated_on[h]) annotated_copies[res.annotated[a].t.gene_name] = res.annotated[a].copies;
+        for (HstRecord& r : recs) {
+            const auto it = annotated_copies.find(res.transcripts[r.transcript].gene_name);
+            r.annotated_copies = it == annotated_copies.end() ? 0 : it->second;
+        }
+        std::vector<HstRecord> extra;
+        for (const std::size_t a : annotated_on[h]) {
+            const AnnotatedTranscript& at = res.annotated[a];
+            HstRecord r;
+            r.source = kAnnotated;
+            r.transcript = a;
+            r.haplotype = h;
+            r.copy = at.copy;
+            r.copies = at.copies;
+            r.annotated_copies = at.copies;
+            for (const auto& [x, y] : at.t.exons) r.sequence += hseq.substr(x, y - x);
+            if (at.t.strand == '-') r.sequence = reverse_complement(r.sequence);
+            const auto it = projected.find({at.t.transcript_id, at.copy});
+            if (it != projected.end() && recs[it->second].sequence == r.sequence) {
+                recs[it->second].source |= kAnnotated;
+                add_detail(recs[it->second].detail, at.detail);
+                continue;
+            }
+            const std::size_t n = at.t.exons.size();
+            r.exons = n;
+            for (std::size_t q = 0; q < n; ++q) {
+                const auto [x, y] = at.t.exons[at.t.strand == '-' ? n - 1 - q : q];
+                r.exon_starts.push_back(x);
+                r.exon_lengths.push_back(y - x);
+            }
+            r.path_start = at.t.exons.front().first;
+            r.path_end = at.t.exons.back().second;
+            if (at.bp_5p) add_detail(r.detail, "clipped:5':" + std::to_string(at.bp_5p));
+            if (at.bp_3p) add_detail(r.detail, "clipped:3':" + std::to_string(at.bp_3p));
+            add_detail(r.detail, at.detail);
+            r.status = at.bp_5p + at.bp_3p ? HstStatus::ClippedAtEdge : HstStatus::Ok;
+            extra.push_back(std::move(r));
+        }
+        std::sort(extra.begin(), extra.end(), [&](const HstRecord& x, const HstRecord& y) {
+            const TranscriptFeature& a = res.annotated[x.transcript].t;
+            const TranscriptFeature& b = res.annotated[y.transcript].t;
+            return std::tie(a.gene_name, a.transcript_id, x.copy, x.path_start) <
+                   std::tie(b.gene_name, b.transcript_id, y.copy, y.path_start);
+        });
+        recs.insert(recs.end(), std::make_move_iterator(extra.begin()), std::make_move_iterator(extra.end()));
+    };
+
     // Haplotypes in batches, so results reach the sink in path order without holding every sequence.
     const std::size_t threads = opt.threads ? opt.threads : std::max(1u, std::thread::hardware_concurrency());
     const std::size_t batch = threads * 4;
     for (std::size_t b0 = 0; b0 < graph.paths.size(); b0 += batch) {
         const std::size_t b1 = std::min(graph.paths.size(), b0 + batch);
         std::vector<std::vector<HstRecord>> got(b1 - b0);
-        run_parallel(b1 - b0, threads, [&](std::size_t k) { got[k] = project_haplotype(b0 + k); });
+        run_parallel(b1 - b0, threads, [&](std::size_t k) {
+            if (project) got[k] = project_haplotype(b0 + k);
+            add_annotated(b0 + k, got[k]);
+        });
         for (const auto& recs : got) sink.add(res, recs);
     }
     return res;

@@ -48,9 +48,17 @@ for c in $(python3 "$TOOLS/transcript_fixture.py" cases); do
   [[ $c == main ]] && continue
   mkdir -p "case_$c"
   python3 "$TOOLS/transcript_fixture.py" write "$c" "case_$c"
-  "$BIN" transcripts -i "case_$c/locus.gfa" -r ref --gtf "case_$c/genes.gtf" -o "case_$c/out" -t 2 -q
+  extra=()
+  [[ -e "case_$c/hap_annotations.tsv" ]] && extra=(--hap-annotations "case_$c/hap_annotations.tsv" --contig-alias "case_$c/alias.tsv")
+  "$BIN" transcripts -i "case_$c/locus.gfa" -r ref --gtf "case_$c/genes.gtf" -o "case_$c/out" -t 2 -q ${extra[@]+"${extra[@]}"}
   check "case $c: every row matches the haplotypes' own transcripts" 'python3 "$TOOLS/transcript_fixture.py" check "case_$c" "case_$c/out" > "case_$c/check.log"; cat "case_$c/check.log"; grep -q "wrong: 0" "case_$c/check.log"'
 done
+
+# haplotypes' own annotations: copies they disagree on, and annotated transcripts alone
+check "the summary notes a gene's copies where the annotation differs" 'awk -F"\t" "\$2==\"GB\"" case_annotated/out.hst.summary.tsv | grep -q "h1#1:1/2"'
+"$BIN" transcripts -i case_annotated/locus.gfa --hap-annotations case_annotated/hap_annotations.tsv \
+  --contig-alias case_annotated/alias.tsv -o ann_only -q
+check "without --gtf, only the annotated transcripts" '[[ "$(tail -n +2 ann_only.hst.tsv | cut -f10 | sort | uniq -c | tr -s " ")" == " 8 annotated" ]]'
 
 # input errors
 "$BIN" transcripts -i locus.gfa -r ref -o e1 -q 2> e1.log
