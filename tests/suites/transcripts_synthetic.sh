@@ -60,6 +60,11 @@ done
 printf 'molecule\tgene\tstart\tend\tstrand\nh1#1#ctg1:0-12000\tGB\t0\t1\t0\n' > gb.bed
 check "the copy check reads the projection's copies, not the annotation's" \
   'python3 "$TOOLS/../../dev/transcripts_copies.py" case_annotated/out.hst.tsv gb.bed | grep -q "^GB	1	1	"'
+grep -e haplotype -e '^h3#' case_annotated/hap_annotations.tsv > h3_only.tsv
+"$BIN" transcripts -i case_annotated/locus.gfa -r ref --gtf case_annotated/genes.gtf --hap-annotations h3_only.tsv \
+  --contig-alias case_annotated/alias.tsv -o h3_only -q
+check "copies are compared only for genes an annotation has" \
+  '[[ "$(awk -F"\t" "NR > 1 && \$2 ~ /^G[ABC]\$/ {print \$NF}" h3_only.hst.summary.tsv | sort -u)" == . ]]'
 check "an exon without its transcript record is reported" 'grep -q "1 exon row(s) whose transcript record is missing" case_annotated/log'
 check "the summary notes a gene's copies where the annotation differs" 'awk -F"\t" "\$2==\"GB\"" case_annotated/out.hst.summary.tsv | grep -q "h1#1:1/2"'
 "$BIN" transcripts -i case_annotated/locus.gfa --hap-annotations case_annotated/hap_annotations.tsv \

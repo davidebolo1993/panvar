@@ -9,6 +9,7 @@
 #include <fstream>
 #include <iostream>
 #include <map>
+#include <set>
 #include <unordered_map>
 #include <stdexcept>
 #include <string>
@@ -66,6 +67,10 @@ public:
                 ref_of_.emplace(res.transcripts[k].transcript_id, k);
                 gene_of_.emplace(res.transcripts[k].gene_name, res.transcripts[k].gene_id);
             }
+            for (const AnnotatedTranscript& at : res.annotated) {
+                const auto gi = gene_of_.find(at.t.gene_name);
+                annotated_genes_.insert(gi != gene_of_.end() ? gi->second : at.t.gene_id);
+            }
             indexed_ = true;
         }
         std::map<std::string, std::pair<int, int>> copies;   // per gene on this haplotype: projected, annotated
@@ -111,7 +116,8 @@ public:
         }
         for (const auto& [gid, c] : copies) {
             ++genes_[gid].by_copies[c.first];
-            if (res.has_annotation[recs.front().haplotype] && c.first != c.second) {
+            // Only genes an annotation has somewhere: one it never annotates says nothing about copies.
+            if (res.has_annotation[recs.front().haplotype] && c.first != c.second && annotated_genes_.count(gid)) {
                 const std::string& hap = res.haplotypes[recs.front().haplotype];
                 genes_[gid].differ.push_back(hap.substr(0, hap.find('#', hap.find('#') + 1)) + ":" +
                                              std::to_string(c.first) + "/" + std::to_string(c.second));
@@ -175,6 +181,7 @@ private:
     bool indexed_ = false;
     std::unordered_map<std::string, std::size_t> ref_of_;
     std::unordered_map<std::string, std::string> gene_of_;
+    std::set<std::string> annotated_genes_;   // gene ids any haplotype's annotation has
     std::size_t hsts_ = 0;
 };
 
