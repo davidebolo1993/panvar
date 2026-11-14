@@ -379,6 +379,13 @@ if(PANVAR_BUILD_TESTING)
                      COMMAND /usr/bin/env bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/suites/recruit_input.sh $<TARGET_FILE:panvar> ${CMAKE_CURRENT_SOURCE_DIR}/tests/tools ${CMAKE_CURRENT_BINARY_DIR}/recruit_input)
             set_tests_properties(panvar_recruit_input PROPERTIES TIMEOUT 300)
         endif()
+        # transcripts on a synthetic locus: every projected transcript against the haplotypes' own splicing.
+        set(PANVAR_TX_SYN ${CMAKE_CURRENT_SOURCE_DIR}/tests/suites/transcripts_synthetic.sh)
+        if(EXISTS ${PANVAR_TX_SYN})
+            add_test(NAME panvar_transcripts_synthetic
+                     COMMAND /usr/bin/env bash ${PANVAR_TX_SYN} $<TARGET_FILE:panvar> ${CMAKE_CURRENT_SOURCE_DIR}/tests/tools ${CMAKE_CURRENT_BINARY_DIR}/transcripts_synthetic)
+            set_tests_properties(panvar_transcripts_synthetic PROPERTIES TIMEOUT 120)
+        endif()
         # Fast, dependency-free smoke on a tiny hand-built graph that exercises every
         # call event type + confounders with exact-record assertions (no vg needed).
         set(PANVAR_SYN_SMOKE ${CMAKE_CURRENT_SOURCE_DIR}/tests/suites/synthetic_smoke.sh)
