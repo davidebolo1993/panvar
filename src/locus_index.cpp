@@ -121,27 +121,44 @@ struct LocusWork {
                                                                // found off them (the locus, both, from there on)
 };
 
-// A haplotype-specific transcript, and per base the graph node it lies on (-1 where unknown).
-struct Hst {
-    std::string seq;
-    std::vector<std::int32_t> node_at;
-};
+// The table beside a transcripts FASTA: <prefix>.hst.tsv (or .hst.tsv.gz) for <prefix>.hst.fa[.gz]; empty
+// when there is none.
+std::string transcripts_table(const std::string& fa) {
+    std::string p = fa;
+    if (p.size() > 3 && p.compare(p.size() - 3, 3, ".gz") == 0) p.resize(p.size() - 3);
+    const std::string tail = ".hst.fa";
+    if (p.size() <= tail.size() || p.compare(p.size() - tail.size(), tail.size(), tail) != 0) return {};
+    const std::string base = p.substr(0, p.size() - tail.size()) + ".hst.tsv";
+    for (const std::string& c : {base, base + ".gz"})
+        if (fs::is_regular_file(c)) return c;
+    return {};
+}
 
-// The transcripts of a panvar transcripts FASTA (plain or gzip). Each status but those of a written
-// transcript with a flaw is taken, or only status=ok with `ok_only`; a record without a status is taken.
-// Their bases are placed on the graph's nodes through the table beside the FASTA (<prefix>.hst.tsv: the
-// haplotype's path and each exon's first base and length on it), where it exists.
-std::vector<Hst> read_transcripts(const std::string& fa, const Graph& g, const std::vector<std::string>& node_names, bool ok_only,
-                                  std::uint64_t& used, std::uint64_t& skipped) {
+// The transcripts' checksum: the FASTA's, and its table's where there is one, as nodes are placed through it.
+std::string transcripts_checksum_of(const std::string& fa) {
+    const std::string t = transcripts_table(fa);
+    return file_checksum(fa) + (t.empty() ? std::string() : "+" + file_checksum(t));
+}
+
+// A transcript's sequence, and the graph node of each of its bases (-1 where unknown).
+using TranscriptFn = std::function<void(const std::string& seq, const std::function<std::int32_t(std::size_t)>& node_at)>;
+
+// The transcripts of a panvar transcripts FASTA (plain or gzip), one at a time. Each status but those of a
+// written transcript with a flaw is taken, or only status=ok with `ok_only`; a record without a status is
+// taken. Their bases are placed on the graph's nodes through the table beside the FASTA (the haplotype's
+// path and each exon's first base and length on it), where it exists. A sequence equal to one already
+// passed on is counted as taken but not passed on again: most transcripts are the same on many haplotypes.
+void for_each_transcript(const std::string& fa, const Graph& g, const std::vector<std::string>& node_names, bool ok_only,
+                         std::uint64_t& used, std::uint64_t& skipped, const TranscriptFn& fn) {
     // the exons of each record on its path, from the table
     struct Place { std::string path; bool forward = true; std::vector<std::uint64_t> starts, lengths; };
     std::unordered_map<std::string, Place> place;
-    const std::string tail = ".hst.fa";
-    if (fa.size() > tail.size() && fa.compare(fa.size() - tail.size(), tail.size(), tail) == 0 &&
-        fs::is_regular_file(fa.substr(0, fa.size() - tail.size()) + ".hst.tsv")) {
-        std::ifstream in(fa.substr(0, fa.size() - tail.size()) + ".hst.tsv");
+    const std::string table = transcripts_table(fa);
+    if (!table.empty()) {
+        GzLineReader in(table);
+        if (!in.ok()) throw std::runtime_error("recruit: cannot read " + table);
         std::string line;
-        std::getline(in, line);
+        in.getline(line);
         std::map<std::string, std::size_t> col;
         {
             std::stringstream ss(line);
@@ -149,9 +166,9 @@ std::vector<Hst> read_transcripts(const std::string& fa, const Graph& g, const s
             for (std::string f; std::getline(ss, f, '\t');) col[f] = k++;
         }
         for (const char* need : {"transcript_id", "gene_name", "haplotype", "copy", "strand", "orientation", "exon_starts", "exon_lengths"})
-            if (!col.count(need)) throw std::runtime_error("recruit: " + fa + ": the table beside it has no " + need + " column");
+            if (!col.count(need)) throw std::runtime_error("recruit: " + table + " has no " + need + " column");
         const bool has_source = col.count("source") && col.count("record");
-        while (std::getline(in, line)) {
+        while (in.getline(line)) {
             std::vector<std::string> f;
             std::stringstream ss(line);
             for (std::string x; std::getline(ss, x, '\t');) f.push_back(x);
@@ -172,7 +189,7 @@ std::vector<Hst> read_transcripts(const std::string& fa, const Graph& g, const s
     for (std::size_t p = 0; p < g.paths.size(); ++p) path_of[g.paths[p].name] = p;
     for (std::size_t i = 0; i < node_names.size(); ++i) node_index[node_names[i]] = i;
     std::map<std::size_t, std::vector<std::uint64_t>> step_end;   // per path used, each step's end
-    std::vector<Hst> out;
+    std::unordered_set<std::uint64_t> seen;                        // sequences passed on, by a 64-bit hash
     GzLineReader in(fa);
     if (!in.ok()) throw std::runtime_error("recruit: cannot read " + fa);
     std::string line, name, status, seq;
@@ -182,29 +199,33 @@ std::vector<Hst> read_transcripts(const std::string& fa, const Graph& g, const s
         const bool take = status.empty() || (ok_only ? status == "ok" : flawed.count(status) != 0);
         if (!take || seq.size() < kK) { ++skipped; return; }
         ++used;
-        Hst h;
         for (char& c : seq) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
-        h.node_at.assign(seq.size(), -1);
+        // a 64-bit hash: two different transcripts colliding would drop one, odds ~1e-19 per pair here
+        const std::uint64_t h = std::hash<std::string>{}(seq) * 0x9e3779b97f4a7c15ULL ^ seq.size();
+        if (!seen.insert(h).second) return;
         const auto pl = place.find(name);
         const auto pi = pl == place.end() ? path_of.end() : path_of.find(pl->second.path);
-        if (pi != path_of.end()) {
-            const PathRecord& path = g.paths[pi->second];
-            auto& ends = step_end[pi->second];
-            if (ends.empty()) {
-                std::uint64_t pos = 0;
-                for (const auto& st : path.steps) { pos += g.nodes.at(st.node_id).sequence.size(); ends.push_back(pos); }
-            }
-            const Place& p = pl->second;
-            std::size_t t = 0;
-            for (std::size_t e = 0; e < p.starts.size() && t < seq.size(); ++e)
-                for (std::uint64_t o = 0; o < p.lengths[e] && t < seq.size(); ++o, ++t) {
-                    const std::uint64_t pos = p.forward ? p.starts[e] + o : p.starts[e] + p.lengths[e] - 1 - o;
-                    const std::size_t si = static_cast<std::size_t>(std::upper_bound(ends.begin(), ends.end(), pos) - ends.begin());
-                    if (si < path.steps.size()) h.node_at[t] = static_cast<std::int32_t>(node_index.at(path.steps[si].node_id));
-                }
+        if (pi == path_of.end()) {
+            fn(seq, [](std::size_t) { return std::int32_t(-1); });
+            return;
         }
-        h.seq = std::move(seq);
-        out.push_back(std::move(h));
+        const PathRecord& path = g.paths[pi->second];
+        auto& ends = step_end[pi->second];
+        if (ends.empty()) {
+            std::uint64_t pos = 0;
+            for (const auto& st : path.steps) { pos += g.nodes.at(st.node_id).sequence.size(); ends.push_back(pos); }
+        }
+        const Place& p = pl->second;
+        std::vector<std::uint64_t> cum(1, 0);   // the transcript offset each exon starts at, as written
+        for (const std::uint64_t l : p.lengths) cum.push_back(cum.back() + l);
+        fn(seq, [&](std::size_t t) -> std::int32_t {
+            if (t >= cum.back()) return -1;
+            const std::size_t e = static_cast<std::size_t>(std::upper_bound(cum.begin(), cum.end(), t) - cum.begin()) - 1;
+            const std::uint64_t o = t - cum[e];
+            const std::uint64_t pos = p.forward ? p.starts[e] + o : p.starts[e] + p.lengths[e] - 1 - o;
+            const std::size_t si = static_cast<std::size_t>(std::upper_bound(ends.begin(), ends.end(), pos) - ends.begin());
+            return si < path.steps.size() ? static_cast<std::int32_t>(node_index.at(path.steps[si].node_id)) : -1;
+        });
     };
     while (in.getline(line)) {
         if (line.empty()) continue;
@@ -221,13 +242,13 @@ std::vector<Hst> read_transcripts(const std::string& fa, const Graph& g, const s
         seq += line;
     }
     flush();
-    return out;
 }
 
 // Every k-mer of every path: nodes it starts on, largest copy number within a path, paths holding it. With
 // transcripts, their k-mers no path holds join as transcript-only: one copy, in no path, on the node of
 // their first base where it is known.
-void collect_kmers(const Graph& g, LocusIndex& idx, std::vector<std::uint32_t>& present, const std::vector<Hst>* transcripts = nullptr) {
+void collect_kmers(const Graph& g, LocusIndex& idx, std::vector<std::uint32_t>& present,
+                   const std::function<void(const TranscriptFn&)>& each_transcript = {}) {
     std::vector<std::string> ids;
     for (const auto& [id, n] : g.nodes) ids.push_back(id);
     const bool numeric = std::all_of(ids.begin(), ids.end(), [](const std::string& s) {
@@ -268,14 +289,19 @@ void collect_kmers(const Graph& g, LocusIndex& idx, std::vector<std::uint32_t>& 
         }
     }
     std::unordered_set<std::uint64_t> from_transcripts;
-    if (transcripts)
-        for (const Hst& h : *transcripts)
-            kmer::for_each_canonical_kmer(h.seq.data(), h.seq.size(), kK, [&](std::uint64_t c, std::size_t start, bool) {
+    const bool with_transcripts = static_cast<bool>(each_transcript);
+    if (with_transcripts)
+        each_transcript([&](const std::string& seq, const std::function<std::int32_t(std::size_t)>& node_at) {
+            kmer::for_each_canonical_kmer(seq.data(), seq.size(), kK, [&](std::uint64_t c, std::size_t start, bool) {
                 if (agg.count(c) && !from_transcripts.count(c)) return;   // a genomic k-mer
                 Agg& a = agg[c];
                 if (from_transcripts.insert(c).second) a.mult = 1;
-                if (a.nodes.empty() && h.node_at[start] >= 0) a.nodes.push_back(static_cast<std::uint32_t>(h.node_at[start]));
+                if (a.nodes.empty()) {
+                    const std::int32_t n = node_at(start);
+                    if (n >= 0) a.nodes.push_back(static_cast<std::uint32_t>(n));
+                }
             });
+        });
     idx.codes.reserve(agg.size());
     for (const auto& [c, a] : agg) idx.codes.push_back(c);
     std::sort(idx.codes.begin(), idx.codes.end());
@@ -292,7 +318,7 @@ void collect_kmers(const Graph& g, LocusIndex& idx, std::vector<std::uint32_t>& 
         idx.nodeset.push_back(it->second);
         idx.mult.push_back(static_cast<std::uint16_t>(std::min<std::uint32_t>(a.mult, 65535)));
         present.push_back(a.paths);
-        if (transcripts) idx.transcript_only.push_back(from_transcripts.count(c) != 0);
+        if (with_transcripts) idx.transcript_only.push_back(from_transcripts.count(c) != 0);
     }
 }
 
@@ -419,7 +445,7 @@ std::string expected_key(const BuildOptions& o, const std::string& gfa, const st
     LocusIndex k;
     k.graph_checksum = file_checksum(gfa);
     if (!transcripts.empty()) {
-        k.transcripts_checksum = file_checksum(transcripts);
+        k.transcripts_checksum = transcripts_checksum_of(transcripts);
         k.transcripts_ok_only = o.transcripts_ok_only;
     }
     const Graph g = parse_gfa(gfa, ParseGfaOptions{true, false});
@@ -592,10 +618,11 @@ std::vector<LocusIndex> build(const BuildOptions& o) {
                 return numeric ? std::stoull(a) < std::stoull(b) : a < b;
             });
             x.transcripts = fs::absolute(tx).string();
-            x.transcripts_checksum = file_checksum(tx);
+            x.transcripts_checksum = transcripts_checksum_of(tx);
             x.transcripts_ok_only = o.transcripts_ok_only;
-            const std::vector<Hst> hsts = read_transcripts(tx, g, node_names, o.transcripts_ok_only, x.transcripts_used, x.transcripts_skipped);
-            collect_kmers(g, x, present, &hsts);
+            collect_kmers(g, x, present, [&](const TranscriptFn& fn) {
+                for_each_transcript(tx, g, node_names, o.transcripts_ok_only, x.transcripts_used, x.transcripts_skipped, fn);
+            });
             const std::size_t n = static_cast<std::size_t>(std::count(x.transcript_only.begin(), x.transcript_only.end(), 1));
             log("locus: " + x.name + "; transcripts: " + std::to_string(x.transcripts_used) + " taken, " + std::to_string(x.transcripts_skipped) +
                 " left out; k-mers only in transcripts: " + std::to_string(n));
@@ -672,7 +699,10 @@ std::vector<LocusIndex> build(const BuildOptions& o) {
                 const std::uint64_t out = w.counts[i] - std::min(w.sub[i], w.counts[i]);
                 if (out >= 1 && out <= kTandemOutside * w.idx.mult[i]) ++tandem_out;
             }
-            if (static_cast<double>(tandem_out) >= kTandemShare * static_cast<double>(w.idx.codes.size())) {
+            // the share is of the haplotypes' k-mers: a transcript's k-mers must not move the trigger
+            const std::size_t genomic = w.idx.codes.size() -
+                static_cast<std::size_t>(std::count(w.idx.transcript_only.begin(), w.idx.transcript_only.end(), 1));
+            if (static_cast<double>(tandem_out) >= kTandemShare * static_cast<double>(genomic)) {
                 everywhere[li] = 1;
                 log("locus: " + w.idx.name + "; tandem k-mers with a few copies outside: " + std::to_string(tandem_out) + "; every genome scanned for pieces");
             }
