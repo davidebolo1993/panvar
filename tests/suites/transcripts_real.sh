@@ -27,6 +27,9 @@ for pair in hla_a:HLA-A hla_b:HLA-B hla_c:HLA-C; do
 done
 check "copies of HLA-C are placed by sequence where its nodes fall short ($(grep -c placed_by_sequence hla_c.hst.tsv) rows)" \
   '[[ $(awk -F"\t" "\$4==\"HLA-C\" && \$25 ~ /placed_by_sequence/ {print \$7}" hla_c.hst.tsv | sort -u | wc -l) -gt 100 ]]'
+"$BIN" transcripts -i "$DATA/hla/hla_c.gfa.gz" -r GRCh38 --gtf "$GTF" -o hla_c_t1 -t 1 -q
+check "1 thread writes the same files as 2 where copies are placed by sequence" \
+  'cmp -s hla_c.hst.tsv hla_c_t1.hst.tsv && cmp -s hla_c.hst.fa hla_c_t1.hst.fa && cmp -s hla_c.hst.summary.tsv hla_c_t1.hst.summary.tsv'
 
 echo "transcripts_real: $pass passed, $fail failed"
 [[ $fail -eq 0 ]]
