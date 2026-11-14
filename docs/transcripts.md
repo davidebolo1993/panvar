@@ -94,6 +94,7 @@ Statuses, most severe first:
 ## Limitations
 
 - A copy is found through the nodes it shares with the reference copy. A copy the graph keeps on nodes of its own, neither folded onto the reference nor aligned to it, is not found.
+- A haplotype's tandem unit cut short (a partial copy) still takes the layout of the reference unit it resembles most; exons that fall outside what it holds are left out and counted (`tandem_unplaced`).
 - Tandem units are told apart by their sequence: a haplotype unit takes the layout of the reference unit it resembles most, and among identical units the choice follows their order. `tandem:14>46` gives the exon count against the reference's.
 - A copy mixing the differences of two near-identical paralogs goes to the one it shares more coding bases with; `rival` in `detail` gives the margin.
 - Only the reference annotation is projected, so isoforms and genes the reference lacks are found only through a haplotype's own annotation. A changed splice site is reported, not judged: its transcript is still written.
