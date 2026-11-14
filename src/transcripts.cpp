@@ -361,8 +361,10 @@ std::string signed_text(long v) { return (v > 0 ? "+" : "") + std::to_string(v);
 
 // Exons of a transcript that repeat with a tandem unit: exons starting at the same node and offset of the
 // reference walk, as a unit the reference walks several times holds the same exon in each pass. The stretch
-// from the first to the last such exon is projected by finding each kind of exon wherever the haplotype's
-// walk holds it, so the transcript follows the haplotype's own number of units.
+// from the first to the last such exon is cut into units, each starting where the stretch's first exon
+// starts; a unit's layout is the kinds of exon it holds, in order. On a haplotype the same start cuts its
+// walk into units, and each unit takes the layout of one reference unit, so the transcript follows the
+// haplotype's own number of units and the reference walk gives back its annotation.
 struct Tandem {
     bool any = false;
     std::size_t lo = 0, hi = 0;   // genomic exon indices of the stretch, inclusive
@@ -370,9 +372,12 @@ struct Tandem {
         int start_node = 0, end_node = 0;
         char start_rev = 0, end_rev = 0;
         std::size_t start_off = 0, end_off = 0;   // offsets of the exon's first and last base in their nodes
-        std::size_t ref_exon = 0, len = 0, count = 0;
+        std::size_t ref_exon = 0, len = 0;
     };
     std::vector<Kind> kinds;
+    std::vector<std::vector<std::size_t>> units;   // per reference unit, its exons' kinds in order
+    std::vector<std::vector<int>> unit_nodes;      // per reference unit, its nodes (sorted, distinct)
+    std::vector<std::size_t> unit_len;             // per reference unit, its bases (the last: a whole unit's)
 };
 
 std::size_t step_at(const Walk& w, std::size_t c) {
@@ -386,7 +391,7 @@ Tandem find_tandem(const Walk& R, const Cuts& cuts) {
     for (std::size_t k = 0; k < cuts.size(); ++k) {
         const std::size_t i = step_at(R, cuts[k].first), j = step_at(R, cuts[k].second - 1);
         kind[k] = {R.node[i], R.node[j], R.rev[i], R.rev[j], cuts[k].first - R.pref[i], cuts[k].second - 1 - R.pref[j],
-                   k, cuts[k].second - cuts[k].first, 1};
+                   k, cuts[k].second - cuts[k].first};
         ++starts[{R.node[i], R.rev[i], kind[k].start_off}];
     }
     for (std::size_t k = 0; k < cuts.size(); ++k) {
@@ -395,16 +400,41 @@ Tandem find_tandem(const Walk& R, const Cuts& cuts) {
         t.hi = k;
         t.any = true;
     }
-    for (std::size_t k = t.lo; t.any && k <= t.hi; ++k) {
+    if (!t.any) return t;
+    const auto same_start = [&](const Tandem::Kind& x, const Tandem::Kind& y) {
+        return std::tie(x.start_node, x.start_rev, x.start_off) == std::tie(y.start_node, y.start_rev, y.start_off);
+    };
+    std::vector<std::size_t> unit_start;
+    for (std::size_t k = t.lo; k <= t.hi; ++k) {
         const Tandem::Kind& x = kind[k];
-        bool seen = false;
-        for (Tandem::Kind& y : t.kinds)
-            if (std::tie(y.start_node, y.start_rev, y.start_off, y.end_node, y.end_rev, y.end_off) ==
-                std::tie(x.start_node, x.start_rev, x.start_off, x.end_node, x.end_rev, x.end_off)) {
-                ++y.count;
-                seen = true;
-            }
-        if (!seen) t.kinds.push_back(x);
+        std::size_t id = t.kinds.size();
+        for (std::size_t q = 0; q < t.kinds.size(); ++q) {
+            const Tandem::Kind& y = t.kinds[q];
+            if (same_start(x, y) && std::tie(y.end_node, y.end_rev, y.end_off) == std::tie(x.end_node, x.end_rev, x.end_off))
+                id = q;
+        }
+        if (id == t.kinds.size()) t.kinds.push_back(x);
+        if (k == t.lo || same_start(x, kind[t.lo])) {
+            t.units.emplace_back();
+            unit_start.push_back(cuts[k].first);
+        }
+        t.units.back().push_back(id);
+    }
+    unit_start.push_back(cuts[t.hi].second);
+    for (std::size_t u = 0; u + 1 < unit_start.size(); ++u) t.unit_len.push_back(unit_start[u + 1] - unit_start[u]);
+    // The last unit ends at its last exon: it is compared over a whole unit, the median of the others.
+    if (t.units.size() > 1) {
+        std::vector<std::size_t> others(t.unit_len.begin(), t.unit_len.end() - 1);
+        std::nth_element(others.begin(), others.begin() + others.size() / 2, others.end());
+        t.unit_len.back() = std::max(t.unit_len.back(), others[others.size() / 2]);
+    }
+    for (std::size_t u = 0; u + 1 < unit_start.size(); ++u) {
+        std::vector<int> nodes;
+        const std::size_t end = std::min(unit_start[u] + t.unit_len[u], R.len());
+        for (std::size_t i = step_at(R, unit_start[u]); i < R.size() && R.pref[i] < end; ++i) nodes.push_back(R.node[i]);
+        std::sort(nodes.begin(), nodes.end());
+        nodes.erase(std::unique(nodes.begin(), nodes.end()), nodes.end());
+        t.unit_nodes.push_back(std::move(nodes));
     }
     return t;
 }
@@ -414,55 +444,105 @@ struct Piece {
     std::size_t ref = 0;        // the reference exon it stands for
 };
 
-// The exons of a tandem stretch on walk W between bases lo and hi: each kind wherever W holds its first and
-// last nodes at about its length apart. Where a unit misses one of the two nodes (a variant at the exon's
-// first or last base), the exon is placed from the other at the reference's length, and counted in
-// `inferred`. Overlapping finds keep exact ones first, then the kind the reference holds more often.
-std::vector<Piece> tandem_exons(const Walk& W, const Tandem& tm, std::size_t lo, std::size_t hi, std::size_t* inferred) {
-    struct Find { Piece p; bool exact; std::size_t count, off; };
-    std::vector<Find> found;
-    const std::size_t j0 = lo < W.len() ? step_at(W, lo) : W.size();
+struct Placed {
+    std::vector<Piece> pieces;
+    std::size_t exact = 0, inferred = 0;
+};
+
+// One reference unit's layout placed on walk W between bases lo and hi, kind after kind: each exon where W
+// holds its first and last nodes about its length apart. Where W lacks one of the two (a variant at the
+// exon's first or last base), the exon is placed from the other at the reference's length (`inferred`).
+Placed place_layout(const Walk& W, const Tandem& tm, const std::vector<std::size_t>& layout, std::size_t lo,
+                    std::size_t hi) {
+    Placed out;
+    std::size_t pos = lo;
     const auto at = [&](std::size_t j, int node, char rev) { return W.node[j] == node && W.rev[j] == rev; };
-    for (const Tandem::Kind& k : tm.kinds) {
+    for (const std::size_t id : layout) {
+        const Tandem::Kind& k = tm.kinds[id];
         const std::size_t slack = std::max<std::size_t>(30, k.len / 5);
-        std::vector<char> end_used(W.size(), 0);
-        for (std::size_t j = j0; j < W.size() && W.pref[j] < hi; ++j) {
-            if (!at(j, k.start_node, k.start_rev)) continue;
-            const std::size_t a = W.pref[j] + k.start_off;
-            if (a < lo) continue;
-            bool exact = false;
+        std::size_t a = SIZE_MAX, b = SIZE_MAX;
+        bool exact = false;
+        for (std::size_t j = step_at(W, pos); j < W.size() && W.pref[j] < hi && a == SIZE_MAX; ++j) {
+            if (!at(j, k.start_node, k.start_rev) || W.pref[j] + k.start_off < pos) continue;
+            a = W.pref[j] + k.start_off;
             for (std::size_t e = j; e < W.size() && W.pref[e] <= a + k.len + slack; ++e) {
                 if (!at(e, k.end_node, k.end_rev)) continue;
-                const std::size_t b = W.pref[e] + k.end_off + 1;
-                if (b <= a || b > hi) continue;
-                if (b - a + slack >= k.len && b - a <= k.len + slack) {
-                    found.push_back({{a, b, k.ref_exon}, true, k.count, b - a > k.len ? b - a - k.len : k.len - (b - a)});
-                    end_used[e] = 1;
-                    exact = true;
-                }
+                const std::size_t x = W.pref[e] + k.end_off + 1;
+                if (x <= a || x > hi) continue;
+                if (x - a + slack >= k.len && x - a <= k.len + slack) { b = x; exact = true; }
                 break;
             }
-            if (!exact && a + k.len <= hi) found.push_back({{a, a + k.len, k.ref_exon}, false, k.count, 0});
         }
-        for (std::size_t e = j0; e < W.size() && W.pref[e] < hi; ++e) {
-            if (end_used[e] || !at(e, k.end_node, k.end_rev)) continue;
-            const std::size_t b = W.pref[e] + k.end_off + 1;
-            if (b <= hi && b >= lo + k.len) found.push_back({{b - k.len, b, k.ref_exon}, false, k.count, 0});
+        if (a != SIZE_MAX && b == SIZE_MAX && a + k.len <= hi) b = a + k.len;
+        if (a == SIZE_MAX)   // no first node: the last one, at the reference's length before it
+            for (std::size_t e = step_at(W, pos); e < W.size() && W.pref[e] < hi; ++e) {
+                if (!at(e, k.end_node, k.end_rev)) continue;
+                const std::size_t x = W.pref[e] + k.end_off + 1;
+                if (x <= hi && x >= pos + k.len) { a = x - k.len; b = x; break; }
+            }
+        if (a == SIZE_MAX || b == SIZE_MAX) continue;
+        out.pieces.push_back({a, b, k.ref_exon});
+        (exact ? out.exact : out.inferred) += 1;
+        pos = b;
+    }
+    return out;
+}
+
+// The exons of a tandem stretch on walk W between bases lo and hi. The walk's units start where it holds the
+// stretch's first exon start; a haplotype with the reference's number of units takes the reference's layouts
+// in order, and otherwise each unit takes the layout that places most of its exons exactly, then the one
+// of the reference unit sharing most of its nodes, then the one nearest in relative position.
+Placed tandem_exons(const Walk& W, const Tandem& tm, std::size_t lo, std::size_t hi) {
+    const Tandem::Kind& s = tm.kinds[tm.units[0][0]];
+    std::vector<std::size_t> starts;
+    for (std::size_t j = lo < W.len() ? step_at(W, lo) : W.size(); j < W.size() && W.pref[j] < hi; ++j)
+        if (W.node[j] == s.start_node && W.rev[j] == s.start_rev && W.pref[j] + s.start_off >= lo &&
+            W.pref[j] + s.start_off < hi)
+            starts.push_back(W.pref[j] + s.start_off);
+    Placed out;
+    const std::size_t n = starts.size(), k = tm.units.size();
+    for (std::size_t u = 0; u < n; ++u) {
+        const std::size_t a = starts[u], b = u + 1 < n ? starts[u + 1] : hi;
+        std::size_t pick = u;
+        Placed best;
+        if (n == k) {
+            best = place_layout(W, tm, tm.units[u], a, b);
+        } else {
+            // The unit's nodes over at most a reference unit's length (the last unit runs to the stretch's end).
+            std::vector<std::size_t> lens(tm.unit_len);
+            std::nth_element(lens.begin(), lens.begin() + lens.size() / 2, lens.end());
+            const std::size_t end = std::min(b, a + lens[lens.size() / 2]);
+            std::vector<int> nodes;
+            for (std::size_t j = step_at(W, a); j < W.size() && W.pref[j] < end; ++j) nodes.push_back(W.node[j]);
+            std::sort(nodes.begin(), nodes.end());
+            nodes.erase(std::unique(nodes.begin(), nodes.end()), nodes.end());
+            double best_share = -1.0;
+            for (std::size_t g = 0; g < k; ++g) {
+                std::vector<int> common;
+                std::set_intersection(nodes.begin(), nodes.end(), tm.unit_nodes[g].begin(), tm.unit_nodes[g].end(),
+                                      std::back_inserter(common));
+                const double share = static_cast<double>(common.size()) /
+                                     static_cast<double>(nodes.size() + tm.unit_nodes[g].size() - common.size());
+                const std::size_t near = u * k / n;
+                Placed p = place_layout(W, tm, tm.units[g], a, b);
+                const auto key = [&](const Placed& x, double sh, std::size_t gg) {
+                    return std::make_tuple(x.exact, sh, -static_cast<long>(gg > near ? gg - near : near - gg));
+                };
+                if (g == 0 || key(p, share, g) > key(best, best_share, pick)) { best = std::move(p); best_share = share; pick = g; }
+            }
+        }
+        // A walk unit missing the start (a variant there) runs over the next: its layout is placed again
+        // while more than half a unit is left and the layout still places an exon.
+        while (!best.pieces.empty()) {
+            out.pieces.insert(out.pieces.end(), best.pieces.begin(), best.pieces.end());
+            out.exact += best.exact;
+            out.inferred += best.inferred;
+            const std::size_t from = best.pieces.back().b;
+            if (b < from || b - from <= tm.unit_len[pick] / 2) break;
+            best = place_layout(W, tm, tm.units[pick], from, b);
         }
     }
-    std::sort(found.begin(), found.end(), [](const Find& x, const Find& y) {
-        return std::tie(y.exact, y.count, x.off, x.p.a) < std::tie(x.exact, x.count, y.off, y.p.a);
-    });
-    std::vector<Piece> kept;
-    for (const Find& f : found) {
-        bool clash = false;
-        for (const Piece& q : kept) clash |= f.p.a < q.b && q.a < f.p.b;
-        if (clash) continue;
-        kept.push_back(f.p);
-        *inferred += !f.exact;
-    }
-    std::sort(kept.begin(), kept.end(), [](const Piece& x, const Piece& y) { return x.a < y.a; });
-    return kept;
+    return out;
 }
 
 // One transcript through one pass.
@@ -509,8 +589,9 @@ HstRecord project_one(const Walk& R, const std::string& rseq, const Gene& g, con
             // Between the exons around the stretch, or the pass's ends where the stretch ends the transcript.
             const std::size_t lo = tm.lo > 0 ? hx[tm.lo - 1].second : W.pref[static_cast<std::size_t>(p.match[p.first])];
             const std::size_t hi = tm.hi + 1 < n ? hx[tm.hi + 1].first : W.pref[static_cast<std::size_t>(p.match[p.last]) + 1];
-            std::size_t inferred = 0;
-            const std::vector<Piece> found = tandem_exons(W, tm, lo, hi, &inferred);
+            const Placed placed = tandem_exons(W, tm, lo, hi);
+            const std::vector<Piece>& found = placed.pieces;
+            const std::size_t inferred = placed.inferred;
             if (found.empty()) {
                 missing = true;
                 add_detail(r.detail, "tandem:missing");
@@ -973,6 +1054,15 @@ TranscriptsResult project_transcripts(const Graph& graph, const TranscriptsOptio
             if (project) got[k] = project_haplotype(b0 + k);
             add_annotated(b0 + k, got[k]);
         });
+        // The reference walk must give back every transcript as annotated, in one of its copies.
+        for (std::size_t k = 0; k < got.size(); ++k) {
+            if (!project || &graph.paths[b0 + k] != ref_path) continue;
+            std::vector<char> back(res.transcripts.size(), 0);
+            for (const HstRecord& r : got[k])
+                if ((r.source & kProjected) && r.sequence == res.reference_sequences[r.transcript]) back[r.transcript] = 1;
+            for (std::size_t x = 0; x < back.size(); ++x)
+                if (!back[x]) res.not_given_back.push_back(res.transcripts[x].transcript_id);
+        }
         for (const auto& recs : got) sink.add(res, recs);
     }
     return res;

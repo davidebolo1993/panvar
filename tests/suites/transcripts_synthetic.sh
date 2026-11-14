@@ -50,7 +50,9 @@ for c in $(python3 "$TOOLS/transcript_fixture.py" cases); do
   python3 "$TOOLS/transcript_fixture.py" write "$c" "case_$c"
   extra=()
   [[ -e "case_$c/hap_annotations.tsv" ]] && extra=(--hap-annotations "case_$c/hap_annotations.tsv" --contig-alias "case_$c/alias.tsv")
-  "$BIN" transcripts -i "case_$c/locus.gfa" -r ref --gtf "case_$c/genes.gtf" -o "case_$c/out" -t 2 -q ${extra[@]+"${extra[@]}"}
+  "$BIN" transcripts -i "case_$c/locus.gfa" -r ref --gtf "case_$c/genes.gtf" -o "case_$c/out" -t 2 -q ${extra[@]+"${extra[@]}"} \
+    2> "case_$c/log"
+  check "case $c: the reference walk gives back its annotation" '! grep -q "does not give back" "case_$c/log"'
   check "case $c: every row matches the haplotypes' own transcripts" 'python3 "$TOOLS/transcript_fixture.py" check "case_$c" "case_$c/out" > "case_$c/check.log"; cat "case_$c/check.log"; grep -q "wrong: 0" "case_$c/check.log"'
 done
 

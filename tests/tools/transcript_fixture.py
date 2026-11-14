@@ -66,6 +66,8 @@ CASES = {
         reversed={"h2": "h1"}),
     # exons inside a repeat unit the reference walks three times and haplotypes 1, 3 or 5 times
     "tandem": dict(units={"ref": 3, "h1": 1, "h2": 5, "h3": 3}, reversed={"h4": "h2"}),
+    # reference units whose exons differ in length (100, 150, 100 bases from one start)
+    "tandem_layout": dict(units={"ref": 3, "h1": 3, "h2": 1, "h3": 5}, layout=[400, 450, 400], reversed={"h4": "h1"}),
     # the main case with haplotypes' own annotations (write_annotated)
     "annotated": dict(),
 }
@@ -223,27 +225,40 @@ def name(h, L):
 
 
 def write_tandem(case, d):
-    """Flank A (2 kb), a 1 kb unit walked n times over the same three nodes, flank B (2 kb). Gene GT has an
-    exon in A, one in each unit and one in B, so each haplotype's transcript has n unit exons."""
+    """Flank A (2 kb), a 1 kb unit walked n times over the same nodes, flank B (2 kb). Gene GT has an exon in
+    A, one in each unit and one in B, so each haplotype's transcript has n unit exons. The reference's unit
+    exons start at one node and end at base 400 or 450 of the unit (`layout`, per reference unit); a
+    haplotype's unit j takes the layout of reference unit j when the counts agree, else of unit j * k / n.
+    `insert` puts 150 bases inside the exon of one unit of a haplotype."""
     rnd = random.Random(11)
     seq = lambda n: "".join(rnd.choice("ACGT") for _ in range(n))
-    A, U, B = list(seq(2000)), list(seq(1000)), list(seq(2000))
-    A[1600:1602], U[298:300], U[400:402], B[498:500] = "GT", "AG", "GT", "AG"
+    A, U, B, I = list(seq(2000)), list(seq(1000)), list(seq(2000)), seq(150)
+    A[1600:1602], U[298:300], U[400:402], U[450:452], B[498:500] = "GT", "AG", "GT", "GT", "AG"
     A, U, B = "".join(A), "".join(U), "".join(B)
-    nodes = {"1": A, "2": U[:300], "3": U[300:400], "4": U[400:], "5": B}
-    walk = lambda n: ["1"] + ["2", "3", "4"] * n + ["5"]
-    walks = {h: [(x, "+") for x in walk(n)] for h, n in case["units"].items()}
-    for h, src in case["reversed"].items():
-        walks[h] = [(x, "-") for x in reversed(walk(case["units"][src]))]
-    k = case["units"]["ref"]
+    nodes = {"1": A, "2": U[:300], "3": U[300:350], "4": U[350:400], "5": U[400:450], "6": U[450:], "7": B, "8": I}
+    units, k = case["units"], case["units"]["ref"]
+    layout = case.get("layout", [400] * k)
+    insert = case.get("insert", {})
+
+    def walk(h, n):
+        w = ["1"]
+        for j in range(n):
+            w += ["2", "3", "8", "4", "5", "6"] if insert.get(h) == j else ["2", "3", "4", "5", "6"]
+        return w + ["7"]
+
+    walks = {h: [(x, "+") for x in walk(h, n)] for h, n in units.items()}
+    for h, src in case.get("reversed", {}).items():
+        walks[h] = [(x, "-") for x in reversed(walk(src, units[src]))]
     L = 2000 + 1000 * k + 2000
-    exons = [(1500, 1600)] + [(2000 + 1000 * u + 300, 2000 + 1000 * u + 400) for u in range(k)] + [(2000 + 1000 * k + 500, 2000 + 1000 * k + 600)]
+    exons = ([(1500, 1600)] + [(2000 + 1000 * u + 300, 2000 + 1000 * u + layout[u]) for u in range(k)] +
+             [(2000 + 1000 * k + 500, 2000 + 1000 * k + 600)])
     with open(f"{d}/locus.gfa", "w") as out:
         out.write("H\tVN:Z:1.0\n")
         for n, s in nodes.items():
             out.write(f"S\t{n}\t{s}\n")
-        for e in ("1\t+\t2\t+", "2\t+\t3\t+", "3\t+\t4\t+", "4\t+\t2\t+", "4\t+\t5\t+"):
-            out.write(f"L\t{e}\t0M\n")
+        for e in ("1 2", "2 3", "3 4", "3 8", "8 4", "4 5", "5 6", "6 2", "6 7"):
+            a, b = e.split()
+            out.write(f"L\t{a}\t+\t{b}\t+\t0M\n")
         for h, steps in walks.items():
             out.write(f"P\t{name(h, L)}\t{','.join(n + o for n, o in steps)}\t*\n")
     attr = 'gene_id "GT"; gene_name "GT"; gene_biotype "protein_coding"; transcript_id "TT1"; transcript_name "TT1"; tag "Ensembl_canonical";'
@@ -254,9 +269,16 @@ def write_tandem(case, d):
     with open(f"{d}/expected.tsv", "w") as out:
         out.write("transcript_id\tgene_name\thaplotype\tcopy\tstatus\tdetail\tsequence\n")
         for h in walks:
-            n = case["units"][case["reversed"].get(h, h)]
-            note = f"tandem:{k}>{n}" if n != k else "."
-            out.write(f"TT1\tGT\t{name(h, L)}\t1\tok\t{note}\t{A[1500:1600] + U[300:400] * n + B[500:600]}\n")
+            src = case.get("reversed", {}).get(h, h)
+            n = units[src]
+            notes = [f"tandem:{k}>{n}"] if n != k else []
+            body = ""
+            for j in range(n):
+                end = layout[j if n == k else j * k // n]
+                body += U[300:350] + (I if insert.get(src) == j else "") + U[350:end]
+            if src in insert:
+                notes.append("tandem_resized:1")
+            out.write(f"TT1\tGT\t{name(h, L)}\t1\tok\t{';'.join(notes) or '.'}\t{A[1500:1600] + body + B[500:600]}\n")
 
 
 def write_annotated(d):
@@ -324,7 +346,7 @@ def write_annotated(d):
 
 def write(case_name, d):
     case = CASES[case_name]
-    if case_name == "tandem":
+    if case_name.startswith("tandem"):
         return write_tandem(case, d)
     if case_name == "annotated":
         return write_annotated(d)

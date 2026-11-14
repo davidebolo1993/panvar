@@ -81,6 +81,7 @@ struct TranscriptsResult {
     std::vector<std::string> haplotypes;           // path names, Graph::paths order
     std::vector<AnnotatedTranscript> annotated;    // the haplotypes' own transcripts
     std::vector<char> has_annotation;              // per path: its haplotype has an annotation
+    std::vector<std::string> not_given_back;       // transcripts the reference walk does not give back as annotated
 };
 
 // Projects every transcript of the GTF with an exon on the reference path onto every path of `graph`, and

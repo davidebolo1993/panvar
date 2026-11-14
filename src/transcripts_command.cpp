@@ -230,6 +230,13 @@ int run_transcripts_command(const std::vector<std::string>& args) {
     const TranscriptsResult res = project_transcripts(graph, opt, sink);
     sink.finish(res, staged.stage(summary));
     if (!res.reference.empty()) log.info("reference: " + res.reference);
+    if (!res.not_given_back.empty()) {
+        std::string ids;
+        for (std::size_t k = 0; k < res.not_given_back.size() && k < 10; ++k) ids += (k ? "," : "") + res.not_given_back[k];
+        std::cerr << cli::log_prefix("transcripts") << "warning: the reference walk does not give back "
+                  << res.not_given_back.size() << " transcript(s) as annotated: " << ids
+                  << (res.not_given_back.size() > 10 ? ",..." : "") << '\n';
+    }
     if (!opt.hap_annotations.empty())
         log.info("haplotypes' own transcripts on their paths: " + std::to_string(res.annotated.size()));
     std::size_t genes = 0;
