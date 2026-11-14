@@ -10,7 +10,7 @@ Projects a reference annotation onto every haplotype walk of a locus graph. Each
 - Exons inside a repeat unit of the gene follow the haplotype's own number of units.
 - A transcript whose exon the haplotype lacks is reported and not written, so other transcripts of the gene still are.
 - An exon boundary that falls inside a variant is moved to the nearest base the haplotype shares with the reference, and flagged.
-- Each HST carries its source, `projected`, so transcripts from other annotations can join them later.
+- A haplotype's own annotation (`--hap-annotations`, e.g. HPRC's CAT or Liftoff) adds its transcripts, cut straight from the walk: isoforms and copies the reference annotation lacks. Each HST carries its source: `projected`, `annotated`, or both.
 
 ## How it works
 
@@ -30,17 +30,22 @@ Projects a reference annotation onto every haplotype walk of a locus graph. Each
 
 8. The exons are cut from the walk with the haplotype's alleles and joined in transcript order; a minus-strand transcript is reverse-complemented. The two splice-site bases at each end of every intron are compared with the reference's; an intron the haplotype shortens below those four bases is lost, and its exons are joined.
 
+9. A haplotype's own annotation is in its assembly's coordinates, and the haplotype's path names its contig and interval (`sample#hap#contig:start-end`, the start 0-based as pggb writes it). Its transcripts with an exon on the path are cut from the walk at those coordinates, strand-aware; one reaching past the path is cut at its ends (`clipped_at_edge`). Its copies are the annotation's: each gene record is one copy, numbered along the walk. An annotated transcript with the same id, copy and sequence as a projected one is that record, of both sources (`projected+annotated`); any other is written beside the projected ones, so where the two disagree both stay.
+
 ## Required inputs
 
 - `-i, --gfa <graph.gfa>`: a locus GFA (plain or gzipped) with one P or W line per haplotype
-- `-r, --reference-path <name>`: the reference path; a unique part of the name is enough. Its name must carry `contig:start-end`, as for `bubble --gtf`
 - `--gtf <path>`: the annotation in reference coordinates (Ensembl or GENCODE, plain or gzipped); its `exon` rows give the exons, its `CDS` rows the coding parts
+- `-r, --reference-path <name>`, with `--gtf`: the reference path; a unique part of the name is enough. Its name must carry `contig:start-end`, as for `bubble --gtf`
+- or `--hap-annotations <table.tsv>` alone, for annotated transcripts only (below); both together give both sources
 - `-o, --out-prefix <prefix>`: output prefix
 
 ## Key options
 
 | flag | what it does | default |
 |------|--------------|---------|
+| `--hap-annotations <tsv>` | haplotypes' own annotations: one row per haplotype, `haplotype` (`sample#hap`, as in the path names) and `path` (its GFF3 or GTF, plain or gzipped); a header row naming `haplotype` is skipped | — |
+| `--contig-alias <tsv>` | contig names of the annotations matched to the paths' contigs: each row lists names of one contig (a chromAlias table works); without it a name matches as it is, or once a `sample#hap#` prefix is removed | — |
 | `--min-exon-share <F>` | the share of the marker's exonic bases a pass must walk to count as a copy; a lower value also counts partial copies | `0.8` |
 | `-t, --threads <N>` | worker threads, one haplotype each (`0` = all cores) | `0` |
 | `-q, --quiet` | no progress logs | off |
@@ -49,7 +54,7 @@ Projects a reference annotation onto every haplotype walk of a locus graph. Each
 
 | file | contents |
 |------|----------|
-| `<prefix>.hst.fa` | one sequence per HST, 5' to 3', named `transcript|gene|haplotype|copy`, with `source=` and `status=` after the name |
+| `<prefix>.hst.fa` | one sequence per HST, 5' to 3', named `transcript|gene|haplotype|copy` (`|annotated` added to an annotated transcript written beside a projected one), with `source=` and `status=` after the name |
 | `<prefix>.hst.tsv` | one row per transcript, haplotype and copy, a row with copy 0 where the haplotype has no copy |
 | `<prefix>.hst.summary.tsv` | one row per gene: copies per haplotype and rows per status |
 
@@ -60,7 +65,7 @@ Projects a reference annotation onto every haplotype walk of a locus graph. Each
 | `transcript_id`, `transcript_name`, `gene_id`, `gene_name`, `biotype`, `strand` | the transcript, from the GTF |
 | `haplotype` | the path |
 | `copy`, `copies` | this copy, numbered along the walk as written, and the gene's copies on the walk |
-| `source` | `projected` |
+| `source` | `projected`, `annotated` (from the haplotype's annotation; `orientation` is `.`, and `ref_length`, `ref_exons` are the projected transcript's of that id, if any) or `projected+annotated` (both, the same sequence) |
 | `status` | below |
 | `orientation` | `+` where the walk passes the gene in the reference's orientation, `-` where it passes it reversed |
 | `path_start`, `path_end` | the HST's first and last exonic base on the walk as written, 0-based, end excluded |
@@ -82,14 +87,15 @@ Statuses, most severe first:
 - `splice_site_changed`: a splice site differs from the reference's;
 - `ok`: every boundary carried exactly.
 
-`hst.summary.tsv` has one row per gene, in reference order: `transcripts` projected, of which `clipped` reach past the reference path, and `outside` (transcripts with no exon on the path, not projected), `haplotypes_by_copies` (`0:2,1:120,2:9` is 2 haplotypes with no copy, 120 with one, 9 with two), `hsts` written, `same_as_ref`, and the rows of each status.
+`hst.summary.tsv` has one row per gene, in reference order: `transcripts` projected, of which `clipped` reach past the reference path, and `outside` (transcripts with no exon on the path, not projected), `haplotypes_by_copies` (`0:2,1:120,2:9` is 2 haplotypes with no copy, 120 with one, 9 with two), `hsts` written, `same_as_ref`, `annotated` (HSTs from the haplotypes' annotations), the rows of each status, and `copies_differ`: each haplotype with an annotation whose copies of the gene differ from the projection's, as `sample#hap:projected/annotated`.
 
 ## Limitations
 
 - A copy is found through the nodes it shares with the reference copy. A copy the graph keeps on nodes of its own, neither folded onto the reference nor aligned to it, is not found.
 - Tandem exons are found by their first and last nodes, so a unit whose exon differs from every reference unit at both ends is not found; `tandem:14>46` gives the count against the reference's.
 - A copy mixing the differences of two near-identical paralogs goes to the one it shares more coding bases with; `rival` in `detail` gives the margin.
-- Only the reference annotation is projected, so isoforms and genes the reference lacks are not found. A changed splice site is reported, not judged: its transcript is still written.
+- Only the reference annotation is projected, so isoforms and genes the reference lacks are found only through a haplotype's own annotation. A changed splice site is reported, not judged: its transcript is still written.
+- An annotated transcript joins a projected one only by the same transcript id and copy number (for CAT, its source transcript); an annotation from another source (RefSeq ids in Liftoff) stays beside the projected transcripts.
 
 ## Example
 
@@ -98,6 +104,11 @@ Statuses, most severe first:
 panvar transcripts -i locus.gfa.gz -r GRCh38 --gtf genes.gtf.gz -o locus
 # count partial copies too
 panvar transcripts -i locus.gfa.gz -r GRCh38 --gtf genes.gtf.gz -o locus --min-exon-share 0.5 -t 2
+# with the haplotypes' own annotations beside the projected ones
+panvar transcripts -i locus.gfa.gz -r GRCh38 --gtf genes.gtf.gz --hap-annotations hap_annotations.tsv \
+  --contig-alias chrom_alias.tsv -o locus
+# the haplotypes' own annotations alone
+panvar transcripts -i locus.gfa.gz --hap-annotations hap_annotations.tsv -o locus
 ```
 
 `scripts/transcripts_examples.sh` projects the loci GTF onto the paralog graphs in `tests/real_data` and prints each gene's copies per haplotype, in `tests/examples/transcripts`.
