@@ -180,8 +180,10 @@ std::vector<AnnotatedTranscript> load_hap_annotations(const Graph& graph, const 
                 const std::string tid = first_of(a, {"gene_id"}) + '\t' + first_of(a, {"transcript_id"});
                 if (tid.size() == 1) continue;
                 (c[2] == "exon" ? exons : cds)[tid].emplace_back(s, e);
+                // its attributes from its first exon row, or from a coding row until an exon row comes, so the
+                // result does not depend on the rows' order
                 Feature& t = exon_tx[tid];
-                if (t.seqid.empty()) t = {c[0], c[6] == "-" ? '-' : '+', std::move(a), "transcript", {}};
+                if (t.seqid.empty() || (c[2] == "exon" && t.type != "exon")) t = {c[0], c[6] == "-" ? '-' : '+', std::move(a), c[2], {}};
                 continue;
             }
             if (c[2] == "exon" || c[2] == "CDS") {
@@ -261,7 +263,7 @@ std::vector<AnnotatedTranscript> load_hap_annotations(const Graph& graph, const 
             if (at.t.gene_id.empty()) at.t.gene_id = at.t.gene_name;
             at.gene_key = sg.empty() ? at.t.gene_name : at.t.gene_id;
             at.t.biotype = first_of(ta, {"transcript_biotype", "transcript_type", "biotype"});
-            if (at.t.biotype.empty()) at.t.biotype = tx->type;
+            if (at.t.biotype.empty()) at.t.biotype = gtf ? "transcript" : tx->type;
             at.gene_record = gtf ? first_of(ta, {"gene_id"}) : gene ? tx->parents[0] : tid;
             at.record = gtf ? first_of(ta, {"transcript_id"}) : tid;
             for (const char* k : {"source_transcript", "source_gene", "transcript_class", "alignment_mode"}) {

@@ -387,6 +387,11 @@ def write_annotated(d):
         # the two records share their source gene under different names: one gene, two copies
         attr = f'gene_id "gc{k}"; gene_name "{"GC" if k == 1 else "GCALT"}"; transcript_id "TC1"; source_gene "GC.1";'
         h5 += [f'ctg5\tCAT\texon\t{pos(m, a)}\t{pos(m, b - 1)}\t.\t+\t.\t{attr}\n' for a, b in case["genes"]["GC"][1]["TC1"]]
+    # a GTF transcript whose CDS row comes before its exon row with other attributes: the exon row's count
+    m5 = maps["h5"][0]
+    h5 += [f'ctg5\tCAT\tCDS\t{pos(m5, 10020)}\t{pos(m5, 10079)}\t.\t+\t0\tgene_id "gv"; gene_name "WRONG"; transcript_id "TV1"; transcript_name "WRONG";\n',
+           f'ctg5\tCAT\texon\t{pos(m5, 10000)}\t{pos(m5, 10099)}\t.\t+\t.\tgene_id "gv"; gene_name "GV"; transcript_id "TV1"; transcript_name "TV1";\n']
+    rows.append(("TV1", "GV", "h5", 1, "ok", ".", seqs["h5"][m5[10000]:m5[10099] + 1], "TV1"))
     for h, lines, ext in (("h1", h1, "gff3"), ("h2", h2, "gff3"), ("h3", h3, "gff3"), ("h5", h5, "gtf")):
         with open(f"{d}/{h}.{ext}", "w") as out:
             out.write("##gff-version 3\n" if ext == "gff3" else "")
@@ -456,7 +461,7 @@ def check(d, prefix):
         for line in fh:
             t, g, h, c, st, det, s, *src = line.rstrip("\n").split("\t")
             source = src[0] if src else "projected"
-            exp[(t, h, c, source, src[1] if source == "annotated" else ".")] = (st, det, s)
+            exp[(t, h, c, source, src[1] if source == "annotated" else ".")] = (st, det, s, g)
     got, fa = {}, {}
     with open(f"{prefix}.hst.fa") as fh:
         for line in fh:
@@ -484,9 +489,11 @@ def check(d, prefix):
             print(f"  row {'missing' if k not in got else 'unexpected'}: {k}")
             bad += 1
             continue
-        st, det, s = exp[k]
+        st, det, s, g = exp[k]
         r, seq = got[k]
         problems = []
+        if r["gene_name"] != g:
+            problems.append(f"gene {r['gene_name']} != {g}")
         if r["status"] != st:
             problems.append(f"status {r['status']} != {st}")
         if det != "." and not all(x in r["detail"].split(";") for x in det.split(";")):
