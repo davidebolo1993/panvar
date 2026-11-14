@@ -87,6 +87,11 @@ check "--transcripts-splice-changed takes it: its junction joins the index ($(tx
   '[[ "$(tx idxc.locus.tsv)" == "P$((J + JS)) S0 R0" ]] && grep -q "rebuilding" sc2.txt && grep -q "splice_site_changed 1/1" sc2.txt && grep -q "with changed splice sites" idxc/locus.index.tsv'
 "${RC[@]}" --save-index idxc --locus data/locus.gfa --transcripts data/sc.hst.fa --transcripts-splice-changed --transcripts-ok-only 2> sc3.txt
 check "with --transcripts-ok-only it is refused" 'grep -q "not both" sc3.txt'
+cp data/locus.hst.fa data/short.hst.fa   # a table whose first row was cut short
+{ sed -n 1p data/locus.hst.tsv; sed -n 2p data/locus.hst.tsv | cut -f1-10; sed -n '3,$p' data/locus.hst.tsv; } > data/short.hst.tsv
+"${RC[@]}" --save-index idxt --locus data/locus.gfa --transcripts data/short.hst.fa 2> short.txt; rc=$?
+check "a table row with fewer fields than the header is skipped with a warning" \
+  '[[ $rc -eq 0 ]] && grep -q "warning: locus: locus; .*short.hst.tsv: 1 row(s) with fewer fields than the header" short.txt'
 "${RC[@]}" --save-index idx3 --locus data/locus.gfa --transcripts other=data/locus.hst.fa 2> bad.txt
 check "transcripts for a locus not given are refused" 'grep -q "no --locus graph is named other" bad.txt'
 

@@ -81,6 +81,10 @@ CASES = {
                            order=["S", "E", "M", "E", "T"], layout=[[(0, 550)]] * 3),
     # a reference unit without exons between two with
     "tandem_empty": dict(units={"ref": 3, "h1": 3, "h2": 4, "h3": 2}, layout=[[(300, 400)], [], [(300, 400)]]),
+    # an exon that passes its own first node again: the starts there are no units, and the exons are left to
+    # the nodes
+    "tandem_overrun": dict(units={"ref": 3, "h1": 3}, pieces=[("E", 50), ("M", 400), ("T", 500)],
+                           order=["E", "M", "E", "T"], layout=[[(0, 500)]] * 3, reversed={"h2": "h1"}),
     # exon boundaries inside a substitution block: one that keeps the splice site, one that changes it
     "substitution": dict(
         L=5000,

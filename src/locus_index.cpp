@@ -184,7 +184,7 @@ using TranscriptFn = std::function<void(const std::string& seq, const std::funct
 void for_each_transcript(const std::string& fa, const Graph& g, const std::vector<std::string>& node_names, bool ok_only,
                          bool splice_changed, std::uint64_t& used, std::uint64_t& skipped,
                          std::map<std::string, std::array<std::uint64_t, 2>>& by_status, std::set<std::string>& genes,
-                         const TranscriptFn& fn) {
+                         std::uint64_t& short_rows, const TranscriptFn& fn) {
     // the exons of each record on its path, and its gene's id, from the table
     struct Place { std::string path, gene_id; bool forward = true; std::vector<std::uint64_t> starts, lengths; };
     std::unordered_map<std::string, Place> place;
@@ -207,7 +207,8 @@ void for_each_transcript(const std::string& fa, const Graph& g, const std::vecto
             std::vector<std::string> f;
             std::stringstream ss(line);
             for (std::string x; std::getline(ss, x, '\t');) f.push_back(x);
-            if (f.size() < col.size() || f[col["exon_starts"]] == ".") continue;
+            if (f.size() < col.size()) { ++short_rows; continue; }   // a cut row: its transcript is placed on no node
+            if (f[col["exon_starts"]] == ".") continue;
             std::string key = f[col["transcript_id"]] + "|" + f[col["gene_name"]] + "|" + f[col["haplotype"]] + "|" + f[col["copy"]];
             if (has_source && f[col["source"]] == "annotated") key += "|annotated:" + f[col["record"]];
             Place p;
@@ -670,10 +671,14 @@ std::vector<LocusIndex> build(const BuildOptions& o) {
             x.transcripts_splice_changed = o.transcripts_splice_changed;
             x.transcriptome = bg::transcriptome_id(m);
             std::map<std::string, std::array<std::uint64_t, 2>> by_status;
+            std::uint64_t short_rows = 0;
             collect_kmers(g, x, present, [&](const TranscriptFn& fn) {
                 for_each_transcript(tx, g, node_names, o.transcripts_ok_only, o.transcripts_splice_changed, x.transcripts_used,
-                                    x.transcripts_skipped, by_status, w.genes, fn);
+                                    x.transcripts_skipped, by_status, w.genes, short_rows, fn);
             });
+            if (short_rows > 0)
+                log("warning: locus: " + x.name + "; " + transcripts_table(tx) + ": " + std::to_string(short_rows) +
+                    " row(s) with fewer fields than the header, skipped: their transcripts' k-mers are placed on no node");
             for (const auto& [status, n] : by_status)
                 x.transcripts_by_status += (x.transcripts_by_status.empty() ? "" : ", ") + status + " " + std::to_string(n[0]) + "/" + std::to_string(n[1]);
             log("locus: " + x.name + "; transcripts taken of all, by status: " + x.transcripts_by_status);

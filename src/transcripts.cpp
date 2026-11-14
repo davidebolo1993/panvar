@@ -511,6 +511,16 @@ Tandem find_tandem(const Walk& R, const std::string& rseq, const Cuts& cuts, con
         un.kmers = unit_kmers(un.seq);
         t.units.push_back(std::move(un));
     }
+    // Units of one repeat are of comparable length, and each holds its exons whole. Equal starts that are not
+    // (a node the reference walks twice for another reason) are no tandem stretch: the exons are left to
+    // their nodes.
+    bool units = lens.empty() || lens.back() <= 2 * lens.front();
+    for (std::size_t u = 0; u < occ.size() && units; ++u) {
+        const std::size_t a = occ[u], b = u + 1 < occ.size() ? occ[u + 1] : last_end;
+        for (std::size_t k = t.lo; k <= t.hi; ++k)
+            if (cuts[k].first >= a && cuts[k].first < b && cuts[k].second > b) units = false;
+    }
+    if (!units) return Tandem{};
     t.min_len = SIZE_MAX;
     for (const auto& un : t.units) t.min_len = std::min(t.min_len, un.seq.size());
     for (const bool at_start : {true, false})
