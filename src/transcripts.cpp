@@ -22,6 +22,7 @@ const char* hst_status_name(HstStatus s) {
         case HstStatus::Ok: return "ok";
         case HstStatus::SpliceSiteChanged: return "splice_site_changed";
         case HstStatus::BoundaryMoved: return "boundary_moved";
+        case HstStatus::ClippedAtEdge: return "clipped_at_edge";
         case HstStatus::IntronLost: return "intron_lost";
         case HstStatus::MissingExon: return "missing_exon";
         case HstStatus::NoCopy: return "no_copy";
@@ -353,12 +354,16 @@ std::string signed_text(long v) { return (v > 0 ? "+" : "") + std::to_string(v);
 
 // One transcript through one pass.
 HstRecord project_one(const Walk& R, const std::string& rseq, const Gene& g, const Pass& p, const Walk& W,
-                      const std::string& wseq, const TranscriptFeature& tx, const Cuts& cuts) {
+                      const std::string& wseq, const TranscriptFeature& tx, const Cuts& cuts,
+                      const TranscriptsResult::EdgeClip& clip) {
     HstRecord r;
     r.reverse = p.reverse;
     const std::size_t n = cuts.size();
     const bool minus = tx.strand == '-';
-    const auto exon_no = [&](std::size_t k) { return minus ? n - k : k + 1; };   // transcript order, 1-based
+    // Exons and introns are numbered in transcript order over the whole annotated transcript, 1-based.
+    const auto exon_no = [&](std::size_t k) { return minus ? clip.exons - clip.first_exon - k : clip.first_exon + k + 1; };
+    if (clip.bp_5p) add_detail(r.detail, "clipped:5':" + std::to_string(clip.bp_5p));
+    if (clip.bp_3p) add_detail(r.detail, "clipped:3':" + std::to_string(clip.bp_3p));
     std::vector<std::pair<std::size_t, std::size_t>> hx(n);
     bool missing = false;
     for (std::size_t k = 0; k < n; ++k) {
@@ -394,7 +399,7 @@ HstRecord project_one(const Walk& R, const std::string& rseq, const Gene& g, con
     // shortens below its two splice sites is lost: its exons are joined.
     bool lost = false;
     for (std::size_t k = 0; k + 1 < n; ++k) {
-        const std::size_t intron = minus ? n - 1 - k : k + 1;
+        const std::size_t intron = minus ? clip.exons - 1 - clip.first_exon - k : clip.first_exon + k + 1;
         const std::size_t rl = cuts[k].second, rr = cuts[k + 1].first;
         const std::size_t hl = hx[k].second, hr = hx[k + 1].first;
         if (rr < rl + 4) continue;
@@ -424,7 +429,8 @@ HstRecord project_one(const Walk& R, const std::string& rseq, const Gene& g, con
     const std::size_t lo = hx.front().first, hi = hx.back().second;
     r.path_start = p.reverse ? W.len() - hi : lo;
     r.path_end = p.reverse ? W.len() - lo : hi;
-    r.status = lost ? HstStatus::IntronLost : r.moved ? HstStatus::BoundaryMoved
+    r.status = lost ? HstStatus::IntronLost : clip.bp_5p + clip.bp_3p ? HstStatus::ClippedAtEdge
+             : r.moved ? HstStatus::BoundaryMoved
              : r.splice_changed ? HstStatus::SpliceSiteChanged : HstStatus::Ok;
     return r;
 }
@@ -537,8 +543,40 @@ TranscriptsResult project_transcripts(const Graph& graph, const TranscriptsOptio
         throw std::runtime_error("transcripts: reference path '" + ref_path->name +
                                  "' carries no contig:start-end, so GTF coordinates cannot be placed on it");
     const std::size_t base = meta.region_start_1based;
-    std::vector<TranscriptFeature> txs =
-        parse_gtf_transcripts(opt.gtf_path, meta.chrom, base, base + R.len() - 1, &res.partial, "transcripts");
+    const std::size_t last = base + R.len() - 1;
+    std::vector<TranscriptFeature> partial;
+    std::vector<TranscriptFeature> txs = parse_gtf_transcripts(opt.gtf_path, meta.chrom, base, last, &partial, "transcripts");
+    std::vector<TranscriptsResult::EdgeClip> tx_clip;
+    for (const TranscriptFeature& t : txs) tx_clip.push_back({t.exons.size(), 0, 0, 0});
+    // A transcript reaching past the path keeps its exons on the path, cut at the path's ends.
+    for (TranscriptFeature& t : partial) {
+        const auto cut = [&](const std::vector<std::pair<std::size_t, std::size_t>>& iv, std::size_t* left,
+                             std::size_t* right, std::size_t* first) {
+            std::vector<std::pair<std::size_t, std::size_t>> kept;
+            for (std::size_t k = 0; k < iv.size(); ++k) {
+                const auto [a, b] = iv[k];
+                if (a < base) *left += std::min(b + 1, base) - a;
+                if (b > last) *right += b - std::max(a, last + 1) + 1;
+                if (b < base || a > last) continue;
+                if (kept.empty() && first) *first = k;
+                kept.emplace_back(std::max(a, base), std::min(b, last));
+            }
+            return kept;
+        };
+        TranscriptsResult::EdgeClip c;
+        c.exons = t.exons.size();
+        std::size_t left = 0, right = 0, unused = 0;
+        t.exons = cut(t.exons, &left, &right, &c.first_exon);
+        t.cds = cut(t.cds, &unused, &unused, nullptr);
+        if (t.exons.empty()) {
+            res.outside.push_back(std::move(t));
+            continue;
+        }
+        c.bp_5p = t.strand == '-' ? right : left;
+        c.bp_3p = t.strand == '-' ? left : right;
+        txs.push_back(std::move(t));
+        tx_clip.push_back(c);
+    }
 
     // Genes, in reference order; transcripts regrouped to follow them.
     std::map<std::string, std::vector<std::size_t>> by_gene;
@@ -557,6 +595,7 @@ TranscriptsResult project_transcripts(const Graph& graph, const TranscriptsOptio
         for (const std::size_t k : by_gene[gid]) {
             g.tx.push_back(res.transcripts.size());
             res.transcripts.push_back(std::move(txs[k]));
+            res.clips.push_back(tx_clip[k]);
             const TranscriptFeature& tr = res.transcripts.back();
             Cuts c;
             for (const auto& [s, e] : tr.exons) c.emplace_back(s - base, e - base + 1);
@@ -674,7 +713,7 @@ TranscriptsResult project_transcripts(const Graph& graph, const TranscriptsOptio
                 for (std::size_t c = 0; c < gp.size(); ++c) {
                     const Pass& p = *gp[c];
                     HstRecord r = project_one(R, rseq, genes[gi], p, p.reverse ? Hr : H, p.reverse ? hrseq : hseq,
-                                              res.transcripts[k], cuts[k]);
+                                              res.transcripts[k], cuts[k], res.clips[k]);
                     r.transcript = k;
                     r.haplotype = h;
                     r.copy = static_cast<int>(c + 1);

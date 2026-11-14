@@ -35,7 +35,7 @@ check "a boundary inside a deletion moves to the nearer shared base" '[[ "$(col 
 check "a reversed walk is read in the reference orientation" '[[ "$(col TA1 h7 orientation)" == - && "$(col TA1 h7 path_start)" == 8700 && "$(col TA1 h7 path_end)" == 11000 ]]'
 check "the minus-strand transcript lists its exons 5 to 3" '[[ "$(col TB1 ref exon_starts)" == "5600,5000" && "$(col TB1 ref exon_lengths)" == "200,100" ]]'
 check "FASTA names are transcript|gene|haplotype|copy" 'grep -q "^>TC1|GC|h5#1#ctg5:0-12000|2 source=projected status=ok$" t1.hst.fa'
-check "the summary counts copies per haplotype" '[[ "$(awk -F"\t" "\$2==\"GC\"{print \$5}" t1.hst.summary.tsv)" == "0:1,1:6,2:2" ]]'
+check "the summary counts copies per haplotype" '[[ "$(awk -F"\t" "\$2==\"GC\"{print \$6}" t1.hst.summary.tsv)" == "0:1,1:6,2:2" ]]'
 
 # the checker refuses a table or FASTA naming one transcript, haplotype and copy twice
 { cat t1.hst.tsv; sed -n 2p t1.hst.tsv; } > dup_row.hst.tsv; cp t1.hst.fa dup_row.hst.fa

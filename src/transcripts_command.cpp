@@ -87,21 +87,27 @@ public:
         cli::close_output(fa_, fa_path_);
         cli::close_output(tsv_, tsv_path_);
         std::map<std::string, std::pair<std::string, std::size_t>> tx, out;
-        for (const TranscriptFeature& t : res.transcripts) { tx[t.gene_id].first = t.gene_name; ++tx[t.gene_id].second; }
-        for (const TranscriptFeature& t : res.partial) { out[t.gene_id].first = t.gene_name; ++out[t.gene_id].second; }
+        std::map<std::string, std::size_t> clipped;
+        for (std::size_t k = 0; k < res.transcripts.size(); ++k) {
+            const TranscriptFeature& t = res.transcripts[k];
+            tx[t.gene_id].first = t.gene_name;
+            ++tx[t.gene_id].second;
+            clipped[t.gene_id] += res.clips[k].bp_5p + res.clips[k].bp_3p > 0;
+        }
+        for (const TranscriptFeature& t : res.outside) { out[t.gene_id].first = t.gene_name; ++out[t.gene_id].second; }
         std::vector<std::string> order;   // projected genes in reference order, then genes only partly inside
         for (const TranscriptFeature& t : res.transcripts)
             if (order.empty() || order.back() != t.gene_id) order.push_back(t.gene_id);
         for (const auto& [gid, v] : out) if (!tx.count(gid)) order.push_back(gid);
         std::ofstream s(summary_path);
         if (!s) throw std::runtime_error("transcripts: cannot write " + summary_path);
-        s << "gene_id\tgene_name\ttranscripts\toutside\thaplotypes_by_copies\thsts\tsame_as_ref";
+        s << "gene_id\tgene_name\ttranscripts\tclipped\toutside\thaplotypes_by_copies\thsts\tsame_as_ref";
         for (int k = 0; k < kHstStatuses; ++k) s << '\t' << hst_status_name(static_cast<HstStatus>(k));
         s << '\n';
         for (const std::string& gid : order) {
             const Tally& g = genes_[gid];
             const std::string name = tx.count(gid) ? tx[gid].first : out[gid].first;
-            s << gid << '\t' << name << '\t' << (tx.count(gid) ? tx[gid].second : 0) << '\t'
+            s << gid << '\t' << name << '\t' << (tx.count(gid) ? tx[gid].second : 0) << '\t' << clipped[gid] << '\t'
               << (out.count(gid) ? out[gid].second : 0) << '\t';
             std::string bc;
             for (const auto& [c, n] : g.by_copies) bc += (bc.empty() ? "" : ",") + std::to_string(c) + ":" + std::to_string(n);
@@ -179,8 +185,11 @@ int run_transcripts_command(const std::vector<std::string>& args) {
     std::size_t genes = 0;
     for (std::size_t k = 0; k < res.transcripts.size(); ++k)
         genes += k == 0 || res.transcripts[k].gene_id != res.transcripts[k - 1].gene_id;
+    std::size_t clipped = 0;
+    for (const TranscriptsResult::EdgeClip& c : res.clips) clipped += c.bp_5p + c.bp_3p > 0;
     log.info("transcripts: " + std::to_string(res.transcripts.size()) + " in " + std::to_string(genes) +
-             " genes; reaching past the reference path, not projected: " + std::to_string(res.partial.size()));
+             " genes, " + std::to_string(clipped) + " cut at the reference path's ends; with no exon on the path: " +
+             std::to_string(res.outside.size()));
     log.info("haplotype-specific transcripts: " + std::to_string(sink.hsts()));
     staged.commit();
     log.wrote({fa, tsv, summary});

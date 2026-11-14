@@ -33,8 +33,8 @@ struct TranscriptsOptions {
 };
 
 // Least to most severe; a record takes the most severe that applies.
-enum class HstStatus { Ok, SpliceSiteChanged, BoundaryMoved, IntronLost, MissingExon, NoCopy };
-constexpr int kHstStatuses = 6;
+enum class HstStatus { Ok, SpliceSiteChanged, BoundaryMoved, ClippedAtEdge, IntronLost, MissingExon, NoCopy };
+constexpr int kHstStatuses = 7;
 const char* hst_status_name(HstStatus s);
 
 // One transcript on one haplotype copy.
@@ -59,12 +59,20 @@ struct HstRecord {
 struct TranscriptsResult {
     std::string reference;                         // resolved reference path name
     std::vector<TranscriptFeature> transcripts;    // projected transcripts, gene-grouped
-    std::vector<TranscriptFeature> partial;        // transcripts reaching past the reference path
+    // Per transcript, what lies past the reference path's ends: a transcript reaching past them is projected
+    // from its exons on the path, cut at its ends.
+    struct EdgeClip {
+        std::size_t exons = 0;        // exons in the annotation
+        std::size_t first_exon = 0;   // the first one on the path, in genomic order (0-based)
+        std::size_t bp_5p = 0, bp_3p = 0;   // annotated exonic bases past the path, at each end of the transcript
+    };
+    std::vector<EdgeClip> clips;
+    std::vector<TranscriptFeature> outside;        // transcripts with no exon on the reference path
     std::vector<std::string> reference_sequences;  // per transcript, spliced from the reference
     std::vector<std::string> haplotypes;           // path names, Graph::paths order
 };
 
-// Projects every transcript of the GTF lying on the reference path onto every path of `graph`. Records
+// Projects every transcript of the GTF with an exon on the reference path onto every path of `graph`. Records
 // reach `sink` haplotype by haplotype, in path order and gene, transcript, copy order within one.
 class HstSink {
 public:

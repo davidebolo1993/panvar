@@ -57,6 +57,13 @@ CASES = {
         haps={"h1": [("del", (1200, 2000)), ("del", (4100, 4300))], "h2": [("del", (1202, 1998))],
               "h3": [("del", (2150, 3050))]},
         reversed={"h4": "h1"}),
+    # transcripts reaching past either end of the reference path, and one with no exon on it
+    "edge": dict(
+        L=5000,
+        genes={"GD": ("+", {"TD1": [(4500, 4700), (5100, 5300)]}), "GK": ("+", {"TK1": [(3800, 3900), (4900, 5100)]}),
+               "GH": ("-", {"TH1": [(-300, -100), (200, 400)]}), "GL": ("+", {"TL1": [(-500, -400), (5400, 5500)]})},
+        haps={"h1": [("snp", 4550)]},
+        reversed={"h2": "h1"}),
 }
 
 
@@ -174,7 +181,12 @@ def project(case, ref, hseq, m, strand, exons):
             if r != h:
                 changed = True
                 notes.append(f"i{intron}.{site}:{rc(r) if strand == '-' else r}>{rc(h) if strand == '-' else h}")
-    clipped = len(inside) < n_all or inside[0][0] != exons[first_in][0] or inside[-1][1] != exons[first_in + len(inside) - 1][1]
+    before = sum(min(b, 0) - a for a, b in exons if a < 0)   # bases past the path's start and end
+    after = sum(b - max(a, L) for a, b in exons if b > L)
+    clipped = before + after > 0
+    for end, bp in (("5'", before if strand == "+" else after), ("3'", after if strand == "+" else before)):
+        if bp:
+            notes.append(f"clipped:{end}:{bp}")
     s = "".join(hseq[a:b] for a, b in hx)
     status = ("intron_lost" if lost else "clipped_at_edge" if clipped else "boundary_moved" if moved
               else "splice_site_changed" if changed else "ok")
@@ -185,6 +197,8 @@ def expected(case, ref, seqs, maps):
     rows = []
     for h in ["ref", *case["haps"], *case.get("reversed", {})]:
         for g, (strand, txs) in case["genes"].items():
+            if not any(b > 0 and a < case["L"] for ex in txs.values() for a, b in ex):
+                continue   # no exon on the path: not projected
             lo = min(max(a, 0) for ex in txs.values() for a, b in ex if b > 0 and a < case["L"])
             hi = max(min(b, case["L"]) for ex in txs.values() for a, b in ex if b > 0 and a < case["L"])
             # copies: the maps holding the gene's bases
@@ -221,6 +235,8 @@ def write(case_name, d):
             out.write(f"P\t{name(h, case['L'])}\t{','.join(n + o for n, o in steps)}\t*\n")
     with open(f"{d}/genes.gtf", "w") as out:
         for g, (strand, txs) in case["genes"].items():
+            if not any(b > 0 and a < case["L"] for ex in txs.values() for a, b in ex):
+                continue   # no exon on the path: not projected
             lo = min(a for ex in txs.values() for a, _ in ex) + OFFSET + 1
             hi = max(b for ex in txs.values() for _, b in ex) + OFFSET
             attr = f'gene_id "{g}"; gene_name "{g}"; gene_biotype "protein_coding";'
@@ -283,7 +299,7 @@ def check(d, prefix):
             print(f"  {k}: " + "; ".join(problems))
             bad += 1
     print(f"rows checked: {len(exp)}; wrong: {bad}")
-    return 1 if bad else 0
+    return 1 if bad or not exp else 0
 
 
 if __name__ == "__main__":

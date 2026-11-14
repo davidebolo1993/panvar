@@ -13,7 +13,7 @@ Projects a reference annotation onto every haplotype walk of a locus graph. Each
 
 ## How it works
 
-1. The GTF's exons are placed on the reference path through the `contig:start-end` in its name. Each exon boundary becomes a reference node and an offset inside it, since boundaries rarely fall between nodes. A transcript reaching past the path is not projected.
+1. The GTF's exons are placed on the reference path through the `contig:start-end` in its name. Each exon boundary becomes a reference node and an offset inside it, since boundaries rarely fall between nodes. A transcript reaching past either end of the path keeps its exons on the path, cut at the path's end, so a gene at the edge of a locus still gets transcripts; one with no exon on the path is left out.
 
 2. Each gene's copies are found with one transcript, its marker: the one tagged Ensembl_canonical, else the one with the most exonic bases. Its coding exons are used where it has them, because paralogs are best told apart by what they encode.
 
@@ -62,23 +62,24 @@ Projects a reference annotation onto every haplotype walk of a locus graph. Each
 | `orientation` | `+` where the walk passes the gene in the reference's orientation, `-` where it passes it reversed |
 | `path_start`, `path_end` | the HST's first and last exonic base on the walk as written, 0-based, end excluded |
 | `length`, `exons` | the HST's length and exons |
-| `ref_length`, `ref_exons` | the same on the reference |
+| `ref_length`, `ref_exons` | the same on the reference path (the part on the path, for a transcript reaching past it) |
 | `same_as_ref` | whether the HST is the reference transcript's sequence |
 | `moved_boundaries` | exon boundaries moved off a variant |
 | `changed_splice_sites` | intron ends whose two splice-site bases differ from the reference's |
 | `exon_starts`, `exon_lengths` | each exon's first base on the walk (as `path_start`) and length, in transcript order |
-| `detail` | notes, `;`-joined: `e3.start:-3` (exon 3's 5' boundary moved, the exon 3 reference bases shorter), `e2:missing`, `e1:walk_end` (the walk ends before it), `i1.donor:GT>AT` (a changed splice site, transcript strand), `i2:intron_lost`, `rival:<gene>:<share>><share>` (the paralog this copy was taken from, and both shares), and for no copy `best_share:<F>` and `taken_by:<gene>` or `inside:<gene>` |
+| `detail` | notes, `;`-joined: `e3.start:-3` (exon 3's 5' boundary moved, the exon 3 reference bases shorter), `e2:missing`, `e1:walk_end` (the walk ends before it), `i1.donor:GT>AT` (a changed splice site, transcript strand), `i2:intron_lost`, `clipped:3':200` (annotated exonic bases past the path at the transcript's 3' end), `rival:<gene>:<share>><share>` (the paralog this copy was taken from, and both shares), and for no copy `best_share:<F>` and `taken_by:<gene>` or `inside:<gene>` |
 
 Statuses, most severe first:
 
 - `no_copy`: the walk has no copy of the gene;
 - `missing_exon`: the copy lacks an exon of this transcript; no sequence is written;
 - `intron_lost`: the haplotype shortens an intron below its two splice sites, so the exons around it are joined;
+- `clipped_at_edge`: the transcript reaches past the reference path, and only its part on the path is projected;
 - `boundary_moved`: an exon boundary lies inside a variant and was moved;
 - `splice_site_changed`: a splice site differs from the reference's;
 - `ok`: every boundary carried exactly.
 
-`hst.summary.tsv` has one row per gene, in reference order: `transcripts` projected and `outside` (reaching past the reference path), `haplotypes_by_copies` (`0:2,1:120,2:9` is 2 haplotypes with no copy, 120 with one, 9 with two), `hsts` written, `same_as_ref`, and the rows of each status.
+`hst.summary.tsv` has one row per gene, in reference order: `transcripts` projected, of which `clipped` reach past the reference path, and `outside` (transcripts with no exon on the path, not projected), `haplotypes_by_copies` (`0:2,1:120,2:9` is 2 haplotypes with no copy, 120 with one, 9 with two), `hsts` written, `same_as_ref`, and the rows of each status.
 
 ## Limitations
 

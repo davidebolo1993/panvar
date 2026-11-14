@@ -20,5 +20,6 @@ for name in c4 gstm cyp2d acot; do
   run "$OUT/$name/$name.transcripts.log" "$PANVAR" transcripts -i "tests/real_data/paralogs/$name.gfa.gz" -r GRCh38 \
     --gtf "$GTF" -o "$OUT/$name/$name" -t 2
   echo "$name: $(grep -o 'haplotype-specific transcripts: [0-9]*' "$OUT/$name/$name.transcripts.log")"
-  awk -F'\t' 'NR > 1 {printf "  %-16s %s\n", $2, $5}' "$OUT/$name/$name.hst.summary.tsv"
+  awk -F'\t' 'NR == 1 {for (i = 1; i <= NF; i++) c[$i] = i; next} {printf "  %-16s %s\n", $2, $c["haplotypes_by_copies"]}' \
+    "$OUT/$name/$name.hst.summary.tsv"
 done
