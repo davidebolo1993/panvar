@@ -14,6 +14,7 @@ namespace panvar {
 struct AnnotatedTranscript {
     TranscriptFeature t;          // ids and names as below; exons 0-based, half-open on the path, ascending
     std::size_t path = 0;         // index into Graph::paths
+    std::string record;           // the annotation's own id of the transcript (GFF3 ID, GTF transcript_id)
     std::string gene_record;      // the annotation's gene record: one per copy
     int copy = 0, copies = 0;     // the record's rank among the gene's records on the path, by position
     std::size_t bp_5p = 0, bp_3p = 0;   // exonic bases past the path, at each end of the transcript

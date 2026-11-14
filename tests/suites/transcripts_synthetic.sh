@@ -26,7 +26,7 @@ col() { awk -F'\t' -v t="$1" -v h="$2" -v c="$3" 'NR==1{for(i=1;i<=NF;i++) ix[$i
 "$BIN" transcripts -i locus.gfa -r ref --gtf genes.gtf -o t2 -t 2 -q
 check "every row matches the haplotypes' own transcripts" 'python3 "$TOOLS/transcript_fixture.py" check . t1 > check.log; cat check.log; grep -q "wrong: 0" check.log'
 check "2 threads write the same files as 1" 'cmp -s t1.hst.tsv t2.hst.tsv && cmp -s t1.hst.fa t2.hst.fa && cmp -s t1.hst.summary.tsv t2.hst.summary.tsv'
-check "the reference walk gives the reference transcripts" '[[ "$(awk -F"\t" "\$7 ~ /^ref#/ {print \$19}" t1.hst.tsv | sort -u)" == yes ]]'
+check "the reference walk gives the reference transcripts" '[[ "$(awk -F"\t" "\$7 ~ /^ref#/ {print \$20}" t1.hst.tsv | sort -u)" == yes ]]'
 check "a duplicated gene gives one transcript per copy" '[[ "$(col TC1 h5 copy | tr "\n" ,)" == "1,2," && "$(col TC1 h5 copies | sort -u)" == 2 ]]'
 check "copies lie apart on the walk" '[[ "$(col TC1 h5 path_start | tr "\n" ,)" == "8000,8900," ]]'
 check "a deleted gene has no copy" '[[ "$(col TC1 h6 status)" == no_copy && "$(col TC1 h6 copy)" == 0 ]]'
@@ -60,7 +60,7 @@ done
 check "the summary notes a gene's copies where the annotation differs" 'awk -F"\t" "\$2==\"GB\"" case_annotated/out.hst.summary.tsv | grep -q "h1#1:1/2"'
 "$BIN" transcripts -i case_annotated/locus.gfa --hap-annotations case_annotated/hap_annotations.tsv \
   --contig-alias case_annotated/alias.tsv -o ann_only -q
-check "without --gtf, only the annotated transcripts" '[[ "$(tail -n +2 ann_only.hst.tsv | cut -f10 | sort | uniq -c | tr -s " ")" == " 8 annotated" ]]'
+check "without --gtf, only the annotated transcripts" '[[ "$(tail -n +2 ann_only.hst.tsv | cut -f10 | sort | uniq -c | tr -s " ")" == " 10 annotated" ]]'
 
 # input errors
 "$BIN" transcripts -i locus.gfa -r ref -o e1 -q 2> e1.log

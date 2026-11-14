@@ -54,7 +54,7 @@ Projects a reference annotation onto every haplotype walk of a locus graph. Each
 
 | file | contents |
 |------|----------|
-| `<prefix>.hst.fa` | one sequence per HST, 5' to 3', named `transcript|gene|haplotype|copy` (`|annotated` added to an annotated transcript written beside a projected one), with `source=` and `status=` after the name |
+| `<prefix>.hst.fa` | one sequence per HST, 5' to 3', named `transcript|gene|haplotype|copy` (`|annotated:<record>` added to an annotated transcript written beside the projected ones, with the annotation's own id, so two records of one source transcript keep apart), with `source=` and `status=` after the name |
 | `<prefix>.hst.tsv` | one row per transcript, haplotype and copy, a row with copy 0 where the haplotype has no copy |
 | `<prefix>.hst.summary.tsv` | one row per gene: copies per haplotype and rows per status |
 
@@ -67,6 +67,7 @@ Projects a reference annotation onto every haplotype walk of a locus graph. Each
 | `copy`, `copies` | this copy, numbered along the walk as written, and the gene's copies on the walk |
 | `source` | `projected`, `annotated` (from the haplotype's annotation; `orientation` is `.`, and `ref_length`, `ref_exons` are the projected transcript's of that id, if any) or `projected+annotated` (both, the same sequence) |
 | `status` | below |
+| `record` | the annotation's own id of the transcript (GFF3 `ID`, GTF `transcript_id`; several where annotated transcripts join one projected record), `.` for a projected one |
 | `orientation` | `+` where the walk passes the gene in the reference's orientation, `-` where it passes it reversed |
 | `path_start`, `path_end` | the HST's first and last exonic base on the walk as written, 0-based, end excluded |
 | `length`, `exons` | the HST's length and exons |

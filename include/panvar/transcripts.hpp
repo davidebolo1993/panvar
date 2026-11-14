@@ -49,6 +49,7 @@ struct HstRecord {
     int source = kProjected;        // HstSource bits
     std::size_t transcript = 0;     // index into the projected transcripts, or (annotated only) the annotated ones
     int annotated_copies = -1;      // the gene's copies in the haplotype's annotation, where it has one
+    std::string record;             // the annotation's own transcript id(s), ','-joined
     std::size_t haplotype = 0;      // index into Graph::paths
     int copy = 0;                   // 1-based along the walk; 0 for no copy
     int copies = 0;                 // passes of the gene on this walk

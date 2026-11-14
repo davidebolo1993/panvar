@@ -303,7 +303,13 @@ def write_annotated(d):
     novel = [(1000, 1300), (3000, 3150)]   # a novel isoform: exon 3 ends early
     h1 += [gff("ctg1", "transcript", pos(m1, 1000), pos(m1, 3149), "+", "ID=nov1;Parent=g1;transcript_class=putative_novel_isoform")]
     h1 += [gff("ctg1", "exon", pos(m1, a), pos(m1, b - 1), "+", "Parent=nov1") for a, b in novel]
-    rows.append(("nov1", "GA", "h1", 1, "ok", "transcript_class:putative_novel_isoform", "".join(seqs["h1"][m1[a]:m1[b - 1] + 1] for a, b in novel)))
+    rows.append(("nov1", "GA", "h1", 1, "ok", "transcript_class:putative_novel_isoform", "".join(seqs["h1"][m1[a]:m1[b - 1] + 1] for a, b in novel), "nov1"))
+    # two records of one source transcript, with different exons, under one gene
+    h1 += [gff("ctg1", "gene", pos(m1, 9000), pos(m1, 9149), "+", "ID=g4;gene_name=GQ")]
+    for rec, end in (("cat1", 9100), ("cat2", 9150)):
+        h1 += [gff("ctg1", "transcript", pos(m1, 9000), pos(m1, end - 1), "+", f"ID={rec};Parent=g4;source_transcript=ENSTQ1.1"),
+               gff("ctg1", "exon", pos(m1, 9000), pos(m1, end - 1), "+", f"Parent={rec}")]
+        rows.append(("ENSTQ1", "GQ", "h1", 1, "ok", "source_transcript:ENSTQ1.1", seqs["h1"][m1[9000]:m1[end - 1] + 1], rec))
     gb2 = [(6500, 6600), (6800, 6900)]       # a second GB copy, minus strand, where the projection sees none
     h1 += [gff("ctg1", "gene", pos(m1, 5000), pos(m1, 5799), "-", "ID=g2;gene_name=GB"),
            gff("ctg1", "transcript", pos(m1, 5000), pos(m1, 5799), "-", "ID=TB1;Parent=g2;transcript_id=TB1")]
@@ -311,17 +317,17 @@ def write_annotated(d):
     h1 += [gff("ctg1", "gene", pos(m1, 6500), pos(m1, 6899), "-", "ID=g3;gene_name=GB"),
            gff("ctg1", "transcript", pos(m1, 6500), pos(m1, 6899), "-", "ID=TB1x;Parent=g3;transcript_id=TB1")]
     h1 += [gff("ctg1", "exon", pos(m1, a), pos(m1, b - 1), "-", "Parent=TB1x") for a, b in gb2]
-    rows.append(("TB1", "GB", "h1", 2, "ok", ".", rc("".join(seqs["h1"][m1[a]:m1[b - 1] + 1] for a, b in gb2))))
+    rows.append(("TB1", "GB", "h1", 2, "ok", ".", rc("".join(seqs["h1"][m1[a]:m1[b - 1] + 1] for a, b in gb2)), "TB1x"))
     m2 = maps["h2"][0]
     edge = [(m2[11500], m2[11700 - 1] + 1), (len(seqs["h2"]) + 100, len(seqs["h2"]) + 200)]   # path coordinates
     h2 = [gff("ctg2", "transcript", edge[0][0] + 1, edge[1][1], "+", "ID=edge1;gene_name=GZ;transcript_id=edge1")]
     h2 += [gff("ctg2", "exon", a + 1, b, "+", "Parent=edge1") for a, b in edge]
-    rows.append(("edge1", "GZ", "h2", 1, "clipped_at_edge", "clipped:3':100", seqs["h2"][edge[0][0]:edge[0][1]]))
+    rows.append(("edge1", "GZ", "h2", 1, "clipped_at_edge", "clipped:3':100", seqs["h2"][edge[0][0]:edge[0][1]], "edge1"))
     m3 = maps["h3"][0]
     alias_ex = [(4000, 4200)]
     h3 = [gff("CTG3ALT", "transcript", pos(m3, 4000), pos(m3, 4199), "+", "ID=al1;gene_name=GY;transcript_id=al1")]
     h3 += [gff("CTG3ALT", "exon", pos(m3, a), pos(m3, b - 1), "+", "Parent=al1") for a, b in alias_ex]
-    rows.append(("al1", "GY", "h3", 1, "ok", ".", seqs["h3"][m3[4000]:m3[4199] + 1]))
+    rows.append(("al1", "GY", "h3", 1, "ok", ".", seqs["h3"][m3[4000]:m3[4199] + 1], "al1"))
     h5 = []
     for k, m in enumerate(maps["h5"], 1):   # GTF: both GC copies, as projected
         attr = f'gene_id "gc{k}"; gene_name "GC"; transcript_id "TC1";'
@@ -339,13 +345,13 @@ def write_annotated(d):
     # TA1 on h1 and both TC1 copies on h5 are the projected records, of both sources
     lines = open(f"{d}/expected.tsv").read().splitlines()
     with open(f"{d}/expected.tsv", "w") as out:
-        out.write(lines[0] + "\tsource\n")
+        out.write(lines[0] + "\tsource\trecord\n")
         for line in lines[1:]:
             f = line.split("\t")
             both = (f[0], f[2].split("#")[0]) in (("TA1", "h1"), ("TC1", "h5"), ("TB1", "h1"))
-            out.write(line + ("\tprojected+annotated" if both else "\tprojected") + "\n")
-        for t, g, h, c, st, det, sq in rows:
-            out.write(f"{t}\t{g}\t{name(h, L)}\t{c}\t{st}\t{det}\t{sq}\tannotated\n")
+            out.write(line + ("\tprojected+annotated" if both else "\tprojected") + "\t.\n")
+        for t, g, h, c, st, det, sq, rec in rows:
+            out.write(f"{t}\t{g}\t{name(h, L)}\t{c}\t{st}\t{det}\t{sq}\tannotated\t{rec}\n")
 
 
 def write(case_name, d):
@@ -394,7 +400,8 @@ def check(d, prefix):
         fh.readline()
         for line in fh:
             t, g, h, c, st, det, s, *src = line.rstrip("\n").split("\t")
-            exp[(t, h, c, src[0] if src else "projected")] = (st, det, s)
+            source = src[0] if src else "projected"
+            exp[(t, h, c, source, src[1] if source == "annotated" else ".")] = (st, det, s)
     got, fa = {}, {}
     with open(f"{prefix}.hst.fa") as fh:
         for line in fh:
@@ -409,11 +416,12 @@ def check(d, prefix):
         hdr = fh.readline().rstrip("\n").split("\t")
         for line in fh:
             r = dict(zip(hdr, line.rstrip("\n").split("\t")))
-            k = (r["transcript_id"], r["haplotype"], r["copy"], r["source"])
+            k = (r["transcript_id"], r["haplotype"], r["copy"], r["source"],
+                 r.get("record") if r["source"] == "annotated" else ".")
             if k in got:
                 sys.exit(f"duplicate row: {k}")
             key = f"{r['transcript_id']}|{r['gene_name']}|{r['haplotype']}|{r['copy']}"
-            key += "|annotated" if r["source"] == "annotated" else ""
+            key += f"|annotated:{r.get('record')}" if r["source"] == "annotated" else ""
             got[k] = (r, fa.get(key) or ".")
     bad = 0
     for k in sorted(set(exp) | set(got)):

@@ -55,7 +55,7 @@ public:
     FileSink(const std::string& fa, const std::string& tsv) : fa_(fa), tsv_(tsv), fa_path_(fa), tsv_path_(tsv) {
         if (!fa_) throw std::runtime_error("transcripts: cannot write " + fa);
         if (!tsv_) throw std::runtime_error("transcripts: cannot write " + tsv);
-        tsv_ << "transcript_id\ttranscript_name\tgene_id\tgene_name\tbiotype\tstrand\thaplotype\tcopy\tcopies\tsource"
+        tsv_ << "transcript_id\ttranscript_name\tgene_id\tgene_name\tbiotype\tstrand\thaplotype\tcopy\tcopies\tsource\trecord"
                 "\tstatus\torientation\tpath_start\tpath_end\tlength\texons\tref_length\tref_exons\tsame_as_ref"
                 "\tmoved_boundaries\tchanged_splice_sites\texon_starts\texon_lengths\tdetail\n";
     }
@@ -82,7 +82,8 @@ public:
             const char* source = r.source == kProjected ? "projected" : annotated_only ? "annotated" : "projected+annotated";
             tsv_ << t.transcript_id << '\t' << t.transcript_name << '\t' << gid << '\t' << t.gene_name << '\t'
                  << (t.biotype.empty() ? "." : t.biotype) << '\t' << t.strand << '\t' << hap << '\t' << r.copy << '\t'
-                 << r.copies << '\t' << source << '\t' << hst_status_name(r.status) << '\t'
+                 << r.copies << '\t' << source << '\t' << (r.record.empty() ? "." : r.record) << '\t'
+                 << hst_status_name(r.status) << '\t'
                  << (annotated_only ? "." : orientation(r)) << '\t';
             if (has) tsv_ << r.path_start << '\t' << r.path_end << '\t' << r.sequence.size() << '\t' << r.exons;
             else tsv_ << ".\t.\t.\t.";
@@ -96,7 +97,7 @@ public:
                  << '\n';
             if (has)
                 fa_ << '>' << t.transcript_id << '|' << t.gene_name << '|' << hap << '|' << r.copy
-                    << (annotated_only ? "|annotated" : "") << " source=" << source << " status=" << hst_status_name(r.status)
+                    << (annotated_only ? "|annotated:" + r.record : "") << " source=" << source << " status=" << hst_status_name(r.status)
                     << '\n' << r.sequence << '\n';
             Tally& g = genes_[gid];
             g.name = t.gene_name;

@@ -255,6 +255,7 @@ std::vector<AnnotatedTranscript> load_hap_annotations(const Graph& graph, const 
             at.t.biotype = first_of(ta, {"transcript_biotype", "transcript_type", "biotype"});
             if (at.t.biotype.empty()) at.t.biotype = tx->type;
             at.gene_record = gtf ? first_of(ta, {"gene_id"}) : gene ? tx->parents[0] : tid;
+            at.record = gtf ? first_of(ta, {"transcript_id"}) : tid;
             for (const char* k : {"source_transcript", "source_gene", "transcript_class", "alignment_mode"}) {
                 const std::string v = first_of(ta, {k});
                 if (!v.empty()) at.detail += (at.detail.empty() ? "" : ";") + std::string(k) + ":" + v;

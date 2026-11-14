@@ -1030,11 +1030,14 @@ TranscriptsResult project_transcripts(const Graph& graph, const TranscriptsOptio
             r.copy = at.copy;
             r.copies = at.copies;
             r.annotated_copies = at.copies;
+            r.record = at.record;
             for (const auto& [x, y] : at.t.exons) r.sequence += hseq.substr(x, y - x);
             if (at.t.strand == '-') r.sequence = reverse_complement(r.sequence);
             const auto it = projected.find({at.t.transcript_id, at.copy});
             if (it != projected.end() && recs[it->second].sequence == r.sequence) {
                 recs[it->second].source |= kAnnotated;
+                std::string& rec = recs[it->second].record;
+                rec += (rec.empty() ? "" : ",") + at.record;
                 add_detail(recs[it->second].detail, at.detail);
                 continue;
             }
