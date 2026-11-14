@@ -38,7 +38,7 @@ namespace fs = std::filesystem;
 
 constexpr std::size_t kK = 31, kS = 11;
 constexpr std::uint64_t kMagic = 0x3130305850585650ULL;   // "PVPXP001"
-constexpr std::uint64_t kVersion = 13;   // 13: transcript-only k-mers counted in the transcriptome and the run's other loci; 2: decoy windows stop at the locus; 3: clusters split at it; 4: S per haplotype; 5: calibration; 6: its decoy pairs cross window edges; 7: locus pieces off the located copies; 8: and past estimated ends; 9: and everywhere for a locus with array pieces outside; 10: stretches reach contig ends; 11: pieces tied to the locus, short contigs whole, no decoys in pieces; 12: transcript k-mers
+constexpr std::uint64_t kVersion = 13;   // 2: decoy windows stop at the locus; 3: clusters split at it; 4: S per haplotype; 5: calibration; 6: its decoy pairs cross window edges; 7: locus pieces off the located copies; 8: and past estimated ends; 9: and everywhere for a locus with array pieces outside; 10: stretches reach contig ends; 11: pieces tied to the locus, short contigs whole, no decoys in pieces; 12: transcript k-mers; 13: those counted in the transcriptome and the run's other loci
 const std::size_t kLengths[] = {100, 150, 250, 1000, 10000};
 constexpr std::size_t kWindowStep = 25;
 // A stretch of a genome is a piece of the locus when, over every window of this many bases in it, this
@@ -178,8 +178,9 @@ using TranscriptFn = std::function<void(const std::string& seq, const std::funct
 // The transcripts of a panvar transcripts FASTA (plain or gzip), one at a time. Every written transcript is
 // taken but those whose splice site differs from the reference's (the haplotype may not splice there, so
 // their junctions are guesses) unless `splice_changed`, or only status=ok with `ok_only`; a record without a
-// status is taken. `by_status` counts the records taken and all, per status. Their bases are placed on the graph's nodes through the table beside the FASTA (the haplotype's
-// path and each exon's first base and length on it), where it exists. A sequence equal to one already
+// status is taken. `by_status` counts the records taken and all, per status. Their bases are placed on the
+// graph's nodes through the table beside the FASTA (the haplotype's path and each exon's first base and
+// length on it), where it exists; `short_rows` counts its rows cut short. A sequence equal to one already
 // passed on is counted as taken but not passed on again: most transcripts are the same on many haplotypes.
 void for_each_transcript(const std::string& fa, const Graph& g, const std::vector<std::string>& node_names, bool ok_only,
                          bool splice_changed, std::uint64_t& used, std::uint64_t& skipped,
