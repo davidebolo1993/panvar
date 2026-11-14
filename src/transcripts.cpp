@@ -452,14 +452,19 @@ struct Piece {
 
 struct Placed {
     std::vector<Piece> pieces;
-    std::size_t exact = 0, inferred = 0;
+    std::size_t exact = 0, inferred = 0, resized = 0;
 };
 
 // One reference unit's layout placed on walk W between bases lo and hi, kind after kind: each exon where W
 // holds its first and last nodes about its length apart. Where W lacks one of the two (a variant at the
 // exon's first or last base), the exon is placed from the other at the reference's length (`inferred`).
+// Where both are there further apart or closer than that (an indel inside the exon, up to half a unit), the
+// exon spans them, with the haplotype's bases (`resized`).
 Placed place_layout(const Walk& W, const Tandem& tm, const std::vector<std::size_t>& layout, std::size_t lo,
                     std::size_t hi) {
+    std::vector<std::size_t> lens(tm.unit_len);
+    std::nth_element(lens.begin(), lens.begin() + lens.size() / 2, lens.end());
+    const std::size_t reach = lens[lens.size() / 2] / 2;
     Placed out;
     std::size_t pos = lo;
     const auto at = [&](std::size_t j, int node, char rev) { return W.node[j] == node && W.rev[j] == rev; };
@@ -467,15 +472,17 @@ Placed place_layout(const Walk& W, const Tandem& tm, const std::vector<std::size
         const Tandem::Kind& k = tm.kinds[id];
         const std::size_t slack = std::max<std::size_t>(30, k.len / 5);
         std::size_t a = SIZE_MAX, b = SIZE_MAX;
-        bool exact = false;
+        bool exact = false, resized = false;
         for (std::size_t j = step_at(W, pos); j < W.size() && W.pref[j] < hi && a == SIZE_MAX; ++j) {
             if (!at(j, k.start_node, k.start_rev) || W.pref[j] + k.start_off < pos) continue;
             a = W.pref[j] + k.start_off;
-            for (std::size_t e = j; e < W.size() && W.pref[e] <= a + k.len + slack; ++e) {
+            for (std::size_t e = j; e < W.size() && W.pref[e] <= a + k.len + std::max(slack, reach); ++e) {
                 if (!at(e, k.end_node, k.end_rev)) continue;
                 const std::size_t x = W.pref[e] + k.end_off + 1;
                 if (x <= a || x > hi) continue;
-                if (x - a + slack >= k.len && x - a <= k.len + slack) { b = x; exact = true; }
+                b = x;
+                exact = x - a + slack >= k.len && x - a <= k.len + slack;
+                resized = !exact;
                 break;
             }
         }
@@ -488,7 +495,7 @@ Placed place_layout(const Walk& W, const Tandem& tm, const std::vector<std::size
             }
         if (a == SIZE_MAX || b == SIZE_MAX) continue;
         out.pieces.push_back({a, b, k.ref_exon});
-        (exact ? out.exact : out.inferred) += 1;
+        (exact ? out.exact : resized ? out.resized : out.inferred) += 1;
         pos = b;
     }
     return out;
@@ -543,6 +550,7 @@ Placed tandem_exons(const Walk& W, const Tandem& tm, std::size_t lo, std::size_t
             out.pieces.insert(out.pieces.end(), best.pieces.begin(), best.pieces.end());
             out.exact += best.exact;
             out.inferred += best.inferred;
+            out.resized += best.resized;
             const std::size_t from = best.pieces.back().b;
             if (b < from || b - from <= tm.unit_len[pick] / 2) break;
             best = place_layout(W, tm, tm.units[pick], from, b);
@@ -605,6 +613,7 @@ HstRecord project_one(const Walk& R, const std::string& rseq, const Gene& g, con
             if (found.size() != tm.hi - tm.lo + 1)
                 add_detail(r.detail, "tandem:" + std::to_string(tm.hi - tm.lo + 1) + ">" + std::to_string(found.size()));
             if (inferred) add_detail(r.detail, "tandem_inferred:" + std::to_string(inferred));
+            if (placed.resized) add_detail(r.detail, "tandem_resized:" + std::to_string(placed.resized));
             pieces.insert(pieces.end(), found.begin(), found.end());
         }
     }
