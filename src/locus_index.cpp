@@ -113,9 +113,14 @@ std::unique_ptr<bg::Background> open_counts(const std::string& store, std::strin
     return bg::Background::open(store);
 }
 
+// The genes a locus's transcripts are of: their ids (Ensembl-style ones without the version) and their names.
+struct OwnGenes {
+    std::set<std::string> ids, names;
+};
+
 struct LocusWork {
     LocusIndex idx;
-    std::set<std::string> genes;                       // ids and names of the genes its transcripts are of
+    OwnGenes genes;                                    // the genes its transcripts are of
     std::vector<std::uint64_t> tx_count, tx_sub, cross;   // per k-mer (transcript-only ones): in the transcriptome,
                                                           // in its own genes' records there, in other loci
     std::vector<std::uint64_t> counts;                 // background counts per k-mer
@@ -143,33 +148,57 @@ std::string transcripts_checksum_of(const std::string& fa) {
     return file_checksum(fa) + (t.empty() ? std::string() : "+" + file_checksum(t));
 }
 
-// A name with and without a trailing version (ENSG00000000001.2), as annotations and FASTA headers differ.
-void add_gene_name(std::set<std::string>& genes, const std::string& name) {
-    if (name.empty() || name == ".") return;
-    genes.insert(name);
-    const std::size_t dot = name.rfind('.');
-    if (dot != std::string::npos && dot > 0 && dot + 1 < name.size() && name.find_first_not_of("0123456789", dot + 1) == std::string::npos)
-        genes.insert(name.substr(0, dot));
+// A gene id as it is compared: an Ensembl-style id (ENS, species letters, G, digits) loses its version
+// (ENSG00000000001.2), as annotations and FASTA headers differ in it. Any other id or name is kept whole: a
+// suffix of a symbol or of a clone-based name tells genes apart.
+std::string gene_id_key(const std::string& id) {
+    const std::size_t dot = id.rfind('.');
+    if (dot == std::string::npos || dot + 1 >= id.size() || id.compare(0, 3, "ENS") != 0 ||
+        id.find_first_not_of("0123456789", dot + 1) != std::string::npos)
+        return id;
+    std::size_t i = 3;
+    while (i < dot && std::isupper(static_cast<unsigned char>(id[i]))) ++i;
+    if (i == 3 || id[i - 1] != 'G' || i == dot || id.find_first_not_of("0123456789", i) != dot) return id;
+    return id.substr(0, dot);
 }
 
-// Whether a transcript FASTA header names one of `genes`: its fields, split at spaces and at | = : ; ,
-// (GENCODE's, Ensembl's and gffread's headers), up to a free-text description.
-bool header_names_gene(const std::string& header, const std::set<std::string>& genes) {
-    std::size_t a = 1;
-    while (a < header.size()) {
-        const std::size_t b = std::min(header.find_first_of(" \t|=:;,", a), header.size());
-        if (b > a) {
-            const std::string token = header.substr(a, b - a);
-            if (token == "description") return false;
-            if (genes.count(token)) return true;
-            const std::size_t dot = token.rfind('.');
-            if (dot != std::string::npos && dot > 0 && dot + 1 < token.size() && token.find_first_not_of("0123456789", dot + 1) == std::string::npos &&
-                genes.count(token.substr(0, dot)))
-                return true;
+bool ensembl_gene_id(const std::string& s) { return gene_id_key(s + ".1") == s; }
+
+// Whether a transcript FASTA header is of one of a locus's own genes. The header's gene id decides where it
+// has one and the locus knows its genes' ids: a record of another gene id is another gene, whatever its
+// symbol. The symbol decides only without an id on either side. Read from the header: of a first word split
+// at |, the second field as the gene id and the sixth (GENCODE) or third as the symbol; of the words after it,
+// key=value or key:value with keys gene_id, gene (an id when Ensembl-style, else a symbol), gene_symbol and
+// gene_name, up to a free-text description.
+bool header_is_own(const std::string& header, const OwnGenes& own) {
+    std::vector<std::string> ids, symbols;
+    std::size_t a = 1, b = std::min(header.find_first_of(" \t", a), header.size());
+    {
+        std::vector<std::string> f;
+        for (std::size_t x = a; x <= b;) {
+            const std::size_t y = std::min(header.find('|', x), b);
+            f.push_back(header.substr(x, y - x));
+            x = y + 1;
         }
-        a = b + 1;
+        if (f.size() >= 2 && !f[1].empty()) ids.push_back(f[1]);
+        if (f.size() >= 6 && !f[5].empty()) symbols.push_back(f[5]);
+        else if (f.size() == 3 && !f[2].empty()) symbols.push_back(f[2]);
     }
-    return false;
+    while (b < header.size()) {
+        a = header.find_first_not_of(" \t", b);
+        if (a == std::string::npos) break;
+        b = std::min(header.find_first_of(" \t", a), header.size());
+        const std::size_t sep = header.find_first_of("=:", a);
+        if (sep == std::string::npos || sep >= b) continue;
+        const std::string key = header.substr(a, sep - a), value = header.substr(sep + 1, b - sep - 1);
+        if (key == "description") break;
+        if (value.empty()) continue;
+        if (key == "gene_id" || (key == "gene" && ensembl_gene_id(gene_id_key(value)))) ids.push_back(value);
+        else if (key == "gene" || key == "gene_symbol" || key == "gene_name") symbols.push_back(value);
+    }
+    if (!ids.empty() && !own.ids.empty())
+        return std::any_of(ids.begin(), ids.end(), [&](const std::string& x) { return own.ids.count(gene_id_key(x)) != 0; });
+    return std::any_of(symbols.begin(), symbols.end(), [&](const std::string& x) { return own.names.count(x) != 0; });
 }
 
 // A transcript's sequence, and the graph node of each of its bases (-1 where unknown).
@@ -184,10 +213,10 @@ using TranscriptFn = std::function<void(const std::string& seq, const std::funct
 // passed on is counted as taken but not passed on again: most transcripts are the same on many haplotypes.
 void for_each_transcript(const std::string& fa, const Graph& g, const std::vector<std::string>& node_names, bool ok_only,
                          bool splice_changed, std::uint64_t& used, std::uint64_t& skipped,
-                         std::map<std::string, std::array<std::uint64_t, 2>>& by_status, std::set<std::string>& genes,
+                         std::map<std::string, std::array<std::uint64_t, 2>>& by_status, OwnGenes& genes,
                          std::uint64_t& short_rows, const TranscriptFn& fn) {
     // the exons of each record on its path, and its gene's id, from the table
-    struct Place { std::string path, gene_id; bool forward = true; std::vector<std::uint64_t> starts, lengths; };
+    struct Place { std::string path, gene_id, gene_name; bool forward = true; std::vector<std::uint64_t> starts, lengths; };
     std::unordered_map<std::string, Place> place;
     const std::string table = transcripts_table(fa);
     if (!table.empty()) {
@@ -215,6 +244,7 @@ void for_each_transcript(const std::string& fa, const Graph& g, const std::vecto
             Place p;
             p.path = f[col["haplotype"]];
             if (col.count("gene_id")) p.gene_id = f[col["gene_id"]];
+            p.gene_name = f[col["gene_name"]];
             p.forward = (f[col["strand"]] == "+") == (f[col["orientation"]] != "-");
             for (const auto& [name, v] : {std::make_pair(std::string("exon_starts"), &p.starts), std::make_pair(std::string("exon_lengths"), &p.lengths)}) {
                 std::stringstream xs(f[col[name]]);
@@ -240,11 +270,17 @@ void for_each_transcript(const std::string& fa, const Graph& g, const std::vecto
         if (!take || seq.size() < kK) { ++skipped; return; }
         ++used;
         ++tally[0];
-        {   // the record's gene: the second field of its name (transcript|gene|haplotype|copy), and the table's id
-            const std::size_t a = name.find('|'), b = a == std::string::npos ? a : name.find('|', a + 1);
-            if (b != std::string::npos) add_gene_name(genes, name.substr(a + 1, b - a - 1));
+        {   // the record's gene: its id and name in the table; without one, the name in the record's own name
+            // (transcript|gene|haplotype|copy)
+            const auto usable = [](const std::string& v) { return !v.empty() && v != "."; };
             const auto at = place.find(name);
-            if (at != place.end()) add_gene_name(genes, at->second.gene_id);
+            const std::size_t a = name.find('|'), b = a == std::string::npos ? a : name.find('|', a + 1);
+            if (at != place.end()) {
+                if (usable(at->second.gene_id)) genes.ids.insert(gene_id_key(at->second.gene_id));
+                if (usable(at->second.gene_name)) genes.names.insert(at->second.gene_name);
+            } else if (b != std::string::npos && usable(name.substr(a + 1, b - a - 1))) {
+                genes.names.insert(name.substr(a + 1, b - a - 1));
+            }
         }
         for (char& c : seq) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
         // a 64-bit hash: two different transcripts colliding would drop one, odds ~1e-19 per pair here
@@ -1050,7 +1086,7 @@ std::vector<LocusIndex> build(const BuildOptions& o) {
                             flush();
                             own.clear();
                             for (const std::size_t li : with)
-                                if (header_names_gene(line, work[li].genes)) own.push_back(li);
+                                if (header_is_own(line, work[li].genes)) own.push_back(li);
                         } else if (!own.empty()) {
                             for (const char c : line) seq += static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
                         }
@@ -1080,7 +1116,7 @@ std::vector<LocusIndex> build(const BuildOptions& o) {
                 std::to_string(x.tx_in_other_loci));
             if (!x.transcriptome_names.empty() && x.transcriptome_records == 0)
                 log("warning: locus: " + x.name + "; no record of the transcriptome names a gene of its transcripts: the locus's own transcripts are "
-                    "counted as elsewhere (gene ids or names must be fields of the FASTA headers)");
+                    "counted as elsewhere (the FASTA headers must carry the genes' ids, or their names where they carry no id)");
         }
     }
 

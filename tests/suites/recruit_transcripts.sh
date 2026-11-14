@@ -121,6 +121,12 @@ check "reads of the paralog's mRNA are not certain once the transcriptome holds 
   '[[ $(certain r5.tsv) -eq 200 && $(certain r6.tsv) -eq 0 ]]'
 check "the gene's own reads, across its own junctions, stay certain ($(certain o6.tsv) of 200)" '[[ $(certain o6.tsv) -eq 200 ]]'
 check "reads across an exon skip no transcript has are not certain with a transcriptome" '[[ $(grep -c "^skip.*	certain	" other6.tsv) -eq 0 ]]'
+"${BG[@]}" -o s1 --add --transcriptome tx=data/tx_similar.fa
+"${RC[@]}" --save-index idxg "${TX[@]}" 2> logg.txt; dump idxg
+check "a record of another gene id, or of a symbol that differs by a suffix, is not the gene's own ($(tx idxg.locus.tsv))" \
+  '[[ "$(tx idxg.locus.tsv)" == "P$JO S$J12 R0" ]] && [[ $(awk -F"\t" "NR>1 && \$8==1 && \$2==\"S\" && \$3!=2" idxg.locus.tsv | wc -l) -eq 0 ]]'
+check "a record named by the symbol alone is the gene's own" 'grep -q "records of the locus.s genes subtracted: 1;" logg.txt'
+"${BG[@]}" -o s1 --add --transcriptome tx=data/tx_paralog.fa
 "${BG[@]}" -o s1 --clean
 check "cleaning keeps the listed transcriptome and removes the replaced one" '[[ $(ls -d s1/tx-* | wc -l) -eq 1 ]]'
 "${BG[@]}" -o s1 --add --genome gn=data/gn.fa && "${BG[@]}" -o s1 --merge; rc=$?

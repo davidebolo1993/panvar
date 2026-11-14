@@ -14,6 +14,8 @@ writes
                        SNP four bases into the fourth exon; its gene GP, on the minus strand
   tx_own.fa            a transcriptome holding the gene's transcript and unrelated ones
   tx_paralog.fa        the same with the paralog's transcript
+  tx_similar.fa        the gene's record named by its symbol alone, and the paralog's transcript under a symbol
+                       that differs by a suffix and under the gene's symbol with another gene id
   junction_kmers.txt   the transcript's k-mers no locus copy holds: all, those of the first two junctions, and
                        those the record of splice_changed.fa adds
   splice_changed.fa    a transcript record with status splice_site_changed: the first exon joined to the third
@@ -97,7 +99,7 @@ write("gn", [("chr1", seq(50000))])
 with open(os.path.join(out, "locus.gfa"), "w") as f:
     f.write("H\tVN:Z:1.0\nS\t1\t" + ref[ls:le] + "\nS\t2\t" + hap_a + "\n")
     f.write(f"P\tref#1#chr1:{ls}-{le}\t1+\t*\nP\tga#1#chr1:{ls}-{le}\t2+\t*\n")
-attr = 'gene_id "GJ"; gene_name "GJ"; transcript_id "TJ1"; transcript_name "TJ1"; tag "Ensembl_canonical";'
+attr = 'gene_id "ENSG00000000001"; gene_name "GJ"; transcript_id "TJ1"; transcript_name "TJ1"; tag "Ensembl_canonical";'
 with open(os.path.join(out, "genes.gtf"), "w") as f:
     at = ls + gene_at
     f.write(f"chr1\ttest\tgene\t{at + 1}\t{at + len(gene)}\t.\t+\t.\t{attr}\n")
@@ -129,7 +131,7 @@ with open(os.path.join(out, "locus_b.gfa"), "w") as f:
         f.write(f"L\t{x}\t{ox}\t{y}\t{oy}\t0M\n")
     for name, w in zip(("ref", "ga"), walks):
         f.write(f"P\t{name}#1#chr1:{bs}-{be}\t{','.join(n + o for n, o in w)}\t*\n")
-attr_b = 'gene_id "GP"; gene_name "GP"; transcript_id "TP1"; transcript_name "TP1"; tag "Ensembl_canonical";'
+attr_b = 'gene_id "ENSG00000000002"; gene_name "GP"; transcript_id "TP1"; transcript_name "TP1"; tag "Ensembl_canonical";'
 with open(os.path.join(out, "genes_b.gtf"), "w") as f:
     at = bs + par_at
     f.write(f"chr1\ttest\tgene\t{at + 1}\t{at + L}\t.\t-\t.\t{attr_b}\n")
@@ -152,13 +154,19 @@ with open(os.path.join(out, "junction_nodes_b.tsv"), "w") as f:
     for k in sorted(expected):
         f.write(f"{k}\t{expected[k]}\n")
 
-# transcriptomes: the gene's own transcript and unrelated ones; then the paralog's too
-others = [(f"TU{k}|GU{k}|GU{k}", seq(900)) for k in range(5)]
+# transcriptomes, named transcript|gene id|gene name: the gene's own transcript (its id with a version) and
+# unrelated ones; then the paralog's too. tx_similar.fa: the gene's record by its symbol alone, and the
+# paralog's transcript twice, under a symbol that differs by a suffix and under the gene's symbol with
+# another gene id
+others = [(f"TU{k}|ENSG000000001{k}0.1|GU{k}", seq(900)) for k in range(5)]
 with open(os.path.join(out, "tx_own.fa"), "w") as f:
-    for name, s in [("TJ1|GJ|GJ", tx)] + others:
+    for name, s in [("TJ1|ENSG00000000001.7|GJ", tx)] + others:
         f.write(f">{name}\n{s}\n")
 with open(os.path.join(out, "tx_paralog.fa"), "w") as f:
-    for name, s in [("TJ1|GJ|GJ", tx), ("TP1|GP|GP", ptx)] + others:
+    for name, s in [("TJ1|ENSG00000000001.7|GJ", tx), ("TP1|ENSG00000000002.3|GP", ptx)] + others:
+        f.write(f">{name}\n{s}\n")
+with open(os.path.join(out, "tx_similar.fa"), "w") as f:
+    for name, s in [("TJ1 gene=GJ", tx), ("TP1 gene=GJ.2", ptx), ("TP9|ENSG00000000002.3|GJ", ptx)] + others:
         f.write(f">{name}\n{s}\n")
 
 own = kmers(ref[ls:le]) | kmers(hap_a)

@@ -69,7 +69,12 @@ Counts every 31-mer of a set of genomes once, so that `recruit` can tell, for ea
 
 ### The transcriptome's FASTA
 
-One record per transcript, for every gene of the reference annotation, not only those near the loci: a paralog anywhere can share a junction. `recruit` subtracts the records of a locus's own genes, which it finds by name, so each header must carry the gene's id or name as a field, split at spaces or at `|`, `=`, `:`, `;` or `,`; a version suffix (`ENSG00000000001.2`) is ignored. Three ways to make one:
+One record per transcript, for every gene of the reference annotation, not only those near the loci: a paralog anywhere can share a junction. `recruit` subtracts the records of a locus's own genes, so each header must say which gene its transcript is of. The gene id decides: a record with another gene id is another gene's, whatever its symbol, since paralogs and readthrough genes share symbols and differ in ids. An Ensembl-style id is compared without its version (`ENSG00000000001.2`); nothing else is trimmed, as a suffix tells symbols and clone-based names apart (`AC012345.1`, `AC012345.2`). The symbol decides only for a header without a gene id, or a locus whose transcripts came without their table. Headers read:
+
+- a first word of `|`-separated fields: the second is the gene id, the sixth (GENCODE) or the third the symbol;
+- after it, `gene_id=`, `gene=` (an id when Ensembl-style, else a symbol), `gene_symbol=` and `gene_name=`, with `=` or `:`, up to `description`.
+
+Three ways to make one:
 
 - GENCODE's transcript sequences (`gencode.vNN.transcripts.fa.gz`): headers `transcript|gene|...|gene name|...`, used as they are;
 - `gffread -w transcripts.fa -g reference.fa genes.gtf`: headers with `gene=<name>`;
