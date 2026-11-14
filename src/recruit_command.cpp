@@ -296,7 +296,12 @@ int run_recruit_command(const std::vector<std::string>& args) {
             try {
                 const recruit::LocusIndex old = recruit::load(plx);
                 if (old.key() == recruit::expected_key(o, l, o.transcripts[li])) { log.info("index: " + plx + "; current, reused"); continue; }
-                log.info("index: " + plx + "; built from another graph, background or settings: rebuilding");
+                // transcripts given once and not now (or the reverse) change what RNA reads can show: said apart
+                const bool had = !old.transcripts_checksum.empty(), has = !o.transcripts[li].empty();
+                log.info("index: " + plx + "; " +
+                         (had && !has ? "built with transcripts, none given now: rebuilding without them (reads across splice junctions lose that evidence; give --transcripts to keep it)"
+                          : !had && has ? "built without transcripts, given now: rebuilding with them"
+                          : "built from another graph, background or settings: rebuilding"));
             } catch (const std::exception& e) {
                 log.info("index: " + plx + "; " + e.what() + ": rebuilding");
             }

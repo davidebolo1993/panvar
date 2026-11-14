@@ -65,9 +65,12 @@ cp -r idx1 idxr
 "${RC[@]}" --save-index idxr "${TX[@]}" 2> reuse.txt
 check "an index with the same transcripts is reused" 'grep -q "current, reused" reuse.txt'
 "${RC[@]}" --save-index idxr --locus data/locus.gfa 2> drop.txt
-check "the same graph without the transcripts is rebuilt" 'grep -q "rebuilding" drop.txt'
+check "the same graph without the transcripts is rebuilt, and the log says what is lost" 'grep -q "built with transcripts, none given now: rebuilding" drop.txt'
 "${RC[@]}" --save-index idxr "${TX[@]}" --transcripts-ok-only 2> okonly.txt
-check "taking status ok only is another index" 'grep -q "rebuilding" okonly.txt && grep -q "status ok only" idxr/locus.index.tsv'
+check "given transcripts again, it is rebuilt with them, and the log says so" 'grep -q "built without transcripts, given now: rebuilding" okonly.txt'
+check "taking status ok only is another index" 'grep -q "status ok only" idxr/locus.index.tsv'
+"${RC[@]}" --save-index idxr "${TX[@]}" 2> other.txt
+check "other settings are a rebuild without that note" 'grep -q "built from another graph, background or settings: rebuilding" other.txt'
 "$BIN" recruit -t 2 --background s1 -r ref --index-only --save-index idx4 "${TX[@]}" 2> cal.txt; rc=$?
 check "a calibrated index with transcripts builds" '[[ $rc -eq 0 ]] && grep -q "calibration: short reads" cal.txt'
 score idx4 reads.fq r4.tsv; dump idx4
