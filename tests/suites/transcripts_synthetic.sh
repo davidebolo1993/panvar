@@ -57,6 +57,9 @@ for c in $(python3 "$TOOLS/transcript_fixture.py" cases); do
 done
 
 # haplotypes' own annotations: copies they disagree on, and annotated transcripts alone
+printf 'molecule\tgene\tstart\tend\tstrand\nh1#1#ctg1:0-12000\tGB\t0\t1\t0\n' > gb.bed
+check "the copy check reads the projection's copies, not the annotation's" \
+  'python3 "$TOOLS/../../dev/transcripts_copies.py" case_annotated/out.hst.tsv gb.bed | grep -q "^GB	1	1	"'
 check "an exon without its transcript record is reported" 'grep -q "1 exon row(s) whose transcript record is missing" case_annotated/log'
 check "the summary notes a gene's copies where the annotation differs" 'awk -F"\t" "\$2==\"GB\"" case_annotated/out.hst.summary.tsv | grep -q "h1#1:1/2"'
 "$BIN" transcripts -i case_annotated/locus.gfa --hap-annotations case_annotated/hap_annotations.tsv \

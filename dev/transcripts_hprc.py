@@ -39,6 +39,7 @@ def select(D, locus, hst_tsv, cat_csv, lo_csv, gene, plan, extra):
         h = f.readline().rstrip('\n').split('\t')
         for l in f:
             t = dict(zip(h, l.rstrip('\n').split('\t')))
+            if t.get('source') == 'annotated': continue
             if t['gene_name'] in [gene] + extra:
                 d[t['haplotype']][t['gene_name']] = int(t['copies'])
     ok = [hp for hp in d if tuple(hp.split('#')[:2]) in cat]
@@ -103,6 +104,7 @@ def compare(D, locus, hst_tsv, gfa, gtf):
             t = l.rstrip('\n').split('\t', 7)
             if t[6] not in want: continue
             t = dict(zip(h, l.rstrip('\n').split('\t')))
+            if t.get('source') == 'annotated': continue   # only the projection is compared
             ours_genes.add(t['gene_name'])
             ours_copies[t['haplotype']][t['gene_name']] = int(t['copies']) if t['copy'] != '0' else 0
             if t['copy'] == '0' or t['exon_starts'] == '.':

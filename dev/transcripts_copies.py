@@ -2,7 +2,8 @@
 """Copies per haplotype of each gene in a pangene BED, against `panvar transcripts`' copies.
 
 usage: transcripts_copies.py <prefix>.hst.tsv <pangene.bed> [BED_NAME=GTF_NAME ...]
-A gene named differently in the BED and the GTF is given as an alias (STK19=WHR1). Per gene: haplotypes
+A gene named differently in the BED and the GTF is given as an alias (STK19=WHR1). Only projected rows
+count; transcripts only a haplotype's own annotation gives are left out. Per gene: haplotypes
 compared, how many match, both totals, and the mismatches as truth>ours: count.
 """
 import collections
@@ -15,6 +16,8 @@ with open(tsv) as fh:
     ix = {k: i for i, k in enumerate(fh.readline().rstrip("\n").split("\t"))}
     for line in fh:
         r = line.rstrip("\n").split("\t")
+        if "source" in ix and r[ix["source"]] == "annotated":
+            continue   # the haplotypes' own annotations count their copies apart
         ours[(r[ix["gene_name"]], r[ix["haplotype"]])] = int(r[ix["copies"]])
 truth = collections.Counter()
 haps = set()
