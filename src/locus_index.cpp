@@ -1139,16 +1139,19 @@ std::vector<LocusIndex> build(const BuildOptions& o) {
         for (const std::size_t li : with) {
             LocusWork& w = work[li];
             LocusIndex& x = w.idx;
+            std::vector<std::string> holding;   // the loci holding some, by name: the same list whichever were built now
             const auto count_in = [&](const LocusIndex& y) {
                 if (x.contig == y.contig && x.start < y.end && y.start < x.end) return;
                 std::uint64_t hits = 0;
                 for (std::size_t i = 0; i < x.codes.size(); ++i)
                     if (x.transcript_only[i] && y.find(x.codes[i]) >= 0) { ++w.cross[i]; ++hits; }
-                if (hits > 0) x.other_loci += (x.other_loci.empty() ? "" : ",") + y.name;
+                if (hits > 0) holding.push_back(y.name);
             };
             for (std::size_t lj = 0; lj < work.size(); ++lj)
                 if (lj != li) count_in(work[lj].idx);
             for (const LocusIndex& y : beside) count_in(y);
+            std::sort(holding.begin(), holding.end());
+            for (const std::string& name : holding) x.other_loci += (x.other_loci.empty() ? "" : ",") + name;
             for (std::size_t i = 0; i < x.codes.size(); ++i) {
                 if (!x.transcript_only[i]) continue;
                 x.tx_in_transcriptome += w.tx_count[i] > w.tx_sub[i];

@@ -163,6 +163,13 @@ check "a junction k-mer another locus's haplotypes hold is shared ($(tx idxp.loc
 "${RC3[@]}" --save-index idxp --locus data/locus.gfa --locus data/locus_p.gfa --transcripts locus=data/sc.hst.fa 2> comp2.txt; dump idxp
 check "rebuilt beside an index that is reused, it still counts that locus ($(tx idxp.locus.tsv))" \
   'grep -q "locus_p.plx; current, reused" comp2.txt && grep -q "locus.plx; .*rebuilding" comp2.txt && [[ "$(tx idxp.locus.tsv)" == "P0 S$J R0" ]]'
+THREE=(--locus data/locus.gfa --locus data/locus_b.gfa --locus data/locus_p.gfa --transcripts locus=data/locus.hst.fa
+       --transcripts locus_b=data/locus_b.hst.fa)
+"${RC3[@]}" --save-index idxo "${THREE[@]}" 2> /dev/null
+cp -r idxo idxo2; rm idxo2/locus.plx idxo2/locus_p.plx   # rebuilt beside locus_b, which is reused
+"${RC3[@]}" --save-index idxo2 "${THREE[@]}" 2> order.txt
+check "an index rebuilt beside a reused one and a rebuilt one names its other loci in one order: the same file" \
+  'grep -q "locus_b.plx; current, reused" order.txt && grep -q "in other loci of the run (locus_b,locus_p)" idxo/locus.index.tsv && cmp -s idxo/locus.plx idxo2/locus.plx && cmp -s idxo/locus.index.tsv idxo2/locus.index.tsv'
 "${RC3[@]}" --save-index idx9 --locus data/locus_b.gfa --transcripts data/locus_b.hst.fa 2> log9.txt; dump idx9 locus_b
 check "indexed alone, the paralog's junction k-mers are all private ($(tx idx9.locus_b.tsv))" \
   '[[ "$(tx idx9.locus_b.tsv)" == "P$(wc -l < data/junction_nodes_b.tsv | tr -d " ") S0 R0" ]]'
