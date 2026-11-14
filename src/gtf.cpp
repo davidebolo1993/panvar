@@ -11,6 +11,7 @@
 #include <iostream>
 #include <map>
 #include <stdexcept>
+#include <tuple>
 #include <unordered_set>
 
 namespace panvar {
@@ -193,6 +194,67 @@ std::vector<GeneFeature> parse_gtf(const std::string& gtf_path,
                       << "; continuing without gene annotation\n";
     }
     return genes;
+}
+
+std::vector<TranscriptFeature> parse_gtf_transcripts(const std::string& gtf_path,
+                                                     const std::string& ref_chrom,
+                                                     std::size_t lo_1based,
+                                                     std::size_t hi_1based,
+                                                     std::vector<TranscriptFeature>* partial,
+                                                     const std::string& module) {
+    GzLineReader reader(gtf_path);
+    if (!reader.ok()) throw std::runtime_error("Failed to open GTF: " + gtf_path);
+    const std::string want = norm_chrom(ref_chrom);
+    std::map<std::string, TranscriptFeature> by_id;
+    bool chrom_seen = false;
+    std::string line;
+    while (reader.getline(line)) {
+        if (line.empty() || line[0] == '#') continue;
+        const std::vector<std::string> f = split_tab(line);
+        if (f.size() < 9 || (f[2] != "exon" && f[2] != "CDS")) continue;
+        if (norm_chrom(f[0]) != want) continue;
+        chrom_seen = true;
+        std::size_t start = 0, end = 0;
+        try {
+            start = static_cast<std::size_t>(std::stoull(f[3]));
+            end = static_cast<std::size_t>(std::stoull(f[4]));
+        } catch (const std::exception&) { continue; }
+        const std::string tid = gtf_attr(f[8], "transcript_id");
+        if (tid.empty() || end < start) continue;
+        TranscriptFeature& t = by_id[tid];
+        if (t.transcript_id.empty()) {
+            t.transcript_id = tid;
+            t.transcript_name = gtf_attr(f[8], "transcript_name");
+            if (t.transcript_name.empty()) t.transcript_name = tid;
+            t.gene_id = gtf_attr(f[8], "gene_id");
+            t.gene_name = gtf_attr(f[8], "gene_name");
+            if (t.gene_name.empty()) t.gene_name = t.gene_id;
+            t.biotype = gtf_attr(f[8], "transcript_biotype");
+            if (t.biotype.empty()) t.biotype = gtf_attr(f[8], "transcript_type");
+            t.strand = f[6] == "-" ? '-' : '+';
+        }
+        if (f[8].find("\"Ensembl_canonical\"") != std::string::npos) t.canonical = true;
+        (f[2] == "exon" ? t.exons : t.cds).emplace_back(start, end);
+    }
+    if (!chrom_seen)
+        std::cerr << cli::log_prefix(module) << "warning: gtf " << gtf_path << " has no exon rows on '" << ref_chrom
+                  << "'\n";
+    std::vector<TranscriptFeature> out;
+    for (auto& [tid, t] : by_id) {
+        if (t.exons.empty()) continue;   // CDS rows without exon rows
+        std::sort(t.exons.begin(), t.exons.end());
+        std::sort(t.cds.begin(), t.cds.end());
+        const std::size_t lo = t.exons.front().first, hi = t.exons.back().second;
+        if (hi < lo_1based || lo > hi_1based) continue;
+        if (lo >= lo_1based && hi <= hi_1based) out.push_back(std::move(t));
+        else if (partial != nullptr) partial->push_back(std::move(t));
+    }
+    const auto by_gene = [](const TranscriptFeature& a, const TranscriptFeature& b) {
+        return std::tie(a.gene_id, a.transcript_id) < std::tie(b.gene_id, b.transcript_id);
+    };
+    std::sort(out.begin(), out.end(), by_gene);
+    if (partial != nullptr) std::sort(partial->begin(), partial->end(), by_gene);
+    return out;
 }
 
 std::unordered_map<std::string, std::vector<int>> project_genes_to_nodes(

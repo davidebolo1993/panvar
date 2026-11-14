@@ -30,6 +30,29 @@ struct GeneFeature {
     std::vector<std::pair<std::size_t, std::size_t>> canonical_cds;
 };
 
+// One transcript of a GTF, from its exon rows, in reference coordinates.
+struct TranscriptFeature {
+    std::string transcript_id;
+    std::string transcript_name;   // falls back to transcript_id
+    std::string gene_id;
+    std::string gene_name;         // falls back to gene_id
+    std::string biotype;           // transcript_biotype (Ensembl) or transcript_type (GENCODE)
+    char strand = '+';
+    bool canonical = false;        // tagged Ensembl_canonical
+    std::vector<std::pair<std::size_t, std::size_t>> exons;   // 1-based, inclusive, ascending
+    std::vector<std::pair<std::size_t, std::size_t>> cds;     // coding parts of the exons, as exons
+};
+
+// Transcripts on `ref_chrom` (matched as parse_gtf does) with an exon overlapping [lo_1based, hi_1based].
+// Those with every exon inside the interval are returned, sorted by gene then transcript id; those with
+// exons outside it go to `partial` when given. Exons are read from the 'exon' rows, coding parts from 'CDS'.
+std::vector<TranscriptFeature> parse_gtf_transcripts(const std::string& gtf_path,
+                                                     const std::string& ref_chrom,
+                                                     std::size_t lo_1based,
+                                                     std::size_t hi_1based,
+                                                     std::vector<TranscriptFeature>* partial = nullptr,
+                                                     const std::string& module = "panvar");
+
 // True iff `name` looks like PanSN `sample#hap#contig:start-end`: at least two '#'
 // separators and a parseable ":start-end" interval. Annotation is gated on this.
 bool is_pansn(const std::string& name);
