@@ -390,6 +390,14 @@ if(PANVAR_BUILD_TESTING)
                      COMMAND /usr/bin/env bash ${PANVAR_TX_SYN} $<TARGET_FILE:panvar> ${CMAKE_CURRENT_SOURCE_DIR}/tests/tools ${CMAKE_CURRENT_BINARY_DIR}/transcripts_synthetic)
             set_tests_properties(panvar_transcripts_synthetic PROPERTIES TIMEOUT 120)
         endif()
+        # transcripts on real hyperpolymorphic loci: a single-copy gene gets a copy on nearly every haplotype.
+        set(PANVAR_TX_REAL ${CMAKE_CURRENT_SOURCE_DIR}/tests/suites/transcripts_real.sh)
+        if(EXISTS ${PANVAR_TX_REAL} AND EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/real_data/hla/hla_c.gfa.gz
+           AND EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/real_data/Homo_sapiens.GRCh38.116.loci.gtf.gz)
+            add_test(NAME panvar_transcripts_real
+                     COMMAND /usr/bin/env bash ${PANVAR_TX_REAL} $<TARGET_FILE:panvar> ${CMAKE_CURRENT_SOURCE_DIR}/tests/real_data ${CMAKE_CURRENT_BINARY_DIR}/transcripts_real)
+            set_tests_properties(panvar_transcripts_real PROPERTIES TIMEOUT 300 LABELS "real")
+        endif()
         # Fast, dependency-free smoke on a tiny hand-built graph that exercises every
         # call event type + confounders with exact-record assertions (no vg needed).
         set(PANVAR_SYN_SMOKE ${CMAKE_CURRENT_SOURCE_DIR}/tests/suites/synthetic_smoke.sh)
