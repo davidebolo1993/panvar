@@ -87,8 +87,10 @@ Manifest read_manifest(const std::string& store_dir) {
     }
     if (!v.has("format") || v.at("format").str() != "panvar-background")
         throw std::runtime_error("background: " + path + " is not a background manifest");
-    if (v.at("version").u64() != 2)
-        throw std::runtime_error("background: " + path + " is format version " + v.at("version").text + "; this panvar reads version 2 (rebuild the store)");
+    // version 3 is version 2 with transcriptomes: a panvar that knows none refuses it, instead of rewriting the
+    // manifest without them and cleaning their folders away
+    if (v.at("version").u64() != 2 && v.at("version").u64() != 3)
+        throw std::runtime_error("background: " + path + " is format version " + v.at("version").text + "; this panvar reads versions 2 and 3 (rebuild the store)");
     if (v.at("k").u64() != kK || v.at("minimizer").u64() != kM) throw std::runtime_error("background: " + path + ": k or minimizer differ");
     Manifest m;
     m.store_id = v.at("store_id").str();
@@ -122,7 +124,7 @@ Manifest read_manifest(const std::string& store_dir) {
 void write_manifest(const std::string& store_dir, const Manifest& m) {
     const std::string path = (fs::path(store_dir) / "manifest.json").string(), tmp = path + ".tmp";
     std::ostringstream o;
-    o << "{\n  \"format\": \"panvar-background\",\n  \"version\": 2,\n  \"store_id\": " << json::quote(m.store_id)
+    o << "{\n  \"format\": \"panvar-background\",\n  \"version\": " << (m.transcriptomes.empty() ? 2 : 3) << ",\n  \"store_id\": " << json::quote(m.store_id)
       << ",\n  \"generation\": " << m.generation << ",\n  \"k\": " << kK << ",\n  \"minimizer\": " << kM
       << ",\n  \"partitions\": " << m.partitions << ",\n  \"next_segment\": " << m.next_segment << ",\n  \"coordinate_references\": [";
     for (std::size_t i = 0; i < m.references.size(); ++i)

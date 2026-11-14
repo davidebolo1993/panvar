@@ -98,6 +98,8 @@ check "transcripts for a locus not given are refused" 'grep -q "no --locus graph
 echo "== the transcriptome"
 "${BG[@]}" -o s1 --add --transcriptome tx=data/tx_own.fa; rc=$?
 check "a transcriptome is added to the store" '[[ $rc -eq 0 ]] && grep -q "\"transcriptomes\"" s1/manifest.json && [[ -d s1/tx-0 ]]'
+check "its manifest is format version 3, which a panvar without transcriptomes refuses; a store without one stays version 2" \
+  'grep -q "\"version\": 3," s1/manifest.json && grep -q "\"version\": 2," s3/manifest.json'
 "${RC[@]}" --save-index idx0b --locus data/locus.gfa 2> log0b.txt
 check "an index without transcripts is the same file with a transcriptome in the store" 'cmp -s idx0/locus.plx idx0b/locus.plx'
 cp -r idx1 idxs
