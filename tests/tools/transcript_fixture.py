@@ -100,6 +100,13 @@ CASES = {
         haps={"h1": [("sub", (1000, 1120)), ("sub", (2000, 2105))], "h2": [("del", (4950, 5350))],
               "h3": [("sub", (1000, 1120)), ("sub", (2000, 2105)), ("del", (2297, 2305))]},
         reversed={"h4": "h1"}),
+    # a gene whose every exon lies on an allele node, 95% identical: no exonic node is shared, and the chain
+    # through its introns and flanks points to it
+    "allele_exons": dict(
+        L=5000, sub_step=20,
+        genes={"GQ": ("+", {"TQ1": [(1000, 1300), (2000, 2300), (3000, 3300)]})},
+        haps={"h1": [("sub", (1000, 1300)), ("sub", (2000, 2300)), ("sub", (3000, 3300))]},
+        reversed={"h2": "h1"}),
     # the main case with haplotypes' own annotations (write_annotated)
     "annotated": dict(),
 }

@@ -1293,7 +1293,10 @@ TranscriptsResult project_transcripts(const Graph& graph, const TranscriptsOptio
         const Occurrences occ(H, t.seq.size());
         std::vector<Pass> passes;
         std::vector<double> best_share(genes.size(), 0.0);
-        std::vector<Pass> weak(genes.size());   // per gene, its best pass below the share: where to look by sequence
+        // per gene, its best pass below the share, where to look by sequence: by the marker's bases it matches,
+        // then by all it matches, as a chain through introns and flanks alone still points to the gene
+        std::vector<Pass> weak(genes.size());
+        const auto reach = [](const Pass& p) { return std::make_pair(p.marker_matched, p.matched); };
         UnitCache unit_cache;
         for (std::size_t gi = 0; gi < genes.size(); ++gi) {
             const Gene& g = genes[gi];
@@ -1314,7 +1317,7 @@ TranscriptsResult project_transcripts(const Graph& graph, const TranscriptsOptio
                     Pass p = make_pass(R, g, marker_cuts[gi], W, chains[k], t, gi, rev);
                     best_share[gi] = std::max(best_share[gi], p.share);
                     if (p.share >= opt.min_exon_share) passes.push_back(std::move(p));
-                    else if (p.marker_matched > weak[gi].marker_matched) weak[gi] = std::move(p);
+                    else if (reach(p) > reach(weak[gi])) weak[gi] = std::move(p);
                 }
             }
         }
@@ -1343,7 +1346,7 @@ TranscriptsResult project_transcripts(const Graph& graph, const TranscriptsOptio
             std::vector<std::size_t> order;
             for (std::size_t gi = 0; gi < genes.size(); ++gi) {
                 const Pass& wp = weak[gi];
-                if (!gene_passes[gi].empty() || !lost_to[gi].empty() || !genes[gi].tandem_spans.empty() || wp.marker_matched == 0) continue;
+                if (!gene_passes[gi].empty() || !lost_to[gi].empty() || !genes[gi].tandem_spans.empty() || wp.matched == 0) continue;
                 found[gi] = place_by_sequence(R, rseq, genes[gi], marker_cuts[gi], wp, wp.reverse ? Hr : H, wp.reverse ? hrseq : hseq);
                 if (found[gi].ok && found[gi].identity >= opt.min_identity && found[gi].coverage >= kPartialCoverage) order.push_back(gi);
             }
