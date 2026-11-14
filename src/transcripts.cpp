@@ -919,8 +919,8 @@ SeqCopy align_stretch(const Walk& R, const std::string& rseq, const Gene& g, con
 
 // A gene's copy found by sequence where its nodes fall short of the share. The gene's span is aligned first,
 // within a band: a copy lies within it. Failing that, the marker's span is aligned at any distance, which
-// is enough to tell a partial copy, or a copy of a short gene with a long isoform beside it; exons outside
-// the marker's span are then not aligned.
+// is enough to tell a partial copy, or a copy of a short gene with a long isoform beside it; exons reaching
+// past the marker's span and its kEndFlank bases on each side are then not aligned.
 SeqCopy place_by_sequence(const Walk& R, const std::string& rseq, const Gene& g, const Cuts& marker, const Pass& p,
                           const Walk& W, const std::string& wseq) {
     const auto cells = [](std::size_t len) {
