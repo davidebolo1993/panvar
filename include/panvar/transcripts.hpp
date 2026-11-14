@@ -36,8 +36,8 @@ struct TranscriptsOptions {
 };
 
 // Least to most severe; a record takes the most severe that applies.
-enum class HstStatus { Ok, SpliceSiteChanged, BoundaryMoved, ClippedAtEdge, IntronLost, MissingExon, NoCopy };
-constexpr int kHstStatuses = 7;
+enum class HstStatus { Ok, SpliceSiteChanged, BoundaryMoved, ClippedAtEdge, IntronLost, NotAsAnnotated, MissingExon, NoCopy };
+constexpr int kHstStatuses = 8;
 const char* hst_status_name(HstStatus s);
 
 // Where an HST comes from: projected from the reference annotation, cut from the haplotype's own annotation,
@@ -82,7 +82,8 @@ struct TranscriptsResult {
     std::vector<std::string> haplotypes;           // path names, Graph::paths order
     std::vector<AnnotatedTranscript> annotated;    // the haplotypes' own transcripts
     std::vector<char> has_annotation;              // per path: its haplotype has an annotation
-    std::vector<std::string> not_given_back;       // transcripts the reference walk does not give back as annotated
+    std::vector<std::string> not_given_back;       // transcripts the reference walk does not give back as annotated:
+                                                   // their records on it have status not_as_annotated
 };
 
 // Projects every transcript of the GTF with an exon on the reference path onto every path of `graph`, and

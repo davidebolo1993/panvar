@@ -67,11 +67,19 @@ CASES = {
     # exons inside a repeat unit the reference walks three times and haplotypes 1, 3 or 5 times
     "tandem": dict(units={"ref": 3, "h1": 1, "h2": 5, "h3": 3}, reversed={"h4": "h2"}),
     # reference units whose exons differ in length (100, 150, 100 bases from one start)
-    "tandem_layout": dict(units={"ref": 3, "h1": 3, "h2": 1, "h3": 5}, layout=[400, 450, 400], reversed={"h4": "h1"}),
+    "tandem_layout": dict(units={"ref": 3, "h1": 3, "h2": 1, "h3": 5}, layout=[[(300, 400)], [(300, 450)], [(300, 400)]],
+                          reversed={"h4": "h1"}),
     # a haplotype with 50 units between 2 kb flanks
     "tandem_long": dict(units={"ref": 3, "h1": 50}),
     # 150 bases inserted inside one unit's exon
-    "tandem_insert": dict(units={"ref": 3, "h1": 3, "h2": 4}, insert={"h1": 1, "h2": 3}),
+    "tandem_insert": dict(units={"ref": 3, "h1": 3, "h2": 4}, insert={"h1": (1, 1, 150), "h2": (3, 1, 150)}),
+    # a unit whose exon's first node differs (the first unit of one haplotype, a middle one of another)
+    "tandem_nostart": dict(units={"ref": 3, "h1": 3, "h2": 4}, alt={"h1": (0, "b"), "h2": (2, "b")}),
+    # a node walked twice inside a unit, the exon ending at its second visit
+    "tandem_revisit": dict(units={"ref": 3, "h1": 3, "h2": 2}, pieces=[("S", 50), ("E", 50), ("M", 400), ("T", 450)],
+                           order=["S", "E", "M", "E", "T"], layout=[[(0, 550)]] * 3),
+    # a reference unit without exons between two with
+    "tandem_empty": dict(units={"ref": 3, "h1": 3, "h2": 4, "h3": 2}, layout=[[(300, 400)], [], [(300, 400)]]),
     # the main case with haplotypes' own annotations (write_annotated)
     "annotated": dict(),
 }
@@ -228,41 +236,70 @@ def name(h, L):
     return f"ref#0#chr1:{OFFSET}-{OFFSET + L}" if h == "ref" else f"{h}#1#ctg{h[1:]}:0-{L}"
 
 
+PIECES = [("a", 300), ("b", 50), ("c", 50), ("d", 50), ("e", 550)]   # the default unit, 1 kb
+
+
 def write_tandem(case, d):
     """Flank A (2 kb), a 1 kb unit walked n times over the same nodes, flank B (2 kb). Gene GT has an exon in
-    A, one in each unit and one in B, so each haplotype's transcript has n unit exons. The reference's unit
-    exons start at one node and end at base 400 or 450 of the unit (`layout`, per reference unit); a
-    haplotype's unit j takes the layout of reference unit j when the counts agree, else of unit j * k / n.
-    `insert` puts 150 bases inside the exon of one unit of a haplotype."""
+    A, the exons of each reference unit's layout (offsets in the unit; a unit may have none), and one in B.
+    A unit is a walk over pieces (`order`; a piece may come twice). A haplotype's unit j takes the layout of
+    reference unit j when the counts agree. `alt` puts a changed copy of one piece in
+    one unit of a haplotype; `insert` puts bases after a piece of one unit. Units are told apart by sequence:
+    with identical units, only the last (which runs into flank B) differs, so a haplotype's last unit takes
+    the reference's last layout and the others the layout nearest their relative position."""
     rnd = random.Random(11)
     seq = lambda n: "".join(rnd.choice("ACGT") for _ in range(n))
-    A, U, B, I = list(seq(2000)), list(seq(1000)), list(seq(2000)), seq(150)
-    A[1600:1602], U[298:300], U[400:402], U[450:452], B[498:500] = "GT", "AG", "GT", "GT", "AG"
-    A, U, B = "".join(A), "".join(U), "".join(B)
-    nodes = {"1": A, "2": U[:300], "3": U[300:350], "4": U[350:400], "5": U[400:450], "6": U[450:], "7": B, "8": I}
+    A, B = list(seq(2000)), list(seq(2000))
+    A[1600:1602], B[498:500] = "GT", "AG"
+    A, B = "".join(A), "".join(B)
+    pieces = case.get("pieces", PIECES)
+    piece = {n: seq(length) for n, length in pieces}
+    order = case.get("order", [n for n, _ in pieces])
     units, k = case["units"], case["units"]["ref"]
-    layout = case.get("layout", [400] * k)
-    insert = case.get("insert", {})
+    layout = case.get("layout", [[(300, 400)]] * k)
+    alt, insert = case.get("alt", {}), case.get("insert", {})
+    nodes = {"A": A, "B": B, **piece}
+    for h, (j, n) in alt.items():
+        s = list(piece[n])
+        s[len(s) // 2] = {"A": "C", "C": "G", "G": "T", "T": "A"}[s[len(s) // 2]]
+        nodes[f"{n}x"] = "".join(s)
+    for h, (j, i, length) in insert.items():
+        nodes["I"] = seq(length) if "I" not in nodes else nodes["I"]
+    ids = {n: str(k + 1) for k, n in enumerate(nodes)}
+
+    def unit(h, j):   # (node names, sequence, insertion offset and length)
+        names = list(order)
+        if h in alt and alt[h][0] == j:
+            names[names.index(alt[h][1])] = alt[h][1] + "x"
+        ins = None
+        if h in insert and insert[h][0] == j:
+            at = insert[h][1] + 1
+            ins = (sum(len(nodes[x]) for x in names[:at]), len(nodes["I"]))
+            names.insert(at, "I")
+        return names, "".join(nodes[x] for x in names), ins
 
     def walk(h, n):
-        w = ["1"]
+        w = ["A"]
         for j in range(n):
-            w += ["2", "3", "8", "4", "5", "6"] if insert.get(h) == j else ["2", "3", "4", "5", "6"]
-        return w + ["7"]
+            w += unit(h, j)[0]
+        return w + ["B"]
 
-    walks = {h: [(x, "+") for x in walk(h, n)] for h, n in units.items()}
+    walks = {h: [(ids[x], "+") for x in walk(h, n)] for h, n in units.items()}
     for h, src in case.get("reversed", {}).items():
-        walks[h] = [(x, "-") for x in reversed(walk(src, units[src]))]
+        walks[h] = [(ids[x], "-") for x in reversed(walk(src, units[src]))]
+    edges = set()
+    for steps in walks.values():
+        for (x, ox), (y, oy) in zip(steps, steps[1:]):
+            edges.add((x, ox, y, oy))
     L = 2000 + 1000 * k + 2000
-    exons = ([(1500, 1600)] + [(2000 + 1000 * u + 300, 2000 + 1000 * u + layout[u]) for u in range(k)] +
+    exons = ([(1500, 1600)] + [(2000 + 1000 * u + a, 2000 + 1000 * u + b) for u in range(k) for a, b in layout[u]] +
              [(2000 + 1000 * k + 500, 2000 + 1000 * k + 600)])
     with open(f"{d}/locus.gfa", "w") as out:
         out.write("H\tVN:Z:1.0\n")
         for n, s in nodes.items():
-            out.write(f"S\t{n}\t{s}\n")
-        for e in ("1 2", "2 3", "3 4", "3 8", "8 4", "4 5", "5 6", "6 2", "6 7"):
-            a, b = e.split()
-            out.write(f"L\t{a}\t+\t{b}\t+\t0M\n")
+            out.write(f"S\t{ids[n]}\t{s}\n")
+        for x, ox, y, oy in sorted(edges):
+            out.write(f"L\t{x}\t{ox}\t{y}\t{oy}\t0M\n")
         for h, steps in walks.items():
             out.write(f"P\t{name(h, L)}\t{','.join(n + o for n, o in steps)}\t*\n")
     attr = 'gene_id "GT"; gene_name "GT"; gene_biotype "protein_coding"; transcript_id "TT1"; transcript_name "TT1"; tag "Ensembl_canonical";'
@@ -270,18 +307,25 @@ def write_tandem(case, d):
         out.write(f"chr1\ttest\ttranscript\t{exons[0][0] + OFFSET + 1}\t{exons[-1][1] + OFFSET}\t.\t+\t.\t{attr}\n")
         for a, b in exons:
             out.write(f"chr1\ttest\texon\t{a + OFFSET + 1}\t{b + OFFSET}\t.\t+\t.\t{attr}\n")
+    ref_count = sum(len(x) for x in layout)
     with open(f"{d}/expected.tsv", "w") as out:
         out.write("transcript_id\tgene_name\thaplotype\tcopy\tstatus\tdetail\tsequence\n")
         for h in walks:
             src = case.get("reversed", {}).get(h, h)
             n = units[src]
-            notes = [f"tandem:{k}>{n}"] if n != k else []
-            body = ""
+            body, count, resized = "", 0, 0
             for j in range(n):
-                end = layout[j if n == k else j * k // n]
-                body += U[300:350] + (I if insert.get(src) == j else "") + U[350:end]
-            if src in insert:
-                notes.append("tandem_resized:1")
+                _, useq, ins = unit(src, j)
+                g = j if n == k else k - 1 if j == n - 1 else min(j * k // n, k - 2)
+                for a, b in layout[g]:
+                    if ins and ins[0] <= a:
+                        a, b = a + ins[1], b + ins[1]
+                    elif ins and a < ins[0] < b:
+                        b += ins[1]
+                        resized += 1
+                    body += useq[a:b]
+                    count += 1
+            notes = ([f"tandem:{ref_count}>{count}"] if count != ref_count else []) + ([f"tandem_resized:{resized}"] if resized else [])
             out.write(f"TT1\tGT\t{name(h, L)}\t1\tok\t{';'.join(notes) or '.'}\t{A[1500:1600] + body + B[500:600]}\n")
 
 

@@ -1,11 +1,14 @@
 #include "panvar/transcripts.hpp"
 
+#include "edlib.h"
+
 #include "panvar/cli_utils.hpp"
 #include "panvar/graph_utils.hpp"
 #include "panvar/parallel.hpp"
 #include "panvar/ref_path.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdio>
 #include <fstream>
@@ -26,6 +29,7 @@ const char* hst_status_name(HstStatus s) {
         case HstStatus::BoundaryMoved: return "boundary_moved";
         case HstStatus::ClippedAtEdge: return "clipped_at_edge";
         case HstStatus::IntronLost: return "intron_lost";
+        case HstStatus::NotAsAnnotated: return "not_as_annotated";
         case HstStatus::MissingExon: return "missing_exon";
         case HstStatus::NoCopy: return "no_copy";
     }
@@ -367,81 +371,120 @@ std::string signed_text(long v) { return (v > 0 ? "+" : "") + std::to_string(v);
 
 // Exons of a transcript that repeat with a tandem unit: exons starting at the same node and offset of the
 // reference walk, as a unit the reference walks several times holds the same exon in each pass. The stretch
-// from the first to the last such exon is cut into units, each starting where the stretch's first exon
-// starts; a unit's layout is the kinds of exon it holds, in order. On a haplotype the same start cuts its
-// walk into units, and each unit takes the layout of one reference unit, so the transcript follows the
-// haplotype's own number of units and the reference walk gives back its annotation.
+// from the first to the last such exon is projected unit by unit, by sequence: the reference's window
+// between the exons around the stretch is cut into a head, its units (each starting where the walk passes
+// the stretch's first exon start, annotated or not) and a tail; on a haplotype the head and tail are
+// aligned at the ends of its window and the units tile the rest, each aligned to the reference unit it
+// resembles most, whose annotated exons (perhaps none) are lifted through that alignment.
 struct Tandem {
     bool any = false;
     std::size_t lo = 0, hi = 0;   // genomic exon indices of the stretch, inclusive
-    struct Kind {
-        int start_node = 0, end_node = 0;
-        char start_rev = 0, end_rev = 0;
-        std::size_t start_off = 0, end_off = 0;   // offsets of the exon's first and last base in their nodes
-        std::size_t ref_exon = 0, len = 0;
+    std::size_t rl = 0, rh = 0;   // the reference window: from the exon before the stretch to the one after
+    std::size_t first = 0;        // where its first unit starts
+    // where the stretch starts or ends the transcript: the window reaches the nearest node the gene's
+    // stretch of the reference holds once (its step), which the haplotype's pass may share
+    std::size_t lo_anchor = SIZE_MAX, hi_anchor = SIZE_MAX;
+    std::string head, tail;       // the window's sequence before the first unit and after the last
+    struct Unit {
+        std::string seq;
+        std::vector<std::array<std::size_t, 3>> exons;   // in the unit: start, end, the reference exon
+        std::vector<std::uint64_t> kmers;               // distinct 15-mers, sorted
     };
-    std::vector<Kind> kinds;
-    std::vector<std::vector<std::size_t>> units;   // per reference unit, its exons' kinds in order
-    std::vector<std::vector<int>> unit_nodes;      // per reference unit, its nodes (sorted, distinct)
-    std::vector<std::size_t> unit_len;             // per reference unit, its bases (the last: a whole unit's)
+    std::vector<Unit> units;
+    std::size_t min_len = 0;
+    std::vector<std::pair<std::string, bool>> probes;   // the units' distinct first and last 200 bases (true: first)
 };
 
 std::size_t step_at(const Walk& w, std::size_t c) {
     return static_cast<std::size_t>(std::upper_bound(w.pref.begin(), w.pref.end(), c) - w.pref.begin()) - 1;
 }
 
-Tandem find_tandem(const Walk& R, const Cuts& cuts) {
+constexpr std::size_t kUnitK = 15;
+
+std::vector<std::uint64_t> unit_kmers(const std::string& s) {
+    std::vector<std::uint64_t> v;
+    std::uint64_t code = 0, valid = 0;
+    const std::uint64_t mask = (1ULL << (2 * kUnitK)) - 1;
+    for (const char c : s) {
+        const int x = c == 'A' ? 0 : c == 'C' ? 1 : c == 'G' ? 2 : c == 'T' ? 3 : -1;
+        if (x < 0) { valid = 0; continue; }
+        code = ((code << 2) | static_cast<std::uint64_t>(x)) & mask;
+        if (++valid >= kUnitK) v.push_back(code);
+    }
+    std::sort(v.begin(), v.end());
+    v.erase(std::unique(v.begin(), v.end()), v.end());
+    return v;
+}
+
+double jaccard(const std::vector<std::uint64_t>& a, const std::vector<std::uint64_t>& b) {
+    std::size_t common = 0;
+    for (std::size_t i = 0, j = 0; i < a.size() && j < b.size();) {
+        if (a[i] < b[j]) ++i;
+        else if (b[j] < a[i]) ++j;
+        else { ++common; ++i; ++j; }
+    }
+    const std::size_t all = a.size() + b.size() - common;
+    return all ? static_cast<double>(common) / static_cast<double>(all) : 0.0;
+}
+
+Tandem find_tandem(const Walk& R, const std::string& rseq, const Cuts& cuts, const Gene& g) {
     Tandem t;
-    std::vector<Tandem::Kind> kind(cuts.size());
-    std::map<std::tuple<int, char, std::size_t>, std::size_t> starts;
+    using Key = std::tuple<int, char, std::size_t>;
+    std::vector<Key> start(cuts.size());
+    std::map<Key, std::size_t> starts;
     for (std::size_t k = 0; k < cuts.size(); ++k) {
-        const std::size_t i = step_at(R, cuts[k].first), j = step_at(R, cuts[k].second - 1);
-        kind[k] = {R.node[i], R.node[j], R.rev[i], R.rev[j], cuts[k].first - R.pref[i], cuts[k].second - 1 - R.pref[j],
-                   k, cuts[k].second - cuts[k].first};
-        ++starts[{R.node[i], R.rev[i], kind[k].start_off}];
+        const std::size_t i = step_at(R, cuts[k].first);
+        start[k] = Key{R.node[i], R.rev[i], cuts[k].first - R.pref[i]};
+        ++starts[start[k]];
     }
     for (std::size_t k = 0; k < cuts.size(); ++k) {
-        if (starts[{kind[k].start_node, kind[k].start_rev, kind[k].start_off}] < 2) continue;
+        if (starts[start[k]] < 2) continue;
         if (!t.any) t.lo = k;
         t.hi = k;
         t.any = true;
     }
     if (!t.any) return t;
-    const auto same_start = [&](const Tandem::Kind& x, const Tandem::Kind& y) {
-        return std::tie(x.start_node, x.start_rev, x.start_off) == std::tie(y.start_node, y.start_rev, y.start_off);
-    };
-    std::vector<std::size_t> unit_start;
-    for (std::size_t k = t.lo; k <= t.hi; ++k) {
-        const Tandem::Kind& x = kind[k];
-        std::size_t id = t.kinds.size();
-        for (std::size_t q = 0; q < t.kinds.size(); ++q) {
-            const Tandem::Kind& y = t.kinds[q];
-            if (same_start(x, y) && std::tie(y.end_node, y.end_rev, y.end_off) == std::tie(x.end_node, x.end_rev, x.end_off))
-                id = q;
+    const std::size_t n = cuts.size();
+    t.rl = t.lo > 0 ? cuts[t.lo - 1].second : cuts[t.lo].first;
+    t.rh = t.hi + 1 < n ? cuts[t.hi + 1].first : cuts[t.hi].second;
+    if (t.lo == 0)
+        for (std::size_t i = step_at(R, t.rl); i-- > g.gs;)
+            if (g.uniq[i - g.gs]) { t.lo_anchor = i; t.rl = R.pref[i + 1]; break; }
+    if (t.hi + 1 == n)
+        for (std::size_t i = step_at(R, t.rh - 1) + 1; i < g.ge; ++i)
+            if (g.uniq[i - g.gs]) { t.hi_anchor = i; t.rh = R.pref[i]; break; }
+    // the units: where the walk passes the first exon's start inside the window
+    const auto [node, rev, off] = start[t.lo];
+    std::vector<std::size_t> occ;
+    for (std::size_t i = step_at(R, t.rl); i < R.size() && R.pref[i] < t.rh; ++i)
+        if (R.node[i] == node && R.rev[i] == rev && R.pref[i] + off >= t.rl && R.pref[i] + off < t.rh) occ.push_back(R.pref[i] + off);
+    std::vector<std::size_t> lens;
+    for (std::size_t u = 0; u + 1 < occ.size(); ++u) lens.push_back(occ[u + 1] - occ[u]);
+    std::sort(lens.begin(), lens.end());
+    // the last unit runs a typical unit's length, and at least to the stretch's last exon
+    const std::size_t typical = lens.empty() ? t.rh - occ.back() : lens[lens.size() / 2];
+    const std::size_t last_end = std::min(t.rh, std::max(occ.back() + typical, cuts[t.hi].second));
+    t.first = occ.front();
+    t.head = rseq.substr(t.rl, occ.front() - t.rl);
+    t.tail = rseq.substr(last_end, t.rh - last_end);
+    for (std::size_t u = 0; u < occ.size(); ++u) {
+        Tandem::Unit un;
+        const std::size_t a = occ[u], b = u + 1 < occ.size() ? occ[u + 1] : last_end;
+        un.seq = rseq.substr(a, b - a);
+        for (std::size_t k = t.lo; k <= t.hi; ++k)
+            if (cuts[k].first >= a && cuts[k].first < b)
+                un.exons.push_back({cuts[k].first - a, std::min(cuts[k].second, b) - a, k});
+        un.kmers = unit_kmers(un.seq);
+        t.units.push_back(std::move(un));
+    }
+    t.min_len = SIZE_MAX;
+    for (const auto& un : t.units) t.min_len = std::min(t.min_len, un.seq.size());
+    for (const bool at_start : {true, false})
+        for (const auto& un : t.units) {
+            const std::size_t len = std::min<std::size_t>(200, un.seq.size());
+            std::pair<std::string, bool> pr{at_start ? un.seq.substr(0, len) : un.seq.substr(un.seq.size() - len), at_start};
+            if (std::find(t.probes.begin(), t.probes.end(), pr) == t.probes.end()) t.probes.push_back(std::move(pr));
         }
-        if (id == t.kinds.size()) t.kinds.push_back(x);
-        if (k == t.lo || same_start(x, kind[t.lo])) {
-            t.units.emplace_back();
-            unit_start.push_back(cuts[k].first);
-        }
-        t.units.back().push_back(id);
-    }
-    unit_start.push_back(cuts[t.hi].second);
-    for (std::size_t u = 0; u + 1 < unit_start.size(); ++u) t.unit_len.push_back(unit_start[u + 1] - unit_start[u]);
-    // The last unit ends at its last exon: it is compared over a whole unit, the median of the others.
-    if (t.units.size() > 1) {
-        std::vector<std::size_t> others(t.unit_len.begin(), t.unit_len.end() - 1);
-        std::nth_element(others.begin(), others.begin() + others.size() / 2, others.end());
-        t.unit_len.back() = std::max(t.unit_len.back(), others[others.size() / 2]);
-    }
-    for (std::size_t u = 0; u + 1 < unit_start.size(); ++u) {
-        std::vector<int> nodes;
-        const std::size_t end = std::min(unit_start[u] + t.unit_len[u], R.len());
-        for (std::size_t i = step_at(R, unit_start[u]); i < R.size() && R.pref[i] < end; ++i) nodes.push_back(R.node[i]);
-        std::sort(nodes.begin(), nodes.end());
-        nodes.erase(std::unique(nodes.begin(), nodes.end()), nodes.end());
-        t.unit_nodes.push_back(std::move(nodes));
-    }
     return t;
 }
 
@@ -452,109 +495,191 @@ struct Piece {
 
 struct Placed {
     std::vector<Piece> pieces;
-    std::size_t exact = 0, inferred = 0, resized = 0;
+    std::size_t units = 0, resized = 0, unplaced = 0;
 };
 
-// One reference unit's layout placed on walk W between bases lo and hi, kind after kind: each exon where W
-// holds its first and last nodes about its length apart. Where W lacks one of the two (a variant at the
-// exon's first or last base), the exon is placed from the other at the reference's length (`inferred`).
-// Where both are there further apart or closer than that (an indel inside the exon, up to half a unit), the
-// exon spans them, with the haplotype's bases (`resized`).
-Placed place_layout(const Walk& W, const Tandem& tm, const std::vector<std::size_t>& layout, std::size_t lo,
-                    std::size_t hi) {
-    std::vector<std::size_t> lens(tm.unit_len);
-    std::nth_element(lens.begin(), lens.begin() + lens.size() / 2, lens.end());
-    const std::size_t reach = lens[lens.size() / 2] / 2;
-    Placed out;
-    std::size_t pos = lo;
-    const auto at = [&](std::size_t j, int node, char rev) { return W.node[j] == node && W.rev[j] == rev; };
-    for (const std::size_t id : layout) {
-        const Tandem::Kind& k = tm.kinds[id];
-        const std::size_t slack = std::max<std::size_t>(30, k.len / 5);
-        std::size_t a = SIZE_MAX, b = SIZE_MAX;
-        bool exact = false, resized = false;
-        for (std::size_t j = step_at(W, pos); j < W.size() && W.pref[j] < hi && a == SIZE_MAX; ++j) {
-            if (!at(j, k.start_node, k.start_rev) || W.pref[j] + k.start_off < pos) continue;
-            a = W.pref[j] + k.start_off;
-            for (std::size_t e = j; e < W.size() && W.pref[e] <= a + k.len + std::max(slack, reach); ++e) {
-                if (!at(e, k.end_node, k.end_rev)) continue;
-                const std::size_t x = W.pref[e] + k.end_off + 1;
-                if (x <= a || x > hi) continue;
-                b = x;
-                exact = x - a + slack >= k.len && x - a <= k.len + slack;
-                resized = !exact;
-                break;
+// edlib on two sequences: the edit distance and, with `path`, the alignment; -1 past `max_ed`.
+EdlibAlignResult align_edlib(const std::string& q, const std::string& t, EdlibAlignMode mode, bool path, int max_ed) {
+    return edlibAlign(q.data(), static_cast<int>(q.size()), t.data(), static_cast<int>(t.size()),
+                      edlibNewAlignConfig(max_ed, mode, path ? EDLIB_TASK_PATH : EDLIB_TASK_LOC, nullptr, 0));
+}
+
+// Where query `q` ends when aligned from the start of `t` (its whole length, t's end free): the length of t
+// it takes, or none past an edit distance of a third of q.
+std::size_t prefix_end(const std::string& q, const std::string& t) {
+    if (q.empty() || t.empty()) return 0;
+    EdlibAlignResult r = align_edlib(q, t, EDLIB_MODE_SHW, false, static_cast<int>(std::max<std::size_t>(20, q.size() / 3)));
+    const std::size_t end = r.editDistance >= 0 && r.numLocations > 0 ? static_cast<std::size_t>(r.endLocations[0]) + 1 : SIZE_MAX;
+    edlibFreeAlignResult(r);
+    return end;
+}
+
+// Where each base of `q` lies in `t`, from their global alignment: per base of q, the position in t before
+// it and after it (equal where t lacks the base). Unit-cost alignment places an indel's bases anywhere in
+// a stretch of equal cost, so the alignment is kept only in runs of at least 12 matched bases; between two
+// runs, the shorter side is set against the other's left or right end, whichever matches more bases, and
+// the rest of the longer side is one indel.
+std::pair<std::vector<std::size_t>, std::vector<std::size_t>> lift(const std::string& q, const std::string& t) {
+    constexpr std::size_t kSolid = 12;
+    std::vector<std::array<std::size_t, 3>> runs{{0, 0, 0}};   // query start, target start, length
+    // a band wide enough for the length difference and a quarter of the bases more; unbounded past it
+    const std::size_t diff = q.size() > t.size() ? q.size() - t.size() : t.size() - q.size();
+    EdlibAlignResult r = align_edlib(q, t, EDLIB_MODE_NW, true, static_cast<int>(diff + q.size() / 4 + 100));
+    if (r.editDistance < 0) {
+        edlibFreeAlignResult(r);
+        r = align_edlib(q, t, EDLIB_MODE_NW, true, -1);
+    }
+    std::size_t qi = 0, ti = 0, rq = 0, rt = 0, len = 0;
+    auto close = [&] {
+        if (len >= kSolid) runs.push_back({rq, rt, len});
+        len = 0;
+    };
+    for (int x = 0; x < r.alignmentLength; ++x) {
+        const unsigned char op = r.alignment[x];
+        if (op == EDLIB_EDOP_MATCH) {
+            if (len == 0) { rq = qi; rt = ti; }
+            ++len; ++qi; ++ti;
+            continue;
+        }
+        close();
+        if (op != EDLIB_EDOP_DELETE) ++qi;   // DELETE: a base of t only; INSERT: of q only
+        if (op != EDLIB_EDOP_INSERT) ++ti;
+    }
+    close();
+    edlibFreeAlignResult(r);
+    runs.push_back({q.size(), t.size(), 0});
+    std::vector<std::size_t> before(q.size()), after(q.size());
+    for (std::size_t k = 0; k + 1 < runs.size(); ++k) {
+        const auto [q0, t0, l0] = runs[k];
+        for (std::size_t i = 0; i < l0; ++i) { before[q0 + i] = t0 + i; after[q0 + i] = t0 + i + 1; }
+        const std::size_t ql = q0 + l0, tl = t0 + l0, qr = runs[k + 1][0], tr = runs[k + 1][1];
+        const std::size_t lq = qr - ql, lt = tr - tl, m = std::min(lq, lt);
+        std::size_t left = 0, right = 0;
+        for (std::size_t i = 0; i < m; ++i) {
+            left += q[ql + i] == t[tl + i];
+            right += q[qr - m + i] == t[tr - m + i];
+        }
+        const bool at_left = left >= right;
+        for (std::size_t i = 0; i < lq; ++i) {
+            const std::size_t x = ql + i;
+            if (at_left ? i < m : i >= lq - m) {
+                const std::size_t y = at_left ? tl + i : tr - (lq - i);
+                before[x] = y;
+                after[x] = y + 1;
+            } else {
+                before[x] = after[x] = at_left ? tr : tl;   // a base t lacks
             }
         }
-        if (a != SIZE_MAX && b == SIZE_MAX && a + k.len <= hi) b = a + k.len;
-        if (a == SIZE_MAX)   // no first node: the last one, at the reference's length before it
-            for (std::size_t e = step_at(W, pos); e < W.size() && W.pref[e] < hi; ++e) {
-                if (!at(e, k.end_node, k.end_rev)) continue;
-                const std::size_t x = W.pref[e] + k.end_off + 1;
-                if (x <= hi && x >= pos + k.len) { a = x - k.len; b = x; break; }
-            }
-        if (a == SIZE_MAX || b == SIZE_MAX) continue;
-        out.pieces.push_back({a, b, k.ref_exon});
-        (exact ? out.exact : resized ? out.resized : out.inferred) += 1;
-        pos = b;
+    }
+    return {before, after};
+}
+
+// A walk's units of one tandem stretch, kept for the haplotype's other transcripts with that stretch: each
+// unit's bounds, the reference unit it resembles most and, once asked for, the alignment lifting its bases.
+struct WalkUnit {
+    std::size_t a = 0, b = 0, g = 0;
+    bool lifted = false;
+    std::vector<std::size_t> before, after;
+};
+using UnitCache = std::map<std::tuple<const char*, std::size_t, std::size_t, std::size_t, std::size_t, std::size_t>, std::vector<WalkUnit>>;
+
+std::vector<WalkUnit> walk_units(const std::string& ws, const Tandem& tm, std::size_t lo, std::size_t hi);
+
+// The exons of a tandem stretch on walk W (its sequence `ws`) between bases lo and hi.
+Placed tandem_exons(const std::string& ws, const Tandem& tm, std::size_t lo, std::size_t hi, UnitCache& cache) {
+    Placed out;
+    if (hi <= lo) return out;
+    auto& units = cache.try_emplace({ws.data(), lo, hi, tm.rl, tm.rh, tm.first}).first->second;
+    if (units.empty()) units = walk_units(ws, tm, lo, hi);
+    out.units = units.size();
+    for (WalkUnit& w : units) {
+        const Tandem::Unit& un = tm.units[w.g];
+        if (un.exons.empty()) continue;
+        if (!w.lifted) {
+            std::tie(w.before, w.after) = lift(un.seq, ws.substr(w.a, w.b - w.a));
+            w.lifted = true;
+        }
+        for (const auto& [a, b, ref] : un.exons) {
+            const std::size_t x = w.before[a], y = w.after[b - 1];
+            if (y <= x) { ++out.unplaced; continue; }
+            out.resized += y - x != b - a;
+            out.pieces.push_back({w.a + x, w.a + y, ref});
+        }
     }
     return out;
 }
 
-// The exons of a tandem stretch on walk W between bases lo and hi. The walk's units start where it holds the
-// stretch's first exon start; a haplotype with the reference's number of units takes the reference's layouts
-// in order, and otherwise each unit takes the layout that places most of its exons exactly, then the one
-// of the reference unit sharing most of its nodes, then the one nearest in relative position.
-Placed tandem_exons(const Walk& W, const Tandem& tm, std::size_t lo, std::size_t hi) {
-    const Tandem::Kind& s = tm.kinds[tm.units[0][0]];
-    std::vector<std::size_t> starts;
-    for (std::size_t j = lo < W.len() ? step_at(W, lo) : W.size(); j < W.size() && W.pref[j] < hi; ++j)
-        if (W.node[j] == s.start_node && W.rev[j] == s.start_rev && W.pref[j] + s.start_off >= lo &&
-            W.pref[j] + s.start_off < hi)
-            starts.push_back(W.pref[j] + s.start_off);
-    Placed out;
-    const std::size_t n = starts.size(), k = tm.units.size();
-    for (std::size_t u = 0; u < n; ++u) {
-        const std::size_t a = starts[u], b = u + 1 < n ? starts[u + 1] : hi;
-        std::size_t pick = u;
-        Placed best;
-        if (n == k) {
-            best = place_layout(W, tm, tm.units[u], a, b);
-        } else {
-            // The unit's nodes over at most a reference unit's length (the last unit runs to the stretch's end).
-            std::vector<std::size_t> lens(tm.unit_len);
-            std::nth_element(lens.begin(), lens.begin() + lens.size() / 2, lens.end());
-            const std::size_t end = std::min(b, a + lens[lens.size() / 2]);
-            std::vector<int> nodes;
-            for (std::size_t j = step_at(W, a); j < W.size() && W.pref[j] < end; ++j) nodes.push_back(W.node[j]);
-            std::sort(nodes.begin(), nodes.end());
-            nodes.erase(std::unique(nodes.begin(), nodes.end()), nodes.end());
-            double best_share = -1.0;
-            for (std::size_t g = 0; g < k; ++g) {
-                std::vector<int> common;
-                std::set_intersection(nodes.begin(), nodes.end(), tm.unit_nodes[g].begin(), tm.unit_nodes[g].end(),
-                                      std::back_inserter(common));
-                const double share = static_cast<double>(common.size()) /
-                                     static_cast<double>(nodes.size() + tm.unit_nodes[g].size() - common.size());
-                const std::size_t near = u * k / n;
-                Placed p = place_layout(W, tm, tm.units[g], a, b);
-                const auto key = [&](const Placed& x, double sh, std::size_t gg) {
-                    return std::make_tuple(x.exact, sh, -static_cast<long>(gg > near ? gg - near : near - gg));
-                };
-                if (g == 0 || key(p, share, g) > key(best, best_share, pick)) { best = std::move(p); best_share = share; pick = g; }
+// The units of a tandem stretch on walk W between bases lo and hi, each with its reference unit.
+std::vector<WalkUnit> walk_units(const std::string& ws, const Tandem& tm, std::size_t lo, std::size_t hi) {
+    std::vector<WalkUnit> out;
+    std::size_t p = lo, q = hi;
+    if (!tm.head.empty()) {   // the head, from the window's start
+        const std::size_t e = prefix_end(tm.head, ws.substr(lo, std::min(hi - lo, tm.head.size() * 3 / 2 + 1000)));
+        if (e != SIZE_MAX) p = lo + e;
+    }
+    if (!tm.tail.empty() && q > p) {   // the tail, back from the window's end
+        const std::size_t span = std::min(q - p, tm.tail.size() * 3 / 2 + 1000);
+        std::string rt(tm.tail.rbegin(), tm.tail.rend()), rw(ws.begin() + static_cast<long>(q - span), ws.begin() + static_cast<long>(q));
+        std::reverse(rw.begin(), rw.end());
+        const std::size_t e = prefix_end(rt, rw);
+        if (e != SIZE_MAX) q -= e;
+    }
+    const std::size_t k = tm.units.size();
+    // the reference unit sharing most 15-mers with a walk unit; ties go to the one nearest `want`
+    auto best_unit = [&](const std::vector<std::uint64_t>& km, double want) {
+        std::size_t best = 0;
+        double share = -1.0;
+        for (std::size_t g = 0; g < k; ++g) {
+            const double j = jaccard(km, tm.units[g].kmers);
+            const double d = std::fabs(static_cast<double>(g) - want), bd = std::fabs(static_cast<double>(best) - want);
+            if (j > share || (j == share && d < bd)) { share = j; best = g; }
+        }
+        return std::make_pair(best, share);
+    };
+    // the units: each next one starts where the walk best holds a reference unit's first bases, or ends where
+    // it best holds a unit's last bases, between half the shortest unit and the longest past the last start;
+    // the nearer match to the reference decides, so an insertion or deletion near one end of a unit leaves
+    // the boundary found from the other
+    std::vector<std::pair<std::size_t, std::size_t>> seg;
+    std::size_t max_len = 0;
+    for (const auto& un : tm.units) max_len = std::max(max_len, un.seq.size());
+    while (p < q) {
+        if (!seg.empty() && q - p < tm.min_len / 2) {   // too little left for a unit: the last one's end
+            seg.back().second = q;
+            break;
+        }
+        const std::size_t from = p + tm.min_len / 2;
+        std::size_t next = SIZE_MAX;
+        int best = -1;
+        if (from < q) {
+            const std::string window = ws.substr(from, std::min(q - from, max_len + tm.min_len / 2));
+            for (const auto& [probe, at_start] : tm.probes) {
+                EdlibAlignResult r = align_edlib(probe, window, EDLIB_MODE_HW, false, static_cast<int>(probe.size() / 10));
+                if (r.editDistance >= 0 && r.numLocations > 0 && (best < 0 || r.editDistance < best)) {
+                    best = r.editDistance;
+                    next = from + static_cast<std::size_t>(at_start ? r.startLocations[0] : r.endLocations[0] + 1);
+                }
+                edlibFreeAlignResult(r);
+                if (best == 0) break;
             }
         }
-        // A walk unit missing the start (a variant there) runs over the next: its layout is placed again
-        // while more than half a unit is left and the layout still places an exon.
-        while (!best.pieces.empty()) {
-            out.pieces.insert(out.pieces.end(), best.pieces.begin(), best.pieces.end());
-            out.exact += best.exact;
-            out.inferred += best.inferred;
-            out.resized += best.resized;
-            const std::size_t from = best.pieces.back().b;
-            if (b < from || b - from <= tm.unit_len[pick] / 2) break;
-            best = place_layout(W, tm, tm.units[pick], from, b);
+        if (next == SIZE_MAX || next >= q) {
+            // the rest is the last unit when it resembles one: past the stretch's end the window may run on
+            if (seg.empty() || best_unit(unit_kmers(ws.substr(p, q - p)), 0).second >= 0.5) seg.emplace_back(p, q);
+            break;
         }
+        seg.emplace_back(p, next);
+        p = next;
+    }
+    // each unit with the reference unit it resembles most (ties: the one nearest in relative position)
+    const std::size_t n = seg.size();
+    for (std::size_t j = 0; j < n; ++j) {
+        const double want = n == k ? static_cast<double>(j) : std::floor(static_cast<double>(j * k) / static_cast<double>(n));
+        WalkUnit w;
+        w.a = seg[j].first;
+        w.b = seg[j].second;
+        w.g = best_unit(unit_kmers(ws.substr(w.a, w.b - w.a)), want).first;
+        out.push_back(std::move(w));
     }
     return out;
 }
@@ -562,7 +687,7 @@ Placed tandem_exons(const Walk& W, const Tandem& tm, std::size_t lo, std::size_t
 // One transcript through one pass.
 HstRecord project_one(const Walk& R, const std::string& rseq, const Gene& g, const Pass& p, const Walk& W,
                       const std::string& wseq, const TranscriptFeature& tx, const Cuts& cuts,
-                      const TranscriptsResult::EdgeClip& clip, const Tandem& tm) {
+                      const TranscriptsResult::EdgeClip& clip, const Tandem& tm, UnitCache& cache) {
     HstRecord r;
     r.reverse = p.reverse;
     const std::size_t n = cuts.size();
@@ -600,20 +725,25 @@ HstRecord project_one(const Walk& R, const std::string& rseq, const Gene& g, con
         if (!in_tandem(k)) {
             pieces.push_back({hx[k].first, hx[k].second, k});
         } else if (k == tm.lo) {
-            // Between the exons around the stretch, or the pass's ends where the stretch ends the transcript.
-            const std::size_t lo = tm.lo > 0 ? hx[tm.lo - 1].second : W.pref[static_cast<std::size_t>(p.match[p.first])];
-            const std::size_t hi = tm.hi + 1 < n ? hx[tm.hi + 1].first : W.pref[static_cast<std::size_t>(p.match[p.last]) + 1];
-            const Placed placed = tandem_exons(W, tm, lo, hi);
+            // The window between the exons around the stretch; where the stretch starts or ends the transcript,
+            // the anchoring node the pass shares, else the pass's end (a cut carried into the repeat could land
+            // in any unit).
+            const auto shared = [&](std::size_t i) { return i != SIZE_MAX && p.match[i - g.gs] >= 0 ? p.match[i - g.gs] : -1L; };
+            const long la = shared(tm.lo_anchor), ha = shared(tm.hi_anchor);
+            const std::size_t lo = tm.lo > 0 ? hx[tm.lo - 1].second
+                                 : la >= 0 ? W.pref[static_cast<std::size_t>(la) + 1] : W.pref[static_cast<std::size_t>(p.match[p.first])];
+            const std::size_t hi = tm.hi + 1 < n ? hx[tm.hi + 1].first
+                                 : ha >= 0 ? W.pref[static_cast<std::size_t>(ha)] : W.pref[static_cast<std::size_t>(p.match[p.last]) + 1];
+            const Placed placed = tandem_exons(wseq, tm, lo, hi, cache);
             const std::vector<Piece>& found = placed.pieces;
-            const std::size_t inferred = placed.inferred;
             if (found.empty()) {
                 missing = true;
                 add_detail(r.detail, "tandem:missing");
             }
             if (found.size() != tm.hi - tm.lo + 1)
                 add_detail(r.detail, "tandem:" + std::to_string(tm.hi - tm.lo + 1) + ">" + std::to_string(found.size()));
-            if (inferred) add_detail(r.detail, "tandem_inferred:" + std::to_string(inferred));
             if (placed.resized) add_detail(r.detail, "tandem_resized:" + std::to_string(placed.resized));
+            if (placed.unplaced) add_detail(r.detail, "tandem_unplaced:" + std::to_string(placed.unplaced));
             pieces.insert(pieces.end(), found.begin(), found.end());
         }
     }
@@ -883,7 +1013,9 @@ TranscriptsResult project_transcripts(const Graph& graph, const TranscriptsOptio
         res.reference_sequences.push_back(res.transcripts[k].strand == '-' ? reverse_complement(s) : s);
     }
     std::vector<Tandem> tandem;
-    for (const Cuts& c : cuts) tandem.push_back(find_tandem(R, c));
+    std::vector<std::size_t> gene_of(cuts.size(), 0);
+    for (std::size_t gi = 0; gi < genes.size(); ++gi) for (const std::size_t k : genes[gi].tx) gene_of[k] = gi;
+    for (std::size_t k = 0; k < cuts.size(); ++k) tandem.push_back(find_tandem(R, rseq, cuts[k], genes[gene_of[k]]));
     for (Gene& g : genes)
         for (const std::size_t k : g.tx)
             if (tandem[k].any) g.tandem_spans.emplace_back(cuts[k][tandem[k].lo].first, cuts[k][tandem[k].hi].second);
@@ -922,6 +1054,7 @@ TranscriptsResult project_transcripts(const Graph& graph, const TranscriptsOptio
         const Occurrences occ(H, t.seq.size());
         std::vector<Pass> passes;
         std::vector<double> best_share(genes.size(), 0.0);
+        UnitCache unit_cache;
         for (std::size_t gi = 0; gi < genes.size(); ++gi) {
             const Gene& g = genes[gi];
             for (const bool rev : {false, true}) {
@@ -978,7 +1111,7 @@ TranscriptsResult project_transcripts(const Graph& graph, const TranscriptsOptio
                 for (std::size_t c = 0; c < gp.size(); ++c) {
                     const Pass& p = *gp[c];
                     HstRecord r = project_one(R, rseq, genes[gi], p, p.reverse ? Hr : H, p.reverse ? hrseq : hseq,
-                                              res.transcripts[k], cuts[k], res.clips[k], tandem[k]);
+                                              res.transcripts[k], cuts[k], res.clips[k], tandem[k], unit_cache);
                     r.transcript = k;
                     r.haplotype = h;
                     r.copy = static_cast<int>(c + 1);
@@ -1088,6 +1221,8 @@ TranscriptsResult project_transcripts(const Graph& graph, const TranscriptsOptio
                 if ((r.source & kProjected) && r.sequence == res.reference_sequences[r.transcript]) back[r.transcript] = 1;
             for (std::size_t x = 0; x < back.size(); ++x)
                 if (!back[x]) res.not_given_back.push_back(res.transcripts[x].transcript_id);
+            for (HstRecord& r : got[k])
+                if ((r.source & kProjected) && !back[r.transcript] && !r.sequence.empty()) r.status = HstStatus::NotAsAnnotated;
         }
         for (const auto& recs : got) sink.add(res, recs);
     }
