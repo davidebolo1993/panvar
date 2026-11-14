@@ -58,9 +58,9 @@ Reads, per sample:
 | `--informative-max <N>` | copies per background haplotype outside the locus up to which a k-mer is shared, not repeat | `8` |
 | `--decoy-genomes <A,B>` | genomes whose homologous windows give decoys | the coordinate reference |
 | `--no-calibration` | build indexes without calibration (the cut is then `--min-sites`, 2) | off |
-| `--transcripts <locus>=<fa>` | the locus's haplotype-specific transcripts, projected and annotated alike: those with status `ok`, `boundary_moved`, `clipped_at_edge` or `intron_lost`, and records without a status. Those with status `splice_site_changed` are left out: a haplotype whose splice site differs from the reference's may not splice there, so the junction written for it is a guess, and its k-mers would be labelled private | none |
+| `--transcripts <locus>=<fa>` | the locus's haplotype-specific transcripts, projected and annotated alike: those with status `ok`, `boundary_moved`, `clipped_at_edge` or `intron_lost`, and records without a status. Those with a changed splice site are left out: a haplotype whose splice site differs from the reference's may not splice there, so the junction written for it is a guess, and its k-mers would be labelled private. The change is read from the table's `changed_splice_sites`, since a more severe status (`boundary_moved`, `clipped_at_edge`, `intron_lost`) covers it; without the table, from the status `splice_site_changed` alone | none |
 | `--transcripts-ok-only` | take only transcripts with status `ok` | off |
-| `--transcripts-splice-changed` | take those with status `splice_site_changed` too | off |
+| `--transcripts-splice-changed` | take those with a changed splice site too | off |
 | `--interleaved` | `-i` FASTQ files hold mates as consecutive records | off |
 | `--cram-reference <fa>` | the FASTA (with `.fai`) a CRAM was compressed against | the one its header names |
 | `--dry-run` | count each input's records by kind and the time to read them | off |

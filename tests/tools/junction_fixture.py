@@ -17,8 +17,10 @@ writes
   tx_similar.fa        the gene's record named by its symbol alone, and the paralog's transcript under a symbol
                        that differs by a suffix and under the gene's symbol with another gene id
   junction_kmers.txt   the transcript's k-mers no locus copy holds: all, those of the first two junctions, and
-                       those the record of splice_changed.fa adds
-  splice_changed.fa    a transcript record with status splice_site_changed: the first exon joined to the third
+                       those each record of splice_changed.fa adds
+  splice_changed.fa, .tsv  two transcript records with a changed splice site, and their table rows: one with
+                       status splice_site_changed (the first exon joined to the third), one whose status
+                       boundary_moved covers the change (the first exon joined to the fourth)
   junction_nodes_b.tsv per k-mer of GP's transcripts that no copy of its locus holds, the node of its first base
   reads.fq             120-base reads across the first two junctions: reads of the paralog's mRNA as well
   reads_own.fq         120-base reads across the last two junctions: the gene's own
@@ -171,7 +173,8 @@ with open(os.path.join(out, "tx_similar.fa"), "w") as f:
 
 own = kmers(ref[ls:le]) | kmers(hap_a)
 with open(os.path.join(out, "junction_kmers.txt"), "w") as f:
-    f.write(f"{len(kmers(tx) - own)} {len(kmers(e1 + e2 + e3) - own)} {len(kmers(e1 + e3) - own - kmers(tx))}\n")
+    f.write(f"{len(kmers(tx) - own)} {len(kmers(e1 + e2 + e3) - own)} {len(kmers(e1 + e3) - own - kmers(tx))} "
+            f"{len(kmers(e1 + e4) - own - kmers(tx) - kmers(e1 + e3))}\n")
 
 
 def fastq(name, reads):
@@ -185,8 +188,17 @@ j3 = len(e1 + e2 + e3)
 fastq("reads_own.fq", [(f"o{k}", tx[s:s + 120]) for k, s in ((k, j3 - 70 + rng.randrange(0, 40)) for k in range(200))])
 pseudo = flank_l[-200:] + tx + "A" * 30 + flank_r[:200]
 skip = e1 + e3
+masked = e1 + e4
 with open(os.path.join(out, "splice_changed.fa"), "w") as f:
     f.write(f">TJ9|GJ|ref#1#chr1:{ls}-{le}|1 source=projected status=splice_site_changed\n{skip}\n")
+    f.write(f">TJ8|GJ|ref#1#chr1:{ls}-{le}|1 source=projected status=boundary_moved\n{masked}\n")
+with open(os.path.join(out, "splice_changed.tsv"), "w") as f:   # rows of the transcripts' table, without its header
+    for tid, status, moved, third, detail in (("TJ9", "splice_site_changed", 0, 2, "i1.donor:GT>GA"),
+                                              ("TJ8", "boundary_moved", 1, 3, "e1.end:+1;i1.donor:GT>GA")):
+        a, b = gene_exons[third]
+        f.write("\t".join(map(str, [tid, tid, "ENSG00000000001", "GJ", ".", "+", f"ref#1#chr1:{ls}-{le}", 1, 1, "projected", ".",
+                                     status, "+", gene_at, gene_at + b, 300 + b - a, 2, ".", ".", ".", moved, 1,
+                                     f"{gene_at},{gene_at + a}", f"300,{b - a}", detail])) + "\n")
 fastq("reads_other.fq",
       [(f"pp_head{k}", pseudo[140 + 2 * k:260 + 2 * k]) for k in range(20)] +                       # flank into exon 1
       [(f"pp_tail{k}", pseudo[len(pseudo) - 330 + 2 * k:len(pseudo) - 210 + 2 * k]) for k in range(20)] +   # exon 5 into the tail

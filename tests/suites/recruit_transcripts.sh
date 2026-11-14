@@ -15,8 +15,9 @@ fi
 BIN="$1"; TOOLS="$2"; OUT="$3"
 rm -rf "$OUT"; mkdir -p "$OUT/tmp"; cd "$OUT" || exit 2
 python3 "$TOOLS/junction_fixture.py" data
-read -r J J12 JS < data/junction_kmers.txt   # the transcript's junction k-mers: all, those the paralog's has too,
-                                             # and those of the record with a changed splice site
+# the transcript's junction k-mers: all, those the paralog's has too, and those added by the record with status
+# splice_site_changed and by the one whose status covers its changed splice site
+read -r J J12 JS JM < data/junction_kmers.txt
 JO=$((J - J12))
 
 pass=0; fail=0
@@ -78,13 +79,14 @@ score idx4 reads.fq r4.tsv; dump idx4
 "$BIN" recruit -t 2 --background s1 -r ref --index-only --save-index idx4 "${TX[@]}" 2> cal2.txt
 check "a calibrated index with transcripts loads again: reused, the same reads certain, the same k-mers" \
   'grep -q "current, reused" cal2.txt && [[ $(certain r4.tsv) -eq 200 ]] && cmp -s <(cut -f1-5,7,8 idx1.locus.tsv | sort) <(cut -f1-5,7,8 idx4.locus.tsv | sort)'
-cat data/locus.hst.fa data/splice_changed.fa > data/sc.hst.fa   # one more record, its splice site changed
+cat data/locus.hst.fa data/splice_changed.fa > data/sc.hst.fa   # two more records, their splice sites changed
+cat data/locus.hst.tsv data/splice_changed.tsv > data/sc.hst.tsv
 "${RC[@]}" --save-index idxc --locus data/locus.gfa --transcripts data/sc.hst.fa 2> sc.txt; dump idxc
-check "a transcript with a changed splice site is left out, and the log counts it by status ($(tx idxc.locus.tsv))" \
-  '[[ "$(tx idxc.locus.tsv)" == "P$J S0 R0" ]] && grep -q "by status: ok 1/1, splice_site_changed 0/1" sc.txt && grep -q "^locus	transcripts_by_status	ok 1/1, splice_site_changed 0/1 (taken/all)" idxc/locus.index.tsv'
+check "transcripts with a changed splice site are left out, under any status, and the log counts them by status ($(tx idxc.locus.tsv))" \
+  '[[ "$(tx idxc.locus.tsv)" == "P$J S0 R0" ]] && grep -q "by status: boundary_moved 0/1, ok 1/1, splice_site_changed 0/1" sc.txt && grep -q "^locus	transcripts_by_status	boundary_moved 0/1, ok 1/1, splice_site_changed 0/1 (taken/all)" idxc/locus.index.tsv'
 "${RC[@]}" --save-index idxc --locus data/locus.gfa --transcripts data/sc.hst.fa --transcripts-splice-changed 2> sc2.txt; dump idxc
-check "--transcripts-splice-changed takes it: its junction joins the index ($(tx idxc.locus.tsv))" \
-  '[[ "$(tx idxc.locus.tsv)" == "P$((J + JS)) S0 R0" ]] && grep -q "rebuilding" sc2.txt && grep -q "splice_site_changed 1/1" sc2.txt && grep -q "with changed splice sites" idxc/locus.index.tsv'
+check "--transcripts-splice-changed takes them: their junctions join the index ($(tx idxc.locus.tsv))" \
+  '[[ "$(tx idxc.locus.tsv)" == "P$((J + JS + JM)) S0 R0" ]] && grep -q "rebuilding" sc2.txt && grep -q "boundary_moved 1/1, ok 1/1, splice_site_changed 1/1" sc2.txt && grep -q "with changed splice sites" idxc/locus.index.tsv'
 "${RC[@]}" --save-index idxc --locus data/locus.gfa --transcripts data/sc.hst.fa --transcripts-splice-changed --transcripts-ok-only 2> sc3.txt
 check "with --transcripts-ok-only it is refused" 'grep -q "not both" sc3.txt'
 cp data/locus.hst.fa data/short.hst.fa   # a table whose first row was cut short

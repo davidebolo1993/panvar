@@ -205,9 +205,10 @@ bool header_is_own(const std::string& header, const OwnGenes& own) {
 using TranscriptFn = std::function<void(const std::string& seq, const std::function<std::int32_t(std::size_t)>& node_at)>;
 
 // The transcripts of a panvar transcripts FASTA (plain or gzip), one at a time. Every written transcript is
-// taken but those whose splice site differs from the reference's (the haplotype may not splice there, so
-// their junctions are guesses) unless `splice_changed`, or only status=ok with `ok_only`; a record without a
-// status is taken. `by_status` counts the records taken and all, per status. Their bases are placed on the
+// taken but those with a splice site that differs from the reference's (the haplotype may not splice there,
+// so their junctions are guesses) unless `splice_changed`, or only status=ok with `ok_only`; a record without
+// a status is taken. A changed splice site is read from the table's count, as a more severe status covers
+// it; without the table, from the status alone. `by_status` counts the records taken and all, per status. Their bases are placed on the
 // graph's nodes through the table beside the FASTA (the haplotype's path and each exon's first base and
 // length on it), where it exists; `short_rows` counts its rows cut short. A sequence equal to one already
 // passed on is counted as taken but not passed on again: most transcripts are the same on many haplotypes.
@@ -216,7 +217,11 @@ void for_each_transcript(const std::string& fa, const Graph& g, const std::vecto
                          std::map<std::string, std::array<std::uint64_t, 2>>& by_status, OwnGenes& genes,
                          std::uint64_t& short_rows, const TranscriptFn& fn) {
     // the exons of each record on its path, and its gene's id, from the table
-    struct Place { std::string path, gene_id, gene_name; bool forward = true; std::vector<std::uint64_t> starts, lengths; };
+    struct Place {
+        std::string path, gene_id, gene_name;
+        bool forward = true, splice_changed = false;
+        std::vector<std::uint64_t> starts, lengths;
+    };
     std::unordered_map<std::string, Place> place;
     const std::string table = transcripts_table(fa);
     if (!table.empty()) {
@@ -245,6 +250,10 @@ void for_each_transcript(const std::string& fa, const Graph& g, const std::vecto
             p.path = f[col["haplotype"]];
             if (col.count("gene_id")) p.gene_id = f[col["gene_id"]];
             p.gene_name = f[col["gene_name"]];
+            if (col.count("changed_splice_sites")) {
+                const std::string& n = f[col["changed_splice_sites"]];
+                p.splice_changed = !n.empty() && n != "." && n != "0";
+            }
             p.forward = (f[col["strand"]] == "+") == (f[col["orientation"]] != "-");
             for (const auto& [name, v] : {std::make_pair(std::string("exon_starts"), &p.starts), std::make_pair(std::string("exon_lengths"), &p.lengths)}) {
                 std::stringstream xs(f[col[name]]);
@@ -263,8 +272,11 @@ void for_each_transcript(const std::string& fa, const Graph& g, const std::vecto
     std::string line, name, status, seq;
     auto flush = [&] {
         if (name.empty()) return;
-        static const std::set<std::string> written = {"ok", "boundary_moved", "clipped_at_edge", "intron_lost"};
-        const bool take = status.empty() || (ok_only ? status == "ok" : written.count(status) != 0 || (splice_changed && status == "splice_site_changed"));
+        static const std::set<std::string> written = {"ok", "splice_site_changed", "boundary_moved", "clipped_at_edge", "intron_lost"};
+        const auto row = place.find(name);
+        const bool changed = status == "splice_site_changed" || (row != place.end() && row->second.splice_changed);
+        const bool take = ok_only ? status.empty() || status == "ok"
+                                  : (status.empty() || written.count(status) != 0) && (splice_changed || !changed);
         auto& tally = by_status[status.empty() ? "no_status" : status];
         ++tally[1];
         if (!take || seq.size() < kK) { ++skipped; return; }
