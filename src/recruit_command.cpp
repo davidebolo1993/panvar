@@ -233,8 +233,13 @@ int run_recruit_command(const std::vector<std::string>& args) {
         const auto eq = t.find('=');
         if (eq != std::string::npos && !fs::is_regular_file(t)) { name = t.substr(0, eq); path = t.substr(eq + 1); }
         std::size_t at = graphs.size();
+        std::string same;   // graphs sharing the name: the transcripts could belong to any of them
         for (std::size_t g = 0; g < graphs.size(); ++g)
-            if (name.empty() ? graphs.size() == 1 : stem(graphs[g]) == name) at = g;
+            if (name.empty() ? graphs.size() == 1 : stem(graphs[g]) == name) {
+                if (at != graphs.size()) same += (same.empty() ? graphs[at] : std::string()) + ", " + graphs[g];
+                at = g;
+            }
+        if (!same.empty()) throw std::runtime_error("recruit: --transcripts " + t + ": several --locus graphs are named " + name + ": " + same);
         if (at == graphs.size())
             throw std::runtime_error("recruit: --transcripts " + t + ": " + (name.empty() ? std::string("give it as <locus name>=<file> with several graphs")
                                                                                       : "no --locus graph is named " + name));
