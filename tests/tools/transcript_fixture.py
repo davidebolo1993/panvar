@@ -7,8 +7,9 @@ panvar.
   transcript_fixture.py write <case> <dir>             writes locus.gfa, genes.gtf, expected.tsv
   transcript_fixture.py check <dir> <prefix>           compares <prefix>.hst.tsv/.hst.fa with expected.tsv
 
-Variants on the reference (0-based, half-open): ("snp", p), ("del", (a, b)) and ("dup", (a, b)), a stretch
-walked twice over the same nodes. A haplotype in "reversed" is another one written from its end.
+Variants on the reference (0-based, half-open): ("snp", p), ("del", (a, b)), ("sub", (a, b)), a stretch of the
+same length with every third base changed (clustered SNPs folded into one node), and ("dup", (a, b)), a
+stretch walked twice over the same nodes. A haplotype in "reversed" is another one written from its end.
 """
 import random
 import sys
@@ -80,6 +81,12 @@ CASES = {
                            order=["S", "E", "M", "E", "T"], layout=[[(0, 550)]] * 3),
     # a reference unit without exons between two with
     "tandem_empty": dict(units={"ref": 3, "h1": 3, "h2": 4, "h3": 2}, layout=[[(300, 400)], [], [(300, 400)]]),
+    # exon boundaries inside a substitution block: one that keeps the splice site, one that changes it
+    "substitution": dict(
+        L=5000,
+        genes={"GS": ("+", {"TS1": [(1000, 1300), (2000, 2100), (3000, 3300)]})},
+        haps={"h1": [("sub", (1296, 1306))], "h2": [("sub", (1996, 2006))], "h3": [("snp", 1300), ("snp", 2999)]},
+        reversed={"h4": "h1"}),
     # the main case with haplotypes' own annotations (write_annotated)
     "annotated": dict(),
 }
@@ -119,6 +126,10 @@ def build(case):
                 nid = str(len(nodes) + 1)
                 nodes[nid] = alt(ref[v])
                 alt_node[v] = nid
+            if kind == "sub" and v not in alt_node:
+                nid = str(len(nodes) + 1)
+                nodes[nid] = "".join(alt(c) if (p - v[0]) % 3 == 0 else c for p, c in enumerate(ref[v[0]:v[1]], v[0]))
+                alt_node[v] = nid
     walks, seqs, maps = {"ref": [(n, "+") for n, _, _ in ref_nodes]}, {"ref": ref}, {"ref": [dict((p, p) for p in range(L))]}
     for h, variants in case["haps"].items():
         steps, pos, m, second = [], 0, {}, None
@@ -129,6 +140,13 @@ def build(case):
                     take = alt_node[v]
                 if kind == "del" and v[0] <= a and b <= v[1]:
                     take = None
+                if kind == "sub" and v[0] <= a and b <= v[1]:   # the block's first node stands for the whole
+                    take = None
+                    if a == v[0]:
+                        steps.append((alt_node[v], "+"))
+                        for p in range(*v):
+                            m[p] = pos + p - v[0]
+                        pos += v[1] - v[0]
             if take:
                 steps.append((take, "+"))
                 for p in range(a, b):
@@ -150,7 +168,7 @@ def build(case):
     return ref, nodes, walks, seqs, maps
 
 
-def project(case, ref, hseq, m, strand, exons):
+def project(case, ref, hseq, m, strand, exons, subs=()):
     """One transcript through one copy's map: (status, notes, sequence)."""
     L = case["L"]
     n_all = len(exons)
@@ -162,6 +180,8 @@ def project(case, ref, hseq, m, strand, exons):
     def cut(c, start, e):
         """The haplotype position of reference cut c (between bases c - 1 and c)."""
         nonlocal moved
+        if any(a < c < b for a, b in subs):   # kept at its offset inside a same-length substitution
+            notes.append(f"e{e}{'.start:' if start == (strand == '+') else '.end:'}in_variant")
         if c in m:
             return m[c]
         if c - 1 in m:
@@ -226,8 +246,10 @@ def expected(case, ref, seqs, maps):
                     continue
                 if not copies:
                     rows.append((t, g, h, 0, "no_copy", [], ""))
+                src = case.get("reversed", {}).get(h, h)
+                subs = [v for kind, v in case["haps"].get(src, []) if kind == "sub"]
                 for c, m in enumerate(copies, 1):
-                    st, notes, s = project(case, ref, seqs[case.get("reversed", {}).get(h, h)], m, strand, exons)
+                    st, notes, s = project(case, ref, seqs[src], m, strand, exons, subs)
                     rows.append((t, g, h, c, st, notes, s))
     return rows
 

@@ -9,7 +9,7 @@ Projects a reference annotation onto every haplotype walk of a locus graph. Each
 - A haplotype without a copy of a gene gets no transcript of it; one with two copies gets two, numbered along the walk.
 - Exons inside a repeat unit of the gene follow the haplotype's own number of units.
 - A transcript whose exon the haplotype lacks is reported and not written, so other transcripts of the gene still are.
-- An exon boundary that falls inside a variant is moved to the nearest base the haplotype shares with the reference, and flagged.
+- An exon boundary that falls inside an indel is moved to the nearest base the haplotype shares with the reference, and flagged; one inside a substitution of the reference's length keeps its offset, and is noted.
 - A haplotype's own annotation (`--hap-annotations`, e.g. HPRC's CAT or Liftoff) adds its transcripts, cut straight from the walk: isoforms and copies the reference annotation lacks. Each HST carries its source: `projected`, `annotated`, or both.
 
 ## How it works
@@ -24,7 +24,7 @@ Projects a reference annotation onto every haplotype walk of a locus graph. Each
 
 5. A short candidate lying inside a longer accepted pass of a gene apart on the reference is dropped when that pass matches the stretch at least as well as the candidate does, and the rest compete again. Such a stretch is part of the other gene's copy that resembles this gene: a pseudogene fragment, or a gene nested in the other copy of a duplicated gene. A candidate that matches better is kept, as a copy left by a deletion between two paralogs lies inside whatever gene surrounds them.
 
-6. Within each copy, an exon boundary is carried to the walk through the node holding it, at the same offset. When the walk does not pass that node (the boundary lies inside a variant), the boundary moves to the nearest position the walk shares with the reference, and a tie keeps the variant inside the exon. An exon sharing no base with the walk is missing.
+6. Within each copy, an exon boundary is carried to the walk through the node holding it, at the same offset. When the walk does not pass that node (the boundary lies inside a variant), the walk's unmatched stretch there is compared with the reference's. Of the same length, it is a substitution (clustered SNPs the graph folds into one node): every base keeps its place, so the boundary keeps its offset and is noted `in_variant`; the splice sites are checked as elsewhere. Otherwise the boundary moves to the nearest position the walk shares with the reference, and a tie keeps the variant inside the exon. An exon sharing no base with the walk is missing.
 
 7. Exons that repeat with a tandem unit inside the gene start at the same node and offset in each unit the reference walks, so a transcript's exons starting where another one starts mark its tandem stretch. The stretch is placed unit by unit, by sequence. On the reference, the window between the exons around the stretch is cut into a head, its units (each starting where the walk passes the stretch's first exon start, with or without exons of its own) and a tail. On a haplotype, the head and the tail are aligned at the two ends of its window. The units tile the rest: each next unit starts where the walk best holds a reference unit's first bases, or ends where it best holds a unit's last bases, so an indel near one end of a unit leaves the boundary found from the other. Each unit then takes the reference unit sharing most 15-mers with it (ties: the unit of the same rank when the counts agree, else the one nearest in relative position), and that unit's annotated exons, perhaps none, are lifted through their alignment. The alignment counts only in runs of matched bases, with each indel kept in one piece, so an exon with an insertion holds it. The reference walk gives back its annotation; a transcript it does not is reported. The marker's tandem stretch does not count towards its share, as haplotypes carry the unit a different number of times.
 
@@ -76,7 +76,7 @@ Projects a reference annotation onto every haplotype walk of a locus graph. Each
 | `moved_boundaries` | exon boundaries moved off a variant |
 | `changed_splice_sites` | intron ends whose two splice-site bases differ from the reference's |
 | `exon_starts`, `exon_lengths` | each exon's first base on the walk (as `path_start`) and length, in transcript order |
-| `detail` | notes, `;`-joined: `e3.start:-3` (exon 3's 5' boundary moved, the exon 3 reference bases shorter), `e2:missing`, `e1:walk_end` (the walk ends before it), `i1.donor:GT>AT` (a changed splice site, transcript strand), `i2:intron_lost`, `clipped:3':200` (annotated exonic bases past the path at the transcript's 3' end), `tandem:14>46` (the exons of the tandem stretch on the reference and on the haplotype; the transcript's exons and introns are then numbered over its own), `tandem_resized:1` (tandem exons with an indel), `tandem_unplaced:1` (tandem exons a unit's alignment leaves without bases), `rival:<gene>:<share>><share>` (the paralog this copy was taken from, and both shares), and for no copy `best_share:<F>` and `taken_by:<gene>` or `inside:<gene>` |
+| `detail` | notes, `;`-joined: `e3.start:-3` (exon 3's 5' boundary moved, the exon 3 reference bases shorter), `e5.end:in_variant` (exon 5's 3' boundary lies in a substitution and kept its offset), `e2:missing`, `e1:walk_end` (the walk ends before it), `i1.donor:GT>AT` (a changed splice site, transcript strand), `i2:intron_lost`, `clipped:3':200` (annotated exonic bases past the path at the transcript's 3' end), `tandem:14>46` (the exons of the tandem stretch on the reference and on the haplotype; the transcript's exons and introns are then numbered over its own), `tandem_resized:1` (tandem exons with an indel), `tandem_unplaced:1` (tandem exons a unit's alignment leaves without bases), `rival:<gene>:<share>><share>` (the paralog this copy was taken from, and both shares), and for no copy `best_share:<F>` and `taken_by:<gene>` or `inside:<gene>` |
 
 Statuses, most severe first:
 
@@ -85,7 +85,7 @@ Statuses, most severe first:
 - `not_as_annotated`: on the reference walk only, a transcript whose projection there differs from its annotation (a warning names them; the projection of that transcript is not to be trusted on any haplotype);
 - `intron_lost`: the haplotype shortens an intron below its two splice sites, so the exons around it are joined;
 - `clipped_at_edge`: the transcript reaches past the reference path, and only its part on the path is projected;
-- `boundary_moved`: an exon boundary lies inside a variant and was moved;
+- `boundary_moved`: an exon boundary lies inside an indel and was moved;
 - `splice_site_changed`: a splice site differs from the reference's;
 - `ok`: every boundary carried exactly.
 

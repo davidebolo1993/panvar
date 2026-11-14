@@ -308,6 +308,7 @@ struct CutOnWalk {
     bool ok = false;
     std::size_t pos = 0;   // on the oriented walk
     long shift = 0;        // reference bases the boundary moved by, positive when the exon grows
+    bool in_variant = false;   // kept at its offset inside a substitution of the reference's length
 };
 
 // Carry reference cut c (between bases) to the walk through pass p. `start`: c opens an exon.
@@ -334,6 +335,18 @@ CutOnWalk map_cut(const Walk& R, const Gene& g, const Pass& p, const Walk& W, st
     if (kl < 0 && kr < 0) return out;
     const std::size_t xl = kl >= 0 ? R.pref[static_cast<std::size_t>(kl) + 1] : 0;
     const std::size_t xr = kr >= 0 ? R.pref[static_cast<std::size_t>(kr)] : 0;
+    if (kl >= 0 && kr >= 0) {
+        // The walk's unmatched stretch is as long as the reference's: a substitution (clustered SNPs the graph
+        // folds into one node), where every base keeps its place and the boundary with it.
+        const std::size_t wl = W.pref[static_cast<std::size_t>(m(static_cast<std::size_t>(kl))) + 1];
+        const std::size_t wr = W.pref[static_cast<std::size_t>(m(static_cast<std::size_t>(kr)))];
+        if (wl <= wr && wr - wl == xr - xl) {
+            out.ok = true;
+            out.in_variant = true;
+            out.pos = wl + (c - xl);
+            return out;
+        }
+    }
     bool go_left;
     if (kl < 0) go_left = false;
     else if (kr < 0) go_left = true;
@@ -717,8 +730,13 @@ HstRecord project_one(const Walk& R, const std::string& rseq, const Gene& g, con
             continue;
         }
         hx[k] = {a.pos, b.pos};
-        if (a.shift != 0) { ++r.moved; add_detail(r.detail, e + (minus ? ".end:" : ".start:") + signed_text(a.shift)); }
-        if (b.shift != 0) { ++r.moved; add_detail(r.detail, e + (minus ? ".start:" : ".end:") + signed_text(b.shift)); }
+        const auto note = [&](const CutOnWalk& x, bool start) {
+            const std::string side = e + (start == minus ? ".end:" : ".start:");
+            if (x.shift != 0) { ++r.moved; add_detail(r.detail, side + signed_text(x.shift)); }
+            if (x.in_variant) add_detail(r.detail, side + "in_variant");
+        };
+        note(a, true);
+        note(b, false);
     }
     std::vector<Piece> pieces;
     for (std::size_t k = 0; k < n && !missing; ++k) {
