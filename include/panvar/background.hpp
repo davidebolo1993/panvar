@@ -246,6 +246,10 @@ struct Manifest {
     std::uint64_t next_segment = 0;
     std::vector<std::pair<std::string, std::uint64_t>> references;   // coordinate references, fingerprints
     std::vector<ManifestSegment> segments;
+    // Transcriptomes: transcript sequences (a FASTA each), counted into segments of their own (tx-<n>). They
+    // are no part of the store's counts, so merging, compacting and the genomes' counts leave them alone;
+    // recruit reads them for the k-mers only a locus's transcripts hold.
+    std::vector<ManifestSegment> transcriptomes;
 };
 bool store_exists(const std::string& store_dir);
 Manifest read_manifest(const std::string& store_dir);
@@ -256,6 +260,8 @@ void write_file_durably(const std::string& path, const std::string& content);
 // What the store counts: a hash of its genomes' names and sequence checksums (not of how they are split
 // into segments, nor of its anchors), so a merge or a new coordinate reference keeps it.
 std::uint64_t content_id(const Manifest& m);
+// The same for its transcriptomes; 0 without any.
+std::uint64_t transcriptome_id(const Manifest& m);
 
 // An exclusive lock on a store's .lock file, held until destroyed; waits for other holders.
 class StoreLock {

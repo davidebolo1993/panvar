@@ -1,14 +1,25 @@
 #!/usr/bin/env python3
-"""A locus whose gene has a paralog elsewhere with the same exons and other introns, for the transcripts
-in the locus index: the exons' k-mers are shared with the paralog, so only the transcript's junctions are
-private. A processed pseudogene (the spliced transcript) in another genome holds the junctions too.
+"""A locus whose gene shares its first three exons with a paralog elsewhere, for the transcripts in the locus
+index. The gene has five exons (the second and fourth 40 bases); the paralog, on the other strand, has the
+same first three and two of its own, with other introns. Exon k-mers of the shared exons are shared; the
+transcript's junctions exist in no genome, so only the transcripts tell which are the paralog's too.
 
     junction_fixture.py <out_dir>
-writes ref.fa (the reference: the locus and the paralog), ga.fa (the locus with small changes), gp.fa (a
-genome with the processed pseudogene), locus.gfa (the reference's and ga's copies), genes.gtf (the gene,
-three exons, the middle one 40 bases), junction_kmers.txt (how many of the transcript's k-mers no locus
-copy holds), and reads.fq (120-base reads across both junctions of the
-transcript, so each holds two private sites only with the transcripts in the index).
+writes
+  ref.fa, ga.fa        the reference (the locus and the paralog) and a genome with small changes in the locus
+  gp.fa                a genome with a processed pseudogene (the spliced transcript and a poly-A tail)
+  gn.fa                an unrelated genome
+  locus.gfa, genes.gtf the locus (the reference's and ga's copies, one node each) and its gene GJ
+  locus_b.gfa, genes_b.gtf  the paralog's locus over several nodes, ga's walk written reversed and carrying a
+                       SNP four bases into the fourth exon; its gene GP, on the minus strand
+  tx_own.fa            a transcriptome holding the gene's transcript and unrelated ones
+  tx_paralog.fa        the same with the paralog's transcript
+  junction_kmers.txt   the transcript's k-mers no locus copy holds: all, and those of the first two junctions
+  junction_nodes_b.tsv per k-mer of GP's transcripts that no copy of its locus holds, the node of its first base
+  reads.fq             120-base reads across the first two junctions: reads of the paralog's mRNA as well
+  reads_own.fq         120-base reads across the last two junctions: the gene's own
+  reads_other.fq       reads of the processed pseudogene running into its flank and its tail (pp*), and reads
+                       across an exon skip no transcript has (skip*)
 """
 import os
 import random
@@ -17,10 +28,15 @@ import sys
 out = sys.argv[1]
 os.makedirs(out, exist_ok=True)
 rng = random.Random(5)
+COMP = str.maketrans("ACGT", "TGCA")
 
 
 def seq(n):
     return "".join(rng.choice("ACGT") for _ in range(n))
+
+
+def rc(s):
+    return s.translate(COMP)[::-1]
 
 
 def mutate(s, rate):
@@ -39,40 +55,127 @@ def write(name, contigs):
                 f.write(s[i:i + 60] + "\n")
 
 
-e1, e2, e3 = seq(300), seq(40), seq(300)
-ls, le = 120000, 140000
-gene_at = 5000                                           # in the locus
-intron1, intron2 = "GT" + seq(1996) + "AG", "GT" + seq(1496) + "AG"
-gene = e1 + intron1 + e2 + intron2 + e3
-paralog = e1 + "GT" + seq(2996) + "AG" + e2 + "GT" + seq(996) + "AG" + e3   # same exons, other introns
+def intron(n):
+    return "GT" + seq(n - 4) + "AG"
+
+
+def gene_of(exons, introns):
+    """The gene's sequence and its exons' intervals in it."""
+    s, iv = "", []
+    for k, e in enumerate(exons):
+        iv.append((len(s), len(s) + len(e)))
+        s += e + (introns[k] if k < len(introns) else "")
+    return s, iv
+
+
+canon = lambda x: min(x, rc(x))
+kmers = lambda s: {canon(s[i:i + 31]) for i in range(len(s) - 30)}
+
+e1, e2, e3, e4, e5 = seq(300), seq(40), seq(300), seq(40), seq(300)
+p4, p5 = seq(40), seq(300)                               # the paralog's own last exons
+ls, le = 120000, 140000                                  # the locus
+gene_at = 5000
+gene, gene_exons = gene_of([e1, e2, e3, e4, e5], [intron(2000), intron(1500), intron(1200), intron(900)])
+paralog, par_exons = gene_of([e1, e2, e3, p4, p5], [intron(3000), intron(1000), intron(1400), intron(700)])
+bs, be = 225000, 245000                                  # the paralog's locus; the paralog on the minus strand
+par_at = 5000
 ref = list(seq(300000))
 ref[ls + gene_at:ls + gene_at + len(gene)] = list(gene)
-ref[230000:230000 + len(paralog)] = list(paralog)
+ref[bs + par_at:bs + par_at + len(paralog)] = list(rc(paralog))
 ref = "".join(ref)
 hap_a = ref[ls:ls + 1000] + mutate(ref[ls + 1000:ls + gene_at], 0.003) + ref[ls + gene_at:le]   # changes outside the gene
+tx = e1 + e2 + e3 + e4 + e5
+ptx = e1 + e2 + e3 + p4 + p5
 write("ref", [("chr1", ref)])
-write("ga", [("chr1", ref[:ls] + hap_a + ref[le:])])
-write("gp", [("chr1", seq(100000) + e1 + e2 + e3 + "A" * 30 + seq(100000))])
+flank_l, flank_r = seq(100000), seq(100000)
+write("gp", [("chr1", flank_l + tx + "A" * 30 + flank_r)])
+write("gn", [("chr1", seq(50000))])
+
+# the locus: one node per copy
 with open(os.path.join(out, "locus.gfa"), "w") as f:
     f.write("H\tVN:Z:1.0\nS\t1\t" + ref[ls:le] + "\nS\t2\t" + hap_a + "\n")
     f.write(f"P\tref#1#chr1:{ls}-{le}\t1+\t*\nP\tga#1#chr1:{ls}-{le}\t2+\t*\n")
-exons, at = [], ls + gene_at
-for e, intron in ((e1, intron1), (e2, intron2), (e3, "")):
-    exons.append((at + 1, at + len(e)))
-    at += len(e) + len(intron)
 attr = 'gene_id "GJ"; gene_name "GJ"; transcript_id "TJ1"; transcript_name "TJ1"; tag "Ensembl_canonical";'
 with open(os.path.join(out, "genes.gtf"), "w") as f:
-    f.write(f"chr1\ttest\tgene\t{exons[0][0]}\t{exons[-1][1]}\t.\t+\t.\t{attr}\n")
-    for a, b in exons:
-        f.write(f"chr1\ttest\texon\t{a}\t{b}\t.\t+\t.\t{attr}\n")
-tx = e1 + e2 + e3
-comp = str.maketrans("ACGT", "TGCA")
-canon = lambda x: min(x, x.translate(comp)[::-1])
-kmers = lambda s: {canon(s[i:i + 31]) for i in range(len(s) - 30)}
-with open(os.path.join(out, "junction_kmers.txt"), "w") as f:   # the transcript's k-mers no locus copy holds
-    f.write(f"{len(kmers(tx) - kmers(ref[ls:le]) - kmers(hap_a))}\n")
-with open(os.path.join(out, "reads.fq"), "w") as f:
-    for k in range(200):
-        s = 300 - 70 + rng.randrange(0, 40)                # across both junctions
-        r = tx[s:s + 120]
-        f.write(f"@j{k}\n{r}\n+\n{'I' * len(r)}\n")
+    at = ls + gene_at
+    f.write(f"chr1\ttest\tgene\t{at + 1}\t{at + len(gene)}\t.\t+\t.\t{attr}\n")
+    for a, b in gene_exons:
+        f.write(f"chr1\ttest\texon\t{at + a + 1}\t{at + b}\t.\t+\t.\t{attr}\n")
+
+# the paralog's locus: nodes cut inside exons and introns, a SNP of ga four bases into the fourth exon (so
+# the junction k-mers over it are ga's own), ga's walk written from its end
+gb = ref[bs:be]
+L = len(paralog)
+gpos = lambda o: par_at + L - 1 - o                     # the locus position of the paralog's base o (its own strand)
+snp = gpos(par_exons[3][0] + 4)
+cuts = sorted({0, len(gb), 2000, gpos(par_exons[4][0] + 100), snp, snp + 1, gpos(par_exons[3][0] - 300),
+               gpos(par_exons[2][0] + 150) + 1, gpos(par_exons[1][0] + 20), gpos(par_exons[0][0] + 120), 15000})
+nodes = [(str(k + 1), a, b) for k, (a, b) in enumerate(zip(cuts, cuts[1:]))]
+alt_id = str(len(nodes) + 1)
+alt_base = {"A": "C", "C": "G", "G": "T", "T": "A"}[gb[snp]]
+gb_a = gb[:snp] + alt_base + gb[snp + 1:]
+write("ga", [("chr1", ref[:ls] + hap_a + ref[le:bs] + gb_a + ref[be:])])
+ref_walk = [n for n, _, _ in nodes]
+ga_walk = [alt_id if a == snp else n for n, a, _ in nodes]
+with open(os.path.join(out, "locus_b.gfa"), "w") as f:
+    f.write("H\tVN:Z:1.0\n")
+    for n, a, b in nodes:
+        f.write(f"S\t{n}\t{gb[a:b]}\n")
+    f.write(f"S\t{alt_id}\t{alt_base}\n")
+    walks = [[(n, "+") for n in ref_walk], [(n, "-") for n in reversed(ga_walk)]]
+    for x, ox, y, oy in sorted({(x, ox, y, oy) for w in walks for (x, ox), (y, oy) in zip(w, w[1:])}):
+        f.write(f"L\t{x}\t{ox}\t{y}\t{oy}\t0M\n")
+    for name, w in zip(("ref", "ga"), walks):
+        f.write(f"P\t{name}#1#chr1:{bs}-{be}\t{','.join(n + o for n, o in w)}\t*\n")
+attr_b = 'gene_id "GP"; gene_name "GP"; transcript_id "TP1"; transcript_name "TP1"; tag "Ensembl_canonical";'
+with open(os.path.join(out, "genes_b.gtf"), "w") as f:
+    at = bs + par_at
+    f.write(f"chr1\ttest\tgene\t{at + 1}\t{at + L}\t.\t-\t.\t{attr_b}\n")
+    for a, b in sorted((L - b, L - a) for a, b in par_exons):
+        f.write(f"chr1\ttest\texon\t{at + a + 1}\t{at + b}\t.\t-\t.\t{attr_b}\n")
+
+# per k-mer of the paralog's transcripts that no copy of its locus holds, the node of its first base: the
+# reference's transcript first, then ga's for the k-mers only it has
+node_at = lambda p, walk: next(walk[k] for k, (_, a, b) in enumerate(nodes) if a <= p < b)
+tx_pos = [gpos(o) for a, b in par_exons for o in range(a, b)]   # the locus position of each transcript base
+genomic = kmers(gb) | kmers(gb_a)
+ptx_a = "".join(rc(gb_a)[len(gb) - 1 - p] for p in tx_pos)
+expected = {}
+for s, walk in ((ptx, ref_walk), (ptx_a, ga_walk)):
+    for t in range(len(s) - 30):
+        k = canon(s[t:t + 31])
+        if k not in genomic and k not in expected:
+            expected[k] = node_at(tx_pos[t], walk)
+with open(os.path.join(out, "junction_nodes_b.tsv"), "w") as f:
+    for k in sorted(expected):
+        f.write(f"{k}\t{expected[k]}\n")
+
+# transcriptomes: the gene's own transcript and unrelated ones; then the paralog's too
+others = [(f"TU{k}|GU{k}|GU{k}", seq(900)) for k in range(5)]
+with open(os.path.join(out, "tx_own.fa"), "w") as f:
+    for name, s in [("TJ1|GJ|GJ", tx)] + others:
+        f.write(f">{name}\n{s}\n")
+with open(os.path.join(out, "tx_paralog.fa"), "w") as f:
+    for name, s in [("TJ1|GJ|GJ", tx), ("TP1|GP|GP", ptx)] + others:
+        f.write(f">{name}\n{s}\n")
+
+own = kmers(ref[ls:le]) | kmers(hap_a)
+with open(os.path.join(out, "junction_kmers.txt"), "w") as f:   # all, and those of the first two junctions
+    f.write(f"{len(kmers(tx) - own)} {len(kmers(e1 + e2 + e3) - own)}\n")
+
+
+def fastq(name, reads):
+    with open(os.path.join(out, name), "w") as f:
+        for rname, r in reads:
+            f.write(f"@{rname}\n{r}\n+\n{'I' * len(r)}\n")
+
+
+fastq("reads.fq", [(f"j{k}", tx[s:s + 120]) for k, s in ((k, 300 - 70 + rng.randrange(0, 40)) for k in range(200))])
+j3 = len(e1 + e2 + e3)
+fastq("reads_own.fq", [(f"o{k}", tx[s:s + 120]) for k, s in ((k, j3 - 70 + rng.randrange(0, 40)) for k in range(200))])
+pseudo = flank_l[-200:] + tx + "A" * 30 + flank_r[:200]
+skip = e1 + e3
+fastq("reads_other.fq",
+      [(f"pp_head{k}", pseudo[140 + 2 * k:260 + 2 * k]) for k in range(20)] +                       # flank into exon 1
+      [(f"pp_tail{k}", pseudo[len(pseudo) - 330 + 2 * k:len(pseudo) - 210 + 2 * k]) for k in range(20)] +   # exon 5 into the tail
+      [(f"skip{k}", skip[300 - 70 + 2 * k:300 + 50 + 2 * k]) for k in range(20)])

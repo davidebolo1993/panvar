@@ -106,6 +106,16 @@ Manifest read_manifest(const std::string& store_dir) {
             ms.genomes.push_back({g.at("name").str(), g.at("path").str(), g.at("bytes").u64(), g.at("checksum").str()});
         m.segments.push_back(std::move(ms));
     }
+    if (v.has("transcriptomes"))
+        for (const auto& s : v.at("transcriptomes").items) {
+            ManifestSegment ms;
+            ms.dir = s.at("dir").str();
+            ms.distinct = s.at("distinct").u64();
+            ms.occurrences = s.at("occurrences").u64();
+            for (const auto& g : s.at("genomes").items)
+                ms.genomes.push_back({g.at("name").str(), g.at("path").str(), g.at("bytes").u64(), g.at("checksum").str()});
+            m.transcriptomes.push_back(std::move(ms));
+        }
     return m;
 }
 
@@ -117,19 +127,28 @@ void write_manifest(const std::string& store_dir, const Manifest& m) {
       << ",\n  \"partitions\": " << m.partitions << ",\n  \"next_segment\": " << m.next_segment << ",\n  \"coordinate_references\": [";
     for (std::size_t i = 0; i < m.references.size(); ++i)
         o << (i ? ", " : "") << "{\"name\": " << json::quote(m.references[i].first) << ", \"fingerprint\": \"" << hex64(m.references[i].second) << "\"}";
-    o << "],\n  \"segments\": [";
-    for (std::size_t s = 0; s < m.segments.size(); ++s) {
-        const auto& ms = m.segments[s];
-        o << (s ? "," : "") << "\n    {\"dir\": " << json::quote(ms.dir) << ", \"distinct\": " << ms.distinct
-          << ", \"occurrences\": " << ms.occurrences << ", \"genomes\": [";
-        for (std::size_t g = 0; g < ms.genomes.size(); ++g) {
-            const auto& ge = ms.genomes[g];
-            o << (g ? "," : "") << "\n      {\"name\": " << json::quote(ge.name) << ", \"path\": " << json::quote(ge.path)
-              << ", \"bytes\": " << ge.bytes << ", \"checksum\": " << json::quote(ge.checksum) << "}";
+    const auto list = [&](const std::vector<ManifestSegment>& segs) {
+        for (std::size_t s = 0; s < segs.size(); ++s) {
+            const auto& ms = segs[s];
+            o << (s ? "," : "") << "\n    {\"dir\": " << json::quote(ms.dir) << ", \"distinct\": " << ms.distinct
+              << ", \"occurrences\": " << ms.occurrences << ", \"genomes\": [";
+            for (std::size_t g = 0; g < ms.genomes.size(); ++g) {
+                const auto& ge = ms.genomes[g];
+                o << (g ? "," : "") << "\n      {\"name\": " << json::quote(ge.name) << ", \"path\": " << json::quote(ge.path)
+                  << ", \"bytes\": " << ge.bytes << ", \"checksum\": " << json::quote(ge.checksum) << "}";
+            }
+            o << "]}";
         }
-        o << "]}";
+    };
+    o << "],\n  \"segments\": [";
+    list(m.segments);
+    o << "\n  ]";
+    if (!m.transcriptomes.empty()) {   // only when there are some: a store without keeps its manifest as it was
+        o << ",\n  \"transcriptomes\": [";
+        list(m.transcriptomes);
+        o << "\n  ]";
     }
-    o << "\n  ]\n}\n";
+    o << "\n}\n";
     write_file_durably(tmp, o.str());
     fs::rename(tmp, path);
     fsync_path(store_dir);
@@ -154,6 +173,16 @@ std::uint64_t content_id(const Manifest& m) {
     std::uint64_t h = 0x84222325cbf29ce4ULL ^ m.partitions;
     for (const auto& x : g) for (const char c : x) h = kmer::mix64(h ^ static_cast<unsigned char>(c));
     return h;
+}
+
+std::uint64_t transcriptome_id(const Manifest& m) {
+    if (m.transcriptomes.empty()) return 0;
+    std::vector<std::string> g;
+    for (const auto& s : m.transcriptomes) for (const auto& ge : s.genomes) g.push_back(ge.name + "\t" + ge.checksum);
+    std::sort(g.begin(), g.end());
+    std::uint64_t h = 0x9ae16a3b2f90404fULL;
+    for (const auto& x : g) for (const char c : x) h = kmer::mix64(h ^ static_cast<unsigned char>(c));
+    return h == 0 ? 1 : h;
 }
 
 Store::Store(const std::string& store_dir) : manifest_(read_manifest(store_dir)) {

@@ -160,3 +160,12 @@ python3 dev/transcripts_hprc.py fetch hprc
 python3 dev/transcripts_hprc.py compare hprc gstm tests/examples/transcripts/gstm/gstm.hst.tsv tests/real_data/paralogs/gstm.gfa.gz \
   tests/real_data/Homo_sapiens.GRCh38.116.loci.gtf.gz
 ```
+
+## A reference transcriptome
+
+`dev/reference_transcripts.py` splices every transcript of a GTF from the reference FASTA and names each `transcript|gene id|gene name`, for `panvar background --add --transcriptome` (`docs/background.md` lists the other ways to make one).
+
+```bash
+python3 dev/reference_transcripts.py GRCh38.fa.gz genes.gtf.gz transcripts.fa
+panvar background -o bg.bgk --add --transcriptome ensembl=transcripts.fa
+```

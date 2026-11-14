@@ -13,8 +13,13 @@
 // Evidence is counted in independent sites: a run of r consecutive private k-mers holds ceil(r / k) of
 // them, since one differing base changes at most k consecutive k-mers.
 // With the locus's haplotype-specific transcripts (panvar transcripts), their k-mers join the table: those
-// the genomic walks lack (mostly across splice junctions) are flagged transcript-only and labelled the same
-// way, with nothing subtracted from their background count, since no background genome holds a transcript.
+// the genomic walks lack (mostly across splice junctions) are flagged transcript-only. No genome holds a
+// transcript, so the genomes' counts see such a k-mer only in a processed pseudogene; a paralog's transcript
+// with the same junction is seen through the background's transcriptome (every annotated transcript, counted
+// apart from the genomes) and through the other loci indexed in the same run. A transcript-only k-mer's
+// count outside is the genomes' count (nothing subtracted), plus the transcriptome's count less its
+// occurrences in the transcripts of the locus's own genes (named in the transcriptome's headers), plus one
+// per other locus of the run holding it. Genomic k-mers are labelled from the genomes alone.
 
 #include <array>
 #include <cstdint>
@@ -102,6 +107,11 @@ struct LocusIndex {
     bool transcripts_ok_only = false;
     std::uint64_t transcripts_used = 0, transcripts_skipped = 0;
     std::vector<std::uint8_t> transcript_only;
+    // the background's transcriptomes when the index was built (their id, 0 without; their names), the records
+    // of the locus's own genes subtracted, and the transcript-only k-mers found in other transcripts and in
+    // the other loci of the run (named)
+    std::uint64_t transcriptome = 0, transcriptome_records = 0, tx_in_transcriptome = 0, tx_in_other_loci = 0;
+    std::string transcriptome_names, other_loci;
 
     std::int64_t find(std::uint64_t canonical) const;
     std::string key() const;                     // what must match for a saved index to be reused

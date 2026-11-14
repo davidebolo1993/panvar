@@ -47,6 +47,9 @@ void print_background_help() {
         << "      --coordinate-reference NAME The genome whose coordinates the locus graphs carry: its anchors are\n"
         << "                                  placed in every genome (on an existing store: adds them)\n"
         << "      --add                       Count the genomes into a new segment of an existing store\n"
+        << "      --transcriptome NAME=PATH   With --add: a FASTA of transcripts (every annotated transcript of the\n"
+        << "                                  reference), counted apart from the genomes; recruit reads it for the\n"
+        << "                                  k-mers only a locus's transcripts hold. A name already there is replaced\n"
         << "      --segment-only <dir>        Count the genomes into <dir> without committing (a parallel job)\n"
         << "      --attach <dir>...           Commit segments built with --segment-only\n"
         << "      --partitions <N>            Partitions of a new store, a power of two (default 4096)\n"
@@ -242,7 +245,7 @@ int run_background_command(const std::vector<std::string>& args) {
     if (args.empty()) { print_background_help(); return 0; }
     std::string out, dump, tmp_dir, segment_only, verify, coordinate_reference, locate_region, range, spell;
     std::vector<std::string> attach;
-    std::vector<bg::Genome> genomes;
+    std::vector<bg::Genome> genomes, transcriptomes;
     std::size_t threads = 0, memory = std::size_t{2} << 30, partitions = 4096, minimizer = 0;
     bool quiet = false, add = false, merge = false, compact = false, partitions_given = false, clean = false, local = false, dedup = true;
     for (std::size_t i = 0; i < args.size(); ++i) {
@@ -258,6 +261,11 @@ int run_background_command(const std::vector<std::string>& args) {
             const auto eq = v.find('=');
             if (eq == std::string::npos || eq == 0 || eq + 1 == v.size()) throw std::runtime_error("--genome takes NAME=PATH, got " + v);
             genomes.push_back({v.substr(0, eq), v.substr(eq + 1), 0, ""});
+        } else if (a == "--transcriptome") {
+            const std::string v = value();
+            const auto eq = v.find('=');
+            if (eq == std::string::npos || eq == 0 || eq + 1 == v.size()) throw std::runtime_error("--transcriptome takes NAME=PATH, got " + v);
+            transcriptomes.push_back({v.substr(0, eq), v.substr(eq + 1), 0, ""});
         } else if (a == "--genomes") {
             const std::string path = value();
             std::ifstream in(path);
@@ -319,10 +327,17 @@ int run_background_command(const std::vector<std::string>& args) {
         if (!fs::is_regular_file(g.path)) throw std::runtime_error("background: genome " + g.name + ": no file at " + g.path);
         g.path = fs::absolute(g.path).string();
     }
+    for (auto& g : transcriptomes) {
+        check_name("transcriptome name", g.name);
+        if (!fs::is_regular_file(g.path)) throw std::runtime_error("background: transcriptome " + g.name + ": no file at " + g.path);
+        if (is_gfa(g.path)) throw std::runtime_error("background: transcriptome " + g.name + ": a transcriptome is a FASTA of transcripts");
+        g.path = fs::absolute(g.path).string();
+    }
     if (!coordinate_reference.empty()) check_name("coordinate reference", coordinate_reference);
     const bool exists = bg::store_exists(out);
     const bool reads_store = !dump.empty() || merge || compact || !verify.empty() || !locate_region.empty() || clean || !attach.empty();
     if (reads_store && !genomes.empty()) throw std::runtime_error("background: this run takes no --genome");
+    if (!transcriptomes.empty() && (reads_store || !segment_only.empty())) throw std::runtime_error("background: --transcriptome goes with --add alone");
     if ((reads_store || add || !segment_only.empty()) && !exists) throw std::runtime_error(out + " is not a background store (no manifest.json)");
 
     // ---- read-only runs
@@ -458,12 +473,13 @@ int run_background_command(const std::vector<std::string>& args) {
         const bg::Manifest m = bg::read_manifest(out);
         std::set<std::string> listed;
         for (const auto& s : m.segments) listed.insert(s.dir);
+        for (const auto& s : m.transcriptomes) listed.insert(s.dir);
         std::uint64_t removed = 0;
         auto remove = [&](const fs::path& p) { std::error_code ec; removed += fs::remove_all(p, ec) > 0; log.info("removed: " + p.filename().string()); };
         std::error_code ec;
         for (const auto& e : fs::directory_iterator(out, ec)) {
             const std::string name = e.path().filename().string();
-            if (e.is_directory() && name.rfind("seg-", 0) == 0 && !listed.count(name)) remove(e.path());
+            if (e.is_directory() && (name.rfind("seg-", 0) == 0 || name.rfind("tx-", 0) == 0) && !listed.count(name)) remove(e.path());
             else if (e.is_directory() && (name.rfind("panvar-background-", 0) == 0 || name.rfind("panvar-compact-", 0) == 0) && !bg::job_alive(e.path().string())) remove(e.path());
             else if (e.is_directory() && name.rfind(".merge-", 0) == 0) {
                 // a merge stays while every segment it plans is listed, or while one of its range jobs runs
@@ -722,6 +738,59 @@ int run_background_command(const std::vector<std::string>& args) {
         ++now.generation;
         bg::write_manifest(out, now);
         log.info("coordinate reference: " + coordinate_reference + "; anchors: " + std::to_string(ref.code.size()) + "; mapped in every genome");
+        log.done();
+        return 0;
+    }
+
+    // ---- counting transcriptomes: each into a segment of its own, listed apart from the genomes' segments
+    if (!transcriptomes.empty()) {
+        if (!add || !genomes.empty() || !coordinate_reference.empty())
+            throw std::runtime_error("background: --transcriptome goes with --add alone, in a run without --genome");
+        std::set<std::string> given;
+        for (const auto& g : transcriptomes) if (!given.insert(g.name).second) throw std::runtime_error("background: transcriptome name " + g.name + " is given twice");
+        {
+            const bg::Manifest m = bg::read_manifest(out);
+            for (const auto& s : m.segments)
+                for (const auto& g : s.genomes)
+                    if (given.count(g.name)) throw std::runtime_error("background: " + g.name + " is a genome of the store");
+        }
+        for (const auto& tx : transcriptomes) {
+            const bg::Manifest m = bg::read_manifest(out);
+            Staging st{fs::path(out) / ".staging" / random_id(), nullptr};
+            st.lock = std::make_unique<bg::JobLock>(st.dir.string());
+            bg::BuildOptions o;
+            o.genomes = {tx};
+            o.segment_dir = (st.dir / "seg").string();
+            o.tmp_dir = default_tmp(tmp_dir, st.dir.string());
+            o.partitions = m.partitions;
+            o.threads = threads;
+            o.memory_bytes = memory;
+            o.dedup = dedup;
+            o.log = [&](const std::string& s) { log.info(s); };
+            o.progress = !quiet;
+            const bg::SegmentStats stats = bg::build_segment(o);
+            const bg::SegmentInfo mine = bg::read_segment_info(o.segment_dir);
+            const bg::StoreLock lock(out);
+            bg::Manifest now = bg::read_manifest(out);
+            const auto old = std::remove_if(now.transcriptomes.begin(), now.transcriptomes.end(), [&](const bg::ManifestSegment& s) {
+                return std::any_of(s.genomes.begin(), s.genomes.end(), [&](const bg::Genome& g) { return g.name == tx.name; });
+            });
+            const bool replaced = old != now.transcriptomes.end();
+            now.transcriptomes.erase(old, now.transcriptomes.end());
+            std::string dir;
+            for (std::uint64_t n = 0;; ++n) {
+                dir = "tx-" + std::to_string(n);
+                const bool listed = std::any_of(now.transcriptomes.begin(), now.transcriptomes.end(), [&](const bg::ManifestSegment& s) { return s.dir == dir; });
+                if (!listed && !fs::exists(fs::path(out) / dir)) break;
+            }
+            fs::rename(o.segment_dir, fs::path(out) / dir);
+            now.transcriptomes.push_back({dir, mine.distinct, mine.occurrences, mine.genomes});
+            ++now.generation;
+            bg::write_manifest(out, now);
+            log.info("transcriptome: " + tx.name + "; segment: " + dir + "; distinct 31-mers: " + std::to_string(stats.distinct) + "; occurrences: " +
+                     std::to_string(stats.kmers) + (replaced ? "; replaces the one of that name (its folder stays until --clean)" : ""));
+        }
+        log.wrote({(fs::path(out) / "manifest.json").string()});
         log.done();
         return 0;
     }

@@ -9,6 +9,7 @@ Counts every 31-mer of a set of genomes once, so that `recruit` can tell, for ea
 - Counts are exact: every k-mer with how often it occurs, summed over strands.
 - A store grows: genomes can be added later as segments, each counted in its own job; a query sums the segments.
 - Once final, a store can be compacted into an [SSHash](https://github.com/jermp/sshash) dictionary, smaller and faster to query; `recruit` uses it when it is current.
+- A store can hold a transcriptome, every annotated transcript of the reference, counted apart from the genomes: `recruit` reads it for the splice-junction k-mers of a locus's transcripts, which no genome holds.
 
 ## How it works
 
@@ -20,6 +21,7 @@ Counts every 31-mer of a set of genomes once, so that `recruit` can tell, for ea
 6. A run writes a segment: a complete store of its genomes, in its own folder. `--add` counts more genomes into a new segment of the store; `--segment-only` counts them into a folder in a separate job, and `--attach` commits such folders. A store changes only when its manifest is rewritten, so a reader never sees half a segment, and a lock keeps two jobs from committing at once.
 7. `--merge` streams the segments' sorted partitions into one segment, summing the counts. `--range I/N` splits the partitions among N jobs; the last to finish commits. Merged-away segments stay on disk until `--clean`, since running jobs may still read them.
 8. `--compact` spells the merged store's k-mers as a set of strings, each k-mer once, in strings where consecutive k-mers overlap by 30 bases (extended greedily over the store), so a string of n k-mers holds n + 30 bases, 2 bits each, instead of 31n. SSHash ([Pibiri 2022](https://doi.org/10.1093/bioinformatics/btac245)) then indexes the strings by their minimizers: a minimal perfect hash of the minimizers points to the strings (or string pieces) holding each, and a k-mer is found by hashing its minimizer and checking those few positions; its count is a weight stored along the strings. The dictionary is written beside the store as `<store>.sshash`.
+9. A transcriptome (`--add --transcriptome NAME=PATH`) is a FASTA of transcripts counted into a segment of its own, `tx-N`, listed apart from the genomes' segments. A splice junction exists in no genome, so the genomes cannot tell a locus's junction k-mer from one a paralog's transcript shares; the transcriptome can. It is kept out of the store's counts, because a transcript repeats the exons its genome already holds: summed in, it would raise the count of every exonic k-mer. So merging, compacting, `--dump` and `--verify` leave it alone, the labels of genomic k-mers never depend on it, and a compacted store reads it from the store folder beside the dictionary. A transcriptome given again under the same name replaces the earlier one.
 
 ## Required inputs
 
@@ -35,6 +37,7 @@ Counts every 31-mer of a set of genomes once, so that `recruit` can tell, for ea
 | `--genomes <tsv>` | genomes as lines of name and path | |
 | `--coordinate-reference NAME` | place this genome's anchors in every genome; on an existing store, adds them | |
 | `--add` | count the genomes into a new segment of an existing store | off |
+| `--transcriptome NAME=PATH` | with `--add`, in a run without genomes: count a FASTA of transcripts apart from the genomes; repeatable | |
 | `--segment-only <dir>` | count the genomes into `<dir>` without committing (a parallel job) | |
 | `--attach <dir>...` | commit segments built with `--segment-only` | |
 | `--merge` | merge the store's segments into one | off |
@@ -56,12 +59,23 @@ Counts every 31-mer of a set of genomes once, so that `recruit` can tell, for ea
 |------|----------|
 | `<store>/manifest.json` | the committed segments, their genomes (path, size, checksum) and the coordinate references |
 | `<store>/seg-N/` | a segment: its partitions (`parts-0.bin`, or one file per merge range), `segment.tsv` (its genomes and counts) and its anchor places per coordinate reference |
+| `<store>/tx-N/` | a transcriptome's segment: its partitions and `segment.tsv` |
 | `<store>/anchors/<reference>/` | the coordinate reference's anchors |
 | `<store>.sshash` | with `--compact`: the dictionary `recruit` reads instead of the store while its fingerprint matches |
 | `--dump <path>` | one line per k-mer: the k-mer and its count, tab-separated, no header |
 | standard output, with `--locate` | one row per copy found in each genome (`genome`, `copy`, `contig`, `start`, `end`, `strand`, the anchors inside and around it, the chains joined); a genome holding no copy gets one row with copy 0 |
 
 `recruit` refuses a store whose genome files changed since they were counted (their size is recorded): the counts would no longer describe the files it reads to locate a locus.
+
+### The transcriptome's FASTA
+
+One record per transcript, for every gene of the reference annotation, not only those near the loci: a paralog anywhere can share a junction. `recruit` subtracts the records of a locus's own genes, which it finds by name, so each header must carry the gene's id or name as a field, split at spaces or at `|`, `=`, `:`, `;` or `,`; a version suffix (`ENSG00000000001.2`) is ignored. Three ways to make one:
+
+- GENCODE's transcript sequences (`gencode.vNN.transcripts.fa.gz`): headers `transcript|gene|...|gene name|...`, used as they are;
+- `gffread -w transcripts.fa -g reference.fa genes.gtf`: headers with `gene=<name>`;
+- `dev/reference_transcripts.py reference.fa genes.gtf transcripts.fa`: headers `transcript|gene id|gene name`.
+
+The annotation should be the one `transcripts` projects, so the genes carry the same ids and names in both.
 
 ## Limitations
 
@@ -70,6 +84,7 @@ Counts every 31-mer of a set of genomes once, so that `recruit` can tell, for ea
 - Counting needs temporary disk of about a byte per genome base for the spill files, and several times that for sorted runs when `--memory` is small; put `--tmp-dir` on a local disk.
 - Anchors find a locus in a genome only where the genome holds enough of the interval's anchors in order; a copy broken across contigs, or inverted, is found in pieces.
 - A graph genome without PanSN path names counts as one haplotype, which lowers the shared cut of `recruit` for it.
+- A transcriptome holds the reference's transcripts only: a paralog's allele with another junction sequence is not in it. `recruit` covers those for loci indexed in one run.
 
 ## Example
 
@@ -82,6 +97,8 @@ panvar background -o bg.bgk --add --genome hg1=hg1.fa.gz
 panvar background -o bg.bgk --segment-only seg_2 --genome hg2=hg2.fa.gz
 panvar background -o bg.bgk --segment-only seg_3 --genome hg3=hg3.fa.gz
 panvar background -o bg.bgk --attach seg_2 seg_3
+# every annotated transcript of the reference, for the junction k-mers of loci indexed with transcripts
+panvar background -o bg.bgk --add --transcriptome gencode=gencode.transcripts.fa.gz
 # the segments merged into one, then compacted
 panvar background -o bg.bgk --merge
 panvar background -o bg.bgk --compact
