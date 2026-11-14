@@ -31,6 +31,7 @@ const char* hst_status_name(HstStatus s) {
         case HstStatus::IntronLost: return "intron_lost";
         case HstStatus::NotAsAnnotated: return "not_as_annotated";
         case HstStatus::MissingExon: return "missing_exon";
+        case HstStatus::PartialCopy: return "partial_copy";
         case HstStatus::NoCopy: return "no_copy";
     }
     return "ok";
@@ -48,6 +49,26 @@ constexpr double kChainIndelCost = 0.05;
 constexpr std::size_t kFillMaxCells = 4000000;
 // Passes of two genes taking the same stretch of a walk: overlapping by more than this share of the shorter.
 constexpr double kParalogOverlap = 0.5;
+// A copy placed by sequence: the marker's exonic bases, aligned at the identity asked for, make a copy where
+// they are covered to the share and a partial copy where covered to this much. The window reaches this share
+// of the stretch past each of its ends, and is given up past this many times the stretch: the chain's
+// anchors then disagree on where the gene lies.
+constexpr double kPartialCoverage = 0.2;
+constexpr double kWindowMargin = 0.1;
+constexpr double kWindowMax = 3.0;
+// An aligned base counts where the bases around it (this many on each side) match to this share, deletions of
+// this length or more aside: unit-cost alignment sets a stretch the walk lacks at an end of the gene against
+// whatever follows, base against base, with many short gaps.
+constexpr std::size_t kLocalFlank = 15;
+constexpr double kLocalIdentity = 0.7;
+constexpr std::size_t kLongDeletion = 20;
+// Fewer aligned bases than this between two gaps are part of the indel around them: an alignment may cut one
+// indel in two around a base that happens to match.
+constexpr std::size_t kBetweenGaps = 12;
+// The largest alignments (stretch times window, in cells) tried: of the gene's span, within a band of a
+// quarter of its bases, and of the marker's span, at any distance.
+constexpr double kSequenceMaxCells = 2.5e9;
+constexpr double kSequenceMaxCellsAny = 5e8;
 
 struct NodeTable {
     std::vector<std::string> seq;
@@ -527,22 +548,43 @@ std::size_t prefix_end(const std::string& q, const std::string& t) {
     return end;
 }
 
-// Where each base of `q` lies in `t`, from their global alignment: per base of q, the position in t before
-// it and after it (equal where t lacks the base). Unit-cost alignment places an indel's bases anywhere in
-// a stretch of equal cost, so the alignment is kept only in runs of at least 12 matched bases; between two
-// runs, the shorter side is set against the other's left or right end, whichever matches more bases, and
-// the rest of the longer side is one indel.
-std::pair<std::vector<std::size_t>, std::vector<std::size_t>> lift(const std::string& q, const std::string& t) {
+// Where each base of `q` lies in `t`, from their alignment (global, or with `infix` q inside t with t's ends
+// free): per base of q, the position in t before it and after it (equal where t lacks the base), and whether
+// the alignment sets it against a base of t, equal or not. Unit-cost alignment places an indel's bases
+// anywhere in a stretch of equal cost, so with `solid` the alignment is kept only in runs of at least 12
+// matched bases; between two runs, the shorter side is set against the other's left or right end, whichever
+// matches more bases, and the rest of the longer side is one indel. Without, every aligned base is kept
+// where the alignment sets it: a stretch of clustered differences, with no run to keep, stays base for base.
+// The alignment is tried within a band wide enough for the length difference and a quarter of the bases more,
+// then, with `any_distance`, without one; else it fails past the band.
+struct Lift {
+    bool ok = false;
+    std::vector<std::size_t> before, after;
+    std::vector<char> aligned, matched;
+    std::size_t t0 = 0, t1 = 0;   // the stretch of t the alignment covers
+};
+
+Lift lift(const std::string& q, const std::string& t, bool infix = false, bool solid = true, bool any_distance = true) {
     constexpr std::size_t kSolid = 12;
-    std::vector<std::array<std::size_t, 3>> runs{{0, 0, 0}};   // query start, target start, length
-    // a band wide enough for the length difference and a quarter of the bases more; unbounded past it
-    const std::size_t diff = q.size() > t.size() ? q.size() - t.size() : t.size() - q.size();
-    EdlibAlignResult r = align_edlib(q, t, EDLIB_MODE_NW, true, static_cast<int>(diff + q.size() / 4 + 100));
+    const EdlibAlignMode mode = infix ? EDLIB_MODE_HW : EDLIB_MODE_NW;
+    const std::size_t diff = infix ? 0 : q.size() > t.size() ? q.size() - t.size() : t.size() - q.size();
+    EdlibAlignResult r = align_edlib(q, t, mode, true, static_cast<int>(diff + q.size() / 4 + 100));
+    Lift out;
     if (r.editDistance < 0) {
         edlibFreeAlignResult(r);
-        r = align_edlib(q, t, EDLIB_MODE_NW, true, -1);
+        if (!any_distance) return out;
+        r = align_edlib(q, t, mode, true, -1);
     }
-    std::size_t qi = 0, ti = 0, rq = 0, rt = 0, len = 0;
+    out.ok = true;
+    out.aligned.assign(q.size(), 0);
+    out.matched.assign(q.size(), 0);
+    out.t0 = infix && r.numLocations > 0 ? static_cast<std::size_t>(r.startLocations[0]) : 0;
+    std::vector<std::size_t>& before = out.before;
+    std::vector<std::size_t>& after = out.after;
+    before.resize(q.size());
+    after.resize(q.size());
+    std::vector<std::array<std::size_t, 3>> runs{{0, out.t0, 0}};   // query start, target start, length
+    std::size_t qi = 0, ti = out.t0, rq = 0, rt = 0, len = 0;
     auto close = [&] {
         if (len >= kSolid) runs.push_back({rq, rt, len});
         len = 0;
@@ -551,17 +593,22 @@ std::pair<std::vector<std::size_t>, std::vector<std::size_t>> lift(const std::st
         const unsigned char op = r.alignment[x];
         if (op == EDLIB_EDOP_MATCH) {
             if (len == 0) { rq = qi; rt = ti; }
+            out.aligned[qi] = out.matched[qi] = 1;
+            before[qi] = ti; after[qi] = ti + 1;
             ++len; ++qi; ++ti;
             continue;
         }
         close();
+        if (op == EDLIB_EDOP_MISMATCH) { out.aligned[qi] = 1; before[qi] = ti; after[qi] = ti + 1; }
+        if (op == EDLIB_EDOP_INSERT) before[qi] = after[qi] = ti;   // a base t lacks
         if (op != EDLIB_EDOP_DELETE) ++qi;   // DELETE: a base of t only; INSERT: of q only
         if (op != EDLIB_EDOP_INSERT) ++ti;
     }
     close();
     edlibFreeAlignResult(r);
-    runs.push_back({q.size(), t.size(), 0});
-    std::vector<std::size_t> before(q.size()), after(q.size());
+    out.t1 = infix ? ti : t.size();
+    if (!solid) return out;
+    runs.push_back({q.size(), out.t1, 0});
     for (std::size_t k = 0; k + 1 < runs.size(); ++k) {
         const auto [q0, t0, l0] = runs[k];
         for (std::size_t i = 0; i < l0; ++i) { before[q0 + i] = t0 + i; after[q0 + i] = t0 + i + 1; }
@@ -584,7 +631,7 @@ std::pair<std::vector<std::size_t>, std::vector<std::size_t>> lift(const std::st
             }
         }
     }
-    return {before, after};
+    return out;
 }
 
 // A walk's units of one tandem stretch, kept for the haplotype's other transcripts with that stretch: each
@@ -609,7 +656,9 @@ Placed tandem_exons(const std::string& ws, const Tandem& tm, std::size_t lo, std
         const Tandem::Unit& un = tm.units[w.g];
         if (un.exons.empty()) continue;
         if (!w.lifted) {
-            std::tie(w.before, w.after) = lift(un.seq, ws.substr(w.a, w.b - w.a));
+            Lift l = lift(un.seq, ws.substr(w.a, w.b - w.a));
+            w.before = std::move(l.before);
+            w.after = std::move(l.after);
             w.lifted = true;
         }
         for (const auto& [a, b, ref] : un.exons) {
@@ -697,12 +746,166 @@ std::vector<WalkUnit> walk_units(const std::string& ws, const Tandem& tm, std::s
     return out;
 }
 
-// One transcript through one pass.
-HstRecord project_one(const Walk& R, const std::string& rseq, const Gene& g, const Pass& p, const Walk& W,
+// A copy placed by sequence: the reference stretch [q0, q0 + n) aligned inside a window of the oriented walk
+// starting at base `a`.
+struct SeqCopy {
+    bool ok = false;
+    bool reverse = false;
+    bool marker_span = false;            // aligned over the marker's span, not the gene's
+    std::size_t q0 = 0, a = 0;
+    Lift map;
+    std::size_t h_lo = 0, h_hi = 0;      // the aligned stretch, on the walk as written
+    double coverage = 0.0, identity = 0.0;   // of the marker's exonic bases: aligned, and equal among those
+};
+
+// One copy of a gene on a walk: a pass (by nodes) or a sequence placement.
+struct Copy {
+    const Pass* pass = nullptr;
+    const SeqCopy* seq = nullptr;
+    bool reverse() const { return pass ? pass->reverse : seq->reverse; }
+};
+
+// Carry reference cut c to the walk through a sequence placement: exact where the base at the boundary is set
+// against a base of the walk. A base the walk lacks sits, with its run of lacking bases, at one position of
+// the walk: the boundary moves to the nearer end of the run, and a tie keeps the variant inside the exon.
+CutOnWalk map_cut(const SeqCopy& sc, std::size_t c, bool start) {
+    CutOnWalk out;
+    const std::size_t n = sc.map.before.size();
+    if (c < sc.q0 || c > sc.q0 + n) return out;
+    const std::size_t i = c - sc.q0;
+    const auto exact = [&](std::size_t k) { return sc.map.after[k] == sc.map.before[k] + 1; };
+    if (start ? i < n && exact(i) : i > 0 && exact(i - 1)) {
+        out.ok = true;
+        out.pos = sc.a + (start ? sc.map.before[i] : sc.map.after[i - 1]);
+        return out;
+    }
+    if (start ? i >= n : i == 0) return out;   // the cut lies at the stretch's end, outside it
+    std::size_t ql = start ? i : i - 1, qr = ql;
+    while (ql > 0 && !exact(ql - 1)) --ql;
+    while (qr + 1 < n && !exact(qr + 1)) ++qr;
+    ++qr;   // [ql, qr) lacking
+    if (ql == 0 && qr == n) return out;
+    out.ok = true;
+    const long dl = static_cast<long>(c - (sc.q0 + ql)), dr = static_cast<long>(sc.q0 + qr - c);
+    const bool left = ql == 0 ? false : qr == n ? true : dl != dr ? dl < dr : start;
+    out.pos = sc.a + (left ? sc.map.after[ql - 1] : sc.map.before[qr]);
+    const long d = left ? dl : dr;
+    out.shift = left == start ? d : -d;
+    return out;
+}
+
+CutOnWalk map_cut(const Walk& R, const Gene& g, const Copy& cp, const Walk& W, std::size_t c, bool start) {
+    return cp.pass ? map_cut(R, g, *cp.pass, W, c, start) : map_cut(*cp.seq, c, start);
+}
+
+bool exon_shared(const Walk& R, const Gene& g, const Copy& cp, std::size_t cs, std::size_t ce) {
+    if (cp.pass) return exon_shared(R, g, *cp.pass, cs, ce);
+    const SeqCopy& sc = *cp.seq;
+    const std::size_t n = sc.map.before.size();
+    for (std::size_t x = std::max(cs, sc.q0); x < ce && x < sc.q0 + n; ++x)
+        if (sc.map.after[x - sc.q0] == sc.map.before[x - sc.q0] + 1) return true;
+    return false;
+}
+
+// The reference stretch [q_lo, q_hi) of a gene aligned inside the window of the walk that pass p, its best
+// chain, points to: from the chain's anchors nearest the stretch's ends, with a margin for indels. Coverage
+// and identity are measured on the marker's exonic bases.
+SeqCopy align_stretch(const Walk& R, const std::string& rseq, const Gene& g, const Cuts& marker, const Pass& p, const Walk& W,
+                      const std::string& wseq, std::size_t q_lo, std::size_t q_hi, bool any_distance) {
+    SeqCopy sc;
+    sc.reverse = p.reverse;
+    const std::size_t len = q_hi - q_lo;
+    // the walk positions of the stretch's two ends, each carried from the matched step nearest to it
+    long a = 0, b = 0, da = -1, db = -1;
+    for (std::size_t k = p.first; k <= p.last; ++k) {
+        if (p.match[k] < 0) continue;
+        const std::size_t i = g.gs + k, j = static_cast<std::size_t>(p.match[k]);
+        const long x0 = static_cast<long>(R.pref[i]), x1 = static_cast<long>(R.pref[i + 1]);
+        const long d0 = std::labs(x0 - static_cast<long>(q_lo)), d1 = std::labs(x1 - static_cast<long>(q_hi));
+        if (da < 0 || d0 < da) { da = d0; a = static_cast<long>(W.pref[j]) + static_cast<long>(q_lo) - x0; }
+        if (db < 0 || d1 < db) { db = d1; b = static_cast<long>(W.pref[j + 1]) + static_cast<long>(q_hi) - x1; }
+    }
+    const long margin = static_cast<long>(kWindowMargin * static_cast<double>(len)) + 100;
+    a = std::max(0L, a - margin);
+    b = std::min(static_cast<long>(W.len()), b + margin);
+    if (da < 0 || b <= a || static_cast<double>(b - a) > kWindowMax * static_cast<double>(len) + 2 * static_cast<double>(margin)) return sc;
+    sc.q0 = q_lo;
+    sc.a = static_cast<std::size_t>(a);
+    sc.map = lift(rseq.substr(q_lo, len), wseq.substr(sc.a, static_cast<std::size_t>(b - a)), true, false, any_distance);
+    if (!sc.map.ok) return sc;
+    {   // bases aligned where the alignment holds (kLocalIdentity); the others are bases the walk lacks
+        Lift& l = sc.map;
+        std::vector<std::size_t> match(len + 1, 0), count(len + 1, 0);
+        for (std::size_t i = 0; i < len;) {
+            std::size_t e = i;
+            while (e < len && !l.aligned[e]) ++e;
+            const bool long_deletion = e - i >= kLongDeletion;
+            for (std::size_t x = i; x < std::max(e, i + 1); ++x) {
+                match[x + 1] = match[x] + l.matched[x];
+                count[x + 1] = count[x] + !(x < e && long_deletion);
+            }
+            i = std::max(e, i + 1);
+        }
+        std::vector<char> keep(len, 0);
+        for (std::size_t i = 0; i < len; ++i) {
+            const std::size_t lo = i > kLocalFlank ? i - kLocalFlank : 0, hi = std::min(len, i + kLocalFlank + 1);
+            keep[i] = l.aligned[i] && static_cast<double>(match[hi] - match[lo]) >= kLocalIdentity * static_cast<double>(count[hi] - count[lo]);
+        }
+        for (std::size_t i = 0; i < len;) {   // runs of aligned bases without a gap, each between two gaps
+            if (!l.aligned[i]) { ++i; continue; }
+            std::size_t e = i + 1;
+            while (e < len && l.aligned[e] && l.before[e] == l.after[e - 1]) ++e;
+            if (i > 0 && e < len && e - i < kBetweenGaps)
+                for (std::size_t x = i; x < e; ++x) keep[x] = 0;
+            i = e;
+        }
+        for (std::size_t i = 0; i < len; ++i)
+            if (!keep[i]) { l.aligned[i] = l.matched[i] = 0; l.after[i] = l.before[i]; }
+    }
+    std::size_t total = 0, aligned = 0, matched = 0;
+    for (const auto& [s, e] : marker)
+        for (std::size_t x = std::max(s, q_lo); x < std::min(e, q_hi); ++x) {
+            ++total;
+            aligned += sc.map.aligned[x - q_lo];
+            matched += sc.map.matched[x - q_lo];
+        }
+    if (total == 0 || aligned == 0) return sc;
+    sc.coverage = static_cast<double>(aligned) / static_cast<double>(total);
+    sc.identity = static_cast<double>(matched) / static_cast<double>(aligned);
+    // the stretch of the walk the copy takes: where the marker's span lies, as for a pass
+    const std::size_t s0 = std::max(g.m_lo, q_lo) - q_lo, s1 = std::min(g.m_hi, q_hi) - q_lo;
+    std::size_t lo = sc.a + sc.map.t0, hi = sc.a + sc.map.t1;
+    if (s1 > s0 && sc.map.after[s1 - 1] > sc.map.before[s0]) { lo = sc.a + sc.map.before[s0]; hi = sc.a + sc.map.after[s1 - 1]; }
+    sc.h_lo = p.reverse ? W.len() - hi : lo;
+    sc.h_hi = p.reverse ? W.len() - lo : hi;
+    sc.ok = true;
+    return sc;
+}
+
+// A gene's copy found by sequence where its nodes fall short of the share. The gene's span is aligned first,
+// within a band: a copy lies within it. Failing that, the marker's span is aligned at any distance, which
+// is enough to tell a partial copy, or a copy of a short gene with a long isoform beside it; exons outside
+// the marker's span are then not aligned.
+SeqCopy place_by_sequence(const Walk& R, const std::string& rseq, const Gene& g, const Cuts& marker, const Pass& p,
+                          const Walk& W, const std::string& wseq) {
+    const auto cells = [](std::size_t len) {
+        return static_cast<double>(len) * (static_cast<double>(len) * (1 + 2 * kWindowMargin) + 200);
+    };
+    SeqCopy sc;
+    if (g.hi > g.lo && cells(g.hi - g.lo) <= kSequenceMaxCells) sc = align_stretch(R, rseq, g, marker, p, W, wseq, g.lo, g.hi, false);
+    if (!sc.ok && g.m_hi > g.m_lo && cells(g.m_hi - g.m_lo) <= kSequenceMaxCellsAny) {
+        sc = align_stretch(R, rseq, g, marker, p, W, wseq, g.m_lo, g.m_hi, true);
+        sc.marker_span = g.m_lo != g.lo || g.m_hi != g.hi;
+    }
+    return sc;
+}
+
+// One transcript through one copy.
+HstRecord project_one(const Walk& R, const std::string& rseq, const Gene& g, const Copy& cp, const Walk& W,
                       const std::string& wseq, const TranscriptFeature& tx, const Cuts& cuts,
                       const TranscriptsResult::EdgeClip& clip, const Tandem& tm, UnitCache& cache) {
     HstRecord r;
-    r.reverse = p.reverse;
+    r.reverse = cp.reverse();
     const std::size_t n = cuts.size();
     const bool minus = tx.strand == '-';
     // Exons and introns are numbered in transcript order over the whole annotated transcript, 1-based; a
@@ -717,13 +920,15 @@ HstRecord project_one(const Walk& R, const std::string& rseq, const Gene& g, con
         if (in_tandem(k)) continue;
         const auto [cs, ce] = cuts[k];
         const std::string e = "e" + std::to_string(exon_no(k));
-        const bool before = cs < R.pref[g.gs + p.first], after = ce > R.pref[g.gs + p.last + 1];
-        if (!exon_shared(R, g, p, cs, ce)) {
+        const bool before = cp.pass && cs < R.pref[g.gs + cp.pass->first] && cp.pass->at_walk_start;
+        const bool after = cp.pass && ce > R.pref[g.gs + cp.pass->last + 1] && cp.pass->at_walk_end;
+        if (!exon_shared(R, g, cp, cs, ce)) {
             missing = true;
-            add_detail(r.detail, e + ((before && p.at_walk_start) || (after && p.at_walk_end) ? ":walk_end" : ":missing"));
+            const bool unaligned = cp.seq && (cs < cp.seq->q0 || ce > cp.seq->q0 + cp.seq->map.before.size());
+            add_detail(r.detail, e + (before || after ? ":walk_end" : unaligned ? ":not_aligned" : ":missing"));
             continue;
         }
-        const CutOnWalk a = map_cut(R, g, p, W, cs, true), b = map_cut(R, g, p, W, ce, false);
+        const CutOnWalk a = map_cut(R, g, cp, W, cs, true), b = map_cut(R, g, cp, W, ce, false);
         if (!a.ok || !b.ok || b.pos <= a.pos) {
             missing = true;
             add_detail(r.detail, e + ":missing");
@@ -743,6 +948,12 @@ HstRecord project_one(const Walk& R, const std::string& rseq, const Gene& g, con
         if (!in_tandem(k)) {
             pieces.push_back({hx[k].first, hx[k].second, k});
         } else if (k == tm.lo) {
+            if (!cp.pass) {   // a tandem stretch is placed through a pass's nodes
+                missing = true;
+                add_detail(r.detail, "tandem:missing");
+                continue;
+            }
+            const Pass& p = *cp.pass;
             // The window between the exons around the stretch; where the stretch starts or ends the transcript,
             // the anchoring node the pass shares, else the pass's end (a cut carried into the repeat could land
             // in any unit).
@@ -809,12 +1020,12 @@ HstRecord project_one(const Walk& R, const std::string& rseq, const Gene& g, con
     r.exons = m;
     for (std::size_t q = 0; q < m; ++q) {
         const Piece& x = pieces[minus ? m - 1 - q : q];
-        r.exon_starts.push_back(p.reverse ? W.len() - x.b : x.a);
+        r.exon_starts.push_back(r.reverse ? W.len() - x.b : x.a);
         r.exon_lengths.push_back(x.b - x.a);
     }
     const std::size_t lo = pieces.front().a, hi = pieces.back().b;
-    r.path_start = p.reverse ? W.len() - hi : lo;
-    r.path_end = p.reverse ? W.len() - lo : hi;
+    r.path_start = r.reverse ? W.len() - hi : lo;
+    r.path_end = r.reverse ? W.len() - lo : hi;
     r.status = lost ? HstStatus::IntronLost : clip.bp_5p + clip.bp_3p ? HstStatus::ClippedAtEdge
              : r.moved ? HstStatus::BoundaryMoved
              : r.splice_changed ? HstStatus::SpliceSiteChanged : HstStatus::Ok;
@@ -1072,6 +1283,7 @@ TranscriptsResult project_transcripts(const Graph& graph, const TranscriptsOptio
         const Occurrences occ(H, t.seq.size());
         std::vector<Pass> passes;
         std::vector<double> best_share(genes.size(), 0.0);
+        std::vector<Pass> weak(genes.size());   // per gene, its best pass below the share: where to look by sequence
         UnitCache unit_cache;
         for (std::size_t gi = 0; gi < genes.size(); ++gi) {
             const Gene& g = genes[gi];
@@ -1092,6 +1304,7 @@ TranscriptsResult project_transcripts(const Graph& graph, const TranscriptsOptio
                     Pass p = make_pass(R, g, marker_cuts[gi], W, chains[k], t, gi, rev);
                     best_share[gi] = std::max(best_share[gi], p.share);
                     if (p.share >= opt.min_exon_share) passes.push_back(std::move(p));
+                    else if (p.marker_matched > weak[gi].marker_matched) weak[gi] = std::move(p);
                 }
             }
         }
@@ -1110,25 +1323,80 @@ TranscriptsResult project_transcripts(const Graph& graph, const TranscriptsOptio
                 rival[a] = "rival:" + res.transcripts[genes[best->gene].tx.front()].gene_name + buf;
             }
         }
+        // A gene with no pass to the share, and not lost to another gene, is looked for by sequence where its
+        // best chain lies. Placements are accepted best first (whole copies before partial ones, then by the
+        // bases they match); one taking the stretch of an accepted pass or placement of a gene apart on the
+        // reference is that gene's. Genes with a tandem stretch are placed by nodes only.
+        std::vector<SeqCopy> placed(genes.size());
+        {
+            std::vector<SeqCopy> found(genes.size());
+            std::vector<std::size_t> order;
+            for (std::size_t gi = 0; gi < genes.size(); ++gi) {
+                const Pass& wp = weak[gi];
+                if (!gene_passes[gi].empty() || !lost_to[gi].empty() || !genes[gi].tandem_spans.empty() || wp.marker_matched == 0) continue;
+                found[gi] = place_by_sequence(R, rseq, genes[gi], marker_cuts[gi], wp, wp.reverse ? Hr : H, wp.reverse ? hrseq : hseq);
+                if (found[gi].ok && found[gi].identity >= opt.min_identity && found[gi].coverage >= kPartialCoverage) order.push_back(gi);
+            }
+            const auto rank = [&](std::size_t gi) {
+                return std::make_tuple(found[gi].coverage >= opt.min_exon_share, found[gi].coverage * found[gi].identity);
+            };
+            std::stable_sort(order.begin(), order.end(), [&](std::size_t x, std::size_t y) { return rank(x) > rank(y); });
+            for (const std::size_t gi : order) {
+                const SeqCopy& sc = found[gi];
+                const auto takes = [&](std::size_t other, std::size_t lo, std::size_t hi) {
+                    if (other == gi || !apart_on_reference(genes[gi], genes[other])) return false;
+                    const std::size_t ov = overlap(sc.h_lo, sc.h_hi, lo, hi);
+                    return static_cast<double>(ov) > kParalogOverlap * static_cast<double>(std::max(sc.h_hi - sc.h_lo, hi - lo));
+                };
+                bool taken = false;
+                for (const std::size_t a : kept) taken = taken || takes(passes[a].gene, passes[a].h_lo, passes[a].h_hi);
+                for (std::size_t other = 0; other < genes.size(); ++other)
+                    taken = taken || (placed[other].ok && takes(other, placed[other].h_lo, placed[other].h_hi));
+                if (!taken) placed[gi] = sc;
+            }
+        }
+        const auto fmt = [](const char* name, double v) {
+            char buf[48];
+            std::snprintf(buf, sizeof buf, "%s:%.3f", name, v);
+            return std::string(buf);
+        };
         for (std::size_t gi = 0; gi < genes.size(); ++gi) {
             auto& gp = gene_passes[gi];
             std::sort(gp.begin(), gp.end(), [](const Pass* a, const Pass* b) { return a->h_lo < b->h_lo; });
+            const SeqCopy& sc = placed[gi];
+            const bool by_sequence = sc.ok && sc.coverage >= opt.min_exon_share;
             for (const std::size_t k : genes[gi].tx) {
-                if (gp.empty()) {
+                if (gp.empty() && !by_sequence) {
                     HstRecord r;
                     r.transcript = k;
                     r.haplotype = h;
-                    r.status = HstStatus::NoCopy;
-                    char buf[32];
-                    std::snprintf(buf, sizeof buf, "%.3f", best_share[gi]);
-                    r.detail = "best_share:" + std::string(buf);
+                    r.status = sc.ok ? HstStatus::PartialCopy : HstStatus::NoCopy;
+                    r.detail = fmt("best_share", best_share[gi]);
+                    if (sc.ok) { add_detail(r.detail, fmt("coverage", sc.coverage)); add_detail(r.detail, fmt("identity", sc.identity)); }
                     if (!lost_to[gi].empty()) add_detail(r.detail, lost_to[gi]);
+                    out.push_back(std::move(r));
+                    continue;
+                }
+                if (by_sequence) {
+                    Copy cp;
+                    cp.seq = &sc;
+                    HstRecord r = project_one(R, rseq, genes[gi], cp, sc.reverse ? Hr : H, sc.reverse ? hrseq : hseq,
+                                              res.transcripts[k], cuts[k], res.clips[k], tandem[k], unit_cache);
+                    r.transcript = k;
+                    r.haplotype = h;
+                    r.copy = 1;
+                    r.copies = 1;
+                    add_detail(r.detail, sc.marker_span ? "placed_by_sequence:marker_span" : "placed_by_sequence");
+                    add_detail(r.detail, fmt("best_share", best_share[gi]));
+                    add_detail(r.detail, fmt("identity", sc.identity));
                     out.push_back(std::move(r));
                     continue;
                 }
                 for (std::size_t c = 0; c < gp.size(); ++c) {
                     const Pass& p = *gp[c];
-                    HstRecord r = project_one(R, rseq, genes[gi], p, p.reverse ? Hr : H, p.reverse ? hrseq : hseq,
+                    Copy cp;
+                    cp.pass = &p;
+                    HstRecord r = project_one(R, rseq, genes[gi], cp, p.reverse ? Hr : H, p.reverse ? hrseq : hseq,
                                               res.transcripts[k], cuts[k], res.clips[k], tandem[k], unit_cache);
                     r.transcript = k;
                     r.haplotype = h;

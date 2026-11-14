@@ -37,6 +37,8 @@ void print_transcripts_help() {
         << "  -o, --out-prefix <prefix>         Output prefix (required)\n"
         << "      --min-exon-share <F>          Share of the gene's marker exons a pass must walk to be a\n"
         << "                                    copy (default 0.8)\n"
+        << "      --min-identity <F>            Identity of the marker exons for a copy placed by sequence,\n"
+        << "                                    where its nodes fall short of the share (default 0.93)\n"
         << "  -t, --threads <N>                 Worker threads (default 0 = all cores)\n"
         << "  -q, --quiet                       No progress logs\n"
         << "  -h, --help                        Show this help\n";
@@ -211,6 +213,7 @@ int run_transcripts_command(const std::vector<std::string>& args) {
         else if (arg == "--contig-alias") opt.contig_alias = require_value(arg);
         else if (arg == "-o" || arg == "--out-prefix") opt.out_prefix = require_value(arg);
         else if (arg == "--min-exon-share") opt.min_exon_share = cli::parse_unit_fraction_arg(arg, require_value(arg));
+        else if (arg == "--min-identity") opt.min_identity = cli::parse_unit_fraction_arg(arg, require_value(arg));
         else if (arg == "-t" || arg == "--threads") opt.threads = cli::parse_size_arg(arg, require_value(arg));
         else if (arg == "-q" || arg == "--quiet") opt.quiet = true;
         else throw std::runtime_error("Unknown option: " + arg);

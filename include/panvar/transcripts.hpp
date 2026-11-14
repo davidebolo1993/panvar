@@ -21,7 +21,10 @@ namespace panvar {
 // stretch is the copy of the gene sharing more of its marker exons, and a shorter pass lying inside
 // another gene's copy that matches it no better is part of that copy. Each exon boundary is carried to the
 // walk through the node holding it; a boundary inside a variant (the walk misses that reference node) moves
-// to the nearest position the walk shares with the reference, and is flagged.
+// to the nearest position the walk shares with the reference, and is flagged. A gene whose nodes fall short
+// of the share on a walk (alleles the graph keeps on nodes of their own) is placed by sequence instead: its
+// reference stretch aligned inside the window its best chain points to, accepted on the marker's coverage
+// and identity.
 
 struct TranscriptsOptions {
     std::string gfa_path;
@@ -31,13 +34,14 @@ struct TranscriptsOptions {
     std::string contig_alias;
     std::string out_prefix;
     double min_exon_share = 0.8;
+    double min_identity = 0.93;     // of the marker's exonic bases, for a copy placed by sequence
     std::size_t threads = 0;
     bool quiet = false;
 };
 
 // Least to most severe; a record takes the most severe that applies.
-enum class HstStatus { Ok, SpliceSiteChanged, BoundaryMoved, ClippedAtEdge, IntronLost, NotAsAnnotated, MissingExon, NoCopy };
-constexpr int kHstStatuses = 8;
+enum class HstStatus { Ok, SpliceSiteChanged, BoundaryMoved, ClippedAtEdge, IntronLost, NotAsAnnotated, MissingExon, PartialCopy, NoCopy };
+constexpr int kHstStatuses = 9;
 const char* hst_status_name(HstStatus s);
 
 // Where an HST comes from: projected from the reference annotation, cut from the haplotype's own annotation,

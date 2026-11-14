@@ -8,8 +8,8 @@ panvar.
   transcript_fixture.py check <dir> <prefix>           compares <prefix>.hst.tsv/.hst.fa with expected.tsv
 
 Variants on the reference (0-based, half-open): ("snp", p), ("del", (a, b)), ("sub", (a, b)), a stretch of the
-same length with every third base changed (clustered SNPs folded into one node), and ("dup", (a, b)), a
-stretch walked twice over the same nodes. A haplotype in "reversed" is another one written from its end.
+same length with every third base changed, or every `sub_step`-th (clustered SNPs folded into one node),
+and ("dup", (a, b)), a stretch walked twice over the same nodes. A haplotype in "reversed" is another one written from its end.
 """
 import random
 import sys
@@ -87,9 +87,19 @@ CASES = {
         genes={"GS": ("+", {"TS1": [(1000, 1300), (2000, 2100), (3000, 3300)]})},
         haps={"h1": [("sub", (1296, 1306))], "h2": [("sub", (1996, 2006))], "h3": [("snp", 1300), ("snp", 2999)]},
         reversed={"h4": "h1"}),
+    # a gene whose exons lie mostly on allele nodes (placed by sequence, with a boundary inside a deletion on
+    # one haplotype), and a gene most of whose exons a deletion removes (a partial copy)
+    "divergent": dict(
+        L=6000, sub_step=5,
+        genes={"GH": ("+", {"TH1": [(1000, 1300), (2000, 2300), (3000, 3300)], "TH2": [(1000, 1300), (3000, 3300)]}),
+               "GP": ("-", {"TP1": [(4500, 4700), (5000, 5300)]})},
+        haps={"h1": [("sub", (1000, 1120)), ("sub", (2000, 2105))], "h2": [("del", (4950, 5350))],
+              "h3": [("sub", (1000, 1120)), ("sub", (2000, 2105)), ("del", (2297, 2305))]},
+        reversed={"h4": "h1"}),
     # the main case with haplotypes' own annotations (write_annotated)
     "annotated": dict(),
 }
+SHARE, IDENTITY, PARTIAL = 0.8, 0.93, 0.2   # panvar's --min-exon-share and --min-identity, and its partial copy
 
 
 def reference(case):
@@ -128,7 +138,8 @@ def build(case):
                 alt_node[v] = nid
             if kind == "sub" and v not in alt_node:
                 nid = str(len(nodes) + 1)
-                nodes[nid] = "".join(alt(c) if (p - v[0]) % 3 == 0 else c for p, c in enumerate(ref[v[0]:v[1]], v[0]))
+                nodes[nid] = "".join(alt(c) if (p - v[0]) % case.get("sub_step", 3) == 0 else c
+                                     for p, c in enumerate(ref[v[0]:v[1]], v[0]))
                 alt_node[v] = nid
     walks, seqs, maps = {"ref": [(n, "+") for n, _, _ in ref_nodes]}, {"ref": ref}, {"ref": [dict((p, p) for p in range(L))]}
     for h, variants in case["haps"].items():
@@ -248,9 +259,28 @@ def expected(case, ref, seqs, maps):
                     rows.append((t, g, h, 0, "no_copy", [], ""))
                 src = case.get("reversed", {}).get(h, h)
                 subs = [v for kind, v in case["haps"].get(src, []) if kind == "sub"]
+                snps = {v for kind, v in case["haps"].get(src, []) if kind == "snp"}
+                by_sequence = False
+                if len(copies) == 1:
+                    # the marker's exonic bases the copy shares by nodes; below the share, the copy is placed by
+                    # sequence when they are covered and alike enough, and is partial when covered less
+                    marker = [p for a, b in next(iter(txs.values())) for p in range(max(a, 0), min(b, case["L"]))]
+                    held = [p for p in marker if p in copies[0]]
+                    changed = [p for p in held if p in snps or
+                               any(a <= p < b and (p - a) % case.get("sub_step", 3) == 0 for a, b in subs)]
+                    on_alleles = [p for p in held if p in snps or any(a <= p < b for a, b in subs)]
+                    if (len(held) - len(on_alleles)) / len(marker) < SHARE:
+                        alike = held and 1 - len(changed) / len(held) >= IDENTITY
+                        if not alike or len(held) / len(marker) < PARTIAL:
+                            rows.append((t, g, h, 0, "no_copy", [], ""))
+                            continue
+                        if len(held) / len(marker) < SHARE:
+                            rows.append((t, g, h, 0, "partial_copy", [], ""))
+                            continue
+                        by_sequence = True
                 for c, m in enumerate(copies, 1):
-                    st, notes, s = project(case, ref, seqs[src], m, strand, exons, subs)
-                    rows.append((t, g, h, c, st, notes, s))
+                    st, notes, s = project(case, ref, seqs[src], m, strand, exons, () if by_sequence else subs)
+                    rows.append((t, g, h, c, st, notes + ["placed_by_sequence"] * by_sequence, s))
     return rows
 
 
