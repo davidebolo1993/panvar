@@ -107,6 +107,13 @@ CASES = {
         genes={"GQ": ("+", {"TQ1": [(1000, 1300), (2000, 2300), (3000, 3300)]})},
         haps={"h1": [("sub", (1000, 1300)), ("sub", (2000, 2300)), ("sub", (3000, 3300))]},
         reversed={"h2": "h1"}),
+    # a gene placed by sequence with a deletion across the start of its first exon and one across the end of
+    # its last: the ends of the gene, where an alignment has nothing past them to hold on to
+    "end_indel": dict(
+        L=6000, sub_step=5,
+        genes={"GH": ("+", {"TH1": [(1000, 1300), (2000, 2300), (3000, 3300)]})},
+        haps={"h1": [("del", (997, 1002)), ("sub", (1010, 1130)), ("sub", (2000, 2105)), ("del", (3296, 3303))]},
+        reversed={"h2": "h1"}),
     # a short gene on the nodes of a stretch inside a longer gene, and a haplotype without the short gene
     # whose copy of the longer one carries an allele there (write_nested)
     "nested": dict(),

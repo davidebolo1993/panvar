@@ -56,19 +56,22 @@ constexpr double kParalogOverlap = 0.5;
 constexpr double kPartialCoverage = 0.2;
 constexpr double kWindowMargin = 0.1;
 constexpr double kWindowMax = 3.0;
-// An aligned base counts where the bases around it (this many on each side) match to this share, deletions of
-// this length or more aside: unit-cost alignment sets a stretch the walk lacks at an end of the gene against
-// whatever follows, base against base, with many short gaps.
+// An aligned base counts where the bases around it (this many on each side) match to this share of the
+// matches, mismatches and gaps there, a gap of any length counting once: unit-cost alignment sets a stretch
+// the walk lacks against whatever follows, base against base with many short gaps, while an indel between
+// matching bases is one gap.
 constexpr std::size_t kLocalFlank = 15;
 constexpr double kLocalIdentity = 0.7;
-constexpr std::size_t kLongDeletion = 20;
-// Fewer aligned bases than this between two gaps are part of the indel around them: an alignment may cut one
-// indel in two around a base that happens to match.
+// Gaps with fewer aligned bases than this between them are one indel, set again in one piece.
 constexpr std::size_t kBetweenGaps = 12;
 // The largest alignments (stretch times window, in cells) tried: of the gene's span, within a band of a
 // quarter of its bases, and of the marker's span, at any distance.
 constexpr double kSequenceMaxCells = 2.5e9;
 constexpr double kSequenceMaxCellsAny = 5e8;
+// Reference bases aligned with the stretch on each side of it: an indel across an end of the gene then lies
+// inside the alignment, where it is a gap; at the alignment's end, the bases the walk lacks would be set
+// against whatever follows.
+constexpr std::size_t kEndFlank = 100;
 
 struct NodeTable {
     std::vector<std::string> seq;
@@ -843,34 +846,56 @@ SeqCopy align_stretch(const Walk& R, const std::string& rseq, const Gene& g, con
     sc.a = static_cast<std::size_t>(a);
     sc.map = lift(rseq.substr(q_lo, len), wseq.substr(sc.a, static_cast<std::size_t>(b - a)), true, false, any_distance);
     if (!sc.map.ok) return sc;
-    {   // bases aligned where the alignment holds (kLocalIdentity); the others are bases the walk lacks
+    {
         Lift& l = sc.map;
-        std::vector<std::size_t> match(len + 1, 0), count(len + 1, 0);
+        const std::string q = rseq.substr(q_lo, len), t = wseq.substr(sc.a, static_cast<std::size_t>(b - a));
+        // Gaps with fewer than kBetweenGaps aligned bases between them are one indel the alignment cut up: unit
+        // costs let it scatter an indel's bases among others that happen to match. Their stretch is set again
+        // as for a lift: the shorter side against the longer's left or right end, whichever matches more
+        // bases, and the rest of the longer side one indel.
+        const auto gap_at = [&](std::size_t i) { return !l.aligned[i] || (i > 0 && l.before[i] != l.after[i - 1]); };
         for (std::size_t i = 0; i < len;) {
-            std::size_t e = i;
-            while (e < len && !l.aligned[e]) ++e;
-            const bool long_deletion = e - i >= kLongDeletion;
-            for (std::size_t x = i; x < std::max(e, i + 1); ++x) {
-                match[x + 1] = match[x] + l.matched[x];
-                count[x + 1] = count[x] + !(x < e && long_deletion);
+            if (!gap_at(i)) { ++i; continue; }
+            std::size_t g = i, gaps = 1, held = 0;   // the last gap of the cluster, its gaps, its aligned bases
+            for (std::size_t k = i + 1; k < len && k - g <= kBetweenGaps; ++k)
+                if (gap_at(k)) { gaps += !(k == g + 1 && !l.aligned[k] && !l.aligned[g]); g = k; }
+            for (std::size_t k = i; k <= g; ++k) held += l.aligned[k];
+            if (gaps > 1 && held > 0) {
+                const std::size_t tl = i > 0 ? l.after[i - 1] : l.t0, tr = g + 1 < len ? l.before[g + 1] : l.t1;
+                const std::size_t lq = g + 1 - i, lt = tr - tl, m = std::min(lq, lt);
+                std::size_t left = 0, right = 0;
+                for (std::size_t x = 0; x < m; ++x) {
+                    left += q[i + x] == t[tl + x];
+                    right += q[g + 1 - m + x] == t[tr - m + x];
+                }
+                const bool at_left = left >= right;
+                for (std::size_t x = 0; x < lq; ++x) {
+                    const bool set = at_left ? x < m : x >= lq - m;
+                    const std::size_t y = !set ? (at_left ? tr : tl) : at_left ? tl + x : tr - (lq - x);
+                    l.before[i + x] = y;
+                    l.after[i + x] = y + set;
+                    l.aligned[i + x] = set;
+                    l.matched[i + x] = set && q[i + x] == t[y];
+                }
             }
-            i = std::max(e, i + 1);
+            i = g + 1;
         }
-        std::vector<char> keep(len, 0);
+        // bases aligned where the alignment holds (kLocalIdentity); the others are bases the walk lacks
+        std::vector<std::size_t> match(len + 1, 0), count(len + 1, 0);
+        for (std::size_t i = 0; i < len; ++i) {
+            // a gap opens at a base the walk lacks after one it has, and where the walk has bases between two
+            const bool lacking = !l.aligned[i], opens = lacking && (i == 0 || l.aligned[i - 1]);
+            const bool inserted = i > 0 && l.before[i] != l.after[i - 1];
+            match[i + 1] = match[i] + l.matched[i];
+            count[i + 1] = count[i] + (lacking ? 0 : 1) + opens + inserted;
+        }
         for (std::size_t i = 0; i < len; ++i) {
             const std::size_t lo = i > kLocalFlank ? i - kLocalFlank : 0, hi = std::min(len, i + kLocalFlank + 1);
-            keep[i] = l.aligned[i] && static_cast<double>(match[hi] - match[lo]) >= kLocalIdentity * static_cast<double>(count[hi] - count[lo]);
+            if (l.aligned[i] && static_cast<double>(match[hi] - match[lo]) < kLocalIdentity * static_cast<double>(count[hi] - count[lo])) {
+                l.aligned[i] = l.matched[i] = 0;
+                l.after[i] = l.before[i];
+            }
         }
-        for (std::size_t i = 0; i < len;) {   // runs of aligned bases without a gap, each between two gaps
-            if (!l.aligned[i]) { ++i; continue; }
-            std::size_t e = i + 1;
-            while (e < len && l.aligned[e] && l.before[e] == l.after[e - 1]) ++e;
-            if (i > 0 && e < len && e - i < kBetweenGaps)
-                for (std::size_t x = i; x < e; ++x) keep[x] = 0;
-            i = e;
-        }
-        for (std::size_t i = 0; i < len; ++i)
-            if (!keep[i]) { l.aligned[i] = l.matched[i] = 0; l.after[i] = l.before[i]; }
     }
     std::size_t total = 0, aligned = 0, matched = 0;
     for (const auto& [s, e] : marker)
@@ -901,10 +926,14 @@ SeqCopy place_by_sequence(const Walk& R, const std::string& rseq, const Gene& g,
     const auto cells = [](std::size_t len) {
         return static_cast<double>(len) * (static_cast<double>(len) * (1 + 2 * kWindowMargin) + 200);
     };
+    const auto align = [&](std::size_t lo, std::size_t hi, bool any_distance) {
+        return align_stretch(R, rseq, g, marker, p, W, wseq, lo > kEndFlank ? lo - kEndFlank : 0, std::min(rseq.size(), hi + kEndFlank),
+                             any_distance);
+    };
     SeqCopy sc;
-    if (g.hi > g.lo && cells(g.hi - g.lo) <= kSequenceMaxCells) sc = align_stretch(R, rseq, g, marker, p, W, wseq, g.lo, g.hi, false);
+    if (g.hi > g.lo && cells(g.hi - g.lo) <= kSequenceMaxCells) sc = align(g.lo, g.hi, false);
     if (!sc.ok && g.m_hi > g.m_lo && cells(g.m_hi - g.m_lo) <= kSequenceMaxCellsAny) {
-        sc = align_stretch(R, rseq, g, marker, p, W, wseq, g.m_lo, g.m_hi, true);
+        sc = align(g.m_lo, g.m_hi, true);
         sc.marker_span = g.m_lo != g.lo || g.m_hi != g.hi;
     }
     return sc;
