@@ -68,6 +68,8 @@ CASES = {
     "tandem": dict(units={"ref": 3, "h1": 1, "h2": 5, "h3": 3}, reversed={"h4": "h2"}),
     # reference units whose exons differ in length (100, 150, 100 bases from one start)
     "tandem_layout": dict(units={"ref": 3, "h1": 3, "h2": 1, "h3": 5}, layout=[400, 450, 400], reversed={"h4": "h1"}),
+    # a haplotype with 50 units between 2 kb flanks
+    "tandem_long": dict(units={"ref": 3, "h1": 50}),
     # the main case with haplotypes' own annotations (write_annotated)
     "annotated": dict(),
 }

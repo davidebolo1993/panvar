@@ -34,8 +34,8 @@ const char* hst_status_name(HstStatus s) {
 
 namespace {
 
-// Chaining: how far back a link may reach, in anchors and in bases (or twice the gene's stretch, for a
-// haplotype carrying many more units of a repeat inside the gene), and what an indel costs per base.
+// Chaining: how far back a link may reach, in anchors and in bases (or twice the gene's stretch; any
+// length across a tandem stretch), and what an indel costs per base.
 constexpr std::size_t kChainLookback = 200;
 constexpr std::size_t kChainMaxGap = 100000;
 constexpr double kChainIndelCost = 0.05;
@@ -117,6 +117,7 @@ struct Gene {
     std::size_t gs = 0, ge = 0;       // reference steps [gs, ge) holding the span, one more on each side
     std::vector<char> uniq;           // per step of [gs, ge): its node occurs once there
     std::size_t marker_bp = 0;
+    std::vector<std::pair<std::size_t, std::size_t>> tandem_spans;   // its transcripts' tandem stretches
 };
 
 // One pass of a walk through a gene: per reference step of [gs, ge), the walk step it matches or -1.
@@ -205,7 +206,9 @@ std::vector<std::vector<Anchor>> chain_anchors(const Walk& R, const Gene& g, con
     const std::size_t n = an.size();
     std::vector<double> f(n);
     std::vector<long> prev(n, -1);
-    const std::size_t max_gap = std::max(kChainMaxGap, 2 * (R.pref[g.ge] - R.pref[g.gs]));
+    // A gene with a tandem stretch links across any length: haplotypes carry any number of units.
+    const std::size_t max_gap = g.tandem_spans.empty() ? std::max(kChainMaxGap, 2 * (R.pref[g.ge] - R.pref[g.gs]))
+                                                       : SIZE_MAX;
     for (std::size_t a = 0; a < n; ++a) {
         f[a] = static_cast<double>(an[a].w);
         const std::size_t stop = a > kChainLookback ? a - kChainLookback : 0;
@@ -215,7 +218,10 @@ std::vector<std::vector<Anchor>> chain_anchors(const Walk& R, const Gene& g, con
             if (dy > max_gap) break;
             const std::size_t dx = an[a].x - (an[b].x + an[b].w);
             if (dx > max_gap) continue;
-            const double dd = std::fabs(static_cast<double>(dx) - static_cast<double>(dy));
+            // A link across a tandem stretch pays nothing for the length the units add or remove.
+            bool across = false;
+            for (const auto& [t0, t1] : g.tandem_spans) across |= an[b].x + an[b].w < t1 && t0 < an[a].x;
+            const double dd = across ? 0.0 : std::fabs(static_cast<double>(dx) - static_cast<double>(dy));
             const double s = f[b] + static_cast<double>(an[a].w) - kChainIndelCost * dd - (dd > 0 ? std::log2(dd) : 0.0);
             if (s > f[a]) { f[a] = s; prev[a] = static_cast<long>(b); }
         }
@@ -869,6 +875,9 @@ TranscriptsResult project_transcripts(const Graph& graph, const TranscriptsOptio
     }
     std::vector<Tandem> tandem;
     for (const Cuts& c : cuts) tandem.push_back(find_tandem(R, c));
+    for (Gene& g : genes)
+        for (const std::size_t k : g.tx)
+            if (tandem[k].any) g.tandem_spans.emplace_back(cuts[k][tandem[k].lo].first, cuts[k][tandem[k].hi].second);
     // A gene's copies are told apart by its marker's coding exons where it has them: paralogs are compared
     // on what they encode, as untranslated ends differ more freely. A tandem stretch of the marker is left
     // out, as haplotypes carry its unit a different number of times.
