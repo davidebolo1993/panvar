@@ -294,11 +294,12 @@ int run_recruit_command(const std::vector<std::string>& args) {
     todo.transcripts.clear();
     std::vector<std::string> wrote;
     // An index with transcripts labels its transcript-only k-mers against the other loci of its run, so its key
-    // holds them: one built beside other loci than those given now is rebuilt. The loci whose indexes stay
+    // holds them, each with its reference path: one built beside other loci than those given now, or beside the
+    // same graphs placed by another path, is rebuilt. The loci whose indexes stay
     // current are handed to the build, which reads them for the loci it builds.
     std::vector<std::string> tokens;
     if (std::any_of(o.transcripts.begin(), o.transcripts.end(), [](const std::string& t) { return !t.empty(); }))
-        for (std::size_t li = 0; li < o.loci.size(); ++li) tokens.push_back(recruit::locus_token(o.loci[li], o.transcripts[li]));
+        for (std::size_t li = 0; li < o.loci.size(); ++li) tokens.push_back(recruit::locus_token(o.loci[li], o.transcripts[li], o.reference_query));
     const auto without_loci = [](const std::string& key) {
         const auto at = key.rfind("|y");
         return at == std::string::npos ? key : key.substr(0, at);

@@ -170,6 +170,12 @@ cp -r idxo idxo2; rm idxo2/locus.plx idxo2/locus_p.plx   # rebuilt beside locus_
 "${RC3[@]}" --save-index idxo2 "${THREE[@]}" 2> order.txt
 check "an index rebuilt beside a reused one and a rebuilt one names its other loci in one order: the same file" \
   'grep -q "locus_b.plx; current, reused" order.txt && grep -q "in other loci of the run (locus_b,locus_p)" idxo/locus.index.tsv && cmp -s idxo/locus.plx idxo2/locus.plx && cmp -s idxo/locus.index.tsv idxo2/locus.index.tsv'
+# a companion whose reference path the query changes, from one elsewhere to one overlapping the locus
+QQ=(--save-index idxq --locus data/locus.gfa --locus data/locus_q.gfa --transcripts locus=data/locus.hst.fa)
+"${RC3[@]}" "${QQ[@]}" 2> q1.txt; dump idxq; q1="$(tx idxq.locus.tsv)"
+"$BIN" recruit -t 2 --background s3 -r REF --index-only --no-calibration "${QQ[@]}" 2> q2.txt; dump idxq
+check "another reference path of a companion rebuilds the locus: overlapping it now, its k-mers are not elsewhere ($q1, $(tx idxq.locus.tsv))" \
+  '[[ "$q1" == "P0 S$J R0" && "$(tx idxq.locus.tsv)" == "P$J S0 R0" ]] && grep -q "locus.plx; .*rebuilding" q2.txt && grep -q "REF#1#chr1" idxq/locus_q.index.tsv'
 "${RC3[@]}" --save-index idx9 --locus data/locus_b.gfa --transcripts data/locus_b.hst.fa 2> log9.txt; dump idx9 locus_b
 check "indexed alone, the paralog's junction k-mers are all private ($(tx idx9.locus_b.tsv))" \
   '[[ "$(tx idx9.locus_b.tsv)" == "P$(wc -l < data/junction_nodes_b.tsv | tr -d " ") S0 R0" ]]'

@@ -113,8 +113,9 @@ struct LocusIndex {
     // the other loci of the run (named)
     std::uint64_t transcriptome = 0, transcriptome_records = 0, tx_in_transcriptome = 0, tx_in_other_loci = 0;
     std::string transcriptome_names, other_loci;
-    // the other loci of the run it was built in (their graphs and transcripts), hashed; 0 without any. Part of
-    // the key with transcripts: their k-mers decide the labels of its transcript-only ones.
+    // the other loci of the run it was built in (their graphs, transcripts and reference paths), hashed; 0
+    // without any. Part of the key with transcripts: their k-mers decide the labels of its transcript-only
+    // ones, unless they overlap it on the reference.
     std::uint64_t companions = 0;
 
     std::int64_t find(std::uint64_t canonical) const;
@@ -143,8 +144,9 @@ struct BuildOptions {
     std::function<void(const std::string&)> log;
 };
 
-// What identifies a locus of a run to the others: its graph's checksum and its transcripts' (empty: none).
-std::string locus_token(const std::string& gfa, const std::string& transcripts);
+// What identifies a locus of a run to the others: its graph's checksum, its transcripts' (empty: none) and
+// the reference path the query names in it, which places it on the reference.
+std::string locus_token(const std::string& gfa, const std::string& transcripts, const std::string& reference_query);
 // The key a locus index built with these options would carry (to test a saved one before building), for
 // a locus graph with its transcripts FASTA (empty: none) and the tokens of the run's other loci.
 std::string expected_key(const BuildOptions& o, const std::string& gfa, const std::string& transcripts = "",

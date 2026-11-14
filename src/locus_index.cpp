@@ -535,8 +535,19 @@ std::string LocusIndex::key() const {
            (transcripts_checksum.empty() ? "" : "|t" + transcripts_checksum + (transcripts_ok_only ? "o" : transcripts_splice_changed ? "s" : "a") + "|x" + hex64(transcriptome) + "|y" + hex64(companions));
 }
 
-std::string locus_token(const std::string& gfa, const std::string& transcripts) {
-    return file_checksum(gfa) + "+" + (transcripts.empty() ? std::string("-") : transcripts_checksum_of(transcripts));
+// A locus to the others of its run: its graph, its transcripts and its reference path, whose name carries the
+// interval. Loci overlapping on the reference are not each other's elsewhere, so another path is another locus.
+static std::string token_of(const std::string& graph_checksum, const std::string& transcripts_checksum, const std::string& reference_path) {
+    return graph_checksum + "+" + (transcripts_checksum.empty() ? std::string("-") : transcripts_checksum) + "+" + reference_path;
+}
+
+std::string locus_token(const std::string& gfa, const std::string& transcripts, const std::string& reference_query) {
+    const Graph g = parse_gfa(gfa, ParseGfaOptions{true, false});
+    std::vector<std::string> names;
+    for (const auto& p : g.paths) names.push_back(p.name);
+    const auto hit = match_reference_name(names, reference_query);
+    return token_of(file_checksum(gfa), transcripts.empty() ? std::string() : transcripts_checksum_of(transcripts),
+                    hit.size() == 1 ? names[hit[0]] : std::string());
 }
 
 // The other loci of a run as one number, whatever their order; 0 without any.
@@ -1085,7 +1096,7 @@ std::vector<LocusIndex> build(const BuildOptions& o) {
             std::vector<std::string> others = o.beside_tokens;
             for (std::size_t lj = 0; lj < work.size(); ++lj) {
                 const LocusIndex& y = work[lj].idx;
-                if (lj != li) others.push_back(y.graph_checksum + "+" + (y.transcripts_checksum.empty() ? std::string("-") : y.transcripts_checksum));
+                if (lj != li) others.push_back(token_of(y.graph_checksum, y.transcripts_checksum, y.reference_path));
             }
             work[li].idx.companions = companions_id(std::move(others));
         }
