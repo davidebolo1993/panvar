@@ -28,7 +28,8 @@ struct AnnotatedTranscript {
 // lines starting with '#' skipped). A path's interval is read as for the reference path.
 //
 // transcript_id is the source transcript without its version where the annotation gives one (CAT's
-// source_transcript), else the transcript's transcript_id or ID; gene_name its gene's gene_name, or
+// source_transcript), else the transcript's transcript_id or ID; gene_id the source gene without its
+// version where given, else the gene's gene_id or ID; gene_name its gene's gene_name, or
 // source_gene_common_name, gene or Name. In GFF3 a transcript is any feature that exons name as Parent, and
 // its gene record the feature it names as Parent; in GTF they are the exons' transcript_id within their
 // gene_id, and that gene_id. A transcript with coding rows (CDS) and no exon rows takes the coding rows

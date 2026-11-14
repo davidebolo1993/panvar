@@ -255,7 +255,7 @@ std::vector<AnnotatedTranscript> load_hap_annotations(const Graph& graph, const 
             at.t.gene_name = first_of(ga, {"gene_name", "source_gene_common_name", "gene", "Name"});
             if (at.t.gene_name.empty()) at.t.gene_name = first_of(ta, {"gene_name", "source_gene_common_name", "gene"});
             const std::string sg = first_of(ga, {"source_gene"}).empty() ? first_of(ta, {"source_gene"}) : first_of(ga, {"source_gene"});
-            at.t.gene_id = sg.rfind("ENS", 0) == 0 ? strip_version(sg) : first_of(ga, {"gene_id", "ID"});
+            at.t.gene_id = !sg.empty() ? strip_version(sg) : first_of(ga, {"gene_id", "ID"});
             if (at.t.gene_id.empty()) at.t.gene_id = first_of(ta, {"gene_id"});
             if (at.t.gene_name.empty()) at.t.gene_name = at.t.gene_id.empty() ? at.t.transcript_id : at.t.gene_id;
             if (at.t.gene_id.empty()) at.t.gene_id = at.t.gene_name;

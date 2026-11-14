@@ -65,11 +65,13 @@ grep -e haplotype -e '^h3#' case_annotated/hap_annotations.tsv > h3_only.tsv
   --contig-alias case_annotated/alias.tsv -o h3_only -q
 check "copies are compared only for genes an annotation has" \
   '[[ "$(awk -F"\t" "NR > 1 && \$2 ~ /^G[ABC]\$/ {print \$NF}" h3_only.hst.summary.tsv | sort -u)" == . ]]'
+check "an annotated gene under another name counts by its source gene" \
+  '[[ "$(awk -F"\t" "\$2==\"GC\" {print \$NF}" case_annotated/out.hst.summary.tsv)" != *h3#1* ]]'
 check "an exon without its transcript record is reported" 'grep -q "1 exon row(s) whose transcript record is missing" case_annotated/log'
 check "the summary notes a gene's copies where the annotation differs" 'awk -F"\t" "\$2==\"GB\"" case_annotated/out.hst.summary.tsv | grep -q "h1#1:1/2"'
 "$BIN" transcripts -i case_annotated/locus.gfa --hap-annotations case_annotated/hap_annotations.tsv \
   --contig-alias case_annotated/alias.tsv -o ann_only -q
-check "without --gtf, only the annotated transcripts" '[[ "$(tail -n +2 ann_only.hst.tsv | cut -f10 | sort | uniq -c | tr -s " ")" == " 11 annotated" ]]'
+check "without --gtf, only the annotated transcripts" '[[ "$(tail -n +2 ann_only.hst.tsv | cut -f10 | sort | uniq -c | tr -s " ")" == " 12 annotated" ]]'
 
 # input errors
 "$BIN" transcripts -i locus.gfa -r ref -o e1 -q 2> e1.log

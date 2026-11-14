@@ -1014,11 +1014,16 @@ TranscriptsResult project_transcripts(const Graph& graph, const TranscriptsOptio
         std::map<std::tuple<std::string, int>, std::size_t> projected;
         for (std::size_t k = 0; k < recs.size(); ++k)
             if (!recs[k].sequence.empty()) projected[{res.transcripts[recs[k].transcript].transcript_id, recs[k].copy}] = k;
-        std::map<std::string, int> annotated_copies;   // per gene name
-        for (const std::size_t a : annotated_on[h]) annotated_copies[res.annotated[a].t.gene_name] = res.annotated[a].copies;
+        // The annotation's copies of each gene, found by gene id (a source gene), else by name.
+        std::map<std::string, int> by_id, by_name;
+        for (const std::size_t a : annotated_on[h]) {
+            by_id[res.annotated[a].t.gene_id] = res.annotated[a].copies;
+            by_name[res.annotated[a].t.gene_name] = res.annotated[a].copies;
+        }
         for (HstRecord& r : recs) {
-            const auto it = annotated_copies.find(res.transcripts[r.transcript].gene_name);
-            r.annotated_copies = it == annotated_copies.end() ? 0 : it->second;
+            const TranscriptFeature& t = res.transcripts[r.transcript];
+            const auto i = by_id.find(t.gene_id), n = by_name.find(t.gene_name);
+            r.annotated_copies = i != by_id.end() ? i->second : n != by_name.end() ? n->second : 0;
         }
         std::vector<HstRecord> extra;
         for (const std::size_t a : annotated_on[h]) {

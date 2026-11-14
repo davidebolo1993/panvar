@@ -66,11 +66,9 @@ public:
             for (std::size_t k = 0; k < res.transcripts.size(); ++k) {
                 ref_of_.emplace(res.transcripts[k].transcript_id, k);
                 gene_of_.emplace(res.transcripts[k].gene_name, res.transcripts[k].gene_id);
+                gene_ids_.insert(res.transcripts[k].gene_id);
             }
-            for (const AnnotatedTranscript& at : res.annotated) {
-                const auto gi = gene_of_.find(at.t.gene_name);
-                annotated_genes_.insert(gi != gene_of_.end() ? gi->second : at.t.gene_id);
-            }
+            for (const AnnotatedTranscript& at : res.annotated) annotated_genes_.insert(gene_id(at.t));
             indexed_ = true;
         }
         std::map<std::string, std::pair<int, int>> copies;   // per gene on this haplotype: projected, annotated
@@ -79,8 +77,7 @@ public:
             const TranscriptFeature& t = annotated_only ? res.annotated[r.transcript].t : res.transcripts[r.transcript];
             const auto ri = annotated_only ? ref_of_.find(t.transcript_id) : ref_of_.end();
             const long ref = !annotated_only ? static_cast<long>(r.transcript) : ri == ref_of_.end() ? -1 : static_cast<long>(ri->second);
-            const auto gi = annotated_only ? gene_of_.find(t.gene_name) : gene_of_.end();
-            const std::string& gid = gi != gene_of_.end() ? gi->second : t.gene_id;
+            const std::string gid = annotated_only ? gene_id(t) : t.gene_id;
             const std::string& hap = res.haplotypes[r.haplotype];
             const bool has = !r.sequence.empty();
             const bool same = has && ref >= 0 && r.sequence == res.reference_sequences[static_cast<std::size_t>(ref)];
@@ -182,6 +179,13 @@ private:
     std::unordered_map<std::string, std::size_t> ref_of_;
     std::unordered_map<std::string, std::string> gene_of_;
     std::set<std::string> annotated_genes_;   // gene ids any haplotype's annotation has
+    std::set<std::string> gene_ids_;          // projected genes
+    // An annotated transcript's gene, as a projected gene where its id or else its name is one.
+    std::string gene_id(const TranscriptFeature& t) const {
+        if (gene_ids_.count(t.gene_id)) return t.gene_id;
+        const auto gi = gene_of_.find(t.gene_name);
+        return gi != gene_of_.end() ? gi->second : t.gene_id;
+    }
     std::size_t hsts_ = 0;
 };
 

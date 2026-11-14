@@ -334,6 +334,10 @@ def write_annotated(d):
     h3 = [gff("CTG3ALT", "transcript", pos(m3, 4000), pos(m3, 4199), "+", "ID=al1;gene_name=GY;transcript_id=al1")]
     h3 += [gff("CTG3ALT", "exon", pos(m3, a), pos(m3, b - 1), "+", "Parent=al1") for a, b in alias_ex]
     rows.append(("al1", "GY", "h3", 1, "ok", ".", seqs["h3"][m3[4000]:m3[4199] + 1], "al1"))
+    # GC under another name, with its source gene: one gene for the copy count
+    h3 += [gff("CTG3ALT", "gene", pos(m3, 8000), pos(m3, 8699), "+", "ID=g6;gene_name=GCALT;source_gene=GC.1"),
+           gff("CTG3ALT", "transcript", pos(m3, 8000), pos(m3, 8699), "+", "ID=c6;Parent=g6;transcript_id=TC1")]
+    h3 += [gff("CTG3ALT", "exon", pos(m3, a), pos(m3, b - 1), "+", "Parent=c6") for a, b in case["genes"]["GC"][1]["TC1"]]
     h5 = []
     for k, m in enumerate(maps["h5"], 1):   # GTF: both GC copies, as projected
         attr = f'gene_id "gc{k}"; gene_name "GC"; transcript_id "TC1";'
@@ -354,7 +358,7 @@ def write_annotated(d):
         out.write(lines[0] + "\tsource\trecord\n")
         for line in lines[1:]:
             f = line.split("\t")
-            both = (f[0], f[2].split("#")[0]) in (("TA1", "h1"), ("TC1", "h5"), ("TB1", "h1"))
+            both = (f[0], f[2].split("#")[0]) in (("TA1", "h1"), ("TC1", "h5"), ("TB1", "h1"), ("TC1", "h3"))
             out.write(line + ("\tprojected+annotated" if both else "\tprojected") + "\t.\n")
         for t, g, h, c, st, det, sq, rec in rows:
             out.write(f"{t}\t{g}\t{name(h, L)}\t{c}\t{st}\t{det}\t{sq}\tannotated\t{rec}\n")

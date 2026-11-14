@@ -88,7 +88,7 @@ Statuses, most severe first:
 - `splice_site_changed`: a splice site differs from the reference's;
 - `ok`: every boundary carried exactly.
 
-`hst.summary.tsv` has one row per gene, in reference order: `transcripts` projected, of which `clipped` reach past the reference path, and `outside` (transcripts with no exon on the path, not projected), `haplotypes_by_copies` (`0:2,1:120,2:9` is 2 haplotypes with no copy, 120 with one, 9 with two), `hsts` written, `same_as_ref`, `annotated` (HSTs from the haplotypes' annotations), the rows of each status, and `copies_differ`: for a gene some haplotype's annotation has, each haplotype with an annotation whose copies of the gene differ from the projection's, as `sample#hap:projected/annotated`.
+`hst.summary.tsv` has one row per gene, in reference order: `transcripts` projected, of which `clipped` reach past the reference path, and `outside` (transcripts with no exon on the path, not projected), `haplotypes_by_copies` (`0:2,1:120,2:9` is 2 haplotypes with no copy, 120 with one, 9 with two), `hsts` written, `same_as_ref`, `annotated` (HSTs from the haplotypes' annotations), the rows of each status, and `copies_differ`: for a gene some haplotype's annotation has (matched by its source gene id, else by name), each haplotype with an annotation whose copies of the gene differ from the projection's, as `sample#hap:projected/annotated`.
 
 ## Limitations
 
