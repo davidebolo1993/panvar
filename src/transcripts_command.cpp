@@ -95,8 +95,9 @@ public:
         for (const auto& [gid, v] : out) if (!tx.count(gid)) order.push_back(gid);
         std::ofstream s(summary_path);
         if (!s) throw std::runtime_error("transcripts: cannot write " + summary_path);
-        s << "gene_id\tgene_name\ttranscripts\toutside\thaplotypes_by_copies\thsts\tsame_as_ref\tok"
-             "\tsplice_site_changed\tboundary_moved\tmissing_exon\tno_copy\n";
+        s << "gene_id\tgene_name\ttranscripts\toutside\thaplotypes_by_copies\thsts\tsame_as_ref";
+        for (int k = 0; k < kHstStatuses; ++k) s << '\t' << hst_status_name(static_cast<HstStatus>(k));
+        s << '\n';
         for (const std::string& gid : order) {
             const Tally& g = genes_[gid];
             const std::string name = tx.count(gid) ? tx[gid].first : out[gid].first;
@@ -105,7 +106,7 @@ public:
             std::string bc;
             for (const auto& [c, n] : g.by_copies) bc += (bc.empty() ? "" : ",") + std::to_string(c) + ":" + std::to_string(n);
             s << (bc.empty() ? "." : bc) << '\t' << g.hst << '\t' << g.same;
-            for (int k = 0; k < 5; ++k) s << '\t' << g.status[k];
+            for (int k = 0; k < kHstStatuses; ++k) s << '\t' << g.status[k];
             s << '\n';
             hsts_ += g.hst;
         }
@@ -117,7 +118,7 @@ public:
 private:
     struct Tally {
         std::string name;
-        std::size_t status[5] = {0, 0, 0, 0, 0};
+        std::size_t status[kHstStatuses] = {};
         std::size_t hst = 0, same = 0;
         std::map<int, std::size_t> by_copies;   // copies -> haplotypes
     };

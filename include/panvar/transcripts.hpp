@@ -32,7 +32,9 @@ struct TranscriptsOptions {
     bool quiet = false;
 };
 
-enum class HstStatus { Ok, SpliceSiteChanged, BoundaryMoved, MissingExon, NoCopy };
+// Least to most severe; a record takes the most severe that applies.
+enum class HstStatus { Ok, SpliceSiteChanged, BoundaryMoved, IntronLost, MissingExon, NoCopy };
+constexpr int kHstStatuses = 6;
 const char* hst_status_name(HstStatus s);
 
 // One transcript on one haplotype copy.

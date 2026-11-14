@@ -49,6 +49,14 @@ CASES = {
         genes={"GG": ("+", {"TG1": [(10020, 10080)]})},
         haps={"h1": [("dup", (10000, 10100))]},
         reversed={"h2": "h1"}),
+    # an intron deleted whole, one cut to its splice sites, one lost with the exon ends around it
+    "intron": dict(
+        L=5000,
+        genes={"GI": ("+", {"TI1": [(1000, 1200), (2000, 2200), (3000, 3200)]}),
+               "GJ": ("-", {"TJ1": [(4000, 4100), (4300, 4400)]})},
+        haps={"h1": [("del", (1200, 2000)), ("del", (4100, 4300))], "h2": [("del", (1202, 1998))],
+              "h3": [("del", (2150, 3050))]},
+        reversed={"h4": "h1"}),
 }
 
 

@@ -25,7 +25,7 @@ Projects a reference annotation onto every haplotype walk of a locus graph. Each
 
 6. Within each copy, an exon boundary is carried to the walk through the node holding it, at the same offset. When the walk does not pass that node (the boundary lies inside a variant), the boundary moves to the nearest position the walk shares with the reference, and a tie keeps the variant inside the exon. An exon sharing no base with the walk is missing.
 
-7. The exons are cut from the walk with the haplotype's alleles and joined in transcript order; a minus-strand transcript is reverse-complemented. The two splice-site bases at each end of every intron are compared with the reference's.
+7. The exons are cut from the walk with the haplotype's alleles and joined in transcript order; a minus-strand transcript is reverse-complemented. The two splice-site bases at each end of every intron are compared with the reference's; an intron the haplotype shortens below those four bases is lost, and its exons are joined.
 
 ## Required inputs
 
@@ -67,12 +67,13 @@ Projects a reference annotation onto every haplotype walk of a locus graph. Each
 | `moved_boundaries` | exon boundaries moved off a variant |
 | `changed_splice_sites` | intron ends whose two splice-site bases differ from the reference's |
 | `exon_starts`, `exon_lengths` | each exon's first base on the walk (as `path_start`) and length, in transcript order |
-| `detail` | notes, `;`-joined: `e3.start:-3` (exon 3's 5' boundary moved, the exon 3 reference bases shorter), `e2:missing`, `e1:walk_end` (the walk ends before it), `i1.donor:GT>AT` (a changed splice site, transcript strand), `rival:<gene>:<share>><share>` (the paralog this copy was taken from, and both shares), and for no copy `best_share:<F>` and `taken_by:<gene>` or `inside:<gene>` |
+| `detail` | notes, `;`-joined: `e3.start:-3` (exon 3's 5' boundary moved, the exon 3 reference bases shorter), `e2:missing`, `e1:walk_end` (the walk ends before it), `i1.donor:GT>AT` (a changed splice site, transcript strand), `i2:intron_lost`, `rival:<gene>:<share>><share>` (the paralog this copy was taken from, and both shares), and for no copy `best_share:<F>` and `taken_by:<gene>` or `inside:<gene>` |
 
 Statuses, most severe first:
 
 - `no_copy`: the walk has no copy of the gene;
 - `missing_exon`: the copy lacks an exon of this transcript; no sequence is written;
+- `intron_lost`: the haplotype shortens an intron below its two splice sites, so the exons around it are joined;
 - `boundary_moved`: an exon boundary lies inside a variant and was moved;
 - `splice_site_changed`: a splice site differs from the reference's;
 - `ok`: every boundary carried exactly.

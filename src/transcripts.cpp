@@ -22,6 +22,7 @@ const char* hst_status_name(HstStatus s) {
         case HstStatus::Ok: return "ok";
         case HstStatus::SpliceSiteChanged: return "splice_site_changed";
         case HstStatus::BoundaryMoved: return "boundary_moved";
+        case HstStatus::IntronLost: return "intron_lost";
         case HstStatus::MissingExon: return "missing_exon";
         case HstStatus::NoCopy: return "no_copy";
     }
@@ -389,12 +390,19 @@ HstRecord project_one(const Walk& R, const std::string& rseq, const Gene& g, con
         r.moved = 0;
         return r;
     }
-    // Splice-site dinucleotides at each intron, compared with the reference's.
+    // Splice-site dinucleotides at each intron, compared with the reference's. An intron the haplotype
+    // shortens below its two splice sites is lost: its exons are joined.
+    bool lost = false;
     for (std::size_t k = 0; k + 1 < n; ++k) {
         const std::size_t intron = minus ? n - 1 - k : k + 1;
         const std::size_t rl = cuts[k].second, rr = cuts[k + 1].first;
         const std::size_t hl = hx[k].second, hr = hx[k + 1].first;
-        if (rr < rl + 4 || hr < hl + 4) continue;
+        if (rr < rl + 4) continue;
+        if (hr < hl + 4) {
+            lost = true;
+            add_detail(r.detail, "i" + std::to_string(intron) + ":intron_lost");
+            continue;
+        }
         const std::string ref_left = rseq.substr(rl, 2), ref_right = rseq.substr(rr - 2, 2);
         const std::string hap_left = wseq.substr(hl, 2), hap_right = wseq.substr(hr - 2, 2);
         const auto note = [&](const char* site, const std::string& a, const std::string& b) {
@@ -416,7 +424,8 @@ HstRecord project_one(const Walk& R, const std::string& rseq, const Gene& g, con
     const std::size_t lo = hx.front().first, hi = hx.back().second;
     r.path_start = p.reverse ? W.len() - hi : lo;
     r.path_end = p.reverse ? W.len() - lo : hi;
-    r.status = r.moved ? HstStatus::BoundaryMoved : r.splice_changed ? HstStatus::SpliceSiteChanged : HstStatus::Ok;
+    r.status = lost ? HstStatus::IntronLost : r.moved ? HstStatus::BoundaryMoved
+             : r.splice_changed ? HstStatus::SpliceSiteChanged : HstStatus::Ok;
     return r;
 }
 
