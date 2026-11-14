@@ -250,6 +250,9 @@ def check(d, prefix):
         for line in fh:
             if line.startswith(">"):
                 key = line[1:].split()[0]
+                if key in fa:
+                    sys.exit(f"duplicate FASTA name: {key}")
+                fa[key] = None
             else:
                 fa[key] = line.strip()
     with open(f"{prefix}.hst.tsv") as fh:
@@ -257,6 +260,8 @@ def check(d, prefix):
         for line in fh:
             r = dict(zip(hdr, line.rstrip("\n").split("\t")))
             k = (r["transcript_id"], r["haplotype"], r["copy"])
+            if k in got:
+                sys.exit(f"duplicate row: {k}")
             key = f"{r['transcript_id']}|{r['gene_name']}|{r['haplotype']}|{r['copy']}"
             got[k] = (r, fa.get(key) or ".")
     bad = 0

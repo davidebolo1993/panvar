@@ -37,6 +37,12 @@ check "the minus-strand transcript lists its exons 5 to 3" '[[ "$(col TB1 ref ex
 check "FASTA names are transcript|gene|haplotype|copy" 'grep -q "^>TC1|GC|h5#1#ctg5:0-12000|2 source=projected status=ok$" t1.hst.fa'
 check "the summary counts copies per haplotype" '[[ "$(awk -F"\t" "\$2==\"GC\"{print \$5}" t1.hst.summary.tsv)" == "0:1,1:6,2:2" ]]'
 
+# the checker refuses a table or FASTA naming one transcript, haplotype and copy twice
+{ cat t1.hst.tsv; sed -n 2p t1.hst.tsv; } > dup_row.hst.tsv; cp t1.hst.fa dup_row.hst.fa
+cp t1.hst.tsv dup_fa.hst.tsv; { cat t1.hst.fa; head -2 t1.hst.fa; } > dup_fa.hst.fa
+check "the checker refuses a repeated row" '! python3 "$TOOLS/transcript_fixture.py" check . dup_row > /dev/null 2>&1'
+check "the checker refuses a repeated FASTA name" '! python3 "$TOOLS/transcript_fixture.py" check . dup_fa > /dev/null 2>&1'
+
 # every case, each row against the haplotypes' own transcripts
 for c in $(python3 "$TOOLS/transcript_fixture.py" cases); do
   [[ $c == main ]] && continue
