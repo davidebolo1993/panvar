@@ -53,7 +53,7 @@ Reads, per sample:
 | flag | what it does | default |
 |------|--------------|---------|
 | `--index-only` | build or check the indexes, read nothing | off |
-| `--save-index <dir>` | where indexes are kept and reused | beside each graph |
+| `--save-index <dir>` | where indexes are kept and reused. A saved index is rebuilt when its graph, background, settings or transcripts differ from those given; the log says when one built with transcripts is rebuilt without them, or the reverse, as that changes what RNA reads can show | beside each graph |
 | `--coordinate-reference <name>` | the background's coordinate reference the graph's coordinates refer to | its only one |
 | `--informative-max <N>` | copies per background haplotype outside the locus up to which a k-mer is shared, not repeat | `8` |
 | `--decoy-genomes <A,B>` | genomes whose homologous windows give decoys | the coordinate reference |
@@ -118,7 +118,6 @@ Table columns:
 - Short pairs across a locus edge are less often certain than inside it: the located copies' ends are uncertain, so the k-mers near them are labelled shared.
 - Long spliced transcripts cross many junctions and read as divergent unless the index holds the locus's transcripts; isoforms the transcripts lack still do.
 - A junction k-mer is checked against other transcripts only through the background's transcriptome and the other loci of the run. A paralog's allele that neither holds (a haplotype-specific junction sequence of a gene outside the loci indexed together) leaves it private.
-- An index is rebuilt when its graph, background, settings or transcripts differ from those given; the log says when one built with transcripts is rebuilt without them, or the reverse, as that changes what RNA reads can show.
 - An index does not record which other loci it was built beside: an index built alone is reused when its locus is later given with others. Rebuild the family's indexes together (remove them, or use another `--save-index`).
 - The calibration simulates DNA reads only: no read class covers junction k-mers yet.
 - A locus missing from a background genome cannot be subtracted there; its k-mers keep that genome's counts, unless the scan for pieces finds it.
