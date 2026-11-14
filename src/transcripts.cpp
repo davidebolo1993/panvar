@@ -264,14 +264,16 @@ Pass make_pass(const Walk& R, const Gene& g, const Cuts& marker, const Walk& W, 
     }
     std::sort(p.walk_steps.begin(), p.walk_steps.end());
     p.share = g.marker_bp ? static_cast<double>(p.marker_matched) / static_cast<double>(g.marker_bp) : 0.0;
-    // The stretch of the walk the pass takes: its matched steps inside the marker's span. Flanking steps may
-    // be matched across other copies, and transcripts reaching into a neighbour would stretch it over that.
+    // The stretch of the walk the pass takes: its matched steps inside the marker's span, each cut to that
+    // span. Flanking steps may be matched across other copies, transcripts reaching into a neighbour would
+    // stretch it over that, and a long node can hold other genes too.
     std::size_t lo = SIZE_MAX, hi = 0;
     for (std::size_t k = p.first; k <= p.last; ++k) {
         const std::size_t i = g.gs + k;
         if (p.match[k] < 0 || R.pref[i + 1] <= g.m_lo || R.pref[i] >= g.m_hi) continue;
-        lo = std::min(lo, W.pref[static_cast<std::size_t>(p.match[k])]);
-        hi = std::max(hi, W.pref[static_cast<std::size_t>(p.match[k]) + 1]);
+        const std::size_t w = W.pref[static_cast<std::size_t>(p.match[k])];
+        lo = std::min(lo, w + std::max(R.pref[i], g.m_lo) - R.pref[i]);
+        hi = std::max(hi, w + std::min(R.pref[i + 1], g.m_hi) - R.pref[i]);
     }
     if (lo >= hi) { lo = W.pref[static_cast<std::size_t>(p.match[p.first])]; hi = lo; }
     p.h_lo = reverse ? W.len() - hi : lo;

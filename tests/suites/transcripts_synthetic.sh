@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
-# panvar transcripts on a synthetic locus: an exon SNP, an exon deletion, a splice-site SNP, a deletion across
-# an exon boundary, a duplicated and a deleted gene, a minus-strand gene and a walk written reversed. Every
-# row's status, notes and sequence against transcripts spliced from each haplotype independently; the same
-# output at 1 and 2 threads; input errors stop the run.
+# panvar transcripts on synthetic loci (transcript_fixture.py cases): exon SNPs and deletions, splice-site
+# variants, a deletion across an exon boundary, duplicated and deleted genes, minus-strand genes and walks
+# written reversed, and the other cases its CASES list. Every row's status, notes and sequence against
+# transcripts spliced from each haplotype independently; the same output at 1 and 2 threads; input errors
+# stop the run.
 #   transcripts_synthetic.sh <panvar_bin> <tests/tools dir> <out_dir>
 set -uo pipefail
 
@@ -12,7 +13,7 @@ if [[ $# -lt 3 ]]; then
 fi
 BIN="$1"; TOOLS="$2"; OUT="$3"
 rm -rf "$OUT"; mkdir -p "$OUT"; cd "$OUT" || exit 2
-python3 "$TOOLS/transcript_fixture.py" write .
+python3 "$TOOLS/transcript_fixture.py" write main .
 
 pass=0; fail=0
 ok() { echo "  ok   $1"; pass=$((pass + 1)); }
@@ -35,6 +36,15 @@ check "a reversed walk is read in the reference orientation" '[[ "$(col TA1 h7 o
 check "the minus-strand transcript lists its exons 5 to 3" '[[ "$(col TB1 ref exon_starts)" == "5600,5000" && "$(col TB1 ref exon_lengths)" == "200,100" ]]'
 check "FASTA names are transcript|gene|haplotype|copy" 'grep -q "^>TC1|GC|h5#1#ctg5:0-12000|2 source=projected status=ok$" t1.hst.fa'
 check "the summary counts copies per haplotype" '[[ "$(awk -F"\t" "\$2==\"GC\"{print \$5}" t1.hst.summary.tsv)" == "0:1,1:6,2:2" ]]'
+
+# every case, each row against the haplotypes' own transcripts
+for c in $(python3 "$TOOLS/transcript_fixture.py" cases); do
+  [[ $c == main ]] && continue
+  mkdir -p "case_$c"
+  python3 "$TOOLS/transcript_fixture.py" write "$c" "case_$c"
+  "$BIN" transcripts -i "case_$c/locus.gfa" -r ref --gtf "case_$c/genes.gtf" -o "case_$c/out" -t 2 -q
+  check "case $c: every row matches the haplotypes' own transcripts" 'python3 "$TOOLS/transcript_fixture.py" check "case_$c" "case_$c/out" > "case_$c/check.log"; cat "case_$c/check.log"; grep -q "wrong: 0" "case_$c/check.log"'
+done
 
 # input errors
 "$BIN" transcripts -i locus.gfa -r ref -o e1 -q 2> e1.log
