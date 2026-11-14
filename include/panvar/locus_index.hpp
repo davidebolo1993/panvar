@@ -101,10 +101,11 @@ struct LocusIndex {
     std::vector<Ceiling> ceilings;
     std::vector<Calibration> calibration;        // empty when not calibrated
     std::uint64_t dust_demoted = 0, span_demoted = 0, negative = 0;
-    // transcripts (empty without): their file, its checksum, whether only status=ok ones were taken, those
-    // taken and left out, and per k-mer the transcript-only flag
-    std::string transcripts, transcripts_checksum;
-    bool transcripts_ok_only = false;
+    // transcripts (empty without): their file, its checksum, whether only status=ok ones were taken or those
+    // with a changed splice site too, those taken and left out (in all and by status, as text), and per k-mer
+    // the transcript-only flag
+    std::string transcripts, transcripts_checksum, transcripts_by_status;
+    bool transcripts_ok_only = false, transcripts_splice_changed = false;
     std::uint64_t transcripts_used = 0, transcripts_skipped = 0;
     std::vector<std::uint8_t> transcript_only;
     // the background's transcriptomes when the index was built (their id, 0 without; their names), the records
@@ -131,6 +132,7 @@ struct BuildOptions {
     // per locus (by position in `loci`): its transcripts FASTA (panvar transcripts' <prefix>.hst.fa), or empty
     std::vector<std::string> transcripts;
     bool transcripts_ok_only = false;            // take status=ok transcripts only
+    bool transcripts_splice_changed = false;     // take those with a changed splice site too
     std::size_t threads = 2;
     std::function<void(const std::string&)> log;
 };

@@ -175,13 +175,16 @@ bool header_names_gene(const std::string& header, const std::set<std::string>& g
 // A transcript's sequence, and the graph node of each of its bases (-1 where unknown).
 using TranscriptFn = std::function<void(const std::string& seq, const std::function<std::int32_t(std::size_t)>& node_at)>;
 
-// The transcripts of a panvar transcripts FASTA (plain or gzip), one at a time. Each status but those of a
-// written transcript with a flaw is taken, or only status=ok with `ok_only`; a record without a status is
-// taken. Their bases are placed on the graph's nodes through the table beside the FASTA (the haplotype's
+// The transcripts of a panvar transcripts FASTA (plain or gzip), one at a time. Every written transcript is
+// taken but those whose splice site differs from the reference's (the haplotype may not splice there, so
+// their junctions are guesses) unless `splice_changed`, or only status=ok with `ok_only`; a record without a
+// status is taken. `by_status` counts the records taken and all, per status. Their bases are placed on the graph's nodes through the table beside the FASTA (the haplotype's
 // path and each exon's first base and length on it), where it exists. A sequence equal to one already
 // passed on is counted as taken but not passed on again: most transcripts are the same on many haplotypes.
 void for_each_transcript(const std::string& fa, const Graph& g, const std::vector<std::string>& node_names, bool ok_only,
-                         std::uint64_t& used, std::uint64_t& skipped, std::set<std::string>& genes, const TranscriptFn& fn) {
+                         bool splice_changed, std::uint64_t& used, std::uint64_t& skipped,
+                         std::map<std::string, std::array<std::uint64_t, 2>>& by_status, std::set<std::string>& genes,
+                         const TranscriptFn& fn) {
     // the exons of each record on its path, and its gene's id, from the table
     struct Place { std::string path, gene_id; bool forward = true; std::vector<std::uint64_t> starts, lengths; };
     std::unordered_map<std::string, Place> place;
@@ -228,10 +231,13 @@ void for_each_transcript(const std::string& fa, const Graph& g, const std::vecto
     std::string line, name, status, seq;
     auto flush = [&] {
         if (name.empty()) return;
-        static const std::set<std::string> flawed = {"ok", "splice_site_changed", "boundary_moved", "clipped_at_edge", "intron_lost"};
-        const bool take = status.empty() || (ok_only ? status == "ok" : flawed.count(status) != 0);
+        static const std::set<std::string> written = {"ok", "boundary_moved", "clipped_at_edge", "intron_lost"};
+        const bool take = status.empty() || (ok_only ? status == "ok" : written.count(status) != 0 || (splice_changed && status == "splice_site_changed"));
+        auto& tally = by_status[status.empty() ? "no_status" : status];
+        ++tally[1];
         if (!take || seq.size() < kK) { ++skipped; return; }
         ++used;
+        ++tally[0];
         {   // the record's gene: the second field of its name (transcript|gene|haplotype|copy), and the table's id
             const std::size_t a = name.find('|'), b = a == std::string::npos ? a : name.find('|', a + 1);
             if (b != std::string::npos) add_gene_name(genes, name.substr(a + 1, b - a - 1));
@@ -476,7 +482,7 @@ std::string LocusIndex::key() const {
     for (const auto& g : decoy_genomes) d += g + ",";
     return "v" + std::to_string(kVersion) + "|" + graph_checksum + "|" + reference_path + "|" + store_id + "|" + std::to_string(content) + "|" +
            coordinate_reference + "|" + std::to_string(informative_max) + "|" + std::to_string(pad) + "|" + std::to_string(dust) + "|" + std::to_string(decoy_min_hits) + "|" + d + (calibrated ? "|c1" : "|c0") +
-           (transcripts_checksum.empty() ? "" : "|t" + transcripts_checksum + (transcripts_ok_only ? "o" : "a") + "|x" + hex64(transcriptome));
+           (transcripts_checksum.empty() ? "" : "|t" + transcripts_checksum + (transcripts_ok_only ? "o" : transcripts_splice_changed ? "s" : "a") + "|x" + hex64(transcriptome));
 }
 
 std::string expected_key(const BuildOptions& o, const std::string& gfa, const std::string& transcripts) {
@@ -486,6 +492,7 @@ std::string expected_key(const BuildOptions& o, const std::string& gfa, const st
     if (!transcripts.empty()) {
         k.transcripts_checksum = transcripts_checksum_of(transcripts);
         k.transcripts_ok_only = o.transcripts_ok_only;
+        k.transcripts_splice_changed = o.transcripts_splice_changed;
         k.transcriptome = bg::transcriptome_id(m);
     }
     const Graph g = parse_gfa(gfa, ParseGfaOptions{true, false});
@@ -660,10 +667,16 @@ std::vector<LocusIndex> build(const BuildOptions& o) {
             x.transcripts = fs::absolute(tx).string();
             x.transcripts_checksum = transcripts_checksum_of(tx);
             x.transcripts_ok_only = o.transcripts_ok_only;
+            x.transcripts_splice_changed = o.transcripts_splice_changed;
             x.transcriptome = bg::transcriptome_id(m);
+            std::map<std::string, std::array<std::uint64_t, 2>> by_status;
             collect_kmers(g, x, present, [&](const TranscriptFn& fn) {
-                for_each_transcript(tx, g, node_names, o.transcripts_ok_only, x.transcripts_used, x.transcripts_skipped, w.genes, fn);
+                for_each_transcript(tx, g, node_names, o.transcripts_ok_only, o.transcripts_splice_changed, x.transcripts_used,
+                                    x.transcripts_skipped, by_status, w.genes, fn);
             });
+            for (const auto& [status, n] : by_status)
+                x.transcripts_by_status += (x.transcripts_by_status.empty() ? "" : ", ") + status + " " + std::to_string(n[0]) + "/" + std::to_string(n[1]);
+            log("locus: " + x.name + "; transcripts taken of all, by status: " + x.transcripts_by_status);
             const std::size_t n = static_cast<std::size_t>(std::count(x.transcript_only.begin(), x.transcript_only.end(), 1));
             log("locus: " + x.name + "; transcripts: " + std::to_string(x.transcripts_used) + " taken, " + std::to_string(x.transcripts_skipped) +
                 " left out; k-mers only in transcripts: " + std::to_string(n));
@@ -1347,6 +1360,7 @@ void save(const LocusIndex& x, const std::string& path) {
             o.vec(x.transcript_only);
             o.u64(x.transcriptome); o.u64(x.transcriptome_records); o.u64(x.tx_in_transcriptome); o.u64(x.tx_in_other_loci);
             o.str(x.transcriptome_names); o.str(x.other_loci);
+            o.u64(x.transcripts_splice_changed); o.str(x.transcripts_by_status);
         }
         o.f.seekp(0);
         o.u64(kMagic);
@@ -1403,6 +1417,7 @@ LocusIndex load(const std::string& path) {
         x.transcript_only = i.vec<std::uint8_t>();
         x.transcriptome = i.u64(); x.transcriptome_records = i.u64(); x.tx_in_transcriptome = i.u64(); x.tx_in_other_loci = i.u64();
         x.transcriptome_names = i.str(); x.other_loci = i.str();
+        x.transcripts_splice_changed = i.u64() != 0; x.transcripts_by_status = i.str();
     }
     const std::size_t n = x.codes.size();
     if (x.cls.size() != n || x.outside.size() != n || x.mult.size() != n || x.backbone.size() != n || x.nodeset.size() != n ||
@@ -1438,7 +1453,8 @@ void write_report(const LocusIndex& x, const std::string& path) {
         std::size_t t[3] = {0, 0, 0};
         for (std::size_t i = 0; i < x.codes.size(); ++i) if (x.transcript_only[i]) ++t[x.cls[i]];
         r << "locus\ttranscripts\t" << x.transcripts << " (" << x.transcripts_used << " taken, " << x.transcripts_skipped << " left out"
-          << (x.transcripts_ok_only ? "; status ok only" : "") << ")"
+          << (x.transcripts_ok_only ? "; status ok only" : x.transcripts_splice_changed ? "; with changed splice sites" : "") << ")"
+          << "\nlocus\ttranscripts_by_status\t" << x.transcripts_by_status << " (taken/all)"
           << "\nlocus\ttranscript_only\t" << t[0] + t[1] + t[2] << " (private " << t[0] << ", shared " << t[1] << ", repeat " << t[2] << ")"
           << "\nlocus\ttranscriptome\t" << (x.transcriptome_names.empty() ? std::string("none in the background")
                                              : x.transcriptome_names + " (records of the locus's genes subtracted: " + std::to_string(x.transcriptome_records) + ")")

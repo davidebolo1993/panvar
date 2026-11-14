@@ -14,7 +14,9 @@ writes
                        SNP four bases into the fourth exon; its gene GP, on the minus strand
   tx_own.fa            a transcriptome holding the gene's transcript and unrelated ones
   tx_paralog.fa        the same with the paralog's transcript
-  junction_kmers.txt   the transcript's k-mers no locus copy holds: all, and those of the first two junctions
+  junction_kmers.txt   the transcript's k-mers no locus copy holds: all, those of the first two junctions, and
+                       those the record of splice_changed.fa adds
+  splice_changed.fa    a transcript record with status splice_site_changed: the first exon joined to the third
   junction_nodes_b.tsv per k-mer of GP's transcripts that no copy of its locus holds, the node of its first base
   reads.fq             120-base reads across the first two junctions: reads of the paralog's mRNA as well
   reads_own.fq         120-base reads across the last two junctions: the gene's own
@@ -160,8 +162,8 @@ with open(os.path.join(out, "tx_paralog.fa"), "w") as f:
         f.write(f">{name}\n{s}\n")
 
 own = kmers(ref[ls:le]) | kmers(hap_a)
-with open(os.path.join(out, "junction_kmers.txt"), "w") as f:   # all, and those of the first two junctions
-    f.write(f"{len(kmers(tx) - own)} {len(kmers(e1 + e2 + e3) - own)}\n")
+with open(os.path.join(out, "junction_kmers.txt"), "w") as f:
+    f.write(f"{len(kmers(tx) - own)} {len(kmers(e1 + e2 + e3) - own)} {len(kmers(e1 + e3) - own - kmers(tx))}\n")
 
 
 def fastq(name, reads):
@@ -175,6 +177,8 @@ j3 = len(e1 + e2 + e3)
 fastq("reads_own.fq", [(f"o{k}", tx[s:s + 120]) for k, s in ((k, j3 - 70 + rng.randrange(0, 40)) for k in range(200))])
 pseudo = flank_l[-200:] + tx + "A" * 30 + flank_r[:200]
 skip = e1 + e3
+with open(os.path.join(out, "splice_changed.fa"), "w") as f:
+    f.write(f">TJ9|GJ|ref#1#chr1:{ls}-{le}|1 source=projected status=splice_site_changed\n{skip}\n")
 fastq("reads_other.fq",
       [(f"pp_head{k}", pseudo[140 + 2 * k:260 + 2 * k]) for k in range(20)] +                       # flank into exon 1
       [(f"pp_tail{k}", pseudo[len(pseudo) - 330 + 2 * k:len(pseudo) - 210 + 2 * k]) for k in range(20)] +   # exon 5 into the tail

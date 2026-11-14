@@ -45,7 +45,9 @@ void print_recruit_help() {
         << "      --transcripts <name=hst.fa>  A locus's haplotype-specific transcripts (panvar transcripts' FASTA),\n"
         << "                                  for the locus graph named <name> (its file name without .gfa[.gz]);\n"
         << "                                  the name may be left out with one graph; repeatable\n"
-        << "      --transcripts-ok-only       Take only transcripts with status ok (default: every written one)\n\n"
+        << "      --transcripts-ok-only       Take only transcripts with status ok (default: every written one but\n"
+        << "                                  those whose splice site differs from the reference's)\n"
+        << "      --transcripts-splice-changed  Take those too: the haplotype may not splice there\n\n"
         << "Reads (one sample's files are read in turn):\n"
         << "  -1, --reads <fq>                FASTQ (plain or gzip); repeatable\n"
         << "  -2, --mates <fq>                Its mates, one per -1\n"
@@ -109,6 +111,7 @@ int run_recruit_command(const std::vector<std::string>& args) {
         else if (a == "--no-calibration") o.calibrate = false;
         else if (a == "--transcripts") transcripts_given.push_back(value());
         else if (a == "--transcripts-ok-only") o.transcripts_ok_only = true;
+        else if (a == "--transcripts-splice-changed") o.transcripts_splice_changed = true;
         else if (a == "--false-certain-rate") { ro.false_certain_rate = parse_number(a, value()); rate_given = true; }
         else if (a == "--decoy-genomes") {
             std::stringstream ss(value());
@@ -254,6 +257,7 @@ int run_recruit_command(const std::vector<std::string>& args) {
             throw std::runtime_error(std::string(e.what()) + " (rebuild it from its graph)");
         }
     }
+    if (o.transcripts_ok_only && o.transcripts_splice_changed) throw std::runtime_error("give --transcripts-ok-only or --transcripts-splice-changed, not both");
     if (!graphs.empty() && o.background.empty()) throw std::runtime_error("recruit requires --background <store.bgk> to index a graph");
     if (!graphs.empty() && o.reference_query.empty()) throw std::runtime_error("recruit requires -r <reference path> to index a graph");
     if (!index_only && (samples.empty() || ro.out.empty()))
