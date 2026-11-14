@@ -376,6 +376,9 @@ if(PANVAR_BUILD_TESTING)
             add_test(NAME panvar_recruit_index
                      COMMAND /usr/bin/env bash ${PANVAR_RECRUIT_INDEX} $<TARGET_FILE:panvar> ${CMAKE_CURRENT_SOURCE_DIR}/tests/tools ${CMAKE_CURRENT_BINARY_DIR}/recruit_index)
             set_tests_properties(panvar_recruit_index PROPERTIES TIMEOUT 300)
+            add_test(NAME panvar_recruit_transcripts
+                     COMMAND /usr/bin/env bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/suites/recruit_transcripts.sh $<TARGET_FILE:panvar> ${CMAKE_CURRENT_SOURCE_DIR}/tests/tools ${CMAKE_CURRENT_BINARY_DIR}/recruit_transcripts)
+            set_tests_properties(panvar_recruit_transcripts PROPERTIES TIMEOUT 300)
             add_test(NAME panvar_recruit_input
                      COMMAND /usr/bin/env bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/suites/recruit_input.sh $<TARGET_FILE:panvar> ${CMAKE_CURRENT_SOURCE_DIR}/tests/tools ${CMAKE_CURRENT_BINARY_DIR}/recruit_input)
             set_tests_properties(panvar_recruit_input PROPERTIES TIMEOUT 300)

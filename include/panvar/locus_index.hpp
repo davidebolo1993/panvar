@@ -12,6 +12,9 @@
 // windows' own alleles), the screen (closed syncmers among P and S k-mers) and per-length ceilings.
 // Evidence is counted in independent sites: a run of r consecutive private k-mers holds ceil(r / k) of
 // them, since one differing base changes at most k consecutive k-mers.
+// With the locus's haplotype-specific transcripts (panvar transcripts), their k-mers join the table: those
+// the genomic walks lack (mostly across splice junctions) are flagged transcript-only and labelled the same
+// way, with nothing subtracted from their background count, since no background genome holds a transcript.
 
 #include <array>
 #include <cstdint>
@@ -93,6 +96,12 @@ struct LocusIndex {
     std::vector<Ceiling> ceilings;
     std::vector<Calibration> calibration;        // empty when not calibrated
     std::uint64_t dust_demoted = 0, span_demoted = 0, negative = 0;
+    // transcripts (empty without): their file, its checksum, whether only status=ok ones were taken, those
+    // taken and left out, and per k-mer the transcript-only flag
+    std::string transcripts, transcripts_checksum;
+    bool transcripts_ok_only = false;
+    std::uint64_t transcripts_used = 0, transcripts_skipped = 0;
+    std::vector<std::uint8_t> transcript_only;
 
     std::int64_t find(std::uint64_t canonical) const;
     std::string key() const;                     // what must match for a saved index to be reused
@@ -109,12 +118,16 @@ struct BuildOptions {
     std::uint32_t decoy_min_hits = 20;           // shared k-mer hits that make a cluster a homologous window
     std::vector<std::string> decoy_genomes;      // default: the coordinate reference
     bool calibrate = true;
+    // per locus (by position in `loci`): its transcripts FASTA (panvar transcripts' <prefix>.hst.fa), or empty
+    std::vector<std::string> transcripts;
+    bool transcripts_ok_only = false;            // take status=ok transcripts only
     std::size_t threads = 2;
     std::function<void(const std::string&)> log;
 };
 
-// The key a locus index built with these options would carry (to test a saved one before building).
-std::string expected_key(const BuildOptions& o, const std::string& gfa);
+// The key a locus index built with these options would carry (to test a saved one before building), for
+// a locus graph with its transcripts FASTA (empty: none).
+std::string expected_key(const BuildOptions& o, const std::string& gfa, const std::string& transcripts = "");
 std::vector<LocusIndex> build(const BuildOptions& options);
 
 void save(const LocusIndex& index, const std::string& path);

@@ -10,7 +10,7 @@ Sorts a sample's reads to locus graphs without aligning them. Each locus graph i
 - `ambiguous`: it has locus evidence but not enough, or conflicting, with the reason;
 - `unrecruited`: it touched the locus's screen but reads as a homolog, or carries no locus evidence.
 
-The output is a table with one row per fragment and locus, the recruited reads as FASTQ if asked, and a summary. Short reads (pairs or single), HiFi and ONT reads are handled alike, from FASTQ, SAM, BAM or CRAM in any sort order.
+The output is a table with one row per fragment and locus, the recruited reads as FASTQ if asked, and a summary. Short reads (pairs or single), HiFi and ONT reads are handled alike, from FASTQ, SAM, BAM or CRAM in any sort order. With the locus's haplotype-specific transcripts (`--transcripts`, from [`transcripts`](transcripts.md)) the index also holds their splice junctions, so RNA reads across them count as locus evidence.
 
 ## How it works
 
@@ -18,11 +18,11 @@ Indexing and scoring are panvar's own; SAM, BAM and CRAM are read with [htslib](
 
 The index, built once per locus graph and kept beside it (`<locus>.plx`, with a report `<locus>.index.tsv`):
 
-1. Every canonical 31-mer of the graph's haplotypes is collected, with the nodes it starts on and its largest copy number within one haplotype. A k-mer once in every haplotype is a backbone k-mer: its depth in a sample is the depth of one copy.
+1. Every canonical 31-mer of the graph's haplotypes is collected, with the nodes it starts on and its largest copy number within one haplotype. A k-mer once in every haplotype is a backbone k-mer: its depth in a sample is the depth of one copy. With `--transcripts`, the transcripts' k-mers the haplotypes lack (mostly across splice junctions) join them, flagged transcript-only: one copy, never backbone, on the node of their first base (through the transcripts' table, `<prefix>.hst.tsv`, beside the FASTA). Their k-mers inside exons are the haplotypes' own and stay as they are.
 2. The locus is located in every background genome: the reference path's interval (`-r`; its name carries `contig:start-end`) is found through the background's anchors, and the k-mers of each copy found are counted and subtracted from the background's counts. A genome whose copy is broken (a copy reaching a contig end, several copies, or none) is also scanned for stretches made almost entirely of the locus's k-mers (95% of every 5,000 bases), and so is the contig of a copy whose end had to be estimated from the reference (no flank anchor where expected, as past an array longer than the reference's): pieces of the locus the anchors cannot place, such as a tandem array cut by a contig break or running past the estimated end, are subtracted too. A stretch less than 5,000 bases from a contig end reaches that end when at least half of the k-mers in between are the locus's: no window fits there, and assemblies hold more errors near their contig ends. When 0.5% of a locus's k-mers are tandem (3 or more copies within a haplotype) yet left with a few copies outside the located ones, the array has pieces next to copies that look whole, and every genome is scanned for that locus (in parallel, one genome per thread). A dense stretch is a piece only when it is tied to the locus: on the contig of a located copy, reaching a contig end, or covering a whole contig shorter than 5,000 bases (with at least half of its k-mers the locus's). One with other sequence on both sides, on a contig without a copy, may be a close paralog the coordinate reference lacks, and stays outside.
-3. Each k-mer is labelled by what is left (its count outside the locus): private (none), shared (up to `--informative-max` per background haplotype, on average) or repeat (more). Private k-mers of low complexity, or that become shared when the located copies are trimmed at their uncertain ends (unless those ends lie in such a stretch), are labelled shared.
-4. Decoys: in the decoy genomes (`--decoy-genomes`), clusters of shared k-mer hits outside the locus's own copy (20 hits, each within 1,500 bp of the next) are homologous windows; their k-mers that are not in the locus and are shared in the background become decoy k-mers, the alleles of the homologs.
-5. The screen is the closed syncmers ([Edgar 2021](https://doi.org/10.7717/peerj.10805); 11-mer minimum at either end) among the private and shared k-mers, about one in ten.
+3. Each k-mer is labelled by what is left (its count outside the locus; for a transcript-only k-mer, its whole background count, as no genome holds a transcript, so a processed pseudogene's junctions make it shared): private (none), shared (up to `--informative-max` per background haplotype, on average) or repeat (more). Private k-mers of low complexity, or that become shared when the located copies are trimmed at their uncertain ends (unless those ends lie in such a stretch), are labelled shared.
+4. Decoys: in the decoy genomes (`--decoy-genomes`), clusters of shared k-mer hits (of the haplotypes' k-mers) outside the locus's own copy (20 hits, each within 1,500 bp of the next) are homologous windows; their k-mers that are not in the locus and are shared in the background become decoy k-mers, the alleles of the homologs.
+5. The screen is the closed syncmers ([Edgar 2021](https://doi.org/10.7717/peerj.10805); 11-mer minimum at either end) among the private and shared k-mers, about one in ten, junction k-mers included.
 6. Calibration: reads are simulated for three classes (2×150 pairs at 0.2% error, HiFi-like reads at 0.1%, ONT-like reads at 3%) from the haplotypes of up to eight samples held out one at a time (the k-mers only that sample carries read as new while its reads are scored), from the decoy windows, and from 5 Mb of the coordinate reference on each side of the locus. They are screened and scored as below, and the index keeps, per class, how many are certain at each cut from one to eight private sites.
 
 Reads, per sample:
@@ -39,6 +39,7 @@ Reads, per sample:
 
 - `--locus <path>`: a locus graph (GFA; PanSN path names) or its index (`.plx`); repeatable
 - to index a graph: `--background <store>` and `-r, --reference <name>` (the graph path whose name carries the coordinates of the background's coordinate reference)
+- optionally, per locus graph, its transcripts: `--transcripts <locus>=<prefix.hst.fa>`, where `<locus>` is the graph's file name without `.gfa[.gz]` (the name of its index), or `--transcripts <prefix.hst.fa>` with one graph
 - reads: `-1`/`-2` FASTQ pairs, `-i` any one file (FASTQ, SAM, BAM, CRAM), or `--samples <sheet.tsv>` for several samples
 - `-o, --out <path>`: the table (or a folder, with `--samples`); not needed with `--index-only`
 
@@ -52,6 +53,8 @@ Reads, per sample:
 | `--informative-max <N>` | copies per background haplotype outside the locus up to which a k-mer is shared, not repeat | `8` |
 | `--decoy-genomes <A,B>` | genomes whose homologous windows give decoys | the coordinate reference |
 | `--no-calibration` | build indexes without calibration (the cut is then `--min-sites`, 2) | off |
+| `--transcripts <locus>=<fa>` | the locus's haplotype-specific transcripts; every one `transcripts` wrote is taken (`ok`, `splice_site_changed`, `boundary_moved`, `clipped_at_edge`, `intron_lost`; a record without a status too), projected and annotated alike | none |
+| `--transcripts-ok-only` | take only transcripts with status `ok` | off |
 | `--interleaved` | `-i` FASTQ files hold mates as consecutive records | off |
 | `--cram-reference <fa>` | the FASTA (with `.fai`) a CRAM was compressed against | the one its header names |
 | `--dry-run` | count each input's records by kind and the time to read them | off |
@@ -75,10 +78,10 @@ A sample sheet holds tab-separated lines of sample, file and optionally a mate f
 | `<out>` | one row per screened fragment and locus (columns below) |
 | `<out stem>.summary.tsv` | the run: error rate and its source, fragments, screened, mean read length; each input's records by kind; per locus, fragments by fate and reason, the backbone depth, the fragments certain for another locus too, and the private-site cut with the calibration behind it |
 | `<locus>.plx` | the index |
-| `<locus>.index.tsv` | the index's report: the locus (k-mers by label, backbone, pieces, decoys, screen), each copy found per genome with the k-mers subtracted, the pieces found off them, the decoy windows, ceilings (the share of read-length windows of each haplotype with 2 private sites) and the calibration (per read class and cut: held-out fragments certain, off-target certain of those screened, and the 95% bound) |
+| `<locus>.index.tsv` | the index's report: the locus (k-mers by label, backbone, pieces, decoys, screen), each copy found per genome with the k-mers subtracted, the pieces found off them, the transcripts taken and the transcript-only k-mers by label (with `--transcripts`), the decoy windows, ceilings (the share of read-length windows of each haplotype with 2 private sites) and the calibration (per read class and cut: held-out fragments certain, off-target certain of those screened, and the 95% bound) |
 | `<reads-out>/<locus>.<fate>_1.fq.gz`, `_2.fq.gz` | with `--reads-out`: recruited pairs, as sequenced, with qualities (`<locus>.<fate>.fq.gz` for single reads) |
 
-An index dumped with `--dump-index` has one row per k-mer of the locus: `kmer` (its canonical sequence), `class` (`P`, `S` or `R`), `outside` (its background count outside the locus), `multiplicity` (its largest copy number within one haplotype), `backbone` (1 if once in every haplotype), `screen` (1 if a screen syncmer) and `nodes` (the graph nodes it starts on). Decoy k-mers follow as class `D`, with `.` in the fields only locus k-mers have.
+An index dumped with `--dump-index` has one row per k-mer of the locus: `kmer` (its canonical sequence), `class` (`P`, `S` or `R`), `outside` (its background count outside the locus), `multiplicity` (its largest copy number within one haplotype), `backbone` (1 if once in every haplotype), `screen` (1 if a screen syncmer), `nodes` (the graph nodes it starts on; for a transcript-only k-mer the node of its first base, `.` when the transcripts' table is missing) and `transcript_only` (1 for a k-mer only the transcripts hold). Decoy k-mers follow as class `D`, with `.` in the fields only locus k-mers have.
 
 Table columns:
 
@@ -107,7 +110,8 @@ Table columns:
 - The calibration simulates about 10,000 off-target fragments per locus and class: no false certain fragment among them bounds the rate at a few per 10,000, not one per million, and overlapping fragments share sites. The summary says whether the rate was shown or only none beyond it seen. Rates per million come from whole-genome negatives (see the dev scripts).
 - A homologous copy carrying the locus's alleles at two distinguishing bases within one read (gene conversion, a paralogous variant at both) reads as certain; a larger background, where more of those alleles are shared, reduces it.
 - Short pairs across a locus edge are less often certain than inside it: the located copies' ends are uncertain, so the k-mers near them are labelled shared.
-- Long spliced transcripts cross many junctions and read as divergent.
+- Long spliced transcripts cross many junctions and read as divergent unless the index holds the locus's transcripts; isoforms the transcripts lack still do.
+- The calibration simulates DNA reads only: no read class covers junction k-mers yet.
 - A locus missing from a background genome cannot be subtracted there; its k-mers keep that genome's counts, unless the scan for pieces finds it.
 - Genomes given to the background as graphs are not scanned for pieces.
 - A homologous copy elsewhere close enough to carry three or more of the reference's unique anchors in order is located as a copy of the locus and subtracted, even one the coordinate reference lacks. Past that, the scan for pieces subtracts only stretches tied to the locus (on a located copy's contig, or reaching a contig end): density alone cannot tell a close paralog from a piece, so one with other sequence on both sides, on a contig without a copy, stays outside and its k-mers shared.
@@ -117,6 +121,9 @@ Table columns:
 ```bash
 # the indexes, once per locus graph, kept beside each graph
 panvar recruit --locus locus_a.gfa --locus locus_b.gfa --background bg.bgk -r GRCh38 --index-only
+# with each locus's transcripts (panvar transcripts -o locus_a ...)
+panvar recruit --locus locus_a.gfa --locus locus_b.gfa --background bg.bgk -r GRCh38 --index-only \
+  --transcripts locus_a=locus_a.hst.fa --transcripts locus_b=locus_b.hst.fa
 # one sample
 panvar recruit --locus locus_a.plx --locus locus_b.plx -1 sample_1.fq.gz -2 sample_2.fq.gz -o sample.tsv
 # a sample sheet, one table per sample in out/

@@ -41,7 +41,11 @@ void print_recruit_help() {
         << "                                  shared, more is repeat (default 8)\n"
         << "      --decoy-genomes <A,B>       Genomes whose homologous windows give decoys (default: the coordinate\n"
         << "                                  reference)\n"
-        << "      --no-calibration            Build indexes without calibration\n\n"
+        << "      --no-calibration            Build indexes without calibration\n"
+        << "      --transcripts <name=hst.fa>  A locus's haplotype-specific transcripts (panvar transcripts' FASTA),\n"
+        << "                                  for the locus graph named <name> (its file name without .gfa[.gz]);\n"
+        << "                                  the name may be left out with one graph; repeatable\n"
+        << "      --transcripts-ok-only       Take only transcripts with status ok (default: every written one)\n\n"
         << "Reads (one sample's files are read in turn):\n"
         << "  -1, --reads <fq>                FASTQ (plain or gzip); repeatable\n"
         << "  -2, --mates <fq>                Its mates, one per -1\n"
@@ -85,7 +89,7 @@ int run_recruit_command(const std::vector<std::string>& args) {
     recruit::ReadOptions ro;
     std::string save_dir, sheet, summary;
     double error_rate = -1, preset_rate = -1;
-    std::vector<std::string> reads1, reads2, singles;
+    std::vector<std::string> reads1, reads2, singles, transcripts_given;
     bool index_only = false, quiet = false, dry_run = false, rate_given = false;
     std::size_t threads = 0;
     for (std::size_t i = 0; i < args.size(); ++i) {
@@ -103,6 +107,8 @@ int run_recruit_command(const std::vector<std::string>& args) {
         else if (a == "--save-index") save_dir = value();
         else if (a == "--informative-max") o.informative_max = static_cast<std::uint32_t>(cli::parse_size_arg(a, value()));
         else if (a == "--no-calibration") o.calibrate = false;
+        else if (a == "--transcripts") transcripts_given.push_back(value());
+        else if (a == "--transcripts-ok-only") o.transcripts_ok_only = true;
         else if (a == "--false-certain-rate") { ro.false_certain_rate = parse_number(a, value()); rate_given = true; }
         else if (a == "--decoy-genomes") {
             std::stringstream ss(value());
@@ -113,16 +119,17 @@ int run_recruit_command(const std::vector<std::string>& args) {
             if (eq == std::string::npos) throw std::runtime_error("--dump-index takes PLX=TSV");
             const recruit::LocusIndex x = recruit::load(v.substr(0, eq));
             std::ofstream out(v.substr(eq + 1));
-            out << "kmer\tclass\toutside\tmultiplicity\tbackbone\tscreen\tnodes\n";
+            out << "kmer\tclass\toutside\tmultiplicity\tbackbone\tscreen\tnodes\ttranscript_only\n";
             for (std::size_t k = 0; k < x.codes.size(); ++k) {
                 const bool screened = std::binary_search(x.screen.begin(), x.screen.end(), x.codes[k]);
                 out << kmer::decode(x.codes[k], 31) << '\t' << "PSR"[x.cls[k]] << '\t' << x.outside[k] << '\t' << x.mult[k] << '\t'
                     << int(x.backbone[k]) << '\t' << int(screened) << '\t';
-                for (std::uint32_t i = x.nodeset_first[x.nodeset[k]]; i < x.nodeset_first[x.nodeset[k] + 1]; ++i)
-                    out << (i > x.nodeset_first[x.nodeset[k]] ? "," : "") << x.nodes[x.nodeset_nodes[i]];
-                out << '\n';
+                const std::uint32_t a = x.nodeset_first[x.nodeset[k]], b = x.nodeset_first[x.nodeset[k] + 1];
+                if (a == b) out << '.';
+                for (std::uint32_t i = a; i < b; ++i) out << (i > a ? "," : "") << x.nodes[x.nodeset_nodes[i]];
+                out << '\t' << (x.transcript_only.empty() ? 0 : int(x.transcript_only[k])) << '\n';
             }
-            for (const std::uint64_t d : x.decoy) out << kmer::decode(d, 31) << "\tD\t.\t.\t.\t0\t.\n";
+            for (const std::uint64_t d : x.decoy) out << kmer::decode(d, 31) << "\tD\t.\t.\t.\t0\t.\t0\n";
             if (!out) throw std::runtime_error("recruit: cannot write " + v.substr(eq + 1));
             return 0;
         } else if (a == "-1" || a == "--reads") reads1.push_back(value());
@@ -211,6 +218,30 @@ int run_recruit_command(const std::vector<std::string>& args) {
         (is_plx(l) ? given_indexes : graphs).push_back(l);
     }
     o.loci = graphs;
+    // transcripts per locus graph, by its name (the file name without .gfa[.gz], as its index is named)
+    auto stem = [](const std::string& gfa) {
+        std::string n = fs::path(gfa).filename().string();
+        for (const char* e : {".gz", ".gfa"}) {
+            const std::string x(e);
+            if (n.size() > x.size() && n.compare(n.size() - x.size(), x.size(), x) == 0) n.resize(n.size() - x.size());
+        }
+        return n;
+    };
+    o.transcripts.assign(graphs.size(), std::string());
+    for (const std::string& t : transcripts_given) {
+        std::string name, path = t;
+        const auto eq = t.find('=');
+        if (eq != std::string::npos && !fs::is_regular_file(t)) { name = t.substr(0, eq); path = t.substr(eq + 1); }
+        std::size_t at = graphs.size();
+        for (std::size_t g = 0; g < graphs.size(); ++g)
+            if (name.empty() ? graphs.size() == 1 : stem(graphs[g]) == name) at = g;
+        if (at == graphs.size())
+            throw std::runtime_error("recruit: --transcripts " + t + ": " + (name.empty() ? std::string("give it as <locus name>=<file> with several graphs")
+                                                                                      : "no --locus graph is named " + name));
+        if (!o.transcripts[at].empty()) throw std::runtime_error("recruit: two --transcripts for locus " + stem(graphs[at]));
+        if (!fs::is_regular_file(path)) throw std::runtime_error("recruit: no file at " + path);
+        o.transcripts[at] = path;
+    }
     for (const auto& plx : given_indexes) {   // a given index is checked now, not first when reads arrive
         try {
             (void)recruit::load(plx);
@@ -251,19 +282,22 @@ int run_recruit_command(const std::vector<std::string>& args) {
     }
     recruit::BuildOptions todo = o;
     todo.loci.clear();
+    todo.transcripts.clear();
     std::vector<std::string> wrote;
-    for (const auto& l : o.loci) {
+    for (std::size_t li = 0; li < o.loci.size(); ++li) {
+        const std::string& l = o.loci[li];
         const std::string plx = index_path(l, ".plx");
         if (fs::exists(plx)) {
             try {
                 const recruit::LocusIndex old = recruit::load(plx);
-                if (old.key() == recruit::expected_key(o, l)) { log.info("index: " + plx + "; current, reused"); continue; }
+                if (old.key() == recruit::expected_key(o, l, o.transcripts[li])) { log.info("index: " + plx + "; current, reused"); continue; }
                 log.info("index: " + plx + "; built from another graph, background or settings: rebuilding");
             } catch (const std::exception& e) {
                 log.info("index: " + plx + "; " + e.what() + ": rebuilding");
             }
         }
         todo.loci.push_back(l);
+        todo.transcripts.push_back(o.transcripts[li]);
     }
     if (!todo.loci.empty()) {
         const auto built = recruit::build(todo);
