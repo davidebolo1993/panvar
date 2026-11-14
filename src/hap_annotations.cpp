@@ -158,7 +158,7 @@ std::vector<AnnotatedTranscript> load_hap_annotations(const Graph& graph, const 
         GzLineReader in(f[1]);
         if (!in.ok()) throw std::runtime_error(module + ": cannot read annotation " + f[1]);
         std::unordered_map<std::string, Feature> features;
-        std::map<std::string, std::vector<std::pair<std::size_t, std::size_t>>> exons;
+        std::map<std::string, std::vector<std::pair<std::size_t, std::size_t>>> exons, cds;
         std::unordered_map<std::string, Feature> exon_tx;   // GTF: the transcript, from its exon rows
         std::string line;
         while (in.getline(line)) {
@@ -175,18 +175,18 @@ std::vector<AnnotatedTranscript> load_hap_annotations(const Graph& graph, const 
             }
             Attrs a = parse_attrs(c[8], gtf);
             if (gtf) {
-                if (c[2] != "exon") continue;
+                if (c[2] != "exon" && c[2] != "CDS") continue;
                 // A transcript is its gene record's: copies of one transcript id in two gene records are two.
                 const std::string tid = first_of(a, {"gene_id"}) + '\t' + first_of(a, {"transcript_id"});
                 if (tid.size() == 1) continue;
-                exons[tid].emplace_back(s, e);
+                (c[2] == "exon" ? exons : cds)[tid].emplace_back(s, e);
                 Feature& t = exon_tx[tid];
                 if (t.seqid.empty()) t = {c[0], c[6] == "-" ? '-' : '+', std::move(a), "transcript", {}};
                 continue;
             }
-            if (c[2] == "exon") {
+            if (c[2] == "exon" || c[2] == "CDS") {
                 for (const std::string& p : split(first_of(a, {"Parent"}), ','))
-                    if (!p.empty()) exons[p].emplace_back(s, e);
+                    if (!p.empty()) (c[2] == "exon" ? exons : cds)[p].emplace_back(s, e);
                 continue;
             }
             const std::string id = first_of(a, {"ID"});
@@ -196,13 +196,20 @@ std::vector<AnnotatedTranscript> load_hap_annotations(const Graph& graph, const 
             features.emplace(id, std::move(ft));
         }
 
+        // A model with coding rows only (no exon rows) takes them as its exons.
+        for (auto& [tid, iv] : cds)
+            if (!exons.count(tid)) exons[tid] = std::move(iv);
         std::vector<AnnotatedTranscript> mine;
+        std::size_t orphan = 0;
         for (auto& [tid, ex] : exons) {
             const auto fit = features.find(tid);
             const Feature* tx = fit != features.end() ? &fit->second : nullptr;
             if (!tx) {
                 const auto git = exon_tx.find(tid);
-                if (git == exon_tx.end()) continue;   // exons whose transcript record is elsewhere
+                if (git == exon_tx.end()) {   // exons naming a transcript the annotation does not hold
+                    orphan += ex.size();
+                    continue;
+                }
                 tx = &git->second;
             }
             const bool gtf = fit == features.end();
@@ -262,6 +269,9 @@ std::vector<AnnotatedTranscript> load_hap_annotations(const Graph& graph, const 
             }
             if (!at.t.exons.empty()) mine.push_back(std::move(at));
         }
+        if (orphan)
+            std::cerr << cli::log_prefix(module) << "warning: " << hap << ": " << orphan
+                      << " exon row(s) whose transcript record is missing in " << f[1] << "; skipped\n";
         // Copies: each gene's records on a path, ranked by their first exon along the path.
         std::map<std::pair<std::size_t, std::string>, std::map<std::string, std::size_t>> records;
         for (const AnnotatedTranscript& at : mine) {

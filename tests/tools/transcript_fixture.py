@@ -323,6 +323,12 @@ def write_annotated(d):
     h2 = [gff("ctg2", "transcript", edge[0][0] + 1, edge[1][1], "+", "ID=edge1;gene_name=GZ;transcript_id=edge1")]
     h2 += [gff("ctg2", "exon", a + 1, b, "+", "Parent=edge1") for a, b in edge]
     rows.append(("edge1", "GZ", "h2", 1, "clipped_at_edge", "clipped:3':100", seqs["h2"][edge[0][0]:edge[0][1]], "edge1"))
+    # a model with CDS rows only, and an exon whose transcript record is missing
+    cds = [(m2[9000], m2[9099] + 1), (m2[9300], m2[9399] + 1)]
+    h2 += [gff("ctg2", "mRNA", cds[0][0] + 1, cds[1][1], "-", "ID=cds1;gene_name=GW;transcript_id=cds1")]
+    h2 += [gff("ctg2", "CDS", a + 1, b, "-", "Parent=cds1") for a, b in cds]
+    h2 += [gff("ctg2", "exon", m2[9500] + 1, m2[9599] + 1, "+", "Parent=nowhere")]
+    rows.append(("cds1", "GW", "h2", 1, "ok", ".", rc("".join(seqs["h2"][a:b] for a, b in cds)), "cds1"))
     m3 = maps["h3"][0]
     alias_ex = [(4000, 4200)]
     h3 = [gff("CTG3ALT", "transcript", pos(m3, 4000), pos(m3, 4199), "+", "ID=al1;gene_name=GY;transcript_id=al1")]
