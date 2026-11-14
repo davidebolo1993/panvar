@@ -384,8 +384,9 @@ def write_annotated(d):
     h3 += [gff("CTG3ALT", "exon", pos(m3, a), pos(m3, b - 1), "+", "Parent=c6") for a, b in case["genes"]["GC"][1]["TC1"]]
     h5 = []
     for k, m in enumerate(maps["h5"], 1):   # GTF: both GC copies, as projected
-        # the two records share their source gene under different names: one gene, two copies
-        attr = f'gene_id "gc{k}"; gene_name "{"GC" if k == 1 else "GCALT"}"; transcript_id "TC1"; source_gene "GC.1";'
+        # the two records share their source gene under different names, the second with CAT's copy suffix:
+        # one gene, two copies
+        attr = f'gene_id "gc{k}"; gene_name "{"GC" if k == 1 else "GCALT"}"; transcript_id "TC1"; source_gene "GC.1{"" if k == 1 else "_2"}";'
         h5 += [f'ctg5\tCAT\texon\t{pos(m, a)}\t{pos(m, b - 1)}\t.\t+\t.\t{attr}\n' for a, b in case["genes"]["GC"][1]["TC1"]]
     # a GTF transcript whose CDS row comes before its exon row with other attributes: the exon row's count
     m5 = maps["h5"][0]
