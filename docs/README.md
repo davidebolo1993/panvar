@@ -23,6 +23,10 @@ Documentation for the `panvar` CLI.
 1. [background.md](background.md) — every k-mer of a set of genomes counted once, with anchors on a reference
 2. [recruit.md](recruit.md) — locus indexes against the background, and each read called certain, ambiguous or unrecruited per locus
 
+### Transcripts
+
+1. [transcripts.md](transcripts.md) — a reference annotation projected onto every haplotype: one transcript per haplotype and gene copy
+
 ### Utilities
 
 - [inspect.md](inspect.md) — clustering, path FASTA, and node/edge matrices for a called bubble.

@@ -31,6 +31,7 @@ docker run --rm -v "$PWD":/work --entrypoint /usr/local/bin/_entrypoint.sh panva
 - [docs/README.md](docs/README.md) — documentation index
 - Modules: [rebuild](docs/rebuild.md) · [bubble](docs/bubble.md) · [panphorte](docs/panphorte.md) · [refine](docs/refine.md) · [call](docs/call.md) · [describe](docs/describe.md) · [associate](docs/associate.md) · [inspect](docs/inspect.md) · [benchmark](docs/benchmark.md)
 - Read recruitment: [background](docs/background.md) · [recruit](docs/recruit.md)
+- Transcripts: [transcripts](docs/transcripts.md)
 
 ## License
 
