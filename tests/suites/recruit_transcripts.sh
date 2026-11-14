@@ -149,6 +149,20 @@ dump idx8; dump idx8 locus_b
 check "junction k-mers the other locus's transcripts hold are shared, the others private ($(tx idx8.locus.tsv))" \
   '[[ $rc -eq 0 && "$(tx idx8.locus.tsv)" == "P$JO S$J12 R0" ]] && grep -q "in other loci of the run (locus_b): $J12" idx8/locus.index.tsv'
 check "the genomic k-mers keep their labels beside another locus" 'cmp -s <(genomic idx1.locus.tsv) <(genomic idx8.locus.tsv)'
+BOTH=(--locus data/locus.gfa --locus data/locus_b.gfa --transcripts locus_b=data/locus_b.hst.fa)
+cp -r idx8 idxm
+"${RC3[@]}" --save-index idxm "${BOTH[@]}" --transcripts locus=data/locus.hst.fa 2> same.txt
+check "the two indexes built together are reused together" '[[ $(grep -c "current, reused" same.txt) -eq 2 ]]'
+"${RC3[@]}" --save-index idxm "${BOTH[@]}" --transcripts locus=data/sc.hst.fa 2> comp.txt; dump idxm; dump idxm locus_b
+check "other transcripts for one locus rebuild both: its junctions keep the other's count ($(tx idxm.locus.tsv))" \
+  '[[ $(grep -c "rebuilding" comp.txt) -eq 2 && "$(tx idxm.locus.tsv)" == "P$JO S$J12 R0" ]] && cmp -s idx8.locus_b.tsv idxm.locus_b.tsv'
+"${RC3[@]}" --save-index idxm --locus data/locus.gfa --transcripts data/sc.hst.fa 2> alone.txt
+check "an index built beside another locus is not reused for that locus alone" 'grep -q "built beside other loci than those given now: rebuilding" alone.txt'
+"${RC3[@]}" --save-index idxp --locus data/locus.gfa --locus data/locus_p.gfa --transcripts locus=data/locus.hst.fa 2> logp.txt; dump idxp
+check "a junction k-mer another locus's haplotypes hold is shared ($(tx idxp.locus.tsv))" '[[ "$(tx idxp.locus.tsv)" == "P0 S$J R0" ]]'
+"${RC3[@]}" --save-index idxp --locus data/locus.gfa --locus data/locus_p.gfa --transcripts locus=data/sc.hst.fa 2> comp2.txt; dump idxp
+check "rebuilt beside an index that is reused, it still counts that locus ($(tx idxp.locus.tsv))" \
+  'grep -q "locus_p.plx; current, reused" comp2.txt && grep -q "locus.plx; .*rebuilding" comp2.txt && [[ "$(tx idxp.locus.tsv)" == "P0 S$J R0" ]]'
 "${RC3[@]}" --save-index idx9 --locus data/locus_b.gfa --transcripts data/locus_b.hst.fa 2> log9.txt; dump idx9 locus_b
 check "indexed alone, the paralog's junction k-mers are all private ($(tx idx9.locus_b.tsv))" \
   '[[ "$(tx idx9.locus_b.tsv)" == "P$(wc -l < data/junction_nodes_b.tsv | tr -d " ") S0 R0" ]]'

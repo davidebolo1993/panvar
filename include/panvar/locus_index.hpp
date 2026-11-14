@@ -113,6 +113,9 @@ struct LocusIndex {
     // the other loci of the run (named)
     std::uint64_t transcriptome = 0, transcriptome_records = 0, tx_in_transcriptome = 0, tx_in_other_loci = 0;
     std::string transcriptome_names, other_loci;
+    // the other loci of the run it was built in (their graphs and transcripts), hashed; 0 without any. Part of
+    // the key with transcripts: their k-mers decide the labels of its transcript-only ones.
+    std::uint64_t companions = 0;
 
     std::int64_t find(std::uint64_t canonical) const;
     std::string key() const;                     // what must match for a saved index to be reused
@@ -133,13 +136,19 @@ struct BuildOptions {
     std::vector<std::string> transcripts;
     bool transcripts_ok_only = false;            // take status=ok transcripts only
     bool transcripts_splice_changed = false;     // take those with a changed splice site too
+    // the run's other loci that are not built now, as their saved indexes are current: what identifies each
+    // (locus_token) and its index, read for the transcript-only k-mers of the loci built
+    std::vector<std::string> beside_tokens, beside_indexes;
     std::size_t threads = 2;
     std::function<void(const std::string&)> log;
 };
 
+// What identifies a locus of a run to the others: its graph's checksum and its transcripts' (empty: none).
+std::string locus_token(const std::string& gfa, const std::string& transcripts);
 // The key a locus index built with these options would carry (to test a saved one before building), for
-// a locus graph with its transcripts FASTA (empty: none).
-std::string expected_key(const BuildOptions& o, const std::string& gfa, const std::string& transcripts = "");
+// a locus graph with its transcripts FASTA (empty: none) and the tokens of the run's other loci.
+std::string expected_key(const BuildOptions& o, const std::string& gfa, const std::string& transcripts = "",
+                         const std::vector<std::string>& others = {});
 std::vector<LocusIndex> build(const BuildOptions& options);
 
 void save(const LocusIndex& index, const std::string& path);

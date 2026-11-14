@@ -293,18 +293,36 @@ int run_recruit_command(const std::vector<std::string>& args) {
     todo.loci.clear();
     todo.transcripts.clear();
     std::vector<std::string> wrote;
+    // An index with transcripts labels its transcript-only k-mers against the other loci of its run, so its key
+    // holds them: one built beside other loci than those given now is rebuilt. The loci whose indexes stay
+    // current are handed to the build, which reads them for the loci it builds.
+    std::vector<std::string> tokens;
+    if (std::any_of(o.transcripts.begin(), o.transcripts.end(), [](const std::string& t) { return !t.empty(); }))
+        for (std::size_t li = 0; li < o.loci.size(); ++li) tokens.push_back(recruit::locus_token(o.loci[li], o.transcripts[li]));
+    const auto without_loci = [](const std::string& key) {
+        const auto at = key.rfind("|y");
+        return at == std::string::npos ? key : key.substr(0, at);
+    };
     for (std::size_t li = 0; li < o.loci.size(); ++li) {
         const std::string& l = o.loci[li];
         const std::string plx = index_path(l, ".plx");
         if (fs::exists(plx)) {
             try {
                 const recruit::LocusIndex old = recruit::load(plx);
-                if (old.key() == recruit::expected_key(o, l, o.transcripts[li])) { log.info("index: " + plx + "; current, reused"); continue; }
+                std::vector<std::string> others;
+                for (std::size_t lj = 0; lj < tokens.size(); ++lj) if (lj != li) others.push_back(tokens[lj]);
+                const std::string expected = recruit::expected_key(o, l, o.transcripts[li], others);
+                if (old.key() == expected) {
+                    log.info("index: " + plx + "; current, reused");
+                    if (!tokens.empty()) { todo.beside_tokens.push_back(tokens[li]); todo.beside_indexes.push_back(plx); }
+                    continue;
+                }
                 // transcripts given once and not now (or the reverse) change what RNA reads can show: said apart
                 const bool had = !old.transcripts_checksum.empty(), has = !o.transcripts[li].empty();
                 log.info("index: " + plx + "; " +
                          (had && !has ? "built with transcripts, none given now: rebuilding without them (reads across splice junctions lose that evidence; give --transcripts to keep it)"
                           : !had && has ? "built without transcripts, given now: rebuilding with them"
+                          : without_loci(old.key()) == without_loci(expected) ? "built beside other loci than those given now: rebuilding (its junction k-mers are labelled against them)"
                           : "built from another graph, background or settings: rebuilding"));
             } catch (const std::exception& e) {
                 log.info("index: " + plx + "; " + e.what() + ": rebuilding");

@@ -10,6 +10,7 @@ writes
   gp.fa                a genome with a processed pseudogene (the spliced transcript and a poly-A tail)
   gn.fa                an unrelated genome
   locus.gfa, genes.gtf the locus (the reference's and ga's copies, one node each) and its gene GJ
+  locus_p.gfa          a locus elsewhere, one of whose two haplotypes carries the processed pseudogene
   locus_b.gfa, genes_b.gtf  the paralog's locus over several nodes, ga's walk written reversed and carrying a
                        SNP four bases into the fourth exon; its gene GP, on the minus strand
   tx_own.fa            a transcriptome holding the gene's transcript and unrelated ones
@@ -107,6 +108,13 @@ with open(os.path.join(out, "genes.gtf"), "w") as f:
     f.write(f"chr1\ttest\tgene\t{at + 1}\t{at + len(gene)}\t.\t+\t.\t{attr}\n")
     for a, b in gene_exons:
         f.write(f"chr1\ttest\texon\t{at + a + 1}\t{at + b}\t.\t+\t.\t{attr}\n")
+
+# a locus elsewhere whose second haplotype holds the processed pseudogene, between two shared nodes
+ps, pm, pe = 60000, 70000, 80000
+with open(os.path.join(out, "locus_p.gfa"), "w") as f:
+    f.write(f"H\tVN:Z:1.0\nS\t1\t{ref[ps:pm]}\nS\t2\t{ref[pm:pe]}\nS\t3\t{tx + 'A' * 30}\n")
+    f.write("L\t1\t+\t2\t+\t0M\nL\t1\t+\t3\t+\t0M\nL\t3\t+\t2\t+\t0M\n")
+    f.write(f"P\tref#1#chr1:{ps}-{pe}\t1+,2+\t*\nP\tgq#1#chr1:{ps}-{pe}\t1+,3+,2+\t*\n")
 
 # the paralog's locus: nodes cut inside exons and introns, a SNP of ga four bases into the fourth exon (so
 # the junction k-mers over it are ga's own), ga's walk written from its end

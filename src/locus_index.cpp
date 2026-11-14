@@ -38,7 +38,7 @@ namespace fs = std::filesystem;
 
 constexpr std::size_t kK = 31, kS = 11;
 constexpr std::uint64_t kMagic = 0x3130305850585650ULL;   // "PVPXP001"
-constexpr std::uint64_t kVersion = 13;   // 2: decoy windows stop at the locus; 3: clusters split at it; 4: S per haplotype; 5: calibration; 6: its decoy pairs cross window edges; 7: locus pieces off the located copies; 8: and past estimated ends; 9: and everywhere for a locus with array pieces outside; 10: stretches reach contig ends; 11: pieces tied to the locus, short contigs whole, no decoys in pieces; 12: transcript k-mers; 13: those counted in the transcriptome and the run's other loci
+constexpr std::uint64_t kVersion = 14;   // 2: decoy windows stop at the locus; 3: clusters split at it; 4: S per haplotype; 5: calibration; 6: its decoy pairs cross window edges; 7: locus pieces off the located copies; 8: and past estimated ends; 9: and everywhere for a locus with array pieces outside; 10: stretches reach contig ends; 11: pieces tied to the locus, short contigs whole, no decoys in pieces; 12: transcript k-mers; 13: those counted in the transcriptome and the run's other loci; 14: those loci in the key
 const std::size_t kLengths[] = {100, 150, 250, 1000, 10000};
 constexpr std::size_t kWindowStep = 25;
 // A stretch of a genome is a piece of the locus when, over every window of this many bases in it, this
@@ -532,10 +532,27 @@ std::string LocusIndex::key() const {
     for (const auto& g : decoy_genomes) d += g + ",";
     return "v" + std::to_string(kVersion) + "|" + graph_checksum + "|" + reference_path + "|" + store_id + "|" + std::to_string(content) + "|" +
            coordinate_reference + "|" + std::to_string(informative_max) + "|" + std::to_string(pad) + "|" + std::to_string(dust) + "|" + std::to_string(decoy_min_hits) + "|" + d + (calibrated ? "|c1" : "|c0") +
-           (transcripts_checksum.empty() ? "" : "|t" + transcripts_checksum + (transcripts_ok_only ? "o" : transcripts_splice_changed ? "s" : "a") + "|x" + hex64(transcriptome));
+           (transcripts_checksum.empty() ? "" : "|t" + transcripts_checksum + (transcripts_ok_only ? "o" : transcripts_splice_changed ? "s" : "a") + "|x" + hex64(transcriptome) + "|y" + hex64(companions));
 }
 
-std::string expected_key(const BuildOptions& o, const std::string& gfa, const std::string& transcripts) {
+std::string locus_token(const std::string& gfa, const std::string& transcripts) {
+    return file_checksum(gfa) + "+" + (transcripts.empty() ? std::string("-") : transcripts_checksum_of(transcripts));
+}
+
+// The other loci of a run as one number, whatever their order; 0 without any.
+std::uint64_t companions_id(std::vector<std::string> tokens) {
+    if (tokens.empty()) return 0;
+    std::sort(tokens.begin(), tokens.end());
+    std::uint64_t h = 0x2545f4914f6cdd1dULL;
+    for (const auto& t : tokens) {
+        for (const char c : t) h = kmer::mix64(h ^ static_cast<unsigned char>(c));
+        h = kmer::mix64(h ^ 0xff);
+    }
+    return h == 0 ? 1 : h;
+}
+
+std::string expected_key(const BuildOptions& o, const std::string& gfa, const std::string& transcripts,
+                         const std::vector<std::string>& others) {
     const bg::Manifest m = bg::read_manifest(o.background);
     LocusIndex k;
     k.graph_checksum = file_checksum(gfa);
@@ -544,6 +561,7 @@ std::string expected_key(const BuildOptions& o, const std::string& gfa, const st
         k.transcripts_ok_only = o.transcripts_ok_only;
         k.transcripts_splice_changed = o.transcripts_splice_changed;
         k.transcriptome = bg::transcriptome_id(m);
+        k.companions = companions_id(others);
     }
     const Graph g = parse_gfa(gfa, ParseGfaOptions{true, false});
     std::vector<std::string> names;
@@ -1053,12 +1071,24 @@ std::vector<LocusIndex> build(const BuildOptions& o) {
 
     // transcript-only k-mers elsewhere: in the background's transcriptomes, less the records of the locus's
     // own genes (so a paralog's junction stays counted), and in the other loci of this run (their haplotypes
-    // and transcripts: a paralog's alleles the reference transcriptome lacks). Loci overlapping on the
-    // reference are one place, not each other's elsewhere.
+    // and transcripts: a paralog's alleles the reference transcriptome lacks), those built now and those
+    // whose saved index is current. Loci overlapping on the reference are one place, not each other's
+    // elsewhere.
     {
         std::vector<std::size_t> with;
         for (std::size_t li = 0; li < work.size(); ++li)
             if (!work[li].idx.transcript_only.empty()) with.push_back(li);
+        std::vector<LocusIndex> beside;
+        if (!with.empty())
+            for (const auto& plx : o.beside_indexes) beside.push_back(load(plx));
+        for (const std::size_t li : with) {   // the run's other loci, in the key
+            std::vector<std::string> others = o.beside_tokens;
+            for (std::size_t lj = 0; lj < work.size(); ++lj) {
+                const LocusIndex& y = work[lj].idx;
+                if (lj != li) others.push_back(y.graph_checksum + "+" + (y.transcripts_checksum.empty() ? std::string("-") : y.transcripts_checksum));
+            }
+            work[li].idx.companions = companions_id(std::move(others));
+        }
         for (const std::size_t li : with) {
             LocusWork& w = work[li];
             w.tx_count.assign(w.idx.codes.size(), 0);
@@ -1109,14 +1139,16 @@ std::vector<LocusIndex> build(const BuildOptions& o) {
         for (const std::size_t li : with) {
             LocusWork& w = work[li];
             LocusIndex& x = w.idx;
-            for (std::size_t lj = 0; lj < work.size(); ++lj) {
-                const LocusIndex& y = work[lj].idx;
-                if (lj == li || (x.contig == y.contig && x.start < y.end && y.start < x.end)) continue;
+            const auto count_in = [&](const LocusIndex& y) {
+                if (x.contig == y.contig && x.start < y.end && y.start < x.end) return;
                 std::uint64_t hits = 0;
                 for (std::size_t i = 0; i < x.codes.size(); ++i)
                     if (x.transcript_only[i] && y.find(x.codes[i]) >= 0) { ++w.cross[i]; ++hits; }
                 if (hits > 0) x.other_loci += (x.other_loci.empty() ? "" : ",") + y.name;
-            }
+            };
+            for (std::size_t lj = 0; lj < work.size(); ++lj)
+                if (lj != li) count_in(work[lj].idx);
+            for (const LocusIndex& y : beside) count_in(y);
             for (std::size_t i = 0; i < x.codes.size(); ++i) {
                 if (!x.transcript_only[i]) continue;
                 x.tx_in_transcriptome += w.tx_count[i] > w.tx_sub[i];
@@ -1415,6 +1447,7 @@ void save(const LocusIndex& x, const std::string& path) {
             o.u64(x.transcriptome); o.u64(x.transcriptome_records); o.u64(x.tx_in_transcriptome); o.u64(x.tx_in_other_loci);
             o.str(x.transcriptome_names); o.str(x.other_loci);
             o.u64(x.transcripts_splice_changed); o.str(x.transcripts_by_status);
+            o.u64(x.companions);
         }
         o.f.seekp(0);
         o.u64(kMagic);
@@ -1472,6 +1505,7 @@ LocusIndex load(const std::string& path) {
         x.transcriptome = i.u64(); x.transcriptome_records = i.u64(); x.tx_in_transcriptome = i.u64(); x.tx_in_other_loci = i.u64();
         x.transcriptome_names = i.str(); x.other_loci = i.str();
         x.transcripts_splice_changed = i.u64() != 0; x.transcripts_by_status = i.str();
+        x.companions = i.u64();
     }
     const std::size_t n = x.codes.size();
     if (x.cls.size() != n || x.outside.size() != n || x.mult.size() != n || x.backbone.size() != n || x.nodeset.size() != n ||

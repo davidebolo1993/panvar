@@ -23,7 +23,7 @@ The index, built once per locus graph and kept beside it (`<locus>.plx`, with a 
 3. Each k-mer is labelled by what is left, its count outside the locus: private (none), shared (up to `--informative-max` per background haplotype, on average) or repeat (more). A transcript-only k-mer exists in no genome, so the genomes show it only in a processed pseudogene, and a paralog's transcript with the same junction must be looked for among transcripts. Its count outside is the sum of:
    - its count in the genomes, with nothing subtracted (a processed pseudogene's junctions);
    - its count in the background's transcriptome (`background --transcriptome`), less its occurrences in the records of the locus's own genes: the genes its transcripts are of, found in the transcriptome's headers by gene id, or by symbol where a header has no id. Only those are subtracted, so a paralog's junction stays counted;
-   - one for each other locus indexed in the same run that holds it, in its haplotypes or its transcripts: a paralog's alleles the reference transcriptome lacks. Loci that overlap on the reference are one place and do not count against each other.
+   - one for each other locus graph of the same run that holds it, in its haplotypes or its transcripts: a paralog's alleles the reference transcriptome lacks. Loci that overlap on the reference are one place and do not count against each other. Indexes given as `.plx` are not counted.
 
    Genomic k-mers are labelled from the genomes alone, whatever transcriptome the store holds. Private k-mers of low complexity, or that become shared when the located copies are trimmed at their uncertain ends (unless those ends lie in such a stretch), are labelled shared.
 4. Decoys: in the decoy genomes (`--decoy-genomes`), clusters of shared k-mer hits (of the haplotypes' k-mers) outside the locus's own copy (20 hits, each within 1,500 bp of the next) are homologous windows; their k-mers that are not in the locus and are shared in the background become decoy k-mers, the alleles of the homologs.
@@ -53,7 +53,7 @@ Reads, per sample:
 | flag | what it does | default |
 |------|--------------|---------|
 | `--index-only` | build or check the indexes, read nothing | off |
-| `--save-index <dir>` | where indexes are kept and reused. A saved index is rebuilt when its graph, background, settings or transcripts differ from those given; the log says when one built with transcripts is rebuilt without them, or the reverse, as that changes what RNA reads can show | beside each graph |
+| `--save-index <dir>` | where indexes are kept and reused. A saved index is rebuilt when its graph, background, settings or transcripts differ from those given; the log says when one built with transcripts is rebuilt without them, or the reverse, as that changes what RNA reads can show. An index with transcripts is also tied to the other locus graphs of its run and their transcripts, as its junction k-mers are labelled against them: given beside other loci, or alone, it is rebuilt, and the loci whose indexes stay current are read from those. To use an index as it was built, give its `.plx` | beside each graph |
 | `--coordinate-reference <name>` | the background's coordinate reference the graph's coordinates refer to | its only one |
 | `--informative-max <N>` | copies per background haplotype outside the locus up to which a k-mer is shared, not repeat | `8` |
 | `--decoy-genomes <A,B>` | genomes whose homologous windows give decoys | the coordinate reference |
@@ -118,7 +118,6 @@ Table columns:
 - Short pairs across a locus edge are less often certain than inside it: the located copies' ends are uncertain, so the k-mers near them are labelled shared.
 - Long spliced transcripts cross many junctions and read as divergent unless the index holds the locus's transcripts; isoforms the transcripts lack still do.
 - A junction k-mer is checked against other transcripts only through the background's transcriptome and the other loci of the run. A paralog's allele that neither holds (a haplotype-specific junction sequence of a gene outside the loci indexed together) leaves it private.
-- An index does not record which other loci it was built beside: an index built alone is reused when its locus is later given with others. Rebuild the family's indexes together (remove them, or use another `--save-index`).
 - The calibration simulates DNA reads only: no read class covers junction k-mers yet.
 - A locus missing from a background genome cannot be subtracted there; its k-mers keep that genome's counts, unless the scan for pieces finds it.
 - Genomes given to the background as graphs are not scanned for pieces.
