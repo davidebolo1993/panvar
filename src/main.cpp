@@ -16,6 +16,7 @@
 #include "panvar/panphorte_command.hpp"
 #include "panvar/rebuild_command.hpp"
 #include "panvar/refine_command.hpp"
+#include "panvar/transcripts_command.hpp"
 
 int main(int argc, char** argv) {
     try {
@@ -73,6 +74,9 @@ int main(int argc, char** argv) {
         }
         if (subcommand == "recruit") {
             return panvar::run_recruit_command(args);
+        }
+        if (subcommand == "transcripts") {
+            return panvar::run_transcripts_command(args);
         }
 
         throw std::runtime_error("unknown command: " + subcommand + " (run 'panvar --help' for the list)");

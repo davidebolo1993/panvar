@@ -244,6 +244,7 @@ add_library(panvarlib
     src/bubbles.cpp
     src/ref_path.cpp
     src/gtf.cpp
+    src/transcripts.cpp
     src/gene_cn_kmer.cpp
     src/minimap2_align.cpp
     src/variant_call.cpp
@@ -312,6 +313,7 @@ add_executable(panvar
     src/associate_command.cpp
     src/background_command.cpp
     src/recruit_command.cpp
+    src/transcripts_command.cpp
 )
 target_include_directories(panvar PRIVATE ${EIGEN_DIR})
 target_compile_definitions(panvar PRIVATE PANVAR_VERSION="${PROJECT_VERSION}")

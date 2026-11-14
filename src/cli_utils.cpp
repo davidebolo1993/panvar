@@ -184,6 +184,8 @@ void print_general_help() {
         << "Read recruitment:\n"
         << "  background Count every k-mer of a set of genomes once, with anchors on a reference\n"
         << "  recruit    Recruit a sample's reads to locus graphs without aligning\n\n"
+        << "Transcripts:\n"
+        << "  transcripts Project a reference annotation onto every haplotype\n\n"
         << "Checks:\n"
         << "  inspect    Show every haplotype's allele and walk at each site\n"
         << "  benchmark  Rebuild each haplotype from call's output and list what is left\n\n"
