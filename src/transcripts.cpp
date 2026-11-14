@@ -1093,19 +1093,24 @@ std::size_t matched_bases(const Pass& p, const Walk& H, std::size_t lo, std::siz
     return n;
 }
 
-// Pass x lies inside y, a longer pass of a gene apart on the reference, and y's alignment matches that
-// stretch of the walk at least as well as x's does: the stretch is the part of y's copy that resembles x's gene
-// (a pseudogene fragment, or a gene nested in the other copy of a duplicated gene), not a copy of x.
-bool nested_in(const Pass& x, const Pass& y, const std::vector<Gene>& genes, const Walk& H) {
+// Pass x, over the stretch [x_lo, x_hi) of the walk, lies inside y, a longer pass of a gene apart on the
+// reference, and y's alignment matches that stretch at least as well as x's does: the stretch is the part of
+// y's copy that resembles x's gene (a pseudogene fragment, or a gene nested in the other copy of a duplicated
+// gene), not a copy of x.
+bool nested_in(const Pass& x, std::size_t x_lo, std::size_t x_hi, const Pass& y, const std::vector<Gene>& genes, const Walk& H) {
     if (x.gene == y.gene || !apart_on_reference(genes[x.gene], genes[y.gene])) return false;
-    const double ov = static_cast<double>(overlap(x.h_lo, x.h_hi, y.h_lo, y.h_hi));
-    if (!(ov > kParalogOverlap * static_cast<double>(x.h_hi - x.h_lo) &&
+    const double ov = static_cast<double>(overlap(x_lo, x_hi, y.h_lo, y.h_hi));
+    if (!(ov > kParalogOverlap * static_cast<double>(x_hi - x_lo) &&
           ov <= kParalogOverlap * static_cast<double>(y.h_hi - y.h_lo)))
         return false;
     // Compared where y's alignment reaches, as y aligns only its own gene's stretch of the reference.
-    const std::size_t lo = std::max(x.h_lo, H.pref[y.walk_steps.front()]);
-    const std::size_t hi = std::min(x.h_hi, H.pref[y.walk_steps.back() + 1]);
+    const std::size_t lo = std::max(x_lo, H.pref[y.walk_steps.front()]);
+    const std::size_t hi = std::min(x_hi, H.pref[y.walk_steps.back() + 1]);
     return matched_bases(y, H, lo, hi) >= matched_bases(x, H, lo, hi);
+}
+
+bool nested_in(const Pass& x, const Pass& y, const std::vector<Gene>& genes, const Walk& H) {
+    return nested_in(x, x.h_lo, x.h_hi, y, genes, H);
 }
 
 // Passes accepted best first, by the share of marker exons they walk, each against the ones accepted
@@ -1392,10 +1397,12 @@ TranscriptsResult project_transcripts(const Graph& graph, const TranscriptsOptio
                     return static_cast<double>(ov) > kParalogOverlap * static_cast<double>(std::max(sc.h_hi - sc.h_lo, hi - lo));
                 };
                 // taken by an accepted pass over the same stretch, or inside one that matches the stretch as well
-                // as the chain the placement comes from: part of that gene's copy, as for a pass
+                // as the chain the placement comes from: part of that gene's copy, as for a pass. The stretch is
+                // the placement's: the chain may hold no node of the marker's span, and then has none.
                 bool taken = false;
                 for (const std::size_t a : kept)
-                    taken = taken || takes(passes[a].gene, passes[a].h_lo, passes[a].h_hi) || nested_in(weak[gi], passes[a], genes, H);
+                    taken = taken || takes(passes[a].gene, passes[a].h_lo, passes[a].h_hi) ||
+                            nested_in(weak[gi], sc.h_lo, sc.h_hi, passes[a], genes, H);
                 for (std::size_t other = 0; other < genes.size(); ++other)
                     taken = taken || (placed[other].ok && takes(other, placed[other].h_lo, placed[other].h_hi));
                 if (!taken) placed[gi] = sc;

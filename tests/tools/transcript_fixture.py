@@ -117,6 +117,9 @@ CASES = {
     # a short gene on the nodes of a stretch inside a longer gene, and a haplotype without the short gene
     # whose copy of the longer one carries an allele there (write_nested)
     "nested": dict(),
+    # the same with the short gene's exon on the middle node alone: its chain on that haplotype holds only the
+    # nodes beside the exon
+    "nested_flank": dict(),
     # the main case with haplotypes' own annotations (write_annotated)
     "annotated": dict(),
 }
@@ -488,11 +491,11 @@ def write_annotated(d):
             out.write(f"{t}\t{g}\t{name(h, L)}\t{c}\t{st}\t{det}\t{sq}\tannotated\t{rec}\n")
 
 
-def write_nested(d):
+def write_nested(d, flank=False):
     """Gene GL: exons L1 and L2 around an intron U (three nodes). Gene GS, further on: one exon, the same three
-    nodes walked again. A haplotype without GS, whose copy of GL has an allele of U's middle node, 96%
-    identical: the chain of GS's nodes there lies inside GL's copy, which matches the stretch as well, so the
-    haplotype has no copy of GS. The same haplotype reversed."""
+    nodes walked again, or with `flank` the middle one alone. A haplotype without GS, whose copy of GL has an
+    allele of U's middle node, 96% identical: the chain of GS's nodes there lies inside GL's copy, which
+    matches the stretch as well, so the haplotype has no copy of GS. The same haplotype reversed."""
     rnd = random.Random(13)
     seq = lambda n: "".join(rnd.choice("ACGT") for _ in range(n))
     size = dict(A=1000, L1=400, Ua=40, Ub=220, Uc=40, L2=400, C=1500, D=1000, T=500)
@@ -508,7 +511,7 @@ def write_nested(d):
     for k, n in enumerate(walk["ref"]):
         at[k] = pos
         pos += size[n]
-    exons = {"GL": [(at[1], at[1] + 400), (at[5], at[5] + 400)], "GS": [(at[7], at[7] + 300)]}
+    exons = {"GL": [(at[1], at[1] + 400), (at[5], at[5] + 400)], "GS": [(at[8], at[8] + 220)] if flank else [(at[7], at[7] + 300)]}
     with open(f"{d}/locus.gfa", "w") as out:
         out.write("H\tVN:Z:1.0\n")
         for n, s in nodes.items():
@@ -524,7 +527,7 @@ def write_nested(d):
             out.write(f"chr1\ttest\ttranscript\t{ex[0][0] + OFFSET + 1}\t{ex[-1][1] + OFFSET}\t.\t+\t.\t{attr}\n")
             for a, b in ex:
                 out.write(f"chr1\ttest\texon\t{a + OFFSET + 1}\t{b + OFFSET}\t.\t+\t.\t{attr}\n")
-    gl, gs = nodes["L1"] + nodes["L2"], nodes["Ua"] + nodes["Ub"] + nodes["Uc"]
+    gl, gs = nodes["L1"] + nodes["L2"], nodes["Ub"] if flank else nodes["Ua"] + nodes["Ub"] + nodes["Uc"]
     with open(f"{d}/expected.tsv", "w") as out:
         out.write("transcript_id\tgene_name\thaplotype\tcopy\tstatus\tdetail\tsequence\n")
         out.write(f"TGL\tGL\t{name('ref', L)}\t1\tok\t.\t{gl}\nTGS\tGS\t{name('ref', L)}\t1\tok\t.\t{gs}\n")
@@ -536,8 +539,8 @@ def write(case_name, d):
     case = CASES[case_name]
     if case_name.startswith("tandem"):
         return write_tandem(case, d)
-    if case_name == "nested":
-        return write_nested(d)
+    if case_name.startswith("nested"):
+        return write_nested(d, case_name == "nested_flank")
     if case_name == "annotated":
         return write_annotated(d)
     ref, nodes, walks, seqs, maps = build(case)
