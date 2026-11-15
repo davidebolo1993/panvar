@@ -59,8 +59,11 @@ void print_call_help() {
         << "                                    (default 0.90)\n"
         << "      --diploid                     One VCF column per sample (paths SAMPLE#HAP#...), not per path\n"
         << "      --no-per-bubble-vcf           Only the region VCF, not one per site\n"
-        << "      --max-seq-bp <N>              Leave INSSEQ, DELSEQ, INVSEQ and each CN_FORMS sequence out above\n"
-        << "                                    N bases, so VCF tools read the lines (default 20000; 0 = no limit)\n"
+        << "      --max-seq-bp <N>              Write INSSEQ, DELSEQ, INVSEQ and each CN_FORMS sequence over N bases\n"
+        << "                                    to <prefix>.alt_seqs.fa instead of the line, so VCF tools read the\n"
+        << "                                    lines (default 20000; 0 = all in the line)\n"
+        << "      --max-fa-seq-bp <N>           Leave sequences over N bases out of <prefix>.alt_seqs.fa too\n"
+        << "                                    (default 0 = none left out)\n"
         << "      --no-variant-nodes            Do not write <prefix>.variant_nodes.tsv (the nodes describe\n"
         << "                                    reads) nor <prefix>.carrier_events.tsv\n"
         << "  -t, --threads <N>                 Worker threads (default 0 = all cores)\n"
@@ -127,6 +130,10 @@ int run_call_command(const std::vector<std::string>& args) {
         }
         if (arg == "--max-seq-bp") {
             options.max_seq_bp = cli::parse_size_arg(arg, require_value(arg));
+            continue;
+        }
+        if (arg == "--max-fa-seq-bp") {
+            options.max_fa_seq_bp = cli::parse_size_arg(arg, require_value(arg));
             continue;
         }
         if (arg == "--merge-distance-bp") {

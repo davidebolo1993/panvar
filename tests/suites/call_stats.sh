@@ -106,10 +106,23 @@ check "the IMPRECISE header gives its three causes (cluster, N run, PATH_INVERSI
 # (SVLEN_RANGE).
 check "no redundant fields in the header" \
   "$(grep -cE '^##INFO=<ID=(START_NODE|END_NODE|NMERGED|CN_SCOPE|REF_CN_SOURCE|CN_REF_FOLD|CN_SHARED_BP|MERGE_SIZE_RATIO),' "$VCF")" "0"
-# The header states the --max-seq-bp the sequences were written with: 60 leaves out the 70 bp DELSEQ.
-"$BIN" call -i "$OUT/cb.sorted.gfa" -c "$OUT/cb.bubbles.csv" -r "$REF_NAME" -o "$OUT/cmax" --max-seq-bp 60 -q >/dev/null 2>&1
-check "--max-seq-bp 60: the header's limit and the DEL's DELSEQ" \
-  "$(grep -c '^##INFO=<ID=DELSEQ.*left out above 60 bp' "$OUT/cmax.region.vcf"):$(awk -F'\t' '!/^#/ && /SVTYPE=DEL;/ && /DELSEQ=/' "$OUT/cmax.region.vcf" | wc -l | tr -d ' ')" "1:0"
+# Sequences over --max-seq-bp leave the line for <prefix>.alt_seqs.fa, which SEQ_FA names: at 50 the 70 bp DELSEQ,
+# the 80 bp INVSEQ and the 60 bp INSSEQ go there, each as its record's <ID>.<entry> with the same bases.
+"$BIN" call -i "$OUT/cb.sorted.gfa" -c "$OUT/cb.bubbles.csv" -r "$REF_NAME" -o "$OUT/cmax" --max-seq-bp 50 -q >/dev/null 2>&1
+check "--max-seq-bp 50: the header's limit, no sequence in a line, SEQ_FA on each record" \
+  "$(grep -c '^##INFO=<ID=DELSEQ.*above 50 bp (--max-seq-bp) in the side FASTA' "$OUT/cmax.region.vcf"):$(grep -v '^#' "$OUT/cmax.region.vcf" | grep -cE 'INSSEQ=|DELSEQ=|INVSEQ='):$(grep -v '^#' "$OUT/cmax.region.vcf" | grep -oE 'SEQ_FA=[A-Z]+' | sort | paste -sd, -)" \
+  "1:0:SEQ_FA=DELSEQ,SEQ_FA=INSSEQ,SEQ_FA=INVSEQ"
+fa_seq() { awk -v n=">$2" '/^>/{p=($0==n); next} p{printf "%s", $0}' "$1"; }
+rid() { awk -F'\t' -v t="$2" '!/^#/ && $8 ~ ";SVTYPE="t";" {print $3}' "$1"; }
+check "the side FASTA holds each record's bases (DEL, INS, INV)" \
+  "$([ "$(fa_seq "$OUT/cmax.alt_seqs.fa" "$(rid "$OUT/cmax.region.vcf" DEL).DELSEQ")" = "$N2" ] && echo del):$([ "$(fa_seq "$OUT/cmax.alt_seqs.fa" "$(rid "$OUT/cmax.region.vcf" INS).INSSEQ")" = "$NI" ] && echo ins):$([ "$(fa_seq "$OUT/cmax.alt_seqs.fa" "$(rid "$OUT/cmax.region.vcf" INV).INVSEQ")" = "$N5" ] && echo inv)" "del:ins:inv"
+# --max-fa-seq-bp caps the side FASTA: over it a sequence is written nowhere, and no FASTA is left at the prefix.
+"$BIN" call -i "$OUT/cb.sorted.gfa" -c "$OUT/cb.bubbles.csv" -r "$REF_NAME" -o "$OUT/cmax" --max-seq-bp 50 --max-fa-seq-bp 65 -q >/dev/null 2>&1
+check "--max-fa-seq-bp 65: only the 60 bp INSSEQ in the side FASTA" \
+  "$(grep -v '^#' "$OUT/cmax.region.vcf" | grep -oE 'SEQ_FA=[A-Z]+' | paste -sd, -):$(grep -c '^>' "$OUT/cmax.alt_seqs.fa")" "SEQ_FA=INSSEQ:1"
+"$BIN" call -i "$OUT/cb.sorted.gfa" -c "$OUT/cb.bubbles.csv" -r "$REF_NAME" -o "$OUT/cmax" --max-seq-bp 50 --max-fa-seq-bp 55 -q >/dev/null 2>&1
+check "--max-fa-seq-bp 55: nothing in the side FASTA, none left from the run before (SEQ_FA records:file)" \
+  "$(grep -v '^#' "$OUT/cmax.region.vcf" | grep -c 'SEQ_FA='):$([ -e "$OUT/cmax.alt_seqs.fa" ] && echo left || echo none)" "0:none"
 
 # The interval in the reference's name: pggb, odgi and impg write a 0-based start with a half-open end
 # (end - start = the path's length), panvar's own W-line names are 1-based inclusive (end - start + 1).
@@ -1121,8 +1134,8 @@ cn_call "$OUT/sep0/g.gfa" "$OUT/sep0"
 check "copies, no reference copy: the gained copies are spelled (CN_FORMS without '*')" \
   "$(awk -F'\t' '!/^#/ && /SVTYPE=CNV;/{print (($8 ~ /CN_FORMS=[^;]*[ACGT]/ && $8 !~ /CN_FORMS=[^;]*\*/) ? "spelled" : "not")}' "$OUT/sep0.region.vcf")" "spelled"
 "$BIN" call -i "$OUT/sep0.b.sorted.gfa" --bubble-prefix "$OUT/sep0.b" -r ref -o "$OUT/sep0_short" --cn --max-seq-bp 100 --quiet >/dev/null 2>&1
-check "copies, --max-seq-bp under a copy: the form is written without its sequence ('*')" \
-  "$(awk -F'\t' '!/^#/ && /SVTYPE=CNV;/{print (($8 !~ /CN_FORMS=/) ? "none" : ($8 ~ /CN_FORMS=[^;]*\*/) ? "unspelled" : "spelled")}' "$OUT/sep0_short.region.vcf")" "unspelled"
+check "copies, --max-seq-bp under a copy: the form is written '*', its sequence in the side FASTA (SEQ_FA)" \
+  "$(awk -F'\t' '!/^#/ && /SVTYPE=CNV;/{print (($8 !~ /CN_FORMS=/) ? "none" : ($8 ~ /CN_FORMS=[^;]*\*/) ? "unspelled" : "spelled")}' "$OUT/sep0_short.region.vcf"):$(grep -v '^#' "$OUT/sep0_short.region.vcf" | grep -oE 'SEQ_FA=[^;[:space:]]*'):$(grep -c '^>bubble.*\.CN_FORMS\.[12]$' "$OUT/sep0_short.alt_seqs.fa")" "unspelled:SEQ_FA=CN_FORMS.1,CN_FORMS.2:2"
 
 # ---------------------------------------------------------------- inverted duplications
 # A fold-back walk (A+ A-) adds a reverse-complemented copy. The UNIT route counts it as CN 2 exactly

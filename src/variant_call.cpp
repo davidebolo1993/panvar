@@ -2150,9 +2150,11 @@ void call_variants(
     cli::ensure_parent_dir_for_file(options.out_prefix + ".region.vcf");
 
     auto write_vcf_header = [&](std::ostream& out) {
-        // the --max-seq-bp this run wrote the sequences with
+        // where this run wrote the sequences: the line up to --max-seq-bp, then the side FASTA up to --max-fa-seq-bp
+        const std::string fa_limit = options.max_fa_seq_bp == 0 ? std::string()
+                                   : ", left out above " + std::to_string(options.max_fa_seq_bp) + " bp (--max-fa-seq-bp)";
         const std::string seq_limit = options.max_seq_bp == 0 ? std::string()
-                                    : "; left out above " + std::to_string(options.max_seq_bp) + " bp (--max-seq-bp)";
+                                    : "; above " + std::to_string(options.max_seq_bp) + " bp (--max-seq-bp) in the side FASTA (SEQ_FA)" + fa_limit;
         out << "##fileformat=VCFv4.2\n";
         out << "##source=panvar call\n";
         out << "##reference=" << ref_name << "\n";
@@ -2171,7 +2173,7 @@ void call_variants(
         out << "##INFO=<ID=RU_LEN,Number=1,Type=Integer,Description=\"Repeat-unit length in bp, one represented copy. Emitted only for CN_METHOD=UNIT; (CN-REF_CN)*RU_LEN is the repeat-copy component of the haplotype size, while FORMAT/CNBP is the full module-walk change and CNRESID is their difference\">\n";
         out << "##INFO=<ID=CN_UNIT_BP,Number=1,Type=Integer,Description=\"CN_METHOD=MODULE only: one copy of the module, the reference's bp over its nodes divided by REF_CN; with REF_CN=0, the median over the haplotypes holding copies of their bp per copy. Copies of different types differ, so a carrier's own change is FORMAT:CNBP\">\n";
         out << "##INFO=<ID=CN_METHOD,Number=1,Type=String,Description=\"How CN was measured: UNIT (copies of a panphorte unit graph, counted exactly where they pass its anchor; a one-node unit graph's are its traversals) or MODULE (--cn: passes through the anchor of a collapsed module, the module nodes the most paths revisit)\">\n";
-        out << "##INFO=<ID=CN_FORMS,Number=.,Type=String,Description=\"CN_METHOD=MODULE: the copies carriers gained or lost, each an edit of the reference, START-END:SEQ (reference bases START..END, 1-based, replaced by SEQ in reference orientation; END=START-1 for an insertion, SEQ empty for a deletion, * where its literal bases are over --max-seq-bp). SEQ may name the reference stretches it repeats, @A-B (bases A..B) or ~A-B (their reverse complement), joined with literal bases by +. FORMAT/CNFORM names each carrier's; with its other records they rebuild its walk\">\n";
+        out << "##INFO=<ID=CN_FORMS,Number=.,Type=String,Description=\"CN_METHOD=MODULE: the copies carriers gained or lost, each an edit of the reference, START-END:SEQ (reference bases START..END, 1-based, replaced by SEQ in reference orientation; END=START-1 for an insertion, SEQ empty for a deletion, * where its literal bases are over --max-seq-bp: SEQ is then in the side FASTA, see SEQ_FA). SEQ may name the reference stretches it repeats, @A-B (bases A..B) or ~A-B (their reverse complement), joined with literal bases by +. FORMAT/CNFORM names each carrier's; with its other records they rebuild its walk\">\n";
         out << "##INFO=<ID=CN_MODULE_REF_BP,Number=1,Type=Integer,Description=\"Reference bp across the bubble interior, each visit counted, over which CN_METHOD=UNIT measures CNBP. On a MODULE record END-POS equals it, unless CN_SPAN_AMBIGUOUS (the span then also encloses the boundary visits between the outermost ones); on a UNIT record END covers the reference's copies, which can lie inside the interior\">\n";
         out << "##INFO=<ID=CN_ANCHOR_BP,Number=1,Type=Integer,Description=\"CN_METHOD=MODULE: bp of the module's anchor, the nodes CN counts passes through\">\n";
         out << "##INFO=<ID=CN_MODULE_NODES_BP,Number=1,Type=Integer,Description=\"CN_METHOD=MODULE: bp of the module's nodes, those some path visits more than once, one visit each\">\n";
@@ -2194,6 +2196,9 @@ void call_variants(
         out << "##INFO=<ID=INSSEQ,Number=1,Type=String,Description=\"Inserted sequence of the representative member (see SVLEN)" << seq_limit << "\">\n";
         out << "##INFO=<ID=DELSEQ,Number=1,Type=String,Description=\"Deleted reference sequence of the representative member (see SVLEN)" << seq_limit << "\">\n";
         out << "##INFO=<ID=INVSEQ,Number=1,Type=String,Description=\"Inverted reference sequence of the representative member (see SVLEN)" << seq_limit << "\">\n";
+        if (options.max_seq_bp != 0)
+            out << "##INFO=<ID=SEQ_FA,Number=.,Type=String,Description=\"This record's sequences over --max-seq-bp (" << options.max_seq_bp
+                << " bp), so its line stays a size VCF tools read: each is the FASTA record <ID>.<entry> of <prefix>.alt_seqs.fa, written with this VCF. An entry is INSSEQ, DELSEQ, INVSEQ, or CN_FORMS.<k> for the k-th CN_FORMS entry, written * there" << fa_limit << "\">\n";
         out << "##FILTER=<ID=PASS,Description=\"All filters passed: every record written passed --min-sv-bp, --min-haplotypes and --min-alt-af\">\n";
         out << "##ALT=<ID=DEL,Description=\"Deletion\">\n";
         out << "##ALT=<ID=INS,Description=\"Insertion\">\n";
@@ -2227,6 +2232,7 @@ void call_variants(
         std::size_t bubble_id = 0;
         std::string id;
         std::string line;                       // full VCF row (with trailing newline)
+        std::vector<std::pair<std::string, std::string>> fa_seqs;   // SEQ_FA entries and their sequences
         std::size_t unaligned_missing = 0;      // its haplotypes GT '.' as unaligned, and as within a larger
         std::size_t covered_missing = 0;        // deletion of their own (the run's counts lose a dropped record's)
         // A module record's sample written as REF_CN because records of its own (holders) hold its change: the
@@ -5054,8 +5060,15 @@ void call_variants(
                 const std::size_t p = e.seq_event ? e.seq_before : e.splice_ok ? e.splice_before : e.ref_pos;
                 rec_iv = {p, p};
             }
-            // INSSEQ, DELSEQ and INVSEQ up to --max-seq-bp, so a record line stays a size VCF tools read
+            // INSSEQ, DELSEQ, INVSEQ and CN_FORMS sequences up to --max-seq-bp go in the line, so it stays a size
+            // VCF tools read; longer ones to the side FASTA (SEQ_FA names them), up to --max-fa-seq-bp.
             const auto seq_fits = [&options](std::size_t n) { return options.max_seq_bp == 0 || n <= options.max_seq_bp; };
+            const auto fa_fits = [&options](std::size_t n) { return options.max_fa_seq_bp == 0 || n <= options.max_fa_seq_bp; };
+            std::vector<std::pair<std::string, std::string>> fa_seqs;   // (SEQ_FA entry, sequence)
+            const auto put_seq = [&](const char* key, const std::string& seq) {
+                if (seq_fits(seq.size())) info << ';' << key << '=' << seq;
+                else if (fa_fits(seq.size())) fa_seqs.emplace_back(key, seq);
+            };
             auto covered_here = [&](const std::string& s) {
                 if (rec_iv.first == 0 || carrier_set.count(s) != 0) return false;
                 const auto it = member_allele.find(s);
@@ -5184,24 +5197,24 @@ void call_variants(
             if (rp_sub || explicit_sub) {
                 // REF/ALT spell it
             } else if (rp) {
-                if (!rp_del.empty() && seq_fits(rp_del.size())) info << ";DELSEQ=" << rp_del;
-                if (!rp_ins.empty() && seq_fits(rp_ins.size())) info << ";INSSEQ=" << rp_ins;
-            } else if (!e.seq.empty() && seq_fits(e.seq.size())) {
+                if (!rp_del.empty()) put_seq("DELSEQ", rp_del);
+                if (!rp_ins.empty()) put_seq("INSSEQ", rp_ins);
+            } else if (!e.seq.empty()) {
                 // Event sequences are spelled along the canonical source->sink walk, and stay that way
                 // internally (merging compares them within one bubble). Where the reference crosses
                 // this bubble sink->source they are written reverse-complemented, in reference-forward
                 // orientation.
                 const std::string oseq = !aligned_seq.empty() ? aligned_seq
                                          : ref_rev ? reverse_complement(e.seq) : e.seq;
-                if (e.type == EvType::Ins) info << ";INSSEQ=" << oseq;
-                else if (e.type == EvType::Del) info << ";DELSEQ=" << oseq;
-                else if (e.type == EvType::Sub && sub_sized) info << ";DELSEQ=" << oseq;
-                else if (e.type == EvType::Inv) info << ";INVSEQ=" << oseq;
+                if (e.type == EvType::Ins) put_seq("INSSEQ", oseq);
+                else if (e.type == EvType::Del) put_seq("DELSEQ", oseq);
+                else if (e.type == EvType::Sub && sub_sized) put_seq("DELSEQ", oseq);
+                else if (e.type == EvType::Inv) put_seq("INVSEQ", oseq);
             }
             // A substitution's INSSEQ is what reconstructs the haplotype, so it has its own size check
             // rather than the replaced sequence's.
-            if (!rp && !explicit_sub && e.type == EvType::Sub && sub_sized && !e.alt_seq.empty() && seq_fits(e.alt_seq.size()))
-                info << ";INSSEQ=" << (ref_rev ? reverse_complement(e.alt_seq) : e.alt_seq);
+            if (!rp && !explicit_sub && e.type == EvType::Sub && sub_sized && !e.alt_seq.empty())
+                put_seq("INSSEQ", ref_rev ? reverse_complement(e.alt_seq) : e.alt_seq);
 
             // FORMAT:CNBP (DUP only): the linear bp a haplotype gains/loses through the module -- spelled
             // walk length (node length x traversal multiplicity) minus the reference's. Unlike RU_LEN
@@ -5229,9 +5242,15 @@ void call_variants(
                 info << ";CN_FORMS=";
                 for (std::size_t k = 0; k < mr.forms.size(); ++k) {
                     const CopyForm& f = mr.forms[k];
-                    info << (k ? "," : "") << f.start << '-' << f.end << ':'
-                         << (!seq_fits(f.literal_bp) ? std::string("*") : f.code.empty() ? f.seq : f.code);
+                    info << (k ? "," : "") << f.start << '-' << f.end << ':';
+                    if (seq_fits(f.literal_bp)) { info << (f.code.empty() ? f.seq : f.code); continue; }
+                    info << '*';   // the sequence, in the side FASTA when it fits there
+                    if (fa_fits(f.seq.size())) fa_seqs.emplace_back("CN_FORMS." + std::to_string(k + 1), f.seq);
                 }
+            }
+            if (!fa_seqs.empty()) {
+                info << ";SEQ_FA=";
+                for (std::size_t k = 0; k < fa_seqs.size(); ++k) info << (k ? "," : "") << fa_seqs[k].first;
             }
             auto sample_cnbp = [&](const std::string& s) -> long long {
                 if (!mr.sample_copies_bp.empty()) {
@@ -5351,6 +5370,7 @@ void call_variants(
             rec.bubble_id = bubble.id;
             rec.id = id;
             rec.line = row.str();
+            rec.fa_seqs = std::move(fa_seqs);
             rec.unaligned_missing = n_unaligned;
             rec.covered_missing = n_unknown - n_unaligned;
             rec.cn_held = std::move(held_fix);
@@ -5885,6 +5905,11 @@ void call_variants(
         finals.push_back(options.out_prefix + ".node_genes.tsv");
         finals.push_back(options.out_prefix + ".dup_gene_cn.tsv");
     }
+    // The sequences too long for a record's line, beside the VCFs, when any record has one.
+    const std::string fa_path = options.out_prefix + ".alt_seqs.fa";
+    const bool fa_active = std::any_of(out_records.begin(), out_records.end(),
+                                       [](const OutRecord& r) { return !r.fa_seqs.empty(); });
+    if (fa_active) finals.push_back(fa_path);
     // The files this run reads: no output may overwrite one, and the stale-file sweeps below never remove one.
     const std::vector<std::string> inputs = {options.gfa_path, options.bubbles_csv_in, options.gtf_path,
                                              options.unit_graph_tsv};
@@ -6306,6 +6331,18 @@ void call_variants(
     if (!region_out) {
         throw std::runtime_error("Failed to finalize region VCF: " + options.out_prefix + ".region.vcf");
     }
+    // One FASTA record per SEQ_FA entry, <ID>.<entry>, in the VCF's order, 60 bases a line.
+    if (fa_active) {
+        std::ofstream fa_out(staged.stage(fa_path));
+        if (!fa_out) throw std::runtime_error("Failed to write " + fa_path);
+        for (const OutRecord& rec : out_records)
+            for (const auto& [entry, seq] : rec.fa_seqs) {
+                fa_out << '>' << rec.id << '.' << entry << '\n';
+                for (std::size_t k = 0; k < seq.size(); k += 60) fa_out.write(seq.data() + k, static_cast<std::streamsize>(std::min<std::size_t>(60, seq.size() - k))) << '\n';
+            }
+        fa_out.close();
+        if (!fa_out) throw std::runtime_error("Failed to finalize " + fa_path);
+    }
     // Each site's file written whole and closed before the next is opened, so a run with many sites holds one
     // file open at a time, not one per site.
     if (options.write_per_bubble_vcf) {
@@ -6341,6 +6378,7 @@ void call_variants(
     // other options would sit beside this run's region VCF and be read as current.
     {
         std::vector<std::string> stale;
+        if (!fa_active) stale.push_back(fa_path);
         if (!options.write_variant_nodes) {
             stale.push_back(options.out_prefix + ".variant_nodes.tsv");
             stale.push_back(options.out_prefix + ".carrier_events.tsv");

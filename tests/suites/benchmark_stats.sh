@@ -516,6 +516,19 @@ BUBBLE=1 spec sepb --cn
 cn_exact() { echo "$(awk -F'\t' '$1=="cn_exact_checked"{print $2}' "$OUT/$1_B.summary.tsv"):$(tail -n +2 "$OUT/$1_B.carrier_checks.tsv" | awk -F'\t' '$3=="cn_exact"' | wc -l | tr -d ' ')"; }
 check "copies: the VCF rebuilds every haplotype (large_left_vcf_bp; cn_exact checked:differing)" \
   "$(sv sepb_B large_left_vcf_bp) $(cn_exact sepb)" "0 6:0"
+# No reference copy: copies of A B (300 bp) gained, so the module record spells them (CN_FORMS). Over --max-seq-bp
+# they go to the side FASTA, and still rebuild; left out by --max-fa-seq-bp too, they are lost.
+{ printf 'N L 2000 91\nN A 150 92\nN B 150 93\nN C 30 94\nN R 2000 95\nP ref#0#chr1:0-4030 L+,C+,R+\n'
+  for i in 1 2 3 4; do printf 'P hone%s#1#chr1 L+,A+,B+,C+,R+\n' "$i"; done
+  for i in 1 2; do printf 'P htwo%s#1#chr1 L+,A+,B+,A+,B+,C+,R+\n' "$i"; done
+  for i in 1 2 3 4 5 6; do printf 'P hr%s#1#chr1 L+,C+,R+\n' "$i"; done; } > "$OUT/cnfa.spec"
+cp "$OUT/cnfa.spec" "$OUT/cnfx.spec"
+BUBBLE=1 spec cnfa --cn --max-seq-bp 100
+check "copies over --max-seq-bp: the forms from the side FASTA rebuild (forms there; large_left_vcf_bp)" \
+  "$(grep -v '^#' "$OUT/cnfa_c.region.vcf" | grep -oE 'SEQ_FA=[^;[:space:]]*' | tr ',' '\n' | grep -c 'CN_FORMS\.') $(sv cnfa_B large_left_vcf_bp)" "2 0"
+BUBBLE=1 spec cnfx --cn --max-seq-bp 100 --max-fa-seq-bp 100
+check "copies whose forms call left out are lost (large_left_vcf; reasons)" \
+  "$(sv cnfx_B large_left_vcf):$(lost_rows cnfx | tr ';' '\n' | cut -d' ' -f4 | sort -u | paste -sd, -)" "6:no_sequence"
 cp "$OUT/sepb.spec" "$OUT/sepbs.spec"
 BUBBLE=1 spec sepbs --cn --max-seq-bp 100
 check "copies, --max-seq-bp under a copy: gained copies named by the reference stretches they repeat still rebuild (large_left_vcf_bp; cn_exact)" \
@@ -705,9 +718,31 @@ cp "$OUT/sub_c.carrier_events.tsv" "$OUT/subn_c.carrier_events.tsv"
 bm -i "$OUT/sub/g.gfa" -c "$OUT/sub/g.bubbles.csv" -r 'ref#0#chr1:0-660' --calls "$OUT/subn_c" -o "$OUT/subn_B" -q >/dev/null 2>&1
 check "a replacement with no INSSEQ is not rebuilt from the VCF, and what it leaves is lost (no_sequence)" \
       "$([ "$(lg subn_B "$UNSPELLED")" -ge 1 ] && echo counted):$(lost_rows subn | cut -d' ' -f4 | sort -u | paste -sd, -)" "counted:no_sequence"
-check "the warning names the cause: a sequence call left out above --max-seq-bp (lines)" \
-      "$(grep -c 'call left out above its --max-seq-bp' "$OUT/subn_B.log"):$(grep -c 'no reference copy' "$OUT/subn_B.log")" "1:0"
+check "the warning names the cause: a sequence call left out above --max-fa-seq-bp (lines)" \
+      "$(grep -c 'call left out above its --max-fa-seq-bp' "$OUT/subn_B.log"):$(grep -c 'no reference copy' "$OUT/subn_B.log")" "1:0"
 check "every haplotype is clean once its replacement is applied" "$(sv sub_B haplotypes_clean_call):$(sv sub_B haplotypes_clean_vcf):$(sv sub_B haplotypes_scored)" "10:10:10"
+# Sequences over call's --max-seq-bp are in <prefix>.alt_seqs.fa: h1 replaces A (60 bp) by B (200 bp), h2 inserts I
+# (150 bp). At 100 the two INSSEQ go there and the VCF still rebuilds both; left out by --max-fa-seq-bp too, both
+# are lost (no_sequence).
+cat > "$OUT/longseq.spec" <<'EOF'
+N S 300 1
+N A 60 2
+N B 200 5
+N I 150 6
+N T 300 3
+P ref#0#chr1:0-660 S+,A+,T+
+P h1#1#chr1 S+,B+,T+
+P h2#1#chr1 S+,A+,I+,T+
+P h3#1#chr1 S+,A+,T+
+B S T A;B;I
+EOF
+spec longseq --max-seq-bp 100
+check "insertions with INSSEQ in the side FASTA rebuild (records naming it; large_left_vcf)" \
+      "$(grep -c 'SEQ_FA=INSSEQ' "$OUT/longseq_c.region.vcf"):$(sv longseq_B large_left_vcf)" "2:0"
+cp "$OUT/longseq.spec" "$OUT/longsx.spec"
+spec longsx --max-seq-bp 100 --max-fa-seq-bp 100
+check "insertions whose INSSEQ call left out are lost (large_left_vcf; reasons)" \
+      "$(sv longsx_B large_left_vcf):$(lost_rows longsx | tr ';' '\n' | cut -d' ' -f4 | sort -u | paste -sd, -)" "2:no_sequence"
 # A short-repeat allele that differs in two changes, 24 bp and 13-for-19, with matching repeat between them. A
 # base-by-base alignment of the haplotype threads gaps through the repeat into one 66 bp replacement; call's
 # alignment keeps the two apart. Both size it the same way (its largest change): not large at --min-sv-bp 50,

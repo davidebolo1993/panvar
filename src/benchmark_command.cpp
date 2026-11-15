@@ -51,7 +51,8 @@ void print_benchmark_help() {
         << "  -c, --bubbles-csv <path>          Site table, by path\n"
         << "  -r, --reference-path <name>       Reference path, as given to call (required)\n"
         << "      --calls <prefix>              call's output: <prefix>.region.vcf and\n"
-        << "                                    <prefix>.carrier_events.tsv, without --diploid\n"
+        << "                                    <prefix>.carrier_events.tsv (and <prefix>.alt_seqs.fa, where\n"
+        << "                                    records name it), without --diploid\n"
         << "                                    (required)\n"
         << "  -o, --out-prefix <prefix>         Output prefix (required)\n"
         << "      --min-sv-bp <N>               Smallest large event (default 50); below call's own,\n"
@@ -146,6 +147,7 @@ struct VcfRecordInfo {
     long long unit_bp = 0;                                // RU_LEN or CN_UNIT_BP: one copy
     long long cn_ref_bp = 0;                              // a CNV's span, POS+1..END: the reference's copies
     std::string ref, info;
+    std::string insseq;                                   // INSSEQ, from the line or the side FASTA
     std::vector<std::string> alts;
     std::unordered_set<std::string> carriers;             // GT names an ALT
     std::unordered_map<std::string, int> sample_allele;   // GT's allele index; -1 for '.'
@@ -189,10 +191,35 @@ bool has_flag(const std::string& info, const std::string& key) {
     return false;
 }
 
-std::vector<VcfRecordInfo> load_region_vcf(const std::string& path, std::vector<std::string>& samples) {
+// The side FASTA call writes the sequences too long for a record's line to (<prefix>.alt_seqs.fa): name -> bases.
+std::unordered_map<std::string, std::string> load_side_fasta(const std::string& path) {
+    std::unordered_map<std::string, std::string> out;
+    std::ifstream in(path);
+    if (!in) throw std::runtime_error("cannot open " + path + ", which the VCF's SEQ_FA entries name (written by call "
+                                      "beside the VCF)");
+    std::string line, *cur = nullptr;
+    while (std::getline(in, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        if (line.empty()) continue;
+        if (line[0] == '>') {
+            const std::size_t sp = line.find_first_of(" \t");
+            cur = &out[line.substr(1, sp == std::string::npos ? std::string::npos : sp - 1)];
+            cur->clear();
+        } else if (cur != nullptr) {
+            *cur += line;
+        }
+    }
+    return out;
+}
+
+// `fa_path`: the side FASTA, read when a record names a sequence in it (SEQ_FA).
+std::vector<VcfRecordInfo> load_region_vcf(const std::string& path, const std::string& fa_path,
+                                           std::vector<std::string>& samples) {
     std::ifstream in(path);
     if (!in) throw std::runtime_error("cannot open " + path);
     std::vector<VcfRecordInfo> out;
+    std::unordered_map<std::string, std::string> side;
+    bool side_read = false;
     std::string line;
     bool header = false;
     while (std::getline(in, line)) {
@@ -237,6 +264,26 @@ std::vector<VcfRecordInfo> load_region_vcf(const std::string& path, std::vector<
                 if (fm.end + 1 < fm.start) throw std::runtime_error(path + ": record " + r.id + " has a CN_FORMS entry ending before it starts");
                 r.cn_forms.push_back(std::move(fm));
             }
+        r.insseq = info_field(f[7], "INSSEQ");
+        // Sequences too long for the line are in the side FASTA, as <ID>.<entry>.
+        const std::string fa = info_field(f[7], "SEQ_FA");
+        if (!fa.empty()) {
+            if (!side_read) { side = load_side_fasta(fa_path); side_read = true; }
+            for (const std::string& entry : split_on(fa, ',')) {
+                const auto it = side.find(r.id + '.' + entry);
+                if (it == side.end())
+                    throw std::runtime_error(fa_path + ": no sequence " + r.id + '.' + entry + ", which " + path + " names");
+                if (entry == "INSSEQ") {
+                    r.insseq = it->second;
+                } else if (entry.rfind("CN_FORMS.", 0) == 0) {
+                    const std::size_t k = parse_count(entry.substr(9), path + " SEQ_FA");
+                    if (k == 0 || k > r.cn_forms.size())
+                        throw std::runtime_error(path + ": record " + r.id + " names CN_FORMS entry " + entry.substr(9) + " in SEQ_FA, which it does not have");
+                    r.cn_forms[k - 1].seq = it->second;
+                    r.cn_forms[k - 1].spelled = true;
+                }
+            }
+        }
         const std::vector<std::string> fmt = split_on(f[8], ':');
         const auto gt_i = std::find(fmt.begin(), fmt.end(), "GT") - fmt.begin();
         const auto cn_i = std::find(fmt.begin(), fmt.end(), "CN") - fmt.begin();
@@ -744,7 +791,7 @@ int run_benchmark_command(const std::vector<std::string>& args) {
                                              out_prefix + ".events.tsv", out_prefix + ".carrier_checks.tsv",
                                              out_prefix + ".present.tsv"};
     for (const std::string& f : finals)
-        for (const std::string& in : {gfa_path, bubbles_csv_in, vcf_in_path, ce_in_path}) {
+        for (const std::string& in : {gfa_path, bubbles_csv_in, vcf_in_path, ce_in_path, calls_prefix + ".alt_seqs.fa"}) {
             std::error_code ec;
             if (f == in || std::filesystem::equivalent(f, in, ec))
                 throw std::runtime_error("benchmark: output '" + f + "' is also an input; refusing to "
@@ -926,17 +973,18 @@ int run_benchmark_command(const std::vector<std::string>& args) {
         std::size_t not_reconstructable = 0, missing_gt = 0, not_in_vcf = 0;
         std::vector<VcfRecordInfo> vcf;
         // A record that could not be spelled for some carrier, and why: "sequence" (left out above call's
-        // --max-seq-bp), "no_copy" (a copy-number record with no reference copy to paste), "other".
+        // --max-fa-seq-bp), "no_copy" (a copy-number record with no reference copy to paste), "other".
         std::unordered_map<std::string, std::string> unspelled;
     };
     Stage stages[2];
     const auto score_mode = [&](const ModeSpec& spec, Stage& out) {
     const bool vcf_mode = spec.vcf;
     const std::string& vcf_in = spec.vcf_in;
+    const std::string fa_in = calls_prefix + ".alt_seqs.fa";
     const std::string& ce_in = spec.ce_in;
     // ---- call's output: the VCF and each carrier's own event ----
     std::vector<std::string> vcf_samples;
-    std::vector<VcfRecordInfo> vcf = load_region_vcf(vcf_in, vcf_samples);
+    std::vector<VcfRecordInfo> vcf = load_region_vcf(vcf_in, fa_in, vcf_samples);
     // A form spelled by the reference stretches it repeats (@A-B, ~A-B reverse-complemented, joined with literal
     // bases by +) is spelled out; one naming bases outside the region cannot be.
     for (VcfRecordInfo& r : vcf)
@@ -1078,7 +1126,7 @@ int run_benchmark_command(const std::vector<std::string>& args) {
                            std::toupper(static_cast<unsigned char>(r.ref[c])) == std::toupper(static_cast<unsigned char>(alt[c]))) ++c;
                     add(r, "seq", r.pos + c, r.pos + r.ref.size() - 1, alt.substr(c), ".", h);
                 } else if (alt == "<DEL>" || alt == "<INS>") {
-                    const std::string ins = info_field(r.info, "INSSEQ");
+                    const std::string& ins = r.insseq;
                     // An insertion, or a replacement, spells its new sequence from INSSEQ.
                     if ((alt == "<INS>" || subst) && ins.empty()) { unspelled.emplace(r.id, "sequence"); reconstructable = false; add(r, "unresolved", 0, 0, std::string(), ".", h); continue; }
                     if (alt == "<INS>" && !subst) add(r, "ins", r.pos + 1, r.pos, ins, ".", h);
@@ -1171,7 +1219,7 @@ int run_benchmark_command(const std::vector<std::string>& args) {
                                     Shorter sh;
                                     if (symbolic) {
                                         sh.lo = o.pos + 1; sh.span = std::max(o.end, o.pos) - o.pos;
-                                        if (has_flag(o.info, "SUBSTITUTION")) sh.with = info_field(o.info, "INSSEQ");
+                                        if (has_flag(o.info, "SUBSTITUTION")) sh.with = o.insseq;
                                     } else if (o.ref.size() > o.alts[0].size()) {
                                         sh.lo = o.pos + 1; sh.span = o.ref.size() - 1; sh.with = o.alts[0].substr(1);
                                     }
@@ -2058,7 +2106,7 @@ int run_benchmark_command(const std::vector<std::string>& args) {
         warn(sc.unresolved_rows, "carrier event(s) call could not place on the reference");
         warn(sv.not_reconstructable, "VCF record(s) that could not be spelled for some carrier");
         warn(unspelled_lost["sequence"], "event(s) left by the VCF only, at a record whose sequence call left out above its "
-             "--max-seq-bp (call --max-seq-bp 0 writes them all)");
+             "--max-fa-seq-bp (call writes them all by default)");
         warn(unspelled_lost["no_copy"], "event(s) left by the VCF only, at a copy-number record with no reference copy to paste");
         warn(unspelled_lost["other"], "event(s) left by the VCF only, at a record that could not be spelled");
         warn(sc.not_in_vcf, "haplotype(s) with no VCF column");

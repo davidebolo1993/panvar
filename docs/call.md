@@ -82,7 +82,8 @@ panphorte's unit-graph table is read from the site table's prefix (or `--panphor
 | `--classify-ins` | tell new insertions (`NOVEL`) from duplications (`DUP`) with minimap2 (`--minimap-preset`, `--minimap-best-n`, `--ins-dup-min-identity`), for every `INS` record by the bases it inserts | off |
 | `--diploid` | one column per sample, with phased `GT` (`/` for a sample with unnumbered haplotypes); `CN` is the sample's total | off |
 | `--no-per-bubble-vcf`, `--no-variant-nodes` | skip the per-site VCFs, or the node and carrier tables | off |
-| `--max-seq-bp <N>` | leave `INSSEQ`, `DELSEQ`, `INVSEQ` and each `CN_FORMS` sequence (its literal bases) out above N bases, so VCF tools read the lines; `0` writes them all | `20000` |
+| `--max-seq-bp <N>` | write `INSSEQ`, `DELSEQ`, `INVSEQ` and each `CN_FORMS` sequence (its literal bases) over N bases to `<prefix>.alt_seqs.fa` instead of the line, so VCF tools read the lines; `0` writes them all in the line | `20000` |
+| `--max-fa-seq-bp <N>` | leave sequences over N bases out of `<prefix>.alt_seqs.fa` too, to cap the output's size; the VCF then cannot rebuild those records | `0` (none) |
 | `-t, --threads <N>` | worker threads (`0` = all cores) | `0` |
 | `-q, --quiet` | no progress logs | off |
 
@@ -94,6 +95,7 @@ panphorte's unit-graph table is read from the site table's prefix (or `--panphor
 | `<prefix>.bubble_<id>.vcf` | one site's records |
 | `<prefix>.variant_nodes.tsv` | per record, the nodes it involves; read by `describe --variant-nodes` |
 | `<prefix>.carrier_events.tsv` | per record and carrier, the event that carrier holds; read by `benchmark` |
+| `<prefix>.alt_seqs.fa` | sequences too long for their record's line (`SEQ_FA`), each as `<ID>.<field>`; written when there are any |
 | `<prefix>.node_genes.tsv`, `<prefix>.dup_gene_cn.tsv` | with `--gtf`: genes per node, and copy number per gene and haplotype |
 
 VCF 4.2. `POS` is the base before the event, `END` its last reference base. `FILTER` is `PASS`: a record that fails a filter is not written. `GT` is `1` for a carrier, `0` for reference-like, `.` for no allele there. Main `INFO` fields:
@@ -101,12 +103,13 @@ VCF 4.2. `POS` is the base before the event, `END` its last reference base. `FIL
 | field | meaning |
 |-------|---------|
 | `SVTYPE`, `SVLEN`, `END` | type, length change (an inversion: its length), last base |
-| `INSSEQ`, `DELSEQ`, `INVSEQ`, `SUBSTITUTION` | the event's sequence, left out above `--max-seq-bp` (20,000) so VCF tools can read the lines. A replacement (`SUB`, or a `DEL`/`INS` flagged `SUBSTITUTION`) is spelled in `REF` and `ALT` where both sides fit and its breakpoints are exact |
+| `INSSEQ`, `DELSEQ`, `INVSEQ`, `SUBSTITUTION` | the event's sequence; above `--max-seq-bp` (20,000) it is in `<prefix>.alt_seqs.fa` instead, so VCF tools can read the lines. A replacement (`SUB`, or a `DEL`/`INS` flagged `SUBSTITUTION`) is spelled in `REF` and `ALT` where both sides fit and its breakpoints are exact |
 | `IMPRECISE`, `CIPOS`, `CIEND`, `HOMLEN` | uncertain or sliding breakpoints: `IMPRECISE` marks a cluster of pieces (`END`-`POS` wider than \|`SVLEN`\|), a breakpoint at an N run of the reference, or a `PATH_INVERSION` whose breakpoints lie in repeats; its `CIPOS`/`CIEND` give how far each breakpoint can lie |
 | `AN`, `AC`, `AF` | haplotypes with an allele at the site (not `.`), carriers, ratio. The reference path is left out, and a haplotype in several contigs counts once, a carrier where one of its contigs carries the record, as with `--diploid` |
 | `BUBBLE_ID`, `EVENT_NODES` | the site and the event's nodes; a `PATH_INVERSION`, typed from the walks, has no nodes |
 | `CN_METHOD`, `REF_CN`, `RU_LEN` | how copies were counted, the reference's count, a unit copy's length; a `CNV`'s `POS`+1..`END` covers the reference's copies |
-| `CN_FORMS` | on a `MODULE` record, the copies its carriers gained or lost, each an edit of the reference: `START-END:SEQ`, reference bases `START`..`END` replaced by `SEQ` in reference orientation (`END` = `START`-1 for an insertion, `SEQ` empty for a deletion). `SEQ` names the reference stretches it repeats where that is shorter, `@A-B` (bases `A`..`B`) or `~A-B` (their reverse complement), joined with literal bases by `+`: a gained copy repeats the reference's copies, so its form stays short however long the copy. It is `*` where its literal bases exceed `--max-seq-bp`. Distinct copies are listed once, in reference order |
+| `CN_FORMS` | on a `MODULE` record, the copies its carriers gained or lost, each an edit of the reference: `START-END:SEQ`, reference bases `START`..`END` replaced by `SEQ` in reference orientation (`END` = `START`-1 for an insertion, `SEQ` empty for a deletion). `SEQ` names the reference stretches it repeats where that is shorter, `@A-B` (bases `A`..`B`) or `~A-B` (their reverse complement), joined with literal bases by `+`: a gained copy repeats the reference's copies, so its form stays short however long the copy. It is `*` where its literal bases exceed `--max-seq-bp`, the sequence then in `<prefix>.alt_seqs.fa`. Distinct copies are listed once, in reference order |
+| `SEQ_FA` | the record's sequences in `<prefix>.alt_seqs.fa`, by field: `INSSEQ`, `DELSEQ`, `INVSEQ`, or `CN_FORMS.<k>` for the k-th form. Each is the FASTA record `<ID>.<field>`, so the file can be indexed (`samtools faidx`) and one allele fetched by name. A side file keeps every sequence, a novel insertion as much as a copy, while each line stays short |
 | `SVLEN_RANGE`, `MERGE_MIN_SIM`, `MERGE_TEST` | how much the merged events differ: their sizes, and the weakest similarity of a member to the representative in the test that admits it (under the test's threshold: the member joined through others) |
 | `GENES` | with `--gtf`: genes over the record; inside a copy of a `MODULE` site holding several genes, the paralogs its carriers hold |
 
