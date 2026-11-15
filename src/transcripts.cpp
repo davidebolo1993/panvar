@@ -53,7 +53,7 @@ constexpr std::int64_t kIndelPerBase = 64;
 // The largest gap between two chained nodes filled by an exact node alignment (cells); larger ones are
 // filled from both ends only.
 constexpr std::size_t kFillMaxCells = 4000000;
-// Passes of two genes taking the same stretch of a walk: overlapping by more than this share of the shorter.
+// Passes of two genes taking the same stretch of a walk: overlapping by more than this share of the longer.
 constexpr double kParalogOverlap = 0.5;
 // A copy placed by sequence: the marker's exonic bases, aligned at the identity asked for, make a copy where
 // they are covered to the share and a partial copy where covered to this much. The window reaches this share
