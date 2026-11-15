@@ -196,6 +196,17 @@ std::vector<GeneFeature> parse_gtf(const std::string& gtf_path,
     return genes;
 }
 
+std::string gene_id_key(const std::string& id) {
+    const std::size_t dot = id.rfind('.');
+    if (dot == std::string::npos || dot + 1 >= id.size() || id.compare(0, 3, "ENS") != 0 ||
+        id.find_first_not_of("0123456789", dot + 1) != std::string::npos)
+        return id;
+    std::size_t i = 3;
+    while (i < dot && std::isupper(static_cast<unsigned char>(id[i]))) ++i;
+    if (i == 3 || id[i - 1] != 'G' || i == dot || id.find_first_not_of("0123456789", i) != dot) return id;
+    return id.substr(0, dot);
+}
+
 std::vector<TranscriptFeature> parse_gtf_transcripts(const std::string& gtf_path,
                                                      const std::string& ref_chrom,
                                                      std::size_t lo_1based,

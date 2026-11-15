@@ -6,6 +6,7 @@
 #include "panvar/fasta_index.hpp"
 #include "panvar/flat_map.hpp"
 #include "panvar/gfa.hpp"
+#include "panvar/gtf.hpp"
 #include "panvar/graph_utils.hpp"
 #include "panvar/gz_reader.hpp"
 #include "panvar/kmer.hpp"
@@ -146,20 +147,6 @@ std::string transcripts_table(const std::string& fa) {
 std::string transcripts_checksum_of(const std::string& fa) {
     const std::string t = transcripts_table(fa);
     return file_checksum(fa) + (t.empty() ? std::string() : "+" + file_checksum(t));
-}
-
-// A gene id as it is compared: an Ensembl-style id (ENS, species letters, G, digits) loses its version
-// (ENSG00000000001.2), as annotations and FASTA headers differ in it. Any other id or name is kept whole: a
-// suffix of a symbol or of a clone-based name tells genes apart.
-std::string gene_id_key(const std::string& id) {
-    const std::size_t dot = id.rfind('.');
-    if (dot == std::string::npos || dot + 1 >= id.size() || id.compare(0, 3, "ENS") != 0 ||
-        id.find_first_not_of("0123456789", dot + 1) != std::string::npos)
-        return id;
-    std::size_t i = 3;
-    while (i < dot && std::isupper(static_cast<unsigned char>(id[i]))) ++i;
-    if (i == 3 || id[i - 1] != 'G' || i == dot || id.find_first_not_of("0123456789", i) != dot) return id;
-    return id.substr(0, dot);
 }
 
 bool ensembl_gene_id(const std::string& s) { return gene_id_key(s + ".1") == s; }

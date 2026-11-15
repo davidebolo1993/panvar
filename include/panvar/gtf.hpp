@@ -56,6 +56,11 @@ std::vector<TranscriptFeature> parse_gtf_transcripts(const std::string& gtf_path
                                                      const std::string& module = "panvar",
                                                      std::set<std::pair<std::string, std::string>>* all_genes = nullptr);
 
+// A gene id as it is compared: an Ensembl-style id (ENS, species letters, G, digits) loses its version
+// (ENSG00000000001.2), as annotations and FASTA headers differ in it. Any other id or name is kept whole: a
+// suffix of a symbol or of a clone-based name tells genes apart.
+std::string gene_id_key(const std::string& id);
+
 // True iff `name` looks like PanSN `sample#hap#contig:start-end`: at least two '#'
 // separators and a parseable ":start-end" interval. Annotation is gated on this.
 bool is_pansn(const std::string& name);

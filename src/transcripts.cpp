@@ -1624,18 +1624,33 @@ TranscriptsResult project_transcripts(const Graph& graph, const TranscriptsOptio
     std::unordered_map<std::string, std::size_t> gene_by_id, gene_by_name, tx_by_id;
     for (std::size_t gi = 0; gi < genes.size(); ++gi) {
         const TranscriptFeature& t0 = res.transcripts[genes[gi].tx.front()];
-        gene_by_id.emplace(t0.gene_id, gi);
+        gene_by_id.emplace(gene_id_key(t0.gene_id), gi);
         gene_by_name.emplace(t0.gene_name, gi);
     }
     for (std::size_t k = 0; k < res.transcripts.size(); ++k) tx_by_id.emplace(res.transcripts[k].transcript_id, k);
-    // Genes the GTF has, on the path or not, by id (without its version) and by name. Only these are judged as
-    // paralog lifts: the place on the reference of a gene the GTF lacks is not known.
+    // Genes the GTF has, on the path or not, by id and by name. Only these are judged as paralog lifts: the
+    // place on the reference of a gene the GTF lacks is not known.
     std::unordered_set<std::string> gtf_ids, gtf_names;
     for (const auto& [id, name] : gtf_genes) {
-        const std::size_t d = id.rfind('.');
-        const bool version = d != std::string::npos && d + 1 < id.size() && id.find_first_not_of("0123456789", d + 1) == std::string::npos;
-        if (!id.empty()) gtf_ids.insert(version ? id.substr(0, d) : id);
+        if (!id.empty()) gtf_ids.insert(gene_id_key(id));
         if (!name.empty()) gtf_names.insert(name);
+    }
+    // Each annotated transcript's gene: by its id where the GTF knows it, else by its name. `ann_gene` is the
+    // projected gene (-1: none), `ann_known` whether the GTF has the gene at all.
+    std::vector<long> ann_gene(res.annotated.size(), -1);
+    std::vector<char> ann_known(res.annotated.size(), 0);
+    for (std::size_t a = 0; a < res.annotated.size(); ++a) {
+        AnnotatedTranscript& at = res.annotated[a];
+        const std::string id = gene_id_key(at.t.gene_id);
+        const auto gi = gene_by_id.find(id);
+        if (gi != gene_by_id.end()) {
+            ann_gene[a] = static_cast<long>(gi->second);
+        } else if (gtf_ids.count(id) == 0) {
+            const auto gn = gene_by_name.find(at.t.gene_name);
+            if (gn != gene_by_name.end()) ann_gene[a] = static_cast<long>(gn->second);
+        }
+        ann_known[a] = ann_gene[a] >= 0 || gtf_ids.count(id) != 0 || gtf_names.count(at.t.gene_name) != 0;
+        if (ann_gene[a] >= 0) at.projected_gene_id = res.transcripts[genes[static_cast<std::size_t>(ann_gene[a])].tx.front()].gene_id;
     }
     // A projected record the annotation may not overrule: its every boundary carried, or moved off a variant.
     const auto clean = [](HstStatus s) {
@@ -1707,10 +1722,8 @@ TranscriptsResult project_transcripts(const Graph& graph, const TranscriptsOptio
                 const auto [it, fresh] = of.emplace(std::make_pair(at.gene_key, at.gene_record), acs.size());
                 if (fresh) {
                     AnnCopy ac;
-                    const auto gi = gene_by_id.find(at.t.gene_id);
-                    const auto gn = gene_by_name.find(at.t.gene_name);
-                    ac.gene = gi != gene_by_id.end() ? static_cast<long>(gi->second) : gn != gene_by_name.end() ? static_cast<long>(gn->second) : -1;
-                    ac.placed = ac.gene >= 0 || gtf_ids.count(at.t.gene_id) != 0 || gtf_names.count(at.t.gene_name) != 0;
+                    ac.gene = ann_gene[a];
+                    ac.placed = ann_known[a] != 0;
                     ac.key = at.gene_key;
                     acs.push_back(std::move(ac));
                 }
@@ -1847,16 +1860,13 @@ TranscriptsResult project_transcripts(const Graph& graph, const TranscriptsOptio
             extra[x].copy = ac.copy;
             extra[x].copies = ac.gene >= 0 ? copies[static_cast<std::size_t>(ac.gene)] : other_copies[ac.key];
         }
-        // The annotation's own copies of each gene, found by gene id (a source gene), else by name.
-        std::map<std::string, int> by_id, by_name;
-        for (const std::size_t a : annotated_on[h]) {
-            by_id[res.annotated[a].t.gene_id] = res.annotated[a].copies;
-            by_name[res.annotated[a].t.gene_name] = res.annotated[a].copies;
-        }
+        // The annotation's own copies of each projected gene.
+        std::map<long, int> own_copies;
+        for (const std::size_t a : annotated_on[h])
+            if (ann_gene[a] >= 0) own_copies[ann_gene[a]] = res.annotated[a].copies;
         for (HstRecord& r : recs) {
-            const TranscriptFeature& tf = res.transcripts[r.transcript];
-            const auto i = by_id.find(tf.gene_id), n = by_name.find(tf.gene_name);
-            r.annotated_copies = i != by_id.end() ? i->second : n != by_name.end() ? n->second : 0;
+            const auto c = own_copies.find(static_cast<long>(gene_of[r.transcript]));
+            r.annotated_copies = c != own_copies.end() ? c->second : 0;
         }
         std::vector<std::size_t> idx(extra.size());
         std::iota(idx.begin(), idx.end(), 0);
