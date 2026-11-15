@@ -1994,7 +1994,8 @@ TranscriptsResult project_transcripts(const Graph& graph, const TranscriptsOptio
     };
 
     // The reference walk must give back every transcript as annotated, in one of its copies. A transcript it
-    // does not give back is projected wrongly there, so its records on every walk are not_as_annotated; this
+    // does not give back is projected wrongly there, so its records on every walk are not_as_annotated (those
+    // without a sequence keep their status, noted not_as_annotated); this
     // comes before the haplotypes' own annotations, which judge projected records by their status.
     std::vector<char> distrusted(res.transcripts.size(), 0);
     if (project) {
@@ -2014,9 +2015,13 @@ TranscriptsResult project_transcripts(const Graph& graph, const TranscriptsOptio
         const std::size_t b1 = std::min(graph.paths.size(), b0 + batch);
         std::vector<std::vector<HstRecord>> got(b1 - b0);
         if (project) run_parallel(b1 - b0, threads, [&](std::size_t k) { got[k] = project_haplotype(b0 + k); });
+        // A record with a more severe status keeps it, and is noted.
         for (auto& recs : got)
-            for (HstRecord& r : recs)
-                if (distrusted[r.transcript] && !r.sequence.empty()) r.status = HstStatus::NotAsAnnotated;
+            for (HstRecord& r : recs) {
+                if (!distrusted[r.transcript]) continue;
+                if (r.sequence.empty()) add_detail(r.detail, "not_as_annotated");
+                else r.status = HstStatus::NotAsAnnotated;
+            }
         run_parallel(b1 - b0, threads, [&](std::size_t k) { add_annotated(b0 + k, got[k]); });
         for (const auto& recs : got) sink.add(res, recs);
     }

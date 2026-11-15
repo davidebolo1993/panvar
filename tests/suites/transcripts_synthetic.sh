@@ -37,6 +37,15 @@ check "the minus-strand transcript lists its exons 5 to 3" '[[ "$(col TB1 ref ex
 check "FASTA names are transcript|gene|haplotype|copy" 'grep -q "^>TC1|GC|h5#1#ctg5:0-12000|2 source=projected status=ok$" t1.hst.fa'
 check "the summary counts copies per haplotype" '[[ "$(awk -F"\t" "\$2==\"GC\"{print \$6}" t1.hst.summary.tsv)" == "0:1,1:6,2:2" ]]'
 
+# a transcript whose exons overlap on the reference: the reference walk does not give it back, and its rows,
+# all missing an exon, keep that status and are noted
+cp genes.gtf naa.gtf
+a='gene_id "GA"; gene_name "GA"; gene_biotype "protein_coding"; transcript_id "TA9"; transcript_name "TA9";'
+printf 'chr1\ttest\texon\t2001\t2301\t.\t+\t.\t%s\nchr1\ttest\texon\t2251\t2401\t.\t+\t.\t%s\n' "$a" "$a" >> naa.gtf
+"$BIN" transcripts -i locus.gfa -r ref --gtf naa.gtf -o naa -t 2 -q 2> naa.log
+check "a transcript the reference walk does not give back is noted on every row that keeps a more severe status" \
+  'grep -q "does not give back 1 transcript(s) as annotated: TA9" naa.log && [[ "$(awk -F"\t" "\$1==\"TA9\" {print \$12, (\$25 ~ /not_as_annotated/)}" naa.hst.tsv | sort -u)" == "missing_exon 1" ]]'
+
 # the checker refuses a table or FASTA naming one transcript, haplotype and copy twice
 { cat t1.hst.tsv; sed -n 2p t1.hst.tsv; } > dup_row.hst.tsv; cp t1.hst.fa dup_row.hst.fa
 cp t1.hst.tsv dup_fa.hst.tsv; { cat t1.hst.fa; head -2 t1.hst.fa; } > dup_fa.hst.fa

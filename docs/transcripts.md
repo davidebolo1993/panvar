@@ -58,7 +58,7 @@ Projects a reference annotation onto every haplotype walk of a locus graph. Each
 
 16. The exons are cut from the walk with the haplotype's alleles and joined in transcript order; a minus-strand transcript is reverse-complemented. The two splice-site bases at each end of every intron are compared with the reference's. An intron the haplotype shortens below those four bases is lost, and its exons are joined.
 
-17. The reference walk is projected first and must give back every transcript as annotated. A transcript it does not give back is projected wrongly there, so its records on every walk are `not_as_annotated`, and a warning names it.
+17. The reference walk is projected first and must give back every transcript as annotated. A transcript it does not give back is projected wrongly there, so its records on every walk are `not_as_annotated`, and a warning names it. A record with a more severe status (`missing_exon`, `partial_copy`, `no_copy`) keeps it, and `detail` notes `not_as_annotated`.
 
 18. A haplotype's own annotation is in its assembly's coordinates, and the haplotype's path names its contig and interval (`sample#hap#contig:start-end`, the start 0-based as pggb writes it). Its transcripts with an exon on the path are cut from the walk at those coordinates, strand-aware. A model with coding rows and no exon rows takes its coding rows as exons. Exon rows naming a transcript the annotation lacks are skipped, with a warning counting them. A transcript reaching past the path is cut at its ends (`clipped_at_edge`). Each gene record of the annotation is one copy. The annotations of different haplotypes are read in parallel.
 
@@ -153,6 +153,7 @@ Exons and introns are numbered in transcript order, 1-based, over the whole anno
 | `on:<gene>` | an annotated transcript lying on that gene's copy |
 | `exons:<n>/<m>` | an annotated transcript's exons against the reference transcript's |
 | `annotated:<record>` | a projected record the annotation overrules |
+| `not_as_annotated` | the reference walk does not give the transcript back, on a record whose status is more severe |
 
 Statuses, most severe first:
 
@@ -163,7 +164,7 @@ Statuses, most severe first:
 | `missing_exon` | the copy lacks an exon of this transcript; no sequence is written |
 | `paralog_lift` | an annotated transcript on another gene's copy (with `--hap-annotations`) |
 | `discordant` | a record the other source contradicts (with `--hap-annotations`) |
-| `not_as_annotated` | the reference walk does not give the transcript back as annotated, so its projection is not trusted on any walk |
+| `not_as_annotated` | the reference walk does not give the transcript back as annotated, so its projection is not trusted on any walk; a record with a more severe status keeps it and notes `not_as_annotated` in `detail` |
 | `intron_lost` | an intron shortened below its two splice sites, its exons joined |
 | `clipped_at_edge` | the transcript reaches past the reference path, and only its part on the path is projected |
 | `boundary_moved` | an exon boundary lies inside an indel and was moved |
