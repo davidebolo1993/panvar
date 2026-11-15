@@ -517,6 +517,7 @@ struct Tandem {
     std::size_t lo = 0, hi = 0;   // genomic exon indices of the stretch, inclusive
     std::size_t rl = 0, rh = 0;   // the reference window: from the exon before the stretch to the one after
     std::size_t first = 0;        // where its first unit starts
+    std::size_t last = 0;         // where its last unit ends
     // where the stretch starts or ends the transcript: the window reaches the nearest node the gene's
     // stretch of the reference holds once (its step), which the haplotype's pass may share
     std::size_t lo_anchor = SIZE_MAX, hi_anchor = SIZE_MAX;
@@ -601,6 +602,7 @@ Tandem find_tandem(const Walk& R, const std::string& rseq, const Cuts& cuts, con
     const std::size_t typical = lens.empty() ? t.rh - occ.back() : lens[lens.size() / 2];
     const std::size_t last_end = std::min(t.rh, std::max(occ.back() + typical, cuts[t.hi].second));
     t.first = occ.front();
+    t.last = last_end;
     t.head = rseq.substr(t.rl, occ.front() - t.rl);
     t.tail = rseq.substr(last_end, t.rh - last_end);
     for (std::size_t u = 0; u < occ.size(); ++u) {
@@ -753,7 +755,8 @@ struct WalkUnit {
     bool lifted = false;
     std::vector<std::size_t> before, after;
 };
-using UnitCache = std::map<std::tuple<const char*, std::size_t, std::size_t, std::size_t, std::size_t, std::size_t>, std::vector<WalkUnit>>;
+using UnitCache = std::map<std::tuple<const char*, std::size_t, std::size_t, std::size_t, std::size_t, std::size_t, std::size_t>,
+                           std::vector<WalkUnit>>;
 
 std::vector<WalkUnit> walk_units(const std::string& ws, const Tandem& tm, std::size_t lo, std::size_t hi);
 
@@ -761,7 +764,7 @@ std::vector<WalkUnit> walk_units(const std::string& ws, const Tandem& tm, std::s
 Placed tandem_exons(const std::string& ws, const Tandem& tm, std::size_t lo, std::size_t hi, UnitCache& cache) {
     Placed out;
     if (hi <= lo) return out;
-    auto& units = cache.try_emplace({ws.data(), lo, hi, tm.rl, tm.rh, tm.first}).first->second;
+    auto& units = cache.try_emplace({ws.data(), lo, hi, tm.rl, tm.rh, tm.first, tm.last}).first->second;
     if (units.empty()) units = walk_units(ws, tm, lo, hi);
     out.units = units.size();
     for (WalkUnit& w : units) {

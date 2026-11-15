@@ -921,7 +921,27 @@ def random_case(seed):
     return dict(L=L, genes=genes, haps=haps, reversed={"h6": "h1", "h7": "h3"})
 
 
+def write_tandem_pair(d):
+    """The tandem case with a second transcript, TT2, whose last tandem exon runs on 400 bases into flank B
+    and past a typical unit: genes.gtf holds TT1 and TT2, alone.gtf TT2 alone. TT2's rows must not depend on
+    TT1's, whose last unit is shorter."""
+    write_tandem(CASES["tandem"], d)
+    lines = open(f"{d}/genes.gtf").read().splitlines()
+    tt2 = []
+    exons = [k for k, l in enumerate(lines) if l.split("\t")[2] == "exon"]
+    for k, line in enumerate(lines):
+        f = line.split("\t")
+        f[8] = f[8].replace('"TT1"', '"TT2"').replace(' tag "Ensembl_canonical";', "")
+        if k == exons[-2]:   # the last tandem exon
+            f[4] = str(2000 + 1000 * CASES["tandem"]["units"]["ref"] + 400 + OFFSET)
+        tt2.append("\t".join(f))
+    open(f"{d}/genes.gtf", "w").write("\n".join(lines + tt2) + "\n")
+    open(f"{d}/alone.gtf", "w").write("\n".join(tt2) + "\n")
+
+
 def write(case_name, d):
+    if case_name == "tandem_pair":
+        return write_tandem_pair(d)
     if case_name.startswith("random:"):   # random:<seed>
         CASES[case_name] = random_case(int(case_name.split(":")[1]))
     case = CASES[case_name]

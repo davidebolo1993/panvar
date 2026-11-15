@@ -71,6 +71,13 @@ for seed in $(seq 1 100); do
 done
 check "100 random cases match the haplotypes' own transcripts${wrong:+ (seeds failing:$wrong)}" '[[ -z "$wrong" ]]'
 
+# two transcripts over one tandem stretch whose last units end apart: each places its own units
+mkdir -p pair && python3 "$TOOLS/transcript_fixture.py" write tandem_pair pair
+"$BIN" transcripts -i pair/locus.gfa -r ref --gtf pair/genes.gtf -o pair/both -t 1 -q 2> pair/both.log
+"$BIN" transcripts -i pair/locus.gfa -r ref --gtf pair/alone.gtf -o pair/alone -t 1 -q 2> pair/alone.log
+check "a tandem transcript is placed the same beside another one with a shorter last unit" \
+  'cmp -s <(grep "^TT2" pair/both.hst.tsv) <(grep "^TT2" pair/alone.hst.tsv) && ! grep -q "does not give back" pair/both.log'
+
 # a gene on allele nodes, and one cut below the share
 dv() { awk -F'\t' -v t="$1" -v h="$2" '$1==t && $7 ~ "^"h"#" {print $12":"$8}' "${3:-case_divergent/out}.hst.tsv"; }
 check "a gene whose exons lie on allele nodes is placed by sequence" \
