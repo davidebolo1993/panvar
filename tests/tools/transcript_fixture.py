@@ -5,7 +5,7 @@ panvar.
 
   transcript_fixture.py cases                          the case names
   transcript_fixture.py write <case> <dir>             writes locus.gfa, genes.gtf, expected.tsv
-  transcript_fixture.py check <dir> <prefix>           compares <prefix>.hst.tsv/.hst.fa with expected.tsv
+  transcript_fixture.py check <dir> <prefix> [<exp>]   compares <prefix>.hst.tsv/.hst.fa with expected.tsv (or <exp>)
 
 Variants on the reference (0-based, half-open): ("snp", p), ("del", (a, b)), ("sub", (a, b)), a stretch of the
 same length with every third base changed, or every `sub_step`-th (clustered SNPs folded into one node),
@@ -142,6 +142,9 @@ CASES = {
     "merged": dict(),
     # the main case with haplotypes' own annotations (write_annotated)
     "annotated": dict(),
+    # the main case with annotations the projection contradicts, fills or that lie on another gene's copy
+    # (write_annotation_rules)
+    "annotation_rules": dict(),
 }
 SHARE, IDENTITY, PARTIAL = 0.8, 0.93, 0.2   # panvar's --min-exon-share and --min-identity, and its partial copy
 
@@ -522,6 +525,80 @@ def write_annotated(d):
             out.write(f"{t}\t{g}\t{name(h, L)}\t{c}\t{st}\t{det}\t{sq}\tannotated\t{rec}\n")
 
 
+def write_annotation_rules(d):
+    """The main case, with annotations: h1 TA1 twice, as projected and with exon 3 ending early, and a novel
+    isoform; h2 TA1 (its exon 2 deleted) with another exon 2, and without it; h4 TA1 with exon 3 starting
+    later than projected, a gene lifted from elsewhere onto GA's copy, and a novel gene there; h6 (no GC) GC
+    on GB's copy, with a novel isoform, and GC on its own further on. expected.tsv is the default run's,
+    expected_prefer.tsv the run with --prefer-annotation's."""
+    write("main", d)
+    case = CASES["main"]
+    L = case["L"]
+    ref, nodes, walks, seqs, maps = build(case)
+    gff = lambda ctg, kind, a, b, strand, attrs: f"{ctg}\tCAT\t{kind}\t{a}\t{b}\t.\t{strand}\t.\t{attrs}\n"
+    lines = {h: [] for h in ("h1", "h2", "h4", "h6")}
+    rows = []   # transcript, gene, haplotype, record, exons, default (copy, status, detail), preferred (copy, status, detail)
+
+    def gene(h, gid, attrs, lo, hi):
+        m = maps[h][0]
+        lines[h].append(gff(f"ctg{h[1:]}", "gene", m[lo] + 1, m[hi - 1] + 1, "+", f"ID={gid};{attrs}"))
+
+    def tx(h, gid, rec, tid, gname, ex, default, preferred, attrs=""):
+        m = maps[h][0]
+        lines[h].append(gff(f"ctg{h[1:]}", "transcript", m[ex[0][0]] + 1, m[ex[-1][1] - 1] + 1, "+",
+                            f"ID={rec};Parent={gid};transcript_id={tid}{attrs}"))
+        lines[h] += [gff(f"ctg{h[1:]}", "exon", m[a] + 1, m[b - 1] + 1, "+", f"Parent={rec}") for a, b in ex]
+        seq = "".join(seqs[h][m[a]:m[b - 1] + 1] for a, b in ex)
+        rows.append((tid, gname, h, rec, seq, default, preferred))
+
+    ta1 = case["genes"]["GA"][1]["TA1"]
+    gene("h1", "a1", "gene_name=GA;source_gene=GA.1", 1000, 3300)
+    tx("h1", "a1", "same1", "TA1", "GA", ta1, None, None)   # joins the projected record
+    tx("h1", "a1", "short1", "TA1", "GA", ta1[:2] + [(3000, 3250)], (1, "discordant", "."), (1, "ok", "."))
+    tx("h1", "a1", "nov1", "nov1", "GA", [(1000, 1300), (3000, 3150)], (1, "ok", "."), (1, "ok", "."))
+    gene("h2", "a2", "gene_name=GA;source_gene=GA.1", 1000, 3300)
+    tx("h2", "a2", "fill2", "TA1", "GA", [(1000, 1300), (2300, 2360), (3000, 3300)],
+       (1, "ok", "annotation_fill"), (1, "ok", "annotation_fill"))
+    tx("h2", "a2", "trunc2", "TA1", "GA", [(1000, 1300), (3000, 3300)], (1, "discordant", "exons:2/3"), (1, "ok", "annotation_fill"))
+    gene("h4", "a4", "gene_name=GA;source_gene=GA.1", 1000, 3300)
+    tx("h4", "a4", "late4", "TA1", "GA", ta1[:2] + [(3010, 3300)], (1, "discordant", "."), (1, "ok", "."))
+    gene("h4", "x4", "gene_name=XL;source_gene=ENSGX9.1", 1100, 2600)
+    tx("h4", "x4", "xl4", "xl4", "XL", [(1100, 1250), (2500, 2600)], (0, "paralog_lift", "on:GA"), (1, "ok", "on:GA"))
+    gene("h4", "n4", "gene_name=NV", 1500, 1600)
+    tx("h4", "n4", "nv4", "nv4", "NV", [(1500, 1600)], (1, "ok", "."), (1, "ok", "."))
+    gene("h6", "c6", "gene_name=GC;source_gene=GC.1", 5000, 5700)
+    tx("h6", "c6", "lift6", "TC1", "GC", [(5000, 5200), (5500, 5700)], (0, "paralog_lift", "on:GB"), (1, "ok", "on:GB"))
+    tx("h6", "c6", "novl6", "novl6", "GC", [(5000, 5200)], (0, "paralog_lift", "on:GB"), (1, "ok", "on:GB"))
+    gene("h6", "f6", "gene_name=GC;source_gene=GC.1_2", 10000, 10700)
+    tx("h6", "f6", "fill6", "TC1", "GC", [(10000, 10200), (10500, 10700)], (1, "ok", "annotation_fill"), (2, "ok", "annotation_fill"))
+    for h, ls in lines.items():
+        with open(f"{d}/{h}.gff3", "w") as out:
+            out.write("##gff-version 3\n")
+            out.writelines(ls)
+    with open(f"{d}/hap_annotations.tsv", "w") as out:
+        out.write("haplotype\tpath\n")
+        for h in lines:
+            out.write(f"{h}#1\t{d}/{h}.gff3\n")
+    with open(f"{d}/alias.tsv", "w") as out:
+        out.write("# names of one contig per row\n")
+    proj = open(f"{d}/expected.tsv").read().splitlines()
+    for name_, k in (("expected.tsv", 5), ("expected_prefer.tsv", 6)):
+        with open(f"{d}/{name_}", "w") as out:
+            out.write(proj[0] + "\tsource\trecord\n")
+            for line in proj[1:]:
+                f = line.split("\t")
+                h = f[2].split("#")[0]
+                if f[0] == "TA1" and h == "h4" and k == 6:   # the annotation overrules the projection
+                    f[4], f[5] = "discordant", "annotated:late4"
+                both = (f[0], h) == ("TA1", "h1")
+                out.write("\t".join(f) + ("\tprojected+annotated" if both else "\tprojected") + "\t.\n")
+            for t, g, h, rec, seq, *want in rows:
+                if want[k - 5] is None:
+                    continue
+                c, st, det = want[k - 5]
+                out.write(f"{t}\t{g}\t{name(h, L)}\t{c}\t{st}\t{det}\t{seq}\tannotated\t{rec}\n")
+
+
 def write_nested(d, flank=False):
     """Gene GL: exons L1 and L2 around an intron U (three nodes). Gene GS, further on: one exon, the same three
     nodes walked again, or with `flank` the middle one alone. A haplotype without GS, whose copy of GL has an
@@ -728,6 +805,8 @@ def write(case_name, d):
         return write_nested(d, case_name == "nested_flank")
     if case_name == "annotated":
         return write_annotated(d)
+    if case_name == "annotation_rules":
+        return write_annotation_rules(d)
     if case_name == "merged":
         return write_merged(d)
     if case_name == "partial_paralog":
@@ -770,9 +849,9 @@ def write(case_name, d):
             out.write(f"{t}\t{g}\t{name(h, case['L'])}\t{c}\t{st}\t{';'.join(notes) or '.'}\t{s or '.'}\n")
 
 
-def check(d, prefix):
+def check(d, prefix, expected_name="expected.tsv"):
     exp = {}
-    with open(f"{d}/expected.tsv") as fh:
+    with open(f"{d}/{expected_name}") as fh:
         fh.readline()
         for line in fh:
             t, g, h, c, st, det, s, *src = line.rstrip("\n").split("\t")
@@ -829,4 +908,4 @@ if __name__ == "__main__":
     elif sys.argv[1] == "write":
         write(sys.argv[2], sys.argv[3])
     else:
-        sys.exit(check(sys.argv[2], sys.argv[3]))
+        sys.exit(check(*sys.argv[2:5]))

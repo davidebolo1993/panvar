@@ -66,9 +66,9 @@ check "a gene cut below the share is a partial copy, with no sequence and no cop
 check "below --min-identity the gene has no copy" '[[ "$(dv TH1 h1 strict)" == no_copy:0 ]]'
 
 # haplotypes' own annotations: copies they disagree on, and annotated transcripts alone
-printf 'molecule\tgene\tstart\tend\tstrand\nh1#1#ctg1:0-12000\tGB\t0\t1\t0\n' > gb.bed
-check "the copy check reads the projection's copies, not the annotation's" \
-  'python3 "$TOOLS/../../dev/transcripts_copies.py" case_annotated/out.hst.tsv gb.bed | grep -q "^GB	1	1	"'
+printf 'molecule\tgene\tstart\tend\tstrand\nh1#1#ctg1:0-12000\tGB\t0\t1\t0\nh1#1#ctg1:0-12000\tGB\t0\t1\t0\n' > gb.bed
+check "a copy the projection lacks and the annotation has off other genes' copies counts" \
+  'python3 "$TOOLS/../../dev/transcripts_copies.py" case_annotated/out.hst.tsv gb.bed | grep -q "^GB	1	1	2	2	"'
 grep -e haplotype -e '^h3#' case_annotated/hap_annotations.tsv > h3_only.tsv
 "$BIN" transcripts -i case_annotated/locus.gfa -r ref --gtf case_annotated/genes.gtf --hap-annotations h3_only.tsv \
   --contig-alias case_annotated/alias.tsv -o h3_only -q
@@ -79,10 +79,25 @@ check "an annotated gene under another name counts by its source gene" \
 check "gene records sharing a source gene are copies of one gene" \
   '[[ "$(awk -F"\t" "\$2==\"GC\" {print \$NF}" case_annotated/out.hst.summary.tsv)" != *h5#1* ]]'
 check "an exon without its transcript record is reported" 'grep -q "1 exon row(s) whose transcript record is missing" case_annotated/log'
-check "the summary notes a gene's copies where the annotation differs" 'awk -F"\t" "\$2==\"GB\"" case_annotated/out.hst.summary.tsv | grep -q "h1#1:1/2"'
+check "the summary notes a gene's copies where the annotation differs" 'awk -F"\t" "\$2==\"GC\"" case_annotation_rules/out.hst.summary.tsv | grep -q "h6#1:1/2"'
 "$BIN" transcripts -i case_annotated/locus.gfa --hap-annotations case_annotated/hap_annotations.tsv \
   --contig-alias case_annotated/alias.tsv -o ann_only -q
 check "without --gtf, only the annotated transcripts" '[[ "$(tail -n +2 ann_only.hst.tsv | cut -f10 | sort | uniq -c | tr -s " ")" == " 13 annotated" ]]'
+
+# the rules between the projection and the annotation (case annotation_rules): rows checked above; the
+# annotation preferred; the summary's counts
+R=case_annotation_rules
+"$BIN" transcripts -i $R/locus.gfa -r ref --gtf $R/genes.gtf --hap-annotations $R/hap_annotations.tsv --contig-alias $R/alias.tsv \
+  --prefer-annotation -o $R/pref -t 2 -q
+check "with --prefer-annotation, annotated records win and none is kept out" \
+  'python3 "$TOOLS/transcript_fixture.py" check $R $R/pref expected_prefer.tsv > $R/pref.log; cat $R/pref.log; grep -q "wrong: 0" $R/pref.log'
+sm() { awk -F'\t' -v g="$2" -v c="$3" 'NR==1{for(i=1;i<=NF;i++) ix[$i]=i; next} $2==g {print $ix[c]}' "$1.hst.summary.tsv"; }
+check "the summary counts the records each rule keeps out" \
+  '[[ "$(sm $R/out GA discordant) $(sm $R/out GC paralog_lift) $(sm $R/out XL paralog_lift)" == "3 2 1" ]]'
+check "a paralog lift is no copy, a filled copy is one" '[[ "$(sm $R/out GC haplotypes_by_copies)" == "1:7,2:2" && "$(sm $R/pref GC haplotypes_by_copies)" == "1:6,2:3" ]]'
+check "without annotations the summary has no columns for their statuses" '! head -1 t1.hst.summary.tsv | grep -q -e discordant -e paralog_lift'
+"$BIN" transcripts -i locus.gfa -r ref --gtf genes.gtf --prefer-annotation -o e0 -q 2> e0.log
+check "--prefer-annotation without --hap-annotations is refused" 'grep -q "needs --hap-annotations" e0.log'
 
 # input errors
 "$BIN" transcripts -i locus.gfa -r ref -o e1 -q 2> e1.log
