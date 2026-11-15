@@ -78,6 +78,8 @@ constexpr double kSequenceMaxCellsAny = 5e8;
 // inside the alignment, where it is a gap; at the alignment's end, the bases the walk lacks would be set
 // against whatever follows.
 constexpr std::size_t kEndFlank = 100;
+// Bases of the reference walk on each side of a gene's span that its stretch takes in, at least one step.
+constexpr std::size_t kGeneFlank = 100;
 
 struct NodeTable {
     std::vector<std::string> seq;
@@ -148,7 +150,7 @@ struct Gene {
     std::size_t marker = 0;           // transcript whose exons decide copies
     std::size_t lo = 0, hi = 0;       // span on the reference walk
     std::size_t m_lo = 0, m_hi = 0;   // the marker's span: where the gene is, for telling copies apart
-    std::size_t gs = 0, ge = 0;       // reference steps [gs, ge) holding the span, one more on each side
+    std::size_t gs = 0, ge = 0;       // reference steps [gs, ge) holding the span and a flank on each side
     std::vector<char> uniq;           // per step of [gs, ge): its node occurs once there
     std::vector<char> own;            // per step of [gs, ge): the reference walks its node nowhere outside the span's steps
     std::size_t marker_bp = 0;
@@ -1435,9 +1437,13 @@ TranscriptsResult project_transcripts(const Graph& graph, const TranscriptsOptio
         const auto step_of = [&](std::size_t c) {
             return static_cast<std::size_t>(std::upper_bound(R.pref.begin(), R.pref.end(), c) - R.pref.begin()) - 1;
         };
+        // The span with a flank of at least one step and kGeneFlank bases on each side: a boundary inside a
+        // variant across the gene's first or last base needs the shared bases past the variant.
         const std::size_t s0 = step_of(g.lo), s1 = step_of(g.hi - 1);
-        g.gs = s0 > 0 ? s0 - 1 : 0;
-        g.ge = std::min(R.size(), s1 + 2);
+        g.gs = s0;
+        while (g.gs > 0 && (g.gs == s0 || R.pref[s0] - R.pref[g.gs] < kGeneFlank)) --g.gs;
+        g.ge = s1 + 1;
+        while (g.ge < R.size() && (g.ge == s1 + 1 || R.pref[g.ge] - R.pref[s1 + 1] < kGeneFlank)) ++g.ge;
         std::unordered_map<int, int> count, inside;   // steps per node over [gs, ge), and over the span alone
         for (std::size_t i = g.gs; i < g.ge; ++i) ++count[R.node[i]];
         for (std::size_t i = s0; i <= s1; ++i) ++inside[R.node[i]];

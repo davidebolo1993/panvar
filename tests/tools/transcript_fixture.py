@@ -122,6 +122,13 @@ CASES = {
         genes={"GS": ("+", {"TS1": [(1000, 1300), (2000, 2100), (3000, 3300)]})},
         haps={"h1": [("sub", (1296, 1306))], "h2": [("sub", (1996, 2006))], "h3": [("snp", 1300), ("snp", 2999)]},
         reversed={"h4": "h1"}),
+    # substitution blocks across a gene's first and last bases, cut by other haplotypes' SNPs into several
+    # nodes: the boundary keeps its offset, as inside the gene
+    "substitution_ends": dict(
+        L=5000,
+        genes={"GS": ("+", {"TS1": [(1000, 1300), (2000, 2300)]}), "GT": ("-", {"TT1": [(3000, 3200), (3500, 3800)]})},
+        haps={"h1": [("sub", (985, 1012)), ("sub", (3790, 3816))], "h2": [("snp", 990), ("snp", 995), ("snp", 3805), ("snp", 3810)]},
+        reversed={"h3": "h1"}),
     # a gene whose exons lie mostly on allele nodes (placed by sequence, with a boundary inside a deletion on
     # one haplotype), and a gene most of whose exons a deletion removes (a partial copy)
     "divergent": dict(
