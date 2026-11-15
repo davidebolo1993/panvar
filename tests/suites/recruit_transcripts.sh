@@ -132,6 +132,14 @@ printf 'TP1\tTP1\tENSG00000000002\tGP\ttranscript\t+\tga#1#chr1:120000-140000\t1
 "${RC[@]}" --save-index idxa --locus data/locus.gfa --transcripts data/ann.hst.fa 2> loga.txt; dump idxa
 check "a paralog only an annotation brings is not the locus's own: its transcript still counts ($(tx idxa.locus.tsv))" \
   '[[ "$(tx idxa.locus.tsv)" == "P$JO S$J12 R0" ]] && grep -q "records of the locus.s genes subtracted: 1;" loga.txt'
+# a processed pseudogene of the paralog inside the locus, on a haplotype of its own: its junction k-mers are
+# genomic and in no genome outside, but in the paralog's transcript
+{ cat data/locus.gfa; printf 'S\t3\t%s\nL\t2\t+\t3\t+\t0M\nP\tgr#1#chr1:120000-140000\t2+,3+\t*\n' \
+  "$(awk '/^>TP1/ {getline; print; exit}' data/tx_paralog.fa)"; } > data/locus_r.gfa
+"${RC[@]}" --save-index idxr2 --locus data/locus_r.gfa --transcripts data/locus.hst.fa 2> logr2.txt; dump idxr2 locus_r
+"$BIN" recruit --locus idxr2/locus_r.plx -i data/reads.fq -o rr2.tsv --min-sites 2 -q
+check "a retrocopy of the paralog in the locus: its junctions are shared, and the paralog's reads not certain ($(certain rr2.tsv) of 200)" \
+  '[[ $(awk -F"\t" "NR>1 && \$8==0 && \$2==\"P\" && \$7==\"3\"" idxr2.locus_r.tsv | wc -l) -lt 100 && $(certain rr2.tsv) -eq 0 ]] && grep -q "made shared: [1-9]" logr2.txt'
 "${BG[@]}" -o s1 --add --transcriptome tx=data/tx_similar.fa
 "${RC[@]}" --save-index idxg "${TX[@]}" 2> logg.txt; dump idxg
 check "a record of another gene id, or of a symbol that differs by a suffix, is not the gene's own ($(tx idxg.locus.tsv))" \

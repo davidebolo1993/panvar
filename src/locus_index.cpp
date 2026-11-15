@@ -122,8 +122,8 @@ struct OwnGenes {
 struct LocusWork {
     LocusIndex idx;
     OwnGenes genes;                                    // the genes its transcripts are of
-    std::vector<std::uint64_t> tx_count, tx_sub, cross;   // per k-mer (transcript-only ones): in the transcriptome,
-                                                          // in its own genes' records there, in other loci
+    std::vector<std::uint64_t> tx_count, tx_sub, cross;   // per k-mer, with transcripts: in the transcriptome, in its
+                                                          // own genes' records there, in other loci (transcript-only ones)
     std::vector<std::uint64_t> counts;                 // background counts per k-mer
     std::vector<std::uint64_t> sub, sub_trim;          // own occurrences in the extended / trimmed spans
     std::map<std::string, std::vector<anchors::Span>> spans;   // per genome: the located copies, then the pieces
@@ -146,7 +146,7 @@ std::string transcripts_table(const std::string& fa) {
 // The transcripts' checksum: the FASTA's, and its table's where there is one, as nodes are placed through it.
 // The transcripts' checksum, led by the revision of the rules that label their k-mers: an index built with
 // transcripts under other rules is rebuilt, and one without transcripts keeps its bytes.
-constexpr const char* kTranscriptRules = "r2:";
+constexpr const char* kTranscriptRules = "r3:";
 
 std::string transcripts_checksum_of(const std::string& fa) {
     const std::string t = transcripts_table(fa);
@@ -1108,7 +1108,7 @@ std::vector<LocusIndex> build(const BuildOptions& o) {
                 for (const std::size_t li : with) {
                     LocusWork& w = work[li];
                     for (std::size_t i = 0; i < w.idx.codes.size(); ++i)
-                        if (w.idx.transcript_only[i]) w.tx_count[i] += seg.count(w.idx.codes[i]);
+                        w.tx_count[i] += seg.count(w.idx.codes[i]);
                 }
                 for (const auto& ge : ts.genomes) {
                     check_unchanged(ge);
@@ -1124,7 +1124,7 @@ std::vector<LocusIndex> build(const BuildOptions& o) {
                             ++w.idx.transcriptome_records;
                             kmer::for_each_canonical_kmer(seq.data(), seq.size(), kK, [&](std::uint64_t c, std::size_t, bool) {
                                 const std::int64_t i = w.idx.find(c);
-                                if (i >= 0 && w.idx.transcript_only[static_cast<std::size_t>(i)]) ++w.tx_sub[static_cast<std::size_t>(i)];
+                                if (i >= 0) ++w.tx_sub[static_cast<std::size_t>(i)];
                             });
                         }
                         seq.clear();
@@ -1181,6 +1181,7 @@ std::vector<LocusIndex> build(const BuildOptions& o) {
         x.cls.resize(n);
         x.outside.resize(n);
         const std::uint64_t shared_max = static_cast<std::uint64_t>(x.informative_max) * x.haplotypes;
+        std::uint64_t in_other_genes = 0;
         auto class_of = [&](std::uint64_t out) { return out == 0 ? kPrivate : out <= shared_max ? kShared : kRepeat; };
         for (std::size_t i = 0; i < n; ++i) {
             // a transcript-only k-mer: nothing subtracted from the genomes' count (none holds a transcript), and
@@ -1197,8 +1198,16 @@ std::vector<LocusIndex> build(const BuildOptions& o) {
             std::uint8_t c = class_of(out);
             if (c != class_of(out_trim) && c == kPrivate) { c = kShared; ++x.span_demoted; }
             if (c == kPrivate && kmer::dust_score(x.codes[i], kK) >= x.dust) { c = kShared; ++x.dust_demoted; }
+            // A genomic k-mer no genome holds outside, in another gene's transcript: a processed pseudogene in
+            // the locus carrying that gene's junctions, whose RNA reads would otherwise be certain.
+            if (c == kPrivate && !transcript_only(x, i) && !w.tx_count.empty() && w.tx_count[i] > w.tx_sub[i]) {
+                c = kShared;
+                ++in_other_genes;
+            }
             x.cls[i] = c;
         }
+        if (!w.tx_count.empty() && !x.transcriptome_names.empty())
+            log("locus: " + x.name + "; genomic k-mers private but in other genes' transcripts, made shared: " + std::to_string(in_other_genes));
         if (x.negative > 0)
             throw std::runtime_error("recruit: " + x.name + ": " + std::to_string(x.negative) +
                                      " k-mers occur more often in the located copies than the background counted: a genome file differs from the one counted");
