@@ -125,6 +125,8 @@ CASES = {
     # a deleted gene whose exons a paralog elsewhere shares: on the paralog's copy, its transcripts stay
     # without a copy (write_paralog)
     "partial_paralog": dict(),
+    # a gene deleted beside a paralog that follows it on the same node (write_adjacent_paralog)
+    "paralog_adjacent": dict(),
     # a short gene on the nodes of a stretch inside a longer gene, and a haplotype without the short gene
     # whose copy of the longer one carries an allele there (write_nested)
     "nested": dict(),
@@ -612,28 +614,22 @@ def write_merged(d):
             out.write(f"TM2\tGM\t{name(h, L)}\t1\tok\t.\t{tm2}\n")
 
 
-def write_paralog(d):
-    """Gene GX: exons X1, X2 and a long one in B. Gene GY, further on: X1 and X2 walked again around another
-    intron, and an exon of its own. A haplotype lacks GX with its flank B. GX's nodes X1 and X2 are on it, in
-    GY's copy, and TX2 has no other exon: but the reference walks them outside GX too, so they are not GX's
-    there, and GX has no copy. The same haplotype reversed."""
-    rnd = random.Random(19)
-    seq = lambda n: "".join(rnd.choice("ACGT") for _ in range(n))
-    size = dict(A=1000, X1=300, I1=500, X2=300, B=3000, S=200, I2=500, C=500, Y3=300, T=500)
-    nodes = {n: seq(k) for n, k in size.items()}
+def node_locus(d, seed, size, walk, exons):
+    """Writes locus.gfa and genes.gtf of a locus drawn as nodes: `size` per node, `walk` per haplotype as node
+    names (an "r" + name entry is that haplotype written reversed), `exons` per gene and transcript as
+    (step, start, end) on the reference walk, the first transcript the canonical one. Returns the nodes'
+    sequences, the reference steps' positions and the path's length."""
+    rnd = random.Random(seed)
+    nodes = {n: "".join(rnd.choice("ACGT") for _ in range(k)) for n, k in size.items()}
     ids = {n: str(k + 1) for k, n in enumerate(nodes)}
-    walk = {"ref": ["A", "X1", "I1", "X2", "B", "S", "X1", "I2", "X2", "C", "Y3", "T"],
-            "h1": ["A", "X1", "I2", "X2", "C", "Y3", "T"]}
-    steps = {h: [(ids[n], "+") for n in w] for h, w in walk.items()}
-    steps["h2"] = [(n, "-") for n, _ in reversed(steps["h1"])]
-    L = sum(size[n] for n in walk["ref"])
+    steps = {}
+    for h, w in walk.items():
+        steps[h] = [(ids[n], "+") for n in w] if isinstance(w, list) else [(n, "-") for n, _ in reversed(steps[w])]
     at, pos = [], 0
     for n in walk["ref"]:
         at.append(pos)
         pos += size[n]
-    exons = {"GX": {"TX1": [(at[1], at[1] + 300), (at[3], at[3] + 300), (at[4] + 200, at[4] + 2800)],
-                    "TX2": [(at[1], at[1] + 300), (at[3], at[3] + 300)]},
-             "GY": {"TY1": [(at[6], at[6] + 300), (at[8], at[8] + 300), (at[10], at[10] + 300)]}}
+    L = pos
     with open(f"{d}/locus.gfa", "w") as out:
         out.write("H\tVN:Z:1.0\n")
         for n, s in nodes.items():
@@ -645,22 +641,53 @@ def write_paralog(d):
     with open(f"{d}/genes.gtf", "w") as out:
         for g, txs in exons.items():
             for k, (t, ex) in enumerate(txs.items()):
+                ex = [(at[i] + a, at[i] + b) for i, a, b in ex]
                 attr = (f'gene_id "{g}"; gene_name "{g}"; gene_biotype "protein_coding"; transcript_id "{t}"; '
                         f'transcript_name "{t}";' + (' tag "Ensembl_canonical";' if k == 0 else ""))
                 out.write(f"chr1\ttest\ttranscript\t{ex[0][0] + OFFSET + 1}\t{ex[-1][1] + OFFSET}\t.\t+\t.\t{attr}\n")
                 for a, b in ex:
                     out.write(f"chr1\ttest\texon\t{a + OFFSET + 1}\t{b + OFFSET}\t.\t+\t.\t{attr}\n")
-    tx2 = nodes["X1"] + nodes["X2"]
-    spliced = {"TX1": tx2 + nodes["B"][200:2800], "TX2": tx2, "TY1": tx2 + nodes["Y3"]}
+    return nodes, at, L
+
+
+def write_rows(d, L, rows):
+    """expected.tsv from (transcript, gene, haplotype, copy, status, sequence) rows."""
     with open(f"{d}/expected.tsv", "w") as out:
         out.write("transcript_id\tgene_name\thaplotype\tcopy\tstatus\tdetail\tsequence\n")
-        for h in ("ref", "h1", "h2"):
-            for g, txs in exons.items():
-                for t in txs:
-                    if g == "GX" and h != "ref":
-                        out.write(f"{t}\t{g}\t{name(h, L)}\t0\tno_copy\t.\t.\n")
-                    else:
-                        out.write(f"{t}\t{g}\t{name(h, L)}\t1\tok\t.\t{spliced[t]}\n")
+        for t, g, h, c, st, s in rows:
+            out.write(f"{t}\t{g}\t{name(h, L)}\t{c}\t{st}\t.\t{s or '.'}\n")
+
+
+def write_paralog(d):
+    """Gene GX: exons X1, X2 and a long one in B. Gene GY, further on: X1 and X2 walked again around another
+    intron, and an exon of its own. A haplotype lacks GX with its flank B. GX's nodes X1 and X2 are on it, in
+    GY's copy, and TX2 has no other exon: but the reference walks them outside GX too, so they are not GX's
+    there, and GX has no copy. The same haplotype reversed."""
+    size = dict(A=1000, X1=300, I1=500, X2=300, B=3000, S=200, I2=500, C=500, Y3=300, T=500)
+    walk = {"ref": ["A", "X1", "I1", "X2", "B", "S", "X1", "I2", "X2", "C", "Y3", "T"],
+            "h1": ["A", "X1", "I2", "X2", "C", "Y3", "T"], "h2": "h1"}
+    exons = {"GX": {"TX1": [(1, 0, 300), (3, 0, 300), (4, 200, 2800)], "TX2": [(1, 0, 300), (3, 0, 300)]},
+             "GY": {"TY1": [(6, 0, 300), (8, 0, 300), (10, 0, 300)]}}
+    nodes, _, L = node_locus(d, 19, size, walk, exons)
+    tx2 = nodes["X1"] + nodes["X2"]
+    spliced = {"TX1": tx2 + nodes["B"][200:2800], "TX2": tx2, "TY1": tx2 + nodes["Y3"]}
+    write_rows(d, L, [(t, g, h, *((0, "no_copy", "") if g == "GX" and h != "ref" else (1, "ok", spliced[t])))
+                      for h in ("ref", "h1", "h2") for g, txs in exons.items() for t in txs])
+
+
+def write_adjacent_paralog(d):
+    """Gene GX: TX1 on M and X, TX2 on X alone. Gene GY, right after it: X walked again, and Y. A haplotype
+    lacks M and the first X; the X left is too little of TX1 for a partial copy. GX's stretch of the reference reaches one step past its last exon, onto GY's X,
+    but X is not GX's own: GX has no copy, and GY keeps its X. The same haplotype reversed."""
+    size = dict(A=1000, M=1200, X=300, Y=300, Q=1000)
+    walk = {"ref": ["A", "M", "X", "X", "Y", "Q"], "h1": ["A", "X", "Y", "Q"], "h2": "h1"}
+    exons = {"GX": {"TX1": [(1, 0, 1000), (2, 50, 250)], "TX2": [(2, 50, 250)]},
+             "GY": {"TY1": [(3, 50, 250), (4, 50, 250)]}}
+    nodes, _, L = node_locus(d, 29, size, walk, exons)
+    x = nodes["X"][50:250]
+    spliced = {"TX1": nodes["M"][:1000] + x, "TX2": x, "TY1": x + nodes["Y"][50:250]}
+    write_rows(d, L, [(t, g, h, *((0, "no_copy", "") if g == "GX" and h != "ref" else (1, "ok", spliced[t])))
+                      for h in ("ref", "h1", "h2") for g, txs in exons.items() for t in txs])
 
 
 def write(case_name, d):
@@ -675,6 +702,8 @@ def write(case_name, d):
         return write_merged(d)
     if case_name == "partial_paralog":
         return write_paralog(d)
+    if case_name == "paralog_adjacent":
+        return write_adjacent_paralog(d)
     ref, nodes, walks, seqs, maps = build(case)
     edges = set()
     for steps in walks.values():

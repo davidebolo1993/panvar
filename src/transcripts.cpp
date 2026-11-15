@@ -144,7 +144,7 @@ struct Gene {
     std::size_t m_lo = 0, m_hi = 0;   // the marker's span: where the gene is, for telling copies apart
     std::size_t gs = 0, ge = 0;       // reference steps [gs, ge) holding the span, one more on each side
     std::vector<char> uniq;           // per step of [gs, ge): its node occurs once there
-    std::vector<char> own;            // per step of [gs, ge): the reference walks its node nowhere outside them
+    std::vector<char> own;            // per step of [gs, ge): the reference walks its node nowhere outside the span's steps
     std::size_t marker_bp = 0;
     std::vector<std::pair<std::size_t, std::size_t>> tandem_spans;   // its transcripts' tandem stretches
 };
@@ -1352,13 +1352,15 @@ TranscriptsResult project_transcripts(const Graph& graph, const TranscriptsOptio
         const std::size_t s0 = step_of(g.lo), s1 = step_of(g.hi - 1);
         g.gs = s0 > 0 ? s0 - 1 : 0;
         g.ge = std::min(R.size(), s1 + 2);
-        std::unordered_map<int, int> count;
+        std::unordered_map<int, int> count, inside;   // steps per node over [gs, ge), and over the span alone
         for (std::size_t i = g.gs; i < g.ge; ++i) ++count[R.node[i]];
+        for (std::size_t i = s0; i <= s1; ++i) ++inside[R.node[i]];
         g.uniq.resize(g.ge - g.gs);
         g.own.resize(g.ge - g.gs);
         for (std::size_t i = g.gs; i < g.ge; ++i) {
             g.uniq[i - g.gs] = count[R.node[i]] == 1;
-            g.own[i - g.gs] = count[R.node[i]] == walked[static_cast<std::size_t>(R.node[i])];
+            // the anchoring steps lie outside the gene: a neighbour's node there is not the gene's
+            g.own[i - g.gs] = inside[R.node[i]] == walked[static_cast<std::size_t>(R.node[i])];
         }
         genes.push_back(std::move(g));
     }
