@@ -123,6 +123,15 @@ check "reads of the paralog's mRNA are not certain once the transcriptome holds 
   '[[ $(certain r5.tsv) -eq 200 && $(certain r6.tsv) -eq 0 ]]'
 check "the gene's own reads, across its own junctions, stay certain ($(certain o6.tsv) of 200)" '[[ $(certain o6.tsv) -eq 200 ]]'
 check "reads across an exon skip no transcript has are not certain with a transcriptome" '[[ $(grep -c "^skip.*	certain	" other6.tsv) -eq 0 ]]'
+# the locus's transcripts with an annotated record of the paralog on its haplotype: the paralog's gene is
+# not the locus's own, so its record in the transcriptome still counts
+cp data/locus.hst.fa data/ann.hst.fa; cp data/locus.hst.tsv data/ann.hst.tsv
+gaseq=$(awk '$1=="S" && $2=="2" {print substr($3, 1001, 980)}' data/locus.gfa)
+printf '>TP1|GP|ga#1#chr1:120000-140000|1|annotated:cat1 source=annotated status=ok\n%s\n' "$gaseq" >> data/ann.hst.fa
+printf 'TP1\tTP1\tENSG00000000002\tGP\ttranscript\t+\tga#1#chr1:120000-140000\t1\t1\tannotated\tcat1\tok\t.\t1000\t1980\t980\t1\t.\t.\t.\t0\t0\t1000\t980\t.\n' >> data/ann.hst.tsv
+"${RC[@]}" --save-index idxa --locus data/locus.gfa --transcripts data/ann.hst.fa 2> loga.txt; dump idxa
+check "a paralog only an annotation brings is not the locus's own: its transcript still counts ($(tx idxa.locus.tsv))" \
+  '[[ "$(tx idxa.locus.tsv)" == "P$JO S$J12 R0" ]] && grep -q "records of the locus.s genes subtracted: 1;" loga.txt'
 "${BG[@]}" -o s1 --add --transcriptome tx=data/tx_similar.fa
 "${RC[@]}" --save-index idxg "${TX[@]}" 2> logg.txt; dump idxg
 check "a record of another gene id, or of a symbol that differs by a suffix, is not the gene's own ($(tx idxg.locus.tsv))" \

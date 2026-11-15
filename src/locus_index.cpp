@@ -144,9 +144,13 @@ std::string transcripts_table(const std::string& fa) {
 }
 
 // The transcripts' checksum: the FASTA's, and its table's where there is one, as nodes are placed through it.
+// The transcripts' checksum, led by the revision of the rules that label their k-mers: an index built with
+// transcripts under other rules is rebuilt, and one without transcripts keeps its bytes.
+constexpr const char* kTranscriptRules = "r2:";
+
 std::string transcripts_checksum_of(const std::string& fa) {
     const std::string t = transcripts_table(fa);
-    return file_checksum(fa) + (t.empty() ? std::string() : "+" + file_checksum(t));
+    return kTranscriptRules + file_checksum(fa) + (t.empty() ? std::string() : "+" + file_checksum(t));
 }
 
 bool ensembl_gene_id(const std::string& s) { return gene_id_key(s + ".1") == s; }
@@ -256,7 +260,7 @@ void for_each_transcript(const std::string& fa, const Graph& g, const std::vecto
     std::unordered_set<std::uint64_t> seen;                        // sequences passed on, by a 64-bit hash
     GzLineReader in(fa);
     if (!in.ok()) throw std::runtime_error("recruit: cannot read " + fa);
-    std::string line, name, status, seq;
+    std::string line, name, status, source, seq;
     auto flush = [&] {
         if (name.empty()) return;
         static const std::set<std::string> written = {"ok", "splice_site_changed", "boundary_moved", "clipped_at_edge", "intron_lost"};
@@ -269,8 +273,11 @@ void for_each_transcript(const std::string& fa, const Graph& g, const std::vecto
         if (!take || seq.size() < kK) { ++skipped; return; }
         ++used;
         ++tally[0];
-        {   // the record's gene: its id and name in the table; without one, the name in the record's own name
-            // (transcript|gene|haplotype|copy)
+        // The record's gene is one of the locus's own when the record is projected: the reference annotation
+        // places that gene in the locus. A gene only a haplotype's annotation brings may be a paralog lifted
+        // onto it, whose transcripts elsewhere are what labels its junctions shared. The gene: its id and name
+        // in the table; without one, the name in the record's own name (transcript|gene|haplotype|copy).
+        if (source != "annotated") {
             const auto usable = [](const std::string& v) { return !v.empty() && v != "."; };
             const auto at = place.find(name);
             const std::size_t a = name.find('|'), b = a == std::string::npos ? a : name.find('|', a + 1);
@@ -319,6 +326,8 @@ void for_each_transcript(const std::string& fa, const Graph& g, const std::vecto
             name = line.substr(1, sp == std::string::npos ? std::string::npos : sp - 1);
             const std::size_t st = line.find(" status=");
             if (st != std::string::npos) status = line.substr(st + 8, line.find(' ', st + 8) - st - 8);
+            const std::size_t so = line.find(" source=");
+            source = so == std::string::npos ? std::string() : line.substr(so + 8, line.find(' ', so + 8) - so - 8);
             continue;
         }
         seq += line;
