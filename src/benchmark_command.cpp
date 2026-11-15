@@ -562,19 +562,27 @@ std::vector<std::array<std::size_t, 3>> kmer_blocks(const std::string& target, c
             if (++run >= k) fn(v, i + 1 - k);
         }
     };
-    std::unordered_map<std::uint64_t, std::size_t> tpos;   // k-mer -> position, SIZE_MAX when repeated
-    tpos.reserve(target.size());
+    // The target's k-mers in one open-addressing table (no 31-mer is UINT64_MAX): tpos is UINT32_MAX when repeated
+    if (std::max(target.size(), query.size()) >= UINT32_MAX) throw std::runtime_error("benchmark: a sequence is too long to anchor");
+    struct Slot { std::uint64_t key = UINT64_MAX; std::uint32_t tpos = 0, qcount = 0; };
+    int shift = 60;   // the table holds 2^(64 - shift) slots, twice the target's k-mers or more
+    while ((std::size_t{1} << (64 - shift)) < 2 * target.size()) --shift;
+    std::vector<Slot> table(std::size_t{1} << (64 - shift));
+    const auto slot = [&](std::uint64_t v) -> Slot& {
+        std::size_t i = v * 0x9E3779B97F4A7C15ull >> shift;
+        while (table[i].key != v && table[i].key != UINT64_MAX) i = (i + 1) & (table.size() - 1);
+        return table[i];
+    };
     scan(target, [&](std::uint64_t v, std::size_t p) {
-        auto [it, fresh] = tpos.try_emplace(v, p);
-        if (!fresh) it->second = SIZE_MAX;
+        Slot& s = slot(v);
+        s.tpos = s.key == v ? UINT32_MAX : static_cast<std::uint32_t>(p);
+        s.key = v;
     });
-    std::unordered_map<std::uint64_t, std::size_t> qcount;
-    qcount.reserve(query.size());
-    scan(query, [&](std::uint64_t v, std::size_t) { ++qcount[v]; });
+    scan(query, [&](std::uint64_t v, std::size_t) { if (Slot& s = slot(v); s.key == v) ++s.qcount; });
     std::vector<std::pair<std::size_t, std::size_t>> hits;   // (query pos, target pos), query order
     scan(query, [&](std::uint64_t v, std::size_t p) {
-        const auto it = tpos.find(v);
-        if (it != tpos.end() && it->second != SIZE_MAX && qcount[v] == 1) hits.emplace_back(p, it->second);
+        const Slot& s = slot(v);
+        if (s.key == v && s.tpos != UINT32_MAX && s.qcount == 1) hits.emplace_back(p, s.tpos);
     });
     // Only long runs anchor: in unique sequence they run for as long as the sequence is unique, while
     // inside a repeat a copy-specific difference makes a run of a few dozen bases.
