@@ -123,6 +123,14 @@ check "--max-fa-seq-bp 65: only the 60 bp INSSEQ in the side FASTA" \
 "$BIN" call -i "$OUT/cb.sorted.gfa" -c "$OUT/cb.bubbles.csv" -r "$REF_NAME" -o "$OUT/cmax" --max-seq-bp 50 --max-fa-seq-bp 55 -q >/dev/null 2>&1
 check "--max-fa-seq-bp 55: nothing in the side FASTA, none left from the run before (SEQ_FA records:file)" \
   "$(grep -v '^#' "$OUT/cmax.region.vcf" | grep -c 'SEQ_FA='):$([ -e "$OUT/cmax.alt_seqs.fa" ] && echo left || echo none)" "0:none"
+# An index of the side FASTA left by an earlier run (samtools faidx, bgzip) names offsets in a file that is no
+# longer there, or no longer the same: a run at the prefix removes it, whether it writes a FASTA or not.
+idx() { for x in fai gzi; do [ -e "$OUT/cmax.alt_seqs.fa.$x" ] && printf '%s ' "$x"; done; echo .; }
+touch "$OUT/cmax.alt_seqs.fa.fai" "$OUT/cmax.alt_seqs.fa.gzi"
+"$BIN" call -i "$OUT/cb.sorted.gfa" -c "$OUT/cb.bubbles.csv" -r "$REF_NAME" -o "$OUT/cmax" --max-seq-bp 50 -q >/dev/null 2>&1
+a=$(idx); touch "$OUT/cmax.alt_seqs.fa.fai" "$OUT/cmax.alt_seqs.fa.gzi"
+"$BIN" call -i "$OUT/cb.sorted.gfa" -c "$OUT/cb.bubbles.csv" -r "$REF_NAME" -o "$OUT/cmax" -q >/dev/null 2>&1
+check "an earlier index of the side FASTA is removed, the FASTA rewritten or not (rewritten:none)" "$a:$(idx)" ".:."
 
 # The interval in the reference's name: pggb, odgi and impg write a 0-based start with a half-open end
 # (end - start = the path's length), panvar's own W-line names are 1-based inclusive (end - start + 1).

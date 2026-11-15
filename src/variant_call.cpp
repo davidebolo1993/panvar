@@ -6379,6 +6379,10 @@ void call_variants(
     {
         std::vector<std::string> stale;
         if (!fa_active) stale.push_back(fa_path);
+        // An index of the side FASTA (samtools faidx, bgzip) holds the offsets of the file it was made from,
+        // which this run replaced or removed.
+        stale.push_back(fa_path + ".fai");
+        stale.push_back(fa_path + ".gzi");
         if (!options.write_variant_nodes) {
             stale.push_back(options.out_prefix + ".variant_nodes.tsv");
             stale.push_back(options.out_prefix + ".carrier_events.tsv");

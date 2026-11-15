@@ -95,7 +95,7 @@ panphorte's unit-graph table is read from the site table's prefix (or `--panphor
 | `<prefix>.bubble_<id>.vcf` | one site's records |
 | `<prefix>.variant_nodes.tsv` | per record, the nodes it involves; read by `describe --variant-nodes` |
 | `<prefix>.carrier_events.tsv` | per record and carrier, the event that carrier holds; read by `benchmark` |
-| `<prefix>.alt_seqs.fa` | sequences too long for their record's line (`SEQ_FA`), each as `<ID>.<field>`; written when there are any |
+| `<prefix>.alt_seqs.fa` | sequences too long for their record's line (`SEQ_FA`), each as `<ID>.<field>`; written when there are any. A run removes one an earlier run left at the prefix, and its index (`.fai`, `.gzi`) either way, whose offsets would no longer match |
 | `<prefix>.node_genes.tsv`, `<prefix>.dup_gene_cn.tsv` | with `--gtf`: genes per node, and copy number per gene and haplotype |
 
 VCF 4.2. `POS` is the base before the event, `END` its last reference base. `FILTER` is `PASS`: a record that fails a filter is not written. `GT` is `1` for a carrier, `0` for reference-like, `.` for no allele there. Main `INFO` fields:
