@@ -4,7 +4,8 @@ relative to it. The expected transcripts are spliced from each haplotype's own s
 panvar.
 
   transcript_fixture.py cases                          the case names
-  transcript_fixture.py write <case> <dir>             writes locus.gfa, genes.gtf, expected.tsv
+  transcript_fixture.py write <case> <dir>             writes locus.gfa, genes.gtf, expected.tsv; case random:<seed>
+                                                       is a random one (random_case)
   transcript_fixture.py check <dir> <prefix> [<exp>]   compares <prefix>.hst.tsv/.hst.fa with expected.tsv (or <exp>)
 
 Variants on the reference (0-based, half-open): ("snp", p), ("del", (a, b)), ("sub", (a, b)), a stretch of the
@@ -857,7 +858,49 @@ def write_adjacent_paralog(d):
                       for h in ("ref", "h1", "h2") for g, txs in exons.items() for t in txs])
 
 
+def random_case(seed):
+    """A random locus: up to three genes of two to four exons (a second isoform skipping exon 2), and five
+    haplotypes, each with up to four SNPs, deletions and substitution blocks, most near an exon boundary,
+    and half with a whole gene duplicated in tandem; two haplotypes are also written reversed."""
+    rnd = random.Random(seed)
+    L, genes, pos = 9000, {}, 600
+    while pos < L - 2500 and len(genes) < 3:
+        exons, p = [], pos
+        for _ in range(rnd.randint(2, 4)):
+            ln = rnd.randint(150, 300)
+            exons.append((p, p + ln))
+            p += ln + rnd.randint(60, 500)
+        txs = {f"T{len(genes)}a": exons}
+        if len(exons) >= 3 and rnd.random() < 0.6:
+            txs[f"T{len(genes)}b"] = [exons[0]] + exons[2:]
+        genes[f"G{len(genes)}"] = (rnd.choice("+-"), txs)
+        pos = p + rnd.randint(300, 900)
+    bounds = sorted({c for _, txs in genes.values() for ex in txs.values() for e in ex for c in e})
+    haps = {}
+    for h in range(1, 6):
+        vs, used = [], []
+        free = lambda a, b: all(b + 2 <= x or a >= y + 2 for x, y in used) and 5 < a and b < L - 5
+        if rnd.random() < 0.5:
+            _, txs = genes[rnd.choice(list(genes))]
+            lo = min(a for ex in txs.values() for a, _ in ex) - rnd.randint(30, 150)
+            hi = max(b for ex in txs.values() for _, b in ex) + rnd.randint(30, 150)
+            vs.append(("dup", (lo, hi)))
+            used += [(lo - 3, lo + 3), (hi - 3, hi + 3)]
+        for _ in range(rnd.randint(1, 4)):
+            kind = rnd.choice(["snp", "del", "del", "sub"])
+            near = rnd.choice(bounds) + rnd.randint(-12, 12) if rnd.random() < 0.8 else rnd.randint(100, L - 400)
+            ln = 1 if kind == "snp" else rnd.choice([1, 2, 3, 5, 8, 12] if kind == "del" else [4, 6, 10, 20])
+            a = near - (0 if kind == "snp" else rnd.randint(0, ln))
+            if free(a, a + ln):
+                vs.append((kind, a if kind == "snp" else (a, a + ln)))
+                used.append((a, a + ln))
+        haps[f"h{h}"] = vs
+    return dict(L=L, genes=genes, haps=haps, reversed={"h6": "h1", "h7": "h3"})
+
+
 def write(case_name, d):
+    if case_name.startswith("random:"):   # random:<seed>
+        CASES[case_name] = random_case(int(case_name.split(":")[1]))
     case = CASES[case_name]
     if case_name.startswith("tandem"):
         return write_tandem(case, d)

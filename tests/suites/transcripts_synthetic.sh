@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # panvar transcripts on synthetic loci (transcript_fixture.py cases): exon SNPs and deletions, splice-site
 # variants, a deletion across an exon boundary, duplicated and deleted genes, minus-strand genes and walks
-# written reversed, and the other cases its CASES list. Every row's status, notes and sequence against
-# transcripts spliced from each haplotype independently; the same output at 1 and 2 threads; input errors
-# stop the run.
+# written reversed, the other cases its CASES list, and 100 seeded random cases. Every row's status, notes
+# and sequence against transcripts spliced from each haplotype independently; the same output at 1 and 2
+# threads; input errors stop the run.
 #   transcripts_synthetic.sh <panvar_bin> <tests/tools dir> <out_dir>
 set -uo pipefail
 
@@ -55,6 +55,21 @@ for c in $(python3 "$TOOLS/transcript_fixture.py" cases); do
   check "case $c: the reference walk gives back its annotation" '! grep -q "does not give back" "case_$c/log"'
   check "case $c: every row matches the haplotypes' own transcripts" 'python3 "$TOOLS/transcript_fixture.py" check "case_$c" "case_$c/out" > "case_$c/check.log"; cat "case_$c/check.log"; grep -q "wrong: 0" "case_$c/check.log"'
 done
+
+# seeded random cases (random_case): genes, SNPs, deletions, substitution blocks and whole-gene tandem
+# duplications, every row against the haplotypes' own transcripts
+wrong=""
+for seed in $(seq 1 100); do
+  d="random_$seed"; mkdir -p "$d"
+  python3 "$TOOLS/transcript_fixture.py" write "random:$seed" "$d"
+  "$BIN" transcripts -i "$d/locus.gfa" -r ref --gtf "$d/genes.gtf" -o "$d/out" -t 2 -q 2> "$d/log"
+  if python3 "$TOOLS/transcript_fixture.py" check "$d" "$d/out" > "$d/check.log" && ! grep -q "does not give back" "$d/log"; then
+    rm -rf "$d"
+  else
+    wrong+=" $seed"
+  fi
+done
+check "100 random cases match the haplotypes' own transcripts${wrong:+ (seeds failing:$wrong)}" '[[ -z "$wrong" ]]'
 
 # a gene on allele nodes, and one cut below the share
 dv() { awk -F'\t' -v t="$1" -v h="$2" '$1==t && $7 ~ "^"h"#" {print $12":"$8}' "${3:-case_divergent/out}.hst.tsv"; }
