@@ -153,6 +153,11 @@ struct Pass {
     std::size_t gene = 0;
     bool reverse = false;
     std::vector<long> match;
+    // where the walk's stretch is a second copy of a segment too (match_again): per reference step of that
+    // copy, which `match` leaves out, its walk step or -1, and the copy's spans on the reference walk; empty
+    // where there is none
+    std::vector<long> again;
+    std::vector<std::pair<std::size_t, std::size_t>> again_spans;
     std::size_t first = 0, last = 0;  // first and last matched steps, relative to gs
     std::size_t h_lo = 0, h_hi = 0;   // bases of the walk as written
     std::vector<std::size_t> walk_steps;   // the matched steps of the walk as written, ascending
@@ -335,13 +340,13 @@ struct CutOnWalk {
     bool in_variant = false;   // kept at its offset inside a substitution of the reference's length
 };
 
-// Carry reference cut c (between bases) to the walk through pass p. `start`: c opens an exon.
-CutOnWalk map_cut(const Walk& R, const Gene& g, const Pass& p, const Walk& W, std::size_t c, bool start) {
+// Carry reference cut c (between bases) to the walk through a pass's match. `start`: c opens an exon.
+CutOnWalk map_cut(const Walk& R, const Gene& g, const std::vector<long>& match, const Walk& W, std::size_t c, bool start) {
     CutOnWalk out;
     // The step holding base c, or the step after the span when c ends the reference walk.
     const std::size_t i = static_cast<std::size_t>(std::upper_bound(R.pref.begin(), R.pref.end(), c) - R.pref.begin()) - 1;
     const std::size_t off = c - R.pref[i];
-    const auto m = [&](std::size_t k) -> long { return k >= g.gs && k < g.ge ? p.match[k - g.gs] : -1; };
+    const auto m = [&](std::size_t k) -> long { return k >= g.gs && k < g.ge ? match[k - g.gs] : -1; };
     if (off > 0 && m(i) >= 0) {
         out.ok = true;
         out.pos = W.pref[static_cast<std::size_t>(m(i))] + off;
@@ -389,13 +394,40 @@ CutOnWalk map_cut(const Walk& R, const Gene& g, const Pass& p, const Walk& W, st
     return out;
 }
 
-bool exon_shared(const Walk& R, const Gene& g, const Pass& p, std::size_t cs, std::size_t ce) {
-    for (std::size_t k = 0; k < p.match.size(); ++k) {
-        if (p.match[k] < 0) continue;
+bool exon_shared(const Walk& R, const Gene& g, const std::vector<long>& match, std::size_t cs, std::size_t ce) {
+    for (std::size_t k = 0; k < match.size(); ++k) {
+        if (match[k] < 0) continue;
         const std::size_t i = g.gs + k;
         if (R.pref[i] < ce && R.pref[i + 1] > cs) return true;
     }
     return false;
+}
+
+// A deletion from one copy of a segment into the next, where the graph folds the copies onto the same nodes,
+// leaves the walk one copy with alleles of both. The pass follows one reference copy and leaves the other
+// unmatched, though the walk passes nodes that only that copy has. A chain of such nodes (the gene's own, on
+// reference steps the pass leaves out, inside the pass on the walk) is that other copy over the same
+// stretch of the walk: the steps between its anchors are aligned node by node, so that an exon lying
+// between them is found there too. Chains come best first; one over reference steps already taken is left.
+void match_again(const Walk& R, const Gene& g, const Walk& W, const std::vector<std::vector<Anchor>>& chains,
+                 const NodeTable& t, Pass& p) {
+    const std::size_t w0 = static_cast<std::size_t>(p.match[p.first]), w1 = static_cast<std::size_t>(p.match[p.last]);
+    for (const std::vector<Anchor>& c : chains) {
+        std::vector<const Anchor*> left;
+        for (const Anchor& a : c)
+            if (p.match[a.i - g.gs] < 0 && a.j > w0 && a.j < w1) left.push_back(&a);
+        if (left.size() < 2) continue;
+        const std::size_t lo = R.pref[left.front()->i], hi = R.pref[left.back()->i + 1];
+        bool taken = false;
+        for (const auto& [s0, s1] : p.again_spans) taken = taken || (lo < s1 && s0 < hi);
+        if (taken) continue;
+        if (p.again.empty()) p.again.assign(p.match.size(), -1);
+        for (std::size_t k = 0; k < left.size(); ++k) {
+            p.again[left[k]->i - g.gs] = static_cast<long>(left[k]->j);
+            if (k + 1 < left.size()) fill_gap(R, left[k]->i + 1, left[k + 1]->i, W, left[k]->j + 1, left[k + 1]->j, t, p.again, g.gs, true);
+        }
+        p.again_spans.emplace_back(lo, hi);
+    }
 }
 
 void add_detail(std::string& d, const std::string& note) {
@@ -808,11 +840,11 @@ CutOnWalk map_cut(const SeqCopy& sc, std::size_t c, bool start) {
 }
 
 CutOnWalk map_cut(const Walk& R, const Gene& g, const Copy& cp, const Walk& W, std::size_t c, bool start) {
-    return cp.pass ? map_cut(R, g, *cp.pass, W, c, start) : map_cut(*cp.seq, c, start);
+    return cp.pass ? map_cut(R, g, cp.pass->match, W, c, start) : map_cut(*cp.seq, c, start);
 }
 
 bool exon_shared(const Walk& R, const Gene& g, const Copy& cp, std::size_t cs, std::size_t ce) {
-    if (cp.pass) return exon_shared(R, g, *cp.pass, cs, ce);
+    if (cp.pass) return exon_shared(R, g, cp.pass->match, cs, ce);
     const SeqCopy& sc = *cp.seq;
     const std::size_t n = sc.map.before.size();
     for (std::size_t x = std::max(cs, sc.q0); x < ce && x < sc.q0 + n; ++x)
@@ -954,33 +986,61 @@ HstRecord project_one(const Walk& R, const std::string& rseq, const Gene& g, con
     if (clip.bp_3p) add_detail(r.detail, "clipped:3':" + std::to_string(clip.bp_3p));
     const auto in_tandem = [&](std::size_t k) { return tm.any && k >= tm.lo && k <= tm.hi; };
     std::vector<std::pair<std::size_t, std::size_t>> hx(n);
-    bool missing = false;
+    std::vector<std::string> lacking(n), notes(n);   // per exon: why the copy lacks it, or its boundaries' notes
+    // per exon the pass lacks: found where the walk's stretch is a second copy of its segment too (match_again)
+    std::vector<char> again(n, 0);
+    const auto in_second_copy = [&](std::size_t cs, std::size_t ce) {
+        if (!cp.pass) return false;
+        for (const auto& [s0, s1] : cp.pass->again_spans)
+            if (s0 <= cs && ce <= s1) return true;
+        return false;
+    };
     for (std::size_t k = 0; k < n; ++k) {
         if (in_tandem(k)) continue;
         const auto [cs, ce] = cuts[k];
         const std::string e = "e" + std::to_string(exon_no(k));
         const bool before = cp.pass && cs < R.pref[g.gs + cp.pass->first] && cp.pass->at_walk_start;
         const bool after = cp.pass && ce > R.pref[g.gs + cp.pass->last + 1] && cp.pass->at_walk_end;
+        CutOnWalk a, b;
         if (!exon_shared(R, g, cp, cs, ce)) {
-            missing = true;
             const bool unaligned = cp.seq && (cs < cp.seq->q0 || ce > cp.seq->q0 + cp.seq->map.before.size());
-            add_detail(r.detail, e + (before || after ? ":walk_end" : unaligned ? ":not_aligned" : ":missing"));
-            continue;
+            lacking[k] = e + (before || after ? ":walk_end" : unaligned ? ":not_aligned" : ":missing");
+        } else {
+            a = map_cut(R, g, cp, W, cs, true);
+            b = map_cut(R, g, cp, W, ce, false);
+            if (!a.ok || !b.ok || b.pos <= a.pos) lacking[k] = e + ":missing";
         }
-        const CutOnWalk a = map_cut(R, g, cp, W, cs, true), b = map_cut(R, g, cp, W, ce, false);
-        if (!a.ok || !b.ok || b.pos <= a.pos) {
-            missing = true;
-            add_detail(r.detail, e + ":missing");
-            continue;
+        if (!lacking[k].empty() && in_second_copy(cs, ce) && exon_shared(R, g, cp.pass->again, cs, ce)) {
+            a = map_cut(R, g, cp.pass->again, W, cs, true);
+            b = map_cut(R, g, cp.pass->again, W, ce, false);
+            again[k] = a.ok && b.ok && b.pos > a.pos;
         }
+        if (!lacking[k].empty() && !again[k]) continue;
         hx[k] = {a.pos, b.pos};
+        if (again[k]) notes[k] = e + ":merged_copy";
         const auto note = [&](const CutOnWalk& x, bool start) {
             const std::string side = e + (start == minus ? ".end:" : ".start:");
-            if (x.shift != 0) { ++r.moved; add_detail(r.detail, side + signed_text(x.shift)); }
-            if (x.in_variant) add_detail(r.detail, side + "in_variant");
+            if (x.shift != 0) { ++r.moved; add_detail(notes[k], side + signed_text(x.shift)); }
+            if (x.in_variant) add_detail(notes[k], side + "in_variant");
         };
         note(a, true);
         note(b, false);
+    }
+    // An exon found on a second copy stays only in its place among the transcript's exons on the walk.
+    for (std::size_t k = 0; k < n; ++k) {
+        if (!again[k]) continue;
+        const auto placed = [&](std::size_t q) { return !in_tandem(q) && (lacking[q].empty() || again[q]); };
+        std::size_t lo = k, hi = k + 1;
+        while (lo > 0 && !placed(lo - 1)) --lo;
+        while (hi < n && !placed(hi)) ++hi;
+        if ((lo > 0 && hx[lo - 1].second > hx[k].first) || (hi < n && hx[hi].first < hx[k].second)) again[k] = 0;
+    }
+    bool missing = false;
+    for (std::size_t k = 0; k < n; ++k) {
+        if (in_tandem(k)) continue;
+        const bool lacks = !lacking[k].empty() && !again[k];
+        missing = missing || lacks;
+        add_detail(r.detail, lacks ? lacking[k] : notes[k]);
     }
     std::vector<Piece> pieces;
     for (std::size_t k = 0; k < n && !missing; ++k) {
@@ -1332,6 +1392,7 @@ TranscriptsResult project_transcripts(const Graph& graph, const TranscriptsOptio
         std::vector<Pass> weak(genes.size());
         const auto reach = [](const Pass& p) { return std::make_pair(p.marker_matched, p.matched); };
         UnitCache unit_cache;
+        std::vector<std::array<std::vector<std::vector<Anchor>>, 2>> chains_of(genes.size());   // per gene and orientation
         for (std::size_t gi = 0; gi < genes.size(); ++gi) {
             const Gene& g = genes[gi];
             for (const bool rev : {false, true}) {
@@ -1339,7 +1400,8 @@ TranscriptsResult project_transcripts(const Graph& graph, const TranscriptsOptio
                 // Chains are completed only when their anchored bases inside the marker's span are a tenth
                 // of the best chain's or more: the others are stray matches of single nodes, not passes.
                 // Bases outside the span are left out, as long flanks would hide a short gene's other copies.
-                const std::vector<std::vector<Anchor>> chains = chain_anchors(R, g, W, occ, rev, H.size());
+                std::vector<std::vector<Anchor>>& chains = chains_of[gi][rev];
+                chains = chain_anchors(R, g, W, occ, rev, H.size());
                 std::vector<std::size_t> bp(chains.size(), 0);
                 std::size_t best = 0;
                 for (std::size_t k = 0; k < chains.size(); ++k) {
@@ -1360,6 +1422,7 @@ TranscriptsResult project_transcripts(const Graph& graph, const TranscriptsOptio
         std::vector<std::vector<const Pass*>> gene_passes(genes.size());
         std::vector<std::string> rival(passes.size());   // the best paralog a kept pass beat, and its share
         for (const std::size_t a : kept) {
+            match_again(R, genes[passes[a].gene], passes[a].reverse ? Hr : H, chains_of[passes[a].gene][passes[a].reverse], t, passes[a]);
             gene_passes[passes[a].gene].push_back(&passes[a]);
             const Pass* best = nullptr;
             for (const Pass& y : passes)

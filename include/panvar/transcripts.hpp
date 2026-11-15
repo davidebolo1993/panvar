@@ -21,7 +21,9 @@ namespace panvar {
 // stretch is the copy of the gene sharing more of its marker exons, and a shorter pass lying inside
 // another gene's copy that matches it no better is part of that copy. Each exon boundary is carried to the
 // walk through the node holding it; a boundary inside a variant (the walk misses that reference node) moves
-// to the nearest position the walk shares with the reference, and is flagged. A gene whose nodes fall short
+// to the nearest position the walk shares with the reference, and is flagged. Where a deletion leaves one copy
+// of a segment the reference walks twice inside the gene, with nodes of both, the exons of the copy the pass
+// does not follow are carried through a second chain of that copy's own nodes. A gene whose nodes fall short
 // of the share on a walk (alleles the graph keeps on nodes of their own) is placed by sequence instead: its
 // reference stretch aligned inside the window its best chain points to, accepted on the marker's coverage
 // and identity.

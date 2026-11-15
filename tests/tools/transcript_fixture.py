@@ -120,6 +120,9 @@ CASES = {
     # the same with the short gene's exon on the middle node alone: its chain on that haplotype holds only the
     # nodes beside the exon
     "nested_flank": dict(),
+    # a segment the reference walks twice inside a gene; haplotypes holding it once, with the second copy's
+    # alleles or the first's, and one lacking an exon of its second copy (write_merged)
+    "merged": dict(),
     # the main case with haplotypes' own annotations (write_annotated)
     "annotated": dict(),
 }
@@ -535,6 +538,58 @@ def write_nested(d, flank=False):
             out.write(f"TGL\tGL\t{name(h, L)}\t1\tok\t.\t{gl}\nTGS\tGS\t{name(h, L)}\t0\tno_copy\t.\t.\n")
 
 
+def write_merged(d):
+    """Gene GM over P, a segment S, U, and S again: the reference walks S twice, over the same nodes but for one
+    allele node on each side of S's middle node, the first ten bases before it (x1, y1 in the first copy; x2,
+    y2 in the second). TM1 has an exon in P, one in the first S and one on the middle node of the second; TM2 one in P
+    and one on the middle node of the first. h1 lacks the stretch from one copy into the other: it holds S once, with the second
+    copy's alleles, so that copy is the second too and TM1's last exon is found on it (merged_copy), where
+    TM2's is. h2 holds both copies and lacks the middle node in the second, and h4 holds S once with the
+    first copy's alleles: the exon is missing, not taken from the first copy. h3 is h1 reversed."""
+    rnd = random.Random(17)
+    seq = lambda n: "".join(rnd.choice("ACGT") for _ in range(n))
+    size = dict(P=1000, Sa=200, x1=1, x2=1, Sl=10, Sb=100, y1=1, y2=1, Sc=200, U=1500, Q=1000)
+    nodes = {n: seq(k) for n, k in size.items()}
+    nodes["x2"], nodes["y2"] = alt(nodes["x1"]), alt(nodes["y1"])
+    ids = {n: str(k + 1) for k, n in enumerate(nodes)}
+    S1, S2 = ["Sa", "x1", "Sl", "Sb", "y1", "Sc"], ["Sa", "x2", "Sl", "Sb", "y2", "Sc"]
+    walk = {"ref": ["P", *S1, "U", *S2, "U", "Q"], "h1": ["P", *S2, "U", "Q"],
+            "h2": ["P", *S1, "U", "Sa", "x2", "Sl", "y2", "Sc", "U", "Q"], "h4": ["P", *S1, "U", "Q"]}
+    steps = {h: [(ids[n], "+") for n in w] for h, w in walk.items()}
+    steps["h3"] = [(n, "-") for n, _ in reversed(steps["h1"])]
+    L = sum(size[n] for n in walk["ref"])
+    at, pos = [], 0
+    for n in walk["ref"]:
+        at.append(pos)
+        pos += size[n]
+    exons = {"TM1": [(300, 900), (at[1] + 50, at[1] + 150), (at[11], at[11] + 100)], "TM2": [(300, 900), (at[4], at[4] + 100)]}
+    with open(f"{d}/locus.gfa", "w") as out:
+        out.write("H\tVN:Z:1.0\n")
+        for n, s in nodes.items():
+            out.write(f"S\t{ids[n]}\t{s}\n")
+        for x, ox, y, oy in sorted({(x, ox, y, oy) for w in steps.values() for (x, ox), (y, oy) in zip(w, w[1:])}):
+            out.write(f"L\t{x}\t{ox}\t{y}\t{oy}\t0M\n")
+        for h, w in steps.items():
+            out.write(f"P\t{name(h, L)}\t{','.join(n + o for n, o in w)}\t*\n")
+    with open(f"{d}/genes.gtf", "w") as out:
+        for t, ex in exons.items():
+            attr = (f'gene_id "GM"; gene_name "GM"; gene_biotype "protein_coding"; transcript_id "{t}"; '
+                    f'transcript_name "{t}";' + (' tag "Ensembl_canonical";' if t == "TM1" else ""))
+            out.write(f"chr1\ttest\ttranscript\t{ex[0][0] + OFFSET + 1}\t{ex[-1][1] + OFFSET}\t.\t+\t.\t{attr}\n")
+            for a, b in ex:
+                out.write(f"chr1\ttest\texon\t{a + OFFSET + 1}\t{b + OFFSET}\t.\t+\t.\t{attr}\n")
+    tm1 = nodes["P"][300:900] + nodes["Sa"][50:150] + nodes["Sb"]
+    tm2 = nodes["P"][300:900] + nodes["Sb"]
+    with open(f"{d}/expected.tsv", "w") as out:
+        out.write("transcript_id\tgene_name\thaplotype\tcopy\tstatus\tdetail\tsequence\n")
+        for h in ("ref", "h1", "h2", "h3", "h4"):
+            if h in ("h2", "h4"):
+                out.write(f"TM1\tGM\t{name(h, L)}\t1\tmissing_exon\te3:missing\t.\n")
+            else:
+                out.write(f"TM1\tGM\t{name(h, L)}\t1\tok\t{'.' if h == 'ref' else 'e3:merged_copy'}\t{tm1}\n")
+            out.write(f"TM2\tGM\t{name(h, L)}\t1\tok\t.\t{tm2}\n")
+
+
 def write(case_name, d):
     case = CASES[case_name]
     if case_name.startswith("tandem"):
@@ -543,6 +598,8 @@ def write(case_name, d):
         return write_nested(d, case_name == "nested_flank")
     if case_name == "annotated":
         return write_annotated(d)
+    if case_name == "merged":
+        return write_merged(d)
     ref, nodes, walks, seqs, maps = build(case)
     edges = set()
     for steps in walks.values():
