@@ -80,6 +80,11 @@ struct VariantCallSummary {
     // --diploid: records not written because no sample column carries an alternate (every carrier's slot is
     // a haplotype whose contigs disagree at the site).
     std::size_t diploid_records_dropped = 0;
+    // Repeat sites (INFO/SITE): sites tagged and their records, and sites left untagged because a haplotype
+    // carries two of their records.
+    std::size_t repeat_sites = 0;
+    std::size_t repeat_site_records = 0;
+    std::size_t repeat_sites_mixed = 0;
     // Of the multi-crossing paths, those with a traversal outside the scored walk that differs from every
     // reference traversal by --min-sv-bp or more in length: a change no record describes
     // (MULTI_CROSSING_UNSCORED).

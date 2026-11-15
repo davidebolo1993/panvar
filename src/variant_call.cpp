@@ -38,6 +38,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <tuple>
 #include <unordered_map>
 #include <unordered_set>
@@ -2165,6 +2166,8 @@ void call_variants(
             << " For INV, the length of the inverted segment, which changes no length. Absent on a CN_METHOD=MODULE CNV, whose carriers gain and lose copies of different lengths: each haplotype's own size is FORMAT/CNBP. Absent too on a CN_METHOD=UNIT record whose carriers both gain and lose copies: no single record-level size exists there -- read SVLEN_RANGE, or FORMAT:CN and CNBP for the per-sample size. A UNIT record whose carriers all change in one direction gives its largest change\">\n";
         out << "##INFO=<ID=SVLEN_RANGE,Number=2,Type=Integer,Description=\"Min,max length change among the events merged into this record (every event each member brought), signed as SVLEN, when they differ; a substitution counts by its net change. On an INV, the inverted lengths. On a CN_METHOD=UNIT CNV: the smallest and largest carrier change, (CN-REF_CN)*RU_LEN in bp\">\n";
         out << "##INFO=<ID=BUBBLE_ID,Number=1,Type=Integer,Description=\"panvar bubble identifier\">\n";
+        out << "##INFO=<ID=SITE,Number=1,Type=String,Description=\"Repeat site: the records sharing this id are alternative alleles of one site, each with its own GT. Grouped from records that are not CNV and span at most 1 kb (END-POS), each widened right by how far it can slide (HOMLEN, CIPOS, CIEND), linked when they overlap or lie within 10 bp; set only where no haplotype carries two of them. The id is bubble<first record's BUBBLE_ID>_SITE_<k>, k counting such sites in that bubble from the left\">\n";
+        out << "##INFO=<ID=SITE_N,Number=1,Type=Integer,Description=\"Records of the repeat site (INFO/SITE), this one included\">\n";
         out << "##INFO=<ID=EVENT_NODES,Number=.,Type=String,Description=\"Variant node set; absent on PATH_INVERSION records\">\n";
         out << "##INFO=<ID=INS_SUBTYPE,Number=1,Type=String,Description=\"--classify-ins, on every INS record (a replacement flagged SUBSTITUTION too), from the bases it inserts (INSSEQ, also where too long to write): DUP where minimap2 aligns half of them or more to the reference across the site at --ins-dup-min-identity, NOVEL otherwise\">\n";
         out << "##INFO=<ID=INVDUP,Number=0,Type=Flag,Description=\"Inverted duplication: the extra copy is the reverse complement of the sequence it copies. On a CN_METHOD=UNIT CNV, some carrier gains copies walked opposite to the reference's (see FORMAT/CNINV), or, with no reference copy, holds a copy and its reverse complement; on an INS with INS_SUBTYPE=DUP, the inserted sequence aligns to the reference across the site on the reverse strand\">\n";
@@ -5878,6 +5881,132 @@ void call_variants(
                 if (r.bubble_id != 0 && !inversion_sites.count(r.bubble_id)) sites.insert(r.bubble_id);
             }
             summary.bubbles_with_calls = sites.size();
+        }
+    }
+
+    // ---- Repeat sites: records that are alternative alleles of one site get INFO/SITE and SITE_N; nothing
+    // else in them changes. Grouped from the records as written: not CNV (copy counts, not alleles), at most
+    // kSiteMaxSpan bp from POS to END (a larger record would chain unrelated sites together), each widened
+    // right by how far it can slide (HOMLEN, CIPOS, CIEND), linked when they overlap or lie within kSiteLinkBp.
+    // A group where one haplotype carries two records is not one site's alleles: left untagged and counted.
+    // Carrying is read from the per-path GT, a haplotype's contigs together (with --diploid, before the
+    // haplotypes are joined into samples).
+    {
+        constexpr std::size_t kSiteMaxSpan = 1000, kSiteLinkBp = 10;
+        static constexpr std::size_t npos = std::string::npos;
+        // the INFO column of a record line, as [begin, end)
+        const auto info_range = [](const std::string& line) -> std::pair<std::size_t, std::size_t> {
+            std::size_t a = 0;
+            for (int c = 0; c < 7; ++c) {
+                a = line.find('\t', a);
+                if (a == npos) return {npos, npos};
+                ++a;
+            }
+            const std::size_t b = line.find('\t', a);
+            return {a, b == npos ? line.size() - (!line.empty() && line.back() == '\n' ? 1 : 0) : b};
+        };
+        // the value of INFO key <key>; found is false when the key is absent
+        const auto info_value = [](std::string_view info, std::string_view key, bool& found) -> std::string_view {
+            found = false;
+            std::size_t a = 0;
+            while (a <= info.size()) {
+                const std::size_t b = std::min(info.find(';', a), info.size());
+                const std::string_view kv = info.substr(a, b - a);
+                if (kv.size() > key.size() && kv.substr(0, key.size()) == key && kv[key.size()] == '=') {
+                    found = true;
+                    return kv.substr(key.size() + 1);
+                }
+                a = b + 1;
+            }
+            return {};
+        };
+        const auto to_ll = [](std::string_view s, long long fallback) {
+            long long v = fallback;
+            const auto r = std::from_chars(s.data(), s.data() + s.size(), v);
+            return r.ec == std::errc() ? v : fallback;
+        };
+        struct SiteCand { std::size_t rec, lo, hi; };
+        std::vector<SiteCand> cands;
+        for (std::size_t k = 0; k < out_records.size(); ++k) {
+            const std::string& line = out_records[k].line;
+            const auto [ia, ib] = info_range(line);
+            if (ia == npos) continue;
+            const std::string_view info = std::string_view(line).substr(ia, ib - ia);
+            bool found = false;
+            if (info_value(info, "SVTYPE", found) == "CNV") continue;
+            const std::size_t pos = out_records[k].pos;
+            const std::string_view end_s = info_value(info, "END", found);
+            const long long end = found ? to_ll(end_s, static_cast<long long>(out_records[k].end))
+                                        : static_cast<long long>(out_records[k].end);
+            if (end < static_cast<long long>(pos) || static_cast<std::size_t>(end) - pos > kSiteMaxSpan) continue;
+            long long slide = 0;
+            if (const std::string_view h = info_value(info, "HOMLEN", found); found) slide = std::max(slide, to_ll(h, 0));
+            for (const std::string_view key : {std::string_view("CIPOS"), std::string_view("CIEND")}) {
+                const std::string_view ci = info_value(info, key, found);
+                const std::size_t comma = ci.find(',');
+                if (found && comma != npos) slide = std::max(slide, to_ll(ci.substr(comma + 1), 0));
+            }
+            cands.push_back({k, pos, static_cast<std::size_t>(end + slide)});
+        }
+        std::sort(cands.begin(), cands.end(), [](const SiteCand& a, const SiteCand& b) {
+            return std::tie(a.lo, a.hi, a.rec) < std::tie(b.lo, b.hi, b.rec);
+        });
+        // Linked intervals: a candidate joins the running group when it starts within kSiteLinkBp of the
+        // group's rightmost end.
+        std::vector<std::vector<std::size_t>> groups;
+        std::size_t right = 0;
+        for (const SiteCand& c : cands) {
+            if (!groups.empty() && c.lo <= right + kSiteLinkBp) {
+                groups.back().push_back(c.rec);
+                right = std::max(right, c.hi);
+            } else {
+                groups.push_back({c.rec});
+                right = c.hi;
+            }
+        }
+        // the haplotypes (path slots) a record line carries
+        const auto carriers_of = [&](const std::string& line) {
+            std::set<std::size_t> out;
+            std::size_t a = 0;
+            for (std::size_t col = 0; a != npos && a < line.size(); ++col) {
+                const std::size_t b = line.find('\t', a);
+                if (col >= 9 && col - 9 < path_slot.size() && path_slot[col - 9] != SIZE_MAX) {
+                    const std::size_t e = std::min({b, line.find(':', a), line.find('\n', a)});
+                    const std::string_view gt = std::string_view(line).substr(a, (e == npos ? line.size() : e) - a);
+                    if (gt != "0" && gt != ".") out.insert(path_slot[col - 9]);
+                }
+                a = b == npos ? npos : b + 1;
+            }
+            return out;
+        };
+        std::map<std::size_t, std::size_t> sites_in_bubble;
+        for (std::vector<std::size_t>& g : groups) {
+            if (g.size() < 2) continue;
+            std::sort(g.begin(), g.end());   // output order
+            std::set<std::size_t> seen;
+            bool mixed = false;
+            for (const std::size_t k : g)
+                for (const std::size_t s : carriers_of(out_records[k].line))
+                    if (!seen.insert(s).second) mixed = true;
+            if (mixed) { ++summary.repeat_sites_mixed; continue; }
+            const std::size_t bubble = out_records[g.front()].bubble_id;
+            const std::string tag = ";SITE=bubble" + std::to_string(bubble) + "_SITE_" +
+                                    std::to_string(++sites_in_bubble[bubble]) + ";SITE_N=" + std::to_string(g.size());
+            for (const std::size_t k : g) {
+                std::string& line = out_records[k].line;
+                const auto [ia, ib] = info_range(line);
+                // after BUBBLE_ID, else at the end of INFO
+                std::size_t at = ib;
+                const std::string_view info = std::string_view(line).substr(ia, ib - ia);
+                std::size_t key = info.rfind("BUBBLE_ID=", 0) == 0 ? 0 : info.find(";BUBBLE_ID=");
+                if (key != npos) {
+                    const std::size_t semi = info.find(';', key + 1);
+                    at = semi == npos ? ib : ia + semi;
+                }
+                line.insert(at, tag);
+            }
+            ++summary.repeat_sites;
+            summary.repeat_site_records += g.size();
         }
     }
 

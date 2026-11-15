@@ -4018,6 +4018,22 @@ check "aligned alleles: the placement a wider band finds (records SVTYPE:SVLEN)"
   "$(awk -F'\t' '!/^#/{n=split($8,f,";"); for(i=1;i<=n;i++) if(f[i] ~ /^SVTYPE=|^SVLEN=/) s=s f[i] " "; } END{print s}' "$OUT/nband/v.region.vcf")" \
   "SVTYPE=DEL SVLEN=-123 SVTYPE=INS SVLEN=86 "
 
+# Repeat sites: the alleles of one site share INFO/SITE and SITE_N; a site where a haplotype carries two records
+# is left untagged and counted in the log. With --diploid, carrying is per haplotype, so a sample with one allele
+# on each haplotype does not mix the site.
+python3 -I "$TOOLS/spec_gfa.py" "$(cd "$(dirname "$0")/.." && pwd)/synthetic_data/call_cases/repeat_site.spec" "$OUT/rsite"
+"$BIN" call -i "$OUT/rsite/g.gfa" -c "$OUT/rsite/g.bubbles.csv" -r 'ref#0#chr1:0-1068' -o "$OUT/rsite/v" \
+  --no-per-bubble-vcf -q > "$OUT/rsite/v.log" 2>&1
+"$BIN" call -i "$OUT/rsite/g.gfa" -c "$OUT/rsite/g.bubbles.csv" -r 'ref#0#chr1:0-1068' -o "$OUT/rsite/d" \
+  --no-per-bubble-vcf --diploid -q >/dev/null 2>&1
+site_tags() { awk -F'\t' '!/^#/{s="."; n="."; k=split($8,f,";");
+  for(i=1;i<=k;i++){ if(f[i] ~ /^SITE=/) s=substr(f[i],6); if(f[i] ~ /^SITE_N=/) n=substr(f[i],8) } printf "%s:%s:%s ", $3, s, n }' "$1"; }
+RS_WANT="bubble1_INS_I1:bubble1_SITE_1:3 bubble1_INS_I2:bubble1_SITE_1:3 bubble1_INS_I3:bubble1_SITE_1:3 bubble2_INS_J:.:. bubble3_DEL_D:.:. "
+check "repeat site: three alleles tagged, the mixed site not (ID:SITE:SITE_N)" "$(site_tags "$OUT/rsite/v.region.vcf")" "$RS_WANT"
+check "repeat site: the same tags with --diploid" "$(site_tags "$OUT/rsite/d.region.vcf")" "$RS_WANT"
+check "repeat site: the mixed site is counted in the log" "$(grep -c '1 repeat site(s) left untagged' "$OUT/rsite/v.log")" "1"
+check "repeat site: SITE and SITE_N in the header" "$(grep -c '^##INFO=<ID=SITE\(_N\)\?,' "$OUT/rsite/v.region.vcf")" "2"
+
 printf "\n"
 if [ "$fails" -eq 0 ]; then printf "call_stats: all assertions passed\n"; exit 0; fi
 # repeated last, shortened: a long output can be cut in the middle by ctest

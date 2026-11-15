@@ -357,6 +357,12 @@ int run_call_command(const std::vector<std::string>& args) {
     if (summary.diploid_records_dropped > 0)
         log.info("--diploid: records with no sample carrier, not written: " +
                  std::to_string(summary.diploid_records_dropped));
+    if (summary.repeat_sites > 0)
+        log.info("repeat sites tagged (INFO/SITE): " + std::to_string(summary.repeat_sites) + "; records: " +
+                 std::to_string(summary.repeat_site_records));
+    if (summary.repeat_sites_mixed > 0)
+        std::cerr << cli::log_prefix("call") << "warning: " << summary.repeat_sites_mixed
+                  << " repeat site(s) left untagged: a haplotype carries two of their records\n";
     if (summary.multi_crossing_unscored_paths > 0) {
         std::string ids;
         for (std::size_t k = 0; k < summary.multi_crossing_unscored_ids.size() && k < 10; ++k)
