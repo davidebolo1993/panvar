@@ -53,9 +53,9 @@ Projects a reference annotation onto every haplotype walk of a locus graph. Each
 
     - A clean projected record (`ok`, `splice_site_changed`, `boundary_moved`, `clipped_at_edge`) wins, and the annotated one differing from it is `discordant`: the projection carries the reference's exons base by base, while an annotation lifted by alignment can shift a boundary or drop an exon.
     - Where the projection fails on a transcript (a missing exon, a partial copy, or a copy it lacks), the annotation fills it (`annotation_fill`), when it has the reference transcript's exon count. With another count it is another model, not the missing transcript, and is `discordant`.
-    - An annotated copy the projection lacks, lying on another gene's projected copy (over half its exonic bases in that copy's stretch, the two genes apart on the reference), is a `paralog_lift`: the annotation put the gene on its paralog. It is no copy. A filling transcript lying on another gene's copy is one too. A gene not projected but known to the reference (the annotation names its source gene, or the GTF has it off the path) is checked against every gene's copy, as its place on the path is not known.
+    - An annotated copy the projection lacks, lying on another gene's projected copy (over half its exonic bases in that copy's stretch, the two genes apart on the reference), is a `paralog_lift`: the annotation put the gene on its paralog. It is no copy. A filling transcript lying on another gene's copy is one too. A gene the GTF has off the path is checked against every gene's copy, as its place on the path is not known.
     - Where the projected record is itself in doubt (`intron_lost`, `not_as_annotated`), both stay.
-    - Any other transcript the reference annotation lacks, such as a novel isoform or a novel gene, is written as annotated.
+    - A gene the GTF lacks entirely (by its source gene id, else its name), such as a novel gene or one of another release, is never judged a paralog lift: where it belongs on the reference cannot be known, and letting its sequence into a recruit index at its own locus costs little. It is written, counted and indexed as annotated, as is a novel isoform of a known gene.
 
     `discordant` and `paralog_lift` records are written but left out of a recruit index. With `--prefer-annotation` the annotation wins instead: an annotated transcript differing from a projected one leaves that record `discordant`, and no annotated record is `discordant` or a `paralog_lift` (a lift is still noted in `detail`). A gene's copies are the projected ones, followed along the walk by the annotated copies the projection lacks that hold a kept record.
 
@@ -137,7 +137,7 @@ Statuses, most severe first:
 - Only the reference annotation is projected, so isoforms and genes the reference lacks are found only through a haplotype's own annotation. A changed splice site is reported, not judged: its transcript is still written.
 - An annotated transcript joins a projected one only by the same transcript id (for CAT, its source transcript) on the copy it overlaps; an annotation from another source (RefSeq ids in Liftoff) stays beside the projected transcripts, unjudged.
 - A filling transcript is judged by its exon count and where it lies, not by its boundaries.
-- A gene the reference annotation lacks, whose source gene the haplotype's annotation names (a gene of another release), is a `paralog_lift` wherever it lies in another gene's copy, even at its own place nested in that gene. A novel gene, with no source gene, is never one.
+- A gene the GTF lacks is never a `paralog_lift`, so one an annotation lifted onto a paralog's copy is kept as a copy of its own and indexed. Using a GTF of the whole genome, rather than of the loci, lets lifts of genes from elsewhere be judged.
 - With `--prefer-annotation`, a truncated annotated model replaces the projected transcript it differs from; one shorter than recruit's k-mers leaves that transcript out of the index altogether.
 
 ## Example
