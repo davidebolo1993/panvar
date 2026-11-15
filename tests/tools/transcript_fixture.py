@@ -153,6 +153,12 @@ CASES = {
         genes={"GQ": ("+", {"TQ1": [(1000, 1300), (2000, 2300), (3000, 3200), (6000, 6080)]})},
         haps={"h1": [("sub", (1000, 1300)), ("sub", (2000, 2300)), ("sub", (3000, 3200)), ("sub", (6000, 6080)), ("del", (3500, 5500))]},
         reversed={"h2": "h1"}),
+    # the same with the last exon at exactly --min-identity (7 of its 100 bases changed): found alone too
+    "intron_shrunk_edge": dict(
+        L=8000, sub_step=15,
+        genes={"GQ": ("+", {"TQ1": [(1000, 1300), (2000, 2300), (3000, 3300), (6000, 6100)]})},
+        haps={"h1": [("sub", (1000, 1300)), ("sub", (2000, 2300)), ("sub", (3000, 3300)), ("sub", (6000, 6100)), ("del", (3500, 5500))]},
+        reversed={"h2": "h1"}),
     "intron_shrunk_minus": dict(
         L=8000, sub_step=20,
         genes={"GQ": ("-", {"TQ1": [(1000, 1080), (3000, 3300), (4000, 4300), (5000, 5200)]})},

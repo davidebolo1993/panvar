@@ -1129,7 +1129,8 @@ HstRecord project_one(const Walk& R, const std::string& rseq, const Gene& g, con
             const std::size_t a = !left ? (hi > far(cuts[static_cast<std::size_t>(rgt)].first - cuts[k].first) ? hi - far(cuts[static_cast<std::size_t>(rgt)].first - cuts[k].first) : 0) : lo;
             const std::size_t b = !right ? std::min(wseq.size(), lo + far(cuts[k].second - cuts[static_cast<std::size_t>(l)].second)) : hi;
             if (b <= a + len / 2) continue;
-            const int max_ed = static_cast<int>((1.0 - cp.min_identity) * static_cast<double>(len));
+            // the edits --min-identity allows, inclusive: 7 in 100 bases at 0.93, though 0.07 * 100 rounds below 7
+            const int max_ed = static_cast<int>(std::floor((1.0 - cp.min_identity) * static_cast<double>(len) + 1e-9));
             EdlibAlignResult x = align_edlib(rseq.substr(cuts[k].first, len), wseq.substr(a, b - a), EDLIB_MODE_HW, false, max_ed);
             if (x.editDistance >= 0 && x.numLocations > 0) {
                 hx[k] = {a + static_cast<std::size_t>(x.startLocations[0]), a + static_cast<std::size_t>(x.endLocations[0]) + 1};
