@@ -466,7 +466,9 @@ DiffSet diff_of(const std::string& ops, const std::string& target, const std::st
     // Each event sized as call sizes a change (change_size_bp), with up to kSizeContextBp of the sequence
     // around it, as far as the next event: aligned on its own, a change in a repeat could not move to where
     // call's alignment of the whole allele puts it. Only aligned columns lie between events, so the context is
-    // as long on both sides. One side alone is its length.
+    // as long on both sides. The context only lets a change move: an event is never larger than the bases it
+    // holds on its larger side, so SNVs beside it, counted on their own, do not join its mismatches. One side
+    // alone is its length.
     for (std::size_t i = 0; i < out.events.size(); ++i) {
         Diff& d = out.events[i];
         if (d.del_bp == 0 || d.ins_bp == 0 || d.t1 > target.size() || d.q1 > query.size()) {
@@ -477,8 +479,9 @@ DiffSet diff_of(const std::string& ops, const std::string& target, const std::st
         const std::size_t next = i + 1 < out.events.size() ? out.events[i + 1].t0 : target.size();
         const std::size_t left = std::min({kSizeContextBp, d.t0 - std::min(prev, d.t0), d.q0});
         const std::size_t right = std::min({kSizeContextBp, std::max(next, d.t1) - d.t1, query.size() - d.q1});
-        d.size_bp = change_size_bp(target.substr(d.t0 - left, d.t1 - d.t0 + left + right),
-                                   query.substr(d.q0 - left, d.q1 - d.q0 + left + right));
+        d.size_bp = std::min(change_size_bp(target.substr(d.t0 - left, d.t1 - d.t0 + left + right),
+                                            query.substr(d.q0 - left, d.q1 - d.q0 + left + right)),
+                             std::max(d.t1 - d.t0, d.q1 - d.q0));
     }
     return out;
 }

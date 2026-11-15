@@ -767,6 +767,28 @@ check "a split short-repeat change: no record, nothing large present or left (re
 bm -i "$OUT/str/g.gfa" -c "$OUT/str/g.bubbles.csv" -r 'ref#0#chr1:0-761' --calls "$OUT/str20_c" --min-sv-bp 20 -o "$OUT/str20_B" -q >/dev/null 2>&1
 check "the same at --min-sv-bp 20: the 24 bp change recorded, large, and left by neither (records:present:bp:left)" \
       "$(grep -vc '^#' "$OUT/str20_c.region.vcf"):$(sv str20_B large_present):$(sv str20_B large_present_bp):$(sv str20_B large_left_call):$(sv str20_B large_left_vcf)" "1:2:48:0:0"
+# A 100 bp inversion of (AAATT)x20 spells (AATTT)x20: its best alignment has no gap, one mismatch in five.
+# Sized base for base it is a 96 bp change (two bases match at either end), so it is large: recovered from
+# call's INV record, and left as not_reported, not lost, when call writes none (--min-sv-bp 200).
+cat > "$OUT/inv5.spec" <<EOF
+N S 300 1
+N L =ACAGAGCAAAACTCCCTCTAAAAATGCGTACG
+N I =$(printf 'AAATT%.0s' $(seq 20))
+N R =ACAGACCTGTCTCGGATTTTCTGGAACTTGTCTCACATTTTC
+N T 300 3
+P ref#0#chr1:0-774 S+,L+,I+,R+,T+
+P h1#1#chr1 S+,L+,I-,R+,T+
+P h2#1#chr1 S+,L+,I-,R+,T+
+P h3#1#chr1 S+,L+,I+,R+,T+
+B S T L;I;R
+EOF
+spec inv5
+check "an inversion spelled base for base: its record, large, recovered (records:present:bp:left)" \
+      "$(grep -vc '^#' "$OUT/inv5_c.region.vcf"):$(sv inv5_B large_present):$(sv inv5_B large_present_bp):$(sv inv5_B large_left_call):$(sv inv5_B large_left_vcf)" "1:2:192:0:0"
+"$BIN" call -i "$OUT/inv5/g.gfa" -c "$OUT/inv5/g.bubbles.csv" -r 'ref#0#chr1:0-774' -o "$OUT/inv5n_c" --min-sv-bp 200 --no-per-bubble-vcf -q >/dev/null 2>&1
+bm -i "$OUT/inv5/g.gfa" -c "$OUT/inv5/g.bubbles.csv" -r 'ref#0#chr1:0-774' --calls "$OUT/inv5n_c" -o "$OUT/inv5n_B" -q >/dev/null 2>&1
+check "with no record for it, the inversion is left as a 96 bp not_reported change (records:left:bp:not_reported)" \
+      "$(grep -vc '^#' "$OUT/inv5n_c.region.vcf"):$(sv inv5n_B large_left_call):$(sv inv5n_B large_left_call_bp):$(sv inv5n_B large_left_call_not_reported)" "0:2:192:2"
 # A 25 kb run replaced by an unrelated 10 kb one, with 1.2 kb of flank either side: too long to align, it is
 # sized by its larger side, 25 kb; the 1 kb of context benchmark sizes it with is not counted.
 "${PYTHON:-python3}" -I - > "$OUT/big.spec" <<'EOF'

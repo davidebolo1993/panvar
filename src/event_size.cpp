@@ -9,15 +9,24 @@
 
 namespace panvar {
 
+// A window of mismatches with no gap is searched over at most this many mismatches from its start.
+constexpr std::size_t kMaxWindowMismatches = 2000;
+
 // The changes an alignment of hap to ref makes, from its CIGAR ((op, length) pairs, op 0 aligned columns
 // compared base by base, 7 '=', 8 'X', 1 hap bases, 2 ref bases). The changes are the gaps. Two gaps are
 // one change, a run replaced, unless the sequence between them aligns well enough to pay for opening a
 // new long gap: some stretch of it scoring 24 (the long-gap open cost) at 2 per match and -4 per
 // mismatch, as twelve matching bases do. Unrelated sequence matches here and there by chance, and those
 // bases do not split a replaced run; a mismatch outside a change is a small variant and not reported.
+// With mismatch_runs, an alignment with no gap at all (an equal-length replacement, or an inversion an
+// aligner spells base for base) has its mismatches as changes, grouped as benchmark groups a gapless
+// difference: mismatches at most ten columns apart, in a window holding one mismatch in five columns or
+// more, are one change from its first to its last differing base, so a run replaced base for base keeps
+// its span; any other mismatch is 1 bp. With a gap, the gaps' changes are all: in a repeat, mismatches
+// beside its gaps are scattered small edits, not a replaced run.
 // False if the CIGAR does not cover both.
 bool changes_from_cigar(const std::vector<std::pair<int, int>>& cigar, const std::string& ref,
-                        const std::string& hap, std::vector<AlignedChange>& out) {
+                        const std::string& hap, std::vector<AlignedChange>& out, bool mismatch_runs) {
     out.clear();
     std::size_t ti = 0, qi = 0;
     bool open = false;
@@ -27,16 +36,23 @@ bool changes_from_cigar(const std::vector<std::pair<int, int>>& cigar, const std
         return x == y && x != 'N';
     };
     long long run = 0;   // best-scoring stretch ending here since the last gap (kept at >= 0)
+    bool gapped = false;
+    std::vector<std::size_t> mm;   // the mismatched columns, by reference position (mismatch_runs)
     for (const auto& [op, len_i] : cigar) {
         const std::size_t len = static_cast<std::size_t>(len_i);
         if (op == 0 || op == 7 || op == 8) {             // aligned columns
             if (ti + len > ref.size() || qi + len > hap.size()) return false;
             for (std::size_t c = 0; c < len; ++c, ++ti, ++qi) {
-                if (!open) continue;
-                run = std::max(0LL, run + ((op != 8 && same(ti, qi)) ? 2 : -4));
+                const bool match = op != 8 && same(ti, qi);
+                if (!open) {
+                    if (mismatch_runs && !gapped && !match) mm.push_back(ti);
+                    continue;
+                }
+                run = std::max(0LL, run + (match ? 2 : -4));
                 if (run >= 24) { out.push_back(cur); open = false; }
             }
         } else if (op == 1 || op == 2) {                 // 1: hap bases (insertion), 2: ref bases
+            gapped = true;
             if (!open) { cur = {ti, ti, qi, qi}; open = true; }
             if (op == 1) qi += len; else ti += len;
             cur.t1 = ti; cur.q1 = qi;                     // through the sequence since the last gap
@@ -47,13 +63,27 @@ bool changes_from_cigar(const std::vector<std::pair<int, int>>& cigar, const std
     }
     if (ti != ref.size() || qi != hap.size()) { out.clear(); return false; }
     if (open) out.push_back(cur);
+    if (!gapped) {   // no gap: reference and haplotype columns are the same positions
+        for (std::size_t a = 0; a < mm.size();) {
+            std::size_t b = a;
+            while (b + 1 < mm.size() && mm[b + 1] - mm[b] <= 11) ++b;
+            for (std::size_t i = a; i <= b;) {
+                std::size_t j = std::min(b, i + kMaxWindowMismatches);
+                while (j > i && 5 * (j - i + 1) < mm[j] - mm[i] + 1) --j;
+                out.push_back({mm[i], mm[j] + 1, mm[i], mm[j] + 1});
+                i = j + 1;
+            }
+            a = b + 1;
+        }
+    }
     return true;
 }
 
 // Global alignment of hap to ref, banded to w diagonals either side, with minimap2's default scoring:
 // match 2, mismatch 4, and two gap costs, 4 + 2 per base and 24 + 1 per base, the cheaper applying, so
 // one long indel costs less than the same bases scattered. False when the alignment failed.
-bool aligned_changes(const std::string& ref, const std::string& hap, int w, std::vector<AlignedChange>& out) {
+bool aligned_changes(const std::string& ref, const std::string& hap, int w, std::vector<AlignedChange>& out,
+                     bool mismatch_runs) {
     out.clear();
     if (ref.empty() || hap.empty()) {
         if (!ref.empty() || !hap.empty()) out.push_back({0, ref.size(), 0, hap.size()});
@@ -105,7 +135,7 @@ bool aligned_changes(const std::string& ref, const std::string& hap, int w, std:
             if (!align(static_cast<int>(need), wide) || wide <= score) cigar = banded;
         }
     }
-    return changes_from_cigar(cigar, ref, hap, out);
+    return changes_from_cigar(cigar, ref, hap, out, mismatch_runs);
 }
 
 // See the header: the largest single change of the aligned core, by its larger side.
@@ -122,7 +152,7 @@ std::size_t change_size_bp(const std::string& r, const std::string& h) {
     if (std::max(n, m) * (2 * band + 1) > kSeqAlignCellCap) return whole;
     const std::string rc = r.substr(p, n), hc = h.substr(p, m);
     std::vector<AlignedChange> changes;
-    if (!aligned_changes(rc, hc, static_cast<int>(band), changes)) return whole;
+    if (!aligned_changes(rc, hc, static_cast<int>(band), changes, true)) return whole;
     std::size_t best = 0;
     for (AlignedChange c : changes) {
         while (c.t0 < c.t1 && c.q0 < c.q1 && rc[c.t0] == hc[c.q0]) { ++c.t0; ++c.q0; }
