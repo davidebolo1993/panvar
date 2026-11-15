@@ -144,6 +144,16 @@ check "a paralog only an annotation brings is not the locus's own: its transcrip
 "$BIN" recruit --locus idxr2/locus_r.plx -i data/reads.fq -o rr2.tsv --min-sites 2 -q
 check "a retrocopy of the paralog in the locus: its junctions are shared, and the paralog's reads not certain ($(certain rr2.tsv) of 200)" \
   '[[ $(awk -F"\t" "NR>1 && \$8==0 && \$2==\"P\" && \$7==\"3\"" idxr2.locus_r.tsv | wc -l) -lt 100 && $(certain rr2.tsv) -eq 0 ]] && grep -q "made shared: [1-9]" logr2.txt'
+# as with --prefer-annotation: the gene's projected record discordant, an annotated one of its gene kept in
+# its place. The gene is still the locus's own, so its record in the transcriptome is subtracted
+sed 's/ source=projected status=ok/ source=projected status=discordant/' data/locus.hst.fa > data/pref.hst.fa
+awk '/^>/ {sub(/ source=projected status=discordant/, "|annotated:a1 source=annotated status=ok")} 1' data/locus.hst.fa \
+  | sed 's/ source=projected status=ok/|annotated:a1 source=annotated status=ok/' >> data/pref.hst.fa
+awk -F'\t' -v OFS='\t' 'NR==1 {print; next} {$12 = ($12=="ok" ? "discordant" : $12); print}' data/locus.hst.tsv > data/pref.hst.tsv
+awk -F'\t' -v OFS='\t' 'NR>1 && $12=="ok" {$10="annotated"; $11="a1"; print}' data/locus.hst.tsv >> data/pref.hst.tsv
+"${RC[@]}" --save-index idxpf --locus data/locus.gfa --transcripts data/pref.hst.fa 2> logpf.txt; dump idxpf
+check "a gene whose projected records are all left out is still the locus's own ($(tx idxpf.locus.tsv))" \
+  '[[ "$(tx idxpf.locus.tsv)" == "P$JO S$J12 R0" ]] && grep -q "records of the locus.s genes subtracted: 1;" logpf.txt'
 "${BG[@]}" -o s1 --add --transcriptome tx=data/tx_similar.fa
 "${RC[@]}" --save-index idxg "${TX[@]}" 2> logg.txt; dump idxg
 check "a record of another gene id, or of a symbol that differs by a suffix, is not the gene's own ($(tx idxg.locus.tsv))" \

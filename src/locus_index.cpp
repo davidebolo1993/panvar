@@ -146,7 +146,7 @@ std::string transcripts_table(const std::string& fa) {
 // The transcripts' checksum: the FASTA's, and its table's where there is one, as nodes are placed through it.
 // The transcripts' checksum, led by the revision of the rules that label their k-mers: an index built with
 // transcripts under other rules is rebuilt, and one without transcripts keeps its bytes.
-constexpr const char* kTranscriptRules = "r3:";
+constexpr const char* kTranscriptRules = "r4:";
 
 std::string transcripts_checksum_of(const std::string& fa) {
     const std::string t = transcripts_table(fa);
@@ -235,6 +235,11 @@ void for_each_transcript(const std::string& fa, const Graph& g, const std::vecto
             std::stringstream ss(line);
             for (std::string x; std::getline(ss, x, '\t');) f.push_back(x);
             if (f.size() < col.size()) { ++short_rows; continue; }   // a cut row: its transcript is placed on no node
+            // a projected row's gene is one of the locus's own, whatever its status (as in the FASTA, below)
+            if ((!has_source || f[col["source"]] != "annotated") && col.count("gene_id") && f[col["gene_id"]] != "." && !f[col["gene_id"]].empty())
+                genes.ids.insert(gene_id_key(f[col["gene_id"]]));
+            if ((!has_source || f[col["source"]] != "annotated") && f[col["gene_name"]] != "." && !f[col["gene_name"]].empty())
+                genes.names.insert(f[col["gene_name"]]);
             if (f[col["exon_starts"]] == ".") continue;
             std::string key = f[col["transcript_id"]] + "|" + f[col["gene_name"]] + "|" + f[col["haplotype"]] + "|" + f[col["copy"]];
             if (has_source && f[col["source"]] == "annotated") key += "|annotated:" + f[col["record"]];
@@ -271,13 +276,8 @@ void for_each_transcript(const std::string& fa, const Graph& g, const std::vecto
         const bool changed = status == "splice_site_changed" || (row != place.end() && row->second.splice_changed);
         const bool take = ok_only ? status.empty() || status == "ok"
                                   : (status.empty() || written.count(status) != 0) && (splice_changed || !changed);
-        auto& tally = by_status[status.empty() ? "no_status" : status];
-        ++tally[1];
-        if (!take || seq.size() < kK) { ++skipped; return; }
-        ++used;
-        ++tally[0];
-        // The record's gene is one of the locus's own when the record is projected: the reference annotation
-        // places that gene in the locus. A gene only a haplotype's annotation brings may be a paralog lifted
+        // The record's gene is one of the locus's own when the record is projected, taken or not: the reference
+        // annotation places that gene in the locus. A gene only a haplotype's annotation brings may be a paralog lifted
         // onto it, whose transcripts elsewhere are what labels its junctions shared. The gene: its id and name
         // in the table; without one, the name in the record's own name (transcript|gene|haplotype|copy).
         if (source != "annotated") {
@@ -291,6 +291,11 @@ void for_each_transcript(const std::string& fa, const Graph& g, const std::vecto
                 genes.names.insert(name.substr(a + 1, b - a - 1));
             }
         }
+        auto& tally = by_status[status.empty() ? "no_status" : status];
+        ++tally[1];
+        if (!take || seq.size() < kK) { ++skipped; return; }
+        ++used;
+        ++tally[0];
         for (char& c : seq) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
         // a 64-bit hash: two different transcripts colliding would drop one, odds ~1e-19 per pair here
         const std::uint64_t h = std::hash<std::string>{}(seq) * 0x9e3779b97f4a7c15ULL ^ seq.size();
