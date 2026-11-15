@@ -69,7 +69,7 @@ struct BubblePathSequence {
 
 struct KmerPathCount {
     std::uint32_t count = 0;
-    std::unordered_set<std::string> nodes;
+    std::vector<std::string> nodes;   // each once, sorted when read
 };
 
 struct SparseKmerEntry {
@@ -311,14 +311,14 @@ void add_window_nodes(
     const std::vector<SequenceSegment>& segments,
     std::size_t window_start,
     std::size_t window_end,
-    std::unordered_set<std::string>& nodes,
+    std::vector<std::string>& nodes,
     std::size_t& segment_hint) {
 
     while (segment_hint < segments.size() && segments[segment_hint].end <= window_start) {
         ++segment_hint;
     }
     for (std::size_t i = segment_hint; i < segments.size() && segments[i].start < window_end; ++i) {
-        nodes.insert(segments[i].node_id);
+        if (std::find(nodes.begin(), nodes.end(), segments[i].node_id) == nodes.end()) nodes.push_back(segments[i].node_id);
     }
 }
 
@@ -1290,7 +1290,8 @@ std::vector<SparseKmerEntry> filtered_feature_counts_with_nodes(
         SparseKmerEntry entry;
         entry.feature_id = id_it->second;
         entry.count = path_count.count;
-        entry.nodes = sorted_nodes(path_count.nodes);
+        entry.nodes = path_count.nodes;
+        std::sort(entry.nodes.begin(), entry.nodes.end());
         out.push_back(std::move(entry));
     }
     std::sort(out.begin(), out.end(), [](const SparseKmerEntry& a, const SparseKmerEntry& b) {
