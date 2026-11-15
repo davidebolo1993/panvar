@@ -64,6 +64,8 @@ Two alleles are aligned base by base with [ksw2](https://github.com/lh3/ksw2), o
 
 9. At an inversion site from `bubble`, the inversion is read from the walks: a run walked backwards between two runs walked forwards.
 
+10. Records that are alternative alleles of one repeat site share `INFO/SITE` and `SITE_N`, so a reader can see them as one site; genotypes stay per record, and `bcftools query -f '%INFO/SITE\t%ID\n'` groups them. A site is two or more records that are not `CNV`s and span at most 1 kb each, so larger records do not chain unrelated sites. Each record is widened to the right by how far it can slide (`HOMLEN`, `CIPOS`, `CIEND`), and records within 10 bp of each other belong to one site. A site is tagged only when no haplotype carries two of its records, since alleles of one site exclude each other; a mixed group is left untagged and counted in a warning. A haplotype is read as `--diploid` reads it, so its contigs count together.
+
 ### Per-gene copy number
 
 A copy-number site can hold several genes, often paralogs. Its count says how many copies there are, but not of which gene, so each haplotype's sequence across the site is read for each gene.
@@ -144,7 +146,7 @@ Position and size:
 | `AN`, `AC`, `AF` | haplotypes with an allele at the site (not `.`); carriers; `AC`/`AN`. The reference path is left out. A haplotype in several contigs counts once, and is a carrier where one of its contigs carries the record, as with `--diploid` |
 | `BUBBLE_ID` | the site |
 | `EVENT_NODES` | the event's nodes; a `PATH_INVERSION` has none |
-| `SITE`, `SITE_N` | repeat-site tag (being added) |
+| `SITE`, `SITE_N` | the repeat site the record is one allele of, and how many records the site has (step 10). The id is `bubble<B>_SITE_<k>`: `B` is the `BUBBLE_ID` of the site's first record, `k` counts the sites starting there from the left. Absent outside a site |
 
 Sequence:
 
