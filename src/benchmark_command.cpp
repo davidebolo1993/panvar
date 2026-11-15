@@ -17,6 +17,7 @@
 #include <numeric>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
@@ -24,6 +25,7 @@
 #include <fstream>
 #include <iostream>
 #include <map>
+#include <mutex>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -516,6 +518,44 @@ bool slide_of(const std::string& target, const std::string& query, const Diff& d
     return true;
 }
 
+// `s` over the 4 letters of `abc` in 2 bits a letter, its length in the last 8 bytes; empty when `s` holds
+// another letter.
+std::string pack(const std::string& s, const char* abc) {
+    std::string out((s.size() + 3) / 4, '\0');
+    for (std::size_t i = 0; i < s.size(); ++i) {
+        const char* at = s[i] ? std::strchr(abc, s[i]) : nullptr;
+        if (!at) return std::string();
+        out[i / 4] = static_cast<char>(out[i / 4] | ((at - abc) << (2 * (i % 4))));
+    }
+    const std::size_t n = s.size();
+    return out.append(reinterpret_cast<const char*>(&n), sizeof n);
+}
+
+std::string unpack(const std::string& packed, const char* abc) {
+    std::size_t n = 0;
+    std::memcpy(&n, packed.data() + packed.size() - sizeof n, sizeof n);
+    std::string s(n, ' ');
+    for (std::size_t i = 0; i < n; ++i) s[i] = abc[(packed[i / 4] >> (2 * (i % 4))) & 3];
+    return s;
+}
+
+// nw_edit_ops, its result kept for stretches of 1000 bases or more, 2 bits a letter: haplotypes that share an
+// allele ask for the same alignment.
+void stretch_ops(const std::string& target, const std::string& query, std::string& ops) {
+    if (std::max(target.size(), query.size()) < 1000) { nw_edit_ops(target, query, ops); return; }
+    static std::mutex mutex;
+    static std::unordered_map<std::string, std::string> kept;
+    const std::string pt = pack(target, "ACGT"), pq = pack(query, "ACGT");
+    if (pt.empty() || pq.empty()) { nw_edit_ops(target, query, ops); return; }
+    const std::string key = pt + pq;
+    std::unique_lock<std::mutex> lock(mutex);
+    if (const auto it = kept.find(key); it != kept.end()) { ops = unpack(it->second, "MXID"); return; }
+    lock.unlock();
+    nw_edit_ops(target, query, ops);
+    lock.lock();
+    kept.emplace(key, pack(ops, "MXID"));
+}
+
 // Global alignment of `target` and `query` cut at blocks both hold exactly: (target pos, query pos,
 // length), increasing in both. Each stretch between blocks is aligned on its own and the blocks are
 // matches, so a large copy-number difference costs only its own stretch, not the whole region.
@@ -526,13 +566,13 @@ std::string aligned_ops(const std::string& target, const std::string& query,
     for (const auto& [bt, bq, len] : blocks) {
         if (bt < t || bq < q || bt + len > target.size() || bq + len > query.size()) continue;
         if (target.compare(bt, len, query, bq, len) != 0) continue;
-        nw_edit_ops(target.substr(t, bt - t), query.substr(q, bq - q), part);
+        stretch_ops(target.substr(t, bt - t), query.substr(q, bq - q), part);
         ops += part;
         ops.append(len, 'M');
         t = bt + len;
         q = bq + len;
     }
-    nw_edit_ops(target.substr(t), query.substr(q), part);
+    stretch_ops(target.substr(t), query.substr(q), part);
     ops += part;
     return ops;
 }
