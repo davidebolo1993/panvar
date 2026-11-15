@@ -604,7 +604,7 @@ std::vector<std::array<std::size_t, 3>> kmer_blocks(const std::string& target, c
     };
     // The target's k-mers in one open-addressing table (no 31-mer is UINT64_MAX): tpos is UINT32_MAX when repeated
     if (std::max(target.size(), query.size()) >= UINT32_MAX) throw std::runtime_error("benchmark: a sequence is too long to anchor");
-    struct Slot { std::uint64_t key = UINT64_MAX; std::uint32_t tpos = 0, qcount = 0; };
+    struct Slot { std::uint64_t key = UINT64_MAX; std::uint32_t tpos = 0, hit = 0; };   // hit: its place in hits, from 1
     int shift = 60;   // the table holds 2^(64 - shift) slots, twice the target's k-mers or more
     while ((std::size_t{1} << (64 - shift)) < 2 * target.size()) --shift;
     std::vector<Slot> table(std::size_t{1} << (64 - shift));
@@ -618,12 +618,14 @@ std::vector<std::array<std::size_t, 3>> kmer_blocks(const std::string& target, c
         s.tpos = s.key == v ? UINT32_MAX : static_cast<std::uint32_t>(p);
         s.key = v;
     });
-    scan(query, [&](std::uint64_t v, std::size_t) { if (Slot& s = slot(v); s.key == v) ++s.qcount; });
     std::vector<std::pair<std::size_t, std::size_t>> hits;   // (query pos, target pos), query order
     scan(query, [&](std::uint64_t v, std::size_t p) {
-        const Slot& s = slot(v);
-        if (s.key == v && s.tpos != UINT32_MAX && s.qcount == 1) hits.emplace_back(p, s.tpos);
+        Slot& s = slot(v);
+        if (s.key != v || s.tpos == UINT32_MAX) return;
+        if (s.hit == 0) { hits.emplace_back(p, s.tpos); s.hit = static_cast<std::uint32_t>(hits.size()); }
+        else { hits[s.hit - 1].second = SIZE_MAX; s.tpos = UINT32_MAX; }   // repeated in the query: its hit is struck
     });
+    hits.erase(std::remove_if(hits.begin(), hits.end(), [](const auto& h) { return h.second == SIZE_MAX; }), hits.end());
     // Only long runs anchor: in unique sequence they run for as long as the sequence is unique, while
     // inside a repeat a copy-specific difference makes a run of a few dozen bases.
     constexpr std::size_t kMinRun = 500;
