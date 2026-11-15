@@ -108,7 +108,7 @@ VCF 4.2. `POS` is the base before the event, `END` its last reference base. `FIL
 | `AN`, `AC`, `AF` | haplotypes with an allele at the site (not `.`), carriers, ratio. The reference path is left out, and a haplotype in several contigs counts once, a carrier where one of its contigs carries the record, as with `--diploid` |
 | `BUBBLE_ID`, `EVENT_NODES` | the site and the event's nodes; a `PATH_INVERSION`, typed from the walks, has no nodes |
 | `CN_METHOD`, `REF_CN`, `RU_LEN` | how copies were counted, the reference's count, a unit copy's length; a `CNV`'s `POS`+1..`END` covers the reference's copies |
-| `CN_FORMS` | on a `MODULE` record, the copies its carriers gained or lost, each an edit of the reference: `START-END:SEQ`, reference bases `START`..`END` replaced by `SEQ` in reference orientation (`END` = `START`-1 for an insertion, `SEQ` empty for a deletion). `SEQ` names the reference stretches it repeats where that is shorter, `@A-B` (bases `A`..`B`) or `~A-B` (their reverse complement), joined with literal bases by `+`: a gained copy repeats the reference's copies, so its form stays short however long the copy. It is `*` where its literal bases exceed `--max-seq-bp`, the sequence then in `<prefix>.alt_seqs.fa`. Distinct copies are listed once, in reference order |
+| `CN_FORMS` | on a `MODULE` record, the copies its carriers gained or lost, each an edit of the reference: `START-END:SEQ`, reference bases `START`..`END` replaced by `SEQ` in reference orientation. An insertion replaces no bases: its stretch is empty, `END` = `START`-1, and `SEQ` goes in before base `START`. A deletion has `SEQ` empty. `SEQ` names the reference stretches it repeats where that is shorter, `@A-B` (bases `A`..`B`) or `~A-B` (their reverse complement), joined with literal bases by `+`: a gained copy repeats the reference's copies, so its form stays short however long the copy. It is `*` where its literal bases exceed `--max-seq-bp`, the sequence then in `<prefix>.alt_seqs.fa`. Distinct copies are listed once, in reference order |
 | `SEQ_FA` | the record's sequences in `<prefix>.alt_seqs.fa`, by field: `INSSEQ`, `DELSEQ`, `INVSEQ`, or `CN_FORMS.<k>` for the k-th form. Each is the FASTA record `<ID>.<field>`, so the file can be indexed (`samtools faidx`) and one allele fetched by name. A side file keeps every sequence, a novel insertion as much as a copy, while each line stays short |
 | `SVLEN_RANGE`, `MERGE_MIN_SIM`, `MERGE_TEST` | how much the merged events differ: their sizes, and the weakest similarity of a member to the representative in the test that admits it (under the test's threshold: the member joined through others) |
 | `GENES` | with `--gtf`: genes over the record; inside a copy of a `MODULE` site holding several genes, the paralogs its carriers hold |
@@ -138,6 +138,77 @@ VCF 4.2. `POS` is the base before the event, `END` its last reference base. `FIL
 | `dosage`, `hits`, `priv_kmers` | `hits` / `priv_kmers`: the gene's private 31-mers found in the haplotype, over how many it has |
 | `copies` | copies found by aligning the whole gene, where they could raise `cn` |
 | `hybrid_copies` | copies that switch from the gene to its paralog (`.` where not assessed) |
+
+### Reading the VCF
+
+One record of each kind, trimmed: `…` stands for left-out columns, fields and bases, and sample columns, named by their paths, are shortened to `sample#haplotype`.
+
+**A deletion.**
+
+```
+#CHROM POS      ID               REF ALT   … INFO                                                                                       FORMAT HG02109#1 HG00097#1 HG02984#1
+chr14  73618322 bubble9_DEL_9275 C   <DEL> … END=73618631;SVTYPE=DEL;SVLEN=-309;HOMLEN=1;CIPOS=0,1;CIEND=0,1;…;AN=465;AC=11;…;DELSEQ=AGAATTCTCT…AGAAAATAAT GT:CN  1:.       0:.       .:.
+```
+
+- `POS` is the base before the deletion: bases `POS`+1..`END` (73618323..73618631) are removed, and `DELSEQ` spells them.
+- `HOMLEN=1`: the same deletion can be placed one base further right. `POS` is the leftmost placement, and `CIPOS`/`CIEND` give the range.
+
+**Genotypes.** In the record above, HG02109#1 carries the deletion (`1`) and HG00097#1 is reference-like (`0`). HG02984#1 is `.`, no allele: its own 2,435-base deletion (`bubble9_DEL_9199`) removes these bases. A haplotype is also `.` where it does not cross the site, crosses an assembly gap there, or could not be aligned there. `.` haplotypes are left out of `AN`.
+
+**A long insertion.**
+
+```
+#CHROM POS      ID                 REF ALT   … INFO                                                                      FORMAT HG03452#1 HG00096#1 HG00096#2
+chr22  42123231 bubble4_INS_2229_2 G   <INS> … END=42123231;SVTYPE=INS;SVLEN=24316;HOMLEN=4;CIPOS=0,4;…;AN=126;AC=1;…;SEQ_FA=INSSEQ GT:CN  1:.       0:.       0:.
+```
+
+```
+samtools faidx <prefix>.alt_seqs.fa bubble4_INS_2229_2.INSSEQ
+```
+
+- An insertion spans no reference bases: `END` = `POS`, and the `SVLEN` bases go in after `POS`.
+- Its 24,316 bases are over `--max-seq-bp`, so `INSSEQ` is not in the line: `SEQ_FA=INSSEQ` says it is the FASTA record `<ID>.INSSEQ` in `<prefix>.alt_seqs.fa`, fetched by name as above.
+
+**A replacement.**
+
+```
+#CHROM POS       ID               REF                    ALT   … INFO                                                               FORMAT HG00097#1 HG00097#2 CHM13#0
+chr1   109644537 bubble3_DEL_2564 ATCCACCCGC…TCGTGATCCG AGCCA … END=109648773;SVTYPE=DEL;SUBSTITUTION;SVLEN=-4232;…;AN=465;AC=278;… GT:CN  1:.       0:.       1:.
+```
+
+- `REF` and `ALT` both start with the base at `POS`: the 4,236 bases after it (`POS`+1..`END`) are replaced by `GCCA`.
+- `SVLEN` is the net change. It reaches `--min-sv-bp`, so the record is a `DEL` flagged `SUBSTITUTION`; under it, the record would be a `SUB`.
+- Both sides fit `--max-seq-bp` and the breakpoints are exact, so `REF` and `ALT` spell them. Otherwise `ALT` is symbolic, with `DELSEQ` and `INSSEQ` in the line or in `SEQ_FA`.
+
+**A copy number (`--cn`).**
+
+```
+#CHROM POS      ID               REF ALT   … INFO                                                                                                                                                                                                                                                  FORMAT                          HG00097#1   CHM13#0           HG005#1          HG00272#1
+chr14  73515671 bubble5_CNV_4014 C   <CNV> … END=73516622;SVTYPE=CNV;…;AC=332;…;REF_CN=2;CN_UNIT_BP=475;CN_METHOD=MODULE;…;CN_FORMS=73515672-73516147:,73515672-73516148:,73515672-73516153:,73515672-73516156:,73515672-73516160:,73515673-73515672:@73515673-73516147,73515673-73516147:,73515895-73516370:A,73516118-73516593:T GT:CN:CNBP:CNRESID:MODBP:CNFORM 0:2:0:0:0:. 1:1:-476:-1:-476:1 1:1:-475:0:-475:7 1:3:475:0:475:6
+```
+
+- `POS`+1..`END` holds the reference's `REF_CN` copies, and `CN_UNIT_BP` is the length of one. `CN` is each haplotype's count: HG00097#1 holds 2 (`0`), CHM13#0 and HG005#1 lost one, HG00272#1 gained one. A `MODULE` record has no `SVLEN`, as its carriers gain and lose copies of different lengths: a carrier's change is its `CNBP`, and `CNRESID` is the part whole copies do not explain.
+- `CN_FORMS` lists the copies gained or lost as edits of the reference, numbered from 1. Entry 1, `73515672-73516147:`, deletes those 476 bases. Entry 6, `73515673-73515672:@73515673-73516147`, is an insertion before base 73515673 of a copy of bases 73515673..73516147, written as their coordinates instead of 475 bases.
+- `CNFORM` gives the carrier's entries, joined by `+` when it holds several: CHM13#0 lost entry 1, a base more than a copy (`CNRESID` -1); HG005#1 lost entry 7, exactly one copy; HG00272#1 gained entry 6. A non-carrier is `.`. A carrier's entries and its other records rebuild its walk.
+
+**Records and `carrier_events.tsv`.**
+
+```
+#CHROM POS       ID               REF ALT   … INFO
+chr1   109654087 bubble4_DEL_2916 A   <DEL> … END=109654190;SVTYPE=DEL;SVLEN=-103;HOMLEN=8;CIPOS=0,8;CIEND=0,8;SVLEN_RANGE=-103,-86;…;AN=465;AC=182;…
+```
+
+```
+variant_id        bubble_id kind ref_start ref_end   cn walk_cn event_bp alt_bp alt       haplotypes
+bubble4_DEL_2916  4         seq  109654096 109654198 .  .       -103     0      .         HG00099#1,…
+bubble4_DEL_2916  4         seq  109654096 109654194 .  .       -99      0      .         HG00097#2,…
+bubble4_DEL_2916  4         seq  109654096 109654190 .  .       -86      9      GAAAAGAAA HG02572#2,…
+…
+```
+
+- A record holds one representative event, the one the most carriers hold: here a 103-base deletion carried by 114 of 182, written left-aligned; its row has it 8 bases further right, as `HOMLEN` allows.
+- `carrier_events.tsv` holds each carrier's own event as found, one row per distinct event with its carriers: 8 rows here, whose sizes `SVLEN_RANGE` spans. An insertion's row has `ref_end` = `ref_start`-1, as for the long insertion above (42123232, 42123231).
+- A copy-number carrier's row has `kind` `cn` and covers its whole copy stretch: HG00272#1 at the `--cn` record above replaces 73515672..73516622 (951 bases) with its 1,426, the change `CN_FORMS` entry 6 writes as one insertion.
 
 ### Visualization
 
