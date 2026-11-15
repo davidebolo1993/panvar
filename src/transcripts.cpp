@@ -1875,11 +1875,9 @@ TranscriptsResult project_transcripts(const Graph& graph, const TranscriptsOptio
     for (std::size_t b0 = 0; b0 < graph.paths.size(); b0 += batch) {
         const std::size_t b1 = std::min(graph.paths.size(), b0 + batch);
         std::vector<std::vector<HstRecord>> got(b1 - b0);
-        run_parallel(b1 - b0, threads, [&](std::size_t k) {
-            if (project) got[k] = project_haplotype(b0 + k);
-            add_annotated(b0 + k, got[k]);
-        });
-        // The reference walk must give back every transcript as annotated, in one of its copies.
+        if (project) run_parallel(b1 - b0, threads, [&](std::size_t k) { got[k] = project_haplotype(b0 + k); });
+        // The reference walk must give back every transcript as annotated, in one of its copies; this comes
+        // before the haplotypes' own annotations, which judge projected records by their status.
         for (std::size_t k = 0; k < got.size(); ++k) {
             if (!project || &graph.paths[b0 + k] != ref_path) continue;
             std::vector<char> back(res.transcripts.size(), 0);
@@ -1890,6 +1888,7 @@ TranscriptsResult project_transcripts(const Graph& graph, const TranscriptsOptio
             for (HstRecord& r : got[k])
                 if ((r.source & kProjected) && !back[r.transcript] && !r.sequence.empty()) r.status = HstStatus::NotAsAnnotated;
         }
+        run_parallel(b1 - b0, threads, [&](std::size_t k) { add_annotated(b0 + k, got[k]); });
         for (const auto& recs : got) sink.add(res, recs);
     }
     return res;
