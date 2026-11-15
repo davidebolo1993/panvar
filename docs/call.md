@@ -14,7 +14,7 @@ Calls structural variants and copy number from a locus graph into a multi-sample
 | `SVTYPE` | meaning |
 |----------|---------|
 | `DEL`, `INS` | sequence lost or gained. A replacement whose net change is `--min-sv-bp` or more is a `DEL` or `INS` of that change, flagged `SUBSTITUTION` |
-| `SUB` | a replacement with a smaller net change, spelled in `REF` and `ALT` |
+| `SUB` | a replacement (bases replaced by other bases) whose net change is under `--min-sv-bp`, spelled in `REF` and `ALT` |
 | `INV` | reference sequence the haplotype walks reverse-complemented |
 | `CNV` | a copy-number change. `<CNV:TR>` is a folded repeat (`CN_METHOD=UNIT`). `<CNV>` is a duplicated stretch (`CN_METHOD=MODULE`). `FORMAT/CN` is each haplotype's copy number |
 
@@ -22,81 +22,61 @@ Calls structural variants and copy number from a locus graph into a multi-sample
 
 Two alleles are aligned base by base with [ksw2](https://github.com/lh3/ksw2), or with [minimap2](https://github.com/lh3/minimap2) when they are long. `--classify-ins` also uses minimap2.
 
-1. **Alleles.** Haplotypes that walk the same nodes across a site share an allele, which is compared once.
-   - A haplotype that crosses an assembly gap at the site is `.`.
-   - A site where the reference has a gap is skipped.
-2. **Folded repeats.** The units come from `panphorte`'s unit-graph table.
-   - A haplotype's copy number is how many times it passes the unit's anchor.
-   - `CNBP` is its change in bases. `CNRESID` is the part of that change whole copies do not explain.
-   - A copy's orientation is that of its step on the anchor.
-3. **Duplicated stretches (`--cn`).** A module is a duplicated stretch the graph collapsed onto shared nodes: the nodes some path walks more than once. Its copies are counted as in step 2.
-   - One copy's length is `CN_UNIT_BP`. With no reference copy, it is the median of the haplotypes' bases per copy.
-   - `CNBP` runs from a walk's first module node to its last. It also takes in sequence that replaces the reference's first or last module nodes. So it is the walk's whole change across its copies.
-   - A module is not counted where its passes are not copies, and a warning suggests `rebuild`. That is the case in two places:
-     - a tangled site, where ten or more nodes have fifty neighbours or more on one side;
-     - a module that would span more than 80% of the reference. Such revisits are scattered, while a real duplication spans a few percent of a locus.
-4. **Comparing alleles.** Each allele is first compared with the reference's node by node. This finds the nodes both walks share on either side of a difference.
-   - By default, the bases between those nodes are then aligned. Node boundaries can cut an indel at an arbitrary place; the alignment places it exactly.
-   - A `MODULE` site stays node by node. Otherwise an extra copy and a novel insertion beside it could be read as one gap.
-   - The alignment is banded by how far the node comparison drifts. Walks matched out of place at short nodes understate that drift. So where the band's score cannot rule out a better alignment outside it, the alignment is redone with a band that can.
-   - Pieces of one event are joined: a replacement cut by short chance matches, and deletions or inversions closer than `--merge-distance-bp`.
-   - A record is written as its minimal change. Different nodes can spell the same bases, so the bases both sides of a replacement share at either end are trimmed. A deletion or insertion that remains is left-aligned, as VCF normalisation does.
-   - Outside a `MODULE` site, a node replacement that is a plain insertion or deletion is written as one, so it merges with the same event found another way. It slides left no further than where the walks' reference starts, because the copies a `UNIT` record counts are not in the walks.
-5. **Copies at a `MODULE` site.** Before anything is merged, each haplotype's copies are told apart from its other changes. This uses its walk and its own events.
-   - **Carriers.** A haplotype is a carrier when its copy number differs and its module changes by `--min-sv-bp` or more (`MODBP`). No event enters this test, so how events are merged cannot change it.
-     - The exception: the change beside its copies goes the same way and is larger than the copies. A deletion that takes a copy with it is then a deletion, and the haplotype reads `GT` 0.
-   - **Cutting.** The haplotype's events that touch its copies are cut at the copies' ends, on node boundaries. A part outside the copies is an event of its own.
-     - The copies run from the first to the last module node on each walk. They widen over sequence that replaces the reference's first or last module nodes.
-     - A copy replaced by a diverged version of itself is not cut.
-   - **Which parts are copies.** A part that passes through the module's anchor is a copy, gained or lost; these passes are what `CN` counts. A part with no such pass is a copy only by its bases:
-     - a gain's insertion that is a version of the reference's copies;
-     - beside a loss, an insertion that is another version of what the loss took beyond its copies.
-     - A deletion with no anchor pass is a change inside a copy that remains.
-     - The copies are at most twice the larger of `MODBP` and the copies changed.
-   - **Writing.** The copies are written on the record as edits of the reference (`CN_FORMS`, `CNFORM`). With the carrier's other records, they rebuild its walk. The other parts go on to the merge.
-   - **Joining.** Pieces of one change are then joined, on the parts left only, so joining never changes the copies. The node comparison cuts one change where the walks meet by chance at short nodes inside the copies. Two cases are joined:
-     - deletions, or insertions, inside the copies and closer than `--merge-distance-bp`;
-     - pieces of any kind, each under `--min-sv-bp` and 10 bases apart or less, one of them touching the copies, when together they reach `--min-sv-bp`.
-   - **Filters.** A record whose carriers would fail `--min-haplotypes` or `--min-alt-af`, at the lowest `AF` it can be written with, takes no copies from them. So a filter at writing cannot drop copies along with the record.
-6. **Merging across haplotypes.** The same event in different haplotypes becomes one record. Two events are the same when all of these hold:
+1. Haplotypes that walk the same nodes across a site share an allele, which is compared once. A haplotype that crosses an assembly gap at the site is `.`, and a site where the reference has a gap is skipped.
+
+2. Folded repeats come from `panphorte`'s unit-graph table. A haplotype's copy number is how many times it passes the unit's anchor, and a copy's orientation is that of its step on the anchor. `CNBP` is its change in bases, and `CNRESID` the part of that change whole copies do not explain.
+
+3. With `--cn`, duplicated stretches the graph collapsed onto shared nodes, the nodes some path walks more than once, are counted too, as modules. Their copies are counted as in step 2. One copy's length is `CN_UNIT_BP`; with no reference copy, it is the median of the haplotypes' bases per copy. `CNBP` runs from a walk's first module node to its last and takes in sequence that replaces the reference's first or last module nodes, so it is the walk's whole change across its copies.
+
+   A module is not counted where its passes are not copies, and a warning suggests `rebuild`. That is a tangled site, where ten or more nodes have fifty neighbours or more on one side, or a module that would span more than 80% of the reference: a real duplication spans a few percent of a locus, while such revisits are scattered.
+
+4. Each allele is first compared with the reference's node by node, which finds the nodes both walks share on either side of a difference. By default the bases between those nodes are then aligned, because node boundaries can cut an indel at an arbitrary place. At a `MODULE` site the comparison stays node by node, so that an extra copy and a novel insertion beside it are not read as one gap.
+
+   The alignment is banded by how far the node comparison drifts. Walks matched out of place at short nodes can understate that drift, so where the band cannot rule out a better alignment outside it, the alignment is redone with a band that can. Pieces of one event are joined: a replacement cut by short chance matches, and deletions or inversions closer than `--merge-distance-bp`.
+
+   A record is written as its minimal change. Different nodes can spell the same bases, so the bases both sides of a replacement share at either end are trimmed, and a deletion or insertion that remains is left-aligned, as VCF normalisation does. Outside a `MODULE` site, a node replacement that is a plain insertion or deletion is written as one, so it merges with the same event found another way. It slides left no further than where the walks' reference starts, because the copies a `UNIT` record counts are not in the walks.
+
+   An event is reported when its size is `--min-sv-bp` or more. Its size is its largest single change: an insertion or deletion is its length, and a replacement counts its larger side. So 300 bases replaced by 290 are reported, though the net change is 10, as a `SUB`. `benchmark` sizes differences the same way.
+
+5. At a duplicated stretch a haplotype can differ in two ways at once: in its number of copies, and by other changes in or next to them. Before anything is merged, `call` separates the two for each haplotype, so each goes to the right record.
+
+   A haplotype carries the copy-number record when its number of copies differs from the reference's and its sequence across the stretch grows or shrinks by `--min-sv-bp` or more (`MODBP`). This is read from its walk alone, so how events are merged cannot change it. The exception is a larger event that takes the copies with it: a deletion that removes a copy and more sequence beside it is reported as that deletion, and the haplotype reads `GT` 0 on the copy-number record. The same holds for an insertion that brings a copy and more.
+
+   The haplotype's changes that overlap its copies are cut where the copies end, and what lies outside them is an ordinary event with a record of its own. A piece that passes through the module's anchor, the node each copy holds once, is a gained or lost copy, which is what `CN` counts. A piece that misses the anchor is a copy only when its sequence is a version of a reference copy, such as an inserted copy that has diverged, or, next to a lost copy, another version of what was lost with it. A deletion that misses the anchor is a change inside a copy that remains. At most twice the larger of `MODBP` and the changed copies' length is taken as copies, so a large unrelated event beside them is not absorbed.
+
+   The copies go on the copy-number record as edits of the reference (`CN_FORMS`, and per carrier `CNFORM`), and with the haplotype's other records they rebuild its walk. Everything else is merged with other haplotypes' events in step 6.
+
+   Where the walks share short nodes inside the copies by chance, the node comparison can cut one change into pieces. These are joined again among the parts that are not copies, so joining never changes the copies: deletions, or insertions, inside the copies and closer than `--merge-distance-bp`, and pieces of any kind under `--min-sv-bp`, at most 10 bases apart and one touching the copies, when together they reach `--min-sv-bp`.
+
+   A copy-number record that `--min-haplotypes` or `--min-alt-af` would drop takes no copies from its carriers: their changes stay ordinary events, so dropping the record never loses them.
+
+6. The same event in different haplotypes becomes one record. Two events are the same when all of these hold:
    - the same type;
    - anchors within `--merge-distance-bp` plus the smaller event's size;
    - length changes less than `--min-sv-bp` apart;
-   - the same sequence (`--merge-seq-identity`). Events from the node comparison may instead share their nodes (`--merge-jaccard`).
+   - the same sequence (`--merge-seq-identity`), or, for events from the node comparison, the same nodes (`--merge-jaccard`).
 
-   A replacement also joins a deletion or insertion of the same net change. The record writes one event, picked in this order: an event of `--min-sv-bp` or more before a smaller one; then the event most carriers hold as written; then an aligned event before a node one; then the larger. As written means its minimal change, so members the walks placed differently but that write the same count together.
-   - At a `MODULE` site every copy shares the same nodes. So events merge around their representative, and a record holds one event per haplotype. Linked pairwise instead, a haplotype's events in different copies would chain into one record, which writes only one of them.
-   - Each carrier's own event is in `carrier_events.tsv`.
-7. **Genotypes and filters.** Non-carriers whose event matches a record are added to it. At a `MODULE` site, each event joins one record only.
-   - A haplotype whose own larger deletion removes the record's bases is `.`.
-   - Records with fewer carriers than `--min-haplotypes`, or an `AF` under `--min-alt-af`, are dropped.
-8. **Genes.** With `--gtf`, each gene at a copy-number site gets its own copy number (see [Per-gene copy number](#per-gene-copy-number) below).
-9. **Inversion sites.** At an inversion site from `bubble`, the inversion is read from the walks: a run walked backwards between two runs walked forwards.
+   A replacement also joins a deletion or insertion of the same net change. The record writes one event: one of `--min-sv-bp` or more before a smaller one, then the one most carriers hold as written (its minimal change, so members the walks placed differently count together), then an aligned event before a node one, then the larger. At a `MODULE` site every copy shares the same nodes, so events merge around their representative and a record holds one event per haplotype; linked pairwise instead, a haplotype's events in different copies would chain into one record that writes only one of them. Each carrier's own event is in `carrier_events.tsv`.
 
-### Event size
+7. Non-carriers whose event matches a record are added to it; at a `MODULE` site, each event joins one record only. A haplotype whose own larger deletion removes the record's bases is `.`. Records with fewer carriers than `--min-haplotypes`, or an `AF` under `--min-alt-af`, are dropped.
 
-One rule sizes an event, here and in `benchmark`. So an event `call` leaves under `--min-sv-bp` is a small difference there too, and an event it reports is a large one.
+8. With `--gtf`, each gene at a copy-number site gets its own copy number (see [Per-gene copy number](#per-gene-copy-number) below).
 
-- An insertion or a deletion is its length.
-- A change with bases on both sides is aligned, with step 4's scoring. Its size is that of its largest change. Each change counts its larger side, so an unrelated replacement counts whole.
-  - Two gaps are separate changes when the stretch between them matches well enough to pay for a new gap, twelve bases. So scattered edits in a repeat do not add up to one large event.
-  - When the alignment has a gap, mismatches beside it are small edits, as in a repeat.
-  - With no gap at all, the mismatches are the changes. This is an equal-length replacement, or an inversion the alignment spells base for base. They are grouped as `benchmark` groups a difference with no gap. Mismatches at most ten columns apart, in a window where one column in five or more differs, are one change from the first differing base to the last, so the change keeps its span. Any other mismatch is 1 bp.
-- A side over 20 kb is not aligned. The event's size is then its larger side, leaving out the bases both sides share at either end.
-- An event is reported when its size is `--min-sv-bp` or more. A replacement is then typed by its net change (see the table above).
+9. At an inversion site from `bubble`, the inversion is read from the walks: a run walked backwards between two runs walked forwards.
 
 ### Per-gene copy number
 
-A copy-number site can hold several genes, often paralogs. Its count says how many copies there are, but not of which gene. So each haplotype's sequence across the site is read for each gene.
+A copy-number site can hold several genes, often paralogs. Its count says how many copies there are, but not of which gene, so each haplotype's sequence across the site is read for each gene.
 
-- **Genes in the copies.** A gene belongs to the copies when most of its coding sequence lies on the reference's copies. So a gene between two copies of a repeat does not take the repeat's count. A site's only gene in the copies takes the site's count. The rules below split the count between several genes.
-- **Private 31-mers.** A gene's private 31-mers are those of its coding sequence found in no other gene of the site. Each copy carries them once. So the gene's copy number is the haplotype's count of them over their number, rounded.
-- **Diverged copies.** A copy that differs from the reference's loses private 31-mers, up to 31 per differing base, and can round down. So the hits are also read where they lie. A run of hits is a copy where the whole gene aligns at 98% identity or more, closer to it than to any other gene of the site. The count is raised to the number of such copies.
-- **Near-identical paralogs.** Two such genes have few private 31-mers, so they are told apart where they differ. The two genes are aligned to each other once. At each position where they differ, the haplotype's 31-mers say how many of its copies carry each gene's version. The median over positions splits the site's count, so one position converted from one gene to the other does not move it.
-  - This is not done where both genes lie in every copy, or for three genes this close.
-- **Hybrids.** A copy of a paralog pair is read exon by exon. When the exons at one end match one gene and the rest match the other, the copy is a hybrid (`hybrid_copies`). A hybrid would read as a copy of both genes. So on a haplotype holding one, the copies found by alignment do not raise the count.
-  - This needs five exons or more that tell the two genes apart, so a pair with a pseudogene is not assessed.
-- **Unreliable counts.** A gene is given the site's total and marked `reliable` 0 when it is counted past the site's total, because its private 31-mers also lie outside the copies. The same holds when nothing tells it apart: no private 31-mers, or a pair with no usable position on that haplotype.
+A gene belongs to the copies when most of its coding sequence lies on the reference's copies, so a gene between two copies of a repeat does not take the repeat's count. A site's only gene in the copies takes the site's count; with several, the count is split as follows.
+
+A gene's private 31-mers are those of its coding sequence found in no other gene of the site. Each copy carries them once, so the gene's copy number is the haplotype's count of them over their number, rounded. A copy that differs from the reference's loses private 31-mers, up to 31 per differing base, and can round down. So the hits are also read where they lie: a run of hits where the whole gene aligns at 98% identity or more, closer to it than to any other gene of the site, is a copy, and the count is raised to the number of such copies.
+
+Two near-identical paralogs have few private 31-mers, so they are told apart where they differ. They are aligned to each other once, and at each position where they differ the haplotype's 31-mers say how many of its copies carry each gene's version. The median over positions splits the site's count, so one position converted from one gene to the other does not move it. This is not done where both genes lie in every copy, or for three genes this close.
+
+A copy of a paralog pair is also read exon by exon. When the exons at one end match one gene and the rest match the other, the copy is a hybrid (`hybrid_copies`). A hybrid would read as a copy of both genes, so on a haplotype holding one, the copies found by alignment do not raise the count. This needs five exons or more that tell the two genes apart, so a pair with a pseudogene is not assessed.
+
+A gene counted past the site's total, because its private 31-mers also lie outside the copies, is given the site's total and marked `reliable` 0. So is a gene nothing tells apart: one with no private 31-mers, or a pair with no usable position on that haplotype.
 
 ## Required inputs
 
