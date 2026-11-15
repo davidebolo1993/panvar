@@ -1278,7 +1278,8 @@ std::vector<std::size_t> accept_passes(const std::vector<Pass>& passes, const st
         if (x.share != y.share) return x.share > y.share;
         if (x.marker_matched != y.marker_matched) return x.marker_matched > y.marker_matched;
         if (x.matched != y.matched) return x.matched > y.matched;   // the whole stretch decides a tie
-        return std::tie(x.gene, x.h_lo) < std::tie(y.gene, y.h_lo);
+        // then a fixed order: by place, then as the passes were found
+        return std::tie(x.gene, x.h_lo, x.h_hi, x.reverse, a) < std::tie(y.gene, y.h_lo, y.h_hi, y.reverse, b);
     });
     const auto greedy = [&](const std::vector<char>& dropped, bool note) {
         std::vector<std::size_t> kept;
@@ -1590,7 +1591,7 @@ TranscriptsResult project_transcripts(const Graph& graph, const TranscriptsOptio
         };
         for (std::size_t gi = 0; gi < genes.size(); ++gi) {
             auto& gp = gene_passes[gi];
-            std::sort(gp.begin(), gp.end(), [](const Pass* a, const Pass* b) { return a->h_lo < b->h_lo; });
+            std::sort(gp.begin(), gp.end(), [](const Pass* a, const Pass* b) { return std::tie(a->h_lo, a->h_hi, a) < std::tie(b->h_lo, b->h_hi, b); });
             const SeqCopy& sc = placed[gi];
             const bool by_sequence = sc.ok && sc.coverage >= opt.min_exon_share;
             if (gp.empty() && !by_sequence) {

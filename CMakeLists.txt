@@ -290,6 +290,9 @@ target_compile_options(panvarlib
         -Wextra
         -Wpedantic
 )
+# transcripts compares floating-point measures against thresholds; without fused multiply-adds, which some
+# targets (arm64) form by default, it gives the same results on every platform.
+set_source_files_properties(src/transcripts.cpp PROPERTIES COMPILE_OPTIONS "-ffp-contract=off")
 
 # PRIVATE: edlib is an implementation detail of align.cpp, not part of panvarlib's
 # public interface. For a static lib CMake still propagates the symbols to the final
