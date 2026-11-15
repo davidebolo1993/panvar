@@ -30,6 +30,8 @@ const char* hst_status_name(HstStatus s) {
         case HstStatus::ClippedAtEdge: return "clipped_at_edge";
         case HstStatus::IntronLost: return "intron_lost";
         case HstStatus::NotAsAnnotated: return "not_as_annotated";
+        case HstStatus::Discordant: return "discordant";
+        case HstStatus::ParalogLift: return "paralog_lift";
         case HstStatus::MissingExon: return "missing_exon";
         case HstStatus::PartialCopy: return "partial_copy";
         case HstStatus::NoCopy: return "no_copy";
@@ -1547,6 +1549,8 @@ TranscriptsResult project_transcripts(const Graph& graph, const TranscriptsOptio
                     if (!whole.empty()) {
                         r = std::move(whole[x]);
                         r.copy = r.copies = 1;
+                        r.copy_lo = weak[gi].h_lo;
+                        r.copy_hi = weak[gi].h_hi;
                         add_detail(r.detail, "below_share");
                     } else {
                         r.status = sc.ok ? HstStatus::PartialCopy : HstStatus::NoCopy;
@@ -1570,6 +1574,8 @@ TranscriptsResult project_transcripts(const Graph& graph, const TranscriptsOptio
                     r.haplotype = h;
                     r.copy = 1;
                     r.copies = 1;
+                    r.copy_lo = sc.h_lo;
+                    r.copy_hi = sc.h_hi;
                     add_detail(r.detail, sc.marker_span ? "placed_by_sequence:marker_span" : "placed_by_sequence");
                     add_detail(r.detail, fmt("best_share", best_share[gi]));
                     add_detail(r.detail, fmt("identity", sc.identity));
@@ -1586,6 +1592,8 @@ TranscriptsResult project_transcripts(const Graph& graph, const TranscriptsOptio
                     r.haplotype = h;
                     r.copy = static_cast<int>(c + 1);
                     r.copies = static_cast<int>(gp.size());
+                    r.copy_lo = p.h_lo;
+                    r.copy_hi = p.h_hi;
                     const std::string& rv = rival[static_cast<std::size_t>(&p - passes.data())];
                     if (!rv.empty()) add_detail(r.detail, rv);
                     out.push_back(std::move(r));
@@ -1609,68 +1617,246 @@ TranscriptsResult project_transcripts(const Graph& graph, const TranscriptsOptio
         }
         for (std::size_t k = 0; k < res.annotated.size(); ++k) annotated_on[res.annotated[k].path].push_back(k);
     }
-    // The haplotype's own transcripts, cut from its walk; one with a projected record's id, copy and sequence
-    // is that record, of both sources.
+    // Projected genes by id and by name, for the annotated transcripts' genes, and projected transcripts by id.
+    std::unordered_map<std::string, std::size_t> gene_by_id, gene_by_name, tx_by_id;
+    for (std::size_t gi = 0; gi < genes.size(); ++gi) {
+        const TranscriptFeature& t0 = res.transcripts[genes[gi].tx.front()];
+        gene_by_id.emplace(t0.gene_id, gi);
+        gene_by_name.emplace(t0.gene_name, gi);
+    }
+    for (std::size_t k = 0; k < res.transcripts.size(); ++k) tx_by_id.emplace(res.transcripts[k].transcript_id, k);
+    std::set<std::string> outside_genes;
+    for (const TranscriptFeature& o : res.outside) outside_genes.insert(o.gene_id);
+    // A projected record the annotation may not overrule: its every boundary carried, or moved off a variant.
+    const auto clean = [](HstStatus s) {
+        return s == HstStatus::Ok || s == HstStatus::SpliceSiteChanged || s == HstStatus::BoundaryMoved || s == HstStatus::ClippedAtEdge;
+    };
+    // The haplotype's own transcripts, cut from its walk. Each annotated gene record is a copy, matched to the
+    // projected copy of its gene it overlaps on the walk. One with a projected record's id, copy and sequence
+    // is that record, of both sources; where they differ, a clean projected record wins. The annotation fills
+    // a transcript or copy the projection fails on; a copy lying on another gene's copy is a paralog lift.
     const auto add_annotated = [&](std::size_t h, std::vector<HstRecord>& recs) {
         if (annotated_on[h].empty()) return;
         const std::string hseq = spell(to_walk(graph.paths[h], t), t);
-        std::map<std::tuple<std::string, int>, std::size_t> projected;
-        for (std::size_t k = 0; k < recs.size(); ++k)
-            if (!recs[k].sequence.empty()) projected[{res.transcripts[recs[k].transcript].transcript_id, recs[k].copy}] = k;
-        // The annotation's copies of each gene, found by gene id (a source gene), else by name.
+        // The projected copies: the stretch each was found on, and that stretch widened to its written transcripts.
+        struct ProjCopy {
+            std::size_t gene = 0;
+            int copy = 0;
+            std::size_t s_lo = 0, s_hi = 0, lo = 0, hi = 0;
+        };
+        std::vector<ProjCopy> pcs;
+        std::map<std::pair<std::size_t, int>, std::size_t> pc_of;
+        std::map<std::pair<std::size_t, int>, std::size_t> rec_of;   // (transcript, copy) -> projected record
+        std::vector<int> projected_copies(genes.size(), 0);
+        for (std::size_t k = 0; k < recs.size(); ++k) {
+            const HstRecord& r = recs[k];
+            rec_of[{r.transcript, r.copy}] = k;
+            if (r.copy == 0) continue;
+            const std::size_t gi = gene_of[r.transcript];
+            projected_copies[gi] = r.copies;
+            const auto [it, fresh] = pc_of.emplace(std::make_pair(gi, r.copy), pcs.size());
+            if (fresh) pcs.push_back({gi, r.copy, r.copy_lo, r.copy_hi, r.copy_lo, r.copy_hi});
+            ProjCopy& pc = pcs[it->second];
+            if (!r.sequence.empty()) {
+                pc.lo = std::min(pc.lo, r.path_start);
+                pc.hi = std::max(pc.hi, r.path_end);
+            }
+        }
+        // The copy of another gene, apart from `gi` on the reference (any gene, for one off the reference path),
+        // whose stretch holds over half of these exonic bases; -1 for none.
+        const auto lifted_onto = [&](const Cuts& ex, long gi) -> long {
+            std::size_t bp = 0, best_bp = 0;
+            for (const auto& [a, b] : ex) bp += b - a;
+            long best = -1;
+            for (std::size_t c = 0; c < pcs.size(); ++c) {
+                const ProjCopy& pc = pcs[c];
+                if (gi >= 0 && (static_cast<std::size_t>(gi) == pc.gene || !apart_on_reference(genes[static_cast<std::size_t>(gi)], genes[pc.gene])))
+                    continue;
+                const std::size_t n = marker_overlap(ex, pc.s_lo, pc.s_hi);
+                if (2 * n > bp && n > best_bp) { best = static_cast<long>(c); best_bp = n; }
+            }
+            return best;
+        };
+        // The annotation's copies: its gene records, with their gene among the projected ones (-1: none) and
+        // their exonic bases, merged.
+        struct AnnCopy {
+            long gene = -1;
+            bool placed = false;      // its gene is known on the reference: projected, or lifted from elsewhere
+            std::string key;          // the gene its copies are counted for, where not a projected one
+            Cuts ex;
+            std::vector<std::size_t> members;   // indices into res.annotated
+            long match = -1, lift = -1;         // the projected copy of its gene it is, or of another gene it lies on
+            bool kept = false;                  // holds a record that is not kept out
+            int copy = 0;
+        };
+        std::vector<AnnCopy> acs;
+        {
+            std::map<std::pair<std::string, std::string>, std::size_t> of;
+            for (const std::size_t a : annotated_on[h]) {
+                const AnnotatedTranscript& at = res.annotated[a];
+                const auto [it, fresh] = of.emplace(std::make_pair(at.gene_key, at.gene_record), acs.size());
+                if (fresh) {
+                    AnnCopy ac;
+                    const auto gi = gene_by_id.find(at.t.gene_id);
+                    const auto gn = gene_by_name.find(at.t.gene_name);
+                    ac.gene = gi != gene_by_id.end() ? static_cast<long>(gi->second) : gn != gene_by_name.end() ? static_cast<long>(gn->second) : -1;
+                    ac.placed = ac.gene >= 0 || at.source_gene || outside_genes.count(at.t.gene_id) != 0;
+                    ac.key = at.gene_key;
+                    acs.push_back(std::move(ac));
+                }
+                AnnCopy& ac = acs[it->second];
+                ac.members.push_back(a);
+                ac.ex.insert(ac.ex.end(), at.t.exons.begin(), at.t.exons.end());
+            }
+        }
+        for (AnnCopy& ac : acs) {
+            std::sort(ac.ex.begin(), ac.ex.end());
+            Cuts merged;
+            for (const auto& iv : ac.ex) {
+                if (!merged.empty() && iv.first <= merged.back().second) merged.back().second = std::max(merged.back().second, iv.second);
+                else merged.push_back(iv);
+            }
+            ac.ex = std::move(merged);
+            std::size_t best_bp = 0;
+            for (std::size_t c = 0; ac.gene >= 0 && c < pcs.size(); ++c) {
+                if (pcs[c].gene != static_cast<std::size_t>(ac.gene)) continue;
+                const std::size_t n = marker_overlap(ac.ex, pcs[c].lo, pcs[c].hi);
+                if (n > best_bp) { best_bp = n; ac.match = static_cast<long>(c); }
+            }
+            if (ac.match < 0 && ac.placed) ac.lift = lifted_onto(ac.ex, ac.gene);
+        }
+
+        // Each annotated transcript as a record; `copy_of` its annotated copy.
+        std::vector<HstRecord> extra;
+        std::vector<std::size_t> copy_of;
+        std::set<std::size_t> joined;                 // projected records an annotated one is
+        std::map<std::size_t, std::size_t> overruled; // projected records an annotated one differs from -> one such
+        for (std::size_t ci = 0; ci < acs.size(); ++ci) {
+            AnnCopy& ac = acs[ci];
+            for (const std::size_t a : ac.members) {
+                const AnnotatedTranscript& at = res.annotated[a];
+                HstRecord r;
+                r.source = kAnnotated;
+                r.transcript = a;
+                r.haplotype = h;
+                r.annotated_copies = at.copies;
+                r.record = at.record;
+                for (const auto& [x, y] : at.t.exons) r.sequence += hseq.substr(x, y - x);
+                if (at.t.strand == '-') r.sequence = reverse_complement(r.sequence);
+                const std::size_t n = at.t.exons.size();
+                r.exons = n;
+                for (std::size_t q = 0; q < n; ++q) {
+                    const auto [x, y] = at.t.exons[at.t.strand == '-' ? n - 1 - q : q];
+                    r.exon_starts.push_back(x);
+                    r.exon_lengths.push_back(y - x);
+                }
+                r.path_start = at.t.exons.front().first;
+                r.path_end = at.t.exons.back().second;
+                if (at.bp_5p) add_detail(r.detail, "clipped:5':" + std::to_string(at.bp_5p));
+                if (at.bp_3p) add_detail(r.detail, "clipped:3':" + std::to_string(at.bp_3p));
+                add_detail(r.detail, at.detail);
+                r.status = at.bp_5p + at.bp_3p ? HstStatus::ClippedAtEdge : HstStatus::Ok;
+                // its projected transcript, of the copy's gene
+                long k = -1;
+                if (ac.gene >= 0) {
+                    const auto it = tx_by_id.find(at.t.transcript_id);
+                    if (it != tx_by_id.end() && gene_of[it->second] == static_cast<std::size_t>(ac.gene)) k = static_cast<long>(it->second);
+                }
+                const auto lift = [&](long c) {
+                    add_detail(r.detail, "on:" + res.transcripts[genes[pcs[static_cast<std::size_t>(c)].gene].tx.front()].gene_name);
+                    if (!opt.prefer_annotation) r.status = HstStatus::ParalogLift;
+                };
+                // the projection fails here: the annotation fills it, unless it lies on another gene's copy or
+                // has other exons than the transcript
+                const auto fill = [&]() {
+                    const long c = lifted_onto(at.t.exons, ac.gene);
+                    if (c >= 0) return lift(c);
+                    const std::size_t ref_exons = res.transcripts[static_cast<std::size_t>(k)].exons.size();
+                    if (n != ref_exons && !opt.prefer_annotation) {
+                        r.status = HstStatus::Discordant;
+                        add_detail(r.detail, "exons:" + std::to_string(n) + "/" + std::to_string(ref_exons));
+                        return;
+                    }
+                    add_detail(r.detail, "annotation_fill");
+                };
+                if (ac.lift >= 0) {
+                    lift(ac.lift);
+                } else if (ac.match >= 0 && k >= 0) {
+                    const auto pit = rec_of.find({static_cast<std::size_t>(k), pcs[static_cast<std::size_t>(ac.match)].copy});
+                    if (pit == rec_of.end()) {
+                        fill();
+                        ac.kept = ac.kept || !annotation_status(r.status);
+                        extra.push_back(std::move(r));
+                        copy_of.push_back(ci);
+                        continue;
+                    }
+                    const std::size_t pi = pit->second;
+                    HstRecord& pr = recs[pi];
+                    if (!pr.sequence.empty() && pr.sequence == r.sequence) {
+                        pr.source |= kAnnotated;
+                        pr.record += (pr.record.empty() ? "" : ",") + at.record;
+                        add_detail(pr.detail, at.detail);
+                        joined.insert(pi);
+                        continue;
+                    }
+                    if (pr.sequence.empty()) fill();
+                    else if (opt.prefer_annotation) overruled.emplace(pi, extra.size());
+                    else if (clean(pr.status)) r.status = HstStatus::Discordant;
+                } else if (ac.match < 0 && k >= 0) {
+                    fill();
+                }
+                ac.kept = ac.kept || !annotation_status(r.status);
+                extra.push_back(std::move(r));
+                copy_of.push_back(ci);
+            }
+        }
+        // With the annotation preferred, a projected record it differs from, and none of its records joins,
+        // is kept out.
+        for (const auto& [pi, x] : overruled) {
+            (void)x;
+            if (joined.count(pi)) continue;
+            recs[pi].status = HstStatus::Discordant;
+            add_detail(recs[pi].detail, "annotated:" + extra[x].record);
+        }
+        // Copies: the projected ones, then the annotated ones the projection lacks, along the walk; a paralog
+        // lift (unless the annotation is preferred) or a copy whose every record is kept out is none.
+        std::vector<std::size_t> order(acs.size());
+        std::iota(order.begin(), order.end(), 0);
+        std::sort(order.begin(), order.end(), [&](std::size_t x, std::size_t y) { return acs[x].ex.front() < acs[y].ex.front(); });
+        std::vector<int> copies = projected_copies;
+        std::map<std::string, int> other_copies;   // genes the projection lacks, by key
+        for (const std::size_t ci : order) {
+            AnnCopy& ac = acs[ci];
+            if (ac.match >= 0) { ac.copy = pcs[static_cast<std::size_t>(ac.match)].copy; continue; }
+            if (!ac.kept) continue;
+            ac.copy = ac.gene >= 0 ? ++copies[static_cast<std::size_t>(ac.gene)] : ++other_copies[ac.key];
+        }
+        for (HstRecord& r : recs) r.copies = copies[gene_of[r.transcript]];
+        for (std::size_t x = 0; x < extra.size(); ++x) {
+            const AnnCopy& ac = acs[copy_of[x]];
+            extra[x].copy = ac.copy;
+            extra[x].copies = ac.gene >= 0 ? copies[static_cast<std::size_t>(ac.gene)] : other_copies[ac.key];
+        }
+        // The annotation's own copies of each gene, found by gene id (a source gene), else by name.
         std::map<std::string, int> by_id, by_name;
         for (const std::size_t a : annotated_on[h]) {
             by_id[res.annotated[a].t.gene_id] = res.annotated[a].copies;
             by_name[res.annotated[a].t.gene_name] = res.annotated[a].copies;
         }
         for (HstRecord& r : recs) {
-            const TranscriptFeature& t = res.transcripts[r.transcript];
-            const auto i = by_id.find(t.gene_id), n = by_name.find(t.gene_name);
+            const TranscriptFeature& tf = res.transcripts[r.transcript];
+            const auto i = by_id.find(tf.gene_id), n = by_name.find(tf.gene_name);
             r.annotated_copies = i != by_id.end() ? i->second : n != by_name.end() ? n->second : 0;
         }
-        std::vector<HstRecord> extra;
-        for (const std::size_t a : annotated_on[h]) {
-            const AnnotatedTranscript& at = res.annotated[a];
-            HstRecord r;
-            r.source = kAnnotated;
-            r.transcript = a;
-            r.haplotype = h;
-            r.copy = at.copy;
-            r.copies = at.copies;
-            r.annotated_copies = at.copies;
-            r.record = at.record;
-            for (const auto& [x, y] : at.t.exons) r.sequence += hseq.substr(x, y - x);
-            if (at.t.strand == '-') r.sequence = reverse_complement(r.sequence);
-            const auto it = projected.find({at.t.transcript_id, at.copy});
-            if (it != projected.end() && recs[it->second].sequence == r.sequence) {
-                recs[it->second].source |= kAnnotated;
-                std::string& rec = recs[it->second].record;
-                rec += (rec.empty() ? "" : ",") + at.record;
-                add_detail(recs[it->second].detail, at.detail);
-                continue;
-            }
-            const std::size_t n = at.t.exons.size();
-            r.exons = n;
-            for (std::size_t q = 0; q < n; ++q) {
-                const auto [x, y] = at.t.exons[at.t.strand == '-' ? n - 1 - q : q];
-                r.exon_starts.push_back(x);
-                r.exon_lengths.push_back(y - x);
-            }
-            r.path_start = at.t.exons.front().first;
-            r.path_end = at.t.exons.back().second;
-            if (at.bp_5p) add_detail(r.detail, "clipped:5':" + std::to_string(at.bp_5p));
-            if (at.bp_3p) add_detail(r.detail, "clipped:3':" + std::to_string(at.bp_3p));
-            add_detail(r.detail, at.detail);
-            r.status = at.bp_5p + at.bp_3p ? HstStatus::ClippedAtEdge : HstStatus::Ok;
-            extra.push_back(std::move(r));
-        }
-        std::sort(extra.begin(), extra.end(), [&](const HstRecord& x, const HstRecord& y) {
-            const TranscriptFeature& a = res.annotated[x.transcript].t;
-            const TranscriptFeature& b = res.annotated[y.transcript].t;
-            return std::tie(a.gene_name, a.transcript_id, x.copy, x.path_start) <
-                   std::tie(b.gene_name, b.transcript_id, y.copy, y.path_start);
+        std::vector<std::size_t> idx(extra.size());
+        std::iota(idx.begin(), idx.end(), 0);
+        std::stable_sort(idx.begin(), idx.end(), [&](std::size_t x, std::size_t y) {
+            const TranscriptFeature& a = res.annotated[extra[x].transcript].t;
+            const TranscriptFeature& b = res.annotated[extra[y].transcript].t;
+            return std::tie(a.gene_name, a.transcript_id, extra[x].copy, extra[x].path_start) <
+                   std::tie(b.gene_name, b.transcript_id, extra[y].copy, extra[y].path_start);
         });
-        recs.insert(recs.end(), std::make_move_iterator(extra.begin()), std::make_move_iterator(extra.end()));
+        for (const std::size_t x : idx) recs.push_back(std::move(extra[x]));
     };
 
     // Haplotypes in batches, so results reach the sink in path order without holding every sequence.

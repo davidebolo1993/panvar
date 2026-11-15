@@ -38,13 +38,18 @@ struct TranscriptsOptions {
     std::string out_prefix;
     double min_exon_share = 0.8;
     double min_identity = 0.93;     // of the marker's exonic bases, for a copy placed by sequence
+    bool prefer_annotation = false; // annotated records win over projected ones they disagree with
     std::size_t threads = 0;
     bool quiet = false;
 };
 
-// Least to most severe; a record takes the most severe that applies.
-enum class HstStatus { Ok, SpliceSiteChanged, BoundaryMoved, ClippedAtEdge, IntronLost, NotAsAnnotated, MissingExon, PartialCopy, NoCopy };
-constexpr int kHstStatuses = 9;
+// Least to most severe; a record takes the most severe that applies. Discordant and ParalogLift mark records
+// written but left out of the recruit index: the other source, or another gene's copy, contradicts them.
+enum class HstStatus { Ok, SpliceSiteChanged, BoundaryMoved, ClippedAtEdge, IntronLost, NotAsAnnotated, Discordant, ParalogLift,
+                       MissingExon, PartialCopy, NoCopy };
+constexpr int kHstStatuses = 11;
+// Statuses only a run with haplotypes' own annotations gives.
+inline bool annotation_status(HstStatus s) { return s == HstStatus::Discordant || s == HstStatus::ParalogLift; }
 const char* hst_status_name(HstStatus s);
 
 // Where an HST comes from: projected from the reference annotation, cut from the haplotype's own annotation,
@@ -59,7 +64,8 @@ struct HstRecord {
     std::string record;             // the annotation's own transcript id(s), ','-joined
     std::size_t haplotype = 0;      // index into Graph::paths
     int copy = 0;                   // 1-based along the walk; 0 for no copy
-    int copies = 0;                 // passes of the gene on this walk
+    int copies = 0;                 // copies of the gene on this walk
+    std::size_t copy_lo = 0, copy_hi = 0;   // projected, copy > 0: the copy's stretch on the walk as written
     HstStatus status = HstStatus::NoCopy;
     bool reverse = false;           // the walk passes the gene against the reference's orientation
     std::size_t path_start = 0;     // 0-based, half-open, along the walk as written
@@ -95,7 +101,10 @@ struct TranscriptsResult {
 
 // Projects every transcript of the GTF with an exon on the reference path onto every path of `graph`, and
 // adds the transcripts of each haplotype's own annotation, cut from its walk; an annotated transcript with
-// the projected one's id, copy and sequence is one record of both sources. Records reach `sink` haplotype
+// the projected one's id, copy and sequence is one record of both sources. Where the two disagree, the
+// projection's clean record wins (or the annotation's, with `prefer_annotation`), the annotation fills a
+// copy or transcript the projection fails on, and an annotated copy lying on another gene's copy is a
+// paralog lift. Records reach `sink` haplotype
 // by haplotype, in path order: projected ones in gene, transcript, copy order, then the annotated ones left.
 class HstSink {
 public:

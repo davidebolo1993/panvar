@@ -34,6 +34,8 @@ void print_transcripts_help() {
         << "                                    path of its GFF3 or GTF, in the assembly's coordinates\n"
         << "      --contig-alias <tsv>          Contig names, one contig per row, matching the annotations'\n"
         << "                                    contigs to the paths' (default: exact, or without sample#hap#)\n"
+        << "      --prefer-annotation           Annotated transcripts win where they differ from projected ones,\n"
+        << "                                    and none is left out of a recruit index\n"
         << "  -o, --out-prefix <prefix>         Output prefix (required)\n"
         << "      --min-exon-share <F>          Share of the gene's marker exons a pass must walk to be a\n"
         << "                                    copy (default 0.8)\n"
@@ -110,7 +112,7 @@ public:
             g.same += same;
             g.annotated += has && (r.source & kAnnotated);
             auto& c = copies.emplace(gid, std::make_pair(0, 0)).first->second;
-            if (r.source & kProjected) c.first = r.copies;
+            c.first = r.copies;
             if (r.annotated_copies >= 0) c.second = r.annotated_copies;
         }
         for (const auto& [gid, c] : copies) {
@@ -124,7 +126,8 @@ public:
         }
     }
 
-    void finish(const TranscriptsResult& res, const std::string& summary_path) {
+    // `annotations`: the run has haplotypes' own annotations, and the statuses only they give get columns.
+    void finish(const TranscriptsResult& res, const std::string& summary_path, bool annotations) {
         cli::close_output(fa_, fa_path_);
         cli::close_output(tsv_, tsv_path_);
         std::map<std::string, std::pair<std::string, std::size_t>> tx, out;
@@ -145,7 +148,9 @@ public:
         std::ofstream s(summary_path);
         if (!s) throw std::runtime_error("transcripts: cannot write " + summary_path);
         s << "gene_id\tgene_name\ttranscripts\tclipped\toutside\thaplotypes_by_copies\thsts\tsame_as_ref\tannotated";
-        for (int k = 0; k < kHstStatuses; ++k) s << '\t' << hst_status_name(static_cast<HstStatus>(k));
+        const auto shown = [&](int k) { return annotations || !annotation_status(static_cast<HstStatus>(k)); };
+        for (int k = 0; k < kHstStatuses; ++k)
+            if (shown(k)) s << '\t' << hst_status_name(static_cast<HstStatus>(k));
         s << "\tcopies_differ\n";
         for (const std::string& gid : order) {
             const Tally& g = genes_[gid];
@@ -155,7 +160,8 @@ public:
             std::string bc;
             for (const auto& [c, n] : g.by_copies) bc += (bc.empty() ? "" : ",") + std::to_string(c) + ":" + std::to_string(n);
             s << (bc.empty() ? "." : bc) << '\t' << g.hst << '\t' << g.same << '\t' << g.annotated;
-            for (int k = 0; k < kHstStatuses; ++k) s << '\t' << g.status[k];
+            for (int k = 0; k < kHstStatuses; ++k)
+                if (shown(k)) s << '\t' << g.status[k];
             std::string d;
             for (const std::string& x : g.differ) d += (d.empty() ? "" : ",") + x;
             s << '\t' << (d.empty() ? "." : d) << '\n';
@@ -211,6 +217,7 @@ int run_transcripts_command(const std::vector<std::string>& args) {
         else if (arg == "--gtf") opt.gtf_path = require_value(arg);
         else if (arg == "--hap-annotations") opt.hap_annotations = require_value(arg);
         else if (arg == "--contig-alias") opt.contig_alias = require_value(arg);
+        else if (arg == "--prefer-annotation") opt.prefer_annotation = true;
         else if (arg == "-o" || arg == "--out-prefix") opt.out_prefix = require_value(arg);
         else if (arg == "--min-exon-share") opt.min_exon_share = cli::parse_unit_fraction_arg(arg, require_value(arg));
         else if (arg == "--min-identity") opt.min_identity = cli::parse_unit_fraction_arg(arg, require_value(arg));
@@ -224,6 +231,8 @@ int run_transcripts_command(const std::vector<std::string>& args) {
     if (!opt.gtf_path.empty() && opt.reference_path.empty())
         throw std::runtime_error("Missing required input: --reference-path <name> (with --gtf)");
     if (opt.out_prefix.empty()) throw std::runtime_error("Missing required input: --out-prefix <prefix>");
+    if (opt.prefer_annotation && opt.hap_annotations.empty())
+        throw std::runtime_error("--prefer-annotation needs --hap-annotations");
     const std::string fa = opt.out_prefix + ".hst.fa", tsv = opt.out_prefix + ".hst.tsv",
                       summary = opt.out_prefix + ".hst.summary.tsv";
     cli::reject_output_collisions("transcripts", {fa, tsv, summary},
@@ -243,7 +252,7 @@ int run_transcripts_command(const std::vector<std::string>& args) {
     cli::StagedOutputs staged("transcripts");
     FileSink sink(staged.stage(fa), staged.stage(tsv));
     const TranscriptsResult res = project_transcripts(graph, opt, sink);
-    sink.finish(res, staged.stage(summary));
+    sink.finish(res, staged.stage(summary), !opt.hap_annotations.empty());
     if (!res.reference.empty()) log.info("reference: " + res.reference);
     if (!res.not_given_back.empty()) {
         std::string ids;
