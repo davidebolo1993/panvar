@@ -877,6 +877,7 @@ struct SeqCopy {
 struct Copy {
     const Pass* pass = nullptr;
     const SeqCopy* seq = nullptr;
+    double min_identity = 1.0;   // a sequence placement's: of an exon looked for alone
     bool reverse() const { return pass ? pass->reverse : seq->reverse; }
 };
 
@@ -1104,6 +1105,39 @@ HstRecord project_one(const Walk& R, const std::string& rseq, const Gene& g, con
         };
         note(a, true);
         note(b, false);
+    }
+    // A copy placed by sequence: an exon the alignment of the whole stretch misses is looked for alone, between
+    // the exons placed around it. Introns differing by kilobases between alleles can pull the unit-cost
+    // alignment of the stretch off a short exon at their end, though the exon is there.
+    if (cp.seq) {
+        const SeqCopy& sc = *cp.seq;
+        for (std::size_t k = 0; k < n; ++k) {
+            const std::string e = "e" + std::to_string(exon_no(k));
+            if (in_tandem(k) || lacking[k] != e + ":missing") continue;
+            const auto placed = [&](std::size_t q) { return !in_tandem(q) && lacking[q].empty(); };
+            long l = static_cast<long>(k) - 1, rgt = static_cast<long>(k) + 1;
+            while (l >= 0 && !placed(static_cast<std::size_t>(l))) --l;
+            while (rgt < static_cast<long>(n) && !placed(static_cast<std::size_t>(rgt))) ++rgt;
+            // Without a placed exon on one side, the window reaches kWindowMax times the reference's distance
+            // from the placed one, as the intron between may be longer.
+            const std::size_t len = cuts[k].second - cuts[k].first;
+            const bool left = l >= 0, right = rgt < static_cast<long>(n);
+            if (!left && !right) continue;
+            const std::size_t lo = left ? hx[static_cast<std::size_t>(l)].second : 0;
+            const std::size_t hi = right ? hx[static_cast<std::size_t>(rgt)].first : wseq.size();
+            const auto far = [&](std::size_t ref_bp) { return static_cast<std::size_t>(kWindowMax * static_cast<double>(ref_bp)) + 1000; };
+            const std::size_t a = !left ? (hi > far(cuts[static_cast<std::size_t>(rgt)].first - cuts[k].first) ? hi - far(cuts[static_cast<std::size_t>(rgt)].first - cuts[k].first) : 0) : lo;
+            const std::size_t b = !right ? std::min(wseq.size(), lo + far(cuts[k].second - cuts[static_cast<std::size_t>(l)].second)) : hi;
+            if (b <= a + len / 2) continue;
+            const int max_ed = static_cast<int>((1.0 - cp.min_identity) * static_cast<double>(len));
+            EdlibAlignResult x = align_edlib(rseq.substr(cuts[k].first, len), wseq.substr(a, b - a), EDLIB_MODE_HW, false, max_ed);
+            if (x.editDistance >= 0 && x.numLocations > 0) {
+                hx[k] = {a + static_cast<std::size_t>(x.startLocations[0]), a + static_cast<std::size_t>(x.endLocations[0]) + 1};
+                lacking[k].clear();
+                notes[k] = e + ":aligned_alone";
+            }
+            edlibFreeAlignResult(x);
+        }
     }
     // An exon found on a second copy stays only in its place among the transcript's exons on the walk.
     for (std::size_t k = 0; k < n; ++k) {
@@ -1648,6 +1682,7 @@ TranscriptsResult project_transcripts(const Graph& graph, const TranscriptsOptio
                 if (by_sequence) {
                     Copy cp;
                     cp.seq = &sc;
+                    cp.min_identity = opt.min_identity;
                     HstRecord r = project_one(R, rseq, genes[gi], cp, sc.reverse ? Hr : H, sc.reverse ? hrseq : hseq,
                                               res.transcripts[k], cuts[k], res.clips[k], tandem[k], unit_cache);
                     r.transcript = k;

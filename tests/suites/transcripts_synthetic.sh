@@ -86,6 +86,7 @@ check "a gene cut below the share is a partial copy, with no sequence and no cop
   '[[ "$(dv TP1 h2)" == partial_copy:0 ]] && ! grep -q "^>TP1|GP|h2#" case_divergent/out.hst.fa && [[ "$(awk -F"\t" "\$2==\"GP\"{print \$6}" case_divergent/out.hst.summary.tsv)" == "0:2,1:4" ]]'
 check "a partial copy on a walk written reversed has orientation -" \
   '[[ "$(awk -F"\t" "\$1==\"TP1\" && \$7 ~ /^h[25]#/ {print \$13}" case_divergent/out.hst.tsv | tr "\n" ,)" == "+,-," ]]'
+check "an exon the stretch's alignment misses is found alone" '[[ $(grep -c "e4:aligned_alone" case_intron_shrunk/out.hst.tsv) -eq 2 ]]'
 "$BIN" transcripts -i case_divergent/locus.gfa -r ref --gtf case_divergent/genes.gtf -o strict --min-identity 0.99 -q
 check "below --min-identity the gene has no copy" '[[ "$(dv TH1 h1 strict)" == no_copy:0 ]]'
 

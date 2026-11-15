@@ -146,6 +146,18 @@ CASES = {
         genes={"GQ": ("+", {"TQ1": [(1000, 1300), (2000, 2300), (3000, 3300)]})},
         haps={"h1": [("sub", (1000, 1300)), ("sub", (2000, 2300)), ("sub", (3000, 3300))]},
         reversed={"h2": "h1"}),
+    # a gene placed by sequence whose last intron the haplotype shortens by 2 kb: the alignment of the whole
+    # stretch misses the short exon past it, which is then found alone; the same on the minus strand
+    "intron_shrunk": dict(
+        L=8000, sub_step=20,
+        genes={"GQ": ("+", {"TQ1": [(1000, 1300), (2000, 2300), (3000, 3200), (6000, 6080)]})},
+        haps={"h1": [("sub", (1000, 1300)), ("sub", (2000, 2300)), ("sub", (3000, 3200)), ("sub", (6000, 6080)), ("del", (3500, 5500))]},
+        reversed={"h2": "h1"}),
+    "intron_shrunk_minus": dict(
+        L=8000, sub_step=20,
+        genes={"GQ": ("-", {"TQ1": [(1000, 1080), (3000, 3300), (4000, 4300), (5000, 5200)]})},
+        haps={"h1": [("sub", (1000, 1080)), ("sub", (3000, 3300)), ("sub", (4000, 4300)), ("sub", (5000, 5200)), ("del", (1200, 2800))]},
+        reversed={"h2": "h1"}),
     # a gene placed by sequence with a deletion across the start of its first exon and one across the end of
     # its last: the ends of the gene, where an alignment has nothing past them to hold on to
     "end_indel": dict(
