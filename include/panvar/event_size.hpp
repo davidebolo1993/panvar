@@ -38,7 +38,8 @@ bool aligned_changes(const std::string& ref, const std::string& hap, int w, std:
 
 // The size of a change from `ref` to `hap`: their shared ends trimmed, the rest aligned (aligned_changes),
 // and the largest single change, each counting its larger side. A one-sided change is its length. Above
-// kSubEditMaxBp a side, or kSeqAlignCellCap cells, the larger side whole. Sized by the larger side alone, one
+// kSubEditMaxBp a side, or kSeqAlignCellCap cells, the larger side of what is left once the shared ends are
+// trimmed, so context given around a change never counts. Sized by the larger side alone, one
 // base changed on a long run would be a long event; by edit distance, an unrelated replacement would be about
 // half its length; summed over the changes, scattered small edits in a repeat would add up to one large one.
 std::size_t change_size_bp(const std::string& ref, const std::string& hap);

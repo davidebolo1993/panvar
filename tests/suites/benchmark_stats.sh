@@ -767,6 +767,19 @@ check "a split short-repeat change: no record, nothing large present or left (re
 bm -i "$OUT/str/g.gfa" -c "$OUT/str/g.bubbles.csv" -r 'ref#0#chr1:0-761' --calls "$OUT/str20_c" --min-sv-bp 20 -o "$OUT/str20_B" -q >/dev/null 2>&1
 check "the same at --min-sv-bp 20: the 24 bp change recorded, large, and left by neither (records:present:bp:left)" \
       "$(grep -vc '^#' "$OUT/str20_c.region.vcf"):$(sv str20_B large_present):$(sv str20_B large_present_bp):$(sv str20_B large_left_call):$(sv str20_B large_left_vcf)" "1:2:48:0:0"
+# A 25 kb run replaced by an unrelated 10 kb one, with 1.2 kb of flank either side: too long to align, it is
+# sized by its larger side, 25 kb; the 1 kb of context benchmark sizes it with is not counted.
+"${PYTHON:-python3}" -I - > "$OUT/big.spec" <<'EOF'
+import random
+r = random.Random(11)
+def s(n): return ''.join(r.choice('ACGT') for _ in range(n))
+for name, seq in (('S', s(1199) + 'T'), ('D', 'G' + s(24998) + 'G'), ('Y', 'C' + s(9998) + 'C'), ('T', 'T' + s(1199))):
+    print(f'N {name} ={seq}')
+print('P ref#0#chr1:0-27400 S+,D+,T+\nP h1#1#chr1 S+,Y+,T+\nP h2#1#chr1 S+,Y+,T+\nP h3#1#chr1 S+,D+,T+\nB S T D;Y')
+EOF
+spec big --min-sv-bp 30000
+check "a replacement over 20 kb is sized by its larger side, not its context (records:left:bp)" \
+      "$(grep -vc '^#' "$OUT/big_c.region.vcf"):$(sv big_B large_left_call):$(sv big_B large_left_call_bp)" "0:2:50000"
 # Two similar segments in the other order: 31 differences each, not a 600 bp deletion and insertion.
 cat > "$OUT/swap.spec" <<'EOF'
 N S 500 1

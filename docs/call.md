@@ -43,7 +43,7 @@ Base-level alignment of two alleles uses [ksw2](https://github.com/lh3/ksw2), an
 One rule sizes an event, here and in `benchmark`, so an event `call` leaves under `--min-sv-bp` is a small difference there too, and one it reports is a large one:
 
 - An insertion or a deletion is its length.
-- A change with bases on both sides is aligned (step 4's scoring). Gaps with a stretch between them that matches well enough to pay for a new gap (twelve bases) are separate changes, so scattered edits in a repeat do not add up to one large event. Each change counts its larger side, so an unrelated replacement counts whole; the event's size is its largest change.
+- A change with bases on both sides is aligned (step 4's scoring). Gaps with a stretch between them that matches well enough to pay for a new gap (twelve bases) are separate changes, so scattered edits in a repeat do not add up to one large event. Each change counts its larger side, so an unrelated replacement counts whole; the event's size is its largest change. A side over 20 kb is not aligned: the event's size is its larger side, the bases both sides share at either end left out.
 - An event is reported when its size is `--min-sv-bp` or more. A replacement is then typed by its net change (see the table above).
 
 ### Per-gene copy number

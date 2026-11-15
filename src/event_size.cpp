@@ -109,14 +109,15 @@ bool aligned_changes(const std::string& ref, const std::string& hap, int w, std:
 }
 
 // See the header: the largest single change of the aligned core, by its larger side.
+// The shared ends are trimmed before any fallback, so sequence around the change given as context is never
+// counted in its size.
 std::size_t change_size_bp(const std::string& r, const std::string& h) {
-    const std::size_t whole = std::max(r.size(), h.size());
-    if (whole > kSubEditMaxBp) return whole;
     std::size_t p = 0, sfx = 0;
     while (p < r.size() && p < h.size() && r[p] == h[p]) ++p;
     while (sfx < r.size() - p && sfx < h.size() - p && r[r.size() - 1 - sfx] == h[h.size() - 1 - sfx]) ++sfx;
     const std::size_t n = r.size() - p - sfx, m = h.size() - p - sfx;
-    if (n == 0 || m == 0) return std::max(n, m);
+    const std::size_t whole = std::max(n, m);
+    if (n == 0 || m == 0 || whole > kSubEditMaxBp) return whole;
     const std::size_t band = (n > m ? n - m : m - n) + 64;
     if (std::max(n, m) * (2 * band + 1) > kSeqAlignCellCap) return whole;
     const std::string rc = r.substr(p, n), hc = h.substr(p, m);
