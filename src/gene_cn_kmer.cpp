@@ -29,6 +29,14 @@ inline int base_code(char c) {
     }
 }
 
+// The k-mers of a map, as 2^22 bits: a k-mer whose bit is off is not in the map, so the lookup is skipped.
+struct KmerFilter {
+    std::vector<std::uint64_t> bits = std::vector<std::uint64_t>(std::size_t{1} << 16);
+    template <class Map> explicit KmerFilter(const Map& m) { for (const auto& kv : m) bits[at(kv.first) >> 6] |= 1ULL << (at(kv.first) & 63); }
+    static std::size_t at(std::uint64_t km) { return static_cast<std::size_t>((km * 0x9E3779B97F4A7C15ULL) >> 42); }
+    bool may_have(std::uint64_t km) const { return (bits[at(km) >> 6] >> (at(km) & 63)) & 1; }
+};
+
 // Collect every canonical (min of forward / reverse-complement) k-mer of `seq` into `out`.
 void collect_canonical_kmers(const std::string& seq, std::size_t k,
                              std::unordered_set<std::uint64_t>& out) {
@@ -129,6 +137,7 @@ std::vector<std::vector<GeneCnEvidence>> resolve_gene_cn_kmer(
     // 3) per haplotype: count private-k-mer occurrences, derive dosage + CN.
     const std::uint64_t mask = (1ULL << (2 * k)) - 1;
     const unsigned top_shift = static_cast<unsigned>(2 * (k - 1));
+    const KmerFilter owned(owner);
     for (std::size_t h = 0; h < hap_seqs.size(); ++h) {
         std::vector<long> hits(n_genes, 0);
         std::vector<std::vector<std::size_t>> at(n_genes);   // where each hit lies on the haplotype
@@ -140,7 +149,7 @@ std::vector<std::vector<GeneCnEvidence>> resolve_gene_cn_kmer(
             if (b < 0) { len = 0; fwd = 0; rev = 0; continue; }
             fwd = ((fwd << 2) | static_cast<std::uint64_t>(b)) & mask;
             rev = (rev >> 2) | (static_cast<std::uint64_t>(3 - b) << top_shift);
-            if (++len >= k) {
+            if (++len >= k && owned.may_have(std::min(fwd, rev))) {
                 const auto it = owner.find(std::min(fwd, rev));
                 if (it != owner.end()) { ++hits[it->second]; at[it->second].push_back(i); }
             }
@@ -597,6 +606,7 @@ std::vector<std::vector<int>> find_hybrid_copies(
         hap_seqs.size(), std::vector<std::vector<std::pair<std::size_t, std::size_t>>>(pairs.size()));
     const std::uint64_t mask = (1ULL << (2 * k)) - 1;
     const unsigned top = static_cast<unsigned>(2 * (k - 1));
+    const KmerFilter in_where(where);
     for (std::size_t h = 0; h < hap_seqs.size(); ++h) {
         std::vector<std::vector<std::pair<std::size_t, std::array<int, 3>>>> hits(pairs.size());
         std::vector<std::vector<std::uint64_t>> hit_km(pairs.size());
@@ -609,6 +619,7 @@ std::vector<std::vector<int>> find_hybrid_copies(
             rev = (rev >> 2) | (static_cast<std::uint64_t>(3 - b) << top);
             if (++len < k) continue;
             const std::uint64_t km = std::min(fwd, rev);
+            if (!in_where.may_have(km)) continue;
             const auto it = where.find(km);
             if (it == where.end()) continue;
             for (const auto& w : it->second) {
