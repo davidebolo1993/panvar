@@ -201,12 +201,13 @@ using TranscriptFn = std::function<void(const std::string& seq, const std::funct
 // a status is taken. A changed splice site is read from the table's count, as a more severe status covers
 // it; without the table, from the status alone. `by_status` counts the records taken and all, per status. Their bases are placed on the
 // graph's nodes through the table beside the FASTA (the haplotype's path and each exon's first base and
-// length on it), where it exists; `short_rows` counts its rows cut short. A sequence equal to one already
+// length on it), where it exists; `short_rows` counts its rows cut short, and `absent_paths` collects the
+// paths it names that the graph lacks. A sequence equal to one already
 // passed on is counted as taken but not passed on again: most transcripts are the same on many haplotypes.
 void for_each_transcript(const std::string& fa, const Graph& g, const std::vector<std::string>& node_names, bool ok_only,
                          bool splice_changed, std::uint64_t& used, std::uint64_t& skipped,
                          std::map<std::string, std::array<std::uint64_t, 2>>& by_status, OwnGenes& genes,
-                         std::uint64_t& short_rows, const TranscriptFn& fn) {
+                         std::uint64_t& short_rows, std::set<std::string>& absent_paths, const TranscriptFn& fn) {
     // the exons of each record on its path, and its gene's id, from the table
     struct Place {
         std::string path, gene_id, gene_name;
@@ -255,6 +256,8 @@ void for_each_transcript(const std::string& fa, const Graph& g, const std::vecto
     }
     std::unordered_map<std::string, std::size_t> path_of, node_index;
     for (std::size_t p = 0; p < g.paths.size(); ++p) path_of[g.paths[p].name] = p;
+    for (const auto& [name, p] : place)
+        if (!path_of.count(p.path)) absent_paths.insert(p.path);
     for (std::size_t i = 0; i < node_names.size(); ++i) node_index[node_names[i]] = i;
     std::map<std::size_t, std::vector<std::uint64_t>> step_end;   // per path used, each step's end
     std::unordered_set<std::uint64_t> seen;                        // sequences passed on, by a 64-bit hash
@@ -746,10 +749,15 @@ std::vector<LocusIndex> build(const BuildOptions& o) {
             x.transcriptome = bg::transcriptome_id(m);
             std::map<std::string, std::array<std::uint64_t, 2>> by_status;
             std::uint64_t short_rows = 0;
+            std::set<std::string> absent_paths;
             collect_kmers(g, x, present, [&](const TranscriptFn& fn) {
                 for_each_transcript(tx, g, node_names, o.transcripts_ok_only, o.transcripts_splice_changed, x.transcripts_used,
-                                    x.transcripts_skipped, by_status, w.genes, short_rows, fn);
+                                    x.transcripts_skipped, by_status, w.genes, short_rows, absent_paths, fn);
             });
+            if (!absent_paths.empty())
+                log("warning: locus: " + x.name + "; " + transcripts_table(tx) + " names " + std::to_string(absent_paths.size()) +
+                    " path(s) the graph lacks (" + *absent_paths.begin() + (absent_paths.size() > 1 ? ", ..." : "") +
+                    "): their transcripts' k-mers are placed on no node; are they of another graph?");
             if (short_rows > 0)
                 log("warning: locus: " + x.name + "; " + transcripts_table(tx) + ": " + std::to_string(short_rows) +
                     " row(s) with fewer fields than the header, skipped: their transcripts' k-mers are placed on no node");

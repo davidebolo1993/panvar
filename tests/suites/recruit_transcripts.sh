@@ -94,6 +94,10 @@ cp data/locus.hst.fa data/short.hst.fa   # a table whose first row was cut short
 "${RC[@]}" --save-index idxt --locus data/locus.gfa --transcripts data/short.hst.fa 2> short.txt; rc=$?
 check "a table row with fewer fields than the header is skipped with a warning" \
   '[[ $rc -eq 0 ]] && grep -q "warning: locus: locus; .*short.hst.tsv: 1 row(s) with fewer fields than the header" short.txt'
+cp data/locus.hst.fa data/renamed.hst.fa; sed 's/ref#1#chr1/rx#1#chr1/' data/locus.hst.tsv > data/renamed.hst.tsv
+"${RC[@]}" --save-index idxn --locus data/locus.gfa --transcripts data/renamed.hst.fa 2> renamed.txt
+check "a table naming a path the graph lacks is warned about" \
+  'grep -q "warning: locus: locus; .*renamed.hst.tsv names 1 path(s) the graph lacks (rx#1#chr1:120000-140000)" renamed.txt'
 "${RC[@]}" --save-index idx3 --locus data/locus.gfa --transcripts other=data/locus.hst.fa 2> bad.txt
 check "transcripts for a locus not given are refused" 'grep -q "no --locus graph is named other" bad.txt'
 
