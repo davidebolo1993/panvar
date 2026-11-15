@@ -1957,6 +1957,20 @@ TranscriptsResult project_transcripts(const Graph& graph, const TranscriptsOptio
         for (const std::size_t x : idx) recs.push_back(std::move(extra[x]));
     };
 
+    // The reference walk must give back every transcript as annotated, in one of its copies. A transcript it
+    // does not give back is projected wrongly there, so its records on every walk are not_as_annotated; this
+    // comes before the haplotypes' own annotations, which judge projected records by their status.
+    std::vector<char> distrusted(res.transcripts.size(), 0);
+    if (project) {
+        std::vector<char> back(res.transcripts.size(), 0);
+        for (const HstRecord& r : project_haplotype(static_cast<std::size_t>(ref_path - graph.paths.data())))
+            if (r.sequence == res.reference_sequences[r.transcript]) back[r.transcript] = 1;
+        for (std::size_t x = 0; x < back.size(); ++x)
+            if (!back[x]) {
+                distrusted[x] = 1;
+                res.not_given_back.push_back(res.transcripts[x].transcript_id);
+            }
+    }
     // Haplotypes in batches, so results reach the sink in path order without holding every sequence.
     const std::size_t threads = opt.threads ? opt.threads : std::max(1u, std::thread::hardware_concurrency());
     const std::size_t batch = threads * 4;
@@ -1964,18 +1978,9 @@ TranscriptsResult project_transcripts(const Graph& graph, const TranscriptsOptio
         const std::size_t b1 = std::min(graph.paths.size(), b0 + batch);
         std::vector<std::vector<HstRecord>> got(b1 - b0);
         if (project) run_parallel(b1 - b0, threads, [&](std::size_t k) { got[k] = project_haplotype(b0 + k); });
-        // The reference walk must give back every transcript as annotated, in one of its copies; this comes
-        // before the haplotypes' own annotations, which judge projected records by their status.
-        for (std::size_t k = 0; k < got.size(); ++k) {
-            if (!project || &graph.paths[b0 + k] != ref_path) continue;
-            std::vector<char> back(res.transcripts.size(), 0);
-            for (const HstRecord& r : got[k])
-                if ((r.source & kProjected) && r.sequence == res.reference_sequences[r.transcript]) back[r.transcript] = 1;
-            for (std::size_t x = 0; x < back.size(); ++x)
-                if (!back[x]) res.not_given_back.push_back(res.transcripts[x].transcript_id);
-            for (HstRecord& r : got[k])
-                if ((r.source & kProjected) && !back[r.transcript] && !r.sequence.empty()) r.status = HstStatus::NotAsAnnotated;
-        }
+        for (auto& recs : got)
+            for (HstRecord& r : recs)
+                if (distrusted[r.transcript] && !r.sequence.empty()) r.status = HstStatus::NotAsAnnotated;
         run_parallel(b1 - b0, threads, [&](std::size_t k) { add_annotated(b0 + k, got[k]); });
         for (const auto& recs : got) sink.add(res, recs);
     }
