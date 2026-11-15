@@ -40,7 +40,8 @@ void print_transcripts_help() {
         << "      --min-exon-share <F>          Share of the gene's marker exons a pass must walk to be a\n"
         << "                                    copy (default 0.8)\n"
         << "      --min-identity <F>            Identity of the marker exons for a copy placed by sequence,\n"
-        << "                                    where its nodes fall short of the share (default 0.93)\n"
+        << "                                    where its nodes fall short of the share, and of an exon\n"
+        << "                                    looked for alone in such a copy (default 0.93)\n"
         << "  -t, --threads <N>                 Worker threads (default 0 = all cores)\n"
         << "  -q, --quiet                       No progress logs\n"
         << "  -h, --help                        Show this help\n";
