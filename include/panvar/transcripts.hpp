@@ -26,7 +26,8 @@ namespace panvar {
 // does not follow are carried through a second chain of that copy's own nodes. A gene whose nodes fall short
 // of the share on a walk (alleles the graph keeps on nodes of their own) is placed by sequence instead: its
 // reference stretch aligned inside the window its best chain points to, accepted on the marker's coverage
-// and identity.
+// and identity. A gene left without a copy still gets the transcripts whose exons are all on its best chain,
+// on nodes the reference walks nowhere outside the gene: a deletion taking the marker's exons leaves them.
 
 struct TranscriptsOptions {
     std::string gfa_path;

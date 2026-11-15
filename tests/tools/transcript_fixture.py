@@ -114,6 +114,17 @@ CASES = {
         genes={"GH": ("+", {"TH1": [(1000, 1300), (2000, 2300), (3000, 3300)]})},
         haps={"h1": [("del", (997, 1002)), ("sub", (1010, 1130)), ("sub", (2000, 2105)), ("del", (3296, 3303))]},
         reversed={"h2": "h1"}),
+    # a gene whose marker loses an exon to a deletion that leaves other transcripts whole: a copy below the
+    # share, with those transcripts written
+    "partial": dict(
+        L=8000,
+        genes={"GW": ("-", {"TW1": [(1000, 1100), (3000, 3600)], "TW2": [(1000, 1100), (1400, 1500)], "TW3": [(3200, 3600)],
+                            "TW4": [(1000, 1100), (1400, 1500), (4500, 4600)]})},
+        haps={"h1": [("del", (2500, 4000))], "h2": [("snp", 1450)]},
+        reversed={"h3": "h1"}),
+    # a deleted gene whose exons a paralog elsewhere shares: on the paralog's copy, its transcripts stay
+    # without a copy (write_paralog)
+    "partial_paralog": dict(),
     # a short gene on the nodes of a stretch inside a longer gene, and a haplotype without the short gene
     # whose copy of the longer one carries an allele there (write_nested)
     "nested": dict(),
@@ -279,14 +290,25 @@ def expected(case, ref, seqs, maps):
             hi = max(min(b, case["L"]) for ex in txs.values() for a, b in ex if b > 0 and a < case["L"])
             # copies: the maps holding the gene's bases
             copies = [m for m in maps[h] if any(p in m for p in range(lo, hi))]
+            src = case.get("reversed", {}).get(h, h)
+            subs = [v for kind, v in case["haps"].get(src, []) if kind == "sub"]
+            snps = {v for kind, v in case["haps"].get(src, []) if kind == "snp"}
+            # a copy below the share still holds the transcripts with every exon on it: with one of them whole,
+            # the haplotype has a copy, and its other transcripts lack an exon
+            whole = len(copies) == 1 and any(project(case, ref, seqs[src], copies[0], strand, ex, subs)[0] != "missing_exon"
+                                             for ex in txs.values() if any(b > 0 and a < case["L"] for a, b in ex))
+
+            def below(t, exons, status):
+                if not whole:
+                    return (t, g, h, 0, status, [], "")
+                st, notes, s = project(case, ref, seqs[src], copies[0], strand, exons, subs)
+                return (t, g, h, 1, st, notes + ["below_share"], s)
+
             for t, exons in txs.items():
                 if not any(b > 0 and a < case["L"] for a, b in exons):
                     continue
                 if not copies:
                     rows.append((t, g, h, 0, "no_copy", [], ""))
-                src = case.get("reversed", {}).get(h, h)
-                subs = [v for kind, v in case["haps"].get(src, []) if kind == "sub"]
-                snps = {v for kind, v in case["haps"].get(src, []) if kind == "snp"}
                 by_sequence = False
                 if len(copies) == 1:
                     # the marker's exonic bases the copy shares by nodes; below the share, the copy is placed by
@@ -299,10 +321,10 @@ def expected(case, ref, seqs, maps):
                     if (len(held) - len(on_alleles)) / len(marker) < SHARE:
                         alike = held and 1 - len(changed) / len(held) >= IDENTITY
                         if not alike or len(held) / len(marker) < PARTIAL:
-                            rows.append((t, g, h, 0, "no_copy", [], ""))
+                            rows.append(below(t, exons, "no_copy"))
                             continue
                         if len(held) / len(marker) < SHARE:
-                            rows.append((t, g, h, 0, "partial_copy", [], ""))
+                            rows.append(below(t, exons, "partial_copy"))
                             continue
                         by_sequence = True
                 for c, m in enumerate(copies, 1):
@@ -590,6 +612,57 @@ def write_merged(d):
             out.write(f"TM2\tGM\t{name(h, L)}\t1\tok\t.\t{tm2}\n")
 
 
+def write_paralog(d):
+    """Gene GX: exons X1, X2 and a long one in B. Gene GY, further on: X1 and X2 walked again around another
+    intron, and an exon of its own. A haplotype lacks GX with its flank B. GX's nodes X1 and X2 are on it, in
+    GY's copy, and TX2 has no other exon: but the reference walks them outside GX too, so they are not GX's
+    there, and GX has no copy. The same haplotype reversed."""
+    rnd = random.Random(19)
+    seq = lambda n: "".join(rnd.choice("ACGT") for _ in range(n))
+    size = dict(A=1000, X1=300, I1=500, X2=300, B=3000, S=200, I2=500, C=500, Y3=300, T=500)
+    nodes = {n: seq(k) for n, k in size.items()}
+    ids = {n: str(k + 1) for k, n in enumerate(nodes)}
+    walk = {"ref": ["A", "X1", "I1", "X2", "B", "S", "X1", "I2", "X2", "C", "Y3", "T"],
+            "h1": ["A", "X1", "I2", "X2", "C", "Y3", "T"]}
+    steps = {h: [(ids[n], "+") for n in w] for h, w in walk.items()}
+    steps["h2"] = [(n, "-") for n, _ in reversed(steps["h1"])]
+    L = sum(size[n] for n in walk["ref"])
+    at, pos = [], 0
+    for n in walk["ref"]:
+        at.append(pos)
+        pos += size[n]
+    exons = {"GX": {"TX1": [(at[1], at[1] + 300), (at[3], at[3] + 300), (at[4] + 200, at[4] + 2800)],
+                    "TX2": [(at[1], at[1] + 300), (at[3], at[3] + 300)]},
+             "GY": {"TY1": [(at[6], at[6] + 300), (at[8], at[8] + 300), (at[10], at[10] + 300)]}}
+    with open(f"{d}/locus.gfa", "w") as out:
+        out.write("H\tVN:Z:1.0\n")
+        for n, s in nodes.items():
+            out.write(f"S\t{ids[n]}\t{s}\n")
+        for x, ox, y, oy in sorted({(x, ox, y, oy) for w in steps.values() for (x, ox), (y, oy) in zip(w, w[1:])}):
+            out.write(f"L\t{x}\t{ox}\t{y}\t{oy}\t0M\n")
+        for h, w in steps.items():
+            out.write(f"P\t{name(h, L)}\t{','.join(n + o for n, o in w)}\t*\n")
+    with open(f"{d}/genes.gtf", "w") as out:
+        for g, txs in exons.items():
+            for k, (t, ex) in enumerate(txs.items()):
+                attr = (f'gene_id "{g}"; gene_name "{g}"; gene_biotype "protein_coding"; transcript_id "{t}"; '
+                        f'transcript_name "{t}";' + (' tag "Ensembl_canonical";' if k == 0 else ""))
+                out.write(f"chr1\ttest\ttranscript\t{ex[0][0] + OFFSET + 1}\t{ex[-1][1] + OFFSET}\t.\t+\t.\t{attr}\n")
+                for a, b in ex:
+                    out.write(f"chr1\ttest\texon\t{a + OFFSET + 1}\t{b + OFFSET}\t.\t+\t.\t{attr}\n")
+    tx2 = nodes["X1"] + nodes["X2"]
+    spliced = {"TX1": tx2 + nodes["B"][200:2800], "TX2": tx2, "TY1": tx2 + nodes["Y3"]}
+    with open(f"{d}/expected.tsv", "w") as out:
+        out.write("transcript_id\tgene_name\thaplotype\tcopy\tstatus\tdetail\tsequence\n")
+        for h in ("ref", "h1", "h2"):
+            for g, txs in exons.items():
+                for t in txs:
+                    if g == "GX" and h != "ref":
+                        out.write(f"{t}\t{g}\t{name(h, L)}\t0\tno_copy\t.\t.\n")
+                    else:
+                        out.write(f"{t}\t{g}\t{name(h, L)}\t1\tok\t.\t{spliced[t]}\n")
+
+
 def write(case_name, d):
     case = CASES[case_name]
     if case_name.startswith("tandem"):
@@ -600,6 +673,8 @@ def write(case_name, d):
         return write_annotated(d)
     if case_name == "merged":
         return write_merged(d)
+    if case_name == "partial_paralog":
+        return write_paralog(d)
     ref, nodes, walks, seqs, maps = build(case)
     edges = set()
     for steps in walks.values():

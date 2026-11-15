@@ -144,6 +144,7 @@ struct Gene {
     std::size_t m_lo = 0, m_hi = 0;   // the marker's span: where the gene is, for telling copies apart
     std::size_t gs = 0, ge = 0;       // reference steps [gs, ge) holding the span, one more on each side
     std::vector<char> uniq;           // per step of [gs, ge): its node occurs once there
+    std::vector<char> own;            // per step of [gs, ge): the reference walks its node nowhere outside them
     std::size_t marker_bp = 0;
     std::vector<std::pair<std::size_t, std::size_t>> tandem_spans;   // its transcripts' tandem stretches
 };
@@ -401,6 +402,14 @@ bool exon_shared(const Walk& R, const Gene& g, const std::vector<long>& match, s
         if (R.pref[i] < ce && R.pref[i + 1] > cs) return true;
     }
     return false;
+}
+
+// Bases of the reference stretch [cs, ce) on matched steps; with `own`, on those whose nodes are the gene's own.
+std::size_t held_bases(const Walk& R, const Gene& g, const std::vector<long>& match, std::size_t cs, std::size_t ce, bool own) {
+    std::size_t n = 0;
+    for (std::size_t k = 0; k < match.size(); ++k)
+        if (match[k] >= 0 && (!own || g.own[k])) n += overlap(R.pref[g.gs + k], R.pref[g.gs + k + 1], cs, ce);
+    return n;
 }
 
 // A deletion from one copy of a segment into the next, where the graph folds the copies onto the same nodes,
@@ -971,10 +980,12 @@ SeqCopy place_by_sequence(const Walk& R, const std::string& rseq, const Gene& g,
     return sc;
 }
 
-// One transcript through one copy.
+// One transcript through one copy. With `own_share` (a pass below the share, which may lie on a paralog or
+// on a diverged stretch), an exon counts only when that share of its bases is on nodes the reference walks
+// nowhere outside the gene: the copy's test, exon by exon.
 HstRecord project_one(const Walk& R, const std::string& rseq, const Gene& g, const Copy& cp, const Walk& W,
                       const std::string& wseq, const TranscriptFeature& tx, const Cuts& cuts,
-                      const TranscriptsResult::EdgeClip& clip, const Tandem& tm, UnitCache& cache) {
+                      const TranscriptsResult::EdgeClip& clip, const Tandem& tm, UnitCache& cache, double own_share = 0.0) {
     HstRecord r;
     r.reverse = cp.reverse();
     const std::size_t n = cuts.size();
@@ -995,6 +1006,9 @@ HstRecord project_one(const Walk& R, const std::string& rseq, const Gene& g, con
             if (s0 <= cs && ce <= s1) return true;
         return false;
     };
+    const auto to_share = [&](std::size_t held, std::size_t cs, std::size_t ce) {
+        return static_cast<double>(held) >= own_share * static_cast<double>(ce - cs);
+    };
     for (std::size_t k = 0; k < n; ++k) {
         if (in_tandem(k)) continue;
         const auto [cs, ce] = cuts[k];
@@ -1009,11 +1023,13 @@ HstRecord project_one(const Walk& R, const std::string& rseq, const Gene& g, con
             a = map_cut(R, g, cp, W, cs, true);
             b = map_cut(R, g, cp, W, ce, false);
             if (!a.ok || !b.ok || b.pos <= a.pos) lacking[k] = e + ":missing";
+            else if (own_share > 0 && !to_share(held_bases(R, g, cp.pass->match, cs, ce, true), cs, ce))   // walked below the share, or on shared nodes
+                lacking[k] = e + (to_share(held_bases(R, g, cp.pass->match, cs, ce, false), cs, ce) ? ":shared_nodes" : ":missing");
         }
         if (!lacking[k].empty() && in_second_copy(cs, ce) && exon_shared(R, g, cp.pass->again, cs, ce)) {
             a = map_cut(R, g, cp.pass->again, W, cs, true);
             b = map_cut(R, g, cp.pass->again, W, ce, false);
-            again[k] = a.ok && b.ok && b.pos > a.pos;
+            again[k] = a.ok && b.ok && b.pos > a.pos && (own_share <= 0 || to_share(held_bases(R, g, cp.pass->again, cs, ce, true), cs, ce));
         }
         if (!lacking[k].empty() && !again[k]) continue;
         hx[k] = {a.pos, b.pos};
@@ -1300,6 +1316,8 @@ TranscriptsResult project_transcripts(const Graph& graph, const TranscriptsOptio
     std::sort(gene_order.begin(), gene_order.end());
     std::vector<Gene> genes;
     std::vector<Cuts> cuts;
+    std::vector<int> walked(t.seq.size(), 0);   // per node, the steps of the reference walk on it
+    for (const int v : R.node) ++walked[static_cast<std::size_t>(v)];
     for (const auto& [first_exon, gid] : gene_order) {
         Gene g;
         for (const std::size_t k : by_gene[gid]) {
@@ -1337,7 +1355,11 @@ TranscriptsResult project_transcripts(const Graph& graph, const TranscriptsOptio
         std::unordered_map<int, int> count;
         for (std::size_t i = g.gs; i < g.ge; ++i) ++count[R.node[i]];
         g.uniq.resize(g.ge - g.gs);
-        for (std::size_t i = g.gs; i < g.ge; ++i) g.uniq[i - g.gs] = count[R.node[i]] == 1;
+        g.own.resize(g.ge - g.gs);
+        for (std::size_t i = g.gs; i < g.ge; ++i) {
+            g.uniq[i - g.gs] = count[R.node[i]] == 1;
+            g.own[i - g.gs] = count[R.node[i]] == walked[static_cast<std::size_t>(R.node[i])];
+        }
         genes.push_back(std::move(g));
     }
     for (std::size_t k = 0; k < res.transcripts.size(); ++k) {
@@ -1481,18 +1503,45 @@ TranscriptsResult project_transcripts(const Graph& graph, const TranscriptsOptio
             std::sort(gp.begin(), gp.end(), [](const Pass* a, const Pass* b) { return a->h_lo < b->h_lo; });
             const SeqCopy& sc = placed[gi];
             const bool by_sequence = sc.ok && sc.coverage >= opt.min_exon_share;
-            for (const std::size_t k : genes[gi].tx) {
-                if (gp.empty() && !by_sequence) {
+            if (gp.empty() && !by_sequence) {
+                // A gene without a copy, and not lost to another gene, may still hold whole transcripts where
+                // its best chain lies: a deletion taking the marker's exons leaves those that do not use them.
+                // Each transcript is projected through that chain; with one of them whole, the walk has a copy
+                // below the share, whose other transcripts lack an exon.
+                std::vector<HstRecord> whole;
+                Pass& wp = weak[gi];
+                if (lost_to[gi].empty() && wp.matched > 0) {
+                    const Walk& W = wp.reverse ? Hr : H;
+                    match_again(R, genes[gi], W, chains_of[gi][wp.reverse], t, wp);
+                    Copy cp;
+                    cp.pass = &wp;
+                    bool any = false;
+                    for (const std::size_t k : genes[gi].tx) {
+                        whole.push_back(project_one(R, rseq, genes[gi], cp, W, wp.reverse ? hrseq : hseq, res.transcripts[k], cuts[k],
+                                                    res.clips[k], tandem[k], unit_cache, opt.min_exon_share));
+                        any = any || whole.back().status != HstStatus::MissingExon;
+                    }
+                    if (!any) whole.clear();
+                }
+                for (std::size_t x = 0; x < genes[gi].tx.size(); ++x) {
                     HstRecord r;
-                    r.transcript = k;
+                    if (!whole.empty()) {
+                        r = std::move(whole[x]);
+                        r.copy = r.copies = 1;
+                        add_detail(r.detail, "below_share");
+                    } else {
+                        r.status = sc.ok ? HstStatus::PartialCopy : HstStatus::NoCopy;
+                    }
+                    r.transcript = genes[gi].tx[x];
                     r.haplotype = h;
-                    r.status = sc.ok ? HstStatus::PartialCopy : HstStatus::NoCopy;
-                    r.detail = fmt("best_share", best_share[gi]);
+                    add_detail(r.detail, fmt("best_share", best_share[gi]));
                     if (sc.ok) { add_detail(r.detail, fmt("coverage", sc.coverage)); add_detail(r.detail, fmt("identity", sc.identity)); }
                     if (!lost_to[gi].empty()) add_detail(r.detail, lost_to[gi]);
                     out.push_back(std::move(r));
-                    continue;
                 }
+                continue;
+            }
+            for (const std::size_t k : genes[gi].tx) {
                 if (by_sequence) {
                     Copy cp;
                     cp.seq = &sc;
