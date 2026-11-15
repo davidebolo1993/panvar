@@ -982,7 +982,7 @@ SeqCopy place_by_sequence(const Walk& R, const std::string& rseq, const Gene& g,
 
 // One transcript through one copy. With `own_share` (a pass below the share, which may lie on a paralog or
 // on a diverged stretch), an exon counts only when that share of its bases is on nodes the reference walks
-// nowhere outside the gene: the copy's test, exon by exon.
+// nowhere outside the gene: the copy's test, exon by exon, tandem exons too.
 HstRecord project_one(const Walk& R, const std::string& rseq, const Gene& g, const Copy& cp, const Walk& W,
                       const std::string& wseq, const TranscriptFeature& tx, const Cuts& cuts,
                       const TranscriptsResult::EdgeClip& clip, const Tandem& tm, UnitCache& cache, double own_share = 0.0) {
@@ -1088,6 +1088,23 @@ HstRecord project_one(const Walk& R, const std::string& rseq, const Gene& g, con
                 add_detail(r.detail, "tandem:" + std::to_string(tm.hi - tm.lo + 1) + ">" + std::to_string(found.size()));
             if (placed.resized) add_detail(r.detail, "tandem_resized:" + std::to_string(placed.resized));
             if (placed.unplaced) add_detail(r.detail, "tandem_unplaced:" + std::to_string(placed.unplaced));
+            // Below the share, each exon placed must lie on the gene's own nodes as the others must: the window
+            // comes from a chain that may lie on a paralog.
+            if (own_share > 0 && !missing) {
+                std::set<int> mine;
+                for (std::size_t q = 0; q < g.own.size(); ++q)
+                    if (g.own[q]) mine.insert(R.node[g.gs + q]);
+                for (const Piece& pc : found) {
+                    std::size_t held = 0;
+                    for (std::size_t j = step_at(W, pc.a); j < W.size() && W.pref[j] < pc.b; ++j)
+                        if (mine.count(W.node[j])) held += overlap(W.pref[j], W.pref[j + 1], pc.a, pc.b);
+                    if (!to_share(held, pc.a, pc.b)) {
+                        missing = true;
+                        add_detail(r.detail, "tandem:shared_nodes");
+                        break;
+                    }
+                }
+            }
             pieces.insert(pieces.end(), found.begin(), found.end());
         }
     }

@@ -125,6 +125,10 @@ CASES = {
     # a deleted gene whose exons a paralog elsewhere shares: on the paralog's copy, its transcripts stay
     # without a copy (write_paralog)
     "partial_paralog": dict(),
+    # the same, with GX's other transcript on exons in tandem (write_tandem_paralog)
+    "paralog_tandem": dict(),
+    # tandem exons whole on the gene's own nodes, the marker's exon deleted: a copy below the share
+    "partial_tandem": dict(),
     # a gene deleted beside a paralog that follows it on the same node (write_adjacent_paralog)
     "paralog_adjacent": dict(),
     # a short gene on the nodes of a stretch inside a longer gene, and a haplotype without the short gene
@@ -651,11 +655,11 @@ def node_locus(d, seed, size, walk, exons):
 
 
 def write_rows(d, L, rows):
-    """expected.tsv from (transcript, gene, haplotype, copy, status, sequence) rows."""
+    """expected.tsv from (transcript, gene, haplotype, copy, status, sequence[, detail]) rows."""
     with open(f"{d}/expected.tsv", "w") as out:
         out.write("transcript_id\tgene_name\thaplotype\tcopy\tstatus\tdetail\tsequence\n")
-        for t, g, h, c, st, s in rows:
-            out.write(f"{t}\t{g}\t{name(h, L)}\t{c}\t{st}\t.\t{s or '.'}\n")
+        for t, g, h, c, st, s, *det in rows:
+            out.write(f"{t}\t{g}\t{name(h, L)}\t{c}\t{st}\t{det[0] if det else '.'}\t{s or '.'}\n")
 
 
 def write_paralog(d):
@@ -673,6 +677,32 @@ def write_paralog(d):
     spliced = {"TX1": tx2 + nodes["B"][200:2800], "TX2": tx2, "TY1": tx2 + nodes["Y3"]}
     write_rows(d, L, [(t, g, h, *((0, "no_copy", "") if g == "GX" and h != "ref" else (1, "ok", spliced[t])))
                       for h in ("ref", "h1", "h2") for g, txs in exons.items() for t in txs])
+
+
+def write_tandem_paralog(d, paralog):
+    """Gene GX: TX1 on its own node M, TX2 on X twice around I, between B and C. With `paralog`, gene GY,
+    further on, walks B, X, I, X and C again between exons of its own, and a haplotype lacks GX: GX's best
+    chain, through B, I and C, lies on GY's copy, where TX2's exons would be placed unit by unit, but the
+    reference walks those nodes outside GX too, so GX has no copy. Without, a haplotype lacks M alone: TX2 is
+    whole on GX's own nodes, a copy below the share. The same haplotype reversed."""
+    size = dict(A=1000, M=300, B=400, X=200, I=300, C=400, S=1500, Y1=300, Y2=300, T=500)
+    gx = ["B", "X", "I", "X", "C"]
+    walk = ({"ref": ["A", "M", *gx, "S", "Y1", *gx, "Y2", "T"], "h1": ["A", "S", "Y1", *gx, "Y2", "T"]} if paralog
+            else {"ref": ["A", "M", *gx, "T"], "h1": ["A", *gx, "T"]})
+    walk["h2"] = "h1"
+    exons = {"GX": {"TX1": [(1, 0, 300)], "TX2": [(3, 0, 150), (5, 0, 150)]}}
+    if paralog:
+        exons["GY"] = {"TY1": [(8, 0, 300), (14, 0, 300)]}
+    nodes, _, L = node_locus(d, 23, size, walk, exons)
+    spliced = {"TX1": nodes["M"], "TX2": nodes["X"][:150] * 2, "TY1": nodes["Y1"] + nodes["Y2"]}
+
+    def row(t, g, h):
+        if g == "GY" or h == "ref":
+            return (t, g, h, 1, "ok", spliced[t])
+        if paralog:
+            return (t, g, h, 0, "no_copy", "")
+        return (t, g, h, 1, "ok", spliced[t], "below_share") if t == "TX2" else (t, g, h, 1, "missing_exon", "", "e1:missing;below_share")
+    write_rows(d, L, [row(t, g, h) for h in ("ref", "h1", "h2") for g, txs in exons.items() for t in txs])
 
 
 def write_adjacent_paralog(d):
@@ -702,6 +732,8 @@ def write(case_name, d):
         return write_merged(d)
     if case_name == "partial_paralog":
         return write_paralog(d)
+    if case_name in ("paralog_tandem", "partial_tandem"):
+        return write_tandem_paralog(d, case_name == "paralog_tandem")
     if case_name == "paralog_adjacent":
         return write_adjacent_paralog(d)
     ref, nodes, walks, seqs, maps = build(case)
