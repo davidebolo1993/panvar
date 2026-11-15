@@ -5964,16 +5964,38 @@ void call_variants(
                 right = c.hi;
             }
         }
-        // the haplotypes (path slots) a record line carries
+        // Each path's haplotype, read as --diploid reads it (sample, haplotype number as a number, so 1 and 01
+        // are one; a plain name is its sample's haplotype 0; a field that is no number is a haplotype of its own),
+        // so a haplotype carrying two records in contigs written two ways is still seen.
+        std::vector<std::size_t> site_slot(sample_names.size(), SIZE_MAX);
+        {
+            std::map<std::pair<std::string, long long>, std::size_t> slot_of;
+            for (std::size_t i = 0; i < sample_names.size(); ++i) {
+                if (i == ref_column) continue;
+                const std::string& n = sample_names[i];
+                const std::size_t a = n.find('#');
+                std::pair<std::string, long long> key{a == std::string::npos ? n : n.substr(0, a), 0};
+                if (a != std::string::npos) {
+                    const std::size_t b = n.find('#', a + 1);
+                    const std::string h = n.substr(a + 1, b == std::string::npos ? std::string::npos : b - a - 1);
+                    if (!h.empty() && h.size() < 18 && h.find_first_not_of("0123456789") == std::string::npos)
+                        key.second = std::stoll(h);
+                    else
+                        key = {"\x01" + n, 0};
+                }
+                site_slot[i] = slot_of.emplace(key, slot_of.size()).first->second;
+            }
+        }
+        // the haplotypes a record line carries
         const auto carriers_of = [&](const std::string& line) {
             std::set<std::size_t> out;
             std::size_t a = 0;
             for (std::size_t col = 0; a != npos && a < line.size(); ++col) {
                 const std::size_t b = line.find('\t', a);
-                if (col >= 9 && col - 9 < path_slot.size() && path_slot[col - 9] != SIZE_MAX) {
+                if (col >= 9 && col - 9 < site_slot.size() && site_slot[col - 9] != SIZE_MAX) {
                     const std::size_t e = std::min({b, line.find(':', a), line.find('\n', a)});
                     const std::string_view gt = std::string_view(line).substr(a, (e == npos ? line.size() : e) - a);
-                    if (gt != "0" && gt != ".") out.insert(path_slot[col - 9]);
+                    if (gt != "0" && gt != ".") out.insert(site_slot[col - 9]);
                 }
                 a = b == npos ? npos : b + 1;
             }
