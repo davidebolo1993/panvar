@@ -201,7 +201,8 @@ std::vector<TranscriptFeature> parse_gtf_transcripts(const std::string& gtf_path
                                                      std::size_t lo_1based,
                                                      std::size_t hi_1based,
                                                      std::vector<TranscriptFeature>* partial,
-                                                     const std::string& module) {
+                                                     const std::string& module,
+                                                     std::set<std::pair<std::string, std::string>>* all_genes) {
     GzLineReader reader(gtf_path);
     if (!reader.ok()) throw std::runtime_error("Failed to open GTF: " + gtf_path);
     const std::string want = norm_chrom(ref_chrom);
@@ -212,6 +213,7 @@ std::vector<TranscriptFeature> parse_gtf_transcripts(const std::string& gtf_path
         if (line.empty() || line[0] == '#') continue;
         const std::vector<std::string> f = split_tab(line);
         if (f.size() < 9 || (f[2] != "exon" && f[2] != "CDS")) continue;
+        if (all_genes != nullptr && f[2] == "exon") all_genes->emplace(gtf_attr(f[8], "gene_id"), gtf_attr(f[8], "gene_name"));
         if (norm_chrom(f[0]) != want) continue;
         chrom_seen = true;
         std::size_t start = 0, end = 0;

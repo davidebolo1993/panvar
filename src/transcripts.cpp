@@ -13,6 +13,7 @@
 #include <cstdio>
 #include <fstream>
 #include <set>
+#include <unordered_set>
 #include <iostream>
 #include <numeric>
 #include <stdexcept>
@@ -1280,6 +1281,7 @@ TranscriptsResult project_transcripts(const Graph& graph, const TranscriptsOptio
     std::string rseq;
     std::size_t base = 0, last = 0;
     std::vector<TranscriptFeature> partial, txs;
+    std::set<std::pair<std::string, std::string>> gtf_genes;   // every gene of the GTF, with annotations to judge
     if (project) {
         R = to_walk(*ref_path, t);
         rseq = spell(R, t);
@@ -1289,7 +1291,8 @@ TranscriptsResult project_transcripts(const Graph& graph, const TranscriptsOptio
                                      "' carries no contig:start-end, so GTF coordinates cannot be placed on it");
         base = meta.region_start_1based;
         last = base + R.len() - 1;
-        txs = parse_gtf_transcripts(opt.gtf_path, meta.chrom, base, last, &partial, "transcripts");
+        txs = parse_gtf_transcripts(opt.gtf_path, meta.chrom, base, last, &partial, "transcripts",
+                                    opt.hap_annotations.empty() ? nullptr : &gtf_genes);
     }
     std::vector<TranscriptsResult::EdgeClip> tx_clip;
     for (const TranscriptFeature& t : txs) tx_clip.push_back({t.exons.size(), 0, 0, 0});
@@ -1625,8 +1628,15 @@ TranscriptsResult project_transcripts(const Graph& graph, const TranscriptsOptio
         gene_by_name.emplace(t0.gene_name, gi);
     }
     for (std::size_t k = 0; k < res.transcripts.size(); ++k) tx_by_id.emplace(res.transcripts[k].transcript_id, k);
-    std::set<std::string> outside_genes;
-    for (const TranscriptFeature& o : res.outside) outside_genes.insert(o.gene_id);
+    // Genes the GTF has, on the path or not, by id (without its version) and by name. Only these are judged as
+    // paralog lifts: the place on the reference of a gene the GTF lacks is not known.
+    std::unordered_set<std::string> gtf_ids, gtf_names;
+    for (const auto& [id, name] : gtf_genes) {
+        const std::size_t d = id.rfind('.');
+        const bool version = d != std::string::npos && d + 1 < id.size() && id.find_first_not_of("0123456789", d + 1) == std::string::npos;
+        if (!id.empty()) gtf_ids.insert(version ? id.substr(0, d) : id);
+        if (!name.empty()) gtf_names.insert(name);
+    }
     // A projected record the annotation may not overrule: its every boundary carried, or moved off a variant.
     const auto clean = [](HstStatus s) {
         return s == HstStatus::Ok || s == HstStatus::SpliceSiteChanged || s == HstStatus::BoundaryMoved || s == HstStatus::ClippedAtEdge;
@@ -1681,7 +1691,7 @@ TranscriptsResult project_transcripts(const Graph& graph, const TranscriptsOptio
         // their exonic bases, merged.
         struct AnnCopy {
             long gene = -1;
-            bool placed = false;      // its gene is known on the reference: projected, or lifted from elsewhere
+            bool placed = false;      // its gene is known on the reference: projected, or in the GTF off the path
             std::string key;          // the gene its copies are counted for, where not a projected one
             Cuts ex;
             std::vector<std::size_t> members;   // indices into res.annotated
@@ -1700,7 +1710,7 @@ TranscriptsResult project_transcripts(const Graph& graph, const TranscriptsOptio
                     const auto gi = gene_by_id.find(at.t.gene_id);
                     const auto gn = gene_by_name.find(at.t.gene_name);
                     ac.gene = gi != gene_by_id.end() ? static_cast<long>(gi->second) : gn != gene_by_name.end() ? static_cast<long>(gn->second) : -1;
-                    ac.placed = ac.gene >= 0 || at.source_gene || outside_genes.count(at.t.gene_id) != 0;
+                    ac.placed = ac.gene >= 0 || gtf_ids.count(at.t.gene_id) != 0 || gtf_names.count(at.t.gene_name) != 0;
                     ac.key = at.gene_key;
                     acs.push_back(std::move(ac));
                 }

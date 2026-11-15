@@ -528,9 +528,9 @@ def write_annotated(d):
 def write_annotation_rules(d):
     """The main case, with annotations: h1 TA1 twice, as projected and with exon 3 ending early, and a novel
     isoform; h2 TA1 (its exon 2 deleted) with another exon 2, and without it; h4 TA1 with exon 3 starting
-    later than projected, a gene lifted from elsewhere onto GA's copy, and a novel gene there (CAT's
-    source_gene=None); h6 (no GC) GC on GB's copy, with a novel isoform, and GC on its own further on.
-    expected.tsv is the default run's, expected_prefer.tsv the run with --prefer-annotation's."""
+    later than projected, on GA's copy a gene the GTF lacks, a gene the GTF has off the path (GO) and a novel
+    gene (CAT's source_gene=None); h6 (no GC) GC on GB's copy, with a novel isoform, and GC on its own further
+    on. expected.tsv is the default run's, expected_prefer.tsv the run with --prefer-annotation's."""
     write("main", d)
     case = CASES["main"]
     L = case["L"]
@@ -563,7 +563,9 @@ def write_annotation_rules(d):
     gene("h4", "a4", "gene_name=GA;source_gene=GA.1", 1000, 3300)
     tx("h4", "a4", "late4", "TA1", "GA", ta1[:2] + [(3010, 3300)], (1, "discordant", "."), (1, "ok", "."))
     gene("h4", "x4", "gene_name=XL;source_gene=ENSGX9.1", 1100, 2600)
-    tx("h4", "x4", "xl4", "xl4", "XL", [(1100, 1250), (2500, 2600)], (0, "paralog_lift", "on:GA"), (1, "ok", "on:GA"))
+    tx("h4", "x4", "xl4", "xl4", "XL", [(1100, 1250), (2500, 2600)], (1, "ok", "."), (1, "ok", "."))
+    gene("h4", "o4", "gene_name=GO", 1000, 3150)
+    tx("h4", "o4", "go4", "go4", "GO", [(1000, 1200), (3050, 3150)], (0, "paralog_lift", "on:GA"), (1, "ok", "on:GA"))
     gene("h4", "n4", "gene_name=NV;source_gene=None", 1500, 1600)
     tx("h4", "n4", "nv4", "nv4", "NV", [(1500, 1600)], (1, "ok", "."), (1, "ok", "."))
     gene("h6", "c6", "gene_name=GC;source_gene=GC.1", 5000, 5700)
@@ -581,6 +583,9 @@ def write_annotation_rules(d):
             out.write(f"{h}#1\t{d}/{h}.gff3\n")
     with open(f"{d}/alias.tsv", "w") as out:
         out.write("# names of one contig per row\n")
+    with open(f"{d}/genes.gtf", "a") as out:   # GO, past the reference path
+        a = 'gene_id "GO"; gene_name "GO"; transcript_id "TO1";'
+        out.write(f"chr1\ttest\texon\t{OFFSET + L + 40001}\t{OFFSET + L + 40200}\t.\t+\t.\t{a}\n")
     proj = open(f"{d}/expected.tsv").read().splitlines()
     for name_, k in (("expected.tsv", 5), ("expected_prefer.tsv", 6)):
         with open(f"{d}/{name_}", "w") as out:

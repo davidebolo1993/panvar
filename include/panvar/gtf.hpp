@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <set>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -46,12 +47,14 @@ struct TranscriptFeature {
 // Transcripts on `ref_chrom` (matched as parse_gtf does) with an exon overlapping [lo_1based, hi_1based].
 // Those with every exon inside the interval are returned, sorted by gene then transcript id; those with
 // exons outside it go to `partial` when given. Exons are read from the 'exon' rows, coding parts from 'CDS'.
+// `all_genes`, when given, receives the gene id and name of every exon row, on any contig.
 std::vector<TranscriptFeature> parse_gtf_transcripts(const std::string& gtf_path,
                                                      const std::string& ref_chrom,
                                                      std::size_t lo_1based,
                                                      std::size_t hi_1based,
                                                      std::vector<TranscriptFeature>* partial = nullptr,
-                                                     const std::string& module = "panvar");
+                                                     const std::string& module = "panvar",
+                                                     std::set<std::pair<std::string, std::string>>* all_genes = nullptr);
 
 // True iff `name` looks like PanSN `sample#hap#contig:start-end`: at least two '#'
 // separators and a parseable ":start-end" interval. Annotation is gated on this.

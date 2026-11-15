@@ -93,7 +93,7 @@ check "with --prefer-annotation, annotated records win and none is kept out" \
   'python3 "$TOOLS/transcript_fixture.py" check $R $R/pref expected_prefer.tsv > $R/pref.log; cat $R/pref.log; grep -q "wrong: 0" $R/pref.log'
 sm() { awk -F'\t' -v g="$2" -v c="$3" 'NR==1{for(i=1;i<=NF;i++) ix[$i]=i; next} $2==g {print $ix[c]}' "$1.hst.summary.tsv"; }
 check "the summary counts the records each rule keeps out" \
-  '[[ "$(sm $R/out GA discordant) $(sm $R/out GC paralog_lift) $(sm $R/out XL paralog_lift)" == "3 2 1" ]]'
+  '[[ "$(sm $R/out GA discordant) $(sm $R/out GC paralog_lift) $(sm $R/out GO paralog_lift) $(sm $R/out XL paralog_lift)" == "3 2 1 0" ]]'
 check "a paralog lift is no copy, a filled copy is one" '[[ "$(sm $R/out GC haplotypes_by_copies)" == "1:7,2:2" && "$(sm $R/pref GC haplotypes_by_copies)" == "1:6,2:3" ]]'
 check "without annotations the summary has no columns for their statuses" '! head -1 t1.hst.summary.tsv | grep -q -e discordant -e paralog_lift'
 "$BIN" transcripts -i locus.gfa -r ref --gtf genes.gtf --prefer-annotation -o e0 -q 2> e0.log
