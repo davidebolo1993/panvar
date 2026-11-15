@@ -264,7 +264,10 @@ std::vector<AnnotatedTranscript> load_hap_annotations(const Graph& graph, const 
             if (at.t.transcript_name.empty()) at.t.transcript_name = at.t.transcript_id;
             at.t.gene_name = first_of(ga, {"gene_name", "source_gene_common_name", "gene", "Name"});
             if (at.t.gene_name.empty()) at.t.gene_name = first_of(ta, {"gene_name", "source_gene_common_name", "gene"});
-            const std::string sg = first_of(ga, {"source_gene"}).empty() ? first_of(ta, {"source_gene"}) : first_of(ga, {"source_gene"});
+            // CAT writes source_gene=None for a novel gene: it has no source gene
+            const auto named = [](const std::string& v) { return v == "None" || v == "N/A" ? std::string() : v; };
+            const std::string sg = !named(first_of(ga, {"source_gene"})).empty() ? named(first_of(ga, {"source_gene"}))
+                                                                                  : named(first_of(ta, {"source_gene"}));
             at.t.gene_id = !sg.empty() ? source_gene_id(sg) : first_of(ga, {"gene_id", "ID"});
             if (at.t.gene_id.empty()) at.t.gene_id = first_of(ta, {"gene_id"});
             if (at.t.gene_name.empty()) at.t.gene_name = at.t.gene_id.empty() ? at.t.transcript_id : at.t.gene_id;

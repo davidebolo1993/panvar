@@ -528,9 +528,9 @@ def write_annotated(d):
 def write_annotation_rules(d):
     """The main case, with annotations: h1 TA1 twice, as projected and with exon 3 ending early, and a novel
     isoform; h2 TA1 (its exon 2 deleted) with another exon 2, and without it; h4 TA1 with exon 3 starting
-    later than projected, a gene lifted from elsewhere onto GA's copy, and a novel gene there; h6 (no GC) GC
-    on GB's copy, with a novel isoform, and GC on its own further on. expected.tsv is the default run's,
-    expected_prefer.tsv the run with --prefer-annotation's."""
+    later than projected, a gene lifted from elsewhere onto GA's copy, and a novel gene there (CAT's
+    source_gene=None); h6 (no GC) GC on GB's copy, with a novel isoform, and GC on its own further on.
+    expected.tsv is the default run's, expected_prefer.tsv the run with --prefer-annotation's."""
     write("main", d)
     case = CASES["main"]
     L = case["L"]
@@ -564,7 +564,7 @@ def write_annotation_rules(d):
     tx("h4", "a4", "late4", "TA1", "GA", ta1[:2] + [(3010, 3300)], (1, "discordant", "."), (1, "ok", "."))
     gene("h4", "x4", "gene_name=XL;source_gene=ENSGX9.1", 1100, 2600)
     tx("h4", "x4", "xl4", "xl4", "XL", [(1100, 1250), (2500, 2600)], (0, "paralog_lift", "on:GA"), (1, "ok", "on:GA"))
-    gene("h4", "n4", "gene_name=NV", 1500, 1600)
+    gene("h4", "n4", "gene_name=NV;source_gene=None", 1500, 1600)
     tx("h4", "n4", "nv4", "nv4", "NV", [(1500, 1600)], (1, "ok", "."), (1, "ok", "."))
     gene("h6", "c6", "gene_name=GC;source_gene=GC.1", 5000, 5700)
     tx("h6", "c6", "lift6", "TC1", "GC", [(5000, 5200), (5500, 5700)], (0, "paralog_lift", "on:GB"), (1, "ok", "on:GB"))
