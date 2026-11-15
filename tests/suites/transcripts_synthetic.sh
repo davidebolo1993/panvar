@@ -76,7 +76,9 @@ dv() { awk -F'\t' -v t="$1" -v h="$2" '$1==t && $7 ~ "^"h"#" {print $12":"$8}' "
 check "a gene whose exons lie on allele nodes is placed by sequence" \
   '[[ "$(dv TH1 h1)" == ok:1 && "$(dv TH1 h4)" == ok:1 ]] && [[ $(grep -c "placed_by_sequence;best_share:0.750;identity:0.950" case_divergent/out.hst.tsv) -eq 4 ]]'
 check "a gene cut below the share is a partial copy, with no sequence and no copy counted" \
-  '[[ "$(dv TP1 h2)" == partial_copy:0 ]] && ! grep -q "^>TP1|GP|h2#" case_divergent/out.hst.fa && [[ "$(awk -F"\t" "\$2==\"GP\"{print \$6}" case_divergent/out.hst.summary.tsv)" == "0:1,1:4" ]]'
+  '[[ "$(dv TP1 h2)" == partial_copy:0 ]] && ! grep -q "^>TP1|GP|h2#" case_divergent/out.hst.fa && [[ "$(awk -F"\t" "\$2==\"GP\"{print \$6}" case_divergent/out.hst.summary.tsv)" == "0:2,1:4" ]]'
+check "a partial copy on a walk written reversed has orientation -" \
+  '[[ "$(awk -F"\t" "\$1==\"TP1\" && \$7 ~ /^h[25]#/ {print \$13}" case_divergent/out.hst.tsv | tr "\n" ,)" == "+,-," ]]'
 "$BIN" transcripts -i case_divergent/locus.gfa -r ref --gtf case_divergent/genes.gtf -o strict --min-identity 0.99 -q
 check "below --min-identity the gene has no copy" '[[ "$(dv TH1 h1 strict)" == no_copy:0 ]]'
 

@@ -1630,6 +1630,7 @@ TranscriptsResult project_transcripts(const Graph& graph, const TranscriptsOptio
                         add_detail(r.detail, "below_share");
                     } else {
                         r.status = sc.ok ? HstStatus::PartialCopy : HstStatus::NoCopy;
+                        r.reverse = sc.ok && sc.reverse;
                     }
                     r.transcript = genes[gi].tx[x];
                     r.haplotype = h;

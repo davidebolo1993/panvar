@@ -138,7 +138,7 @@ CASES = {
                "GP": ("-", {"TP1": [(4500, 4700), (5000, 5300)]})},
         haps={"h1": [("sub", (1000, 1120)), ("sub", (2000, 2105))], "h2": [("del", (4950, 5350))],
               "h3": [("sub", (1000, 1120)), ("sub", (2000, 2105)), ("del", (2297, 2305))]},
-        reversed={"h4": "h1"}),
+        reversed={"h4": "h1", "h5": "h2"}),
     # a gene whose every exon lies on an allele node, 95% identical: no exonic node is shared, and the chain
     # through its introns and flanks points to it
     "allele_exons": dict(
