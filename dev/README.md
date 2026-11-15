@@ -169,3 +169,14 @@ python3 dev/transcripts_hprc.py compare hprc gstm tests/examples/transcripts/gst
 python3 dev/reference_transcripts.py GRCh38.fa.gz genes.gtf.gz transcripts.fa
 panvar background -o bg.bgk --add --transcriptome ensembl=transcripts.fa
 ```
+
+## RNA recruitment against simulations
+
+`dev/rna_simulate.sh` recruits simulated RNA reads to locus graphs in four arms: genomic walks only (a), with the locus's transcripts (b), with a transcriptome segment in the background too (c), and with the haplotypes' own annotations merged (d, for loci given `CAT_<locus>`). Per locus, groups of held-out samples and their relatives leave the graph. The truth is the annotation projected onto the held-out haplotypes alone (`dev/rna_sim.py only`, the same transcripts as on the whole graph). `dev/rna_sim.py simulate` expresses them with a log-normal profile, genes on and off, and makes molecules the annotation lacks from their walks: an exon skip at a junction no transcript has, a retained intron, the unspliced span, an end extended into its flank. Negatives are reference transcripts outside the locus: the families of the locus genes, processed pseudogenes sharing 31-mers with the locus transcripts, and a sample of the rest. Reads: 2x150 pairs at 0.2% substitutions, whole molecules at 0.1% (Kinnex-like), and pbsim3's ONT model on molecules cut at their 5' end. `dev/rna_score.py` scores certain recall per perturbation, on reads across junctions, on whole long molecules, false certain per negative set and precision.
+
+The store must hold the genomes only when the run starts: arms a and b are indexed, then the transcriptome (from `dev/rna_sim.py transcriptome`, Ensembl's cDNA and ncRNA on the primary chromosomes) joins it, then c and d. With a background of some chromosomes, `CHROMS` keeps the negatives on them.
+
+```bash
+python3 dev/rna_sim.py transcriptome --out tx.fa.gz Homo_sapiens.GRCh38.cdna.all.fa.gz Homo_sapiens.GRCh38.ncrna.fa.gz
+LOCI="gstm acot" CAT_gstm=gstm.ann.tsv CAT_acot=acot.ann.tsv bash dev/rna_simulate.sh out bg.bgk tx.fa.gz ~/tools/pbsim3
+```
