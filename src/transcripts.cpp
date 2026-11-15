@@ -1686,7 +1686,7 @@ TranscriptsResult project_transcripts(const Graph& graph, const TranscriptsOptio
     res.has_annotation.assign(graph.paths.size(), 0);
     std::vector<std::vector<std::size_t>> annotated_on(graph.paths.size());
     if (!opt.hap_annotations.empty()) {
-        res.annotated = load_hap_annotations(graph, opt.hap_annotations, opt.contig_alias, "transcripts");
+        res.annotated = load_hap_annotations(graph, opt.hap_annotations, opt.contig_alias, "transcripts", opt.threads);
         std::set<std::string> haps;
         std::ifstream table(opt.hap_annotations);
         for (std::string line; std::getline(table, line);) haps.insert(line.substr(0, line.find('\t')));

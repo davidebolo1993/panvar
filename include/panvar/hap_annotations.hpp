@@ -36,7 +36,9 @@ struct AnnotatedTranscript {
 // its gene record the feature it names as Parent; in GTF they are the exons' transcript_id within their
 // gene_id, and that gene_id. A transcript with coding rows (CDS) and no exon rows takes the coding rows
 // as its exons; exon rows naming a transcript the annotation does not hold are skipped, with a warning.
+// The haplotypes' annotations are read on `threads` threads (0: all cores).
 std::vector<AnnotatedTranscript> load_hap_annotations(const Graph& graph, const std::string& table,
-                                                      const std::string& alias, const std::string& module);
+                                                      const std::string& alias, const std::string& module,
+                                                      std::size_t threads = 1);
 
 }  // namespace panvar

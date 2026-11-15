@@ -3,6 +3,7 @@
 #include "panvar/cli_utils.hpp"
 #include "panvar/graph_utils.hpp"
 #include "panvar/gz_reader.hpp"
+#include "panvar/parallel.hpp"
 #include "panvar/ref_path.hpp"
 
 #include <algorithm>
@@ -97,7 +98,8 @@ struct Feature {
 }  // namespace
 
 std::vector<AnnotatedTranscript> load_hap_annotations(const Graph& graph, const std::string& table,
-                                                      const std::string& alias, const std::string& module) {
+                                                      const std::string& alias, const std::string& module,
+                                                      std::size_t threads) {
     // Contig aliases: every name on a row names one contig.
     std::unordered_map<std::string, std::size_t> group;
     if (!alias.empty()) {
@@ -123,13 +125,20 @@ std::vector<AnnotatedTranscript> load_hap_annotations(const Graph& graph, const 
 
     std::ifstream tf(table);
     if (!tf) throw std::runtime_error(module + ": cannot read --hap-annotations " + table);
-    std::vector<AnnotatedTranscript> out;
-    std::string row;
-    while (std::getline(tf, row)) {
+    std::vector<std::vector<std::string>> rows;
+    for (std::string row; std::getline(tf, row);) {
         if (!row.empty() && row.back() == '\r') row.pop_back();
-        const std::vector<std::string> f = split(row, '\t');
+        std::vector<std::string> f = split(row, '\t');
         if (row.empty() || row[0] == '#' || f[0] == "haplotype") continue;
         if (f.size() < 2) throw std::runtime_error(module + ": --hap-annotations row without a path: " + row);
+        rows.push_back(std::move(f));
+    }
+    // Each haplotype's annotation is read on its own thread; results and warnings keep the table's order.
+    std::vector<std::vector<AnnotatedTranscript>> got(rows.size());
+    std::vector<std::string> warnings(rows.size());
+    run_parallel(rows.size(), threads, [&](std::size_t r) {
+        const std::vector<std::string>& f = rows[r];
+        std::string& warn = warnings[r];
         const std::string& hap = f[0];
         // The haplotype's paths and the contig interval each covers.
         std::vector<PathSpan> spans;
@@ -139,16 +148,15 @@ std::vector<AnnotatedTranscript> load_hap_annotations(const Graph& graph, const 
             const std::vector<std::size_t> pref = path_prefix_bp(pr, graph.nodes);
             const ParsedReferencePath meta = parse_reference_path_label(pr.name, pref.back(), pr.type == 'W');
             if (!meta.has_interval) {
-                std::cerr << cli::log_prefix(module) << "warning: path " << pr.name
-                          << " carries no contig:start-end; its annotation is not placed\n";
+                warn += cli::log_prefix(module) + "warning: path " + pr.name + " carries no contig:start-end; its annotation is not placed\n";
                 continue;
             }
             const std::string tail = pr.name.substr(hap.size() + 1);
             spans.push_back({p, tail.substr(0, tail.rfind(':')), meta.region_start_1based, pref.back()});
         }
         if (spans.empty()) {
-            std::cerr << cli::log_prefix(module) << "warning: --hap-annotations: no path of haplotype " << hap << "\n";
-            continue;
+            warn += cli::log_prefix(module) + "warning: --hap-annotations: no path of haplotype " + hap + "\n";
+            return;
         }
         std::unordered_map<std::string, std::vector<std::size_t>> on_contig;   // seqid -> spans
         const auto spans_of = [&](const std::string& seqid) -> const std::vector<std::size_t>& {
@@ -171,8 +179,11 @@ std::vector<AnnotatedTranscript> load_hap_annotations(const Graph& graph, const 
         std::string line;
         while (in.getline(line)) {
             if (line.empty() || line[0] == '#') continue;
+            // most rows are of other contigs: those are left before the row is split
+            const std::size_t tab = line.find('\t');
+            if (tab == std::string::npos || spans_of(line.substr(0, tab)).empty()) continue;
             const std::vector<std::string> c = split(line, '\t');
-            if (c.size() < 9 || spans_of(c[0]).empty()) continue;
+            if (c.size() < 9) continue;
             const bool gtf = c[8].find('"') != std::string::npos && c[8].find('=') == std::string::npos;
             std::size_t s = 0, e = 0;
             try {
@@ -284,8 +295,8 @@ std::vector<AnnotatedTranscript> load_hap_annotations(const Graph& graph, const 
             if (!at.t.exons.empty()) mine.push_back(std::move(at));
         }
         if (orphan)
-            std::cerr << cli::log_prefix(module) << "warning: " << hap << ": " << orphan
-                      << " exon row(s) whose transcript record is missing in " << f[1] << "; skipped\n";
+            warn += cli::log_prefix(module) + "warning: " + hap + ": " + std::to_string(orphan) +
+                    " exon row(s) whose transcript record is missing in " + f[1] + "; skipped\n";
         // Copies: each gene's records on a path, ranked by their first exon along the path. A gene is its source
         // gene where the annotation gives one (records of one source gene under different names are copies
         // of it), else its name (Liftoff's extra copies have ids of their own).
@@ -303,7 +314,12 @@ std::vector<AnnotatedTranscript> load_hap_annotations(const Graph& graph, const 
             for (std::size_t k = 0; k < order.size(); ++k)
                 if (order[k].second == at.gene_record) at.copy = static_cast<int>(k + 1);
         }
-        out.insert(out.end(), std::make_move_iterator(mine.begin()), std::make_move_iterator(mine.end()));
+        got[r] = std::move(mine);
+    });
+    std::vector<AnnotatedTranscript> out;
+    for (std::size_t r = 0; r < rows.size(); ++r) {
+        std::cerr << warnings[r];
+        out.insert(out.end(), std::make_move_iterator(got[r].begin()), std::make_move_iterator(got[r].end()));
     }
     return out;
 }
