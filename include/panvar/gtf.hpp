@@ -60,6 +60,9 @@ std::vector<TranscriptFeature> parse_gtf_transcripts(const std::string& gtf_path
 // (ENSG00000000001.2), as annotations and FASTA headers differ in it. Any other id or name is kept whole: a
 // suffix of a symbol or of a clone-based name tells genes apart.
 std::string gene_id_key(const std::string& id);
+// A transcript id as it is compared, the same way: an Ensembl-style transcript id (ENST00000000001.2, as
+// GENCODE writes it) loses its version.
+std::string transcript_id_key(const std::string& id);
 
 // True iff `name` looks like PanSN `sample#hap#contig:start-end`: at least two '#'
 // separators and a parseable ":start-end" interval. Annotation is gated on this.

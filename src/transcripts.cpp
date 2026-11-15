@@ -1693,14 +1693,15 @@ TranscriptsResult project_transcripts(const Graph& graph, const TranscriptsOptio
         }
         for (std::size_t k = 0; k < res.annotated.size(); ++k) annotated_on[res.annotated[k].path].push_back(k);
     }
-    // Projected genes by id and by name, for the annotated transcripts' genes, and projected transcripts by id.
+    // Projected genes by id and by name, for the annotated transcripts' genes, and projected transcripts by id
+    // (Ensembl ids without their version, as annotations and GTFs differ in it).
     std::unordered_map<std::string, std::size_t> gene_by_id, gene_by_name, tx_by_id;
     for (std::size_t gi = 0; gi < genes.size(); ++gi) {
         const TranscriptFeature& t0 = res.transcripts[genes[gi].tx.front()];
         gene_by_id.emplace(gene_id_key(t0.gene_id), gi);
         gene_by_name.emplace(t0.gene_name, gi);
     }
-    for (std::size_t k = 0; k < res.transcripts.size(); ++k) tx_by_id.emplace(res.transcripts[k].transcript_id, k);
+    for (std::size_t k = 0; k < res.transcripts.size(); ++k) tx_by_id.emplace(transcript_id_key(res.transcripts[k].transcript_id), k);
     // Genes the GTF has, on the path or not, by id and by name. Only these are judged as paralog lifts: the
     // place on the reference of a gene the GTF lacks is not known.
     std::unordered_set<std::string> gtf_ids, gtf_names;
@@ -1855,7 +1856,7 @@ TranscriptsResult project_transcripts(const Graph& graph, const TranscriptsOptio
                 // its projected transcript, of the copy's gene
                 long k = -1;
                 if (ac.gene >= 0) {
-                    const auto it = tx_by_id.find(at.t.transcript_id);
+                    const auto it = tx_by_id.find(transcript_id_key(at.t.transcript_id));
                     if (it != tx_by_id.end() && gene_of[it->second] == static_cast<std::size_t>(ac.gene)) k = static_cast<long>(it->second);
                 }
                 const auto lift = [&](long c) {

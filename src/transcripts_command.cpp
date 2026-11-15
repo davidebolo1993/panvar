@@ -67,7 +67,7 @@ public:
 
     void add(const TranscriptsResult& res, const std::vector<HstRecord>& recs) override {
         if (!indexed_) {   // projected transcripts by id, for the annotated ones
-            for (std::size_t k = 0; k < res.transcripts.size(); ++k) ref_of_.emplace(res.transcripts[k].transcript_id, k);
+            for (std::size_t k = 0; k < res.transcripts.size(); ++k) ref_of_.emplace(transcript_id_key(res.transcripts[k].transcript_id), k);
             for (const AnnotatedTranscript& at : res.annotated) annotated_genes_.insert(gene_id(at));
             indexed_ = true;
         }
@@ -75,7 +75,7 @@ public:
         for (const HstRecord& r : recs) {
             const bool annotated_only = r.source == kAnnotated;
             const TranscriptFeature& t = annotated_only ? res.annotated[r.transcript].t : res.transcripts[r.transcript];
-            const auto ri = annotated_only ? ref_of_.find(t.transcript_id) : ref_of_.end();
+            const auto ri = annotated_only ? ref_of_.find(transcript_id_key(t.transcript_id)) : ref_of_.end();
             const long ref = !annotated_only ? static_cast<long>(r.transcript) : ri == ref_of_.end() ? -1 : static_cast<long>(ri->second);
             const std::string gid = annotated_only ? gene_id(res.annotated[r.transcript]) : t.gene_id;
             const std::string& hap = res.haplotypes[r.haplotype];

@@ -196,16 +196,23 @@ std::vector<GeneFeature> parse_gtf(const std::string& gtf_path,
     return genes;
 }
 
-std::string gene_id_key(const std::string& id) {
+namespace {
+// An Ensembl-style id of the given kind (G: gene, T: transcript) without its version.
+std::string ensembl_id_key(const std::string& id, char kind) {
     const std::size_t dot = id.rfind('.');
     if (dot == std::string::npos || dot + 1 >= id.size() || id.compare(0, 3, "ENS") != 0 ||
         id.find_first_not_of("0123456789", dot + 1) != std::string::npos)
         return id;
     std::size_t i = 3;
     while (i < dot && std::isupper(static_cast<unsigned char>(id[i]))) ++i;
-    if (i == 3 || id[i - 1] != 'G' || i == dot || id.find_first_not_of("0123456789", i) != dot) return id;
+    if (i == 3 || id[i - 1] != kind || i == dot || id.find_first_not_of("0123456789", i) != dot) return id;
     return id.substr(0, dot);
 }
+}  // namespace
+
+std::string gene_id_key(const std::string& id) { return ensembl_id_key(id, 'G'); }
+
+std::string transcript_id_key(const std::string& id) { return ensembl_id_key(id, 'T'); }
 
 std::vector<TranscriptFeature> parse_gtf_transcripts(const std::string& gtf_path,
                                                      const std::string& ref_chrom,

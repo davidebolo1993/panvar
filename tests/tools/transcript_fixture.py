@@ -179,6 +179,9 @@ CASES = {
     # a segment the reference walks twice inside a gene; haplotypes holding it once, with the second copy's
     # alleles or the first's, and one lacking an exon of its second copy (write_merged)
     "merged": dict(),
+    # annotation_rules with TA1 under a versioned Ensembl id in the GTF (GENCODE's ENST...2) and without the
+    # version in the annotations: the same transcript
+    "annotation_versioned": dict(),
     # the main case with haplotypes' own annotations (write_annotated)
     "annotated": dict(),
     # the main case with annotations the projection contradicts, fills or that lie on another gene's copy
@@ -660,6 +663,26 @@ def write_annotation_rules(d):
                 out.write(f"{t}\t{g}\t{name(h, L)}\t{c}\t{st}\t{det}\t{seq}\tannotated\t{rec}\n")
 
 
+def write_versioned(d):
+    """annotation_rules, TA1 named ENST00000000001.2 in the GTF and ENST00000000001 in the annotations."""
+    import glob
+    write_annotation_rules(d)
+    versioned, plain = "ENST00000000001.2", "ENST00000000001"
+    for path, old, new in [(f"{d}/genes.gtf", 'transcript_id "TA1"', f'transcript_id "{versioned}"')] + \
+            [(p, "transcript_id=TA1", f"transcript_id={plain}") for p in glob.glob(f"{d}/*.gff3")]:
+        text = open(path).read()
+        open(path, "w").write(text.replace(old, new))
+    for name_ in ("expected.tsv", "expected_prefer.tsv"):
+        lines = open(f"{d}/{name_}").read().splitlines()
+        with open(f"{d}/{name_}", "w") as out:
+            out.write(lines[0] + "\n")
+            for line in lines[1:]:
+                f = line.split("\t")
+                if f[0] == "TA1":
+                    f[0] = plain if f[7] == "annotated" else versioned
+                out.write("\t".join(f) + "\n")
+
+
 def write_nested(d, flank=False):
     """Gene GL: exons L1 and L2 around an intron U (three nodes). Gene GS, further on: one exon, the same three
     nodes walked again, or with `flank` the middle one alone. A haplotype without GS, whose copy of GL has an
@@ -910,6 +933,8 @@ def write(case_name, d):
         return write_annotated(d)
     if case_name == "annotation_rules":
         return write_annotation_rules(d)
+    if case_name == "annotation_versioned":
+        return write_versioned(d)
     if case_name == "merged":
         return write_merged(d)
     if case_name == "partial_paralog":
