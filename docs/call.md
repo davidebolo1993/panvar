@@ -113,7 +113,20 @@ VCF 4.2. `POS` is the base before the event, `END` its last reference base. `FIL
 | `SVLEN_RANGE`, `MERGE_MIN_SIM`, `MERGE_TEST` | how much the merged events differ: their sizes, and the weakest similarity of a member to the representative in the test that admits it (under the test's threshold: the member joined through others) |
 | `GENES` | with `--gtf`: genes over the record; inside a copy of a `MODULE` site holding several genes, the paralogs its carriers hold |
 
-`FORMAT`: `GT`, `CN` (`.` except on a `CNV`; on a `MODULE` record a haplotype that is no carrier, but whose change a written record of its own holds, reads `REF_CN`, as a dosage read off `CN` would otherwise count it twice); on a `CNV` also `CNBP` and `CNRESID` (from the copies measured), on a `MODULE` record `MODBP` and, where the record names copies, `CNFORM`, and on a `UNIT` record `CNINV`. `MODBP` is the change over the module's own nodes, which decides `GT` there: a carrier's `CN` differs from `REF_CN` and its `MODBP` reaches `--min-sv-bp`, unless the change beside its copies goes their way and is more than the copies (step 5). `CNFORM` lists the carrier's copies as indices into `CN_FORMS`, joined by `+` (`.` for a non-carrier, or for a carrier with no copy written: none of its changes is a copy, or none could be written as an edit of one reference stretch, and such a change stays a record of its own); with `--diploid` it is joined per haplotype as `GT` is. `CNINV` counts the copies in the opposite orientation to the reference's copy (with no reference copy, to the orientation most haplotypes' copies take). A gain with more such copies than the reference has is flagged `INVDUP`; with no reference copy, only a haplotype holding a copy and its reverse complement is. The full list is in the VCF header.
+`FORMAT` fields; the copy-number ones are `.` on records that are not `CNV`s:
+
+| field | on | meaning |
+|-------|----|---------|
+| `GT` | every record | `1` carrier, `0` reference-like, `.` no allele there. With `--diploid`, the sample's haplotypes joined by `\|` (phased) or `/` |
+| `CN` | `CNV` | the haplotype's copies of the unit (`UNIT`) or of the module (`MODULE`). On a `MODULE` record a haplotype that is no carrier, but whose change a written record of its own holds, reads `REF_CN`, as a dosage read off `CN` would otherwise count it twice |
+| `CNBP` | `CNV` | bases gained (+) or lost (−) against the reference, from the haplotype's walk: over the site on a `UNIT` record; on a `MODULE` record, from its first module node to its last, with everything walked between |
+| `CNRESID` | `CNV` | `CNBP` minus the copies' worth of bases, (`CN` − `REF_CN`) × the unit's length: the change whole copies do not explain. `0` means the whole size difference is copy number |
+| `MODBP` | `MODULE` | the change over the module's own nodes, each visit counted. It decides `GT`: a carrier's `CN` differs from `REF_CN` and its `MODBP` reaches `--min-sv-bp`, unless the change beside its copies goes their way and is more than the copies (step 5) |
+| `CNFORM` | `MODULE` naming copies | the carrier's copies as indices into `CN_FORMS`, joined by `+`; `.` for a non-carrier, or for a carrier with no copy written: none of its changes is a copy, or none could be written as an edit of one reference stretch, and such a change stays a record of its own. With `--diploid`, joined per haplotype as `GT` is |
+| `CNINV` | `UNIT` | how many of the haplotype's copies run opposite to the reference's copy (with no reference copy, to the orientation most haplotypes' copies take). A gain with more such copies than the reference has is flagged `INVDUP`; with no reference copy, only a haplotype holding a copy and its reverse complement is |
+| `HCN` | `CNV`, `--diploid` | each haplotype's `CN`, in `GT` order, joined as `GT` is; `CN` is their sum, and `CNBP`, `CNRESID`, `MODBP` and `CNINV` are sums too |
+
+The VCF header describes every field.
 
 `carrier_events.tsv`, one row per record and event; carriers holding the same event share a row:
 
