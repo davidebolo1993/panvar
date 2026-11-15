@@ -232,6 +232,7 @@ add_library(panvarlib
     src/gfa.cpp
     src/gfa_io.cpp
     src/align.cpp
+    src/event_size.cpp
     src/graph_utils.cpp
     src/variant_nodes.cpp
     src/graph_sort.cpp

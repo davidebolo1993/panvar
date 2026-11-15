@@ -13,7 +13,7 @@ Each haplotype is rebuilt twice: from `call`'s own events for it (`carrier_event
 
 ## How it works
 
-Alignments use [edlib](https://github.com/Martinsos/edlib).
+Alignments use [edlib](https://github.com/Martinsos/edlib); a difference is sized with `call`'s alignment, [ksw2](https://github.com/lh3/ksw2).
 
 1. A haplotype is scored only where it overlaps the reference, so a partial assembly is not charged for what it lacks: between the first and last anchors, nodes both walk once and in the same order. A walk starting or ending on the reference's first or last node is scored to the region's edge, so a deletion right there counts.
 2. Each rebuild is the reference edited with the haplotype's events, in reference order:
@@ -22,7 +22,7 @@ Alignments use [edlib](https://github.com/Martinsos/edlib).
    - Of two overlapping events the longer is applied and the other counted as a conflict; events past the scored stretch are left out and counted.
 3. A `MODULE` record that names its carriers' copies (`CN_FORMS`, `CNFORM`) has each carrier's copies pasted as written, a form naming reference stretches spelled from them: the record and the carrier's other records then rebuild its walk, with nothing to infer. A form `call` wrote without its sequence (over `--max-seq-bp`) is skipped and counted. Otherwise a copy-number record holds a count, not a sequence, so the VCF rebuild pastes or removes `CN − REF_CN` copies of a reference copy, beside the reference's copies, which run from `POS`+1 to `END`. Where copies come in forms (diverged paralogs, long and short copies), a carrier gets the form closest to its own change per copy (`CNBP`). A gained copy shorter than every form is explained by a deletion record inside the copy when the sizes match; when two deletions could explain it, the VCF does not say which, and none is applied.
 4. Each rebuild is aligned to the haplotype end to end, by edit distance. To keep long regions fast, the alignment is pinned at exact blocks, runs of 500 bases or more identical in both and found once in each, and only the stretches between them are aligned. A repeat holds no such block, so it is aligned in one piece and its copies go where they fit best. The plain reference is aligned the same way, once.
-5. Gaps `--merge-gap` columns apart or fewer form one difference. A stretch dense in mismatches (one column in five, over `--min-sv-bp` columns) is one too, since an inversion or an equal-length replacement aligns almost without gaps. A difference is sized as `call` sizes it, by the larger side.
+5. Gaps `--merge-gap` columns apart or fewer form one difference. A stretch dense in mismatches (one column in five, over `--min-sv-bp` columns) is one too, since an inversion or an equal-length replacement aligns almost without gaps. A difference is sized as `call` sizes an event (see [Event size](call.md#event-size)), with up to 1 kb of the sequence either side, as far as the next difference: an edit-distance alignment threads gaps through a repeat, and would join changes `call` keeps apart into one large replacement.
 6. Each difference left is looked up against the haplotype's own events, the records (its own and the others'), and the sites, to say why it is left. An insertion or deletion inside a repeat can be written at any copy, and the alignment picks one end, so it is looked up anywhere it can slide to.
 
    Left by `call`'s own events (`call`): the first cause that applies.
@@ -153,7 +153,7 @@ Each script lists its options under `--help`.
 - An imprecise inversion is applied between its `POS` and `END`, so a few kb can be left at its ends.
 - A haplotype that starts or ends inside the region is scored between its first and last shared anchors, so a deletion at its very end looks like an assembly that stops there.
 - Inside a repeat, a difference with changes besides one insertion or deletion is looked up where the alignment places it, which can be another copy than `call`'s; it then shows as small differences or as `other`.
-- Sizes follow `call`'s, except that very unequal replacements, inversions in AT-rich sequence, and deletions of a few units of a diverged repeat can be sized differently.
+- Sizes use `call`'s rule, over at most 1 kb either side of a difference rather than the whole allele, so a change in a longer repeat can still be sized differently.
 - The carrier check compares sizes and counts, not positions or sequence: a carrier filed under another record of the same size passes, and differences inside a copy stretch that cancel in length pass too.
 
 ## Example

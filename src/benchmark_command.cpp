@@ -4,6 +4,7 @@
 #include "panvar/bubble_path.hpp"
 #include "panvar/bubbles.hpp"
 #include "panvar/cli_utils.hpp"
+#include "panvar/event_size.hpp"
 #include "panvar/gfa.hpp"
 #include "panvar/graph_utils.hpp"
 #include "panvar/output.hpp"
@@ -273,13 +274,16 @@ std::vector<VcfRecordInfo> load_region_vcf(const std::string& path, std::vector<
 // mismatches with no gap is an event where it is dense, one column in five or more over `min_event`
 // columns or more (an inversion or an equal-length replacement can align with few gaps). An event is
 // sized as call sizes a replaced run, by the larger of the bases each side holds over it: its gaps and
-// mismatches, and the chance matches between them.
+// mismatches, and the chance matches between them. Its size is call's (change_size_bp): an event with bases on
+// both sides is aligned as call aligns alleles and sized by its largest single change, so one call leaves under
+// --min-sv-bp is small here too.
 struct Diff {
     std::size_t t0 = 0, t1 = 0;     // target interval [t0, t1)
     std::size_t q0 = 0, q1 = 0;     // query interval [q0, q1)
     std::size_t del_bp = 0, ins_bp = 0;
+    std::size_t size_bp = 0;
     bool has_del = false, has_ins = false;
-    std::size_t size() const { return std::max(del_bp, ins_bp); }
+    std::size_t size() const { return size_bp; }
     const char* type() const { return !has_ins && has_del ? "DEL" : !has_del && has_ins ? "INS" : "SUB"; }
 };
 
@@ -288,13 +292,16 @@ struct Diff {
 constexpr std::size_t kChanceRun = 5;
 // A dense window is searched over at most this many mismatches from its start.
 constexpr std::size_t kMaxWindowMismatches = 2000;
+// An event is sized with up to this much of the sequence either side of it (see diff_of).
+constexpr std::size_t kSizeContextBp = 1000;
 
 struct DiffSet {
     std::vector<Diff> events;       // every event, any size
     std::size_t mismatches = 0;     // mismatches outside every event (SNVs)
 };
 
-DiffSet diff_of(const std::string& ops, std::size_t merge_gap, std::size_t min_event) {
+DiffSet diff_of(const std::string& ops, const std::string& target, const std::string& query, std::size_t merge_gap,
+                std::size_t min_event) {
     DiffSet out;
     const std::size_t n = ops.size();
     const auto gap = [&](std::size_t c) { return ops[c] == 'I' || ops[c] == 'D'; };
@@ -408,6 +415,23 @@ DiffSet diff_of(const std::string& ops, std::size_t merge_gap, std::size_t min_e
         }
         if (ops[c] != 'I') ++t;
         if (ops[c] != 'D') ++q;
+    }
+    // Each event sized as call sizes a change (change_size_bp), with up to kSizeContextBp of the sequence
+    // around it, as far as the next event: aligned on its own, a change in a repeat could not move to where
+    // call's alignment of the whole allele puts it. Only aligned columns lie between events, so the context is
+    // as long on both sides. One side alone is its length.
+    for (std::size_t i = 0; i < out.events.size(); ++i) {
+        Diff& d = out.events[i];
+        if (d.del_bp == 0 || d.ins_bp == 0 || d.t1 > target.size() || d.q1 > query.size()) {
+            d.size_bp = std::max(d.del_bp, d.ins_bp);
+            continue;
+        }
+        const std::size_t prev = i > 0 ? out.events[i - 1].t1 : 0;
+        const std::size_t next = i + 1 < out.events.size() ? out.events[i + 1].t0 : target.size();
+        const std::size_t left = std::min({kSizeContextBp, d.t0 - std::min(prev, d.t0), d.q0});
+        const std::size_t right = std::min({kSizeContextBp, std::max(next, d.t1) - d.t1, query.size() - d.q1});
+        d.size_bp = change_size_bp(target.substr(d.t0 - left, d.t1 - d.t0 + left + right),
+                                   query.substr(d.q0 - left, d.q1 - d.q0 + left + right));
     }
     return out;
 }
@@ -887,7 +911,10 @@ int run_benchmark_command(const std::vector<std::string>& args) {
         pr.o1 = ref_prefix[r1 + 1];   // reference offsets [o0, o1)
         pr.g_start = region_start + pr.o0;
         pr.g_end = region_start + pr.o1 - 1;
-        pr.base = diff_of(align_ops(ref_seq.substr(pr.o0, pr.o1 - pr.o0), pr.truth), merge_gap, min_sv_bp);
+        {
+            const std::string ref_part = ref_seq.substr(pr.o0, pr.o1 - pr.o0);
+            pr.base = diff_of(align_ops(ref_part, pr.truth), ref_part, pr.truth, merge_gap, min_sv_bp);
+        }
         pr.status = "scored";
     });
 
@@ -1449,8 +1476,9 @@ int run_benchmark_command(const std::vector<std::string>& args) {
                     }
                     if (!clash) made += ref_seq.substr(at - region_start, e.ref_end + 1 - at);
                     large = false;
-                    if (!clash && upper(made) != upper(e.alt))
-                        for (const Diff& d : diff_of(align_ops(upper(made), upper(e.alt)), merge_gap, min_sv_bp).events)
+                    const std::string um = upper(made), ua = upper(e.alt);
+                    if (!clash && um != ua)
+                        for (const Diff& d : diff_of(align_ops(um, ua), um, ua, merge_gap, min_sv_bp).events)
                             large = large || d.size() >= min_sv_bp;
                     if (!clash && !large) break;
                 }
@@ -1705,7 +1733,7 @@ int run_benchmark_command(const std::vector<std::string>& args) {
             hr.present_rows.push_back(std::move(p));
         }
         // With nothing applied the reconstruction is the reference, already aligned.
-        const DiffSet left = applied.empty() ? base : diff_of(align_ops(recon, truth), merge_gap, min_sv_bp);
+        const DiffSet left = applied.empty() ? base : diff_of(align_ops(recon, truth), recon, truth, merge_gap, min_sv_bp);
         hr.left_snv = left.mismatches;
         std::unordered_set<std::string> carried;   // every record the haplotype carries, applied or not
         if (const auto it = events_of.find(path.name); it != events_of.end())

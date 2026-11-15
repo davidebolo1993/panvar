@@ -708,6 +708,30 @@ check "a replacement with no INSSEQ is not rebuilt from the VCF, and what it lea
 check "the warning names the cause: a sequence call left out above --max-seq-bp (lines)" \
       "$(grep -c 'call left out above its --max-seq-bp' "$OUT/subn_B.log"):$(grep -c 'no reference copy' "$OUT/subn_B.log")" "1:0"
 check "every haplotype is clean once its replacement is applied" "$(sv sub_B haplotypes_clean_call):$(sv sub_B haplotypes_clean_vcf):$(sv sub_B haplotypes_scored)" "10:10:10"
+# A short-repeat allele that differs in two changes, 24 bp and 13-for-19, with matching repeat between them. A
+# base-by-base alignment of the haplotype threads gaps through the repeat into one 66 bp replacement; call's
+# alignment keeps the two apart. Both size it the same way (its largest change): not large at --min-sv-bp 50,
+# and at 20 the 24 bp change is large and the record call writes for it accounts for it.
+cat > "$OUT/str.spec" <<'EOF'
+N S 300 1
+N L =ACAGAGCAAAACTCCCTCTAAAAATG
+N A =AAAGAAAGGAAGGGAAGGGAAGGGAAGGGAAGGGAGGGGAAGGGAAGGGAAGGGAAGGGAAGGGGAAAGAAAGGAAGAAAGAAAGAAAGAAAG
+N B =GAAGGGAAGGGAAGGGAAGGGAAGGGAGGGGAGGGGAGGGGAGGGGAGGGGAGGGGAGGGGAGGGGAGGGGAGGGGAGGGGAGGGGAGGGGAGGGGAGGGGAGGGGAGGGGAGGGGAGGGAAAAG
+N R =ACAGACCTGTCTCGGATTTTCTGGAACTTGTCTCACATTTTC
+N T 300 3
+P ref#0#chr1:0-761 S+,L+,A+,R+,T+
+P h1#1#chr1 S+,L+,B+,R+,T+
+P h2#1#chr1 S+,L+,B+,R+,T+
+P h3#1#chr1 S+,L+,A+,R+,T+
+B S T L;A;B;R
+EOF
+spec str
+check "a split short-repeat change: no record, nothing large present or left (records:present:left)" \
+      "$(grep -vc '^#' "$OUT/str_c.region.vcf"):$(sv str_B large_present):$(sv str_B large_left_call)" "0:0:0"
+"$BIN" call -i "$OUT/str/g.gfa" -c "$OUT/str/g.bubbles.csv" -r 'ref#0#chr1:0-761' -o "$OUT/str20_c" --min-sv-bp 20 --no-per-bubble-vcf -q >/dev/null 2>&1
+bm -i "$OUT/str/g.gfa" -c "$OUT/str/g.bubbles.csv" -r 'ref#0#chr1:0-761' --calls "$OUT/str20_c" --min-sv-bp 20 -o "$OUT/str20_B" -q >/dev/null 2>&1
+check "the same at --min-sv-bp 20: the 24 bp change recorded, large, and left by neither (records:present:bp:left)" \
+      "$(grep -vc '^#' "$OUT/str20_c.region.vcf"):$(sv str20_B large_present):$(sv str20_B large_present_bp):$(sv str20_B large_left_call):$(sv str20_B large_left_vcf)" "1:2:48:0:0"
 # Two similar segments in the other order: 31 differences each, not a 600 bp deletion and insertion.
 cat > "$OUT/swap.spec" <<'EOF'
 N S 500 1
