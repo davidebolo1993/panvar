@@ -85,6 +85,37 @@ CASES = {
     # the nodes
     "tandem_overrun": dict(units={"ref": 3, "h1": 3}, pieces=[("E", 50), ("M", 400), ("T", 500)],
                            order=["E", "M", "E", "T"], layout=[[(0, 500)]] * 3, reversed={"h2": "h1"}),
+    # whole genes duplicated in tandem over several nodes, the first copy with a deletion or an SNP, the second
+    # the reference's: a chain moving from one copy to the other inside an exon would join them
+    "dup_gene": dict(
+        L=9000,
+        genes={"G0": ("+", {"T0a": [(600, 842), (949, 1230), (1616, 1838), (2100, 2370)], "T0b": [(600, 842), (1616, 1838), (2100, 2370)]}),
+               "G1": ("+", {"T1a": [(3195, 3386), (3855, 4046)]}),
+               "G2": ("-", {"T2a": [(4778, 4982), (5189, 5451)]})},
+        haps={"h1": [("snp", 3184)], "h2": [("dup", (4710, 5562)), ("del", (4052, 4055))],
+              "h3": [("dup", (519, 2420)), ("del", (1840, 1843)), ("del", (5704, 5712))],
+              "h4": [("dup", (546, 2445)), ("snp", 3859), ("snp", 5439), ("del", (1214, 1219))], "h5": [("snp", 4973)]},
+        reversed={"h6": "h1", "h7": "h3"}),
+    # the same, the first copy's deletion across the end of the gene's last exon
+    "dup_gene_end": dict(
+        L=9000,
+        genes={"G0": ("-", {"T0a": [(600, 813), (1297, 1593)]}), "G1": ("+", {"T1a": [(2595, 2813), (3177, 3346)]}),
+               "G2": ("+", {"T2a": [(4028, 4213), (4303, 4577)]})},
+        haps={"h1": [("dup", (3998, 4608)), ("del", (2599, 2611))], "h2": [("del", (2794, 2802))],
+              "h3": [("del", (6133, 6134)), ("del", (4200, 4208))], "h4": [("dup", (3922, 4652)), ("del", (4575, 4583)), ("snp", 4585)],
+              "h5": [("snp", 4569)]},
+        reversed={"h6": "h1", "h7": "h4"}),
+    # stretches duplicated in tandem inside a gene, over several nodes: one holding an exon, one starting
+    # inside an exon, one ending inside an exon, one holding two exons. Each haplotype has one copy of the
+    # gene, its exons whole (`intragenic`: its transcripts are the reference's).
+    "dup_intragenic": dict(
+        L=6000,
+        genes={"GI": ("+", {"TI1": [(1000, 1200), (2000, 2200), (3000, 3200), (4000, 4200)],
+                            "TI2": [(1000, 1200), (2000, 2200), (4000, 4200)]})},
+        haps={"h1": [("dup", (1800, 2600))], "h2": [("dup", (2100, 2900))], "h3": [("snp", 1900), ("snp", 2400), ("snp", 2700), ("snp", 3500)],
+              "h4": [("dup", (1500, 3500))], "h5": [("dup", (2900, 4100))]},
+        intragenic={"h1", "h2", "h4", "h5"},
+        reversed={"h6": "h2", "h7": "h5"}),
     # exon boundaries inside a substitution block: one that keeps the splice site, one that changes it
     "substitution": dict(
         L=5000,
@@ -300,6 +331,8 @@ def expected(case, ref, seqs, maps):
             # copies: the maps holding the gene's bases
             copies = [m for m in maps[h] if any(p in m for p in range(lo, hi))]
             src = case.get("reversed", {}).get(h, h)
+            if src != h:   # copies are numbered along the walk as written
+                copies.reverse()
             subs = [v for kind, v in case["haps"].get(src, []) if kind == "sub"]
             snps = {v for kind, v in case["haps"].get(src, []) if kind == "snp"}
             # a copy below the share still holds the transcripts with every exon on it: with one of them whole,
@@ -315,6 +348,10 @@ def expected(case, ref, seqs, maps):
 
             for t, exons in txs.items():
                 if not any(b > 0 and a < case["L"] for a, b in exons):
+                    continue
+                if src in case.get("intragenic", ()):
+                    st, notes, s = project(case, ref, ref, maps["ref"][0], strand, exons)
+                    rows.append((t, g, h, 1, st, notes, s))
                     continue
                 if not copies:
                     rows.append((t, g, h, 0, "no_copy", [], ""))
@@ -337,7 +374,9 @@ def expected(case, ref, seqs, maps):
                             continue
                         by_sequence = True
                 for c, m in enumerate(copies, 1):
-                    st, notes, s = project(case, ref, seqs[src], m, strand, exons, () if by_sequence else subs)
+                    # a duplication's second copy walks the reference's nodes: no substitution there
+                    on_subs = () if by_sequence or m is not maps[src][0] else subs
+                    st, notes, s = project(case, ref, seqs[src], m, strand, exons, on_subs)
                     rows.append((t, g, h, c, st, notes + ["placed_by_sequence"] * by_sequence, s))
     return rows
 

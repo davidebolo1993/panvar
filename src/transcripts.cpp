@@ -43,10 +43,13 @@ const char* hst_status_name(HstStatus s) {
 namespace {
 
 // Chaining: how far back a link may reach, in anchors and in bases (or twice the gene's stretch; any
-// length across a tandem stretch), and what an indel costs per base.
+// length across a tandem stretch). Scores are integers, in 1/1280 of a base, so that equal chains tie
+// exactly on every platform: a node scores its bases, and an indel costs 1/20 of a base per base and log2
+// of its length.
 constexpr std::size_t kChainLookback = 200;
 constexpr std::size_t kChainMaxGap = 100000;
-constexpr double kChainIndelCost = 0.05;
+constexpr std::int64_t kScoreUnit = 1280;
+constexpr std::int64_t kIndelPerBase = 64;
 // The largest gap between two chained nodes filled by an exact node alignment (cells); larger ones are
 // filled from both ends only.
 constexpr std::size_t kFillMaxCells = 4000000;
@@ -150,6 +153,8 @@ struct Gene {
     std::vector<char> own;            // per step of [gs, ge): the reference walks its node nowhere outside the span's steps
     std::size_t marker_bp = 0;
     std::vector<std::pair<std::size_t, std::size_t>> tandem_spans;   // its transcripts' tandem stretches
+    Cuts exons;                       // every exon of its transcripts, merged, on the reference walk
+    std::unordered_map<int, std::size_t> step_of;   // its once-occurring nodes: their reference step
 };
 
 // One pass of a walk through a gene: per reference step of [gs, ge), the walk step it matches or -1.
@@ -225,7 +230,20 @@ void fill_gap(const Walk& R, std::size_t i0, std::size_t i1, const Walk& W, std:
     }
 }
 
+// What an indel of d bases costs a chain, in score units: per base, and log2(d), linear between powers of two.
+std::int64_t indel_cost(std::size_t d) {
+    if (d == 0) return 0;
+    int msb = 0;
+    while ((d >> (msb + 1)) != 0) ++msb;
+    const std::uint64_t below = static_cast<std::uint64_t>(d) - (std::uint64_t{1} << msb);
+    return static_cast<std::int64_t>(d) * kIndelPerBase + msb * kScoreUnit + static_cast<std::int64_t>((below * kScoreUnit) >> msb);
+}
+
 // Colinear chains of the gene's once-occurring reference nodes on walk W, best first; each anchor used once.
+// Where a walk holds a stretch of the gene twice, moving from one copy to the next costs the same at every
+// node, so equal chains differ only in where they move. A link with an indel inside an exon costs one unit
+// more, so the move falls in an intron or outside the gene, never inside an exon; of equal links, the
+// nearest on the walk wins.
 std::vector<std::vector<Anchor>> chain_anchors(const Walk& R, const Gene& g, const Walk& W, const Occurrences& occ,
                                                bool reverse, std::size_t walk_steps) {
     std::vector<Anchor> an;
@@ -241,13 +259,20 @@ std::vector<std::vector<Anchor>> chain_anchors(const Walk& R, const Gene& g, con
     }
     std::sort(an.begin(), an.end(), [](const Anchor& a, const Anchor& b) { return a.j < b.j; });
     const std::size_t n = an.size();
-    std::vector<double> f(n);
+    std::vector<std::int64_t> f(n);
     std::vector<long> prev(n, -1);
+    // whether an exon of the gene starts before reference base b and ends after base a: a link from a node
+    // ending at a to one starting at b moves inside it
+    const auto in_exon = [&](std::size_t a, std::size_t b) {
+        const auto it = std::partition_point(g.exons.begin(), g.exons.end(), [&](const auto& e) { return e.second <= a; });
+        return it != g.exons.end() && it->first < b;
+    };
     // A gene with a tandem stretch links across any length: haplotypes carry any number of units.
     const std::size_t max_gap = g.tandem_spans.empty() ? std::max(kChainMaxGap, 2 * (R.pref[g.ge] - R.pref[g.gs]))
                                                        : SIZE_MAX;
     for (std::size_t a = 0; a < n; ++a) {
-        f[a] = static_cast<double>(an[a].w);
+        const std::int64_t w = static_cast<std::int64_t>(an[a].w) * kScoreUnit;
+        f[a] = w;
         const std::size_t stop = a > kChainLookback ? a - kChainLookback : 0;
         for (std::size_t b = a; b-- > stop;) {
             if (an[b].i >= an[a].i) continue;
@@ -258,8 +283,8 @@ std::vector<std::vector<Anchor>> chain_anchors(const Walk& R, const Gene& g, con
             // A link across a tandem stretch pays nothing for the length the units add or remove.
             bool across = false;
             for (const auto& [t0, t1] : g.tandem_spans) across |= an[b].x + an[b].w < t1 && t0 < an[a].x;
-            const double dd = across ? 0.0 : std::fabs(static_cast<double>(dx) - static_cast<double>(dy));
-            const double s = f[b] + static_cast<double>(an[a].w) - kChainIndelCost * dd - (dd > 0 ? std::log2(dd) : 0.0);
+            const std::size_t dd = across ? 0 : dx > dy ? dx - dy : dy - dx;
+            const std::int64_t s = f[b] + w - indel_cost(dd) - (dd > 0 && in_exon(an[b].x + an[b].w, an[a].x) ? 1 : 0);
             if (s > f[a]) { f[a] = s; prev[a] = static_cast<long>(b); }
         }
     }
@@ -283,7 +308,7 @@ std::vector<std::vector<Anchor>> chain_anchors(const Walk& R, const Gene& g, con
 
 // A chain made into a pass: the gaps between its anchors and past its ends aligned node by node.
 Pass make_pass(const Walk& R, const Gene& g, const Cuts& marker, const Walk& W, const std::vector<Anchor>& c,
-               const NodeTable& t, std::size_t gene_index, bool reverse) {
+               const NodeTable& t, std::size_t gene_index, bool reverse, const std::vector<char>& taken) {
     Pass p;
     p.gene = gene_index;
     p.reverse = reverse;
@@ -292,14 +317,16 @@ Pass make_pass(const Walk& R, const Gene& g, const Cuts& marker, const Walk& W, 
         p.match[c[k].i - g.gs] = static_cast<long>(c[k].j);
         if (k + 1 < c.size()) fill_gap(R, c[k].i + 1, c[k + 1].i, W, c[k].j + 1, c[k + 1].j, t, p.match, g.gs, true);
     }
-    // Past the ends, the walk is searched over a little more than the reference stretch left to match.
+    // Past the ends, the walk is searched over a little more than the reference stretch left to match, up to
+    // an anchor of a better chain (`taken`): that is another copy of the stretch. A gene with a tandem stretch
+    // takes no such stop, as its units repeat on the walk and its pass must reach them all.
     const std::size_t lead = R.pref[c.front().i] - R.pref[g.gs];
     std::size_t j0 = c.front().j;
-    while (j0 > 0 && W.pref[c.front().j] - W.pref[j0 - 1] <= lead + lead / 2 + 1000) --j0;
+    while (j0 > 0 && W.pref[c.front().j] - W.pref[j0 - 1] <= lead + lead / 2 + 1000 && !taken[j0 - 1]) --j0;
     fill_gap(R, g.gs, c.front().i, W, j0, c.front().j, t, p.match, g.gs, true);
     const std::size_t trail = R.pref[g.ge] - R.pref[c.back().i + 1];
     std::size_t j1 = c.back().j + 1;
-    while (j1 < W.size() && W.pref[j1 + 1] - W.pref[c.back().j + 1] <= trail + trail / 2 + 1000) ++j1;
+    while (j1 < W.size() && W.pref[j1 + 1] - W.pref[c.back().j + 1] <= trail + trail / 2 + 1000 && !taken[j1]) ++j1;
     fill_gap(R, c.back().i + 1, g.ge, W, c.back().j + 1, j1, t, p.match, g.gs, false);
 
     bool any = false;
@@ -403,6 +430,32 @@ bool exon_shared(const Walk& R, const Gene& g, const std::vector<long>& match, s
         if (match[k] < 0) continue;
         const std::size_t i = g.gs + k;
         if (R.pref[i] < ce && R.pref[i + 1] > cs) return true;
+    }
+    return false;
+}
+
+// Whether the matched steps over reference bases [cs, ce) lie further apart on the walk than on the reference
+// by more than the stretch's length, with nodes of the gene between them: the match moves from one copy of a
+// duplicated stretch to another inside it, and the bases between them are not the exon's.
+bool exon_jumps(const Walk& R, const Gene& g, const std::vector<long>& match, const Walk& W, std::size_t cs, std::size_t ce) {
+    const auto gene_between = [&](std::size_t j0, std::size_t j1) {
+        for (std::size_t j = j0; j < j1; ++j)
+            if (g.step_of.count(W.node[j])) return true;
+        return false;
+    };
+    long pj = -1;
+    std::size_t pi = 0;
+    for (std::size_t k = 0; k < match.size(); ++k) {
+        const std::size_t i = g.gs + k;
+        if (match[k] < 0 || R.pref[i + 1] <= cs || R.pref[i] >= ce) continue;
+        if (pj >= 0) {
+            if (match[k] <= pj) return true;
+            const std::size_t j0 = static_cast<std::size_t>(pj) + 1, j1 = static_cast<std::size_t>(match[k]);
+            const std::size_t dy = W.pref[j1] - W.pref[j0], dx = R.pref[i] - R.pref[pi + 1];
+            if (dy > dx + (ce - cs) && gene_between(j0, j1)) return true;
+        }
+        pj = match[k];
+        pi = i;
     }
     return false;
 }
@@ -1026,13 +1079,15 @@ HstRecord project_one(const Walk& R, const std::string& rseq, const Gene& g, con
             a = map_cut(R, g, cp, W, cs, true);
             b = map_cut(R, g, cp, W, ce, false);
             if (!a.ok || !b.ok || b.pos <= a.pos) lacking[k] = e + ":missing";
+            else if (cp.pass && exon_jumps(R, g, cp.pass->match, W, cs, ce)) lacking[k] = e + ":not_contiguous";
             else if (own_share > 0 && !to_share(held_bases(R, g, cp.pass->match, cs, ce, true), cs, ce))   // walked below the share, or on shared nodes
                 lacking[k] = e + (to_share(held_bases(R, g, cp.pass->match, cs, ce, false), cs, ce) ? ":shared_nodes" : ":missing");
         }
         if (!lacking[k].empty() && in_second_copy(cs, ce) && exon_shared(R, g, cp.pass->again, cs, ce)) {
             a = map_cut(R, g, cp.pass->again, W, cs, true);
             b = map_cut(R, g, cp.pass->again, W, ce, false);
-            again[k] = a.ok && b.ok && b.pos > a.pos && (own_share <= 0 || to_share(held_bases(R, g, cp.pass->again, cs, ce, true), cs, ce));
+            again[k] = a.ok && b.ok && b.pos > a.pos && !exon_jumps(R, g, cp.pass->again, W, cs, ce) &&
+                       (own_share <= 0 || to_share(held_bases(R, g, cp.pass->again, cs, ce, true), cs, ce));
         }
         if (!lacking[k].empty() && !again[k]) continue;
         hx[k] = {a.pos, b.pos};
@@ -1365,6 +1420,14 @@ TranscriptsResult project_transcripts(const Graph& graph, const TranscriptsOptio
             g.lo = std::min(g.lo, cuts[k].front().first);
             g.hi = std::max(g.hi, cuts[k].back().second);
         }
+        for (const std::size_t k : g.tx) g.exons.insert(g.exons.end(), cuts[k].begin(), cuts[k].end());
+        std::sort(g.exons.begin(), g.exons.end());
+        Cuts merged;
+        for (const auto& e : g.exons) {
+            if (!merged.empty() && e.first <= merged.back().second) merged.back().second = std::max(merged.back().second, e.second);
+            else merged.push_back(e);
+        }
+        g.exons = std::move(merged);
         g.marker_bp = best_bp;
         g.m_lo = cuts[g.marker].front().first;
         g.m_hi = cuts[g.marker].back().second;
@@ -1381,6 +1444,7 @@ TranscriptsResult project_transcripts(const Graph& graph, const TranscriptsOptio
         g.own.resize(g.ge - g.gs);
         for (std::size_t i = g.gs; i < g.ge; ++i) {
             g.uniq[i - g.gs] = count[R.node[i]] == 1;
+            if (g.uniq[i - g.gs]) g.step_of.emplace(R.node[i], i);
             // the anchoring steps lie outside the gene: a neighbour's node there is not the gene's
             g.own[i - g.gs] = inside[R.node[i]] == walked[static_cast<std::size_t>(R.node[i])];
         }
@@ -1454,9 +1518,11 @@ TranscriptsResult project_transcripts(const Graph& graph, const TranscriptsOptio
                     for (const Anchor& a : chains[k]) bp[k] += overlap(a.x, a.x + a.w, g.m_lo, g.m_hi);
                     best = std::max(best, bp[k]);
                 }
+                std::vector<char> taken(W.size(), 0);   // the walk steps of the chains before, for make_pass
                 for (std::size_t k = 0; k < chains.size(); ++k) {
                     if (10 * bp[k] < best || (bp[k] == 0 && best > 0)) continue;
-                    Pass p = make_pass(R, g, marker_cuts[gi], W, chains[k], t, gi, rev);
+                    Pass p = make_pass(R, g, marker_cuts[gi], W, chains[k], t, gi, rev, taken);
+                    if (g.tandem_spans.empty()) for (const Anchor& a : chains[k]) taken[a.j] = 1;
                     best_share[gi] = std::max(best_share[gi], p.share);
                     if (p.share >= opt.min_exon_share) passes.push_back(std::move(p));
                     else if (reach(p) > reach(weak[gi])) weak[gi] = std::move(p);
