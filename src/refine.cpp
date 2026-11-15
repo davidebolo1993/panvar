@@ -131,9 +131,9 @@ struct PathCrossings {
 // `a_in_rev`/`b_in_rev` are each anchor's orientation walking into the region; leaving through an anchor
 // walks it the other way. Consecutive anchor hits that are not an entry followed by an exit (re-entering
 // by the anchor just left, or a stretch between two exits outside the region) are not crossings. Interior
-// steps no crossing covers are counted in `outside`.
+// steps no crossing covers are counted in `outside`, when `interior` is given.
 PathCrossings crossings_of(const Steps& steps, const std::string& a, bool a_in_rev, const std::string& b,
-                           bool b_in_rev, const std::unordered_set<std::string>& interior) {
+                           bool b_in_rev, const std::unordered_set<std::string>* interior = nullptr) {
     PathCrossings out;
     std::vector<std::size_t> hits;
     for (std::size_t k = 0; k < steps.size(); ++k)
@@ -158,8 +158,9 @@ PathCrossings crossings_of(const Steps& steps, const std::string& a, bool a_in_r
         for (std::size_t k = c.lo + 1; k < c.hi; ++k) covered[k] = 1;
         out.crossings.push_back(std::move(c));
     }
-    for (std::size_t k = 0; k < steps.size(); ++k)
-        if (!covered[k] && interior.count(steps[k].node_id) != 0) ++out.outside;
+    if (interior)
+        for (std::size_t k = 0; k < steps.size(); ++k)
+            if (!covered[k] && interior->count(steps[k].node_id) != 0) ++out.outside;
     return out;
 }
 
@@ -410,8 +411,7 @@ RegionResult process_region(const std::vector<Bubble>& comp, const GfaModel& mod
     std::unordered_map<std::size_t, std::vector<Crossing>> per_path;
     std::unordered_set<std::string> region_nodes = anch.interior;
     for (const std::size_t idx : ref_and_paths) {
-        PathCrossings pc = crossings_of(model.paths[idx].steps, anch.a, anch.a_in_rev, anch.b, anch.b_in_rev,
-                                        anch.interior);
+        PathCrossings pc = crossings_of(model.paths[idx].steps, anch.a, anch.a_in_rev, anch.b, anch.b_in_rev);
         for (const Crossing& c : pc.crossings)
             for (const PathStep& st : c.steps) region_nodes.insert(st.node_id);
         if (!pc.crossings.empty()) per_path[idx] = std::move(pc.crossings);
@@ -419,7 +419,7 @@ RegionResult process_region(const std::vector<Bubble>& comp, const GfaModel& mod
     std::string partial_path;   // the first path touching the interior outside a crossing
     for (const std::size_t idx : ref_and_paths)
         if (partial_path.empty() &&
-            crossings_of(model.paths[idx].steps, anch.a, anch.a_in_rev, anch.b, anch.b_in_rev, region_nodes)
+            crossings_of(model.paths[idx].steps, anch.a, anch.a_in_rev, anch.b, anch.b_in_rev, &region_nodes)
                     .outside > 0)
             partial_path = gfa_path_name(model.paths[idx]);
     if (const auto it = per_path.find(ref_idx); it != per_path.end() && it->second.front().reversed)
@@ -1035,7 +1035,7 @@ RefineSummary refine_graph(const RefineOptions& options) {
             if (const Anchors anch = region_anchors(comps[c]); anch.ok)
                 for (const std::size_t idx : path_order)
                     for (const Crossing& x : crossings_of(model.paths[idx].steps, anch.a, anch.a_in_rev, anch.b,
-                                                          anch.b_in_rev, anch.interior).crossings)
+                                                          anch.b_in_rev).crossings)
                         for (const PathStep& st : x.steps) nodes.insert(st.node_id);
             for (const std::string& n : nodes) {
                 const auto [it, fresh] = owner.emplace(n, c);
