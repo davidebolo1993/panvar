@@ -6,9 +6,12 @@
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <system_error>
+
+#include "panvar/gz_inflate.hpp"
 
 #include <zlib.h>
 #include <sys/stat.h>
@@ -23,7 +26,7 @@ namespace panvar {
 //
 // A damaged compressed file throws rather than reading as a shorter valid one. GFA writers put the
 // path lines last, so a truncated graph otherwise loses haplotypes and parses cleanly. Decompression
-// drives zlib's inflate directly, member by member, rather than gzread: gzread takes anything after a
+// drives inflate directly (Inflater: zlib-ng where built with it), member by member, rather than gzread: gzread takes anything after a
 // complete member that is not a gzip header as trailing garbage and ends the file there, so one damaged
 // block header in a BGZF file, or in any multi-member .gz, would silently drop everything after it.
 class GzLineReader {
@@ -38,12 +41,12 @@ public:
         refill();
         gz_ = in_len_ - in_pos_ >= 2 && in_[in_pos_] == 0x1f && in_[in_pos_ + 1] == 0x8b;
         if (gz_) {
-            std::memset(&zs_, 0, sizeof(zs_));
-            if (inflateInit2(&zs_, 15 + 16) != Z_OK) {
+            try {
+                inflater_ = std::make_unique<Inflater>();
+            } catch (const std::exception&) {
                 close();
                 throw std::runtime_error(path_ + ": cannot initialise decompression");
             }
-            zs_open_ = true;
             if (is_bgzf_missing_eof_marker(fp_)) {
                 close();
                 throw std::runtime_error(
@@ -96,10 +99,7 @@ public:
 
 private:
     void close() {
-        if (zs_open_) {
-            inflateEnd(&zs_);
-            zs_open_ = false;
-        }
+        inflater_.reset();
         if (fp_ != nullptr) {
             std::fclose(fp_);
             fp_ = nullptr;
@@ -138,28 +138,24 @@ private:
         if (done_) return 0;
         while (true) {
             if (in_pos_ == in_len_) refill();
-            zs_.next_in = in_ + in_pos_;
-            zs_.avail_in = static_cast<uInt>(in_len_ - in_pos_);
-            zs_.next_out = reinterpret_cast<Bytef*>(out);
-            zs_.avail_out = static_cast<uInt>(cap);
-            const int ret = inflate(&zs_, Z_NO_FLUSH);
-            in_pos_ = in_len_ - zs_.avail_in;
-            const std::size_t produced = cap - zs_.avail_out;
-            if (ret == Z_STREAM_END) {
+            std::size_t used = 0, produced = 0;
+            const Inflater::Status st = inflater_->run(in_ + in_pos_, in_len_ - in_pos_, out, cap, used, produced);
+            in_pos_ += used;
+            if (st == Inflater::kMemberEnd) {
                 next_member();
                 if (produced > 0 || done_) return produced;
                 continue;
             }
-            if (ret == Z_OK || ret == Z_BUF_ERROR) {
-                if (produced > 0) return produced;
+            if (st == Inflater::kOk) return produced;
+            if (st == Inflater::kNeedInput) {
                 if (in_pos_ == in_len_ && in_eof_) {
                     throw std::runtime_error(path_ + ": compressed stream ends early, so the file is "
                                                      "truncated");
                 }
                 continue;
             }
-            const std::string why = zs_.msg != nullptr ? zs_.msg : "data error";
-            throw std::runtime_error(path_ + ": cannot decompress (zlib: " + why + ")");
+            const char* msg = inflater_->message();
+            throw std::runtime_error(path_ + ": cannot decompress (zlib: " + std::string(msg != nullptr ? msg : "data error") + ")");
         }
     }
 
@@ -177,7 +173,7 @@ private:
         }
         if (in_len_ - in_pos_ < 2) refill();
         if (in_len_ - in_pos_ >= 2 && in_[in_pos_] == 0x1f && in_[in_pos_ + 1] == 0x8b) {
-            inflateReset(&zs_);
+            inflater_->next_member();
             return;
         }
         throw std::runtime_error(path_ + ": data after a complete gzip member is not another gzip "
@@ -211,8 +207,7 @@ private:
     std::FILE* fp_ = nullptr;
     bool gz_ = false;
     bool done_ = false;
-    bool zs_open_ = false;
-    z_stream zs_{};
+    std::unique_ptr<Inflater> inflater_;
     unsigned char in_[1 << 16];
     std::size_t in_pos_ = 0;
     std::size_t in_len_ = 0;

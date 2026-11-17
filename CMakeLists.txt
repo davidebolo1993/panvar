@@ -15,6 +15,31 @@ option(PANVAR_SLOW_TESTS "Enable the slow test label (the ~6 minute rebuild suit
 find_package(Threads REQUIRED)
 find_package(ZLIB REQUIRED)
 
+# zlib-ng (submodule, its own zng_ API next to the system zlib) decompresses gzip input (src/gz_inflate.cpp): inflate
+# about twice as fast on x86. Off by default on macOS, whose system zlib inflates faster there. Everything else,
+# compression included, uses the system zlib, so written files do not change.
+if(APPLE)
+    set(PANVAR_ZLIB_NG_DEFAULT OFF)
+else()
+    set(PANVAR_ZLIB_NG_DEFAULT ON)
+endif()
+option(PANVAR_ZLIB_NG "Decompress gzip input with zlib-ng from external/zlib-ng" ${PANVAR_ZLIB_NG_DEFAULT})
+if(PANVAR_ZLIB_NG AND NOT EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/external/zlib-ng/CMakeLists.txt)
+    message(WARNING "PANVAR_ZLIB_NG is on but external/zlib-ng is missing (git submodule update --init external/zlib-ng): "
+                    "gzip input uses the system zlib")
+    set(PANVAR_ZLIB_NG OFF)
+endif()
+if(PANVAR_ZLIB_NG)
+    set(ZLIB_COMPAT OFF CACHE BOOL "" FORCE)
+    set(ZLIB_ENABLE_TESTS OFF CACHE BOOL "" FORCE)
+    set(ZLIBNG_ENABLE_TESTS OFF CACHE BOOL "" FORCE)
+    set(WITH_GTEST OFF CACHE BOOL "" FORCE)
+    add_subdirectory(external/zlib-ng EXCLUDE_FROM_ALL)
+    message(STATUS "gzip input: zlib-ng from external/zlib-ng")
+else()
+    message(STATUS "gzip input: system zlib")
+endif()
+
 set(MINIMAP2_DIR ${CMAKE_CURRENT_SOURCE_DIR}/external/minimap2)
 set(MINIMAP2_LIB ${MINIMAP2_DIR}/libminimap2.a)
 if(NOT EXISTS ${MINIMAP2_DIR}/minimap.h OR NOT EXISTS ${MINIMAP2_DIR}/Makefile)
@@ -229,6 +254,7 @@ endif()
 
 add_library(panvarlib
     src/cli_utils.cpp
+    src/gz_inflate.cpp
     src/gfa.cpp
     src/gfa_io.cpp
     src/align.cpp
@@ -294,6 +320,10 @@ target_compile_options(panvarlib
 # public interface. For a static lib CMake still propagates the symbols to the final
 # executable link, while keeping edlib out of the installed export set.
 target_link_libraries(panvarlib PRIVATE edlib abpoa minigraph sshash hts ZLIB::ZLIB)
+if(PANVAR_ZLIB_NG)
+    set_source_files_properties(src/gz_inflate.cpp PROPERTIES COMPILE_DEFINITIONS PANVAR_ZLIB_NG)
+    target_link_libraries(panvarlib PRIVATE zlibstatic)
+endif()
 # GCC 8 and older keep std::filesystem in a separate library; PUBLIC so every target linking
 # panvarlib (the tool and the unit tests) gets it after the library on the link line.
 if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND CMAKE_CXX_COMPILER_VERSION VERSION_LESS 9)
