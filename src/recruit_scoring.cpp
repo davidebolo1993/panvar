@@ -3,6 +3,7 @@
 #include "panvar/kmer.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <stdexcept>
 #include <string>
@@ -136,28 +137,37 @@ double tolerated_runs(std::uint32_t callable, double e) {
 }
 
 bool uncallable(const Evidence& v) { return v.windows > 0 && v.kmers * 2 < v.windows; }
-bool divergent(const Evidence& v, const ReadOptions& o) { return static_cast<double>(v.runs_n) > tolerated_runs(v.seg_kmers, o.error_rate); }
+// What a fragment is held to: the error rate its mismatch runs are judged against (its own, from its base qualities,
+// where higher than the run's) and the decoy sites tolerated per private site (more in a long read, which crosses
+// stretches shared with homologs: a few decoy sites among hundreds of private ones).
+struct Bar {
+    double error;
+    double decoy_share;
+};
 
-bool is_certain(const Evidence& v, const ReadOptions& o, std::uint32_t min_sites) {
-    if (v.seg_kmers == 0 || uncallable(v) || divergent(v, o)) return false;
-    return v.sites_p >= min_sites && v.sites_d <= o.decoy_share * v.sites_p &&
+bool divergent(const Evidence& v, const Bar& b) { return static_cast<double>(v.runs_n) > tolerated_runs(v.seg_kmers, b.error); }
+
+bool is_certain(const Evidence& v, const ReadOptions& o, std::uint32_t min_sites, const Bar& b) {
+    if (v.seg_kmers == 0 || uncallable(v) || divergent(v, b)) return false;
+    return v.sites_p >= min_sites && v.sites_d <= b.decoy_share * v.sites_p &&
            v.sites_p >= o.min_density * static_cast<double>(v.seg_kmers) / static_cast<double>(kK);
 }
 
 // A fragment's fate. The pair's pooled evidence decides; failing that, one mate certain on its own makes
 // the pair certain too ("rescued"): the mates lie an insert apart, so the other one is in the locus or its
 // flank. Certain fragments with a mate outside every segment are rescued, with a mate partly outside partial.
-void decide(Row& r, const Evidence& one, const Evidence* two, const char* status[2], const ReadOptions& o, std::uint32_t min_sites) {
+void decide(Row& r, const Evidence& one, const Evidence* two, const char* status[2], const ReadOptions& o, std::uint32_t min_sites,
+            const Bar& b) {
     const Evidence& v = r.ev;
     // pooled evidence decides a pair only with a mate wholly in the locus: two mates that both leave it
     // would pool islands (a pair across an edge has a mate inside unless the mates overlap)
-    const bool pooled = is_certain(v, o, min_sites) &&
+    const bool pooled = is_certain(v, o, min_sites, b) &&
                         (two == nullptr || std::string(status[0]) == "in" || std::string(status[1]) == "in");
     // one mate certain on its own carries the pair unless the other leans to a homolog (more decoy sites
     // than private ones) away from a locus edge; at an edge (the certain mate runs out of the locus) the
     // other mate may well be in a homologous flank
     auto carries = [&](const Evidence& mine, const Evidence& other, const char* my_status) {
-        return is_certain(mine, o, min_sites) &&
+        return is_certain(mine, o, min_sites, b) &&
                (other.sites_d + other.decoy_out <= other.sites_p || std::string(my_status) == "part");
     };
     const bool alone = two != nullptr && (carries(one, *two, status[0]) || carries(*two, one, status[1]));
@@ -172,12 +182,34 @@ void decide(Row& r, const Evidence& one, const Evidence* two, const char* status
     if (v.sites_p == 0 && decoy >= 2) { r.fate = "unrecruited"; r.reason = "homolog"; return; }
     if (v.sites_p >= 1 && decoy >= 1) { r.fate = "ambiguous"; r.reason = "conflict"; return; }
     if (uncallable(v) && v.sites_p >= 1) { r.fate = "ambiguous"; r.reason = "uncallable"; return; }
-    if (divergent(v, o) && v.sites_p >= 1) { r.fate = "ambiguous"; r.reason = "divergent"; return; }
+    if (divergent(v, b) && v.sites_p >= 1) { r.fate = "ambiguous"; r.reason = "divergent"; return; }
     if (v.sites_p >= min_sites) { r.fate = "ambiguous"; r.reason = "sparse"; return; }
     if (v.sites_p >= 1) { r.fate = "ambiguous"; r.reason = "single_site"; return; }
     if (v.n_s >= 1) { r.fate = "ambiguous"; r.reason = "shared_only"; return; }
     r.fate = "unrecruited";
     r.reason = "no_evidence";
+}
+
+// A fragment's bar. Its error rate is the mean of 10^(-Q/10) over its bases with qualities, as the run's estimate
+// is, when that is higher than the run's and says something (under 30%): HiFi reads range from 99% to 99.99%
+// accurate, and a read at 99.5% must not be held to the run's 99.9%. A read of 1 kb or more gets the long-read
+// decoy share. Simulated reads (no qualities) are held to the run's rate, so the calibration scores as runs do.
+Bar bar_for(const Fragment& fr, const ReadOptions& o) {
+    static const std::array<double, 128> kErr = [] {
+        std::array<double, 128> e{};
+        for (int c = 0; c < 128; ++c) e[c] = c < 33 ? 1.0 : std::pow(10.0, -(c - 33) / 10.0);
+        return e;
+    }();
+    double sum = 0;
+    std::size_t n = 0, longest = 0;
+    for (const auto& [s, q] : {std::pair{&fr.seq1, &fr.qual1}, std::pair{&fr.seq2, &fr.qual2}}) {
+        longest = std::max(longest, s->size());
+        if (q->empty() || q->size() != s->size()) continue;
+        for (const char c : *q) sum += kErr[static_cast<unsigned char>(c) & 127];
+        n += q->size();
+    }
+    const double own = n ? sum / static_cast<double>(n) : 0.0;
+    return {own > o.error_rate && own < 0.3 ? own : o.error_rate, longest >= kLongRead ? o.decoy_share_long : o.decoy_share};
 }
 
 // Scores one fragment against one locus.
@@ -189,6 +221,7 @@ Row score_fragment(const Fragment& fr, const LocusTable& t, std::uint32_t li, co
     r.fragment = fr.name;
     r.locus = li;
     const bool pair = fr.paired;
+    const Bar bar = bar_for(fr, o);
     Evidence ev[2], dedup2;
     const char* status[2] = {"out", "out"};
     std::vector<std::uint64_t> seen;
@@ -258,11 +291,11 @@ Row score_fragment(const Fragment& fr, const LocusTable& t, std::uint32_t li, co
         *certain_through = 0;
         for (std::uint32_t m = kMaxCut; m >= 1 && *certain_through == 0; --m) {
             Row x = r;
-            decide(x, ev[0], pair ? &ev[1] : nullptr, status, o, m);
+            decide(x, ev[0], pair ? &ev[1] : nullptr, status, o, m, bar);
             if (x.fate[0] == 'c') *certain_through = m;
         }
     }
-    decide(r, ev[0], pair ? &ev[1] : nullptr, status, o, t.min_sites ? t.min_sites : o.min_sites);
+    decide(r, ev[0], pair ? &ev[1] : nullptr, status, o, t.min_sites ? t.min_sites : o.min_sites, bar);
     return r;
 }
 

@@ -16,6 +16,7 @@
 namespace panvar::recruit::scoring {
 
 constexpr std::size_t kK = 31, kS = 11;
+constexpr std::size_t kLongRead = 1000;   // a read this long or longer is held to the long-read decoy share
 constexpr std::uint8_t kLabelP = 0, kLabelS = 1, kLabelR = 2, kLabelD = 3, kLabelN = 4, kMultiBit = 8, kBackboneBit = 16;
 
 // One locus, as reads see it: each k-mer's label (P/S/R, D for decoys), with bits for multi-copy P and

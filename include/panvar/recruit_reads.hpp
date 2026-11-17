@@ -50,6 +50,8 @@ struct ReadOptions {
     bool calibrated_cut = true;          // per locus, the lowest cut meeting the false-certain rate
     double false_certain_rate = 1e-6;    // per screened off-target fragment of the run's read class
     double decoy_share = 0.05;           // decoy sites tolerated, as a share of the private sites
+    double decoy_share_long = 0.25;      // the same for reads of kLongRead bases or more, which cross stretches shared
+                                         // with homologs: a few decoy sites among hundreds of private ones
     double min_density = 0.05;           // private sites per 31 callable bases: chance hits in a long read are sparse
     double error_rate = -1;              // per base: the expected mismatch runs, beside one new allele per kb;
                                          // below 0: estimated from the base qualities of the first reads

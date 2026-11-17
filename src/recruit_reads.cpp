@@ -277,7 +277,7 @@ ReadStats recruit_reads(const ReadOptions& options) {
     io.cram_reference = o.cram_reference;
     io.interleaved = o.interleaved;
     io.threads = std::max<std::size_t>(1, o.threads / 4);   // decompression: a quarter of the scorers keeps up
-    io.qualities = !o.reads_out.empty() || o.error_rate < 0;
+    io.qualities = true;   // a read's own error rate comes from its qualities
     io.screened = screened;
     io.log = o.log;
     std::size_t next_input = 0;
