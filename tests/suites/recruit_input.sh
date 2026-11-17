@@ -117,6 +117,10 @@ fi
 "$BIN" recruit --locus "$IDX" -1 r_1.fq -2 r_2.fq -o out.tsv --reads-out reads_out --preset illumina -q
 check "certain pairs are written as FASTQ, mates in step" '[[ $(gzip -dc reads_out/locus.certain_1.fq.gz | awk "NR % 4 == 1" | wc -l) -eq $(awk -F"\t" '"'"'$3=="certain"'"'"' out.tsv | wc -l) && $(gzip -dc reads_out/locus.certain_2.fq.gz | wc -l) -eq $(gzip -dc reads_out/locus.certain_1.fq.gz | wc -l) ]]'
 check "the summary gives the error rate and the backbone depth" 'grep -q "^run.error_rate.0.00200.given" out.summary.tsv && grep -q "backbone_depth" out.summary.tsv'
+"$BIN" recruit --locus "$IDX" -1 r_1.fq -2 r_2.fq -o out1.tsv --reads-out reads_out1 --preset illumina -t 1 -q
+"$BIN" recruit --locus "$IDX" -1 r_1.fq -2 r_2.fq -o out4.tsv --reads-out reads_out4 --preset illumina -t 4 -q
+check "the FASTQ files are the same bytes at 1 and 4 threads" 'diff -r reads_out1 reads_out4 > /dev/null && cmp -s out1.tsv out4.tsv'
+check "the ambiguous reads are written too, by default" '[[ $(gzip -dc reads_out1/locus.ambiguous_1.fq.gz | awk "NR % 4 == 1" | wc -l) -eq $(awk -F"\t" '"'"'$3=="ambiguous"'"'"' out1.tsv | wc -l) ]]'
 "$BIN" recruit --locus "$IDX" -1 r_1.fq -2 r_2.fq -o est.tsv 2> est.log
 check "without a rate, it is estimated from the base qualities" 'grep -q "error rate: 0.0010 (estimated from" est.log'
 

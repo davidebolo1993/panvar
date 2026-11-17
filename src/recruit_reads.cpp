@@ -17,6 +17,7 @@
 #include <filesystem>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <set>
 #include <stdexcept>
 #include <thread>
@@ -35,40 +36,125 @@ void Evidence::add(const Evidence& o) {
 namespace {
 
 // Recruited reads as gzip FASTQ, per locus and fate: <locus>.<fate>_1/_2.fq.gz for pairs, <locus>.<fate>.fq.gz
-// for single reads. Files open when first written; past a cap they are closed and reopened to append (a
-// gzip file of several members reads as one).
+// for single reads. Records are collected per file; each file's text is compressed in pieces of kPiece
+// bytes (the last one shorter), each piece one gzip member, by several threads at each flush; a gzip file of
+// several members reads as one. Pieces are cut by size alone, so the files depend neither on the thread count
+// nor on the batches. Files open when first written; past a cap they are closed and reopened to append.
 class ReadWriters {
 public:
-    explicit ReadWriters(std::string dir) : dir_(std::move(dir)) { std::filesystem::create_directories(dir_); }
-    ~ReadWriters() { close_all(); }
+    ReadWriters(std::string dir, std::size_t threads) : dir_(std::move(dir)), threads_(std::max<std::size_t>(1, threads)) {
+        std::filesystem::create_directories(dir_);
+    }
+    ~ReadWriters() {
+        try { close_all(); } catch (...) {}
+    }
     void write(const std::string& locus, const char* fate, const char* suffix, const std::string& header, const std::string& seq,
                const std::string& qual) {
-        const std::string key = locus + "." + fate + suffix + ".fq.gz";
-        auto it = open_.find(key);
-        if (it == open_.end()) {
-            if (open_.size() >= kMaxOpen) close_all();
-            const bool again = started_.count(key) > 0;
-            gzFile f = gzopen((std::filesystem::path(dir_) / key).string().c_str(), again ? "ab3" : "wb3");
-            if (f == nullptr) throw std::runtime_error("recruit: cannot write " + dir_ + "/" + key);
-            started_.insert(key);
-            it = open_.emplace(key, f).first;
+        std::string& to = pending_[locus + "." + fate + suffix + ".fq.gz"];
+        to += '@';
+        to += header;
+        to += '\n';
+        to += seq;
+        to += "\n+\n";
+        if (qual.size() == seq.size()) to += qual;
+        else to.append(seq.size(), 'I');
+        to += '\n';
+        pending_bytes_ += header.size() + 2 * seq.size() + 6;
+        if (pending_bytes_ >= kFlushAt) flush();   // bounds memory; the pieces stay the same
+    }
+    // Compresses each file's whole pieces written so far (with `all`, the rest too) and appends them.
+    void flush(bool all = false) {
+        struct Piece {
+            const std::string* key;
+            const char* data;
+            std::size_t size;
+            std::string gz;
+        };
+        std::vector<Piece> pieces;
+        for (const auto& [key, text] : pending_)
+            for (std::size_t a = 0; a < text.size() && (all || text.size() - a >= kPiece); a += kPiece)
+                pieces.push_back({&key, text.data() + a, std::min(kPiece, text.size() - a), {}});
+        std::atomic<std::size_t> cursor{0};
+        std::exception_ptr failed;
+        std::mutex failed_mutex;
+        auto work = [&] {
+            try {
+                for (std::size_t i; (i = cursor++) < pieces.size();) pieces[i].gz = gzip_member(pieces[i].data, pieces[i].size);
+            } catch (...) {
+                std::lock_guard<std::mutex> lock(failed_mutex);
+                if (!failed) failed = std::current_exception();
+            }
+        };
+        std::vector<std::thread> pool;
+        for (std::size_t t = 1; t < std::min(threads_, pieces.size()); ++t) pool.emplace_back(work);
+        work();
+        for (auto& t : pool) t.join();
+        if (failed) std::rethrow_exception(failed);
+        std::map<std::string, std::size_t> done;   // bytes compressed per file
+        for (const Piece& p : pieces) {
+            std::FILE* f = file(*p.key);
+            if (std::fwrite(p.gz.data(), 1, p.gz.size(), f) != p.gz.size()) throw std::runtime_error("recruit: cannot write " + dir_ + "/" + *p.key);
+            done[*p.key] += p.size;
         }
-        std::string rec = "@" + header + "\n" + seq + "\n+\n";
-        rec += qual.size() == seq.size() ? qual : std::string(seq.size(), 'I');
-        rec += '\n';
-        if (gzwrite(it->second, rec.data(), static_cast<unsigned>(rec.size())) != static_cast<int>(rec.size()))
-            throw std::runtime_error("recruit: cannot write " + dir_ + "/" + key);
+        for (const auto& [key, n] : done) {
+            std::string& text = pending_[key];
+            if (n == text.size()) {
+                pending_.erase(key);
+            } else {
+                text.erase(0, n);
+                if (text.capacity() > 2 * kPiece) text.shrink_to_fit();
+            }
+        }
+        pending_bytes_ = 0;
+        for (const auto& [key, text] : pending_) pending_bytes_ += text.size();
     }
     void close_all() {
-        for (auto& [key, f] : open_)
-            if (gzclose(f) != Z_OK) throw std::runtime_error("recruit: cannot write " + dir_ + "/" + key);
-        open_.clear();
+        flush(true);
+        close_files();
     }
 
 private:
     static constexpr std::size_t kMaxOpen = 200;
+    static constexpr std::size_t kPiece = std::size_t{4} << 20;
+    static constexpr std::size_t kFlushAt = std::size_t{256} << 20;   // text waiting before a flush
+
+    static std::string gzip_member(const char* data, std::size_t size) {
+        z_stream zs{};
+        if (deflateInit2(&zs, 3, Z_DEFLATED, 15 + 16, 8, Z_DEFAULT_STRATEGY) != Z_OK) throw std::runtime_error("recruit: cannot start compression");
+        std::string out(deflateBound(&zs, static_cast<uLong>(size)), '\0');
+        zs.next_in = reinterpret_cast<Bytef*>(const_cast<char*>(data));
+        zs.avail_in = static_cast<uInt>(size);
+        zs.next_out = reinterpret_cast<Bytef*>(out.data());
+        zs.avail_out = static_cast<uInt>(out.size());
+        const int ret = deflate(&zs, Z_FINISH);
+        out.resize(out.size() - zs.avail_out);
+        deflateEnd(&zs);
+        if (ret != Z_STREAM_END) throw std::runtime_error("recruit: cannot compress the recruited reads");
+        return out;
+    }
+    std::FILE* file(const std::string& key) {
+        auto it = open_.find(key);
+        if (it != open_.end()) return it->second;
+        if (open_.size() >= kMaxOpen) close_files();
+        const bool again = started_.count(key) > 0;
+        std::FILE* f = std::fopen((std::filesystem::path(dir_) / key).string().c_str(), again ? "ab" : "wb");
+        if (f == nullptr) throw std::runtime_error("recruit: cannot write " + dir_ + "/" + key);
+        started_.insert(key);
+        return open_.emplace(key, f).first->second;
+    }
+    void close_files() {
+        std::string bad;
+        for (auto& [key, f] : open_)
+            if (std::fclose(f) != 0 && bad.empty()) bad = key;
+        open_.clear();
+        if (!bad.empty()) throw std::runtime_error("recruit: cannot write " + dir_ + "/" + bad);
+    }
+
     std::string dir_;
-    std::map<std::string, gzFile> open_;
+    std::size_t threads_;
+    std::map<std::string, std::string> pending_;
+    std::size_t pending_bytes_ = 0;
+    std::map<std::string, std::FILE*> open_;
     std::set<std::string> started_;
 };
 
@@ -293,7 +379,7 @@ ReadStats recruit_reads(const ReadOptions& options) {
     if (out == nullptr) throw std::runtime_error("recruit: cannot write " + o.out);
     std::fprintf(out, "fragment\tlocus\tfate\treason\tmates\tseg1\tseg2\tsites_p\tsites_d\tdecoy_out\truns_n\tseg_kmers\tn_p\tn_s\tn_r\tn_d\tn_n\tkmers\twindows\tbases\tmulti_p\tnodes\tother_loci\tcertain_loci\n");
     std::unique_ptr<ReadWriters> writers;
-    if (!o.reads_out.empty()) writers = std::make_unique<ReadWriters>(o.reads_out);
+    if (!o.reads_out.empty()) writers = std::make_unique<ReadWriters>(o.reads_out, o.threads);
     const Costs costs = costs_for(o.error_rate);
     const double gap_cost = costs.gap_cost, flank_share = costs.flank_share;
 
@@ -371,6 +457,7 @@ ReadStats recruit_reads(const ReadOptions& options) {
                 }
             }
         }
+        if (writers) writers->flush();
         if (std::ferror(out) || std::fflush(out) != 0) throw std::runtime_error("recruit: cannot write " + o.out);
         if (st.fragments >= next_report) {   // a line every 10 million fragments: a stream has no total for a bar
             log("progress: fragments: " + std::to_string(st.fragments) + "; screened: " + std::to_string(st.screened) + "; certain: " +

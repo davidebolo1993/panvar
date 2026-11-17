@@ -76,7 +76,7 @@ A sample sheet holds tab-separated lines of sample, file and optionally a mate f
 | `<out stem>.summary.tsv` | the run: error rate and its source, fragments, screened, mean read length; each input's records by kind; per locus, fragments by fate and reason, the backbone depth, the fragments certain for another locus too, and the private-site cut with the calibration behind it |
 | `<locus>.plx` | the index |
 | `<locus>.index.tsv` | the index's report: the locus (k-mers by label, backbone, pieces, decoys, screen), each copy found per genome with the k-mers subtracted, the pieces found off them, the decoy windows, ceilings (the share of read-length windows of each haplotype with 2 private sites) and the calibration (per read class and cut: held-out fragments certain, off-target certain of those screened, and the 95% bound) |
-| `<reads-out>/<locus>.<fate>_1.fq.gz`, `_2.fq.gz` | with `--reads-out`: recruited pairs, as sequenced, with qualities (`<locus>.<fate>.fq.gz` for single reads) |
+| `<reads-out>/<locus>.<fate>_1.fq.gz`, `_2.fq.gz` | with `--reads-out`: recruited pairs, as sequenced, with qualities (`<locus>.<fate>.fq.gz` for single reads); with `--samples`, in `<reads-out>/<sample>/`. Each file is a chain of gzip members, compressed by all threads (any gzip reader reads it as one) |
 
 An index dumped with `--dump-index` has one row per k-mer of the locus: `kmer` (its canonical sequence), `class` (`P`, `S` or `R`), `outside` (its background count outside the locus), `multiplicity` (its largest copy number within one haplotype), `backbone` (1 if once in every haplotype), `screen` (1 if a screen syncmer) and `nodes` (the graph nodes it starts on). Decoy k-mers follow as class `D`, with `.` in the fields only locus k-mers have.
 
