@@ -277,6 +277,8 @@ ReadStats recruit_reads(const ReadOptions& options) {
     io.cram_reference = o.cram_reference;
     io.interleaved = o.interleaved;
     io.threads = std::max<std::size_t>(1, o.threads / 4);   // decompression: a quarter of the scorers keeps up
+    io.fetch_threads = std::max<std::size_t>(1, o.threads);  // the mates fetched at the end: nothing else runs then
+    io.parse_threads = std::max<std::size_t>(1, o.threads / 4);   // alignment records prepared beside the pairing
     io.qualities = true;   // a read's own error rate comes from its qualities
     io.screened = screened;
     io.log = o.log;

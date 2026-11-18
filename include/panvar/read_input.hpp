@@ -32,6 +32,8 @@ struct InputOptions {
     bool interleaved = false;                                 // a single FASTQ holds mates as consecutive records
     bool qualities = true;                                    // keep base qualities (CRAM decodes them only if so)
     std::size_t threads = 2;                                  // htslib decompression threads
+    std::size_t fetch_threads = 1;                            // threads fetching mates through the index at the end
+    std::size_t parse_threads = 1;                            // threads preparing alignment records (names, sequences)
     std::function<bool(const std::string&)> screened;         // a read hits some locus screen (coordinate-sorted input)
     std::function<void(const std::string&)> log;
 };

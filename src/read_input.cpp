@@ -5,13 +5,18 @@
 #include <htslib/hts.h>
 #include <htslib/sam.h>
 #include <htslib/thread_pool.h>
+#include <pthread.h>
 
 #include <algorithm>
 #include <array>
+#include <condition_variable>
 #include <cstdlib>
 #include <deque>
 #include <exception>
 #include <filesystem>
+#include <map>
+#include <mutex>
+#include <functional>
 #include <stdexcept>
 #include <thread>
 #include <tuple>
@@ -20,6 +25,33 @@
 namespace panvar::recruit {
 
 namespace {
+
+// A thread with an 8 MB stack, Linux's default: htslib's CRAM decoders keep large tables on the stack, more than
+// the 512 KB macOS gives a std::thread.
+class BigStackThread {
+public:
+    explicit BigStackThread(std::function<void()> f) : f_(std::move(f)) {
+        pthread_attr_t attr;
+        pthread_attr_init(&attr);
+        pthread_attr_setstacksize(&attr, 8u << 20);
+        const int r = pthread_create(&id_, &attr, &BigStackThread::run, this);
+        pthread_attr_destroy(&attr);
+        if (r != 0) throw std::runtime_error("recruit: cannot start a thread");
+    }
+    ~BigStackThread() { if (!joined_) pthread_join(id_, nullptr); }
+    BigStackThread(const BigStackThread&) = delete;
+    BigStackThread& operator=(const BigStackThread&) = delete;
+    void join() { pthread_join(id_, nullptr); joined_ = true; }
+
+private:
+    static void* run(void* self) {
+        static_cast<BigStackThread*>(self)->f_();
+        return nullptr;
+    }
+    std::function<void()> f_;
+    pthread_t id_{};
+    bool joined_ = false;
+};
 
 bool read_fastq(GzLineReader& in, std::string& name, std::string& seq, std::string& qual) {
     std::string h, plus;
@@ -167,8 +199,9 @@ struct HtsFile {
     HtsFile& operator=(const HtsFile&) = delete;
     // The next record; false at the end; a damaged file (truncated BGZF, a CRAM whose reference cannot be
     // found) stops the run with the file named.
-    bool read() {
-        const int r = sam_read1(fp, hdr, rec);
+    bool read() { return read(rec); }
+    bool read(bam1_t* into) {
+        const int r = sam_read1(fp, hdr, into);
         if (r >= 0) return true;
         if (r == -1) return false;
         throw std::runtime_error("recruit: " + path + ": cannot read a record (truncated or damaged, or a CRAM whose reference cannot be found; see --cram-reference)");
@@ -263,17 +296,36 @@ public:
         }
     }
     ~Alignments() override {
+        stop_pipeline();
+        for (auto& c : chunks_) for (bam1_t* b : c->recs) bam_destroy1(b);
         file_.reset();
         if (pool_.pool) hts_tpool_destroy(pool_.pool);
     }
     std::size_t next(std::vector<Fragment>& out, std::size_t n) override {
+        if (!started_) start_pipeline();
         while (ready_.size() < n && !eof_) {
-            if (!file_->read()) {
-                eof_ = true;
-                finish();
-                break;
+            if (cur_ != nullptr && cur_pos_ < cur_->n) {
+                take(cur_->out[cur_pos_++]);
+                continue;
             }
-            take(file_->rec);
+            if (cur_ != nullptr) {
+                const bool last = cur_->last;
+                const std::exception_ptr error = cur_->error;
+                release(cur_);
+                cur_ = nullptr;
+                if (error) {
+                    stop_pipeline();
+                    std::rethrow_exception(error);
+                }
+                if (last) {
+                    stop_pipeline();
+                    eof_ = true;
+                    finish();
+                    break;
+                }
+            }
+            cur_ = wait_chunk(next_id_++);
+            cur_pos_ = 0;
         }
         const std::size_t k = std::min(n, ready_.size());
         out.resize(k);
@@ -316,34 +368,161 @@ private:
         std::int64_t mpos = -1;
     };
 
+    // A record's fields that take() uses, prepared off the pairing thread.
+    struct Rec {
+        std::uint16_t flag = 0;
+        std::int32_t tid = -1, mtid = -1;
+        std::int64_t pos = -1, mpos = -1;
+        std::string name, seq, qual;
+    };
+    void prepare(const bam1_t* b, Rec& r) const {
+        r.flag = b->core.flag;
+        r.tid = b->core.tid;
+        r.pos = b->core.pos;
+        r.mtid = b->core.mtid;
+        r.mpos = b->core.mpos;
+        r.name.assign(bam_get_qname(b));
+        r.qual.clear();
+        if (r.flag & (BAM_FSECONDARY | BAM_FSUPPLEMENTARY | BAM_FQCFAIL)) { r.seq.clear(); return; }   // skipped by take()
+        r.seq = sequence_of(b, o_.qualities ? &r.qual : nullptr);
+    }
+
+    // The reading pipeline: one thread reads records into chunks (htslib decodes on its own threads), workers prepare
+    // them (names, sequences, qualities) in parallel, and next() takes them in file order, so the pairing sees the
+    // records exactly as one thread reading them would.
+    struct Chunk {
+        std::uint64_t id = 0;
+        std::vector<bam1_t*> recs;
+        std::size_t n = 0;
+        bool last = false;               // the file ends with this chunk
+        std::exception_ptr error;        // reading failed after its n records
+        std::vector<Rec> out;
+    };
+    static constexpr std::size_t kChunk = 4096;
+    void start_pipeline() {
+        started_ = true;
+        const std::size_t workers = std::max<std::size_t>(1, o_.parse_threads);
+        for (std::size_t i = 0; i < 2 * workers + 4; ++i) {
+            auto c = std::make_unique<Chunk>();
+            c->recs.resize(kChunk);
+            for (bam1_t*& b : c->recs) b = bam_init1();
+            c->out.resize(kChunk);
+            free_.push_back(c.get());
+            chunks_.push_back(std::move(c));
+        }
+        producer_ = std::make_unique<BigStackThread>([this] { produce(); });
+        for (std::size_t i = 0; i < workers; ++i) workers_.push_back(std::make_unique<BigStackThread>([this] { work(); }));
+    }
+    void stop_pipeline() {
+        if (!started_ || stopped_) return;
+        {
+            std::lock_guard<std::mutex> lock(mu_);
+            stop_ = true;
+        }
+        cv_.notify_all();
+        if (producer_) producer_->join();
+        for (auto& w : workers_) w->join();
+        stopped_ = true;
+    }
+    void produce() {
+        for (std::uint64_t id = 0;; ++id) {
+            Chunk* c = nullptr;
+            {
+                std::unique_lock<std::mutex> lock(mu_);
+                cv_.wait(lock, [&] { return stop_ || !free_.empty(); });
+                if (stop_) break;
+                c = free_.front();
+                free_.pop_front();
+            }
+            c->id = id;
+            c->n = 0;
+            c->last = false;
+            c->error = nullptr;
+            try {
+                while (c->n < kChunk) {
+                    if (!file_->read(c->recs[c->n])) { c->last = true; break; }
+                    ++c->n;
+                }
+            } catch (...) {
+                c->error = std::current_exception();
+                c->last = true;
+            }
+            {
+                std::lock_guard<std::mutex> lock(mu_);
+                todo_.push_back(c);
+                if (c->last) produced_ = true;
+            }
+            cv_.notify_all();
+            if (c->last) break;
+        }
+        std::lock_guard<std::mutex> lock(mu_);
+        produced_ = true;
+        cv_.notify_all();
+    }
+    void work() {
+        for (;;) {
+            Chunk* c = nullptr;
+            {
+                std::unique_lock<std::mutex> lock(mu_);
+                cv_.wait(lock, [&] { return stop_ || !todo_.empty() || produced_; });
+                if (todo_.empty()) {
+                    if (stop_ || produced_) return;
+                    continue;
+                }
+                c = todo_.front();
+                todo_.pop_front();
+            }
+            for (std::size_t i = 0; i < c->n; ++i) prepare(c->recs[i], c->out[i]);
+            {
+                std::lock_guard<std::mutex> lock(mu_);
+                done_[c->id] = c;
+            }
+            cv_.notify_all();
+        }
+    }
+    Chunk* wait_chunk(std::uint64_t id) {
+        std::unique_lock<std::mutex> lock(mu_);
+        cv_.wait(lock, [&] { return done_.count(id) > 0; });
+        Chunk* c = done_[id];
+        done_.erase(id);
+        return c;
+    }
+    void release(Chunk* c) {
+        {
+            std::lock_guard<std::mutex> lock(mu_);
+            free_.push_back(c);
+        }
+        cv_.notify_all();
+    }
+
     // Skip, count and turn a record into a fragment, or hold it for its mate.
-    void take(const bam1_t* b) {
+    void take(Rec& r) {
         ++st_.records;
-        const std::uint16_t flag = b->core.flag;
+        const std::uint16_t flag = r.flag;
         if (flag & BAM_FSECONDARY) { ++st_.secondary; return; }
         if (flag & BAM_FSUPPLEMENTARY) { ++st_.supplementary; return; }
         if (flag & BAM_FQCFAIL) { ++st_.qc_fail; return; }
         if (flag & BAM_FDUP) ++st_.duplicates;
         if (flag & BAM_FUNMAP) ++st_.unmapped;
-        std::string name = bam_get_qname(b);
+        std::string name = std::move(r.name);
         if (!(flag & BAM_FPAIRED)) {
-            emit(std::move(name), read_of(b), Read{}, false);
+            emit(std::move(name), Read{std::move(r.seq), std::move(r.qual)}, Read{}, false);
             return;
         }
         const bool read1 = !(flag & BAM_FREAD2);
         if (coordinate_) {
-            check_order(b);
-            if (b->core.tid != last_tid_) {
-                sweep(b->core.tid, -1);
-                last_tid_ = b->core.tid;
+            check_order(r.tid, r.pos, name);
+            if (r.tid != last_tid_) {
+                sweep(r.tid, -1);
+                last_tid_ = r.tid;
             } else if (st_.records % 65536 == 0) {
-                sweep(b->core.tid, b->core.pos);
+                sweep(r.tid, r.pos);
             }
         }
         const auto it = held_.find(name);
         if (it != held_.end()) {
             if (it->second.read1 != read1) {
-                pair_up(std::move(name), std::move(it->second), read_of(b), read1);
+                pair_up(std::move(name), std::move(it->second), Read{std::move(r.seq), std::move(r.qual)}, read1);
                 held_.erase(it);
                 return;
             }
@@ -353,10 +532,11 @@ private:
             held_.erase(it);
         }
         Held h;
-        h.seq = sequence_of(b, o_.qualities ? &h.qual : nullptr);
+        h.seq = std::move(r.seq);
+        h.qual = std::move(r.qual);
         h.read1 = read1;
-        h.mtid = b->core.mtid;
-        h.mpos = b->core.mpos;
+        h.mtid = r.mtid;
+        h.mpos = r.mpos;
         if (!coordinate_) {
             if (lean_) {   // holding too much already: only a read that hits a screen is kept, its mate fetched later
                 if (o_.screened(h.seq)) {
@@ -373,8 +553,8 @@ private:
             if (held_.size() > hold_max_) go_lean();
             return;
         }
-        const std::int32_t tid = b->core.tid;
-        const std::int64_t pos = b->core.pos;
+        const std::int32_t tid = r.tid;
+        const std::int64_t pos = r.pos;
         // a mate without a known place (unplaced, or RNEXT/PNEXT unavailable) is waited for like a near one
         const bool mate_unplaced = h.mtid < 0 || h.mpos < 0 || tid < 0;
         const bool behind = !mate_unplaced && (h.mtid < tid || (h.mtid == tid && h.mpos < pos));
@@ -393,12 +573,10 @@ private:
     }
 
     // Pairing relies on the order the header claims: a record before the last one stops the run.
-    void check_order(const bam1_t* b) {
-        const std::int32_t tid = b->core.tid;
-        const std::int64_t pos = b->core.pos;
+    void check_order(std::int32_t tid, std::int64_t pos, const std::string& qname) {
         if (tid < 0) { unplaced_seen_ = true; return; }
         if (unplaced_seen_ || tid < order_tid_ || (tid == order_tid_ && pos < order_pos_))
-            throw std::runtime_error("recruit: " + path_ + " is not sorted by coordinate (" + bam_get_qname(b) +
+            throw std::runtime_error("recruit: " + path_ + " is not sorted by coordinate (" + qname +
                                      " comes after a later position), though it is read as sorted");
         order_tid_ = tid;
         order_pos_ = pos;
@@ -491,13 +669,20 @@ private:
 
     void fetch() {
         std::vector<char> found(wanted_.size(), 0);
-        HtsFile again(path_, o_, &pool_);
-        hts_idx_t* idx = sam_index_load(again.fp, path_.c_str());
-        if (idx != nullptr) {
+        std::vector<Read> mates(wanted_.size());
+        bool indexed = false;
+        {
+            HtsFile probe(path_, o_, nullptr);
+            hts_idx_t* idx = sam_index_load(probe.fp, path_.c_str());
+            indexed = idx != nullptr;
+            if (idx) hts_idx_destroy(idx);
+        }
+        if (indexed) {
             // in the mates' order on the genome. A CRAM reads nearby mates by one query, so each reference contig
             // is loaded once (in the order the reads came, it reloads a contig at almost every mate); a BAM queries
             // each mate position alone, as a query decodes every record between its ends.
-            const std::int64_t gap = hts_get_format(again.fp)->format == cram ? kFetchGap : 0;
+            const bool is_cram = hts_get_format(file_->fp)->format == cram;
+            const std::int64_t gap = is_cram ? kFetchGap : 0;
             std::vector<std::size_t> order;
             for (std::size_t i = 0; i < wanted_.size(); ++i)
                 if (wanted_[i].mtid >= 0 && wanted_[i].mpos >= 0) order.push_back(i);
@@ -505,36 +690,67 @@ private:
                 return std::tie(wanted_[a].mtid, wanted_[a].mpos, a) < std::tie(wanted_[b].mtid, wanted_[b].mpos, b);
             });
             if (o_.log && !order.empty()) o_.log("input: " + path_ + "; mates to fetch through the index: " + std::to_string(order.size()));
-            std::vector<Read> mates(wanted_.size());
-            std::unordered_map<std::string, std::vector<std::size_t>> group;   // a query's wanted reads, by name
+            std::vector<std::pair<std::size_t, std::size_t>> queries;   // ranges of `order`, one query each
             for (std::size_t a = 0; a < order.size();) {
                 std::size_t b = a + 1;
                 while (b < order.size() && wanted_[order[b]].mtid == wanted_[order[a]].mtid &&
                        wanted_[order[b]].mpos - wanted_[order[b - 1]].mpos <= gap)
                     ++b;
-                group.clear();
-                for (std::size_t k = a; k < b; ++k) group[wanted_[order[k]].name].push_back(order[k]);
-                std::size_t left = b - a;
-                hts_itr_t* itr = sam_itr_queryi(idx, wanted_[order[a]].mtid, wanted_[order[a]].mpos, wanted_[order[b - 1]].mpos + 1);
-                if (itr != nullptr) {
-                    int r = 0;
-                    while (left > 0 && (r = sam_itr_next(again.fp, itr, again.rec)) >= 0) {
-                        const auto it = group.find(bam_get_qname(again.rec));
-                        if (it == group.end()) continue;
-                        for (const std::size_t i : it->second)
-                            if (!found[i] && again.rec->core.pos == wanted_[i].mpos && mate_of(again.rec, wanted_[i])) {
-                                found[i] = 1;
-                                mates[i] = read_of(again.rec);
-                                --left;
-                                break;
-                            }
-                    }
-                    hts_itr_destroy(itr);
-                    if (left > 0 && r < -1) { hts_idx_destroy(idx); throw std::runtime_error("recruit: " + path_ + ": cannot read a record while fetching mates"); }
-                }
+                queries.emplace_back(a, b);
                 a = b;
             }
-            hts_idx_destroy(idx);
+            // the queries are independent: each thread takes a run of them in genome order, with its own file and
+            // index, and fills the slots of its mates; they are delivered in the reads' order once all are done
+            const std::size_t n = std::max<std::size_t>(1, std::min(o_.fetch_threads, queries.size()));
+            std::vector<std::size_t> cut{0};
+            for (std::size_t t = 1; t < n; ++t) {   // about as many mates per thread
+                std::size_t q = cut.back();
+                while (q < queries.size() && queries[q].first < order.size() * t / n) ++q;
+                cut.push_back(q);
+            }
+            cut.push_back(queries.size());
+            std::vector<std::exception_ptr> errors(n);
+            auto work = [&](std::size_t t) {
+                try {
+                    HtsFile f(path_, o_, nullptr);
+                    hts_idx_t* idx = sam_index_load(f.fp, path_.c_str());
+                    if (idx == nullptr) throw std::runtime_error("recruit: " + path_ + ": cannot load the index");
+                    std::unordered_map<std::string, std::vector<std::size_t>> group;   // a query's wanted reads, by name
+                    for (std::size_t q = cut[t]; q < cut[t + 1]; ++q) {
+                        const auto [a, b] = queries[q];
+                        group.clear();
+                        for (std::size_t k = a; k < b; ++k) group[wanted_[order[k]].name].push_back(order[k]);
+                        std::size_t left = b - a;
+                        hts_itr_t* itr = sam_itr_queryi(idx, wanted_[order[a]].mtid, wanted_[order[a]].mpos, wanted_[order[b - 1]].mpos + 1);
+                        if (itr == nullptr) continue;
+                        int r = 0;
+                        while (left > 0 && (r = sam_itr_next(f.fp, itr, f.rec)) >= 0) {
+                            const auto it = group.find(bam_get_qname(f.rec));
+                            if (it == group.end()) continue;
+                            for (const std::size_t i : it->second)
+                                if (!found[i] && f.rec->core.pos == wanted_[i].mpos && mate_of(f.rec, wanted_[i])) {
+                                    found[i] = 1;
+                                    mates[i] = read_of(f.rec);
+                                    --left;
+                                    break;
+                                }
+                        }
+                        hts_itr_destroy(itr);
+                        if (left > 0 && r < -1) {
+                            hts_idx_destroy(idx);
+                            throw std::runtime_error("recruit: " + path_ + ": cannot read a record while fetching mates");
+                        }
+                    }
+                    hts_idx_destroy(idx);
+                } catch (...) {
+                    errors[t] = std::current_exception();
+                }
+            };
+            std::vector<std::unique_ptr<BigStackThread>> pool;
+            for (std::size_t t = 1; t < n; ++t) pool.push_back(std::make_unique<BigStackThread>([&work, t] { work(t); }));
+            work(0);
+            for (auto& th : pool) th->join();
+            for (const auto& e : errors) if (e) std::rethrow_exception(e);
             for (std::size_t i = 0; i < wanted_.size(); ++i)   // in the order the reads came, as before
                 if (found[i]) deliver(wanted_[i], std::move(mates[i]));
         }
@@ -542,7 +758,7 @@ private:
         for (std::size_t i = 0; i < wanted_.size(); ++i)
             if (!found[i]) rest.emplace(wanted_[i].name, i);   // no index, no mate place, or stale mate fields
         if (!rest.empty()) {
-            if (o_.log) o_.log("input: " + path_ + "; second pass for mates: " + std::to_string(rest.size()) + (idx == nullptr ? " (no index)" : " (not where the index put them)"));
+            if (o_.log) o_.log("input: " + path_ + "; second pass for mates: " + std::to_string(rest.size()) + (indexed ? " (not where the index put them)" : " (no index)"));
             HtsFile pass(path_, o_, &pool_);
             while (!rest.empty() && pass.read()) {
                 const auto it = rest.find(bam_get_qname(pass.rec));
@@ -608,6 +824,18 @@ private:
     std::vector<Wanted> wanted_;
     std::deque<Fragment> ready_;
     InputStats st_;
+    // the pipeline
+    std::mutex mu_;
+    std::condition_variable cv_;
+    std::vector<std::unique_ptr<Chunk>> chunks_;
+    std::deque<Chunk*> free_, todo_;
+    std::map<std::uint64_t, Chunk*> done_;
+    std::unique_ptr<BigStackThread> producer_;
+    std::vector<std::unique_ptr<BigStackThread>> workers_;
+    bool started_ = false, stopped_ = false, stop_ = false, produced_ = false;
+    std::uint64_t next_id_ = 0;
+    Chunk* cur_ = nullptr;
+    std::size_t cur_pos_ = 0;
 };
 
 }  // namespace
