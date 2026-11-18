@@ -38,7 +38,7 @@ namespace fs = std::filesystem;
 
 constexpr std::size_t kK = 31, kS = 11;
 constexpr std::uint64_t kMagic = 0x3130305850585650ULL;   // "PVPXP001"
-constexpr std::uint64_t kVersion = 12;   // 2: decoy windows stop at the locus; 3: clusters split at it; 4: S per haplotype; 5: calibration; 6: its decoy pairs cross window edges; 7: locus pieces off the located copies; 8: and past estimated ends; 9: and everywhere for a locus with array pieces outside; 10: stretches reach contig ends; 11: pieces tied to the locus, short contigs whole, no decoys in pieces; 12: copies walked out from their anchors
+constexpr std::uint64_t kVersion = 13;   // 2: decoy windows stop at the locus; 3: clusters split at it; 4: S per haplotype; 5: calibration; 6: its decoy pairs cross window edges; 7: locus pieces off the located copies; 8: and past estimated ends; 9: and everywhere for a locus with array pieces outside; 10: stretches reach contig ends; 11: pieces tied to the locus, short contigs whole, no decoys in pieces; 12: copies walked out from their anchors; 13: across repeats
 const std::size_t kLengths[] = {100, 150, 250, 1000, 10000};
 constexpr std::size_t kWindowStep = 25;
 // A stretch of a genome is a piece of the locus when, over every window of this many bases in it, this
@@ -49,9 +49,10 @@ constexpr std::uint64_t kPieceWindow = 5000;
 constexpr double kPieceDensity = 0.95;
 // A located copy is certain between its outermost inside anchors; past them its ends are estimated, and may
 // overshoot into flank. From the anchored stretch the copy is walked out over windows of this many k-mer starts
-// in which this share are the locus's (repeats left out): a copy's own sequence, new alleles and all, keeps it
-// up, a flank holds almost none. Reference anchors cluster where a locus is like the reference, so at a locus
-// whose haplotypes differ from it most of each copy lies past them.
+// in which this share are the locus's: a copy's own sequence, new alleles and all, keeps it up, a flank holds
+// almost none. Repeats count only to cross from one stretch of the locus to the next. Reference anchors cluster
+// where a locus is like the reference, so at a locus whose haplotypes differ from it most of each copy lies past
+// them.
 constexpr std::uint64_t kWalkWindow = 1000;
 constexpr double kWalkDensity = 0.5;
 // A locus is looked for in every genome when this share of its k-mers are tandem (this many copies or more
@@ -63,14 +64,18 @@ constexpr std::uint64_t kTandemOutside = 10;
 constexpr double kTandemShare = 0.005;
 
 // A located copy walked out from its anchored stretch [inner_start, inner_end) through the stretches dense in the
-// locus's k-mers (kWalkWindow, kWalkDensity; repeats, above `repeat_above` background copies, left out), within
-// [start, end). `hits` are the locus's k-mer occurrences in the span (position, k-mer), sorted by position.
+// locus's k-mers (kWalkWindow, kWalkDensity), within [start, end). Repeats (above `repeat_above` background copies)
+// do not carry the walk on their own: a stretch dense only with them joins the copy when locus sequence goes on past
+// it (a repeat element inside the locus), not when it only runs on into the flank. `hits` are the locus's k-mer
+// occurrences in the span (position, k-mer), sorted by position.
 std::pair<std::uint64_t, std::uint64_t> walk_out(const std::vector<std::pair<std::uint64_t, std::uint32_t>>& hits,
                                                  const std::vector<std::uint64_t>& counts, std::uint64_t repeat_above,
                                                  std::uint64_t start, std::uint64_t end, std::uint64_t inner_start, std::uint64_t inner_end) {
-    std::vector<std::uint64_t> p;
-    for (const auto& [pos, i] : hits)
+    std::vector<std::uint64_t> p, all;   // positions of the locus's k-mers: repeats left out, and all of them
+    for (const auto& [pos, i] : hits) {
+        if (all.empty() || all.back() != pos) all.push_back(pos);
         if (counts[i] <= repeat_above && (p.empty() || p.back() != pos)) p.push_back(pos);
+    }
     std::uint64_t lo = inner_start, hi = inner_end;
     if (end < start + kK || p.empty()) return {lo, hi};
     const std::uint64_t starts = end - start - kK + 1;
@@ -79,23 +84,33 @@ std::pair<std::uint64_t, std::uint64_t> walk_out(const std::vector<std::pair<std
         return {lo, hi};
     }
     const std::size_t need = static_cast<std::size_t>(std::ceil(kWalkDensity * static_cast<double>(kWalkWindow)));
-    std::vector<std::pair<std::uint64_t, std::uint64_t>> dense;   // the union of the windows holding enough of them
-    for (std::size_t i = 0, j = 0; i < p.size(); ++i) {
-        if (j < i) j = i;
-        while (j < p.size() && p[j] < p[i] + kWalkWindow) ++j;
-        if (j - i < need) continue;
-        const std::uint64_t ws = p[i], we = p[j - 1] + kK;
-        if (!dense.empty() && ws <= dense.back().second) dense.back().second = std::max(dense.back().second, we);
-        else dense.emplace_back(ws, we);
-    }
-    for (bool grown = true; grown;) {   // stretches touching the copy join it
+    auto dense_of = [&](const std::vector<std::uint64_t>& q) {   // the union of the windows holding enough of them
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> dense;
+        for (std::size_t i = 0, j = 0; i < q.size(); ++i) {
+            if (j < i) j = i;
+            while (j < q.size() && q[j] < q[i] + kWalkWindow) ++j;
+            if (j - i < need) continue;
+            const std::uint64_t ws = q[i], we = q[j - 1] + kK;
+            if (!dense.empty() && ws <= dense.back().second) dense.back().second = std::max(dense.back().second, we);
+            else dense.emplace_back(ws, we);
+        }
+        return dense;
+    };
+    const auto dense = dense_of(p), bridges = dense_of(all);   // a stretch of `dense` lies within one of `bridges`
+    auto touch = [](std::uint64_t a, std::uint64_t b, std::uint64_t c, std::uint64_t d) { return a <= d && b >= c; };
+    for (bool grown = true; grown;) {   // stretches touching the copy, or reached from it across repeats, join it
         grown = false;
-        for (const auto& [a, b] : dense)
-            if (a <= hi && b >= lo && (a < lo || b > hi)) {
+        for (const auto& [a, b] : dense) {
+            if (a >= lo && b <= hi) continue;
+            bool reach = touch(a, b, lo, hi);
+            for (std::size_t k = 0; !reach && k < bridges.size(); ++k)
+                reach = touch(bridges[k].first, bridges[k].second, lo, hi) && touch(bridges[k].first, bridges[k].second, a, b);
+            if (reach) {
                 lo = std::min(lo, a);
                 hi = std::max(hi, b);
                 grown = true;
             }
+        }
     }
     return {std::max(lo, start), std::min(hi, end)};
 }

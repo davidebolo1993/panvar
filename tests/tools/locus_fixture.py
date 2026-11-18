@@ -171,3 +171,25 @@ with open(os.path.join(out, "ends", "locus.gfa"), "w") as f:
     f.write(f"S\t1\t{ref3[ls3:le3]}\nS\t2\t{hap_d}\n")
     f.write(f"P\tref#1#chr1:{ls3}-{le3}\t1+\t*\n")
     f.write(f"P\tgd#1#chr1:{ls3}-{le3}\t2+\t*\n")
+
+# rep/: the locus of ends/ with a 3 kb repeat element (20 copies elsewhere) between its anchored middle and a 6 kb
+# end that differs from the reference: the walk crosses the repeat to that end. The same element right past the
+# locus's other end, in the flank, is not crossed: no locus sequence follows it.
+os.makedirs(os.path.join(out, "rep"), exist_ok=True)
+ref4 = list(seq(400000))
+ls4, le4 = 120000, 160000
+element = seq(3000)
+ref4[ls4 + 6000:ls4 + 9000] = list(element)
+for i in range(10):
+    a = 200000 + i * 15000
+    ref4[a:a + 3000] = list(element)
+ref4 = "".join(ref4)
+hap_r = mutate(ref4[ls4:ls4 + 6000], 0.3) + ref4[ls4 + 6000:le4 - 6000] + mutate(ref4[le4 - 6000:le4], 0.3)
+far = "".join(seq(2000) + element for _ in range(10))
+write("rep/ref", [("chr1", ref4)])
+write("rep/gr", [("chr1", ref4[:ls4] + hap_r + element + ref4[le4:]), ("x", far)])
+with open(os.path.join(out, "rep", "locus.gfa"), "w") as f:
+    f.write("H\tVN:Z:1.0\n")
+    f.write(f"S\t1\t{ref4[ls4:le4]}\nS\t2\t{hap_r}\n")
+    f.write(f"P\tref#1#chr1:{ls4}-{le4}\t1+\t*\n")
+    f.write(f"P\tgr#1#chr1:{ls4}-{le4}\t2+\t*\n")

@@ -113,6 +113,13 @@ check "array stubs at contig ends count as the locus ($(pieces idx_ends/locus.in
 walk() { awk -F'\t' '$1=="span" && $2=="gd" {print $8 "-" $9 ":" $10 "-" $11}' "$1"; }
 check "a copy anchored in its middle is walked out to its ends ($(walk idx_walk/locus.index.tsv))" '[[ $rc -eq 0 && "$(walk idx_walk/locus.index.tsv)" =~ ^1[23][0-9]{4}-1[45][0-9]{4}:120000-160000$ ]]'
 check "its ends' k-mers stay private, none demoted; the far copy's are shared" '[[ $(field idx_walk/locus.index.tsv span_demoted) == 0 ]] && python3 "$TOOLS/locus_outside.py" idx_walk/locus.index.tsv dump_walk.tsv 8 data/ends/ref.fa data/ends/gd.fa > brute_walk.txt && awk -F"\t" '"'"'NR>1 && $2=="S" {s++} NR>1 && $2=="P" {p++} END {exit !(s>1900 && s<2100 && p>55000)}'"'"' dump_walk.tsv'
+# a repeat element between the anchored middle and a differing end is crossed; the same element in the flank is not
+"$BIN" background -t 2 --partitions 64 --memory 64M -q --tmp-dir "$OUT/tmp" -o s_rep --genome ref=data/rep/ref.fa --genome gr=data/rep/gr.fa --coordinate-reference ref
+"$BIN" recruit -t 2 -q --background s_rep -r ref --index-only --save-index idx_rep --locus data/rep/locus.gfa; rc=$?
+"$BIN" recruit --dump-index idx_rep/locus.plx=dump_rep.tsv
+rwalk() { awk -F'\t' '$1=="span" && $2=="gr" {print $8 "-" $9 ":" $10 "-" $11}' "$1"; }
+check "a copy is walked across a repeat inside it, not into one past its end ($(rwalk idx_rep/locus.index.tsv))" '[[ $rc -eq 0 && "$(rwalk idx_rep/locus.index.tsv)" =~ :120000-160000$ ]]'
+check "the end past the repeat stays private" '[[ $(field idx_rep/locus.index.tsv span_demoted) == 0 ]] && python3 "$TOOLS/locus_outside.py" idx_rep/locus.index.tsv dump_rep.tsv 8 data/rep/ref.fa data/rep/gr.fa > brute_rep.txt'
 "$BIN" recruit -t 4 -q --background s_split -r ref --index-only --save-index idx_split4 --locus data/split/locus.gfa
 "$BIN" recruit --dump-index idx_split4/locus.plx=dump_split4.tsv
 check "the piece scan on 4 threads gives the same index" 'cmp -s dump_split.tsv dump_split4.tsv'
