@@ -328,7 +328,7 @@ ReadStats recruit_reads(const ReadOptions& options) {
         std::snprintf(b, sizeof b, "%.4f", o.error_rate);
         log(std::string("error rate: ") + b + " (" + st.error_source + ")");
     }
-    // each locus's private-site cut: calibrated for the run's read class (from the first reads), or the given
+    // each locus's private-site cut: calibrated for the run's read class (the preset's, or from the first reads), or the given
     // one when the run scores by other rules than the calibration did
     std::vector<std::string> cut_note(loci.size());
     {
@@ -345,7 +345,7 @@ ReadStats recruit_reads(const ReadOptions& options) {
             if (!o.calibrated_cut) {
                 note = std::to_string(o.min_sites) + " given";
             } else {
-                const Cut c = calibrated_cut(calibration[li], mean, o.error_rate, o.false_certain_rate);
+                const Cut c = calibrated_cut(calibration[li], o.read_class, mean, o.error_rate, o.false_certain_rate);
                 if (c.by == nullptr) {
                     note = std::to_string(o.min_sites) + " (the index carries no calibration)";
                 } else if (c.min_sites == 0) {

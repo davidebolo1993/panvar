@@ -54,13 +54,15 @@ void print_recruit_help() {
         << "  -o, --out <tsv>                 One row per screened fragment and locus: fate, reason, each mate's\n"
         << "                                  locus segment, the evidence and the graph nodes\n"
         << "      --false-certain-rate <r>    Per locus, the lowest calibrated private-site cut (at least 2) whose\n"
-        << "                                  off-target reads are certain at most at this rate (default 1e-6)\n"
+        << "                                  off-target reads are certain at most at this rate (default 1e-4)\n"
         << "      --min-sites <N>             One private-site cut for every locus instead\n"
         << "      --error-rate <e>            The reads' error rate per base (default: from base qualities); a read\n"
         << "                                  whose own qualities say more errors is held to its own rate\n"
         << "      --decoy-share-long <r>      Decoy sites tolerated per private site in reads of 1 kb or more (default\n"
         << "                                  0.25; 0.05 in shorter reads)\n"
-        << "      --preset <p>                The error rate of illumina (0.002), hifi (0.001), ont (0.03) or clr (0.1)\n"
+        << "      --preset <p>                The read type, illumina, hifi or ont: its calibration class and error\n"
+        << "                                  rate (0.002, 0.001, 0.03; --error-rate overrides). Corrected long reads\n"
+        << "                                  are hifi, any other long reads ont\n"
         << "      --reads-out <dir>           The recruited reads as gzip FASTQ, per locus and fate\n"
         << "      --certain-only              With --reads-out: certain reads only\n"
         << "      --summary <tsv>             The run's summary (default: beside -o, .summary.tsv)\n\n"
@@ -147,11 +149,10 @@ int run_recruit_command(const std::vector<std::string>& args) {
         else if (a == "--decoy-share-long") ro.decoy_share_long = parse_number(a, value());
         else if (a == "--preset") {
             const std::string p = value();
-            if (p == "illumina") preset_rate = 0.002;
-            else if (p == "hifi") preset_rate = 0.001;
-            else if (p == "ont") preset_rate = 0.03;
-            else if (p == "clr") preset_rate = 0.1;
-            else throw std::runtime_error("--preset is illumina, hifi, ont or clr");
+            if (p == "illumina") preset_rate = 0.002, ro.read_class = "short";
+            else if (p == "hifi") preset_rate = 0.001, ro.read_class = "hifi";
+            else if (p == "ont") preset_rate = 0.03, ro.read_class = "ont";
+            else throw std::runtime_error("--preset is illumina, hifi or ont");
         } else if (a == "--reads-out") ro.reads_out = value();
         else if (a == "--certain-only") ro.reads_ambiguous = false;
         else if (a == "--summary") summary = value();

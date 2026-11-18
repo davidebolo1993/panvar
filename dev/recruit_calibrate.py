@@ -111,7 +111,7 @@ def main():
             continue
         ok = [r for r in t if r["upper95_per_million"] <= a.target]
         best = max(ok or t, key=lambda r: (r["recall"], -r["upper95_per_million"]))
-        default = next(r for r in t if (r["min_sites"], r["min_density"], r["decoy_share"]) == (2, 0.05, 0.05))
+        default = next(r for r in t if (r["min_sites"], r["min_density"], r["decoy_share"]) == (2, 0.0, 0.05))
         for label, r in (("best", best), ("default", default)):
             print(f"{tech}\t{label} ({r['min_sites']}, {r['min_density']}, {r['decoy_share']})\t{r['recall']:.4f}\t"
                   f"{r['false_certain']} / {r['negatives']}\t{r['upper95_per_million']:.2f}\t{'yes' if r['upper95_per_million'] <= a.target else 'no'}")

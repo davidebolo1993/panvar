@@ -147,27 +147,26 @@ struct Bar {
 
 bool divergent(const Evidence& v, const Bar& b) { return static_cast<double>(v.runs_n) > tolerated_runs(v.seg_kmers, b.error); }
 
-bool is_certain(const Evidence& v, const ReadOptions& o, std::uint32_t min_sites, const Bar& b) {
+bool is_certain(const Evidence& v, std::uint32_t min_sites, const Bar& b) {
     if (v.seg_kmers == 0 || uncallable(v) || divergent(v, b)) return false;
-    return v.sites_p >= min_sites && v.sites_d <= b.decoy_share * v.sites_p &&
-           v.sites_p >= o.min_density * static_cast<double>(v.seg_kmers) / static_cast<double>(kK);
+    return v.sites_p >= min_sites && v.sites_d <= b.decoy_share * v.sites_p;
 }
 
 // A fragment's fate. The pair's pooled evidence decides; failing that, one mate certain on its own makes
 // the pair certain too ("rescued"): the mates lie an insert apart, so the other one is in the locus or its
 // flank. Certain fragments with a mate outside every segment are rescued, with a mate partly outside partial.
-void decide(Row& r, const Evidence& one, const Evidence* two, const char* status[2], const ReadOptions& o, std::uint32_t min_sites,
+void decide(Row& r, const Evidence& one, const Evidence* two, const char* status[2], std::uint32_t min_sites,
             const Bar& b) {
     const Evidence& v = r.ev;
     // pooled evidence decides a pair only with a mate wholly in the locus: two mates that both leave it
     // would pool islands (a pair across an edge has a mate inside unless the mates overlap)
-    const bool pooled = is_certain(v, o, min_sites, b) &&
+    const bool pooled = is_certain(v, min_sites, b) &&
                         (two == nullptr || std::string(status[0]) == "in" || std::string(status[1]) == "in");
     // one mate certain on its own carries the pair unless the other leans to a homolog (more decoy sites
     // than private ones) away from a locus edge; at an edge (the certain mate runs out of the locus) the
     // other mate may well be in a homologous flank
     auto carries = [&](const Evidence& mine, const Evidence& other, const char* my_status) {
-        return is_certain(mine, o, min_sites, b) &&
+        return is_certain(mine, min_sites, b) &&
                (other.sites_d + other.decoy_out <= other.sites_p || std::string(my_status) == "part");
     };
     const bool alone = two != nullptr && (carries(one, *two, status[0]) || carries(*two, one, status[1]));
@@ -183,7 +182,8 @@ void decide(Row& r, const Evidence& one, const Evidence* two, const char* status
     if (v.sites_p >= 1 && decoy >= 1) { r.fate = "ambiguous"; r.reason = "conflict"; return; }
     if (uncallable(v) && v.sites_p >= 1) { r.fate = "ambiguous"; r.reason = "uncallable"; return; }
     if (divergent(v, b) && v.sites_p >= 1) { r.fate = "ambiguous"; r.reason = "divergent"; return; }
-    if (v.sites_p >= min_sites) { r.fate = "ambiguous"; r.reason = "sparse"; return; }
+    // enough sites together, but both mates leave the locus, so their evidence is not pooled (see above)
+    if (v.sites_p >= min_sites) { r.fate = "ambiguous"; r.reason = "mates_out"; return; }
     if (v.sites_p >= 1) { r.fate = "ambiguous"; r.reason = "single_site"; return; }
     if (v.n_s >= 1) { r.fate = "ambiguous"; r.reason = "shared_only"; return; }
     r.fate = "unrecruited";
@@ -291,11 +291,11 @@ Row score_fragment(const Fragment& fr, const LocusTable& t, std::uint32_t li, co
         *certain_through = 0;
         for (std::uint32_t m = kMaxCut; m >= 1 && *certain_through == 0; --m) {
             Row x = r;
-            decide(x, ev[0], pair ? &ev[1] : nullptr, status, o, m, bar);
+            decide(x, ev[0], pair ? &ev[1] : nullptr, status, m, bar);
             if (x.fate[0] == 'c') *certain_through = m;
         }
     }
-    decide(r, ev[0], pair ? &ev[1] : nullptr, status, o, t.min_sites ? t.min_sites : o.min_sites, bar);
+    decide(r, ev[0], pair ? &ev[1] : nullptr, status, t.min_sites ? t.min_sites : o.min_sites, bar);
     return r;
 }
 

@@ -35,10 +35,12 @@ struct Cut {
                                           // simulation was large enough to show it, not only to see none
 };
 
-// The read class nearest a run (short below 1 kb mean read length; long: hifi at an error rate up to 1%,
-// else ont) and its lowest cut, never below 2, whose observed off-target false-certain share is at most
-// `rate`. With fewer screened negatives than 1 / rate this is the lowest cut with none observed.
-Cut calibrated_cut(const std::vector<Calibration>& c, double mean_read_length, double error_rate, double rate);
+// The run's read class (`read_class`, or when empty the nearest: short below 1 kb mean read length; long:
+// hifi at an error rate up to 1%, else ont) and its lowest cut, never below 2, whose observed off-target
+// false-certain share is at most `rate`. With fewer screened negatives than 1 / rate this is the lowest cut
+// with none observed.
+Cut calibrated_cut(const std::vector<Calibration>& c, const std::string& read_class, double mean_read_length, double error_rate,
+                   double rate);
 
 // The share's one-sided 95% upper bound with `events` of `n` (Poisson).
 double upper_bound(std::uint64_t events, std::uint64_t n);

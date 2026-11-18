@@ -281,8 +281,9 @@ double upper_bound(std::uint64_t events, std::uint64_t n) {
     return std::min(1.0, u / static_cast<double>(n));
 }
 
-Cut calibrated_cut(const std::vector<Calibration>& cs, double mean_read_length, double error_rate, double rate) {
-    const std::string want = mean_read_length < 1000 ? "short" : error_rate <= 0.01 ? "hifi" : "ont";
+Cut calibrated_cut(const std::vector<Calibration>& cs, const std::string& read_class, double mean_read_length, double error_rate,
+                   double rate) {
+    const std::string want = !read_class.empty() ? read_class : mean_read_length < 1000 ? "short" : error_rate <= 0.01 ? "hifi" : "ont";
     for (const Calibration& c : cs) {
         if (c.read_class != want) continue;
         const std::uint64_t screened = c.flank_screened + c.decoy_screened;
