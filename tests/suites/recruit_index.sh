@@ -105,6 +105,14 @@ check "a locus without an array is not looked for in every genome" '! grep -q "e
 "$BIN" recruit -t 2 -q --background s_ends -r ref --index-only --save-index idx_ends --locus data/split_e/locus.gfa; rc=$?
 "$BIN" recruit --dump-index idx_ends/locus.plx=dump_ends.tsv
 check "array stubs at contig ends count as the locus ($(pieces idx_ends/locus.index.tsv))" '[[ $rc -eq 0 && "$(pieces idx_ends/locus.index.tsv)" == "ge:o:0-23700 " && $(field idx_ends/locus.index.tsv span_demoted) == 0 ]] && python3 "$TOOLS/locus_outside.py" idx_ends/locus.index.tsv dump_ends.tsv 8 data/split_e/ref.fa data/split_e/ge.fa data/split_e/gt.fa > brute_ends.txt && awk -F"\t" '"'"'NR>1 && $2!="D" {n++; p+=($2=="P")} END {exit !(n>50000 && p==n)}'"'"' dump_ends.tsv'
+# copies whose ends differ from the reference: anchored in the middle only, walked out to their ends through
+# the locus's own k-mers, which stay private; the far copy of a stretch of one end stays outside (shared)
+"$BIN" background -t 2 --partitions 64 --memory 64M -q --tmp-dir "$OUT/tmp" -o s_walk --genome ref=data/ends/ref.fa --genome gd=data/ends/gd.fa --coordinate-reference ref
+"$BIN" recruit -t 2 -q --background s_walk -r ref --index-only --save-index idx_walk --locus data/ends/locus.gfa; rc=$?
+"$BIN" recruit --dump-index idx_walk/locus.plx=dump_walk.tsv
+walk() { awk -F'\t' '$1=="span" && $2=="gd" {print $8 "-" $9 ":" $10 "-" $11}' "$1"; }
+check "a copy anchored in its middle is walked out to its ends ($(walk idx_walk/locus.index.tsv))" '[[ $rc -eq 0 && "$(walk idx_walk/locus.index.tsv)" =~ ^1[23][0-9]{4}-1[45][0-9]{4}:120000-160000$ ]]'
+check "its ends' k-mers stay private, none demoted; the far copy's are shared" '[[ $(field idx_walk/locus.index.tsv span_demoted) == 0 ]] && python3 "$TOOLS/locus_outside.py" idx_walk/locus.index.tsv dump_walk.tsv 8 data/ends/ref.fa data/ends/gd.fa > brute_walk.txt && awk -F"\t" '"'"'NR>1 && $2=="S" {s++} NR>1 && $2=="P" {p++} END {exit !(s>1900 && s<2100 && p>55000)}'"'"' dump_walk.tsv'
 "$BIN" recruit -t 4 -q --background s_split -r ref --index-only --save-index idx_split4 --locus data/split/locus.gfa
 "$BIN" recruit --dump-index idx_split4/locus.plx=dump_split4.tsv
 check "the piece scan on 4 threads gives the same index" 'cmp -s dump_split.tsv dump_split4.tsv'

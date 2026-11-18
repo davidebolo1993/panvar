@@ -155,3 +155,19 @@ write("split_c/gc", [("chr1", seq(60000)), ("p", seq(3000) + clustered(long_arra
 # holding nothing but its array (a piece), and a short contig of other sequence
 os.makedirs(os.path.join(out, "split_h"), exist_ok=True)
 write("split_h/gh", [("chr1", seq(30000)), ("s", long_array[2000:6500]), ("n", seq(3000))])
+
+# ends/: a locus whose two 10 kb ends are 30% diverged from the reference in another genome: no reference
+# anchor holds there, so that copy is anchored in its middle only and its ends are uncertain. Its own k-mers
+# there occur nowhere else, and must stay private: the copy is walked out through them. A copy of one end
+# far away on the same contig stays outside.
+os.makedirs(os.path.join(out, "ends"), exist_ok=True)
+ref3 = seq(300000)
+ls3, le3 = 120000, 160000
+hap_d = mutate(ref3[ls3:ls3 + 10000], 0.3) + ref3[ls3 + 10000:le3 - 10000] + mutate(ref3[le3 - 10000:le3], 0.3)
+write("ends/ref", [("chr1", ref3)])
+write("ends/gd", [("chr1", ref3[:ls3] + hap_d + ref3[le3:] + seq(20000) + hap_d[2000:4000] + seq(20000))])
+with open(os.path.join(out, "ends", "locus.gfa"), "w") as f:
+    f.write("H\tVN:Z:1.0\n")
+    f.write(f"S\t1\t{ref3[ls3:le3]}\nS\t2\t{hap_d}\n")
+    f.write(f"P\tref#1#chr1:{ls3}-{le3}\t1+\t*\n")
+    f.write(f"P\tgd#1#chr1:{ls3}-{le3}\t2+\t*\n")

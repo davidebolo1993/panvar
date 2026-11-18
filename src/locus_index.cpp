@@ -38,7 +38,7 @@ namespace fs = std::filesystem;
 
 constexpr std::size_t kK = 31, kS = 11;
 constexpr std::uint64_t kMagic = 0x3130305850585650ULL;   // "PVPXP001"
-constexpr std::uint64_t kVersion = 11;   // 2: decoy windows stop at the locus; 3: clusters split at it; 4: S per haplotype; 5: calibration; 6: its decoy pairs cross window edges; 7: locus pieces off the located copies; 8: and past estimated ends; 9: and everywhere for a locus with array pieces outside; 10: stretches reach contig ends; 11: pieces tied to the locus, short contigs whole, no decoys in pieces
+constexpr std::uint64_t kVersion = 12;   // 2: decoy windows stop at the locus; 3: clusters split at it; 4: S per haplotype; 5: calibration; 6: its decoy pairs cross window edges; 7: locus pieces off the located copies; 8: and past estimated ends; 9: and everywhere for a locus with array pieces outside; 10: stretches reach contig ends; 11: pieces tied to the locus, short contigs whole, no decoys in pieces; 12: copies walked out from their anchors
 const std::size_t kLengths[] = {100, 150, 250, 1000, 10000};
 constexpr std::size_t kWindowStep = 25;
 // A stretch of a genome is a piece of the locus when, over every window of this many bases in it, this
@@ -47,6 +47,13 @@ constexpr std::size_t kWindowStep = 25;
 // cluster, can be as dense.
 constexpr std::uint64_t kPieceWindow = 5000;
 constexpr double kPieceDensity = 0.95;
+// A located copy is certain between its outermost inside anchors; past them its ends are estimated, and may
+// overshoot into flank. From the anchored stretch the copy is walked out over windows of this many k-mer starts
+// in which this share are the locus's (repeats left out): a copy's own sequence, new alleles and all, keeps it
+// up, a flank holds almost none. Reference anchors cluster where a locus is like the reference, so at a locus
+// whose haplotypes differ from it most of each copy lies past them.
+constexpr std::uint64_t kWalkWindow = 1000;
+constexpr double kWalkDensity = 0.5;
 // A locus is looked for in every genome when this share of its k-mers are tandem (this many copies or more
 // within a haplotype) and left with a few copies outside the located ones (at most this many times their own
 // copy number): the mark of array pieces next to copies that look whole. A locus without an array has a few
@@ -54,6 +61,44 @@ constexpr double kPieceDensity = 0.95;
 constexpr std::uint16_t kTandemCopies = 3;
 constexpr std::uint64_t kTandemOutside = 10;
 constexpr double kTandemShare = 0.005;
+
+// A located copy walked out from its anchored stretch [inner_start, inner_end) through the stretches dense in the
+// locus's k-mers (kWalkWindow, kWalkDensity; repeats, above `repeat_above` background copies, left out), within
+// [start, end). `hits` are the locus's k-mer occurrences in the span (position, k-mer), sorted by position.
+std::pair<std::uint64_t, std::uint64_t> walk_out(const std::vector<std::pair<std::uint64_t, std::uint32_t>>& hits,
+                                                 const std::vector<std::uint64_t>& counts, std::uint64_t repeat_above,
+                                                 std::uint64_t start, std::uint64_t end, std::uint64_t inner_start, std::uint64_t inner_end) {
+    std::vector<std::uint64_t> p;
+    for (const auto& [pos, i] : hits)
+        if (counts[i] <= repeat_above && (p.empty() || p.back() != pos)) p.push_back(pos);
+    std::uint64_t lo = inner_start, hi = inner_end;
+    if (end < start + kK || p.empty()) return {lo, hi};
+    const std::uint64_t starts = end - start - kK + 1;
+    if (starts < kWalkWindow) {   // no window fits: the whole span, when dense enough over all of it
+        if (static_cast<double>(p.size()) >= kWalkDensity * static_cast<double>(starts)) return {start, end};
+        return {lo, hi};
+    }
+    const std::size_t need = static_cast<std::size_t>(std::ceil(kWalkDensity * static_cast<double>(kWalkWindow)));
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> dense;   // the union of the windows holding enough of them
+    for (std::size_t i = 0, j = 0; i < p.size(); ++i) {
+        if (j < i) j = i;
+        while (j < p.size() && p[j] < p[i] + kWalkWindow) ++j;
+        if (j - i < need) continue;
+        const std::uint64_t ws = p[i], we = p[j - 1] + kK;
+        if (!dense.empty() && ws <= dense.back().second) dense.back().second = std::max(dense.back().second, we);
+        else dense.emplace_back(ws, we);
+    }
+    for (bool grown = true; grown;) {   // stretches touching the copy join it
+        grown = false;
+        for (const auto& [a, b] : dense)
+            if (a <= hi && b >= lo && (a < lo || b > hi)) {
+                lo = std::min(lo, a);
+                hi = std::max(hi, b);
+                grown = true;
+            }
+    }
+    return {std::max(lo, start), std::min(hi, end)};
+}
 
 std::string hex64(std::uint64_t v) {
     char b[17];
@@ -496,18 +541,29 @@ std::vector<LocusIndex> build(const BuildOptions& o) {
         }
         for (std::size_t k = 0; k < iv.size(); ++k) {
             LocusWork& w = work[owner[k].first];
-            const anchors::Span& sp = w.spans[gname][owner[k].second];
-            std::uint64_t found = 0;
+            anchors::Span& sp = w.spans[gname][owner[k].second];
+            // the locus's k-mer occurrences in the span, by position
+            std::vector<std::pair<std::uint64_t, std::uint32_t>> hits;
             for (const auto& piece : pieces[k])
                 kmer::for_each_canonical_kmer(piece.seq.data(), piece.seq.size(), kK, [&](std::uint64_t c, std::size_t at, bool) {
                     const std::int64_t i = w.idx.find(c);
-                    if (i < 0) return;
-                    ++w.sub[i];
-                    ++found;
-                    const std::uint64_t pos = piece.start + at;
-                    if (pos >= sp.inner_start && pos + kK <= sp.inner_end) ++w.sub_trim[i];
+                    if (i >= 0) hits.emplace_back(piece.start + at, static_cast<std::uint32_t>(i));
                 });
-            w.idx.spans.push_back({gname, sp.contig, sp.start, sp.end, sp.forward, found});
+            std::sort(hits.begin(), hits.end());
+            const auto [lo, hi] = walk_out(hits, w.counts, static_cast<std::uint64_t>(w.idx.informative_max) * w.idx.haplotypes,
+                                           sp.start, sp.end, sp.inner_start, sp.inner_end);
+            for (const auto& [pos, i] : hits) {
+                ++w.sub[i];
+                if (pos >= lo && pos + kK <= hi) ++w.sub_trim[i];
+            }
+            GenomeSpan gs{gname, sp.contig, sp.start, sp.end, sp.forward, hits.size()};
+            gs.anchored_start = sp.inner_start;
+            gs.anchored_end = sp.inner_end;
+            gs.locus_start = lo;
+            gs.locus_end = hi;
+            w.idx.spans.push_back(std::move(gs));
+            sp.inner_start = lo;   // the piece scan's uncertain ends are those past the walked-out copy
+            sp.inner_end = hi;
         }
     }
 
@@ -1022,7 +1078,8 @@ void save(const LocusIndex& x, const std::string& path) {
         for (const auto& n : x.nodes) o.str(n);
         o.vec(x.decoy); o.vec(x.screen);
         o.u64(x.spans.size());
-        for (const auto& s : x.spans) { o.str(s.genome); o.str(s.contig); o.u64(s.start); o.u64(s.end); o.u64(s.forward); o.u64(s.subtracted); o.u64(s.piece); }
+        for (const auto& s : x.spans) { o.str(s.genome); o.str(s.contig); o.u64(s.start); o.u64(s.end); o.u64(s.forward); o.u64(s.subtracted); o.u64(s.piece);
+                                     o.u64(s.anchored_start); o.u64(s.anchored_end); o.u64(s.locus_start); o.u64(s.locus_end); }
         o.vec(x.ceilings);
         o.u64(x.dust_demoted); o.u64(x.span_demoted); o.u64(x.negative);
         o.u64(x.decoy_min_hits); o.u64(x.decoy_windows); o.u64(x.decoy_bases); o.u64(x.haplotypes);
@@ -1071,7 +1128,8 @@ LocusIndex load(const std::string& path) {
     for (auto& n : x.nodes) n = i.str();
     x.decoy = i.vec<std::uint64_t>(); x.screen = i.vec<std::uint64_t>();
     x.spans.resize(i.u64());
-    for (auto& s : x.spans) { s.genome = i.str(); s.contig = i.str(); s.start = i.u64(); s.end = i.u64(); s.forward = i.u64() != 0; s.subtracted = i.u64(); s.piece = i.u64() != 0; }
+    for (auto& s : x.spans) { s.genome = i.str(); s.contig = i.str(); s.start = i.u64(); s.end = i.u64(); s.forward = i.u64() != 0; s.subtracted = i.u64(); s.piece = i.u64() != 0;
+                                      s.anchored_start = i.u64(); s.anchored_end = i.u64(); s.locus_start = i.u64(); s.locus_end = i.u64(); }
     x.ceilings = i.vec<Ceiling>();
     x.dust_demoted = i.u64(); x.span_demoted = i.u64(); x.negative = i.u64();
     x.decoy_min_hits = static_cast<std::uint32_t>(i.u64()); x.decoy_windows = i.u64(); x.decoy_bases = i.u64(); x.haplotypes = i.u64();
@@ -1117,9 +1175,11 @@ void write_report(const LocusIndex& x, const std::string& path) {
       << "\nlocus\tpieces\t" << pieces << " (" << piece_bp << " bp)"
       << "\nlocus\tdecoys\t" << x.decoy.size() << "\nlocus\tdecoy_windows\t" << x.decoy_windows << " (" << x.decoy_bases << " bp)"
       << "\nlocus\tscreen\t" << x.screen.size() << '\n';
-    r << "span\tgenome\tcontig\tstart\tend\tstrand\tsubtracted\n";
+    r << "span\tgenome\tcontig\tstart\tend\tstrand\tsubtracted\tanchored_start\tanchored_end\tlocus_start\tlocus_end\n";
     for (const auto& s : x.spans)
-        if (!s.piece) r << "span\t" << s.genome << '\t' << s.contig << '\t' << s.start << '\t' << s.end << '\t' << (s.forward ? '+' : '-') << '\t' << s.subtracted << '\n';
+        if (!s.piece)
+            r << "span\t" << s.genome << '\t' << s.contig << '\t' << s.start << '\t' << s.end << '\t' << (s.forward ? '+' : '-') << '\t' << s.subtracted
+              << '\t' << s.anchored_start << '\t' << s.anchored_end << '\t' << s.locus_start << '\t' << s.locus_end << '\n';
     r << "piece\tgenome\tcontig\tstart\tend\tsubtracted\n";
     for (const auto& s : x.spans)
         if (s.piece) r << "piece\t" << s.genome << '\t' << s.contig << '\t' << s.start << '\t' << s.end << '\t' << s.subtracted << '\n';
