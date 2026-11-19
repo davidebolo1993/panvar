@@ -24,9 +24,12 @@ struct GraphCounts {
 };
 
 // Streams the graph's k-mer material to `push(sequence, multiplicity)` (false stops); every haplotype's
-// k-mers are produced exactly as often as in its spelled sequence.
+// k-mers are produced exactly as often as in its spelled sequence. A node longer than `chunk_bases` goes in
+// pieces overlapping by k - 1 bases; junction strings are flushed past `junction_budget` bytes. The node
+// sequences themselves are held in memory (about a byte a base).
 GraphCounts count_graph(const std::string& gfa, std::uint32_t genome, std::size_t threads,
-                        const std::function<bool(std::string, std::uint64_t)>& push);
+                        const std::function<bool(std::string, std::uint64_t)>& push,
+                        std::size_t chunk_bases = std::size_t{1} << 24, std::size_t junction_budget = std::size_t{1} << 30);
 
 // Anchors placed on every haplotype contig (indexes as in GraphCounts::contigs).
 std::vector<anchors::Hit> graph_anchors(const std::string& gfa, const anchors::AnchorLookup& lookup, std::uint32_t genome,

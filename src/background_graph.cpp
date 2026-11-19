@@ -179,7 +179,8 @@ std::uint64_t acgt_of(const Graph& g, std::uint32_t v) {
 
 }  // namespace
 
-GraphCounts count_graph(const std::string& gfa, std::uint32_t, std::size_t, const std::function<bool(std::string, std::uint64_t)>& push) {
+GraphCounts count_graph(const std::string& gfa, std::uint32_t, std::size_t, const std::function<bool(std::string, std::uint64_t)>& push,
+                        std::size_t chunk_bases, std::size_t junction_budget) {
     const Graph g = load_nodes(gfa);
     GraphCounts out;
     out.checksum = g.checksum;
@@ -187,7 +188,8 @@ GraphCounts count_graph(const std::string& gfa, std::uint32_t, std::size_t, cons
     std::vector<std::uint64_t> traversals(nodes, 0);
     std::unordered_map<std::string, std::uint64_t> junctions;
     std::size_t junction_bytes = 0;
-    constexpr std::size_t kJunctionBudget = std::size_t{1} << 30;
+    const std::size_t kJunctionBudget = std::max<std::size_t>(std::size_t{16} << 20, junction_budget);
+    const std::size_t chunk = std::max<std::size_t>(chunk_bases, 2 * kK);
     bool stopped = false;
     auto flush_junctions = [&] {
         for (auto& [key, n] : junctions) {
@@ -220,7 +222,9 @@ GraphCounts count_graph(const std::string& gfa, std::uint32_t, std::size_t, cons
     for (std::uint32_t v = 0; v < nodes && !stopped; ++v) {
         if (traversals[v] == 0) continue;
         out.bases += acgt_of(g, v) * traversals[v];
-        if (g.len(v) >= kK && !push(g.seq.substr(g.start[v], g.len(v)), traversals[v])) stopped = true;
+        // a long node in pieces overlapping by k - 1 bases: each k-mer lies wholly in exactly one
+        for (std::uint64_t a = g.start[v], e = g.start[v + 1]; a + kK <= e && !stopped; a += chunk - (kK - 1))
+            if (!push(g.seq.substr(a, std::min<std::uint64_t>(chunk, e - a)), traversals[v])) stopped = true;
     }
     return out;
 }

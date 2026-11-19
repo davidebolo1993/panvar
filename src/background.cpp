@@ -954,7 +954,7 @@ SegmentStats build_segment(const BuildOptions& o) {
                             it.genome = static_cast<std::uint32_t>(gi);
                             it.anchors = false;
                             return queue.push(std::move(it));
-                        });
+                        }, chunk_bases, o.memory_bytes / 8);
                     if (aborted_run) break;
                     checksum = gc.checksum;
                     genome_bases = gc.bases;
@@ -1278,11 +1278,19 @@ SegmentStats merge_range(const MergeRangeOptions& o) {
     PartsWriter writer(o.out_path, partitions, o.first, o.end);
     std::mutex bar_m;
     cli::ProgressBar bar(o.progress ? cli::log_prefix("background") + "merging partitions" : std::string(), o.end - o.first);
+    bool warned = false;
     parallel_for(o.end - o.first, o.threads, [&](std::size_t i) {
         std::vector<std::uint64_t> codes, cnt;
         merge_partition(raw, o.first + static_cast<std::uint32_t>(i), [&](std::uint64_t c, std::uint64_t n) { codes.push_back(c); cnt.push_back(n); });
+        // a partition is held whole while it is encoded (codes, counts and their encoding: about 40 bytes a k-mer)
+        const std::uint64_t held = codes.size() * 40;
         writer.put(o.first + static_cast<std::uint32_t>(i), codes, cnt);
         std::lock_guard<std::mutex> lk(bar_m);
+        if (!warned && o.memory_bytes > 0 && o.log && held > o.memory_bytes / std::max<std::size_t>(1, o.threads)) {
+            warned = true;
+            o.log("warning: merge: partition " + std::to_string(o.first + i) + " holds " + std::to_string(codes.size()) + " k-mers; encoding it took " +
+                  std::to_string(held >> 20) + " MB, more than a thread's share of --memory: a store with more partitions needs less");
+        }
         bar.tick();
     });
     bar.done();

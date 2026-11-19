@@ -345,6 +345,7 @@ public:
 private:
     static constexpr std::int64_t kNear = 100000;   // a mate this far ahead is waited for
     static constexpr std::int64_t kFetchGap = 200000;   // CRAM mates this close are fetched by one query
+    static constexpr double kStaleShare = 0.1;   // more mates than this missing from their places: stale mate fields, read again
     static constexpr std::size_t kHoldMax = 2000000;  // reads waiting for mates in an unsorted file before going lean
     struct Read {
         std::string seq, qual;
@@ -360,12 +361,14 @@ private:
         bool candidate = false;   // kept because it hits a screen (else waiting for a near mate, unscreened)
         std::int32_t mtid = -1;
         std::int64_t mpos = -1;
+        bool mate_unmapped = false;
     };
     struct Wanted {   // a kept read whose mate must be fetched
         std::string name, seq, qual;
         bool read1 = true;
         std::int32_t mtid = -1;
         std::int64_t mpos = -1;
+        bool mate_unmapped = false;   // flagged so: a file of mapped reads may not hold the mate at all
     };
 
     // A record's fields that take() uses, prepared off the pairing thread.
@@ -399,6 +402,7 @@ private:
         std::vector<Rec> out;
     };
     static constexpr std::size_t kChunk = 4096;
+    static constexpr std::size_t kChunkBytes = std::size_t{32} << 20;   // a chunk of long reads stops here: memory, not records
     void start_pipeline() {
         started_ = true;
         const std::size_t workers = std::max<std::size_t>(1, o_.parse_threads);
@@ -439,8 +443,10 @@ private:
             c->last = false;
             c->error = nullptr;
             try {
-                while (c->n < kChunk) {
+                std::size_t bytes = 0;
+                while (c->n < kChunk && bytes < kChunkBytes) {
                     if (!file_->read(c->recs[c->n])) { c->last = true; break; }
+                    bytes += static_cast<std::size_t>(c->recs[c->n]->l_data);
                     ++c->n;
                 }
             } catch (...) {
@@ -542,6 +548,7 @@ private:
         h.read1 = read1;
         h.mtid = r.mtid;
         h.mpos = r.mpos;
+        h.mate_unmapped = r.flag & BAM_FMUNMAP;
         if (!coordinate_) {
             if (lean_) {   // holding too much already: only a read that hits a screen is kept, its mate fetched later
                 if (o_.screened(h.seq)) {
@@ -564,7 +571,7 @@ private:
         const bool mate_unplaced = h.mtid < 0 || h.mpos < 0 || tid < 0;
         const bool behind = !mate_unplaced && (h.mtid < tid || (h.mtid == tid && h.mpos < pos));
         if (behind) {   // its mate passed and was not kept: it did not hit; this one decides the pair
-            if (o_.screened(h.seq)) wanted_.push_back({std::move(name), std::move(h.seq), std::move(h.qual), read1, h.mtid, h.mpos});
+            if (o_.screened(h.seq)) wanted_.push_back({std::move(name), std::move(h.seq), std::move(h.qual), read1, h.mtid, h.mpos, h.mate_unmapped});
             else ++st_.unscreened;
             return;
         }
@@ -595,7 +602,7 @@ private:
             const bool known = h.mtid >= 0 && h.mpos >= 0;
             const bool passed = pos < 0 ? h.mtid != tid : (h.mtid < tid || (h.mtid == tid && h.mpos < pos));
             if (!h.candidate && known && passed) {
-                if (o_.screened(h.seq)) wanted_.push_back({it->first, std::move(h.seq), std::move(h.qual), h.read1, h.mtid, h.mpos});
+                if (o_.screened(h.seq)) wanted_.push_back({it->first, std::move(h.seq), std::move(h.qual), h.read1, h.mtid, h.mpos, h.mate_unmapped});
                 else ++st_.dropped;
                 it = held_.erase(it);
             } else {
@@ -637,7 +644,7 @@ private:
             return;
         }
         for (auto& [name, h] : held_) {
-            if (h.candidate || o_.screened(h.seq)) wanted_.push_back({name, std::move(h.seq), std::move(h.qual), h.read1, h.mtid, h.mpos});
+            if (h.candidate || o_.screened(h.seq)) wanted_.push_back({name, std::move(h.seq), std::move(h.qual), h.read1, h.mtid, h.mpos, h.mate_unmapped});
             else ++st_.dropped;
         }
         held_.clear();
@@ -674,6 +681,9 @@ private:
 
     void fetch() {
         std::vector<char> found(wanted_.size(), 0);
+        std::vector<char> queried(wanted_.size(), 0);    // its mate's place was read through the index
+        std::vector<char> filtered(wanted_.size(), 0);   // its mate is at its place, but secondary, supplementary or QC-failed
+        std::vector<char> moved(wanted_.size(), 0);      // its mate is in the file, but not at its place: stale fields
         std::vector<Read> mates(wanted_.size());
         bool indexed = false;
         {
@@ -728,17 +738,28 @@ private:
                         std::size_t left = b - a;
                         hts_itr_t* itr = sam_itr_queryi(idx, wanted_[order[a]].mtid, wanted_[order[a]].mpos, wanted_[order[b - 1]].mpos + 1);
                         if (itr == nullptr) continue;
+                        for (std::size_t k = a; k < b; ++k) queried[order[k]] = 1;
                         int r = 0;
                         while (left > 0 && (r = sam_itr_next(f.fp, itr, f.rec)) >= 0) {
                             const auto it = group.find(bam_get_qname(f.rec));
                             if (it == group.end()) continue;
-                            for (const std::size_t i : it->second)
-                                if (!found[i] && f.rec->core.pos == wanted_[i].mpos && mate_of(f.rec, wanted_[i])) {
+                            // the other read of the pair: taken at its place; seen filtered there, it is out of
+                            // the file; seen elsewhere (a query may overlap it), the mate fields are stale
+                            for (const std::size_t i : it->second) {
+                                if (found[i] || static_cast<bool>(f.rec->core.flag & BAM_FREAD2) != wanted_[i].read1) continue;
+                                const bool usable = mate_of(f.rec, wanted_[i]);
+                                if (f.rec->core.pos != wanted_[i].mpos) {
+                                    if (usable) moved[i] = 1;
+                                    continue;
+                                }
+                                if (usable) {
                                     found[i] = 1;
                                     mates[i] = read_of(f.rec);
                                     --left;
                                     break;
                                 }
+                                filtered[i] = 1;
+                            }
                         }
                         hts_itr_destroy(itr);
                         if (left > 0 && r < -1) {
@@ -759,9 +780,28 @@ private:
             for (std::size_t i = 0; i < wanted_.size(); ++i)   // in the order the reads came, as before
                 if (found[i]) deliver(wanted_[i], std::move(mates[i]));
         }
-        std::unordered_map<std::string, std::size_t> rest;   // a second pass for mates no index found
-        for (std::size_t i = 0; i < wanted_.size(); ++i)
-            if (!found[i]) rest.emplace(wanted_[i].name, i);   // no index, no mate place, or stale mate fields
+        // a second pass for mates no index can find (no index; a file not sorted by coordinate), for mates seen
+        // away from their place (stale mate fields), and for mates missing from their place only when many are.
+        // A mate seen filtered, flagged unmapped in a file of mapped reads, or without a place in a sorted file
+        // (it would have been met on the way) is not in the file: one such read must not cost a full pass.
+        std::unordered_map<std::string, std::size_t> rest;
+        std::vector<std::size_t> missing;
+        std::size_t asked = 0, out_of_file = 0;
+        for (std::size_t i = 0; i < wanted_.size(); ++i) {
+            asked += queried[i];
+            if (found[i]) continue;
+            if (!indexed || moved[i] || (!queried[i] && !coordinate_)) rest.emplace(wanted_[i].name, i);
+            else if (filtered[i] || wanted_[i].mate_unmapped || !queried[i]) ++out_of_file;
+            else missing.push_back(i);
+        }
+        if (!missing.empty() && static_cast<double>(missing.size()) > kStaleShare * static_cast<double>(asked)) {
+            for (const std::size_t i : missing) rest.emplace(wanted_[i].name, i);
+        } else {
+            out_of_file += missing.size();
+        }
+        if (o_.log && out_of_file > 0)
+            o_.log("input: " + path_ + "; mates not in the file (filtered, or absent where the index puts them): " + std::to_string(out_of_file) +
+                   "; those reads are scored alone");
         if (!rest.empty()) {
             if (o_.log) o_.log("input: " + path_ + "; second pass for mates: " + std::to_string(rest.size()) + (indexed ? " (not where the index put them)" : " (no index)"));
             HtsFile pass(path_, o_, &pool_);

@@ -34,13 +34,17 @@ constexpr std::uint64_t kSegMagic = 0x3247455352434E41ULL;   // "ANCRSEG2"
 constexpr std::size_t kPlaceBytes = 12;                      // genome u16, flags u16, contig u32, pos u32
 constexpr std::uint16_t kForward = 1, kRepeated = 2;
 
-// Streams a FASTA's contigs to `threads` workers: f(contig index, sequence). Contig names and lengths are
-// collected in file order.
+// Streams a FASTA's contigs to `threads` workers in pieces of kPieceBases overlapping by k - 1 bases (each
+// k-mer lies wholly in exactly one): f(contig index, offset of the piece in its contig, piece). At most
+// `threads` pieces wait, so memory stays near 2 x threads pieces whatever the contigs' lengths. Contig names
+// and lengths are collected in file order.
+constexpr std::size_t kPieceBases = std::size_t{8} << 20;
 void for_each_contig(const std::string& fasta, std::size_t threads, std::vector<std::string>& names, std::vector<std::uint64_t>& lengths,
-                     const std::function<void(std::uint32_t, const std::string&)>& f) {
+                     const std::function<void(std::uint32_t, std::uint64_t, const std::string&)>& f) {
     GzLineReader in(fasta);
     if (!in.ok()) throw std::runtime_error("anchors: cannot read " + fasta);
-    std::deque<std::pair<std::uint32_t, std::string>> queue;
+    struct Job { std::uint32_t contig; std::uint64_t offset; std::string seq; };
+    std::deque<Job> queue;
     std::mutex m;
     std::condition_variable not_empty, not_full;
     bool closed = false;
@@ -49,7 +53,7 @@ void for_each_contig(const std::string& fasta, std::size_t threads, std::vector<
     for (std::size_t t = 0; t < std::max<std::size_t>(1, threads); ++t)
         pool.emplace_back([&] {
             while (true) {
-                std::pair<std::uint32_t, std::string> job;
+                Job job;
                 {
                     std::unique_lock<std::mutex> lk(m);
                     not_empty.wait(lk, [&] { return !queue.empty() || closed; });
@@ -59,7 +63,7 @@ void for_each_contig(const std::string& fasta, std::size_t threads, std::vector<
                     not_full.notify_one();
                 }
                 try {
-                    f(job.first, job.second);
+                    f(job.contig, job.offset, job.seq);
                 } catch (...) {
                     std::lock_guard<std::mutex> lk(m);
                     if (!failure) failure = std::current_exception();
@@ -69,30 +73,43 @@ void for_each_contig(const std::string& fasta, std::size_t threads, std::vector<
                 }
             }
         });
-    auto push = [&](std::uint32_t id, std::string seq) {
+    auto push = [&](std::uint32_t id, std::uint64_t offset, std::string seq) {
         std::unique_lock<std::mutex> lk(m);
         not_full.wait(lk, [&] { return queue.size() < std::max<std::size_t>(1, threads) || failure; });
         if (failure) return false;
-        queue.emplace_back(id, std::move(seq));
+        queue.push_back({id, offset, std::move(seq)});
         not_empty.notify_one();
         return true;
     };
     std::string line, seq;
+    std::uint64_t offset = 0;   // of seq's first base in its contig
     bool have = false;
+    auto end_contig = [&] {   // the rest of the contig, and its length
+        lengths.push_back(offset + seq.size());
+        const bool ok = seq.size() < kK || push(static_cast<std::uint32_t>(names.size() - 1), offset, std::move(seq));
+        seq.clear();
+        offset = 0;
+        return ok;
+    };
     try {
         while (in.getline(line)) {
             if (line.empty()) continue;
             if (line[0] == '>') {
-                if (have) { lengths.push_back(seq.size()); if (!push(static_cast<std::uint32_t>(names.size() - 1), std::move(seq))) break; }
-                seq.clear();
+                if (have && !end_contig()) break;
                 const auto sp = line.find_first_of(" \t");
                 names.push_back(line.substr(1, sp == std::string::npos ? std::string::npos : sp - 1));
                 have = true;
                 continue;
             }
             seq += line;
+            if (seq.size() >= kPieceBases + kK - 1) {   // a whole piece: pass it on, keep its last k - 1 bases
+                std::string piece = seq.substr(0, kPieceBases + kK - 1);
+                seq.erase(0, kPieceBases);
+                if (!push(static_cast<std::uint32_t>(names.size() - 1), offset, std::move(piece))) break;
+                offset += kPieceBases;
+            }
         }
-        if (have && lengths.size() < names.size()) { lengths.push_back(seq.size()); push(static_cast<std::uint32_t>(names.size() - 1), std::move(seq)); }
+        if (have && lengths.size() < names.size()) end_contig();
     } catch (...) {
         std::lock_guard<std::mutex> lk(m);
         if (!failure) failure = std::current_exception();
@@ -158,11 +175,11 @@ ReferenceAnchors build_reference(const std::string& genome, const std::string& f
     std::mutex hm;
     ReferenceAnchors ref;
     ref.genome = genome;
-    for_each_contig(fasta, threads, ref.contigs, ref.contig_lengths, [&](std::uint32_t contig, const std::string& seq) {
-        if (seq.size() >= (1ULL << 32)) throw std::runtime_error("anchors: " + fasta + ": a contig of 4 Gb or more");
+    for_each_contig(fasta, threads, ref.contigs, ref.contig_lengths, [&](std::uint32_t contig, std::uint64_t offset, const std::string& seq) {
+        if (offset + seq.size() >= (1ULL << 32)) throw std::runtime_error("anchors: " + fasta + ": a contig of 4 Gb or more");
         std::vector<RefHit> local;
         kmer::for_each_closed_syncmer(seq.data(), seq.size(), kK, kS, [&](std::uint64_t c, std::size_t p, bool fwd) {
-            if (sampled(c)) local.push_back({c, contig, static_cast<std::uint32_t>(p), fwd});
+            if (sampled(c)) local.push_back({c, contig, static_cast<std::uint32_t>(offset + p), fwd});
         });
         std::lock_guard<std::mutex> lk(hm);
         hits.insert(hits.end(), local.begin(), local.end());
@@ -265,10 +282,10 @@ std::vector<Hit> map_fasta(const AnchorLookup& lookup, const std::string& fasta,
                            std::vector<std::string>& contigs, std::vector<std::uint64_t>& lengths) {
     std::vector<Hit> hits;
     std::mutex hm;
-    for_each_contig(fasta, threads, contigs, lengths, [&](std::uint32_t contig, const std::string& seq) {
-        if (seq.size() >= (1ULL << 32)) throw std::runtime_error("anchors: " + fasta + ": a contig of 4 Gb or more");
+    for_each_contig(fasta, threads, contigs, lengths, [&](std::uint32_t contig, std::uint64_t offset, const std::string& seq) {
+        if (offset + seq.size() >= (1ULL << 32)) throw std::runtime_error("anchors: " + fasta + ": a contig of 4 Gb or more");
         std::vector<Hit> local;
-        scan_anchors(lookup, seq.data(), seq.size(), 0, genome, contig, local);
+        scan_anchors(lookup, seq.data(), seq.size(), offset, genome, contig, local);
         std::lock_guard<std::mutex> lk(hm);
         hits.insert(hits.end(), local.begin(), local.end());
     });

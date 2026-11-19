@@ -45,7 +45,7 @@ Counts every 31-mer of a set of genomes once, so that `recruit` can tell, for ea
 | `--dump <path>` | every k-mer and its count, segments summed | |
 | `--verify <path>` | check that another background (store or `.sshash`) holds the same counts | |
 | `--partitions <N>` | partitions of a new store, a power of two | `4096` |
-| `--memory <size>` | memory bound for counting, such as `16G` | `2G` |
+| `--memory <size>` | memory bound for counting, such as `16G`; a partition is held whole while it is encoded (about 40 bytes a distinct k-mer), so a store needs enough `--partitions` that one fits in a thread's share (a warning says when it does not) | `2G` |
 | `--tmp-dir <dir>` | spill files | `$TMPDIR`, else inside the store (with `--segment-only`, beside the segment folder) |
 | `-t, --threads <N>` | worker threads | the CPUs available |
 | `-q, --quiet` | no progress logs | off |

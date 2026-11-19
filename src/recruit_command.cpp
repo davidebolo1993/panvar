@@ -271,13 +271,21 @@ int run_recruit_command(const std::vector<std::string>& args) {
         todo.loci.push_back(l);
     }
     if (!todo.loci.empty()) {
+        std::vector<std::string> failed;
+        todo.errors = &failed;
         const auto built = recruit::build(todo);
+        std::string why;   // the loci that failed: the others are saved first, so a rerun builds only these
         for (std::size_t i = 0; i < built.size(); ++i) {
+            if (i < failed.size() && !failed[i].empty()) { why += (why.empty() ? "" : "\n") + failed[i]; continue; }
             const std::string plx = index_path(todo.loci[i], ".plx"), tsv = index_path(todo.loci[i], ".index.tsv");
             recruit::save(built[i], plx);
             recruit::write_report(built[i], tsv);
             wrote.push_back(plx);
             wrote.push_back(tsv);
+        }
+        if (!why.empty()) {
+            log.wrote(wrote);
+            throw std::runtime_error(why + "\n(the other loci's indexes are saved)");
         }
     }
     if (!index_only) {

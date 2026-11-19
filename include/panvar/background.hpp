@@ -181,6 +181,8 @@ struct MergeRangeOptions {
     std::uint32_t first = 0, end = 0;
     std::size_t threads = 2;
     bool progress = false;            // a progress bar over the partitions (on a terminal)
+    std::uint64_t memory_bytes = 0;   // --memory: a partition is held whole while it is encoded; 0, no check
+    std::function<void(const std::string&)> log;
 };
 SegmentStats merge_range(const MergeRangeOptions& options);
 

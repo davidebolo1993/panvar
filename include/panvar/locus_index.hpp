@@ -114,6 +114,9 @@ struct BuildOptions {
     bool calibrate = true;
     std::size_t threads = 2;
     std::function<void(const std::string&)> log;
+    // Per locus, why it failed after the shared genome scans (empty: built). Given, the other loci are still
+    // returned whole; without it the first failure throws.
+    std::vector<std::string>* errors = nullptr;
 };
 
 // The key a locus index built with these options would carry (to test a saved one before building).

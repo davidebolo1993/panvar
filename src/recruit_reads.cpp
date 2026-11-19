@@ -60,7 +60,12 @@ public:
         else to.append(seq.size(), 'I');
         to += '\n';
         pending_bytes_ += header.size() + 2 * seq.size() + 6;
-        if (pending_bytes_ >= kFlushAt) flush();   // bounds memory; the pieces stay the same
+        // bounds memory; the pieces stay the same. Text short of a whole piece waits (under kPiece per file), so
+        // when a flush finds none whole, the next waits until kFlushAt more has come rather than scanning again
+        if (pending_bytes_ >= flush_at_) {
+            flush();
+            flush_at_ = pending_bytes_ + kFlushAt;
+        }
     }
     // Compresses each file's whole pieces written so far (with `all`, the rest too) and appends them.
     void flush(bool all = false) {
@@ -117,6 +122,7 @@ private:
     static constexpr std::size_t kMaxOpen = 200;
     static constexpr std::size_t kPiece = std::size_t{4} << 20;
     static constexpr std::size_t kFlushAt = std::size_t{256} << 20;   // text waiting before a flush
+    std::size_t flush_at_ = kFlushAt;
 
     static std::string gzip_member(const char* data, std::size_t size) {
         z_stream zs{};
@@ -299,22 +305,28 @@ ReadStats recruit_reads(const ReadOptions& options) {
             (s.unmatched > 0 ? "; reads without their mate: " + std::to_string(s.unmatched) : std::string()));
         source.reset();
     };
-    constexpr std::size_t kBatch = 20000;
+    constexpr std::size_t kBatch = 20000;                        // fragments in a batch at most
+    constexpr std::size_t kBatchBytes = std::size_t{1} << 30;    // and bases plus qualities: long reads fill this first
+    constexpr std::size_t kBatchStep = 1000;                     // fragments asked for at a time, to stop near the bound
     // The next batch is read while the workers score the current one.
     auto read_batch = [&](std::vector<Fragment>& batch) {   // the inputs one after another
         batch.clear();
         std::vector<Fragment> part;
-        while (batch.size() < kBatch) {
+        std::size_t bytes = 0;
+        while (batch.size() < kBatch && bytes < kBatchBytes) {
             if (!source) {
                 if (next_input == o.inputs.size()) break;
                 const auto& [a, b] = o.inputs[next_input++];
                 source = b.empty() ? open_input(a, io) : open_fastq_pair(a, b);
             }
-            if (source->next(part, kBatch - batch.size()) == 0) {
+            if (source->next(part, std::min(kBatchStep, kBatch - batch.size())) == 0) {
                 close_source();
                 continue;
             }
-            for (auto& f : part) batch.push_back(std::move(f));
+            for (auto& f : part) {
+                bytes += f.seq1.size() + f.qual1.size() + f.seq2.size() + f.qual2.size();
+                batch.push_back(std::move(f));
+            }
         }
     };
     std::vector<Fragment> batch, next;

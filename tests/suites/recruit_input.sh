@@ -95,6 +95,10 @@ if command -v samtools > /dev/null; then
   awk -F'\t' 'BEGIN {OFS = "\t"} !/^@/ && $8 > 150000 {$8 += 7} {print}' coord.sam | samtools view -b -o stale.bam - && samtools index stale.bam
   "$BIN" recruit --locus "$IDX" -i stale.bam -o stale.tsv -t 4 2> stale.log; sorted stale.tsv
   check "stale mate positions: the mates are found by a second pass, same table" 'cmp -s stale.tsv.sorted fq.tsv.sorted && grep -q "not where the index put them" stale.log'
+  # a few mates QC-failed in an indexed file: their reads are scored alone, without reading the file again
+  samtools view -b -o orphans.bam orphans.sam && samtools index orphans.bam
+  "$BIN" recruit --locus "$IDX" -i orphans.bam -o orphans_bam.tsv -t 4 2> orphans_bam.log; sorted orphans_bam.tsv; sorted orphans.tsv
+  check "QC-failed mates in an indexed file: no second pass, the same table as the SAM" '! grep -q "second pass" orphans_bam.log && grep -q "mates not in the file" orphans_bam.log && cmp -s orphans_bam.tsv.sorted orphans.tsv.sorted'
   # no mate waited for: every pair whose first read misses the screens has its mate fetched
   PANVAR_TEST_NEAR=0 "$BIN" recruit --locus "$IDX" -i coord.bam -o fetch.tsv -t 4 2> fetch.log; sorted fetch.tsv
   check "mates fetched through the index by contig and position: same table ($(grep -o 'mates fetched: [0-9]*' fetch.log))" 'cmp -s fetch.tsv.sorted fq.tsv.sorted && ! grep -q "second pass" fetch.log && [[ $(grep -o "mates fetched: [0-9]*" fetch.log | grep -o "[0-9]*$") -ge 10 ]]'

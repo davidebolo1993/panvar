@@ -16,6 +16,8 @@
 #include <cmath>
 #include <atomic>
 #include <cstdio>
+#include <cstdlib>
+#include <tuple>
 #include <cstring>
 #include <exception>
 #include <filesystem>
@@ -47,6 +49,10 @@ constexpr std::size_t kWindowStep = 25;
 // cluster, can be as dense.
 constexpr std::uint64_t kPieceWindow = 5000;
 constexpr double kPieceDensity = 0.95;
+// The piece scan looks up every kPieceSample-th k-mer start first: a window of kPieceWindow starts holding a share
+// kPieceDensity of the locus's has, at worst, all its misses on sampled starts, and still that many sampled hits
+constexpr std::uint64_t kPieceSample = 8;
+static_assert(kPieceWindow % kPieceSample == 0, "a window holds a whole number of sampled starts");
 // A located copy is certain between its outermost inside anchors; past them its ends are estimated, and may
 // overshoot into flank. From the anchored stretch the copy is walked out over windows of this many k-mer starts
 // in which this share are the locus's: a copy's own sequence, new alleles and all, keeps it up, a flank holds
@@ -178,6 +184,7 @@ struct LocusWork {
     std::vector<std::uint64_t> counts;                 // background counts per k-mer
     std::vector<std::uint64_t> sub, sub_trim;          // own occurrences in the extended / trimmed spans
     std::uint64_t ref_kmers = 0;                       // the reference path's k-mers (its interval must hold them)
+    std::string error;                                 // why this locus failed after the shared scans (empty: fine)
     std::map<std::string, std::vector<anchors::Span>> spans;   // per genome: the located copies, then the pieces
                                                                // found off them (the locus, both, from there on)
 };
@@ -542,8 +549,41 @@ std::vector<LocusIndex> build(const BuildOptions& o) {
             std::to_string(x.start) + "-" + std::to_string(x.end) + "; located in genomes: " + std::to_string(w.spans.size()));
     });
 
-    // subtraction: read every span from its genome (one file at a time, every locus at once)
-    for (const auto& [gname, ge] : genomes) {
+    // subtraction: read every span from its genome (genomes in parallel, every locus at once; what each finds is
+    // applied in genome order, so the index does not depend on the threads)
+    std::vector<FlatMap<std::uint32_t>> code_index(work.size());   // k-mer -> its index in the locus's codes
+    parallel_for(work.size(), threads, [&](std::size_t li) {
+        const auto& codes = work[li].idx.codes;
+        code_index[li].reserve(std::max<std::size_t>(codes.size(), 1));
+        for (std::size_t i = 0; i < codes.size(); ++i) {
+            bool existing = false;
+            code_index[li].slot(codes[i], existing) = static_cast<std::uint32_t>(i);
+        }
+    });
+    struct Subtracted {
+        std::vector<std::tuple<std::uint32_t, std::uint32_t, bool>> occ;   // (locus, k-mer, inside the walked-out copy)
+        std::vector<std::pair<std::size_t, GenomeSpan>> spans;
+    };
+    std::vector<std::string> gnames;
+    for (const auto& g : genomes) gnames.push_back(g.first);
+    std::vector<Subtracted> subtracted(gnames.size());
+    std::vector<char> ready(gnames.size(), 0);
+    std::size_t applied = 0;   // genomes before this one are applied: each is applied once it and all before it are done
+    std::mutex apply_mutex;
+    auto apply_ready = [&] {
+        while (applied < gnames.size() && ready[applied]) {
+            Subtracted& r = subtracted[applied++];
+            for (const auto& [li, i, trimmed] : r.occ) {
+                ++work[li].sub[i];
+                if (trimmed) ++work[li].sub_trim[i];
+            }
+            for (auto& [li, gs] : r.spans) work[li].idx.spans.push_back(std::move(gs));
+            r = Subtracted{};
+        }
+    };
+    parallel_for(gnames.size(), threads, [&](std::size_t gi) {
+        const std::string& gname = gnames[gi];
+        const bg::Genome& ge = genomes.at(gname);
         std::vector<fasta::Interval> iv;
         std::vector<std::pair<std::size_t, std::size_t>> owner;   // (locus, span)
         for (std::size_t li = 0; li < work.size(); ++li) {
@@ -554,34 +594,41 @@ std::vector<LocusIndex> build(const BuildOptions& o) {
                 owner.emplace_back(li, s);
             }
         }
-        if (iv.empty()) continue;
+        auto done = [&] {
+            std::lock_guard<std::mutex> lock(apply_mutex);
+            ready[gi] = 1;
+            apply_ready();
+        };
+        if (iv.empty()) { done(); return; }
         check_unchanged(ge);
         std::vector<std::vector<bg::graph::Haplotypes::Piece>> pieces(iv.size());   // a FASTA span is one piece
         if (is_gfa_file(ge.path)) {
             const bg::graph::Haplotypes h(ge.path);
             for (std::size_t k = 0; k < iv.size(); ++k) pieces[k] = h.fetch(iv[k].contig, iv[k].start, iv[k].end);
         } else {
-            if (!fasta::IndexedFasta::indexed(ge.path)) log("note: genome: " + ge.path + "; no .fai (and .gzi): read in full to cut its spans");
+            if (!fasta::IndexedFasta::indexed(ge.path)) {
+                std::lock_guard<std::mutex> lock(apply_mutex);
+                log("note: genome: " + ge.path + "; no .fai (and .gzi): read in full to cut its spans");
+            }
             std::vector<std::string> seqs = fasta::fetch_intervals(ge.path, iv);
             for (std::size_t k = 0; k < iv.size(); ++k) pieces[k].push_back({iv[k].start, std::move(seqs[k])});
         }
+        Subtracted& out = subtracted[gi];
         for (std::size_t k = 0; k < iv.size(); ++k) {
-            LocusWork& w = work[owner[k].first];
-            anchors::Span& sp = w.spans[gname][owner[k].second];
+            const std::size_t li = owner[k].first;
+            LocusWork& w = work[li];
+            anchors::Span& sp = w.spans.find(gname)->second[owner[k].second];   // this genome's own: no other thread
             // the locus's k-mer occurrences in the span, by position
             std::vector<std::pair<std::uint64_t, std::uint32_t>> hits;
             for (const auto& piece : pieces[k])
                 kmer::for_each_canonical_kmer(piece.seq.data(), piece.seq.size(), kK, [&](std::uint64_t c, std::size_t at, bool) {
-                    const std::int64_t i = w.idx.find(c);
-                    if (i >= 0) hits.emplace_back(piece.start + at, static_cast<std::uint32_t>(i));
+                    const std::uint32_t* i = code_index[li].find(c);
+                    if (i != nullptr) hits.emplace_back(piece.start + at, *i);
                 });
             std::sort(hits.begin(), hits.end());
             const auto [lo, hi] = walk_out(hits, w.counts, static_cast<std::uint64_t>(w.idx.informative_max) * w.idx.haplotypes,
                                            sp.start, sp.end, sp.inner_start, sp.inner_end);
-            for (const auto& [pos, i] : hits) {
-                ++w.sub[i];
-                if (pos >= lo && pos + kK <= hi) ++w.sub_trim[i];
-            }
+            for (const auto& [pos, i] : hits) out.occ.emplace_back(static_cast<std::uint32_t>(li), i, pos >= lo && pos + kK <= hi);
             // the reference's own interval must hold the reference path: a label off its sequence would subtract
             // nothing there and turn the locus's k-mers shared
             if (gname == cref && owner[k].second == 0 && hits.size() < w.ref_kmers)
@@ -593,11 +640,13 @@ std::vector<LocusIndex> build(const BuildOptions& o) {
             gs.anchored_end = sp.inner_end;
             gs.locus_start = lo;
             gs.locus_end = hi;
-            w.idx.spans.push_back(std::move(gs));
+            out.spans.emplace_back(li, std::move(gs));
             sp.inner_start = lo;   // the piece scan's uncertain ends are those past the walked-out copy
             sp.inner_end = hi;
         }
-    }
+        done();
+    });
+    apply_ready();
 
     // pieces: a genome whose copy of a locus is broken (a copy reaching a contig end, more than one copy, or
     // none) may hold more of it out of the anchors' reach, such as a tandem array cut by a contig break; a copy
@@ -670,6 +719,7 @@ std::vector<LocusIndex> build(const BuildOptions& o) {
             }
         }
         const std::size_t need = static_cast<std::size_t>(std::ceil(kPieceDensity * static_cast<double>(kPieceWindow)));
+        const std::size_t sampled_need = kPieceWindow / kPieceSample - (kPieceWindow - need);   // see kPieceSample
         // what a genome's scan finds, applied in genome order once all are scanned (genomes run in parallel)
         struct Found {
             std::vector<std::pair<std::uint32_t, std::uint32_t>> off, ends;   // (locus, k-mer): off the copies / in an uncertain end
@@ -679,14 +729,19 @@ std::vector<LocusIndex> build(const BuildOptions& o) {
                         std::size_t inner, Found& f) {
             if (seq.size() < kK) return;
             const bool whole_only = seq.size() < kPieceWindow + kK - 1;   // no window fits
-            // each locus's k-mer starts on the contig, in order: ranges scanned in parallel, joined in order
+            // each locus's k-mer starts on the contig, in order: ranges scanned in parallel, joined in order. On a
+            // contig longer than a window, only every kPieceSample-th start is looked up first; a dense window
+            // (need of kPieceWindow starts) keeps at least sampled_need of its sampled starts, so only around
+            // windows that do is every start looked up: the same stretches, an eighth of the lookups
             const std::size_t starts = seq.size() - kK + 1;
             const std::size_t parts = std::min<std::size_t>(inner, std::max<std::size_t>(1, starts / 65536));
+            const std::uint64_t step = whole_only ? 1 : kPieceSample;
             std::vector<std::vector<std::vector<std::uint64_t>>> part_hits(parts, std::vector<std::vector<std::uint64_t>>(work.size()));
             auto scan_part = [&](std::size_t p) {
                 const std::size_t a = starts * p / parts, b = starts * (p + 1) / parts;
                 if (b <= a) return;
                 kmer::for_each_canonical_kmer(seq.data() + a, b - a + kK - 1, kK, [&](std::uint64_t c, std::size_t off, bool) {
+                    if ((a + off) % step != 0) return;
                     const std::uint32_t* id = lk.find(c);
                     if (id == nullptr) return;
                     for (const std::uint32_t li : lk_owners[*id]) if (here[li]) part_hits[p][li].push_back(a + off);
@@ -697,6 +752,29 @@ std::vector<LocusIndex> build(const BuildOptions& o) {
                 if (!here[li]) continue;
                 std::vector<std::uint64_t> hits;
                 for (std::size_t p = 0; p < parts; ++p) hits.insert(hits.end(), part_hits[p][li].begin(), part_hits[p][li].end());
+                if (!whole_only) {
+                    // candidate windows from the sampled starts, widened by two windows each way (a stretch's
+                    // reach to a contig end is decided within a window of it), then every start in them
+                    std::vector<std::pair<std::uint64_t, std::uint64_t>> regions;
+                    for (std::size_t i = 0, j = 0; i < hits.size(); ++i) {
+                        if (j < i) j = i;
+                        while (j < hits.size() && hits[j] < hits[i] + kPieceWindow) ++j;
+                        if (j - i < sampled_need) continue;
+                        const std::uint64_t ra = hits[i] > 2 * kPieceWindow ? hits[i] - 2 * kPieceWindow : 0;
+                        const std::uint64_t rb = std::min<std::uint64_t>(starts, hits[i] + 3 * kPieceWindow);
+                        if (!regions.empty() && ra <= regions.back().second) regions.back().second = std::max(regions.back().second, rb);
+                        else regions.emplace_back(ra, rb);
+                    }
+                    hits.clear();
+                    for (const auto& r : regions) {
+                        const std::uint64_t ra = r.first, rb = r.second;
+                        kmer::for_each_canonical_kmer(seq.data() + ra, rb - ra + kK - 1, kK, [&](std::uint64_t c, std::size_t off, bool) {
+                            const std::uint32_t* id = lk.find(c);
+                            if (id == nullptr) return;
+                            for (const std::uint32_t x : lk_owners[*id]) if (x == li) { hits.push_back(ra + off); break; }
+                        });
+                    }
+                }
                 std::vector<std::pair<std::uint64_t, std::uint64_t>> dense;
                 if (whole_only) {
                     // a contig shorter than a window is a piece whole when at least half of its k-mer starts are the
@@ -872,9 +950,12 @@ std::vector<LocusIndex> build(const BuildOptions& o) {
             if (c == kPrivate && kmer::dust_score(x.codes[i], kK) >= x.dust) { c = kShared; ++x.dust_demoted; }
             x.cls[i] = c;
         }
-        if (x.negative > 0)
-            throw std::runtime_error("recruit: " + x.name + ": " + std::to_string(x.negative) +
-                                     " k-mers occur more often in the located copies than the background counted: a genome file differs from the one counted");
+        if (const char* f = std::getenv("PANVAR_TEST_FAIL_LOCUS"); f != nullptr && x.name == f) x.negative = std::max<std::uint64_t>(x.negative, 1);
+        if (x.negative > 0) {   // this locus fails; the others go on, their indexes are kept
+            w.error = "recruit: " + x.name + ": " + std::to_string(x.negative) +
+                      " k-mers occur more often in the located copies than the background counted: a genome file differs from the one counted";
+            log(w.error);
+        }
     }
 
     // decoys: the homologous windows of the decoy genomes around their S k-mers, outside the locus
@@ -1059,7 +1140,14 @@ std::vector<LocusIndex> build(const BuildOptions& o) {
         }
         for (std::size_t li = 0; li < work.size(); ++li) {
             LocusIndex& x = work[li].idx;
-            calibrate(x, *graphs[li], off[li], threads);
+            if (!work[li].error.empty()) continue;
+            try {
+                calibrate(x, *graphs[li], off[li], threads);
+            } catch (const std::exception& e) {
+                work[li].error = "recruit: " + x.name + ": calibration: " + e.what();
+                log(work[li].error);
+                continue;
+            }
             if (std::none_of(graphs[li]->paths.begin(), graphs[li]->paths.end(), [](const PathRecord& p) { return p.name.find('#') != std::string::npos; }))
                 log("note: locus: " + x.name + "; no path name is PanSN (sample#haplotype#contig): calibration holds out one path at a time, "
                     "so a sample's other haplotype stays in and held-out recall is optimistic");
@@ -1076,7 +1164,14 @@ std::vector<LocusIndex> build(const BuildOptions& o) {
         }
     }
     std::vector<LocusIndex> out;
-    for (auto& w : work) out.push_back(std::move(w.idx));
+    for (auto& w : work) {
+        if (!w.error.empty() && o.errors == nullptr) throw std::runtime_error(w.error);
+        out.push_back(std::move(w.idx));
+    }
+    if (o.errors != nullptr) {
+        o.errors->clear();
+        for (const auto& w : work) o.errors->push_back(w.error);
+    }
     return out;
 }
 

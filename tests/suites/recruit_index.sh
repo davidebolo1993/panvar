@@ -64,6 +64,9 @@ PY
 "${RC[@]}" --save-index idx_short --locus short.gfa 2> short.txt; rc=$?
 check "a short locus builds and is found in the other genomes" '[[ $rc -eq 0 && $(awk -F"\t" '"'"'$1=="span" && $2!="genome" && $2!="ref"'"'"' idx_short/short.index.tsv | wc -l) -ge 2 ]]'
 check "a short locus's copies are certain only around the projected interval" 'awk -F"\t" '"'"'$1=="span" && $2!="genome" && $2!="ref" {n++; if ($9 - $8 > 0.2 * ($5 - $4)) bad++} END {exit !(n > 0 && !bad)}'"'"' idx_short/short.index.tsv'
+# one locus failing late: the others' indexes are still saved, the run fails naming it
+PANVAR_TEST_FAIL_LOCUS=short "${RC[@]}" --save-index idx_two --locus data/locus.gfa --locus short.gfa 2> two.txt; rc=$?
+check "a locus failing late leaves the others' indexes saved" '[[ $rc -ne 0 && -f idx_two/locus.plx && ! -f idx_two/short.plx ]] && grep -q "the other loci" two.txt'
 check "ceilings per read length" 'awk -F"\t" '"'"'$1=="ceiling" && $2==150 && $4>0.9 && $4<=1'"'"' idx/locus.index.tsv | grep -q .'
 
 # reads: from the locus, from its paralog, from elsewhere in the reference

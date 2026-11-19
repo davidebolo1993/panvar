@@ -554,6 +554,8 @@ int run_background_command(const std::vector<std::string>& args) {
             mo.first = static_cast<std::uint32_t>(static_cast<std::uint64_t>(m.partitions) * i / ranges);
             mo.end = static_cast<std::uint32_t>(static_cast<std::uint64_t>(m.partitions) * (i + 1) / ranges);
             mo.threads = threads;
+            mo.memory_bytes = memory;
+            mo.log = [&](const std::string& s) { log.info(s); };
             log.info("merge: partitions: " + std::to_string(mo.first) + "-" + std::to_string(mo.end) + "; segments: " + std::to_string(m.segments.size()));
             mo.progress = !quiet;
             bg::merge_range(mo);
