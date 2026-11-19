@@ -37,7 +37,9 @@ void print_background_help() {
         << "Usage:\n"
         << "  panvar background -o <store.bgk> [--add] --genome NAME=PATH [...] [--coordinate-reference NAME]\n"
         << "  panvar background -o <store.bgk> --segment-only <dir> --genome NAME=PATH [...]   (then --attach <dir>)\n"
-        << "  panvar background -o <store.bgk> --merge [--range I/N] | --compact | --clean\n\n"
+        << "  panvar background -o <store.bgk> --merge [--range I/N] | --compact | --clean\n"
+        << "  panvar background -o <store.bgk> --package <dir>      (after --compact: what recruit needs, to share)\n"
+        << "  panvar background -o <store.bgk or package> --relocate <genomes.tsv>\n\n"
         << "Count every 31-mer of a set of genomes once, with anchors that find any interval of the coordinate\n"
         << "reference in every genome, for recruit.\n\n"
         << "Building:\n"
@@ -56,6 +58,10 @@ void print_background_help() {
         << "      --merge                     Merge the store's segments into one\n"
         << "      --range I/N                 With --merge: only the I-th of N partition ranges (0-based), one job each\n"
         << "      --compact                   Write the merged store as an SSHash dictionary, <store>.sshash\n"
+        << "      --package <dir>             Write a packaged background: the compacted counts, the anchors joined and\n"
+        << "                                  packed, the manifest; recruit builds indexes from it as from the store\n"
+        << "      --relocate <tsv>            Genome files moved (name<TAB>path): each taken by its size, or, if\n"
+        << "                                  recompressed, by the checksum of its sequence\n"
         << "      --clean                     Remove what no committed segment or running job uses\n\n"
         << "Inspecting:\n"
         << "      --locate <region>           Where each genome holds a region of the coordinate reference\n"
@@ -240,7 +246,7 @@ struct Staging {
 
 int run_background_command(const std::vector<std::string>& args) {
     if (args.empty()) { print_background_help(); return 0; }
-    std::string out, dump, tmp_dir, segment_only, verify, coordinate_reference, locate_region, range, spell;
+    std::string out, dump, tmp_dir, segment_only, verify, coordinate_reference, locate_region, range, spell, package, relocate;
     std::vector<std::string> attach;
     std::vector<bg::Genome> genomes;
     std::size_t threads = 0, memory = std::size_t{2} << 30, partitions = 4096, minimizer = 0;
@@ -278,6 +284,8 @@ int run_background_command(const std::vector<std::string>& args) {
         } else if (a == "--merge") merge = true;
         else if (a == "--range") range = value();
         else if (a == "--compact") compact = true;
+        else if (a == "--package") package = value();
+        else if (a == "--relocate") relocate = value();
         else if (a == "--local-strings") local = true;
         else if (a == "--minimizer") minimizer = cli::parse_size_arg(a, value());
         else if (a == "--verify") verify = value();
@@ -308,8 +316,10 @@ int run_background_command(const std::vector<std::string>& args) {
     if (out.empty()) throw std::runtime_error("background requires -o/--out <store.bgk>");
     const int modes = static_cast<int>(add) + static_cast<int>(merge) + static_cast<int>(compact) + static_cast<int>(!dump.empty()) +
         static_cast<int>(!verify.empty()) + static_cast<int>(!locate_region.empty()) + static_cast<int>(clean) +
-        static_cast<int>(!segment_only.empty()) + static_cast<int>(!attach.empty());
-    if (modes > 1) throw std::runtime_error("background: --add, --segment-only, --attach, --merge, --compact, --dump, --verify, --locate and --clean are separate runs");
+        static_cast<int>(!segment_only.empty()) + static_cast<int>(!attach.empty()) + static_cast<int>(!package.empty()) +
+        static_cast<int>(!relocate.empty());
+    if (modes > 1)
+        throw std::runtime_error("background: --add, --segment-only, --attach, --merge, --compact, --package, --relocate, --dump, --verify, --locate and --clean are separate runs");
     if (!range.empty() && !merge) throw std::runtime_error("--range goes with --merge");
     if (local && !compact) throw std::runtime_error("--local-strings goes with --compact");
     if (partitions_given && (partitions == 0 || partitions > bg::kMaxPartitions || (partitions & (partitions - 1)) != 0))
@@ -321,9 +331,116 @@ int run_background_command(const std::vector<std::string>& args) {
     }
     if (!coordinate_reference.empty()) check_name("coordinate reference", coordinate_reference);
     const bool exists = bg::store_exists(out);
-    const bool reads_store = !dump.empty() || merge || compact || !verify.empty() || !locate_region.empty() || clean || !attach.empty();
+    const bool reads_store = !dump.empty() || merge || compact || !verify.empty() || !locate_region.empty() || clean || !attach.empty() ||
+                             !package.empty() || !relocate.empty();
     if (reads_store && !genomes.empty()) throw std::runtime_error("background: this run takes no --genome");
     if ((reads_store || add || !segment_only.empty()) && !exists) throw std::runtime_error(out + " is not a background store (no manifest.json)");
+
+    if (exists && bg::is_package(out) && (add || merge || compact || clean || !dump.empty() || !verify.empty() || !attach.empty() ||
+                                          !segment_only.empty() || !package.empty()))
+        throw std::runtime_error("background: " + out + " is a packaged background (its compacted counts, anchors and genome list): recruit "
+                                 "reads it, and --relocate and --locate work on it, but changing or dumping it needs the full store");
+    // ---- a package: the compacted counts, the anchors (joined and packed) and the manifest, for recruit to read
+    if (!package.empty()) {
+        const bg::StoreLock lock(out);
+        const bg::Manifest m = bg::read_manifest(out);
+        std::string base = out;
+        while (base.size() > 1 && base.back() == '/') base.pop_back();
+        const std::string dict = base + ".sshash";
+        if (!fs::is_regular_file(dict)) throw std::runtime_error("background: --package needs the compacted counts " + dict + " (run --compact first)");
+        const auto counts = bg::Background::open(dict);   // must be this store's, and current
+        if (fs::exists(package) && !fs::is_empty(package)) throw std::runtime_error("background: " + package + " exists and is not empty");
+        const fs::path pk(package);
+        fs::create_directories(pk / "seg-0");
+        bg::Manifest pm = m;   // one segment of all the genomes: the anchors are joined into one file
+        pm.segments.clear();
+        bg::ManifestSegment all;
+        all.dir = "seg-0";
+        all.distinct = counts->distinct();
+        for (const auto& sg : m.segments) {
+            all.occurrences += sg.occurrences;
+            all.genomes.insert(all.genomes.end(), sg.genomes.begin(), sg.genomes.end());
+        }
+        pm.segments.push_back(all);
+        pm.next_segment = 1;
+        std::vector<std::string> wrote;
+        for (const auto& [ref_name, fp] : m.references) {
+            const fs::path from = fs::path(out) / "anchors" / ref_name, to = pk / "anchors" / ref_name;
+            fs::create_directories(to);
+            for (const auto& e : fs::directory_iterator(from)) if (e.is_regular_file()) fs::copy_file(e.path(), to / e.path().filename());
+            std::vector<std::string> inputs;
+            std::uint64_t before = 0;
+            for (const auto& sg : m.segments) {
+                inputs.push_back((fs::path(out) / sg.dir / ("anchors-" + ref_name + ".bin")).string());
+                before += fs::file_size(inputs.back());
+            }
+            const anchors::ReferenceAnchors ref = anchors::load_reference((from / "reference.anc").string());
+            const std::string dst = (pk / "seg-0" / ("anchors-" + ref_name + ".bin")).string();
+            const std::uint64_t after = anchors::pack_anchors(inputs, ref, dst);
+            log.info("package: anchors on " + ref_name + "; " + std::to_string(m.segments.size()) + " files, " + std::to_string(before >> 20) +
+                     " MB, packed into one of " + std::to_string(after >> 20) + " MB");
+            wrote.push_back(dst);
+        }
+        fs::copy_file(dict, pk / "counts.sshash");
+        log.info("package: counts: " + std::to_string(fs::file_size(dict) >> 20) + " MB (" + std::to_string(counts->distinct()) + " k-mers)");
+        bg::write_manifest(package, pm);   // last: its manifest makes the package whole
+        wrote.push_back((pk / "counts.sshash").string());
+        wrote.push_back((pk / "manifest.json").string());
+        log.info("package: genomes: " + std::to_string(all.genomes.size()) + "; their files are read again by recruit to build indexes "
+                 "(give where they are with --relocate when they move)");
+        log.wrote(wrote);
+        log.done();
+        return 0;
+    }
+
+    // ---- genome files moved: new paths, each checked against what was counted (its size, else its sequence checksum)
+    if (!relocate.empty()) {
+        std::ifstream in(relocate);
+        if (!in) throw std::runtime_error("cannot read " + relocate);
+        std::map<std::string, std::string> to;
+        std::string line;
+        while (std::getline(in, line)) {
+            line = cli::trim_ascii(line);
+            if (line.empty() || line[0] == '#') continue;
+            const auto tab = line.find_first_of("\t ");
+            if (tab == std::string::npos) throw std::runtime_error(relocate + ": expected name and path, got " + line);
+            to[line.substr(0, tab)] = fs::absolute(cli::trim_ascii(line.substr(tab + 1))).string();
+        }
+        const bg::StoreLock lock(out);
+        bg::Manifest m = bg::read_manifest(out);
+        std::size_t moved = 0, by_size = 0, by_checksum = 0;
+        std::set<std::string> known;
+        for (auto& sg : m.segments)
+            for (auto& g : sg.genomes) {
+                known.insert(g.name);
+                const auto it = to.find(g.name);
+                if (it == to.end()) continue;
+                std::error_code ec;
+                const std::uint64_t size = fs::file_size(it->second, ec);
+                if (ec) throw std::runtime_error("background: genome " + g.name + ": no file at " + it->second);
+                if (size == g.bytes) {
+                    ++by_size;
+                } else {
+                    const std::string sum = bg::sequence_checksum(it->second);
+                    if (sum != g.checksum)
+                        throw std::runtime_error("background: genome " + g.name + ": " + it->second + " is not the genome counted (its sequence checksum is " +
+                                                 sum + ", " + g.checksum + " when counted)");
+                    ++by_checksum;
+                    g.bytes = size;
+                }
+                g.path = it->second;
+                ++moved;
+            }
+        for (const auto& [name, path] : to)
+            if (!known.count(name)) throw std::runtime_error("background: " + relocate + " names " + name + ", which " + out + " does not hold");
+        ++m.generation;
+        bg::write_manifest(out, m);
+        log.info("relocate: genomes: " + std::to_string(moved) + " (" + std::to_string(by_size) + " the size counted, " + std::to_string(by_checksum) +
+                 " another size but the sequence counted)");
+        log.wrote({(fs::path(out) / "manifest.json").string()});
+        log.done();
+        return 0;
+    }
 
     // ---- read-only runs
     if (!dump.empty()) {

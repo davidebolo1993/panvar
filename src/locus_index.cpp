@@ -182,7 +182,7 @@ std::unique_ptr<bg::Background> open_counts(const std::string& store, std::uint6
             if (log) log(std::string("not using the compacted background: ") + e.what());
         }
     }
-    kind = "store";
+    kind = bg::is_package(store) ? "compacted" : "store";   // a package's counts are its compacted dictionary
     auto b = bg::Background::open(store);
     if (b->content() != content)
         throw std::runtime_error("recruit: the background " + store + " changed while it was read (a commit by another job): run again");

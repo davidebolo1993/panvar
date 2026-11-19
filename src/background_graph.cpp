@@ -193,6 +193,8 @@ std::uint64_t acgt_of(const Graph& g, std::uint32_t v) {
 
 }  // namespace
 
+std::uint64_t sequence_checksum(const std::string& gfa) { return load_nodes(gfa).checksum; }
+
 GraphCounts count_graph(const std::string& gfa, std::uint32_t, std::size_t, const std::function<bool(std::string, std::uint64_t)>& push,
                         std::size_t chunk_bases, std::size_t junction_budget) {
     const Graph g = load_nodes(gfa);

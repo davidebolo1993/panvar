@@ -156,7 +156,12 @@ std::uint64_t content_id(const Manifest& m) {
     return h;
 }
 
+bool is_package(const std::string& store_dir) { return fs::is_regular_file(fs::path(store_dir) / "counts.sshash"); }
+
 Store::Store(const std::string& store_dir) : manifest_(read_manifest(store_dir)) {
+    if (is_package(store_dir))
+        throw std::runtime_error("background: " + store_dir + " is a packaged background (its compacted counts, anchors and genome list): "
+                                 "recruit reads it, but adding, merging, compacting or dumping need the full store");
     partitions_ = manifest_.partitions;
     for (const auto& ms : manifest_.segments) {
         segs_.push_back(std::make_unique<Segment>((fs::path(store_dir) / ms.dir).string()));

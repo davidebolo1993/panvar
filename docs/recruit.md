@@ -38,7 +38,7 @@ Reads, per sample:
 ## Required inputs
 
 - `--locus <path>`: a locus graph (GFA; PanSN path names) or its index (`.plx`); repeatable
-- to index a graph: `--background <store>` and `-r, --reference <name>` (the graph path whose name carries the coordinates of the background's coordinate reference)
+- to index a graph: `--background <store>` (a store, or a packaged background: see `background --package`) and `-r, --reference <name>` (the graph path whose name carries the coordinates of the background's coordinate reference)
 - reads: `-1`/`-2` FASTQ pairs, `-i` any one file (FASTQ, SAM, BAM, CRAM), or `--samples <sheet.tsv>` for several samples
 - `-o, --out <path>`: the table (or a folder, with `--samples`); not needed with `--index-only`
 

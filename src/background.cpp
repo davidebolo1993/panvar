@@ -1300,4 +1300,15 @@ SegmentStats merge_range(const MergeRangeOptions& o) {
     return st;
 }
 
+// The checksum counting records for a genome file (Genome::checksum): of a FASTA's lines, or the graph's.
+std::string sequence_checksum(const std::string& path) {
+    if (detect_input(path) == InputKind::Gfa) return hex64(graph::sequence_checksum(path));
+    GzLineReader in(path);
+    if (!in.ok()) throw std::runtime_error("background: cannot read " + path);
+    std::uint64_t checksum = 0x5bd1e9955bd1e995ULL;
+    std::string line;
+    while (in.getline(line)) checksum = hash_bytes(line.data(), line.size(), checksum);
+    return hex64(checksum);
+}
+
 }  // namespace panvar::bg

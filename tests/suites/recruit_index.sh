@@ -180,6 +180,31 @@ p = sys.argv[1]; b = bytearray(open(p, "rb").read()); b[len(b) // 2] ^= 0x10; op
 PY
 "$BIN" recruit --locus damaged.plx -1 reads_1.fq -2 reads_2.fq -o damaged.tsv -q 2> damaged.txt; rc=$?
 check "a damaged index is refused" '[[ $rc -ne 0 ]] && grep -q "corrupt" damaged.txt'
+
+# a package: the compacted counts, the anchors joined and packed, the manifest; recruit builds the same index from it
+"${BG[@]}" -o s --compact
+"${BG[@]}" -o s --package pkg; rc=$?
+check "a store packages: counts.sshash, the manifest, one packed anchor file" '[[ $rc -eq 0 && -f pkg/counts.sshash && -f pkg/manifest.json && -f pkg/seg-0/anchors-ref.bin && ! -e pkg/seg-0/parts-0.bin ]]'
+packed=$(wc -c < pkg/seg-0/anchors-ref.bin | tr -d ' '); unpacked=$(cat s/seg-*/anchors-ref.bin | wc -c | tr -d ' ')
+check "packed anchors are well under half the size ($packed of $unpacked bytes)" '[[ $((packed * 2)) -lt $unpacked ]]'
+"$BIN" recruit -t 2 -q --background pkg -r ref --index-only --save-index idx_pkg --locus data/locus.gfa; rc=$?
+"$BIN" recruit --dump-index idx_pkg/locus.plx=dump_pkg.tsv
+check "an index built from the package equals the store's" '[[ $rc -eq 0 ]] && cmp -s dump.tsv dump_pkg.tsv'
+"${BG[@]}" -o s --locate chr1:120000-160000 > loc_store.tsv; "${BG[@]}" -o pkg --locate chr1:120000-160000 > loc_pkg.tsv
+check "--locate reads the packed anchors alike" '[[ -s loc_store.tsv ]] && cmp -s loc_store.tsv loc_pkg.tsv'
+"${BG[@]}" -o pkg --add --genome gx=data/ga.fa 2> pkg_add.txt; rc=$?
+check "a package cannot be changed" '[[ $rc -ne 0 ]] && grep -q "packaged background" pkg_add.txt'
+# genome files moved, or recompressed: their new paths are checked against what was counted
+mkdir -p moved && gzip -c data/ga.fa > moved/ga.fa.gz && cp data/gb.fa moved/gb.fa
+printf 'ga\tmoved/ga.fa.gz\ngb\tmoved/gb.fa\n' > moved.tsv
+"$BIN" background -o pkg --relocate moved.tsv 2> reloc.txt; rc=$?
+check "relocated genomes: one by size, one recompressed by its sequence checksum" '[[ $rc -eq 0 ]] && grep -q "1 the size counted, 1 another size but the sequence counted" reloc.txt'
+"$BIN" recruit -t 2 -q --background pkg -r ref --index-only --save-index idx_moved --locus data/locus.gfa; rc=$?
+"$BIN" recruit --dump-index idx_moved/locus.plx=dump_moved.tsv
+check "the index from the relocated genomes is the same" '[[ $rc -eq 0 ]] && cmp -s dump.tsv dump_moved.tsv'
+printf 'ga\tdata/gb.fa\n' > wrong.tsv
+"${BG[@]}" -o pkg --relocate wrong.tsv 2> wrong.txt; rc=$?
+check "a genome file other than the one counted is refused" '[[ $rc -ne 0 ]] && grep -q "is not the genome counted" wrong.txt'
 cp data/ga.fa data/ga_moved.fa
 "$BIN" background -t 2 --partitions 64 --memory 64M -q --tmp-dir "$OUT/tmp" -o s_moved --genome ref=data/ref.fa --genome ga=data/ga_moved.fa --coordinate-reference ref
 printf '>chr1\nACGT\n' >> data/ga_moved.fa

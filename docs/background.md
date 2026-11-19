@@ -40,6 +40,8 @@ Counts every 31-mer of a set of genomes once, so that `recruit` can tell, for ea
 | `--merge` | merge the store's segments into one | off |
 | `--range I/N` | with `--merge`: only the I-th of N partition ranges (0-based) | all |
 | `--compact` | write the merged store as an SSHash dictionary | off |
+| `--package <dir>` | write a packaged background to `<dir>`: the compacted counts, the anchors joined into one packed file per coordinate reference, and the manifest; what `recruit` needs to build locus indexes, without the partitioned counts (needs `--compact` first) | |
+| `--relocate <tsv>` | genome files moved: one `name<TAB>path` per line; a file of the size counted is taken, one of another size (recompressed, say) only when its sequence checksum is the one counted | |
 | `--clean` | remove what no committed segment or running job uses | off |
 | `--locate <region>` | print where each genome holds a region of the coordinate reference | |
 | `--dump <path>` | every k-mer and its count, segments summed | |
@@ -58,10 +60,15 @@ Counts every 31-mer of a set of genomes once, so that `recruit` can tell, for ea
 | `<store>/seg-N/` | a segment: its partitions (`parts-0.bin`, or one file per merge range), `segment.tsv` (its genomes and counts) and its anchor places per coordinate reference |
 | `<store>/anchors/<reference>/` | the coordinate reference's anchors |
 | `<store>.sshash` | with `--compact`: the dictionary `recruit` reads instead of the store while its fingerprint matches |
+| `<dir>/` | with `--package`: `manifest.json` (every genome in one segment), `counts.sshash`, `anchors/<reference>/` and `seg-0/anchors-<reference>.bin` (the places packed: about 5 bytes each instead of 12). `recruit --background <dir>` reads it as a store; it cannot be added to, merged or dumped |
 | `--dump <path>` | one line per k-mer: the k-mer and its count, tab-separated, no header |
 | standard output, with `--locate` | one row per copy found in each genome (`genome`, `copy`, `contig`, `start`, `end`, `strand`, the anchors inside and around it, the chains joined); a genome holding no copy gets one row with copy 0 |
 
 `recruit` refuses a store whose genome files changed since they were counted (their size is recorded): the counts would no longer describe the files it reads to locate a locus.
+
+## Sharing a background
+
+Counting hundreds of genomes takes days; building a locus index against them takes an hour. A packaged background lets others skip the first: `--compact`, then `--package <dir>`, and share `<dir>`. The genome files are not in it (they are public, and large): the index reads them again to locate each locus and cut its copies. Whoever receives the package downloads the genomes and gives their paths with `--relocate`: a file byte for byte as counted is taken by its size, and one recompressed or otherwise rewritten (bgzip, say, for faster reading by interval) by the checksum of its sequence lines, so a different assembly is never taken for the one counted. Indexes built from a package are the ones the full store gives.
 
 ## Limitations
 

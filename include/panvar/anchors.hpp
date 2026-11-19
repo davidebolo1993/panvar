@@ -110,12 +110,18 @@ private:
     std::vector<std::string> genomes_;
     std::vector<std::vector<std::string>> contigs_;
     std::vector<std::vector<std::uint64_t>> lengths_;
-    const std::uint64_t* first_ = nullptr;    // anchors + 1 offsets into places
-    const unsigned char* places_ = nullptr;   // 12 bytes each
+    std::uint64_t version_ = 2;
+    const std::uint64_t* first_ = nullptr;    // anchors + 1 offsets into places (version 3: in bytes)
+    const unsigned char* places_ = nullptr;   // 12 bytes each (version 3: packed)
 };
 
 // Joins segments' anchor files (genomes in segment order) into one, for a merged segment.
 void merge_segment_anchors(const std::vector<std::string>& inputs, const ReferenceAnchors& ref, const std::string& out);
+
+// The same join written packed (version 3): each anchor's places as varints, the genome as the step from the
+// place before, the contig with the flags, the position as the signed step from the place before; about a
+// third of the 12 bytes a place takes unpacked. Read in place like any anchor file. Returns the bytes written.
+std::uint64_t pack_anchors(const std::vector<std::string>& inputs, const ReferenceAnchors& ref, const std::string& out);
 
 // A copy of a reference interval found in a genome.
 struct Span {

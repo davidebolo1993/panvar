@@ -31,6 +31,9 @@ GraphCounts count_graph(const std::string& gfa, std::uint32_t genome, std::size_
                         const std::function<bool(std::string, std::uint64_t)>& push,
                         std::size_t chunk_bases = std::size_t{1} << 24, std::size_t junction_budget = std::size_t{1} << 30);
 
+// The checksum counting records for a graph genome (GraphCounts::checksum).
+std::uint64_t sequence_checksum(const std::string& gfa);
+
 // Anchors placed on every haplotype contig (indexes as in GraphCounts::contigs).
 std::vector<anchors::Hit> graph_anchors(const std::string& gfa, const anchors::AnchorLookup& lookup, std::uint32_t genome,
                                         std::size_t threads);

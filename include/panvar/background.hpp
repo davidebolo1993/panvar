@@ -258,6 +258,11 @@ void write_file_durably(const std::string& path, const std::string& content);
 // What the store counts: a hash of its genomes' names and sequence checksums (not of how they are split
 // into segments, nor of its anchors), so a merge or a new coordinate reference keeps it.
 std::uint64_t content_id(const Manifest& m);
+// The checksum counting records for a genome file (Genome::checksum), to check a file moved or recompressed.
+std::string sequence_checksum(const std::string& path);
+// A packaged background: the manifest, the anchors and the compacted counts (counts.sshash) in one folder,
+// without the partitioned counts. recruit reads it as a store; it cannot be changed.
+bool is_package(const std::string& store_dir);
 
 // An exclusive lock on a store's .lock file, held until destroyed; waits for other holders.
 class StoreLock {

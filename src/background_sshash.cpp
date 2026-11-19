@@ -413,6 +413,13 @@ void local_strings(const Segment& seg, std::size_t threads, SpssWriter& out, con
 }  // namespace
 
 std::unique_ptr<Background> Background::open(const std::string& path) {
+    if (fs::is_directory(path) && is_package(path)) {   // its own manifest must be the dictionary's store and content
+        auto dict = std::make_unique<SshashBackground>((fs::path(path) / "counts.sshash").string());
+        const Manifest m = read_manifest(path);
+        if (m.store_id != dict->store_id() || content_id(m) != dict->content())
+            throw std::runtime_error("background: " + path + ": its counts.sshash was compacted from other genomes than its manifest lists");
+        return dict;
+    }
     if (fs::is_directory(path)) return std::make_unique<StoreBackground>(path);
     if (!fs::is_regular_file(path)) throw std::runtime_error("background: no store or compacted background at " + path);
     auto dict = std::make_unique<SshashBackground>(path);

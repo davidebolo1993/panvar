@@ -369,7 +369,8 @@ SegmentAnchors::SegmentAnchors(const std::string& path) : map_(std::make_unique<
     const auto* base = static_cast<const unsigned char*>(map_->data());
     Reader r{base, base + map_->size(), path};
     if (map_->size() < 56 || r.u64() != kSegMagic) throw std::runtime_error("anchors: " + path + " is incomplete or not an anchor file of this version");
-    if (r.u64() != 2) throw std::runtime_error("anchors: " + path + ": unknown version");
+    version_ = r.u64();
+    if (version_ != 2 && version_ != 3) throw std::runtime_error("anchors: " + path + ": unknown version");
     fingerprint_ = r.u64();
     anchors_ = r.u64();
     const std::uint64_t ng = r.u64(), np = r.u64(), names_bytes = r.u64();
@@ -383,10 +384,15 @@ SegmentAnchors::SegmentAnchors(const std::string& path) : map_(std::make_unique<
         for (std::uint64_t c = 0; c < nc; ++c) { contigs_.back().push_back(nr.str()); lengths_.back().push_back(nr.u64()); }
     }
     r.p += names_bytes;
-    r.need((anchors_ + 1) * 8 + np * kPlaceBytes);
+    r.need((anchors_ + 1) * 8);
     first_ = reinterpret_cast<const std::uint64_t*>(r.p);
     places_ = r.p + (anchors_ + 1) * 8;
-    if (first_[anchors_] != np) throw std::runtime_error("anchors: " + path + " is corrupt");
+    if (version_ == 2) {
+        r.need((anchors_ + 1) * 8 + np * kPlaceBytes);
+        if (first_[anchors_] != np) throw std::runtime_error("anchors: " + path + " is corrupt");
+    } else {
+        r.need((anchors_ + 1) * 8 + first_[anchors_]);   // packed: offsets in bytes
+    }
     for (std::size_t a = 0; a < anchors_; ++a)
         if (first_[a] > first_[a + 1]) throw std::runtime_error("anchors: " + path + " is corrupt");
 }
@@ -395,6 +401,36 @@ SegmentAnchors::~SegmentAnchors() = default;
 
 void SegmentAnchors::places(std::size_t a, std::vector<Place>& out) const {
     out.clear();
+    if (version_ == 3) {
+        const unsigned char* p = places_ + first_[a];
+        const unsigned char* const end = places_ + first_[a + 1];
+        auto varint = [&] {
+            std::uint64_t v = 0;
+            for (int shift = 0;; shift += 7) {
+                if (p >= end || shift > 63) throw std::runtime_error("anchors: a packed anchor file is corrupt");
+                const unsigned char b = *p++;
+                v |= static_cast<std::uint64_t>(b & 0x7F) << shift;
+                if (!(b & 0x80)) return v;
+            }
+        };
+        std::uint64_t g = 0, pos = 0;
+        while (p < end) {
+            g += varint();
+            const std::uint64_t cf = varint();
+            const std::uint64_t z = varint();
+            pos = static_cast<std::uint64_t>(static_cast<std::int64_t>(pos) + ((z & 1) ? -static_cast<std::int64_t>(z >> 1) - 1 : static_cast<std::int64_t>(z >> 1)));
+            Place q;
+            q.genome = static_cast<std::uint32_t>(g);
+            q.contig = static_cast<std::uint32_t>(cf >> 2);
+            q.forward = cf & 1;
+            q.repeated = (cf & 2) != 0;
+            q.pos = static_cast<std::uint32_t>(pos);
+            if (q.genome >= genomes_.size() || q.contig >= contigs_[q.genome].size())
+                throw std::runtime_error("anchors: a place outside its genome's contigs");
+            out.push_back(q);
+        }
+        return;
+    }
     for (std::uint64_t i = first_[a]; i < first_[a + 1]; ++i) {
         const unsigned char* rec = places_ + i * kPlaceBytes;
         const std::uint16_t flags = get16(rec + 2);
@@ -411,7 +447,87 @@ void SegmentAnchors::places(std::size_t a, std::vector<Place>& out) const {
 }
 
 std::uint64_t SegmentAnchors::bytes_touched(std::size_t a_begin, std::size_t a_end) const {
-    return (a_end - a_begin + 1) * 8 + (first_[a_end] - first_[a_begin]) * kPlaceBytes;
+    return (a_end - a_begin + 1) * 8 + (first_[a_end] - first_[a_begin]) * (version_ == 3 ? 1 : kPlaceBytes);
+}
+
+std::uint64_t pack_anchors(const std::vector<std::string>& inputs, const ReferenceAnchors& ref, const std::string& out) {
+    std::vector<std::unique_ptr<SegmentAnchors>> in;
+    std::vector<std::string> genome_names;
+    std::vector<std::vector<std::string>> contig_names;
+    std::vector<std::vector<std::uint64_t>> contig_lengths;
+    std::vector<std::uint32_t> genome_base;   // each input's first genome in the joined list
+    const std::size_t n = ref.code.size();
+    for (const auto& path : inputs) {
+        in.push_back(std::make_unique<SegmentAnchors>(path));
+        const SegmentAnchors& s = *in.back();
+        if (s.fingerprint() != ref.fingerprint() || s.anchors() != n) throw std::runtime_error("anchors: " + path + " belongs to another anchor set");
+        genome_base.push_back(static_cast<std::uint32_t>(genome_names.size()));
+        for (std::size_t g = 0; g < s.genomes().size(); ++g) {
+            genome_names.push_back(s.genomes()[g]);
+            contig_names.push_back(s.contigs(g));
+            contig_lengths.emplace_back();
+            for (std::size_t c = 0; c < s.contigs(g).size(); ++c) contig_lengths.back().push_back(s.contig_length(g, c));
+        }
+    }
+    const std::string tmp = out + ".tmp";
+    Writer w{std::fopen(tmp.c_str(), "wb"), tmp};
+    if (w.f == nullptr) throw std::runtime_error("anchors: cannot write " + tmp);
+    std::vector<std::uint64_t> first(n + 1, 0);
+    std::uint64_t places = 0, bytes = 0;
+    try {
+        std::string names;
+        auto put = [&](std::uint64_t v) { names.append(reinterpret_cast<const char*>(&v), 8); };
+        for (std::size_t g = 0; g < genome_names.size(); ++g) {
+            put(genome_names[g].size()); names += genome_names[g];
+            put(contig_names[g].size());
+            for (std::size_t c = 0; c < contig_names[g].size(); ++c) { put(contig_names[g][c].size()); names += contig_names[g][c]; put(contig_lengths[g][c]); }
+        }
+        while (names.size() % 8) names += '\0';
+        w.u64(0); w.u64(3); w.u64(ref.fingerprint()); w.u64(n); w.u64(genome_names.size());
+        const long places_at = std::ftell(w.f);
+        w.u64(0);   // places, filled in below
+        w.u64(names.size());
+        w.bytes(names.data(), names.size());
+        const long first_at = std::ftell(w.f);
+        w.bytes(first.data(), first.size() * 8);   // filled in below
+        std::string buf;
+        auto varint = [&](std::uint64_t v) {
+            while (v >= 0x80) { buf += static_cast<char>((v & 0x7F) | 0x80); v >>= 7; }
+            buf += static_cast<char>(v);
+        };
+        std::vector<Place> ps;
+        for (std::size_t a = 0; a < n; ++a) {
+            first[a] = bytes;
+            buf.clear();
+            std::uint64_t g = 0;
+            std::int64_t pos = 0;
+            for (std::size_t s = 0; s < in.size(); ++s) {
+                in[s]->places(a, ps);   // by genome, contig and position, so the genomes only grow
+                for (const Place& q : ps) {
+                    const std::uint64_t gg = genome_base[s] + q.genome;
+                    varint(gg - g);
+                    g = gg;
+                    varint((static_cast<std::uint64_t>(q.contig) << 2) | (q.forward ? 1 : 0) | (q.repeated ? 2 : 0));
+                    const std::int64_t d = static_cast<std::int64_t>(q.pos) - pos;
+                    varint(d >= 0 ? static_cast<std::uint64_t>(d) << 1 : ((static_cast<std::uint64_t>(-(d + 1)) << 1) | 1));
+                    pos = q.pos;
+                    ++places;
+                }
+            }
+            w.bytes(buf.data(), buf.size());
+            bytes += buf.size();
+        }
+        first[n] = bytes;
+        if (std::fseek(w.f, first_at, SEEK_SET) != 0) throw std::runtime_error("anchors: cannot write " + tmp);
+        w.bytes(first.data(), first.size() * 8);
+        if (std::fseek(w.f, places_at, SEEK_SET) != 0) throw std::runtime_error("anchors: cannot write " + tmp);
+        w.u64(places);
+        if (std::fflush(w.f) != 0 || ::fsync(fileno(w.f)) != 0 || std::fseek(w.f, 0, SEEK_SET) != 0) throw std::runtime_error("anchors: cannot write " + tmp);
+        w.u64(kSegMagic);
+    } catch (...) { std::fclose(w.f); std::error_code ec; fs::remove(tmp, ec); throw; }
+    if (std::fflush(w.f) != 0 || ::fsync(fileno(w.f)) != 0 || std::fclose(w.f) != 0) throw std::runtime_error("anchors: cannot write " + tmp);
+    fs::rename(tmp, out);
+    return fs::file_size(out);
 }
 
 void merge_segment_anchors(const std::vector<std::string>& inputs, const ReferenceAnchors& ref, const std::string& out) {
