@@ -168,6 +168,18 @@ check "genomes scanned in parallel give the index of one at a time" 'cmp -s dump
 "$BIN" background -t 2 --partitions 64 --memory 64M -q --tmp-dir "$OUT/tmp" -o s_graph --genome ref=data/ref.fa --genome lg=data/locus.gfa --coordinate-reference ref
 "$BIN" recruit -t 2 -q --background s_graph -r ref --index-only --save-index idx_graph --locus data/locus.gfa 2> graph.txt; rc=$?
 check "a graph genome's PanSN paths count as haplotypes (1 FASTA + 3 paths)" '[[ $rc -eq 0 ]] && grep -q "haplotypes.4 in the background" idx_graph/locus.index.tsv'
+# a haplotype named twice over the same range is refused (a span could be cut from the wrong one)
+awk -F'\t' 'BEGIN {OFS = "\t"} {print} $1 == "P" && $2 ~ /^ga#/ {print}' data/locus.gfa > dup.gfa
+"$BIN" background -t 2 --partitions 64 --memory 64M -q --tmp-dir "$OUT/tmp" -o s_dup --genome ref=data/ref.fa --genome lg=dup.gfa --coordinate-reference ref 2> dup.txt; rc=$?
+check "a graph genome naming a haplotype twice is refused" '[[ $rc -ne 0 ]] && grep -q "is given twice" dup.txt'
+# a damaged index is refused when loaded, not scored with
+cp idx/locus.plx damaged.plx
+python3 - damaged.plx <<'PY'
+import sys
+p = sys.argv[1]; b = bytearray(open(p, "rb").read()); b[len(b) // 2] ^= 0x10; open(p, "wb").write(bytes(b))
+PY
+"$BIN" recruit --locus damaged.plx -1 reads_1.fq -2 reads_2.fq -o damaged.tsv -q 2> damaged.txt; rc=$?
+check "a damaged index is refused" '[[ $rc -ne 0 ]] && grep -q "corrupt" damaged.txt'
 cp data/ga.fa data/ga_moved.fa
 "$BIN" background -t 2 --partitions 64 --memory 64M -q --tmp-dir "$OUT/tmp" -o s_moved --genome ref=data/ref.fa --genome ga=data/ga_moved.fa --coordinate-reference ref
 printf '>chr1\nACGT\n' >> data/ga_moved.fa

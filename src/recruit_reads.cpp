@@ -297,6 +297,7 @@ ReadStats recruit_reads(const ReadOptions& options) {
         const InputStats& s = source->stats();
         st.fragments += s.unscreened + s.dropped;   // passed over before scoring, unscreened
         input_stats.emplace_back(source->describe(), s);
+        if (s.fragments + s.unscreened + s.dropped == 0) log("warning: input: " + source->describe() + "; it holds no reads");
         log("input: " + source->describe() + "; records: " + std::to_string(s.records) + "; fragments: " +
             std::to_string(s.fragments + s.unscreened + s.dropped) + "; pairs: " + std::to_string(s.pairs + s.unscreened) +
             (s.secondary + s.supplementary + s.qc_fail > 0 ? "; skipped: secondary " + std::to_string(s.secondary) + ", supplementary " +
@@ -308,6 +309,25 @@ ReadStats recruit_reads(const ReadOptions& options) {
     constexpr std::size_t kBatch = 20000;                        // fragments in a batch at most
     constexpr std::size_t kBatchBytes = std::size_t{1} << 30;    // and bases plus qualities: long reads fill this first
     constexpr std::size_t kBatchStep = 1000;                     // fragments asked for at a time, to stop near the bound
+    // One sample's inputs must hold one read type: the error rate, read class and cut come from the first reads.
+    // Each input's first reads are checked against the first input's: short (under 1 kb) or long.
+    int first_long = -1;               // the first input's: 0 short, 1 long, -1 not yet seen
+    std::string first_input;
+    bool checked_input = false;        // the current input's first reads were checked
+    auto check_type = [&](const std::vector<Fragment>& part) {
+        std::uint64_t bases = 0, reads = 0;
+        for (const Fragment& f : part) {
+            bases += f.seq1.size() + f.seq2.size();
+            reads += !f.seq1.empty() + !f.seq2.empty();
+        }
+        if (reads == 0) return;
+        checked_input = true;
+        const int is_long = static_cast<double>(bases) / static_cast<double>(reads) >= 1000 ? 1 : 0;
+        if (first_long < 0) { first_long = is_long; first_input = source->describe(); return; }
+        if (is_long != first_long)
+            throw std::runtime_error("recruit: " + source->describe() + " holds " + (is_long ? "long" : "short") + " reads and " + first_input + " " +
+                                     (is_long ? "short" : "long") + " ones: one sample's inputs must be one read type (give them as separate samples)");
+    };
     // The next batch is read while the workers score the current one.
     auto read_batch = [&](std::vector<Fragment>& batch) {   // the inputs one after another
         batch.clear();
@@ -318,11 +338,13 @@ ReadStats recruit_reads(const ReadOptions& options) {
                 if (next_input == o.inputs.size()) break;
                 const auto& [a, b] = o.inputs[next_input++];
                 source = b.empty() ? open_input(a, io) : open_fastq_pair(a, b);
+                checked_input = false;
             }
             if (source->next(part, std::min(kBatchStep, kBatch - batch.size())) == 0) {
                 close_source();
                 continue;
             }
+            if (!checked_input) check_type(part);
             for (auto& f : part) {
                 bytes += f.seq1.size() + f.qual1.size() + f.seq2.size() + f.qual2.size();
                 batch.push_back(std::move(f));
@@ -386,6 +408,14 @@ ReadStats recruit_reads(const ReadOptions& options) {
                         note += b;
                     }
                     if (c.by->insert > 0 && !pairs) note += "; calibrated on pairs, the run reads single reads";
+                    {   // the calibration scored by the default rules: a run scoring by others is not what it measured
+                        const ReadOptions d;
+                        if (o.decoy_share != d.decoy_share || o.decoy_share_long != d.decoy_share_long) {
+                            std::snprintf(b, sizeof b, "; the run's decoy shares (%.3g, %.3g long) are not the calibration's (%.3g, %.3g)",
+                                          o.decoy_share, o.decoy_share_long, d.decoy_share, d.decoy_share_long);
+                            note += b;
+                        }
+                    }
                 }
             }
             cut_note[li] = note;
@@ -393,11 +423,32 @@ ReadStats recruit_reads(const ReadOptions& options) {
         }
     }
 
-    std::FILE* out = std::fopen(o.out.c_str(), "w");
-    if (out == nullptr) throw std::runtime_error("recruit: cannot write " + o.out);
+    // the table and summary are written under temporary names and renamed when complete; an earlier run's are
+    // removed first, so a run that fails leaves none that looks finished
+    const std::string out_tmp = o.out + ".tmp", summary_tmp = o.summary.empty() ? std::string() : o.summary + ".tmp";
+    {
+        std::error_code ec;
+        std::filesystem::remove(o.out, ec);
+        if (!o.summary.empty()) std::filesystem::remove(o.summary, ec);
+    }
+    std::FILE* out = std::fopen(out_tmp.c_str(), "w");
+    if (out == nullptr) throw std::runtime_error("recruit: cannot write " + out_tmp);
     std::fprintf(out, "fragment\tlocus\tfate\treason\tmates\tseg1\tseg2\tsites_p\tsites_d\tdecoy_out\truns_n\tseg_kmers\tn_p\tn_s\tn_r\tn_d\tn_n\tkmers\twindows\tbases\tmulti_p\tnodes\tother_loci\tcertain_loci\n");
     std::unique_ptr<ReadWriters> writers;
-    if (!o.reads_out.empty()) writers = std::make_unique<ReadWriters>(o.reads_out, o.threads);
+    if (!o.reads_out.empty()) {
+        // an earlier run's reads of these loci go first: a locus and fate with no reads now must not keep old ones
+        std::error_code ec;
+        std::size_t removed = 0;
+        if (std::filesystem::is_directory(o.reads_out, ec))
+            for (const auto& e : std::filesystem::directory_iterator(o.reads_out, ec)) {
+                const std::string f = e.path().filename().string();
+                if (f.size() < 7 || f.compare(f.size() - 6, 6, ".fq.gz") != 0) continue;
+                for (const LocusTable& l : loci)
+                    if (f.compare(0, l.name.size() + 1, l.name + ".") == 0) { std::filesystem::remove(e.path(), ec); ++removed; break; }
+            }
+        if (removed > 0) log("reads-out: " + o.reads_out + "; " + std::to_string(removed) + " files of an earlier run removed");
+        writers = std::make_unique<ReadWriters>(o.reads_out, o.threads);
+    }
     const Costs costs = costs_for(o.error_rate);
     const double gap_cost = costs.gap_cost, flank_share = costs.flank_share;
 
@@ -495,11 +546,12 @@ ReadStats recruit_reads(const ReadOptions& options) {
     }
     close_source();
     if (writers) writers->close_all();
-    if (std::fclose(out) != 0) throw std::runtime_error("recruit: cannot write " + o.out);
+    if (std::fclose(out) != 0) throw std::runtime_error("recruit: cannot write " + out_tmp);
+    std::filesystem::rename(out_tmp, o.out);
 
     if (!o.summary.empty()) {
-        std::FILE* sm = std::fopen(o.summary.c_str(), "w");
-        if (sm == nullptr) throw std::runtime_error("recruit: cannot write " + o.summary);
+        std::FILE* sm = std::fopen(summary_tmp.c_str(), "w");
+        if (sm == nullptr) throw std::runtime_error("recruit: cannot write " + summary_tmp);
         std::fprintf(sm, "section\tkey\tvalue\textra\n");
         std::fprintf(sm, "run\terror_rate\t%.5f\t%s\n", o.error_rate, st.error_source.c_str());
         std::fprintf(sm, "run\tfragments\t%llu\t\nrun\tscreened\t%llu\t\n", static_cast<unsigned long long>(st.fragments),
@@ -528,7 +580,8 @@ ReadStats recruit_reads(const ReadOptions& options) {
             std::fprintf(sm, "locus\t%s\tcertain_in_other_loci\t%llu\n", loci[li].name.c_str(), static_cast<unsigned long long>(multi_certain[li]));
             std::fprintf(sm, "locus\t%s\tsite_cut\t%s\n", loci[li].name.c_str(), cut_note[li].c_str());
         }
-        if (std::fclose(sm) != 0) throw std::runtime_error("recruit: cannot write " + o.summary);
+        if (std::fclose(sm) != 0) throw std::runtime_error("recruit: cannot write " + summary_tmp);
+        std::filesystem::rename(summary_tmp, o.summary);
     }
     return st;
 }

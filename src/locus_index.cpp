@@ -18,6 +18,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <tuple>
+#include <unistd.h>
 #include <cstring>
 #include <exception>
 #include <filesystem>
@@ -40,7 +41,7 @@ namespace fs = std::filesystem;
 
 constexpr std::size_t kK = 31, kS = 11;
 constexpr std::uint64_t kMagic = 0x3130305850585650ULL;   // "PVPXP001"
-constexpr std::uint64_t kVersion = 13;   // 2: decoy windows stop at the locus; 3: clusters split at it; 4: S per haplotype; 5: calibration; 6: its decoy pairs cross window edges; 7: locus pieces off the located copies; 8: and past estimated ends; 9: and everywhere for a locus with array pieces outside; 10: stretches reach contig ends; 11: pieces tied to the locus, short contigs whole, no decoys in pieces; 12: copies walked out from their anchors; 13: across repeats
+constexpr std::uint64_t kVersion = 14;   // 2: decoy windows stop at the locus; 3: clusters split at it; 4: S per haplotype; 5: calibration; 6: its decoy pairs cross window edges; 7: locus pieces off the located copies; 8: and past estimated ends; 9: and everywhere for a locus with array pieces outside; 10: stretches reach contig ends; 11: pieces tied to the locus, short contigs whole, no decoys in pieces; 12: copies walked out from their anchors; 13: across repeats; 14: a checksum
 const std::size_t kLengths[] = {100, 150, 250, 1000, 10000};
 constexpr std::size_t kWindowStep = 25;
 // A stretch of a genome is a piece of the locus when, over every window of this many bases in it, this
@@ -162,21 +163,30 @@ std::string locus_name_of(const std::string& gfa) {
     return n;
 }
 
-// Which counts to read: the compacted dictionary beside the store when it is current, else the store.
-std::unique_ptr<bg::Background> open_counts(const std::string& store, std::string& kind, const std::function<void(const std::string&)>& log) {
+// Which counts to read: the compacted dictionary beside the store when it holds the manifest's genomes (`content`),
+// else the store, which must hold them too: a commit between reading the manifest and the counts (another job's
+// --add) would mix two sets of genomes in one index.
+std::unique_ptr<bg::Background> open_counts(const std::string& store, std::uint64_t content, std::string& kind,
+                                            const std::function<void(const std::string&)>& log) {
     std::string base = store;
     while (base.size() > 1 && base.back() == '/') base.pop_back();
     if (fs::is_regular_file(base + ".sshash")) {
         try {
             auto b = bg::Background::open(base + ".sshash");
-            kind = "compacted";
-            return b;
+            if (b->content() == content) {
+                kind = "compacted";
+                return b;
+            }
+            if (log) log("not using the compacted background: it was compacted from other genomes than the store holds now");
         } catch (const std::exception& e) {
             if (log) log(std::string("not using the compacted background: ") + e.what());
         }
     }
     kind = "store";
-    return bg::Background::open(store);
+    auto b = bg::Background::open(store);
+    if (b->content() != content)
+        throw std::runtime_error("recruit: the background " + store + " changed while it was read (a commit by another job): run again");
+    return b;
 }
 
 struct LocusWork {
@@ -266,38 +276,23 @@ void compute_ceilings(const Graph& g, LocusIndex& idx) {
         });
         std::vector<std::uint32_t> pc(nk + 1, 0);
         for (std::size_t i = 0; i < nk; ++i) pc[i + 1] = pc[i] + (lab[i] == kPrivate);
-        // runs of private (and of private single-copy) k-mers: start, end (inclusive); a window's sites are
-        // ceil(clipped length / k) summed over the runs it meets
-        auto runs_of = [&](bool single_only) {
-            std::vector<std::pair<std::size_t, std::size_t>> r;
-            for (std::size_t i = 0; i < nk;) {
-                const auto ok = [&](std::size_t j) { return lab[j] == kPrivate && (!single_only || single[j]); };
-                if (!ok(i)) { ++i; continue; }
-                std::size_t e = i;
-                while (e + 1 < nk && ok(e + 1)) ++e;
-                r.emplace_back(i, e);
-                i = e + 1;
-            }
-            return r;
+        // two sites in a window, counted as the scorer counts them (a site opens at a private k-mer and takes in
+        // those starting less than k after it, whatever lies between): the window's last private k-mer starts k or
+        // more after its first. Nearest private (and private single-copy) k-mer at or after / at or before each start.
+        constexpr std::size_t kNone = static_cast<std::size_t>(-1);
+        auto nearest = [&](bool single_only, std::vector<std::size_t>& next, std::vector<std::size_t>& prev) {
+            const auto ok = [&](std::size_t j) { return lab[j] == kPrivate && (!single_only || single[j]); };
+            next.assign(nk + 1, kNone);
+            prev.assign(nk, kNone);
+            for (std::size_t i = nk; i-- > 0;) next[i] = ok(i) ? i : next[i + 1];
+            for (std::size_t i = 0; i < nk; ++i) prev[i] = ok(i) ? i : (i > 0 ? prev[i - 1] : kNone);
         };
-        const auto rp = runs_of(false), rs = runs_of(true);
-        auto prefix = [&](const std::vector<std::pair<std::size_t, std::size_t>>& r) {
-            std::vector<std::uint64_t> p(r.size() + 1, 0);
-            for (std::size_t i = 0; i < r.size(); ++i) p[i + 1] = p[i] + (r[i].second - r[i].first + kK) / kK;
-            return p;
-        };
-        const auto pp = prefix(rp), pq = prefix(rs);
-        auto sites = [&](const std::vector<std::pair<std::size_t, std::size_t>>& r, const std::vector<std::uint64_t>& p, std::size_t a, std::size_t e) {
-            // runs ending at or after a, starting at or before e
-            const std::size_t lo = static_cast<std::size_t>(std::lower_bound(r.begin(), r.end(), a, [](const auto& x, std::size_t v) { return x.second < v; }) - r.begin());
-            const std::size_t hi = static_cast<std::size_t>(std::upper_bound(r.begin(), r.end(), e, [](std::size_t v, const auto& x) { return v < x.first; }) - r.begin());
-            if (lo >= hi) return std::uint64_t{0};
-            std::uint64_t n = p[hi] - p[lo];
-            auto full = [&](std::size_t i) { return (r[i].second - r[i].first + kK) / kK; };
-            auto clip = [&](std::size_t i) { const std::size_t s0 = std::max(r[i].first, a), e0 = std::min(r[i].second, e); return (e0 - s0 + kK) / kK; };
-            n = n - full(lo) + clip(lo);
-            if (hi - 1 != lo) n = n - full(hi - 1) + clip(hi - 1);
-            return n;
+        std::vector<std::size_t> next_p, prev_p, next_s, prev_s;
+        nearest(false, next_p, prev_p);
+        nearest(true, next_s, prev_s);
+        auto two_sites = [&](const std::vector<std::size_t>& next, const std::vector<std::size_t>& prev, std::size_t a, std::size_t e) {
+            const std::size_t f = next[a], l = prev[e];
+            return f != kNone && f <= e && l != kNone && l >= f + kK;
         };
         for (std::size_t li = 0; li < std::size(kLengths); ++li) {
             const std::size_t L = kLengths[li];
@@ -307,8 +302,8 @@ void compute_ceilings(const Graph& g, LocusIndex& idx) {
                 const std::size_t e = w + L - kK;   // last k-mer start in the window
                 ++n;
                 a += pc[e + 1] - pc[w] >= 3;
-                b += sites(rp, pp, w, e) >= 2;
-                c += sites(rs, pq, w, e) >= 2;
+                b += two_sites(next_p, prev_p, w, e);
+                c += two_sites(next_s, prev_s, w, e);
             }
             if (n == 0) continue;
             p3[li].push_back(static_cast<double>(a) / n);
@@ -334,20 +329,50 @@ void compute_ceilings(const Graph& g, LocusIndex& idx) {
 }
 
 // Binary writing and reading of the .plx file.
+// A running checksum over the bytes written or read after the magic word, stored last: a damaged index is
+// refused when loaded rather than scoring with wrong labels.
+std::uint64_t hash_bytes_into(std::uint64_t h, const void* p, std::size_t n) {
+    const auto* b = static_cast<const unsigned char*>(p);
+    std::size_t i = 0;
+    for (; i + 8 <= n; i += 8) { std::uint64_t w; std::memcpy(&w, b + i, 8); h = kmer::mix64(h ^ w); }
+    std::uint64_t w = 0;
+    std::memcpy(&w, b + i, n - i);
+    return kmer::mix64(h ^ w ^ (static_cast<std::uint64_t>(n) << 56));
+}
+constexpr std::uint64_t kChecksumSeed = 0x6a09e667f3bcc909ULL;
 struct Out {
     std::ofstream f;
-    void u64(std::uint64_t v) { f.write(reinterpret_cast<const char*>(&v), 8); }
-    void str(const std::string& s) { u64(s.size()); f.write(s.data(), static_cast<std::streamsize>(s.size())); }
-    template <class T> void vec(const std::vector<T>& v) { u64(v.size()); f.write(reinterpret_cast<const char*>(v.data()), static_cast<std::streamsize>(v.size() * sizeof(T))); }
+    std::uint64_t h = kChecksumSeed;
+    void bytes(const void* p, std::size_t n) { f.write(static_cast<const char*>(p), static_cast<std::streamsize>(n)); h = hash_bytes_into(h, p, n); }
+    void u64(std::uint64_t v) { bytes(&v, 8); }
+    void raw64(std::uint64_t v) { f.write(reinterpret_cast<const char*>(&v), 8); }   // outside the checksum
+    void str(const std::string& s) { u64(s.size()); bytes(s.data(), s.size()); }
+    template <class T> void vec(const std::vector<T>& v) { u64(v.size()); bytes(v.data(), v.size() * sizeof(T)); }
 };
 struct In {
     std::ifstream f;
     std::string path;
-    std::uint64_t u64() { std::uint64_t v = 0; if (!f.read(reinterpret_cast<char*>(&v), 8)) throw std::runtime_error("recruit: " + path + " is truncated"); return v; }
-    std::string str() { std::string s(u64(), '\0'); if (!s.empty() && !f.read(&s[0], static_cast<std::streamsize>(s.size()))) throw std::runtime_error("recruit: " + path + " is truncated"); return s; }
+    std::uint64_t h = kChecksumSeed;
+    void bytes(void* p, std::size_t n) {
+        if (n > 0 && !f.read(static_cast<char*>(p), static_cast<std::streamsize>(n))) throw std::runtime_error("recruit: " + path + " is truncated");
+        h = hash_bytes_into(h, p, n);
+    }
+    std::uint64_t u64() { std::uint64_t v = 0; bytes(&v, 8); return v; }
+    std::uint64_t raw64() { std::uint64_t v = 0; if (!f.read(reinterpret_cast<char*>(&v), 8)) throw std::runtime_error("recruit: " + path + " is truncated"); return v; }
+    // a length read from the file, bounded by what is left of it, so a damaged length is refused, not allocated
+    std::uint64_t length(std::size_t unit) {
+        const std::uint64_t n = u64();
+        const auto at = f.tellg();
+        f.seekg(0, std::ios::end);
+        const auto end = f.tellg();
+        f.seekg(at);
+        if (unit > 0 && n > static_cast<std::uint64_t>(end - at) / unit) throw std::runtime_error("recruit: " + path + " is corrupt");
+        return n;
+    }
+    std::string str() { std::string s(length(1), '\0'); bytes(s.data(), s.size()); return s; }   // empty ones hashed too, as written
     template <class T> std::vector<T> vec() {
-        std::vector<T> v(u64());
-        if (!v.empty() && !f.read(reinterpret_cast<char*>(v.data()), static_cast<std::streamsize>(v.size() * sizeof(T)))) throw std::runtime_error("recruit: " + path + " is truncated");
+        std::vector<T> v(length(sizeof(T)));
+        bytes(v.data(), v.size() * sizeof(T));
         return v;
     }
 };
@@ -478,7 +503,7 @@ std::vector<LocusIndex> build(const BuildOptions& o) {
     for (const auto& d : decoys)
         if (!genomes.count(d)) throw std::runtime_error("recruit: decoy genome " + d + " is not in the background");
     std::string kind;
-    const auto counts = open_counts(o.background, kind, o.log);
+    const auto counts = open_counts(o.background, bg::content_id(m), kind, o.log);
     log("background: " + counts->kind() + "; coordinate reference: " + cref + "; haplotypes: " + std::to_string(haplotypes));
     const anchors::ReferenceAnchors ref = anchors::load_reference((fs::path(o.background) / "anchors" / cref / "reference.anc").string());
     std::vector<std::unique_ptr<anchors::SegmentAnchors>> seg_anchors;
@@ -1176,11 +1201,11 @@ std::vector<LocusIndex> build(const BuildOptions& o) {
 }
 
 void save(const LocusIndex& x, const std::string& path) {
-    const std::string tmp = path + ".tmp";
+    const std::string tmp = path + ".tmp." + std::to_string(::getpid());   // two jobs writing one index do not share it
     {
         Out o{std::ofstream(tmp, std::ios::binary)};
         if (!o.f) throw std::runtime_error("recruit: cannot write " + tmp);
-        o.u64(0);
+        o.raw64(0);
         o.u64(kVersion);
         o.str(x.key());
         for (const auto* s : {&x.name, &x.graph_path, &x.graph_checksum, &x.reference_path, &x.contig, &x.background, &x.store_id,
@@ -1216,8 +1241,9 @@ void save(const LocusIndex& x, const std::string& path) {
             for (const auto* a : {&c.locus_certain, &c.flank_certain, &c.decoy_certain})
                 for (const std::uint64_t v : *a) o.u64(v);
         }
+        o.raw64(o.h);
         o.f.seekp(0);
-        o.u64(kMagic);
+        o.raw64(kMagic);
         o.f.flush();
         if (!o.f) throw std::runtime_error("recruit: cannot write " + tmp);
     }
@@ -1227,7 +1253,7 @@ void save(const LocusIndex& x, const std::string& path) {
 LocusIndex load(const std::string& path) {
     In i{std::ifstream(path, std::ios::binary), path};
     if (!i.f) throw std::runtime_error("recruit: cannot read " + path);
-    if (i.u64() != kMagic) throw std::runtime_error("recruit: " + path + " is not a locus index of this version (or was interrupted)");
+    if (i.raw64() != kMagic) throw std::runtime_error("recruit: " + path + " is not a locus index of this version (or was interrupted)");
     if (i.u64() != kVersion) throw std::runtime_error("recruit: " + path + ": unknown version");
     LocusIndex x;
     const std::string key = i.str();
@@ -1239,25 +1265,25 @@ LocusIndex load(const std::string& path) {
     x.pad = i.u64();
     const std::uint64_t dbits = i.u64();
     std::memcpy(&x.dust, &dbits, 8);
-    x.decoy_genomes.resize(i.u64());
+    x.decoy_genomes.resize(i.length(8));
     for (auto& d : x.decoy_genomes) d = i.str();
     x.paths = i.u64();
     x.codes = i.vec<std::uint64_t>(); x.cls = i.vec<std::uint8_t>(); x.outside = i.vec<std::uint32_t>(); x.mult = i.vec<std::uint16_t>();
     x.backbone = i.vec<std::uint8_t>(); x.nodeset = i.vec<std::uint32_t>();
     x.nodeset_first = i.vec<std::uint32_t>(); x.nodeset_nodes = i.vec<std::uint32_t>();
-    x.nodes.resize(i.u64());
+    x.nodes.resize(i.length(8));
     for (auto& n : x.nodes) n = i.str();
     x.decoy = i.vec<std::uint64_t>(); x.screen = i.vec<std::uint64_t>();
-    x.spans.resize(i.u64());
+    x.spans.resize(i.length(8));
     for (auto& s : x.spans) { s.genome = i.str(); s.contig = i.str(); s.start = i.u64(); s.end = i.u64(); s.forward = i.u64() != 0; s.subtracted = i.u64(); s.piece = i.u64() != 0;
                                       s.anchored_start = i.u64(); s.anchored_end = i.u64(); s.locus_start = i.u64(); s.locus_end = i.u64(); }
     x.ceilings = i.vec<Ceiling>();
     x.dust_demoted = i.u64(); x.span_demoted = i.u64(); x.negative = i.u64();
     x.decoy_min_hits = static_cast<std::uint32_t>(i.u64()); x.decoy_windows = i.u64(); x.decoy_bases = i.u64(); x.haplotypes = i.u64();
-    x.decoy_window_list.resize(i.u64());
+    x.decoy_window_list.resize(i.length(8));
     for (auto& w : x.decoy_window_list) { w.genome = i.str(); w.contig = i.str(); w.start = i.u64(); w.end = i.u64(); w.hits = i.u64(); }
     x.calibrated = i.u64() != 0;
-    x.calibration.resize(i.u64());
+    x.calibration.resize(i.length(8));
     for (auto& c : x.calibration) {
         c.read_class = i.str();
         const std::uint64_t ebits = i.u64();
@@ -1266,15 +1292,21 @@ LocusIndex load(const std::string& path) {
         for (auto* a : {&c.locus_certain, &c.flank_certain, &c.decoy_certain})
             for (std::uint64_t& v : *a) v = i.u64();
     }
+    const std::uint64_t sum = i.h;
+    if (i.raw64() != sum) throw std::runtime_error("recruit: " + path + " is corrupt (its checksum does not match)");
     const std::size_t n = x.codes.size();
-    if (x.cls.size() != n || x.outside.size() != n || x.mult.size() != n || x.backbone.size() != n || x.nodeset.size() != n ||
-        key != x.key())
-        throw std::runtime_error("recruit: " + path + " is corrupt");
+    bool ok = x.cls.size() == n && x.outside.size() == n && x.mult.size() == n && x.backbone.size() == n && x.nodeset.size() == n &&
+              key == x.key() && !x.nodeset_first.empty() && x.nodeset_first.back() == x.nodeset_nodes.size() &&
+              std::is_sorted(x.codes.begin(), x.codes.end()) && std::is_sorted(x.nodeset_first.begin(), x.nodeset_first.end());
+    for (std::size_t k = 0; ok && k < n; ++k) ok = x.nodeset[k] + 1 < x.nodeset_first.size() || x.cls[k] != kPrivate;
+    for (std::size_t k = 0; ok && k < x.nodeset_nodes.size(); ++k) ok = x.nodeset_nodes[k] < x.nodes.size();
+    if (!ok) throw std::runtime_error("recruit: " + path + " is corrupt");
     return x;
 }
 
 void write_report(const LocusIndex& x, const std::string& path) {
-    std::ofstream r(path);
+    const std::string tmp = path + ".tmp." + std::to_string(::getpid());
+    std::ofstream r(tmp);
     std::size_t np = 0, ns = 0, nr = 0, bb = 0, multi = 0;
     for (std::size_t i = 0; i < x.codes.size(); ++i) {
         (x.cls[i] == kPrivate ? np : x.cls[i] == kShared ? ns : nr)++;
@@ -1325,7 +1357,9 @@ void write_report(const LocusIndex& x, const std::string& path) {
               << c.locus_certain[m] << '\t' << rb.substr(0, rb.find('\t')) << '\t' << c.flank_screened << '\t' << c.flank_certain[m] << '\t'
               << c.decoy_screened << '\t' << c.decoy_certain[m] << '\t' << rb.substr(rb.find('\t') + 1) << '\n';
         }
-    if (!r) throw std::runtime_error("recruit: cannot write " + path);
+    r.close();
+    if (!r) throw std::runtime_error("recruit: cannot write " + tmp);
+    fs::rename(tmp, path);
 }
 
 }  // namespace panvar::recruit

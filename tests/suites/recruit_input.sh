@@ -158,6 +158,21 @@ check "--dry-run counts records by kind" 'awk -F"\t" '"'"'$2=="name.sam" && $3 >
 printf 's1\tr_1.fq\tr_2.fq\ns2\tname.sam\ns2\tinter.fq\n' > sheet.tsv
 "$BIN" recruit --locus "$IDX" --samples sheet.tsv -o per_sample -q
 check "a sample sheet writes one table per sample, files of a sample pooled" '[[ -f per_sample/s1.tsv && $(tail -n +2 per_sample/s2.tsv | wc -l) -gt $(tail -n +2 per_sample/s1.tsv | wc -l) ]]'
+# one sample's inputs of two read types are refused: the cut and error rate come from its first reads
+python3 - data/ref.fa > long.fq <<'PY'
+import sys
+s = "".join(l.strip() for l in open(sys.argv[1]) if not l.startswith(">"))
+for i in range(20):
+    r = s[120000 + i * 1500:120000 + i * 1500 + 5000]
+    print(f"@long{i}\n{r}\n+\n{'I' * len(r)}")
+PY
+printf 's3\tr_1.fq\tr_2.fq\ns3\tlong.fq\n' > mixed_sheet.tsv
+"$BIN" recruit --locus "$IDX" --samples mixed_sheet.tsv -o mixed_type -q 2> mixed_type.txt; rc=$?
+check "one sample's short and long inputs are refused" '[[ $rc -ne 0 ]] && grep -q "must be one read type" mixed_type.txt'
+# reads-out: an earlier run's files of the same loci go, so none stays that this run did not write
+mkdir -p stale_out && echo old | gzip > stale_out/locus.ambiguous_9.fq.gz && echo keep > stale_out/notes.txt
+"$BIN" recruit --locus "$IDX" -1 r_1.fq -2 r_2.fq -o stale_run.tsv --reads-out stale_out 2> stale_run.log
+check "reads-out: an earlier run's files of these loci are removed, others kept" '[[ ! -f stale_out/locus.ambiguous_9.fq.gz && -f stale_out/notes.txt && -f stale_run.tsv && ! -f stale_run.tsv.tmp ]] && grep -q "earlier run removed" stale_run.log'
 
 sed -n '5,$p' r_2.fq > shifted_2.fq
 "$BIN" recruit --locus "$IDX" -1 r_1.fq -2 shifted_2.fq -o x.tsv -q 2> err1.txt; rc=$?

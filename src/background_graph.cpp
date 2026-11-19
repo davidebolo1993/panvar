@@ -5,6 +5,7 @@
 #include "panvar/kmer.hpp"
 
 #include <algorithm>
+#include <map>
 #include <cstring>
 #include <fstream>
 #include <stdexcept>
@@ -97,6 +98,7 @@ void for_each_walk(const std::string& gfa, const Graph& g, F&& f) {
     if (!in.ok()) throw std::runtime_error("background: cannot read " + gfa);
     std::string line;
     Walk w;
+    std::map<std::string, std::vector<std::pair<std::uint64_t, std::uint64_t>>> ranges;   // per haplotype name, its walks
     auto node = [&](const std::string& name) {
         const auto it = g.id.find(name);
         if (it == g.id.end()) throw std::runtime_error("background: " + gfa + ": a walk visits undefined node " + name);
@@ -130,7 +132,19 @@ void for_each_walk(const std::string& gfa, const Graph& g, F&& f) {
                 i = e;
             }
         }
+        std::uint64_t len = 0;
+        for (const auto& st : w.steps) len += g.len(st.first);
+        ranges[w.contig].emplace_back(w.offset, w.offset + len);
         f(w);
+    }
+    // a name given twice over the same range (two P lines of one name, or W lines that overlap) would let a span of
+    // the locus be cut from the wrong one: refused
+    for (auto& [name, r] : ranges) {
+        std::sort(r.begin(), r.end());
+        for (std::size_t i = 1; i < r.size(); ++i)
+            if (r[i].first < r[i - 1].second)
+                throw std::runtime_error("background: " + gfa + ": haplotype " + name + " is given twice over " + std::to_string(r[i].first) + "-" +
+                                         std::to_string(std::min(r[i].second, r[i - 1].second)) + " (paths of one name, or walks that overlap)");
     }
 }
 
@@ -314,34 +328,35 @@ Haplotypes::~Haplotypes() = default;
 // two); a part no walk covers is an error, not a shorter sequence.
 std::vector<Haplotypes::Piece> Haplotypes::fetch(const std::string& contig, std::uint64_t start, std::uint64_t end) const {
     std::vector<std::size_t> hit;
+    bool named = false;
     for (std::size_t wi = 0; wi < impl_->walks.size(); ++wi) {
+        if (impl_->walks[wi].contig != contig) continue;
+        named = true;
         const auto& st = impl_->starts[wi];
-        if (impl_->walks[wi].contig == contig && start < st.back() && end > st.front()) hit.push_back(wi);
+        if (start < st.back() && end > st.front()) hit.push_back(wi);
     }
+    if (!named) throw std::runtime_error("background: no haplotype " + contig);
     std::sort(hit.begin(), hit.end(), [&](std::size_t x, std::size_t y) { return impl_->starts[x].front() < impl_->starts[y].front(); });
+    // the parts of [start, end) the walks hold, one piece per walk; the rest (before a walk that does not start at
+    // 0, between walks, past the last) holds no sequence in this genome, so nothing there to cut
     std::vector<Piece> out;
-    std::uint64_t at = start;
     for (const std::size_t wi : hit) {
         const Walk& w = impl_->walks[wi];
         const auto& st = impl_->starts[wi];
-        if (st.back() <= at) continue;
-        if (st.front() > at) break;   // a gap before this walk
-        const std::uint64_t stop = std::min<std::uint64_t>(end, st.back());
+        const std::uint64_t from_pos = std::max<std::uint64_t>(start, st.front()), stop = std::min<std::uint64_t>(end, st.back());
+        if (stop <= from_pos) continue;
         Piece piece;
-        piece.start = at;
-        std::size_t i = static_cast<std::size_t>(std::upper_bound(st.begin(), st.end(), at) - st.begin()) - 1;
+        piece.start = from_pos;
+        std::size_t i = static_cast<std::size_t>(std::upper_bound(st.begin(), st.end(), from_pos) - st.begin()) - 1;
         for (; i + 1 < st.size() && st[i] < stop; ++i) {
             const auto [v, rev] = w.steps[i];
-            const std::uint64_t from = at > st[i] ? at - st[i] : 0;
+            const std::uint64_t from = from_pos > st[i] ? from_pos - st[i] : 0;
             const std::uint64_t to = std::min<std::uint64_t>(impl_->g.len(v), stop - st[i]);
             impl_->g.append(piece.seq, v, rev, from, to);
         }
         out.push_back(std::move(piece));
-        at = stop;
-        if (at >= end) return out;
     }
-    throw std::runtime_error("background: no haplotype " + contig + " covering " + std::to_string(at) + "-" + std::to_string(end) +
-                             (at > start ? " (of " + std::to_string(start) + "-" + std::to_string(end) + ")" : std::string()));
+    return out;
 }
 
 void spell_graph(const std::string& gfa, const std::string& fasta_out) {

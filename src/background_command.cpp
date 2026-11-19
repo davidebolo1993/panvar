@@ -463,7 +463,11 @@ int run_background_command(const std::vector<std::string>& args) {
         std::error_code ec;
         for (const auto& e : fs::directory_iterator(out, ec)) {
             const std::string name = e.path().filename().string();
-            if (e.is_directory() && name.rfind("seg-", 0) == 0 && !listed.count(name)) remove(e.path());
+            if (e.is_directory() && name.rfind("seg-", 0) == 0 && !listed.count(name)) {
+                // an unlisted segment is left over, unless a --segment-only job still writes it (it holds its lock)
+                if (bg::job_alive(e.path().string())) log.info("kept: " + name + " (a job still writes it)");
+                else remove(e.path());
+            }
             else if (e.is_directory() && (name.rfind("panvar-background-", 0) == 0 || name.rfind("panvar-compact-", 0) == 0) && !bg::job_alive(e.path().string())) remove(e.path());
             else if (e.is_directory() && name.rfind(".merge-", 0) == 0) {
                 // a merge stays while every segment it plans is listed, or while one of its range jobs runs

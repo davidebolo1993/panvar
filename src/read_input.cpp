@@ -53,16 +53,16 @@ private:
     bool joined_ = false;
 };
 
-bool read_fastq(GzLineReader& in, std::string& name, std::string& seq, std::string& qual) {
+bool read_fastq(GzLineReader& in, const std::string& path, std::string& name, std::string& seq, std::string& qual) {
     std::string h, plus;
     while (in.getline(h)) {
         if (h.empty()) continue;
-        if (h[0] != '@') throw std::runtime_error("recruit: not FASTQ (a record starts with '" + h.substr(0, 1) + "')");
-        if (!in.getline(seq) || !in.getline(plus) || !in.getline(qual)) throw std::runtime_error("recruit: a truncated FASTQ record");
+        if (h[0] != '@') throw std::runtime_error("recruit: " + path + ": not FASTQ (a record starts with '" + h.substr(0, 1) + "')");
+        if (!in.getline(seq) || !in.getline(plus) || !in.getline(qual)) throw std::runtime_error("recruit: " + path + ": a truncated FASTQ record");
         if (!seq.empty() && seq.back() == '\r') seq.pop_back();
         if (!qual.empty() && qual.back() == '\r') qual.pop_back();
         if (plus.empty() || plus[0] != '+' || qual.size() != seq.size())
-            throw std::runtime_error("recruit: a malformed FASTQ record at " + h.substr(0, 60) + " (multi-line FASTQ is not read)");
+            throw std::runtime_error("recruit: " + path + ": a malformed FASTQ record at " + h.substr(0, 60) + " (multi-line FASTQ is not read)");
         const auto sp = h.find_first_of(" \t");
         name = h.substr(1, sp == std::string::npos ? std::string::npos : sp - 1);
         if (name.size() > 2 && name[name.size() - 2] == '/' && (name.back() == '1' || name.back() == '2')) name.resize(name.size() - 2);
@@ -87,13 +87,13 @@ public:
         std::exception_ptr failed1, failed2;
         std::thread mates([&] {
             try {
-                while (n2 < n && read_fastq(*in2_, names2_[n2], out[n2].seq2, out[n2].qual2)) ++n2;
+                while (n2 < n && read_fastq(*in2_, r2_, names2_[n2], out[n2].seq2, out[n2].qual2)) ++n2;
             } catch (...) {
                 failed2 = std::current_exception();
             }
         });
         try {
-            while (n1 < n && read_fastq(*in1_, out[n1].name, out[n1].seq1, out[n1].qual1)) out[n1++].paired = true;
+            while (n1 < n && read_fastq(*in1_, r1_, out[n1].name, out[n1].seq1, out[n1].qual1)) out[n1++].paired = true;
         } catch (...) {
             failed1 = std::current_exception();
         }
@@ -104,7 +104,7 @@ public:
         if (n2 > n1) throw std::runtime_error("recruit: " + r2_ + " has more reads than " + r1_);
         if (n1 < n) {   // the first file ended: so must the second
             std::string name, seq, qual;
-            if (read_fastq(*in2_, name, seq, qual)) throw std::runtime_error("recruit: " + r2_ + " has more reads than " + r1_);
+            if (read_fastq(*in2_, r2_, name, seq, qual)) throw std::runtime_error("recruit: " + r2_ + " has more reads than " + r1_);
         }
         for (std::size_t i = 0; i < n1; ++i)
             if (names2_[i] != out[i].name) throw std::runtime_error("recruit: mates out of step: " + out[i].name + " and " + names2_[i]);
@@ -131,13 +131,13 @@ public:
         out.resize(n);
         std::size_t k = 0;
         std::string name2;
-        while (k < n && read_fastq(*in_, out[k].name, out[k].seq1, out[k].qual1)) {
+        while (k < n && read_fastq(*in_, path_, out[k].name, out[k].seq1, out[k].qual1)) {
             ++st_.records;
             out[k].paired = interleaved_;
             out[k].seq2.clear();
             out[k].qual2.clear();
             if (interleaved_) {
-                if (!read_fastq(*in_, name2, out[k].seq2, out[k].qual2)) throw std::runtime_error("recruit: " + path_ + ": an odd number of interleaved records");
+                if (!read_fastq(*in_, path_, name2, out[k].seq2, out[k].qual2)) throw std::runtime_error("recruit: " + path_ + ": an odd number of interleaved records");
                 if (name2 != out[k].name) throw std::runtime_error("recruit: " + path_ + ": interleaved mates out of step: " + out[k].name + " and " + name2);
                 ++st_.records;
                 ++st_.pairs;
@@ -240,10 +240,12 @@ const std::array<std::array<char, 2>, 256> kPairs = [] {
     for (int i = 0; i < 256; ++i) t[i] = {seq_nt16_str[i >> 4], seq_nt16_str[i & 15]};
     return t;
 }();
-const std::array<char, 256> kComplement = [] {
+const std::array<char, 256> kComplement = [] {   // IUPAC codes complemented too (R <-> Y, K <-> M, B <-> V, D <-> H)
     std::array<char, 256> t{};
     t.fill('N');
-    t['A'] = 'T'; t['C'] = 'G'; t['G'] = 'C'; t['T'] = 'A';
+    const char* from = "ACGTRYKMBVDHSWN";
+    const char* to = "TGCAYRMKVBHDSWN";
+    for (int i = 0; from[i]; ++i) t[static_cast<unsigned char>(from[i])] = to[i];
     return t;
 }();
 

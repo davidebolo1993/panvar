@@ -57,6 +57,21 @@ check "killed between moving the segment in and writing the manifest: unlisted, 
 check "the same --add again commits it under a free name" 'same s t_123'
 "${BG[@]}" -o s --clean
 check "--clean removes the unlisted segment" '[[ $(on_disk s) == $(listed s) ]]'
+# an unlisted segment a --segment-only job still writes (its lock held) is kept by --clean
+mkdir -p s/seg-live && : > s/seg-live/job.lock
+python3 -c '
+import fcntl, sys, time
+f = open("s/seg-live/job.lock", "r+")
+fcntl.lockf(f, fcntl.LOCK_EX)
+open("s/seg-live/held", "w").close()
+time.sleep(30)
+' & holder=$!
+for _ in $(seq 50); do [[ -f s/seg-live/held ]] && break; sleep 0.1; done
+"${BG[@]}" -o s --clean
+check "--clean keeps a segment a job still writes" '[[ -d s/seg-live ]]'
+kill $holder 2> /dev/null; wait $holder 2> /dev/null
+"${BG[@]}" -o s --clean
+check "--clean removes it once the job is gone" '[[ ! -d s/seg-live ]]'
 "${BG[@]}" -o s --add --genome g1b=data/g1.fa --genome g1=data/g4.fa 2> err.txt; rc=$?
 check "a genome name already in the store is refused" '[[ $rc -ne 0 ]] && grep -q "already in the store" err.txt && same s t_123'
 
