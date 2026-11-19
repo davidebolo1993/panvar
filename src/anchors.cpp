@@ -546,7 +546,9 @@ std::vector<Span> locate(const ReferenceAnchors& ref, const std::vector<const Se
                         if (pts[j].inside) { ++inside; --inside_left; if (first_in == SIZE_MAX) first_in = j; last_in = j; }
                         else { ++flanks; if (pts[j].before) before = j; else if (after == SIZE_MAX) after = j; }
                     }
-                    if (inside < required || (required == 0 && (before == SIZE_MAX || after == SIZE_MAX))) continue;
+                    // a locus with fewer inside anchors than a chain needs (a short one) takes a copy only between
+                    // flank anchors on both sides: a lone inside anchor could be a stray placement anywhere
+                    if (inside < required || (inside < o.min_inside && (before == SIZE_MAX || after == SIZE_MAX))) continue;
                     // the copy on the genome, in reference terms: left = reference start side
                     std::uint64_t lo, hi, ilo, ihi;
                     auto gpos = [&](std::size_t j) { return pts[j].pos; };
@@ -574,11 +576,25 @@ std::vector<Span> locate(const ReferenceAnchors& ref, const std::vector<const Se
                         hi = std::max({a, b, gpos(first_in), gpos(last_in)});
                         ilo = std::min(gpos(first_in), gpos(last_in));
                         ihi = std::max(gpos(first_in), gpos(last_in));
-                    } else {   // an interval without inside anchors: between the nearest flanks
+                    } else {   // an interval without inside anchors: between the nearest flanks, with only the
+                        // interval projected from them taken as certain (the rest may be flank)
                         lo = std::min(gpos(before), gpos(after));
                         hi = std::max(gpos(before), gpos(after));
-                        ilo = lo;
-                        ihi = hi;
+                        // genome position of reference position x, from anchor j (its k-mer covers [ref_pos, ref_pos + k))
+                        auto project = [&](std::size_t j, std::uint64_t x) -> std::uint64_t {
+                            const std::uint64_t r = pts[j].ref_pos, g = gpos(j);
+                            if (same) return x >= r ? g + (x - r) : (g > r - x ? g - (r - x) : 0);
+                            const std::uint64_t back = r + kK;   // reverse: x maps to g + (r + k - x)
+                            return x <= back ? g + (back - x) : (g > x - back ? g - (x - back) : 0);
+                        };
+                        std::uint64_t a = same ? project(before, start) : project(after, end);
+                        std::uint64_t b = same ? project(after, end) : project(before, start);
+                        a = std::clamp(a, lo, hi);
+                        b = std::clamp(b, lo, hi);
+                        if (a > b) a = b = lo + (hi - lo) / 2;
+                        ilo = a;
+                        ihi = b > kK ? b - kK : a;   // inner_end adds k back below
+                        if (ihi < ilo) ihi = ilo;
                     }
                     Span sp;
                     sp.genome = sa.genomes()[g];

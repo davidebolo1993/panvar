@@ -401,8 +401,11 @@ ReadStats recruit_reads(const ReadOptions& options) {
         rows.assign(batch.size(), {});
         std::atomic<std::size_t> cursor{0};
         std::vector<std::thread> pool;
+        std::mutex score_mu;
+        std::exception_ptr score_failed;   // a scorer's error, rethrown once all have stopped
         for (std::size_t t = 0; t < threads; ++t)
             pool.emplace_back([&] {
+              try {
                 std::vector<std::uint32_t> hit;
                 for (std::size_t i; (i = cursor++) < batch.size();) {
                     const Fragment& fr = batch[i];
@@ -415,10 +418,16 @@ ReadStats recruit_reads(const ReadOptions& options) {
                     hit.erase(std::unique(hit.begin(), hit.end()), hit.end());
                     for (const std::uint32_t li : hit) rows[i].push_back(score_fragment(fr, loci[li], li, o, gap_cost, flank_share));
                 }
+              } catch (...) {
+                std::lock_guard<std::mutex> lock(score_mu);
+                if (!score_failed) score_failed = std::current_exception();
+                cursor = batch.size();
+              }
             });
         std::exception_ptr failed;
         try { read_batch(next); } catch (...) { failed = std::current_exception(); }
         for (auto& t : pool) t.join();
+        if (score_failed) std::rethrow_exception(score_failed);
         if (failed) std::rethrow_exception(failed);
         for (std::size_t i = 0; i < batch.size(); ++i) {
             ++st.fragments;

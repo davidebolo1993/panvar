@@ -472,7 +472,12 @@ private:
                 c = todo_.front();
                 todo_.pop_front();
             }
-            for (std::size_t i = 0; i < c->n; ++i) prepare(c->recs[i], c->out[i]);
+            try {
+                for (std::size_t i = 0; i < c->n; ++i) prepare(c->recs[i], c->out[i]);
+            } catch (...) {   // passed on with the chunk, rethrown where it is taken in order
+                if (!c->error) c->error = std::current_exception();
+                c->n = 0;
+            }
             {
                 std::lock_guard<std::mutex> lock(mu_);
                 done_[c->id] = c;

@@ -32,6 +32,38 @@ check "the interval is read from the reference path" '[[ "$(field idx/locus.inde
 check "the locus is found in every genome" '[[ $(awk -F"\t" '"'"'$1=="span" && $2!="genome"'"'"' idx/locus.index.tsv | cut -f2 | sort -u | wc -l | tr -d " ") == 3 ]]'
 check "the paralog makes shared k-mers and decoys" '[[ $(field idx/locus.index.tsv shared | cut -d" " -f1) -gt 1000 && $(field idx/locus.index.tsv decoys) -gt 1000 ]]'
 check "the screen holds only private and shared k-mers, about one in ten" 'awk -F"\t" '"'"'NR>1 && $2!="D" {n++; s+=$6} END {exit !(s > n/20 && s < n/5)}'"'"' dump.tsv'
+
+# a reference path whose label is not where its sequence is, or not its length, is refused
+sed 's/^P\tref#1#chr1:120000-160000/P\tref#1#chr1:125000-165000/' data/locus.gfa > shifted.gfa
+"${RC[@]}" --save-index idx_shift --locus shifted.gfa 2> shift.txt; rc=$?
+check "a reference label off its sequence is refused" '[[ $rc -ne 0 ]] && grep -q "label does not match the reference" shift.txt'
+sed 's/^P\tref#1#chr1:120000-160000/P\tref#1#chr1:120000-150000/' data/locus.gfa > short_label.gfa
+"${RC[@]}" --save-index idx_len --locus short_label.gfa 2> len.txt; rc=$?
+check "a reference label of another length is refused" '[[ $rc -ne 0 ]] && grep -q "length is not the path" len.txt'
+# a link that overlaps would join segments into k-mers no genome has: refused
+awk -F'\t' 'BEGIN {OFS = "\t"} $1 == "S" && $2 == 1 {print "S", "1", substr($3, 1, 20000); print "S", "1b", substr($3, 19971); next}
+  $1 == "P" && $2 ~ /^ref/ {print "P", $2, "1+,1b+", "*"; next} {print}
+  END {print "L", "1", "+", "1b", "+", "30M"}' data/locus.gfa > overlap.gfa
+"${RC[@]}" --save-index idx_ovl --locus overlap.gfa 2> ovl.txt; rc=$?
+check "a link with an overlap is refused" '[[ $rc -ne 0 ]] && grep -q "overlaps by 30 bases" ovl.txt'
+# a short locus (fewer anchors inside than a chain needs): copies only between flank anchors, and only the
+# interval projected from them taken as certain
+python3 - data/ref.fa data/ga.fa > short.gfa <<'PY'
+import sys
+def chrom(path):
+    s = []
+    for line in open(path):
+        if line.startswith(">"):
+            if s: break
+            continue
+        s.append(line.strip())
+    return "".join(s)
+r = chrom(sys.argv[1])[130000:130600]
+print("H\tVN:Z:1.0"); print(f"S\t1\t{r}"); print("P\tref#1#chr1:130000-130600\t1+\t*")
+PY
+"${RC[@]}" --save-index idx_short --locus short.gfa 2> short.txt; rc=$?
+check "a short locus builds and is found in the other genomes" '[[ $rc -eq 0 && $(awk -F"\t" '"'"'$1=="span" && $2!="genome" && $2!="ref"'"'"' idx_short/short.index.tsv | wc -l) -ge 2 ]]'
+check "a short locus's copies are certain only around the projected interval" 'awk -F"\t" '"'"'$1=="span" && $2!="genome" && $2!="ref" {n++; if ($9 - $8 > 0.2 * ($5 - $4)) bad++} END {exit !(n > 0 && !bad)}'"'"' idx_short/short.index.tsv'
 check "ceilings per read length" 'awk -F"\t" '"'"'$1=="ceiling" && $2==150 && $4>0.9 && $4<=1'"'"' idx/locus.index.tsv | grep -q .'
 
 # reads: from the locus, from its paralog, from elsewhere in the reference

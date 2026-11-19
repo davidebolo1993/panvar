@@ -48,24 +48,33 @@ std::vector<Kmer> label_read(const std::string& s, const LocusTable& t, Evidence
 }
 
 // The read's locus segment: the stretch of k-mers with the highest score, a locus k-mer (P, S or R) +1, a
-// decoy k-mer -2, and a k-mer in neither table free for the first k of a run (one differing base makes
-// that many) and `gap_cost` after it, so a long run means the read has left the locus. Returns [first,
-// last] k-mer indices (of equal scores, the longest); first > last when the read has no locus k-mer.
+// decoy k-mer -2, and a k-mer in neither table free within k of a locus or decoy k-mer it runs on from (one
+// differing base makes k of them) and `gap_cost` past that, so a long run means the read has left the locus.
+// Free k-mers are counted from both ends of a run, and kept at either end of the stretch, so a read and its
+// reverse complement get the same segment. Returns [first, last] k-mer indices (of equal scores, the
+// longest); first > last when the read has no locus k-mer.
 std::pair<std::size_t, std::size_t> locus_segment(const std::vector<Kmer>& v, double gap_cost) {
-    double best = 0, cur = 0;
-    std::size_t best_first = 1, best_last = 0, first = 0, run = 0;
-    for (std::size_t i = 0; i < v.size(); ++i) {
-        const bool continues = i > 0 && v[i].start == v[i - 1].start + 1;
-        double x;
-        if (v[i].lab == kLabelN) {
-            run = continues && v[i - 1].lab == kLabelN ? run + 1 : 1;
-            x = run <= kK ? 0.0 : -gap_cost;
-        } else {
-            run = 0;
-            x = v[i].lab == kLabelD ? -2.0 : 1.0;
+    const std::size_t n = v.size();
+    std::vector<double> x(n);
+    for (std::size_t i = 0; i < n;) {
+        if (v[i].lab != kLabelN) { x[i] = v[i].lab == kLabelD ? -2.0 : 1.0; ++i; continue; }
+        std::size_t j = i + 1;   // the run of k-mers in neither table: [i, j), consecutive starts
+        while (j < n && v[j].lab == kLabelN && v[j].start == v[j - 1].start + 1) ++j;
+        const bool left = i > 0 && v[i - 1].lab != kLabelN && v[i].start == v[i - 1].start + 1;
+        const bool right = j < n && v[j].lab != kLabelN && v[j].start == v[j - 1].start + 1;
+        for (std::size_t q = i; q < j; ++q) {
+            const bool near = (left && q - i < kK) || (right && j - 1 - q < kK) || (!left && !right && q - i < kK);
+            x[q] = near ? 0.0 : -gap_cost;
         }
-        if (cur <= 0) { cur = 0; first = i; }
-        cur += x;
+        i = j;
+    }
+    double best = 0, cur = 0;
+    std::size_t best_first = 1, best_last = 0, first = 0;
+    bool free_only = false;   // every k-mer since `first` scored 0: the stretch may still start there
+    for (std::size_t i = 0; i < n; ++i) {
+        if (cur < 0 || (cur == 0 && !free_only)) { cur = 0; first = i; free_only = true; }
+        if (x[i] != 0) free_only = false;
+        cur += x[i];
         if (cur > best || (cur == best && cur > 0 && i - first > best_last - best_first)) { best = cur; best_first = first; best_last = i; }
     }
     return {best_first, best_last};

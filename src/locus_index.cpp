@@ -177,6 +177,7 @@ struct LocusWork {
     LocusIndex idx;
     std::vector<std::uint64_t> counts;                 // background counts per k-mer
     std::vector<std::uint64_t> sub, sub_trim;          // own occurrences in the extended / trimmed spans
+    std::uint64_t ref_kmers = 0;                       // the reference path's k-mers (its interval must hold them)
     std::map<std::string, std::vector<anchors::Span>> spans;   // per genome: the located copies, then the pieces
                                                                // found off them (the locus, both, from there on)
 };
@@ -491,6 +492,13 @@ std::vector<LocusIndex> build(const BuildOptions& o) {
         x.graph_checksum = file_checksum(o.loci[li]);
         graphs[li] = std::make_unique<Graph>(parse_gfa(o.loci[li]));
         const Graph& g = *graphs[li];
+        // paths are spelled by joining their segments, so a link that overlaps would invent k-mers
+        for (const auto& [id, n] : g.nodes)
+            for (const auto* side : {&n.start, &n.end})
+                for (const auto& nb : *side)
+                    if (nb.overlap > 0)
+                        throw std::runtime_error("recruit: " + o.loci[li] + ": a link from " + id + " to " + nb.node_id + " overlaps by " +
+                                                 std::to_string(nb.overlap) + " bases; only 0M or * links are supported");
         std::vector<std::string> names;
         for (const auto& p : g.paths) names.push_back(p.name);
         const auto hit = match_reference_name(names, o.reference_query);
@@ -500,6 +508,9 @@ std::vector<LocusIndex> build(const BuildOptions& o) {
         const std::string ref_seq = spell_path_steps_sequence(g, g.paths[hit[0]].steps);
         const ParsedReferencePath rp = parse_reference_path_label(x.reference_path, ref_seq.size(), g.paths[hit[0]].type == 'W');
         if (!rp.has_interval) throw std::runtime_error("recruit: " + x.reference_path + " carries no interval (contig:start-end)");
+        if (rp.length_mismatch)
+            throw std::runtime_error("recruit: " + x.reference_path + ": the interval's length is not the path's, " + std::to_string(ref_seq.size()) + " bases");
+        kmer::for_each_canonical_kmer(ref_seq.data(), ref_seq.size(), kK, [&](std::uint64_t, std::size_t, bool) { ++w.ref_kmers; });
         x.contig = rp.chrom;
         x.start = rp.region_start_1based - 1;
         x.end = x.start + ref_seq.size();
@@ -571,6 +582,12 @@ std::vector<LocusIndex> build(const BuildOptions& o) {
                 ++w.sub[i];
                 if (pos >= lo && pos + kK <= hi) ++w.sub_trim[i];
             }
+            // the reference's own interval must hold the reference path: a label off its sequence would subtract
+            // nothing there and turn the locus's k-mers shared
+            if (gname == cref && owner[k].second == 0 && hits.size() < w.ref_kmers)
+                throw std::runtime_error("recruit: " + w.idx.reference_path + ": " + cref + " " + sp.contig + ":" + std::to_string(sp.start) + "-" +
+                                         std::to_string(sp.end) + " holds " + std::to_string(hits.size()) + " of the path's " +
+                                         std::to_string(w.ref_kmers) + " k-mers; the label does not match the reference");
             GenomeSpan gs{gname, sp.contig, sp.start, sp.end, sp.forward, hits.size()};
             gs.anchored_start = sp.inner_start;
             gs.anchored_end = sp.inner_end;
@@ -675,10 +692,7 @@ std::vector<LocusIndex> build(const BuildOptions& o) {
                     for (const std::uint32_t li : lk_owners[*id]) if (here[li]) part_hits[p][li].push_back(a + off);
                 });
             };
-            std::vector<std::thread> pool;
-            for (std::size_t p = 1; p < parts; ++p) pool.emplace_back(scan_part, p);
-            scan_part(0);
-            for (auto& t : pool) t.join();
+            parallel_for(parts, parts, scan_part);
             for (std::size_t li = 0; li < work.size(); ++li) {
                 if (!here[li]) continue;
                 std::vector<std::uint64_t> hits;
@@ -917,10 +931,7 @@ std::vector<LocusIndex> build(const BuildOptions& o) {
                 });
             };
             if (starts > 0) {
-                std::vector<std::thread> pool;
-                for (std::size_t p = 1; p < parts; ++p) pool.emplace_back(scan_part, p);
-                scan_part(0);
-                for (auto& t : pool) t.join();
+                parallel_for(parts, parts, scan_part);
                 for (std::size_t li = 0; li < work.size(); ++li)
                     for (std::size_t p = 0; p < parts; ++p)
                         hits[li].insert(hits[li].end(), part_hits[p][li].begin(), part_hits[p][li].end());

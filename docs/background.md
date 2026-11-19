@@ -46,7 +46,7 @@ Counts every 31-mer of a set of genomes once, so that `recruit` can tell, for ea
 | `--verify <path>` | check that another background (store or `.sshash`) holds the same counts | |
 | `--partitions <N>` | partitions of a new store, a power of two | `4096` |
 | `--memory <size>` | memory bound for counting, such as `16G` | `2G` |
-| `--tmp-dir <dir>` | spill files | `$TMPDIR`, else inside the store |
+| `--tmp-dir <dir>` | spill files | `$TMPDIR`, else inside the store (with `--segment-only`, beside the segment folder) |
 | `-t, --threads <N>` | worker threads | the CPUs available |
 | `-q, --quiet` | no progress logs | off |
 

@@ -55,6 +55,24 @@ python3 "$TOOLS/locus_reads.py" data/ref.fa chr1 120000 160000 1000 ovl 9 ovl 15
 "$BIN" recruit --locus "$IDX" -i ovl_1.fq -o ovl_one.tsv -q
 check "wholly overlapping mates count each site once" 'diff <(cut -f1,8 ovl_pair.tsv | sort) <(cut -f1,8 ovl_one.tsv | sort) > /dev/null'
 
+# a read and its reverse complement get the same call: a differing base 15 bases from either end
+python3 - r_1.fq <<'PY'
+import sys
+comp = str.maketrans("ACGTN", "TGCAN")
+with open(sys.argv[1]) as f, open("strand_fw.fq", "w") as fw, open("strand_rc.fq", "w") as rc:
+    lines = f.read().split("\n")
+    for i in range(0, len(lines) - 3, 4):
+        h, s, q = lines[i], list(lines[i + 1]), lines[i + 3]
+        for at in (15, len(s) - 16):
+            s[at] = "A" if s[at] != "A" else "C"
+        s = "".join(s)
+        fw.write(f"{h}\n{s}\n+\n{q}\n")
+        rc.write(f"{h}\n{s.translate(comp)[::-1]}\n+\n{q[::-1]}\n")
+PY
+"$BIN" recruit --locus "$IDX" -i strand_fw.fq -o strand_fw.tsv -q
+"$BIN" recruit --locus "$IDX" -i strand_rc.fq -o strand_rc.tsv -q
+check "a read and its reverse complement get the same call ($(tail -n +2 strand_fw.tsv | wc -l | tr -d ' ') rows)" 'diff <(cut -f1-4,8-11 strand_fw.tsv | sort) <(cut -f1-4,8-11 strand_rc.tsv | sort) > /dev/null'
+
 # mates lost to the QC filter: their partners are scored alone and reported
 awk -F'\t' 'BEGIN {OFS = "\t"} !/^@/ && int($2 / 128) % 2 == 1 && int($2 / 512) % 2 == 0 && ++n % 25 == 0 {$2 += 512} {print}' coord.sam > orphans.sam
 "$BIN" recruit --locus "$IDX" -i orphans.sam -o orphans.tsv -t 2 2> orphans.log; rc=$?
