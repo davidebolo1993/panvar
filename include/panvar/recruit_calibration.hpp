@@ -33,10 +33,15 @@ struct Cut {
     bool met = true;                      // false: no cut reaches the rate (the largest is used)
     bool shown = false;                   // the false-certain share's 95% bound is within the rate: the
                                           // simulation was large enough to show it, not only to see none
+    std::uint32_t floor = 2;              // the lowest cut the read class allows (lowest_cut)
 };
 
+// The lowest cut a read class takes: 2, and 3 for ont reads. Ultra-long noisy reads cross enough sequence to
+// carry two chance private sites far more often than the simulated off-target reads show.
+std::uint32_t lowest_cut(const std::string& read_class);
+
 // The run's read class (`read_class`, or when empty the nearest: short below 1 kb mean read length; long:
-// hifi at an error rate up to 1%, else ont) and its lowest cut, never below 2, whose observed off-target
+// hifi at an error rate up to 1%, else ont) and its lowest cut, never below lowest_cut, whose observed off-target
 // false-certain share is at most `rate`. With fewer screened negatives than 1 / rate this is the lowest cut
 // with none observed.
 Cut calibrated_cut(const std::vector<Calibration>& c, const std::string& read_class, double mean_read_length, double error_rate,

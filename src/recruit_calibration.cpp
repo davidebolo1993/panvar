@@ -281,18 +281,22 @@ double upper_bound(std::uint64_t events, std::uint64_t n) {
     return std::min(1.0, u / static_cast<double>(n));
 }
 
+std::uint32_t lowest_cut(const std::string& read_class) { return read_class == "ont" ? 3 : 2; }
+
 Cut calibrated_cut(const std::vector<Calibration>& cs, const std::string& read_class, double mean_read_length, double error_rate,
                    double rate) {
     const std::string want = !read_class.empty() ? read_class : mean_read_length < 1000 ? "short" : error_rate <= 0.01 ? "hifi" : "ont";
+    Cut none;
+    none.floor = lowest_cut(want);
     for (const Calibration& c : cs) {
         if (c.read_class != want) continue;
         const std::uint64_t screened = c.flank_screened + c.decoy_screened;
-        Cut cut;
+        Cut cut = none;
         cut.by = &c;
         if (screened == 0) return cut;   // nothing measured: no calibrated cut
         cut.min_sites = kMaxCut;
         cut.met = false;
-        for (std::uint32_t m = 2; m <= kMaxCut; ++m) {
+        for (std::uint32_t m = cut.floor; m <= kMaxCut; ++m) {
             const std::uint64_t fc = c.flank_certain[m] + c.decoy_certain[m];
             if (static_cast<double>(fc) <= rate * static_cast<double>(screened)) {
                 cut.min_sites = m;
@@ -303,7 +307,7 @@ Cut calibrated_cut(const std::vector<Calibration>& cs, const std::string& read_c
         cut.shown = upper_bound(c.flank_certain[cut.min_sites] + c.decoy_certain[cut.min_sites], screened) <= rate;
         return cut;
     }
-    return {};
+    return none;
 }
 
 }  // namespace panvar::recruit

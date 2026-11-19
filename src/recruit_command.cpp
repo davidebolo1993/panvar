@@ -53,7 +53,7 @@ void print_recruit_help() {
         << "Calls:\n"
         << "  -o, --out <tsv>                 One row per screened fragment and locus: fate, reason, each mate's\n"
         << "                                  locus segment, the evidence and the graph nodes\n"
-        << "      --false-certain-rate <r>    Per locus, the lowest calibrated private-site cut (at least 2) whose\n"
+        << "      --false-certain-rate <r>    Per locus, the lowest calibrated private-site cut (at least 2; 3 for ont) whose\n"
         << "                                  off-target reads are certain at most at this rate (default 1e-4)\n"
         << "      --min-sites <N>             One private-site cut for every locus instead\n"
         << "      --error-rate <e>            The reads' error rate per base (default: from base qualities); a read\n"

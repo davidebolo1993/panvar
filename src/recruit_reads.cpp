@@ -348,10 +348,13 @@ ReadStats recruit_reads(const ReadOptions& options) {
                 note = std::to_string(o.min_sites) + " given";
             } else {
                 const Cut c = calibrated_cut(calibration[li], o.read_class, mean, o.error_rate, o.false_certain_rate);
+                const std::uint32_t fallback = std::max(o.min_sites, c.floor);
                 if (c.by == nullptr) {
-                    note = std::to_string(o.min_sites) + " (the index carries no calibration)";
+                    loci[li].min_sites = fallback;
+                    note = std::to_string(fallback) + " (the index carries no calibration)";
                 } else if (c.min_sites == 0) {
-                    note = std::to_string(o.min_sites) + " (the calibration screened no off-target read)";
+                    loci[li].min_sites = fallback;
+                    note = std::to_string(fallback) + " (the calibration screened no off-target read)";
                 } else {
                     loci[li].min_sites = c.min_sites;
                     const std::uint64_t scr = c.by->flank_screened + c.by->decoy_screened;
@@ -364,6 +367,7 @@ ReadStats recruit_reads(const ReadOptions& options) {
                                   !c.met ? "no cut reaches the rate: the largest is used"
                                   : c.shown ? "within the rate" : "too few to show the rate (none beyond it seen)");
                     note = b;
+                    if (c.floor > 2) note += "; " + c.by->read_class + " reads start at " + std::to_string(c.floor);
                     if (o.error_rate > 2 * c.by->error_rate) {
                         std::snprintf(b, sizeof b, "; the run's error rate %.4f is above the calibration's %.4f: its off-target reads may be certain more often",
                                       o.error_rate, c.by->error_rate);
