@@ -156,11 +156,37 @@ bool is_gfa_file(const std::string& path) {
     return false;
 }
 
-std::string locus_name_of(const std::string& gfa) {
-    std::string n = fs::path(gfa).filename().string();
-    for (const char* ext : {".gz", ".gfa", ".gfa1"})
-        if (n.size() > std::strlen(ext) && n.compare(n.size() - std::strlen(ext), std::strlen(ext), ext) == 0) n.resize(n.size() - std::strlen(ext));
-    return n;
+// A locus is a graph (GFA) or its haplotypes (FASTA). A FASTA locus is read as a graph of one segment per record, each
+// the only step of a path named as the record: the index needs only the paths' sequences, and a graph's paths spelled
+// out give the same index but for the nodes each private k-mer starts on, which a FASTA locus does not have.
+Graph read_locus(const std::string& path, bool sequences, bool& fasta) {
+    fasta = !is_gfa_file(path);
+    if (!fasta) return parse_gfa(path, ParseGfaOptions{true, sequences});
+    GzLineReader in(path);
+    if (!in.ok()) throw std::runtime_error("recruit: cannot read " + path);
+    Graph g;
+    std::unordered_set<std::string> names;
+    std::string line;
+    Node* node = nullptr;
+    while (in.getline(line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        if (line.empty()) continue;
+        if (line[0] == '>') {
+            const auto sp = line.find_first_of(" \t");
+            const std::string name = line.substr(1, sp == std::string::npos ? std::string::npos : sp - 1);
+            if (name.empty()) throw std::runtime_error("recruit: " + path + ": a FASTA record without a name");
+            if (!names.insert(name).second) throw std::runtime_error("recruit: " + path + ": two records named " + name);
+            const std::string id = std::to_string(g.paths.size() + 1);
+            node = &g.nodes[id];
+            node->id = id;
+            g.paths.push_back(PathRecord{name, 'P', {PathStep{id, false}}});
+            continue;
+        }
+        if (node == nullptr) throw std::runtime_error("recruit: " + path + " is neither a GFA graph nor a FASTA file");
+        if (sequences) node->sequence += line;
+    }
+    if (g.paths.empty()) throw std::runtime_error("recruit: " + path + ": no locus graph or FASTA records");
+    return g;
 }
 
 // Which counts to read: the compacted dictionary beside the store when it holds the manifest's genomes (`content`),
@@ -199,8 +225,9 @@ struct LocusWork {
                                                                // found off them (the locus, both, from there on)
 };
 
-// Every k-mer of every path: nodes it starts on, largest copy number within a path, paths holding it.
-void collect_kmers(const Graph& g, LocusIndex& idx, std::vector<std::uint32_t>& present) {
+// Every k-mer of every path: nodes it starts on (none for a FASTA locus), largest copy number within a path, paths
+// holding it.
+void collect_kmers(const Graph& g, LocusIndex& idx, std::vector<std::uint32_t>& present, bool with_nodes) {
     std::vector<std::string> ids;
     for (const auto& [id, n] : g.nodes) ids.push_back(id);
     const bool numeric = std::all_of(ids.begin(), ids.end(), [](const std::string& s) {
@@ -211,7 +238,7 @@ void collect_kmers(const Graph& g, LocusIndex& idx, std::vector<std::uint32_t>& 
     });
     std::unordered_map<std::string, std::uint32_t> node_index;
     for (std::size_t i = 0; i < ids.size(); ++i) node_index[ids[i]] = static_cast<std::uint32_t>(i);
-    idx.nodes = ids;
+    if (with_nodes) idx.nodes = ids;
 
     struct Agg { std::uint32_t mult = 0, paths = 0; std::vector<std::uint32_t> nodes; };
     std::unordered_map<std::uint64_t, Agg> agg;
@@ -232,7 +259,8 @@ void collect_kmers(const Graph& g, LocusIndex& idx, std::vector<std::uint32_t>& 
             std::size_t e = i;
             Agg& a = agg[occ[i].first];
             while (e < occ.size() && occ[e].first == occ[i].first) {
-                if (a.nodes.empty() || std::find(a.nodes.begin(), a.nodes.end(), occ[e].second) == a.nodes.end()) a.nodes.push_back(occ[e].second);
+                if (with_nodes && (a.nodes.empty() || std::find(a.nodes.begin(), a.nodes.end(), occ[e].second) == a.nodes.end()))
+                    a.nodes.push_back(occ[e].second);
                 ++e;
             }
             a.mult = std::max<std::uint32_t>(a.mult, static_cast<std::uint32_t>(e - i));
@@ -391,11 +419,25 @@ std::string LocusIndex::key() const {
            coordinate_reference + "|" + std::to_string(informative_max) + "|" + std::to_string(pad) + "|" + std::to_string(dust) + "|" + std::to_string(decoy_min_hits) + "|" + d + (calibrated ? "|c1" : "|c0");
 }
 
+std::string locus_name(const std::string& path) {
+    std::string n = fs::path(path).filename().string();
+    auto strip = [&](const char* ext) {
+        const std::size_t e = std::strlen(ext);
+        if (n.size() > e && n.compare(n.size() - e, e, ext) == 0) { n.resize(n.size() - e); return true; }
+        return false;
+    };
+    strip(".gz");
+    for (const char* ext : {".gfa", ".gfa1", ".fa", ".fasta", ".fna"})
+        if (strip(ext)) break;
+    return n;
+}
+
 std::string expected_key(const BuildOptions& o, const std::string& gfa) {
     const bg::Manifest m = bg::read_manifest(o.background);
     LocusIndex k;
     k.graph_checksum = file_checksum(gfa);
-    const Graph g = parse_gfa(gfa, ParseGfaOptions{true, false});
+    bool fasta = false;
+    const Graph g = read_locus(gfa, false, fasta);
     std::vector<std::string> names;
     for (const auto& p : g.paths) names.push_back(p.name);
     const auto hit = match_reference_name(names, o.reference_query);
@@ -520,9 +562,10 @@ std::vector<LocusIndex> build(const BuildOptions& o) {
         LocusWork& w = work[li];
         LocusIndex& x = w.idx;
         x.graph_path = fs::absolute(o.loci[li]).string();
-        x.name = locus_name_of(o.loci[li]);
+        x.name = locus_name(o.loci[li]);
         x.graph_checksum = file_checksum(o.loci[li]);
-        graphs[li] = std::make_unique<Graph>(parse_gfa(o.loci[li]));
+        bool fasta = false;
+        graphs[li] = std::make_unique<Graph>(read_locus(o.loci[li], true, fasta));
         const Graph& g = *graphs[li];
         // paths are spelled by joining their segments, so a link that overlaps would invent k-mers
         for (const auto& [id, n] : g.nodes)
@@ -560,7 +603,7 @@ std::vector<LocusIndex> build(const BuildOptions& o) {
         x.decoy_genomes = decoys;
         x.calibrated = o.calibrate;
         std::vector<std::uint32_t> present;
-        collect_kmers(g, x, present);
+        collect_kmers(g, x, present, !fasta);
         x.backbone.resize(x.codes.size());
         for (std::size_t i = 0; i < x.codes.size(); ++i) x.backbone[i] = present[i] == x.paths && x.mult[i] == 1;
         w.counts = counts->count_batch(x.codes);

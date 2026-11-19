@@ -25,13 +25,14 @@ namespace fs = std::filesystem;
 void print_recruit_help() {
     std::cout
         << "Usage:\n"
-        << "  panvar recruit --locus <graph.gfa> [...] --background <store.bgk> -r <name> --index-only\n"
-        << "  panvar recruit --locus <graph.gfa | index.plx> [...] <reads> -o <out.tsv> [options]\n"
+        << "  panvar recruit --locus <graph.gfa | haplotypes.fa> [...] --background <store.bgk> -r <name> --index-only\n"
+        << "  panvar recruit --locus <graph.gfa | haplotypes.fa | index.plx> [...] <reads> -o <out.tsv> [options]\n"
         << "  panvar recruit --locus <...> [...] --samples <sheet.tsv> -o <out dir> [options]\n\n"
         << "Sort a sample's reads to locus graphs without aligning: each fragment is called certain, ambiguous\n"
         << "or unrecruited for every locus it hits, from an index built once per graph against the background.\n\n"
         << "Locus indexes:\n"
-        << "      --locus <path>              A locus graph (GFA) or its index (.plx); repeatable\n"
+        << "      --locus <path>              A locus graph (GFA), its haplotypes (FASTA, one record per path) or its\n"
+        << "                                  index (.plx); repeatable\n"
         << "      --background <dir>          The background store (required to index a graph)\n"
         << "  -r, --reference <name>          The graph path carrying the coordinates (required to index a graph)\n"
         << "      --coordinate-reference <name>  The background's coordinate reference (default: its only one)\n"
@@ -123,8 +124,9 @@ int run_recruit_command(const std::vector<std::string>& args) {
                 const bool screened = std::binary_search(x.screen.begin(), x.screen.end(), x.codes[k]);
                 out << kmer::decode(x.codes[k], 31) << '\t' << "PSR"[x.cls[k]] << '\t' << x.outside[k] << '\t' << x.mult[k] << '\t'
                     << int(x.backbone[k]) << '\t' << int(screened) << '\t';
-                for (std::uint32_t i = x.nodeset_first[x.nodeset[k]]; i < x.nodeset_first[x.nodeset[k] + 1]; ++i)
-                    out << (i > x.nodeset_first[x.nodeset[k]] ? "," : "") << x.nodes[x.nodeset_nodes[i]];
+                const std::uint32_t first = x.nodeset_first[x.nodeset[k]], last = x.nodeset_first[x.nodeset[k] + 1];
+                if (first == last) out << '.';   // none: a FASTA locus
+                for (std::uint32_t i = first; i < last; ++i) out << (i > first ? "," : "") << x.nodes[x.nodeset_nodes[i]];
                 out << '\n';
             }
             for (const std::uint64_t d : x.decoy) out << kmer::decode(d, 31) << "\tD\t.\t.\t.\t0\t.\n";
@@ -208,7 +210,7 @@ int run_recruit_command(const std::vector<std::string>& args) {
                 }
         return 0;
     }
-    if (o.loci.empty()) throw std::runtime_error("recruit requires --locus <graph.gfa | index.plx>");
+    if (o.loci.empty()) throw std::runtime_error("recruit requires --locus <graph.gfa | haplotypes.fa | index.plx>");
     auto is_plx = [](const std::string& p) { return p.size() > 4 && p.compare(p.size() - 4, 4, ".plx") == 0; };
     std::vector<std::string> given_indexes, graphs;
     for (const auto& l : o.loci) {
@@ -237,11 +239,7 @@ int run_recruit_command(const std::vector<std::string>& args) {
     o.log = [&](const std::string& s) { log.info(s); };
 
     auto index_path = [&](const std::string& gfa, const std::string& ext) {
-        std::string n = fs::path(gfa).filename().string();
-        for (const char* e : {".gz", ".gfa"}) {
-            const std::string x(e);
-            if (n.size() > x.size() && n.compare(n.size() - x.size(), x.size(), x) == 0) n.resize(n.size() - x.size());
-        }
+        const std::string n = recruit::locus_name(gfa);
         const fs::path dir = save_dir.empty() ? fs::path(gfa).parent_path() : fs::path(save_dir);
         fs::create_directories(dir.empty() ? fs::path(".") : dir);
         return (dir / (n + ext)).string();

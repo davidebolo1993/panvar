@@ -80,6 +80,25 @@ fate() { awk -F'\t' -v p="$1" -v f="$2" 'NR>1 && index($1, p)==1 && $3==f' recru
 check "reads from the locus are certain ($(fate loc certain) of 2000)" '[[ $rc -eq 0 && $(fate loc certain) -ge 1900 ]]'
 check "reads from the paralog are never certain, and mostly unrecruited as homolog ($(fate par unrecruited) of 2000)" '[[ $(fate par certain) == 0 && $(fate par unrecruited) -ge 1000 ]]'
 check "reads from elsewhere are not even screened" '[[ $(awk -F"\t" '"'"'NR>1 && index($1, "far")==1'"'"' recruited.tsv | wc -l | tr -d " ") == 0 ]]'
+# a FASTA locus, the graph's paths spelled out one record each (the fixture's steps are all forward): the graph's
+# index but for the nodes, and the same calls
+mkdir -p fa
+awk -F'\t' '$1 == "S" {s[$2] = $3} $1 == "P" {n = split($3, st, ","); q = ""; for (i = 1; i <= n; i++) q = q s[substr(st[i], 1, length(st[i]) - 1)]
+  print ">" $2; print q}' data/locus.gfa > fa/locus.fa
+"${RC[@]}" --save-index idx_fa --locus fa/locus.fa; rc=$?
+"$BIN" recruit --dump-index idx_fa/locus.plx=dump_fa.tsv
+check "a FASTA locus gives its graph's k-mers, classes and counts, without nodes" '[[ $rc -eq 0 ]] && cmp -s <(cut -f1-6 dump.tsv) <(cut -f1-6 dump_fa.tsv) && [[ $(tail -n +2 dump_fa.tsv | cut -f7 | sort -u) == "." ]]'
+check "and its report and calibration but for the graph and its node sets" 'diff <(grep -vE "^locus	(graph|node_sets)	" idx/locus.index.tsv) <(grep -vE "^locus	(graph|node_sets)	" idx_fa/locus.index.tsv) > /dev/null'
+"$BIN" recruit --locus idx_fa/locus.plx -1 reads_1.fq -2 reads_2.fq -o recruited_fa.tsv -t 2 -q
+nodes_col=$(head -1 recruited.tsv | tr '\t' '\n' | grep -n '^nodes$' | cut -d: -f1)
+blank() { awk -v c="$nodes_col" 'BEGIN {FS = OFS = "\t"} {$c = ""; print}' "$1"; }
+check "and the same calls, nodes \".\"" 'cmp -s <(blank recruited.tsv) <(blank recruited_fa.tsv) && [[ $(tail -n +2 recruited_fa.tsv | cut -f"$nodes_col" | sort -u) == "." ]]'
+{ cat fa/locus.fa; printf ">ga#1#chr1:120000-160000\n"; sed -n 2p fa/locus.fa; } > fa/dup.fa
+"${RC[@]}" --save-index idx_dup --locus fa/dup.fa 2> dup.txt; rc=$?
+check "a FASTA locus with two records of one name is refused" '[[ $rc -ne 0 ]] && grep -q "two records named ga#1#chr1:120000-160000" dup.txt'
+printf 'not a locus\n' > fa/text.fa
+"${RC[@]}" --save-index idx_text --locus fa/text.fa 2> text.txt; rc=$?
+check "a file neither GFA nor FASTA is refused" '[[ $rc -ne 0 ]] && grep -q "neither a GFA graph nor a FASTA file" text.txt'
 # across the locus's end (its last few hundred bases are shared: the copies' ends are uncertain): pairs of
 # 1400 bp fragments with one mate well inside and the other past the end; single 2 kb reads past the end
 python3 "$TOOLS/locus_reads.py" data/ref.fa chr1 158700 160400 300 edge 4 reads_edge 1400

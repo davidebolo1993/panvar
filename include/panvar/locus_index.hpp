@@ -119,6 +119,8 @@ struct BuildOptions {
     std::vector<std::string>* errors = nullptr;
 };
 
+// A locus's name: its file's name without .gz and .gfa, .gfa1, .fa, .fasta or .fna; its index is <name>.plx.
+std::string locus_name(const std::string& path);
 // The key a locus index built with these options would carry (to test a saved one before building).
 std::string expected_key(const BuildOptions& o, const std::string& gfa);
 std::vector<LocusIndex> build(const BuildOptions& options);

@@ -37,7 +37,7 @@ Reads, per sample:
 
 ## Required inputs
 
-- `--locus <path>`: a locus graph (GFA; PanSN path names) or its index (`.plx`); repeatable
+- `--locus <path>`: a locus graph (GFA; PanSN path names), its haplotypes (FASTA, one record per path, named as the paths would be), or its index (`.plx`); repeatable. A FASTA locus gives the index its graph would, without the nodes: they are the only thing the index takes from the graph beyond its paths' sequences, so a FASTA locus's `nodes` are `.`.
 - to index a graph: `--background <store>` (a store, or a packaged background: see `background --package`) and `-r, --reference <name>` (the graph path whose name carries the coordinates of the background's coordinate reference)
 - reads: `-1`/`-2` FASTQ pairs, `-i` any one file (FASTQ, SAM, BAM, CRAM), or `--samples <sheet.tsv>` for several samples
 - `-o, --out <path>`: the table (or a folder, with `--samples`); not needed with `--index-only`
