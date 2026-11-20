@@ -207,3 +207,29 @@ with open(os.path.join(out, "split_f", "locus.gfa"), "w") as f:
     f.write(f"S\t1\t{ref2[ls2:le2]}\nS\t2\t{hap_f}\n")
     f.write(f"P\tref#1#chr1:{ls2}-{le2}\t1+\t*\n")
     f.write(f"P\tgf#1#chr1:{ls2}-{ls2 + len(hap_f)}\t2+\t*\n")
+
+# logo/: a locus with no paralog in the coordinate reference, and genomes holding the locus and one homolog each,
+# held out in calibration: gu a 1% diverged paralog of 10 kb of it (its alleles there are the locus's, shared only
+# with gu), gd an identical copy of 8 kb (shared k-mers only). Each homolog is cut in pieces of 400 bases (each with
+# the next one's first 30, so every k-mer of the stretch is in one) laid in reverse order: no three anchors in order,
+# so neither is located as a copy of the locus. A held-out haplotype gh is in the graph alone.
+logo = os.path.join(out, "logo")
+os.makedirs(logo, exist_ok=True)
+ref5 = seq(300000)
+ls5, le5 = 120000, 160000
+
+
+def scrambled(a, b, rate):
+    pieces = [mutate(ref5[x:min(x + 430, b)], rate) for x in range(a, b - 30, 400)]
+    return "".join(p + seq(100) for p in reversed(pieces))
+
+
+write("logo/ref", [("chr1", ref5)])
+write("logo/gu", [("chr1", ref5), ("u", seq(20000) + scrambled(130000, 140000, 0.01) + seq(20000))])
+write("logo/gd", [("chr1", ref5), ("d", seq(20000) + scrambled(145000, 153000, 0.0) + seq(20000))])
+hap_h = mutate(ref5[ls5:le5], 0.002)
+with open(os.path.join(logo, "locus.gfa"), "w") as f:
+    f.write("H\tVN:Z:1.0\n")
+    f.write(f"S\t1\t{ref5[ls5:le5]}\nS\t2\t{hap_h}\n")
+    f.write(f"P\tref#1#chr1:{ls5}-{le5}\t1+\t*\n")
+    f.write(f"P\tgh#1#chr1:{ls5}-{le5}\t2+\t*\n")

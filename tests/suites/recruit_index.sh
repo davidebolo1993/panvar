@@ -283,17 +283,20 @@ check "calibration: certain counts within their totals, falling as the cut rises
 held=$(cal idx/locus.index.tsv | awk -F'\t' '$2=="short" && $6==2 {print $8 " of " $7}')
 check "calibration: the paralog gives off-target reads, the held-out sample locus reads ($held certain at 2 sites)" 'cal idx/locus.index.tsv | awk -F"\t" '"'"'$2=="short" && $6==2 && $12 > 1000 && $7 > 500 && $8 / $7 > 0.9 {ok = 1} END {exit !ok}'"'"''
 check "calibration on 4 threads equals the 1-thread one" '[[ "$(cal idx/locus.index.tsv)" == "$(cal idx4/locus.index.tsv)" ]]'
-check "recruit takes each locus's calibrated cut and reports it" 'grep -q "^locus.locus.site_cut.2.calibrated (short reads)" recruited.summary.tsv'
+check "recruit takes each locus's score thresholds and reports them" 'grep -q "^locus.locus.score.short reads: r_in" recruited.summary.tsv && grep -q "^locus.locus.certain_threshold.[0-9.-]*: held-out recall" recruited.summary.tsv && grep -q "^locus.locus.likely_threshold" recruited.summary.tsv'
+check "the table appends score and tier" '[[ "$(head -1 recruited.tsv | cut -f25-)" == "score	tier" ]] && awk -F"\t" '"'"'NR > 1 && ($25 !~ /^-?[0-9]+\.[0-9][0-9]$/ || ($3 == "certain") != ($26 == "certain")) {bad = 1} END {exit bad}'"'"' recruited.tsv'
+"$BIN" recruit --locus idx/locus.plx -1 reads_1.fq -2 reads_2.fq -o rules1.tsv -t 2 -q --rules v1
+check "the first rules: the calibrated cut, reported" 'grep -q "^locus.locus.site_cut.2.calibrated (short reads)" rules1.summary.tsv'
 "$BIN" recruit --locus idx/locus.plx -1 reads_1.fq -2 reads_2.fq -o fixed.tsv -t 2 -q --min-sites 3
 check "--min-sites gives every locus that cut" 'grep -q "^locus.locus.site_cut.3.given" fixed.summary.tsv'
-"$BIN" recruit --locus idx/locus.plx -1 reads_1.fq -2 reads_2.fq -o ontcut.tsv -t 2 -q --preset ont
-check "ont reads: the calibrated cut starts at 3" 'grep -q -E "^locus.locus.site_cut.[3-8] calibrated \(ont reads\).*ont reads start at 3" ontcut.summary.tsv'
+"$BIN" recruit --locus idx/locus.plx -1 reads_1.fq -2 reads_2.fq -o ontcut.tsv -t 2 -q --preset ont --rules v1
+check "the first rules, ont reads: the calibrated cut starts at 3" 'grep -q -E "^locus.locus.site_cut.[3-8] calibrated \(ont reads\).*ont reads start at 3" ontcut.summary.tsv'
 check "summary rows keep four fields" '[[ $(awk -F"\t" '"'"'NF != 4'"'"' recruited.summary.tsv | wc -l | tr -d " ") == 0 ]]'
 "$BIN" recruit --locus idx/locus.plx -1 reads_1.fq -2 reads_2.fq -o both.tsv -q --min-sites 3 --false-certain-rate 1e-3 2> both.txt; rc=$?
 check "--min-sites and --false-certain-rate together are refused" '[[ $rc -ne 0 ]] && grep -q "not both" both.txt'
 "$BIN" recruit -t 2 -q --background s -r ref --index-only --save-index idx_nocal --locus data/locus.gfa --no-calibration
 "$BIN" recruit --locus idx_nocal/locus.plx -1 reads_1.fq -2 reads_2.fq -o nocal.tsv -t 2 -q
-check "an index without calibration: no calibration rows, the cut 2, the same table" '[[ -z "$(cal idx_nocal/locus.index.tsv)" ]] && grep -q "site_cut.2 (the index carries no calibration)" nocal.summary.tsv && cmp -s recruited.tsv nocal.tsv'
+check "an index without calibration: no calibration rows, the cut 2, the first rules' calls, no score" '[[ -z "$(cal idx_nocal/locus.index.tsv)" ]] && grep -q "site_cut.2 (the index carries no calibration)" nocal.summary.tsv && cmp -s <(cut -f1-24 rules1.tsv) <(cut -f1-24 nocal.tsv) && [[ "$(tail -n +2 nocal.tsv | cut -f25-26 | sort -u)" == ".	." ]]'
 "$BIN" recruit --locus idx_nocal/locus.plx -1 reads_1.fq -2 reads_2.fq -o nocal_ont.tsv -t 2 -q --preset ont
 check "an index without calibration, ont reads: the cut 3" 'grep -q "site_cut.3 (the index carries no calibration)" nocal_ont.summary.tsv'
 mkdir -p twin/a twin/b && cp data/locus.gfa twin/a/locus.gfa && cp data/locus.gfa twin/b/locus.gfa
@@ -350,6 +353,85 @@ if command -v samtools > /dev/null && command -v bgzip > /dev/null; then
   check "genomes read by interval give the pieces and index of a full read ($same of $cases)" '[[ $same == $cases ]]'
 else
   echo "  skip indexed and bgzip genomes (samtools or bgzip not installed)"
+fi
+
+# the score. A locus whose homologs are held by other genomes only: each calibration genome held out of the background
+# in turn, the locus k-mers only it shares read as private, so reads from its homolog carry chance private sites
+"$BIN" background -t 2 --partitions 64 --memory 64M -q --tmp-dir "$OUT/tmp" -o s_logo --genome ref=data/logo/ref.fa --genome gu=data/logo/gu.fa --genome gd=data/logo/gd.fa --coordinate-reference ref
+LG=("$BIN" recruit -q --background s_logo -r ref --index-only --locus data/logo/locus.gfa)
+"${LG[@]}" -t 2 --save-index idx_logo --decoy-genomes ref,gd,gu; rc=$?
+"$BIN" recruit --dump-index idx_logo/locus.plx=dump_logo.tsv
+cg() { awk -F'\t' -v g="$2" -v c="$3" '$1=="calibration_genome" && $2==g {print $c}' "$1"; }
+shared_logo=$(awk -F'\t' 'NR > 1 && $2 == "S"' dump_logo.tsv | wc -l | tr -d ' ')
+check "the decoy genomes other than the reference are held out in calibration ($(field idx_logo/locus.index.tsv calibration_genomes))" '[[ $rc -eq 0 && "$(field idx_logo/locus.index.tsv calibration_genomes)" == "gd,gu (chosen by the homolog k-mers each adds)" ]]'
+check "each relabels as private the locus k-mers only it shares (gu $(cg idx_logo/locus.index.tsv gu 6) + gd $(cg idx_logo/locus.index.tsv gd 6) of $shared_logo shared)" '[[ $(( $(cg idx_logo/locus.index.tsv gu 6) + $(cg idx_logo/locus.index.tsv gd 6) )) == $shared_logo && $(cg idx_logo/locus.index.tsv gu 6) -gt 1000 && $(cg idx_logo/locus.index.tsv gd 6) -gt 1000 ]]'
+genome_private() { awk -F'\t' -v g="$2" '$1=="score_genome" && $2=="short" && $3==g {print $6 " of " $5}' "$1"; }
+check "its homolog's reads are scored with chance private sites (gu: $(genome_private idx_logo/locus.index.tsv gu) screened)" 'awk -F"\t" '"'"'$1=="score_genome" && $2=="short" && $3=="gu" && $6 > 0 && $5 >= $6 {ok = 1} END {exit !ok}'"'"' idx_logo/locus.index.tsv'
+PANVAR_TEST_CALIBRATION_GENOMES_MAX=1 "${LG[@]}" -t 2 --save-index idx_logo1 --decoy-genomes ref,gd,gu
+check "with room for one, the genome adding the most homolog k-mers is taken, not the first listed ($(field idx_logo1/locus.index.tsv calibration_genomes))" '[[ "$(field idx_logo1/locus.index.tsv calibration_genomes)" == gu\ * ]]'
+"${LG[@]}" -t 2 --save-index idx_logo_r --calibration-genomes gd
+check "calibration genomes given that are not decoy genomes: scanned for windows, no decoys from them" '[[ "$(field idx_logo_r/locus.index.tsv calibration_genomes)" == "gd (given)" && $(field idx_logo_r/locus.index.tsv decoys) == 0 ]] && grep -q "^calibration_window.gd.d" idx_logo_r/locus.index.tsv'
+"${LG[@]}" -t 2 --save-index idx_logo_n
+check "no genome to hold out besides the reference: said so" '[[ "$(field idx_logo_n/locus.index.tsv calibration_genomes)" == none\ \(* ]]'
+"${LG[@]}" -t 1 --save-index idx_logo_t1 --decoy-genomes ref,gd,gu
+check "calibration with genomes held out on 1 thread equals 2 threads" 'grep -q "^score_genome.short.gu" idx_logo_t1/locus.index.tsv && cmp -s idx_logo/locus.index.tsv idx_logo_t1/locus.index.tsv && cmp -s idx_logo/locus.plx idx_logo_t1/locus.plx'
+# a long read of the stretch gd shares, with two private sites spliced in 150 bases apart, and a 350-base read of it around
+# them: the same sites, but the long read holds hundreds of k-mers that would carry more sites if it were the locus
+python3 - data/logo/ref.fa > reads_len.fq <<'PY'
+import sys
+seq = "".join(l.strip() for l in open(sys.argv[1]) if not l.startswith(">"))
+read = seq[146000:149000] + seq[125000:125040] + seq[149040:149150] + seq[126000:126040] + seq[149190:152000]
+short = read[2950:3300]
+for name, r in (("long", read), ("short", short)):
+    print(f"@{name}\n{r}\n+\n{'I' * len(r)}")
+PY
+"$BIN" recruit --locus idx_logo/locus.plx -i reads_len.fq -o len.tsv --preset hifi -t 2 -q
+lenrow() { awk -F'\t' -v f="$1" '$1==f {print "sites " $8 ", score " $25}' len.tsv; }
+check "a long stretch with few sites scores below a short dense one (long: $(lenrow long); short: $(lenrow short))" 'awk -F"\t" '"'"'$1=="long" {l = $25; lp = $8} $1=="short" {s = $25; sp = $8} END {exit !(lp == 2 && sp == 2 && l + 0 < s + 0)}'"'"' len.tsv'
+# thresholds follow the asked rate; the table is the same on any thread count. Pairs from the locus and from each homolog
+python3 "$TOOLS/locus_reads.py" data/logo/ref.fa chr1 120000 160000 2000 loc 7 reads_lg_locus
+python3 "$TOOLS/locus_reads.py" data/logo/gu.fa u 20000 32500 1000 hu 8 reads_lg_u
+python3 "$TOOLS/locus_reads.py" data/logo/gd.fa d 20000 30000 1000 hd 9 reads_lg_d
+cat reads_lg_locus_1.fq reads_lg_u_1.fq reads_lg_d_1.fq > reads_lg_1.fq
+cat reads_lg_locus_2.fq reads_lg_u_2.fq reads_lg_d_2.fq > reads_lg_2.fq
+prev=""; mono=1; counts=""
+for rate in 0.1 0.01 0.001 0.0001; do
+  "$BIN" recruit --locus idx_logo/locus.plx -1 reads_lg_1.fq -2 reads_lg_2.fq -o rate_$rate.tsv --certain-rate $rate --likely-rate 0.1 -t 2 -q
+  th=$(awk -F'\t' '$3=="certain_threshold" {split($4, a, ":"); print a[1]}' rate_$rate.summary.tsv 2> /dev/null); [[ $th == any ]] && th=-1e9
+  [[ -z $th ]] && mono=0
+  n=$(awk -F'\t' 'NR > 1 && $3=="certain"' rate_$rate.tsv | wc -l | tr -d ' ')
+  if [[ -n $prev ]] && ! awk -v a="$prev" -v b="$th" -v m="$prev_n" -v n="$n" 'BEGIN {exit !(b + 0 >= a + 0 && n <= m)}'; then mono=0; fi
+  prev=$th; prev_n=$n; counts="$counts $rate:$th:$n"
+done
+check "a lower --certain-rate never lowers a threshold nor adds certain fragments ($counts)" '[[ $mono == 1 ]]'
+"$BIN" recruit --locus idx_logo/locus.plx -1 reads_lg_1.fq -2 reads_lg_2.fq -o t1.tsv -t 1 -q --likely-rate 0.1
+"$BIN" recruit --locus idx_logo/locus.plx -1 reads_lg_1.fq -2 reads_lg_2.fq -o t2.tsv -t 2 -q --likely-rate 0.1 --reads-out t2_reads
+check "scores and tiers on 1 thread equal 2 threads" 'cmp -s t1.tsv t2.tsv && [[ $(awk -F"\t" '"'"'NR > 1 && $25 != "."'"'"' t1.tsv | wc -l) -gt 0 ]]'
+nlikely=$(awk -F'\t' 'NR > 1 && $3=="likely"' t2.tsv | wc -l | tr -d ' ')
+check "likely fragments go to their own files ($nlikely)" '[[ $nlikely -gt 0 && $(gzip -dc t2_reads/locus.likely_1.fq.gz | awk "END {print NR / 4}") == $nlikely ]]'
+"$BIN" recruit --locus idx_logo/locus.plx -1 reads_lg_1.fq -2 reads_lg_2.fq -o bad.tsv --certain-rate 0.01 --likely-rate 0.001 -q 2> bad.txt; rc=$?
+check "--likely-rate below --certain-rate is refused" '[[ $rc -ne 0 ]] && grep -q "likely-rate must be at least" bad.txt'
+# an index of an earlier format is refused, saying so
+cp idx_logo/locus.plx old.plx
+python3 - old.plx <<'PY'
+import struct, sys
+p = sys.argv[1]; b = bytearray(open(p, "rb").read()); b[8:16] = struct.pack("<Q", 15); open(p, "wb").write(bytes(b))
+PY
+"$BIN" recruit --locus old.plx -1 reads_1.fq -2 reads_2.fq -o old.tsv -q 2> old.txt; rc=$?
+check "an index of format 15 is refused: rebuild it" '[[ $rc -ne 0 ]] && grep -q "of format 15; this panvar reads format 16" old.txt && grep -q "rebuild" old.txt'
+# the first rules reproduce a reference build's tables (RECRUIT_V1_BIN: a panvar of the first rules)
+if [[ -n "${RECRUIT_V1_BIN:-}" ]]; then
+  same=0; cases=0
+  "$RECRUIT_V1_BIN" recruit -t 2 -q --background s -r ref --index-only --save-index idx_v1ref --locus data/locus.gfa 2> /dev/null
+  "$BIN" recruit -t 2 -q --background s -r ref --index-only --save-index idx_v1new --locus data/locus.gfa
+  for x in "reads_1.fq -2 reads_2.fq" "reads_edge_1.fq -2 reads_edge_2.fq" "reads_long_1.fq" "reads_span_1.fq" "reads_flank.fq:i"; do
+    args=(-1 ${x%%:*}); [[ $x == *:i ]] && args=(-i ${x%%:*})
+    "$RECRUIT_V1_BIN" recruit --locus idx_v1ref/locus.plx ${args[@]} -o v1ref_$cases.tsv -t 2 -q
+    "$BIN" recruit --locus idx_v1new/locus.plx ${args[@]} -o v1new_$cases.tsv -t 2 -q --rules v1
+    cmp -s <(cut -f1-24 v1new_$cases.tsv) v1ref_$cases.tsv && cmp -s <(grep -v "^input" v1new_$cases.summary.tsv) <(grep -v "^input" v1ref_$cases.summary.tsv) && same=$((same + 1))
+    cases=$((cases + 1))
+  done
+  check "--rules v1 gives the reference build's tables and summaries ($same of $cases inputs)" '[[ $same == $cases ]]'
 fi
 
 # a full store relocated: its segments' records follow, so later steps read the new files
