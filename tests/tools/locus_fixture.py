@@ -193,3 +193,17 @@ with open(os.path.join(out, "rep", "locus.gfa"), "w") as f:
     f.write(f"S\t1\t{ref4[ls4:le4]}\nS\t2\t{hap_r}\n")
     f.write(f"P\tref#1#chr1:{ls4}-{le4}\t1+\t*\n")
     f.write(f"P\tgr#1#chr1:{ls4}-{le4}\t2+\t*\n")
+
+# split_f/: the locus of split/, and a genome whose copy is whole and which holds more of its array mid-way
+# along the same contig, far from the copy with other sequence on both sides (as a close paralog on a
+# chromosome-long contig): the index looks in every genome, and that stretch is no piece
+os.makedirs(os.path.join(out, "split_f"), exist_ok=True)
+arr_f = array(6)
+hap_f = left + arr_f + right
+write("split_f/ref", [("chr1", ref2)])
+write("split_f/gf", [("chr1", ref2[:ls2] + hap_f + ref2[le2:] + seq(150000) + arr_f[:4 * 5500] + seq(20000))])
+with open(os.path.join(out, "split_f", "locus.gfa"), "w") as f:
+    f.write("H\tVN:Z:1.0\n")
+    f.write(f"S\t1\t{ref2[ls2:le2]}\nS\t2\t{hap_f}\n")
+    f.write(f"P\tref#1#chr1:{ls2}-{le2}\t1+\t*\n")
+    f.write(f"P\tgf#1#chr1:{ls2}-{ls2 + len(hap_f)}\t2+\t*\n")

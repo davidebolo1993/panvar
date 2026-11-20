@@ -42,7 +42,7 @@ namespace fs = std::filesystem;
 
 constexpr std::size_t kK = 31, kS = 11;
 constexpr std::uint64_t kMagic = 0x3130305850585650ULL;   // "PVPXP001"
-constexpr std::uint64_t kVersion = 14;   // 2: decoy windows stop at the locus; 3: clusters split at it; 4: S per haplotype; 5: calibration; 6: its decoy pairs cross window edges; 7: locus pieces off the located copies; 8: and past estimated ends; 9: and everywhere for a locus with array pieces outside; 10: stretches reach contig ends; 11: pieces tied to the locus, short contigs whole, no decoys in pieces; 12: copies walked out from their anchors; 13: across repeats; 14: a checksum
+constexpr std::uint64_t kVersion = 15;   // 2: decoy windows stop at the locus; 3: clusters split at it; 4: S per haplotype; 5: calibration; 6: its decoy pairs cross window edges; 7: locus pieces off the located copies; 8: and past estimated ends; 9: and everywhere for a locus with array pieces outside; 10: stretches reach contig ends; 11: pieces tied to the locus, short contigs whole, no decoys in pieces; 12: copies walked out from their anchors; 13: across repeats; 14: a checksum; 15: pieces only next to a copy or at a contig end
 const std::size_t kLengths[] = {100, 150, 250, 1000, 10000};
 constexpr std::size_t kWindowStep = 25;
 // A stretch of a genome is a piece of the locus when, over every window of this many bases in it, this
@@ -51,6 +51,9 @@ constexpr std::size_t kWindowStep = 25;
 // cluster, can be as dense.
 constexpr std::uint64_t kPieceWindow = 5000;
 constexpr double kPieceDensity = 0.95;
+// A stretch is next to a located copy, or to another piece, when at most this many bases lie between them:
+// less than a window of other sequence, as where an array's density dips
+constexpr std::uint64_t kPieceGap = kPieceWindow;
 // The piece scan looks up every kPieceSample-th k-mer start first: a window of kPieceWindow starts holding a share
 // kPieceDensity of the locus's has, at worst, all its misses on sampled starts, and still that many sampled hits
 constexpr std::uint64_t kPieceSample = 8;
@@ -909,13 +912,26 @@ std::vector<LocusIndex> build(const BuildOptions& o) {
                 std::vector<const anchors::Span*> own;   // the located copies on this contig
                 const auto it = w.spans.find(gname);
                 if (it != w.spans.end()) for (const auto& sp : it->second) if (sp.contig == name) own.push_back(&sp);
-                for (const auto& stretch : dense) {
-                    const std::uint64_t a = stretch.first, b = stretch.second;
-                    // only a stretch tied to the locus is a piece: on a contig of a located copy, or reaching a
-                    // contig end (an array broken across contigs, a stub, a contig of its own). One with other
-                    // sequence on both sides, on a contig without a copy, may be a paralog the coordinate
-                    // reference lacks: it stays outside (shared, never falsely private).
-                    if (own.empty() && a > 0 && b < seq.size()) continue;
+                // only a stretch tied to the locus is a piece: reaching a contig end (an array broken across
+                // contigs, a stub, a contig of its own), or next to a located copy, directly or through other
+                // such stretches (an array running past the copy's end). One apart from every copy with other
+                // sequence on both sides may be a paralog the coordinate reference lacks, even on a copy's
+                // contig, which can hold a whole chromosome: it stays outside (shared, never falsely private).
+                std::vector<char> tied(dense.size(), 0);
+                for (std::size_t si = 0; si < dense.size(); ++si) {
+                    const std::uint64_t a = dense[si].first, b = dense[si].second;
+                    tied[si] = a == 0 || b == seq.size() || std::any_of(own.begin(), own.end(), [&](const anchors::Span* sp) {
+                        return a <= sp->end + kPieceGap && sp->start <= b + kPieceGap;
+                    });
+                }
+                // through neighbours: the stretches are sorted and disjoint
+                for (std::size_t si = 1; si < dense.size(); ++si)
+                    if (tied[si - 1] && dense[si].first <= dense[si - 1].second + kPieceGap) tied[si] = 1;
+                for (std::size_t si = dense.size(); si-- > 1;)
+                    if (tied[si] && dense[si].first <= dense[si - 1].second + kPieceGap) tied[si - 1] = 1;
+                for (std::size_t si = 0; si < dense.size(); ++si) {
+                    if (!tied[si]) continue;
+                    const std::uint64_t a = dense[si].first, b = dense[si].second;
                     // the stretch off the copies, as pieces overlapping a neighbouring copy by k - 1 bases: a k-mer
                     // lies wholly in exactly one copy or piece
                     std::vector<std::pair<std::uint64_t, std::uint64_t>> off{{a, b}};
