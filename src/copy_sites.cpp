@@ -181,6 +181,7 @@ std::vector<std::vector<Bubble>> copy_sites(const Graph& graph, const std::vecto
 
     // Per path: its reading, and its tokens matched to each reference token.
     std::vector<std::vector<Tok>> reading(np);
+    std::vector<char> backwards(np, 0);
     std::vector<Alignment> al(np);
     for (std::size_t pi = 0; pi < np; ++pi) {
         if (pi == ref_idx) {
@@ -215,7 +216,11 @@ std::vector<std::vector<Bubble>> copy_sites(const Graph& graph, const std::vecto
                 return cache[k] = interior_similarity(graph, graph.paths[pi], *h[i].c, ref, *rt[j].c);
             };
             Alignment a = align(h, rt, sim);
-            if (!al[pi].score.valid || better(a.score, al[pi].score)) { al[pi] = std::move(a); reading[pi] = std::move(h); }
+            if (!al[pi].score.valid || better(a.score, al[pi].score)) {
+                al[pi] = std::move(a);
+                reading[pi] = std::move(h);
+                backwards[pi] = rev;
+            }
         }
     }
 
@@ -224,8 +229,13 @@ std::vector<std::vector<Bubble>> copy_sites(const Graph& graph, const std::vecto
     std::vector<Windows> copy_win(rt.size());
     for (std::size_t j = 0; j < rt.size(); ++j)
         copy_win[j][&ref] = own_window(ref, rt[j].c->left, rt[j].c->right, rt[j].c->source_to_sink);
-    // Gap sites: between two reference crossings, the paths whose copies between them differ in number.
-    std::map<std::pair<std::size_t, std::size_t>, Windows> gap_win;
+    // Gap sites: between two reference crossings, the paths whose copies between them differ in number. A gap
+    // is read from the first crossing's exit to the second's entry (kBetween). Where those are one step, on the
+    // reference or on a path, that walk would hold no stretch to place the change in: the gap then takes in
+    // the first crossing (kWithFirst), or the second where the first is an end node (kWithSecond), on both
+    // walks, and the path is read there for that crossing, not at its copy site.
+    enum : int { kBetween = 0, kWithFirst = 1, kWithSecond = 2 };
+    std::map<std::tuple<std::size_t, std::size_t, int>, Windows> gap_win;
     std::vector<std::vector<std::size_t>> matched_of(np);   // per path, per reference token: its token, or none
     constexpr std::size_t kNone = static_cast<std::size_t>(-1);
 
@@ -234,12 +244,26 @@ std::vector<std::vector<Bubble>> copy_sites(const Graph& graph, const std::vecto
         const PathRecord& p = graph.paths[pi];
         const std::vector<Tok>& h = reading[pi];
         const auto& pairs = al[pi].pairs;
+        // The path's stretch from one step to another, in its reading: the order of the steps where they
+        // differ, and of the path's crossings where it is one step.
+        const auto stretch = [&](std::size_t from, std::size_t to) {
+            return own_window(p, from, to, from != to ? from < to : backwards[pi] == 0);
+        };
         matched_of[pi].assign(rt.size(), kNone);
         for (const auto& [i, j] : pairs) matched_of[pi][j] = i;
         // The path's window at each reference crossing it matches; widened below over crossings it cannot place.
         std::vector<std::pair<std::size_t, std::size_t>> win(rt.size(), {kNone, kNone});
         std::vector<std::size_t> held(rt.size(), 1);
         for (const auto& [i, j] : pairs) win[j] = {h[i].c->left, h[i].c->right};
+        // The path's gap between its crossings matched to reference crossings jp and jn.
+        const auto add_gap = [&](std::size_t jp, std::size_t jn, const Tok& a, const Tok& b) {
+            int how = kBetween;
+            if (rt[jp].exit >= rt[jn].entry) how = kWithFirst;
+            else if (a.exit == b.entry) how = a.c->site < bubbles.size() ? kWithFirst : kWithSecond;
+            gap_win[{jp, jn, how}][&p] = stretch(how == kWithFirst ? a.entry : a.exit, how == kWithSecond ? b.exit : b.entry);
+            if (how == kWithFirst) win[jp] = {kNone, kNone};
+            if (how == kWithSecond) win[jn] = {kNone, kNone};
+        };
         for (std::size_t k = 0; k <= pairs.size(); ++k) {
             const bool has_p = k > 0, has_n = k < pairs.size();
             const std::size_t i0 = has_p ? pairs[k - 1].first + 1 : 0, i1 = has_n ? pairs[k].first : h.size();
@@ -259,7 +283,7 @@ std::vector<std::vector<Bubble>> copy_sites(const Graph& graph, const std::vecto
                     const PathStep& y = ref.steps[rt[j0 - 1].exit + k];
                     same = x.node_id == y.node_id && (x.reverse != (a.exit > b.entry)) == y.reverse;
                 }
-                if (!same) gap_win[{j0 - 1, j1}][&p] = own_window(p, a.exit, b.entry, a.exit < b.entry);
+                if (!same) add_gap(j0 - 1, j1, a, b);
                 continue;
             }
             bool involves = (has_p && is_multi(rt[j0 - 1].c->site)) || (has_n && is_multi(rt[j1].c->site));
@@ -276,17 +300,9 @@ std::vector<std::vector<Bubble>> copy_sites(const Graph& graph, const std::vecto
                            bubbles[x.c->site].parent_id != 0;
             }
             if (inverted) continue;
-            // Between two matched crossings the change has a place: one gap site, read from the first's exit
-            // to the second's entry on both walks. Where the two crossings meet at one boundary step on the
-            // reference, nothing lies between: the gap starts at the first crossing's entry, and that crossing
-            // is read there, not at its copy site.
+            // Between two matched crossings the change has a place: one gap site.
             if (has_p && has_n) {
-                const Tok& a = h[i0 - 1];
-                const Tok& b = h[i1];
-                const bool meet = rt[j0 - 1].exit >= rt[j1].entry;
-                const std::size_t from = meet ? a.entry : a.exit;
-                gap_win[{j0 - 1, j1}][&p] = own_window(p, from, b.entry, from < b.entry);
-                if (meet) win[j0 - 1] = {kNone, kNone};
+                add_gap(j0 - 1, j1, h[i0 - 1], h[i1]);
                 continue;
             }
             // Otherwise a crossing left over goes into the window of a matched crossing of the same site and
@@ -317,15 +333,26 @@ std::vector<std::vector<Bubble>> copy_sites(const Graph& graph, const std::vecto
     // A gap site's other paths, matching both its reference crossings, hold what the reference holds between them
     // (a path whose stretch differs is a carrier above) and read the reference's stretch: copies they hold
     // between are typed one at a time, not again here.
+    const auto gap_ref_window = [&](std::size_t jp, std::size_t jn, int how) {
+        return own_window(ref, how == kWithFirst ? rt[jp].entry : rt[jp].exit, how == kWithSecond ? rt[jn].exit : rt[jn].entry, true);
+    };
     for (auto& [key, w] : gap_win) {
-        const auto [jp, jn] = key;
-        const std::size_t from = rt[jp].exit >= rt[jn].entry ? rt[jp].entry : rt[jp].exit;
-        const PathWindow rw = own_window(ref, from, rt[jn].entry, true);
+        const auto [jp, jn, how] = key;
+        const PathWindow rw = gap_ref_window(jp, jn, how);
         w[&ref] = rw;
         for (std::size_t pi = 0; pi < np; ++pi) {
             const PathRecord& p = graph.paths[pi];
             if (pi == ref_idx || w.count(&p) || matched_of[pi].empty()) continue;
-            if (matched_of[pi][jp] != kNone && matched_of[pi][jn] != kNone) w[&p] = PathWindow{&ref, rw.first, rw.last, true};
+            if (matched_of[pi][jp] == kNone || matched_of[pi][jn] == kNone) continue;
+            // a carrier in another reading of the same gap holds neither allele here: no window
+            bool other = false;
+            for (const int o : {kBetween, kWithFirst, kWithSecond}) {
+                const auto it = o == how ? gap_win.end() : gap_win.find({jp, jn, o});
+                if (it == gap_win.end()) continue;
+                const auto pw = it->second.find(&p);
+                other = other || (pw != it->second.end() && pw->second.from == &p);
+            }
+            if (!other) w[&p] = PathWindow{&ref, rw.first, rw.last, true};
         }
     }
 
@@ -338,19 +365,18 @@ std::vector<std::vector<Bubble>> copy_sites(const Graph& graph, const std::vecto
         out[si].push_back(std::move(b));
     }
     // The gap sites, each under the site of the reference crossing before it (after it, from the start). Its
-    // boundaries are the steps the reference leaves that crossing by and enters the next by; its interior every
-    // node a path reads between.
+    // boundaries are the ends of the reference's stretch; its interior every node a path reads between.
     for (auto& [key, w] : gap_win) {
-        const auto [jp, jn] = key;
+        const auto [jp, jn, how] = key;
         const std::size_t si = rt[jp].c->site < bubbles.size() ? rt[jp].c->site : rt[jn].c->site;
         if (si >= bubbles.size()) continue;
         Bubble b;
         b.id = bubbles[si].id;
-        const std::size_t from = rt[jp].exit >= rt[jn].entry ? rt[jp].entry : rt[jp].exit;
-        b.source = ref.steps[from].node_id;
-        b.source_reverse = ref.steps[from].reverse;
-        b.sink = ref.steps[rt[jn].entry].node_id;
-        b.sink_reverse = ref.steps[rt[jn].entry].reverse;
+        const PathWindow rw = gap_ref_window(jp, jn, how);
+        b.source = ref.steps[rw.first].node_id;
+        b.source_reverse = ref.steps[rw.first].reverse;
+        b.sink = ref.steps[rw.last].node_id;
+        b.sink_reverse = ref.steps[rw.last].reverse;
         std::set<std::string> inside;
         for (const auto& [path, pw] : w)
             for (std::size_t k = pw.first + 1; k < pw.last; ++k) inside.insert(pw.from->steps[k].node_id);

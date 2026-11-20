@@ -4135,6 +4135,21 @@ python3 -I "$TOOLS/spec_gfa.py" "$SPEC_DIR/tandem_gain.spec" "$OUT/tgain"
 check "tandem gain: the copy inserted once, a change in the other copy of its own (POS:SVTYPE:SVLEN:GT r1 g1 g2)" \
   "$(copy_records "$OUT/tgain/v.region.vcf")" "299:DEL:-80:001 480:INS:450:011 "
 
+# A haplotype holding one copy made of the first copy's first site and the second copy's second (hyb, and hybr on
+# the other strand): its two crossings meet at one node, so the stretch it lacks is read with the first of them.
+# One deletion for both strands, placed on the reference; c1 and c2 lack one whole copy each.
+python3 -I "$TOOLS/spec_gfa.py" "$SPEC_DIR/hybrid_copy.spec" "$OUT/hybc"
+"$BIN" call -i "$OUT/hybc/g.gfa" -c "$OUT/hybc/g.bubbles.csv" -r 'ref#0#chr1:1-1150' -o "$OUT/hybc/v" \
+  --no-per-bubble-vcf -q > "$OUT/hybc/v.log" 2>&1
+check "hybrid copy: one deletion whichever strand the haplotype is stored on (POS:SVTYPE:SVLEN:GT r1 hyb hybr c1 c2)" \
+  "$(copy_records "$OUT/hybc/v.region.vcf")" "200:DEL:-450:0...1 380:DEL:-370:011.. 550:DEL:-300:0..1. "
+check "hybrid copy: every carrier's event is placed on the reference" \
+  "$(grep -c unresolved "$OUT/hybc/v.carrier_events.tsv")" "0"
+"$BIN" benchmark -i "$OUT/hybc/g.gfa" -c "$OUT/hybc/g.bubbles.csv" -r 'ref#0#chr1:1-1150' --calls "$OUT/hybc/v" \
+  -o "$OUT/hybc/b" -q > "$OUT/hybc/b.log" 2>&1
+check "hybrid copy: the records rebuild every haplotype (bp left by call's events:by the VCF)" \
+  "$(awk -F'\t' '$1=="large_left_call_bp"{c=$2} $1=="large_left_vcf_bp"{v=$2} END{print c":"v}' "$OUT/hybc/b.summary.tsv")" "0:0"
+
 printf "\n"
 if [ "$fails" -eq 0 ]; then printf "call_stats: all assertions passed\n"; exit 0; fi
 # repeated last, shortened: a long output can be cut in the middle by ctest
