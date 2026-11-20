@@ -294,7 +294,8 @@ int run_bubble_command(const std::vector<std::string>& args) {
 
         // Find boundary pairs internally with the vg-faithful cactus finder.
         options.snarl_pairs_override =
-            find_top_level_snarls_cactus(snarl_input_from_model(model), &options.snarl_inward_override);
+            find_top_level_snarls_cactus(snarl_input_from_model(model, options.reference_path),
+                                         &options.snarl_inward_override);
         options.snarl_source_supplied = true;
         log.info("snarls: " + std::to_string(options.snarl_pairs_override.size()) + " (built-in finder)");
     } else {

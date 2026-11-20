@@ -958,12 +958,19 @@ allsites() { tail -n +2 "$1" 2>/dev/null | awk -F, '{printf "%s%s..%s", (NR>1?" 
 
 # A --merge-nearby-bp fusion that the overlap pass would drop takes a site with it: here the fused site
 # meets the wrapper kept beside the sites inside it, and the site on the wrapper's far side must survive.
-"$BIN" bubble -i "$CASES/merge_wrapper.gfa" -r REF -o "$OUT/mw" -q >/dev/null 2>"$OUT/mw.err"
-[ "$(allsites "$OUT/mw.bubbles.csv")" = "3..6 8..12" ] \
+# The reference runs through both of the wrapper's boundaries, so the wrapper is kept.
+"$BIN" bubble -i "$CASES/merge_wrapper_onref.gfa" -r REF -o "$OUT/mw" -q >/dev/null 2>"$OUT/mw.err"
+[ "$(allsites "$OUT/mw.bubbles.csv")" = "5..8 10..13" ] \
   && ok "a merge that would lose a site to the overlap pass is undone, both sites kept" \
-  || bad "merge next to a wrapper gave '$(allsites "$OUT/mw.bubbles.csv")', expected '3..6 8..12'"
+  || bad "merge next to a wrapper gave '$(allsites "$OUT/mw.bubbles.csv")', expected '5..8 10..13'"
 grep -q "would lose a site to the overlap" "$OUT/mw.err" \
   && ok "the undone merge is reported" || bad "the undone merge was not reported"
+# The same graph with the reference starting inside the wrapper: one boundary is off the reference, so the
+# wrapper is replaced by the sites inside it, and the two nearby sites merge as any others do.
+"$BIN" bubble -i "$CASES/merge_wrapper.gfa" -r REF -o "$OUT/mwo" -q >/dev/null 2>"$OUT/mwo.err"
+[ "$(allsites "$OUT/mwo.bubbles.csv")" = "3..12" ] \
+  && ok "a wrapper with a boundary off the reference gives way to the sites inside it" \
+  || bad "wrapper off the reference gave '$(allsites "$OUT/mwo.bubbles.csv")', expected '3..12'"
 
 # Only a crossing read through both inward sides is one: `3+ 1+` past the 1+..3+ site walks the outer
 # sides of both boundaries and counted as a deletion allele.

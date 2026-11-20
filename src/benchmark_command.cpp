@@ -858,11 +858,27 @@ int run_benchmark_command(const std::vector<std::string>& args) {
         const BubblePathIndex ridx = build_bubble_path_index(*ref_path);
         for (const Bubble& b : bubbles) {
             std::vector<std::size_t> used;
-            if (!bubble_steps(*ref_path, ridx, b, nullptr, &used) || used.empty()) continue;
-            // The interior, from the last base of the near boundary to the first of the far one: the
-            // boundary nodes are shared sequence.
-            const auto [lo, hi] = std::minmax_element(used.begin(), used.end());
-            bubble_span.push_back({b.id, {region_start + ref_prefix[*lo + 1] - 1, region_start + ref_prefix[*hi]}});
+            if (bubble_steps(*ref_path, ridx, b, nullptr, &used) && !used.empty()) {
+                // The interior, from the last base of the near boundary to the first of the far one: the
+                // boundary nodes are shared sequence.
+                const auto [lo, hi] = std::minmax_element(used.begin(), used.end());
+                bubble_span.push_back({b.id, {region_start + ref_prefix[*lo + 1] - 1, region_start + ref_prefix[*hi]}});
+                continue;
+            }
+            // A site the reference does not cross but runs through (a boundary off the reference): it
+            // spans the reference's steps on its nodes, so what is left there is not read as lying
+            // outside every site.
+            std::size_t lo = SIZE_MAX, hi = 0;
+            const auto take = [&](const std::string& n) {
+                const auto it = ridx.positions.find(n);
+                if (it == ridx.positions.end()) return;
+                for (const std::size_t k : it->second) { lo = std::min(lo, k); hi = std::max(hi, k); }
+            };
+            take(b.source);
+            take(b.sink);
+            for (const std::string& n : b.inside) take(n);
+            if (lo != SIZE_MAX)
+                bubble_span.push_back({b.id, {region_start + ref_prefix[lo] - 1, region_start + ref_prefix[hi + 1]}});
         }
     }
 

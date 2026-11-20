@@ -34,6 +34,12 @@ struct SnarlGraphInput {
     // traverse_decomposition). Empty: no node is walked around, so no cycle roots it; vg's rooting, where
     // every cycle may, is every entry 1.
     std::vector<char> walked_twice;
+    // Per node rank, whether the reference path walks it. A top-level snarl with the reference inside it
+    // and a boundary off the reference does not describe a site along the reference: the root ran through
+    // a haplotype's end, a long insertion or a repeat instead of the reference's ends, so the reference
+    // hangs inside one snarl few paths cross. Such a snarl is replaced by the snarls inside it, recursively
+    // (see find_top_level_snarls_cactus). Empty: no reference given.
+    std::vector<char> on_reference;
 };
 
 // Which side of each boundary the snarl's interior hangs off: true = the node's end side.
@@ -49,12 +55,15 @@ struct SnarlInward {
 // real site there is nested in it. A snarl in a cycle-rooted component holding an end (first or last step)
 // of more than half of that component's paths may be such a wrapper: it is returned with the snarls inside
 // it, recursively, and bubble's overlap pass keeps the smaller sites. `inward`, when given, receives each
-// pair's inward sides in the same order, since the pair alone carries no orientation.
+// pair's inward sides in the same order, since the pair alone carries no orientation. With a reference
+// (`on_reference`), a snarl holding reference nodes with a boundary off the reference is replaced by the
+// snarls inside it, whatever the root.
 std::vector<std::pair<std::string, std::string>> find_top_level_snarls_cactus(
     const SnarlGraphInput& in, std::vector<SnarlInward>* inward = nullptr);
 
 // Build the cactus finder input from an editable GFA model (ranks = node_order index, edge orientation from
-// L-line orients). Use after an internal sort so ids are stable.
-SnarlGraphInput snarl_input_from_model(const GfaModel& model);
+// L-line orients). Use after an internal sort so ids are stable. `reference_path`, a path name in the
+// model, fills `on_reference`; empty leaves it empty.
+SnarlGraphInput snarl_input_from_model(const GfaModel& model, const std::string& reference_path = "");
 
 } // namespace panvar

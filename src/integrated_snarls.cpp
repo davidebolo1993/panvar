@@ -830,16 +830,32 @@ std::vector<std::pair<std::string, std::string>> find_top_level_snarls_cactus(
         }
         return holding * 2 > paths;
     };
+    // A snarl with the reference inside and a boundary off it is not a site along the reference: the
+    // reference enters or leaves it through no boundary, so no record could be placed there and most
+    // haplotypes do not cross it. Its own snarls are passed on instead, down to those the reference runs
+    // between.
+    auto off_reference = [&](const Found& f) {
+        if (in.on_reference.empty()) return false;
+        if (in.on_reference[f.start >> 1] && in.on_reference[f.end >> 1]) return false;
+        for (const std::size_t r : f.interior)
+            if (in.on_reference[r]) return true;
+        return false;
+    };
     std::function<void(std::size_t)> visit = [&](std::size_t i) {
+        const bool wraps = wraps_ends(all[i]);   // also drops the boundaries from the interior
+        if (off_reference(all[i])) {
+            for (const std::size_t c : all[i].children) visit(c);
+            return;
+        }
         emit(all[i]);
-        if (!wraps_ends(all[i])) return;
+        if (!wraps) return;
         for (const std::size_t c : all[i].children) visit(c);
     };
     for (const std::size_t r : roots) visit(r);
     return out;
 }
 
-SnarlGraphInput snarl_input_from_model(const GfaModel& model) {
+SnarlGraphInput snarl_input_from_model(const GfaModel& model, const std::string& reference_path) {
     SnarlGraphInput sgi;
     sgi.node_ids = model.node_order;
     sgi.node_len.resize(model.node_order.size());
@@ -885,6 +901,13 @@ SnarlGraphInput snarl_input_from_model(const GfaModel& model) {
         const auto fi = rank_of.find(p.steps.front().node_id);
         const auto li = rank_of.find(p.steps.back().node_id);
         if (fi != rank_of.end() && li != rank_of.end()) sgi.path_ends.emplace_back(fi->second, li->second);
+        if (!reference_path.empty() && gfa_path_name(p) == reference_path) {
+            sgi.on_reference.assign(model.node_order.size(), 0);
+            for (const auto& st : p.steps) {
+                const auto r = rank_of.find(st.node_id);
+                if (r != rank_of.end()) sgi.on_reference[r->second] = 1;
+            }
+        }
     }
     return sgi;
 }

@@ -999,5 +999,15 @@ check "a site table naming nodes the graph lacks, or an id twice, is refused" "$
        >/dev/null 2> "$OUT/dip.err"
 check "a --diploid VCF is refused as one (rc:says so)" "$?:$(grep -c 'without --diploid' "$OUT/dip.err")" "2:1"
 
+# A site the reference runs through without crossing: its sink I is an insertion two haplotypes carry after A,
+# off the reference. call types nothing there, and the insertions left are named with the site, which spans
+# the reference's steps on its nodes, not as lying outside every site.
+{ printf 'N S 200 1\nN A 100 2\nN I 120 3\nN T 200 4\n'
+  printf 'P ref#0#chr1:1-500 S+,A+,T+\nP h1#1#chr1 S+,A+,I+,T+\nP h2#1#chr1 S+,A+,I+,T+\nP r1#1#chr1 S+,A+,T+\n'
+  printf 'B S I A\n'; } > "$OUT/offref.spec"
+spec offref
+check "a site the reference runs through without crossing is named for what is left on it (type size cause site records)" \
+  "$(left_rows offref)" "INS 120 not_reported 1 .;INS 120 not_reported 1 ."
+
 printf "%d assertion(s) failed\n" "$fails"
 [ "$fails" -eq 0 ]

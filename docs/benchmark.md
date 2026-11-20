@@ -115,7 +115,7 @@ How each rebuild was made (events applied, those left out for overlapping anothe
 | `ref_start`, `ref_end` | where it lies on the reference, from the base before it to the base after |
 | `type`, `size_bp`, `del_bp`, `ins_bp` | `DEL`, `INS` or `SUB`; its size, as `call` sizes it, and the bases removed and added |
 | `reason` | `events.tsv` only: why it is left, a cause of `call`'s miss or, at `vcf`, a VCF reason (step 6) |
-| `bubbles` | the sites it lies in, or can slide to inside a repeat; `.` for none |
+| `bubbles` | the sites it lies in, or can slide to inside a repeat; `.` for none. A site the reference runs through without crossing it (a boundary off the reference) spans the reference's steps on its nodes |
 | `records` | `events.tsv` only: the records it lies at, `.` for none |
 
 `carrier_checks.tsv`, one row per carrier that disagrees with its record:

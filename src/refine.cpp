@@ -1282,7 +1282,8 @@ RefineSummary refine_graph(const RefineOptions& options) {
     bopts.min_variant_bp = options.resnarl_min_variant_bp;
     bopts.merge_nearby_bp = options.resnarl_merge_nearby_bp;
     bopts.fuse_ambiguous = options.resnarl_fuse_ambiguous;
-    bopts.snarl_pairs_override = find_top_level_snarls_cactus(snarl_input_from_model(model), &bopts.snarl_inward_override);
+    bopts.snarl_pairs_override = find_top_level_snarls_cactus(
+        snarl_input_from_model(model, sort_result.resolved_reference), &bopts.snarl_inward_override);
     bopts.snarl_source_supplied = true;
     bopts.quiet = options.quiet;
     bopts.log_module = "refine";
