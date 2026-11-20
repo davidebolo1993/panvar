@@ -22,6 +22,9 @@ struct PathWindow {
     std::size_t last = 0;
     bool forward = true;
     std::size_t crossings = 1;   // the site's crossings it holds: more than one where a copy could not be placed
+    // On a stretch between copies: whole copies this path gains (+) or loses (-) there against the reference, 0
+    // where its change there is not a whole copy.
+    int copies = 0;
 };
 
 struct Bubble {
@@ -67,6 +70,10 @@ struct Bubble {
     std::shared_ptr<const std::unordered_map<const PathRecord*, PathWindow>> windows;
     // Of those, a stretch between two copies where a path holds more or fewer copies than the reference.
     bool between_copies = false;
+    // On such a stretch: the reference's copies of what is gained or lost there, and the ids of the sites those
+    // copies cross.
+    std::size_t copy_ref_cn = 0;
+    std::vector<std::size_t> copy_block_sites;
 };
 
 struct BubbleCallOptions {

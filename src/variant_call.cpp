@@ -2189,6 +2189,8 @@ void call_variants(
         out << "##INFO=<ID=IMPRECISE,Number=0,Type=Flag,Description=\"The breakpoints are not exact, for one of three reasons. The record describes an event CLUSTER rather than one exact event: coalescing joined several pieces that keep reference sequence between them, or the deletion spans loop copies a CNV record counts (their bases are left out of SVLEN), so POS+1..END is wider than the |SVLEN| bases removed. A breakpoint abuts an N in the reference (the base before POS+1 or after END), which places the event only to within the N run. Or a PATH_INVERSION whose breakpoints lie in repeats, with CIPOS/CIEND not zero. On a PRECISE DEL or INV, END-POS equals |SVLEN|\">\n";
         out << "##INFO=<ID=CN_SPAN_AMBIGUOUS,Number=1,Type=Integer,Description=\"Path measurements taken over a module span whose source or sink boundary occurs MORE THAN ONCE in that path. The span is then first-source..last-sink, which is a choice: it can enclose two separate visits and the content between them rather than one module. Every quantity measured over the span -- CN, CNBP, CN_MODULE_REF_BP -- inherits that choice on those paths. Absent when every boundary is visited once\">\n";
         out << "##INFO=<ID=MULTI_CROSSING,Number=1,Type=Integer,Description=\"Traversing paths read across this bubble in one walk that holds more than one traversal: traversals the copy matching could not place one by one, or every traversal of a path where the site table gives no boundary orientations (then counted over the whole path). A traversal is a run of consecutive steps from one boundary to the other with only bubble-interior nodes between (possibly none); a boundary touched from or towards outside the bubble is not one. The walk spans the sequence between its traversals, and the events and copy numbers taken from it count the interior once per traversal. Absent when there are none\">\n";
+        out << "##INFO=<ID=COPY,Number=1,Type=String,Description=\"gain or loss: on a DEL or INS of a stretch between the copies of a duplication the graph collapsed, every carrier gains, or every carrier loses, whole copies there (with --cn such a change is a CNV record instead)\">\n";
+        out << "##INFO=<ID=COPIES,Number=1,Type=Integer,Description=\"With COPY: the copies gained or lost, the most among the carriers\">\n";
         out << "##INFO=<ID=MULTI_CROSSING_UNSCORED,Number=1,Type=Integer,Description=\"Of the MULTI_CROSSING paths, those with a traversal the scored walk does not hold whose allele length differs from every reference traversal of this bubble by --min-sv-bp or more: an SV-sized difference no record here describes. Absent when none\">\n";
         if (!genes.empty())
             out << "##INFO=<ID=GENES,Number=.,Type=String,Description=\"Gene(s) overlapping the variant (from --gtf); for an event inside a gene of a copy-number site's copies, that gene's paralogs its carriers hold\">\n";
@@ -2243,6 +2245,11 @@ void call_variants(
         // field it takes instead, with its measured CN, when none of those records is written.
         struct CnHeld { std::size_t col = 0; std::string measured; std::vector<std::string> holders; };
         std::vector<CnHeld> cn_held;
+        // A record of a stretch between copies whose carriers all gain (+1), or all lose (-1), whole copies, and
+        // that stretch's site.
+        int copy_kind = 0;
+        const Bubble* gap = nullptr;
+        bool of_copies = false;   // from a run of a site read one copy at a time, or of a stretch between copies
     };
     std::vector<OutRecord> out_records;
     // A record's module samples written as REF_CN whose holders are all left out (`gone`) take their measured CN.
@@ -2288,6 +2295,9 @@ void call_variants(
         std::unordered_set<std::string> module_nodes;            // the nodes of the module's copies
         std::vector<char> in_copies;                             // per gene_idx: lies in the copies
         bool module = false;                                     // a MODULE record (else UNIT)
+        // The reference stretch of the copies where their nodes would not say it: a whole copy gained or lost,
+        // whose nodes the reference also walks in its other copies. Empty elsewhere.
+        std::vector<std::pair<std::size_t, std::size_t>> copy_stretch;
     };
     std::vector<DupGeneTarget> dup_targets;
 
@@ -2329,8 +2339,14 @@ void call_variants(
     // Bubbles run serially; parallelism is inside each bubble, over its alleles (the walk-diff DP is
     // the hot path, and an SV locus is usually one dominant folded bubble). Each bubble writes only to
     // its own slot, so results are order-deterministic.
+    // What a run over one site writes. A site read one copy at a time is also read in one walk, for its copy
+    // numbers only: copies are counted over every crossing, as a module or a repeat holds them, while its
+    // other changes are typed copy by copy.
+    enum class SiteRun { kAll, kCopyNumber, kVariants };
+    // The repeat units whose copies the copy-number runs count: a run of copies leaves them out of its walks.
+    std::unordered_set<std::string> counted_units;
     auto process_bubble = [&](std::size_t bubble_idx, const Bubble& bubble,
-                              std::unordered_map<std::string, int>& id_counts) {
+                              std::unordered_map<std::string, int>& id_counts, SiteRun run) {
         // Shadow the shared sinks with this bubble's local buffers: the loop body below
         // writes only through these names, so each bubble accumulates independently. id_counts is per
         // site (variant ids embed the site's id), shared by the copies a site is read as.
@@ -2626,12 +2642,13 @@ void call_variants(
         if (bubble.windows)
             for (const auto& [path, w] : *bubble.windows)
                 if (w.crossings > 1 && traverses.count(path->name)) ++multi_crossing_paths;
-        if (multi_crossing_unscored > 0) {
+        // The run's counters describe how its changes are typed; a copy-number run types none.
+        if (multi_crossing_unscored > 0 && run != SiteRun::kCopyNumber) {
             ++summary.multi_crossing_unscored_bubbles;
             summary.multi_crossing_unscored_paths += multi_crossing_unscored;
             summary.multi_crossing_unscored_ids.push_back(bubble.id);
         }
-        if (multi_crossing_paths > 0) {
+        if (multi_crossing_paths > 0 && run != SiteRun::kCopyNumber) {
             ++summary.multi_crossing_bubbles;
             summary.multi_crossing_paths += multi_crossing_paths;
         }
@@ -3083,7 +3100,7 @@ void call_variants(
         std::unordered_set<std::string> unified_internal;   // repeat units inside the module's copies
         // A stretch between copies holds a gained or lost copy whole, as an insertion or deletion: the nodes it
         // revisits are pieces of the copies on either side, not a module's copies.
-        if (options.cn && ref_idx < graph.paths.size() && !bubble.between_copies) {
+        if (options.cn && ref_idx < graph.paths.size() && run != SiteRun::kVariants) {
             const std::unordered_set<std::string> inside_set(bubble.inside.begin(), bubble.inside.end());
             std::vector<std::size_t> pis;   // the traversing paths
             std::size_t ref_k = SIZE_MAX;
@@ -3294,7 +3311,12 @@ void call_variants(
         // Node-outer, allele-inner, so that every allele's traversal count of a unit node becomes a copy
         // number, including alleles matching the reference: a reference-like traverser gets REF_CN by
         // measurement rather than by default, and the per-gene sidecar has its count to split.
+        // A run of copies writes no copy number: the units the site's own run counts leave its walks.
+        if (run == SiteRun::kVariants)
+            for (const std::string& cn : cn_nodes)
+                if (counted_units.count(cn)) rep_consumed.insert(cn);
         for (const std::string& cn : cn_nodes) {
+            if (run == SiteRun::kVariants) break;
             if (twin_of.count(cn) || unified_internal.count(cn)) continue;
             // No unit-length gate: the per-allele size test below is the one that matters (see
             // rep_callable). A short loop with no SV-sized copy change still produces no record.
@@ -3413,6 +3435,8 @@ void call_variants(
                     for (const std::string& t : tw->second) if (cn_nodes.count(t)) rep_consumed.insert(t);
             }
         }
+
+        if (run == SiteRun::kCopyNumber) counted_units.insert(rep_consumed.begin(), rep_consumed.end());
 
         // DEL/INS/INV per allele, kept down to the rescue floor, then merged. Emitted beside a module record:
         // its DUP is dosage, not the sequence-resolved indels inside the bubble. The
@@ -5015,6 +5039,19 @@ void call_variants(
             std::ostringstream info;
             info << "END=" << end << ";SVTYPE=" << svt;
             if (rp ? (!rp_del.empty() && !rp_ins.empty() && !rp_sub) : sub_sized) info << ";SUBSTITUTION";
+            // At a stretch between copies, a change every carrier makes of whole copies, all gained or all lost.
+            int copy_kind = 0, copy_n = 0;
+            if (bubble.between_copies && e.type != EvType::Dup && bubble.windows) {
+                for (const std::string& m : mr.carriers) {
+                    const auto w = bubble.windows->find(&graph.paths[name_to_pi.at(m)]);
+                    const int c = w == bubble.windows->end() ? 0 : w->second.copies;
+                    const int k = c > 0 ? 1 : c < 0 ? -1 : 0;
+                    if (k == 0 || (copy_kind != 0 && k != copy_kind)) { copy_kind = 0; break; }
+                    copy_kind = k;
+                    copy_n = std::max(copy_n, c > 0 ? c : -c);
+                }
+            }
+            if (copy_kind != 0) info << ";COPY=" << (copy_kind > 0 ? "gain" : "loss") << ";COPIES=" << copy_n;
             // At a collapsed module carriers both gain and lose copies around REF_CN, so a single
             // record-level size is not merely imprecise -- it does not exist. Per-carrier CNBP carries
             // it instead. A UNIT record is the same when its carriers change in both directions: some
@@ -5423,6 +5460,9 @@ void call_variants(
             rec.unaligned_missing = n_unaligned;
             rec.covered_missing = n_unknown - n_unaligned;
             rec.cn_held = std::move(held_fix);
+            rec.copy_kind = copy_kind;
+            if (bubble.between_copies) rec.gap = &bubble;
+            rec.of_copies = bubble.windows != nullptr;
             if (!held_ptrs.empty()) held_rows.emplace_back(out_records.size(), std::move(held_ptrs));
             id_of[&mr] = id;
             out_records.push_back(std::move(rec));
@@ -5689,11 +5729,40 @@ void call_variants(
     for (std::size_t pi = 0; pi < graph.paths.size(); ++pi)
         if (&graph.paths[pi] == ref_path) ref_pi = pi;
     const std::vector<std::vector<Bubble>> copies = copy_sites(graph, path_indexes, bubbles, ref_pi);
+    // First the copy numbers of the sites read copy by copy, each in one walk as any site: of what that run
+    // writes, only its copy-number records are kept. Their counted units are then known to the runs of copies.
+    for (std::size_t bubble_idx = 0; bubble_idx < bubbles.size(); ++bubble_idx) {
+        if (copies[bubble_idx].empty()) continue;
+        bool split = false;
+        for (const Bubble& b : copies[bubble_idx]) split = split || (b.windows && !b.between_copies);
+        if (!split) continue;
+        BubbleOut& bo = bouts[bubble_idx];
+        const std::size_t r0 = bo.records.size(), n0 = bo.variant_nodes.size(), c0 = bo.carrier_events.size();
+        std::unordered_map<std::string, int> id_counts;
+        process_bubble(bubble_idx, bubbles[bubble_idx], id_counts, SiteRun::kCopyNumber);
+        std::unordered_set<std::string> kept;
+        std::vector<OutRecord> recs;
+        for (std::size_t k = r0; k < bo.records.size(); ++k)
+            if (bo.records[k].line.find(";SVTYPE=CNV;") != std::string::npos) {
+                kept.insert(bo.records[k].id);
+                recs.push_back(std::move(bo.records[k]));
+            }
+        bo.records.resize(r0);
+        for (OutRecord& r : recs) bo.records.push_back(std::move(r));
+        const auto keep_rows = [&](std::vector<std::string>& rows, std::size_t from) {
+            rows.erase(std::remove_if(rows.begin() + static_cast<std::ptrdiff_t>(from), rows.end(),
+                                      [&](const std::string& row) { return !kept.count(row.substr(0, row.find('\t'))); }),
+                       rows.end());
+        };
+        keep_rows(bo.variant_nodes, n0);
+        keep_rows(bo.carrier_events, c0);
+    }
     for (std::size_t bubble_idx = 0; bubble_idx < bubbles.size(); ++bubble_idx) {
         // ids are per site, so the copies of a site share one count and number their records apart
         std::unordered_map<std::string, int> id_counts;
-        if (copies[bubble_idx].empty()) process_bubble(bubble_idx, bubbles[bubble_idx], id_counts);
-        for (const Bubble& b : copies[bubble_idx]) process_bubble(bubble_idx, b, id_counts);
+        if (copies[bubble_idx].empty()) process_bubble(bubble_idx, bubbles[bubble_idx], id_counts, SiteRun::kAll);
+        for (const Bubble& b : copies[bubble_idx])
+            process_bubble(bubble_idx, b, id_counts, b.windows ? SiteRun::kVariants : SiteRun::kAll);
         call_progress.tick();
     }
 
@@ -5872,6 +5941,332 @@ void call_variants(
         if (no_site > 0)
             std::cerr << cli::log_prefix("call") << "warning: " << no_site << " inversion(s) read from the walks lie in no inversion site of "
                       << options.bubbles_csv_in << " and are not written (made at a different --min-variant-bp?)\n";
+    }
+
+    // ---- Whole copies gained or lost, with --cn. A stretch between copies whose carriers all gain or all lose whole
+    // copies is one copy-number record over the copies, carrying each carrier's own bases as its forms, in place of
+    // its insertions or deletions. Where a module record of the site's one-walk run already holds those carriers'
+    // copy change (its copy is as long as the change), that record is the block's and the insertions or deletions
+    // go. Module records of single sites in the copies, each counting the same change over its own few nodes, give
+    // way to the block's record, which takes over their genes. A module carrier's change at a copy site that one of
+    // its copies holds is the module's, and the carrier leaves that record.
+    if (options.cn && !options.diploid && !out_records.empty()) {
+        const auto split = [](const std::string& line, char sep) {
+            std::vector<std::string> f;
+            std::size_t a = 0;
+            const std::size_t n = !line.empty() && line.back() == '\n' ? line.size() - 1 : line.size();
+            while (true) {
+                const std::size_t b = line.find(sep, a);
+                if (b == std::string::npos || b >= n) { f.push_back(line.substr(a, n - a)); break; }
+                f.push_back(line.substr(a, b - a));
+                a = b + 1;
+            }
+            return f;
+        };
+        const auto info_of = [](const std::string& info, const std::string& key) -> std::string {
+            const std::string k = key + "=";
+            for (std::size_t p = 0; p <= info.size();) {
+                const std::size_t q = std::min(info.find(';', p), info.size());
+                if (info.compare(p, k.size(), k) == 0) return info.substr(p + k.size(), q - p - k.size());
+                p = q + 1;
+            }
+            return std::string();
+        };
+        struct Parsed {
+            std::vector<std::string> cols;
+            std::set<std::size_t> carriers;   // sample columns holding GT 1
+            bool module = false;
+            std::size_t unit = 0;
+        };
+        std::vector<Parsed> parsed(out_records.size());
+        for (std::size_t r = 0; r < out_records.size(); ++r) {
+            Parsed& pr = parsed[r];
+            pr.cols = split(out_records[r].line, '\t');
+            for (std::size_t c = 9; c < pr.cols.size(); ++c)
+                if (pr.cols[c].compare(0, 2, "1:") == 0 || pr.cols[c] == "1") pr.carriers.insert(c - 9);
+            pr.module = info_of(pr.cols[7], "CN_METHOD") == "MODULE";
+            if (pr.module) pr.unit = static_cast<std::size_t>(std::atoll(info_of(pr.cols[7], "CN_UNIT_BP").c_str()));
+        }
+        std::unordered_set<std::string> drop;   // records left out, with their node and carrier rows
+        std::unordered_map<std::string, std::vector<std::string>> ce_of;   // record -> its carrier rows
+        for (const std::string& row : carrier_events_rows) ce_of[row.substr(0, row.find('\t'))].push_back(row);
+        std::unordered_map<std::string, std::string> vn_of;
+        for (const std::string& row : variant_nodes_rows) vn_of[row.substr(0, row.find('\t'))] = row;
+        std::vector<OutRecord> added;
+        std::vector<std::string> added_vn, added_ce;
+        std::unordered_set<std::string> ids;
+        for (const OutRecord& r : out_records) ids.insert(r.id);
+
+        // The blocks: whole-copy records grouped where their reference stretches meet.
+        std::vector<std::size_t> whole;
+        for (std::size_t r = 0; r < out_records.size(); ++r)
+            if (out_records[r].copy_kind != 0 && out_records[r].gap != nullptr) whole.push_back(r);
+        std::vector<std::size_t> group(whole.size());
+        for (std::size_t k = 0; k < whole.size(); ++k) group[k] = k;
+        const std::function<std::size_t(std::size_t)> root = [&](std::size_t k) { return group[k] == k ? k : group[k] = root(group[k]); };
+        for (std::size_t a = 0; a < whole.size(); ++a)
+            for (std::size_t b = a + 1; b < whole.size(); ++b) {
+                const OutRecord& x = out_records[whole[a]];
+                const OutRecord& y = out_records[whole[b]];
+                if (x.gap == y.gap || (x.pos <= std::max(y.end, y.pos) && y.pos <= std::max(x.end, x.pos)))
+                    group[root(a)] = root(b);
+            }
+        std::map<std::size_t, std::vector<std::size_t>> blocks;
+        for (std::size_t k = 0; k < whole.size(); ++k) blocks[root(k)].push_back(whole[k]);
+
+        for (const auto& [key, recs] : blocks) {
+            (void)key;
+            std::set<std::size_t> carriers, sites;
+            std::set<const Bubble*> gaps;
+            long long copy_bp = 0;
+            for (const std::size_t r : recs) {
+                carriers.insert(parsed[r].carriers.begin(), parsed[r].carriers.end());
+                gaps.insert(out_records[r].gap);
+                sites.insert(out_records[r].gap->copy_block_sites.begin(), out_records[r].gap->copy_block_sites.end());
+                copy_bp = std::max(copy_bp, std::llabs(std::atoll(info_of(parsed[r].cols[7], "SVLEN").c_str())));
+            }
+            std::vector<std::size_t> pieces;
+            bool covered = false;
+            for (std::size_t r = 0; r < out_records.size(); ++r) {
+                if (!parsed[r].module || drop.count(out_records[r].id) || !sites.count(out_records[r].bubble_id)) continue;
+                const Parsed& m = parsed[r];
+                std::size_t shared = 0;
+                for (const std::size_t c : carriers) shared += m.carriers.count(c);
+                if (2 * static_cast<long long>(m.unit) >= copy_bp) covered = covered || shared == carriers.size();
+                else if (2 * shared >= carriers.size()) pieces.push_back(r);
+            }
+            if (covered) {
+                for (const std::size_t r : recs) drop.insert(out_records[r].id);
+                continue;
+            }
+
+            // The block's record: each carrier's own change is a form, as its carrier row gives it.
+            const OutRecord& first = out_records[recs.front()];
+            std::size_t ref_cn = SIZE_MAX;
+            for (const Bubble* g : gaps) ref_cn = std::min(ref_cn, g->copy_ref_cn);
+            struct Form { std::size_t rs, re; std::string alt; bool operator<(const Form& o) const { return std::tie(rs, re, alt) < std::tie(o.rs, o.re, o.alt); } };
+            std::map<std::string, std::vector<Form>> forms_of;   // haplotype -> its forms
+            std::set<Form> all_forms;
+            std::vector<std::string> nodes;
+            std::set<std::string> node_seen;
+            for (const std::size_t r : recs) {
+                const std::string& rid = out_records[r].id;
+                for (const std::string& row : ce_of[rid]) {
+                    const std::vector<std::string> f = split(row, '\t');
+                    if (f.size() < 11 || f[2] == "unresolved") continue;
+                    Form fm{static_cast<std::size_t>(std::atoll(f[3].c_str())), static_cast<std::size_t>(std::atoll(f[4].c_str())),
+                            f[9] == "." ? std::string() : f[9]};
+                    all_forms.insert(fm);
+                    for (const std::string& h : split(f[10], ',')) forms_of[h].push_back(fm);
+                }
+                if (const auto vn = vn_of.find(rid); vn != vn_of.end())
+                    for (const std::string& n : split(split(vn->second, '\t').back(), ','))
+                        if (node_seen.insert(n).second) nodes.push_back(n);
+            }
+            if (all_forms.empty()) continue;
+            for (const std::size_t r : recs) drop.insert(out_records[r].id);
+            for (const std::size_t r : pieces) drop.insert(out_records[r].id);
+            const std::vector<Form> fl(all_forms.begin(), all_forms.end());
+            const auto form_no = [&](const Form& f) { return static_cast<std::size_t>(std::lower_bound(fl.begin(), fl.end(), f) - fl.begin()) + 1; };
+            std::size_t pos = SIZE_MAX, end = 0;
+            for (const Form& f : fl) { pos = std::min(pos, f.rs - 1); end = std::max(end, f.re); }
+            end = std::max(end, pos);
+            // CN and bp per haplotype: the reference's copies, and those its stretch gains or loses.
+            std::vector<std::string> fmt(sample_names.size(), ".:.:.:.:.:.");
+            std::size_t an = 0, ac = 0;
+            std::vector<double> per_copy;
+            DupGeneTarget target;
+            target.module = true;
+            for (std::size_t c = 0; c < sample_names.size(); ++c) {
+                const PathRecord& p = graph.paths[name_to_pi.at(sample_names[c])];
+                int copies = 0;
+                bool reads = false;
+                for (const Bubble* g : gaps)
+                    if (const auto w = g->windows->find(&p); w != g->windows->end()) { reads = true; copies = copies != 0 ? copies : w->second.copies; }
+                if (!reads) continue;
+                const std::size_t cn = static_cast<std::size_t>(std::max<long long>(0, static_cast<long long>(ref_cn) + copies));
+                target.sample_cn[sample_names[c]] = cn;
+                long long bp = 0;
+                std::string form_ids;
+                if (copies != 0) {
+                    const auto it = forms_of.find(sample_names[c]);
+                    if (it != forms_of.end()) {
+                        std::vector<std::size_t> no;
+                        for (const Form& f : it->second) {
+                            bp += static_cast<long long>(f.alt.size()) - static_cast<long long>(f.re + 1 - f.rs);
+                            no.push_back(form_no(f));
+                        }
+                        std::sort(no.begin(), no.end());
+                        for (std::size_t k = 0; k < no.size(); ++k) form_ids += (k ? "+" : "") + std::to_string(no[k]);
+                        per_copy.push_back(std::fabs(static_cast<double>(bp)) / std::abs(copies));
+                    }
+                }
+                const bool carrier = copies != 0 && !form_ids.empty();
+                fmt[c] = std::string(carrier ? "1" : "0") + ':' + std::to_string(cn) + ':' + std::to_string(bp) + ":@RESID" +
+                         std::to_string(bp) + '|' + std::to_string(copies) + ':' + std::to_string(bp) + ':' + (carrier ? form_ids : ".");
+                if (&p != ref_path) { ++an; if (carrier) ++ac; }
+            }
+            std::sort(per_copy.begin(), per_copy.end());
+            const long long unit = per_copy.empty() ? copy_bp : std::llround(per_copy[per_copy.size() / 2]);
+            for (std::string& f : fmt) {   // CNRESID = CNBP - (CN - REF_CN) x unit
+                const std::size_t at = f.find(":@RESID");
+                if (at == std::string::npos) continue;
+                const std::size_t bar = f.find('|', at);
+                const std::size_t colon = f.find(':', bar);
+                const long long bp = std::atoll(f.substr(at + 7, bar - at - 7).c_str());
+                const long long copies = std::atoll(f.substr(bar + 1, colon - bar - 1).c_str());
+                f = f.substr(0, at) + ':' + std::to_string(bp - copies * unit) + f.substr(colon);
+            }
+            std::string id = "bubble" + std::to_string(first.bubble_id) + "_CNV_" + first.id.substr(first.id.rfind('_') + 1);
+            for (int n = 2; ids.count(id); ++n) id = "bubble" + std::to_string(first.bubble_id) + "_CNV_" + first.id.substr(first.id.rfind('_') + 1) + '_' + std::to_string(n);
+            ids.insert(id);
+            OutRecord rec;
+            rec.pos = pos; rec.end = end; rec.bubble_id = first.bubble_id; rec.id = id;
+            std::ostringstream info;
+            info << "END=" << end << ";SVTYPE=CNV;BUBBLE_ID=" << first.bubble_id << ";AN=" << an << ";AC=" << ac;
+            { char buf[32]; std::snprintf(buf, sizeof(buf), "%.4g", an > 0 ? static_cast<double>(ac) / static_cast<double>(an) : 0.0); info << ";AF=" << buf; }
+            info << ";EVENT_NODES=";
+            for (std::size_t k = 0; k < nodes.size(); ++k) info << (k ? "," : "") << nodes[k];
+            info << ";REF_CN=" << ref_cn << ";CN_UNIT_BP=" << unit << ";CN_METHOD=MODULE;CN_FORMS=";
+            std::vector<std::string> seq_fa;
+            for (std::size_t k = 0; k < fl.size(); ++k) {
+                info << (k ? "," : "") << fl[k].rs << '-' << fl[k].re << ':';
+                if (options.max_seq_bp == 0 || fl[k].alt.size() <= options.max_seq_bp) { info << fl[k].alt; continue; }
+                info << '*';
+                const std::string name = "CN_FORMS." + std::to_string(k + 1);
+                seq_fa.push_back(name);
+                if (options.max_fa_seq_bp == 0 || fl[k].alt.size() <= options.max_fa_seq_bp) rec.fa_seqs.emplace_back(name, fl[k].alt);
+            }
+            if (!seq_fa.empty()) {
+                info << ";SEQ_FA=";
+                for (std::size_t k = 0; k < seq_fa.size(); ++k) info << (k ? "," : "") << seq_fa[k];
+            }
+            const std::string ref_base = pos >= ref_meta.region_start_1based && pos - ref_meta.region_start_1based < ref_genome.size()
+                ? std::string(1, ref_genome[pos - ref_meta.region_start_1based]) : std::string("N");
+            std::string line = ref_meta.chrom + '\t' + std::to_string(pos) + '\t' + id + '\t' + ref_base + "\t<CNV>\t.\tPASS\t" +
+                               info.str() + "\tGT:CN:CNBP:CNRESID:MODBP:CNFORM";
+            for (const std::string& f : fmt) line += '\t' + f;
+            rec.line = line + '\n';
+            added.push_back(std::move(rec));
+            std::string nl;
+            for (std::size_t k = 0; k < nodes.size(); ++k) nl += (k ? "," : "") + nodes[k];
+            added_vn.push_back(id + '\t' + std::to_string(first.bubble_id) + "\tCNV\t" + nl);
+            std::map<std::string, std::vector<std::string>> ce_rows;   // row body -> carriers
+            for (const auto& [h, fs] : forms_of)
+                for (const Form& f : fs) {
+                    const std::size_t cn = target.sample_cn.count(h) ? target.sample_cn.at(h) : 0;
+                    const long long net = static_cast<long long>(f.alt.size()) - static_cast<long long>(f.re + 1 - f.rs);
+                    ce_rows["cn\t" + std::to_string(f.rs) + '\t' + std::to_string(f.re) + '\t' + std::to_string(cn) + '\t' +
+                            std::to_string(cn) + '\t' + std::to_string(net) + '\t' + std::to_string(f.alt.size()) + '\t' +
+                            (f.alt.empty() ? std::string(".") : f.alt)].push_back(h);
+                }
+            for (auto& [body, haps] : ce_rows) {
+                std::sort(haps.begin(), haps.end());
+                std::string row = id + '\t' + std::to_string(first.bubble_id) + '\t' + body + '\t';
+                for (std::size_t k = 0; k < haps.size(); ++k) row += (k ? "," : "") + haps[k];
+                added_ce.push_back(std::move(row));
+            }
+            // The genes of the module records it replaces; its copies are the reference's stretch the change spans.
+            std::set<int> genes_seen;
+            for (const std::size_t r : pieces)
+                for (const DupGeneTarget& t : dup_targets) {
+                    if (t.variant_id != out_records[r].id) continue;
+                    if (target.variant_id.empty()) { target.variant_id = id; target.bubble_id = t.bubble_id; }
+                    for (const int g : t.gene_idx) if (genes_seen.insert(g).second) target.gene_idx.push_back(g);
+                }
+            for (const Bubble* g : gaps)
+                if (const auto w = g->windows->find(ref_path); w != g->windows->end()) {
+                    for (std::size_t k = w->second.first; k <= w->second.last; ++k) target.module_nodes.insert(ref_path->steps[k].node_id);
+                    target.copy_stretch.emplace_back(ref_meta.region_start_1based + ref_prefix[w->second.first],
+                                                     ref_meta.region_start_1based + ref_prefix[w->second.last + 1] - 1);
+                }
+            if (!target.variant_id.empty()) dup_targets.push_back(std::move(target));
+        }
+
+        // A module carrier's change at a copy site of the module's site that one of its copies holds.
+        for (std::size_t m = 0; m < out_records.size(); ++m) {
+            if (!parsed[m].module || drop.count(out_records[m].id)) continue;
+            const Parsed& mp = parsed[m];
+            const std::vector<std::string> fs = split(info_of(mp.cols[7], "CN_FORMS"), ',');
+            std::vector<std::pair<long long, long long>> iv(fs.size());   // each form's reference stretch, widened by a copy
+            for (std::size_t k = 0; k < fs.size(); ++k) {
+                const std::size_t dash = fs[k].find('-'), colon = fs[k].find(':');
+                if (dash == std::string::npos || colon == std::string::npos) { iv[k] = {1, 0}; continue; }
+                iv[k] = {std::atoll(fs[k].substr(0, dash).c_str()) - static_cast<long long>(mp.unit),
+                         std::atoll(fs[k].substr(dash + 1, colon - dash - 1).c_str()) + static_cast<long long>(mp.unit)};
+            }
+            const std::vector<std::string> fmt_keys = split(mp.cols.size() > 8 ? mp.cols[8] : std::string(), ':');
+            const std::size_t fi = static_cast<std::size_t>(std::find(fmt_keys.begin(), fmt_keys.end(), "CNFORM") - fmt_keys.begin());
+            for (std::size_t r = 0; r < out_records.size(); ++r) {
+                if (r == m || parsed[r].module || !out_records[r].of_copies || drop.count(out_records[r].id) ||
+                    out_records[r].bubble_id != out_records[m].bubble_id ||
+                    out_records[r].line.find(";SVTYPE=CNV;") != std::string::npos)
+                    continue;
+                const long long lo = static_cast<long long>(out_records[r].pos), hi = static_cast<long long>(std::max(out_records[r].end, out_records[r].pos));
+                std::vector<std::size_t> leave;
+                for (const std::size_t c : parsed[r].carriers) {
+                    if (!mp.carriers.count(c) || 9 + c >= mp.cols.size()) continue;
+                    const std::vector<std::string> v = split(mp.cols[9 + c], ':');
+                    if (fi >= v.size() || v[fi] == ".") continue;
+                    bool held = false;
+                    for (const std::string& n : split(v[fi], '+')) {
+                        const std::size_t k = static_cast<std::size_t>(std::atoll(n.c_str()));
+                        if (k >= 1 && k <= iv.size() && lo <= iv[k - 1].second && iv[k - 1].first <= hi) held = true;
+                    }
+                    if (held) leave.push_back(c);
+                }
+                if (leave.empty()) continue;
+                Parsed& pr = parsed[r];
+                for (const std::size_t c : leave) {
+                    pr.carriers.erase(c);
+                    std::string& col = pr.cols[9 + c];
+                    col = "0" + col.substr(col.find(':') == std::string::npos ? col.size() : col.find(':'));
+                }
+                if (pr.carriers.empty()) { drop.insert(out_records[r].id); continue; }
+                const std::string an = info_of(pr.cols[7], "AN");
+                std::string info = pr.cols[7];
+                const auto set_field = [&](const std::string& k, const std::string& v) {
+                    const std::size_t at = info.find(";" + k + "=");
+                    if (at == std::string::npos) return;
+                    const std::size_t q = std::min(info.find(';', at + 1), info.size());
+                    info = info.substr(0, at + 2 + k.size()) + v + info.substr(q);
+                };
+                set_field("AC", std::to_string(pr.carriers.size()));
+                char buf[32];
+                std::snprintf(buf, sizeof(buf), "%.4g", std::atof(an.c_str()) > 0 ? static_cast<double>(pr.carriers.size()) / std::atof(an.c_str()) : 0.0);
+                set_field("AF", buf);
+                pr.cols[7] = info;
+                std::string line;
+                for (std::size_t k = 0; k < pr.cols.size(); ++k) line += (k ? "\t" : "") + pr.cols[k];
+                out_records[r].line = line + '\n';
+                std::unordered_set<std::string> gone_h;
+                for (const std::size_t c : leave) gone_h.insert(sample_names[c]);
+                for (std::string& row : carrier_events_rows) {
+                    if (row.compare(0, out_records[r].id.size() + 1, out_records[r].id + '\t') != 0) continue;
+                    const std::size_t tab = row.rfind('\t');
+                    std::string keep;
+                    for (const std::string& h : split(row.substr(tab + 1), ','))
+                        if (!gone_h.count(h)) keep += (keep.empty() ? "" : ",") + h;
+                    row = keep.empty() ? std::string() : row.substr(0, tab + 1) + keep;
+                }
+            }
+        }
+        {
+            out_records.erase(std::remove_if(out_records.begin(), out_records.end(), [&](const OutRecord& r) { return drop.count(r.id) != 0; }),
+                              out_records.end());
+            const auto prune = [&](std::vector<std::string>& rows) {
+                rows.erase(std::remove_if(rows.begin(), rows.end(), [&](const std::string& row) {
+                    return row.empty() || drop.count(row.substr(0, row.find('\t'))) != 0;
+                }), rows.end());
+            };
+            prune(variant_nodes_rows);
+            prune(carrier_events_rows);
+            dup_targets.erase(std::remove_if(dup_targets.begin(), dup_targets.end(), [&](const DupGeneTarget& t) { return drop.count(t.variant_id) != 0; }),
+                              dup_targets.end());
+            for (OutRecord& r : added) out_records.push_back(std::move(r));
+            for (std::string& v : added_vn) variant_nodes_rows.push_back(std::move(v));
+            for (std::string& c : added_ce) carrier_events_rows.push_back(std::move(c));
+        }
     }
 
     // ---- Coordinate-sort all records and write the (indexable) region + per-bubble VCFs.
@@ -6299,9 +6694,9 @@ void call_variants(
                 // A module's copies hold nodes no path revisits, so its stretch runs from its first node to its
                 // last. A repeat unit's copies are its own nodes: a gene between two copies that are not
                 // adjacent is not in them.
-                std::vector<std::pair<std::size_t, std::size_t>> stretch;
+                std::vector<std::pair<std::size_t, std::size_t>> stretch = t.copy_stretch;
                 for (const std::string& id : t.module_nodes)
-                    if (const auto it = ref_iv.find(id); it != ref_iv.end())
+                    if (const auto it = ref_iv.find(id); it != ref_iv.end() && t.copy_stretch.empty())
                         stretch.insert(stretch.end(), it->second.begin(), it->second.end());
                 std::sort(stretch.begin(), stretch.end());
                 std::vector<std::pair<std::size_t, std::size_t>> merged_iv;

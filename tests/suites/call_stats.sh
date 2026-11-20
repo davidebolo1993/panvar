@@ -829,17 +829,16 @@ mr_span=$(( $(inf END) - mr_pos ))
 [ "$(( mr_span - $(inf CN_MODULE_REF_BP) ))" = "100" ] \
   && ok "and the excess is exactly the boundary visits between the outermost ones (K+S=100)" \
   || bad "span excess $(( mr_span - $(inf CN_MODULE_REF_BP) )), expected 100"
-# With the boundary orientations each crossing is read on its own: the second copy is the reference's for
-# all, and the module record is the first copy's, one copy of 300 bp at 201..500 where h1 holds two. h2 keeps
-# half of the anchor there (P, not Q) and reads as no copy.
+# With the boundary orientations the changes are read one copy at a time, but the copies are still counted in one
+# walk: the module record is the one above, and h2's lost Q, not a copy, is a deletion of its own in its first copy.
 printf 'bubble_id,source,source_orient,sink,sink_orient,inside_node_count,total_node_count,path_support,distinct_alleles,ref_allele_support,alt_allele_support_max,alt_allele_support_min,min_inside_bp,max_inside_bp,inside_nodes\n1,S,+,K,+,2,4,3,3,1,1,1,150,450,"P;Q"\n' > "$OUT/modrep_o.bubbles.csv"
 "$BIN" call -i "$OUT/modrep.gfa" -c "$OUT/modrep_o.bubbles.csv" \
    --reference-path "grch38#0#chr1:1-1100" -o "$OUT/modrep_o" --cn --min-sv-bp 20 -q >/dev/null 2>&1
-check "a module in a site crossed twice, each copy read on its own (POS END REF_CN CN_SPAN_AMBIGUOUS | CN h1 h2 | records)" \
+check "a module in a site crossed twice, counted in one walk (POS END REF_CN CN_SPAN_AMBIGUOUS | CN h1 h2 | records)" \
   "$(awk -F'\t' '/^#CHROM/{for(i=10;i<=NF;i++){if($i=="h1#1#chr1")a=i; if($i=="h2#1#chr1")b=i}}
        !/^#/ && $8 ~ /SVTYPE=CNV/{e=$8; sub(/^END=/,"",e); sub(/;.*/,"",e); r=$8; sub(/.*REF_CN=/,"",r); sub(/;.*/,"",r)
          split($a,x,":"); split($b,y,":"); printf "%s %s %s %s | %s %s | ", $2, e, r, ($8 ~ /CN_SPAN_AMBIGUOUS/ ? "yes" : "no"), x[2], y[2]}
-       !/^#/{n++} END{print n}' "$OUT/modrep_o.region.vcf")" "200 500 1 no | 2 0 | 1"
+       !/^#/{n++} END{print n}' "$OUT/modrep_o.region.vcf")" "200 900 2 yes | 3 2 | 2"
 
 # A haplotype crossing the module sink to source opens its span on the sink. hrev passes S once upstream
 # (F S X), then walks G- K- (Q- P-)x2 S- F-: its first S comes before its K, and reading the direction from
@@ -4164,6 +4163,49 @@ check "hybrid copy: every carrier's event is placed on the reference" \
   -o "$OUT/hybc/b" -q > "$OUT/hybc/b.log" 2>&1
 check "hybrid copy: the records rebuild every haplotype (bp left by call's events:by the VCF)" \
   "$(awk -F'\t' '$1=="large_left_call_bp"{c=$2} $1=="large_left_vcf_bp"{v=$2} END{print c":"v}' "$OUT/hybc/b.summary.tsv")" "0:0"
+
+# Copy numbers of a site read one copy at a time come from one walk over all its copies, as at any site: a module
+# (with its gene) and a repeat are counted over both blocks, and a repeat's site has one record.
+cn_of() { # CN per haplotype after the reference on the CNV records, one record per line
+  awk -F'\t' '!/^#/ && $8 ~ /SVTYPE=CNV/{g=""; for(i=11;i<=NF;i++){split($i,x,":"); g=g x[2] " "} print g}' "$1" | tr '\n' '|'; }
+gene_cn() { awk -F'\t' 'NR>1{printf "%s ", $5}' "$1"; }
+python3 -I "$TOOLS/spec_gfa.py" "$SPEC_DIR/module_in_copies.spec" "$OUT/micp"
+"$BIN" call -i "$OUT/micp/g.gfa" -c "$OUT/micp/g.bubbles.csv" -r 'ref#0#chr9:1-1950' -o "$OUT/micp/v" --cn \
+  --gtf "$SPEC_DIR/module_in_copies.gtf" --no-per-bubble-vcf -q > "$OUT/micp/v.log" 2>&1
+check "a module in collapsed copies: counted over both blocks, and its gene (module CN r1 h1 h2 hl hg | gene ref r1 h1 h2 hl hg)" \
+  "$(cn_of "$OUT/micp/v.region.vcf")$(gene_cn "$OUT/micp/v.dup_gene_cn.tsv")" "2 3 3 1 3 |2 2 3 3 1 3 "
+# The module holds hl's and hg's copy change and h1's and h2's extra module: no insertion or deletion says it again.
+check "a module in collapsed copies: its record is the only one (records)" \
+  "$(grep -v '^#' "$OUT/micp/v.region.vcf" | awk -F'\t' '{t=$8; sub(/.*SVTYPE=/,"",t); sub(/;.*/,"",t); printf "%s ", t}')" "CNV "
+python3 -I "$TOOLS/spec_gfa.py" "$SPEC_DIR/unit_in_copies.spec" "$OUT/uicp"
+"$BIN" call -i "$OUT/uicp/g.gfa" -c "$OUT/uicp/g.bubbles.csv" -r 'ref#0#chr1:1-1250' -o "$OUT/uicp/v" --no-per-bubble-vcf -q \
+  > "$OUT/uicp/v.log" 2>&1
+check "a repeat in collapsed copies: one record, counted over both blocks (CN r1 u1 u2 u12 l)" \
+  "$(cn_of "$OUT/uicp/v.region.vcf")" "5 7 7 4 3 |"
+python3 -I "$TOOLS/spec_gfa.py" "$SPEC_DIR/unit_gene_in_copies.spec" "$OUT/ugcp"
+"$BIN" call -i "$OUT/ugcp/g.gfa" -c "$OUT/ugcp/g.bubbles.csv" -r 'ref#0#chr9:1-2450' -o "$OUT/ugcp/v" --cn \
+  --gtf "$SPEC_DIR/unit_gene_in_copies.gtf" --no-per-bubble-vcf -q > "$OUT/ugcp/v.log" 2>&1
+check "a repeat with a gene in collapsed copies: the gene's copies follow the repeat's (CN | gene ref r1 u1 u2 u12 l)" \
+  "$(cn_of "$OUT/ugcp/v.region.vcf")$(gene_cn "$OUT/ugcp/v.dup_gene_cn.tsv")" "5 7 7 4 3 |5 5 7 7 4 3 "
+
+# A whole copy gained or lost: without --cn an insertion or deletion that says so; with --cn a copy-number record in
+# its place, carrying the carrier's bases, and no insertion or deletion of the same change.
+copy_info() { awk -F'\t' '!/^#/{t=$8; sub(/.*SVTYPE=/,"",t); sub(/;.*/,"",t); c="-"; if($8 ~ /COPY=/){c=$8; sub(/.*COPY=/,"",c); sub(/;.*/,"",c); n=$8; sub(/.*COPIES=/,"",n); sub(/;.*/,"",n); c=c n}
+    g=""; for(i=11;i<=NF;i++){split($i,x,":"); g=g x[1] (t=="CNV" ? "(" x[2] ")" : "")} printf "%s:%s:%s ", t, c, g}' "$1"; }
+check "a whole copy gained or lost, without --cn: COPY on its record (SVTYPE:COPY:GT, inverted copies | tandem gain)" \
+  "$(copy_info "$OUT/invc/v.region.vcf")|$(copy_info "$OUT/tgain/v.region.vcf")" \
+  "INS:-:01000 DEL:loss1:00010 DEL:-:001.0 DEL:-:00001 |DEL:-:001 INS:gain1:011 "
+"$BIN" call -i "$OUT/invc/g.gfa" -c "$OUT/invc/g.bubbles.csv" -r 'ref#0#chr1:1-1570' -o "$OUT/invc/cn" --cn \
+  --no-per-bubble-vcf -q > "$OUT/invc/cn.log" 2>&1
+"$BIN" call -i "$OUT/tgain/g.gfa" -c "$OUT/tgain/g.bubbles.csv" -r 'ref#0#chr1:1-780' -o "$OUT/tgain/cn" --cn \
+  --no-per-bubble-vcf -q > "$OUT/tgain/cn.log" 2>&1
+check "a whole copy gained or lost, with --cn: one copy-number record, no insertion or deletion (SVTYPE:COPY:GT(CN))" \
+  "$(copy_info "$OUT/invc/cn.region.vcf")|$(copy_info "$OUT/tgain/cn.region.vcf")" \
+  "INS:-:01000 CNV:-:0(1)0(1)0(1)1(0)0(1) DEL:-:001.0 DEL:-:00001 |DEL:-:001 CNV:-:0(1)1(2)1(2) "
+"$BIN" benchmark -i "$OUT/invc/g.gfa" -c "$OUT/invc/g.bubbles.csv" -r 'ref#0#chr1:1-1570' --calls "$OUT/invc/cn" \
+  -o "$OUT/invc/cnb" -q > "$OUT/invc/cnb.log" 2>&1
+check "a whole copy lost, with --cn: the records rebuild every haplotype (bp left by call's events:by the VCF)" \
+  "$(awk -F'\t' '$1=="large_left_call_bp"{c=$2} $1=="large_left_vcf_bp"{v=$2} END{print c":"v}' "$OUT/invc/cnb.summary.tsv")" "0:0"
 
 printf "\n"
 if [ "$fails" -eq 0 ]; then printf "call_stats: all assertions passed\n"; exit 0; fi

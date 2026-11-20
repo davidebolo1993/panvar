@@ -236,6 +236,8 @@ std::vector<std::vector<Bubble>> copy_sites(const Graph& graph, const std::vecto
     // walks, and the path is read there for that crossing, not at its copy site.
     enum : int { kBetween = 0, kWithFirst = 1, kWithSecond = 2 };
     std::map<std::tuple<std::size_t, std::size_t, int>, Windows> gap_win;
+    // Per gap: the reference's copies of what its paths gain or lose, and the sites those copies cross.
+    std::map<std::tuple<std::size_t, std::size_t, int>, std::pair<std::size_t, std::set<std::size_t>>> gap_copies;
     std::vector<std::vector<std::size_t>> matched_of(np);   // per path, per reference token: its token, or none
     constexpr std::size_t kNone = static_cast<std::size_t>(-1);
 
@@ -255,12 +257,47 @@ std::vector<std::vector<Bubble>> copy_sites(const Graph& graph, const std::vecto
         std::vector<std::pair<std::size_t, std::size_t>> win(rt.size(), {kNone, kNone});
         std::vector<std::size_t> held(rt.size(), 1);
         for (const auto& [i, j] : pairs) win[j] = {h[i].c->left, h[i].c->right};
+        // Its whole copies gained or lost in a gap: per site the reference crosses, its crossings left unmatched
+        // between the two less the reference's. All gains, or all losses, of the same crossings make whole
+        // copies, as many as the most at one site; anything else (a replacement, an inverted stretch) is not one,
+        // nor is losing a site's only crossing, a deletion of what is not a copy.
+        std::map<std::size_t, long> held_sites;   // the path's crossings per site
+        for (const Tok& t : h) ++held_sites[t.c->site];
+        const auto copies_of = [&](std::size_t i0, std::size_t i1, std::size_t j0, std::size_t j1, std::size_t& ref_cn,
+                                   std::set<std::size_t>& sites) {
+            std::map<std::pair<std::size_t, bool>, long> net;
+            for (std::size_t i = i0; i < i1; ++i) ++net[{h[i].c->site, h[i].fwd}];
+            for (std::size_t j = j0; j < j1; ++j) --net[{rt[j].c->site, rt[j].fwd}];
+            long most = 0, sign = 0;
+            ref_cn = kNone;
+            for (const auto& [key, n] : net) {
+                if (key.first >= bubbles.size() || n == 0) continue;
+                const auto rc = ref_count.find(key);
+                if (rc == ref_count.end() || (sign != 0 && (n > 0) != (sign > 0)) || (n < 0 && held_sites[key.first] == 0))
+                    return 0L;
+                sign = n > 0 ? 1 : -1;
+                most = std::max(most, n > 0 ? n : -n);
+                ref_cn = std::min(ref_cn, rc->second);
+                sites.insert(bubbles[key.first].id);
+            }
+            return sign * most;
+        };
         // The path's gap between its crossings matched to reference crossings jp and jn.
         const auto add_gap = [&](std::size_t jp, std::size_t jn, const Tok& a, const Tok& b) {
             int how = kBetween;
             if (rt[jp].exit >= rt[jn].entry) how = kWithFirst;
             else if (a.exit == b.entry) how = a.c->site < bubbles.size() ? kWithFirst : kWithSecond;
-            gap_win[{jp, jn, how}][&p] = stretch(how == kWithFirst ? a.entry : a.exit, how == kWithSecond ? b.exit : b.entry);
+            PathWindow& w = gap_win[{jp, jn, how}][&p];
+            w = stretch(how == kWithFirst ? a.entry : a.exit, how == kWithSecond ? b.exit : b.entry);
+            std::size_t rc = kNone;
+            std::set<std::size_t> sites;
+            const std::size_t ia = static_cast<std::size_t>(&a - h.data()), ib = static_cast<std::size_t>(&b - h.data());
+            w.copies = static_cast<int>(copies_of(ia + 1, ib, jp + 1, jn, rc, sites));
+            if (w.copies != 0) {
+                auto& gc = gap_copies[{jp, jn, how}];
+                gc.first = gc.second.empty() ? rc : std::min(gc.first, rc);
+                gc.second.insert(sites.begin(), sites.end());
+            }
             if (how == kWithFirst) win[jp] = {kNone, kNone};
             if (how == kWithSecond) win[jn] = {kNone, kNone};
         };
@@ -383,6 +420,10 @@ std::vector<std::vector<Bubble>> copy_sites(const Graph& graph, const std::vecto
         inside.erase(b.source);
         inside.erase(b.sink);
         b.inside.assign(inside.begin(), inside.end());
+        if (const auto gc = gap_copies.find(key); gc != gap_copies.end()) {
+            b.copy_ref_cn = gc->second.first;
+            b.copy_block_sites.assign(gc->second.second.begin(), gc->second.second.end());
+        }
         b.windows = std::make_shared<const Windows>(std::move(w));
         b.between_copies = true;
         if (out[si].empty() && !is_multi(si)) out[si].push_back(bubbles[si]);
