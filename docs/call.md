@@ -34,7 +34,7 @@ Two alleles are aligned base by base with [ksw2](https://github.com/lh3/ksw2), o
    - Crossings that read the reference's backwards, in reverse order, inside an inversion site are an inversion, written at that site (step 9) and not again between the copies.
    - A crossing the matching cannot place, one outside the anchors, is read in one walk with the nearest crossing of its site and direction, and the records say so (`MULTI_CROSSING`).
 
-   These sites and stretches keep the site's `BUBBLE_ID` (a stretch, the site's before it), with ids numbered apart. A stretch holds nodes of other sites and of none: its records name that site's nodes only (`EVENT_NODES`, `variant_nodes.tsv`), or the boundary they start at when the event holds none of them, since `describe` reads a record's nodes as its site's.
+   These sites and stretches keep the site's `BUBBLE_ID` (a stretch, the site's before it), with ids numbered apart. A stretch holds nodes of other sites and of none: its records name that site's nodes only (`EVENT_NODES`, `variant_nodes.tsv`), or the boundary the stretch shares with the site when the event holds none of them, since `describe` reads a record's nodes as its site's.
 
 2. Folded repeats come from `panphorte`'s unit-graph table. A haplotype's copy number is how many times it passes the unit's anchor, and a copy's orientation is that of its step on the anchor. `CNBP` is its change in bases, and `CNRESID` the part of that change whole copies do not explain.
 
