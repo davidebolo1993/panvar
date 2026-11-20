@@ -198,6 +198,8 @@ public:
     Mapping& operator=(const Mapping&) = delete;
     const void* data() const { return data_; }
     std::size_t size() const { return size_; }
+    // Scattered reads (no read-ahead), or the default again.
+    void advise_random(bool random) const;
 private:
     void* data_ = nullptr;
     std::size_t size_ = 0;
@@ -234,6 +236,10 @@ private:
     std::vector<Where> where_;    // per partition
     std::uint32_t partitions_ = 0;
 };
+
+// Several segments opened (and checked) at once: checking reads two scattered words per partition, which
+// on a network filesystem costs a round trip each, so the segments are opened side by side.
+std::vector<std::unique_ptr<Segment>> open_segments(const std::vector<std::string>& dirs, std::size_t threads);
 
 // The store's manifest: the only list of its segments.
 struct ManifestSegment {

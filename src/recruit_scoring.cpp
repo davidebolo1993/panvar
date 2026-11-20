@@ -52,7 +52,8 @@ std::vector<Kmer> label_read(const std::string& s, const LocusTable& t, Evidence
 // differing base makes k of them) and `gap_cost` past that, so a long run means the read has left the locus.
 // Free k-mers are counted from both ends of a run, and kept at either end of the stretch, so a read and its
 // reverse complement get the same segment. Returns [first, last] k-mer indices (of equal scores, the
-// longest); first > last when the read has no locus k-mer.
+// longest; of those, the one holding the smallest canonical k-mer, which does not depend on the strand);
+// first > last when the read has no locus k-mer.
 std::pair<std::size_t, std::size_t> locus_segment(const std::vector<Kmer>& v, double gap_cost) {
     const std::size_t n = v.size();
     std::vector<double> x(n);
@@ -70,12 +71,17 @@ std::pair<std::size_t, std::size_t> locus_segment(const std::vector<Kmer>& v, do
     }
     double best = 0, cur = 0;
     std::size_t best_first = 1, best_last = 0, first = 0;
+    std::uint64_t cur_min = ~0ULL, best_min = ~0ULL;   // the smallest k-mer code of the stretch, and of the best
     bool free_only = false;   // every k-mer since `first` scored 0: the stretch may still start there
     for (std::size_t i = 0; i < n; ++i) {
-        if (cur < 0 || (cur == 0 && !free_only)) { cur = 0; first = i; free_only = true; }
+        if (cur < 0 || (cur == 0 && !free_only)) { cur = 0; first = i; free_only = true; cur_min = ~0ULL; }
         if (x[i] != 0) free_only = false;
         cur += x[i];
-        if (cur > best || (cur == best && cur > 0 && i - first > best_last - best_first)) { best = cur; best_first = first; best_last = i; }
+        cur_min = std::min(cur_min, v[i].code);
+        const std::size_t len = i - first, best_len = best_last - best_first;
+        if (cur > best || (cur == best && cur > 0 && (len > best_len || (len == best_len && cur_min < best_min)))) {
+            best = cur; best_first = first; best_last = i; best_min = cur_min;
+        }
     }
     return {best_first, best_last};
 }

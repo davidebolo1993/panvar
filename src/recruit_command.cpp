@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <map>
 #include <filesystem>
 #include <fstream>
@@ -79,7 +80,7 @@ double parse_number(const std::string& name, const std::string& v) {
     std::size_t used = 0;
     double x = 0;
     try { x = std::stod(v, &used); } catch (const std::exception&) { used = 0; }
-    if (used == 0 || used != v.size()) throw std::runtime_error(name + " takes a number, got '" + v + "'");
+    if (used == 0 || used != v.size() || !std::isfinite(x)) throw std::runtime_error(name + " takes a number, got '" + v + "'");
     return x;
 }
 
@@ -147,8 +148,14 @@ int run_recruit_command(const std::vector<std::string>& args) {
             else if (m == "all") ro.screen = recruit::Screen::All;
             else throw std::runtime_error("--screen is syncmer, minimizer or all");
         } else if (a == "--min-sites") { ro.min_sites = static_cast<std::uint32_t>(cli::parse_size_arg(a, value())); ro.calibrated_cut = false; }
-        else if (a == "--error-rate") error_rate = parse_number(a, value());
-        else if (a == "--decoy-share-long") ro.decoy_share_long = parse_number(a, value());
+        else if (a == "--error-rate") {
+            error_rate = parse_number(a, value());
+            if (!(error_rate >= 0 && error_rate < 0.5)) throw std::runtime_error("--error-rate must be in [0, 0.5)");
+        }
+        else if (a == "--decoy-share-long") {
+            ro.decoy_share_long = parse_number(a, value());
+            if (!(ro.decoy_share_long >= 0 && ro.decoy_share_long <= 1)) throw std::runtime_error("--decoy-share-long must be in [0, 1]");
+        }
         else if (a == "--preset") {
             const std::string p = value();
             if (p == "illumina") preset_rate = 0.002, ro.read_class = "short";
@@ -180,6 +187,9 @@ int run_recruit_command(const std::vector<std::string>& args) {
             for (std::string x; std::getline(ss, x, '\t');) f.push_back(x);
             if (f.size() < 2 || f.size() > 3 || f[0].empty() || f[1].empty())
                 throw std::runtime_error("recruit: " + sheet + ": a line is not sample, file[, mate file]: " + line);
+            // the name becomes a file name in -o: a path in it could write over another sample's or leave -o
+            if (f[0] == "." || f[0] == ".." || f[0].find('/') != std::string::npos || f[0].find('\\') != std::string::npos)
+                throw std::runtime_error("recruit: " + sheet + ": sample name '" + f[0] + "' is not a plain file name");
             if (!at.count(f[0])) { at[f[0]] = samples.size(); samples.push_back({f[0], {}}); }
             samples[at[f[0]]].second.emplace_back(resolve(f[1]), f.size() == 3 ? resolve(f[2]) : std::string());
         }
@@ -232,7 +242,6 @@ int run_recruit_command(const std::vector<std::string>& args) {
     if (ro.min_sites == 0) throw std::runtime_error("--min-sites must be at least 1");
     if (rate_given && !ro.calibrated_cut) throw std::runtime_error("give --false-certain-rate or --min-sites, not both");
     if (!(ro.false_certain_rate >= 0 && ro.false_certain_rate < 1)) throw std::runtime_error("--false-certain-rate must be in [0, 1)");
-    if (error_rate >= 0.5) throw std::runtime_error("--error-rate must be between 0 and 0.5");
     ro.error_rate = error_rate >= 0 ? error_rate : preset_rate;   // below 0: estimated from base qualities
     cli::RunLog log("recruit", quiet);
     o.threads = threads == 0 ? bg::default_threads() : threads;

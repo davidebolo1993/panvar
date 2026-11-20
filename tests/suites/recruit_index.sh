@@ -37,6 +37,21 @@ check "the screen holds only private and shared k-mers, about one in ten" 'awk -
 sed 's/^P\tref#1#chr1:120000-160000/P\tref#1#chr1:125000-165000/' data/locus.gfa > shifted.gfa
 "${RC[@]}" --save-index idx_shift --locus shifted.gfa 2> shift.txt; rc=$?
 check "a reference label off its sequence is refused" '[[ $rc -ne 0 ]] && grep -q "label does not match the reference" shift.txt'
+# a label on another path's sequence: the interval holds the locus's k-mers, but not the reference path's
+python3 - data/ref.fa > swapped.fa <<'PY'
+import sys
+s = []
+for line in open(sys.argv[1]):
+    if line.startswith(">"):
+        if s: break
+        continue
+    s.append(line.strip())
+r = "".join(s)
+print(">ref#1#chr1:120000-160000"); print(r[121000:161000])
+print(">gx#1#chr1:120000-160000"); print(r[120000:160000])
+PY
+"${RC[@]}" --save-index idx_swap --locus swapped.fa 2> swap.txt; rc=$?
+check "a reference label on another path's sequence is refused" '[[ $rc -ne 0 ]] && grep -q "does not spell the path" swap.txt'
 sed 's/^P\tref#1#chr1:120000-160000/P\tref#1#chr1:120000-150000/' data/locus.gfa > short_label.gfa
 "${RC[@]}" --save-index idx_len --locus short_label.gfa 2> len.txt; rc=$?
 check "a reference label of another length is refused" '[[ $rc -ne 0 ]] && grep -q "length is not the path" len.txt'
@@ -217,13 +232,24 @@ check "a package cannot be changed" '[[ $rc -ne 0 ]] && grep -q "packaged backgr
 mkdir -p moved && gzip -c data/ga.fa > moved/ga.fa.gz && cp data/gb.fa moved/gb.fa
 printf 'ga\tmoved/ga.fa.gz\ngb\tmoved/gb.fa\n' > moved.tsv
 "$BIN" background -o pkg --relocate moved.tsv 2> reloc.txt; rc=$?
-check "relocated genomes: one by size, one recompressed by its sequence checksum" '[[ $rc -eq 0 ]] && grep -q "1 the size counted, 1 another size but the sequence counted" reloc.txt'
+check "relocated genomes, one recompressed: each checked by its sequence" '[[ $rc -eq 0 ]] && grep -q "genomes: 2; each checked against the sequence counted" reloc.txt'
 "$BIN" recruit -t 2 -q --background pkg -r ref --index-only --save-index idx_moved --locus data/locus.gfa; rc=$?
 "$BIN" recruit --dump-index idx_moved/locus.plx=dump_moved.tsv
 check "the index from the relocated genomes is the same" '[[ $rc -eq 0 ]] && cmp -s dump.tsv dump_moved.tsv'
 printf 'ga\tdata/gb.fa\n' > wrong.tsv
 "${BG[@]}" -o pkg --relocate wrong.tsv 2> wrong.txt; rc=$?
 check "a genome file other than the one counted is refused" '[[ $rc -ne 0 ]] && grep -q "is not the genome counted" wrong.txt'
+# a file of the size counted but another sequence (one base changed) is refused too
+python3 - data/gb.fa moved/gb_mut.fa <<'PY'
+import sys
+lines = open(sys.argv[1]).read().split("\n")
+i = next(k for k, l in enumerate(lines) if l and not l.startswith(">"))
+c = lines[i][0]; lines[i] = ("A" if c != "A" else "C") + lines[i][1:]
+open(sys.argv[2], "w").write("\n".join(lines))
+PY
+printf 'gb\tmoved/gb_mut.fa\n' > same_size.tsv
+"${BG[@]}" -o pkg --relocate same_size.tsv 2> same_size.txt; rc=$?
+check "a file of the size counted but another sequence is refused" '[[ $rc -ne 0 && $(wc -c < moved/gb_mut.fa) == $(wc -c < data/gb.fa) ]] && grep -q "is not the genome counted" same_size.txt'
 cp data/ga.fa data/ga_moved.fa
 "$BIN" background -t 2 --partitions 64 --memory 64M -q --tmp-dir "$OUT/tmp" -o s_moved --genome ref=data/ref.fa --genome ga=data/ga_moved.fa --coordinate-reference ref
 printf '>chr1\nACGT\n' >> data/ga_moved.fa
@@ -292,6 +318,12 @@ if command -v samtools > /dev/null && command -v bgzip > /dev/null; then
 else
   echo "  skip indexed and bgzip genomes (samtools or bgzip not installed)"
 fi
+
+# a full store relocated: its segments' records follow, so later steps read the new files
+cp -r s s_rel && mkdir -p moved_s && cp data/ga.fa moved_s/ga.fa
+printf 'ga\tmoved_s/ga.fa\n' > moved_s.tsv
+"${BG[@]}" -o s_rel --relocate moved_s.tsv; rc=$?
+check "a store's relocated genomes are recorded in its segments too" '[[ $rc -eq 0 ]] && grep -q "moved_s/ga.fa" s_rel/seg-*/segment.tsv && ! grep -q "data/ga.fa" s_rel/seg-*/segment.tsv'
 
 echo
 echo "recruit_index: $pass passed, $fail failed"

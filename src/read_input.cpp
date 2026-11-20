@@ -348,6 +348,7 @@ private:
     static constexpr std::int64_t kNear = 100000;   // a mate this far ahead is waited for
     static constexpr std::int64_t kFetchGap = 200000;   // CRAM mates this close are fetched by one query
     static constexpr double kStaleShare = 0.1;   // more mates than this missing from their places: stale mate fields, read again
+    static constexpr std::int64_t kStaleMargin = 2000;   // bases around a mate's place also searched for it
     static constexpr std::size_t kHoldMax = 2000000;  // reads waiting for mates in an unsorted file before going lean
     struct Read {
         std::string seq, qual;
@@ -738,7 +739,10 @@ private:
                         group.clear();
                         for (std::size_t k = a; k < b; ++k) group[wanted_[order[k]].name].push_back(order[k]);
                         std::size_t left = b - a;
-                        hts_itr_t* itr = sam_itr_queryi(idx, wanted_[order[a]].mtid, wanted_[order[a]].mpos, wanted_[order[b - 1]].mpos + 1);
+                        // a margin around the places: a mate whose fields are a little stale is seen there, and
+                        // then sought by a second pass, instead of being taken as absent
+                        hts_itr_t* itr = sam_itr_queryi(idx, wanted_[order[a]].mtid, std::max<std::int64_t>(0, wanted_[order[a]].mpos - kStaleMargin),
+                                                        wanted_[order[b - 1]].mpos + 1 + kStaleMargin);
                         if (itr == nullptr) continue;
                         for (std::size_t k = a; k < b; ++k) queried[order[k]] = 1;
                         int r = 0;

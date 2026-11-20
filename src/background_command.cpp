@@ -7,6 +7,7 @@
 #include "panvar/gz_reader.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <chrono>
 #include <cstdio>
@@ -408,35 +409,67 @@ int run_background_command(const std::vector<std::string>& args) {
         }
         const bg::StoreLock lock(out);
         bg::Manifest m = bg::read_manifest(out);
-        std::size_t moved = 0, by_size = 0, by_checksum = 0;
         std::set<std::string> known;
+        std::vector<bg::Genome*> moving;
         for (auto& sg : m.segments)
             for (auto& g : sg.genomes) {
                 known.insert(g.name);
-                const auto it = to.find(g.name);
-                if (it == to.end()) continue;
-                std::error_code ec;
-                const std::uint64_t size = fs::file_size(it->second, ec);
-                if (ec) throw std::runtime_error("background: genome " + g.name + ": no file at " + it->second);
-                if (size == g.bytes) {
-                    ++by_size;
-                } else {
-                    const std::string sum = bg::sequence_checksum(it->second);
-                    if (sum != g.checksum)
-                        throw std::runtime_error("background: genome " + g.name + ": " + it->second + " is not the genome counted (its sequence checksum is " +
-                                                 sum + ", " + g.checksum + " when counted)");
-                    ++by_checksum;
-                    g.bytes = size;
-                }
-                g.path = it->second;
-                ++moved;
+                if (to.count(g.name)) moving.push_back(&g);
             }
         for (const auto& [name, path] : to)
             if (!known.count(name)) throw std::runtime_error("background: " + relocate + " names " + name + ", which " + out + " does not hold");
+        // every new file must hold the sequence counted: a file of the same size may hold another sequence
+        std::vector<std::uint64_t> sizes(moving.size());
+        std::vector<std::string> errors(moving.size());
+        {
+            std::atomic<std::size_t> next{0};
+            std::vector<std::thread> pool;
+            for (std::size_t t = 0; t < std::max<std::size_t>(1, std::min(threads, moving.size())); ++t)
+                pool.emplace_back([&] {
+                    for (std::size_t i; (i = next++) < moving.size();) {
+                        const bg::Genome& g = *moving[i];
+                        const std::string& path = to.at(g.name);
+                        try {
+                            std::error_code ec;
+                            sizes[i] = fs::file_size(path, ec);
+                            if (ec) { errors[i] = "genome " + g.name + ": no file at " + path; continue; }
+                            const std::string sum = bg::sequence_checksum(path);
+                            if (sum != g.checksum)
+                                errors[i] = "genome " + g.name + ": " + path + " is not the genome counted (its sequence checksum is " + sum + ", " +
+                                            g.checksum + " when counted)";
+                        } catch (const std::exception& e) {
+                            errors[i] = e.what();
+                        }
+                    }
+                });
+            for (auto& th : pool) th.join();
+        }
+        for (const auto& e : errors)
+            if (!e.empty()) throw std::runtime_error("background: " + e);
+        std::map<std::string, std::pair<std::string, std::uint64_t>> placed;   // name -> new path, size
+        for (std::size_t i = 0; i < moving.size(); ++i) {
+            moving[i]->path = to.at(moving[i]->name);
+            moving[i]->bytes = sizes[i];
+            placed[moving[i]->name] = {moving[i]->path, sizes[i]};
+        }
+        // the segments' own records too: adding a coordinate reference maps their genomes from them
+        for (const auto& sg : m.segments) {
+            const fs::path dir = fs::path(out) / sg.dir;
+            if (!fs::exists(dir / "segment.tsv")) continue;   // a package keeps no segments
+            bg::SegmentInfo info = bg::read_segment_info(dir.string());
+            bool changed = false;
+            for (auto& g : info.genomes) {
+                const auto it = placed.find(g.name);
+                if (it == placed.end()) continue;
+                g.path = it->second.first;
+                g.bytes = it->second.second;
+                changed = true;
+            }
+            if (changed) bg::write_segment_info(dir.string(), info);
+        }
         ++m.generation;
         bg::write_manifest(out, m);
-        log.info("relocate: genomes: " + std::to_string(moved) + " (" + std::to_string(by_size) + " the size counted, " + std::to_string(by_checksum) +
-                 " another size but the sequence counted)");
+        log.info("relocate: genomes: " + std::to_string(moving.size()) + "; each checked against the sequence counted");
         log.wrote({(fs::path(out) / "manifest.json").string()});
         log.done();
         return 0;
@@ -764,9 +797,21 @@ int run_background_command(const std::vector<std::string>& args) {
         // committed, and only then are the sources removed: a failure or a kill leaves them where they were
         std::vector<bg::SegmentInfo> infos;
         for (const auto& a : attach) {
+            // attaching moves the segment: one a store lists (here or elsewhere) would vanish from that store
+            const fs::path dir = fs::weakly_canonical(fs::path(a));
+            if (fs::exists(dir / "manifest.json")) throw std::runtime_error("background: " + a + " is a store, not a segment");
+            const fs::path parent = dir.parent_path();
+            if (fs::exists(parent / "manifest.json")) {
+                bool listed = false;
+                try {
+                    for (const auto& s : bg::read_manifest(parent.string()).segments) listed = listed || s.dir == dir.filename().string();
+                } catch (const std::exception&) {}
+                if (listed) throw std::runtime_error("background: " + a + " is a segment of the store " + parent.string() +
+                                                     "; --attach takes a segment built with --segment-only");
+            }
             infos.push_back(bg::read_segment_info(a));
-            const bg::Segment check(a);   // complete and readable
         }
+        bg::open_segments(attach, threads);   // complete and readable
         const bg::StoreLock lock(out);
         bg::Manifest m = bg::read_manifest(out);
         std::vector<bg::Genome> incoming;

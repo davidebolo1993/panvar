@@ -599,9 +599,11 @@ public:
             std::vector<std::uint64_t> c, k;
         };
         std::vector<Cursor> cur(a.disk.size());
-        constexpr std::uint64_t kChunk = 1 << 15;
+        // each run holds a chunk of codes and counts (16 bytes a k-mer): with many runs the chunks shrink, so
+        // together they stay within half the budget
+        const std::uint64_t chunk = std::clamp<std::uint64_t>(budget_ / (32 * cur.size()), 64, 1 << 15);
         auto refill = [&](Cursor& r) {
-            const std::uint64_t take = std::min<std::uint64_t>(kChunk, r.n - r.at);
+            const std::uint64_t take = std::min<std::uint64_t>(chunk, r.n - r.at);
             r.c.resize(take);
             r.k.resize(take);
             if (std::fseek(runs_.fp, static_cast<long>(r.off + r.at * 8), SEEK_SET) != 0 || std::fread(r.c.data(), 8, take, runs_.fp) != take ||
@@ -1159,6 +1161,10 @@ Mapping::Mapping(const std::string& path) {
 
 Mapping::~Mapping() { if (data_ != nullptr) ::munmap(data_, size_); }
 
+void Mapping::advise_random(bool random) const {
+    if (data_ != nullptr) ::madvise(data_, size_, random ? MADV_RANDOM : MADV_NORMAL);   // a hint: failure changes nothing
+}
+
 std::uint64_t parts_distinct(const std::string& path) {
     const Mapping m(path);
     const auto* w = static_cast<const std::uint64_t*>(m.data());
@@ -1176,6 +1182,7 @@ Segment::Segment(const std::string& segment_dir) : dir_(segment_dir), info_(read
         const std::string path = (fs::path(dir_) / pf.file).string();
         maps_.push_back(std::make_unique<Mapping>(path));
         const Mapping& m = *maps_.back();
+        m.advise_random(true);   // the checks touch two words per partition: read-ahead would fetch far more
         const auto* w = static_cast<const std::uint64_t*>(m.data());
         const std::uint64_t total = m.size() / 8;
         auto bad = [&](const std::string& why) { return std::runtime_error("background: " + path + " " + why); };
@@ -1204,9 +1211,16 @@ Segment::Segment(const std::string& segment_dir) : dir_(segment_dir), info_(read
             const counts::View cnt(w + off + codes.words(), codes.size());
             where_[p] = {w + off, size};
         }
+        m.advise_random(false);
     }
     for (std::uint32_t p = 0; p < partitions_; ++p)
         if (!seen[p]) throw std::runtime_error("background: " + dir_ + " lacks partition " + std::to_string(p));
+}
+
+std::vector<std::unique_ptr<Segment>> open_segments(const std::vector<std::string>& dirs, std::size_t threads) {
+    std::vector<std::unique_ptr<Segment>> segs(dirs.size());
+    parallel_for(dirs.size(), threads, [&](std::size_t i) { segs[i] = std::make_unique<Segment>(dirs[i]); });
+    return segs;
 }
 
 Segment::Part Segment::part(std::uint32_t p) const {
@@ -1265,12 +1279,11 @@ void merge_partition(const std::vector<const Segment*>& segs, std::uint32_t p,
 
 SegmentStats merge_range(const MergeRangeOptions& o) {
     if (o.segment_dirs.empty()) throw std::runtime_error("background: nothing to merge");
-    std::vector<std::unique_ptr<Segment>> segs;
+    const std::vector<std::unique_ptr<Segment>> segs = open_segments(o.segment_dirs, o.threads);
     std::vector<const Segment*> raw;
-    for (const auto& d : o.segment_dirs) {
-        segs.push_back(std::make_unique<Segment>(d));
-        raw.push_back(segs.back().get());
-        if (segs.back()->partitions() != segs.front()->partitions())
+    for (const auto& s : segs) {
+        raw.push_back(s.get());
+        if (s->partitions() != segs.front()->partitions())
             throw std::runtime_error("background: segments with different partition counts cannot be merged");
     }
     const std::uint32_t partitions = segs.front()->partitions();

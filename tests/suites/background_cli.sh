@@ -107,6 +107,10 @@ check "an attach killed before its commit: store unchanged, source still there" 
 "${BG[@]}" -o s_att --clean && "${BG[@]}" -o s_att --attach seg_x
 truth t_all6 data/ref.fa data/g1.fa data/g2.fa data/g3.fa data/g4.fa data/g6.fa
 check "attached after --clean, its genome counts once" 'same s_att t_all6 && [[ $(on_disk s_att) == $(listed s_att) && ! -d seg_x ]]'
+"${BG[@]}" -o s_att --attach s/seg-0 2> err.txt; rc=$?
+check "another store's committed segment is refused, and stays in that store" '[[ $rc -ne 0 && -f s/seg-0/segment.tsv ]] && grep -q "is a segment of the store" err.txt && same s t_all'
+"${BG[@]}" -o s_att --attach s 2> err.txt; rc=$?
+check "a store given to --attach is refused" '[[ $rc -ne 0 ]] && grep -q "is a store, not a segment" err.txt && same s t_all'
 
 echo "== merging in ranges"
 PANVAR_TEST_FAIL_AT=merge-range "${BG[@]}" -o s --merge --range 0/3; rc=$?

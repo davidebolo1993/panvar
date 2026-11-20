@@ -13,6 +13,7 @@
 #include "panvar/ref_path.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <atomic>
 #include <cstdio>
@@ -220,6 +221,7 @@ struct LocusWork {
     std::vector<std::uint64_t> counts;                 // background counts per k-mer
     std::vector<std::uint64_t> sub, sub_trim;          // own occurrences in the extended / trimmed spans
     std::uint64_t ref_kmers = 0;                       // the reference path's k-mers (its interval must hold them)
+    std::string ref_seq;                               // the reference path's sequence (its interval must spell it)
     std::string error;                                 // why this locus failed after the shared scans (empty: fine)
     std::map<std::string, std::vector<anchors::Span>> spans;   // per genome: the located copies, then the pieces
                                                                // found off them (the locus, both, from there on)
@@ -586,6 +588,7 @@ std::vector<LocusIndex> build(const BuildOptions& o) {
         if (rp.length_mismatch)
             throw std::runtime_error("recruit: " + x.reference_path + ": the interval's length is not the path's, " + std::to_string(ref_seq.size()) + " bases");
         kmer::for_each_canonical_kmer(ref_seq.data(), ref_seq.size(), kK, [&](std::uint64_t, std::size_t, bool) { ++w.ref_kmers; });
+        w.ref_seq = ref_seq;
         x.contig = rp.chrom;
         x.start = rp.region_start_1based - 1;
         x.end = x.start + ref_seq.size();
@@ -638,13 +641,11 @@ std::vector<LocusIndex> build(const BuildOptions& o) {
     std::vector<char> ready(gnames.size(), 0);
     std::size_t applied = 0;   // genomes before this one are applied: each is applied once it and all before it are done
     std::mutex apply_mutex;
+    // occurrences are summed as soon as a genome is done (the order does not matter); spans keep the genomes'
+    // order, so they wait for the genomes before
     auto apply_ready = [&] {
         while (applied < gnames.size() && ready[applied]) {
             Subtracted& r = subtracted[applied++];
-            for (const auto& [li, i, trimmed] : r.occ) {
-                ++work[li].sub[i];
-                if (trimmed) ++work[li].sub_trim[i];
-            }
             for (auto& [li, gs] : r.spans) work[li].idx.spans.push_back(std::move(gs));
             r = Subtracted{};
         }
@@ -664,6 +665,12 @@ std::vector<LocusIndex> build(const BuildOptions& o) {
         }
         auto done = [&] {
             std::lock_guard<std::mutex> lock(apply_mutex);
+            Subtracted& r = subtracted[gi];
+            for (const auto& [li, i, trimmed] : r.occ) {
+                ++work[li].sub[i];
+                if (trimmed) ++work[li].sub_trim[i];
+            }
+            decltype(r.occ)().swap(r.occ);
             ready[gi] = 1;
             apply_ready();
         };
@@ -698,7 +705,28 @@ std::vector<LocusIndex> build(const BuildOptions& o) {
                                            sp.start, sp.end, sp.inner_start, sp.inner_end);
             for (const auto& [pos, i] : hits) out.occ.emplace_back(static_cast<std::uint32_t>(li), i, pos >= lo && pos + kK <= hi);
             // the reference's own interval must hold the reference path: a label off its sequence would subtract
-            // nothing there and turn the locus's k-mers shared
+            // nothing there and turn the locus's k-mers shared. Where the span covers the label's interval, the
+            // interval must spell the path (another path's k-mers there would pass a count); else its k-mers.
+            if (gname == cref && owner[k].second == 0 && sp.contig == w.idx.contig) {
+                const std::string* covering = nullptr;
+                std::uint64_t at = 0;
+                for (const auto& piece : pieces[k])
+                    if (piece.start <= w.idx.start && piece.start + piece.seq.size() >= w.idx.end) { covering = &piece.seq; at = w.idx.start - piece.start; }
+                if (covering != nullptr) {
+                    auto same = [&](const std::string& want) {
+                        if (want.size() != w.idx.end - w.idx.start) return false;
+                        for (std::size_t q = 0; q < want.size(); ++q) {
+                            const int a = std::toupper(static_cast<unsigned char>((*covering)[at + q])), b = std::toupper(static_cast<unsigned char>(want[q]));
+                            const bool acgt = std::strchr("ACGT", a) != nullptr && std::strchr("ACGT", b) != nullptr;   // N or IUPAC: either way
+                            if (acgt && a != b) return false;
+                        }
+                        return true;
+                    };
+                    if (!same(w.ref_seq) && !same(reverse_complement(w.ref_seq)))
+                        throw std::runtime_error("recruit: " + w.idx.reference_path + ": " + cref + " " + w.idx.contig + ":" + std::to_string(w.idx.start) + "-" +
+                                                 std::to_string(w.idx.end) + " does not spell the path; the label does not match the reference");
+                }
+            }
             if (gname == cref && owner[k].second == 0 && hits.size() < w.ref_kmers)
                 throw std::runtime_error("recruit: " + w.idx.reference_path + ": " + cref + " " + sp.contig + ":" + std::to_string(sp.start) + "-" +
                                          std::to_string(sp.end) + " holds " + std::to_string(hits.size()) + " of the path's " +
@@ -965,6 +993,11 @@ std::vector<LocusIndex> build(const BuildOptions& o) {
                 for (std::size_t k = 0; k < iv.size(); ++k) scan(gname, iv[k].contig, seqs[k], here_for(iv[k].contig), inner, found[gi]);
             }
             std::lock_guard<std::mutex> lock(log_mutex);
+            // the occurrences counted as each genome is done, not held for every genome until the last
+            for (const auto& [li, i] : found[gi].off) { ++work[li].sub[i]; ++work[li].sub_trim[i]; }
+            for (const auto& [li, i] : found[gi].ends) ++work[li].sub_trim[i];
+            decltype(found[gi].off)().swap(found[gi].off);
+            decltype(found[gi].ends)().swap(found[gi].ends);
             log(nd.whole.empty() ? "pieces: contigs scanned: " + gname + " (" + std::to_string(nd.contigs.size()) + ")"
                                  : "pieces: genome scanned: " + gname);
         });
@@ -976,8 +1009,6 @@ std::vector<LocusIndex> build(const BuildOptions& o) {
             for (const std::size_t li : nd.whole) counted[li] = 1;
             for (const auto& c : nd.contigs) for (const std::size_t li : c.second) counted[li] = 1;
             for (std::size_t li = 0; li < work.size(); ++li) scanned_for[li] += counted[li];
-            for (const auto& [li, i] : found[gi].off) { ++work[li].sub[i]; ++work[li].sub_trim[i]; }
-            for (const auto& [li, i] : found[gi].ends) ++work[li].sub_trim[i];
             for (auto& [li, sp] : found[gi].pieces) {
                 piece_genomes[li].insert(sp.genome);
                 // a piece is the locus wherever a copy is: no decoy window or off-target read is taken from it

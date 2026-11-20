@@ -36,12 +36,12 @@ Counts every 31-mer of a set of genomes once, so that `recruit` can tell, for ea
 | `--coordinate-reference NAME` | place this genome's anchors in every genome; on an existing store, adds them | |
 | `--add` | count the genomes into a new segment of an existing store | off |
 | `--segment-only <dir>` | count the genomes into `<dir>` without committing (a parallel job) | |
-| `--attach <dir>...` | commit segments built with `--segment-only` | |
+| `--attach <dir>...` | commit segments built with `--segment-only` (moved into the store; a store, or a segment a store lists, is refused) | |
 | `--merge` | merge the store's segments into one | off |
 | `--range I/N` | with `--merge`: only the I-th of N partition ranges (0-based) | all |
 | `--compact` | write the merged store as an SSHash dictionary | off |
 | `--package <dir>` | write a packaged background to `<dir>`: the compacted counts, the anchors joined into one packed file per coordinate reference, and the manifest; what `recruit` needs to build locus indexes, without the partitioned counts (needs `--compact` first) | |
-| `--relocate <tsv>` | genome files moved: one `name<TAB>path` per line; a file of the size counted is taken, one of another size (recompressed, say) only when its sequence checksum is the one counted | |
+| `--relocate <tsv>` | genome files moved: one `name<TAB>path` per line; each file is taken only when its sequence checksum is the one counted (the files are read in parallel, `-t`) | |
 | `--clean` | remove what no committed segment or running job uses | off |
 | `--locate <region>` | print where each genome holds a region of the coordinate reference | |
 | `--dump <path>` | every k-mer and its count, segments summed | |
@@ -68,7 +68,7 @@ Counts every 31-mer of a set of genomes once, so that `recruit` can tell, for ea
 
 ## Sharing a background
 
-Counting hundreds of genomes takes days; building a locus index against them takes an hour. A packaged background lets others skip the first: `--compact`, then `--package <dir>`, and share `<dir>`. The genome files are not in it (they are public, and large): the index reads them again to locate each locus and cut its copies. Whoever receives the package downloads the genomes and gives their paths with `--relocate`: a file byte for byte as counted is taken by its size, and one recompressed or otherwise rewritten (bgzip, say, for faster reading by interval) by the checksum of its sequence lines, so a different assembly is never taken for the one counted. Indexes built from a package are the ones the full store gives.
+Counting hundreds of genomes takes days; building a locus index against them takes an hour. A packaged background lets others skip the first: `--compact`, then `--package <dir>`, and share `<dir>`. The genome files are not in it (they are public, and large): the index reads them again to locate each locus and cut its copies. Whoever receives the package downloads the genomes and gives their paths with `--relocate`: each file is taken by the checksum of its sequence lines, so one recompressed or otherwise rewritten (bgzip, say, for faster reading by interval) is taken and a different assembly never is, even one of the same size. Indexes built from a package are the ones the full store gives.
 
 ## Limitations
 

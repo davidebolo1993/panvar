@@ -439,13 +439,14 @@ ReadStats recruit_reads(const ReadOptions& options) {
         // an earlier run's reads of these loci go first: a locus and fate with no reads now must not keep old ones
         std::error_code ec;
         std::size_t removed = 0;
+        // only the names this run writes: another locus's name may start with this one's
+        std::set<std::string> ours;
+        for (const LocusTable& l : loci)
+            for (const char* fate : {"certain", "ambiguous"})
+                for (const char* suffix : {"", "_1", "_2"}) ours.insert(l.name + "." + fate + suffix + ".fq.gz");
         if (std::filesystem::is_directory(o.reads_out, ec))
-            for (const auto& e : std::filesystem::directory_iterator(o.reads_out, ec)) {
-                const std::string f = e.path().filename().string();
-                if (f.size() < 7 || f.compare(f.size() - 6, 6, ".fq.gz") != 0) continue;
-                for (const LocusTable& l : loci)
-                    if (f.compare(0, l.name.size() + 1, l.name + ".") == 0) { std::filesystem::remove(e.path(), ec); ++removed; break; }
-            }
+            for (const auto& e : std::filesystem::directory_iterator(o.reads_out, ec))
+                if (ours.count(e.path().filename().string())) { std::filesystem::remove(e.path(), ec); ++removed; }
         if (removed > 0) log("reads-out: " + o.reads_out + "; " + std::to_string(removed) + " files of an earlier run removed");
         writers = std::make_unique<ReadWriters>(o.reads_out, o.threads);
     }

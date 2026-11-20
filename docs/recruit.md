@@ -57,8 +57,8 @@ Reads, per sample:
 | `--dry-run` | count each input's records by kind and the time to read them | off |
 | `--false-certain-rate <r>` | the off-target certain rate each locus's cut is chosen for | `1e-4` |
 | `--min-sites <N>` | one private-site cut for every locus | calibrated |
-| `--error-rate <e>` | the reads' error rate per base; a read whose qualities say more is held to its own | from base qualities |
-| `--decoy-share-long <r>` | decoy sites tolerated per private site in reads of 1 kb or more | 0.25 |
+| `--error-rate <e>` | the reads' error rate per base, in [0, 0.5); a read whose qualities say more is held to its own | from base qualities |
+| `--decoy-share-long <r>` | decoy sites tolerated per private site in reads of 1 kb or more, in [0, 1] | 0.25 |
 | `--preset <p>` | the read type, `illumina`, `hifi` or `ont`: its calibration class and error rate (0.002, 0.001, 0.03); `--error-rate` overrides the rate. Corrected long reads (HiFi, error-corrected ONT) are `hifi`, any other long reads `ont` | from the reads |
 | `--reads-out <dir>` | the recruited reads as gzip FASTQ, per locus and fate | off |
 | `--certain-only` | with `--reads-out`, certain reads only | off |
@@ -105,7 +105,7 @@ Table columns:
 ## Limitations
 
 - k is 31, as in the background.
-- The calibration simulates about 10,000 off-target fragments per locus and class: no false certain fragment among them bounds the rate at a few per 10,000, not one per million, and overlapping fragments share sites. The summary says whether the rate was shown or only none beyond it seen. Rates per million come from whole-genome negatives (see the dev scripts).
+- The calibration simulates off-target fragments from each source (the flanks, the decoy windows): about 100,000 short pairs, and up to 4,000 long reads, fewer when the source is short (two 5 Mb flanks give about 1,300 HiFi or 2,000 ONT reads); fewer still hit the screen. No false certain fragment among them bounds the rate at 3 over the number screened (a 95% bound): showing 1e-4 takes 30,000 screened, one per million three million; overlapping fragments share sites. The summary says whether the rate was shown or only none beyond it seen. Rates per million come from whole-genome negatives (see the dev scripts).
 - A homologous copy carrying the locus's alleles at two distinguishing bases within one read (gene conversion, a paralogous variant at both) reads as certain; a larger background, where more of those alleles are shared, reduces it.
 - Short pairs across a locus edge are less often certain than inside it: the located copies' ends are uncertain, so the k-mers near them are labelled shared.
 - Long spliced transcripts cross many junctions and read as divergent.

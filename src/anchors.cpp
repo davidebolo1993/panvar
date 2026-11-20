@@ -536,9 +536,10 @@ void merge_segment_anchors(const std::vector<std::string>& inputs, const Referen
     std::vector<std::vector<std::string>> contigs;
     std::vector<std::vector<std::uint64_t>> lengths;
     std::vector<std::uint32_t> genome_base;
+    const std::uint64_t ref_fp = ref.fingerprint();
     for (const auto& p : inputs) {
         in.push_back(std::make_unique<SegmentAnchors>(p));
-        if (in.back()->fingerprint() != ref.fingerprint() || in.back()->anchors() != ref.code.size())
+        if (in.back()->fingerprint() != ref_fp || in.back()->anchors() != ref.code.size())
             throw std::runtime_error("anchors: " + p + " belongs to another anchor set");
         genome_base.push_back(static_cast<std::uint32_t>(genomes.size()));
         for (std::size_t g = 0; g < in.back()->genomes().size(); ++g) {
@@ -602,8 +603,9 @@ std::vector<Span> locate(const ReferenceAnchors& ref, const std::vector<const Se
     if (start >= end) throw std::runtime_error("anchors: the interval's start must be below its end");
     if (end > ref.contig_lengths[c])
         throw std::runtime_error("anchors: " + contig + " is " + std::to_string(ref.contig_lengths[c]) + " bp; the interval ends at " + std::to_string(end));
+    const std::uint64_t ref_fp = ref.fingerprint();   // a pass over every reference anchor: once, not per segment
     for (const auto* s : segments)
-        if (s->fingerprint() != ref.fingerprint()) throw std::runtime_error("anchors: a segment's anchors belong to another anchor set");
+        if (s->fingerprint() != ref_fp) throw std::runtime_error("anchors: a segment's anchors belong to another anchor set");
     auto first_at_or_after = [&](std::uint64_t pos) {
         return static_cast<std::size_t>(std::lower_bound(ref.at.begin(), ref.at.end(), std::make_pair(c, pos),
             [](const RefPlace& a, const std::pair<std::uint32_t, std::uint64_t>& b) {

@@ -163,11 +163,12 @@ Store::Store(const std::string& store_dir) : manifest_(read_manifest(store_dir))
         throw std::runtime_error("background: " + store_dir + " is a packaged background (its compacted counts, anchors and genome list): "
                                  "recruit reads it, but adding, merging, compacting or dumping need the full store");
     partitions_ = manifest_.partitions;
-    for (const auto& ms : manifest_.segments) {
-        segs_.push_back(std::make_unique<Segment>((fs::path(store_dir) / ms.dir).string()));
-        if (segs_.back()->partitions() != partitions_)
-            throw std::runtime_error("background: " + ms.dir + " has a partition count other than the store's");
-    }
+    std::vector<std::string> dirs;
+    for (const auto& ms : manifest_.segments) dirs.push_back((fs::path(store_dir) / ms.dir).string());
+    segs_ = open_segments(dirs, std::min<std::size_t>(8, default_threads()));
+    for (std::size_t i = 0; i < segs_.size(); ++i)
+        if (segs_[i]->partitions() != partitions_)
+            throw std::runtime_error("background: " + manifest_.segments[i].dir + " has a partition count other than the store's");
 }
 
 std::uint64_t Store::count(std::uint64_t canonical_kmer) const {

@@ -170,9 +170,20 @@ printf 's3\tr_1.fq\tr_2.fq\ns3\tlong.fq\n' > mixed_sheet.tsv
 "$BIN" recruit --locus "$IDX" --samples mixed_sheet.tsv -o mixed_type -q 2> mixed_type.txt; rc=$?
 check "one sample's short and long inputs are refused" '[[ $rc -ne 0 ]] && grep -q "must be one read type" mixed_type.txt'
 # reads-out: an earlier run's files of the same loci go, so none stays that this run did not write
-mkdir -p stale_out && echo old | gzip > stale_out/locus.ambiguous_9.fq.gz && echo keep > stale_out/notes.txt
+mkdir -p stale_out && echo old | gzip > stale_out/locus.ambiguous_1.fq.gz && echo keep > stale_out/notes.txt
+echo other | gzip > stale_out/locus.x.certain_1.fq.gz   # a locus named locus.x: not this run's
 "$BIN" recruit --locus "$IDX" -1 r_1.fq -2 r_2.fq -o stale_run.tsv --reads-out stale_out 2> stale_run.log
-check "reads-out: an earlier run's files of these loci are removed, others kept" '[[ ! -f stale_out/locus.ambiguous_9.fq.gz && -f stale_out/notes.txt && -f stale_run.tsv && ! -f stale_run.tsv.tmp ]] && grep -q "earlier run removed" stale_run.log'
+check "reads-out: an earlier run's files of these loci are removed, others kept" '! gzip -dc stale_out/locus.ambiguous_1.fq.gz 2> /dev/null | grep -qx old && [[ -f stale_out/notes.txt && -f stale_run.tsv && ! -f stale_run.tsv.tmp ]] && grep -q "earlier run removed" stale_run.log'
+check "reads-out: another locus whose name starts with this one's keeps its files" '[[ -f stale_out/locus.x.certain_1.fq.gz ]]'
+printf '../up\tr_1.fq\tr_2.fq\n' > path_sheet.tsv
+"$BIN" recruit --locus "$IDX" --samples path_sheet.tsv -o path_out -q 2> path_sheet.txt; rc=$?
+check "a sample name with a path in it is refused" '[[ $rc -ne 0 && ! -e up.tsv ]] && grep -q "not a plain file name" path_sheet.txt'
+for v in -1 nan 2; do
+  "$BIN" recruit --locus "$IDX" -1 r_1.fq -2 r_2.fq -o share.tsv -q --decoy-share-long $v 2> share.txt; rc=$?
+  check "--decoy-share-long $v is refused" '[[ $rc -ne 0 ]] && grep -q "decoy-share-long" share.txt'
+done
+"$BIN" recruit --locus "$IDX" -1 r_1.fq -2 r_2.fq -o rate.tsv -q --error-rate -0.1 2> rate.txt; rc=$?
+check "a negative --error-rate is refused" '[[ $rc -ne 0 ]] && grep -q "error-rate" rate.txt'
 
 sed -n '5,$p' r_2.fq > shifted_2.fq
 "$BIN" recruit --locus "$IDX" -1 r_1.fq -2 shifted_2.fq -o x.tsv -q 2> err1.txt; rc=$?
