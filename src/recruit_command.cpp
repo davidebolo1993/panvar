@@ -44,9 +44,10 @@ void print_recruit_help() {
         << "                                  shared, more is repeat (default 8)\n"
         << "      --decoy-genomes <A,B>       Genomes whose homologous windows give decoys (default: the coordinate\n"
         << "                                  reference)\n"
-        << "      --calibration-genomes <A,B> Genomes held out one at a time in calibration (default: per locus, up to\n"
-        << "                                  8 decoy genomes other than the coordinate reference, chosen by the\n"
-        << "                                  homolog k-mers each adds)\n"
+        << "      --calibration-genomes <A,B> Candidates for the genomes calibration holds out one at a time (default:\n"
+        << "                                  the decoy genomes other than the coordinate reference)\n"
+        << "      --calibration-max <N>       Candidates each locus holds out, at most, taken by the homolog k-mers\n"
+        << "                                  each adds (default 8)\n"
         << "      --no-calibration            Build indexes without calibration\n\n"
         << "Reads (one sample's files are read in turn):\n"
         << "  -1, --reads <fq>                FASTQ (plain or gzip); repeatable\n"
@@ -129,6 +130,7 @@ int run_recruit_command(const std::vector<std::string>& args) {
             for (std::string d; std::getline(ss, d, ',');) if (!d.empty()) o.calibration_genomes.push_back(d);
             if (o.calibration_genomes.empty()) throw std::runtime_error("--calibration-genomes takes a comma list of genomes");
         }
+        else if (a == "--calibration-max") o.calibration_max = cli::parse_size_arg(a, value());
         else if (a == "--decoy-genomes") {
             std::stringstream ss(value());
             for (std::string d; std::getline(ss, d, ',');) if (!d.empty()) o.decoy_genomes.push_back(d);

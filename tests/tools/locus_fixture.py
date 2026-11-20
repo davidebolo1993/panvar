@@ -233,3 +233,9 @@ with open(os.path.join(logo, "locus.gfa"), "w") as f:
     f.write(f"S\t1\t{ref5[ls5:le5]}\nS\t2\t{hap_h}\n")
     f.write(f"P\tref#1#chr1:{ls5}-{le5}\t1+\t*\n")
     f.write(f"P\tgh#1#chr1:{ls5}-{le5}\t2+\t*\n")
+
+# gc: an identical copy of 8 kb of the locus, cut in pieces of 1 kb laid in reverse order with nothing between: no
+# three anchors in order, so it is not located as a copy, yet nearly every k-mer of it is the locus's
+write("logo/gc", [("chr1", ref5), ("c", seq(20000) + "".join(ref5[x:x + 1000] for x in reversed(range(121000, 129000, 1000))) + seq(20000))])
+# ge: a 3% diverged paralog of the same 8 kb, in pieces like gu's: few of its k-mers are the locus's
+write("logo/ge", [("chr1", ref5), ("e", seq(20000) + scrambled(121000, 129000, 0.03) + seq(20000))])

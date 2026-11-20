@@ -420,13 +420,22 @@ ReadStats recruit_reads(const ReadOptions& options) {
                         char th[32];
                         if (t->bin == kEveryBin) std::snprintf(th, sizeof th, "any");
                         else std::snprintf(th, sizeof th, "%.4f", t->bin * kScoreBin);
-                        std::snprintf(b, sizeof b, "%s: held-out recall %.4f; off-target %llu of %llu screened (rate %.3g asked), 95%% bound %.3g, %s", th,
+                        std::snprintf(b, sizeof b, "%s: held-out recall %.4f; off-target %llu of %llu screened (share %.3g, rate %.3g asked), 95%% bound %.3g, %s", th,
                                       t->locus_total ? static_cast<double>(t->locus) / static_cast<double>(t->locus_total) : 0.0,
-                                      static_cast<unsigned long long>(t->off), static_cast<unsigned long long>(t->off_screened), t->rate, t->bound(),
-                                      t->shown ? "within the rate" : t->off == 0 ? "too few to show the rate (none beyond it seen)"
-                                                                     : "within the rate as seen, its bound above it");
+                                      static_cast<unsigned long long>(t->off), static_cast<unsigned long long>(t->off_screened), t->share, t->rate, t->bound(),
+                                      t->shown ? "within the rate" : t->extrapolated ? "too few to show the rate: the threshold is extrapolated"
+                                      : t->off == 0 ? "too few to show the rate (none beyond it seen)" : "within the rate as seen, its bound above it");
+                        std::string note = b;
+                        if (t->extrapolated) {
+                            char seen[32];
+                            if (t->observed_bin == kEveryBin) std::snprintf(seen, sizeof seen, "any");
+                            else std::snprintf(seen, sizeof seen, "%.4f", t->observed_bin * kScoreBin);
+                            std::snprintf(b, sizeof b, " from the tail of the off-target scores (scale %.3g, a private site in %.3g of off-target fragments; the fragments seen give %s)",
+                                          t->tail_scale, t->tail_site_share, seen);
+                            note += b;
+                        }
                         notes[li].push_back(std::string(name) + "_threshold");
-                        notes[li].push_back(b);
+                        notes[li].push_back(note);
                     }
                     log("locus: " + loci[li].name + "; " + notes[li][1] + "; certain from " + notes[li][3] + "; likely from " + notes[li][5]);
                     continue;

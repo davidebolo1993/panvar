@@ -6,6 +6,7 @@
 #include "panvar/recruit_scoring.hpp"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cctype>
 #include <cmath>
@@ -75,9 +76,9 @@ std::string with_errors(const std::string& s, double e, double indel_share, Rng&
 
 // A fragment to simulate: `length` bases of `src` from `at` (a pair: its two ends, `length` the insert).
 struct Job {
-    const std::string* src;
+    std::size_t src;     // which sequence
     std::uint64_t at, length;
-    std::uint8_t kind;   // 0 locus, 1 flank, 2 decoy, 3 a calibration genome's
+    std::uint8_t kind;   // 0 locus, 1 flank, 2 decoy
 };
 
 struct Tally {
@@ -93,8 +94,8 @@ struct Result {
 };
 
 // Simulates and scores the jobs.
-std::vector<Result> run(const std::vector<Job>& jobs, std::uint64_t seed, const Class& c, const scoring::LocusTable& t,
-                        const std::vector<std::uint64_t>& screen, std::size_t threads) {
+std::vector<Result> run(const std::vector<Job>& jobs, const std::vector<const std::string*>& srcs, std::uint64_t seed, const Class& c,
+                        const scoring::LocusTable& t, const std::vector<std::uint64_t>& screen, std::size_t threads) {
     ReadOptions o;
     o.error_rate = c.error;
     const scoring::Costs costs = scoring::costs_for(c.error);
@@ -103,16 +104,17 @@ std::vector<Result> run(const std::vector<Job>& jobs, std::uint64_t seed, const 
     auto work = [&] {
         for (std::size_t i; (i = next++) < jobs.size();) {
             const Job& j = jobs[i];
+            const std::string* src = srcs[j.src];
             Rng rng{seed ^ (0xD1B54A32D192ED03ULL * (i + 1))};
             Fragment f;
             f.name = "f";
             if (c.insert > 0) {
                 f.paired = true;
                 const std::uint64_t r = std::min<std::uint64_t>(c.length, j.length);
-                f.seq1 = with_errors(j.src->substr(j.at, r), c.error, c.indel_share, rng);
-                f.seq2 = with_errors(reverse_complement(j.src->substr(j.at + j.length - r, r)), c.error, c.indel_share, rng);
+                f.seq1 = with_errors(src->substr(j.at, r), c.error, c.indel_share, rng);
+                f.seq2 = with_errors(reverse_complement(src->substr(j.at + j.length - r, r)), c.error, c.indel_share, rng);
             } else {
-                f.seq1 = with_errors(j.src->substr(j.at, j.length), c.error, c.indel_share, rng);
+                f.seq1 = with_errors(src->substr(j.at, j.length), c.error, c.indel_share, rng);
             }
             // the screen, as recruit applies it: a closed syncmer of the index (and not held out)
             bool hit = false;
@@ -146,18 +148,25 @@ void tally_of(const std::vector<Job>& jobs, const std::vector<Result>& res, Tall
     }
 }
 
+// An off-target stretch as fragments are laid over it: its length, the window in it and whether it is one.
+struct Extent {
+    std::uint64_t n, core_start, core_end;
+    bool decoy;
+};
+
 // Off-target fragments from flanks (tiled) and windows with context (tiled with reads overlapping the window: fragments
 // overlapping a window share its sites, so false certain fragments cluster by site, and the bound treats them as
 // independent), about `want` from each kind of source.
-std::vector<Job> off_jobs(const std::vector<OffTarget>& off, const Class& c, Rng& rng, std::uint8_t flank_kind, std::uint8_t decoy_kind) {
+std::vector<Job> off_jobs(const std::vector<Extent>& off, const Class& c, Rng& rng, std::uint8_t flank_kind, std::uint8_t decoy_kind) {
     std::uint64_t flank_bases = 0, decoy_bases = 0;
-    for (const OffTarget& r : off) (r.decoy ? decoy_bases : flank_bases) += r.decoy ? r.core_end - r.core_start + (c.insert ? 0 : c.length) : r.seq.size();
+    for (const Extent& r : off) (r.decoy ? decoy_bases : flank_bases) += r.decoy ? r.core_end - r.core_start + (c.insert ? 0 : c.length) : r.n;
     const std::uint64_t want = c.insert ? kOffShort : kOffLong;
     const std::uint64_t stride_flank = std::max<std::uint64_t>(c.insert ? 50 : c.length / 2, flank_bases / want);
     const std::uint64_t stride_decoy = std::max<std::uint64_t>(c.insert ? 10 : 500, decoy_bases / want);
     std::vector<Job> jobs;
-    for (const OffTarget& r : off) {
-        const std::uint64_t n = r.seq.size();
+    for (std::size_t ri = 0; ri < off.size(); ++ri) {
+        const Extent& r = off[ri];
+        const std::uint64_t n = r.n;
         const std::uint8_t kind = r.decoy ? decoy_kind : flank_kind;
         if (c.insert) {
             // decoy windows: fragments with at least a read length inside the window, in its context too
@@ -169,16 +178,16 @@ std::vector<Job> off_jobs(const std::vector<OffTarget>& off, const Class& c, Rng
                                                                               static_cast<double>(c.length), static_cast<double>(max_l)));
                 if (a + L > n) continue;
                 if (r.decoy && std::min(a + L, r.core_end) < std::max(a, r.core_start) + c.length) continue;
-                jobs.push_back({&r.seq, a, L, kind});
+                jobs.push_back({ri, a, L, kind});
             }
         } else if (n <= c.length) {
-            if (n >= 2 * kK) jobs.push_back({&r.seq, 0, n, kind});
+            if (n >= 2 * kK) jobs.push_back({ri, 0, n, kind});
         } else if (r.decoy) {   // reads ending at least 1 kb into the window, starting at least 1 kb before its end
             const std::uint64_t lo = std::min(n - c.length, r.core_start + 1000 > c.length ? r.core_start + 1000 - c.length : 0);
             const std::uint64_t hi = std::min(n - c.length, std::max(lo, r.core_end > 1000 ? r.core_end - 1000 : 0));
-            for (std::uint64_t a = lo; a <= hi; a += stride_decoy) jobs.push_back({&r.seq, a, c.length, kind});
+            for (std::uint64_t a = lo; a <= hi; a += stride_decoy) jobs.push_back({ri, a, c.length, kind});
         } else {
-            for (std::uint64_t a = 0; a + c.length <= n; a += stride_flank) jobs.push_back({&r.seq, a, c.length, kind});
+            for (std::uint64_t a = 0; a + c.length <= n; a += stride_flank) jobs.push_back({ri, a, c.length, kind});
         }
     }
     return jobs;
@@ -189,11 +198,6 @@ std::uint64_t fnv1a(const std::string& s) {
     std::uint64_t h = 0xCBF29CE484222325ULL;
     for (const char c : s) h = (h ^ static_cast<unsigned char>(c)) * 0x100000001B3ULL;
     return h;
-}
-
-std::string sample_of(const std::string& path) {
-    const std::size_t h = path.find('#');
-    return h == std::string::npos ? path : path.substr(0, h);
 }
 
 // Sites per k k-mers, with half a site and one k-mer stretch of prior so that no rate is 0.
@@ -221,30 +225,280 @@ std::uint64_t ScoreHistogram::at_least(std::int32_t b) const {
     return n;
 }
 
-void calibrate(LocusIndex& x, const Graph& g, const std::vector<OffTarget>& off, const std::vector<GenomeOffTarget>& genomes,
-               std::size_t threads) {
+std::string calibration_sample(const std::string& path) {
+    const std::size_t h = path.find('#');
+    return h == std::string::npos ? path : path.substr(0, h);
+}
+
+DecoyFilter::DecoyFilter(const std::vector<std::uint64_t>& codes, const std::vector<std::uint64_t>& decoys) {
+    std::uint64_t bits = 1024;
+    while (bits < 16 * (codes.size() + decoys.size())) bits <<= 1;
+    bits_.assign(bits / 64, 0);
+    mask_ = bits - 1;
+    for (const auto* v : {&codes, &decoys})
+        for (const std::uint64_t d : *v) {
+            const std::uint64_t h = kmer::mix64(d) & mask_;
+            bits_[h >> 6] |= 1ULL << (h & 63);
+        }
+}
+
+bool DecoyFilter::maybe(std::uint64_t code) const {
+    const std::uint64_t h = kmer::mix64(code) & mask_;
+    return (bits_[h >> 6] >> (h & 63)) & 1;
+}
+
+namespace {
+
+// Sorted positions, counted over ranges.
+struct Marks {
+    std::vector<std::uint32_t> at;
+    std::size_t count(std::uint64_t a, std::uint64_t b) const {   // in [a, b)
+        return static_cast<std::size_t>(std::lower_bound(at.begin(), at.end(), b) - std::lower_bound(at.begin(), at.end(), a));
+    }
+};
+
+// Sorted, disjoint stretches of positions.
+struct Runs {
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> r;
+    void add(std::uint64_t a, std::uint64_t b) {   // in increasing order of a
+        if (!r.empty() && a <= r.back().second) r.back().second = std::max(r.back().second, b);
+        else r.emplace_back(a, b);
+    }
+    std::uint64_t covered(std::uint64_t a, std::uint64_t b) const {   // positions of [a, b) in a stretch
+        std::uint64_t n = 0;
+        auto it = std::upper_bound(r.begin(), r.end(), a, [](std::uint64_t v, const std::pair<std::uint64_t, std::uint64_t>& x) { return v < x.second; });
+        for (; it != r.end() && it->first < b; ++it) n += std::min(b, it->second) - std::max(a, it->first);
+        return n;
+    }
+};
+
+constexpr std::uint8_t kNoKmer = 7, kScreenBit = 8;
+
+// A block of a held-out genome as reads of it are labelled: per k-mer start its label (kNoKmer where no k-mer
+// starts, kScreenBit on a screen k-mer), and where the private k-mers, the screen k-mers and the decoy sites
+// (decoy k-mers k apart) lie; the starts without a k-mer; the stretches that read as a copy of the locus.
+struct BlockLabels {
+    std::vector<std::uint8_t> lab;
+    Marks priv, screen, dsite;
+    Runs none, copy;
+};
+
+// A mate read off a block's labels, [at, at + n) of it, with errors at rate e: each error leaves the k-mers over
+// it unknown (one that makes a known k-mer by chance is not looked for). True when a screen k-mer is read whole.
+bool read_labels(const std::string& seq, const BlockLabels& L, std::uint64_t at, std::uint64_t n, bool reverse, double e, Rng& rng,
+                 std::vector<scoring::Kmer>& out) {
+    out.clear();
+    if (n < kK) return false;
+    std::vector<std::uint64_t> err;   // error positions: the gaps between them are geometric
+    const double lq = std::log(1.0 - e);
+    auto gap = [&] { return std::floor(std::log(std::max(rng.unit(), 1e-300)) / lq); };
+    for (double p = gap(); p < static_cast<double>(n); p += 1.0 + gap()) err.push_back(static_cast<std::uint64_t>(p));
+    bool screened = false;
+    std::size_t ei = 0;
+    out.reserve(n - kK + 1);
+    kmer::for_each_canonical_kmer(seq.data() + at, n, kK, [&](std::uint64_t code, std::size_t start, bool) {
+        while (ei < err.size() && err[ei] < start) ++ei;
+        const bool hit = ei < err.size() && err[ei] < start + kK;
+        const std::uint8_t l = L.lab[at + start];
+        screened = screened || (!hit && (l & kScreenBit));
+        out.push_back({code, static_cast<std::uint32_t>(start), static_cast<std::uint8_t>(hit ? kLabelN : (l & 7)), false});
+    });
+    if (reverse) {
+        std::reverse(out.begin(), out.end());
+        for (scoring::Kmer& k : out) k.start = static_cast<std::uint32_t>(n - kK - k.start);
+    }
+    return screened;
+}
+
+double median(std::vector<double> v) {
+    std::sort(v.begin(), v.end());
+    const std::size_t n = v.size();
+    return n == 0 ? 0.0 : n % 2 ? v[n / 2] : 0.5 * (v[n / 2 - 1] + v[n / 2]);
+}
+
+}  // namespace
+
+GenomeScan scan_genome(const LocusIndex& x, const FlatMap<std::uint32_t>& code_index, const DecoyFilter& filter,
+                       const std::vector<std::uint64_t>& decoy_counts, const std::string& genome,
+                       const std::vector<std::string>& blocks, const std::vector<OffStretch>& stretches) {
+    GenomeScan out;
+    out.stats.genome = genome;
+    for (const OffStretch& s : stretches) out.stats.windows += s.window;
+    const std::size_t nc = x.codes.size(), nd = x.decoy.size();
+    // the k-mer starts holding a locus k-mer (its index) or a decoy (its index after them): few among the genome's,
+    // which the filter passes over
+    struct Hit {
+        std::uint32_t pos, id;
+    };
+    std::vector<std::vector<Hit>> hits(blocks.size());
+    std::vector<BlockLabels> labels(blocks.size());
+    std::vector<std::uint32_t> in_locus(nc, 0), in_decoy(nd, 0);
+    for (std::size_t b = 0; b < blocks.size(); ++b) {
+        const std::string& seq = blocks[b];
+        BlockLabels& L = labels[b];
+        out.stats.bases += seq.size();
+        const std::size_t n = seq.size() >= kK ? seq.size() - kK + 1 : 0;
+        L.lab.assign(n, kLabelN);
+        std::size_t next = 0;   // the starts before this one are done
+        auto no_kmers = [&](std::size_t from, std::size_t to) {
+            if (to <= from) return;
+            std::fill(L.lab.begin() + static_cast<std::ptrdiff_t>(from), L.lab.begin() + static_cast<std::ptrdiff_t>(to), kNoKmer);
+            L.none.add(from, to);
+        };
+        kmer::for_each_canonical_kmer(seq.data(), seq.size(), kK, [&](std::uint64_t c, std::size_t start, bool) {
+            no_kmers(next, start);
+            next = start + 1;
+            if (!filter.maybe(c)) return;
+            if (const std::uint32_t* i = code_index.find(c)) {
+                ++in_locus[*i];
+                hits[b].push_back({static_cast<std::uint32_t>(start), *i});
+                return;
+            }
+            const auto it = std::lower_bound(x.decoy.begin(), x.decoy.end(), c);
+            if (it == x.decoy.end() || *it != c) return;
+            const std::size_t j = static_cast<std::size_t>(it - x.decoy.begin());
+            ++in_decoy[j];
+            hits[b].push_back({static_cast<std::uint32_t>(start), static_cast<std::uint32_t>(nc + j)});
+        });
+        no_kmers(next, n);
+    }
+    // held out, the genome's own homolog k-mers change label: a locus k-mer whose every occurrence outside the locus
+    // is in it would be private, a decoy only it holds unknown
+    std::vector<char> to_private(nc, 0), to_unknown(nd, 0);
+    out.homolog.assign((nc + nd + 63) / 64, 0);
+    auto hold = [&](std::size_t id) {
+        out.homolog[id >> 6] |= 1ULL << (id & 63);
+        ++out.stats.homolog_kmers;
+    };
+    for (std::size_t i = 0; i < nc; ++i) {
+        if (in_locus[i] == 0 || x.cls[i] == kPrivate) continue;
+        hold(i);
+        if (x.outside[i] == in_locus[i]) { to_private[i] = 1; ++out.stats.relabelled; }
+    }
+    for (std::size_t j = 0; j < nd; ++j) {
+        if (in_decoy[j] == 0) continue;
+        hold(nc + j);
+        if (decoy_counts[j] == in_decoy[j]) { to_unknown[j] = 1; ++out.stats.unlabelled; }
+    }
+    const std::size_t copy_need = static_cast<std::size_t>(std::ceil(kCopyDensity * static_cast<double>(kCopyWindow)));
+    for (std::size_t b = 0; b < blocks.size(); ++b) {
+        BlockLabels& L = labels[b];
+        bool open = false;
+        std::uint64_t first = 0;
+        std::vector<std::uint32_t> like;   // the starts that read as the locus's own sequence
+        for (const Hit& h : hits[b]) {
+            std::uint8_t lab;
+            if (h.id < nc) {
+                lab = to_private[h.id] ? scoring::kLabelP : x.cls[h.id];
+                if (x.cls[h.id] != kRepeat && kmer::is_closed_syncmer(x.codes[h.id], kK, kS)) lab |= kScreenBit;
+            } else {
+                lab = to_unknown[h.id - nc] ? kLabelN : scoring::kLabelD;
+            }
+            const std::uint8_t l = lab & 7;
+            if (l == scoring::kLabelP) L.priv.at.push_back(h.pos);
+            if (lab & kScreenBit) L.screen.at.push_back(h.pos);
+            if (l == scoring::kLabelD && (!open || h.pos >= first + kK)) {
+                L.dsite.at.push_back(h.pos);
+                open = true;
+                first = h.pos;
+            }
+            if (l == scoring::kLabelP || l == scoring::kLabelS) like.push_back(h.pos);
+            L.lab[h.pos] = lab;
+        }
+        std::vector<Hit>().swap(hits[b]);
+        // a stretch as dense in the locus's k-mers as a copy of it is one: its reads are the locus's, not off-target
+        // (windows of kCopyWindow starts, each from one of the locus's k-mers)
+        for (std::size_t i = 0, j = 0; i < like.size(); ++i) {
+            while (j < like.size() && like[j] < like[i] + kCopyWindow) ++j;
+            if (j - i >= copy_need && like[i] + kCopyWindow <= L.lab.size()) L.copy.add(like[i], like[i] + kCopyWindow);
+        }
+        out.stats.copy_bases += L.copy.covered(0, L.lab.size());
+    }
+    std::vector<Extent> extents;
+    for (const OffStretch& s : stretches) extents.push_back({s.end - s.start, s.core_start - s.start, s.core_end - s.start, s.window});
+    const ReadOptions defaults;
+    for (const Class& c : kClasses) {
+        GenomeClassScan cs;
+        Rng rng{0x5EEDULL ^ fnv1a(x.name + c.name + "#" + genome)};
+        const std::vector<Job> jobs = off_jobs(extents, c, rng, 0, 0);
+        const std::uint64_t seed = rng.next();
+        const scoring::Costs costs = scoring::costs_for(c.error);
+        const double clean = std::pow(1.0 - c.error, static_cast<double>(kK));   // a k-mer read without an error
+        std::vector<scoring::Kmer> mate[2];
+        for (std::size_t i = 0; i < jobs.size(); ++i) {
+            const Job& j = jobs[i];
+            const OffStretch& st = stretches[j.src];
+            const BlockLabels& L = labels[st.block];
+            const std::uint64_t at = st.start + j.at;
+            if (L.copy.covered(at, at + j.length) > 0) { ++cs.copies; continue; }
+            ++cs.fragments;
+            // the mates' bases, and their k-mer starts
+            const std::uint64_t r = c.insert ? std::min<std::uint64_t>(c.length, j.length) : j.length;
+            const int mates = c.insert ? 2 : 1;
+            const std::uint64_t from[2] = {at, at + j.length - r};
+            if (r < kK) continue;
+            std::size_t priv = 0, hits = 0;
+            for (int m = 0; m < mates; ++m) {
+                priv += L.priv.count(from[m], from[m] + r - kK + 1);
+                hits += L.screen.count(from[m], from[m] + r - kK + 1);
+            }
+            if (hits == 0) continue;   // not screened: no screen k-mer to read
+            Rng frng{seed ^ (0xD1B54A32D192ED03ULL * (i + 1))};
+            if (priv == 0) {   // it cannot be called: counted when an error-free screen k-mer is likely enough
+                if (frng.unit() >= 1.0 - std::pow(1.0 - clean, static_cast<double>(hits))) continue;
+                ++cs.screened;
+                for (int m = 0; m < mates; ++m) {
+                    const std::uint64_t a = from[m], b = from[m] + r - kK + 1;
+                    cs.kmers += static_cast<double>(b - a - L.none.covered(a, b));
+                    cs.sites_d += static_cast<double>(L.dsite.count(a, b));
+                }
+                continue;
+            }
+            bool screened = false;
+            for (int m = 0; m < mates; ++m) screened = read_labels(blocks[st.block], L, from[m], r, m == 1, c.error, frng, mate[m]) || screened;
+            if (!screened) continue;
+            ++cs.screened;
+            const scoring::Judged jd = scoring::judge_labelled(mate[0], r, mates == 2 ? &mate[1] : nullptr, mates == 2 ? r : 0, c.error,
+                                                               r >= scoring::kLongRead ? defaults.decoy_share_long : defaults.decoy_share,
+                                                               costs.gap_cost, costs.flank_share);
+            cs.with_private += jd.pooled.p > 0;
+            cs.sites_p += jd.pooled.p;
+            cs.sites_d += jd.pooled.d;
+            cs.kmers += jd.pooled.n;
+            if (jd.pooled_ok || jd.mate_ok[0] || jd.mate_ok[1]) cs.judged.push_back(jd);
+        }
+        out.classes.push_back(std::move(cs));
+    }
+    return out;
+}
+
+void calibrate(LocusIndex& x, const Graph& g, const std::vector<OffTarget>& off, const std::vector<GenomeScan>& genomes,
+               const std::vector<std::int32_t>& owner, std::size_t threads) {
     scoring::LocusTable t = scoring::table_of(x);
-    // samples and their haplotypes; the reference path's sample is in the background and is not held out
+    // samples and their haplotypes, numbered by first path; the reference path's sample is in the background and is
+    // not held out
     std::map<std::string, std::vector<std::size_t>> samples;
-    for (std::size_t p = 0; p < g.paths.size(); ++p) samples[sample_of(g.paths[p].name)].push_back(p);
-    samples.erase(sample_of(x.reference_path));
+    std::map<std::string, std::int32_t> sample_id;
+    for (std::size_t p = 0; p < g.paths.size(); ++p) {
+        const std::string s = calibration_sample(g.paths[p].name);
+        samples[s].push_back(p);
+        sample_id.emplace(s, static_cast<std::int32_t>(sample_id.size()));
+    }
+    samples.erase(calibration_sample(x.reference_path));
     std::vector<std::string> names;
     for (const auto& [s, ps] : samples) names.push_back(s);
     std::vector<std::string> held;
     for (std::size_t i = 0; i < std::min(kMaxHeldOut, names.size()); ++i) held.push_back(names[i * names.size() / std::min(kMaxHeldOut, names.size())]);
-    // the sample each k-mer occurs in (-1: several)
+    // the held-out samples' haplotypes
     std::vector<std::string> seqs(g.paths.size());
-    std::vector<std::int32_t> owner(x.codes.size(), -2);
-    std::map<std::string, std::int32_t> sample_id;
-    for (std::size_t p = 0; p < g.paths.size(); ++p) {
-        seqs[p] = spell_path_steps_sequence(g, g.paths[p].steps);
-        const std::int32_t id = sample_id.emplace(sample_of(g.paths[p].name), static_cast<std::int32_t>(sample_id.size())).first->second;
-        kmer::for_each_canonical_kmer(seqs[p].data(), seqs[p].size(), kK, [&](std::uint64_t c, std::size_t, bool) {
-            const std::int64_t i = x.find(c);
-            if (i < 0) return;
-            std::int32_t& w = owner[static_cast<std::size_t>(i)];
-            w = w == -2 || w == id ? id : -1;
-        });
+    std::vector<const std::string*> path_srcs(g.paths.size()), off_srcs;
+    for (std::size_t p = 0; p < g.paths.size(); ++p) path_srcs[p] = &seqs[p];
+    for (const std::string& s : held)
+        for (const std::size_t p : samples[s]) seqs[p] = spell_path_steps_sequence(g, g.paths[p].steps);
+    std::vector<Extent> off_extents;
+    for (const OffTarget& r : off) {
+        off_srcs.push_back(&r.seq);
+        off_extents.push_back({r.seq.size(), r.core_start, r.core_end, r.decoy});
     }
     // labels changed for a while, then put back
     std::vector<std::pair<std::uint8_t*, std::uint8_t>> saved;
@@ -260,7 +514,8 @@ void calibrate(LocusIndex& x, const Graph& g, const std::vector<OffTarget>& off,
     };
 
     x.calibration.clear();
-    for (const Class& c : kClasses) {
+    for (std::size_t ci = 0; ci < std::size(kClasses); ++ci) {
+        const Class& c = kClasses[ci];
         Calibration cal;
         cal.read_class = c.name;
         cal.error_rate = c.error;
@@ -269,7 +524,7 @@ void calibrate(LocusIndex& x, const Graph& g, const std::vector<OffTarget>& off,
         cal.held_out = held.size();
         Rng rng{0x5EEDULL ^ fnv1a(x.name + c.name)};
         Tally tally[3];
-        std::vector<scoring::Judged> locus_j, off_j, genome_j;   // screened fragments
+        std::vector<scoring::Judged> locus_j, off_j;   // screened fragments
         auto keep = [](const std::vector<Result>& res, std::vector<scoring::Judged>& to) {
             for (const Result& r : res) if (r.screened) to.push_back(r.judged);
         };
@@ -286,47 +541,23 @@ void calibrate(LocusIndex& x, const Graph& g, const std::vector<OffTarget>& off,
                 for (std::uint64_t k = 0; k < n; ++k) {
                     std::uint64_t L = c.insert ? static_cast<std::uint64_t>(std::clamp(static_cast<double>(c.insert) + c.insert_sd * rng.normal(), static_cast<double>(c.length), static_cast<double>(span))) : len_one;
                     L = std::min<std::uint64_t>(L, seq.size());
-                    jobs.push_back({&seq, rng.next() % (seq.size() - L + 1), L, 0});
+                    jobs.push_back({p, rng.next() % (seq.size() - L + 1), L, 0});
                 }
             }
             const std::int32_t id = sample_id.at(s);
             for (std::size_t i = 0; i < x.codes.size(); ++i)
                 if (owner[i] == id) relabel(x.codes[i], kLabelN);
-            const auto res = run(jobs, rng.next(), c, t, x.screen, threads);
+            const auto res = run(jobs, path_srcs, rng.next(), c, t, x.screen, threads);
             restore();
             tally_of(jobs, res, tally);
             keep(res, locus_j);
         }
         // off target: the flanks of the coordinate reference and the decoy windows, read as the index labels them
         {
-            const std::vector<Job> jobs = off_jobs(off, c, rng, 1, 2);
-            const auto res = run(jobs, rng.next(), c, t, x.screen, threads);
+            const std::vector<Job> jobs = off_jobs(off_extents, c, rng, 1, 2);
+            const auto res = run(jobs, off_srcs, rng.next(), c, t, x.screen, threads);
             tally_of(jobs, res, tally);
             keep(res, off_j);
-        }
-        // off target from each calibration genome held out of the background: the locus k-mers only it holds outside
-        // the locus read as private, the decoy k-mers only it holds as unknown, as a new sample's paralogs would
-        for (const GenomeOffTarget& go : genomes) {
-            GenomeTally gt;
-            gt.genome = x.calibration_genomes.at(go.genome).genome;
-            Rng grng{0x5EEDULL ^ fnv1a(x.name + c.name + "#" + gt.genome)};
-            const std::vector<Job> jobs = off_jobs(go.off, c, grng, 3, 3);
-            for (const std::uint32_t i : go.relabel)
-                relabel(x.codes[i], static_cast<std::uint8_t>(scoring::kLabelP | (x.mult[i] > 1 ? scoring::kMultiBit : 0) |
-                                                              (x.backbone[i] ? scoring::kBackboneBit : 0)));
-            for (const std::uint64_t d : go.unlabel) relabel(d, kLabelN);
-            const auto res = run(jobs, grng.next(), c, t, x.screen, threads);
-            restore();
-            gt.fragments = jobs.size();
-            for (const Result& r : res) {
-                if (!r.screened) continue;
-                ++gt.screened;
-                gt.with_private += r.judged.pooled.p > 0;
-                genome_j.push_back(r.judged);
-            }
-            cal.genome_fragments += gt.fragments;
-            cal.genome_screened += gt.screened;
-            cal.genomes.push_back(gt);
         }
         cal.locus = tally[0].n;
         cal.flank = tally[1].n;
@@ -337,8 +568,8 @@ void calibrate(LocusIndex& x, const Graph& g, const std::vector<OffTarget>& off,
         cal.flank_certain = tally[1].certain;
         cal.decoy_certain = tally[2].certain;
         // the score: site rates of the pooled stretches, then each fragment's deciding score
-        double sums[2][3] = {};   // locus, off-target: private sites, decoy sites, k-mers
-        for (const auto* v : {&locus_j, &off_j, &genome_j})
+        double sums[2][3] = {};   // locus, simulated off-target: private sites, decoy sites, k-mers
+        for (const auto* v : {&locus_j, &off_j})
             for (const scoring::Judged& j : *v) {
                 if (j.pooled.n == 0) continue;
                 double* to = sums[v == &locus_j ? 0 : 1];
@@ -346,20 +577,43 @@ void calibrate(LocusIndex& x, const Graph& g, const std::vector<OffTarget>& off,
                 to[1] += j.pooled.d;
                 to[2] += j.pooled.n;
             }
-        if (!locus_j.empty() && !(off_j.empty() && genome_j.empty())) {
+        // off target from each calibration genome held out of the background, scanned: its own site rates, to which the
+        // private sites sequencing errors make (the simulated off-target fragments', which hold no other) add
+        const double r_errors = sums[1][2] > 0 ? sums[1][0] / (sums[1][2] / static_cast<double>(kK) + 1.0) : 0.0;
+        std::vector<double> r_outs, q_outs;
+        for (const GenomeScan& gs : genomes) {
+            const GenomeClassScan& cs = gs.classes.at(ci);
+            GenomeTally gt;
+            gt.genome = gs.stats.genome;
+            gt.fragments = cs.fragments;
+            gt.screened = cs.screened;
+            gt.with_private = cs.with_private;
+            gt.copies = cs.copies;
+            if (cs.screened > 0) {
+                gt.r_out = site_rate(cs.sites_p, cs.kmers) + r_errors;
+                gt.q_out = site_rate(cs.sites_d, cs.kmers);
+                r_outs.push_back(gt.r_out);
+                q_outs.push_back(gt.q_out);
+            }
+            cal.genome_fragments += gt.fragments;
+            cal.genome_screened += gt.screened;
+            cal.genomes.push_back(gt);
+        }
+        if (!locus_j.empty() && !(off_j.empty() && r_outs.empty())) {
             cal.r_in = site_rate(sums[0][0], sums[0][2]);
             cal.q_in = site_rate(sums[0][1], sums[0][2]);
-            cal.r_out = site_rate(sums[1][0], sums[1][2]);
-            cal.q_out = site_rate(sums[1][1], sums[1][2]);
+            // the median genome's rates: one genome holding much of the locus elsewhere does not set them
+            cal.r_out = r_outs.empty() ? site_rate(sums[1][0], sums[1][2]) : median(r_outs);
+            cal.q_out = q_outs.empty() ? site_rate(sums[1][1], sums[1][2]) : median(q_outs);
             const scoring::Rates r{cal.r_in, cal.r_out, cal.q_in, cal.q_out};
-            auto ptrs = [](const std::vector<scoring::Judged>& v) {
-                std::vector<const scoring::Judged*> p;
-                for (const auto& j : v) p.push_back(&j);
-                return p;
-            };
-            cal.locus_score = histogram(ptrs(locus_j), r);
-            cal.off_score = histogram(ptrs(off_j), r);
-            cal.genome_score = histogram(ptrs(genome_j), r);
+            std::vector<const scoring::Judged*> lp, op, gp;
+            for (const auto& j : locus_j) lp.push_back(&j);
+            for (const auto& j : off_j) op.push_back(&j);
+            for (const GenomeScan& gs : genomes)
+                for (const auto& j : gs.classes.at(ci).judged) gp.push_back(&j);
+            cal.locus_score = histogram(lp, r);
+            cal.off_score = histogram(op, r);
+            cal.genome_score = histogram(gp, r);
         }
         x.calibration.push_back(cal);
     }
@@ -402,30 +656,82 @@ const Calibration* calibration_for(const std::vector<Calibration>& cs, const std
 
 bool has_score(const Calibration& c) { return c.r_in > 0 && c.r_out > 0 && c.q_in > 0 && c.q_out > 0; }
 
-double Tier::bound() const { return upper_bound(off, off_screened); }
-
 Tier score_tier(const Calibration& c, double rate) {
     Tier t;
     t.rate = rate;
-    t.off_screened = c.flank_screened + c.decoy_screened + c.genome_screened;
+    // the two kinds of off-target fragment, simulated and scanned: each one's share is of its own screened fragments
+    const std::uint64_t screened[2] = {c.flank_screened + c.decoy_screened, c.genome_screened};
+    const double w[2] = {screened[0] ? 1.0 / static_cast<double>(screened[0]) : 0.0, screened[1] ? 1.0 / static_cast<double>(screened[1]) : 0.0};
+    t.off_screened = screened[0] + screened[1];
     t.locus_total = c.locus;
-    std::map<std::int32_t, std::uint64_t> off;   // every off-target fragment that can be called, by score bin
-    for (const ScoreHistogram* h : {&c.off_score, &c.genome_score})
-        for (std::size_t i = 0; i < h->bin.size(); ++i) off[h->bin[i]] += h->count[i];
-    // from the top down, the bins whose off-target fragments stay within the rate
-    const double allowed = rate * static_cast<double>(t.off_screened);
-    std::uint64_t reached = 0;
-    t.bin = kEveryBin;
-    for (auto it = off.rbegin(); it != off.rend(); ++it) {
-        if (static_cast<double>(reached + it->second) > allowed) {
-            t.bin = it->first + 1;
-            break;
+    std::map<std::int32_t, std::array<std::uint64_t, 2>> off;   // every off-target fragment that can be called, by score bin
+    std::uint64_t callable = 0;
+    for (int k = 0; k < 2; ++k) {
+        const ScoreHistogram& h = k == 0 ? c.off_score : c.genome_score;
+        for (std::size_t i = 0; i < h.bin.size(); ++i) {
+            off[h.bin[i]][k] += h.count[i];
+            callable += h.count[i];
         }
-        reached += it->second;
     }
-    t.off = reached;
+    auto share_of = [&](const std::array<std::uint64_t, 2>& n) { return static_cast<double>(n[0]) * w[0] + static_cast<double>(n[1]) * w[1]; };
+    // observed: from the top down, the bins whose off-target fragments stay within the rate
+    t.bin = kEveryBin;
+    {
+        double share = 0;
+        for (auto it = off.rbegin(); it != off.rend(); ++it) {
+            share += share_of(it->second);
+            if (share > rate * (1.0 + 1e-9)) {
+                t.bin = it->first + 1;
+                break;
+            }
+        }
+    }
+    // Too few fragments to show the rate (none beyond a threshold would still leave the bound above it): the scores
+    // are taken to go on beyond those seen as an exponential tail. Its scale is fitted from what makes a higher
+    // score: one more private site adds ln(r_in / r_out) and is as rare as a private site is among the off-target
+    // fragments (the share that can be called, at its 95% bound). The threshold is the lowest at which a tail of
+    // that scale lies above every score seen.
+    t.observed_bin = t.bin;
+    double least = 0, site_share = 0;
+    std::array<std::uint64_t, 2> all{};
+    for (const auto& [bin, n] : off)
+        for (int k = 0; k < 2; ++k) all[k] += n[k];
+    for (int k = 0; k < 2; ++k)
+        if (screened[k]) {
+            least += upper_bound(0, screened[k]);
+            site_share += upper_bound(all[k], screened[k]);
+        }
+    if (rate > 0 && rate < least && callable > 0 && c.r_in > c.r_out && site_share < 1.0) {
+        t.tail_scale = std::log(c.r_in / c.r_out) / std::log(1.0 / site_share);
+        t.tail_site_share = site_share;
+        double share = 0, s = 0;
+        bool any = false;
+        for (auto it = off.rbegin(); it != off.rend(); ++it) {
+            share += share_of(it->second);
+            const double at = static_cast<double>(it->first + 1) * kScoreBin + t.tail_scale * std::log(share / rate);
+            if (!any || at > s) {
+                s = at;
+                t.tail_from = it->first;
+                any = true;
+            }
+        }
+        const std::int32_t bin = scoring::score_bin(s) + 1;
+        if (t.bin == kEveryBin || bin > t.bin) {
+            t.bin = bin;
+            t.extrapolated = true;
+        }
+    }
+    std::array<std::uint64_t, 2> reached{};
+    for (auto it = off.lower_bound(t.bin); it != off.end(); ++it)
+        for (int k = 0; k < 2; ++k) reached[k] += it->second[k];
+    t.off = reached[0] + reached[1];
+    t.share = share_of(reached);
+    t.share_bound = t.off_screened == 0 ? 1.0 : 0.0;
+    for (int k = 0; k < 2; ++k)
+        if (screened[k]) t.share_bound += upper_bound(reached[k], screened[k]);
+    t.share_bound = std::min(1.0, t.share_bound);
     t.locus = c.locus_score.at_least(t.bin);
-    t.shown = t.bound() <= rate;
+    t.shown = t.share_bound <= rate;
     return t;
 }
 

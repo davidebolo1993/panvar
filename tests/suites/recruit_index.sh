@@ -363,14 +363,24 @@ LG=("$BIN" recruit -q --background s_logo -r ref --index-only --locus data/logo/
 "$BIN" recruit --dump-index idx_logo/locus.plx=dump_logo.tsv
 cg() { awk -F'\t' -v g="$2" -v c="$3" '$1=="calibration_genome" && $2==g {print $c}' "$1"; }
 shared_logo=$(awk -F'\t' 'NR > 1 && $2 == "S"' dump_logo.tsv | wc -l | tr -d ' ')
-check "the decoy genomes other than the reference are held out in calibration ($(field idx_logo/locus.index.tsv calibration_genomes))" '[[ $rc -eq 0 && "$(field idx_logo/locus.index.tsv calibration_genomes)" == "gd,gu (chosen by the homolog k-mers each adds)" ]]'
+check "the decoy genomes other than the reference are held out in calibration, the one holding the most homolog k-mers first ($(field idx_logo/locus.index.tsv calibration_genomes))" '[[ $rc -eq 0 && "$(field idx_logo/locus.index.tsv calibration_genomes)" == "gu,gd (up to 8 of the decoy genomes, by the homolog k-mers each adds)" ]]'
 check "each relabels as private the locus k-mers only it shares (gu $(cg idx_logo/locus.index.tsv gu 6) + gd $(cg idx_logo/locus.index.tsv gd 6) of $shared_logo shared)" '[[ $(( $(cg idx_logo/locus.index.tsv gu 6) + $(cg idx_logo/locus.index.tsv gd 6) )) == $shared_logo && $(cg idx_logo/locus.index.tsv gu 6) -gt 1000 && $(cg idx_logo/locus.index.tsv gd 6) -gt 1000 ]]'
 genome_private() { awk -F'\t' -v g="$2" '$1=="score_genome" && $2=="short" && $3==g {print $6 " of " $5}' "$1"; }
 check "its homolog's reads are scored with chance private sites (gu: $(genome_private idx_logo/locus.index.tsv gu) screened)" 'awk -F"\t" '"'"'$1=="score_genome" && $2=="short" && $3=="gu" && $6 > 0 && $5 >= $6 {ok = 1} END {exit !ok}'"'"' idx_logo/locus.index.tsv'
-PANVAR_TEST_CALIBRATION_GENOMES_MAX=1 "${LG[@]}" -t 2 --save-index idx_logo1 --decoy-genomes ref,gd,gu
-check "with room for one, the genome adding the most homolog k-mers is taken, not the first listed ($(field idx_logo1/locus.index.tsv calibration_genomes))" '[[ "$(field idx_logo1/locus.index.tsv calibration_genomes)" == gu\ * ]]'
-"${LG[@]}" -t 2 --save-index idx_logo_r --calibration-genomes gd
-check "calibration genomes given that are not decoy genomes: scanned for windows, no decoys from them" '[[ "$(field idx_logo_r/locus.index.tsv calibration_genomes)" == "gd (given)" && $(field idx_logo_r/locus.index.tsv decoys) == 0 ]] && grep -q "^calibration_window.gd.d" idx_logo_r/locus.index.tsv'
+"${LG[@]}" -t 2 --save-index idx_logo1 --decoy-genomes ref,gd,gu --calibration-max 1
+check "--calibration-max 1: the genome adding the most homolog k-mers is taken, not the first listed ($(field idx_logo1/locus.index.tsv calibration_genomes))" '[[ "$(field idx_logo1/locus.index.tsv calibration_genomes)" == "gu (up to 1 of the decoy genomes, by the homolog k-mers each adds)" ]]'
+"${LG[@]}" -t 2 --save-index idx_logo_c --decoy-genomes ref,gd,gu --calibration-genomes gd,gu --calibration-max 1
+check "--calibration-genomes names the candidates: of them the locus takes the one adding the most ($(field idx_logo_c/locus.index.tsv calibration_genomes))" '[[ "$(field idx_logo_c/locus.index.tsv calibration_genomes)" == "gu (up to 1 of the 2 given, by the homolog k-mers each adds)" ]]'
+"${LG[@]}" -t 2 --save-index idx_logo_m --decoy-genomes ref,gd,gu --calibration-max 0 2> max0.txt; rc=$?
+check "--calibration-max 0 is refused" '[[ $rc -ne 0 ]] && grep -q "at least 1" max0.txt'
+# candidates that are not decoy genomes are not scanned whole: their windows are where the anchors place the
+# coordinate reference's (the paralog of the first fixture, which ga and gb hold too)
+"$BIN" recruit -t 2 --background s -r ref --index-only --save-index idx_cand --locus data/locus.gfa --calibration-genomes ga,gb 2> cand.txt; rc=$?
+cwin=$(awk -F'\t' '$1=="calibration_window" && $2=="ga" {print $3 ":" $4 "-" $5}' idx_cand/locus.index.tsv | head -1)
+check "candidates that are not decoy genomes: their windows placed by the anchors, the genomes not scanned whole (ga: $cwin)" '[[ $rc -eq 0 ]] && awk -F"\t" '"'"'$1=="calibration_window" && $2=="ga" && $3=="chr1" && $4 > 225000 && $4 < 235000 && $5 > 255000 && $5 < 265000 {ok = 1} END {exit !ok}'"'"' idx_cand/locus.index.tsv && ! grep -q "genome scanned: ga" cand.txt && grep -q "calibration genomes: scanned: ga" cand.txt && [[ $(field idx_cand/locus.index.tsv decoy_windows | cut -d" " -f1) == $(field idx/locus.index.tsv decoy_windows | cut -d" " -f1) ]]'
+check "a candidate adding no homolog k-mer to those taken is not held out ($(field idx_cand/locus.index.tsv calibration_genomes))" '[[ "$(field idx_cand/locus.index.tsv calibration_genomes)" == "ga (up to 8 of the 2 given, by the homolog k-mers each adds)" ]]'
+"$BIN" recruit -t 2 -q --background s -r ref --index-only --save-index idx_cand_ref --locus data/locus.gfa --calibration-genomes ref,ga 2> candref.txt; rc=$?
+check "the coordinate reference as a calibration genome is refused" '[[ $rc -ne 0 ]] && grep -q "coordinate reference" candref.txt'
 "${LG[@]}" -t 2 --save-index idx_logo_n
 check "no genome to hold out besides the reference: said so" '[[ "$(field idx_logo_n/locus.index.tsv calibration_genomes)" == none\ \(* ]]'
 "${LG[@]}" -t 1 --save-index idx_logo_t1 --decoy-genomes ref,gd,gu
@@ -424,6 +434,28 @@ nlikely=$(awk -F'\t' 'NR > 1 && $3=="likely"' t2.tsv | wc -l | tr -d ' ')
 check "likely fragments go to their own files ($nlikely)" '[[ $nlikely -gt 0 && $(gzip -dc t2_reads/locus.likely_1.fq.gz | awk "END {print NR / 4}") == $nlikely ]]'
 "$BIN" recruit --locus idx_logo/locus.plx -1 reads_lg_1.fq -2 reads_lg_2.fq -o bad.tsv --certain-rate 0.01 --likely-rate 0.001 -q 2> bad.txt; rc=$?
 check "--likely-rate below --certain-rate is refused" '[[ $rc -ne 0 ]] && grep -q "likely-rate must be at least" bad.txt'
+# a genome holding a copy of part of the locus that no anchors place (its pieces in reverse order): held out, its
+# reads there are the locus's, not off-target, and certain reads stay certain
+"$BIN" background -t 2 --partitions 64 --memory 64M -q --tmp-dir "$OUT/tmp" -o s_copy --genome ref=data/logo/ref.fa --genome gc=data/logo/gc.fa --coordinate-reference ref
+"$BIN" recruit -q -t 2 --background s_copy -r ref --index-only --locus data/logo/locus.gfa --save-index idx_copy --decoy-genomes ref,gc
+copy_bases=$(cg idx_copy/locus.index.tsv gc 8); copy_frag=$(awk -F'\t' '$1=="score_genome" && $2=="short" && $3=="gc" {print $7}' idx_copy/locus.index.tsv)
+copy_recall=$(awk -F'\t' '$1=="score_tier" && $2=="short" && $3=="0.0001" {print $6}' idx_copy/locus.index.tsv)
+check "a held-out genome's stretch that reads as a copy of the locus is not off-target (gc: ${copy_bases:-none} bases, ${copy_frag:-no} fragments left out; certain recall ${copy_recall:-none})" '[[ ${copy_bases:-0} -ge 5000 && ${copy_frag:-0} -gt 0 ]] && awk -v r="${copy_recall:-0}" '"'"'BEGIN {exit !(r >= 0.8)}'"'"' && [[ $(awk -F"\t" '"'"'$1=="span" && $2=="gc"'"'"' idx_copy/locus.index.tsv | wc -l | tr -d " ") == 1 ]]'
+# the off-target rates are the median genome's: gd, which holds much of the locus in pieces, does not set them
+"$BIN" background -t 2 --partitions 64 --memory 64M -q --tmp-dir "$OUT/tmp" -o s_logo3 --genome ref=data/logo/ref.fa --genome gu=data/logo/gu.fa --genome gd=data/logo/gd.fa --genome ge=data/logo/ge.fa --coordinate-reference ref
+"$BIN" recruit -q -t 2 --background s_logo3 -r ref --index-only --locus data/logo/locus.gfa --save-index idx_logo3 --decoy-genomes ref,gu,gd,ge
+median_ok() {   # the short class's r_out is the middle one of its three genomes' own
+  awk -F'\t' '$1=="score_rates" && $2=="short" {r = $4} $1=="score_genome" && $2=="short" {v[++n] = $8} END {
+    if (n != 3) exit 1
+    for (i = 1; i <= 3; i++) for (j = i + 1; j <= 3; j++) if (v[j] + 0 < v[i] + 0) {t = v[i]; v[i] = v[j]; v[j] = t}
+    exit !(v[2] == r && v[3] > v[2] && v[2] > v[1]) }' "$1"
+}
+rates=$(awk -F'\t' '$1=="score_genome" && $2=="short" {print $3 " " $8}' idx_logo3/locus.index.tsv | tr '\n' ',')
+check "the off-target site rate is the median of the held-out genomes' own (r_out $(awk -F'\t' '$1=="score_rates" && $2=="short" {print $4}' idx_logo3/locus.index.tsv); $rates)" 'median_ok idx_logo3/locus.index.tsv'
+# a rate the off-target fragments are too few to show: the threshold is read off their fitted tail, never below the
+# one they give, and the run says so; a rate they can show is the one observed
+tier() { awk -F'\t' -v r="$2" -v c="$3" '$1=="score_tier" && $2=="short" && $3==r {print $c}' "$1"; }
+check "a rate too low to show: the threshold extrapolated from the off-target tail ($(tier idx/locus.index.tsv 0.0001 4), $(tier idx/locus.index.tsv 0.0001 12)), said in the summary; a rate shown: observed ($(tier idx/locus.index.tsv 0.01 4))" '[[ "$(tier idx/locus.index.tsv 0.0001 11)" == extrapolated && "$(tier idx/locus.index.tsv 0.01 11)" == observed && "$(tier idx/locus.index.tsv 0.01 12)" == "." ]] && grep -q "^locus.locus.certain_threshold.*too few to show the rate: the threshold is extrapolated from the tail of the off-target scores (scale .*; the fragments seen give" recruited.summary.tsv && ! grep -q "^locus.locus.likely_threshold.*extrapolated" recruited.summary.tsv'
 # an index of an earlier format is refused, saying so
 cp idx_logo/locus.plx old.plx
 python3 - old.plx <<'PY'
@@ -431,7 +463,7 @@ import struct, sys
 p = sys.argv[1]; b = bytearray(open(p, "rb").read()); b[8:16] = struct.pack("<Q", 15); open(p, "wb").write(bytes(b))
 PY
 "$BIN" recruit --locus old.plx -1 reads_1.fq -2 reads_2.fq -o old.tsv -q 2> old.txt; rc=$?
-check "an index of format 15 is refused: rebuild it" '[[ $rc -ne 0 ]] && grep -q "of format 15; this panvar reads format 16" old.txt && grep -q "rebuild" old.txt'
+check "an index of format 15 is refused: rebuild it" '[[ $rc -ne 0 ]] && grep -q "of format 15; this panvar reads format 17" old.txt && grep -q "rebuild" old.txt'
 # the first rules reproduce a reference build's tables (RECRUIT_V1_BIN: a panvar of the first rules)
 if [[ -n "${RECRUIT_V1_BIN:-}" ]]; then
   same=0; cases=0
