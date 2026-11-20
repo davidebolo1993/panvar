@@ -4,10 +4,11 @@ CLI: `panvar recruit`
 
 ## What it does
 
-Sorts a sample's reads to locus graphs without aligning them. Each locus graph is indexed once against a [background](background.md): every k-mer of its haplotypes is labelled by how often the rest of the genome holds it. Each read, or pair, that touches a locus is then called for that locus:
+Sorts a sample's reads to locus graphs without aligning them. Each locus graph is indexed once against a [background](background.md): every k-mer of its haplotypes is labelled by how often the rest of the genome holds it. Each read, or pair, that touches a locus gets one score for that locus, from the sequence it carries that is found nowhere else in the background (private k-mers) against the sequence that points to a homologous copy elsewhere (decoy k-mers), and is called:
 
-- `certain`: it carries enough sequence found nowhere else in the background (private k-mers) to belong to the locus, and nothing that points to a homologous copy elsewhere;
-- `ambiguous`: it has locus evidence but not enough, or conflicting, with the reason;
+- `certain`: its score reaches the locus's certain threshold, the lowest at which simulated off-target reads are certain at most at `--certain-rate`;
+- `likely`: its score reaches the likely threshold, set the same way for `--likely-rate`;
+- `ambiguous`: it has locus evidence but too little, or conflicting, with the reason;
 - `unrecruited`: it touched the locus's screen but reads as a homolog, or carries no locus evidence.
 
 The output is a table with one row per fragment and locus, the recruited reads as FASTQ if asked, and a summary. Short reads (pairs or single), HiFi and ONT reads are handled alike, from FASTQ, SAM, BAM or CRAM in any sort order.
@@ -23,7 +24,12 @@ The index, built once per locus graph and kept beside it (`<locus>.plx`, with a 
 3. Each k-mer is labelled by what is left (its count outside the locus): private (none), shared (up to `--informative-max` per background haplotype, on average) or repeat (more). Private k-mers of low complexity, or that become shared when the located copies are cut at their walked-out ends (unless the rest lies in such a stretch), are labelled shared.
 4. Decoys: in the decoy genomes (`--decoy-genomes`), clusters of shared k-mer hits outside the locus's own copy (20 hits, each within 1,500 bp of the next) are homologous windows; their k-mers that are not in the locus and are shared in the background become decoy k-mers, the alleles of the homologs.
 5. The screen is the closed syncmers ([Edgar 2021](https://doi.org/10.7717/peerj.10805); 11-mer minimum at either end) among the private and shared k-mers, about one in ten.
-6. Calibration: reads are simulated for three classes (2×150 pairs at 0.2% error, HiFi-like reads at 0.1%, ONT-like reads at 3%) from the haplotypes of up to eight samples held out one at a time (the k-mers only that sample carries read as new while its reads are scored), from the decoy windows, and from 5 Mb of the coordinate reference on each side of the locus. They are screened and scored as below, and the index keeps, per class, how many are certain at each cut from one to eight private sites.
+6. Calibration: reads are simulated for three classes (2×150 pairs at 0.2% error, HiFi-like reads at 0.1%, ONT-like reads at 3%), screened and scored as below:
+   - locus reads, from the haplotypes of up to eight samples held out one at a time (the k-mers only that sample carries read as new while its reads are scored);
+   - off-target reads, from the decoy windows and from 5 Mb of the coordinate reference on each side of the locus, read as the index labels them: they gain private sites only by sequencing errors;
+   - off-target reads from the calibration genomes, each held out of the background in turn: its homologous windows (found as the decoy windows are, with 15 kb of context) and 1 Mb on each side of its copies of the locus, read with every locus k-mer that only this genome holds outside the locus labelled private, and every decoy k-mer that only it holds labelled unknown. That is what a new sample's paralog looks like: alleles the locus shares with no genome of the background. By default each locus takes up to eight of the decoy genomes other than the coordinate reference: first the one whose windows and flanks hold the most distinct homolog k-mers (locus k-mers that are not private, and decoy k-mers), then each time the one adding the most k-mers the chosen ones lack, while one adds any (ties: the earlier listed). With no decoy genome besides the coordinate reference there is none, and the index report says so. `--calibration-genomes` gives the list instead; a genome in it that is not a decoy genome is scanned for homologous windows too, which give no decoys.
+
+   From these the index keeps, per class, the site rates of the score (step 11): private and decoy sites per 31 k-mers of judged sequence in the locus reads (`r_in`, `q_in`) and in the off-target reads (`r_out`, `q_out`, both off-target sets), each with half a site and one 31-k-mer stretch added so that no rate is 0; and histograms of the deciding scores, in bins of 1/16, of the locus reads, the off-target reads and the calibration genomes' reads. The thresholds are chosen from them when reads are scored, so the rates are a run's choice. It keeps too, for `--rules v1`, how many reads are certain at each private-site cut from one to eight.
 
 Reads, per sample:
 
@@ -31,9 +37,15 @@ Reads, per sample:
 8. Each k-mer of a read is labelled private, shared, repeat, decoy, or neither (a sequencing error or a new allele).
 9. The read's locus segment is its highest-scoring stretch: locus k-mers count +1, decoy k-mers −2, and a k-mer in neither table is free within 31 k-mers of a locus or decoy k-mer its run touches, on either side (one differing base makes that many), and costs beyond that; free k-mers at either end of the stretch are kept, so a read and its reverse complement get the same segment. When the read leaves the locus at its ends (beyond the segment, few locus k-mers, and a homologous flank on one side at most), the segment alone is judged; otherwise the whole read is. A side is a homologous flank when its decoy sites would count against the segment, two or more and at least the decoy share of the segment's private sites, so a stray decoy k-mer far along a long read does not make the whole read judged.
 10. Evidence is counted in independent sites: a private (or decoy) k-mer counts only when it starts 31 or more bases after the last one counted, so all k-mers one differing base touches count once. A pair's mates are pooled without counting a site twice.
-11. A fragment is certain with at least the cut's private sites (the calibrated cut, below), decoy sites at most 5% of them (25% in reads of 1 kb or more, `--decoy-share-long`: a long read in a locus crosses stretches shared with homologs and picks up a few decoy sites among hundreds of private ones), and no more runs of unknown k-mers than sequencing errors and about one new allele per kilobase explain (not `divergent`). The errors expected are the read's own, from its base qualities, where they exceed the run's rate: HiFi reads range from 99% to 99.99% accurate, and the least accurate are not judged by the average. A pair is judged on its pooled evidence when a mate lies wholly in the locus; failing that, one mate certain on its own makes the pair certain (`rescued`), unless the other mate leans to a homolog away from a locus edge. A fragment that runs out of the locus is `partial`.
-12. A fragment with no private site and two or more decoy sites is unrecruited as `homolog`. Otherwise a fragment with locus evidence is ambiguous, with the first reason that holds: `conflict` (private and decoy sites), `uncallable` (mostly unreadable k-mers), `divergent`, `mates_out` (enough sites together, but both mates leave the locus, so they are not pooled), `single_site`, `shared_only`; one with nothing as `no_evidence`.
-13. The cut: the run's read class (`--preset`, or from the first reads: short below 1 kb mean length; long reads HiFi at an error rate up to 1%, else ONT) picks a calibration, and each locus takes the lowest cut of at least two private sites (three for ONT) whose simulated off-target reads were certain at most at `--false-certain-rate`. ONT starts at three because ultra-long noisy reads cross enough sequence to pick up two chance private sites far more often than the simulated reads show. `--min-sites` sets one cut for every locus instead.
+11. The score of a judged stretch with n callable k-mers, p private sites and d decoy sites is
+
+    S = p · ln(r_in / r_out) − (n / 31) · (r_in − r_out) + d · ln(q_in / q_out) − (n / 31) · (q_in − q_out)
+
+    the log-likelihood ratio of the counts seen, for a locus read against an off-target one, each a Poisson process of sites along the stretch. It holds length, density and decoys in one number: a long stretch from the locus is expected to carry many private sites, so a few on a long stretch score low; decoy sites weigh against private ones. Sites cluster on paralog variants, so S ranks fragments rather than giving a probability: the thresholds come from calibration, which absorbs that. A read without a segment is judged whole, its decoy sites counted, so its k-mers count in n.
+12. A stretch may call a fragment when it has a private site, is callable (not mostly unreadable k-mers) and not `divergent`: no more runs of unknown k-mers than sequencing errors and about one new allele per kilobase explain. The errors expected are the read's own, from its base qualities, where they exceed the run's rate: HiFi reads range from 99% to 99.99% accurate, and the least accurate are not judged by the average. A pair's stretches are the pooled one (both mates' segments, a site the mates share counted once, n the sum of both) and each mate alone. The pooled stretch may call the pair when a mate lies wholly in the locus: two mates that both leave it would pool islands. A mate alone may call it unless the other mate leans to a homolog (more decoy sites than private ones) away from a locus edge; the mates lie an insert apart, so the other one is in the locus or its flank. The fragment's deciding score is the best of the stretches that may call it.
+13. A fragment is certain when the pooled stretch, or one mate alone (`rescued`), reaches the certain threshold; likely when one reaches the likely threshold. A certain fragment that runs out of the locus is `partial`. A fragment with no private site and two or more decoy sites is unrecruited as `homolog`. Any other fragment that is not certain keeps the first reason that holds: `conflict` (private and decoy sites), `uncallable`, `divergent`, `mates_out` (the pooled stretch reaches the certain threshold, but both mates leave the locus), `single_site`, `low_score` (two or more private sites, below the threshold), `shared_only`; a likely fragment has one, an ambiguous one too, and one with nothing is unrecruited as `no_evidence`.
+14. The thresholds: the run's read class (`--preset`, or from the first reads: short below 1 kb mean length; long reads HiFi at an error rate up to 1%, else ONT) picks a calibration, and each locus takes, per tier, the lowest score bin whose simulated off-target fragments (both sets) reach it at most at the tier's rate of those screened. With fewer screened off-target fragments than 1 / rate, that is just above the highest off-target score seen. The summary gives the thresholds, the off-target fragments reaching them, the 95% bound on that share, and the held-out recall at each.
+15. The first rules stay for comparison (`--rules v1`), and decide an index without calibration or a run with `--min-sites`: a fragment is certain with at least the cut's private sites, decoy sites at most 5% of them (25% in reads of 1 kb or more), callable and not divergent, pooled and rescued as above. The cut is calibrated per locus, the lowest of at least two private sites (three for ONT) whose simulated off-target reads were certain at most at `--certain-rate`; without calibration it is 2 (3 for ONT); `--min-sites` sets it for every locus.
 
 ## Required inputs
 
@@ -51,16 +63,18 @@ Reads, per sample:
 | `--coordinate-reference <name>` | the background's coordinate reference the graph's coordinates refer to | its only one |
 | `--informative-max <N>` | copies per background haplotype outside the locus up to which a k-mer is shared, not repeat | `8` |
 | `--decoy-genomes <A,B>` | genomes whose homologous windows give decoys | the coordinate reference |
-| `--no-calibration` | build indexes without calibration (the cut is then `--min-sites`, 2; 3 for ONT reads) | off |
+| `--calibration-genomes <A,B>` | genomes held out one at a time in calibration (FASTA) | per locus, up to 8 decoy genomes other than the coordinate reference, by the homolog k-mers each adds |
+| `--no-calibration` | build indexes without calibration (fragments are then decided by the private-site cut, `--min-sites`, 2; 3 for ONT reads) | off |
 | `--interleaved` | `-i` FASTQ files hold mates as consecutive records | off |
 | `--cram-reference <fa>` | the FASTA (with `.fai`) a CRAM was compressed against | the one its header names |
 | `--dry-run` | count each input's records by kind and the time to read them | off |
-| `--false-certain-rate <r>` | the off-target certain rate each locus's cut is chosen for | `1e-4` |
-| `--min-sites <N>` | one private-site cut for every locus | calibrated |
+| `--certain-rate <r>` | the off-target rate each locus's certain threshold is chosen for | `1e-4` |
+| `--likely-rate <r>` | the same for likely; at least `--certain-rate` | `1e-2` |
+| `--min-sites <N>` | decide by one private-site cut for every locus instead of the score | |
 | `--error-rate <e>` | the reads' error rate per base, in [0, 0.5); a read whose qualities say more is held to its own | from base qualities |
-| `--decoy-share-long <r>` | decoy sites tolerated per private site in reads of 1 kb or more, in [0, 1] | 0.25 |
+| `--decoy-share-long <r>` | decoy sites per private site beyond a segment that make a side a homologous flank in reads of 1 kb or more (0.05 in shorter ones), in [0, 1] | 0.25 |
 | `--preset <p>` | the read type, `illumina`, `hifi` or `ont`: its calibration class and error rate (0.002, 0.001, 0.03); `--error-rate` overrides the rate. Corrected long reads (HiFi, error-corrected ONT) are `hifi`, any other long reads `ont` | from the reads |
-| `--reads-out <dir>` | the recruited reads as gzip FASTQ, per locus and fate | off |
+| `--reads-out <dir>` | the recruited reads as gzip FASTQ, per locus and fate (certain, likely, ambiguous) | off |
 | `--certain-only` | with `--reads-out`, certain reads only | off |
 | `--summary <path>` | the run's summary | beside the table |
 | `--dump-index <plx>=<tsv>` | write every k-mer of an index as text (columns below), and stop | |
@@ -74,10 +88,10 @@ A sample sheet holds tab-separated lines of sample, file and optionally a mate f
 | file | contents |
 |------|----------|
 | `<out>` | one row per screened fragment and locus (columns below) |
-| `<out stem>.summary.tsv` | the run: error rate and its source, fragments, screened, mean read length; each input's records by kind; per locus, fragments by fate and reason, the backbone depth, the fragments certain for another locus too, and the private-site cut with the calibration behind it |
+| `<out stem>.summary.tsv` | the run: error rate and its source, fragments, screened, mean read length; each input's records by kind; per locus, fragments by fate and reason, the backbone depth, the fragments certain for another locus too, the score's rates, and per tier the threshold, the held-out recall, the off-target fragments reaching it of those screened and the 95% bound (or, decided by the first rules, the private-site cut with the calibration behind it) |
 | `<locus>.plx` | the index |
-| `<locus>.index.tsv` | the index's report: the locus (k-mers by label, backbone, pieces, decoys, screen), each copy found per genome with the k-mers subtracted, the pieces found off them, the decoy windows, ceilings (the share of read-length windows of each haplotype with 2 private sites, counted as the scorer counts them: k bases apart) and the calibration (per read class and cut: held-out fragments certain, off-target certain of those screened, and the 95% bound) |
-| `<reads-out>/<locus>.<fate>_1.fq.gz`, `_2.fq.gz` | with `--reads-out`: recruited pairs, as sequenced, with qualities (`<locus>.<fate>.fq.gz` for single reads); with `--samples`, in `<reads-out>/<sample>/`. An earlier run's files for the same loci are removed first. Each file is a chain of gzip members, compressed by all threads (any gzip reader reads it as one) |
+| `<locus>.index.tsv` | the index's report: the locus (k-mers by label, backbone, pieces, decoys, screen, calibration genomes), each copy found per genome with the k-mers subtracted, the pieces found off them, the decoy windows, ceilings (the share of read-length windows of each haplotype with 2 private sites, counted as the scorer counts them: k bases apart), the first rules' calibration (per read class and cut: held-out fragments certain, off-target certain of those screened, and the 95% bound), each calibration genome (windows, bases read, homolog k-mers, k-mers relabelled private, decoys unlabelled) and the windows read from those that are not decoy genomes, the score's rates per read class, each calibration genome's off-target fragments (screened, with a private site), and the thresholds and recall at rates from 1e-1 to 1e-5 |
+| `<reads-out>/<locus>.<fate>_1.fq.gz`, `_2.fq.gz` | with `--reads-out`: recruited pairs (certain, likely, ambiguous), as sequenced, with qualities (`<locus>.<fate>.fq.gz` for single reads); with `--samples`, in `<reads-out>/<sample>/`. An earlier run's files for the same loci are removed first. Each file is a chain of gzip members, compressed by all threads (any gzip reader reads it as one) |
 
 An index dumped with `--dump-index` has one row per k-mer of the locus: `kmer` (its canonical sequence), `class` (`P`, `S` or `R`), `outside` (its background count outside the locus), `multiplicity` (its largest copy number within one haplotype), `backbone` (1 if once in every haplotype), `screen` (1 if a screen syncmer) and `nodes` (the graph nodes it starts on). Decoy k-mers follow as class `D`, with `.` in the fields only locus k-mers have.
 
@@ -87,8 +101,8 @@ Table columns:
 |--------|---------|
 | `fragment` | the read or pair name |
 | `locus` | the locus |
-| `fate` | `certain`, `ambiguous` or `unrecruited` |
-| `reason` | `.`, or why: `partial`, `rescued` for certain; the ambiguous and unrecruited reasons above |
+| `fate` | `certain`, `likely`, `ambiguous` or `unrecruited` |
+| `reason` | `.`, or why: `partial`, `rescued` for certain; why not certain for the others (above) |
 | `mates` | each mate's place: `in` (wholly in the locus), `part` (a segment covering part of it), `out` |
 | `seg1`, `seg2` | each mate's locus segment in read bases (`start-end`), `.` when it has none |
 | `sites_p`, `sites_d` | independent private and decoy sites in the segments |
@@ -101,11 +115,14 @@ Table columns:
 | `nodes` | the graph nodes of the private k-mers in the segments, `.` if none |
 | `other_loci` | the other loci the fragment was scored for |
 | `certain_loci` | how many loci it is certain for |
+| `score` | the deciding score (the pooled one when no stretch may call the fragment), `.` when the index has no score calibration for the run's reads |
+| `tier` | the tier the deciding score reaches, `certain`, `likely` or `.`; with `--rules v1` or `--min-sites`, where the score would put the fragment |
 
 ## Limitations
 
 - k is 31, as in the background.
-- The calibration simulates off-target fragments from each source (the flanks, the decoy windows): about 100,000 short pairs, and up to 4,000 long reads, fewer when the source is short (two 5 Mb flanks give about 1,300 HiFi or 2,000 ONT reads); fewer still hit the screen. No false certain fragment among them bounds the rate at 3 over the number screened (a 95% bound): showing 1e-4 takes 30,000 screened, one per million three million; overlapping fragments share sites. The summary says whether the rate was shown or only none beyond it seen. Rates per million come from whole-genome negatives (see the dev scripts).
+- The calibration simulates off-target fragments from each source (the flanks, the decoy windows, and each calibration genome's windows and flanks): about 100,000 short pairs, and up to 4,000 long reads, fewer when the source is short (two 5 Mb flanks give about 1,300 HiFi or 2,000 ONT reads); fewer still hit the screen. No off-target fragment above a threshold bounds the rate at 3 over the number screened (a 95% bound): showing 1e-4 takes 30,000 screened, one per million three million; overlapping fragments share sites. With fewer, a threshold sits just above the highest off-target score seen, and a fragment scoring a little higher, such as one private site on a short segment of a long noisy read, is certain. The summary says whether the rate was shown or only none beyond it seen. Rates per million come from whole-genome negatives (see the dev scripts).
+- The score's rates are per locus and read class. A calibration genome holding a copy of part of the locus that no other genome holds (an identical or near-identical duplicate) gives off-target reads that read as the locus, which raises `r_out` towards `r_in` and the thresholds for the whole locus: certain recall falls everywhere in it, not only in the duplicated part.
 - A homologous copy carrying the locus's alleles at two distinguishing bases within one read (gene conversion, a paralogous variant at both) reads as certain; a larger background, where more of those alleles are shared, reduces it.
 - Short pairs across a locus edge are less often certain than inside it: the located copies' ends are uncertain, so the k-mers near them are labelled shared.
 - Long spliced transcripts cross many junctions and read as divergent.

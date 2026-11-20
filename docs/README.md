@@ -21,7 +21,7 @@ Documentation for the `panvar` CLI.
 `background → recruit`: count the genome once, then sort each sample's reads to the locus graphs without aligning.
 
 1. [background.md](background.md) — every k-mer of a set of genomes counted once, with anchors on a reference
-2. [recruit.md](recruit.md) — locus indexes against the background, and each read called certain, ambiguous or unrecruited per locus
+2. [recruit.md](recruit.md) — locus indexes against the background, and each read scored and called certain, likely, ambiguous or unrecruited per locus
 
 ### Utilities
 
