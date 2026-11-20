@@ -2436,6 +2436,21 @@ void call_variants(
         std::unordered_set<std::string> bubble_own(bubble.inside.begin(), bubble.inside.end());
         bubble_own.insert(bubble.source);
         bubble_own.insert(bubble.sink);
+        // A stretch between copies is written under its site's id, though most of its nodes are other sites'
+        // or none's. Its records name the nodes that site owns, as the readers of variant_nodes.tsv require of
+        // every record; `fallback` (a node of the site: one of the record's, else the boundary the stretch
+        // shares with the site) where the event holds none.
+        const auto named_nodes = [&](const std::vector<std::string>& nodes, const std::string& fallback) {
+            if (!bubble.between_copies) return nodes;
+            const Bubble& site = bubbles[bubble_idx];
+            std::unordered_set<std::string> own(site.inside.begin(), site.inside.end());
+            own.insert(site.source);
+            own.insert(site.sink);
+            std::vector<std::string> out;
+            for (const std::string& nd : nodes) if (own.count(nd)) out.push_back(nd);
+            if (out.empty()) out.push_back(!fallback.empty() ? fallback : own.count(bubble.source) ? bubble.source : bubble.sink);
+            return out;
+        };
         // Genomic first base of the boundary occurrence that walk uses (the source is its first step,
         // the sink its last), not the boundary node's first occurrence anywhere. 0 when unavailable.
         auto walk_boundary_start = [&](bool sink) -> std::size_t {
@@ -5129,8 +5144,11 @@ void call_variants(
             const double af = an > 0 ? static_cast<double>(ac) / static_cast<double>(an) : 0.0;
             info << ";BUBBLE_ID=" << bubble.id << ";AN=" << an << ";AC=" << ac;
             { char buf[32]; std::snprintf(buf, sizeof(buf), "%.4g", af); info << ";AF=" << buf; }
+            // as the records name them: the node table's, and of those the event's
+            const std::vector<std::string> row_nodes = named_nodes(var_nodes, std::string());
+            const std::vector<std::string> info_nodes = named_nodes(ev_nodes, row_nodes.empty() ? std::string() : row_nodes.front());
             info << ";EVENT_NODES=";
-            for (std::size_t k = 0; k < ev_nodes.size(); ++k) { if (k) info << ','; info << ev_nodes[k]; }
+            for (std::size_t k = 0; k < info_nodes.size(); ++k) { if (k) info << ','; info << info_nodes[k]; }
             if (e.type == EvType::Dup) info << ";REF_CN=" << e.ref_cn;
             if (e.type == EvType::Dup && e.ru_len > 0) {
                 if (e.cn_method == CnMethod::Unit) {
@@ -5411,7 +5429,7 @@ void call_variants(
 
             if (options.write_variant_nodes) {
                 std::string nodes;
-                for (std::size_t k = 0; k < var_nodes.size(); ++k) { if (k) nodes += ','; nodes += var_nodes[k]; }
+                for (std::size_t k = 0; k < row_nodes.size(); ++k) { if (k) nodes += ','; nodes += row_nodes[k]; }
                 variant_nodes_rows.push_back(
                     id + '\t' + std::to_string(bubble.id) + '\t' + svt + '\t' + nodes);
 

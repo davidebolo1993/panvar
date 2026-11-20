@@ -1403,12 +1403,13 @@ mcw_f=$(grep -v '^#' "$OUT/mcw.region.vcf" | grep -c 'MULTI_CROSSING=2[^0-9]')
   || bad "traversals outside the walk: $mcw_f of $mcw_n record(s) carry MULTI_CROSSING=2"
 # With the orientations each crossing is matched on its own: hback's first lacks A, and what follows it (X, then
 # S A K reversed) is an insertion before G; hempty lacks A, and X S after its first crossing is an insertion.
+# X is no node of the site, so the insertions do not name it.
 printf '%s\n1,S,+,K,+,1,3,4,2,1,3,3,0,100,"A"\n' "$MOD_HDR" > "$OUT/mcw_o.bubbles.csv"
 "$BIN" call -i "$OUT/mcw.gfa" -c "$OUT/mcw_o.bubbles.csv" -r ref -o "$OUT/mcw_o" -q >/dev/null 2>&1
 check "traversals read one by one (SVTYPE:SVLEN:EVENT_NODES:GT hdel hback hempty | flagged)" \
   "$(awk -F'\t' '!/^#/{t=$8; sub(/.*SVTYPE=/,"",t); sub(/;.*/,"",t); l=$8; sub(/.*SVLEN=/,"",l); sub(/;.*/,"",l)
        e=$8; sub(/.*EVENT_NODES=/,"",e); sub(/;.*/,"",e); printf "%s:%s:%s:%s%s%s ", t, l, e, substr($11,1,1), substr($12,1,1), substr($13,1,1)}' "$OUT/mcw_o.region.vcf")|$(grep -v '^#' "$OUT/mcw_o.region.vcf" | grep -c 'MULTI_CROSSING')" \
-  "DEL:-100:A:111 INS:160:K,X,S:001 INS:260:K,X,A,S:010 |0"
+  "DEL:-100:A:111 INS:160:K,S:001 INS:260:K,A,S:010 |0"
 
 # ---------------------------------------------------------------- orientation from the reference walk
 # The reference meets the sink K once upstream (a repeat copy), then crosses the bubble S..K forward:
@@ -4134,6 +4135,20 @@ python3 -I "$TOOLS/spec_gfa.py" "$SPEC_DIR/tandem_gain.spec" "$OUT/tgain"
   --no-per-bubble-vcf -q > "$OUT/tgain/v.log" 2>&1
 check "tandem gain: the copy inserted once, a change in the other copy of its own (POS:SVTYPE:SVLEN:GT r1 g1 g2)" \
   "$(copy_records "$OUT/tgain/v.region.vcf")" "299:DEL:-80:001 480:INS:450:011 "
+
+# A stretch between copies is written under a site's id, and holds nodes of other sites and of none. Its records
+# name that site's nodes only, which describe requires of every record of the node table.
+record_nodes() { tail -n +2 "$1" | awk -F'\t' '{printf "%s:%s:%s ", $1, $2, $4}'; }
+check "inverted copies: the lost copy's record names its site's nodes (variant_id:site:nodes)" \
+  "$(record_nodes "$OUT/invc/v.variant_nodes.tsv")" "bubble1_DEL_X:1:X bubble2_INS_I:2:I bubble2_DEL_C:2:C,B bubble3_DEL_Y:3:Y "
+check "tandem gain: the gained copy's record names its site's nodes (variant_id:site:nodes | EVENT_NODES)" \
+  "$(record_nodes "$OUT/tgain/v.variant_nodes.tsv")|$(grep -v '^#' "$OUT/tgain/v.region.vcf" | grep -o 'EVENT_NODES=[^;]*' | tr '\n' ' ')" \
+  "bubble1_DEL_X:1:X bubble2_INS_C:2:C,B,I |EVENT_NODES=X EVENT_NODES=C,B,I "
+for t in invc tgain; do
+  "$BIN" describe -i "$OUT/$t/g.gfa" -c "$OUT/$t/g.bubbles.csv" -o "$OUT/$t/dsc" --variant-vcf "$OUT/$t/v.region.vcf" \
+    --variant-nodes "$OUT/$t/v.variant_nodes.tsv" -q > "$OUT/$t/dsc.log" 2>&1
+  check "$t: describe reads the records with their nodes (exit status)" "$?" "0"
+done
 
 # A haplotype holding one copy made of the first copy's first site and the second copy's second (hyb, and hybr on
 # the other strand): its two crossings meet at one node, so the stretch it lacks is read with the first of them.
