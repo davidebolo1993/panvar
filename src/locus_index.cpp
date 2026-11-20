@@ -43,7 +43,7 @@ namespace fs = std::filesystem;
 
 constexpr std::size_t kK = 31, kS = 11;
 constexpr std::uint64_t kMagic = 0x3130305850585650ULL;   // "PVPXP001"
-constexpr std::uint64_t kVersion = 15;   // 2: decoy windows stop at the locus; 3: clusters split at it; 4: S per haplotype; 5: calibration; 6: its decoy pairs cross window edges; 7: locus pieces off the located copies; 8: and past estimated ends; 9: and everywhere for a locus with array pieces outside; 10: stretches reach contig ends; 11: pieces tied to the locus, short contigs whole, no decoys in pieces; 12: copies walked out from their anchors; 13: across repeats; 14: a checksum; 15: pieces only next to a copy or at a contig end
+constexpr std::uint64_t kVersion = 16;   // 2: decoy windows stop at the locus; 3: clusters split at it; 4: S per haplotype; 5: calibration; 6: its decoy pairs cross window edges; 7: locus pieces off the located copies; 8: and past estimated ends; 9: and everywhere for a locus with array pieces outside; 10: stretches reach contig ends; 11: pieces tied to the locus, short contigs whole, no decoys in pieces; 12: copies walked out from their anchors; 13: across repeats; 14: a checksum; 15: pieces only next to a copy or at a contig end; 16: the score's calibration, genomes held out
 const std::size_t kLengths[] = {100, 150, 250, 1000, 10000};
 constexpr std::size_t kWindowStep = 25;
 // A stretch of a genome is a piece of the locus when, over every window of this many bases in it, this
@@ -234,6 +234,7 @@ struct LocusWork {
     std::string error;                                 // why this locus failed after the shared scans (empty: fine)
     std::map<std::string, std::vector<anchors::Span>> spans;   // per genome: the located copies, then the pieces
                                                                // found off them (the locus, both, from there on)
+    std::vector<std::uint64_t> decoy_counts;           // background counts of the decoy k-mers (parallel to idx.decoy)
 };
 
 // Every k-mer of every path: nodes it starts on (none for a FASTA locus), largest copy number within a path, paths
@@ -385,6 +386,7 @@ struct Out {
     void bytes(const void* p, std::size_t n) { f.write(static_cast<const char*>(p), static_cast<std::streamsize>(n)); h = hash_bytes_into(h, p, n); }
     void u64(std::uint64_t v) { bytes(&v, 8); }
     void raw64(std::uint64_t v) { f.write(reinterpret_cast<const char*>(&v), 8); }   // outside the checksum
+    void f64(double v) { std::uint64_t b; std::memcpy(&b, &v, 8); u64(b); }
     void str(const std::string& s) { u64(s.size()); bytes(s.data(), s.size()); }
     template <class T> void vec(const std::vector<T>& v) { u64(v.size()); bytes(v.data(), v.size() * sizeof(T)); }
 };
@@ -397,6 +399,7 @@ struct In {
         h = hash_bytes_into(h, p, n);
     }
     std::uint64_t u64() { std::uint64_t v = 0; bytes(&v, 8); return v; }
+    double f64() { const std::uint64_t b = u64(); double v; std::memcpy(&v, &b, 8); return v; }
     std::uint64_t raw64() { std::uint64_t v = 0; if (!f.read(reinterpret_cast<char*>(&v), 8)) throw std::runtime_error("recruit: " + path + " is truncated"); return v; }
     // a length read from the file, bounded by what is left of it, so a damaged length is refused, not allocated
     std::uint64_t length(std::size_t unit) {
@@ -424,10 +427,12 @@ std::int64_t LocusIndex::find(std::uint64_t canonical) const {
 }
 
 std::string LocusIndex::key() const {
-    std::string d;
+    std::string d, cg;
     for (const auto& g : decoy_genomes) d += g + ",";
+    for (const auto& g : calibration_genomes_given) cg += g + ",";
     return "v" + std::to_string(kVersion) + "|" + graph_checksum + "|" + reference_path + "|" + store_id + "|" + std::to_string(content) + "|" +
-           coordinate_reference + "|" + std::to_string(informative_max) + "|" + std::to_string(pad) + "|" + std::to_string(dust) + "|" + std::to_string(decoy_min_hits) + "|" + d + (calibrated ? "|c1" : "|c0");
+           coordinate_reference + "|" + std::to_string(informative_max) + "|" + std::to_string(pad) + "|" + std::to_string(dust) + "|" + std::to_string(decoy_min_hits) + "|" + d +
+           (calibrated ? "|c1|" + (cg.empty() ? std::string("auto") : cg) : "|c0");
 }
 
 std::string locus_name(const std::string& path) {
@@ -463,6 +468,7 @@ std::string expected_key(const BuildOptions& o, const std::string& gfa) {
     k.decoy_min_hits = o.decoy_min_hits;
     k.decoy_genomes = o.decoy_genomes.empty() ? std::vector<std::string>{k.coordinate_reference} : o.decoy_genomes;
     k.calibrated = o.calibrate;
+    k.calibration_genomes_given = o.calibration_genomes;
     return k.key();
 }
 
@@ -500,6 +506,238 @@ void parallel_for(std::size_t n, std::size_t threads, const std::function<void(s
     run();
     for (auto& t : pool) t.join();
     if (failed) std::rethrow_exception(failed);
+}
+
+// A calibration genome's off-target sequence for a locus: its homologous windows with context (cut where the
+// locus's own copy begins, as the windows are) and kCalibrationGenomeFlank bases on each side of its copies,
+// none of the locus's copies or pieces; read as merged blocks, so no base is counted twice.
+struct GenomeRegion {
+    struct Rec {
+        std::size_t block = 0;
+        std::uint64_t start = 0, end = 0, core_start = 0, core_end = 0;   // on the contig
+        bool window = false;
+    };
+    std::vector<fasta::Interval> blocks;   // by contig and start, disjoint
+    std::vector<Rec> recs;
+    std::uint64_t windows = 0;
+};
+
+GenomeRegion region_of(const LocusWork& w, const std::string& genome) {
+    const LocusIndex& x = w.idx;
+    GenomeRegion r;
+    const auto own_it = w.spans.find(genome);
+    static const std::vector<anchors::Span> kNone;
+    const std::vector<anchors::Span>& own = own_it == w.spans.end() ? kNone : own_it->second;
+    std::vector<GenomeRegion::Rec> recs;
+    std::vector<std::string> contig_of;
+    for (const auto* list : {&x.decoy_window_list, &x.calibration_window_list})
+        for (const DecoyWindow& win : *list) {
+            if (win.genome != genome) continue;
+            std::uint64_t s = win.start > kCalibrationContext ? win.start - kCalibrationContext : 0, e = win.end + kCalibrationContext;
+            for (const auto& sp : own) {
+                if (sp.contig != win.contig || sp.end <= s || sp.start >= e) continue;
+                if (sp.end <= win.start) s = std::max<std::uint64_t>(s, sp.end);
+                else if (sp.start >= win.end) e = std::min<std::uint64_t>(e, sp.start);
+            }
+            if (e <= s) continue;
+            ++r.windows;
+            recs.push_back({0, s, e, win.start, win.end, true});
+            contig_of.push_back(win.contig);
+        }
+    for (const GenomeSpan& sp : x.spans) {
+        if (sp.genome != genome || sp.piece) continue;
+        const std::pair<std::uint64_t, std::uint64_t> sides[2] = {{sp.start > kCalibrationGenomeFlank ? sp.start - kCalibrationGenomeFlank : 0, sp.start},
+                                                                  {sp.end, sp.end + kCalibrationGenomeFlank}};
+        for (const auto& [a, b] : sides) {
+            // the side less every copy and piece of the locus on the contig
+            std::vector<std::pair<std::uint64_t, std::uint64_t>> parts{{a, b}};
+            for (const auto& o : own) {
+                if (o.contig != sp.contig) continue;
+                std::vector<std::pair<std::uint64_t, std::uint64_t>> next;
+                for (const auto& [ps, pe] : parts) {
+                    if (o.end <= ps || o.start >= pe) { next.emplace_back(ps, pe); continue; }
+                    if (o.start > ps) next.emplace_back(ps, o.start);
+                    if (o.end < pe) next.emplace_back(o.end, pe);
+                }
+                parts.swap(next);
+            }
+            for (const auto& [ps, pe] : parts)
+                if (pe > ps) {
+                    recs.push_back({0, ps, pe, ps, pe, false});
+                    contig_of.push_back(sp.contig);
+                }
+        }
+    }
+    std::vector<std::size_t> order(recs.size());
+    for (std::size_t i = 0; i < order.size(); ++i) order[i] = i;
+    std::sort(order.begin(), order.end(), [&](std::size_t a, std::size_t b) {
+        return std::tie(contig_of[a], recs[a].start, recs[a].end) < std::tie(contig_of[b], recs[b].start, recs[b].end);
+    });
+    for (const std::size_t i : order) {
+        GenomeRegion::Rec rec = recs[i];
+        if (r.blocks.empty() || r.blocks.back().contig != contig_of[i] || rec.start > r.blocks.back().end)
+            r.blocks.push_back({contig_of[i], rec.start, rec.end});
+        else
+            r.blocks.back().end = std::max(r.blocks.back().end, rec.end);
+        rec.block = r.blocks.size() - 1;
+        r.recs.push_back(rec);
+    }
+    return r;
+}
+
+// What a calibration genome holds for a locus, read from its blocks: the off-target records, and the k-mers that
+// change label while it is held out.
+struct GenomeRead {
+    CalibrationGenome stats;
+    GenomeOffTarget held;
+    std::vector<std::uint32_t> homolog;   // its distinct homolog k-mers: locus (not private) indices, then decoys after them
+};
+
+GenomeRead read_region(const LocusWork& w, const FlatMap<std::uint32_t>& code_index, const GenomeRegion& r, const std::vector<std::string>& seqs,
+                       bool keep_records) {
+    const LocusIndex& x = w.idx;
+    GenomeRead out;
+    out.stats.windows = r.windows;
+    std::vector<std::uint32_t> in_locus(x.codes.size(), 0), in_decoy(x.decoy.size(), 0);
+    for (const std::string& b : seqs) {
+        out.stats.bases += b.size();
+        kmer::for_each_canonical_kmer(b.data(), b.size(), kK, [&](std::uint64_t c, std::size_t, bool) {
+            if (const std::uint32_t* i = code_index.find(c)) { ++in_locus[*i]; return; }
+            const auto it = std::lower_bound(x.decoy.begin(), x.decoy.end(), c);
+            if (it != x.decoy.end() && *it == c) ++in_decoy[static_cast<std::size_t>(it - x.decoy.begin())];
+        });
+    }
+    for (std::size_t i = 0; i < in_locus.size(); ++i) {
+        if (in_locus[i] == 0 || x.cls[i] == kPrivate) continue;
+        out.homolog.push_back(static_cast<std::uint32_t>(i));
+        // every occurrence outside the locus is in this genome: without it, the k-mer would be private
+        if (x.outside[i] == in_locus[i]) out.held.relabel.push_back(static_cast<std::uint32_t>(i));
+    }
+    for (std::size_t j = 0; j < in_decoy.size(); ++j) {
+        if (in_decoy[j] == 0) continue;
+        out.homolog.push_back(static_cast<std::uint32_t>(x.codes.size() + j));
+        if (w.decoy_counts[j] == in_decoy[j]) out.held.unlabel.push_back(x.decoy[j]);
+    }
+    out.stats.homolog_kmers = out.homolog.size();
+    out.stats.relabelled = out.held.relabel.size();
+    out.stats.unlabelled = out.held.unlabel.size();
+    if (!keep_records) return out;
+    for (const GenomeRegion::Rec& rec : r.recs) {
+        const fasta::Interval& b = r.blocks[rec.block];
+        const std::string& seq = seqs[rec.block];
+        const std::uint64_t a = rec.start - b.start, e = std::min<std::uint64_t>(rec.end - b.start, seq.size());
+        if (e <= a) continue;   // past the contig's end
+        OffTarget t;
+        t.decoy = rec.window;
+        t.seq = seq.substr(a, e - a);
+        t.core_start = std::min<std::uint64_t>(rec.core_start - rec.start, t.seq.size());
+        t.core_end = std::min<std::uint64_t>(rec.core_end - rec.start, t.seq.size());
+        out.held.off.push_back(std::move(t));
+    }
+    return out;
+}
+
+// The genomes each locus holds out in calibration, and their off-target sequence. Given, every locus takes the list.
+// By default each locus picks among the decoy genomes other than the coordinate reference, up to kCalibrationGenomesMax:
+// first the one whose windows and flanks hold the most distinct homolog k-mers (locus k-mers that are not private,
+// and decoy k-mers), then each next the one adding the most k-mers absent from those chosen (ties: the earlier in the
+// list), until none adds any. Genomes are read one at a time, every locus at once; with more candidates than
+// can be taken, twice (to choose, then to keep the chosen ones' sequence).
+void read_calibration_genomes(std::vector<LocusWork>& work, const std::map<std::string, bg::Genome>& genomes, const std::string& cref,
+                              const std::vector<std::string>& decoys, const std::vector<std::string>& given,
+                              const std::vector<FlatMap<std::uint32_t>>& code_index, std::size_t threads,
+                              const std::function<void(const std::string&)>& log, std::vector<std::vector<GenomeOffTarget>>& out) {
+    std::vector<std::string> candidates = given;
+    if (given.empty())
+        for (const auto& d : decoys)
+            if (d != cref) candidates.push_back(d);
+    std::size_t most = kCalibrationGenomesMax;
+    if (const char* m = std::getenv("PANVAR_TEST_CALIBRATION_GENOMES_MAX"); m != nullptr) most = std::max<std::size_t>(1, std::strtoull(m, nullptr, 10));
+    const bool choose = given.empty() && candidates.size() > most;
+    // per locus, the genomes it takes (indices into candidates)
+    std::vector<std::vector<std::size_t>> chosen(work.size());
+    auto read_genome = [&](std::size_t ci, const std::vector<std::size_t>& loci, bool keep, std::vector<GenomeRead>& got) {
+        const std::string& gname = candidates[ci];
+        const bg::Genome& ge = genomes.at(gname);
+        check_unchanged(ge);
+        std::vector<GenomeRegion> regions(loci.size());
+        std::vector<fasta::Interval> all;
+        for (std::size_t k = 0; k < loci.size(); ++k) {
+            regions[k] = region_of(work[loci[k]], gname);
+            all.insert(all.end(), regions[k].blocks.begin(), regions[k].blocks.end());
+        }
+        std::vector<std::string> seqs = all.empty() ? std::vector<std::string>() : fasta::fetch_intervals(ge.path, all);
+        std::vector<std::vector<std::string>> per(loci.size());
+        for (std::size_t k = 0, at = 0; k < loci.size(); ++k)
+            for (std::size_t b = 0; b < regions[k].blocks.size(); ++b) per[k].push_back(std::move(seqs[at++]));
+        got.assign(loci.size(), {});
+        parallel_for(loci.size(), threads, [&](std::size_t k) {
+            got[k] = read_region(work[loci[k]], code_index[loci[k]], regions[k], per[k], keep);
+            got[k].stats.genome = gname;
+        });
+    };
+    std::vector<std::size_t> every(work.size());
+    for (std::size_t li = 0; li < work.size(); ++li) every[li] = li;
+    if (choose) {
+        std::vector<std::vector<std::vector<std::uint32_t>>> homolog(work.size(), std::vector<std::vector<std::uint32_t>>(candidates.size()));
+        for (std::size_t ci = 0; ci < candidates.size(); ++ci) {
+            std::vector<GenomeRead> got;
+            read_genome(ci, every, false, got);
+            for (std::size_t li = 0; li < work.size(); ++li) homolog[li][ci] = std::move(got[li].homolog);
+            log("calibration genomes: candidate read: " + candidates[ci]);
+        }
+        for (std::size_t li = 0; li < work.size(); ++li) {
+            const LocusIndex& x = work[li].idx;
+            std::vector<char> covered(x.codes.size() + x.decoy.size(), 0), taken(candidates.size(), 0);
+            while (chosen[li].size() < most) {
+                std::size_t best = candidates.size(), best_gain = 0;
+                for (std::size_t ci = 0; ci < candidates.size(); ++ci) {
+                    if (taken[ci]) continue;
+                    std::size_t gain = 0;
+                    for (const std::uint32_t id : homolog[li][ci]) gain += !covered[id];
+                    if (gain > best_gain) { best = ci; best_gain = gain; }
+                }
+                if (best == candidates.size()) break;   // none adds a homolog k-mer
+                taken[best] = 1;
+                chosen[li].push_back(best);
+                for (const std::uint32_t id : homolog[li][best]) covered[id] = 1;
+            }
+        }
+    } else {
+        for (std::size_t li = 0; li < work.size(); ++li)
+            for (std::size_t ci = 0; ci < candidates.size(); ++ci) chosen[li].push_back(ci);
+    }
+    // the chosen genomes' sequence, each genome once for every locus taking it
+    std::vector<std::vector<std::pair<std::size_t, GenomeRead>>> found(work.size());   // (rank in chosen, what was read)
+    for (std::size_t ci = 0; ci < candidates.size(); ++ci) {
+        std::vector<std::size_t> loci;
+        for (std::size_t li = 0; li < work.size(); ++li)
+            if (work[li].error.empty() && std::find(chosen[li].begin(), chosen[li].end(), ci) != chosen[li].end()) loci.push_back(li);
+        if (loci.empty()) continue;
+        std::vector<GenomeRead> got;
+        read_genome(ci, loci, true, got);
+        for (std::size_t k = 0; k < loci.size(); ++k) {
+            const std::size_t rank = static_cast<std::size_t>(std::find(chosen[loci[k]].begin(), chosen[loci[k]].end(), ci) - chosen[loci[k]].begin());
+            found[loci[k]].emplace_back(rank, std::move(got[k]));
+        }
+        log("calibration genomes: read: " + candidates[ci] + " (for " + std::to_string(loci.size()) + " loci)");
+    }
+    for (std::size_t li = 0; li < work.size(); ++li) {
+        LocusIndex& x = work[li].idx;
+        std::sort(found[li].begin(), found[li].end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+        x.calibration_genomes.clear();
+        for (auto& [rank, gr] : found[li]) {
+            gr.held.genome = x.calibration_genomes.size();
+            x.calibration_genomes.push_back(gr.stats);
+            out[li].push_back(std::move(gr.held));
+        }
+        std::string names;
+        for (const auto& c : x.calibration_genomes) names += (names.empty() ? "" : ",") + c.genome;
+        if (work[li].error.empty())
+            log("locus: " + x.name + "; calibration genomes: " +
+                (names.empty() ? std::string("none (no genome to hold out besides the coordinate reference: off-target reads gain private sites by sequencing errors only)")
+                               : names));
+    }
 }
 
 std::vector<LocusIndex> build(const BuildOptions& o) {
@@ -555,6 +793,14 @@ std::vector<LocusIndex> build(const BuildOptions& o) {
     const std::vector<std::string> decoys = o.decoy_genomes.empty() ? std::vector<std::string>{cref} : o.decoy_genomes;
     for (const auto& d : decoys)
         if (!genomes.count(d)) throw std::runtime_error("recruit: decoy genome " + d + " is not in the background");
+    // calibration genomes given that are not decoy genomes: scanned for homologous windows too, which give no decoys
+    std::vector<std::string> scanned = decoys;
+    for (const auto& c : o.calibration_genomes) {
+        if (!genomes.count(c)) throw std::runtime_error("recruit: calibration genome " + c + " is not in the background");
+        if (std::count(o.calibration_genomes.begin(), o.calibration_genomes.end(), c) > 1)
+            throw std::runtime_error("recruit: calibration genome " + c + " is given twice");
+        if (std::find(scanned.begin(), scanned.end(), c) == scanned.end()) scanned.push_back(c);
+    }
     std::string kind;
     const auto counts = open_counts(o.background, bg::content_id(m), kind, o.log);
     log("background: " + counts->kind() + "; coordinate reference: " + cref + "; haplotypes: " + std::to_string(haplotypes));
@@ -616,6 +862,7 @@ std::vector<LocusIndex> build(const BuildOptions& o) {
         x.dust = o.dust;
         x.decoy_min_hits = o.decoy_min_hits;
         x.decoy_genomes = decoys;
+        x.calibration_genomes_given = o.calibration_genomes;
         x.calibrated = o.calibrate;
         std::vector<std::uint32_t> present;
         collect_kmers(g, x, present, !fasta);
@@ -1172,10 +1419,12 @@ std::vector<LocusIndex> build(const BuildOptions& o) {
     }
     const std::size_t scan_threads = threads;
     std::vector<std::unordered_set<std::uint64_t>> candidates(work.size());
-    cli::ProgressBar decoy_bar(bar_label("decoys: scanning genomes"), decoys.size());
-    for (const auto& dname : decoys) {
+    cli::ProgressBar decoy_bar(bar_label("decoys: scanning genomes"), scanned.size());
+    for (const auto& dname : scanned) {
         const bg::Genome& ge = genomes.at(dname);
-        if (is_gfa_file(ge.path)) throw std::runtime_error("recruit: decoy genome " + dname + " is a graph; decoys must be FASTA");
+        const bool is_decoy = std::find(decoys.begin(), decoys.end(), dname) != decoys.end();
+        if (is_gfa_file(ge.path))
+            throw std::runtime_error("recruit: " + std::string(is_decoy ? "decoy" : "calibration") + " genome " + dname + " is a graph; it must be FASTA");
         check_unchanged(ge);
         GzLineReader in(ge.path);
         if (!in.ok()) throw std::runtime_error("recruit: cannot read " + ge.path);
@@ -1228,6 +1477,10 @@ std::vector<LocusIndex> build(const BuildOptions& o) {
                             else if (first >= sp.end) ws = std::max<std::uint64_t>(ws, sp.end);
                         }
                     if (we <= ws) return;
+                    if (!is_decoy) {   // a calibration genome's homologous window: read in calibration, no decoys
+                        work[li].idx.calibration_window_list.push_back({dname, name, ws, we, count});
+                        return;
+                    }
                     ++work[li].idx.decoy_windows;
                     work[li].idx.decoy_bases += we - ws;
                     work[li].idx.decoy_window_list.push_back({dname, name, ws, we, count});
@@ -1265,7 +1518,7 @@ std::vector<LocusIndex> build(const BuildOptions& o) {
             seq += line;
         }
         scan();
-        log("decoys: genome scanned: " + dname);
+        log(std::string(is_decoy ? "decoys" : "calibration windows") + ": genome scanned: " + dname);
         decoy_bar.tick();
     }
     decoy_bar.done();
@@ -1275,7 +1528,10 @@ std::vector<LocusIndex> build(const BuildOptions& o) {
         std::sort(cand.begin(), cand.end());
         const auto cc = counts->count_batch(cand);
         for (std::size_t i = 0; i < cand.size(); ++i)
-            if (cc[i] <= static_cast<std::uint64_t>(x.informative_max) * x.haplotypes) x.decoy.push_back(cand[i]);
+            if (cc[i] <= static_cast<std::uint64_t>(x.informative_max) * x.haplotypes) {
+                x.decoy.push_back(cand[i]);
+                work[li].decoy_counts.push_back(cc[i]);
+            }
         // screen: closed syncmers among P and S
         for (std::size_t i = 0; i < x.codes.size(); ++i)
             if (x.cls[i] != kRepeat && kmer::is_closed_syncmer(x.codes[i], kK, kS)) x.screen.push_back(x.codes[i]);
@@ -1333,13 +1589,17 @@ std::vector<LocusIndex> build(const BuildOptions& o) {
                 t.core_start = std::min(t.core_start, t.core_end);
             }
         }
+        // calibration genomes: each held out of the background in turn, its homologous windows and flanks read as a
+        // new sample's off-target sequence (see read_calibration_genomes)
+        std::vector<std::vector<GenomeOffTarget>> held_genomes(work.size());
+        read_calibration_genomes(work, genomes, cref, decoys, o.calibration_genomes, code_index, threads, log, held_genomes);
         cli::ProgressBar cal_bar(bar_label("calibrating loci"), work.size());
         for (std::size_t li = 0; li < work.size(); ++li) {
             struct Tick { cli::ProgressBar& bar; ~Tick() { bar.tick(); } } tick{cal_bar};   // as each locus ends
             LocusIndex& x = work[li].idx;
             if (!work[li].error.empty()) continue;
             try {
-                calibrate(x, *graphs[li], off[li], threads);
+                calibrate(x, *graphs[li], off[li], held_genomes[li], threads);
             } catch (const std::exception& e) {
                 work[li].error = "recruit: " + x.name + ": calibration: " + e.what();
                 log(work[li].error);
@@ -1412,6 +1672,20 @@ void save(const LocusIndex& x, const std::string& path) {
             for (const std::uint64_t v : {ebits, c.read_length, c.insert, c.held_out, c.locus, c.flank, c.decoy, c.flank_screened, c.decoy_screened}) o.u64(v);
             for (const auto* a : {&c.locus_certain, &c.flank_certain, &c.decoy_certain})
                 for (const std::uint64_t v : *a) o.u64(v);
+            for (const double r : {c.r_in, c.r_out, c.q_in, c.q_out}) o.f64(r);
+            o.u64(c.genome_fragments); o.u64(c.genome_screened);
+            for (const ScoreHistogram* h : {&c.locus_score, &c.off_score, &c.genome_score}) { o.vec(h->bin); o.vec(h->count); }
+            o.u64(c.genomes.size());
+            for (const auto& g : c.genomes) { o.str(g.genome); o.u64(g.fragments); o.u64(g.screened); o.u64(g.with_private); }
+        }
+        o.u64(x.calibration_genomes_given.size());
+        for (const auto& g : x.calibration_genomes_given) o.str(g);
+        o.u64(x.calibration_window_list.size());
+        for (const auto& w : x.calibration_window_list) { o.str(w.genome); o.str(w.contig); o.u64(w.start); o.u64(w.end); o.u64(w.hits); }
+        o.u64(x.calibration_genomes.size());
+        for (const auto& g : x.calibration_genomes) {
+            o.str(g.genome);
+            for (const std::uint64_t v : {g.windows, g.bases, g.homolog_kmers, g.relabelled, g.unlabelled}) o.u64(v);
         }
         o.raw64(o.h);
         o.f.seekp(0);
@@ -1425,8 +1699,10 @@ void save(const LocusIndex& x, const std::string& path) {
 LocusIndex load(const std::string& path) {
     In i{std::ifstream(path, std::ios::binary), path};
     if (!i.f) throw std::runtime_error("recruit: cannot read " + path);
-    if (i.raw64() != kMagic) throw std::runtime_error("recruit: " + path + " is not a locus index of this version (or was interrupted)");
-    if (i.u64() != kVersion) throw std::runtime_error("recruit: " + path + ": unknown version");
+    if (i.raw64() != kMagic) throw std::runtime_error("recruit: " + path + " is not a locus index (or was interrupted)");
+    if (const std::uint64_t v = i.u64(); v != kVersion)
+        throw std::runtime_error("recruit: " + path + " is a locus index of format " + std::to_string(v) + "; this panvar reads format " +
+                                 std::to_string(kVersion) + (v < kVersion ? ", which calibrates the score: rebuild it" : ": use the panvar that built it, or rebuild it"));
     LocusIndex x;
     const std::string key = i.str();
     for (auto* s : {&x.name, &x.graph_path, &x.graph_checksum, &x.reference_path, &x.contig, &x.background, &x.store_id,
@@ -1463,6 +1739,25 @@ LocusIndex load(const std::string& path) {
         for (std::uint64_t* v : {&c.read_length, &c.insert, &c.held_out, &c.locus, &c.flank, &c.decoy, &c.flank_screened, &c.decoy_screened}) *v = i.u64();
         for (auto* a : {&c.locus_certain, &c.flank_certain, &c.decoy_certain})
             for (std::uint64_t& v : *a) v = i.u64();
+        for (double* r : {&c.r_in, &c.r_out, &c.q_in, &c.q_out}) *r = i.f64();
+        c.genome_fragments = i.u64(); c.genome_screened = i.u64();
+        for (ScoreHistogram* h : {&c.locus_score, &c.off_score, &c.genome_score}) {
+            h->bin = i.vec<std::int32_t>();
+            h->count = i.vec<std::uint64_t>();
+            if (h->bin.size() != h->count.size() || !std::is_sorted(h->bin.begin(), h->bin.end()))
+                throw std::runtime_error("recruit: " + path + " is corrupt");
+        }
+        c.genomes.resize(i.length(8));
+        for (auto& g : c.genomes) { g.genome = i.str(); g.fragments = i.u64(); g.screened = i.u64(); g.with_private = i.u64(); }
+    }
+    x.calibration_genomes_given.resize(i.length(8));
+    for (auto& g : x.calibration_genomes_given) g = i.str();
+    x.calibration_window_list.resize(i.length(8));
+    for (auto& w : x.calibration_window_list) { w.genome = i.str(); w.contig = i.str(); w.start = i.u64(); w.end = i.u64(); w.hits = i.u64(); }
+    x.calibration_genomes.resize(i.length(8));
+    for (auto& g : x.calibration_genomes) {
+        g.genome = i.str();
+        for (std::uint64_t* v : {&g.windows, &g.bases, &g.homolog_kmers, &g.relabelled, &g.unlabelled}) *v = i.u64();
     }
     const std::uint64_t sum = i.h;
     if (i.raw64() != sum) throw std::runtime_error("recruit: " + path + " is corrupt (its checksum does not match)");
@@ -1499,7 +1794,14 @@ void write_report(const LocusIndex& x, const std::string& path) {
       << "\nlocus\tdust_demoted\t" << x.dust_demoted << "\nlocus\tspan_demoted\t" << x.span_demoted << "\nlocus\tnegative_residuals\t" << x.negative
       << "\nlocus\tpieces\t" << pieces << " (" << piece_bp << " bp)"
       << "\nlocus\tdecoys\t" << x.decoy.size() << "\nlocus\tdecoy_windows\t" << x.decoy_windows << " (" << x.decoy_bases << " bp)"
-      << "\nlocus\tscreen\t" << x.screen.size() << '\n';
+      << "\nlocus\tscreen\t" << x.screen.size();
+    std::string held;
+    for (const auto& g : x.calibration_genomes) held += (held.empty() ? "" : ",") + g.genome;
+    r << "\nlocus\tcalibration_genomes\t"
+      << (!x.calibrated ? std::string("none (no calibration)")
+          : !held.empty() ? held + (x.calibration_genomes_given.empty() ? " (chosen by the homolog k-mers each adds)" : " (given)")
+                          : std::string("none (off-target reads gain private sites by sequencing errors only)"))
+      << '\n';
     r << "span\tgenome\tcontig\tstart\tend\tstrand\tsubtracted\tanchored_start\tanchored_end\tlocus_start\tlocus_end\n";
     for (const auto& s : x.spans)
         if (!s.piece)
@@ -1529,6 +1831,39 @@ void write_report(const LocusIndex& x, const std::string& path) {
               << c.locus_certain[m] << '\t' << rb.substr(0, rb.find('\t')) << '\t' << c.flank_screened << '\t' << c.flank_certain[m] << '\t'
               << c.decoy_screened << '\t' << c.decoy_certain[m] << '\t' << rb.substr(rb.find('\t') + 1) << '\n';
         }
+    // the score: the genomes held out, the windows read from those that are not decoy genomes, the site rates per
+    // read class, each genome's off-target fragments, and the thresholds a few rates give
+    r << "calibration_genome\tgenome\twindows\tbases\thomolog_kmers\trelabelled_private\tunlabelled_decoys\n";
+    for (const auto& g : x.calibration_genomes)
+        r << "calibration_genome\t" << g.genome << '\t' << g.windows << '\t' << g.bases << '\t' << g.homolog_kmers << '\t' << g.relabelled << '\t'
+          << g.unlabelled << '\n';
+    r << "calibration_window\tgenome\tcontig\tstart\tend\thits\n";
+    for (const auto& w : x.calibration_window_list)
+        r << "calibration_window\t" << w.genome << '\t' << w.contig << '\t' << w.start << '\t' << w.end << '\t' << w.hits << '\n';
+    r << "score_rates\tclass\tr_in\tr_out\tq_in\tq_out\toff_screened\tgenome_screened\n";
+    for (const auto& c : x.calibration) {
+        char b[256];
+        std::snprintf(b, sizeof b, "%.6g\t%.6g\t%.6g\t%.6g", c.r_in, c.r_out, c.q_in, c.q_out);
+        r << "score_rates\t" << c.read_class << '\t' << b << '\t' << c.flank_screened + c.decoy_screened << '\t' << c.genome_screened << '\n';
+    }
+    r << "score_genome\tclass\tgenome\tfragments\tscreened\twith_private\n";
+    for (const auto& c : x.calibration)
+        for (const auto& g : c.genomes)
+            r << "score_genome\t" << c.read_class << '\t' << g.genome << '\t' << g.fragments << '\t' << g.screened << '\t' << g.with_private << '\n';
+    r << "score_tier\tclass\trate\tthreshold\tlocus_reached\trecall\toff_reached\toff_screened\tbound\n";
+    for (const auto& c : x.calibration) {
+        if (!has_score(c)) continue;
+        for (const double rate : {1e-1, 1e-2, 1e-3, 1e-4, 1e-5}) {
+            const Tier t = score_tier(c, rate);
+            char th[32], b[256];
+            if (t.bin == kEveryBin) std::snprintf(th, sizeof th, "any");
+            else std::snprintf(th, sizeof th, "%.4f", t.bin * kScoreBin);
+            std::snprintf(b, sizeof b, "%g\t%s\t%llu\t%.4f\t%llu\t%llu\t%.3g", rate, th, static_cast<unsigned long long>(t.locus),
+                          t.locus_total ? static_cast<double>(t.locus) / static_cast<double>(t.locus_total) : 0.0, static_cast<unsigned long long>(t.off),
+                          static_cast<unsigned long long>(t.off_screened), t.bound());
+            r << "score_tier\t" << c.read_class << '\t' << b << '\n';
+        }
+    }
     r.close();
     if (!r) throw std::runtime_error("recruit: cannot write " + tmp);
     fs::rename(tmp, path);
