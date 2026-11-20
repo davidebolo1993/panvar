@@ -293,7 +293,10 @@ double f_upper(double f, double d1, double d2) {
 }
 
 // A dosage's classes as a general (not additive) effect, for a measured phenotype: each class of samples
-// at one dosage gets its own mean, a class of fewer than 5 samples joined to its nearest. p_genotypic tests
+// at one dosage gets its own mean, a class of fewer than 5 samples joined to its nearest. An imputed dosage
+// counts at its nearest whole number: each distinct value as its own class would fit one mean per few
+// samples, which tests nothing and costs the cube of the samples per row. A dosage on another scale, which
+// rounding would leave in one class, keeps its exact values. p_genotypic tests
 // the classes against the covariates alone (k - 1 df); p_nonadditive tests them against the additive line
 // (k - 2 df), so it flags a threshold, a dominant or a U-shaped dose-response. NaN below 3 classes for
 // p_nonadditive, below 2 for p_genotypic.
@@ -302,7 +305,13 @@ void genotypic_test(const std::vector<double>& g, const std::vector<double>& yk,
     *p_geno = kNaN; *p_nonadd = kNaN;
     const std::size_t n = g.size();
     std::map<double, std::size_t> cnt;
-    for (double v : g) ++cnt[v];
+    bool rounded = false;
+    for (double v : g) { const double r = std::round(v); rounded = rounded || r != v; ++cnt[r]; }
+    if (rounded && cnt.size() < 2) {
+        cnt.clear(); rounded = false;
+        for (double v : g) ++cnt[v];
+    }
+    const auto key = [&](double v) { return rounded ? std::round(v) : v; };
     std::vector<std::pair<double, std::size_t>> cls(cnt.begin(), cnt.end());
     // Merge small classes into their nearest neighbour, smallest first.
     for (;;) {
@@ -318,9 +327,9 @@ void genotypic_test(const std::vector<double>& g, const std::vector<double>& yk,
     }
     const std::size_t k = cls.size();
     if (k < 2) return;
-    // A class that took in another holds several dosages: the additive line is then no longer inside the
-    // class model, so the dosage itself joins the class model to keep the two nested.
-    const bool merged = cls.size() < cnt.size();
+    // A class holding several dosages (it took in another, or its dosages were rounded) leaves the additive
+    // line outside the class model, so the dosage itself joins the class model to keep the two nested.
+    const bool merged = rounded || cls.size() < cnt.size();
     // A sample's class: the merged class whose original values cover its dosage (nearest kept value).
     auto class_of = [&](double v) {
         std::size_t best = 0;
@@ -336,7 +345,7 @@ void genotypic_test(const std::vector<double>& g, const std::vector<double>& yk,
         X0[i * p0] = 1.0; Xa[i * pa] = 1.0; Xg[i * pg] = 1.0;
         for (std::size_t j = 0; j < nc; ++j) { X0[i * p0 + 1 + j] = zk[i][j]; Xa[i * pa + 1 + j] = zk[i][j]; Xg[i * pg + 1 + j] = zk[i][j]; }
         Xa[i * pa + p0] = g[i];
-        const std::size_t c = class_of(g[i]);
+        const std::size_t c = class_of(key(g[i]));
         for (std::size_t d = 1; d < k; ++d) Xg[i * pg + p0 + d - 1] = (c == d) ? 1.0 : 0.0;
         if (merged) Xg[i * pg + p0 + k - 1] = g[i];
     }

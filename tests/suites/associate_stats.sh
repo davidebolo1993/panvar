@@ -953,6 +953,14 @@ awk -v F="$OUT" 'BEGIN{ n=61; printf "m, A, B" > (F "/gm.bimbam"); for(i=1;i<=n;
 "$BIN" associate --genotypes "$OUT/gm.bimbam" --samples "$OUT/gm.samples" --phenotype "$OUT/gm.pheno" --min-maf 0 --finemap-l 0 -o "$OUT/gm" --quiet >/dev/null 2>&1
 close "$(col "$OUT/gm.assoc.tsv" p_nonadditive m)" 0.4659560631 1e-4 && close "$(col "$OUT/gm.assoc.tsv" p_genotypic m)" 2.537310399e-75 1e-3 \
   && ok "merged dose classes: nested tests as R's anova" || bad "merged classes: $(col "$OUT/gm.assoc.tsv" p_genotypic m) / $(col "$OUT/gm.assoc.tsv" p_nonadditive m)"
+# Imputed dosages (27 distinct values around 0, 1 and 2): the classes are the nearest whole numbers.
+#   R: cls <- round(g); anova(lm(y ~ g), lm(y ~ g + factor(cls))) p 9.977848648e-15; against lm(y ~ 1) 5.031455631e-14
+awk -v F="$OUT" 'BEGIN{ printf "u, A, B" > (F "/gi.bimbam"); for(i=1;i<=60;i++){ g=int((i-1)/20); j=((i*13)%9)/40; printf ", %.3f", (g==0?j:(g==2?2-j:1+j-0.1)) > (F "/gi.bimbam") } printf "\n" > (F "/gi.bimbam")
+  for(i=1;i<=60;i++) print "s" i > (F "/gi.samples"); print "sample\tphenotype" > (F "/gi.pheno")
+  for(i=1;i<=60;i++){ g=int((i-1)/20); printf "s%d\t%.10g\n", i, (g==1) + ((i*37)%11)/10 - 0.5 > (F "/gi.pheno") } }'
+"$BIN" associate --genotypes "$OUT/gi.bimbam" --samples "$OUT/gi.samples" --phenotype "$OUT/gi.pheno" --min-maf 0 --finemap-l 0 -o "$OUT/gi" --quiet >/dev/null 2>&1
+close "$(col "$OUT/gi.assoc.tsv" p_nonadditive u)" 9.977848648e-15 1e-4 && close "$(col "$OUT/gi.assoc.tsv" p_genotypic u)" 5.031455631e-14 1e-4 \
+  && ok "imputed dosages: classes at the nearest whole number, as R's anova" || bad "imputed classes: $(col "$OUT/gi.assoc.tsv" p_genotypic u) / $(col "$OUT/gi.assoc.tsv" p_nonadditive u)"
 # The exact group test does not depend on dosage units: the Fisher fixture at 1e-8 per copy.
 sed 's/, 1/, 0.00000001/g' "$OUT/fx.bimbam" > "$OUT/fxs.bimbam"
 "$BIN" associate --genotypes "$OUT/fxs.bimbam" --samples "$OUT/fx.samples" --phenotype "$OUT/fx.pheno" --unit variant --min-maf 0 \
@@ -1236,6 +1244,11 @@ for nm in ncp ncs; do
     && ok "near-collinear informative columns ($nm): the conditional p-values do not depend on T's offset or units" \
     || bad "near-collinear ($nm): S $(col "$OUT/$nm.assoc.tsv" p_conditional S) vs $(col "$OUT/nc0.assoc.tsv" p_conditional S), T $(col "$OUT/$nm.assoc.tsv" p_conditional T) vs $(col "$OUT/nc0.assoc.tsv" p_conditional T) ($(col "$OUT/$nm.assoc.tsv" cond_role T))"
 done
+# The dose classes do not depend on the units either: T in units of 1e-3 keeps its three classes.
+[ "$(col "$OUT/nc0.assoc.tsv" p_genotypic T)" != NA ] && close "$(col "$OUT/ncs.assoc.tsv" p_genotypic T)" "$(col "$OUT/nc0.assoc.tsv" p_genotypic T)" 1e-6 \
+  && close "$(col "$OUT/ncs.assoc.tsv" p_nonadditive T)" "$(col "$OUT/nc0.assoc.tsv" p_nonadditive T)" 1e-6 \
+  && ok "dose classes in other units: the same genotypic tests" \
+  || bad "dose classes in units of 1e-3: $(col "$OUT/ncs.assoc.tsv" p_genotypic T) vs $(col "$OUT/nc0.assoc.tsv" p_genotypic T)"
 
 # ------------------------------------------------- tails that must not depend on the dosage's units
 # The 17-carrier record of 2,000 samples with one case, in units of 0.001 per copy: the group's saddlepoint
