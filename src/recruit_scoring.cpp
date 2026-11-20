@@ -208,6 +208,65 @@ void decide(Row& r, const Evidence& one, const Evidence* two, const char* status
     r.reason = "no_evidence";
 }
 
+bool callable(const Evidence& v, const Bar& b) { return v.seg_kmers > 0 && v.sites_p >= 1 && !uncallable(v) && !divergent(v, b); }
+
+bool is_in(const char* status) { return status[0] == 'i'; }
+
+// What the score decides on (see Judged), from the pooled evidence and each mate's own.
+Judged judge(const Evidence& v, const Evidence& one, const Evidence* two, const char* status[2], const Bar& b) {
+    Judged j;
+    // a read without a segment is judged whole: its decoy sites count, so its k-mers do
+    auto counts = [](const Evidence& e) { return Counts{e.sites_p, e.sites_d, e.seg_kmers > 0 ? e.seg_kmers : e.kmers}; };
+    j.pooled = counts(v);
+    j.pooled.n = 0;
+    for (const Evidence* e : {&one, two})
+        if (e != nullptr) j.pooled.n += counts(*e).n;
+    const bool ok = callable(v, b);
+    j.pooled_ok = ok && (two == nullptr || is_in(status[0]) || is_in(status[1]));
+    j.pooled_mates_out = ok && !j.pooled_ok;
+    if (two != nullptr) {
+        const Evidence* e[2] = {&one, two};
+        for (int m = 0; m < 2; ++m) {
+            const Evidence& other = *e[1 - m];
+            j.mate[m] = counts(*e[m]);
+            j.mate_ok[m] = callable(*e[m], b) && (other.sites_d + other.decoy_out <= other.sites_p || status[m][0] == 'p');
+        }
+    }
+    return j;
+}
+
+// A fragment's fate by the score. Certain when the pooled stretch, or one mate alone (rescued), reaches the
+// certain bin; likely when one reaches the likely bin; otherwise as by the first rules, with `low_score` for
+// two or more private sites that fall short. A not-certain fragment keeps the reason it is not certain.
+void decide_by_score(Row& r, const Judged& j, const LocusTable& t, const char* status[2], bool pair, const Bar& b) {
+    const Evidence& v = r.ev;
+    auto reaches = [&](const Counts& c, bool ok, std::int32_t bin) { return ok && score_bin(score(c, t.rates)) >= bin; };
+    auto any = [&](std::int32_t bin) {
+        return reaches(j.mate[0], j.mate_ok[0], bin) || reaches(j.mate[1], j.mate_ok[1], bin);
+    };
+    const bool pooled = reaches(j.pooled, j.pooled_ok, t.certain_bin);
+    if (pooled || any(t.certain_bin)) {
+        r.fate = "certain";
+        const bool out = pair && (std::string(status[0]) == "out" || std::string(status[1]) == "out");
+        const bool part = std::string(status[0]) == "part" || (pair && std::string(status[1]) == "part");
+        r.reason = !pooled || out ? "rescued" : part ? "partial" : ".";
+        return;
+    }
+    const bool likely = reaches(j.pooled, j.pooled_ok, t.likely_bin) || any(t.likely_bin);
+    const std::uint32_t decoy = v.sites_d + v.decoy_out;
+    if (v.sites_p == 0 && decoy >= 2) { r.fate = "unrecruited"; r.reason = "homolog"; return; }
+    r.fate = likely ? "likely" : "ambiguous";
+    if (v.sites_p >= 1 && decoy >= 1) { r.reason = "conflict"; return; }
+    if (uncallable(v) && v.sites_p >= 1) { r.reason = "uncallable"; return; }
+    if (divergent(v, b) && v.sites_p >= 1) { r.reason = "divergent"; return; }
+    if (j.pooled_mates_out && reaches(j.pooled, true, t.certain_bin)) { r.reason = "mates_out"; return; }
+    if (v.sites_p == 1) { r.reason = "single_site"; return; }
+    if (v.sites_p >= 2) { r.reason = "low_score"; return; }
+    if (v.n_s >= 1) { r.reason = "shared_only"; return; }
+    r.fate = "unrecruited";
+    r.reason = "no_evidence";
+}
+
 // A fragment's bar. Its error rate is the mean of 10^(-Q/10) over its bases with qualities, as the run's estimate
 // is, when that is higher than the run's and says something (under 30%): HiFi reads range from 99% to 99.99%
 // accurate, and a read at 99.5% must not be held to the run's 99.9%. A read of 1 kb or more gets the long-read
@@ -233,8 +292,32 @@ Bar bar_for(const Fragment& fr, const ReadOptions& o) {
 // Scores one fragment against one locus.
 }  // namespace
 
+double score(const Counts& c, const Rates& r) {
+    const double len = static_cast<double>(c.n) / static_cast<double>(kK);
+    return static_cast<double>(c.p) * std::log(r.r_in / r.r_out) - len * (r.r_in - r.r_out) +
+           static_cast<double>(c.d) * std::log(r.q_in / r.q_out) - len * (r.q_in - r.q_out);
+}
+
+std::int32_t score_bin(double s) {
+    return static_cast<std::int32_t>(std::clamp(std::floor(s / kScoreBin), -1e9, 1e9));
+}
+
+bool deciding_score(const Judged& j, const Rates& r, double& s) {
+    bool any = false;
+    auto take = [&](const Counts& c, bool ok) {
+        if (!ok) return;
+        const double x = score(c, r);
+        if (!any || x > s) s = x;
+        any = true;
+    };
+    take(j.pooled, j.pooled_ok);
+    take(j.mate[0], j.mate_ok[0]);
+    take(j.mate[1], j.mate_ok[1]);
+    return any;
+}
+
 Row score_fragment(const Fragment& fr, const LocusTable& t, std::uint32_t li, const ReadOptions& o, double gap_cost,
-                   double flank_share, std::uint32_t* certain_through) {
+                   double flank_share, std::uint32_t* certain_through, Judged* judged) {
     Row r;
     r.fragment = fr.name;
     r.locus = li;
@@ -324,7 +407,19 @@ Row score_fragment(const Fragment& fr, const LocusTable& t, std::uint32_t li, co
             if (x.fate[0] == 'c') *certain_through = m;
         }
     }
-    decide(r, ev[0], pair ? &ev[1] : nullptr, status, t.min_sites ? t.min_sites : o.min_sites, bar);
+    const Judged j = judge(r.ev, ev[0], pair ? &ev[1] : nullptr, status, bar);
+    if (judged != nullptr) *judged = j;
+    if (t.rates.known()) {
+        r.scored = true;
+        if (deciding_score(j, t.rates, r.score)) {
+            const std::int32_t bin = score_bin(r.score);
+            if (t.tiers) r.tier = bin >= t.certain_bin ? "certain" : bin >= t.likely_bin ? "likely" : ".";
+        } else {
+            r.score = score(j.pooled, t.rates);
+        }
+    }
+    if (t.by_score) decide_by_score(r, j, t, status, pair, bar);
+    else decide(r, ev[0], pair ? &ev[1] : nullptr, status, t.min_sites ? t.min_sites : o.min_sites, bar);
     return r;
 }
 

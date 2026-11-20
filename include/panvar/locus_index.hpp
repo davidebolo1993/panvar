@@ -52,6 +52,19 @@ struct Ceiling {
 // own k-mers removed from the index), from the decoy windows and from the coordinate reference's flanks,
 // scored as recruit scores them; the counts certain at each private-site cut m (index m, 1 to kMaxCut).
 constexpr std::uint32_t kMaxCut = 8;
+// Scores are binned at this width; a fragment reaches a tier when its score's bin is at least the tier's.
+constexpr double kScoreBin = 1.0 / 16;
+struct ScoreHistogram {
+    std::vector<std::int32_t> bin;            // increasing
+    std::vector<std::uint64_t> count;
+    std::uint64_t at_least(std::int32_t b) const;   // fragments in bins >= b
+};
+// A calibration genome's off-target fragments in one read class.
+struct GenomeTally {
+    std::string genome;
+    std::uint64_t fragments = 0, screened = 0;
+    std::uint64_t with_private = 0;           // screened with a private site under its relabelling
+};
 struct Calibration {
     std::string read_class;                   // short, hifi, ont
     double error_rate = 0;
@@ -61,6 +74,25 @@ struct Calibration {
     std::uint64_t flank = 0, decoy = 0;       // off-target fragments simulated
     std::uint64_t flank_screened = 0, decoy_screened = 0;
     std::array<std::uint64_t, kMaxCut + 1> locus_certain{}, flank_certain{}, decoy_certain{};
+    // The score: private and decoy sites per k bases of judged sequence in held-out locus fragments (r_in,
+    // q_in) and in off-target ones (r_out, q_out), all screened; and histograms of the deciding score
+    // (bins of kScoreBin) of the fragments that can be called, held-out, off-target from the flanks and
+    // decoy windows, and off-target from the calibration genomes (each held out of the background in turn).
+    double r_in = 0, r_out = 0, q_in = 0, q_out = 0;
+    std::uint64_t genome_fragments = 0, genome_screened = 0;
+    ScoreHistogram locus_score, off_score, genome_score;
+    std::vector<GenomeTally> genomes;         // per calibration genome
+};
+
+// A genome held out of the background in calibration: its homologous windows (with context) and the flanks of its
+// copies of the locus are read as a new sample's off-target sequence, with the locus k-mers only it holds outside
+// the locus labelled private and the decoy k-mers only it holds unknown.
+struct CalibrationGenome {
+    std::string genome;
+    std::uint64_t windows = 0, bases = 0;      // homologous windows, and bases read (windows, context, flanks)
+    std::uint64_t homolog_kmers = 0;           // distinct locus (not private) and decoy k-mers in them
+    std::uint64_t relabelled = 0;              // locus k-mers it alone holds outside the locus: private when held out
+    std::uint64_t unlabelled = 0;              // decoy k-mers it alone holds: unknown when held out
 };
 
 struct LocusIndex {
@@ -75,6 +107,7 @@ struct LocusIndex {
     double dust = 2.5;
     std::uint32_t decoy_min_hits = 20;
     std::vector<std::string> decoy_genomes;
+    std::vector<std::string> calibration_genomes_given;   // --calibration-genomes; empty: chosen per locus
     bool calibrated = false;
     std::size_t paths = 0;
     std::uint64_t decoy_windows = 0, decoy_bases = 0;
@@ -93,6 +126,8 @@ struct LocusIndex {
     // report
     std::vector<GenomeSpan> spans;
     std::vector<DecoyWindow> decoy_window_list;
+    std::vector<DecoyWindow> calibration_window_list;   // homologous windows of calibration genomes that are not decoy genomes
+    std::vector<CalibrationGenome> calibration_genomes;  // the genomes held out in calibration, in the order chosen
     std::vector<Ceiling> ceilings;
     std::vector<Calibration> calibration;        // empty when not calibrated
     std::uint64_t dust_demoted = 0, span_demoted = 0, negative = 0;
@@ -111,6 +146,9 @@ struct BuildOptions {
     double dust = 2.5;
     std::uint32_t decoy_min_hits = 20;           // shared k-mer hits that make a cluster a homologous window
     std::vector<std::string> decoy_genomes;      // default: the coordinate reference
+    // Genomes held out one at a time in calibration (calibration_genomes_max at most). Empty: per locus, chosen among
+    // the decoy genomes other than the coordinate reference, greedily by the homolog k-mers each adds.
+    std::vector<std::string> calibration_genomes;
     bool calibrate = true;
     std::size_t threads = 2;
     std::function<void(const std::string&)> log;
