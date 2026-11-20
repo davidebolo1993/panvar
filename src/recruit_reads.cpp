@@ -423,7 +423,8 @@ ReadStats recruit_reads(const ReadOptions& options) {
                         std::snprintf(b, sizeof b, "%s: held-out recall %.4f; off-target %llu of %llu screened (rate %.3g asked), 95%% bound %.3g, %s", th,
                                       t->locus_total ? static_cast<double>(t->locus) / static_cast<double>(t->locus_total) : 0.0,
                                       static_cast<unsigned long long>(t->off), static_cast<unsigned long long>(t->off_screened), t->rate, t->bound(),
-                                      t->shown ? "within the rate" : "too few to show the rate (none beyond it seen)");
+                                      t->shown ? "within the rate" : t->off == 0 ? "too few to show the rate (none beyond it seen)"
+                                                                     : "within the rate as seen, its bound above it");
                         notes[li].push_back(std::string(name) + "_threshold");
                         notes[li].push_back(b);
                     }
