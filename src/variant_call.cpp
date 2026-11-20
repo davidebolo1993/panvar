@@ -6,6 +6,7 @@
 #include "panvar/bubble_path.hpp"
 #include "panvar/bubbles.hpp"
 #include "panvar/cli_utils.hpp"
+#include "panvar/copy_sites.hpp"
 #include "panvar/event_size.hpp"
 #include "panvar/gene_cn_kmer.hpp"
 #include "panvar/graph_utils.hpp"
@@ -2187,7 +2188,7 @@ void call_variants(
         out << "##INFO=<ID=PATH_INVERSION,Number=0,Type=Flag,Description=\"An inversion at an inversion site (bubble kind 'inversion'), typed from the haplotypes' walks: a run of reference nodes a haplotype walks reversed, between two runs it walks forward. Such a site is made where no snarl holds the inversion -- its breakpoints lie in inverted repeats the graph collapses, so every path crosses the repeat nodes in both orientations -- and encloses the sites inside it. POS is the last forward base before the inverted run, END the last base before the forward run after it; CIPOS/CIEND give the breakpoint ranges and IMPRECISE is set when they are not zero. Typed from the walks rather than from one site's nodes, it has no EVENT_NODES, START_NODE or END_NODE\">\n";
         out << "##INFO=<ID=IMPRECISE,Number=0,Type=Flag,Description=\"The breakpoints are not exact, for one of three reasons. The record describes an event CLUSTER rather than one exact event: coalescing joined several pieces that keep reference sequence between them, or the deletion spans loop copies a CNV record counts (their bases are left out of SVLEN), so POS+1..END is wider than the |SVLEN| bases removed. A breakpoint abuts an N in the reference (the base before POS+1 or after END), which places the event only to within the N run. Or a PATH_INVERSION whose breakpoints lie in repeats, with CIPOS/CIEND not zero. On a PRECISE DEL or INV, END-POS equals |SVLEN|\">\n";
         out << "##INFO=<ID=CN_SPAN_AMBIGUOUS,Number=1,Type=Integer,Description=\"Path measurements taken over a module span whose source or sink boundary occurs MORE THAN ONCE in that path. The span is then first-source..last-sink, which is a choice: it can enclose two separate visits and the content between them rather than one module. Every quantity measured over the span -- CN, CNBP, CN_MODULE_REF_BP -- inherits that choice on those paths. Absent when every boundary is visited once\">\n";
-        out << "##INFO=<ID=MULTI_CROSSING,Number=1,Type=Integer,Description=\"Traversing paths that traverse this bubble more than once, counted over the whole path. A traversal is a run of consecutive steps from one boundary to the other with only bubble-interior nodes between (possibly none); a boundary touched from or towards outside the bubble is not one. The path's walk is one source..sink window, so it either spans the sequence between traversals, and the events and copy numbers taken from it count the interior once per traversal, or holds one traversal and leaves the others untyped. Reported, not corrected. Absent when every path traverses once\">\n";
+        out << "##INFO=<ID=MULTI_CROSSING,Number=1,Type=Integer,Description=\"Traversing paths read across this bubble in one walk that holds more than one traversal: traversals the copy matching could not place one by one, or every traversal of a path where the site table gives no boundary orientations (then counted over the whole path). A traversal is a run of consecutive steps from one boundary to the other with only bubble-interior nodes between (possibly none); a boundary touched from or towards outside the bubble is not one. The walk spans the sequence between its traversals, and the events and copy numbers taken from it count the interior once per traversal. Absent when there are none\">\n";
         out << "##INFO=<ID=MULTI_CROSSING_UNSCORED,Number=1,Type=Integer,Description=\"Of the MULTI_CROSSING paths, those with a traversal the scored walk does not hold whose allele length differs from every reference traversal of this bubble by --min-sv-bp or more: an SV-sized difference no record here describes. Absent when none\">\n";
         if (!genes.empty())
             out << "##INFO=<ID=GENES,Number=.,Type=String,Description=\"Gene(s) overlapping the variant (from --gtf); for an event inside a gene of a copy-number site's copies, that gene's paralogs its carriers hold\">\n";
@@ -2307,7 +2308,13 @@ void call_variants(
         std::unordered_set<std::string> bnodes(bubble.inside.begin(), bubble.inside.end());
         bnodes.insert(bubble.source);
         bnodes.insert(bubble.sink);
-        for (std::size_t k = 0; k < ref_path->steps.size(); ++k) {
+        // a site read one copy at a time: the steps of the reference's own window
+        std::size_t k0 = 0, k1 = ref_path->steps.size();
+        if (bubble.windows) {
+            const auto it = bubble.windows->find(ref_path);
+            if (it != bubble.windows->end()) { k0 = it->second.first; k1 = it->second.last + 1; }
+        }
+        for (std::size_t k = k0; k < k1; ++k) {
             const std::string& id = ref_path->steps[k].node_id;
             if (bnodes.count(id) && !pos.count(id)) {
                 pos[id] = ref_meta.region_start_1based + ref_prefix[k];
@@ -2322,18 +2329,17 @@ void call_variants(
     // Bubbles run serially; parallelism is inside each bubble, over its alleles (the walk-diff DP is
     // the hot path, and an SV locus is usually one dominant folded bubble). Each bubble writes only to
     // its own slot, so results are order-deterministic.
-    auto process_bubble = [&](std::size_t bubble_idx) {
-        const Bubble& bubble = bubbles[bubble_idx];
+    auto process_bubble = [&](std::size_t bubble_idx, const Bubble& bubble,
+                              std::unordered_map<std::string, int>& id_counts) {
         // Shadow the shared sinks with this bubble's local buffers: the loop body below
-        // writes only through these names, so each bubble accumulates independently. id_counts is
-        // bubble-scoped (variant ids embed the bubble id), so a local map reproduces the ids exactly.
+        // writes only through these names, so each bubble accumulates independently. id_counts is per
+        // site (variant ids embed the site's id), shared by the copies a site is read as.
         BubbleOut& bout = bouts[bubble_idx];
         VariantCallSummary& summary = bout.sum;
         std::vector<OutRecord>& out_records = bout.records;
         std::vector<std::string>& variant_nodes_rows = bout.variant_nodes;
         std::vector<std::string>& carrier_events_rows = bout.carrier_events;
         std::vector<DupGeneTarget>& dup_targets = bout.dup_targets;
-        std::unordered_map<std::string, int> id_counts;
         if (!bubble_filter.empty() && bubble_filter.find(bubble.id) == bubble_filter.end()) return;
         if (bubble.inversion_parent) return;   // typed below, from the haplotypes' walks
         ++summary.bubbles_seen;
@@ -2492,6 +2498,12 @@ void call_variants(
         auto module_span = [&](std::size_t pi, bool* ambiguous = nullptr, bool* opens_on_source = nullptr)
             -> std::pair<std::size_t, std::size_t> {
             if (ambiguous != nullptr) *ambiguous = false;
+            if (bubble.windows) {
+                const auto it = bubble.windows->find(&graph.paths[pi]);
+                if (it == bubble.windows->end()) return {1, 0};
+                if (opens_on_source != nullptr) *opens_on_source = it->second.forward;
+                return {it->second.first, it->second.last};
+            }
             const auto& idx = path_indexes[pi].positions;
             const auto sit = idx.find(bubble.source);
             const auto kit = idx.find(bubble.sink);
@@ -2515,6 +2527,15 @@ void call_variants(
             return {lo, hi};
         };
 
+        // The steps a module span indexes: a path's own, or the reference's where it reads the reference's window.
+        auto span_steps = [&](std::size_t pi) -> const std::vector<PathStep>& {
+            if (bubble.windows) {
+                const auto it = bubble.windows->find(&graph.paths[pi]);
+                if (it != bubble.windows->end()) return it->second.from->steps;
+            }
+            return graph.paths[pi].steps;
+        };
+
         const std::size_t rescue_floor =
             options.rescue_min_bp != 0 ? options.rescue_min_bp : std::max<std::size_t>(1, options.min_sv_bp / 2);
 
@@ -2536,13 +2557,14 @@ void call_variants(
         // outside the walk is still one. The walk is a single source..sink window, so it either spans
         // the sequence between traversals (events and copy numbers then count the interior once per
         // traversal) or holds one of them and leaves the others untyped. Reported, not corrected:
-        // MULTI_CROSSING on every record of the bubble and a run-summary counter.
+        // MULTI_CROSSING on every record of the bubble and a run-summary counter. A site read one copy at a time
+        // has a window per path, which holds more than one traversal only where a copy could not be placed.
         std::size_t multi_crossing_paths = 0;
         // ...and of those, the paths with a traversal the walk does not hold whose allele differs from every
         // reference traversal by --min-sv-bp or more in length: an SV-sized change no record of this bubble
         // can describe. Reported, not called (MULTI_CROSSING_UNSCORED and the run summary).
         std::size_t multi_crossing_unscored = 0;
-        if (bubble.source != bubble.sink) {
+        if (bubble.source != bubble.sink && !bubble.windows) {
             const std::unordered_set<std::string> interior(bubble.inside.begin(), bubble.inside.end());
             // Each traversal of path `pi`: its boundary step indices (low, high) and its interior bp.
             struct Traversal { std::size_t lo, hi, bp; };
@@ -2585,6 +2607,10 @@ void call_variants(
                 }
             }
         }
+        // A site read one copy at a time: a path whose window holds crossings it could not place one by one.
+        if (bubble.windows)
+            for (const auto& [path, w] : *bubble.windows)
+                if (w.crossings > 1 && traverses.count(path->name)) ++multi_crossing_paths;
         if (multi_crossing_unscored > 0) {
             ++summary.multi_crossing_unscored_bubbles;
             summary.multi_crossing_unscored_paths += multi_crossing_unscored;
@@ -3040,7 +3066,9 @@ void call_variants(
         // reference's first and last module visit) stay in the walks, so a change within one copy is an
         // insertion or deletion and a whole extra copy goes with the copy change.
         std::unordered_set<std::string> unified_internal;   // repeat units inside the module's copies
-        if (options.cn && ref_idx < graph.paths.size()) {
+        // A stretch between copies holds a gained or lost copy whole, as an insertion or deletion: the nodes it
+        // revisits are pieces of the copies on either side, not a module's copies.
+        if (options.cn && ref_idx < graph.paths.size() && !bubble.between_copies) {
             const std::unordered_set<std::string> inside_set(bubble.inside.begin(), bubble.inside.end());
             std::vector<std::size_t> pis;   // the traversing paths
             std::size_t ref_k = SIZE_MAX;
@@ -3052,7 +3080,7 @@ void call_variants(
             std::vector<std::unordered_map<std::string, std::size_t>> visits(pis.size());
             for (std::size_t k = 0; k < pis.size(); ++k) {
                 const auto sp = module_span(pis[k]);
-                const std::vector<PathStep>& st = graph.paths[pis[k]].steps;
+                const std::vector<PathStep>& st = span_steps(pis[k]);
                 for (std::size_t i = sp.first; i <= sp.second && i < st.size(); ++i) {
                     const std::string& id = st[i].node_id;
                     if (inside_set.count(id) && rep_unit_of(id) == nullptr) ++visits[k][id];
@@ -3126,7 +3154,7 @@ void call_variants(
                 const std::unordered_set<std::string> mod_set(mod.begin(), mod.end());
                 for (std::size_t k = 0; k < pis.size(); ++k) {
                     const auto sp = module_span(pis[k]);
-                    const std::vector<PathStep>& st = graph.paths[pis[k]].steps;
+                    const std::vector<PathStep>& st = span_steps(pis[k]);
                     std::size_t lo = SIZE_MAX, hi = 0;
                     for (std::size_t i = sp.first; i <= sp.second && i < st.size(); ++i)
                         if (mod_set.count(st[i].node_id)) { lo = std::min(lo, i); hi = std::max(hi, i); }
@@ -3137,7 +3165,7 @@ void call_variants(
                 if (!internal.empty())
                     for (std::size_t k = 0; k < pis.size(); ++k) {
                         const auto sp = module_span(pis[k]);
-                        const std::vector<PathStep>& st = graph.paths[pis[k]].steps;
+                        const std::vector<PathStep>& st = span_steps(pis[k]);
                         for (std::size_t i = sp.first; i <= sp.second && i < st.size(); ++i) {
                             const std::string* u = inside_set.count(st[i].node_id) ? rep_unit_of(st[i].node_id) : nullptr;
                             if (u != nullptr && internal.count(*u)) internal_bp[k] += node_len(graph, st[i].node_id);
@@ -3182,7 +3210,7 @@ void call_variants(
                 const long long ref_mbp = static_cast<long long>(module_bp(ref_k));
                 auto copies_bp = [&](std::size_t k) {
                     const auto sp = module_span(pis[k]);
-                    const std::vector<PathStep>& st = graph.paths[pis[k]].steps;
+                    const std::vector<PathStep>& st = span_steps(pis[k]);
                     std::size_t lo = SIZE_MAX, hi = 0;
                     for (std::size_t i = sp.first; i <= sp.second && i < st.size(); ++i)
                         if (mod_set.count(st[i].node_id)) { lo = std::min(lo, i); hi = std::max(hi, i); }
@@ -5229,7 +5257,7 @@ void call_variants(
             auto cnbp_walk_bp = [&](std::size_t pi) -> long long {
                 const auto sp = module_span(pi);
                 if (sp.first > sp.second) return 0;
-                const std::vector<PathStep>& steps = graph.paths[pi].steps;
+                const std::vector<PathStep>& steps = span_steps(pi);
                 long long bp = 0;
                 for (std::size_t i = sp.first; i <= sp.second && i < steps.size(); ++i)
                     if (cnbp_inside.count(steps[i].node_id)) bp += static_cast<long long>(node_len(graph, steps[i].node_id));
@@ -5637,8 +5665,17 @@ void call_variants(
         }
     };
     // Ticked as bubbles are processed, not in the merge below, so the bar follows the run.
+    // A site some path crosses more than once is read one copy at a time (copy_sites.hpp): its copies, and the
+    // stretches between copies where a path holds more or fewer of them, are read in its place, under its id.
+    std::size_t ref_pi = graph.paths.size();
+    for (std::size_t pi = 0; pi < graph.paths.size(); ++pi)
+        if (&graph.paths[pi] == ref_path) ref_pi = pi;
+    const std::vector<std::vector<Bubble>> copies = copy_sites(graph, path_indexes, bubbles, ref_pi);
     for (std::size_t bubble_idx = 0; bubble_idx < bubbles.size(); ++bubble_idx) {
-        process_bubble(bubble_idx);
+        // ids are per site, so the copies of a site share one count and number their records apart
+        std::unordered_map<std::string, int> id_counts;
+        if (copies[bubble_idx].empty()) process_bubble(bubble_idx, bubbles[bubble_idx], id_counts);
+        for (const Bubble& b : copies[bubble_idx]) process_bubble(bubble_idx, b, id_counts);
         call_progress.tick();
     }
 

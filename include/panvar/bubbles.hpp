@@ -1,7 +1,9 @@
 #pragma once
 
 #include <cstddef>
+#include <memory>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -10,6 +12,17 @@
 #include "panvar/integrated_snarls.hpp"
 
 namespace panvar {
+
+// One path's window across a site that call reads one copy at a time: steps `first`..`last` of `from`, read
+// first to last when `forward`. `from` is the path itself, or the reference where the path holds the
+// reference's allele there.
+struct PathWindow {
+    const PathRecord* from = nullptr;
+    std::size_t first = 0;
+    std::size_t last = 0;
+    bool forward = true;
+    std::size_t crossings = 1;   // the site's crossings it holds: more than one where a copy could not be placed
+};
 
 struct Bubble {
     std::size_t id = 0;
@@ -49,6 +62,11 @@ struct Bubble {
     // Boundaries of the sites inside an inversion site; set by view_inversion_sites_on_own_nodes, not
     // stored.
     std::vector<std::pair<std::string, std::string>> inner_bounds;
+    // Set by call on a site it reads one copy at a time (copy_sites.hpp): each path's window, the reference's
+    // included. A path left out does not cross. Null on the sites of a site table.
+    std::shared_ptr<const std::unordered_map<const PathRecord*, PathWindow>> windows;
+    // Of those, a stretch between two copies where a path holds more or fewer copies than the reference.
+    bool between_copies = false;
 };
 
 struct BubbleCallOptions {

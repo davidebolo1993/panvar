@@ -781,7 +781,9 @@ fi
 # produces a CN record with a repeated boundary, so nothing exercised that choice.
 #
 # The reference here visits S and K TWICE, with a full module between each pair. Nothing is
-# self-adjacent, so the UNIT route cannot fire and the collapsed-module route is used.
+# self-adjacent, so the UNIT route cannot fire and the collapsed-module route is used. A site table with
+# boundary orientations has each crossing read on its own (checked after these), so the table here has none,
+# which reads each path in one walk from its first crossing to its last.
 { printf 'H\tVN:Z:1.0\n'
   printf 'S\tF\t%s\nS\tS\t%s\nS\tP\t%s\nS\tQ\t%s\nS\tK\t%s\nS\tG\t%s\n' \
     "$(gblk 150 21)" "$(gblk 50 22)" "$(gblk 150 23)" "$(gblk 150 24)" "$(gblk 50 25)" "$(gblk 150 26)"
@@ -790,7 +792,7 @@ fi
   printf 'P\tgrch38#0#chr1:1-1100\tF+,S+,P+,Q+,K+,S+,P+,Q+,K+,G+\t*\n'
   printf 'P\th1#1#chr1\tF+,S+,P+,Q+,P+,Q+,K+,S+,P+,Q+,K+,G+\t*\n'
   printf 'P\th2#1#chr1\tF+,S+,P+,K+,S+,P+,Q+,K+,G+\t*\n'; } > "$OUT/modrep.gfa"
-printf 'bubble_id,source,source_orient,sink,sink_orient,inside_node_count,total_node_count,path_support,distinct_alleles,ref_allele_support,alt_allele_support_max,alt_allele_support_min,min_inside_bp,max_inside_bp,inside_nodes\n1,S,+,K,+,2,4,3,3,1,1,1,150,450,"P;Q"\n' > "$OUT/modrep.bubbles.csv"
+printf 'bubble_id,source,sink,inside_node_count,total_node_count,path_support,distinct_alleles,ref_allele_support,alt_allele_support_max,alt_allele_support_min,min_inside_bp,max_inside_bp,inside_nodes\n1,S,K,2,4,3,3,1,1,1,150,450,"P;Q"\n' > "$OUT/modrep.bubbles.csv"
 "$BIN" call -i "$OUT/modrep.gfa" -c "$OUT/modrep.bubbles.csv" \
    --reference-path "grch38#0#chr1:1-1100" -o "$OUT/modrep" --cn --min-sv-bp 20 -q >/dev/null 2>&1
 MRV="$OUT/modrep.region.vcf"
@@ -827,6 +829,17 @@ mr_span=$(( $(inf END) - mr_pos ))
 [ "$(( mr_span - $(inf CN_MODULE_REF_BP) ))" = "100" ] \
   && ok "and the excess is exactly the boundary visits between the outermost ones (K+S=100)" \
   || bad "span excess $(( mr_span - $(inf CN_MODULE_REF_BP) )), expected 100"
+# With the boundary orientations each crossing is read on its own: the second copy is the reference's for
+# all, and the module record is the first copy's, one copy of 300 bp at 201..500 where h1 holds two. h2 keeps
+# half of the anchor there (P, not Q) and reads as no copy.
+printf 'bubble_id,source,source_orient,sink,sink_orient,inside_node_count,total_node_count,path_support,distinct_alleles,ref_allele_support,alt_allele_support_max,alt_allele_support_min,min_inside_bp,max_inside_bp,inside_nodes\n1,S,+,K,+,2,4,3,3,1,1,1,150,450,"P;Q"\n' > "$OUT/modrep_o.bubbles.csv"
+"$BIN" call -i "$OUT/modrep.gfa" -c "$OUT/modrep_o.bubbles.csv" \
+   --reference-path "grch38#0#chr1:1-1100" -o "$OUT/modrep_o" --cn --min-sv-bp 20 -q >/dev/null 2>&1
+check "a module in a site crossed twice, each copy read on its own (POS END REF_CN CN_SPAN_AMBIGUOUS | CN h1 h2 | records)" \
+  "$(awk -F'\t' '/^#CHROM/{for(i=10;i<=NF;i++){if($i=="h1#1#chr1")a=i; if($i=="h2#1#chr1")b=i}}
+       !/^#/ && $8 ~ /SVTYPE=CNV/{e=$8; sub(/^END=/,"",e); sub(/;.*/,"",e); r=$8; sub(/.*REF_CN=/,"",r); sub(/;.*/,"",r)
+         split($a,x,":"); split($b,y,":"); printf "%s %s %s %s | %s %s | ", $2, e, r, ($8 ~ /CN_SPAN_AMBIGUOUS/ ? "yes" : "no"), x[2], y[2]}
+       !/^#/{n++} END{print n}' "$OUT/modrep_o.region.vcf")" "200 500 1 no | 2 0 | 1"
 
 # A haplotype crossing the module sink to source opens its span on the sink. hrev passes S once upstream
 # (F S X), then walks G- K- (Q- P-)x2 S- F-: its first S comes before its K, and reading the direction from
@@ -839,7 +852,7 @@ mr_span=$(( $(inf END) - mr_pos ))
   printf 'P\tref#0#chr1:1-1000\tF+,S+,P+,Q+,P+,Q+,K+,G+\t*\n'
   printf 'P\threv#1#chr1\tF+,S+,X+,G-,K-,Q-,P-,Q-,P-,S-,F-\t*\n'
   printf 'P\thgain#1#chr1\tF+,S+,P+,Q+,P+,Q+,P+,Q+,K+,G+\t*\n'; } > "$OUT/modrev.gfa"
-printf '%s\n1,S,+,K,+,2,4,3,2,1,1,1,300,900,"P;Q"\n' "$(head -1 "$OUT/modrep.bubbles.csv")" > "$OUT/modrev.bubbles.csv"
+printf '%s\n1,S,+,K,+,2,4,3,2,1,1,1,300,900,"P;Q"\n' "$(head -1 "$OUT/modrep_o.bubbles.csv")" > "$OUT/modrev.bubbles.csv"
 "$BIN" call -i "$OUT/modrev.gfa" -c "$OUT/modrev.bubbles.csv" -r 'ref#0#chr1:1-1000' -o "$OUT/modrev" \
   --cn --no-per-bubble-vcf -q >/dev/null 2>&1
 MRV="$OUT/modrev.region.vcf"
@@ -1276,10 +1289,10 @@ printf '%s\n1,S,+,K,+,3,5,2,2,1,1,1,0,900,"P;Q;X"\n' "$MOD_HDR" > "$OUT/minv.bub
   || bad "CN-invariant module: expected no DUP record, got $(grep -v '^#' "$OUT/minv.region.vcf" | grep -o 'CN_METHOD=[A-Z_]*' | head -1)"
 
 # ---------------------------------------------------------------- a path crossing a bubble twice
-# htwice runs S A K, back to S, then S B K: three traversals (S..K, the direct K->S step, S..K). Its
-# walk is the widest source..sink interval, so it includes the first crossing and the K->S return:
-# the INS it yields is S,K,B rather than B. Not corrected, but every record of the bubble must say
-# so, in both VCFs; hdel traverses once.
+# htwice runs S A K, back to S, then S B K: three traversals (S..K, the direct K->S step, S..K). Read from a
+# site table without boundary orientations, its walk is the widest source..sink interval, so it includes the
+# first crossing and the K->S return: the INS it yields is S,K,B rather than B. Not corrected, but every record
+# of the bubble must say so, in both VCFs; hdel traverses once.
 { printf 'H\tVN:Z:1.0\n'
   printf 'S\tF\t%s\nS\tS\t%s\nS\tA\t%s\nS\tB\t%s\nS\tK\t%s\nS\tG\t%s\n' "$(rseq 500 61)" "$(rseq 40 62)" \
     "$(rseq 100 63)" "$(rseq 120 64)" "$(rseq 40 65)" "$(rseq 500 66)"
@@ -1288,7 +1301,8 @@ printf '%s\n1,S,+,K,+,3,5,2,2,1,1,1,0,900,"P;Q;X"\n' "$MOD_HDR" > "$OUT/minv.bub
   printf 'P\tref#0#chr1:1-1180\tF+,S+,A+,K+,G+\t*\n'
   printf 'P\thdel#1#chr1\tF+,S+,K+,G+\t*\n'
   printf 'P\thtwice#1#chr1\tF+,S+,A+,K+,S+,B+,K+,G+\t*\n'; } > "$OUT/mc.gfa"
-printf '%s\n1,S,+,K,+,2,4,3,3,1,1,1,0,120,"A;B"\n' "$MOD_HDR" > "$OUT/mc.bubbles.csv"
+MOD_HDR_NO_ORIENT='bubble_id,source,sink,inside_node_count,total_node_count,path_support,distinct_alleles,ref_allele_support,alt_allele_support_max,alt_allele_support_min,min_inside_bp,max_inside_bp,inside_nodes'
+printf '%s\n1,S,K,2,4,3,3,1,1,1,0,120,"A;B"\n' "$MOD_HDR_NO_ORIENT" > "$OUT/mc.bubbles.csv"
 mc_log=$("$BIN" call -i "$OUT/mc.gfa" -c "$OUT/mc.bubbles.csv" -r ref -o "$OUT/mc" 2>&1 >/dev/null)
 mc_n=$(grep -v '^#' "$OUT/mc.region.vcf" | wc -l | tr -d ' ')
 mc_f=$(grep -v '^#' "$OUT/mc.region.vcf" | grep -c 'MULTI_CROSSING=1[^0-9]')
@@ -1300,6 +1314,15 @@ mc_f=$(grep -v '^#' "$OUT/mc.region.vcf" | grep -c 'MULTI_CROSSING=1[^0-9]')
 ! grep -v '^#' "$VCF" | grep -q 'MULTI_CROSSING' \
   && ok "MULTI_CROSSING is absent where every path crosses once" \
   || bad "MULTI_CROSSING emitted on the single-crossing coordinate fixture"
+# With the orientations, htwice's crossings are matched to the reference's one by one, its first and last nodes
+# anchoring them: the first is the reference's, and the second, after K, is an insertion of S B K. No walk holds
+# two traversals, so nothing is flagged.
+printf '%s\n1,S,+,K,+,2,4,3,3,1,1,1,0,120,"A;B"\n' "$MOD_HDR" > "$OUT/mc_o.bubbles.csv"
+"$BIN" call -i "$OUT/mc.gfa" -c "$OUT/mc_o.bubbles.csv" -r ref -o "$OUT/mc_o" -q >/dev/null 2>&1
+check "a path crossing a bubble twice, crossings read one by one (SVTYPE:SVLEN:EVENT_NODES:GT hdel htwice | flagged)" \
+  "$(awk -F'\t' '!/^#/{t=$8; sub(/.*SVTYPE=/,"",t); sub(/;.*/,"",t); l=$8; sub(/.*SVLEN=/,"",l); sub(/;.*/,"",l)
+       e=$8; sub(/.*EVENT_NODES=/,"",e); sub(/;.*/,"",e); printf "%s:%s:%s:%s%s ", t, l, e, substr($11,1,1), substr($12,1,1)}' "$OUT/mc_o.region.vcf")|$(grep -v '^#' "$OUT/mc_o.region.vcf" | grep -c 'MULTI_CROSSING')" \
+  "DEL:-100:A:10 INS:200:K,S,B:01 |0"
 
 # ---------------------------------------------------------------- bubble reversed against the reference
 # The same graph called with its bubble row in reference order (fwd) and with source and sink swapped
@@ -1358,8 +1381,9 @@ mct_log=$("$BIN" call -i "$OUT/mct.gfa" -c "$OUT/mct.bubbles.csv" -r ref -o "$OU
   || bad "touch-only paths flagged: $(grep -v '^#' "$OUT/mct.region.vcf" | grep -o 'MULTI_CROSSING=[0-9]*' | head -1)"
 
 # Traversals are counted over the whole path, not only its walk. hback crosses S..K with A deleted,
-# leaves for X, and comes back K- A- S-: its walk is one crossing, the other lies outside it. hempty
-# crosses S..K twice with nothing between, leaving for X in between. Both are flagged; hdel is not.
+# leaves for X, and comes back K- A- S-: read without boundary orientations, its walk is one crossing, the other
+# lies outside it. hempty crosses S..K twice with nothing between, leaving for X in between. Both are flagged;
+# hdel is not.
 { printf 'H\tVN:Z:1.0\n'
   printf 'S\tF\t%s\nS\tS\t%s\nS\tA\t%s\nS\tK\t%s\nS\tX\t%s\nS\tG\t%s\n' "$(rseq 500 61)" "$(rseq 40 62)" \
     "$(rseq 100 63)" "$(rseq 40 65)" "$(rseq 80 67)" "$(rseq 500 66)"
@@ -1369,7 +1393,7 @@ mct_log=$("$BIN" call -i "$OUT/mct.gfa" -c "$OUT/mct.bubbles.csv" -r ref -o "$OU
   printf 'P\thdel#1#chr1\tF+,S+,K+,G+\t*\n'
   printf 'P\thback#1#chr1\tF+,S+,K+,X+,K-,A-,S-,G+\t*\n'
   printf 'P\themptyx#1#chr1\tF+,S+,K+,X+,S+,K+,G+\t*\n'; } > "$OUT/mcw.gfa"
-printf '%s\n1,S,+,K,+,1,3,4,2,1,3,3,0,100,"A"\n' "$MOD_HDR" > "$OUT/mcw.bubbles.csv"
+printf '%s\n1,S,K,1,3,4,2,1,3,3,0,100,"A"\n' "$MOD_HDR_NO_ORIENT" > "$OUT/mcw.bubbles.csv"
 mcw_log=$("$BIN" call -i "$OUT/mcw.gfa" -c "$OUT/mcw.bubbles.csv" -r ref -o "$OUT/mcw" 2>&1 >/dev/null)
 mcw_n=$(grep -v '^#' "$OUT/mcw.region.vcf" | wc -l | tr -d ' ')
 mcw_f=$(grep -v '^#' "$OUT/mcw.region.vcf" | grep -c 'MULTI_CROSSING=2[^0-9]')
@@ -1377,6 +1401,14 @@ mcw_f=$(grep -v '^#' "$OUT/mcw.region.vcf" | grep -c 'MULTI_CROSSING=2[^0-9]')
   && printf '%s\n' "$mcw_log" | grep -q 'paths crossing a site more than once: 2; sites: 1' \
   && ok "a second traversal outside the walk, and two empty traversals, flag MULTI_CROSSING=2 on all $mcw_n record(s)" \
   || bad "traversals outside the walk: $mcw_f of $mcw_n record(s) carry MULTI_CROSSING=2"
+# With the orientations each crossing is matched on its own: hback's first lacks A, and what follows it (X, then
+# S A K reversed) is an insertion before G; hempty lacks A, and X S after its first crossing is an insertion.
+printf '%s\n1,S,+,K,+,1,3,4,2,1,3,3,0,100,"A"\n' "$MOD_HDR" > "$OUT/mcw_o.bubbles.csv"
+"$BIN" call -i "$OUT/mcw.gfa" -c "$OUT/mcw_o.bubbles.csv" -r ref -o "$OUT/mcw_o" -q >/dev/null 2>&1
+check "traversals read one by one (SVTYPE:SVLEN:EVENT_NODES:GT hdel hback hempty | flagged)" \
+  "$(awk -F'\t' '!/^#/{t=$8; sub(/.*SVTYPE=/,"",t); sub(/;.*/,"",t); l=$8; sub(/.*SVLEN=/,"",l); sub(/;.*/,"",l)
+       e=$8; sub(/.*EVENT_NODES=/,"",e); sub(/;.*/,"",e); printf "%s:%s:%s:%s%s%s ", t, l, e, substr($11,1,1), substr($12,1,1), substr($13,1,1)}' "$OUT/mcw_o.region.vcf")|$(grep -v '^#' "$OUT/mcw_o.region.vcf" | grep -c 'MULTI_CROSSING')" \
+  "DEL:-100:A:111 INS:160:K,X,S:001 INS:260:K,X,A,S:010 |0"
 
 # ---------------------------------------------------------------- orientation from the reference walk
 # The reference meets the sink K once upstream (a repeat copy), then crosses the bubble S..K forward:
@@ -2332,15 +2364,22 @@ PCC="$(cd "$(dirname "$0")/.." && pwd)/synthetic_data/panphorte_cases"
 check "two rotations of one motif at one site are one unit (CN per haplotype | CNV records)" \
   "$(ug_cn "$OUT/rot_c.region.vcf")|$(grep -v '^#' "$OUT/rot_c.region.vcf" | grep -c 'SVTYPE=CNV')" "ref 2 h1 2 h2 3 hX 2 |1"
 
-# A site every path crosses twice, the second time inverted: the scored walk holds the first crossing only.
-# h2's 100 bp deletion is in the second, so no record can describe it; it is counted and flagged
-# (MULTI_CROSSING_UNSCORED) rather than lost silently. h1's, in the first crossing, is called.
+# A site every path crosses twice, the second time inverted. Read from a table without boundary orientations,
+# the scored walk holds the first crossing only: h2's 100 bp deletion is in the second, so no record can describe
+# it; it is counted and flagged (MULTI_CROSSING_UNSCORED) rather than lost silently. h1's, in the first, is called.
 BC="$(cd "$(dirname "$0")/.." && pwd)/synthetic_data/bubble_cases"
-"$BIN" call -i "$BC/inverted_second_crossing.gfa" -c "$BC/inverted_second_crossing.csv" -r ref -o "$OUT/isc" \
+cut -d, -f1,2,4,6- "$BC/inverted_second_crossing.csv" > "$OUT/isc_no_orient.csv"
+"$BIN" call -i "$BC/inverted_second_crossing.gfa" -c "$OUT/isc_no_orient.csv" -r ref -o "$OUT/isc" \
   --no-per-bubble-vcf > /dev/null 2> "$OUT/isc.err"
 check "twice-crossed site: an SV-sized change outside the scored walk is flagged (UNSCORED | warning | DEL AC)" \
   "$(grep -o 'MULTI_CROSSING_UNSCORED=[0-9]*' "$OUT/isc.region.vcf" | sort -u | tr '\n' ' ')|$(grep -c 'MULTI_CROSSING_UNSCORED' "$OUT/isc.err")|$(grep -v '^#' "$OUT/isc.region.vcf" | grep -o 'SVTYPE=DEL;SVLEN=-100' | wc -l | tr -d ' ')" \
   "MULTI_CROSSING_UNSCORED=1 |1|1"
+# With the orientations each copy is read on its own, and both deletions are written, each at its copy.
+"$BIN" call -i "$BC/inverted_second_crossing.gfa" -c "$BC/inverted_second_crossing.csv" -r ref -o "$OUT/isc_o" \
+  --no-per-bubble-vcf > /dev/null 2> "$OUT/isc_o.err"
+check "twice-crossed site, each copy read on its own: both deletions written (POS:SVLEN:GT h0 h1 h2 | UNSCORED)" \
+  "$(awk -F'\t' '!/^#/{l=$8; sub(/.*SVLEN=/,"",l); sub(/;.*/,"",l); printf "%s:%s:%s%s%s ", $2, l, substr($11,1,1), substr($12,1,1), substr($13,1,1)}' "$OUT/isc_o.region.vcf")|$(grep -c 'MULTI_CROSSING_UNSCORED' "$OUT/isc_o.err")" \
+  "640:-100:010 1520:-100:001 |0"
 
 # hapA duplicates X Y, hapB Y Z, one carrier each: two different tandem duplications, two INS records,
 # the same whichever path comes first. (The PEAK route labelled one record by a gaining allele's busiest
@@ -4035,12 +4074,14 @@ check "repeat site: the same tags with --diploid" "$(site_tags "$OUT/rsite/d.reg
 check "repeat site: the mixed sites are counted in the log" "$(grep -c '2 repeat site(s) left untagged' "$OUT/rsite/v.log")" "1"
 check "repeat site: SITE and SITE_N in the header" "$(grep -c '^##INFO=<ID=SITE\(_N\)\?,' "$OUT/rsite/v.region.vcf")" "2"
 
-# Sites the reference crosses twice: each site's walk spans the stretch between the copies, so an insertion there
-# (and the second site's allele, inside the first site's walk) is seen by both sites. Each is written once: the
-# second site's allele at the second site, whose nodes it is made of, and the insertion, on neither site's nodes,
-# at the first. The node and carrier tables hold no row for a record left out.
+# Sites the reference crosses twice, read from a table without boundary orientations: each site's walk spans the
+# stretch between the copies, so an insertion there (and the second site's allele, inside the first site's walk)
+# is seen by both sites. Each is written once: the second site's allele at the second site, whose nodes it is made
+# of, and the insertion, on neither site's nodes, at the first. The node and carrier tables hold no row for a
+# record left out.
 python3 -I "$TOOLS/spec_gfa.py" "$(cd "$(dirname "$0")/.." && pwd)/synthetic_data/call_cases/doubly_crossed.spec" "$OUT/dcross"
-"$BIN" call -i "$OUT/dcross/g.gfa" -c "$OUT/dcross/g.bubbles.csv" -r 'ref#0#chr1:1-1600' -o "$OUT/dcross/v" \
+cut -d, -f1,2,4,6- "$OUT/dcross/g.bubbles.csv" > "$OUT/dcross/no_orient.csv"
+"$BIN" call -i "$OUT/dcross/g.gfa" -c "$OUT/dcross/no_orient.csv" -r 'ref#0#chr1:1-1600' -o "$OUT/dcross/v" \
   --no-per-bubble-vcf -q > "$OUT/dcross/v.log" 2>&1
 check "doubly crossed sites: each event written once (POS:SVTYPE:SVLEN:ID)" \
   "$(awk -F'\t' '!/^#/{n=split($8,f,";"); t=""; l=""; for(i=1;i<=n;i++){ if(f[i] ~ /^SVTYPE=/) t=substr(f[i],8); if(f[i] ~ /^SVLEN=/) l=substr(f[i],7)} printf "%s:%s:%s:%s ", $2, t, l, $3}' "$OUT/dcross/v.region.vcf")" \
@@ -4049,6 +4090,13 @@ check "doubly crossed sites: the record kept is the one listing the event's node
   "$(awk -F'\t' '$1 ~ /_SUB_E$/{printf "%s %s %s %s ", $1, $2, $3, $4}' "$OUT/dcross/v.variant_nodes.tsv")" "bubble2_SUB_E 2 SUB E,E2 "
 check "doubly crossed sites: no node or carrier row for a record left out" \
   "$(cat "$OUT/dcross/v.variant_nodes.tsv" "$OUT/dcross/v.carrier_events.tsv" | awk -F'\t' '$1 == "bubble1_SUB_E" || $1 == "bubble2_INS_I"' | wc -l | tr -d ' ')" "0"
+# With the orientations each copy is read on its own, and the stretch between them where i* differ is read once,
+# under the site before it: the same records, nothing to leave out.
+"$BIN" call -i "$OUT/dcross/g.gfa" -c "$OUT/dcross/g.bubbles.csv" -r 'ref#0#chr1:1-1600' -o "$OUT/dcross/o" \
+  --no-per-bubble-vcf > "$OUT/dcross/o.log" 2>&1
+check "doubly crossed sites, each copy read on its own (POS:SVTYPE:SVLEN:ID | records left out)" \
+  "$(awk -F'\t' '!/^#/{n=split($8,f,";"); t=""; l=""; for(i=1;i<=n;i++){ if(f[i] ~ /^SVTYPE=/) t=substr(f[i],8); if(f[i] ~ /^SVLEN=/) l=substr(f[i],7)} printf "%s:%s:%s:%s ", $2, t, l, $3}' "$OUT/dcross/o.region.vcf")|$(grep -c 'repeating another record' "$OUT/dcross/o.log")" \
+  "260:SUB:0:bubble1_SUB_B 380:SUB:0:bubble2_SUB_E 800:INS:120:bubble2_INS_I |0"
 
 # A module between the two crossings of a doubly crossed site: htest's deletion holds its copy change, and both
 # sites see it. Left out at one of them as a repeat, it is still written, so htest reads REF_CN on the module's
@@ -4061,6 +4109,31 @@ check "module between a doubly crossed site's copies: htest's deletion written o
        !/^#/ && $8 ~ /SVTYPE=DEL;/ {split($c,g,":"); if (g[1]=="1") n++}
        !/^#/ && $3 ~ /^bubble2_CNV/ {split($c,g,":"); cn=g[1]":"g[2]}
        END{print n+0, cn}' "$OUT/mdc/v.region.vcf")" "1 0:2"
+
+# Sites the reference crosses twice, the second copy inverted: each copy is read on its own. i1's insertion lies in
+# the first copy, d2's deletion in the second; l1 holds the first copy only and lacks the stretch from it to F9, one
+# deletion, and has no allele at the second copy. Each written once, and the rebuild leaves nothing.
+SPEC_DIR="$(cd "$(dirname "$0")/.." && pwd)/synthetic_data/call_cases"
+copy_records() { # POS:SVTYPE:SVLEN:GT per record, GT over the haplotypes after the reference, in column order
+  awk -F'\t' '!/^#/{n=split($8,f,";"); t=""; l=""; for(i=1;i<=n;i++){ if(f[i] ~ /^SVTYPE=/) t=substr(f[i],8); if(f[i] ~ /^SVLEN=/) l=substr(f[i],7)}
+    g=""; for(i=11;i<=NF;i++) g=g substr($i,1,1); printf "%s:%s:%s:%s ", $2, t, l, g}' "$1"; }
+python3 -I "$TOOLS/spec_gfa.py" "$SPEC_DIR/inverted_copies.spec" "$OUT/invc"
+"$BIN" call -i "$OUT/invc/g.gfa" -c "$OUT/invc/g.bubbles.csv" -r 'ref#0#chr1:1-1570' -o "$OUT/invc/v" \
+  --no-per-bubble-vcf -q > "$OUT/invc/v.log" 2>&1
+check "inverted copies: each copy read on its own, the lost copy once (POS:SVTYPE:SVLEN:GT r1 i1 d2 l1 y1)" \
+  "$(copy_records "$OUT/invc/v.region.vcf")" "480:INS:70:01000 580:DEL:-530:00010 930:DEL:-80:001.0 1410:DEL:-60:00001 "
+"$BIN" benchmark -i "$OUT/invc/g.gfa" -c "$OUT/invc/g.bubbles.csv" -r 'ref#0#chr1:1-1570' --calls "$OUT/invc/v" \
+  -o "$OUT/invc/b" -q > "$OUT/invc/b.log" 2>&1
+check "inverted copies: the records rebuild every haplotype (bp left by call's events:by the VCF)" \
+  "$(awk -F'\t' '$1=="large_left_call_bp"{c=$2} $1=="large_left_vcf_bp"{v=$2} END{print c":"v}' "$OUT/invc/b.summary.tsv")" "0:0"
+
+# A copy gained right after the one the reference holds, with I in it (g1, g2): one insertion of the whole copy, I
+# included, rather than one per site. g2's deletion of X in its first copy is a change of that copy, of its own.
+python3 -I "$TOOLS/spec_gfa.py" "$SPEC_DIR/tandem_gain.spec" "$OUT/tgain"
+"$BIN" call -i "$OUT/tgain/g.gfa" -c "$OUT/tgain/g.bubbles.csv" -r 'ref#0#chr1:1-780' -o "$OUT/tgain/v" \
+  --no-per-bubble-vcf -q > "$OUT/tgain/v.log" 2>&1
+check "tandem gain: the copy inserted once, a change in the other copy of its own (POS:SVTYPE:SVLEN:GT r1 g1 g2)" \
+  "$(copy_records "$OUT/tgain/v.region.vcf")" "299:DEL:-80:001 480:INS:450:011 "
 
 printf "\n"
 if [ "$fails" -eq 0 ]; then printf "call_stats: all assertions passed\n"; exit 0; fi

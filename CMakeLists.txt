@@ -242,6 +242,7 @@ add_library(panvarlib
     src/bubble_alleles.cpp
     src/syncmer.cpp
     src/bubble_path.cpp
+    src/copy_sites.cpp
     src/bubbles.cpp
     src/ref_path.cpp
     src/gtf.cpp

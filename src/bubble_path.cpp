@@ -173,6 +173,22 @@ std::vector<PathStep> canonical_bubble_path_steps(
 std::optional<std::vector<PathStep>> bubble_steps(
     const PathRecord& path, const BubblePathIndex& index, const Bubble& bubble,
     BubblePathInterval* used_interval, std::vector<std::size_t>* used_step_indices, bool inward_only) {
+    if (bubble.windows) {
+        // A window given for this path; one read from the reference has no steps of this path to index.
+        const auto it = bubble.windows->find(&path);
+        if (it == bubble.windows->end()) return std::nullopt;
+        const PathWindow& w = it->second;
+        const BubblePathInterval iv{w.first, w.last, 0, w.forward};
+        std::vector<std::size_t> idx;
+        std::vector<PathStep> s = canonical_bubble_path_steps(*w.from, bubble, iv, &idx);
+        if (s.empty()) return std::nullopt;
+        if (used_interval != nullptr) *used_interval = iv;
+        if (used_step_indices != nullptr) {
+            if (w.from == &path) *used_step_indices = std::move(idx);
+            else used_step_indices->clear();
+        }
+        return s;
+    }
     // With `inward_only`, a window must leave its first boundary and reach its last through the inward sides:
     // a walk into the site that turns back and reaches the far boundary from outside does not cross it.
     const auto inward = [&](const BubblePathInterval& w) {
@@ -257,6 +273,12 @@ std::optional<std::vector<PathStep>> bubble_steps(
 std::vector<BubblePathInterval> bubble_crossings(const PathRecord& path, const BubblePathIndex& index,
                                                  const Bubble& bubble, bool fallback) {
     std::vector<BubblePathInterval> out;
+    if (bubble.windows) {
+        const auto it = bubble.windows->find(&path);
+        if (it != bubble.windows->end() && it->second.from == &path)
+            out.push_back(BubblePathInterval{it->second.first, it->second.last, 0, it->second.forward});
+        return out;
+    }
     const auto si = index.positions.find(bubble.source);
     const auto ki = index.positions.find(bubble.sink);
     // A table without orientations gives none to test: its default would pick crossings at random.
