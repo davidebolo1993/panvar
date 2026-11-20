@@ -354,6 +354,9 @@ int run_call_command(const std::vector<std::string>& args) {
         log.info("paths crossing a site more than once: " + std::to_string(summary.multi_crossing_paths) +
                  "; sites: " + std::to_string(summary.multi_crossing_bubbles) + " (records flagged MULTI_CROSSING)");
     }
+    if (summary.duplicate_records_dropped > 0)
+        log.info("records repeating another record's event and genotypes, not written: " +
+                 std::to_string(summary.duplicate_records_dropped));
     if (summary.diploid_records_dropped > 0)
         log.info("--diploid: records with no sample carrier, not written: " +
                  std::to_string(summary.diploid_records_dropped));

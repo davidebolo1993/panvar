@@ -80,6 +80,9 @@ struct VariantCallSummary {
     // --diploid: records not written because no sample column carries an alternate (every carrier's slot is
     // a haplotype whose contigs disagree at the site).
     std::size_t diploid_records_dropped = 0;
+    // Records not written because another record holds the same event, alleles and genotypes (two sites
+    // whose walks both span it).
+    std::size_t duplicate_records_dropped = 0;
     // Repeat sites (INFO/SITE): sites tagged and their records, and sites left untagged because a haplotype
     // carries two of their records.
     std::size_t repeat_sites = 0;

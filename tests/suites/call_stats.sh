@@ -4035,6 +4035,33 @@ check "repeat site: the same tags with --diploid" "$(site_tags "$OUT/rsite/d.reg
 check "repeat site: the mixed sites are counted in the log" "$(grep -c '2 repeat site(s) left untagged' "$OUT/rsite/v.log")" "1"
 check "repeat site: SITE and SITE_N in the header" "$(grep -c '^##INFO=<ID=SITE\(_N\)\?,' "$OUT/rsite/v.region.vcf")" "2"
 
+# Sites the reference crosses twice: each site's walk spans the stretch between the copies, so an insertion there
+# (and the second site's allele, inside the first site's walk) is seen by both sites. Each is written once: the
+# second site's allele at the second site, whose nodes it is made of, and the insertion, on neither site's nodes,
+# at the first. The node and carrier tables hold no row for a record left out.
+python3 -I "$TOOLS/spec_gfa.py" "$(cd "$(dirname "$0")/.." && pwd)/synthetic_data/call_cases/doubly_crossed.spec" "$OUT/dcross"
+"$BIN" call -i "$OUT/dcross/g.gfa" -c "$OUT/dcross/g.bubbles.csv" -r 'ref#0#chr1:1-1600' -o "$OUT/dcross/v" \
+  --no-per-bubble-vcf -q > "$OUT/dcross/v.log" 2>&1
+check "doubly crossed sites: each event written once (POS:SVTYPE:SVLEN:ID)" \
+  "$(awk -F'\t' '!/^#/{n=split($8,f,";"); t=""; l=""; for(i=1;i<=n;i++){ if(f[i] ~ /^SVTYPE=/) t=substr(f[i],8); if(f[i] ~ /^SVLEN=/) l=substr(f[i],7)} printf "%s:%s:%s:%s ", $2, t, l, $3}' "$OUT/dcross/v.region.vcf")" \
+  "260:SUB:0:bubble1_SUB_B 380:SUB:0:bubble2_SUB_E 800:INS:120:bubble1_INS_I "
+check "doubly crossed sites: the record kept is the one listing the event's nodes (id site type nodes)" \
+  "$(awk -F'\t' '$1 ~ /_SUB_E$/{printf "%s %s %s %s ", $1, $2, $3, $4}' "$OUT/dcross/v.variant_nodes.tsv")" "bubble2_SUB_E 2 SUB E,E2 "
+check "doubly crossed sites: no node or carrier row for a record left out" \
+  "$(cat "$OUT/dcross/v.variant_nodes.tsv" "$OUT/dcross/v.carrier_events.tsv" | awk -F'\t' '$1 == "bubble1_SUB_E" || $1 == "bubble2_INS_I"' | wc -l | tr -d ' ')" "0"
+
+# A module between the two crossings of a doubly crossed site: htest's deletion holds its copy change, and both
+# sites see it. Left out at one of them as a repeat, it is still written, so htest reads REF_CN on the module's
+# record as it does when the deletion is written at both.
+python3 -I "$TOOLS/spec_gfa.py" "$(cd "$(dirname "$0")/.." && pwd)/synthetic_data/call_cases/module_in_doubly_crossed.spec" "$OUT/mdc"
+"$BIN" call -i "$OUT/mdc/g.gfa" -c "$OUT/mdc/g.bubbles.csv" -r 'ref#0#chr1:1-5580' -o "$OUT/mdc/v" --cn \
+  --no-per-bubble-vcf -q > "$OUT/mdc/v.log" 2>&1
+check "module between a doubly crossed site's copies: htest's deletion written once, REF_CN kept (DEL records with htest, module GT:CN)" \
+  "$(awk -F'\t' '/^#CHROM/{for(i=10;i<=NF;i++) if($i=="htest#1#chr1") c=i}
+       !/^#/ && $8 ~ /SVTYPE=DEL;/ {split($c,g,":"); if (g[1]=="1") n++}
+       !/^#/ && $3 ~ /^bubble2_CNV/ {split($c,g,":"); cn=g[1]":"g[2]}
+       END{print n+0, cn}' "$OUT/mdc/v.region.vcf")" "1 0:2"
+
 printf "\n"
 if [ "$fails" -eq 0 ]; then printf "call_stats: all assertions passed\n"; exit 0; fi
 # repeated last, shortened: a long output can be cut in the middle by ctest

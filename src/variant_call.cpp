@@ -5826,12 +5826,89 @@ void call_variants(
                          if (a.end != b.end) return a.end < b.end;
                          return a.id < b.id;
                      });
-    // A record is not written when no sample column carries it (--diploid), or when its written AF is under
-    // --min-alt-af. Found once, before the outputs are listed, so the per-site files, the
-    // node and carrier tables and the run's counts all leave it out.
-    if (options.diploid || options.min_maf > 0.0) {
-        std::unordered_set<std::string> dropped;
+    // A record written twice: two sites whose walks both span one event (a path crossing a site more than
+    // once is read from its first crossing to its last, taking in what lies between) write the same
+    // position, alleles, sequence and genotypes under two ids. It is written once, at the site holding most of
+    // the event's nodes (EVENT_NODES lists a site's own nodes only), so the record, its node row and its
+    // per-site file stay with the site the event lies in; on a tie, under the first id in coordinate order.
+    // Copy-number records are left alone, as their counts are per site.
+    std::unordered_set<std::string> duplicate_ids;
+    // a record left out as a repeat -> the record written for it
+    std::unordered_map<std::string, std::string> written_as;
+    {
+        // `own_nodes` receives how many nodes the record lists in EVENT_NODES
+        const auto same_event_key = [](const OutRecord& r, std::size_t& own_nodes) {
+            own_nodes = 0;
+            std::vector<std::string> cols;
+            std::string line = r.line;
+            if (!line.empty() && line.back() == '\n') line.pop_back();
+            for (std::size_t a = 0;;) {
+                const std::size_t b = line.find('\t', a);
+                cols.push_back(line.substr(a, b == std::string::npos ? std::string::npos : b - a));
+                if (b == std::string::npos) break;
+                a = b + 1;
+            }
+            if (cols.size() < 8) return std::string();
+            // INFO without the fields that name the site or say how the event was found there
+            std::string info;
+            for (std::size_t p = 0; p <= cols[7].size();) {
+                const std::size_t q = std::min(cols[7].find(';', p), cols[7].size());
+                const std::string f = cols[7].substr(p, q - p);
+                const std::string k = f.substr(0, f.find('='));
+                if (f == "SVTYPE=CNV") return std::string();
+                if (k == "EVENT_NODES" && f.size() > k.size() + 1)
+                    own_nodes = 1 + static_cast<std::size_t>(std::count(f.begin(), f.end(), ','));
+                if (k != "BUBBLE_ID" && k != "EVENT_NODES" && k != "MULTI_CROSSING" && k != "MULTI_CROSSING_UNSCORED" &&
+                    k != "MERGE_MIN_SIM" && k != "MERGE_TEST" && k != "SEQ_FA")
+                    info += f + ';';
+                p = q + 1;
+            }
+            std::string key = cols[0] + '\t' + cols[1] + '\t' + cols[3] + '\t' + cols[4] + '\t' + info;
+            for (const auto& [name, seq] : r.fa_seqs) key += '\t' + name + '=' + seq;
+            for (std::size_t c = 8; c < cols.size(); ++c) key += '\t' + cols[c];
+            return key;
+        };
+        // The records of each key, in output order, with their own nodes.
+        std::unordered_map<std::string, std::size_t> group_of;
+        std::vector<std::vector<std::pair<std::size_t, std::size_t>>> groups;   // (record, own nodes)
+        for (std::size_t i = 0; i < out_records.size(); ++i) {
+            std::size_t own = 0;
+            std::string key = same_event_key(out_records[i], own);
+            if (key.empty()) continue;
+            const std::size_t g = group_of.emplace(std::move(key), groups.size()).first->second;
+            if (g == groups.size()) groups.emplace_back();
+            groups[g].emplace_back(i, own);
+        }
+        for (const auto& g : groups) {
+            if (g.size() < 2) continue;
+            std::size_t keep = 0;
+            for (std::size_t m = 1; m < g.size(); ++m)
+                if (g[m].second > g[keep].second) keep = m;
+            for (std::size_t m = 0; m < g.size(); ++m) {
+                if (m == keep) continue;
+                duplicate_ids.insert(out_records[g[m].first].id);
+                written_as.emplace(out_records[g[m].first].id, out_records[g[keep].first].id);
+            }
+        }
+        summary.duplicate_records_dropped = duplicate_ids.size();
+    }
+    // A record is not written when no sample column carries it (--diploid), when its written AF is under
+    // --min-alt-af, or when it repeats another record. Found once, before the outputs are listed, so the
+    // per-site files, the node and carrier tables and the run's counts all leave it out.
+    if (options.diploid || options.min_maf > 0.0 || !duplicate_ids.empty()) {
+        std::unordered_set<std::string> dropped = duplicate_ids;
+        out_records.erase(std::remove_if(out_records.begin(), out_records.end(), [&](const OutRecord& r) {
+            if (!dropped.count(r.id)) return false;
+            summary.unaligned_missing -= r.unaligned_missing;
+            summary.covered_missing -= r.covered_missing;
+            return true;
+        }), out_records.end());
         std::size_t no_column = 0;
+        // A record left out as a repeat still holds its change, in the record written for it.
+        const auto gone = [&](const std::string& id) {
+            const auto w = written_as.find(id);
+            return dropped.count(w == written_as.end() ? id : w->second) != 0;
+        };
         // A module sample read as REF_CN because a dropped record held its change takes its measured CN. That
         // changes the line it is written with, and with --diploid can make a slot's contigs agree, which adds
         // to AN: the records are tested again until none is dropped (each restoration happens once).
@@ -5848,7 +5925,7 @@ void call_variants(
             again = false;
             for (OutRecord& r : out_records) {
                 const std::string before = r.line;
-                apply_measured_cn(r, [&](const std::string& id) { return dropped.count(id) != 0; });
+                apply_measured_cn(r, gone);
                 if (r.line != before) again = true;
             }
         }
