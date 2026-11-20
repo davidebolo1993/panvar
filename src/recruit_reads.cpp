@@ -1,5 +1,7 @@
 #include "panvar/recruit_reads.hpp"
 
+#include "panvar/cli_utils.hpp"
+
 #include "panvar/flat_map.hpp"
 #include "panvar/kmer.hpp"
 #include "panvar/read_input.hpp"
@@ -290,10 +292,13 @@ ReadStats recruit_reads(const ReadOptions& options) {
     io.log = o.log;
     std::size_t next_input = 0;
     std::unique_ptr<FragmentSource> source;
+    std::unique_ptr<cli::ProgressBar> input_bar;   // how far through the current input
     ReadStats st;
     std::vector<std::pair<std::string, InputStats>> input_stats;
     auto close_source = [&] {
         if (!source) return;
+        if (input_bar) input_bar->done();
+        input_bar.reset();
         const InputStats& s = source->stats();
         st.fragments += s.unscreened + s.dropped;   // passed over before scoring, unscreened
         input_stats.emplace_back(source->describe(), s);
@@ -339,11 +344,16 @@ ReadStats recruit_reads(const ReadOptions& options) {
                 const auto& [a, b] = o.inputs[next_input++];
                 source = b.empty() ? open_input(a, io) : open_fastq_pair(a, b);
                 checked_input = false;
+                if (o.log && source->progress_total() > 0)
+                    input_bar = std::make_unique<cli::ProgressBar>(
+                        cli::log_prefix("recruit") + "reading input" + (o.inputs.size() > 1 ? " " + std::to_string(next_input) + " of " + std::to_string(o.inputs.size()) : std::string()),
+                        source->progress_total(), source->progress_in_bases() ? cli::ProgressBar::Unit::bases : cli::ProgressBar::Unit::bytes);
             }
             if (source->next(part, std::min(kBatchStep, kBatch - batch.size())) == 0) {
                 close_source();
                 continue;
             }
+            if (input_bar) input_bar->set(source->progress_done());
             if (!checked_input) check_type(part);
             for (auto& f : part) {
                 bytes += f.seq1.size() + f.qual1.size() + f.seq2.size() + f.qual2.size();

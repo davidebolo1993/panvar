@@ -3,6 +3,7 @@
 #include "panvar/anchors.hpp"
 #include "panvar/background.hpp"
 #include "panvar/background_graph.hpp"
+#include "panvar/cli_utils.hpp"
 #include "panvar/fasta_index.hpp"
 #include "panvar/flat_map.hpp"
 #include "panvar/gfa.hpp"
@@ -54,6 +55,11 @@ constexpr double kPieceDensity = 0.95;
 // A stretch is next to a located copy, or to another piece, when at most this many bases lie between them:
 // less than a window of other sequence, as where an array's density dips
 constexpr std::uint64_t kPieceGap = kPieceWindow;
+// So a genome indexed for reading by interval is read only where a piece can be: around each located copy and
+// at each contig's ends, this many bases at first, widened while a piece comes within the margin of a part's
+// edge (closer, a window or a neighbouring piece past the edge could still change it)
+constexpr std::uint64_t kPiecePad = 8 * kPieceWindow;
+constexpr std::uint64_t kPieceMargin = kPieceGap + 3 * kPieceWindow;
 // The piece scan looks up every kPieceSample-th k-mer start first: a window of kPieceWindow starts holding a share
 // kPieceDensity of the locus's has, at worst, all its misses on sampled starts, and still that many sampled hits
 constexpr std::uint64_t kPieceSample = 8;
@@ -563,6 +569,9 @@ std::vector<LocusIndex> build(const BuildOptions& o) {
     // 1-3: each locus's k-mers, their background counts, their copies in every genome
     std::vector<LocusWork> work(o.loci.size());
     std::vector<std::unique_ptr<Graph>> graphs(o.loci.size());
+    // progress bars when the run logs (not --quiet)
+    auto bar_label = [&](const std::string& what) { return o.log ? cli::log_prefix("recruit") + what : std::string(); };
+    cli::ProgressBar locate_bar(bar_label("locating loci"), o.loci.size());
     parallel_for(o.loci.size(), threads, [&](std::size_t li) {
         LocusWork& w = work[li];
         LocusIndex& x = w.idx;
@@ -621,7 +630,9 @@ std::vector<LocusIndex> build(const BuildOptions& o) {
         w.spans[cref] = {self};
         log("locus: " + x.name + "; k-mers: " + std::to_string(x.codes.size()) + "; paths: " + std::to_string(x.paths) + "; interval: " + x.contig + ":" +
             std::to_string(x.start) + "-" + std::to_string(x.end) + "; located in genomes: " + std::to_string(w.spans.size()));
+        locate_bar.tick();
     });
+    locate_bar.done();
 
     // subtraction: read every span from its genome (genomes in parallel, every locus at once; what each finds is
     // applied in genome order, so the index does not depend on the threads)
@@ -653,6 +664,7 @@ std::vector<LocusIndex> build(const BuildOptions& o) {
             r = Subtracted{};
         }
     };
+    cli::ProgressBar cut_bar(bar_label("reading the copies from genomes"), gnames.size());
     parallel_for(gnames.size(), threads, [&](std::size_t gi) {
         const std::string& gname = gnames[gi];
         const bg::Genome& ge = genomes.at(gname);
@@ -744,7 +756,9 @@ std::vector<LocusIndex> build(const BuildOptions& o) {
             sp.inner_end = hi;
         }
         done();
+        cut_bar.tick();
     });
+    cut_bar.done();
     apply_ready();
 
     // pieces: a genome whose copy of a locus is broken (a copy reaching a contig end, more than one copy, or
@@ -824,10 +838,14 @@ std::vector<LocusIndex> build(const BuildOptions& o) {
             std::vector<std::pair<std::uint32_t, std::uint32_t>> off, ends;   // (locus, k-mer): off the copies / in an uncertain end
             std::vector<std::pair<std::size_t, GenomeSpan>> pieces;
         };
-        auto scan = [&](const std::string& gname, const std::string& name, const std::string& seq, const std::vector<char>& here,
-                        std::size_t inner, Found& f) {
+        // `seq` is [offset, offset + seq.size()) of a contig `len` bases long. A scan of part of a contig sets grow[0]
+        // (grow[1]) when a piece reaches within kPieceMargin of the part's start (end) inside the contig: the part
+        // must be widened there and scanned again
+        auto scan = [&](const std::string& gname, const std::string& name, const std::string& seq, std::uint64_t offset,
+                        std::uint64_t len, const std::vector<char>& here, std::size_t inner, Found& f, char* grow) {
             if (seq.size() < kK) return;
-            const bool whole_only = seq.size() < kPieceWindow + kK - 1;   // no window fits
+            const bool whole_only = len < kPieceWindow + kK - 1;   // no window fits
+            const bool at_start = offset == 0, at_end = offset + seq.size() == len;
             // each locus's k-mer starts on the contig, in order: ranges scanned in parallel, joined in order. On a
             // contig longer than a window, only every kPieceSample-th start is looked up first; a dense window
             // (need of kPieceWindow starts) keeps at least sampled_need of its sampled starts, so only around
@@ -896,12 +914,12 @@ std::vector<LocusIndex> build(const BuildOptions& o) {
                     // their contig ends
                     if (!dense.empty()) {
                         auto& first = dense.front();
-                        if (first.first > 0 && first.first < kPieceWindow) {
+                        if (at_start && first.first > 0 && first.first < kPieceWindow) {
                             const std::size_t n = static_cast<std::size_t>(std::lower_bound(hits.begin(), hits.end(), first.first) - hits.begin());
                             if (2 * n >= first.first) first.first = 0;
                         }
                         auto& last = dense.back();
-                        if (last.second < seq.size() && seq.size() - last.second < kPieceWindow) {
+                        if (at_end && last.second < seq.size() && seq.size() - last.second < kPieceWindow) {
                             const std::uint64_t from = last.second - kK + 1;   // the first start past the stretch's last k-mer
                             const std::size_t n = static_cast<std::size_t>(hits.end() - std::upper_bound(hits.begin(), hits.end(), last.second - kK));
                             if (2 * n >= starts - from) last.second = seq.size();
@@ -917,10 +935,11 @@ std::vector<LocusIndex> build(const BuildOptions& o) {
                 // such stretches (an array running past the copy's end). One apart from every copy with other
                 // sequence on both sides may be a paralog the coordinate reference lacks, even on a copy's
                 // contig, which can hold a whole chromosome: it stays outside (shared, never falsely private).
+                for (auto& d : dense) { d.first += offset; d.second += offset; }   // contig coordinates from here
                 std::vector<char> tied(dense.size(), 0);
                 for (std::size_t si = 0; si < dense.size(); ++si) {
                     const std::uint64_t a = dense[si].first, b = dense[si].second;
-                    tied[si] = a == 0 || b == seq.size() || std::any_of(own.begin(), own.end(), [&](const anchors::Span* sp) {
+                    tied[si] = a == 0 || b == len || std::any_of(own.begin(), own.end(), [&](const anchors::Span* sp) {
                         return a <= sp->end + kPieceGap && sp->start <= b + kPieceGap;
                     });
                 }
@@ -929,6 +948,11 @@ std::vector<LocusIndex> build(const BuildOptions& o) {
                     if (tied[si - 1] && dense[si].first <= dense[si - 1].second + kPieceGap) tied[si] = 1;
                 for (std::size_t si = dense.size(); si-- > 1;)
                     if (tied[si] && dense[si].first <= dense[si - 1].second + kPieceGap) tied[si - 1] = 1;
+                for (std::size_t si = 0; si < dense.size(); ++si) {
+                    if (!tied[si] || grow == nullptr) continue;
+                    if (!at_start && dense[si].first < offset + kPieceMargin) grow[0] = 1;
+                    if (!at_end && dense[si].second + kPieceMargin > offset + seq.size()) grow[1] = 1;
+                }
                 for (std::size_t si = 0; si < dense.size(); ++si) {
                     if (!tied[si]) continue;
                     const std::uint64_t a = dense[si].first, b = dense[si].second;
@@ -945,7 +969,7 @@ std::vector<LocusIndex> build(const BuildOptions& o) {
                         off = std::move(next);
                     }
                     std::vector<std::uint64_t> found(off.size(), 0);
-                    kmer::for_each_canonical_kmer(seq.data() + a, b - a, kK, [&](std::uint64_t c, std::size_t at, bool) {
+                    kmer::for_each_canonical_kmer(seq.data() + (a - offset), b - a, kK, [&](std::uint64_t c, std::size_t at, bool) {
                         const std::int64_t i = w.idx.find(c);
                         if (i < 0) return;
                         const std::uint64_t pos = a + at;
@@ -970,6 +994,7 @@ std::vector<LocusIndex> build(const BuildOptions& o) {
         const std::size_t inner = std::max<std::size_t>(1, threads / outer);
         std::mutex log_mutex;
         for (const auto& e : scan_list) check_unchanged(genomes.at(e.first));
+        cli::ProgressBar scan_bar(bar_label("pieces: scanning genomes"), scan_list.size());
         parallel_for(scan_list.size(), outer, [&](std::size_t gi) {
             const std::string& gname = scan_list[gi].first;
             const Need& nd = scan_list[gi].second;
@@ -986,14 +1011,63 @@ std::vector<LocusIndex> build(const BuildOptions& o) {
                 if (it != nd.contigs.end()) for (const std::size_t li : it->second) h[li] = 1;
                 return h;
             };
-            if (!nd.whole.empty()) {
+            if (fasta::IndexedFasta::indexed(ge.path)) {
+                fasta::IndexedFasta fa(ge.path);
+                const std::vector<std::string> names = [&] {
+                    std::vector<std::string> v;
+                    if (!nd.whole.empty()) return fa.contigs();
+                    for (const auto& c : nd.contigs) v.push_back(c.first);
+                    return v;
+                }();
+                for (const std::string& name : names) {
+                    const std::uint64_t len = fa.length(name);
+                    const std::vector<char> here = here_for(name);
+                    std::vector<std::pair<std::uint64_t, std::uint64_t>> parts{{0, std::min(len, kPiecePad)},
+                                                                               {len > kPiecePad ? len - kPiecePad : 0, len}};
+                    for (std::size_t li = 0; li < work.size(); ++li) {
+                        const auto it = here[li] ? work[li].spans.find(gname) : work[li].spans.end();
+                        if (it == work[li].spans.end()) continue;
+                        for (const auto& sp : it->second)
+                            if (sp.contig == name) parts.emplace_back(sp.start > kPiecePad ? sp.start - kPiecePad : 0, std::min(len, sp.end + kPiecePad));
+                    }
+                    while (true) {
+                        std::sort(parts.begin(), parts.end());
+                        std::vector<std::pair<std::uint64_t, std::uint64_t>> merged;
+                        for (const auto& x : parts) {
+                            if (!merged.empty() && x.first <= merged.back().second + 2 * kPieceMargin) merged.back().second = std::max(merged.back().second, x.second);
+                            else merged.push_back(x);
+                        }
+                        parts = std::move(merged);
+                        Found here_found;
+                        bool grew = false;
+                        for (auto& x : parts) {
+                            char grow[2] = {0, 0};
+                            scan(gname, name, fa.fetch(name, x.first, x.second), x.first, len, here, inner, here_found, grow);
+                            const std::uint64_t w = std::max(x.second - x.first, kPiecePad);
+                            if (grow[0]) x.first = x.first > w ? x.first - w : 0;
+                            if (grow[1]) x.second = std::min(len, x.second + w);
+                            grew = grew || grow[0] || grow[1];
+                        }
+                        if (grew) continue;
+                        // in the order a scan of the whole contig gives: by locus, then along the contig
+                        std::stable_sort(here_found.pieces.begin(), here_found.pieces.end(), [](const auto& x, const auto& y) {
+                            return x.first != y.first ? x.first < y.first : x.second.start < y.second.start;
+                        });
+                        Found& f = found[gi];
+                        f.off.insert(f.off.end(), here_found.off.begin(), here_found.off.end());
+                        f.ends.insert(f.ends.end(), here_found.ends.begin(), here_found.ends.end());
+                        for (auto& pc : here_found.pieces) f.pieces.push_back(std::move(pc));
+                        break;
+                    }
+                }
+            } else if (!nd.whole.empty()) {
                 GzLineReader in(ge.path);
                 if (!in.ok()) throw std::runtime_error("recruit: cannot read " + ge.path);
                 std::string line, name, seq;
                 while (in.getline(line)) {
                     if (line.empty()) continue;
                     if (line[0] == '>') {
-                        if (!name.empty()) scan(gname, name, seq, here_for(name), inner, found[gi]);
+                        if (!name.empty()) scan(gname, name, seq, 0, seq.size(), here_for(name), inner, found[gi], nullptr);
                         const auto sp = line.find_first_of(" \t");
                         name = line.substr(1, sp == std::string::npos ? std::string::npos : sp - 1);
                         seq.clear();
@@ -1001,12 +1075,13 @@ std::vector<LocusIndex> build(const BuildOptions& o) {
                     }
                     seq += line;
                 }
-                if (!name.empty()) scan(gname, name, seq, here_for(name), inner, found[gi]);
+                if (!name.empty()) scan(gname, name, seq, 0, seq.size(), here_for(name), inner, found[gi], nullptr);
             } else {
                 std::vector<fasta::Interval> iv;
                 for (const auto& c : nd.contigs) iv.push_back({c.first, 0, nd.lengths.at(c.first)});
                 const std::vector<std::string> seqs = fasta::fetch_intervals(ge.path, iv);
-                for (std::size_t k = 0; k < iv.size(); ++k) scan(gname, iv[k].contig, seqs[k], here_for(iv[k].contig), inner, found[gi]);
+                for (std::size_t k = 0; k < iv.size(); ++k)
+                    scan(gname, iv[k].contig, seqs[k], 0, seqs[k].size(), here_for(iv[k].contig), inner, found[gi], nullptr);
             }
             std::lock_guard<std::mutex> lock(log_mutex);
             // the occurrences counted as each genome is done, not held for every genome until the last
@@ -1016,7 +1091,9 @@ std::vector<LocusIndex> build(const BuildOptions& o) {
             decltype(found[gi].ends)().swap(found[gi].ends);
             log(nd.whole.empty() ? "pieces: contigs scanned: " + gname + " (" + std::to_string(nd.contigs.size()) + ")"
                                  : "pieces: genome scanned: " + gname);
+            scan_bar.tick();
         });
+        scan_bar.done();
         std::vector<std::size_t> scanned_for(work.size(), 0);
         std::vector<std::set<std::string>> piece_genomes(work.size());
         for (std::size_t gi = 0; gi < scan_list.size(); ++gi) {
@@ -1095,6 +1172,7 @@ std::vector<LocusIndex> build(const BuildOptions& o) {
     }
     const std::size_t scan_threads = threads;
     std::vector<std::unordered_set<std::uint64_t>> candidates(work.size());
+    cli::ProgressBar decoy_bar(bar_label("decoys: scanning genomes"), decoys.size());
     for (const auto& dname : decoys) {
         const bg::Genome& ge = genomes.at(dname);
         if (is_gfa_file(ge.path)) throw std::runtime_error("recruit: decoy genome " + dname + " is a graph; decoys must be FASTA");
@@ -1188,7 +1266,9 @@ std::vector<LocusIndex> build(const BuildOptions& o) {
         }
         scan();
         log("decoys: genome scanned: " + dname);
+        decoy_bar.tick();
     }
+    decoy_bar.done();
     parallel_for(work.size(), threads, [&](std::size_t li) {
         LocusIndex& x = work[li].idx;
         std::vector<std::uint64_t> cand(candidates[li].begin(), candidates[li].end());
@@ -1253,7 +1333,9 @@ std::vector<LocusIndex> build(const BuildOptions& o) {
                 t.core_start = std::min(t.core_start, t.core_end);
             }
         }
+        cli::ProgressBar cal_bar(bar_label("calibrating loci"), work.size());
         for (std::size_t li = 0; li < work.size(); ++li) {
+            struct Tick { cli::ProgressBar& bar; ~Tick() { bar.tick(); } } tick{cal_bar};   // as each locus ends
             LocusIndex& x = work[li].idx;
             if (!work[li].error.empty()) continue;
             try {

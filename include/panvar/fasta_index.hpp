@@ -26,6 +26,8 @@ public:
     static bool indexed(const std::string& path);
     bool has(const std::string& contig) const { return fai_.count(contig) != 0; }
     std::uint64_t length(const std::string& contig) const;
+    // The contigs, in the order of the file.
+    const std::vector<std::string>& contigs() const { return order_; }
     // The bases of [start, end) of a contig, clamped to its length, newlines removed.
     std::string fetch(const std::string& contig, std::uint64_t start, std::uint64_t end);
 
@@ -34,6 +36,7 @@ private:
     void read_bytes(std::uint64_t offset, std::uint64_t n, std::string& out);
     std::string path_;
     std::map<std::string, Entry> fai_;
+    std::vector<std::string> order_;
     bool bgzf_ = false;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> gzi_;   // (compressed, uncompressed) block starts
     std::FILE* f_ = nullptr;

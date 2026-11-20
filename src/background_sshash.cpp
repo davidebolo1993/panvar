@@ -2,6 +2,7 @@
 // lookup interface over both forms. The only file that includes SSHash's headers.
 
 #include "panvar/background.hpp"
+#include "panvar/cli_utils.hpp"
 
 #include "include/dictionary_types.hpp"
 // SSHash's templates are instantiated by including its sources, as its own tools do.
@@ -176,6 +177,7 @@ public:
         ++strings_;
         bases_ += seq.size();
         kmers_ += w.size();
+        if (bar != nullptr) bar->add(w.size());
         if (b.size() >= (std::size_t{4} << 20)) flush();
     }
     void flush() {
@@ -190,6 +192,7 @@ public:
         if (rc != Z_OK) throw std::runtime_error("background: cannot write " + path_);
     }
     std::uint64_t strings_ = 0, bases_ = 0, kmers_ = 0;
+    cli::ProgressBar* bar = nullptr;   // advanced by the k-mers written
 private:
     std::string path_, buf_;
     gzFile gz_ = nullptr;
@@ -473,9 +476,12 @@ CompactStats compact_store(const CompactOptions& o) {
     log("compact: string set: k-mers: " + std::to_string(n) + "; strings: " + (o.local_strings ? "partition-local paths, glued" : "greedy over the store"));
     {
         SpssWriter w(spss);
+        cli::ProgressBar bar(o.quiet ? std::string() : cli::log_prefix("background") + "compact: strings over the k-mers", n);
+        w.bar = &bar;
         if (o.local_strings) local_strings(*seg, o.threads, w, log);
         else greedy_strings(*seg, o.threads, w);
         w.close();
+        bar.done();
         st.strings = w.strings_;
         st.string_bases = w.bases_;
         st.kmers = w.kmers_;

@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <condition_variable>
 #include <cstdlib>
 #include <deque>
@@ -77,6 +78,14 @@ std::unique_ptr<GzLineReader> open_text(const std::string& path) {
     return in;
 }
 
+// A regular file's size; 0 for a stream or a file that cannot be read.
+std::uint64_t file_bytes(const std::string& path) {
+    std::error_code ec;
+    if (!std::filesystem::is_regular_file(path, ec)) return 0;
+    const auto n = std::filesystem::file_size(path, ec);
+    return ec ? 0 : n;
+}
+
 class FastqPair final : public FragmentSource {
 public:
     FastqPair(std::string r1, std::string r2) : r1_(std::move(r1)), r2_(std::move(r2)), in1_(open_text(r1_)), in2_(open_text(r2_)) {}
@@ -116,6 +125,8 @@ public:
     }
     const InputStats& stats() const override { return st_; }
     std::string describe() const override { return r1_ + " + " + r2_ + " (FASTQ pairs)"; }
+    std::uint64_t progress_done() const override { return in1_->consumed() + in2_->consumed(); }
+    std::uint64_t progress_total() const override { return file_bytes(r1_) + file_bytes(r2_); }
 
 private:
     std::string r1_, r2_;
@@ -150,6 +161,8 @@ public:
     }
     const InputStats& stats() const override { return st_; }
     std::string describe() const override { return path_ + (interleaved_ ? " (interleaved FASTQ)" : " (FASTQ)"); }
+    std::uint64_t progress_done() const override { return in_->consumed(); }
+    std::uint64_t progress_total() const override { return file_bytes(path_); }
 
 private:
     std::string path_;
@@ -164,6 +177,8 @@ struct HtsFile {
     sam_hdr_t* hdr = nullptr;
     bam1_t* rec = nullptr;
     std::string path;
+    std::atomic<std::int32_t> at_tid{-1};   // the last placed record read: how far through a sorted file
+    std::atomic<std::int64_t> at_pos{0};
     HtsFile(const std::string& p, const InputOptions& o, htsThreadPool* pool) : path(p) {
         fp = sam_open(p.c_str(), "r");
         if (fp == nullptr) throw std::runtime_error("recruit: cannot open " + p);
@@ -202,7 +217,10 @@ struct HtsFile {
     bool read() { return read(rec); }
     bool read(bam1_t* into) {
         const int r = sam_read1(fp, hdr, into);
-        if (r >= 0) return true;
+        if (r >= 0) {
+            if (into->core.tid >= 0) { at_tid.store(into->core.tid, std::memory_order_relaxed); at_pos.store(into->core.pos, std::memory_order_relaxed); }
+            return true;
+        }
         if (r == -1) return false;
         throw std::runtime_error("recruit: " + path + ": cannot read a record (truncated or damaged, or a CRAM whose reference cannot be found; see --cram-reference)");
     }
@@ -288,6 +306,11 @@ public:
         try {
             file_ = std::make_unique<HtsFile>(path, o, &pool_);
             coordinate_ = file_->coordinate_sorted();
+            if (coordinate_)
+                for (int i = 0; i < sam_hdr_nref(file_->hdr); ++i) {
+                    contig_start_.push_back(genome_bases_);
+                    genome_bases_ += static_cast<std::uint64_t>(sam_hdr_tid2len(file_->hdr, i));
+                }
             sample_ = file_->sample();
             if (coordinate_ && !o.screened) throw std::runtime_error("recruit: coordinate-sorted input needs the loci's screen");
         } catch (...) {
@@ -343,6 +366,13 @@ public:
         const char* kind = f->format == cram ? "CRAM" : f->format == bam ? "BAM" : "SAM";
         return path_ + " (" + kind + (coordinate_ ? ", coordinate-sorted" : "") + (sample_.empty() ? "" : ", sample " + sample_) + ")";
     }
+    std::uint64_t progress_done() const override {
+        const std::int32_t tid = file_->at_tid.load(std::memory_order_relaxed);
+        if (tid < 0 || static_cast<std::size_t>(tid) >= contig_start_.size()) return 0;
+        return contig_start_[static_cast<std::size_t>(tid)] + static_cast<std::uint64_t>(file_->at_pos.load(std::memory_order_relaxed));
+    }
+    std::uint64_t progress_total() const override { return genome_bases_; }
+    bool progress_in_bases() const override { return true; }
 
 private:
     static constexpr std::int64_t kNear = 100000;   // a mate this far ahead is waited for
@@ -862,6 +892,8 @@ private:
     std::string path_;
     htsThreadPool pool_{nullptr, 0};
     std::unique_ptr<HtsFile> file_;
+    std::vector<std::uint64_t> contig_start_;   // a sorted file's contigs end to end, for its progress
+    std::uint64_t genome_bases_ = 0;
     std::string sample_;
     bool coordinate_ = false, eof_ = false, lean_ = false;
     std::uint64_t lean_dropped_ = 0;

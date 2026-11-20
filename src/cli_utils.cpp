@@ -42,6 +42,11 @@ double elapsed_seconds(const std::chrono::steady_clock::time_point& start) {
 }
 
 namespace {
+
+// A bar is drawn on the terminal's current line (no newline yet): a log line clears it first, and the bar is
+// drawn again below at its next update.
+std::atomic<bool> g_bar_on_line{false};
+
 // Current wall-clock time as HH:MM:SS for log-line prefixes.
 std::string clock_hms() {
     const std::time_t t = std::time(nullptr);
@@ -64,6 +69,7 @@ void RunLog::line(const std::string& message) const {
     if (quiet_) {
         return;
     }
+    if (g_bar_on_line.exchange(false)) std::cerr << "\r\033[K";
     std::cerr << '[' << module_ << ' ' << clock_hms() << "] " << message << '\n';
     std::cerr.flush();
 }
@@ -115,56 +121,105 @@ bool stderr_is_tty() {
 #endif
 }
 
-ProgressBar::ProgressBar(std::string label, std::size_t total)
-    : label_(std::move(label)), total_(total) {
-    // Only animate on an interactive stderr; skip entirely for empty work or when
-    // suppressed by an empty label (the mechanism used to honor --quiet).
-    active_ = total_ > 0 && !label_.empty() && stderr_is_tty();
-    if (active_) {
-        render();
-    }
+namespace {
+
+std::string duration_text(double s) {
+    const long t = static_cast<long>(s + 0.5);
+    char buf[32];
+    if (t < 60) std::snprintf(buf, sizeof buf, "%lds", t);
+    else if (t < 3600) std::snprintf(buf, sizeof buf, "%ldm%02lds", t / 60, t % 60);
+    else std::snprintf(buf, sizeof buf, "%ldh%02ldm", t / 3600, t / 60 % 60);
+    return buf;
+}
+
+// A label made with log_prefix carries the time it was made; a log line gets the time it is written.
+std::string fresh_prefix(const std::string& label) {
+    static const std::regex stamp(R"(^\[([^ \]]+) \d\d:\d\d:\d\d\] )");
+    std::smatch m;
+    if (!std::regex_search(label, m, stamp)) return label;
+    return "[" + m[1].str() + " " + clock_hms() + "] " + label.substr(m[0].length());
+}
+
+}  // namespace
+
+ProgressBar::ProgressBar(std::string label, std::size_t total, Unit unit)
+    : label_(std::move(label)), total_(total), unit_(unit) {
+    active_ = total_ > 0 && !label_.empty();
+    tty_ = active_ && stderr_is_tty();
+    start_ = last_draw_ = std::chrono::steady_clock::now();
+    if (tty_) update(0, true);
 }
 
 ProgressBar::~ProgressBar() {
     // Unwinding from an error: drawing the finished bar would show N/N for a run that failed.
     if (std::uncaught_exceptions() > 0) {
-        if (active_ && !finished_) std::cerr << '\n';
+        if (tty_ && !finished_) std::cerr << '\n';
         return;
     }
     done();
 }
 
-void ProgressBar::tick() {
-    if (current_ < total_) {
-        ++current_;
-    }
-    if (active_ && !finished_) {
-        render();
-    }
+void ProgressBar::add(std::size_t n) {
+    if (!active_) return;
+    const std::size_t now = current_.fetch_add(n, std::memory_order_relaxed) + n;
+    update(std::min(now, total_), false);
+}
+
+void ProgressBar::set(std::size_t done) {
+    if (!active_) return;
+    current_.store(done, std::memory_order_relaxed);
+    update(std::min(done, total_), false);
 }
 
 void ProgressBar::done() {
-    if (finished_) {
-        return;
-    }
+    std::lock_guard<std::mutex> lock(m_);
+    if (finished_) return;
     finished_ = true;
-    if (active_) {
-        current_ = total_;
-        render();
-        std::cerr << '\n';
-        std::cerr.flush();
-    }
+    if (!tty_) return;
+    current_.store(total_);
+    constexpr std::size_t kWidth = 30;
+    std::cerr << '\r' << label_ << " [" << std::string(kWidth, '#') << "] " << amount(total_) << std::string(16, ' ') << '\n';
+    std::cerr.flush();
+    g_bar_on_line.store(false);
 }
 
-void ProgressBar::render() {
-    constexpr std::size_t kWidth = 30;
-    const std::size_t filled =
-        total_ == 0 ? kWidth : (current_ * kWidth) / total_;
-    std::cerr << '\r' << label_ << " [";
-    for (std::size_t i = 0; i < kWidth; ++i) {
-        std::cerr << (i < filled ? '#' : '-');
+std::string ProgressBar::amount(std::size_t n) const {
+    char buf[64];
+    if (unit_ == Unit::count && total_ < 10000000) return std::to_string(n) + "/" + std::to_string(total_);
+    if (unit_ == Unit::count) {
+        std::snprintf(buf, sizeof buf, "%.1f/%.1f M", static_cast<double>(n) / 1e6, static_cast<double>(total_) / 1e6);
+        return buf;
     }
-    std::cerr << "] " << current_ << '/' << total_;
+    std::snprintf(buf, sizeof buf, unit_ == Unit::bytes ? "%.1f/%.1f GB" : "%.2f/%.2f Gb", static_cast<double>(n) / 1e9,
+                  static_cast<double>(total_) / 1e9);
+    return buf;
+}
+
+void ProgressBar::update(std::size_t now, bool force) {
+    const auto t = std::chrono::steady_clock::now();
+    std::unique_lock<std::mutex> lock(m_, std::defer_lock);
+    if (force) lock.lock();
+    else if (!lock.try_lock()) return;   // another thread is drawing
+    if (finished_) return;
+    const double elapsed = std::chrono::duration<double>(t - start_).count();
+    const std::string left = now > 0 && now < total_ && elapsed >= 5 && now * 100 >= total_   // past 1%: early rates mislead
+        ? duration_text(elapsed * static_cast<double>(total_ - now) / static_cast<double>(now)) + " left" : std::string();
+    if (tty_) {
+        if (!force && now < total_ && t - last_draw_ < std::chrono::milliseconds(100)) return;
+        last_draw_ = t;
+        constexpr std::size_t kWidth = 30;
+        const std::size_t filled = (now * kWidth) / total_;
+        std::cerr << '\r' << label_ << " [" << std::string(filled, '#') << std::string(kWidth - filled, '-') << "] " << amount(now)
+                  << (left.empty() ? std::string() : ", " + left) << "    ";
+        std::cerr.flush();
+        g_bar_on_line.store(true);
+        return;
+    }
+    const std::size_t step = now * 20 / total_;
+    if (elapsed < 30 || step <= logged_step_ || now >= total_) return;
+    logged_step_ = step;
+    std::cerr << fresh_prefix(label_) << ": " << amount(now) << " (" << now * 100 / total_ << "%), " << duration_text(elapsed)
+              << (left.empty() ? std::string() : ", " + left) << '\n';
     std::cerr.flush();
 }
 

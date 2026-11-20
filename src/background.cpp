@@ -941,12 +941,13 @@ SegmentStats build_segment(const BuildOptions& o) {
                 }
             });
         }
+        cli::ProgressBar read_bar(o.progress ? cli::log_prefix("background") + "reading genomes" : std::string(), bases);
         try {
             for (std::size_t gi = 0; gi < genomes.size(); ++gi) {
                 Genome& g = genomes[gi];
                 std::error_code ec;
                 g.bytes = fs::file_size(g.path, ec);
-                std::uint64_t checksum = 0x5bd1e9955bd1e995ULL, genome_bases = 0;
+                std::uint64_t checksum = 0x5bd1e9955bd1e995ULL, genome_bases = 0, unreported = 0;
                 if (kinds[gi] == InputKind::Gfa) {
                     graph::GraphCounts gc = graph::count_graph(g.path, static_cast<std::uint32_t>(gi), threads,
                         [&](std::string seq, std::uint64_t mult) {
@@ -1017,6 +1018,7 @@ SegmentStats build_segment(const BuildOptions& o) {
                             chunk.append(line, at, take);
                             contig_pos += take;
                             at += take;
+                            if ((unreported += take) >= (std::uint64_t{1} << 24)) { read_bar.add(unreported); unreported = 0; }
                             if (contig_pos >= (1ULL << 32) && !lookups.empty())
                                 throw std::runtime_error("background: " + g.path + ": a contig of 4 Gb or more; anchors keep 32-bit positions");
                             if (chunk.size() >= chunk_bases) ship(true);
@@ -1025,6 +1027,7 @@ SegmentStats build_segment(const BuildOptions& o) {
                     if (have) { ship(false); contig_lengths[gi].push_back(contig_pos); }
                     if (aborted) break;
                 }
+                read_bar.add(kinds[gi] == InputKind::Gfa ? genome_bases : unreported);
                 g.checksum = hex64(checksum);
                 acgt += genome_bases;
                 log("read: " + g.name + "; ACGT bases: " + std::to_string(genome_bases) + (genome_bases == 0 ? " (no sequence)" : ""));
@@ -1034,6 +1037,7 @@ SegmentStats build_segment(const BuildOptions& o) {
         }
         queue.close();
         for (auto& w : workers) w.join();
+        if (!failure) read_bar.done();
     }
     std::uint64_t dedup_hits = 0;
     if (!failure) {
@@ -1217,9 +1221,12 @@ Segment::Segment(const std::string& segment_dir) : dir_(segment_dir), info_(read
         if (!seen[p]) throw std::runtime_error("background: " + dir_ + " lacks partition " + std::to_string(p));
 }
 
-std::vector<std::unique_ptr<Segment>> open_segments(const std::vector<std::string>& dirs, std::size_t threads) {
+std::vector<std::unique_ptr<Segment>> open_segments(const std::vector<std::string>& dirs, std::size_t threads,
+                                                   const std::string& progress_label) {
     std::vector<std::unique_ptr<Segment>> segs(dirs.size());
-    parallel_for(dirs.size(), threads, [&](std::size_t i) { segs[i] = std::make_unique<Segment>(dirs[i]); });
+    cli::ProgressBar bar(progress_label, dirs.size());
+    parallel_for(dirs.size(), threads, [&](std::size_t i) { segs[i] = std::make_unique<Segment>(dirs[i]); bar.tick(); });
+    bar.done();
     return segs;
 }
 
@@ -1279,7 +1286,8 @@ void merge_partition(const std::vector<const Segment*>& segs, std::uint32_t p,
 
 SegmentStats merge_range(const MergeRangeOptions& o) {
     if (o.segment_dirs.empty()) throw std::runtime_error("background: nothing to merge");
-    const std::vector<std::unique_ptr<Segment>> segs = open_segments(o.segment_dirs, o.threads);
+    const std::vector<std::unique_ptr<Segment>> segs =
+        open_segments(o.segment_dirs, o.threads, o.progress ? cli::log_prefix("background") + "checking segments" : std::string());
     std::vector<const Segment*> raw;
     for (const auto& s : segs) {
         raw.push_back(s.get());

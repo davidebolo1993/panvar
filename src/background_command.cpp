@@ -424,6 +424,7 @@ int run_background_command(const std::vector<std::string>& args) {
         {
             std::atomic<std::size_t> next{0};
             std::vector<std::thread> pool;
+            cli::ProgressBar bar(quiet ? std::string() : cli::log_prefix("background") + "relocate: checking genomes", moving.size());
             for (std::size_t t = 0; t < std::max<std::size_t>(1, std::min(threads, moving.size())); ++t)
                 pool.emplace_back([&] {
                     for (std::size_t i; (i = next++) < moving.size();) {
@@ -440,9 +441,11 @@ int run_background_command(const std::vector<std::string>& args) {
                         } catch (const std::exception& e) {
                             errors[i] = e.what();
                         }
+                        bar.tick();
                     }
                 });
             for (auto& th : pool) th.join();
+            bar.done();
         }
         for (const auto& e : errors)
             if (!e.empty()) throw std::runtime_error("background: " + e);
@@ -482,11 +485,15 @@ int run_background_command(const std::vector<std::string>& args) {
         if (f == nullptr) throw std::runtime_error("cannot write " + dump);
         std::uint64_t n = 0;
         bool ok = true;
-        for (std::uint32_t p = 0; p < store.partitions(); ++p)
+        cli::ProgressBar bar(quiet ? std::string() : cli::log_prefix("background") + "dumping partitions", store.partitions());
+        for (std::uint32_t p = 0; p < store.partitions(); ++p) {
             store.for_each(p, [&](std::uint64_t code, std::uint64_t count) {
                 if (std::fprintf(f, "%s\t%llu\n", kmer::decode(code, bg::kK).c_str(), static_cast<unsigned long long>(count)) < 0) ok = false;
                 ++n;
             });
+            bar.tick();
+        }
+        bar.done();
         if (std::fclose(f) != 0 || !ok) throw std::runtime_error("cannot write " + dump);
         log.info("dumped: k-mers: " + std::to_string(n) + "; segments: " + std::to_string(store.segments()));
         log.wrote({dump});
@@ -542,7 +549,9 @@ int run_background_command(const std::vector<std::string>& args) {
         log.info("verify: " + verify + " (" + other->kind() + "); against: " + out);
         std::uint64_t checked = 0, wrong = 0;
         std::vector<std::uint64_t> codes, counts;
+        cli::ProgressBar bar(quiet ? std::string() : cli::log_prefix("background") + "verifying partitions", store.partitions());
         for (std::uint32_t p = 0; p < store.partitions(); ++p) {
+            bar.tick();
             codes.clear(); counts.clear();
             store.for_each(p, [&](std::uint64_t code, std::uint64_t count) { codes.push_back(code); counts.push_back(count); });
             const auto got = other->count_batch(codes);
@@ -811,7 +820,7 @@ int run_background_command(const std::vector<std::string>& args) {
             }
             infos.push_back(bg::read_segment_info(a));
         }
-        bg::open_segments(attach, threads);   // complete and readable
+        bg::open_segments(attach, threads, quiet ? std::string() : cli::log_prefix("background") + "checking segments");   // complete and readable
         const bg::StoreLock lock(out);
         bg::Manifest m = bg::read_manifest(out);
         std::vector<bg::Genome> incoming;

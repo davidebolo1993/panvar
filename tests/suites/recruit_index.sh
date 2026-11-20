@@ -320,6 +320,22 @@ if command -v samtools > /dev/null && command -v bgzip > /dev/null; then
   "$BIN" recruit -t 2 -q --background s0 -r ref --index-only --save-index idx0 --locus data/locus.gfa
   "$BIN" recruit --dump-index idx0/locus.plx=dump0.tsv
   check "genomes read through .fai, or bgzip and .gzi, give the same index" 'cmp -s dump0.tsv dump_fa.tsv && cmp -s dump0.tsv dump_fa.gz.tsv'
+  # the piece fixtures read by interval (around the copies and at contig ends only): the same pieces and index
+  same=0; cases=0
+  for spec in "split split/locus.gfa split/ref:ref split/gs:gs" "split_p split/locus.gfa split/ref:ref split/gs:gs split/gp:gp" \
+              "split_c split/locus.gfa split/ref:ref split_c/gc:gc" "split_h split/locus.gfa split/ref:ref split_h/gh:gh" \
+              "tail split_t/locus.gfa split_t/ref:ref split_t/gl:gl" "orphan split_o/locus.gfa split_o/ref:ref split_o/go:go" \
+              "ends split_e/locus.gfa split_e/ref:ref split_e/ge:ge split_e/gt:gt" "far split_f/locus.gfa split_f/ref:ref split_f/gf:gf"; do
+    read -r c gfa rest <<< "$spec"; args=()
+    for x in $rest; do f=${x%%:*}; n=${x##*:}; mkdir -p zp/$c
+      bgzip -c data/$f.fa > zp/$c/$n.fa.gz && samtools faidx zp/$c/$n.fa.gz; args+=(--genome $n=zp/$c/$n.fa.gz); done
+    "$BIN" background -t 2 --partitions 64 --memory 64M -q --tmp-dir "$OUT/tmp" -o s_z$c "${args[@]}" --coordinate-reference ref
+    "$BIN" recruit -t 2 -q --background s_z$c -r ref --index-only --save-index idx_z$c --locus data/$gfa
+    "$BIN" recruit --dump-index idx_z$c/locus.plx=dump_z$c.tsv
+    cases=$((cases + 1))
+    cmp -s dump_$c.tsv dump_z$c.tsv && cmp -s <(grep "^piece" idx_$c/locus.index.tsv) <(grep "^piece" idx_z$c/locus.index.tsv) && same=$((same + 1))
+  done
+  check "genomes read by interval give the pieces and index of a full read ($same of $cases)" '[[ $same == $cases ]]'
 else
   echo "  skip indexed and bgzip genomes (samtools or bgzip not installed)"
 fi

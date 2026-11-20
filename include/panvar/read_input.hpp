@@ -56,6 +56,11 @@ public:
     virtual std::size_t next(std::vector<Fragment>& out, std::size_t n) = 0;
     virtual const InputStats& stats() const = 0;
     virtual std::string describe() const = 0;   // the file(s) and how they are read
+    // How far through the input: done of total, bytes of FASTQ files or bases along the genome of a
+    // coordinate-sorted alignment file (progress_in_bases); a total of 0 when it cannot be told.
+    virtual std::uint64_t progress_done() const { return 0; }
+    virtual std::uint64_t progress_total() const { return 0; }
+    virtual bool progress_in_bases() const { return false; }
 };
 
 // FASTQ mates in two files, read on two threads.

@@ -48,6 +48,7 @@ IndexedFasta::IndexedFasta(const std::string& path) : path_(path) {
         std::string name;
         Entry e{};
         if (!(ss >> name >> e.length >> e.offset >> e.line_bases >> e.line_width)) continue;
+        if (!fai_.count(name)) order_.push_back(name);
         fai_[name] = e;
     }
     if (gzip_magic(path)) {

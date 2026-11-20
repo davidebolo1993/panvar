@@ -239,7 +239,8 @@ private:
 
 // Several segments opened (and checked) at once: checking reads two scattered words per partition, which
 // on a network filesystem costs a round trip each, so the segments are opened side by side.
-std::vector<std::unique_ptr<Segment>> open_segments(const std::vector<std::string>& dirs, std::size_t threads);
+std::vector<std::unique_ptr<Segment>> open_segments(const std::vector<std::string>& dirs, std::size_t threads,
+                                                   const std::string& progress_label = std::string());
 
 // The store's manifest: the only list of its segments.
 struct ManifestSegment {

@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cerrno>
 #include <cstddef>
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
@@ -61,6 +62,8 @@ public:
     GzLineReader& operator=(const GzLineReader&) = delete;
 
     bool ok() const { return fp_ != nullptr; }
+    // Bytes read from the file so far (compressed, for a gzip file): how far through it the reader is.
+    std::uint64_t consumed() const { return consumed_; }
 
     bool getline(std::string& out) {
         std::size_t from = pos_;
@@ -98,6 +101,7 @@ public:
     }
 
 private:
+    std::uint64_t consumed_ = 0;
     void close() {
         inflater_.reset();
         if (fp_ != nullptr) {
@@ -116,6 +120,7 @@ private:
         while (!in_eof_ && in_len_ < sizeof(in_)) {
             const std::size_t got = std::fread(in_ + in_len_, 1, sizeof(in_) - in_len_, fp_);
             in_len_ += got;
+            consumed_ += got;
             if (got == 0) {
                 if (std::ferror(fp_)) {
                     throw std::runtime_error(path_ + ": read error (" + std::strerror(errno) + ")");

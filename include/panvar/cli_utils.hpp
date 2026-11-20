@@ -1,7 +1,9 @@
 #pragma once
 
+#include <atomic>
 #include <chrono>
 #include <cstddef>
+#include <mutex>
 #include <fstream>
 #include <set>
 #include <string>
@@ -18,32 +20,42 @@ bool stderr_is_tty();
 // Wall-clock seconds elapsed since `start`, used for progress logging.
 double elapsed_seconds(const std::chrono::steady_clock::time_point& start);
 
-// Minimal single-threaded progress bar printed to stderr (keeps stdout clean for
-// the machine-readable summary). Renders as `\rlabel [####----] 42/120` and is
-// rewritten in place on each tick; call done() (or let the destructor run) to emit
-// the trailing newline. Rendering is skipped when stderr is not a TTY so piped logs
-// stay clean.
+// Progress bar printed to stderr (keeps stdout clean for the machine-readable summary). On a terminal it
+// renders as `\rlabel [####----] 42/120, 3m10s left` and is rewritten in place; elsewhere (a job's log) it
+// writes a line at every 5% once 30 s have passed, so short runs log nothing more. Safe to advance from
+// several threads. An empty label (the mechanism used to honor --quiet) or a total of 0 draws nothing. Call
+// done() (or let the destructor run) to finish the terminal line.
 class ProgressBar {
 public:
-    ProgressBar(std::string label, std::size_t total);
+    enum class Unit { count, bytes, bases };
+    ProgressBar(std::string label, std::size_t total, Unit unit = Unit::count);
     ~ProgressBar();
 
     ProgressBar(const ProgressBar&) = delete;
     ProgressBar& operator=(const ProgressBar&) = delete;
 
-    // Advance by one unit and redraw.
-    void tick();
+    // Advance by one unit (or n) and redraw.
+    void tick() { add(1); }
+    void add(std::size_t n);
+    // Set the amount done (a position in a file, say).
+    void set(std::size_t done);
     // Finish: redraw at 100% and emit a newline (idempotent).
     void done();
 
 private:
-    void render();
+    void update(std::size_t now, bool force);
+    std::string amount(std::size_t n) const;
 
     std::string label_;
     std::size_t total_ = 0;
-    std::size_t current_ = 0;
+    Unit unit_ = Unit::count;
+    std::atomic<std::size_t> current_{0};
     bool active_ = false;
+    bool tty_ = false;
     bool finished_ = false;
+    std::mutex m_;
+    std::chrono::steady_clock::time_point start_, last_draw_;
+    std::size_t logged_step_ = 0;   // the last 5% step written to a log
 };
 
 // Consistent, timestamped run logging for the command layer. Every line goes to
