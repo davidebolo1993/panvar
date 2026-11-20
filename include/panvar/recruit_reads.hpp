@@ -3,7 +3,8 @@
 // Recruiting reads to locus indexes without aligning: each read (or pair) is screened by its closed
 // syncmers against the loaded loci; for every locus it hits, each of its k-mers is labelled P, S, R (the
 // locus table), D (the decoys) or N (neither), each read's locus segment is found from the labels, and the
-// evidence in the segments decides the fragment's fate: certain, ambiguous (with a reason) or unrecruited.
+// evidence in the segments, scored, decides the fragment's fate: certain, likely, ambiguous (with a reason) or
+// unrecruited.
 
 #include "panvar/locus_index.hpp"
 
@@ -46,9 +47,14 @@ struct ReadOptions {
     bool interleaved = false;            // single FASTQ files hold mates as consecutive records
     std::string out;                     // per-fragment table (TSV)
     Screen screen = Screen::Syncmer;
+    // Fragments are decided by the score, each locus's tiers set for these off-target rates (per screened
+    // off-target fragment of the run's read class), or by the first rules: a private-site cut, calibrated for
+    // the certain rate (`rules_v1`), or given (`calibrated_cut` false).
+    double false_certain_rate = 1e-4;    // certain
+    double likely_rate = 1e-2;           // likely
+    bool rules_v1 = false;
     std::uint32_t min_sites = 2;         // private sites for certain (each locus's calibrated cut instead, if so)
     bool calibrated_cut = true;          // per locus, the lowest cut meeting the false-certain rate
-    double false_certain_rate = 1e-4;    // per screened off-target fragment of the run's read class
     std::string read_class;              // the calibration's read class: short, hifi or ont (empty: from the first reads)
     double decoy_share = 0.05;           // decoy sites tolerated, as a share of the private sites
     double decoy_share_long = 0.25;      // the same for reads of kLongRead bases or more, which cross stretches shared
@@ -56,7 +62,7 @@ struct ReadOptions {
     double error_rate = -1;              // per base: the expected mismatch runs, beside one new allele per kb;
                                          // below 0: estimated from the base qualities of the first reads
     std::string reads_out;               // a folder for the recruited reads as FASTQ (none if empty)
-    bool reads_ambiguous = true;         // write ambiguous reads too (else certain only)
+    bool reads_ambiguous = true;         // write likely and ambiguous reads too (else certain only)
     std::string summary;                 // the run's summary table (none if empty)
     std::size_t threads = 2;
     std::function<void(const std::string&)> log;
@@ -64,7 +70,7 @@ struct ReadOptions {
 
 struct ReadStats {
     std::uint64_t fragments = 0, screened = 0;
-    std::uint64_t certain = 0, ambiguous = 0, unrecruited = 0;
+    std::uint64_t certain = 0, likely = 0, ambiguous = 0, unrecruited = 0;
     double error_rate = 0;               // the rate scored with
     std::string error_source;            // given, or estimated from base qualities, or a default
 };

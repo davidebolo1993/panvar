@@ -374,9 +374,10 @@ ReadStats recruit_reads(const ReadOptions& options) {
         std::snprintf(b, sizeof b, "%.4f", o.error_rate);
         log(std::string("error rate: ") + b + " (" + st.error_source + ")");
     }
-    // each locus's private-site cut: calibrated for the run's read class (the preset's, or from the first reads), or the given
-    // one when the run scores by other rules than the calibration did
-    std::vector<std::string> cut_note(loci.size());
+    // each locus's decision for the run's read class (the preset's, or from the first reads): the score's tiers,
+    // or by the first rules a private-site cut, calibrated or given. A locus without the score's calibration is
+    // decided by the cut.
+    std::vector<std::vector<std::string>> notes(loci.size());   // summary rows: key, value
     {
         std::uint64_t bases = 0, reads = 0;
         bool pairs = false;
@@ -386,7 +387,50 @@ ReadStats recruit_reads(const ReadOptions& options) {
             pairs = pairs || (f.paired && !f.seq1.empty() && !f.seq2.empty());
         }
         const double mean = reads ? static_cast<double>(bases) / static_cast<double>(reads) : 0;
+        char b[768];
+        // what a run unlike the calibration should know
+        auto caveats = [&](const Calibration& c) {
+            std::string note;
+            if (o.error_rate > 2 * c.error_rate) {
+                std::snprintf(b, sizeof b, "; the run's error rate %.4f is above the calibration's %.4f: its off-target reads may be certain more often",
+                              o.error_rate, c.error_rate);
+                note += b;
+            }
+            if (c.insert > 0 && !pairs) note += "; calibrated on pairs, the run reads single reads";
+            return note;
+        };
         for (std::size_t li = 0; li < loci.size(); ++li) {
+            const Calibration* c = calibration_for(calibration[li], o.read_class, mean, o.error_rate);
+            const bool score = c != nullptr && has_score(*c);
+            if (score) {
+                loci[li].rates = Rates{c->r_in, c->r_out, c->q_in, c->q_out};
+                const Tier ct = score_tier(*c, o.false_certain_rate), lt = score_tier(*c, o.likely_rate);
+                loci[li].certain_bin = ct.bin;
+                loci[li].likely_bin = std::min(lt.bin, ct.bin);
+                loci[li].tiers = true;
+                loci[li].by_score = !o.rules_v1 && o.calibrated_cut;
+                if (loci[li].by_score) {
+                    std::snprintf(b, sizeof b, "%s reads: r_in %.4g, r_out %.4g, q_in %.4g, q_out %.4g; off-target screened %llu, of them %llu from %zu held-out genomes",
+                                  c->read_class.c_str(), c->r_in, c->r_out, c->q_in, c->q_out,
+                                  static_cast<unsigned long long>(c->flank_screened + c->decoy_screened + c->genome_screened),
+                                  static_cast<unsigned long long>(c->genome_screened), c->genomes.size());
+                    notes[li].push_back("score");
+                    notes[li].push_back(b + caveats(*c));
+                    for (const auto& [name, t] : {std::pair<const char*, const Tier*>{"certain", &ct}, {"likely", &lt}}) {
+                        char th[32];
+                        if (t->bin == kEveryBin) std::snprintf(th, sizeof th, "any");
+                        else std::snprintf(th, sizeof th, "%.4f", t->bin * kScoreBin);
+                        std::snprintf(b, sizeof b, "%s: held-out recall %.4f; off-target %llu of %llu screened (rate %.3g asked), 95%% bound %.3g, %s", th,
+                                      t->locus_total ? static_cast<double>(t->locus) / static_cast<double>(t->locus_total) : 0.0,
+                                      static_cast<unsigned long long>(t->off), static_cast<unsigned long long>(t->off_screened), t->rate, t->bound(),
+                                      t->shown ? "within the rate" : "too few to show the rate (none beyond it seen)");
+                        notes[li].push_back(std::string(name) + "_threshold");
+                        notes[li].push_back(b);
+                    }
+                    log("locus: " + loci[li].name + "; " + notes[li][1] + "; certain from " + notes[li][3] + "; likely from " + notes[li][5]);
+                    continue;
+                }
+            }
             std::string note;
             if (!o.calibrated_cut) {
                 note = std::to_string(o.min_sites) + " given";
@@ -403,7 +447,6 @@ ReadStats recruit_reads(const ReadOptions& options) {
                     loci[li].min_sites = c.min_sites;
                     const std::uint64_t scr = c.by->flank_screened + c.by->decoy_screened;
                     const std::uint64_t fc = c.by->flank_certain[c.min_sites] + c.by->decoy_certain[c.min_sites];
-                    char b[512];
                     std::snprintf(b, sizeof b, "%u calibrated (%s reads): held-out recall %.4f; false certain %llu of %llu screened off-target, 95%% bound %.3g, %s",
                                   c.min_sites, c.by->read_class.c_str(),
                                   c.by->locus ? static_cast<double>(c.by->locus_certain[c.min_sites]) / static_cast<double>(c.by->locus) : 0.0,
@@ -412,12 +455,7 @@ ReadStats recruit_reads(const ReadOptions& options) {
                                   : c.shown ? "within the rate" : "too few to show the rate (none beyond it seen)");
                     note = b;
                     if (c.floor > 2) note += "; " + c.by->read_class + " reads start at " + std::to_string(c.floor);
-                    if (o.error_rate > 2 * c.by->error_rate) {
-                        std::snprintf(b, sizeof b, "; the run's error rate %.4f is above the calibration's %.4f: its off-target reads may be certain more often",
-                                      o.error_rate, c.by->error_rate);
-                        note += b;
-                    }
-                    if (c.by->insert > 0 && !pairs) note += "; calibrated on pairs, the run reads single reads";
+                    note += caveats(*c.by);
                     {   // the calibration scored by the default rules: a run scoring by others is not what it measured
                         const ReadOptions d;
                         if (o.decoy_share != d.decoy_share || o.decoy_share_long != d.decoy_share_long) {
@@ -428,7 +466,8 @@ ReadStats recruit_reads(const ReadOptions& options) {
                     }
                 }
             }
-            cut_note[li] = note;
+            if (!o.rules_v1 && o.calibrated_cut) note += "; the index carries no score calibration for these reads: decided by the private-site cut";
+            notes[li] = {"site_cut", note};
             log("locus: " + loci[li].name + "; site cut: " + note);
         }
     }
@@ -443,7 +482,7 @@ ReadStats recruit_reads(const ReadOptions& options) {
     }
     std::FILE* out = std::fopen(out_tmp.c_str(), "w");
     if (out == nullptr) throw std::runtime_error("recruit: cannot write " + out_tmp);
-    std::fprintf(out, "fragment\tlocus\tfate\treason\tmates\tseg1\tseg2\tsites_p\tsites_d\tdecoy_out\truns_n\tseg_kmers\tn_p\tn_s\tn_r\tn_d\tn_n\tkmers\twindows\tbases\tmulti_p\tnodes\tother_loci\tcertain_loci\n");
+    std::fprintf(out, "fragment\tlocus\tfate\treason\tmates\tseg1\tseg2\tsites_p\tsites_d\tdecoy_out\truns_n\tseg_kmers\tn_p\tn_s\tn_r\tn_d\tn_n\tkmers\twindows\tbases\tmulti_p\tnodes\tother_loci\tcertain_loci\tscore\ttier\n");
     std::unique_ptr<ReadWriters> writers;
     if (!o.reads_out.empty()) {
         // an earlier run's reads of these loci go first: a locus and fate with no reads now must not keep old ones
@@ -452,7 +491,7 @@ ReadStats recruit_reads(const ReadOptions& options) {
         // only the names this run writes: another locus's name may start with this one's
         std::set<std::string> ours;
         for (const LocusTable& l : loci)
-            for (const char* fate : {"certain", "ambiguous"})
+            for (const char* fate : {"certain", "likely", "ambiguous"})
                 for (const char* suffix : {"", "_1", "_2"}) ours.insert(l.name + "." + fate + suffix + ".fq.gz");
         if (std::filesystem::is_directory(o.reads_out, ec))
             for (const auto& e : std::filesystem::directory_iterator(o.reads_out, ec))
@@ -518,21 +557,25 @@ ReadStats recruit_reads(const ReadOptions& options) {
                 for (const Row& x : rows[i])
                     if (x.locus != r.locus) others += (others.empty() ? "" : ",") + loci[x.locus].name;
                 if (others.empty()) others = ".";
-                std::fprintf(out, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%u\t%u\t%u\t%u\t%u\t%u\t%u\t%u\t%u\t%u\t%u\t%u\t%u\t%u\t%s\t%s\t%u\n", r.fragment.c_str(),
+                char score[32] = ".";
+                if (r.scored) std::snprintf(score, sizeof score, "%.2f", r.score);
+                std::fprintf(out, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%u\t%u\t%u\t%u\t%u\t%u\t%u\t%u\t%u\t%u\t%u\t%u\t%u\t%u\t%s\t%s\t%u\t%s\t%s\n", r.fragment.c_str(),
                              loci[r.locus].name.c_str(), r.fate, r.reason, r.mates, r.seg[0].c_str(), r.seg[1].c_str(), v.sites_p, v.sites_d,
                              v.decoy_out, v.runs_n, v.seg_kmers, v.n_p, v.n_s, v.n_r, v.n_d, v.n_n, v.kmers, v.windows, v.bases, v.multi,
-                             r.nodes.c_str(), others.c_str(), certain_loci);
+                             r.nodes.c_str(), others.c_str(), certain_loci, score, r.tier);
                 ++by_reason[r.locus][std::string(r.fate) + (r.reason[0] == '.' ? "" : std::string("\t") + r.reason)];
                 if (r.fate[0] == 'c') {
                     ++st.certain;
                     backbone_seen[r.locus] += r.backbone;
                     if (certain_loci > 1) ++multi_certain[r.locus];
+                } else if (r.fate[0] == 'l') {
+                    ++st.likely;
                 } else if (r.fate[0] == 'a') {
                     ++st.ambiguous;
                 } else {
                     ++st.unrecruited;
                 }
-                if (writers && (r.fate[0] == 'c' || (r.fate[0] == 'a' && o.reads_ambiguous))) {
+                if (writers && (r.fate[0] == 'c' || ((r.fate[0] == 'a' || r.fate[0] == 'l') && o.reads_ambiguous))) {
                     const std::string header = fr.name + " fate=" + r.fate + " reason=" + r.reason + " mates=" + r.mates +
                                                " sites_p=" + std::to_string(v.sites_p) + " other_loci=" + others;
                     const bool two = fr.paired && !fr.seq1.empty() && !fr.seq2.empty();
@@ -589,7 +632,8 @@ ReadStats recruit_reads(const ReadOptions& options) {
             std::fprintf(sm, "locus\t%s\tbackbone_depth\t%.2f k-mer depth, %.2f base depth over %llu backbone k-mers\n", loci[li].name.c_str(), kdepth, bdepth,
                          static_cast<unsigned long long>(loci[li].backbone));
             std::fprintf(sm, "locus\t%s\tcertain_in_other_loci\t%llu\n", loci[li].name.c_str(), static_cast<unsigned long long>(multi_certain[li]));
-            std::fprintf(sm, "locus\t%s\tsite_cut\t%s\n", loci[li].name.c_str(), cut_note[li].c_str());
+            for (std::size_t k = 0; k + 1 < notes[li].size(); k += 2)
+                std::fprintf(sm, "locus\t%s\t%s\t%s\n", loci[li].name.c_str(), notes[li][k].c_str(), notes[li][k + 1].c_str());
         }
         if (std::fclose(sm) != 0) throw std::runtime_error("recruit: cannot write " + summary_tmp);
         std::filesystem::rename(summary_tmp, o.summary);

@@ -29,8 +29,9 @@ void print_recruit_help() {
         << "  panvar recruit --locus <graph.gfa | haplotypes.fa> [...] --background <store.bgk> -r <name> --index-only\n"
         << "  panvar recruit --locus <graph.gfa | haplotypes.fa | index.plx> [...] <reads> -o <out.tsv> [options]\n"
         << "  panvar recruit --locus <...> [...] --samples <sheet.tsv> -o <out dir> [options]\n\n"
-        << "Sort a sample's reads to locus graphs without aligning: each fragment is called certain, ambiguous\n"
-        << "or unrecruited for every locus it hits, from an index built once per graph against the background.\n\n"
+        << "Sort a sample's reads to locus graphs without aligning: each fragment is called certain, likely,\n"
+        << "ambiguous or unrecruited for every locus it hits, from an index built once per graph against the\n"
+        << "background.\n\n"
         << "Locus indexes:\n"
         << "      --locus <path>              A locus graph (GFA), its haplotypes (FASTA, one record per path) or its\n"
         << "                                  index (.plx); repeatable\n"
@@ -43,6 +44,9 @@ void print_recruit_help() {
         << "                                  shared, more is repeat (default 8)\n"
         << "      --decoy-genomes <A,B>       Genomes whose homologous windows give decoys (default: the coordinate\n"
         << "                                  reference)\n"
+        << "      --calibration-genomes <A,B> Genomes held out one at a time in calibration (default: per locus, up to\n"
+        << "                                  8 decoy genomes other than the coordinate reference, chosen by the\n"
+        << "                                  homolog k-mers each adds)\n"
         << "      --no-calibration            Build indexes without calibration\n\n"
         << "Reads (one sample's files are read in turn):\n"
         << "  -1, --reads <fq>                FASTQ (plain or gzip); repeatable\n"
@@ -55,17 +59,19 @@ void print_recruit_help() {
         << "Calls:\n"
         << "  -o, --out <tsv>                 One row per screened fragment and locus: fate, reason, each mate's\n"
         << "                                  locus segment, the evidence and the graph nodes\n"
-        << "      --false-certain-rate <r>    Per locus, the lowest calibrated private-site cut (at least 2; 3 for ont) whose\n"
-        << "                                  off-target reads are certain at most at this rate (default 1e-4)\n"
-        << "      --min-sites <N>             One private-site cut for every locus instead\n"
+        << "      --certain-rate <r>          Per locus, the lowest score whose calibrated off-target fragments are\n"
+        << "                                  certain at most at this rate (default 1e-4)\n"
+        << "      --likely-rate <r>           The same for likely (default 1e-2)\n"
+        << "      --min-sites <N>             One private-site cut for every locus instead of the score\n"
         << "      --error-rate <e>            The reads' error rate per base (default: from base qualities); a read\n"
         << "                                  whose own qualities say more errors is held to its own rate\n"
-        << "      --decoy-share-long <r>      Decoy sites tolerated per private site in reads of 1 kb or more (default\n"
-        << "                                  0.25; 0.05 in shorter reads)\n"
+        << "      --decoy-share-long <r>      Decoy sites per private site beyond a long read's segment (1 kb or more)\n"
+        << "                                  that make a homologous flank (default 0.25; 0.05 in shorter reads)\n"
         << "      --preset <p>                The read type, illumina, hifi or ont: its calibration class and error\n"
         << "                                  rate (0.002, 0.001, 0.03; --error-rate overrides). Corrected long reads\n"
         << "                                  are hifi, any other long reads ont\n"
-        << "      --reads-out <dir>           The recruited reads as gzip FASTQ, per locus and fate\n"
+        << "      --reads-out <dir>           The recruited reads as gzip FASTQ, per locus and fate (certain, likely,\n"
+        << "                                  ambiguous)\n"
         << "      --certain-only              With --reads-out: certain reads only\n"
         << "      --summary <tsv>             The run's summary (default: beside -o, .summary.tsv)\n\n"
         << "Inspecting:\n"
@@ -94,6 +100,7 @@ int run_recruit_command(const std::vector<std::string>& args) {
     double error_rate = -1, preset_rate = -1;
     std::vector<std::string> reads1, reads2, singles;
     bool index_only = false, quiet = false, dry_run = false, rate_given = false;
+    std::string rules;
     std::size_t threads = 0;
     for (std::size_t i = 0; i < args.size(); ++i) {
         const std::string& a = args[i];
@@ -110,7 +117,18 @@ int run_recruit_command(const std::vector<std::string>& args) {
         else if (a == "--save-index") save_dir = value();
         else if (a == "--informative-max") o.informative_max = static_cast<std::uint32_t>(cli::parse_size_arg(a, value()));
         else if (a == "--no-calibration") o.calibrate = false;
-        else if (a == "--false-certain-rate") { ro.false_certain_rate = parse_number(a, value()); rate_given = true; }
+        else if (a == "--certain-rate" || a == "--false-certain-rate") { ro.false_certain_rate = parse_number(a, value()); rate_given = true; }
+        else if (a == "--likely-rate") ro.likely_rate = parse_number(a, value());
+        else if (a == "--rules") {   // v1: the first rules (a calibrated private-site cut), for comparison; not in the help
+            rules = value();
+            if (rules != "v1" && rules != "v2") throw std::runtime_error("--rules is v1 or v2");
+            ro.rules_v1 = rules == "v1";
+        }
+        else if (a == "--calibration-genomes") {
+            std::stringstream ss(value());
+            for (std::string d; std::getline(ss, d, ',');) if (!d.empty()) o.calibration_genomes.push_back(d);
+            if (o.calibration_genomes.empty()) throw std::runtime_error("--calibration-genomes takes a comma list of genomes");
+        }
         else if (a == "--decoy-genomes") {
             std::stringstream ss(value());
             for (std::string d; std::getline(ss, d, ',');) if (!d.empty()) o.decoy_genomes.push_back(d);
@@ -240,8 +258,10 @@ int run_recruit_command(const std::vector<std::string>& args) {
     if (!index_only && (samples.empty() || ro.out.empty()))
         throw std::runtime_error("recruit requires reads (-1/-2, -i or --samples) and -o (or --index-only)");
     if (ro.min_sites == 0) throw std::runtime_error("--min-sites must be at least 1");
-    if (rate_given && !ro.calibrated_cut) throw std::runtime_error("give --false-certain-rate or --min-sites, not both");
-    if (!(ro.false_certain_rate >= 0 && ro.false_certain_rate < 1)) throw std::runtime_error("--false-certain-rate must be in [0, 1)");
+    if (rate_given && !ro.calibrated_cut) throw std::runtime_error("give --certain-rate or --min-sites, not both");
+    if (!(ro.false_certain_rate >= 0 && ro.false_certain_rate < 1)) throw std::runtime_error("--certain-rate must be in [0, 1)");
+    if (!(ro.likely_rate >= 0 && ro.likely_rate < 1)) throw std::runtime_error("--likely-rate must be in [0, 1)");
+    if (ro.likely_rate < ro.false_certain_rate) throw std::runtime_error("--likely-rate must be at least --certain-rate");
     ro.error_rate = error_rate >= 0 ? error_rate : preset_rate;   // below 0: estimated from base qualities
     cli::RunLog log("recruit", quiet);
     o.threads = threads == 0 ? bg::default_threads() : threads;
@@ -315,7 +335,8 @@ int run_recruit_command(const std::vector<std::string>& args) {
             if (!name.empty()) log.info("sample: " + name + "; inputs: " + std::to_string(files.size()));
             const recruit::ReadStats st = recruit::recruit_reads(ro);
             log.info((name.empty() ? std::string() : "sample: " + name + "; ") + "fragments: " + std::to_string(st.fragments) + "; screened: " +
-                     std::to_string(st.screened) + "; certain: " + std::to_string(st.certain) + "; ambiguous: " + std::to_string(st.ambiguous) +
+                     std::to_string(st.screened) + "; certain: " + std::to_string(st.certain) + "; likely: " + std::to_string(st.likely) +
+                     "; ambiguous: " + std::to_string(st.ambiguous) +
                      "; unrecruited: " + std::to_string(st.unrecruited) + " (per locus)");
             wrote.push_back(ro.out);
             wrote.push_back(ro.summary);
