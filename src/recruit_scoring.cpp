@@ -155,6 +155,9 @@ bool uncallable(const Evidence& v) { return v.windows > 0 && v.kmers * 2 < v.win
 // What a fragment is held to: the error rate its mismatch runs are judged against (its own, from its base qualities,
 // where higher than the run's) and the decoy sites tolerated per private site (more in a long read, which crosses
 // stretches shared with homologs: a few decoy sites among hundreds of private ones).
+// Decoy sites a side beyond a segment needs, at least, to count as a homologous flank
+constexpr std::size_t kFlankDecoySites = 2;
+
 struct Bar {
     double error;
     double decoy_share;
@@ -249,21 +252,32 @@ Row score_fragment(const Fragment& fr, const LocusTable& t, std::uint32_t li, co
         if (seg.first <= seg.second && seg.second - seg.first + 1 < kK) seg = {1, 0};
         // The segment alone is judged when the read leaves the locus at its ends: what lies beyond each end
         // (if anything) holds few locus k-mers, under a quarter of what locus sequence read at the error
-        // rate gives, and decoy k-mers lie beyond one end at most (a homologous flank on one side).
-        // Otherwise (an error cluster or a new allele stopped the segment) the whole read is judged.
+        // rate gives, and a homologous flank lies beyond one end at most. A side is a homologous flank when its
+        // decoy sites would count against the segment: two or more, and at least the decoy share of the
+        // segment's private sites; a stray decoy k-mer far along a long read is not one. Otherwise (an error
+        // cluster or a new allele stopped the segment) the whole read is judged.
         bool boundary = false;
         if (seg.first <= seg.second) {
-            auto side = [&](std::size_t a, std::size_t b, bool& decoy) {   // locus k-mer share in [a, b)
+            auto share = [&](std::size_t a, std::size_t b) {   // locus k-mer share in [a, b)
                 std::size_t locus = 0;
-                for (std::size_t i = a; i < b; ++i) {
-                    if (v[i].lab == kLabelD) decoy = true;
-                    else if (v[i].lab != kLabelN) ++locus;
-                }
+                for (std::size_t i = a; i < b; ++i) locus += v[i].lab != kLabelN && v[i].lab != kLabelD;
                 return b > a ? static_cast<double>(locus) / static_cast<double>(b - a) : 0.0;
             };
-            bool decoy_l = false, decoy_r = false;
-            const double left = side(0, seg.first, decoy_l), right = side(seg.second + 1, v.size(), decoy_r);
-            boundary = left < flank_share && right < flank_share && !(decoy_l && decoy_r);
+            auto sites = [&](std::size_t a, std::size_t b, std::uint8_t lab) {   // k bases apart, in read order
+                std::size_t n = 0;
+                bool open = false;
+                std::uint32_t first = 0;
+                for (std::size_t i = a; i < b; ++i)
+                    if (v[i].lab == lab && (!open || v[i].start >= first + kK)) { ++n; open = true; first = v[i].start; }
+                return n;
+            };
+            const std::size_t private_sites = sites(seg.first, seg.second + 1, kLabelP);
+            auto homologous = [&](std::size_t a, std::size_t b) {
+                const std::size_t d = sites(a, b, kLabelD);
+                return d >= kFlankDecoySites && static_cast<double>(d) >= bar.decoy_share * static_cast<double>(private_sites);
+            };
+            boundary = share(0, seg.first) < flank_share && share(seg.second + 1, v.size()) < flank_share &&
+                       !(homologous(0, seg.first) && homologous(seg.second + 1, v.size()));
             if (!boundary) seg = {0, v.size() - 1};
         }
         if (m == 0) {

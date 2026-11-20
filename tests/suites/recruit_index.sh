@@ -126,6 +126,18 @@ python3 "$TOOLS/locus_reads.py" data/ref.fa chr1 115000 165000 30 span 6 reads_s
 "$BIN" recruit --locus idx/locus.plx -1 reads_span_1.fq -o span.tsv -t 2 -q
 check "reads holding the whole locus between two flanks are certain, partial ($(reason span.tsv partial) of 30)" '[[ $(reason span.tsv partial) == 30 ]]'
 check "reads past the end are certain, partial ($(reason long.tsv partial) of 300), segments within the read" '[[ $(reason long.tsv partial) -ge 270 ]] && awk -F"\t" '"'"'NR>1 && $4=="partial" {split($6, g, "-"); if (g[2] - g[1] >= 2000 || g[1] != 0 && g[2] != 2000) bad = 1} END {exit bad}'"'"' long.tsv'
+# a long read through the locus with the paralog (a homologous flank, its decoys) beyond one end and one stray
+# paralog 40-mer beyond the other: the stray k-mers are no flank, so the locus stretch alone is judged
+python3 - data/ref.fa > reads_flank.fq <<'PY'
+import sys
+seq = "".join(l.strip() for l in open(sys.argv[1]) if not l.startswith(">"))
+locus = seq[120000:160000]
+stray = next(seq[a:a + 40] for a in range(232000, 258000, 7) if seq[a:a + 40] not in locus)
+read = seq[100000:110000] + stray + seq[110000:260000]
+print("@flank\n" + read + "\n+\n" + "I" * len(read))
+PY
+"$BIN" recruit --locus idx/locus.plx -i reads_flank.fq -o flank.tsv -t 2 -q
+check "a stray decoy k-mer beyond one end does not make a long read judged whole ($(awk -F'\t' 'NR > 1 {print $3 "/" $4}' flank.tsv))" '[[ "$(awk -F"\t" '"'"'NR > 1 {print $3}'"'"' flank.tsv)" == certain ]]'
 
 # a locus copy broken inside a tandem array: the array's middle sits on a contig of its own, out of the
 # anchors' reach; it is found as a piece and subtracted, and the copies' uncertain ends that are array count
