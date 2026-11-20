@@ -33,6 +33,10 @@ struct Counts {
 double score(const Counts& c, const Rates& r);
 std::int32_t score_bin(double s);
 
+// Certain takes this many independent private sites in the stretch that reaches its threshold: one differing base
+// cannot be told from one sequencing error or one new allele.
+constexpr std::uint32_t kCertainSites = 2;
+
 // What decides a fragment under the score, before rates: the pooled stretch (a pair's mates pooled, sites counted
 // once) and each mate alone, and which of them may call it. A stretch may call it with a private site, callable
 // and not divergent; the pooled one with a mate wholly in the locus (or a single read), a mate alone unless the
@@ -87,6 +91,19 @@ Costs costs_for(double error_rate);
 
 // A locus index as reads see it.
 LocusTable table_of(const LocusIndex& x);
+
+// A read's k-mer, labelled: its canonical code, its start in the read and its label.
+struct Kmer {
+    std::uint64_t code;
+    std::uint32_t start;
+    std::uint8_t lab;
+    bool backbone;
+};
+
+// What the score decides on for a fragment given as labelled k-mers (each mate's in read order, with its bases),
+// held to this error rate and decoy share: the calibration's scan of sequence it has labelled itself.
+Judged judge_labelled(const std::vector<Kmer>& one, std::size_t bases1, const std::vector<Kmer>* two, std::size_t bases2,
+                      double error_rate, double decoy_share, double gap_cost, double flank_share);
 
 // One fragment against one locus. With `certain_through`, also the largest private-site cut (up to
 // kMaxCut) at which the fragment is certain by the first rules, 0 if none: certain at a cut means certain at

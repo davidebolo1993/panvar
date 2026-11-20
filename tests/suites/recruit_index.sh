@@ -388,6 +388,19 @@ PY
 "$BIN" recruit --locus idx_logo/locus.plx -i reads_len.fq -o len.tsv --preset hifi -t 2 -q
 lenrow() { awk -F'\t' -v f="$1" '$1==f {print "sites " $8 ", score " $25}' len.tsv; }
 check "a long stretch with few sites scores below a short dense one (long: $(lenrow long); short: $(lenrow short))" 'awk -F"\t" '"'"'$1=="long" {l = $25; lp = $8} $1=="short" {s = $25; sp = $8} END {exit !(lp == 2 && sp == 2 && l + 0 < s + 0)}'"'"' len.tsv'
+# one private site is never certain: with every threshold as low as it goes, a read holding one spliced-in site is
+# likely, the same read with a second site certain
+python3 - data/logo/ref.fa > reads_one.fq <<'PY'
+import sys
+seq = "".join(l.strip() for l in open(sys.argv[1]) if not l.startswith(">"))
+one = seq[149000:149050] + seq[125000:125040] + seq[149090:149200]
+two = seq[149000:149050] + seq[125000:125040] + seq[149090:149150] + seq[126000:126040] + seq[149190:149260]
+for name, r in (("one", one), ("two", two)):
+    print(f"@{name}\n{r}\n+\n{'I' * len(r)}")
+PY
+"$BIN" recruit --locus idx_logo/locus.plx -i reads_one.fq -o one.tsv --preset illumina --certain-rate 0.9 --likely-rate 0.9 -t 2 -q
+onerow() { awk -F'\t' -v f="$1" '$1==f {print $3 "/" $4 "/" $8 " sites/tier " $26}' one.tsv; }
+check "one private site is never certain, two can be (one: $(onerow one); two: $(onerow two))" '[[ "$(onerow one)" == "likely/single_site/1 sites/tier likely" && "$(onerow two)" == certain/*/2\ sites/tier\ certain ]]'
 # thresholds follow the asked rate; the table is the same on any thread count. Pairs from the locus and from each homolog
 python3 "$TOOLS/locus_reads.py" data/logo/ref.fa chr1 120000 160000 2000 loc 7 reads_lg_locus
 python3 "$TOOLS/locus_reads.py" data/logo/gu.fa u 20000 32500 1000 hu 8 reads_lg_u

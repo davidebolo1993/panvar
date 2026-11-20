@@ -13,13 +13,6 @@ namespace panvar::recruit::scoring {
 
 namespace {
 
-struct Kmer {
-    std::uint64_t code;
-    std::uint32_t start;
-    std::uint8_t lab;
-    bool backbone;
-};
-
 // One mate's k-mers, labelled, with the whole-read counts.
 std::vector<Kmer> label_read(const std::string& s, const LocusTable& t, Evidence& ev) {
     ev.bases += static_cast<std::uint32_t>(s.size());
@@ -235,31 +228,42 @@ Judged judge(const Evidence& v, const Evidence& one, const Evidence* two, const 
     return j;
 }
 
+// The tier a fragment's stretches reach: 2 certain, 1 likely, 0 neither; `pooled_certain` when the pooled stretch
+// is certain. Certain takes kCertainSites private sites in the stretch that reaches the certain bin.
+int tier_of(const Judged& j, const LocusTable& t, bool* pooled_certain = nullptr) {
+    auto reaches = [&](const Counts& c, bool ok, std::int32_t bin, std::uint32_t sites) {
+        return ok && c.p >= sites && score_bin(score(c, t.rates)) >= bin;
+    };
+    auto any = [&](std::int32_t bin, std::uint32_t sites) {
+        return reaches(j.pooled, j.pooled_ok, bin, sites) || reaches(j.mate[0], j.mate_ok[0], bin, sites) ||
+               reaches(j.mate[1], j.mate_ok[1], bin, sites);
+    };
+    if (pooled_certain != nullptr) *pooled_certain = reaches(j.pooled, j.pooled_ok, t.certain_bin, kCertainSites);
+    return any(t.certain_bin, kCertainSites) ? 2 : any(t.likely_bin, 1) ? 1 : 0;
+}
+
 // A fragment's fate by the score. Certain when the pooled stretch, or one mate alone (rescued), reaches the
-// certain bin; likely when one reaches the likely bin; otherwise as by the first rules, with `low_score` for
-// two or more private sites that fall short. A not-certain fragment keeps the reason it is not certain.
+// certain bin with two private sites; likely when one reaches the likely bin; otherwise as by the first rules,
+// with `low_score` for two or more private sites that fall short. A not-certain fragment keeps the reason it is
+// not certain.
 void decide_by_score(Row& r, const Judged& j, const LocusTable& t, const char* status[2], bool pair, const Bar& b) {
     const Evidence& v = r.ev;
-    auto reaches = [&](const Counts& c, bool ok, std::int32_t bin) { return ok && score_bin(score(c, t.rates)) >= bin; };
-    auto any = [&](std::int32_t bin) {
-        return reaches(j.mate[0], j.mate_ok[0], bin) || reaches(j.mate[1], j.mate_ok[1], bin);
-    };
-    const bool pooled = reaches(j.pooled, j.pooled_ok, t.certain_bin);
-    if (pooled || any(t.certain_bin)) {
+    bool pooled = false;
+    const int tier = tier_of(j, t, &pooled);
+    if (tier == 2) {
         r.fate = "certain";
         const bool out = pair && (std::string(status[0]) == "out" || std::string(status[1]) == "out");
         const bool part = std::string(status[0]) == "part" || (pair && std::string(status[1]) == "part");
         r.reason = !pooled || out ? "rescued" : part ? "partial" : ".";
         return;
     }
-    const bool likely = reaches(j.pooled, j.pooled_ok, t.likely_bin) || any(t.likely_bin);
     const std::uint32_t decoy = v.sites_d + v.decoy_out;
     if (v.sites_p == 0 && decoy >= 2) { r.fate = "unrecruited"; r.reason = "homolog"; return; }
-    r.fate = likely ? "likely" : "ambiguous";
+    r.fate = tier == 1 ? "likely" : "ambiguous";
     if (v.sites_p >= 1 && decoy >= 1) { r.reason = "conflict"; return; }
     if (uncallable(v) && v.sites_p >= 1) { r.reason = "uncallable"; return; }
     if (divergent(v, b) && v.sites_p >= 1) { r.reason = "divergent"; return; }
-    if (j.pooled_mates_out && reaches(j.pooled, true, t.certain_bin)) { r.reason = "mates_out"; return; }
+    if (j.pooled_mates_out && j.pooled.p >= kCertainSites && score_bin(score(j.pooled, t.rates)) >= t.certain_bin) { r.reason = "mates_out"; return; }
     if (v.sites_p == 1) { r.reason = "single_site"; return; }
     if (v.sites_p >= 2) { r.reason = "low_score"; return; }
     if (v.n_s >= 1) { r.reason = "shared_only"; return; }
@@ -289,47 +293,14 @@ Bar bar_for(const Fragment& fr, const ReadOptions& o) {
     return {own > o.error_rate && own < 0.3 ? own : o.error_rate, longest >= kLongRead ? o.decoy_share_long : o.decoy_share};
 }
 
-// Scores one fragment against one locus.
-}  // namespace
-
-double score(const Counts& c, const Rates& r) {
-    const double len = static_cast<double>(c.n) / static_cast<double>(kK);
-    return static_cast<double>(c.p) * std::log(r.r_in / r.r_out) - len * (r.r_in - r.r_out) +
-           static_cast<double>(c.d) * std::log(r.q_in / r.q_out) - len * (r.q_in - r.q_out);
-}
-
-std::int32_t score_bin(double s) {
-    return static_cast<std::int32_t>(std::clamp(std::floor(s / kScoreBin), -1e9, 1e9));
-}
-
-bool deciding_score(const Judged& j, const Rates& r, double& s) {
-    bool any = false;
-    auto take = [&](const Counts& c, bool ok) {
-        if (!ok) return;
-        const double x = score(c, r);
-        if (!any || x > s) s = x;
-        any = true;
-    };
-    take(j.pooled, j.pooled_ok);
-    take(j.mate[0], j.mate_ok[0]);
-    take(j.mate[1], j.mate_ok[1]);
-    return any;
-}
-
-Row score_fragment(const Fragment& fr, const LocusTable& t, std::uint32_t li, const ReadOptions& o, double gap_cost,
-                   double flank_share, std::uint32_t* certain_through, Judged* judged) {
-    Row r;
-    r.fragment = fr.name;
-    r.locus = li;
-    const bool pair = fr.paired;
-    const Bar bar = bar_for(fr, o);
-    Evidence ev[2], dedup2;
-    const char* status[2] = {"out", "out"};
+// Each mate's locus segment and the evidence in it, from its labelled k-mers; `ev` holds each mate's whole-read
+// counts on entry. `on_segment(m, v, seg)` sees each mate's final segment (first > last: none).
+template <class F>
+void weigh(const std::vector<Kmer>* mates[2], int n_mates, const Bar& bar, double gap_cost, double flank_share, Evidence ev[2],
+           Evidence& dedup2, const char* status[2], F&& on_segment) {
     std::vector<std::uint64_t> seen;
-    std::vector<std::uint32_t> sets;   // node sets of the private k-mers in the segments
-    for (int m = 0; m < (pair ? 2 : 1); ++m) {
-        const std::string& s = m == 0 ? fr.seq1 : fr.seq2;
-        const std::vector<Kmer> v = label_read(s, t, ev[m]);
+    for (int m = 0; m < n_mates; ++m) {
+        const std::vector<Kmer>& v = *mates[m];
         auto seg = locus_segment(v, gap_cost);
         // a segment shorter than k k-mers (under 2k - 1 bases of locus) is no evidence of the locus
         if (seg.first <= seg.second && seg.second - seg.first + 1 < kK) seg = {1, 0};
@@ -372,18 +343,88 @@ Row score_fragment(const Fragment& fr, const LocusTable& t, std::uint32_t li, co
             dedup2.sites_p = dedup2.sites_d = dedup2.decoy_out = dedup2.runs_n = dedup2.seg_kmers = 0;
             count_segment(v, seg, boundary, dedup2, &seen, nullptr);
         }
+        on_segment(m, v, seg);
+        if (seg.first <= seg.second) status[m] = ev[m].seg_kmers * 10 >= ev[m].kmers * 9 ? "in" : "part";
+    }
+}
+
+}  // namespace
+
+Judged judge_labelled(const std::vector<Kmer>& one, std::size_t bases1, const std::vector<Kmer>* two, std::size_t bases2,
+                      double error_rate, double decoy_share, double gap_cost, double flank_share) {
+    Evidence ev[2], dedup2;
+    const std::vector<Kmer>* mates[2] = {&one, two};
+    const std::size_t bases[2] = {bases1, bases2};
+    const int n = two != nullptr ? 2 : 1;
+    for (int m = 0; m < n; ++m) {
+        Evidence& e = ev[m];
+        e.bases = static_cast<std::uint32_t>(bases[m]);
+        if (bases[m] >= kK) e.windows = static_cast<std::uint32_t>(bases[m] - kK + 1);
+        e.kmers = static_cast<std::uint32_t>(mates[m]->size());
+        for (const Kmer& k : *mates[m]) {
+            switch (k.lab) {
+                case kLabelP: ++e.n_p; break;
+                case kLabelS: ++e.n_s; break;
+                case kLabelR: ++e.n_r; break;
+                case kLabelD: ++e.n_d; break;
+                default: ++e.n_n;
+            }
+        }
+    }
+    const char* status[2] = {"out", "out"};
+    const Bar bar{error_rate, decoy_share};
+    weigh(mates, n, bar, gap_cost, flank_share, ev, dedup2, status, [](int, const std::vector<Kmer>&, std::pair<std::size_t, std::size_t>) {});
+    Evidence pooled = ev[0];
+    if (two != nullptr) pooled.add(dedup2);
+    return judge(pooled, ev[0], two != nullptr ? &ev[1] : nullptr, status, bar);
+}
+
+double score(const Counts& c, const Rates& r) {
+    const double len = static_cast<double>(c.n) / static_cast<double>(kK);
+    return static_cast<double>(c.p) * std::log(r.r_in / r.r_out) - len * (r.r_in - r.r_out) +
+           static_cast<double>(c.d) * std::log(r.q_in / r.q_out) - len * (r.q_in - r.q_out);
+}
+
+std::int32_t score_bin(double s) {
+    return static_cast<std::int32_t>(std::clamp(std::floor(s / kScoreBin), -1e9, 1e9));
+}
+
+bool deciding_score(const Judged& j, const Rates& r, double& s) {
+    bool any = false;
+    auto take = [&](const Counts& c, bool ok) {
+        if (!ok) return;
+        const double x = score(c, r);
+        if (!any || x > s) s = x;
+        any = true;
+    };
+    take(j.pooled, j.pooled_ok);
+    take(j.mate[0], j.mate_ok[0]);
+    take(j.mate[1], j.mate_ok[1]);
+    return any;
+}
+
+Row score_fragment(const Fragment& fr, const LocusTable& t, std::uint32_t li, const ReadOptions& o, double gap_cost,
+                   double flank_share, std::uint32_t* certain_through, Judged* judged) {
+    Row r;
+    r.fragment = fr.name;
+    r.locus = li;
+    const bool pair = fr.paired;
+    const Bar bar = bar_for(fr, o);
+    Evidence ev[2], dedup2;
+    const char* status[2] = {"out", "out"};
+    std::vector<std::uint32_t> sets;   // node sets of the private k-mers in the segments
+    std::vector<Kmer> labelled[2];
+    const int n_mates = pair ? 2 : 1;
+    for (int m = 0; m < n_mates; ++m) labelled[m] = label_read(m == 0 ? fr.seq1 : fr.seq2, t, ev[m]);
+    const std::vector<Kmer>* mates[2] = {&labelled[0], &labelled[1]};
+    weigh(mates, n_mates, bar, gap_cost, flank_share, ev, dedup2, status, [&](int m, const std::vector<Kmer>& v, std::pair<std::size_t, std::size_t> seg) {
         for (std::size_t i = seg.first; i <= seg.second && i < v.size(); ++i) {
             if (v[i].backbone) ++r.backbone;
             if (v[i].lab == kLabelP)
                 if (const std::uint32_t* ns = t.nodeset.find(v[i].code)) sets.push_back(*ns);
         }
-        if (seg.first <= seg.second) {
-            r.seg[m] = std::to_string(v[seg.first].start) + "-" + std::to_string(v[seg.second].start + kK);
-            status[m] = ev[m].seg_kmers * 10 >= ev[m].kmers * 9 ? "in" : "part";
-        } else {
-            r.seg[m] = ".";
-        }
-    }
+        r.seg[m] = seg.first <= seg.second ? std::to_string(v[seg.first].start) + "-" + std::to_string(v[seg.second].start + kK) : ".";
+    });
     std::sort(sets.begin(), sets.end());
     sets.erase(std::unique(sets.begin(), sets.end()), sets.end());
     std::vector<std::uint32_t> nodes;
@@ -412,8 +453,10 @@ Row score_fragment(const Fragment& fr, const LocusTable& t, std::uint32_t li, co
     if (t.rates.known()) {
         r.scored = true;
         if (deciding_score(j, t.rates, r.score)) {
-            const std::int32_t bin = score_bin(r.score);
-            if (t.tiers) r.tier = bin >= t.certain_bin ? "certain" : bin >= t.likely_bin ? "likely" : ".";
+            if (t.tiers) {
+                const int tier = tier_of(j, t);
+                r.tier = tier == 2 ? "certain" : tier == 1 ? "likely" : ".";
+            }
         } else {
             r.score = score(j.pooled, t.rates);
         }
