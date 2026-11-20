@@ -19,7 +19,9 @@ namespace panvar {
 // falling reference order is stored on the other strand and is read reversed, so both strands give the same
 // result. A reversed run of at least `min_bp`, in falling reference order (eight step pairs in ten), between
 // two forward runs is an inversion; haplotypes whose reversed runs overlap by nine tenths are one, placed at
-// the flanks most of them share. Positions are 0-based offsets along the reference path.
+// the flanks most of them share. The runs must not overlap on the reference; where a few steps far out of place
+// (a node of one copy of a repeat walked at the other's, at most a twentieth of a run's bases at either end) make
+// them, the runs are read without those steps. Positions are 0-based offsets along the reference path.
 struct PathInversion {
     std::size_t left_end = 0;      // last base of the forward run before the inversion
     std::size_t inv_lo = 0;        // first base of the reversed run
@@ -27,6 +29,8 @@ struct PathInversion {
     std::size_t right_start = 0;   // first base of the forward run after it
     std::string left_node, right_node;   // the reference nodes holding left_end and right_start
     std::vector<std::size_t> carriers;   // path indices
+    // Each carrier's own flanks (left_end, right_start), as carriers: the inversion each one makes.
+    std::vector<std::pair<std::size_t, std::size_t>> carrier_flanks;
 };
 
 struct PathInversionScan {

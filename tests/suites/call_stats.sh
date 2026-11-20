@@ -4207,6 +4207,19 @@ check "a whole copy gained or lost, with --cn: one copy-number record, no insert
 check "a whole copy lost, with --cn: the records rebuild every haplotype (bp left by call's events:by the VCF)" \
   "$(awk -F'\t' '$1=="large_left_call_bp"{c=$2} $1=="large_left_vcf_bp"{v=$2} END{print c":"v}' "$OUT/invc/cnb.summary.tsv")" "0:0"
 
+# Inversions of three lengths at one inversion site: each haplotype carries the record of its own inversion (two
+# whose backward runs overlap by nine tenths share one, with their lengths' range), one reaching past the site's last
+# node is written there too, and a haplotype carrying one is . at the others it overlaps, not 0.
+python3 -I "$TOOLS/spec_gfa.py" "$SPEC_DIR/inversion_lengths.spec" "$OUT/invl"
+printf 'bubble_id,source,source_orient,sink,sink_orient,path_support,min_inside_bp,max_inside_bp,inside_nodes,kind,parent_id\n1,F0,+,X3,+,6,0,2100,"R;X1;X2",inversion,\n' \
+  > "$OUT/invl/inv.csv"
+"$BIN" call -i "$OUT/invl/g.gfa" -c "$OUT/invl/inv.csv" -r 'ref#0#chr1:1-3260' -o "$OUT/invl/v" --no-per-bubble-vcf -q \
+  > "$OUT/invl/v.log" 2>&1
+check "inversions of three lengths: one record each, alleles of one together, . at the others (POS:SVLEN:SVLEN_RANGE:GT r1 ifirst imid imid2 iall)" \
+  "$(awk -F'\t' '!/^#/{l=$8; sub(/.*;SVLEN=/,"",l); sub(/;.*/,"",l); r="-"; if($8 ~ /SVLEN_RANGE=/){r=$8; sub(/.*SVLEN_RANGE=/,"",r); sub(/;.*/,"",r)}
+       g=""; for(i=11;i<=NF;i++) g=g substr($i,1,1); printf "%s:%s:%s:%s ", $2, l, r, g}' "$OUT/invl/v.region.vcf")" \
+  "200:1100:-:01... 200:2860:-:0...1 900:1400:1400,1460:0.11. "
+
 printf "\n"
 if [ "$fails" -eq 0 ]; then printf "call_stats: all assertions passed\n"; exit 0; fi
 # repeated last, shortened: a long output can be cut in the middle by ctest

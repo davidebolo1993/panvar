@@ -5865,6 +5865,10 @@ void call_variants(
         }
         std::size_t written = 0, no_site = 0;
         std::unordered_map<std::size_t, int> per_parent;
+        // The inversions to write, each with its site, first: a haplotype that carries one of them has no allele
+        // at another it overlaps, rather than the reference's.
+        struct Planned { const PathInversion* inv; const Bubble* parent; std::size_t pos, end; };
+        std::vector<Planned> planned;
         for (const PathInversion& inv_site : scan.inversions) {
             // The representative breakpoints: the flanks most carriers share.
             const std::size_t left = g0 + inv_site.left_end, a = g0 + inv_site.inv_lo, b = g0 + inv_site.inv_hi,
@@ -5877,12 +5881,31 @@ void call_variants(
                 if (hi > lo && 2 * (hi - lo) >= end - pos) dup = true;
             }
             if (dup) continue;
-            // The inversion site whose flanks hold the reversed run.
+            // The inversion site whose flanks hold the reversed run; where none holds it, the one it overlaps most,
+            // so a haplotype carrying it is not left reading the reference's allele there.
             const Bubble* parent = nullptr;
             for (const auto& [bi, sp] : parent_span)
                 if (sp.first <= a && b < sp.second) { parent = &bubbles[bi]; break; }
+            if (parent == nullptr) {
+                std::size_t most = 0;
+                for (const auto& [bi, sp] : parent_span) {
+                    const std::size_t lo = std::max(sp.first, a), hi = std::min(sp.second, b + 1);
+                    if (hi > lo && hi - lo > most) { most = hi - lo; parent = &bubbles[bi]; }
+                }
+            }
             if (parent == nullptr) { ++no_site; continue; }
             if (!bubble_filter.empty() && !bubble_filter.count(parent->id)) continue;
+            planned.push_back({&inv_site, parent, pos, end});
+        }
+        for (const Planned& pl : planned) {
+            const PathInversion& inv_site = *pl.inv;
+            const Bubble* parent = pl.parent;
+            const std::size_t left = g0 + inv_site.left_end, a = g0 + inv_site.inv_lo, b = g0 + inv_site.inv_hi,
+                              right = g0 + inv_site.right_start;
+            const std::size_t pos = pl.pos, end = pl.end;
+            std::unordered_set<std::size_t> other;   // carriers of another inversion written over this one
+            for (const Planned& o : planned)
+                if (&o != &pl && o.pos < end && pos < o.end) other.insert(o.inv->carriers.begin(), o.inv->carriers.end());
             const std::unordered_set<std::size_t> carriers(inv_site.carriers.begin(), inv_site.carriers.end());
             std::string gts;
             std::size_t an = 0, ac = 0;
@@ -5890,6 +5913,7 @@ void call_variants(
             for (std::size_t pi = 0; pi < graph.paths.size(); ++pi) {
                 std::string gt;
                 if (carriers.count(pi)) { gt = "1"; ++an; ++ac; carrier_names.push_back(graph.paths[pi].name); }
+                else if (other.count(pi)) gt = ".";
                 else if (span[pi].first <= left && span[pi].second >= right) { gt = "0"; ++an; }
                 else gt = ".";
                 gts += '\t' + gt + ":.";
@@ -5905,6 +5929,10 @@ void call_variants(
             std::ostringstream info;
             info << "END=" << end << ";SVTYPE=INV;SVLEN=" << (end - pos) << ";PATH_INVERSION;BUBBLE_ID=" << parent->id;
             if (cipos > 0 || ciend > 0) info << ";IMPRECISE;CIPOS=0," << cipos << ";CIEND=-" << ciend << ",0";
+            // Its carriers' own inversions, where their lengths differ: the record writes one of them.
+            std::size_t len_lo = SIZE_MAX, len_hi = 0;
+            for (const auto& [l, r] : inv_site.carrier_flanks) { len_lo = std::min(len_lo, r - 1 - l); len_hi = std::max(len_hi, r - 1 - l); }
+            if (len_lo < len_hi) info << ";SVLEN_RANGE=" << len_lo << ',' << len_hi;
             info << ";AN=" << an << ";AC=" << ac << ";AF=" << afb;
             if (!genes.empty()) {
                 const std::vector<std::string> gnames = genes_in_interval(pos + 1, end);
@@ -5921,16 +5949,21 @@ void call_variants(
                        info.str() + "\tGT:CN" + gts + '\n';
             out_records.push_back(std::move(rec));
             if (options.write_variant_nodes) {
-                // benchmark applies the inverted reference stretch to each carrier; the repeats at the
-                // breakpoints come out as small differences
-                std::sort(carrier_names.begin(), carrier_names.end());
-                const std::size_t g0 = pos + 1, g1 = end;
-                const std::string inv = reverse_complement(ref_genome.substr(g0 - ref_meta.region_start_1based, g1 - g0 + 1));
+                // benchmark applies the inverted reference stretch to each carrier, between its own flanks; the
+                // repeats at the breakpoints come out as small differences
                 variant_nodes_rows.push_back(id + '\t' + std::to_string(parent->id) + "\tINV\t" + own_nodes(*parent));
-                std::string row = id + '\t' + std::to_string(parent->id) + "\tinv\t" + std::to_string(g0) + '\t' + std::to_string(g1) + "\t.\t.\t" +
-                                  std::to_string(g1 - g0 + 1) + '\t' + std::to_string(inv.size()) + '\t' + inv + '\t';
-                for (std::size_t k = 0; k < carrier_names.size(); ++k) { if (k) row += ','; row += carrier_names[k]; }
-                carrier_events_rows.push_back(std::move(row));
+                std::map<std::pair<std::size_t, std::size_t>, std::vector<std::string>> by_flanks;
+                for (std::size_t k = 0; k < inv_site.carriers.size(); ++k)
+                    by_flanks[inv_site.carrier_flanks[k]].push_back(graph.paths[inv_site.carriers[k]].name);
+                for (auto& [fl, names] : by_flanks) {
+                    std::sort(names.begin(), names.end());
+                    const std::size_t g0c = g0 + fl.first + 1, g1c = g0 + fl.second - 1;
+                    const std::string inv = reverse_complement(ref_genome.substr(g0c - ref_meta.region_start_1based, g1c - g0c + 1));
+                    std::string row = id + '\t' + std::to_string(parent->id) + "\tinv\t" + std::to_string(g0c) + '\t' + std::to_string(g1c) +
+                                      "\t.\t.\t" + std::to_string(g1c - g0c + 1) + '\t' + std::to_string(inv.size()) + '\t' + inv + '\t';
+                    for (std::size_t k = 0; k < names.size(); ++k) { if (k) row += ','; row += names[k]; }
+                    carrier_events_rows.push_back(std::move(row));
+                }
             }
             ++written;
             ++summary.records_written;

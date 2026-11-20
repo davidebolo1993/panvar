@@ -36,8 +36,27 @@ PathInversionScan find_path_inversions(const Graph& graph, const PathRecord& ref
         std::size_t outer_first = 0, outer_last = 0;
         bool outer_long = false;
         std::string lo_node, hi_node;
+        std::vector<std::pair<std::size_t, const std::string*>> steps;   // its own steps' (start, node), absorbed runs left out
+        std::vector<std::size_t> lens;                                 // and their lengths
     };
     struct Cand { std::size_t pi, left, a, b, right; std::string left_node, right_node; };
+    // A run's reference range without the steps far out of place at either end: in reference order, steps are
+    // left out from each end while they hold at most a twentieth of the run's bases.
+    struct Bound { std::size_t lo, hi; const std::string* lo_node; const std::string* hi_node; };
+    const auto trimmed = [](const Run& r) {
+        std::vector<std::size_t> order(r.steps.size());
+        for (std::size_t k = 0; k < order.size(); ++k) order[k] = k;
+        std::sort(order.begin(), order.end(), [&](std::size_t x, std::size_t y) { return r.steps[x].first < r.steps[y].first; });
+        std::size_t total = 0;
+        for (const std::size_t l : r.lens) total += l;
+        std::size_t i = 0, j = order.size(), cut = 0;
+        while (i + 1 < j && 20 * (cut + r.lens[order[i]]) <= total) cut += r.lens[order[i++]];
+        cut = 0;
+        while (j > i + 1 && 20 * (cut + r.lens[order[j - 1]]) <= total) cut += r.lens[order[--j]];
+        if (order.empty()) return Bound{r.lo, r.hi, &r.lo_node, &r.hi_node};
+        const std::size_t a = order[i], b = order[j - 1];
+        return Bound{r.steps[a].first, r.steps[b].first + r.lens[b] - 1, r.steps[a].second, r.steps[b].second};
+    };
     std::vector<Cand> cands;
     for (std::size_t pi = 0; pi < graph.paths.size(); ++pi) {
         if (&graph.paths[pi] == &reference) { out.span[pi] = {0, ref_total == 0 ? 0 : ref_total - 1}; continue; }
@@ -71,6 +90,8 @@ PathInversionScan find_path_inversions(const Graph& graph, const PathRecord& ref
                 Run& r = runs.back();
                 r.bp += h.len;
                 r.last_start = h.start;
+                r.steps.emplace_back(h.start, h.node);
+                r.lens.push_back(h.len);
                 if (h.start < r.lo) { r.lo = h.start; r.lo_node = *h.node; }
                 if (h.start + h.len - 1 >= r.hi) { r.hi = h.start + h.len - 1; r.hi_node = *h.node; }
             }
@@ -89,6 +110,8 @@ PathInversionScan find_path_inversions(const Graph& graph, const PathRecord& ref
                     m.bp += r.bp;
                     if (r.lo < m.lo) { m.lo = r.lo; m.lo_node = r.lo_node; }
                     if (r.hi > m.hi) { m.hi = r.hi; m.hi_node = r.hi_node; }
+                    m.steps.insert(m.steps.end(), r.steps.begin(), r.steps.end());
+                    m.lens.insert(m.lens.end(), r.lens.begin(), r.lens.end());
                     if (r.bp >= min_bp && !m.outer_long) { m.outer_first = r.first_start; m.outer_long = true; }
                     if (r.bp >= min_bp || !m.outer_long) m.outer_last = r.last_start;
                 } else {
@@ -122,8 +145,12 @@ PathInversionScan find_path_inversions(const Graph& graph, const PathRecord& ref
             const Run& L = merged[k - 1]; const Run& M = merged[k]; const Run& R = merged[k + 1];
             if (M.fwd || !L.fwd || !R.fwd || M.bp < min_bp) continue;
             if (M.pairs > 0 && 10 * M.falls < 8 * M.pairs) continue;   // not walked in falling order
-            if (!(L.hi < M.lo && M.hi < R.lo)) continue;              // flanks must lie outside it
-            cands.push_back(Cand{pi, L.hi, M.lo, M.hi, R.lo, L.hi_node, R.lo_node});
+            if (L.hi < M.lo && M.hi < R.lo) {                        // flanks must lie outside it
+                cands.push_back(Cand{pi, L.hi, M.lo, M.hi, R.lo, L.hi_node, R.lo_node});
+                continue;
+            }
+            const Bound l = trimmed(L), m = trimmed(M), r = trimmed(R);
+            if (l.hi < m.lo && m.hi < r.lo) cands.push_back(Cand{pi, l.hi, m.lo, m.hi, r.lo, *l.hi_node, *r.lo_node});
         }
     }
     std::sort(cands.begin(), cands.end(), [](const Cand& x, const Cand& y) {
@@ -147,12 +174,15 @@ PathInversionScan find_path_inversions(const Graph& graph, const PathRecord& ref
             [](const auto& x, const auto& y) { return x.second < y.second; })->first;
         PathInversion inv;
         std::tie(inv.left_end, inv.inv_lo, inv.inv_hi, inv.right_start) = best;
+        std::vector<std::tuple<std::size_t, std::size_t, std::size_t>> own;   // (path, left, right)
         for (const Cand& c : g) {
             if (std::tie(c.left, c.a, c.b, c.right) == best) { inv.left_node = c.left_node; inv.right_node = c.right_node; }
-            inv.carriers.push_back(c.pi);
+            own.emplace_back(c.pi, c.left, c.right);
         }
-        std::sort(inv.carriers.begin(), inv.carriers.end());
-        inv.carriers.erase(std::unique(inv.carriers.begin(), inv.carriers.end()), inv.carriers.end());
+        std::sort(own.begin(), own.end());
+        own.erase(std::unique(own.begin(), own.end(), [](const auto& x, const auto& y) { return std::get<0>(x) == std::get<0>(y); }),
+                  own.end());
+        for (const auto& [pi, l, r] : own) { inv.carriers.push_back(pi); inv.carrier_flanks.emplace_back(l, r); }
         out.inversions.push_back(std::move(inv));
     }
     return out;
