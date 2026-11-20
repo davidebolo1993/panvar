@@ -400,22 +400,22 @@ ReadStats recruit_reads(const ReadOptions& options) {
             return note;
         };
         for (std::size_t li = 0; li < loci.size(); ++li) {
-            const Calibration* c = calibration_for(calibration[li], o.read_class, mean, o.error_rate);
-            const bool score = c != nullptr && has_score(*c);
+            const Calibration* cal = calibration_for(calibration[li], o.read_class, mean, o.error_rate);
+            const bool score = cal != nullptr && has_score(*cal);
             if (score) {
-                loci[li].rates = Rates{c->r_in, c->r_out, c->q_in, c->q_out};
-                const Tier ct = score_tier(*c, o.false_certain_rate), lt = score_tier(*c, o.likely_rate);
+                loci[li].rates = Rates{cal->r_in, cal->r_out, cal->q_in, cal->q_out};
+                const Tier ct = score_tier(*cal, o.false_certain_rate), lt = score_tier(*cal, o.likely_rate);
                 loci[li].certain_bin = ct.bin;
                 loci[li].likely_bin = std::min(lt.bin, ct.bin);
                 loci[li].tiers = true;
                 loci[li].by_score = !o.rules_v1 && o.calibrated_cut;
                 if (loci[li].by_score) {
                     std::snprintf(b, sizeof b, "%s reads: r_in %.4g, r_out %.4g, q_in %.4g, q_out %.4g; off-target screened %llu, of them %llu from %zu held-out genomes",
-                                  c->read_class.c_str(), c->r_in, c->r_out, c->q_in, c->q_out,
-                                  static_cast<unsigned long long>(c->flank_screened + c->decoy_screened + c->genome_screened),
-                                  static_cast<unsigned long long>(c->genome_screened), c->genomes.size());
+                                  cal->read_class.c_str(), cal->r_in, cal->r_out, cal->q_in, cal->q_out,
+                                  static_cast<unsigned long long>(cal->flank_screened + cal->decoy_screened + cal->genome_screened),
+                                  static_cast<unsigned long long>(cal->genome_screened), cal->genomes.size());
                     notes[li].push_back("score");
-                    notes[li].push_back(b + caveats(*c));
+                    notes[li].push_back(b + caveats(*cal));
                     for (const auto& [name, t] : {std::pair<const char*, const Tier*>{"certain", &ct}, {"likely", &lt}}) {
                         char th[32];
                         if (t->bin == kEveryBin) std::snprintf(th, sizeof th, "any");
