@@ -6292,6 +6292,11 @@ void call_variants(
                 for (std::size_t k = 0; k < haps.size(); ++k) row += (k ? "," : "") + haps[k];
                 added_ce.push_back(std::move(row));
             }
+            // The per-gene rows of the module records it replaces are read from those sites as before, and name
+            // the record written in their place.
+            for (const std::size_t r : pieces)
+                for (DupGeneTarget& t : dup_targets)
+                    if (t.variant_id == out_records[r].id) t.variant_id = id;
         }
 
         // A module carrier's change at a copy site of the module's site that one of its copies holds.
