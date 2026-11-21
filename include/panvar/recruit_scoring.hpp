@@ -107,8 +107,10 @@ Judged judge_labelled(const std::vector<Kmer>& one, std::size_t bases1, const st
 
 // One fragment against one locus. With `certain_through`, also the largest private-site cut (up to
 // kMaxCut) at which the fragment is certain by the first rules, 0 if none: certain at a cut means certain at
-// every lower one. With `judged`, what the score decides on.
+// every lower one. With `judged`, what the score decides on; with `judged_only`, nothing else is wanted, and a
+// fragment without a private k-mer, which no stretch can call, is not weighed: `judged` holds its k-mers and decoy
+// sites read whole, and the row is not to be used.
 Row score_fragment(const Fragment& fr, const LocusTable& t, std::uint32_t li, const ReadOptions& o, double gap_cost, double flank_share,
-                   std::uint32_t* certain_through = nullptr, Judged* judged = nullptr);
+                   std::uint32_t* certain_through = nullptr, Judged* judged = nullptr, bool judged_only = false);
 
 }  // namespace panvar::recruit::scoring

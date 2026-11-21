@@ -74,6 +74,34 @@ std::string with_errors(const std::string& s, double e, double indel_share, Rng&
     return out;
 }
 
+// The same errors, drawn by the gaps between them: one draw per error instead of one per base. Its reads are
+// not those of with_errors, which the first rules' counts were made with.
+std::string with_errors_by_gaps(const std::string& s, double e, double indel_share, Rng& rng) {
+    static const char kBases[] = "ACGT";
+    std::string out;
+    out.reserve(s.size() + s.size() / 50 + 4);
+    const double lq = std::log(1.0 - e);
+    auto upper = [](char c) { return static_cast<char>(std::toupper(static_cast<unsigned char>(c))); };
+    for (std::size_t at = 0;;) {
+        const double gap = std::floor(std::log(std::max(rng.unit(), 1e-300)) / lq);
+        const std::size_t next = gap >= static_cast<double>(s.size() - at) ? s.size() : at + static_cast<std::size_t>(gap);
+        for (std::size_t i = at; i < next; ++i) out += upper(s[i]);
+        if (next >= s.size()) break;
+        const char c = upper(s[next]);
+        const double k = rng.unit();
+        if (k >= indel_share) {   // substitution
+            char b;
+            do b = kBases[rng.next() & 3]; while (b == c);
+            out += b;
+        } else if (k >= indel_share / 2) {   // insertion; below that, deletion
+            out += kBases[rng.next() & 3];
+            out += c;
+        }
+        at = next + 1;
+    }
+    return out;
+}
+
 // A fragment to simulate: `length` bases of `src` from `at` (a pair: its two ends, `length` the insert).
 struct Job {
     std::size_t src;     // which sequence
@@ -93,14 +121,17 @@ struct Result {
     scoring::Judged judged;
 };
 
-// Simulates and scores the jobs.
+// Simulates and scores the jobs. With `score_only`, what the score decides on and no more: errors drawn by their
+// gaps, no count of the cuts the first rules would call the fragment certain at, and a fragment without a private
+// k-mer not weighed.
 std::vector<Result> run(const std::vector<Job>& jobs, const std::vector<const std::string*>& srcs, std::uint64_t seed, const Class& c,
-                        const scoring::LocusTable& t, const std::vector<std::uint64_t>& screen, std::size_t threads) {
+                        const scoring::LocusTable& t, const std::vector<std::uint64_t>& screen, std::size_t threads, bool score_only = false) {
     ReadOptions o;
     o.error_rate = c.error;
     const scoring::Costs costs = scoring::costs_for(c.error);
     std::vector<Result> res(jobs.size());
     std::atomic<std::size_t> next{0};
+    const auto errors = score_only ? with_errors_by_gaps : with_errors;
     auto work = [&] {
         for (std::size_t i; (i = next++) < jobs.size();) {
             const Job& j = jobs[i];
@@ -111,10 +142,10 @@ std::vector<Result> run(const std::vector<Job>& jobs, const std::vector<const st
             if (c.insert > 0) {
                 f.paired = true;
                 const std::uint64_t r = std::min<std::uint64_t>(c.length, j.length);
-                f.seq1 = with_errors(src->substr(j.at, r), c.error, c.indel_share, rng);
-                f.seq2 = with_errors(reverse_complement(src->substr(j.at + j.length - r, r)), c.error, c.indel_share, rng);
+                f.seq1 = errors(src->substr(j.at, r), c.error, c.indel_share, rng);
+                f.seq2 = errors(reverse_complement(src->substr(j.at + j.length - r, r)), c.error, c.indel_share, rng);
             } else {
-                f.seq1 = with_errors(src->substr(j.at, j.length), c.error, c.indel_share, rng);
+                f.seq1 = errors(src->substr(j.at, j.length), c.error, c.indel_share, rng);
             }
             // the screen, as recruit applies it: a closed syncmer of the index (and not held out)
             bool hit = false;
@@ -127,7 +158,7 @@ std::vector<Result> run(const std::vector<Job>& jobs, const std::vector<const st
             if (!hit) continue;
             res[i].screened = true;
             std::uint32_t m = 0;
-            scoring::score_fragment(f, t, 0, o, costs.gap_cost, costs.flank_share, &m, &res[i].judged);
+            scoring::score_fragment(f, t, 0, o, costs.gap_cost, costs.flank_share, score_only ? nullptr : &m, &res[i].judged, score_only);
             res[i].through = static_cast<std::uint8_t>(m);
         }
     };
@@ -588,7 +619,7 @@ void calibrate(LocusIndex& x, const Graph& g, const std::vector<OffTarget>& off,
                 }
             Rng wrng{0x5EEDULL ^ fnv1a(x.name + c.name + "#windows")};
             const std::vector<Job> jobs = off_jobs(windows, c, wrng, 1, 2, true);
-            const auto res = run(jobs, window_srcs, wrng.next(), c, t, x.screen, threads);
+            const auto res = run(jobs, window_srcs, wrng.next(), c, t, x.screen, threads, true);
             for (const Result& r : res) {
                 if (!r.screened) continue;
                 off_j.push_back(r.judged);

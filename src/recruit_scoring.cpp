@@ -404,7 +404,7 @@ bool deciding_score(const Judged& j, const Rates& r, double& s) {
 }
 
 Row score_fragment(const Fragment& fr, const LocusTable& t, std::uint32_t li, const ReadOptions& o, double gap_cost,
-                   double flank_share, std::uint32_t* certain_through, Judged* judged) {
+                   double flank_share, std::uint32_t* certain_through, Judged* judged, bool judged_only) {
     Row r;
     r.fragment = fr.name;
     r.locus = li;
@@ -416,6 +416,21 @@ Row score_fragment(const Fragment& fr, const LocusTable& t, std::uint32_t li, co
     std::vector<Kmer> labelled[2];
     const int n_mates = pair ? 2 : 1;
     for (int m = 0; m < n_mates; ++m) labelled[m] = label_read(m == 0 ? fr.seq1 : fr.seq2, t, ev[m]);
+    if (judged_only && judged != nullptr && ev[0].n_p + ev[1].n_p == 0) {
+        // no private k-mer: no stretch can call it. Its k-mers and decoy sites, read whole, are all that is kept.
+        Judged j;
+        for (int m = 0; m < n_mates; ++m) {
+            j.pooled.n += ev[m].kmers;
+            bool open = false;
+            std::uint32_t first = 0;
+            for (const Kmer& k : labelled[m])
+                if (k.lab == kLabelD && (!open || k.start >= first + kK)) { ++j.pooled.d; open = true; first = k.start; }
+        }
+        *judged = j;
+        r.fate = "unrecruited";
+        r.reason = "no_evidence";
+        return r;
+    }
     const std::vector<Kmer>* mates[2] = {&labelled[0], &labelled[1]};
     weigh(mates, n_mates, bar, gap_cost, flank_share, ev, dedup2, status, [&](int m, const std::vector<Kmer>& v, std::pair<std::size_t, std::size_t> seg) {
         for (std::size_t i = seg.first; i <= seg.second && i < v.size(); ++i) {
