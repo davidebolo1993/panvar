@@ -2295,9 +2295,6 @@ void call_variants(
         std::unordered_set<std::string> module_nodes;            // the nodes of the module's copies
         std::vector<char> in_copies;                             // per gene_idx: lies in the copies
         bool module = false;                                     // a MODULE record (else UNIT)
-        // The reference stretch of the copies where their nodes would not say it: a whole copy gained or lost,
-        // whose nodes the reference also walks in its other copies. Empty elsewhere.
-        std::vector<std::pair<std::size_t, std::size_t>> copy_stretch;
     };
     std::vector<DupGeneTarget> dup_targets;
 
@@ -6142,11 +6139,11 @@ void call_variants(
         for (const auto& [key, recs] : blocks) {
             (void)key;
             std::set<std::size_t> carriers, sites;
-            std::set<const Bubble*> gaps;
+            std::vector<const Bubble*> gaps;   // the block's stretches, in the order of their records
             long long copy_bp = 0;
             for (const std::size_t r : recs) {
                 carriers.insert(parsed[r].carriers.begin(), parsed[r].carriers.end());
-                gaps.insert(out_records[r].gap);
+                if (std::find(gaps.begin(), gaps.end(), out_records[r].gap) == gaps.end()) gaps.push_back(out_records[r].gap);
                 sites.insert(out_records[r].gap->copy_block_sites.begin(), out_records[r].gap->copy_block_sites.end());
                 copy_bp = std::max(copy_bp, std::llabs(std::atoll(info_of(parsed[r].cols[7], "SVLEN").c_str())));
             }
@@ -6200,20 +6197,24 @@ void call_variants(
             std::vector<std::string> fmt(sample_names.size(), ".:.:.:.:.:.");
             std::size_t an = 0, ac = 0;
             std::vector<double> per_copy;
-            DupGeneTarget target;
-            target.module = true;
+            std::unordered_map<std::string, std::size_t> cn_of;
             for (std::size_t c = 0; c < sample_names.size(); ++c) {
                 const PathRecord& p = graph.paths[name_to_pi.at(sample_names[c])];
+                // Its stretches are different copies: what it gains or loses in each adds up.
                 int copies = 0;
-                bool reads = false;
+                bool reads = false, changed = false;
                 for (const Bubble* g : gaps)
-                    if (const auto w = g->windows->find(&p); w != g->windows->end()) { reads = true; copies = copies != 0 ? copies : w->second.copies; }
+                    if (const auto w = g->windows->find(&p); w != g->windows->end()) {
+                        reads = true;
+                        copies += w->second.copies;
+                        changed = changed || w->second.copies != 0;
+                    }
                 if (!reads) continue;
                 const std::size_t cn = static_cast<std::size_t>(std::max<long long>(0, static_cast<long long>(ref_cn) + copies));
-                target.sample_cn[sample_names[c]] = cn;
+                cn_of[sample_names[c]] = cn;
                 long long bp = 0;
                 std::string form_ids;
-                if (copies != 0) {
+                if (changed) {
                     const auto it = forms_of.find(sample_names[c]);
                     if (it != forms_of.end()) {
                         std::vector<std::size_t> no;
@@ -6223,10 +6224,10 @@ void call_variants(
                         }
                         std::sort(no.begin(), no.end());
                         for (std::size_t k = 0; k < no.size(); ++k) form_ids += (k ? "+" : "") + std::to_string(no[k]);
-                        per_copy.push_back(std::fabs(static_cast<double>(bp)) / std::abs(copies));
+                        if (copies != 0) per_copy.push_back(std::fabs(static_cast<double>(bp)) / std::abs(copies));
                     }
                 }
-                const bool carrier = copies != 0 && !form_ids.empty();
+                const bool carrier = changed && !form_ids.empty();
                 fmt[c] = std::string(carrier ? "1" : "0") + ':' + std::to_string(cn) + ':' + std::to_string(bp) + ":@RESID" +
                          std::to_string(bp) + '|' + std::to_string(copies) + ':' + std::to_string(bp) + ':' + (carrier ? form_ids : ".");
                 if (&p != ref_path) { ++an; if (carrier) ++ac; }
@@ -6279,7 +6280,7 @@ void call_variants(
             std::map<std::string, std::vector<std::string>> ce_rows;   // row body -> carriers
             for (const auto& [h, fs] : forms_of)
                 for (const Form& f : fs) {
-                    const std::size_t cn = target.sample_cn.count(h) ? target.sample_cn.at(h) : 0;
+                    const std::size_t cn = cn_of.count(h) ? cn_of.at(h) : 0;
                     const long long net = static_cast<long long>(f.alt.size()) - static_cast<long long>(f.re + 1 - f.rs);
                     ce_rows["cn\t" + std::to_string(f.rs) + '\t' + std::to_string(f.re) + '\t' + std::to_string(cn) + '\t' +
                             std::to_string(cn) + '\t' + std::to_string(net) + '\t' + std::to_string(f.alt.size()) + '\t' +
@@ -6291,21 +6292,6 @@ void call_variants(
                 for (std::size_t k = 0; k < haps.size(); ++k) row += (k ? "," : "") + haps[k];
                 added_ce.push_back(std::move(row));
             }
-            // The genes of the module records it replaces; its copies are the reference's stretch the change spans.
-            std::set<int> genes_seen;
-            for (const std::size_t r : pieces)
-                for (const DupGeneTarget& t : dup_targets) {
-                    if (t.variant_id != out_records[r].id) continue;
-                    if (target.variant_id.empty()) { target.variant_id = id; target.bubble_id = t.bubble_id; }
-                    for (const int g : t.gene_idx) if (genes_seen.insert(g).second) target.gene_idx.push_back(g);
-                }
-            for (const Bubble* g : gaps)
-                if (const auto w = g->windows->find(ref_path); w != g->windows->end()) {
-                    for (std::size_t k = w->second.first; k <= w->second.last; ++k) target.module_nodes.insert(ref_path->steps[k].node_id);
-                    target.copy_stretch.emplace_back(ref_meta.region_start_1based + ref_prefix[w->second.first],
-                                                     ref_meta.region_start_1based + ref_prefix[w->second.last + 1] - 1);
-                }
-            if (!target.variant_id.empty()) dup_targets.push_back(std::move(target));
         }
 
         // A module carrier's change at a copy site of the module's site that one of its copies holds.
@@ -6390,8 +6376,6 @@ void call_variants(
             };
             prune(variant_nodes_rows);
             prune(carrier_events_rows);
-            dup_targets.erase(std::remove_if(dup_targets.begin(), dup_targets.end(), [&](const DupGeneTarget& t) { return drop.count(t.variant_id) != 0; }),
-                              dup_targets.end());
             for (OutRecord& r : added) out_records.push_back(std::move(r));
             for (std::string& v : added_vn) variant_nodes_rows.push_back(std::move(v));
             for (std::string& c : added_ce) carrier_events_rows.push_back(std::move(c));
@@ -6815,9 +6799,9 @@ void call_variants(
                 // A module's copies hold nodes no path revisits, so its stretch runs from its first node to its
                 // last. A repeat unit's copies are its own nodes: a gene between two copies that are not
                 // adjacent is not in them.
-                std::vector<std::pair<std::size_t, std::size_t>> stretch = t.copy_stretch;
+                std::vector<std::pair<std::size_t, std::size_t>> stretch;
                 for (const std::string& id : t.module_nodes)
-                    if (const auto it = ref_iv.find(id); it != ref_iv.end() && t.copy_stretch.empty())
+                    if (const auto it = ref_iv.find(id); it != ref_iv.end())
                         stretch.insert(stretch.end(), it->second.begin(), it->second.end());
                 std::sort(stretch.begin(), stretch.end());
                 std::vector<std::pair<std::size_t, std::size_t>> merged_iv;

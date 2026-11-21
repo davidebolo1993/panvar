@@ -4207,6 +4207,15 @@ check "a whole copy gained or lost, with --cn: one copy-number record, no insert
 check "a whole copy lost, with --cn: the records rebuild every haplotype (bp left by call's events:by the VCF)" \
   "$(awk -F'\t' '$1=="large_left_call_bp"{c=$2} $1=="large_left_vcf_bp"{v=$2} END{print c":"v}' "$OUT/invc/cnb.summary.tsv")" "0:0"
 
+# A haplotype that loses a copy in each of two stretches of one copy-number record (p, the second and the fourth
+# copy; q's loss of three spans both) is counted over both: two copies lost, not one.
+python3 -I "$TOOLS/spec_gfa.py" "$SPEC_DIR/copies_two_stretches.spec" "$OUT/twos"
+"$BIN" call -i "$OUT/twos/g.gfa" -c "$OUT/twos/g.bubbles.csv" -r 'ref#0#chr1:1-1520' -o "$OUT/twos/cn" --cn \
+  --no-per-bubble-vcf -q > "$OUT/twos/cn.log" 2>&1
+check "copies lost in two stretches of one copy-number record add up (SVTYPE:COPY:GT(CN) r1 p q | REF_CN:CN_UNIT_BP)" \
+  "$(copy_info "$OUT/twos/cn.region.vcf")|$(awk -F'\t' '!/^#/{r=$8; sub(/.*REF_CN=/,"",r); sub(/;.*/,"",r); u=$8; sub(/.*CN_UNIT_BP=/,"",u); sub(/;.*/,"",u); printf "%s:%s ", r, u}' "$OUT/twos/cn.region.vcf")" \
+  "CNV:-:0(4)1(2)1(1) |4:280 "
+
 # Inversions of three lengths at one inversion site: each haplotype carries the record of its own inversion (two
 # that are one event by the merge criteria share one, with their lengths' range), one reaching past the site's last
 # node is written there too, and a haplotype carrying one is . at the others it overlaps, not 0.
