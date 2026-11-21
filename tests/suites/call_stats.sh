@@ -4220,6 +4220,19 @@ check "inversions of three lengths: one record each, alleles of one together, . 
        g=""; for(i=11;i<=NF;i++) g=g substr($i,1,1); printf "%s:%s:%s:%s ", $2, l, r, g}' "$OUT/invl/v.region.vcf")" \
   "200:1100:-:01... 200:2860:-:0...1 900:1400:1400,1460:0.11. "
 
+# A short node of the inverted stretch walked forwards in the left flank (invq): only that step is left out for the
+# runs to lie apart, so invq carries the inversion at its own breakpoints, those of inv, whatever short nodes end
+# the runs.
+python3 -I "$TOOLS/spec_gfa.py" "$SPEC_DIR/inversion_stray_step.spec" "$OUT/invs"
+printf 'bubble_id,source,source_orient,sink,sink_orient,path_support,min_inside_bp,max_inside_bp,inside_nodes,kind,parent_id\n1,F0,+,F9,+,4,0,3020,"A1;A2;M1;M2;Q;M3;M4;M5;B1",inversion,\n' \
+  > "$OUT/invs/inv.csv"
+"$BIN" call -i "$OUT/invs/g.gfa" -c "$OUT/invs/inv.csv" -r 'ref#0#chr1:1-8020' -o "$OUT/invs/v" --no-per-bubble-vcf -q \
+  > "$OUT/invs/v.log" 2>&1
+check "an inversion with one step out of place: its own breakpoints, one record (POS:SVLEN:SVLEN_RANGE:GT r1 inv invq | carrier rows)" \
+  "$(awk -F'\t' '!/^#/{l=$8; sub(/.*;SVLEN=/,"",l); sub(/;.*/,"",l); r="-"; if($8 ~ /SVLEN_RANGE=/){r=$8; sub(/.*SVLEN_RANGE=/,"",r); sub(/;.*/,"",r)}
+       g=""; for(i=11;i<=NF;i++) g=g substr($i,1,1); printf "%s:%s:%s:%s ", $2, l, r, g}' "$OUT/invs/v.region.vcf")|$(awk -F'\t' 'NR>1{printf "%s-%s:%s ", $4, $5, $11}' "$OUT/invs/v.carrier_events.tsv")" \
+  "3040:1940:-:011 |3041-4980:inv#1#chr1,invq#1#chr1 "
+
 printf "\n"
 if [ "$fails" -eq 0 ]; then printf "call_stats: all assertions passed\n"; exit 0; fi
 # repeated last, shortened: a long output can be cut in the middle by ctest

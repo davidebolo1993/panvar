@@ -40,22 +40,36 @@ PathInversionScan find_path_inversions(const Graph& graph, const PathRecord& ref
         std::vector<std::size_t> lens;                                 // and their lengths
     };
     struct Cand { std::size_t pi, left, a, b, right; std::string left_node, right_node; };
-    // A run's reference range without the steps far out of place at either end: in reference order, steps are
-    // left out from each end while they hold at most a twentieth of the run's bases.
-    struct Bound { std::size_t lo, hi; const std::string* lo_node; const std::string* hi_node; };
-    const auto trimmed = [](const Run& r) {
+    // A run's bounds at one end, in reference order, as its outermost steps are left out one by one while they
+    // hold at most a twentieth of the run's bases: (bound, its node, bases left out).
+    struct Bound { std::size_t at; const std::string* node; std::size_t cut; };
+    const auto bounds = [](const Run& r, bool top) {
         std::vector<std::size_t> order(r.steps.size());
         for (std::size_t k = 0; k < order.size(); ++k) order[k] = k;
         std::sort(order.begin(), order.end(), [&](std::size_t x, std::size_t y) { return r.steps[x].first < r.steps[y].first; });
-        std::size_t total = 0;
+        if (top) std::reverse(order.begin(), order.end());
+        std::size_t total = 0, cut = 0;
         for (const std::size_t l : r.lens) total += l;
-        std::size_t i = 0, j = order.size(), cut = 0;
-        while (i + 1 < j && 20 * (cut + r.lens[order[i]]) <= total) cut += r.lens[order[i++]];
-        cut = 0;
-        while (j > i + 1 && 20 * (cut + r.lens[order[j - 1]]) <= total) cut += r.lens[order[--j]];
-        if (order.empty()) return Bound{r.lo, r.hi, &r.lo_node, &r.hi_node};
-        const std::size_t a = order[i], b = order[j - 1];
-        return Bound{r.steps[a].first, r.steps[b].first + r.lens[b] - 1, r.steps[a].second, r.steps[b].second};
+        std::vector<Bound> out;
+        for (std::size_t k = 0; k < order.size() && 20 * cut <= total; ++k) {
+            const std::size_t i = order[k];
+            out.push_back({top ? r.steps[i].first + r.lens[i] - 1 : r.steps[i].first, r.steps[i].second, cut});
+            cut += r.lens[i];
+        }
+        return out;
+    };
+    // Where the lower of two runs reaches into the upper one, the fewest bases of steps far out of place are
+    // left out of them for the two to lie apart: the lower run's last bound and the upper run's first, or none.
+    const auto apart = [&](const Run& lower, const Run& upper, Bound& last, Bound& first) {
+        const std::vector<Bound> tops = bounds(lower, true), bottoms = bounds(upper, false);
+        bool found = false;
+        std::size_t j = bottoms.size();   // the first bound of the upper run above the lower run's
+        for (const Bound& t : tops) {
+            while (j > 0 && bottoms[j - 1].at > t.at) --j;
+            if (j == bottoms.size() || (found && t.cut + bottoms[j].cut >= last.cut + first.cut)) continue;
+            last = t; first = bottoms[j]; found = true;
+        }
+        return found;
     };
     std::vector<Cand> cands;
     for (std::size_t pi = 0; pi < graph.paths.size(); ++pi) {
@@ -149,8 +163,9 @@ PathInversionScan find_path_inversions(const Graph& graph, const PathRecord& ref
                 cands.push_back(Cand{pi, L.hi, M.lo, M.hi, R.lo, L.hi_node, R.lo_node});
                 continue;
             }
-            const Bound l = trimmed(L), m = trimmed(M), r = trimmed(R);
-            if (l.hi < m.lo && m.hi < r.lo) cands.push_back(Cand{pi, l.hi, m.lo, m.hi, r.lo, *l.hi_node, *r.lo_node});
+            Bound l, m_lo, m_hi, r;
+            if (apart(L, M, l, m_lo) && apart(M, R, m_hi, r) && m_lo.at <= m_hi.at)
+                cands.push_back(Cand{pi, l.at, m_lo.at, m_hi.at, r.at, *l.node, *r.node});
         }
     }
     std::sort(cands.begin(), cands.end(), [](const Cand& x, const Cand& y) {
