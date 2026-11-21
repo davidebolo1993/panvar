@@ -377,6 +377,7 @@ ReadStats recruit_reads(const ReadOptions& options) {
     // each locus's private-site cut: calibrated for the run's read class (the preset's, or from the first reads), or the given
     // one when the run scores by other rules than the calibration did
     std::vector<std::string> cut_note(loci.size());
+    std::string long_rules = "none";   // the long-read rules the run applies
     {
         std::uint64_t bases = 0, reads = 0;
         bool pairs = false;
@@ -430,6 +431,20 @@ ReadStats recruit_reads(const ReadOptions& options) {
             }
             cut_note[li] = note;
             log("locus: " + loci[li].name + "; site cut: " + note);
+        }
+        // the long-read rules of the run's read class
+        const std::string cls = run_read_class(o.read_class, mean, o.error_rate);
+        std::string off;
+        for (LocusTable& t : loci) {
+            t.run_error = o.error_rate;
+            t.min_end_bases = cls == "hifi" ? kMinEndBases : 0;
+            t.dense_conflicts = (cls == "hifi" || cls == "ont") && t.private_share >= kDenseLocusShare;
+            if ((cls == "hifi" || cls == "ont") && !t.dense_conflicts) off += (off.empty() ? "" : ",") + t.name;
+        }
+        if (cls == "hifi" || cls == "ont") {
+            long_rules = cls + " reads: dense conflict reads certain" + (off.empty() ? std::string() : " (not at " + off + ", under half private)") +
+                         (cls == "hifi" ? "; certain end stretches of " + std::to_string(kMinEndBases) + " bases or more" : std::string());
+            log("long-read rules: " + long_rules);
         }
     }
 
@@ -569,6 +584,7 @@ ReadStats recruit_reads(const ReadOptions& options) {
                      static_cast<unsigned long long>(st.screened));
         const double mean_read = reads_seen ? static_cast<double>(read_bases) / static_cast<double>(reads_seen) : 0;
         std::fprintf(sm, "run\tmean_read_length\t%.1f\t\n", mean_read);
+        std::fprintf(sm, "run\tlong_read_rules\t%s\t\n", long_rules.c_str());
         for (const auto& [name, s] : input_stats)
             std::fprintf(sm, "input\t%s\t%llu\trecords; skipped %llu secondary, %llu supplementary, %llu QC-failed; %llu duplicates, %llu unmapped kept; %llu fragments (%llu pairs), %llu unscreened pairs; %llu mates fetched, %llu without their mate\n",
                          name.c_str(), static_cast<unsigned long long>(s.records), static_cast<unsigned long long>(s.secondary),

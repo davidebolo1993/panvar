@@ -230,6 +230,20 @@ Bar bar_for(const Fragment& fr, const ReadOptions& o) {
     return {own > o.error_rate && own < 0.3 ? own : o.error_rate, longest >= kLongRead ? o.decoy_share_long : o.decoy_share};
 }
 
+// The long-read rules (recruit_scoring.hpp), after the fragment's fate. `end_bases`: the first read's segment in bases.
+void long_read_rules(Row& r, const LocusTable& t, std::size_t end_bases) {
+    const Evidence& v = r.ev;
+    if (t.dense_conflicts && std::string(r.reason) == "conflict" && v.kmers > 0 &&
+        static_cast<double>(v.n_p) >= kDenseShare * static_cast<double>(v.kmers) && v.sites_p >= kDenseSites &&
+        v.sites_d <= 2 * (v.sites_p + 1) && static_cast<double>(v.runs_n) <= tolerated_runs(v.seg_kmers, t.run_error)) {
+        r.fate = "certain";
+        r.reason = "dense";
+    } else if (t.min_end_bases > 0 && std::string(r.fate) == "certain" && std::string(r.reason) == "partial" && end_bases < t.min_end_bases) {
+        r.fate = "ambiguous";
+        r.reason = "short_end";
+    }
+}
+
 // Scores one fragment against one locus.
 }  // namespace
 
@@ -244,6 +258,7 @@ Row score_fragment(const Fragment& fr, const LocusTable& t, std::uint32_t li, co
     const char* status[2] = {"out", "out"};
     std::vector<std::uint64_t> seen;
     std::vector<std::uint32_t> sets;   // node sets of the private k-mers in the segments
+    std::size_t end_bases = 0;         // the first read's segment in bases
     for (int m = 0; m < (pair ? 2 : 1); ++m) {
         const std::string& s = m == 0 ? fr.seq1 : fr.seq2;
         const std::vector<Kmer> v = label_read(s, t, ev[m]);
@@ -296,6 +311,7 @@ Row score_fragment(const Fragment& fr, const LocusTable& t, std::uint32_t li, co
         }
         if (seg.first <= seg.second) {
             r.seg[m] = std::to_string(v[seg.first].start) + "-" + std::to_string(v[seg.second].start + kK);
+            if (m == 0) end_bases = v[seg.second].start + kK - v[seg.first].start;
             status[m] = ev[m].seg_kmers * 10 >= ev[m].kmers * 9 ? "in" : "part";
         } else {
             r.seg[m] = ".";
@@ -325,6 +341,7 @@ Row score_fragment(const Fragment& fr, const LocusTable& t, std::uint32_t li, co
         }
     }
     decide(r, ev[0], pair ? &ev[1] : nullptr, status, t.min_sites ? t.min_sites : o.min_sites, bar);
+    long_read_rules(r, t, end_bases);
     return r;
 }
 
@@ -345,6 +362,7 @@ LocusTable table_of(const LocusIndex& x) {
     t.label.reserve(x.codes.size() + x.decoy.size());
     std::size_t np = 0;
     for (std::size_t i = 0; i < x.codes.size(); ++i) np += x.cls[i] == kPrivate;
+    t.private_share = x.codes.empty() ? 0.0 : static_cast<double>(np) / static_cast<double>(x.codes.size());
     t.nodeset.reserve(np);
     bool existing = false;
     for (std::size_t i = 0; i < x.codes.size(); ++i) {

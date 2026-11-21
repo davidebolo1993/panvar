@@ -40,8 +40,11 @@ struct Cut {
 // carry two chance private sites far more often than the simulated off-target reads show.
 std::uint32_t lowest_cut(const std::string& read_class);
 
-// The run's read class (`read_class`, or when empty the nearest: short below 1 kb mean read length; long:
-// hifi at an error rate up to 1%, else ont) and its lowest cut, never below lowest_cut, whose observed off-target
+// The run's read class: `read_class`, or when empty the nearest (short below 1 kb mean read length; long: hifi at
+// an error rate up to 1%, else ont).
+std::string run_read_class(const std::string& read_class, double mean_read_length, double error_rate);
+
+// The run's read class (run_read_class) and its lowest cut, never below lowest_cut, whose observed off-target
 // false-certain share is at most `rate`. With fewer screened negatives than 1 / rate this is the lowest cut
 // with none observed.
 Cut calibrated_cut(const std::vector<Calibration>& c, const std::string& read_class, double mean_read_length, double error_rate,

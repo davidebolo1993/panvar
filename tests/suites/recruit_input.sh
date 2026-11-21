@@ -185,6 +185,23 @@ done
 "$BIN" recruit --locus "$IDX" -1 r_1.fq -2 r_2.fq -o rate.tsv -q --error-rate -0.1 2> rate.txt; rc=$?
 check "a negative --error-rate is refused" '[[ $rc -ne 0 ]] && grep -q "error-rate" rate.txt'
 
+# long-read rules: a hifi read certain on a short end stretch of the locus (under 500 bases) is ambiguous; an ont
+# run keeps it (its floor of 3 sites guards it); a pair run applies none
+python3 - data/ref.fa > ends.fq <<'PY'
+import sys
+s = "".join(l.strip() for l in open(sys.argv[1]) if not l.startswith(">"))
+for i, inside in enumerate([300, 400, 800, 1500] * 3):
+    a = 160000 - inside
+    r = s[a:a + 6000]
+    print(f"@end{inside}_{i}\n{r}\n+\n{'I' * len(r)}")
+PY
+"$BIN" recruit --locus "$IDX" -i ends.fq -o ends_hifi.tsv --preset hifi -q
+"$BIN" recruit --locus "$IDX" -i ends.fq -o ends_ont.tsv --preset ont -q
+short_end() { awk -F'\t' 'NR > 1 && $4 == "short_end" {split($1, a, "_"); print a[1]}' "$1" | sort -u | tr '\n' ' '; }
+check "hifi: end stretches under 500 bases are ambiguous (short_end: $(short_end ends_hifi.tsv))" '[[ "$(short_end ends_hifi.tsv)" == "end300 end400 " ]] && awk -F"\t" '"'"'NR > 1 && $1 ~ /^end(800|1500)_/ && $3 != "certain"'"'"' ends_hifi.tsv | wc -l | grep -qx " *0"'
+check "ont: no end rule" '! grep -q short_end ends_ont.tsv'
+check "the summary names the run's long-read rules" 'grep -q "^run.long_read_rules.hifi reads: dense conflict reads certain; certain end stretches of 500 bases" ends_hifi.summary.tsv && grep -q "^run.long_read_rules.ont reads: dense conflict reads certain.$" ends_ont.summary.tsv && grep -q "^run.long_read_rules.none" out.summary.tsv'
+
 sed -n '5,$p' r_2.fq > shifted_2.fq
 "$BIN" recruit --locus "$IDX" -1 r_1.fq -2 shifted_2.fq -o x.tsv -q 2> err1.txt; rc=$?
 check "mates out of step stop the run" '[[ $rc -ne 0 ]] && grep -q "out of step\|fewer reads" err1.txt'

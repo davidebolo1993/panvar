@@ -283,9 +283,13 @@ double upper_bound(std::uint64_t events, std::uint64_t n) {
 
 std::uint32_t lowest_cut(const std::string& read_class) { return read_class == "ont" ? 3 : 2; }
 
+std::string run_read_class(const std::string& read_class, double mean_read_length, double error_rate) {
+    return !read_class.empty() ? read_class : mean_read_length < 1000 ? "short" : error_rate <= 0.01 ? "hifi" : "ont";
+}
+
 Cut calibrated_cut(const std::vector<Calibration>& cs, const std::string& read_class, double mean_read_length, double error_rate,
                    double rate) {
-    const std::string want = !read_class.empty() ? read_class : mean_read_length < 1000 ? "short" : error_rate <= 0.01 ? "hifi" : "ont";
+    const std::string want = run_read_class(read_class, mean_read_length, error_rate);
     Cut none;
     none.floor = lowest_cut(want);
     for (const Calibration& c : cs) {

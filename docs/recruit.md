@@ -34,6 +34,11 @@ Reads, per sample:
 11. A fragment is certain with at least the cut's private sites (the calibrated cut, below), decoy sites at most 5% of them (25% in reads of 1 kb or more, `--decoy-share-long`: a long read in a locus crosses stretches shared with homologs and picks up a few decoy sites among hundreds of private ones), and no more runs of unknown k-mers than sequencing errors and about one new allele per kilobase explain (not `divergent`). The errors expected are the read's own, from its base qualities, where they exceed the run's rate: HiFi reads range from 99% to 99.99% accurate, and the least accurate are not judged by the average. A pair is judged on its pooled evidence when a mate lies wholly in the locus; failing that, one mate certain on its own makes the pair certain (`rescued`), unless the other mate leans to a homolog away from a locus edge. A fragment that runs out of the locus is `partial`.
 12. A fragment with no private site and two or more decoy sites is unrecruited as `homolog`. Otherwise a fragment with locus evidence is ambiguous, with the first reason that holds: `conflict` (private and decoy sites), `uncallable` (mostly unreadable k-mers), `divergent`, `mates_out` (enough sites together, but both mates leave the locus, so they are not pooled), `single_site`, `shared_only`; one with nothing as `no_evidence`.
 13. The cut: the run's read class (`--preset`, or from the first reads: short below 1 kb mean length; long reads HiFi at an error rate up to 1%, else ONT) picks a calibration, and each locus takes the lowest cut of at least two private sites (three for ONT) whose simulated off-target reads were certain at most at `--false-certain-rate`. ONT starts at three because ultra-long noisy reads cross enough sequence to pick up two chance private sites far more often than the simulated reads show. `--min-sites` sets one cut for every locus instead.
+14. Long reads (a HiFi or ONT run) take two more rules after their fate. They are not in the calibration, which the cuts were set by.
+    - `dense`: a `conflict` read is certain when private k-mers are at least 1.5% of its k-mers, with five private sites or more, decoy sites in its segment at most twice its private sites plus two, and no more runs of unknown k-mers than the run's error rate explains. A long locus read crosses stretches shared with homologs and can carry more decoy sites than the share allows; dense private sites outweigh them. Not at loci whose k-mers are under half private, where reads from the paralogs are as dense in private sites as the locus's own.
+    - `short_end` (HiFi): a read certain on a segment that runs out of the locus (`partial`) needs 500 bases of it, else it is ambiguous. A long read touching a locus with a short end stretch can carry two chance private sites there.
+
+    The summary's `long_read_rules` line says which applied, and at which loci `dense` did not.
 
 ## Required inputs
 
@@ -74,7 +79,7 @@ A sample sheet holds tab-separated lines of sample, file and optionally a mate f
 | file | contents |
 |------|----------|
 | `<out>` | one row per screened fragment and locus (columns below) |
-| `<out stem>.summary.tsv` | the run: error rate and its source, fragments, screened, mean read length; each input's records by kind; per locus, fragments by fate and reason, the backbone depth, the fragments certain for another locus too, and the private-site cut with the calibration behind it |
+| `<out stem>.summary.tsv` | the run: error rate and its source, fragments, screened, mean read length, the long-read rules applied; each input's records by kind; per locus, fragments by fate and reason, the backbone depth, the fragments certain for another locus too, and the private-site cut with the calibration behind it |
 | `<locus>.plx` | the index |
 | `<locus>.index.tsv` | the index's report: the locus (k-mers by label, backbone, pieces, decoys, screen), each copy found per genome with the k-mers subtracted, the pieces found off them, the decoy windows, ceilings (the share of read-length windows of each haplotype with 2 private sites, counted as the scorer counts them: k bases apart) and the calibration (per read class and cut: held-out fragments certain, off-target certain of those screened, and the 95% bound) |
 | `<reads-out>/<locus>.<fate>_1.fq.gz`, `_2.fq.gz` | with `--reads-out`: recruited pairs, as sequenced, with qualities (`<locus>.<fate>.fq.gz` for single reads); with `--samples`, in `<reads-out>/<sample>/`. An earlier run's files for the same loci are removed first. Each file is a chain of gzip members, compressed by all threads (any gzip reader reads it as one) |
@@ -88,7 +93,7 @@ Table columns:
 | `fragment` | the read or pair name |
 | `locus` | the locus |
 | `fate` | `certain`, `ambiguous` or `unrecruited` |
-| `reason` | `.`, or why: `partial`, `rescued` for certain; the ambiguous and unrecruited reasons above |
+| `reason` | `.`, or why: `partial`, `rescued`, `dense` for certain; the ambiguous and unrecruited reasons above, and `short_end` |
 | `mates` | each mate's place: `in` (wholly in the locus), `part` (a segment covering part of it), `out` |
 | `seg1`, `seg2` | each mate's locus segment in read bases (`start-end`), `.` when it has none |
 | `sites_p`, `sites_d` | independent private and decoy sites in the segments |
@@ -107,6 +112,8 @@ Table columns:
 - k is 31, as in the background.
 - The calibration simulates off-target fragments from each source (the flanks, the decoy windows): about 100,000 short pairs, and up to 4,000 long reads, fewer when the source is short (two 5 Mb flanks give about 1,300 HiFi or 2,000 ONT reads); fewer still hit the screen. No false certain fragment among them bounds the rate at 3 over the number screened (a 95% bound): showing 1e-4 takes 30,000 screened, one per million three million; overlapping fragments share sites. The summary says whether the rate was shown or only none beyond it seen. Rates per million come from whole-genome negatives (see the dev scripts).
 - A homologous copy carrying the locus's alleles at two distinguishing bases within one read (gene conversion, a paralogous variant at both) reads as certain; a larger background, where more of those alleles are shared, reduces it.
+- The long-read rules' constants (1.5% private k-mers, five sites, decoys at most twice the private sites plus two, loci at least half private, 500 bases) are set from benchmark samples, not by the calibration.
+- There is no tier between certain and ambiguous. Ambiguous fragments hold most of the locus reads certain misses, among many from homologs; the table's `reason` and site columns select among them (for example `conflict` reads with many private sites).
 - Short pairs across a locus edge are less often certain than inside it: the located copies' ends are uncertain, so the k-mers near them are labelled shared.
 - Long spliced transcripts cross many junctions and read as divergent.
 - A locus missing from a background genome cannot be subtracted there; its k-mers keep that genome's counts, unless the scan for pieces finds it.

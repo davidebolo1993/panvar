@@ -30,7 +30,24 @@ struct LocusTable {
     std::vector<std::string> nodes;
     std::uint64_t backbone = 0;       // backbone k-mers in the index
     std::uint32_t min_sites = 0;      // the private sites certain needs here (0: the run's)
+    double private_share = 0;         // private k-mers among the locus's k-mers
+    // The long-read rules (see long_read_rules), set by a run for its read class; off in calibration, which the
+    // cuts were set by.
+    bool dense_conflicts = false;     // a conflict read with dense private sites is certain
+    std::uint32_t min_end_bases = 0;  // a read certain on a segment that leaves the locus needs this many bases of it
+    double run_error = 0;             // the error rate the dense rule holds mismatch runs to
 };
+
+// The long-read rules. Dense: a conflict read (private and decoy sites) is certain when private k-mers are at least
+// kDenseShare of its k-mers, with kDenseSites private sites or more, decoy sites in its segment at most twice its
+// private sites plus two, and no more mismatch runs than the run's error rate explains; hifi and ont runs, at loci
+// whose k-mers are at least kDenseLocusShare private (below that, paralog reads are as dense as the locus's own).
+// End: in a hifi run, a read certain on a segment that leaves the locus needs kMinEndBases of it (a short end stretch
+// carries chance sites).
+constexpr double kDenseShare = 0.015;
+constexpr std::uint32_t kDenseSites = 5;
+constexpr double kDenseLocusShare = 0.5;
+constexpr std::uint32_t kMinEndBases = 500;
 
 struct Row {
     std::string fragment;
