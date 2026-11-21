@@ -83,6 +83,8 @@ struct Calibration {
     // held-out, off-target simulated from the flanks and decoy windows, and off-target scanned from the
     // calibration genomes (each held out of the background in turn).
     double r_in = 0, r_out = 0, q_in = 0, q_out = 0;
+    std::uint64_t off_screened = 0;           // the simulated off-target fragments the score screened (its long reads
+                                              // over the decoy windows are laid apart from the first rules')
     std::uint64_t genome_fragments = 0, genome_screened = 0;
     ScoreHistogram locus_score, off_score, genome_score;
     std::vector<GenomeTally> genomes;         // per calibration genome

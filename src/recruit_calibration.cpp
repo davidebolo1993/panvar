@@ -156,8 +156,13 @@ struct Extent {
 
 // Off-target fragments from flanks (tiled) and windows with context (tiled with reads overlapping the window: fragments
 // overlapping a window share its sites, so false certain fragments cluster by site, and the bound treats them as
-// independent), about `want` from each kind of source.
-std::vector<Job> off_jobs(const std::vector<Extent>& off, const Class& c, Rng& rng, std::uint8_t flank_kind, std::uint8_t decoy_kind) {
+// independent), about `want` from each kind of source. With `every_overlap`, long reads are laid over a window so
+// that every overlap with it, from a k-mer at one end of the read to the whole read, comes up as often as
+// sequencing gives it: one start drawn in each stride from where the read's last k-mer is the window's first to
+// where its first is the window's last. A read that touches a homolog only at its end is judged on a short
+// stretch, where two sites score high; a fixed grid a set distance into the window never lays one.
+std::vector<Job> off_jobs(const std::vector<Extent>& off, const Class& c, Rng& rng, std::uint8_t flank_kind, std::uint8_t decoy_kind,
+                          bool every_overlap = false) {
     std::uint64_t flank_bases = 0, decoy_bases = 0;
     for (const Extent& r : off) (r.decoy ? decoy_bases : flank_bases) += r.decoy ? r.core_end - r.core_start + (c.insert ? 0 : c.length) : r.n;
     const std::uint64_t want = c.insert ? kOffShort : kOffLong;
@@ -182,6 +187,13 @@ std::vector<Job> off_jobs(const std::vector<Extent>& off, const Class& c, Rng& r
             }
         } else if (n <= c.length) {
             if (n >= 2 * kK) jobs.push_back({ri, 0, n, kind});
+        } else if (r.decoy && every_overlap) {
+            const std::uint64_t lo = std::min(n - c.length, r.core_start + kK > c.length ? r.core_start + kK - c.length : 0);
+            const std::uint64_t hi = std::min(n - c.length, std::max(lo, r.core_end > kK ? r.core_end - kK : 0));
+            for (std::uint64_t cell = lo; cell <= hi; cell += stride_decoy) {
+                const std::uint64_t width = std::min<std::uint64_t>(stride_decoy, hi - cell + 1);
+                jobs.push_back({ri, cell + std::min<std::uint64_t>(width - 1, static_cast<std::uint64_t>(rng.unit() * static_cast<double>(width))), c.length, kind});
+            }
         } else if (r.decoy) {   // reads ending at least 1 kb into the window, starting at least 1 kb before its end
             const std::uint64_t lo = std::min(n - c.length, r.core_start + 1000 > c.length ? r.core_start + 1000 - c.length : 0);
             const std::uint64_t hi = std::min(n - c.length, std::max(lo, r.core_end > 1000 ? r.core_end - 1000 : 0));
@@ -420,7 +432,7 @@ GenomeScan scan_genome(const LocusIndex& x, const FlatMap<std::uint32_t>& code_i
     for (const Class& c : kClasses) {
         GenomeClassScan cs;
         Rng rng{0x5EEDULL ^ fnv1a(x.name + c.name + "#" + genome)};
-        const std::vector<Job> jobs = off_jobs(extents, c, rng, 0, 0);
+        const std::vector<Job> jobs = off_jobs(extents, c, rng, 0, 0, true);
         const std::uint64_t seed = rng.next();
         const scoring::Costs costs = scoring::costs_for(c.error);
         const double clean = std::pow(1.0 - c.error, static_cast<double>(kK));   // a k-mer read without an error
@@ -553,17 +565,42 @@ void calibrate(LocusIndex& x, const Graph& g, const std::vector<OffTarget>& off,
             keep(res, locus_j);
         }
         // off target: the flanks of the coordinate reference and the decoy windows, read as the index labels them
+        // The first rules count the long reads over the decoy windows as they were first laid; the score takes them
+        // laid at every overlap, so those are simulated apart, and it screens its own number.
+        std::uint64_t windows_screened = 0;
         {
             const std::vector<Job> jobs = off_jobs(off_extents, c, rng, 1, 2);
             const auto res = run(jobs, off_srcs, rng.next(), c, t, x.screen, threads);
             tally_of(jobs, res, tally);
-            keep(res, off_j);
+            for (std::size_t i = 0; i < jobs.size(); ++i) {
+                if (!res[i].screened || (c.insert == 0 && jobs[i].kind == 2)) continue;
+                off_j.push_back(res[i].judged);
+                windows_screened += jobs[i].kind == 2;
+            }
+        }
+        if (c.insert == 0) {
+            std::vector<Extent> windows;
+            std::vector<const std::string*> window_srcs;
+            for (std::size_t i = 0; i < off_extents.size(); ++i)
+                if (off_extents[i].decoy) {
+                    windows.push_back(off_extents[i]);
+                    window_srcs.push_back(off_srcs[i]);
+                }
+            Rng wrng{0x5EEDULL ^ fnv1a(x.name + c.name + "#windows")};
+            const std::vector<Job> jobs = off_jobs(windows, c, wrng, 1, 2, true);
+            const auto res = run(jobs, window_srcs, wrng.next(), c, t, x.screen, threads);
+            for (const Result& r : res) {
+                if (!r.screened) continue;
+                off_j.push_back(r.judged);
+                ++windows_screened;
+            }
         }
         cal.locus = tally[0].n;
         cal.flank = tally[1].n;
         cal.decoy = tally[2].n;
         cal.flank_screened = tally[1].screened;
         cal.decoy_screened = tally[2].screened;
+        cal.off_screened = tally[1].screened + windows_screened;
         cal.locus_certain = tally[0].certain;
         cal.flank_certain = tally[1].certain;
         cal.decoy_certain = tally[2].certain;
@@ -660,7 +697,7 @@ Tier score_tier(const Calibration& c, double rate) {
     Tier t;
     t.rate = rate;
     // the two kinds of off-target fragment, simulated and scanned: each one's share is of its own screened fragments
-    const std::uint64_t screened[2] = {c.flank_screened + c.decoy_screened, c.genome_screened};
+    const std::uint64_t screened[2] = {c.off_screened, c.genome_screened};
     const double w[2] = {screened[0] ? 1.0 / static_cast<double>(screened[0]) : 0.0, screened[1] ? 1.0 / static_cast<double>(screened[1]) : 0.0};
     t.off_screened = screened[0] + screened[1];
     t.locus_total = c.locus;

@@ -412,7 +412,7 @@ ReadStats recruit_reads(const ReadOptions& options) {
                 if (loci[li].by_score) {
                     std::snprintf(b, sizeof b, "%s reads: r_in %.4g, r_out %.4g, q_in %.4g, q_out %.4g; off-target screened %llu, of them %llu from %zu held-out genomes",
                                   cal->read_class.c_str(), cal->r_in, cal->r_out, cal->q_in, cal->q_out,
-                                  static_cast<unsigned long long>(cal->flank_screened + cal->decoy_screened + cal->genome_screened),
+                                  static_cast<unsigned long long>(cal->off_screened + cal->genome_screened),
                                   static_cast<unsigned long long>(cal->genome_screened), cal->genomes.size());
                     notes[li].push_back("score");
                     notes[li].push_back(b + caveats(*cal));

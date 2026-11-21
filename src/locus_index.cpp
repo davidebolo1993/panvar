@@ -43,7 +43,7 @@ namespace fs = std::filesystem;
 
 constexpr std::size_t kK = 31, kS = 11;
 constexpr std::uint64_t kMagic = 0x3130305850585650ULL;   // "PVPXP001"
-constexpr std::uint64_t kVersion = 17;   // 2: decoy windows stop at the locus; 3: clusters split at it; 4: S per haplotype; 5: calibration; 6: its decoy pairs cross window edges; 7: locus pieces off the located copies; 8: and past estimated ends; 9: and everywhere for a locus with array pieces outside; 10: stretches reach contig ends; 11: pieces tied to the locus, short contigs whole, no decoys in pieces; 12: copies walked out from their anchors; 13: across repeats; 14: a checksum; 15: pieces only next to a copy or at a contig end; 16: the score's calibration, genomes held out; 17: the held-out genomes scanned, their median rates, candidates
+constexpr std::uint64_t kVersion = 18;   // 2: decoy windows stop at the locus; 3: clusters split at it; 4: S per haplotype; 5: calibration; 6: its decoy pairs cross window edges; 7: locus pieces off the located copies; 8: and past estimated ends; 9: and everywhere for a locus with array pieces outside; 10: stretches reach contig ends; 11: pieces tied to the locus, short contigs whole, no decoys in pieces; 12: copies walked out from their anchors; 13: across repeats; 14: a checksum; 15: pieces only next to a copy or at a contig end; 16: the score's calibration, genomes held out; 17: the held-out genomes scanned, their median rates, candidates; 18: long off-target reads at every overlap with a window
 const std::size_t kLengths[] = {100, 150, 250, 1000, 10000};
 constexpr std::size_t kWindowStep = 25;
 // A stretch of a genome is a piece of the locus when, over every window of this many bases in it, this
@@ -1650,7 +1650,7 @@ void save(const LocusIndex& x, const std::string& path) {
             for (const auto* a : {&c.locus_certain, &c.flank_certain, &c.decoy_certain})
                 for (const std::uint64_t v : *a) o.u64(v);
             for (const double r : {c.r_in, c.r_out, c.q_in, c.q_out}) o.f64(r);
-            o.u64(c.genome_fragments); o.u64(c.genome_screened);
+            o.u64(c.off_screened); o.u64(c.genome_fragments); o.u64(c.genome_screened);
             for (const ScoreHistogram* h : {&c.locus_score, &c.off_score, &c.genome_score}) { o.vec(h->bin); o.vec(h->count); }
             o.u64(c.genomes.size());
             for (const auto& g : c.genomes) {
@@ -1722,7 +1722,7 @@ LocusIndex load(const std::string& path) {
         for (auto* a : {&c.locus_certain, &c.flank_certain, &c.decoy_certain})
             for (std::uint64_t& v : *a) v = i.u64();
         for (double* r : {&c.r_in, &c.r_out, &c.q_in, &c.q_out}) *r = i.f64();
-        c.genome_fragments = i.u64(); c.genome_screened = i.u64();
+        c.off_screened = i.u64(); c.genome_fragments = i.u64(); c.genome_screened = i.u64();
         for (ScoreHistogram* h : {&c.locus_score, &c.off_score, &c.genome_score}) {
             h->bin = i.vec<std::int32_t>();
             h->count = i.vec<std::uint64_t>();
@@ -1833,7 +1833,7 @@ void write_report(const LocusIndex& x, const std::string& path) {
     for (const auto& c : x.calibration) {
         char b[256];
         std::snprintf(b, sizeof b, "%.6g\t%.6g\t%.6g\t%.6g", c.r_in, c.r_out, c.q_in, c.q_out);
-        r << "score_rates\t" << c.read_class << '\t' << b << '\t' << c.flank_screened + c.decoy_screened << '\t' << c.genome_screened << '\n';
+        r << "score_rates\t" << c.read_class << '\t' << b << '\t' << c.off_screened << '\t' << c.genome_screened << '\n';
     }
     r << "score_genome\tclass\tgenome\tfragments\tscreened\twith_private\tlocus_copy_fragments\tr_out\tq_out\n";
     for (const auto& c : x.calibration)

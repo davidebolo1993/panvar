@@ -456,6 +456,18 @@ check "the off-target site rate is the median of the held-out genomes' own (r_ou
 # one they give, and the run says so; a rate they can show is the one observed
 tier() { awk -F'\t' -v r="$2" -v c="$3" '$1=="score_tier" && $2=="short" && $3==r {print $c}' "$1"; }
 check "a rate too low to show: the threshold extrapolated from the off-target tail ($(tier idx/locus.index.tsv 0.0001 4), $(tier idx/locus.index.tsv 0.0001 12)), said in the summary; a rate shown: observed ($(tier idx/locus.index.tsv 0.01 4))" '[[ "$(tier idx/locus.index.tsv 0.0001 11)" == extrapolated && "$(tier idx/locus.index.tsv 0.01 11)" == observed && "$(tier idx/locus.index.tsv 0.01 12)" == "." ]] && grep -q "^locus.locus.certain_threshold.*too few to show the rate: the threshold is extrapolated from the tail of the off-target scores (scale .*; the fragments seen give" recruited.summary.tsv && ! grep -q "^locus.locus.likely_threshold.*extrapolated" recruited.summary.tsv'
+# long reads that touch a homolog only at their end. Every genome holds near-identical paralogs of stretches of the
+# locus; gx, held out in calibration, holds the locus's alleles at two bases at the start of three of them. A new
+# sample's 12 kb reads ending 120 to 280 bases into such a paralog are judged on that short stretch, two private
+# sites in it: the calibration lays reads at every overlap with a window, sees the like in gx, and they are not certain
+"$BIN" background -t 2 --partitions 64 --memory 64M -q --tmp-dir "$OUT/tmp" -o s_tips --genome ref=data/tips/ref.fa --genome ga=data/tips/ga.fa --genome gb=data/tips/gb.fa --genome gx=data/tips/gx.fa --coordinate-reference ref
+"$BIN" recruit -q -t 2 --background s_tips -r ref --index-only --locus data/tips/locus.gfa --save-index idx_tips --decoy-genomes ref,ga,gb,gx
+endrow() { awk -F'\t' 'NR > 1 {n++; two += $8 == 2 && $5 == "part"; c += $3 == "certain"} END {print n + 0 " reads, " two + 0 " with two private sites on a part, " c + 0 " certain"}' "$1"; }
+for p in hifi ont; do
+  "$BIN" recruit --locus idx_tips/locus.plx -i data/tips/reads_end.fq -o tips_$p.tsv --preset $p -t 2 -q
+  recall=$(awk -F'\t' -v c=$p '$1=="score_tier" && $2==c && $3=="0.0001" {print $6}' idx_tips/locus.index.tsv)
+  check "$p reads touching a homolog only at their end, two private sites there, are not certain ($(endrow tips_$p.tsv)); held-out recall $recall" '[[ "$(endrow tips_$p.tsv)" == "6 reads, 6 with two private sites on a part, 0 certain" && $recall == 1.0000 ]]'
+done
 # an index of an earlier format is refused, saying so
 cp idx_logo/locus.plx old.plx
 python3 - old.plx <<'PY'
@@ -463,7 +475,7 @@ import struct, sys
 p = sys.argv[1]; b = bytearray(open(p, "rb").read()); b[8:16] = struct.pack("<Q", 15); open(p, "wb").write(bytes(b))
 PY
 "$BIN" recruit --locus old.plx -1 reads_1.fq -2 reads_2.fq -o old.tsv -q 2> old.txt; rc=$?
-check "an index of format 15 is refused: rebuild it" '[[ $rc -ne 0 ]] && grep -q "of format 15; this panvar reads format 17" old.txt && grep -q "rebuild" old.txt'
+check "an index of format 15 is refused: rebuild it" '[[ $rc -ne 0 ]] && grep -q "of format 15; this panvar reads format 18" old.txt && grep -q "rebuild" old.txt'
 # the first rules reproduce a reference build's tables (RECRUIT_V1_BIN: a panvar of the first rules)
 if [[ -n "${RECRUIT_V1_BIN:-}" ]]; then
   same=0; cases=0

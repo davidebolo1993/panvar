@@ -239,3 +239,50 @@ with open(os.path.join(logo, "locus.gfa"), "w") as f:
 write("logo/gc", [("chr1", ref5), ("c", seq(20000) + "".join(ref5[x:x + 1000] for x in reversed(range(121000, 129000, 1000))) + seq(20000))])
 # ge: a 3% diverged paralog of the same 8 kb, in pieces like gu's: few of its k-mers are the locus's
 write("logo/ge", [("chr1", ref5), ("e", seq(20000) + scrambled(121000, 129000, 0.03) + seq(20000))])
+
+# tips/: a locus with sixteen near-identical paralogs of 1.5 kb stretches of it, in every genome. Each paralog has its
+# own alleles at two bases near its start (35, 70) and every 150 bases from 330 on; gx holds the locus's alleles at
+# those first two in three of the paralogs, as a new sample might. reads_end.fq: 12 kb reads of another sample, whose
+# other paralogs hold the locus's alleles there, ending 120 to 280 bases into such a paralog: two private sites at
+# the end of a read that is otherwise off the locus.
+tips = os.path.join(out, "tips")
+os.makedirs(tips, exist_ok=True)
+ref6 = list(seq(900000))
+ls6, le6 = 150000, 190000
+locus6 = "".join(ref6[ls6:le6])
+own6 = [35, 70] + list(range(330, 1500, 150))
+copies6 = []
+for i in range(16):
+    src = locus6[500 + 2400 * i:2000 + 2400 * i]
+    b = list(src)
+    for p in own6:
+        b[p] = {"A": "C", "C": "G", "G": "T", "T": "A"}[b[p]]
+    copies6.append(src)
+    ref6[230000 + 40000 * i:231500 + 40000 * i] = b
+ref6 = "".join(ref6)
+
+
+def locus_alleles(which):   # the genome with the locus's alleles at the first two bases of those paralogs
+    g = list(ref6)
+    for i in which:
+        for p in (35, 70):
+            g[230000 + 40000 * i + p] = copies6[i][p]
+    return "".join(g)
+
+
+hap6 = mutate(locus6, 0.002)
+write("tips/ref", [("chr1", ref6)])
+write("tips/ga", [("chr1", ref6[:ls6] + hap6 + ref6[le6:])])
+write("tips/gb", [("chr1", ref6[:ls6] + mutate(locus6, 0.002) + ref6[le6:])])
+write("tips/gx", [("chr1", locus_alleles((0, 1, 2)))])
+with open(os.path.join(tips, "locus.gfa"), "w") as f:
+    f.write("H\tVN:Z:1.0\n")
+    f.write(f"S\t1\t{locus6}\nS\t2\t{hap6}\n")
+    f.write(f"P\tref#1#chr1:{ls6}-{le6}\t1+\t*\n")
+    f.write(f"P\tga#1#chr1:{ls6}-{le6}\t2+\t*\n")
+gy = locus_alleles((9, 12))
+with open(os.path.join(tips, "reads_end.fq"), "w") as f:
+    for i in (9, 12):
+        for t in (120, 200, 280):
+            end = 230000 + 40000 * i + t
+            f.write(f"@end{i}_{t}\n{gy[end - 12000:end]}\n+\n{'I' * 12000}\n")
