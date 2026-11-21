@@ -1,6 +1,6 @@
 # An inversion site (F0 to X3, inverted repeat R at both ends of the stretch) with inversions of three lengths
 # between the copies of R. ifirst inverts X1 X2; imid inverts X2 X3 and imid2 X2 X3 Xs, alleles of one inversion
-# (their reversed runs overlap by nine tenths); iall inverts X1 to X4, past the site's last node. Each haplotype is a
+# (they share most of their bases, as two events merged into one record do); iall inverts X1 to X4, past the site's last node. Each haplotype is a
 # carrier of the record holding its inversion, and no allele (.) at the others it overlaps.
 N F0 200 1601
 N R 300 1602

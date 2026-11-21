@@ -29,12 +29,13 @@ struct PathInversion {
     std::size_t right_start = 0;   // first base of the forward run after it
     std::string left_node, right_node;   // the reference nodes holding left_end and right_start
     std::vector<std::size_t> carriers;   // path indices
-    // Each carrier's own flanks (left_end, right_start), as carriers: the inversion each one makes.
-    std::vector<std::pair<std::size_t, std::size_t>> carrier_flanks;
 };
 
 struct PathInversionScan {
     std::vector<PathInversion> inversions;
+    // Each haplotype's own inversion, one carrier each, by reversed run then path: what the grouped ones are
+    // made of. A caller with its own test of two inversions being one groups these.
+    std::vector<PathInversion> each;
     // Per path, the reference offsets its once-walked reference nodes reach ({SIZE_MAX, 0} when none);
     // the reference path itself spans everything.
     std::vector<std::pair<std::size_t, std::size_t>> span;

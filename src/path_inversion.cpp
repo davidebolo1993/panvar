@@ -171,6 +171,13 @@ PathInversionScan find_path_inversions(const Graph& graph, const PathRecord& ref
     std::sort(cands.begin(), cands.end(), [](const Cand& x, const Cand& y) {
         return std::tie(x.a, x.b, x.pi) < std::tie(y.a, y.b, y.pi);
     });
+    for (const Cand& c : cands) {
+        PathInversion inv;
+        inv.left_end = c.left; inv.inv_lo = c.a; inv.inv_hi = c.b; inv.right_start = c.right;
+        inv.left_node = c.left_node; inv.right_node = c.right_node;
+        inv.carriers.push_back(c.pi);
+        out.each.push_back(std::move(inv));
+    }
     std::vector<std::vector<Cand>> groups;
     for (const Cand& c : cands) {
         bool placed = false;
@@ -189,15 +196,12 @@ PathInversionScan find_path_inversions(const Graph& graph, const PathRecord& ref
             [](const auto& x, const auto& y) { return x.second < y.second; })->first;
         PathInversion inv;
         std::tie(inv.left_end, inv.inv_lo, inv.inv_hi, inv.right_start) = best;
-        std::vector<std::tuple<std::size_t, std::size_t, std::size_t>> own;   // (path, left, right)
         for (const Cand& c : g) {
             if (std::tie(c.left, c.a, c.b, c.right) == best) { inv.left_node = c.left_node; inv.right_node = c.right_node; }
-            own.emplace_back(c.pi, c.left, c.right);
+            inv.carriers.push_back(c.pi);
         }
-        std::sort(own.begin(), own.end());
-        own.erase(std::unique(own.begin(), own.end(), [](const auto& x, const auto& y) { return std::get<0>(x) == std::get<0>(y); }),
-                  own.end());
-        for (const auto& [pi, l, r] : own) { inv.carriers.push_back(pi); inv.carrier_flanks.emplace_back(l, r); }
+        std::sort(inv.carriers.begin(), inv.carriers.end());
+        inv.carriers.erase(std::unique(inv.carriers.begin(), inv.carriers.end()), inv.carriers.end());
         out.inversions.push_back(std::move(inv));
     }
     return out;

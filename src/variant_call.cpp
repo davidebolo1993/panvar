@@ -2339,6 +2339,167 @@ void call_variants(
     // Bubbles run serially; parallelism is inside each bubble, over its alleles (the walk-diff DP is
     // the hot path, and an SV locus is usually one dominant folded bubble). Each bubble writes only to
     // its own slot, so results are order-deterministic.
+    // An event as the change it makes to the reference: the base before it, the bases it deletes, the
+    // sequence it inserts (genomic orientation). Aligned events always have one; node events when exact.
+    struct Splice { std::size_t before = 0, del = 0; const std::string* ins = nullptr; };
+    auto splice_of = [](const Event& e, Splice& sp) {
+        if (e.seq_event) { sp = {e.seq_before, e.del_bp, &e.seq_ins}; return true; }
+        if (e.splice_ok) { sp = {e.splice_before, e.splice_del, &e.splice_ins}; return true; }
+        return false;
+    };
+    // The identity of the two haplotypes events a and b make, as edit distance against the larger
+    // event; 0 when they cannot be compared or the stretch where they differ is not alike.
+    auto spliced_identity = [&](const Event& a, const Event& b) -> double {
+        Splice A, B;
+        if (!splice_of(a, A) || !splice_of(b, B)) return 0.0;
+        if (A.before == B.before && A.del == B.del && *A.ins == *B.ins) return 1.0;
+        const std::size_t base = ref_meta.region_start_1based;
+        const std::size_t big = std::max(a.size_bp, b.size_bp), small = std::min(a.size_bp, b.size_bp);
+        const double len_ratio = options.merge_size_ratio > 0.0 ? options.merge_size_ratio : options.merge_seq_identity;
+        if (big == 0 || static_cast<double>(small) < len_ratio * static_cast<double>(big)) return 0.0;
+        const std::size_t sa = A.before + 1, sb = B.before + 1;
+        const std::size_t ea = sa + A.del, eb = sb + B.del;
+        const std::size_t lo = std::min(sa, sb), hi = std::max(ea, eb);
+        if (lo < base || hi - base > ref_genome.size()) return 0.0;
+        // Each haplotype over [lo, hi): the reference with the event spliced in. Read base by base,
+        // so the shared ends are found without building either; only the core between them is
+        // built and aligned, and the alignment stops once the identity cannot be reached.
+        const std::size_t nx = hi - lo - A.del + A.ins->size(), ny = hi - lo - B.del + B.ins->size();
+        auto at = [&](const Splice& e, std::size_t st, std::size_t en, std::size_t i) -> char {
+            if (i < st - lo) return ref_genome[lo - base + i];
+            i -= st - lo;
+            if (i < e.ins->size()) return (*e.ins)[i];
+            return ref_genome[en - base + (i - e.ins->size())];
+        };
+        std::size_t p = 0, q = 0;
+        while (p < nx && p < ny && at(A, sa, ea, p) == at(B, sb, eb, p)) ++p;
+        while (q < nx - p && q < ny - p && at(A, sa, ea, nx - 1 - q) == at(B, sb, eb, ny - 1 - q)) ++q;
+        std::string x, y;
+        x.reserve(nx - p - q);
+        y.reserve(ny - p - q);
+        for (std::size_t i = p; i < nx - q; ++i) x += at(A, sa, ea, i);
+        for (std::size_t i = p; i < ny - q; ++i) y += at(B, sb, eb, i);
+        // The largest distance that can still reach the identity, with room for rounding: over it is
+        // no match, whatever the identity the bound itself would give.
+        const auto max_k = static_cast<std::size_t>((1.0 - options.merge_seq_identity) * static_cast<double>(big) + 1e-6);
+        const std::size_t ed = nw_distance(x, y, max_k);
+        if (ed > max_k) return 0.0;
+        // Against the event, two placements of one size in unique sequence look alike: unrelated
+        // sequence aligns at about half an edit per base, so two equal large deletions a few kb apart
+        // can differ by less than the identity allows. Where the placements are a structural variant's
+        // length apart and the haplotypes differ by as many edits, the sequence between them must be the
+        // same, as it is where one event sits in either copy of a duplication: the edits are measured
+        // against that distance. Base changes clustered in one placement are not a distance apart.
+        const std::size_t apart = std::max(sa > sb ? sa - sb : sb - sa, ea > eb ? ea - eb : eb - ea);
+        if (apart >= options.min_sv_bp && ed >= options.min_sv_bp &&
+            1.0 - static_cast<double>(ed) / static_cast<double>(apart) < options.merge_seq_identity)
+            return 0.0;
+        return ed >= big ? 0.0 : 1.0 - static_cast<double>(ed) / static_cast<double>(big);
+    };
+    // Two non-DUP events are the same site: compatible types, anchors within the window, net length
+    // changes less than --min-sv-bp apart, and then the haplotypes they make where both are exact
+    // changes, else node-set Jaccard or sequence identity. out_jac/out_seq receive the evidence
+    // (seq computed only when the Jaccard gate did not already decide it).
+    // out_test: the test that decided, "spliced" (the haplotypes the two make), "jaccard" (their nodes) or
+    // "seq" (their sequences); empty where none was reached.
+    auto events_match = [&](const Event& a, const Event& b,
+                            double* out_jac = nullptr, double* out_seq = nullptr, const char** out_test = nullptr) {
+        if (out_jac) *out_jac = -1.0;
+        if (out_seq) *out_seq = -1.0;
+        if (out_test) *out_test = "";
+        // Net length change: a deletion's is minus its size, an insertion's its size.
+        auto net_of = [](const Event& e) -> long long {
+            if (e.type == EvType::Ins) return static_cast<long long>(e.size_bp);
+            if (e.type == EvType::Del) return -static_cast<long long>(e.size_bp);
+            return static_cast<long long>(e.ins_bp) - static_cast<long long>(e.del_bp);
+        };
+        auto sgn = [&](const Event& e) { const long long v = net_of(e); return v > 0 ? 1 : v < 0 ? -1 : 0; };
+        // Two aligned events are the same when the haplotypes they make are, so a substitution can
+        // match a deletion or insertion it nearly is (a run replaced by a few bases against the same
+        // run deleted), provided their net changes point the same way; spliced identity and the net gate
+        // below decide. Node events keep to one type.
+        if (a.type != b.type) {
+            const bool sub_pair = a.seq_event && b.seq_event &&
+                (a.type == EvType::Sub || b.type == EvType::Sub) &&
+                a.type != EvType::Inv && b.type != EvType::Inv && a.type != EvType::Dup && b.type != EvType::Dup;
+            if (!sub_pair || sgn(a) != sgn(b) || sgn(a) == 0) return false;
+        }
+        // Substitutions share the nodes of the run they replace whichever way their length moves,
+        // so a loss and a gain of one size would pass the node test: their net changes have to
+        // point the same way (or both be none).
+        if (a.type == EvType::Sub && b.type == EvType::Sub && sgn(a) != sgn(b)) return false;
+        if (a.ref_pos == 0 || b.ref_pos == 0) {
+            // fall back to node/seq only when no coordinate
+        } else {
+            // Position window scales with event size: a large insertion/deletion can
+            // attach at a fuzzy breakpoint that varies by kilobases across haplotypes,
+            // yet still be the same event. The sequence/Jaccard gate below keeps this
+            // from over-merging genuinely distinct events at nearby positions.
+            const long long window = static_cast<long long>(options.merge_distance_bp) +
+                static_cast<long long>(std::min(a.size_bp, b.size_bp));
+            const long long d = static_cast<long long>(a.ref_pos) - static_cast<long long>(b.ref_pos);
+            if (d > window || d < -window) return false;
+        }
+        // Two events found by aligning alleles are the same when the haplotypes they make are: each is
+        // spliced into the reference over the stretch both span and the results compared, as edit
+        // distance against the larger event. In an exact repeat that is left-normalisation; where the
+        // same deletion is placed differently inside a segmental duplication, it measures the
+        // duplicate's homology rather than how far the two placements are apart. Their nodes are
+        // not used: an aligned event's nodes are those it overlaps, so in a repeat deletions of very
+        // different sizes share them all.
+        // And their length changes must differ by less than --min-sv-bp, so that a record's carriers
+        // never differ in length by a structural variant; the identity alone allows that on large
+        // events. Base changes between them are left to the identity, as one large insertion carries
+        // ordinary divergence.
+        if (a.seq_event && b.seq_event) {
+            const long long na = static_cast<long long>(a.ins_bp) - static_cast<long long>(a.del_bp);
+            const long long nb = static_cast<long long>(b.ins_bp) - static_cast<long long>(b.del_bp);
+            const long long dn = na > nb ? na - nb : nb - na;
+            const bool len_ok = dn < static_cast<long long>(options.min_sv_bp);
+            if (out_jac) *out_jac = -1.0;
+            if (out_test) *out_test = "spliced";
+            // The length gate is the cheap test: where it fails and the identity is not asked for, it is
+            // not measured.
+            if (!len_ok && out_seq == nullptr) return false;
+            const double sid = spliced_identity(a, b);
+            if (out_seq) *out_seq = sid;
+            return sid >= options.merge_seq_identity && len_ok;
+        }
+        // The node rules keep the aligned rules' length gate: a record's carriers never differ in
+        // length by a structural variant, however many nodes they share (a deletion shares most of
+        // its bases with a smaller one inside it).
+        {
+            const long long na = net_of(a), nb = net_of(b);
+            if (a.type != EvType::Inv && (na > nb ? na - nb : nb - na) >= static_cast<long long>(options.min_sv_bp))
+                return false;
+        }
+        // Two events that are each one exact change compare as aligned ones do, by the haplotypes they
+        // make, so the same inserted node at two places is two insertions, not one.
+        {
+            Splice A, B;
+            if (a.type != EvType::Inv && splice_of(a, A) && splice_of(b, B)) {
+                const double sid = spliced_identity(a, b);
+                if (out_seq) *out_seq = sid;
+                if (out_test) *out_test = "spliced";
+                return sid >= options.merge_seq_identity;
+            }
+        }
+        const double jac = weighted_jaccard(graph, a.nodes, b.nodes);
+        if (out_jac) *out_jac = jac;
+        if (out_test) *out_test = "jaccard";
+        if (jac >= options.merge_jaccard) return true;
+        const double len_ratio =
+            options.merge_size_ratio > 0.0 ? options.merge_size_ratio : options.merge_seq_identity;
+        // A substitution is compared on both sequences, replaced and replacing: two that replace
+        // the same reference run with different sequence are different alleles.
+        const double sid = a.type == EvType::Sub
+            ? seq_identity(a.seq + "|" + a.alt_seq, b.seq + "|" + b.alt_seq, options.merge_seq_identity, len_ratio)
+            : seq_identity(a.seq, b.seq, options.merge_seq_identity, len_ratio);
+        if (out_seq) *out_seq = sid;
+        if (out_test) *out_test = "seq";
+        return sid >= options.merge_seq_identity;
+    };
+
     // What a run over one site writes. A site read one copy at a time is also read in one walk, for its copy
     // numbers only: copies are counted over every crossing, as a module or a repeat holds them, while its
     // other changes are typed copy by copy.
@@ -2680,167 +2841,6 @@ void call_variants(
             const std::size_t glen = node_len(graph, e.anchor_node);
             return static_cast<long long>(it->second + (e.anchor_after && glen > 0 ? glen - 1 : 0));
         };
-        // An event as the change it makes to the reference: the base before it, the bases it deletes, the
-        // sequence it inserts (genomic orientation). Aligned events always have one; node events when exact.
-        struct Splice { std::size_t before = 0, del = 0; const std::string* ins = nullptr; };
-        auto splice_of = [](const Event& e, Splice& sp) {
-            if (e.seq_event) { sp = {e.seq_before, e.del_bp, &e.seq_ins}; return true; }
-            if (e.splice_ok) { sp = {e.splice_before, e.splice_del, &e.splice_ins}; return true; }
-            return false;
-        };
-        // The identity of the two haplotypes events a and b make, as edit distance against the larger
-        // event; 0 when they cannot be compared or the stretch where they differ is not alike.
-        auto spliced_identity = [&](const Event& a, const Event& b) -> double {
-            Splice A, B;
-            if (!splice_of(a, A) || !splice_of(b, B)) return 0.0;
-            if (A.before == B.before && A.del == B.del && *A.ins == *B.ins) return 1.0;
-            const std::size_t base = ref_meta.region_start_1based;
-            const std::size_t big = std::max(a.size_bp, b.size_bp), small = std::min(a.size_bp, b.size_bp);
-            const double len_ratio = options.merge_size_ratio > 0.0 ? options.merge_size_ratio : options.merge_seq_identity;
-            if (big == 0 || static_cast<double>(small) < len_ratio * static_cast<double>(big)) return 0.0;
-            const std::size_t sa = A.before + 1, sb = B.before + 1;
-            const std::size_t ea = sa + A.del, eb = sb + B.del;
-            const std::size_t lo = std::min(sa, sb), hi = std::max(ea, eb);
-            if (lo < base || hi - base > ref_genome.size()) return 0.0;
-            // Each haplotype over [lo, hi): the reference with the event spliced in. Read base by base,
-            // so the shared ends are found without building either; only the core between them is
-            // built and aligned, and the alignment stops once the identity cannot be reached.
-            const std::size_t nx = hi - lo - A.del + A.ins->size(), ny = hi - lo - B.del + B.ins->size();
-            auto at = [&](const Splice& e, std::size_t st, std::size_t en, std::size_t i) -> char {
-                if (i < st - lo) return ref_genome[lo - base + i];
-                i -= st - lo;
-                if (i < e.ins->size()) return (*e.ins)[i];
-                return ref_genome[en - base + (i - e.ins->size())];
-            };
-            std::size_t p = 0, q = 0;
-            while (p < nx && p < ny && at(A, sa, ea, p) == at(B, sb, eb, p)) ++p;
-            while (q < nx - p && q < ny - p && at(A, sa, ea, nx - 1 - q) == at(B, sb, eb, ny - 1 - q)) ++q;
-            std::string x, y;
-            x.reserve(nx - p - q);
-            y.reserve(ny - p - q);
-            for (std::size_t i = p; i < nx - q; ++i) x += at(A, sa, ea, i);
-            for (std::size_t i = p; i < ny - q; ++i) y += at(B, sb, eb, i);
-            // The largest distance that can still reach the identity, with room for rounding: over it is
-            // no match, whatever the identity the bound itself would give.
-            const auto max_k = static_cast<std::size_t>((1.0 - options.merge_seq_identity) * static_cast<double>(big) + 1e-6);
-            const std::size_t ed = nw_distance(x, y, max_k);
-            if (ed > max_k) return 0.0;
-            // Against the event, two placements of one size in unique sequence look alike: unrelated
-            // sequence aligns at about half an edit per base, so two equal large deletions a few kb apart
-            // can differ by less than the identity allows. Where the placements are a structural variant's
-            // length apart and the haplotypes differ by as many edits, the sequence between them must be the
-            // same, as it is where one event sits in either copy of a duplication: the edits are measured
-            // against that distance. Base changes clustered in one placement are not a distance apart.
-            const std::size_t apart = std::max(sa > sb ? sa - sb : sb - sa, ea > eb ? ea - eb : eb - ea);
-            if (apart >= options.min_sv_bp && ed >= options.min_sv_bp &&
-                1.0 - static_cast<double>(ed) / static_cast<double>(apart) < options.merge_seq_identity)
-                return 0.0;
-            return ed >= big ? 0.0 : 1.0 - static_cast<double>(ed) / static_cast<double>(big);
-        };
-        // Two non-DUP events are the same site: compatible types, anchors within the window, net length
-        // changes less than --min-sv-bp apart, and then the haplotypes they make where both are exact
-        // changes, else node-set Jaccard or sequence identity. out_jac/out_seq receive the evidence
-        // (seq computed only when the Jaccard gate did not already decide it).
-        // out_test: the test that decided, "spliced" (the haplotypes the two make), "jaccard" (their nodes) or
-        // "seq" (their sequences); empty where none was reached.
-        auto events_match = [&](const Event& a, const Event& b,
-                                double* out_jac = nullptr, double* out_seq = nullptr, const char** out_test = nullptr) {
-            if (out_jac) *out_jac = -1.0;
-            if (out_seq) *out_seq = -1.0;
-            if (out_test) *out_test = "";
-            // Net length change: a deletion's is minus its size, an insertion's its size.
-            auto net_of = [](const Event& e) -> long long {
-                if (e.type == EvType::Ins) return static_cast<long long>(e.size_bp);
-                if (e.type == EvType::Del) return -static_cast<long long>(e.size_bp);
-                return static_cast<long long>(e.ins_bp) - static_cast<long long>(e.del_bp);
-            };
-            auto sgn = [&](const Event& e) { const long long v = net_of(e); return v > 0 ? 1 : v < 0 ? -1 : 0; };
-            // Two aligned events are the same when the haplotypes they make are, so a substitution can
-            // match a deletion or insertion it nearly is (a run replaced by a few bases against the same
-            // run deleted), provided their net changes point the same way; spliced identity and the net gate
-            // below decide. Node events keep to one type.
-            if (a.type != b.type) {
-                const bool sub_pair = a.seq_event && b.seq_event &&
-                    (a.type == EvType::Sub || b.type == EvType::Sub) &&
-                    a.type != EvType::Inv && b.type != EvType::Inv && a.type != EvType::Dup && b.type != EvType::Dup;
-                if (!sub_pair || sgn(a) != sgn(b) || sgn(a) == 0) return false;
-            }
-            // Substitutions share the nodes of the run they replace whichever way their length moves,
-            // so a loss and a gain of one size would pass the node test: their net changes have to
-            // point the same way (or both be none).
-            if (a.type == EvType::Sub && b.type == EvType::Sub && sgn(a) != sgn(b)) return false;
-            if (a.ref_pos == 0 || b.ref_pos == 0) {
-                // fall back to node/seq only when no coordinate
-            } else {
-                // Position window scales with event size: a large insertion/deletion can
-                // attach at a fuzzy breakpoint that varies by kilobases across haplotypes,
-                // yet still be the same event. The sequence/Jaccard gate below keeps this
-                // from over-merging genuinely distinct events at nearby positions.
-                const long long window = static_cast<long long>(options.merge_distance_bp) +
-                    static_cast<long long>(std::min(a.size_bp, b.size_bp));
-                const long long d = static_cast<long long>(a.ref_pos) - static_cast<long long>(b.ref_pos);
-                if (d > window || d < -window) return false;
-            }
-            // Two events found by aligning alleles are the same when the haplotypes they make are: each is
-            // spliced into the reference over the stretch both span and the results compared, as edit
-            // distance against the larger event. In an exact repeat that is left-normalisation; where the
-            // same deletion is placed differently inside a segmental duplication, it measures the
-            // duplicate's homology rather than how far the two placements are apart. Their nodes are
-            // not used: an aligned event's nodes are those it overlaps, so in a repeat deletions of very
-            // different sizes share them all.
-            // And their length changes must differ by less than --min-sv-bp, so that a record's carriers
-            // never differ in length by a structural variant; the identity alone allows that on large
-            // events. Base changes between them are left to the identity, as one large insertion carries
-            // ordinary divergence.
-            if (a.seq_event && b.seq_event) {
-                const long long na = static_cast<long long>(a.ins_bp) - static_cast<long long>(a.del_bp);
-                const long long nb = static_cast<long long>(b.ins_bp) - static_cast<long long>(b.del_bp);
-                const long long dn = na > nb ? na - nb : nb - na;
-                const bool len_ok = dn < static_cast<long long>(options.min_sv_bp);
-                if (out_jac) *out_jac = -1.0;
-                if (out_test) *out_test = "spliced";
-                // The length gate is the cheap test: where it fails and the identity is not asked for, it is
-                // not measured.
-                if (!len_ok && out_seq == nullptr) return false;
-                const double sid = spliced_identity(a, b);
-                if (out_seq) *out_seq = sid;
-                return sid >= options.merge_seq_identity && len_ok;
-            }
-            // The node rules keep the aligned rules' length gate: a record's carriers never differ in
-            // length by a structural variant, however many nodes they share (a deletion shares most of
-            // its bases with a smaller one inside it).
-            {
-                const long long na = net_of(a), nb = net_of(b);
-                if (a.type != EvType::Inv && (na > nb ? na - nb : nb - na) >= static_cast<long long>(options.min_sv_bp))
-                    return false;
-            }
-            // Two events that are each one exact change compare as aligned ones do, by the haplotypes they
-            // make, so the same inserted node at two places is two insertions, not one.
-            {
-                Splice A, B;
-                if (a.type != EvType::Inv && splice_of(a, A) && splice_of(b, B)) {
-                    const double sid = spliced_identity(a, b);
-                    if (out_seq) *out_seq = sid;
-                    if (out_test) *out_test = "spliced";
-                    return sid >= options.merge_seq_identity;
-                }
-            }
-            const double jac = weighted_jaccard(graph, a.nodes, b.nodes);
-            if (out_jac) *out_jac = jac;
-            if (out_test) *out_test = "jaccard";
-            if (jac >= options.merge_jaccard) return true;
-            const double len_ratio =
-                options.merge_size_ratio > 0.0 ? options.merge_size_ratio : options.merge_seq_identity;
-            // A substitution is compared on both sequences, replaced and replacing: two that replace
-            // the same reference run with different sequence are different alleles.
-            const double sid = a.type == EvType::Sub
-                ? seq_identity(a.seq + "|" + a.alt_seq, b.seq + "|" + b.alt_seq, options.merge_seq_identity, len_ratio)
-                : seq_identity(a.seq, b.seq, options.merge_seq_identity, len_ratio);
-            if (out_seq) *out_seq = sid;
-            if (out_test) *out_test = "seq";
-            return sid >= options.merge_seq_identity;
-        };
-
         // A self-loop the UNIT route calls is one whose unit is SV-sized, or whose copy change is: the
         // event is unit x |copy change|, so a short unit gaining many copies is an SV-sized event. Gating
         // on the unit alone would lose such events outright, as the loop is removed from the DEL/INS/INV
@@ -5884,11 +5884,69 @@ void call_variants(
         }
         std::size_t written = 0, no_site = 0;
         std::unordered_map<std::size_t, int> per_parent;
+        // Each haplotype's inversion is an event, the reference stretch between its flanks turned, and the same
+        // inversion in different haplotypes is one record by the test that makes any two events one
+        // (events_match), linked pairwise as node events are. The record is placed at the flanks most of its
+        // carriers share, and keeps each carrier's own.
+        struct InvRecord {
+            std::size_t left_end = 0, inv_lo = 0, inv_hi = 0, right_start = 0;
+            std::vector<std::size_t> carriers;                                 // path indices
+            std::vector<std::pair<std::size_t, std::size_t>> carrier_flanks;   // each one's (left_end, right_start)
+        };
+        std::vector<InvRecord> inv_records;
+        {
+            // Inversions with the same flanks are one event: compared once.
+            std::map<std::pair<std::size_t, std::size_t>, std::size_t> class_of;
+            std::vector<Event> events;
+            std::vector<std::size_t> cls(scan.each.size());
+            for (std::size_t i = 0; i < scan.each.size(); ++i) {
+                const PathInversion& inv = scan.each[i];
+                const auto [it, fresh] = class_of.try_emplace({inv.left_end, inv.right_start}, events.size());
+                cls[i] = it->second;
+                if (!fresh) continue;
+                Event e;
+                e.type = EvType::Inv;
+                const std::size_t lo = inv.left_end + 1, hi = inv.right_start;   // offsets, half-open
+                for (std::size_t k = static_cast<std::size_t>(std::lower_bound(ref_prefix.begin(), ref_prefix.end(), lo) - ref_prefix.begin());
+                     k < ref_path->steps.size() && ref_prefix[k + 1] <= hi; ++k)
+                    e.nodes.push_back(ref_path->steps[k].node_id);
+                e.seq = lo < hi && hi <= ref_genome.size() ? ref_genome.substr(lo, hi - lo) : std::string();
+                e.size_bp = hi > lo ? hi - lo : 0;
+                e.ref_pos = g0 + lo;
+                events.push_back(std::move(e));
+            }
+            DisjointSet dsu(events.size());
+            for (std::size_t x = 0; x < events.size(); ++x)
+                for (std::size_t y = x + 1; y < events.size(); ++y)
+                    if (dsu.find(x) != dsu.find(y) && events_match(events[x], events[y])) dsu.unite(x, y);
+            std::map<std::size_t, std::size_t> group_of;   // root -> group, in the order haplotypes' inversions come
+            std::vector<std::vector<std::size_t>> groups;
+            for (std::size_t i = 0; i < scan.each.size(); ++i) {
+                const auto [it, fresh] = group_of.try_emplace(dsu.find(cls[i]), groups.size());
+                if (fresh) groups.emplace_back();
+                groups[it->second].push_back(i);
+            }
+            for (const std::vector<std::size_t>& g : groups) {
+                std::map<std::tuple<std::size_t, std::size_t, std::size_t, std::size_t>, std::size_t> votes;
+                for (const std::size_t i : g)
+                    ++votes[{scan.each[i].left_end, scan.each[i].inv_lo, scan.each[i].inv_hi, scan.each[i].right_start}];
+                InvRecord rec;
+                std::tie(rec.left_end, rec.inv_lo, rec.inv_hi, rec.right_start) =
+                    std::max_element(votes.begin(), votes.end(), [](const auto& x, const auto& y) { return x.second < y.second; })->first;
+                std::vector<std::tuple<std::size_t, std::size_t, std::size_t>> own;   // (path, left, right)
+                for (const std::size_t i : g) own.emplace_back(scan.each[i].carriers.front(), scan.each[i].left_end, scan.each[i].right_start);
+                std::sort(own.begin(), own.end());
+                own.erase(std::unique(own.begin(), own.end(), [](const auto& x, const auto& y) { return std::get<0>(x) == std::get<0>(y); }),
+                          own.end());
+                for (const auto& [pi, l, r] : own) { rec.carriers.push_back(pi); rec.carrier_flanks.emplace_back(l, r); }
+                inv_records.push_back(std::move(rec));
+            }
+        }
         // The inversions to write, each with its site, first: a haplotype that carries one of them has no allele
         // at another it overlaps, rather than the reference's.
-        struct Planned { const PathInversion* inv; const Bubble* parent; std::size_t pos, end; };
+        struct Planned { const InvRecord* inv; const Bubble* parent; std::size_t pos, end; };
         std::vector<Planned> planned;
-        for (const PathInversion& inv_site : scan.inversions) {
+        for (const InvRecord& inv_site : inv_records) {
             // The representative breakpoints: the flanks most carriers share.
             const std::size_t left = g0 + inv_site.left_end, a = g0 + inv_site.inv_lo, b = g0 + inv_site.inv_hi,
                               right = g0 + inv_site.right_start;
@@ -5917,7 +5975,7 @@ void call_variants(
             planned.push_back({&inv_site, parent, pos, end});
         }
         for (const Planned& pl : planned) {
-            const PathInversion& inv_site = *pl.inv;
+            const InvRecord& inv_site = *pl.inv;
             const Bubble* parent = pl.parent;
             const std::size_t left = g0 + inv_site.left_end, a = g0 + inv_site.inv_lo, b = g0 + inv_site.inv_hi,
                               right = g0 + inv_site.right_start;
