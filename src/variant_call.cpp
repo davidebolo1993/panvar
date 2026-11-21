@@ -5739,6 +5739,7 @@ void call_variants(
         BubbleOut& bo = bouts[bubble_idx];
         const std::size_t r0 = bo.records.size(), n0 = bo.variant_nodes.size(), c0 = bo.carrier_events.size();
         std::unordered_map<std::string, int> id_counts;
+        const VariantCallSummary before = bo.sum;
         process_bubble(bubble_idx, bubbles[bubble_idx], id_counts, SiteRun::kCopyNumber);
         std::unordered_set<std::string> kept;
         std::vector<OutRecord> recs;
@@ -5748,6 +5749,24 @@ void call_variants(
                 recs.push_back(std::move(bo.records[k]));
             }
         bo.records.resize(r0);
+        // Of this run's counts, those of its copy numbers and of the records kept: the site and its other
+        // records are counted where they are typed, copy by copy.
+        {
+            VariantCallSummary sum = before;
+            sum.tangle_ids = bo.sum.tangle_ids;
+            sum.oversized_ids = bo.sum.oversized_ids;
+            sum.copy_carriers = bo.sum.copy_carriers;
+            sum.copy_own_event = bo.sum.copy_own_event;
+            sum.copy_no_form = bo.sum.copy_no_form;
+            sum.copy_pass_off = bo.sum.copy_pass_off;
+            sum.records_written += recs.size();
+            sum.dup += recs.size();
+            for (const OutRecord& r : recs) {
+                sum.unaligned_missing += r.unaligned_missing;
+                sum.covered_missing += r.covered_missing;
+            }
+            bo.sum = std::move(sum);
+        }
         for (OutRecord& r : recs) bo.records.push_back(std::move(r));
         const auto keep_rows = [&](std::vector<std::string>& rows, std::size_t from) {
             rows.erase(std::remove_if(rows.begin() + static_cast<std::ptrdiff_t>(from), rows.end(),
@@ -5975,6 +5994,21 @@ void call_variants(
             std::cerr << cli::log_prefix("call") << "warning: " << no_site << " inversion(s) read from the walks lie in no inversion site of "
                       << options.bubbles_csv_in << " and are not written (made at a different --min-variant-bp?)\n";
     }
+
+    // The run's record counts, from the records as they stand: after records are left out or replaced.
+    const auto count_records = [&]() {
+        summary.records_written = out_records.size();
+        summary.del = summary.ins = summary.inv = summary.dup = summary.sub = 0;
+        for (const OutRecord& r : out_records) {
+            const std::size_t a = r.line.find("SVTYPE=");
+            const std::string type = a == std::string::npos ? "" : r.line.substr(a + 7, 3);
+            if (type == "DEL") ++summary.del;
+            else if (type == "INS") ++summary.ins;
+            else if (type == "INV") ++summary.inv;
+            else if (type == "CNV") ++summary.dup;
+            else if (type == "SUB") ++summary.sub;
+        }
+    };
 
     // ---- Whole copies gained or lost, with --cn. A stretch between copies whose carriers all gain or all lose whole
     // copies is one copy-number record over the copies, carrying each carrier's own bases as its forms, in place of
@@ -6285,8 +6319,12 @@ void call_variants(
             }
         }
         {
-            out_records.erase(std::remove_if(out_records.begin(), out_records.end(), [&](const OutRecord& r) { return drop.count(r.id) != 0; }),
-                              out_records.end());
+            out_records.erase(std::remove_if(out_records.begin(), out_records.end(), [&](const OutRecord& r) {
+                if (!drop.count(r.id)) return false;
+                summary.unaligned_missing -= r.unaligned_missing;
+                summary.covered_missing -= r.covered_missing;
+                return true;
+            }), out_records.end());
             const auto prune = [&](std::vector<std::string>& rows) {
                 rows.erase(std::remove_if(rows.begin(), rows.end(), [&](const std::string& row) {
                     return row.empty() || drop.count(row.substr(0, row.find('\t'))) != 0;
@@ -6299,6 +6337,7 @@ void call_variants(
             for (OutRecord& r : added) out_records.push_back(std::move(r));
             for (std::string& v : added_vn) variant_nodes_rows.push_back(std::move(v));
             for (std::string& c : added_ce) carrier_events_rows.push_back(std::move(c));
+            if (!drop.empty()) count_records();
         }
     }
 
@@ -6423,23 +6462,14 @@ void call_variants(
             };
             keep(variant_nodes_rows);
             keep(carrier_events_rows);
-            summary.records_written = out_records.size();
-            summary.del = summary.ins = summary.inv = summary.dup = summary.sub = 0;
+            count_records();
             // 'with records' counts ordinary sites, as 'sites' does: an inversion record carries its
             // inversion site's id
             std::unordered_set<std::size_t> inversion_sites;
             for (const Bubble& b : bubbles) if (b.inversion_parent) inversion_sites.insert(b.id);
             std::set<std::size_t> sites;
-            for (const OutRecord& r : out_records) {
-                const std::size_t a = r.line.find("SVTYPE=");
-                const std::string type = a == std::string::npos ? "" : r.line.substr(a + 7, 3);
-                if (type == "DEL") ++summary.del;
-                else if (type == "INS") ++summary.ins;
-                else if (type == "INV") ++summary.inv;
-                else if (type == "CNV") ++summary.dup;
-                else if (type == "SUB") ++summary.sub;
+            for (const OutRecord& r : out_records)
                 if (r.bubble_id != 0 && !inversion_sites.count(r.bubble_id)) sites.insert(r.bubble_id);
-            }
             summary.bubbles_with_calls = sites.size();
         }
     }
